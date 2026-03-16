@@ -10429,13 +10429,6 @@ components:
       properties:
         deploymentVersion:
           $ref: '#/components/schemas/WorkerDeploymentVersion'
-        revisionNumber:
-          type: string
-          description: |-
-            Revision number of the task queue routing config at the time the target
-             was declined. If an incoming target's revision is <= this value, it is
-             not newer and is not used for deciding whether or not to suppress the
-             upgrade signal.
       description: |-
         Wrapper for a target deployment version that the SDK declined to upgrade to.
          See declined_target_version_upgrade on WorkflowExecutionStartedEventAttributes.
@@ -18549,22 +18542,6 @@ components:
 
              Used internally by the server during continue-as-new and retry.
              Should not be read or interpreted by SDKs.
-        timeSkippingConfig:
-          allOf:
-            - $ref: '#/components/schemas/TimeSkippingConfig'
-          description: |-
-            Initial time-skipping configuration for this workflow execution, recorded at start time.
-             This may have been set explicitly via the start workflow request, or propagated from a
-             parent/previous execution.
-
-             The configuration may be updated after start via UpdateWorkflowExecutionOptions, which
-             will be reflected in the WorkflowExecutionOptionsUpdatedEvent.
-        initialSkippedDuration:
-          pattern: ^-?(?:0|[1-9][0-9]{0,11})(?:\.[0-9]{1,9})?s$
-          type: string
-          description: |-
-            The time skipped by the previous execution that started this workflow.
-             It can happen in cases of child workflows and continue-as-new workflows.
       description: Always the first event in workflow history
     WorkflowExecutionTerminatedEventAttributes:
       type: object

@@ -196,29 +196,12 @@ message WorkflowExecutionStartedEventAttributes {
     // Used internally by the server during continue-as-new and retry.
     // Should not be read or interpreted by SDKs.
     DeclinedTargetVersionUpgrade declined_target_version_upgrade = 40;
-
-    // Initial time-skipping configuration for this workflow execution, recorded at start time.
-    // This may have been set explicitly via the start workflow request, or propagated from a
-    // parent/previous execution.
-    //
-    // The configuration may be updated after start via UpdateWorkflowExecutionOptions, which
-    // will be reflected in the WorkflowExecutionOptionsUpdatedEvent.
-    temporal.api.workflow.v1.TimeSkippingConfig time_skipping_config = 41;
-
-    // The time skipped by the previous execution that started this workflow.
-    // It can happen in cases of child workflows and continue-as-new workflows.
-    google.protobuf.Duration initial_skipped_duration = 42;
 }
 
 // Wrapper for a target deployment version that the SDK declined to upgrade to.
 // See declined_target_version_upgrade on WorkflowExecutionStartedEventAttributes.
 message DeclinedTargetVersionUpgrade {
     temporal.api.deployment.v1.WorkerDeploymentVersion deployment_version = 1;
-    // Revision number of the task queue routing config at the time the target
-    // was declined. If an incoming target's revision is <= this value, it is
-    // not newer and is not used for deciding whether or not to suppress the
-    // upgrade signal.
-    int64 revision_number = 2;
 }
 
 message WorkflowExecutionCompletedEventAttributes {
