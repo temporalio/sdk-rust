@@ -36,6 +36,7 @@ use std::{
     },
     time::{Duration, Instant, SystemTime},
 };
+use temporalio_client::worker::CancelActivityCallback;
 use temporalio_common::protos::{
     coresdk::{
         ActivityHeartbeat, ActivitySlotInfo,
@@ -170,6 +171,8 @@ pub(crate) struct WorkerActivityTasks {
     complete_notify: Arc<Notify>,
     /// Token to notify when poll returned a shutdown error
     poll_returned_shutdown_token: CancellationToken,
+    /// Used to inject external cancellations (e.g. from nexus worker commands)
+    cancels_tx: UnboundedSender<PendingActivityCancel>,
 }
 
 #[derive(derive_more::From)]
@@ -205,6 +208,7 @@ impl WorkerActivityTasks {
             start_tasks_stream_complete.clone(),
         );
         let (cancels_tx, cancels_rx) = unbounded_channel();
+        let external_cancels_tx = cancels_tx.clone();
         let heartbeat_manager = ActivityHeartbeatManager::new(client, cancels_tx.clone());
         let complete_notify = Arc::new(Notify::new());
         let source_stream = stream::select_with_strategy(
@@ -239,6 +243,7 @@ impl WorkerActivityTasks {
             poll_returned_shutdown_token: CancellationToken::new(),
             outstanding_activity_tasks,
             completers_lock: Default::default(),
+            cancels_tx: external_cancels_tx,
         }
     }
 
@@ -473,6 +478,27 @@ impl WorkerActivityTasks {
             sem: self.eager_activities_semaphore.clone(),
             tx: self.eager_activities_tx.clone(),
         }
+    }
+
+    /// Returns a callback that can be used to cancel activities from outside this manager.
+    pub(crate) fn cancel_activity_callback(&self) -> CancelActivityCallback {
+        let outstanding = self.outstanding_activity_tasks.clone();
+        let cancels_tx = self.cancels_tx.clone();
+        Arc::new(move |task_token: TaskToken| {
+            if outstanding.contains_key(&task_token) {
+                let _ = cancels_tx.send(PendingActivityCancel::new(
+                    task_token,
+                    ActivityCancelReason::Cancelled,
+                    ActivityCancellationDetails {
+                        is_cancelled: true,
+                        ..Default::default()
+                    },
+                ));
+                true
+            } else {
+                false
+            }
+        })
     }
 
     #[cfg(test)]

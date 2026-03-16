@@ -78,7 +78,8 @@ use std::{
     time::{Duration, SystemTime},
 };
 use temporalio_client::worker::{
-    ClientWorker, HeartbeatCallback, SharedNamespaceWorkerTrait, Slot as SlotTrait,
+    CancelActivityCallback, ClientWorker, HeartbeatCallback, SharedNamespaceWorkerTrait,
+    Slot as SlotTrait,
 };
 use temporalio_common::{
     protos::{
@@ -869,10 +870,14 @@ impl Worker {
             )
         });
 
+        let cancel_activity_callback = at_task_mgr
+            .as_ref()
+            .map(|mgr| mgr.cancel_activity_callback());
         let client_worker_registrator = Arc::new(ClientWorkerRegistrator {
             worker_instance_key,
             slot_provider: provider,
             heartbeat_manager: worker_heartbeat,
+            cancel_activity_callback,
             client: RwLock::new(client.clone()),
             shared_namespace_worker,
             task_types: config.task_types,
@@ -1953,6 +1958,7 @@ struct ClientWorkerRegistrator {
     worker_instance_key: Uuid,
     slot_provider: SlotProvider,
     heartbeat_manager: Option<WorkerHeartbeatManager>,
+    cancel_activity_callback: Option<CancelActivityCallback>,
     client: RwLock<Arc<dyn WorkerClient>>,
     shared_namespace_worker: bool,
     task_types: WorkerTaskTypes,
@@ -1988,6 +1994,10 @@ impl ClientWorker for ClientWorkerRegistrator {
         } else {
             None
         }
+    }
+
+    fn cancel_activity_callback(&self) -> Option<CancelActivityCallback> {
+        self.cancel_activity_callback.clone()
     }
 
     fn new_shared_namespace_worker(

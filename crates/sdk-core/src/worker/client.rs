@@ -134,6 +134,14 @@ impl WorkerClientBag {
             None
         }
     }
+
+    fn worker_control_task_queue(&self) -> String {
+        format!(
+            "temporal-sys/worker-commands/{}/{}",
+            self.namespace,
+            self.worker_grouping_key()
+        )
+    }
 }
 
 /// This trait contains everything workers need to interact with Temporal, and hence provides a
@@ -310,8 +318,8 @@ impl WorkerClient for WorkerClientBag {
             worker_version_capabilities: self.worker_version_capabilities(),
             deployment_options: self.deployment_options(),
             worker_instance_key: self.worker_instance_key.to_string(),
+            worker_control_task_queue: self.worker_control_task_queue(),
             poller_group_id: Default::default(),
-            worker_control_task_queue: Default::default(),
         }
         .into_request();
         request.extensions_mut().insert(IsWorkerTaskLongPoll);
@@ -350,8 +358,8 @@ impl WorkerClient for WorkerClientBag {
             worker_version_capabilities: self.worker_version_capabilities(),
             deployment_options: self.deployment_options(),
             worker_instance_key: self.worker_instance_key.to_string(),
+            worker_control_task_queue: self.worker_control_task_queue(),
             poller_group_id: Default::default(),
-            worker_control_task_queue: Default::default(),
         }
         .into_request();
         request.extensions_mut().insert(IsWorkerTaskLongPoll);
@@ -449,9 +457,10 @@ impl WorkerClient for WorkerClientBag {
             deployment: None,
             versioning_behavior: request.versioning_behavior.into(),
             deployment_options: self.deployment_options(),
+            worker_instance_key: self.worker_instance_key.to_string(),
+            worker_control_task_queue: self.worker_control_task_queue(),
             resource_id: Default::default(),
             worker_instance_key: self.worker_instance_key.to_string(),
-            worker_control_task_queue: Default::default(),
         };
         Ok(self
             .connection

@@ -71,6 +71,7 @@ fn to_system_time(ts: Timestamp) -> SystemTime {
     UNIX_EPOCH + Duration::new(ts.seconds as u64, ts.nanos as u32)
 }
 
+#[allow(deprecated)]
 async fn list_worker_heartbeats(client: &Client, query: impl Into<String>) -> Vec<WorkerHeartbeat> {
     let mut raw_client = client.clone();
     let response = WorkflowService::list_workers(
@@ -278,7 +279,8 @@ async fn docker_worker_heartbeat_basic(#[values("otel", "prom", "no_metrics")] b
                     .unwrap()
                     .into_inner();
                     #[allow(deprecated)]
-                    let hb = workers_list
+                    #[allow(deprecated)]
+    let hb = workers_list
                         .workers_info
                         .iter()
                         .find_map(|wi| {
@@ -974,6 +976,7 @@ async fn worker_heartbeat_failure_metrics() {
         eventually(
             || async {
                 let heartbeats = list_worker_heartbeats(&client, query.clone()).await;
+                #[allow(deprecated)]
                 let heartbeat = heartbeats
                     .into_iter()
                     .find(|hb| hb.worker_instance_key == worker_key)
