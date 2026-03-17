@@ -2204,3 +2204,77 @@ async fn immediate_activity_cancelation() {
     worker.set_worker_interceptor(aai);
     worker.run().await.unwrap();
 }
+
+/// Verifies that activity cancellation is delivered via the nexus worker command channel
+/// even when the activity does not heartbeat.
+#[tokio::test]
+async fn activity_cancel_delivered_without_heartbeat() {
+    let wf_name = "activity_cancel_delivered_without_heartbeat";
+    let mut starter = CoreWfStarter::new(wf_name);
+
+    struct WaitForCancelActivities {}
+    #[activities]
+    impl WaitForCancelActivities {
+        #[activity]
+        async fn wait_for_cancel(
+            self: Arc<Self>,
+            ctx: ActivityContext,
+            _: String,
+        ) -> Result<String, ActivityError> {
+            ctx.cancelled().await;
+            Ok("done".to_string())
+        }
+    }
+
+    starter
+        .sdk_config
+        .register_activities(WaitForCancelActivities {});
+    let mut worker = starter.worker().await;
+
+    #[workflow]
+    #[derive(Default)]
+    struct CancelWithoutHeartbeatWorkflow;
+
+    #[workflow_methods]
+    impl CancelWithoutHeartbeatWorkflow {
+        #[run]
+        async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<()> {
+            let act_fut = ctx.start_activity(
+                WaitForCancelActivities::wait_for_cancel,
+                "hi".to_string(),
+                ActivityOptions {
+                    // Longer than workflow timeout
+                    start_to_close_timeout: Some(Duration::from_secs(30)),
+                    retry_policy: Some(RetryPolicy {
+                        maximum_attempts: 1,
+                        ..Default::default()
+                    }),
+                    cancellation_type: ActivityCancellationType::WaitCancellationCompleted,
+                    ..Default::default()
+                },
+            );
+            // Timer needed to avoid cancel-before-sent
+            ctx.timer(Duration::from_millis(10)).await;
+            act_fut.cancel();
+            let _ = act_fut.await;
+            Ok(())
+        }
+    }
+
+    worker.register_workflow::<CancelWithoutHeartbeatWorkflow>();
+
+    let task_queue = starter.get_task_queue().to_owned();
+    let handle = worker
+        .submit_workflow(
+            CancelWithoutHeartbeatWorkflow::run,
+            (),
+            WorkflowStartOptions::new(task_queue, wf_name.to_owned())
+                .run_timeout(Duration::from_secs(10))
+                .build(),
+        )
+        .await
+        .unwrap();
+    // Fails with workflow timeout if cancel doesn't work
+    worker.run_until_done().await.unwrap();
+    handle.get_result(Default::default()).await.unwrap();
+}
