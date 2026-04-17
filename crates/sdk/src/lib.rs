@@ -74,41 +74,19 @@ extern crate self as temporalio_sdk;
 pub mod activities;
 pub mod error;
 pub mod interceptors;
-mod workflow_context;
 mod workflow_executor;
 mod workflow_future;
+mod workflow_registry;
 pub mod workflows;
 
-#[macro_export]
-#[doc(hidden)]
-macro_rules! __temporal_select {
-    ($($tokens:tt)*) => {
-        ::futures_util::select_biased! { $($tokens)* }
-    };
-}
-
-#[macro_export]
-#[doc(hidden)]
-macro_rules! __temporal_join {
-    ($($tokens:tt)*) => {
-        ::futures_util::join!($($tokens)*)
-    };
-}
-
-use workflow_future::WorkflowFunction;
-
-pub use error::{
-    ActivityExecutionError, ApplicationFailure, ChildWorkflowExecutionError,
-    ChildWorkflowSignalError, ChildWorkflowStartError, OutgoingActivityError, OutgoingError,
-    OutgoingWorkflowError,
-};
 pub use temporalio_client::Namespace;
-pub use workflow_context::{
+pub use temporalio_workflow::{
     ActivityCloseTimeouts, ActivityOptions, BaseWorkflowContext, CancellableFuture,
     ChildWorkflowOptions, ContinueAsNewOptions, ExternalWorkflowHandle, LocalActivityOptions,
     NexusOperationOptions, ParentWorkflowInfo, RootWorkflowInfo, Signal, SignalData,
     StartChildWorkflowExecutionFailedCause, StartedChildWorkflow, SyncWorkflowContext,
-    TimerOptions, WorkflowContext, WorkflowContextView,
+    TimerOptions, TimerResult, WorkflowContext, WorkflowContextView, WorkflowResult,
+    WorkflowTermination,
 };
 
 use crate::{
@@ -117,11 +95,9 @@ use crate::{
         activity_error_to_core_result,
     },
     interceptors::{ActivityInboundInterceptor, WorkerInterceptor},
-    workflow_context::{
-        ChildWfCommon, NexusUnblockData, PendingChildWorkflow, StartedNexusOperation,
-    },
-    workflow_executor::WorkflowExecutor,
-    workflows::{WorkflowDefinitions, WorkflowImplementation, WorkflowImplementer},
+    workflow_executor::{TaskHandle, WorkflowExecutor},
+    workflow_future::WorkflowFunction,
+    workflow_registry::WorkflowDefinitions,
 };
 use anyhow::{Context, anyhow, bail};
 use futures_util::{FutureExt, StreamExt, TryFutureExt, TryStreamExt};
@@ -132,6 +108,7 @@ use std::{
     fmt::{Debug, Display, Formatter},
     future::Future,
     marker::PhantomData,
+    panic::AssertUnwindSafe,
     sync::Arc,
     time::Duration,
 };
@@ -144,18 +121,9 @@ use temporalio_common::{
         TaskToken,
         coresdk::{
             ActivityTaskCompletion, AsJsonPayloadExt,
-            activity_result::{ActivityExecutionResult, ActivityResolution},
+            activity_result::ActivityExecutionResult,
             activity_task::{ActivityTask, activity_task},
-            child_workflow::ChildWorkflowResult,
-            nexus::NexusOperationResult,
-            workflow_activation::{
-                WorkflowActivation,
-                resolve_child_workflow_execution_start::Status as ChildWorkflowStartStatus,
-                resolve_nexus_operation_start, workflow_activation_job::Variant,
-            },
-            workflow_commands::{
-                ContinueAsNewWorkflowExecution, WorkflowCommand, workflow_command,
-            },
+            workflow_activation::{WorkflowActivation, workflow_activation_job::Variant},
             workflow_completion::WorkflowActivationCompletion,
         },
         temporal::api::{
@@ -168,10 +136,10 @@ use temporalio_sdk_core::{
     CoreRuntime, PollError, PollerBehavior, TunerBuilder, Worker as CoreWorker, WorkerConfig,
     WorkerTuner, WorkerVersioningStrategy, WorkflowErrorType, init_worker,
 };
+use temporalio_workflow::runtime::entry::WorkflowImplementation;
 use tokio::sync::{
     Notify,
     mpsc::{UnboundedSender, unbounded_channel},
-    oneshot,
 };
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tokio_util::sync::CancellationToken;
@@ -301,8 +269,12 @@ impl<S: worker_options_builder::State> WorkerOptionsBuilder<S> {
     }
 
     /// Registers all workflows on a workflow implementer.
-    pub fn register_workflow<WI: WorkflowImplementer>(mut self) -> Self {
-        self.workflows.register_workflow::<WI>();
+    pub fn register_workflow<W>(mut self) -> Self
+    where
+        W: WorkflowImplementation,
+        <W::Run as WorkflowDefinition>::Input: Send,
+    {
+        self.workflows.register_workflow::<W>();
         self
     }
 
@@ -362,8 +334,12 @@ impl WorkerOptions {
     }
 
     /// Registers all workflows on a workflow implementer.
-    pub fn register_workflow<WI: WorkflowImplementer>(&mut self) -> &mut Self {
-        self.workflows.register_workflow::<WI>();
+    pub fn register_workflow<W>(&mut self) -> &mut Self
+    where
+        W: WorkflowImplementation,
+        <W::Run as WorkflowDefinition>::Input: Send,
+    {
+        self.workflows.register_workflow::<W>();
         self
     }
 
@@ -572,10 +548,14 @@ impl Worker {
     }
 
     /// Registers all workflows on a workflow implementer.
-    pub fn register_workflow<WI: WorkflowImplementer>(&mut self) -> &mut Self {
+    pub fn register_workflow<W>(&mut self) -> &mut Self
+    where
+        W: WorkflowImplementation,
+        <W::Run as WorkflowDefinition>::Input: Send,
+    {
         self.workflow_half
             .workflow_definitions
-            .register_workflow::<WI>();
+            .register_workflow::<W>();
         self
     }
 
@@ -599,9 +579,8 @@ impl Worker {
     pub async fn run(&mut self) -> Result<(), anyhow::Error> {
         let shutdown_token = CancellationToken::new();
         let (common, wf_half, act_half) = self.split_apart();
-        let (wf_future_tx, wf_future_rx) = unbounded_channel::<
-            WorkflowFutureHandle<workflow_executor::TaskHandle<WorkflowResult<Payload>>>,
-        >();
+        let (wf_future_tx, wf_future_rx) =
+            unbounded_channel::<WorkflowFutureHandle<TaskHandle<WorkflowResult<Payload>>>>();
         let (completions_tx, completions_rx) = unbounded_channel();
 
         // Workflows run in a LocalSet because they use Rc<RefCell> for state management.
@@ -809,10 +788,8 @@ impl WorkflowHalf {
         mut activation: WorkflowActivation,
         completions_tx: &UnboundedSender<WorkflowActivationCompletion>,
         executor: &WorkflowExecutor,
-    ) -> Result<
-        Option<WorkflowFutureHandle<workflow_executor::TaskHandle<WorkflowResult<Payload>>>>,
-        anyhow::Error,
-    > {
+    ) -> Result<Option<WorkflowFutureHandle<TaskHandle<WorkflowResult<Payload>>>>, anyhow::Error>
+    {
         let mut res = None;
         let run_id = activation.run_id.clone();
 
@@ -1018,299 +995,6 @@ impl ActivityHalf {
     }
 }
 
-#[derive(Debug)]
-enum UnblockEvent {
-    Timer(u32, TimerResult),
-    Activity(u32, Box<ActivityResolution>),
-    WorkflowStart(u32, Box<ChildWorkflowStartStatus>),
-    WorkflowComplete(u32, Box<ChildWorkflowResult>),
-    SignalExternal(u32, Option<Failure>),
-    CancelExternal(u32, Option<Failure>),
-    NexusOperationStart(u32, Box<resolve_nexus_operation_start::Status>),
-    NexusOperationComplete(u32, Box<NexusOperationResult>),
-}
-
-/// Result of awaiting on a timer
-#[derive(Debug, Copy, Clone, PartialEq, Eq)]
-pub enum TimerResult {
-    /// The timer was cancelled
-    Cancelled,
-    /// The timer elapsed and fired
-    Fired,
-}
-
-/// Successful result of sending a signal to an external workflow
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct SignalExternalOk;
-/// Result of awaiting on sending a signal to an external workflow
-pub type SignalExternalWfResult = Result<SignalExternalOk, Failure>;
-
-/// Successful result of sending a cancel request to an external workflow
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct CancelExternalOk;
-/// Result of awaiting on sending a cancel request to an external workflow
-pub type CancelExternalWfResult = Result<CancelExternalOk, Failure>;
-
-trait Unblockable {
-    type OtherDat;
-
-    fn unblock(ue: UnblockEvent, od: Self::OtherDat) -> Self;
-}
-
-impl Unblockable for TimerResult {
-    type OtherDat = ();
-    fn unblock(ue: UnblockEvent, _: Self::OtherDat) -> Self {
-        match ue {
-            UnblockEvent::Timer(_, result) => result,
-            _ => panic!("Invalid unblock event for timer"),
-        }
-    }
-}
-
-impl Unblockable for ActivityResolution {
-    type OtherDat = ();
-    fn unblock(ue: UnblockEvent, _: Self::OtherDat) -> Self {
-        match ue {
-            UnblockEvent::Activity(_, result) => *result,
-            _ => panic!("Invalid unblock event for activity"),
-        }
-    }
-}
-
-impl<WD: WorkflowDefinition> Unblockable for PendingChildWorkflow<WD> {
-    type OtherDat = ChildWfCommon;
-    fn unblock(ue: UnblockEvent, od: Self::OtherDat) -> Self {
-        match ue {
-            UnblockEvent::WorkflowStart(_, result) => Self {
-                status: *result,
-                common: od,
-                _phantom: PhantomData,
-            },
-            _ => panic!("Invalid unblock event for child workflow start"),
-        }
-    }
-}
-
-impl Unblockable for ChildWorkflowResult {
-    type OtherDat = ();
-    fn unblock(ue: UnblockEvent, _: Self::OtherDat) -> Self {
-        match ue {
-            UnblockEvent::WorkflowComplete(_, result) => *result,
-            _ => panic!("Invalid unblock event for child workflow complete"),
-        }
-    }
-}
-
-impl Unblockable for SignalExternalWfResult {
-    type OtherDat = ();
-    fn unblock(ue: UnblockEvent, _: Self::OtherDat) -> Self {
-        match ue {
-            UnblockEvent::SignalExternal(_, maybefail) => {
-                maybefail.map_or(Ok(SignalExternalOk), Err)
-            }
-            _ => panic!("Invalid unblock event for signal external workflow result"),
-        }
-    }
-}
-
-impl Unblockable for CancelExternalWfResult {
-    type OtherDat = ();
-    fn unblock(ue: UnblockEvent, _: Self::OtherDat) -> Self {
-        match ue {
-            UnblockEvent::CancelExternal(_, maybefail) => {
-                maybefail.map_or(Ok(CancelExternalOk), Err)
-            }
-            _ => panic!("Invalid unblock event for signal external workflow result"),
-        }
-    }
-}
-
-type NexusStartResult = Result<StartedNexusOperation, Failure>;
-impl Unblockable for NexusStartResult {
-    type OtherDat = NexusUnblockData;
-    fn unblock(ue: UnblockEvent, od: Self::OtherDat) -> Self {
-        match ue {
-            UnblockEvent::NexusOperationStart(_, result) => match *result {
-                resolve_nexus_operation_start::Status::OperationToken(op_token) => {
-                    Ok(StartedNexusOperation {
-                        operation_token: Some(op_token),
-                        unblock_dat: od,
-                    })
-                }
-                resolve_nexus_operation_start::Status::StartedSync(_) => {
-                    Ok(StartedNexusOperation {
-                        operation_token: None,
-                        unblock_dat: od,
-                    })
-                }
-                resolve_nexus_operation_start::Status::Failed(f) => Err(f),
-            },
-            _ => panic!("Invalid unblock event for nexus operation"),
-        }
-    }
-}
-
-impl Unblockable for NexusOperationResult {
-    type OtherDat = ();
-
-    fn unblock(ue: UnblockEvent, _: Self::OtherDat) -> Self {
-        match ue {
-            UnblockEvent::NexusOperationComplete(_, result) => *result,
-            _ => panic!("Invalid unblock event for nexus operation complete"),
-        }
-    }
-}
-
-/// Identifier for cancellable operations
-#[derive(Debug, Clone)]
-pub(crate) enum CancellableID {
-    Timer(u32),
-    Activity(u32),
-    LocalActivity(u32),
-    ChildWorkflow {
-        seqnum: u32,
-        reason: String,
-    },
-    SignalExternalWorkflow(u32),
-    /// A nexus operation (waiting for start)
-    NexusOp(u32),
-}
-
-/// Cancellation IDs that support a reason.
-pub(crate) trait SupportsCancelReason {
-    /// Returns a new version of this ID with the provided cancellation reason.
-    fn with_reason(self, reason: String) -> CancellableID;
-}
-#[derive(Debug, Clone)]
-pub(crate) enum CancellableIDWithReason {
-    ChildWorkflow { seqnum: u32 },
-}
-impl SupportsCancelReason for CancellableIDWithReason {
-    fn with_reason(self, reason: String) -> CancellableID {
-        match self {
-            CancellableIDWithReason::ChildWorkflow { seqnum } => {
-                CancellableID::ChildWorkflow { seqnum, reason }
-            }
-        }
-    }
-}
-impl From<CancellableIDWithReason> for CancellableID {
-    fn from(v: CancellableIDWithReason) -> Self {
-        v.with_reason("".to_string())
-    }
-}
-
-#[derive(derive_more::From)]
-#[allow(clippy::large_enum_variant)]
-enum RustWfCmd {
-    #[from(ignore)]
-    Cancel(CancellableID),
-    ForceWFTFailure(anyhow::Error),
-    NewCmd(CommandCreateRequest),
-    NewNonblockingCmd(workflow_command::Variant),
-    SubscribeChildWorkflowCompletion(CommandSubscribeChildWorkflowCompletion),
-    SubscribeNexusOperationCompletion {
-        seq: u32,
-        unblocker: oneshot::Sender<UnblockEvent>,
-    },
-}
-
-struct CommandCreateRequest {
-    cmd: WorkflowCommand,
-    unblocker: oneshot::Sender<UnblockEvent>,
-}
-
-struct CommandSubscribeChildWorkflowCompletion {
-    seq: u32,
-    unblocker: oneshot::Sender<UnblockEvent>,
-}
-
-/// The result of running a workflow.
-///
-/// Successful completion returns `Ok(T)` where `T` is the workflow's return type.
-/// Non-error terminations (cancel, eviction, continue-as-new) return `Err(WorkflowTermination)`.
-pub type WorkflowResult<T> = Result<T, WorkflowTermination>;
-
-/// Represents ways a workflow can terminate without producing a normal result.
-///
-/// This is used as the error type in [`WorkflowResult<T>`] for non-error termination conditions
-/// like cancellation, eviction, continue-as-new, or actual failures.
-#[derive(Debug, thiserror::Error)]
-pub enum WorkflowTermination {
-    /// The workflow was cancelled.
-    #[error("Workflow cancelled")]
-    Cancelled,
-
-    /// The workflow was evicted from the cache.
-    #[error("Workflow evicted from cache")]
-    Evicted,
-
-    /// The workflow should continue as a new execution.
-    #[error("Continue as new")]
-    ContinueAsNew(Box<ContinueAsNewWorkflowExecution>),
-
-    /// The workflow failed with an error.
-    #[error("Workflow failed: {0}")]
-    Failed(#[source] OutgoingWorkflowError),
-}
-
-impl WorkflowTermination {
-    /// Construct a [WorkflowTermination::ContinueAsNew]
-    pub fn continue_as_new(can: ContinueAsNewWorkflowExecution) -> Self {
-        Self::ContinueAsNew(Box::new(can))
-    }
-
-    /// Construct a [WorkflowTermination::Failed] variant from an application failure.
-    pub fn failed_application(err: ApplicationFailure) -> Self {
-        Self::Failed(err.into())
-    }
-}
-
-impl From<anyhow::Error> for WorkflowTermination {
-    fn from(err: anyhow::Error) -> Self {
-        Self::Failed(err.into())
-    }
-}
-
-impl From<temporalio_common::data_converters::PayloadConversionError> for WorkflowTermination {
-    fn from(err: temporalio_common::data_converters::PayloadConversionError) -> Self {
-        Self::Failed(err.into())
-    }
-}
-
-impl From<workflows::WorkflowError> for WorkflowTermination {
-    fn from(err: workflows::WorkflowError) -> Self {
-        match err {
-            workflows::WorkflowError::PayloadConversion(e) => Self::from(e),
-            workflows::WorkflowError::Execution(e) => Self::from(e),
-        }
-    }
-}
-
-impl From<ActivityExecutionError> for WorkflowTermination {
-    fn from(value: ActivityExecutionError) -> Self {
-        Self::Failed(value.into())
-    }
-}
-
-impl From<ChildWorkflowExecutionError> for WorkflowTermination {
-    fn from(value: ChildWorkflowExecutionError) -> Self {
-        Self::Failed(value.into())
-    }
-}
-
-impl From<ChildWorkflowStartError> for WorkflowTermination {
-    fn from(value: ChildWorkflowStartError) -> Self {
-        Self::Failed(value.into())
-    }
-}
-
-impl From<ChildWorkflowSignalError> for WorkflowTermination {
-    fn from(value: ChildWorkflowSignalError) -> Self {
-        Self::Failed(value.into())
-    }
-}
-
 /// Activity functions may return these values when exiting
 #[derive(Debug)]
 pub enum ActExitValue<T> {
@@ -1364,18 +1048,30 @@ impl PrintablePanicType for EndPrintingAttempts {
 }
 
 #[cfg(test)]
+#[allow(dead_code, unreachable_pub)]
 mod tests {
     use super::*;
     use crate::activities::ActivityError;
-    use temporalio_macros::{activities, workflow, workflow_methods};
+    use temporalio_macros::{activities, activity_definitions, workflow, workflow_methods};
 
     struct MyActivities {}
+
+    #[activity_definitions]
+    trait SharedActivities {
+        #[activity(name = "shared-greet")]
+        fn greet(name: String) -> String;
+    }
 
     #[activities]
     impl MyActivities {
         #[activity]
         async fn my_activity(_ctx: ActivityContext) -> Result<(), ActivityError> {
             Ok(())
+        }
+
+        #[activity(definition = shared_activities::Greet)]
+        async fn greet(_ctx: ActivityContext, name: String) -> Result<String, ActivityError> {
+            Ok(name)
         }
 
         #[activity]
@@ -1401,6 +1097,11 @@ mod tests {
         wf_ctx.start_activity(
             MyActivities::my_activity,
             (),
+            ActivityOptions::start_to_close_timeout(Duration::from_secs(5)),
+        );
+        wf_ctx.start_activity(
+            shared_activities::greet,
+            "Hi".to_owned(),
             ActivityOptions::start_to_close_timeout(Duration::from_secs(5)),
         );
         wf_ctx.start_activity(

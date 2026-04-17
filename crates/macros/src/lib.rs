@@ -2,6 +2,7 @@ use proc_macro::TokenStream;
 use syn::parse_macro_input;
 
 mod activities_definitions;
+mod activity_definitions;
 mod fsm_impl;
 mod macro_utils;
 mod workflow_definitions;
@@ -22,6 +23,17 @@ pub fn activities(_attr: TokenStream, item: TokenStream) -> TokenStream {
 #[proc_macro_attribute]
 pub fn activity(_attr: TokenStream, item: TokenStream) -> TokenStream {
     item
+}
+
+/// Defines activity markers and shared contracts without providing native implementations.
+///
+/// This macro is intended for workflow crates that need typed activity declarations which can be
+/// implemented elsewhere by a native worker crate.
+#[proc_macro_attribute]
+pub fn activity_definitions(_attr: TokenStream, item: TokenStream) -> TokenStream {
+    let def: activity_definitions::ActivityDefinitionsTrait =
+        parse_macro_input!(item as activity_definitions::ActivityDefinitionsTrait);
+    def.codegen()
 }
 
 /// Marks a struct as a workflow definition.

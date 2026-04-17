@@ -1,0 +1,31 @@
+package temporal:workflow-runtime@0.1.0;
+
+interface workflow-host {
+  set-current-details: func(details: string);
+
+  start-timer: func(req: types.start-timer-request);
+  cancel-timer: func(seq: u32);
+
+  schedule-activity: func(req: types.schedule-activity-request);
+  cancel-activity: func(seq: u32);
+
+  schedule-local-activity: func(req: types.schedule-local-activity-request);
+  cancel-local-activity: func(seq: u32);
+
+  start-child-workflow: func(req: types.start-child-workflow-request);
+  cancel-child-workflow: func(req: types.cancel-child-workflow-request);
+
+  request-cancel-external-workflow: func(req: types.request-cancel-external-workflow-request);
+  signal-external-workflow: func(req: types.signal-external-workflow-request);
+  cancel-signal-external-workflow: func(seq: u32);
+
+  schedule-nexus-operation: func(req: types.schedule-nexus-operation-request);
+  cancel-nexus-operation: func(req: types.request-cancel-nexus-operation-request);
+
+  upsert-search-attributes: func(entries: list<types.named-payload>);
+  upsert-memo: func(entries: list<types.named-payload>);
+  set-patch-marker: func(patch-id: string, deprecated: bool);
+
+  complete-update: func(protocol-instance-id: string, result: types.payload);
+  reject-update: func(protocol-instance-id: string, failure: types.failure);
+}

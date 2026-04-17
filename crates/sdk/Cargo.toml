@@ -43,6 +43,10 @@ path = "../sdk-core"
 version = "0.4"
 default-features = false
 
+[dependencies.temporalio-workflow]
+path = "../workflow"
+version = "0.2"
+
 [dependencies.temporalio-common]
 path = "../common"
 version = "0.4"

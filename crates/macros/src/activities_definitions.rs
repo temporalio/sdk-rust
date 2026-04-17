@@ -19,6 +19,7 @@ pub(crate) struct ActivitiesDefinition {
 #[derive(Default)]
 struct ActivityAttributes {
     name_override: Option<syn::Expr>,
+    definition_path: Option<syn::Path>,
 }
 
 struct ActivityMethod {
@@ -101,6 +102,11 @@ fn extract_activity_attributes(attrs: &[Attribute]) -> syn::Result<ActivityAttri
                     let value = meta.value()?;
                     let expr: syn::Expr = value.parse()?;
                     activity_attributes.name_override = Some(expr);
+                    Ok(())
+                } else if meta.path.is_ident("definition") {
+                    let value = meta.value()?;
+                    let path: syn::Path = value.parse()?;
+                    activity_attributes.definition_path = Some(path);
                     Ok(())
                 } else {
                     Err(meta.error("unsupported activity attribute"))
@@ -458,12 +464,43 @@ impl ActivitiesDefinition {
 
         let has_input = !activity.input_types.is_empty();
 
-        let activity_name = if let Some(ref name_expr) = activity.attributes.name_override {
+        let activity_name = if let Some(ref definition_path) = activity.attributes.definition_path {
+            quote! { <#definition_path as ::temporalio_common::ActivityDefinition>::name() }
+        } else if let Some(ref name_expr) = activity.attributes.name_override {
             quote! { #name_expr }
         } else {
             let default_name = format!("{}::{}", impl_type_name, activity.method.sig.ident);
             quote! { #default_name }
         };
+        let definition_assertions = activity
+            .attributes
+            .definition_path
+            .as_ref()
+            .map(|definition_path| {
+                quote! {
+                    const _: () = {
+                        trait __TemporalSame<T> {}
+                        impl<T> __TemporalSame<T> for T {}
+                        fn __assert_same_input<A, B>()
+                        where
+                            A: __TemporalSame<B>,
+                        {}
+                        fn __assert_same_output<A, B>()
+                        where
+                            A: __TemporalSame<B>,
+                        {}
+                        let _ = __assert_same_input::<
+                            <#module_ident::#struct_ident as ::temporalio_common::ActivityDefinition>::Input,
+                            <#definition_path as ::temporalio_common::ActivityDefinition>::Input,
+                        >;
+                        let _ = __assert_same_output::<
+                            <#module_ident::#struct_ident as ::temporalio_common::ActivityDefinition>::Output,
+                            <#definition_path as ::temporalio_common::ActivityDefinition>::Output,
+                        >;
+                    };
+                }
+            })
+            .unwrap_or_default();
 
         let receiver_pattern = if activity.is_static {
             quote! { _receiver }
@@ -545,6 +582,8 @@ impl ActivitiesDefinition {
                     #execute_body
                 }
             }
+
+            #definition_assertions
         }
     }
 

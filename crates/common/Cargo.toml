@@ -23,7 +23,7 @@ prometheus = [
   "dep:tokio",
 ]
 envconfig = ["dep:toml", "dep:dirs"]
-serde_serialize = []
+serde_serialize = ["temporalio-common-wasm/serde_serialize"]
 core-telemetry-bridge = ["dep:ringbuf", "dep:futures-channel"]
 core-based-sdk = ["core-telemetry-bridge", "prometheus", "envconfig"]
 
@@ -96,11 +96,13 @@ url = "2.5"
 uuid = { version = "1.18", default-features = false, features = ["v4"] }
 pbjson = { workspace = true }
 
+[dependencies.temporalio-common-wasm]
+path = "../common-wasm"
+version = "0.2"
+
 [build-dependencies]
 prost = { workspace = true }
 prost-types = "0.14"
-tonic-prost-build = { workspace = true }
-pbjson-build = { workspace = true }
 
 [lints]
 workspace = true

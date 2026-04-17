@@ -1,0 +1,575 @@
+//! Guest-side workflow execution implementation used by native and future WASM hosts.
+
+#![allow(missing_docs)]
+
+use crate::{
+    WorkflowContext,
+    runtime::{
+        BaseWorkflowContext,
+        entry::{WorkflowError, WorkflowImplementation},
+        guest::WorkflowInstance,
+        model::{TimerResult, UnblockEvent, WorkflowResult, WorkflowTermination},
+        types::{
+            ActivationJobResult, ActivationResult, IntoPayloadMap, MAIN_ROUTINE_ID,
+            MainRoutineCompletion, NamedPayload, QueryInvocation, QueryResponse, RoutineCompletion,
+            RoutineId, RoutineKind, RoutinePollResult, SignalInvocation, StartedRoutine,
+            UpdateInvocation, UpdateRoutineCompletion, WorkflowActivation, WorkflowActivationJob,
+            WorkflowFailure, WorkflowResolution,
+        },
+    },
+};
+use futures_util::{
+    FutureExt,
+    future::{Fuse, LocalBoxFuture},
+};
+use std::{
+    cell::RefCell,
+    collections::HashMap,
+    rc::Rc,
+    task::{Context, Poll, Waker},
+};
+use temporalio_common_wasm::{
+    WorkflowDefinition,
+    data_converters::{
+        GenericPayloadConverter, PayloadConversionError, PayloadConverter, SerializationContext,
+        SerializationContextData,
+    },
+    protos::temporal::api::{
+        common::v1::{Payload, Payloads},
+        failure::v1::Failure,
+    },
+};
+
+pub struct GuestWorkflowInstance<W: WorkflowImplementation> {
+    base_ctx: BaseWorkflowContext,
+    ctx: WorkflowContext<W>,
+    run_future: Fuse<LocalBoxFuture<'static, Result<Payload, WorkflowTermination>>>,
+    next_routine_id: RoutineId,
+    routines: HashMap<RoutineId, GuestRoutine>,
+}
+
+enum GuestRoutine {
+    Signal {
+        future: LocalBoxFuture<'static, Result<(), WorkflowError>>,
+    },
+    Update {
+        protocol_instance_id: String,
+        future: LocalBoxFuture<'static, Result<Payload, WorkflowError>>,
+    },
+}
+
+enum RoutinePollState<T> {
+    Ready {
+        result: T,
+        made_progress: bool,
+    },
+    ForcedFailure {
+        failure: WorkflowFailure,
+        made_progress: bool,
+    },
+    Stalled {
+        made_progress: bool,
+    },
+}
+
+struct DispatchData<'a> {
+    payloads: Payloads,
+    headers: HashMap<String, Payload>,
+    converter: &'a PayloadConverter,
+}
+
+impl<'a> DispatchData<'a> {
+    fn from_named_payloads(
+        payloads: Vec<Payload>,
+        headers: Vec<NamedPayload>,
+        converter: &'a PayloadConverter,
+    ) -> Self {
+        Self {
+            payloads: Payloads { payloads },
+            headers: headers.into_payload_map(),
+            converter,
+        }
+    }
+}
+
+impl<W: WorkflowImplementation> GuestWorkflowInstance<W>
+where
+    <W::Run as WorkflowDefinition>::Input: Send,
+{
+    pub fn instantiate(
+        payloads: Vec<Payload>,
+        converter: PayloadConverter,
+        base_ctx: BaseWorkflowContext,
+    ) -> Result<Box<dyn WorkflowInstance>, PayloadConversionError> {
+        let ser_ctx = SerializationContext {
+            data: &SerializationContextData::Workflow,
+            converter: &converter,
+        };
+        let input = converter.from_payloads(&ser_ctx, payloads)?;
+        let (init_input, run_input) = if W::INIT_TAKES_INPUT {
+            (Some(input), None)
+        } else {
+            (None, Some(input))
+        };
+        Ok(Box::new(Self::new(base_ctx, init_input, run_input)))
+    }
+
+    pub fn new(
+        base_ctx: BaseWorkflowContext,
+        init_input: Option<<W::Run as WorkflowDefinition>::Input>,
+        run_input: Option<<W::Run as WorkflowDefinition>::Input>,
+    ) -> Self {
+        let view = base_ctx.view();
+        let workflow = W::init(view, init_input);
+        Self::new_with_workflow(workflow, base_ctx, run_input)
+    }
+
+    pub fn new_with_workflow(
+        workflow: W,
+        base_ctx: BaseWorkflowContext,
+        run_input: Option<<W::Run as WorkflowDefinition>::Input>,
+    ) -> Self {
+        let workflow = Rc::new(RefCell::new(workflow));
+        let ctx = WorkflowContext::from_base(base_ctx.clone(), workflow);
+        let run_future = W::run(ctx.clone(), run_input).fuse();
+        Self {
+            base_ctx,
+            ctx,
+            run_future,
+            next_routine_id: MAIN_ROUTINE_ID + 1,
+            routines: HashMap::new(),
+        }
+    }
+
+    fn query_metadata(&self) -> QueryResponse {
+        #[derive(serde::Serialize)]
+        struct WorkflowMetadataJson {
+            #[serde(rename = "currentDetails", skip_serializing_if = "String::is_empty")]
+            current_details: String,
+        }
+
+        let converter = PayloadConverter::default();
+        let ctx = SerializationContext {
+            data: &SerializationContextData::Workflow,
+            converter: &converter,
+        };
+        QueryResponse {
+            result: converter
+                .to_payload(
+                    &ctx,
+                    &WorkflowMetadataJson {
+                        current_details: self.base_ctx.current_details(),
+                    },
+                )
+                .map_err(|err| Failure {
+                    message: err.to_string(),
+                    ..Default::default()
+                }),
+        }
+    }
+
+    fn rejection_for_missing_update_handler(name: String) -> ActivationJobResult {
+        ActivationJobResult::UpdateRejected(Box::new(Failure {
+            message: format!("No update handler registered for update name {name}"),
+            ..Default::default()
+        }))
+    }
+
+    fn next_routine_id(&mut self) -> RoutineId {
+        let id = self.next_routine_id;
+        self.next_routine_id += 1;
+        id
+    }
+
+    fn start_signal_routine(&mut self, signal: SignalInvocation) -> ActivationJobResult {
+        let name = signal.name;
+        let data = DispatchData::from_named_payloads(
+            signal.args,
+            signal.headers,
+            self.ctx.payload_converter(),
+        );
+        let ctx = self.ctx.with_headers(data.headers);
+        if let Some(future) = W::dispatch_signal(ctx, &name, data.payloads, data.converter) {
+            let routine_id = self.next_routine_id();
+            self.routines
+                .insert(routine_id, GuestRoutine::Signal { future });
+            ActivationJobResult::StartedRoutine(StartedRoutine {
+                routine_id,
+                kind: RoutineKind::Signal { name },
+            })
+        } else {
+            ActivationJobResult::None
+        }
+    }
+
+    fn start_update_routine(&mut self, update: UpdateInvocation) -> ActivationJobResult {
+        let protocol_instance_id = update.protocol_instance_id.clone();
+        let name = update.name.clone();
+        if update.run_validator {
+            let data = DispatchData::from_named_payloads(
+                update.args.clone(),
+                update.headers.clone(),
+                self.ctx.payload_converter(),
+            );
+            let view = self.ctx.view();
+            let validation = self
+                .ctx
+                .state(|wf| wf.validate_update(view, &update.name, &data.payloads, data.converter));
+            match validation {
+                Some(Ok(())) => {}
+                Some(Err(e)) => {
+                    return ActivationJobResult::UpdateRejected(Box::new(e.into()));
+                }
+                None => return Self::rejection_for_missing_update_handler(name),
+            }
+        }
+
+        let data = DispatchData::from_named_payloads(
+            update.args,
+            update.headers,
+            self.ctx.payload_converter(),
+        );
+        let ctx = self.ctx.with_headers(data.headers);
+        if let Some(future) = W::dispatch_update(ctx, &name, data.payloads, data.converter) {
+            let routine_id = self.next_routine_id();
+            self.routines.insert(
+                routine_id,
+                GuestRoutine::Update {
+                    protocol_instance_id: protocol_instance_id.clone(),
+                    future,
+                },
+            );
+            ActivationJobResult::StartedRoutine(StartedRoutine {
+                routine_id,
+                kind: RoutineKind::Update {
+                    name,
+                    update_id: update.update_id,
+                    protocol_instance_id,
+                },
+            })
+        } else {
+            Self::rejection_for_missing_update_handler(name)
+        }
+    }
+
+    fn query(&self, query: QueryInvocation) -> QueryResponse {
+        if query.name == "__temporal_workflow_metadata" {
+            return self.query_metadata();
+        }
+
+        let data = DispatchData::from_named_payloads(
+            query.args,
+            query.headers,
+            self.ctx.payload_converter(),
+        );
+        let view = self.ctx.view();
+        QueryResponse {
+            result: match self
+                .ctx
+                .state(|wf| wf.dispatch_query(view, &query.name, &data.payloads, data.converter))
+            {
+                Some(Ok(payload)) => Ok(payload),
+                None => Err(Failure {
+                    message: format!("No query handler for '{}'", query.name),
+                    ..Default::default()
+                }),
+                Some(Err(e)) => Err(e.into()),
+            },
+        }
+    }
+
+    fn apply_resolution(&mut self, resolution: WorkflowResolution) {
+        let event = match resolution {
+            WorkflowResolution::TimerFired(event) => {
+                UnblockEvent::Timer(event.seq, TimerResult::Fired)
+            }
+            WorkflowResolution::Activity(event) => {
+                UnblockEvent::Activity(event.seq, Box::new(event.result))
+            }
+            WorkflowResolution::ChildWorkflowStart(event) => {
+                UnblockEvent::WorkflowStart(event.seq, Box::new(event.status))
+            }
+            WorkflowResolution::ChildWorkflow(event) => {
+                UnblockEvent::WorkflowComplete(event.seq, Box::new(event.result))
+            }
+            WorkflowResolution::ExternalSignal(event) => {
+                UnblockEvent::SignalExternal(event.seq, event.failure)
+            }
+            WorkflowResolution::ExternalCancel(event) => {
+                UnblockEvent::CancelExternal(event.seq, event.failure)
+            }
+            WorkflowResolution::NexusStart(event) => {
+                UnblockEvent::NexusOperationStart(event.seq, Box::new(event.status))
+            }
+            WorkflowResolution::Nexus(event) => {
+                UnblockEvent::NexusOperationComplete(event.seq, Box::new(event.result))
+            }
+        };
+        self.base_ctx
+            .unblock(event)
+            .expect("resolution must have a registered unblocker");
+    }
+
+    fn terminal_outcome_from_result(
+        result: WorkflowResult<Payload>,
+    ) -> crate::runtime::types::TerminalOutcome {
+        match result {
+            Ok(result) => crate::runtime::types::TerminalOutcome::Completed(result),
+            Err(WorkflowTermination::ContinueAsNew(req)) => {
+                crate::runtime::types::TerminalOutcome::ContinueAsNew(*req)
+            }
+            Err(WorkflowTermination::Cancelled) => {
+                crate::runtime::types::TerminalOutcome::Cancelled
+            }
+            Err(WorkflowTermination::Evicted) => {
+                panic!("workflow instances must not explicitly return eviction")
+            }
+            Err(WorkflowTermination::Failed(err)) => {
+                crate::runtime::types::TerminalOutcome::Failed(Box::new(Failure {
+                    message: format!("Workflow execution error: {err}"),
+                    ..Default::default()
+                }))
+            }
+        }
+    }
+
+    fn forced_failure(base_ctx: &BaseWorkflowContext) -> Option<WorkflowFailure> {
+        base_ctx.take_forced_wft_failure().map(|err| {
+            Box::new(Failure {
+                message: err.to_string(),
+                ..Default::default()
+            })
+        })
+    }
+
+    fn poll_routine_loop<F: Future + Unpin>(
+        base_ctx: &BaseWorkflowContext,
+        cx: &mut Context<'_>,
+        future: &mut F,
+    ) -> RoutinePollState<F::Output> {
+        base_ctx.take_state_mutated();
+        base_ctx.take_runtime_progress();
+        let mut made_progress = false;
+
+        loop {
+            if let Some(failure) = Self::forced_failure(base_ctx) {
+                return RoutinePollState::ForcedFailure {
+                    failure,
+                    made_progress,
+                };
+            }
+
+            match future.poll_unpin(cx) {
+                Poll::Ready(result) => {
+                    let state_mutated = base_ctx.take_state_mutated();
+                    let runtime_progress = base_ctx.take_runtime_progress();
+                    made_progress |= state_mutated || runtime_progress;
+                    return RoutinePollState::Ready {
+                        result,
+                        made_progress,
+                    };
+                }
+                Poll::Pending => {
+                    let state_mutated = base_ctx.take_state_mutated();
+                    let runtime_progress = base_ctx.take_runtime_progress();
+                    made_progress |= state_mutated || runtime_progress;
+                    if !(state_mutated || runtime_progress) {
+                        return RoutinePollState::Stalled { made_progress };
+                    }
+                }
+            }
+        }
+    }
+
+    fn poll_main_routine(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Result<RoutinePollResult, WorkflowFailure> {
+        Ok(
+            match Self::poll_routine_loop(&self.base_ctx, cx, &mut self.run_future) {
+                RoutinePollState::Ready {
+                    result,
+                    made_progress,
+                } => RoutinePollResult {
+                    completion: Some(Box::new(RoutineCompletion::Main(
+                        MainRoutineCompletion::Terminal(Box::new(
+                            Self::terminal_outcome_from_result(result),
+                        )),
+                    ))),
+                    made_progress,
+                },
+                RoutinePollState::ForcedFailure {
+                    failure,
+                    made_progress,
+                } => RoutinePollResult {
+                    completion: Some(Box::new(RoutineCompletion::Main(
+                        MainRoutineCompletion::TaskFailed(crate::runtime::types::TaskFailure {
+                            failure,
+                            force_cause: None,
+                        }),
+                    ))),
+                    made_progress,
+                },
+                RoutinePollState::Stalled { made_progress } => RoutinePollResult {
+                    completion: Some(Box::new(RoutineCompletion::Main(
+                        MainRoutineCompletion::Blocked,
+                    ))),
+                    made_progress,
+                },
+            },
+        )
+    }
+
+    fn poll_signal_routine(
+        &mut self,
+        routine_id: RoutineId,
+        mut future: LocalBoxFuture<'static, Result<(), WorkflowError>>,
+        cx: &mut Context<'_>,
+    ) -> Result<RoutinePollResult, WorkflowFailure> {
+        match Self::poll_routine_loop(&self.base_ctx, cx, &mut future) {
+            RoutinePollState::Ready {
+                result,
+                made_progress,
+            } => {
+                let result = result.map_err(|err| {
+                    Box::new(Failure {
+                        message: format!("Signal handler error: {err}"),
+                        ..Default::default()
+                    })
+                });
+                Ok(RoutinePollResult {
+                    completion: Some(Box::new(RoutineCompletion::Signal(result))),
+                    made_progress,
+                })
+            }
+            RoutinePollState::ForcedFailure { failure, .. } => Err(failure),
+            RoutinePollState::Stalled { made_progress } => {
+                self.routines
+                    .insert(routine_id, GuestRoutine::Signal { future });
+                Ok(RoutinePollResult {
+                    completion: None,
+                    made_progress,
+                })
+            }
+        }
+    }
+
+    fn poll_update_routine(
+        &mut self,
+        routine_id: RoutineId,
+        protocol_instance_id: String,
+        mut future: LocalBoxFuture<'static, Result<Payload, WorkflowError>>,
+        cx: &mut Context<'_>,
+    ) -> Result<RoutinePollResult, WorkflowFailure> {
+        match Self::poll_routine_loop(&self.base_ctx, cx, &mut future) {
+            RoutinePollState::Ready {
+                result,
+                made_progress,
+            } => {
+                let completion = match result {
+                    Ok(result) => UpdateRoutineCompletion::Completed {
+                        protocol_instance_id,
+                        result,
+                    },
+                    Err(err) => UpdateRoutineCompletion::Rejected {
+                        protocol_instance_id,
+                        failure: Box::new(err.into()),
+                    },
+                };
+                Ok(RoutinePollResult {
+                    completion: Some(Box::new(RoutineCompletion::Update(completion))),
+                    made_progress,
+                })
+            }
+            RoutinePollState::ForcedFailure { failure, .. } => Err(failure),
+            RoutinePollState::Stalled { made_progress } => {
+                self.routines.insert(
+                    routine_id,
+                    GuestRoutine::Update {
+                        protocol_instance_id,
+                        future,
+                    },
+                );
+                Ok(RoutinePollResult {
+                    completion: None,
+                    made_progress,
+                })
+            }
+        }
+    }
+}
+
+impl<W: WorkflowImplementation> WorkflowInstance for GuestWorkflowInstance<W>
+where
+    <W::Run as WorkflowDefinition>::Input: Send,
+{
+    fn activate(
+        &mut self,
+        activation: WorkflowActivation,
+    ) -> Result<ActivationResult, WorkflowFailure> {
+        self.base_ctx.apply_activation_context(&activation.context);
+        let mut job_results = Vec::with_capacity(activation.jobs.len());
+        for job in activation.jobs {
+            let result = match job {
+                WorkflowActivationJob::NotifyPatch { patch_id } => {
+                    self.base_ctx.record_patch(patch_id, true);
+                    ActivationJobResult::None
+                }
+                WorkflowActivationJob::Cancel { reason } => {
+                    self.base_ctx.notify_cancel(reason);
+                    ActivationJobResult::None
+                }
+                WorkflowActivationJob::Signal(signal) => self.start_signal_routine(signal),
+                WorkflowActivationJob::Update(update) => self.start_update_routine(update),
+                WorkflowActivationJob::Query(query) => {
+                    ActivationJobResult::QueryResponse(Box::new(self.query(query)))
+                }
+                WorkflowActivationJob::Resolution(resolution) => {
+                    self.apply_resolution(resolution);
+                    ActivationJobResult::None
+                }
+            };
+            job_results.push(result);
+        }
+        Ok(ActivationResult { job_results })
+    }
+
+    fn poll_routine(
+        &mut self,
+        routine_id: RoutineId,
+        waker: &Waker,
+    ) -> Result<RoutinePollResult, WorkflowFailure> {
+        let mut cx = Context::from_waker(waker);
+        if routine_id == MAIN_ROUTINE_ID {
+            return self.poll_main_routine(&mut cx);
+        }
+
+        let routine = self.routines.remove(&routine_id).ok_or_else(|| {
+            Box::new(Failure {
+                message: format!("No routine registered for id {routine_id}"),
+                ..Default::default()
+            })
+        })?;
+
+        match routine {
+            GuestRoutine::Signal { future } => {
+                self.poll_signal_routine(routine_id, future, &mut cx)
+            }
+            GuestRoutine::Update {
+                protocol_instance_id,
+                future,
+            } => self.poll_update_routine(routine_id, protocol_instance_id, future, &mut cx),
+        }
+    }
+}
+
+pub fn instantiate_workflow<W: WorkflowImplementation>(
+    payloads: Vec<Payload>,
+    converter: PayloadConverter,
+    base_ctx: BaseWorkflowContext,
+) -> Result<Box<dyn WorkflowInstance>, PayloadConversionError>
+where
+    <W::Run as WorkflowDefinition>::Input: Send,
+{
+    GuestWorkflowInstance::<W>::instantiate(payloads, converter, base_ctx)
+}
