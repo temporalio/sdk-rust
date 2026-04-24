@@ -47,10 +47,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let out = PathBuf::from(env::var("OUT_DIR").unwrap());
     let descriptor_file = out.join("descriptors.bin");
     let mut builder = tonic_prost_build::configure()
-        // We don't actually want to build the grpc definitions - we don't need them (for now).
-        // Just build the message structs.
+        // Workflow guests need message structs, while the native common crate enables this
+        // feature to preserve the generated clients it re-exports today.
         .build_server(false)
-        .build_client(true)
+        .build_client(env::var_os("CARGO_FEATURE_GRPC_CLIENTS").is_some())
         // Make conversions easier for some types
         .type_attribute(
             "temporal.api.history.v1.HistoryEvent.attributes",

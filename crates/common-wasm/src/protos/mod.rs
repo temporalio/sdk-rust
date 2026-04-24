@@ -2597,12 +2597,12 @@ pub mod temporal {
                     },
                 };
                 use anyhow::{anyhow, bail};
+                use http::Uri;
                 use prost::Name;
                 use std::{
                     collections::HashMap,
                     fmt::{Display, Formatter},
                 };
-                use tonic::transport::Uri;
 
                 tonic::include_proto!("temporal.api.nexus.v1");
 

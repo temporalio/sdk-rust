@@ -6,7 +6,7 @@
 //! Example usage:
 //! ```
 //! use temporalio_macros::{workflow, workflow_methods};
-//! use temporalio_sdk::{
+//! use temporalio_workflow::{
 //!     SyncWorkflowContext, WorkflowContext, WorkflowContextView, WorkflowResult,
 //! };
 //!

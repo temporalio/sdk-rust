@@ -1,7 +1,8 @@
 //! Runtime entry traits implemented by workflow definitions and message handlers.
 
 use crate::{
-    SyncWorkflowContext, WorkflowContext, WorkflowContextView, runtime::model::WorkflowTermination,
+    SyncWorkflowContext, WorkflowContext, WorkflowContextView,
+    runtime::{model::WorkflowTermination, types::WorkflowDefinitionDescriptor},
 };
 use futures_util::future::{FutureExt, LocalBoxFuture};
 use temporalio_common_wasm::{
@@ -55,6 +56,9 @@ pub trait WorkflowImplementation: Sized + 'static {
 
     /// Returns the workflow type name.
     fn name() -> &'static str;
+
+    /// Returns the exported workflow definition metadata for this workflow.
+    fn definition() -> WorkflowDefinitionDescriptor;
 
     /// Initialize the workflow instance.
     fn init(

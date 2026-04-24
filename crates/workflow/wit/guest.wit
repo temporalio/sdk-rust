@@ -1,18 +1,20 @@
 package temporal:workflow-runtime@0.1.0;
 
 interface workflow-guest {
-  list-workflows: func() -> list<types.workflow-definition>;
+  use types.{activation-result, failure, routine-id, routine-poll-result, workflow-activation, workflow-definition, workflow-init};
+
+  list-workflows: func() -> list<workflow-definition>;
 
   instantiate-workflow:
-    func(workflow-type: string, init: types.workflow-init, args: list<types.payload>)
-    -> result<workflow-instance, types.failure>;
+    func(init: workflow-init)
+    -> result<workflow-instance, failure>;
 
   resource workflow-instance {
     activate:
-      func(activation: types.workflow-activation)
-      -> result<types.activation-result, types.failure>;
+      func(activation: workflow-activation)
+      -> result<activation-result, failure>;
     poll-routine:
-      func(routine-id: types.routine-id)
-      -> result<types.routine-poll-result, types.failure>;
+      func(routine-id: routine-id)
+      -> result<routine-poll-result, failure>;
   }
 }

@@ -3,25 +3,9 @@
 #![allow(missing_docs)]
 
 use crate::runtime::types::{
-    ActivationResult, RoutineId, RoutinePollResult, WorkflowActivation,
-    WorkflowDefinitionDescriptor, WorkflowFailure, WorkflowInit,
+    ActivationResult, RoutineId, RoutinePollResult, WorkflowActivation, WorkflowFailure,
 };
 use std::task::Waker;
-use temporalio_common_wasm::protos::temporal::api::common::v1::Payload;
-
-/// Runtime-facing workflow module interface for native and WASM backends.
-pub trait WorkflowModule {
-    /// List workflow definitions exported by this module.
-    fn list_workflows(&self) -> Vec<WorkflowDefinitionDescriptor>;
-
-    /// Instantiate a workflow run by workflow type.
-    fn instantiate_workflow(
-        &self,
-        workflow_type: &str,
-        init: WorkflowInit,
-        args: Vec<Payload>,
-    ) -> Result<Box<dyn WorkflowInstance>, WorkflowFailure>;
-}
 
 /// Runtime-facing single-workflow execution interface for native and WASM backends.
 pub trait WorkflowInstance {

@@ -38,7 +38,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let out = PathBuf::from(env::var("OUT_DIR").unwrap());
     let descriptor_file = out.join("descriptors.bin");
 
-    let mut protoc = Command::new("protoc");
+    let mut protoc = Command::new(env::var_os("PROTOC").unwrap_or_else(|| "protoc".into()));
     protoc.arg(format!(
         "--descriptor_set_out={}",
         descriptor_file.display()

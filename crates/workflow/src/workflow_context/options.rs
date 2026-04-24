@@ -1,25 +1,30 @@
 use std::{collections::HashMap, time::Duration};
 
-use crate::runtime::types::{
-    ContinueAsNewRequest, IntoNamedPayloads, ScheduleActivityRequest, ScheduleLocalActivityRequest,
-    ScheduleNexusOperationRequest, SignalInvocation, StartChildWorkflowRequest, StartTimerRequest,
-    StringHeader,
-};
+use crate::runtime::types::ContinueAsNewRequest;
 use temporalio_common_wasm::{
     Priority,
+    data_converters::{
+        GenericPayloadConverter, PayloadConverter, SerializationContext, SerializationContextData,
+    },
     protos::{
         coresdk::{
-            child_workflow::ChildWorkflowCancellationType, common::VersioningIntent,
-            nexus::NexusOperationCancellationType, workflow_commands::ActivityCancellationType,
+            child_workflow::{ChildWorkflowCancellationType, ParentClosePolicy},
+            common::VersioningIntent,
+            nexus::NexusOperationCancellationType,
+            workflow_activation::SignalWorkflow,
+            workflow_commands::{
+                ActivityCancellationType, ContinueAsNewWorkflowExecution, ScheduleActivity,
+                ScheduleLocalActivity, ScheduleNexusOperation, StartChildWorkflowExecution,
+                StartTimer, WorkflowCommand, workflow_command,
+            },
         },
         temporal::api::{
             common::v1::{Payload, RetryPolicy, SearchAttributes},
-            enums::v1::{ParentClosePolicy, WorkflowIdReusePolicy},
+            enums::v1::{ContinueAsNewVersioningBehavior, WorkflowIdReusePolicy},
+            sdk::v1::UserMetadata,
         },
     },
 };
-// TODO: Before release, probably best to avoid using proto types entirely here. They're awkward.
-
 /// Options for scheduling an activity
 #[derive(Debug, bon::Builder, Clone)]
 #[non_exhaustive]
@@ -128,30 +133,40 @@ impl ActivityCloseTimeouts {
 }
 
 impl ActivityOptions {
-    pub(crate) fn into_request(
+    pub(crate) fn into_command(
         self,
         seq: u32,
         activity_type: String,
         args: Vec<Payload>,
-    ) -> ScheduleActivityRequest {
+    ) -> WorkflowCommand {
         let (start_to_close_timeout, schedule_to_close_timeout) =
             self.close_timeouts.into_durations();
-        ScheduleActivityRequest {
-            seq,
-            activity_type,
-            activity_id: self.activity_id,
-            task_queue: self.task_queue,
-            args,
-            schedule_to_close_timeout,
-            schedule_to_start_timeout: self.schedule_to_start_timeout,
-            start_to_close_timeout,
-            heartbeat_timeout: self.heartbeat_timeout,
-            cancellation_type: self.cancellation_type,
-            retry_policy: self.retry_policy,
-            priority: self.priority,
-            summary: self.summary,
-            do_not_eagerly_execute: self.do_not_eagerly_execute,
-        }
+        command_with_metadata(
+            workflow_command::Variant::ScheduleActivity(ScheduleActivity {
+                seq,
+                activity_type,
+                activity_id: self.activity_id.unwrap_or_else(|| seq.to_string()),
+                task_queue: self.task_queue.unwrap_or_default(),
+                arguments: args,
+                schedule_to_close_timeout: schedule_to_close_timeout
+                    .and_then(|duration| duration.try_into().ok()),
+                schedule_to_start_timeout: self
+                    .schedule_to_start_timeout
+                    .and_then(|duration| duration.try_into().ok()),
+                start_to_close_timeout: start_to_close_timeout
+                    .and_then(|duration| duration.try_into().ok()),
+                heartbeat_timeout: self
+                    .heartbeat_timeout
+                    .and_then(|duration| duration.try_into().ok()),
+                cancellation_type: self.cancellation_type.into(),
+                retry_policy: self.retry_policy,
+                priority: self.priority.map(Into::into),
+                do_not_eagerly_execute: self.do_not_eagerly_execute,
+                ..Default::default()
+            }),
+            self.summary,
+            None,
+        )
     }
 }
 
@@ -196,31 +211,43 @@ pub struct LocalActivityOptions {
 }
 
 impl LocalActivityOptions {
-    pub(crate) fn into_request(
+    pub(crate) fn into_command(
         mut self,
         seq: u32,
         activity_type: String,
         args: Vec<Payload>,
-    ) -> ScheduleLocalActivityRequest {
+    ) -> WorkflowCommand {
         // Tests and some workflow code rely on the historical SDK behavior where omitted local
         // activity timeouts are normalized before the command is emitted.
         self.schedule_to_close_timeout
             .get_or_insert(Duration::from_secs(100));
-        ScheduleLocalActivityRequest {
-            seq,
-            activity_type,
-            activity_id: self.activity_id,
-            args,
-            retry_policy: self.retry_policy,
-            attempt: self.attempt,
-            original_schedule_time: self.original_schedule_time.and_then(|t| t.try_into().ok()),
-            timer_backoff_threshold: self.timer_backoff_threshold,
-            cancellation_type: self.cancel_type,
-            schedule_to_close_timeout: self.schedule_to_close_timeout,
-            schedule_to_start_timeout: self.schedule_to_start_timeout,
-            start_to_close_timeout: self.start_to_close_timeout,
-            summary: self.summary,
-        }
+        command_with_metadata(
+            workflow_command::Variant::ScheduleLocalActivity(ScheduleLocalActivity {
+                seq,
+                activity_type,
+                activity_id: self.activity_id.unwrap_or_else(|| seq.to_string()),
+                arguments: args,
+                retry_policy: Some(self.retry_policy),
+                attempt: self.attempt.unwrap_or(1),
+                original_schedule_time: self.original_schedule_time,
+                local_retry_threshold: self
+                    .timer_backoff_threshold
+                    .and_then(|duration| duration.try_into().ok()),
+                cancellation_type: self.cancel_type.into(),
+                schedule_to_close_timeout: self
+                    .schedule_to_close_timeout
+                    .and_then(|duration| duration.try_into().ok()),
+                schedule_to_start_timeout: self
+                    .schedule_to_start_timeout
+                    .and_then(|duration| duration.try_into().ok()),
+                start_to_close_timeout: self
+                    .start_to_close_timeout
+                    .and_then(|duration| duration.try_into().ok()),
+                ..Default::default()
+            }),
+            self.summary,
+            None,
+        )
     }
 }
 
@@ -258,33 +285,47 @@ pub struct ChildWorkflowOptions {
 }
 
 impl ChildWorkflowOptions {
-    pub(crate) fn into_request(
+    pub(crate) fn into_command(
         self,
         seq: u32,
         workflow_type: String,
         args: Vec<Payload>,
-    ) -> StartChildWorkflowRequest {
-        StartChildWorkflowRequest {
-            seq,
-            workflow_type,
-            workflow_id: self.workflow_id,
-            task_queue: self.task_queue,
-            args,
-            cancellation_type: self.cancel_type,
-            parent_close_policy: self.parent_close_policy,
-            static_summary: self.static_summary,
-            static_details: self.static_details,
-            id_reuse_policy: self.id_reuse_policy,
-            execution_timeout: self.execution_timeout,
-            run_timeout: self.run_timeout,
-            task_timeout: self.task_timeout,
-            cron_schedule: self.cron_schedule,
-            search_attributes: self
-                .search_attributes
-                .unwrap_or_default()
-                .into_named_payloads(),
-            priority: self.priority,
-        }
+    ) -> WorkflowCommand {
+        command_with_metadata(
+            workflow_command::Variant::StartChildWorkflowExecution(StartChildWorkflowExecution {
+                seq,
+                workflow_type,
+                workflow_id: self.workflow_id,
+                task_queue: self.task_queue.unwrap_or_default(),
+                input: args,
+                cancellation_type: self.cancel_type.into(),
+                parent_close_policy: self.parent_close_policy.into(),
+                workflow_id_reuse_policy: match self.id_reuse_policy {
+                    WorkflowIdReusePolicy::Unspecified => WorkflowIdReusePolicy::AllowDuplicate,
+                    policy => policy,
+                }
+                .into(),
+                workflow_execution_timeout: self
+                    .execution_timeout
+                    .and_then(|duration| duration.try_into().ok()),
+                workflow_run_timeout: self
+                    .run_timeout
+                    .and_then(|duration| duration.try_into().ok()),
+                workflow_task_timeout: self
+                    .task_timeout
+                    .and_then(|duration| duration.try_into().ok()),
+                cron_schedule: self.cron_schedule.unwrap_or_default(),
+                search_attributes: self.search_attributes.and_then(|attrs| {
+                    (!attrs.is_empty()).then_some(SearchAttributes {
+                        indexed_fields: attrs,
+                    })
+                }),
+                priority: self.priority.map(Into::into),
+                ..Default::default()
+            }),
+            self.static_summary,
+            self.static_details,
+        )
     }
 }
 
@@ -309,11 +350,12 @@ impl Signal {
         }
     }
 
-    pub(crate) fn into_invocation(self) -> SignalInvocation {
-        SignalInvocation {
-            name: self.signal_name,
-            args: self.data.input,
-            headers: self.data.headers.into_named_payloads(),
+    pub(crate) fn into_invocation(self) -> SignalWorkflow {
+        SignalWorkflow {
+            signal_name: self.signal_name,
+            input: self.data.input,
+            identity: String::new(),
+            headers: self.data.headers,
         }
     }
 }
@@ -366,12 +408,19 @@ impl From<Duration> for TimerOptions {
 }
 
 impl TimerOptions {
-    pub(crate) fn into_request(self, seq: u32) -> StartTimerRequest {
-        StartTimerRequest {
-            seq,
-            timeout: self.duration,
-            summary: self.summary,
-        }
+    pub(crate) fn into_command(self, seq: u32) -> WorkflowCommand {
+        command_with_metadata(
+            workflow_command::Variant::StartTimer(StartTimer {
+                seq,
+                start_to_fire_timeout: Some(
+                    self.duration
+                        .try_into()
+                        .expect("workflow timer timeout must fit into protobuf duration"),
+                ),
+            }),
+            self.summary,
+            None,
+        )
     }
 }
 
@@ -418,21 +467,29 @@ pub struct NexusOperationOptions {
 }
 
 impl NexusOperationOptions {
-    pub(crate) fn into_request(self, seq: u32) -> ScheduleNexusOperationRequest {
-        ScheduleNexusOperationRequest {
+    pub(crate) fn into_command(self, seq: u32) -> WorkflowCommand {
+        workflow_command::Variant::ScheduleNexusOperation(ScheduleNexusOperation {
             seq,
             endpoint: self.endpoint,
             service: self.service,
             operation: self.operation,
             input: self.input,
-            schedule_to_close_timeout: self.schedule_to_close_timeout,
-            schedule_to_start_timeout: self.schedule_to_start_timeout,
-            start_to_close_timeout: self.start_to_close_timeout,
-            headers: string_headers(self.nexus_header),
-            cancellation_type: self.cancellation_type.unwrap_or(
-                temporalio_common_wasm::protos::coresdk::nexus::NexusOperationCancellationType::WaitCancellationCompleted,
-            ),
-        }
+            schedule_to_close_timeout: self
+                .schedule_to_close_timeout
+                .and_then(|duration| duration.try_into().ok()),
+            schedule_to_start_timeout: self
+                .schedule_to_start_timeout
+                .and_then(|duration| duration.try_into().ok()),
+            start_to_close_timeout: self
+                .start_to_close_timeout
+                .and_then(|duration| duration.try_into().ok()),
+            nexus_header: self.nexus_header,
+            cancellation_type: self
+                .cancellation_type
+                .unwrap_or(NexusOperationCancellationType::WaitCancellationCompleted)
+                .into(),
+        })
+        .into()
     }
 }
 
@@ -469,32 +526,61 @@ impl ContinueAsNewOptions {
         workflow_type: String,
         arguments: Vec<Payload>,
     ) -> ContinueAsNewRequest {
-        ContinueAsNewRequest {
-            workflow_type: Some(self.workflow_type.unwrap_or(workflow_type)),
-            task_queue: self.task_queue,
-            args: arguments,
-            run_timeout: self.run_timeout,
-            task_timeout: self.task_timeout,
-            memo: self.memo.unwrap_or_default().into_named_payloads(),
-            headers: self.headers.unwrap_or_default().into_named_payloads(),
-            search_attributes: self
-                .search_attributes
-                .map(|attrs| attrs.indexed_fields.into_named_payloads()),
+        ContinueAsNewWorkflowExecution {
+            workflow_type: self.workflow_type.unwrap_or(workflow_type),
+            task_queue: self.task_queue.unwrap_or_default(),
+            arguments,
+            workflow_run_timeout: self
+                .run_timeout
+                .and_then(|duration| duration.try_into().ok()),
+            workflow_task_timeout: self
+                .task_timeout
+                .and_then(|duration| duration.try_into().ok()),
+            memo: self.memo.unwrap_or_default(),
+            headers: self.headers.unwrap_or_default(),
+            search_attributes: self.search_attributes,
             retry_policy: self.retry_policy,
-            versioning_intent: Some(
-                self.versioning_intent
-                    .unwrap_or(VersioningIntent::Unspecified),
-            ),
-            initial_versioning_behavior: None,
+            versioning_intent: self
+                .versioning_intent
+                .unwrap_or(VersioningIntent::Unspecified)
+                .into(),
+            initial_versioning_behavior: ContinueAsNewVersioningBehavior::Unspecified.into(),
         }
     }
 }
 
-fn string_headers(entries: impl IntoIterator<Item = (String, String)>) -> Vec<StringHeader> {
-    entries
-        .into_iter()
-        .map(|(key, value)| StringHeader { key, value })
-        .collect()
+fn command_with_metadata(
+    variant: workflow_command::Variant,
+    summary: Option<String>,
+    details: Option<String>,
+) -> WorkflowCommand {
+    WorkflowCommand {
+        variant: Some(variant),
+        user_metadata: string_user_metadata(summary, details),
+    }
+}
+
+fn string_user_metadata(summary: Option<String>, details: Option<String>) -> Option<UserMetadata> {
+    if summary.is_none() && details.is_none() {
+        return None;
+    }
+    let converter = PayloadConverter::default();
+    let context = SerializationContext {
+        data: &SerializationContextData::Workflow,
+        converter: &converter,
+    };
+    Some(UserMetadata {
+        summary: summary.map(|value| {
+            converter
+                .to_payload(&context, &value)
+                .expect("String-to-JSON payload serialization is infallible")
+        }),
+        details: details.map(|value| {
+            converter
+                .to_payload(&context, &value)
+                .expect("String-to-JSON payload serialization is infallible")
+        }),
+    })
 }
 
 #[cfg(test)]
@@ -534,9 +620,12 @@ mod tests {
             schedule_to_close: Duration::from_secs(8),
         })
         .build()
-        .into_request(7, "test".to_string(), vec![]);
-        assert_eq!(req.start_to_close_timeout.unwrap().as_secs(), 3);
-        assert_eq!(req.schedule_to_close_timeout.unwrap().as_secs(), 8);
+        .into_command(7, "test".to_string(), vec![]);
+        let Some(workflow_command::Variant::ScheduleActivity(req)) = req.variant else {
+            panic!("expected ScheduleActivity command");
+        };
+        assert_eq!(req.start_to_close_timeout.unwrap().seconds, 3);
+        assert_eq!(req.schedule_to_close_timeout.unwrap().seconds, 8);
     }
 
     #[test]
@@ -547,11 +636,15 @@ mod tests {
             run_timeout: Some(Duration::from_secs(10)),
             ..Default::default()
         };
-        let req = opts.into_request(1, "TestWorkflow".to_string(), vec![]);
-        let exec_timeout = req.execution_timeout.unwrap();
-        let run_timeout = req.run_timeout.unwrap();
-        assert_eq!(exec_timeout.as_secs(), 60);
-        assert_eq!(run_timeout.as_secs(), 10);
+        let command = opts.into_command(1, "TestWorkflow".to_string(), vec![]);
+        let Some(workflow_command::Variant::StartChildWorkflowExecution(req)) = command.variant
+        else {
+            panic!("expected StartChildWorkflowExecution command");
+        };
+        let exec_timeout = req.workflow_execution_timeout.unwrap();
+        let run_timeout = req.workflow_run_timeout.unwrap();
+        assert_eq!(exec_timeout.seconds, 60);
+        assert_eq!(run_timeout.seconds, 10);
     }
 
     #[test]
@@ -561,9 +654,13 @@ mod tests {
             execution_timeout: Some(Duration::from_secs(60)),
             ..Default::default()
         };
-        let req = opts.into_request(1, "TestWorkflow".to_string(), vec![]);
-        let exec_timeout = req.execution_timeout.unwrap();
-        assert_eq!(exec_timeout.as_secs(), 60);
-        assert!(req.run_timeout.is_none());
+        let command = opts.into_command(1, "TestWorkflow".to_string(), vec![]);
+        let Some(workflow_command::Variant::StartChildWorkflowExecution(req)) = command.variant
+        else {
+            panic!("expected StartChildWorkflowExecution command");
+        };
+        let exec_timeout = req.workflow_execution_timeout.unwrap();
+        assert_eq!(exec_timeout.seconds, 60);
+        assert!(req.workflow_run_timeout.is_none());
     }
 }

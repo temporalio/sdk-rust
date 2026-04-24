@@ -11,7 +11,8 @@ use temporalio_common::{
         coresdk::{
             AsJsonPayloadExt,
             child_workflow::{
-                ChildWorkflowCancellationType, StartChildWorkflowExecutionFailedCause,
+                ChildWorkflowCancellationType, ParentClosePolicy,
+                StartChildWorkflowExecutionFailedCause,
             },
             workflow_activation::{WorkflowActivationJob, workflow_activation_job},
             workflow_commands::{
@@ -21,7 +22,7 @@ use temporalio_common::{
             workflow_completion::WorkflowActivationCompletion,
         },
         temporal::api::{
-            enums::v1::{CommandType, EventType, ParentClosePolicy, WorkflowTaskFailedCause},
+            enums::v1::{CommandType, EventType, WorkflowTaskFailedCause},
             history::v1::{
                 StartChildWorkflowExecutionFailedEventAttributes,
                 StartChildWorkflowExecutionInitiatedEventAttributes, history_event,

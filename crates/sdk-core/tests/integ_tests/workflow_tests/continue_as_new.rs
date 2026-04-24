@@ -93,8 +93,8 @@ impl WfWithTimer {
     async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<()> {
         ctx.timer(Duration::from_millis(500)).await;
         Err(WorkflowTermination::continue_as_new(ContinueAsNewRequest {
-            args: vec![[1].into()],
-            initial_versioning_behavior: Some(ContinueAsNewVersioningBehavior::AutoUpgrade),
+            arguments: vec![[1].into()],
+            initial_versioning_behavior: ContinueAsNewVersioningBehavior::AutoUpgrade.into(),
             ..Default::default()
         }))
     }

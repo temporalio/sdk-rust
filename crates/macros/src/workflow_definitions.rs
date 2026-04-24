@@ -68,41 +68,6 @@ fn generate_method_call(prefixed_method: &syn::Ident, has_input: bool) -> TokenS
     }
 }
 
-/// Generate an async handler body. The async move block is required because the underlying
-/// method borrows ctx, and we need to move ctx into the block to make the future 'static.
-fn generate_async_handler_body(
-    impl_type: &Type,
-    prefixed_method: &syn::Ident,
-    has_input: bool,
-) -> TokenStream2 {
-    let method_call = if has_input {
-        quote! { #impl_type::#prefixed_method(&mut ctx, input) }
-    } else {
-        quote! { #impl_type::#prefixed_method(&mut ctx) }
-    };
-    quote! { async move { #method_call.await }.boxed_local() }
-}
-
-/// Generate an async update handler body that returns Result.
-/// If is_fallible, the method already returns Result; otherwise wrap in Ok via .map().
-fn generate_async_update_handler_body(
-    impl_type: &Type,
-    prefixed_method: &syn::Ident,
-    has_input: bool,
-    is_fallible: bool,
-) -> TokenStream2 {
-    let method_call = if has_input {
-        quote! { #impl_type::#prefixed_method(&mut ctx, input) }
-    } else {
-        quote! { #impl_type::#prefixed_method(&mut ctx) }
-    };
-    if is_fallible {
-        quote! { async move { #method_call.await }.boxed_local() }
-    } else {
-        quote! { async move { #method_call.await }.map(Ok).boxed_local() }
-    }
-}
-
 /// Parsed representation of a `#[workflow_methods]` impl block
 pub(crate) struct WorkflowMethodsDefinition {
     impl_block: ItemImpl,
@@ -772,16 +737,21 @@ impl WorkflowMethodsDefinition {
 
         let has_input = signal.input_type.is_some();
         let executable_impl = if signal.is_async {
-            let handle_body =
-                generate_async_handler_body(impl_type, &info.prefixed_method, has_input);
+            let prefixed_method = &info.prefixed_method;
+            let method_call = if has_input {
+                quote! { #impl_type::#prefixed_method(&mut ctx, input) }
+            } else {
+                quote! { #impl_type::#prefixed_method(&mut ctx) }
+            };
             quote! {
                 impl ::temporalio_workflow::workflows::ExecutableAsyncSignal<#module_ident::#struct_ident> for #impl_type {
                     fn handle(
                         mut ctx: ::temporalio_workflow::WorkflowContext<Self>,
                         input: <#module_ident::#struct_ident as ::temporalio_workflow::common::SignalDefinition>::Input,
-                    ) -> ::futures_util::future::LocalBoxFuture<'static, ()> {
-                        use ::futures_util::FutureExt;
-                        #handle_body
+                    ) -> ::temporalio_workflow::__private::futures_util::future::LocalBoxFuture<'static, ()> {
+                        ::temporalio_workflow::__private::futures_util::FutureExt::boxed_local(
+                            async move { #method_call.await }
+                        )
                     }
                 }
             }
@@ -903,19 +873,34 @@ impl WorkflowMethodsDefinition {
         };
 
         let executable_impl = if update.is_async {
-            let handle_body = generate_async_update_handler_body(
-                impl_type,
-                &info.prefixed_method,
-                has_input,
-                update.is_fallible,
-            );
+            let prefixed_method = &info.prefixed_method;
+            let method_call = if has_input {
+                quote! { #impl_type::#prefixed_method(&mut ctx, input) }
+            } else {
+                quote! { #impl_type::#prefixed_method(&mut ctx) }
+            };
+            let handle_body = if update.is_fallible {
+                quote! {
+                    ::temporalio_workflow::__private::futures_util::FutureExt::boxed_local(
+                        async move { #method_call.await }
+                    )
+                }
+            } else {
+                quote! {
+                    ::temporalio_workflow::__private::futures_util::FutureExt::boxed_local(
+                        ::temporalio_workflow::__private::futures_util::FutureExt::map(
+                            async move { #method_call.await },
+                            Ok,
+                        )
+                    )
+                }
+            };
             quote! {
                 impl ::temporalio_workflow::workflows::ExecutableAsyncUpdate<#module_ident::#struct_ident> for #impl_type {
                     fn handle(
                         mut ctx: ::temporalio_workflow::WorkflowContext<Self>,
                         input: <#module_ident::#struct_ident as ::temporalio_workflow::common::UpdateDefinition>::Input,
-                    ) -> ::futures_util::future::LocalBoxFuture<'static, Result<<#module_ident::#struct_ident as ::temporalio_workflow::common::UpdateDefinition>::Output, Box<dyn ::std::error::Error + Send + Sync>>> {
-                        use ::futures_util::FutureExt;
+                    ) -> ::temporalio_workflow::__private::futures_util::future::LocalBoxFuture<'static, Result<<#module_ident::#struct_ident as ::temporalio_workflow::common::UpdateDefinition>::Output, Box<dyn ::std::error::Error + Send + Sync>>> {
                         #handle_body
                     }
 
@@ -1004,18 +989,31 @@ impl WorkflowMethodsDefinition {
         };
 
         let run_impl_body = quote! {
-            use ::futures_util::FutureExt;
-            async move {
+            ::temporalio_workflow::__private::futures_util::FutureExt::boxed_local(async move {
                 let result = #run_call;
                 match result {
                     Ok(value) => ::temporalio_workflow::workflows::serialize_result(value, &ctx.payload_converter())
                         .map_err(::temporalio_workflow::WorkflowTermination::from),
                     Err(e) => Err(e),
                 }
-            }.boxed_local()
+            })
         };
 
         // Generate signal dispatch match arms
+        let signal_names: Vec<TokenStream2> = self
+            .signals
+            .iter()
+            .map(|s| {
+                let info = HandlerCodegenInfo::new(
+                    &s.method,
+                    &s.attributes,
+                    s.input_type.as_ref(),
+                    module_ident,
+                );
+                let handler_name = &info.handler_name;
+                quote! { (#handler_name).to_string() }
+            })
+            .collect();
         let dispatch_signal_arms: Vec<TokenStream2> = self
             .signals
             .iter()
@@ -1051,7 +1049,7 @@ impl WorkflowMethodsDefinition {
                     name: &str,
                     payloads: ::temporalio_workflow::common::protos::temporal::api::common::v1::Payloads,
                     converter: &::temporalio_workflow::common::data_converters::PayloadConverter,
-                ) -> Option<::futures_util::future::LocalBoxFuture<'static, Result<(), ::temporalio_workflow::workflows::WorkflowError>>> {
+                ) -> Option<::temporalio_workflow::__private::futures_util::future::LocalBoxFuture<'static, Result<(), ::temporalio_workflow::workflows::WorkflowError>>> {
                     match name {
                         #(#dispatch_signal_arms)*
                         _ => None,
@@ -1081,6 +1079,27 @@ impl WorkflowMethodsDefinition {
                 } else {
                     quote! {
                         #handler_name => Some(<Self as ::temporalio_workflow::workflows::ExecutableSyncUpdate<#module_ident::#struct_ident>>::dispatch(ctx, payloads, converter)),
+                    }
+                }
+            })
+            .collect();
+
+        let update_definitions: Vec<TokenStream2> = self
+            .updates
+            .iter()
+            .map(|u| {
+                let info = HandlerCodegenInfo::new(
+                    &u.method,
+                    &u.attributes,
+                    u.input_type.as_ref(),
+                    module_ident,
+                );
+                let handler_name = &info.handler_name;
+                let has_validator = u.validator.is_some();
+                quote! {
+                    ::temporalio_workflow::runtime::types::UpdateDefinitionDescriptor {
+                        name: (#handler_name).to_string(),
+                        has_validator: #has_validator,
                     }
                 }
             })
@@ -1122,7 +1141,7 @@ impl WorkflowMethodsDefinition {
                     name: &str,
                     payloads: ::temporalio_workflow::common::protos::temporal::api::common::v1::Payloads,
                     converter: &::temporalio_workflow::common::data_converters::PayloadConverter,
-                ) -> Option<::futures_util::future::LocalBoxFuture<'static, Result<::temporalio_workflow::common::protos::temporal::api::common::v1::Payload, ::temporalio_workflow::workflows::WorkflowError>>> {
+                ) -> Option<::temporalio_workflow::__private::futures_util::future::LocalBoxFuture<'static, Result<::temporalio_workflow::common::protos::temporal::api::common::v1::Payload, ::temporalio_workflow::workflows::WorkflowError>>> {
                     match name {
                         #(#dispatch_update_arms)*
                         _ => None,
@@ -1146,6 +1165,20 @@ impl WorkflowMethodsDefinition {
         };
 
         // Generate dispatch_query match arms
+        let query_names: Vec<TokenStream2> = self
+            .queries
+            .iter()
+            .map(|q| {
+                let info = HandlerCodegenInfo::new(
+                    &q.method,
+                    &q.attributes,
+                    q.input_type.as_ref(),
+                    module_ident,
+                );
+                let handler_name = &info.handler_name;
+                quote! { (#handler_name).to_string() }
+            })
+            .collect();
         let dispatch_query_arms: Vec<TokenStream2> = self
             .queries
             .iter()
@@ -1196,6 +1229,17 @@ impl WorkflowMethodsDefinition {
                     <#impl_type>::name()
                 }
 
+                fn definition() -> ::temporalio_workflow::runtime::types::WorkflowDefinitionDescriptor {
+                    ::temporalio_workflow::runtime::types::WorkflowDefinitionDescriptor {
+                        workflow_type: Self::name().to_string(),
+                        has_init: #has_init,
+                        init_takes_input: #init_has_input,
+                        signals: vec![#(#signal_names),*],
+                        queries: vec![#(#query_names),*],
+                        updates: vec![#(#update_definitions),*],
+                    }
+                }
+
                 fn init(
                     ctx: ::temporalio_workflow::WorkflowContextView,
                     input: ::std::option::Option<<Self::Run as ::temporalio_workflow::common::WorkflowDefinition>::Input>,
@@ -1206,7 +1250,7 @@ impl WorkflowMethodsDefinition {
                 fn run(
                     mut ctx: ::temporalio_workflow::WorkflowContext<Self>,
                     input: ::std::option::Option<<Self::Run as ::temporalio_workflow::common::WorkflowDefinition>::Input>,
-                ) -> ::futures_util::future::LocalBoxFuture<'static, Result<::temporalio_workflow::common::protos::temporal::api::common::v1::Payload, ::temporalio_workflow::WorkflowTermination>> {
+                ) -> ::temporalio_workflow::__private::futures_util::future::LocalBoxFuture<'static, Result<::temporalio_workflow::common::protos::temporal::api::common::v1::Payload, ::temporalio_workflow::WorkflowTermination>> {
                     #run_impl_body
                 }
 

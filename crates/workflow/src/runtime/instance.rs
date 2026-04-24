@@ -10,11 +10,10 @@ use crate::{
         guest::WorkflowInstance,
         model::{TimerResult, UnblockEvent, WorkflowResult, WorkflowTermination},
         types::{
-            ActivationJobResult, ActivationResult, IntoPayloadMap, MAIN_ROUTINE_ID,
-            MainRoutineCompletion, NamedPayload, QueryInvocation, QueryResponse, RoutineCompletion,
-            RoutineId, RoutineKind, RoutinePollResult, SignalInvocation, StartedRoutine,
-            UpdateInvocation, UpdateRoutineCompletion, WorkflowActivation, WorkflowActivationJob,
-            WorkflowFailure, WorkflowResolution,
+            ActivationJobResult, ActivationResult, MAIN_ROUTINE_ID, MainRoutineCompletion,
+            QueryResponse, RoutineCompletion, RoutineId, RoutineKind, RoutinePollResult,
+            StartedRoutine, UpdateRoutineCompletion, UpdateRoutineKind, WorkflowActivation,
+            WorkflowFailure,
         },
     },
 };
@@ -34,9 +33,15 @@ use temporalio_common_wasm::{
         GenericPayloadConverter, PayloadConversionError, PayloadConverter, SerializationContext,
         SerializationContextData,
     },
-    protos::temporal::api::{
-        common::v1::{Payload, Payloads},
-        failure::v1::Failure,
+    protos::{
+        coresdk::workflow_activation::{
+            DoUpdate, QueryWorkflow, SignalWorkflow,
+            workflow_activation_job::Variant as ActivationVariant,
+        },
+        temporal::api::{
+            common::v1::{Payload, Payloads},
+            failure::v1::Failure,
+        },
     },
 };
 
@@ -72,24 +77,8 @@ enum RoutinePollState<T> {
     },
 }
 
-struct DispatchData<'a> {
-    payloads: Payloads,
-    headers: HashMap<String, Payload>,
-    converter: &'a PayloadConverter,
-}
-
-impl<'a> DispatchData<'a> {
-    fn from_named_payloads(
-        payloads: Vec<Payload>,
-        headers: Vec<NamedPayload>,
-        converter: &'a PayloadConverter,
-    ) -> Self {
-        Self {
-            payloads: Payloads { payloads },
-            headers: headers.into_payload_map(),
-            converter,
-        }
-    }
+fn expect_resolution<T>(value: Option<T>) -> T {
+    value.expect("resolution expected payload")
 }
 
 impl<W: WorkflowImplementation> GuestWorkflowInstance<W>
@@ -111,17 +100,11 @@ where
         } else {
             (None, Some(input))
         };
-        Ok(Box::new(Self::new(base_ctx, init_input, run_input)))
-    }
-
-    pub fn new(
-        base_ctx: BaseWorkflowContext,
-        init_input: Option<<W::Run as WorkflowDefinition>::Input>,
-        run_input: Option<<W::Run as WorkflowDefinition>::Input>,
-    ) -> Self {
-        let view = base_ctx.view();
-        let workflow = W::init(view, init_input);
-        Self::new_with_workflow(workflow, base_ctx, run_input)
+        Ok(Box::new({
+            let view = base_ctx.view();
+            let workflow = W::init(view, init_input);
+            Self::new_with_workflow(workflow, base_ctx, run_input)
+        }))
     }
 
     pub fn new_with_workflow(
@@ -181,40 +164,38 @@ where
         id
     }
 
-    fn start_signal_routine(&mut self, signal: SignalInvocation) -> ActivationJobResult {
-        let name = signal.name;
-        let data = DispatchData::from_named_payloads(
-            signal.args,
-            signal.headers,
-            self.ctx.payload_converter(),
-        );
-        let ctx = self.ctx.with_headers(data.headers);
-        if let Some(future) = W::dispatch_signal(ctx, &name, data.payloads, data.converter) {
+    fn start_signal_routine(&mut self, signal: SignalWorkflow) -> ActivationJobResult {
+        let name = signal.signal_name;
+        let payloads = Payloads {
+            payloads: signal.input,
+        };
+        let converter = self.ctx.payload_converter();
+        let ctx = self.ctx.with_headers(signal.headers);
+        if let Some(future) = W::dispatch_signal(ctx, &name, payloads, converter) {
             let routine_id = self.next_routine_id();
             self.routines
                 .insert(routine_id, GuestRoutine::Signal { future });
             ActivationJobResult::StartedRoutine(StartedRoutine {
                 routine_id,
-                kind: RoutineKind::Signal { name },
+                kind: RoutineKind::Signal(name),
             })
         } else {
             ActivationJobResult::None
         }
     }
 
-    fn start_update_routine(&mut self, update: UpdateInvocation) -> ActivationJobResult {
+    fn start_update_routine(&mut self, update: DoUpdate) -> ActivationJobResult {
         let protocol_instance_id = update.protocol_instance_id.clone();
         let name = update.name.clone();
         if update.run_validator {
-            let data = DispatchData::from_named_payloads(
-                update.args.clone(),
-                update.headers.clone(),
-                self.ctx.payload_converter(),
-            );
+            let payloads = Payloads {
+                payloads: update.input.clone(),
+            };
+            let converter = self.ctx.payload_converter();
             let view = self.ctx.view();
             let validation = self
                 .ctx
-                .state(|wf| wf.validate_update(view, &update.name, &data.payloads, data.converter));
+                .state(|wf| wf.validate_update(view, &update.name, &payloads, converter));
             match validation {
                 Some(Ok(())) => {}
                 Some(Err(e)) => {
@@ -224,13 +205,12 @@ where
             }
         }
 
-        let data = DispatchData::from_named_payloads(
-            update.args,
-            update.headers,
-            self.ctx.payload_converter(),
-        );
-        let ctx = self.ctx.with_headers(data.headers);
-        if let Some(future) = W::dispatch_update(ctx, &name, data.payloads, data.converter) {
+        let payloads = Payloads {
+            payloads: update.input,
+        };
+        let converter = self.ctx.payload_converter();
+        let ctx = self.ctx.with_headers(update.headers);
+        if let Some(future) = W::dispatch_update(ctx, &name, payloads, converter) {
             let routine_id = self.next_routine_id();
             self.routines.insert(
                 routine_id,
@@ -241,36 +221,35 @@ where
             );
             ActivationJobResult::StartedRoutine(StartedRoutine {
                 routine_id,
-                kind: RoutineKind::Update {
+                kind: RoutineKind::Update(UpdateRoutineKind {
                     name,
-                    update_id: update.update_id,
+                    update_id: update.id,
                     protocol_instance_id,
-                },
+                }),
             })
         } else {
             Self::rejection_for_missing_update_handler(name)
         }
     }
 
-    fn query(&self, query: QueryInvocation) -> QueryResponse {
-        if query.name == "__temporal_workflow_metadata" {
+    fn query(&self, query: QueryWorkflow) -> QueryResponse {
+        if query.query_type == "__temporal_workflow_metadata" {
             return self.query_metadata();
         }
 
-        let data = DispatchData::from_named_payloads(
-            query.args,
-            query.headers,
-            self.ctx.payload_converter(),
-        );
+        let payloads = Payloads {
+            payloads: query.arguments,
+        };
+        let converter = self.ctx.payload_converter();
         let view = self.ctx.view();
         QueryResponse {
             result: match self
                 .ctx
-                .state(|wf| wf.dispatch_query(view, &query.name, &data.payloads, data.converter))
+                .state(|wf| wf.dispatch_query(view, &query.query_type, &payloads, converter))
             {
                 Some(Ok(payload)) => Ok(payload),
                 None => Err(Failure {
-                    message: format!("No query handler for '{}'", query.name),
+                    message: format!("No query handler for '{}'", query.query_type),
                     ..Default::default()
                 }),
                 Some(Err(e)) => Err(e.into()),
@@ -278,32 +257,39 @@ where
         }
     }
 
-    fn apply_resolution(&mut self, resolution: WorkflowResolution) {
+    fn apply_resolution(&mut self, resolution: ActivationVariant) {
         let event = match resolution {
-            WorkflowResolution::TimerFired(event) => {
+            ActivationVariant::FireTimer(event) => {
                 UnblockEvent::Timer(event.seq, TimerResult::Fired)
             }
-            WorkflowResolution::Activity(event) => {
-                UnblockEvent::Activity(event.seq, Box::new(event.result))
+            ActivationVariant::ResolveActivity(event) => {
+                UnblockEvent::Activity(event.seq, Box::new(expect_resolution(event.result)))
             }
-            WorkflowResolution::ChildWorkflowStart(event) => {
-                UnblockEvent::WorkflowStart(event.seq, Box::new(event.status))
+            ActivationVariant::ResolveChildWorkflowExecutionStart(event) => {
+                UnblockEvent::WorkflowStart(event.seq, Box::new(expect_resolution(event.status)))
             }
-            WorkflowResolution::ChildWorkflow(event) => {
-                UnblockEvent::WorkflowComplete(event.seq, Box::new(event.result))
+            ActivationVariant::ResolveChildWorkflowExecution(event) => {
+                UnblockEvent::WorkflowComplete(event.seq, Box::new(expect_resolution(event.result)))
             }
-            WorkflowResolution::ExternalSignal(event) => {
+            ActivationVariant::ResolveSignalExternalWorkflow(event) => {
                 UnblockEvent::SignalExternal(event.seq, event.failure)
             }
-            WorkflowResolution::ExternalCancel(event) => {
+            ActivationVariant::ResolveRequestCancelExternalWorkflow(event) => {
                 UnblockEvent::CancelExternal(event.seq, event.failure)
             }
-            WorkflowResolution::NexusStart(event) => {
-                UnblockEvent::NexusOperationStart(event.seq, Box::new(event.status))
+            ActivationVariant::ResolveNexusOperationStart(event) => {
+                UnblockEvent::NexusOperationStart(
+                    event.seq,
+                    Box::new(expect_resolution(event.status)),
+                )
             }
-            WorkflowResolution::Nexus(event) => {
-                UnblockEvent::NexusOperationComplete(event.seq, Box::new(event.result))
+            ActivationVariant::ResolveNexusOperation(event) => {
+                UnblockEvent::NexusOperationComplete(
+                    event.seq,
+                    Box::new(expect_resolution(event.result)),
+                )
             }
+            _ => unreachable!("only resolution jobs can be applied as resolutions"),
         };
         self.base_ctx
             .unblock(event)
@@ -316,7 +302,7 @@ where
         match result {
             Ok(result) => crate::runtime::types::TerminalOutcome::Completed(result),
             Err(WorkflowTermination::ContinueAsNew(req)) => {
-                crate::runtime::types::TerminalOutcome::ContinueAsNew(*req)
+                crate::runtime::types::TerminalOutcome::ContinueAsNew(req)
             }
             Err(WorkflowTermination::Cancelled) => {
                 crate::runtime::types::TerminalOutcome::Cancelled
@@ -333,15 +319,6 @@ where
         }
     }
 
-    fn forced_failure(base_ctx: &BaseWorkflowContext) -> Option<WorkflowFailure> {
-        base_ctx.take_forced_wft_failure().map(|err| {
-            Box::new(Failure {
-                message: err.to_string(),
-                ..Default::default()
-            })
-        })
-    }
-
     fn poll_routine_loop<F: Future + Unpin>(
         base_ctx: &BaseWorkflowContext,
         cx: &mut Context<'_>,
@@ -352,7 +329,12 @@ where
         let mut made_progress = false;
 
         loop {
-            if let Some(failure) = Self::forced_failure(base_ctx) {
+            if let Some(failure) = base_ctx.take_forced_wft_failure().map(|err| {
+                Box::new(Failure {
+                    message: err.to_string(),
+                    ..Default::default()
+                })
+            }) {
                 return RoutinePollState::ForcedFailure {
                     failure,
                     made_progress,
@@ -391,10 +373,8 @@ where
                     result,
                     made_progress,
                 } => RoutinePollResult {
-                    completion: Some(Box::new(RoutineCompletion::Main(
-                        MainRoutineCompletion::Terminal(Box::new(
-                            Self::terminal_outcome_from_result(result),
-                        )),
+                    completion: Some(RoutineCompletion::Main(MainRoutineCompletion::Terminal(
+                        Box::new(Self::terminal_outcome_from_result(result)),
                     ))),
                     made_progress,
                 },
@@ -402,18 +382,16 @@ where
                     failure,
                     made_progress,
                 } => RoutinePollResult {
-                    completion: Some(Box::new(RoutineCompletion::Main(
-                        MainRoutineCompletion::TaskFailed(crate::runtime::types::TaskFailure {
+                    completion: Some(RoutineCompletion::Main(MainRoutineCompletion::TaskFailed(
+                        crate::runtime::types::TaskFailure {
                             failure,
                             force_cause: None,
-                        }),
+                        },
                     ))),
                     made_progress,
                 },
                 RoutinePollState::Stalled { made_progress } => RoutinePollResult {
-                    completion: Some(Box::new(RoutineCompletion::Main(
-                        MainRoutineCompletion::Blocked,
-                    ))),
+                    completion: Some(RoutineCompletion::Main(MainRoutineCompletion::Blocked)),
                     made_progress,
                 },
             },
@@ -438,7 +416,7 @@ where
                     })
                 });
                 Ok(RoutinePollResult {
-                    completion: Some(Box::new(RoutineCompletion::Signal(result))),
+                    completion: Some(RoutineCompletion::Signal(result)),
                     made_progress,
                 })
             }
@@ -477,7 +455,7 @@ where
                     },
                 };
                 Ok(RoutinePollResult {
-                    completion: Some(Box::new(RoutineCompletion::Update(completion))),
+                    completion: Some(RoutineCompletion::Update(completion)),
                     made_progress,
                 })
             }
@@ -507,26 +485,46 @@ where
         &mut self,
         activation: WorkflowActivation,
     ) -> Result<ActivationResult, WorkflowFailure> {
-        self.base_ctx.apply_activation_context(&activation.context);
+        self.base_ctx.apply_activation_context(&activation);
         let mut job_results = Vec::with_capacity(activation.jobs.len());
         for job in activation.jobs {
-            let result = match job {
-                WorkflowActivationJob::NotifyPatch { patch_id } => {
-                    self.base_ctx.record_patch(patch_id, true);
+            let result = match job.variant {
+                Some(ActivationVariant::InitializeWorkflow(_))
+                | Some(ActivationVariant::UpdateRandomSeed(_)) => ActivationJobResult::None,
+                Some(ActivationVariant::NotifyHasPatch(patch)) => {
+                    self.base_ctx.record_patch(patch.patch_id, true);
                     ActivationJobResult::None
                 }
-                WorkflowActivationJob::Cancel { reason } => {
-                    self.base_ctx.notify_cancel(reason);
+                Some(ActivationVariant::CancelWorkflow(cancel)) => {
+                    self.base_ctx.notify_cancel(cancel.reason);
                     ActivationJobResult::None
                 }
-                WorkflowActivationJob::Signal(signal) => self.start_signal_routine(signal),
-                WorkflowActivationJob::Update(update) => self.start_update_routine(update),
-                WorkflowActivationJob::Query(query) => {
+                Some(ActivationVariant::SignalWorkflow(signal)) => {
+                    self.start_signal_routine(signal)
+                }
+                Some(ActivationVariant::DoUpdate(update)) => self.start_update_routine(update),
+                Some(ActivationVariant::QueryWorkflow(query)) => {
                     ActivationJobResult::QueryResponse(Box::new(self.query(query)))
                 }
-                WorkflowActivationJob::Resolution(resolution) => {
+                Some(
+                    resolution @ (ActivationVariant::FireTimer(_)
+                    | ActivationVariant::ResolveActivity(_)
+                    | ActivationVariant::ResolveChildWorkflowExecutionStart(_)
+                    | ActivationVariant::ResolveChildWorkflowExecution(_)
+                    | ActivationVariant::ResolveSignalExternalWorkflow(_)
+                    | ActivationVariant::ResolveRequestCancelExternalWorkflow(_)
+                    | ActivationVariant::ResolveNexusOperationStart(_)
+                    | ActivationVariant::ResolveNexusOperation(_)),
+                ) => {
                     self.apply_resolution(resolution);
                     ActivationJobResult::None
+                }
+                Some(ActivationVariant::RemoveFromCache(_)) => ActivationJobResult::None,
+                None => {
+                    return Err(Box::new(Failure {
+                        message: "Activation job missing variant".to_string(),
+                        ..Default::default()
+                    }));
                 }
             };
             job_results.push(result);

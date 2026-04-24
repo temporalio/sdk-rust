@@ -11,16 +11,11 @@ use crate::runtime::{
     entry::WorkflowImplementation,
     host::WorkflowHost,
     model::{
-        CancelExternalWfResult, CancellableID, CancellableIDWithReason, NexusStartResult,
-        SignalExternalWfResult, SupportsCancelReason, TimerResult, UnblockEvent, Unblockable,
-        WorkflowTermination,
-    },
-    types::{
-        CancelChildWorkflowRequest, IntoNamedPayloads, RequestCancelExternalWorkflowRequest,
-        RequestCancelNexusOperationRequest, SignalExternalWorkflowRequest, SignalWorkflowTarget,
-        WorkflowExecutionRef,
+        CancelExternalWfResult, CancellableID, NexusStartResult, SignalExternalWfResult,
+        TimerResult, UnblockEvent, Unblockable, WorkflowTermination,
     },
 };
+use futures_channel::oneshot;
 use futures_util::{
     FutureExt,
     future::{FusedFuture, Shared},
@@ -53,21 +48,31 @@ use temporalio_common_wasm::{
     protos::{
         coresdk::{
             activity_result::{ActivityResolution, Cancellation, activity_resolution},
-            child_workflow::ChildWorkflowResult,
+            child_workflow::{ChildWorkflowResult, child_workflow_result},
+            common::NamespacedWorkflowExecution,
             nexus::NexusOperationResult,
             workflow_activation::{
-                InitializeWorkflow,
+                InitializeWorkflow, WorkflowActivation as CoreWorkflowActivation,
                 resolve_child_workflow_execution_start::Status as ChildWorkflowStartStatus,
+                workflow_activation_job::Variant as ActivationVariant,
+            },
+            workflow_commands::{
+                CancelChildWorkflowExecution, CancelSignalWorkflow, CancelTimer,
+                ModifyWorkflowProperties, RequestCancelActivity,
+                RequestCancelExternalWorkflowExecution, RequestCancelLocalActivity,
+                RequestCancelNexusOperation, SetPatchMarker, SignalExternalWorkflowExecution,
+                UpsertWorkflowSearchAttributes, signal_external_workflow_execution,
+                workflow_command,
             },
         },
         temporal::api::{
             common::v1::{Memo, Payload, SearchAttributes},
             failure::v1::{CanceledFailureInfo, Failure, failure::FailureInfo},
         },
+        utilities::TryIntoOrNone,
     },
     worker::WorkerDeploymentVersion,
 };
-use tokio::sync::{oneshot, watch};
 
 /// Non-generic base context containing all workflow execution infrastructure.
 ///
@@ -77,10 +82,13 @@ pub struct BaseWorkflowContext {
     inner: Rc<WorkflowContextInner>,
 }
 impl BaseWorkflowContext {
-    pub(crate) fn apply_activation_context(&self, ctx: &crate::runtime::types::ActivationContext) {
+    pub(crate) fn apply_activation_context(&self, activation: &CoreWorkflowActivation) {
         let mut shared = self.inner.shared.borrow_mut();
-        shared.activation = ctx.clone();
-        if let Some(seed) = ctx.updated_randomness_seed {
+        shared.activation = activation.clone();
+        if let Some(seed) = activation.jobs.iter().find_map(|job| match &job.variant {
+            Some(ActivationVariant::UpdateRandomSeed(attrs)) => Some(attrs.randomness_seed),
+            _ => None,
+        }) {
             shared.random_seed = seed;
         }
     }
@@ -200,8 +208,8 @@ struct WorkflowContextInner {
     run_id: String,
     inital_information: InitializeWorkflow,
     runtime: WorkflowRuntimeState,
-    am_cancelled_tx: watch::Sender<Option<String>>,
-    am_cancelled: watch::Receiver<Option<String>>,
+    cancelled_reason: RefCell<Option<String>>,
+    cancel_wakers: RefCell<Vec<Waker>>,
     shared: RefCell<WorkflowContextSharedData>,
     seq_nums: RefCell<WfCtxProtectedDat>,
     data_converter: DataConverter,
@@ -397,7 +405,6 @@ impl BaseWorkflowContext {
         data_converter: DataConverter,
         host: Rc<dyn WorkflowHost>,
     ) -> Self {
-        let (am_cancelled_tx, am_cancelled) = watch::channel(None);
         Self {
             inner: Rc::new(WorkflowContextInner {
                 namespace,
@@ -413,8 +420,8 @@ impl BaseWorkflowContext {
                 }),
                 inital_information: init_workflow_job,
                 runtime: WorkflowRuntimeState::new(host),
-                am_cancelled_tx,
-                am_cancelled,
+                cancelled_reason: RefCell::new(None),
+                cancel_wakers: RefCell::new(Vec::new()),
                 seq_nums: RefCell::new(WfCtxProtectedDat {
                     next_timer_sequence_number: 1,
                     next_activity_sequence_number: 1,
@@ -450,10 +457,10 @@ impl BaseWorkflowContext {
 
     pub(crate) fn notify_cancel(&self, reason: String) {
         let _guard = SdkWakeGuard::new();
-        self.inner
-            .am_cancelled_tx
-            .send(Some(reason))
-            .expect("Cancel receiver not dropped");
+        *self.inner.cancelled_reason.borrow_mut() = Some(reason);
+        for waker in self.inner.cancel_wakers.borrow_mut().drain(..) {
+            waker.wake();
+        }
         self.inner.runtime.mark_progress();
     }
 
@@ -470,27 +477,50 @@ impl BaseWorkflowContext {
                     .runtime
                     .maybe_unblock(UnblockEvent::Timer(seq, TimerResult::Cancelled))
                 {
-                    self.inner.runtime.host.cancel_timer(seq);
+                    self.inner.runtime.host.push_command(
+                        workflow_command::Variant::CancelTimer(CancelTimer { seq }).into(),
+                    );
                 }
             }
-            CancellableID::Activity(seq) => self.inner.runtime.host.cancel_activity(seq),
-            CancellableID::LocalActivity(seq) => self.inner.runtime.host.cancel_local_activity(seq),
-            CancellableID::ChildWorkflow { seqnum, reason } => self
-                .inner
-                .runtime
-                .host
-                .cancel_child_workflow(CancelChildWorkflowRequest {
-                    seq: seqnum,
-                    reason: Some(reason),
-                }),
-            CancellableID::SignalExternalWorkflow(seq) => {
-                self.inner.runtime.host.cancel_signal_external_workflow(seq)
+            CancellableID::Activity(seq) => {
+                self.inner.runtime.host.push_command(
+                    workflow_command::Variant::RequestCancelActivity(RequestCancelActivity { seq })
+                        .into(),
+                );
             }
-            CancellableID::NexusOp(seq) => self
-                .inner
-                .runtime
-                .host
-                .cancel_nexus_operation(RequestCancelNexusOperationRequest { seq }),
+            CancellableID::LocalActivity(seq) => {
+                self.inner.runtime.host.push_command(
+                    workflow_command::Variant::RequestCancelLocalActivity(
+                        RequestCancelLocalActivity { seq },
+                    )
+                    .into(),
+                );
+            }
+            CancellableID::ChildWorkflow { seqnum, reason } => {
+                self.inner.runtime.host.push_command(
+                    workflow_command::Variant::CancelChildWorkflowExecution(
+                        CancelChildWorkflowExecution {
+                            child_workflow_seq: seqnum,
+                            reason,
+                        },
+                    )
+                    .into(),
+                );
+            }
+            CancellableID::SignalExternalWorkflow(seq) => {
+                self.inner.runtime.host.push_command(
+                    workflow_command::Variant::CancelSignalWorkflow(CancelSignalWorkflow { seq })
+                        .into(),
+                );
+            }
+            CancellableID::NexusOp(seq) => {
+                self.inner.runtime.host.push_command(
+                    workflow_command::Variant::RequestCancelNexusOperation(
+                        RequestCancelNexusOperation { seq },
+                    )
+                    .into(),
+                );
+            }
         }
     }
 
@@ -511,7 +541,7 @@ impl BaseWorkflowContext {
         self.inner
             .runtime
             .register_unblocker(PendingCommandId::Timer(seq), unblocker);
-        self.inner.runtime.host.start_timer(opts.into_request(seq));
+        self.inner.runtime.host.push_command(opts.into_command(seq));
         cmd
     }
 
@@ -546,7 +576,7 @@ impl BaseWorkflowContext {
         if opts.task_queue.is_none() {
             opts.task_queue = Some(self.inner.task_queue.clone());
         }
-        self.inner.runtime.host.schedule_activity(opts.into_request(
+        self.inner.runtime.host.push_command(opts.into_command(
             seq,
             AD::name().to_string(),
             payloads,
@@ -611,7 +641,10 @@ impl BaseWorkflowContext {
         // not await the result until *after* we receive an activation for it, there will be nothing
         // to match when unblocking.
         let (result_cmd, unblocker) = CancellableWFCommandFut::new(
-            CancellableIDWithReason::ChildWorkflow { seqnum: child_seq },
+            CancellableID::ChildWorkflow {
+                seqnum: child_seq,
+                reason: String::new(),
+            },
             self.clone(),
         );
         self.inner.runtime.register_unblocker(
@@ -628,7 +661,10 @@ impl BaseWorkflowContext {
         };
 
         let (cmd, unblocker) = CancellableWFCommandFut::new_with_dat(
-            CancellableIDWithReason::ChildWorkflow { seqnum: child_seq },
+            CancellableID::ChildWorkflow {
+                seqnum: child_seq,
+                reason: String::new(),
+            },
             common,
             self.clone(),
         );
@@ -638,7 +674,7 @@ impl BaseWorkflowContext {
         self.inner
             .runtime
             .host
-            .start_child_workflow(opts.into_request(child_seq, workflow_type, payloads));
+            .push_command(opts.into_command(child_seq, workflow_type, payloads));
 
         ChildWorkflowStartFut::Running(cmd)
     }
@@ -659,13 +695,13 @@ impl BaseWorkflowContext {
         self.inner
             .runtime
             .host
-            .schedule_local_activity(opts.into_request(seq, activity_type, arguments));
+            .push_command(opts.into_command(seq, activity_type, arguments));
         cmd
     }
 
     fn send_signal_wf(
         self,
-        target: SignalWorkflowTarget,
+        target: signal_external_workflow_execution::Target,
         signal: Signal,
     ) -> impl CancellableFuture<SignalExternalWfResult> {
         let seq = self
@@ -678,14 +714,19 @@ impl BaseWorkflowContext {
         self.inner
             .runtime
             .register_unblocker(PendingCommandId::SignalExternal(seq), unblocker);
-        self.inner
-            .runtime
-            .host
-            .signal_external_workflow(SignalExternalWorkflowRequest {
-                seq,
-                target,
-                signal: signal.into_invocation(),
-            });
+        let signal = signal.into_invocation();
+        self.inner.runtime.host.push_command(
+            workflow_command::Variant::SignalExternalWorkflowExecution(
+                SignalExternalWorkflowExecution {
+                    seq,
+                    signal_name: signal.signal_name,
+                    args: signal.input,
+                    target: Some(target),
+                    headers: signal.headers,
+                },
+            )
+            .into(),
+        );
         cmd
     }
 }
@@ -713,7 +754,13 @@ impl<W> SyncWorkflowContext<W> {
 
     /// Return the current time according to the workflow (which is not wall-clock time).
     pub fn workflow_time(&self) -> Option<SystemTime> {
-        self.base.inner.shared.borrow().activation.workflow_time
+        self.base
+            .inner
+            .shared
+            .borrow()
+            .activation
+            .timestamp
+            .try_into_or_none()
     }
 
     /// Return the length of history so far at this point in the workflow
@@ -730,8 +777,9 @@ impl<W> SyncWorkflowContext<W> {
             .shared
             .borrow()
             .activation
-            .current_deployment_version
             .clone()
+            .deployment_version_for_current_task
+            .map(Into::into)
     }
 
     /// Return current values for workflow search attributes
@@ -780,18 +828,15 @@ impl<W> SyncWorkflowContext<W> {
 
     /// A future that resolves if/when the workflow is cancelled, with the user provided cause
     pub fn cancelled(&self) -> impl FusedFuture<Output = String> + '_ {
-        let am_cancelled = self.base.inner.am_cancelled.clone();
-        async move {
-            if let Some(s) = am_cancelled.borrow().as_ref() {
-                return s.clone();
+        let inner = self.base.inner.clone();
+        future::poll_fn(move |cx| {
+            if let Some(reason) = inner.cancelled_reason.borrow().as_ref() {
+                Poll::Ready(reason.clone())
+            } else {
+                inner.cancel_wakers.borrow_mut().push(cx.waker().clone());
+                Poll::Pending
             }
-            am_cancelled
-                .clone()
-                .changed()
-                .await
-                .expect("Cancelled send half not dropped");
-            am_cancelled.borrow().as_ref().cloned().unwrap_or_default()
-        }
+        })
         .fuse()
     }
 
@@ -891,11 +936,13 @@ impl<W> SyncWorkflowContext<W> {
     }
 
     fn patch_impl(&self, patch_id: &str, deprecated: bool) -> bool {
-        self.base
-            .inner
-            .runtime
-            .host
-            .set_patch_marker(patch_id.to_string(), deprecated);
+        self.base.inner.runtime.host.push_command(
+            workflow_command::Variant::SetPatchMarker(SetPatchMarker {
+                patch_id: patch_id.to_string(),
+                deprecated,
+            })
+            .into(),
+        );
         // See if we already know about the status of this change
         if let Some(present) = self.base.inner.shared.borrow().changes.get(patch_id) {
             return *present;
@@ -931,20 +978,28 @@ impl<W> SyncWorkflowContext<W> {
 
     /// Add or create a set of search attributes
     pub fn upsert_search_attributes(&self, attr_iter: impl IntoIterator<Item = (String, Payload)>) {
-        self.base
-            .inner
-            .runtime
-            .host
-            .upsert_search_attributes(attr_iter.into_named_payloads());
+        self.base.inner.runtime.host.push_command(
+            workflow_command::Variant::UpsertWorkflowSearchAttributes(
+                UpsertWorkflowSearchAttributes {
+                    search_attributes: Some(SearchAttributes {
+                        indexed_fields: attr_iter.into_iter().collect(),
+                    }),
+                },
+            )
+            .into(),
+        );
     }
 
     /// Add or create a set of search attributes
     pub fn upsert_memo(&self, attr_iter: impl IntoIterator<Item = (String, Payload)>) {
-        self.base
-            .inner
-            .runtime
-            .host
-            .upsert_memo(attr_iter.into_named_payloads());
+        self.base.inner.runtime.host.push_command(
+            workflow_command::Variant::ModifyWorkflowProperties(ModifyWorkflowProperties {
+                upserted_memo: Some(Memo {
+                    fields: attr_iter.into_iter().collect(),
+                }),
+            })
+            .into(),
+        );
     }
 
     /// Set the current details string for this workflow execution.
@@ -990,7 +1045,7 @@ impl<W> SyncWorkflowContext<W> {
             .inner
             .runtime
             .host
-            .schedule_nexus_operation(opts.into_request(seq));
+            .push_command(opts.into_command(seq));
         cmd
     }
 
@@ -1328,10 +1383,10 @@ impl WfCtxProtectedDat {
 }
 
 #[derive(Clone, Debug, Default)]
-pub(crate) struct WorkflowContextSharedData {
+struct WorkflowContextSharedData {
     /// Maps change ids -> resolved status
     changes: HashMap<String, bool>,
-    activation: crate::runtime::types::ActivationContext,
+    activation: CoreWorkflowActivation,
     search_attributes: SearchAttributes,
     random_seed: u64,
     /// Current details string, surfaced via the workflow metadata query.
@@ -1402,22 +1457,22 @@ where
     }
 }
 
-struct CancellableWFCommandFut<T, D, ID = CancellableID> {
+struct CancellableWFCommandFut<T, D> {
     cmd_fut: WFCommandFut<T, D>,
-    cancellable_id: ID,
+    cancellable_id: CancellableID,
     base_ctx: BaseWorkflowContext,
 }
-impl<T, ID> CancellableWFCommandFut<T, (), ID> {
+impl<T> CancellableWFCommandFut<T, ()> {
     fn new(
-        cancellable_id: ID,
+        cancellable_id: CancellableID,
         base_ctx: BaseWorkflowContext,
     ) -> (Self, oneshot::Sender<UnblockEvent>) {
         Self::new_with_dat(cancellable_id, (), base_ctx)
     }
 }
-impl<T, D, ID> CancellableWFCommandFut<T, D, ID> {
+impl<T, D> CancellableWFCommandFut<T, D> {
     fn new_with_dat(
-        cancellable_id: ID,
+        cancellable_id: CancellableID,
         other_dat: D,
         base_ctx: BaseWorkflowContext,
     ) -> (Self, oneshot::Sender<UnblockEvent>) {
@@ -1432,8 +1487,8 @@ impl<T, D, ID> CancellableWFCommandFut<T, D, ID> {
         )
     }
 }
-impl<T, D, ID> Unpin for CancellableWFCommandFut<T, D, ID> where T: Unblockable<OtherDat = D> {}
-impl<T, D, ID> Future for CancellableWFCommandFut<T, D, ID>
+impl<T, D> Unpin for CancellableWFCommandFut<T, D> where T: Unblockable<OtherDat = D> {}
+impl<T, D> Future for CancellableWFCommandFut<T, D>
 where
     T: Unblockable<OtherDat = D>,
 {
@@ -1443,7 +1498,7 @@ where
         self.cmd_fut.poll_unpin(cx)
     }
 }
-impl<T, D, ID> FusedFuture for CancellableWFCommandFut<T, D, ID>
+impl<T, D> FusedFuture for CancellableWFCommandFut<T, D>
 where
     T: Unblockable<OtherDat = D>,
 {
@@ -1452,22 +1507,21 @@ where
     }
 }
 
-impl<T, D, ID> CancellableFuture<T> for CancellableWFCommandFut<T, D, ID>
+impl<T, D> CancellableFuture<T> for CancellableWFCommandFut<T, D>
 where
     T: Unblockable<OtherDat = D>,
-    ID: Clone + Into<CancellableID>,
 {
     fn cancel(&self) {
-        self.base_ctx.cancel(self.cancellable_id.clone().into());
+        self.base_ctx.cancel(self.cancellable_id.clone());
     }
 }
-impl<T, D> CancellableFutureWithReason<T> for CancellableWFCommandFut<T, D, CancellableIDWithReason>
+impl<T, D> CancellableFutureWithReason<T> for CancellableWFCommandFut<T, D>
 where
     T: Unblockable<OtherDat = D>,
 {
     fn cancel_with_reason(&self, reason: String) {
-        let new_id = self.cancellable_id.clone().with_reason(reason);
-        self.base_ctx.cancel(new_id);
+        self.base_ctx
+            .cancel(self.cancellable_id.clone().with_reason(reason));
     }
 }
 
@@ -1484,7 +1538,7 @@ struct LATimerBackoffFut {
     terminated: bool,
 }
 impl LATimerBackoffFut {
-    pub(crate) fn new(
+    fn new(
         activity_type: String,
         arguments: Vec<Payload>,
         opts: LocalActivityOptions,
@@ -1734,7 +1788,7 @@ where
 pub(crate) struct ChildWfCommon {
     workflow_id: String,
     child_seq: u32,
-    result_future: CancellableWFCommandFut<ChildWorkflowResult, (), CancellableIDWithReason>,
+    result_future: CancellableWFCommandFut<ChildWorkflowResult, ()>,
     base_ctx: BaseWorkflowContext,
     data_converter: DataConverter,
 }
@@ -1790,7 +1844,6 @@ where
             } => match Pin::new(inner).poll(cx) {
                 Poll::Pending => Poll::Pending,
                 Poll::Ready(result) => Poll::Ready({
-                    use temporalio_common_wasm::protos::coresdk::child_workflow::child_workflow_result;
                     let status = result.status.ok_or_else(|| {
                         data_converter
                             .to_error(
@@ -2074,15 +2127,13 @@ where
 
     /// Cancel the child workflow
     pub fn cancel(&self, reason: String) {
-        self.common
-            .base_ctx
-            .inner
-            .runtime
-            .host
-            .cancel_child_workflow(CancelChildWorkflowRequest {
-                seq: self.common.child_seq,
-                reason: Some(reason),
-            });
+        self.common.base_ctx.inner.runtime.host.push_command(
+            workflow_command::Variant::CancelChildWorkflowExecution(CancelChildWorkflowExecution {
+                child_workflow_seq: self.common.child_seq,
+                reason,
+            })
+            .into(),
+        );
     }
 
     /// Send a typed signal to the child workflow.
@@ -2103,7 +2154,9 @@ where
             }
         };
         let signal = Signal::new(S::name(&signal), payloads);
-        let target = SignalWorkflowTarget::ChildWorkflowId(self.common.workflow_id.clone());
+        let target = signal_external_workflow_execution::Target::ChildWorkflowId(
+            self.common.workflow_id.clone(),
+        );
         SignalChildFut::Running {
             inner: self.common.base_ctx.clone().send_signal_wf(target, signal),
             data_converter: self.common.data_converter.clone(),
@@ -2153,11 +2206,13 @@ impl ExternalWorkflowHandle {
             }
         };
         let signal = Signal::new(S::name(&signal), payloads);
-        let target = SignalWorkflowTarget::WorkflowExecution(WorkflowExecutionRef {
-            namespace: self.namespace.clone(),
-            workflow_id: self.workflow_id.clone(),
-            run_id: self.run_id.clone(),
-        });
+        let target = signal_external_workflow_execution::Target::WorkflowExecution(
+            NamespacedWorkflowExecution {
+                namespace: self.namespace.clone(),
+                workflow_id: self.workflow_id.clone(),
+                run_id: self.run_id.clone().unwrap_or_default(),
+            },
+        );
         SignalExternalFut::Running(self.base_ctx.clone().send_signal_wf(target, signal))
     }
 
@@ -2177,17 +2232,20 @@ impl ExternalWorkflowHandle {
             .inner
             .runtime
             .register_unblocker(PendingCommandId::CancelExternal(seq), unblocker);
-        self.base_ctx
-            .inner
-            .runtime
-            .host
-            .request_cancel_external_workflow(RequestCancelExternalWorkflowRequest {
-                seq,
-                namespace: Some(self.namespace.clone()),
-                workflow_id: self.workflow_id.clone(),
-                run_id: self.run_id.clone(),
-                reason,
-            });
+        self.base_ctx.inner.runtime.host.push_command(
+            workflow_command::Variant::RequestCancelExternalWorkflowExecution(
+                RequestCancelExternalWorkflowExecution {
+                    seq,
+                    workflow_execution: Some(NamespacedWorkflowExecution {
+                        namespace: self.namespace.clone(),
+                        workflow_id: self.workflow_id.clone(),
+                        run_id: self.run_id.clone().unwrap_or_default(),
+                    }),
+                    reason: reason.unwrap_or_default(),
+                },
+            )
+            .into(),
+        );
         cmd
     }
 }
@@ -2276,17 +2334,18 @@ impl StartedNexusOperation {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::runtime::types::{
-        NamedPayload, RequestCancelExternalWorkflowRequest, RequestCancelNexusOperationRequest,
-        ScheduleActivityRequest, ScheduleLocalActivityRequest, ScheduleNexusOperationRequest,
-        SignalExternalWorkflowRequest, StartChildWorkflowRequest, StartTimerRequest,
-    };
     use std::collections::HashMap;
     use temporalio_common_wasm::{
         data_converters::{TemporalDeserializable, TemporalSerializable},
         protos::{
-            coresdk::{AsJsonPayloadExt, common::VersioningIntent},
-            temporal::api::common::v1::{Payload, RetryPolicy},
+            coresdk::{
+                AsJsonPayloadExt, common::VersioningIntent as ProtoVersioningIntent,
+                workflow_commands::WorkflowCommand,
+            },
+            temporal::api::{
+                common::v1::{Payload, RetryPolicy},
+                enums::v1::ContinueAsNewVersioningBehavior,
+            },
         },
     };
     use temporalio_macros::{workflow, workflow_methods};
@@ -2296,23 +2355,7 @@ mod tests {
 
     impl WorkflowHost for NoopHost {
         fn set_current_details(&self, _details: String) {}
-        fn start_timer(&self, _req: StartTimerRequest) {}
-        fn cancel_timer(&self, _seq: u32) {}
-        fn schedule_activity(&self, _req: ScheduleActivityRequest) {}
-        fn cancel_activity(&self, _seq: u32) {}
-        fn schedule_local_activity(&self, _req: ScheduleLocalActivityRequest) {}
-        fn cancel_local_activity(&self, _seq: u32) {}
-        fn start_child_workflow(&self, _req: StartChildWorkflowRequest) {}
-        fn cancel_child_workflow(&self, _req: CancelChildWorkflowRequest) {}
-        fn request_cancel_external_workflow(&self, _req: RequestCancelExternalWorkflowRequest) {}
-        fn signal_external_workflow(&self, _req: SignalExternalWorkflowRequest) {}
-        fn cancel_signal_external_workflow(&self, _seq: u32) {}
-        fn schedule_nexus_operation(&self, _req: ScheduleNexusOperationRequest) {}
-        fn cancel_nexus_operation(&self, _req: RequestCancelNexusOperationRequest) {}
-        fn upsert_search_attributes(&self, _entries: Vec<NamedPayload>) {}
-        fn upsert_memo(&self, _entries: Vec<NamedPayload>) {}
-        fn set_patch_marker(&self, _patch_id: String, _deprecated: bool) {}
-        fn continue_as_new(&self, _req: crate::runtime::types::ContinueAsNewRequest) {}
+        fn push_command(&self, _command: WorkflowCommand) {}
     }
 
     #[workflow]
@@ -2361,17 +2404,17 @@ mod tests {
         assert_eq!(
             *cmd,
             crate::runtime::types::ContinueAsNewRequest {
-                workflow_type: Some(TestWorkflow.name().to_string()),
-                task_queue: None,
-                args: vec![7u8.as_json_payload().unwrap()],
-                run_timeout: None,
-                task_timeout: None,
-                memo: vec![],
-                headers: vec![],
+                workflow_type: TestWorkflow.name().to_string(),
+                task_queue: String::new(),
+                arguments: vec![7u8.as_json_payload().unwrap()],
+                workflow_run_timeout: None,
+                workflow_task_timeout: None,
+                memo: HashMap::new(),
+                headers: HashMap::new(),
                 search_attributes: None,
                 retry_policy: None,
-                versioning_intent: Some(VersioningIntent::Unspecified),
-                initial_versioning_behavior: None,
+                versioning_intent: ProtoVersioningIntent::Unspecified.into(),
+                initial_versioning_behavior: ContinueAsNewVersioningBehavior::Unspecified.into(),
             }
         );
     }
@@ -2411,7 +2454,7 @@ mod tests {
                         maximum_attempts: 5,
                         ..Default::default()
                     }),
-                    versioning_intent: Some(VersioningIntent::Compatible),
+                    versioning_intent: Some(ProtoVersioningIntent::Compatible),
                 },
             )
             .expect_err("continue_as_new should terminate the workflow");
@@ -2426,20 +2469,20 @@ mod tests {
         assert_eq!(
             *cmd,
             crate::runtime::types::ContinueAsNewRequest {
-                workflow_type: Some("next-workflow".to_string()),
-                task_queue: Some("next-task-queue".to_string()),
-                args: vec![11u8.as_json_payload().unwrap()],
-                run_timeout: Some(Duration::from_secs(10)),
-                task_timeout: Some(Duration::from_secs(3)),
-                memo: memo.into_named_payloads(),
-                headers: headers.into_named_payloads(),
-                search_attributes: Some(search_attributes.indexed_fields.into_named_payloads()),
+                workflow_type: "next-workflow".to_string(),
+                task_queue: "next-task-queue".to_string(),
+                arguments: vec![11u8.as_json_payload().unwrap()],
+                workflow_run_timeout: Some(Duration::from_secs(10).try_into().unwrap()),
+                workflow_task_timeout: Some(Duration::from_secs(3).try_into().unwrap()),
+                memo,
+                headers,
+                search_attributes: Some(search_attributes),
                 retry_policy: Some(RetryPolicy {
                     maximum_attempts: 5,
                     ..Default::default()
                 }),
-                versioning_intent: Some(VersioningIntent::Compatible),
-                initial_versioning_behavior: None,
+                versioning_intent: ProtoVersioningIntent::Compatible.into(),
+                initial_versioning_behavior: ContinueAsNewVersioningBehavior::Unspecified.into(),
             }
         );
     }
@@ -2462,7 +2505,7 @@ mod tests {
             unreachable!()
         };
 
-        assert_eq!(cmd.search_attributes, Some(vec![]));
+        assert_eq!(cmd.search_attributes, Some(SearchAttributes::default()));
     }
 
     #[test]

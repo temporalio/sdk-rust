@@ -15,6 +15,7 @@ exclude = ["protos/*/.github/*"]
 
 [features]
 serde_serialize = []
+grpc-clients = ["tonic/channel"]
 
 [dependencies]
 anyhow = "1.0"
@@ -32,7 +33,7 @@ prost-types = { workspace = true }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
-tonic = { workspace = true, default-features = false, features = ["transport", "codegen"] }
+tonic = { workspace = true, default-features = false, features = ["codegen"] }
 tonic-prost = { workspace = true }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", default-features = false, features = [
@@ -43,8 +44,8 @@ tracing-subscriber = { version = "0.3", default-features = false, features = [
 ] }
 tracing-core = "0.1"
 url = "2.5"
-uuid = { version = "1.18", default-features = false, features = ["v4"] }
 pbjson = { workspace = true }
+http = "1"
 
 [build-dependencies]
 prost = { workspace = true }

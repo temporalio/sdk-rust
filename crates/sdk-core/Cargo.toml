@@ -152,7 +152,7 @@ hyper-util = { version = "0.1", features = [
 ] }
 rstest = "0.26"
 semver = "1.0"
-temporalio-sdk = { path = "../sdk" }
+temporalio-sdk = { path = "../sdk", features = ["wasm-workflows"] }
 temporalio-common = { path = "../common", version = "0.4", default-features = false }
 temporalio-workflow = { path = "../workflow" }
 tokio = { version = "1.47", default-features = false, features = [

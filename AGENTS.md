@@ -24,6 +24,7 @@ document as your quick reference when submitting pull requests.
   so helps prevent ambiguous method resolution because of traits. Putting them at the top of a tests module is also acceptable.
 - If you want to format, don't bother checking first. Just run formatting, and run it by using
   `cargo +nightly fmt`, because some settings require the nightly formatter.
+- Do not extract functions for relatively simple helpers that are only used in one location.
 
 
 ## Repo Specific Utilities

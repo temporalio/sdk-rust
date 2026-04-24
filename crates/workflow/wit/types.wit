@@ -1,150 +1,19 @@
 package temporal:workflow-runtime@0.1.0;
 
-record payload-metadata-entry {
-  key: string,
-  value: list<u8>,
-}
+interface types {
+type payload = list<u8>;
 
-record payload {
-  metadata: list<payload-metadata-entry>,
-  data: list<u8>,
-}
+type workflow-command = list<u8>;
 
-record named-payload {
-  key: string,
-  value: payload,
-}
-
-record duration {
-  seconds: s64,
-  nanos: u32,
-}
-
-record timestamp {
-  seconds: s64,
-  nanos: u32,
-}
-
-record workflow-execution-ref {
-  namespace: string,
-  workflow-id: string,
-  run-id: option<string>,
-}
-
-record worker-deployment-version {
-  deployment-name: string,
-  build-id: string,
-}
-
-record priority {
-  priority-key: option<u32>,
-  fairness-key: option<string>,
-  fairness-weight: option<f32>,
-}
-
-record retry-policy {
-  initial-interval: option<duration>,
-  backoff-coefficient: option<float64>,
-  maximum-interval: option<duration>,
-  maximum-attempts: option<i32>,
-  non-retryable-error-types: list<string>,
-}
-
-record failure {
-  message: string,
-  source: option<string>,
-  stack-trace: option<string>,
-  encoded-attributes: list<u8>,
-  cause: option<failure>,
-}
-
-enum workflow-id-reuse-policy {
-  allow-duplicate,
-  allow-duplicate-failed-only,
-  reject-duplicate,
-  terminate-if-running,
-}
-
-enum parent-close-policy {
-  unspecified,
-  terminate,
-  abandon,
-  request-cancel,
-}
-
-enum activity-cancellation-type {
-  try-cancel,
-  wait-cancellation-completed,
-  abandon,
-}
-
-enum child-workflow-cancellation-type {
-  abandon,
-  try-cancel,
-  wait-cancellation-completed,
-  wait-cancellation-requested,
-}
-
-enum nexus-operation-cancellation-type {
-  wait-cancellation-completed,
-  abandon,
-  try-cancel,
-  wait-cancellation-requested,
-}
-
-enum versioning-intent {
-  unspecified,
-  compatible,
-  default,
-}
-
-enum versioning-behavior {
-  unspecified,
-  pinned,
-  auto-upgrade,
-}
+type failure = list<u8>;
 
 type workflow-task-failed-cause = u32;
-type suggest-continue-as-new-reason = u32;
-type start-child-workflow-failed-cause = u32;
 
 record workflow-init {
   namespace: string,
   task-queue: string,
-  workflow-id: string,
   run-id: string,
-  workflow-type: string,
-  attempt: u32,
-  first-execution-run-id: string,
-  continued-from-run-id: option<string>,
-  start-time: option<timestamp>,
-  execution-timeout: option<duration>,
-  run-timeout: option<duration>,
-  task-timeout: option<duration>,
-  parent: option<workflow-execution-ref>,
-  root: option<workflow-execution-ref>,
-  retry-policy: option<retry-policy>,
-  cron-schedule: option<string>,
-  memo: list<named-payload>,
-  search-attributes: list<named-payload>,
-  headers: list<named-payload>,
-  identity: option<string>,
-  priority: option<priority>,
-  randomness-seed: u64,
-}
-
-record activation-context {
-  workflow-time: option<timestamp>,
-  is-replaying: bool,
-  history-length: u32,
-  history-size-bytes: u64,
-  continue-as-new-suggested: bool,
-  current-deployment-version: option<worker-deployment-version>,
-  last-sdk-version: option<string>,
-  available-internal-flags: list<u32>,
-  updated-randomness-seed: option<u64>,
-  target-worker-deployment-version-changed: bool,
-  suggest-continue-as-new-reasons: list<suggest-continue-as-new-reason>,
+  initialize-workflow: list<u8>,
 }
 
 record workflow-definition {
@@ -161,128 +30,13 @@ record update-definition {
   has-validator: bool,
 }
 
-record signal-invocation {
-  name: string,
-  args: list<payload>,
-  headers: list<named-payload>,
-}
-
-record update-invocation {
-  update-id: string,
-  protocol-instance-id: string,
-  name: string,
-  args: list<payload>,
-  headers: list<named-payload>,
-  run-validator: bool,
-}
-
-record query-invocation {
-  name: string,
-  args: list<payload>,
-  headers: list<named-payload>,
-}
-
 record query-response {
-  result: result<payload, failure>,
+  response: result<payload, failure>,
 }
 
 type routine-id = u64;
 
-record timer-fired {
-  seq: u32,
-}
-
-variant activity-result {
-  completed(payload),
-  failed(failure),
-  cancelled(failure),
-  backoff(duration),
-}
-
-record activity-resolution {
-  seq: u32,
-  result: activity-result,
-}
-
-variant child-workflow-start-status {
-  succeeded(string),
-  failed(start-child-workflow-failed-cause),
-  cancelled(failure),
-}
-
-record child-workflow-start-resolution {
-  seq: u32,
-  status: child-workflow-start-status,
-}
-
-variant child-workflow-result {
-  completed(payload),
-  failed(failure),
-  cancelled(failure),
-}
-
-record child-workflow-resolution {
-  seq: u32,
-  result: child-workflow-result,
-}
-
-record external-signal-resolution {
-  seq: u32,
-  failure: option<failure>,
-}
-
-record external-cancel-resolution {
-  seq: u32,
-  failure: option<failure>,
-}
-
-variant nexus-start-status {
-  operation-token(string),
-  started-sync,
-  failed(failure),
-}
-
-record nexus-start-resolution {
-  seq: u32,
-  status: nexus-start-status,
-}
-
-variant nexus-result {
-  completed(payload),
-  failed(failure),
-  cancelled(failure),
-  timed-out(failure),
-}
-
-record nexus-resolution {
-  seq: u32,
-  result: nexus-result,
-}
-
-variant workflow-resolution {
-  timer-fired(timer-fired),
-  activity(activity-resolution),
-  child-workflow-start(child-workflow-start-resolution),
-  child-workflow(child-workflow-resolution),
-  external-signal(external-signal-resolution),
-  external-cancel(external-cancel-resolution),
-  nexus-start(nexus-start-resolution),
-  nexus(nexus-resolution),
-}
-
-variant workflow-activation-job {
-  notify-patch(string),
-  cancel(string),
-  signal(signal-invocation),
-  update(update-invocation),
-  query(query-invocation),
-  resolution(workflow-resolution),
-}
-
-record workflow-activation {
-  context: activation-context,
-  jobs: list<workflow-activation-job>,
-}
+type workflow-activation = list<u8>;
 
 variant routine-kind {
   main,
@@ -312,123 +66,7 @@ record activation-result {
   job-results: list<activation-job-result>,
 }
 
-record start-timer-request {
-  seq: u32,
-  timeout: duration,
-  summary: option<string>,
-}
-
-record schedule-activity-request {
-  seq: u32,
-  activity-type: string,
-  activity-id: option<string>,
-  task-queue: option<string>,
-  args: list<payload>,
-  schedule-to-start-timeout: option<duration>,
-  start-to-close-timeout: option<duration>,
-  schedule-to-close-timeout: option<duration>,
-  heartbeat-timeout: option<duration>,
-  cancellation-type: activity-cancellation-type,
-  retry-policy: option<retry-policy>,
-  priority: option<priority>,
-  summary: option<string>,
-  do-not-eagerly-execute: bool,
-}
-
-record schedule-local-activity-request {
-  seq: u32,
-  activity-type: string,
-  activity-id: option<string>,
-  args: list<payload>,
-  retry-policy: retry-policy,
-  attempt: option<u32>,
-  original-schedule-time: option<timestamp>,
-  timer-backoff-threshold: option<duration>,
-  cancellation-type: activity-cancellation-type,
-  schedule-to-close-timeout: option<duration>,
-  schedule-to-start-timeout: option<duration>,
-  start-to-close-timeout: option<duration>,
-  summary: option<string>,
-}
-
-record start-child-workflow-request {
-  seq: u32,
-  workflow-type: string,
-  workflow-id: string,
-  task-queue: option<string>,
-  args: list<payload>,
-  cancellation-type: child-workflow-cancellation-type,
-  parent-close-policy: parent-close-policy,
-  static-summary: option<string>,
-  static-details: option<string>,
-  id-reuse-policy: workflow-id-reuse-policy,
-  execution-timeout: option<duration>,
-  run-timeout: option<duration>,
-  task-timeout: option<duration>,
-  cron-schedule: option<string>,
-  search-attributes: list<named-payload>,
-  priority: option<priority>,
-}
-
-record cancel-child-workflow-request {
-  seq: u32,
-  reason: option<string>,
-}
-
-record request-cancel-external-workflow-request {
-  seq: u32,
-  namespace: option<string>,
-  workflow-id: string,
-  run-id: option<string>,
-  reason: option<string>,
-}
-
-record signal-external-workflow-request {
-  seq: u32,
-  target: signal-workflow-target,
-  signal: signal-invocation,
-}
-
-variant signal-workflow-target {
-  workflow-execution(workflow-execution-ref),
-  child-workflow-id(string),
-}
-
-record schedule-nexus-operation-request {
-  seq: u32,
-  endpoint: string,
-  service: string,
-  operation: string,
-  input: option<payload>,
-  schedule-to-close-timeout: option<duration>,
-  schedule-to-start-timeout: option<duration>,
-  start-to-close-timeout: option<duration>,
-  headers: list<string-header>,
-  cancellation-type: nexus-operation-cancellation-type,
-}
-
-record request-cancel-nexus-operation-request {
-  seq: u32,
-}
-
-record continue-as-new-request {
-  workflow-type: option<string>,
-  task-queue: option<string>,
-  args: list<payload>,
-  run-timeout: option<duration>,
-  task-timeout: option<duration>,
-  memo: list<named-payload>,
-  headers: list<named-payload>,
-  search-attributes: option<list<named-payload>>,
-  retry-policy: option<retry-policy>,
-  versioning-intent: option<versioning-intent>,
-  initial-versioning-behavior: option<continue-as-new-versioning-behavior>,
-}
-
-record string-header {
-  key: string,
-  value: string,
-}
+type continue-as-new-request = list<u8>;
 
 record task-failure {
   failure: failure,
@@ -455,7 +93,7 @@ variant update-routine-completion {
 
 record update-routine-success {
   protocol-instance-id: string,
-  result: payload,
+  value: payload,
 }
 
 record update-routine-rejection {
@@ -477,4 +115,5 @@ variant routine-completion {
 record routine-poll-result {
   completion: option<routine-completion>,
   made-progress: bool,
+}
 }

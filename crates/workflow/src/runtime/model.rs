@@ -186,28 +186,14 @@ pub enum CancellableID {
     NexusOp(u32),
 }
 
-pub(crate) trait SupportsCancelReason {
-    fn with_reason(self, reason: String) -> CancellableID;
-}
-
-#[derive(Debug, Clone)]
-pub enum CancellableIDWithReason {
-    ChildWorkflow { seqnum: u32 },
-}
-
-impl SupportsCancelReason for CancellableIDWithReason {
-    fn with_reason(self, reason: String) -> CancellableID {
+impl CancellableID {
+    pub(crate) fn with_reason(self, reason: String) -> Self {
         match self {
-            CancellableIDWithReason::ChildWorkflow { seqnum } => {
+            CancellableID::ChildWorkflow { seqnum, .. } => {
                 CancellableID::ChildWorkflow { seqnum, reason }
             }
+            other => other,
         }
-    }
-}
-
-impl From<CancellableIDWithReason> for CancellableID {
-    fn from(v: CancellableIDWithReason) -> Self {
-        v.with_reason(String::new())
     }
 }
 

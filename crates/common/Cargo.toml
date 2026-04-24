@@ -99,6 +99,7 @@ pbjson = { workspace = true }
 [dependencies.temporalio-common-wasm]
 path = "../common-wasm"
 version = "0.2"
+features = ["grpc-clients"]
 
 [build-dependencies]
 prost = { workspace = true }

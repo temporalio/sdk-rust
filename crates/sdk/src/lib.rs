@@ -77,6 +77,8 @@ pub mod interceptors;
 mod workflow_executor;
 mod workflow_future;
 mod workflow_registry;
+#[cfg(feature = "wasm-workflows")]
+mod workflow_wasm;
 pub mod workflows;
 
 pub use temporalio_client::Namespace;
@@ -88,6 +90,8 @@ pub use temporalio_workflow::{
     TimerOptions, TimerResult, WorkflowContext, WorkflowContextView, WorkflowResult,
     WorkflowTermination,
 };
+#[cfg(feature = "wasm-workflows")]
+pub use workflow_wasm::WasmWorkflowComponent;
 
 use crate::{
     activities::{
@@ -96,7 +100,7 @@ use crate::{
     },
     interceptors::{ActivityInboundInterceptor, WorkerInterceptor},
     workflow_executor::{TaskHandle, WorkflowExecutor},
-    workflow_future::WorkflowFunction,
+    workflow_future::start_workflow,
     workflow_registry::WorkflowDefinitions,
 };
 use anyhow::{Context, anyhow, bail};
@@ -161,6 +165,10 @@ pub struct WorkerOptions {
 
     #[builder(field)]
     workflows: WorkflowDefinitions,
+
+    #[cfg(feature = "wasm-workflows")]
+    #[builder(field)]
+    wasm_workflow_components: Vec<WasmWorkflowComponent>,
 
     /// Set the deployment options for this worker. Defaults to a hash of the currently running
     /// executable.
@@ -305,6 +313,13 @@ impl<S: worker_options_builder::State> WorkerOptionsBuilder<S> {
             .register_workflow_run_with_factory::<W, F>(factory);
         self
     }
+
+    /// Register a prebuilt WASM workflow component that exports one or more workflows.
+    #[cfg(feature = "wasm-workflows")]
+    pub fn register_wasm_workflow(mut self, component: WasmWorkflowComponent) -> Self {
+        self.wasm_workflow_components.push(component);
+        self
+    }
 }
 
 // Needs to exist to avoid https://github.com/elastio/bon/issues/359
@@ -355,6 +370,13 @@ impl WorkerOptions {
     {
         self.workflows
             .register_workflow_run_with_factory::<W, F>(factory);
+        self
+    }
+
+    /// Register a prebuilt WASM workflow component that exports one or more workflows.
+    #[cfg(feature = "wasm-workflows")]
+    pub fn register_wasm_workflow(&mut self, component: WasmWorkflowComponent) -> &mut Self {
+        self.wasm_workflow_components.push(component);
         self
     }
 
@@ -444,28 +466,17 @@ struct ActivityHalf {
 }
 
 impl Worker {
-    /// Create a new worker from an existing connection, and options.
+    /// Create a new worker from an existing client, and options.
     pub fn new(
         runtime: &CoreRuntime,
         client: Client,
-        mut options: WorkerOptions,
+        options: WorkerOptions,
     ) -> Result<Self, Box<dyn std::error::Error>> {
-        let acts = std::mem::take(&mut options.activities);
-        let wfs = std::mem::take(&mut options.workflows);
         let wc = options
             .to_core_options(client.namespace(), client.identity())
             .map_err(|s| anyhow::anyhow!("{s}"))?;
         let core = init_worker(runtime, wc, client.connection().clone())?;
-        let mut me = Self::new_from_core_definitions(
-            Arc::new(core),
-            client.data_converter().clone(),
-            Default::default(),
-            Default::default(),
-        );
-        me.set_detect_nondeterministic_futures(options.detect_nondeterministic_futures);
-        me.activity_half.activities = acts;
-        me.workflow_half.workflow_definitions = wfs;
-        Ok(me)
+        Self::new_from_core_options(Arc::new(core), client.data_converter().clone(), options)
     }
 
     // TODO [rust-sdk-branch]: Eliminate this constructor in favor of passing in fake connection
@@ -481,7 +492,25 @@ impl Worker {
 
     // TODO [rust-sdk-branch]: Eliminate this constructor in favor of passing in fake connection
     #[doc(hidden)]
-    pub fn new_from_core_definitions(
+    pub fn new_from_core_options(
+        worker: Arc<CoreWorker>,
+        data_converter: DataConverter,
+        mut options: WorkerOptions,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        let acts = std::mem::take(&mut options.activities);
+        let wfs = std::mem::take(&mut options.workflows);
+        #[cfg(feature = "wasm-workflows")]
+        let wasm_components = std::mem::take(&mut options.wasm_workflow_components);
+        let mut me = Self::new_from_core_definitions(worker, data_converter, acts, wfs);
+        me.set_detect_nondeterministic_futures(options.detect_nondeterministic_futures);
+        #[cfg(feature = "wasm-workflows")]
+        me.workflow_half
+            .workflow_definitions
+            .register_wasm_workflows(wasm_components)?;
+        Ok(me)
+    }
+
+    fn new_from_core_definitions(
         worker: Arc<CoreWorker>,
         data_converter: DataConverter,
         activities: ActivityDefinitions,
@@ -802,7 +831,8 @@ impl WorkflowHalf {
             let workflow_type = sw.workflow_type.clone();
             let (wff, activations) = {
                 if let Some(factory) = self.workflow_definitions.get_workflow(&workflow_type) {
-                    match WorkflowFunction::from_invocation(factory).start_workflow(
+                    match start_workflow(
+                        factory,
                         common.worker.get_config().namespace.clone(),
                         common.task_queue.clone(),
                         run_id.clone(),
