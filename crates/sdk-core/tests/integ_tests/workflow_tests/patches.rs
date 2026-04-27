@@ -37,10 +37,10 @@ use temporalio_common::{
 };
 
 use temporalio_common::worker::WorkerTaskTypes;
-use temporalio_macros::{activities, workflow, workflow_methods};
+use temporalio_macros::{activity_definitions, workflow, workflow_methods};
 use temporalio_sdk::{
     ActivityOptions, SyncWorkflowContext, WorkflowContext, WorkflowResult,
-    activities::{ActivityContext, ActivityError},
+    activities::ActivityError,
 };
 use temporalio_sdk_core::{
     replay::{DEFAULT_WORKFLOW_TYPE, TestHistoryBuilder},
@@ -400,10 +400,10 @@ fn patch_marker_single_activity(
 }
 
 struct FakeAct;
-#[activities]
+#[activity_definitions]
 impl FakeAct {
     #[activity(name = "")]
-    fn nameless(_: ActivityContext) -> Result<RawValue, ActivityError> {
+    fn nameless() -> Result<RawValue, ActivityError> {
         unimplemented!()
     }
 }

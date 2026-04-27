@@ -2,7 +2,6 @@ use proc_macro::TokenStream;
 use syn::parse_macro_input;
 
 mod activities_definitions;
-mod activity_definitions;
 mod fsm_impl;
 mod macro_utils;
 mod workflow_definitions;
@@ -13,9 +12,8 @@ mod workflow_definitions;
 /// For a usage example, see that crate's documentation.
 #[proc_macro_attribute]
 pub fn activities(_attr: TokenStream, item: TokenStream) -> TokenStream {
-    let def: activities_definitions::ActivitiesDefinition =
-        parse_macro_input!(item as activities_definitions::ActivitiesDefinition);
-    def.codegen()
+    let def = parse_macro_input!(item as activities_definitions::ActivitiesParse);
+    def.0.codegen()
 }
 
 /// Marks a method within an `#[activities]` impl block as an activity.
@@ -25,15 +23,17 @@ pub fn activity(_attr: TokenStream, item: TokenStream) -> TokenStream {
     item
 }
 
-/// Defines activity markers and shared contracts without providing native implementations.
+/// Declares activities without providing implementations. Each method must omit the
+/// `ActivityContext` parameter and have a body of exactly `unimplemented!()`. The macro emits
+/// the same marker structs and inherent consts as `#[activities]` so call sites use the same
+/// `MyActivities::greet` form, but no execution machinery is generated.
 ///
-/// This macro is intended for workflow crates that need typed activity declarations which can be
-/// implemented elsewhere by a native worker crate.
+/// Intended for workflow crates that need typed activity declarations which are implemented
+/// elsewhere by a separate worker crate (or in another language).
 #[proc_macro_attribute]
 pub fn activity_definitions(_attr: TokenStream, item: TokenStream) -> TokenStream {
-    let def: activity_definitions::ActivityDefinitionsTrait =
-        parse_macro_input!(item as activity_definitions::ActivityDefinitionsTrait);
-    def.codegen()
+    let def = parse_macro_input!(item as activities_definitions::DefinitionsParse);
+    def.0.codegen()
 }
 
 /// Marks a struct as a workflow definition.

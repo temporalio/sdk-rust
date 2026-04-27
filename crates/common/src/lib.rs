@@ -17,9 +17,9 @@ pub mod protos;
 pub mod telemetry;
 pub mod worker;
 pub use temporalio_common_wasm::{
-    ActivityDefinition, HasWorkflowDefinition, Priority, QueryDefinition, SignalDefinition,
-    UntypedWorkflow, UpdateDefinition, WorkerDeploymentVersion, WorkflowDefinition,
-    data_converters,
+    ActivityDefinition, ActivityError, HasWorkflowDefinition, Priority, QueryDefinition,
+    SignalDefinition, UntypedWorkflow, UpdateDefinition, WorkerDeploymentVersion,
+    WorkflowDefinition, data_converters,
 };
 
 macro_rules! dbg_panic {

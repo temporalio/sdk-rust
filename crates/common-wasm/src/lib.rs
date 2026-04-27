@@ -14,7 +14,7 @@ pub mod protos;
 pub mod worker;
 mod workflow_definition;
 
-pub use activity_definition::ActivityDefinition;
+pub use activity_definition::{ActivityDefinition, ActivityError};
 pub use priority::Priority;
 pub use worker::WorkerDeploymentVersion;
 pub use workflow_definition::{
