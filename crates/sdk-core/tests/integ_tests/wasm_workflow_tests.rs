@@ -14,12 +14,29 @@ const WASM_WORKFLOW_TYPE: &str = "HelloWorkflow";
 #[tokio::test]
 async fn wasm_workflow_component_executes() {
     let component_path = build_wasm_hello_component().await;
-    let mut starter = CoreWfStarter::new("wasm_workflow_component_executes");
+    let component = WasmWorkflowComponent::from_file(WASM_COMPONENT_ID, component_path)
+        .expect("sample WASM component should be loadable");
+    run_hello_workflow("wasm_workflow_component_executes", component).await;
+}
+
+// Mirrors `wasm_workflow_component_executes` but loads the component bytes into memory and
+// registers via `from_bytes`, exercising the dynamic-blob loading path that callers will use
+// for runtime-supplied components (e.g. fetched over the network rather than read from disk).
+#[tokio::test]
+async fn wasm_workflow_component_executes_from_bytes() {
+    let component_path = build_wasm_hello_component().await;
+    let bytes = tokio::fs::read(&component_path)
+        .await
+        .expect("WASM component file should be readable");
+    let component = WasmWorkflowComponent::from_bytes(WASM_COMPONENT_ID, bytes)
+        .expect("WASM component bytes should be loadable");
+    run_hello_workflow("wasm_workflow_component_executes_from_bytes", component).await;
+}
+
+async fn run_hello_workflow(test_name: &'static str, component: WasmWorkflowComponent) {
+    let mut starter = CoreWfStarter::new(test_name);
     starter.sdk_config.task_types = WorkerTaskTypes::workflow_only();
-    starter.sdk_config.register_wasm_workflow(
-        WasmWorkflowComponent::from_file(WASM_COMPONENT_ID, component_path)
-            .expect("sample WASM component should be loadable"),
-    );
+    starter.sdk_config.register_wasm_workflow(component);
 
     let mut worker = starter.worker().await;
     let client = starter.get_client().await;

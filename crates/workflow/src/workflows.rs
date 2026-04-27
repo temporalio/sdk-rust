@@ -94,8 +94,7 @@ use futures_util::FutureExt;
 
 pub use crate::runtime::entry::{
     ExecutableAsyncSignal, ExecutableAsyncUpdate, ExecutableQuery, ExecutableSyncSignal,
-    ExecutableSyncUpdate, WorkflowError, WorkflowImplementation, deserialize_input,
-    serialize_output, serialize_result, wrap_handler_error,
+    ExecutableSyncUpdate, WorkflowError, WorkflowImplementation, serialize_result,
 };
 
 /// Deterministic `join_all` for use in Temporal workflows.

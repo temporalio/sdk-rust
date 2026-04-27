@@ -1,7 +1,6 @@
 //! Component-model guest export support for workflow crates.
-
-#![allow(missing_docs)]
-
+//!
+//! Everything in this module is internal SDK/component glue.
 use crate::{
     BaseWorkflowContext,
     runtime::{
@@ -74,8 +73,8 @@ impl<T: StaticWorkflowComponent> wit_guest::Guest for ExportedComponent<T> {
             initialize_workflow: decode_proto(init.initialize_workflow),
         };
         let workflow_type = init.initialize_workflow.workflow_type.clone();
-        let instance = T::instantiate_workflow(&workflow_type, init, host)
-            .map_err(convert_failure_to_wit_box)?;
+        let instance =
+            T::instantiate_workflow(&workflow_type, init, host).map_err(|e| e.encode_to_vec())?;
         Ok(wit_guest::WorkflowInstance::new(ExportedWorkflowInstance(
             RefCell::new(instance),
         )))
@@ -106,20 +105,18 @@ impl wit_guest::GuestWorkflowInstance for ExportedWorkflowInstance {
                                 wit_types::QueryResponse {
                                     response: response
                                         .result
-                                        .map(encode_proto)
-                                        .map_err(encode_proto),
+                                        .map(|e| e.encode_to_vec())
+                                        .map_err(|e| e.encode_to_vec()),
                                 },
                             )
                         }
                         ActivationJobResult::UpdateRejected(failure) => {
-                            wit_types::ActivationJobResult::UpdateRejected(
-                                convert_failure_to_wit_box(failure),
-                            )
+                            wit_types::ActivationJobResult::UpdateRejected(failure.encode_to_vec())
                         }
                     })
                     .collect(),
             })
-            .map_err(convert_failure_to_wit_box)
+            .map_err(|e| e.encode_to_vec())
     }
 
     fn poll_routine(
@@ -140,7 +137,7 @@ impl wit_guest::GuestWorkflowInstance for ExportedWorkflowInstance {
                             MainRoutineCompletion::TaskFailed(task_failure) => {
                                 wit_types::MainRoutineCompletion::TaskFailed(
                                     wit_types::TaskFailure {
-                                        failure: convert_failure_to_wit_box(task_failure.failure),
+                                        failure: task_failure.failure.encode_to_vec(),
                                         force_cause: task_failure.force_cause,
                                     },
                                 )
@@ -148,20 +145,20 @@ impl wit_guest::GuestWorkflowInstance for ExportedWorkflowInstance {
                             MainRoutineCompletion::Terminal(outcome) => {
                                 wit_types::MainRoutineCompletion::Terminal(match *outcome {
                                     TerminalOutcome::Completed(payload) => {
-                                        wit_types::TerminalOutcome::Completed(encode_proto(payload))
+                                        wit_types::TerminalOutcome::Completed(
+                                            payload.encode_to_vec(),
+                                        )
                                     }
                                     TerminalOutcome::Failed(failure) => {
-                                        wit_types::TerminalOutcome::Failed(
-                                            convert_failure_to_wit_box(failure),
-                                        )
+                                        wit_types::TerminalOutcome::Failed(failure.encode_to_vec())
                                     }
                                     TerminalOutcome::Cancelled => {
                                         wit_types::TerminalOutcome::Cancelled
                                     }
                                     TerminalOutcome::ContinueAsNew(req) => {
-                                        wit_types::TerminalOutcome::ContinueAsNew(encode_proto(
-                                            *req,
-                                        ))
+                                        wit_types::TerminalOutcome::ContinueAsNew(
+                                            req.encode_to_vec(),
+                                        )
                                     }
                                 })
                             }
@@ -170,9 +167,9 @@ impl wit_guest::GuestWorkflowInstance for ExportedWorkflowInstance {
                     RoutineCompletion::Signal(result) => {
                         wit_types::RoutineCompletion::Signal(match result {
                             Ok(()) => wit_types::SignalRoutineCompletion::Succeeded,
-                            Err(failure) => wit_types::SignalRoutineCompletion::Failed(
-                                convert_failure_to_wit_box(failure),
-                            ),
+                            Err(failure) => {
+                                wit_types::SignalRoutineCompletion::Failed(failure.encode_to_vec())
+                            }
                         })
                     }
                     RoutineCompletion::Update(completion) => {
@@ -183,7 +180,7 @@ impl wit_guest::GuestWorkflowInstance for ExportedWorkflowInstance {
                             } => wit_types::UpdateRoutineCompletion::Completed(
                                 wit_types::UpdateRoutineSuccess {
                                     protocol_instance_id,
-                                    value: encode_proto(result),
+                                    value: result.encode_to_vec(),
                                 },
                             ),
                             UpdateRoutineCompletion::Rejected {
@@ -192,7 +189,7 @@ impl wit_guest::GuestWorkflowInstance for ExportedWorkflowInstance {
                             } => wit_types::UpdateRoutineCompletion::Rejected(
                                 wit_types::UpdateRoutineRejection {
                                     protocol_instance_id,
-                                    failure: convert_failure_to_wit_box(failure),
+                                    failure: failure.encode_to_vec(),
                                 },
                             ),
                         })
@@ -200,7 +197,7 @@ impl wit_guest::GuestWorkflowInstance for ExportedWorkflowInstance {
                 }),
                 made_progress: result.made_progress,
             })
-            .map_err(convert_failure_to_wit_box)
+            .map_err(|e| e.encode_to_vec())
     }
 }
 
@@ -237,16 +234,8 @@ impl WorkflowHost for ImportedWorkflowHost {
     }
 
     fn push_command(&self, command: WorkflowCommand) {
-        wit_host::push_command(&encode_proto(command));
+        wit_host::push_command(&command.encode_to_vec());
     }
-}
-
-fn convert_failure_to_wit_box(failure: WorkflowFailure) -> wit_types::Failure {
-    encode_proto(*failure)
-}
-
-fn encode_proto<M: Message>(message: M) -> Vec<u8> {
-    message.encode_to_vec()
 }
 
 fn decode_proto<M: Message + prost::Name + Default>(bytes: Vec<u8>) -> M {

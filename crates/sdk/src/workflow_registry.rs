@@ -10,13 +10,15 @@ use temporalio_common::{
         coresdk::workflow_activation::InitializeWorkflow, temporal::api::common::v1::Payload,
     },
 };
-use temporalio_workflow::runtime::{
+use temporalio_workflow::{
     BaseWorkflowContext,
-    entry::WorkflowImplementation,
-    guest::WorkflowInstance,
-    host::WorkflowHost,
-    instance::{GuestWorkflowInstance, instantiate_workflow},
-    types::WorkflowDefinitionDescriptor,
+    runtime::{
+        entry::WorkflowImplementation,
+        guest::WorkflowInstance,
+        host::WorkflowHost,
+        instance::{GuestWorkflowInstance, instantiate_workflow},
+        types::WorkflowDefinitionDescriptor,
+    },
 };
 
 /// Host-owned execution inputs used to instantiate a single workflow run.

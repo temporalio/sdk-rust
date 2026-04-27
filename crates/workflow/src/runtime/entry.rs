@@ -277,7 +277,7 @@ pub trait ExecutableAsyncUpdate<U: UpdateDefinition>: WorkflowImplementation {
 }
 
 /// Deserialize handler input from payloads.
-pub fn deserialize_input<I: TemporalDeserializable + 'static>(
+pub(crate) fn deserialize_input<I: TemporalDeserializable + 'static>(
     payloads: Vec<Payload>,
     converter: &PayloadConverter,
 ) -> Result<I, WorkflowError> {
@@ -289,7 +289,7 @@ pub fn deserialize_input<I: TemporalDeserializable + 'static>(
 }
 
 /// Serialize handler output to a payload.
-pub fn serialize_output<O: TemporalSerializable + 'static>(
+pub(crate) fn serialize_output<O: TemporalSerializable + 'static>(
     output: &O,
     converter: &PayloadConverter,
 ) -> Result<Payload, WorkflowError> {
@@ -301,7 +301,7 @@ pub fn serialize_output<O: TemporalSerializable + 'static>(
 }
 
 /// Wrap a handler error into WorkflowError.
-pub fn wrap_handler_error(e: Box<dyn std::error::Error + Send + Sync>) -> WorkflowError {
+pub(crate) fn wrap_handler_error(e: Box<dyn std::error::Error + Send + Sync>) -> WorkflowError {
     WorkflowError::Execution(anyhow::anyhow!(e))
 }
 

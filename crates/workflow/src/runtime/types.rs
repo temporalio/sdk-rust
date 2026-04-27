@@ -1,6 +1,6 @@
 //! Shared runtime model types mirroring the checked-in WIT interface.
-
-#![allow(missing_docs)]
+//!
+//! All items here are SDK/runtime glue.
 
 use temporalio_common_wasm::protos::{
     coresdk::{

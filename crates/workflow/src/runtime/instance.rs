@@ -1,11 +1,8 @@
 //! Guest-side workflow execution implementation used by native and future WASM hosts.
 
-#![allow(missing_docs)]
-
 use crate::{
-    WorkflowContext,
+    BaseWorkflowContext, WorkflowContext,
     runtime::{
-        BaseWorkflowContext,
         entry::{WorkflowError, WorkflowImplementation},
         guest::WorkflowInstance,
         model::{TimerResult, UnblockEvent, WorkflowResult, WorkflowTermination},

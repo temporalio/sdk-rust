@@ -1,8 +1,7 @@
 //! Unstable runtime-facing APIs for workflow hosts and future WASM integrations.
 //!
 //! These modules collect the parts of the workflow crate that are intended for SDK/runtime glue
-//! rather than normal workflow authors. The long-term target for this namespace is the WIT surface
-//! checked in under `crates/workflow/wit/`.
+//! rather than normal workflow authors.
 
 use std::{
     cell::Cell,
@@ -17,8 +16,6 @@ pub mod host;
 pub mod instance;
 pub mod model;
 pub mod types;
-
-pub use crate::workflow_context::{BaseWorkflowContext, WorkflowContextView};
 
 thread_local! {
     static SDK_WAKE_DEPTH: Cell<u32> = const { Cell::new(0) };

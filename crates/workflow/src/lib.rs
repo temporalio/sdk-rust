@@ -13,9 +13,25 @@ pub mod __private {
 
 #[doc(hidden)]
 pub mod component;
+#[doc(hidden)]
 pub mod runtime;
 mod workflow_context;
 pub mod workflows;
+
+#[doc(hidden)]
+pub use runtime::model::{CancellableID, UnblockEvent};
+pub use runtime::model::{TimerResult, WorkflowResult, WorkflowTermination};
+#[doc(hidden)]
+pub use runtime::{SdkWakeGuard, is_sdk_wake};
+pub use workflow_context::{
+    ActivityCloseTimeouts, ActivityExecutionError, ActivityOptions, BaseWorkflowContext,
+    CancellableFuture, ChildWorkflowExecutionError, ChildWorkflowOptions, ChildWorkflowSignalError,
+    ContinueAsNewOptions, ExternalWorkflowHandle, LocalActivityOptions, NexusOperationOptions,
+    ParentWorkflowInfo, RootWorkflowInfo, Signal, SignalData,
+    StartChildWorkflowExecutionFailedCause, StartedChildWorkflow, SyncWorkflowContext,
+    TimerOptions, WorkflowContext, WorkflowContextView,
+};
+pub use workflows::{join, join_all, select};
 
 #[macro_export]
 #[doc(hidden)]
@@ -92,17 +108,3 @@ macro_rules! export_workflow_module {
         };
     };
 }
-
-#[doc(hidden)]
-pub use runtime::model::{CancellableID, UnblockEvent};
-pub use runtime::model::{TimerResult, WorkflowResult, WorkflowTermination};
-#[doc(hidden)]
-pub use runtime::{SdkWakeGuard, is_sdk_wake};
-pub use workflow_context::{
-    ActivityCloseTimeouts, ActivityExecutionError, ActivityOptions, BaseWorkflowContext,
-    CancellableFuture, ChildWorkflowExecutionError, ChildWorkflowOptions, ChildWorkflowSignalError,
-    ContinueAsNewOptions, ExternalWorkflowHandle, LocalActivityOptions, NexusOperationOptions,
-    ParentWorkflowInfo, RootWorkflowInfo, Signal, SignalData,
-    StartChildWorkflowExecutionFailedCause, StartedChildWorkflow, SyncWorkflowContext,
-    TimerOptions, WorkflowContext, WorkflowContextView,
-};

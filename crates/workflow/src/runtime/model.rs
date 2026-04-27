@@ -1,7 +1,5 @@
 //! Runtime protocol and execution model types shared by workflow code and native hosts.
 
-#![allow(missing_docs)]
-
 use crate::{
     runtime::types::ContinueAsNewRequest,
     workflow_context::{

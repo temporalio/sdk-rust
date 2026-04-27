@@ -1,7 +1,5 @@
 //! High-level guest-side runtime traits mirroring the checked-in WIT interface.
 
-#![allow(missing_docs)]
-
 use crate::runtime::types::{
     ActivationResult, RoutineId, RoutinePollResult, WorkflowActivation, WorkflowFailure,
 };
