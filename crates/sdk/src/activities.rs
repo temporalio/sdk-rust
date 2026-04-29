@@ -42,6 +42,9 @@
 //!     }
 //! }
 //! ```
+//!
+//! This will allows you to call the activity from workflow code still, but the actual function
+//! will never be invoked, since you won't have registered it with the worker.
 
 #[doc(inline)]
 pub use temporalio_macros::activities;

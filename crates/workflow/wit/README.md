@@ -1,54 +1,58 @@
 # Workflow Runtime WIT
 
-This directory defines the canonical high-level workflow guest interface for the future WASM SDK.
+This directory defines `temporal:workflow-runtime@0.1.0`, the high-level guest interface that
+workflow code targets when it is compiled to a WebAssembly component. It is intentionally separate
+from the core activation/completion protocol that worker SDKs speak to the Temporal cluster: core
+remains the worker-facing protocol, and a worker is responsible for translating core activations
+and completions into calls against this interface.
 
-This is intentionally **not** the existing core activation/completion protocol. Core remains the
-worker-facing protocol for the foreseeable future, and other language SDKs will continue to use it.
-The Rust worker will translate core activations and completions into this higher-level interface.
+## What's in here
 
-## Why this lives in `temporalio-workflow`
+- `world.wit` — the `workflow-module` world: imports `workflow-host`, exports `workflow-guest`.
+- `guest.wit` — `workflow-guest`: the entry points the guest exports for the host to drive
+  (`list-workflows`, `instantiate-workflow`, and the `workflow-instance` resource with `activate`
+  and `poll-routine`).
+- `host.wit` — `workflow-host`: the host capabilities the guest imports (e.g. `set-current-details`,
+  `push-command`).
+- `types.wit` — shared records and variants used by both sides (init/activation/completion shapes,
+  routine kinds, terminal outcomes, etc.). Some fields are typed as `list<u8>` and carry encoded
+  protobuf messages — those proto schemas are part of the ABI; see *Stability* below.
 
-`temporalio-workflow` is the crate that workflow implementations compile against. Checking the WIT
-in here gives the Rust runtime refactor a concrete target:
+## How a workflow runs against it
 
-- `temporalio_workflow::runtime::*` should evolve toward a direct Rust mirror of these interfaces.
-- The native Rust worker should keep calling those Rust traits directly, with no WIT serialization
-  in the hot path.
-- A future WASM backend should expose the same interface through the component model.
+1. The host instantiates a workflow run by calling `instantiate-workflow` with `workflow-init`.
+2. For each activation, the host calls `activate` on the `workflow-instance` resource. The guest
+   processes the activation's jobs and reports per-job results (started routines, query responses,
+   update rejections).
+3. The guest drives its routines (main, signals, updates) by being polled — the host calls
+   `poll-routine(routine-id)` until the routine either completes or reports it made no progress.
+4. While running, the guest invokes host functions to push commands and update execution state.
 
-## Layering
+The guest interface is deliberately higher-level than core's activation protocol: ordering rules
+and worker bookkeeping live in the host translation layer, not in the guest contract.
 
-The layers are:
+## Synchronous ABI and the WASIp3 future
 
-1. Core activation/completion protocol
-2. Native worker translation layer
-3. This WIT-shaped workflow runtime interface
-4. Workflow guest code
+The guest interface is synchronous: `activate` and `poll-routine` return ordinary results, and a
+routine signals "blocked" by returning `routine-poll-result.made-progress = false`. The host
+re-enters `poll-routine` after the relevant activation lands. This shape is what stable Wasmtime
+and `wit-bindgen` support today.
 
-That translation layer is where activation ordering and other core-specific details stay hidden.
-The guest interface here is deliberately higher level:
+When component-model async (WASIp3 / Preview 3) is stable in Wasmtime, the natural evolution is:
 
-- the host instantiates a workflow run
-- the host applies activation-wide context
-- the host notifies signals, cancellation, patches, updates, and operation resolutions
-- the guest polls until it blocks or terminates
+- `activate` and `poll-routine` become `async func`.
+- `routine-poll-result.made-progress` and the explicit `routine-id`-keyed polling protocol can
+  go away — the host can `await` each routine directly.
 
-## Native and WASM execution
-
-The runtime should support two backends behind the same worker translation logic:
-
-- a native backend that invokes Rust traits directly in-process
-- a WASM backend that invokes a component implementing `workflow-module`
-
-The goal is one logical execution model with two transport backends, not two independent workers.
+That is a breaking ABI change and will require a major-version WIT bump.
 
 ## Stability
 
-The package is published as `temporal:workflow-runtime@0.1.0` and is **not yet stable**. Until
-this is bumped to `1.0.0` any release may bump the minor version with breaking changes. Once
-external SDKs (Python, TypeScript, Go, etc.) begin compiling guest workflows against this WIT,
-breaking changes need to follow normal SemVer discipline: bump the package version, dual-export
-the old and new world from the host for a deprecation window, and document the migration path.
+The package is published as `temporal:workflow-runtime@0.1.0` and is **not yet stable**. Until it
+is bumped to `1.0.0`, any release may bump the minor version with breaking changes. Once external
+SDKs (Python, TypeScript, Go, etc.) begin compiling guest workflows against this WIT, breaking
+changes need to follow normal SemVer discipline: bump the package version, dual-export the old
+and new world from the host for a deprecation window, and document the migration path.
 
 Changes that force a major bump include:
 
@@ -57,21 +61,3 @@ Changes that force a major bump include:
 - Reordering variant cases (the discriminant order is part of the ABI).
 - Changing the proto messages encoded into `list<u8>`-typed fields (`failure`, `payload`,
   `workflow-command`, `workflow-activation`, `continue-as-new-request`).
-
-## Synchronous ABI and the WASIp3 future
-
-The current guest interface is intentionally synchronous: `activate` and `poll-routine` both
-return ordinary results, and the guest is expected to suspend by returning
-`routine-poll-result.made-progress = false`. The host then re-enters `poll-routine` after the
-relevant activation lands.
-
-This shape is what stable Wasmtime + `wit-bindgen` support today. When component-model async
-(WASIp3 / Preview 3) lands as stable in Wasmtime, the natural evolution is:
-
-- `activate` and `poll-routine` become `async func`.
-- `routine-poll-result.made-progress` and the explicit `routine-id`-keyed polling protocol
-  likely go away — the host can just `await` each routine directly.
-
-That is a breaking ABI change, so it will require a major-version WIT bump. Any other-language
-SDK that ships a guest implementation should expect to regenerate bindings against the new
-world at that point.

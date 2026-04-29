@@ -32,8 +32,9 @@ wit-bindgen = { version = "0.57.1", default-features = false, features = ["macro
 path = "../common-wasm"
 version = "0.2"
 
+[dependencies.temporalio-macros]
+path = "../macros"
+version = "0.3"
+
 [lints]
 workspace = true
-
-[dev-dependencies]
-temporalio-macros = { path = "../macros" }

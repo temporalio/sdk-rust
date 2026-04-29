@@ -12,8 +12,8 @@ mod workflow_definitions;
 /// For a usage example, see that crate's documentation.
 #[proc_macro_attribute]
 pub fn activities(_attr: TokenStream, item: TokenStream) -> TokenStream {
-    let def = parse_macro_input!(item as activities_definitions::ActivitiesParse);
-    def.0.codegen()
+    let def = parse_macro_input!(item with activities_definitions::parse_activities);
+    def.codegen()
 }
 
 /// Marks a method within an `#[activities]` impl block as an activity.
@@ -32,8 +32,8 @@ pub fn activity(_attr: TokenStream, item: TokenStream) -> TokenStream {
 /// elsewhere by a separate worker crate (or in another language).
 #[proc_macro_attribute]
 pub fn activity_definitions(_attr: TokenStream, item: TokenStream) -> TokenStream {
-    let def = parse_macro_input!(item as activities_definitions::DefinitionsParse);
-    def.0.codegen()
+    let def = parse_macro_input!(item with activities_definitions::parse_definitions);
+    def.codegen()
 }
 
 /// Marks a struct as a workflow definition.

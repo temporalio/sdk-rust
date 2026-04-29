@@ -7,8 +7,7 @@ use proc_macro2::TokenStream as TokenStream2;
 use quote::{format_ident, quote, quote_spanned};
 use syn::{
     Attribute, Block, Expr, FnArg, ImplItem, ItemImpl, ReturnType, Stmt, Type, TypePath,
-    parse::{Parse, ParseStream},
-    spanned::Spanned,
+    parse::ParseStream, spanned::Spanned,
 };
 
 #[derive(Copy, Clone, Eq, PartialEq)]
@@ -26,22 +25,12 @@ pub(crate) struct ActivitiesDefinition {
     mode: ParseMode,
 }
 
-/// Newtype that implements `Parse` for `ParseMode::Activities`.
-pub(crate) struct ActivitiesParse(pub ActivitiesDefinition);
-
-impl Parse for ActivitiesParse {
-    fn parse(input: ParseStream) -> syn::Result<Self> {
-        ActivitiesDefinition::parse_with_mode(input, ParseMode::Activities).map(Self)
-    }
+pub(crate) fn parse_activities(input: ParseStream) -> syn::Result<ActivitiesDefinition> {
+    ActivitiesDefinition::parse_with_mode(input, ParseMode::Activities)
 }
 
-/// Newtype that implements `Parse` for `ParseMode::Definitions`.
-pub(crate) struct DefinitionsParse(pub ActivitiesDefinition);
-
-impl Parse for DefinitionsParse {
-    fn parse(input: ParseStream) -> syn::Result<Self> {
-        ActivitiesDefinition::parse_with_mode(input, ParseMode::Definitions).map(Self)
-    }
+pub(crate) fn parse_definitions(input: ParseStream) -> syn::Result<ActivitiesDefinition> {
+    ActivitiesDefinition::parse_with_mode(input, ParseMode::Definitions)
 }
 
 #[derive(Default)]
@@ -319,11 +308,11 @@ impl ActivitiesDefinition {
         let module_ident = format_ident!("{}", module_name);
         let is_definitions = self.mode == ParseMode::Definitions;
 
-        // Re-emit the impl block with `#[activity]` attrs stripped and methods renamed
-        // `__greet` so the marker-struct const can keep the original name. Re-emitting also
-        // ensures any types referenced in the user's signatures (e.g. `ActivityError`) keep
-        // their imports live; in Definitions mode the bodies are `unimplemented!()` and
-        // never called, so the rewritten methods are tagged `#[allow(dead_code)]`.
+        // Re-emit the impl block with `#[activity]` attrs stripped and methods renamed with a `__`
+        // prefix so the marker-struct const can keep the original name. Re-emitting also ensures
+        // any types referenced in the user's signatures (e.g. `ActivityError`) keep their imports
+        // live; in Definitions mode the bodies are `unimplemented!()` and never called, so the
+        // rewritten methods are tagged `#[allow(dead_code)]`.
         let cleaned_impl = {
             let mut cleaned = self.impl_block.clone();
             for item in &mut cleaned.items {

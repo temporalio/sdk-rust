@@ -25,7 +25,6 @@ mod integ_tests {
     mod schedule_tests;
     mod update_tests;
     mod visibility_tests;
-    mod wasm_workflow_tests;
     mod worker_heartbeat_tests;
     mod worker_tests;
     mod worker_versioning_tests;

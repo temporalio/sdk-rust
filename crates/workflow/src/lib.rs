@@ -5,6 +5,9 @@
 extern crate self as temporalio_workflow;
 
 pub use temporalio_common_wasm as common;
+pub use temporalio_macros::{
+    init, query, run, signal, update, update_validator, workflow, workflow_methods,
+};
 
 #[doc(hidden)]
 pub mod __private {

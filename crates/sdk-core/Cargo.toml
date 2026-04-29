@@ -200,6 +200,19 @@ test = false
 required-features = ["test-utilities"]
 
 [[test]]
+name = "wasm_workflow_tests"
+path = "tests/wasm_workflow_tests.rs"
+# Prevents autodiscovery, and hence these getting run with `cargo test`. Run with
+# `cargo integ-test -t wasm_workflow_tests`. Building these requires the `wasm32-unknown-unknown`
+# target and `cargo component`, which aren't installed by default.
+test = false
+required-features = [
+  "temporalio-common/serde_serialize",
+  "test-utilities",
+  "ephemeral-server",
+]
+
+[[test]]
 name = "global_metric_tests"
 path = "tests/global_metric_tests.rs"
 test = false

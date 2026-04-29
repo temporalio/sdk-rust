@@ -1,3 +1,10 @@
+//! Tests that exercise the WASM workflow execution path. These are kept in a separate test binary
+//! because they require `cargo component` and the `wasm32-unknown-unknown` target to build the
+//! sample components, which not every CI environment has installed.
+
+#[allow(dead_code)]
+mod common;
+
 use crate::common::CoreWfStarter;
 use std::{path::PathBuf, time::Duration};
 use temporalio_client::{UntypedWorkflow, WorkflowStartOptions};
