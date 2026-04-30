@@ -9,7 +9,7 @@ use std::{
     task::{Context, Poll},
 };
 use temporalio_common::{
-    data_converters::{DataConverter, PayloadConverter},
+    data_converters::DataConverter,
     protos::{
         coresdk::{
             workflow_activation::{
@@ -59,7 +59,7 @@ pub(crate) fn start_workflow(
     run_id: String,
     init_workflow_job: InitializeWorkflow,
     outgoing_completions: UnboundedSender<WorkflowActivationCompletion>,
-    payload_converter: PayloadConverter,
+    data_converter: DataConverter,
     detect_nondeterministic: bool,
 ) -> Result<
     (
@@ -81,7 +81,7 @@ pub(crate) fn start_workflow(
         task_queue,
         run_id,
         init_workflow_job,
-        payload_converter: payload_converter.clone(),
+        data_converter: data_converter.clone(),
         host: host.clone(),
     })
     .context("Failed to create workflow execution")?;

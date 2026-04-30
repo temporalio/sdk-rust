@@ -1,6 +1,6 @@
 [package]
 name = "temporalio-workflow"
-version = "0.2.0"
+version = "0.4.0"
 edition = "2024"
 authors = ["Temporal Technologies Inc. <sdk@temporal.io>"]
 license-file = { workspace = true }
@@ -30,11 +30,11 @@ wit-bindgen = { version = "0.57.1", default-features = false, features = ["macro
 
 [dependencies.temporalio-common-wasm]
 path = "../common-wasm"
-version = "0.2"
+version = "0.4"
 
 [dependencies.temporalio-macros]
 path = "../macros"
-version = "0.3"
+version = "0.4"
 
 [lints]
 workspace = true

@@ -148,11 +148,24 @@ where
         }
     }
 
-    fn rejection_for_missing_update_handler(name: String) -> ActivationJobResult {
-        ActivationJobResult::UpdateRejected(Box::new(Failure {
-            message: format!("No update handler registered for update name {name}"),
-            ..Default::default()
-        }))
+    fn rejection_for_missing_update_handler(&self, name: String) -> ActivationJobResult {
+        ActivationJobResult::UpdateRejected(Box::new(self.workflow_error_to_failure(
+            WorkflowError::Execution(anyhow::anyhow!(
+                "No update handler registered for update name {name}"
+            )),
+        )))
+    }
+
+    fn workflow_error_to_failure(&self, err: WorkflowError) -> Failure {
+        use temporalio_common_wasm::error::{OutgoingError, OutgoingWorkflowError};
+        let outgoing: OutgoingWorkflowError = match err {
+            WorkflowError::PayloadConversion(err) => OutgoingWorkflowError::from(err),
+            WorkflowError::Execution(err) => OutgoingWorkflowError::from(err),
+        };
+        self.base_ctx.data_converter().to_failure(
+            &SerializationContextData::Workflow,
+            OutgoingError::Workflow(outgoing),
+        )
     }
 
     fn next_routine_id(&mut self) -> RoutineId {
@@ -196,9 +209,11 @@ where
             match validation {
                 Some(Ok(())) => {}
                 Some(Err(e)) => {
-                    return ActivationJobResult::UpdateRejected(Box::new(e.into()));
+                    return ActivationJobResult::UpdateRejected(Box::new(
+                        self.workflow_error_to_failure(e),
+                    ));
                 }
-                None => return Self::rejection_for_missing_update_handler(name),
+                None => return self.rejection_for_missing_update_handler(name),
             }
         }
 
@@ -225,7 +240,7 @@ where
                 }),
             })
         } else {
-            Self::rejection_for_missing_update_handler(name)
+            self.rejection_for_missing_update_handler(name)
         }
     }
 
@@ -245,11 +260,10 @@ where
                 .state(|wf| wf.dispatch_query(view, &query.query_type, &payloads, converter))
             {
                 Some(Ok(payload)) => Ok(payload),
-                None => Err(Failure {
-                    message: format!("No query handler for '{}'", query.query_type),
-                    ..Default::default()
-                }),
-                Some(Err(e)) => Err(e.into()),
+                None => Err(self.workflow_error_to_failure(WorkflowError::Execution(
+                    anyhow::anyhow!("No query handler for '{}'", query.query_type),
+                ))),
+                Some(Err(e)) => Err(self.workflow_error_to_failure(e)),
             },
         }
     }
@@ -294,6 +308,7 @@ where
     }
 
     fn terminal_outcome_from_result(
+        &self,
         result: WorkflowResult<Payload>,
     ) -> crate::runtime::types::TerminalOutcome {
         match result {
@@ -308,10 +323,11 @@ where
                 panic!("workflow instances must not explicitly return eviction")
             }
             Err(WorkflowTermination::Failed(err)) => {
-                crate::runtime::types::TerminalOutcome::Failed(Box::new(Failure {
-                    message: format!("Workflow execution error: {err}"),
-                    ..Default::default()
-                }))
+                let failure = self.base_ctx.data_converter().to_failure(
+                    &SerializationContextData::Workflow,
+                    temporalio_common_wasm::error::OutgoingError::Workflow(err),
+                );
+                crate::runtime::types::TerminalOutcome::Failed(Box::new(failure))
             }
         }
     }
@@ -371,7 +387,7 @@ where
                     made_progress,
                 } => RoutinePollResult {
                     completion: Some(RoutineCompletion::Main(MainRoutineCompletion::Terminal(
-                        Box::new(Self::terminal_outcome_from_result(result)),
+                        Box::new(self.terminal_outcome_from_result(result)),
                     ))),
                     made_progress,
                 },
@@ -406,12 +422,7 @@ where
                 result,
                 made_progress,
             } => {
-                let result = result.map_err(|err| {
-                    Box::new(Failure {
-                        message: format!("Signal handler error: {err}"),
-                        ..Default::default()
-                    })
-                });
+                let result = result.map_err(|err| Box::new(self.workflow_error_to_failure(err)));
                 Ok(RoutinePollResult {
                     completion: Some(RoutineCompletion::Signal(result)),
                     made_progress,
@@ -448,7 +459,7 @@ where
                     },
                     Err(err) => UpdateRoutineCompletion::Rejected {
                         protocol_instance_id,
-                        failure: Box::new(err.into()),
+                        failure: Box::new(self.workflow_error_to_failure(err)),
                     },
                 };
                 Ok(RoutinePollResult {

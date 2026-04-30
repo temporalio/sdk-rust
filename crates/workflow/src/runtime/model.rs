@@ -3,12 +3,15 @@
 use crate::{
     runtime::types::ContinueAsNewRequest,
     workflow_context::{
-        ActivityExecutionError, ChildWfCommon, ChildWorkflowExecutionError,
-        ChildWorkflowSignalError, NexusUnblockData, PendingChildWorkflow, StartedNexusOperation,
+        ChildWfCommon, NexusUnblockData, PendingChildWorkflow, StartedNexusOperation,
     },
 };
 use temporalio_common_wasm::{
     WorkflowDefinition,
+    error::{
+        ActivityExecutionError, ApplicationFailure, ChildWorkflowExecutionError,
+        ChildWorkflowSignalError,
+    },
     protos::{
         coresdk::{
             activity_result::ActivityResolution,
@@ -208,7 +211,7 @@ pub enum WorkflowTermination {
     #[error("Continue as new")]
     ContinueAsNew(Box<ContinueAsNewRequest>),
     #[error("Workflow failed: {0}")]
-    Failed(#[source] anyhow::Error),
+    Failed(#[source] temporalio_common_wasm::error::OutgoingWorkflowError),
 }
 
 impl WorkflowTermination {
@@ -216,31 +219,53 @@ impl WorkflowTermination {
         Self::ContinueAsNew(Box::new(can))
     }
 
-    pub fn failed(err: impl Into<anyhow::Error>) -> Self {
+    /// Construct a [`WorkflowTermination::Failed`] from an [`ApplicationFailure`].
+    pub fn failed_application(err: ApplicationFailure) -> Self {
         Self::Failed(err.into())
     }
 }
 
 impl From<anyhow::Error> for WorkflowTermination {
     fn from(err: anyhow::Error) -> Self {
-        Self::Failed(err)
+        Self::Failed(err.into())
+    }
+}
+
+impl From<temporalio_common_wasm::data_converters::PayloadConversionError> for WorkflowTermination {
+    fn from(value: temporalio_common_wasm::data_converters::PayloadConversionError) -> Self {
+        Self::Failed(value.into())
+    }
+}
+
+impl From<crate::runtime::entry::WorkflowError> for WorkflowTermination {
+    fn from(value: crate::runtime::entry::WorkflowError) -> Self {
+        match value {
+            crate::runtime::entry::WorkflowError::PayloadConversion(err) => Self::from(err),
+            crate::runtime::entry::WorkflowError::Execution(err) => Self::from(err),
+        }
     }
 }
 
 impl From<ActivityExecutionError> for WorkflowTermination {
     fn from(value: ActivityExecutionError) -> Self {
-        Self::failed(value)
+        Self::Failed(value.into())
     }
 }
 
 impl From<ChildWorkflowExecutionError> for WorkflowTermination {
     fn from(value: ChildWorkflowExecutionError) -> Self {
-        Self::failed(value)
+        Self::Failed(value.into())
     }
 }
 
 impl From<ChildWorkflowSignalError> for WorkflowTermination {
     fn from(value: ChildWorkflowSignalError) -> Self {
-        Self::failed(value)
+        Self::Failed(value.into())
+    }
+}
+
+impl From<temporalio_common_wasm::error::ChildWorkflowStartError> for WorkflowTermination {
+    fn from(value: temporalio_common_wasm::error::ChildWorkflowStartError) -> Self {
+        Self::Failed(value.into())
     }
 }

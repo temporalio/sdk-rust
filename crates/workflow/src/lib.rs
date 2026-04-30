@@ -26,11 +26,14 @@ pub use runtime::model::{CancellableID, UnblockEvent};
 pub use runtime::model::{TimerResult, WorkflowResult, WorkflowTermination};
 #[doc(hidden)]
 pub use runtime::{SdkWakeGuard, is_sdk_wake};
+pub use temporalio_common_wasm::error::{
+    ActivityExecutionError, ChildWorkflowExecutionError, ChildWorkflowSignalError,
+    ChildWorkflowStartError,
+};
 pub use workflow_context::{
-    ActivityCloseTimeouts, ActivityExecutionError, ActivityOptions, BaseWorkflowContext,
-    CancellableFuture, ChildWorkflowExecutionError, ChildWorkflowOptions, ChildWorkflowSignalError,
-    ContinueAsNewOptions, ExternalWorkflowHandle, LocalActivityOptions, NexusOperationOptions,
-    ParentWorkflowInfo, RootWorkflowInfo, Signal, SignalData,
+    ActivityCloseTimeouts, ActivityOptions, BaseWorkflowContext, CancellableFuture,
+    ChildWorkflowOptions, ContinueAsNewOptions, ExternalWorkflowHandle, LocalActivityOptions,
+    NexusOperationOptions, ParentWorkflowInfo, RootWorkflowInfo, Signal, SignalData,
     StartChildWorkflowExecutionFailedCause, StartedChildWorkflow, SyncWorkflowContext,
     TimerOptions, WorkflowContext, WorkflowContextView,
 };

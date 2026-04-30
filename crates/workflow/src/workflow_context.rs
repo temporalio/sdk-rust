@@ -93,6 +93,11 @@ impl BaseWorkflowContext {
         }
     }
 
+    /// Returns the [`DataConverter`] associated with this workflow's worker.
+    pub fn data_converter(&self) -> &DataConverter {
+        &self.inner.data_converter
+    }
+
     pub(crate) fn record_patch(&self, patch_id: String, present: bool) {
         self.inner
             .shared

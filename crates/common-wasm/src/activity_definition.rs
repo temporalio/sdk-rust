@@ -3,9 +3,8 @@
 
 use crate::{
     data_converters::{TemporalDeserializable, TemporalSerializable},
-    protos::temporal::api::common::v1::Payload,
+    error::{ApplicationFailure, FailurePayloads},
 };
-use std::time::Duration;
 
 /// Implement on a marker struct to define an activity.
 ///
@@ -26,22 +25,13 @@ pub trait ActivityDefinition {
 /// Returned as errors from activity functions.
 #[derive(Debug)]
 pub enum ActivityError {
-    /// This error can be returned from activities to allow the explicit configuration of certain
-    /// error properties. It's also the default error type that arbitrary errors will be converted
-    /// into.
-    Retryable {
-        /// The underlying error
-        source: Box<dyn std::error::Error + Send + Sync + 'static>,
-        /// If specified, the next retry (if there is one) will occur after this delay
-        explicit_delay: Option<Duration>,
-    },
+    /// Return this error to attach application-failure metadata to an activity failure.
+    Application(Box<ApplicationFailure>),
     /// Return this error to indicate your activity is cancelling
     Cancelled {
-        /// Some data to save as the cancellation reason
-        details: Option<Payload>,
+        /// Optional cancellation details.
+        details: Option<FailurePayloads>,
     },
-    /// Return this error to indicate that the activity should not be retried.
-    NonRetryable(Box<dyn std::error::Error + Send + Sync + 'static>),
     /// Return this error to indicate that the activity will be completed outside of this activity
     /// definition, by an external client.
     WillCompleteAsync,
@@ -52,6 +42,22 @@ impl ActivityError {
     pub fn cancelled() -> Self {
         Self::Cancelled { details: None }
     }
+
+    /// Construct a cancelled error with details that will be converted using the active data
+    /// converter.
+    pub fn cancelled_with_details<T>(details: T) -> Self
+    where
+        T: Into<FailurePayloads>,
+    {
+        Self::Cancelled {
+            details: Some(details.into()),
+        }
+    }
+
+    /// Construct an application activity error.
+    pub fn application(err: ApplicationFailure) -> Self {
+        Self::Application(err.into())
+    }
 }
 
 impl<E> From<E> for ActivityError
@@ -59,9 +65,9 @@ where
     E: Into<anyhow::Error>,
 {
     fn from(source: E) -> Self {
-        Self::Retryable {
-            source: source.into().into_boxed_dyn_error(),
-            explicit_delay: None,
+        match source.into().downcast::<ApplicationFailure>() {
+            Ok(application_failure) => Self::Application(Box::new(application_failure)),
+            Err(err) => Self::Application(ApplicationFailure::new(err).into()),
         }
     }
 }

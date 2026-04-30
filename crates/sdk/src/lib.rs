@@ -81,6 +81,11 @@ mod workflow_registry;
 mod workflow_wasm;
 pub mod workflows;
 
+pub use crate::error::{
+    ActivityExecutionError, ApplicationFailure, ChildWorkflowExecutionError,
+    ChildWorkflowSignalError, ChildWorkflowStartError, OutgoingActivityError, OutgoingError,
+    OutgoingWorkflowError,
+};
 pub use temporalio_client::Namespace;
 pub use temporalio_workflow::{
     ActivityCloseTimeouts, ActivityOptions, BaseWorkflowContext, CancellableFuture,
@@ -130,9 +135,7 @@ use temporalio_common::{
             workflow_activation::{WorkflowActivation, workflow_activation_job::Variant},
             workflow_completion::WorkflowActivationCompletion,
         },
-        temporal::api::{
-            common::v1::Payload, enums::v1::WorkflowTaskFailedCause, failure::v1::Failure,
-        },
+        temporal::api::{common::v1::Payload, enums::v1::WorkflowTaskFailedCause},
     },
     worker::{WorkerDeploymentOptions, WorkerTaskTypes, build_id_from_current_exe},
 };

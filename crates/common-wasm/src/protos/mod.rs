@@ -161,6 +161,14 @@ pub mod coresdk {
                 }
             }
 
+            pub fn cancel(fail: APIFailure) -> Self {
+                Self {
+                    status: Some(aer::Status::Cancelled(Cancellation {
+                        failure: Some(fail),
+                    })),
+                }
+            }
+
             pub fn cancel_from_details(payload: Option<Payload>) -> Self {
                 Self {
                     status: Some(aer::Status::Cancelled(Cancellation::from_details(payload))),

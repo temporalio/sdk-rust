@@ -9,6 +9,7 @@ extern crate tracing;
 
 mod activity_definition;
 pub mod data_converters;
+pub mod error;
 mod priority;
 pub mod protos;
 pub mod worker;

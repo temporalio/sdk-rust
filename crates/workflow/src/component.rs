@@ -18,7 +18,7 @@ use futures_util::task::noop_waker;
 use prost::Message;
 use std::{cell::RefCell, marker::PhantomData, rc::Rc};
 use temporalio_common_wasm::{
-    data_converters::PayloadConverter,
+    data_converters::DataConverter,
     protos::{coresdk::workflow_commands::WorkflowCommand, temporal::api::failure::v1::Failure},
 };
 
@@ -209,13 +209,14 @@ where
     <W::Run as temporalio_common_wasm::WorkflowDefinition>::Input: Send,
 {
     let args = init.initialize_workflow.arguments.clone();
-    let payload_converter = PayloadConverter::default();
+    let data_converter = DataConverter::default();
+    let payload_converter = data_converter.payload_converter().clone();
     let base_ctx = BaseWorkflowContext::new(
         init.namespace,
         init.task_queue,
         init.run_id,
         init.initialize_workflow,
-        payload_converter.clone(),
+        data_converter,
         host,
     );
     instantiate_workflow::<W>(args, payload_converter, base_ctx).map_err(|err| {

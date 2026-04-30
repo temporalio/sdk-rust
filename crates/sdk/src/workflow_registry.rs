@@ -4,7 +4,8 @@ use anyhow::Context;
 use temporalio_common::{
     WorkflowDefinition,
     data_converters::{
-        GenericPayloadConverter, PayloadConverter, SerializationContext, SerializationContextData,
+        DataConverter, GenericPayloadConverter, PayloadConverter, SerializationContext,
+        SerializationContextData,
     },
     protos::{
         coresdk::workflow_activation::InitializeWorkflow, temporal::api::common::v1::Payload,
@@ -27,7 +28,7 @@ pub(crate) struct WorkflowExecutionInput {
     pub task_queue: String,
     pub run_id: String,
     pub init_workflow_job: InitializeWorkflow,
-    pub payload_converter: PayloadConverter,
+    pub data_converter: DataConverter,
     pub host: Rc<dyn WorkflowHost>,
 }
 
@@ -150,16 +151,17 @@ fn workflow_input_parts(
         task_queue,
         run_id,
         init_workflow_job,
-        payload_converter,
+        data_converter,
         host,
     } = input;
     let payloads = init_workflow_job.arguments.clone();
+    let payload_converter = data_converter.payload_converter().clone();
     let base_ctx = BaseWorkflowContext::new(
         namespace,
         task_queue,
         run_id,
         init_workflow_job,
-        payload_converter.clone(),
+        data_converter,
         host,
     );
     (payloads, payload_converter, base_ctx)

@@ -1,6 +1,6 @@
 [package]
 name = "temporalio-common-wasm"
-version = "0.2.0"
+version = "0.4.0"
 edition = "2024"
 authors = ["Temporal Technologies Inc. <sdk@temporal.io>"]
 license-file = { workspace = true }
@@ -58,5 +58,6 @@ workspace = true
 
 [dev-dependencies]
 futures-util = { version = "0.3", default-features = false }
+rstest = "0.26"
 tempfile = "3.21"
 tokio = { version = "1.47", features = ["macros", "rt"] }
