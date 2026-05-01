@@ -1332,8 +1332,6 @@ async fn graceful_shutdown_sends_shutdown_worker_rpc_during_initiate() {
     worker.finalize_shutdown().await;
 }
 
-/// Verifies that even if the a nexus task completion is dropped, the nexus worker
-/// is able to trigger PollShutdown.
 #[tokio::test]
 async fn validate_enables_auto_enroll_capability() {
     let mut mock = mock_worker_client();
@@ -1392,7 +1390,7 @@ async fn validate_without_auto_enroll_leaves_capabilities_off() {
     worker.drain_pollers_and_shutdown().await;
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn nexus_shutdown_does_not_hang_when_pending_completion_is_cancelled() {
     let telemetry = telemetry_init(
         TelemetryOptions::builder()
