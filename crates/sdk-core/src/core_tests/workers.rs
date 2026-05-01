@@ -1443,11 +1443,11 @@ async fn nexus_shutdown_does_not_hang_when_pending_completion_is_cancelled() {
         .await
         .expect_err("poll should wait for the outstanding Nexus task");
 
-    // Send completion that we know will hang indefinitely before notifying waitiers
+    // Send completion that we know will hang indefinitely before notifying waiters
     let mut completion =
         Box::pin(worker.complete_nexus_task(create_test_nexus_completion(nexus_task.task_token())));
 
-    // Wait for the completion to start then drop it before notify_waitiers is triggered
+    // Wait for the completion to start then drop it before notify_waiters is triggered
     // Use select so the completion future is polled and completion actually starts
     tokio::select! {
         _ = completion_rpc_started.wait() => {}
