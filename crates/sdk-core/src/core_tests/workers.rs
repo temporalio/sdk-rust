@@ -1331,6 +1331,8 @@ async fn graceful_shutdown_sends_shutdown_worker_rpc_during_initiate() {
     worker.finalize_shutdown().await;
 }
 
+/// Verifies that even if the a nexus task completion is dropped, the nexus worker
+/// is able to trigger PollShutdown.
 #[tokio::test]
 async fn validate_enables_auto_enroll_capability() {
     let mut mock = mock_worker_client();
@@ -1394,6 +1396,8 @@ async fn nexus_shutdown_does_not_hang_when_pending_completion_is_cancelled() {
     let mut client = mock_manual_worker_client();
     let completion_rpc_started = Arc::new(Barrier::new(2));
     let completion_rpc_started_clone = completion_rpc_started.clone();
+
+    // Create a client that will hang on complete_nexus_task
     client
         .expect_complete_nexus_task()
         .times(1)
@@ -1429,16 +1433,22 @@ async fn nexus_shutdown_does_not_hang_when_pending_completion_is_cancelled() {
     });
     let worker = mock_worker(mocks);
 
+    // Poll the first task from the stream and initiate shutdown
     let nexus_task = worker.poll_nexus_task().await.unwrap();
     worker.initiate_shutdown();
 
-    let mut shutdown_poll = Box::pin(worker.poll_nexus_task());
-    tokio::time::timeout(Duration::from_millis(50), shutdown_poll.as_mut())
+    // Poll the stream again and expect it to wait for the task to complete
+    let mut poll_future = Box::pin(worker.poll_nexus_task());
+    tokio::time::timeout(Duration::from_millis(50), poll_future.as_mut())
         .await
-        .expect_err("shutdown poll should wait for the outstanding Nexus task");
+        .expect_err("poll should wait for the outstanding Nexus task");
 
+    // Send completion that we know will hang indefinitely before notifying waitiers
     let mut completion =
         Box::pin(worker.complete_nexus_task(create_test_nexus_completion(nexus_task.task_token())));
+
+    // Wait for the completion to start then drop it before notify_waitiers is triggered
+    // Use select so the completion future is polled and completion actually starts
     tokio::select! {
         _ = completion_rpc_started.wait() => {}
         result = completion.as_mut() => {
@@ -1447,11 +1457,13 @@ async fn nexus_shutdown_does_not_hang_when_pending_completion_is_cancelled() {
     }
     drop(completion);
 
-    let poll_result = tokio::time::timeout(Duration::from_secs(1), shutdown_poll.as_mut())
+    // Polling again should now return PollError::ShutDown because the outstanding task map is empty
+    // and waiters should have been notified.
+    let poll_result = tokio::time::timeout(Duration::from_secs(1), poll_future.as_mut())
         .await
         .expect("shutdown poll should finish when a pending completion future is cancelled");
-    assert_matches!(poll_result.unwrap_err(), PollError::ShutDown);
-    drop(shutdown_poll);
+    assert_matches!(poll_result, Err(PollError::ShutDown));
+    drop(poll_future);
 
     worker.shutdown().await;
     worker.finalize_shutdown().await;

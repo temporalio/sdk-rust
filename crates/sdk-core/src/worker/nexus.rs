@@ -351,9 +351,9 @@ impl NexusManager {
     }
 }
 
-// TaskCompleteNotify is used to ensure that waiters are notified when a task
-// is removed from the outstanding task map even in the event that the running
-// future is dropped.
+/// TaskCompleteNotify is used to ensure that waiters are notified when a task
+/// is removed from the outstanding task map even in the event that the running
+/// future is dropped.
 struct TaskCompletedNotify {
     inner: Option<Arc<Notify>>,
 }
