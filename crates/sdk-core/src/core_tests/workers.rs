@@ -10,11 +10,11 @@ use crate::{
         self, PollerBehavior,
         client::{
             MockWorkerClient,
-            mocks::{DEFAULT_TEST_CAPABILITIES, mock_worker_client},
+            mocks::{DEFAULT_TEST_CAPABILITIES, mock_manual_worker_client, mock_worker_client},
         },
     },
 };
-use futures_util::{stream, stream::StreamExt};
+use futures_util::{FutureExt, future, stream, stream::StreamExt};
 use std::{
     cell::RefCell,
     collections::HashMap,
@@ -1387,4 +1387,72 @@ async fn validate_without_auto_enroll_leaves_capabilities_off() {
     assert!(!caps.poller_autoscaling());
 
     worker.drain_pollers_and_shutdown().await;
+}
+
+#[tokio::test]
+async fn nexus_shutdown_does_not_hang_when_pending_completion_is_cancelled() {
+    let mut client = mock_manual_worker_client();
+    let completion_rpc_started = Arc::new(Barrier::new(2));
+    let completion_rpc_started_clone = completion_rpc_started.clone();
+    client
+        .expect_complete_nexus_task()
+        .times(1)
+        .returning(move |_, _| {
+            let completion_rpc_started = completion_rpc_started_clone.clone();
+            async move {
+                completion_rpc_started.wait().await;
+                future::pending::<Result<RespondNexusTaskCompletedResponse, tonic::Status>>().await
+            }
+            .boxed()
+        });
+
+    let mut mocks = MocksHolder::from_client_with_custom(
+        client,
+        None::<stream::Empty<PollWorkflowTaskQueueResponse>>,
+        None::<Vec<QueueResponse<PollActivityTaskQueueResponse>>>,
+        Some(vec![QueueResponse::from(create_test_nexus_task(
+            None,
+            Some(nexus::v1::request::Capabilities {
+                temporal_failure_responses: true,
+            }),
+        ))]),
+    );
+    mocks.worker_cfg(|w| {
+        w.task_queue = "nexus-shutdown-cancelled-completion".to_string();
+        w.task_types = WorkerTaskTypes {
+            enable_workflows: false,
+            enable_local_activities: false,
+            enable_remote_activities: false,
+            enable_nexus: true,
+        };
+        w.skip_client_worker_set_check = true;
+    });
+    let worker = mock_worker(mocks);
+
+    let nexus_task = worker.poll_nexus_task().await.unwrap();
+    worker.initiate_shutdown();
+
+    let mut shutdown_poll = Box::pin(worker.poll_nexus_task());
+    tokio::time::timeout(Duration::from_millis(50), shutdown_poll.as_mut())
+        .await
+        .expect_err("shutdown poll should wait for the outstanding Nexus task");
+
+    let mut completion =
+        Box::pin(worker.complete_nexus_task(create_test_nexus_completion(nexus_task.task_token())));
+    tokio::select! {
+        _ = completion_rpc_started.wait() => {}
+        result = completion.as_mut() => {
+            panic!("completion should stay pending, got {result:?}");
+        }
+    }
+    drop(completion);
+
+    let poll_result = tokio::time::timeout(Duration::from_secs(1), shutdown_poll.as_mut())
+        .await
+        .expect("shutdown poll should finish when a pending completion future is cancelled");
+    assert_matches!(poll_result.unwrap_err(), PollError::ShutDown);
+    drop(shutdown_poll);
+
+    worker.shutdown().await;
+    worker.finalize_shutdown().await;
 }

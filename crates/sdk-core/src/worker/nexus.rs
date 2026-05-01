@@ -127,6 +127,8 @@ impl NexusManager {
     ) -> Result<(), CompleteNexusError> {
         let removed = self.outstanding_task_map.lock().remove(&tt);
         if let Some(task_info) = removed {
+            let task_completed_notify =
+                TaskCompletedNotify::new(self.task_completed_notify.clone());
             self.metrics
                 .nexus_task_execution_latency(task_info.start_time.elapsed());
             task_info.timeout_task.inspect(|jh| jh.abort());
@@ -317,7 +319,7 @@ impl NexusManager {
                 }
             };
 
-            self.task_completed_notify.notify_waiters();
+            task_completed_notify.notify_waiters();
 
             if let Some(e) = maybe_net_err {
                 if e.code() == tonic::Code::NotFound {
@@ -346,6 +348,37 @@ impl NexusManager {
             return;
         }
         self.poll_returned_shutdown_token.cancelled().await;
+    }
+}
+
+// TaskCompleteNotify is used to ensure that waiters are notified when a task
+// is removed from the outstanding task map even in the event that the running
+// future is dropped.
+struct TaskCompletedNotify {
+    inner: Option<Arc<Notify>>,
+}
+
+impl TaskCompletedNotify {
+    fn new(notify: Arc<Notify>) -> Self {
+        Self {
+            inner: Some(notify),
+        }
+    }
+
+    fn notify_inner(&mut self) {
+        if let Some(notify) = self.inner.take() {
+            notify.notify_waiters();
+        }
+    }
+
+    fn notify_waiters(mut self) {
+        self.notify_inner();
+    }
+}
+
+impl Drop for TaskCompletedNotify {
+    fn drop(&mut self) {
+        self.notify_inner();
     }
 }
 
