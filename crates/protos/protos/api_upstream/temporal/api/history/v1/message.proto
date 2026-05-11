@@ -204,6 +204,10 @@ message WorkflowExecutionStartedEventAttributes {
     // The configuration may be updated after start via UpdateWorkflowExecutionOptions, which
     // will be reflected in the WorkflowExecutionOptionsUpdatedEvent.
     temporal.api.workflow.v1.TimeSkippingConfig time_skipping_config = 41;
+
+    // The time skipped by the previous execution that started this workflow.
+    // It can happen in cases of child workflows and continue-as-new workflows.
+    google.protobuf.Duration initial_skipped_duration = 42;
 }
 
 // Wrapper for a target deployment version that the SDK declined to upgrade to.
@@ -770,6 +774,12 @@ message StartChildWorkflowExecutionInitiatedEventAttributes {
     bool inherit_build_id = 19 [deprecated = true];
     // Priority metadata
     temporal.api.common.v1.Priority priority = 20;
+
+    // The propagated time-skipping configuration for the child workflow.
+    temporal.api.workflow.v1.TimeSkippingConfig time_skipping_config = 21;
+
+    // Propagate the duration skipped to the child workflow.
+    google.protobuf.Duration initial_skipped_duration = 30;
 }
 
 message StartChildWorkflowExecutionFailedEventAttributes {

@@ -1527,6 +1527,10 @@ service WorkflowService {
                 body: "*"
             }
         };
+        option (temporal.api.protometa.v1.request_header) = {
+            header: "temporal-resource-id"
+            value: "workflow:{execution.workflow_id}"
+        };
     }
 
     // WorkerHeartbeat receive heartbeat request from the worker.
@@ -1861,6 +1865,141 @@ service WorkflowService {
     // (-- api-linter: core::0127::http-annotation=disabled
     //     aip.dev/not-precedent: Activity deletion not exposed to HTTP, users should use cancel or terminate. --)
     rpc DeleteActivityExecution (DeleteActivityExecutionRequest) returns (DeleteActivityExecutionResponse) {}
+
+    // PauseActivityExecution pauses the execution of an activity specified by its ID.
+    // This API can be used to target a workflow activity or a standalone activity
+    //
+    // Pausing an activity means:
+    // - If the activity is currently waiting for a retry or is running and subsequently fails,
+    //   it will not be rescheduled until it is unpaused.
+    // - If the activity is already paused, calling this method will have no effect.
+    // - If the activity is running and finishes successfully, the activity will be completed.
+    // - If the activity is running and finishes with failure:
+    //   * if there is no retry left - the activity will be completed.
+    //   * if there are more retries left - the activity will be paused.
+    // For long-running activities:
+    // - activities in paused state will send a cancellation with "activity_paused" set to 'true' in response to 'RecordActivityTaskHeartbeat'.
+    //
+    // Returns a `NotFound` error if there is no pending activity with the provided ID
+    rpc PauseActivityExecution (PauseActivityExecutionRequest) returns (PauseActivityExecutionResponse) {
+        option (google.api.http) = {
+            // Standalone activity
+            post: "/namespaces/{namespace}/activities/{activity_id}/pause"
+            body: "*"
+            additional_bindings {
+                post: "/api/v1/namespaces/{namespace}/activities/{activity_id}/pause"
+                body: "*"
+            }
+            // Workflow activity
+            additional_bindings {
+                post: "/namespaces/{namespace}/workflows/{workflow_id}/activities/{activity_id}/pause"
+                body: "*"
+            }
+            additional_bindings {
+                post: "/api/v1/namespaces/{namespace}/workflows/{workflow_id}/activities/{activity_id}/pause"
+                body: "*"
+            }
+        };
+        option (temporal.api.protometa.v1.request_header) = {
+            header: "temporal-resource-id"
+            value: "{resource_id}"
+        };
+    }
+
+    // ResetActivityExecution resets the execution of an activity specified by its ID.
+    // This API can be used to target a workflow activity or a standalone activity.
+    //
+    // Resetting an activity means:
+    // * number of attempts will be reset to 0.
+    // * activity timeouts will be reset.
+    // * if the activity is waiting for retry, and it is not paused or 'keep_paused' is not provided:
+    //    it will be scheduled immediately (* see 'jitter' flag)
+    //
+    // Returns a `NotFound` error if there is no pending activity with the provided ID or type.
+    rpc ResetActivityExecution (ResetActivityExecutionRequest) returns (ResetActivityExecutionResponse) {
+        option (google.api.http) = {
+            // Standalone activity
+            post: "/namespaces/{namespace}/activities/{activity_id}/reset"
+            body: "*"
+            additional_bindings {
+                post: "/api/v1/namespaces/{namespace}/activities/{activity_id}/reset"
+                body: "*"
+            }
+            // Workflow activity
+            additional_bindings {
+                post: "/namespaces/{namespace}/workflows/{workflow_id}/activities/{activity_id}/reset"
+                body: "*"
+            }
+            additional_bindings {
+                post: "/api/v1/namespaces/{namespace}/workflows/{workflow_id}/activities/{activity_id}/reset"
+                body: "*"
+            }
+        };
+        option (temporal.api.protometa.v1.request_header) = {
+            header: "temporal-resource-id"
+            value: "{resource_id}"
+        };
+    }
+
+    // UnpauseActivityExecution unpauses the execution of an activity specified by its ID.
+    // This API can be used to target a workflow activity or a standalone activity.
+    //
+    // If activity is not paused, this call will have no effect.
+    // If the activity was paused while waiting for retry, it will be scheduled immediately (* see 'jitter' flag).
+    // Once the activity is unpaused, all timeout timers will be regenerated.
+    //
+    // Returns a `NotFound` error if there is no pending activity with the provided ID
+    rpc UnpauseActivityExecution (UnpauseActivityExecutionRequest) returns (UnpauseActivityExecutionResponse) {
+        option (google.api.http) = {
+            // Standalone activity
+            post: "/namespaces/{namespace}/activities/{activity_id}/unpause"
+            body: "*"
+            additional_bindings {
+                post: "/api/v1/namespaces/{namespace}/activities/{activity_id}/unpause"
+                body: "*"
+            }
+            // Workflow activity
+            additional_bindings {
+                post: "/namespaces/{namespace}/workflows/{workflow_id}/activities/{activity_id}/unpause"
+                body: "*"
+            }
+            additional_bindings {
+                post: "/api/v1/namespaces/{namespace}/workflows/{workflow_id}/activities/{activity_id}/unpause"
+                body: "*"
+            }
+        };
+        option (temporal.api.protometa.v1.request_header) = {
+            header: "temporal-resource-id"
+            value: "{resource_id}"
+        };
+    }
+
+    // UpdateActivityExecutionOptions is called by the client to update the options of an activity by its ID.
+    // This API can be used to target a workflow activity or a standalone activity.
+    rpc UpdateActivityExecutionOptions (UpdateActivityExecutionOptionsRequest) returns (UpdateActivityExecutionOptionsResponse) {
+        option (google.api.http) = {
+            // Standalone activity
+            post: "/namespaces/{namespace}/activities/{activity_id}/update-options"
+            body: "*"
+            additional_bindings {
+                post: "/api/v1/namespaces/{namespace}/activities/{activity_id}/update-options"
+                body: "*"
+            }
+            // Workflow activity
+            additional_bindings {
+                post: "/namespaces/{namespace}/workflows/{workflow_id}/activities/{activity_id}/update-options"
+                body: "*"
+            }
+            additional_bindings {
+                post: "/api/v1/namespaces/{namespace}/workflows/{workflow_id}/activities/{activity_id}/update-options"
+                body: "*"
+            }
+        };
+        option (temporal.api.protometa.v1.request_header) = {
+            header: "temporal-resource-id"
+            value: "{resource_id}"
+        };
+    }
 
     // TerminateNexusOperationExecution terminates an existing Nexus operation immediately.
     //

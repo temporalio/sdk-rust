@@ -784,6 +784,9 @@ async fn call_workflow_service(
         }
         "PatchSchedule" => rpc_call_on_trait!(client, call, WorkflowService, patch_schedule),
         "PauseActivity" => rpc_call_on_trait!(client, call, WorkflowService, pause_activity),
+        "PauseActivityExecution" => {
+            rpc_call_on_trait!(client, call, WorkflowService, pause_activity_execution)
+        }
         "PauseWorkflowExecution" => {
             rpc_call_on_trait!(client, call, WorkflowService, pause_workflow_execution)
         }
@@ -859,6 +862,9 @@ async fn call_workflow_service(
             )
         }
         "ResetActivity" => rpc_call_on_trait!(client, call, WorkflowService, reset_activity),
+        "ResetActivityExecution" => {
+            rpc_call_on_trait!(client, call, WorkflowService, reset_activity_execution)
+        }
         "ResetStickyTaskQueue" => {
             rpc_call_on_trait!(client, call, WorkflowService, reset_sticky_task_queue)
         }
@@ -999,8 +1005,19 @@ async fn call_workflow_service(
         "UnpauseActivity" => {
             rpc_call_on_trait!(client, call, WorkflowService, unpause_activity)
         }
+        "UnpauseActivityExecution" => {
+            rpc_call_on_trait!(client, call, WorkflowService, unpause_activity_execution)
+        }
         "UnpauseWorkflowExecution" => {
             rpc_call_on_trait!(client, call, WorkflowService, unpause_workflow_execution)
+        }
+        "UpdateActivityExecutionOptions" => {
+            rpc_call_on_trait!(
+                client,
+                call,
+                WorkflowService,
+                update_activity_execution_options
+            )
         }
         "UpdateActivityOptions" => {
             rpc_call_on_trait!(client, call, WorkflowService, update_activity_options)

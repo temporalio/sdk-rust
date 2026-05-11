@@ -50,6 +50,8 @@ message NamespaceInfo {
         bool worker_poll_complete_on_shutdown = 8;
         // True if the namespace supports poller autoscaling
         bool poller_autoscaling = 9;
+        // True if the namespace supports worker commands (server-to-worker communication via control queues).
+        bool worker_commands = 10;
     }
 
     // Namespace configured limits

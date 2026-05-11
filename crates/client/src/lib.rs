@@ -786,7 +786,11 @@ impl Namespace {
             Namespace::Name(n) => (n, "".to_owned()),
             Namespace::Id(n) => ("".to_owned(), n),
         };
-        DescribeNamespaceRequest { namespace, id }
+        DescribeNamespaceRequest {
+            namespace,
+            id,
+            weak_consistency: false,
+        }
     }
 }
 

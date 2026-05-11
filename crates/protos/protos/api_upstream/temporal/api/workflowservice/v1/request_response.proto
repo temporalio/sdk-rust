@@ -86,6 +86,11 @@ message ListNamespacesResponse {
 message DescribeNamespaceRequest {
     string namespace = 1;
     string id = 2;
+    // If true, the server may serve the response from an eventually-consistent
+    // source instead of reading through to persistence. Defaults to false,
+    // which preserves read-after-write consistency. SDKs should set this when
+    // fetching namespace capabilities on worker/client startup.
+    bool weak_consistency = 3;
 }
 
 message DescribeNamespaceResponse {
@@ -199,6 +204,7 @@ message StartWorkflowExecutionRequest {
     temporal.api.common.v1.Priority priority = 27;
     // Deployment Options of the worker who will process the eager task. Passed when `request_eager_execution=true`.
     temporal.api.deployment.v1.WorkerDeploymentOptions eager_worker_deployment_options = 28;
+
     // Time-skipping configuration. If not set, time skipping is disabled.
     temporal.api.workflow.v1.TimeSkippingConfig time_skipping_config = 29;
 }
@@ -2065,6 +2071,7 @@ message ExecuteMultiOperationResponse {
 }
 
 // NOTE: keep in sync with temporal.api.batch.v1.BatchOperationUpdateActivityOptions
+// Deprecated. Use `UpdateActivityExecutionOptionsRequest`.
 message UpdateActivityOptionsRequest {
     // Namespace of the workflow which scheduled this activity
     string namespace = 1;
@@ -2092,17 +2099,56 @@ message UpdateActivityOptionsRequest {
 
     // If set, the activity options will be restored to the default.
     // Default options are then options activity was created with.
-    // They are part of the first SCHEDULE event.
+    // They are part of the first schedule event.
     // This flag cannot be combined with any other option; if you supply
     // restore_original together with other options, the request will be rejected.
     bool restore_original = 8;
 }
 
+message UpdateActivityExecutionOptionsRequest {
+    // Namespace of the workflow which scheduled this activity
+    string namespace = 1;
+
+    // If provided, targets a workflow activity for the given workflow ID.
+    // If empty, targets a standalone activity.
+    string workflow_id = 2;
+    // The ID of the activity to target. 
+    string activity_id = 3;
+    // Run ID of the workflow or standalone activity.
+    string run_id = 4;
+
+    // The identity of the client who initiated this request
+    string identity = 5;
+
+    // Activity options. Partial updates are accepted and controlled by update_mask
+    temporal.api.activity.v1.ActivityOptions activity_options = 6;
+
+    // Controls which fields from `activity_options` will be applied
+    google.protobuf.FieldMask update_mask = 7;
+
+    // If set, the activity options will be restored to the default.
+    // Default options are then options activity was created with.
+    // They are part of the first schedule event.
+    // This flag cannot be combined with any other option; if you supply
+    // restore_original together with other options, the request will be rejected.
+    bool restore_original = 8;
+
+    // Resource ID for routing. Contains "workflow:{workflow_id}" for workflow activities or "activity:{activity_id}" for standalone activities.
+    string resource_id = 9;
+}
+
+// Deprecated. Use `UpdateActivityExecutionOptionsResponse`.
 message UpdateActivityOptionsResponse {
     // Activity options after an update
     temporal.api.activity.v1.ActivityOptions activity_options = 1;
 }
 
+message UpdateActivityExecutionOptionsResponse {
+    // Activity options after an update
+    temporal.api.activity.v1.ActivityOptions activity_options = 1;
+}
+
+// Deprecated. Use `PauseActivityExecutionRequest`.
 message PauseActivityRequest {
     // Namespace of the workflow which scheduled this activity.
     string namespace = 1;
@@ -2123,11 +2169,45 @@ message PauseActivityRequest {
 
     // Reason to pause the activity.
     string reason = 6;
+
+    // Used to de-dupe pause requests.
+    string request_id = 7;
+
 }
 
+message PauseActivityExecutionRequest {
+    // Namespace of the workflow which scheduled this activity.
+    string namespace = 1;
+
+    // If provided, pause a workflow activity (or activities) for the given workflow ID.
+    // If empty, targets a standalone activity.
+    string workflow_id = 2;
+    // The ID of the activity to target. 
+    string activity_id = 3;
+    // Run ID of the workflow or standalone activity.
+    string run_id = 4;
+
+    // The identity of the client who initiated this request.
+    string identity = 5;
+
+    // Reason to pause the activity.
+    string reason = 6;
+
+    // Resource ID for routing. Contains "workflow:{workflow_id}" for workflow activities or "activity:{activity_id}" for standalone activities.
+    string resource_id = 7;
+
+    // Used to de-dupe pause requests.
+    string request_id = 8;
+}
+
+// Deprecated. Use `PauseActivityExecutionResponse`.
 message PauseActivityResponse {
 }
 
+message PauseActivityExecutionResponse {
+}
+
+// Deprecated. Use `UnpauseActivityExecutionRequest`.
 message UnpauseActivityRequest {
     // Namespace of the workflow which scheduled this activity.
     string namespace = 1;
@@ -2157,10 +2237,46 @@ message UnpauseActivityRequest {
     google.protobuf.Duration jitter = 9;
 }
 
+message UnpauseActivityExecutionRequest {
+    // Namespace of the workflow which scheduled this activity.
+    string namespace = 1;
+
+    // If provided, targets a workflow activity for the given workflow ID.
+    // If empty, targets a standalone activity.
+    string workflow_id = 2;
+    // The ID of the activity to target. 
+    string activity_id = 3;
+    // Run ID of the workflow or standalone activity.
+    string run_id = 4;
+
+    // The identity of the client who initiated this request.
+    string identity = 5;
+
+    // Providing this flag will also reset the number of attempts.
+    bool reset_attempts = 6;
+
+    // Providing this flag will also reset the heartbeat details.
+    bool reset_heartbeat = 7;
+
+    // Reason to unpause the activity.
+    string reason = 8;
+
+    // If set, the activity will start at a random time within the specified jitter duration.
+    google.protobuf.Duration jitter = 9;
+
+    // Resource ID for routing. Contains "workflow:{workflow_id}" for workflow activities or "activity:{activity_id}" for standalone activities.
+    string resource_id = 10;
+}
+
+// Deprecated. Use `UnpauseActivityExecutionResponse`.
 message UnpauseActivityResponse {
 }
 
+message UnpauseActivityExecutionResponse {
+}
+
 // NOTE: keep in sync with temporal.api.batch.v1.BatchOperationResetActivities
+// Deprecated. Use `ResetActivityExecutionRequest`.
 message ResetActivityRequest {
     // Namespace of the workflow which scheduled this activity.
     string namespace = 1;
@@ -2193,12 +2309,50 @@ message ResetActivityRequest {
 
     // If set, the activity options will be restored to the defaults.
     // Default options are then options activity was created with.
-    // They are part of the first SCHEDULE event.
+    // They are part of the first schedule event.
     bool restore_original_options = 9;
-
 }
 
+message ResetActivityExecutionRequest {
+    // Namespace of the workflow which scheduled this activity.
+    string namespace = 1;
+
+    // If provided, targets a workflow activity for the given workflow ID.
+    // If empty, targets a standalone activity.
+    string workflow_id = 2;
+    // The ID of the activity to target.
+    string activity_id = 3;
+    // Run ID of the workflow or standalone activity.
+    string run_id = 4;
+
+    // The identity of the client who initiated this request.
+    string identity = 5;
+
+    // Indicates that activity should reset heartbeat details.
+    // This flag will be applied only to the new instance of the activity.
+    bool reset_heartbeat = 6;
+
+    // If activity is paused, it will remain paused after reset
+    bool keep_paused = 7;
+
+    // If set, and activity is in backoff, the activity will start at a random time within the specified jitter duration.
+    // (unless it is paused and keep_paused is set)
+    google.protobuf.Duration jitter = 8;
+
+    // If set, the activity options will be restored to the defaults.
+    // Default options are then options activity was created with.
+    // They are part of the first schedule event.
+    bool restore_original_options = 9;
+
+    // Resource ID for routing. Contains "workflow:{workflow_id}" for workflow activities or "activity:{activity_id}" for standalone activities.
+    string resource_id = 10;
+}
+
+// Deprecated. Use `ResetActivityExecutionRequest`.
 message ResetActivityResponse {
+}
+
+message ResetActivityExecutionResponse {
 }
 
 // Keep the parameters in sync with:
@@ -2781,6 +2935,10 @@ message ListWorkersRequest {
     //* StartTime
     //* Status
     string query = 4;
+
+    // When true, the response will include system workers that are created implicitly
+    // by the server and not by the user. By default, system workers are excluded.
+    bool include_system_workers = 5;
 }
 
 message ListWorkersResponse {
