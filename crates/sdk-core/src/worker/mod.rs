@@ -727,8 +727,8 @@ impl Worker {
                         shutdown_token.child_token(),
                         Some(move |np| np_metrics.record_num_pollers(np)),
                         nexus_last_suc_poll_time.clone(),
-                        shared_namespace_worker,
                         capabilities.clone(),
+                        shared_namespace_worker,
                     )) as BoxedNexusPoller)
                 } else {
                     None

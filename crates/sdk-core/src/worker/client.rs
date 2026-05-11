@@ -165,7 +165,6 @@ pub trait WorkerClient: Sync + Send {
     async fn poll_nexus_task(
         &self,
         poll_options: PollOptions,
-        send_heartbeat: bool,
     ) -> Result<PollNexusTaskQueueResponse>;
     /// Complete a workflow task
     async fn complete_workflow_task(
@@ -275,6 +274,9 @@ pub struct PollOptions {
     pub no_retry: Option<NoRetryOnMatching>,
     /// Overrides the default RPC timeout for the poll request
     pub timeout_override: Option<Duration>,
+    /// If true, poll using `TaskQueueKind::WorkerCommands`. Currently only meaningful for Nexus
+    /// polls issued by the shared-namespace worker.
+    pub worker_commands_queue: bool,
 }
 /// Additional options specific to workflow task polling
 #[derive(Debug, Clone)]
@@ -381,14 +383,18 @@ impl WorkerClient for WorkerClientBag {
     async fn poll_nexus_task(
         &self,
         poll_options: PollOptions,
-        _send_heartbeat: bool,
     ) -> Result<PollNexusTaskQueueResponse> {
+        let kind = if poll_options.worker_commands_queue {
+            TaskQueueKind::WorkerCommands
+        } else {
+            TaskQueueKind::Normal
+        };
         #[allow(deprecated)] // want to list all fields explicitly
         let mut request = PollNexusTaskQueueRequest {
             namespace: self.namespace.clone(),
             task_queue: Some(TaskQueue {
                 name: poll_options.task_queue,
-                kind: TaskQueueKind::Normal as i32,
+                kind: kind as i32,
                 normal_name: "".to_string(),
             }),
             identity: self.identity(),

@@ -324,7 +324,7 @@ mod tests {
         mock.expect_poll_workflow_task()
             .returning(move |_namespace, _task_queue| Ok(Default::default()));
         mock.expect_poll_nexus_task()
-            .returning(move |_poll_options, _send_heartbeat| Ok(Default::default()));
+            .returning(move |_poll_options| Ok(Default::default()));
         mock.expect_record_worker_heartbeat().times(3).returning(
             move |_namespace, worker_heartbeat| {
                 assert_eq!(1, worker_heartbeat.len());
@@ -445,7 +445,7 @@ mod tests {
         let poll_returned_command_clone = poll_returned_command.clone();
         let at_clone = activity_task_token.clone();
         mock.expect_poll_nexus_task()
-            .returning(move |poll_options, _send_heartbeat| {
+            .returning(move |poll_options| {
                 if poll_options
                     .task_queue
                     .starts_with("temporal-sys/worker-commands/")
