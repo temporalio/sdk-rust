@@ -13743,6 +13743,11 @@
       "properties": {
         "deploymentVersion": {
           "$ref": "#/definitions/v1WorkerDeploymentVersion"
+        },
+        "revisionNumber": {
+          "type": "string",
+          "format": "int64",
+          "description": "Revision number of the task queue routing config at the time the target\nwas declined. If an incoming target's revision is <= this value, it is\nnot newer and is not used for deciding whether or not to suppress the\nupgrade signal."
         }
       },
       "description": "Wrapper for a target deployment version that the SDK declined to upgrade to.\nSee declined_target_version_upgrade on WorkflowExecutionStartedEventAttributes."
@@ -17960,14 +17965,6 @@
         "priority": {
           "$ref": "#/definitions/v1Priority",
           "title": "Priority metadata"
-        },
-        "timeSkippingConfig": {
-          "$ref": "#/definitions/v1TimeSkippingConfig",
-          "description": "The propagated time-skipping configuration for the child workflow."
-        },
-        "initialSkippedDuration": {
-          "type": "string",
-          "description": "Propagate the duration skipped to the child workflow."
         }
       }
     },
@@ -18356,7 +18353,11 @@
       "properties": {
         "enabled": {
           "type": "boolean",
-          "description": "Enables or disables time skipping for this workflow execution."
+          "description": "Enables or disables time skipping for this workflow execution.\nBy default, this field is propagated to transitively related workflows (child workflows/start-as-new/reset) \nat the time they are started.\nChanges made after a transitively related workflow has started are not propagated."
+        },
+        "disablePropagation": {
+          "type": "boolean",
+          "description": "If set, the enabled field is not propagated to transitively related workflows."
         },
         "maxSkippedDuration": {
           "type": "string",
@@ -18365,9 +18366,14 @@
         "maxElapsedDuration": {
           "type": "string",
           "description": "Maximum elapsed time since time skipping was enabled.\nThis includes both skipped time and real time elapsing."
+        },
+        "maxTargetTime": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Absolute virtual timestamp at which time skipping is disabled.\nTime skipping will not advance beyond this point."
         }
       },
-      "description": "Configuration for time skipping during a workflow execution.\nWhen enabled, virtual time advances automatically whenever there is no in-flight work.\nIn-flight work includes activities, child workflows, Nexus operations, signal/cancel external workflow operations,\nand possibly other features added in the future.\nUser timers are not classified as in-flight work and will be skipped over.\nWhen time advances, it skips to the earlier of the next user timer or the configured bound, if either exists.\n\nPropagation behavior of time skipping:\nThe enabled flag, bound fields, and accumulated skipped duration are propagated to related executions as follows:\n(1) Child workflows and continue-as-new: both the configuration and the accumulated skipped duration are\n    inherited from the current execution. The configured bound is shared between the inherited skipped\n    duration and any additional duration skipped by the new run.\n(2) Retry and cron: the configuration and accumulated skipped duration are inherited as recorded when the\n    current workflow started; the accumulated skipped duration of the current run is not propagated.\n(3) Reset: the new run retains the time-skipping configuration of the current execution. Because reset replays\n    all events up to the reset point and re-applies any UpdateWorkflowExecutionOptions changes made after that\n    point, the resulting run ends up with the same final time-skipping configuration as the previous run."
+      "description": "Configuration for time skipping during a workflow execution.\nWhen enabled, virtual time advances automatically whenever there is no in-flight work.\nIn-flight work includes activities, child workflows, Nexus operations, signal/cancel external workflow operations,\nand possibly other features added in the future.\nUser timers are not classified as in-flight work and will be skipped over.\nWhen time advances, it skips to the earlier of the next user timer or the configured bound, if either exists."
     },
     "v1TimeoutFailureInfo": {
       "type": "object",
@@ -19651,7 +19657,7 @@
         },
         "timeSkippingConfig": {
           "$ref": "#/definitions/v1TimeSkippingConfig",
-          "description": "Time-skipping configuration for this workflow execution.\nIf not set, the time-skipping configuration is not updated by this request;\nthe existing configuration is preserved."
+          "description": "Time-skipping configuration for this workflow execution.\nIf not set, the time-skipping conf will not get updated upon request, \ni.e. the existing time-skipping conf will be preserved."
         }
       }
     },
@@ -19917,6 +19923,10 @@
         "declinedTargetVersionUpgrade": {
           "$ref": "#/definitions/v1DeclinedTargetVersionUpgrade",
           "description": "During a previous run of this workflow, the server may have notified the SDK\nthat the Target Worker Deployment Version changed, but the SDK declined to\nupgrade (e.g., by continuing-as-new with PINNED behavior). This field records\nthe target version that was declined.\n\nThis is a wrapper message to distinguish \"never declined\" (nil wrapper) from\n\"declined an unversioned target\" (non-nil wrapper with nil deployment_version).\n\nUsed internally by the server during continue-as-new and retry.\nShould not be read or interpreted by SDKs."
+        },
+        "timeSkippingConfig": {
+          "$ref": "#/definitions/v1TimeSkippingConfig",
+          "description": "Initial time-skipping configuration for this workflow execution, recorded at start time.\nThis may have been set explicitly via the start workflow request, or propagated from a\nparent/previous execution.\n\nThe configuration may be updated after start via UpdateWorkflowExecutionOptions, which\nwill be reflected in the WorkflowExecutionOptionsUpdatedEvent."
         }
       },
       "title": "Always the first event in workflow history"

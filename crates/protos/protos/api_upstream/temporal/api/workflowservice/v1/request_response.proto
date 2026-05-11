@@ -2491,7 +2491,7 @@ message CreateWorkerDeploymentVersionRequest {
 
     // Optional. The identity of the client who initiated this request.
     string identity = 3;
-
+    
     // A unique identifier for this create request for idempotence. Typically UUIDv4.
     // If a second request with the same ID is recieved, it is considered a successful no-op.
     // Retrying with a different request ID for the same deployment name + build ID is an error.
@@ -2754,6 +2754,7 @@ message RecordWorkerHeartbeatRequest {
     string identity = 2;
 
     repeated temporal.api.worker.v1.WorkerHeartbeat worker_heartbeat = 3;
+
     // Resource ID for routing. Contains the worker grouping key.
     string resource_id = 4;
 }

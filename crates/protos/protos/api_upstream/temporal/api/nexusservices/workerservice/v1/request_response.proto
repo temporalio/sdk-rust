@@ -13,7 +13,6 @@ import "temporal/api/worker/v1/message.proto";
 
 // (--
 // Internal Nexus service for server-to-worker communication.
-// See service.yaml for the service definition.
 // --)
 
 // Request payload for the "ExecuteCommands" Nexus operation.

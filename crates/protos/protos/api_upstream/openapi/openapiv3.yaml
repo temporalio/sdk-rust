@@ -10429,6 +10429,13 @@ components:
       properties:
         deploymentVersion:
           $ref: '#/components/schemas/WorkerDeploymentVersion'
+        revisionNumber:
+          type: string
+          description: |-
+            Revision number of the task queue routing config at the time the target
+             was declined. If an incoming target's revision is <= this value, it is
+             not newer and is not used for deciding whether or not to suppress the
+             upgrade signal.
       description: |-
         Wrapper for a target deployment version that the SDK declined to upgrade to.
          See declined_target_version_upgrade on WorkflowExecutionStartedEventAttributes.
@@ -15550,14 +15557,6 @@ components:
           allOf:
             - $ref: '#/components/schemas/Priority'
           description: Priority metadata
-        timeSkippingConfig:
-          allOf:
-            - $ref: '#/components/schemas/TimeSkippingConfig'
-          description: The propagated time-skipping configuration for the child workflow.
-        initialSkippedDuration:
-          pattern: ^-?(?:0|[1-9][0-9]{0,11})(?:\.[0-9]{1,9})?s$
-          type: string
-          description: Propagate the duration skipped to the child workflow.
     StartNexusOperationExecutionRequest:
       type: object
       properties:
@@ -16244,7 +16243,10 @@ components:
       properties:
         enabled:
           type: boolean
-          description: Enables or disables time skipping for this workflow execution.
+          description: "Enables or disables time skipping for this workflow execution.\n By default, this field is propagated to transitively related workflows (child workflows/start-as-new/reset) \n at the time they are started.\n Changes made after a transitively related workflow has started are not propagated."
+        disablePropagation:
+          type: boolean
+          description: If set, the enabled field is not propagated to transitively related workflows.
         maxSkippedDuration:
           pattern: ^-?(?:0|[1-9][0-9]{0,11})(?:\.[0-9]{1,9})?s$
           type: string
@@ -16255,7 +16257,19 @@ components:
           description: |-
             Maximum elapsed time since time skipping was enabled.
              This includes both skipped time and real time elapsing.
-      description: "Configuration for time skipping during a workflow execution.\n When enabled, virtual time advances automatically whenever there is no in-flight work.\n In-flight work includes activities, child workflows, Nexus operations, signal/cancel external workflow operations,\n and possibly other features added in the future.\n User timers are not classified as in-flight work and will be skipped over.\n When time advances, it skips to the earlier of the next user timer or the configured bound, if either exists.\n \n Propagation behavior of time skipping:\n The enabled flag, bound fields, and accumulated skipped duration are propagated to related executions as follows:\n (1) Child workflows and continue-as-new: both the configuration and the accumulated skipped duration are\n     inherited from the current execution. The configured bound is shared between the inherited skipped\n     duration and any additional duration skipped by the new run.\n (2) Retry and cron: the configuration and accumulated skipped duration are inherited as recorded when the\n     current workflow started; the accumulated skipped duration of the current run is not propagated.\n (3) Reset: the new run retains the time-skipping configuration of the current execution. Because reset replays\n     all events up to the reset point and re-applies any UpdateWorkflowExecutionOptions changes made after that\n     point, the resulting run ends up with the same final time-skipping configuration as the previous run."
+        maxTargetTime:
+          type: string
+          description: |-
+            Absolute virtual timestamp at which time skipping is disabled.
+             Time skipping will not advance beyond this point.
+          format: date-time
+      description: |-
+        Configuration for time skipping during a workflow execution.
+         When enabled, virtual time advances automatically whenever there is no in-flight work.
+         In-flight work includes activities, child workflows, Nexus operations, signal/cancel external workflow operations,
+         and possibly other features added in the future.
+         User timers are not classified as in-flight work and will be skipped over.
+         When time advances, it skips to the earlier of the next user timer or the configured bound, if either exists.
     TimeoutFailureInfo:
       type: object
       properties:
@@ -18205,10 +18219,7 @@ components:
         timeSkippingConfig:
           allOf:
             - $ref: '#/components/schemas/TimeSkippingConfig'
-          description: |-
-            Time-skipping configuration for this workflow execution.
-             If not set, the time-skipping configuration is not updated by this request;
-             the existing configuration is preserved.
+          description: "Time-skipping configuration for this workflow execution.\n If not set, the time-skipping conf will not get updated upon request, \n i.e. the existing time-skipping conf will be preserved."
     WorkflowExecutionOptionsUpdatedEventAttributes:
       type: object
       properties:
@@ -18542,6 +18553,16 @@ components:
 
              Used internally by the server during continue-as-new and retry.
              Should not be read or interpreted by SDKs.
+        timeSkippingConfig:
+          allOf:
+            - $ref: '#/components/schemas/TimeSkippingConfig'
+          description: |-
+            Initial time-skipping configuration for this workflow execution, recorded at start time.
+             This may have been set explicitly via the start workflow request, or propagated from a
+             parent/previous execution.
+
+             The configuration may be updated after start via UpdateWorkflowExecutionOptions, which
+             will be reflected in the WorkflowExecutionOptionsUpdatedEvent.
       description: Always the first event in workflow history
     WorkflowExecutionTerminatedEventAttributes:
       type: object

@@ -202,6 +202,7 @@ message EndpointTarget {
         // Nexus task queue to route requests to.
         string task_queue = 2;
     }
+
     // Target an external server by URL.
     // At a later point, this will support providing credentials, in the meantime, an http.RoundTripper can be injected
     // into the server to modify the request.

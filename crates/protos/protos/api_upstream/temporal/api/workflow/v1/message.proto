@@ -580,8 +580,8 @@ message WorkflowExecutionOptions {
     temporal.api.common.v1.Priority priority = 2;
 
     // Time-skipping configuration for this workflow execution.
-    // If not set, the time-skipping configuration is not updated by this request;
-    // the existing configuration is preserved.
+    // If not set, the time-skipping conf will not get updated upon request, 
+    // i.e. the existing time-skipping conf will be preserved.
     TimeSkippingConfig time_skipping_config = 3;
 }
 
@@ -591,32 +591,31 @@ message WorkflowExecutionOptions {
 // and possibly other features added in the future.
 // User timers are not classified as in-flight work and will be skipped over.
 // When time advances, it skips to the earlier of the next user timer or the configured bound, if either exists.
-// 
-// Propagation behavior of time skipping:
-// The enabled flag, bound fields, and accumulated skipped duration are propagated to related executions as follows:
-// (1) Child workflows and continue-as-new: both the configuration and the accumulated skipped duration are
-//     inherited from the current execution. The configured bound is shared between the inherited skipped
-//     duration and any additional duration skipped by the new run.
-// (2) Retry and cron: the configuration and accumulated skipped duration are inherited as recorded when the
-//     current workflow started; the accumulated skipped duration of the current run is not propagated.
-// (3) Reset: the new run retains the time-skipping configuration of the current execution. Because reset replays
-//     all events up to the reset point and re-applies any UpdateWorkflowExecutionOptions changes made after that
-//     point, the resulting run ends up with the same final time-skipping configuration as the previous run.
 message TimeSkippingConfig {
-    reserved 2, 6;
-    reserved "disable_propagation", "max_target_time";
 
     // Enables or disables time skipping for this workflow execution.
+    // By default, this field is propagated to transitively related workflows (child workflows/start-as-new/reset) 
+    // at the time they are started.
+    // Changes made after a transitively related workflow has started are not propagated.
     bool enabled = 1;
 
-    // Optional bound that limits the gap between the virtual time of this execution and wall-clock time.
-    // Once the bound is reached, time skipping is automatically disabled,
-    // but can be re-enabled by setting `enabled` to true via UpdateWorkflowExecutionOptions.
-    // This bound cannot be set to a value smaller than the execution's currently skipped duration.
+    // If set, the enabled field is not propagated to transitively related workflows.
+    bool disable_propagation = 2;
+
+    // Optional bound that limits how long time skipping remains active.
+    // Once the bound is reached, time skipping is automatically disabled.
+    // It can later be re-enabled via UpdateWorkflowExecutionOptions.
     //
-    // This is useful in testing scenarios where a workflow is expected to receive
-    // signals, updates, or other external events while timers are in progress.
+    // This is particularly useful in testing scenarios where workflows
+    // are expected to receive signals, updates, or other events while
+    // timers are in progress.
+    //
+    // This bound is not propagated to transitively related workflows. 
+    // When bound is also needed for transitively related workflows,
+    // it is recommended to set disable_propagation to true 
+    // and configure TimeSkippingConfig explicitly for transitively related workflows.
     oneof bound {
+
         // Maximum total virtual time that can be skipped.
         google.protobuf.Duration max_skipped_duration = 4;
 
@@ -624,6 +623,10 @@ message TimeSkippingConfig {
         // This includes both skipped time and real time elapsing.
         // (-- api-linter: core::0142::time-field-names=disabled --)
         google.protobuf.Duration max_elapsed_duration = 5;
+
+        // Absolute virtual timestamp at which time skipping is disabled.
+        // Time skipping will not advance beyond this point.
+        google.protobuf.Timestamp max_target_time = 6;
     }
 }
 
