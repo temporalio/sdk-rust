@@ -485,7 +485,7 @@ impl WorkerActivityTasks {
         let outstanding = self.outstanding_activity_tasks.clone();
         let cancels_tx = self.cancels_tx.clone();
         Arc::new(move |task_token: TaskToken| {
-            if outstanding.contains_key(&task_token) {
+            if outstanding.lock().contains_key(&task_token) {
                 let _ = cancels_tx.send(PendingActivityCancel::new(
                     task_token,
                     ActivityCancelReason::Cancelled,

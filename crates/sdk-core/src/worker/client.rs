@@ -460,7 +460,6 @@ impl WorkerClient for WorkerClientBag {
             worker_instance_key: self.worker_instance_key.to_string(),
             worker_control_task_queue: self.worker_control_task_queue(),
             resource_id: Default::default(),
-            worker_instance_key: self.worker_instance_key.to_string(),
         };
         Ok(self
             .connection

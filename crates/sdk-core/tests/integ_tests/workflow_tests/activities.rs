@@ -2242,16 +2242,13 @@ async fn activity_cancel_delivered_without_heartbeat() {
             let act_fut = ctx.start_activity(
                 WaitForCancelActivities::wait_for_cancel,
                 "hi".to_string(),
-                ActivityOptions {
-                    // Longer than workflow timeout
-                    start_to_close_timeout: Some(Duration::from_secs(30)),
-                    retry_policy: Some(RetryPolicy {
+                ActivityOptions::with_start_to_close_timeout(Duration::from_secs(30))
+                    .retry_policy(RetryPolicy {
                         maximum_attempts: 1,
                         ..Default::default()
-                    }),
-                    cancellation_type: ActivityCancellationType::WaitCancellationCompleted,
-                    ..Default::default()
-                },
+                    })
+                    .cancellation_type(ActivityCancellationType::WaitCancellationCompleted)
+                    .build(),
             );
             // Timer needed to avoid cancel-before-sent
             ctx.timer(Duration::from_millis(10)).await;
