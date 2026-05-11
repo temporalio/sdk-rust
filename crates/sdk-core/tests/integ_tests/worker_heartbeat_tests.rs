@@ -81,6 +81,7 @@ async fn list_worker_heartbeats(client: &Client, query: impl Into<String>) -> Ve
             page_size: 200,
             next_page_token: Vec::new(),
             query: query.into(),
+            include_system_workers: false,
         }
         .into_request(),
     )
@@ -232,6 +233,7 @@ async fn docker_worker_heartbeat_basic(#[values("otel", "prom", "no_metrics")] b
                 page_size: 100,
                 next_page_token: Vec::new(),
                 query: String::new(),
+                include_system_workers: false,
             }
             .into_request(),
         )
@@ -272,6 +274,7 @@ async fn docker_worker_heartbeat_basic(#[values("otel", "prom", "no_metrics")] b
                             page_size: 100,
                             next_page_token: Vec::new(),
                             query: String::new(),
+                            include_system_workers: false,
                         }
                         .into_request(),
                     )
@@ -280,7 +283,7 @@ async fn docker_worker_heartbeat_basic(#[values("otel", "prom", "no_metrics")] b
                     .into_inner();
                     #[allow(deprecated)]
                     #[allow(deprecated)]
-    let hb = workers_list
+                    let hb = workers_list
                         .workers_info
                         .iter()
                         .find_map(|wi| {
@@ -400,6 +403,7 @@ async fn docker_worker_heartbeat_tuner() {
             page_size: 100,
             next_page_token: Vec::new(),
             query: String::new(),
+            include_system_workers: false,
         }
         .into_request(),
     )
@@ -1068,6 +1072,7 @@ async fn worker_heartbeat_no_runtime_heartbeat() {
             page_size: 100,
             next_page_token: Vec::new(),
             query: String::new(),
+            include_system_workers: false,
         }
         .into_request(),
     )
@@ -1140,6 +1145,7 @@ async fn worker_heartbeat_skip_client_worker_set_check() {
             page_size: 100,
             next_page_token: Vec::new(),
             query: String::new(),
+            include_system_workers: false,
         }
         .into_request(),
     )

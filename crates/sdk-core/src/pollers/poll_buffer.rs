@@ -4,7 +4,9 @@ use crate::{
     worker::{
         ActivitySlotKind, NamespaceCapabilities, NexusSlotKind, PollerBehavior, SlotKind,
         WFTPollerShared, WorkflowSlotKind,
-        client::{PollActivityOptions, PollOptions, PollWorkflowOptions, WorkerClient},
+        client::{
+            PollActivityOptions, PollNexusOptions, PollOptions, PollWorkflowOptions, WorkerClient,
+        },
     },
 };
 use backoff::{SystemClock, backoff::Backoff, exponential::ExponentialBackoff};
@@ -153,7 +155,6 @@ impl LongPollBuffer<PollWorkflowTaskQueueResponse, WorkflowSlotKind> {
                             task_queue,
                             no_retry,
                             timeout_override,
-                            worker_commands_queue: false,
                         },
                         PollWorkflowOptions { sticky_queue_name },
                     )
@@ -211,7 +212,6 @@ impl LongPollBuffer<PollActivityTaskQueueResponse, ActivitySlotKind> {
                             task_queue,
                             no_retry,
                             timeout_override,
-                            worker_commands_queue: false,
                         },
                         PollActivityOptions {
                             max_tasks_per_sec: options.max_tps,
@@ -265,12 +265,16 @@ impl LongPollBuffer<PollNexusTaskQueueResponse, NexusSlotKind> {
             let task_queue = task_queue.clone();
             async move {
                 client
-                    .poll_nexus_task(PollOptions {
-                        task_queue,
-                        no_retry,
-                        timeout_override,
-                        worker_commands_queue,
-                    })
+                    .poll_nexus_task(
+                        PollOptions {
+                            task_queue,
+                            no_retry,
+                            timeout_override,
+                        },
+                        PollNexusOptions {
+                            worker_commands_queue,
+                        },
+                    )
                     .await
             }
         };

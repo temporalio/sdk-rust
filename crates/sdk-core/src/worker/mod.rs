@@ -2252,6 +2252,10 @@ where
     })
 }
 
+fn worker_control_task_queue(namespace: &str, grouping_key: &str) -> String {
+    format!("temporal-sys/worker-commands/{namespace}/{grouping_key}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

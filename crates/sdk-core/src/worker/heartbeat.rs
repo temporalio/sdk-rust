@@ -1,6 +1,9 @@
 use crate::{
     WorkerClient, WorkerConfig,
-    worker::{PollError, PollerBehavior, TaskPollers, WorkerTelemetry, WorkerVersioningStrategy},
+    worker::{
+        PollError, PollerBehavior, TaskPollers, Worker, WorkerTelemetry, WorkerVersioningStrategy,
+        worker_control_task_queue,
+    },
 };
 use parking_lot::RwLock;
 use prost::Message;
@@ -45,111 +48,147 @@ impl SharedNamespaceWorker {
         heartbeat_interval: Duration,
         telemetry: Option<WorkerTelemetry>,
     ) -> Result<Self, anyhow::Error> {
-        let config = WorkerConfig::builder()
-            .namespace(namespace.clone())
-            .task_queue(format!(
-                "temporal-sys/worker-commands/{namespace}/{}",
-                client.worker_grouping_key(),
-            ))
-            .task_types(WorkerTaskTypes::nexus_only())
-            .max_outstanding_nexus_tasks(5_usize)
-            .versioning_strategy(WorkerVersioningStrategy::None {
-                build_id: "1.0".to_owned(),
-            })
-            .nexus_task_poller_behavior(PollerBehavior::SimpleMaximum(1_usize))
-            .build()
-            .expect("internal shared namespace worker options are valid");
-        let worker = crate::worker::Worker::new_with_pollers(
-            config,
-            None,
-            client.clone(),
-            TaskPollers::Real,
-            telemetry,
-            None,
-            true,
-        )?;
-
         let reset_notify = Arc::new(Notify::new());
         let cancel = CancellationToken::new();
-        let cancel_clone = cancel.clone();
-
-        let client_clone = client;
-        let namespace_clone = namespace.clone();
-
         let callbacks_map = Arc::new(RwLock::new(HashMap::<Uuid, WorkerCallbacks>::new()));
-        let callbacks_map_clone = callbacks_map.clone();
 
-        tokio::spawn(async move {
-            match client_clone.describe_namespace().await {
-                Ok(namespace_resp) => {
-                    if namespace_resp
-                        .namespace_info
-                        .and_then(|info| info.capabilities)
-                        .map(|caps| caps.worker_heartbeats)
-                        != Some(true)
-                    {
-                        debug!(
-                            "Worker heartbeating configured for runtime, but server version does not support it."
-                        );
-                        worker.shutdown().await;
+        tokio::spawn({
+            let client = client.clone();
+            let namespace = namespace.clone();
+            let callbacks_map = callbacks_map.clone();
+            let cancel = cancel.clone();
+            async move {
+                let worker_commands_supported = match client.describe_namespace().await {
+                    Ok(namespace_resp) => {
+                        let caps = namespace_resp
+                            .namespace_info
+                            .and_then(|info| info.capabilities);
+                        if caps.as_ref().map(|c| c.worker_heartbeats) != Some(true) {
+                            debug!(
+                                "Worker heartbeating configured for runtime, but server version does not support it."
+                            );
+                            return;
+                        }
+                        caps.map(|c| c.worker_commands).unwrap_or(false)
+                    }
+                    Err(e) => {
+                        warn!(error=?e, "Network error while describing namespace for heartbeat capabilities");
                         return;
                     }
-                }
-                Err(e) => {
-                    warn!(error=?e, "Network error while describing namespace for heartbeat capabilities");
-                    worker.shutdown().await;
-                    return;
-                }
-            }
-            let mut ticker = tokio::time::interval(heartbeat_interval);
-            loop {
-                tokio::select! {
-                    _ = ticker.tick() => {
-                        let mut hb_to_send = Vec::new();
-                        let hb_callbacks: Vec<_> = {
-                            callbacks_map_clone.read().values()
-                                .map(|cb| cb.heartbeat.clone())
-                                .collect()
-                        };
-                        for heartbeat_callback in hb_callbacks {
-                            let mut heartbeat = heartbeat_callback();
-                            // All of these heartbeat details rely on a client. To avoid circular
-                            // dependencies, this must be populated from within SharedNamespaceWorker
-                            // to get info from the current client
-                            client_clone.set_heartbeat_client_fields(&mut heartbeat);
-                            hb_to_send.push(heartbeat);
+                };
+
+                // Returns true if the heartbeat loop should stop.
+                async fn tick_heartbeat(
+                    client: &Arc<dyn WorkerClient>,
+                    namespace: &str,
+                    callbacks_map: &Arc<RwLock<HashMap<Uuid, WorkerCallbacks>>>,
+                ) -> bool {
+                    let mut hb_to_send = Vec::new();
+                    let hb_callbacks: Vec<_> = callbacks_map
+                        .read()
+                        .values()
+                        .map(|cb| cb.heartbeat.clone())
+                        .collect();
+                    for heartbeat_callback in hb_callbacks {
+                        let mut heartbeat = heartbeat_callback();
+                        // All of these heartbeat details rely on a client. To avoid circular
+                        // dependencies, this must be populated from within SharedNamespaceWorker
+                        // to get info from the current client
+                        client.set_heartbeat_client_fields(&mut heartbeat);
+                        hb_to_send.push(heartbeat);
+                    }
+                    if let Err(e) = client
+                        .record_worker_heartbeat(namespace.to_owned(), hb_to_send)
+                        .await
+                    {
+                        if matches!(e.code(), tonic::Code::Unimplemented) {
+                            return true;
                         }
-                        if let Err(e) = client_clone.record_worker_heartbeat(namespace_clone.clone(), hb_to_send).await {
-                            if matches!(e.code(), tonic::Code::Unimplemented) {
-                                worker.shutdown().await;
-                                return;
-                            }
-                            warn!(error=?e, "Network error while sending worker heartbeat");
+                        warn!(error=?e, "Network error while sending worker heartbeat");
+                    }
+                    false
+                }
+
+                // Returns true if the polling loop should stop.
+                async fn handle_nexus_poll(
+                    worker: &Worker,
+                    callbacks_map: &Arc<RwLock<HashMap<Uuid, WorkerCallbacks>>>,
+                    nexus_result: Result<NexusTask, PollError>,
+                ) -> bool {
+                    match nexus_result {
+                        Ok(task) => {
+                            handle_worker_command_task(worker, callbacks_map, task).await;
+                            false
+                        }
+                        Err(PollError::ShutDown) => true,
+                        Err(e) => {
+                            warn!(error=?e, "Error polling nexus task for worker commands");
+                            false
                         }
                     }
-                    nexus_result = worker.poll_nexus_task() => {
-                        match nexus_result {
-                            Ok(task) => {
-                                handle_worker_command_task(
-                                    &worker,
-                                    &callbacks_map_clone,
-                                    task,
-                                ).await;
-                            }
-                            Err(PollError::ShutDown) => {
+                }
+
+                if worker_commands_supported {
+                    let config = WorkerConfig::builder()
+                        .namespace(namespace.clone())
+                        .task_queue(worker_control_task_queue(
+                            &namespace,
+                            &client.worker_grouping_key().to_string(),
+                        ))
+                        .task_types(WorkerTaskTypes::nexus_only())
+                        .max_outstanding_nexus_tasks(5_usize)
+                        .versioning_strategy(WorkerVersioningStrategy::None {
+                            build_id: "1.0".to_owned(),
+                        })
+                        .nexus_task_poller_behavior(PollerBehavior::SimpleMaximum(1_usize))
+                        .build()
+                        .expect("internal shared namespace worker options are valid");
+                    match Worker::new_with_pollers(
+                        config,
+                        None,
+                        client.clone(),
+                        TaskPollers::Real,
+                        telemetry,
+                        None,
+                        true,
+                    ) {
+                        Ok(worker) => {
+                            tokio::spawn({
+                                let cm = callbacks_map.clone();
+                                let cancel = cancel.clone();
+                                async move {
+                                    loop {
+                                        tokio::select! {
+                                            nexus_result = worker.poll_nexus_task() => {
+                                                if handle_nexus_poll(&worker, &cm, nexus_result).await {
+                                                    break;
+                                                }
+                                            }
+                                            _ = cancel.cancelled() => break,
+                                        }
+                                    }
+                                    worker.shutdown().await;
+                                }
+                            });
+                        }
+                        Err(e) => {
+                            warn!(error=?e, "Failed to build worker for nexus command polling");
+                        }
+                    }
+                } else {
+                    debug!("Server does not support the worker_commands capability");
+                }
+
+                let mut ticker = tokio::time::interval(heartbeat_interval);
+                loop {
+                    tokio::select! {
+                        _ = ticker.tick() => {
+                            if tick_heartbeat(&client, &namespace, &callbacks_map).await {
                                 break;
                             }
-                            Err(e) => {
-                                warn!(error=?e, "Error polling nexus task for worker commands");
-                            }
                         }
-                    }
-                    _ = reset_notify.notified() => {
-                        ticker.reset();
-                    }
-                    _ = cancel_clone.cancelled() => {
-                        worker.shutdown().await;
-                        return;
+                        _ = reset_notify.notified() => ticker.reset(),
+                        _ = cancel.cancelled() => break,
                     }
                 }
             }
@@ -189,7 +228,7 @@ impl SharedNamespaceWorkerTrait for SharedNamespaceWorker {
 }
 
 async fn handle_worker_command_task(
-    worker: &crate::worker::Worker,
+    worker: &Worker,
     callbacks_map: &Arc<RwLock<HashMap<Uuid, WorkerCallbacks>>>,
     task: NexusTask,
 ) {
@@ -306,9 +345,9 @@ mod tests {
     use temporalio_common::protos::temporal::api::{
         common::v1::Payload,
         namespace::v1::{NamespaceInfo, namespace_info::Capabilities},
-        nexus::v1::{Request, StartOperationRequest, request},
-        nexusservices::workerservice::v1::ExecuteCommandsRequest,
-        worker::v1::{CancelActivityCommand, WorkerCommand, worker_command},
+        nexus::v1::{Request, StartOperationRequest, request, response, start_operation_response},
+        nexusservices::workerservice::v1::{ExecuteCommandsRequest, ExecuteCommandsResponse},
+        worker::v1::{CancelActivityCommand, WorkerCommand, worker_command, worker_command_result},
         workflowservice::v1::{
             DescribeNamespaceResponse, PollNexusTaskQueueResponse, RecordWorkerHeartbeatResponse,
             RespondNexusTaskCompletedResponse,
@@ -324,7 +363,7 @@ mod tests {
         mock.expect_poll_workflow_task()
             .returning(move |_namespace, _task_queue| Ok(Default::default()));
         mock.expect_poll_nexus_task()
-            .returning(move |_poll_options| Ok(Default::default()));
+            .returning(move |_poll_options, _nexus_options| Ok(Default::default()));
         mock.expect_record_worker_heartbeat().times(3).returning(
             move |_namespace, worker_heartbeat| {
                 assert_eq!(1, worker_heartbeat.len());
@@ -429,28 +468,36 @@ mod tests {
             .returning(|| ("test-core".to_string(), "0.0.0".to_string()));
         mock.expect_identity()
             .returning(|| "test-identity".to_string());
-        mock.expect_worker_grouping_key().returning(Uuid::new_v4);
+        let worker_grouping_key = Uuid::new_v4();
+        mock.expect_worker_grouping_key()
+            .returning(move || worker_grouping_key);
         mock.expect_worker_instance_key().returning(Uuid::new_v4);
         mock.expect_set_heartbeat_client_fields()
             .returning(|_hb| {});
 
         let activity_task_token = vec![1, 2, 3, 4];
 
-        let completed_response = Arc::new(Mutex::new(
-            None::<temporalio_common::protos::temporal::api::nexus::v1::Response>,
-        ));
-        let completed_response_clone = completed_response.clone();
+        let (completion_tx, completion_rx) = tokio::sync::oneshot::channel();
+        let completion_tx = Mutex::new(Some(completion_tx));
 
         let poll_returned_command = Arc::new(AtomicBool::new(false));
         let poll_returned_command_clone = poll_returned_command.clone();
         let at_clone = activity_task_token.clone();
+        let expected_task_queue = format!(
+            "temporal-sys/worker-commands/{}/{worker_grouping_key}",
+            crate::test_help::NAMESPACE
+        );
         mock.expect_poll_nexus_task()
-            .returning(move |poll_options| {
-                if poll_options
-                    .task_queue
-                    .starts_with("temporal-sys/worker-commands/")
-                    && !poll_returned_command_clone.swap(true, Ordering::SeqCst)
-                {
+            .returning(move |poll_options, nexus_options| {
+                assert!(
+                    nexus_options.worker_commands_queue,
+                    "shared namespace worker must poll the worker-commands queue"
+                );
+                assert_eq!(
+                    poll_options.task_queue, expected_task_queue,
+                    "shared namespace worker must poll its own control task queue"
+                );
+                if !poll_returned_command_clone.swap(true, Ordering::SeqCst) {
                     Ok(make_execute_commands_nexus_response(
                         vec![99],
                         vec![WorkerCommand {
@@ -467,12 +514,12 @@ mod tests {
             });
         mock.expect_complete_nexus_task()
             .returning(move |_task_token, response| {
-                *completed_response_clone.lock().unwrap() = Some(response);
+                if let Some(tx) = completion_tx.lock().unwrap().take() {
+                    let _ = tx.send(response);
+                }
                 Ok(RespondNexusTaskCompletedResponse {})
             });
 
-        mock.expect_poll_workflow_task()
-            .returning(move |_namespace, _task_queue| Ok(Default::default()));
         mock.expect_record_worker_heartbeat()
             .returning(move |_namespace, _worker_heartbeat| Ok(RecordWorkerHeartbeatResponse {}));
         mock.expect_describe_namespace().returning(move || {
@@ -480,6 +527,7 @@ mod tests {
                 namespace_info: Some(NamespaceInfo {
                     capabilities: Some(Capabilities {
                         worker_heartbeats: true,
+                        worker_commands: true,
                         ..Capabilities::default()
                     }),
                     ..NamespaceInfo::default()
@@ -504,22 +552,12 @@ mod tests {
         )
         .unwrap();
 
-        // Give time for the SharedNamespaceWorker to poll and process the nexus task
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        let response = tokio::time::timeout(Duration::from_secs(5), completion_rx)
+            .await
+            .expect("nexus task was not completed in time")
+            .expect("completion sender was dropped");
         worker.drain_activity_poller_and_shutdown().await;
 
-        // Verify the nexus task was completed with a valid ExecuteCommandsResponse
-        let response = completed_response
-            .lock()
-            .unwrap()
-            .take()
-            .expect("Nexus task should have been completed");
-
-        use temporalio_common::protos::temporal::api::{
-            nexus::v1::{response, start_operation_response},
-            nexusservices::workerservice::v1::ExecuteCommandsResponse,
-            worker::v1::worker_command_result,
-        };
         let start_op = match response.variant {
             Some(response::Variant::StartOperation(s)) => s,
             other => panic!("Expected StartOperation response, got {:?}", other),

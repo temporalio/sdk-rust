@@ -1,6 +1,6 @@
 [env]
 # This temporarily overrides the version of the CLI used for integration tests, locally and in CI
-CLI_VERSION_OVERRIDE = "v1.6.3-serverless"
+# CLI_VERSION_OVERRIDE = "v1.6.3-serverless"
 
 [alias]
 # Not sure why --all-features doesn't work
