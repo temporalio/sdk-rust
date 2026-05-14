@@ -1,6 +1,6 @@
 //! Tests that exercise the WASM workflow execution path. These are kept in a separate test binary
-//! because they require `cargo component` and the `wasm32-unknown-unknown` target to build the
-//! sample components, which not every CI environment has installed.
+//! because they require `cargo component` and extra wasm targets to build the sample components,
+//! which not every CI environment has installed.
 
 #[allow(dead_code)]
 mod common;

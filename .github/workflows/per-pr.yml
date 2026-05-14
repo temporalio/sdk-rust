@@ -200,8 +200,9 @@ jobs:
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
-        with:
-          targets: wasm32-unknown-unknown
+      - name: Install WASM Rust targets
+        # Install after checkout so rustup uses this repo's rust-toolchain.toml override.
+        run: rustup target add wasm32-unknown-unknown wasm32-wasip1
       - name: Install protoc
         uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3
         with:
