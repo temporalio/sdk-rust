@@ -1432,6 +1432,7 @@ impl TryFrom<&ClientTlsOptions> for temporalio_client::TlsOptions {
                     ));
                 }
             },
+            server_cert_verifier: None,
         })
     }
 }

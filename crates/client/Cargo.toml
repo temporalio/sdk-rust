@@ -45,6 +45,7 @@ tokio = { version = "1.47", default-features = false, features = [
   "time",
 ] }
 tonic = { workspace = true, default-features = false, features = ["tls-native-roots", "channel"] }
+tokio-rustls = { version = "0.26", default-features = false }
 tower = { version = "0.5", features = ["util"] }
 tracing = "0.1"
 url = "2.5"

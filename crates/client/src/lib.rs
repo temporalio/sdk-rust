@@ -40,6 +40,9 @@ pub use metrics::{LONG_REQUEST_LATENCY_HISTOGRAM_NAME, REQUEST_LATENCY_HISTOGRAM
 pub use options_structs::*;
 pub use replaceable::SharedReplaceableClient;
 pub use retry::RetryOptions;
+/// Re-export the `ServerCertVerifier` trait so that users can implement custom TLS
+/// server certificate verification without depending on `tokio-rustls` directly.
+pub use tokio_rustls::rustls::client::danger::ServerCertVerifier;
 pub use tonic;
 pub use workflow_handle::{
     UntypedQuery, UntypedSignal, UntypedUpdate, UntypedWorkflow, UntypedWorkflowHandle,
@@ -410,11 +413,15 @@ async fn add_tls_to_channel(
     if let Some(tls_cfg) = tls_options {
         let mut tls = tonic::transport::ClientTlsConfig::new();
 
-        if let Some(root_cert) = &tls_cfg.server_root_ca_cert {
-            let server_root_ca_cert = Certificate::from_pem(root_cert);
-            tls = tls.ca_certificate(server_root_ca_cert);
-        } else {
-            tls = tls.with_native_roots();
+        // When a custom verifier is set, server_root_ca_cert is ignored because
+        // tonic's tls_config_with_verifier replaces the default WebPKI verifier entirely.
+        if tls_cfg.server_cert_verifier.is_none() {
+            if let Some(root_cert) = &tls_cfg.server_root_ca_cert {
+                let server_root_ca_cert = Certificate::from_pem(root_cert);
+                tls = tls.ca_certificate(server_root_ca_cert);
+            } else {
+                tls = tls.with_native_roots();
+            }
         }
 
         if let Some(domain) = &tls_cfg.domain {
@@ -434,7 +441,13 @@ async fn add_tls_to_channel(
             tls = tls.identity(client_identity);
         }
 
-        return channel.tls_config(tls).map_err(Into::into);
+        return if let Some(verifier) = &tls_cfg.server_cert_verifier {
+            channel
+                .tls_config_with_verifier(tls, verifier.clone())
+                .map_err(Into::into)
+        } else {
+            channel.tls_config(tls).map_err(Into::into)
+        };
     }
     Ok(channel)
 }
@@ -1483,6 +1496,155 @@ mod tests {
             .build();
         dbg!(&opts.keep_alive);
         assert!(opts.keep_alive.is_none());
+    }
+
+    mod tls_custom_verifier_tests {
+        use super::*;
+        use tokio_rustls::rustls::{
+            client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier},
+            pki_types::{CertificateDer, ServerName, UnixTime},
+            DigitallySignedStruct, Error as RustlsError, SignatureScheme,
+        };
+
+        /// A minimal mock verifier for testing. In production, users would
+        /// implement real certificate pinning or custom validation here.
+        #[derive(Debug)]
+        struct MockVerifier;
+
+        impl ServerCertVerifier for MockVerifier {
+            fn verify_server_cert(
+                &self,
+                _end_entity: &CertificateDer<'_>,
+                _intermediates: &[CertificateDer<'_>],
+                _server_name: &ServerName<'_>,
+                _ocsp_response: &[u8],
+                _now: UnixTime,
+            ) -> Result<ServerCertVerified, RustlsError> {
+                Ok(ServerCertVerified::assertion())
+            }
+
+            fn verify_tls12_signature(
+                &self,
+                _message: &[u8],
+                _cert: &CertificateDer<'_>,
+                _dss: &DigitallySignedStruct,
+            ) -> Result<HandshakeSignatureValid, RustlsError> {
+                Ok(HandshakeSignatureValid::assertion())
+            }
+
+            fn verify_tls13_signature(
+                &self,
+                _message: &[u8],
+                _cert: &CertificateDer<'_>,
+                _dss: &DigitallySignedStruct,
+            ) -> Result<HandshakeSignatureValid, RustlsError> {
+                Ok(HandshakeSignatureValid::assertion())
+            }
+
+            fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+                vec![
+                    SignatureScheme::ECDSA_NISTP256_SHA256,
+                    SignatureScheme::RSA_PSS_SHA256,
+                ]
+            }
+        }
+
+        #[test]
+        fn tls_options_with_verifier_default_is_none() {
+            let opts = TlsOptions::default();
+            assert!(opts.server_cert_verifier.is_none());
+        }
+
+        #[test]
+        fn tls_options_with_verifier_clone() {
+            let opts = TlsOptions {
+                server_cert_verifier: Some(Arc::new(MockVerifier)),
+                ..Default::default()
+            };
+            let cloned = opts.clone();
+            assert!(cloned.server_cert_verifier.is_some());
+        }
+
+        #[test]
+        fn tls_options_debug_shows_custom_when_verifier_set() {
+            let opts = TlsOptions {
+                server_cert_verifier: Some(Arc::new(MockVerifier)),
+                domain: Some("test.example.com".to_string()),
+                ..Default::default()
+            };
+            let debug_str = format!("{opts:?}");
+            assert!(
+                debug_str.contains("<custom>"),
+                "Debug output should show <custom> for verifier, got: {debug_str}"
+            );
+            assert!(
+                debug_str.contains("test.example.com"),
+                "Debug output should show domain, got: {debug_str}"
+            );
+        }
+
+        #[test]
+        fn tls_options_debug_shows_none_when_no_verifier() {
+            let opts = TlsOptions::default();
+            let debug_str = format!("{opts:?}");
+            assert!(
+                debug_str.contains("server_cert_verifier: None"),
+                "Debug output should show None for verifier, got: {debug_str}"
+            );
+        }
+
+        #[tokio::test]
+        async fn add_tls_to_channel_with_custom_verifier() {
+            let tls_opts = TlsOptions {
+                server_cert_verifier: Some(Arc::new(MockVerifier)),
+                domain: Some("test.temporal.io".to_string()),
+                ..Default::default()
+            };
+            let endpoint = tonic::transport::Channel::from_static("https://test.temporal.io:7233");
+            let result = add_tls_to_channel(Some(&tls_opts), endpoint).await;
+            assert!(
+                result.is_ok(),
+                "add_tls_to_channel should succeed with a custom verifier: {:?}",
+                result.err()
+            );
+        }
+
+        #[tokio::test]
+        async fn add_tls_to_channel_with_verifier_ignores_ca_cert() {
+            // When both server_cert_verifier and server_root_ca_cert are set,
+            // the CA cert should be ignored (not passed to tonic) to avoid
+            // tonic's VerifierConflict error.
+            let tls_opts = TlsOptions {
+                server_root_ca_cert: Some(b"some-ca-cert-bytes".to_vec()),
+                server_cert_verifier: Some(Arc::new(MockVerifier)),
+                domain: Some("test.temporal.io".to_string()),
+                ..Default::default()
+            };
+            let endpoint = tonic::transport::Channel::from_static("https://test.temporal.io:7233");
+            let result = add_tls_to_channel(Some(&tls_opts), endpoint).await;
+            assert!(
+                result.is_ok(),
+                "add_tls_to_channel should succeed even when server_root_ca_cert is set \
+                 alongside a custom verifier (CA cert should be ignored): {:?}",
+                result.err()
+            );
+        }
+
+        #[tokio::test]
+        async fn add_tls_to_channel_without_verifier_still_works() {
+            // Regression test: the original PEM path must still work.
+            let tls_opts = TlsOptions {
+                domain: Some("test.temporal.io".to_string()),
+                ..Default::default()
+            };
+            let endpoint = tonic::transport::Channel::from_static("https://test.temporal.io:7233");
+            let result = add_tls_to_channel(Some(&tls_opts), endpoint).await;
+            assert!(
+                result.is_ok(),
+                "add_tls_to_channel should succeed without a verifier (native roots): {:?}",
+                result.err()
+            );
+        }
     }
 
     mod list_workflows_tests {
