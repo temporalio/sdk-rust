@@ -113,10 +113,10 @@ pub use workflow_context::{
 
 use crate::{
     activities::{
-        ActivityContext, ActivityDefinitions, ActivityError, ActivityImplementer,
-        ExecutableActivity,
+        ActivityContext, ActivityDefinitions, ActivityImplementer, ExecutableActivity,
+        activity_execution_output_to_core,
     },
-    interceptors::WorkerInterceptor,
+    interceptors::{ActivityInterceptor, WorkerInterceptor},
     workflow_context::{
         ChildWfCommon, NexusUnblockData, PendingChildWorkflow, StartedNexusOperation,
     },
@@ -132,7 +132,6 @@ use std::{
     fmt::{Debug, Display, Formatter},
     future::Future,
     marker::PhantomData,
-    panic::AssertUnwindSafe,
     sync::Arc,
     time::Duration,
 };
@@ -145,7 +144,7 @@ use temporalio_common::{
         TaskToken,
         coresdk::{
             ActivityTaskCompletion, AsJsonPayloadExt,
-            activity_result::{ActivityExecutionResult, ActivityResolution},
+            activity_result::ActivityResolution,
             activity_task::{ActivityTask, activity_task},
             child_workflow::ChildWorkflowResult,
             nexus::NexusOperationResult,
@@ -294,6 +293,7 @@ impl<S: worker_options_builder::State> WorkerOptionsBuilder<S> {
     pub fn register_activity<AD>(mut self, instance: Arc<AD::Implementer>) -> Self
     where
         AD: ActivityDefinition + ExecutableActivity,
+        AD::Input: Send + Sync,
         AD::Output: Send + Sync,
     {
         self.activities.register_activity::<AD>(instance);
@@ -350,6 +350,7 @@ impl WorkerOptions {
     pub fn register_activity<AD>(&mut self, instance: Arc<AD::Implementer>) -> &mut Self
     where
         AD: ActivityDefinition + ExecutableActivity,
+        AD::Input: Send + Sync,
         AD::Output: Send + Sync,
     {
         self.activities.register_activity::<AD>(instance);
@@ -438,6 +439,7 @@ struct CommonWorker {
     worker: Arc<CoreWorker>,
     task_queue: String,
     worker_interceptor: Option<Box<dyn WorkerInterceptor>>,
+    activity_interceptor: Option<Arc<dyn ActivityInterceptor>>,
     data_converter: DataConverter,
 }
 
@@ -514,6 +516,7 @@ impl Worker {
                 task_queue: worker.get_config().task_queue.clone(),
                 worker,
                 worker_interceptor: None,
+                activity_interceptor: None,
                 data_converter,
             },
             workflow_half: WorkflowHalf {
@@ -559,6 +562,7 @@ impl Worker {
     pub fn register_activity<AD>(&mut self, instance: Arc<AD::Implementer>) -> &mut Self
     where
         AD: ActivityDefinition + ExecutableActivity,
+        AD::Input: Send + Sync,
         AD::Output: Send + Sync,
     {
         self.activity_half
@@ -731,6 +735,7 @@ impl Worker {
                             common.worker.clone(),
                             common.task_queue.clone(),
                             common.data_converter.clone(),
+                            common.activity_interceptor.clone(),
                             activity,
                         )?;
                     }
@@ -750,6 +755,11 @@ impl Worker {
     /// Set a [WorkerInterceptor]
     pub fn set_worker_interceptor(&mut self, interceptor: impl WorkerInterceptor + 'static) {
         self.common.worker_interceptor = Some(Box::new(interceptor));
+    }
+
+    /// Set an [ActivityInterceptor].
+    pub fn set_activity_interceptor(&mut self, interceptor: impl ActivityInterceptor + 'static) {
+        self.common.activity_interceptor = Some(Arc::new(interceptor));
     }
 
     /// Turns this rust worker into a new worker with all the same workflows and activities
@@ -917,6 +927,7 @@ impl ActivityHalf {
         worker: Arc<CoreWorker>,
         task_queue: String,
         data_converter: DataConverter,
+        activity_interceptor: Option<Arc<dyn ActivityInterceptor>>,
         activity: ActivityTask,
     ) -> Result<(), anyhow::Error> {
         match activity.variant {
@@ -942,7 +953,6 @@ impl ActivityHalf {
 
                 let (ctx, args) =
                     ActivityContext::new(worker.clone(), ct, task_queue, task_token.clone(), start);
-                let activity_data_converter = data_converter.clone();
                 let codec_data_converter = data_converter.clone();
 
                 tokio::spawn(async move {
@@ -952,47 +962,11 @@ impl ActivityHalf {
                                 .record("temporalWorkflowID", &info.workflow_id)
                                 .record("temporalRunID", &info.run_id);
                         }
-                        (act_fn)(args, activity_data_converter, ctx).await
+                        (act_fn)(args, data_converter, ctx, activity_interceptor).await
                     }
                     .instrument(span);
-                    let output = AssertUnwindSafe(act_fut).catch_unwind().await;
-                    let activity_context = SerializationContextData::Activity;
-                    let result = match output {
-                        Err(e) => ActivityExecutionResult::fail(
-                            data_converter.to_failure(
-                                &activity_context,
-                                OutgoingError::Activity(OutgoingActivityError::Application(
-                                    ApplicationFailure::new(anyhow!(
-                                        "Activity function panicked: {}",
-                                        panic_formatter(e)
-                                    ))
-                                    .into(),
-                                )),
-                            ),
-                        ),
-                        Ok(Ok(p)) => ActivityExecutionResult::ok(p),
-                        Ok(Err(err)) => match err {
-                            ActivityError::Application(app) => {
-                                ActivityExecutionResult::fail(data_converter.to_failure(
-                                    &activity_context,
-                                    OutgoingError::Activity(OutgoingActivityError::Application(
-                                        app,
-                                    )),
-                                ))
-                            }
-                            ActivityError::Cancelled { details } => {
-                                ActivityExecutionResult::cancel(data_converter.to_failure(
-                                    &activity_context,
-                                    OutgoingError::Activity(OutgoingActivityError::Cancelled {
-                                        details,
-                                    }),
-                                ))
-                            }
-                            ActivityError::WillCompleteAsync => {
-                                ActivityExecutionResult::will_complete_async()
-                            }
-                        },
-                    };
+                    let result = act_fut.await;
+                    let result = activity_execution_output_to_core(&codec_data_converter, result);
                     let mut completion = ActivityTaskCompletion {
                         task_token,
                         result: Some(result),
@@ -1376,7 +1350,7 @@ mod tests {
     #[activities]
     impl MyActivities {
         #[activity]
-        async fn my_activity(_ctx: ActivityContext) -> Result<(), ActivityError> {
+        async fn my_activity(_ctx: ActivityContext) -> Result<(), activities::ActivityError> {
             Ok(())
         }
 
@@ -1385,7 +1359,7 @@ mod tests {
             self: Arc<Self>,
             _ctx: ActivityContext,
             _: String,
-        ) -> Result<(), ActivityError> {
+        ) -> Result<(), activities::ActivityError> {
             Ok(())
         }
     }
