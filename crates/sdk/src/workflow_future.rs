@@ -28,6 +28,7 @@ use temporalio_common::{
         temporal::api::{
             common::v1::Payload,
             enums::v1::{VersioningBehavior, WorkflowTaskFailedCause},
+            failure::v1::Failure,
         },
     },
 };
@@ -162,13 +163,18 @@ enum ActivationJobContext {
 
 impl WorkflowFuture {
     fn fail_wft(&self, run_id: String, fail: Error, cause: Option<WorkflowTaskFailedCause>) {
-        warn!("Workflow task failed for {}: {}", run_id, fail);
+        self.fail_wft_with_failure(run_id, fail.into(), cause);
+    }
+
+    fn fail_wft_with_failure(
+        &self,
+        run_id: String,
+        failure: Failure,
+        cause: Option<WorkflowTaskFailedCause>,
+    ) {
+        warn!("Workflow task failed for {}: {}", run_id, failure);
         self.outgoing_completions
-            .send(WorkflowActivationCompletion::fail(
-                run_id,
-                fail.into(),
-                cause,
-            ))
+            .send(WorkflowActivationCompletion::fail(run_id, failure, cause))
             .expect("Completion channel intact");
     }
 
@@ -563,66 +569,66 @@ impl Future for WorkflowFuture {
                             );
                             continue 'activations;
                         }
-                        Some(result) => {
-                            match result {
-                                RoutineCompletion::Main(MainRoutineCompletion::Blocked) => {}
-                                RoutineCompletion::Main(MainRoutineCompletion::TaskFailed(
-                                    task_failure,
-                                )) => {
-                                    self.fail_wft(
-                                        run_id.clone(),
-                                        anyhow!(task_failure.failure.message),
-                                        None,
-                                    );
-                                    continue 'activations;
-                                }
-                                RoutineCompletion::Main(MainRoutineCompletion::Terminal(
-                                    outcome,
-                                )) => {
-                                    {
-                                        let host: &NativeWorkflowHost = &self.host;
-                                        let outcome = *outcome;
-                                        match outcome {
-                                            TerminalOutcome::Completed(result) => {
-                                                host.push_command_variant(workflow_command::Variant::CompleteWorkflowExecution(
+                        Some(result) => match result {
+                            RoutineCompletion::Main(MainRoutineCompletion::Blocked) => {}
+                            RoutineCompletion::Main(MainRoutineCompletion::TaskFailed(
+                                task_failure,
+                            )) => {
+                                self.fail_wft_with_failure(
+                                    run_id.clone(),
+                                    *task_failure.failure,
+                                    workflow_task_failed_cause_from_wit(task_failure.force_cause),
+                                );
+                                continue 'activations;
+                            }
+                            RoutineCompletion::Main(MainRoutineCompletion::Terminal(outcome)) => {
+                                {
+                                    let host: &NativeWorkflowHost = &self.host;
+                                    let outcome = *outcome;
+                                    match outcome {
+                                        TerminalOutcome::Completed(result) => {
+                                            host.push_command_variant(workflow_command::Variant::CompleteWorkflowExecution(
                                                 CompleteWorkflowExecution {
                                                     result: Some(result),
                                                 },
                                             ));
-                                            }
-                                            TerminalOutcome::Failed(failure) => {
-                                                host.push_command_variant(workflow_command::Variant::FailWorkflowExecution(
-                                                FailWorkflowExecution {
-                                                    failure: Some(*failure),
-                                                },
-                                            ));
-                                            }
-                                            TerminalOutcome::Cancelled => {
-                                                host.push_command_variant(workflow_command::Variant::CancelWorkflowExecution(
-                                                CancelWorkflowExecution {},
-                                            ));
-                                            }
-                                            TerminalOutcome::ContinueAsNew(req) => {
-                                                host.push_command_variant(workflow_command::Variant::ContinueAsNewWorkflowExecution(
+                                        }
+                                        TerminalOutcome::Failed(failure) => {
+                                            host.push_command_variant(
+                                                workflow_command::Variant::FailWorkflowExecution(
+                                                    FailWorkflowExecution {
+                                                        failure: Some(*failure),
+                                                    },
+                                                ),
+                                            );
+                                        }
+                                        TerminalOutcome::Cancelled => {
+                                            host.push_command_variant(
+                                                workflow_command::Variant::CancelWorkflowExecution(
+                                                    CancelWorkflowExecution {},
+                                                ),
+                                            );
+                                        }
+                                        TerminalOutcome::ContinueAsNew(req) => {
+                                            host.push_command_variant(workflow_command::Variant::ContinueAsNewWorkflowExecution(
                                                 *req,
                                             ));
-                                            }
                                         }
-                                    };
-                                    should_stop_polling = true;
-                                }
-                                other => {
-                                    self.fail_wft(
-                                        run_id.clone(),
-                                        anyhow!(
-                                            "main routine returned unexpected completion {other:?}"
-                                        ),
-                                        None,
-                                    );
-                                    continue 'activations;
-                                }
+                                    }
+                                };
+                                should_stop_polling = true;
                             }
-                        }
+                            other => {
+                                self.fail_wft(
+                                    run_id.clone(),
+                                    anyhow!(
+                                        "main routine returned unexpected completion {other:?}"
+                                    ),
+                                    None,
+                                );
+                                continue 'activations;
+                            }
+                        },
                     }
 
                     if should_stop_polling || !pass_made_progress {
@@ -637,6 +643,12 @@ impl Future for WorkflowFuture {
     }
 }
 
+fn workflow_task_failed_cause_from_wit(cause: Option<u32>) -> Option<WorkflowTaskFailedCause> {
+    cause
+        .and_then(|cause| i32::try_from(cause).ok())
+        .and_then(|cause| WorkflowTaskFailedCause::try_from(cause).ok())
+}
+
 fn update_response(
     instance_id: String,
     resp: update_response::Response,
@@ -646,4 +658,31 @@ fn update_response(
         response: Some(resp),
     }
     .into()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn workflow_task_failed_cause_from_wit_preserves_known_causes() {
+        assert_eq!(
+            workflow_task_failed_cause_from_wit(Some(
+                WorkflowTaskFailedCause::NonDeterministicError as u32
+            )),
+            Some(WorkflowTaskFailedCause::NonDeterministicError)
+        );
+        assert_eq!(
+            workflow_task_failed_cause_from_wit(Some(
+                WorkflowTaskFailedCause::GrpcMessageTooLarge as u32
+            )),
+            Some(WorkflowTaskFailedCause::GrpcMessageTooLarge)
+        );
+    }
+
+    #[test]
+    fn workflow_task_failed_cause_from_wit_ignores_unknown_causes() {
+        assert_eq!(workflow_task_failed_cause_from_wit(None), None);
+        assert_eq!(workflow_task_failed_cause_from_wit(Some(u32::MAX)), None);
+    }
 }
