@@ -33,6 +33,7 @@ jobs:
       - run: rustup component add rustfmt clippy
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
+          cache-bin: false
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo fmt --all --check
       - run: cargo doc --workspace --all-features --no-deps
@@ -83,6 +84,7 @@ jobs:
             core.exportVariable('RUSTFLAGS', '-Csymbol-mangling-version=v0');
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
+          cache-bin: false
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo test -- --include-ignored --nocapture
       - name: Find test executable for cgroup tests
@@ -124,6 +126,7 @@ jobs:
       - run: rustup component add rustfmt clippy
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
+          cache-bin: false
           save-if: ${{ github.ref == 'refs/heads/main' }}
           key: msrv
       - run: cargo install cargo-msrv
@@ -186,6 +189,7 @@ jobs:
             core.exportVariable('RUSTFLAGS', '-Csymbol-mangling-version=v0');
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
+          cache-bin: false
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo integ-test
 
@@ -211,6 +215,7 @@ jobs:
 
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
+          cache-bin: false
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo test --features=test-utilities --test cloud_tests
 
@@ -239,6 +244,7 @@ jobs:
           compose-file: ./etc/docker/docker-compose-ci.yaml
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
+          cache-bin: false
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo integ-test docker_
 
@@ -256,6 +262,7 @@ jobs:
           repo-token: ${{ secrets.GITHUB_TOKEN }}
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
+          cache-bin: false
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Build examples
         run: cargo build --examples -p temporalio-sdk --features examples
