@@ -1,7 +1,7 @@
-# Activity Interceptor
+# Activity Inbound Interceptor
 
-Demonstrates wrapping activity execution with an interceptor that logs decoded activity inputs and
-outputs.
+Demonstrates wrapping inbound activity execution with an interceptor that logs decoded activity
+inputs and outputs.
 
 Run the worker first, then start the workflow in another terminal:
 

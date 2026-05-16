@@ -1,5 +1,6 @@
 mod workflows;
 
+use futures_util::{FutureExt, future::BoxFuture};
 use temporalio_client::{
     Client, ClientOptions, Connection, envconfig::LoadClientConfigProfileOptions,
 };
@@ -7,7 +8,8 @@ use temporalio_common::telemetry::TelemetryOptions;
 use temporalio_sdk::{
     Worker, WorkerOptions,
     interceptors::{
-        ActivityExecutionInput, ActivityExecutionNext, ActivityExecutionOutput, ActivityInterceptor,
+        ActivityInboundInterceptor, ActivityInboundInterceptorNext, ExecuteActivityInput,
+        ExecuteActivityOutput,
     },
 };
 use temporalio_sdk_core::{CoreRuntime, RuntimeOptions};
@@ -17,39 +19,44 @@ use workflows::{
 
 struct LoggingActivityInterceptor;
 
-#[async_trait::async_trait]
-impl ActivityInterceptor for LoggingActivityInterceptor {
-    async fn execute_activity(
-        &self,
-        input: ActivityExecutionInput,
-        next: ActivityExecutionNext<'_>,
-    ) -> ActivityExecutionOutput {
-        let activity_type = input.context().info().activity_type.clone();
-        match activity_type.as_str() {
-            name if name == GreetingActivities::greet.name() => {
-                if let Some(request) = input.downcast_ref::<GreetingRequest>() {
-                    println!("greet input: {request:?}");
+impl ActivityInboundInterceptor for LoggingActivityInterceptor {
+    fn execute_activity<'a, 'b>(
+        &'a self,
+        input: ExecuteActivityInput,
+        next: ActivityInboundInterceptorNext<'b>,
+    ) -> BoxFuture<'a, ExecuteActivityOutput>
+    where
+        'b: 'a,
+    {
+        async move {
+            let activity_type = input.activity_info().activity_type.clone();
+            match activity_type.as_str() {
+                name if name == GreetingActivities::greet.name() => {
+                    if let Some(request) = input.args_ref::<GreetingRequest>() {
+                        println!("greet input: {request:?}");
+                    }
                 }
+                other => println!("running activity: {other}"),
             }
-            other => println!("running activity: {other}"),
-        }
 
-        let result = next.run(input).await;
+            let result = next.run(input).await;
 
-        match activity_type.as_str() {
-            name if name == GreetingActivities::greet.name() => {
-                if let Ok(output) = &result
-                    && let Some(response) = output.downcast_ref::<GreetingResponse>()
-                {
-                    println!("greet output: {response:?}");
+            match activity_type.as_str() {
+                name if name == GreetingActivities::greet.name() => {
+                    if let Ok(output) = &result
+                        && let Some(response) = output.downcast_ref::<GreetingResponse>()
+                    {
+                        println!("greet output: {response:?}");
+                    }
                 }
+                _ => {}
             }
-            _ => {}
+            if let Err(err) = &result {
+                println!("activity {activity_type} failed: {err:?}");
+            }
+            result
         }
-        if let Err(err) = &result {
-            println!("activity {activity_type} failed: {err:?}");
-        }
-        result
+        .boxed()
     }
 }
 
@@ -71,7 +78,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .build();
 
     let mut worker = Worker::new(&runtime, client, worker_options)?;
-    worker.set_activity_interceptor(LoggingActivityInterceptor);
+    worker.set_activity_inbound_interceptor(LoggingActivityInterceptor);
     println!("Worker started on task queue: activity-interceptor");
     worker.run().await?;
 

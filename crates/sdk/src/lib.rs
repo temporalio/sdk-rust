@@ -114,9 +114,9 @@ pub use workflow_context::{
 use crate::{
     activities::{
         ActivityContext, ActivityDefinitions, ActivityImplementer, ExecutableActivity,
-        activity_execution_output_to_core,
+        activity_error_to_core_result,
     },
-    interceptors::{ActivityInterceptor, WorkerInterceptor},
+    interceptors::{ActivityInboundInterceptor, WorkerInterceptor},
     workflow_context::{
         ChildWfCommon, NexusUnblockData, PendingChildWorkflow, StartedNexusOperation,
     },
@@ -138,13 +138,13 @@ use std::{
 use temporalio_client::{Client, NamespacedClient};
 use temporalio_common::{
     ActivityDefinition, WorkflowDefinition,
-    data_converters::{DataConverter, SerializationContextData},
+    data_converters::{DataConverter, SerializationContext, SerializationContextData},
     payload_visitor::{decode_payloads, encode_payloads},
     protos::{
         TaskToken,
         coresdk::{
             ActivityTaskCompletion, AsJsonPayloadExt,
-            activity_result::ActivityResolution,
+            activity_result::{ActivityExecutionResult, ActivityResolution},
             activity_task::{ActivityTask, activity_task},
             child_workflow::ChildWorkflowResult,
             nexus::NexusOperationResult,
@@ -439,7 +439,7 @@ struct CommonWorker {
     worker: Arc<CoreWorker>,
     task_queue: String,
     worker_interceptor: Option<Box<dyn WorkerInterceptor>>,
-    activity_interceptor: Option<Arc<dyn ActivityInterceptor>>,
+    activity_inbound_interceptor: Option<Arc<dyn ActivityInboundInterceptor>>,
     data_converter: DataConverter,
 }
 
@@ -516,7 +516,7 @@ impl Worker {
                 task_queue: worker.get_config().task_queue.clone(),
                 worker,
                 worker_interceptor: None,
-                activity_interceptor: None,
+                activity_inbound_interceptor: None,
                 data_converter,
             },
             workflow_half: WorkflowHalf {
@@ -735,7 +735,7 @@ impl Worker {
                             common.worker.clone(),
                             common.task_queue.clone(),
                             common.data_converter.clone(),
-                            common.activity_interceptor.clone(),
+                            common.activity_inbound_interceptor.clone(),
                             activity,
                         )?;
                     }
@@ -757,9 +757,12 @@ impl Worker {
         self.common.worker_interceptor = Some(Box::new(interceptor));
     }
 
-    /// Set an [ActivityInterceptor].
-    pub fn set_activity_interceptor(&mut self, interceptor: impl ActivityInterceptor + 'static) {
-        self.common.activity_interceptor = Some(Arc::new(interceptor));
+    /// Set an [ActivityInboundInterceptor], replacing any existing activity inbound interceptor.
+    pub fn set_activity_inbound_interceptor(
+        &mut self,
+        interceptor: impl ActivityInboundInterceptor + 'static,
+    ) {
+        self.common.activity_inbound_interceptor = Some(Arc::new(interceptor));
     }
 
     /// Turns this rust worker into a new worker with all the same workflows and activities
@@ -927,7 +930,7 @@ impl ActivityHalf {
         worker: Arc<CoreWorker>,
         task_queue: String,
         data_converter: DataConverter,
-        activity_interceptor: Option<Arc<dyn ActivityInterceptor>>,
+        activity_inbound_interceptor: Option<Arc<dyn ActivityInboundInterceptor>>,
         activity: ActivityTask,
     ) -> Result<(), anyhow::Error> {
         match activity.variant {
@@ -962,11 +965,28 @@ impl ActivityHalf {
                                 .record("temporalWorkflowID", &info.workflow_id)
                                 .record("temporalRunID", &info.run_id);
                         }
-                        (act_fn)(args, data_converter, ctx, activity_interceptor).await
+                        (act_fn)(args, data_converter, ctx, activity_inbound_interceptor).await
                     }
                     .instrument(span);
                     let result = act_fut.await;
-                    let result = activity_execution_output_to_core(&codec_data_converter, result);
+                    let result = match result {
+                        Ok(output) => {
+                            // Codec application happens at the SDK/Core boundary, so activity
+                            // implementations work with the payload converter directly.
+                            let pc = codec_data_converter.payload_converter();
+                            let ctx = SerializationContext {
+                                data: &SerializationContextData::Activity,
+                                converter: pc,
+                            };
+                            match output.serialize_payload(&ctx) {
+                                Ok(payload) => ActivityExecutionResult::ok(payload),
+                                Err(err) => {
+                                    activity_error_to_core_result(&codec_data_converter, err.into())
+                                }
+                            }
+                        }
+                        Err(err) => activity_error_to_core_result(&codec_data_converter, err),
+                    };
                     let mut completion = ActivityTaskCompletion {
                         task_token,
                         result: Some(result),

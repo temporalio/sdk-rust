@@ -50,17 +50,19 @@ pub use temporalio_macros::activities;
 use crate::{
     OutgoingActivityError, OutgoingError,
     interceptors::{
-        ActivityExecutionInput, ActivityExecutionNext, ActivityExecutionOutput,
-        ActivityExecutionValue, ActivityInterceptor,
+        ActivityExecutionValue, ActivityInboundInterceptor, ActivityInboundInterceptorNext,
+        ExecuteActivityInput, ExecuteActivityOutput,
     },
     panic_formatter,
 };
-use futures_util::{FutureExt, future::BoxFuture};
+use futures_util::{
+    FutureExt,
+    future::{BoxFuture, ready},
+};
 use prost_types::{Duration, Timestamp};
 use std::{
     collections::HashMap,
     fmt::Debug,
-    future::Future,
     panic::AssertUnwindSafe,
     sync::Arc,
     time::{Duration as StdDuration, SystemTime},
@@ -194,6 +196,10 @@ impl ActivityContext {
     /// Get headers attached to this activity
     pub fn headers(&self) -> &HashMap<String, Payload> {
         &self.header_fields
+    }
+
+    pub(crate) fn headers_mut(&mut self) -> &mut HashMap<String, Payload> {
+        &mut self.header_fields
     }
 }
 
@@ -354,8 +360,8 @@ pub(crate) type ActivityInvocation = Arc<
             Vec<Payload>,
             DataConverter,
             ActivityContext,
-            Option<Arc<dyn ActivityInterceptor>>,
-        ) -> BoxFuture<'static, ActivityExecutionOutput>
+            Option<Arc<dyn ActivityInboundInterceptor>>,
+        ) -> BoxFuture<'static, ExecuteActivityOutput>
         + Send
         + Sync,
 >;
@@ -400,9 +406,9 @@ impl ActivityDefinitions {
     {
         self.activities.insert(
             AD::name(),
-            Arc::new(move |payloads, dc, c, activity_interceptor| {
+            Arc::new(move |payloads, dc, c, activity_inbound_interceptor| {
                 let instance = instance.clone();
-                catch_activity_panic(async move {
+                async move {
                     // Codec application happens at the SDK/Core boundary, so activity
                     // implementations work with the payload converter directly.
                     let pc = dc.payload_converter();
@@ -411,13 +417,23 @@ impl ActivityDefinitions {
                         converter: pc,
                     };
                     let input: AD::Input = pc.from_payloads(&ctx, payloads)?;
-                    let input = ActivityExecutionInput::new(c, Box::new(input));
-                    let next = activity_execution_next::<AD>(instance);
-                    match activity_interceptor {
-                        Some(interceptor) => interceptor.execute_activity(input, next).await,
-                        None => next.run(input).await,
+                    let input = ExecuteActivityInput::new(c, Box::new(input));
+                    let next = activity_inbound_interceptor_next::<AD>(instance);
+                    let activity_execution = match activity_inbound_interceptor {
+                        Some(interceptor) => {
+                            async move { interceptor.execute_activity(input, next).await }.boxed()
+                        }
+                        None => next.run(input),
+                    };
+                    match AssertUnwindSafe(activity_execution).catch_unwind().await {
+                        Ok(output) => output,
+                        Err(panic) => Err(ApplicationFailure::new(anyhow::anyhow!(
+                            "Activity function panicked: {}",
+                            panic_formatter(panic)
+                        ))
+                        .into()),
                     }
-                })
+                }
                 .boxed()
             }),
         );
@@ -433,66 +449,48 @@ impl ActivityDefinitions {
     }
 }
 
-fn activity_execution_next<AD>(instance: Arc<AD::Implementer>) -> ActivityExecutionNext<'static>
+fn activity_inbound_interceptor_next<AD>(
+    instance: Arc<AD::Implementer>,
+) -> ActivityInboundInterceptorNext<'static>
 where
     AD: ActivityDefinition + ExecutableActivity,
     AD::Input: Send + Sync,
     AD::Output: Send + Sync,
 {
-    ActivityExecutionNext::new(move |input| {
-        catch_activity_panic(async move {
-            let (activity_context, input) = input.into_parts();
-            let input = *input
-                .downcast::<AD::Input>()
-                .expect("activity interceptor returned input with wrong concrete type");
-            AD::execute(Some(instance), activity_context, input)
+    ActivityInboundInterceptorNext::new(move |input| {
+        let (activity_context, args) = input.into_parts();
+        let args = match args.downcast::<AD::Input>() {
+            Ok(args) => args,
+            Err(_) => {
+                return ready(Err(ApplicationFailure::new(anyhow::anyhow!(
+                    "Activity inbound interceptor returned arguments with wrong concrete type for activity {}",
+                    AD::name()
+                ))
+                .into()))
+                .boxed();
+            }
+        };
+
+        async move {
+            match AssertUnwindSafe(AD::execute(Some(instance), activity_context, *args))
+                .catch_unwind()
                 .await
-                .map(|output| Box::new(output) as Box<dyn ActivityExecutionValue>)
-        })
+            {
+                Ok(result) => {
+                    result.map(|output| Box::new(output) as Box<dyn ActivityExecutionValue>)
+                }
+                Err(panic) => Err(ApplicationFailure::new(anyhow::anyhow!(
+                    "Activity function panicked: {}",
+                    panic_formatter(panic)
+                ))
+                .into()),
+            }
+        }
         .boxed()
     })
 }
 
-pub(crate) fn activity_execution_output_to_core(
-    dc: &DataConverter,
-    output: ActivityExecutionOutput,
-) -> ActivityExecutionResult {
-    match output {
-        Ok(output) => {
-            // Codec application happens at the SDK/Core boundary, so activity implementations work
-            // with the payload converter directly.
-            let pc = dc.payload_converter();
-            let ctx = SerializationContext {
-                data: &SerializationContextData::Activity,
-                converter: pc,
-            };
-            match output.serialize_payload(&ctx) {
-                Ok(payload) => ActivityExecutionResult::ok(payload),
-                Err(err) => activity_error_to_core_result(dc, err.into()),
-            }
-        }
-        Err(err) => activity_error_to_core_result(dc, err),
-    }
-}
-
-async fn catch_activity_panic(
-    future: impl Future<Output = ActivityExecutionOutput>,
-) -> ActivityExecutionOutput {
-    match AssertUnwindSafe(future).catch_unwind().await {
-        Ok(output) => output,
-        Err(panic) => Err(activity_panic_to_execution_error(panic)),
-    }
-}
-
-fn activity_panic_to_execution_error(panic: Box<dyn std::any::Any + Send>) -> ActivityError {
-    ApplicationFailure::new(anyhow::anyhow!(
-        "Activity function panicked: {}",
-        panic_formatter(panic)
-    ))
-    .into()
-}
-
-fn activity_error_to_core_result(
+pub(crate) fn activity_error_to_core_result(
     dc: &DataConverter,
     err: ActivityError,
 ) -> ActivityExecutionResult {
