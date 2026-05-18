@@ -162,6 +162,36 @@ async fn parallel_timers() {
 
 #[workflow]
 #[derive(Default)]
+struct CancelAlreadyFiredTimerWf;
+
+#[workflow_methods]
+impl CancelAlreadyFiredTimerWf {
+    #[run(name = DEFAULT_WORKFLOW_TYPE)]
+    async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<()> {
+        let mut t1 = ctx.timer(Duration::from_secs(1));
+        let mut t2 = ctx.timer(Duration::from_secs(1));
+        temporalio_sdk::workflows::select! {
+            _ = t1 => {}
+            _ = t2 => {}
+        }
+        t2.cancel();
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn cancel_unpolled_timer_after_both_timers_fire_same_activation() {
+    let mut t = canned_histories::parallel_timer("1", "2");
+    t.add_workflow_task_completed();
+    t.add_workflow_execution_completed();
+
+    let mut worker = build_fake_sdk(MockPollCfg::from_hist_builder(t));
+    worker.register_workflow::<CancelAlreadyFiredTimerWf>();
+    worker.run().await.unwrap();
+}
+
+#[workflow]
+#[derive(Default)]
 struct HappyTimerWf;
 
 #[workflow_methods]

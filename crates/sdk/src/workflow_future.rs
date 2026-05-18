@@ -182,23 +182,20 @@ impl WorkflowFuture {
     }
 
     fn unblock(&mut self, event: UnblockEvent) -> Result<(), Error> {
-        let cmd_id = match event {
-            UnblockEvent::Timer(seq, _) => CommandID::Timer(seq),
-            UnblockEvent::Activity(seq, _) => CommandID::Activity(seq),
-            UnblockEvent::WorkflowStart(seq, _) => CommandID::ChildWorkflowStart(seq),
-            UnblockEvent::WorkflowComplete(seq, _) => CommandID::ChildWorkflowComplete(seq),
-            UnblockEvent::SignalExternal(seq, _) => CommandID::SignalExternal(seq),
-            UnblockEvent::CancelExternal(seq, _) => CommandID::CancelExternal(seq),
-            UnblockEvent::NexusOperationStart(seq, _) => CommandID::NexusOpStart(seq),
-            UnblockEvent::NexusOperationComplete(seq, _) => CommandID::NexusOpComplete(seq),
+        let cmd_id = CommandID::from(&event);
+        self.maybe_unblock(event)
+            .then_some(())
+            .ok_or_else(|| anyhow!("Command {cmd_id:?} not found to unblock!"))
+    }
+
+    fn maybe_unblock(&mut self, event: UnblockEvent) -> bool {
+        let cmd_id = CommandID::from(&event);
+        let Some(unblocker) = self.command_status.remove(&cmd_id) else {
+            return false;
         };
-        let unblocker = self.command_status.remove(&cmd_id);
         let _guard = SdkWakeGuard::new();
-        let _ = unblocker
-            .ok_or_else(|| anyhow!("Command {cmd_id:?} not found to unblock!"))?
-            .unblocker
-            .send(event);
-        Ok(())
+        let _ = unblocker.unblocker.send(event);
+        true
     }
 
     fn fail_wft(&self, run_id: String, fail: Error, cause: Option<WorkflowTaskFailedCause>) {
@@ -696,7 +693,11 @@ impl WorkflowFuture {
                 RustWfCmd::Cancel(cancellable_id) => {
                     let cmd_variant = match cancellable_id {
                         CancellableID::Timer(seq) => {
-                            self.unblock(UnblockEvent::Timer(seq, TimerResult::Cancelled))?;
+                            if !self.maybe_unblock(UnblockEvent::Timer(seq, TimerResult::Cancelled))
+                            {
+                                // If timer is no longer present, do not emit command for cancellation.
+                                continue;
+                            }
                             // Re-poll wf future since a timer is now unblocked
                             res = self.execution.poll_run(cx);
                             workflow_command::Variant::CancelTimer(CancelTimer { seq })
@@ -840,6 +841,21 @@ enum CommandID {
     CancelExternal(u32),
     NexusOpStart(u32),
     NexusOpComplete(u32),
+}
+
+impl From<&UnblockEvent> for CommandID {
+    fn from(event: &UnblockEvent) -> Self {
+        match event {
+            UnblockEvent::Timer(seq, _) => CommandID::Timer(*seq),
+            UnblockEvent::Activity(seq, _) => CommandID::Activity(*seq),
+            UnblockEvent::WorkflowStart(seq, _) => CommandID::ChildWorkflowStart(*seq),
+            UnblockEvent::WorkflowComplete(seq, _) => CommandID::ChildWorkflowComplete(*seq),
+            UnblockEvent::SignalExternal(seq, _) => CommandID::SignalExternal(*seq),
+            UnblockEvent::CancelExternal(seq, _) => CommandID::CancelExternal(*seq),
+            UnblockEvent::NexusOperationStart(seq, _) => CommandID::NexusOpStart(*seq),
+            UnblockEvent::NexusOperationComplete(seq, _) => CommandID::NexusOpComplete(*seq),
+        }
+    }
 }
 
 fn update_response(
