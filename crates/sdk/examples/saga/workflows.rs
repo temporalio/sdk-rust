@@ -1,17 +1,12 @@
 #![allow(unreachable_pub)]
+use futures_util::future::LocalBoxFuture;
 use std::time::Duration;
+use temporalio_common::ActivityDefinition;
 use temporalio_macros::{activities, workflow, workflow_methods};
 use temporalio_sdk::{
     ActivityExecutionError, ActivityOptions, ApplicationFailure, WorkflowContext, WorkflowResult,
     activities::{ActivityContext, ActivityError},
 };
-
-#[derive(Debug)]
-enum Booking {
-    Hotel,
-    Flight,
-    Car,
-}
 
 #[workflow]
 #[derive(Default)]
@@ -24,87 +19,90 @@ impl SagaWorkflow {
         ctx: &mut WorkflowContext<Self>,
         trip_id: String,
     ) -> WorkflowResult<Vec<String>> {
-        let mut compensations: Vec<(Booking, String)> = Vec::new();
-
-        match Self::book_trip(ctx, trip_id, &mut compensations).await {
-            Ok(()) => Ok(compensations.into_iter().map(|(_, id)| id).collect()),
+        let mut saga = Saga::new(ctx, activity_opts());
+        match Self::book_trip(&mut saga, trip_id).await {
+            Ok(ids) => Ok(ids),
             Err(e) => {
-                Self::run_compensations(ctx, &compensations).await;
+                saga.compensate().await;
                 Err(e.into())
             }
         }
     }
 
     async fn book_trip(
-        ctx: &mut WorkflowContext<SagaWorkflow>,
+        saga: &mut Saga,
         trip_id: String,
-        compensations: &mut Vec<(Booking, String)>,
-    ) -> Result<(), ActivityExecutionError> {
-        let hotel = ctx
-            .start_activity(
+    ) -> Result<Vec<String>, ActivityExecutionError> {
+        let hotel = saga
+            .step(
                 BookingActivities::book_hotel,
                 trip_id.clone(),
-                activity_opts(),
+                BookingActivities::cancel_hotel,
             )
             .await?;
-        compensations.push((Booking::Hotel, hotel));
-
-        let flight = ctx
-            .start_activity(
+        let flight = saga
+            .step(
                 BookingActivities::book_flight,
                 trip_id.clone(),
-                activity_opts(),
+                BookingActivities::cancel_flight,
             )
             .await?;
-        compensations.push((Booking::Flight, flight));
-
-        let car = ctx
-            .start_activity(
+        let car = saga
+            .step(
                 BookingActivities::book_car,
                 trip_id.clone(),
-                activity_opts(),
+                BookingActivities::cancel_car,
             )
             .await?;
-        compensations.push((Booking::Car, car));
+        Ok(vec![hotel, flight, car])
+    }
+}
 
-        Ok(())
+/// Records compensations and runs them in reverse on failure.
+struct Saga {
+    ctx: WorkflowContext<SagaWorkflow>,
+    opts: ActivityOptions,
+    compensations: Vec<LocalBoxFuture<'static, ()>>,
+}
+
+impl Saga {
+    fn new(ctx: &WorkflowContext<SagaWorkflow>, opts: ActivityOptions) -> Self {
+        Self {
+            ctx: ctx.clone(),
+            opts,
+            compensations: Vec::new(),
+        }
     }
 
-    async fn run_compensations<W>(
-        ctx: &mut WorkflowContext<W>,
-        compensations: &[(Booking, String)],
-    ) {
-        for (service, booking_id) in compensations.iter().rev() {
-            let result = match *service {
-                Booking::Hotel => {
-                    ctx.start_activity(
-                        BookingActivities::cancel_hotel,
-                        booking_id.clone(),
-                        activity_opts(),
-                    )
-                    .await
-                }
-                Booking::Flight => {
-                    ctx.start_activity(
-                        BookingActivities::cancel_flight,
-                        booking_id.clone(),
-                        activity_opts(),
-                    )
-                    .await
-                }
-                Booking::Car => {
-                    ctx.start_activity(
-                        BookingActivities::cancel_car,
-                        booking_id.clone(),
-                        activity_opts(),
-                    )
-                    .await
-                }
-            };
-
-            if let Err(e) = result {
-                eprintln!("Compensation failed for {service:?} {booking_id}: {e}");
+    async fn step<Step, Compensation>(
+        &mut self,
+        forward: Step,
+        input: impl Into<Step::Input>,
+        compensate: Compensation,
+    ) -> Result<Step::Output, ActivityExecutionError>
+    where
+        Step: ActivityDefinition,
+        Step::Output: Clone + Into<Compensation::Input>,
+        Compensation: ActivityDefinition<Output = ()> + 'static,
+    {
+        let out = self
+            .ctx
+            .start_activity(forward, input, self.opts.clone())
+            .await?;
+        let cmp_input: Compensation::Input = out.clone().into();
+        let ctx = self.ctx.clone();
+        let opts = self.opts.clone();
+        self.compensations.push(Box::pin(async move {
+            if let Err(e) = ctx.start_activity(compensate, cmp_input, opts).await {
+                eprintln!("Compensation {} failed: {e}", Compensation::name());
             }
+        }));
+        Ok(out)
+    }
+
+    async fn compensate(self) {
+        for c in self.compensations.into_iter().rev() {
+            c.await;
         }
     }
 }
