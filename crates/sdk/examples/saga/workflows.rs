@@ -30,7 +30,7 @@ impl SagaWorkflow {
     }
 
     async fn book_trip(
-        saga: &mut Saga<Self>,
+        saga: &mut Saga,
         trip_id: String,
     ) -> Result<Vec<String>, ActivityExecutionError> {
         let hotel = saga
@@ -59,14 +59,14 @@ impl SagaWorkflow {
 }
 
 /// Records compensations and runs them in reverse on failure.
-struct Saga<W> {
-    ctx: WorkflowContext<W>,
+struct Saga {
+    ctx: WorkflowContext<SagaWorkflow>,
     opts: ActivityOptions,
-    compensations: Vec<Box<dyn FnOnce() -> LocalBoxFuture<'static, ()>>>,
+    compensations: Vec<LocalBoxFuture<'static, ()>>,
 }
 
-impl<W: 'static> Saga<W> {
-    fn new(ctx: &WorkflowContext<W>, opts: ActivityOptions) -> Self {
+impl Saga {
+    fn new(ctx: &WorkflowContext<SagaWorkflow>, opts: ActivityOptions) -> Self {
         Self {
             ctx: ctx.clone(),
             opts,
@@ -92,19 +92,17 @@ impl<W: 'static> Saga<W> {
         let cmp_input: Compensation::Input = out.clone().into();
         let ctx = self.ctx.clone();
         let opts = self.opts.clone();
-        self.compensations.push(Box::new(move || {
-            Box::pin(async move {
-                if let Err(e) = ctx.start_activity(compensate, cmp_input, opts).await {
-                    eprintln!("Compensation {} failed: {e}", Compensation::name());
-                }
-            })
+        self.compensations.push(Box::pin(async move {
+            if let Err(e) = ctx.start_activity(compensate, cmp_input, opts).await {
+                eprintln!("Compensation {} failed: {e}", Compensation::name());
+            }
         }));
         Ok(out)
     }
 
     async fn compensate(self) {
         for c in self.compensations.into_iter().rev() {
-            c().await;
+            c.await;
         }
     }
 }
