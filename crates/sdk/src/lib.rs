@@ -1,6 +1,6 @@
 #![warn(missing_docs)] // error if there are missing docs
 
-//! This crate defines an alpha-stage Temporal Rust SDK.
+//! This crate defines a Public Preview Temporal Rust SDK.
 //!
 //! Currently defining activities and running an activity-only worker is the most stable code.
 //! Workflow definitions exist and running a workflow worker works, but the API is still very

@@ -45,7 +45,11 @@ message ConnectivityRuleSpec {
 }
 
 // A public connectivity rule allows access to the namespace via the public internet.
-message PublicConnectivityRule {}
+message PublicConnectivityRule {
+  // Flag to determine namespace is connected via a predictable set of IPs on public internet
+  // temporal:versioning:min_version=v0.15.0
+  bool enable_stable_ips = 1;
+}
 
 // A private connectivity rule allows connections from a specific private vpc only.
 message PrivateConnectivityRule {

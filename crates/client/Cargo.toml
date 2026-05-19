@@ -12,7 +12,9 @@ categories = ["development-tools"]
 readme = "README.md"
 
 [features]
-default = ["envconfig"]
+default = ["envconfig", "tls-ring"]
+tls-ring = ["tonic/tls-ring"]
+tls-aws-lc = ["tonic/tls-aws-lc"]
 telemetry = ["dep:opentelemetry"]
 core-based-sdk = []
 envconfig = ["temporalio-common/envconfig"]
@@ -42,7 +44,7 @@ tokio = { version = "1.47", default-features = false, features = [
   "sync",
   "time",
 ] }
-tonic = { workspace = true, default-features = false, features = ["tls-ring", "tls-native-roots", "channel"] }
+tonic = { workspace = true, default-features = false, features = ["tls-native-roots", "channel"] }
 tower = { version = "0.5", features = ["util"] }
 tracing = "0.1"
 url = "2.5"

@@ -16,7 +16,9 @@ rust-version = "1.88.0"
 [lib]
 
 [features]
-default = ["envconfig", "prometheus"]
+default = ["envconfig", "prometheus", "tls-ring"]
+tls-ring = ["temporalio-client/tls-ring"]
+tls-aws-lc = ["temporalio-client/tls-aws-lc"]
 envconfig = ["temporalio-client/envconfig", "temporalio-common/envconfig"]
 prometheus = ["temporalio-common/prometheus"]
 otel = [
@@ -102,7 +104,6 @@ tokio = { version = "1.47", default-features = false, features = [
 tokio-util = { version = "0.7", features = ["io", "io-util"] }
 tokio-stream = { version = "0.1", default-features = false }
 tonic = { workspace = true, default-features = false, features = [
-  "tls-ring",
   "tls-native-roots",
   "transport",
   "codegen",

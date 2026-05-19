@@ -1,7 +1,7 @@
 use crate::{
     client::{
-        ClientHttpConnectProxyOptions, ClientKeepAliveOptions, ClientRetryOptions,
-        ClientTlsOptions, Connection, GrpcMetadataHolder, RpcCallOptions,
+        ClientDnsLoadBalancingOptions, ClientHttpConnectProxyOptions, ClientKeepAliveOptions,
+        ClientRetryOptions, ClientTlsOptions, Connection, GrpcMetadataHolder, RpcCallOptions,
         temporal_core_client_connect, temporal_core_client_free, temporal_core_client_rpc_call,
     },
     runtime::{
@@ -340,6 +340,12 @@ impl Context {
             })
         });
 
+        let dns_load_balancing_options = options.dns_load_balancing.as_ref().map(|dns| {
+            Box::new(ClientDnsLoadBalancingOptions {
+                resolution_interval_millis: dns.resolution_interval.as_millis() as u64,
+            })
+        });
+
         let client_options = Box::new(crate::client::ConnectionOptions {
             target_url: options.target.as_str().into(),
             client_name: options.get_client_name().into(),
@@ -352,6 +358,7 @@ impl Context {
             retry_options: &*retry_options,
             keep_alive_options: pointer_or_null(keep_alive_options.as_deref()),
             http_connect_proxy_options: pointer_or_null(proxy_options.as_deref()),
+            dns_load_balancing_options: pointer_or_null(dns_load_balancing_options.as_deref()),
             grpc_override_callback,
             grpc_override_callback_user_data,
         });
@@ -368,6 +375,7 @@ impl Context {
                 retry_options,
                 keep_alive_options,
                 proxy_options,
+                dns_load_balancing_options,
                 client_options,
             )),
         })) as *mut libc::c_void;

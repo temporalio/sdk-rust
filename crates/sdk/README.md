@@ -3,10 +3,10 @@
 [![crates.io](https://img.shields.io/crates/v/temporalio-sdk.svg)](https://crates.io/crates/temporalio-sdk)
 [![docs.rs](https://docs.rs/temporalio-sdk/badge.svg)](https://docs.rs/temporalio-sdk)
 
-This crate contains a prerelease Rust SDK. The SDK is built on top of
+This crate contains a Public Preview Rust SDK. The SDK is built on top of
 Core and provides a native Rust experience for writing Temporal workflows and activities.
 
-⚠️ **The SDK is under active development and should be considered prerelease.** The API can and
+⚠️ **The SDK is in Public Preview and under active development.** The API can and
 will continue to evolve.
 
 ## Quick Start
