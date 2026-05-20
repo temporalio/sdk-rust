@@ -40,7 +40,7 @@ pub use metrics::{LONG_REQUEST_LATENCY_HISTOGRAM_NAME, REQUEST_LATENCY_HISTOGRAM
 pub use options_structs::*;
 pub use replaceable::SharedReplaceableClient;
 pub use retry::RetryOptions;
-/// Danger-related TLS modules.
+/// Potentially dangerous TLS related functionality.
 pub mod danger {
     /// Re-export the `ServerCertVerifier` trait so that users can implement custom TLS
     /// server certificate verification without depending on `tokio-rustls` directly,
