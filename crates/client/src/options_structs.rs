@@ -152,6 +152,11 @@ pub struct TlsOptions {
     /// - Custom trust-domain validation (e.g., SAN-URI extraction)
     /// - Federated root certificate stores
     ///
+    /// # WARNING
+    /// Implementing a custom `ServerCertVerifier` can lead to severely insecure TLS connections
+    /// (e.g., disabling all validation or allowing man-in-the-middle attacks) if not done carefully.
+    /// Only use this if you know exactly what you are doing.
+    ///
     /// The verifier must implement [`ServerCertVerifier`] from the `rustls` crate.
     /// Note that `domain` is still respected for the `:authority` header / origin override
     /// even when a custom verifier is set.

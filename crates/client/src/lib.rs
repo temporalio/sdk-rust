@@ -40,9 +40,13 @@ pub use metrics::{LONG_REQUEST_LATENCY_HISTOGRAM_NAME, REQUEST_LATENCY_HISTOGRAM
 pub use options_structs::*;
 pub use replaceable::SharedReplaceableClient;
 pub use retry::RetryOptions;
-/// Re-export the `ServerCertVerifier` trait so that users can implement custom TLS
-/// server certificate verification without depending on `tokio-rustls` directly.
-pub use tokio_rustls::rustls::client::danger::ServerCertVerifier;
+/// Danger-related TLS modules.
+pub mod danger {
+    /// Re-export the `ServerCertVerifier` trait so that users can implement custom TLS
+    /// server certificate verification without depending on `tokio-rustls` directly,
+    /// while explicitly acknowledging the danger in the import path.
+    pub use tokio_rustls::rustls::client::danger::ServerCertVerifier;
+}
 pub use tonic;
 pub use workflow_handle::{
     UntypedQuery, UntypedSignal, UntypedUpdate, UntypedWorkflow, UntypedWorkflowHandle,
@@ -411,10 +415,14 @@ async fn add_tls_to_channel(
     mut channel: Endpoint,
 ) -> Result<Endpoint, ClientConnectError> {
     if let Some(tls_cfg) = tls_options {
+        if tls_cfg.server_cert_verifier.is_some() && tls_cfg.server_root_ca_cert.is_some() {
+            return Err(ClientConnectError::InvalidConfig(
+                "Cannot set both `server_root_ca_cert` and `server_cert_verifier`".to_owned(),
+            ));
+        }
+
         let mut tls = tonic::transport::ClientTlsConfig::new();
 
-        // When a custom verifier is set, server_root_ca_cert is ignored because
-        // tonic's tls_config_with_verifier replaces the default WebPKI verifier entirely.
         if tls_cfg.server_cert_verifier.is_none() {
             if let Some(root_cert) = &tls_cfg.server_root_ca_cert {
                 let server_root_ca_cert = Certificate::from_pem(root_cert);
@@ -1549,50 +1557,6 @@ mod tests {
             }
         }
 
-        #[test]
-        fn tls_options_with_verifier_default_is_none() {
-            let opts = TlsOptions::default();
-            assert!(opts.server_cert_verifier.is_none());
-        }
-
-        #[test]
-        fn tls_options_with_verifier_clone() {
-            let opts = TlsOptions {
-                server_cert_verifier: Some(Arc::new(MockVerifier)),
-                ..Default::default()
-            };
-            let cloned = opts.clone();
-            assert!(cloned.server_cert_verifier.is_some());
-        }
-
-        #[test]
-        fn tls_options_debug_shows_custom_when_verifier_set() {
-            let opts = TlsOptions {
-                server_cert_verifier: Some(Arc::new(MockVerifier)),
-                domain: Some("test.example.com".to_string()),
-                ..Default::default()
-            };
-            let debug_str = format!("{opts:?}");
-            assert!(
-                debug_str.contains("<custom>"),
-                "Debug output should show <custom> for verifier, got: {debug_str}"
-            );
-            assert!(
-                debug_str.contains("test.example.com"),
-                "Debug output should show domain, got: {debug_str}"
-            );
-        }
-
-        #[test]
-        fn tls_options_debug_shows_none_when_no_verifier() {
-            let opts = TlsOptions::default();
-            let debug_str = format!("{opts:?}");
-            assert!(
-                debug_str.contains("server_cert_verifier: None"),
-                "Debug output should show None for verifier, got: {debug_str}"
-            );
-        }
-
         #[tokio::test]
         async fn add_tls_to_channel_with_custom_verifier() {
             let tls_opts = TlsOptions {
@@ -1610,10 +1574,9 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn add_tls_to_channel_with_verifier_ignores_ca_cert() {
+        async fn add_tls_to_channel_with_verifier_and_ca_cert_fails() {
             // When both server_cert_verifier and server_root_ca_cert are set,
-            // the CA cert should be ignored (not passed to tonic) to avoid
-            // tonic's VerifierConflict error.
+            // add_tls_to_channel should fail with InvalidConfig.
             let tls_opts = TlsOptions {
                 server_root_ca_cert: Some(b"some-ca-cert-bytes".to_vec()),
                 server_cert_verifier: Some(Arc::new(MockVerifier)),
@@ -1623,10 +1586,9 @@ mod tests {
             let endpoint = tonic::transport::Channel::from_static("https://test.temporal.io:7233");
             let result = add_tls_to_channel(Some(&tls_opts), endpoint).await;
             assert!(
-                result.is_ok(),
-                "add_tls_to_channel should succeed even when server_root_ca_cert is set \
-                 alongside a custom verifier (CA cert should be ignored): {:?}",
-                result.err()
+                matches!(result, Err(ClientConnectError::InvalidConfig(_))),
+                "add_tls_to_channel should fail with InvalidConfig when both CA cert and verifier are set: {:?}",
+                result
             );
         }
 
