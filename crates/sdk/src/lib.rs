@@ -439,7 +439,7 @@ struct CommonWorker {
     worker: Arc<CoreWorker>,
     task_queue: String,
     worker_interceptor: Option<Box<dyn WorkerInterceptor>>,
-    activity_inbound_interceptor: Option<Arc<dyn ActivityInboundInterceptor>>,
+    activity_inbound_interceptors: Vec<Arc<dyn ActivityInboundInterceptor>>,
     data_converter: DataConverter,
 }
 
@@ -516,7 +516,7 @@ impl Worker {
                 task_queue: worker.get_config().task_queue.clone(),
                 worker,
                 worker_interceptor: None,
-                activity_inbound_interceptor: None,
+                activity_inbound_interceptors: Vec::new(),
                 data_converter,
             },
             workflow_half: WorkflowHalf {
@@ -735,7 +735,7 @@ impl Worker {
                             common.worker.clone(),
                             common.task_queue.clone(),
                             common.data_converter.clone(),
-                            common.activity_inbound_interceptor.clone(),
+                            common.activity_inbound_interceptors.clone(),
                             activity,
                         )?;
                     }
@@ -757,12 +757,15 @@ impl Worker {
         self.common.worker_interceptor = Some(Box::new(interceptor));
     }
 
-    /// Set an [ActivityInboundInterceptor], replacing any existing activity inbound interceptor.
-    pub fn set_activity_inbound_interceptor(
+    /// Append an [ActivityInboundInterceptor] to the chain. Interceptors run in the order they
+    /// are added, outer-most first.
+    pub fn add_activity_inbound_interceptor(
         &mut self,
-        interceptor: impl ActivityInboundInterceptor + 'static,
+        interceptor: impl ActivityInboundInterceptor,
     ) {
-        self.common.activity_inbound_interceptor = Some(Arc::new(interceptor));
+        self.common
+            .activity_inbound_interceptors
+            .push(Arc::new(interceptor));
     }
 
     /// Turns this rust worker into a new worker with all the same workflows and activities
@@ -930,7 +933,7 @@ impl ActivityHalf {
         worker: Arc<CoreWorker>,
         task_queue: String,
         data_converter: DataConverter,
-        activity_inbound_interceptor: Option<Arc<dyn ActivityInboundInterceptor>>,
+        activity_inbound_interceptors: Vec<Arc<dyn ActivityInboundInterceptor>>,
         activity: ActivityTask,
     ) -> Result<(), anyhow::Error> {
         match activity.variant {
@@ -965,7 +968,7 @@ impl ActivityHalf {
                                 .record("temporalWorkflowID", &info.workflow_id)
                                 .record("temporalRunID", &info.run_id);
                         }
-                        (act_fn)(args, data_converter, ctx, activity_inbound_interceptor).await
+                        (act_fn)(args, data_converter, ctx, activity_inbound_interceptors).await
                     }
                     .instrument(span);
                     let result = act_fut.await;
@@ -1363,6 +1366,7 @@ impl PrintablePanicType for EndPrintingAttempts {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::activities::ActivityError;
     use temporalio_macros::{activities, workflow, workflow_methods};
 
     struct MyActivities {}
@@ -1370,7 +1374,7 @@ mod tests {
     #[activities]
     impl MyActivities {
         #[activity]
-        async fn my_activity(_ctx: ActivityContext) -> Result<(), activities::ActivityError> {
+        async fn my_activity(_ctx: ActivityContext) -> Result<(), ActivityError> {
             Ok(())
         }
 
@@ -1379,7 +1383,7 @@ mod tests {
             self: Arc<Self>,
             _ctx: ActivityContext,
             _: String,
-        ) -> Result<(), activities::ActivityError> {
+        ) -> Result<(), ActivityError> {
             Ok(())
         }
     }

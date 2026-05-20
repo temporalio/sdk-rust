@@ -5,7 +5,7 @@ use crate::{
     activities::{ActivityContext, ActivityError, ActivityInfo},
 };
 use anyhow::bail;
-use futures_util::{FutureExt, future::BoxFuture};
+use futures_util::future::BoxFuture;
 use std::{
     any::Any,
     collections::HashMap,
@@ -67,6 +67,24 @@ pub trait WorkerInterceptor {
     }
 }
 
+/// Continuation for an interceptor operation.
+///
+/// Interceptor implementations call [`Next::run`] to invoke the next step of the chain.
+pub struct Next<'a, I, O> {
+    inner: Box<dyn FnOnce(I) -> O + Send + 'a>,
+}
+
+impl<'a, I, O> Next<'a, I, O> {
+    pub(crate) fn new(f: impl FnOnce(I) -> O + Send + 'a) -> Self {
+        Self { inner: Box::new(f) }
+    }
+
+    /// Continue the call chain with the provided input.
+    pub fn run(self, input: I) -> O {
+        (self.inner)(input)
+    }
+}
+
 /// Activity execution data passed to [`ActivityInboundInterceptor::execute_activity`].
 #[non_exhaustive]
 pub struct ExecuteActivityInput {
@@ -109,7 +127,7 @@ impl ExecuteActivityInput {
     }
 }
 
-/// Type-erased activity output returned from [`ActivityInboundInterceptorNext::run`].
+/// Type-erased activity output carried through the activity interceptor chain.
 pub trait ActivityExecutionValue:
     Any + TemporalSerializable + Send + Sync + activity_execution_value::Sealed
 {
@@ -140,41 +158,23 @@ impl dyn ActivityExecutionValue {
     }
 }
 
-/// Output of an activity execution returned from [`ActivityInboundInterceptorNext::run`].
-pub type ExecuteActivityOutput = Result<Box<dyn ActivityExecutionValue>, ActivityError>;
+/// Result of an activity execution carried through the interceptor chain.
+pub type ExecuteActivityResult = Result<Box<dyn ActivityExecutionValue>, ActivityError>;
 
-/// The next activity execution step in an interceptor chain.
-pub struct ActivityInboundInterceptorNext<'a> {
-    run: Box<dyn FnOnce(ExecuteActivityInput) -> BoxFuture<'a, ExecuteActivityOutput> + Send + 'a>,
-}
+/// Future produced by activity inbound interceptors.
+pub type ExecuteActivityOutput<'a> = BoxFuture<'a, ExecuteActivityResult>;
 
-impl<'a> ActivityInboundInterceptorNext<'a> {
-    pub(crate) fn new(
-        run: impl FnOnce(ExecuteActivityInput) -> BoxFuture<'a, ExecuteActivityOutput> + Send + 'a,
-    ) -> Self {
-        Self { run: Box::new(run) }
-    }
-
-    /// Run the next interceptor or the activity implementation.
-    pub fn run(self, input: ExecuteActivityInput) -> BoxFuture<'a, ExecuteActivityOutput> {
-        (self.run)(input)
-    }
-}
-
-/// Implementors can intercept activity execution.
+/// Inbound interceptor for activity calls coming from the server.
 ///
-/// Advanced usage only.
-pub trait ActivityInboundInterceptor: Send + Sync {
-    /// Wrap activity execution.
-    fn execute_activity<'a, 'b>(
+/// Must be implemented by inbound activity interceptors.
+pub trait ActivityInboundInterceptor: Send + Sync + 'static {
+    /// Called to invoke the activity.
+    fn execute_activity<'a>(
         &'a self,
         input: ExecuteActivityInput,
-        next: ActivityInboundInterceptorNext<'b>,
-    ) -> BoxFuture<'a, ExecuteActivityOutput>
-    where
-        'b: 'a,
-    {
-        async move { next.run(input).await }.boxed()
+        next: Next<'a, ExecuteActivityInput, ExecuteActivityOutput<'a>>,
+    ) -> ExecuteActivityOutput<'a> {
+        next.run(input)
     }
 }
 
@@ -219,46 +219,6 @@ impl WorkerInterceptor for InterceptorWithNext {
             next.on_workflow_activation(a).await?;
         }
         Ok(())
-    }
-}
-
-/// Supports the composition of activity inbound interceptors.
-pub struct ActivityInboundInterceptorWithNext {
-    inner: Box<dyn ActivityInboundInterceptor>,
-    next: Option<Box<ActivityInboundInterceptorWithNext>>,
-}
-
-impl ActivityInboundInterceptorWithNext {
-    /// Create from an existing interceptor, can be used to initialize a chain of interceptors.
-    pub fn new(inner: Box<dyn ActivityInboundInterceptor>) -> Self {
-        Self { inner, next: None }
-    }
-
-    /// Sets the next interceptor, and then returns that interceptor, wrapped by
-    /// [ActivityInboundInterceptorWithNext]. You can keep calling this method on it to extend the chain.
-    pub fn set_next(&mut self, next: Box<dyn ActivityInboundInterceptor>) -> &mut Self {
-        self.next.insert(Box::new(Self::new(next)))
-    }
-}
-
-impl ActivityInboundInterceptor for ActivityInboundInterceptorWithNext {
-    fn execute_activity<'a, 'b>(
-        &'a self,
-        input: ExecuteActivityInput,
-        next: ActivityInboundInterceptorNext<'b>,
-    ) -> BoxFuture<'a, ExecuteActivityOutput>
-    where
-        'b: 'a,
-    {
-        let chain_next = ActivityInboundInterceptorNext::new(move |input| {
-            Box::pin(async move {
-                match self.next.as_deref() {
-                    Some(next_interceptor) => next_interceptor.execute_activity(input, next).await,
-                    None => next.run(input).await,
-                }
-            })
-        });
-        self.inner.execute_activity(input, chain_next)
     }
 }
 

@@ -5,7 +5,7 @@ use crate::common::{
 };
 use anyhow::anyhow;
 use assert_matches::assert_matches;
-use futures_util::{FutureExt, future::BoxFuture};
+use futures_util::FutureExt;
 use std::{
     sync::{
         Arc, Mutex,
@@ -50,8 +50,8 @@ use temporalio_sdk::{
     WorkflowContext, WorkflowResult,
     activities::{ActivityContext, ActivityError},
     interceptors::{
-        ActivityInboundInterceptor, ActivityInboundInterceptorNext,
-        ActivityInboundInterceptorWithNext, ExecuteActivityInput, ExecuteActivityOutput,
+        ActivityInboundInterceptor, ExecuteActivityInput, ExecuteActivityOutput,
+        ExecuteActivityResult, Next,
     },
 };
 use temporalio_sdk_core::{
@@ -127,14 +127,11 @@ struct RecordingActivityInboundInterceptor {
 }
 
 impl ActivityInboundInterceptor for RecordingActivityInboundInterceptor {
-    fn execute_activity<'a, 'b>(
+    fn execute_activity<'a>(
         &'a self,
         input: ExecuteActivityInput,
-        next: ActivityInboundInterceptorNext<'b>,
-    ) -> BoxFuture<'a, ExecuteActivityOutput>
-    where
-        'b: 'a,
-    {
+        next: Next<'a, ExecuteActivityInput, ExecuteActivityOutput<'a>>,
+    ) -> ExecuteActivityOutput<'a> {
         async move {
             let info = input.activity_info();
             let activity_type = info.activity_type.clone();
@@ -171,7 +168,7 @@ impl ActivityInboundInterceptor for RecordingActivityInboundInterceptor {
                         .ok()
                         .and_then(|output| output.downcast_ref::<String>())
                         .cloned(),
-                    status: Some(activity_execution_output_status(&result)),
+                    status: Some(activity_execution_result_status(&result)),
                 });
             result
         }
@@ -179,9 +176,7 @@ impl ActivityInboundInterceptor for RecordingActivityInboundInterceptor {
     }
 }
 
-fn activity_execution_output_status(
-    result: &temporalio_sdk::interceptors::ExecuteActivityOutput,
-) -> &'static str {
+fn activity_execution_result_status(result: &ExecuteActivityResult) -> &'static str {
     match result {
         Ok(_) => "completed",
         Err(ActivityError::Application(_)) => "failed",
@@ -262,7 +257,7 @@ async fn one_activity_only() {
 #[tokio::test]
 async fn activity_interceptor_wraps_activity_execution() {
     let wf_name = OneActivityWorkflow::name();
-    let mut starter = CoreWfStarter::new(wf_name);
+    let mut starter = CoreWfStarter::new("activity_interceptor_wraps_activity_execution");
     starter.sdk_config.register_activities(StdActivities);
     starter
         .sdk_config
@@ -270,18 +265,18 @@ async fn activity_interceptor_wraps_activity_execution() {
     let mut worker = starter.worker().await;
 
     let records = Arc::new(ActivityInterceptorRecords::default());
-    let mut interceptor =
-        ActivityInboundInterceptorWithNext::new(Box::new(RecordingActivityInboundInterceptor {
-            interceptor: "outer",
-            records: records.clone(),
-        }));
-    interceptor.set_next(Box::new(RecordingActivityInboundInterceptor {
-        interceptor: "inner",
-        records: records.clone(),
-    }));
     worker
         .inner_mut()
-        .set_activity_inbound_interceptor(interceptor);
+        .add_activity_inbound_interceptor(RecordingActivityInboundInterceptor {
+            interceptor: "outer",
+            records: records.clone(),
+        });
+    worker
+        .inner_mut()
+        .add_activity_inbound_interceptor(RecordingActivityInboundInterceptor {
+            interceptor: "inner",
+            records: records.clone(),
+        });
 
     let input = "hello from input!".to_string();
     let task_queue = starter.get_task_queue().to_owned();
@@ -289,7 +284,7 @@ async fn activity_interceptor_wraps_activity_execution() {
         .submit_workflow(
             OneActivityWorkflow::run,
             input.clone(),
-            WorkflowStartOptions::new(task_queue, wf_name.to_owned()).build(),
+            WorkflowStartOptions::new(task_queue.clone(), task_queue).build(),
         )
         .await
         .unwrap();
@@ -347,7 +342,7 @@ async fn activity_interceptor_wraps_activity_execution() {
 #[tokio::test]
 async fn activity_interceptor_wraps_local_activity_execution() {
     let wf_name = OneLocalActivityWorkflow::name();
-    let mut starter = CoreWfStarter::new(wf_name);
+    let mut starter = CoreWfStarter::new("activity_interceptor_wraps_local_activity_execution");
     starter.sdk_config.register_activities(StdActivities);
     starter
         .sdk_config
@@ -357,7 +352,7 @@ async fn activity_interceptor_wraps_local_activity_execution() {
     let records = Arc::new(ActivityInterceptorRecords::default());
     worker
         .inner_mut()
-        .set_activity_inbound_interceptor(RecordingActivityInboundInterceptor {
+        .add_activity_inbound_interceptor(RecordingActivityInboundInterceptor {
             interceptor: "local",
             records: records.clone(),
         });
@@ -368,7 +363,7 @@ async fn activity_interceptor_wraps_local_activity_execution() {
         .submit_workflow(
             OneLocalActivityWorkflow::run,
             input.clone(),
-            WorkflowStartOptions::new(task_queue, wf_name.to_owned()).build(),
+            WorkflowStartOptions::new(task_queue.clone(), task_queue).build(),
         )
         .await
         .unwrap();
@@ -406,14 +401,11 @@ async fn activity_interceptor_wraps_local_activity_execution() {
 struct MutatingActivityInboundInterceptor;
 
 impl ActivityInboundInterceptor for MutatingActivityInboundInterceptor {
-    fn execute_activity<'a, 'b>(
+    fn execute_activity<'a>(
         &'a self,
         mut input: ExecuteActivityInput,
-        next: ActivityInboundInterceptorNext<'b>,
-    ) -> BoxFuture<'a, ExecuteActivityOutput>
-    where
-        'b: 'a,
-    {
+        next: Next<'a, ExecuteActivityInput, ExecuteActivityOutput<'a>>,
+    ) -> ExecuteActivityOutput<'a> {
         if let Some(input) = input.args_mut::<String>() {
             input.push_str(" mutated");
         }
@@ -423,8 +415,7 @@ impl ActivityInboundInterceptor for MutatingActivityInboundInterceptor {
 
 #[tokio::test]
 async fn activity_inbound_interceptor_can_mutate_activity_input() {
-    let wf_name = OneActivityWorkflow::name();
-    let mut starter = CoreWfStarter::new(wf_name);
+    let mut starter = CoreWfStarter::new("activity_inbound_interceptor_can_mutate_activity_input");
     starter.sdk_config.register_activities(StdActivities);
     starter
         .sdk_config
@@ -433,7 +424,7 @@ async fn activity_inbound_interceptor_can_mutate_activity_input() {
 
     worker
         .inner_mut()
-        .set_activity_inbound_interceptor(MutatingActivityInboundInterceptor);
+        .add_activity_inbound_interceptor(MutatingActivityInboundInterceptor);
 
     let input = "hello from input!".to_string();
     let task_queue = starter.get_task_queue().to_owned();
@@ -441,7 +432,7 @@ async fn activity_inbound_interceptor_can_mutate_activity_input() {
         .submit_workflow(
             OneActivityWorkflow::run,
             input,
-            WorkflowStartOptions::new(task_queue, wf_name.to_owned()).build(),
+            WorkflowStartOptions::new(task_queue.clone(), task_queue).build(),
         )
         .await
         .unwrap();
@@ -488,7 +479,7 @@ async fn activity_interceptor_observes_activity_error() {
     }
 
     let wf_name = ActivityFailureWorkflow::name();
-    let mut starter = CoreWfStarter::new(wf_name);
+    let mut starter = CoreWfStarter::new("activity_interceptor_observes_activity_error");
     starter.sdk_config.register_activities(FailingActivities);
     starter
         .sdk_config
@@ -498,7 +489,7 @@ async fn activity_interceptor_observes_activity_error() {
     let records = Arc::new(ActivityInterceptorRecords::default());
     worker
         .inner_mut()
-        .set_activity_inbound_interceptor(RecordingActivityInboundInterceptor {
+        .add_activity_inbound_interceptor(RecordingActivityInboundInterceptor {
             interceptor: "failure",
             records: records.clone(),
         });
@@ -509,7 +500,7 @@ async fn activity_interceptor_observes_activity_error() {
         .submit_workflow(
             ActivityFailureWorkflow::run,
             input.clone(),
-            WorkflowStartOptions::new(task_queue, wf_name.to_owned()).build(),
+            WorkflowStartOptions::new(task_queue.clone(), task_queue).build(),
         )
         .await
         .unwrap();
@@ -584,7 +575,7 @@ async fn activity_interceptor_observes_activity_panic() {
     }
 
     let wf_name = ActivityPanicWorkflow::name();
-    let mut starter = CoreWfStarter::new(wf_name);
+    let mut starter = CoreWfStarter::new("activity_interceptor_observes_activity_panic");
     starter.sdk_config.register_activities(PanickingActivities);
     starter
         .sdk_config
@@ -594,7 +585,7 @@ async fn activity_interceptor_observes_activity_panic() {
     let records = Arc::new(ActivityInterceptorRecords::default());
     worker
         .inner_mut()
-        .set_activity_inbound_interceptor(RecordingActivityInboundInterceptor {
+        .add_activity_inbound_interceptor(RecordingActivityInboundInterceptor {
             interceptor: "panic",
             records: records.clone(),
         });
@@ -605,7 +596,7 @@ async fn activity_interceptor_observes_activity_panic() {
         .submit_workflow(
             ActivityPanicWorkflow::run,
             input.clone(),
-            WorkflowStartOptions::new(task_queue, wf_name.to_owned()).build(),
+            WorkflowStartOptions::new(task_queue.clone(), task_queue).build(),
         )
         .await
         .unwrap();

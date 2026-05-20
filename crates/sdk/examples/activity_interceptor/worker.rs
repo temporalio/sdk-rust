@@ -1,16 +1,13 @@
 mod workflows;
 
-use futures_util::{FutureExt, future::BoxFuture};
+use futures_util::FutureExt;
 use temporalio_client::{
     Client, ClientOptions, Connection, envconfig::LoadClientConfigProfileOptions,
 };
 use temporalio_common::telemetry::TelemetryOptions;
 use temporalio_sdk::{
     Worker, WorkerOptions,
-    interceptors::{
-        ActivityInboundInterceptor, ActivityInboundInterceptorNext, ExecuteActivityInput,
-        ExecuteActivityOutput,
-    },
+    interceptors::{ActivityInboundInterceptor, ExecuteActivityInput, ExecuteActivityOutput, Next},
 };
 use temporalio_sdk_core::{CoreRuntime, RuntimeOptions};
 use workflows::{
@@ -20,14 +17,11 @@ use workflows::{
 struct LoggingActivityInterceptor;
 
 impl ActivityInboundInterceptor for LoggingActivityInterceptor {
-    fn execute_activity<'a, 'b>(
+    fn execute_activity<'a>(
         &'a self,
         input: ExecuteActivityInput,
-        next: ActivityInboundInterceptorNext<'b>,
-    ) -> BoxFuture<'a, ExecuteActivityOutput>
-    where
-        'b: 'a,
-    {
+        next: Next<'a, ExecuteActivityInput, ExecuteActivityOutput<'a>>,
+    ) -> ExecuteActivityOutput<'a> {
         async move {
             let activity_type = input.activity_info().activity_type.clone();
             match activity_type.as_str() {
@@ -38,9 +32,7 @@ impl ActivityInboundInterceptor for LoggingActivityInterceptor {
                 }
                 other => println!("running activity: {other}"),
             }
-
             let result = next.run(input).await;
-
             match activity_type.as_str() {
                 name if name == GreetingActivities::greet.name() => {
                     if let Ok(output) = &result
@@ -78,7 +70,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .build();
 
     let mut worker = Worker::new(&runtime, client, worker_options)?;
-    worker.set_activity_inbound_interceptor(LoggingActivityInterceptor);
+    worker.add_activity_inbound_interceptor(LoggingActivityInterceptor);
     println!("Worker started on task queue: activity-interceptor");
     worker.run().await?;
 
