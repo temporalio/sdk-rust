@@ -107,7 +107,7 @@ use tonic::{
         MetadataValue,
     },
     service::Interceptor,
-    transport::{Certificate, Channel, Endpoint, Identity},
+    transport::{Certificate, Endpoint, Identity},
 };
 use tower::ServiceBuilder;
 use uuid::Uuid;
@@ -185,7 +185,7 @@ impl Connection {
                 Some(handle),
             )
         } else {
-            let channel = Channel::from_shared(options.target.to_string())?;
+            let channel = Endpoint::from_shared(options.target.to_string())?;
             let channel = add_tls_to_channel(options.tls_options.as_ref(), channel).await?;
             let channel = if let Some(keep_alive) = options.keep_alive.as_ref() {
                 channel
