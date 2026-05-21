@@ -166,7 +166,7 @@ async fn build_wasm_hello_component() -> PathBuf {
         .ancestors()
         .nth(2)
         .expect("sdk-core crate should live under crates/")
-        .join("samples/wasm-workflows/hello");
+        .join("crates/sdk/examples/wasm_workflows");
     let output = Command::new(env!("CARGO"))
         .args([
             "component",
