@@ -9,6 +9,7 @@ use std::{
     sync::{Arc, atomic::AtomicU64},
     time::Duration,
 };
+pub(crate) use temporalio_common::telemetry::metrics::message_direction;
 use temporalio_common::{
     protos::temporal::api::{enums::v1::WorkflowTaskFailedCause, failure::v1::Failure},
     telemetry::metrics::{core::*, *},
@@ -40,12 +41,14 @@ struct Instruments {
     wf_task_sched_to_start_latency: HistogramDuration,
     wf_task_replay_latency: HistogramDuration,
     wf_task_execution_latency: HistogramDuration,
+    wf_payload_size: Histogram,
     act_poll_no_task: Counter,
     act_task_received_counter: Counter,
     act_execution_failed: Counter,
     act_sched_to_start_latency: HistogramDuration,
     act_exec_latency: HistogramDuration,
     act_exec_succeeded_latency: HistogramDuration,
+    act_payload_size: Histogram,
     la_execution_cancelled: Counter,
     la_execution_failed: Counter,
     la_exec_latency: HistogramDuration,
@@ -118,7 +121,7 @@ impl MetricsContext {
         instruments.update_attributes(tm.get_default_attributes());
         Self {
             instruments: Arc::new(instruments),
-            meter: self.meter.clone(),
+            meter: tm,
             in_memory_metrics: self.in_memory_metrics.clone(),
         }
     }
@@ -182,6 +185,10 @@ impl MetricsContext {
         self.instruments.wf_task_replay_latency.records(dur);
     }
 
+    pub(crate) fn wf_payload_size(&self, size_bytes: u64) {
+        self.instruments.wf_payload_size.records(size_bytes);
+    }
+
     /// An activity long poll timed out
     pub(crate) fn act_poll_timeout(&self) {
         self.instruments.act_poll_no_task.adds(1);
@@ -211,6 +218,10 @@ impl MetricsContext {
     /// activity task, to the time lang responded with a completion (failure or success).
     pub(crate) fn act_execution_latency(&self, dur: Duration) {
         self.instruments.act_exec_latency.records(dur);
+    }
+
+    pub(crate) fn act_payload_size(&self, size_bytes: u64) {
+        self.instruments.act_payload_size.records(size_bytes);
     }
 
     pub(crate) fn la_execution_cancelled(&self) {
@@ -383,6 +394,12 @@ impl Instruments {
                 unit: "duration".into(),
                 description: "Histogram of workflow task execution (not replay) latencies".into(),
             }),
+            wf_payload_size: meter.histogram(MetricParameters {
+                name: WORKFLOW_PAYLOAD_SIZE_HISTOGRAM_NAME.into(),
+                unit: "By".into(),
+                description: "Histogram of workflow input and successful result payload sizes"
+                    .into(),
+            }),
             act_poll_no_task: meter.counter(MetricParameters {
                 name: "activity_poll_no_task".into(),
                 description: "Count of activity task queue poll timeouts (no new task)".into(),
@@ -412,6 +429,12 @@ impl Instruments {
                 name: "activity_succeed_endtoend_latency".into(),
                 unit: "duration".into(),
                 description: "Histogram of activity execution latencies for successful activities"
+                    .into(),
+            }),
+            act_payload_size: meter.histogram(MetricParameters {
+                name: ACTIVITY_PAYLOAD_SIZE_HISTOGRAM_NAME.into(),
+                unit: "By".into(),
+                description: "Histogram of activity input and successful result payload sizes"
                     .into(),
             }),
             la_execution_cancelled: meter.counter(MetricParameters {
@@ -535,6 +558,8 @@ impl Instruments {
             .update_attributes(new_attributes.clone());
         self.wf_task_execution_latency
             .update_attributes(new_attributes.clone());
+        self.wf_payload_size
+            .update_attributes(new_attributes.clone());
         self.act_poll_no_task
             .update_attributes(new_attributes.clone());
         self.act_task_received_counter
@@ -546,6 +571,8 @@ impl Instruments {
         self.act_exec_latency
             .update_attributes(new_attributes.clone());
         self.act_exec_succeeded_latency
+            .update_attributes(new_attributes.clone());
+        self.act_payload_size
             .update_attributes(new_attributes.clone());
         self.la_execution_cancelled
             .update_attributes(new_attributes.clone());
@@ -737,6 +764,7 @@ pub(crate) fn activity_type(ty: String) -> MetricKeyValue {
 pub(crate) fn workflow_type(ty: String) -> MetricKeyValue {
     MetricKeyValue::new(KEY_WF_TYPE, ty)
 }
+
 pub(crate) fn workflow_worker_type() -> MetricKeyValue {
     MetricKeyValue::new(KEY_WORKER_TYPE, "WorkflowWorker")
 }
@@ -1187,7 +1215,7 @@ mod tests {
         a2.set(Arc::new(DummyCustomAttrs(2))).unwrap();
         // Verify all metrics are created. This number will need to get updated any time a metric
         // is added.
-        let num_metrics = 35;
+        let num_metrics = 37;
         #[allow(clippy::needless_range_loop)] // Sorry clippy, this reads easier.
         for metric_num in 2..=num_metrics + 1 {
             let hole = assert_matches!(&events[metric_num],

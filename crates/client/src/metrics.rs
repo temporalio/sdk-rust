@@ -1,8 +1,10 @@
 use crate::{AttachMetricLabels, CallType, callback_based, dbg_panic};
+use bytes::Bytes;
 use futures_util::{
     FutureExt, TryFutureExt,
     future::{BoxFuture, Either},
 };
+use http_body_util::BodyExt;
 use std::{
     fmt,
     task::{Context, Poll},
@@ -11,12 +13,15 @@ use std::{
 use temporalio_common::telemetry::{
     TaskQueueLabelStrategy,
     metrics::{
-        Counter, CounterBase, HistogramDuration, HistogramDurationBase, MetricAttributable,
-        MetricAttributes, MetricKeyValue, MetricParameters, TemporalMeter,
+        Counter, CounterBase, Histogram, HistogramBase, HistogramDuration, HistogramDurationBase,
+        MESSAGE_DIRECTION_REQUEST, MESSAGE_DIRECTION_RESPONSE, MetricAttributable,
+        MetricAttributes, MetricKeyValue, MetricParameters, TemporalMeter, message_direction,
     },
 };
 use tonic::{Code, body::Body, transport::Channel};
 use tower::Service;
+
+pub use temporalio_common::telemetry::metrics::RPC_MESSAGE_SIZE_HISTOGRAM_NAME;
 
 /// The string name (which may be prefixed) for this metric
 pub static REQUEST_LATENCY_HISTOGRAM_NAME: &str = "request_latency";
@@ -40,6 +45,7 @@ struct Instruments {
 
     svc_request_latency: HistogramDuration,
     long_svc_request_latency: HistogramDuration,
+    rpc_message_size: Histogram,
 }
 
 impl MetricsContext {
@@ -75,6 +81,11 @@ impl MetricsContext {
                 unit: "duration".into(),
                 description: "Histogram of client long-poll request latencies".into(),
             }),
+            rpc_message_size: tm.histogram(MetricParameters {
+                name: RPC_MESSAGE_SIZE_HISTOGRAM_NAME.into(),
+                unit: "By".into(),
+                description: "Histogram of client gRPC request and response body sizes".into(),
+            }),
         };
         Self {
             poll_is_long: false,
@@ -109,8 +120,14 @@ impl MetricsContext {
                     .long_svc_request_latency
                     .with_attributes(self.meter.get_default_attributes())
             })
-            .map(|v| {
+            .and_then(|v| {
                 self.instruments.long_svc_request_latency = v;
+                self.instruments
+                    .rpc_message_size
+                    .with_attributes(self.meter.get_default_attributes())
+            })
+            .map(|v| {
+                self.instruments.rpc_message_size = v;
             })
             .inspect_err(|e| {
                 dbg_panic!("Failed to extend client metrics attributes: {:?}", e);
@@ -166,6 +183,10 @@ impl MetricsContext {
             self.instruments.svc_request_latency.records(dur);
         }
     }
+
+    pub(crate) fn rpc_message_size(&self, size_bytes: u64) {
+        self.instruments.rpc_message_size.records(size_bytes);
+    }
 }
 
 const KEY_NAMESPACE: &str = "namespace";
@@ -214,6 +235,44 @@ fn code_as_screaming_snake(code: &Code) -> &'static str {
         Code::DataLoss => "DATA_LOSS",
         Code::Unauthenticated => "UNAUTHENTICATED",
     }
+}
+
+struct BodySizeRecorder {
+    size_bytes: u64,
+    record: Box<dyn Fn(u64) + Send + Sync>,
+}
+
+impl BodySizeRecorder {
+    fn new(record: impl Fn(u64) + Send + Sync + 'static) -> Self {
+        Self {
+            size_bytes: 0,
+            record: Box::new(record),
+        }
+    }
+
+    fn add_frame(&mut self, frame: &Bytes) {
+        self.size_bytes += frame.len() as u64;
+    }
+}
+
+impl Drop for BodySizeRecorder {
+    fn drop(&mut self) {
+        (self.record)(self.size_bytes);
+    }
+}
+
+fn body_with_size_recorder(body: Body, recorder: BodySizeRecorder) -> Body {
+    let mut recorder = recorder;
+    Body::new(body.map_frame(move |frame| {
+        if let Some(data) = frame.data_ref() {
+            recorder.add_frame(data);
+        }
+        frame
+    }))
+}
+
+fn body_size_recorder(metrics: MetricsContext) -> BodySizeRecorder {
+    BodySizeRecorder::new(move |size_bytes| metrics.rpc_message_size(size_bytes))
 }
 
 /// Implements metrics functionality for gRPC (really, any http) calls
@@ -294,6 +353,11 @@ impl Service<http::Request<Body>> for GrpcMetricSvc {
                     metrics
                 })
             });
+        if let Some(metrics) = metrics.as_ref() {
+            let mut req_metrics = metrics.clone();
+            req_metrics.with_new_attrs([message_direction(MESSAGE_DIRECTION_REQUEST)]);
+            req = req.map(|body| body_with_size_recorder(body, body_size_recorder(req_metrics)));
+        }
         let callfut = match &mut self.inner {
             ChannelOrGrpcOverride::Channel(inner) => {
                 Either::Left(inner.call(req).map_err(Into::into))
@@ -306,7 +370,7 @@ impl Service<http::Request<Body>> for GrpcMetricSvc {
         async move {
             let started = Instant::now();
             let res = callfut.await;
-            if let Some(metrics) = metrics {
+            if let Some(metrics) = metrics.as_ref() {
                 metrics.record_svc_req_latency(started.elapsed());
                 match res {
                     Ok(ref ok_res) => {
@@ -339,8 +403,44 @@ impl Service<http::Request<Body>> for GrpcMetricSvc {
                     }
                 }
             }
-            res
+            match (res, metrics) {
+                (Ok(res), Some(metrics)) => {
+                    let mut resp_metrics = metrics;
+                    resp_metrics.with_new_attrs([message_direction(MESSAGE_DIRECTION_RESPONSE)]);
+                    Ok(res.map(|body| {
+                        body_with_size_recorder(body, body_size_recorder(resp_metrics))
+                    }))
+                }
+                (res, _) => res,
+            }
         }
         .boxed()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use http_body_util::Full;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    };
+
+    #[tokio::test]
+    async fn body_size_recorder_counts_data_frames() {
+        let recorded = Arc::new(AtomicU64::new(0));
+        let recorded_clone = recorded.clone();
+        let body = Body::new(Full::new(Bytes::from_static(b"hello")));
+        let body = body_with_size_recorder(
+            body,
+            BodySizeRecorder::new(move |size_bytes| {
+                recorded_clone.store(size_bytes, Ordering::Relaxed);
+            }),
+        );
+
+        let _ = body.collect().await.unwrap();
+
+        assert_eq!(recorded.load(Ordering::Relaxed), 5);
     }
 }

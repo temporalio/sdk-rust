@@ -64,8 +64,8 @@ use temporalio_common::{
 };
 use temporalio_macros::{activities, workflow, workflow_methods};
 use temporalio_sdk::{
-    ActivityOptions, CancellableFuture, LocalActivityOptions, NexusOperationOptions,
-    WorkflowContext, WorkflowResult,
+    ActivityOptions, CancellableFuture, ChildWorkflowOptions, LocalActivityOptions,
+    NexusOperationOptions, WorkflowContext, WorkflowResult,
     activities::{ActivityContext, ActivityError},
 };
 use temporalio_sdk_core::{
@@ -85,6 +85,16 @@ use url::Url;
 
 pub(crate) async fn get_text(endpoint: String) -> String {
     reqwest::get(endpoint).await.unwrap().text().await.unwrap()
+}
+
+fn metric_value(body: &str, metric_prefix: &str) -> f64 {
+    body.lines()
+        .find(|line| line.starts_with(metric_prefix))
+        .and_then(|line| line.rsplit_once(' '))
+        .unwrap_or_else(|| panic!("missing metric line starting with {metric_prefix}"))
+        .1
+        .parse()
+        .unwrap_or_else(|err| panic!("metric value for {metric_prefix} should parse: {err}"))
 }
 
 #[rstest::rstest]
@@ -939,6 +949,40 @@ async fn activity_metrics() {
              namespace=\"{NAMESPACE}\",service_name=\"temporal-core-sdk\",\
              task_queue=\"{task_queue}\",workflow_type=\"{wf_type}\"}} 1"
     )));
+    assert!(body.contains(&format!(
+        "temporal_activity_payload_size_count{{activity_type=\"pass_fail_act\",\
+             message_direction=\"request\",namespace=\"{NAMESPACE}\",\
+             service_name=\"temporal-core-sdk\",task_queue=\"{task_queue}\",\
+             workflow_type=\"{wf_type}\"}} 2"
+    )));
+    assert!(body.contains(&format!(
+        "temporal_activity_payload_size_count{{activity_type=\"pass_fail_act\",\
+             message_direction=\"response\",namespace=\"{NAMESPACE}\",\
+             service_name=\"temporal-core-sdk\",task_queue=\"{task_queue}\",\
+             workflow_type=\"{wf_type}\"}} 1"
+    )));
+    assert!(
+        metric_value(
+            &body,
+            &format!(
+                "temporal_activity_payload_size_sum{{activity_type=\"pass_fail_act\",\
+                 message_direction=\"request\",namespace=\"{NAMESPACE}\",\
+                 service_name=\"temporal-core-sdk\",task_queue=\"{task_queue}\",\
+                 workflow_type=\"{wf_type}\"}}"
+            )
+        ) > 0.0
+    );
+    assert!(
+        metric_value(
+            &body,
+            &format!(
+                "temporal_activity_payload_size_sum{{activity_type=\"pass_fail_act\",\
+                 message_direction=\"response\",namespace=\"{NAMESPACE}\",\
+                 service_name=\"temporal-core-sdk\",task_queue=\"{task_queue}\",\
+                 workflow_type=\"{wf_type}\"}}"
+            )
+        ) > 0.0
+    );
 
     assert!(body.contains(&format!(
         "temporal_local_activity_total{{activity_type=\"pass_fail_act\",namespace=\"{NAMESPACE}\",\
@@ -968,6 +1012,100 @@ async fn activity_metrics() {
              namespace=\"{NAMESPACE}\",service_name=\"temporal-core-sdk\",\
              task_queue=\"{task_queue}\",\
              workflow_type=\"{wf_type}\"}} 1"
+    )));
+}
+
+#[tokio::test]
+async fn payload_size_metrics() {
+    let (telemopts, addr, _aborter) = prom_metrics(None);
+    let rt = CoreRuntime::new_assume_tokio(get_integ_runtime_options(telemopts)).unwrap();
+    let wf_name = "payload_size_metrics";
+    let mut starter = CoreWfStarter::new_with_runtime(wf_name, rt);
+    starter.sdk_config.task_types = WorkerTaskTypes::workflow_only();
+    let mut worker = starter.worker().await;
+
+    #[workflow]
+    #[derive(Default)]
+    struct PayloadMetricsChild;
+
+    #[workflow_methods]
+    impl PayloadMetricsChild {
+        #[run]
+        async fn run(_ctx: &mut WorkflowContext<Self>, input: String) -> WorkflowResult<String> {
+            Ok(format!("child-result:{input}"))
+        }
+    }
+
+    #[workflow]
+    #[derive(Default)]
+    struct PayloadMetricsParent;
+
+    #[workflow_methods]
+    impl PayloadMetricsParent {
+        #[run]
+        async fn run(ctx: &mut WorkflowContext<Self>, input: String) -> WorkflowResult<String> {
+            let started = ctx
+                .child_workflow(
+                    PayloadMetricsChild::run,
+                    "child-input".to_string(),
+                    ChildWorkflowOptions {
+                        workflow_id: "payload-size-child".to_string(),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("child workflow should start");
+            let child_result = started.result().await?;
+            Ok(format!("parent-result:{input}:{child_result}"))
+        }
+    }
+
+    worker.register_workflow::<PayloadMetricsParent>();
+    worker.register_workflow::<PayloadMetricsChild>();
+    let task_queue = starter.get_task_queue().to_owned();
+    let workflow_id = wf_name.to_owned();
+    worker
+        .submit_workflow(
+            PayloadMetricsParent::run,
+            "parent-input".to_string(),
+            WorkflowStartOptions::new(task_queue.clone(), workflow_id).build(),
+        )
+        .await
+        .unwrap();
+    worker.run_until_done().await.unwrap();
+
+    let body = get_text(format!("http://{addr}/metrics")).await;
+    let parent_wf_type = PayloadMetricsParent::name();
+    let child_wf_type = PayloadMetricsChild::name();
+    assert!(body.contains(&format!(
+        "temporal_workflow_payload_size_count{{message_direction=\"request\",\
+             namespace=\"{NAMESPACE}\",service_name=\"temporal-core-sdk\",\
+             task_queue=\"{task_queue}\",workflow_type=\"{parent_wf_type}\"}} 1"
+    )));
+    assert!(body.contains(&format!(
+        "temporal_workflow_payload_size_count{{message_direction=\"response\",\
+             namespace=\"{NAMESPACE}\",service_name=\"temporal-core-sdk\",\
+             task_queue=\"{task_queue}\",workflow_type=\"{parent_wf_type}\"}} 1"
+    )));
+    assert!(body.contains(&format!(
+        "temporal_workflow_payload_size_count{{message_direction=\"request\",\
+             namespace=\"{NAMESPACE}\",service_name=\"temporal-core-sdk\",\
+             task_queue=\"{task_queue}\",workflow_type=\"{child_wf_type}\"}} 1"
+    )));
+    assert!(body.contains(&format!(
+        "temporal_workflow_payload_size_count{{message_direction=\"response\",\
+             namespace=\"{NAMESPACE}\",service_name=\"temporal-core-sdk\",\
+             task_queue=\"{task_queue}\",workflow_type=\"{child_wf_type}\"}} 1"
+    )));
+    assert!(body.contains(&format!(
+        "temporal_rpc_message_size_count{{message_direction=\"request\",\
+             namespace=\"{NAMESPACE}\",operation=\"RespondWorkflowTaskCompleted\",\
+             service_name=\"temporal-core-sdk\"}} "
+    )));
+    assert!(body.contains(&format!(
+        "temporal_rpc_message_size_count{{message_direction=\"response\",\
+             namespace=\"{NAMESPACE}\",operation=\"RespondWorkflowTaskCompleted\",\
+             service_name=\"temporal-core-sdk\"}} "
     )));
 }
 

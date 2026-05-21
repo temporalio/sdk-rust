@@ -2,11 +2,13 @@ use super::{
     HistogramBucketOverrides, MetricTemporality, OtelCollectorOptions, OtlpProtocol,
     TELEM_SERVICE_NAME,
     metrics::{
-        ACTIVITY_EXEC_LATENCY_HISTOGRAM_NAME, ACTIVITY_SCHED_TO_START_LATENCY_HISTOGRAM_NAME,
-        CoreMeter, Counter, DEFAULT_MS_BUCKETS, DEFAULT_S_BUCKETS, Gauge, GaugeF64, Histogram,
-        HistogramBase, HistogramDuration, HistogramDurationBase, HistogramF64, HistogramF64Base,
-        MetricAttributable, MetricAttributes, MetricParameters, NewAttributes, UpDownCounter,
-        WORKFLOW_E2E_LATENCY_HISTOGRAM_NAME, WORKFLOW_TASK_EXECUTION_LATENCY_HISTOGRAM_NAME,
+        ACTIVITY_EXEC_LATENCY_HISTOGRAM_NAME, ACTIVITY_PAYLOAD_SIZE_HISTOGRAM_NAME,
+        ACTIVITY_SCHED_TO_START_LATENCY_HISTOGRAM_NAME, CoreMeter, Counter, DEFAULT_MS_BUCKETS,
+        DEFAULT_S_BUCKETS, Gauge, GaugeF64, Histogram, HistogramBase, HistogramDuration,
+        HistogramDurationBase, HistogramF64, HistogramF64Base, MetricAttributable,
+        MetricAttributes, MetricParameters, NewAttributes, RPC_MESSAGE_SIZE_HISTOGRAM_NAME,
+        UpDownCounter, WORKFLOW_E2E_LATENCY_HISTOGRAM_NAME, WORKFLOW_PAYLOAD_SIZE_HISTOGRAM_NAME,
+        WORKFLOW_TASK_EXECUTION_LATENCY_HISTOGRAM_NAME,
         WORKFLOW_TASK_REPLAY_LATENCY_HISTOGRAM_NAME,
         WORKFLOW_TASK_SCHED_TO_START_LATENCY_HISTOGRAM_NAME, default_buckets_for,
     },
@@ -94,6 +96,15 @@ pub(super) fn augment_meter_provider_with_defaults(
             ACTIVITY_EXEC_LATENCY_HISTOGRAM_NAME,
             use_seconds,
         ));
+    mpb = mpb.with_view(histo_view(
+        WORKFLOW_PAYLOAD_SIZE_HISTOGRAM_NAME,
+        use_seconds,
+    ));
+    mpb = mpb.with_view(histo_view(
+        ACTIVITY_PAYLOAD_SIZE_HISTOGRAM_NAME,
+        use_seconds,
+    ));
+    mpb = mpb.with_view(histo_view(RPC_MESSAGE_SIZE_HISTOGRAM_NAME, use_seconds));
     // Fallback default
     mpb = mpb.with_view(move |ins: &Instrument| {
         if ins.kind() == InstrumentKind::Histogram {

@@ -28,6 +28,23 @@ pub const ACTIVITY_SCHED_TO_START_LATENCY_HISTOGRAM_NAME: &str =
     "activity_schedule_to_start_latency";
 /// The string name (which may be prefixed) for this metric
 pub const ACTIVITY_EXEC_LATENCY_HISTOGRAM_NAME: &str = "activity_execution_latency";
+/// The string name (which may be prefixed) for this metric
+pub const WORKFLOW_PAYLOAD_SIZE_HISTOGRAM_NAME: &str = "workflow_payload_size";
+/// The string name (which may be prefixed) for this metric
+pub const ACTIVITY_PAYLOAD_SIZE_HISTOGRAM_NAME: &str = "activity_payload_size";
+/// The string name (which may be prefixed) for this metric
+pub const RPC_MESSAGE_SIZE_HISTOGRAM_NAME: &str = "rpc_message_size";
+
+const KEY_MESSAGE_DIRECTION: &str = "message_direction";
+/// Kept shared so all payload-size emitters use the same request direction label.
+pub const MESSAGE_DIRECTION_REQUEST: &str = "request";
+/// Kept shared so all payload-size emitters use the same response direction label.
+pub const MESSAGE_DIRECTION_RESPONSE: &str = "response";
+
+/// Keeps the payload-size label key consistent across client and core emitters.
+pub fn message_direction(direction: &'static str) -> MetricKeyValue {
+    MetricKeyValue::new(KEY_MESSAGE_DIRECTION, direction)
+}
 
 /// Helps define buckets once in terms of millis, but also generates a seconds version
 macro_rules! define_latency_buckets {
@@ -37,12 +54,7 @@ macro_rules! define_latency_buckets {
             pub(super) static $sec_name: &[f64] = &[$( $bucket / 1000.0, )*];
         )*
 
-        /// Returns the default histogram buckets that lang should use for a given metric name if
-        /// they have not been overridden by the user. If `use_seconds` is true, returns buckets
-        /// in terms of seconds rather than milliseconds.
-        ///
-        /// The name must *not* be prefixed with `temporal_`
-        pub fn default_buckets_for(histo_name: &str, use_seconds: bool) -> &'static [f64] {
+        fn default_duration_buckets_for(histo_name: &str, use_seconds: bool) -> &'static [f64] {
             match histo_name {
                 $(
                     $metric_name => { if use_seconds { &$sec_name } else { &$name } },
@@ -103,6 +115,34 @@ define_latency_buckets!(
         [50., 100., 500., 1000., 2500., 10_000.]
     )
 );
+
+pub(super) static PAYLOAD_SIZE_BUCKETS: &[f64] = &[
+    128.0,
+    512.0,
+    1_024.0,
+    4_096.0,
+    16_384.0,
+    65_536.0,
+    262_144.0,
+    1_048_576.0,
+    4_194_304.0,
+    16_777_216.0,
+    67_108_864.0,
+];
+
+/// Returns the default histogram buckets that lang should use for a given metric name if they have
+/// not been overridden by the user. If `use_seconds` is true, duration metric buckets are returned
+/// in terms of seconds rather than milliseconds.
+///
+/// The name must *not* be prefixed with `temporal_`.
+pub fn default_buckets_for(histo_name: &str, use_seconds: bool) -> &'static [f64] {
+    match histo_name {
+        WORKFLOW_PAYLOAD_SIZE_HISTOGRAM_NAME
+        | ACTIVITY_PAYLOAD_SIZE_HISTOGRAM_NAME
+        | RPC_MESSAGE_SIZE_HISTOGRAM_NAME => PAYLOAD_SIZE_BUCKETS,
+        _ => default_duration_buckets_for(histo_name, use_seconds),
+    }
+}
 
 /// Implementors of this trait are expected to be defined in each language's bridge.
 /// The implementor is responsible for the allocation/instantiation of new metric meters which
