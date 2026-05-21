@@ -88,5 +88,5 @@ Reviewers will look for:
 
 - Fetch workflow histories with `cargo run --bin histfetch <workflow_id> [run_id]` (binary lives in
   `crates/core/src/histfetch.rs`).
-- Protobuf files under `crates/common/protos/api_upstream` are a git subtree; see
+- Protobuf files under `crates/protos/protos/api_upstream` are a git subtree; see
   `README.md` for update instructions.

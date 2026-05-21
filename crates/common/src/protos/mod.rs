@@ -2,4 +2,4 @@
 //! the Temporal Core SDK. Language SDK authors can generate structs using the proto definitions
 //! that will match the generated structs in this module.
 
-pub use temporalio_common_wasm::protos::*;
+pub use temporalio_protos::*;

@@ -8,52 +8,16 @@ use std::{
     env,
     fs::File,
     io::{Read, Write},
-    path::{Path, PathBuf},
-    process::Command,
+    path::Path,
 };
 
-const ROOT_PROTOS: &[&str] = &[
-    "./protos/local/temporal/sdk/core/core_interface.proto",
-    "./protos/api_upstream/temporal/api/sdk/v1/workflow_metadata.proto",
-    "./protos/api_upstream/temporal/api/workflowservice/v1/service.proto",
-    "./protos/api_upstream/temporal/api/operatorservice/v1/service.proto",
-    "./protos/api_upstream/temporal/api/errordetails/v1/message.proto",
-    "./protos/api_cloud_upstream/temporal/api/cloud/cloudservice/v1/service.proto",
-    "./protos/testsrv_upstream/temporal/api/testservice/v1/service.proto",
-    "./protos/grpc/health/v1/health.proto",
-    "./protos/google/rpc/status.proto",
-];
-
-const INCLUDE_DIRS: &[&str] = &[
-    "./protos/api_upstream",
-    "./protos/api_cloud_upstream",
-    "./protos/local",
-    "./protos/testsrv_upstream",
-    "./protos/grpc",
-    "./protos",
-];
-
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    println!("cargo:rerun-if-changed=./protos");
-    let out = PathBuf::from(env::var("OUT_DIR").unwrap());
-    let descriptor_file = out.join("descriptors.bin");
-
-    let mut protoc = Command::new(env::var_os("PROTOC").unwrap_or_else(|| "protoc".into()));
-    protoc.arg(format!(
-        "--descriptor_set_out={}",
-        descriptor_file.display()
-    ));
-    protoc.arg("--include_imports");
-    for include_dir in INCLUDE_DIRS {
-        protoc.arg("-I").arg(include_dir);
-    }
-    for proto in ROOT_PROTOS {
-        protoc.arg(proto);
-    }
-    let output = protoc.output()?;
-    if !output.status.success() {
-        return Err(format!("protoc failed: {}", String::from_utf8_lossy(&output.stderr)).into());
-    }
+    println!("cargo:rerun-if-env-changed=DEP_TEMPORALIO_PROTOS_DESCRIPTOR_PATH");
+    let out = std::path::PathBuf::from(env::var("OUT_DIR").unwrap());
+    let descriptor_file = std::path::PathBuf::from(
+        env::var("DEP_TEMPORALIO_PROTOS_DESCRIPTOR_PATH")
+            .map_err(|_| "temporalio-protos did not publish descriptor metadata")?,
+    );
 
     generate_payload_visitor(&out, &descriptor_file)?;
     Ok(())

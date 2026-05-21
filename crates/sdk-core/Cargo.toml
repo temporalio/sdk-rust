@@ -123,7 +123,7 @@ zip = { version = "8.4", optional = true, default-features = false, features = [
 path = "../common"
 version = "0.4"
 default-features = false
-features = ["core-telemetry-bridge"]
+features = ["core-telemetry-bridge", "serde_serialize"]
 
 [dependencies.temporalio-client]
 path = "../client"

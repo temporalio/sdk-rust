@@ -45,9 +45,10 @@ const SERDE_DERIVE_PREFIXES: &[&str] = &[
 ];
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    println!("cargo:rerun-if-changed=../common/protos");
+    println!("cargo:rerun-if-changed=./protos");
     let out = PathBuf::from(env::var("OUT_DIR").unwrap());
     let descriptor_file = out.join("descriptors.bin");
+    println!("cargo:descriptor_path={}", descriptor_file.display());
     let mut builder = tonic_prost_build::configure()
         // Workflow guests need message structs, while the native common crate enables this
         // feature to preserve the generated clients it re-exports today.
@@ -88,7 +89,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .type_attribute(
             "coresdk.workflow_commands.WorkflowCommand.variant",
-            "#[derive(::derive_more::From, ::derive_more::Display)]",
+            "#[derive(::derive_more::From)]",
         )
         .type_attribute(
             "coresdk.workflow_commands.QueryResult.variant",
@@ -119,28 +120,32 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "#[derive(::derive_more::Display)]",
         )
         .type_attribute("coresdk.Task.variant", "#[derive(::derive_more::From)]")
+        .type_attribute(
+            "coresdk.workflow_commands.WorkflowCommand.variant",
+            "#[derive(::derive_more::Display)]",
+        )
         // All external data is useful to be able to JSON serialize, so it can render in web UI
-        .type_attribute(".coresdk.external_data", ALWAYS_SERDE);
+        .type_attribute(".coresdk.external_data", ALWAYS_SERDE)
+        .field_attribute(
+            "coresdk.external_data.LocalActivityMarkerData.complete_time",
+            "#[serde(with = \"sdk_helpers::opt_timestamp\")]",
+        )
+        .field_attribute(
+            "coresdk.external_data.LocalActivityMarkerData.original_schedule_time",
+            "#[serde(with = \"sdk_helpers::opt_timestamp\")]",
+        )
+        .field_attribute(
+            "coresdk.external_data.LocalActivityMarkerData.backoff",
+            "#[serde(with = \"sdk_helpers::opt_duration\")]",
+        )
+        .skip_debug(["temporal.api.common.v1.Payload"]);
 
     for prefix in SERDE_DERIVE_PREFIXES {
         builder = builder.type_attribute(*prefix, SERDE_ATTR);
     }
 
     builder
-        .field_attribute(
-            "coresdk.external_data.LocalActivityMarkerData.complete_time",
-            "#[serde(with = \"opt_timestamp\")]",
-        )
-        .field_attribute(
-            "coresdk.external_data.LocalActivityMarkerData.original_schedule_time",
-            "#[serde(with = \"opt_timestamp\")]",
-        )
-        .field_attribute(
-            "coresdk.external_data.LocalActivityMarkerData.backoff",
-            "#[serde(with = \"opt_duration\")]",
-        )
         .file_descriptor_set_path(&descriptor_file)
-        .skip_debug(["temporal.api.common.v1.Payload"])
         .compile_with_config(
             {
                 let mut c = Config::new();
@@ -148,23 +153,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 c
             },
             &[
-                "../common/protos/local/temporal/sdk/core/core_interface.proto",
-                "../common/protos/api_upstream/temporal/api/sdk/v1/workflow_metadata.proto",
-                "../common/protos/api_upstream/temporal/api/workflowservice/v1/service.proto",
-                "../common/protos/api_upstream/temporal/api/operatorservice/v1/service.proto",
-                "../common/protos/api_upstream/temporal/api/errordetails/v1/message.proto",
-                "../common/protos/api_cloud_upstream/temporal/api/cloud/cloudservice/v1/service.proto",
-                "../common/protos/testsrv_upstream/temporal/api/testservice/v1/service.proto",
-                "../common/protos/grpc/health/v1/health.proto",
-                "../common/protos/google/rpc/status.proto",
+                "./protos/local/temporal/sdk/core/core_interface.proto",
+                "./protos/api_upstream/temporal/api/sdk/v1/workflow_metadata.proto",
+                "./protos/api_upstream/temporal/api/workflowservice/v1/service.proto",
+                "./protos/api_upstream/temporal/api/operatorservice/v1/service.proto",
+                "./protos/api_upstream/temporal/api/errordetails/v1/message.proto",
+                "./protos/api_cloud_upstream/temporal/api/cloud/cloudservice/v1/service.proto",
+                "./protos/testsrv_upstream/temporal/api/testservice/v1/service.proto",
+                "./protos/grpc/health/v1/health.proto",
+                "./protos/google/rpc/status.proto",
             ],
             &[
-                "../common/protos/api_upstream",
-                "../common/protos/api_cloud_upstream",
-                "../common/protos/local",
-                "../common/protos/testsrv_upstream",
-                "../common/protos/grpc",
-                "../common/protos",
+                "./protos/api_upstream",
+                "./protos/api_cloud_upstream",
+                "./protos/local",
+                "./protos/testsrv_upstream",
+                "./protos/grpc",
+                "./protos",
             ],
         )?;
 

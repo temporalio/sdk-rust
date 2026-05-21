@@ -11,7 +11,11 @@ mod activity_definition;
 pub mod data_converters;
 pub mod error;
 mod priority;
-pub mod protos;
+pub mod protos {
+    //! Protobuf definitions re-exported from `temporalio-protos`.
+
+    pub use temporalio_protos::*;
+}
 pub mod worker;
 mod workflow_definition;
 
