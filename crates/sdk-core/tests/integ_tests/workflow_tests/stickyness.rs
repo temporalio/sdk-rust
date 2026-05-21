@@ -20,7 +20,7 @@ async fn timer_workflow_not_sticky() {
     starter.sdk_config.task_types = WorkerTaskTypes::workflow_only();
     starter.sdk_config.max_cached_workflows = 0_usize;
     let mut worker = starter.worker().await;
-    worker.register_workflow::<TimerWf>();
+    worker.register_workflow::<TimerWf>().unwrap();
 
     let task_queue = starter.get_task_queue().to_owned();
     let workflow_id = starter.get_task_queue().to_owned();
@@ -69,10 +69,12 @@ async fn timer_workflow_timeout_on_sticky() {
     let timed_out_once = Arc::new(AtomicBool::new(false));
     let run_ct = Arc::new(AtomicUsize::new(0));
     let run_ct_clone = run_ct.clone();
-    worker.register_workflow_with_factory(move || TimerTimeoutWf {
-        timed_out_once: timed_out_once.clone(),
-        run_ct: run_ct_clone.clone(),
-    });
+    worker
+        .register_workflow_with_factory(move || TimerTimeoutWf {
+            timed_out_once: timed_out_once.clone(),
+            run_ct: run_ct_clone.clone(),
+        })
+        .unwrap();
 
     worker
         .submit_workflow(TimerTimeoutWf::run, (), starter.workflow_options.clone())
@@ -128,9 +130,11 @@ async fn cache_miss_ok() {
 
     let barr = Arc::new(Barrier::new(2));
     let barr_clone = barr.clone();
-    worker.register_workflow_with_factory(move || CacheMissWf {
-        barr: barr_clone.clone(),
-    });
+    worker
+        .register_workflow_with_factory(move || CacheMissWf {
+            barr: barr_clone.clone(),
+        })
+        .unwrap();
 
     let task_queue = starter.get_task_queue().to_owned();
     let handle = worker

@@ -56,10 +56,12 @@ async fn reset_workflow() {
 
     let notify = Arc::new(Notify::new());
     let notify_clone = notify.clone();
-    worker.register_workflow_with_factory(move || ResetMeWf {
-        notify: notify_clone.clone(),
-        post_reset_received: false,
-    });
+    worker
+        .register_workflow_with_factory(move || ResetMeWf {
+            notify: notify_clone.clone(),
+            post_reset_received: false,
+        })
+        .unwrap();
 
     let task_queue = starter.get_task_queue().to_owned();
     let handle = worker
@@ -194,14 +196,16 @@ async fn reset_randomseed() {
     let notify = Arc::new(Notify::new());
     let notify_clone = notify.clone();
     let saw_updated_seed_for_wf = saw_updated_seed.clone();
-    worker.register_workflow_with_factory(move || ResetRandomseedWf {
-        did_fail: did_fail.clone(),
-        rand_seed: rand_seed.clone(),
-        saw_updated_seed: saw_updated_seed_for_wf.clone(),
-        notify: notify_clone.clone(),
-        post_fail_received: false,
-        post_reset_received: false,
-    });
+    worker
+        .register_workflow_with_factory(move || ResetRandomseedWf {
+            did_fail: did_fail.clone(),
+            rand_seed: rand_seed.clone(),
+            saw_updated_seed: saw_updated_seed_for_wf.clone(),
+            notify: notify_clone.clone(),
+            post_fail_received: false,
+            post_reset_received: false,
+        })
+        .unwrap();
     worker.register_activities(StdActivities);
 
     let task_queue = starter.get_task_queue().to_owned();

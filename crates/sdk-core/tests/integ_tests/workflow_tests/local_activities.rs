@@ -92,7 +92,7 @@ async fn one_local_activity() {
     let mut starter = CoreWfStarter::new(wf_name);
     starter.sdk_config.register_activities(StdActivities);
     let mut worker = starter.worker().await;
-    worker.register_workflow::<OneLocalActivityWf>();
+    worker.register_workflow::<OneLocalActivityWf>().unwrap();
 
     let task_queue = starter.get_task_queue().to_owned();
     let handle = worker
@@ -135,7 +135,9 @@ async fn local_act_concurrent_with_timer() {
     let mut starter = CoreWfStarter::new(wf_name);
     starter.sdk_config.register_activities(StdActivities);
     let mut worker = starter.worker().await;
-    worker.register_workflow::<LocalActConcurrentWithTimerWf>();
+    worker
+        .register_workflow::<LocalActConcurrentWithTimerWf>()
+        .unwrap();
 
     let task_queue = starter.get_task_queue().to_owned();
     worker
@@ -175,7 +177,9 @@ async fn local_act_then_timer_then_wait_result() {
     let mut starter = CoreWfStarter::new(wf_name);
     starter.sdk_config.register_activities(StdActivities);
     let mut worker = starter.worker().await;
-    worker.register_workflow::<LocalActThenTimerThenWaitResult>();
+    worker
+        .register_workflow::<LocalActThenTimerThenWaitResult>()
+        .unwrap();
 
     let task_queue = starter.get_task_queue().to_owned();
     worker
@@ -216,7 +220,9 @@ async fn long_running_local_act_with_timer() {
     starter.workflow_options.task_timeout = Some(Duration::from_secs(1));
     starter.sdk_config.register_activities(StdActivities);
     let mut worker = starter.worker().await;
-    worker.register_workflow::<LocalActThenTimerThenWait>();
+    worker
+        .register_workflow::<LocalActThenTimerThenWait>()
+        .unwrap();
 
     let task_queue = starter.get_task_queue().to_owned();
     worker
@@ -256,7 +262,7 @@ async fn local_act_fanout() {
     starter.sdk_config.tuner = Arc::new(TunerHolder::fixed_size(5, 1, 1, 1));
     starter.sdk_config.register_activities(StdActivities);
     let mut worker = starter.worker().await;
-    worker.register_workflow::<LocalActFanoutWf>();
+    worker.register_workflow::<LocalActFanoutWf>().unwrap();
 
     let task_queue = starter.get_task_queue().to_owned();
     worker
@@ -307,7 +313,9 @@ async fn local_act_retry_timer_backoff() {
     let mut starter = CoreWfStarter::new(wf_name);
     starter.sdk_config.register_activities(StdActivities);
     let mut worker = starter.worker().await;
-    worker.register_workflow::<LocalActRetryTimerBackoff>();
+    worker
+        .register_workflow::<LocalActRetryTimerBackoff>()
+        .unwrap();
 
     let task_queue = starter.get_task_queue().to_owned();
     let handle = worker
@@ -400,7 +408,7 @@ async fn cancel_immediate(#[case] cancel_type: ActivityCancellationType) {
     }
 
     let mut worker = starter.worker().await;
-    worker.register_workflow::<CancelImmediate>();
+    worker.register_workflow::<CancelImmediate>().unwrap();
 
     let task_queue = starter.get_task_queue().to_owned();
     worker
@@ -565,7 +573,9 @@ async fn cancel_after_act_starts(
 
     let mut worker = starter.worker().await;
     let bo_dur = cancel_on_backoff.unwrap_or_else(|| Duration::from_secs(1));
-    worker.register_workflow::<CancelAfterActStartsWf>();
+    worker
+        .register_workflow::<CancelAfterActStartsWf>()
+        .unwrap();
 
     let task_queue = starter.get_task_queue().to_owned();
     worker
@@ -668,7 +678,7 @@ async fn x_to_close_timeout(#[case] is_schedule: bool) {
     } else {
         TimeoutType::StartToClose
     };
-    worker.register_workflow::<XToCloseTimeoutWf>();
+    worker.register_workflow::<XToCloseTimeoutWf>().unwrap();
 
     let task_queue = starter.get_task_queue().to_owned();
     worker
@@ -735,7 +745,9 @@ async fn schedule_to_close_timeout_across_timer_backoff(#[case] cached: bool) {
     }
 
     let mut worker = starter.worker().await;
-    worker.register_workflow::<ScheduleToCloseTimeoutAcrossTimerBackoff>();
+    worker
+        .register_workflow::<ScheduleToCloseTimeoutAcrossTimerBackoff>()
+        .unwrap();
 
     let num_attempts = Arc::new(AtomicU8::new(0));
 
@@ -778,7 +790,9 @@ async fn eviction_wont_make_local_act_get_dropped(#[values(true, false)] short_w
     starter.sdk_config.max_cached_workflows = 0_usize;
     starter.sdk_config.register_activities(StdActivities);
     let mut worker = starter.worker().await;
-    worker.register_workflow::<LocalActThenTimerThenWait>();
+    worker
+        .register_workflow::<LocalActThenTimerThenWait>()
+        .unwrap();
 
     let task_queue = starter.get_task_queue().to_owned();
     let opts = if short_wft_timeout {
@@ -847,7 +861,9 @@ async fn timer_backoff_concurrent_with_non_timer_backoff() {
     }
 
     let mut worker = starter.worker().await;
-    worker.register_workflow::<TimerBackoffConcurrentWf>();
+    worker
+        .register_workflow::<TimerBackoffConcurrentWf>()
+        .unwrap();
 
     let task_queue = starter.get_task_queue().to_owned();
     worker
@@ -903,7 +919,9 @@ async fn repro_nondeterminism_with_timer_bug() {
     }
 
     let mut worker = starter.worker().await;
-    worker.register_workflow::<ReproNondeterminismWithTimerBugWf>();
+    worker
+        .register_workflow::<ReproNondeterminismWithTimerBugWf>()
+        .unwrap();
 
     let task_queue = starter.get_task_queue().to_owned();
     let handle = worker
@@ -946,7 +964,7 @@ async fn weird_la_nondeterminism_repro(#[values(true, false)] fix_hist: bool) {
     }
 
     let mut worker = replay_sdk_worker([HistoryForReplay::new(hist, "fake".to_owned())]);
-    worker.register_workflow::<LaProblemWorkflow>();
+    worker.register_workflow::<LaProblemWorkflow>().unwrap();
     worker.register_activities(StdActivities);
     worker.run().await.unwrap();
 }
@@ -964,7 +982,7 @@ async fn second_weird_la_nondeterminism_repro() {
     hist = thb.get_full_history_info().unwrap().into();
 
     let mut worker = replay_sdk_worker([HistoryForReplay::new(hist, "fake".to_owned())]);
-    worker.register_workflow::<LaProblemWorkflow>();
+    worker.register_workflow::<LaProblemWorkflow>().unwrap();
     worker.register_activities(StdActivities);
     worker.run().await.unwrap();
 }
@@ -980,7 +998,7 @@ async fn third_weird_la_nondeterminism_repro() {
     hist = thb.get_full_history_info().unwrap().into();
 
     let mut worker = replay_sdk_worker([HistoryForReplay::new(hist, "fake".to_owned())]);
-    worker.register_workflow::<LaProblemWorkflow>();
+    worker.register_workflow::<LaProblemWorkflow>().unwrap();
     worker.register_activities(StdActivities);
     worker.run().await.unwrap();
 }
@@ -1060,7 +1078,9 @@ async fn la_resolve_same_time_as_other_cancel() {
     }
 
     let mut worker = starter.worker().await;
-    worker.register_workflow::<LaResolveSameTimeAsOtherCancelWf>();
+    worker
+        .register_workflow::<LaResolveSameTimeAsOtherCancelWf>()
+        .unwrap();
 
     let task_queue = starter.get_task_queue().to_owned();
     let handle = worker
@@ -1141,7 +1161,9 @@ async fn long_local_activity_with_update(
     }
 
     let mut worker = starter.worker().await;
-    worker.register_workflow::<LongLocalActivityWithUpdateWf>();
+    worker
+        .register_workflow::<LongLocalActivityWithUpdateWf>()
+        .unwrap();
 
     let task_queue = starter.get_task_queue().to_owned();
     let handle = worker
@@ -1234,7 +1256,9 @@ async fn local_activity_with_heartbeat_only_causes_one_wakeup() {
     }
 
     let mut worker = starter.worker().await;
-    worker.register_workflow::<LocalActivityWithHeartbeatOnlyCausesOneWakeupWf>();
+    worker
+        .register_workflow::<LocalActivityWithHeartbeatOnlyCausesOneWakeupWf>()
+        .unwrap();
 
     let task_queue = starter.get_task_queue().to_owned();
     let handle = worker
@@ -1281,7 +1305,9 @@ async fn local_activity_with_summary() {
     let mut starter = CoreWfStarter::new(wf_name);
     starter.sdk_config.register_activities(StdActivities);
     let mut worker = starter.worker().await;
-    worker.register_workflow::<LocalActivityWithSummaryWf>();
+    worker
+        .register_workflow::<LocalActivityWithSummaryWf>()
+        .unwrap();
 
     let handle = starter.start_with_worker(wf_name, &mut worker).await;
     worker.run_until_done().await.unwrap();
@@ -1362,7 +1388,9 @@ async fn local_act_two_wfts_before_marker(#[case] replay: bool, #[case] cached: 
         }
     }
 
-    worker.register_workflow::<LocalActTwoWftsBeforeMarkerWf>();
+    worker
+        .register_workflow::<LocalActTwoWftsBeforeMarkerWf>()
+        .unwrap();
     worker.register_activities(StdActivities);
     worker.run_until_done().await.unwrap();
 }
@@ -1386,7 +1414,7 @@ async fn local_act_many_concurrent() {
     let mh = MockPollCfg::from_resp_batches(wf_id, t, [1, 2, 3], mock);
     let mut worker = mock_sdk(mh);
 
-    worker.register_workflow::<LocalActFanoutWf>();
+    worker.register_workflow::<LocalActFanoutWf>().unwrap();
     worker.register_activities(StdActivities);
     worker.run_until_done().await.unwrap();
 }
@@ -1441,7 +1469,7 @@ async fn local_act_heartbeat(#[case] shutdown_middle: bool) {
         }
     }
 
-    worker.register_workflow::<LocalActHeartbeatWf>();
+    worker.register_workflow::<LocalActHeartbeatWf>().unwrap();
 
     struct EchoWithConditionalBarrier {
         shutdown_barr: Option<Arc<Barrier>>,
@@ -1534,7 +1562,9 @@ async fn local_act_fail_and_retry(#[case] eventually_pass: bool) {
         }
     }
 
-    worker.register_workflow::<LocalActFailAndRetryWf>();
+    worker
+        .register_workflow::<LocalActFailAndRetryWf>()
+        .unwrap();
     let attempts = Arc::new(AtomicUsize::new(0));
 
     struct EventuallyPassingActivity {
@@ -1630,7 +1660,9 @@ async fn local_act_retry_long_backoff_uses_timer() {
         }
     }
 
-    worker.register_workflow::<LocalActRetryLongBackoffUsesTimerWf>();
+    worker
+        .register_workflow::<LocalActRetryLongBackoffUsesTimerWf>()
+        .unwrap();
     worker.register_activities(StdActivities);
     worker.run_until_done().await.unwrap();
 }
@@ -1662,7 +1694,7 @@ async fn local_act_null_result() {
         }
     }
 
-    worker.register_workflow::<LocalActNullResultWf>();
+    worker.register_workflow::<LocalActNullResultWf>().unwrap();
     worker.register_activities(StdActivities);
     worker.run_until_done().await.unwrap();
 }
@@ -1699,7 +1731,9 @@ async fn local_act_command_immediately_follows_la_marker() {
         }
     }
 
-    worker.register_workflow::<LocalActCommandImmediatelyFollowsLaMarkerWf>();
+    worker
+        .register_workflow::<LocalActCommandImmediatelyFollowsLaMarkerWf>()
+        .unwrap();
     worker.register_activities(StdActivities);
     worker.run_until_done().await.unwrap();
 }
@@ -2005,7 +2039,9 @@ async fn test_schedule_to_start_timeout() {
         }
     }
 
-    worker.register_workflow::<TestScheduleToStartTimeoutWf>();
+    worker
+        .register_workflow::<TestScheduleToStartTimeoutWf>()
+        .unwrap();
     worker.register_activities(StdActivities);
     worker.run_until_done().await.unwrap();
 }
@@ -2101,7 +2137,9 @@ async fn test_schedule_to_start_timeout_not_based_on_original_time(
         }
     }
 
-    worker.register_workflow::<TestScheduleToStartTimeoutNotBasedOnOriginalTimeWf>();
+    worker
+        .register_workflow::<TestScheduleToStartTimeoutNotBasedOnOriginalTimeWf>()
+        .unwrap();
     worker.register_activities(StdActivities);
     worker.run_until_done().await.unwrap();
 }
@@ -2174,7 +2212,9 @@ async fn start_to_close_timeout_allows_retries(#[values(true, false)] la_complet
         }
     }
 
-    worker.register_workflow::<StartToCloseTimeoutAllowsRetriesWf>();
+    worker
+        .register_workflow::<StartToCloseTimeoutAllowsRetriesWf>()
+        .unwrap();
     let attempts = Arc::new(AtomicUsize::new(0));
     let cancels = Arc::new(AtomicUsize::new(0));
 
@@ -2251,7 +2291,9 @@ async fn wft_failure_cancels_running_las() {
         }
     }
 
-    worker.register_workflow::<WftFailureCancelsRunningLasWf>();
+    worker
+        .register_workflow::<WftFailureCancelsRunningLasWf>()
+        .unwrap();
 
     struct ActivityThatExpectsCancellation;
     #[activities]
@@ -2317,7 +2359,9 @@ async fn resolved_las_not_recorded_if_wft_fails_many_times() {
         }
     }
 
-    worker.register_workflow::<ResolvedLasNotRecordedIfWftFailsManyTimesWf>();
+    worker
+        .register_workflow::<ResolvedLasNotRecordedIfWftFailsManyTimesWf>()
+        .unwrap();
     worker.register_activities(StdActivities);
     worker.run_until_done().await.unwrap();
 }
@@ -2377,7 +2421,9 @@ async fn local_act_records_nonfirst_attempts_ok() {
         }
     }
 
-    worker.register_workflow::<LocalActRecordsNonfirstAttemptsOkWf>();
+    worker
+        .register_workflow::<LocalActRecordsNonfirstAttemptsOkWf>()
+        .unwrap();
     worker.register_activities(StdActivities);
     worker.run_until_done().await.unwrap();
     assert_eq!(nonfirst_counts.len(), 3);
@@ -2693,7 +2739,9 @@ async fn local_act_retry_explicit_delay() {
         }
     }
 
-    worker.register_workflow::<LocalActRetryExplicitDelayWf>();
+    worker
+        .register_workflow::<LocalActRetryExplicitDelayWf>()
+        .unwrap();
     let attempts = Arc::new(AtomicUsize::new(0));
 
     struct ActivityWithExplicitBackoff {
@@ -2820,7 +2868,7 @@ async fn one_la_success(#[case] replay: bool, #[case] completes_ok: bool) {
     });
 
     let mut worker = build_fake_sdk(mock_cfg);
-    worker.register_workflow::<LaWf>();
+    worker.register_workflow::<LaWf>().unwrap();
 
     struct ActivityWithReplayCheck {
         replay: bool,
@@ -2980,9 +3028,9 @@ async fn two_sequential_las(
     let mut worker = build_fake_sdk(mock_cfg);
     worker.set_worker_interceptor(aai);
     if parallel {
-        worker.register_workflow::<TwoLaWfParallel>();
+        worker.register_workflow::<TwoLaWfParallel>().unwrap();
     } else {
-        worker.register_workflow::<TwoLaWf>();
+        worker.register_workflow::<TwoLaWf>().unwrap();
     }
     worker.register_activities(ResolvedActivity);
     worker.run().await.unwrap();
@@ -3075,7 +3123,7 @@ async fn las_separated_by_timer(#[case] replay: bool) {
 
     let mut worker = build_fake_sdk(mock_cfg);
     worker.set_worker_interceptor(aai);
-    worker.register_workflow::<LaTimerLaWf>();
+    worker.register_workflow::<LaTimerLaWf>().unwrap();
     worker.register_activities(ResolvedActivity);
     worker.run().await.unwrap();
 }
@@ -3107,7 +3155,7 @@ async fn one_la_heartbeating_wft_failure_still_executes() {
     });
 
     let mut worker = build_fake_sdk(mock_cfg);
-    worker.register_workflow::<LaWf>();
+    worker.register_workflow::<LaWf>().unwrap();
     worker.register_activities(ResolvedActivity);
     worker.run().await.unwrap();
 }
@@ -3168,7 +3216,9 @@ async fn immediate_cancel(
         }
     }
 
-    worker.register_workflow::<CancelBeforeActStartsWf>();
+    worker
+        .register_workflow::<CancelBeforeActStartsWf>()
+        .unwrap();
     worker.run().await.unwrap();
 }
 
@@ -3289,7 +3339,9 @@ async fn cancel_after_act_starts_canned(
         }
     }
 
-    worker.register_workflow::<CancelAfterActStartsCannedWf>();
+    worker
+        .register_workflow::<CancelAfterActStartsCannedWf>()
+        .unwrap();
 
     struct ActivityWithConditionalCancelWait {
         cancel_type: ActivityCancellationType,

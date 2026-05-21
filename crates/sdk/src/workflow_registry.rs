@@ -45,6 +45,26 @@ struct RegisteredWorkflow {
     factory: WorkflowExecutionFactory,
 }
 
+/// Error returned when a workflow cannot be registered.
+#[derive(Debug, thiserror::Error, Clone, PartialEq, Eq)]
+pub enum WorkflowRegistrationError {
+    /// The workflow type is already registered.
+    #[error("Workflow type {workflow_type} is already registered")]
+    DuplicateWorkflowType {
+        /// The duplicate workflow type.
+        workflow_type: String,
+    },
+
+    /// The workflow type has an `#[init]` method and cannot be registered with a factory.
+    #[error(
+        "Workflow type {workflow_type} must not define an #[init] method when registered with a factory"
+    )]
+    FactoryRegistrationWithInit {
+        /// The workflow type with an `#[init]` method.
+        workflow_type: String,
+    },
+}
+
 /// Contains workflow registrations in a form ready for execution by workers.
 #[derive(Default, Clone)]
 pub struct WorkflowDefinitions {
@@ -58,7 +78,11 @@ impl WorkflowDefinitions {
     }
 
     /// Register a workflow implementation.
-    pub fn register_workflow<W: WorkflowImplementation>(&mut self) -> &mut Self
+    ///
+    /// Returns an error if a workflow with the same type is already registered.
+    pub fn register_workflow<W: WorkflowImplementation>(
+        &mut self,
+    ) -> Result<&mut Self, WorkflowRegistrationError>
     where
         <W::Run as WorkflowDefinition>::Input: Send,
     {
@@ -67,23 +91,28 @@ impl WorkflowDefinitions {
             instantiate_workflow::<W>(payloads, payload_converter, base_ctx)
                 .context("Failed to instantiate native workflow")
         });
-        self.insert_workflow(W::definition(), factory)
-            .unwrap_or_else(|err| panic!("{err}"));
-        self
+        self.insert_workflow(W::definition(), factory)?;
+        Ok(self)
     }
 
     /// Register a workflow with a custom factory for instance creation.
-    pub fn register_workflow_run_with_factory<W, F>(&mut self, user_factory: F) -> &mut Self
+    ///
+    /// Returns an error if a workflow with the same type is already registered, or if the workflow
+    /// type defines an `#[init]` method.
+    pub fn register_workflow_run_with_factory<W, F>(
+        &mut self,
+        user_factory: F,
+    ) -> Result<&mut Self, WorkflowRegistrationError>
     where
         W: WorkflowImplementation,
         <W::Run as WorkflowDefinition>::Input: Send,
         F: Fn() -> W + Send + Sync + 'static,
     {
-        assert!(
-            !W::HAS_INIT,
-            "Workflows registered with a factory must not define an #[init] method. \
-             The factory replaces init for instance creation."
-        );
+        if W::HAS_INIT {
+            return Err(WorkflowRegistrationError::FactoryRegistrationWithInit {
+                workflow_type: W::definition().workflow_type,
+            });
+        }
 
         let factory = Arc::new(move |input| {
             let (payloads, payload_converter, base_ctx) = workflow_input_parts(input);
@@ -102,9 +131,8 @@ impl WorkflowDefinitions {
             )) as Box<dyn WorkflowInstance>)
         });
 
-        self.insert_workflow(W::definition(), factory)
-            .unwrap_or_else(|err| panic!("{err}"));
-        self
+        self.insert_workflow(W::definition(), factory)?;
+        Ok(self)
     }
 
     /// Check if any workflows are registered.
@@ -116,10 +144,10 @@ impl WorkflowDefinitions {
         &mut self,
         definition: WorkflowDefinitionDescriptor,
         factory: WorkflowExecutionFactory,
-    ) -> Result<(), anyhow::Error> {
+    ) -> Result<(), WorkflowRegistrationError> {
         let workflow_type = definition.workflow_type.clone();
         if self.workflows.contains_key(&workflow_type) {
-            anyhow::bail!("Workflow type {workflow_type} is already registered");
+            return Err(WorkflowRegistrationError::DuplicateWorkflowType { workflow_type });
         }
         self.workflows.insert(
             workflow_type,

@@ -99,7 +99,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let worker_options = WorkerOptions::new("my-task-queue")
         .register_activities(MyActivities { counter: Default::default() })
-        .register_workflow::<GreetingWorkflow>()
+        .register_workflow::<GreetingWorkflow>()?
         .build();
 
     Worker::new(&runtime, client, worker_options)?.run().await?;
@@ -339,7 +339,7 @@ let worker_options = WorkerOptions::new("task-queue")
     .activity_task_poller_behavior(...)
     .graceful_shutdown_period(Duration::from_secs(30))
     .register_activities(my_activities)
-    .register_workflow::<MyWorkflow>()
+    .register_workflow::<MyWorkflow>()?
     .build();
 ```
 
@@ -474,4 +474,3 @@ directly. The application failure's own message and metadata are still preserved
 This keeps the Rust SDK's `Failure`s aligned with other Temporal SDKs: SDK error types
 remain represented as Temporal failure types, while unknown Rust error types are encoded as
 application failures.
-

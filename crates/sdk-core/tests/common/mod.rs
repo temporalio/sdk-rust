@@ -54,7 +54,7 @@ use temporalio_common::{
     worker::{WorkerDeploymentOptions, WorkerDeploymentVersion, WorkerTaskTypes},
 };
 use temporalio_sdk::{
-    Worker, WorkerOptions,
+    Worker, WorkerOptions, WorkflowRegistrationError,
     activities::ActivityImplementer,
     interceptors::{
         FailOnNondeterminismInterceptor, InterceptorWithNext, ReturnWorkflowExitValueInterceptor,
@@ -536,23 +536,26 @@ impl TestWorker {
     }
 
     #[allow(unused)]
-    pub(crate) fn register_workflow<W>(&mut self) -> &mut Self
+    pub(crate) fn register_workflow<W>(&mut self) -> Result<&mut Self, WorkflowRegistrationError>
     where
         W: WorkflowImplementation,
         <W::Run as WorkflowDefinition>::Input: Send,
     {
-        self.inner.register_workflow::<W>();
-        self
+        self.inner.register_workflow::<W>()?;
+        Ok(self)
     }
 
-    pub(crate) fn register_workflow_with_factory<W, F>(&mut self, factory: F) -> &mut Self
+    pub(crate) fn register_workflow_with_factory<W, F>(
+        &mut self,
+        factory: F,
+    ) -> Result<&mut Self, WorkflowRegistrationError>
     where
         W: WorkflowImplementation,
         <W::Run as WorkflowDefinition>::Input: Send,
         F: Fn() -> W + Send + Sync + 'static,
     {
-        self.inner.register_workflow_with_factory::<W, F>(factory);
-        self
+        self.inner.register_workflow_with_factory::<W, F>(factory)?;
+        Ok(self)
     }
 
     /// Create a handle that can be used to submit workflows. Useful when workflows need to be

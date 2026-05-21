@@ -110,10 +110,12 @@ pub(crate) async fn priority_values_sent_to_server() {
     }
 
     worker.register_activities(PriorityActivities);
-    worker.register_workflow_with_factory::<ParentWf, _>(move || ParentWf {
-        child_type: child_type.to_owned(),
-    });
-    worker.register_workflow::<ChildWf>();
+    worker
+        .register_workflow_with_factory::<ParentWf, _>(move || ParentWf {
+            child_type: child_type.to_owned(),
+        })
+        .unwrap();
+    worker.register_workflow::<ChildWf>().unwrap();
 
     worker
         .submit_workflow(ParentWf::run, (), starter.workflow_options.clone())

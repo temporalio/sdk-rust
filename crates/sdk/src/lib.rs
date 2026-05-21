@@ -84,7 +84,7 @@ pub mod workflows;
 pub use crate::error::{
     ActivityExecutionError, ApplicationFailure, ChildWorkflowExecutionError,
     ChildWorkflowSignalError, ChildWorkflowStartError, OutgoingActivityError, OutgoingError,
-    OutgoingWorkflowError,
+    OutgoingWorkflowError, WorkflowRegistrationError,
 };
 pub use temporalio_client::Namespace;
 pub use temporalio_workflow::{
@@ -280,13 +280,13 @@ impl<S: worker_options_builder::State> WorkerOptionsBuilder<S> {
     }
 
     /// Registers all workflows on a workflow implementer.
-    pub fn register_workflow<W>(mut self) -> Self
+    pub fn register_workflow<W>(mut self) -> Result<Self, WorkflowRegistrationError>
     where
         W: WorkflowImplementation,
         <W::Run as WorkflowDefinition>::Input: Send,
     {
-        self.workflows.register_workflow::<W>();
-        self
+        self.workflows.register_workflow::<W>()?;
+        Ok(self)
     }
 
     /// Register a workflow with a custom factory for instance creation.
@@ -301,20 +301,23 @@ impl<S: worker_options_builder::State> WorkerOptionsBuilder<S> {
     /// Only use when you understand the implications and have a specific need that cannot be met
     /// otherwise.
     ///
-    /// # Panics
+    /// # Errors
     ///
-    /// Panics if the workflow type defines an `#[init]` method. Workflows using
-    /// factory registration must not have `#[init]` to avoid ambiguity about
-    /// instance creation.
-    pub fn register_workflow_with_factory<W, F>(mut self, factory: F) -> Self
+    /// Returns an error if a workflow with the same type is already registered, or if the workflow
+    /// type defines an `#[init]` method. Workflows using factory registration must not have
+    /// `#[init]` to avoid ambiguity about instance creation.
+    pub fn register_workflow_with_factory<W, F>(
+        mut self,
+        factory: F,
+    ) -> Result<Self, WorkflowRegistrationError>
     where
         W: WorkflowImplementation,
         <W::Run as WorkflowDefinition>::Input: Send,
         F: Fn() -> W + Send + Sync + 'static,
     {
         self.workflows
-            .register_workflow_run_with_factory::<W, F>(factory);
-        self
+            .register_workflow_run_with_factory::<W, F>(factory)?;
+        Ok(self)
     }
 
     /// Register a prebuilt WASM workflow component that exports one or more workflows.
@@ -352,28 +355,31 @@ impl WorkerOptions {
     }
 
     /// Registers all workflows on a workflow implementer.
-    pub fn register_workflow<W>(&mut self) -> &mut Self
+    pub fn register_workflow<W>(&mut self) -> Result<&mut Self, WorkflowRegistrationError>
     where
         W: WorkflowImplementation,
         <W::Run as WorkflowDefinition>::Input: Send,
     {
-        self.workflows.register_workflow::<W>();
-        self
+        self.workflows.register_workflow::<W>()?;
+        Ok(self)
     }
 
     /// Register a workflow with a custom factory for instance creation.
     ///
     /// # Warning: Advanced Usage
     /// See [WorkerOptionsBuilder::register_workflow_with_factory] for more.
-    pub fn register_workflow_with_factory<W, F>(&mut self, factory: F) -> &mut Self
+    pub fn register_workflow_with_factory<W, F>(
+        &mut self,
+        factory: F,
+    ) -> Result<&mut Self, WorkflowRegistrationError>
     where
         W: WorkflowImplementation,
         <W::Run as WorkflowDefinition>::Input: Send,
         F: Fn() -> W + Send + Sync + 'static,
     {
         self.workflows
-            .register_workflow_run_with_factory::<W, F>(factory);
-        self
+            .register_workflow_run_with_factory::<W, F>(factory)?;
+        Ok(self)
     }
 
     /// Register a prebuilt WASM workflow component that exports one or more workflows.
@@ -580,21 +586,24 @@ impl Worker {
     }
 
     /// Registers all workflows on a workflow implementer.
-    pub fn register_workflow<W>(&mut self) -> &mut Self
+    pub fn register_workflow<W>(&mut self) -> Result<&mut Self, WorkflowRegistrationError>
     where
         W: WorkflowImplementation,
         <W::Run as WorkflowDefinition>::Input: Send,
     {
         self.workflow_half
             .workflow_definitions
-            .register_workflow::<W>();
-        self
+            .register_workflow::<W>()?;
+        Ok(self)
     }
 
     /// Register a workflow with a custom factory for instance creation.
     ///
     /// See [WorkerOptionsBuilder::register_workflow_with_factory] for more.
-    pub fn register_workflow_with_factory<W, F>(&mut self, factory: F) -> &mut Self
+    pub fn register_workflow_with_factory<W, F>(
+        &mut self,
+        factory: F,
+    ) -> Result<&mut Self, WorkflowRegistrationError>
     where
         W: WorkflowImplementation,
         <W::Run as WorkflowDefinition>::Input: Send,
@@ -602,8 +611,8 @@ impl Worker {
     {
         self.workflow_half
             .workflow_definitions
-            .register_workflow_run_with_factory::<W, F>(factory);
-        self
+            .register_workflow_run_with_factory::<W, F>(factory)?;
+        Ok(self)
     }
 
     /// Runs the worker. Eventually resolves after the worker has been explicitly shut down,
@@ -1203,7 +1212,45 @@ mod tests {
 
     #[test]
     fn test_workflow_registration() {
-        let _ = WorkerOptions::new("task_q").register_workflow::<MyWorkflow>();
+        let _ = WorkerOptions::new("task_q")
+            .register_workflow::<MyWorkflow>()
+            .unwrap();
+    }
+
+    #[test]
+    fn duplicate_workflow_registration_errors() {
+        let result = WorkerOptions::new("task_q")
+            .register_workflow::<MyWorkflow>()
+            .unwrap()
+            .register_workflow::<MyWorkflow>();
+
+        let err = match result {
+            Ok(_) => panic!("duplicate workflow registration should error"),
+            Err(err) => err,
+        };
+        assert_eq!(
+            err,
+            WorkflowRegistrationError::DuplicateWorkflowType {
+                workflow_type: "MyWorkflow".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn factory_registration_with_init_errors() {
+        let result = WorkerOptions::new("task_q")
+            .register_workflow_with_factory(|| MyWorkflow { counter: 0 });
+
+        let err = match result {
+            Ok(_) => panic!("factory registration with #[init] should error"),
+            Err(err) => err,
+        };
+        assert_eq!(
+            err,
+            WorkflowRegistrationError::FactoryRegistrationWithInit {
+                workflow_type: "MyWorkflow".to_string()
+            }
+        );
     }
 
     fn default_identity() -> String {

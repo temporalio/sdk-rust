@@ -74,9 +74,11 @@ async fn test_determinism_error_then_recovers() {
 
     let run_ct = Arc::new(AtomicUsize::new(1));
     let run_ct_clone = run_ct.clone();
-    worker.register_workflow_with_factory(move || TimerWfNondeterministic {
-        run_ct: run_ct_clone.clone(),
-    });
+    worker
+        .register_workflow_with_factory(move || TimerWfNondeterministic {
+            run_ct: run_ct_clone.clone(),
+        })
+        .unwrap();
     let task_queue = starter.get_task_queue().to_owned();
     worker
         .submit_workflow(
@@ -126,9 +128,11 @@ async fn task_fail_causes_replay_unset_too_soon() {
 
     let did_fail = Arc::new(AtomicBool::new(false));
     let did_fail_clone = did_fail.clone();
-    worker.register_workflow_with_factory(move || TaskFailReplayWf {
-        did_fail: did_fail_clone.clone(),
-    });
+    worker
+        .register_workflow_with_factory(move || TaskFailReplayWf {
+            did_fail: did_fail_clone.clone(),
+        })
+        .unwrap();
 
     let task_queue = starter.get_task_queue().to_owned();
     let handle = worker
@@ -191,9 +195,11 @@ async fn test_panic_wf_task_rejected_properly() {
     let mut worker = mock_sdk(mh);
 
     let did_fail = Arc::new(AtomicBool::new(false));
-    worker.register_workflow_with_factory(move || TimerWfFailsOnce {
-        did_fail: did_fail.clone(),
-    });
+    worker
+        .register_workflow_with_factory(move || TimerWfFailsOnce {
+            did_fail: did_fail.clone(),
+        })
+        .unwrap();
     let task_queue = "fake_tq".to_owned();
     worker
         .submit_wf(
@@ -251,9 +257,11 @@ async fn test_wf_task_rejected_properly_due_to_nondeterminism(#[case] use_cache:
 
     let started_count = Arc::new(AtomicUsize::new(0));
     let count_clone = started_count.clone();
-    worker.register_workflow_with_factory(move || NondeterministicTimerWf {
-        started_count: count_clone.clone(),
-    });
+    worker
+        .register_workflow_with_factory(move || NondeterministicTimerWf {
+            started_count: count_clone.clone(),
+        })
+        .unwrap();
 
     let task_queue = "fake_tq".to_owned();
     worker
@@ -356,7 +364,9 @@ async fn activity_id_or_type_change_is_nondeterministic(
             cfg.max_cached_workflows = 2;
         }
     });
-    worker.register_workflow::<ActivityIdOrTypeChangeWf>();
+    worker
+        .register_workflow::<ActivityIdOrTypeChangeWf>()
+        .unwrap();
 
     let task_queue = "fake_tq".to_owned();
     worker
@@ -440,7 +450,9 @@ async fn child_wf_id_or_type_change_is_nondeterministic(
         }
     });
 
-    worker.register_workflow::<ChildWfIdOrTypeChangeWf>();
+    worker
+        .register_workflow::<ChildWfIdOrTypeChangeWf>()
+        .unwrap();
 
     let task_queue = "fake_tq".to_owned();
     worker
@@ -489,9 +501,11 @@ async fn nondeterministic_future_detection_fails_wft() {
 
     let attempt = Arc::new(AtomicUsize::new(0));
     let attempt_clone = attempt.clone();
-    worker.register_workflow_with_factory(move || TokioSleepWf {
-        attempt: attempt_clone.clone(),
-    });
+    worker
+        .register_workflow_with_factory(move || TokioSleepWf {
+            attempt: attempt_clone.clone(),
+        })
+        .unwrap();
 
     let task_queue = starter.get_task_queue().to_owned();
     let handle = worker
@@ -575,7 +589,7 @@ async fn repro_channel_missing_because_nondeterminism() {
             cfg.ignore_evicts_on_shutdown = false;
         });
 
-        worker.register_workflow::<ReproChannelMissingWf>();
+        worker.register_workflow::<ReproChannelMissingWf>().unwrap();
 
         let task_queue = "fake_tq".to_owned();
         worker

@@ -42,7 +42,7 @@ async fn timer_workflow_workflow_driver() {
     let mut starter = CoreWfStarter::new(wf_name);
     starter.sdk_config.task_types = WorkerTaskTypes::workflow_only();
     let mut worker = starter.worker().await;
-    worker.register_workflow::<TimerWf>();
+    worker.register_workflow::<TimerWf>().unwrap();
 
     let task_queue = starter.get_task_queue().to_owned();
     let workflow_id = starter.get_task_queue().to_owned();
@@ -154,7 +154,7 @@ async fn parallel_timers() {
     let mut starter = CoreWfStarter::new(wf_name);
     starter.sdk_config.task_types = WorkerTaskTypes::workflow_only();
     let mut worker = starter.worker().await;
-    worker.register_workflow::<ParallelTimerWf>();
+    worker.register_workflow::<ParallelTimerWf>().unwrap();
 
     starter.start_with_worker(wf_name, &mut worker).await;
     worker.run_until_done().await.unwrap();
@@ -186,7 +186,9 @@ async fn cancel_unpolled_timer_after_both_timers_fire_same_activation() {
     t.add_workflow_execution_completed();
 
     let mut worker = build_fake_sdk(MockPollCfg::from_hist_builder(t));
-    worker.register_workflow::<CancelAlreadyFiredTimerWf>();
+    worker
+        .register_workflow::<CancelAlreadyFiredTimerWf>()
+        .unwrap();
     worker.run().await.unwrap();
 }
 
@@ -223,7 +225,7 @@ async fn test_fire_happy_path_inc() {
     });
 
     let mut worker = build_fake_sdk(mock_cfg);
-    worker.register_workflow::<HappyTimerWf>();
+    worker.register_workflow::<HappyTimerWf>().unwrap();
     worker.run().await.unwrap();
 }
 
@@ -251,7 +253,7 @@ async fn mismatched_timer_ids_errors() {
         if message.contains("Timer fired event did not have expected timer id 1"))
     });
     let mut worker = build_fake_sdk(mock_cfg);
-    worker.register_workflow::<MismatchedTimerWf>();
+    worker.register_workflow::<MismatchedTimerWf>().unwrap();
     worker.run().await.unwrap();
 }
 
@@ -293,7 +295,7 @@ async fn incremental_cancellation() {
     });
 
     let mut worker = build_fake_sdk(mock_cfg);
-    worker.register_workflow::<CancelTimerWf>();
+    worker.register_workflow::<CancelTimerWf>().unwrap();
     worker.run().await.unwrap();
 }
 
@@ -329,7 +331,7 @@ async fn cancel_before_sent_to_server() {
         });
     });
     let mut worker = build_fake_sdk(mock_cfg);
-    worker.register_workflow::<CancelBeforeSentWf>();
+    worker.register_workflow::<CancelBeforeSentWf>().unwrap();
     worker.run().await.unwrap();
 }
 
@@ -372,6 +374,6 @@ async fn wait_condition_waker_in_futures_unordered() {
     // FuturesUnordered uses internal wakers that forward wake calls outside the
     // SdkWakeGuard scope.
     worker.set_detect_nondeterministic_futures(false);
-    worker.register_workflow::<WaitConditionWakerWf>();
+    worker.register_workflow::<WaitConditionWakerWf>().unwrap();
     worker.run().await.unwrap();
 }

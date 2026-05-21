@@ -44,7 +44,7 @@ async fn continue_as_new_happy_path() {
     let mut starter = CoreWfStarter::new(wf_name);
     starter.sdk_config.task_types = WorkerTaskTypes::workflow_only();
     let mut worker = starter.worker().await;
-    worker.register_workflow::<ContinueAsNewWf>();
+    worker.register_workflow::<ContinueAsNewWf>().unwrap();
 
     let task_queue = starter.get_task_queue().to_owned();
     worker
@@ -66,7 +66,7 @@ async fn continue_as_new_multiple_concurrent() {
     starter.sdk_config.max_cached_workflows = 5_usize;
     starter.sdk_config.tuner = Arc::new(TunerHolder::fixed_size(5, 1, 1, 1));
     let mut worker = starter.worker().await;
-    worker.register_workflow::<ContinueAsNewWf>();
+    worker.register_workflow::<ContinueAsNewWf>().unwrap();
 
     let task_queue = starter.get_task_queue().to_owned();
     let wf_names = (1..=20).map(|i| format!("{wf_name}-{i}"));
@@ -125,7 +125,7 @@ async fn wf_completing_with_continue_as_new() {
     });
 
     let mut worker = build_fake_sdk(mock_cfg);
-    worker.register_workflow::<WfWithTimer>();
+    worker.register_workflow::<WfWithTimer>().unwrap();
     worker.run().await.unwrap();
 }
 
@@ -161,7 +161,9 @@ async fn continue_as_new_suggested_flag_exposed() {
 
     let mock_cfg = MockPollCfg::from_hist_builder(t);
     let mut worker = build_fake_sdk(mock_cfg);
-    worker.register_workflow::<ContinueAsNewSuggestedWf>();
+    worker
+        .register_workflow::<ContinueAsNewSuggestedWf>()
+        .unwrap();
     worker.run().await.unwrap();
 }
 
@@ -190,7 +192,9 @@ async fn clear_search_attributes_on_continue_as_new() {
     let mut starter = CoreWfStarter::new(wf_name);
     starter.sdk_config.task_types = WorkerTaskTypes::workflow_only();
     let mut worker = starter.worker().await;
-    worker.register_workflow::<ClearSearchAttrsOnContinueAsNewWf>();
+    worker
+        .register_workflow::<ClearSearchAttrsOnContinueAsNewWf>()
+        .unwrap();
 
     let task_queue = starter.get_task_queue().to_owned();
     worker

@@ -82,7 +82,7 @@ async fn fuzzy_workflow() {
     starter.sdk_config.max_cached_workflows = 25;
     starter.sdk_config.tuner = Arc::new(TunerHolder::fixed_size(25, 25, 100, 100));
     let mut worker = starter.worker().await;
-    worker.register_workflow::<FuzzyWf>();
+    worker.register_workflow::<FuzzyWf>().unwrap();
     worker.register_activities(StdActivities);
 
     let client = starter.get_client().await;
