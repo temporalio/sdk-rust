@@ -263,7 +263,8 @@ async fn activity_interceptor_wraps_activity_execution() {
     starter.sdk_config.register_activities(StdActivities);
     starter
         .sdk_config
-        .register_workflow::<OneActivityWorkflow>();
+        .register_workflow::<OneActivityWorkflow>()
+        .unwrap();
     let mut worker = starter.worker().await;
 
     let records = Arc::new(ActivityInterceptorRecords::default());
@@ -348,7 +349,8 @@ async fn activity_interceptor_wraps_local_activity_execution() {
     starter.sdk_config.register_activities(StdActivities);
     starter
         .sdk_config
-        .register_workflow::<OneLocalActivityWorkflow>();
+        .register_workflow::<OneLocalActivityWorkflow>()
+        .unwrap();
     let mut worker = starter.worker().await;
 
     let records = Arc::new(ActivityInterceptorRecords::default());
@@ -421,7 +423,8 @@ async fn activity_inbound_interceptor_can_mutate_activity_input() {
     starter.sdk_config.register_activities(StdActivities);
     starter
         .sdk_config
-        .register_workflow::<OneActivityWorkflow>();
+        .register_workflow::<OneActivityWorkflow>()
+        .unwrap();
     let mut worker = starter.worker().await;
 
     worker
@@ -485,7 +488,8 @@ async fn activity_interceptor_observes_activity_error() {
     starter.sdk_config.register_activities(FailingActivities);
     starter
         .sdk_config
-        .register_workflow::<ActivityFailureWorkflow>();
+        .register_workflow::<ActivityFailureWorkflow>()
+        .unwrap();
     let mut worker = starter.worker().await;
 
     let records = Arc::new(ActivityInterceptorRecords::default());
@@ -581,7 +585,8 @@ async fn activity_interceptor_observes_activity_panic() {
     starter.sdk_config.register_activities(PanickingActivities);
     starter
         .sdk_config
-        .register_workflow::<ActivityPanicWorkflow>();
+        .register_workflow::<ActivityPanicWorkflow>()
+        .unwrap();
     let mut worker = starter.worker().await;
 
     let records = Arc::new(ActivityInterceptorRecords::default());

@@ -24,9 +24,7 @@ pub fn activity(_attr: TokenStream, item: TokenStream) -> TokenStream {
 }
 
 /// Declares activities without providing implementations. Each method must omit the
-/// `ActivityContext` parameter and have a body of exactly `unimplemented!()`. The macro emits
-/// the same marker structs and inherent consts as `#[activities]` so call sites use the same
-/// `MyActivities::greet` form, but no execution machinery is generated.
+/// `ActivityContext` parameter and have a body of exactly `unimplemented!()`.
 ///
 /// Intended for workflow crates that need typed activity declarations which are implemented
 /// elsewhere by a separate worker crate (or in another language).

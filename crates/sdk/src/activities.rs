@@ -76,6 +76,7 @@ use temporalio_common::{
     data_converters::{
         DataConverter, GenericPayloadConverter, SerializationContext, SerializationContextData,
     },
+    error::ApplicationFailure,
     protos::{
         coresdk::{ActivityHeartbeat, activity_result::ActivityExecutionResult, activity_task},
         temporal::api::common::v1::{Payload, RetryPolicy, WorkflowExecution},

@@ -1,4 +1,4 @@
-use std::{fs, path::PathBuf, rc::Rc, sync::Arc};
+use std::{fs, io, path::PathBuf, rc::Rc, sync::Arc};
 
 use anyhow::{Context, bail};
 use prost::Message;
@@ -52,13 +52,16 @@ impl WasmWorkflowComponent {
     pub fn from_file(
         component_id: impl Into<String>,
         path: impl Into<PathBuf>,
-    ) -> Result<Self, anyhow::Error> {
+    ) -> io::Result<Self> {
         let path = path.into();
-        if !path.exists() {
-            bail!(
-                "WASM workflow component file does not exist: {}",
-                path.display()
-            );
+        if !path.try_exists()? {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!(
+                    "WASM workflow component file does not exist: {}",
+                    path.display()
+                ),
+            ));
         }
         Ok(Self {
             component_id: component_id.into(),
@@ -70,10 +73,13 @@ impl WasmWorkflowComponent {
     pub fn from_bytes(
         component_id: impl Into<String>,
         bytes: impl Into<Arc<[u8]>>,
-    ) -> Result<Self, anyhow::Error> {
+    ) -> io::Result<Self> {
         let bytes = bytes.into();
         if bytes.is_empty() {
-            bail!("WASM workflow component bytes must not be empty");
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "WASM workflow component bytes must not be empty",
+            ));
         }
         Ok(Self {
             component_id: component_id.into(),

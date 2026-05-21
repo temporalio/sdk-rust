@@ -116,8 +116,6 @@ use std::{
     collections::{HashMap, HashSet},
     fmt::{Debug, Display, Formatter},
     future::Future,
-    marker::PhantomData,
-    panic::AssertUnwindSafe,
     sync::Arc,
     time::Duration,
 };

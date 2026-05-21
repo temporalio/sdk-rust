@@ -217,8 +217,7 @@ impl WorkflowFuture {
                 .context("Empty activation job variant")?
             {
                 Variant::InitializeWorkflow(_) => {
-                    should_poll_routines = true;
-                    push_context!(ActivationJobContext::Passive);
+                    push_polled_context!(ActivationJobContext::Passive);
                 }
                 Variant::FireTimer(_) => {
                     push_polled_context!(ActivationJobContext::Passive);
@@ -242,8 +241,7 @@ impl WorkflowFuture {
                     push_polled_context!(ActivationJobContext::Passive);
                 }
                 Variant::UpdateRandomSeed(_) => {
-                    should_poll_routines = true;
-                    push_context!(ActivationJobContext::Passive);
+                    push_polled_context!(ActivationJobContext::Passive);
                 }
                 Variant::QueryWorkflow(q) => {
                     debug!(query_type = %q.query_type, "Query received");
