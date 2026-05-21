@@ -1,4 +1,4 @@
-use crate::{replay::HistoryInfo, test_help::CoreInternalFlags};
+use crate::{internal_flags::CoreInternalFlags, replay::HistoryInfo};
 use anyhow::bail;
 use prost_types::Timestamp;
 use std::{
@@ -48,6 +48,10 @@ pub struct TestHistoryBuilder {
     final_workflow_task_started_event_id: i64,
     previous_task_completed_id: i64,
     original_run_id: String,
+    /// When true, the builder auto-sets `WftChunkingV2` on the first WFTCompleted.
+    use_wft_chunking_v2: bool,
+    /// Tracks whether we've already emitted the first WFTCompleted
+    has_seen_wft_completed: bool,
 }
 
 impl TestHistoryBuilder {
@@ -69,6 +73,8 @@ impl TestHistoryBuilder {
             original_run_id: extract_original_run_id_from_events(&events)
                 .expect("Run id must be discoverable")
                 .to_string(),
+            use_wft_chunking_v2: false,
+            has_seen_wft_completed: false,
             events,
         }
     }
@@ -87,6 +93,15 @@ impl TestHistoryBuilder {
         let attribs =
             default_attribs(event_type).expect("Couldn't make default attributes in test builder");
         self.add(attribs)
+    }
+
+    /// Enable WFT chunking v2 for this builder. When enabled, the first
+    /// WFTCompleted event gets the cumulative `WftChunkingV2` flag.
+    pub fn set_use_wft_chunking_v2(&mut self) {
+        if self.has_seen_wft_completed {
+            panic!("WFT chunking v2 can only be enabled before the first WFTCompleted");
+        }
+        self.use_wft_chunking_v2 = true;
     }
 
     /// Adds the following events:
@@ -127,6 +142,10 @@ impl TestHistoryBuilder {
             ..Default::default()
         });
         self.previous_task_completed_id = id;
+        if self.use_wft_chunking_v2 && !self.has_seen_wft_completed {
+            self.set_flags_on_wft_completed(id, &[CoreInternalFlags::WftChunkingV2]);
+        }
+        self.has_seen_wft_completed = true;
     }
 
     /// Add a workflow task timed out event.
@@ -600,20 +619,25 @@ impl TestHistoryBuilder {
 
     /// Sets internal patches which should appear in the first WFT complete event
     pub fn set_flags_first_wft(&mut self, core: &[CoreInternalFlags], lang: &[u32]) {
-        Self::set_flags(
-            self.events.iter_mut(),
-            &core.iter().map(|f| *f as u32).collect::<Vec<_>>(),
-            lang,
-        )
+        Self::set_flags(self.events.iter_mut(), core, lang)
     }
 
     /// Sets internal patches which should appear in the most recent complete event
     pub fn set_flags_last_wft(&mut self, core: &[CoreInternalFlags], lang: &[u32]) {
-        Self::set_flags(
-            self.events.iter_mut().rev(),
-            &core.iter().map(|f| *f as u32).collect::<Vec<_>>(),
-            lang,
-        )
+        Self::set_flags(self.events.iter_mut().rev(), core, lang)
+    }
+
+    /// Sets core flags on the WFTCompleted event with the given event ID.
+    pub fn set_flags_on_wft_completed(&mut self, event_id: i64, core: &[CoreInternalFlags]) {
+        if let Some(event) = self.events.iter_mut().find(|e| e.event_id == event_id)
+            && let Some(Attributes::WorkflowTaskCompletedEventAttributes(ref mut a)) =
+                event.attributes
+        {
+            let sdk_dat = a.sdk_metadata.get_or_insert_with(Default::default);
+            sdk_dat
+                .core_used_flags
+                .extend(core.iter().map(|f| *f as u32));
+        }
     }
 
     /// Get the event ID of the most recently added event
@@ -628,7 +652,7 @@ impl TestHistoryBuilder {
 
     fn set_flags<'a>(
         mut events: impl Iterator<Item = &'a mut HistoryEvent>,
-        core: &[u32],
+        core: &[CoreInternalFlags],
         lang: &[u32],
     ) {
         if let Some(first_attrs) = events.find_map(|e| {
@@ -642,7 +666,7 @@ impl TestHistoryBuilder {
             let sdk_dat = first_attrs
                 .sdk_metadata
                 .get_or_insert_with(Default::default);
-            sdk_dat.core_used_flags = core.to_vec();
+            sdk_dat.core_used_flags = core.iter().map(|f| *f as u32).collect();
             sdk_dat.lang_used_flags = lang.to_vec();
         }
     }

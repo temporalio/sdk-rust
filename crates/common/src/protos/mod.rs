@@ -2347,6 +2347,102 @@ pub mod temporal {
                         }
                     }
 
+                    /// Returns true if safe replay of this event requires restoring the original
+                    /// WFT start time. The WFT chunking algorithm v2 may collapse away a WFT
+                    /// sequence only if that WFT contains no time-sensitive events.
+                    ///
+                    /// Any event that may result in user code being executed is time-sensitive.
+                    /// Ignorable events and events that modify the workflow's metadata/internal
+                    /// without triggering user code are not time-sensitive.
+                    pub fn is_wft_time_sensitive_event(&self) -> bool {
+                        // Never add a catch-all case to this match statement.
+                        // We need to explicitly mark any new event types as time-sensitive or not.
+                        match self.event_type() {
+                            // WFExecutionStarted is time-sensitive because it triggers execution
+                            // of the workflow's main function. WFExec terminal events are not.
+                            EventType::WorkflowExecutionStarted => true,
+                            EventType::WorkflowExecutionCompleted => false,
+                            EventType::WorkflowExecutionFailed => false,
+                            EventType::WorkflowExecutionTimedOut => false,
+                            EventType::WorkflowExecutionContinuedAsNew => false,
+                            EventType::WorkflowExecutionTerminated => false,
+                            EventType::WorkflowExecutionCanceled => false,
+
+                            // WFT framing events are not time-sensitive, because
+                            // they do not result in user code execution by themselves.
+                            EventType::WorkflowTaskScheduled => false,
+                            EventType::WorkflowTaskStarted => false,
+                            EventType::WorkflowTaskCompleted => false,
+                            EventType::WorkflowTaskTimedOut => false,
+                            EventType::WorkflowTaskFailed => false,
+
+                            EventType::ActivityTaskScheduled => true,
+                            EventType::ActivityTaskStarted => true,
+                            EventType::ActivityTaskCompleted => true,
+                            EventType::ActivityTaskFailed => true,
+                            EventType::ActivityTaskTimedOut => true,
+                            EventType::ActivityTaskCancelRequested => true,
+                            EventType::ActivityTaskCanceled => true,
+
+                            EventType::TimerStarted => true,
+                            EventType::TimerFired => true,
+                            EventType::TimerCanceled => true,
+
+                            EventType::StartChildWorkflowExecutionInitiated => true,
+                            EventType::StartChildWorkflowExecutionFailed => true,
+                            EventType::ChildWorkflowExecutionStarted => true,
+                            EventType::ChildWorkflowExecutionCompleted => true,
+                            EventType::ChildWorkflowExecutionFailed => true,
+                            EventType::ChildWorkflowExecutionCanceled => true,
+                            EventType::ChildWorkflowExecutionTimedOut => true,
+                            EventType::ChildWorkflowExecutionTerminated => true,
+
+                            EventType::WorkflowExecutionSignaled => true,
+                            EventType::WorkflowExecutionCancelRequested => true,
+
+                            EventType::SignalExternalWorkflowExecutionInitiated => true,
+                            EventType::SignalExternalWorkflowExecutionFailed => true,
+                            EventType::ExternalWorkflowExecutionSignaled => true,
+
+                            EventType::RequestCancelExternalWorkflowExecutionInitiated => true,
+                            EventType::RequestCancelExternalWorkflowExecutionFailed => true,
+                            EventType::ExternalWorkflowExecutionCancelRequested => true,
+
+                            EventType::WorkflowExecutionUpdateAdmitted => true,
+                            EventType::WorkflowExecutionUpdateAccepted => true,
+                            EventType::WorkflowExecutionUpdateCompleted => true,
+
+                            // Update rejection doesn't trigger user code execution.
+                            EventType::WorkflowExecutionUpdateRejected => false,
+
+                            EventType::NexusOperationScheduled => true,
+                            EventType::NexusOperationStarted => true,
+                            EventType::NexusOperationCompleted => true,
+                            EventType::NexusOperationFailed => true,
+                            EventType::NexusOperationCanceled => true,
+                            EventType::NexusOperationTimedOut => true,
+                            EventType::NexusOperationCancelRequested => true,
+                            EventType::NexusOperationCancelRequestCompleted => true,
+                            EventType::NexusOperationCancelRequestFailed => true,
+
+                            EventType::MarkerRecorded => false,
+                            EventType::UpsertWorkflowSearchAttributes => false,
+                            EventType::WorkflowPropertiesModifiedExternally => false,
+                            EventType::ActivityPropertiesModifiedExternally => false,
+                            EventType::WorkflowPropertiesModified => false,
+                            EventType::WorkflowExecutionOptionsUpdated => false,
+
+                            // Ignored events obviously can't be time-sensitive.
+                            EventType::WorkflowExecutionPaused => false,
+                            EventType::WorkflowExecutionUnpaused => false,
+                            EventType::WorkflowExecutionTimeSkippingTransitioned => false,
+
+                            EventType::Unspecified => {
+                                panic!("Unexpected unspecified event type.");
+                            }
+                        }
+                    }
+
                     pub fn is_ignorable(&self) -> bool {
                         if !self.worker_may_ignore {
                             return false;

@@ -2457,15 +2457,17 @@ async fn core_internal_flags() {
         mock_worker_client(),
     );
     mh.completion_mock_fn = Some(Box::new(move |c| {
+        let expected: HashSet<u32> = CoreInternalFlags::all_cumulative_default_enabled()
+            .chain(CoreInternalFlags::all_first_wft_only_default_enabled())
+            .map(|f| f as u32)
+            .collect();
         assert_eq!(
             c.sdk_metadata
                 .core_used_flags
                 .iter()
                 .copied()
                 .collect::<HashSet<_>>(),
-            CoreInternalFlags::all_except_too_high()
-                .map(|f| f as u32)
-                .collect()
+            expected
         );
         Ok(Default::default())
     }));

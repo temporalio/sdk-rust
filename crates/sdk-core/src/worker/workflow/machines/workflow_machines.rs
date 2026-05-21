@@ -275,6 +275,11 @@ impl WorkflowMachines {
         // Peek ahead to determine used flags in the first WFT.
         if let Some(attrs) = basics.history.peek_next_wft_completed(0) {
             observed_internal_flags.add_from_complete(attrs);
+        } else {
+            // There's not even a single WFT Completed event for this workflow, which implies
+            // that 1) this is the first WFT and 2) we're not replaying. That's a good time to
+            // set all flags that should be set but can only be set on the first WFT.
+            observed_internal_flags.write_all_cumulative_default_enabled(true);
         };
         Self {
             last_history_from_server: basics.history,
@@ -424,7 +429,7 @@ impl WorkflowMachines {
         // already recorded.
         (*self.observed_internal_flags)
             .borrow_mut()
-            .write_all_known();
+            .write_all_cumulative_default_enabled(false);
         self.commands.iter().filter_map(|c| {
             if !self.machine(c.machine).is_final_state() {
                 match &c.command {
