@@ -73,6 +73,7 @@ envconfig = ["temporalio-sdk-core/envconfig"]
 prometheus = ["temporalio-sdk-core/prometheus"]
 otel = ["temporalio-sdk-core/otel"]
 examples = ["serde/derive", "dep:serde_json", "envconfig"]
+wasm-examples = []
 wasm-workflows = ["dep:wasmtime"]
 
 [dependencies.serde_json]
@@ -218,6 +219,12 @@ required-features = ["examples"]
 name = "schedules-starter"
 path = "examples/schedules/starter.rs"
 required-features = ["examples"]
+
+[[example]]
+name = "wasm-workflows"
+path = "examples/wasm_workflows/src/lib.rs"
+crate-type = ["cdylib"]
+required-features = ["examples", "wasm-examples"]
 
 [lints]
 workspace = true

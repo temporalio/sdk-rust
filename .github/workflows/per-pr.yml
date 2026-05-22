@@ -299,15 +299,7 @@ jobs:
           temporal operator search-attribute create --name CustomKeywordField --type Keyword
           temporal operator search-attribute create --name CustomIntField --type Int
       - name: Run examples
-        run: |
-          for dir in crates/sdk/examples/*/; do
-            sample="$(basename "$dir" | tr '_' '-')"
-            cargo run -p temporalio-sdk --features examples --example "${sample}-worker" &
-            WORKER_PID=$!
-            timeout 20 cargo run -p temporalio-sdk --features examples --example "${sample}-starter"
-            kill $WORKER_PID 2>/dev/null || true
-            wait $WORKER_PID 2>/dev/null || true
-          done
+        run: bash ./etc/run-sdk-examples.sh
 
   c-bridge-static-link-test:
     name: "C bridge static link test"
