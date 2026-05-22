@@ -93,6 +93,16 @@ path = "examples/activity_heartbeating/starter.rs"
 required-features = ["examples"]
 
 [[example]]
+name = "activity-interceptor-worker"
+path = "examples/activity_interceptor/worker.rs"
+required-features = ["examples"]
+
+[[example]]
+name = "activity-interceptor-starter"
+path = "examples/activity_interceptor/starter.rs"
+required-features = ["examples"]
+
+[[example]]
 name = "timer-examples-worker"
 path = "examples/timer_examples/worker.rs"
 required-features = ["examples"]

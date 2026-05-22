@@ -5,9 +5,10 @@ use crate::common::{
 };
 use anyhow::anyhow;
 use assert_matches::assert_matches;
+use futures_util::FutureExt;
 use std::{
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, Ordering},
     },
     time::Duration,
@@ -45,8 +46,13 @@ use temporalio_common::{
 };
 use temporalio_macros::{activities, workflow, workflow_methods};
 use temporalio_sdk::{
-    ActivityExecutionError, ActivityOptions, CancellableFuture, WorkflowContext, WorkflowResult,
+    ActivityExecutionError, ActivityOptions, CancellableFuture, LocalActivityOptions,
+    WorkflowContext, WorkflowResult,
     activities::{ActivityContext, ActivityError},
+    interceptors::{
+        ActivityInboundInterceptor, ExecuteActivityInput, ExecuteActivityOutput,
+        ExecuteActivityResult, Next,
+    },
 };
 use temporalio_sdk_core::{
     PollerBehavior, prost_dur,
@@ -74,6 +80,108 @@ impl OneActivityWorkflow {
             )
             .await?;
         Ok(r)
+    }
+}
+
+#[workflow]
+#[derive(Default)]
+struct OneLocalActivityWorkflow;
+
+#[workflow_methods]
+impl OneLocalActivityWorkflow {
+    #[run]
+    async fn run(ctx: &mut WorkflowContext<Self>, input: String) -> WorkflowResult<String> {
+        let r = ctx
+            .start_local_activity(StdActivities::echo, input, LocalActivityOptions::default())
+            .await?;
+        Ok(r)
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum ActivityInterceptorPhase {
+    Before,
+    After,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct ActivityInterceptorRecord {
+    interceptor: &'static str,
+    phase: ActivityInterceptorPhase,
+    activity_type: String,
+    workflow_type: String,
+    is_local: bool,
+    input: Option<String>,
+    output: Option<String>,
+    status: Option<&'static str>,
+}
+
+#[derive(Default)]
+struct ActivityInterceptorRecords {
+    records: Mutex<Vec<ActivityInterceptorRecord>>,
+}
+
+struct RecordingActivityInboundInterceptor {
+    interceptor: &'static str,
+    records: Arc<ActivityInterceptorRecords>,
+}
+
+impl ActivityInboundInterceptor for RecordingActivityInboundInterceptor {
+    fn execute_activity<'a>(
+        &'a self,
+        input: ExecuteActivityInput,
+        next: Next<'a, ExecuteActivityInput, ExecuteActivityOutput<'a>>,
+    ) -> ExecuteActivityOutput<'a> {
+        async move {
+            let info = input.activity_info();
+            let activity_type = info.activity_type.clone();
+            let workflow_type = info.workflow_type.clone();
+            let is_local = info.is_local;
+            self.records
+                .records
+                .lock()
+                .unwrap()
+                .push(ActivityInterceptorRecord {
+                    interceptor: self.interceptor,
+                    phase: ActivityInterceptorPhase::Before,
+                    activity_type: activity_type.clone(),
+                    workflow_type: workflow_type.clone(),
+                    is_local,
+                    input: input.args_ref::<String>().cloned(),
+                    output: None,
+                    status: None,
+                });
+            let result = next.run(input).await;
+            self.records
+                .records
+                .lock()
+                .unwrap()
+                .push(ActivityInterceptorRecord {
+                    interceptor: self.interceptor,
+                    phase: ActivityInterceptorPhase::After,
+                    activity_type,
+                    workflow_type,
+                    is_local,
+                    input: None,
+                    output: result
+                        .as_ref()
+                        .ok()
+                        .and_then(|output| output.downcast_ref::<String>())
+                        .cloned(),
+                    status: Some(activity_execution_result_status(&result)),
+                });
+            result
+        }
+        .boxed()
+    }
+}
+
+fn activity_execution_result_status(result: &ExecuteActivityResult) -> &'static str {
+    match result {
+        Ok(_) => "completed",
+        Err(ActivityError::Application(_)) => "failed",
+        Err(ActivityError::Cancelled { .. }) => "cancelled",
+        Err(ActivityError::WillCompleteAsync) => "will_complete_async",
     }
 }
 
@@ -144,6 +252,382 @@ async fn one_activity_only() {
     worker.run_until_done().await.unwrap();
     let r = handle.get_result(Default::default()).await.unwrap();
     assert_eq!(r, input);
+}
+
+#[tokio::test]
+async fn activity_interceptor_wraps_activity_execution() {
+    let wf_name = OneActivityWorkflow::name();
+    let mut starter = CoreWfStarter::new("activity_interceptor_wraps_activity_execution");
+    starter.sdk_config.register_activities(StdActivities);
+    starter
+        .sdk_config
+        .register_workflow::<OneActivityWorkflow>();
+    let mut worker = starter.worker().await;
+
+    let records = Arc::new(ActivityInterceptorRecords::default());
+    worker
+        .inner_mut()
+        .add_activity_inbound_interceptor(RecordingActivityInboundInterceptor {
+            interceptor: "outer",
+            records: records.clone(),
+        });
+    worker
+        .inner_mut()
+        .add_activity_inbound_interceptor(RecordingActivityInboundInterceptor {
+            interceptor: "inner",
+            records: records.clone(),
+        });
+
+    let input = "hello from input!".to_string();
+    let task_queue = starter.get_task_queue().to_owned();
+    let handle = worker
+        .submit_workflow(
+            OneActivityWorkflow::run,
+            input.clone(),
+            WorkflowStartOptions::new(task_queue.clone(), task_queue).build(),
+        )
+        .await
+        .unwrap();
+    worker.run_until_done().await.unwrap();
+    let r = handle.get_result(Default::default()).await.unwrap();
+    assert_eq!(r, input);
+
+    assert_eq!(
+        records.records.lock().unwrap().as_slice(),
+        &[
+            ActivityInterceptorRecord {
+                interceptor: "outer",
+                phase: ActivityInterceptorPhase::Before,
+                activity_type: "StdActivities::echo".to_owned(),
+                workflow_type: wf_name.to_owned(),
+                is_local: false,
+                input: Some(input.clone()),
+                output: None,
+                status: None,
+            },
+            ActivityInterceptorRecord {
+                interceptor: "inner",
+                phase: ActivityInterceptorPhase::Before,
+                activity_type: "StdActivities::echo".to_owned(),
+                workflow_type: wf_name.to_owned(),
+                is_local: false,
+                input: Some(input.clone()),
+                output: None,
+                status: None,
+            },
+            ActivityInterceptorRecord {
+                interceptor: "inner",
+                phase: ActivityInterceptorPhase::After,
+                activity_type: "StdActivities::echo".to_owned(),
+                workflow_type: wf_name.to_owned(),
+                is_local: false,
+                input: None,
+                output: Some(input.clone()),
+                status: Some("completed"),
+            },
+            ActivityInterceptorRecord {
+                interceptor: "outer",
+                phase: ActivityInterceptorPhase::After,
+                activity_type: "StdActivities::echo".to_owned(),
+                workflow_type: wf_name.to_owned(),
+                is_local: false,
+                input: None,
+                output: Some(input.clone()),
+                status: Some("completed"),
+            },
+        ]
+    );
+}
+
+#[tokio::test]
+async fn activity_interceptor_wraps_local_activity_execution() {
+    let wf_name = OneLocalActivityWorkflow::name();
+    let mut starter = CoreWfStarter::new("activity_interceptor_wraps_local_activity_execution");
+    starter.sdk_config.register_activities(StdActivities);
+    starter
+        .sdk_config
+        .register_workflow::<OneLocalActivityWorkflow>();
+    let mut worker = starter.worker().await;
+
+    let records = Arc::new(ActivityInterceptorRecords::default());
+    worker
+        .inner_mut()
+        .add_activity_inbound_interceptor(RecordingActivityInboundInterceptor {
+            interceptor: "local",
+            records: records.clone(),
+        });
+
+    let input = "hello from local input!".to_string();
+    let task_queue = starter.get_task_queue().to_owned();
+    let handle = worker
+        .submit_workflow(
+            OneLocalActivityWorkflow::run,
+            input.clone(),
+            WorkflowStartOptions::new(task_queue.clone(), task_queue).build(),
+        )
+        .await
+        .unwrap();
+    worker.run_until_done().await.unwrap();
+    let r = handle.get_result(Default::default()).await.unwrap();
+    assert_eq!(r, input);
+
+    assert_eq!(
+        records.records.lock().unwrap().as_slice(),
+        &[
+            ActivityInterceptorRecord {
+                interceptor: "local",
+                phase: ActivityInterceptorPhase::Before,
+                activity_type: "StdActivities::echo".to_owned(),
+                workflow_type: wf_name.to_owned(),
+                is_local: true,
+                input: Some(input.clone()),
+                output: None,
+                status: None,
+            },
+            ActivityInterceptorRecord {
+                interceptor: "local",
+                phase: ActivityInterceptorPhase::After,
+                activity_type: "StdActivities::echo".to_owned(),
+                workflow_type: wf_name.to_owned(),
+                is_local: true,
+                input: None,
+                output: Some(input.clone()),
+                status: Some("completed"),
+            },
+        ]
+    );
+}
+
+struct MutatingActivityInboundInterceptor;
+
+impl ActivityInboundInterceptor for MutatingActivityInboundInterceptor {
+    fn execute_activity<'a>(
+        &'a self,
+        mut input: ExecuteActivityInput,
+        next: Next<'a, ExecuteActivityInput, ExecuteActivityOutput<'a>>,
+    ) -> ExecuteActivityOutput<'a> {
+        if let Some(input) = input.args_mut::<String>() {
+            input.push_str(" mutated");
+        }
+        next.run(input)
+    }
+}
+
+#[tokio::test]
+async fn activity_inbound_interceptor_can_mutate_activity_input() {
+    let mut starter = CoreWfStarter::new("activity_inbound_interceptor_can_mutate_activity_input");
+    starter.sdk_config.register_activities(StdActivities);
+    starter
+        .sdk_config
+        .register_workflow::<OneActivityWorkflow>();
+    let mut worker = starter.worker().await;
+
+    worker
+        .inner_mut()
+        .add_activity_inbound_interceptor(MutatingActivityInboundInterceptor);
+
+    let input = "hello from input!".to_string();
+    let task_queue = starter.get_task_queue().to_owned();
+    let handle = worker
+        .submit_workflow(
+            OneActivityWorkflow::run,
+            input,
+            WorkflowStartOptions::new(task_queue.clone(), task_queue).build(),
+        )
+        .await
+        .unwrap();
+    worker.run_until_done().await.unwrap();
+    let r = handle.get_result(Default::default()).await.unwrap();
+    assert_eq!(r, "hello from input! mutated");
+}
+
+#[tokio::test]
+async fn activity_interceptor_observes_activity_error() {
+    struct FailingActivities;
+
+    #[activities]
+    impl FailingActivities {
+        #[activity]
+        async fn fail(_ctx: ActivityContext, input: String) -> Result<String, ActivityError> {
+            Err(anyhow!("failed input: {input}").into())
+        }
+    }
+
+    #[workflow]
+    #[derive(Default)]
+    struct ActivityFailureWorkflow;
+
+    #[workflow_methods]
+    impl ActivityFailureWorkflow {
+        #[run]
+        async fn run(ctx: &mut WorkflowContext<Self>, input: String) -> WorkflowResult<()> {
+            let result: Result<String, ActivityExecutionError> = ctx
+                .start_activity(
+                    FailingActivities::fail,
+                    input,
+                    ActivityOptions::with_start_to_close_timeout(Duration::from_secs(5))
+                        .retry_policy(RetryPolicy {
+                            maximum_attempts: 1,
+                            ..Default::default()
+                        })
+                        .build(),
+                )
+                .await;
+            assert!(result.is_err());
+            Ok(())
+        }
+    }
+
+    let wf_name = ActivityFailureWorkflow::name();
+    let mut starter = CoreWfStarter::new("activity_interceptor_observes_activity_error");
+    starter.sdk_config.register_activities(FailingActivities);
+    starter
+        .sdk_config
+        .register_workflow::<ActivityFailureWorkflow>();
+    let mut worker = starter.worker().await;
+
+    let records = Arc::new(ActivityInterceptorRecords::default());
+    worker
+        .inner_mut()
+        .add_activity_inbound_interceptor(RecordingActivityInboundInterceptor {
+            interceptor: "failure",
+            records: records.clone(),
+        });
+
+    let input = "bad input".to_string();
+    let task_queue = starter.get_task_queue().to_owned();
+    let handle = worker
+        .submit_workflow(
+            ActivityFailureWorkflow::run,
+            input.clone(),
+            WorkflowStartOptions::new(task_queue.clone(), task_queue).build(),
+        )
+        .await
+        .unwrap();
+    worker.run_until_done().await.unwrap();
+    handle.get_result(Default::default()).await.unwrap();
+
+    assert_eq!(
+        records.records.lock().unwrap().as_slice(),
+        &[
+            ActivityInterceptorRecord {
+                interceptor: "failure",
+                phase: ActivityInterceptorPhase::Before,
+                activity_type: "FailingActivities::fail".to_owned(),
+                workflow_type: wf_name.to_owned(),
+                is_local: false,
+                input: Some(input),
+                output: None,
+                status: None,
+            },
+            ActivityInterceptorRecord {
+                interceptor: "failure",
+                phase: ActivityInterceptorPhase::After,
+                activity_type: "FailingActivities::fail".to_owned(),
+                workflow_type: wf_name.to_owned(),
+                is_local: false,
+                input: None,
+                output: None,
+                status: Some("failed"),
+            },
+        ]
+    );
+}
+
+#[tokio::test]
+async fn activity_interceptor_observes_activity_panic() {
+    struct PanickingActivities;
+
+    #[activities]
+    impl PanickingActivities {
+        #[activity]
+        async fn panic_activity(
+            _ctx: ActivityContext,
+            input: String,
+        ) -> Result<String, ActivityError> {
+            panic!("panic input: {input}");
+        }
+    }
+
+    #[workflow]
+    #[derive(Default)]
+    struct ActivityPanicWorkflow;
+
+    #[workflow_methods]
+    impl ActivityPanicWorkflow {
+        #[run]
+        async fn run(ctx: &mut WorkflowContext<Self>, input: String) -> WorkflowResult<()> {
+            let result: Result<String, ActivityExecutionError> = ctx
+                .start_activity(
+                    PanickingActivities::panic_activity,
+                    input,
+                    ActivityOptions::with_start_to_close_timeout(Duration::from_secs(5))
+                        .retry_policy(RetryPolicy {
+                            maximum_attempts: 1,
+                            ..Default::default()
+                        })
+                        .build(),
+                )
+                .await;
+            assert!(result.is_err());
+            Ok(())
+        }
+    }
+
+    let wf_name = ActivityPanicWorkflow::name();
+    let mut starter = CoreWfStarter::new("activity_interceptor_observes_activity_panic");
+    starter.sdk_config.register_activities(PanickingActivities);
+    starter
+        .sdk_config
+        .register_workflow::<ActivityPanicWorkflow>();
+    let mut worker = starter.worker().await;
+
+    let records = Arc::new(ActivityInterceptorRecords::default());
+    worker
+        .inner_mut()
+        .add_activity_inbound_interceptor(RecordingActivityInboundInterceptor {
+            interceptor: "panic",
+            records: records.clone(),
+        });
+
+    let input = "panic input".to_string();
+    let task_queue = starter.get_task_queue().to_owned();
+    let handle = worker
+        .submit_workflow(
+            ActivityPanicWorkflow::run,
+            input.clone(),
+            WorkflowStartOptions::new(task_queue.clone(), task_queue).build(),
+        )
+        .await
+        .unwrap();
+    worker.run_until_done().await.unwrap();
+    handle.get_result(Default::default()).await.unwrap();
+
+    assert_eq!(
+        records.records.lock().unwrap().as_slice(),
+        &[
+            ActivityInterceptorRecord {
+                interceptor: "panic",
+                phase: ActivityInterceptorPhase::Before,
+                activity_type: "PanickingActivities::panic_activity".to_owned(),
+                workflow_type: wf_name.to_owned(),
+                is_local: false,
+                input: Some(input),
+                output: None,
+                status: None,
+            },
+            ActivityInterceptorRecord {
+                interceptor: "panic",
+                phase: ActivityInterceptorPhase::After,
+                activity_type: "PanickingActivities::panic_activity".to_owned(),
+                workflow_type: wf_name.to_owned(),
+                is_local: false,
+                input: None,
+                output: None,
+                status: Some("failed"),
+            },
+        ]
+    );
 }
 
 #[tokio::test]
