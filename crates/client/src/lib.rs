@@ -1509,9 +1509,9 @@ mod tests {
     mod tls_custom_verifier_tests {
         use super::*;
         use tokio_rustls::rustls::{
+            DigitallySignedStruct, Error as RustlsError, SignatureScheme,
             client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier},
             pki_types::{CertificateDer, ServerName, UnixTime},
-            DigitallySignedStruct, Error as RustlsError, SignatureScheme,
         };
 
         /// A minimal mock verifier for testing. In production, users would
