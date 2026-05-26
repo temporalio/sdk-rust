@@ -193,6 +193,30 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo integ-test
 
+  wasm-workflow-tests:
+    name: WASM workflow tests
+    timeout-minutes: ${{ github.ref == 'refs/heads/main' && 30 || 25 }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+      - name: Install WASM Rust targets
+        # Install after checkout so rustup uses this repo's rust-toolchain.toml override.
+        run: rustup target add wasm32-unknown-unknown wasm32-wasip1
+      - name: Install protoc
+        uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3
+        with:
+          # TODO: Upgrade proto once https://github.com/arduino/setup-protoc/issues/99 is fixed
+          version: "23.x"
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+          key: wasm-workflow-tests
+      - name: Install cargo-component
+        run: cargo install --locked cargo-component
+      - run: cargo integ-test -t wasm_workflow_tests
+
   cloud-tests:
     if: github.event.pull_request.head.repo.full_name == '' || github.event.pull_request.head.repo.full_name == 'temporalio/sdk-rust'
     name: Cloud tests
@@ -275,15 +299,7 @@ jobs:
           temporal operator search-attribute create --name CustomKeywordField --type Keyword
           temporal operator search-attribute create --name CustomIntField --type Int
       - name: Run examples
-        run: |
-          for dir in crates/sdk/examples/*/; do
-            sample="$(basename "$dir" | tr '_' '-')"
-            cargo run -p temporalio-sdk --features examples --example "${sample}-worker" &
-            WORKER_PID=$!
-            timeout 20 cargo run -p temporalio-sdk --features examples --example "${sample}-starter"
-            kill $WORKER_PID 2>/dev/null || true
-            wait $WORKER_PID 2>/dev/null || true
-          done
+        run: bash ./etc/run-sdk-examples.sh
 
   c-bridge-static-link-test:
     name: "C bridge static link test"

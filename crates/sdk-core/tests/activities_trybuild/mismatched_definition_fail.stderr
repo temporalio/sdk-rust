@@ -1,0 +1,12 @@
+error[E0277]: the trait bound `i32: ActivityImplMustMatchDefinition<std::string::String>` is not satisfied
+  --> tests/activities_trybuild/mismatched_definition_fail.rs:16:1
+   |
+16 | #[activities]
+   | ^^^^^^^^^^^^^ the trait `ActivityImplMustMatchDefinition<std::string::String>` is not implemented for `i32`
+   |
+note: required by a bound in `assert_input_matches_definition`
+  --> tests/activities_trybuild/mismatched_definition_fail.rs:16:1
+   |
+16 | #[activities]
+   | ^^^^^^^^^^^^^ required by this bound in `assert_input_matches_definition`
+   = note: this error originates in the attribute macro `activities` (in Nightly builds, run with -Z macro-backtrace for more info)

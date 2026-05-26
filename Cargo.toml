@@ -3,8 +3,11 @@ members = [
     "crates/sdk-core",
     "crates/client",
     "crates/common",
+    "crates/common-wasm",
+    "crates/protos",
     "crates/macros",
     "crates/sdk",
+    "crates/workflow",
     "crates/sdk-core-c-bridge",
 ]
 resolver = "2"

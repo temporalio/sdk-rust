@@ -21,8 +21,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let client = Client::new(connection, client_opts)?;
 
     let worker_options = WorkerOptions::new("child-workflows")
-        .register_workflow::<ParentWorkflow>()
-        .register_workflow::<GreetingChildWorkflow>()
+        .register_workflow::<ParentWorkflow>()?
+        .register_workflow::<GreetingChildWorkflow>()?
         .task_types(WorkerTaskTypes::workflow_only())
         .build();
 

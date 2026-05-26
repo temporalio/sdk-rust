@@ -290,7 +290,9 @@ async fn small_workflow_slots_and_pollers(#[values(false, true)] use_autoscaling
     starter.sdk_config.register_activities(StdActivities);
     let mut worker = starter.worker().await;
 
-    worker.register_workflow::<OnlyOneWorkflowSlotAndTwoPollers>();
+    worker
+        .register_workflow::<OnlyOneWorkflowSlotAndTwoPollers>()
+        .unwrap();
     let task_queue = starter.get_task_queue().to_owned();
     worker
         .submit_workflow(

@@ -123,7 +123,7 @@ zip = { version = "8.4", optional = true, default-features = false, features = [
 path = "../common"
 version = "0.4"
 default-features = false
-features = ["core-telemetry-bridge"]
+features = ["core-telemetry-bridge", "serde_serialize"]
 
 [dependencies.temporalio-client]
 path = "../client"
@@ -152,8 +152,9 @@ hyper-util = { version = "0.1", features = [
 ] }
 rstest = "0.26"
 semver = "1.0"
-temporalio-sdk = { path = "../sdk" }
+temporalio-sdk = { path = "../sdk", features = ["wasm-workflows"] }
 temporalio-common = { path = "../common", version = "0.4", default-features = false }
+temporalio-workflow = { path = "../workflow" }
 tokio = { version = "1.47", default-features = false, features = [
   "rt",
   "rt-multi-thread",
@@ -197,6 +198,20 @@ name = "manual_tests"
 path = "tests/manual_tests.rs"
 test = false
 required-features = ["test-utilities"]
+
+[[test]]
+name = "wasm_workflow_tests"
+path = "tests/wasm_workflow_tests.rs"
+# Prevents autodiscovery, and hence these getting run with `cargo test`. Run with
+# `cargo integ-test -t wasm_workflow_tests`. Building these requires `cargo component` plus both
+# `wasm32-unknown-unknown` and `wasm32-wasip1`; cargo-component still validates the WASIp1 target
+# even when this sample is built with an explicit unknown-unknown target.
+test = false
+required-features = [
+  "temporalio-common/serde_serialize",
+  "test-utilities",
+  "ephemeral-server",
+]
 
 [[test]]
 name = "global_metric_tests"

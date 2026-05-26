@@ -7,7 +7,7 @@
 //!     Arc,
 //!     atomic::{AtomicUsize, Ordering},
 //! };
-//! use temporalio_macros::activities;
+//! use temporalio_macros::{activities, activity_definitions};
 //! use temporalio_sdk::activities::{ActivityContext, ActivityError};
 //!
 //! struct MyActivities {
@@ -29,13 +29,15 @@
 //! }
 //!
 //! // If you need to refer to an activity that is defined externally, in a different codebase or
-//! // possibly a differenet language, you can simply leave the function body unimplemented like so:
+//! // possibly a different language, use `#[activity_definitions]`. Methods must omit the
+//! // `ActivityContext` parameter and have a body of `unimplemented!()`. Workflows can then call
+//! // these definitions just like real activities.
 //!
 //! struct ExternalActivities;
-//! #[activities]
+//! #[activity_definitions]
 //! impl ExternalActivities {
 //!     #[activity(name = "foo")]
-//!     async fn foo(_ctx: ActivityContext, _: String) -> Result<String, ActivityError> {
+//!     fn foo(_: String) -> Result<String, ActivityError> {
 //!         unimplemented!()
 //!     }
 //! }
@@ -68,12 +70,13 @@ use std::{
     time::{Duration as StdDuration, SystemTime},
 };
 use temporalio_client::Priority;
+pub use temporalio_common::ActivityError;
 use temporalio_common::{
     ActivityDefinition,
     data_converters::{
         DataConverter, GenericPayloadConverter, SerializationContext, SerializationContextData,
     },
-    error::{ApplicationFailure, FailurePayloads},
+    error::ApplicationFailure,
     protos::{
         coresdk::{ActivityHeartbeat, activity_result::ActivityExecutionResult, activity_task},
         temporal::api::common::v1::{Payload, RetryPolicy, WorkflowExecution},
@@ -241,56 +244,6 @@ pub struct ActivityInfo {
     pub priority: Priority,
     /// Run ID of this activity execution. Only set for standalone activities.
     pub run_id: Option<String>,
-}
-
-/// Returned as errors from activity functions.
-#[derive(Debug)]
-pub enum ActivityError {
-    /// Return this error to attach application-failure metadata to an activity failure.
-    Application(Box<ApplicationFailure>),
-    /// Return this error to indicate your activity is cancelling
-    Cancelled {
-        /// Optional cancellation details.
-        details: Option<FailurePayloads>,
-    },
-    /// Return this error to indicate that the activity will be completed outside of this activity
-    /// definition, by an external client.
-    WillCompleteAsync,
-}
-
-impl ActivityError {
-    /// Construct a cancelled error without details
-    pub fn cancelled() -> Self {
-        Self::Cancelled { details: None }
-    }
-
-    /// Construct a cancelled error with details that will be converted using the active data
-    /// converter.
-    pub fn cancelled_with_details<T>(details: T) -> Self
-    where
-        T: Into<FailurePayloads>,
-    {
-        Self::Cancelled {
-            details: Some(details.into()),
-        }
-    }
-
-    /// Construct an application activity error.
-    pub fn application(err: ApplicationFailure) -> Self {
-        Self::Application(err.into())
-    }
-}
-
-impl<E> From<E> for ActivityError
-where
-    E: Into<anyhow::Error>,
-{
-    fn from(source: E) -> Self {
-        match source.into().downcast::<ApplicationFailure>() {
-            Ok(application_failure) => Self::Application(Box::new(application_failure)),
-            Err(err) => Self::Application(ApplicationFailure::new(err).into()),
-        }
-    }
 }
 
 /// Deadline calculation.  This is a port of
@@ -532,6 +485,7 @@ impl Debug for ActivityDefinitions {
 mod test {
     use super::*;
     use rstest::rstest;
+    use temporalio_common::error::ApplicationFailure;
 
     #[rstest]
     #[case(true)]

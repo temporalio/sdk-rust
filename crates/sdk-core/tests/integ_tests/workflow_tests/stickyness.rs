@@ -7,7 +7,7 @@ use std::{
     time::Duration,
 };
 use temporalio_client::WorkflowStartOptions;
-use temporalio_common::worker::WorkerTaskTypes;
+use temporalio_common::{protos::temporal::api::enums::v1::EventType, worker::WorkerTaskTypes};
 use temporalio_macros::{workflow, workflow_methods};
 use temporalio_sdk::{WorkflowContext, WorkflowResult};
 use temporalio_sdk_core::{PollerBehavior, TunerHolder};
@@ -20,7 +20,7 @@ async fn timer_workflow_not_sticky() {
     starter.sdk_config.task_types = WorkerTaskTypes::workflow_only();
     starter.sdk_config.max_cached_workflows = 0_usize;
     let mut worker = starter.worker().await;
-    worker.register_workflow::<TimerWf>();
+    worker.register_workflow::<TimerWf>().unwrap();
 
     let task_queue = starter.get_task_queue().to_owned();
     let workflow_id = starter.get_task_queue().to_owned();
@@ -69,10 +69,12 @@ async fn timer_workflow_timeout_on_sticky() {
     let timed_out_once = Arc::new(AtomicBool::new(false));
     let run_ct = Arc::new(AtomicUsize::new(0));
     let run_ct_clone = run_ct.clone();
-    worker.register_workflow_with_factory(move || TimerTimeoutWf {
-        timed_out_once: timed_out_once.clone(),
-        run_ct: run_ct_clone.clone(),
-    });
+    worker
+        .register_workflow_with_factory(move || TimerTimeoutWf {
+            timed_out_once: timed_out_once.clone(),
+            run_ct: run_ct_clone.clone(),
+        })
+        .unwrap();
 
     worker
         .submit_workflow(TimerTimeoutWf::run, (), starter.workflow_options.clone())
@@ -81,6 +83,24 @@ async fn timer_workflow_timeout_on_sticky() {
     worker.run_until_done().await.unwrap();
     // If it didn't run twice it didn't time out
     assert_eq!(run_ct.load(Ordering::SeqCst), 2);
+
+    // `force_task_fail` happens after creating the timer, so the workflow StartTimer command
+    // buffered when the task fails. The failure path should evict the workflow and drop that host
+    // before replay retries the task. If the old buffer survived, the retry would send the stale
+    // StartTimer along with the new one.
+    let history = starter.get_history().await;
+    let timer_started_count = history
+        .events
+        .iter()
+        .filter(|event| event.event_type() == EventType::TimerStarted)
+        .count();
+    let wft_failed_count = history
+        .events
+        .iter()
+        .filter(|event| event.event_type() == EventType::WorkflowTaskFailed)
+        .count();
+    assert_eq!(wft_failed_count, 1);
+    assert_eq!(timer_started_count, 1);
 }
 
 #[workflow]
@@ -110,9 +130,11 @@ async fn cache_miss_ok() {
 
     let barr = Arc::new(Barrier::new(2));
     let barr_clone = barr.clone();
-    worker.register_workflow_with_factory(move || CacheMissWf {
-        barr: barr_clone.clone(),
-    });
+    worker
+        .register_workflow_with_factory(move || CacheMissWf {
+            barr: barr_clone.clone(),
+        })
+        .unwrap();
 
     let task_queue = starter.get_task_queue().to_owned();
     let handle = worker
