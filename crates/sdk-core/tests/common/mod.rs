@@ -54,13 +54,13 @@ use temporalio_common::{
     worker::{WorkerDeploymentOptions, WorkerDeploymentVersion, WorkerTaskTypes},
 };
 use temporalio_sdk::{
-    Worker, WorkerOptions,
+    Worker, WorkerOptions, WorkflowRegistrationError,
     activities::ActivityImplementer,
     interceptors::{
         FailOnNondeterminismInterceptor, InterceptorWithNext, ReturnWorkflowExitValueInterceptor,
         WorkerInterceptor,
     },
-    workflows::{WorkflowImplementation, WorkflowImplementer},
+    workflows::WorkflowImplementation,
 };
 #[cfg(any(feature = "test-utilities", test))]
 pub(crate) use temporalio_sdk_core::test_help::NAMESPACE;
@@ -347,13 +347,12 @@ impl CoreWfStarter {
     pub(crate) async fn worker(&mut self) -> TestWorker {
         let worker = self.get_worker().await;
         let client = self.get_client().await;
-        let mut sdk = Worker::new_from_core_definitions(
+        let sdk = Worker::new_from_core_options(
             worker,
             client.data_converter().clone(),
-            self.sdk_config.activities(),
-            self.sdk_config.workflows(),
-        );
-        sdk.set_detect_nondeterministic_futures(self.sdk_config.detect_nondeterministic_futures);
+            self.sdk_config.clone(),
+        )
+        .expect("SDK worker should initialize from core worker and options");
         let mut w = TestWorker::new(sdk);
         w.client = Some(client);
 
@@ -537,19 +536,26 @@ impl TestWorker {
     }
 
     #[allow(unused)]
-    pub(crate) fn register_workflow<WI: WorkflowImplementer>(&mut self) -> &mut Self {
-        self.inner.register_workflow::<WI>();
-        self
+    pub(crate) fn register_workflow<W>(&mut self) -> Result<&mut Self, WorkflowRegistrationError>
+    where
+        W: WorkflowImplementation,
+        <W::Run as WorkflowDefinition>::Input: Send,
+    {
+        self.inner.register_workflow::<W>()?;
+        Ok(self)
     }
 
-    pub(crate) fn register_workflow_with_factory<W, F>(&mut self, factory: F) -> &mut Self
+    pub(crate) fn register_workflow_with_factory<W, F>(
+        &mut self,
+        factory: F,
+    ) -> Result<&mut Self, WorkflowRegistrationError>
     where
         W: WorkflowImplementation,
         <W::Run as WorkflowDefinition>::Input: Send,
         F: Fn() -> W + Send + Sync + 'static,
     {
-        self.inner.register_workflow_with_factory::<W, F>(factory);
-        self
+        self.inner.register_workflow_with_factory::<W, F>(factory)?;
+        Ok(self)
     }
 
     /// Create a handle that can be used to submit workflows. Useful when workflows need to be

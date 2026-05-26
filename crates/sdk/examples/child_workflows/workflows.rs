@@ -29,7 +29,7 @@ impl ParentWorkflow {
 
         for (i, name) in names.iter().enumerate() {
             let started = ctx
-                .child_workflow(
+                .start_child_workflow(
                     GreetingChildWorkflow::run,
                     name.clone(),
                     ChildWorkflowOptions {

@@ -65,7 +65,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let client = Client::new(connection, client_opts)?;
 
     let worker_options = WorkerOptions::new("activity-interceptor")
-        .register_workflow::<ActivityInterceptorWorkflow>()
+        .register_workflow::<ActivityInterceptorWorkflow>()?
         .register_activities(GreetingActivities)
         .build();
 

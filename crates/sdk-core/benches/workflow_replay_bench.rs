@@ -36,7 +36,9 @@ pub fn criterion_benchmark(c: &mut Criterion) {
         b.to_async(&tokio_runtime).iter_batched(
             || replay_sdk_worker([hist.clone()]),
             |mut worker| async move {
-                worker.register_workflow_with_factory(move || TimersWf { num_timers });
+                worker
+                    .register_workflow_with_factory(move || TimersWf { num_timers })
+                    .unwrap();
                 worker.run().await.unwrap();
             },
             BatchSize::SmallInput,
@@ -51,10 +53,12 @@ pub fn criterion_benchmark(c: &mut Criterion) {
         b.to_async(&tokio_runtime).iter_batched(
             || replay_sdk_worker([hist.clone()]),
             |mut worker| async move {
-                worker.register_workflow_with_factory(move || BigSignalsWf {
-                    num_tasks,
-                    signal_count: 0,
-                });
+                worker
+                    .register_workflow_with_factory(move || BigSignalsWf {
+                        num_tasks,
+                        signal_count: 0,
+                    })
+                    .unwrap();
                 worker.run().await.unwrap();
             },
             BatchSize::SmallInput,

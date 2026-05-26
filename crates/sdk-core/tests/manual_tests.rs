@@ -152,7 +152,7 @@ async fn poller_load_spiky() {
     let submitter = worker.get_submitter_handle();
 
     worker.register_activities(JitteryEchoActivities);
-    worker.register_workflow::<PollerLoadSpikyWf>();
+    worker.register_workflow::<PollerLoadSpikyWf>().unwrap();
     let client = starter.get_client().await;
     let tq = starter.get_task_queue().to_owned();
 
@@ -287,7 +287,7 @@ async fn poller_load_sustained() {
     };
     starter.sdk_config.task_types = WorkerTaskTypes::workflow_only();
     let mut worker = starter.worker().await;
-    worker.register_workflow::<PollerLoadSustainedWf>();
+    worker.register_workflow::<PollerLoadSustainedWf>().unwrap();
     let client = starter.get_client().await;
     let tq = starter.get_task_queue().to_owned();
 
@@ -369,7 +369,9 @@ async fn poller_load_spike_then_sustained() {
     let submitter = worker.get_submitter_handle();
 
     worker.register_activities(JitteryEchoActivities);
-    worker.register_workflow::<PollerLoadSpikeThenSustainedWf>();
+    worker
+        .register_workflow::<PollerLoadSpikeThenSustainedWf>()
+        .unwrap();
     let client = starter.get_client().await;
     let tq = starter.get_task_queue().to_owned();
 
