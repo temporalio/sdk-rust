@@ -31,6 +31,7 @@ See each example's README for details and expected output.
 
 - [Hello World](hello_world/) — Basic workflow that calls a single activity
 - [Activity Heartbeating](activity_heartbeating/) — Long-running activity with heartbeating and resume-on-retry
+- [Activity Inbound Interceptor](activity_interceptor/) — Wrapping inbound activity execution and inspecting typed inputs/outputs
 - [Timer Examples](timer_examples/) — Workflow timers, racing timers against activities, and timer cancellation
 - [Message Passing](message_passing/) — Signals, queries, and updates on a workflow
 - [Child Workflows](child_workflows/) — Starting and collecting results from child workflows

@@ -1,11 +1,4 @@
-# Temporal Core SDK
-
-Core SDK that can be used as a base for other Temporal SDKs. It is currently used as the base of:
-
-- [TypeScript SDK](https://github.com/temporalio/sdk-typescript/)
-- [Python SDK](https://github.com/temporalio/sdk-python/)
-- [.NET SDK](https://github.com/temporalio/sdk-dotnet/)
-- [Ruby SDK](https://github.com/temporalio/sdk-ruby/)
+![Temporal Rust SDK](https://raw.githubusercontent.com/temporalio/assets/main/files/w/rust.png)
 
 # Temporal Rust SDK
 
@@ -21,9 +14,18 @@ Currently in Public Preview, see more in the [SDK README.md](crates/sdk/README.m
 
 Currently in Public Preview, see more in the [client README.md](crates/client/README.md)
 
+# Temporal Core SDK
+
+Core SDK that can be used as a base for other Temporal SDKs. It is currently used as the base of:
+
+- [TypeScript SDK](https://github.com/temporalio/sdk-typescript/)
+- [Python SDK](https://github.com/temporalio/sdk-python/)
+- [.NET SDK](https://github.com/temporalio/sdk-dotnet/)
+- [Ruby SDK](https://github.com/temporalio/sdk-ruby/)
+
 # Documentation
 
-Core SDK documentation can be generated with `cargo doc`, output will be placed in the
+Rust & Core SDK documentation can be generated with `cargo doc`, output will be placed in the
 `target/doc` directory.
 
 [Architecture](ARCHITECTURE.md) doc provides some high-level information about how Core SDK works

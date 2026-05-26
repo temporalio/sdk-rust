@@ -56,8 +56,7 @@
 ///
 /// ```no_run
 /// use std::time::Duration;
-/// use temporalio_sdk::workflows::select;
-/// use temporalio_sdk::WorkflowContext;
+/// use temporalio_sdk::{WorkflowContext, workflows::select};
 ///
 /// # async fn hidden(ctx: &mut WorkflowContext<()>) {
 /// select! {
