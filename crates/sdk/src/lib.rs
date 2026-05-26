@@ -472,6 +472,44 @@ struct ActivityHalf {
     task_tokens_to_cancels: HashMap<TaskToken, CancellationToken>,
 }
 
+#[derive(Debug, thiserror::Error)]
+enum ActivityTaskHandlerError {
+    #[error("{source}")]
+    UnregisteredActivity {
+        source: ActivityNotRegisteredError,
+        task_token: Vec<u8>,
+    },
+    #[error(transparent)]
+    Fatal(#[from] anyhow::Error),
+}
+
+#[derive(Debug, thiserror::Error)]
+enum ActivityNotRegisteredError {
+    #[error(
+        "Activity {activity_type} is not registered on this worker, available activities: {}",
+        .available_activities.join(", ")
+    )]
+    HasAvailable {
+        activity_type: String,
+        available_activities: Vec<&'static str>,
+    },
+    #[error("Activity {activity_type} is not registered on this worker, no available activities.")]
+    NoAvailable { activity_type: String },
+}
+
+impl ActivityNotRegisteredError {
+    fn new(activity_type: String, available_activities: Vec<&'static str>) -> Self {
+        if available_activities.is_empty() {
+            Self::NoAvailable { activity_type }
+        } else {
+            Self::HasAvailable {
+                activity_type,
+                available_activities,
+            }
+        }
+    }
+}
+
 impl Worker {
     /// Create a new worker from an existing client, and options.
     pub fn new(
@@ -749,13 +787,41 @@ impl Worker {
                             &SerializationContextData::Activity,
                         )
                         .await;
-                        act_half.activity_task_handler(
+                        match act_half.activity_task_handler(
                             common.worker.clone(),
                             common.task_queue.clone(),
                             common.data_converter.clone(),
                             common.activity_inbound_interceptors.clone(),
                             activity,
-                        )?;
+                        ) {
+                            Ok(()) => {}
+                            Err(ActivityTaskHandlerError::UnregisteredActivity {
+                                source,
+                                task_token,
+                            }) => {
+                                let failure = common.data_converter.to_failure(
+                                    &SerializationContextData::Activity,
+                                    OutgoingError::Activity(OutgoingActivityError::Application(
+                                        ApplicationFailure::builder(source)
+                                            .type_name("NotFoundError".to_owned())
+                                            .build()
+                                            .into(),
+                                    )),
+                                );
+                                let mut completion = ActivityTaskCompletion {
+                                    task_token,
+                                    result: Some(ActivityExecutionResult::fail(failure)),
+                                };
+                                encode_payloads(
+                                    &mut completion,
+                                    common.data_converter.codec(),
+                                    &SerializationContextData::Activity,
+                                )
+                                .await;
+                                common.worker.complete_activity_task(completion).await?;
+                            }
+                            Err(ActivityTaskHandlerError::Fatal(err)) => return Err(err),
+                        };
                     }
                 };
                 Result::<_, anyhow::Error>::Ok(())
@@ -952,15 +1018,18 @@ impl ActivityHalf {
         data_converter: DataConverter,
         activity_inbound_interceptors: Vec<Arc<dyn ActivityInboundInterceptor>>,
         activity: ActivityTask,
-    ) -> Result<(), anyhow::Error> {
+    ) -> Result<(), ActivityTaskHandlerError> {
         match activity.variant {
             Some(activity_task::Variant::Start(start)) => {
-                let act_fn = self.activities.get(&start.activity_type).ok_or_else(|| {
-                    anyhow!(
-                        "No function registered for activity type {}",
-                        start.activity_type
-                    )
-                })?;
+                let Some(act_fn) = self.activities.get(&start.activity_type) else {
+                    let activity_type = start.activity_type.clone();
+                    let source =
+                        ActivityNotRegisteredError::new(activity_type, self.activities.names());
+                    return Err(ActivityTaskHandlerError::UnregisteredActivity {
+                        source,
+                        task_token: activity.task_token,
+                    });
+                };
                 let span = info_span!(
                     "RunActivity",
                     "otel.name" = format!("RunActivity:{}", start.activity_type),
@@ -1029,7 +1098,9 @@ impl ActivityHalf {
                     ct.cancel();
                 }
             }
-            None => bail!("Undefined activity task variant"),
+            None => {
+                return Err(anyhow!("Undefined activity task variant").into());
+            }
         }
         Ok(())
     }

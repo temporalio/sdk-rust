@@ -411,6 +411,12 @@ impl ActivityDefinitions {
     pub(crate) fn get(&self, act_type: &str) -> Option<ActivityInvocation> {
         self.activities.get(act_type).cloned()
     }
+
+    pub(crate) fn names(&self) -> Vec<&'static str> {
+        let mut names: Vec<_> = self.activities.keys().copied().collect();
+        names.sort_unstable();
+        names
+    }
 }
 
 fn activity_inbound_base<'a, AD>(

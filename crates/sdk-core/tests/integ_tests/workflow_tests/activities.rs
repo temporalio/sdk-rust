@@ -701,6 +701,86 @@ async fn activity_panics_are_retryable() {
 }
 
 #[tokio::test]
+async fn unregistered_activity_type_fails_activity_task_not_worker() {
+    const MISSING_ACTIVITY_TYPE: &str = "missing_activity";
+
+    struct MissingActivities;
+
+    #[activities]
+    impl MissingActivities {
+        #[activity(name = MISSING_ACTIVITY_TYPE)]
+        async fn missing(_ctx: ActivityContext) -> Result<(), ActivityError> {
+            Ok(())
+        }
+    }
+
+    #[workflow]
+    #[derive(Default)]
+    struct MissingActivityWorkflow;
+
+    #[workflow_methods]
+    impl MissingActivityWorkflow {
+        #[run]
+        async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<Option<(String, String)>> {
+            let result = ctx
+                .start_activity(
+                    MissingActivities::missing,
+                    (),
+                    ActivityOptions::with_start_to_close_timeout(Duration::from_secs(5))
+                        .retry_policy(RetryPolicy {
+                            maximum_attempts: 1,
+                            ..Default::default()
+                        })
+                        .build(),
+                )
+                .await;
+            let Err(ActivityExecutionError::Failed(failure)) = result else {
+                return Ok(None);
+            };
+            let Some(IncomingError::Application(app_failure)) = failure.cause() else {
+                return Ok(None);
+            };
+            Ok(Some((
+                app_failure.to_string(),
+                app_failure.type_name().unwrap_or_default().to_string(),
+            )))
+        }
+    }
+
+    let wf_name = MissingActivityWorkflow::name();
+    let mut starter = CoreWfStarter::new(wf_name);
+    starter.sdk_config.register_activities(StdActivities);
+    starter
+        .sdk_config
+        .register_workflow::<MissingActivityWorkflow>();
+    let mut worker = starter.worker().await;
+
+    let task_queue = starter.get_task_queue().to_owned();
+    let handle = worker
+        .submit_workflow(
+            MissingActivityWorkflow::run,
+            (),
+            WorkflowStartOptions::new(task_queue.clone(), task_queue).build(),
+        )
+        .await
+        .unwrap();
+
+    worker.run_until_done().await.unwrap();
+    let (message, error_type) = handle
+        .get_result(Default::default())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(error_type, "NotFoundError");
+    assert_eq!(
+        message,
+        format!(
+            "Activity {MISSING_ACTIVITY_TYPE} is not registered on this worker, available activities: StdActivities::always_fail, StdActivities::concat, StdActivities::echo, StdActivities::no_op, default_act_type, delay",
+        ),
+    );
+}
+
+#[tokio::test]
 async fn activity_workflow() {
     let mut starter = init_core_and_create_wf("activity_workflow").await;
     let core = starter.get_worker().await;
