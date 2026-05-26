@@ -752,7 +752,8 @@ async fn unregistered_activity_type_fails_activity_task_not_worker() {
     starter.sdk_config.register_activities(StdActivities);
     starter
         .sdk_config
-        .register_workflow::<MissingActivityWorkflow>();
+        .register_workflow::<MissingActivityWorkflow>()
+        .unwrap();
     let mut worker = starter.worker().await;
 
     let task_queue = starter.get_task_queue().to_owned();
