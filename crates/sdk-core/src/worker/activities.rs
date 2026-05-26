@@ -598,39 +598,51 @@ where
                                 // possibility of clock skew messing things up, and it's relative
                                 // unlikeliness compared to the other timeouts.
                                 let local_timeout_buffer = self.local_timeout_buffer;
-                                static HEARTBEAT_TYPE: &str = "heartbeat";
-                                let timeout_at = [
-                                    (HEARTBEAT_TYPE, task.resp.heartbeat_timeout),
-                                    ("start_to_close", task.resp.start_to_close_timeout),
-                                ]
-                                .into_iter()
-                                .filter_map(|(k, d)| {
-                                    d.and_then(|d| Duration::try_from(d).ok().map(|d| (k, d)))
-                                })
-                                .filter(|(_, d)| !d.is_zero())
-                                .min_by(|(_, d1), (_, d2)| d1.cmp(d2));
-                                if let Some((timeout_type, timeout_at)) = timeout_at {
-                                    let sleep_time = timeout_at + local_timeout_buffer;
+                                let to_sleep = |d: Option<prost_types::Duration>|
+                                    -> Option<Duration> {
+                                    d.and_then(|d| Duration::try_from(d).ok())
+                                        .filter(|d| !d.is_zero())
+                                        .map(|d| d + local_timeout_buffer)
+                                };
+                                let hb_sleep = to_sleep(task.resp.heartbeat_timeout);
+                                let s2c_sleep = to_sleep(task.resp.start_to_close_timeout);
+                                if hb_sleep.is_some() || s2c_sleep.is_some() {
                                     let cancel_tx = cancels_tx.clone();
                                     let task_token = tt.clone();
-                                    let resetter = if timeout_type == HEARTBEAT_TYPE {
-                                        Some(Arc::new(Notify::new()))
-                                    } else {
-                                        None
-                                    };
+                                    // A resettable heartbeat timer and a non-resettable
+                                    // start_to_close timer run in parallel — whichever fires
+                                    // first cancels the activity. Heartbeats reset the heartbeat
+                                    // timer only; start_to_close is always enforced locally.
+                                    let resetter = hb_sleep.map(|_| Arc::new(Notify::new()));
                                     let resetter_clone = resetter.clone();
                                     let local_timeouts_task =
                                         Some(tokio::task::spawn(async move {
-                                            if let Some(rs) = resetter_clone {
-                                                loop {
-                                                    tokio::select! {
-                                                        _ = rs.notified() => continue,
-                                                        _ = tokio::time::sleep(sleep_time) => break,
+                                            let heartbeat_timer = async {
+                                                if let (Some(sleep_time), Some(rs)) =
+                                                    (hb_sleep, resetter_clone)
+                                                {
+                                                    loop {
+                                                        tokio::select! {
+                                                            _ = rs.notified() => continue,
+                                                            _ = tokio::time::sleep(sleep_time)
+                                                                => return "heartbeat",
+                                                        }
                                                     }
                                                 }
-                                            } else {
-                                                tokio::time::sleep(sleep_time).await;
-                                            }
+                                                std::future::pending::<&'static str>().await
+                                            };
+                                            let start_to_close_timer = async {
+                                                if let Some(sleep_time) = s2c_sleep {
+                                                    tokio::time::sleep(sleep_time).await;
+                                                    "start_to_close"
+                                                } else {
+                                                    std::future::pending::<&'static str>().await
+                                                }
+                                            };
+                                            let timeout_type = tokio::select! {
+                                                t = heartbeat_timer => t,
+                                                t = start_to_close_timer => t,
+                                            };
                                             debug!(
                                                 task_token=%task_token,
                                                 "Timing out activity due to elapsed local \
@@ -1018,6 +1030,121 @@ mod tests {
         };
 
         join!(heartbeater, poller);
+
+        atm.complete(
+            TaskToken(t.task_token),
+            ActivityExecutionResult::fail("unimportant".into())
+                .status
+                .unwrap(),
+            mock_client.as_ref(),
+        )
+        .await;
+
+        atm.initiate_shutdown();
+        assert_matches!(atm.poll().await.unwrap_err(), PollError::ShutDown);
+        atm.shutdown().await;
+    }
+
+    // Regression test for SDK-5113 / sdk-core#1188:
+    //   When start_to_close_timeout > heartbeat_timeout, continuous successful
+    //   heartbeats must NOT prevent start_to_close_timeout from firing. The
+    //   current implementation creates a single timer for the *minimum* of the
+    //   two timeouts (the heartbeat one here) and every heartbeat resets it,
+    //   so start_to_close is never enforced locally and the activity runs
+    //   indefinitely on the worker after the server has timed it out.
+    #[tokio::test]
+    async fn start_to_close_fires_when_heartbeat_timeout_shorter() {
+        let mut mock_client = mock_worker_client();
+        mock_client
+            .expect_poll_activity_task()
+            .times(1)
+            .returning(move |_, _| {
+                Ok(PollActivityTaskQueueResponse {
+                    task_token: vec![1],
+                    activity_id: "act1".to_string(),
+                    start_to_close_timeout: Some(prost_dur!(from_millis(300))),
+                    heartbeat_timeout: Some(prost_dur!(from_millis(100))),
+                    ..Default::default()
+                })
+            });
+        mock_client
+            .expect_poll_activity_task()
+            .returning(|_, _| Ok(Default::default()));
+        mock_client
+            .expect_record_activity_heartbeat()
+            .returning(|_, _| Ok(Default::default()));
+        let mock_client = Arc::new(mock_client);
+        let sem = fixed_size_permit_dealer(1);
+        let shutdown_token = CancellationToken::new();
+        let ap = LongPollBuffer::new_activity_task(
+            mock_client.clone(),
+            "tq".to_string(),
+            PollerBehavior::SimpleMaximum(1),
+            sem.clone(),
+            shutdown_token.clone(),
+            None::<fn(usize)>,
+            ActivityTaskOptions {
+                max_worker_acts_per_second: None,
+                max_tps: None,
+            },
+            Arc::new(AtomicCell::new(None)),
+            Arc::new(NamespaceCapabilities {
+                graceful_poll_shutdown: AtomicBool::new(false),
+                poller_autoscaling: AtomicBool::new(false),
+            }),
+        );
+        let atm = WorkerActivityTasks::new(
+            sem.clone(),
+            Box::new(ap),
+            mock_client.clone(),
+            MetricsContext::no_op(),
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+            None,
+            Duration::from_millis(0), // No buffer in this test
+        );
+
+        let t = atm.poll().await.unwrap();
+        let tt = t.task_token.clone();
+        let start = Instant::now();
+
+        // Heartbeat every 50ms (faster than the 100ms heartbeat_timeout) so a
+        // successful heartbeat-report always resets the heartbeat timer before
+        // it can expire. start_to_close (300ms) must still fire.
+        let heartbeater = async {
+            loop {
+                let _ = atm.record_heartbeat(ActivityHeartbeat {
+                    task_token: tt.clone(),
+                    details: vec![],
+                });
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        };
+        // start_to_close_timeout=300ms. Allow generous slack (2s) before we
+        // declare the bug present, to keep this stable on slow CI.
+        let poller = async {
+            tokio::time::timeout(Duration::from_secs(2), atm.poll())
+                .await
+                .expect(
+                    "start_to_close_timeout was not enforced locally — \
+                     continuous heartbeats kept resetting the only timer \
+                     (SDK-5113)",
+                )
+                .unwrap()
+        };
+        let should_timeout = tokio::select! {
+            v = poller => v,
+            _ = heartbeater => unreachable!("heartbeat loop never exits on its own"),
+        };
+        assert!(should_timeout.is_timeout());
+        // Sanity check: should fire near start_to_close_timeout (300ms),
+        // not earlier — heartbeats are still succeeding so the heartbeat
+        // timer alone should never fire.
+        assert!(
+            start.elapsed() >= Duration::from_millis(290),
+            "timeout fired too early ({:?}); start_to_close_timeout is 300ms",
+            start.elapsed()
+        );
 
         atm.complete(
             TaskToken(t.task_token),
