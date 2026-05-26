@@ -830,6 +830,7 @@ pub(crate) fn get_integ_tls_config() -> Option<TlsOptions> {
                 client_cert,
                 client_private_key,
             }),
+            server_cert_verifier: None,
         })
     } else {
         None
