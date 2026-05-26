@@ -1133,7 +1133,11 @@ service CloudService {
             body: "*"
         };
         option (grpc.gateway.protoc_gen_openapiv2.options.openapiv2_operation) = {
+<<<<<<< HEAD
             tags: ["Account"];
+=======
+            tags: ["Billing"];
+>>>>>>> 2b25a9330048d270a87e295e383e28c45cccb752
             summary: "Create a billing report";
             description: "Creates a billing report for the account";
             external_docs: {
@@ -1149,7 +1153,11 @@ service CloudService {
             get: "/cloud/billing-reports/{billing_report_id}"
         };
         option (grpc.gateway.protoc_gen_openapiv2.options.openapiv2_operation) = {
+<<<<<<< HEAD
             tags: ["Account"];
+=======
+            tags: ["Billing"];
+>>>>>>> 2b25a9330048d270a87e295e383e28c45cccb752
             summary: "Get a billing report";
             description: "Gets an existing billing report for the account";
             external_docs: {

@@ -23,6 +23,20 @@ message BillingReportSpec {
   // The description for the billing report.
   // Optional, default is empty.
   string description = 4;
+<<<<<<< HEAD
+=======
+  // The data granularity of the billing report.
+  // Optional, default is hourly.
+  // temporal:versioning:min_version=v0.16.0
+  BillingReportGranularity granularity = 5;
+
+  enum BillingReportGranularity {
+    BILLING_REPORT_GRANULARITY_UNSPECIFIED = 0;
+    BILLING_REPORT_GRANULARITY_HOURLY = 1;
+    BILLING_REPORT_GRANULARITY_DAILY = 2;
+    BILLING_REPORT_GRANULARITY_MONTHLY = 3;
+  }
+>>>>>>> 2b25a9330048d270a87e295e383e28c45cccb752
 }
 
 message BillingReport {
