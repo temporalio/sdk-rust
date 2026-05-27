@@ -64,7 +64,8 @@ pub(crate) async fn grpc_message_too_large() {
         .sdk_config
         .register_workflow_with_factory(move || OversizeGrpcMessageWf {
             run_flag: run_flag_clone.clone(),
-        });
+        })
+        .unwrap();
 
     let mut sdk = starter.worker().await;
     sdk.submit_workflow(
@@ -143,7 +144,9 @@ pub(crate) async fn shutdown_during_active_timer_activity_workflows() {
         };
     starter.sdk_config.register_activities(StdActivities);
     let mut worker = starter.worker().await;
-    worker.register_workflow::<ShutdownTimerActivityLoopWf>();
+    worker
+        .register_workflow::<ShutdownTimerActivityLoopWf>()
+        .unwrap();
 
     let core = worker.core_worker();
     core.validate().await.unwrap();

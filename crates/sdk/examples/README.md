@@ -45,3 +45,4 @@ See each example's README for details and expected output.
 - [Cancellation](cancellation/) — Workflow and activity cancellation with cleanup
 - [Encryption](encryption/) — Custom `PayloadCodec` for payload encryption
 - [Schedules](schedules/) — Creating and managing scheduled workflows
+- [WASM Workflows](wasm_workflows/) — Component workflow used by WASM workflow integration tests

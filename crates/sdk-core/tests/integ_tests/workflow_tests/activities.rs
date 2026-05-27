@@ -211,7 +211,8 @@ async fn multi_arg_activity() {
     starter.sdk_config.register_activities(StdActivities);
     starter
         .sdk_config
-        .register_workflow::<MultiArgActivityWorkflow>();
+        .register_workflow::<MultiArgActivityWorkflow>()
+        .unwrap();
     let mut worker = starter.worker().await;
 
     let input = "hello".to_string();
@@ -236,7 +237,8 @@ async fn one_activity_only() {
     starter.sdk_config.register_activities(StdActivities);
     starter
         .sdk_config
-        .register_workflow::<OneActivityWorkflow>();
+        .register_workflow::<OneActivityWorkflow>()
+        .unwrap();
     let mut worker = starter.worker().await;
 
     let input = "hello from input!".to_string();
@@ -261,7 +263,8 @@ async fn activity_interceptor_wraps_activity_execution() {
     starter.sdk_config.register_activities(StdActivities);
     starter
         .sdk_config
-        .register_workflow::<OneActivityWorkflow>();
+        .register_workflow::<OneActivityWorkflow>()
+        .unwrap();
     let mut worker = starter.worker().await;
 
     let records = Arc::new(ActivityInterceptorRecords::default());
@@ -346,7 +349,8 @@ async fn activity_interceptor_wraps_local_activity_execution() {
     starter.sdk_config.register_activities(StdActivities);
     starter
         .sdk_config
-        .register_workflow::<OneLocalActivityWorkflow>();
+        .register_workflow::<OneLocalActivityWorkflow>()
+        .unwrap();
     let mut worker = starter.worker().await;
 
     let records = Arc::new(ActivityInterceptorRecords::default());
@@ -419,7 +423,8 @@ async fn activity_inbound_interceptor_can_mutate_activity_input() {
     starter.sdk_config.register_activities(StdActivities);
     starter
         .sdk_config
-        .register_workflow::<OneActivityWorkflow>();
+        .register_workflow::<OneActivityWorkflow>()
+        .unwrap();
     let mut worker = starter.worker().await;
 
     worker
@@ -483,7 +488,8 @@ async fn activity_interceptor_observes_activity_error() {
     starter.sdk_config.register_activities(FailingActivities);
     starter
         .sdk_config
-        .register_workflow::<ActivityFailureWorkflow>();
+        .register_workflow::<ActivityFailureWorkflow>()
+        .unwrap();
     let mut worker = starter.worker().await;
 
     let records = Arc::new(ActivityInterceptorRecords::default());
@@ -579,7 +585,8 @@ async fn activity_interceptor_observes_activity_panic() {
     starter.sdk_config.register_activities(PanickingActivities);
     starter
         .sdk_config
-        .register_workflow::<ActivityPanicWorkflow>();
+        .register_workflow::<ActivityPanicWorkflow>()
+        .unwrap();
     let mut worker = starter.worker().await;
 
     let records = Arc::new(ActivityInterceptorRecords::default());
@@ -675,7 +682,8 @@ async fn activity_panics_are_retryable() {
     starter.sdk_config.register_activities(PanicOnceActivities);
     starter
         .sdk_config
-        .register_workflow::<ActivityPanicRetryWorkflow>();
+        .register_workflow::<ActivityPanicRetryWorkflow>()
+        .unwrap();
     let mut worker = starter.worker().await;
 
     let task_queue = starter.get_task_queue().to_owned();
@@ -690,6 +698,87 @@ async fn activity_panics_are_retryable() {
 
     worker.run_until_done().await.unwrap();
     assert_eq!(handle.get_result(Default::default()).await.unwrap(), 2);
+}
+
+#[tokio::test]
+async fn unregistered_activity_type_fails_activity_task_not_worker() {
+    const MISSING_ACTIVITY_TYPE: &str = "missing_activity";
+
+    struct MissingActivities;
+
+    #[activities]
+    impl MissingActivities {
+        #[activity(name = MISSING_ACTIVITY_TYPE)]
+        async fn missing(_ctx: ActivityContext) -> Result<(), ActivityError> {
+            Ok(())
+        }
+    }
+
+    #[workflow]
+    #[derive(Default)]
+    struct MissingActivityWorkflow;
+
+    #[workflow_methods]
+    impl MissingActivityWorkflow {
+        #[run]
+        async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<Option<(String, String)>> {
+            let result = ctx
+                .start_activity(
+                    MissingActivities::missing,
+                    (),
+                    ActivityOptions::with_start_to_close_timeout(Duration::from_secs(5))
+                        .retry_policy(RetryPolicy {
+                            maximum_attempts: 1,
+                            ..Default::default()
+                        })
+                        .build(),
+                )
+                .await;
+            let Err(ActivityExecutionError::Failed(failure)) = result else {
+                return Ok(None);
+            };
+            let Some(IncomingError::Application(app_failure)) = failure.cause() else {
+                return Ok(None);
+            };
+            Ok(Some((
+                app_failure.to_string(),
+                app_failure.type_name().unwrap_or_default().to_string(),
+            )))
+        }
+    }
+
+    let wf_name = MissingActivityWorkflow::name();
+    let mut starter = CoreWfStarter::new(wf_name);
+    starter.sdk_config.register_activities(StdActivities);
+    starter
+        .sdk_config
+        .register_workflow::<MissingActivityWorkflow>()
+        .unwrap();
+    let mut worker = starter.worker().await;
+
+    let task_queue = starter.get_task_queue().to_owned();
+    let handle = worker
+        .submit_workflow(
+            MissingActivityWorkflow::run,
+            (),
+            WorkflowStartOptions::new(task_queue.clone(), task_queue).build(),
+        )
+        .await
+        .unwrap();
+
+    worker.run_until_done().await.unwrap();
+    let (message, error_type) = handle
+        .get_result(Default::default())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(error_type, "NotFoundError");
+    assert_eq!(
+        message,
+        format!(
+            "Activity {MISSING_ACTIVITY_TYPE} is not registered on this worker, available activities: StdActivities::always_fail, StdActivities::concat, StdActivities::echo, StdActivities::no_op, default_act_type, delay",
+        ),
+    );
 }
 
 #[tokio::test]
@@ -956,7 +1045,9 @@ async fn workflow_observes_non_retryable_activity() {
         }
     }
 
-    worker.register_workflow::<NonRetryableActivityFailureWorkflow>();
+    worker
+        .register_workflow::<NonRetryableActivityFailureWorkflow>()
+        .unwrap();
 
     let task_queue = starter.get_task_queue().to_owned();
     worker
@@ -1597,7 +1688,8 @@ async fn one_activity_abandon_cancelled_before_started() {
     starter.sdk_config.register_activities(StdActivities);
     starter
         .sdk_config
-        .register_workflow::<OneActivityAbandonCancelledBeforeStarted>();
+        .register_workflow::<OneActivityAbandonCancelledBeforeStarted>()
+        .unwrap();
     let mut worker = starter.worker().await;
 
     let task_queue = starter.get_task_queue().to_owned();
@@ -1643,7 +1735,8 @@ async fn one_activity_abandon_cancelled_after_complete() {
     starter.sdk_config.register_activities(StdActivities);
     starter
         .sdk_config
-        .register_workflow::<OneActivityAbandonCancelledAfterComplete>();
+        .register_workflow::<OneActivityAbandonCancelledAfterComplete>()
+        .unwrap();
     let mut worker = starter.worker().await;
 
     let task_queue = starter.get_task_queue().to_owned();
@@ -1721,7 +1814,9 @@ async fn graceful_shutdown() {
         }
     }
 
-    worker.register_workflow::<GracefulShutdownWorkflow>();
+    worker
+        .register_workflow::<GracefulShutdownWorkflow>()
+        .unwrap();
 
     let task_queue = starter.get_task_queue().to_owned();
     worker
@@ -1826,7 +1921,9 @@ async fn activity_can_be_cancelled_by_local_timeout() {
         }
     }
 
-    worker.register_workflow::<ActivityLocalTimeoutWorkflow>();
+    worker
+        .register_workflow::<ActivityLocalTimeoutWorkflow>()
+        .unwrap();
 
     let task_queue = starter.get_task_queue().to_owned();
     worker
@@ -1895,7 +1992,9 @@ async fn long_activity_timeout_repro() {
         }
     }
 
-    worker.register_workflow::<LongActivityTimeoutReproWorkflow>();
+    worker
+        .register_workflow::<LongActivityTimeoutReproWorkflow>()
+        .unwrap();
 
     starter.start_with_worker(wf_name, &mut worker).await;
     worker.run_until_done().await.unwrap();
@@ -1952,7 +2051,9 @@ async fn pass_activity_summary_to_metadata() {
         }
     }
 
-    worker.register_workflow::<ActivitySummaryWorkflow>();
+    worker
+        .register_workflow::<ActivitySummaryWorkflow>()
+        .unwrap();
     let task_queue = worker.inner_mut().task_queue().to_owned();
     worker
         .submit_wf(
@@ -2025,7 +2126,9 @@ async fn abandoned_activities_ignore_start_and_complete(hist_batches: &'static [
         }
     }
 
-    worker.register_workflow::<AbandonedActivitiesWorkflow>();
+    worker
+        .register_workflow::<AbandonedActivitiesWorkflow>()
+        .unwrap();
     let task_queue = worker.inner_mut().task_queue().to_owned();
     worker
         .submit_wf(
@@ -2069,7 +2172,9 @@ async fn immediate_activity_cancelation() {
     t.add_full_wf_task();
     t.add_workflow_execution_completed();
     let mut worker = build_fake_sdk(MockPollCfg::from_resps(t, [ResponseType::AllHistory]));
-    worker.register_workflow::<ImmediateActivityCancelationWorkflow>();
+    worker
+        .register_workflow::<ImmediateActivityCancelationWorkflow>()
+        .unwrap();
 
     let mut aai = ActivationAssertionsInterceptor::default();
     aai.then(|a| {

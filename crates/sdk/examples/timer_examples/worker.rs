@@ -21,7 +21,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let client = Client::new(connection, client_opts)?;
 
     let worker_options = WorkerOptions::new("timer-examples")
-        .register_workflow::<TimerWorkflow>()
+        .register_workflow::<TimerWorkflow>()?
         .register_activities(TimerActivities)
         .build();
 

@@ -91,7 +91,7 @@ async fn activity_load() {
     let mut worker = starter.worker().await;
 
     let starting = Instant::now();
-    worker.register_workflow::<ActivityLoadWf>();
+    worker.register_workflow::<ActivityLoadWf>().unwrap();
     join_all((0..CONCURRENCY).map(|i| {
         let worker = &worker;
         let wf_id = format!("activity_load_{i}");
@@ -179,7 +179,7 @@ async fn chunky_activities_resource_based() {
     let mut worker = starter.worker().await;
 
     let starting = Instant::now();
-    worker.register_workflow::<ChunkyActivityWf>();
+    worker.register_workflow::<ChunkyActivityWf>().unwrap();
     join_all((0..WORKFLOWS).map(|i| {
         let worker = &worker;
         let wf_id = format!("chunk_activity_{i}");
@@ -250,7 +250,7 @@ async fn workflow_load() {
     starter.sdk_config.register_activities(StdActivities);
     let task_queue = starter.get_task_queue().to_owned();
     let mut worker = starter.worker().await;
-    worker.register_workflow::<WorkflowLoadWf>();
+    worker.register_workflow::<WorkflowLoadWf>().unwrap();
 
     let mut workflow_handles = vec![];
     for i in 0..num_workflows {
@@ -304,7 +304,7 @@ async fn evict_while_la_running_no_interference() {
     let task_queue = starter.get_task_queue().to_owned();
     let mut worker = starter.worker().await;
 
-    worker.register_workflow::<LaProblemWorkflow>();
+    worker.register_workflow::<LaProblemWorkflow>().unwrap();
 
     let client = starter.get_client().await;
     let subfs = FuturesUnordered::new();
@@ -373,7 +373,9 @@ async fn can_paginate_long_history() {
     starter.sdk_config.max_cached_workflows = 0;
 
     let mut worker = starter.worker().await;
-    worker.register_workflow::<ManyParallelTimersLonghistWf>();
+    worker
+        .register_workflow::<ManyParallelTimersLonghistWf>()
+        .unwrap();
     let task_queue = starter.get_task_queue().to_owned();
     let handle = worker
         .submit_workflow(
@@ -468,7 +470,7 @@ async fn poller_autoscaling_basic_loadtest() {
     starter.sdk_config.register_activities(JitteryActivities);
     let mut worker = starter.worker().await;
     let shutdown_handle = worker.inner_mut().shutdown_handle();
-    worker.register_workflow::<PollerLoadWf>();
+    worker.register_workflow::<PollerLoadWf>().unwrap();
     let client = starter.get_client().await;
 
     let task_queue = starter.get_task_queue().to_owned();
