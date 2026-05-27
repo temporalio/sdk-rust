@@ -387,14 +387,12 @@ where
                     let capabilities = capabilities.clone();
                     let poll_task = tokio::spawn(async move {
                         let r = if capabilities.graceful_poll_shutdown() {
-                            let mut graceful_poll_shutdown_rx =
-                                capabilities.subscribe_graceful_poll_shutdown();
                             let shutdown_for_graceful_fallback = shutdown.clone();
                             let local_interrupt_after_graceful_disabled = async move {
                                 shutdown_for_graceful_fallback.cancelled().await;
-                                let _ = graceful_poll_shutdown_rx
-                                    .wait_for(|enabled| !*enabled)
-                                    .await;
+                                while capabilities.graceful_poll_shutdown() {
+                                    tokio::time::sleep(Duration::from_millis(10)).await;
+                                }
                             };
                             tokio::select! {
                                 r = pf(timeout_override) => r,
@@ -896,7 +894,10 @@ mod tests {
                 wft_poller_shared: Some(Arc::new(WFTPollerShared::new(Some(10)))),
             },
             Arc::new(AtomicCell::new(None)),
-            Arc::new(NamespaceCapabilities::default()),
+            Arc::new(NamespaceCapabilities {
+                graceful_poll_shutdown: AtomicBool::new(false),
+                poller_autoscaling: AtomicBool::new(false),
+            }),
         );
 
         // Poll a bunch of times, "interrupting" it each time, we should only actually have polled
@@ -953,7 +954,10 @@ mod tests {
                 wft_poller_shared: Some(Arc::new(WFTPollerShared::new(Some(1)))),
             },
             Arc::new(AtomicCell::new(None)),
-            Arc::new(NamespaceCapabilities::default()),
+            Arc::new(NamespaceCapabilities {
+                graceful_poll_shutdown: AtomicBool::new(false),
+                poller_autoscaling: AtomicBool::new(false),
+            }),
         );
 
         // Should not see error, unwraps should get empty response
@@ -1030,7 +1034,10 @@ mod tests {
                 wft_poller_shared: Some(Arc::new(WFTPollerShared::new(Some(10)))),
             },
             Arc::new(AtomicCell::new(None)),
-            Arc::new(NamespaceCapabilities::default()),
+            Arc::new(NamespaceCapabilities {
+                graceful_poll_shutdown: AtomicBool::new(false),
+                poller_autoscaling: AtomicBool::new(false),
+            }),
         );
 
         let first_task = pb.poll().await.expect("Should get first task");
@@ -1136,7 +1143,10 @@ mod tests {
                 wft_poller_shared: Some(Arc::new(WFTPollerShared::new(Some(10)))),
             },
             Arc::new(AtomicCell::new(None)),
-            Arc::new(NamespaceCapabilities::default()),
+            Arc::new(NamespaceCapabilities {
+                graceful_poll_shutdown: AtomicBool::new(false),
+                poller_autoscaling: AtomicBool::new(false),
+            }),
         ));
 
         // Trigger the first poll to initialize and get the scaling decision
@@ -1217,7 +1227,10 @@ mod tests {
                 wft_poller_shared: None,
             },
             Arc::new(AtomicCell::new(None)),
-            Arc::new(NamespaceCapabilities::new(graceful, false)),
+            Arc::new(NamespaceCapabilities {
+                graceful_poll_shutdown: AtomicBool::new(graceful),
+                poller_autoscaling: AtomicBool::new(false),
+            }),
         );
 
         let first = pb.poll().await.unwrap().unwrap();
@@ -1269,7 +1282,10 @@ mod tests {
             min: minimum,
             target: AtomicUsize::new(10),
             ever_saw_scaling_decision: AtomicBool::new(false),
-            capabilities: Arc::new(NamespaceCapabilities::new(false, supports_autoscaling)),
+            capabilities: Arc::new(NamespaceCapabilities {
+                graceful_poll_shutdown: AtomicBool::new(false),
+                poller_autoscaling: AtomicBool::new(supports_autoscaling),
+            }),
             behavior: PollerBehavior::Autoscaling {
                 minimum,
                 maximum: 10,

@@ -434,46 +434,21 @@ pub struct Worker {
 
 /// Namespace capabilities discovered via `describe_namespace` during worker validation.
 pub struct NamespaceCapabilities {
-    pub(crate) graceful_poll_shutdown: watch::Sender<bool>,
-    graceful_poll_shutdown_rx: watch::Receiver<bool>,
+    pub(crate) graceful_poll_shutdown: AtomicBool,
     pub(crate) poller_autoscaling: AtomicBool,
 }
 
 impl NamespaceCapabilities {
-    pub(crate) fn new(graceful_poll_shutdown: bool, poller_autoscaling: bool) -> Self {
-        let (graceful_poll_shutdown, graceful_poll_shutdown_rx) =
-            watch::channel(graceful_poll_shutdown);
-        Self {
-            graceful_poll_shutdown,
-            graceful_poll_shutdown_rx,
-            poller_autoscaling: AtomicBool::new(poller_autoscaling),
-        }
-    }
-
     /// Returns true if the server supports graceful poll cancellation on shutdown, so pollers
     /// can let in-flight polls complete rather than hard-killing them.
     pub fn graceful_poll_shutdown(&self) -> bool {
-        *self.graceful_poll_shutdown_rx.borrow()
-    }
-
-    pub(crate) fn set_graceful_poll_shutdown(&self, enabled: bool) {
-        let _ = self.graceful_poll_shutdown.send(enabled);
-    }
-
-    pub(crate) fn subscribe_graceful_poll_shutdown(&self) -> watch::Receiver<bool> {
-        self.graceful_poll_shutdown.subscribe()
+        self.graceful_poll_shutdown.load(Ordering::Relaxed)
     }
 
     /// Returns true if pollers may scale down on poll timeout even without an explicit scaling
     /// decision from the server.
     pub fn poller_autoscaling(&self) -> bool {
         self.poller_autoscaling.load(Ordering::Relaxed)
-    }
-}
-
-impl Default for NamespaceCapabilities {
-    fn default() -> Self {
-        Self::new(false, false)
     }
 }
 
@@ -550,7 +525,9 @@ impl Worker {
                 });
                 if let Some(caps) = ns_info.and_then(|ns| ns.capabilities) {
                     if caps.worker_poll_complete_on_shutdown {
-                        self.capabilities.set_graceful_poll_shutdown(true);
+                        self.capabilities
+                            .graceful_poll_shutdown
+                            .store(true, Ordering::Relaxed);
                     }
                     if caps.poller_autoscaling {
                         self.capabilities
@@ -678,7 +655,10 @@ impl Worker {
         let wf_sticky_last_suc_poll_time = Arc::new(AtomicCell::new(None));
         let act_last_suc_poll_time = Arc::new(AtomicCell::new(None));
         let nexus_last_suc_poll_time = Arc::new(AtomicCell::new(None));
-        let capabilities = Arc::new(NamespaceCapabilities::default());
+        let capabilities = Arc::new(NamespaceCapabilities {
+            graceful_poll_shutdown: AtomicBool::new(false),
+            poller_autoscaling: AtomicBool::new(false),
+        });
 
         let nexus_slots = MeteredPermitDealer::new(
             tuner.nexus_task_slot_supplier(),
@@ -1471,7 +1451,9 @@ impl Worker {
                         tonic::Code::Unimplemented | tonic::Code::Unavailable
                     ) =>
                 {
-                    capabilities.set_graceful_poll_shutdown(false);
+                    capabilities
+                        .graceful_poll_shutdown
+                        .store(false, Ordering::Relaxed);
                     debug!(
                         "shutdown_worker rpc unavailable during worker shutdown; \
                          falling back to local poll shutdown: {:?}",
