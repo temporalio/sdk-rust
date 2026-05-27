@@ -2841,6 +2841,13 @@ pub mod temporal {
                 }
             }
         }
+        pub mod nexusservices {
+            pub mod workerservice {
+                pub mod v1 {
+                    tonic::include_proto!("temporal.api.nexusservices.workerservice.v1");
+                }
+            }
+        }
         pub mod workflowservice {
             pub mod v1 {
                 tonic::include_proto!("temporal.api.workflowservice.v1");

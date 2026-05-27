@@ -2258,7 +2258,9 @@ async fn activity_cancel_delivered_without_heartbeat() {
         }
     }
 
-    worker.register_workflow::<CancelWithoutHeartbeatWorkflow>();
+    worker
+        .register_workflow::<CancelWithoutHeartbeatWorkflow>()
+        .unwrap();
 
     let task_queue = starter.get_task_queue().to_owned();
     let handle = worker
