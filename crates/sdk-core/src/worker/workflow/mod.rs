@@ -75,7 +75,7 @@ use temporalio_common::{
         temporal::api::{
             command::v1::{Command as ProtoCommand, Command, command::Attributes},
             common::v1::{
-                Memo, MeteringMetadata, RetryPolicy, SearchAttributes, WorkflowExecution,
+                Memo, MeteringMetadata, Payload, RetryPolicy, SearchAttributes, WorkflowExecution,
             },
             enums::v1::{VersioningBehavior, WorkflowTaskFailedCause},
             failure::v1::{ApplicationFailureInfo, failure::FailureInfo},
@@ -86,7 +86,10 @@ use temporalio_common::{
             workflowservice::v1::{PollActivityTaskQueueResponse, get_system_info_response},
         },
     },
-    telemetry::set_trace_subscriber_for_current_thread,
+    telemetry::{
+        metrics::{MESSAGE_DIRECTION_REQUEST, MESSAGE_DIRECTION_RESPONSE},
+        set_trace_subscriber_for_current_thread,
+    },
 };
 use tokio::{
     sync::{
@@ -287,6 +290,7 @@ impl Workflows {
             match al {
                 ActivationOrAuto::LangActivation(mut act)
                 | ActivationOrAuto::ReadyForQueries(mut act) => {
+                    record_workflow_activation_payload_sizes(&self.metrics, &act);
                     prepare_to_ship_activation(&mut act);
                     debug!(activation=%act, "Sending activation to lang");
                     break Ok(act);
@@ -370,6 +374,7 @@ impl Workflows {
                     } else {
                         0
                     };
+                record_workflow_completion_payload_sizes(&run_metrics, &commands);
                 let mut maybe_record_terminal_metric = detect_terminal_command(&commands);
                 let mut completion = WorkflowTaskCompletion {
                     task_token: task_token.clone(),
@@ -1707,6 +1712,52 @@ fn prepare_to_ship_activation(wfa: &mut WorkflowActivation) {
         }
         variant_ordinal(j1v).cmp(&variant_ordinal(j2v))
     });
+}
+
+fn record_workflow_activation_payload_sizes(
+    metric_context: &MetricsContext,
+    wfa: &WorkflowActivation,
+) {
+    for job in &wfa.jobs {
+        if let Some(workflow_activation_job::Variant::InitializeWorkflow(init)) = &job.variant {
+            metric_context
+                .with_new_attrs([
+                    metrics::workflow_type(init.workflow_type.clone()),
+                    metrics::message_direction(MESSAGE_DIRECTION_REQUEST),
+                ])
+                .wf_payload_size(payloads_size(&init.arguments));
+        }
+    }
+}
+
+fn record_workflow_completion_payload_sizes(metric_context: &MetricsContext, commands: &[Command]) {
+    for command in commands {
+        if let Some(Attributes::CompleteWorkflowExecutionCommandAttributes(complete)) =
+            &command.attributes
+        {
+            metric_context
+                .with_new_attrs([metrics::message_direction(MESSAGE_DIRECTION_RESPONSE)])
+                .wf_payload_size(
+                    complete
+                        .result
+                        .as_ref()
+                        .map_or(0, |payloads| payloads_size(&payloads.payloads)),
+                );
+        }
+    }
+}
+
+fn payloads_size(payloads: &[Payload]) -> u64 {
+    payloads.iter().map(payload_size).sum()
+}
+
+fn payload_size(payload: &Payload) -> u64 {
+    let metadata_size: usize = payload
+        .metadata
+        .iter()
+        .map(|(key, value)| key.len() + value.len())
+        .sum();
+    (payload.data.len() + metadata_size) as u64
 }
 
 fn make_grpc_message_too_large_failure() -> Failure {

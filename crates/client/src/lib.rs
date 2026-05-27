@@ -36,7 +36,10 @@ pub use async_activity_handle::{
     ActivityHeartbeatResponse, ActivityIdentifier, AsyncActivityHandle,
 };
 
-pub use metrics::{LONG_REQUEST_LATENCY_HISTOGRAM_NAME, REQUEST_LATENCY_HISTOGRAM_NAME};
+pub use metrics::{
+    LONG_REQUEST_LATENCY_HISTOGRAM_NAME, REQUEST_LATENCY_HISTOGRAM_NAME,
+    RPC_MESSAGE_SIZE_HISTOGRAM_NAME,
+};
 pub use options_structs::*;
 pub use replaceable::SharedReplaceableClient;
 pub use retry::RetryOptions;

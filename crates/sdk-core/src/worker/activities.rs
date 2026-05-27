@@ -14,7 +14,8 @@ use crate::{
     },
     pollers::{BoxedActPoller, PermittedTqResp, TrackedPermittedTqResp, new_activity_task_poller},
     telemetry::metrics::{
-        MetricsContext, activity_type, eager, should_record_failure_metric, workflow_type,
+        MetricsContext, activity_type, eager, message_direction, should_record_failure_metric,
+        workflow_type,
     },
     worker::{
         ActivitySlotKind, PollError,
@@ -36,16 +37,22 @@ use std::{
     },
     time::{Duration, Instant, SystemTime},
 };
-use temporalio_common::protos::{
-    coresdk::{
-        ActivityHeartbeat, ActivitySlotInfo,
-        activity_result::{self as ar, activity_execution_result as aer},
-        activity_task::{ActivityCancelReason, ActivityCancellationDetails, ActivityTask},
+use temporalio_common::{
+    protos::{
+        coresdk::{
+            ActivityHeartbeat, ActivitySlotInfo,
+            activity_result::{self as ar, activity_execution_result as aer},
+            activity_task::{ActivityCancelReason, ActivityCancellationDetails, ActivityTask},
+        },
+        temporal::api::{
+            common::v1::{Payload, Payloads},
+            failure::v1::{
+                ApplicationFailureInfo, CanceledFailureInfo, Failure, failure::FailureInfo,
+            },
+            workflowservice::v1::PollActivityTaskQueueResponse,
+        },
     },
-    temporal::api::{
-        failure::v1::{ApplicationFailureInfo, CanceledFailureInfo, Failure, failure::FailureInfo},
-        workflowservice::v1::PollActivityTaskQueueResponse,
-    },
+    telemetry::metrics::{MESSAGE_DIRECTION_REQUEST, MESSAGE_DIRECTION_RESPONSE},
 };
 use tokio::{
     join,
@@ -325,9 +332,11 @@ impl WorkerActivityTasks {
             outstanding_activity_tasks.remove(&task_token)
         };
         if let Some(act_info) = act_info {
+            let activity_type_name = act_info.base.activity_type.clone();
+            let workflow_type_name = act_info.base.workflow_type.clone();
             let act_metrics = self.metrics.with_new_attrs([
-                activity_type(act_info.base.activity_type),
-                workflow_type(act_info.base.workflow_type),
+                activity_type(activity_type_name.clone()),
+                workflow_type(workflow_type_name.clone()),
             ]);
             Span::current().record("workflow_id", act_info.base.workflow_id);
             Span::current().record("run_id", act_info.base.workflow_run_id);
@@ -352,6 +361,13 @@ impl WorkerActivityTasks {
                 let maybe_net_err = match status {
                     aer::Status::WillCompleteAsync(_) => None,
                     aer::Status::Completed(ar::Success { result }) => {
+                        self.metrics
+                            .with_new_attrs([
+                                activity_type(activity_type_name.clone()),
+                                workflow_type(workflow_type_name.clone()),
+                                message_direction(MESSAGE_DIRECTION_RESPONSE),
+                            ])
+                            .act_payload_size(maybe_payload_size(result.as_ref()));
                         if let Some(sched_time) = act_info
                             .base
                             .scheduled_time
@@ -557,6 +573,13 @@ where
                                             eager(is_eager),
                                         ])
                                         .act_task_received();
+                                    self.metrics
+                                        .with_new_attrs([
+                                            activity_type(activity_type_name.to_owned()),
+                                            workflow_type(wf_type.name.clone()),
+                                            message_direction(MESSAGE_DIRECTION_REQUEST),
+                                        ])
+                                        .act_payload_size(payloads_size(task.resp.input.as_ref()));
                                 }
                             }
                             // There could be an else statement here but since the response
@@ -733,6 +756,25 @@ impl ActivitiesFromWFTsHandle {
     }
 }
 
+fn payloads_size(payloads: Option<&Payloads>) -> u64 {
+    payloads
+        .map(|payloads| payloads.payloads.iter().map(payload_size).sum())
+        .unwrap_or_default()
+}
+
+fn maybe_payload_size(payload: Option<&Payload>) -> u64 {
+    payload.map(payload_size).unwrap_or_default()
+}
+
+fn payload_size(payload: &Payload) -> u64 {
+    let metadata_size: usize = payload
+        .metadata
+        .iter()
+        .map(|(key, value)| key.len() + value.len())
+        .sum();
+    (payload.data.len() + metadata_size) as u64
+}
+
 fn worker_shutdown_failure() -> Failure {
     Failure {
         message: "Worker is shutting down and this activity did not complete in time".to_string(),
@@ -761,6 +803,19 @@ mod tests {
     };
     use crossbeam_utils::atomic::AtomicCell;
     use temporalio_common::protos::coresdk::activity_result::ActivityExecutionResult;
+
+    #[test]
+    fn payload_size_counts_data_and_metadata_bytes() {
+        let payload = Payload {
+            metadata: HashMap::from([("encoding".to_owned(), b"json/plain".to_vec())]),
+            data: b"{\"job_id\":\"abc\"}".to_vec(),
+            ..Default::default()
+        };
+
+        let expected_size = payload.data.len() + "encoding".len() + b"json/plain".len();
+
+        assert_eq!(payload_size(&payload), expected_size as u64);
+    }
 
     #[tokio::test]
     async fn per_worker_ratelimit() {
