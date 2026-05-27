@@ -325,13 +325,7 @@ mod tests {
     use crate::{
         test_help::{WorkerExt, test_worker_cfg},
         worker,
-        worker::{
-            PollerBehavior,
-            client::{
-                MockWorkerClient,
-                mocks::{DEFAULT_TEST_CAPABILITIES, mock_worker_client},
-            },
-        },
+        worker::{PollerBehavior, client::mocks::mock_worker_client},
     };
     use prost::Message;
     use std::{
@@ -341,17 +335,23 @@ mod tests {
         },
         time::Duration,
     };
-    use temporalio_client::worker::ClientWorkerSet;
-    use temporalio_common::protos::temporal::api::{
-        common::v1::Payload,
-        namespace::v1::{NamespaceInfo, namespace_info::Capabilities},
-        nexus::v1::{Request, StartOperationRequest, request, response, start_operation_response},
-        nexusservices::workerservice::v1::{ExecuteCommandsRequest, ExecuteCommandsResponse},
-        worker::v1::{CancelActivityCommand, WorkerCommand, worker_command, worker_command_result},
-        workflowservice::v1::{
-            DescribeNamespaceResponse, PollNexusTaskQueueResponse, RecordWorkerHeartbeatResponse,
-            RespondNexusTaskCompletedResponse,
+    use temporalio_common::{
+        protos::temporal::api::{
+            common::v1::Payload,
+            namespace::v1::{NamespaceInfo, namespace_info::Capabilities},
+            nexus::v1::{
+                Request, StartOperationRequest, request, response, start_operation_response,
+            },
+            nexusservices::workerservice::v1::{ExecuteCommandsRequest, ExecuteCommandsResponse},
+            worker::v1::{
+                CancelActivityCommand, WorkerCommand, worker_command, worker_command_result,
+            },
+            workflowservice::v1::{
+                DescribeNamespaceResponse, PollNexusTaskQueueResponse,
+                RecordWorkerHeartbeatResponse, RespondNexusTaskCompletedResponse,
+            },
         },
+        worker::WorkerTaskTypes,
     };
     use uuid::Uuid;
 
@@ -421,59 +421,65 @@ mod tests {
         assert_eq!(3, heartbeat_count.load(Ordering::Relaxed));
     }
 
-    fn make_execute_commands_nexus_response(
-        task_token: Vec<u8>,
-        commands: Vec<WorkerCommand>,
-    ) -> PollNexusTaskQueueResponse {
-        let exec_req = ExecuteCommandsRequest { commands };
-        PollNexusTaskQueueResponse {
-            task_token,
-            request: Some(Request {
-                header: Default::default(),
-                scheduled_time: None,
-                endpoint: String::new(),
-                variant: Some(request::Variant::StartOperation(StartOperationRequest {
-                    service: "temporal.api.nexusservices.workerservice.v1.WorkerService"
-                        .to_string(),
-                    operation: "ExecuteCommands".to_string(),
-                    request_id: "test-req-id".to_string(),
-                    callback: String::new(),
-                    payload: Some(Payload {
-                        data: exec_req.encode_to_vec(),
-                        ..Default::default()
+    #[tokio::test]
+    async fn worker_commands_not_polled_when_capability_disabled() {
+        let mut mock = mock_worker_client();
+        let namespace = format!("{}-{}", crate::test_help::NAMESPACE, Uuid::new_v4());
+
+        let poll_called = Arc::new(AtomicBool::new(false));
+        let poll_called_clone = poll_called.clone();
+        mock.expect_poll_nexus_task().returning(move |_, _| {
+            poll_called_clone.store(true, Ordering::SeqCst);
+            Ok(Default::default())
+        });
+
+        let (heartbeat_tx, heartbeat_rx) = tokio::sync::oneshot::channel();
+        let heartbeat_tx = Mutex::new(Some(heartbeat_tx));
+        mock.expect_record_worker_heartbeat()
+            .returning(move |_, _| {
+                if let Some(tx) = heartbeat_tx.lock().unwrap().take() {
+                    let _ = tx.send(());
+                }
+                Ok(RecordWorkerHeartbeatResponse {})
+            });
+        mock.expect_describe_namespace().returning(move || {
+            Ok(DescribeNamespaceResponse {
+                namespace_info: Some(NamespaceInfo {
+                    capabilities: Some(Capabilities {
+                        worker_heartbeats: true,
+                        worker_commands: false,
+                        ..Capabilities::default()
                     }),
-                    callback_header: Default::default(),
-                    links: vec![],
-                })),
-                capabilities: None,
-            }),
-            ..Default::default()
-        }
+                    ..NamespaceInfo::default()
+                }),
+                ..DescribeNamespaceResponse::default()
+            })
+        });
+
+        let shared_worker = super::SharedNamespaceWorker::new(
+            Arc::new(mock),
+            namespace,
+            Duration::from_millis(100),
+            None,
+        )
+        .unwrap();
+
+        tokio::time::timeout(Duration::from_secs(5), heartbeat_rx)
+            .await
+            .expect("worker heartbeat was not recorded in time")
+            .expect("heartbeat sender was dropped");
+        shared_worker.cancel.cancel();
+
+        assert!(
+            !poll_called.load(Ordering::SeqCst),
+            "shared namespace worker must not poll worker commands without the capability"
+        );
     }
 
     #[tokio::test]
     async fn worker_command_cancel_activity() {
-        let mut mock = MockWorkerClient::new();
-        let isolated_registry = Arc::new(ClientWorkerSet::new());
-        mock.expect_workers().return_const(isolated_registry);
-        mock.expect_capabilities()
-            .returning(|| Some(*DEFAULT_TEST_CAPABILITIES));
-        mock.expect_is_mock().returning(|| true);
-        mock.expect_shutdown_worker()
-            .returning(|_, _, _, _| {
-                use temporalio_common::protos::temporal::api::workflowservice::v1::ShutdownWorkerResponse;
-                Ok(ShutdownWorkerResponse {})
-            });
-        mock.expect_sdk_name_and_version()
-            .returning(|| ("test-core".to_string(), "0.0.0".to_string()));
-        mock.expect_identity()
-            .returning(|| "test-identity".to_string());
-        let worker_grouping_key = Uuid::new_v4();
-        mock.expect_worker_grouping_key()
-            .returning(move || worker_grouping_key);
-        mock.expect_worker_instance_key().returning(Uuid::new_v4);
-        mock.expect_set_heartbeat_client_fields()
-            .returning(|_hb| {});
+        let mut mock = mock_worker_client();
+        let namespace = format!("{}-{}", crate::test_help::NAMESPACE, Uuid::new_v4());
 
         let activity_task_token = vec![1, 2, 3, 4];
 
@@ -483,31 +489,55 @@ mod tests {
         let poll_returned_command = Arc::new(AtomicBool::new(false));
         let poll_returned_command_clone = poll_returned_command.clone();
         let at_clone = activity_task_token.clone();
-        let expected_task_queue = format!(
-            "temporal-sys/worker-commands/{}/{worker_grouping_key}",
-            crate::test_help::NAMESPACE
-        );
+        let expected_task_queue_prefix = format!("temporal-sys/worker-commands/{namespace}/");
         mock.expect_poll_nexus_task()
             .returning(move |poll_options, nexus_options| {
                 assert!(
                     nexus_options.worker_commands_queue,
                     "shared namespace worker must poll the worker-commands queue"
                 );
-                assert_eq!(
-                    poll_options.task_queue, expected_task_queue,
-                    "shared namespace worker must poll its own control task queue"
-                );
+                let task_queue_grouping_key = poll_options
+                    .task_queue
+                    .strip_prefix(&expected_task_queue_prefix)
+                    .expect("shared namespace worker must poll its own control task queue");
+                Uuid::parse_str(task_queue_grouping_key)
+                    .expect("control task queue must include worker grouping key");
                 if !poll_returned_command_clone.swap(true, Ordering::SeqCst) {
-                    Ok(make_execute_commands_nexus_response(
-                        vec![99],
-                        vec![WorkerCommand {
+                    let exec_req = ExecuteCommandsRequest {
+                        commands: vec![WorkerCommand {
                             r#type: Some(worker_command::Type::CancelActivity(
                                 CancelActivityCommand {
                                     task_token: at_clone.clone(),
                                 },
                             )),
                         }],
-                    ))
+                    };
+                    Ok(PollNexusTaskQueueResponse {
+                        task_token: vec![99],
+                        request: Some(Request {
+                            header: Default::default(),
+                            scheduled_time: None,
+                            endpoint: String::new(),
+                            variant: Some(request::Variant::StartOperation(
+                                StartOperationRequest {
+                                    service:
+                                        "temporal.api.nexusservices.workerservice.v1.WorkerService"
+                                            .to_string(),
+                                    operation: "ExecuteCommands".to_string(),
+                                    request_id: "test-req-id".to_string(),
+                                    callback: String::new(),
+                                    payload: Some(Payload {
+                                        data: exec_req.encode_to_vec(),
+                                        ..Default::default()
+                                    }),
+                                    callback_header: Default::default(),
+                                    links: vec![],
+                                },
+                            )),
+                            capabilities: None,
+                        }),
+                        ..Default::default()
+                    })
                 } else {
                     Ok(Default::default())
                 }
@@ -536,11 +566,13 @@ mod tests {
             })
         });
 
-        let config = test_worker_cfg()
+        let mut config = test_worker_cfg()
             .activity_task_poller_behavior(PollerBehavior::SimpleMaximum(1_usize))
             .max_outstanding_activities(1_usize)
             .build()
             .unwrap();
+        config.namespace = namespace;
+        config.task_types = WorkerTaskTypes::activity_only();
 
         let client = Arc::new(mock);
         let worker = worker::Worker::new(
