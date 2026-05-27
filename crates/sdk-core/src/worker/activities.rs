@@ -601,13 +601,13 @@ where
                                 // There is a bug in the server that translates non-set
                                 // heartbeat timeouts into 0 duration. We treat 0 the same way
                                 // as None so we don't spawn a timer that would fire immediately.
-                                let to_sleep = |d: Option<prost_types::Duration>|
-                                    -> Option<Duration> {
-                                    d.and_then(|d| Duration::try_from(d).ok())
-                                        .filter(|d| !d.is_zero())
-                                        .map(|d| d + local_timeout_buffer)
-                                };
-                                if let Some(timers) = LocalActivityTimers::new(
+                                let to_sleep =
+                                    |d: Option<prost_types::Duration>| -> Option<Duration> {
+                                        d.and_then(|d| Duration::try_from(d).ok())
+                                            .filter(|d| !d.is_zero())
+                                            .map(|d| d + local_timeout_buffer)
+                                    };
+                                if let Some(timers) = ActivityLocalTimers::new(
                                     to_sleep(task.resp.heartbeat_timeout),
                                     to_sleep(task.resp.start_to_close_timeout),
                                 ) {
@@ -737,14 +737,14 @@ fn worker_shutdown_failure() -> Failure {
 }
 
 /// Which of an activity's two local timers fired first. Returned from
-/// [`LocalActivityTimers::run`] and used downstream only for logging.
+/// [`ActivityLocalTimers::run`] and used downstream only for logging.
 #[derive(Debug, Clone, Copy)]
-enum LocalActivityTimeout {
+enum ActivityLocalTimeoutKind {
     Heartbeat,
     StartToClose,
 }
 
-impl LocalActivityTimeout {
+impl ActivityLocalTimeoutKind {
     fn as_str(self) -> &'static str {
         match self {
             Self::Heartbeat => "heartbeat",
@@ -761,16 +761,13 @@ impl LocalActivityTimeout {
 ///
 /// Construction returns [`None`] when both timeouts are unset, so the
 /// caller knows not to spawn a local-timeouts task at all.
-struct LocalActivityTimers {
+struct ActivityLocalTimers {
     heartbeat: Option<(Duration, Arc<Notify>)>,
     start_to_close: Option<Duration>,
 }
 
-impl LocalActivityTimers {
-    fn new(
-        heartbeat: Option<Duration>,
-        start_to_close: Option<Duration>,
-    ) -> Option<Self> {
+impl ActivityLocalTimers {
+    fn new(heartbeat: Option<Duration>, start_to_close: Option<Duration>) -> Option<Self> {
         if heartbeat.is_none() && start_to_close.is_none() {
             return None;
         }
@@ -790,30 +787,30 @@ impl LocalActivityTimers {
     /// Drive the two timers concurrently; resolves with whichever fires
     /// first. The losing arm is dropped (cancel-safe for both `sleep` and
     /// `Notify::notified`).
-    async fn run(self) -> LocalActivityTimeout {
+    async fn run(self) -> ActivityLocalTimeoutKind {
         let heartbeat_timer = async {
             if let Some((sleep_time, rs)) = self.heartbeat {
                 loop {
                     tokio::select! {
                         _ = rs.notified() => continue,
                         _ = tokio::time::sleep(sleep_time)
-                            => return LocalActivityTimeout::Heartbeat,
+                            => return ActivityLocalTimeoutKind::Heartbeat,
                     }
                 }
             }
             std::future::pending().await
         };
-        let s2c_timer = async {
+        let start_to_close_timer = async {
             if let Some(sleep_time) = self.start_to_close {
                 tokio::time::sleep(sleep_time).await;
-                LocalActivityTimeout::StartToClose
+                ActivityLocalTimeoutKind::StartToClose
             } else {
                 std::future::pending().await
             }
         };
         tokio::select! {
             t = heartbeat_timer => t,
-            t = s2c_timer => t,
+            t = start_to_close_timer => t,
         }
     }
 }
