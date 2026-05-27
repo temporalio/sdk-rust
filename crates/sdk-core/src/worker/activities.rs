@@ -825,10 +825,52 @@ mod tests {
         abstractions::tests::fixed_size_permit_dealer,
         pollers::{ActivityTaskOptions, LongPollBuffer},
         prost_dur,
-        worker::{NamespaceCapabilities, PollerBehavior, client::mocks::mock_worker_client},
+        worker::{
+            NamespaceCapabilities, PollerBehavior,
+            client::{MockWorkerClient, mocks::mock_worker_client},
+        },
     };
     use crossbeam_utils::atomic::AtomicCell;
     use temporalio_common::protos::coresdk::activity_result::ActivityExecutionResult;
+
+    /// Shared setup for the local-timeout tests: single activity slot, single
+    /// poller, no per-worker rate limit. Only the local-timeout buffer varies
+    /// across these tests. (The ratelimit test below has more variation and
+    /// keeps its setup inline.)
+    fn build_local_timeout_test_atm(
+        mock_client: Arc<MockWorkerClient>,
+        local_timeout_buffer: Duration,
+    ) -> WorkerActivityTasks {
+        let sem = fixed_size_permit_dealer(1);
+        let shutdown_token = CancellationToken::new();
+        let ap = LongPollBuffer::new_activity_task(
+            mock_client.clone(),
+            "tq".to_string(),
+            PollerBehavior::SimpleMaximum(1),
+            sem.clone(),
+            shutdown_token,
+            None::<fn(usize)>,
+            ActivityTaskOptions {
+                max_worker_acts_per_second: None,
+                max_tps: None,
+            },
+            Arc::new(AtomicCell::new(None)),
+            Arc::new(NamespaceCapabilities {
+                graceful_poll_shutdown: AtomicBool::new(false),
+                poller_autoscaling: AtomicBool::new(false),
+            }),
+        );
+        WorkerActivityTasks::new(
+            sem,
+            Box::new(ap),
+            mock_client,
+            MetricsContext::no_op(),
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+            None,
+            local_timeout_buffer,
+        )
+    }
 
     #[tokio::test]
     async fn per_worker_ratelimit() {
@@ -955,35 +997,7 @@ mod tests {
                 })
             });
         let mock_client = Arc::new(mock_client);
-        let sem = fixed_size_permit_dealer(1);
-        let shutdown_token = CancellationToken::new();
-        let ap = LongPollBuffer::new_activity_task(
-            mock_client.clone(),
-            "tq".to_string(),
-            PollerBehavior::SimpleMaximum(1),
-            sem.clone(),
-            shutdown_token.clone(),
-            None::<fn(usize)>,
-            ActivityTaskOptions {
-                max_worker_acts_per_second: None,
-                max_tps: None,
-            },
-            Arc::new(AtomicCell::new(None)),
-            Arc::new(NamespaceCapabilities {
-                graceful_poll_shutdown: AtomicBool::new(false),
-                poller_autoscaling: AtomicBool::new(false),
-            }),
-        );
-        let atm = WorkerActivityTasks::new(
-            sem.clone(),
-            Box::new(ap),
-            mock_client.clone(),
-            MetricsContext::no_op(),
-            Duration::from_secs(1),
-            Duration::from_secs(1),
-            None,
-            Duration::from_millis(100), // Short buffer for unit test
-        );
+        let atm = build_local_timeout_test_atm(mock_client.clone(), Duration::from_millis(100));
 
         for _ in 1..=3 {
             let start = Instant::now();
@@ -1033,35 +1047,7 @@ mod tests {
             .times(2)
             .returning(|_, _| Ok(Default::default()));
         let mock_client = Arc::new(mock_client);
-        let sem = fixed_size_permit_dealer(1);
-        let shutdown_token = CancellationToken::new();
-        let ap = LongPollBuffer::new_activity_task(
-            mock_client.clone(),
-            "tq".to_string(),
-            PollerBehavior::SimpleMaximum(1),
-            sem.clone(),
-            shutdown_token.clone(),
-            None::<fn(usize)>,
-            ActivityTaskOptions {
-                max_worker_acts_per_second: None,
-                max_tps: None,
-            },
-            Arc::new(AtomicCell::new(None)),
-            Arc::new(NamespaceCapabilities {
-                graceful_poll_shutdown: AtomicBool::new(false),
-                poller_autoscaling: AtomicBool::new(false),
-            }),
-        );
-        let atm = WorkerActivityTasks::new(
-            sem.clone(),
-            Box::new(ap),
-            mock_client.clone(),
-            MetricsContext::no_op(),
-            Duration::from_secs(1),
-            Duration::from_secs(1),
-            None,
-            Duration::from_millis(0), // No buffer in this test
-        );
+        let atm = build_local_timeout_test_atm(mock_client.clone(), Duration::from_millis(0));
 
         let t = atm.poll().await.unwrap();
 
@@ -1130,35 +1116,7 @@ mod tests {
             .expect_record_activity_heartbeat()
             .returning(|_, _| Ok(Default::default()));
         let mock_client = Arc::new(mock_client);
-        let sem = fixed_size_permit_dealer(1);
-        let shutdown_token = CancellationToken::new();
-        let ap = LongPollBuffer::new_activity_task(
-            mock_client.clone(),
-            "tq".to_string(),
-            PollerBehavior::SimpleMaximum(1),
-            sem.clone(),
-            shutdown_token.clone(),
-            None::<fn(usize)>,
-            ActivityTaskOptions {
-                max_worker_acts_per_second: None,
-                max_tps: None,
-            },
-            Arc::new(AtomicCell::new(None)),
-            Arc::new(NamespaceCapabilities {
-                graceful_poll_shutdown: AtomicBool::new(false),
-                poller_autoscaling: AtomicBool::new(false),
-            }),
-        );
-        let atm = WorkerActivityTasks::new(
-            sem.clone(),
-            Box::new(ap),
-            mock_client.clone(),
-            MetricsContext::no_op(),
-            Duration::from_secs(1),
-            Duration::from_secs(1),
-            None,
-            Duration::from_millis(0), // No buffer in this test
-        );
+        let atm = build_local_timeout_test_atm(mock_client.clone(), Duration::from_millis(0));
 
         let t = atm.poll().await.unwrap();
         let tt = t.task_token.clone();
@@ -1239,35 +1197,7 @@ mod tests {
             .expect_poll_activity_task()
             .returning(|_, _| Ok(Default::default()));
         let mock_client = Arc::new(mock_client);
-        let sem = fixed_size_permit_dealer(1);
-        let shutdown_token = CancellationToken::new();
-        let ap = LongPollBuffer::new_activity_task(
-            mock_client.clone(),
-            "tq".to_string(),
-            PollerBehavior::SimpleMaximum(1),
-            sem.clone(),
-            shutdown_token.clone(),
-            None::<fn(usize)>,
-            ActivityTaskOptions {
-                max_worker_acts_per_second: None,
-                max_tps: None,
-            },
-            Arc::new(AtomicCell::new(None)),
-            Arc::new(NamespaceCapabilities {
-                graceful_poll_shutdown: AtomicBool::new(false),
-                poller_autoscaling: AtomicBool::new(false),
-            }),
-        );
-        let atm = WorkerActivityTasks::new(
-            sem.clone(),
-            Box::new(ap),
-            mock_client.clone(),
-            MetricsContext::no_op(),
-            Duration::from_secs(1),
-            Duration::from_secs(1),
-            None,
-            Duration::from_millis(0),
-        );
+        let atm = build_local_timeout_test_atm(mock_client.clone(), Duration::from_millis(0));
 
         let start = Instant::now();
         let t = atm.poll().await.unwrap();
@@ -1328,35 +1258,7 @@ mod tests {
             .expect_fail_activity_task()
             .returning(|_, _| Ok(Default::default()));
         let mock_client = Arc::new(mock_client);
-        let sem = fixed_size_permit_dealer(1);
-        let shutdown_token = CancellationToken::new();
-        let ap = LongPollBuffer::new_activity_task(
-            mock_client.clone(),
-            "tq".to_string(),
-            PollerBehavior::SimpleMaximum(1),
-            sem.clone(),
-            shutdown_token.clone(),
-            None::<fn(usize)>,
-            ActivityTaskOptions {
-                max_worker_acts_per_second: None,
-                max_tps: None,
-            },
-            Arc::new(AtomicCell::new(None)),
-            Arc::new(NamespaceCapabilities {
-                graceful_poll_shutdown: AtomicBool::new(false),
-                poller_autoscaling: AtomicBool::new(false),
-            }),
-        );
-        let atm = WorkerActivityTasks::new(
-            sem.clone(),
-            Box::new(ap),
-            mock_client.clone(),
-            MetricsContext::no_op(),
-            Duration::from_secs(1),
-            Duration::from_secs(1),
-            None,
-            Duration::from_millis(0),
-        );
+        let atm = build_local_timeout_test_atm(mock_client.clone(), Duration::from_millis(0));
 
         let t = atm.poll().await.unwrap();
         // Now wait a generous window for any spurious local cancel. If a
