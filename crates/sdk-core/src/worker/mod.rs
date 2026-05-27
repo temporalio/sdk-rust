@@ -1456,7 +1456,7 @@ impl Worker {
                         .store(false, Ordering::Relaxed);
                     debug!(
                         "shutdown_worker rpc unavailable during worker shutdown; \
-                         falling back to local poll shutdown: {:?}",
+                         disabling graceful poll shutdown and interrupting polls locally: {:?}",
                         err
                     );
                 }
