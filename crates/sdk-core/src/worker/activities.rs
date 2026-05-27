@@ -607,49 +607,20 @@ where
                                         .filter(|d| !d.is_zero())
                                         .map(|d| d + local_timeout_buffer)
                                 };
-                                let hb_sleep = to_sleep(task.resp.heartbeat_timeout);
-                                let s2c_sleep = to_sleep(task.resp.start_to_close_timeout);
-                                if hb_sleep.is_some() || s2c_sleep.is_some() {
+                                if let Some(timers) = LocalActivityTimers::new(
+                                    to_sleep(task.resp.heartbeat_timeout),
+                                    to_sleep(task.resp.start_to_close_timeout),
+                                ) {
+                                    let resetter = timers.heartbeat_resetter();
                                     let cancel_tx = cancels_tx.clone();
                                     let task_token = tt.clone();
-                                    // A resettable heartbeat timer and a non-resettable
-                                    // start_to_close timer run in parallel — whichever fires
-                                    // first cancels the activity. Heartbeats reset the heartbeat
-                                    // timer only; start_to_close is always enforced locally.
-                                    let resetter = hb_sleep.map(|_| Arc::new(Notify::new()));
-                                    let resetter_clone = resetter.clone();
                                     let local_timeouts_task =
                                         Some(tokio::task::spawn(async move {
-                                            let heartbeat_timer = async {
-                                                if let (Some(sleep_time), Some(rs)) =
-                                                    (hb_sleep, resetter_clone)
-                                                {
-                                                    loop {
-                                                        tokio::select! {
-                                                            _ = rs.notified() => continue,
-                                                            _ = tokio::time::sleep(sleep_time)
-                                                                => return "heartbeat",
-                                                        }
-                                                    }
-                                                }
-                                                std::future::pending::<&'static str>().await
-                                            };
-                                            let start_to_close_timer = async {
-                                                if let Some(sleep_time) = s2c_sleep {
-                                                    tokio::time::sleep(sleep_time).await;
-                                                    "start_to_close"
-                                                } else {
-                                                    std::future::pending::<&'static str>().await
-                                                }
-                                            };
-                                            let timeout_type = tokio::select! {
-                                                t = heartbeat_timer => t,
-                                                t = start_to_close_timer => t,
-                                            };
+                                            let timeout_type = timers.run().await;
                                             debug!(
                                                 task_token=%task_token,
-                                                "Timing out activity due to elapsed local \
-                                                 {timeout_type} timer"
+                                                "Timing out activity due to elapsed local {} timer",
+                                                timeout_type.as_str()
                                             );
                                             let _ = cancel_tx.send(PendingActivityCancel::new(
                                                 task_token,
@@ -762,6 +733,88 @@ fn worker_shutdown_failure() -> Failure {
                 ..Default::default()
             },
         )),
+    }
+}
+
+/// Which of an activity's two local timers fired first. Returned from
+/// [`LocalActivityTimers::run`] and used downstream only for logging.
+#[derive(Debug, Clone, Copy)]
+enum LocalActivityTimeout {
+    Heartbeat,
+    StartToClose,
+}
+
+impl LocalActivityTimeout {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Heartbeat => "heartbeat",
+            Self::StartToClose => "start_to_close",
+        }
+    }
+}
+
+/// Races a (resettable) heartbeat timer against a (non-resettable)
+/// `start_to_close` timer for one activity attempt. The heartbeat timer is
+/// reset every time the held [`Notify`] is signalled (by the heartbeat
+/// manager, when a heartbeat RPC ack arrives); the `start_to_close` timer
+/// just counts down. Whichever fires first wins.
+///
+/// Construction returns [`None`] when both timeouts are unset, so the
+/// caller knows not to spawn a local-timeouts task at all.
+struct LocalActivityTimers {
+    heartbeat: Option<(Duration, Arc<Notify>)>,
+    start_to_close: Option<Duration>,
+}
+
+impl LocalActivityTimers {
+    fn new(
+        heartbeat: Option<Duration>,
+        start_to_close: Option<Duration>,
+    ) -> Option<Self> {
+        if heartbeat.is_none() && start_to_close.is_none() {
+            return None;
+        }
+        Some(Self {
+            heartbeat: heartbeat.map(|d| (d, Arc::new(Notify::new()))),
+            start_to_close,
+        })
+    }
+
+    /// A clone of the [`Notify`] that resets the heartbeat timer, for the
+    /// heartbeat manager to signal. [`None`] when there's no heartbeat
+    /// timer in play.
+    fn heartbeat_resetter(&self) -> Option<Arc<Notify>> {
+        self.heartbeat.as_ref().map(|t| t.1.clone())
+    }
+
+    /// Drive the two timers concurrently; resolves with whichever fires
+    /// first. The losing arm is dropped (cancel-safe for both `sleep` and
+    /// `Notify::notified`).
+    async fn run(self) -> LocalActivityTimeout {
+        let heartbeat_timer = async {
+            if let Some((sleep_time, rs)) = self.heartbeat {
+                loop {
+                    tokio::select! {
+                        _ = rs.notified() => continue,
+                        _ = tokio::time::sleep(sleep_time)
+                            => return LocalActivityTimeout::Heartbeat,
+                    }
+                }
+            }
+            std::future::pending().await
+        };
+        let s2c_timer = async {
+            if let Some(sleep_time) = self.start_to_close {
+                tokio::time::sleep(sleep_time).await;
+                LocalActivityTimeout::StartToClose
+            } else {
+                std::future::pending().await
+            }
+        };
+        tokio::select! {
+            t = heartbeat_timer => t,
+            t = s2c_timer => t,
+        }
     }
 }
 
@@ -1165,9 +1218,7 @@ mod tests {
 
     // start_to_close < heartbeat_timeout: the start_to_close timer (the
     // shorter one) must fire even though there's a longer heartbeat timer
-    // also running. The buggy `min_by` code accidentally handled this
-    // correctly (no resetter on start_to_close → fires); the two-timer
-    // refactor should still handle it.
+    // also running.
     #[tokio::test]
     async fn start_to_close_fires_when_shorter_than_heartbeat() {
         let mut mock_client = mock_worker_client();
