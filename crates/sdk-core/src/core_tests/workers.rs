@@ -1,8 +1,10 @@
 use crate::{
     CompleteNexusError, PollError, prost_dur,
+    replay::canned_histories,
     test_help::{
         MockPollCfg, MockWorkerInputs, MocksHolder, QueueResponse, ResponseType, WorkerExt,
-        WorkerTestHelpers, build_fake_worker, build_mock_pollers, mock_worker, test_worker_cfg,
+        WorkerTestHelpers, build_fake_worker, build_mock_pollers, mock_worker, start_timer_cmd,
+        test_worker_cfg,
     },
     worker::{
         self, PollerBehavior,
@@ -13,18 +15,17 @@ use crate::{
     },
 };
 use futures_util::{stream, stream::StreamExt};
-use std::sync::{
-    Arc,
-    atomic::{AtomicBool, Ordering},
-};
-use std::{cell::RefCell, collections::HashMap, time::Duration};
-use temporalio_common::protos::temporal::api::{
-    namespace::v1::{NamespaceInfo, namespace_info::Capabilities},
-    workflowservice::v1::DescribeNamespaceResponse,
+use std::{
+    cell::RefCell,
+    collections::HashMap,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Duration,
 };
 use temporalio_common::{
     protos::{
-        canned_histories,
         coresdk::{
             ActivityTaskCompletion,
             activity_result::ActivityExecutionResult,
@@ -40,6 +41,7 @@ use temporalio_common::{
                 ApplicationFailureInfo, CanceledFailureInfo, Failure, NexusHandlerFailureInfo,
                 TimeoutFailureInfo, failure::FailureInfo,
             },
+            namespace::v1::{NamespaceInfo, namespace_info::Capabilities},
             nexus::{
                 self,
                 v1::{
@@ -49,18 +51,17 @@ use temporalio_common::{
                 },
             },
             workflowservice::v1::{
-                PollActivityTaskQueueResponse, PollNexusTaskQueueResponse,
-                PollWorkflowTaskQueueResponse, RespondActivityTaskCompletedResponse,
-                RespondNexusTaskCompletedResponse, RespondNexusTaskFailedResponse,
-                RespondWorkflowTaskCompletedResponse, ShutdownWorkerResponse,
+                DescribeNamespaceResponse, PollActivityTaskQueueResponse,
+                PollNexusTaskQueueResponse, PollWorkflowTaskQueueResponse,
+                RespondActivityTaskCompletedResponse, RespondNexusTaskCompletedResponse,
+                RespondNexusTaskFailedResponse, RespondWorkflowTaskCompletedResponse,
+                ShutdownWorkerResponse,
             },
         },
-        test_utils::start_timer_cmd,
     },
     worker::WorkerTaskTypes,
 };
-use tokio::sync::Notify;
-use tokio::sync::{Barrier, watch};
+use tokio::sync::{Barrier, Notify, watch};
 use uuid::Uuid;
 
 #[tokio::test]

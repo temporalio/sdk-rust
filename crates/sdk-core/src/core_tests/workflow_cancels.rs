@@ -1,21 +1,18 @@
 use crate::{
     job_assert,
+    replay::canned_histories,
     test_help::{
         ResponseType, WorkflowCachingPolicy::NonSticky, build_fake_worker, gen_assert_and_reply,
-        poll_and_reply,
+        poll_and_reply, start_timer_cmd,
     },
 };
 use rstest::rstest;
 use std::time::Duration;
-use temporalio_common::protos::{
-    canned_histories,
-    coresdk::{
-        workflow_activation::{WorkflowActivationJob, workflow_activation_job},
-        workflow_commands::{
-            CancelWorkflowExecution, CompleteWorkflowExecution, FailWorkflowExecution,
-        },
+use temporalio_common::protos::coresdk::{
+    workflow_activation::{WorkflowActivationJob, workflow_activation_job},
+    workflow_commands::{
+        CancelWorkflowExecution, CompleteWorkflowExecution, FailWorkflowExecution,
     },
-    test_utils::start_timer_cmd,
 };
 
 enum CompletionType {

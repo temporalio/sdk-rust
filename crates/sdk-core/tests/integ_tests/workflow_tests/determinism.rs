@@ -14,7 +14,6 @@ use temporalio_common::{
     UntypedWorkflow,
     data_converters::RawValue,
     protos::{
-        TestHistoryBuilder, canned_histories,
         coresdk::AsJsonPayloadExt,
         temporal::api::{
             enums::v1::{EventType, WorkflowTaskFailedCause},
@@ -30,7 +29,7 @@ use temporalio_sdk::{
     workflows,
 };
 use temporalio_sdk_core::{
-    replay::DEFAULT_WORKFLOW_TYPE,
+    replay::{DEFAULT_WORKFLOW_TYPE, TestHistoryBuilder, canned_histories},
     test_help::{CoreInternalFlags, MockPollCfg, ResponseType, mock_worker_client},
 };
 
@@ -58,8 +57,7 @@ impl TimerWfNondeterministic {
                     (),
                     ActivityOptions::start_to_close_timeout(Duration::from_secs(5)),
                 )
-                .await
-                .map_err(|e| anyhow::anyhow!("{e}"))?;
+                .await?;
             }
             _ => panic!("Ran too many times"),
         }
@@ -76,9 +74,11 @@ async fn test_determinism_error_then_recovers() {
 
     let run_ct = Arc::new(AtomicUsize::new(1));
     let run_ct_clone = run_ct.clone();
-    worker.register_workflow_with_factory(move || TimerWfNondeterministic {
-        run_ct: run_ct_clone.clone(),
-    });
+    worker
+        .register_workflow_with_factory(move || TimerWfNondeterministic {
+            run_ct: run_ct_clone.clone(),
+        })
+        .unwrap();
     let task_queue = starter.get_task_queue().to_owned();
     worker
         .submit_workflow(
@@ -128,9 +128,11 @@ async fn task_fail_causes_replay_unset_too_soon() {
 
     let did_fail = Arc::new(AtomicBool::new(false));
     let did_fail_clone = did_fail.clone();
-    worker.register_workflow_with_factory(move || TaskFailReplayWf {
-        did_fail: did_fail_clone.clone(),
-    });
+    worker
+        .register_workflow_with_factory(move || TaskFailReplayWf {
+            did_fail: did_fail_clone.clone(),
+        })
+        .unwrap();
 
     let task_queue = starter.get_task_queue().to_owned();
     let handle = worker
@@ -193,9 +195,11 @@ async fn test_panic_wf_task_rejected_properly() {
     let mut worker = mock_sdk(mh);
 
     let did_fail = Arc::new(AtomicBool::new(false));
-    worker.register_workflow_with_factory(move || TimerWfFailsOnce {
-        did_fail: did_fail.clone(),
-    });
+    worker
+        .register_workflow_with_factory(move || TimerWfFailsOnce {
+            did_fail: did_fail.clone(),
+        })
+        .unwrap();
     let task_queue = "fake_tq".to_owned();
     worker
         .submit_wf(
@@ -253,9 +257,11 @@ async fn test_wf_task_rejected_properly_due_to_nondeterminism(#[case] use_cache:
 
     let started_count = Arc::new(AtomicUsize::new(0));
     let count_clone = started_count.clone();
-    worker.register_workflow_with_factory(move || NondeterministicTimerWf {
-        started_count: count_clone.clone(),
-    });
+    worker
+        .register_workflow_with_factory(move || NondeterministicTimerWf {
+            started_count: count_clone.clone(),
+        })
+        .unwrap();
 
     let task_queue = "fake_tq".to_owned();
     worker
@@ -291,12 +297,10 @@ impl ActivityIdOrTypeChangeWf {
                         ..Default::default()
                     },
                 )
-                .await
-                .map_err(|e| anyhow::anyhow!("{e}"))?;
+                .await?;
             } else {
                 ctx.start_local_activity(StdActivities::no_op, (), Default::default())
-                    .await
-                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+                    .await?;
             }
         } else if id_change {
             ctx.start_activity(
@@ -306,16 +310,14 @@ impl ActivityIdOrTypeChangeWf {
                     .activity_id("I'm bad and wrong!".to_string())
                     .build(),
             )
-            .await
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
+            .await?;
         } else {
             ctx.start_activity(
                 StdActivities::no_op,
                 (),
                 ActivityOptions::start_to_close_timeout(Duration::from_secs(5)),
             )
-            .await
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
+            .await?;
         }
         Ok(())
     }
@@ -335,7 +337,7 @@ async fn activity_id_or_type_change_is_nondeterministic(
     } else {
         canned_histories::single_activity("1")
     };
-    t.set_flags_first_wft(&[CoreInternalFlags::IdAndTypeDeterminismChecks as u32], &[]);
+    t.set_flags_first_wft(&[CoreInternalFlags::IdAndTypeDeterminismChecks], &[]);
     t.set_wf_input((id_change, local_act).as_json_payload().unwrap());
     let mock = mock_worker_client();
     let mut mh = MockPollCfg::from_resp_batches(
@@ -362,7 +364,9 @@ async fn activity_id_or_type_change_is_nondeterministic(
             cfg.max_cached_workflows = 2;
         }
     });
-    worker.register_workflow::<ActivityIdOrTypeChangeWf>();
+    worker
+        .register_workflow::<ActivityIdOrTypeChangeWf>()
+        .unwrap();
 
     let task_queue = "fake_tq".to_owned();
     worker
@@ -385,7 +389,7 @@ impl ChildWfIdOrTypeChangeWf {
     #[run(name = DEFAULT_WORKFLOW_TYPE)]
     async fn run(ctx: &mut WorkflowContext<Self>, id_change: bool) -> WorkflowResult<()> {
         if id_change {
-            ctx.child_workflow(
+            ctx.start_child_workflow(
                 UntypedWorkflow::new("child"),
                 RawValue::new(vec![]),
                 ChildWorkflowOptions {
@@ -395,7 +399,7 @@ impl ChildWfIdOrTypeChangeWf {
             )
             .await?;
         } else {
-            ctx.child_workflow(
+            ctx.start_child_workflow(
                 UntypedWorkflow::new("not the child wf type"),
                 RawValue::new(vec![]),
                 ChildWorkflowOptions {
@@ -418,7 +422,7 @@ async fn child_wf_id_or_type_change_is_nondeterministic(
     let wf_id = "fakeid";
     let wf_type = DEFAULT_WORKFLOW_TYPE;
     let mut t = canned_histories::single_child_workflow("1");
-    t.set_flags_first_wft(&[CoreInternalFlags::IdAndTypeDeterminismChecks as u32], &[]);
+    t.set_flags_first_wft(&[CoreInternalFlags::IdAndTypeDeterminismChecks], &[]);
     t.set_wf_input(id_change.as_json_payload().unwrap());
     let mock = mock_worker_client();
     let mut mh = MockPollCfg::from_resp_batches(
@@ -446,7 +450,9 @@ async fn child_wf_id_or_type_change_is_nondeterministic(
         }
     });
 
-    worker.register_workflow::<ChildWfIdOrTypeChangeWf>();
+    worker
+        .register_workflow::<ChildWfIdOrTypeChangeWf>()
+        .unwrap();
 
     let task_queue = "fake_tq".to_owned();
     worker
@@ -495,9 +501,11 @@ async fn nondeterministic_future_detection_fails_wft() {
 
     let attempt = Arc::new(AtomicUsize::new(0));
     let attempt_clone = attempt.clone();
-    worker.register_workflow_with_factory(move || TokioSleepWf {
-        attempt: attempt_clone.clone(),
-    });
+    worker
+        .register_workflow_with_factory(move || TokioSleepWf {
+            attempt: attempt_clone.clone(),
+        })
+        .unwrap();
 
     let task_queue = starter.get_task_queue().to_owned();
     let handle = worker
@@ -581,7 +589,7 @@ async fn repro_channel_missing_because_nondeterminism() {
             cfg.ignore_evicts_on_shutdown = false;
         });
 
-        worker.register_workflow::<ReproChannelMissingWf>();
+        worker.register_workflow::<ReproChannelMissingWf>().unwrap();
 
         let task_queue = "fake_tq".to_owned();
         worker

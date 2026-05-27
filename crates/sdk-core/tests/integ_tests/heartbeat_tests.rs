@@ -2,32 +2,29 @@ use crate::common::{CoreWfStarter, activity_functions::StdActivities, init_core_
 use assert_matches::assert_matches;
 use std::time::Duration;
 use temporalio_client::WorkflowStartOptions;
-use temporalio_common::{
-    prost_dur,
-    protos::{
-        DEFAULT_ACTIVITY_TYPE,
-        coresdk::{
-            ActivityHeartbeat, ActivityTaskCompletion, IntoCompletion,
-            activity_result::{
-                self, ActivityExecutionResult, ActivityResolution, activity_resolution as act_res,
-            },
-            activity_task::activity_task,
-            workflow_activation::{
-                ResolveActivity, WorkflowActivationJob, workflow_activation_job,
-            },
-            workflow_commands::{ActivityCancellationType, ScheduleActivity},
-            workflow_completion::WorkflowActivationCompletion,
+use temporalio_common::protos::{
+    coresdk::{
+        ActivityHeartbeat, ActivityTaskCompletion, IntoCompletion,
+        activity_result::{
+            self, ActivityExecutionResult, ActivityResolution, activity_resolution as act_res,
         },
-        temporal::api::{
-            common::v1::{Payload, RetryPolicy},
-            enums::v1::TimeoutType,
-        },
-        test_utils::schedule_activity_cmd,
+        activity_task::activity_task,
+        workflow_activation::{ResolveActivity, WorkflowActivationJob, workflow_activation_job},
+        workflow_commands::{ActivityCancellationType, ScheduleActivity},
+        workflow_completion::WorkflowActivationCompletion,
+    },
+    temporal::api::{
+        common::v1::{Payload, RetryPolicy},
+        enums::v1::TimeoutType,
     },
 };
 use temporalio_macros::{workflow, workflow_methods};
 use temporalio_sdk::{ActivityExecutionError, ActivityOptions, WorkflowContext, WorkflowResult};
-use temporalio_sdk_core::test_help::{WorkerTestHelpers, drain_pollers_and_shutdown};
+use temporalio_sdk_core::{
+    prost_dur,
+    replay::DEFAULT_ACTIVITY_TYPE,
+    test_help::{WorkerTestHelpers, drain_pollers_and_shutdown, schedule_activity_cmd},
+};
 use tokio::time::sleep;
 
 #[workflow]
@@ -52,11 +49,13 @@ impl ActivityDoesntHeartbeatHitsTimeoutThenCompletesWf {
             )
             .await;
         let err = res.unwrap_err();
-        if let ActivityExecutionError::Failed(f) = &err {
-            assert_eq!(f.is_timeout(), Some(TimeoutType::Heartbeat));
-        } else {
+        let ActivityExecutionError::Failed(failure) = &err else {
             panic!("expected Failed, got {err:?}");
-        }
+        };
+        let Some(timeout) = failure.as_timeout() else {
+            panic!("expected timeout cause, got {failure:?}");
+        };
+        assert_eq!(timeout.timeout_type(), TimeoutType::Heartbeat);
         Ok(())
     }
 }
@@ -219,7 +218,9 @@ async fn activity_doesnt_heartbeat_hits_timeout_then_completes() {
     starter.sdk_config.register_activities(StdActivities);
     let mut worker = starter.worker().await;
 
-    worker.register_workflow::<ActivityDoesntHeartbeatHitsTimeoutThenCompletesWf>();
+    worker
+        .register_workflow::<ActivityDoesntHeartbeatHitsTimeoutThenCompletesWf>()
+        .unwrap();
 
     let task_queue = starter.get_task_queue().to_owned();
     let handle = worker

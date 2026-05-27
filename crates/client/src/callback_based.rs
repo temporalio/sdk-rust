@@ -4,7 +4,7 @@
 use anyhow::anyhow;
 use bytes::{BufMut, BytesMut};
 use futures_util::{future::BoxFuture, stream};
-use http::{HeaderMap, Request, Response};
+use http::{HeaderMap, HeaderValue, Request, Response};
 use http_body_util::{BodyExt, StreamBody, combinators::BoxBody};
 use hyper::body::{Bytes, Frame};
 use std::{
@@ -104,9 +104,12 @@ impl Service<Request<tonic::body::Body>> for CallbackBasedGrpcService {
                     let mut body_prepend = BytesMut::with_capacity(5);
                     body_prepend.put_u8(0); // 0 means no compression
                     body_prepend.put_u32(success.proto.len() as u32);
+                    let mut trailers = HeaderMap::new();
+                    trailers.insert("grpc-status", HeaderValue::from_static("0"));
                     let stream = stream::iter(vec![
                         Ok::<_, Status>(Frame::data(Bytes::from(body_prepend))),
                         Ok::<_, Status>(Frame::data(Bytes::from(success.proto))),
+                        Ok::<_, Status>(Frame::trailers(trailers)),
                     ]);
                     let stream_body = StreamBody::new(stream);
                     let full_body = BoxBody::new(stream_body).boxed();

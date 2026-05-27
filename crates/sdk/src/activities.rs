@@ -7,7 +7,7 @@
 //!     Arc,
 //!     atomic::{AtomicUsize, Ordering},
 //! };
-//! use temporalio_macros::activities;
+//! use temporalio_macros::{activities, activity_definitions};
 //! use temporalio_sdk::activities::{ActivityContext, ActivityError};
 //!
 //! struct MyActivities {
@@ -29,13 +29,15 @@
 //! }
 //!
 //! // If you need to refer to an activity that is defined externally, in a different codebase or
-//! // possibly a differenet language, you can simply leave the function body unimplemented like so:
+//! // possibly a different language, use `#[activity_definitions]`. Methods must omit the
+//! // `ActivityContext` parameter and have a body of `unimplemented!()`. Workflows can then call
+//! // these definitions just like real activities.
 //!
 //! struct ExternalActivities;
-//! #[activities]
+//! #[activity_definitions]
 //! impl ExternalActivities {
 //!     #[activity(name = "foo")]
-//!     async fn foo(_ctx: ActivityContext, _: String) -> Result<String, ActivityError> {
+//!     fn foo(_: String) -> Result<String, ActivityError> {
 //!         unimplemented!()
 //!     }
 //! }
@@ -47,22 +49,36 @@
 #[doc(inline)]
 pub use temporalio_macros::activities;
 
-use futures_util::{FutureExt, future::BoxFuture};
+use crate::{
+    OutgoingActivityError, OutgoingError,
+    interceptors::{
+        ActivityExecutionValue, ActivityInboundInterceptor, ExecuteActivityInput,
+        ExecuteActivityOutput, Next,
+    },
+    panic_formatter,
+};
+use futures_util::{
+    FutureExt,
+    future::{BoxFuture, ready},
+};
 use prost_types::{Duration, Timestamp};
 use std::{
     collections::HashMap,
     fmt::Debug,
+    panic::AssertUnwindSafe,
     sync::Arc,
     time::{Duration as StdDuration, SystemTime},
 };
 use temporalio_client::Priority;
+pub use temporalio_common::ActivityError;
 use temporalio_common::{
     ActivityDefinition,
     data_converters::{
         DataConverter, GenericPayloadConverter, SerializationContext, SerializationContextData,
     },
+    error::ApplicationFailure,
     protos::{
-        coresdk::{ActivityHeartbeat, activity_task},
+        coresdk::{ActivityHeartbeat, activity_result::ActivityExecutionResult, activity_task},
         temporal::api::common::v1::{Payload, RetryPolicy, WorkflowExecution},
         utilities::TryIntoOrNone,
     },
@@ -184,6 +200,10 @@ impl ActivityContext {
     pub fn headers(&self) -> &HashMap<String, Payload> {
         &self.header_fields
     }
+
+    pub(crate) fn headers_mut(&mut self) -> &mut HashMap<String, Payload> {
+        &mut self.header_fields
+    }
 }
 
 /// Various information about a specific activity attempt.
@@ -224,49 +244,6 @@ pub struct ActivityInfo {
     pub priority: Priority,
     /// Run ID of this activity execution. Only set for standalone activities.
     pub run_id: Option<String>,
-}
-
-/// Returned as errors from activity functions.
-#[derive(Debug)]
-pub enum ActivityError {
-    /// This error can be returned from activities to allow the explicit configuration of certain
-    /// error properties. It's also the default error type that arbitrary errors will be converted
-    /// into.
-    Retryable {
-        /// The underlying error
-        source: Box<dyn std::error::Error + Send + Sync + 'static>,
-        /// If specified, the next retry (if there is one) will occur after this delay
-        explicit_delay: Option<StdDuration>,
-    },
-    /// Return this error to indicate your activity is cancelling
-    Cancelled {
-        /// Some data to save as the cancellation reason
-        details: Option<Payload>,
-    },
-    /// Return this error to indicate that the activity should not be retried.
-    NonRetryable(Box<dyn std::error::Error + Send + Sync + 'static>),
-    /// Return this error to indicate that the activity will be completed outside of this activity
-    /// definition, by an external client.
-    WillCompleteAsync,
-}
-
-impl ActivityError {
-    /// Construct a cancelled error without details
-    pub fn cancelled() -> Self {
-        Self::Cancelled { details: None }
-    }
-}
-
-impl<E> From<E> for ActivityError
-where
-    E: Into<anyhow::Error>,
-{
-    fn from(source: E) -> Self {
-        Self::Retryable {
-            source: source.into().into_boxed_dyn_error(),
-            explicit_delay: None,
-        }
-    }
 }
 
 /// Deadline calculation.  This is a port of
@@ -336,10 +313,26 @@ pub(crate) type ActivityInvocation = Arc<
             Vec<Payload>,
             DataConverter,
             ActivityContext,
-        ) -> BoxFuture<'static, Result<Payload, ActivityError>>
+            Vec<Arc<dyn ActivityInboundInterceptor>>,
+        ) -> ExecuteActivityOutput<'static>
         + Send
         + Sync,
 >;
+
+fn call_execute_activity<'a>(
+    interceptors: &'a [Arc<dyn ActivityInboundInterceptor>],
+    input: ExecuteActivityInput,
+    next: Next<'a, ExecuteActivityInput, ExecuteActivityOutput<'a>>,
+) -> ExecuteActivityOutput<'a> {
+    if let Some((first, rest)) = interceptors.split_first() {
+        first.execute_activity(
+            input,
+            Next::new(move |input| call_execute_activity(rest, input, next)),
+        )
+    } else {
+        next.run(input)
+    }
+}
 
 #[doc(hidden)]
 pub trait ActivityImplementer {
@@ -376,26 +369,34 @@ impl ActivityDefinitions {
     pub fn register_activity<AD>(&mut self, instance: Arc<AD::Implementer>) -> &mut Self
     where
         AD: ActivityDefinition + ExecutableActivity,
+        AD::Input: Send + Sync,
         AD::Output: Send + Sync,
     {
         self.activities.insert(
             AD::name(),
-            Arc::new(move |payloads, dc, c| {
+            Arc::new(move |payloads, dc, c, activity_inbound_interceptors| {
                 let instance = instance.clone();
-                let dc = dc.clone();
                 async move {
-                    // Use PayloadConverter (not DataConverter) since the codec is applied
-                    // at the SDK/Core boundary by the visitor, not here.
+                    // Codec application happens at the SDK/Core boundary, so activity
+                    // implementations work with the payload converter directly.
                     let pc = dc.payload_converter();
                     let ctx = SerializationContext {
                         data: &SerializationContextData::Activity,
                         converter: pc,
                     };
-                    let deserialized: AD::Input = pc
-                        .from_payloads(&ctx, payloads)
-                        .map_err(ActivityError::from)?;
-                    let result = AD::execute(Some(instance), c, deserialized).await?;
-                    pc.to_payload(&ctx, &result).map_err(ActivityError::from)
+                    let input: AD::Input = pc.from_payloads(&ctx, payloads)?;
+                    let input = ExecuteActivityInput::new(c, Box::new(input));
+                    let leaf = activity_inbound_base::<AD>(instance);
+                    let activity_execution =
+                        call_execute_activity(&activity_inbound_interceptors, input, leaf);
+                    match AssertUnwindSafe(activity_execution).catch_unwind().await {
+                        Ok(output) => output,
+                        Err(panic) => Err(ApplicationFailure::new(anyhow::anyhow!(
+                            "Activity function panicked: {}",
+                            panic_formatter(panic)
+                        ))
+                        .into()),
+                    }
                 }
                 .boxed()
             }),
@@ -410,6 +411,72 @@ impl ActivityDefinitions {
     pub(crate) fn get(&self, act_type: &str) -> Option<ActivityInvocation> {
         self.activities.get(act_type).cloned()
     }
+
+    pub(crate) fn names(&self) -> Vec<&'static str> {
+        let mut names: Vec<_> = self.activities.keys().copied().collect();
+        names.sort_unstable();
+        names
+    }
+}
+
+fn activity_inbound_base<'a, AD>(
+    instance: Arc<AD::Implementer>,
+) -> Next<'a, ExecuteActivityInput, ExecuteActivityOutput<'a>>
+where
+    AD: ActivityDefinition + ExecutableActivity,
+    AD::Input: Send + Sync,
+    AD::Output: Send + Sync,
+{
+    Next::new(
+        move |input: ExecuteActivityInput| -> ExecuteActivityOutput<'a> {
+            let (activity_context, args) = input.into_parts();
+            let args = match args.downcast::<AD::Input>() {
+                Ok(args) => args,
+                Err(_) => {
+                    return ready(Err(ApplicationFailure::new(anyhow::anyhow!(
+                    "Activity inbound interceptor returned arguments with wrong concrete type for activity {}",
+                    AD::name()
+                ))
+                .into()))
+                .boxed();
+                }
+            };
+
+            async move {
+                match AssertUnwindSafe(AD::execute(Some(instance), activity_context, *args))
+                    .catch_unwind()
+                    .await
+                {
+                    Ok(result) => {
+                        result.map(|output| Box::new(output) as Box<dyn ActivityExecutionValue>)
+                    }
+                    Err(panic) => Err(ApplicationFailure::new(anyhow::anyhow!(
+                        "Activity function panicked: {}",
+                        panic_formatter(panic)
+                    ))
+                    .into()),
+                }
+            }
+            .boxed()
+        },
+    )
+}
+
+pub(crate) fn activity_error_to_core_result(
+    dc: &DataConverter,
+    err: ActivityError,
+) -> ActivityExecutionResult {
+    match err {
+        ActivityError::Application(app) => ActivityExecutionResult::fail(dc.to_failure(
+            &SerializationContextData::Activity,
+            OutgoingError::Activity(OutgoingActivityError::Application(app)),
+        )),
+        ActivityError::Cancelled { details } => ActivityExecutionResult::cancel(dc.to_failure(
+            &SerializationContextData::Activity,
+            OutgoingError::Activity(OutgoingActivityError::Cancelled { details }),
+        )),
+        ActivityError::WillCompleteAsync => ActivityExecutionResult::will_complete_async(),
+    }
 }
 
 impl Debug for ActivityDefinitions {
@@ -417,5 +484,55 @@ impl Debug for ActivityDefinitions {
         f.debug_struct("ActivityDefinitions")
             .field("activities", &self.activities.keys())
             .finish()
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+    use rstest::rstest;
+    use temporalio_common::error::ApplicationFailure;
+
+    #[rstest]
+    #[case(true)]
+    #[case(false)]
+    fn activity_error_conversion_is_not_lossy(#[case] non_retryable: bool) {
+        use temporalio_common::protos::temporal::api::enums::v1::ApplicationErrorCategory;
+
+        let original = ApplicationFailure::builder(anyhow::anyhow!("big boom"))
+            .type_name("BigBoom".to_owned())
+            .non_retryable(non_retryable)
+            .next_retry_delay(StdDuration::from_secs(3))
+            .category(ApplicationErrorCategory::Benign)
+            .details("details")
+            .build();
+        let err = ActivityError::from(original);
+        let ActivityError::Application(actual) = err else {
+            panic!("application failure should become app failure")
+        };
+        assert_eq!(actual.type_name(), Some("BigBoom"));
+        assert_eq!(actual.is_non_retryable(), non_retryable);
+        assert_eq!(actual.next_retry_delay(), Some(StdDuration::from_secs(3)));
+        assert_eq!(actual.category(), ApplicationErrorCategory::Benign);
+        assert_eq!(actual.to_string(), "big boom");
+    }
+
+    #[test]
+    fn activity_error_from_special_err_becomes_application() {
+        #[derive(Debug, PartialEq)]
+        struct MyError;
+
+        impl std::error::Error for MyError {}
+        impl std::fmt::Display for MyError {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("MyError")
+            }
+        }
+
+        let err = ActivityError::from(MyError);
+        let ActivityError::Application(actual) = err else {
+            panic!("expected application failure, got {err:?}")
+        };
+        assert_eq!(actual.to_string(), "MyError");
     }
 }

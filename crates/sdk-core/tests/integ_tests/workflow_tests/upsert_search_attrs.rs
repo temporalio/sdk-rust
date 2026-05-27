@@ -6,7 +6,6 @@ use temporalio_client::{
 };
 use temporalio_common::{
     protos::{
-        DEFAULT_WORKFLOW_TYPE, TestHistoryBuilder,
         coresdk::{AsJsonPayloadExt, FromJsonPayloadExt},
         temporal::api::{
             command::v1::{Command, command},
@@ -18,7 +17,10 @@ use temporalio_common::{
 };
 use temporalio_macros::{workflow, workflow_methods};
 use temporalio_sdk::{WorkflowContext, WorkflowResult, WorkflowTermination};
-use temporalio_sdk_core::test_help::MockPollCfg;
+use temporalio_sdk_core::{
+    replay::{DEFAULT_WORKFLOW_TYPE, TestHistoryBuilder},
+    test_help::MockPollCfg,
+};
 use uuid::Uuid;
 
 #[workflow]
@@ -57,7 +59,7 @@ async fn sends_upsert() {
     starter.sdk_config.task_types = WorkerTaskTypes::workflow_only();
     let mut worker = starter.worker().await;
 
-    worker.register_workflow::<SearchAttrUpdater>();
+    worker.register_workflow::<SearchAttrUpdater>().unwrap();
     let task_queue = starter.get_task_queue().to_owned();
     worker
         .submit_wf(
@@ -166,6 +168,6 @@ async fn upsert_search_attrs_from_workflow() {
     });
 
     let mut worker = build_fake_sdk(mock_cfg);
-    worker.register_workflow::<UpsertTestWf>();
+    worker.register_workflow::<UpsertTestWf>().unwrap();
     worker.run().await.unwrap();
 }

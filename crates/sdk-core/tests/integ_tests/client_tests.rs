@@ -5,8 +5,12 @@ use crate::common::{
     http_proxy::HttpProxy,
 };
 use assert_matches::assert_matches;
-use futures_util::FutureExt;
-use http_body_util::Full;
+use futures_util::{FutureExt, stream};
+use http_body_util::{BodyExt, StreamBody, combinators::BoxBody};
+use hyper::{
+    body::{Bytes, Frame},
+    http::{HeaderMap, HeaderValue},
+};
 use prost::Message;
 use std::{
     collections::HashMap,
@@ -538,14 +542,18 @@ where
         .encode(&mut buf)
         .expect("failed to encode response message");
 
-    // Props to o3-mini for giving me a cheap way to make a grpc response
     let mut frame = Vec::with_capacity(5 + buf.len());
     frame.push(0);
     let len = buf.len() as u32;
     frame.extend_from_slice(&len.to_be_bytes());
     frame.extend_from_slice(&buf);
-    let full_body = Full::new(frame.into());
-    let body = Body::new(full_body);
+    let mut trailers = HeaderMap::new();
+    trailers.insert("grpc-status", HeaderValue::from_static("0"));
+    let stream = stream::iter(vec![
+        Ok::<_, Status>(Frame::data(Bytes::from(frame))),
+        Ok::<_, Status>(Frame::trailers(trailers)),
+    ]);
+    let body = Body::new(BoxBody::new(StreamBody::new(stream)).boxed());
 
     // Build the HTTP response with the required gRPC headers.
     Response::builder()

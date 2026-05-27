@@ -19,7 +19,6 @@ use temporalio_client::{
 };
 use temporalio_common::{
     data_converters::RawValue,
-    prost_dur,
     protos::{
         coresdk::{
             IntoCompletion,
@@ -29,7 +28,6 @@ use temporalio_common::{
             workflow_completion::WorkflowActivationCompletion,
         },
         temporal::api::enums::v1::EventType,
-        test_utils::schedule_activity_cmd,
     },
     telemetry::{CoreLogStreamConsumer, Logger, TelemetryOptions},
 };
@@ -38,8 +36,8 @@ use temporalio_sdk::{ActivityOptions, WorkflowContext, WorkflowResult};
 use temporalio_sdk_core::{
     CoreRuntime, PollerBehavior, RuntimeOptions, TunerHolder,
     ephemeral_server::{TemporalDevServerConfig, default_cached_download},
-    init_worker,
-    test_help::{NAMESPACE, WorkerTestHelpers, drain_pollers_and_shutdown},
+    init_worker, prost_dur,
+    test_help::{NAMESPACE, WorkerTestHelpers, drain_pollers_and_shutdown, schedule_activity_cmd},
 };
 use tokio::{sync::Notify, time::timeout};
 use tracing::info;
@@ -292,7 +290,9 @@ async fn small_workflow_slots_and_pollers(#[values(false, true)] use_autoscaling
     starter.sdk_config.register_activities(StdActivities);
     let mut worker = starter.worker().await;
 
-    worker.register_workflow::<OnlyOneWorkflowSlotAndTwoPollers>();
+    worker
+        .register_workflow::<OnlyOneWorkflowSlotAndTwoPollers>()
+        .unwrap();
     let task_queue = starter.get_task_queue().to_owned();
     worker
         .submit_workflow(

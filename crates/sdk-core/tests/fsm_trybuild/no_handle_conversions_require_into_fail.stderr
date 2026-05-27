@@ -1,15 +1,20 @@
 error[E0277]: the trait bound `One: From<Two>` is not satisfied
- --> tests/fsm_trybuild/no_handle_conversions_require_into_fail.rs:9:5
-  |
-9 |     Two --(B)--> One;
-  |     ^^^ the trait `From<Two>` is not implemented for `One`
-  |
-  = note: required for `Two` to implement `Into<One>`
+  --> tests/fsm_trybuild/no_handle_conversions_require_into_fail.rs:9:5
+   |
+ 9 |     Two --(B)--> One;
+   |     ^^^ unsatisfied trait bound
+   |
+help: the trait `From<Two>` is not implemented for `One`
+  --> tests/fsm_trybuild/no_handle_conversions_require_into_fail.rs:13:1
+   |
+13 | pub struct One {}
+   | ^^^^^^^^^^^^^^
+   = note: required for `Two` to implement `Into<One>`
 note: required by a bound in `TransitionResult::<Sm, Ds>::from`
- --> $WORKSPACE/crates/common/src/fsm_trait.rs
-  |
-  |     pub fn from<CurrentState>(current_state: CurrentState) -> Self
-  |            ---- required by a bound in this associated function
-  |     where
-  |         CurrentState: Into<Ds>,
-  |                       ^^^^^^^^ required by this bound in `TransitionResult::<Sm, Ds>::from`
+  --> $WORKSPACE/crates/common/src/fsm_trait.rs
+   |
+   |     pub fn from<CurrentState>(current_state: CurrentState) -> Self
+   |            ---- required by a bound in this associated function
+   |     where
+   |         CurrentState: Into<Ds>,
+   |                       ^^^^^^^^ required by this bound in `TransitionResult::<Sm, Ds>::from`

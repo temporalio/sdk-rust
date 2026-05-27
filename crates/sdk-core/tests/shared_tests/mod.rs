@@ -14,9 +14,15 @@ use temporalio_client::{
 use temporalio_common::{
     UntypedWorkflow,
     protos::temporal::api::{
-        enums::v1::{EventType, WorkflowTaskFailedCause::GrpcMessageTooLarge},
-        history::v1::history_event::Attributes::{
-            WorkflowExecutionTerminatedEventAttributes, WorkflowTaskFailedEventAttributes,
+        enums::v1::{
+            EventType,
+            WorkflowTaskFailedCause::{self, GrpcMessageTooLarge},
+        },
+        history::v1::history_event::{
+            self,
+            Attributes::{
+                WorkflowExecutionTerminatedEventAttributes, WorkflowTaskFailedEventAttributes,
+            },
         },
     },
     worker::WorkerTaskTypes,
@@ -58,7 +64,8 @@ pub(crate) async fn grpc_message_too_large() {
         .sdk_config
         .register_workflow_with_factory(move || OversizeGrpcMessageWf {
             run_flag: run_flag_clone.clone(),
-        });
+        })
+        .unwrap();
 
     let mut sdk = starter.worker().await;
     sdk.submit_workflow(
@@ -137,7 +144,9 @@ pub(crate) async fn shutdown_during_active_timer_activity_workflows() {
         };
     starter.sdk_config.register_activities(StdActivities);
     let mut worker = starter.worker().await;
-    worker.register_workflow::<ShutdownTimerActivityLoopWf>();
+    worker
+        .register_workflow::<ShutdownTimerActivityLoopWf>()
+        .unwrap();
 
     let core = worker.core_worker();
     core.validate().await.unwrap();
@@ -197,9 +206,14 @@ pub(crate) async fn shutdown_during_active_timer_activity_workflows() {
         let bad_events: Vec<_> = history
             .events()
             .iter()
-            .filter(|e| {
-                e.event_type() == EventType::WorkflowTaskFailed
-                    || e.event_type() == EventType::WorkflowTaskTimedOut
+            .filter(|e| match &e.attributes {
+                Some(history_event::Attributes::WorkflowTaskFailedEventAttributes(f))
+                    if f.cause() != WorkflowTaskFailedCause::ForceCloseCommand =>
+                {
+                    true
+                }
+                Some(history_event::Attributes::WorkflowTaskTimedOutEventAttributes(_)) => true,
+                _ => false,
             })
             .collect();
         assert!(

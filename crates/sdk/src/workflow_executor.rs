@@ -10,41 +10,11 @@ use std::{
     },
     task::{Context, Poll, Wake, Waker},
 };
-
-thread_local! {
-    static SDK_WAKE_DEPTH: Cell<u32> = const { Cell::new(0) };
-}
-
-/// Guard that marks the current scope as an SDK-initiated wake source.
-///
-/// When the tracking waker's `wake()` is called while this guard is active
-/// (depth > 0), the wake is recognized as coming from SDK internals and is not
-/// flagged as nondeterministic. Nesting is safe via a depth counter, and the
-/// `Drop` impl ensures cleanup.
-pub(crate) struct SdkWakeGuard {
-    _priv: (), // prevent construction outside this module
-}
-
-impl SdkWakeGuard {
-    pub(crate) fn new() -> Self {
-        SDK_WAKE_DEPTH.with(|c| c.set(c.get() + 1));
-        Self { _priv: () }
-    }
-}
-
-impl Drop for SdkWakeGuard {
-    fn drop(&mut self) {
-        SDK_WAKE_DEPTH.with(|c| c.set(c.get() - 1));
-    }
-}
-
-fn is_sdk_wake() -> bool {
-    SDK_WAKE_DEPTH.with(|c| c.get() > 0)
-}
+use temporalio_workflow::runtime::is_sdk_wake;
 
 /// Persists across polls to accumulate non-SDK wake detection. Each poll creates a lightweight
 /// waker via [`WakeTracker::new_per_poll_waker`] that shares the detection flag but has the
-/// current parent waker baked in (no mutex needed).
+/// current parent waker baked in, which avoids sharing mutable waker state across polls.
 pub(crate) struct WakeTracker {
     non_sdk_wake_detected: Arc<AtomicBool>,
 }
@@ -56,8 +26,8 @@ impl WakeTracker {
         }
     }
 
-    /// Create a waker for this poll that forwards to `parent_waker` and sets the shared
-    /// detection flag on non-SDK wakes.
+    /// Create a waker for this poll that forwards to `parent_waker` and sets the shared detection
+    /// flag on non-SDK wakes.
     pub(crate) fn new_per_poll_waker(&self, parent_waker: &Waker) -> Waker {
         Waker::from(Arc::new(PerPollWakeTracker {
             non_sdk_wake_detected: self.non_sdk_wake_detected.clone(),
@@ -88,24 +58,10 @@ impl Wake for PerPollWakeTracker {
     }
 }
 
-/// A future wrapper that activates [`SdkWakeGuard`] during poll. Use this around futures whose
-/// internal waker machinery (e.g., `FuturesOrdered` inside `join_all`) would otherwise trigger
-/// false positives in nondeterminism detection.
-pub(crate) struct SdkGuardedFuture<F>(pub(crate) F);
-
-impl<F: Future + Unpin> Future for SdkGuardedFuture<F> {
-    type Output = F::Output;
-
-    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let _guard = SdkWakeGuard::new();
-        Pin::new(&mut self.0).poll(cx)
-    }
-}
-
 struct ExecutorShared {
     ready_queue: parking_lot::Mutex<VecDeque<u64>>,
-    /// Waker to notify when tasks are enqueued. Set by `shutdown` so it can
-    /// park instead of busy-polling when tasks are waiting on external events.
+    /// Waker to notify when tasks are enqueued. Set by `shutdown` so it can park instead of
+    /// busy-polling when tasks are waiting on external events.
     waker: parking_lot::Mutex<Option<Waker>>,
 }
 
@@ -189,6 +145,12 @@ pub(crate) struct WorkflowExecutor {
     shared: Arc<ExecutorShared>,
 }
 
+impl Default for WorkflowExecutor {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl WorkflowExecutor {
     pub(crate) fn new() -> Self {
         Self {
@@ -201,7 +163,8 @@ impl WorkflowExecutor {
         }
     }
 
-    /// Spawn a future onto this executor, returning a `!Send` join handle.
+    /// Spawn a future onto this executor and return a handle that resolves once the executor drains
+    /// that task to completion.
     pub(crate) fn spawn<F, T>(&self, future: F) -> TaskHandle<T>
     where
         F: Future<Output = T> + 'static,
@@ -246,7 +209,8 @@ impl WorkflowExecutor {
         self.tasks.borrow().is_empty()
     }
 
-    /// Drain remaining tasks until all complete.
+    /// Keep draining until no tasks remain because workflow shutdown must flush spawned handlers
+    /// before the activation can be considered quiescent.
     pub(crate) async fn shutdown(&self) {
         std::future::poll_fn(|cx| {
             *self.shared.waker.lock() = Some(cx.waker().clone());
@@ -260,7 +224,8 @@ impl WorkflowExecutor {
         .await
     }
 
-    /// Drain the ready queue, polling all ready tasks once.
+    /// Poll each ready task once so wake-ups that happen during polling are re-queued instead of
+    /// recursively draining the executor on the same stack.
     pub(crate) fn process_tasks(&self) {
         loop {
             let task_id = self.shared.ready_queue.lock().pop_front();
@@ -281,6 +246,7 @@ impl WorkflowExecutor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use temporalio_workflow::runtime::SdkWakeGuard;
     use tokio::sync::oneshot;
 
     #[tokio::test]
@@ -369,17 +335,16 @@ mod tests {
     fn sdk_wake_guard_nesting() {
         assert!(!is_sdk_wake());
 
-        let _g1 = SdkWakeGuard::new();
+        let guard1 = SdkWakeGuard::new();
         assert!(is_sdk_wake());
 
         {
-            let _g2 = SdkWakeGuard::new();
+            let _guard2 = SdkWakeGuard::new();
             assert!(is_sdk_wake());
         }
-        // g2 dropped, but g1 still active
         assert!(is_sdk_wake());
 
-        drop(_g1);
+        drop(guard1);
         assert!(!is_sdk_wake());
     }
 
@@ -390,7 +355,6 @@ mod tests {
             panic!("test panic");
         }));
         assert!(result.is_err());
-        // Guard was cleaned up by Drop despite the panic
         assert!(!is_sdk_wake());
     }
 
@@ -400,11 +364,9 @@ mod tests {
         let noop = Waker::noop();
         let waker = tracker.new_per_poll_waker(noop);
 
-        // Wake without SDK guard -- should be detected
         waker.wake_by_ref();
         assert!(tracker.take_non_sdk_wake());
 
-        // Wake with SDK guard -- should not be detected
         let _guard = SdkWakeGuard::new();
         waker.wake_by_ref();
         assert!(!tracker.take_non_sdk_wake());
@@ -416,10 +378,8 @@ mod tests {
         let noop = Waker::noop();
         let waker = tracker.new_per_poll_waker(noop);
 
-        // Set SDK guard on THIS thread
         let _guard = SdkWakeGuard::new();
 
-        // Wake from another thread -- thread-local not set there
         let handle = std::thread::spawn(move || {
             waker.wake_by_ref();
         });

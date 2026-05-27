@@ -135,8 +135,8 @@ async fn async_activity_completions(
                     let err = activity_result.expect_err("expected failure");
                     if let ActivityExecutionError::Failed(failure) = err {
                         // The failure we sent is wrapped as the cause
-                        let cause = failure.cause.expect("cause should be present");
-                        assert_eq!(cause.message, "async failure reason");
+                        let cause = failure.cause().expect("cause should be present");
+                        assert_eq!(cause.failure().message, "async failure reason");
                     } else {
                         panic!("expected Failed, got {err:?}");
                     }
@@ -153,7 +153,9 @@ async fn async_activity_completions(
         }
     }
 
-    worker.register_workflow::<AsyncCompletionWorkflow>();
+    worker
+        .register_workflow::<AsyncCompletionWorkflow>()
+        .unwrap();
 
     let completion_task = tokio::spawn(async move {
         let info = info_rx.recv().await.expect("should receive activity info");

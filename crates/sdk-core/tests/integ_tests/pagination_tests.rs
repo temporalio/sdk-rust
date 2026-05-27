@@ -3,18 +3,18 @@ use std::sync::{
     Arc,
     atomic::{AtomicUsize, Ordering},
 };
-use temporalio_common::protos::{
-    DEFAULT_WORKFLOW_TYPE, TestHistoryBuilder,
-    temporal::api::{
-        common::v1::WorkflowExecution,
-        enums::v1::{EventType, WorkflowTaskFailedCause},
-        history::v1::{History, HistoryEvent},
-        workflowservice::v1::GetWorkflowExecutionHistoryResponse,
-    },
+use temporalio_common::protos::temporal::api::{
+    common::v1::WorkflowExecution,
+    enums::v1::{EventType, WorkflowTaskFailedCause},
+    history::v1::{History, HistoryEvent},
+    workflowservice::v1::GetWorkflowExecutionHistoryResponse,
 };
 use temporalio_macros::{workflow, workflow_methods};
 use temporalio_sdk::{SyncWorkflowContext, WorkflowContext, WorkflowResult};
-use temporalio_sdk_core::test_help::{MockPollCfg, ResponseType, mock_worker_client};
+use temporalio_sdk_core::{
+    replay::{DEFAULT_WORKFLOW_TYPE, TestHistoryBuilder},
+    test_help::{MockPollCfg, ResponseType, mock_worker_client},
+};
 
 #[workflow]
 struct WeirdPaginationWf {
@@ -125,10 +125,12 @@ async fn weird_pagination_doesnt_drop_wft_events() {
 
     let sig_ctr = Arc::new(AtomicUsize::new(0));
     let sig_ctr_clone = sig_ctr.clone();
-    worker.register_workflow_with_factory(move || WeirdPaginationWf {
-        sig_ctr: sig_ctr_clone.clone(),
-        signal_count: 0,
-    });
+    worker
+        .register_workflow_with_factory(move || WeirdPaginationWf {
+            sig_ctr: sig_ctr_clone.clone(),
+            signal_count: 0,
+        })
+        .unwrap();
 
     worker.run_until_done().await.unwrap();
     assert_eq!(sig_ctr.load(Ordering::Acquire), 2);
@@ -268,10 +270,12 @@ async fn extreme_pagination_doesnt_drop_wft_events_worker() {
 
     let sig_ctr = Arc::new(AtomicUsize::new(0));
     let sig_ctr_clone = sig_ctr.clone();
-    worker.register_workflow_with_factory(move || ExtremePaginationWf {
-        sig_ctr: sig_ctr_clone.clone(),
-        signal_count: 0,
-    });
+    worker
+        .register_workflow_with_factory(move || ExtremePaginationWf {
+            sig_ctr: sig_ctr_clone.clone(),
+            signal_count: 0,
+        })
+        .unwrap();
 
     worker.run_until_done().await.unwrap();
     assert_eq!(sig_ctr.load(Ordering::Acquire), 6);

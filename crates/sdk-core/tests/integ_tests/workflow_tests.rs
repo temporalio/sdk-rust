@@ -40,9 +40,7 @@ use temporalio_client::{
 };
 use temporalio_common::{
     data_converters::RawValue,
-    prost_dur,
     protos::{
-        DEFAULT_WORKFLOW_TYPE, canned_histories,
         coresdk::{
             ActivityTaskCompletion, AsJsonPayloadExt, IntoCompletion,
             activity_result::ActivityExecutionResult,
@@ -61,7 +59,6 @@ use temporalio_common::{
             sdk::v1::UserMetadata,
             workflowservice::v1::ResetStickyTaskQueueRequest,
         },
-        test_utils::schedule_activity_cmd,
     },
     worker::{WorkerDeploymentOptions, WorkerDeploymentVersion, WorkerTaskTypes},
 };
@@ -71,9 +68,11 @@ use temporalio_sdk::{
     interceptors::WorkerInterceptor,
 };
 use temporalio_sdk_core::{
-    CoreRuntime, PollError, PollerBehavior, TunerHolder, WorkflowErrorType,
-    replay::HistoryForReplay,
-    test_help::{MockPollCfg, WorkerTestHelpers, drain_pollers_and_shutdown},
+    CoreRuntime, PollError, PollerBehavior, TunerHolder, WorkflowErrorType, prost_dur,
+    replay::{DEFAULT_WORKFLOW_TYPE, HistoryForReplay, canned_histories},
+    test_help::{
+        MockPollCfg, WorkerTestHelpers, drain_pollers_and_shutdown, schedule_activity_cmd,
+    },
 };
 use tokio::{join, sync::Notify, time::sleep};
 use tonic::IntoRequest;
@@ -100,7 +99,7 @@ async fn parallel_workflows_same_queue() {
     starter.sdk_config.task_types = WorkerTaskTypes::workflow_only();
     let mut core = starter.worker().await;
 
-    core.register_workflow::<ParallelWorkflowsWf>();
+    core.register_workflow::<ParallelWorkflowsWf>().unwrap();
     let task_queue = starter.get_task_queue().to_owned();
     for i in 0..25 {
         core.submit_workflow(
@@ -506,8 +505,7 @@ impl SlowCompletesWf {
                 "hi!".to_string(),
                 ActivityOptions::start_to_close_timeout(Duration::from_secs(5)),
             )
-            .await
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
+            .await?;
             ctx.timer(Duration::from_secs(1)).await;
         }
         Ok(())
@@ -524,7 +522,7 @@ async fn slow_completes_with_small_cache() {
 
     worker.register_activities(StdActivities);
 
-    worker.register_workflow::<SlowCompletesWf>();
+    worker.register_workflow::<SlowCompletesWf>().unwrap();
     let task_queue = starter.get_task_queue().to_owned();
     for i in 0..20 {
         worker
@@ -839,7 +837,7 @@ async fn nondeterminism_errors_fail_workflow_when_configured_to(
         }
     }
 
-    worker.register_workflow::<NondeterminismTimerWf>();
+    worker.register_workflow::<NondeterminismTimerWf>().unwrap();
     let client = starter.get_client().await;
     let core_worker = worker.core_worker();
     starter.start_with_worker(wf_name, &mut worker).await;
@@ -882,13 +880,14 @@ async fn nondeterminism_errors_fail_workflow_when_configured_to(
                 "hi".to_owned(),
                 ActivityOptions::start_to_close_timeout(Duration::from_secs(5)),
             )
-            .await
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
+            .await?;
             Ok(())
         }
     }
 
-    worker.register_workflow::<NondeterminismActivityWf>();
+    worker
+        .register_workflow::<NondeterminismActivityWf>()
+        .unwrap();
     // We need to generate a task so that we'll encounter the error (first avoid WFT timeout)
     WorkflowService::reset_sticky_task_queue(
         &mut client.clone(),
@@ -957,15 +956,13 @@ async fn history_out_of_order_on_restart() {
                     ..Default::default()
                 },
             )
-            .await
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
+            .await?;
             ctx.start_activity(
                 StdActivities::echo,
                 "hi".to_string(),
                 ActivityOptions::start_to_close_timeout(Duration::from_secs(5)),
             )
-            .await
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
+            .await?;
             ctx.state(|wf| wf.hit_sleep.notify_one());
             ctx.timer(Duration::from_secs(5)).await;
             Ok(())
@@ -988,8 +985,7 @@ async fn history_out_of_order_on_restart() {
                     ..Default::default()
                 },
             )
-            .await
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
+            .await?;
             // Timer is added after restarting workflow
             ctx.timer(Duration::from_secs(1)).await;
             ctx.start_activity(
@@ -997,8 +993,7 @@ async fn history_out_of_order_on_restart() {
                 "hi".to_string(),
                 ActivityOptions::start_to_close_timeout(Duration::from_secs(5)),
             )
-            .await
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
+            .await?;
             ctx.timer(Duration::from_secs(2)).await;
             Ok(())
         }
@@ -1006,10 +1001,12 @@ async fn history_out_of_order_on_restart() {
 
     worker.register_activities(StdActivities);
     worker2.register_activities(StdActivities);
-    worker.register_workflow_with_factory(move || HistoryOutOfOrderWf1 {
-        hit_sleep: hit_sleep_clone1.clone(),
-    });
-    worker2.register_workflow::<HistoryOutOfOrderWf2>();
+    worker
+        .register_workflow_with_factory(move || HistoryOutOfOrderWf1 {
+            hit_sleep: hit_sleep_clone1.clone(),
+        })
+        .unwrap();
+    worker2.register_workflow::<HistoryOutOfOrderWf2>().unwrap();
     let task_queue = starter.get_task_queue().to_owned();
     worker
         .submit_workflow(
@@ -1086,7 +1083,7 @@ async fn pass_timer_summary_to_metadata() {
     }
 
     let mut worker = mock_sdk_cfg(mock_cfg, |_| {});
-    worker.register_workflow::<PassTimerSummaryWf>();
+    worker.register_workflow::<PassTimerSummaryWf>().unwrap();
     worker
         .submit_wf(
             DEFAULT_WORKFLOW_TYPE.to_owned(),

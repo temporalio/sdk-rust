@@ -12,13 +12,13 @@ use std::{
     thread,
     time::Duration,
 };
-use temporalio_common::{
-    protos::{DEFAULT_WORKFLOW_TYPE, canned_histories},
-    telemetry::metrics::{MetricKeyValue, MetricParameters, NewAttributes},
-};
+use temporalio_common::telemetry::metrics::{MetricKeyValue, MetricParameters, NewAttributes};
 use temporalio_macros::{workflow, workflow_methods};
 use temporalio_sdk::{SyncWorkflowContext, WorkflowContext, WorkflowResult};
-use temporalio_sdk_core::{CoreRuntime, replay::HistoryForReplay};
+use temporalio_sdk_core::{
+    CoreRuntime,
+    replay::{DEFAULT_WORKFLOW_TYPE, HistoryForReplay, canned_histories},
+};
 
 pub fn criterion_benchmark(c: &mut Criterion) {
     let tokio_runtime = tokio::runtime::Builder::new_current_thread()
@@ -36,7 +36,9 @@ pub fn criterion_benchmark(c: &mut Criterion) {
         b.to_async(&tokio_runtime).iter_batched(
             || replay_sdk_worker([hist.clone()]),
             |mut worker| async move {
-                worker.register_workflow_with_factory(move || TimersWf { num_timers });
+                worker
+                    .register_workflow_with_factory(move || TimersWf { num_timers })
+                    .unwrap();
                 worker.run().await.unwrap();
             },
             BatchSize::SmallInput,
@@ -51,10 +53,12 @@ pub fn criterion_benchmark(c: &mut Criterion) {
         b.to_async(&tokio_runtime).iter_batched(
             || replay_sdk_worker([hist.clone()]),
             |mut worker| async move {
-                worker.register_workflow_with_factory(move || BigSignalsWf {
-                    num_tasks,
-                    signal_count: 0,
-                });
+                worker
+                    .register_workflow_with_factory(move || BigSignalsWf {
+                        num_tasks,
+                        signal_count: 0,
+                    })
+                    .unwrap();
                 worker.run().await.unwrap();
             },
             BatchSize::SmallInput,

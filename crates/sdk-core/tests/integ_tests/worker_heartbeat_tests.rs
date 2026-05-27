@@ -18,7 +18,6 @@ use temporalio_client::{
     grpc::WorkflowService,
 };
 use temporalio_common::{
-    prost_dur,
     protos::{
         coresdk::AsJsonPayloadExt,
         temporal::api::{
@@ -40,7 +39,7 @@ use temporalio_sdk::{
 };
 use temporalio_sdk_core::{
     CoreRuntime, PollerBehavior, ResourceBasedTuner, ResourceSlotOptions, RuntimeOptions,
-    TunerHolder,
+    TunerHolder, prost_dur,
 };
 use tokio::{sync::Notify, time::sleep};
 use tonic::IntoRequest;
@@ -210,7 +209,7 @@ async fn docker_worker_heartbeat_basic(#[values("otel", "prom", "no_metrics")] b
         }
     }
 
-    worker.register_workflow::<HeartbeatBasicWf>();
+    worker.register_workflow::<HeartbeatBasicWf>().unwrap();
 
     starter
         .start_with_worker(HeartbeatBasicWf::name(), &mut worker)
@@ -383,7 +382,7 @@ async fn docker_worker_heartbeat_tuner() {
         }
     }
 
-    worker.register_workflow::<HeartbeatTunerWf>();
+    worker.register_workflow::<HeartbeatTunerWf>().unwrap();
 
     starter
         .start_with_worker(HeartbeatTunerWf::name(), &mut worker)
@@ -669,7 +668,7 @@ async fn worker_heartbeat_sticky_cache_miss() {
         }
     }
 
-    worker.register_workflow::<StickyCacheMissWf>();
+    worker.register_workflow::<StickyCacheMissWf>().unwrap();
 
     let wf1_id = format!("{wf_name}_wf1");
     let wf2_id = format!("{wf_name}_wf2");
@@ -772,11 +771,11 @@ async fn worker_heartbeat_multiple_workers() {
     }
 
     let mut worker_a = starter.worker().await;
-    worker_a.register_workflow::<MultiWorkersWf>();
+    worker_a.register_workflow::<MultiWorkersWf>().unwrap();
 
     let mut starter_b = starter.clone_no_worker();
     let mut worker_b = starter_b.worker().await;
-    worker_b.register_workflow::<MultiWorkersWf>();
+    worker_b.register_workflow::<MultiWorkersWf>().unwrap();
 
     let worker_a_key = worker_a.worker_instance_key().to_string();
     let worker_b_key = worker_b.worker_instance_key().to_string();
@@ -929,7 +928,7 @@ async fn worker_heartbeat_failure_metrics() {
         }
     }
 
-    worker.register_workflow::<FailureMetricsWf>();
+    worker.register_workflow::<FailureMetricsWf>().unwrap();
 
     let worker_key = worker_instance_key.to_string();
     let task_queue = starter.get_task_queue().to_owned();
@@ -1050,7 +1049,7 @@ async fn worker_heartbeat_no_runtime_heartbeat() {
         }
     }
 
-    worker.register_workflow::<NoRuntimeHeartbeatWf>();
+    worker.register_workflow::<NoRuntimeHeartbeatWf>().unwrap();
 
     starter
         .start_with_worker(NoRuntimeHeartbeatWf::name(), &mut worker)
@@ -1120,7 +1119,9 @@ async fn worker_heartbeat_skip_client_worker_set_check() {
         }
     }
 
-    worker.register_workflow::<SkipClientWorkerSetCheckWf>();
+    worker
+        .register_workflow::<SkipClientWorkerSetCheckWf>()
+        .unwrap();
 
     starter
         .start_with_worker(SkipClientWorkerSetCheckWf::name(), &mut worker)

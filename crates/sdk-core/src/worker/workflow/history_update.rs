@@ -805,17 +805,14 @@ fn find_end_index_of_next_wft_seq(
 mod tests {
     use super::*;
     use crate::{
-        replay::{HistoryInfo, TestHistoryBuilder},
+        replay::{HistoryInfo, TestHistoryBuilder, canned_histories},
         test_help::{ResponseType, hist_to_poll_resp},
         worker::client::mocks::mock_worker_client,
     };
     use futures_util::TryStreamExt;
-    use temporalio_common::protos::{
-        canned_histories,
-        temporal::api::{
-            common::v1::WorkflowExecution, enums::v1::WorkflowTaskFailedCause,
-            workflowservice::v1::GetWorkflowExecutionHistoryResponse,
-        },
+    use temporalio_common::protos::temporal::api::{
+        common::v1::WorkflowExecution, enums::v1::WorkflowTaskFailedCause,
+        workflowservice::v1::GetWorkflowExecutionHistoryResponse,
     };
 
     impl From<HistoryInfo> for HistoryUpdate {

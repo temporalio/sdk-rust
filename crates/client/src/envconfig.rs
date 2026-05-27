@@ -89,6 +89,7 @@ fn build_tls_options(tls: ClientConfigTLS) -> Result<TlsOptions, ConfigError> {
         server_root_ca_cert,
         domain: tls.server_name,
         client_tls_options,
+        server_cert_verifier: None,
     })
 }
 

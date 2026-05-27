@@ -761,10 +761,17 @@ where
     /// Describes the current schedule, applies the closure to modify it, and
     /// sends the update. The conflict token is managed automatically.
     ///
-    /// ```ignore
-    /// handle.update(|u| {
-    ///     u.set_note("updated").set_paused(true);
-    /// }).await?;
+    /// ```no_run
+    /// # async fn hidden(
+    /// #     handle: &temporalio_client::schedules::ScheduleHandle<temporalio_client::Client>,
+    /// # ) -> Result<(), temporalio_client::schedules::ScheduleError> {
+    /// handle
+    ///     .update(|u| {
+    ///         u.set_note("updated").set_paused(true);
+    ///     })
+    ///     .await?;
+    /// # Ok(())
+    /// # }
     /// ```
     // TODO: Add a retry loop for conflict token mismatch. The server
     // returns FailedPrecondition with "mismatched conflict token".

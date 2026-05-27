@@ -31,7 +31,7 @@ async fn list_workflows(#[case] limit: Option<usize>) {
     starter.sdk_config.task_types = WorkerTaskTypes::workflow_only();
     let client = starter.get_client().await;
     let mut worker = starter.worker().await;
-    worker.register_workflow::<EmptyWorkflow>();
+    worker.register_workflow::<EmptyWorkflow>().unwrap();
 
     let suffix = rand_6_chars();
     let num_workflows = 5;

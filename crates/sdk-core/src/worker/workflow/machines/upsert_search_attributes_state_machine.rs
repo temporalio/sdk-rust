@@ -253,10 +253,7 @@ mod tests {
         t.add_by_type(EventType::WorkflowExecutionStarted);
         t.add_full_wf_task();
         if flag_in_history {
-            t.set_flags_first_wft(
-                &[CoreInternalFlags::UpsertSearchAttributeOnPatch as u32],
-                &[],
-            );
+            t.set_flags_first_wft(&[CoreInternalFlags::UpsertSearchAttributeOnPatch], &[]);
         }
         if with_patched_cmd {
             t.add_has_change_marker(&patch_id, false);

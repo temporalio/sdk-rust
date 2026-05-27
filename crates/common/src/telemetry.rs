@@ -3,7 +3,7 @@
 /// Metric instrument types and the [`CoreMeter`] trait.
 pub mod metrics;
 
-#[cfg(feature = "core-based-sdk")]
+#[cfg(feature = "core-telemetry-bridge")]
 mod log_export;
 #[cfg(feature = "otel")]
 mod otel;
@@ -31,10 +31,10 @@ use tracing::{Level, Subscriber};
 use tracing_subscriber::{EnvFilter, Layer, layer::SubscriberExt};
 use url::Url;
 
-#[cfg(feature = "core-based-sdk")]
+#[cfg(feature = "core-telemetry-bridge")]
 use crate::telemetry::log_export::CoreLogConsumerLayer;
 
-#[cfg(feature = "core-based-sdk")]
+#[cfg(feature = "core-telemetry-bridge")]
 pub use log_export::{CoreLogBuffer, CoreLogBufferedConsumer, CoreLogStreamConsumer};
 #[cfg(feature = "otel")]
 pub use otel::build_otlp_metric_exporter;
@@ -200,13 +200,13 @@ pub enum Logger {
         /// An [EnvFilter](https://docs.rs/tracing-subscriber/latest/tracing_subscriber/struct.EnvFilter.html) filter string.
         filter: String,
     },
-    #[cfg(feature = "core-based-sdk")]
+    #[cfg(feature = "core-telemetry-bridge")]
     /// Forward logs to Lang - collectable with `fetch_global_buffered_logs`.
     Forward {
         /// An [EnvFilter](https://docs.rs/tracing-subscriber/latest/tracing_subscriber/struct.EnvFilter.html) filter string.
         filter: String,
     },
-    #[cfg(feature = "core-based-sdk")]
+    #[cfg(feature = "core-telemetry-bridge")]
     /// Push logs to Lang. Can be used with
     /// temporalio_sdk_core::telemetry::log_export::CoreLogBufferedConsumer to buffer.
     Push {
@@ -277,7 +277,7 @@ pub trait CoreLogConsumer: Send + Sync + Debug {
     fn on_log(&self, log: CoreLog);
 }
 
-#[cfg(feature = "core-based-sdk")]
+#[cfg(feature = "core-telemetry-bridge")]
 const FORWARD_LOG_BUFFER_SIZE: usize = 2048;
 
 /// Help you construct an [EnvFilter] compatible filter string which will forward all core module
@@ -291,7 +291,7 @@ pub fn construct_filter_string(core_level: Level, other_level: Level) -> String 
 /// Holds initialized tracing/metrics exporters, etc
 pub struct TelemetryInstance {
     metric_prefix: String,
-    #[cfg(feature = "core-based-sdk")]
+    #[cfg(feature = "core-telemetry-bridge")]
     logs_out: Option<parking_lot::Mutex<CoreLogBuffer>>,
     metrics: Option<Arc<dyn CoreMeter + 'static>>,
     /// The tracing subscriber which is associated with this telemetry instance. May be `None` if
@@ -372,7 +372,7 @@ pub fn remove_trace_subscriber_for_current_thread() {
     SUB_GUARD.take();
 }
 
-#[cfg(feature = "core-based-sdk")]
+#[cfg(feature = "core-telemetry-bridge")]
 impl CoreTelemetry for TelemetryInstance {
     fn fetch_buffered_logs(&self) -> Vec<CoreLog> {
         if let Some(logs_out) = self.logs_out.as_ref() {
@@ -390,13 +390,13 @@ impl CoreTelemetry for TelemetryInstance {
 ///
 /// See [TelemetryOptions] docs for more on configuration.
 pub fn telemetry_init(opts: TelemetryOptions) -> Result<TelemetryInstance, anyhow::Error> {
-    #[cfg(feature = "core-based-sdk")]
+    #[cfg(feature = "core-telemetry-bridge")]
     let mut logs_out = None;
 
     // Tracing subscriber layers =========
     let mut console_pretty_layer = None;
     let mut console_compact_layer = None;
-    #[cfg(feature = "core-based-sdk")]
+    #[cfg(feature = "core-telemetry-bridge")]
     let mut forward_layer = None;
     // ===================================
 
@@ -431,14 +431,14 @@ pub fn telemetry_init(opts: TelemetryOptions) -> Result<TelemetryInstance, anyho
                         )
                     }
                 }
-                #[cfg(feature = "core-based-sdk")]
+                #[cfg(feature = "core-telemetry-bridge")]
                 Logger::Forward { filter } => {
                     let (export_layer, lo) =
                         CoreLogConsumerLayer::new_buffered(FORWARD_LOG_BUFFER_SIZE);
                     logs_out = Some(parking_lot::Mutex::new(lo));
                     forward_layer = Some(export_layer.with_filter(EnvFilter::new(filter)));
                 }
-                #[cfg(feature = "core-based-sdk")]
+                #[cfg(feature = "core-telemetry-bridge")]
                 Logger::Push { filter, consumer } => {
                     forward_layer = Some(
                         CoreLogConsumerLayer::new(consumer).with_filter(EnvFilter::new(filter)),
@@ -448,7 +448,7 @@ pub fn telemetry_init(opts: TelemetryOptions) -> Result<TelemetryInstance, anyho
             let reg = tracing_subscriber::registry()
                 .with(console_pretty_layer)
                 .with(console_compact_layer);
-            #[cfg(feature = "core-based-sdk")]
+            #[cfg(feature = "core-telemetry-bridge")]
             let reg = reg.with(forward_layer);
 
             Arc::new(reg) as Arc<dyn Subscriber + Send + Sync>
@@ -457,7 +457,7 @@ pub fn telemetry_init(opts: TelemetryOptions) -> Result<TelemetryInstance, anyho
 
     Ok(TelemetryInstance {
         metric_prefix: opts.metric_prefix,
-        #[cfg(feature = "core-based-sdk")]
+        #[cfg(feature = "core-telemetry-bridge")]
         logs_out,
         metrics: opts.metrics,
         trace_subscriber: tracing_sub,

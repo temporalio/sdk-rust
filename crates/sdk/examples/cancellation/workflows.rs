@@ -64,8 +64,7 @@ impl CancellationWorkflow {
                         (),
                         ActivityOptions::start_to_close_timeout(Duration::from_secs(10)),
                     )
-                    .await
-                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+                    .await?;
 
                 Ok(format!("Cancelled (reason={reason}), {cleanup_result}"))
             }

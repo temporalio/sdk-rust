@@ -52,8 +52,7 @@ impl HeartbeatingWorkflow {
                     .heartbeat_timeout(Duration::from_secs(5))
                     .build(),
             )
-            .await
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
+            .await?;
         Ok(result)
     }
 }

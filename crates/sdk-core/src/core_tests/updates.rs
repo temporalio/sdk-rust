@@ -1,5 +1,6 @@
 use crate::{
     prost_dur,
+    replay::{DEFAULT_ACTIVITY_TYPE, TestHistoryBuilder},
     test_help::{
         MockPollCfg, PollWFTRespExt, ResponseType, WorkerTestHelpers, build_mock_pollers,
         hist_to_poll_resp, mock_worker,
@@ -7,7 +8,6 @@ use crate::{
     worker::client::mocks::mock_worker_client,
 };
 use temporalio_common::protos::{
-    DEFAULT_ACTIVITY_TYPE, TestHistoryBuilder,
     coresdk::{
         workflow_activation::{WorkflowActivationJob, workflow_activation_job},
         workflow_commands::{

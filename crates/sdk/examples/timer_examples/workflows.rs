@@ -37,7 +37,7 @@ impl TimerWorkflow {
                 100u64,
                 ActivityOptions::start_to_close_timeout(Duration::from_secs(30)),
             ) => {
-                result.map_err(|e| anyhow::anyhow!("{e}"))?;
+                result?;
                 "activity"
             }
         };

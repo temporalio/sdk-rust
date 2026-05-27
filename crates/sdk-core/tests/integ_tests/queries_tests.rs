@@ -8,7 +8,6 @@ use temporalio_client::{
 };
 use temporalio_common::{
     data_converters::RawValue,
-    prost_dur,
     protos::{
         coresdk::{
             workflow_activation::{WorkflowActivationJob, workflow_activation_job},
@@ -16,10 +15,12 @@ use temporalio_common::{
             workflow_completion::WorkflowActivationCompletion,
         },
         temporal::api::failure::v1::Failure,
-        test_utils::start_timer_cmd,
     },
 };
-use temporalio_sdk_core::test_help::{WorkerTestHelpers, drain_pollers_and_shutdown};
+use temporalio_sdk_core::{
+    prost_dur,
+    test_help::{WorkerTestHelpers, drain_pollers_and_shutdown, start_timer_cmd},
+};
 use tokio::join;
 
 #[tokio::test]

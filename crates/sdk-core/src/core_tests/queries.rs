@@ -1,7 +1,9 @@
 use crate::{
+    replay::{TestHistoryBuilder, canned_histories},
     test_help::{
         MockPollCfg, MocksHolder, ResponseType, WorkerExt, WorkerTestHelpers, build_mock_pollers,
-        hist_to_poll_resp, mock_worker, single_hist_mock_sg,
+        hist_to_poll_resp, mock_worker, query_ok, schedule_activity_cmd, single_hist_mock_sg,
+        start_timer_cmd,
     },
     worker::{
         LEGACY_QUERY_ID, WorkerVersioningStrategy,
@@ -19,7 +21,6 @@ use std::{
 };
 use temporalio_client::MESSAGE_TOO_LARGE_KEY;
 use temporalio_common::protos::{
-    TestHistoryBuilder, canned_histories,
     coresdk::{
         workflow_activation::{
             WorkflowActivationJob, remove_from_cache::EvictionReason, workflow_activation_job,
@@ -40,7 +41,6 @@ use temporalio_common::protos::{
             GetWorkflowExecutionHistoryResponse, RespondWorkflowTaskCompletedResponse,
         },
     },
-    test_utils::{query_ok, schedule_activity_cmd, start_timer_cmd},
 };
 
 #[rstest::rstest]

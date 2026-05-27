@@ -22,7 +22,6 @@ use temporalio_client::{Connection, WorkflowStartOptions};
 use temporalio_common::{
     data_converters::{DataConverter, RawValue},
     protos::{
-        DEFAULT_WORKFLOW_TYPE, TestHistoryBuilder, canned_histories,
         coresdk::{
             ActivityTaskCompletion,
             activity_result::ActivityExecutionResult,
@@ -56,7 +55,6 @@ use temporalio_common::{
 use temporalio_macros::{activities, workflow, workflow_methods};
 use temporalio_sdk::{
     ActivityOptions, LocalActivityOptions, WorkerOptions, WorkflowContext, WorkflowResult,
-    WorkflowTermination,
     activities::{ActivityContext, ActivityError},
     interceptors::WorkerInterceptor,
 };
@@ -65,6 +63,7 @@ use temporalio_sdk_core::{
     ResourceBasedTuner, ResourceSlotOptions, SlotInfo, SlotInfoTrait, SlotMarkUsedContext,
     SlotReleaseContext, SlotReservationContext, SlotSupplier, SlotSupplierPermit, TunerBuilder,
     WorkerConfig, WorkerValidationError, WorkerVersioningStrategy, WorkflowSlotKind, init_worker,
+    replay::{DEFAULT_WORKFLOW_TYPE, TestHistoryBuilder, canned_histories},
     test_help::{
         FakeWfResponses, MockPollCfg, ResponseType, build_mock_pollers, drain_pollers_and_shutdown,
         hist_to_poll_resp, mock_worker, mock_worker_client,
@@ -201,7 +200,9 @@ async fn resource_based_few_pollers_guarantees_non_sticky_poll() {
 
     // Workflow doesn't actually need to do anything. We just need to see that we don't get stuck
     // by assigning all slots to sticky pollers.
-    worker.register_workflow::<ResourceBasedNonStickyWf>();
+    worker
+        .register_workflow::<ResourceBasedNonStickyWf>()
+        .unwrap();
     let task_queue = starter.get_task_queue().to_owned();
     for i in 0..20 {
         worker
@@ -251,7 +252,8 @@ async fn oversize_grpc_message() {
 
     core.register_workflow_with_factory(move || OversizeGrpcMessageWf {
         has_run: has_run_clone.clone(),
-    });
+    })
+    .unwrap();
     starter
         .start_with_worker(OversizeGrpcMessageWf::name(), &mut core)
         .await;
@@ -419,24 +421,24 @@ async fn activity_tasks_from_completion_reserve_slots() {
                 (),
                 ActivityOptions::start_to_close_timeout(Duration::from_secs(5)),
             )
-            .await
-            .map_err(|e| WorkflowTermination::from(anyhow::Error::from(e)))?;
+            .await?;
             ctx.start_activity(
                 FakeAct::act2,
                 (),
                 ActivityOptions::start_to_close_timeout(Duration::from_secs(5)),
             )
-            .await
-            .map_err(|e| WorkflowTermination::from(anyhow::Error::from(e)))?;
+            .await?;
             ctx.state(|wf| wf.complete_token.cancel());
             Ok(())
         }
     }
 
     let wf_token = workflow_complete_token.clone();
-    worker.register_workflow_with_factory(move || ActivityTasksCompletionWf {
-        complete_token: wf_token.clone(),
-    });
+    worker
+        .register_workflow_with_factory(move || ActivityTasksCompletionWf {
+            complete_token: wf_token.clone(),
+        })
+        .unwrap();
 
     let act_completer = async {
         barr.wait().await;
@@ -504,7 +506,7 @@ async fn max_wft_respected() {
         }
     }
 
-    worker.register_workflow::<MaxWftWf>();
+    worker.register_workflow::<MaxWftWf>().unwrap();
     worker.run_until_done().await.unwrap();
 }
 
@@ -594,7 +596,7 @@ async fn history_length_with_fail_and_timeout(
         }
     }
 
-    worker.register_workflow::<HistoryLengthWf>();
+    worker.register_workflow::<HistoryLengthWf>().unwrap();
     worker.run_until_done().await.unwrap();
 }
 
@@ -664,7 +666,7 @@ async fn sets_build_id_from_wft_complete() {
         }
     }
 
-    worker.register_workflow::<BuildIdWf>();
+    worker.register_workflow::<BuildIdWf>().unwrap();
     worker.run_until_done().await.unwrap();
 }
 
@@ -807,7 +809,7 @@ async fn test_custom_slot_supplier_simple() {
         }
     }
 
-    worker.register_workflow::<SlotSupplierWorkflow>();
+    worker.register_workflow::<SlotSupplierWorkflow>().unwrap();
 
     let task_queue = starter.get_task_queue().to_owned();
     worker

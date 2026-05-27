@@ -1,8 +1,9 @@
 use crate::common::activity_functions::StdActivities;
 use std::time::Duration;
-use temporalio_common::{prost_dur, protos::temporal::api::common::v1::RetryPolicy};
+use temporalio_common::protos::temporal::api::common::v1::RetryPolicy;
 use temporalio_macros::{workflow, workflow_methods};
 use temporalio_sdk::{ActivityOptions, LocalActivityOptions, WorkflowContext, WorkflowResult};
+use temporalio_sdk_core::prost_dur;
 
 #[workflow]
 #[derive(Default)]

@@ -4,7 +4,6 @@ use crate::common::build_fake_sdk;
 use serde::{Deserialize, Serialize};
 use std::{cell::Cell, collections::HashMap, future::poll_fn, task::Poll, time::Duration};
 use temporalio_common::protos::{
-    DEFAULT_WORKFLOW_TYPE, TestHistoryBuilder,
     coresdk::workflow_commands::query_result,
     temporal::api::{
         common::v1::WorkflowType,
@@ -16,8 +15,11 @@ use temporalio_common::protos::{
 };
 use temporalio_macros::{workflow, workflow_methods};
 use temporalio_sdk::{SyncWorkflowContext, WorkflowContext, WorkflowContextView, WorkflowResult};
-use temporalio_sdk_core::test_help::{
-    LegacyQueryResult, MockPollCfg, ResponseType, hist_to_poll_resp, mock_worker_client,
+use temporalio_sdk_core::{
+    replay::{DEFAULT_WORKFLOW_TYPE, TestHistoryBuilder},
+    test_help::{
+        LegacyQueryResult, MockPollCfg, ResponseType, hist_to_poll_resp, mock_worker_client,
+    },
 };
 
 /// A workflow that returns Pending on first poll and Ready on second poll.
@@ -110,7 +112,9 @@ async fn query_only_activation_should_not_advance_workflow() {
     });
 
     let mut worker = build_fake_sdk(mock_cfg);
-    worker.register_workflow::<CompleteOnSecondPollWf>();
+    worker
+        .register_workflow::<CompleteOnSecondPollWf>()
+        .unwrap();
     worker.run().await.unwrap();
 }
 
@@ -167,7 +171,9 @@ async fn nonexistent_query_should_not_advance_workflow() {
     });
 
     let mut worker = build_fake_sdk(mock_cfg);
-    worker.register_workflow::<CompleteOnSecondPollWf>();
+    worker
+        .register_workflow::<CompleteOnSecondPollWf>()
+        .unwrap();
     worker.run().await.unwrap();
 }
 
@@ -293,7 +299,7 @@ async fn non_legacy_query_should_see_state_after_workflow_advances() {
     });
 
     let mut worker = build_fake_sdk(mock_cfg);
-    worker.register_workflow::<CounterWf>();
+    worker.register_workflow::<CounterWf>().unwrap();
     worker.run().await.unwrap();
 }
 
@@ -409,7 +415,7 @@ async fn query_returns_workflow_context_view_info() {
     });
 
     let mut worker = build_fake_sdk(mock_cfg);
-    worker.register_workflow::<ContextViewWf>();
+    worker.register_workflow::<ContextViewWf>().unwrap();
     worker.run().await.unwrap();
 }
 
@@ -503,7 +509,7 @@ async fn workflow_metadata_query_returns_current_details() {
     });
 
     let mut worker = build_fake_sdk(mock_cfg);
-    worker.register_workflow::<CurrentDetailsWf>();
+    worker.register_workflow::<CurrentDetailsWf>().unwrap();
     worker.run().await.unwrap();
 }
 
@@ -578,6 +584,6 @@ async fn workflow_metadata_query_empty_details() {
     });
 
     let mut worker = build_fake_sdk(mock_cfg);
-    worker.register_workflow::<NoCurrentDetailsWf>();
+    worker.register_workflow::<NoCurrentDetailsWf>().unwrap();
     worker.run().await.unwrap();
 }

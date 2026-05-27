@@ -21,7 +21,6 @@ use temporalio_client::{
 };
 use temporalio_common::{
     data_converters::RawValue,
-    prost_dur,
     protos::{
         coresdk::{
             ActivityTaskCompletion,
@@ -73,7 +72,7 @@ use temporalio_sdk_core::{
     CoreRuntime, FixedSizeSlotSupplier, PollError, PollerBehavior, SlotKind, SlotMarkUsedContext,
     SlotReleaseContext, SlotReservationContext, SlotSupplier, SlotSupplierPermit,
     TokioRuntimeBuilder, TunerBuilder, WorkerConfig, WorkerVersioningStrategy, WorkflowSlotKind,
-    init_worker,
+    init_worker, prost_dur,
     replay::TestHistoryBuilder,
     test_help::{
         MockPollCfg, ResponseType, TemporalMeter, WorkerExt, WorkerTestHelpers, build_mock_pollers,
@@ -905,7 +904,7 @@ async fn activity_metrics() {
         }
     }
 
-    worker.register_workflow::<ActivityMetricsWf>();
+    worker.register_workflow::<ActivityMetricsWf>().unwrap();
     let task_queue = starter.get_task_queue().to_owned();
     let workflow_id = wf_name.to_owned();
     worker
@@ -1043,7 +1042,7 @@ async fn nexus_metrics() {
         }
     }
 
-    worker.register_workflow::<NexusMetricsWf>();
+    worker.register_workflow::<NexusMetricsWf>().unwrap();
     let task_queue = starter.get_task_queue().to_owned();
     let workflow_id = wf_name.to_owned();
     worker
@@ -1196,7 +1195,7 @@ async fn evict_on_complete_does_not_count_as_forced_eviction() {
         }
     }
 
-    worker.register_workflow::<EvictOnCompleteWf>();
+    worker.register_workflow::<EvictOnCompleteWf>().unwrap();
     let task_queue = starter.get_task_queue().to_owned();
     let workflow_id = wf_name.to_owned();
     worker
@@ -1294,7 +1293,7 @@ async fn metrics_available_from_custom_slot_supplier() {
         }
     }
 
-    worker.register_workflow::<CustomSlotSupplierWf>();
+    worker.register_workflow::<CustomSlotSupplierWf>().unwrap();
     let task_queue = starter.get_task_queue().to_owned();
     worker
         .submit_workflow(
@@ -1467,7 +1466,9 @@ async fn sticky_queue_label_strategy(
         }
     }
 
-    worker.register_workflow::<StickyQueueLabelStrategyWf>();
+    worker
+        .register_workflow::<StickyQueueLabelStrategyWf>()
+        .unwrap();
     let task_queue = starter.get_task_queue().to_owned();
     worker
         .submit_workflow(
@@ -1555,7 +1556,9 @@ async fn resource_based_tuner_metrics() {
         }
     }
 
-    worker.register_workflow::<ResourceBasedTunerMetricsWf>();
+    worker
+        .register_workflow::<ResourceBasedTunerMetricsWf>()
+        .unwrap();
     let task_queue = starter.get_task_queue().to_owned();
     let workflow_id = wf_name.to_owned();
     worker

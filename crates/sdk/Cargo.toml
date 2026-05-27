@@ -1,6 +1,6 @@
 [package]
 name = "temporalio-sdk"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
 authors = ["Spencer Judge <spencer@temporal.io>"]
 license-file = { workspace = true }
@@ -22,6 +22,7 @@ futures-util = { version = "0.3", default-features = false, features = [
 ] }
 gethostname = "1.0.2"
 parking_lot = { version = "0.12" }
+prost = { workspace = true }
 prost-types = { workspace = true }
 serde = "1.0"
 thiserror = "2"
@@ -37,32 +38,43 @@ tokio-util = { version = "0.7" }
 tokio-stream = { version = "0.1", default-features = false }
 tracing = "0.1"
 uuid = { version = "1.18", default-features = false, features = ["v4"] }
+wasmtime = { version = "44", optional = true, features = ["component-model"] }
 
 [dependencies.temporalio-sdk-core]
 path = "../sdk-core"
-version = "0.3"
+version = "0.4"
 default-features = false
+
+[dependencies.temporalio-workflow]
+path = "../workflow"
+version = "0.4"
 
 [dependencies.temporalio-common]
 path = "../common"
-version = "0.3"
+version = "0.4"
+default-features = false
 
 [dependencies.temporalio-client]
 path = "../client"
-version = "0.3"
+version = "0.4"
+default-features = false
 
 [dependencies.temporalio-macros]
 path = "../macros"
-version = "0.3"
+version = "0.4"
 
 [dev-dependencies]
 futures = "0.3"
 rstest = "0.26"
 
 [features]
-default = []
-antithesis_assertions = ["temporalio-sdk-core/antithesis_assertions"]
-examples = ["serde/derive", "dep:serde_json"]
+default = ["envconfig", "prometheus"]
+envconfig = ["temporalio-sdk-core/envconfig"]
+prometheus = ["temporalio-sdk-core/prometheus"]
+otel = ["temporalio-sdk-core/otel"]
+examples = ["serde/derive", "dep:serde_json", "envconfig"]
+wasm-examples = []
+wasm-workflows = ["dep:wasmtime"]
 
 [dependencies.serde_json]
 version = "1"
@@ -86,6 +98,16 @@ required-features = ["examples"]
 [[example]]
 name = "activity-heartbeating-starter"
 path = "examples/activity_heartbeating/starter.rs"
+required-features = ["examples"]
+
+[[example]]
+name = "activity-interceptor-worker"
+path = "examples/activity_interceptor/worker.rs"
+required-features = ["examples"]
+
+[[example]]
+name = "activity-interceptor-starter"
+path = "examples/activity_interceptor/starter.rs"
 required-features = ["examples"]
 
 [[example]]
@@ -197,6 +219,12 @@ required-features = ["examples"]
 name = "schedules-starter"
 path = "examples/schedules/starter.rs"
 required-features = ["examples"]
+
+[[example]]
+name = "wasm-workflows"
+path = "examples/wasm_workflows/src/lib.rs"
+crate-type = ["cdylib"]
+required-features = ["examples", "wasm-examples"]
 
 [lints]
 workspace = true

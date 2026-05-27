@@ -11,7 +11,7 @@ use std::{
     time::Duration,
 };
 
-#[cfg(feature = "core-based-sdk")]
+#[cfg(feature = "core-telemetry-bridge")]
 pub mod core;
 
 /// The string name (which may be prefixed) for this metric
@@ -377,10 +377,10 @@ pub enum MetricAttributes {
         labels: Arc<OrderedPromLabelSet>,
     },
     /// Buffered attributes used by core-based SDKs for deferred metric initialization.
-    #[cfg(feature = "core-based-sdk")]
+    #[cfg(feature = "core-telemetry-bridge")]
     Buffer(core::BufferAttributes),
     /// Dynamic attributes backed by a lang-side custom implementation.
-    #[cfg(feature = "core-based-sdk")]
+    #[cfg(feature = "core-telemetry-bridge")]
     Dynamic(Arc<dyn core::CustomMetricAttributes>),
     /// No-op attributes that store labels but do not record.
     NoOp(Arc<HashMap<String, String>>),

@@ -1,16 +1,18 @@
 use crate::{
-    test_help::{MockPollCfg, ResponseType, build_mock_pollers, hist_to_poll_resp, mock_worker},
+    replay::{TestHistoryBuilder, canned_histories},
+    test_help::{
+        MockPollCfg, ResponseType, build_mock_pollers, hist_to_poll_resp, mock_worker, query_ok,
+        start_timer_cmd,
+    },
     worker::{LEGACY_QUERY_ID, client::mocks::mock_worker_client},
 };
 use std::{collections::VecDeque, time::Duration};
 use temporalio_common::protos::{
-    TestHistoryBuilder, canned_histories,
     coresdk::{
         workflow_activation::{WorkflowActivationJob, workflow_activation_job},
         workflow_completion::WorkflowActivationCompletion,
     },
     temporal::api::{enums::v1::EventType, query::v1::WorkflowQuery},
-    test_utils::{query_ok, start_timer_cmd},
 };
 
 #[tokio::test]

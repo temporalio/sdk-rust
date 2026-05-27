@@ -1,7 +1,8 @@
 use std::time::Duration;
-use temporalio_common::{data_converters::RawValue, protos::DEFAULT_ACTIVITY_TYPE};
+use temporalio_common::data_converters::RawValue;
 use temporalio_macros::activities;
 use temporalio_sdk::activities::{ActivityContext, ActivityError};
+use temporalio_sdk_core::replay::DEFAULT_ACTIVITY_TYPE;
 use tokio::time::sleep;
 
 pub(crate) struct StdActivities;

@@ -8,23 +8,31 @@ use std::{
     time::Duration,
 };
 use temporalio_client::{
-    Client, ClientOptions, UntypedWorkflow, WorkflowDescribeOptions, WorkflowStartOptions,
+    Client, ClientOptions, UntypedWorkflow, WorkflowDescribeOptions, WorkflowExecuteUpdateOptions,
+    WorkflowQueryOptions, WorkflowSignalOptions, WorkflowStartOptions,
+    errors::{WorkflowGetResultError, WorkflowUpdateError},
 };
 use temporalio_common::{
     data_converters::{
-        DataConverter, DefaultFailureConverter, MultiArgs2, PayloadCodec, PayloadConversionError,
-        PayloadConverter, SerializationContext, SerializationContextData, TemporalDeserializable,
-        TemporalSerializable,
+        DataConverter, DefaultFailureConverter, DefaultPayloadCodec, FailureConverter, MultiArgs2,
+        PayloadCodec, PayloadConversionError, PayloadConverter, SerializationContext,
+        SerializationContextData, TemporalDeserializable, TemporalSerializable,
     },
+    error::{IncomingError, OutgoingError},
     protos::{
         coresdk::AsJsonPayloadExt,
-        temporal::api::{common::v1::Payload, history::v1::history_event::Attributes},
+        temporal::api::{
+            common::v1::{Payload, RetryPolicy},
+            failure::v1::failure::FailureInfo,
+            history::v1::history_event::Attributes,
+        },
     },
     worker::WorkerTaskTypes,
 };
 use temporalio_macros::{activities, workflow, workflow_methods};
 use temporalio_sdk::{
-    ActivityOptions, WorkflowContext, WorkflowResult,
+    ActivityOptions, CancellableFuture, SyncWorkflowContext, WorkflowContext, WorkflowContextView,
+    WorkflowResult,
     activities::{ActivityContext, ActivityError},
 };
 
@@ -91,6 +99,85 @@ impl TestActivities {
     }
 }
 
+struct FailurePayloadActivities;
+#[activities]
+impl FailurePayloadActivities {
+    #[activity]
+    async fn cancel_with_tracked_details(ctx: ActivityContext) -> Result<(), ActivityError> {
+        let mut ticker = tokio::time::interval(Duration::from_millis(100));
+        loop {
+            tokio::select! {
+                _ = ctx.cancelled() => break,
+                _ = ticker.tick() => ctx.record_heartbeat(vec![]),
+            }
+        }
+        Err(ActivityError::cancelled_with_details(
+            "codec-cancel-details".to_string(),
+        ))
+    }
+
+    #[activity]
+    async fn heartbeat_then_timeout(ctx: ActivityContext) -> Result<(), ActivityError> {
+        ctx.record_heartbeat(vec![
+            TrackedValue::new("codec-heartbeat-details".to_string())
+                .as_json_payload()
+                .map_err(ActivityError::from)?,
+        ]);
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        Ok(())
+    }
+}
+
+const FAILURE_CONVERTER_ERROR_MESSAGE: &str = "intentional failure converter error";
+const WORKFLOW_FAILURE_MESSAGE: &str = "workflow converter fallback failure";
+const ACTIVITY_PANIC_MESSAGE: &str = "activity converter fallback panic";
+const QUERY_FAILURE_MESSAGE: &str = "query converter fallback failure";
+const UPDATE_VALIDATOR_FAILURE_MESSAGE: &str = "update validator converter fallback failure";
+const UPDATE_HANDLER_FAILURE_MESSAGE: &str = "update handler converter fallback failure";
+
+#[derive(Debug)]
+struct FailingFailureConverter;
+
+impl FailureConverter for FailingFailureConverter {
+    fn to_failure(
+        &self,
+        err: OutgoingError,
+        _payload_converter: &PayloadConverter,
+        _context: &SerializationContextData,
+    ) -> temporalio_common::protos::temporal::api::failure::v1::Failure {
+        temporalio_common::protos::temporal::api::failure::v1::Failure::application_failure(
+            format!(
+                "Failed converting error to failure: Encoding error: {FAILURE_CONVERTER_ERROR_MESSAGE}, original error message: {}",
+                err
+            ),
+            false,
+        )
+    }
+
+    fn to_error(
+        &self,
+        failure: temporalio_common::protos::temporal::api::failure::v1::Failure,
+        payload_converter: &PayloadConverter,
+        context: &SerializationContextData,
+    ) -> Result<IncomingError, PayloadConversionError> {
+        DefaultFailureConverter.to_error(failure, payload_converter, context)
+    }
+}
+
+async fn starter_with_failing_failure_converter(test_name: &str) -> CoreWfStarter {
+    let connection = get_integ_connection(None).await;
+    let data_converter = DataConverter::new(
+        PayloadConverter::default(),
+        FailingFailureConverter,
+        DefaultPayloadCodec,
+    );
+    let client_opts = ClientOptions::new(integ_namespace())
+        .data_converter(data_converter)
+        .build();
+    let client = Client::new(connection, client_opts).unwrap();
+    CoreWfStarter::new_with_overrides(test_name, None, Some(client))
+}
+
 #[workflow]
 #[derive(Default)]
 struct DataConverterTestWorkflow;
@@ -107,8 +194,7 @@ impl DataConverterTestWorkflow {
                 input,
                 ActivityOptions::start_to_close_timeout(Duration::from_secs(5)),
             )
-            .await
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
+            .await?;
 
         Ok(output)
     }
@@ -131,11 +217,403 @@ impl DescribeDataConverterWorkflow {
                 input,
                 ActivityOptions::start_to_close_timeout(Duration::from_secs(5)),
             )
-            .await
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
+            .await?;
 
         Ok(output)
     }
+}
+
+#[workflow]
+#[derive(Default)]
+struct CancellationDetailsWorkflow;
+#[workflow_methods]
+impl CancellationDetailsWorkflow {
+    #[run]
+    async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<TrackedWrapper> {
+        let act = ctx.start_activity(
+            FailurePayloadActivities::cancel_with_tracked_details,
+            (),
+            ActivityOptions::with_start_to_close_timeout(Duration::from_secs(5))
+                .heartbeat_timeout(Duration::from_secs(1))
+                .cancellation_type(
+                    temporalio_common::protos::coresdk::workflow_commands::ActivityCancellationType::WaitCancellationCompleted,
+                )
+                .build(),
+        );
+        // WaitCancellationCompleted only carries activity-supplied details if the worker has
+        // started the activity and observed the cancellation.
+        ctx.timer(Duration::from_millis(100)).await;
+        act.cancel();
+        let err = act.await.expect_err("activity should be cancelled");
+        let Some(cancelled) = err.as_cancelled() else {
+            panic!("expected cancelled failure, got {err:?}");
+        };
+        let details = cancelled
+            .details::<String>()
+            .expect("cancellation details should decode")
+            .expect("cancellation details should be present");
+        Ok(TrackedWrapper(TrackedValue::new(details)))
+    }
+}
+
+#[workflow]
+#[derive(Default)]
+struct HeartbeatDetailsWorkflow;
+#[workflow_methods]
+impl HeartbeatDetailsWorkflow {
+    #[run]
+    async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<TrackedWrapper> {
+        let err = ctx
+            .start_activity(
+                FailurePayloadActivities::heartbeat_then_timeout,
+                (),
+                ActivityOptions::with_start_to_close_timeout(Duration::from_secs(5))
+                    .heartbeat_timeout(Duration::from_secs(1))
+                    .retry_policy(RetryPolicy {
+                        maximum_attempts: 1,
+                        ..Default::default()
+                    })
+                    .build(),
+            )
+            .await
+            .expect_err("activity should time out");
+        let timeout = err.as_timeout().expect("activity should timeout");
+        let details = timeout
+            .last_heartbeat_details()?
+            .expect("heartbeat details should be present");
+        Ok(TrackedWrapper(details))
+    }
+}
+
+#[workflow]
+#[derive(Default)]
+struct WorkflowFailureFallbackWorkflow;
+#[workflow_methods]
+impl WorkflowFailureFallbackWorkflow {
+    #[run]
+    async fn run(_ctx: &mut WorkflowContext<Self>) -> WorkflowResult<()> {
+        Err(anyhow::anyhow!(WORKFLOW_FAILURE_MESSAGE).into())
+    }
+}
+
+struct PanicActivities;
+#[activities]
+impl PanicActivities {
+    #[activity]
+    async fn panic_activity(_ctx: ActivityContext, _input: String) -> Result<(), ActivityError> {
+        panic!("{ACTIVITY_PANIC_MESSAGE}");
+    }
+}
+
+#[workflow]
+#[derive(Default)]
+struct ActivityPanicFallbackWorkflow;
+#[workflow_methods]
+impl ActivityPanicFallbackWorkflow {
+    #[run]
+    async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<()> {
+        let _ = ctx
+            .start_activity(
+                PanicActivities::panic_activity,
+                String::new(),
+                ActivityOptions::with_start_to_close_timeout(Duration::from_secs(5))
+                    .retry_policy(RetryPolicy {
+                        maximum_attempts: 1,
+                        ..Default::default()
+                    })
+                    .build(),
+            )
+            .await
+            .expect_err("activity should fail");
+        Ok(())
+    }
+}
+
+#[workflow]
+#[derive(Default)]
+struct QueryUpdateFailureFallbackWorkflow {
+    finish: bool,
+}
+
+#[workflow_methods]
+impl QueryUpdateFailureFallbackWorkflow {
+    #[run]
+    async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<()> {
+        ctx.wait_condition(|s| s.finish).await;
+        Ok(())
+    }
+
+    #[signal]
+    fn finish(&mut self, _ctx: &mut SyncWorkflowContext<Self>) {
+        self.finish = true;
+    }
+
+    #[query]
+    fn fail_query(
+        &self,
+        _ctx: &WorkflowContextView,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        Err(QUERY_FAILURE_MESSAGE.into())
+    }
+
+    #[update_validator(fail_validated_update)]
+    fn validate_fail_validated_update(
+        &self,
+        _ctx: &WorkflowContextView,
+        _input: &(),
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        Err(UPDATE_VALIDATOR_FAILURE_MESSAGE.into())
+    }
+
+    #[update]
+    fn fail_validated_update(&mut self, _ctx: &mut SyncWorkflowContext<Self>, _input: ()) {}
+
+    #[update]
+    async fn fail_update(
+        _ctx: &mut WorkflowContext<Self>,
+        _input: (),
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        Err(UPDATE_HANDLER_FAILURE_MESSAGE.into())
+    }
+}
+
+#[tokio::test]
+async fn custom_failure_converter_fallback_applied_to_workflow_failures() {
+    let wf_name = WorkflowFailureFallbackWorkflow::name();
+    let mut starter = starter_with_failing_failure_converter(wf_name).await;
+    starter
+        .sdk_config
+        .register_workflow::<WorkflowFailureFallbackWorkflow>()
+        .unwrap();
+    starter.sdk_config.task_types = WorkerTaskTypes::workflow_only();
+    let mut worker = starter.worker().await;
+
+    let task_queue = starter.get_task_queue().to_owned();
+    let handle = worker
+        .submit_workflow(
+            WorkflowFailureFallbackWorkflow::run,
+            (),
+            WorkflowStartOptions::new(task_queue, wf_name.to_owned()).build(),
+        )
+        .await
+        .unwrap();
+    worker.run_until_done().await.unwrap();
+
+    let failure = match handle.get_result(Default::default()).await.unwrap_err() {
+        WorkflowGetResultError::Failed(failure) => failure,
+        err => panic!("unexpected workflow result error: {err:?}"),
+    };
+    assert_eq!(
+        failure.message,
+        format!(
+            "Failed converting error to failure: Encoding error: {FAILURE_CONVERTER_ERROR_MESSAGE}, original error message: {WORKFLOW_FAILURE_MESSAGE}"
+        )
+    );
+    assert!(matches!(
+        failure.failure_info,
+        Some(FailureInfo::ApplicationFailureInfo(_))
+    ));
+}
+
+#[tokio::test]
+async fn custom_failure_converter_fallback_applied_to_activity_panic_failures() {
+    let wf_name = ActivityPanicFallbackWorkflow::name();
+    let mut starter = starter_with_failing_failure_converter(wf_name).await;
+    starter.sdk_config.register_activities(PanicActivities);
+    starter
+        .sdk_config
+        .register_workflow::<ActivityPanicFallbackWorkflow>()
+        .unwrap();
+    let mut worker = starter.worker().await;
+
+    let task_queue = starter.get_task_queue().to_owned();
+    let handle = worker
+        .submit_workflow(
+            ActivityPanicFallbackWorkflow::run,
+            (),
+            WorkflowStartOptions::new(task_queue, wf_name.to_owned()).build(),
+        )
+        .await
+        .unwrap();
+    worker.run_until_done().await.unwrap();
+    handle.get_result(Default::default()).await.unwrap();
+
+    let history = handle.fetch_history(Default::default()).await.unwrap();
+    let activity_failure = history
+        .into_events()
+        .into_iter()
+        .find_map(|event| match event.attributes {
+            Some(Attributes::ActivityTaskFailedEventAttributes(attrs)) => attrs.failure,
+            _ => None,
+        })
+        .expect("workflow history should contain an activity failure");
+
+    assert_eq!(
+        activity_failure.message,
+        format!(
+            "Failed converting error to failure: Encoding error: {FAILURE_CONVERTER_ERROR_MESSAGE}, original error message: Activity function panicked: {ACTIVITY_PANIC_MESSAGE}"
+        )
+    );
+    assert!(matches!(
+        activity_failure.failure_info,
+        Some(FailureInfo::ApplicationFailureInfo(_))
+    ));
+}
+
+#[tokio::test]
+async fn custom_failure_converter_fallback_applied_to_query_failures() {
+    let wf_name = QueryUpdateFailureFallbackWorkflow::name();
+    let mut starter = starter_with_failing_failure_converter(wf_name).await;
+    starter
+        .sdk_config
+        .register_workflow::<QueryUpdateFailureFallbackWorkflow>()
+        .unwrap();
+    starter.sdk_config.task_types = WorkerTaskTypes::workflow_only();
+    let mut worker = starter.worker().await;
+
+    let task_queue = starter.get_task_queue().to_owned();
+    let handle = worker
+        .submit_workflow(
+            QueryUpdateFailureFallbackWorkflow::run,
+            (),
+            WorkflowStartOptions::new(task_queue, wf_name.to_owned()).build(),
+        )
+        .await
+        .unwrap();
+
+    let query_and_finish = async {
+        let err = handle
+            .query(
+                QueryUpdateFailureFallbackWorkflow::fail_query,
+                (),
+                WorkflowQueryOptions::default(),
+            )
+            .await
+            .expect_err("query should fail");
+        assert!(err.to_string().contains(&format!(
+            "Failed converting error to failure: Encoding error: {FAILURE_CONVERTER_ERROR_MESSAGE}, original error message: {QUERY_FAILURE_MESSAGE}"
+        )));
+        handle
+            .signal(
+                QueryUpdateFailureFallbackWorkflow::finish,
+                (),
+                WorkflowSignalOptions::default(),
+            )
+            .await
+            .unwrap();
+    };
+
+    let (_, worker_res) = tokio::join!(query_and_finish, worker.run_until_done());
+    worker_res.unwrap();
+    handle.get_result(Default::default()).await.unwrap();
+}
+
+#[tokio::test]
+async fn custom_failure_converter_fallback_applied_to_update_validation_failures() {
+    let wf_name = QueryUpdateFailureFallbackWorkflow::name();
+    let mut starter = starter_with_failing_failure_converter(wf_name).await;
+    starter
+        .sdk_config
+        .register_workflow::<QueryUpdateFailureFallbackWorkflow>()
+        .unwrap();
+    starter.sdk_config.task_types = WorkerTaskTypes::workflow_only();
+    let mut worker = starter.worker().await;
+
+    let task_queue = starter.get_task_queue().to_owned();
+    let handle = worker
+        .submit_workflow(
+            QueryUpdateFailureFallbackWorkflow::run,
+            (),
+            WorkflowStartOptions::new(task_queue, format!("{wf_name}_validator")).build(),
+        )
+        .await
+        .unwrap();
+
+    let update_and_finish = async {
+        let err = handle
+            .execute_update(
+                QueryUpdateFailureFallbackWorkflow::fail_validated_update,
+                (),
+                WorkflowExecuteUpdateOptions::default(),
+            )
+            .await
+            .expect_err("update should be rejected");
+        let WorkflowUpdateError::Failed(failure) = err else {
+            panic!("expected failed update error");
+        };
+        assert_eq!(
+            failure.message,
+            format!(
+                "Failed converting error to failure: Encoding error: {FAILURE_CONVERTER_ERROR_MESSAGE}, original error message: {UPDATE_VALIDATOR_FAILURE_MESSAGE}"
+            )
+        );
+        handle
+            .signal(
+                QueryUpdateFailureFallbackWorkflow::finish,
+                (),
+                WorkflowSignalOptions::default(),
+            )
+            .await
+            .unwrap();
+    };
+
+    let (_, worker_res) = tokio::join!(update_and_finish, worker.run_until_done());
+    worker_res.unwrap();
+    handle.get_result(Default::default()).await.unwrap();
+}
+
+#[tokio::test]
+async fn custom_failure_converter_fallback_applied_to_update_handler_failures() {
+    let wf_name = QueryUpdateFailureFallbackWorkflow::name();
+    let mut starter = starter_with_failing_failure_converter(wf_name).await;
+    starter
+        .sdk_config
+        .register_workflow::<QueryUpdateFailureFallbackWorkflow>()
+        .unwrap();
+    starter.sdk_config.task_types = WorkerTaskTypes::workflow_only();
+    let mut worker = starter.worker().await;
+
+    let task_queue = starter.get_task_queue().to_owned();
+    let handle = worker
+        .submit_workflow(
+            QueryUpdateFailureFallbackWorkflow::run,
+            (),
+            WorkflowStartOptions::new(task_queue, format!("{wf_name}_handler")).build(),
+        )
+        .await
+        .unwrap();
+
+    let update_and_finish = async {
+        let err = handle
+            .execute_update(
+                QueryUpdateFailureFallbackWorkflow::fail_update,
+                (),
+                WorkflowExecuteUpdateOptions::default(),
+            )
+            .await
+            .expect_err("update should fail");
+        let WorkflowUpdateError::Failed(failure) = err else {
+            panic!("expected failed update error");
+        };
+        assert_eq!(
+            failure.message,
+            format!(
+                "Failed converting error to failure: Encoding error: {FAILURE_CONVERTER_ERROR_MESSAGE}, original error message: {UPDATE_HANDLER_FAILURE_MESSAGE}"
+            )
+        );
+        handle
+            .signal(
+                QueryUpdateFailureFallbackWorkflow::finish,
+                (),
+                WorkflowSignalOptions::default(),
+            )
+            .await
+            .unwrap();
+    };
+
+    let (_, worker_res) = tokio::join!(update_and_finish, worker.run_until_done());
+    worker_res.unwrap();
+    handle.get_result(Default::default()).await.unwrap();
 }
 
 #[tokio::test]
@@ -145,7 +623,8 @@ async fn data_converter_tracks_serialization_points() {
     starter.sdk_config.register_activities(TestActivities);
     starter
         .sdk_config
-        .register_workflow::<DataConverterTestWorkflow>();
+        .register_workflow::<DataConverterTestWorkflow>()
+        .unwrap();
     let mut worker = starter.worker().await;
 
     let input = TrackedValue::new("test-input".to_string());
@@ -211,7 +690,10 @@ impl MultiArgs2Workflow {
 async fn multi_args_serializes_as_multiple_payloads() {
     let wf_name = MultiArgs2Workflow::name();
     let mut starter = CoreWfStarter::new(wf_name);
-    starter.sdk_config.register_workflow::<MultiArgs2Workflow>();
+    starter
+        .sdk_config
+        .register_workflow::<MultiArgs2Workflow>()
+        .unwrap();
     starter.sdk_config.task_types = WorkerTaskTypes::workflow_only();
     let mut worker = starter.worker().await;
 
@@ -384,7 +866,8 @@ async fn codec_encodes_and_decodes_payloads() {
     starter.sdk_config.task_types = WorkerTaskTypes::all();
     starter
         .sdk_config
-        .register_workflow::<DataConverterTestWorkflow>();
+        .register_workflow::<DataConverterTestWorkflow>()
+        .unwrap();
     // Use task queue name as workflow ID to avoid collisions with parallel tests
     let wf_id = starter.get_task_queue().to_owned();
     let mut worker = starter.worker().await;
@@ -442,7 +925,8 @@ async fn describe_decodes_workflow_payload_fields() {
     starter.sdk_config.task_types = WorkerTaskTypes::all();
     starter
         .sdk_config
-        .register_workflow::<DescribeDataConverterWorkflow>();
+        .register_workflow::<DescribeDataConverterWorkflow>()
+        .unwrap();
     let wf_id = starter.get_task_queue().to_owned();
     let mut worker = starter.worker().await;
 
@@ -512,7 +996,8 @@ async fn describe_decodes_user_metadata_with_ungated_xor_codec() {
     starter.sdk_config.task_types = WorkerTaskTypes::all();
     starter
         .sdk_config
-        .register_workflow::<DescribeDataConverterWorkflow>();
+        .register_workflow::<DescribeDataConverterWorkflow>()
+        .unwrap();
     let wf_id = starter.get_task_queue().to_owned();
     let mut worker = starter.worker().await;
 
@@ -546,4 +1031,104 @@ async fn describe_decodes_user_metadata_with_ungated_xor_codec() {
     // Making sure codec isn't used when decoding user metadata
     assert_eq!(desc.static_summary(), Some("codec summary"));
     assert_eq!(desc.static_details(), Some("codec details"));
+}
+
+#[tokio::test]
+async fn codec_roundtrips_activity_cancellation_details() {
+    let wf_name = CancellationDetailsWorkflow::name();
+    let codec = Arc::new(XorCodec::new(0x42));
+
+    let connection = get_integ_connection(None).await;
+    let data_converter = DataConverter::new(
+        PayloadConverter::default(),
+        DefaultFailureConverter,
+        codec.clone(),
+    );
+    let client_opts = ClientOptions::new(integ_namespace())
+        .data_converter(data_converter)
+        .build();
+    let client = Client::new(connection, client_opts).unwrap();
+
+    let mut starter = CoreWfStarter::new_with_overrides(wf_name, None, Some(client));
+    starter
+        .sdk_config
+        .register_activities(FailurePayloadActivities);
+    starter.sdk_config.task_types = WorkerTaskTypes::all();
+    starter
+        .sdk_config
+        .register_workflow::<CancellationDetailsWorkflow>()
+        .unwrap();
+    let wf_id = starter.get_task_queue().to_owned();
+    let mut worker = starter.worker().await;
+
+    let handle = worker
+        .submit_workflow(
+            CancellationDetailsWorkflow::run,
+            (),
+            WorkflowStartOptions::new(starter.get_task_queue(), wf_id).build(),
+        )
+        .await
+        .unwrap();
+    worker.run_until_done().await.unwrap();
+
+    let details = handle.get_result(Default::default()).await.unwrap().0;
+    assert_eq!(details.data, "codec-cancel-details");
+    assert!(
+        codec.encode_count() > 0,
+        "codec should encode cancellation details"
+    );
+    assert!(
+        codec.decode_count() > 0,
+        "codec should decode cancellation details"
+    );
+}
+
+#[tokio::test]
+async fn codec_roundtrips_activity_heartbeat_timeout_details() {
+    let wf_name = HeartbeatDetailsWorkflow::name();
+    let codec = Arc::new(XorCodec::new(0x42));
+
+    let connection = get_integ_connection(None).await;
+    let data_converter = DataConverter::new(
+        PayloadConverter::default(),
+        DefaultFailureConverter,
+        codec.clone(),
+    );
+    let client_opts = ClientOptions::new(integ_namespace())
+        .data_converter(data_converter)
+        .build();
+    let client = Client::new(connection, client_opts).unwrap();
+
+    let mut starter = CoreWfStarter::new_with_overrides(wf_name, None, Some(client));
+    starter
+        .sdk_config
+        .register_activities(FailurePayloadActivities);
+    starter.sdk_config.task_types = WorkerTaskTypes::all();
+    starter
+        .sdk_config
+        .register_workflow::<HeartbeatDetailsWorkflow>()
+        .unwrap();
+    let wf_id = starter.get_task_queue().to_owned();
+    let mut worker = starter.worker().await;
+
+    let handle = worker
+        .submit_workflow(
+            HeartbeatDetailsWorkflow::run,
+            (),
+            WorkflowStartOptions::new(starter.get_task_queue(), wf_id).build(),
+        )
+        .await
+        .unwrap();
+    worker.run_until_done().await.unwrap();
+
+    let details = handle.get_result(Default::default()).await.unwrap().0;
+    assert_eq!(details.data, "codec-heartbeat-details");
+    assert!(
+        codec.encode_count() > 0,
+        "codec should encode heartbeat details"
+    );
+    assert!(
+        codec.decode_count() > 0,
+        "codec should decode heartbeat details"
+    );
 }

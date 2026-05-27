@@ -193,25 +193,32 @@ include!(concat!(env!("OUT_DIR"), "/payload_visitor_impl.rs"));
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protos::{
-        coresdk::{
-            activity_result::{
-                ActivityResolution, Success, activity_resolution::Status as ActivityStatus,
+    use crate::{
+        data_converters::{DefaultFailureConverter, FailureConverter, PayloadConverter},
+        error::{ApplicationFailure, OutgoingError, OutgoingWorkflowError},
+        protos::{
+            coresdk::{
+                activity_result::{
+                    ActivityResolution, Success, activity_resolution::Status as ActivityStatus,
+                },
+                workflow_activation::{
+                    InitializeWorkflow, ResolveActivity, WorkflowActivation, WorkflowActivationJob,
+                    workflow_activation_job::Variant,
+                },
+                workflow_commands::{
+                    ContinueAsNewWorkflowExecution, ScheduleActivity, StartChildWorkflowExecution,
+                    UpsertWorkflowSearchAttributes, WorkflowCommand,
+                    workflow_command::Variant as CmdVariant,
+                },
+                workflow_completion::{
+                    WorkflowActivationCompletion, workflow_activation_completion::Status,
+                },
             },
-            workflow_activation::{
-                InitializeWorkflow, ResolveActivity, WorkflowActivation, WorkflowActivationJob,
-                workflow_activation_job::Variant,
-            },
-            workflow_commands::{
-                ContinueAsNewWorkflowExecution, ScheduleActivity, StartChildWorkflowExecution,
-                UpsertWorkflowSearchAttributes, WorkflowCommand,
-                workflow_command::Variant as CmdVariant,
-            },
-            workflow_completion::{
-                WorkflowActivationCompletion, workflow_activation_completion::Status,
+            temporal::api::{
+                common::v1::{Memo, SearchAttributes},
+                failure::v1::failure::FailureInfo,
             },
         },
-        temporal::api::common::v1::{Memo, SearchAttributes},
     };
     use futures::FutureExt;
     use std::collections::HashMap;
@@ -644,5 +651,32 @@ mod tests {
         for (i, p) in payloads.payloads.iter().enumerate() {
             assert!(is_encoded(p), "payload {} should be encoded", i);
         }
+    }
+
+    #[tokio::test]
+    async fn test_encode_failure_encodes_application_failure_details() {
+        let mut failure = DefaultFailureConverter.to_failure(
+            OutgoingError::Workflow(OutgoingWorkflowError::Application(Box::new(
+                ApplicationFailure::builder(anyhow::anyhow!("app boom"))
+                    .details(crate::data_converters::RawValue::new(vec![make_payload(
+                        "detail",
+                    )]))
+                    .build(),
+            ))),
+            &PayloadConverter::default(),
+            &SerializationContextData::Workflow,
+        );
+
+        encode_payloads(
+            &mut failure,
+            &MarkingCodec,
+            &SerializationContextData::Workflow,
+        )
+        .await;
+
+        let Some(FailureInfo::ApplicationFailureInfo(info)) = failure.failure_info else {
+            panic!("expected application failure info")
+        };
+        assert!(is_encoded(&info.details.unwrap().payloads[0]));
     }
 }

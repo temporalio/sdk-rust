@@ -4,7 +4,6 @@ use temporalio_client::{
 };
 use temporalio_common::{
     protos::{
-        DEFAULT_WORKFLOW_TYPE, TestHistoryBuilder,
         coresdk::{AsJsonPayloadExt, FromJsonPayloadExt},
         temporal::api::{
             command::v1::{Command, command},
@@ -16,7 +15,10 @@ use temporalio_common::{
 };
 use temporalio_macros::{workflow, workflow_methods};
 use temporalio_sdk::{WorkflowContext, WorkflowResult};
-use temporalio_sdk_core::test_help::MockPollCfg;
+use temporalio_sdk_core::{
+    replay::{DEFAULT_WORKFLOW_TYPE, TestHistoryBuilder},
+    test_help::MockPollCfg,
+};
 use uuid::Uuid;
 
 static FIELD_A: &str = "cat_name";
@@ -46,7 +48,7 @@ async fn sends_modify_wf_props() {
     starter.sdk_config.task_types = WorkerTaskTypes::workflow_only();
     let mut worker = starter.worker().await;
 
-    worker.register_workflow::<MemoUpserter>();
+    worker.register_workflow::<MemoUpserter>().unwrap();
     let task_queue = starter.get_task_queue().to_owned();
     let run_id = worker
         .submit_wf(
@@ -144,6 +146,6 @@ async fn workflow_modify_props() {
     });
 
     let mut worker = build_fake_sdk(mock_cfg);
-    worker.register_workflow::<ModifyPropsWf>();
+    worker.register_workflow::<ModifyPropsWf>().unwrap();
     worker.run().await.unwrap();
 }

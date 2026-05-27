@@ -33,8 +33,7 @@ impl LocalActivitiesWorkflow {
                 name.clone(),
                 ActivityOptions::start_to_close_timeout(Duration::from_secs(10)),
             )
-            .await
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
+            .await?;
 
         let local_result = ctx
             .start_local_activity(
@@ -45,8 +44,7 @@ impl LocalActivitiesWorkflow {
                     ..Default::default()
                 },
             )
-            .await
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
+            .await?;
 
         Ok((remote_result, local_result))
     }

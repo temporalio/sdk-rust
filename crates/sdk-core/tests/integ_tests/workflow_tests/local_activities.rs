@@ -23,7 +23,6 @@ use temporalio_client::{
 use temporalio_common::{
     data_converters::RawValue,
     protos::{
-        DEFAULT_ACTIVITY_TYPE, canned_histories,
         coresdk::{
             ActivityTaskCompletion, AsJsonPayloadExt, FromJsonPayloadExt,
             activity_result::ActivityExecutionResult,
@@ -39,27 +38,29 @@ use temporalio_common::{
             command::v1::{RecordMarkerCommandAttributes, command},
             common::v1::RetryPolicy,
             enums::v1::{CommandType, EventType, TimeoutType, WorkflowTaskFailedCause},
-            failure::v1::{Failure, failure::FailureInfo},
+            failure::v1::Failure,
             history::v1::history_event::Attributes::MarkerRecordedEventAttributes,
             query::v1::WorkflowQuery,
         },
-        test_utils::{query_ok, schedule_local_activity_cmd, start_timer_cmd},
     },
 };
 use temporalio_macros::{activities, workflow, workflow_methods};
 use temporalio_sdk::{
-    ActivityExecutionError, ActivityOptions, CancellableFuture, LocalActivityOptions,
-    WorkflowContext, WorkflowContextView, WorkflowResult, WorkflowTermination,
+    ActivityExecutionError, ActivityOptions, ApplicationFailure, CancellableFuture,
+    LocalActivityOptions, WorkflowContext, WorkflowContextView, WorkflowResult,
     activities::{ActivityContext, ActivityError},
     interceptors::{FailOnNondeterminismInterceptor, WorkerInterceptor},
 };
 use temporalio_sdk_core::{
     PollError, TunerHolder, prost_dur,
-    replay::{DEFAULT_WORKFLOW_TYPE, HistoryForReplay, TestHistoryBuilder, default_wes_attribs},
+    replay::{
+        DEFAULT_ACTIVITY_TYPE, DEFAULT_WORKFLOW_TYPE, HistoryForReplay, TestHistoryBuilder,
+        canned_histories, default_wes_attribs,
+    },
     test_help::{
         LEGACY_QUERY_ID, MockPollCfg, ResponseType, WorkerExt, WorkerTestHelpers,
-        build_mock_pollers, hist_to_poll_resp, mock_worker, mock_worker_client,
-        single_hist_mock_sg,
+        build_mock_pollers, hist_to_poll_resp, mock_worker, mock_worker_client, query_ok,
+        schedule_local_activity_cmd, single_hist_mock_sg, start_timer_cmd,
     },
 };
 use tokio::{join, select, sync::Barrier};
@@ -79,8 +80,7 @@ impl OneLocalActivityWf {
             "hi!".to_string(),
             LocalActivityOptions::default(),
         )
-        .await
-        .map_err(|e| WorkflowTermination::from(anyhow::Error::from(e)))?;
+        .await?;
         assert!(initial_workflow_time < ctx.workflow_time().unwrap());
         Ok(())
     }
@@ -92,7 +92,7 @@ async fn one_local_activity() {
     let mut starter = CoreWfStarter::new(wf_name);
     starter.sdk_config.register_activities(StdActivities);
     let mut worker = starter.worker().await;
-    worker.register_workflow::<OneLocalActivityWf>();
+    worker.register_workflow::<OneLocalActivityWf>().unwrap();
 
     let task_queue = starter.get_task_queue().to_owned();
     let handle = worker
@@ -135,7 +135,9 @@ async fn local_act_concurrent_with_timer() {
     let mut starter = CoreWfStarter::new(wf_name);
     starter.sdk_config.register_activities(StdActivities);
     let mut worker = starter.worker().await;
-    worker.register_workflow::<LocalActConcurrentWithTimerWf>();
+    worker
+        .register_workflow::<LocalActConcurrentWithTimerWf>()
+        .unwrap();
 
     let task_queue = starter.get_task_queue().to_owned();
     worker
@@ -175,7 +177,9 @@ async fn local_act_then_timer_then_wait_result() {
     let mut starter = CoreWfStarter::new(wf_name);
     starter.sdk_config.register_activities(StdActivities);
     let mut worker = starter.worker().await;
-    worker.register_workflow::<LocalActThenTimerThenWaitResult>();
+    worker
+        .register_workflow::<LocalActThenTimerThenWaitResult>()
+        .unwrap();
 
     let task_queue = starter.get_task_queue().to_owned();
     worker
@@ -216,7 +220,9 @@ async fn long_running_local_act_with_timer() {
     starter.workflow_options.task_timeout = Some(Duration::from_secs(1));
     starter.sdk_config.register_activities(StdActivities);
     let mut worker = starter.worker().await;
-    worker.register_workflow::<LocalActThenTimerThenWait>();
+    worker
+        .register_workflow::<LocalActThenTimerThenWait>()
+        .unwrap();
 
     let task_queue = starter.get_task_queue().to_owned();
     worker
@@ -256,7 +262,7 @@ async fn local_act_fanout() {
     starter.sdk_config.tuner = Arc::new(TunerHolder::fixed_size(5, 1, 1, 1));
     starter.sdk_config.register_activities(StdActivities);
     let mut worker = starter.worker().await;
-    worker.register_workflow::<LocalActFanoutWf>();
+    worker.register_workflow::<LocalActFanoutWf>().unwrap();
 
     let task_queue = starter.get_task_queue().to_owned();
     worker
@@ -307,7 +313,9 @@ async fn local_act_retry_timer_backoff() {
     let mut starter = CoreWfStarter::new(wf_name);
     starter.sdk_config.register_activities(StdActivities);
     let mut worker = starter.worker().await;
-    worker.register_workflow::<LocalActRetryTimerBackoff>();
+    worker
+        .register_workflow::<LocalActRetryTimerBackoff>()
+        .unwrap();
 
     let task_queue = starter.get_task_queue().to_owned();
     let handle = worker
@@ -400,7 +408,7 @@ async fn cancel_immediate(#[case] cancel_type: ActivityCancellationType) {
     }
 
     let mut worker = starter.worker().await;
-    worker.register_workflow::<CancelImmediate>();
+    worker.register_workflow::<CancelImmediate>().unwrap();
 
     let task_queue = starter.get_task_queue().to_owned();
     worker
@@ -488,7 +496,9 @@ async fn cancel_after_act_starts(
                 tokio::select! {
                     _ = tokio::time::sleep(Duration::from_secs(100)) => {}
                     _ = ctx.cancelled() => {
-                        return Err(ActivityError::cancelled())
+                        return Err(ActivityError::cancelled_with_details(
+                            "cancel-after-start".to_string(),
+                        ))
                     }
                     _ = self.manual_cancel.cancelled() => {
                         return Ok(())
@@ -545,18 +555,27 @@ async fn cancel_after_act_starts(
             // This extra timer is here to ensure the presence of another WF task doesn't mess up
             // resolving the LA with cancel on replay
             ctx.timer(Duration::from_secs(1)).await;
-            let resolution = la.await;
-            assert!(matches!(
-                resolution,
-                Err(ActivityExecutionError::Cancelled(_))
-            ));
+            let err = la.await.unwrap_err();
+            let ActivityExecutionError::Cancelled(cancel_err) = err else {
+                panic!("expected cancellation failure, got {err:?}");
+            };
+            let expected_details = if bo_dur == Duration::from_secs(1)
+                && cancel_type == ActivityCancellationType::WaitCancellationCompleted
+            {
+                Some("cancel-after-start".to_string())
+            } else {
+                None
+            };
+            assert_eq!(cancel_err.details::<String>().unwrap(), expected_details);
             Ok(())
         }
     }
 
     let mut worker = starter.worker().await;
     let bo_dur = cancel_on_backoff.unwrap_or_else(|| Duration::from_secs(1));
-    worker.register_workflow::<CancelAfterActStartsWf>();
+    worker
+        .register_workflow::<CancelAfterActStartsWf>()
+        .unwrap();
 
     let task_queue = starter.get_task_queue().to_owned();
     worker
@@ -639,14 +658,11 @@ async fn x_to_close_timeout(#[case] is_schedule: bool) {
                 )
                 .await;
             let err = res.unwrap_err();
-            if let ActivityExecutionError::Failed(f) = &err {
-                assert_eq!(
-                    f.is_timeout(),
-                    Some(TimeoutType::try_from(timeout_type).unwrap())
-                );
-            } else {
-                return Err(anyhow!("expected Failed, got {err:?}").into());
-            }
+            let timeout = err.as_timeout().unwrap();
+            assert_eq!(
+                timeout.timeout_type(),
+                TimeoutType::try_from(timeout_type).unwrap()
+            );
             Ok(())
         }
     }
@@ -662,7 +678,7 @@ async fn x_to_close_timeout(#[case] is_schedule: bool) {
     } else {
         TimeoutType::StartToClose
     };
-    worker.register_workflow::<XToCloseTimeoutWf>();
+    worker.register_workflow::<XToCloseTimeoutWf>().unwrap();
 
     let task_queue = starter.get_task_queue().to_owned();
     worker
@@ -717,17 +733,21 @@ async fn schedule_to_close_timeout_across_timer_backoff(#[case] cached: bool) {
                 )
                 .await;
             let err = res.unwrap_err();
-            if let ActivityExecutionError::Failed(f) = &err {
-                assert_eq!(f.is_timeout(), Some(TimeoutType::ScheduleToClose));
-            } else {
+            let ActivityExecutionError::Failed(failure) = &err else {
                 panic!("expected Failed, got {err:?}");
-            }
+            };
+            let Some(timeout) = failure.as_timeout() else {
+                panic!("expected timeout cause, got {failure:?}");
+            };
+            assert_eq!(timeout.timeout_type(), TimeoutType::ScheduleToClose);
             Ok(())
         }
     }
 
     let mut worker = starter.worker().await;
-    worker.register_workflow::<ScheduleToCloseTimeoutAcrossTimerBackoff>();
+    worker
+        .register_workflow::<ScheduleToCloseTimeoutAcrossTimerBackoff>()
+        .unwrap();
 
     let num_attempts = Arc::new(AtomicU8::new(0));
 
@@ -770,7 +790,9 @@ async fn eviction_wont_make_local_act_get_dropped(#[values(true, false)] short_w
     starter.sdk_config.max_cached_workflows = 0_usize;
     starter.sdk_config.register_activities(StdActivities);
     let mut worker = starter.worker().await;
-    worker.register_workflow::<LocalActThenTimerThenWait>();
+    worker
+        .register_workflow::<LocalActThenTimerThenWait>()
+        .unwrap();
 
     let task_queue = starter.get_task_queue().to_owned();
     let opts = if short_wft_timeout {
@@ -839,7 +861,9 @@ async fn timer_backoff_concurrent_with_non_timer_backoff() {
     }
 
     let mut worker = starter.worker().await;
-    worker.register_workflow::<TimerBackoffConcurrentWf>();
+    worker
+        .register_workflow::<TimerBackoffConcurrentWf>()
+        .unwrap();
 
     let task_queue = starter.get_task_queue().to_owned();
     worker
@@ -895,7 +919,9 @@ async fn repro_nondeterminism_with_timer_bug() {
     }
 
     let mut worker = starter.worker().await;
-    worker.register_workflow::<ReproNondeterminismWithTimerBugWf>();
+    worker
+        .register_workflow::<ReproNondeterminismWithTimerBugWf>()
+        .unwrap();
 
     let task_queue = starter.get_task_queue().to_owned();
     let handle = worker
@@ -938,7 +964,7 @@ async fn weird_la_nondeterminism_repro(#[values(true, false)] fix_hist: bool) {
     }
 
     let mut worker = replay_sdk_worker([HistoryForReplay::new(hist, "fake".to_owned())]);
-    worker.register_workflow::<LaProblemWorkflow>();
+    worker.register_workflow::<LaProblemWorkflow>().unwrap();
     worker.register_activities(StdActivities);
     worker.run().await.unwrap();
 }
@@ -956,7 +982,7 @@ async fn second_weird_la_nondeterminism_repro() {
     hist = thb.get_full_history_info().unwrap().into();
 
     let mut worker = replay_sdk_worker([HistoryForReplay::new(hist, "fake".to_owned())]);
-    worker.register_workflow::<LaProblemWorkflow>();
+    worker.register_workflow::<LaProblemWorkflow>().unwrap();
     worker.register_activities(StdActivities);
     worker.run().await.unwrap();
 }
@@ -972,7 +998,7 @@ async fn third_weird_la_nondeterminism_repro() {
     hist = thb.get_full_history_info().unwrap().into();
 
     let mut worker = replay_sdk_worker([HistoryForReplay::new(hist, "fake".to_owned())]);
-    worker.register_workflow::<LaProblemWorkflow>();
+    worker.register_workflow::<LaProblemWorkflow>().unwrap();
     worker.register_activities(StdActivities);
     worker.run().await.unwrap();
 }
@@ -1052,7 +1078,9 @@ async fn la_resolve_same_time_as_other_cancel() {
     }
 
     let mut worker = starter.worker().await;
-    worker.register_workflow::<LaResolveSameTimeAsOtherCancelWf>();
+    worker
+        .register_workflow::<LaResolveSameTimeAsOtherCancelWf>()
+        .unwrap();
 
     let task_queue = starter.get_task_queue().to_owned();
     let handle = worker
@@ -1118,8 +1146,7 @@ async fn long_local_activity_with_update(
                 Duration::from_secs(6),
                 LocalActivityOptions::default(),
             )
-            .await
-            .map_err(|e| WorkflowTermination::from(anyhow::Error::from(e)))?;
+            .await?;
             Ok(ctx.state(|wf| wf.update_counter))
         }
 
@@ -1134,7 +1161,9 @@ async fn long_local_activity_with_update(
     }
 
     let mut worker = starter.worker().await;
-    worker.register_workflow::<LongLocalActivityWithUpdateWf>();
+    worker
+        .register_workflow::<LongLocalActivityWithUpdateWf>()
+        .unwrap();
 
     let task_queue = starter.get_task_queue().to_owned();
     let handle = worker
@@ -1227,7 +1256,9 @@ async fn local_activity_with_heartbeat_only_causes_one_wakeup() {
     }
 
     let mut worker = starter.worker().await;
-    worker.register_workflow::<LocalActivityWithHeartbeatOnlyCausesOneWakeupWf>();
+    worker
+        .register_workflow::<LocalActivityWithHeartbeatOnlyCausesOneWakeupWf>()
+        .unwrap();
 
     let task_queue = starter.get_task_queue().to_owned();
     let handle = worker
@@ -1263,8 +1294,7 @@ impl LocalActivityWithSummaryWf {
                 ..Default::default()
             },
         )
-        .await
-        .map_err(|e| WorkflowTermination::from(anyhow::Error::from(e)))?;
+        .await?;
         Ok(())
     }
 }
@@ -1275,7 +1305,9 @@ async fn local_activity_with_summary() {
     let mut starter = CoreWfStarter::new(wf_name);
     starter.sdk_config.register_activities(StdActivities);
     let mut worker = starter.worker().await;
-    worker.register_workflow::<LocalActivityWithSummaryWf>();
+    worker
+        .register_workflow::<LocalActivityWithSummaryWf>()
+        .unwrap();
 
     let handle = starter.start_with_worker(wf_name, &mut worker).await;
     worker.run_until_done().await.unwrap();
@@ -1356,7 +1388,9 @@ async fn local_act_two_wfts_before_marker(#[case] replay: bool, #[case] cached: 
         }
     }
 
-    worker.register_workflow::<LocalActTwoWftsBeforeMarkerWf>();
+    worker
+        .register_workflow::<LocalActTwoWftsBeforeMarkerWf>()
+        .unwrap();
     worker.register_activities(StdActivities);
     worker.run_until_done().await.unwrap();
 }
@@ -1380,7 +1414,7 @@ async fn local_act_many_concurrent() {
     let mh = MockPollCfg::from_resp_batches(wf_id, t, [1, 2, 3], mock);
     let mut worker = mock_sdk(mh);
 
-    worker.register_workflow::<LocalActFanoutWf>();
+    worker.register_workflow::<LocalActFanoutWf>().unwrap();
     worker.register_activities(StdActivities);
     worker.run_until_done().await.unwrap();
 }
@@ -1430,13 +1464,12 @@ async fn local_act_heartbeat(#[case] shutdown_middle: bool) {
                 "hi".to_string(),
                 LocalActivityOptions::default(),
             )
-            .await
-            .map_err(|e| WorkflowTermination::from(anyhow::Error::from(e)))?;
+            .await?;
             Ok(())
         }
     }
 
-    worker.register_workflow::<LocalActHeartbeatWf>();
+    worker.register_workflow::<LocalActHeartbeatWf>().unwrap();
 
     struct EchoWithConditionalBarrier {
         shutdown_barr: Option<Arc<Barrier>>,
@@ -1529,7 +1562,9 @@ async fn local_act_fail_and_retry(#[case] eventually_pass: bool) {
         }
     }
 
-    worker.register_workflow::<LocalActFailAndRetryWf>();
+    worker
+        .register_workflow::<LocalActFailAndRetryWf>()
+        .unwrap();
     let attempts = Arc::new(AtomicUsize::new(0));
 
     struct EventuallyPassingActivity {
@@ -1625,7 +1660,9 @@ async fn local_act_retry_long_backoff_uses_timer() {
         }
     }
 
-    worker.register_workflow::<LocalActRetryLongBackoffUsesTimerWf>();
+    worker
+        .register_workflow::<LocalActRetryLongBackoffUsesTimerWf>()
+        .unwrap();
     worker.register_activities(StdActivities);
     worker.run_until_done().await.unwrap();
 }
@@ -1652,13 +1689,12 @@ async fn local_act_null_result() {
         #[run(name = DEFAULT_WORKFLOW_TYPE)]
         async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<()> {
             ctx.start_local_activity(StdActivities::default, (), LocalActivityOptions::default())
-                .await
-                .map_err(|e| WorkflowTermination::from(anyhow::Error::from(e)))?;
+                .await?;
             Ok(())
         }
     }
 
-    worker.register_workflow::<LocalActNullResultWf>();
+    worker.register_workflow::<LocalActNullResultWf>().unwrap();
     worker.register_activities(StdActivities);
     worker.run_until_done().await.unwrap();
 }
@@ -1689,14 +1725,15 @@ async fn local_act_command_immediately_follows_la_marker() {
         #[run(name = DEFAULT_WORKFLOW_TYPE)]
         async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<()> {
             ctx.start_local_activity(StdActivities::default, (), LocalActivityOptions::default())
-                .await
-                .map_err(|e| WorkflowTermination::from(anyhow::Error::from(e)))?;
+                .await?;
             ctx.timer(Duration::from_secs(1)).await;
             Ok(())
         }
     }
 
-    worker.register_workflow::<LocalActCommandImmediatelyFollowsLaMarkerWf>();
+    worker
+        .register_workflow::<LocalActCommandImmediatelyFollowsLaMarkerWf>()
+        .unwrap();
     worker.register_activities(StdActivities);
     worker.run_until_done().await.unwrap();
 }
@@ -1988,18 +2025,23 @@ async fn test_schedule_to_start_timeout() {
                 .await;
             assert!(la_res.is_err());
             if let Err(ActivityExecutionError::Failed(ref fail)) = la_res {
-                assert_eq!(fail.is_timeout(), Some(TimeoutType::ScheduleToStart));
-                assert_matches!(fail.failure_info, Some(FailureInfo::ActivityFailureInfo(_)));
-                assert_matches!(
-                    fail.cause.as_ref().unwrap().failure_info,
-                    Some(FailureInfo::TimeoutFailureInfo(_))
+                let Some(timeout) = fail.as_timeout() else {
+                    panic!("expected timeout cause, got {fail:?}");
+                };
+                assert_eq!(timeout.timeout_type(), TimeoutType::ScheduleToStart);
+                assert_eq!(
+                    fail.activity_type()
+                        .map(|activity_type| activity_type.name.as_str()),
+                    Some(StdActivities::echo.name())
                 );
             }
             Ok(())
         }
     }
 
-    worker.register_workflow::<TestScheduleToStartTimeoutWf>();
+    worker
+        .register_workflow::<TestScheduleToStartTimeoutWf>()
+        .unwrap();
     worker.register_activities(StdActivities);
     worker.run_until_done().await.unwrap();
 }
@@ -2086,13 +2128,18 @@ async fn test_schedule_to_start_timeout_not_based_on_original_time(
             if is_sched_to_start {
                 assert!(la_res.is_ok());
             } else if let Err(ActivityExecutionError::Failed(ref fail)) = la_res {
-                assert_eq!(fail.is_timeout(), Some(TimeoutType::ScheduleToClose));
+                let Some(timeout) = fail.as_timeout() else {
+                    panic!("expected timeout cause, got {fail:?}");
+                };
+                assert_eq!(timeout.timeout_type(), TimeoutType::ScheduleToClose);
             }
             Ok(())
         }
     }
 
-    worker.register_workflow::<TestScheduleToStartTimeoutNotBasedOnOriginalTimeWf>();
+    worker
+        .register_workflow::<TestScheduleToStartTimeoutNotBasedOnOriginalTimeWf>()
+        .unwrap();
     worker.register_activities(StdActivities);
     worker.run_until_done().await.unwrap();
 }
@@ -2156,13 +2203,18 @@ async fn start_to_close_timeout_allows_retries(#[values(true, false)] la_complet
             if la_completes {
                 assert!(la_res.is_ok(), "Result should be ok was {la_res:?}");
             } else if let Err(ActivityExecutionError::Failed(ref fail)) = la_res {
-                assert_eq!(fail.is_timeout(), Some(TimeoutType::StartToClose));
+                let Some(timeout) = fail.as_timeout() else {
+                    panic!("expected timeout cause, got {fail:?}");
+                };
+                assert_eq!(timeout.timeout_type(), TimeoutType::StartToClose);
             }
             Ok(())
         }
     }
 
-    worker.register_workflow::<StartToCloseTimeoutAllowsRetriesWf>();
+    worker
+        .register_workflow::<StartToCloseTimeoutAllowsRetriesWf>()
+        .unwrap();
     let attempts = Arc::new(AtomicUsize::new(0));
     let cancels = Arc::new(AtomicUsize::new(0));
 
@@ -2239,7 +2291,9 @@ async fn wft_failure_cancels_running_las() {
         }
     }
 
-    worker.register_workflow::<WftFailureCancelsRunningLasWf>();
+    worker
+        .register_workflow::<WftFailureCancelsRunningLasWf>()
+        .unwrap();
 
     struct ActivityThatExpectsCancellation;
     #[activities]
@@ -2300,13 +2354,14 @@ async fn resolved_las_not_recorded_if_wft_fails_many_times() {
                     ..Default::default()
                 },
             )
-            .await
-            .map_err(|e| WorkflowTermination::from(anyhow::Error::from(e)))?;
+            .await?;
             panic!()
         }
     }
 
-    worker.register_workflow::<ResolvedLasNotRecordedIfWftFailsManyTimesWf>();
+    worker
+        .register_workflow::<ResolvedLasNotRecordedIfWftFailsManyTimesWf>()
+        .unwrap();
     worker.register_activities(StdActivities);
     worker.run_until_done().await.unwrap();
 }
@@ -2366,7 +2421,9 @@ async fn local_act_records_nonfirst_attempts_ok() {
         }
     }
 
-    worker.register_workflow::<LocalActRecordsNonfirstAttemptsOkWf>();
+    worker
+        .register_workflow::<LocalActRecordsNonfirstAttemptsOkWf>()
+        .unwrap();
     worker.register_activities(StdActivities);
     worker.run_until_done().await.unwrap();
     assert_eq!(nonfirst_counts.len(), 3);
@@ -2682,7 +2739,9 @@ async fn local_act_retry_explicit_delay() {
         }
     }
 
-    worker.register_workflow::<LocalActRetryExplicitDelayWf>();
+    worker
+        .register_workflow::<LocalActRetryExplicitDelayWf>()
+        .unwrap();
     let attempts = Arc::new(AtomicUsize::new(0));
 
     struct ActivityWithExplicitBackoff {
@@ -2695,10 +2754,11 @@ async fn local_act_retry_explicit_delay() {
             // Succeed on 3rd attempt (which is ==2 since fetch_add returns prev val)
             let last_attempt = self.attempts.fetch_add(1, Ordering::Relaxed);
             if 0 == last_attempt {
-                Err(ActivityError::Retryable {
-                    source: anyhow!("Explicit backoff error").into_boxed_dyn_error(),
-                    explicit_delay: Some(Duration::from_millis(300)),
-                })
+                Err(ActivityError::application(
+                    ApplicationFailure::builder(anyhow!("Explicit backoff error"))
+                        .next_retry_delay(Duration::from_millis(300))
+                        .build(),
+                ))
             } else if 2 == last_attempt {
                 Ok(())
             } else {
@@ -2808,7 +2868,7 @@ async fn one_la_success(#[case] replay: bool, #[case] completes_ok: bool) {
     });
 
     let mut worker = build_fake_sdk(mock_cfg);
-    worker.register_workflow::<LaWf>();
+    worker.register_workflow::<LaWf>().unwrap();
 
     struct ActivityWithReplayCheck {
         replay: bool,
@@ -2850,11 +2910,9 @@ impl TwoLaWf {
     #[run(name = DEFAULT_WORKFLOW_TYPE)]
     async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<()> {
         ctx.start_local_activity(StdActivities::default, (), LocalActivityOptions::default())
-            .await
-            .map_err(|e| WorkflowTermination::from(anyhow::Error::from(e)))?;
+            .await?;
         ctx.start_local_activity(StdActivities::default, (), LocalActivityOptions::default())
-            .await
-            .map_err(|e| WorkflowTermination::from(anyhow::Error::from(e)))?;
+            .await?;
         Ok(())
     }
 }
@@ -2970,9 +3028,9 @@ async fn two_sequential_las(
     let mut worker = build_fake_sdk(mock_cfg);
     worker.set_worker_interceptor(aai);
     if parallel {
-        worker.register_workflow::<TwoLaWfParallel>();
+        worker.register_workflow::<TwoLaWfParallel>().unwrap();
     } else {
-        worker.register_workflow::<TwoLaWf>();
+        worker.register_workflow::<TwoLaWf>().unwrap();
     }
     worker.register_activities(ResolvedActivity);
     worker.run().await.unwrap();
@@ -2987,12 +3045,10 @@ impl LaTimerLaWf {
     #[run(name = DEFAULT_WORKFLOW_TYPE)]
     async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<()> {
         ctx.start_local_activity(StdActivities::default, (), LocalActivityOptions::default())
-            .await
-            .map_err(|e| WorkflowTermination::from(anyhow::Error::from(e)))?;
+            .await?;
         ctx.timer(Duration::from_secs(5)).await;
         ctx.start_local_activity(StdActivities::default, (), LocalActivityOptions::default())
-            .await
-            .map_err(|e| WorkflowTermination::from(anyhow::Error::from(e)))?;
+            .await?;
         Ok(())
     }
 }
@@ -3067,7 +3123,7 @@ async fn las_separated_by_timer(#[case] replay: bool) {
 
     let mut worker = build_fake_sdk(mock_cfg);
     worker.set_worker_interceptor(aai);
-    worker.register_workflow::<LaTimerLaWf>();
+    worker.register_workflow::<LaTimerLaWf>().unwrap();
     worker.register_activities(ResolvedActivity);
     worker.run().await.unwrap();
 }
@@ -3099,7 +3155,7 @@ async fn one_la_heartbeating_wft_failure_still_executes() {
     });
 
     let mut worker = build_fake_sdk(mock_cfg);
-    worker.register_workflow::<LaWf>();
+    worker.register_workflow::<LaWf>().unwrap();
     worker.register_activities(ResolvedActivity);
     worker.run().await.unwrap();
 }
@@ -3160,7 +3216,9 @@ async fn immediate_cancel(
         }
     }
 
-    worker.register_workflow::<CancelBeforeActStartsWf>();
+    worker
+        .register_workflow::<CancelBeforeActStartsWf>()
+        .unwrap();
     worker.run().await.unwrap();
 }
 
@@ -3272,26 +3330,18 @@ async fn cancel_after_act_starts_canned(
             ctx.timer(Duration::from_secs(1)).await;
             la.cancel();
             ctx.timer(Duration::from_secs(1)).await;
-            let resolution = la.await;
-            assert!(matches!(
-                resolution,
-                Err(ActivityExecutionError::Cancelled(_))
-            ));
-            if let Err(ActivityExecutionError::Cancelled(rfail)) = resolution {
-                assert_matches!(
-                    rfail.failure_info,
-                    Some(FailureInfo::ActivityFailureInfo(_))
-                );
-                assert_matches!(
-                    rfail.cause.unwrap().failure_info,
-                    Some(FailureInfo::CanceledFailureInfo(_))
-                );
-            }
+            let err = la.await.unwrap_err();
+            let ActivityExecutionError::Cancelled(cancel_err) = err else {
+                panic!("expected cancelled error, got {err:?}");
+            };
+            assert!(cancel_err.raw_details().is_none());
             Ok(())
         }
     }
 
-    worker.register_workflow::<CancelAfterActStartsCannedWf>();
+    worker
+        .register_workflow::<CancelAfterActStartsCannedWf>()
+        .unwrap();
 
     struct ActivityWithConditionalCancelWait {
         cancel_type: ActivityCancellationType,

@@ -13,7 +13,7 @@ use temporalio_client::{WorkflowSignalOptions, WorkflowStartOptions};
 use temporalio_common::{
     data_converters::RawValue,
     protos::{
-        DEFAULT_WORKFLOW_TYPE, TestHistoryBuilder, VERSION_SEARCH_ATTR_KEY,
+        VERSION_SEARCH_ATTR_KEY,
         constants::PATCH_MARKER_NAME,
         coresdk::{
             AsJsonPayloadExt, FromJsonPayloadExt,
@@ -37,12 +37,15 @@ use temporalio_common::{
 };
 
 use temporalio_common::worker::WorkerTaskTypes;
-use temporalio_macros::{activities, workflow, workflow_methods};
+use temporalio_macros::{activity_definitions, workflow, workflow_methods};
 use temporalio_sdk::{
     ActivityOptions, SyncWorkflowContext, WorkflowContext, WorkflowResult,
-    activities::{ActivityContext, ActivityError},
+    activities::ActivityError,
 };
-use temporalio_sdk_core::test_help::{CoreInternalFlags, MockPollCfg, ResponseType};
+use temporalio_sdk_core::{
+    replay::{DEFAULT_WORKFLOW_TYPE, TestHistoryBuilder},
+    test_help::{CoreInternalFlags, MockPollCfg, ResponseType},
+};
 use tokio::{join, sync::Notify};
 
 const MY_PATCH_ID: &str = "integ_test_change_name";
@@ -76,7 +79,7 @@ async fn writes_change_markers() {
     let mut starter = CoreWfStarter::new(wf_name);
     starter.sdk_config.task_types = WorkerTaskTypes::workflow_only();
     let mut worker = starter.worker().await;
-    worker.register_workflow::<ChangesWf>();
+    worker.register_workflow::<ChangesWf>().unwrap();
 
     starter.start_with_worker(wf_name, &mut worker).await;
     worker.run_until_done().await.unwrap();
@@ -118,9 +121,11 @@ async fn can_add_change_markers() {
     starter.sdk_config.task_types = WorkerTaskTypes::workflow_only();
     let mut worker = starter.worker().await;
     let did_die = Arc::new(AtomicBool::new(false));
-    worker.register_workflow_with_factory(move || NoChangeThenChangeWf {
-        did_die: did_die.clone(),
-    });
+    worker
+        .register_workflow_with_factory(move || NoChangeThenChangeWf {
+            did_die: did_die.clone(),
+        })
+        .unwrap();
 
     starter.start_with_worker(wf_name, &mut worker).await;
     worker.run_until_done().await.unwrap();
@@ -152,9 +157,11 @@ async fn replaying_with_patch_marker() {
     starter.sdk_config.task_types = WorkerTaskTypes::workflow_only();
     let mut worker = starter.worker().await;
     let did_die = Arc::new(AtomicBool::new(false));
-    worker.register_workflow_with_factory(move || ReplayWithChangeMarkerWf {
-        did_die: did_die.clone(),
-    });
+    worker
+        .register_workflow_with_factory(move || ReplayWithChangeMarkerWf {
+            did_die: did_die.clone(),
+        })
+        .unwrap();
 
     starter.start_with_worker(wf_name, &mut worker).await;
     worker.run_until_done().await.unwrap();
@@ -192,9 +199,11 @@ async fn patched_on_second_workflow_task_is_deterministic() {
     starter.sdk_config.task_types = WorkerTaskTypes::workflow_only();
     let mut worker = starter.worker().await;
     let fail_once = Arc::new(AtomicBool::new(true));
-    worker.register_workflow_with_factory(move || TimerPatchedTimerWf {
-        fail_once: fail_once.clone(),
-    });
+    worker
+        .register_workflow_with_factory(move || TimerPatchedTimerWf {
+            fail_once: fail_once.clone(),
+        })
+        .unwrap();
 
     starter.start_with_worker(wf_name, &mut worker).await;
     worker.run_until_done().await.unwrap();
@@ -233,9 +242,11 @@ async fn can_remove_deprecated_patch_near_other_patch() {
     starter.sdk_config.task_types = WorkerTaskTypes::workflow_only();
     let mut worker = starter.worker().await;
     let did_die = Arc::new(AtomicBool::new(false));
-    worker.register_workflow_with_factory(move || RemoveDeprecatedPatchNearOtherPatchWf {
-        did_die: did_die.clone(),
-    });
+    worker
+        .register_workflow_with_factory(move || RemoveDeprecatedPatchNearOtherPatchWf {
+            did_die: did_die.clone(),
+        })
+        .unwrap();
 
     starter.start_with_worker(wf_name, &mut worker).await;
     worker.run_until_done().await.unwrap();
@@ -283,11 +294,13 @@ async fn deprecated_patch_removal() {
     let did_die = Arc::new(AtomicBool::new(false));
     let send_sig = Arc::new(Notify::new());
     let send_sig_clone = send_sig.clone();
-    worker.register_workflow_with_factory(move || DeprecatedPatchRemovalWf {
-        did_die: did_die.clone(),
-        notify: send_sig_clone.clone(),
-        signal_received: false,
-    });
+    worker
+        .register_workflow_with_factory(move || DeprecatedPatchRemovalWf {
+            did_die: did_die.clone(),
+            notify: send_sig_clone.clone(),
+            signal_received: false,
+        })
+        .unwrap();
 
     let handle = worker
         .submit_workflow(
@@ -343,10 +356,7 @@ fn patch_marker_single_activity(
     let mut t = TestHistoryBuilder::default();
     t.add_by_type(EventType::WorkflowExecutionStarted);
     t.add_full_wf_task();
-    t.set_flags_first_wft(
-        &[CoreInternalFlags::UpsertSearchAttributeOnPatch as u32],
-        &[],
-    );
+    t.set_flags_first_wft(&[CoreInternalFlags::UpsertSearchAttributeOnPatch], &[]);
     match marker_type {
         MarkerType::Deprecated => {
             t.add_has_change_marker(MY_PATCH_ID, true);
@@ -400,10 +410,10 @@ fn patch_marker_single_activity(
 }
 
 struct FakeAct;
-#[activities]
+#[activity_definitions]
 impl FakeAct {
     #[activity(name = "")]
-    fn nameless(_: ActivityContext) -> Result<RawValue, ActivityError> {
+    fn nameless() -> Result<RawValue, ActivityError> {
         unimplemented!()
     }
 }
@@ -557,9 +567,11 @@ async fn v1_and_v4_changes(
 
     let mut worker = build_fake_sdk(mock_cfg);
     worker.set_worker_interceptor(aai);
-    worker.register_workflow_with_factory(move || PatchWf {
-        version: wf_version,
-    });
+    worker
+        .register_workflow_with_factory(move || PatchWf {
+            version: wf_version,
+        })
+        .unwrap();
     worker.run().await.unwrap();
 }
 
@@ -664,9 +676,11 @@ async fn v2_and_v3_changes(
 
     let mut worker = build_fake_sdk(mock_cfg);
     worker.set_worker_interceptor(aai);
-    worker.register_workflow_with_factory(move || PatchWf {
-        version: wf_version,
-    });
+    worker
+        .register_workflow_with_factory(move || PatchWf {
+            version: wf_version,
+        })
+        .unwrap();
     worker.run().await.unwrap();
 }
 
@@ -717,10 +731,7 @@ async fn same_change_multiple_spots(#[case] have_marker_in_hist: bool, #[case] r
     let mut t = TestHistoryBuilder::default();
     t.add_by_type(EventType::WorkflowExecutionStarted);
     t.add_full_wf_task();
-    t.set_flags_first_wft(
-        &[CoreInternalFlags::UpsertSearchAttributeOnPatch as u32],
-        &[],
-    );
+    t.set_flags_first_wft(&[CoreInternalFlags::UpsertSearchAttributeOnPatch], &[]);
     if have_marker_in_hist {
         t.add_has_change_marker(MY_PATCH_ID, false);
         t.add_upsert_search_attrs_for_patch(&[MY_PATCH_ID.to_string()]);
@@ -795,7 +806,9 @@ async fn same_change_multiple_spots(#[case] have_marker_in_hist: bool, #[case] r
     };
 
     let mut worker = build_fake_sdk(mock_cfg);
-    worker.register_workflow::<SameChangeMultipleSpotsWf>();
+    worker
+        .register_workflow::<SameChangeMultipleSpotsWf>()
+        .unwrap();
     worker.run().await.unwrap();
 }
 
@@ -827,10 +840,7 @@ async fn many_patches_combine_in_search_attrib_update(#[case] num_patches: usize
     let mut t = TestHistoryBuilder::default();
     t.add_by_type(EventType::WorkflowExecutionStarted);
     t.add_full_wf_task();
-    t.set_flags_first_wft(
-        &[CoreInternalFlags::UpsertSearchAttributeOnPatch as u32],
-        &[],
-    );
+    t.set_flags_first_wft(&[CoreInternalFlags::UpsertSearchAttributeOnPatch], &[]);
     for i in 1..=num_patches {
         let id = format!("patch-{i}");
         t.add_has_change_marker(&id, false);
@@ -877,7 +887,9 @@ async fn many_patches_combine_in_search_attrib_update(#[case] num_patches: usize
     });
 
     let mut worker = build_fake_sdk(mock_cfg);
-    worker.register_workflow_with_factory(move || ManyPatchesWf { num_patches });
+    worker
+        .register_workflow_with_factory(move || ManyPatchesWf { num_patches })
+        .unwrap();
     worker.run().await.unwrap();
 }
 
@@ -908,7 +920,7 @@ async fn patch_marker_size_overflow_replay_is_deterministic() {
     let mut starter = CoreWfStarter::new(wf_name);
     starter.sdk_config.task_types = WorkerTaskTypes::workflow_only();
     let mut worker = starter.worker().await;
-    worker.register_workflow::<ManyPatchesInOneWftWf>();
+    worker.register_workflow::<ManyPatchesInOneWftWf>().unwrap();
 
     let task_queue = starter.get_task_queue().to_owned();
     let handle = worker

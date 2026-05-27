@@ -34,8 +34,7 @@ impl PollingWorkflow {
         for attempt in 1..=max_attempts {
             let is_ready = ctx
                 .start_activity(PollingActivities::check_condition, attempt, activity_opts())
-                .await
-                .map_err(|e| anyhow::anyhow!("{e}"))?;
+                .await?;
 
             if is_ready {
                 return Ok(format!("Condition met on attempt {attempt}"));

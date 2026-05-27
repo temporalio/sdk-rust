@@ -3,9 +3,7 @@ use futures_util::{StreamExt, stream::FuturesUnordered};
 use std::{future::Future, pin::Pin, time::Duration};
 use temporalio_client::WorkflowStartOptions;
 use temporalio_common::{
-    prost_dur,
     protos::{
-        DEFAULT_WORKFLOW_TYPE, TestHistoryBuilder, canned_histories,
         coresdk::{
             workflow_commands::{CancelTimer, CompleteWorkflowExecution, StartTimer},
             workflow_completion::WorkflowActivationCompletion,
@@ -14,13 +12,16 @@ use temporalio_common::{
             enums::v1::{CommandType, EventType, WorkflowTaskFailedCause},
             failure::v1::Failure,
         },
-        test_utils::start_timer_cmd,
     },
     worker::WorkerTaskTypes,
 };
 use temporalio_macros::{workflow, workflow_methods};
 use temporalio_sdk::{CancellableFuture, WorkflowContext, WorkflowResult};
-use temporalio_sdk_core::test_help::{MockPollCfg, WorkerTestHelpers, drain_pollers_and_shutdown};
+use temporalio_sdk_core::{
+    prost_dur,
+    replay::{DEFAULT_WORKFLOW_TYPE, TestHistoryBuilder, canned_histories},
+    test_help::{MockPollCfg, WorkerTestHelpers, drain_pollers_and_shutdown, start_timer_cmd},
+};
 
 #[workflow]
 #[derive(Default)]
@@ -41,7 +42,7 @@ async fn timer_workflow_workflow_driver() {
     let mut starter = CoreWfStarter::new(wf_name);
     starter.sdk_config.task_types = WorkerTaskTypes::workflow_only();
     let mut worker = starter.worker().await;
-    worker.register_workflow::<TimerWf>();
+    worker.register_workflow::<TimerWf>().unwrap();
 
     let task_queue = starter.get_task_queue().to_owned();
     let workflow_id = starter.get_task_queue().to_owned();
@@ -153,10 +154,42 @@ async fn parallel_timers() {
     let mut starter = CoreWfStarter::new(wf_name);
     starter.sdk_config.task_types = WorkerTaskTypes::workflow_only();
     let mut worker = starter.worker().await;
-    worker.register_workflow::<ParallelTimerWf>();
+    worker.register_workflow::<ParallelTimerWf>().unwrap();
 
     starter.start_with_worker(wf_name, &mut worker).await;
     worker.run_until_done().await.unwrap();
+}
+
+#[workflow]
+#[derive(Default)]
+struct CancelAlreadyFiredTimerWf;
+
+#[workflow_methods]
+impl CancelAlreadyFiredTimerWf {
+    #[run(name = DEFAULT_WORKFLOW_TYPE)]
+    async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<()> {
+        let mut t1 = ctx.timer(Duration::from_secs(1));
+        let mut t2 = ctx.timer(Duration::from_secs(1));
+        temporalio_sdk::workflows::select! {
+            _ = t1 => {}
+            _ = t2 => {}
+        }
+        t2.cancel();
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn cancel_unpolled_timer_after_both_timers_fire_same_activation() {
+    let mut t = canned_histories::parallel_timer("1", "2");
+    t.add_workflow_task_completed();
+    t.add_workflow_execution_completed();
+
+    let mut worker = build_fake_sdk(MockPollCfg::from_hist_builder(t));
+    worker
+        .register_workflow::<CancelAlreadyFiredTimerWf>()
+        .unwrap();
+    worker.run().await.unwrap();
 }
 
 #[workflow]
@@ -192,7 +225,7 @@ async fn test_fire_happy_path_inc() {
     });
 
     let mut worker = build_fake_sdk(mock_cfg);
-    worker.register_workflow::<HappyTimerWf>();
+    worker.register_workflow::<HappyTimerWf>().unwrap();
     worker.run().await.unwrap();
 }
 
@@ -220,7 +253,7 @@ async fn mismatched_timer_ids_errors() {
         if message.contains("Timer fired event did not have expected timer id 1"))
     });
     let mut worker = build_fake_sdk(mock_cfg);
-    worker.register_workflow::<MismatchedTimerWf>();
+    worker.register_workflow::<MismatchedTimerWf>().unwrap();
     worker.run().await.unwrap();
 }
 
@@ -262,7 +295,7 @@ async fn incremental_cancellation() {
     });
 
     let mut worker = build_fake_sdk(mock_cfg);
-    worker.register_workflow::<CancelTimerWf>();
+    worker.register_workflow::<CancelTimerWf>().unwrap();
     worker.run().await.unwrap();
 }
 
@@ -298,7 +331,7 @@ async fn cancel_before_sent_to_server() {
         });
     });
     let mut worker = build_fake_sdk(mock_cfg);
-    worker.register_workflow::<CancelBeforeSentWf>();
+    worker.register_workflow::<CancelBeforeSentWf>().unwrap();
     worker.run().await.unwrap();
 }
 
@@ -341,6 +374,6 @@ async fn wait_condition_waker_in_futures_unordered() {
     // FuturesUnordered uses internal wakers that forward wake calls outside the
     // SdkWakeGuard scope.
     worker.set_detect_nondeterministic_futures(false);
-    worker.register_workflow::<WaitConditionWakerWf>();
+    worker.register_workflow::<WaitConditionWakerWf>().unwrap();
     worker.run().await.unwrap();
 }

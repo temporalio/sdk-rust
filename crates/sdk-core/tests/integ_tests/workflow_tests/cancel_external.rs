@@ -2,7 +2,6 @@ use crate::common::{CoreWfStarter, build_fake_sdk};
 use temporalio_client::WorkflowStartOptions;
 use temporalio_common::{
     protos::{
-        DEFAULT_WORKFLOW_TYPE, TestHistoryBuilder,
         coresdk::common::NamespacedWorkflowExecution,
         temporal::api::enums::v1::{CommandType, EventType},
     },
@@ -10,7 +9,10 @@ use temporalio_common::{
 };
 use temporalio_macros::{workflow, workflow_methods};
 use temporalio_sdk::{WorkflowContext, WorkflowResult};
-use temporalio_sdk_core::test_help::MockPollCfg;
+use temporalio_sdk_core::{
+    replay::{DEFAULT_WORKFLOW_TYPE, TestHistoryBuilder},
+    test_help::MockPollCfg,
+};
 
 #[workflow]
 #[derive(Default)]
@@ -47,8 +49,8 @@ async fn sends_cancel_to_other_wf() {
     let mut starter = CoreWfStarter::new("sends_cancel_to_other_wf");
     starter.sdk_config.task_types = WorkerTaskTypes::workflow_only();
     let mut worker = starter.worker().await;
-    worker.register_workflow::<CancelSender>();
-    worker.register_workflow::<CancelReceiver>();
+    worker.register_workflow::<CancelSender>().unwrap();
+    worker.register_workflow::<CancelReceiver>().unwrap();
 
     let task_queue = starter.get_task_queue().to_owned();
     let receiver_wfid = "sends-cancel-receiver";
@@ -156,6 +158,6 @@ async fn sends_cancel_canned(#[case] fails: bool) {
             });
     });
     let mut worker = build_fake_sdk(mock_cfg);
-    worker.register_workflow::<CancelSenderCanned>();
+    worker.register_workflow::<CancelSenderCanned>().unwrap();
     worker.run().await.unwrap();
 }

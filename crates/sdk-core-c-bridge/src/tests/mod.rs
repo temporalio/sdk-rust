@@ -161,7 +161,7 @@ fn test_all_rpc_calls_exist() {
             context,
             RpcService::Workflow,
             include_str!(
-                "../../../common/protos/api_upstream/temporal/api/workflowservice/v1/service.proto"
+                "../../../protos/protos/api_upstream/temporal/api/workflowservice/v1/service.proto"
             ),
         ));
 
@@ -169,7 +169,7 @@ fn test_all_rpc_calls_exist() {
             context,
             RpcService::Operator,
             include_str!(
-                "../../../common/protos/api_upstream/temporal/api/operatorservice/v1/service.proto"
+                "../../../protos/protos/api_upstream/temporal/api/operatorservice/v1/service.proto"
             ),
         ));
 
@@ -177,7 +177,7 @@ fn test_all_rpc_calls_exist() {
             context,
             RpcService::Cloud,
             include_str!(
-                "../../../common/protos/api_cloud_upstream/temporal/api/cloud/cloudservice/v1/service.proto"
+                "../../../protos/protos/api_cloud_upstream/temporal/api/cloud/cloudservice/v1/service.proto"
             ),
         ));
 
@@ -185,14 +185,14 @@ fn test_all_rpc_calls_exist() {
             context,
             RpcService::Test,
             include_str!(
-                "../../../common/protos/testsrv_upstream/temporal/api/testservice/v1/service.proto"
+                "../../../protos/protos/testsrv_upstream/temporal/api/testservice/v1/service.proto"
             ),
         ));
 
         assert!(all_rpc_calls_exist(
             context,
             RpcService::Health,
-            include_str!("../../../common/protos/grpc/health/v1/health.proto"),
+            include_str!("../../../protos/protos/grpc/health/v1/health.proto"),
         ));
     });
 }

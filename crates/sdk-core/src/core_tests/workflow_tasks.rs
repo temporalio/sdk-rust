@@ -2,13 +2,14 @@ use crate::{
     PollError, PollWorkflowOptions, Worker, advance_fut,
     internal_flags::CoreInternalFlags,
     job_assert,
-    replay::TestHistoryBuilder,
+    replay::{TestHistoryBuilder, canned_histories, default_act_sched, default_wes_attribs},
     test_help::{
         FakeWfResponses, MockPollCfg, MocksHolder, ResponseType, WorkerExt, WorkerTestHelpers,
         WorkflowCachingPolicy::{self, AfterEveryReply, NonSticky},
         build_fake_worker, build_mock_pollers, build_multihist_mock_sg, fanout_tasks,
         gen_assert_and_fail, gen_assert_and_reply, hist_to_poll_resp, mock_worker, poll_and_reply,
-        poll_and_reply_clears_outstanding_evicts, single_hist_mock_sg, test_worker_cfg,
+        poll_and_reply_clears_outstanding_evicts, single_hist_mock_sg, start_timer_cmd,
+        test_worker_cfg,
     },
     worker::{
         PollerBehavior, SlotMarkUsedContext, SlotReleaseContext, SlotReservationContext,
@@ -31,7 +32,6 @@ use std::{
 use temporalio_client::MESSAGE_TOO_LARGE_KEY;
 use temporalio_common::{
     protos::{
-        canned_histories,
         coresdk::{
             activity_result::{self as ar, ActivityResolution, activity_resolution},
             common::VersioningIntent,
@@ -47,7 +47,6 @@ use temporalio_common::{
             },
             workflow_completion::WorkflowActivationCompletion,
         },
-        default_act_sched, default_wes_attribs,
         temporal::api::{
             command::v1::command::Attributes,
             common::v1::{Payload, RetryPolicy},
@@ -61,7 +60,6 @@ use temporalio_common::{
                 GetWorkflowExecutionHistoryResponse, RespondWorkflowTaskCompletedResponse,
             },
         },
-        test_utils::start_timer_cmd,
     },
     worker::WorkerTaskTypes,
 };
@@ -2391,7 +2389,13 @@ async fn lang_internal_flag_with_update() {
     let mut t = TestHistoryBuilder::default();
     t.add_by_type(EventType::WorkflowExecutionStarted);
     t.add_full_wf_task();
-    t.set_flags_last_wft(&[1, 2], &[1]);
+    t.set_flags_last_wft(
+        &[
+            CoreInternalFlags::IdAndTypeDeterminismChecks,
+            CoreInternalFlags::UpsertSearchAttributeOnPatch,
+        ],
+        &[1],
+    );
     let updid = t.add_update_accepted("upd1", "upd");
     t.add_update_completed(updid);
     t.add_workflow_execution_completed();
@@ -2513,7 +2517,7 @@ async fn post_terminal_commands_are_retained_when_replaying_and_flag_set() {
     t.add_full_wf_task();
     t.add_timer_started("1".to_string());
     t.add_workflow_execution_completed();
-    t.set_flags_last_wft(&[CoreInternalFlags::MoveTerminalCommands as u32], &[]);
+    t.set_flags_last_wft(&[CoreInternalFlags::MoveTerminalCommands], &[]);
 
     let commands_sent_by_lang = vec![
         CompleteWorkflowExecution { result: None }.into(),

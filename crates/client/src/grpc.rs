@@ -521,6 +521,10 @@ macro_rules! proxier_impl {
         }
         dyn_clone::clone_trait_object!($trait_name);
 
+        // `allow(deprecated)`: upstream proto deprecations (e.g. cloud-api
+        // AddNamespaceRegion) generate calls to deprecated tonic client
+        // methods inside the impls; we still wire them for back-compat.
+        #[allow(deprecated)]
         impl<RC> $trait_name for RC
         where
             RC: RawGrpcCaller + RawClientProducer + Clone + Unpin,
@@ -533,6 +537,7 @@ macro_rules! proxier_impl {
 
         impl<T: Send + Sync + 'static> RawGrpcCaller for $client_type<T> {}
 
+        #[allow(deprecated)]
         impl<T> $trait_name for $client_type<T>
         where
             T: GrpcService<Body> + Clone + Send + Sync + 'static,
@@ -1798,6 +1803,11 @@ proxier! {
     (get_namespace_capacity_info, cloudreq::GetNamespaceCapacityInfoRequest, cloudreq::GetNamespaceCapacityInfoResponse);
     (create_billing_report, cloudreq::CreateBillingReportRequest, cloudreq::CreateBillingReportResponse);
     (get_billing_report, cloudreq::GetBillingReportRequest, cloudreq::GetBillingReportResponse);
+    (get_custom_roles, cloudreq::GetCustomRolesRequest, cloudreq::GetCustomRolesResponse);
+    (get_custom_role, cloudreq::GetCustomRoleRequest, cloudreq::GetCustomRoleResponse);
+    (create_custom_role, cloudreq::CreateCustomRoleRequest, cloudreq::CreateCustomRoleResponse);
+    (update_custom_role, cloudreq::UpdateCustomRoleRequest, cloudreq::UpdateCustomRoleResponse);
+    (delete_custom_role, cloudreq::DeleteCustomRoleRequest, cloudreq::DeleteCustomRoleResponse);
 }
 
 proxier! {
@@ -1922,7 +1932,7 @@ mod tests {
     fn verify_all_workflow_service_methods_implemented() {
         // This is less work than trying to hook into the codegen process
         let proto_def = include_str!(
-            "../../common/protos/api_upstream/temporal/api/workflowservice/v1/service.proto"
+            "../../protos/protos/api_upstream/temporal/api/workflowservice/v1/service.proto"
         );
         verify_methods(proto_def, ALL_IMPLEMENTED_WORKFLOW_SERVICE_RPCS);
     }
@@ -1930,7 +1940,7 @@ mod tests {
     #[test]
     fn verify_all_operator_service_methods_implemented() {
         let proto_def = include_str!(
-            "../../common/protos/api_upstream/temporal/api/operatorservice/v1/service.proto"
+            "../../protos/protos/api_upstream/temporal/api/operatorservice/v1/service.proto"
         );
         verify_methods(proto_def, ALL_IMPLEMENTED_OPERATOR_SERVICE_RPCS);
     }
@@ -1938,7 +1948,7 @@ mod tests {
     #[test]
     fn verify_all_cloud_service_methods_implemented() {
         let proto_def = include_str!(
-            "../../common/protos/api_cloud_upstream/temporal/api/cloud/cloudservice/v1/service.proto"
+            "../../protos/protos/api_cloud_upstream/temporal/api/cloud/cloudservice/v1/service.proto"
         );
         verify_methods(proto_def, ALL_IMPLEMENTED_CLOUD_SERVICE_RPCS);
     }
@@ -1946,14 +1956,14 @@ mod tests {
     #[test]
     fn verify_all_test_service_methods_implemented() {
         let proto_def = include_str!(
-            "../../common/protos/testsrv_upstream/temporal/api/testservice/v1/service.proto"
+            "../../protos/protos/testsrv_upstream/temporal/api/testservice/v1/service.proto"
         );
         verify_methods(proto_def, ALL_IMPLEMENTED_TEST_SERVICE_RPCS);
     }
 
     #[test]
     fn verify_all_health_service_methods_implemented() {
-        let proto_def = include_str!("../../common/protos/grpc/health/v1/health.proto");
+        let proto_def = include_str!("../../protos/protos/grpc/health/v1/health.proto");
         verify_methods(proto_def, ALL_IMPLEMENTED_HEALTH_SERVICE_RPCS);
     }
 

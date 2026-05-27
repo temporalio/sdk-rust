@@ -5,7 +5,6 @@ use temporalio_client::{
 };
 use temporalio_common::{
     protos::{
-        DEFAULT_WORKFLOW_TYPE, canned_histories,
         coresdk::workflow_activation::{WorkflowActivationJob, workflow_activation_job},
         temporal::api::enums::v1::{CommandType, WorkflowExecutionStatus},
     },
@@ -13,7 +12,10 @@ use temporalio_common::{
 };
 use temporalio_macros::{workflow, workflow_methods};
 use temporalio_sdk::{WorkflowContext, WorkflowResult, WorkflowTermination};
-use temporalio_sdk_core::test_help::MockPollCfg;
+use temporalio_sdk_core::{
+    replay::{DEFAULT_WORKFLOW_TYPE, canned_histories},
+    test_help::MockPollCfg,
+};
 
 #[workflow]
 #[derive(Default)]
@@ -49,7 +51,7 @@ async fn cancel_during_timer() {
     starter.sdk_config.task_types = WorkerTaskTypes::workflow_only();
     let mut worker = starter.worker().await;
     let client = starter.get_client().await;
-    worker.register_workflow::<CancelledWf>();
+    worker.register_workflow::<CancelledWf>().unwrap();
     let task_queue = starter.get_task_queue().to_owned();
     let wf_id = task_queue.clone();
     let wf_handle = worker
@@ -141,7 +143,7 @@ async fn wf_completing_with_cancelled() {
     });
 
     let mut worker = build_fake_sdk(mock_cfg);
-    worker.register_workflow::<WfWithTimer>();
+    worker.register_workflow::<WfWithTimer>().unwrap();
     worker.set_worker_interceptor(aai);
     worker.run().await.unwrap();
 }
