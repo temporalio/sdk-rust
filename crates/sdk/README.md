@@ -312,8 +312,9 @@ ctx.start_local_activity(
 
 ## Cancellation
 
-Workflows and activities support cancellation. Note that in an activity, you must regularly
-heartbeat with `ctx.record_heartbeat(...)` to receive cancellations.
+Workflows and activities support cancellation. Activity cancellation may be delivered independently
+from heartbeating, though long-running activities may still wish to heartbeat with
+`ctx.record_heartbeat(...)` to report progress.
 
 ```rust
 use temporalio_sdk::workflows::select;

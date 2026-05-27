@@ -282,7 +282,6 @@ async fn docker_worker_heartbeat_basic(#[values("otel", "prom", "no_metrics")] b
                     .unwrap()
                     .into_inner();
                     #[allow(deprecated)]
-                    #[allow(deprecated)]
                     let hb = workers_list
                         .workers_info
                         .iter()

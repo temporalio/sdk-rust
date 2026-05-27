@@ -1195,12 +1195,11 @@ impl Worker {
     /// instead send it as a separate activity task to the lang, decoupling heartbeat and
     /// cancellation processing.
     ///
-    /// For now activity still need to send heartbeats if they want to receive cancellation
-    /// requests. In the future we will change this and will dispatch cancellations more
-    /// proactively. Note that this function does not block on the server call and returns
-    /// immediately. Underlying validation errors are swallowed and logged, this has been agreed to
-    /// be optimal behavior for the user as we don't want to break activity execution due to badly
-    /// configured heartbeat options.
+    /// Activities may receive cancellation requests independently from heartbeating. Note that
+    /// this function does not block on the server call and returns immediately. Underlying
+    /// validation errors are swallowed and logged, this has been agreed to be optimal behavior for
+    /// the user as we don't want to break activity execution due to badly configured heartbeat
+    /// options.
     pub fn record_activity_heartbeat(&self, details: ActivityHeartbeat) {
         if let Some(at_mgr) = self.at_task_mgr.as_ref() {
             let tt = TaskToken(details.task_token.clone());
