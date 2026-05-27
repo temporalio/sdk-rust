@@ -434,9 +434,11 @@ pub struct Worker {
 }
 
 /// Namespace capabilities discovered via `describe_namespace` during worker validation.
+#[derive(Default)]
 pub struct NamespaceCapabilities {
     pub(crate) graceful_poll_shutdown: AtomicBool,
     pub(crate) poller_autoscaling: AtomicBool,
+    pub(crate) worker_commands: AtomicBool,
 }
 
 impl NamespaceCapabilities {
@@ -450,6 +452,11 @@ impl NamespaceCapabilities {
     /// decision from the server.
     pub fn poller_autoscaling(&self) -> bool {
         self.poller_autoscaling.load(Ordering::Relaxed)
+    }
+
+    /// Returns true if worker commands are supported in this namespace.
+    pub fn worker_commands(&self) -> bool {
+        self.worker_commands.load(Ordering::Relaxed)
     }
 }
 
@@ -533,6 +540,11 @@ impl Worker {
                     if caps.poller_autoscaling {
                         self.capabilities
                             .poller_autoscaling
+                            .store(true, Ordering::Relaxed);
+                    }
+                    if caps.worker_commands {
+                        self.capabilities
+                            .worker_commands
                             .store(true, Ordering::Relaxed);
                     }
                 }
@@ -659,6 +671,7 @@ impl Worker {
         let capabilities = Arc::new(NamespaceCapabilities {
             graceful_poll_shutdown: AtomicBool::new(false),
             poller_autoscaling: AtomicBool::new(false),
+            worker_commands: AtomicBool::new(false),
         });
 
         let nexus_slots = MeteredPermitDealer::new(

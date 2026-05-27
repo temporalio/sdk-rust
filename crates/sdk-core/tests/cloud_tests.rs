@@ -37,3 +37,8 @@ async fn priority_values_sent_to_server() {
 async fn shutdown_during_active_timer_activity_workflows() {
     shared_tests::shutdown_during_active_timer_activity_workflows().await
 }
+
+#[tokio::test]
+async fn activity_cancel_delivered_without_heartbeat() {
+    shared_tests::activity_cancel_delivered_without_heartbeat().await
+}

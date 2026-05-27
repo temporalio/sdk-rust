@@ -831,10 +831,7 @@ mod tests {
                 max_tps: None,
             },
             Arc::new(AtomicCell::new(None)),
-            Arc::new(NamespaceCapabilities {
-                graceful_poll_shutdown: AtomicBool::new(false),
-                poller_autoscaling: AtomicBool::new(false),
-            }),
+            Arc::new(NamespaceCapabilities::default()),
         );
         let atm = WorkerActivityTasks::new(
             sem.clone(),
@@ -927,10 +924,7 @@ mod tests {
                 max_tps: None,
             },
             Arc::new(AtomicCell::new(None)),
-            Arc::new(NamespaceCapabilities {
-                graceful_poll_shutdown: AtomicBool::new(false),
-                poller_autoscaling: AtomicBool::new(false),
-            }),
+            Arc::new(NamespaceCapabilities::default()),
         );
         let atm = WorkerActivityTasks::new(
             sem.clone(),
@@ -1005,10 +999,7 @@ mod tests {
                 max_tps: None,
             },
             Arc::new(AtomicCell::new(None)),
-            Arc::new(NamespaceCapabilities {
-                graceful_poll_shutdown: AtomicBool::new(false),
-                poller_autoscaling: AtomicBool::new(false),
-            }),
+            Arc::new(NamespaceCapabilities::default()),
         );
         let atm = WorkerActivityTasks::new(
             sem.clone(),

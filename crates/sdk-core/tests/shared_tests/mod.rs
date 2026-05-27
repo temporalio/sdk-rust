@@ -12,23 +12,31 @@ use temporalio_client::{
     WorkflowFetchHistoryOptions, WorkflowStartOptions, WorkflowTerminateOptions,
 };
 use temporalio_common::{
-    UntypedWorkflow,
-    protos::temporal::api::{
-        enums::v1::{
-            EventType,
-            WorkflowTaskFailedCause::{self, GrpcMessageTooLarge},
-        },
-        history::v1::history_event::{
-            self,
-            Attributes::{
-                WorkflowExecutionTerminatedEventAttributes, WorkflowTaskFailedEventAttributes,
+    ActivityError, UntypedWorkflow,
+    protos::{
+        coresdk::workflow_commands::ActivityCancellationType,
+        temporal::api::{
+            common::v1::RetryPolicy,
+            enums::v1::{
+                EventType,
+                WorkflowTaskFailedCause::{self, GrpcMessageTooLarge},
+            },
+            history::v1::history_event::{
+                self,
+                Attributes::{
+                    WorkflowExecutionTerminatedEventAttributes, WorkflowTaskFailedEventAttributes,
+                },
             },
         },
     },
     worker::WorkerTaskTypes,
 };
-use temporalio_macros::{workflow, workflow_methods};
-use temporalio_sdk::{ActivityOptions, WorkflowContext, WorkflowResult, WorkflowTermination};
+use temporalio_macros::{activities, workflow, workflow_methods};
+use temporalio_sdk::{
+    ActivityOptions, CancellableFuture, WorkflowContext, WorkflowResult, WorkflowTermination,
+    activities::ActivityContext,
+};
+use tracing::warn;
 
 pub(crate) mod priority;
 
@@ -221,4 +229,86 @@ pub(crate) async fn shutdown_during_active_timer_activity_workflows() {
             "Workflow {wf_id} had unexpected WFT failures/timeouts: {bad_events:?}"
         );
     }
+}
+
+/// Verifies that activity cancellation is delivered via the nexus worker command channel
+/// even when the activity does not heartbeat.
+pub(crate) async fn activity_cancel_delivered_without_heartbeat() {
+    let wf_name = "activity_cancel_delivered_without_heartbeat";
+    let mut starter = CoreWfStarter::new_cloud_or_local(wf_name, "")
+        .await
+        .unwrap();
+
+    struct WaitForCancelActivities {}
+    #[activities]
+    impl WaitForCancelActivities {
+        #[activity]
+        async fn wait_for_cancel(
+            self: Arc<Self>,
+            ctx: ActivityContext,
+            _: String,
+        ) -> Result<String, ActivityError> {
+            ctx.cancelled().await;
+            Ok("done".to_string())
+        }
+    }
+
+    starter
+        .sdk_config
+        .register_activities(WaitForCancelActivities {});
+    let mut worker = starter.worker().await;
+    if !worker
+        .core_worker()
+        .get_namespace_capabilities()
+        .worker_commands()
+    {
+        warn!("Skipping test: worker_commands not supported in this namespace");
+        return;
+    }
+
+    #[workflow]
+    #[derive(Default)]
+    struct CancelWithoutHeartbeatWorkflow;
+
+    #[workflow_methods]
+    impl CancelWithoutHeartbeatWorkflow {
+        #[run]
+        async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<()> {
+            let act_fut = ctx.start_activity(
+                WaitForCancelActivities::wait_for_cancel,
+                "hi".to_string(),
+                ActivityOptions::with_start_to_close_timeout(Duration::from_secs(30))
+                    .retry_policy(RetryPolicy {
+                        maximum_attempts: 1,
+                        ..Default::default()
+                    })
+                    .cancellation_type(ActivityCancellationType::WaitCancellationCompleted)
+                    .build(),
+            );
+            // Timer needed to avoid cancel-before-sent
+            ctx.timer(Duration::from_millis(10)).await;
+            act_fut.cancel();
+            let _ = act_fut.await;
+            Ok(())
+        }
+    }
+
+    worker
+        .register_workflow::<CancelWithoutHeartbeatWorkflow>()
+        .unwrap();
+
+    let task_queue = starter.get_task_queue().to_owned();
+    let handle = worker
+        .submit_workflow(
+            CancelWithoutHeartbeatWorkflow::run,
+            (),
+            WorkflowStartOptions::new(task_queue, wf_name.to_owned())
+                .run_timeout(Duration::from_secs(10))
+                .build(),
+        )
+        .await
+        .unwrap();
+    // Fails with workflow timeout if cancel doesn't work
+    worker.run_until_done().await.unwrap();
+    handle.get_result(Default::default()).await.unwrap();
 }
