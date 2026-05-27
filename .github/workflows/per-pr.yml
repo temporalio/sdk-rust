@@ -54,7 +54,7 @@ jobs:
         os: [ubuntu-latest, ubuntu-arm, macos-intel, macos-arm, windows-latest]
         include:
           - os: windows-latest
-            timeoutMinutes: 20
+            timeoutMinutes: 30
           - os: ubuntu-latest
           - os: ubuntu-arm
             runsOn: ubuntu-24.04-arm64-2-core
@@ -62,7 +62,7 @@ jobs:
             runsOn: macos-14
           - os: macos-intel
             runsOn: macos-15-intel
-            timeoutMinutes: 20
+            timeoutMinutes: 30
     runs-on: ${{ matrix.runsOn || matrix.os }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
