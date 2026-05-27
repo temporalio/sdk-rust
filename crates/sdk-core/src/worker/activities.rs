@@ -1162,4 +1162,176 @@ mod tests {
         assert_matches!(atm.poll().await.unwrap_err(), PollError::ShutDown);
         atm.shutdown().await;
     }
+
+    // start_to_close < heartbeat_timeout: the start_to_close timer (the
+    // shorter one) must fire even though there's a longer heartbeat timer
+    // also running. The buggy `min_by` code accidentally handled this
+    // correctly (no resetter on start_to_close → fires); the two-timer
+    // refactor should still handle it.
+    #[tokio::test]
+    async fn start_to_close_fires_when_shorter_than_heartbeat() {
+        let mut mock_client = mock_worker_client();
+        mock_client
+            .expect_poll_activity_task()
+            .times(1)
+            .returning(move |_, _| {
+                Ok(PollActivityTaskQueueResponse {
+                    task_token: vec![1],
+                    activity_id: "act1".to_string(),
+                    start_to_close_timeout: Some(prost_dur!(from_millis(100))),
+                    heartbeat_timeout: Some(prost_dur!(from_millis(500))),
+                    ..Default::default()
+                })
+            });
+        // Any subsequent polls during the test return nothing.
+        mock_client
+            .expect_poll_activity_task()
+            .returning(|_, _| Ok(Default::default()));
+        let mock_client = Arc::new(mock_client);
+        let sem = fixed_size_permit_dealer(1);
+        let shutdown_token = CancellationToken::new();
+        let ap = LongPollBuffer::new_activity_task(
+            mock_client.clone(),
+            "tq".to_string(),
+            PollerBehavior::SimpleMaximum(1),
+            sem.clone(),
+            shutdown_token.clone(),
+            None::<fn(usize)>,
+            ActivityTaskOptions {
+                max_worker_acts_per_second: None,
+                max_tps: None,
+            },
+            Arc::new(AtomicCell::new(None)),
+            Arc::new(NamespaceCapabilities {
+                graceful_poll_shutdown: AtomicBool::new(false),
+                poller_autoscaling: AtomicBool::new(false),
+            }),
+        );
+        let atm = WorkerActivityTasks::new(
+            sem.clone(),
+            Box::new(ap),
+            mock_client.clone(),
+            MetricsContext::no_op(),
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+            None,
+            Duration::from_millis(0),
+        );
+
+        let start = Instant::now();
+        let t = atm.poll().await.unwrap();
+        let should_timeout = atm.poll().await.unwrap();
+        assert!(should_timeout.is_timeout());
+        // Must fire near start_to_close (100ms), not near heartbeat (500ms).
+        assert!(
+            start.elapsed() >= Duration::from_millis(90),
+            "timeout fired too early ({:?})",
+            start.elapsed()
+        );
+        assert!(
+            start.elapsed() < Duration::from_millis(400),
+            "timeout fired too late ({:?}); should be near start_to_close (100ms), \
+             not heartbeat_timeout (500ms)",
+            start.elapsed()
+        );
+        atm.complete(
+            TaskToken(t.task_token),
+            ActivityExecutionResult::fail("unimportant".into())
+                .status
+                .unwrap(),
+            mock_client.as_ref(),
+        )
+        .await;
+
+        atm.initiate_shutdown();
+        assert_matches!(atm.poll().await.unwrap_err(), PollError::ShutDown);
+        atm.shutdown().await;
+    }
+
+    // When both timeouts are unset (or zero — server bug equivalent), no
+    // local timer task is spawned and no local cancel is ever issued. The
+    // activity runs until externally completed.
+    #[tokio::test]
+    async fn no_local_timer_when_both_timeouts_unset() {
+        let mut mock_client = mock_worker_client();
+        mock_client
+            .expect_poll_activity_task()
+            .times(1)
+            .returning(move |_, _| {
+                Ok(PollActivityTaskQueueResponse {
+                    task_token: vec![1],
+                    activity_id: "act1".to_string(),
+                    // Both unset — neither will spawn a local timer.
+                    start_to_close_timeout: None,
+                    heartbeat_timeout: None,
+                    ..Default::default()
+                })
+            });
+        mock_client
+            .expect_poll_activity_task()
+            .returning(|_, _| Ok(Default::default()));
+        // Unlike the other tests, this activity is never cancelled — it
+        // completes "normally" via fail, which requires an RPC mock since
+        // the activity isn't flagged as already-cancelled-by-core.
+        mock_client
+            .expect_fail_activity_task()
+            .returning(|_, _| Ok(Default::default()));
+        let mock_client = Arc::new(mock_client);
+        let sem = fixed_size_permit_dealer(1);
+        let shutdown_token = CancellationToken::new();
+        let ap = LongPollBuffer::new_activity_task(
+            mock_client.clone(),
+            "tq".to_string(),
+            PollerBehavior::SimpleMaximum(1),
+            sem.clone(),
+            shutdown_token.clone(),
+            None::<fn(usize)>,
+            ActivityTaskOptions {
+                max_worker_acts_per_second: None,
+                max_tps: None,
+            },
+            Arc::new(AtomicCell::new(None)),
+            Arc::new(NamespaceCapabilities {
+                graceful_poll_shutdown: AtomicBool::new(false),
+                poller_autoscaling: AtomicBool::new(false),
+            }),
+        );
+        let atm = WorkerActivityTasks::new(
+            sem.clone(),
+            Box::new(ap),
+            mock_client.clone(),
+            MetricsContext::no_op(),
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+            None,
+            Duration::from_millis(0),
+        );
+
+        let t = atm.poll().await.unwrap();
+        // Now wait a generous window for any spurious local cancel. If a
+        // local timer were incorrectly spawned with a zero/unset duration,
+        // it would fire near-immediately; 500ms is far longer than any such
+        // bug would need.
+        let no_cancel = tokio::time::timeout(Duration::from_millis(500), atm.poll()).await;
+        assert!(
+            no_cancel.is_err(),
+            "expected no local cancel, but poll() returned {:?}",
+            no_cancel
+        );
+
+        // Use a fail status so the mock client doesn't need a
+        // complete_activity_task expectation.
+        atm.complete(
+            TaskToken(t.task_token),
+            ActivityExecutionResult::fail("unimportant".into())
+                .status
+                .unwrap(),
+            mock_client.as_ref(),
+        )
+        .await;
+
+        atm.initiate_shutdown();
+        assert_matches!(atm.poll().await.unwrap_err(), PollError::ShutDown);
+        atm.shutdown().await;
+    }
 }
