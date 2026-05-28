@@ -272,10 +272,16 @@ async fn oversize_grpc_message() {
     let tq = starter.get_task_queue();
     crate::common::eventually(
         || async {
-            let body = crate::integ_tests::metrics_tests::get_text(format!("http://{addr}/metrics")).await;
-            if body.contains(&format!(
-                "temporal_workflow_task_execution_failed{{failure_reason=\"GrpcMessageTooLarge\",namespace=\"{NAMESPACE}\",service_name=\"temporal-core-sdk\",task_queue=\"{tq}\"}} 1"
-            )) {
+            let body =
+                crate::integ_tests::metrics_tests::get_text(format!("http://{addr}/metrics")).await;
+            if body.lines().any(|line| {
+                line.starts_with("temporal_workflow_task_execution_failed{")
+                    && line.contains("failure_reason=\"GrpcMessageTooLarge\"")
+                    && line.contains(&format!("namespace=\"{NAMESPACE}\""))
+                    && line.contains("service_name=\"temporal-core-sdk\"")
+                    && line.contains(&format!("task_queue=\"{tq}\""))
+                    && line.ends_with(" 1")
+            }) {
                 Ok(())
             } else {
                 Err(())

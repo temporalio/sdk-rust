@@ -134,7 +134,6 @@ pub(crate) struct Workflows {
     local_act_mgr: Option<Arc<LocalActivityManager>>,
     ever_polled: AtomicBool,
     default_versioning_behavior: Option<VersioningBehavior>,
-    metrics: MetricsContext,
 }
 
 pub(crate) struct WorkflowBasics {
@@ -177,7 +176,6 @@ impl Workflows {
         let (fetch_tx, fetch_rx) = unbounded_channel();
         let shutdown_tok = basics.shutdown_token.clone();
         let task_queue = basics.worker_config.task_queue.clone();
-        let metrics = basics.metrics.clone();
         let default_versioning_behavior = basics.default_versioning_behavior;
         let extracted_wft_stream = WFTExtractor::build(
             client.clone(),
@@ -269,7 +267,6 @@ impl Workflows {
             local_act_mgr,
             ever_polled: AtomicBool::new(false),
             default_versioning_behavior,
-            metrics,
         }
     }
 
@@ -424,7 +421,7 @@ impl Workflows {
                             );
                             self.handle_activation_failed(run_id, completion_time, new_outcome)
                                 .await;
-                            self.metrics
+                            run_metrics
                                 .with_new_attrs([metrics::failure_reason(
                                     FailureReason::GrpcMessageTooLarge,
                                 )])
