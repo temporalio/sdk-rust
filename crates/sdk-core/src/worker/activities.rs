@@ -1176,11 +1176,11 @@ mod tests {
                 .expect("start_to_close_timeout was not enforced locally")
                 .unwrap()
         };
-        let should_timeout = tokio::select! {
+        let activity_task = tokio::select! {
             v = poller => v,
             _ = heartbeater => unreachable!("heartbeat loop never exits on its own"),
         };
-        assert!(should_timeout.is_timeout());
+        assert!(activity_task.is_timeout());
 
         atm.complete(
             TaskToken(t.task_token),
