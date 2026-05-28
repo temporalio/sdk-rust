@@ -769,12 +769,12 @@ enum ActivityLocalTimeoutKind {
     StartToClose,
 }
 
-impl ActivityLocalTimeoutKind {
-    fn as_str(self) -> &'static str {
-        match self {
+impl std::fmt::Display for ActivityLocalTimeoutKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
             Self::Heartbeat => "heartbeat",
             Self::StartToClose => "start_to_close",
-        }
+        })
     }
 }
 
