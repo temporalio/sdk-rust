@@ -1173,11 +1173,7 @@ mod tests {
         let poller = async {
             tokio::time::timeout(Duration::from_secs(2), atm.poll())
                 .await
-                .expect(
-                    "start_to_close_timeout was not enforced locally — \
-                     continuous heartbeats kept resetting the only timer \
-                     (SDK-5113)",
-                )
+                .expect("start_to_close_timeout was not enforced locally")
                 .unwrap()
         };
         let should_timeout = tokio::select! {
