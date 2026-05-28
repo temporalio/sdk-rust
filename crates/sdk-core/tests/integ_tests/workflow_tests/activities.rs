@@ -13,7 +13,7 @@ use std::{
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, AtomicU64, Ordering},
-\    },
+    },
     time::Duration,
 };
 use temporalio_client::{
@@ -2064,7 +2064,7 @@ async fn start_to_close_local_timeout_fires_with_heartbeats() {
         }
     }
 
-    worker.register_workflow::<StartToCloseWithHeartbeatWorkflow>();
+    worker.register_workflow::<StartToCloseWithHeartbeatWorkflow>().unwrap();
 
     let task_queue = starter.get_task_queue().to_owned();
     worker
