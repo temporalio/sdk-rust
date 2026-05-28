@@ -811,8 +811,7 @@ impl ActivityLocalTimers {
     }
 
     /// Drive the two timers concurrently; resolves with whichever fires
-    /// first. The losing arm is dropped (cancel-safe for both `sleep` and
-    /// `Notify::notified`).
+    /// first.
     async fn run(self) -> ActivityLocalTimeoutKind {
         let heartbeat_timer = async {
             if let Some((sleep_time, rs)) = self.heartbeat {
@@ -856,10 +855,6 @@ mod tests {
     use crossbeam_utils::atomic::AtomicCell;
     use temporalio_common::protos::coresdk::activity_result::ActivityExecutionResult;
 
-    /// Shared setup for the local-timeout tests: single activity slot, single
-    /// poller, no per-worker rate limit. Only the local-timeout buffer varies
-    /// across these tests. (The ratelimit test below has more variation and
-    /// keeps its setup inline.)
     fn build_local_timeout_test_atm(
         mock_client: Arc<MockWorkerClient>,
         local_timeout_buffer: Duration,
@@ -1133,13 +1128,7 @@ mod tests {
         atm.shutdown().await;
     }
 
-    // Regression test for SDK-5113 / sdk-core#1188:
-    //   When start_to_close_timeout > heartbeat_timeout, continuous successful
-    //   heartbeats must NOT prevent start_to_close_timeout from firing. The
-    //   current implementation creates a single timer for the *minimum* of the
-    //   two timeouts (the heartbeat one here) and every heartbeat resets it,
-    //   so start_to_close is never enforced locally and the activity runs
-    //   indefinitely on the worker after the server has timed it out.
+    // Regression test for https://github.com/temporalio/sdk-rust/issues/1188.
     #[tokio::test]
     async fn start_to_close_fires_when_heartbeat_timeout_shorter() {
         let mut mock_client = mock_worker_client();
