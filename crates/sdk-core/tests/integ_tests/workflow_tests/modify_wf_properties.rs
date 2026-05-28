@@ -48,7 +48,7 @@ async fn sends_modify_wf_props() {
     starter.sdk_config.task_types = WorkerTaskTypes::workflow_only();
     let mut worker = starter.worker().await;
 
-    worker.register_workflow::<MemoUpserter>();
+    worker.register_workflow::<MemoUpserter>().unwrap();
     let task_queue = starter.get_task_queue().to_owned();
     let run_id = worker
         .submit_wf(
@@ -146,6 +146,6 @@ async fn workflow_modify_props() {
     });
 
     let mut worker = build_fake_sdk(mock_cfg);
-    worker.register_workflow::<ModifyPropsWf>();
+    worker.register_workflow::<ModifyPropsWf>().unwrap();
     worker.run().await.unwrap();
 }

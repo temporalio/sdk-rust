@@ -4,7 +4,9 @@ use crate::{
     worker::{
         ActivitySlotKind, NamespaceCapabilities, NexusSlotKind, PollerBehavior, SlotKind,
         WFTPollerShared, WorkflowSlotKind,
-        client::{PollActivityOptions, PollOptions, PollWorkflowOptions, WorkerClient},
+        client::{
+            PollActivityOptions, PollNexusOptions, PollOptions, PollWorkflowOptions, WorkerClient,
+        },
     },
 };
 use backoff::{SystemClock, backoff::Backoff, exponential::ExponentialBackoff};
@@ -248,8 +250,8 @@ impl LongPollBuffer<PollNexusTaskQueueResponse, NexusSlotKind> {
         shutdown: CancellationToken,
         num_pollers_handler: Option<impl Fn(usize) + Send + Sync + 'static>,
         last_successful_poll_time: Arc<AtomicCell<Option<SystemTime>>>,
-        send_heartbeat: bool,
         capabilities: Arc<NamespaceCapabilities>,
+        worker_commands_queue: bool,
     ) -> Self {
         let no_retry = if matches!(poller_behavior, PollerBehavior::Autoscaling { .. }) {
             Some(NoRetryOnMatching {
@@ -269,7 +271,9 @@ impl LongPollBuffer<PollNexusTaskQueueResponse, NexusSlotKind> {
                             no_retry,
                             timeout_override,
                         },
-                        send_heartbeat,
+                        PollNexusOptions {
+                            worker_commands_queue,
+                        },
                     )
                     .await
             }
@@ -884,10 +888,7 @@ mod tests {
                 wft_poller_shared: Some(Arc::new(WFTPollerShared::new(Some(10)))),
             },
             Arc::new(AtomicCell::new(None)),
-            Arc::new(NamespaceCapabilities {
-                graceful_poll_shutdown: AtomicBool::new(false),
-                poller_autoscaling: AtomicBool::new(false),
-            }),
+            Arc::new(NamespaceCapabilities::default()),
         );
 
         // Poll a bunch of times, "interrupting" it each time, we should only actually have polled
@@ -944,10 +945,7 @@ mod tests {
                 wft_poller_shared: Some(Arc::new(WFTPollerShared::new(Some(1)))),
             },
             Arc::new(AtomicCell::new(None)),
-            Arc::new(NamespaceCapabilities {
-                graceful_poll_shutdown: AtomicBool::new(false),
-                poller_autoscaling: AtomicBool::new(false),
-            }),
+            Arc::new(NamespaceCapabilities::default()),
         );
 
         // Should not see error, unwraps should get empty response
@@ -1024,10 +1022,7 @@ mod tests {
                 wft_poller_shared: Some(Arc::new(WFTPollerShared::new(Some(10)))),
             },
             Arc::new(AtomicCell::new(None)),
-            Arc::new(NamespaceCapabilities {
-                graceful_poll_shutdown: AtomicBool::new(false),
-                poller_autoscaling: AtomicBool::new(false),
-            }),
+            Arc::new(NamespaceCapabilities::default()),
         );
 
         let first_task = pb.poll().await.expect("Should get first task");
@@ -1133,10 +1128,7 @@ mod tests {
                 wft_poller_shared: Some(Arc::new(WFTPollerShared::new(Some(10)))),
             },
             Arc::new(AtomicCell::new(None)),
-            Arc::new(NamespaceCapabilities {
-                graceful_poll_shutdown: AtomicBool::new(false),
-                poller_autoscaling: AtomicBool::new(false),
-            }),
+            Arc::new(NamespaceCapabilities::default()),
         ));
 
         // Trigger the first poll to initialize and get the scaling decision
@@ -1217,9 +1209,10 @@ mod tests {
                 wft_poller_shared: None,
             },
             Arc::new(AtomicCell::new(None)),
-            Arc::new(NamespaceCapabilities {
-                graceful_poll_shutdown: AtomicBool::new(graceful),
-                poller_autoscaling: AtomicBool::new(false),
+            Arc::new({
+                let ns = NamespaceCapabilities::default();
+                ns.graceful_poll_shutdown.store(graceful, Ordering::Relaxed);
+                ns
             }),
         );
 
@@ -1272,9 +1265,11 @@ mod tests {
             min: minimum,
             target: AtomicUsize::new(10),
             ever_saw_scaling_decision: AtomicBool::new(false),
-            capabilities: Arc::new(NamespaceCapabilities {
-                graceful_poll_shutdown: AtomicBool::new(false),
-                poller_autoscaling: AtomicBool::new(supports_autoscaling),
+            capabilities: Arc::new({
+                let ns = NamespaceCapabilities::default();
+                ns.poller_autoscaling
+                    .store(supports_autoscaling, Ordering::Relaxed);
+                ns
             }),
             behavior: PollerBehavior::Autoscaling {
                 minimum,

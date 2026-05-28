@@ -24,6 +24,7 @@ document as your quick reference when submitting pull requests.
   so helps prevent ambiguous method resolution because of traits. Putting them at the top of a tests module is also acceptable.
 - If you want to format, don't bother checking first. Just run formatting, and run it by using
   `cargo +nightly fmt`, because some settings require the nightly formatter.
+- Do not extract functions for relatively simple helpers that are only used in one location.
 
 
 ## Repo Specific Utilities
@@ -87,5 +88,5 @@ Reviewers will look for:
 
 - Fetch workflow histories with `cargo run --bin histfetch <workflow_id> [run_id]` (binary lives in
   `crates/core/src/histfetch.rs`).
-- Protobuf files under `crates/common/protos/api_upstream` are a git subtree; see
+- Protobuf files under `crates/protos/protos/api_upstream` are a git subtree; see
   `README.md` for update instructions.

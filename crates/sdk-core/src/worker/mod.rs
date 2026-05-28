@@ -78,7 +78,8 @@ use std::{
     time::{Duration, SystemTime},
 };
 use temporalio_client::worker::{
-    ClientWorker, HeartbeatCallback, SharedNamespaceWorkerTrait, Slot as SlotTrait,
+    CancelActivityCallback, ClientWorker, HeartbeatCallback, SharedNamespaceWorkerTrait,
+    Slot as SlotTrait,
 };
 use temporalio_common::{
     protos::{
@@ -433,9 +434,11 @@ pub struct Worker {
 }
 
 /// Namespace capabilities discovered via `describe_namespace` during worker validation.
+#[derive(Default)]
 pub struct NamespaceCapabilities {
     pub(crate) graceful_poll_shutdown: AtomicBool,
     pub(crate) poller_autoscaling: AtomicBool,
+    pub(crate) worker_commands: AtomicBool,
 }
 
 impl NamespaceCapabilities {
@@ -449,6 +452,11 @@ impl NamespaceCapabilities {
     /// decision from the server.
     pub fn poller_autoscaling(&self) -> bool {
         self.poller_autoscaling.load(Ordering::Relaxed)
+    }
+
+    /// Returns true if worker commands are supported in this namespace.
+    pub fn worker_commands(&self) -> bool {
+        self.worker_commands.load(Ordering::Relaxed)
     }
 }
 
@@ -532,6 +540,11 @@ impl Worker {
                     if caps.poller_autoscaling {
                         self.capabilities
                             .poller_autoscaling
+                            .store(true, Ordering::Relaxed);
+                    }
+                    if caps.worker_commands {
+                        self.capabilities
+                            .worker_commands
                             .store(true, Ordering::Relaxed);
                     }
                 }
@@ -658,6 +671,7 @@ impl Worker {
         let capabilities = Arc::new(NamespaceCapabilities {
             graceful_poll_shutdown: AtomicBool::new(false),
             poller_autoscaling: AtomicBool::new(false),
+            worker_commands: AtomicBool::new(false),
         });
 
         let nexus_slots = MeteredPermitDealer::new(
@@ -726,8 +740,8 @@ impl Worker {
                         shutdown_token.child_token(),
                         Some(move |np| np_metrics.record_num_pollers(np)),
                         nexus_last_suc_poll_time.clone(),
-                        shared_namespace_worker,
                         capabilities.clone(),
+                        shared_namespace_worker,
                     )) as BoxedNexusPoller)
                 } else {
                     None
@@ -869,10 +883,14 @@ impl Worker {
             )
         });
 
+        let cancel_activity_callback = at_task_mgr
+            .as_ref()
+            .map(|mgr| mgr.cancel_activity_callback());
         let client_worker_registrator = Arc::new(ClientWorkerRegistrator {
             worker_instance_key,
             slot_provider: provider,
             heartbeat_manager: worker_heartbeat,
+            cancel_activity_callback,
             client: RwLock::new(client.clone()),
             shared_namespace_worker,
             task_types: config.task_types,
@@ -997,7 +1015,7 @@ impl Worker {
         // Wait for all permits to be released, but don't totally hang real-world shutdown.
         tokio::select! {
             _ = async { self.all_permits_tracker.lock().await.all_done().await } => {},
-            _ = tokio::time::sleep(Duration::from_secs(1)) => {
+            _ = tokio::time::sleep(Duration::from_secs(5)) => {
                 dbg_panic!("Waiting for all slot permits to release took too long!");
             }
         }
@@ -1177,12 +1195,11 @@ impl Worker {
     /// instead send it as a separate activity task to the lang, decoupling heartbeat and
     /// cancellation processing.
     ///
-    /// For now activity still need to send heartbeats if they want to receive cancellation
-    /// requests. In the future we will change this and will dispatch cancellations more
-    /// proactively. Note that this function does not block on the server call and returns
-    /// immediately. Underlying validation errors are swallowed and logged, this has been agreed to
-    /// be optimal behavior for the user as we don't want to break activity execution due to badly
-    /// configured heartbeat options.
+    /// Activities may receive cancellation requests independently from heartbeating. Note that
+    /// this function does not block on the server call and returns immediately. Underlying
+    /// validation errors are swallowed and logged, this has been agreed to be optimal behavior for
+    /// the user as we don't want to break activity execution due to badly configured heartbeat
+    /// options.
     pub fn record_activity_heartbeat(&self, details: ActivityHeartbeat) {
         if let Some(at_mgr) = self.at_task_mgr.as_ref() {
             let tt = TaskToken(details.task_token.clone());
@@ -1953,6 +1970,7 @@ struct ClientWorkerRegistrator {
     worker_instance_key: Uuid,
     slot_provider: SlotProvider,
     heartbeat_manager: Option<WorkerHeartbeatManager>,
+    cancel_activity_callback: Option<CancelActivityCallback>,
     client: RwLock<Arc<dyn WorkerClient>>,
     shared_namespace_worker: bool,
     task_types: WorkerTaskTypes,
@@ -1988,6 +2006,10 @@ impl ClientWorker for ClientWorkerRegistrator {
         } else {
             None
         }
+    }
+
+    fn cancel_activity_callback(&self) -> Option<CancelActivityCallback> {
+        self.cancel_activity_callback.clone()
     }
 
     fn new_shared_namespace_worker(
@@ -2240,6 +2262,10 @@ where
         last_interval_processed_tasks: 0,
         last_interval_failure_tasks: 0,
     })
+}
+
+fn worker_control_task_queue(namespace: &str, grouping_key: &str) -> String {
+    format!("temporal-sys/worker-commands/{namespace}/{grouping_key}")
 }
 
 #[cfg(test)]

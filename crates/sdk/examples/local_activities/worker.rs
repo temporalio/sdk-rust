@@ -21,7 +21,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let client = Client::new(connection, client_opts)?;
 
     let worker_options = WorkerOptions::new("local-activities")
-        .register_workflow::<LocalActivitiesWorkflow>()
+        .register_workflow::<LocalActivitiesWorkflow>()?
         .register_activities(GreetingActivities)
         .build();
 
