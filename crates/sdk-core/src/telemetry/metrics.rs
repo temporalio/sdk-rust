@@ -118,7 +118,7 @@ impl MetricsContext {
         instruments.update_attributes(tm.get_default_attributes());
         Self {
             instruments: Arc::new(instruments),
-            meter: self.meter.clone(),
+            meter: tm,
             in_memory_metrics: self.in_memory_metrics.clone(),
         }
     }
