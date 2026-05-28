@@ -624,9 +624,7 @@ where
                                 // possibility of clock skew messing things up, and it's relative
                                 // unlikeliness compared to the other timeouts.
                                 let local_timeout_buffer = self.local_timeout_buffer;
-                                // There is a bug in the server that translates non-set
-                                // heartbeat timeouts into 0 duration. We treat 0 the same way
-                                // as None so we don't spawn a timer that would fire immediately.
+                                // Filter out 0 / non-set timeouts, and add timeout buffer.
                                 let to_sleep =
                                     |d: Option<prost_types::Duration>| -> Option<Duration> {
                                         d.and_then(|d| Duration::try_from(d).ok())
