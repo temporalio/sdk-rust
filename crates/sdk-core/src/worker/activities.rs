@@ -645,8 +645,7 @@ where
                                             let timeout_type = timers.run().await;
                                             debug!(
                                                 task_token=%task_token,
-                                                "Timing out activity due to elapsed local {} timer",
-                                                timeout_type.as_str()
+                                                "Timing out activity due to elapsed local {timeout_type} timer",
                                             );
                                             let _ = cancel_tx.send(PendingActivityCancel::new(
                                                 task_token,
