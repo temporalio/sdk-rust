@@ -892,6 +892,35 @@ mod tests {
         )
     }
 
+    // Confirms that a repeatedly-resetting heartbeat timer does not
+    // prevent the start_to_close timer from firing.
+    #[tokio::test]
+    async fn activity_local_timers_start_to_close_wins_despite_resets() {
+        let timers = ActivityLocalTimers::new(
+            Some(Duration::from_millis(100)),
+            Some(Duration::from_millis(300)),
+        )
+        .expect("at least one timeout is set");
+        let resetter = timers
+            .heartbeat_resetter()
+            .expect("heartbeat timer present");
+
+        let reset_loop = async {
+            loop {
+                resetter.notify_one();
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        };
+        let kind = tokio::select! {
+            kind = timers.run() => kind,
+            _ = reset_loop => unreachable!("reset loop never exits on its own"),
+        };
+        assert!(
+            matches!(kind, ActivityLocalTimeoutKind::StartToClose),
+            "expected start_to_close to fire, got {kind:?}"
+        );
+    }
+
     #[tokio::test]
     async fn per_worker_ratelimit() {
         let mut mock_client = mock_worker_client();
