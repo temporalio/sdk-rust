@@ -16,8 +16,9 @@ use std::{
     time::Duration,
 };
 use temporalio_client::{
-    Connection, NamespacedClient, REQUEST_LATENCY_HISTOGRAM_NAME, UntypedQuery, UntypedWorkflow,
-    WorkflowExecutionInfo, WorkflowQueryOptions, WorkflowStartOptions, grpc::WorkflowService,
+    Connection, MESSAGE_TOO_LARGE_KEY, NamespacedClient, REQUEST_LATENCY_HISTOGRAM_NAME,
+    UntypedQuery, UntypedWorkflow, WorkflowExecutionInfo, WorkflowQueryOptions,
+    WorkflowStartOptions, grpc::WorkflowService,
 };
 use temporalio_common::{
     data_converters::RawValue,
@@ -38,6 +39,7 @@ use temporalio_common::{
             common::v1::RetryPolicy,
             enums::v1::{
                 NexusHandlerErrorRetryBehavior, WorkflowIdConflictPolicy, WorkflowIdReusePolicy,
+                WorkflowTaskFailedCause,
             },
             failure::v1::Failure,
             nexus::{
@@ -1751,4 +1753,161 @@ async fn wf_task_latency_recorded_on_dropped_wft() {
     )
     .await
     .unwrap();
+}
+
+#[tokio::test]
+async fn wf_task_execution_failed_metric_includes_workflow_type() {
+    let (telemopts, addr, _aborter) = prom_metrics(None);
+    let rt = CoreRuntime::new_assume_tokio(get_integ_runtime_options(telemopts)).unwrap();
+    let meter = rt.telemetry().get_temporal_metric_meter().unwrap();
+
+    let mut t = TestHistoryBuilder::default();
+    t.add_by_type(
+        temporalio_common::protos::temporal::api::enums::v1::EventType::WorkflowExecutionStarted,
+    );
+    t.add_workflow_task_scheduled_and_started();
+
+    let mut mh = MockPollCfg::from_resp_batches(
+        "fake_wf_id",
+        t,
+        [ResponseType::AllHistory, ResponseType::AllHistory],
+        mock_worker_client(),
+    );
+    mh.num_expected_fails = 1;
+    mh.num_expected_completions = Some(0.into());
+
+    let mut mock = build_mock_pollers(mh);
+    mock.worker_cfg(|wc| wc.max_cached_workflows = 1);
+    mock.set_temporal_meter(meter);
+    let core = mock_worker(mock);
+
+    let act = core.poll_workflow_activation().await.unwrap();
+    core.complete_workflow_activation(WorkflowActivationCompletion::fail(
+        act.run_id,
+        "test failure".into(),
+        None,
+    ))
+    .await
+    .unwrap();
+    core.handle_eviction().await;
+
+    // The reported WFT failure evicts the run. Consume the replayed activation so the worker can
+    // shut down cleanly without an outstanding workflow task.
+    let act = core.poll_workflow_activation().await.unwrap();
+    core.complete_workflow_activation(WorkflowActivationCompletion::fail(
+        act.run_id,
+        "test failure".into(),
+        None,
+    ))
+    .await
+    .unwrap();
+
+    core.drain_pollers_and_shutdown().await;
+
+    let metric_line = eventually(
+        || {
+            let endpoint = format!("http://{addr}/metrics");
+            async move {
+                let body = get_text(endpoint).await;
+                body.lines()
+                    .find(|l| {
+                        l.starts_with("temporal_workflow_task_execution_failed{")
+                            && l.contains("failure_reason=\"WorkflowError\"")
+                    })
+                    .map(ToString::to_string)
+                    .ok_or_else(|| anyhow!("wf_task_execution_failed metric not found"))
+            }
+        },
+        Duration::from_secs(5),
+    )
+    .await
+    .unwrap();
+
+    assert!(
+        metric_line.contains("workflow_type=\"default_wf_type\""),
+        "Expected workflow_type label on metric, got: {metric_line}"
+    );
+}
+
+#[tokio::test]
+async fn grpc_message_too_large_wf_task_execution_failed_metric_includes_workflow_type() {
+    let (telemopts, addr, _aborter) = prom_metrics(None);
+    let rt = CoreRuntime::new_assume_tokio(get_integ_runtime_options(telemopts)).unwrap();
+    let meter = rt.telemetry().get_temporal_metric_meter().unwrap();
+
+    let mut t = TestHistoryBuilder::default();
+    t.add_by_type(
+        temporalio_common::protos::temporal::api::enums::v1::EventType::WorkflowExecutionStarted,
+    );
+    t.add_workflow_task_scheduled_and_started();
+
+    let mut mh = MockPollCfg::from_resp_batches(
+        "fake_wf_id",
+        t,
+        [ResponseType::AllHistory, ResponseType::AllHistory],
+        mock_worker_client(),
+    );
+    mh.num_expected_fails = 1;
+    let mut times = 1;
+    mh.completion_mock_fn = Some(Box::new(move |_| {
+        if times == 1 {
+            let mut err = tonic::Status::new(
+                tonic::Code::ResourceExhausted,
+                "grpc: received message larger than max",
+            );
+            err.metadata_mut().insert(MESSAGE_TOO_LARGE_KEY, 1.into());
+            times += 1;
+            Err(err)
+        } else {
+            Ok(Default::default())
+        }
+    }));
+    mh.expect_fail_wft_matcher =
+        Box::new(|_, cause, _| *cause == WorkflowTaskFailedCause::GrpcMessageTooLarge);
+
+    let mut mock = build_mock_pollers(mh);
+    mock.worker_cfg(|wc| wc.max_cached_workflows = 1);
+    mock.set_temporal_meter(meter);
+    let core = mock_worker(mock);
+
+    let act = core.poll_workflow_activation().await.unwrap();
+    core.complete_workflow_activation(WorkflowActivationCompletion::empty(&act.run_id))
+        .await
+        .unwrap();
+    core.handle_eviction().await;
+
+    // The first completion records the metric and evicts the run. Complete the replayed activation
+    // so the worker has no outstanding workflow task when shutdown drains pollers.
+    let act = core.poll_workflow_activation().await.unwrap();
+    core.complete_execution(&act.run_id).await;
+
+    core.drain_pollers_and_shutdown().await;
+
+    let metric_line = eventually(
+        || {
+            let endpoint = format!("http://{addr}/metrics");
+            async move {
+                let body = get_text(endpoint).await;
+                body.lines()
+                    .find(|l| {
+                        l.starts_with("temporal_workflow_task_execution_failed{")
+                            && l.contains("failure_reason=\"GrpcMessageTooLarge\"")
+                    })
+                    .map(ToString::to_string)
+                    .ok_or_else(|| anyhow!("wf_task_execution_failed metric not found"))
+            }
+        },
+        Duration::from_secs(5),
+    )
+    .await
+    .unwrap();
+
+    assert!(
+        metric_line.contains("failure_reason=\"GrpcMessageTooLarge\""),
+        "Expected GrpcMessageTooLarge failure reason on metric, got: {metric_line}"
+    );
+    assert!(
+        metric_line.contains("workflow_type=\"default_wf_type\""),
+        "Expected workflow_type label on metric, got: {metric_line}"
+    );
 }

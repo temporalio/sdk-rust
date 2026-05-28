@@ -1151,6 +1151,19 @@ mod tests {
     impl BufferInstrumentRef for DummyInstrumentRef {}
 
     #[test]
+    fn with_new_attrs_adds_attrs_to_returned_context() {
+        let mc = MetricsContext::no_op();
+        let mc2 = mc.with_new_attrs([MetricKeyValue::new("workflow_type", "my_wf")]);
+        let MetricAttributes::NoOp(labels) = mc2.meter.get_default_attributes() else {
+            panic!("expected no-op metric attributes");
+        };
+        assert_eq!(
+            labels.get("workflow_type").map(String::as_str),
+            Some("my_wf")
+        );
+    }
+
+    #[test]
     fn test_buffered_core_context() {
         let call_buffer = Arc::new(MetricsCallBuffer::new(100));
         let telem_instance = telemetry_init(
