@@ -2064,7 +2064,9 @@ async fn start_to_close_local_timeout_fires_with_heartbeats() {
         }
     }
 
-    worker.register_workflow::<StartToCloseWithHeartbeatWorkflow>().unwrap();
+    worker
+        .register_workflow::<StartToCloseWithHeartbeatWorkflow>()
+        .unwrap();
 
     let task_queue = starter.get_task_queue().to_owned();
     worker
