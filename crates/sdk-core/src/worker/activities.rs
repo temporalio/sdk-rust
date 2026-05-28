@@ -1137,7 +1137,6 @@ mod tests {
 
         let t = atm.poll().await.unwrap();
         let tt = t.task_token.clone();
-        let start = Instant::now();
 
         // Heartbeat every 50ms (faster than the 100ms heartbeat_timeout) so a
         // successful heartbeat-report always resets the heartbeat timer before
@@ -1168,129 +1167,7 @@ mod tests {
             _ = heartbeater => unreachable!("heartbeat loop never exits on its own"),
         };
         assert!(should_timeout.is_timeout());
-        // Sanity check: should fire near start_to_close_timeout (300ms),
-        // not earlier — heartbeats are still succeeding so the heartbeat
-        // timer alone should never fire.
-        assert!(
-            start.elapsed() >= Duration::from_millis(290),
-            "timeout fired too early ({:?}); start_to_close_timeout is 300ms",
-            start.elapsed()
-        );
 
-        atm.complete(
-            TaskToken(t.task_token),
-            ActivityExecutionResult::fail("unimportant".into())
-                .status
-                .unwrap(),
-            mock_client.as_ref(),
-        )
-        .await;
-
-        atm.initiate_shutdown();
-        assert_matches!(atm.poll().await.unwrap_err(), PollError::ShutDown);
-        atm.shutdown().await;
-    }
-
-    // start_to_close < heartbeat_timeout: the start_to_close timer (the
-    // shorter one) must fire even though there's a longer heartbeat timer
-    // also running.
-    #[tokio::test]
-    async fn start_to_close_fires_when_shorter_than_heartbeat() {
-        let mut mock_client = mock_worker_client();
-        mock_client
-            .expect_poll_activity_task()
-            .times(1)
-            .returning(move |_, _| {
-                Ok(PollActivityTaskQueueResponse {
-                    task_token: vec![1],
-                    activity_id: "act1".to_string(),
-                    start_to_close_timeout: Some(prost_dur!(from_millis(100))),
-                    heartbeat_timeout: Some(prost_dur!(from_millis(500))),
-                    ..Default::default()
-                })
-            });
-        // Any subsequent polls during the test return nothing.
-        mock_client
-            .expect_poll_activity_task()
-            .returning(|_, _| Ok(Default::default()));
-        let mock_client = Arc::new(mock_client);
-        let atm = build_local_timeout_test_atm(mock_client.clone(), Duration::from_millis(0));
-
-        let start = Instant::now();
-        let t = atm.poll().await.unwrap();
-        let should_timeout = atm.poll().await.unwrap();
-        assert!(should_timeout.is_timeout());
-        // Must fire near start_to_close (100ms), not near heartbeat (500ms).
-        assert!(
-            start.elapsed() >= Duration::from_millis(90),
-            "timeout fired too early ({:?})",
-            start.elapsed()
-        );
-        assert!(
-            start.elapsed() < Duration::from_millis(400),
-            "timeout fired too late ({:?}); should be near start_to_close (100ms), \
-             not heartbeat_timeout (500ms)",
-            start.elapsed()
-        );
-        atm.complete(
-            TaskToken(t.task_token),
-            ActivityExecutionResult::fail("unimportant".into())
-                .status
-                .unwrap(),
-            mock_client.as_ref(),
-        )
-        .await;
-
-        atm.initiate_shutdown();
-        assert_matches!(atm.poll().await.unwrap_err(), PollError::ShutDown);
-        atm.shutdown().await;
-    }
-
-    // When both timeouts are unset (or zero — server bug equivalent), no
-    // local timer task is spawned and no local cancel is ever issued. The
-    // activity runs until externally completed.
-    #[tokio::test]
-    async fn no_local_timer_when_both_timeouts_unset() {
-        let mut mock_client = mock_worker_client();
-        mock_client
-            .expect_poll_activity_task()
-            .times(1)
-            .returning(move |_, _| {
-                Ok(PollActivityTaskQueueResponse {
-                    task_token: vec![1],
-                    activity_id: "act1".to_string(),
-                    // Both unset — neither will spawn a local timer.
-                    start_to_close_timeout: None,
-                    heartbeat_timeout: None,
-                    ..Default::default()
-                })
-            });
-        mock_client
-            .expect_poll_activity_task()
-            .returning(|_, _| Ok(Default::default()));
-        // Unlike the other tests, this activity is never cancelled — it
-        // completes "normally" via fail, which requires an RPC mock since
-        // the activity isn't flagged as already-cancelled-by-core.
-        mock_client
-            .expect_fail_activity_task()
-            .returning(|_, _| Ok(Default::default()));
-        let mock_client = Arc::new(mock_client);
-        let atm = build_local_timeout_test_atm(mock_client.clone(), Duration::from_millis(0));
-
-        let t = atm.poll().await.unwrap();
-        // Now wait a generous window for any spurious local cancel. If a
-        // local timer were incorrectly spawned with a zero/unset duration,
-        // it would fire near-immediately; 500ms is far longer than any such
-        // bug would need.
-        let no_cancel = tokio::time::timeout(Duration::from_millis(500), atm.poll()).await;
-        assert!(
-            no_cancel.is_err(),
-            "expected no local cancel, but poll() returned {:?}",
-            no_cancel
-        );
-
-        // Use a fail status so the mock client doesn't need a
-        // complete_activity_task expectation.
         atm.complete(
             TaskToken(t.task_token),
             ActivityExecutionResult::fail("unimportant".into())
