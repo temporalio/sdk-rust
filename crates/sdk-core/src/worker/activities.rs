@@ -812,15 +812,14 @@ impl ActivityLocalTimers {
     async fn run(self) -> ActivityLocalTimeoutKind {
         let heartbeat_timer = async {
             if let Some((sleep_time, rs)) = self.heartbeat {
-                loop {
-                    tokio::select! {
-                        _ = rs.notified() => continue,
-                        _ = tokio::time::sleep(sleep_time)
-                            => return ActivityLocalTimeoutKind::Heartbeat,
-                    }
-                }
+                while tokio::time::timeout(sleep_time, rs.notified())
+                    .await
+                    .is_ok()
+                {}
+                ActivityLocalTimeoutKind::Heartbeat
+            } else {
+                std::future::pending().await
             }
-            std::future::pending().await
         };
         let start_to_close_timer = async {
             if let Some(sleep_time) = self.start_to_close {
