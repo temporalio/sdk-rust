@@ -675,6 +675,14 @@ impl ManagedRun {
         } else {
             false
         };
+        if evict && let Some(sink) = self.local_activity_request_sink.as_deref() {
+            let immediate_resolutions = sink.sink_reqs(vec![LocalActRequest::InvalidateRun(
+                self.wfm.machines.run_id.clone(),
+            )]);
+            if !immediate_resolutions.is_empty() {
+                dbg_panic!("Invalidating local activities should not produce resolutions");
+            }
+        }
         let buffered = if evict {
             mem::take(&mut self.task_buffer)
         } else {
@@ -904,6 +912,15 @@ impl ManagedRun {
         }
 
         if !self.activation_is_eviction() && self.trying_to_evict.is_none() {
+            let outstanding_las = self.wfm.machines.outstanding_local_activity_count();
+            if outstanding_las > 0 && self.config.max_cached_workflows == 0 {
+                warn!(
+                    run_id=%info.run_id,
+                    reason=?info.reason,
+                    outstanding_local_activities=outstanding_las,
+                    "Eviction requested while local activities are still in flight; local activities when using max_cached_workflows=0 are likely to be dropped or retried"
+                );
+            }
             debug!(run_id=%info.run_id, reason=%info.message, "Eviction requested");
             // If we've requested an eviction because of failure related reasons then we want to
             // delete any pending queries, since handling them no longer makes sense. Evictions

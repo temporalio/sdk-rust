@@ -137,6 +137,8 @@ pub(crate) enum LocalActRequest {
     Cancel(ExecutingLAId),
     #[from(ignore)]
     CancelAllInRun(String),
+    #[from(ignore)]
+    InvalidateRun(String),
     StartHeartbeatTimeout {
         send_on_elapse: HeartbeatTimeoutMsg,
         deadline: Instant,
@@ -297,9 +299,7 @@ impl LocalActivityManager {
                     let tt = dlock.gen_next_token();
                     match dlock.la_info.entry(id) {
                         Entry::Occupied(o) => {
-                            // Do not queue local activities which are in fact already executing.
-                            // This can happen during evictions.
-                            debug!(
+                            dbg_panic!(
                                 "Tried to queue already-executing local activity {:?}",
                                 o.key()
                             );
@@ -368,6 +368,24 @@ impl LocalActivityManager {
                             immediate_resolutions.push(immediate_res);
                         }
                     }
+                }
+                LocalActRequest::InvalidateRun(run_id) => {
+                    debug!(run_id=%run_id, "Invalidating all local activities for run");
+                    let mut dlock = self.dat.lock();
+                    dlock
+                        .outstanding_activity_tasks
+                        .retain(|_, info| info.la_info.workflow_exec_info.run_id != run_id);
+                    dlock.la_info.retain(|id, info| {
+                        if id.run_id == run_id {
+                            if let Some(backoff_task) = info.backing_off_task.as_ref() {
+                                backoff_task.abort();
+                            }
+                            false
+                        } else {
+                            true
+                        }
+                    });
+                    self.set_shutdown_complete_if_ready(&mut dlock);
                 }
                 LocalActRequest::IndicateWorkflowTaskCompleted(run_id) => {
                     let mut dlock = self.dat.lock();
@@ -447,6 +465,10 @@ impl LocalActivityManager {
         let sa = new_la.schedule_cmd;
 
         let mut dat = self.dat.lock();
+        if !dat.la_info.contains_key(&id) {
+            debug!(id=?id, "Dropping invalidated local activity request");
+            return None;
+        }
         // If this request originated from a local backoff task, clear the entry for it. We
         // don't await the handle because we know it must already be done, and there's no
         // meaningful value.
@@ -977,7 +999,6 @@ impl Drop for TimeoutBag {
 mod tests {
     use super::*;
     use crate::{prost_dur, protosext::LACloseTimeouts, retry_logic::ValidatedRetryPolicy};
-    use futures_util::FutureExt;
     use temporalio_common::protos::temporal::api::{
         common::v1::RetryPolicy,
         failure::v1::{ApplicationFailureInfo, Failure, failure::FailureInfo},
@@ -1074,6 +1095,35 @@ mod tests {
                 lam.complete(&tt, LocalActivityExecutionResult::Completed(Default::default()));
             } => (),
         };
+    }
+
+    #[tokio::test]
+    async fn invalidate_drops_queued_activity() {
+        let lam = LocalActivityManager::test(5);
+        let run_id = "run_id";
+        lam.enqueue([NewLocalAct {
+            schedule_cmd: ValidScheduleLA {
+                seq: 1,
+                activity_id: 1.to_string(),
+                ..Default::default()
+            },
+            workflow_type: "".to_string(),
+            workflow_exec_info: WorkflowExecution {
+                workflow_id: "".to_string(),
+                run_id: run_id.to_string(),
+            },
+            schedule_time: SystemTime::now(),
+        }
+        .into()]);
+
+        lam.enqueue([LocalActRequest::InvalidateRun(run_id.to_string())]);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), lam.next_pending())
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(lam.num_outstanding(), 0);
     }
 
     #[tokio::test]
@@ -1363,7 +1413,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn idempotency_enforced() {
+    #[should_panic(expected = "Tried to queue already-executing local activity")]
+    async fn duplicate_local_activity_queue_panics() {
         let lam = LocalActivityManager::test(10);
         let new_la = NewLocalAct {
             schedule_cmd: ValidScheduleLA {
@@ -1378,18 +1429,7 @@ mod tests {
             },
             schedule_time: SystemTime::now(),
         };
-        // Verify only one will get queued
-        lam.enqueue([new_la.clone().into(), new_la.clone().into()]);
-        lam.next_pending().await.unwrap().unwrap();
-        assert_eq!(lam.num_outstanding(), 1);
-        // There should be nothing else in the queue
-        assert!(lam.rcvs.lock().await.next().now_or_never().is_none());
-
-        // Verify that if we now enqueue the same act again, after the task is outstanding, we still
-        // don't add it.
-        lam.enqueue([new_la.into()]);
-        assert_eq!(lam.num_outstanding(), 1);
-        assert!(lam.rcvs.lock().await.next().now_or_never().is_none());
+        lam.enqueue([new_la.clone().into(), new_la.into()]);
     }
 
     #[tokio::test]
