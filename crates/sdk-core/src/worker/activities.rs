@@ -783,14 +783,17 @@ struct ActivityLocalTimers {
 }
 
 impl ActivityLocalTimers {
-    fn new(heartbeat: Option<prost_types::Duration>, start_to_close: Option<prost_types::Duration>, local_timeout_buffer: Duration) -> Option<Self> {
+    fn new(
+        heartbeat: Option<prost_types::Duration>,
+        start_to_close: Option<prost_types::Duration>,
+        local_timeout_buffer: Duration,
+    ) -> Option<Self> {
         // Filter out 0 / non-set timeouts, and add timeout buffer.
-        let to_sleep =
-            |d: Option<prost_types::Duration>| -> Option<Duration> {
-                d.and_then(|d| Duration::try_from(d).ok())
-                    .filter(|d| !d.is_zero())
-                    .map(|d| d + local_timeout_buffer)
-            };
+        let to_sleep = |d: Option<prost_types::Duration>| -> Option<Duration> {
+            d.and_then(|d| Duration::try_from(d).ok())
+                .filter(|d| !d.is_zero())
+                .map(|d| d + local_timeout_buffer)
+        };
 
         let heartbeat = to_sleep(heartbeat);
         let start_to_close = to_sleep(start_to_close);
