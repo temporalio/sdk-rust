@@ -623,17 +623,10 @@ where
                                 // heartbeating. Schedule to closed is not tracked due to the
                                 // possibility of clock skew messing things up, and it's relative
                                 // unlikeliness compared to the other timeouts.
-                                let local_timeout_buffer = self.local_timeout_buffer;
-                                // Filter out 0 / non-set timeouts, and add timeout buffer.
-                                let to_sleep =
-                                    |d: Option<prost_types::Duration>| -> Option<Duration> {
-                                        d.and_then(|d| Duration::try_from(d).ok())
-                                            .filter(|d| !d.is_zero())
-                                            .map(|d| d + local_timeout_buffer)
-                                    };
                                 if let Some(timers) = ActivityLocalTimers::new(
-                                    to_sleep(task.resp.heartbeat_timeout),
-                                    to_sleep(task.resp.start_to_close_timeout),
+                                    task.resp.heartbeat_timeout,
+                                    task.resp.start_to_close_timeout,
+                                    self.local_timeout_buffer,
                                 ) {
                                     let resetter = timers.heartbeat_resetter();
                                     let cancel_tx = cancels_tx.clone();
@@ -790,7 +783,18 @@ struct ActivityLocalTimers {
 }
 
 impl ActivityLocalTimers {
-    fn new(heartbeat: Option<Duration>, start_to_close: Option<Duration>) -> Option<Self> {
+    fn new(heartbeat: Option<prost_types::Duration>, start_to_close: Option<prost_types::Duration>, local_timeout_buffer: Duration) -> Option<Self> {
+        // Filter out 0 / non-set timeouts, and add timeout buffer.
+        let to_sleep =
+            |d: Option<prost_types::Duration>| -> Option<Duration> {
+                d.and_then(|d| Duration::try_from(d).ok())
+                    .filter(|d| !d.is_zero())
+                    .map(|d| d + local_timeout_buffer)
+            };
+
+        let heartbeat = to_sleep(heartbeat);
+        let start_to_close = to_sleep(start_to_close);
+
         if heartbeat.is_none() && start_to_close.is_none() {
             return None;
         }
@@ -888,8 +892,9 @@ mod tests {
     #[tokio::test]
     async fn activity_local_timers_start_to_close_wins_despite_resets() {
         let timers = ActivityLocalTimers::new(
-            Some(Duration::from_millis(100)),
-            Some(Duration::from_millis(300)),
+            Some(prost_dur!(from_millis(100))),
+            Some(prost_dur!(from_millis(300))),
+            Duration::from_millis(0),
         )
         .expect("at least one timeout is set");
         let resetter = timers
