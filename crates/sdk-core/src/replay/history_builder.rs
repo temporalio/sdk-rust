@@ -519,6 +519,9 @@ impl TestHistoryBuilder {
                     name: update_name.into(),
                     args: None,
                 }),
+                request_id: String::new(),
+                completion_callbacks: vec![],
+                links: vec![],
             }),
             protocol_instance_id,
         };

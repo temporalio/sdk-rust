@@ -746,6 +746,9 @@ where
                         name: update.name().to_string(),
                         args: Some(Payloads { payloads }),
                     }),
+                    request_id: String::new(),
+                    completion_callbacks: vec![],
+                    links: vec![],
                 }),
                 ..Default::default()
             }

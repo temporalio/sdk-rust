@@ -62,6 +62,12 @@ message Input {
 message Request {
     Meta meta = 1;
     Input input = 2;
+    // The request ID of the request.
+    string request_id = 3;
+    // Callbacks to be called by the server when this update reaches a terminal state.
+    repeated temporal.api.common.v1.Callback completion_callbacks = 4;
+     // Links to be associated with this update.
+    repeated temporal.api.common.v1.Link links = 5;
 }
 
 // An Update protocol message indicating that a Workflow Update has been rejected.

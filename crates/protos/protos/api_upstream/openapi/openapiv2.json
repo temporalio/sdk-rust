@@ -2621,7 +2621,7 @@
     },
     "/api/v1/namespaces/{namespace}/task-queues/{taskQueue}/worker-build-id-compatibility": {
       "get": {
-        "summary": "Deprecated. Use `GetWorkerVersioningRules`.\nFetches the worker build id versioning sets for a task queue.",
+        "summary": "Deprecated. Use `GetWorkerVersioningRules`.\nWill be removed in server version v1.32.0.\nFetches the worker build id versioning sets for a task queue.",
         "operationId": "GetWorkerBuildIdCompatibility2",
         "responses": {
           "200": {
@@ -2667,7 +2667,7 @@
     },
     "/api/v1/namespaces/{namespace}/task-queues/{taskQueue}/worker-versioning-rules": {
       "get": {
-        "summary": "Fetches the Build ID assignment and redirect rules for a Task Queue.\nWARNING: Worker Versioning is not yet stable and the API and behavior may change incompatibly.",
+        "summary": "Fetches the Build ID assignment and redirect rules for a Task Queue.\nWill be removed in server version v1.32.0.",
         "operationId": "GetWorkerVersioningRules2",
         "responses": {
           "200": {
@@ -3376,7 +3376,7 @@
     },
     "/api/v1/namespaces/{namespace}/worker-task-reachability": {
       "get": {
-        "summary": "Deprecated. Use `DescribeTaskQueue`.",
+        "summary": "Deprecated. Use `DescribeTaskQueue`.\nWill be removed in server version v1.32.0.",
         "description": "Fetches task reachability to determine whether a worker may be retired.\nThe request may specify task queues to query for or let the server fetch all task queues mapped to the given\nbuild IDs.\n\nWhen requesting a large number of task queues or all task queues associated with the given build ids in a\nnamespace, all task queues will be listed in the response but some of them may not contain reachability\ninformation due to a server enforced limit. When reaching the limit, task queues that reachability information\ncould not be retrieved for will be marked with a single TASK_REACHABILITY_UNSPECIFIED entry. The caller may issue\nanother call to get the reachability for those task queues.\n\nOpen source users can adjust this limit by setting the server's dynamic config value for\n`limit.reachabilityTaskQueueScan` with the caveat that this call can strain the visibility store.",
         "operationId": "GetWorkerTaskReachability2",
         "responses": {
@@ -8135,7 +8135,7 @@
     },
     "/namespaces/{namespace}/task-queues/{taskQueue}/worker-build-id-compatibility": {
       "get": {
-        "summary": "Deprecated. Use `GetWorkerVersioningRules`.\nFetches the worker build id versioning sets for a task queue.",
+        "summary": "Deprecated. Use `GetWorkerVersioningRules`.\nWill be removed in server version v1.32.0.\nFetches the worker build id versioning sets for a task queue.",
         "operationId": "GetWorkerBuildIdCompatibility",
         "responses": {
           "200": {
@@ -8181,7 +8181,7 @@
     },
     "/namespaces/{namespace}/task-queues/{taskQueue}/worker-versioning-rules": {
       "get": {
-        "summary": "Fetches the Build ID assignment and redirect rules for a Task Queue.\nWARNING: Worker Versioning is not yet stable and the API and behavior may change incompatibly.",
+        "summary": "Fetches the Build ID assignment and redirect rules for a Task Queue.\nWill be removed in server version v1.32.0.",
         "operationId": "GetWorkerVersioningRules",
         "responses": {
           "200": {
@@ -8851,7 +8851,7 @@
     },
     "/namespaces/{namespace}/worker-task-reachability": {
       "get": {
-        "summary": "Deprecated. Use `DescribeTaskQueue`.",
+        "summary": "Deprecated. Use `DescribeTaskQueue`.\nWill be removed in server version v1.32.0.",
         "description": "Fetches task reachability to determine whether a worker may be retired.\nThe request may specify task queues to query for or let the server fetch all task queues mapped to the given\nbuild IDs.\n\nWhen requesting a large number of task queues or all task queues associated with the given build ids in a\nnamespace, all task queues will be listed in the response but some of them may not contain reachability\ninformation due to a server enforced limit. When reaching the limit, task queues that reachability information\ncould not be retrieved for will be marked with a single TASK_REACHABILITY_UNSPECIFIED entry. The caller may issue\nanother call to get the reachability for those task queues.\n\nOpen source users can adjust this limit by setting the server's dynamic config value for\n`limit.reachabilityTaskQueueScan` with the caveat that this call can strain the visibility store.",
         "operationId": "GetWorkerTaskReachability",
         "responses": {
@@ -10599,6 +10599,15 @@
       "type": "object",
       "description": "Trigger for when the activity is closed."
     },
+    "CallbackInfoUpdateWorkflowExecutionCompleted": {
+      "type": "object",
+      "properties": {
+        "updateId": {
+          "type": "string"
+        }
+      },
+      "description": "Trigger for when a workflow update is completed."
+    },
     "CallbackInfoWorkflowClosed": {
       "type": "object",
       "description": "Trigger for when the workflow is closed."
@@ -10744,6 +10753,24 @@
         }
       },
       "description": "A link to a standalone Nexus operation."
+    },
+    "LinkWorkflow": {
+      "type": "object",
+      "properties": {
+        "namespace": {
+          "type": "string"
+        },
+        "workflowId": {
+          "type": "string"
+        },
+        "runId": {
+          "type": "string"
+        },
+        "reason": {
+          "type": "string"
+        }
+      },
+      "description": "A link to a workflow execution. This is a more general version of WorkflowEvent that doesn't specify a \nparticular event within the workflow, useful when you want to link to a workflow but there is no particular event to link to,\nsuch as a Query or a Rejected Update."
     },
     "LinkWorkflowEvent": {
       "type": "object",
@@ -11081,6 +11108,27 @@
         }
       },
       "description": "RequestIdReference is a indirect reference to a history event through the request ID."
+    },
+    "WorkflowExecutionOptionsUpdatedEventAttributesWorkflowUpdateOptionsUpdate": {
+      "type": "object",
+      "properties": {
+        "updateId": {
+          "type": "string",
+          "description": "The ID of the workflow update this update options update corresponds to."
+        },
+        "attachedRequestId": {
+          "type": "string",
+          "title": "Request ID attached to the running workflow update so that subsequent requests with same\nrequest ID will be deduped"
+        },
+        "attachedCompletionCallbacks": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "$ref": "#/definitions/v1Callback"
+          },
+          "description": "Completion callbacks attached to the running workflow update."
+        }
+      }
     },
     "WorkflowRuleActionActionActivityPause": {
       "type": "object"
@@ -12857,6 +12905,26 @@
                   "description": "The arguments to pass to the named Update handler."
                 }
               }
+            },
+            "requestId": {
+              "type": "string",
+              "description": "The request ID of the request."
+            },
+            "completionCallbacks": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "$ref": "#/definitions/v1Callback"
+              },
+              "description": "Callbacks to be called by the server when this update reaches a terminal state."
+            },
+            "links": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "$ref": "#/definitions/apiCommonV1Link"
+              },
+              "description": "Links to be associated with this update."
             }
           },
           "description": "The request information that will be delivered all the way down to the\nWorkflow Execution."
@@ -13052,6 +13120,9 @@
       "properties": {
         "workflowClosed": {
           "$ref": "#/definitions/CallbackInfoWorkflowClosed"
+        },
+        "updateWorkflowExecutionCompleted": {
+          "$ref": "#/definitions/CallbackInfoUpdateWorkflowExecutionCompleted"
         }
       }
     },
@@ -13251,6 +13322,14 @@
           "type": "string",
           "format": "int64",
           "description": "Total number of heartbeats recorded across all attempts of this activity, including retries."
+        },
+        "sdkName": {
+          "type": "string",
+          "description": "The name of the SDK of the worker that most recently picked up an attempt of this activity.\nOverwritten on each new attempt. Empty if unknown."
+        },
+        "sdkVersion": {
+          "type": "string",
+          "description": "The version of the SDK of the worker that most recently picked up an attempt of this activity.\nOverwritten on each new attempt. Empty if unknown."
         }
       },
       "description": "Information about a standalone activity."
@@ -14957,6 +15036,14 @@
             "$ref": "#/definitions/v1FailoverStatus"
           },
           "description": "Contains the historical state of failover_versions for the cluster, truncated to contain only the last N\nstates to ensure that the list does not grow unbounded."
+        },
+        "pollerGroupInfos": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "$ref": "#/definitions/v1PollerGroupInfo"
+          },
+          "description": "The initial info that client should use for poller group assignment. This information is\nupdated through poll response. Client is supposed to use the info received in the latest\npoll response."
         }
       }
     },
@@ -15992,6 +16079,9 @@
         },
         "nexusOperation": {
           "$ref": "#/definitions/LinkNexusOperation"
+        },
+        "workflow": {
+          "$ref": "#/definitions/LinkWorkflow"
         }
       },
       "description": "Link can be associated with history events. It might contain information about an external entity\nrelated to the history event. For example, workflow A makes a Nexus call that starts workflow B:\nin this case, a history event in workflow A could contain a Link to the workflow started event in\nworkflow B, and vice-versa."
@@ -16454,6 +16544,14 @@
         "workerCommands": {
           "type": "boolean",
           "description": "True if the namespace supports worker commands (server-to-worker communication via control queues)."
+        },
+        "standaloneNexusOperation": {
+          "type": "boolean",
+          "description": "True if the namespace supports standalone Nexus operations."
+        },
+        "workflowUpdateCallbacks": {
+          "type": "boolean",
+          "title": "True if the namespace supports attaching callbacks on workflow updates"
         }
       },
       "description": "Namespace capability details. Should contain what features are enabled in a namespace."
@@ -16887,6 +16985,11 @@
         "identity": {
           "type": "string",
           "description": "The identity of the client who started this operation."
+        },
+        "stateSizeBytes": {
+          "type": "string",
+          "format": "int64",
+          "description": "Updated once on scheduled and once on terminal status."
         }
       },
       "description": "Full current state of a standalone Nexus operation, as of the time of the request."
@@ -16940,6 +17043,11 @@
         "executionDuration": {
           "type": "string",
           "description": "The difference between close time and scheduled time.\nThis field is only populated if the operation is closed."
+        },
+        "stateSizeBytes": {
+          "type": "string",
+          "format": "int64",
+          "description": "Updated once on scheduled and once on terminal status."
         }
       },
       "description": "Limited Nexus operation information returned in the list response.\nWhen adding fields here, ensure that it is also present in NexusOperationExecutionInfo (note that it may already be present in\nNexusOperationExecutionInfo but not at the top-level)."
@@ -17905,6 +18013,26 @@
         },
         "input": {
           "$ref": "#/definitions/v1Input"
+        },
+        "requestId": {
+          "type": "string",
+          "description": "The request ID of the request."
+        },
+        "completionCallbacks": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "$ref": "#/definitions/v1Callback"
+          },
+          "description": "Callbacks to be called by the server when this update reaches a terminal state."
+        },
+        "links": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "$ref": "#/definitions/v1Link"
+          },
+          "description": "Links to be associated with this update."
         }
       },
       "description": "The client request that triggers a Workflow Update."
@@ -18397,6 +18525,11 @@
         "invalidScheduleError": {
           "type": "string",
           "description": "Deprecated."
+        },
+        "stateSizeBytes": {
+          "type": "string",
+          "format": "int64",
+          "description": "Size of the schedule's internal state (including payloads) in bytes."
         }
       }
     },
@@ -18450,6 +18583,11 @@
             "type": "string",
             "format": "date-time"
           }
+        },
+        "stateSizeBytes": {
+          "type": "string",
+          "format": "int64",
+          "description": "Size of the schedule's internal state (including payloads) in bytes."
         }
       },
       "description": "ScheduleListInfo is an abbreviated set of values from Schedule and ScheduleInfo\nthat's returned in ListSchedules."
@@ -19672,6 +19810,10 @@
         "stage": {
           "$ref": "#/definitions/v1UpdateWorkflowExecutionLifecycleStage",
           "description": "The most advanced lifecycle stage that the Update is known to have\nreached, where lifecycle stages are ordered\nUPDATE_WORKFLOW_EXECUTION_LIFECYCLE_STAGE_UNSPECIFIED <\nUPDATE_WORKFLOW_EXECUTION_LIFECYCLE_STAGE_ADMITTED <\nUPDATE_WORKFLOW_EXECUTION_LIFECYCLE_STAGE_ACCEPTED <\nUPDATE_WORKFLOW_EXECUTION_LIFECYCLE_STAGE_COMPLETED.\nUNSPECIFIED will be returned if and only if the server's maximum wait\ntime was reached before the Update reached the stage specified in the\nrequest WaitPolicy, and before the context deadline expired; clients may\nmay then retry the call as needed."
+        },
+        "link": {
+          "$ref": "#/definitions/v1Link",
+          "description": "Link to the update event. May be null if the update has not yet been accepted."
         }
       }
     },
@@ -20694,6 +20836,14 @@
         "timeSkippingConfig": {
           "$ref": "#/definitions/v1TimeSkippingConfig",
           "description": "If set, the time-skipping configuration was changed. Contains the full updated configuration."
+        },
+        "workflowUpdateOptions": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "$ref": "#/definitions/WorkflowExecutionOptionsUpdatedEventAttributesWorkflowUpdateOptionsUpdate"
+          },
+          "description": "Updates to workflow updates options."
         }
       }
     },

@@ -921,6 +921,9 @@ impl PollWFTRespExt for PollWorkflowTaskQueueResponse {
                 name: "update_fn".to_string(),
                 args: None,
             }),
+            request_id: String::new(),
+            completion_callbacks: vec![],
+            links: vec![],
         };
         self.messages.push(protocol::v1::Message {
             id: format!("update-{}", update_id.to_string()),

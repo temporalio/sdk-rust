@@ -2229,6 +2229,7 @@ paths:
         - WorkflowService
       description: |-
         Deprecated. Use `GetWorkerVersioningRules`.
+         Will be removed in server version v1.32.0.
          Fetches the worker build id versioning sets for a task queue.
       operationId: GetWorkerBuildIdCompatibility
       parameters:
@@ -2270,7 +2271,7 @@ paths:
         - WorkflowService
       description: |-
         Fetches the Build ID assignment and redirect rules for a Task Queue.
-         WARNING: Worker Versioning is not yet stable and the API and behavior may change incompatibly.
+         Will be removed in server version v1.32.0.
       operationId: GetWorkerVersioningRules
       parameters:
         - name: namespace
@@ -3048,6 +3049,7 @@ paths:
         - WorkflowService
       description: |-
         Deprecated. Use `DescribeTaskQueue`.
+         Will be removed in server version v1.32.0.
 
          Fetches task reachability to determine whether a worker may be retired.
          The request may specify task queues to query for or let the server fetch all task queues mapped to the given
@@ -7207,6 +7209,7 @@ paths:
         - WorkflowService
       description: |-
         Deprecated. Use `GetWorkerVersioningRules`.
+         Will be removed in server version v1.32.0.
          Fetches the worker build id versioning sets for a task queue.
       operationId: GetWorkerBuildIdCompatibility
       parameters:
@@ -7248,7 +7251,7 @@ paths:
         - WorkflowService
       description: |-
         Fetches the Build ID assignment and redirect rules for a Task Queue.
-         WARNING: Worker Versioning is not yet stable and the API and behavior may change incompatibly.
+         Will be removed in server version v1.32.0.
       operationId: GetWorkerVersioningRules
       parameters:
         - name: namespace
@@ -7993,6 +7996,7 @@ paths:
         - WorkflowService
       description: |-
         Deprecated. Use `DescribeTaskQueue`.
+         Will be removed in server version v1.32.0.
 
          Fetches task reachability to determine whether a worker may be retired.
          The request may specify task queues to query for or let the server fetch all task queues mapped to the given
@@ -9732,6 +9736,16 @@ components:
         totalHeartbeatCount:
           type: string
           description: Total number of heartbeats recorded across all attempts of this activity, including retries.
+        sdkName:
+          type: string
+          description: |-
+            The name of the SDK of the worker that most recently picked up an attempt of this activity.
+             Overwritten on each new attempt. Empty if unknown.
+        sdkVersion:
+          type: string
+          description: |-
+            The version of the SDK of the worker that most recently picked up an attempt of this activity.
+             Overwritten on each new attempt. Empty if unknown.
       description: Information about a standalone activity.
     ActivityExecutionListInfo:
       type: object
@@ -11514,6 +11528,14 @@ components:
           description: |-
             Contains the historical state of failover_versions for the cluster, truncated to contain only the last N
              states to ensure that the list does not grow unbounded.
+        pollerGroupInfos:
+          type: array
+          items:
+            $ref: '#/components/schemas/PollerGroupInfo'
+          description: |-
+            The initial info that client should use for poller group assignment. This information is
+             updated through poll response. Client is supposed to use the info received in the latest
+             poll response.
     DescribeNexusOperationExecutionResponse:
       type: object
       properties:
@@ -12489,6 +12511,8 @@ components:
           $ref: '#/components/schemas/Link_Activity'
         nexusOperation:
           $ref: '#/components/schemas/Link_NexusOperation'
+        workflow:
+          $ref: '#/components/schemas/Link_Workflow'
       description: |-
         Link can be associated with history events. It might contain information about an external entity
          related to the history event. For example, workflow A makes a Nexus call that starts workflow B:
@@ -12523,6 +12547,18 @@ components:
         runId:
           type: string
       description: A link to a standalone Nexus operation.
+    Link_Workflow:
+      type: object
+      properties:
+        namespace:
+          type: string
+        workflowId:
+          type: string
+        runId:
+          type: string
+        reason:
+          type: string
+      description: "A link to a workflow execution. This is a more general version of WorkflowEvent that doesn't specify a \n particular event within the workflow, useful when you want to link to a workflow but there is no particular event to link to,\n such as a Query or a Rejected Update."
     Link_WorkflowEvent:
       type: object
       properties:
@@ -12924,6 +12960,12 @@ components:
         workerCommands:
           type: boolean
           description: True if the namespace supports worker commands (server-to-worker communication via control queues).
+        standaloneNexusOperation:
+          type: boolean
+          description: True if the namespace supports standalone Nexus operations.
+        workflowUpdateCallbacks:
+          type: boolean
+          description: True if the namespace supports attaching callbacks on workflow updates
       description: Namespace capability details. Should contain what features are enabled in a namespace.
     NamespaceInfo_Limits:
       type: object
@@ -13329,6 +13371,9 @@ components:
         identity:
           type: string
           description: The identity of the client who started this operation.
+        stateSizeBytes:
+          type: string
+          description: Updated once on scheduled and once on terminal status.
       description: Full current state of a standalone Nexus operation, as of the time of the request.
     NexusOperationExecutionListInfo:
       type: object
@@ -13381,6 +13426,9 @@ components:
           description: |-
             The difference between close time and scheduled time.
              This field is only populated if the operation is closed.
+        stateSizeBytes:
+          type: string
+          description: Updated once on scheduled and once on terminal status.
       description: |-
         Limited Nexus operation information returned in the list response.
          When adding fields here, ensure that it is also present in NexusOperationExecutionInfo (note that it may already be present in
@@ -14555,6 +14603,19 @@ components:
           $ref: '#/components/schemas/Meta'
         input:
           $ref: '#/components/schemas/Input'
+        requestId:
+          type: string
+          description: The request ID of the request.
+        completionCallbacks:
+          type: array
+          items:
+            $ref: '#/components/schemas/Callback'
+          description: Callbacks to be called by the server when this update reaches a terminal state.
+        links:
+          type: array
+          items:
+            $ref: '#/components/schemas/Link'
+          description: Links to be associated with this update.
       description: The client request that triggers a Workflow Update.
     RequestCancelActivityExecutionRequest:
       type: object
@@ -15450,6 +15511,9 @@ components:
         invalidScheduleError:
           type: string
           description: Deprecated.
+        stateSizeBytes:
+          type: string
+          description: Size of the schedule's internal state (including payloads) in bytes.
     ScheduleListEntry:
       type: object
       properties:
@@ -15493,6 +15557,9 @@ components:
           items:
             type: string
             format: date-time
+        stateSizeBytes:
+          type: string
+          description: Size of the schedule's internal state (including payloads) in bytes.
       description: |-
         ScheduleListInfo is an abbreviated set of values from Schedule and ScheduleInfo
          that's returned in ListSchedules.
@@ -17930,6 +17997,10 @@ components:
              request WaitPolicy, and before the context deadline expired; clients may
              may then retry the call as needed.
           format: enum
+        link:
+          allOf:
+            - $ref: '#/components/schemas/Link'
+          description: Link to the update event. May be null if the update has not yet been accepted.
     UpsertWorkflowSearchAttributesEventAttributes:
       type: object
       properties:
@@ -19274,6 +19345,27 @@ components:
           allOf:
             - $ref: '#/components/schemas/TimeSkippingConfig'
           description: If set, the time-skipping configuration was changed. Contains the full updated configuration.
+        workflowUpdateOptions:
+          type: array
+          items:
+            $ref: '#/components/schemas/WorkflowExecutionOptionsUpdatedEventAttributes_WorkflowUpdateOptionsUpdate'
+          description: Updates to workflow updates options.
+    WorkflowExecutionOptionsUpdatedEventAttributes_WorkflowUpdateOptionsUpdate:
+      type: object
+      properties:
+        updateId:
+          type: string
+          description: The ID of the workflow update this update options update corresponds to.
+        attachedRequestId:
+          type: string
+          description: |-
+            Request ID attached to the running workflow update so that subsequent requests with same
+             request ID will be deduped
+        attachedCompletionCallbacks:
+          type: array
+          items:
+            $ref: '#/components/schemas/Callback'
+          description: Completion callbacks attached to the running workflow update.
     WorkflowExecutionPauseInfo:
       type: object
       properties:

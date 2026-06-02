@@ -102,6 +102,10 @@ message DescribeNamespaceResponse {
     // Contains the historical state of failover_versions for the cluster, truncated to contain only the last N
     // states to ensure that the list does not grow unbounded.
     repeated temporal.api.replication.v1.FailoverStatus failover_history = 6;
+    // The initial info that client should use for poller group assignment. This information is
+    // updated through poll response. Client is supposed to use the info received in the latest
+    // poll response.
+    repeated temporal.api.taskqueue.v1.PollerGroupInfo poller_group_infos = 7;
 }
 
 message UpdateNamespaceRequest {
@@ -269,7 +273,7 @@ message PollWorkflowTaskQueueRequest {
     temporal.api.taskqueue.v1.TaskQueue task_queue = 2;
     // Unless this is the first poll, the client must pass one of the poller group IDs received in
     // `poller_group_infos` of the last the PollWorkflowTaskQueueResponse according to the
-    // instructions. If not set, the poll is routed randomly which can cause it being blocked
+    // instructions. If not set, the poll is routed randomly which can cause it to be blocked
     // without receiving a task while the queue actually has tasks in another server location.
     string poller_group_id = 10;
     // The identity of the worker/client who is polling this task queue
@@ -482,7 +486,7 @@ message PollActivityTaskQueueRequest {
     temporal.api.taskqueue.v1.TaskQueue task_queue = 2;
     // Unless this is the first poll, the client must pass one of the poller group IDs received in
     // `poller_group_infos` of the last the PollActivityTaskQueueResponse according to the
-    // instructions. If not set, the poll is routed randomly which can cause it being blocked
+    // instructions. If not set, the poll is routed randomly which can cause it to be blocked
     // without receiving a task while the queue actually has tasks in another server location.
     string poller_group_id = 10;
     // The identity of the worker/client
@@ -1809,6 +1813,9 @@ message UpdateWorkflowExecutionResponse {
     // request WaitPolicy, and before the context deadline expired; clients may
     // may then retry the call as needed.
     temporal.api.enums.v1.UpdateWorkflowExecutionLifecycleStage stage = 3;
+
+    // Link to the update event. May be null if the update has not yet been accepted.
+    temporal.api.common.v1.Link link = 4;
 }
 
 message StartBatchOperationRequest {
@@ -1947,7 +1954,7 @@ message PollNexusTaskQueueRequest {
     temporal.api.taskqueue.v1.TaskQueue task_queue = 3;
     // Unless this is the first poll, the client must pass one of the poller group IDs received in
     // `poller_group_infos` of the last the PollNexusTaskQueueResponse according to the
-    // instructions. If not set, the poll is routed randomly which can cause it being blocked
+    // instructions. If not set, the poll is routed randomly which can cause it to be blocked
     // without receiving a task while the queue actually has tasks in another server location.
     string poller_group_id = 9;
     // The identity of the client who initiated this request.
@@ -2900,6 +2907,7 @@ message TriggerWorkflowRuleResponse {
     // True is the rule was applied, based on the rule conditions (predicate/visibility_query).
     bool applied = 1;
 }
+
 message RecordWorkerHeartbeatRequest {
     // Namespace this worker belongs to.
     string namespace = 1;

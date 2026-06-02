@@ -168,6 +168,14 @@ message ActivityExecutionInfo {
 
     // Total number of heartbeats recorded across all attempts of this activity, including retries.
     int64 total_heartbeat_count = 34;
+
+    // The name of the SDK of the worker that most recently picked up an attempt of this activity.
+    // Overwritten on each new attempt. Empty if unknown.
+    string sdk_name = 35;
+
+    // The version of the SDK of the worker that most recently picked up an attempt of this activity.
+    // Overwritten on each new attempt. Empty if unknown.
+    string sdk_version = 36;
 }
 
 // Limited activity information returned in the list response.

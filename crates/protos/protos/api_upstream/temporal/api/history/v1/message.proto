@@ -881,6 +881,15 @@ message ChildWorkflowExecutionTerminatedEventAttributes {
 }
 
 message WorkflowExecutionOptionsUpdatedEventAttributes {
+    message WorkflowUpdateOptionsUpdate {
+        // The ID of the workflow update this update options update corresponds to.
+        string update_id = 1;
+        // Request ID attached to the running workflow update so that subsequent requests with same
+        // request ID will be deduped
+        string attached_request_id = 2;
+        // Completion callbacks attached to the running workflow update.
+        repeated temporal.api.common.v1.Callback attached_completion_callbacks = 3;
+    }
     // Versioning override upserted in this event.
     // Ignored if nil or if unset_versioning_override is true.
     temporal.api.workflow.v1.VersioningOverride versioning_override = 1;
@@ -898,6 +907,8 @@ message WorkflowExecutionOptionsUpdatedEventAttributes {
     temporal.api.common.v1.Priority priority = 6;
     // If set, the time-skipping configuration was changed. Contains the full updated configuration.
     temporal.api.workflow.v1.TimeSkippingConfig time_skipping_config = 7;
+    // Updates to workflow updates options.
+    repeated WorkflowUpdateOptionsUpdate workflow_update_options = 8;
 }
 
 // Not used anywhere. Use case is replaced by WorkflowExecutionOptionsUpdatedEventAttributes
