@@ -19,9 +19,12 @@ use crate::{
         OutgoingError, OutgoingWorkflowError, ResetWorkflowError, ServerError, TerminatedError,
         TimeoutError,
     },
-    protos::temporal::api::failure::v1::{
-        ActivityFailureInfo, ApplicationFailureInfo, CanceledFailureInfo,
-        ChildWorkflowExecutionFailureInfo, Failure, failure::FailureInfo,
+    protos::temporal::api::{
+        enums::v1::ApplicationErrorCategory as ProtoApplicationErrorCategory,
+        failure::v1::{
+            ActivityFailureInfo, ApplicationFailureInfo, CanceledFailureInfo,
+            ChildWorkflowExecutionFailureInfo, Failure, failure::FailureInfo,
+        },
     },
 };
 
@@ -320,7 +323,7 @@ impl EncodeFailure for ApplicationFailure {
                     non_retryable: self.is_non_retryable(),
                     details,
                     next_retry_delay: self.next_retry_delay().and_then(|d| d.try_into().ok()),
-                    category: self.category() as i32,
+                    category: ProtoApplicationErrorCategory::from(self.category()) as i32,
                 },
             )),
             ..Default::default()
@@ -501,9 +504,9 @@ mod tests {
     use super::*;
     use crate::{
         data_converters::{GenericPayloadConverter, SerializationContext},
+        error::ApplicationErrorCategory,
         protos::temporal::api::{
             common::v1::{Payload, Payloads},
-            enums::v1::ApplicationErrorCategory,
             failure::v1::{
                 ActivityFailureInfo, ChildWorkflowExecutionFailureInfo, NexusHandlerFailureInfo,
                 NexusOperationFailureInfo, ResetWorkflowFailureInfo, ServerFailureInfo,
@@ -649,7 +652,7 @@ mod tests {
         assert_eq!(failure.message, "app boom");
         assert_eq!(info.r#type, "MyType");
         assert!(info.non_retryable);
-        assert_eq!(info.category(), ApplicationErrorCategory::Benign);
+        assert_eq!(info.category(), ProtoApplicationErrorCategory::Benign);
         assert_eq!(info.details.unwrap().payloads[0].data, b"details".to_vec());
     }
 

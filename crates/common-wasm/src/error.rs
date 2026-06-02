@@ -10,7 +10,7 @@ use crate::{
         coresdk::child_workflow::StartChildWorkflowExecutionFailedCause,
         temporal::api::{
             common::v1::{Payload, Payloads},
-            enums::v1::{ApplicationErrorCategory, TimeoutType},
+            enums::v1::{ApplicationErrorCategory as ProtoApplicationErrorCategory, TimeoutType},
             failure::v1::Failure,
         },
     },
@@ -116,6 +116,35 @@ where
     fn from(value: T) -> Self {
         Self {
             repr: FailurePayloadsRepr::Serializable(Box::new(value)),
+        }
+    }
+}
+
+/// Categorizes an [`ApplicationFailure`] to hint at how the server and tooling should treat it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum ApplicationErrorCategory {
+    /// No category was specified.
+    #[default]
+    Unspecified,
+    /// An expected error with little or no severity. Benign errors are logged at a reduced level
+    /// and excluded from error metrics by the server.
+    Benign,
+}
+
+impl From<ApplicationErrorCategory> for ProtoApplicationErrorCategory {
+    fn from(value: ApplicationErrorCategory) -> Self {
+        match value {
+            ApplicationErrorCategory::Unspecified => ProtoApplicationErrorCategory::Unspecified,
+            ApplicationErrorCategory::Benign => ProtoApplicationErrorCategory::Benign,
+        }
+    }
+}
+
+impl From<ProtoApplicationErrorCategory> for ApplicationErrorCategory {
+    fn from(value: ProtoApplicationErrorCategory) -> Self {
+        match value {
+            ProtoApplicationErrorCategory::Unspecified => ApplicationErrorCategory::Unspecified,
+            ProtoApplicationErrorCategory::Benign => ApplicationErrorCategory::Benign,
         }
     }
 }
@@ -248,7 +277,7 @@ impl ApplicationFailure {
             type_name,
             non_retryable: app_info.non_retryable,
             next_retry_delay: app_info.next_retry_delay.and_then(|d| d.try_into().ok()),
-            category: app_info.category(),
+            category: app_info.category().into(),
             details: app_info.details.map(|details| {
                 FailurePayloads::from(DecodablePayloads::new(
                     details.payloads,
@@ -1130,7 +1159,7 @@ mod tests {
         assert_eq!(info.r#type, "MyType");
         assert!(info.non_retryable);
         assert_eq!(info.details, Some(payloads));
-        assert_eq!(info.category(), ApplicationErrorCategory::Benign);
+        assert_eq!(info.category(), ProtoApplicationErrorCategory::Benign);
         assert_eq!(info.next_retry_delay.unwrap().seconds, 3);
     }
 

@@ -2,7 +2,7 @@
 
 pub use crate::workflow_registry::WorkflowRegistrationError;
 pub use temporalio_common::error::{
-    ActivityExecutionError, ApplicationFailure, ChildWorkflowExecutionError,
-    ChildWorkflowSignalError, ChildWorkflowStartError, OutgoingActivityError, OutgoingError,
-    OutgoingWorkflowError,
+    ActivityExecutionError, ApplicationErrorCategory, ApplicationFailure,
+    ChildWorkflowExecutionError, ChildWorkflowSignalError, ChildWorkflowStartError,
+    OutgoingActivityError, OutgoingError, OutgoingWorkflowError,
 };

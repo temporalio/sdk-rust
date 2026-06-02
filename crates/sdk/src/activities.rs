@@ -491,14 +491,12 @@ impl Debug for ActivityDefinitions {
 mod test {
     use super::*;
     use rstest::rstest;
-    use temporalio_common::error::ApplicationFailure;
+    use temporalio_common::error::{ApplicationErrorCategory, ApplicationFailure};
 
     #[rstest]
     #[case(true)]
     #[case(false)]
     fn activity_error_conversion_is_not_lossy(#[case] non_retryable: bool) {
-        use temporalio_common::protos::temporal::api::enums::v1::ApplicationErrorCategory;
-
         let original = ApplicationFailure::builder(anyhow::anyhow!("big boom"))
             .type_name("BigBoom".to_owned())
             .non_retryable(non_retryable)
