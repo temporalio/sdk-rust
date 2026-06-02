@@ -1326,15 +1326,6 @@ proxier! {
         }
     );
     (
-        update_activity_execution_options,
-        UpdateActivityExecutionOptionsRequest,
-        UpdateActivityExecutionOptionsResponse,
-        |r| {
-            let labels = namespaced_request!(r);
-            r.extensions_mut().insert(labels);
-        }
-    );
-    (
         pause_activity,
         PauseActivityRequest,
         PauseActivityResponse,
@@ -1344,27 +1335,9 @@ proxier! {
         }
     );
     (
-        pause_activity_execution,
-        PauseActivityExecutionRequest,
-        PauseActivityExecutionResponse,
-        |r| {
-            let labels = namespaced_request!(r);
-            r.extensions_mut().insert(labels);
-        }
-    );
-    (
         unpause_activity,
         UnpauseActivityRequest,
         UnpauseActivityResponse,
-        |r| {
-            let labels = namespaced_request!(r);
-            r.extensions_mut().insert(labels);
-        }
-    );
-    (
-        unpause_activity_execution,
-        UnpauseActivityExecutionRequest,
-        UnpauseActivityExecutionResponse,
         |r| {
             let labels = namespaced_request!(r);
             r.extensions_mut().insert(labels);
@@ -1383,15 +1356,6 @@ proxier! {
         reset_activity,
         ResetActivityRequest,
         ResetActivityResponse,
-        |r| {
-            let labels = namespaced_request!(r);
-            r.extensions_mut().insert(labels);
-        }
-    );
-    (
-        reset_activity_execution,
-        ResetActivityExecutionRequest,
-        ResetActivityExecutionResponse,
         |r| {
             let labels = namespaced_request!(r);
             r.extensions_mut().insert(labels);
