@@ -6,7 +6,7 @@ on:
 
 jobs:
   trigger-api-go-delete-release:
-    uses: temporalio/api-go/.github/workflows/delete-release.yml@master
+    uses: temporalio/api-go/.github/workflows/delete-release.yml@main
     with:
       tag: ${{ github.event.release.tag_name }}
       api_commit_sha: ${{ github.event.release.target_commitish }}

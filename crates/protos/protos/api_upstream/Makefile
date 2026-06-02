@@ -76,7 +76,7 @@ http-api-docs:
 ##### Plugins & tools #####
 grpc-install:
 	@printf $(COLOR) "Install/update protoc and plugins..."
-	@go install go.temporal.io/api/cmd/protogen@master
+	@go install go.temporal.io/api/cmd/protogen@main
 	@go install google.golang.org/protobuf/cmd/protoc-gen-go@latest
 	@go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@latest
 	@go install github.com/grpc-ecosystem/grpc-gateway/v2/protoc-gen-grpc-gateway@latest
@@ -118,8 +118,8 @@ buf-lint: $(STAMPDIR)/buf-mod-prune
 	(cd $(PROTO_ROOT) && buf lint)
 
 buf-breaking:
-	@printf $(COLOR) "Run buf breaking changes check against master branch..."	
-	@(cd $(PROTO_ROOT) && buf breaking --against 'https://github.com/temporalio/api.git#branch=master')
+	@printf $(COLOR) "Run buf breaking changes check against main branch..."
+	@(cd $(PROTO_ROOT) && buf breaking --against 'https://github.com/temporalio/api.git#branch=main')
 
 nexus-rpc-yaml: nexus-rpc-yaml-install
 	printf $(COLOR) "Generate nexus/temporal-proto-models-nexusrpc.yaml..."

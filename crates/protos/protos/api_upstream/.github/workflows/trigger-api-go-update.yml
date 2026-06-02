@@ -3,13 +3,13 @@ name: 'Trigger api-go Update'
 on:
   push:
     branches:
-      - master
+      - main
   workflow_dispatch:
     inputs:
       branch:
-        description: "Branch in api-go repo to trigger update protos (default: master)"
+        description: "Branch in api-go repo to trigger update protos (default: main)"
         required: true
-        default: master
+        default: main
 
 jobs:
   notify:
