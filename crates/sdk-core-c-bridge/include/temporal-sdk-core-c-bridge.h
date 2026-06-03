@@ -6,8 +6,8 @@
 #include <stdlib.h>
 
 typedef enum TemporalCoreClientGrpcCompression {
-  Gzip = 0,
-  None = 1,
+  TemporalCoreClientGrpcCompression_Gzip = 0,
+  TemporalCoreClientGrpcCompression_None = 1,
 } TemporalCoreClientGrpcCompression;
 
 typedef enum TemporalCoreRpcService {
