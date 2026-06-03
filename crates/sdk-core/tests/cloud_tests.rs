@@ -29,6 +29,11 @@ async fn grpc_message_too_large_test() {
 }
 
 #[tokio::test]
+async fn grpc_compression_roundtrip() {
+    shared_tests::grpc_compression_roundtrip().await
+}
+
+#[tokio::test]
 async fn priority_values_sent_to_server() {
     shared_tests::priority::priority_values_sent_to_server().await
 }

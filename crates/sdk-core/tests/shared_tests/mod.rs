@@ -1,6 +1,6 @@
 //! Shared tests that are meant to be run against both local dev server and cloud
 
-use crate::common::{CoreWfStarter, activity_functions::StdActivities};
+use crate::common::{CoreWfStarter, activity_functions::StdActivities, get_cloud_or_local_client};
 use std::{
     sync::{
         Arc,
@@ -9,7 +9,8 @@ use std::{
     time::Duration,
 };
 use temporalio_client::{
-    WorkflowFetchHistoryOptions, WorkflowStartOptions, WorkflowTerminateOptions,
+    GrpcCompression, NamespacedClient, WorkflowFetchHistoryOptions, WorkflowStartOptions,
+    WorkflowTerminateOptions, grpc::WorkflowService,
 };
 use temporalio_common::{
     ActivityError, UntypedWorkflow,
@@ -27,6 +28,7 @@ use temporalio_common::{
                     WorkflowExecutionTerminatedEventAttributes, WorkflowTaskFailedEventAttributes,
                 },
             },
+            workflowservice::v1::ListWorkflowExecutionsRequest,
         },
     },
     worker::WorkerTaskTypes,
@@ -36,9 +38,32 @@ use temporalio_sdk::{
     ActivityOptions, CancellableFuture, WorkflowContext, WorkflowResult, WorkflowTermination,
     activities::ActivityContext,
 };
+use tonic::IntoRequest;
 use tracing::warn;
 
 pub(crate) mod priority;
+
+/// Performs a basic gRPC round-trip with each compression setting to confirm both compressed and
+/// uncompressed transport work end-to-end against a real server.
+pub(crate) async fn grpc_compression_roundtrip() {
+    for compression in [GrpcCompression::None, GrpcCompression::Gzip] {
+        let mut client = get_cloud_or_local_client(compression).await;
+        let namespace = client.namespace();
+        client
+            .list_workflow_executions(
+                ListWorkflowExecutionsRequest {
+                    namespace,
+                    page_size: 1,
+                    ..Default::default()
+                }
+                .into_request(),
+            )
+            .await
+            .unwrap_or_else(|e| {
+                panic!("list_workflow_executions failed with {compression:?}: {e}")
+            });
+    }
+}
 
 #[workflow]
 struct OversizeGrpcMessageWf {

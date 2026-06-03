@@ -361,6 +361,12 @@ impl Context {
             dns_load_balancing_options: pointer_or_null(dns_load_balancing_options.as_deref()),
             grpc_override_callback,
             grpc_override_callback_user_data,
+            grpc_compression: match options.grpc_compression {
+                temporalio_client::GrpcCompression::None => {
+                    crate::client::ClientGrpcCompression::None
+                }
+                _ => crate::client::ClientGrpcCompression::Gzip,
+            },
         });
 
         let client_options_ptr = &*client_options as *const _;

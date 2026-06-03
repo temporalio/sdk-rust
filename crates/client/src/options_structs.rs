@@ -78,6 +78,12 @@ pub struct ConnectionOptions {
     pub disable_error_code_metric_tags: bool,
     /// If set, all gRPC calls will be routed through the provided service.
     pub service_override: Option<callback_based::CallbackBasedGrpcService>,
+    /// Controls transport-level gRPC compression for the client. Defaults to
+    /// [GrpcCompression::Gzip], which compresses outbound request bodies and accepts
+    /// compressed responses. Set to [GrpcCompression::None] to opt out.
+    /// If service_override is specified, is forced to `None`.
+    #[builder(default)]
+    pub grpc_compression: GrpcCompression,
 
     // Internal / Core-based SDK only options below =============================================
     /// If set true, get_system_info will not be called upon connection.
@@ -130,6 +136,18 @@ pub struct ClientOptions {
     /// The data converter used for serializing/deserializing payloads.
     #[builder(default)]
     pub data_converter: DataConverter,
+}
+
+/// Selects the transport-level compression used for gRPC calls. See
+/// [ConnectionOptions::grpc_compression].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub enum GrpcCompression {
+    /// Do not compress requests or advertise acceptance of compressed responses.
+    None,
+    /// Gzip-compress outbound requests and accept gzip-compressed responses.
+    #[default]
+    Gzip,
 }
 
 /// Configuration options for TLS

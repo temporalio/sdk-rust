@@ -29,9 +29,9 @@ use std::{
     time::{Duration, Instant},
 };
 use temporalio_client::{
-    Client, ClientTlsOptions, Connection, ConnectionOptions, NamespacedClient, TlsOptions,
-    UntypedWorkflow, UntypedWorkflowHandle, WorkflowExecutionInfo, WorkflowGetResultOptions,
-    WorkflowHandle, WorkflowStartOptions,
+    Client, ClientTlsOptions, Connection, ConnectionOptions, GrpcCompression, NamespacedClient,
+    TlsOptions, UntypedWorkflow, UntypedWorkflowHandle, WorkflowExecutionInfo,
+    WorkflowGetResultOptions, WorkflowHandle, WorkflowStartOptions,
     errors::{WorkflowGetResultError, WorkflowStartError},
     grpc::WorkflowService,
 };
@@ -209,6 +209,10 @@ pub(crate) fn init_integ_telem() -> Option<&'static CoreRuntime> {
 }
 
 pub(crate) async fn get_cloud_client() -> Client {
+    get_cloud_client_with_compression(GrpcCompression::default()).await
+}
+
+async fn get_cloud_client_with_compression(compression: GrpcCompression) -> Client {
     let cloud_addr = env::var("TEMPORAL_CLOUD_ADDRESS").unwrap();
     let cloud_key = env::var("TEMPORAL_CLIENT_KEY").unwrap();
 
@@ -228,11 +232,26 @@ pub(crate) async fn get_cloud_client() -> Client {
             }),
             ..Default::default()
         })
+        .grpc_compression(compression)
         .build();
     let connection = Connection::connect(connection_opts).await.unwrap();
     let namespace = env::var("TEMPORAL_NAMESPACE").expect("TEMPORAL_NAMESPACE must be set");
     let client_opts = temporalio_client::ClientOptions::new(namespace).build();
     Client::new(connection, client_opts).unwrap()
+}
+
+/// Gets a namespaced client targeting cloud if the cloud env vars are present, otherwise the local
+/// dev server, configured with the given transport-level gRPC compression.
+pub(crate) async fn get_cloud_or_local_client(compression: GrpcCompression) -> Client {
+    if env::var("TEMPORAL_CLOUD_ADDRESS").is_ok() {
+        get_cloud_client_with_compression(compression).await
+    } else {
+        let mut opts = get_integ_server_options();
+        opts.grpc_compression = compression;
+        let connection = Connection::connect(opts).await.expect("Must connect");
+        let client_opts = temporalio_client::ClientOptions::new(integ_namespace()).build();
+        Client::new(connection, client_opts).unwrap()
+    }
 }
 
 /// Implements a builder pattern to help integ tests initialize core and create workflows

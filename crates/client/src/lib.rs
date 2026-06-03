@@ -108,6 +108,7 @@ use tonic::{
     Code, IntoRequest,
     body::Body,
     client::GrpcService,
+    codec::CompressionEncoding,
     codegen::InterceptedService,
     metadata::{
         AsciiMetadataKey, AsciiMetadataValue, BinaryMetadataKey, BinaryMetadataValue, MetadataMap,
@@ -162,6 +163,13 @@ impl Connection {
     /// Connect to a Temporal service.
     pub async fn connect(options: ConnectionOptions) -> Result<Self, ClientConnectError> {
         let dns_lb_opts = dns::validate_and_get_dns_lb(&options)?.cloned();
+        // The callback-based override transport cannot decode compressed request bodies, so
+        // compression is forced off whenever a service override is in use.
+        let compression = if options.service_override.is_some() {
+            GrpcCompression::None
+        } else {
+            options.grpc_compression
+        };
         let (service, dns_task) = if let Some(service_override) = options.service_override {
             (
                 GrpcMetricSvc {
@@ -238,7 +246,7 @@ impl Connection {
             headers: headers.clone(),
         };
         let svc = InterceptedService::new(service, interceptor);
-        let mut svc_client = TemporalServiceClient::new(svc);
+        let mut svc_client = TemporalServiceClient::new(svc, compression);
 
         let capabilities = if !options.skip_get_system_info {
             match svc_client
@@ -574,7 +582,7 @@ fn get_decode_max_size() -> usize {
 }
 
 impl TemporalServiceClient {
-    fn new<T>(svc: T) -> Self
+    fn new<T>(svc: T, compression: GrpcCompression) -> Self
     where
         T: GrpcService<Body> + Send + Sync + Clone + 'static,
         T::ResponseBody: tonic::codegen::Body<Data = tonic::codegen::Bytes> + Send + 'static,
@@ -582,23 +590,25 @@ impl TemporalServiceClient {
         <T::ResponseBody as tonic::codegen::Body>::Error: Into<tonic::codegen::StdError> + Send,
         <T as GrpcService<Body>>::Future: Send,
     {
-        let workflow_svc_client = Box::new(
-            WorkflowServiceClient::new(svc.clone())
-                .max_decoding_message_size(get_decode_max_size()),
-        );
-        let operator_svc_client = Box::new(
-            OperatorServiceClient::new(svc.clone())
-                .max_decoding_message_size(get_decode_max_size()),
-        );
-        let cloud_svc_client = Box::new(
-            CloudServiceClient::new(svc.clone()).max_decoding_message_size(get_decode_max_size()),
-        );
-        let test_svc_client = Box::new(
-            TestServiceClient::new(svc.clone()).max_decoding_message_size(get_decode_max_size()),
-        );
-        let health_svc_client = Box::new(
-            HealthClient::new(svc.clone()).max_decoding_message_size(get_decode_max_size()),
-        );
+        // The generated service clients don't share a trait exposing the compression setters, so
+        // a macro applies the same configuration to each concrete client type.
+        macro_rules! configure {
+            ($client:expr) => {{
+                let client = $client.max_decoding_message_size(get_decode_max_size());
+                match compression {
+                    GrpcCompression::Gzip => client
+                        .send_compressed(CompressionEncoding::Gzip)
+                        .accept_compressed(CompressionEncoding::Gzip),
+                    GrpcCompression::None => client,
+                }
+            }};
+        }
+
+        let workflow_svc_client = Box::new(configure!(WorkflowServiceClient::new(svc.clone())));
+        let operator_svc_client = Box::new(configure!(OperatorServiceClient::new(svc.clone())));
+        let cloud_svc_client = Box::new(configure!(CloudServiceClient::new(svc.clone())));
+        let test_svc_client = Box::new(configure!(TestServiceClient::new(svc.clone())));
+        let health_svc_client = Box::new(configure!(HealthClient::new(svc.clone())));
 
         Self {
             workflow_svc_client,
