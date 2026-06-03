@@ -22,7 +22,7 @@ use std::{
     time::Duration,
 };
 use temporalio_client::{
-    Connection, GrpcCompression, Namespace, RETRYABLE_ERROR_CODES, RetryOptions, UntypedWorkflow,
+    Connection, Namespace, RETRYABLE_ERROR_CODES, RetryOptions, UntypedWorkflow,
     grpc::WorkflowService, proxy::HttpConnectProxyOptions,
 };
 use temporalio_common::protos::temporal::api::{
@@ -320,61 +320,8 @@ async fn namespace_header_attached_to_relevant_calls() {
 }
 
 #[tokio::test]
-async fn grpc_compression_sets_encoding_header() {
-    let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
-    let (header_tx, mut header_rx) = tokio::sync::mpsc::unbounded_channel();
-
-    let listener = TcpListener::bind("[::]:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-
-    let server_handle = tokio::spawn(async move {
-        Server::builder()
-            .add_service(GenericService {
-                header_to_parse: "grpc-encoding",
-                header_tx,
-                response_maker: |_| async { Response::new(Body::empty()) }.boxed(),
-            })
-            .serve_with_incoming_shutdown(
-                tokio_stream::wrappers::TcpListenerStream::new(listener),
-                async {
-                    shutdown_rx.await.ok();
-                },
-            )
-            .await
-            .unwrap();
-    });
-
-    for (compression, expected) in [(GrpcCompression::Gzip, "gzip"), (GrpcCompression::None, "")] {
-        let mut opts = get_integ_server_options();
-        opts.target = format!("http://localhost:{}", addr.port())
-            .parse::<url::Url>()
-            .unwrap();
-        opts.set_skip_get_system_info(true);
-        opts.retry_options = RetryOptions::no_retries();
-        opts.grpc_compression = compression;
-        let connection = Connection::connect(opts).await.unwrap();
-        let client_opts = temporalio_client::ClientOptions::new(NAMESPACE).build();
-        let client = temporalio_client::Client::new(connection, client_opts).unwrap();
-
-        let _ = WorkflowService::list_namespaces(
-            &mut client.clone(),
-            ListNamespacesRequest::default().into_request(),
-        )
-        .await;
-        let val = header_rx.recv().await.unwrap();
-        assert_eq!(
-            expected, val,
-            "unexpected grpc-encoding for {compression:?}"
-        );
-    }
-
-    shutdown_tx.send(()).unwrap();
-    server_handle.await.unwrap();
-}
-
-#[tokio::test]
-async fn grpc_compression_roundtrip() {
-    crate::shared_tests::grpc_compression_roundtrip().await
+async fn grpc_compression() {
+    crate::shared_tests::grpc_compression().await
 }
 
 #[tokio::test]

@@ -142,6 +142,7 @@ bytes = "1.10"
 clap = { version = "4.5", features = ["derive"] }
 criterion = { version = "0.8", features = ["async", "async_tokio"] }
 crossbeam-queue = "0.3"
+flate2 = "1.1"
 http-body-util = { version = "0.1" }
 hyper = { version = "1.7" }
 hyper-util = { version = "0.1", features = [

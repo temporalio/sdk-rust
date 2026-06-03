@@ -1,6 +1,11 @@
 //! Shared tests that are meant to be run against both local dev server and cloud
 
-use crate::common::{CoreWfStarter, activity_functions::StdActivities, get_cloud_or_local_client};
+use crate::common::{
+    CoreWfStarter, NAMESPACE, activity_functions::StdActivities, fake_grpc_server::GenericService,
+    get_cloud_or_local_client,
+};
+use futures_util::FutureExt;
+use http_body_util::BodyExt;
 use std::{
     sync::{
         Arc,
@@ -9,8 +14,9 @@ use std::{
     time::Duration,
 };
 use temporalio_client::{
-    GrpcCompression, NamespacedClient, WorkflowFetchHistoryOptions, WorkflowStartOptions,
-    WorkflowTerminateOptions, grpc::WorkflowService,
+    Client, ClientOptions, Connection, ConnectionOptions, GrpcCompression, NamespacedClient,
+    RetryOptions, WorkflowFetchHistoryOptions, WorkflowStartOptions, WorkflowTerminateOptions,
+    grpc::WorkflowService,
 };
 use temporalio_common::{
     ActivityError, UntypedWorkflow,
@@ -28,7 +34,7 @@ use temporalio_common::{
                     WorkflowExecutionTerminatedEventAttributes, WorkflowTaskFailedEventAttributes,
                 },
             },
-            workflowservice::v1::ListWorkflowExecutionsRequest,
+            workflowservice::v1::{DescribeNamespaceRequest, ListWorkflowExecutionsRequest},
         },
     },
     worker::WorkerTaskTypes,
@@ -38,18 +44,39 @@ use temporalio_sdk::{
     ActivityOptions, CancellableFuture, WorkflowContext, WorkflowResult, WorkflowTermination,
     activities::ActivityContext,
 };
-use tonic::IntoRequest;
+use tokio::{
+    net::TcpListener,
+    sync::{mpsc, oneshot},
+};
+use tonic::{
+    IntoRequest,
+    body::Body,
+    codegen::http::{Request, Response},
+    transport::Server,
+};
 use tracing::warn;
 
 pub(crate) mod priority;
 
-/// Performs a basic gRPC round-trip with each compression setting to confirm both compressed and
-/// uncompressed transport work end-to-end against a real server.
-pub(crate) async fn grpc_compression_roundtrip() {
+/// Verifies transport-level gRPC compression end-to-end, with and without it enabled.
+///
+/// Part 1 runs against the real server (cloud or local dev server) and confirms both settings work
+/// *and* that the server actually engages compression rather than silently ignoring it: the
+/// Temporal frontend only gzip-compresses its response when the client advertises
+/// `grpc-accept-encoding: gzip` (which our toggle controls), so `grpc-encoding: gzip` on the
+/// response iff enabled proves the negotiation is live.
+///
+/// Part 2 proves the *outbound request* bytes on the wire are genuinely gzip-compressed. We cannot
+/// inspect the bytes of the real (TLS) connection, so this routes through an in-process tonic
+/// server that lets us read the raw gRPC frame and confirm the compression flag, gzip magic bytes,
+/// size reduction, and that the payload decompresses to the exact same protobuf as the
+/// uncompressed request.
+pub(crate) async fn grpc_compression() {
+    // Part 1: real-server negotiation.
     for compression in [GrpcCompression::None, GrpcCompression::Gzip] {
         let mut client = get_cloud_or_local_client(compression).await;
         let namespace = client.namespace();
-        client
+        let resp = client
             .list_workflow_executions(
                 ListWorkflowExecutionsRequest {
                     namespace,
@@ -62,7 +89,130 @@ pub(crate) async fn grpc_compression_roundtrip() {
             .unwrap_or_else(|e| {
                 panic!("list_workflow_executions failed with {compression:?}: {e}")
             });
+        let server_encoding = resp
+            .metadata()
+            .get("grpc-encoding")
+            .map(|v| v.to_str().unwrap().to_owned());
+        match compression {
+            GrpcCompression::Gzip => assert_eq!(
+                server_encoding.as_deref(),
+                Some("gzip"),
+                "server must gzip-compress the response when compression is enabled, proving \
+                 compression was actually negotiated and not ignored"
+            ),
+            GrpcCompression::None => assert_eq!(
+                server_encoding, None,
+                "server must not compress the response when compression is disabled"
+            ),
+            _ => unreachable!("only None and Gzip are iterated"),
+        }
     }
+
+    // Part 2: wire-level proof the request body is really gzip.
+    let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+    let (header_tx, mut header_rx) = mpsc::unbounded_channel::<String>();
+    let (body_tx, mut body_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server_handle = tokio::spawn(async move {
+        Server::builder()
+            .add_service(GenericService {
+                header_to_parse: "grpc-encoding",
+                header_tx,
+                response_maker: move |req: Request<Body>| {
+                    let body_tx = body_tx.clone();
+                    async move {
+                        let body = req.into_body().collect().await.unwrap().to_bytes().to_vec();
+                        let _ = body_tx.send(body);
+                        Response::new(Body::empty())
+                    }
+                    .boxed()
+                },
+            })
+            .serve_with_incoming_shutdown(
+                tokio_stream::wrappers::TcpListenerStream::new(listener),
+                async {
+                    shutdown_rx.await.ok();
+                },
+            )
+            .await
+            .unwrap();
+    });
+
+    // A sizable, highly compressible field so compression is unambiguous and clearly shrinks the
+    // payload.
+    let big_namespace = "compressible-namespace-".repeat(512);
+
+    let mut frames = Vec::new();
+    for (compression, expected_encoding) in
+        [(GrpcCompression::None, ""), (GrpcCompression::Gzip, "gzip")]
+    {
+        let mut opts =
+            ConnectionOptions::new(format!("http://{addr}").parse::<url::Url>().unwrap()).build();
+        opts.set_skip_get_system_info(true);
+        opts.retry_options = RetryOptions::no_retries();
+        opts.grpc_compression = compression;
+        let connection = Connection::connect(opts).await.unwrap();
+        let mut client = Client::new(connection, ClientOptions::new(NAMESPACE).build()).unwrap();
+
+        let _ = client
+            .describe_namespace(
+                DescribeNamespaceRequest {
+                    namespace: big_namespace.clone(),
+                    ..Default::default()
+                }
+                .into_request(),
+            )
+            .await;
+
+        assert_eq!(
+            header_rx.recv().await.unwrap(),
+            expected_encoding,
+            "unexpected grpc-encoding header for {compression:?}"
+        );
+        frames.push(body_rx.recv().await.unwrap());
+    }
+
+    shutdown_tx.send(()).unwrap();
+    server_handle.await.unwrap();
+
+    // gRPC message frame: [compressed-flag: u8][length: u32 BE][message].
+    let none_frame = &frames[0];
+    let gzip_frame = &frames[1];
+    assert_eq!(
+        none_frame[0], 0,
+        "uncompressed request frame must have compression flag 0"
+    );
+    assert_eq!(
+        gzip_frame[0], 1,
+        "gzip request frame must have compression flag 1"
+    );
+
+    let none_msg = &none_frame[5..];
+    let gzip_msg = &gzip_frame[5..];
+    assert_eq!(
+        &gzip_msg[..2],
+        &[0x1f, 0x8b],
+        "compressed payload must begin with gzip magic bytes"
+    );
+    assert!(
+        gzip_msg.len() < none_msg.len(),
+        "gzip payload ({} bytes) should be smaller than uncompressed ({} bytes)",
+        gzip_msg.len(),
+        none_msg.len()
+    );
+
+    let mut decompressed = Vec::new();
+    std::io::Read::read_to_end(
+        &mut flate2::read::GzDecoder::new(gzip_msg),
+        &mut decompressed,
+    )
+    .unwrap();
+    assert_eq!(
+        decompressed, none_msg,
+        "gzip payload must decompress to the exact protobuf bytes of the uncompressed request"
+    );
 }
 
 #[workflow]
