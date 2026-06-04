@@ -5,16 +5,17 @@ use temporalio_common::{
     protos::{
         coresdk::AsJsonPayloadExt,
         temporal::api::{
-            command::v1::command::Attributes,
-            common::v1::SearchAttributes,
-            enums::v1::{CommandType, ContinueAsNewVersioningBehavior},
+            command::v1::command::Attributes, common::v1::SearchAttributes, enums::v1::CommandType,
             history::v1::history_event,
         },
     },
     worker::WorkerTaskTypes,
 };
 use temporalio_macros::{workflow, workflow_methods};
-use temporalio_sdk::{ContinueAsNewOptions, WorkflowContext, WorkflowResult, WorkflowTermination};
+use temporalio_sdk::{
+    ContinueAsNewOptions, ContinueAsNewVersioningBehavior, WorkflowContext, WorkflowResult,
+    WorkflowTermination,
+};
 use temporalio_sdk_core::{
     TunerHolder,
     replay::{DEFAULT_WORKFLOW_TYPE, canned_histories},
@@ -139,9 +140,11 @@ impl ContinueAsNewSuggestedWf {
     async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<()> {
         // First WFT: flag should be false
         assert!(!ctx.continue_as_new_suggested());
+        assert!(!ctx.target_worker_deployment_version_changed());
         ctx.timer(Duration::from_millis(500)).await;
         // Second WFT: flag should be true (set on WFT started event 8)
         assert!(ctx.continue_as_new_suggested());
+        assert!(ctx.target_worker_deployment_version_changed());
         ctx.continue_as_new(&(), ContinueAsNewOptions::default())?;
         Ok(())
     }
@@ -156,6 +159,7 @@ async fn continue_as_new_suggested_flag_exposed() {
             he.attributes
         {
             attrs.suggest_continue_as_new = true;
+            attrs.target_worker_deployment_version_changed = true;
         }
     });
 

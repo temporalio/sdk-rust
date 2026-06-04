@@ -518,6 +518,12 @@ pub struct ContinueAsNewOptions {
     pub retry_policy: Option<RetryPolicy>,
     /// Whether the new workflow should run on a worker with a compatible build id.
     pub versioning_intent: Option<VersioningIntent>,
+    /// Versioning behavior to use for the first workflow task of the new run.
+    ///
+    /// This experimental option is only meaningful for workers using worker deployment
+    /// versioning. `AutoUpgrade` routes the new run to the current deployment version;
+    /// `UseRampingVersion` routes it to the ramping deployment version when one is configured.
+    pub initial_versioning_behavior: Option<ContinueAsNewVersioningBehavior>,
 }
 
 impl ContinueAsNewOptions {
@@ -544,7 +550,10 @@ impl ContinueAsNewOptions {
                 .versioning_intent
                 .unwrap_or(VersioningIntent::Unspecified)
                 .into(),
-            initial_versioning_behavior: ContinueAsNewVersioningBehavior::Unspecified.into(),
+            initial_versioning_behavior: self
+                .initial_versioning_behavior
+                .unwrap_or(ContinueAsNewVersioningBehavior::Unspecified)
+                .into(),
         }
     }
 }

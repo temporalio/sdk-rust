@@ -87,6 +87,7 @@ pub use crate::error::{
     OutgoingWorkflowError, WorkflowRegistrationError,
 };
 pub use temporalio_client::Namespace;
+pub use temporalio_common::protos::temporal::api::enums::v1::ContinueAsNewVersioningBehavior;
 pub use temporalio_workflow::{
     ActivityCloseTimeouts, ActivityOptions, BaseWorkflowContext, CancellableFuture,
     ChildWorkflowOptions, ContinueAsNewOptions, ExternalWorkflowHandle, LocalActivityOptions,
