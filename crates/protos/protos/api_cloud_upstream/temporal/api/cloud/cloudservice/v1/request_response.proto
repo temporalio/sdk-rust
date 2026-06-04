@@ -1168,3 +1168,54 @@ message DeleteCustomRoleResponse {
     // The async operation.
     temporal.api.cloud.operation.v1.AsyncOperation async_operation = 1;
 }
+
+message GetUserNamespaceAssignmentsRequest {
+    // The namespace to get users for.
+    string namespace = 1;
+    // The requested size of the page to retrieve - optional.
+    // Cannot exceed 1000. Defaults to 100.
+    int32 page_size = 2;
+    // The page token if this is continuing from another response - optional.
+    string page_token = 3;
+}
+
+message GetUserNamespaceAssignmentsResponse {
+    // The list of users with access to the namespace.
+    repeated temporal.api.cloud.identity.v1.UserNamespaceAssignment users = 1;
+    // The next page's token.
+    string next_page_token = 2;
+}
+
+message GetServiceAccountNamespaceAssignmentsRequest {
+    // The namespace to get service accounts for.
+    string namespace = 1;
+    // The requested size of the page to retrieve - optional.
+    // Cannot exceed 1000. Defaults to 100.
+    int32 page_size = 2;
+    // The page token if this is continuing from another response - optional.
+    string page_token = 3;
+}
+
+message GetServiceAccountNamespaceAssignmentsResponse {
+    // The list of service accounts with access to the namespace.
+    repeated temporal.api.cloud.identity.v1.ServiceAccountNamespaceAssignment service_accounts = 1;
+    // The next page's token.
+    string next_page_token = 2;
+}
+
+message GetUserGroupNamespaceAssignmentsRequest {
+    // The namespace to get user groups for.
+    string namespace = 1;
+    // The requested size of the page to retrieve - optional.
+    // Cannot exceed 1000. Defaults to 100.
+    int32 page_size = 2;
+    // The page token if this is continuing from another response - optional.
+    string page_token = 3;
+}
+
+message GetUserGroupNamespaceAssignmentsResponse {
+    // The list of user groups with access to the namespace.
+    repeated temporal.api.cloud.identity.v1.UserGroupNamespaceAssignment groups = 1;
+    // The next page's token.
+    string next_page_token = 2;
+}

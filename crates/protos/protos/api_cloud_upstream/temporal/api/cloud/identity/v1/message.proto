@@ -347,3 +347,42 @@ message CustomRole {
     // Will not be set if the custom role has never been modified.
     google.protobuf.Timestamp last_modified_time = 7;
 }
+
+message UserNamespaceAssignment {
+    // The ID of the user.
+    string id = 1;
+    // The email of the user.
+    string email = 2;
+    // The access assigned to the user at the namespace level.
+    NamespaceAccess namespace_access = 3;
+    // True if the user has inherited access to the namespace through an account or project role.
+    bool inherited_access = 4;
+    // The current resource version of the user.
+    string resource_version = 5;
+}
+
+message ServiceAccountNamespaceAssignment {
+    // The ID of the service account.
+    string id = 1;
+    // The name of the service account.
+    string name = 2;
+    // The access assigned to the service account at the namespace level.
+    NamespaceAccess namespace_access = 3;
+    // True if the service account has inherited access to the namespace through an account or project role.
+    bool inherited_access = 4;
+    // The current resource version of the service account.
+    string resource_version = 5;
+}
+
+message UserGroupNamespaceAssignment {
+    // The ID of the group.
+    string id = 1;
+    // The display name of the group.
+    string display_name = 2;
+    // The access assigned to the group at the namespace level.
+    NamespaceAccess namespace_access = 3;
+    // True if the group has inherited access to the namespace through an account or project role.
+    bool inherited_access = 4;
+    // The current resource version of the group.
+    string resource_version = 5;
+}

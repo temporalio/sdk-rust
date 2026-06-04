@@ -1289,6 +1289,25 @@ async fn call_cloud_service(
         "DeleteCustomRole" => {
             rpc_call_on_trait!(client, call, CloudService, delete_custom_role)
         }
+        "GetUserNamespaceAssignments" => {
+            rpc_call_on_trait!(client, call, CloudService, get_user_namespace_assignments)
+        }
+        "GetServiceAccountNamespaceAssignments" => {
+            rpc_call_on_trait!(
+                client,
+                call,
+                CloudService,
+                get_service_account_namespace_assignments
+            )
+        }
+        "GetUserGroupNamespaceAssignments" => {
+            rpc_call_on_trait!(
+                client,
+                call,
+                CloudService,
+                get_user_group_namespace_assignments
+            )
+        }
         rpc => Err(anyhow::anyhow!("Unknown RPC call {rpc}")),
     }
 }
