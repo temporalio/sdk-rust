@@ -122,6 +122,7 @@ where
 
 /// Categorizes an [`ApplicationFailure`] to hint at how the server and tooling should treat it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[non_exhaustive]
 pub enum ApplicationErrorCategory {
     /// No category was specified.
     #[default]
