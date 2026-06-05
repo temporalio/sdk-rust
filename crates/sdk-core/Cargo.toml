@@ -59,7 +59,7 @@ itertools = "0.14"
 lru = "0.18"
 mockall = "0.14"
 opentelemetry = { workspace = true, features = ["metrics"], optional = true }
-opentelemetry_sdk = { version = "0.31", default-features = false, features = [
+opentelemetry_sdk = { version = "0.32", default-features = false, features = [
   "rt-tokio",
   "metrics",
   "spec_unstable_metrics_views",

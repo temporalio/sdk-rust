@@ -47,7 +47,7 @@ hyper-util = { version = "0.1", features = [
   "tokio",
 ], optional = true }
 opentelemetry = { workspace = true, features = ["metrics"], optional = true }
-opentelemetry_sdk = { version = "0.31", default-features = false, features = [
+opentelemetry_sdk = { version = "0.32", default-features = false, features = [
   "rt-tokio",
   "metrics",
   "spec_unstable_metrics_views",
