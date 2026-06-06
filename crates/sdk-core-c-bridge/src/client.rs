@@ -56,7 +56,6 @@ pub struct ConnectionOptions {
     pub grpc_compression: ClientGrpcCompression,
 }
 
-/// cbindgen:prefix-with-name=true
 #[derive(Clone, Copy)]
 #[repr(C)]
 pub enum ClientGrpcCompression {
