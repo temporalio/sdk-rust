@@ -153,7 +153,9 @@ async fn async_activity_completions(
         }
     }
 
-    worker.register_workflow::<AsyncCompletionWorkflow>();
+    worker
+        .register_workflow::<AsyncCompletionWorkflow>()
+        .unwrap();
 
     let completion_task = tokio::spawn(async move {
         let info = info_rx.recv().await.expect("should receive activity info");

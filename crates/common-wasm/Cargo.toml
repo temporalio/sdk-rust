@@ -1,0 +1,52 @@
+[package]
+name = "temporalio-common-wasm"
+version = "0.4.0"
+edition = "2024"
+authors = ["Temporal Technologies Inc. <sdk@temporal.io>"]
+license-file = { workspace = true }
+description = "WASM-safe shared functionality for the Temporal Rust workflow surface"
+homepage = "https://temporal.io/"
+repository = "https://github.com/temporalio/sdk-core"
+keywords = ["temporal", "workflow"]
+categories = ["development-tools"]
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[features]
+serde_serialize = ["temporalio-protos/serde_serialize"]
+grpc-clients = ["temporalio-protos/grpc-clients"]
+
+[dependencies]
+anyhow = "1.0"
+async-trait = "0.1"
+bon = { workspace = true }
+crc32fast = "1"
+derive_more = { workspace = true }
+erased-serde = "0.4"
+futures = { version = "0.3", default-features = false, features = ["alloc"] }
+parking_lot = { version = "0.12" }
+prost = { workspace = true }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", default-features = false, features = [
+  "parking_lot",
+  "env-filter",
+  "registry",
+  "ansi",
+] }
+tracing-core = "0.1"
+url = "2.5"
+[dependencies.temporalio-protos]
+path = "../protos"
+version = "0.4"
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+futures-util = { version = "0.3", default-features = false }
+rstest = "0.26"
+tempfile = "3.21"
+tokio = { version = "1.47", features = ["macros", "rt"] }

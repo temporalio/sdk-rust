@@ -29,6 +29,11 @@ async fn grpc_message_too_large_test() {
 }
 
 #[tokio::test]
+async fn grpc_compression() {
+    shared_tests::grpc_compression().await
+}
+
+#[tokio::test]
 async fn priority_values_sent_to_server() {
     shared_tests::priority::priority_values_sent_to_server().await
 }
@@ -36,4 +41,9 @@ async fn priority_values_sent_to_server() {
 #[tokio::test]
 async fn shutdown_during_active_timer_activity_workflows() {
     shared_tests::shutdown_during_active_timer_activity_workflows().await
+}
+
+#[tokio::test]
+async fn activity_cancel_delivered_without_heartbeat() {
+    shared_tests::activity_cancel_delivered_without_heartbeat().await
 }

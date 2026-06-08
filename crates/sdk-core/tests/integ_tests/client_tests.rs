@@ -320,6 +320,11 @@ async fn namespace_header_attached_to_relevant_calls() {
 }
 
 #[tokio::test]
+async fn grpc_compression() {
+    crate::shared_tests::grpc_compression().await
+}
+
+#[tokio::test]
 async fn cloud_ops_test() {
     let api_key = match env::var("TEMPORAL_CLIENT_CLOUD_API_KEY") {
         Ok(k) => k,

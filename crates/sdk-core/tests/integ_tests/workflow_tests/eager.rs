@@ -35,7 +35,7 @@ async fn eager_wf_start() {
     // hang the test if eager task dispatch failed
     starter.workflow_options.task_timeout = Some(Duration::from_secs(1500));
     let mut worker = starter.worker().await;
-    worker.register_workflow::<EagerWf>();
+    worker.register_workflow::<EagerWf>().unwrap();
     let task_queue = starter.get_task_queue().to_string();
     let res = eager_start(
         wf_name,
@@ -60,7 +60,7 @@ async fn eager_wf_start_different_clients() {
     // hang the test if wf task needs retry
     starter.workflow_options.task_timeout = Some(Duration::from_secs(1500));
     let mut worker = starter.worker().await;
-    worker.register_workflow::<EagerWf>();
+    worker.register_workflow::<EagerWf>().unwrap();
 
     let connection = get_integ_connection(None).await;
     let client_opts = temporalio_client::ClientOptions::new(NAMESPACE).build();

@@ -1588,6 +1588,42 @@ proxier! {
         }
     );
     (
+        pause_activity_execution,
+        PauseActivityExecutionRequest,
+        PauseActivityExecutionResponse,
+        |r| {
+            let labels = namespaced_request!(r);
+            r.extensions_mut().insert(labels);
+        }
+    );
+    (
+        unpause_activity_execution,
+        UnpauseActivityExecutionRequest,
+        UnpauseActivityExecutionResponse,
+        |r| {
+            let labels = namespaced_request!(r);
+            r.extensions_mut().insert(labels);
+        }
+    );
+    (
+        reset_activity_execution,
+        ResetActivityExecutionRequest,
+        ResetActivityExecutionResponse,
+        |r| {
+            let labels = namespaced_request!(r);
+            r.extensions_mut().insert(labels);
+        }
+    );
+    (
+        update_activity_execution_options,
+        UpdateActivityExecutionOptionsRequest,
+        UpdateActivityExecutionOptionsResponse,
+        |r| {
+            let labels = namespaced_request!(r);
+            r.extensions_mut().insert(labels);
+        }
+    );
+    (
         count_nexus_operation_executions,
         CountNexusOperationExecutionsRequest,
         CountNexusOperationExecutionsResponse,
@@ -1808,6 +1844,9 @@ proxier! {
     (create_custom_role, cloudreq::CreateCustomRoleRequest, cloudreq::CreateCustomRoleResponse);
     (update_custom_role, cloudreq::UpdateCustomRoleRequest, cloudreq::UpdateCustomRoleResponse);
     (delete_custom_role, cloudreq::DeleteCustomRoleRequest, cloudreq::DeleteCustomRoleResponse);
+    (get_user_namespace_assignments, cloudreq::GetUserNamespaceAssignmentsRequest, cloudreq::GetUserNamespaceAssignmentsResponse);
+    (get_service_account_namespace_assignments, cloudreq::GetServiceAccountNamespaceAssignmentsRequest, cloudreq::GetServiceAccountNamespaceAssignmentsResponse);
+    (get_user_group_namespace_assignments, cloudreq::GetUserGroupNamespaceAssignmentsRequest, cloudreq::GetUserGroupNamespaceAssignmentsResponse);
 }
 
 proxier! {
@@ -1932,7 +1971,7 @@ mod tests {
     fn verify_all_workflow_service_methods_implemented() {
         // This is less work than trying to hook into the codegen process
         let proto_def = include_str!(
-            "../../common/protos/api_upstream/temporal/api/workflowservice/v1/service.proto"
+            "../../protos/protos/api_upstream/temporal/api/workflowservice/v1/service.proto"
         );
         verify_methods(proto_def, ALL_IMPLEMENTED_WORKFLOW_SERVICE_RPCS);
     }
@@ -1940,7 +1979,7 @@ mod tests {
     #[test]
     fn verify_all_operator_service_methods_implemented() {
         let proto_def = include_str!(
-            "../../common/protos/api_upstream/temporal/api/operatorservice/v1/service.proto"
+            "../../protos/protos/api_upstream/temporal/api/operatorservice/v1/service.proto"
         );
         verify_methods(proto_def, ALL_IMPLEMENTED_OPERATOR_SERVICE_RPCS);
     }
@@ -1948,7 +1987,7 @@ mod tests {
     #[test]
     fn verify_all_cloud_service_methods_implemented() {
         let proto_def = include_str!(
-            "../../common/protos/api_cloud_upstream/temporal/api/cloud/cloudservice/v1/service.proto"
+            "../../protos/protos/api_cloud_upstream/temporal/api/cloud/cloudservice/v1/service.proto"
         );
         verify_methods(proto_def, ALL_IMPLEMENTED_CLOUD_SERVICE_RPCS);
     }
@@ -1956,14 +1995,14 @@ mod tests {
     #[test]
     fn verify_all_test_service_methods_implemented() {
         let proto_def = include_str!(
-            "../../common/protos/testsrv_upstream/temporal/api/testservice/v1/service.proto"
+            "../../protos/protos/testsrv_upstream/temporal/api/testservice/v1/service.proto"
         );
         verify_methods(proto_def, ALL_IMPLEMENTED_TEST_SERVICE_RPCS);
     }
 
     #[test]
     fn verify_all_health_service_methods_implemented() {
-        let proto_def = include_str!("../../common/protos/grpc/health/v1/health.proto");
+        let proto_def = include_str!("../../protos/protos/grpc/health/v1/health.proto");
         verify_methods(proto_def, ALL_IMPLEMENTED_HEALTH_SERVICE_RPCS);
     }
 

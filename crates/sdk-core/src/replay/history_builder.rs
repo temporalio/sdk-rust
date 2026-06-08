@@ -519,6 +519,7 @@ impl TestHistoryBuilder {
                     name: update_name.into(),
                     args: None,
                 }),
+                ..Default::default()
             }),
             protocol_instance_id,
         };

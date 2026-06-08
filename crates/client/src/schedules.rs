@@ -1550,6 +1550,7 @@ mod tests {
                     seconds: 1_700_000_000,
                     nanos: 0,
                 }],
+                state_size_bytes: 0,
             }),
         };
 

@@ -11,8 +11,11 @@ use std::{
     sync::Arc,
 };
 use temporalio_common::{
-    protos::temporal::api::{
-        worker::v1::WorkerHeartbeat, workflowservice::v1::PollWorkflowTaskQueueResponse,
+    protos::{
+        TaskToken,
+        temporal::api::{
+            worker::v1::WorkerHeartbeat, workflowservice::v1::PollWorkflowTaskQueueResponse,
+        },
     },
     worker::{WorkerDeploymentOptions, WorkerTaskTypes},
 };
@@ -194,7 +197,13 @@ impl ClientWorkerSetImpl {
                     v.insert(shared_worker)
                 }
             };
-            shared_worker.register_callback(worker_instance_key, heartbeat_callback);
+            shared_worker.register_callback(
+                worker_instance_key,
+                WorkerCallbacks {
+                    heartbeat: heartbeat_callback,
+                    cancel_activity: worker.cancel_activity_callback(),
+                },
+            );
         }
 
         let worker_info =
@@ -283,13 +292,13 @@ pub trait SharedNamespaceWorkerTrait {
     /// Namespace that the shared namespace worker is connected to.
     fn namespace(&self) -> String;
 
-    /// Registers a heartbeat callback.
-    fn register_callback(&self, worker_instance_key: Uuid, heartbeat_callback: HeartbeatCallback);
+    /// Registers worker callbacks.
+    fn register_callback(&self, worker_instance_key: Uuid, callbacks: WorkerCallbacks);
 
-    /// Unregisters a heartbeat callback. Returns the callback removed, as well as a bool that
+    /// Unregisters worker callbacks. Returns the callbacks removed, as well as a bool that
     /// indicates if there are no remaining callbacks in the SharedNamespaceWorker, indicating
     /// the shared worker itself can be shut down.
-    fn unregister_callback(&self, worker_instance_key: Uuid) -> (Option<HeartbeatCallback>, bool);
+    fn unregister_callback(&self, worker_instance_key: Uuid) -> (Option<WorkerCallbacks>, bool);
 
     /// Returns the number of workers registered to this shared worker.
     fn num_workers(&self) -> usize;
@@ -393,6 +402,17 @@ impl std::fmt::Debug for ClientWorkerSet {
 /// Contains a worker heartbeat callback, wrapped for mocking
 pub type HeartbeatCallback = Arc<dyn Fn() -> WorkerHeartbeat + Send + Sync>;
 
+/// Callback to cancel an activity by task token. Returns true if the activity was found.
+pub type CancelActivityCallback = Arc<dyn Fn(TaskToken) -> bool + Send + Sync>;
+
+/// Bundles all per-worker callbacks registered with the SharedNamespaceWorker.
+pub struct WorkerCallbacks {
+    /// Callback to collect heartbeat data from the worker.
+    pub heartbeat: HeartbeatCallback,
+    /// Callback to cancel an activity by task token.
+    pub cancel_activity: Option<CancelActivityCallback>,
+}
+
 /// Represents a complete worker that can handle both slot management
 /// and worker heartbeat functionality.
 #[cfg_attr(test, mockall::automock)]
@@ -422,6 +442,9 @@ pub trait ClientWorker: Send + Sync {
 
     /// Returns the heartbeat callback that can be used to get WorkerHeartbeat data.
     fn heartbeat_callback(&self) -> Option<HeartbeatCallback>;
+
+    /// Returns a callback that can cancel an activity by task token.
+    fn cancel_activity_callback(&self) -> Option<CancelActivityCallback>;
 
     /// Creates a new worker that implements the [SharedNamespaceWorkerTrait]
     fn new_shared_namespace_worker(
@@ -713,7 +736,7 @@ mod tests {
 
     struct MockSharedNamespaceWorker {
         namespace: String,
-        callbacks: Arc<RwLock<HashMap<Uuid, HeartbeatCallback>>>,
+        callbacks: Arc<RwLock<HashMap<Uuid, WorkerCallbacks>>>,
     }
 
     impl std::fmt::Debug for MockSharedNamespaceWorker {
@@ -739,20 +762,16 @@ mod tests {
             self.namespace.clone()
         }
 
-        fn register_callback(
-            &self,
-            worker_instance_key: Uuid,
-            heartbeat_callback: HeartbeatCallback,
-        ) {
+        fn register_callback(&self, worker_instance_key: Uuid, callbacks: WorkerCallbacks) {
             self.callbacks
                 .write()
-                .insert(worker_instance_key, heartbeat_callback);
+                .insert(worker_instance_key, callbacks);
         }
 
         fn unregister_callback(
             &self,
             worker_instance_key: Uuid,
-        ) -> (Option<HeartbeatCallback>, bool) {
+        ) -> (Option<WorkerCallbacks>, bool) {
             let mut callbacks = self.callbacks.write();
             let callback = callbacks.remove(&worker_instance_key);
             let is_empty = callbacks.is_empty();
@@ -805,6 +824,9 @@ mod tests {
             mock_provider
                 .expect_heartbeat_callback()
                 .returning(|| Some(Arc::new(WorkerHeartbeat::default)));
+            mock_provider
+                .expect_cancel_activity_callback()
+                .returning(|| None);
 
             let namespace_clone = namespace.clone();
             mock_provider

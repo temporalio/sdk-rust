@@ -1,6 +1,6 @@
 use crate::{HttpConnectProxyOptions, RetryOptions, VERSION, callback_based};
 use http::Uri;
-use std::{collections::HashMap, time::Duration};
+use std::{collections::HashMap, sync::Arc, time::Duration};
 use temporalio_common::{
     data_converters::DataConverter,
     protos::temporal::api::{
@@ -17,6 +17,7 @@ use temporalio_common::{
     },
     telemetry::metrics::TemporalMeter,
 };
+use tokio_rustls::rustls::client::danger::ServerCertVerifier;
 use url::Url;
 
 /// Options for [crate::Connection::connect].
@@ -77,6 +78,12 @@ pub struct ConnectionOptions {
     pub disable_error_code_metric_tags: bool,
     /// If set, all gRPC calls will be routed through the provided service.
     pub service_override: Option<callback_based::CallbackBasedGrpcService>,
+    /// Controls transport-level gRPC compression for the client. Defaults to
+    /// [GrpcCompression::Gzip], which compresses outbound request bodies and accepts
+    /// compressed responses. Set to [GrpcCompression::None] to opt out.
+    /// If service_override is specified, is forced to `None`.
+    #[builder(default)]
+    pub grpc_compression: GrpcCompression,
 
     // Internal / Core-based SDK only options below =============================================
     /// If set true, get_system_info will not be called upon connection.
@@ -131,8 +138,20 @@ pub struct ClientOptions {
     pub data_converter: DataConverter,
 }
 
+/// Selects the transport-level compression used for gRPC calls. See
+/// [ConnectionOptions::grpc_compression].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub enum GrpcCompression {
+    /// Do not compress requests or advertise acceptance of compressed responses.
+    None,
+    /// Gzip-compress outbound requests and accept gzip-compressed responses.
+    #[default]
+    Gzip,
+}
+
 /// Configuration options for TLS
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Default)]
 pub struct TlsOptions {
     /// Bytes representing the root CA certificate used by the server. If not set, and the server's
     /// cert is issued by someone the operating system trusts, verification will still work (ex:
@@ -143,6 +162,43 @@ pub struct TlsOptions {
     pub domain: Option<String>,
     /// TLS info for the client. If specified, core will attempt to use mTLS.
     pub client_tls_options: Option<ClientTlsOptions>,
+    /// Optional custom server certificate verifier. When set, this replaces the default
+    /// certificate verification and `server_root_ca_cert` is ignored.
+    ///
+    /// This is useful for:
+    /// - Certificate pinning
+    /// - Custom trust-domain validation (e.g., SAN-URI extraction)
+    /// - Federated root certificate stores
+    ///
+    /// # WARNING
+    /// Implementing a custom `ServerCertVerifier` can lead to severely insecure TLS connections
+    /// (e.g., disabling all validation or allowing man-in-the-middle attacks) if not done carefully.
+    /// Only use this if you know exactly what you are doing.
+    ///
+    /// The verifier must implement [`ServerCertVerifier`] from the `rustls` crate.
+    /// Note that `domain` is still respected for the `:authority` header / origin override
+    /// even when a custom verifier is set.
+    pub server_cert_verifier: Option<Arc<dyn ServerCertVerifier>>,
+}
+
+impl std::fmt::Debug for TlsOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TlsOptions")
+            .field(
+                "server_root_ca_cert",
+                &self
+                    .server_root_ca_cert
+                    .as_ref()
+                    .map(|c| format!("{} bytes", c.len())),
+            )
+            .field("domain", &self.domain)
+            .field("client_tls_options", &self.client_tls_options)
+            .field(
+                "server_cert_verifier",
+                &self.server_cert_verifier.as_ref().map(|_| "<custom>"),
+            )
+            .finish()
+    }
 }
 
 /// If using mTLS, both the client cert and private key must be specified, this contains them.

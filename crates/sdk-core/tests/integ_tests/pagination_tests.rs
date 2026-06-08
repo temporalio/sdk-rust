@@ -125,10 +125,12 @@ async fn weird_pagination_doesnt_drop_wft_events() {
 
     let sig_ctr = Arc::new(AtomicUsize::new(0));
     let sig_ctr_clone = sig_ctr.clone();
-    worker.register_workflow_with_factory(move || WeirdPaginationWf {
-        sig_ctr: sig_ctr_clone.clone(),
-        signal_count: 0,
-    });
+    worker
+        .register_workflow_with_factory(move || WeirdPaginationWf {
+            sig_ctr: sig_ctr_clone.clone(),
+            signal_count: 0,
+        })
+        .unwrap();
 
     worker.run_until_done().await.unwrap();
     assert_eq!(sig_ctr.load(Ordering::Acquire), 2);
@@ -268,10 +270,12 @@ async fn extreme_pagination_doesnt_drop_wft_events_worker() {
 
     let sig_ctr = Arc::new(AtomicUsize::new(0));
     let sig_ctr_clone = sig_ctr.clone();
-    worker.register_workflow_with_factory(move || ExtremePaginationWf {
-        sig_ctr: sig_ctr_clone.clone(),
-        signal_count: 0,
-    });
+    worker
+        .register_workflow_with_factory(move || ExtremePaginationWf {
+            sig_ctr: sig_ctr_clone.clone(),
+            signal_count: 0,
+        })
+        .unwrap();
 
     worker.run_until_done().await.unwrap();
     assert_eq!(sig_ctr.load(Ordering::Acquire), 6);

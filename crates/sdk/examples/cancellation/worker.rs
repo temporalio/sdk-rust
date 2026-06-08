@@ -21,7 +21,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let client = Client::new(connection, client_opts)?;
 
     let worker_options = WorkerOptions::new("cancellation")
-        .register_workflow::<CancellationWorkflow>()
+        .register_workflow::<CancellationWorkflow>()?
         .register_activities(CancellationActivities)
         .build();
 

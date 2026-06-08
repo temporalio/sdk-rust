@@ -12,8 +12,7 @@ mod workflow_definitions;
 /// For a usage example, see that crate's documentation.
 #[proc_macro_attribute]
 pub fn activities(_attr: TokenStream, item: TokenStream) -> TokenStream {
-    let def: activities_definitions::ActivitiesDefinition =
-        parse_macro_input!(item as activities_definitions::ActivitiesDefinition);
+    let def = parse_macro_input!(item with activities_definitions::parse_activities);
     def.codegen()
 }
 
@@ -22,6 +21,17 @@ pub fn activities(_attr: TokenStream, item: TokenStream) -> TokenStream {
 #[proc_macro_attribute]
 pub fn activity(_attr: TokenStream, item: TokenStream) -> TokenStream {
     item
+}
+
+/// Declares activities without providing implementations. Each method must omit the
+/// `ActivityContext` parameter and have a body of exactly `unimplemented!()`.
+///
+/// Intended for workflow crates that need typed activity declarations which are implemented
+/// elsewhere by a separate worker crate (or in another language).
+#[proc_macro_attribute]
+pub fn activity_definitions(_attr: TokenStream, item: TokenStream) -> TokenStream {
+    let def = parse_macro_input!(item with activities_definitions::parse_definitions);
+    def.codegen()
 }
 
 /// Marks a struct as a workflow definition.

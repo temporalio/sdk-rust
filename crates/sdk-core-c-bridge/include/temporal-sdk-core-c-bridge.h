@@ -5,6 +5,11 @@
 #include <stdint.h>
 #include <stdlib.h>
 
+typedef enum TemporalCoreClientGrpcCompression {
+  TemporalCoreClientGrpcCompression_Gzip = 0,
+  TemporalCoreClientGrpcCompression_None = 1,
+} TemporalCoreClientGrpcCompression;
+
 typedef enum TemporalCoreRpcService {
   Workflow = 1,
   Operator,
@@ -186,6 +191,12 @@ typedef struct TemporalCoreConnectionOptions {
    * http_connect_proxy_options is also set.
    */
   const struct TemporalCoreClientDnsLoadBalancingOptions *dns_load_balancing_options;
+  /**
+   * Selects transport-level gRPC compression. The zero value enables gzip, which is the
+   * default. Ignored when grpc_override_callback is set, since that transport cannot decode
+   * compressed request bodies.
+   */
+  enum TemporalCoreClientGrpcCompression grpc_compression;
 } TemporalCoreConnectionOptions;
 
 typedef struct TemporalCoreByteArray {

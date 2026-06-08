@@ -218,7 +218,9 @@ async fn activity_doesnt_heartbeat_hits_timeout_then_completes() {
     starter.sdk_config.register_activities(StdActivities);
     let mut worker = starter.worker().await;
 
-    worker.register_workflow::<ActivityDoesntHeartbeatHitsTimeoutThenCompletesWf>();
+    worker
+        .register_workflow::<ActivityDoesntHeartbeatHitsTimeoutThenCompletesWf>()
+        .unwrap();
 
     let task_queue = starter.get_task_queue().to_owned();
     let handle = worker

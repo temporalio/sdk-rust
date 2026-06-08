@@ -200,7 +200,9 @@ async fn resource_based_few_pollers_guarantees_non_sticky_poll() {
 
     // Workflow doesn't actually need to do anything. We just need to see that we don't get stuck
     // by assigning all slots to sticky pollers.
-    worker.register_workflow::<ResourceBasedNonStickyWf>();
+    worker
+        .register_workflow::<ResourceBasedNonStickyWf>()
+        .unwrap();
     let task_queue = starter.get_task_queue().to_owned();
     for i in 0..20 {
         worker
@@ -250,7 +252,8 @@ async fn oversize_grpc_message() {
 
     core.register_workflow_with_factory(move || OversizeGrpcMessageWf {
         has_run: has_run_clone.clone(),
-    });
+    })
+    .unwrap();
     starter
         .start_with_worker(OversizeGrpcMessageWf::name(), &mut core)
         .await;
@@ -269,10 +272,16 @@ async fn oversize_grpc_message() {
     let tq = starter.get_task_queue();
     crate::common::eventually(
         || async {
-            let body = crate::integ_tests::metrics_tests::get_text(format!("http://{addr}/metrics")).await;
-            if body.contains(&format!(
-                "temporal_workflow_task_execution_failed{{failure_reason=\"GrpcMessageTooLarge\",namespace=\"{NAMESPACE}\",service_name=\"temporal-core-sdk\",task_queue=\"{tq}\"}} 1"
-            )) {
+            let body =
+                crate::integ_tests::metrics_tests::get_text(format!("http://{addr}/metrics")).await;
+            if body.lines().any(|line| {
+                line.starts_with("temporal_workflow_task_execution_failed{")
+                    && line.contains("failure_reason=\"GrpcMessageTooLarge\"")
+                    && line.contains(&format!("namespace=\"{NAMESPACE}\""))
+                    && line.contains("service_name=\"temporal-core-sdk\"")
+                    && line.contains(&format!("task_queue=\"{tq}\""))
+                    && line.ends_with(" 1")
+            }) {
                 Ok(())
             } else {
                 Err(())
@@ -431,9 +440,11 @@ async fn activity_tasks_from_completion_reserve_slots() {
     }
 
     let wf_token = workflow_complete_token.clone();
-    worker.register_workflow_with_factory(move || ActivityTasksCompletionWf {
-        complete_token: wf_token.clone(),
-    });
+    worker
+        .register_workflow_with_factory(move || ActivityTasksCompletionWf {
+            complete_token: wf_token.clone(),
+        })
+        .unwrap();
 
     let act_completer = async {
         barr.wait().await;
@@ -501,7 +512,7 @@ async fn max_wft_respected() {
         }
     }
 
-    worker.register_workflow::<MaxWftWf>();
+    worker.register_workflow::<MaxWftWf>().unwrap();
     worker.run_until_done().await.unwrap();
 }
 
@@ -591,7 +602,7 @@ async fn history_length_with_fail_and_timeout(
         }
     }
 
-    worker.register_workflow::<HistoryLengthWf>();
+    worker.register_workflow::<HistoryLengthWf>().unwrap();
     worker.run_until_done().await.unwrap();
 }
 
@@ -661,7 +672,7 @@ async fn sets_build_id_from_wft_complete() {
         }
     }
 
-    worker.register_workflow::<BuildIdWf>();
+    worker.register_workflow::<BuildIdWf>().unwrap();
     worker.run_until_done().await.unwrap();
 }
 
@@ -804,7 +815,7 @@ async fn test_custom_slot_supplier_simple() {
         }
     }
 
-    worker.register_workflow::<SlotSupplierWorkflow>();
+    worker.register_workflow::<SlotSupplierWorkflow>().unwrap();
 
     let task_queue = starter.get_task_queue().to_owned();
     worker

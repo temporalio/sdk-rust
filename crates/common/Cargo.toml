@@ -9,7 +9,6 @@ homepage = "https://temporal.io/"
 repository = "https://github.com/temporalio/sdk-rust"
 keywords = ["temporal", "workflow"]
 categories = ["development-tools"]
-exclude = ["protos/*/.github/*"]
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
@@ -23,14 +22,13 @@ prometheus = [
   "dep:tokio",
 ]
 envconfig = ["dep:toml", "dep:dirs"]
-serde_serialize = []
+serde_serialize = ["temporalio-common-wasm/serde_serialize", "temporalio-protos/serde_serialize"]
 core-telemetry-bridge = ["dep:ringbuf", "dep:futures-channel"]
 core-based-sdk = ["core-telemetry-bridge", "prometheus", "envconfig"]
 
 [dependencies]
 anyhow = "1.0"
 async-trait = "0.1"
-base64 = "0.22"
 bon = { workspace = true }
 crc32fast = "1"
 dirs = { version = "6.0", optional = true }
@@ -65,9 +63,6 @@ opentelemetry-otlp = { version = "0.31", default-features = false, features = [
 ], optional = true }
 parking_lot = { version = "0.12" }
 prometheus = { version = "0.14", optional = true, default-features = false }
-prost = { workspace = true }
-prost-wkt = "0.7"
-prost-types = { workspace = true }
 ringbuf = { version = "0.5", optional = true }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = { workspace = true }
@@ -82,7 +77,6 @@ tonic = { workspace = true, default-features = false, features = [
   "transport",
   "codegen",
 ] }
-tonic-prost = { workspace = true }
 tracing = "0.1"
 # TODO [rust-sdk-branch]: Is it reasonable to make this optional?
 tracing-subscriber = { version = "0.3", default-features = false, features = [
@@ -94,13 +88,19 @@ tracing-subscriber = { version = "0.3", default-features = false, features = [
 tracing-core = "0.1"
 url = "2.5"
 uuid = { version = "1.18", default-features = false, features = ["v4"] }
-pbjson = { workspace = true }
+
+[dependencies.temporalio-protos]
+path = "../protos"
+version = "0.4"
+features = ["grpc-clients"]
+
+[dependencies.temporalio-common-wasm]
+path = "../common-wasm"
+version = "0.4"
 
 [build-dependencies]
 prost = { workspace = true }
 prost-types = "0.14"
-tonic-prost-build = { workspace = true }
-pbjson-build = { workspace = true }
 
 [lints]
 workspace = true

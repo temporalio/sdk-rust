@@ -63,7 +63,7 @@ fn fire_happy_hist(num_timers: u32) -> Worker {
     let mut t = canned_histories::long_sequential_timers(num_timers as usize);
     t.set_wf_input(num_timers.as_json_payload().unwrap());
     let mut worker = build_fake_sdk(MockPollCfg::from_resps(t, [ResponseType::AllHistory]));
-    worker.register_workflow::<TimersWf>();
+    worker.register_workflow::<TimersWf>().unwrap();
     worker
 }
 
@@ -90,7 +90,7 @@ async fn replay_flag_is_correct_partial_history() {
     let mut t = canned_histories::long_sequential_timers(2);
     t.set_wf_input(1u32.as_json_payload().unwrap());
     let mut worker = build_fake_sdk(MockPollCfg::from_resps(t, [1]));
-    worker.register_workflow::<TimersWf>();
+    worker.register_workflow::<TimersWf>().unwrap();
 
     let mut aai = ActivationAssertionsInterceptor::default();
     aai.then(|a| assert!(!a.is_replaying));
@@ -202,7 +202,7 @@ async fn replay_using_wf_function() {
     let mut t = canned_histories::long_sequential_timers(num_timers as usize);
     t.set_wf_input(num_timers.as_json_payload().unwrap());
     let mut worker = replay_sdk_worker([test_hist_to_replay(t)]);
-    worker.register_workflow::<TimersWf>();
+    worker.register_workflow::<TimersWf>().unwrap();
     worker.run().await.unwrap();
 }
 
@@ -219,14 +219,14 @@ async fn replay_ending_wft_complete_with_commands_but_no_scheduled_started() {
     }
     t.set_wf_input(3u32.as_json_payload().unwrap());
     let mut worker = replay_sdk_worker([test_hist_to_replay(t)]);
-    worker.register_workflow::<TimersWf>();
+    worker.register_workflow::<TimersWf>().unwrap();
     worker.run().await.unwrap();
 }
 
 async fn replay_abrupt_ending(mut t: TestHistoryBuilder) {
     t.set_wf_input(1u32.as_json_payload().unwrap());
     let mut worker = replay_sdk_worker([test_hist_to_replay(t)]);
-    worker.register_workflow::<TimersWf>();
+    worker.register_workflow::<TimersWf>().unwrap();
     worker.run().await.unwrap();
 }
 #[tokio::test]
@@ -247,7 +247,7 @@ async fn replay_shutdown_worker() {
     let mut t = canned_histories::single_timer("1");
     t.set_wf_input(1u32.as_json_payload().unwrap());
     let mut worker = replay_sdk_worker([test_hist_to_replay(t)]);
-    worker.register_workflow::<TimersWf>();
+    worker.register_workflow::<TimersWf>().unwrap();
     let shutdown_ctr_i = UniqueShutdownWorker::default();
     let shutdown_ctr = shutdown_ctr_i.runs.clone();
     worker.set_worker_interceptor(shutdown_ctr_i);
@@ -321,8 +321,8 @@ async fn multiple_histories_replay(#[values(false, true)] use_feeder: bool) {
     let runs_ctr_i = UniqueRunsCounter::default();
     let runs_ctr = runs_ctr_i.runs.clone();
     worker.set_worker_interceptor(runs_ctr_i);
-    worker.register_workflow::<OneTimerWf>();
-    worker.register_workflow::<SeqTimerWf>();
+    worker.register_workflow::<OneTimerWf>().unwrap();
+    worker.register_workflow::<SeqTimerWf>().unwrap();
 
     if use_feeder {
         let feed_fut = async move {
@@ -353,7 +353,7 @@ async fn multiple_histories_can_handle_dupe_run_ids() {
         test_hist_to_replay(hist1.clone()),
         test_hist_to_replay(hist1),
     ]);
-    worker.register_workflow::<OneTimerWf>();
+    worker.register_workflow::<OneTimerWf>().unwrap();
     worker.run().await.unwrap();
 }
 
@@ -366,7 +366,7 @@ async fn replay_old_patch_format() {
             .unwrap(),
         "fake".to_owned(),
     )]);
-    worker.register_workflow::<ChangesWf>();
+    worker.register_workflow::<ChangesWf>().unwrap();
     worker.run().await.unwrap();
 }
 

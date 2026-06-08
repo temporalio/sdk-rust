@@ -118,7 +118,7 @@ impl MetricsContext {
         instruments.update_attributes(tm.get_default_attributes());
         Self {
             instruments: Arc::new(instruments),
-            meter: self.meter.clone(),
+            meter: tm,
             in_memory_metrics: self.in_memory_metrics.clone(),
         }
     }
@@ -1149,6 +1149,19 @@ mod tests {
     #[derive(Debug, Clone)]
     struct DummyInstrumentRef(usize);
     impl BufferInstrumentRef for DummyInstrumentRef {}
+
+    #[test]
+    fn with_new_attrs_adds_attrs_to_returned_context() {
+        let mc = MetricsContext::no_op();
+        let mc2 = mc.with_new_attrs([MetricKeyValue::new("workflow_type", "my_wf")]);
+        let MetricAttributes::NoOp(labels) = mc2.meter.get_default_attributes() else {
+            panic!("expected no-op metric attributes");
+        };
+        assert_eq!(
+            labels.get("workflow_type").map(String::as_str),
+            Some("my_wf")
+        );
+    }
 
     #[test]
     fn test_buffered_core_context() {

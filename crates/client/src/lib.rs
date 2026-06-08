@@ -40,6 +40,13 @@ pub use metrics::{LONG_REQUEST_LATENCY_HISTOGRAM_NAME, REQUEST_LATENCY_HISTOGRAM
 pub use options_structs::*;
 pub use replaceable::SharedReplaceableClient;
 pub use retry::RetryOptions;
+/// Potentially dangerous TLS related functionality.
+pub mod danger {
+    /// Re-export the `ServerCertVerifier` trait so that users can implement custom TLS
+    /// server certificate verification without depending on `tokio-rustls` directly,
+    /// while explicitly acknowledging the danger in the import path.
+    pub use tokio_rustls::rustls::client::danger::ServerCertVerifier;
+}
 pub use tonic;
 pub use workflow_handle::{
     UntypedQuery, UntypedSignal, UntypedUpdate, UntypedWorkflow, UntypedWorkflowHandle,
@@ -101,13 +108,14 @@ use tonic::{
     Code, IntoRequest,
     body::Body,
     client::GrpcService,
+    codec::CompressionEncoding,
     codegen::InterceptedService,
     metadata::{
         AsciiMetadataKey, AsciiMetadataValue, BinaryMetadataKey, BinaryMetadataValue, MetadataMap,
         MetadataValue,
     },
     service::Interceptor,
-    transport::{Certificate, Channel, Endpoint, Identity},
+    transport::{Certificate, Endpoint, Identity},
 };
 use tower::ServiceBuilder;
 use uuid::Uuid;
@@ -155,6 +163,13 @@ impl Connection {
     /// Connect to a Temporal service.
     pub async fn connect(options: ConnectionOptions) -> Result<Self, ClientConnectError> {
         let dns_lb_opts = dns::validate_and_get_dns_lb(&options)?.cloned();
+        // The callback-based override transport cannot decode compressed request bodies, so
+        // compression is forced off whenever a service override is in use.
+        let compression = if options.service_override.is_some() {
+            GrpcCompression::None
+        } else {
+            options.grpc_compression
+        };
         let (service, dns_task) = if let Some(service_override) = options.service_override {
             (
                 GrpcMetricSvc {
@@ -185,7 +200,7 @@ impl Connection {
                 Some(handle),
             )
         } else {
-            let channel = Channel::from_shared(options.target.to_string())?;
+            let channel = Endpoint::from_shared(options.target.to_string())?;
             let channel = add_tls_to_channel(options.tls_options.as_ref(), channel).await?;
             let channel = if let Some(keep_alive) = options.keep_alive.as_ref() {
                 channel
@@ -231,7 +246,7 @@ impl Connection {
             headers: headers.clone(),
         };
         let svc = InterceptedService::new(service, interceptor);
-        let mut svc_client = TemporalServiceClient::new(svc);
+        let mut svc_client = TemporalServiceClient::new(svc, compression);
 
         let capabilities = if !options.skip_get_system_info {
             match svc_client
@@ -408,13 +423,21 @@ async fn add_tls_to_channel(
     mut channel: Endpoint,
 ) -> Result<Endpoint, ClientConnectError> {
     if let Some(tls_cfg) = tls_options {
+        if tls_cfg.server_cert_verifier.is_some() && tls_cfg.server_root_ca_cert.is_some() {
+            return Err(ClientConnectError::InvalidConfig(
+                "Cannot set both `server_root_ca_cert` and `server_cert_verifier`".to_owned(),
+            ));
+        }
+
         let mut tls = tonic::transport::ClientTlsConfig::new();
 
-        if let Some(root_cert) = &tls_cfg.server_root_ca_cert {
-            let server_root_ca_cert = Certificate::from_pem(root_cert);
-            tls = tls.ca_certificate(server_root_ca_cert);
-        } else {
-            tls = tls.with_native_roots();
+        if tls_cfg.server_cert_verifier.is_none() {
+            if let Some(root_cert) = &tls_cfg.server_root_ca_cert {
+                let server_root_ca_cert = Certificate::from_pem(root_cert);
+                tls = tls.ca_certificate(server_root_ca_cert);
+            } else {
+                tls = tls.with_native_roots();
+            }
         }
 
         if let Some(domain) = &tls_cfg.domain {
@@ -434,7 +457,13 @@ async fn add_tls_to_channel(
             tls = tls.identity(client_identity);
         }
 
-        return channel.tls_config(tls).map_err(Into::into);
+        return if let Some(verifier) = &tls_cfg.server_cert_verifier {
+            channel
+                .tls_config_with_verifier(tls, verifier.clone())
+                .map_err(Into::into)
+        } else {
+            channel.tls_config(tls).map_err(Into::into)
+        };
     }
     Ok(channel)
 }
@@ -553,7 +582,7 @@ fn get_decode_max_size() -> usize {
 }
 
 impl TemporalServiceClient {
-    fn new<T>(svc: T) -> Self
+    fn new<T>(svc: T, compression: GrpcCompression) -> Self
     where
         T: GrpcService<Body> + Send + Sync + Clone + 'static,
         T::ResponseBody: tonic::codegen::Body<Data = tonic::codegen::Bytes> + Send + 'static,
@@ -561,23 +590,25 @@ impl TemporalServiceClient {
         <T::ResponseBody as tonic::codegen::Body>::Error: Into<tonic::codegen::StdError> + Send,
         <T as GrpcService<Body>>::Future: Send,
     {
-        let workflow_svc_client = Box::new(
-            WorkflowServiceClient::new(svc.clone())
-                .max_decoding_message_size(get_decode_max_size()),
-        );
-        let operator_svc_client = Box::new(
-            OperatorServiceClient::new(svc.clone())
-                .max_decoding_message_size(get_decode_max_size()),
-        );
-        let cloud_svc_client = Box::new(
-            CloudServiceClient::new(svc.clone()).max_decoding_message_size(get_decode_max_size()),
-        );
-        let test_svc_client = Box::new(
-            TestServiceClient::new(svc.clone()).max_decoding_message_size(get_decode_max_size()),
-        );
-        let health_svc_client = Box::new(
-            HealthClient::new(svc.clone()).max_decoding_message_size(get_decode_max_size()),
-        );
+        // The generated service clients don't share a trait exposing the compression setters, so
+        // a macro applies the same configuration to each concrete client type.
+        macro_rules! configure {
+            ($client:expr) => {{
+                let client = $client.max_decoding_message_size(get_decode_max_size());
+                match compression {
+                    GrpcCompression::Gzip => client
+                        .send_compressed(CompressionEncoding::Gzip)
+                        .accept_compressed(CompressionEncoding::Gzip),
+                    GrpcCompression::None => client,
+                }
+            }};
+        }
+
+        let workflow_svc_client = Box::new(configure!(WorkflowServiceClient::new(svc.clone())));
+        let operator_svc_client = Box::new(configure!(OperatorServiceClient::new(svc.clone())));
+        let cloud_svc_client = Box::new(configure!(CloudServiceClient::new(svc.clone())));
+        let test_svc_client = Box::new(configure!(TestServiceClient::new(svc.clone())));
+        let health_svc_client = Box::new(configure!(HealthClient::new(svc.clone())));
 
         Self {
             workflow_svc_client,
@@ -765,7 +796,11 @@ impl Namespace {
             Namespace::Name(n) => (n, "".to_owned()),
             Namespace::Id(n) => ("".to_owned(), n),
         };
-        DescribeNamespaceRequest { namespace, id }
+        DescribeNamespaceRequest {
+            namespace,
+            id,
+            weak_consistency: false,
+        }
     }
 }
 
@@ -1483,6 +1518,109 @@ mod tests {
             .build();
         dbg!(&opts.keep_alive);
         assert!(opts.keep_alive.is_none());
+    }
+
+    mod tls_custom_verifier_tests {
+        use super::*;
+        use tokio_rustls::rustls::{
+            DigitallySignedStruct, Error as RustlsError, SignatureScheme,
+            client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier},
+            pki_types::{CertificateDer, ServerName, UnixTime},
+        };
+
+        /// A minimal mock verifier for testing. In production, users would
+        /// implement real certificate pinning or custom validation here.
+        #[derive(Debug)]
+        struct MockVerifier;
+
+        impl ServerCertVerifier for MockVerifier {
+            fn verify_server_cert(
+                &self,
+                _end_entity: &CertificateDer<'_>,
+                _intermediates: &[CertificateDer<'_>],
+                _server_name: &ServerName<'_>,
+                _ocsp_response: &[u8],
+                _now: UnixTime,
+            ) -> Result<ServerCertVerified, RustlsError> {
+                Ok(ServerCertVerified::assertion())
+            }
+
+            fn verify_tls12_signature(
+                &self,
+                _message: &[u8],
+                _cert: &CertificateDer<'_>,
+                _dss: &DigitallySignedStruct,
+            ) -> Result<HandshakeSignatureValid, RustlsError> {
+                Ok(HandshakeSignatureValid::assertion())
+            }
+
+            fn verify_tls13_signature(
+                &self,
+                _message: &[u8],
+                _cert: &CertificateDer<'_>,
+                _dss: &DigitallySignedStruct,
+            ) -> Result<HandshakeSignatureValid, RustlsError> {
+                Ok(HandshakeSignatureValid::assertion())
+            }
+
+            fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+                vec![
+                    SignatureScheme::ECDSA_NISTP256_SHA256,
+                    SignatureScheme::RSA_PSS_SHA256,
+                ]
+            }
+        }
+
+        #[tokio::test]
+        async fn add_tls_to_channel_with_custom_verifier() {
+            let tls_opts = TlsOptions {
+                server_cert_verifier: Some(Arc::new(MockVerifier)),
+                domain: Some("test.temporal.io".to_string()),
+                ..Default::default()
+            };
+            let endpoint = tonic::transport::Channel::from_static("https://test.temporal.io:7233");
+            let result = add_tls_to_channel(Some(&tls_opts), endpoint).await;
+            assert!(
+                result.is_ok(),
+                "add_tls_to_channel should succeed with a custom verifier: {:?}",
+                result.err()
+            );
+        }
+
+        #[tokio::test]
+        async fn add_tls_to_channel_with_verifier_and_ca_cert_fails() {
+            // When both server_cert_verifier and server_root_ca_cert are set,
+            // add_tls_to_channel should fail with InvalidConfig.
+            let tls_opts = TlsOptions {
+                server_root_ca_cert: Some(b"some-ca-cert-bytes".to_vec()),
+                server_cert_verifier: Some(Arc::new(MockVerifier)),
+                domain: Some("test.temporal.io".to_string()),
+                ..Default::default()
+            };
+            let endpoint = tonic::transport::Channel::from_static("https://test.temporal.io:7233");
+            let result = add_tls_to_channel(Some(&tls_opts), endpoint).await;
+            assert!(
+                matches!(result, Err(ClientConnectError::InvalidConfig(_))),
+                "add_tls_to_channel should fail with InvalidConfig when both CA cert and verifier are set: {:?}",
+                result
+            );
+        }
+
+        #[tokio::test]
+        async fn add_tls_to_channel_without_verifier_still_works() {
+            // Regression test: the original PEM path must still work.
+            let tls_opts = TlsOptions {
+                domain: Some("test.temporal.io".to_string()),
+                ..Default::default()
+            };
+            let endpoint = tonic::transport::Channel::from_static("https://test.temporal.io:7233");
+            let result = add_tls_to_channel(Some(&tls_opts), endpoint).await;
+            assert!(
+                result.is_ok(),
+                "add_tls_to_channel should succeed without a verifier (native roots): {:?}",
+                result.err()
+            );
+        }
     }
 
     mod list_workflows_tests {

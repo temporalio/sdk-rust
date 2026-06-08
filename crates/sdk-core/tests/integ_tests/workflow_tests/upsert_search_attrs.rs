@@ -59,7 +59,7 @@ async fn sends_upsert() {
     starter.sdk_config.task_types = WorkerTaskTypes::workflow_only();
     let mut worker = starter.worker().await;
 
-    worker.register_workflow::<SearchAttrUpdater>();
+    worker.register_workflow::<SearchAttrUpdater>().unwrap();
     let task_queue = starter.get_task_queue().to_owned();
     worker
         .submit_wf(
@@ -168,6 +168,6 @@ async fn upsert_search_attrs_from_workflow() {
     });
 
     let mut worker = build_fake_sdk(mock_cfg);
-    worker.register_workflow::<UpsertTestWf>();
+    worker.register_workflow::<UpsertTestWf>().unwrap();
     worker.run().await.unwrap();
 }

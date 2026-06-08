@@ -21,7 +21,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let client = Client::new(connection, client_opts)?;
 
     let worker_options = WorkerOptions::new("activity-heartbeating")
-        .register_workflow::<HeartbeatingWorkflow>()
+        .register_workflow::<HeartbeatingWorkflow>()?
         .register_activities(HeartbeatingActivities)
         .build();
 

@@ -1,7 +1,10 @@
 //! Worker-specific client needs
 
 pub(crate) mod mocks;
-use crate::{protosext::legacy_query_failure, worker::WorkerVersioningStrategy};
+use crate::{
+    protosext::legacy_query_failure,
+    worker::{WorkerVersioningStrategy, worker_control_task_queue},
+};
 use parking_lot::Mutex;
 use prost_types::Duration as PbDuration;
 use std::{
@@ -134,6 +137,10 @@ impl WorkerClientBag {
             None
         }
     }
+
+    fn worker_control_task_queue(&self) -> String {
+        worker_control_task_queue(&self.namespace, &self.worker_grouping_key().to_string())
+    }
 }
 
 /// This trait contains everything workers need to interact with Temporal, and hence provides a
@@ -157,7 +164,7 @@ pub trait WorkerClient: Sync + Send {
     async fn poll_nexus_task(
         &self,
         poll_options: PollOptions,
-        send_heartbeat: bool,
+        nexus_options: PollNexusOptions,
     ) -> Result<PollNexusTaskQueueResponse>;
     /// Complete a workflow task
     async fn complete_workflow_task(
@@ -280,6 +287,13 @@ pub struct PollActivityOptions {
     /// Optional rate limit (tasks per second) for activity polling
     pub max_tasks_per_sec: Option<f64>,
 }
+/// Additional options specific to Nexus task polling
+#[derive(Debug, Clone, Default)]
+pub struct PollNexusOptions {
+    /// If true, poll using `TaskQueueKind::WorkerCommands` — the per-process control queue used
+    /// by the shared-namespace worker to receive server-to-worker commands.
+    pub worker_commands_queue: bool,
+}
 
 #[async_trait::async_trait]
 impl WorkerClient for WorkerClientBag {
@@ -310,8 +324,8 @@ impl WorkerClient for WorkerClientBag {
             worker_version_capabilities: self.worker_version_capabilities(),
             deployment_options: self.deployment_options(),
             worker_instance_key: self.worker_instance_key.to_string(),
+            worker_control_task_queue: self.worker_control_task_queue(),
             poller_group_id: Default::default(),
-            worker_control_task_queue: Default::default(),
         }
         .into_request();
         request.extensions_mut().insert(IsWorkerTaskLongPoll);
@@ -350,8 +364,8 @@ impl WorkerClient for WorkerClientBag {
             worker_version_capabilities: self.worker_version_capabilities(),
             deployment_options: self.deployment_options(),
             worker_instance_key: self.worker_instance_key.to_string(),
+            worker_control_task_queue: self.worker_control_task_queue(),
             poller_group_id: Default::default(),
-            worker_control_task_queue: Default::default(),
         }
         .into_request();
         request.extensions_mut().insert(IsWorkerTaskLongPoll);
@@ -373,19 +387,26 @@ impl WorkerClient for WorkerClientBag {
     async fn poll_nexus_task(
         &self,
         poll_options: PollOptions,
-        _send_heartbeat: bool,
+        nexus_options: PollNexusOptions,
     ) -> Result<PollNexusTaskQueueResponse> {
+        let kind = if nexus_options.worker_commands_queue {
+            TaskQueueKind::WorkerCommands
+        } else {
+            TaskQueueKind::Normal
+        };
         #[allow(deprecated)] // want to list all fields explicitly
         let mut request = PollNexusTaskQueueRequest {
             namespace: self.namespace.clone(),
             task_queue: Some(TaskQueue {
                 name: poll_options.task_queue,
-                kind: TaskQueueKind::Normal as i32,
+                kind: kind as i32,
                 normal_name: "".to_string(),
             }),
             identity: self.identity(),
             worker_version_capabilities: self.worker_version_capabilities(),
             deployment_options: self.deployment_options(),
+            // TODO: Piggyback worker heartbeats here if this is the system nexus worker and reset
+            //   heartbeating ticker when done
             worker_heartbeat: Vec::new(),
             worker_instance_key: self.worker_instance_key.to_string(),
             poller_group_id: Default::default(),
@@ -449,9 +470,9 @@ impl WorkerClient for WorkerClientBag {
             deployment: None,
             versioning_behavior: request.versioning_behavior.into(),
             deployment_options: self.deployment_options(),
-            resource_id: Default::default(),
             worker_instance_key: self.worker_instance_key.to_string(),
-            worker_control_task_queue: Default::default(),
+            worker_control_task_queue: self.worker_control_task_queue(),
+            resource_id: Default::default(),
         };
         Ok(self
             .connection

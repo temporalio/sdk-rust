@@ -157,7 +157,9 @@ async fn activity_has_deployment_stamp() {
     let mut worker = starter.worker().await;
     let client = starter.get_client().await;
 
-    worker.register_workflow::<ActivityHasDeploymentStampWf>();
+    worker
+        .register_workflow::<ActivityHasDeploymentStampWf>()
+        .unwrap();
     let submitter = worker.get_submitter_handle();
     let shutdown_handle = worker.inner_mut().shutdown_handle();
 
