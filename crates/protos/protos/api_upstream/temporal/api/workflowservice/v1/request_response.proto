@@ -3196,13 +3196,18 @@ message DescribeActivityExecutionRequest {
     // guaranteed that a client making a sequence of long-poll requests will see a complete
     // sequence of state changes.
     bytes long_poll_token = 6;
+    // Include the heartbeat_details field inside info in the response if available.
+    bool include_heartbeat_details = 7;
+    // Include the last_failure field inside info in the response if available.
+    bool include_last_failure = 8;
 }
 
 message DescribeActivityExecutionResponse {
     // The run ID of the activity, useful when run_id was not specified in the request.
     string run_id = 1;
 
-    // Information about the activity execution.
+    // Information about the activity execution. Fields heartbeat_details and last_failure are omitted unless
+    // the request has include_heartbeat_details or include_last_failure set to true, respectively.
     temporal.api.activity.v1.ActivityExecutionInfo info = 2;
 
     // Serialized activity input, passed as arguments to the activity function.
