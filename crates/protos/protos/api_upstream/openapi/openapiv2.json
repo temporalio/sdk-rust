@@ -440,6 +440,20 @@
             "required": false,
             "type": "string",
             "format": "byte"
+          },
+          {
+            "name": "includeHeartbeatDetails",
+            "description": "Include the heartbeat_details field inside info in the response if available.",
+            "in": "query",
+            "required": false,
+            "type": "boolean"
+          },
+          {
+            "name": "includeLastFailure",
+            "description": "Include the last_failure field inside info in the response if available.",
+            "in": "query",
+            "required": false,
+            "type": "boolean"
           }
         ],
         "tags": [
@@ -5985,6 +5999,20 @@
             "required": false,
             "type": "string",
             "format": "byte"
+          },
+          {
+            "name": "includeHeartbeatDetails",
+            "description": "Include the heartbeat_details field inside info in the response if available.",
+            "in": "query",
+            "required": false,
+            "type": "boolean"
+          },
+          {
+            "name": "includeLastFailure",
+            "description": "Include the last_failure field inside info in the response if available.",
+            "in": "query",
+            "required": false,
+            "type": "boolean"
           }
         ],
         "tags": [
@@ -13221,7 +13249,7 @@
         },
         "heartbeatDetails": {
           "$ref": "#/definitions/v1Payloads",
-          "description": "Details provided in the last recorded activity heartbeat."
+          "description": "Details provided in the last recorded activity heartbeat.\nDescribeActivityExecution does not set this field unless include_heartbeat_details was true in the request."
         },
         "lastHeartbeatTime": {
           "type": "string",
@@ -13259,7 +13287,7 @@
         },
         "lastFailure": {
           "$ref": "#/definitions/v1Failure",
-          "description": "Failure details from the last failed attempt."
+          "description": "Failure details from the last failed attempt.\nDescribeActivityExecution does not set this field unless include_last_failure was true in the request."
         },
         "lastWorkerIdentity": {
           "type": "string"
@@ -13330,6 +13358,10 @@
         "sdkVersion": {
           "type": "string",
           "description": "The version of the SDK of the worker that most recently picked up an attempt of this activity.\nOverwritten on each new attempt. Empty if unknown."
+        },
+        "startDelay": {
+          "type": "string",
+          "description": "Time to wait before dispatching the first activity task. This delay is not applied to retry attempts."
         }
       },
       "description": "Information about a standalone activity."
@@ -14926,7 +14958,7 @@
         },
         "info": {
           "$ref": "#/definitions/v1ActivityExecutionInfo",
-          "description": "Information about the activity execution."
+          "description": "Information about the activity execution. Fields heartbeat_details and last_failure are omitted unless\nthe request has include_heartbeat_details or include_last_failure set to true, respectively."
         },
         "input": {
           "$ref": "#/definitions/v1Payloads",
