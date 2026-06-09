@@ -333,7 +333,7 @@ impl ContinueAsNewAutoUpgradeV1 {
             .await;
         assert!(ctx.target_worker_deployment_version_changed());
         let mut options = ContinueAsNewOptions::default();
-        options.initial_versioning_behavior = ContinueAsNewVersioningBehavior::AutoUpgrade.into();
+        options.initial_versioning_behavior = Some(ContinueAsNewVersioningBehavior::AutoUpgrade);
         ctx.continue_as_new(&(attempt + 1), options)?;
         Ok("v1.0".to_string())
     }
@@ -394,7 +394,7 @@ async fn continue_as_new_auto_upgrade_uses_current_deployment_version() {
         wait_for_worker_deployment_version(&client, &deploy_name, &v1).await;
         wait_for_worker_deployment_version(&client, &deploy_name, &v2).await;
         set_current_deployment_version(&client, &deploy_name, &v1).await;
-        wait_for_worker_deployment_routing(&client, &deploy_name, Some(&v1), None).await;
+        wait_for_worker_deployment_routing(&client, &deploy_name, Some(&v1), None, None).await;
 
         let handle = client
             .start_workflow(
@@ -413,7 +413,7 @@ async fn continue_as_new_auto_upgrade_uses_current_deployment_version() {
         .await;
 
         set_current_deployment_version(&client, &deploy_name, &v2).await;
-        wait_for_worker_deployment_routing(&client, &deploy_name, Some(&v2), None).await;
+        wait_for_worker_deployment_routing(&client, &deploy_name, Some(&v2), None, None).await;
         handle
             .signal(
                 ContinueAsNewAutoUpgradeV1::continue_as_new,
@@ -461,7 +461,7 @@ impl ContinueAsNewUseRampingVersionV1 {
             .await;
         let mut options = ContinueAsNewOptions::default();
         options.initial_versioning_behavior =
-            ContinueAsNewVersioningBehavior::UseRampingVersion.into();
+            Some(ContinueAsNewVersioningBehavior::UseRampingVersion);
         ctx.continue_as_new(&(attempt + 1), options)?;
         Ok("v1.0".to_string())
     }
@@ -522,7 +522,7 @@ async fn continue_as_new_use_ramping_version_uses_ramping_deployment_version() {
         wait_for_worker_deployment_version(&client, &deploy_name, &v1).await;
         wait_for_worker_deployment_version(&client, &deploy_name, &v2).await;
         set_current_deployment_version(&client, &deploy_name, &v1).await;
-        wait_for_worker_deployment_routing(&client, &deploy_name, Some(&v1), None).await;
+        wait_for_worker_deployment_routing(&client, &deploy_name, Some(&v1), None, None).await;
 
         let handle = client
             .start_workflow(
@@ -541,7 +541,8 @@ async fn continue_as_new_use_ramping_version_uses_ramping_deployment_version() {
         .await;
 
         set_ramping_deployment_version(&client, &deploy_name, &v2, 0.0).await;
-        wait_for_worker_deployment_routing(&client, &deploy_name, Some(&v1), Some(&v2)).await;
+        wait_for_worker_deployment_routing(&client, &deploy_name, Some(&v1), Some(&v2), Some(0.0))
+            .await;
         handle
             .signal(
                 ContinueAsNewUseRampingVersionV1::continue_as_new,
@@ -637,6 +638,7 @@ async fn wait_for_worker_deployment_routing(
     deployment_name: &str,
     expected_current: Option<&WorkerDeploymentVersion>,
     expected_ramping: Option<&WorkerDeploymentVersion>,
+    expected_ramping_percentage: Option<f32>,
 ) {
     eventually(
         async || {
@@ -669,6 +671,14 @@ async fn wait_for_worker_deployment_routing(
                 .map(WorkerDeploymentVersion::from);
             if ramping.as_ref() != expected_ramping {
                 return Err(format!("ramping deployment version mismatch: {ramping:?}"));
+            }
+            if let Some(expected_ramping_percentage) = expected_ramping_percentage {
+                let actual = routing.ramping_version_percentage;
+                if (actual - expected_ramping_percentage).abs() > f32::EPSILON {
+                    return Err(format!(
+                        "ramping percentage mismatch: expected {expected_ramping_percentage}, got {actual}"
+                    ));
+                }
             }
             Ok(())
         },

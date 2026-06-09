@@ -5,17 +5,19 @@ use temporalio_common::{
     protos::{
         coresdk::AsJsonPayloadExt,
         temporal::api::{
-            command::v1::command::Attributes, common::v1::SearchAttributes, enums::v1::CommandType,
+            command::v1::command::Attributes,
+            common::v1::SearchAttributes,
+            enums::v1::{
+                CommandType,
+                ContinueAsNewVersioningBehavior as ProtoContinueAsNewVersioningBehavior,
+            },
             history::v1::history_event,
         },
     },
     worker::WorkerTaskTypes,
 };
 use temporalio_macros::{workflow, workflow_methods};
-use temporalio_sdk::{
-    ContinueAsNewOptions, ContinueAsNewVersioningBehavior, WorkflowContext, WorkflowResult,
-    WorkflowTermination,
-};
+use temporalio_sdk::{ContinueAsNewOptions, WorkflowContext, WorkflowResult, WorkflowTermination};
 use temporalio_sdk_core::{
     TunerHolder,
     replay::{DEFAULT_WORKFLOW_TYPE, canned_histories},
@@ -95,7 +97,7 @@ impl WfWithTimer {
         ctx.timer(Duration::from_millis(500)).await;
         Err(WorkflowTermination::continue_as_new(ContinueAsNewRequest {
             arguments: vec![[1].into()],
-            initial_versioning_behavior: ContinueAsNewVersioningBehavior::AutoUpgrade.into(),
+            initial_versioning_behavior: ProtoContinueAsNewVersioningBehavior::AutoUpgrade.into(),
             ..Default::default()
         }))
     }
@@ -120,7 +122,7 @@ async fn wf_completing_with_continue_as_new() {
                 assert_matches!(
                     wft.commands[0].attributes.as_ref().unwrap(),
                     Attributes::ContinueAsNewWorkflowExecutionCommandAttributes(can_attrs)
-                        if can_attrs.initial_versioning_behavior == ContinueAsNewVersioningBehavior::AutoUpgrade as i32
+                        if can_attrs.initial_versioning_behavior == ProtoContinueAsNewVersioningBehavior::AutoUpgrade as i32
                 );
             });
     });

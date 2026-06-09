@@ -2,7 +2,8 @@ mod options;
 
 pub use options::{
     ActivityCloseTimeouts, ActivityOptions, ChildWorkflowOptions, ContinueAsNewOptions,
-    LocalActivityOptions, NexusOperationOptions, Signal, SignalData, TimerOptions,
+    ContinueAsNewVersioningBehavior, LocalActivityOptions, NexusOperationOptions, Signal,
+    SignalData, TimerOptions,
 };
 pub use temporalio_common_wasm::protos::coresdk::child_workflow::StartChildWorkflowExecutionFailedCause;
 
@@ -2368,7 +2369,7 @@ mod tests {
             },
             temporal::api::{
                 common::v1::{Payload, RetryPolicy},
-                enums::v1::ContinueAsNewVersioningBehavior,
+                enums::v1::ContinueAsNewVersioningBehavior as ProtoContinueAsNewVersioningBehavior,
             },
         },
     };
@@ -2438,7 +2439,8 @@ mod tests {
                 search_attributes: None,
                 retry_policy: None,
                 versioning_intent: ProtoVersioningIntent::Unspecified.into(),
-                initial_versioning_behavior: ContinueAsNewVersioningBehavior::Unspecified.into(),
+                initial_versioning_behavior: ProtoContinueAsNewVersioningBehavior::Unspecified
+                    .into(),
             }
         );
     }
@@ -2509,7 +2511,7 @@ mod tests {
                     ..Default::default()
                 }),
                 versioning_intent: ProtoVersioningIntent::Compatible.into(),
-                initial_versioning_behavior: ContinueAsNewVersioningBehavior::UseRampingVersion
+                initial_versioning_behavior: ProtoContinueAsNewVersioningBehavior::UseRampingVersion
                     as i32,
             }
         );
@@ -2555,7 +2557,7 @@ mod tests {
 
         assert_eq!(
             cmd.initial_versioning_behavior,
-            ContinueAsNewVersioningBehavior::AutoUpgrade as i32
+            ProtoContinueAsNewVersioningBehavior::AutoUpgrade as i32
         );
     }
 
