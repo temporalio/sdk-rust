@@ -406,6 +406,16 @@ paths:
           schema:
             type: string
             format: bytes
+        - name: includeHeartbeatDetails
+          in: query
+          description: Include the heartbeat_details field inside info in the response if available.
+          schema:
+            type: boolean
+        - name: includeLastFailure
+          in: query
+          description: Include the last_failure field inside info in the response if available.
+          schema:
+            type: boolean
       responses:
         "200":
           description: OK
@@ -5411,6 +5421,16 @@ paths:
           schema:
             type: string
             format: bytes
+        - name: includeHeartbeatDetails
+          in: query
+          description: Include the heartbeat_details field inside info in the response if available.
+          schema:
+            type: boolean
+        - name: includeLastFailure
+          in: query
+          description: Include the last_failure field inside info in the response if available.
+          schema:
+            type: boolean
       responses:
         "200":
           description: OK
@@ -9646,7 +9666,9 @@ components:
         heartbeatDetails:
           allOf:
             - $ref: '#/components/schemas/Payloads'
-          description: Details provided in the last recorded activity heartbeat.
+          description: |-
+            Details provided in the last recorded activity heartbeat.
+             DescribeActivityExecution does not set this field unless include_heartbeat_details was true in the request.
         lastHeartbeatTime:
           type: string
           description: Time the last heartbeat was recorded.
@@ -9678,7 +9700,9 @@ components:
         lastFailure:
           allOf:
             - $ref: '#/components/schemas/Failure'
-          description: Failure details from the last failed attempt.
+          description: |-
+            Failure details from the last failed attempt.
+             DescribeActivityExecution does not set this field unless include_last_failure was true in the request.
         lastWorkerIdentity:
           type: string
         currentRetryInterval:
@@ -9746,6 +9770,10 @@ components:
           description: |-
             The version of the SDK of the worker that most recently picked up an attempt of this activity.
              Overwritten on each new attempt. Empty if unknown.
+        startDelay:
+          pattern: ^-?(?:0|[1-9][0-9]{0,11})(?:\.[0-9]{1,9})?s$
+          type: string
+          description: Time to wait before dispatching the first activity task. This delay is not applied to retry attempts.
       description: Information about a standalone activity.
     ActivityExecutionListInfo:
       type: object
@@ -11429,7 +11457,9 @@ components:
         info:
           allOf:
             - $ref: '#/components/schemas/ActivityExecutionInfo'
-          description: Information about the activity execution.
+          description: |-
+            Information about the activity execution. Fields heartbeat_details and last_failure are omitted unless
+             the request has include_heartbeat_details or include_last_failure set to true, respectively.
         input:
           allOf:
             - $ref: '#/components/schemas/Payloads'
