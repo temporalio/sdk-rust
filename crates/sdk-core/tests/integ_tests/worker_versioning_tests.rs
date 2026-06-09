@@ -147,6 +147,25 @@ async fn sets_deployment_info_on_task_responses(#[values(true, false)] use_defau
     assert_eq!(dv.build_id, "1.0");
 }
 
+#[workflow]
+#[derive(Default)]
+struct ActivityHasDeploymentStampWf;
+
+#[workflow_methods]
+impl ActivityHasDeploymentStampWf {
+    #[run(name = "activity_has_deployment_stamp")]
+    async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<()> {
+        let _ = ctx
+            .start_activity(
+                StdActivities::echo,
+                "hi!".to_string(),
+                ActivityOptions::start_to_close_timeout(Duration::from_secs(5)),
+            )
+            .await;
+        Ok(())
+    }
+}
+
 #[tokio::test]
 async fn activity_has_deployment_stamp() {
     let wf_name = "activity_has_deployment_stamp";
@@ -297,6 +316,46 @@ async fn versioning_off_with_custom_build_id() {
     );
 }
 
+#[workflow]
+#[derive(Default)]
+struct ContinueAsNewAutoUpgradeV1 {
+    should_continue_as_new: bool,
+}
+
+#[workflow_methods]
+impl ContinueAsNewAutoUpgradeV1 {
+    #[run(name = "continue_as_new_auto_upgrade_uses_current_deployment_version")]
+    async fn run(ctx: &mut WorkflowContext<Self>, attempt: u8) -> WorkflowResult<String> {
+        if attempt > 0 {
+            return Ok("v1.0".to_string());
+        }
+        ctx.wait_condition(|state| state.should_continue_as_new)
+            .await;
+        assert!(ctx.target_worker_deployment_version_changed());
+        let mut options = ContinueAsNewOptions::default();
+        options.initial_versioning_behavior = ContinueAsNewVersioningBehavior::AutoUpgrade.into();
+        ctx.continue_as_new(&(attempt + 1), options)?;
+        Ok("v1.0".to_string())
+    }
+
+    #[signal]
+    fn continue_as_new(&mut self, _ctx: &mut SyncWorkflowContext<Self>, _: ()) {
+        self.should_continue_as_new = true;
+    }
+}
+
+#[workflow]
+#[derive(Default)]
+struct ContinueAsNewAutoUpgradeV2;
+
+#[workflow_methods]
+impl ContinueAsNewAutoUpgradeV2 {
+    #[run(name = "continue_as_new_auto_upgrade_uses_current_deployment_version")]
+    async fn run(_ctx: &mut WorkflowContext<Self>, _attempt: u8) -> WorkflowResult<String> {
+        Ok("v2.0".to_string())
+    }
+}
+
 #[tokio::test]
 async fn continue_as_new_auto_upgrade_uses_current_deployment_version() {
     let wf_type = "continue_as_new_auto_upgrade_uses_current_deployment_version";
@@ -383,6 +442,46 @@ async fn continue_as_new_auto_upgrade_uses_current_deployment_version() {
     })
     .await
     .unwrap();
+}
+
+#[workflow]
+#[derive(Default)]
+struct ContinueAsNewUseRampingVersionV1 {
+    should_continue_as_new: bool,
+}
+
+#[workflow_methods]
+impl ContinueAsNewUseRampingVersionV1 {
+    #[run(name = "continue_as_new_use_ramping_version_uses_ramping_deployment_version")]
+    async fn run(ctx: &mut WorkflowContext<Self>, attempt: u8) -> WorkflowResult<String> {
+        if attempt > 0 {
+            return Ok("v1.0".to_string());
+        }
+        ctx.wait_condition(|state| state.should_continue_as_new)
+            .await;
+        let mut options = ContinueAsNewOptions::default();
+        options.initial_versioning_behavior =
+            ContinueAsNewVersioningBehavior::UseRampingVersion.into();
+        ctx.continue_as_new(&(attempt + 1), options)?;
+        Ok("v1.0".to_string())
+    }
+
+    #[signal]
+    fn continue_as_new(&mut self, _ctx: &mut SyncWorkflowContext<Self>, _: ()) {
+        self.should_continue_as_new = true;
+    }
+}
+
+#[workflow]
+#[derive(Default)]
+struct ContinueAsNewUseRampingVersionV2;
+
+#[workflow_methods]
+impl ContinueAsNewUseRampingVersionV2 {
+    #[run(name = "continue_as_new_use_ramping_version_uses_ramping_deployment_version")]
+    async fn run(_ctx: &mut WorkflowContext<Self>, _attempt: u8) -> WorkflowResult<String> {
+        Ok("v2.0".to_string())
+    }
 }
 
 #[tokio::test]
@@ -679,103 +778,4 @@ async fn wait_for_workflow_deployment_version(
     )
     .await
     .unwrap();
-}
-
-#[workflow]
-#[derive(Default)]
-struct ActivityHasDeploymentStampWf;
-
-#[workflow_methods]
-impl ActivityHasDeploymentStampWf {
-    #[run(name = "activity_has_deployment_stamp")]
-    async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<()> {
-        let _ = ctx
-            .start_activity(
-                StdActivities::echo,
-                "hi!".to_string(),
-                ActivityOptions::start_to_close_timeout(Duration::from_secs(5)),
-            )
-            .await;
-        Ok(())
-    }
-}
-
-#[workflow]
-#[derive(Default)]
-struct ContinueAsNewAutoUpgradeV1 {
-    should_continue_as_new: bool,
-}
-
-#[workflow_methods]
-impl ContinueAsNewAutoUpgradeV1 {
-    #[run(name = "continue_as_new_auto_upgrade_uses_current_deployment_version")]
-    async fn run(ctx: &mut WorkflowContext<Self>, attempt: u8) -> WorkflowResult<String> {
-        if attempt > 0 {
-            return Ok("v1.0".to_string());
-        }
-        ctx.wait_condition(|state| state.should_continue_as_new)
-            .await;
-        assert!(ctx.target_worker_deployment_version_changed());
-        let mut options = ContinueAsNewOptions::default();
-        options.initial_versioning_behavior = ContinueAsNewVersioningBehavior::AutoUpgrade.into();
-        ctx.continue_as_new(&(attempt + 1), options)?;
-        Ok("v1.0".to_string())
-    }
-
-    #[signal]
-    fn continue_as_new(&mut self, _ctx: &mut SyncWorkflowContext<Self>, _: ()) {
-        self.should_continue_as_new = true;
-    }
-}
-
-#[workflow]
-#[derive(Default)]
-struct ContinueAsNewAutoUpgradeV2;
-
-#[workflow_methods]
-impl ContinueAsNewAutoUpgradeV2 {
-    #[run(name = "continue_as_new_auto_upgrade_uses_current_deployment_version")]
-    async fn run(_ctx: &mut WorkflowContext<Self>, _attempt: u8) -> WorkflowResult<String> {
-        Ok("v2.0".to_string())
-    }
-}
-
-#[workflow]
-#[derive(Default)]
-struct ContinueAsNewUseRampingVersionV1 {
-    should_continue_as_new: bool,
-}
-
-#[workflow_methods]
-impl ContinueAsNewUseRampingVersionV1 {
-    #[run(name = "continue_as_new_use_ramping_version_uses_ramping_deployment_version")]
-    async fn run(ctx: &mut WorkflowContext<Self>, attempt: u8) -> WorkflowResult<String> {
-        if attempt > 0 {
-            return Ok("v1.0".to_string());
-        }
-        ctx.wait_condition(|state| state.should_continue_as_new)
-            .await;
-        let mut options = ContinueAsNewOptions::default();
-        options.initial_versioning_behavior =
-            ContinueAsNewVersioningBehavior::UseRampingVersion.into();
-        ctx.continue_as_new(&(attempt + 1), options)?;
-        Ok("v1.0".to_string())
-    }
-
-    #[signal]
-    fn continue_as_new(&mut self, _ctx: &mut SyncWorkflowContext<Self>, _: ()) {
-        self.should_continue_as_new = true;
-    }
-}
-
-#[workflow]
-#[derive(Default)]
-struct ContinueAsNewUseRampingVersionV2;
-
-#[workflow_methods]
-impl ContinueAsNewUseRampingVersionV2 {
-    #[run(name = "continue_as_new_use_ramping_version_uses_ramping_deployment_version")]
-    async fn run(_ctx: &mut WorkflowContext<Self>, _attempt: u8) -> WorkflowResult<String> {
-        Ok("v2.0".to_string())
-    }
 }
