@@ -18,3 +18,9 @@ to docs, or any other relevant information.
 # Changelog
 
 ## [Unreleased]
+
+### Added
+* `client()` and `workflow_handle()` helpers to `ActivityContext` for easily obtaining a Temporal client
+
+### Breaking Changes
+* The `ActivityContext` constructor now requires `ClientOptions`.
