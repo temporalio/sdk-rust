@@ -322,6 +322,13 @@ pub struct WorkflowStartOptions {
 
     /// Multi-line static details for the workflow, shown in the Temporal UI.
     pub static_details: Option<String>,
+
+    /// Optional memo attached to the workflow execution. Memos are returned by
+    /// `list_workflows` and `describe_workflow_execution` so callers can stash small
+    /// caller-supplied metadata on a workflow without round-tripping through a query.
+    /// Each value must already be a serialized `Payload`; the builder does not encode
+    /// values for you.
+    pub memo: Option<HashMap<String, Payload>>,
 }
 
 /// A signal to send atomically when starting a workflow.
@@ -539,3 +546,45 @@ pub struct WorkflowListOptions {
 #[derive(Debug, Clone, Default, bon::Builder)]
 #[non_exhaustive]
 pub struct WorkflowCountOptions {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn payload(s: &str) -> Payload {
+        Payload {
+            metadata: std::collections::HashMap::new(),
+            data: s.as_bytes().to_vec(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn workflow_start_options_memo_defaults_to_none() {
+        let opts = WorkflowStartOptions::new("tq", "wf-id").build();
+        assert!(opts.memo.is_none());
+    }
+
+    #[test]
+    fn workflow_start_options_memo_is_settable_via_builder() {
+        let mut fields = HashMap::new();
+        fields.insert("interview_start_time".to_owned(), payload("2026-06-09T18:00:00Z"));
+        fields.insert("deadline".to_owned(), payload("2026-06-09T19:30:00Z"));
+        let opts = WorkflowStartOptions::new("tq", "wf-id").memo(fields.clone()).build();
+        let stored = opts.memo.as_ref().expect("memo should be set");
+        assert_eq!(stored.len(), 2);
+        assert_eq!(stored.get("interview_start_time"), fields.get("interview_start_time"));
+        assert_eq!(stored.get("deadline"), fields.get("deadline"));
+    }
+
+    #[test]
+    fn workflow_start_options_round_trip_through_clone() {
+        // Cloning the options must preserve the memo (callers can construct one set of
+        // options and reuse them across signal-with-start variants).
+        let mut fields = HashMap::new();
+        fields.insert("k".to_owned(), payload("v"));
+        let opts = WorkflowStartOptions::new("tq", "wf-id").memo(fields).build();
+        let cloned = opts.clone();
+        assert_eq!(opts.memo.as_ref().unwrap().get("k"), cloned.memo.as_ref().unwrap().get("k"));
+    }
+}
