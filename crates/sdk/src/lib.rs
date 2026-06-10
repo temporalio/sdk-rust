@@ -119,7 +119,7 @@ use std::{
     sync::Arc,
     time::Duration,
 };
-use temporalio_client::{Client, NamespacedClient};
+use temporalio_client::{Client, ClientOptions, NamespacedClient};
 use temporalio_common::{
     ActivityDefinition, WorkflowDefinition,
     data_converters::{DataConverter, SerializationContext, SerializationContextData},
@@ -445,6 +445,7 @@ struct CommonWorker {
     task_queue: String,
     worker_interceptor: Option<Box<dyn WorkerInterceptor>>,
     activity_inbound_interceptors: Vec<Arc<dyn ActivityInboundInterceptor>>,
+    client_options: ClientOptions,
     data_converter: DataConverter,
 }
 
@@ -521,15 +522,18 @@ impl Worker {
             .to_core_options(client.namespace(), client.identity())
             .map_err(|s| anyhow::anyhow!("{s}"))?;
         let core = init_worker(runtime, wc, client.connection().clone())?;
-        Self::new_from_core_options(Arc::new(core), client.data_converter().clone(), options)
+        Self::new_from_core_options(Arc::new(core), client.options().clone(), options)
     }
 
     // TODO [rust-sdk-branch]: Eliminate this constructor in favor of passing in fake connection
     #[doc(hidden)]
     pub fn new_from_core(worker: Arc<CoreWorker>, data_converter: DataConverter) -> Self {
+        let client_options = ClientOptions::new(worker.get_config().namespace.clone())
+            .data_converter(data_converter)
+            .build();
         Self::new_from_core_definitions(
             worker,
-            data_converter,
+            client_options,
             Default::default(),
             Default::default(),
         )
@@ -539,14 +543,14 @@ impl Worker {
     #[doc(hidden)]
     pub fn new_from_core_options(
         worker: Arc<CoreWorker>,
-        data_converter: DataConverter,
+        client_options: ClientOptions,
         mut options: WorkerOptions,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let acts = std::mem::take(&mut options.activities);
         let wfs = std::mem::take(&mut options.workflows);
         #[cfg(feature = "wasm-workflows")]
         let wasm_components = std::mem::take(&mut options.wasm_workflow_components);
-        let mut me = Self::new_from_core_definitions(worker, data_converter, acts, wfs);
+        let mut me = Self::new_from_core_definitions(worker, client_options, acts, wfs);
         me.set_detect_nondeterministic_futures(options.detect_nondeterministic_futures);
         #[cfg(feature = "wasm-workflows")]
         me.workflow_half
@@ -557,16 +561,18 @@ impl Worker {
 
     fn new_from_core_definitions(
         worker: Arc<CoreWorker>,
-        data_converter: DataConverter,
+        client_options: ClientOptions,
         activities: ActivityDefinitions,
         workflows: WorkflowDefinitions,
     ) -> Self {
+        let data_converter = client_options.data_converter.clone();
         Self {
             common: CommonWorker {
                 task_queue: worker.get_config().task_queue.clone(),
                 worker,
                 worker_interceptor: None,
                 activity_inbound_interceptors: Vec::new(),
+                client_options,
                 data_converter,
             },
             workflow_half: WorkflowHalf {
@@ -789,6 +795,7 @@ impl Worker {
                         .await;
                         match act_half.activity_task_handler(
                             common.worker.clone(),
+                            common.client_options.clone(),
                             common.task_queue.clone(),
                             common.data_converter.clone(),
                             common.activity_inbound_interceptors.clone(),
@@ -1014,6 +1021,7 @@ impl ActivityHalf {
     fn activity_task_handler(
         &mut self,
         worker: Arc<CoreWorker>,
+        client_options: ClientOptions,
         task_queue: String,
         data_converter: DataConverter,
         activity_inbound_interceptors: Vec<Arc<dyn ActivityInboundInterceptor>>,
@@ -1043,8 +1051,14 @@ impl ActivityHalf {
                 self.task_tokens_to_cancels
                     .insert(task_token.clone().into(), ct.clone());
 
-                let (ctx, args) =
-                    ActivityContext::new(worker.clone(), ct, task_queue, task_token.clone(), start);
+                let (ctx, args) = ActivityContext::new(
+                    worker.clone(),
+                    client_options,
+                    ct,
+                    task_queue,
+                    task_token.clone(),
+                    start,
+                );
                 let codec_data_converter = data_converter.clone();
 
                 tokio::spawn(async move {

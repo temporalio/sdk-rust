@@ -372,7 +372,7 @@ impl CoreWfStarter {
         let client = self.get_client().await;
         let sdk = Worker::new_from_core_options(
             worker,
-            client.data_converter().clone(),
+            client.options().clone(),
             self.sdk_config.clone(),
         )
         .expect("SDK worker should initialize from core worker and options");

@@ -413,11 +413,8 @@ pub(crate) async fn activity_cancel_delivered_without_heartbeat() {
     let mut starter = CoreWfStarter::new_cloud_or_local(wf_name, "")
         .await
         .unwrap();
-    let client = starter.get_client().await;
 
-    struct WaitForCancelActivities {
-        client: Client,
-    }
+    struct WaitForCancelActivities;
     #[activities]
     impl WaitForCancelActivities {
         #[activity]
@@ -426,15 +423,8 @@ pub(crate) async fn activity_cancel_delivered_without_heartbeat() {
             ctx: ActivityContext,
             _: String,
         ) -> Result<String, ActivityError> {
-            self.client
-                .get_workflow_handle::<CancelWithoutHeartbeatWorkflow>(
-                    ctx.info()
-                        .workflow_execution
-                        .as_ref()
-                        .unwrap()
-                        .workflow_id
-                        .clone(),
-                )
+            ctx.workflow_handle::<CancelWithoutHeartbeatWorkflow>()
+                .unwrap()
                 .signal(
                     CancelWithoutHeartbeatWorkflow::act_started,
                     (),
@@ -449,7 +439,7 @@ pub(crate) async fn activity_cancel_delivered_without_heartbeat() {
 
     starter
         .sdk_config
-        .register_activities(WaitForCancelActivities { client });
+        .register_activities(WaitForCancelActivities);
     let mut worker = starter.worker().await;
     if !worker
         .core_worker()
