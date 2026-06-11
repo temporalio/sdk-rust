@@ -26,3 +26,7 @@ to docs, or any other relevant information.
 
 ### Breaking Changes
 * The `ActivityContext` constructor now requires `ClientOptions`.
+### Breaking Changes
+
+- Rust SDK `ApplicationFailure` and `WorkflowError` APIs now use boxed `std::error::Error` values instead of
+  `anyhow::Error`.
