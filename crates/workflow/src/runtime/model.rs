@@ -231,6 +231,12 @@ impl From<anyhow::Error> for WorkflowTermination {
     }
 }
 
+impl From<ApplicationFailure> for WorkflowTermination {
+    fn from(value: ApplicationFailure) -> Self {
+        Self::Failed(value.into())
+    }
+}
+
 impl From<temporalio_common_wasm::data_converters::PayloadConversionError> for WorkflowTermination {
     fn from(value: temporalio_common_wasm::data_converters::PayloadConversionError) -> Self {
         Self::Failed(value.into())
