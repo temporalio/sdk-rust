@@ -555,6 +555,8 @@ pub struct ContinueAsNewOptions {
     pub run_timeout: Option<Duration>,
     /// Timeout of a single workflow task.
     pub task_timeout: Option<Duration>,
+    /// Delay before the first workflow task of the continued run is scheduled.
+    pub backoff_start_interval: Option<Duration>,
     /// If set, the new workflow will have this memo. If `None`, reuses the current memo.
     pub memo: Option<HashMap<String, Payload>>,
     /// If set, the new workflow will have these headers.
@@ -589,6 +591,9 @@ impl ContinueAsNewOptions {
                 .and_then(|duration| duration.try_into().ok()),
             workflow_task_timeout: self
                 .task_timeout
+                .and_then(|duration| duration.try_into().ok()),
+            backoff_start_interval: self
+                .backoff_start_interval
                 .and_then(|duration| duration.try_into().ok()),
             memo: self.memo.unwrap_or_default(),
             headers: self.headers.unwrap_or_default(),
@@ -644,6 +649,21 @@ fn string_user_metadata(summary: Option<String>, details: Option<String>) -> Opt
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn continue_as_new_options_maps_backoff_start_interval_to_request() {
+        let req = ContinueAsNewOptions {
+            backoff_start_interval: Some(Duration::from_secs(7)),
+            ..Default::default()
+        }
+        .into_request("test-workflow".to_string(), vec![]);
+
+        let backoff = req
+            .backoff_start_interval
+            .expect("backoff_start_interval should be set");
+        assert_eq!(backoff.seconds, 7);
+        assert_eq!(backoff.nanos, 0);
+    }
 
     #[test]
     fn activity_options_with_start_to_close_timeout_wrapper_supports_builder_chaining() {

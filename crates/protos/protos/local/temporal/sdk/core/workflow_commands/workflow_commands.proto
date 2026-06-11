@@ -219,6 +219,8 @@ message ContinueAsNewWorkflowExecution {
     // For example, choose to AutoUpgrade on continue-as-new instead of inheriting the pinned version
     // of the previous run.
     temporal.api.enums.v1.ContinueAsNewVersioningBehavior initial_versioning_behavior = 11;
+    // Delay before the first workflow task of the continued run is scheduled.
+    google.protobuf.Duration backoff_start_interval = 12;
 }
 
 // Indicate a workflow has completed as cancelled. Generally sent as a response to an activation
