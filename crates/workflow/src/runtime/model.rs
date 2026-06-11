@@ -247,7 +247,11 @@ impl From<crate::runtime::entry::WorkflowError> for WorkflowTermination {
     fn from(value: crate::runtime::entry::WorkflowError) -> Self {
         match value {
             crate::runtime::entry::WorkflowError::PayloadConversion(err) => Self::from(err),
-            crate::runtime::entry::WorkflowError::Execution(err) => Self::from(err),
+            crate::runtime::entry::WorkflowError::Execution(err) => Self::Failed(
+                temporalio_common_wasm::error::OutgoingWorkflowError::Application(Box::new(
+                    ApplicationFailure::new(err),
+                )),
+            ),
         }
     }
 }
