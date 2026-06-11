@@ -148,7 +148,7 @@ impl PendingCommandId {
 struct WorkflowRuntimeState {
     host: Rc<dyn WorkflowHost>,
     pending_unblocks: RefCell<HashMap<PendingCommandId, oneshot::Sender<UnblockEvent>>>,
-    forced_wft_failure: RefCell<Option<anyhow::Error>>,
+    forced_wft_failure: RefCell<Option<Box<dyn std::error::Error + Send + Sync>>>,
     progress_made: Cell<bool>,
 }
 
@@ -190,12 +190,12 @@ impl WorkflowRuntimeState {
         true
     }
 
-    fn set_forced_wft_failure(&self, err: anyhow::Error) {
+    fn set_forced_wft_failure(&self, err: Box<dyn std::error::Error + Send + Sync>) {
         *self.forced_wft_failure.borrow_mut() = Some(err);
         self.progress_made.set(true);
     }
 
-    fn take_forced_wft_failure(&self) -> Option<anyhow::Error> {
+    fn take_forced_wft_failure(&self) -> Option<Box<dyn std::error::Error + Send + Sync>> {
         self.forced_wft_failure.borrow_mut().take()
     }
 
@@ -457,7 +457,9 @@ impl BaseWorkflowContext {
         self.inner.runtime.take_progress()
     }
 
-    pub(crate) fn take_forced_wft_failure(&self) -> Option<anyhow::Error> {
+    pub(crate) fn take_forced_wft_failure(
+        &self,
+    ) -> Option<Box<dyn std::error::Error + Send + Sync>> {
         self.inner.runtime.take_forced_wft_failure()
     }
 
@@ -1031,8 +1033,8 @@ impl<W> SyncWorkflowContext<W> {
     }
 
     /// Force a workflow task failure (EX: in order to retry on non-sticky queue)
-    pub fn force_task_fail(&self, with: anyhow::Error) {
-        self.base.inner.runtime.set_forced_wft_failure(with);
+    pub fn force_task_fail(&self, with: impl Into<Box<dyn std::error::Error + Send + Sync>>) {
+        self.base.inner.runtime.set_forced_wft_failure(with.into());
     }
 
     /// Start a nexus operation
@@ -1292,7 +1294,7 @@ impl<W> WorkflowContext<W> {
     }
 
     /// Force a workflow task failure (EX: in order to retry on non-sticky queue)
-    pub fn force_task_fail(&self, with: anyhow::Error) {
+    pub fn force_task_fail(&self, with: impl Into<Box<dyn std::error::Error + Send + Sync>>) {
         self.sync.force_task_fail(with)
     }
 
