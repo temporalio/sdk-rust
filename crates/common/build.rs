@@ -691,7 +691,7 @@ fn is_map_entry(options: &Option<MessageOptions>) -> bool {
 }
 
 // ===========================================================================
-// Payload-limits validator generator (sibling of the payload-visitor generator)
+// Payload-limits validator generator
 //
 // Emits `PayloadLimitsValidatable` impls for the closure of outbound gRPC request
 // messages, dispatching each payload-bearing *leaf* field through a hand-authored
