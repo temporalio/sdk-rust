@@ -317,6 +317,20 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
 
+    use crate::protos::temporal::api::command::v1::{
+        Command, CompleteWorkflowExecutionCommandAttributes,
+        FailWorkflowExecutionCommandAttributes, ModifyWorkflowPropertiesCommandAttributes,
+        RecordMarkerCommandAttributes, ScheduleActivityTaskCommandAttributes,
+        ScheduleNexusOperationCommandAttributes, command::Attributes,
+    };
+    use crate::protos::temporal::api::failure::v1::Failure;
+    use crate::protos::temporal::api::protocol::v1::Message;
+    use crate::protos::temporal::api::sdk::v1::UserMetadata;
+    use crate::protos::temporal::api::workflowservice::v1::{
+        RespondActivityTaskFailedRequest, RespondWorkflowTaskCompletedRequest,
+        StartWorkflowExecutionRequest,
+    };
+
     fn payload(data: &[u8]) -> Payload {
         Payload {
             metadata: HashMap::new(),
@@ -333,12 +347,6 @@ mod tests {
         // (2 + 10) + (3 + 20) = 35
         assert_eq!(map_payload_data_sum(m.iter()), 35);
     }
-
-    use crate::protos::temporal::api::sdk::v1::UserMetadata;
-    use crate::protos::temporal::api::workflowservice::v1::{
-        RespondActivityTaskFailedRequest, RespondWorkflowTaskCompletedRequest,
-        StartWorkflowExecutionRequest,
-    };
 
     /// A sink that records the path of each visited field (order is not significant).
     #[derive(Default)]
@@ -425,7 +433,7 @@ mod tests {
         // RespondActivityTaskFailed.failure is classified warn-only (enforce_error = false), so even
         // with worker error limits a huge failure does not produce an error-level violation.
         let req = RespondActivityTaskFailedRequest {
-            failure: Some(crate::protos::temporal::api::failure::v1::Failure {
+            failure: Some(Failure {
                 message: "x".repeat(10_000),
                 ..Default::default()
             }),
@@ -445,7 +453,6 @@ mod tests {
 
     #[test]
     fn blob_classed_memo_is_measured_as_fields_data_sum() {
-        use crate::protos::temporal::api::command::v1::ModifyWorkflowPropertiesCommandAttributes;
         // upserted_memo is classified `blob`, so it is measured as the data-sum of its fields
         // (the server's line-1386 check), NOT whole-Memo proto size.
         let mut fields = HashMap::new();
@@ -464,7 +471,6 @@ mod tests {
 
     #[test]
     fn marker_details_map_is_measured_as_payloads_sum() {
-        use crate::protos::temporal::api::command::v1::RecordMarkerCommandAttributes;
         // details is a map<string, Payloads>, measured as sum(len(key) + payloads.Size()).
         let mut details = HashMap::new();
         details.insert("marker".to_string(), payloads(1000));
@@ -480,7 +486,6 @@ mod tests {
 
     #[test]
     fn single_payload_field_is_measured_as_payload_size() {
-        use crate::protos::temporal::api::command::v1::ScheduleNexusOperationCommandAttributes;
         // ScheduleNexusOperation.input is a single Payload (not Payloads).
         let attr = ScheduleNexusOperationCommandAttributes {
             input: Some(payload(&[0u8; 1000])),
@@ -494,10 +499,9 @@ mod tests {
 
     #[test]
     fn whole_failure_is_measured_as_message_size() {
-        use crate::protos::temporal::api::command::v1::FailWorkflowExecutionCommandAttributes;
         // FailWorkflowExecution.failure is blob-classed and measured as the whole Failure proto size.
         let attr = FailWorkflowExecutionCommandAttributes {
-            failure: Some(crate::protos::temporal::api::failure::v1::Failure {
+            failure: Some(Failure {
                 message: "x".repeat(1000),
                 ..Default::default()
             }),
@@ -599,10 +603,6 @@ mod tests {
 
     #[test]
     fn visits_payload_fields_of_each_command() {
-        use crate::protos::temporal::api::command::v1::{
-            Command, CompleteWorkflowExecutionCommandAttributes,
-            ScheduleActivityTaskCommandAttributes, command::Attributes,
-        };
         let req = RespondWorkflowTaskCompletedRequest {
             commands: vec![
                 Command {
@@ -640,7 +640,6 @@ mod tests {
     fn visits_protocol_message_body() {
         // Message.body is a google.protobuf.Any (not payload-bearing), reached only because Message
         // is a forced whole-message leaf and the parent recurses into `messages`.
-        use crate::protos::temporal::api::protocol::v1::Message;
         let req = RespondWorkflowTaskCompletedRequest {
             messages: vec![Message {
                 body: Some(Default::default()),
