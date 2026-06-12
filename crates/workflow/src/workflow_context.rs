@@ -38,13 +38,13 @@ use temporalio_common_wasm::{
     ActivityDefinition, SignalDefinition, WorkflowDefinition,
     data_converters::{
         ActivityExecutionDecodeHint, ChildWorkflowExecutionDecodeHint,
-        ChildWorkflowSignalDecodeHint, ChildWorkflowStartDecodeHint, DataConverter,
-        GenericPayloadConverter, PayloadConversionError, PayloadConverter, SerializationContext,
-        SerializationContextData, TemporalDeserializable,
+        ChildWorkflowStartDecodeHint, DataConverter, GenericPayloadConverter,
+        PayloadConversionError, PayloadConverter, SerializationContext, SerializationContextData,
+        TemporalDeserializable, WorkflowSignalDecodeHint,
     },
     error::{
-        ActivityExecutionError, ChildWorkflowExecutionError, ChildWorkflowSignalError,
-        ChildWorkflowStartError,
+        ActivityExecutionError, ChildWorkflowExecutionError, ChildWorkflowStartError,
+        WorkflowSignalError,
     },
     protos::{
         coresdk::{
@@ -2066,7 +2066,7 @@ where
 enum SignalChildFut<F> {
     /// Immediate error (e.g., signal input serialization failure). Resolves on first poll.
     Errored {
-        error: Option<ChildWorkflowSignalError>,
+        error: Option<WorkflowSignalError>,
     },
     Running {
         inner: F,
@@ -2076,7 +2076,7 @@ enum SignalChildFut<F> {
 }
 
 impl<F> SignalChildFut<F> {
-    fn eager(err: ChildWorkflowSignalError) -> Self {
+    fn eager(err: WorkflowSignalError) -> Self {
         Self::Errored { error: Some(err) }
     }
 }
@@ -2087,7 +2087,7 @@ impl<F> Future for SignalChildFut<F>
 where
     F: Future<Output = SignalExternalWfResult> + Unpin,
 {
-    type Output = Result<(), ChildWorkflowSignalError>;
+    type Output = Result<(), WorkflowSignalError>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
@@ -2104,7 +2104,7 @@ where
                 Poll::Ready(Err(failure)) => Poll::Ready(Err(data_converter.to_error(
                     &SerializationContextData::Workflow,
                     failure,
-                    ChildWorkflowSignalDecodeHint,
+                    WorkflowSignalDecodeHint,
                 )?)),
             },
             SignalChildFut::Terminated => panic!("polled after termination"),
@@ -2125,7 +2125,7 @@ where
     }
 }
 
-impl<F> CancellableFuture<Result<(), ChildWorkflowSignalError>> for SignalChildFut<F>
+impl<F> CancellableFuture<Result<(), WorkflowSignalError>> for SignalChildFut<F>
 where
     F: CancellableFuture<SignalExternalWfResult> + Unpin,
 {
@@ -2168,7 +2168,7 @@ where
         &self,
         signal: S,
         input: S::Input,
-    ) -> impl CancellableFuture<Result<(), ChildWorkflowSignalError>> + 'static {
+    ) -> impl CancellableFuture<Result<(), WorkflowSignalError>> + 'static {
         let payload_converter = self.common.data_converter.payload_converter();
         let ctx = SerializationContext {
             data: &SerializationContextData::Workflow,

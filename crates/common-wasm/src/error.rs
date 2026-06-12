@@ -359,9 +359,9 @@ pub enum OutgoingWorkflowError {
     /// A workflow failure sourced from child-workflow start.
     #[error(transparent)]
     ChildWorkflowStart(#[from] Box<ChildWorkflowStartError>),
-    /// A workflow failure sourced from child-workflow signaling.
+    /// A workflow failure sourced from signaling a workflow.
     #[error(transparent)]
-    ChildWorkflowSignal(#[from] Box<ChildWorkflowSignalError>),
+    WorkflowSignal(#[from] Box<WorkflowSignalError>),
 }
 
 impl From<anyhow::Error> for OutgoingWorkflowError {
@@ -400,9 +400,9 @@ impl From<ChildWorkflowStartError> for OutgoingWorkflowError {
     }
 }
 
-impl From<ChildWorkflowSignalError> for OutgoingWorkflowError {
-    fn from(value: ChildWorkflowSignalError) -> Self {
-        Self::ChildWorkflowSignal(Box::new(value))
+impl From<WorkflowSignalError> for OutgoingWorkflowError {
+    fn from(value: WorkflowSignalError) -> Self {
+        Self::WorkflowSignal(Box::new(value))
     }
 }
 
@@ -1023,52 +1023,52 @@ impl ChildWorkflowExecutionError {
     }
 }
 
-/// Error returned when signaling a child workflow fails.
+/// Error returned when signaling a workflow fails.
 #[derive(Debug, thiserror::Error)]
-pub enum ChildWorkflowSignalError {
+pub enum WorkflowSignalError {
     /// The signal delivery failed.
     #[error("Child workflow signal failed: {}", .0.failure().message)]
-    Failed(#[source] Box<ChildWorkflowSignalFailureError>),
+    Failed(#[source] Box<WorkflowSignalFailureError>),
     /// Failed to serialize the signal input payload.
     #[error("Signal payload conversion failed: {0}")]
     Serialization(#[from] PayloadConversionError),
 }
 
-impl ChildWorkflowSignalError {
-    /// Returns the retained top-level child-workflow signal failure proto, if one exists.
+impl WorkflowSignalError {
+    /// Returns the retained top-level workflow signal failure proto, if one exists.
     pub fn failure(&self) -> Option<&Failure> {
         match self {
-            ChildWorkflowSignalError::Failed(err) => Some(err.failure()),
-            ChildWorkflowSignalError::Serialization(_) => None,
+            WorkflowSignalError::Failed(err) => Some(err.failure()),
+            WorkflowSignalError::Serialization(_) => None,
         }
     }
 
-    /// Returns the normalized cause of the child-workflow signal failure, if any.
+    /// Returns the normalized cause of the workflow signal failure, if any.
     pub fn cause(&self) -> Option<&IncomingError> {
         match self {
-            ChildWorkflowSignalError::Failed(err) => err.cause(),
-            ChildWorkflowSignalError::Serialization(_) => None,
+            WorkflowSignalError::Failed(err) => err.cause(),
+            WorkflowSignalError::Serialization(_) => None,
         }
     }
 
     /// Returns the underlying failure reason for wrapper-shaped signal failures.
     pub fn reason(&self) -> Option<&IncomingError> {
         match self {
-            ChildWorkflowSignalError::Failed(err) => Some(err.error()),
-            ChildWorkflowSignalError::Serialization(_) => None,
+            WorkflowSignalError::Failed(err) => Some(err.error()),
+            WorkflowSignalError::Serialization(_) => None,
         }
     }
 }
 
-/// A normalized child-workflow signal failure wrapper.
+/// A normalized workflow signal failure wrapper.
 #[derive(Debug)]
-pub struct ChildWorkflowSignalFailureError {
+pub struct WorkflowSignalFailureError {
     failure: Failure,
     error: Box<IncomingError>,
 }
 
-impl ChildWorkflowSignalFailureError {
-    /// Creates a child-workflow signal failure wrapper.
+impl WorkflowSignalFailureError {
+    /// Creates a workflow signal failure wrapper.
     pub(crate) fn new(failure: Failure, error: IncomingError) -> Self {
         Self {
             failure,
@@ -1081,7 +1081,7 @@ impl ChildWorkflowSignalFailureError {
         &self.failure
     }
 
-    /// Returns the normalized direct cause of the child-workflow signal failure, if any.
+    /// Returns the normalized direct cause of the workflow signal failure, if any.
     pub fn cause(&self) -> Option<&IncomingError> {
         self.error.cause()
     }
@@ -1092,13 +1092,13 @@ impl ChildWorkflowSignalFailureError {
     }
 }
 
-impl std::fmt::Display for ChildWorkflowSignalFailureError {
+impl std::fmt::Display for WorkflowSignalFailureError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         self.failure.fmt(f)
     }
 }
 
-impl std::error::Error for ChildWorkflowSignalFailureError {
+impl std::error::Error for WorkflowSignalFailureError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         self.cause()
             .map(|cause| cause as &(dyn std::error::Error + 'static))

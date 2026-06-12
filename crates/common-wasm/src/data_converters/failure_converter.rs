@@ -13,11 +13,11 @@ use super::{PayloadConversionError, PayloadConverter, SerializationContextData};
 use crate::{
     error::{
         ActivityExecutionError, ActivityFailureError, ApplicationFailure, CancelledError,
-        ChildWorkflowExecutionError, ChildWorkflowFailureError, ChildWorkflowSignalError,
-        ChildWorkflowSignalFailureError, ChildWorkflowStartError, IncomingError,
-        IncomingNexusHandlerError, IncomingNexusOperationExecutionError, OutgoingActivityError,
-        OutgoingError, OutgoingWorkflowError, ResetWorkflowError, ServerError, TerminatedError,
-        TimeoutError,
+        ChildWorkflowExecutionError, ChildWorkflowFailureError, ChildWorkflowStartError,
+        IncomingError, IncomingNexusHandlerError, IncomingNexusOperationExecutionError,
+        OutgoingActivityError, OutgoingError, OutgoingWorkflowError, ResetWorkflowError,
+        ServerError, TerminatedError, TimeoutError, WorkflowSignalError,
+        WorkflowSignalFailureError,
     },
     protos::temporal::api::{
         enums::v1::ApplicationErrorCategory as ProtoApplicationErrorCategory,
@@ -148,16 +148,16 @@ impl FailureDecodeHint for ChildWorkflowExecutionDecodeHint {
     }
 }
 
-/// Decode hint for child-workflow signal failures.
+/// Decode hint for workflow signal failures.
 #[derive(Debug, Clone, Copy)]
-pub struct ChildWorkflowSignalDecodeHint;
+pub struct WorkflowSignalDecodeHint;
 
-impl FailureDecodeHint for ChildWorkflowSignalDecodeHint {
-    type Output = ChildWorkflowSignalError;
+impl FailureDecodeHint for WorkflowSignalDecodeHint {
+    type Output = WorkflowSignalError;
 
     fn adapt(self, normalized: IncomingError) -> Self::Output {
         let failure = normalized.failure().clone();
-        ChildWorkflowSignalError::Failed(Box::new(ChildWorkflowSignalFailureError::new(
+        WorkflowSignalError::Failed(Box::new(WorkflowSignalFailureError::new(
             failure, normalized,
         )))
     }
@@ -187,7 +187,7 @@ impl FailureConverter for DefaultFailureConverter {
             OutgoingError::Workflow(OutgoingWorkflowError::ChildWorkflowStart(child)) => {
                 child.encode_failure(payload_converter, context)
             }
-            OutgoingError::Workflow(OutgoingWorkflowError::ChildWorkflowSignal(signal)) => {
+            OutgoingError::Workflow(OutgoingWorkflowError::WorkflowSignal(signal)) => {
                 signal.encode_failure(payload_converter, context)
             }
         };
@@ -223,7 +223,7 @@ enum ClassifiedFailure<'a> {
     ActivityExecution(&'a ActivityExecutionError),
     ChildWorkflowExecution(&'a ChildWorkflowExecutionError),
     ChildWorkflowStart(&'a ChildWorkflowStartError),
-    ChildWorkflowSignal(&'a ChildWorkflowSignalError),
+    WorkflowSignal(&'a WorkflowSignalError),
     Generic(&'a (dyn std::error::Error + 'static)),
 }
 
@@ -247,8 +247,8 @@ impl<'a> ClassifiedFailure<'a> {
             Self::ChildWorkflowExecution(child)
         } else if let Some(child) = err.downcast_ref::<ChildWorkflowStartError>() {
             Self::ChildWorkflowStart(child)
-        } else if let Some(child_signal) = err.downcast_ref::<ChildWorkflowSignalError>() {
-            Self::ChildWorkflowSignal(child_signal)
+        } else if let Some(child_signal) = err.downcast_ref::<WorkflowSignalError>() {
+            Self::WorkflowSignal(child_signal)
         } else {
             Self::Generic(err)
         }
@@ -288,7 +288,7 @@ impl<'a> ClassifiedFailure<'a> {
                 .unwrap_or_else(|converter_error| {
                     encode_failed_error_conversion(child, converter_error)
                 }),
-            Self::ChildWorkflowSignal(signal) => signal
+            Self::WorkflowSignal(signal) => signal
                 .encode_failure(
                     &PayloadConverter::default(),
                     &SerializationContextData::None,
@@ -390,7 +390,7 @@ impl EncodeFailure for ChildWorkflowStartError {
     }
 }
 
-impl EncodeFailure for ChildWorkflowSignalError {
+impl EncodeFailure for WorkflowSignalError {
     fn encode_failure(
         &self,
         _: &PayloadConverter,
@@ -1433,11 +1433,11 @@ mod tests {
             .to_error(
                 &SerializationContextData::Workflow,
                 failure.clone(),
-                ChildWorkflowSignalDecodeHint,
+                WorkflowSignalDecodeHint,
             )
             .unwrap();
 
-        let ChildWorkflowSignalError::Failed(decoded_failure) = decoded else {
+        let WorkflowSignalError::Failed(decoded_failure) = decoded else {
             panic!("expected failed child-workflow signal error");
         };
         assert_eq!(decoded_failure.failure(), &failure);

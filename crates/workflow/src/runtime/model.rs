@@ -10,7 +10,7 @@ use temporalio_common_wasm::{
     WorkflowDefinition,
     error::{
         ActivityExecutionError, ApplicationFailure, ChildWorkflowExecutionError,
-        ChildWorkflowSignalError,
+        WorkflowSignalError,
     },
     protos::{
         coresdk::{
@@ -268,8 +268,8 @@ impl From<ChildWorkflowExecutionError> for WorkflowTermination {
     }
 }
 
-impl From<ChildWorkflowSignalError> for WorkflowTermination {
-    fn from(value: ChildWorkflowSignalError) -> Self {
+impl From<WorkflowSignalError> for WorkflowTermination {
+    fn from(value: WorkflowSignalError) -> Self {
         Self::Failed(value.into())
     }
 }

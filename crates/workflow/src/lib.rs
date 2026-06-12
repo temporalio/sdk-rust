@@ -27,8 +27,8 @@ pub use runtime::model::{TimerResult, WorkflowResult, WorkflowTermination};
 #[doc(hidden)]
 pub use runtime::{SdkWakeGuard, is_sdk_wake};
 pub use temporalio_common_wasm::error::{
-    ActivityExecutionError, ChildWorkflowExecutionError, ChildWorkflowSignalError,
-    ChildWorkflowStartError,
+    ActivityExecutionError, ChildWorkflowExecutionError, ChildWorkflowStartError,
+    WorkflowSignalError,
 };
 pub use workflow_context::{
     ActivityCloseTimeouts, ActivityOptions, BaseWorkflowContext, CancellableFuture,
