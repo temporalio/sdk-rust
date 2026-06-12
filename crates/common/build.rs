@@ -8,8 +8,11 @@ use std::{
     env,
     fs::File,
     io::{Read, Write},
+    iter::repeat,
     path::Path,
 };
+
+use FieldPolicy::{NotValidated, Validated};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("cargo:rerun-if-env-changed=DEP_TEMPORALIO_PROTOS_DESCRIPTOR_PATH");
@@ -728,11 +731,11 @@ const EXTRA_WHOLE_MESSAGE_LEAVES: &[&str] = &[
 ];
 
 // Payload-limits decision tables — THE source of truth for how the SDK mirrors the server's
-// payload/memo size checks.
-//   - Blob          blob (payload) size limit, warn + error
-//   - Memo          memo size limit, warn + error
-//   - BlobWarn      blob limit, warning only
-//   - NotValidated  the server does not enforce a *replicable* limit on this field
+// payload/memo size checks. Fields are grouped by policy (the loader maps each list to a
+// `FieldPolicy`):
+//   - BLOB_FIELDS / MEMO_FIELDS  blob / memo limit, warn + error
+//   - BLOB_WARN_FIELDS           blob limit, warning only (enforce_error = false)
+//   - NOT_VALIDATED_FIELDS       the server enforces no replicable limit on the field
 //
 // Roots are derived automatically from the proto service definitions (every `temporal.api.*` RPC
 // *input* message; see `service_request_roots`), so a new RPC/request can't be silently missed — its
@@ -878,29 +881,33 @@ fn service_request_roots(descriptor_set: &FileDescriptorSet) -> Vec<String> {
     roots
 }
 
-/// The limit policy a payload field is subject to, per the decision table.
+/// Which limit a validated field is checked against — mirrors the runtime `LimitClass`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LimitClass {
-    /// Blob limit, warn + error.
     Blob,
-    /// Memo limit, warn + error.
     Memo,
-    /// Blob limit, warning only.
-    BlobWarn,
-    /// The server does not enforce a (replicable) limit on this field; recorded explicitly.
-    NotValidated,
 }
 
 impl LimitClass {
-    /// The generated `(LimitClass token, enforce_error)` pair, or `None` for `NotValidated`.
-    fn token(self) -> Option<(&'static str, bool)> {
+    /// The generated runtime `LimitClass` token.
+    fn token(self) -> &'static str {
         match self {
-            Self::Blob => Some(("crate::payload_limits::LimitClass::Blob", true)),
-            Self::Memo => Some(("crate::payload_limits::LimitClass::Memo", true)),
-            Self::BlobWarn => Some(("crate::payload_limits::LimitClass::Blob", false)),
-            Self::NotValidated => None,
+            Self::Blob => "crate::payload_limits::LimitClass::Blob",
+            Self::Memo => "crate::payload_limits::LimitClass::Memo",
         }
     }
+}
+
+/// How a field is classified in the decision table. A validated field carries its [`LimitClass`] and
+/// whether an over-limit is enforced as an error (warn + error) or warning-only — kept separate, as
+/// the runtime sink does. `NotValidated` fields emit no check.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FieldPolicy {
+    Validated {
+        class: LimitClass,
+        enforce_error: bool,
+    },
+    NotValidated,
 }
 
 /// What a (non-oneof) field resolves to for limit purposes.
@@ -1031,22 +1038,29 @@ fn generate_payload_limits_validator(
     Ok(())
 }
 
-/// Load the decision table: `field proto path -> limit class`.
-fn load_payload_limits_table() -> Result<HashMap<String, LimitClass>, Box<dyn std::error::Error>> {
-    use std::iter::repeat;
+/// Load the decision table: `field proto path -> FieldPolicy`.
+fn load_payload_limits_table() -> Result<HashMap<String, FieldPolicy>, Box<dyn std::error::Error>> {
+    let blob = Validated {
+        class: LimitClass::Blob,
+        enforce_error: true,
+    };
+    let memo = Validated {
+        class: LimitClass::Memo,
+        enforce_error: true,
+    };
+    let blob_warn = Validated {
+        class: LimitClass::Blob,
+        enforce_error: false,
+    };
     let entries = BLOB_FIELDS
         .iter()
-        .zip(repeat(LimitClass::Blob))
-        .chain(MEMO_FIELDS.iter().zip(repeat(LimitClass::Memo)))
-        .chain(BLOB_WARN_FIELDS.iter().zip(repeat(LimitClass::BlobWarn)))
-        .chain(
-            NOT_VALIDATED_FIELDS
-                .iter()
-                .zip(repeat(LimitClass::NotValidated)),
-        );
+        .zip(repeat(blob))
+        .chain(MEMO_FIELDS.iter().zip(repeat(memo)))
+        .chain(BLOB_WARN_FIELDS.iter().zip(repeat(blob_warn)))
+        .chain(NOT_VALIDATED_FIELDS.iter().zip(repeat(NotValidated)));
     let mut map = HashMap::new();
-    for (path, class) in entries {
-        if map.insert((*path).to_string(), class).is_some() {
+    for (path, classification) in entries {
+        if map.insert((*path).to_string(), classification).is_some() {
             return Err(format!("payload-limits: duplicate table entry for `{path}`").into());
         }
     }
@@ -1163,7 +1177,7 @@ fn classify_field(
 fn generate_limits_impl(
     base: &PayloadVisitorGenerator,
     proto_name: &str,
-    table: &HashMap<String, LimitClass>,
+    table: &HashMap<String, FieldPolicy>,
     used_keys: &mut HashSet<String>,
     unclassified: &mut Vec<String>,
 ) -> String {
@@ -1300,17 +1314,17 @@ fn is_map_field(parent_msg: &DescriptorProto, field: &FieldDescriptorProto) -> b
     })
 }
 
-/// Resolve the table class for a leaf path, recording usage / lack of classification.
+/// Resolve the classification for a leaf path, recording usage / lack of classification.
 fn leaf_class(
     proto_path: &str,
-    table: &HashMap<String, LimitClass>,
+    table: &HashMap<String, FieldPolicy>,
     used_keys: &mut HashSet<String>,
     unclassified: &mut Vec<String>,
-) -> Option<LimitClass> {
+) -> Option<FieldPolicy> {
     match table.get(proto_path) {
-        Some(class) => {
+        Some(classification) => {
             used_keys.insert(proto_path.to_string());
-            Some(*class)
+            Some(*classification)
         }
         None => {
             unclassified.push(proto_path.to_string());
@@ -1356,17 +1370,19 @@ fn emit_leaf(
     proto_field: &str,
     rust_field: &str,
     kind: LeafKind,
-    table: &HashMap<String, LimitClass>,
+    table: &HashMap<String, FieldPolicy>,
     used_keys: &mut HashSet<String>,
     unclassified: &mut Vec<String>,
 ) -> String {
-    let Some(class) = leaf_class(proto_path, table, used_keys, unclassified) else {
-        return String::new();
+    let Some(FieldPolicy::Validated {
+        class,
+        enforce_error,
+    }) = leaf_class(proto_path, table, used_keys, unclassified)
+    else {
+        return String::new(); // unclassified (build fails) or NotValidated (no check)
     };
     let kind = effective_kind(kind, class);
-    let Some((class_token, enforce)) = class.token() else {
-        return String::new(); // NotValidated
-    };
+    let class_token = class.token();
     match kind {
         // Optional message singulars: guard on Some.
         LeafKind::SinglePayloads
@@ -1378,7 +1394,7 @@ fn emit_leaf(
         | LeafKind::WholeMessage => {
             let size = leaf_size_expr(kind, "inner");
             format!(
-                "        if let Some(inner) = &self.{rust_field} {{\n            sink.check(\"{proto_field}\", {class_token}, {size}, {enforce});\n        }}\n"
+                "        if let Some(inner) = &self.{rust_field} {{\n            sink.check(\"{proto_field}\", {class_token}, {size}, {enforce_error});\n        }}\n"
             )
         }
         // Repeated / map: always present (empty -> 0, harmless).
@@ -1388,7 +1404,9 @@ fn emit_leaf(
         | LeafKind::MapPayloads => {
             let accessor = format!("self.{rust_field}");
             let size = leaf_size_expr(kind, &accessor);
-            format!("        sink.check(\"{proto_field}\", {class_token}, {size}, {enforce});\n")
+            format!(
+                "        sink.check(\"{proto_field}\", {class_token}, {size}, {enforce_error});\n"
+            )
         }
     }
 }
@@ -1398,19 +1416,21 @@ fn oneof_leaf_check(
     proto_path: &str,
     proto_field: &str,
     kind: LeafKind,
-    table: &HashMap<String, LimitClass>,
+    table: &HashMap<String, FieldPolicy>,
     used_keys: &mut HashSet<String>,
     unclassified: &mut Vec<String>,
 ) -> String {
-    let Some(class) = leaf_class(proto_path, table, used_keys, unclassified) else {
+    let Some(FieldPolicy::Validated {
+        class,
+        enforce_error,
+    }) = leaf_class(proto_path, table, used_keys, unclassified)
+    else {
         return String::new();
     };
     let kind = effective_kind(kind, class);
-    let Some((class_token, enforce)) = class.token() else {
-        return String::new();
-    };
+    let class_token = class.token();
     let size = leaf_size_expr(kind, "inner");
-    format!("sink.check(\"{proto_field}\", {class_token}, {size}, {enforce});")
+    format!("sink.check(\"{proto_field}\", {class_token}, {size}, {enforce_error});")
 }
 
 /// Adjust a leaf's measurement for its classified limit. A `Memo` validated against the *blob*
@@ -1418,9 +1438,7 @@ fn oneof_leaf_check(
 /// `ModifyWorkflowProperties.upserted_memo`); a memo-classed `Memo` keeps whole-proto `memo_size`.
 fn effective_kind(kind: LeafKind, class: LimitClass) -> LeafKind {
     match (kind, class) {
-        (LeafKind::SingleMemo, LimitClass::Blob | LimitClass::BlobWarn) => {
-            LeafKind::MemoFieldsDataSum
-        }
+        (LeafKind::SingleMemo, LimitClass::Blob) => LeafKind::MemoFieldsDataSum,
         _ => kind,
     }
 }
