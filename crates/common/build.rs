@@ -36,8 +36,12 @@ fn generate_payload_visitor(
     File::open(descriptor_path)?.read_to_end(&mut descriptor_bytes)?;
     let descriptor_set = FileDescriptorSet::decode(&descriptor_bytes[..])?;
 
-    let mut generator = PayloadVisitorGenerator::new();
-    generator.process_descriptors(&descriptor_set);
+    let model = PayloadModel::build(&descriptor_set);
+    let mut generator = PayloadVisitorGenerator {
+        model,
+        message_fields: HashMap::new(),
+    };
+    generator.build_field_infos();
 
     let output_path = out_dir.join("payload_visitor_impl.rs");
     let mut file = File::create(&output_path)?;
@@ -87,50 +91,36 @@ struct OneofVariant {
     name: String,
 }
 
-/// Generator for PayloadVisitable implementations.
-struct PayloadVisitorGenerator {
+struct PayloadModel {
     /// Maps fully qualified message names to their descriptors
     messages: HashMap<String, DescriptorProto>,
-    /// Messages that contain Payloads (directly or transitively)
+    /// Message names that contain Payloads (directly or transitively)
     payload_containing: HashSet<String>,
     /// Types currently being checked (for cycle detection)
     checking: HashSet<String>,
     /// Types that have been checked and don't contain payloads
     not_payload_containing: HashSet<String>,
-    /// The payload fields for each message
-    message_fields: HashMap<String, Vec<PayloadFieldInfo>>,
 }
 
-impl PayloadVisitorGenerator {
-    fn new() -> Self {
-        Self {
+impl PayloadModel {
+    fn build(descriptor_set: &FileDescriptorSet) -> Self {
+        let mut model = Self {
             messages: HashMap::new(),
             payload_containing: HashSet::new(),
             checking: HashSet::new(),
             not_payload_containing: HashSet::new(),
-            message_fields: HashMap::new(),
-        }
-    }
-
-    fn process_descriptors(&mut self, descriptor_set: &FileDescriptorSet) {
-        // First pass: collect all message types
+        };
         for file in &descriptor_set.file {
             let package = file.package.as_deref().unwrap_or("");
             for msg in &file.message_type {
-                self.collect_messages(package, msg);
+                model.collect_messages(package, msg);
             }
         }
-
-        // Second pass: find payload-containing types
-        let all_names: Vec<String> = self.messages.keys().cloned().collect();
+        let all_names: Vec<String> = model.messages.keys().cloned().collect();
         for name in &all_names {
-            self.check_contains_payload(name);
+            model.check_contains_payload(name);
         }
-
-        // Third pass: build field info for payload-containing types
-        for name in self.payload_containing.clone() {
-            self.build_field_info(&name);
-        }
+        model
     }
 
     fn collect_messages(&mut self, package: &str, msg: &DescriptorProto) {
@@ -207,54 +197,32 @@ impl PayloadVisitorGenerator {
         msg: &DescriptorProto,
         field: &FieldDescriptorProto,
     ) -> bool {
-        if is_message_type(field) {
-            let type_name = field.type_name.as_deref().unwrap_or("");
-            let type_name = type_name.trim_start_matches('.');
-
-            // Check if this is a map type
-            if let Some(nested) = msg.nested_type.iter().find(|n| {
-                is_map_entry(&n.options)
-                    && n.name.as_deref()
-                        == Some(&Self::to_map_entry_name(
-                            field.name.as_deref().unwrap_or(""),
-                        ))
-            }) {
-                // It's a map - check the value type
-                if let Some(value_field) = nested
-                    .field
-                    .iter()
-                    .find(|f| f.name.as_deref() == Some("value"))
-                {
-                    let value_type = value_field
-                        .type_name
-                        .as_deref()
-                        .unwrap_or("")
-                        .trim_start_matches('.');
-                    return self.check_contains_payload(value_type);
-                }
-            }
-
-            return self.check_contains_payload(type_name);
+        if !is_message_type(field) {
+            return false;
         }
-
-        false
+        // For a map, follow the value type; otherwise the field's own message type.
+        let target = match map_value_type(msg, field) {
+            Some(value_type) => value_type,
+            None => field
+                .type_name
+                .as_deref()
+                .unwrap_or("")
+                .trim_start_matches('.'),
+        };
+        self.check_contains_payload(target)
     }
+}
 
-    fn to_map_entry_name(field_name: &str) -> String {
-        let mut result = String::new();
-        let mut capitalize_next = true;
-        for c in field_name.chars() {
-            if c == '_' {
-                capitalize_next = true;
-            } else if capitalize_next {
-                result.push(c.to_ascii_uppercase());
-                capitalize_next = false;
-            } else {
-                result.push(c);
-            }
+struct PayloadVisitorGenerator {
+    model: PayloadModel,
+    message_fields: HashMap<String, Vec<PayloadFieldInfo>>,
+}
+
+impl PayloadVisitorGenerator {
+    fn build_field_infos(&mut self) {
+        for name in self.model.payload_containing.clone() {
+            self.build_field_info(&name);
         }
-        result.push_str("Entry");
-        result
     }
 
     fn build_field_info(&mut self, name: &str) {
@@ -267,7 +235,7 @@ impl PayloadVisitorGenerator {
             return;
         }
 
-        let msg = match self.messages.get(name) {
+        let msg = match self.model.messages.get(name) {
             Some(m) => m.clone(),
             None => return,
         };
@@ -307,7 +275,7 @@ impl PayloadVisitorGenerator {
                         .as_deref()
                         .unwrap_or("")
                         .trim_start_matches('.');
-                    if self.payload_containing.contains(type_name) {
+                    if self.model.payload_containing.contains(type_name) {
                         variants.push(OneofVariant {
                             name: field.name.clone().unwrap_or_default(),
                         });
@@ -340,79 +308,30 @@ impl PayloadVisitorGenerator {
         let field_name = field.name.as_deref().unwrap_or("");
         let proto_path = format!("{}.{}", parent_name, field_name);
 
-        if !is_message_type(field) {
-            return None;
-        }
-
-        let type_name = field
-            .type_name
-            .as_deref()
-            .unwrap_or("")
-            .trim_start_matches('.');
-
-        // Check if it's a map
-        if let Some(nested) = parent_msg.nested_type.iter().find(|n| {
-            is_map_entry(&n.options)
-                && n.name.as_deref() == Some(&Self::to_map_entry_name(field_name))
-        }) {
-            let value_field = nested
-                .field
-                .iter()
-                .find(|f| f.name.as_deref() == Some("value"))?;
-            let value_type = value_field
-                .type_name
-                .as_deref()
-                .unwrap_or("")
-                .trim_start_matches('.');
-
-            if !self.payload_containing.contains(value_type) {
-                return None;
-            }
-
-            if value_type == "temporal.api.common.v1.Payload" {
-                return Some(PayloadFieldInfo {
-                    name: field_name.to_string(),
-                    proto_path,
-                    kind: PayloadFieldKind::MapPayload,
-                });
-            } else {
-                return Some(PayloadFieldInfo {
-                    name: field_name.to_string(),
-                    proto_path,
-                    kind: PayloadFieldKind::MapNestedMessage,
-                });
-            }
-        }
-
-        if !self.payload_containing.contains(type_name) {
-            return None;
-        }
-
-        let is_repeated = is_repeated(field);
-
-        if type_name == "temporal.api.common.v1.Payload" {
-            Some(PayloadFieldInfo {
-                name: field_name.to_string(),
-                proto_path,
-                kind: if is_repeated {
-                    PayloadFieldKind::RepeatedPayload
+        let kind = match field_shape(&self.model, parent_msg, field)? {
+            FieldShape::Map(value_type) => {
+                if value_type == "temporal.api.common.v1.Payload" {
+                    PayloadFieldKind::MapPayload
                 } else {
-                    PayloadFieldKind::SinglePayload
-                },
-            })
-        } else if type_name == "temporal.api.common.v1.Payloads" {
-            Some(PayloadFieldInfo {
-                name: field_name.to_string(),
-                proto_path,
-                kind: PayloadFieldKind::PayloadsMessage,
-            })
-        } else {
-            Some(PayloadFieldInfo {
-                name: field_name.to_string(),
-                proto_path,
-                kind: PayloadFieldKind::NestedMessage,
-            })
-        }
+                    PayloadFieldKind::MapNestedMessage
+                }
+            }
+            FieldShape::Single(t) => match t.as_str() {
+                "temporal.api.common.v1.Payload" => PayloadFieldKind::SinglePayload,
+                "temporal.api.common.v1.Payloads" => PayloadFieldKind::PayloadsMessage,
+                _ => PayloadFieldKind::NestedMessage,
+            },
+            FieldShape::Repeated(t) => match t.as_str() {
+                "temporal.api.common.v1.Payload" => PayloadFieldKind::RepeatedPayload,
+                "temporal.api.common.v1.Payloads" => PayloadFieldKind::PayloadsMessage,
+                _ => PayloadFieldKind::NestedMessage,
+            },
+        };
+        Some(PayloadFieldInfo {
+            name: field_name.to_string(),
+            proto_path,
+            kind,
+        })
     }
 
     fn generate(&self) -> String {
@@ -420,7 +339,7 @@ impl PayloadVisitorGenerator {
         output.push_str("// Generated from descriptors.bin - DO NOT EDIT\n\n");
 
         // Generate impls for each payload-containing type
-        for name in self.payload_containing.iter() {
+        for name in self.model.payload_containing.iter() {
             if name == "temporal.api.common.v1.Payload" || name == "temporal.api.common.v1.Payloads"
             {
                 continue;
@@ -435,7 +354,7 @@ impl PayloadVisitorGenerator {
     }
 
     fn generate_impl(&self, proto_name: &str, fields: &[PayloadFieldInfo]) -> String {
-        let rust_path = self.proto_to_rust_path(proto_name);
+        let rust_path = proto_to_rust_path(proto_name);
 
         let mut impl_body = String::new();
 
@@ -470,7 +389,7 @@ impl crate::payload_visitor::PayloadVisitable for {rust_path} {{
         proto_path: &str,
         kind: &PayloadFieldKind,
     ) -> String {
-        let rust_field = Self::to_snake_case(field_name);
+        let rust_field = to_snake_case(field_name);
 
         match kind {
             PayloadFieldKind::SinglePayload => {
@@ -535,7 +454,7 @@ impl crate::payload_visitor::PayloadVisitable for {rust_path} {{
             PayloadFieldKind::NestedMessage => {
                 // Check if the field in the parent is repeated
                 let parent_name = proto_path.rsplit_once('.').map(|(p, _)| p).unwrap_or("");
-                let is_field_repeated = if let Some(msg) = self.messages.get(parent_name) {
+                let is_field_repeated = if let Some(msg) = self.model.messages.get(parent_name) {
                     msg.field
                         .iter()
                         .any(|f| f.name.as_deref() == Some(field_name) && is_repeated(f))
@@ -569,14 +488,14 @@ impl crate::payload_visitor::PayloadVisitable for {rust_path} {{
                 // Compute the parent proto name from the proto_path
                 let parent_proto_name = proto_path.rsplit_once('.').map(|(p, _)| p).unwrap_or("");
                 // Get the full rust path to the oneof enum
-                let enum_path = self.proto_to_rust_oneof_enum_path(parent_proto_name, oneof_name);
+                let enum_path = proto_to_rust_oneof_enum_path(parent_proto_name, oneof_name);
                 // The field in the struct is snake_case of the oneof field name
-                let rust_field = Self::to_snake_case(oneof_name);
+                let rust_field = to_snake_case(oneof_name);
 
                 let mut arms = String::new();
 
                 for variant in variants {
-                    let variant_name = Self::to_pascal_case(&variant.name);
+                    let variant_name = to_pascal_case(&variant.name);
                     arms.push_str(&format!(
                         "                {enum_path}::{variant}(msg) => msg.visit_payloads_mut(visitor).await,\n",
                         enum_path = enum_path,
@@ -608,75 +527,92 @@ impl crate::payload_visitor::PayloadVisitable for {rust_path} {{
             }
         }
     }
+}
 
-    fn proto_to_rust_path(&self, proto_name: &str) -> String {
-        let parts: Vec<&str> = proto_name.split('.').collect();
-        let mut rust_parts = Vec::new();
+fn to_map_entry_name(field_name: &str) -> String {
+    let mut result = String::new();
+    let mut capitalize_next = true;
+    for c in field_name.chars() {
+        if c == '_' {
+            capitalize_next = true;
+        } else if capitalize_next {
+            result.push(c.to_ascii_uppercase());
+            capitalize_next = false;
+        } else {
+            result.push(c);
+        }
+    }
+    result.push_str("Entry");
+    result
+}
 
-        // Handle the package -> module mapping
-        for (i, part) in parts.iter().enumerate() {
-            if i == parts.len() - 1 {
-                // Last part is the type name - keep PascalCase
-                rust_parts.push((*part).to_string());
-            } else {
-                // Package parts become snake_case modules
-                rust_parts.push(Self::to_snake_case(part));
+fn proto_to_rust_path(proto_name: &str) -> String {
+    let parts: Vec<&str> = proto_name.split('.').collect();
+    let mut rust_parts = Vec::new();
+
+    // Handle the package -> module mapping
+    for (i, part) in parts.iter().enumerate() {
+        if i == parts.len() - 1 {
+            // Last part is the type name - keep PascalCase
+            rust_parts.push((*part).to_string());
+        } else {
+            // Package parts become snake_case modules
+            rust_parts.push(to_snake_case(part));
+        }
+    }
+
+    // The protos module structure
+    let path = rust_parts.join("::");
+
+    // Map to the actual crate paths
+    format!("crate::protos::{}", path)
+}
+
+fn proto_to_rust_oneof_enum_path(parent_proto_name: &str, oneof_name: &str) -> String {
+    let parts: Vec<&str> = parent_proto_name.split('.').collect();
+    let mut rust_parts = Vec::new();
+
+    // All parts become snake_case modules (struct name becomes a module containing the enum)
+    for part in parts.iter() {
+        rust_parts.push(to_snake_case(part));
+    }
+
+    let module_path = rust_parts.join("::");
+    // The enum name is PascalCase of the oneof field name
+    let enum_name = to_pascal_case(oneof_name);
+
+    format!("crate::protos::{}::{}", module_path, enum_name)
+}
+
+fn to_snake_case(s: &str) -> String {
+    let mut result = String::new();
+    for (i, c) in s.chars().enumerate() {
+        if c.is_uppercase() {
+            if i > 0 {
+                result.push('_');
             }
+            result.push(c.to_ascii_lowercase());
+        } else {
+            result.push(c);
         }
-
-        // The protos module structure
-        let path = rust_parts.join("::");
-
-        // Map to the actual crate paths
-        format!("crate::protos::{}", path)
     }
+    result
+}
 
-    fn proto_to_rust_oneof_enum_path(&self, parent_proto_name: &str, oneof_name: &str) -> String {
-        let parts: Vec<&str> = parent_proto_name.split('.').collect();
-        let mut rust_parts = Vec::new();
-
-        // All parts become snake_case modules (struct name becomes a module containing the enum)
-        for part in parts.iter() {
-            rust_parts.push(Self::to_snake_case(part));
+fn to_pascal_case(s: &str) -> String {
+    let mut result = String::new();
+    let mut capitalize_next = true;
+    for c in s.chars() {
+        if c == '_' {
+            capitalize_next = true;
+        } else if capitalize_next {
+            result.push(c.to_ascii_uppercase());
+            capitalize_next = false;
+        } else {
+            result.push(c);
         }
-
-        let module_path = rust_parts.join("::");
-        // The enum name is PascalCase of the oneof field name
-        let enum_name = Self::to_pascal_case(oneof_name);
-
-        format!("crate::protos::{}::{}", module_path, enum_name)
     }
-
-    fn to_snake_case(s: &str) -> String {
-        let mut result = String::new();
-        for (i, c) in s.chars().enumerate() {
-            if c.is_uppercase() {
-                if i > 0 {
-                    result.push('_');
-                }
-                result.push(c.to_ascii_lowercase());
-            } else {
-                result.push(c);
-            }
-        }
-        result
-    }
-
-    fn to_pascal_case(s: &str) -> String {
-        let mut result = String::new();
-        let mut capitalize_next = true;
-        for c in s.chars() {
-            if c == '_' {
-                capitalize_next = true;
-            } else if capitalize_next {
-                result.push(c.to_ascii_uppercase());
-                capitalize_next = false;
-            } else {
-                result.push(c);
-            }
-        }
-        result
-    }
+    result
 }
 
 fn is_message_type(field: &FieldDescriptorProto) -> bool {
@@ -693,22 +629,83 @@ fn is_map_entry(options: &Option<MessageOptions>) -> bool {
         .is_some_and(|o| o.map_entry.unwrap_or(false))
 }
 
+/// If `field` is a proto map, the fully-qualified name of its value type (leading `.` trimmed).
+/// `None` if the field isn't a map.
+fn map_value_type<'a>(
+    parent_msg: &'a DescriptorProto,
+    field: &FieldDescriptorProto,
+) -> Option<&'a str> {
+    let entry_name = to_map_entry_name(field.name.as_deref().unwrap_or(""));
+    let entry = parent_msg
+        .nested_type
+        .iter()
+        .find(|n| is_map_entry(&n.options) && n.name.as_deref() == Some(&entry_name))?;
+    let value = entry
+        .field
+        .iter()
+        .find(|f| f.name.as_deref() == Some("value"))?;
+    Some(
+        value
+            .type_name
+            .as_deref()
+            .unwrap_or("")
+            .trim_start_matches('.'),
+    )
+}
+
+/// The payload-relevant structural shape of a single (non-oneof) field, carrying the
+/// fully-qualified target type. `None` for non-message fields and for message fields whose target
+/// isn't payload-containing — both generators ignore those. The *terminal-vs-recurse* decision and
+/// any measurement strategy are left to each generator, since they draw that boundary differently.
+enum FieldShape {
+    Single(String),
+    Repeated(String),
+    Map(String),
+}
+
+fn field_shape(
+    model: &PayloadModel,
+    parent_msg: &DescriptorProto,
+    field: &FieldDescriptorProto,
+) -> Option<FieldShape> {
+    if !is_message_type(field) {
+        return None;
+    }
+    if let Some(value_type) = map_value_type(parent_msg, field) {
+        return model
+            .payload_containing
+            .contains(value_type)
+            .then(|| FieldShape::Map(value_type.to_string()));
+    }
+    let type_name = field
+        .type_name
+        .as_deref()
+        .unwrap_or("")
+        .trim_start_matches('.');
+    if !model.payload_containing.contains(type_name) {
+        return None;
+    }
+    Some(if is_repeated(field) {
+        FieldShape::Repeated(type_name.to_string())
+    } else {
+        FieldShape::Single(type_name.to_string())
+    })
+}
+
 // ===========================================================================
 // Payload-limits validator generator
 //
-// Emits `PayloadLimitsValidatable` impls for the closure of outbound gRPC request
-// messages, dispatching each payload-bearing *leaf* field through a hand-authored
-// decision tables (`*_FIELDS`, grouped by class) mapping `(message.field)` -> limit class.
-// The *measurement strategy* is derived mechanically from each field's proto shape;
-// the table only records the specified class decision (blob / memo / not).
+// The decision table (`*_FIELDS`, grouped by class) records only the limit class per
+// `(message.field)`; the measurement strategy is derived mechanically from each field's
+// proto shape, so editing the table never means re-deciding how a field is measured.
 //
 // Any payload-bearing leaf field that is missing from the table -- or any stale table
 // entry no longer produced by the descriptor walk -- fails the build. This is the
 // compile-time forcing function: a proto change cannot land until classified here.
 // ===========================================================================
 
-/// Fully-qualified proto names whose value is a *measurable unit* the server checks as a whole.
-/// The generator stops recursion at these and emits a table-driven leaf check at the parent field.
+/// The generator stops recursion at these types and emits a table-driven leaf check at the parent
+/// field, rather than descending into their inner payload fields.
 const TERMINAL_LEAVES: &[&str] = &[
     "temporal.api.common.v1.Payload",
     "temporal.api.common.v1.Payloads",
@@ -739,8 +736,7 @@ const EXTRA_WHOLE_MESSAGE_LEAVES: &[&str] = &[
 //
 // Roots are derived automatically from the proto service definitions (every `temporal.api.*` RPC
 // *input* message; see `service_request_roots`), so a new RPC/request can't be silently missed — its
-// payload fields become unclassified and fail the build until added below. The measurement strategy
-// is derived mechanically from the field's proto shape.
+// payload fields become unclassified and fail the build until added below.
 const BLOB_FIELDS: &[&str] = &[
     "temporal.api.command.v1.CompleteWorkflowExecutionCommandAttributes.result",
     "temporal.api.command.v1.ContinueAsNewWorkflowExecutionCommandAttributes.input",
@@ -881,7 +877,6 @@ fn service_request_roots(descriptor_set: &FileDescriptorSet) -> Vec<String> {
     roots
 }
 
-/// Which limit a validated field is checked against — mirrors the runtime `LimitClass`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LimitClass {
     Blob,
@@ -889,7 +884,6 @@ enum LimitClass {
 }
 
 impl LimitClass {
-    /// The generated runtime `LimitClass` token.
     fn token(self) -> &'static str {
         match self {
             Self::Blob => "crate::payload_limits::LimitClass::Blob",
@@ -898,25 +892,19 @@ impl LimitClass {
     }
 }
 
-/// How a field is classified in the decision table. A validated field carries its [`LimitClass`] and
-/// whether an over-limit is enforced as an error (warn + error) or warning-only — kept separate, as
-/// the runtime sink does. `NotValidated` fields emit no check.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FieldPolicy {
     Validated {
         class: LimitClass,
+        /// When false, an over-limit is reported warning-only (never escalated to an error).
         enforce_error: bool,
     },
     NotValidated,
 }
 
-/// What a (non-oneof) field resolves to for limit purposes.
 enum Target {
-    /// A measurable leaf requiring a table entry at the field's proto path.
     Leaf(LeafKind),
-    /// A payload-containing nested message to recurse into.
     Struct(StructShape, String),
-    /// Not payload-bearing; ignored.
     Skip,
 }
 
@@ -955,24 +943,14 @@ fn generate_payload_limits_validator(
     File::open(descriptor_path)?.read_to_end(&mut descriptor_bytes)?;
     let descriptor_set = FileDescriptorSet::decode(&descriptor_bytes[..])?;
 
-    // Reuse the visitor generator's first two passes for message collection + payload reachability.
-    let mut base = PayloadVisitorGenerator::new();
-    for file in &descriptor_set.file {
-        let package = file.package.as_deref().unwrap_or("");
-        for msg in &file.message_type {
-            base.collect_messages(package, msg);
-        }
-    }
-    let all_names: Vec<String> = base.messages.keys().cloned().collect();
-    for name in &all_names {
-        base.check_contains_payload(name);
-    }
+    // Reuse the visitor generator's message collection + payload reachability.
+    let mut model = PayloadModel::build(&descriptor_set);
 
     // Force the owners of extra whole-message leaves to be treated as validatable, so the closure
     // walk recurses into them (e.g. RespondWorkflowTaskCompletedRequest.messages -> Message.body).
     for path in EXTRA_WHOLE_MESSAGE_LEAVES {
         if let Some((owner, _)) = path.rsplit_once('.') {
-            base.payload_containing.insert(owner.to_string());
+            model.payload_containing.insert(owner.to_string());
         }
     }
 
@@ -982,7 +960,7 @@ fn generate_payload_limits_validator(
 
     // Compute the closure of structural messages reachable from the service request roots.
     let roots = service_request_roots(&descriptor_set);
-    let to_generate = limits_closure(&base, &roots);
+    let to_generate = limits_closure(&model, &roots);
 
     let mut output = String::new();
     output.push_str("// Generated from descriptors.bin - DO NOT EDIT\n");
@@ -992,7 +970,7 @@ fn generate_payload_limits_validator(
     generate_names.sort();
     for name in &generate_names {
         output.push_str(&generate_limits_impl(
-            &base,
+            &model,
             name,
             &table,
             &mut used_keys,
@@ -1038,7 +1016,6 @@ fn generate_payload_limits_validator(
     Ok(())
 }
 
-/// Load the decision table: `field proto path -> FieldPolicy`.
 fn load_payload_limits_table() -> Result<HashMap<String, FieldPolicy>, Box<dyn std::error::Error>> {
     let blob = Validated {
         class: LimitClass::Blob,
@@ -1069,22 +1046,22 @@ fn load_payload_limits_table() -> Result<HashMap<String, FieldPolicy>, Box<dyn s
 
 /// BFS from the roots, following payload-containing structural fields, collecting the message types
 /// that need a generated `PayloadLimitsValidatable` impl (excludes terminal leaf types).
-fn limits_closure(base: &PayloadVisitorGenerator, roots: &[String]) -> HashSet<String> {
+fn limits_closure(model: &PayloadModel, roots: &[String]) -> HashSet<String> {
     let mut result = HashSet::new();
     let mut queue: Vec<String> = roots.to_vec();
     while let Some(name) = queue.pop() {
         if TERMINAL_LEAVES.contains(&name.as_str()) || result.contains(&name) {
             continue;
         }
-        let Some(msg) = base.messages.get(&name) else {
+        let Some(msg) = model.messages.get(&name) else {
             continue;
         };
-        if !base.payload_containing.contains(&name) {
+        if !model.payload_containing.contains(&name) {
             continue;
         }
         result.insert(name.clone());
         for field in &msg.field {
-            if let Target::Struct(_, ty) = classify_field(base, msg, field) {
+            if let Target::Struct(_, ty) = classify_field(model, msg, field) {
                 queue.push(ty);
             } else if is_message_type(field) {
                 // Oneof variants are message-typed; enqueue payload-containing structural variants.
@@ -1094,7 +1071,7 @@ fn limits_closure(base: &PayloadVisitorGenerator, roots: &[String]) -> HashSet<S
                     .unwrap_or("")
                     .trim_start_matches('.')
                     .to_string();
-                if base.payload_containing.contains(&ty) && !TERMINAL_LEAVES.contains(&ty.as_str())
+                if model.payload_containing.contains(&ty) && !TERMINAL_LEAVES.contains(&ty.as_str())
                 {
                     queue.push(ty);
                 }
@@ -1104,86 +1081,56 @@ fn limits_closure(base: &PayloadVisitorGenerator, roots: &[String]) -> HashSet<S
     result
 }
 
-/// Classify a (non-map-handling-aside) field into a leaf check or a structural recursion.
 fn classify_field(
-    base: &PayloadVisitorGenerator,
+    model: &PayloadModel,
     parent_msg: &DescriptorProto,
     field: &FieldDescriptorProto,
 ) -> Target {
-    if !is_message_type(field) {
+    let Some(shape) = field_shape(model, parent_msg, field) else {
         return Target::Skip;
-    }
-    let field_name = field.name.as_deref().unwrap_or("");
-    let type_name = field
-        .type_name
-        .as_deref()
-        .unwrap_or("")
-        .trim_start_matches('.');
-
-    // Map fields: classified by their value type.
-    if let Some(nested) = parent_msg.nested_type.iter().find(|n| {
-        is_map_entry(&n.options)
-            && n.name.as_deref() == Some(&PayloadVisitorGenerator::to_map_entry_name(field_name))
-    }) {
-        let value_field = nested
-            .field
-            .iter()
-            .find(|f| f.name.as_deref() == Some("value"));
-        let value_type = value_field
-            .and_then(|f| f.type_name.as_deref())
-            .unwrap_or("")
-            .trim_start_matches('.');
-        return match value_type {
+    };
+    match shape {
+        FieldShape::Map(value_type) => match value_type.as_str() {
             "temporal.api.common.v1.Payload" => Target::Leaf(LeafKind::MapPayload),
             "temporal.api.common.v1.Payloads" => Target::Leaf(LeafKind::MapPayloads),
-            other if base.payload_containing.contains(other) => {
-                Target::Struct(StructShape::Map, other.to_string())
-            }
-            _ => Target::Skip,
-        };
-    }
-
-    if !base.payload_containing.contains(type_name) {
-        return Target::Skip;
-    }
-
-    let repeated = is_repeated(field);
-    match type_name {
-        "temporal.api.common.v1.Payload" => Target::Leaf(if repeated {
-            LeafKind::RepeatedPayload
-        } else {
-            LeafKind::SinglePayload
-        }),
-        "temporal.api.common.v1.Payloads" => Target::Leaf(LeafKind::SinglePayloads),
-        "temporal.api.common.v1.Memo" => Target::Leaf(LeafKind::SingleMemo),
-        "temporal.api.common.v1.Header" => Target::Leaf(LeafKind::SingleHeader),
-        "temporal.api.common.v1.SearchAttributes" => Target::Leaf(LeafKind::SingleSearchAttributes),
-        "temporal.api.failure.v1.Failure" => Target::Leaf(if repeated {
-            LeafKind::RepeatedWholeMessage
-        } else {
-            LeafKind::WholeMessage
-        }),
-        other => Target::Struct(
-            if repeated {
-                StructShape::Repeated
-            } else {
-                StructShape::Single
-            },
-            other.to_string(),
-        ),
+            other => Target::Struct(StructShape::Map, other.to_string()),
+        },
+        FieldShape::Single(type_name) => match terminal_leaf_kind(&type_name, false) {
+            Some(kind) => Target::Leaf(kind),
+            None => Target::Struct(StructShape::Single, type_name),
+        },
+        FieldShape::Repeated(type_name) => match terminal_leaf_kind(&type_name, true) {
+            Some(kind) => Target::Leaf(kind),
+            None => Target::Struct(StructShape::Repeated, type_name),
+        },
     }
 }
 
+/// The leaf measurement kind for a `TERMINAL_LEAVES` type, or `None` for any other (recurse-into)
+/// message. `repeated` only changes Payload and Failure, the two that have a per-element form.
+fn terminal_leaf_kind(type_name: &str, repeated: bool) -> Option<LeafKind> {
+    Some(match type_name {
+        "temporal.api.common.v1.Payload" if repeated => LeafKind::RepeatedPayload,
+        "temporal.api.common.v1.Payload" => LeafKind::SinglePayload,
+        "temporal.api.common.v1.Payloads" => LeafKind::SinglePayloads,
+        "temporal.api.common.v1.Memo" => LeafKind::SingleMemo,
+        "temporal.api.common.v1.Header" => LeafKind::SingleHeader,
+        "temporal.api.common.v1.SearchAttributes" => LeafKind::SingleSearchAttributes,
+        "temporal.api.failure.v1.Failure" if repeated => LeafKind::RepeatedWholeMessage,
+        "temporal.api.failure.v1.Failure" => LeafKind::WholeMessage,
+        _ => return None,
+    })
+}
+
 fn generate_limits_impl(
-    base: &PayloadVisitorGenerator,
+    model: &PayloadModel,
     proto_name: &str,
     table: &HashMap<String, FieldPolicy>,
     used_keys: &mut HashSet<String>,
     unclassified: &mut Vec<String>,
 ) -> String {
-    let conv = PayloadVisitorGenerator::new();
-    let rust_path = conv.proto_to_rust_path(proto_name);
-    let msg = &base.messages[proto_name];
+    let rust_path = proto_to_rust_path(proto_name);
+    let msg = &model.messages[proto_name];
 
     let mut body = String::new();
 
@@ -1198,8 +1145,8 @@ fn generate_limits_impl(
         }
         let field_name = field.name.as_deref().unwrap_or("");
         let proto_path = format!("{proto_name}.{field_name}");
-        let rust_field = PayloadVisitorGenerator::to_snake_case(field_name);
-        match classify_field(base, msg, field) {
+        let rust_field = to_snake_case(field_name);
+        match classify_field(model, msg, field) {
             Target::Leaf(kind) => {
                 body.push_str(&emit_leaf(
                     &proto_path,
@@ -1233,22 +1180,14 @@ fn generate_limits_impl(
                 .as_deref()
                 .unwrap_or("")
                 .trim_start_matches('.');
-            if !is_message_type(field) || !base.payload_containing.contains(type_name) {
+            if !is_message_type(field) || !model.payload_containing.contains(type_name) {
                 continue;
             }
             payload_variants += 1;
-            let variant = PayloadVisitorGenerator::to_pascal_case(var_field);
-            let enum_path = conv.proto_to_rust_oneof_enum_path(proto_name, oneof_name);
-            if TERMINAL_LEAVES.contains(&type_name) {
+            let variant = to_pascal_case(var_field);
+            let enum_path = proto_to_rust_oneof_enum_path(proto_name, oneof_name);
+            if let Some(kind) = terminal_leaf_kind(type_name, false) {
                 let proto_path = format!("{proto_name}.{var_field}");
-                let kind = match type_name {
-                    "temporal.api.common.v1.Payloads" => LeafKind::SinglePayloads,
-                    "temporal.api.common.v1.Payload" => LeafKind::SinglePayload,
-                    "temporal.api.common.v1.Memo" => LeafKind::SingleMemo,
-                    "temporal.api.common.v1.Header" => LeafKind::SingleHeader,
-                    "temporal.api.failure.v1.Failure" => LeafKind::WholeMessage,
-                    _ => LeafKind::SingleSearchAttributes,
-                };
                 let check =
                     oneof_leaf_check(&proto_path, var_field, kind, table, used_keys, unclassified);
                 arms.push_str(&format!(
@@ -1263,7 +1202,7 @@ fn generate_limits_impl(
         if payload_variants == 0 {
             continue;
         }
-        let rust_field = PayloadVisitorGenerator::to_snake_case(oneof_name);
+        let rust_field = to_snake_case(oneof_name);
         // A catch-all is needed unless every variant is payload-bearing.
         let catch_all = if payload_variants < variants.len() {
             "                _ => {}\n"
@@ -1283,7 +1222,7 @@ fn generate_limits_impl(
         if owner != proto_name {
             continue;
         }
-        let rust_field = PayloadVisitorGenerator::to_snake_case(field_name);
+        let rust_field = to_snake_case(field_name);
         body.push_str(&emit_leaf(
             path,
             field_name,
@@ -1307,14 +1246,11 @@ impl crate::payload_limits::PayloadLimitsValidatable for {rust_path} {{
 
 /// Whether this field is the synthetic representation of a proto map (and thus not a real oneof).
 fn is_map_field(parent_msg: &DescriptorProto, field: &FieldDescriptorProto) -> bool {
-    let field_name = field.name.as_deref().unwrap_or("");
-    parent_msg.nested_type.iter().any(|n| {
-        is_map_entry(&n.options)
-            && n.name.as_deref() == Some(&PayloadVisitorGenerator::to_map_entry_name(field_name))
-    })
+    map_value_type(parent_msg, field).is_some()
 }
 
-/// Resolve the classification for a leaf path, recording usage / lack of classification.
+/// Records the lookup as a used table key (or as unclassified, which fails the build) as a side
+/// effect, so the caller need not track table coverage itself.
 fn leaf_class(
     proto_path: &str,
     table: &HashMap<String, FieldPolicy>,
@@ -1333,7 +1269,8 @@ fn leaf_class(
     }
 }
 
-/// The size expression for a leaf, given the name of the accessor binding already in scope.
+/// `accessor` must name a binding already in scope in the emitted code; the returned expression
+/// references it.
 fn leaf_size_expr(kind: LeafKind, accessor: &str) -> String {
     match kind {
         LeafKind::SinglePayloads => format!("crate::payload_limits::payloads_size({accessor})"),
@@ -1364,7 +1301,6 @@ fn leaf_size_expr(kind: LeafKind, accessor: &str) -> String {
     }
 }
 
-/// Emit a leaf check for a regular (non-oneof) field.
 fn emit_leaf(
     proto_path: &str,
     proto_field: &str,
@@ -1411,7 +1347,8 @@ fn emit_leaf(
     }
 }
 
-/// Emit a leaf check inside a oneof match arm, where the variant payload is bound to `inner`.
+/// The emitted check references a binding named `inner`, which the enclosing oneof match arm must
+/// bind to the variant payload.
 fn oneof_leaf_check(
     proto_path: &str,
     proto_field: &str,
@@ -1443,8 +1380,6 @@ fn effective_kind(kind: LeafKind, class: LimitClass) -> LeafKind {
     }
 }
 
-/// Emit a structural recursion for a regular (non-oneof) field, pushing a path segment (proto field
-/// name, plus index/key for repeated/map fields) around the descent.
 fn emit_struct(rust_field: &str, proto_field: &str, shape: StructShape) -> String {
     match shape {
         StructShape::Single => format!(
