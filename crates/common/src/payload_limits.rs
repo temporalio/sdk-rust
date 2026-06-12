@@ -1,8 +1,8 @@
 //! Payload/memo size-limit validation infrastructure.
 //!
 //! Mirrors the size checks the Temporal server enforces. The per-(message, field) policy is
-//! generated from the proto descriptors against the hand-authored `PAYLOAD_LIMITS_TABLE` in
-//! `build.rs`; adding or removing a payload-bearing field fails the build until the table is updated.
+//! generated from the proto descriptors against the hand-authored `*_FIELDS` tables in
+//! `build.rs`; adding or removing a payload-bearing field fails the build until they're updated.
 //!
 //! Size is the serialized proto size (`encoded_len()`), except for the map-aggregate helpers that
 //! mirror the server's `len(key) + …` accounting (`map_payloads_sum` / `map_payload_data_sum`).

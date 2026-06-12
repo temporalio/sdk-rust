@@ -695,7 +695,7 @@ fn is_map_entry(options: &Option<MessageOptions>) -> bool {
 //
 // Emits `PayloadLimitsValidatable` impls for the closure of outbound gRPC request
 // messages, dispatching each payload-bearing *leaf* field through a hand-authored
-// decision table (`PAYLOAD_LIMITS_TABLE`) that maps `(message.field)` -> limit class.
+// decision tables (`*_FIELDS`, grouped by class) mapping `(message.field)` -> limit class.
 // The *measurement strategy* is derived mechanically from each field's proto shape;
 // the table only records the specified class decision (blob / memo / not).
 //
@@ -727,390 +727,125 @@ const EXTRA_WHOLE_MESSAGE_LEAVES: &[&str] = &[
     "temporal.api.protocol.v1.Message.body",
 ];
 
-// Payload-limits decision table — THE source of truth for how the SDK mirrors the server's
+// Payload-limits decision tables — THE source of truth for how the SDK mirrors the server's
 // payload/memo size checks.
-//
-// Each entry maps a payload-bearing leaf field (`<fully.qualified.Message>.<field>`) to the
-// server-enforced limit policy ([`LimitClass`]):
 //   - Blob          blob (payload) size limit, warn + error
 //   - Memo          memo size limit, warn + error
 //   - BlobWarn      blob limit, warning only
 //   - NotValidated  the server does not enforce a *replicable* limit on this field
 //
-// The validated closure's roots are derived automatically from the proto service definitions (every
-// `temporal.api.*` RPC *input* message; see `service_request_roots`), so a new RPC/request cannot be
-// silently missed — its payload fields become unclassified and fail the build until added here.
-//
-// The measurement strategy is derived mechanically from the field's proto shape.
-const PAYLOAD_LIMITS_TABLE: &[(&str, LimitClass)] = &[
-    // ============================== Blob (payload) limit, warn + error ==========================
-    (
-        "temporal.api.command.v1.CompleteWorkflowExecutionCommandAttributes.result",
-        LimitClass::Blob,
-    ),
-    (
-        "temporal.api.command.v1.ContinueAsNewWorkflowExecutionCommandAttributes.input",
-        LimitClass::Blob,
-    ),
-    (
-        "temporal.api.command.v1.FailWorkflowExecutionCommandAttributes.failure",
-        LimitClass::Blob,
-    ), // whole Failure proto
-    // Data-sum of the memo's fields (not whole-Memo); the server's merged-memo check is not replicable.
-    (
-        "temporal.api.command.v1.ModifyWorkflowPropertiesCommandAttributes.upserted_memo",
-        LimitClass::Blob,
-    ),
-    (
-        "temporal.api.command.v1.RecordMarkerCommandAttributes.details",
-        LimitClass::Blob,
-    ), // map<string,Payloads> sum
-    (
-        "temporal.api.command.v1.ScheduleActivityTaskCommandAttributes.input",
-        LimitClass::Blob,
-    ),
-    (
-        "temporal.api.command.v1.ScheduleNexusOperationCommandAttributes.input",
-        LimitClass::Blob,
-    ),
-    (
-        "temporal.api.command.v1.SignalExternalWorkflowExecutionCommandAttributes.input",
-        LimitClass::Blob,
-    ),
-    (
-        "temporal.api.command.v1.StartChildWorkflowExecutionCommandAttributes.input",
-        LimitClass::Blob,
-    ),
-    (
-        "temporal.api.command.v1.UpsertWorkflowSearchAttributesCommandAttributes.search_attributes",
-        LimitClass::Blob,
-    ), // indexed_fields data-sum
-    ("temporal.api.protocol.v1.Message.body", LimitClass::Blob), // whole Any body; see EXTRA_WHOLE_MESSAGE_LEAVES
-    (
-        "temporal.api.query.v1.WorkflowQuery.query_args",
-        LimitClass::Blob,
-    ),
-    (
-        "temporal.api.workflow.v1.NewWorkflowExecutionInfo.input",
-        LimitClass::Blob,
-    ),
-    (
-        "temporal.api.workflowservice.v1.RecordActivityTaskHeartbeatByIdRequest.details",
-        LimitClass::Blob,
-    ),
-    (
-        "temporal.api.workflowservice.v1.RecordActivityTaskHeartbeatRequest.details",
-        LimitClass::Blob,
-    ),
-    (
-        "temporal.api.workflowservice.v1.RespondActivityTaskCanceledByIdRequest.details",
-        LimitClass::Blob,
-    ),
-    (
-        "temporal.api.workflowservice.v1.RespondActivityTaskCanceledRequest.details",
-        LimitClass::Blob,
-    ),
-    (
-        "temporal.api.workflowservice.v1.RespondActivityTaskCompletedByIdRequest.result",
-        LimitClass::Blob,
-    ),
-    (
-        "temporal.api.workflowservice.v1.RespondActivityTaskCompletedRequest.result",
-        LimitClass::Blob,
-    ),
-    (
-        "temporal.api.workflowservice.v1.SignalWithStartWorkflowExecutionRequest.input",
-        LimitClass::Blob,
-    ),
-    (
-        "temporal.api.workflowservice.v1.SignalWithStartWorkflowExecutionRequest.signal_input",
-        LimitClass::Blob,
-    ),
-    (
-        "temporal.api.workflowservice.v1.SignalWorkflowExecutionRequest.input",
-        LimitClass::Blob,
-    ),
-    (
-        "temporal.api.workflowservice.v1.StartActivityExecutionRequest.input",
-        LimitClass::Blob,
-    ),
-    (
-        "temporal.api.workflowservice.v1.StartNexusOperationExecutionRequest.input",
-        LimitClass::Blob,
-    ),
-    (
-        "temporal.api.workflowservice.v1.StartWorkflowExecutionRequest.input",
-        LimitClass::Blob,
-    ),
-    // ============================== Memo limit, warn + error ====================================
-    (
-        "temporal.api.command.v1.ContinueAsNewWorkflowExecutionCommandAttributes.memo",
-        LimitClass::Memo,
-    ),
-    (
-        "temporal.api.command.v1.StartChildWorkflowExecutionCommandAttributes.memo",
-        LimitClass::Memo,
-    ),
-    (
-        "temporal.api.workflow.v1.NewWorkflowExecutionInfo.memo",
-        LimitClass::Memo,
-    ),
-    (
-        "temporal.api.workflowservice.v1.SignalWithStartWorkflowExecutionRequest.memo",
-        LimitClass::Memo,
-    ),
-    (
-        "temporal.api.workflowservice.v1.StartWorkflowExecutionRequest.memo",
-        LimitClass::Memo,
-    ),
-    // ============================== Warning only ================================================
-    // Failure responses.
-    (
-        "temporal.api.workflowservice.v1.RespondActivityTaskFailedByIdRequest.failure",
-        LimitClass::BlobWarn,
-    ),
-    (
-        "temporal.api.workflowservice.v1.RespondActivityTaskFailedByIdRequest.last_heartbeat_details",
-        LimitClass::BlobWarn,
-    ),
-    (
-        "temporal.api.workflowservice.v1.RespondActivityTaskFailedRequest.failure",
-        LimitClass::BlobWarn,
-    ),
-    (
-        "temporal.api.workflowservice.v1.RespondActivityTaskFailedRequest.last_heartbeat_details",
-        LimitClass::BlobWarn,
-    ),
-    (
-        "temporal.api.workflowservice.v1.RespondNexusTaskFailedRequest.failure",
-        LimitClass::BlobWarn,
-    ),
-    (
-        "temporal.api.workflowservice.v1.RespondWorkflowTaskFailedRequest.failure",
-        LimitClass::BlobWarn,
-    ),
-    // Query results.
-    (
-        "temporal.api.query.v1.WorkflowQueryResult.answer",
-        LimitClass::BlobWarn,
-    ),
-    (
-        "temporal.api.workflowservice.v1.RespondQueryTaskCompletedRequest.query_result",
-        LimitClass::BlobWarn,
-    ),
-    // ============================== Not validated ===============================================
+// Roots are derived automatically from the proto service definitions (every `temporal.api.*` RPC
+// *input* message; see `service_request_roots`), so a new RPC/request can't be silently missed — its
+// payload fields become unclassified and fail the build until added below. The measurement strategy
+// is derived mechanically from the field's proto shape.
+const BLOB_FIELDS: &[&str] = &[
+    "temporal.api.command.v1.CompleteWorkflowExecutionCommandAttributes.result",
+    "temporal.api.command.v1.ContinueAsNewWorkflowExecutionCommandAttributes.input",
+    "temporal.api.command.v1.FailWorkflowExecutionCommandAttributes.failure", // whole Failure proto
+    "temporal.api.command.v1.ModifyWorkflowPropertiesCommandAttributes.upserted_memo", // memo fields data-sum
+    "temporal.api.command.v1.RecordMarkerCommandAttributes.details", // map<string,Payloads> sum
+    "temporal.api.command.v1.ScheduleActivityTaskCommandAttributes.input",
+    "temporal.api.command.v1.ScheduleNexusOperationCommandAttributes.input",
+    "temporal.api.command.v1.SignalExternalWorkflowExecutionCommandAttributes.input",
+    "temporal.api.command.v1.StartChildWorkflowExecutionCommandAttributes.input",
+    "temporal.api.command.v1.UpsertWorkflowSearchAttributesCommandAttributes.search_attributes", // indexed_fields data-sum
+    "temporal.api.protocol.v1.Message.body", // whole Any body; see EXTRA_WHOLE_MESSAGE_LEAVES
+    "temporal.api.query.v1.WorkflowQuery.query_args",
+    "temporal.api.workflow.v1.NewWorkflowExecutionInfo.input",
+    "temporal.api.workflowservice.v1.RecordActivityTaskHeartbeatByIdRequest.details",
+    "temporal.api.workflowservice.v1.RecordActivityTaskHeartbeatRequest.details",
+    "temporal.api.workflowservice.v1.RespondActivityTaskCanceledByIdRequest.details",
+    "temporal.api.workflowservice.v1.RespondActivityTaskCanceledRequest.details",
+    "temporal.api.workflowservice.v1.RespondActivityTaskCompletedByIdRequest.result",
+    "temporal.api.workflowservice.v1.RespondActivityTaskCompletedRequest.result",
+    "temporal.api.workflowservice.v1.SignalWithStartWorkflowExecutionRequest.input",
+    "temporal.api.workflowservice.v1.SignalWithStartWorkflowExecutionRequest.signal_input",
+    "temporal.api.workflowservice.v1.SignalWorkflowExecutionRequest.input",
+    "temporal.api.workflowservice.v1.StartActivityExecutionRequest.input",
+    "temporal.api.workflowservice.v1.StartNexusOperationExecutionRequest.input",
+    "temporal.api.workflowservice.v1.StartWorkflowExecutionRequest.input",
+];
+
+const MEMO_FIELDS: &[&str] = &[
+    "temporal.api.command.v1.ContinueAsNewWorkflowExecutionCommandAttributes.memo",
+    "temporal.api.command.v1.StartChildWorkflowExecutionCommandAttributes.memo",
+    "temporal.api.workflow.v1.NewWorkflowExecutionInfo.memo",
+    "temporal.api.workflowservice.v1.SignalWithStartWorkflowExecutionRequest.memo",
+    "temporal.api.workflowservice.v1.StartWorkflowExecutionRequest.memo",
+];
+
+// Warn-only: the SDK warns but never proactively fails the task (failure responses; query results).
+const BLOB_WARN_FIELDS: &[&str] = &[
+    "temporal.api.workflowservice.v1.RespondActivityTaskFailedByIdRequest.failure",
+    "temporal.api.workflowservice.v1.RespondActivityTaskFailedByIdRequest.last_heartbeat_details",
+    "temporal.api.workflowservice.v1.RespondActivityTaskFailedRequest.failure",
+    "temporal.api.workflowservice.v1.RespondActivityTaskFailedRequest.last_heartbeat_details",
+    "temporal.api.workflowservice.v1.RespondNexusTaskFailedRequest.failure",
+    "temporal.api.workflowservice.v1.RespondWorkflowTaskFailedRequest.failure",
+    "temporal.api.query.v1.WorkflowQueryResult.answer",
+    "temporal.api.workflowservice.v1.RespondQueryTaskCompletedRequest.query_result",
+];
+
+const NOT_VALIDATED_FIELDS: &[&str] = &[
     // Headers: server records a HeaderSize metric only.
-    (
-        "temporal.api.batch.v1.BatchOperationSignal.header",
-        LimitClass::NotValidated,
-    ),
-    (
-        "temporal.api.command.v1.ContinueAsNewWorkflowExecutionCommandAttributes.header",
-        LimitClass::NotValidated,
-    ),
-    (
-        "temporal.api.command.v1.RecordMarkerCommandAttributes.header",
-        LimitClass::NotValidated,
-    ),
-    (
-        "temporal.api.command.v1.ScheduleActivityTaskCommandAttributes.header",
-        LimitClass::NotValidated,
-    ),
-    (
-        "temporal.api.command.v1.SignalExternalWorkflowExecutionCommandAttributes.header",
-        LimitClass::NotValidated,
-    ),
-    (
-        "temporal.api.command.v1.StartChildWorkflowExecutionCommandAttributes.header",
-        LimitClass::NotValidated,
-    ),
-    (
-        "temporal.api.query.v1.WorkflowQuery.header",
-        LimitClass::NotValidated,
-    ),
-    (
-        "temporal.api.update.v1.Input.header",
-        LimitClass::NotValidated,
-    ),
-    (
-        "temporal.api.workflow.v1.NewWorkflowExecutionInfo.header",
-        LimitClass::NotValidated,
-    ),
-    (
-        "temporal.api.workflow.v1.PostResetOperation.SignalWorkflow.header",
-        LimitClass::NotValidated,
-    ),
-    (
-        "temporal.api.workflowservice.v1.SignalWithStartWorkflowExecutionRequest.header",
-        LimitClass::NotValidated,
-    ),
-    (
-        "temporal.api.workflowservice.v1.SignalWorkflowExecutionRequest.header",
-        LimitClass::NotValidated,
-    ),
-    (
-        "temporal.api.workflowservice.v1.StartActivityExecutionRequest.header",
-        LimitClass::NotValidated,
-    ),
-    (
-        "temporal.api.workflowservice.v1.StartWorkflowExecutionRequest.header",
-        LimitClass::NotValidated,
-    ),
-    // Search attributes: separate SA limits; the server's check merges with the workflow's existing
-    // SAs, which the SDK doesn't have, so it's not replicable.
-    (
-        "temporal.api.command.v1.ContinueAsNewWorkflowExecutionCommandAttributes.search_attributes",
-        LimitClass::NotValidated,
-    ),
-    (
-        "temporal.api.command.v1.StartChildWorkflowExecutionCommandAttributes.search_attributes",
-        LimitClass::NotValidated,
-    ),
-    (
-        "temporal.api.workflow.v1.NewWorkflowExecutionInfo.search_attributes",
-        LimitClass::NotValidated,
-    ),
-    (
-        "temporal.api.workflowservice.v1.CreateScheduleRequest.search_attributes",
-        LimitClass::NotValidated,
-    ),
-    (
-        "temporal.api.workflowservice.v1.SignalWithStartWorkflowExecutionRequest.search_attributes",
-        LimitClass::NotValidated,
-    ),
-    (
-        "temporal.api.workflowservice.v1.StartActivityExecutionRequest.search_attributes",
-        LimitClass::NotValidated,
-    ),
-    (
-        "temporal.api.workflowservice.v1.StartNexusOperationExecutionRequest.search_attributes",
-        LimitClass::NotValidated,
-    ),
-    (
-        "temporal.api.workflowservice.v1.StartWorkflowExecutionRequest.search_attributes",
-        LimitClass::NotValidated,
-    ),
-    (
-        "temporal.api.workflowservice.v1.UpdateScheduleRequest.search_attributes",
-        LimitClass::NotValidated,
-    ),
-    // Internal carry-over fields the SDK does not author / the server does not size-check here.
-    (
-        "temporal.api.command.v1.CancelWorkflowExecutionCommandAttributes.details",
-        LimitClass::NotValidated,
-    ),
-    (
-        "temporal.api.command.v1.ContinueAsNewWorkflowExecutionCommandAttributes.failure",
-        LimitClass::NotValidated,
-    ),
-    (
-        "temporal.api.command.v1.ContinueAsNewWorkflowExecutionCommandAttributes.last_completion_result",
-        LimitClass::NotValidated,
-    ),
-    (
-        "temporal.api.command.v1.RecordMarkerCommandAttributes.failure",
-        LimitClass::NotValidated,
-    ),
-    (
-        "temporal.api.workflowservice.v1.StartWorkflowExecutionRequest.continued_failure",
-        LimitClass::NotValidated,
-    ),
-    (
-        "temporal.api.workflowservice.v1.StartWorkflowExecutionRequest.last_completion_result",
-        LimitClass::NotValidated,
-    ),
-    (
-        "temporal.api.workflowservice.v1.TerminateWorkflowExecutionRequest.details",
-        LimitClass::NotValidated,
-    ), // not size-checked
-    // Dedicated size limits the server enforces but the SDK can't replicate: not blob/memo, and not
-    // exposed via DescribeNamespace.
-    //   - UserMetadata summary/details: dedicated limits enforced only on the nexus-start path; the
-    //     workflow/command user_metadata reached here isn't size-checked anyway.
-    //   - Nexus EndpointSpec.description: Operator Create/UpdateNexusEndpoint checks it against
-    //     `maxDescriptionSize` (the cloud variant is cloud-only).
-    (
-        "temporal.api.sdk.v1.UserMetadata.details",
-        LimitClass::NotValidated,
-    ),
-    (
-        "temporal.api.sdk.v1.UserMetadata.summary",
-        LimitClass::NotValidated,
-    ),
-    (
-        "temporal.api.nexus.v1.EndpointSpec.description",
-        LimitClass::NotValidated,
-    ),
-    (
-        "temporal.api.cloud.nexus.v1.EndpointSpec.description",
-        LimitClass::NotValidated,
-    ),
-    // Update input args: frontend records a metric only — enforced later, on delivery, via the
-    // protocol Message.body check above.
-    (
-        "temporal.api.update.v1.Input.args",
-        LimitClass::NotValidated,
-    ),
+    "temporal.api.batch.v1.BatchOperationSignal.header",
+    "temporal.api.command.v1.ContinueAsNewWorkflowExecutionCommandAttributes.header",
+    "temporal.api.command.v1.RecordMarkerCommandAttributes.header",
+    "temporal.api.command.v1.ScheduleActivityTaskCommandAttributes.header",
+    "temporal.api.command.v1.SignalExternalWorkflowExecutionCommandAttributes.header",
+    "temporal.api.command.v1.StartChildWorkflowExecutionCommandAttributes.header",
+    "temporal.api.query.v1.WorkflowQuery.header",
+    "temporal.api.update.v1.Input.header",
+    "temporal.api.workflow.v1.NewWorkflowExecutionInfo.header",
+    "temporal.api.workflow.v1.PostResetOperation.SignalWorkflow.header",
+    "temporal.api.workflowservice.v1.SignalWithStartWorkflowExecutionRequest.header",
+    "temporal.api.workflowservice.v1.SignalWorkflowExecutionRequest.header",
+    "temporal.api.workflowservice.v1.StartActivityExecutionRequest.header",
+    "temporal.api.workflowservice.v1.StartWorkflowExecutionRequest.header",
+    // Search attributes: separate non-replicable SA limit (server merges with the workflow's existing SAs).
+    "temporal.api.command.v1.ContinueAsNewWorkflowExecutionCommandAttributes.search_attributes",
+    "temporal.api.command.v1.StartChildWorkflowExecutionCommandAttributes.search_attributes",
+    "temporal.api.workflow.v1.NewWorkflowExecutionInfo.search_attributes",
+    "temporal.api.workflowservice.v1.CreateScheduleRequest.search_attributes",
+    "temporal.api.workflowservice.v1.SignalWithStartWorkflowExecutionRequest.search_attributes",
+    "temporal.api.workflowservice.v1.StartActivityExecutionRequest.search_attributes",
+    "temporal.api.workflowservice.v1.StartNexusOperationExecutionRequest.search_attributes",
+    "temporal.api.workflowservice.v1.StartWorkflowExecutionRequest.search_attributes",
+    "temporal.api.workflowservice.v1.UpdateScheduleRequest.search_attributes",
+    // Internal carry-over fields the SDK doesn't author / the server doesn't size-check here.
+    "temporal.api.command.v1.CancelWorkflowExecutionCommandAttributes.details",
+    "temporal.api.command.v1.ContinueAsNewWorkflowExecutionCommandAttributes.failure",
+    "temporal.api.command.v1.ContinueAsNewWorkflowExecutionCommandAttributes.last_completion_result",
+    "temporal.api.command.v1.RecordMarkerCommandAttributes.failure",
+    "temporal.api.workflowservice.v1.StartWorkflowExecutionRequest.continued_failure",
+    "temporal.api.workflowservice.v1.StartWorkflowExecutionRequest.last_completion_result",
+    "temporal.api.workflowservice.v1.TerminateWorkflowExecutionRequest.details",
+    // Dedicated, non-fetchable limits (not blob/memo, not in DescribeNamespace): UserMetadata
+    // (nexus-start only); Nexus EndpointSpec.description (maxDescriptionSize; cloud variant cloud-only).
+    "temporal.api.sdk.v1.UserMetadata.details",
+    "temporal.api.sdk.v1.UserMetadata.summary",
+    "temporal.api.nexus.v1.EndpointSpec.description",
+    "temporal.api.cloud.nexus.v1.EndpointSpec.description",
+    // Update input args: frontend records a metric only — enforced on delivery via Message.body.
+    "temporal.api.update.v1.Input.args",
     // Query/nexus failures and the nexus sync response payload: not size-checked on these paths.
-    (
-        "temporal.api.nexus.v1.StartOperationResponse.Sync.payload",
-        LimitClass::NotValidated,
-    ),
-    (
-        "temporal.api.nexus.v1.StartOperationResponse.failure",
-        LimitClass::NotValidated,
-    ),
-    (
-        "temporal.api.query.v1.WorkflowQueryResult.failure",
-        LimitClass::NotValidated,
-    ),
-    (
-        "temporal.api.workflowservice.v1.RespondQueryTaskCompletedRequest.failure",
-        LimitClass::NotValidated,
-    ),
-    // Schedules: server sums memo.Size() + action.input.Size() vs the blob limit — a cross-field
-    // aggregate the per-field model can't express (deferred to a Custom validator). The action input
-    // is still blob-checked individually via NewWorkflowExecutionInfo.input.
-    (
-        "temporal.api.workflowservice.v1.CreateScheduleRequest.memo",
-        LimitClass::NotValidated,
-    ),
-    (
-        "temporal.api.workflowservice.v1.UpdateScheduleRequest.memo",
-        LimitClass::NotValidated,
-    ),
-    // Enforced downstream, not at the request that carries them: the signal input is blob-checked
-    // per target when the batch/reset fans out to a signal, not at StartBatchOperation / reset.
-    (
-        "temporal.api.batch.v1.BatchOperationSignal.input",
-        LimitClass::NotValidated,
-    ),
-    (
-        "temporal.api.workflow.v1.PostResetOperation.SignalWorkflow.input",
-        LimitClass::NotValidated,
-    ),
+    "temporal.api.nexus.v1.StartOperationResponse.Sync.payload",
+    "temporal.api.nexus.v1.StartOperationResponse.failure",
+    "temporal.api.query.v1.WorkflowQueryResult.failure",
+    "temporal.api.workflowservice.v1.RespondQueryTaskCompletedRequest.failure",
+    // Schedules: server sums memo + action.input vs blob — cross-field aggregate (Custom, deferred).
+    "temporal.api.workflowservice.v1.CreateScheduleRequest.memo",
+    "temporal.api.workflowservice.v1.UpdateScheduleRequest.memo",
+    // Enforced downstream: signal input is blob-checked per target on batch/reset fan-out.
+    "temporal.api.batch.v1.BatchOperationSignal.input",
+    "temporal.api.workflow.v1.PostResetOperation.SignalWorkflow.input",
     // Not size-checked by the server.
-    (
-        "temporal.api.batch.v1.BatchOperationTermination.details",
-        LimitClass::NotValidated,
-    ),
-    (
-        "temporal.api.deployment.v1.UpdateDeploymentMetadata.upsert_entries",
-        LimitClass::NotValidated,
-    ),
-    (
-        "temporal.api.workflowservice.v1.UpdateWorkerDeploymentVersionMetadataRequest.upsert_entries",
-        LimitClass::NotValidated,
-    ),
+    "temporal.api.batch.v1.BatchOperationTermination.details",
+    "temporal.api.deployment.v1.UpdateDeploymentMetadata.upsert_entries",
+    "temporal.api.workflowservice.v1.UpdateWorkerDeploymentVersionMetadataRequest.upsert_entries",
     // Cloud-only API; not handled by the OSS server.
-    (
-        "temporal.api.compute.v1.ComputeProvider.details",
-        LimitClass::NotValidated,
-    ),
-    (
-        "temporal.api.compute.v1.ComputeScaler.details",
-        LimitClass::NotValidated,
-    ),
+    "temporal.api.compute.v1.ComputeProvider.details",
+    "temporal.api.compute.v1.ComputeScaler.details",
 ];
 
 /// The roots of the validated closure are derived automatically from the proto service definitions:
@@ -1244,7 +979,7 @@ fn generate_payload_limits_validator(
 
     let mut output = String::new();
     output.push_str("// Generated from descriptors.bin - DO NOT EDIT\n");
-    output.push_str("// Payload-limits validators. Edit PAYLOAD_LIMITS_TABLE in build.rs to classify fields.\n\n");
+    output.push_str("// Payload-limits validators. Edit the *_FIELDS tables in build.rs to classify fields.\n\n");
 
     let mut generate_names: Vec<String> = to_generate.into_iter().collect();
     generate_names.sort();
@@ -1264,15 +999,13 @@ fn generate_payload_limits_validator(
         unclassified.dedup();
         let list = unclassified
             .iter()
-            .map(|p| {
-                format!("    (\"{p}\", LimitClass::Blob),  // or Memo / BlobWarn / NotValidated")
-            })
+            .map(|p| format!("    \"{p}\","))
             .collect::<Vec<_>>()
             .join("\n");
         return Err(format!(
-            "payload-limits: {} payload-bearing field(s) are not classified in PAYLOAD_LIMITS_TABLE \
-             (crates/common/build.rs). Add an entry per field (the server-enforced limit class), \
-             e.g.:\n{}\n",
+            "payload-limits: {} payload-bearing field(s) are not classified. Add each to the right \
+             *_FIELDS list (BLOB_FIELDS / MEMO_FIELDS / BLOB_WARN_FIELDS / NOT_VALIDATED_FIELDS) in \
+             crates/common/build.rs:\n{}\n",
             unclassified.len(),
             list
         )
@@ -1285,7 +1018,7 @@ fn generate_payload_limits_validator(
         let mut stale: Vec<String> = stale.into_iter().cloned().collect();
         stale.sort();
         return Err(format!(
-            "payload-limits: {} stale entr(y/ies) in PAYLOAD_LIMITS_TABLE (crates/common/build.rs) \
+            "payload-limits: {} stale entr(y/ies) in the *_FIELDS tables (crates/common/build.rs) \
              no longer correspond to a payload-bearing field; remove them:\n    {}\n",
             stale.len(),
             stale.join("\n    ")
@@ -1300,9 +1033,20 @@ fn generate_payload_limits_validator(
 
 /// Load the decision table: `field proto path -> limit class`.
 fn load_payload_limits_table() -> Result<HashMap<String, LimitClass>, Box<dyn std::error::Error>> {
+    use std::iter::repeat;
+    let entries = BLOB_FIELDS
+        .iter()
+        .zip(repeat(LimitClass::Blob))
+        .chain(MEMO_FIELDS.iter().zip(repeat(LimitClass::Memo)))
+        .chain(BLOB_WARN_FIELDS.iter().zip(repeat(LimitClass::BlobWarn)))
+        .chain(
+            NOT_VALIDATED_FIELDS
+                .iter()
+                .zip(repeat(LimitClass::NotValidated)),
+        );
     let mut map = HashMap::new();
-    for (path, class) in PAYLOAD_LIMITS_TABLE {
-        if map.insert((*path).to_string(), *class).is_some() {
+    for (path, class) in entries {
+        if map.insert((*path).to_string(), class).is_some() {
             return Err(format!("payload-limits: duplicate table entry for `{path}`").into());
         }
     }
