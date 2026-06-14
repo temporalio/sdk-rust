@@ -625,6 +625,10 @@ pub extern "C" fn temporal_core_worker_validate(
                 .into_raw()
                 .cast_const(),
         };
+        // Drop our worker clone before waking lang: finalize_shutdown() takes
+        // sole ownership via Arc::try_unwrap, which fails if this clone is still
+        // alive when the woken thread calls it. (notify-after-release)
+        drop(core_worker);
         unsafe {
             callback(user_data.into(), fail);
         }
@@ -688,6 +692,10 @@ pub extern "C" fn temporal_core_worker_poll_workflow_activation(
                     .cast_const(),
             ),
         };
+        // Drop our worker clone before waking lang: finalize_shutdown() takes
+        // sole ownership via Arc::try_unwrap, which fails if this clone is still
+        // alive when the woken thread calls it. (notify-after-release)
+        drop(core_worker);
         unsafe {
             callback(user_data.into(), success, fail);
         }
@@ -722,6 +730,10 @@ pub extern "C" fn temporal_core_worker_poll_activity_task(
                     .cast_const(),
             ),
         };
+        // Drop our worker clone before waking lang: finalize_shutdown() takes
+        // sole ownership via Arc::try_unwrap, which fails if this clone is still
+        // alive when the woken thread calls it. (notify-after-release)
+        drop(core_worker);
         unsafe {
             callback(user_data.into(), success, fail);
         }
@@ -756,6 +768,10 @@ pub extern "C" fn temporal_core_worker_poll_nexus_task(
                     .cast_const(),
             ),
         };
+        // Drop our worker clone before waking lang: finalize_shutdown() takes
+        // sole ownership via Arc::try_unwrap, which fails if this clone is still
+        // alive when the woken thread calls it. (notify-after-release)
+        drop(core_worker);
         unsafe {
             callback(user_data.into(), success, fail);
         }
@@ -798,6 +814,10 @@ pub extern "C" fn temporal_core_worker_complete_workflow_activation(
                 .into_raw()
                 .cast_const(),
         };
+        // Drop our worker clone before waking lang: finalize_shutdown() takes
+        // sole ownership via Arc::try_unwrap, which fails if this clone is still
+        // alive when the woken thread calls it. (notify-after-release)
+        drop(core_worker);
         unsafe {
             callback(user_data.into(), fail);
         }
@@ -840,6 +860,10 @@ pub extern "C" fn temporal_core_worker_complete_activity_task(
                 .into_raw()
                 .cast_const(),
         };
+        // Drop our worker clone before waking lang: finalize_shutdown() takes
+        // sole ownership via Arc::try_unwrap, which fails if this clone is still
+        // alive when the woken thread calls it. (notify-after-release)
+        drop(core_worker);
         unsafe {
             callback(user_data.into(), fail);
         }
@@ -882,6 +906,10 @@ pub extern "C" fn temporal_core_worker_complete_nexus_task(
                 .into_raw()
                 .cast_const(),
         };
+        // Drop our worker clone before waking lang: finalize_shutdown() takes
+        // sole ownership via Arc::try_unwrap, which fails if this clone is still
+        // alive when the woken thread calls it. (notify-after-release)
+        drop(core_worker);
         unsafe {
             callback(user_data.into(), fail);
         }
