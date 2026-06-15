@@ -7,6 +7,7 @@
 #[macro_use]
 extern crate tracing;
 
+mod activity;
 mod async_activity_handle;
 pub mod callback_based;
 mod dns;
@@ -27,6 +28,7 @@ mod retry;
 pub mod schedules;
 #[cfg(test)]
 mod test_helpers;
+pub(crate) mod utils;
 pub mod worker;
 mod workflow_handle;
 mod workflow_status;
@@ -36,16 +38,16 @@ pub use crate::{
     request_extensions::PayloadErrorLimits,
     retry::{CallType, RETRYABLE_ERROR_CODES},
 };
+pub use activity::*;
 pub use async_activity_handle::{
     ActivityHeartbeatResponse, ActivityIdentifier, AsyncActivityHandle,
 };
-#[doc(hidden)]
-pub use retry::jittered;
-
 pub use metrics::{LONG_REQUEST_LATENCY_HISTOGRAM_NAME, REQUEST_LATENCY_HISTOGRAM_NAME};
 pub use options_structs::*;
 pub use replaceable::SharedReplaceableClient;
 pub use retry::RetryOptions;
+#[doc(hidden)]
+pub use retry::jittered;
 pub use temporalio_common::{Memo, RetryPolicy};
 /// Potentially dangerous TLS related functionality.
 pub mod danger {
@@ -69,6 +71,7 @@ use crate::{
     },
     metrics::{ChannelOrGrpcOverride, GrpcMetricSvc, MetricsContext},
     request_extensions::RequestExt,
+    utils::try_into_or_box_err,
     worker::ClientWorkerSet,
 };
 use errors::*;
@@ -85,7 +88,7 @@ use std::{
     time::{Duration, SystemTime},
 };
 use temporalio_common::{
-    HasWorkflowDefinition,
+    ActivityDefinition, HasWorkflowDefinition, UntypedActivity,
     data_converters::{
         DataConverter, GenericPayloadConverter, PayloadConverter, SerializationContext,
         SerializationContextData,
@@ -97,8 +100,11 @@ use temporalio_common::{
         proto_ts_to_system_time,
         temporal::api::{
             cloud::cloudservice::v1::cloud_service_client::CloudServiceClient,
-            common::v1::WorkflowType,
-            enums::v1::TaskQueueKind,
+            common::v1::{ActivityType, WorkflowType},
+            enums::v1::{
+                ActivityIdConflictPolicy as ProtoActivityIdConflictPolicy,
+                ActivityIdReusePolicy as ProtoActivityIdReusePolicy, TaskQueueKind,
+            },
             errordetails::v1::WorkflowExecutionAlreadyStartedFailure,
             operatorservice::v1::operator_service_client::OperatorServiceClient,
             sdk::v1::UserMetadata,
@@ -830,11 +836,107 @@ impl Client {
     /// Get a handle to complete an activity asynchronously.
     ///
     /// An activity returning `ActivityError::WillCompleteAsync` can be completed with this handle.
+    ///
+    /// To get a handle to a standalone activity that can be used to wait for result and manage
+    /// the execution, see [`get_activity_handle`](Self::get_activity_handle).
     pub fn get_async_activity_handle(
         &self,
         identifier: ActivityIdentifier,
     ) -> AsyncActivityHandle<Self> {
         WorkflowClientTrait::get_async_activity_handle(self, identifier)
+    }
+
+    /// Start a standalone activity.
+    ///
+    /// Returns [`ActivityHandle`] that can be used to wait for result or to perform other
+    /// operations on the activity.
+    pub async fn start_activity<A>(
+        &self,
+        activity: A,
+        input: A::Input,
+        options: ActivityStartOptions,
+    ) -> Result<ActivityHandle<Self, A>, StartActivityError>
+    where
+        A: ActivityDefinition,
+    {
+        WorkflowClientTrait::start_activity(self, activity, input, options).await
+    }
+
+    /// Start a standalone activity and wait for its result.
+    ///
+    /// Equivalent to `start_activity(...).await?.result()`.
+    pub async fn execute_activity<A>(
+        &self,
+        activity: A,
+        input: A::Input,
+        options: ActivityStartOptions,
+    ) -> Result<A::Output, ExecuteActivityError>
+    where
+        A: ActivityDefinition,
+    {
+        WorkflowClientTrait::execute_activity(self, activity, input, options).await
+    }
+
+    /// Get a handle to an existing standalone activity execution. If `run_id` is not specified,
+    /// the handle always targets the latest execution with matching ID.
+    ///
+    /// Note that the validity of the handle is not checked until a method is called on it.
+    /// If invalid ID or run ID is used, the method will return `NotFound` error.
+    ///
+    /// To get an untyped handle, use [`get_untyped_activity_handle`](Self::get_untyped_activity_handle).
+    ///
+    /// To get a handle that can be used to complete an activity asynchronously,
+    /// see [`get_async_activity_handle`](Self::get_async_activity_handle).
+    pub fn get_activity_handle<A>(
+        &self,
+        activity: A,
+        id: impl Into<String>,
+        run_id: Option<String>,
+    ) -> ActivityHandle<Self, A>
+    where
+        Self: Sized,
+        A: ActivityDefinition,
+    {
+        WorkflowClientTrait::get_activity_handle(self, activity, id, run_id)
+    }
+
+    /// Get an untyped handle to an existing standalone activity execution. If `run_id` is not
+    /// specified, the handle always targets the latest execution with matching ID.
+    ///
+    /// Note that the validity of the handle is not checked until a method is called on it.
+    /// If invalid ID or run ID is used, the method will return `NotFound` error.
+    ///
+    /// To get a typed handle, use [`get_activity_handle`](Self::get_activity_handle).
+    ///
+    /// To get a handle that can be used to complete an activity asynchronously,
+    /// see [`get_async_activity_handle`](Self::get_async_activity_handle).
+    pub fn get_untyped_activity_handle(
+        &self,
+        id: impl Into<String>,
+        run_id: Option<String>,
+    ) -> ActivityHandle<Self, UntypedActivity>
+    where
+        Self: Sized,
+    {
+        WorkflowClientTrait::get_untyped_activity_handle(self, id, run_id)
+    }
+
+    /// List activities matching a query. Returns a stream that lazily paginates through results.
+    pub fn list_activities(
+        &self,
+        query: impl Into<String>,
+        options: ActivityListOptions,
+    ) -> ListActivitiesStream {
+        WorkflowClientTrait::list_activities(self, query, options)
+    }
+
+    /// Count activities matching a query.
+    pub async fn count_activities(
+        &self,
+        query: impl Into<String>,
+        options: ActivityCountOptions,
+    ) -> Result<ActivityExecutionCount, ClientError> {
+        WorkflowClientTrait::count_activities(self, query, options).await
     }
 }
 
@@ -914,6 +1016,62 @@ pub(crate) trait WorkflowClientTrait: NamespacedClient {
     ) -> AsyncActivityHandle<Self>
     where
         Self: Sized;
+
+    /// Start a standalone activity.
+    fn start_activity<A>(
+        &self,
+        activity: A,
+        input: A::Input,
+        options: ActivityStartOptions,
+    ) -> impl Future<Output = Result<ActivityHandle<Self, A>, StartActivityError>>
+    where
+        Self: Sized,
+        A: ActivityDefinition;
+
+    /// Start a standalone activity and wait for its result.
+    fn execute_activity<A>(
+        &self,
+        activity: A,
+        input: A::Input,
+        options: ActivityStartOptions,
+    ) -> impl Future<Output = Result<A::Output, ExecuteActivityError>>
+    where
+        Self: Sized,
+        A: ActivityDefinition;
+
+    /// Get a handle to a previously started standalone activity.
+    fn get_activity_handle<A>(
+        &self,
+        activity: A,
+        id: impl Into<String>,
+        run_id: Option<String>,
+    ) -> ActivityHandle<Self, A>
+    where
+        Self: Sized,
+        A: ActivityDefinition;
+
+    /// Get an untyped handle to a previously started standalone activity.
+    fn get_untyped_activity_handle(
+        &self,
+        id: impl Into<String>,
+        run_id: Option<String>,
+    ) -> ActivityHandle<Self, UntypedActivity>
+    where
+        Self: Sized;
+
+    /// List activities matching a query. Returns a stream that lazily paginates through results.
+    fn list_activities(
+        &self,
+        query: impl Into<String>,
+        _options: ActivityListOptions,
+    ) -> ListActivitiesStream;
+
+    /// Count activities matching a query.
+    fn count_activities(
+        &self,
+        query: impl Into<String>,
+        _options: ActivityCountOptions,
+    ) -> impl Future<Output = Result<ActivityExecutionCount, ClientError>>;
 }
 
 /// A client that is bound to a namespace
@@ -1443,6 +1601,201 @@ where
         Self: Sized,
     {
         AsyncActivityHandle::new(self.clone(), identifier)
+    }
+
+    async fn start_activity<A>(
+        &self,
+        activity: A,
+        input: A::Input,
+        options: ActivityStartOptions,
+    ) -> Result<ActivityHandle<Self, A>, StartActivityError>
+    where
+        Self: Sized,
+        A: ActivityDefinition,
+    {
+        let mut client = self.clone();
+        let dc = client.data_converter();
+        let sc = &SerializationContextData::Activity;
+
+        let close_timeouts = options.close_timeouts.into_values();
+        let user_metadata = {
+            let summary = match &options.static_summary {
+                Some(summary) => Some(dc.to_payload(sc, summary).await?),
+                None => None,
+            };
+            let details = match &options.static_details {
+                Some(details) => Some(dc.to_payload(sc, details).await?),
+                None => None,
+            };
+            (summary.is_some() || details.is_some()).then_some(UserMetadata { summary, details })
+        };
+
+        let resp = client
+            .start_activity_execution(
+                StartActivityExecutionRequest {
+                    namespace: client.namespace(),
+                    identity: client.identity(),
+                    request_id: Uuid::new_v4().to_string(),
+                    activity_id: options.id.clone(),
+                    activity_type: Some(ActivityType {
+                        name: activity.name().to_string(),
+                    }),
+                    task_queue: Some(TaskQueue {
+                        name: options.task_queue,
+                        kind: TaskQueueKind::Normal.into(),
+                        normal_name: "".to_string(),
+                    }),
+                    schedule_to_close_timeout: try_into_or_box_err(
+                        close_timeouts.schedule_to_close,
+                        StartActivityError::Other,
+                    )?,
+                    schedule_to_start_timeout: try_into_or_box_err(
+                        options.schedule_to_start_timeout,
+                        StartActivityError::Other,
+                    )?,
+                    start_to_close_timeout: try_into_or_box_err(
+                        close_timeouts.start_to_close,
+                        StartActivityError::Other,
+                    )?,
+                    heartbeat_timeout: try_into_or_box_err(
+                        options.heartbeat_timeout,
+                        StartActivityError::Other,
+                    )?,
+                    retry_policy: options.retry_policy.map(Into::into),
+                    input: dc.to_payloads(sc, &input).await?.into_payloads(),
+                    id_reuse_policy: ProtoActivityIdReusePolicy::from(options.id_reuse_policy)
+                        .into(),
+                    id_conflict_policy: ProtoActivityIdConflictPolicy::from(
+                        options.id_conflict_policy,
+                    )
+                    .into(),
+                    search_attributes: options.search_attributes.map(SearchAttributes::into_proto),
+                    header: options.header,
+                    user_metadata,
+                    priority: Some(options.priority.into()),
+                    start_delay: try_into_or_box_err(
+                        options.start_delay,
+                        StartActivityError::Other,
+                    )?,
+                    ..Default::default()
+                }
+                .into_request(),
+            )
+            .await?
+            .into_inner();
+
+        Ok(ActivityHandle::new(
+            client,
+            options.id,
+            (!resp.run_id.is_empty()).then_some(resp.run_id),
+        ))
+    }
+
+    async fn execute_activity<A>(
+        &self,
+        activity: A,
+        input: A::Input,
+        options: ActivityStartOptions,
+    ) -> Result<A::Output, ExecuteActivityError>
+    where
+        Self: Sized,
+        A: ActivityDefinition,
+    {
+        Ok(self
+            .start_activity(activity, input, options)
+            .await?
+            .result()
+            .await?)
+    }
+
+    fn get_activity_handle<A>(
+        &self,
+        _activity: A,
+        id: impl Into<String>,
+        run_id: Option<String>,
+    ) -> ActivityHandle<Self, A>
+    where
+        Self: Sized,
+        A: ActivityDefinition,
+    {
+        ActivityHandle::new(self.clone(), id.into(), run_id)
+    }
+
+    fn get_untyped_activity_handle(
+        &self,
+        id: impl Into<String>,
+        run_id: Option<String>,
+    ) -> ActivityHandle<Self, UntypedActivity>
+    where
+        Self: Sized,
+    {
+        ActivityHandle::new(self.clone(), id.into(), run_id)
+    }
+
+    fn list_activities(
+        &self,
+        query: impl Into<String>,
+        _options: ActivityListOptions,
+    ) -> ListActivitiesStream {
+        let client = self.clone();
+        let namespace = client.namespace();
+        let query = query.into();
+
+        ListActivitiesStream::new(stream::unfold(
+            Some(vec![]), // empty token for initial query, None if done
+            move |next_page_token| {
+                let mut client = client.clone();
+                let namespace = namespace.clone();
+                let query = query.clone();
+
+                async move {
+                    // making it more visible that we're terminating stream here
+                    #[allow(clippy::question_mark)]
+                    let Some(token): Option<Vec<u8>> = next_page_token else {
+                        return None;
+                    };
+
+                    match WorkflowService::list_activity_executions(
+                        &mut client,
+                        ListActivityExecutionsRequest {
+                            namespace,
+                            page_size: 0, // Use server default
+                            next_page_token: token.clone(),
+                            query,
+                        }
+                        .into_request(),
+                    )
+                    .await
+                    .map(|r| r.into_inner())
+                    {
+                        Ok(resp) => Some((
+                            Ok(resp.executions),
+                            (!resp.next_page_token.is_empty()).then_some(resp.next_page_token),
+                        )),
+                        Err(e) => Some((Err(e.into()), Some(token))),
+                    }
+                }
+            },
+        ))
+    }
+
+    async fn count_activities(
+        &self,
+        query: impl Into<String>,
+        _options: ActivityCountOptions,
+    ) -> Result<ActivityExecutionCount, ClientError> {
+        let mut client = self.clone();
+        let resp = client
+            .count_activity_executions(
+                CountActivityExecutionsRequest {
+                    namespace: client.namespace(),
+                    query: query.into(),
+                }
+                .into_request(),
+            )
+            .await?
+            .into_inner();
+        Ok(ActivityExecutionCount::from_response(resp))
     }
 }
 

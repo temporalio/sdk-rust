@@ -2,7 +2,7 @@ use std::{collections::HashMap, time::Duration};
 
 use crate::{MemoValues, runtime::types::ContinueAsNewRequest};
 use temporalio_common_wasm::{
-    Priority, RetryPolicy,
+    ActivityCloseTimeoutOptions, Priority, RetryPolicy,
     data_converters::{
         GenericPayloadConverter, PayloadConversionError, PayloadConverter, SerializationContext,
         SerializationContextData,
@@ -285,9 +285,9 @@ impl From<ProtoNexusOperationCancellationType> for NexusOperationCancellationTyp
 pub struct ActivityOptions {
     /// Timeouts for activity completion.
     ///
-    /// See [`ActivityCloseTimeouts`] for the meaning of each timeout variant.
+    /// See [`ActivityCloseTimeoutOptions`] for the meaning of each timeout variant.
     #[builder(start_fn)]
-    pub close_timeouts: ActivityCloseTimeouts,
+    pub close_timeouts: ActivityCloseTimeoutOptions,
     /// Identifier to use for tracking the activity in Workflow history.
     /// The `activityId` can be accessed by the activity function.
     /// Does not need to be unique.
@@ -324,14 +324,14 @@ pub struct ActivityOptions {
 }
 
 impl ActivityOptions {
-    /// Returns a builder with `close_timeout` set to [`ActivityCloseTimeouts::StartToClose`].
+    /// Returns a builder with `close_timeout` set to [`ActivityCloseTimeoutOptions::StartToClose`].
     pub fn with_start_to_close_timeout(duration: Duration) -> ActivityOptionsBuilder {
-        Self::with_close_timeouts(ActivityCloseTimeouts::StartToClose(duration))
+        Self::with_close_timeouts(ActivityCloseTimeoutOptions::StartToClose(duration))
     }
 
-    /// Returns a builder with `close_timeout` set to [`ActivityCloseTimeouts::ScheduleToClose`].
+    /// Returns a builder with `close_timeout` set to [`ActivityCloseTimeoutOptions::ScheduleToClose`].
     pub fn with_schedule_to_close_timeout(duration: Duration) -> ActivityOptionsBuilder {
-        Self::with_close_timeouts(ActivityCloseTimeouts::ScheduleToClose(duration))
+        Self::with_close_timeouts(ActivityCloseTimeoutOptions::ScheduleToClose(duration))
     }
 
     /// Creates activity options with only `start_to_close_timeout` set.
@@ -349,43 +349,6 @@ impl ActivityOptions {
     }
 }
 
-/// The timeouts applied to an activity's completion.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ActivityCloseTimeouts {
-    /// Total time that a workflow is willing to wait for Activity to complete.
-    /// `ActivityCloseTimeouts::ScheduleToClose` limits the total time of an Activity's execution
-    /// including retries (use `ActivityCloseTimeouts::StartToClose` to limit the time of a single
-    /// attempt).
-    ScheduleToClose(Duration),
-    /// Maximum time of a single Activity execution attempt. Note that the Temporal Server doesn't
-    /// detect Worker process failures directly. It relies on this timeout to detect that an
-    /// Activity that didn't complete on time. So this timeout should be as short as the longest
-    /// possible execution of the Activity body. Potentially long running Activities must specify
-    /// `ActivityOptions::heartbeat_timeout` and heartbeat from the activity periodically for timely
-    /// failure detection.
-    StartToClose(Duration),
-    /// Applies both execution-attempt and overall-completion bounds.
-    Both {
-        /// Maximum time of a single Activity execution attempt.
-        start_to_close: Duration,
-        /// Total time that a workflow is willing to wait for Activity to complete.
-        schedule_to_close: Duration,
-    },
-}
-
-impl ActivityCloseTimeouts {
-    fn into_durations(self) -> (Option<Duration>, Option<Duration>) {
-        match self {
-            Self::ScheduleToClose(schedule_to_close) => (None, Some(schedule_to_close)),
-            Self::StartToClose(start_to_close) => (Some(start_to_close), None),
-            Self::Both {
-                start_to_close,
-                schedule_to_close,
-            } => (Some(start_to_close), Some(schedule_to_close)),
-        }
-    }
-}
-
 impl ActivityOptions {
     pub(crate) fn into_command(
         self,
@@ -393,8 +356,7 @@ impl ActivityOptions {
         activity_type: String,
         args: Vec<Payload>,
     ) -> WorkflowCommand {
-        let (start_to_close_timeout, schedule_to_close_timeout) =
-            self.close_timeouts.into_durations();
+        let close_timeouts = self.close_timeouts.into_values();
         command_with_metadata(
             workflow_command::Variant::ScheduleActivity(ScheduleActivity {
                 seq,
@@ -402,12 +364,14 @@ impl ActivityOptions {
                 activity_id: self.activity_id.unwrap_or_else(|| seq.to_string()),
                 task_queue: self.task_queue.unwrap_or_default(),
                 arguments: args,
-                schedule_to_close_timeout: schedule_to_close_timeout
+                schedule_to_close_timeout: close_timeouts
+                    .schedule_to_close
                     .and_then(|duration| duration.try_into().ok()),
                 schedule_to_start_timeout: self
                     .schedule_to_start_timeout
                     .and_then(|duration| duration.try_into().ok()),
-                start_to_close_timeout: start_to_close_timeout
+                start_to_close_timeout: close_timeouts
+                    .start_to_close
                     .and_then(|duration| duration.try_into().ok()),
                 heartbeat_timeout: self
                     .heartbeat_timeout
@@ -829,7 +793,6 @@ pub struct ContinueAsNewOptions {
     /// search attributes.
     pub search_attributes: Option<SearchAttributes>,
     /// If set, the new workflow will have this retry policy. If `None`, reuses the current policy.
-    #[builder(into)]
     pub retry_policy: Option<RetryPolicy>,
     /// Whether the new workflow should run on a worker with a compatible build id.
     pub versioning_intent: Option<VersioningIntent>,
@@ -999,7 +962,7 @@ mod tests {
 
         assert_eq!(
             opts.close_timeouts,
-            ActivityCloseTimeouts::StartToClose(Duration::from_secs(5))
+            ActivityCloseTimeoutOptions::StartToClose(Duration::from_secs(5))
         );
         assert_eq!(opts.heartbeat_timeout, Some(Duration::from_secs(2)));
     }
@@ -1012,14 +975,14 @@ mod tests {
 
         assert_eq!(
             opts.close_timeouts,
-            ActivityCloseTimeouts::ScheduleToClose(Duration::from_secs(5))
+            ActivityCloseTimeoutOptions::ScheduleToClose(Duration::from_secs(5))
         );
         assert_eq!(opts.heartbeat_timeout, Some(Duration::from_secs(2)));
     }
 
     #[test]
     fn activity_options_both_close_timeouts_map_to_command() {
-        let req = ActivityOptions::with_close_timeouts(ActivityCloseTimeouts::Both {
+        let req = ActivityOptions::with_close_timeouts(ActivityCloseTimeoutOptions::Both {
             start_to_close: Duration::from_secs(3),
             schedule_to_close: Duration::from_secs(8),
         })

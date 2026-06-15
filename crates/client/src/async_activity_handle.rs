@@ -23,17 +23,25 @@ use tonic::IntoRequest;
 
 /// Identifies an async activity for completion outside a worker.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub enum ActivityIdentifier {
     /// Identify activity by its task token
     TaskToken(TaskToken),
-    /// Identify activity by workflow and activity IDs.
-    ById {
+    /// Identify workflow activity by workflow and activity IDs.
+    ByIdWorkflow {
         /// ID of the workflow that scheduled this activity.
         workflow_id: String,
-        /// Run ID of the workflow (optional - if not provided, targets the latest run).
-        run_id: String,
+        /// Run ID of the workflow (if not provided, targets the latest run).
+        run_id: Option<String>,
         /// ID of the activity to complete.
         activity_id: String,
+    },
+    /// Identify standalone activity by activity ID.
+    ByIdStandalone {
+        /// ID of the activity to complete.
+        activity_id: String,
+        /// Run ID of the activity (if not provided, targets the latest run).
+        run_id: Option<String>,
     },
 }
 
@@ -43,17 +51,54 @@ impl ActivityIdentifier {
         Self::TaskToken(token)
     }
 
-    /// Create an identifier from workflow and activity IDs. Use an empty run id to target the
-    /// latest workflow execution.
-    pub fn by_id(
+    /// Create an identifier of a workflow activity from workflow and activity IDs. Set run_id to
+    /// None to target the latest workflow execution.
+    pub fn by_id_workflow(
         workflow_id: impl Into<String>,
-        run_id: impl Into<String>,
+        run_id: Option<impl Into<String>>,
         activity_id: impl Into<String>,
     ) -> Self {
-        Self::ById {
+        Self::ByIdWorkflow {
             workflow_id: workflow_id.into(),
-            run_id: run_id.into(),
+            run_id: run_id.map(Into::into),
             activity_id: activity_id.into(),
+        }
+    }
+
+    /// Create an identifier of a standalone activity from activity IDs. Set run_id to None to
+    /// target the latest workflow execution.
+    pub fn by_id_standalone(
+        activity_id: impl Into<String>,
+        run_id: Option<impl Into<String>>,
+    ) -> Self {
+        Self::ByIdStandalone {
+            activity_id: activity_id.into(),
+            run_id: run_id.map(Into::into),
+        }
+    }
+
+    /// Internal use only. Returns workflow ID, run ID and activity ID as separate strings.
+    fn id_tuple(&self) -> (String, String, String) {
+        debug_assert!(!matches!(self, ActivityIdentifier::TaskToken(..)));
+        match self {
+            ActivityIdentifier::ByIdWorkflow {
+                workflow_id,
+                run_id,
+                activity_id,
+            } => (
+                workflow_id.clone(),
+                run_id.clone().unwrap_or_default(),
+                activity_id.clone(),
+            ),
+            ActivityIdentifier::ByIdStandalone {
+                activity_id,
+                run_id,
+            } => (
+                "".into(),
+                run_id.clone().unwrap_or_default(),
+                activity_id.clone(),
+            ),
+            _ => unreachable!("Unknown activity identifier variant"),
         }
     }
 }
@@ -98,43 +143,37 @@ impl<CT: WorkflowService + NamespacedClient + Clone> AsyncActivityHandle<CT> {
             }),
             None => None,
         };
-        match &self.identifier {
-            ActivityIdentifier::TaskToken(token) => {
-                WorkflowService::respond_activity_task_completed(
-                    &mut self.client.clone(),
-                    RespondActivityTaskCompletedRequest {
-                        task_token: token.0.clone(),
-                        result,
-                        identity: self.client.identity(),
-                        namespace: self.client.namespace(),
-                        ..Default::default()
-                    }
-                    .into_request(),
-                )
-                .await
-                .map_err(AsyncActivityError::from_status)?;
-            }
-            ActivityIdentifier::ById {
-                workflow_id,
-                run_id,
-                activity_id,
-            } => {
-                WorkflowService::respond_activity_task_completed_by_id(
-                    &mut self.client.clone(),
-                    RespondActivityTaskCompletedByIdRequest {
-                        namespace: self.client.namespace(),
-                        workflow_id: workflow_id.clone(),
-                        run_id: run_id.clone(),
-                        activity_id: activity_id.clone(),
-                        result,
-                        identity: self.client.identity(),
-                        resource_id: Default::default(),
-                    }
-                    .into_request(),
-                )
-                .await
-                .map_err(AsyncActivityError::from_status)?;
-            }
+        if let ActivityIdentifier::TaskToken(token) = &self.identifier {
+            WorkflowService::respond_activity_task_completed(
+                &mut self.client.clone(),
+                RespondActivityTaskCompletedRequest {
+                    task_token: token.0.clone(),
+                    result,
+                    identity: self.client.identity(),
+                    namespace: self.client.namespace(),
+                    ..Default::default()
+                }
+                .into_request(),
+            )
+            .await
+            .map_err(AsyncActivityError::from_status)?;
+        } else {
+            let (workflow_id, run_id, activity_id) = self.identifier.id_tuple();
+            WorkflowService::respond_activity_task_completed_by_id(
+                &mut self.client.clone(),
+                RespondActivityTaskCompletedByIdRequest {
+                    namespace: self.client.namespace(),
+                    workflow_id,
+                    run_id,
+                    activity_id,
+                    result,
+                    identity: self.client.identity(),
+                    resource_id: Default::default(),
+                }
+                .into_request(),
+            )
+            .await
+            .map_err(AsyncActivityError::from_status)?;
         }
         Ok(())
     }
@@ -170,45 +209,39 @@ impl<CT: WorkflowService + NamespacedClient + Clone> AsyncActivityHandle<CT> {
             }),
             None => None,
         };
-        match &self.identifier {
-            ActivityIdentifier::TaskToken(token) => {
-                WorkflowService::respond_activity_task_failed(
-                    &mut self.client.clone(),
-                    RespondActivityTaskFailedRequest {
-                        task_token: token.0.clone(),
-                        failure: Some(failure),
-                        identity: self.client.identity(),
-                        namespace: self.client.namespace(),
-                        last_heartbeat_details,
-                        ..Default::default()
-                    }
-                    .into_request(),
-                )
-                .await
-                .map_err(AsyncActivityError::from_status)?;
-            }
-            ActivityIdentifier::ById {
-                workflow_id,
-                run_id,
-                activity_id,
-            } => {
-                WorkflowService::respond_activity_task_failed_by_id(
-                    &mut self.client.clone(),
-                    RespondActivityTaskFailedByIdRequest {
-                        namespace: self.client.namespace(),
-                        workflow_id: workflow_id.clone(),
-                        run_id: run_id.clone(),
-                        activity_id: activity_id.clone(),
-                        failure: Some(failure),
-                        identity: self.client.identity(),
-                        last_heartbeat_details,
-                        resource_id: Default::default(),
-                    }
-                    .into_request(),
-                )
-                .await
-                .map_err(AsyncActivityError::from_status)?;
-            }
+        if let ActivityIdentifier::TaskToken(token) = &self.identifier {
+            WorkflowService::respond_activity_task_failed(
+                &mut self.client.clone(),
+                RespondActivityTaskFailedRequest {
+                    task_token: token.0.clone(),
+                    failure: Some(failure),
+                    identity: self.client.identity(),
+                    namespace: self.client.namespace(),
+                    last_heartbeat_details,
+                    ..Default::default()
+                }
+                .into_request(),
+            )
+            .await
+            .map_err(AsyncActivityError::from_status)?;
+        } else {
+            let (workflow_id, run_id, activity_id) = self.identifier.id_tuple();
+            WorkflowService::respond_activity_task_failed_by_id(
+                &mut self.client.clone(),
+                RespondActivityTaskFailedByIdRequest {
+                    namespace: self.client.namespace(),
+                    workflow_id: workflow_id.clone(),
+                    run_id: run_id.clone(),
+                    activity_id: activity_id.clone(),
+                    failure: Some(failure),
+                    identity: self.client.identity(),
+                    last_heartbeat_details,
+                    resource_id: Default::default(),
+                }
+                .into_request(),
+            )
+            .await
+            .map_err(AsyncActivityError::from_status)?;
         }
         Ok(())
     }
@@ -228,43 +261,37 @@ impl<CT: WorkflowService + NamespacedClient + Clone> AsyncActivityHandle<CT> {
             }),
             None => None,
         };
-        match &self.identifier {
-            ActivityIdentifier::TaskToken(token) => {
-                WorkflowService::respond_activity_task_canceled(
-                    &mut self.client.clone(),
-                    RespondActivityTaskCanceledRequest {
-                        task_token: token.0.clone(),
-                        details,
-                        identity: self.client.identity(),
-                        namespace: self.client.namespace(),
-                        ..Default::default()
-                    }
-                    .into_request(),
-                )
-                .await
-                .map_err(AsyncActivityError::from_status)?;
-            }
-            ActivityIdentifier::ById {
-                workflow_id,
-                run_id,
-                activity_id,
-            } => {
-                WorkflowService::respond_activity_task_canceled_by_id(
-                    &mut self.client.clone(),
-                    RespondActivityTaskCanceledByIdRequest {
-                        namespace: self.client.namespace(),
-                        workflow_id: workflow_id.clone(),
-                        run_id: run_id.clone(),
-                        activity_id: activity_id.clone(),
-                        details,
-                        identity: self.client.identity(),
-                        ..Default::default()
-                    }
-                    .into_request(),
-                )
-                .await
-                .map_err(AsyncActivityError::from_status)?;
-            }
+        if let ActivityIdentifier::TaskToken(token) = &self.identifier {
+            WorkflowService::respond_activity_task_canceled(
+                &mut self.client.clone(),
+                RespondActivityTaskCanceledRequest {
+                    task_token: token.0.clone(),
+                    details,
+                    identity: self.client.identity(),
+                    namespace: self.client.namespace(),
+                    ..Default::default()
+                }
+                .into_request(),
+            )
+            .await
+            .map_err(AsyncActivityError::from_status)?;
+        } else {
+            let (workflow_id, run_id, activity_id) = self.identifier.id_tuple();
+            WorkflowService::respond_activity_task_canceled_by_id(
+                &mut self.client.clone(),
+                RespondActivityTaskCanceledByIdRequest {
+                    namespace: self.client.namespace(),
+                    workflow_id: workflow_id.clone(),
+                    run_id: run_id.clone(),
+                    activity_id: activity_id.clone(),
+                    details,
+                    identity: self.client.identity(),
+                    ..Default::default()
+                }
+                .into_request(),
+            )
+            .await
+            .map_err(AsyncActivityError::from_status)?;
         }
         Ok(())
     }
@@ -290,47 +317,41 @@ impl<CT: WorkflowService + NamespacedClient + Clone> AsyncActivityHandle<CT> {
             }),
             None => None,
         };
-        match &self.identifier {
-            ActivityIdentifier::TaskToken(token) => {
-                let resp = WorkflowService::record_activity_task_heartbeat(
-                    &mut self.client.clone(),
-                    RecordActivityTaskHeartbeatRequest {
-                        task_token: token.0.clone(),
-                        details,
-                        identity: self.client.identity(),
-                        namespace: self.client.namespace(),
-                        resource_id: Default::default(),
-                    }
-                    .into_request(),
-                )
-                .await
-                .map_err(AsyncActivityError::from_status)?
-                .into_inner();
-                Ok(ActivityHeartbeatResponse::from(resp))
-            }
-            ActivityIdentifier::ById {
-                workflow_id,
-                run_id,
-                activity_id,
-            } => {
-                let resp = WorkflowService::record_activity_task_heartbeat_by_id(
-                    &mut self.client.clone(),
-                    RecordActivityTaskHeartbeatByIdRequest {
-                        namespace: self.client.namespace(),
-                        workflow_id: workflow_id.clone(),
-                        run_id: run_id.clone(),
-                        activity_id: activity_id.clone(),
-                        details,
-                        identity: self.client.identity(),
-                        resource_id: Default::default(),
-                    }
-                    .into_request(),
-                )
-                .await
-                .map_err(AsyncActivityError::from_status)?
-                .into_inner();
-                Ok(ActivityHeartbeatResponse::from(resp))
-            }
+        if let ActivityIdentifier::TaskToken(token) = &self.identifier {
+            let resp = WorkflowService::record_activity_task_heartbeat(
+                &mut self.client.clone(),
+                RecordActivityTaskHeartbeatRequest {
+                    task_token: token.0.clone(),
+                    details,
+                    identity: self.client.identity(),
+                    namespace: self.client.namespace(),
+                    resource_id: Default::default(),
+                }
+                .into_request(),
+            )
+            .await
+            .map_err(AsyncActivityError::from_status)?
+            .into_inner();
+            Ok(ActivityHeartbeatResponse::from(resp))
+        } else {
+            let (workflow_id, run_id, activity_id) = self.identifier.id_tuple();
+            let resp = WorkflowService::record_activity_task_heartbeat_by_id(
+                &mut self.client.clone(),
+                RecordActivityTaskHeartbeatByIdRequest {
+                    namespace: self.client.namespace(),
+                    workflow_id: workflow_id.clone(),
+                    run_id: run_id.clone(),
+                    activity_id: activity_id.clone(),
+                    details,
+                    identity: self.client.identity(),
+                    resource_id: Default::default(),
+                }
+                .into_request(),
+            )
+            .await
+            .map_err(AsyncActivityError::from_status)?
+            .into_inner();
+            Ok(ActivityHeartbeatResponse::from(resp))
         }
     }
 }

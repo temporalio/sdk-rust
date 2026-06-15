@@ -5,7 +5,8 @@ mod failure_converter;
 
 pub use failure_converter::{
     ActivityExecutionDecodeHint, ChildWorkflowExecutionDecodeHint, ChildWorkflowStartDecodeHint,
-    DefaultFailureConverter, FailureConverter, FailureDecodeHint, WorkflowSignalDecodeHint,
+    DefaultFailureConverter, FailureConverter, FailureDecodeHint, NoopDecodeHint,
+    WorkflowSignalDecodeHint,
 };
 
 use crate::protos::temporal::api::common::v1::Payload;

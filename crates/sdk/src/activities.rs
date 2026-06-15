@@ -72,7 +72,7 @@ use std::{
 use temporalio_client::{Client, ClientOptions, Priority, WorkflowExecutionInfo, WorkflowHandle};
 pub use temporalio_common::ActivityError;
 use temporalio_common::{
-    ActivityDefinition, HasWorkflowDefinition, RetryPolicy, WorkflowExecution,
+    ActivityDefinition, HasWorkflowDefinition, RetryPolicy,
     data_converters::{
         DataConverter, DecodablePayloads, GenericPayloadConverter, PayloadConversionError,
         PayloadConverter, RawValue, SerializationContext, SerializationContextData,
@@ -139,6 +139,10 @@ impl ActivityContext {
             heartbeat_details,
             client_options.data_converter.payload_converter().clone(),
         );
+        let (workflow_id, workflow_run_id) = workflow_execution
+            .map(|we| (we.workflow_id, we.run_id))
+            .unzip();
+        let activity_run_id = (workflow_id.is_none() && !run_id.is_empty()).then_some(run_id);
 
         (
             ActivityContext {
@@ -150,9 +154,10 @@ impl ActivityContext {
                 info: ActivityInfo {
                     task_token,
                     task_queue,
-                    workflow_type,
-                    workflow_namespace,
-                    workflow_execution: workflow_execution.map(Into::into),
+                    workflow_type: (!workflow_type.is_empty()).then_some(workflow_type),
+                    namespace: workflow_namespace,
+                    workflow_id,
+                    workflow_run_id,
                     activity_id,
                     activity_type,
                     heartbeat_timeout: heartbeat_timeout.try_into_or_none(),
@@ -165,7 +170,7 @@ impl ActivityContext {
                     retry_policy: retry_policy.map(Into::into),
                     is_local,
                     priority: priority.map(Into::into).unwrap_or_default(),
-                    run_id: (!run_id.is_empty()).then_some(run_id),
+                    activity_run_id,
                 },
             },
             input,
@@ -225,18 +230,22 @@ impl ActivityContext {
 
     /// Return a workflow handle for the workflow execution that started this activity, if any.
     pub fn workflow_handle<W: HasWorkflowDefinition>(&self) -> Option<WorkflowHandle<Client, W>> {
-        let workflow_execution = self.info.workflow_execution.as_ref()?;
-        let run_id = (!workflow_execution.run_id().is_empty())
-            .then(|| workflow_execution.run_id().to_owned());
-        Some(WorkflowHandle::new(
-            self.client(),
-            WorkflowExecutionInfo {
-                namespace: self.client_options.namespace.clone(),
-                workflow_id: workflow_execution.workflow_id().to_owned(),
-                run_id: run_id.clone(),
-                first_execution_run_id: run_id,
-            },
-        ))
+        self.info().workflow_id.clone().map(|workflow_id| {
+            debug_assert!(
+                self.info().workflow_run_id.is_some(),
+                "workflow_run_id should be set when workflow_id is set"
+            );
+            let run_id = self.info.workflow_run_id.clone();
+            WorkflowHandle::new(
+                self.client(),
+                WorkflowExecutionInfo {
+                    namespace: self.client_options.namespace.clone(),
+                    workflow_id,
+                    run_id: run_id.clone(),
+                    first_execution_run_id: run_id,
+                },
+            )
+        })
     }
 
     /// Get headers attached to this activity
@@ -295,12 +304,14 @@ impl ActivityHeartbeatDetails {
 pub struct ActivityInfo {
     /// An opaque token representing a specific Activity task.
     pub task_token: Vec<u8>,
-    /// The type of the workflow that invoked this activity.
-    pub workflow_type: String,
-    /// The namespace of the workflow that invoked this activity.
-    pub workflow_namespace: String,
-    /// The execution of the workflow that invoked this activity.
-    pub workflow_execution: Option<WorkflowExecution>,
+    /// The type of the workflow that invoked this activity. None for standalone activities.
+    pub workflow_type: Option<String>,
+    /// The namespace of this activity.
+    pub namespace: String,
+    /// ID of the workflow that invoked this activity. None for standalone activities.
+    pub workflow_id: Option<String>,
+    /// Run ID of the workflow that invoked this activity. None for standalone activities.
+    pub workflow_run_id: Option<String>,
     /// The ID of this activity.
     pub activity_id: String,
     /// The type of this activity.
@@ -326,7 +337,7 @@ pub struct ActivityInfo {
     /// Priority of this activity. If unset uses [Priority::default].
     pub priority: Priority,
     /// Run ID of this activity execution. Only set for standalone activities.
-    pub run_id: Option<String>,
+    pub activity_run_id: Option<String>,
 }
 
 /// Deadline calculation.  This is a port of

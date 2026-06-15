@@ -59,6 +59,18 @@ pub trait FailureDecodeHint {
     fn adapt(self, normalized: IncomingError) -> Self::Output;
 }
 
+/// No-op decode hint; returns the error unchanged.
+#[derive(Debug, Clone, Copy)]
+pub struct NoopDecodeHint;
+
+impl FailureDecodeHint for NoopDecodeHint {
+    type Output = IncomingError;
+
+    fn adapt(self, normalized: IncomingError) -> Self::Output {
+        normalized
+    }
+}
+
 /// Decode hint for activity execution results.
 #[derive(Debug, Clone, Copy)]
 pub struct ActivityExecutionDecodeHint {

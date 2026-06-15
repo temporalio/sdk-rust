@@ -29,7 +29,7 @@ pub use runtime::model::{TimerResult, WorkflowResult, WorkflowTermination};
 #[doc(hidden)]
 pub use runtime::{SdkWakeGuard, is_sdk_wake};
 pub use temporalio_common_wasm::{
-    Memo, RetryPolicy,
+    ActivityCloseTimeoutOptions, Memo, RetryPolicy,
     error::{
         ActivityExecutionError, ChildWorkflowExecutionError, ChildWorkflowStartError, RetryState,
         TimeoutType, WorkflowSignalError,
@@ -38,8 +38,8 @@ pub use temporalio_common_wasm::{
 #[doc(hidden)]
 pub use workflow_context::PatchActivationCaller;
 pub use workflow_context::{
-    ActivityCancellationType, ActivityCloseTimeouts, ActivityOptions, BaseWorkflowContext,
-    CancellableFuture, ChildWorkflowCancellationType, ChildWorkflowOptions, ContinueAsNewOptions,
+    ActivityCancellationType, ActivityOptions, BaseWorkflowContext, CancellableFuture,
+    ChildWorkflowCancellationType, ChildWorkflowOptions, ContinueAsNewOptions,
     ContinueAsNewVersioningBehavior, ExternalWorkflowHandle, LocalActivityOptions,
     NamespacedWorkflowInfo, NexusOperationCancellationType, NexusOperationOptions,
     ParentClosePolicy, PatchActivationCallback, PatchActivationInput, Signal, SignalData,

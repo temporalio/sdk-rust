@@ -7,6 +7,8 @@
 #[macro_use]
 extern crate tracing;
 
+use std::time::Duration;
+
 mod activity_definition;
 pub mod data_converters;
 pub mod error;
@@ -48,3 +50,55 @@ macro_rules! dbg_panic {
 }
 #[allow(unused_imports)]
 pub(crate) use dbg_panic;
+
+/// Represents Activity schedule-to-close and start-to-close timeouts for the purposes of specifying
+/// Activity options. Specifying at least one of them is required, but specifying both is also
+/// allowed. Note that this type does not cover all available timeout options for an Activity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ActivityCloseTimeoutOptions {
+    /// Total time the Activity is allowed to run, including retries.
+    ScheduleToClose(Duration),
+    /// Maximum time of a single Activity execution attempt. Note that the Temporal Server doesn't
+    /// detect Worker process failures directly. It relies on this timeout to detect that an
+    /// Activity that didn't complete on time. So this timeout should be as short as the longest
+    /// possible execution of the Activity body. Potentially long running Activities must specify
+    /// `heartbeat_timeout` in options and heartbeat from the activity periodically for timely
+    /// failure detection.
+    StartToClose(Duration),
+    /// Applies both execution-attempt and overall-completion bounds.
+    Both {
+        /// Total time the Activity is allowed to run, including retries.
+        schedule_to_close: Duration,
+        /// Maximum time of a single Activity execution attempt.
+        start_to_close: Duration,
+    },
+}
+
+impl ActivityCloseTimeoutOptions {
+    /// For internal use. Converts options to [`ActivityCloseTimeoutValues`].
+    #[doc(hidden)]
+    pub fn into_values(self) -> ActivityCloseTimeoutValues {
+        let (schedule_to_close, start_to_close) = match self {
+            ActivityCloseTimeoutOptions::ScheduleToClose(t) => (Some(t), None),
+            ActivityCloseTimeoutOptions::StartToClose(t) => (None, Some(t)),
+            ActivityCloseTimeoutOptions::Both {
+                schedule_to_close,
+                start_to_close,
+            } => (Some(schedule_to_close), Some(start_to_close)),
+        };
+
+        ActivityCloseTimeoutValues {
+            schedule_to_close,
+            start_to_close,
+        }
+    }
+}
+
+/// For internal use. Obtained from [`ActivityCloseTimeoutOptions`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive] // disallow direct construction
+#[doc(hidden)]
+pub struct ActivityCloseTimeoutValues {
+    pub schedule_to_close: Option<Duration>,
+    pub start_to_close: Option<Duration>,
+}
