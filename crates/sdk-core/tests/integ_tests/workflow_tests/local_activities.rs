@@ -782,33 +782,6 @@ async fn schedule_to_close_timeout_across_timer_backoff(#[case] cached: bool) {
     assert_eq!(3, num_attempts.load(Ordering::Relaxed));
 }
 
-#[rstest::rstest]
-#[tokio::test]
-async fn eviction_wont_make_local_act_get_dropped(#[values(true, false)] short_wft_timeout: bool) {
-    let wf_name = format!("eviction_wont_make_local_act_get_dropped_{short_wft_timeout}");
-    let mut starter = CoreWfStarter::new(&wf_name);
-    starter.sdk_config.max_cached_workflows = 0_usize;
-    starter.sdk_config.register_activities(StdActivities);
-    let mut worker = starter.worker().await;
-    worker
-        .register_workflow::<LocalActThenTimerThenWait>()
-        .unwrap();
-
-    let task_queue = starter.get_task_queue().to_owned();
-    let opts = if short_wft_timeout {
-        WorkflowStartOptions::new(task_queue, wf_name.clone())
-            .task_timeout(Duration::from_secs(1))
-            .build()
-    } else {
-        WorkflowStartOptions::new(task_queue, wf_name.clone()).build()
-    };
-    worker
-        .submit_workflow(LocalActThenTimerThenWait::run, (), opts)
-        .await
-        .unwrap();
-    worker.run_until_done().await.unwrap();
-}
-
 #[tokio::test]
 async fn timer_backoff_concurrent_with_non_timer_backoff() {
     let wf_name = "timer_backoff_concurrent_with_non_timer_backoff";

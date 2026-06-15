@@ -1383,6 +1383,11 @@ impl Worker {
         &self.config
     }
 
+    /// Return a clone of the current client connection backing this worker, if available.
+    pub fn get_client_connection(&self) -> Option<Connection> {
+        self.client.connection()
+    }
+
     /// Returns the namespace capabilities discovered during [Worker::validate].
     pub fn get_namespace_capabilities(&self) -> &NamespaceCapabilities {
         &self.capabilities

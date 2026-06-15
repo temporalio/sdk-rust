@@ -58,11 +58,12 @@ jobs:
           - os: ubuntu-latest
           - os: ubuntu-arm
             runsOn: ubuntu-24.04-arm64-2-core
+            timeoutMinutes: 30
           - os: macos-arm
             runsOn: macos-14
           - os: macos-intel
-            runsOn: macos-15-intel
-            timeoutMinutes: 30
+            runsOn: macos-26-intel
+            timeoutMinutes: 40
     runs-on: ${{ matrix.runsOn || matrix.os }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
@@ -167,7 +168,8 @@ jobs:
           - os: macos-arm
             runsOn: macos-14
           - os: macos-intel
-            runsOn: macos-15-intel
+            runsOn: macos-26-intel
+            timeoutMinutes: 40
     runs-on: ${{ matrix.runsOn || matrix.os }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6

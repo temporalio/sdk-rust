@@ -329,6 +329,9 @@ message NexusOperationExecutionInfo {
 
     // The identity of the client who started this operation.
     string identity = 28;
+
+    // Updated once on scheduled and once on terminal status.
+    int64 state_size_bytes = 29;
 }
 
 // Limited Nexus operation information returned in the list response.
@@ -362,4 +365,7 @@ message NexusOperationExecutionListInfo {
     // The difference between close time and scheduled time.
     // This field is only populated if the operation is closed.
     google.protobuf.Duration execution_duration = 11;
+
+    // Updated once on scheduled and once on terminal status.
+    int64 state_size_bytes = 12;
 }

@@ -2,7 +2,8 @@ mod options;
 
 pub use options::{
     ActivityCloseTimeouts, ActivityOptions, ChildWorkflowOptions, ContinueAsNewOptions,
-    LocalActivityOptions, NexusOperationOptions, Signal, SignalData, TimerOptions,
+    ContinueAsNewVersioningBehavior, LocalActivityOptions, NexusOperationOptions, Signal,
+    SignalData, TimerOptions,
 };
 pub use temporalio_common_wasm::protos::coresdk::child_workflow::StartChildWorkflowExecutionFailedCause;
 
@@ -37,13 +38,13 @@ use temporalio_common_wasm::{
     ActivityDefinition, SignalDefinition, WorkflowDefinition,
     data_converters::{
         ActivityExecutionDecodeHint, ChildWorkflowExecutionDecodeHint,
-        ChildWorkflowSignalDecodeHint, ChildWorkflowStartDecodeHint, DataConverter,
-        GenericPayloadConverter, PayloadConversionError, PayloadConverter, SerializationContext,
-        SerializationContextData, TemporalDeserializable,
+        ChildWorkflowStartDecodeHint, DataConverter, GenericPayloadConverter, PayloadConverter,
+        SerializationContext, SerializationContextData, TemporalDeserializable,
+        WorkflowSignalDecodeHint,
     },
     error::{
-        ActivityExecutionError, ChildWorkflowExecutionError, ChildWorkflowSignalError,
-        ChildWorkflowStartError,
+        ActivityExecutionError, ChildWorkflowExecutionError, ChildWorkflowStartError,
+        WorkflowSignalError,
     },
     protos::{
         coresdk::{
@@ -147,7 +148,7 @@ impl PendingCommandId {
 struct WorkflowRuntimeState {
     host: Rc<dyn WorkflowHost>,
     pending_unblocks: RefCell<HashMap<PendingCommandId, oneshot::Sender<UnblockEvent>>>,
-    forced_wft_failure: RefCell<Option<anyhow::Error>>,
+    forced_wft_failure: RefCell<Option<Box<dyn std::error::Error + Send + Sync>>>,
     progress_made: Cell<bool>,
 }
 
@@ -189,12 +190,12 @@ impl WorkflowRuntimeState {
         true
     }
 
-    fn set_forced_wft_failure(&self, err: anyhow::Error) {
+    fn set_forced_wft_failure(&self, err: Box<dyn std::error::Error + Send + Sync>) {
         *self.forced_wft_failure.borrow_mut() = Some(err);
         self.progress_made.set(true);
     }
 
-    fn take_forced_wft_failure(&self) -> Option<anyhow::Error> {
+    fn take_forced_wft_failure(&self) -> Option<Box<dyn std::error::Error + Send + Sync>> {
         self.forced_wft_failure.borrow_mut().take()
     }
 
@@ -456,7 +457,9 @@ impl BaseWorkflowContext {
         self.inner.runtime.take_progress()
     }
 
-    pub(crate) fn take_forced_wft_failure(&self) -> Option<anyhow::Error> {
+    pub(crate) fn take_forced_wft_failure(
+        &self,
+    ) -> Option<Box<dyn std::error::Error + Send + Sync>> {
         self.inner.runtime.take_forced_wft_failure()
     }
 
@@ -812,6 +815,18 @@ impl<W> SyncWorkflowContext<W> {
             .continue_as_new_suggested
     }
 
+    /// Returns true if the workflow's target worker deployment version changed.
+    ///
+    /// This experimental signal is intended for workers using worker deployment versioning.
+    pub fn target_worker_deployment_version_changed(&self) -> bool {
+        self.base
+            .inner
+            .shared
+            .borrow()
+            .activation
+            .target_worker_deployment_version_changed
+    }
+
     /// Returns the headers for the current handler invocation (signal, update, query, etc.).
     ///
     /// When called from within a signal handler, returns the headers that were sent with that
@@ -1018,8 +1033,8 @@ impl<W> SyncWorkflowContext<W> {
     }
 
     /// Force a workflow task failure (EX: in order to retry on non-sticky queue)
-    pub fn force_task_fail(&self, with: anyhow::Error) {
-        self.base.inner.runtime.set_forced_wft_failure(with);
+    pub fn force_task_fail(&self, with: impl Into<Box<dyn std::error::Error + Send + Sync>>) {
+        self.base.inner.runtime.set_forced_wft_failure(with.into());
     }
 
     /// Start a nexus operation
@@ -1156,6 +1171,13 @@ impl<W> WorkflowContext<W> {
         self.sync.continue_as_new_suggested()
     }
 
+    /// Returns true if the workflow's target worker deployment version changed.
+    ///
+    /// This experimental signal is intended for workers using worker deployment versioning.
+    pub fn target_worker_deployment_version_changed(&self) -> bool {
+        self.sync.target_worker_deployment_version_changed()
+    }
+
     /// Returns the headers for the current handler invocation (signal, update, query, etc.).
     pub fn headers(&self) -> &HashMap<String, Payload> {
         self.sync.headers()
@@ -1272,7 +1294,7 @@ impl<W> WorkflowContext<W> {
     }
 
     /// Force a workflow task failure (EX: in order to retry on non-sticky queue)
-    pub fn force_task_fail(&self, with: anyhow::Error) {
+    pub fn force_task_fail(&self, with: impl Into<Box<dyn std::error::Error + Send + Sync>>) {
         self.sync.force_task_fail(with)
     }
 
@@ -2044,7 +2066,7 @@ where
 enum SignalChildFut<F> {
     /// Immediate error (e.g., signal input serialization failure). Resolves on first poll.
     Errored {
-        error: Option<ChildWorkflowSignalError>,
+        error: Option<WorkflowSignalError>,
     },
     Running {
         inner: F,
@@ -2054,7 +2076,7 @@ enum SignalChildFut<F> {
 }
 
 impl<F> SignalChildFut<F> {
-    fn eager(err: ChildWorkflowSignalError) -> Self {
+    fn eager(err: WorkflowSignalError) -> Self {
         Self::Errored { error: Some(err) }
     }
 }
@@ -2065,7 +2087,7 @@ impl<F> Future for SignalChildFut<F>
 where
     F: Future<Output = SignalExternalWfResult> + Unpin,
 {
-    type Output = Result<(), ChildWorkflowSignalError>;
+    type Output = Result<(), WorkflowSignalError>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
@@ -2082,7 +2104,7 @@ where
                 Poll::Ready(Err(failure)) => Poll::Ready(Err(data_converter.to_error(
                     &SerializationContextData::Workflow,
                     failure,
-                    ChildWorkflowSignalDecodeHint,
+                    WorkflowSignalDecodeHint,
                 )?)),
             },
             SignalChildFut::Terminated => panic!("polled after termination"),
@@ -2103,7 +2125,7 @@ where
     }
 }
 
-impl<F> CancellableFuture<Result<(), ChildWorkflowSignalError>> for SignalChildFut<F>
+impl<F> CancellableFuture<Result<(), WorkflowSignalError>> for SignalChildFut<F>
 where
     F: CancellableFuture<SignalExternalWfResult> + Unpin,
 {
@@ -2146,7 +2168,7 @@ where
         &self,
         signal: S,
         input: S::Input,
-    ) -> impl CancellableFuture<Result<(), ChildWorkflowSignalError>> + 'static {
+    ) -> impl CancellableFuture<Result<(), WorkflowSignalError>> + 'static {
         let payload_converter = self.common.data_converter.payload_converter();
         let ctx = SerializationContext {
             data: &SerializationContextData::Workflow,
@@ -2198,8 +2220,8 @@ impl ExternalWorkflowHandle {
         &self,
         signal: S,
         input: S::Input,
-    ) -> impl CancellableFuture<SignalExternalWfResult> + 'static {
-        let payload_converter = self.base_ctx.inner.data_converter.payload_converter();
+    ) -> impl CancellableFuture<Result<(), WorkflowSignalError>> + 'static {
+        let payload_converter = self.base_ctx.data_converter().payload_converter();
         let ctx = SerializationContext {
             data: &SerializationContextData::Workflow,
             converter: payload_converter,
@@ -2207,7 +2229,7 @@ impl ExternalWorkflowHandle {
         let payloads = match payload_converter.to_payloads(&ctx, &input) {
             Ok(p) => p,
             Err(e) => {
-                return SignalExternalFut::SerializationError(Some(e));
+                return SignalChildFut::eager(e.into());
             }
         };
         let signal = Signal::new(S::name(&signal), payloads);
@@ -2218,7 +2240,10 @@ impl ExternalWorkflowHandle {
                 run_id: self.run_id.clone().unwrap_or_default(),
             },
         );
-        SignalExternalFut::Running(self.base_ctx.clone().send_signal_wf(target, signal))
+        SignalChildFut::Running {
+            inner: self.base_ctx.clone().send_signal_wf(target, signal),
+            data_converter: self.base_ctx.data_converter().clone(),
+        }
     }
 
     /// Request cancellation of the external workflow.
@@ -2252,61 +2277,6 @@ impl ExternalWorkflowHandle {
             .into(),
         );
         cmd
-    }
-}
-
-enum SignalExternalFut<F> {
-    Running(F),
-    SerializationError(Option<PayloadConversionError>),
-    Done,
-}
-
-impl<F: Unpin> Unpin for SignalExternalFut<F> {}
-
-impl<F> Future for SignalExternalFut<F>
-where
-    F: Future<Output = SignalExternalWfResult> + Unpin,
-{
-    type Output = SignalExternalWfResult;
-
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let this = self.get_mut();
-        match this {
-            SignalExternalFut::Running(inner) => {
-                let result = std::task::ready!(Pin::new(inner).poll(cx));
-                *this = SignalExternalFut::Done;
-                Poll::Ready(result)
-            }
-            SignalExternalFut::SerializationError(e) => {
-                let err = e.take().expect("polled after completion");
-                *this = SignalExternalFut::Done;
-                Poll::Ready(Err(Failure {
-                    message: format!("Failed to serialize signal input: {err}"),
-                    ..Default::default()
-                }))
-            }
-            SignalExternalFut::Done => panic!("polled after completion"),
-        }
-    }
-}
-
-impl<F> FusedFuture for SignalExternalFut<F>
-where
-    F: Future<Output = SignalExternalWfResult> + Unpin,
-{
-    fn is_terminated(&self) -> bool {
-        matches!(self, SignalExternalFut::Done)
-    }
-}
-
-impl<F> CancellableFuture<SignalExternalWfResult> for SignalExternalFut<F>
-where
-    F: CancellableFuture<SignalExternalWfResult> + Unpin,
-{
-    fn cancel(&self) {
-        if let SignalExternalFut::Running(inner) = self {
-            inner.cancel()
-        }
     }
 }
 
@@ -2349,7 +2319,7 @@ mod tests {
             },
             temporal::api::{
                 common::v1::{Payload, RetryPolicy},
-                enums::v1::ContinueAsNewVersioningBehavior,
+                enums::v1::ContinueAsNewVersioningBehavior as ProtoContinueAsNewVersioningBehavior,
             },
         },
     };
@@ -2414,12 +2384,14 @@ mod tests {
                 arguments: vec![7u8.as_json_payload().unwrap()],
                 workflow_run_timeout: None,
                 workflow_task_timeout: None,
+                backoff_start_interval: None,
                 memo: HashMap::new(),
                 headers: HashMap::new(),
                 search_attributes: None,
                 retry_policy: None,
                 versioning_intent: ProtoVersioningIntent::Unspecified.into(),
-                initial_versioning_behavior: ContinueAsNewVersioningBehavior::Unspecified.into(),
+                initial_versioning_behavior: ProtoContinueAsNewVersioningBehavior::Unspecified
+                    .into(),
             }
         );
     }
@@ -2452,6 +2424,7 @@ mod tests {
                     task_queue: Some("next-task-queue".to_string()),
                     run_timeout: Some(Duration::from_secs(10)),
                     task_timeout: Some(Duration::from_secs(3)),
+                    backoff_start_interval: Some(Duration::from_secs(4)),
                     memo: Some(memo.clone()),
                     headers: Some(headers.clone()),
                     search_attributes: Some(search_attributes.clone()),
@@ -2460,6 +2433,9 @@ mod tests {
                         ..Default::default()
                     }),
                     versioning_intent: Some(ProtoVersioningIntent::Compatible),
+                    initial_versioning_behavior: Some(
+                        ContinueAsNewVersioningBehavior::UseRampingVersion,
+                    ),
                 },
             )
             .expect_err("continue_as_new should terminate the workflow");
@@ -2479,6 +2455,7 @@ mod tests {
                 arguments: vec![11u8.as_json_payload().unwrap()],
                 workflow_run_timeout: Some(Duration::from_secs(10).try_into().unwrap()),
                 workflow_task_timeout: Some(Duration::from_secs(3).try_into().unwrap()),
+                backoff_start_interval: Some(Duration::from_secs(4).try_into().unwrap()),
                 memo,
                 headers,
                 search_attributes: Some(search_attributes),
@@ -2487,7 +2464,8 @@ mod tests {
                     ..Default::default()
                 }),
                 versioning_intent: ProtoVersioningIntent::Compatible.into(),
-                initial_versioning_behavior: ContinueAsNewVersioningBehavior::Unspecified.into(),
+                initial_versioning_behavior: ProtoContinueAsNewVersioningBehavior::UseRampingVersion
+                    as i32,
             }
         );
     }
@@ -2511,6 +2489,29 @@ mod tests {
         };
 
         assert_eq!(cmd.search_attributes, Some(SearchAttributes::default()));
+    }
+
+    #[test]
+    fn workflow_context_continue_as_new_applies_auto_upgrade_versioning_behavior() {
+        let ctx = test_context();
+
+        let termination = ctx
+            .continue_as_new(
+                &13,
+                ContinueAsNewOptions {
+                    initial_versioning_behavior: Some(ContinueAsNewVersioningBehavior::AutoUpgrade),
+                    ..Default::default()
+                },
+            )
+            .expect_err("continue_as_new should terminate the workflow");
+        let WorkflowTermination::ContinueAsNew(cmd) = termination else {
+            unreachable!()
+        };
+
+        assert_eq!(
+            cmd.initial_versioning_behavior,
+            ProtoContinueAsNewVersioningBehavior::AutoUpgrade as i32
+        );
     }
 
     #[test]

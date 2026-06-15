@@ -20,7 +20,10 @@ use temporalio_common_wasm::{
         },
         temporal::api::{
             common::v1::{Payload, RetryPolicy, SearchAttributes},
-            enums::v1::{ContinueAsNewVersioningBehavior, WorkflowIdReusePolicy},
+            enums::v1::{
+                ContinueAsNewVersioningBehavior as ProtoContinueAsNewVersioningBehavior,
+                WorkflowIdReusePolicy,
+            },
             sdk::v1::UserMetadata,
         },
     },
@@ -493,6 +496,51 @@ impl NexusOperationOptions {
     }
 }
 
+/// Versioning behavior to use for the first workflow task of a new continue-as-new run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[non_exhaustive]
+pub enum ContinueAsNewVersioningBehavior {
+    /// No initial versioning behavior was specified.
+    #[default]
+    Unspecified,
+    /// Start the new run with AutoUpgrade behavior.
+    AutoUpgrade,
+    /// Start the new run on the task queue's ramping deployment version.
+    UseRampingVersion,
+}
+
+impl From<ContinueAsNewVersioningBehavior> for ProtoContinueAsNewVersioningBehavior {
+    fn from(value: ContinueAsNewVersioningBehavior) -> Self {
+        match value {
+            ContinueAsNewVersioningBehavior::Unspecified => {
+                ProtoContinueAsNewVersioningBehavior::Unspecified
+            }
+            ContinueAsNewVersioningBehavior::AutoUpgrade => {
+                ProtoContinueAsNewVersioningBehavior::AutoUpgrade
+            }
+            ContinueAsNewVersioningBehavior::UseRampingVersion => {
+                ProtoContinueAsNewVersioningBehavior::UseRampingVersion
+            }
+        }
+    }
+}
+
+impl From<ProtoContinueAsNewVersioningBehavior> for ContinueAsNewVersioningBehavior {
+    fn from(value: ProtoContinueAsNewVersioningBehavior) -> Self {
+        match value {
+            ProtoContinueAsNewVersioningBehavior::Unspecified => {
+                ContinueAsNewVersioningBehavior::Unspecified
+            }
+            ProtoContinueAsNewVersioningBehavior::AutoUpgrade => {
+                ContinueAsNewVersioningBehavior::AutoUpgrade
+            }
+            ProtoContinueAsNewVersioningBehavior::UseRampingVersion => {
+                ContinueAsNewVersioningBehavior::UseRampingVersion
+            }
+        }
+    }
+}
+
 /// Options for continuing a workflow as a new execution.
 ///
 /// Unset fields inherit the current workflow's values where applicable.
@@ -507,6 +555,8 @@ pub struct ContinueAsNewOptions {
     pub run_timeout: Option<Duration>,
     /// Timeout of a single workflow task.
     pub task_timeout: Option<Duration>,
+    /// Delay before the first workflow task of the continued run is scheduled.
+    pub backoff_start_interval: Option<Duration>,
     /// If set, the new workflow will have this memo. If `None`, reuses the current memo.
     pub memo: Option<HashMap<String, Payload>>,
     /// If set, the new workflow will have these headers.
@@ -518,6 +568,12 @@ pub struct ContinueAsNewOptions {
     pub retry_policy: Option<RetryPolicy>,
     /// Whether the new workflow should run on a worker with a compatible build id.
     pub versioning_intent: Option<VersioningIntent>,
+    /// Versioning behavior to use for the first workflow task of the new run.
+    ///
+    /// This experimental option is only meaningful for workers using worker deployment
+    /// versioning. `AutoUpgrade` routes the new run to the current deployment version;
+    /// `UseRampingVersion` routes it to the ramping deployment version when one is configured.
+    pub initial_versioning_behavior: Option<ContinueAsNewVersioningBehavior>,
 }
 
 impl ContinueAsNewOptions {
@@ -536,6 +592,9 @@ impl ContinueAsNewOptions {
             workflow_task_timeout: self
                 .task_timeout
                 .and_then(|duration| duration.try_into().ok()),
+            backoff_start_interval: self
+                .backoff_start_interval
+                .and_then(|duration| duration.try_into().ok()),
             memo: self.memo.unwrap_or_default(),
             headers: self.headers.unwrap_or_default(),
             search_attributes: self.search_attributes,
@@ -544,7 +603,11 @@ impl ContinueAsNewOptions {
                 .versioning_intent
                 .unwrap_or(VersioningIntent::Unspecified)
                 .into(),
-            initial_versioning_behavior: ContinueAsNewVersioningBehavior::Unspecified.into(),
+            initial_versioning_behavior: ProtoContinueAsNewVersioningBehavior::from(
+                self.initial_versioning_behavior
+                    .unwrap_or(ContinueAsNewVersioningBehavior::Unspecified),
+            )
+            .into(),
         }
     }
 }
@@ -586,6 +649,21 @@ fn string_user_metadata(summary: Option<String>, details: Option<String>) -> Opt
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn continue_as_new_options_maps_backoff_start_interval_to_request() {
+        let req = ContinueAsNewOptions {
+            backoff_start_interval: Some(Duration::from_secs(7)),
+            ..Default::default()
+        }
+        .into_request("test-workflow".to_string(), vec![]);
+
+        let backoff = req
+            .backoff_start_interval
+            .expect("backoff_start_interval should be set");
+        assert_eq!(backoff.seconds, 7);
+        assert_eq!(backoff.nanos, 0);
+    }
 
     #[test]
     fn activity_options_with_start_to_close_timeout_wrapper_supports_builder_chaining() {

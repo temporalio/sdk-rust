@@ -30,6 +30,7 @@ use temporalio_common_wasm::{
         GenericPayloadConverter, PayloadConversionError, PayloadConverter, SerializationContext,
         SerializationContextData,
     },
+    error::ApplicationFailure,
     protos::{
         coresdk::workflow_activation::{
             DoUpdate, QueryWorkflow, SignalWorkflow,
@@ -149,22 +150,32 @@ where
     }
 
     fn rejection_for_missing_update_handler(&self, name: String) -> ActivationJobResult {
-        ActivationJobResult::UpdateRejected(Box::new(self.workflow_error_to_failure(
-            WorkflowError::Execution(anyhow::anyhow!(
-                "No update handler registered for update name {name}"
-            )),
-        )))
+        ActivationJobResult::UpdateRejected(Box::new(self.message_to_failure(format!(
+            "No update handler registered for update name {name}"
+        ))))
     }
 
     fn workflow_error_to_failure(&self, err: WorkflowError) -> Failure {
         use temporalio_common_wasm::error::{OutgoingError, OutgoingWorkflowError};
         let outgoing: OutgoingWorkflowError = match err {
             WorkflowError::PayloadConversion(err) => OutgoingWorkflowError::from(err),
-            WorkflowError::Execution(err) => OutgoingWorkflowError::from(err),
+            WorkflowError::Execution(err) => {
+                OutgoingWorkflowError::Application(Box::new(ApplicationFailure::new(err)))
+            }
         };
         self.base_ctx.data_converter().to_failure(
             &SerializationContextData::Workflow,
             OutgoingError::Workflow(outgoing),
+        )
+    }
+
+    fn message_to_failure(&self, message: String) -> Failure {
+        use temporalio_common_wasm::error::{OutgoingError, OutgoingWorkflowError};
+        self.base_ctx.data_converter().to_failure(
+            &SerializationContextData::Workflow,
+            OutgoingError::Workflow(OutgoingWorkflowError::Application(Box::new(
+                ApplicationFailure::new(message),
+            ))),
         )
     }
 
@@ -260,9 +271,10 @@ where
                 .state(|wf| wf.dispatch_query(view, &query.query_type, &payloads, converter))
             {
                 Some(Ok(payload)) => Ok(payload),
-                None => Err(self.workflow_error_to_failure(WorkflowError::Execution(
-                    anyhow::anyhow!("No query handler for '{}'", query.query_type),
-                ))),
+                None => {
+                    Err(self
+                        .message_to_failure(format!("No query handler for '{}'", query.query_type)))
+                }
                 Some(Err(e)) => Err(self.workflow_error_to_failure(e)),
             },
         }

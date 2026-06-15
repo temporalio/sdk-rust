@@ -34,9 +34,8 @@ use temporalio_common::{
 };
 use temporalio_macros::{workflow, workflow_methods};
 use temporalio_sdk::{
-    CancellableFuture, ChildWorkflowExecutionError, ChildWorkflowOptions, ChildWorkflowSignalError,
-    ChildWorkflowStartError, SyncWorkflowContext, WorkflowContext, WorkflowResult,
-    WorkflowTermination,
+    CancellableFuture, ChildWorkflowExecutionError, ChildWorkflowOptions, ChildWorkflowStartError,
+    SyncWorkflowContext, WorkflowContext, WorkflowResult, WorkflowSignalError, WorkflowTermination,
 };
 use temporalio_sdk_core::{
     replay::{DEFAULT_WORKFLOW_TYPE, TestHistoryBuilder, canned_histories},
@@ -1450,10 +1449,7 @@ impl ChildSignalSerializationFailParent {
         let signal_result = started
             .signal(UnserializableSignalChild::bad_signal, AlwaysFailsSerialize)
             .await;
-        assert_matches!(
-            signal_result,
-            Err(ChildWorkflowSignalError::Serialization(_))
-        );
+        assert_matches!(signal_result, Err(WorkflowSignalError::Serialization(_)));
 
         // Cancel child so parent can complete cleanly.
         started.cancel("test done".to_string());

@@ -623,44 +623,20 @@ where
                                 // heartbeating. Schedule to closed is not tracked due to the
                                 // possibility of clock skew messing things up, and it's relative
                                 // unlikeliness compared to the other timeouts.
-                                let local_timeout_buffer = self.local_timeout_buffer;
-                                static HEARTBEAT_TYPE: &str = "heartbeat";
-                                let timeout_at = [
-                                    (HEARTBEAT_TYPE, task.resp.heartbeat_timeout),
-                                    ("start_to_close", task.resp.start_to_close_timeout),
-                                ]
-                                .into_iter()
-                                .filter_map(|(k, d)| {
-                                    d.and_then(|d| Duration::try_from(d).ok().map(|d| (k, d)))
-                                })
-                                .filter(|(_, d)| !d.is_zero())
-                                .min_by(|(_, d1), (_, d2)| d1.cmp(d2));
-                                if let Some((timeout_type, timeout_at)) = timeout_at {
-                                    let sleep_time = timeout_at + local_timeout_buffer;
+                                if let Some(timers) = ActivityLocalTimers::new(
+                                    task.resp.heartbeat_timeout,
+                                    task.resp.start_to_close_timeout,
+                                    self.local_timeout_buffer,
+                                ) {
+                                    let resetter = timers.heartbeat_resetter();
                                     let cancel_tx = cancels_tx.clone();
                                     let task_token = tt.clone();
-                                    let resetter = if timeout_type == HEARTBEAT_TYPE {
-                                        Some(Arc::new(Notify::new()))
-                                    } else {
-                                        None
-                                    };
-                                    let resetter_clone = resetter.clone();
                                     let local_timeouts_task =
                                         Some(tokio::task::spawn(async move {
-                                            if let Some(rs) = resetter_clone {
-                                                loop {
-                                                    tokio::select! {
-                                                        _ = rs.notified() => continue,
-                                                        _ = tokio::time::sleep(sleep_time) => break,
-                                                    }
-                                                }
-                                            } else {
-                                                tokio::time::sleep(sleep_time).await;
-                                            }
+                                            let timeout_type = timers.run().await;
                                             debug!(
                                                 task_token=%task_token,
-                                                "Timing out activity due to elapsed local \
-                                                 {timeout_type} timer"
+                                                "Timing out activity due to elapsed local {timeout_type} timer",
                                             );
                                             let _ = cancel_tx.send(PendingActivityCancel::new(
                                                 task_token,
@@ -776,6 +752,97 @@ fn worker_shutdown_failure() -> Failure {
     }
 }
 
+/// Which of an activity's two local timers fired first. Returned from
+/// [`ActivityLocalTimers::run`] and used downstream only for logging.
+#[derive(Debug, Clone, Copy)]
+enum ActivityLocalTimeoutKind {
+    Heartbeat,
+    StartToClose,
+}
+
+impl std::fmt::Display for ActivityLocalTimeoutKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Heartbeat => "heartbeat",
+            Self::StartToClose => "start_to_close",
+        })
+    }
+}
+
+/// Races a (resettable) heartbeat timer against a (non-resettable)
+/// `start_to_close` timer for one activity attempt. The heartbeat timer is
+/// reset every time the held [`Notify`] is signalled (by the heartbeat
+/// manager, when a heartbeat RPC ack arrives); the `start_to_close` timer
+/// just counts down. Whichever fires first wins.
+///
+/// Construction returns [`None`] when both timeouts are unset, so the
+/// caller knows not to spawn a local-timeouts task at all.
+struct ActivityLocalTimers {
+    heartbeat: Option<(Duration, Arc<Notify>)>,
+    start_to_close: Option<Duration>,
+}
+
+impl ActivityLocalTimers {
+    fn new(
+        heartbeat: Option<prost_types::Duration>,
+        start_to_close: Option<prost_types::Duration>,
+        local_timeout_buffer: Duration,
+    ) -> Option<Self> {
+        // Filter out 0 / non-set timeouts, and add timeout buffer.
+        let to_sleep = |d: Option<prost_types::Duration>| -> Option<Duration> {
+            d.and_then(|d| Duration::try_from(d).ok())
+                .filter(|d| !d.is_zero())
+                .map(|d| d + local_timeout_buffer)
+        };
+
+        let heartbeat = to_sleep(heartbeat);
+        let start_to_close = to_sleep(start_to_close);
+
+        if heartbeat.is_none() && start_to_close.is_none() {
+            return None;
+        }
+        Some(Self {
+            heartbeat: heartbeat.map(|d| (d, Arc::new(Notify::new()))),
+            start_to_close,
+        })
+    }
+
+    /// A clone of the [`Notify`] that resets the heartbeat timer, for the
+    /// heartbeat manager to signal. [`None`] when there's no heartbeat
+    /// timer in play.
+    fn heartbeat_resetter(&self) -> Option<Arc<Notify>> {
+        self.heartbeat.as_ref().map(|t| t.1.clone())
+    }
+
+    /// Drive the two timers concurrently; resolves with whichever fires
+    /// first.
+    async fn run(self) -> ActivityLocalTimeoutKind {
+        let heartbeat_timer = async {
+            if let Some((sleep_time, rs)) = self.heartbeat {
+                while tokio::time::timeout(sleep_time, rs.notified())
+                    .await
+                    .is_ok()
+                {}
+                ActivityLocalTimeoutKind::Heartbeat
+            } else {
+                std::future::pending().await
+            }
+        };
+        let start_to_close_timer = async {
+            if let Some(sleep_time) = self.start_to_close {
+                tokio::time::sleep(sleep_time).await;
+                ActivityLocalTimeoutKind::StartToClose
+            } else {
+                std::future::pending().await
+            }
+        };
+        tokio::select! {
+            t = heartbeat_timer => t,
+            t = start_to_close_timer => t,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -783,10 +850,75 @@ mod tests {
         abstractions::tests::fixed_size_permit_dealer,
         pollers::{ActivityTaskOptions, LongPollBuffer},
         prost_dur,
-        worker::{NamespaceCapabilities, PollerBehavior, client::mocks::mock_worker_client},
+        worker::{
+            NamespaceCapabilities, PollerBehavior,
+            client::{MockWorkerClient, mocks::mock_worker_client},
+        },
     };
     use crossbeam_utils::atomic::AtomicCell;
     use temporalio_common::protos::coresdk::activity_result::ActivityExecutionResult;
+
+    fn build_local_timeout_test_atm(
+        mock_client: Arc<MockWorkerClient>,
+        local_timeout_buffer: Duration,
+    ) -> WorkerActivityTasks {
+        let sem = fixed_size_permit_dealer(1);
+        let shutdown_token = CancellationToken::new();
+        let ap = LongPollBuffer::new_activity_task(
+            mock_client.clone(),
+            "tq".to_string(),
+            PollerBehavior::SimpleMaximum(1),
+            sem.clone(),
+            shutdown_token,
+            None::<fn(usize)>,
+            ActivityTaskOptions {
+                max_worker_acts_per_second: None,
+                max_tps: None,
+            },
+            Arc::new(AtomicCell::new(None)),
+            Arc::new(NamespaceCapabilities::default()),
+        );
+        WorkerActivityTasks::new(
+            sem,
+            Box::new(ap),
+            mock_client,
+            MetricsContext::no_op(),
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+            None,
+            local_timeout_buffer,
+        )
+    }
+
+    // Confirms that a repeatedly-resetting heartbeat timer does not
+    // prevent the start_to_close timer from firing.
+    #[tokio::test]
+    async fn activity_local_timers_start_to_close_wins_despite_resets() {
+        let timers = ActivityLocalTimers::new(
+            Some(prost_dur!(from_millis(100))),
+            Some(prost_dur!(from_millis(300))),
+            Duration::from_millis(0),
+        )
+        .expect("at least one timeout is set");
+        let resetter = timers
+            .heartbeat_resetter()
+            .expect("heartbeat timer present");
+
+        let reset_loop = async {
+            loop {
+                resetter.notify_one();
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        };
+        let kind = tokio::select! {
+            kind = timers.run() => kind,
+            _ = reset_loop => unreachable!("reset loop never exits on its own"),
+        };
+        assert!(
+            matches!(kind, ActivityLocalTimeoutKind::StartToClose),
+            "expected start_to_close to fire, got {kind:?}"
+        );
+    }
 
     #[tokio::test]
     async fn per_worker_ratelimit() {
@@ -910,32 +1042,7 @@ mod tests {
                 })
             });
         let mock_client = Arc::new(mock_client);
-        let sem = fixed_size_permit_dealer(1);
-        let shutdown_token = CancellationToken::new();
-        let ap = LongPollBuffer::new_activity_task(
-            mock_client.clone(),
-            "tq".to_string(),
-            PollerBehavior::SimpleMaximum(1),
-            sem.clone(),
-            shutdown_token.clone(),
-            None::<fn(usize)>,
-            ActivityTaskOptions {
-                max_worker_acts_per_second: None,
-                max_tps: None,
-            },
-            Arc::new(AtomicCell::new(None)),
-            Arc::new(NamespaceCapabilities::default()),
-        );
-        let atm = WorkerActivityTasks::new(
-            sem.clone(),
-            Box::new(ap),
-            mock_client.clone(),
-            MetricsContext::no_op(),
-            Duration::from_secs(1),
-            Duration::from_secs(1),
-            None,
-            Duration::from_millis(100), // Short buffer for unit test
-        );
+        let atm = build_local_timeout_test_atm(mock_client.clone(), Duration::from_millis(100));
 
         for _ in 1..=3 {
             let start = Instant::now();
@@ -985,32 +1092,7 @@ mod tests {
             .times(2)
             .returning(|_, _| Ok(Default::default()));
         let mock_client = Arc::new(mock_client);
-        let sem = fixed_size_permit_dealer(1);
-        let shutdown_token = CancellationToken::new();
-        let ap = LongPollBuffer::new_activity_task(
-            mock_client.clone(),
-            "tq".to_string(),
-            PollerBehavior::SimpleMaximum(1),
-            sem.clone(),
-            shutdown_token.clone(),
-            None::<fn(usize)>,
-            ActivityTaskOptions {
-                max_worker_acts_per_second: None,
-                max_tps: None,
-            },
-            Arc::new(AtomicCell::new(None)),
-            Arc::new(NamespaceCapabilities::default()),
-        );
-        let atm = WorkerActivityTasks::new(
-            sem.clone(),
-            Box::new(ap),
-            mock_client.clone(),
-            MetricsContext::no_op(),
-            Duration::from_secs(1),
-            Duration::from_secs(1),
-            None,
-            Duration::from_millis(0), // No buffer in this test
-        );
+        let atm = build_local_timeout_test_atm(mock_client.clone(), Duration::from_millis(0));
 
         let t = atm.poll().await.unwrap();
 
@@ -1035,6 +1117,74 @@ mod tests {
         };
 
         join!(heartbeater, poller);
+
+        atm.complete(
+            TaskToken(t.task_token),
+            ActivityExecutionResult::fail("unimportant".into())
+                .status
+                .unwrap(),
+            mock_client.as_ref(),
+        )
+        .await;
+
+        atm.initiate_shutdown();
+        assert_matches!(atm.poll().await.unwrap_err(), PollError::ShutDown);
+        atm.shutdown().await;
+    }
+
+    // Regression test for https://github.com/temporalio/sdk-rust/issues/1188.
+    #[tokio::test]
+    async fn start_to_close_fires_when_heartbeat_timeout_shorter() {
+        let mut mock_client = mock_worker_client();
+        mock_client
+            .expect_poll_activity_task()
+            .times(1)
+            .returning(move |_, _| {
+                Ok(PollActivityTaskQueueResponse {
+                    task_token: vec![1],
+                    activity_id: "act1".to_string(),
+                    start_to_close_timeout: Some(prost_dur!(from_millis(300))),
+                    heartbeat_timeout: Some(prost_dur!(from_millis(100))),
+                    ..Default::default()
+                })
+            });
+        mock_client
+            .expect_poll_activity_task()
+            .returning(|_, _| Ok(Default::default()));
+        mock_client
+            .expect_record_activity_heartbeat()
+            .returning(|_, _| Ok(Default::default()));
+        let mock_client = Arc::new(mock_client);
+        let atm = build_local_timeout_test_atm(mock_client.clone(), Duration::from_millis(0));
+
+        let t = atm.poll().await.unwrap();
+        let tt = t.task_token.clone();
+
+        // Heartbeat every 50ms (faster than the 100ms heartbeat_timeout) so a
+        // successful heartbeat-report always resets the heartbeat timer before
+        // it can expire. start_to_close (300ms) must still fire.
+        let heartbeater = async {
+            loop {
+                let _ = atm.record_heartbeat(ActivityHeartbeat {
+                    task_token: tt.clone(),
+                    details: vec![],
+                });
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        };
+        // start_to_close_timeout=300ms. Allow generous slack (2s) before we
+        // declare the bug present, to keep this stable on slow CI.
+        let poller = async {
+            tokio::time::timeout(Duration::from_secs(2), atm.poll())
+                .await
+                .expect("start_to_close_timeout was not enforced locally")
+                .unwrap()
+        };
+        let activity_task = tokio::select! {
+            v = poller => v,
+            _ = heartbeater => unreachable!("heartbeat loop never exits on its own"),
+        };
+        assert!(activity_task.is_timeout());
 
         atm.complete(
             TaskToken(t.task_token),

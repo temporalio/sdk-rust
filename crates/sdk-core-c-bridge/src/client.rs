@@ -50,6 +50,17 @@ pub struct ConnectionOptions {
     /// refreshed. If null, DNS load balancing is disabled. Ignored (forced off) when
     /// http_connect_proxy_options is also set.
     pub dns_load_balancing_options: *const ClientDnsLoadBalancingOptions,
+    /// Selects transport-level gRPC compression. The zero value enables gzip, which is the
+    /// default. Ignored when grpc_override_callback is set, since that transport cannot decode
+    /// compressed request bodies.
+    pub grpc_compression: ClientGrpcCompression,
+}
+
+#[derive(Clone, Copy)]
+#[repr(C)]
+pub enum ClientGrpcCompression {
+    Gzip = 0,
+    None = 1,
 }
 
 #[repr(C)]
@@ -1289,6 +1300,25 @@ async fn call_cloud_service(
         "DeleteCustomRole" => {
             rpc_call_on_trait!(client, call, CloudService, delete_custom_role)
         }
+        "GetUserNamespaceAssignments" => {
+            rpc_call_on_trait!(client, call, CloudService, get_user_namespace_assignments)
+        }
+        "GetServiceAccountNamespaceAssignments" => {
+            rpc_call_on_trait!(
+                client,
+                call,
+                CloudService,
+                get_service_account_namespace_assignments
+            )
+        }
+        "GetUserGroupNamespaceAssignments" => {
+            rpc_call_on_trait!(
+                client,
+                call,
+                CloudService,
+                get_user_group_namespace_assignments
+            )
+        }
         rpc => Err(anyhow::anyhow!("Unknown RPC call {rpc}")),
     }
 }
@@ -1420,6 +1450,10 @@ impl TryFrom<&ConnectionOptions> for temporalio_client::ConnectionOptions {
                 .maybe_http_connect_proxy(http_connect_proxy)
                 .dns_load_balancing(dns_load_balancing)
                 .maybe_tls_options(tls_cfg)
+                .grpc_compression(match opts.grpc_compression {
+                    ClientGrpcCompression::Gzip => temporalio_client::GrpcCompression::Gzip,
+                    ClientGrpcCompression::None => temporalio_client::GrpcCompression::None,
+                })
                 .build(),
         )
     }
@@ -1531,6 +1565,7 @@ mod tests {
             grpc_override_callback: None,
             grpc_override_callback_user_data: std::ptr::null_mut(),
             dns_load_balancing_options: std::ptr::null(),
+            grpc_compression: ClientGrpcCompression::Gzip,
         }
     }
 
@@ -1555,6 +1590,29 @@ mod tests {
             .dns_load_balancing
             .expect("DNS load balancing should be enabled");
         assert_eq!(dns_opts.resolution_interval, Duration::from_millis(5_000));
+    }
+
+    #[test]
+    fn grpc_compression_defaults_to_gzip() {
+        let opts = base_connection_options();
+        let converted: temporalio_client::ConnectionOptions = (&opts).try_into().unwrap();
+        assert_eq!(
+            converted.grpc_compression,
+            temporalio_client::GrpcCompression::Gzip
+        );
+    }
+
+    #[test]
+    fn grpc_compression_none_passes_through() {
+        let opts = ConnectionOptions {
+            grpc_compression: ClientGrpcCompression::None,
+            ..base_connection_options()
+        };
+        let converted: temporalio_client::ConnectionOptions = (&opts).try_into().unwrap();
+        assert_eq!(
+            converted.grpc_compression,
+            temporalio_client::GrpcCompression::None
+        );
     }
 
     #[test]

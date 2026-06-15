@@ -1133,7 +1133,7 @@ service CloudService {
             body: "*"
         };
         option (grpc.gateway.protoc_gen_openapiv2.options.openapiv2_operation) = {
-            tags: ["Account"];
+            tags: ["Billing"];
             summary: "Create a billing report";
             description: "Creates a billing report for the account";
             external_docs: {
@@ -1149,7 +1149,7 @@ service CloudService {
             get: "/cloud/billing-reports/{billing_report_id}"
         };
         option (grpc.gateway.protoc_gen_openapiv2.options.openapiv2_operation) = {
-            tags: ["Account"];
+            tags: ["Billing"];
             summary: "Get a billing report";
             description: "Gets an existing billing report for the account";
             external_docs: {
@@ -1237,6 +1237,54 @@ service CloudService {
             external_docs: {
                 url: "https://docs.temporal.io/cloud/custom-roles";
                 description: "Custom roles documentation";
+            };
+        };
+    }
+
+    // Get users with access to a namespace
+    rpc GetUserNamespaceAssignments(GetUserNamespaceAssignmentsRequest) returns (GetUserNamespaceAssignmentsResponse) {
+        option (google.api.http) = {
+            get: "/cloud/namespaces/{namespace}/user-assignments",
+        };
+        option (grpc.gateway.protoc_gen_openapiv2.options.openapiv2_operation) = {
+            tags: ["Users"];
+            summary: "Get users with access to a namespace";
+            description: "Returns the users that have access to the namespace, including each user's namespace-level access.";
+            external_docs: {
+                url: "https://docs.temporal.io/cloud/users";
+                description: "Users documentation";
+            };
+        };
+    }
+
+    // Get service accounts with access to a namespace
+    rpc GetServiceAccountNamespaceAssignments(GetServiceAccountNamespaceAssignmentsRequest) returns (GetServiceAccountNamespaceAssignmentsResponse) {
+        option (google.api.http) = {
+            get: "/cloud/namespaces/{namespace}/service-account-assignments",
+        };
+        option (grpc.gateway.protoc_gen_openapiv2.options.openapiv2_operation) = {
+            tags: ["Service Accounts"];
+            summary: "List service accounts with access to a namespace";
+            description: "Returns the service accounts that have access to the namespace, including each service account's namespace-level access.";
+            external_docs: {
+                url: "https://docs.temporal.io/cloud/service-accounts";
+                description: "Service Accounts documentation";
+            };
+        };
+    }
+
+    // Get user groups with access to a namespace
+    rpc GetUserGroupNamespaceAssignments(GetUserGroupNamespaceAssignmentsRequest) returns (GetUserGroupNamespaceAssignmentsResponse) {
+        option (google.api.http) = {
+            get: "/cloud/namespaces/{namespace}/user-group-assignments",
+        };
+        option (grpc.gateway.protoc_gen_openapiv2.options.openapiv2_operation) = {
+            tags: ["Groups"];
+            summary: "List user groups with access to a namespace";
+            description: "Returns the user groups that have access to the namespace, including each group's namespace-level access.";
+            external_docs: {
+                url: "https://docs.temporal.io/cloud/user-groups";
+                description: "User groups documentation";
             };
         };
     }

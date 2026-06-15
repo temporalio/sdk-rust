@@ -246,6 +246,10 @@ pub trait WorkerClient: Sync + Send {
 
     /// Replace the underlying connection
     fn replace_connection(&self, new_client: Connection);
+    /// Return a clone of the current underlying connection, if one is available.
+    fn connection(&self) -> Option<Connection> {
+        None
+    }
     /// Return server capabilities
     fn capabilities(&self) -> Option<Capabilities>;
     /// Return workers using this client
@@ -796,6 +800,10 @@ impl WorkerClient for WorkerClientBag {
 
     fn replace_connection(&self, new_connection: Connection) {
         self.connection.replace_client(new_connection);
+    }
+
+    fn connection(&self) -> Option<Connection> {
+        Some(self.connection.inner_clone())
     }
 
     fn capabilities(&self) -> Option<Capabilities> {

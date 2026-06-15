@@ -137,6 +137,8 @@ pub(crate) enum LocalActRequest {
     Cancel(ExecutingLAId),
     #[from(ignore)]
     CancelAllInRun(String),
+    #[from(ignore)]
+    InvalidateRun(String),
     StartHeartbeatTimeout {
         send_on_elapse: HeartbeatTimeoutMsg,
         deadline: Instant,
@@ -297,9 +299,7 @@ impl LocalActivityManager {
                     let tt = dlock.gen_next_token();
                     match dlock.la_info.entry(id) {
                         Entry::Occupied(o) => {
-                            // Do not queue local activities which are in fact already executing.
-                            // This can happen during evictions.
-                            debug!(
+                            dbg_panic!(
                                 "Tried to queue already-executing local activity {:?}",
                                 o.key()
                             );
@@ -369,6 +369,24 @@ impl LocalActivityManager {
                         }
                     }
                 }
+                LocalActRequest::InvalidateRun(run_id) => {
+                    debug!(run_id=%run_id, "Invalidating all local activities for run");
+                    let mut dlock = self.dat.lock();
+                    dlock
+                        .outstanding_activity_tasks
+                        .retain(|_, info| info.la_info.workflow_exec_info.run_id != run_id);
+                    dlock.la_info.retain(|id, info| {
+                        if id.run_id == run_id {
+                            if let Some(backoff_task) = info.backing_off_task.as_ref() {
+                                backoff_task.abort();
+                            }
+                            false
+                        } else {
+                            true
+                        }
+                    });
+                    self.set_shutdown_complete_if_ready(&mut dlock);
+                }
                 LocalActRequest::IndicateWorkflowTaskCompleted(run_id) => {
                     let mut dlock = self.dat.lock();
                     let las_for_run = dlock
@@ -388,9 +406,9 @@ impl LocalActivityManager {
     /// Returns the next pending local-activity related action, or None if shutdown has initiated
     /// and there are no more remaining actions to take.
     pub(crate) async fn next_pending(&self) -> Option<NextPendingLAAction> {
-        let (new_or_retry, permit) = match self.rcvs.lock().await.next().await? {
-            NewOrCancel::Cancel(c) => {
-                return match c {
+        loop {
+            let (new_or_retry, permit) = match self.rcvs.lock().await.next().await? {
+                NewOrCancel::Cancel(c) => match c {
                     CancelOrTimeout::Cancel(c) => {
                         if self
                             .dat
@@ -398,11 +416,10 @@ impl LocalActivityManager {
                             .outstanding_activity_tasks
                             .contains_key(c.task_token.as_slice())
                         {
-                            Some(NextPendingLAAction::Dispatch(c))
-                        } else {
-                            // Don't dispatch cancels for things we've already stopped tracking
-                            None
+                            return Some(NextPendingLAAction::Dispatch(c));
                         }
+                        // Don't dispatch cancels for things we've already stopped tracking
+                        continue;
                     }
                     CancelOrTimeout::Timeout { run_id, resolution } => {
                         let tt = self
@@ -416,120 +433,123 @@ impl LocalActivityManager {
                             .as_ref()
                             .map(|lai| lai.task_token.clone());
                         if let Some(task_token) = tt {
-                            Some(NextPendingLAAction::Autocomplete(
+                            return Some(NextPendingLAAction::Autocomplete(
                                 self.complete(&task_token, resolution.result),
-                            ))
-                        } else {
-                            // This timeout is for a no-longer-tracked activity, so, whatever
-                            None
+                            ));
                         }
+                        // This timeout is for a no-longer-tracked activity, so, whatever
+                        continue;
                     }
-                };
+                },
+                NewOrCancel::New(n, perm) => (n, perm),
+            };
+
+            // It is important that there are no await points after receiving from the channel, as
+            // it would mean dropping this future would cause us to drop the activity request.
+            let (new_la, attempt) = match new_or_retry {
+                NewOrRetry::New(n) => {
+                    let explicit_attempt_num_or_1 = n.schedule_cmd.attempt.max(1);
+                    (n, explicit_attempt_num_or_1)
+                }
+                NewOrRetry::Retry { in_flight, attempt } => (in_flight, attempt),
+            };
+            let la_info_for_in_flight_map = new_la.clone();
+            let id = ExecutingLAId {
+                run_id: new_la.workflow_exec_info.run_id.clone(),
+                seq_num: new_la.schedule_cmd.seq,
+            };
+            let orig_sched_time = new_la.schedule_cmd.original_schedule_time;
+            let sa = new_la.schedule_cmd;
+
+            let mut dat = self.dat.lock();
+            if !dat.la_info.contains_key(&id) {
+                debug!(id=?id, "Dropping invalidated local activity request");
+                continue;
             }
-            NewOrCancel::New(n, perm) => (n, perm),
-        };
+            // If this request originated from a local backoff task, clear the entry for it. We
+            // don't await the handle because we know it must already be done, and there's no
+            // meaningful value.
+            dat.la_info
+                .get_mut(&id)
+                .map(|lai| lai.backing_off_task.take());
 
-        // It is important that there are no await points after receiving from the channel, as
-        // it would mean dropping this future would cause us to drop the activity request.
-        let (new_la, attempt) = match new_or_retry {
-            NewOrRetry::New(n) => {
-                let explicit_attempt_num_or_1 = n.schedule_cmd.attempt.max(1);
-                (n, explicit_attempt_num_or_1)
-            }
-            NewOrRetry::Retry { in_flight, attempt } => (in_flight, attempt),
-        };
-        let la_info_for_in_flight_map = new_la.clone();
-        let id = ExecutingLAId {
-            run_id: new_la.workflow_exec_info.run_id.clone(),
-            seq_num: new_la.schedule_cmd.seq,
-        };
-        let orig_sched_time = new_la.schedule_cmd.original_schedule_time;
-        let sa = new_la.schedule_cmd;
-
-        let mut dat = self.dat.lock();
-        // If this request originated from a local backoff task, clear the entry for it. We
-        // don't await the handle because we know it must already be done, and there's no
-        // meaningful value.
-        dat.la_info
-            .get_mut(&id)
-            .map(|lai| lai.backing_off_task.take());
-
-        // If this task sat in the queue for too long, return a timeout for it instead
-        if let Some(s2s) = sa.schedule_to_start_timeout.as_ref() {
-            let sat_for = new_la.schedule_time.elapsed().unwrap_or_default();
-            if sat_for > *s2s {
-                return Some(NextPendingLAAction::Autocomplete(
-                    LACompleteAction::Report {
-                        run_id: new_la.workflow_exec_info.run_id,
-                        resolution: LocalActivityResolution {
-                            seq: sa.seq,
-                            result: LocalActivityExecutionResult::timeout(
-                                TimeoutType::ScheduleToStart,
-                            ),
-                            runtime: sat_for,
-                            attempt,
-                            backoff: None,
-                            original_schedule_time: orig_sched_time,
+            // If this task sat in the queue for too long, return a timeout for it instead
+            if let Some(s2s) = sa.schedule_to_start_timeout.as_ref() {
+                let sat_for = new_la.schedule_time.elapsed().unwrap_or_default();
+                if sat_for > *s2s {
+                    return Some(NextPendingLAAction::Autocomplete(
+                        LACompleteAction::Report {
+                            run_id: new_la.workflow_exec_info.run_id,
+                            resolution: LocalActivityResolution {
+                                seq: sa.seq,
+                                result: LocalActivityExecutionResult::timeout(
+                                    TimeoutType::ScheduleToStart,
+                                ),
+                                runtime: sat_for,
+                                attempt,
+                                backoff: None,
+                                original_schedule_time: orig_sched_time,
+                            },
+                            task: None,
                         },
-                        task: None,
-                    },
-                ));
+                    ));
+                }
             }
-        }
 
-        let la_info = dat.la_info.get_mut(&id).expect("Activity must exist");
-        let tt = la_info.task_token.clone();
-        if let Some(to) = la_info.timeout_bag.as_mut() {
-            to.mark_started();
-        }
-        dat.outstanding_activity_tasks.insert(
-            tt.clone(),
-            LocalInFlightActInfo {
-                la_info: la_info_for_in_flight_map,
-                dispatch_time: Instant::now(),
-                attempt,
-                _permit: permit.into_used(LocalActivitySlotInfo {
-                    activity_type: sa.activity_type.clone(),
-                }),
-            },
-        );
+            let la_info = dat.la_info.get_mut(&id).expect("Activity must exist");
+            let tt = la_info.task_token.clone();
+            if let Some(to) = la_info.timeout_bag.as_mut() {
+                to.mark_started();
+            }
+            dat.outstanding_activity_tasks.insert(
+                tt.clone(),
+                LocalInFlightActInfo {
+                    la_info: la_info_for_in_flight_map,
+                    dispatch_time: Instant::now(),
+                    attempt,
+                    _permit: permit.into_used(LocalActivitySlotInfo {
+                        activity_type: sa.activity_type.clone(),
+                    }),
+                },
+            );
 
-        let (schedule_to_close, start_to_close) = sa.close_timeouts.into_sched_and_start();
-        self.metrics
-            .with_new_attrs([
-                activity_type(sa.activity_type.clone()),
-                workflow_type(new_la.workflow_type.clone()),
-            ])
-            .la_executed();
-        Some(NextPendingLAAction::Dispatch(ActivityTask {
-            task_token: tt.0,
-            variant: Some(activity_task::Variant::Start(Start {
-                workflow_namespace: self.namespace.clone(),
-                workflow_type: new_la.workflow_type,
-                workflow_execution: Some(new_la.workflow_exec_info),
-                activity_id: sa.activity_id,
-                activity_type: sa.activity_type,
-                header_fields: sa.headers,
-                input: sa.arguments,
-                heartbeat_details: vec![],
-                scheduled_time: Some(new_la.schedule_time.into()),
-                current_attempt_scheduled_time: Some(new_la.schedule_time.into()),
-                started_time: Some(SystemTime::now().into()),
-                attempt,
-                schedule_to_close_timeout: schedule_to_close
-                    .unwrap_or(Duration::ZERO)
-                    .try_into()
-                    .ok(),
-                start_to_close_timeout: start_to_close
-                    .or(schedule_to_close)
-                    .and_then(|t| t.try_into().ok()),
-                heartbeat_timeout: None,
-                retry_policy: Some(sa.retry_policy.into()),
-                priority: Some(Default::default()),
-                is_local: true,
-                run_id: String::new(),
-            })),
-        }))
+            let (schedule_to_close, start_to_close) = sa.close_timeouts.into_sched_and_start();
+            self.metrics
+                .with_new_attrs([
+                    activity_type(sa.activity_type.clone()),
+                    workflow_type(new_la.workflow_type.clone()),
+                ])
+                .la_executed();
+            return Some(NextPendingLAAction::Dispatch(ActivityTask {
+                task_token: tt.0,
+                variant: Some(activity_task::Variant::Start(Start {
+                    workflow_namespace: self.namespace.clone(),
+                    workflow_type: new_la.workflow_type,
+                    workflow_execution: Some(new_la.workflow_exec_info),
+                    activity_id: sa.activity_id,
+                    activity_type: sa.activity_type,
+                    header_fields: sa.headers,
+                    input: sa.arguments,
+                    heartbeat_details: vec![],
+                    scheduled_time: Some(new_la.schedule_time.into()),
+                    current_attempt_scheduled_time: Some(new_la.schedule_time.into()),
+                    started_time: Some(SystemTime::now().into()),
+                    attempt,
+                    schedule_to_close_timeout: schedule_to_close
+                        .unwrap_or(Duration::ZERO)
+                        .try_into()
+                        .ok(),
+                    start_to_close_timeout: start_to_close
+                        .or(schedule_to_close)
+                        .and_then(|t| t.try_into().ok()),
+                    heartbeat_timeout: None,
+                    retry_policy: Some(sa.retry_policy.into()),
+                    priority: Some(Default::default()),
+                    is_local: true,
+                    run_id: String::new(),
+                })),
+            }));
+        }
     }
 
     /// Mark a local activity as having completed
@@ -977,7 +997,6 @@ impl Drop for TimeoutBag {
 mod tests {
     use super::*;
     use crate::{prost_dur, protosext::LACloseTimeouts, retry_logic::ValidatedRetryPolicy};
-    use futures_util::FutureExt;
     use temporalio_common::protos::temporal::api::{
         common::v1::RetryPolicy,
         failure::v1::{ApplicationFailureInfo, Failure, failure::FailureInfo},
@@ -1074,6 +1093,59 @@ mod tests {
                 lam.complete(&tt, LocalActivityExecutionResult::Completed(Default::default()));
             } => (),
         };
+    }
+
+    #[tokio::test]
+    async fn invalidate_drops_queued_activity() {
+        let lam = LocalActivityManager::test(5);
+        let run_id = "run_id";
+        let other_run_id = "other_run_id";
+        lam.enqueue([
+            NewLocalAct {
+                schedule_cmd: ValidScheduleLA {
+                    seq: 1,
+                    activity_id: 1.to_string(),
+                    ..Default::default()
+                },
+                workflow_type: "".to_string(),
+                workflow_exec_info: WorkflowExecution {
+                    workflow_id: "".to_string(),
+                    run_id: run_id.to_string(),
+                },
+                schedule_time: SystemTime::now(),
+            }
+            .into(),
+            NewLocalAct {
+                schedule_cmd: ValidScheduleLA {
+                    seq: 1,
+                    activity_id: 2.to_string(),
+                    ..Default::default()
+                },
+                workflow_type: "".to_string(),
+                workflow_exec_info: WorkflowExecution {
+                    workflow_id: "".to_string(),
+                    run_id: other_run_id.to_string(),
+                },
+                schedule_time: SystemTime::now(),
+            }
+            .into(),
+        ]);
+
+        lam.enqueue([LocalActRequest::InvalidateRun(run_id.to_string())]);
+        let next = tokio::time::timeout(Duration::from_millis(100), lam.next_pending())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_matches!(
+            next.variant.unwrap(),
+            activity_task::Variant::Start(Start {
+                activity_id,
+                workflow_execution: Some(WorkflowExecution { run_id, .. }),
+                ..
+            }) if activity_id == "2" && run_id == other_run_id
+        );
+        assert_eq!(lam.num_outstanding(), 1);
     }
 
     #[tokio::test]
@@ -1363,7 +1435,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn idempotency_enforced() {
+    #[should_panic(expected = "Tried to queue already-executing local activity")]
+    async fn duplicate_local_activity_queue_panics() {
         let lam = LocalActivityManager::test(10);
         let new_la = NewLocalAct {
             schedule_cmd: ValidScheduleLA {
@@ -1378,18 +1451,7 @@ mod tests {
             },
             schedule_time: SystemTime::now(),
         };
-        // Verify only one will get queued
-        lam.enqueue([new_la.clone().into(), new_la.clone().into()]);
-        lam.next_pending().await.unwrap().unwrap();
-        assert_eq!(lam.num_outstanding(), 1);
-        // There should be nothing else in the queue
-        assert!(lam.rcvs.lock().await.next().now_or_never().is_none());
-
-        // Verify that if we now enqueue the same act again, after the task is outstanding, we still
-        // don't add it.
-        lam.enqueue([new_la.into()]);
-        assert_eq!(lam.num_outstanding(), 1);
-        assert!(lam.rcvs.lock().await.next().now_or_never().is_none());
+        lam.enqueue([new_la.clone().into(), new_la.into()]);
     }
 
     #[tokio::test]

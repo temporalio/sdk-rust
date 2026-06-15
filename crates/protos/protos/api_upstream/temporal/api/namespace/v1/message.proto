@@ -52,6 +52,10 @@ message NamespaceInfo {
         bool poller_autoscaling = 9;
         // True if the namespace supports worker commands (server-to-worker communication via control queues).
         bool worker_commands = 10;
+        // True if the namespace supports standalone Nexus operations.
+        bool standalone_nexus_operation = 11;
+        // True if the namespace supports attaching callbacks on workflow updates
+        bool workflow_update_callbacks = 12;
     }
 
     // Namespace configured limits

@@ -7,7 +7,10 @@ use temporalio_common::{
         temporal::api::{
             command::v1::command::Attributes,
             common::v1::SearchAttributes,
-            enums::v1::{CommandType, ContinueAsNewVersioningBehavior},
+            enums::v1::{
+                CommandType,
+                ContinueAsNewVersioningBehavior as ProtoContinueAsNewVersioningBehavior,
+            },
             history::v1::history_event,
         },
     },
@@ -94,7 +97,7 @@ impl WfWithTimer {
         ctx.timer(Duration::from_millis(500)).await;
         Err(WorkflowTermination::continue_as_new(ContinueAsNewRequest {
             arguments: vec![[1].into()],
-            initial_versioning_behavior: ContinueAsNewVersioningBehavior::AutoUpgrade.into(),
+            initial_versioning_behavior: ProtoContinueAsNewVersioningBehavior::AutoUpgrade.into(),
             ..Default::default()
         }))
     }
@@ -119,7 +122,7 @@ async fn wf_completing_with_continue_as_new() {
                 assert_matches!(
                     wft.commands[0].attributes.as_ref().unwrap(),
                     Attributes::ContinueAsNewWorkflowExecutionCommandAttributes(can_attrs)
-                        if can_attrs.initial_versioning_behavior == ContinueAsNewVersioningBehavior::AutoUpgrade as i32
+                        if can_attrs.initial_versioning_behavior == ProtoContinueAsNewVersioningBehavior::AutoUpgrade as i32
                 );
             });
     });
@@ -139,9 +142,11 @@ impl ContinueAsNewSuggestedWf {
     async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<()> {
         // First WFT: flag should be false
         assert!(!ctx.continue_as_new_suggested());
+        assert!(!ctx.target_worker_deployment_version_changed());
         ctx.timer(Duration::from_millis(500)).await;
         // Second WFT: flag should be true (set on WFT started event 8)
         assert!(ctx.continue_as_new_suggested());
+        assert!(ctx.target_worker_deployment_version_changed());
         ctx.continue_as_new(&(), ContinueAsNewOptions::default())?;
         Ok(())
     }
@@ -156,6 +161,7 @@ async fn continue_as_new_suggested_flag_exposed() {
             he.attributes
         {
             attrs.suggest_continue_as_new = true;
+            attrs.target_worker_deployment_version_changed = true;
         }
     });
 

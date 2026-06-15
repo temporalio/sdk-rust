@@ -6,7 +6,7 @@ on:
       branch:
         description: "Branch to be tagged"
         required: true
-        default: master
+        default: main
       tag:
         description: "Tag for new version (v1.23.4)"
         required: true
@@ -90,7 +90,7 @@ jobs:
   check-compatibility-sdk-go:
     needs: prepare-inputs
     if: ${{ github.event.inputs.skip_sdk_check == false || github.event.inputs.skip_sdk_check == 'false' }}
-    uses: temporalio/api-go/.github/workflows/check-sdk-compat.yml@master
+    uses: temporalio/api-go/.github/workflows/check-sdk-compat.yml@main
     with:
       sdk_ref: latest
       api_ref: ${{ needs.prepare-inputs.outputs.api_go_commit_sha }}
@@ -134,7 +134,7 @@ jobs:
     if: |
       !cancelled() &&
       needs.create-release.result == 'success'
-    uses: temporalio/api-go/.github/workflows/create-release.yml@master
+    uses: temporalio/api-go/.github/workflows/create-release.yml@main
     with:
       ref: ${{ needs.prepare-inputs.outputs.api_go_commit_sha }}
       tag: ${{ github.event.inputs.tag }}

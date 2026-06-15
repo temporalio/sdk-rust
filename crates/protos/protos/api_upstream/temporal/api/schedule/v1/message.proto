@@ -349,6 +349,9 @@ message ScheduleInfo {
 
     // Deprecated.
     string invalid_schedule_error = 8 [deprecated = true];
+
+    // Size of the schedule's internal state (including payloads) in bytes.
+    int64 state_size_bytes = 12;
 }
 
 message Schedule {
@@ -377,6 +380,9 @@ message ScheduleListInfo {
     // From info (maybe fewer entries):
     repeated ScheduleActionResult recent_actions = 5;
     repeated google.protobuf.Timestamp future_action_times = 6;
+
+    // Size of the schedule's internal state (including payloads) in bytes.
+    int64 state_size_bytes = 7;
 }
 
 // ScheduleListEntry is returned by ListSchedules.

@@ -13,15 +13,18 @@ use super::{PayloadConversionError, PayloadConverter, SerializationContextData};
 use crate::{
     error::{
         ActivityExecutionError, ActivityFailureError, ApplicationFailure, CancelledError,
-        ChildWorkflowExecutionError, ChildWorkflowFailureError, ChildWorkflowSignalError,
-        ChildWorkflowSignalFailureError, ChildWorkflowStartError, IncomingError,
-        IncomingNexusHandlerError, IncomingNexusOperationExecutionError, OutgoingActivityError,
-        OutgoingError, OutgoingWorkflowError, ResetWorkflowError, ServerError, TerminatedError,
-        TimeoutError,
+        ChildWorkflowExecutionError, ChildWorkflowFailureError, ChildWorkflowStartError,
+        IncomingError, IncomingNexusHandlerError, IncomingNexusOperationExecutionError,
+        OutgoingActivityError, OutgoingError, OutgoingWorkflowError, ResetWorkflowError,
+        ServerError, TerminatedError, TimeoutError, WorkflowSignalError,
+        WorkflowSignalFailureError,
     },
-    protos::temporal::api::failure::v1::{
-        ActivityFailureInfo, ApplicationFailureInfo, CanceledFailureInfo,
-        ChildWorkflowExecutionFailureInfo, Failure, failure::FailureInfo,
+    protos::temporal::api::{
+        enums::v1::ApplicationErrorCategory as ProtoApplicationErrorCategory,
+        failure::v1::{
+            ActivityFailureInfo, ApplicationFailureInfo, CanceledFailureInfo,
+            ChildWorkflowExecutionFailureInfo, Failure, failure::FailureInfo,
+        },
     },
 };
 
@@ -145,16 +148,16 @@ impl FailureDecodeHint for ChildWorkflowExecutionDecodeHint {
     }
 }
 
-/// Decode hint for child-workflow signal failures.
+/// Decode hint for workflow signal failures.
 #[derive(Debug, Clone, Copy)]
-pub struct ChildWorkflowSignalDecodeHint;
+pub struct WorkflowSignalDecodeHint;
 
-impl FailureDecodeHint for ChildWorkflowSignalDecodeHint {
-    type Output = ChildWorkflowSignalError;
+impl FailureDecodeHint for WorkflowSignalDecodeHint {
+    type Output = WorkflowSignalError;
 
     fn adapt(self, normalized: IncomingError) -> Self::Output {
         let failure = normalized.failure().clone();
-        ChildWorkflowSignalError::Failed(Box::new(ChildWorkflowSignalFailureError::new(
+        WorkflowSignalError::Failed(Box::new(WorkflowSignalFailureError::new(
             failure, normalized,
         )))
     }
@@ -184,7 +187,7 @@ impl FailureConverter for DefaultFailureConverter {
             OutgoingError::Workflow(OutgoingWorkflowError::ChildWorkflowStart(child)) => {
                 child.encode_failure(payload_converter, context)
             }
-            OutgoingError::Workflow(OutgoingWorkflowError::ChildWorkflowSignal(signal)) => {
+            OutgoingError::Workflow(OutgoingWorkflowError::WorkflowSignal(signal)) => {
                 signal.encode_failure(payload_converter, context)
             }
         };
@@ -220,7 +223,7 @@ enum ClassifiedFailure<'a> {
     ActivityExecution(&'a ActivityExecutionError),
     ChildWorkflowExecution(&'a ChildWorkflowExecutionError),
     ChildWorkflowStart(&'a ChildWorkflowStartError),
-    ChildWorkflowSignal(&'a ChildWorkflowSignalError),
+    WorkflowSignal(&'a WorkflowSignalError),
     Generic(&'a (dyn std::error::Error + 'static)),
 }
 
@@ -244,8 +247,8 @@ impl<'a> ClassifiedFailure<'a> {
             Self::ChildWorkflowExecution(child)
         } else if let Some(child) = err.downcast_ref::<ChildWorkflowStartError>() {
             Self::ChildWorkflowStart(child)
-        } else if let Some(child_signal) = err.downcast_ref::<ChildWorkflowSignalError>() {
-            Self::ChildWorkflowSignal(child_signal)
+        } else if let Some(child_signal) = err.downcast_ref::<WorkflowSignalError>() {
+            Self::WorkflowSignal(child_signal)
         } else {
             Self::Generic(err)
         }
@@ -285,7 +288,7 @@ impl<'a> ClassifiedFailure<'a> {
                 .unwrap_or_else(|converter_error| {
                     encode_failed_error_conversion(child, converter_error)
                 }),
-            Self::ChildWorkflowSignal(signal) => signal
+            Self::WorkflowSignal(signal) => signal
                 .encode_failure(
                     &PayloadConverter::default(),
                     &SerializationContextData::None,
@@ -313,14 +316,14 @@ impl EncodeFailure for ApplicationFailure {
             cause: self
                 .cause()
                 .map(|cause| Box::new(cause.failure().clone()))
-                .or_else(|| encode_application_failure_cause(self.source_error().as_ref())),
+                .or_else(|| encode_application_failure_cause(self.source_error())),
             failure_info: Some(FailureInfo::ApplicationFailureInfo(
                 ApplicationFailureInfo {
                     r#type: self.type_name().unwrap_or_default().to_owned(),
                     non_retryable: self.is_non_retryable(),
                     details,
                     next_retry_delay: self.next_retry_delay().and_then(|d| d.try_into().ok()),
-                    category: self.category() as i32,
+                    category: ProtoApplicationErrorCategory::from(self.category()) as i32,
                 },
             )),
             ..Default::default()
@@ -387,7 +390,7 @@ impl EncodeFailure for ChildWorkflowStartError {
     }
 }
 
-impl EncodeFailure for ChildWorkflowSignalError {
+impl EncodeFailure for WorkflowSignalError {
     fn encode_failure(
         &self,
         _: &PayloadConverter,
@@ -501,9 +504,9 @@ mod tests {
     use super::*;
     use crate::{
         data_converters::{GenericPayloadConverter, SerializationContext},
+        error::ApplicationErrorCategory,
         protos::temporal::api::{
             common::v1::{Payload, Payloads},
-            enums::v1::ApplicationErrorCategory,
             failure::v1::{
                 ActivityFailureInfo, ChildWorkflowExecutionFailureInfo, NexusHandlerFailureInfo,
                 NexusOperationFailureInfo, ResetWorkflowFailureInfo, ServerFailureInfo,
@@ -649,7 +652,7 @@ mod tests {
         assert_eq!(failure.message, "app boom");
         assert_eq!(info.r#type, "MyType");
         assert!(info.non_retryable);
-        assert_eq!(info.category(), ApplicationErrorCategory::Benign);
+        assert_eq!(info.category(), ProtoApplicationErrorCategory::Benign);
         assert_eq!(info.details.unwrap().payloads[0].data, b"details".to_vec());
     }
 
@@ -770,13 +773,12 @@ mod tests {
             )),
             ..Default::default()
         };
-        let app = ApplicationFailure::new(anyhow::Error::new(ActivityExecutionError::Failed(
-            ActivityFailureError::new(
+        let app =
+            ApplicationFailure::new(ActivityExecutionError::Failed(ActivityFailureError::new(
                 activity_failure.clone(),
                 ActivityFailureInfo::default(),
                 None,
-            ),
-        )));
+            )));
         let converted = convert(OutgoingWorkflowError::Application(Box::new(app)));
         assert!(matches!(
             converted.failure_info,
@@ -794,13 +796,12 @@ mod tests {
             )),
             ..Default::default()
         };
-        let app = ApplicationFailure::new(anyhow::Error::new(ActivityExecutionError::Failed(
-            ActivityFailureError::new(
+        let app =
+            ApplicationFailure::new(ActivityExecutionError::Failed(ActivityFailureError::new(
                 activity_failure.clone(),
                 ActivityFailureInfo::default(),
                 None,
-            ),
-        )));
+            )));
 
         assert!(app.cause().is_none());
 
@@ -1432,11 +1433,11 @@ mod tests {
             .to_error(
                 &SerializationContextData::Workflow,
                 failure.clone(),
-                ChildWorkflowSignalDecodeHint,
+                WorkflowSignalDecodeHint,
             )
             .unwrap();
 
-        let ChildWorkflowSignalError::Failed(decoded_failure) = decoded else {
+        let WorkflowSignalError::Failed(decoded_failure) = decoded else {
             panic!("expected failed child-workflow signal error");
         };
         assert_eq!(decoded_failure.failure(), &failure);

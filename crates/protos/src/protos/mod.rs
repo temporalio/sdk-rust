@@ -1989,6 +1989,7 @@ pub mod temporal {
                                 },
                                 retry_policy: c.retry_policy,
                                 search_attributes: c.search_attributes,
+                                backoff_start_interval: c.backoff_start_interval,
                                 inherit_build_id,
                                 initial_versioning_behavior: c.initial_versioning_behavior,
                                 ..Default::default()

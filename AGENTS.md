@@ -25,6 +25,7 @@ document as your quick reference when submitting pull requests.
 - If you want to format, don't bother checking first. Just run formatting, and run it by using
   `cargo +nightly fmt`, because some settings require the nightly formatter.
 - Do not extract functions for relatively simple helpers that are only used in one location.
+- Use custom error types leveraging `thiserror` for any public facing error types
 
 
 ## Repo Specific Utilities
