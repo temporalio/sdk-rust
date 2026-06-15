@@ -55,7 +55,7 @@
 //!                 deployment_name: "my_deployment".to_owned(),
 //!                 build_id: "my_build_id".to_owned(),
 //!             },
-//!             use_worker_versioning: false
+//!             use_worker_versioning: false,
 //!             default_versioning_behavior: None,
 //!         })
 //!         .register_activities(MyActivities)
