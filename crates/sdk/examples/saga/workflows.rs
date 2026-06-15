@@ -131,9 +131,7 @@ impl BookingActivities {
     pub async fn book_car(_ctx: ActivityContext, trip_id: String) -> Result<String, ActivityError> {
         if trip_id.contains("fail") {
             return Err(ActivityError::application(
-                ApplicationFailure::non_retryable(anyhow::anyhow!(
-                    "Car booking failed for trip {trip_id}"
-                )),
+                ApplicationFailure::non_retryable("Car booking failed for trip {trip_id}"),
             ));
         }
         Ok(format!("car-{trip_id}"))

@@ -52,7 +52,7 @@ impl CancellationWorkflow {
 
         temporalio_sdk::workflows::select! {
             result = &mut activity_fut => {
-                let value = result.map_err(|e| anyhow::anyhow!("{e}"))?;
+                let value = result?;
                 Ok(value)
             }
             reason = ctx.cancelled() => {

@@ -316,7 +316,7 @@ impl EncodeFailure for ApplicationFailure {
             cause: self
                 .cause()
                 .map(|cause| Box::new(cause.failure().clone()))
-                .or_else(|| encode_application_failure_cause(self.source_error().as_ref())),
+                .or_else(|| encode_application_failure_cause(self.source_error())),
             failure_info: Some(FailureInfo::ApplicationFailureInfo(
                 ApplicationFailureInfo {
                     r#type: self.type_name().unwrap_or_default().to_owned(),
@@ -773,13 +773,12 @@ mod tests {
             )),
             ..Default::default()
         };
-        let app = ApplicationFailure::new(anyhow::Error::new(ActivityExecutionError::Failed(
-            ActivityFailureError::new(
+        let app =
+            ApplicationFailure::new(ActivityExecutionError::Failed(ActivityFailureError::new(
                 activity_failure.clone(),
                 ActivityFailureInfo::default(),
                 None,
-            ),
-        )));
+            )));
         let converted = convert(OutgoingWorkflowError::Application(Box::new(app)));
         assert!(matches!(
             converted.failure_info,
@@ -797,13 +796,12 @@ mod tests {
             )),
             ..Default::default()
         };
-        let app = ApplicationFailure::new(anyhow::Error::new(ActivityExecutionError::Failed(
-            ActivityFailureError::new(
+        let app =
+            ApplicationFailure::new(ActivityExecutionError::Failed(ActivityFailureError::new(
                 activity_failure.clone(),
                 ActivityFailureInfo::default(),
                 None,
-            ),
-        )));
+            )));
 
         assert!(app.cause().is_none());
 

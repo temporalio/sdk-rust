@@ -155,7 +155,7 @@ impl From<ProtoApplicationErrorCategory> for ApplicationErrorCategory {
 #[builder(start_fn = builder, state_mod(vis = "pub"))]
 pub struct ApplicationFailure {
     #[builder(start_fn, into)]
-    source: anyhow::Error,
+    source: Box<dyn std::error::Error + Send + Sync>,
     type_name: Option<String>,
     #[builder(default)]
     non_retryable: bool,
@@ -170,7 +170,7 @@ pub struct ApplicationFailure {
 
 impl ApplicationFailure {
     /// Construct a retryable application failure with no extra metadata.
-    pub fn new(source: impl Into<anyhow::Error>) -> Self {
+    pub fn new(source: impl Into<Box<dyn std::error::Error + Send + Sync>>) -> Self {
         Self {
             source: source.into(),
             type_name: None,
@@ -184,7 +184,7 @@ impl ApplicationFailure {
     }
 
     /// Construct a non-retryable application failure with no extra metadata.
-    pub fn non_retryable(source: impl Into<anyhow::Error>) -> Self {
+    pub fn non_retryable(source: impl Into<Box<dyn std::error::Error + Send + Sync>>) -> Self {
         Self {
             non_retryable: true,
             ..Self::new(source)
@@ -192,8 +192,8 @@ impl ApplicationFailure {
     }
 
     /// Returns the wrapped source error.
-    pub fn source_error(&self) -> &anyhow::Error {
-        &self.source
+    pub fn source_error(&self) -> &(dyn std::error::Error + Send + Sync + 'static) {
+        &*self.source as &(dyn std::error::Error + Send + Sync + 'static)
     }
 
     /// Returns the configured application failure type name, if any.
@@ -274,7 +274,7 @@ impl ApplicationFailure {
             .unwrap_or_default();
         let type_name = (!app_info.r#type.is_empty()).then_some(app_info.r#type.clone());
         Self {
-            source: anyhow::anyhow!(failure.message.clone()),
+            source: failure.message.clone().into(),
             type_name,
             non_retryable: app_info.non_retryable,
             next_retry_delay: app_info.next_retry_delay.and_then(|d| d.try_into().ok()),
