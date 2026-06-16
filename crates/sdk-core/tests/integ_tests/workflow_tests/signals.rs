@@ -388,7 +388,7 @@ impl SignalSerializationFailure {
         let result = handle
             .signal(SignalSerializationFailure::bad_signal, BadSignalInput)
             .await;
-        Ok(result.unwrap_err().message)
+        Ok(result.unwrap_err().to_string())
     }
 
     #[signal]

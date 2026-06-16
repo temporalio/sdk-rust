@@ -498,29 +498,35 @@ async fn lazy_download_exe(
     // temporary path
     match file {
         Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {
-            // If the download lock file exists but is old, delete it and try again, since it may
-            // have been left by an abandoned process.
-            if !already_tried_cleaning_old
-                && temp_dest.metadata()?.modified()?.elapsed()?.as_secs() > 90
-            {
-                std::fs::remove_file(temp_dest)?;
-                return Box::pin(lazy_download_exe(client, uri, file_to_extract, dest, true)).await;
-            }
-
-            // Since it already exists, we'll try once a second for 20 seconds
-            // to wait for it to be done, then return false so the caller can
-            // try again.
-            for _ in 0..20 {
-                sleep(Duration::from_secs(1)).await;
-                if !temp_dest.exists() {
-                    return Ok(false);
+            // Another process is already downloading to the temp file. Wait for
+            // it to finish instead of giving up after a fixed deadline. We only
+            // reclaim the download if the temp file stops making progress (its
+            // mtime stops advancing), which means the other process likely died.
+            const DOWNLOAD_STALE_SECS: u64 = 60;
+            loop {
+                let since_progress = match temp_dest.metadata() {
+                    Err(_) => return Ok(false),
+                    Ok(meta) => meta.modified()?.elapsed()?.as_secs(),
+                };
+                if since_progress > DOWNLOAD_STALE_SECS {
+                    // No progress for a while; assume the downloader was
+                    // abandoned. Reclaim it once; if it goes stale again, fail
+                    // loudly rather than looping forever.
+                    if already_tried_cleaning_old {
+                        return Err(anyhow!(
+                            "Temp download file at {} made no progress for over {} \
+                            seconds. Make sure another download isn't stuck and \
+                            delete the temp file.",
+                            temp_dest.display(),
+                            DOWNLOAD_STALE_SECS,
+                        ));
+                    }
+                    std::fs::remove_file(temp_dest)?;
+                    return Box::pin(lazy_download_exe(client, uri, file_to_extract, dest, true))
+                        .await;
                 }
+                sleep(Duration::from_secs(1)).await;
             }
-            Err(anyhow!(
-                "Temp download file at {} not complete after 20 seconds. \
-                Make sure another download isn't running for too long and delete the temp file.",
-                temp_dest.display()
-            ))
         }
         Err(err) => Err(err.into()),
         // If the dest was added since, just remove temp file

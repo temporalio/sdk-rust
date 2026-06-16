@@ -11,6 +11,8 @@ extern crate tracing;
 pub mod envconfig;
 #[doc(hidden)]
 pub mod fsm_trait;
+#[doc(hidden)]
+pub mod payload_limits;
 pub mod payload_visitor;
 pub mod protos;
 pub mod telemetry;

@@ -38,13 +38,13 @@ use temporalio_common_wasm::{
     ActivityDefinition, SignalDefinition, WorkflowDefinition,
     data_converters::{
         ActivityExecutionDecodeHint, ChildWorkflowExecutionDecodeHint,
-        ChildWorkflowSignalDecodeHint, ChildWorkflowStartDecodeHint, DataConverter,
-        GenericPayloadConverter, PayloadConversionError, PayloadConverter, SerializationContext,
-        SerializationContextData, TemporalDeserializable,
+        ChildWorkflowStartDecodeHint, DataConverter, GenericPayloadConverter, PayloadConverter,
+        SerializationContext, SerializationContextData, TemporalDeserializable,
+        WorkflowSignalDecodeHint,
     },
     error::{
-        ActivityExecutionError, ChildWorkflowExecutionError, ChildWorkflowSignalError,
-        ChildWorkflowStartError,
+        ActivityExecutionError, ChildWorkflowExecutionError, ChildWorkflowStartError,
+        WorkflowSignalError,
     },
     protos::{
         coresdk::{
@@ -148,7 +148,7 @@ impl PendingCommandId {
 struct WorkflowRuntimeState {
     host: Rc<dyn WorkflowHost>,
     pending_unblocks: RefCell<HashMap<PendingCommandId, oneshot::Sender<UnblockEvent>>>,
-    forced_wft_failure: RefCell<Option<anyhow::Error>>,
+    forced_wft_failure: RefCell<Option<Box<dyn std::error::Error + Send + Sync>>>,
     progress_made: Cell<bool>,
 }
 
@@ -190,12 +190,12 @@ impl WorkflowRuntimeState {
         true
     }
 
-    fn set_forced_wft_failure(&self, err: anyhow::Error) {
+    fn set_forced_wft_failure(&self, err: Box<dyn std::error::Error + Send + Sync>) {
         *self.forced_wft_failure.borrow_mut() = Some(err);
         self.progress_made.set(true);
     }
 
-    fn take_forced_wft_failure(&self) -> Option<anyhow::Error> {
+    fn take_forced_wft_failure(&self) -> Option<Box<dyn std::error::Error + Send + Sync>> {
         self.forced_wft_failure.borrow_mut().take()
     }
 
@@ -457,7 +457,9 @@ impl BaseWorkflowContext {
         self.inner.runtime.take_progress()
     }
 
-    pub(crate) fn take_forced_wft_failure(&self) -> Option<anyhow::Error> {
+    pub(crate) fn take_forced_wft_failure(
+        &self,
+    ) -> Option<Box<dyn std::error::Error + Send + Sync>> {
         self.inner.runtime.take_forced_wft_failure()
     }
 
@@ -1031,8 +1033,8 @@ impl<W> SyncWorkflowContext<W> {
     }
 
     /// Force a workflow task failure (EX: in order to retry on non-sticky queue)
-    pub fn force_task_fail(&self, with: anyhow::Error) {
-        self.base.inner.runtime.set_forced_wft_failure(with);
+    pub fn force_task_fail(&self, with: impl Into<Box<dyn std::error::Error + Send + Sync>>) {
+        self.base.inner.runtime.set_forced_wft_failure(with.into());
     }
 
     /// Start a nexus operation
@@ -1292,7 +1294,7 @@ impl<W> WorkflowContext<W> {
     }
 
     /// Force a workflow task failure (EX: in order to retry on non-sticky queue)
-    pub fn force_task_fail(&self, with: anyhow::Error) {
+    pub fn force_task_fail(&self, with: impl Into<Box<dyn std::error::Error + Send + Sync>>) {
         self.sync.force_task_fail(with)
     }
 
@@ -2064,7 +2066,7 @@ where
 enum SignalChildFut<F> {
     /// Immediate error (e.g., signal input serialization failure). Resolves on first poll.
     Errored {
-        error: Option<ChildWorkflowSignalError>,
+        error: Option<WorkflowSignalError>,
     },
     Running {
         inner: F,
@@ -2074,7 +2076,7 @@ enum SignalChildFut<F> {
 }
 
 impl<F> SignalChildFut<F> {
-    fn eager(err: ChildWorkflowSignalError) -> Self {
+    fn eager(err: WorkflowSignalError) -> Self {
         Self::Errored { error: Some(err) }
     }
 }
@@ -2085,7 +2087,7 @@ impl<F> Future for SignalChildFut<F>
 where
     F: Future<Output = SignalExternalWfResult> + Unpin,
 {
-    type Output = Result<(), ChildWorkflowSignalError>;
+    type Output = Result<(), WorkflowSignalError>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
@@ -2102,7 +2104,7 @@ where
                 Poll::Ready(Err(failure)) => Poll::Ready(Err(data_converter.to_error(
                     &SerializationContextData::Workflow,
                     failure,
-                    ChildWorkflowSignalDecodeHint,
+                    WorkflowSignalDecodeHint,
                 )?)),
             },
             SignalChildFut::Terminated => panic!("polled after termination"),
@@ -2123,7 +2125,7 @@ where
     }
 }
 
-impl<F> CancellableFuture<Result<(), ChildWorkflowSignalError>> for SignalChildFut<F>
+impl<F> CancellableFuture<Result<(), WorkflowSignalError>> for SignalChildFut<F>
 where
     F: CancellableFuture<SignalExternalWfResult> + Unpin,
 {
@@ -2166,7 +2168,7 @@ where
         &self,
         signal: S,
         input: S::Input,
-    ) -> impl CancellableFuture<Result<(), ChildWorkflowSignalError>> + 'static {
+    ) -> impl CancellableFuture<Result<(), WorkflowSignalError>> + 'static {
         let payload_converter = self.common.data_converter.payload_converter();
         let ctx = SerializationContext {
             data: &SerializationContextData::Workflow,
@@ -2218,8 +2220,8 @@ impl ExternalWorkflowHandle {
         &self,
         signal: S,
         input: S::Input,
-    ) -> impl CancellableFuture<SignalExternalWfResult> + 'static {
-        let payload_converter = self.base_ctx.inner.data_converter.payload_converter();
+    ) -> impl CancellableFuture<Result<(), WorkflowSignalError>> + 'static {
+        let payload_converter = self.base_ctx.data_converter().payload_converter();
         let ctx = SerializationContext {
             data: &SerializationContextData::Workflow,
             converter: payload_converter,
@@ -2227,7 +2229,7 @@ impl ExternalWorkflowHandle {
         let payloads = match payload_converter.to_payloads(&ctx, &input) {
             Ok(p) => p,
             Err(e) => {
-                return SignalExternalFut::SerializationError(Some(e));
+                return SignalChildFut::eager(e.into());
             }
         };
         let signal = Signal::new(S::name(&signal), payloads);
@@ -2238,7 +2240,10 @@ impl ExternalWorkflowHandle {
                 run_id: self.run_id.clone().unwrap_or_default(),
             },
         );
-        SignalExternalFut::Running(self.base_ctx.clone().send_signal_wf(target, signal))
+        SignalChildFut::Running {
+            inner: self.base_ctx.clone().send_signal_wf(target, signal),
+            data_converter: self.base_ctx.data_converter().clone(),
+        }
     }
 
     /// Request cancellation of the external workflow.
@@ -2272,61 +2277,6 @@ impl ExternalWorkflowHandle {
             .into(),
         );
         cmd
-    }
-}
-
-enum SignalExternalFut<F> {
-    Running(F),
-    SerializationError(Option<PayloadConversionError>),
-    Done,
-}
-
-impl<F: Unpin> Unpin for SignalExternalFut<F> {}
-
-impl<F> Future for SignalExternalFut<F>
-where
-    F: Future<Output = SignalExternalWfResult> + Unpin,
-{
-    type Output = SignalExternalWfResult;
-
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let this = self.get_mut();
-        match this {
-            SignalExternalFut::Running(inner) => {
-                let result = std::task::ready!(Pin::new(inner).poll(cx));
-                *this = SignalExternalFut::Done;
-                Poll::Ready(result)
-            }
-            SignalExternalFut::SerializationError(e) => {
-                let err = e.take().expect("polled after completion");
-                *this = SignalExternalFut::Done;
-                Poll::Ready(Err(Failure {
-                    message: format!("Failed to serialize signal input: {err}"),
-                    ..Default::default()
-                }))
-            }
-            SignalExternalFut::Done => panic!("polled after completion"),
-        }
-    }
-}
-
-impl<F> FusedFuture for SignalExternalFut<F>
-where
-    F: Future<Output = SignalExternalWfResult> + Unpin,
-{
-    fn is_terminated(&self) -> bool {
-        matches!(self, SignalExternalFut::Done)
-    }
-}
-
-impl<F> CancellableFuture<SignalExternalWfResult> for SignalExternalFut<F>
-where
-    F: CancellableFuture<SignalExternalWfResult> + Unpin,
-{
-    fn cancel(&self) {
-        if let SignalExternalFut::Running(inner) = self {
-            inner.cancel()
-        }
     }
 }
 

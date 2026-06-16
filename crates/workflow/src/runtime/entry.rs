@@ -26,7 +26,7 @@ pub enum WorkflowError {
 
     /// Workflow execution error
     #[error("Workflow execution error: {0}")]
-    Execution(#[from] anyhow::Error),
+    Execution(#[from] Box<dyn std::error::Error + Send + Sync>),
 }
 
 impl From<WorkflowError> for Failure {
@@ -172,7 +172,7 @@ pub trait ExecutableQuery<Q: QueryDefinition>: WorkflowImplementation {
         converter: &PayloadConverter,
     ) -> Result<Payload, WorkflowError> {
         let input = deserialize_input::<Q::Input>(payloads.payloads.clone(), converter)?;
-        let output = self.handle(ctx, input).map_err(wrap_handler_error)?;
+        let output = self.handle(ctx, input).map_err(WorkflowError::Execution)?;
         serialize_output(&output, converter)
     }
 }
@@ -213,7 +213,7 @@ pub trait ExecutableSyncUpdate<U: UpdateDefinition>: WorkflowImplementation {
                 Ok(payload) => std::future::ready(Ok(payload)).boxed_local(),
                 Err(e) => std::future::ready(Err(e)).boxed_local(),
             },
-            Err(e) => std::future::ready(Err(wrap_handler_error(e))).boxed_local(),
+            Err(e) => std::future::ready(Err(WorkflowError::Execution(e))).boxed_local(),
         }
     }
 
@@ -225,7 +225,7 @@ pub trait ExecutableSyncUpdate<U: UpdateDefinition>: WorkflowImplementation {
         converter: &PayloadConverter,
     ) -> Result<(), WorkflowError> {
         let input = deserialize_input::<U::Input>(payloads.payloads.clone(), converter)?;
-        self.validate(ctx, &input).map_err(wrap_handler_error)
+        self.validate(ctx, &input).map_err(WorkflowError::Execution)
     }
 }
 
@@ -258,7 +258,9 @@ pub trait ExecutableAsyncUpdate<U: UpdateDefinition>: WorkflowImplementation {
         };
         let converter = converter.clone();
         async move {
-            let output = Self::handle(ctx, input).await.map_err(wrap_handler_error)?;
+            let output = Self::handle(ctx, input)
+                .await
+                .map_err(WorkflowError::Execution)?;
             serialize_output(&output, &converter)
         }
         .boxed_local()
@@ -272,7 +274,7 @@ pub trait ExecutableAsyncUpdate<U: UpdateDefinition>: WorkflowImplementation {
         converter: &PayloadConverter,
     ) -> Result<(), WorkflowError> {
         let input = deserialize_input::<U::Input>(payloads.payloads.clone(), converter)?;
-        self.validate(ctx, &input).map_err(wrap_handler_error)
+        self.validate(ctx, &input).map_err(WorkflowError::Execution)
     }
 }
 
@@ -298,11 +300,6 @@ pub(crate) fn serialize_output<O: TemporalSerializable + 'static>(
         converter,
     };
     converter.to_payload(&ctx, output).map_err(Into::into)
-}
-
-/// Wrap a handler error into WorkflowError.
-pub(crate) fn wrap_handler_error(e: Box<dyn std::error::Error + Send + Sync>) -> WorkflowError {
-    WorkflowError::Execution(anyhow::anyhow!(e))
 }
 
 /// Serialize a workflow result value to a payload.

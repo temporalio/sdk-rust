@@ -2,9 +2,10 @@
 
 //! This crate defines a Public Preview Temporal Rust SDK.
 //!
-//! Currently defining activities and running an activity-only worker is the most stable code.
-//! Workflow definitions exist and running a workflow worker works, but the API is still very
-//! unstable.
+//! The SDK is built on top of Core and provides a native Rust experience for writing Temporal
+//! Workflows and Activities.
+//!
+//! The SDK is in Public Preview and under active development. The API can and will continue to evolve.
 //!
 //! An example of running an activity worker:
 //! ```no_run
@@ -83,8 +84,8 @@ pub mod workflows;
 
 pub use crate::error::{
     ActivityExecutionError, ApplicationFailure, ChildWorkflowExecutionError,
-    ChildWorkflowSignalError, ChildWorkflowStartError, OutgoingActivityError, OutgoingError,
-    OutgoingWorkflowError, WorkflowRegistrationError,
+    ChildWorkflowStartError, OutgoingActivityError, OutgoingError, OutgoingWorkflowError,
+    WorkflowRegistrationError, WorkflowSignalError,
 };
 pub use temporalio_client::Namespace;
 pub use temporalio_workflow::{
