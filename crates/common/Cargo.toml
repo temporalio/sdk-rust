@@ -13,7 +13,17 @@ categories = ["development-tools"]
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [features]
-otel = ["dep:opentelemetry", "dep:opentelemetry_sdk", "dep:opentelemetry-otlp"]
+otel = ["dep:opentelemetry", "dep:opentelemetry_sdk", "dep:opentelemetry-otlp", "dep:reqwest"]
+tls-ring = [
+  "opentelemetry-otlp?/tls-ring",
+  "opentelemetry-otlp?/reqwest-rustls",
+  "tonic/tls-native-roots",
+]
+tls-aws-lc = [
+  "opentelemetry-otlp?/tls-aws-lc",
+  "tonic/tls-native-roots",
+  "reqwest?/rustls-tls-native-roots-no-provider",
+]
 prometheus = [
   "dep:prometheus",
   "dep:hyper",
@@ -55,13 +65,12 @@ opentelemetry_sdk = { version = "0.31", default-features = false, features = [
 opentelemetry-otlp = { version = "0.31", default-features = false, features = [
   "tokio",
   "metrics",
-  "tls-roots",
   "http-proto",
   "grpc-tonic",
   "reqwest-blocking-client",
-  "reqwest-rustls",
 ], optional = true }
 parking_lot = { version = "0.12" }
+reqwest = { version = "0.12", default-features = false, optional = true }
 prometheus = { version = "0.14", optional = true, default-features = false }
 ringbuf = { version = "0.5", optional = true }
 serde = { version = "1.0", features = ["derive"] }

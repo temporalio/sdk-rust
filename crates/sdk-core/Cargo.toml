@@ -17,8 +17,19 @@ rust-version = "1.88.0"
 
 [features]
 default = ["envconfig", "prometheus", "tls-ring"]
-tls-ring = ["temporalio-client/tls-ring"]
-tls-aws-lc = ["temporalio-client/tls-aws-lc"]
+tls-ring = [
+  "temporalio-client/tls-ring",
+  "temporalio-common/tls-ring",
+  "opentelemetry-otlp?/tls-ring",
+  "opentelemetry-otlp?/reqwest-rustls",
+  "tonic/tls-native-roots",
+]
+tls-aws-lc = [
+  "temporalio-client/tls-aws-lc",
+  "temporalio-common/tls-aws-lc",
+  "opentelemetry-otlp?/tls-aws-lc",
+  "tonic/tls-native-roots",
+]
 envconfig = ["temporalio-client/envconfig", "temporalio-common/envconfig"]
 prometheus = ["temporalio-common/prometheus"]
 otel = [
@@ -67,11 +78,9 @@ opentelemetry_sdk = { version = "0.31", default-features = false, features = [
 opentelemetry-otlp = { version = "0.31", default-features = false, features = [
   "tokio",
   "metrics",
-  "tls-roots",
   "http-proto",
   "grpc-tonic",
   "reqwest-blocking-client",
-  "reqwest-rustls",
 ], optional = true }
 parking_lot = { version = "0.12" }
 pid = "4.0"

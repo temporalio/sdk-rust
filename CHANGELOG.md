@@ -23,6 +23,11 @@ to docs, or any other relevant information.
 * `client()` and `workflow_handle()` helpers to `ActivityContext` for easily obtaining a Temporal client
 * Exposed `backoff_start_interval` when continuing as new, which will delay the first task of the
   continued workflow by the configured interval.
+* The `tls-ring` / `tls-aws-lc` features now also select the TLS crypto backend for the OTLP metric
+  exporter (in addition to the gRPC service client). Previously the OTLP exporter hardcoded the `ring`
+  backend regardless of the selected feature, which prevented producing a `ring`-free, `aws-lc-rs`-only
+  (FIPS-capable) build. Building with `--no-default-features --features tls-aws-lc,otel` now yields a
+  dependency tree free of `ring`.
 
 ### Breaking Changes
 * The `ActivityContext` constructor now requires `ClientOptions`.
