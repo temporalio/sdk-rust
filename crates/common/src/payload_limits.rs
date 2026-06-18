@@ -317,18 +317,20 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
 
-    use crate::protos::temporal::api::command::v1::{
-        Command, CompleteWorkflowExecutionCommandAttributes,
-        FailWorkflowExecutionCommandAttributes, ModifyWorkflowPropertiesCommandAttributes,
-        RecordMarkerCommandAttributes, ScheduleActivityTaskCommandAttributes,
-        ScheduleNexusOperationCommandAttributes, command::Attributes,
-    };
-    use crate::protos::temporal::api::failure::v1::Failure;
-    use crate::protos::temporal::api::protocol::v1::Message;
-    use crate::protos::temporal::api::sdk::v1::UserMetadata;
-    use crate::protos::temporal::api::workflowservice::v1::{
-        RespondActivityTaskFailedRequest, RespondWorkflowTaskCompletedRequest,
-        StartWorkflowExecutionRequest,
+    use crate::protos::temporal::api::{
+        command::v1::{
+            Command, CompleteWorkflowExecutionCommandAttributes,
+            FailWorkflowExecutionCommandAttributes, ModifyWorkflowPropertiesCommandAttributes,
+            RecordMarkerCommandAttributes, ScheduleActivityTaskCommandAttributes,
+            ScheduleNexusOperationCommandAttributes, command::Attributes,
+        },
+        failure::v1::Failure,
+        protocol::v1::Message,
+        sdk::v1::UserMetadata,
+        workflowservice::v1::{
+            RespondActivityTaskFailedRequest, RespondWorkflowTaskCompletedRequest,
+            StartWorkflowExecutionRequest,
+        },
     };
 
     fn payload(data: &[u8]) -> Payload {
