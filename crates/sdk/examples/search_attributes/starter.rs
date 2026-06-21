@@ -1,12 +1,11 @@
 mod workflows;
 
-use std::collections::HashMap;
 use temporalio_client::{
     Client, ClientOptions, Connection, WorkflowGetResultOptions, WorkflowStartOptions,
     envconfig::LoadClientConfigProfileOptions,
 };
-use temporalio_common::protos::coresdk::AsJsonPayloadExt;
-use workflows::SearchAttributesWorkflow;
+use temporalio_common::search_attributes::TypedSearchAttributes;
+use workflows::{INT_FIELD, KEYWORD_FIELD, SearchAttributesWorkflow};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -15,18 +14,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let connection = Connection::connect(conn_opts).await?;
     let client = Client::new(connection, client_opts)?;
 
-    let mut search_attrs = HashMap::new();
-    search_attrs.insert(
-        "CustomKeywordField".to_string(),
-        "initial-value".as_json_payload()?,
-    );
+    let search_attrs = TypedSearchAttributes::new([
+        KEYWORD_FIELD.value_set("initial-value".into()),
+        INT_FIELD.value_set(0),
+    ]);
 
     let handle = client
         .start_workflow(
             SearchAttributesWorkflow::run,
             (),
             WorkflowStartOptions::new("search-attributes", "search-attributes-workflow-id")
-                .search_attributes(search_attrs)
+                .typed_search_attributes(search_attrs)
                 .build(),
         )
         .await?;

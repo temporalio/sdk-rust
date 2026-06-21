@@ -27,6 +27,7 @@ use temporalio_common_wasm::{
             sdk::v1::UserMetadata,
         },
     },
+    search_attributes::TypedSearchAttributes,
 };
 /// Options for scheduling an activity
 #[derive(Debug, bon::Builder, Clone)]
@@ -283,6 +284,9 @@ pub struct ChildWorkflowOptions {
     pub cron_schedule: Option<String>,
     /// Optionally associate extra search attributes with a workflow
     pub search_attributes: Option<HashMap<String, Payload>>,
+    /// Typed search attributes to set on the child workflow.
+    /// If both this and `search_attributes` are set, this takes precedence.
+    pub typed_search_attributes: Option<TypedSearchAttributes>,
     /// Priority for the workflow
     pub priority: Option<Priority>,
 }
@@ -318,11 +322,16 @@ impl ChildWorkflowOptions {
                     .task_timeout
                     .and_then(|duration| duration.try_into().ok()),
                 cron_schedule: self.cron_schedule.unwrap_or_default(),
-                search_attributes: self.search_attributes.and_then(|attrs| {
-                    (!attrs.is_empty()).then_some(SearchAttributes {
-                        indexed_fields: attrs,
-                    })
-                }),
+                search_attributes: self
+                    .typed_search_attributes
+                    .map(|t| t.to_proto())
+                    .or_else(|| {
+                        self.search_attributes.and_then(|attrs| {
+                            (!attrs.is_empty()).then_some(SearchAttributes {
+                                indexed_fields: attrs,
+                            })
+                        })
+                    }),
                 priority: self.priority.map(Into::into),
                 ..Default::default()
             }),
@@ -564,6 +573,9 @@ pub struct ContinueAsNewOptions {
     /// If set, the new workflow will have these search attributes. If `None`, reuses the current
     /// search attributes.
     pub search_attributes: Option<SearchAttributes>,
+    /// Typed search attributes for the continued workflow.
+    /// If both this and `search_attributes` are set, this takes precedence.
+    pub typed_search_attributes: Option<TypedSearchAttributes>,
     /// If set, the new workflow will have this retry policy. If `None`, reuses the current policy.
     pub retry_policy: Option<RetryPolicy>,
     /// Whether the new workflow should run on a worker with a compatible build id.
@@ -597,7 +609,10 @@ impl ContinueAsNewOptions {
                 .and_then(|duration| duration.try_into().ok()),
             memo: self.memo.unwrap_or_default(),
             headers: self.headers.unwrap_or_default(),
-            search_attributes: self.search_attributes,
+            search_attributes: self
+                .typed_search_attributes
+                .map(|t| Some(t.to_proto()))
+                .unwrap_or(self.search_attributes),
             retry_policy: self.retry_policy,
             versioning_intent: self
                 .versioning_intent

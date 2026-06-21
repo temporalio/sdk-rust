@@ -20,7 +20,7 @@ pub mod worker;
 pub use temporalio_common_wasm::{
     ActivityDefinition, ActivityError, HasWorkflowDefinition, Priority, QueryDefinition,
     SignalDefinition, UntypedWorkflow, UpdateDefinition, WorkerDeploymentVersion,
-    WorkflowDefinition, data_converters, error,
+    WorkflowDefinition, data_converters, error, search_attributes,
 };
 
 macro_rules! dbg_panic {

@@ -15,6 +15,7 @@ use temporalio_common::{
         replication::v1::ClusterReplicationConfig,
         workflowservice::v1::RegisterNamespaceRequest,
     },
+    search_attributes::TypedSearchAttributes,
     telemetry::metrics::TemporalMeter,
 };
 use tokio_rustls::rustls::client::danger::ServerCertVerifier;
@@ -288,6 +289,10 @@ pub struct WorkflowStartOptions {
 
     /// Optionally associate extra search attributes with a workflow
     pub search_attributes: Option<HashMap<String, Payload>>,
+
+    /// Typed search attributes to set when starting the workflow.
+    /// If both this and `search_attributes` are set, this takes precedence.
+    pub typed_search_attributes: Option<TypedSearchAttributes>,
 
     /// Optionally enable Eager Workflow Start, a latency optimization using local workers
     /// NOTE: Experimental

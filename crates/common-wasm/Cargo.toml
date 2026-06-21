@@ -26,6 +26,7 @@ erased-serde = "0.4"
 futures = { version = "0.3", default-features = false, features = ["alloc"] }
 parking_lot = { version = "0.12" }
 prost = { workspace = true }
+prost-types = { workspace = true }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = { workspace = true }
 thiserror = { workspace = true }

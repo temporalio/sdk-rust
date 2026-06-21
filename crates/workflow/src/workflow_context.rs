@@ -72,6 +72,7 @@ use temporalio_common_wasm::{
         },
         utilities::TryIntoOrNone,
     },
+    search_attributes::{SearchAttributeUpdate, TypedSearchAttributes},
     worker::WorkerDeploymentVersion,
 };
 
@@ -795,6 +796,11 @@ impl<W> SyncWorkflowContext<W> {
         Ref::map(self.base.inner.shared.borrow(), |s| &s.search_attributes)
     }
 
+    /// Return current values for workflow search attributes as a typed collection.
+    pub fn typed_search_attributes(&self) -> TypedSearchAttributes {
+        TypedSearchAttributes::from_proto(&self.base.inner.shared.borrow().search_attributes)
+    }
+
     /// Return the workflow's randomness seed
     pub fn random_seed(&self) -> u64 {
         self.base.inner.shared.borrow().random_seed
@@ -1010,6 +1016,22 @@ impl<W> SyncWorkflowContext<W> {
         );
     }
 
+    /// Add, update, or remove search attributes using typed keys.
+    pub fn upsert_typed_search_attributes(
+        &self,
+        updates: impl IntoIterator<Item = SearchAttributeUpdate>,
+    ) {
+        let proto = TypedSearchAttributes::updates_to_proto(updates);
+        self.base.inner.runtime.host.push_command(
+            workflow_command::Variant::UpsertWorkflowSearchAttributes(
+                UpsertWorkflowSearchAttributes {
+                    search_attributes: Some(proto),
+                },
+            )
+            .into(),
+        );
+    }
+
     /// Add or create a set of search attributes
     pub fn upsert_memo(&self, attr_iter: impl IntoIterator<Item = (String, Payload)>) {
         self.base.inner.runtime.host.push_command(
@@ -1156,6 +1178,11 @@ impl<W> WorkflowContext<W> {
         self.sync.search_attributes()
     }
 
+    /// Return current values for workflow search attributes as a typed collection.
+    pub fn typed_search_attributes(&self) -> TypedSearchAttributes {
+        self.sync.typed_search_attributes()
+    }
+
     /// Return the workflow's randomness seed
     pub fn random_seed(&self) -> u64 {
         self.sync.random_seed()
@@ -1279,6 +1306,14 @@ impl<W> WorkflowContext<W> {
     /// Add or create a set of search attributes
     pub fn upsert_search_attributes(&self, attr_iter: impl IntoIterator<Item = (String, Payload)>) {
         self.sync.upsert_search_attributes(attr_iter)
+    }
+
+    /// Add, update, or remove search attributes using typed keys.
+    pub fn upsert_typed_search_attributes(
+        &self,
+        updates: impl IntoIterator<Item = SearchAttributeUpdate>,
+    ) {
+        self.sync.upsert_typed_search_attributes(updates)
     }
 
     /// Add or create a set of memo fields
