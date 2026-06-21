@@ -72,12 +72,21 @@ pub mod danger {
     /// while explicitly acknowledging the danger in the import path.
     pub use tokio_rustls::rustls::client::danger::ServerCertVerifier;
 }
-/// Re-export the `ResolvesClientCert` trait so that users can implement dynamic
-/// client certificate resolution without depending on `tokio-rustls` directly.
+/// Re-export of [`tokio_rustls::rustls::SignatureScheme`] — parameter type
+/// of [`ResolvesClientCert::resolve`].
+pub use tokio_rustls::rustls::SignatureScheme;
+/// Re-export the `ResolvesClientCert` trait and supporting types so that users
+/// can implement dynamic client certificate resolution without depending on
+/// `tokio-rustls` directly.
 ///
 /// This enables transparent certificate rotation for mTLS connections (e.g.,
 /// short-lived certs issued by Vault and rotated on disk by a sidecar).
+///
+/// Implementors will also need [`CertifiedKey`] and [`SignatureScheme`].
 pub use tokio_rustls::rustls::client::ResolvesClientCert;
+/// Re-export of [`tokio_rustls::rustls::sign::CertifiedKey`] — the return type
+/// of [`ResolvesClientCert::resolve`].
+pub use tokio_rustls::rustls::sign::CertifiedKey;
 pub use tonic;
 pub use workflow_handle::{
     UntypedQuery, UntypedSignal, UntypedUpdate, UntypedWorkflow, UntypedWorkflowHandle,
@@ -308,6 +317,14 @@ impl Connection {
             } else {
                 channel
             };
+            // Validate that proxy and dynamic cert resolver aren't combined
+            if options.http_connect_proxy.is_some() && custom_connector_info.is_some() {
+                return Err(ClientConnectError::InvalidConfig(
+                    "client_cert_resolver is not yet supported with http_connect_proxy. \
+                     Use static client_tls_options when using a proxy, or remove the proxy."
+                        .to_owned(),
+                ));
+            }
             // Connect, using a custom TLS connector if dynamic cert resolution is needed
             let channel = if let Some(proxy) = options.http_connect_proxy.as_ref() {
                 proxy.connect_endpoint(&channel).await?
@@ -597,7 +614,13 @@ async fn add_tls_to_channel(
             let rustls_config = build_custom_rustls_config(tls_cfg, Some(resolver.clone()))?;
             let sni_domain = domain_override
                 .or_else(|| channel.uri().host().map(str::to_owned))
-                .unwrap_or_default();
+                .ok_or_else(|| {
+                    ClientConnectError::InvalidConfig(
+                        "Cannot determine TLS server name for dynamic cert resolution: \
+                         set 'domain' in TlsOptions or use a URL with a hostname"
+                            .to_owned(),
+                    )
+                })?;
             return Ok(TlsConfigResult::CustomConnector {
                 endpoint: channel,
                 rustls_config: Arc::new(rustls_config),
@@ -698,6 +721,13 @@ fn build_custom_rustls_config(
                         ))
                     })?;
             roots.add_parsable_certificates(certs);
+            if roots.is_empty() {
+                return Err(ClientConnectError::InvalidConfig(
+                    "None of the provided CA certificates could be parsed. \
+                     Ensure the PEM data contains valid X.509 certificates."
+                        .to_owned(),
+                ));
+            }
         } else {
             // Use native OS root certificates (same logic as tonic's with_native_roots)
             let native_result = rustls_native_certs::load_native_certs();
@@ -713,6 +743,11 @@ fn build_custom_rustls_config(
                 ));
             }
             roots.add_parsable_certificates(native_result.certs);
+            if roots.is_empty() {
+                return Err(ClientConnectError::InvalidConfig(
+                    "Native TLS root certificates were found but none could be parsed".to_owned(),
+                ));
+            }
         }
         builder.with_root_certificates(roots)
     };
@@ -730,12 +765,25 @@ fn build_custom_rustls_config(
     Ok(config)
 }
 
+/// Default TCP connect timeout for the dynamic TLS connector.
+/// Matches a reasonable timeout for production use; the built-in tonic connector
+/// uses `Endpoint::connect_timeout()` which we cannot access from a custom connector.
+const DYNAMIC_TLS_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// A custom connector that wraps a TCP connector with TLS using a custom
 /// `rustls::ClientConfig` (needed for dynamic cert resolution).
 #[derive(Clone)]
 struct DynamicTlsConnector {
     tls: tokio_rustls::TlsConnector,
     domain: Arc<tokio_rustls::rustls::pki_types::ServerName<'static>>,
+}
+
+impl std::fmt::Debug for DynamicTlsConnector {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DynamicTlsConnector")
+            .field("domain", &self.domain)
+            .finish()
+    }
 }
 
 impl tower::Service<Uri> for DynamicTlsConnector {
@@ -753,11 +801,40 @@ impl tower::Service<Uri> for DynamicTlsConnector {
         let domain = self.domain.clone();
 
         Box::pin(async move {
-            let host = uri.host().unwrap_or("localhost");
+            let host = uri
+                .host()
+                .ok_or_else(|| -> Box<dyn std::error::Error + Send + Sync> {
+                    format!("URI has no host for TLS connection: {uri}").into()
+                })?;
             let port = uri.port_u16().unwrap_or(443);
-            let tcp = tokio::net::TcpStream::connect(format!("{host}:{port}")).await?;
+            let addr = format!("{host}:{port}");
+
+            debug!(target: "temporal_client", %uri, %addr, "DynamicTlsConnector: establishing TCP+TLS connection");
+
+            // Use a timeout to prevent hanging on unreachable hosts.
+            // Tonic's built-in connector respects Endpoint::connect_timeout(),
+            // but custom connectors must handle timeouts themselves.
+            let tcp = tokio::time::timeout(
+                DYNAMIC_TLS_CONNECT_TIMEOUT,
+                tokio::net::TcpStream::connect(&addr),
+            )
+            .await
+            .map_err(|_| -> Box<dyn std::error::Error + Send + Sync> {
+                format!(
+                    "TCP connect to {addr} timed out after {}s",
+                    DYNAMIC_TLS_CONNECT_TIMEOUT.as_secs()
+                )
+                .into()
+            })?
+            .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+                format!("TCP connect to {addr} failed: {e}").into()
+            })?;
+
+            // Disable Nagle's algorithm for low-latency gRPC messaging
             tcp.set_nodelay(true)?;
+
             let tls_stream = tls.connect(domain.as_ref().to_owned(), tcp).await?;
+            debug!(target: "temporal_client", %addr, "DynamicTlsConnector: TLS handshake complete");
             Ok(hyper_util::rt::TokioIo::new(tls_stream))
         })
     }
@@ -2183,41 +2260,6 @@ mod tests {
             }
         }
 
-        /// A mock `ResolvesClientCert` that tracks how many times it was called.
-        /// Useful for verifying that the resolver is actually wired up.
-        #[derive(Debug)]
-        struct CountingCertResolver {
-            call_count: std::sync::atomic::AtomicUsize,
-        }
-
-        impl CountingCertResolver {
-            fn new() -> Self {
-                Self {
-                    call_count: std::sync::atomic::AtomicUsize::new(0),
-                }
-            }
-
-            fn count(&self) -> usize {
-                self.call_count.load(std::sync::atomic::Ordering::Relaxed)
-            }
-        }
-
-        impl tokio_rustls::rustls::client::ResolvesClientCert for CountingCertResolver {
-            fn resolve(
-                &self,
-                _acceptable_issuers: &[&[u8]],
-                _sigschemes: &[tokio_rustls::rustls::SignatureScheme],
-            ) -> Option<Arc<tokio_rustls::rustls::sign::CertifiedKey>> {
-                self.call_count
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                None
-            }
-
-            fn has_certs(&self) -> bool {
-                true
-            }
-        }
-
         #[tokio::test]
         async fn add_tls_with_client_cert_resolver_returns_custom_connector() {
             let resolver = Arc::new(MockClientCertResolver);
@@ -2401,8 +2443,8 @@ mod tests {
         }
 
         #[test]
-        fn dynamic_tls_connector_is_clone() {
-            // Verify DynamicTlsConnector is Clone (required by tonic for retries)
+        fn dynamic_tls_connector_is_clone_and_debug() {
+            // Verify DynamicTlsConnector is Clone (required by tonic) and Debug
             let config = build_custom_rustls_config(
                 &TlsOptions::default(),
                 Some(Arc::new(MockClientCertResolver)),
@@ -2417,6 +2459,48 @@ mod tests {
                 domain: Arc::new(server_name),
             };
             let _cloned = connector.clone();
+            let debug_str = format!("{:?}", connector);
+            assert!(
+                debug_str.contains("DynamicTlsConnector"),
+                "Debug should show struct name: {debug_str}"
+            );
+            assert!(
+                debug_str.contains("test.temporal.io"),
+                "Debug should show domain: {debug_str}"
+            );
+        }
+
+        #[tokio::test]
+        async fn add_tls_resolver_with_ip_host_uses_ip_as_domain() {
+            // When no explicit domain is set, the host from the URI is used for SNI.
+            // This verifies the .or_else() fallback works correctly.
+            let resolver = Arc::new(MockClientCertResolver);
+            let tls_opts = TlsOptions {
+                client_cert_resolver: Some(resolver),
+                // No domain set — should fall back to URI host
+                ..Default::default()
+            };
+            let endpoint = tonic::transport::Channel::from_static("https://192.168.1.100:7233");
+            let result = add_tls_to_channel(Some(&tls_opts), endpoint).await;
+            match result {
+                Ok(TlsConfigResult::CustomConnector { domain, .. }) => {
+                    assert_eq!(domain, "192.168.1.100");
+                }
+                other => panic!(
+                    "Expected CustomConnector with IP domain, got {:?}",
+                    other.err()
+                ),
+            }
+        }
+
+        #[test]
+        fn re_exports_are_accessible() {
+            // Verify that CertifiedKey and SignatureScheme are re-exported
+            // and usable from the crate root. This is a compile-time check.
+            fn _assert_types_exist(_resolver: &dyn ResolvesClientCert, _scheme: SignatureScheme) {
+                // This function just needs to compile
+            }
+            let _ = SignatureScheme::ECDSA_NISTP256_SHA256;
         }
     }
 
