@@ -72,6 +72,12 @@ pub mod danger {
     /// while explicitly acknowledging the danger in the import path.
     pub use tokio_rustls::rustls::client::danger::ServerCertVerifier;
 }
+/// Re-export the `ResolvesClientCert` trait so that users can implement dynamic
+/// client certificate resolution without depending on `tokio-rustls` directly.
+///
+/// This enables transparent certificate rotation for mTLS connections (e.g.,
+/// short-lived certs issued by Vault and rotated on disk by a sidecar).
+pub use tokio_rustls::rustls::client::ResolvesClientCert;
 pub use tonic;
 pub use workflow_handle::{
     UntypedQuery, UntypedSignal, UntypedUpdate, UntypedWorkflow, UntypedWorkflowHandle,
@@ -271,13 +277,24 @@ impl Connection {
                 Some(handle),
             )
         } else {
-            let channel = Endpoint::from_shared(options.target.to_string())?;
-            let channel = if let Some(timeout) = options.connect_timeout {
-                channel.connect_timeout(timeout)
+            let endpoint = Endpoint::from_shared(options.target.to_string())?;
+            let endpoint = if let Some(timeout) = options.connect_timeout {
+                endpoint.connect_timeout(timeout)
             } else {
-                channel
+                endpoint
             };
-            let channel = add_tls_to_channel(options.tls_options.as_ref(), channel).await?;
+            let tls_result = add_tls_to_channel(options.tls_options.as_ref(), endpoint).await?;
+
+            let (channel, custom_connector_info) = match tls_result {
+                TlsConfigResult::Standard(ep) => (ep, None),
+                TlsConfigResult::CustomConnector {
+                    endpoint: ep,
+                    rustls_config,
+                    domain,
+                } => (ep, Some((rustls_config, domain))),
+            };
+
+
             let channel = if let Some(keep_alive) = options.keep_alive.as_ref() {
                 channel
                     .keep_alive_while_idle(true)
@@ -291,9 +308,23 @@ impl Connection {
             } else {
                 channel
             };
-            // If there is a proxy, we have to connect that way
+            // Connect, using a custom TLS connector if dynamic cert resolution is needed
             let channel = if let Some(proxy) = options.http_connect_proxy.as_ref() {
                 proxy.connect_endpoint(&channel).await?
+            } else if let Some((rustls_config, domain)) = custom_connector_info {
+                let server_name =
+                    tokio_rustls::rustls::pki_types::ServerName::try_from(domain.as_str())
+                        .map_err(|e| {
+                            ClientConnectError::InvalidConfig(format!(
+                                "Invalid TLS domain name '{domain}': {e}"
+                            ))
+                        })?
+                        .to_owned();
+                let connector = DynamicTlsConnector {
+                    tls: tokio_rustls::TlsConnector::from(rustls_config),
+                    domain: Arc::new(server_name),
+                };
+                channel.connect_with_connector(connector).await?
             } else {
                 channel.connect().await?
             };
@@ -512,12 +543,32 @@ impl ClientHeaders {
     }
 }
 
+/// Result of TLS configuration: either standard tonic TLS was applied to the endpoint,
+/// or a custom rustls config is needed for dynamic certificate resolution.
+#[derive(Debug)]
+enum TlsConfigResult {
+    /// Standard tonic TLS was applied, endpoint is ready to connect normally.
+    Standard(Endpoint),
+    /// A custom rustls::ClientConfig is needed. The endpoint has no TLS configured;
+    /// the caller must use `connect_with_connector` with a custom TLS connector.
+    CustomConnector {
+        endpoint: Endpoint,
+        rustls_config: Arc<tokio_rustls::rustls::ClientConfig>,
+        domain: String,
+    },
+}
+
 /// If TLS is configured, set the appropriate options on the provided channel and return it.
 /// Passes it through if TLS options not set.
+///
+/// When `client_cert_resolver` is set, tonic's built-in TLS cannot be used (it only supports
+/// static client certificates). In that case, we return `TlsConfigResult::CustomConnector`
+/// with a manually-built `rustls::ClientConfig` that the caller must use with
+/// `connect_with_connector`.
 async fn add_tls_to_channel(
     tls_options: Option<&TlsOptions>,
     mut channel: Endpoint,
-) -> Result<Endpoint, ClientConnectError> {
+) -> Result<TlsConfigResult, ClientConnectError> {
     if let Some(tls_cfg) = tls_options {
         if tls_cfg.server_cert_verifier.is_some() && tls_cfg.server_root_ca_cert.is_some() {
             return Err(ClientConnectError::InvalidConfig(
@@ -525,6 +576,36 @@ async fn add_tls_to_channel(
             ));
         }
 
+        if tls_cfg.client_tls_options.is_some() && tls_cfg.client_cert_resolver.is_some() {
+            return Err(ClientConnectError::InvalidConfig(
+                "Cannot set both `client_tls_options` and `client_cert_resolver`. \
+                 Use `client_tls_options` for static certificates or \
+                 `client_cert_resolver` for dynamic certificate resolution, but not both."
+                    .to_owned(),
+            ));
+        }
+
+        // Extract the domain for SNI / :authority header
+        let domain_override = tls_cfg.domain.clone();
+        if let Some(domain) = &domain_override {
+            let uri: Uri = format!("https://{domain}").parse()?;
+            channel = channel.origin(uri);
+        }
+
+        // Dynamic certificate resolver path: build rustls::ClientConfig manually
+        if let Some(resolver) = &tls_cfg.client_cert_resolver {
+            let rustls_config = build_custom_rustls_config(tls_cfg, Some(resolver.clone()))?;
+            let sni_domain = domain_override
+                .or_else(|| channel.uri().host().map(str::to_owned))
+                .unwrap_or_default();
+            return Ok(TlsConfigResult::CustomConnector {
+                endpoint: channel,
+                rustls_config: Arc::new(rustls_config),
+                domain: sni_domain,
+            });
+        }
+
+        // Standard tonic TLS path
         let mut tls = tonic::transport::ClientTlsConfig::new();
 
         if tls_cfg.server_cert_verifier.is_none() {
@@ -538,13 +619,6 @@ async fn add_tls_to_channel(
 
         if let Some(domain) = &tls_cfg.domain {
             tls = tls.domain_name(domain);
-
-            // This song and dance ultimately is just to make sure the `:authority` header ends
-            // up correct on requests while we use TLS. Setting the header directly in our
-            // interceptor doesn't work since seemingly it is overridden at some point by
-            // something lower level.
-            let uri: Uri = format!("https://{domain}").parse()?;
-            channel = channel.origin(uri);
         }
 
         if let Some(client_opts) = &tls_cfg.client_tls_options {
@@ -553,15 +627,140 @@ async fn add_tls_to_channel(
             tls = tls.identity(client_identity);
         }
 
-        return if let Some(verifier) = &tls_cfg.server_cert_verifier {
+        let endpoint = if let Some(verifier) = &tls_cfg.server_cert_verifier {
             channel
                 .tls_config_with_verifier(tls, verifier.clone())
-                .map_err(Into::into)
+                .map_err(ClientConnectError::from)?
         } else {
-            channel.tls_config(tls).map_err(Into::into)
+            channel.tls_config(tls).map_err(ClientConnectError::from)?
         };
+        return Ok(TlsConfigResult::Standard(endpoint));
     }
-    Ok(channel)
+    Ok(TlsConfigResult::Standard(channel))
+}
+
+/// Build a `rustls::ClientConfig` manually for the dynamic certificate resolver path.
+///
+/// This replicates the logic that tonic normally handles internally but uses
+/// `with_client_cert_resolver` instead of `with_client_auth_cert`.
+fn build_custom_rustls_config(
+    tls_cfg: &TlsOptions,
+    client_cert_resolver: Option<Arc<dyn tokio_rustls::rustls::client::ResolvesClientCert>>,
+) -> Result<tokio_rustls::rustls::ClientConfig, ClientConnectError> {
+    use tokio_rustls::rustls::{ClientConfig, RootCertStore, crypto};
+
+    // Get or install a crypto provider
+    let provider = crypto::CryptoProvider::get_default()
+        .cloned()
+        .or_else(|| {
+            // Try ring first, then aws-lc, matching tonic's behavior
+            #[cfg(feature = "tls-ring")]
+            {
+                return Some(Arc::new(crypto::ring::default_provider()));
+            }
+            #[cfg(feature = "tls-aws-lc")]
+            {
+                return Some(Arc::new(crypto::aws_lc_rs::default_provider()));
+            }
+            #[allow(unreachable_code)]
+            None
+        })
+        .ok_or_else(|| {
+            ClientConnectError::InvalidConfig(
+                "No TLS crypto provider available. Enable the `tls-ring` or `tls-aws-lc` feature."
+                    .to_owned(),
+            )
+        })?;
+
+    let builder = ClientConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .map_err(|e| {
+            ClientConnectError::InvalidConfig(format!("Failed to configure TLS protocols: {e}"))
+        })?;
+
+    // Configure server certificate verification
+    let builder = if let Some(verifier) = &tls_cfg.server_cert_verifier {
+        builder
+            .dangerous()
+            .with_custom_certificate_verifier(verifier.clone())
+    } else {
+        use std::io::Cursor;
+        use tokio_rustls::rustls::pki_types::{CertificateDer, pem::PemObject as _};
+
+        let mut roots = RootCertStore::empty();
+        if let Some(ca_cert) = &tls_cfg.server_root_ca_cert {
+            let certs: Vec<CertificateDer<'static>> =
+                CertificateDer::pem_reader_iter(&mut Cursor::new(ca_cert))
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|e| {
+                        ClientConnectError::InvalidConfig(format!(
+                            "Failed to parse CA certificate PEM: {e}"
+                        ))
+                    })?;
+            roots.add_parsable_certificates(certs);
+        } else {
+            // Use native OS root certificates (same logic as tonic's with_native_roots)
+            let native_result = rustls_native_certs::load_native_certs();
+            if !native_result.errors.is_empty() {
+                warn!(
+                    "errors occurred when loading native certs: {:?}",
+                    native_result.errors
+                );
+            }
+            if native_result.certs.is_empty() {
+                return Err(ClientConnectError::InvalidConfig(
+                    "No native TLS root certificates found".to_owned(),
+                ));
+            }
+            roots.add_parsable_certificates(native_result.certs);
+        }
+        builder.with_root_certificates(roots)
+    };
+
+    // Configure client authentication
+    let mut config = if let Some(resolver) = client_cert_resolver {
+        builder.with_client_cert_resolver(resolver)
+    } else {
+        builder.with_no_client_auth()
+    };
+
+    // Set ALPN to h2 for HTTP/2 (required by gRPC)
+    config.alpn_protocols.push(b"h2".to_vec());
+
+    Ok(config)
+}
+
+/// A custom connector that wraps a TCP connector with TLS using a custom
+/// `rustls::ClientConfig` (needed for dynamic cert resolution).
+#[derive(Clone)]
+struct DynamicTlsConnector {
+    tls: tokio_rustls::TlsConnector,
+    domain: Arc<tokio_rustls::rustls::pki_types::ServerName<'static>>,
+}
+
+impl tower::Service<Uri> for DynamicTlsConnector {
+    type Response = hyper_util::rt::TokioIo<tokio_rustls::client::TlsStream<tokio::net::TcpStream>>;
+    type Error = Box<dyn std::error::Error + Send + Sync>;
+    type Future =
+        Pin<Box<dyn std::future::Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+
+    fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, uri: Uri) -> Self::Future {
+        let tls = self.tls.clone();
+        let domain = self.domain.clone();
+
+        Box::pin(async move {
+            let host = uri.host().unwrap_or("localhost");
+            let port = uri.port_u16().unwrap_or(443);
+            let tcp = tokio::net::TcpStream::connect(format!("{host}:{port}")).await?;
+            tcp.set_nodelay(true)?;
+            let tls_stream = tls.connect(domain.as_ref().to_owned(), tcp).await?;
+            Ok(hyper_util::rt::TokioIo::new(tls_stream))
+        })
+    }
 }
 
 fn parse_ascii_headers(
@@ -1924,7 +2123,7 @@ mod tests {
             let endpoint = tonic::transport::Channel::from_static("https://test.temporal.io:7233");
             let result = add_tls_to_channel(Some(&tls_opts), endpoint).await;
             assert!(
-                result.is_ok(),
+                matches!(&result, Ok(TlsConfigResult::Standard(_))),
                 "add_tls_to_channel should succeed with a custom verifier: {:?}",
                 result.err()
             );
@@ -1957,10 +2156,267 @@ mod tests {
             let endpoint = tonic::transport::Channel::from_static("https://test.temporal.io:7233");
             let result = add_tls_to_channel(Some(&tls_opts), endpoint).await;
             assert!(
-                result.is_ok(),
+                matches!(&result, Ok(TlsConfigResult::Standard(_))),
                 "add_tls_to_channel should succeed without a verifier (native roots): {:?}",
                 result.err()
             );
+        }
+
+        // --- Dynamic client cert resolver tests ---
+
+        /// A mock `ResolvesClientCert` that always returns None (no client cert).
+        /// Used to test the plumbing without requiring real certificates.
+        #[derive(Debug)]
+        struct MockClientCertResolver;
+
+        impl tokio_rustls::rustls::client::ResolvesClientCert for MockClientCertResolver {
+            fn resolve(
+                &self,
+                _acceptable_issuers: &[&[u8]],
+                _sigschemes: &[tokio_rustls::rustls::SignatureScheme],
+            ) -> Option<Arc<tokio_rustls::rustls::sign::CertifiedKey>> {
+                None // No client cert available — server may reject, but plumbing works
+            }
+
+            fn has_certs(&self) -> bool {
+                false
+            }
+        }
+
+        /// A mock `ResolvesClientCert` that tracks how many times it was called.
+        /// Useful for verifying that the resolver is actually wired up.
+        #[derive(Debug)]
+        struct CountingCertResolver {
+            call_count: std::sync::atomic::AtomicUsize,
+        }
+
+        impl CountingCertResolver {
+            fn new() -> Self {
+                Self {
+                    call_count: std::sync::atomic::AtomicUsize::new(0),
+                }
+            }
+
+            fn count(&self) -> usize {
+                self.call_count.load(std::sync::atomic::Ordering::Relaxed)
+            }
+        }
+
+        impl tokio_rustls::rustls::client::ResolvesClientCert for CountingCertResolver {
+            fn resolve(
+                &self,
+                _acceptable_issuers: &[&[u8]],
+                _sigschemes: &[tokio_rustls::rustls::SignatureScheme],
+            ) -> Option<Arc<tokio_rustls::rustls::sign::CertifiedKey>> {
+                self.call_count
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                None
+            }
+
+            fn has_certs(&self) -> bool {
+                true
+            }
+        }
+
+        #[tokio::test]
+        async fn add_tls_with_client_cert_resolver_returns_custom_connector() {
+            let resolver = Arc::new(MockClientCertResolver);
+            let tls_opts = TlsOptions {
+                client_cert_resolver: Some(resolver),
+                domain: Some("test.temporal.io".to_string()),
+                ..Default::default()
+            };
+            let endpoint = tonic::transport::Channel::from_static("https://test.temporal.io:7233");
+            let result = add_tls_to_channel(Some(&tls_opts), endpoint).await;
+            match result {
+                Ok(TlsConfigResult::CustomConnector {
+                    domain,
+                    rustls_config,
+                    ..
+                }) => {
+                    assert_eq!(domain, "test.temporal.io");
+                    // Verify ALPN is set to h2
+                    assert_eq!(rustls_config.alpn_protocols, vec![b"h2".to_vec()]);
+                }
+                other => panic!(
+                    "Expected TlsConfigResult::CustomConnector, got {:?}",
+                    other.err()
+                ),
+            }
+        }
+
+        #[tokio::test]
+        async fn add_tls_with_client_cert_resolver_inherits_domain_from_endpoint() {
+            let resolver = Arc::new(MockClientCertResolver);
+            let tls_opts = TlsOptions {
+                client_cert_resolver: Some(resolver),
+                // No explicit domain — should be derived from the endpoint URI
+                ..Default::default()
+            };
+            let endpoint =
+                tonic::transport::Channel::from_static("https://my-server.example.com:7233");
+            let result = add_tls_to_channel(Some(&tls_opts), endpoint).await;
+            match result {
+                Ok(TlsConfigResult::CustomConnector { domain, .. }) => {
+                    assert_eq!(domain, "my-server.example.com");
+                }
+                other => panic!(
+                    "Expected TlsConfigResult::CustomConnector, got {:?}",
+                    other.err()
+                ),
+            }
+        }
+
+        #[tokio::test]
+        async fn add_tls_with_resolver_and_custom_verifier() {
+            let resolver = Arc::new(MockClientCertResolver);
+            let tls_opts = TlsOptions {
+                client_cert_resolver: Some(resolver),
+                server_cert_verifier: Some(Arc::new(MockVerifier)),
+                domain: Some("test.temporal.io".to_string()),
+                ..Default::default()
+            };
+            let endpoint = tonic::transport::Channel::from_static("https://test.temporal.io:7233");
+            let result = add_tls_to_channel(Some(&tls_opts), endpoint).await;
+            assert!(
+                matches!(&result, Ok(TlsConfigResult::CustomConnector { .. })),
+                "Should succeed when combining cert resolver with custom server verifier: {:?}",
+                result.err()
+            );
+        }
+
+        #[tokio::test]
+        async fn add_tls_with_resolver_and_custom_ca_cert() {
+            // Use a valid PEM-formatted CA certificate
+            let ca_pem = include_bytes!("../tests/testdata/ca.pem");
+            let resolver = Arc::new(MockClientCertResolver);
+            let tls_opts = TlsOptions {
+                client_cert_resolver: Some(resolver),
+                server_root_ca_cert: Some(ca_pem.to_vec()),
+                domain: Some("test.temporal.io".to_string()),
+                ..Default::default()
+            };
+            let endpoint = tonic::transport::Channel::from_static("https://test.temporal.io:7233");
+            let result = add_tls_to_channel(Some(&tls_opts), endpoint).await;
+            assert!(
+                matches!(&result, Ok(TlsConfigResult::CustomConnector { .. })),
+                "Should succeed when combining cert resolver with custom CA cert: {:?}",
+                result.err()
+            );
+        }
+
+        #[tokio::test]
+        async fn add_tls_both_static_and_dynamic_client_cert_fails() {
+            let resolver = Arc::new(MockClientCertResolver);
+            let tls_opts = TlsOptions {
+                client_tls_options: Some(ClientTlsOptions {
+                    client_cert: b"some-cert".to_vec(),
+                    client_private_key: b"some-key".to_vec(),
+                }),
+                client_cert_resolver: Some(resolver),
+                domain: Some("test.temporal.io".to_string()),
+                ..Default::default()
+            };
+            let endpoint = tonic::transport::Channel::from_static("https://test.temporal.io:7233");
+            let result = add_tls_to_channel(Some(&tls_opts), endpoint).await;
+            assert!(
+                matches!(result, Err(ClientConnectError::InvalidConfig(msg)) if msg.contains("client_tls_options") && msg.contains("client_cert_resolver")),
+                "Should fail with InvalidConfig when both static and dynamic client certs are set"
+            );
+        }
+
+        #[tokio::test]
+        async fn add_tls_no_options_returns_standard_passthrough() {
+            let endpoint = tonic::transport::Channel::from_static("http://localhost:7233");
+            let result = add_tls_to_channel(None, endpoint).await;
+            assert!(
+                matches!(&result, Ok(TlsConfigResult::Standard(_))),
+                "Should return Standard when no TLS options are set"
+            );
+        }
+
+        #[test]
+        fn build_custom_rustls_config_with_resolver() {
+            let resolver = Arc::new(MockClientCertResolver);
+            let tls_opts = TlsOptions {
+                domain: Some("test.temporal.io".to_string()),
+                ..Default::default()
+            };
+            let config = build_custom_rustls_config(&tls_opts, Some(resolver));
+            assert!(config.is_ok(), "Should build config: {:?}", config.err());
+            let config = config.unwrap();
+            assert_eq!(config.alpn_protocols, vec![b"h2".to_vec()]);
+        }
+
+        #[test]
+        fn build_custom_rustls_config_without_resolver() {
+            let tls_opts = TlsOptions {
+                domain: Some("test.temporal.io".to_string()),
+                ..Default::default()
+            };
+            let config = build_custom_rustls_config(&tls_opts, None);
+            assert!(config.is_ok(), "Should build config: {:?}", config.err());
+        }
+
+        #[test]
+        fn build_custom_rustls_config_with_custom_verifier_and_resolver() {
+            let resolver = Arc::new(MockClientCertResolver);
+            let tls_opts = TlsOptions {
+                server_cert_verifier: Some(Arc::new(MockVerifier)),
+                domain: Some("test.temporal.io".to_string()),
+                ..Default::default()
+            };
+            let config = build_custom_rustls_config(&tls_opts, Some(resolver));
+            assert!(
+                config.is_ok(),
+                "Should build config with custom verifier + resolver: {:?}",
+                config.err()
+            );
+        }
+
+        #[test]
+        fn tls_options_debug_shows_custom_for_resolver() {
+            let resolver = Arc::new(MockClientCertResolver);
+            let tls_opts = TlsOptions {
+                client_cert_resolver: Some(resolver),
+                ..Default::default()
+            };
+            let debug_str = format!("{:?}", tls_opts);
+            assert!(
+                debug_str.contains("\"<custom>\""),
+                "Debug should show <custom> for client_cert_resolver: {debug_str}"
+            );
+            assert!(
+                debug_str.contains("client_cert_resolver"),
+                "Debug should contain field name: {debug_str}"
+            );
+        }
+
+        #[test]
+        fn tls_options_default_has_no_resolver() {
+            let tls_opts = TlsOptions::default();
+            assert!(tls_opts.client_cert_resolver.is_none());
+            assert!(tls_opts.client_tls_options.is_none());
+            assert!(tls_opts.server_cert_verifier.is_none());
+        }
+
+        #[test]
+        fn dynamic_tls_connector_is_clone() {
+            // Verify DynamicTlsConnector is Clone (required by tonic for retries)
+            let config = build_custom_rustls_config(
+                &TlsOptions::default(),
+                Some(Arc::new(MockClientCertResolver)),
+            )
+            .unwrap();
+            let server_name =
+                tokio_rustls::rustls::pki_types::ServerName::try_from("test.temporal.io")
+                    .unwrap()
+                    .to_owned();
+            let connector = DynamicTlsConnector {
+                tls: tokio_rustls::TlsConnector::from(Arc::new(config)),
+                domain: Arc::new(server_name),
+            };
+            let _cloned = connector.clone();
         }
     }
 

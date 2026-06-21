@@ -21,7 +21,7 @@ use temporalio_common::{
     search_attributes::SearchAttributes,
     telemetry::metrics::TemporalMeter,
 };
-use tokio_rustls::rustls::client::danger::ServerCertVerifier;
+use tokio_rustls::rustls::client::{ResolvesClientCert, danger::ServerCertVerifier};
 use url::Url;
 
 /// Options for [crate::Connection::connect].
@@ -180,6 +180,9 @@ pub struct TlsOptions {
     /// the domain name will be extracted from the URL used to connect.
     pub domain: Option<String>,
     /// TLS info for the client. If specified, core will attempt to use mTLS.
+    ///
+    /// Mutually exclusive with [`client_cert_resolver`](TlsOptions::client_cert_resolver).
+    /// Setting both is an error.
     pub client_tls_options: Option<ClientTlsOptions>,
     /// Optional custom server certificate verifier. When set, this replaces the default
     /// certificate verification and `server_root_ca_cert` is ignored.
@@ -198,6 +201,25 @@ pub struct TlsOptions {
     /// Note that `domain` is still respected for the `:authority` header / origin override
     /// even when a custom verifier is set.
     pub server_cert_verifier: Option<Arc<dyn ServerCertVerifier>>,
+    /// Optional dynamic client certificate resolver. When set, the resolver is called during
+    /// each TLS handshake to provide the client certificate, enabling transparent certificate
+    /// rotation without process restart.
+    ///
+    /// This is useful for:
+    /// - Short-lived mTLS certificates rotated on disk by a sidecar (e.g., Vault agent)
+    /// - HSM-backed certificate selection
+    /// - Dynamic certificate selection based on server hints
+    ///
+    /// Mutually exclusive with [`client_tls_options`](TlsOptions::client_tls_options).
+    /// Setting both is an error.
+    ///
+    /// The resolver must implement [`ResolvesClientCert`] from the `rustls` crate.
+    /// A simple implementation that reloads certificates from disk can use
+    /// `Arc<RwLock<CertifiedKey>>` internally.
+    ///
+    /// **Note:** The resolver is called on each new TLS handshake (new connections), not on every
+    /// RPC over an existing HTTP/2 connection. Certificate rotation takes effect upon reconnection.
+    pub client_cert_resolver: Option<Arc<dyn ResolvesClientCert>>,
 }
 
 impl Default for TlsOptions {
@@ -221,6 +243,10 @@ impl std::fmt::Debug for TlsOptions {
             .field(
                 "server_cert_verifier",
                 &self.server_cert_verifier.as_ref().map(|_| "<custom>"),
+            )
+            .field(
+                "client_cert_resolver",
+                &self.client_cert_resolver.as_ref().map(|_| "<custom>"),
             )
             .finish()
     }
