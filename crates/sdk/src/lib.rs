@@ -75,6 +75,7 @@ extern crate self as temporalio_sdk;
 pub mod activities;
 pub mod error;
 pub mod interceptors;
+pub mod nexus;
 mod workflow_executor;
 mod workflow_future;
 mod workflow_registry;
@@ -105,6 +106,10 @@ use crate::{
         activity_error_to_core_result,
     },
     interceptors::{ActivityInboundInterceptor, WorkerInterceptor},
+    nexus::{
+        NexusCancelContext, NexusHandlerError, NexusServiceDefinitions, NexusStartContext,
+        cancel_ok_status, handler_error_status,
+    },
     workflow_executor::{TaskHandle, WorkflowExecutor},
     workflow_future::start_workflow,
     workflow_registry::WorkflowDefinitions,
@@ -118,7 +123,7 @@ use std::{
     fmt::{Debug, Display, Formatter},
     future::Future,
     sync::Arc,
-    time::Duration,
+    time::{Duration, SystemTime},
 };
 use temporalio_client::{Client, ClientOptions, NamespacedClient};
 use temporalio_common::{
@@ -131,10 +136,14 @@ use temporalio_common::{
             ActivityTaskCompletion, AsJsonPayloadExt,
             activity_result::ActivityExecutionResult,
             activity_task::{ActivityTask, activity_task},
+            nexus::{NexusTaskCompletion, nexus_task, nexus_task_completion},
             workflow_activation::{WorkflowActivation, workflow_activation_job::Variant},
             workflow_completion::WorkflowActivationCompletion,
         },
-        temporal::api::{common::v1::Payload, enums::v1::WorkflowTaskFailedCause},
+        temporal::api::{
+            common::v1::Payload, enums::v1::WorkflowTaskFailedCause,
+            nexus::v1::request as nexus_request,
+        },
     },
     worker::{WorkerDeploymentOptions, WorkerTaskTypes, build_id_from_current_exe},
 };
@@ -167,6 +176,9 @@ pub struct WorkerOptions {
 
     #[builder(field)]
     workflows: WorkflowDefinitions,
+
+    #[builder(field)]
+    nexus_definitions: NexusServiceDefinitions,
 
     #[cfg(feature = "wasm-workflows")]
     #[builder(field)]
@@ -325,6 +337,48 @@ impl<S: worker_options_builder::State> WorkerOptionsBuilder<S> {
         self.wasm_workflow_components.push(component);
         self
     }
+
+    /// Register a typed Nexus start handler. See
+    /// [`NexusServiceDefinitions::register_operation`](crate::nexus::NexusServiceDefinitions::register_operation).
+    pub fn register_nexus_operation<I, O, F, Fut>(
+        mut self,
+        service: impl Into<String>,
+        operation: impl Into<String>,
+        handler: F,
+    ) -> Self
+    where
+        I: temporalio_common::data_converters::TemporalDeserializable + Send + 'static,
+        O: temporalio_common::data_converters::TemporalSerializable + Send + Sync + 'static,
+        F: Fn(NexusStartContext, I) -> Fut + Send + Sync + 'static,
+        Fut: Future<
+                Output = Result<
+                    crate::nexus::NexusOperationResult<O>,
+                    crate::nexus::NexusHandlerError,
+                >,
+            > + Send
+            + 'static,
+    {
+        self.nexus_definitions
+            .register_operation(service, operation, handler);
+        self
+    }
+
+    /// Register a custom Nexus cancel handler. See
+    /// [`NexusServiceDefinitions::register_cancel_handler`](crate::nexus::NexusServiceDefinitions::register_cancel_handler).
+    pub fn register_nexus_cancel_handler<F, Fut>(
+        mut self,
+        service: impl Into<String>,
+        operation: impl Into<String>,
+        handler: F,
+    ) -> Self
+    where
+        F: Fn(NexusCancelContext) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<(), NexusHandlerError>> + Send + 'static,
+    {
+        self.nexus_definitions
+            .register_cancel_handler(service, operation, handler);
+        self
+    }
 }
 
 // Needs to exist to avoid https://github.com/elastio/bon/issues/359
@@ -393,6 +447,48 @@ impl WorkerOptions {
         self.workflows.clone()
     }
 
+    /// Register a typed Nexus start handler. See
+    /// [`NexusServiceDefinitions::register_operation`](crate::nexus::NexusServiceDefinitions::register_operation).
+    pub fn register_nexus_operation<I, O, F, Fut>(
+        &mut self,
+        service: impl Into<String>,
+        operation: impl Into<String>,
+        handler: F,
+    ) -> &mut Self
+    where
+        I: temporalio_common::data_converters::TemporalDeserializable + Send + 'static,
+        O: temporalio_common::data_converters::TemporalSerializable + Send + Sync + 'static,
+        F: Fn(NexusStartContext, I) -> Fut + Send + Sync + 'static,
+        Fut: Future<
+                Output = Result<
+                    crate::nexus::NexusOperationResult<O>,
+                    crate::nexus::NexusHandlerError,
+                >,
+            > + Send
+            + 'static,
+    {
+        self.nexus_definitions
+            .register_operation(service, operation, handler);
+        self
+    }
+
+    /// Register a custom Nexus cancel handler. See
+    /// [`NexusServiceDefinitions::register_cancel_handler`](crate::nexus::NexusServiceDefinitions::register_cancel_handler).
+    pub fn register_nexus_cancel_handler<F, Fut>(
+        &mut self,
+        service: impl Into<String>,
+        operation: impl Into<String>,
+        handler: F,
+    ) -> &mut Self
+    where
+        F: Fn(NexusCancelContext) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<(), NexusHandlerError>> + Send + 'static,
+    {
+        self.nexus_definitions
+            .register_cancel_handler(service, operation, handler);
+        self
+    }
+
     #[doc(hidden)]
     pub fn to_core_options(
         &self,
@@ -439,6 +535,7 @@ pub struct Worker {
     common: CommonWorker,
     workflow_half: WorkflowHalf,
     activity_half: ActivityHalf,
+    nexus_half: NexusHalf,
 }
 
 struct CommonWorker {
@@ -472,6 +569,13 @@ struct ActivityHalf {
     /// Maps activity type to the function for executing activities of that type
     activities: ActivityDefinitions,
     task_tokens_to_cancels: HashMap<TaskToken, CancellationToken>,
+}
+
+#[derive(Default)]
+struct NexusHalf {
+    service_definitions: NexusServiceDefinitions,
+    /// Maps task token bytes to cancellation tokens for in-flight start operations.
+    in_flight_tokens: HashMap<Vec<u8>, CancellationToken>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -537,6 +641,7 @@ impl Worker {
             client_options,
             Default::default(),
             Default::default(),
+            Default::default(),
         )
     }
 
@@ -549,9 +654,10 @@ impl Worker {
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let acts = std::mem::take(&mut options.activities);
         let wfs = std::mem::take(&mut options.workflows);
+        let nexus = std::mem::take(&mut options.nexus_definitions);
         #[cfg(feature = "wasm-workflows")]
         let wasm_components = std::mem::take(&mut options.wasm_workflow_components);
-        let mut me = Self::new_from_core_definitions(worker, client_options, acts, wfs);
+        let mut me = Self::new_from_core_definitions(worker, client_options, acts, wfs, nexus);
         me.set_detect_nondeterministic_futures(options.detect_nondeterministic_futures);
         #[cfg(feature = "wasm-workflows")]
         me.workflow_half
@@ -565,6 +671,7 @@ impl Worker {
         client_options: ClientOptions,
         activities: ActivityDefinitions,
         workflows: WorkflowDefinitions,
+        nexus_definitions: NexusServiceDefinitions,
     ) -> Self {
         let data_converter = client_options.data_converter.clone();
         Self {
@@ -584,6 +691,10 @@ impl Worker {
             },
             activity_half: ActivityHalf {
                 activities,
+                ..Default::default()
+            },
+            nexus_half: NexusHalf {
+                service_definitions: nexus_definitions,
                 ..Default::default()
             },
         }
@@ -662,7 +773,7 @@ impl Worker {
     /// or may return early with an error in the event of some unresolvable problem.
     pub async fn run(&mut self) -> Result<(), anyhow::Error> {
         let shutdown_token = CancellationToken::new();
-        let (common, wf_half, act_half) = self.split_apart();
+        let (common, wf_half, act_half, nexus_half) = self.split_apart();
         let (wf_future_tx, wf_future_rx) =
             unbounded_channel::<WorkflowFutureHandle<TaskHandle<WorkflowResult<Payload>>>>();
         let (completions_tx, completions_rx) = unbounded_channel();
@@ -834,6 +945,25 @@ impl Worker {
                 };
                 Result::<_, anyhow::Error>::Ok(())
             },
+            // Poll nexus tasks only if handlers have been registered.
+            async {
+                if !nexus_half.service_definitions.is_empty() {
+                    loop {
+                        let task = common.worker.poll_nexus_task().await;
+                        if matches!(task, Err(PollError::ShutDown)) {
+                            break;
+                        }
+                        let task = task?;
+                        nexus_half.nexus_task_handler(
+                            common.worker.clone(),
+                            common.client_options.clone(),
+                            common.data_converter.clone(),
+                            task,
+                        );
+                    }
+                }
+                Result::<_, anyhow::Error>::Ok(())
+            },
             wf_completion_processor,
         )?;
 
@@ -883,11 +1013,19 @@ impl Worker {
         self.common.worker.clone()
     }
 
-    fn split_apart(&mut self) -> (&mut CommonWorker, &mut WorkflowHalf, &mut ActivityHalf) {
+    fn split_apart(
+        &mut self,
+    ) -> (
+        &mut CommonWorker,
+        &mut WorkflowHalf,
+        &mut ActivityHalf,
+        &mut NexusHalf,
+    ) {
         (
             &mut self.common,
             &mut self.workflow_half,
             &mut self.activity_half,
+            &mut self.nexus_half,
         )
     }
 }
@@ -1118,6 +1256,107 @@ impl ActivityHalf {
             }
         }
         Ok(())
+    }
+}
+
+impl NexusHalf {
+    fn nexus_task_handler(
+        &mut self,
+        worker: Arc<CoreWorker>,
+        client_options: ClientOptions,
+        dc: DataConverter,
+        task: temporalio_common::protos::coresdk::nexus::NexusTask,
+    ) {
+        use nexus_task::Variant;
+        match task.variant {
+            Some(Variant::Task(poll_resp)) => {
+                let task_token = poll_resp.task_token;
+                let deadline = task
+                    .request_deadline
+                    .and_then(|t| SystemTime::try_from(t).ok());
+                let Some(request) = poll_resp.request else {
+                    return;
+                };
+                let headers = request.header;
+                match request.variant {
+                    Some(nexus_request::Variant::StartOperation(start)) => {
+                        let Some(handler) = self
+                            .service_definitions
+                            .get_start(&start.service, &start.operation)
+                        else {
+                            let message = format!(
+                                "no handler registered for nexus operation {}/{}",
+                                start.service, start.operation
+                            );
+                            Self::spawn_completion(worker, task_token, async move {
+                                handler_error_status(NexusHandlerError::not_found(message))
+                            });
+                            return;
+                        };
+                        let ct = CancellationToken::new();
+                        self.in_flight_tokens.insert(task_token.clone(), ct.clone());
+                        let ctx = NexusStartContext::new(
+                            start.service,
+                            start.operation,
+                            start.request_id,
+                            headers,
+                            deadline,
+                            ct,
+                            worker.clone(),
+                            client_options,
+                        );
+                        let payload = start.payload;
+                        Self::spawn_completion(worker, task_token, async move {
+                            handler(ctx, payload, dc).await
+                        });
+                    }
+                    Some(nexus_request::Variant::CancelOperation(cancel)) => {
+                        let cancel_handler = self
+                            .service_definitions
+                            .get_cancel(&cancel.service, &cancel.operation);
+                        let ctx = NexusCancelContext::new(
+                            cancel.service,
+                            cancel.operation,
+                            cancel.operation_token,
+                            headers,
+                            deadline,
+                        );
+                        Self::spawn_completion(worker, task_token, async move {
+                            match cancel_handler {
+                                Some(h) => h(ctx).await,
+                                None => cancel_ok_status(),
+                            }
+                        });
+                    }
+                    None => {}
+                }
+            }
+            Some(Variant::CancelTask(cancel)) => {
+                if let Some(ct) = self.in_flight_tokens.remove(&cancel.task_token) {
+                    ct.cancel();
+                }
+            }
+            None => {}
+        }
+    }
+
+    /// Spawns a task that awaits the handler-produced status and reports it back to core.
+    fn spawn_completion<F>(worker: Arc<CoreWorker>, task_token: Vec<u8>, status_fut: F)
+    where
+        F: Future<Output = nexus_task_completion::Status> + Send + 'static,
+    {
+        tokio::spawn(async move {
+            let status = status_fut.await;
+            if let Err(e) = worker
+                .complete_nexus_task(NexusTaskCompletion {
+                    task_token,
+                    status: Some(status),
+                })
+                .await
+            {
+                warn!("Failed to complete nexus task: {e}");
+            }
+        });
     }
 }
 
