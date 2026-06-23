@@ -26,7 +26,7 @@ prost = { workspace = true }
 prost-types = { workspace = true }
 serde = { version = "1.0", features = ["derive"] }
 thiserror = "2"
-wit-bindgen = { version = "0.57.1", default-features = false, features = ["macros", "std", "realloc", "bitflags"] }
+wit-bindgen = { version = "0.58.0", default-features = false, features = ["macros", "std", "realloc", "bitflags"] }
 
 [dependencies.temporalio-common-wasm]
 path = "../common-wasm"
