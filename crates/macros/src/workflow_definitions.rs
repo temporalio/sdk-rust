@@ -1078,8 +1078,7 @@ impl WorkflowMethodsDefinition {
             })
             .collect();
 
-        // Generate dispatch_signal only if there are signals
-        let dispatch_signal_impl = if self.signals.is_empty() {
+        let decode_signal_impl = if self.signals.is_empty() {
             quote! {}
         } else {
             quote! {
@@ -1093,7 +1092,21 @@ impl WorkflowMethodsDefinition {
                         _ => Ok(::std::option::Option::None),
                     }
                 }
+            }
+        };
 
+        let dispatch_signal_impl = if self.signals.is_empty() {
+            quote! {
+                fn dispatch_signal(
+                    _ctx: ::temporalio_workflow::WorkflowContext<Self>,
+                    name: &str,
+                    _input: ::std::boxed::Box<dyn ::std::any::Any>,
+                ) -> ::temporalio_workflow::__private::futures_util::future::LocalBoxFuture<'static, Result<(), ::temporalio_workflow::workflows::WorkflowError>> {
+                    unreachable!("typed signal dispatch called for unknown signal handler '{name}'")
+                }
+            }
+        } else {
+            quote! {
                 fn dispatch_signal(
                     ctx: ::temporalio_workflow::WorkflowContext<Self>,
                     name: &str,
@@ -1101,7 +1114,7 @@ impl WorkflowMethodsDefinition {
                 ) -> ::temporalio_workflow::__private::futures_util::future::LocalBoxFuture<'static, Result<(), ::temporalio_workflow::workflows::WorkflowError>> {
                     match name {
                         #(#dispatch_signal_arms)*
-                        _ => panic!("typed signal dispatch called for unknown signal handler '{name}'"),
+                        _ => unreachable!("typed signal dispatch called for unknown signal handler '{name}'"),
                     }
                 }
             }
@@ -1197,8 +1210,7 @@ impl WorkflowMethodsDefinition {
             })
             .collect();
 
-        // Generate dispatch_update and validate_update only if there are updates
-        let dispatch_update_impl = if self.updates.is_empty() {
+        let decode_update_impl = if self.updates.is_empty() {
             quote! {}
         } else {
             quote! {
@@ -1212,7 +1224,31 @@ impl WorkflowMethodsDefinition {
                         _ => Ok(::std::option::Option::None),
                     }
                 }
+            }
+        };
 
+        let dispatch_update_impl = if self.updates.is_empty() {
+            quote! {
+                fn dispatch_update(
+                    _ctx: ::temporalio_workflow::WorkflowContext<Self>,
+                    name: &str,
+                    _input: ::std::boxed::Box<dyn ::std::any::Any>,
+                    _converter: &::temporalio_workflow::common::data_converters::PayloadConverter,
+                ) -> ::temporalio_workflow::__private::futures_util::future::LocalBoxFuture<'static, Result<::temporalio_workflow::common::protos::temporal::api::common::v1::Payload, ::temporalio_workflow::workflows::WorkflowError>> {
+                    unreachable!("typed update dispatch called for unknown update handler '{name}'")
+                }
+
+                fn validate_update(
+                    &self,
+                    _ctx: ::temporalio_workflow::WorkflowContextView,
+                    name: &str,
+                    _input: ::std::boxed::Box<dyn ::std::any::Any>,
+                ) -> Result<(), ::temporalio_workflow::workflows::WorkflowError> {
+                    unreachable!("typed update validation called for unknown update handler '{name}'")
+                }
+            }
+        } else {
+            quote! {
                 fn dispatch_update(
                     ctx: ::temporalio_workflow::WorkflowContext<Self>,
                     name: &str,
@@ -1221,7 +1257,7 @@ impl WorkflowMethodsDefinition {
                 ) -> ::temporalio_workflow::__private::futures_util::future::LocalBoxFuture<'static, Result<::temporalio_workflow::common::protos::temporal::api::common::v1::Payload, ::temporalio_workflow::workflows::WorkflowError>> {
                     match name {
                         #(#dispatch_update_arms)*
-                        _ => panic!("typed update dispatch called for unknown update handler '{name}'"),
+                        _ => unreachable!("typed update dispatch called for unknown update handler '{name}'"),
                     }
                 }
 
@@ -1233,7 +1269,7 @@ impl WorkflowMethodsDefinition {
                 ) -> Result<(), ::temporalio_workflow::workflows::WorkflowError> {
                     match name {
                         #(#validate_update_arms)*
-                        _ => panic!("typed update validation called for unknown update handler '{name}'"),
+                        _ => unreachable!("typed update validation called for unknown update handler '{name}'"),
                     }
                 }
             }
@@ -1293,8 +1329,7 @@ impl WorkflowMethodsDefinition {
             })
             .collect();
 
-        // Generate dispatch_query only if there are queries
-        let dispatch_query_impl = if self.queries.is_empty() {
+        let decode_query_impl = if self.queries.is_empty() {
             quote! {}
         } else {
             quote! {
@@ -1308,7 +1343,23 @@ impl WorkflowMethodsDefinition {
                         _ => Ok(::std::option::Option::None),
                     }
                 }
+            }
+        };
 
+        let dispatch_query_impl = if self.queries.is_empty() {
+            quote! {
+                fn dispatch_query(
+                    &self,
+                    _ctx: ::temporalio_workflow::WorkflowContextView,
+                    name: &str,
+                    _input: ::std::boxed::Box<dyn ::std::any::Any>,
+                    _converter: &::temporalio_workflow::common::data_converters::PayloadConverter,
+                ) -> Result<::temporalio_workflow::common::protos::temporal::api::common::v1::Payload, ::temporalio_workflow::workflows::WorkflowError> {
+                    unreachable!("typed query dispatch called for unknown query handler '{name}'")
+                }
+            }
+        } else {
+            quote! {
                 fn dispatch_query(
                     &self,
                     ctx: ::temporalio_workflow::WorkflowContextView,
@@ -1318,7 +1369,7 @@ impl WorkflowMethodsDefinition {
                 ) -> Result<::temporalio_workflow::common::protos::temporal::api::common::v1::Payload, ::temporalio_workflow::workflows::WorkflowError> {
                     match name {
                         #(#dispatch_query_arms)*
-                        _ => panic!("typed query dispatch called for unknown query handler '{name}'"),
+                        _ => unreachable!("typed query dispatch called for unknown query handler '{name}'"),
                     }
                 }
             }
@@ -1361,8 +1412,11 @@ impl WorkflowMethodsDefinition {
                 }
 
                 #dispatch_signal_impl
+                #decode_signal_impl
                 #dispatch_update_impl
+                #decode_update_impl
                 #dispatch_query_impl
+                #decode_query_impl
             }
         }
     }

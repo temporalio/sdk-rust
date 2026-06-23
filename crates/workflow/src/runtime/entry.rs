@@ -90,12 +90,10 @@ pub trait WorkflowImplementation: Sized + 'static {
 
     /// Dispatch a signal using an already decoded input value.
     fn dispatch_signal(
-        _ctx: WorkflowContext<Self>,
+        ctx: WorkflowContext<Self>,
         name: &str,
-        _input: Box<dyn Any>,
-    ) -> LocalBoxFuture<'static, Result<(), WorkflowError>> {
-        panic!("typed signal dispatch called for unknown signal handler '{name}'")
-    }
+        input: Box<dyn Any>,
+    ) -> LocalBoxFuture<'static, Result<(), WorkflowError>>;
 
     /// Decode a query's payloads into that query handler's concrete input type.
     fn decode_query_input(
@@ -109,13 +107,11 @@ pub trait WorkflowImplementation: Sized + 'static {
     /// Dispatch a query using an already decoded input value.
     fn dispatch_query(
         &self,
-        _ctx: WorkflowContextView,
+        ctx: WorkflowContextView,
         name: &str,
-        _input: Box<dyn Any>,
-        _converter: &PayloadConverter,
-    ) -> Result<Payload, WorkflowError> {
-        panic!("typed query dispatch called for unknown query handler '{name}'")
-    }
+        input: Box<dyn Any>,
+        converter: &PayloadConverter,
+    ) -> Result<Payload, WorkflowError>;
 
     /// Decode an update's payloads into that update handler's concrete input type.
     fn decode_update_input(
@@ -128,23 +124,19 @@ pub trait WorkflowImplementation: Sized + 'static {
 
     /// Dispatch an update using an already decoded input value.
     fn dispatch_update(
-        _ctx: WorkflowContext<Self>,
+        ctx: WorkflowContext<Self>,
         name: &str,
-        _input: Box<dyn Any>,
-        _converter: &PayloadConverter,
-    ) -> LocalBoxFuture<'static, Result<Payload, WorkflowError>> {
-        panic!("typed update dispatch called for unknown update handler '{name}'")
-    }
+        input: Box<dyn Any>,
+        converter: &PayloadConverter,
+    ) -> LocalBoxFuture<'static, Result<Payload, WorkflowError>>;
 
     /// Validate an update using an already decoded input value.
     fn validate_update(
         &self,
-        _ctx: WorkflowContextView,
+        ctx: WorkflowContextView,
         name: &str,
-        _input: Box<dyn Any>,
-    ) -> Result<(), WorkflowError> {
-        panic!("typed update validation called for unknown update handler '{name}'")
-    }
+        input: Box<dyn Any>,
+    ) -> Result<(), WorkflowError>;
 }
 
 /// Trait for executing synchronous signal handlers on a workflow.
