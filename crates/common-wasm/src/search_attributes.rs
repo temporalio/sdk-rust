@@ -8,7 +8,7 @@
 //! # Example
 //!
 //! ```
-//! use temporalio_common_wasm::search_attributes::SearchAttributeKey;
+//! use temporalio_common_wasm::search_attributes::{SearchAttributeKey, Timestamp};
 //!
 //! const MY_BOOL: SearchAttributeKey<bool> = SearchAttributeKey::bool("my_bool");
 //! const MY_KW: SearchAttributeKey<String> = SearchAttributeKey::keyword("my_keyword");
@@ -20,13 +20,10 @@
 use std::collections::HashMap;
 use std::marker::PhantomData;
 
-use prost_types::Timestamp;
-
 use crate::protos::temporal::api::common::v1::{
     Payload, SearchAttributes as ProtoSearchAttributes,
 };
 use crate::protos::temporal::api::enums::v1::IndexedValueType;
-use crate::protos::{ENCODING_PAYLOAD_KEY, JSON_ENCODING_VAL};
 
 /// Metadata key for the search attribute value type, matching Go SDK convention.
 const TYPE_METADATA_KEY: &str = "type";
@@ -51,6 +48,118 @@ pub enum SearchAttributeError {
 }
 
 // ---------------------------------------------------------------------------
+// SDK-owned Timestamp type
+// ---------------------------------------------------------------------------
+
+/// An SDK-owned timestamp for Datetime search attributes.
+///
+/// This type decouples the public API from `prost_types::Timestamp`. Conversion
+/// traits are provided for [`prost_types::Timestamp`] and
+/// [`std::time::SystemTime`].
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Timestamp {
+    /// Seconds since the Unix epoch (1970-01-01T00:00:00Z).
+    /// For times before the epoch, seconds is negative and `nanos` still
+    /// represents a non-negative offset within that second.
+    pub seconds: i64,
+    /// Non-negative fractions of a second at nanosecond resolution.
+    /// Must be in the range `[0, 999_999_999]` (following the protobuf
+    /// `google.protobuf.Timestamp` convention).
+    pub nanos: i32,
+}
+
+impl std::fmt::Display for Timestamp {
+    /// Formats the timestamp as an RFC3339 string (e.g., `2023-11-14T22:13:20.000000000Z`).
+    /// Falls back to `Debug` formatting if the timestamp is out of chrono's range.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match timestamp_to_rfc3339(self) {
+            Ok(s) => f.write_str(&s),
+            Err(_) => write!(f, "Timestamp({}, {})", self.seconds, self.nanos),
+        }
+    }
+}
+
+impl From<prost_types::Timestamp> for Timestamp {
+    fn from(ts: prost_types::Timestamp) -> Self {
+        Self {
+            seconds: ts.seconds,
+            nanos: ts.nanos,
+        }
+    }
+}
+
+impl From<Timestamp> for prost_types::Timestamp {
+    fn from(ts: Timestamp) -> Self {
+        prost_types::Timestamp {
+            seconds: ts.seconds,
+            nanos: ts.nanos,
+        }
+    }
+}
+
+impl From<std::time::SystemTime> for Timestamp {
+    fn from(st: std::time::SystemTime) -> Self {
+        match st.duration_since(std::time::UNIX_EPOCH) {
+            Ok(dur) => Self {
+                seconds: dur.as_secs() as i64,
+                nanos: dur.subsec_nanos() as i32,
+            },
+            Err(e) => {
+                // Normalize to protobuf convention: nanos always non-negative.
+                // Example: 1.25s before epoch → { seconds: -2, nanos: 750_000_000 }
+                let dur = e.duration();
+                let secs = dur.as_secs() as i64;
+                let nanos = dur.subsec_nanos();
+                if nanos == 0 {
+                    Self {
+                        seconds: -secs,
+                        nanos: 0,
+                    }
+                } else {
+                    Self {
+                        seconds: -(secs + 1),
+                        nanos: (1_000_000_000 - nanos) as i32,
+                    }
+                }
+            }
+        }
+    }
+}
+
+impl TryFrom<Timestamp> for std::time::SystemTime {
+    type Error = SearchAttributeError;
+
+    fn try_from(ts: Timestamp) -> Result<Self, Self::Error> {
+        let epoch = std::time::UNIX_EPOCH;
+        if ts.seconds >= 0 {
+            epoch
+                .checked_add(std::time::Duration::new(
+                    ts.seconds as u64,
+                    ts.nanos.max(0) as u32,
+                ))
+                .ok_or_else(|| {
+                    SearchAttributeError::InvalidTimestamp(
+                        "timestamp out of SystemTime range".into(),
+                    )
+                })
+        } else {
+            // Reverse the normalization: { seconds: -2, nanos: 750_000_000 }
+            // means 1.25s before epoch → Duration::new(1, 250_000_000)
+            let abs_secs = ts.seconds.unsigned_abs();
+            let nanos = ts.nanos.max(0) as u32;
+            let dur = if nanos == 0 {
+                std::time::Duration::new(abs_secs, 0)
+            } else {
+                std::time::Duration::new(abs_secs - 1, 1_000_000_000 - nanos)
+            };
+            epoch.checked_sub(dur).ok_or_else(|| {
+                SearchAttributeError::InvalidTimestamp("timestamp out of SystemTime range".into())
+            })
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // SearchAttributeValue trait
 // ---------------------------------------------------------------------------
 
@@ -60,14 +169,14 @@ mod private {
     impl Sealed for i64 {}
     impl Sealed for f64 {}
     impl Sealed for String {}
-    impl Sealed for prost_types::Timestamp {}
+    impl Sealed for super::Timestamp {}
     impl Sealed for Vec<String> {}
 }
 
 /// A value type that can be stored as a Temporal search attribute.
 ///
 /// This trait is sealed and implemented for: `bool`, `i64`, `f64`, `String`,
-/// [`prost_types::Timestamp`], and `Vec<String>`.
+/// [`Timestamp`], and `Vec<String>`.
 pub trait SearchAttributeValue: private::Sealed + Clone + Sized {
     /// Encode this value into a search attribute [`Payload`].
     fn to_search_attribute_payload(
@@ -82,6 +191,10 @@ pub trait SearchAttributeValue: private::Sealed + Clone + Sized {
     fn default_indexed_value_type() -> IndexedValueType;
 }
 
+// ---------------------------------------------------------------------------
+// Shared JSON payload helpers (reuses the SDK's JSON payload encoding conventions)
+// ---------------------------------------------------------------------------
+
 fn type_metadata_str(ivt: IndexedValueType) -> &'static str {
     match ivt {
         IndexedValueType::Bool => "Bool",
@@ -95,97 +208,107 @@ fn type_metadata_str(ivt: IndexedValueType) -> &'static str {
     }
 }
 
-fn build_payload(
-    json_bytes: Vec<u8>,
+/// Encode a serde-serializable value into a search attribute [`Payload`].
+///
+/// This mirrors the encoding used by the SDK's
+/// [`SerdeJsonPayloadConverter`][crate::data_converters], but adds the
+/// search-attribute `type` metadata key. By using the same `json/plain`
+/// encoding and metadata layout, payloads produced here are decode-compatible
+/// with the standard payload converter and vice-versa.
+fn encode_json_search_attr<T: serde::Serialize>(
+    value: &T,
     indexed_value_type: IndexedValueType,
-) -> Payload {
+) -> Result<Payload, SearchAttributeError> {
+    let data = serde_json::to_vec(value)?;
     let mut metadata = HashMap::with_capacity(2);
-    metadata.insert(
-        ENCODING_PAYLOAD_KEY.to_string(),
-        JSON_ENCODING_VAL.as_bytes().to_vec(),
-    );
+    metadata.insert("encoding".to_string(), b"json/plain".to_vec());
     metadata.insert(
         TYPE_METADATA_KEY.to_string(),
         type_metadata_str(indexed_value_type).as_bytes().to_vec(),
     );
-    Payload {
+    Ok(Payload {
         metadata,
-        data: json_bytes,
+        data,
         ..Default::default()
-    }
+    })
 }
 
-fn validate_encoding(payload: &Payload) -> Result<(), SearchAttributeError> {
-    let encoding = payload.metadata.get(ENCODING_PAYLOAD_KEY).ok_or_else(|| {
-        SearchAttributeError::InvalidPayload {
-            reason: "missing encoding metadata".into(),
-        }
-    })?;
-    if encoding.as_slice() != JSON_ENCODING_VAL.as_bytes() {
+/// Decode a search attribute [`Payload`] back into a concrete type.
+///
+/// Validates the `json/plain` encoding metadata (matching the standard payload
+/// converter expectation) before attempting JSON deserialization.
+fn decode_json_search_attr<T: serde::de::DeserializeOwned>(
+    payload: &Payload,
+) -> Result<T, SearchAttributeError> {
+    let encoding =
+        payload
+            .metadata
+            .get("encoding")
+            .ok_or_else(|| SearchAttributeError::InvalidPayload {
+                reason: "missing encoding metadata".into(),
+            })?;
+    if encoding.as_slice() != b"json/plain" {
         return Err(SearchAttributeError::InvalidPayload {
             reason: format!(
-                "expected encoding '{}', got '{}'",
-                JSON_ENCODING_VAL,
+                "expected encoding 'json/plain', got '{}'",
                 String::from_utf8_lossy(encoding)
             ),
         });
     }
-    Ok(())
+    Ok(serde_json::from_slice(&payload.data)?)
 }
 
-// --- bool ---
+// ---------------------------------------------------------------------------
+// Macro for simple (serde-native) SearchAttributeValue impls
+// ---------------------------------------------------------------------------
 
-impl SearchAttributeValue for bool {
-    fn to_search_attribute_payload(
-        &self,
-        indexed_value_type: IndexedValueType,
-    ) -> Result<Payload, SearchAttributeError> {
-        Ok(build_payload(serde_json::to_vec(self)?, indexed_value_type))
-    }
+/// Implements [`SearchAttributeValue`] for types that are directly
+/// serde-serializable as their JSON wire representation (no special conversion).
+macro_rules! impl_simple_search_attribute_value {
+    ($ty:ty, $ivt:expr) => {
+        impl SearchAttributeValue for $ty {
+            fn to_search_attribute_payload(
+                &self,
+                indexed_value_type: IndexedValueType,
+            ) -> Result<Payload, SearchAttributeError> {
+                encode_json_search_attr(self, indexed_value_type)
+            }
 
-    fn from_search_attribute_payload(payload: &Payload) -> Result<Self, SearchAttributeError> {
-        validate_encoding(payload)?;
-        Ok(serde_json::from_slice(&payload.data)?)
-    }
+            fn from_search_attribute_payload(
+                payload: &Payload,
+            ) -> Result<Self, SearchAttributeError> {
+                decode_json_search_attr(payload)
+            }
 
-    fn default_indexed_value_type() -> IndexedValueType {
-        IndexedValueType::Bool
-    }
+            fn default_indexed_value_type() -> IndexedValueType {
+                $ivt
+            }
+        }
+    };
 }
 
-// --- i64 ---
+impl_simple_search_attribute_value!(bool, IndexedValueType::Bool);
+impl_simple_search_attribute_value!(i64, IndexedValueType::Int);
+impl_simple_search_attribute_value!(String, IndexedValueType::Keyword);
+impl_simple_search_attribute_value!(Vec<String>, IndexedValueType::KeywordList);
 
-impl SearchAttributeValue for i64 {
-    fn to_search_attribute_payload(
-        &self,
-        indexed_value_type: IndexedValueType,
-    ) -> Result<Payload, SearchAttributeError> {
-        Ok(build_payload(serde_json::to_vec(self)?, indexed_value_type))
-    }
-
-    fn from_search_attribute_payload(payload: &Payload) -> Result<Self, SearchAttributeError> {
-        validate_encoding(payload)?;
-        Ok(serde_json::from_slice(&payload.data)?)
-    }
-
-    fn default_indexed_value_type() -> IndexedValueType {
-        IndexedValueType::Int
-    }
-}
-
-// --- f64 ---
-
+// f64 requires a manual impl to reject NaN and Infinity, which serde_json
+// silently serializes as `null` rather than returning an error.
 impl SearchAttributeValue for f64 {
     fn to_search_attribute_payload(
         &self,
         indexed_value_type: IndexedValueType,
     ) -> Result<Payload, SearchAttributeError> {
-        Ok(build_payload(serde_json::to_vec(self)?, indexed_value_type))
+        if !self.is_finite() {
+            return Err(SearchAttributeError::InvalidPayload {
+                reason: format!("f64 search attribute value must be finite, got {}", self),
+            });
+        }
+        encode_json_search_attr(self, indexed_value_type)
     }
 
     fn from_search_attribute_payload(payload: &Payload) -> Result<Self, SearchAttributeError> {
-        validate_encoding(payload)?;
-        Ok(serde_json::from_slice(&payload.data)?)
+        decode_json_search_attr(payload)
     }
 
     fn default_indexed_value_type() -> IndexedValueType {
@@ -193,116 +316,36 @@ impl SearchAttributeValue for f64 {
     }
 }
 
-// --- String ---
+// ---------------------------------------------------------------------------
+// Timestamp SearchAttributeValue impl (RFC3339 string on the wire)
+// ---------------------------------------------------------------------------
 
-impl SearchAttributeValue for String {
-    fn to_search_attribute_payload(
-        &self,
-        indexed_value_type: IndexedValueType,
-    ) -> Result<Payload, SearchAttributeError> {
-        Ok(build_payload(serde_json::to_vec(self)?, indexed_value_type))
-    }
+/// Format a [`Timestamp`] as an RFC3339 string using `chrono`.
+fn timestamp_to_rfc3339(ts: &Timestamp) -> Result<String, SearchAttributeError> {
+    use chrono::{DateTime, Utc};
 
-    fn from_search_attribute_payload(payload: &Payload) -> Result<Self, SearchAttributeError> {
-        validate_encoding(payload)?;
-        Ok(serde_json::from_slice(&payload.data)?)
-    }
-
-    fn default_indexed_value_type() -> IndexedValueType {
-        IndexedValueType::Keyword
-    }
+    let nanos = u32::try_from(ts.nanos.max(0)).unwrap_or(0);
+    let dt = DateTime::<Utc>::from_timestamp(ts.seconds, nanos).ok_or_else(|| {
+        SearchAttributeError::InvalidTimestamp(format!(
+            "cannot represent seconds={} nanos={} as DateTime",
+            ts.seconds, ts.nanos
+        ))
+    })?;
+    Ok(dt.to_rfc3339_opts(chrono::SecondsFormat::Nanos, true))
 }
 
-// --- Timestamp ---
-// Temporal wire format expects RFC3339 strings for Datetime search attributes.
-
-fn timestamp_to_rfc3339(ts: &Timestamp) -> String {
-    use std::fmt::Write;
-
-    let total_secs = ts.seconds;
-    // 86400 seconds per day, epoch is 1970-01-01
-    let (days_from_epoch, day_secs) = {
-        let mut d = total_secs.div_euclid(86400);
-        let mut s = total_secs.rem_euclid(86400);
-        if s < 0 {
-            s += 86400;
-            d -= 1;
-        }
-        (d, s as u64)
-    };
-
-    let hours = day_secs / 3600;
-    let minutes = (day_secs % 3600) / 60;
-    let seconds = day_secs % 60;
-
-    // Civil date from days since epoch using a well-known algorithm
-    let z = days_from_epoch + 719468;
-    let era = z.div_euclid(146097);
-    let doe = z.rem_euclid(146097) as u64;
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
-    let y = (yoe as i64) + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    let y = if m <= 2 { y + 1 } else { y };
-
-    let nanos = ts.nanos.max(0) as u32;
-    let mut buf = String::with_capacity(30);
-    if nanos == 0 {
-        write!(buf, "{y:04}-{m:02}-{d:02}T{hours:02}:{minutes:02}:{seconds:02}Z").unwrap();
-    } else {
-        write!(
-            buf,
-            "{y:04}-{m:02}-{d:02}T{hours:02}:{minutes:02}:{seconds:02}.{nanos:09}Z"
-        )
-        .unwrap();
-    }
-    buf
-}
-
+/// Parse an RFC3339 string into a [`Timestamp`] using `chrono`.
 fn rfc3339_to_timestamp(s: &str) -> Result<Timestamp, SearchAttributeError> {
+    use chrono::DateTime;
+
     let s = s.trim_matches('"');
-
-    let parse_err = |msg: &str| SearchAttributeError::InvalidTimestamp(msg.to_string());
-
-    if s.len() < 20 {
-        return Err(parse_err("string too short for RFC3339"));
-    }
-
-    let year: i64 = s[0..4].parse().map_err(|_| parse_err("invalid year"))?;
-    let month: u64 = s[5..7].parse().map_err(|_| parse_err("invalid month"))?;
-    let day: u64 = s[8..10].parse().map_err(|_| parse_err("invalid day"))?;
-    let hour: u64 = s[11..13].parse().map_err(|_| parse_err("invalid hour"))?;
-    let min: u64 = s[14..16].parse().map_err(|_| parse_err("invalid minute"))?;
-    let sec: u64 = s[17..19].parse().map_err(|_| parse_err("invalid second"))?;
-
-    // Parse optional fractional seconds
-    let nanos: i32 = if s.len() > 20 && s.as_bytes()[19] == b'.' {
-        let frac_end = s[20..]
-            .find(|c: char| c == 'Z' || c == '+' || c == '-')
-            .unwrap_or(s.len() - 20);
-        let frac_str = &s[20..20 + frac_end];
-        let padded = format!("{frac_str:0<9}");
-        padded[..9]
-            .parse()
-            .map_err(|_| parse_err("invalid fractional seconds"))?
-    } else {
-        0
-    };
-
-    // Convert civil date to days since epoch
-    let y = if month <= 2 { year - 1 } else { year };
-    let m = if month <= 2 { month + 9 } else { month - 3 };
-    let era = y.div_euclid(400);
-    let yoe = y.rem_euclid(400) as u64;
-    let doy = (153 * m + 2) / 5 + day - 1;
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    let days = era * 146097 + doe as i64 - 719468;
-
-    let seconds = days * 86400 + (hour * 3600 + min * 60 + sec) as i64;
-
-    Ok(Timestamp { seconds, nanos })
+    let dt = DateTime::parse_from_rfc3339(s).map_err(|e| {
+        SearchAttributeError::InvalidTimestamp(format!("failed to parse RFC3339 '{}': {}", s, e))
+    })?;
+    Ok(Timestamp {
+        seconds: dt.timestamp(),
+        nanos: dt.timestamp_subsec_nanos() as i32,
+    })
 }
 
 impl SearchAttributeValue for Timestamp {
@@ -310,41 +353,17 @@ impl SearchAttributeValue for Timestamp {
         &self,
         indexed_value_type: IndexedValueType,
     ) -> Result<Payload, SearchAttributeError> {
-        let rfc3339 = timestamp_to_rfc3339(self);
-        Ok(build_payload(
-            serde_json::to_vec(&rfc3339)?,
-            indexed_value_type,
-        ))
+        let rfc3339 = timestamp_to_rfc3339(self)?;
+        encode_json_search_attr(&rfc3339, indexed_value_type)
     }
 
     fn from_search_attribute_payload(payload: &Payload) -> Result<Self, SearchAttributeError> {
-        validate_encoding(payload)?;
-        let s: String = serde_json::from_slice(&payload.data)?;
+        let s: String = decode_json_search_attr(payload)?;
         rfc3339_to_timestamp(&s)
     }
 
     fn default_indexed_value_type() -> IndexedValueType {
         IndexedValueType::Datetime
-    }
-}
-
-// --- Vec<String> ---
-
-impl SearchAttributeValue for Vec<String> {
-    fn to_search_attribute_payload(
-        &self,
-        indexed_value_type: IndexedValueType,
-    ) -> Result<Payload, SearchAttributeError> {
-        Ok(build_payload(serde_json::to_vec(self)?, indexed_value_type))
-    }
-
-    fn from_search_attribute_payload(payload: &Payload) -> Result<Self, SearchAttributeError> {
-        validate_encoding(payload)?;
-        Ok(serde_json::from_slice(&payload.data)?)
-    }
-
-    fn default_indexed_value_type() -> IndexedValueType {
-        IndexedValueType::KeywordList
     }
 }
 
@@ -355,7 +374,15 @@ impl SearchAttributeValue for Vec<String> {
 /// A typed handle for a named search attribute, carrying its value type at the
 /// type level. Construct via the const factory methods such as
 /// [`SearchAttributeKey::bool`], [`SearchAttributeKey::keyword`], etc.
-#[derive(Debug, Clone)]
+///
+/// Key names must be `&'static str`, which enables compile-time construction
+/// via `const` but means runtime-determined key names are not supported.
+/// Define keys as constants:
+///
+/// ```rust,ignore
+/// const MY_KEY: SearchAttributeKey<String> = SearchAttributeKey::keyword("my_attr");
+/// ```
+#[derive(Debug, Clone, Copy)]
 pub struct SearchAttributeKey<T: SearchAttributeValue> {
     name: &'static str,
     indexed_value_type: IndexedValueType,
@@ -374,14 +401,26 @@ impl<T: SearchAttributeValue> SearchAttributeKey<T> {
     }
 
     /// Create a [`SearchAttributeUpdate`] that sets the attribute to the given value.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the value cannot be serialized to JSON. This can happen for
+    /// `f64` values that are `NaN` or `Infinity` (which are not valid JSON),
+    /// or for `Timestamp` values with out-of-range seconds. Use
+    /// [`try_value_set`](Self::try_value_set) for a fallible alternative.
     pub fn value_set(&self, val: T) -> SearchAttributeUpdate {
-        let payload = val
-            .to_search_attribute_payload(self.indexed_value_type)
-            .expect("search attribute serialization should not fail for supported types");
-        SearchAttributeUpdate {
+        self.try_value_set(val)
+            .expect("search attribute serialization failed (use try_value_set for non-finite f64 or out-of-range timestamps)")
+    }
+
+    /// Fallible version of [`value_set`](Self::value_set). Returns an error
+    /// instead of panicking if the value cannot be serialized.
+    pub fn try_value_set(&self, val: T) -> Result<SearchAttributeUpdate, SearchAttributeError> {
+        let payload = val.to_search_attribute_payload(self.indexed_value_type)?;
+        Ok(SearchAttributeUpdate {
             name: self.name.to_string(),
             payload: Some(payload),
-        }
+        })
     }
 
     /// Create a [`SearchAttributeUpdate`] that removes this attribute.
@@ -529,6 +568,19 @@ impl TypedSearchAttributes {
         T::from_search_attribute_payload(payload).ok()
     }
 
+    /// Retrieve a typed value, distinguishing "key absent" from "deserialization
+    /// failed". Returns `Ok(None)` if the key is absent, `Ok(Some(val))` on
+    /// success, or `Err` if the payload is present but cannot be deserialized.
+    pub fn try_get<T: SearchAttributeValue>(
+        &self,
+        key: &SearchAttributeKey<T>,
+    ) -> Result<Option<T>, SearchAttributeError> {
+        match self.fields.get(key.name()) {
+            None => Ok(None),
+            Some(payload) => T::from_search_attribute_payload(payload).map(Some),
+        }
+    }
+
     /// Returns `true` if a payload exists for the given key.
     pub fn contains_key<T: SearchAttributeValue>(&self, key: &SearchAttributeKey<T>) -> bool {
         self.fields.contains_key(key.name())
@@ -544,10 +596,30 @@ impl TypedSearchAttributes {
         self.fields.len()
     }
 
+    /// Returns an iterator over the attribute names in this collection.
+    pub fn keys(&self) -> impl Iterator<Item = &str> {
+        self.fields.keys().map(|s| s.as_str())
+    }
+
+    /// Returns a reference to the raw payload for the given attribute name,
+    /// if present. This is useful for advanced use cases such as forwarding
+    /// payloads without deserializing them.
+    pub fn raw_payload(&self, name: &str) -> Option<&Payload> {
+        self.fields.get(name)
+    }
+
     /// Convert to the proto wire representation.
     pub fn to_proto(&self) -> ProtoSearchAttributes {
         ProtoSearchAttributes {
             indexed_fields: self.fields.clone(),
+        }
+    }
+
+    /// Convert to the proto wire representation, consuming `self` to avoid
+    /// cloning.
+    pub fn into_proto(self) -> ProtoSearchAttributes {
+        ProtoSearchAttributes {
+            indexed_fields: self.fields,
         }
     }
 
@@ -592,8 +664,8 @@ mod tests {
 
     fn assert_payload_metadata(payload: &Payload, expected_type: &str) {
         assert_eq!(
-            payload.metadata.get(ENCODING_PAYLOAD_KEY).unwrap(),
-            JSON_ENCODING_VAL.as_bytes()
+            payload.metadata.get("encoding").unwrap(),
+            b"json/plain".as_slice()
         );
         assert_eq!(
             payload.metadata.get(TYPE_METADATA_KEY).unwrap(),
@@ -608,10 +680,7 @@ mod tests {
             .to_search_attribute_payload(IndexedValueType::Bool)
             .unwrap();
         assert_payload_metadata(&payload, "Bool");
-        assert_eq!(
-            bool::from_search_attribute_payload(&payload).unwrap(),
-            true
-        );
+        assert_eq!(bool::from_search_attribute_payload(&payload).unwrap(), true);
     }
 
     #[test]
@@ -739,10 +808,7 @@ mod tests {
 
     #[test]
     fn to_proto_from_proto_round_trip() {
-        let attrs = TypedSearchAttributes::new([
-            BOOL_KEY.value_set(false),
-            INT_KEY.value_set(7),
-        ]);
+        let attrs = TypedSearchAttributes::new([BOOL_KEY.value_set(false), INT_KEY.value_set(7)]);
 
         let proto = attrs.to_proto();
         assert_eq!(proto.indexed_fields.len(), 2);
@@ -754,10 +820,7 @@ mod tests {
 
     #[test]
     fn value_unset_removes_entry() {
-        let attrs = TypedSearchAttributes::new([
-            BOOL_KEY.value_set(true),
-            BOOL_KEY.value_unset(),
-        ]);
+        let attrs = TypedSearchAttributes::new([BOOL_KEY.value_set(true), BOOL_KEY.value_unset()]);
         assert!(attrs.is_empty());
         assert_eq!(attrs.get(&BOOL_KEY), None);
     }
@@ -800,8 +863,10 @@ mod tests {
 
     #[test]
     fn updates_to_proto_includes_empty_payload_for_unset() {
-        let proto =
-            TypedSearchAttributes::updates_to_proto([BOOL_KEY.value_set(true), INT_KEY.value_unset()]);
+        let proto = TypedSearchAttributes::updates_to_proto([
+            BOOL_KEY.value_set(true),
+            INT_KEY.value_unset(),
+        ]);
 
         let bool_payload = proto.indexed_fields.get("my_bool").unwrap();
         assert!(!bool_payload.data.is_empty());
@@ -823,8 +888,9 @@ mod tests {
             seconds: 1_700_000_000,
             nanos: 0,
         };
-        let rfc = timestamp_to_rfc3339(&ts);
-        assert_eq!(rfc, "2023-11-14T22:13:20Z");
+        let rfc = timestamp_to_rfc3339(&ts).unwrap();
+        // SecondsFormat::Nanos emits full precision even for zero nanos
+        assert_eq!(rfc, "2023-11-14T22:13:20.000000000Z");
     }
 
     #[test]
@@ -833,7 +899,7 @@ mod tests {
             seconds: 1_700_000_000,
             nanos: 500_000_000,
         };
-        let rfc = timestamp_to_rfc3339(&ts);
+        let rfc = timestamp_to_rfc3339(&ts).unwrap();
         assert_eq!(rfc, "2023-11-14T22:13:20.500000000Z");
 
         let parsed = rfc3339_to_timestamp(&rfc).unwrap();
@@ -850,5 +916,193 @@ mod tests {
         let unset = BOOL_KEY.value_unset();
         assert_eq!(unset.name(), "my_bool");
         assert!(unset.is_unset());
+    }
+
+    #[test]
+    fn timestamp_from_prost_types() {
+        let prost_ts = prost_types::Timestamp {
+            seconds: 1_000_000,
+            nanos: 42,
+        };
+        let ts: Timestamp = prost_ts.into();
+        assert_eq!(ts.seconds, 1_000_000);
+        assert_eq!(ts.nanos, 42);
+
+        let back: prost_types::Timestamp = ts.into();
+        assert_eq!(back.seconds, 1_000_000);
+        assert_eq!(back.nanos, 42);
+    }
+
+    #[test]
+    fn timestamp_from_system_time() {
+        let st = std::time::UNIX_EPOCH + std::time::Duration::new(1_700_000_000, 123_456_789);
+        let ts: Timestamp = st.into();
+        assert_eq!(ts.seconds, 1_700_000_000);
+        assert_eq!(ts.nanos, 123_456_789);
+
+        let back: std::time::SystemTime = ts.try_into().unwrap();
+        assert_eq!(back, st);
+    }
+
+    // --- Edge-case tests (from review feedback) ---
+
+    #[test]
+    fn timestamp_pre_epoch_normalized() {
+        // 1.25 seconds before epoch → { seconds: -2, nanos: 750_000_000 }
+        let st = std::time::UNIX_EPOCH - std::time::Duration::new(1, 250_000_000);
+        let ts: Timestamp = st.into();
+        assert_eq!(ts.seconds, -2);
+        assert_eq!(ts.nanos, 750_000_000);
+
+        let back: std::time::SystemTime = ts.try_into().unwrap();
+        assert_eq!(back, st);
+    }
+
+    #[test]
+    fn timestamp_pre_epoch_exact_second() {
+        // Exactly 5 seconds before epoch
+        let st = std::time::UNIX_EPOCH - std::time::Duration::new(5, 0);
+        let ts: Timestamp = st.into();
+        assert_eq!(ts.seconds, -5);
+        assert_eq!(ts.nanos, 0);
+
+        let back: std::time::SystemTime = ts.try_into().unwrap();
+        assert_eq!(back, st);
+    }
+
+    #[test]
+    fn timestamp_pre_epoch_rfc3339_round_trip() {
+        let ts = Timestamp {
+            seconds: -2,
+            nanos: 750_000_000,
+        };
+        let payload = ts
+            .to_search_attribute_payload(IndexedValueType::Datetime)
+            .unwrap();
+        let decoded = Timestamp::from_search_attribute_payload(&payload).unwrap();
+        assert_eq!(decoded.seconds, ts.seconds);
+        assert_eq!(decoded.nanos, ts.nanos);
+    }
+
+    #[test]
+    #[should_panic(expected = "search attribute serialization failed")]
+    fn value_set_panics_on_nan() {
+        FLOAT_KEY.value_set(f64::NAN);
+    }
+
+    #[test]
+    #[should_panic(expected = "search attribute serialization failed")]
+    fn value_set_panics_on_infinity() {
+        FLOAT_KEY.value_set(f64::INFINITY);
+    }
+
+    #[test]
+    fn try_value_set_returns_error_on_nan() {
+        let result = FLOAT_KEY.try_value_set(f64::NAN);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn try_value_set_returns_error_on_infinity() {
+        let result = FLOAT_KEY.try_value_set(f64::INFINITY);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn round_trip_empty_string() {
+        let val = String::new();
+        let payload = val
+            .to_search_attribute_payload(IndexedValueType::Keyword)
+            .unwrap();
+        assert_eq!(String::from_search_attribute_payload(&payload).unwrap(), "");
+    }
+
+    #[test]
+    fn round_trip_empty_keyword_list() {
+        let val: Vec<String> = vec![];
+        let payload = val
+            .to_search_attribute_payload(IndexedValueType::KeywordList)
+            .unwrap();
+        assert_eq!(
+            Vec::<String>::from_search_attribute_payload(&payload).unwrap(),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn round_trip_large_int_boundaries() {
+        for val in [i64::MAX, i64::MIN, 0i64] {
+            let payload = val
+                .to_search_attribute_payload(IndexedValueType::Int)
+                .unwrap();
+            assert_eq!(i64::from_search_attribute_payload(&payload).unwrap(), val);
+        }
+    }
+
+    #[test]
+    fn decode_missing_encoding_metadata() {
+        let payload = Payload {
+            metadata: HashMap::new(),
+            data: b"true".to_vec(),
+            ..Default::default()
+        };
+        let result = bool::from_search_attribute_payload(&payload);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn decode_wrong_encoding_metadata() {
+        let mut metadata = HashMap::new();
+        metadata.insert("encoding".to_string(), b"binary/plain".to_vec());
+        let payload = Payload {
+            metadata,
+            data: b"true".to_vec(),
+            ..Default::default()
+        };
+        let result = bool::from_search_attribute_payload(&payload);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn decode_garbage_json_data() {
+        let mut metadata = HashMap::new();
+        metadata.insert("encoding".to_string(), b"json/plain".to_vec());
+        let payload = Payload {
+            metadata,
+            data: b"not-valid-json!!!".to_vec(),
+            ..Default::default()
+        };
+        let result = bool::from_search_attribute_payload(&payload);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn keys_returns_attribute_names() {
+        let attrs = TypedSearchAttributes::new([BOOL_KEY.value_set(true), INT_KEY.value_set(42)]);
+        let mut keys: Vec<&str> = attrs.keys().collect();
+        keys.sort();
+        assert_eq!(keys, vec!["my_bool", "my_int"]);
+    }
+
+    #[test]
+    fn raw_payload_returns_payload() {
+        let attrs = TypedSearchAttributes::new([BOOL_KEY.value_set(true)]);
+        let payload = attrs.raw_payload("my_bool").unwrap();
+        assert!(!payload.data.is_empty());
+        assert!(attrs.raw_payload("nonexistent").is_none());
+    }
+
+    #[test]
+    fn into_proto_moves_without_clone() {
+        let attrs = TypedSearchAttributes::new([INT_KEY.value_set(7)]);
+        let proto = attrs.into_proto();
+        assert_eq!(proto.indexed_fields.len(), 1);
+    }
+
+    #[test]
+    fn search_attribute_key_is_copy() {
+        let key = BOOL_KEY;
+        let key2 = key; // Copy, not move
+        assert_eq!(key.name(), key2.name());
     }
 }

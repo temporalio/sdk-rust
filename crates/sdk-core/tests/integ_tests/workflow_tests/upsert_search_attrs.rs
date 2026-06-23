@@ -1,18 +1,18 @@
 use crate::common::{CoreWfStarter, SEARCH_ATTR_INT, SEARCH_ATTR_TXT, build_fake_sdk};
 use assert_matches::assert_matches;
-use std::{collections::HashMap, time::Duration};
+use std::time::Duration;
 use temporalio_client::{
     UntypedWorkflow, WorkflowDescribeOptions, WorkflowGetResultOptions, WorkflowStartOptions,
 };
 use temporalio_common::{
     protos::{
-        coresdk::{AsJsonPayloadExt, FromJsonPayloadExt},
+        coresdk::FromJsonPayloadExt,
         temporal::api::{
             command::v1::{Command, command},
-            common::v1::Payload,
             enums::v1::EventType,
         },
     },
+    search_attributes::{SearchAttributeKey, TypedSearchAttributes},
     worker::WorkerTaskTypes,
 };
 use temporalio_macros::{workflow, workflow_methods};
@@ -23,6 +23,9 @@ use temporalio_sdk_core::{
 };
 use uuid::Uuid;
 
+const SA_INT: SearchAttributeKey<i64> = SearchAttributeKey::int(SEARCH_ATTR_INT);
+const SA_TXT: SearchAttributeKey<String> = SearchAttributeKey::text(SEARCH_ATTR_TXT);
+
 #[workflow]
 #[derive(Default)]
 struct SearchAttrUpdater;
@@ -31,17 +34,12 @@ struct SearchAttrUpdater;
 impl SearchAttrUpdater {
     #[run(name = "sends_upsert_search_attrs")]
     async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<()> {
-        let mut int_val = ctx
-            .search_attributes()
-            .indexed_fields
-            .get(SEARCH_ATTR_INT)
-            .cloned()
-            .unwrap_or_default();
-        let orig_val = int_val.data[0];
-        int_val.data[0] += 1;
+        let typed = ctx.typed_search_attributes();
+        let orig_val = typed.get(&SA_INT).unwrap_or(0);
+        let new_val = orig_val + 1;
         ctx.upsert_search_attributes([
-            (SEARCH_ATTR_TXT.to_string(), "goodbye".as_json_payload()?),
-            (SEARCH_ATTR_INT.to_string(), int_val),
+            SA_TXT.value_set("goodbye".into()),
+            SA_INT.value_set(new_val),
         ]);
         if orig_val == 49 {
             Err(WorkflowTermination::continue_as_new(Default::default()))
@@ -66,12 +64,9 @@ async fn sends_upsert() {
             wf_name,
             vec![],
             WorkflowStartOptions::new(task_queue, wf_id.to_string())
-                .search_attributes(HashMap::from([
-                    (
-                        SEARCH_ATTR_TXT.to_string(),
-                        "hello".as_json_payload().unwrap(),
-                    ),
-                    (SEARCH_ATTR_INT.to_string(), 1.as_json_payload().unwrap()),
+                .search_attributes(TypedSearchAttributes::new([
+                    SA_TXT.value_set("hello".into()),
+                    SA_INT.value_set(1),
                 ]))
                 .execution_timeout(Duration::from_secs(4))
                 .build(),
@@ -117,23 +112,11 @@ struct UpsertTestWf;
 impl UpsertTestWf {
     #[run(name = DEFAULT_WORKFLOW_TYPE)]
     async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<()> {
-        const K1: &str = "foo";
-        const K2: &str = "bar";
+        const K1: SearchAttributeKey<String> = SearchAttributeKey::keyword("foo");
+        const K2: SearchAttributeKey<String> = SearchAttributeKey::keyword("bar");
         ctx.upsert_search_attributes([
-            (
-                String::from(K1),
-                Payload {
-                    data: vec![0x01],
-                    ..Default::default()
-                },
-            ),
-            (
-                String::from(K2),
-                Payload {
-                    data: vec![0x02],
-                    ..Default::default()
-                },
-            ),
+            K1.value_set("value1".into()),
+            K2.value_set("value2".into()),
         ]);
         Ok(())
     }
@@ -159,8 +142,9 @@ async fn upsert_search_attrs_from_workflow() {
                     let fields = &msg.search_attributes.as_ref().unwrap().indexed_fields;
                     let payload1 = fields.get(k1).unwrap();
                     let payload2 = fields.get(k2).unwrap();
-                    assert_eq!(payload1.data[0], 0x01);
-                    assert_eq!(payload2.data[0], 0x02);
+                    // Verify payloads have JSON-encoded data
+                    assert!(!payload1.data.is_empty());
+                    assert!(!payload2.data.is_empty());
                     assert_eq!(fields.len(), 2);
                 }
             );

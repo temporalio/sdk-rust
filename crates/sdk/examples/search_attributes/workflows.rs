@@ -20,7 +20,7 @@ impl SearchAttributesWorkflow {
             .get(&KEYWORD_FIELD)
             .unwrap_or_default();
 
-        ctx.upsert_typed_search_attributes([
+        ctx.upsert_search_attributes([
             KEYWORD_FIELD.value_set("updated-value".into()),
             INT_FIELD.value_set(42),
         ]);

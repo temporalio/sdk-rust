@@ -1,19 +1,15 @@
 use crate::common::{CoreWfStarter, SEARCH_ATTR_TXT, build_fake_sdk};
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{sync::Arc, time::Duration};
 use temporalio_client::WorkflowStartOptions;
 use temporalio_common::{
-    protos::{
-        coresdk::AsJsonPayloadExt,
-        temporal::api::{
-            command::v1::command::Attributes,
-            common::v1::SearchAttributes,
-            enums::v1::{
-                CommandType,
-                ContinueAsNewVersioningBehavior as ProtoContinueAsNewVersioningBehavior,
-            },
-            history::v1::history_event,
+    protos::temporal::api::{
+        command::v1::command::Attributes,
+        enums::v1::{
+            CommandType, ContinueAsNewVersioningBehavior as ProtoContinueAsNewVersioningBehavior,
         },
+        history::v1::history_event,
     },
+    search_attributes::{SearchAttributeKey, TypedSearchAttributes},
     worker::WorkerTaskTypes,
 };
 use temporalio_macros::{workflow, workflow_methods};
@@ -24,6 +20,8 @@ use temporalio_sdk_core::{
     test_help::MockPollCfg,
 };
 use temporalio_workflow::runtime::types::ContinueAsNewRequest;
+
+const SA_TXT: SearchAttributeKey<String> = SearchAttributeKey::text(SEARCH_ATTR_TXT);
 
 #[workflow]
 #[derive(Default)]
@@ -183,7 +181,7 @@ impl ClearSearchAttrsOnContinueAsNewWf {
     async fn run(ctx: &mut WorkflowContext<Self>, first_run: bool) -> WorkflowResult<()> {
         if first_run {
             let mut opts = ContinueAsNewOptions::default();
-            opts.search_attributes = Some(SearchAttributes::default());
+            opts.search_attributes = Some(TypedSearchAttributes::default());
             ctx.continue_as_new(&false, opts)?;
         }
 
@@ -208,10 +206,9 @@ async fn clear_search_attributes_on_continue_as_new() {
             ClearSearchAttrsOnContinueAsNewWf::run,
             true,
             WorkflowStartOptions::new(task_queue, wf_name.to_string())
-                .search_attributes(HashMap::from([(
-                    SEARCH_ATTR_TXT.to_string(),
-                    "hello".as_json_payload().unwrap(),
-                )]))
+                .search_attributes(TypedSearchAttributes::new([
+                    SA_TXT.value_set("hello".into())
+                ]))
                 .build(),
         )
         .await

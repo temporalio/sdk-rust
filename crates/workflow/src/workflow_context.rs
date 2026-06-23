@@ -1002,22 +1002,8 @@ impl<W> SyncWorkflowContext<W> {
         }
     }
 
-    /// Add or create a set of search attributes
-    pub fn upsert_search_attributes(&self, attr_iter: impl IntoIterator<Item = (String, Payload)>) {
-        self.base.inner.runtime.host.push_command(
-            workflow_command::Variant::UpsertWorkflowSearchAttributes(
-                UpsertWorkflowSearchAttributes {
-                    search_attributes: Some(SearchAttributes {
-                        indexed_fields: attr_iter.into_iter().collect(),
-                    }),
-                },
-            )
-            .into(),
-        );
-    }
-
     /// Add, update, or remove search attributes using typed keys.
-    pub fn upsert_typed_search_attributes(
+    pub fn upsert_search_attributes(
         &self,
         updates: impl IntoIterator<Item = SearchAttributeUpdate>,
     ) {
@@ -1303,17 +1289,12 @@ impl<W> WorkflowContext<W> {
         self.sync.external_workflow(workflow_id, run_id)
     }
 
-    /// Add or create a set of search attributes
-    pub fn upsert_search_attributes(&self, attr_iter: impl IntoIterator<Item = (String, Payload)>) {
-        self.sync.upsert_search_attributes(attr_iter)
-    }
-
     /// Add, update, or remove search attributes using typed keys.
-    pub fn upsert_typed_search_attributes(
+    pub fn upsert_search_attributes(
         &self,
         updates: impl IntoIterator<Item = SearchAttributeUpdate>,
     ) {
-        self.sync.upsert_typed_search_attributes(updates)
+        self.sync.upsert_search_attributes(updates)
     }
 
     /// Add or create a set of memo fields

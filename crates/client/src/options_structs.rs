@@ -6,7 +6,7 @@ use temporalio_common::{
     protos::temporal::api::{
         common::{
             self,
-            v1::{Header, Payload, Payloads},
+            v1::{Header, Payloads},
         },
         enums::v1::{
             ArchivalState, HistoryEventFilterType, QueryRejectCondition, WorkflowIdConflictPolicy,
@@ -287,12 +287,8 @@ pub struct WorkflowStartOptions {
     /// Optionally set a cron schedule for the workflow
     pub cron_schedule: Option<String>,
 
-    /// Optionally associate extra search attributes with a workflow
-    pub search_attributes: Option<HashMap<String, Payload>>,
-
     /// Typed search attributes to set when starting the workflow.
-    /// If both this and `search_attributes` are set, this takes precedence.
-    pub typed_search_attributes: Option<TypedSearchAttributes>,
+    pub search_attributes: Option<TypedSearchAttributes>,
 
     /// Optionally enable Eager Workflow Start, a latency optimization using local workers
     /// NOTE: Experimental

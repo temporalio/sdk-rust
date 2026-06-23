@@ -19,7 +19,7 @@ use temporalio_common_wasm::{
             },
         },
         temporal::api::{
-            common::v1::{Payload, RetryPolicy, SearchAttributes},
+            common::v1::{Payload, RetryPolicy},
             enums::v1::{
                 ContinueAsNewVersioningBehavior as ProtoContinueAsNewVersioningBehavior,
                 WorkflowIdReusePolicy,
@@ -282,11 +282,8 @@ pub struct ChildWorkflowOptions {
     pub task_timeout: Option<Duration>,
     /// Optionally set a cron schedule for the workflow
     pub cron_schedule: Option<String>,
-    /// Optionally associate extra search attributes with a workflow
-    pub search_attributes: Option<HashMap<String, Payload>>,
     /// Typed search attributes to set on the child workflow.
-    /// If both this and `search_attributes` are set, this takes precedence.
-    pub typed_search_attributes: Option<TypedSearchAttributes>,
+    pub search_attributes: Option<TypedSearchAttributes>,
     /// Priority for the workflow
     pub priority: Option<Priority>,
 }
@@ -322,16 +319,7 @@ impl ChildWorkflowOptions {
                     .task_timeout
                     .and_then(|duration| duration.try_into().ok()),
                 cron_schedule: self.cron_schedule.unwrap_or_default(),
-                search_attributes: self
-                    .typed_search_attributes
-                    .map(|t| t.to_proto())
-                    .or_else(|| {
-                        self.search_attributes.and_then(|attrs| {
-                            (!attrs.is_empty()).then_some(SearchAttributes {
-                                indexed_fields: attrs,
-                            })
-                        })
-                    }),
+                search_attributes: self.search_attributes.map(|t| t.to_proto()),
                 priority: self.priority.map(Into::into),
                 ..Default::default()
             }),
@@ -570,12 +558,8 @@ pub struct ContinueAsNewOptions {
     pub memo: Option<HashMap<String, Payload>>,
     /// If set, the new workflow will have these headers.
     pub headers: Option<HashMap<String, Payload>>,
-    /// If set, the new workflow will have these search attributes. If `None`, reuses the current
-    /// search attributes.
-    pub search_attributes: Option<SearchAttributes>,
     /// Typed search attributes for the continued workflow.
-    /// If both this and `search_attributes` are set, this takes precedence.
-    pub typed_search_attributes: Option<TypedSearchAttributes>,
+    pub search_attributes: Option<TypedSearchAttributes>,
     /// If set, the new workflow will have this retry policy. If `None`, reuses the current policy.
     pub retry_policy: Option<RetryPolicy>,
     /// Whether the new workflow should run on a worker with a compatible build id.
@@ -609,10 +593,7 @@ impl ContinueAsNewOptions {
                 .and_then(|duration| duration.try_into().ok()),
             memo: self.memo.unwrap_or_default(),
             headers: self.headers.unwrap_or_default(),
-            search_attributes: self
-                .typed_search_attributes
-                .map(|t| Some(t.to_proto()))
-                .unwrap_or(self.search_attributes),
+            search_attributes: self.search_attributes.map(|t| t.to_proto()),
             retry_policy: self.retry_policy,
             versioning_intent: self
                 .versioning_intent

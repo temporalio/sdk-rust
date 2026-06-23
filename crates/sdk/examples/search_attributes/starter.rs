@@ -24,7 +24,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             SearchAttributesWorkflow::run,
             (),
             WorkflowStartOptions::new("search-attributes", "search-attributes-workflow-id")
-                .typed_search_attributes(search_attrs)
+                .search_attributes(search_attrs)
                 .build(),
         )
         .await?;
