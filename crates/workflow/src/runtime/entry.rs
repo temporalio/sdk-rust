@@ -5,11 +5,12 @@ use crate::{
     runtime::{model::WorkflowTermination, types::WorkflowDefinitionDescriptor},
 };
 use futures_util::future::{FutureExt, LocalBoxFuture};
+use std::any::Any;
 use temporalio_common_wasm::{
     QueryDefinition, SignalDefinition, UpdateDefinition, WorkflowDefinition,
     data_converters::{
         GenericPayloadConverter, PayloadConversionError, PayloadConverter, SerializationContext,
-        SerializationContextData, TemporalDeserializable, TemporalSerializable,
+        SerializationContextData, TemporalSerializable,
     },
     protos::temporal::api::{
         common::v1::{Payload, Payloads},
@@ -36,6 +37,12 @@ impl From<WorkflowError> for Failure {
             ..Default::default()
         }
     }
+}
+
+fn downcast_handler_input<T: Any>(input: Box<dyn Any>, handler_kind: &'static str) -> T {
+    *input.downcast::<T>().unwrap_or_else(|_| {
+        panic!("typed {handler_kind} dispatch received input with wrong concrete type")
+    })
 }
 
 /// Trait implemented by workflow structs to enable execution by the worker.
@@ -72,46 +79,71 @@ pub trait WorkflowImplementation: Sized + 'static {
         input: Option<<Self::Run as WorkflowDefinition>::Input>,
     ) -> LocalBoxFuture<'static, Result<Payload, WorkflowTermination>>;
 
-    /// Dispatch an update request by name. Returns `None` if no handler for that name.
-    fn dispatch_update(
-        _ctx: WorkflowContext<Self>,
+    /// Decode a signal's payloads into that signal handler's concrete input type.
+    fn decode_signal_input(
         _name: &str,
         _payloads: Payloads,
         _converter: &PayloadConverter,
-    ) -> Option<LocalBoxFuture<'static, Result<Payload, WorkflowError>>> {
-        None
+    ) -> Result<Option<Box<dyn Any>>, WorkflowError> {
+        Ok(None)
     }
 
-    /// Validate an update request by name.
-    fn validate_update(
-        &self,
-        _ctx: WorkflowContextView,
+    /// Dispatch a signal using an already decoded input value.
+    fn dispatch_signal(
+        _ctx: WorkflowContext<Self>,
+        name: &str,
+        _input: Box<dyn Any>,
+    ) -> LocalBoxFuture<'static, Result<(), WorkflowError>> {
+        panic!("typed signal dispatch called for unknown signal handler '{name}'")
+    }
+
+    /// Decode a query's payloads into that query handler's concrete input type.
+    fn decode_query_input(
         _name: &str,
         _payloads: &Payloads,
         _converter: &PayloadConverter,
-    ) -> Option<Result<(), WorkflowError>> {
-        None
+    ) -> Result<Option<Box<dyn Any>>, WorkflowError> {
+        Ok(None)
     }
 
-    /// Dispatch a signal by name.
-    fn dispatch_signal(
-        _ctx: WorkflowContext<Self>,
-        _name: &str,
-        _payloads: Payloads,
-        _converter: &PayloadConverter,
-    ) -> Option<LocalBoxFuture<'static, Result<(), WorkflowError>>> {
-        None
-    }
-
-    /// Dispatch a query by name.
+    /// Dispatch a query using an already decoded input value.
     fn dispatch_query(
         &self,
         _ctx: WorkflowContextView,
-        _name: &str,
-        _payloads: &Payloads,
+        name: &str,
+        _input: Box<dyn Any>,
         _converter: &PayloadConverter,
-    ) -> Option<Result<Payload, WorkflowError>> {
-        None
+    ) -> Result<Payload, WorkflowError> {
+        panic!("typed query dispatch called for unknown query handler '{name}'")
+    }
+
+    /// Decode an update's payloads into that update handler's concrete input type.
+    fn decode_update_input(
+        _name: &str,
+        _payloads: Payloads,
+        _converter: &PayloadConverter,
+    ) -> Result<Option<Box<dyn Any>>, WorkflowError> {
+        Ok(None)
+    }
+
+    /// Dispatch an update using an already decoded input value.
+    fn dispatch_update(
+        _ctx: WorkflowContext<Self>,
+        name: &str,
+        _input: Box<dyn Any>,
+        _converter: &PayloadConverter,
+    ) -> LocalBoxFuture<'static, Result<Payload, WorkflowError>> {
+        panic!("typed update dispatch called for unknown update handler '{name}'")
+    }
+
+    /// Validate an update using an already decoded input value.
+    fn validate_update(
+        &self,
+        _ctx: WorkflowContextView,
+        name: &str,
+        _input: Box<dyn Any>,
+    ) -> Result<(), WorkflowError> {
+        panic!("typed update validation called for unknown update handler '{name}'")
     }
 }
 
@@ -120,20 +152,15 @@ pub trait ExecutableSyncSignal<S: SignalDefinition>: WorkflowImplementation {
     /// Handle an incoming signal with the given input.
     fn handle(&mut self, ctx: &mut SyncWorkflowContext<Self>, input: S::Input);
 
-    /// Dispatch the signal with payload deserialization.
+    /// Dispatch the signal with an already decoded input.
     fn dispatch(
         ctx: WorkflowContext<Self>,
-        payloads: Payloads,
-        converter: &PayloadConverter,
+        input: Box<dyn Any>,
     ) -> LocalBoxFuture<'static, Result<(), WorkflowError>> {
-        match deserialize_input::<S::Input>(payloads.payloads, converter) {
-            Ok(input) => {
-                let mut sync_ctx = ctx.sync_context();
-                ctx.state_mut(|wf| Self::handle(wf, &mut sync_ctx, input));
-                std::future::ready(Ok(())).boxed_local()
-            }
-            Err(e) => std::future::ready(Err(e)).boxed_local(),
-        }
+        let input = downcast_handler_input::<S::Input>(input, "signal");
+        let mut sync_ctx = ctx.sync_context();
+        ctx.state_mut(|wf| Self::handle(wf, &mut sync_ctx, input));
+        std::future::ready(Ok(())).boxed_local()
     }
 }
 
@@ -142,16 +169,13 @@ pub trait ExecutableAsyncSignal<S: SignalDefinition>: WorkflowImplementation {
     /// Handle an incoming signal with the given input.
     fn handle(ctx: WorkflowContext<Self>, input: S::Input) -> LocalBoxFuture<'static, ()>;
 
-    /// Dispatch the signal with payload deserialization.
+    /// Dispatch the signal with an already decoded input.
     fn dispatch(
         ctx: WorkflowContext<Self>,
-        payloads: Payloads,
-        converter: &PayloadConverter,
+        input: Box<dyn Any>,
     ) -> LocalBoxFuture<'static, Result<(), WorkflowError>> {
-        match deserialize_input::<S::Input>(payloads.payloads, converter) {
-            Ok(input) => Self::handle(ctx, input).map(|()| Ok(())).boxed_local(),
-            Err(e) => std::future::ready(Err(e)).boxed_local(),
-        }
+        let input = downcast_handler_input::<S::Input>(input, "signal");
+        Self::handle(ctx, input).map(|()| Ok(())).boxed_local()
     }
 }
 
@@ -164,14 +188,14 @@ pub trait ExecutableQuery<Q: QueryDefinition>: WorkflowImplementation {
         input: Q::Input,
     ) -> Result<Q::Output, Box<dyn std::error::Error + Send + Sync>>;
 
-    /// Dispatch the query with payload deserialization and output serialization.
+    /// Dispatch the query with an already decoded input.
     fn dispatch(
         &self,
         ctx: &WorkflowContextView,
-        payloads: &Payloads,
+        input: Box<dyn Any>,
         converter: &PayloadConverter,
     ) -> Result<Payload, WorkflowError> {
-        let input = deserialize_input::<Q::Input>(payloads.payloads.clone(), converter)?;
+        let input = downcast_handler_input::<Q::Input>(input, "query");
         let output = self.handle(ctx, input).map_err(WorkflowError::Execution)?;
         serialize_output(&output, converter)
     }
@@ -195,21 +219,17 @@ pub trait ExecutableSyncUpdate<U: UpdateDefinition>: WorkflowImplementation {
         Ok(())
     }
 
-    /// Dispatch the update with payload deserialization and output serialization.
+    /// Dispatch the update with an already decoded input.
     fn dispatch(
         ctx: WorkflowContext<Self>,
-        payloads: Payloads,
+        input: Box<dyn Any>,
         converter: &PayloadConverter,
     ) -> LocalBoxFuture<'static, Result<Payload, WorkflowError>> {
-        let input = match deserialize_input::<U::Input>(payloads.payloads, converter) {
-            Ok(v) => v,
-            Err(e) => return std::future::ready(Err(e)).boxed_local(),
-        };
-        let converter = converter.clone();
+        let input = downcast_handler_input::<U::Input>(input, "update");
         let mut sync_ctx = ctx.sync_context();
         let result = ctx.state_mut(|wf| Self::handle(wf, &mut sync_ctx, input));
         match result {
-            Ok(output) => match serialize_output(&output, &converter) {
+            Ok(output) => match serialize_output(&output, converter) {
                 Ok(payload) => std::future::ready(Ok(payload)).boxed_local(),
                 Err(e) => std::future::ready(Err(e)).boxed_local(),
             },
@@ -217,14 +237,13 @@ pub trait ExecutableSyncUpdate<U: UpdateDefinition>: WorkflowImplementation {
         }
     }
 
-    /// Dispatch validation with payload deserialization.
+    /// Dispatch validation with an already decoded input.
     fn dispatch_validate(
         &self,
         ctx: &WorkflowContextView,
-        payloads: &Payloads,
-        converter: &PayloadConverter,
+        input: Box<dyn Any>,
     ) -> Result<(), WorkflowError> {
-        let input = deserialize_input::<U::Input>(payloads.payloads.clone(), converter)?;
+        let input = downcast_handler_input::<U::Input>(input, "update validation");
         self.validate(ctx, &input).map_err(WorkflowError::Execution)
     }
 }
@@ -246,16 +265,13 @@ pub trait ExecutableAsyncUpdate<U: UpdateDefinition>: WorkflowImplementation {
         Ok(())
     }
 
-    /// Dispatch the update with payload deserialization and output serialization.
+    /// Dispatch the update with an already decoded input.
     fn dispatch(
         ctx: WorkflowContext<Self>,
-        payloads: Payloads,
+        input: Box<dyn Any>,
         converter: &PayloadConverter,
     ) -> LocalBoxFuture<'static, Result<Payload, WorkflowError>> {
-        let input = match deserialize_input::<U::Input>(payloads.payloads, converter) {
-            Ok(v) => v,
-            Err(e) => return std::future::ready(Err(e)).boxed_local(),
-        };
+        let input = downcast_handler_input::<U::Input>(input, "update");
         let converter = converter.clone();
         async move {
             let output = Self::handle(ctx, input)
@@ -266,28 +282,15 @@ pub trait ExecutableAsyncUpdate<U: UpdateDefinition>: WorkflowImplementation {
         .boxed_local()
     }
 
-    /// Dispatch validation with payload deserialization.
+    /// Dispatch validation with an already decoded input.
     fn dispatch_validate(
         &self,
         ctx: &WorkflowContextView,
-        payloads: &Payloads,
-        converter: &PayloadConverter,
+        input: Box<dyn Any>,
     ) -> Result<(), WorkflowError> {
-        let input = deserialize_input::<U::Input>(payloads.payloads.clone(), converter)?;
+        let input = downcast_handler_input::<U::Input>(input, "update validation");
         self.validate(ctx, &input).map_err(WorkflowError::Execution)
     }
-}
-
-/// Deserialize handler input from payloads.
-pub(crate) fn deserialize_input<I: TemporalDeserializable + 'static>(
-    payloads: Vec<Payload>,
-    converter: &PayloadConverter,
-) -> Result<I, WorkflowError> {
-    let ctx = SerializationContext {
-        data: &SerializationContextData::Workflow,
-        converter,
-    };
-    converter.from_payloads(&ctx, payloads).map_err(Into::into)
 }
 
 /// Serialize handler output to a payload.

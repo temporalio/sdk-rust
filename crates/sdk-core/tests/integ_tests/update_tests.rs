@@ -861,6 +861,81 @@ async fn update_fail_sdk() {
 }
 
 #[tokio::test]
+async fn unknown_update_rejected_sdk() {
+    let wf_name = "unknown_update_rejected_sdk";
+    let mut starter = CoreWfStarter::new(wf_name);
+    starter.sdk_config.task_types = WorkerTaskTypes::workflow_only();
+    let mut worker = starter.worker().await;
+    let client = starter.get_client().await;
+
+    #[workflow]
+    #[derive(Default)]
+    struct UnknownUpdateRejectedSdkWf {
+        done: bool,
+    }
+
+    #[workflow_methods]
+    impl UnknownUpdateRejectedSdkWf {
+        #[run]
+        async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<()> {
+            ctx.wait_condition(|s| s.done).await;
+            Ok(())
+        }
+
+        #[update]
+        async fn known_update(_ctx: &mut WorkflowContext<Self>, _: ()) {}
+
+        #[signal]
+        fn done_signal(&mut self, _ctx: &mut SyncWorkflowContext<Self>, _: ()) {
+            self.done = true;
+        }
+    }
+
+    worker
+        .register_workflow::<UnknownUpdateRejectedSdkWf>()
+        .unwrap();
+    let task_queue = starter.get_task_queue().to_owned();
+    let handle = worker
+        .submit_workflow(
+            UnknownUpdateRejectedSdkWf::run,
+            (),
+            WorkflowStartOptions::new(task_queue, starter.get_wf_id().to_owned()).build(),
+        )
+        .await
+        .unwrap();
+    let update = async {
+        let res = handle
+            .execute_update(
+                UntypedUpdate::new("missing_update"),
+                RawValue::from_value(&(), client.data_converter().payload_converter()),
+                WorkflowExecuteUpdateOptions::default(),
+            )
+            .await;
+        match res.unwrap_err() {
+            temporalio_client::errors::WorkflowUpdateError::Failed(failure) => {
+                assert_eq!(
+                    failure.message,
+                    "No update handler registered for update name missing_update"
+                )
+            }
+            _ => panic!("expected failure"),
+        }
+        handle
+            .signal(
+                UnknownUpdateRejectedSdkWf::done_signal,
+                (),
+                WorkflowSignalOptions::default(),
+            )
+            .await
+            .unwrap();
+    };
+    let run = async {
+        worker.run_until_done().await.unwrap();
+    };
+    join!(update, run);
+}
+
+#[tokio::test]
 async fn update_timer_sequence() {
     let wf_name = "update_timer_sequence";
     let mut starter = CoreWfStarter::new(wf_name);
