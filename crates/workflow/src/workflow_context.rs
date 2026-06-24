@@ -8,7 +8,7 @@ pub use options::{
 pub use temporalio_common_wasm::protos::coresdk::child_workflow::StartChildWorkflowExecutionFailedCause;
 
 use crate::runtime::{
-    SdkWakeGuard,
+    SdkGuardedFuture, SdkWakeGuard,
     entry::WorkflowImplementation,
     host::WorkflowHost,
     model::{
@@ -2296,7 +2296,12 @@ pub(crate) struct NexusUnblockData {
 
 impl StartedNexusOperation {
     pub async fn result(&self) -> NexusOperationResult {
-        self.unblock_dat.result_future.clone().await
+        // The result future is a `Shared`; poll it inside an `SdkWakeGuard` (via
+        // `SdkGuardedFuture`) so its internal waker machinery isn't mistaken for a non-SDK wake on
+        // replay (which would fail the workflow task with TMPRL1100). This mirrors how `join_all`'s
+        // `FuturesOrdered` is guarded in `workflows.rs`. Without it, a workflow that awaits a Nexus
+        // operation result and then keeps running trips nondeterminism detection when replayed.
+        SdkGuardedFuture(self.unblock_dat.result_future.clone()).await
     }
 
     pub fn cancel(&self) {

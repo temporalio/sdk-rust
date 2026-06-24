@@ -29,6 +29,14 @@ to docs, or any other relevant information.
   (FIPS-capable) build. Building with `--no-default-features --features tls-aws-lc,otel` now yields a
   dependency tree free of `ring`.
 
+### Fixed
+* Awaiting a Nexus operation's result (`StartedNexusOperation::result()`) no longer trips
+  nondeterminism detection ("a waker was invoked by a non-SDK source", TMPRL1100) on replay. The
+  result future is a `Shared`, whose internal waker machinery must be polled inside an `SdkWakeGuard`
+  (as `join_all` already is); it now is. Previously, a workflow that awaited a Nexus operation result
+  and then kept running (e.g. parked on a `wait_condition`) would fail its workflow task whenever it
+  was replayed — breaking queries and durable recovery for that execution.
+
 ### Breaking Changes
 * The `ActivityContext` constructor now requires `ClientOptions`.
 ### Breaking Changes
