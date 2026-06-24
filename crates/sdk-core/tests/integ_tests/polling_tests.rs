@@ -357,10 +357,7 @@ async fn replace_client_works_after_polling_failure() {
         let poll_retry_log_found = poll_retry_log_found.clone();
         async move {
             let mut enabled = false;
-            loop {
-                let Some(log) = log_rx.next().await else {
-                    break;
-                };
+            while let Some(log) = log_rx.next().await {
                 if !enabled {
                     enabled = look_for_poll_retry_log.load(Ordering::Acquire);
                 }
