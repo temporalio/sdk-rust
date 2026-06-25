@@ -287,7 +287,7 @@ pub struct WorkflowStartOptions {
     /// Optionally set a cron schedule for the workflow
     pub cron_schedule: Option<String>,
 
-    /// Typed search attributes to set when starting the workflow.
+    /// Additional search attributes for the workflow.
     pub search_attributes: Option<TypedSearchAttributes>,
 
     /// Optionally enable Eager Workflow Start, a latency optimization using local workers
