@@ -282,7 +282,7 @@ pub struct ChildWorkflowOptions {
     pub task_timeout: Option<Duration>,
     /// Optionally set a cron schedule for the workflow
     pub cron_schedule: Option<String>,
-    /// Typed search attributes to set on the child workflow.
+    /// Additional search attributes to set on the child workflow.
     pub search_attributes: Option<TypedSearchAttributes>,
     /// Priority for the workflow
     pub priority: Option<Priority>,
