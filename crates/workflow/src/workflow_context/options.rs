@@ -27,7 +27,7 @@ use temporalio_common_wasm::{
             sdk::v1::UserMetadata,
         },
     },
-    search_attributes::TypedSearchAttributes,
+    search_attributes::SearchAttributes,
 };
 /// Options for scheduling an activity
 #[derive(Debug, bon::Builder, Clone)]
@@ -283,7 +283,7 @@ pub struct ChildWorkflowOptions {
     /// Optionally set a cron schedule for the workflow
     pub cron_schedule: Option<String>,
     /// Additional search attributes to set on the child workflow.
-    pub search_attributes: Option<TypedSearchAttributes>,
+    pub search_attributes: Option<SearchAttributes>,
     /// Priority for the workflow
     pub priority: Option<Priority>,
 }
@@ -560,7 +560,7 @@ pub struct ContinueAsNewOptions {
     pub headers: Option<HashMap<String, Payload>>,
     /// If set, the new workflow will have these search attributes. If `None`, reuses the current
     /// search attributes.
-    pub search_attributes: Option<TypedSearchAttributes>,
+    pub search_attributes: Option<SearchAttributes>,
     /// If set, the new workflow will have this retry policy. If `None`, reuses the current policy.
     pub retry_policy: Option<RetryPolicy>,
     /// Whether the new workflow should run on a worker with a compatible build id.

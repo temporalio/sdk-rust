@@ -12,7 +12,7 @@ use temporalio_common::{
             enums::v1::EventType,
         },
     },
-    search_attributes::{SearchAttributeKey, TypedSearchAttributes},
+    search_attributes::{SearchAttributeKey, SearchAttributes},
     worker::WorkerTaskTypes,
 };
 use temporalio_macros::{workflow, workflow_methods};
@@ -34,7 +34,7 @@ struct SearchAttrUpdater;
 impl SearchAttrUpdater {
     #[run(name = "sends_upsert_search_attrs")]
     async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<()> {
-        let typed = ctx.typed_search_attributes();
+        let typed = ctx.search_attributes();
         let orig_val = typed.get(&SA_INT).unwrap_or(0);
         let new_val = orig_val + 1;
         ctx.upsert_search_attributes([
@@ -64,7 +64,7 @@ async fn sends_upsert() {
             wf_name,
             vec![],
             WorkflowStartOptions::new(task_queue, wf_id.to_string())
-                .search_attributes(TypedSearchAttributes::new([
+                .search_attributes(SearchAttributes::new([
                     SA_TXT.value_set("hello".into()),
                     SA_INT.value_set(1),
                 ]))
@@ -142,9 +142,8 @@ async fn upsert_search_attrs_from_workflow() {
                     let fields = &msg.search_attributes.as_ref().unwrap().indexed_fields;
                     let payload1 = fields.get(k1).unwrap();
                     let payload2 = fields.get(k2).unwrap();
-                    // Verify payloads have JSON-encoded data
-                    assert!(!payload1.data.is_empty());
-                    assert!(!payload2.data.is_empty());
+                    assert_eq!(payload1.data, b"\"value1\"");
+                    assert_eq!(payload2.data, b"\"value2\"");
                     assert_eq!(fields.len(), 2);
                 }
             );

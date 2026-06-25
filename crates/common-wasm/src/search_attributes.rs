@@ -8,7 +8,7 @@
 //! # Example
 //!
 //! ```
-//! use temporalio_common_wasm::search_attributes::{SearchAttributeKey, Timestamp};
+//! use temporalio_common_wasm::search_attributes::SearchAttributeKey;
 //!
 //! const MY_BOOL: SearchAttributeKey<bool> = SearchAttributeKey::bool("my_bool");
 //! const MY_KW: SearchAttributeKey<String> = SearchAttributeKey::keyword("my_keyword");
@@ -25,7 +25,7 @@ use crate::protos::temporal::api::common::v1::{
 };
 use crate::protos::temporal::api::enums::v1::IndexedValueType;
 
-/// Metadata key for the search attribute value type, matching Go SDK convention.
+/// Metadata key for the search attribute value type, kept consistent across all SDKs.
 const TYPE_METADATA_KEY: &str = "type";
 
 /// Errors arising from search attribute serialization or deserialization.
@@ -532,17 +532,17 @@ impl SearchAttributeUpdate {
 }
 
 // ---------------------------------------------------------------------------
-// TypedSearchAttributes
+// SearchAttributes
 // ---------------------------------------------------------------------------
 
 /// A collection of search attribute payloads, providing type-safe access via
 /// [`SearchAttributeKey`].
 #[derive(Debug, Clone, Default)]
-pub struct TypedSearchAttributes {
+pub struct SearchAttributes {
     fields: HashMap<String, Payload>,
 }
 
-impl TypedSearchAttributes {
+impl SearchAttributes {
     /// Construct from an iterator of [`SearchAttributeUpdate`]s.
     ///
     /// Updates with `None` payloads remove any existing entry for that key.
@@ -749,7 +749,7 @@ mod tests {
         assert_eq!(decoded.seconds, ts.seconds);
         assert_eq!(decoded.nanos, ts.nanos);
 
-        let attrs = TypedSearchAttributes::new([DT_KEY.value_set(ts.clone())]);
+        let attrs = SearchAttributes::new([DT_KEY.value_set(ts.clone())]);
         let got = attrs.get(&DT_KEY).unwrap();
         assert_eq!(got.seconds, ts.seconds);
         assert_eq!(got.nanos, ts.nanos);
@@ -784,7 +784,7 @@ mod tests {
 
     #[test]
     fn typed_search_attributes_new_and_get() {
-        let attrs = TypedSearchAttributes::new([
+        let attrs = SearchAttributes::new([
             BOOL_KEY.value_set(true),
             INT_KEY.value_set(99),
             FLOAT_KEY.value_set(2.72),
@@ -808,19 +808,19 @@ mod tests {
 
     #[test]
     fn to_proto_from_proto_round_trip() {
-        let attrs = TypedSearchAttributes::new([BOOL_KEY.value_set(false), INT_KEY.value_set(7)]);
+        let attrs = SearchAttributes::new([BOOL_KEY.value_set(false), INT_KEY.value_set(7)]);
 
         let proto = attrs.to_proto();
         assert_eq!(proto.indexed_fields.len(), 2);
 
-        let restored = TypedSearchAttributes::from_proto(&proto);
+        let restored = SearchAttributes::from_proto(&proto);
         assert_eq!(restored.get(&BOOL_KEY), Some(false));
         assert_eq!(restored.get(&INT_KEY), Some(7));
     }
 
     #[test]
     fn value_unset_removes_entry() {
-        let attrs = TypedSearchAttributes::new([BOOL_KEY.value_set(true), BOOL_KEY.value_unset()]);
+        let attrs = SearchAttributes::new([BOOL_KEY.value_set(true), BOOL_KEY.value_unset()]);
         assert!(attrs.is_empty());
         assert_eq!(attrs.get(&BOOL_KEY), None);
     }
@@ -848,14 +848,14 @@ mod tests {
 
     #[test]
     fn get_returns_none_for_missing_key() {
-        let attrs = TypedSearchAttributes::default();
+        let attrs = SearchAttributes::default();
         assert_eq!(attrs.get(&BOOL_KEY), None);
         assert!(!attrs.contains_key(&INT_KEY));
     }
 
     #[test]
     fn get_returns_none_for_type_mismatch() {
-        let attrs = TypedSearchAttributes::new([BOOL_KEY.value_set(true)]);
+        let attrs = SearchAttributes::new([BOOL_KEY.value_set(true)]);
         // Try to read the bool payload as an i64 — should gracefully return None
         let mismatched_key = SearchAttributeKey::<i64>::int("my_bool");
         assert_eq!(attrs.get(&mismatched_key), None);
@@ -863,7 +863,7 @@ mod tests {
 
     #[test]
     fn updates_to_proto_includes_empty_payload_for_unset() {
-        let proto = TypedSearchAttributes::updates_to_proto([
+        let proto = SearchAttributes::updates_to_proto([
             BOOL_KEY.value_set(true),
             INT_KEY.value_unset(),
         ]);
@@ -878,7 +878,7 @@ mod tests {
 
     #[test]
     fn contains_key_returns_true_when_present() {
-        let attrs = TypedSearchAttributes::new([INT_KEY.value_set(42)]);
+        let attrs = SearchAttributes::new([INT_KEY.value_set(42)]);
         assert!(attrs.contains_key(&INT_KEY));
     }
 
@@ -1078,7 +1078,7 @@ mod tests {
 
     #[test]
     fn keys_returns_attribute_names() {
-        let attrs = TypedSearchAttributes::new([BOOL_KEY.value_set(true), INT_KEY.value_set(42)]);
+        let attrs = SearchAttributes::new([BOOL_KEY.value_set(true), INT_KEY.value_set(42)]);
         let mut keys: Vec<&str> = attrs.keys().collect();
         keys.sort();
         assert_eq!(keys, vec!["my_bool", "my_int"]);
@@ -1086,7 +1086,7 @@ mod tests {
 
     #[test]
     fn raw_payload_returns_payload() {
-        let attrs = TypedSearchAttributes::new([BOOL_KEY.value_set(true)]);
+        let attrs = SearchAttributes::new([BOOL_KEY.value_set(true)]);
         let payload = attrs.raw_payload("my_bool").unwrap();
         assert!(!payload.data.is_empty());
         assert!(attrs.raw_payload("nonexistent").is_none());
@@ -1094,7 +1094,7 @@ mod tests {
 
     #[test]
     fn into_proto_moves_without_clone() {
-        let attrs = TypedSearchAttributes::new([INT_KEY.value_set(7)]);
+        let attrs = SearchAttributes::new([INT_KEY.value_set(7)]);
         let proto = attrs.into_proto();
         assert_eq!(proto.indexed_fields.len(), 1);
     }

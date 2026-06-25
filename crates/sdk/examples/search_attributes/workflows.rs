@@ -16,7 +16,7 @@ impl SearchAttributesWorkflow {
     #[run]
     pub async fn run(ctx: &mut WorkflowContext<Self>, _input: ()) -> WorkflowResult<String> {
         let initial_keyword = ctx
-            .typed_search_attributes()
+            .search_attributes()
             .get(&KEYWORD_FIELD)
             .unwrap_or_default();
 

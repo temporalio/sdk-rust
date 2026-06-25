@@ -23,11 +23,10 @@ use futures_util::{
     task::Context,
 };
 use std::{
-    cell::{Cell, Ref, RefCell},
+    cell::{Cell, RefCell},
     collections::HashMap,
     future::{self, Future},
     marker::PhantomData,
-    ops::Deref,
     pin::Pin,
     rc::Rc,
     sync::atomic::{AtomicBool, Ordering},
@@ -67,12 +66,12 @@ use temporalio_common_wasm::{
             },
         },
         temporal::api::{
-            common::v1::{Memo, Payload, SearchAttributes},
+            common::v1::{Memo, Payload, SearchAttributes as ProtoSearchAttributes},
             failure::v1::{CanceledFailureInfo, Failure, failure::FailureInfo},
         },
         utilities::TryIntoOrNone,
     },
-    search_attributes::{SearchAttributeUpdate, TypedSearchAttributes},
+    search_attributes::{SearchAttributeUpdate, SearchAttributes},
     worker::WorkerDeploymentVersion,
 };
 
@@ -317,7 +316,7 @@ pub struct WorkflowContextView {
     /// User-defined memo
     pub memo: Option<Memo>,
     /// Initial search attributes
-    pub search_attributes: Option<SearchAttributes>,
+    pub search_attributes: Option<ProtoSearchAttributes>,
 }
 
 /// Information about a parent workflow.
@@ -791,14 +790,9 @@ impl<W> SyncWorkflowContext<W> {
             .map(Into::into)
     }
 
-    /// Return current values for workflow search attributes
-    pub fn search_attributes(&self) -> impl Deref<Target = SearchAttributes> + '_ {
-        Ref::map(self.base.inner.shared.borrow(), |s| &s.search_attributes)
-    }
-
     /// Return current values for workflow search attributes.
-    pub fn search_attributes(&self) -> TypedSearchAttributes {
-        TypedSearchAttributes::from_proto(&self.base.inner.shared.borrow().search_attributes)
+    pub fn search_attributes(&self) -> SearchAttributes {
+        SearchAttributes::from_proto(&self.base.inner.shared.borrow().search_attributes)
     }
 
     /// Return the workflow's randomness seed
@@ -1007,7 +1001,7 @@ impl<W> SyncWorkflowContext<W> {
         &self,
         updates: impl IntoIterator<Item = SearchAttributeUpdate>,
     ) {
-        let proto = TypedSearchAttributes::updates_to_proto(updates);
+        let proto = SearchAttributes::updates_to_proto(updates);
         self.base.inner.runtime.host.push_command(
             workflow_command::Variant::UpsertWorkflowSearchAttributes(
                 UpsertWorkflowSearchAttributes {
@@ -1159,14 +1153,9 @@ impl<W> WorkflowContext<W> {
         self.sync.current_deployment_version()
     }
 
-    /// Return current values for workflow search attributes
-    pub fn search_attributes(&self) -> impl Deref<Target = SearchAttributes> + '_ {
+    /// Return current values for workflow search attributes.
+    pub fn search_attributes(&self) -> SearchAttributes {
         self.sync.search_attributes()
-    }
-
-    /// Return current values for workflow search attributes as a typed collection.
-    pub fn typed_search_attributes(&self) -> TypedSearchAttributes {
-        self.sync.typed_search_attributes()
     }
 
     /// Return the workflow's randomness seed
@@ -1430,7 +1419,7 @@ struct WorkflowContextSharedData {
     /// Maps change ids -> resolved status
     changes: HashMap<String, bool>,
     activation: CoreWorkflowActivation,
-    search_attributes: SearchAttributes,
+    search_attributes: ProtoSearchAttributes,
     random_seed: u64,
     /// Current details string, surfaced via the workflow metadata query.
     current_details: String,
@@ -2426,11 +2415,12 @@ mod tests {
             "header-key".to_string(),
             Payload::from(b"header-value".as_slice()),
         );
-        let mut search_attributes = SearchAttributes::default();
-        search_attributes.indexed_fields.insert(
+        let mut proto_search_attributes = ProtoSearchAttributes::default();
+        proto_search_attributes.indexed_fields.insert(
             "CustomKeywordField".to_string(),
             Payload::from(b"value".as_slice()),
         );
+        let search_attributes = SearchAttributes::from_proto(&proto_search_attributes);
 
         let termination = sync
             .continue_as_new(
@@ -2474,7 +2464,7 @@ mod tests {
                 backoff_start_interval: Some(Duration::from_secs(4).try_into().unwrap()),
                 memo,
                 headers,
-                search_attributes: Some(search_attributes),
+                search_attributes: Some(proto_search_attributes),
                 retry_policy: Some(RetryPolicy {
                     maximum_attempts: 5,
                     ..Default::default()
@@ -2504,7 +2494,7 @@ mod tests {
             unreachable!()
         };
 
-        assert_eq!(cmd.search_attributes, Some(SearchAttributes::default()));
+        assert_eq!(cmd.search_attributes, Some(ProtoSearchAttributes::default()));
     }
 
     #[test]

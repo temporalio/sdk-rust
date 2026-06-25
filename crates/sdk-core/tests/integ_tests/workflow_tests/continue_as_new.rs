@@ -9,7 +9,7 @@ use temporalio_common::{
         },
         history::v1::history_event,
     },
-    search_attributes::{SearchAttributeKey, TypedSearchAttributes},
+    search_attributes::{SearchAttributeKey, SearchAttributes},
     worker::WorkerTaskTypes,
 };
 use temporalio_macros::{workflow, workflow_methods};
@@ -181,7 +181,7 @@ impl ClearSearchAttrsOnContinueAsNewWf {
     async fn run(ctx: &mut WorkflowContext<Self>, first_run: bool) -> WorkflowResult<()> {
         if first_run {
             let mut opts = ContinueAsNewOptions::default();
-            opts.search_attributes = Some(TypedSearchAttributes::default());
+            opts.search_attributes = Some(SearchAttributes::default());
             ctx.continue_as_new(&false, opts)?;
         }
 
@@ -206,7 +206,7 @@ async fn clear_search_attributes_on_continue_as_new() {
             ClearSearchAttrsOnContinueAsNewWf::run,
             true,
             WorkflowStartOptions::new(task_queue, wf_name.to_string())
-                .search_attributes(TypedSearchAttributes::new([
+                .search_attributes(SearchAttributes::new([
                     SA_TXT.value_set("hello".into())
                 ]))
                 .build(),

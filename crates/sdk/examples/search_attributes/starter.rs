@@ -4,7 +4,7 @@ use temporalio_client::{
     Client, ClientOptions, Connection, WorkflowGetResultOptions, WorkflowStartOptions,
     envconfig::LoadClientConfigProfileOptions,
 };
-use temporalio_common::search_attributes::TypedSearchAttributes;
+use temporalio_common::search_attributes::SearchAttributes;
 use workflows::{INT_FIELD, KEYWORD_FIELD, SearchAttributesWorkflow};
 
 #[tokio::main]
@@ -14,7 +14,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let connection = Connection::connect(conn_opts).await?;
     let client = Client::new(connection, client_opts)?;
 
-    let search_attrs = TypedSearchAttributes::new([
+    let search_attrs = SearchAttributes::new([
         KEYWORD_FIELD.value_set("initial-value".into()),
         INT_FIELD.value_set(0),
     ]);
