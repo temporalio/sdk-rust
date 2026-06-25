@@ -796,8 +796,8 @@ impl<W> SyncWorkflowContext<W> {
         Ref::map(self.base.inner.shared.borrow(), |s| &s.search_attributes)
     }
 
-    /// Return current values for workflow search attributes as a typed collection.
-    pub fn typed_search_attributes(&self) -> TypedSearchAttributes {
+    /// Return current values for workflow search attributes.
+    pub fn search_attributes(&self) -> TypedSearchAttributes {
         TypedSearchAttributes::from_proto(&self.base.inner.shared.borrow().search_attributes)
     }
 
