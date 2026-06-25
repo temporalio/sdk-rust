@@ -558,7 +558,8 @@ pub struct ContinueAsNewOptions {
     pub memo: Option<HashMap<String, Payload>>,
     /// If set, the new workflow will have these headers.
     pub headers: Option<HashMap<String, Payload>>,
-    /// Typed search attributes for the continued workflow.
+    /// If set, the new workflow will have these search attributes. If `None`, reuses the current
+    /// search attributes.
     pub search_attributes: Option<TypedSearchAttributes>,
     /// If set, the new workflow will have this retry policy. If `None`, reuses the current policy.
     pub retry_policy: Option<RetryPolicy>,
