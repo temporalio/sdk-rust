@@ -68,6 +68,29 @@ fn generate_method_call(prefixed_method: &syn::Ident, has_input: bool) -> TokenS
     }
 }
 
+fn generate_decode_arm(
+    handler_name: &TokenStream2,
+    input_type: &TokenStream2,
+    payloads: TokenStream2,
+) -> TokenStream2 {
+    quote! {
+        #handler_name => {
+            let ctx = ::temporalio_workflow::common::data_converters::SerializationContext {
+                data: &::temporalio_workflow::common::data_converters::SerializationContextData::Workflow,
+                converter,
+            };
+            let input: #input_type = <::temporalio_workflow::common::data_converters::PayloadConverter as ::temporalio_workflow::common::data_converters::GenericPayloadConverter>::from_payloads(
+                converter,
+                &ctx,
+                #payloads,
+            )?;
+            Ok(::std::option::Option::Some(
+                ::std::boxed::Box::new(input) as ::std::boxed::Box<dyn ::std::any::Any>
+            ))
+        },
+    }
+}
+
 /// Parsed representation of a `#[workflow_methods]` impl block
 pub(crate) struct WorkflowMethodsDefinition {
     impl_block: ItemImpl,
@@ -1014,6 +1037,22 @@ impl WorkflowMethodsDefinition {
                 quote! { (#handler_name).to_string() }
             })
             .collect();
+        let decode_signal_arms: Vec<TokenStream2> = self
+            .signals
+            .iter()
+            .map(|s| {
+                let info = HandlerCodegenInfo::new(
+                    &s.method,
+                    &s.attributes,
+                    s.input_type.as_ref(),
+                    module_ident,
+                );
+                let input_type = &info.input_type_tokens;
+                let handler_name = &info.handler_name;
+
+                generate_decode_arm(handler_name, input_type, quote! { payloads.payloads })
+            })
+            .collect();
         let dispatch_signal_arms: Vec<TokenStream2> = self
             .signals
             .iter()
@@ -1029,36 +1068,75 @@ impl WorkflowMethodsDefinition {
 
                 if s.is_async {
                     quote! {
-                        #handler_name => Some(<Self as ::temporalio_workflow::workflows::ExecutableAsyncSignal<#module_ident::#struct_ident>>::dispatch(ctx.clone(), payloads, converter)),
+                        #handler_name => <Self as ::temporalio_workflow::workflows::ExecutableAsyncSignal<#module_ident::#struct_ident>>::dispatch(ctx.clone(), input),
                     }
                 } else {
                     quote! {
-                        #handler_name => Some(<Self as ::temporalio_workflow::workflows::ExecutableSyncSignal<#module_ident::#struct_ident>>::dispatch(ctx, payloads, converter)),
+                        #handler_name => <Self as ::temporalio_workflow::workflows::ExecutableSyncSignal<#module_ident::#struct_ident>>::dispatch(ctx, input),
                     }
                 }
             })
             .collect();
 
-        // Generate dispatch_signal only if there are signals
-        let dispatch_signal_impl = if self.signals.is_empty() {
+        let decode_signal_impl = if self.signals.is_empty() {
             quote! {}
+        } else {
+            quote! {
+                fn decode_signal_input(
+                    name: &str,
+                    payloads: ::temporalio_workflow::common::protos::temporal::api::common::v1::Payloads,
+                    converter: &::temporalio_workflow::common::data_converters::PayloadConverter,
+                ) -> Result<::std::option::Option<::std::boxed::Box<dyn ::std::any::Any>>, ::temporalio_workflow::workflows::WorkflowError> {
+                    match name {
+                        #(#decode_signal_arms)*
+                        _ => Ok(::std::option::Option::None),
+                    }
+                }
+            }
+        };
+
+        let dispatch_signal_impl = if self.signals.is_empty() {
+            quote! {
+                fn dispatch_signal(
+                    _ctx: ::temporalio_workflow::WorkflowContext<Self>,
+                    name: &str,
+                    _input: ::std::boxed::Box<dyn ::std::any::Any>,
+                ) -> ::temporalio_workflow::__private::futures_util::future::LocalBoxFuture<'static, Result<(), ::temporalio_workflow::workflows::WorkflowError>> {
+                    unreachable!("typed signal dispatch called for unknown signal handler '{name}'")
+                }
+            }
         } else {
             quote! {
                 fn dispatch_signal(
                     ctx: ::temporalio_workflow::WorkflowContext<Self>,
                     name: &str,
-                    payloads: ::temporalio_workflow::common::protos::temporal::api::common::v1::Payloads,
-                    converter: &::temporalio_workflow::common::data_converters::PayloadConverter,
-                ) -> Option<::temporalio_workflow::__private::futures_util::future::LocalBoxFuture<'static, Result<(), ::temporalio_workflow::workflows::WorkflowError>>> {
+                    input: ::std::boxed::Box<dyn ::std::any::Any>,
+                ) -> ::temporalio_workflow::__private::futures_util::future::LocalBoxFuture<'static, Result<(), ::temporalio_workflow::workflows::WorkflowError>> {
                     match name {
                         #(#dispatch_signal_arms)*
-                        _ => None,
+                        _ => unreachable!("typed signal dispatch called for unknown signal handler '{name}'"),
                     }
                 }
             }
         };
 
         // Generate update dispatch match arms
+        let decode_update_arms: Vec<TokenStream2> = self
+            .updates
+            .iter()
+            .map(|u| {
+                let info = HandlerCodegenInfo::new(
+                    &u.method,
+                    &u.attributes,
+                    u.input_type.as_ref(),
+                    module_ident,
+                );
+                let input_type = &info.input_type_tokens;
+                let handler_name = &info.handler_name;
+
+                generate_decode_arm(handler_name, input_type, quote! { payloads.payloads })
+            })
+            .collect();
         let dispatch_update_arms: Vec<TokenStream2> = self
             .updates
             .iter()
@@ -1074,11 +1152,11 @@ impl WorkflowMethodsDefinition {
 
                 if u.is_async {
                     quote! {
-                        #handler_name => Some(<Self as ::temporalio_workflow::workflows::ExecutableAsyncUpdate<#module_ident::#struct_ident>>::dispatch(ctx.clone(), payloads, converter)),
+                        #handler_name => <Self as ::temporalio_workflow::workflows::ExecutableAsyncUpdate<#module_ident::#struct_ident>>::dispatch(ctx.clone(), input, converter),
                     }
                 } else {
                     quote! {
-                        #handler_name => Some(<Self as ::temporalio_workflow::workflows::ExecutableSyncUpdate<#module_ident::#struct_ident>>::dispatch(ctx, payloads, converter)),
+                        #handler_name => <Self as ::temporalio_workflow::workflows::ExecutableSyncUpdate<#module_ident::#struct_ident>>::dispatch(ctx, input, converter),
                     }
                 }
             })
@@ -1109,6 +1187,7 @@ impl WorkflowMethodsDefinition {
         let validate_update_arms: Vec<TokenStream2> = self
             .updates
             .iter()
+            .filter(|u| u.validator.is_some())
             .map(|u| {
                 let info = HandlerCodegenInfo::new(
                     &u.method,
@@ -1119,32 +1198,66 @@ impl WorkflowMethodsDefinition {
                 let struct_ident = &info.struct_ident;
                 let handler_name = &info.handler_name;
 
-                let validate_trait = if u.is_async {
+                let update_trait = if u.is_async {
                     quote! { ::temporalio_workflow::workflows::ExecutableAsyncUpdate<#module_ident::#struct_ident> }
                 } else {
                     quote! { ::temporalio_workflow::workflows::ExecutableSyncUpdate<#module_ident::#struct_ident> }
                 };
 
                 quote! {
-                    #handler_name => Some(<Self as #validate_trait>::dispatch_validate(self, &ctx, payloads, converter)),
+                    #handler_name => <Self as #update_trait>::dispatch_validate(self, &ctx, input),
                 }
             })
             .collect();
 
-        // Generate dispatch_update and validate_update only if there are updates
-        let dispatch_update_impl = if self.updates.is_empty() {
+        let decode_update_impl = if self.updates.is_empty() {
             quote! {}
+        } else {
+            quote! {
+                fn decode_update_input(
+                    name: &str,
+                    payloads: ::temporalio_workflow::common::protos::temporal::api::common::v1::Payloads,
+                    converter: &::temporalio_workflow::common::data_converters::PayloadConverter,
+                ) -> Result<::std::option::Option<::std::boxed::Box<dyn ::std::any::Any>>, ::temporalio_workflow::workflows::WorkflowError> {
+                    match name {
+                        #(#decode_update_arms)*
+                        _ => Ok(::std::option::Option::None),
+                    }
+                }
+            }
+        };
+
+        let dispatch_update_impl = if self.updates.is_empty() {
+            quote! {
+                fn dispatch_update(
+                    _ctx: ::temporalio_workflow::WorkflowContext<Self>,
+                    name: &str,
+                    _input: ::std::boxed::Box<dyn ::std::any::Any>,
+                    _converter: &::temporalio_workflow::common::data_converters::PayloadConverter,
+                ) -> ::temporalio_workflow::__private::futures_util::future::LocalBoxFuture<'static, Result<::temporalio_workflow::common::protos::temporal::api::common::v1::Payload, ::temporalio_workflow::workflows::WorkflowError>> {
+                    unreachable!("typed update dispatch called for unknown update handler '{name}'")
+                }
+
+                fn validate_update(
+                    &self,
+                    _ctx: ::temporalio_workflow::WorkflowContextView,
+                    name: &str,
+                    _input: ::std::boxed::Box<dyn ::std::any::Any>,
+                ) -> Result<(), ::temporalio_workflow::workflows::WorkflowError> {
+                    unreachable!("typed update validation called for unknown update handler '{name}'")
+                }
+            }
         } else {
             quote! {
                 fn dispatch_update(
                     ctx: ::temporalio_workflow::WorkflowContext<Self>,
                     name: &str,
-                    payloads: ::temporalio_workflow::common::protos::temporal::api::common::v1::Payloads,
+                    input: ::std::boxed::Box<dyn ::std::any::Any>,
                     converter: &::temporalio_workflow::common::data_converters::PayloadConverter,
-                ) -> Option<::temporalio_workflow::__private::futures_util::future::LocalBoxFuture<'static, Result<::temporalio_workflow::common::protos::temporal::api::common::v1::Payload, ::temporalio_workflow::workflows::WorkflowError>>> {
+                ) -> ::temporalio_workflow::__private::futures_util::future::LocalBoxFuture<'static, Result<::temporalio_workflow::common::protos::temporal::api::common::v1::Payload, ::temporalio_workflow::workflows::WorkflowError>> {
                     match name {
                         #(#dispatch_update_arms)*
-                        _ => None,
+                        _ => unreachable!("typed update dispatch called for unknown update handler '{name}'"),
                     }
                 }
 
@@ -1152,13 +1265,11 @@ impl WorkflowMethodsDefinition {
                     &self,
                     ctx: ::temporalio_workflow::WorkflowContextView,
                     name: &str,
-                    payloads: &::temporalio_workflow::common::protos::temporal::api::common::v1::Payloads,
-                    converter: &::temporalio_workflow::common::data_converters::PayloadConverter,
-                ) -> Option<Result<(), ::temporalio_workflow::workflows::WorkflowError>> {
-
+                    input: ::std::boxed::Box<dyn ::std::any::Any>,
+                ) -> Result<(), ::temporalio_workflow::workflows::WorkflowError> {
                     match name {
                         #(#validate_update_arms)*
-                        _ => None,
+                        _ => unreachable!("typed update validation called for unknown update handler '{name}'"),
                     }
                 }
             }
@@ -1179,6 +1290,26 @@ impl WorkflowMethodsDefinition {
                 quote! { (#handler_name).to_string() }
             })
             .collect();
+        let decode_query_arms: Vec<TokenStream2> = self
+            .queries
+            .iter()
+            .map(|q| {
+                let info = HandlerCodegenInfo::new(
+                    &q.method,
+                    &q.attributes,
+                    q.input_type.as_ref(),
+                    module_ident,
+                );
+                let input_type = &info.input_type_tokens;
+                let handler_name = &info.handler_name;
+
+                generate_decode_arm(
+                    handler_name,
+                    input_type,
+                    quote! { payloads.payloads.clone() },
+                )
+            })
+            .collect();
         let dispatch_query_arms: Vec<TokenStream2> = self
             .queries
             .iter()
@@ -1193,26 +1324,52 @@ impl WorkflowMethodsDefinition {
                 let handler_name = &info.handler_name;
 
                 quote! {
-                    #handler_name => Some(<Self as ::temporalio_workflow::workflows::ExecutableQuery<#module_ident::#struct_ident>>::dispatch(self, &ctx, payloads, converter)),
+                    #handler_name => <Self as ::temporalio_workflow::workflows::ExecutableQuery<#module_ident::#struct_ident>>::dispatch(self, &ctx, input, converter),
                 }
             })
             .collect();
 
-        // Generate dispatch_query only if there are queries
-        let dispatch_query_impl = if self.queries.is_empty() {
+        let decode_query_impl = if self.queries.is_empty() {
             quote! {}
+        } else {
+            quote! {
+                fn decode_query_input(
+                    name: &str,
+                    payloads: &::temporalio_workflow::common::protos::temporal::api::common::v1::Payloads,
+                    converter: &::temporalio_workflow::common::data_converters::PayloadConverter,
+                ) -> Result<::std::option::Option<::std::boxed::Box<dyn ::std::any::Any>>, ::temporalio_workflow::workflows::WorkflowError> {
+                    match name {
+                        #(#decode_query_arms)*
+                        _ => Ok(::std::option::Option::None),
+                    }
+                }
+            }
+        };
+
+        let dispatch_query_impl = if self.queries.is_empty() {
+            quote! {
+                fn dispatch_query(
+                    &self,
+                    _ctx: ::temporalio_workflow::WorkflowContextView,
+                    name: &str,
+                    _input: ::std::boxed::Box<dyn ::std::any::Any>,
+                    _converter: &::temporalio_workflow::common::data_converters::PayloadConverter,
+                ) -> Result<::temporalio_workflow::common::protos::temporal::api::common::v1::Payload, ::temporalio_workflow::workflows::WorkflowError> {
+                    unreachable!("typed query dispatch called for unknown query handler '{name}'")
+                }
+            }
         } else {
             quote! {
                 fn dispatch_query(
                     &self,
                     ctx: ::temporalio_workflow::WorkflowContextView,
                     name: &str,
-                    payloads: &::temporalio_workflow::common::protos::temporal::api::common::v1::Payloads,
+                    input: ::std::boxed::Box<dyn ::std::any::Any>,
                     converter: &::temporalio_workflow::common::data_converters::PayloadConverter,
-                ) -> Option<Result<::temporalio_workflow::common::protos::temporal::api::common::v1::Payload, ::temporalio_workflow::workflows::WorkflowError>> {
+                ) -> Result<::temporalio_workflow::common::protos::temporal::api::common::v1::Payload, ::temporalio_workflow::workflows::WorkflowError> {
                     match name {
                         #(#dispatch_query_arms)*
-                        _ => None,
+                        _ => unreachable!("typed query dispatch called for unknown query handler '{name}'"),
                     }
                 }
             }
@@ -1255,8 +1412,11 @@ impl WorkflowMethodsDefinition {
                 }
 
                 #dispatch_signal_impl
+                #decode_signal_impl
                 #dispatch_update_impl
+                #decode_update_impl
                 #dispatch_query_impl
+                #decode_query_impl
             }
         }
     }

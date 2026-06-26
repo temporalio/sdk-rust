@@ -496,7 +496,7 @@ fn merge_transition_dests(transitions: Vec<Transition>) -> Vec<Transition> {
         };
         match map.entry(without_dests) {
             Entry::Occupied(mut e) => {
-                e.get_mut().to.extend(t.to.into_iter());
+                e.get_mut().to.extend(t.to);
             }
             Entry::Vacant(v) => {
                 v.insert(t);

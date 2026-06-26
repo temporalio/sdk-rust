@@ -21,6 +21,7 @@ use futures_util::{
 use std::{
     cell::RefCell,
     collections::HashMap,
+    future::ready,
     rc::Rc,
     task::{Context, Poll, Waker},
 };
@@ -191,68 +192,101 @@ where
             payloads: signal.input,
         };
         let converter = self.ctx.payload_converter();
-        let ctx = self.ctx.with_headers(signal.headers);
-        if let Some(future) = W::dispatch_signal(ctx, &name, payloads, converter) {
-            let routine_id = self.next_routine_id();
-            self.routines
-                .insert(routine_id, GuestRoutine::Signal { future });
-            ActivationJobResult::StartedRoutine(StartedRoutine {
-                routine_id,
-                kind: RoutineKind::Signal(name),
-            })
-        } else {
-            ActivationJobResult::None
-        }
+        let future = match W::decode_signal_input(&name, payloads, converter) {
+            Ok(Some(input)) => {
+                let ctx = self.ctx.with_headers(signal.headers);
+                W::dispatch_signal(ctx, &name, input)
+            }
+            Err(err) => ready(Err(err)).boxed_local(),
+            Ok(None) => return ActivationJobResult::None,
+        };
+        let routine_id = self.next_routine_id();
+        self.routines
+            .insert(routine_id, GuestRoutine::Signal { future });
+        ActivationJobResult::StartedRoutine(StartedRoutine {
+            routine_id,
+            kind: RoutineKind::Signal(name),
+        })
     }
 
     fn start_update_routine(&mut self, update: DoUpdate) -> ActivationJobResult {
-        let protocol_instance_id = update.protocol_instance_id.clone();
-        let name = update.name.clone();
-        if update.run_validator {
+        let DoUpdate {
+            id,
+            protocol_instance_id,
+            name,
+            input,
+            headers,
+            run_validator,
+            ..
+        } = update;
+        let has_validator = match W::definition()
+            .updates
+            .into_iter()
+            .find(|update| update.name.as_str() == name)
+            .map(|update| update.has_validator)
+        {
+            Some(has_validator) => has_validator,
+            None => return self.rejection_for_missing_update_handler(name),
+        };
+
+        if run_validator && has_validator {
             let payloads = Payloads {
-                payloads: update.input.clone(),
+                payloads: input.clone(),
             };
             let converter = self.ctx.payload_converter();
+            let decoded_input = match W::decode_update_input(&name, payloads, converter) {
+                Ok(Some(input)) => input,
+                Err(err) => {
+                    return ActivationJobResult::UpdateRejected(Box::new(
+                        self.workflow_error_to_failure(err),
+                    ));
+                }
+                Ok(None) => {
+                    return self.rejection_for_missing_update_handler(name);
+                }
+            };
             let view = self.ctx.view();
             let validation = self
                 .ctx
-                .state(|wf| wf.validate_update(view, &update.name, &payloads, converter));
+                .state(|wf| wf.validate_update(view, &name, decoded_input));
             match validation {
-                Some(Ok(())) => {}
-                Some(Err(e)) => {
+                Ok(()) => {}
+                Err(e) => {
                     return ActivationJobResult::UpdateRejected(Box::new(
                         self.workflow_error_to_failure(e),
                     ));
                 }
-                None => return self.rejection_for_missing_update_handler(name),
             }
         }
 
-        let payloads = Payloads {
-            payloads: update.input,
-        };
+        let payloads = Payloads { payloads: input };
         let converter = self.ctx.payload_converter();
-        let ctx = self.ctx.with_headers(update.headers);
-        if let Some(future) = W::dispatch_update(ctx, &name, payloads, converter) {
-            let routine_id = self.next_routine_id();
-            self.routines.insert(
-                routine_id,
-                GuestRoutine::Update {
-                    protocol_instance_id: protocol_instance_id.clone(),
-                    future,
-                },
-            );
-            ActivationJobResult::StartedRoutine(StartedRoutine {
-                routine_id,
-                kind: RoutineKind::Update(UpdateRoutineKind {
-                    name,
-                    update_id: update.id,
-                    protocol_instance_id,
-                }),
-            })
-        } else {
-            self.rejection_for_missing_update_handler(name)
-        }
+        let future = match W::decode_update_input(&name, payloads, converter) {
+            Ok(Some(input)) => {
+                let ctx = self.ctx.with_headers(headers);
+                W::dispatch_update(ctx, &name, input, converter)
+            }
+            Err(err) => ready(Err(err)).boxed_local(),
+            Ok(None) => {
+                return self.rejection_for_missing_update_handler(name);
+            }
+        };
+        let routine_id = self.next_routine_id();
+        self.routines.insert(
+            routine_id,
+            GuestRoutine::Update {
+                protocol_instance_id: protocol_instance_id.clone(),
+                future,
+            },
+        );
+        ActivationJobResult::StartedRoutine(StartedRoutine {
+            routine_id,
+            kind: RoutineKind::Update(UpdateRoutineKind {
+                name,
+                update_id: id,
+                protocol_instance_id,
+            }),
+        })
     }
 
     fn query(&self, query: QueryWorkflow) -> QueryResponse {
@@ -265,18 +299,27 @@ where
         };
         let converter = self.ctx.payload_converter();
         let view = self.ctx.view();
+        let decoded_input = match W::decode_query_input(&query.query_type, &payloads, converter) {
+            Ok(Some(input)) => input,
+            Err(err) => {
+                return QueryResponse {
+                    result: Err(self.workflow_error_to_failure(err)),
+                };
+            }
+            Ok(None) => {
+                return QueryResponse {
+                    result: Err(self.message_to_failure(format!(
+                        "No query handler for '{}'",
+                        query.query_type
+                    ))),
+                };
+            }
+        };
         QueryResponse {
-            result: match self
+            result: self
                 .ctx
-                .state(|wf| wf.dispatch_query(view, &query.query_type, &payloads, converter))
-            {
-                Some(Ok(payload)) => Ok(payload),
-                None => {
-                    Err(self
-                        .message_to_failure(format!("No query handler for '{}'", query.query_type)))
-                }
-                Some(Err(e)) => Err(self.workflow_error_to_failure(e)),
-            },
+                .state(|wf| wf.dispatch_query(view, &query.query_type, decoded_input, converter))
+                .map_err(|err| self.workflow_error_to_failure(err)),
         }
     }
 

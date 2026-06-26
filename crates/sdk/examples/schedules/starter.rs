@@ -1,3 +1,5 @@
+mod workflows;
+
 use futures_util::StreamExt;
 use temporalio_client::{
     Client, ClientOptions, Connection,
@@ -21,7 +23,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             schedule_id,
             CreateScheduleOptions::builder()
                 .action(ScheduleAction::start_workflow(
-                    "ScheduledWorkflow",
+                    workflows::ScheduledWorkflow::run,
+                    "world".to_string(),
                     "schedules",
                     "scheduled-workflow",
                 ))

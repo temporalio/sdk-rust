@@ -1,16 +1,25 @@
 use crate::{Client, NamespacedClient, grpc::WorkflowService};
-use futures_util::stream;
+use futures_util::{FutureExt, future::BoxFuture, stream};
 use std::{
     collections::VecDeque,
     pin::Pin,
+    sync::Arc,
     task::{Context, Poll},
     time::{Duration, SystemTime},
 };
-use temporalio_common::protos::{
-    proto_ts_to_system_time,
-    temporal::api::{
-        common::v1 as common_proto, schedule::v1 as schedule_proto,
-        taskqueue::v1 as taskqueue_proto, workflow::v1 as workflow_proto, workflowservice::v1::*,
+use temporalio_common::{
+    HasWorkflowDefinition,
+    data_converters::{
+        DataConverter, PayloadConversionError, SerializationContextData, TemporalSerializable,
+    },
+    protos::{
+        coresdk::IntoPayloadsExt,
+        proto_ts_to_system_time,
+        temporal::api::{
+            common::v1 as common_proto, schedule::v1 as schedule_proto,
+            taskqueue::v1 as taskqueue_proto, workflow::v1 as workflow_proto,
+            workflowservice::v1::*,
+        },
     },
 };
 use tonic::IntoRequest;
@@ -23,6 +32,61 @@ pub enum ScheduleError {
     /// An rpc error from the server.
     #[error("Server error: {0}")]
     Rpc(#[from] tonic::Status),
+    /// Failed to encode workflow input payloads.
+    #[error("Payload conversion error: {0}")]
+    PayloadConversion(#[from] PayloadConversionError),
+}
+
+trait SerializableScheduleInput: Send + Sync {
+    fn to_payloads<'a>(
+        &'a self,
+        dc: &'a DataConverter,
+        context: &'a SerializationContextData,
+    ) -> BoxFuture<'a, Result<Vec<common_proto::Payload>, PayloadConversionError>>;
+}
+
+impl<T> SerializableScheduleInput for T
+where
+    T: TemporalSerializable + Send + Sync + 'static,
+{
+    fn to_payloads<'a>(
+        &'a self,
+        dc: &'a DataConverter,
+        context: &'a SerializationContextData,
+    ) -> BoxFuture<'a, Result<Vec<common_proto::Payload>, PayloadConversionError>> {
+        dc.to_payloads(context, self).boxed()
+    }
+}
+
+/// Workflow input for a schedule action, stored unencoded until the schedule is created.
+#[derive(derive_more::Debug, Clone)]
+pub struct ScheduleWorkflowInput {
+    repr: ScheduleWorkflowInputRepr,
+}
+
+#[derive(derive_more::Debug, Clone)]
+enum ScheduleWorkflowInputRepr {
+    #[debug("Deferred(...)")]
+    Deferred(#[debug(skip)] Arc<dyn SerializableScheduleInput>),
+}
+
+impl ScheduleWorkflowInput {
+    fn new_deferred<T>(val: T) -> Self
+    where
+        T: SerializableScheduleInput + 'static,
+    {
+        Self {
+            repr: ScheduleWorkflowInputRepr::Deferred(Arc::new(val)),
+        }
+    }
+
+    pub(crate) async fn into_payloads(
+        self,
+        dc: &DataConverter,
+    ) -> Result<Vec<common_proto::Payload>, PayloadConversionError> {
+        let ScheduleWorkflowInputRepr::Deferred(v) = self.repr;
+        v.to_payloads(dc, &SerializationContextData::Workflow).await
+    }
 }
 
 /// Options for creating a schedule.
@@ -51,7 +115,7 @@ pub struct CreateScheduleOptions {
 
 /// The action a schedule should perform on each trigger.
 // TODO: The proto supports other action types beyond StartWorkflow.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(derive_more::Debug, Clone)]
 #[non_exhaustive]
 pub enum ScheduleAction {
     /// Start a workflow execution.
@@ -62,44 +126,64 @@ pub enum ScheduleAction {
         task_queue: String,
         /// The workflow ID prefix. The server may append a timestamp.
         workflow_id: String,
+        /// Workflow input to pass on each execution. `None` means no input.
+        input: Option<ScheduleWorkflowInput>,
     },
 }
 
 impl ScheduleAction {
-    /// Create a start-workflow action.
-    pub fn start_workflow(
-        workflow_type: impl Into<String>,
+    /// Create a start-workflow action. Input is encoded when the schedule is created.
+    pub fn start_workflow<W>(
+        workflow: W,
+        input: W::Input,
         task_queue: impl Into<String>,
         workflow_id: impl Into<String>,
-    ) -> Self {
+    ) -> Self
+    where
+        W: HasWorkflowDefinition,
+        W::Input: TemporalSerializable + Send + Sync + 'static,
+    {
         Self::StartWorkflow {
-            workflow_type: workflow_type.into(),
+            workflow_type: workflow.name().to_string(),
             task_queue: task_queue.into(),
             workflow_id: workflow_id.into(),
+            input: Some(ScheduleWorkflowInput::new_deferred(input)),
         }
     }
 
-    pub(crate) fn into_proto(self) -> schedule_proto::ScheduleAction {
+    pub(crate) async fn into_proto(
+        self,
+        dc: &DataConverter,
+    ) -> Result<schedule_proto::ScheduleAction, PayloadConversionError> {
         match self {
             Self::StartWorkflow {
                 workflow_type,
                 task_queue,
                 workflow_id,
-            } => schedule_proto::ScheduleAction {
-                action: Some(schedule_proto::schedule_action::Action::StartWorkflow(
-                    workflow_proto::NewWorkflowExecutionInfo {
-                        workflow_id,
-                        workflow_type: Some(common_proto::WorkflowType {
-                            name: workflow_type,
-                        }),
-                        task_queue: Some(taskqueue_proto::TaskQueue {
-                            name: task_queue,
+                input,
+            } => {
+                let input = if let Some(wi) = input {
+                    wi.into_payloads(dc).await?.into_payloads()
+                } else {
+                    None
+                };
+                Ok(schedule_proto::ScheduleAction {
+                    action: Some(schedule_proto::schedule_action::Action::StartWorkflow(
+                        workflow_proto::NewWorkflowExecutionInfo {
+                            workflow_id,
+                            workflow_type: Some(common_proto::WorkflowType {
+                                name: workflow_type,
+                            }),
+                            task_queue: Some(taskqueue_proto::TaskQueue {
+                                name: task_queue,
+                                ..Default::default()
+                            }),
+                            input,
                             ..Default::default()
-                        }),
-                        ..Default::default()
-                    },
-                )),
-            },
+                        },
+                    )),
+                })
+            }
         }
     }
 }
@@ -460,6 +544,7 @@ impl ScheduleDescription {
     pub fn into_update(self) -> ScheduleUpdate {
         ScheduleUpdate {
             schedule: self.raw.schedule.unwrap_or_default(),
+            pending_action: None,
         }
     }
 }
@@ -527,6 +612,7 @@ pub struct ScheduleBackfill {
 #[derive(Debug, Clone)]
 pub struct ScheduleUpdate {
     schedule: schedule_proto::Schedule,
+    pending_action: Option<ScheduleAction>,
 }
 
 impl ScheduleUpdate {
@@ -538,7 +624,7 @@ impl ScheduleUpdate {
 
     /// Replace the schedule action (what to do on trigger).
     pub fn set_action(&mut self, action: ScheduleAction) -> &mut Self {
-        self.schedule.action = Some(action.into_proto());
+        self.pending_action = Some(action);
         self
     }
 
@@ -790,7 +876,10 @@ where
     /// Prefer [`update()`](Self::update) for most use cases. Use this when you
     /// need to inspect the [`ScheduleDescription`] before deciding what to
     /// change.
-    pub async fn send_update(&self, update: ScheduleUpdate) -> Result<(), ScheduleError> {
+    pub async fn send_update(&self, mut update: ScheduleUpdate) -> Result<(), ScheduleError> {
+        if let Some(action) = update.pending_action.take() {
+            update.schedule.action = Some(action.into_proto(self.client.data_converter()).await?);
+        }
         WorkflowService::update_schedule(
             &mut self.client.clone(),
             UpdateScheduleRequest {
@@ -960,7 +1049,7 @@ impl Client {
         });
         let schedule = schedule_proto::Schedule {
             spec: Some(opts.spec.into_proto()),
-            action: Some(opts.action.into_proto()),
+            action: Some(opts.action.into_proto(self.data_converter()).await?),
             policies,
             state: Some(schedule_proto::ScheduleState {
                 paused: opts.paused,
@@ -1676,5 +1765,35 @@ mod tests {
             ScheduleOverlapPolicy::default(),
             ScheduleOverlapPolicy::Unspecified
         );
+    }
+
+    #[tokio::test]
+    async fn schedule_action_start_workflow_with_input_into_proto() {
+        use temporalio_common::{
+            UntypedWorkflow,
+            data_converters::{DataConverter, RawValue},
+            protos::temporal::api::common::v1::Payload,
+        };
+
+        let payload = Payload {
+            metadata: [("encoding".to_string(), b"json/plain".to_vec())]
+                .into_iter()
+                .collect(),
+            data: b"42".to_vec(),
+            ..Default::default()
+        };
+        let action = ScheduleAction::start_workflow(
+            UntypedWorkflow::new("MyWorkflow"),
+            RawValue::new(vec![payload.clone()]),
+            "my-queue",
+            "my-wf-id",
+        );
+        let proto = action.into_proto(&DataConverter::default()).await.unwrap();
+        #[allow(irrefutable_let_patterns)]
+        let schedule_proto::schedule_action::Action::StartWorkflow(wf_info) = proto.action.unwrap()
+        else {
+            panic!("expected StartWorkflow action")
+        };
+        assert_eq!(wf_info.input.unwrap().payloads, vec![payload]);
     }
 }
