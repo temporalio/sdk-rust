@@ -319,7 +319,7 @@ impl ChildWorkflowOptions {
                     .task_timeout
                     .and_then(|duration| duration.try_into().ok()),
                 cron_schedule: self.cron_schedule.unwrap_or_default(),
-                search_attributes: self.search_attributes.map(|t| t.to_proto()),
+                search_attributes: self.search_attributes.map(|t| t.into_proto()),
                 priority: self.priority.map(Into::into),
                 ..Default::default()
             }),
@@ -594,7 +594,7 @@ impl ContinueAsNewOptions {
                 .and_then(|duration| duration.try_into().ok()),
             memo: self.memo.unwrap_or_default(),
             headers: self.headers.unwrap_or_default(),
-            search_attributes: self.search_attributes.map(|t| t.to_proto()),
+            search_attributes: self.search_attributes.map(|t| t.into_proto()),
             retry_policy: self.retry_policy,
             versioning_intent: self
                 .versioning_intent

@@ -23,6 +23,9 @@ bon = { workspace = true }
 crc32fast = "1"
 derive_more = { workspace = true }
 erased-serde = "0.4"
+# Only the `alloc` feature is needed for RFC3339 formatting. Do NOT use
+# Utc::now() or other clock functions — they are unavailable in
+# wasm32-unknown-unknown without the `wasmbind` feature.
 chrono = { version = "0.4", default-features = false, features = ["alloc"] }
 futures = { version = "0.3", default-features = false, features = ["alloc"] }
 parking_lot = { version = "0.12" }

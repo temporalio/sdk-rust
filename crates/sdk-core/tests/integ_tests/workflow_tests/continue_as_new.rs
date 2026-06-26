@@ -185,7 +185,7 @@ impl ClearSearchAttrsOnContinueAsNewWf {
             ctx.continue_as_new(&false, opts)?;
         }
 
-        assert!(ctx.search_attributes().indexed_fields.is_empty());
+        assert!(ctx.search_attributes().is_empty());
         Ok(())
     }
 }

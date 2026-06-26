@@ -20,6 +20,8 @@
 use std::collections::HashMap;
 use std::marker::PhantomData;
 
+use tracing::warn;
+
 use crate::protos::temporal::api::common::v1::{
     Payload, SearchAttributes as ProtoSearchAttributes,
 };
@@ -30,6 +32,7 @@ const TYPE_METADATA_KEY: &str = "type";
 
 /// Errors arising from search attribute serialization or deserialization.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum SearchAttributeError {
     /// JSON serialization failed.
     #[error("failed to serialize search attribute value: {0}")]
@@ -58,14 +61,45 @@ pub enum SearchAttributeError {
 /// [`std::time::SystemTime`].
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Timestamp {
-    /// Seconds since the Unix epoch (1970-01-01T00:00:00Z).
-    /// For times before the epoch, seconds is negative and `nanos` still
-    /// represents a non-negative offset within that second.
-    pub seconds: i64,
-    /// Non-negative fractions of a second at nanosecond resolution.
-    /// Must be in the range `[0, 999_999_999]` (following the protobuf
-    /// `google.protobuf.Timestamp` convention).
-    pub nanos: i32,
+    seconds: i64,
+    nanos: i32,
+}
+
+impl Timestamp {
+    /// The maximum valid value for nanoseconds.
+    const MAX_NANOS: i32 = 999_999_999;
+
+    /// Creates a new `Timestamp`.
+    ///
+    /// # Arguments
+    /// * `seconds` — seconds since the Unix epoch (negative for pre-epoch).
+    /// * `nanos` — non-negative nanosecond offset within the second,
+    ///   in the range `[0, 999_999_999]`. Values outside this range are
+    ///   clamped.
+    pub fn new(seconds: i64, nanos: i32) -> Self {
+        Self {
+            seconds,
+            nanos: nanos.clamp(0, Self::MAX_NANOS),
+        }
+    }
+
+    /// Returns seconds since the Unix epoch.
+    pub fn seconds(&self) -> i64 {
+        self.seconds
+    }
+
+    /// Returns the nanosecond component (always in `[0, 999_999_999]`).
+    pub fn nanos(&self) -> i32 {
+        self.nanos
+    }
+
+    /// Returns this timestamp as a `prost_types::Timestamp`.
+    pub fn to_prost(&self) -> prost_types::Timestamp {
+        prost_types::Timestamp {
+            seconds: self.seconds,
+            nanos: self.nanos,
+        }
+    }
 }
 
 impl std::fmt::Display for Timestamp {
@@ -81,18 +115,15 @@ impl std::fmt::Display for Timestamp {
 
 impl From<prost_types::Timestamp> for Timestamp {
     fn from(ts: prost_types::Timestamp) -> Self {
-        Self {
-            seconds: ts.seconds,
-            nanos: ts.nanos,
-        }
+        Timestamp::new(ts.seconds, ts.nanos)
     }
 }
 
 impl From<Timestamp> for prost_types::Timestamp {
     fn from(ts: Timestamp) -> Self {
         prost_types::Timestamp {
-            seconds: ts.seconds,
-            nanos: ts.nanos,
+            seconds: ts.seconds(),
+            nanos: ts.nanos(),
         }
     }
 }
@@ -100,10 +131,7 @@ impl From<Timestamp> for prost_types::Timestamp {
 impl From<std::time::SystemTime> for Timestamp {
     fn from(st: std::time::SystemTime) -> Self {
         match st.duration_since(std::time::UNIX_EPOCH) {
-            Ok(dur) => Self {
-                seconds: dur.as_secs() as i64,
-                nanos: dur.subsec_nanos() as i32,
-            },
+            Ok(dur) => Timestamp::new(dur.as_secs() as i64, dur.subsec_nanos() as i32),
             Err(e) => {
                 // Normalize to protobuf convention: nanos always non-negative.
                 // Example: 1.25s before epoch → { seconds: -2, nanos: 750_000_000 }
@@ -111,15 +139,9 @@ impl From<std::time::SystemTime> for Timestamp {
                 let secs = dur.as_secs() as i64;
                 let nanos = dur.subsec_nanos();
                 if nanos == 0 {
-                    Self {
-                        seconds: -secs,
-                        nanos: 0,
-                    }
+                    Timestamp::new(-secs, 0)
                 } else {
-                    Self {
-                        seconds: -(secs + 1),
-                        nanos: (1_000_000_000 - nanos) as i32,
-                    }
+                    Timestamp::new(-(secs + 1), (1_000_000_000 - nanos) as i32)
                 }
             }
         }
@@ -188,6 +210,10 @@ pub trait SearchAttributeValue: private::Sealed + Clone + Sized {
     fn from_search_attribute_payload(payload: &Payload) -> Result<Self, SearchAttributeError>;
 
     /// The default [`IndexedValueType`] for this Rust type.
+    ///
+    /// This is used internally when a key does not explicitly specify the
+    /// indexed value type. Most callers should use [`SearchAttributeKey`]
+    /// constructors rather than calling this directly.
     fn default_indexed_value_type() -> IndexedValueType;
 }
 
@@ -195,6 +221,7 @@ pub trait SearchAttributeValue: private::Sealed + Clone + Sized {
 // Shared JSON payload helpers (reuses the SDK's JSON payload encoding conventions)
 // ---------------------------------------------------------------------------
 
+#[allow(unreachable_patterns)] // Wildcard is intentional for forward-compat with new proto variants
 fn type_metadata_str(ivt: IndexedValueType) -> &'static str {
     match ivt {
         IndexedValueType::Bool => "Bool",
@@ -204,7 +231,7 @@ fn type_metadata_str(ivt: IndexedValueType) -> &'static str {
         IndexedValueType::Text => "Text",
         IndexedValueType::Datetime => "Datetime",
         IndexedValueType::KeywordList => "KeywordList",
-        IndexedValueType::Unspecified => "Unspecified",
+        IndexedValueType::Unspecified | _ => "Unspecified",
     }
 }
 
@@ -324,11 +351,11 @@ impl SearchAttributeValue for f64 {
 fn timestamp_to_rfc3339(ts: &Timestamp) -> Result<String, SearchAttributeError> {
     use chrono::{DateTime, Utc};
 
-    let nanos = u32::try_from(ts.nanos.max(0)).unwrap_or(0);
-    let dt = DateTime::<Utc>::from_timestamp(ts.seconds, nanos).ok_or_else(|| {
+    let nanos = u32::try_from(ts.nanos()).unwrap_or(0);
+    let dt = DateTime::<Utc>::from_timestamp(ts.seconds(), nanos).ok_or_else(|| {
         SearchAttributeError::InvalidTimestamp(format!(
             "cannot represent seconds={} nanos={} as DateTime",
-            ts.seconds, ts.nanos
+            ts.seconds(), ts.nanos()
         ))
     })?;
     Ok(dt.to_rfc3339_opts(chrono::SecondsFormat::Nanos, true))
@@ -338,14 +365,16 @@ fn timestamp_to_rfc3339(ts: &Timestamp) -> Result<String, SearchAttributeError> 
 fn rfc3339_to_timestamp(s: &str) -> Result<Timestamp, SearchAttributeError> {
     use chrono::DateTime;
 
+    // Strip surrounding quotes if present — some SDKs or raw payloads may
+    // pass the RFC3339 string with JSON-style quotes still attached.
     let s = s.trim_matches('"');
     let dt = DateTime::parse_from_rfc3339(s).map_err(|e| {
         SearchAttributeError::InvalidTimestamp(format!("failed to parse RFC3339 '{}': {}", s, e))
     })?;
-    Ok(Timestamp {
-        seconds: dt.timestamp(),
-        nanos: dt.timestamp_subsec_nanos() as i32,
-    })
+    Ok(Timestamp::new(
+        dt.timestamp(),
+        dt.timestamp_subsec_nanos() as i32,
+    ))
 }
 
 impl SearchAttributeValue for Timestamp {
@@ -375,11 +404,16 @@ impl SearchAttributeValue for Timestamp {
 /// type level. Construct via the const factory methods such as
 /// [`SearchAttributeKey::bool`], [`SearchAttributeKey::keyword`], etc.
 ///
+/// # Key names
+///
 /// Key names must be `&'static str`, which enables compile-time construction
 /// via `const` but means runtime-determined key names are not supported.
-/// Define keys as constants:
+/// For dynamic key names (e.g., from config), use
+/// [`SearchAttributes::raw_payload`] as an escape hatch for untyped access.
 ///
-/// ```rust,ignore
+/// ```
+/// use temporalio_common_wasm::search_attributes::SearchAttributeKey;
+///
 /// const MY_KEY: SearchAttributeKey<String> = SearchAttributeKey::keyword("my_attr");
 /// ```
 #[derive(Debug, Clone, Copy)]
@@ -511,8 +545,16 @@ impl SearchAttributeKey<Vec<String>> {
 // SearchAttributeUpdate
 // ---------------------------------------------------------------------------
 
-/// A pending mutation to a single search attribute. `None` payload means the
-/// attribute should be removed.
+/// A pending mutation to a single search attribute.
+///
+/// When `payload` is `None`, the attribute should be removed. The semantics
+/// differ slightly depending on how the update is consumed:
+///
+/// - [`SearchAttributes::new`] / [`SearchAttributes::apply`]: a `None` payload
+///   removes the key from the in-memory collection (the key is simply absent).
+/// - [`SearchAttributes::updates_to_proto`]: a `None` payload produces an
+///   empty [`Payload`] in the proto map, signaling the server to clear that
+///   attribute.
 #[derive(Debug, Clone)]
 pub struct SearchAttributeUpdate {
     pub(crate) name: String,
@@ -537,7 +579,7 @@ impl SearchAttributeUpdate {
 
 /// A collection of search attribute payloads, providing type-safe access via
 /// [`SearchAttributeKey`].
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct SearchAttributes {
     fields: HashMap<String, Payload>,
 }
@@ -561,11 +603,36 @@ impl SearchAttributes {
         Self { fields }
     }
 
+    /// Apply a single update to this collection. If the update sets a value,
+    /// it is inserted (replacing any existing entry); if the update unsets a
+    /// value, the entry is removed.
+    pub fn apply(&mut self, update: SearchAttributeUpdate) {
+        match update.payload {
+            Some(payload) => {
+                self.fields.insert(update.name, payload);
+            }
+            None => {
+                self.fields.remove(&update.name);
+            }
+        }
+    }
+
     /// Retrieve a typed value. Returns `None` if the key is absent or
     /// deserialization fails (graceful degradation — no panic on type mismatch).
     pub fn get<T: SearchAttributeValue>(&self, key: &SearchAttributeKey<T>) -> Option<T> {
         let payload = self.fields.get(key.name())?;
-        T::from_search_attribute_payload(payload).ok()
+        match T::from_search_attribute_payload(payload) {
+            Ok(val) => Some(val),
+            Err(e) => {
+                warn!(
+                    key = key.name(),
+                    error = %e,
+                    "Failed to deserialize search attribute; returning None. \
+                     Use try_get() for explicit error handling."
+                );
+                None
+            }
+        }
     }
 
     /// Retrieve a typed value, distinguishing "key absent" from "deserialization
@@ -629,7 +696,18 @@ impl SearchAttributes {
             fields: attrs.indexed_fields.clone(),
         }
     }
+}
 
+impl From<ProtoSearchAttributes> for SearchAttributes {
+    /// Construct from an owned proto, moving the inner map without cloning.
+    fn from(attrs: ProtoSearchAttributes) -> Self {
+        Self {
+            fields: attrs.indexed_fields,
+        }
+    }
+}
+
+impl SearchAttributes {
     /// Convert to the proto representation, producing empty-data payloads for
     /// entries that were unset. This is used when building an upsert command
     /// that needs to explicitly clear attributes on the server.
@@ -638,11 +716,7 @@ impl SearchAttributes {
     ) -> ProtoSearchAttributes {
         let mut indexed_fields = HashMap::new();
         for update in updates {
-            let payload = update.payload.unwrap_or_else(|| Payload {
-                metadata: HashMap::new(),
-                data: Vec::new(),
-                ..Default::default()
-            });
+            let payload = update.payload.unwrap_or_default();
             indexed_fields.insert(update.name, payload);
         }
         ProtoSearchAttributes { indexed_fields }
@@ -732,10 +806,7 @@ mod tests {
 
     #[test]
     fn round_trip_datetime() {
-        let ts = Timestamp {
-            seconds: 1_700_000_000,
-            nanos: 123_456_789,
-        };
+        let ts = Timestamp::new(1_700_000_000, 123_456_789);
         let payload = ts
             .to_search_attribute_payload(IndexedValueType::Datetime)
             .unwrap();
@@ -746,27 +817,24 @@ mod tests {
         assert!(json_str.contains('T'));
 
         let decoded = Timestamp::from_search_attribute_payload(&payload).unwrap();
-        assert_eq!(decoded.seconds, ts.seconds);
-        assert_eq!(decoded.nanos, ts.nanos);
+        assert_eq!(decoded.seconds(), ts.seconds());
+        assert_eq!(decoded.nanos(), ts.nanos());
 
         let attrs = SearchAttributes::new([DT_KEY.value_set(ts.clone())]);
         let got = attrs.get(&DT_KEY).unwrap();
-        assert_eq!(got.seconds, ts.seconds);
-        assert_eq!(got.nanos, ts.nanos);
+        assert_eq!(got.seconds(), ts.seconds());
+        assert_eq!(got.nanos(), ts.nanos());
     }
 
     #[test]
     fn round_trip_datetime_no_nanos() {
-        let ts = Timestamp {
-            seconds: 0,
-            nanos: 0,
-        };
+        let ts = Timestamp::new(0, 0);
         let payload = ts
             .to_search_attribute_payload(IndexedValueType::Datetime)
             .unwrap();
         let decoded = Timestamp::from_search_attribute_payload(&payload).unwrap();
-        assert_eq!(decoded.seconds, 0);
-        assert_eq!(decoded.nanos, 0);
+        assert_eq!(decoded.seconds(), 0);
+        assert_eq!(decoded.nanos(), 0);
     }
 
     #[test]
@@ -884,10 +952,7 @@ mod tests {
 
     #[test]
     fn timestamp_rfc3339_format() {
-        let ts = Timestamp {
-            seconds: 1_700_000_000,
-            nanos: 0,
-        };
+        let ts = Timestamp::new(1_700_000_000, 0);
         let rfc = timestamp_to_rfc3339(&ts).unwrap();
         // SecondsFormat::Nanos emits full precision even for zero nanos
         assert_eq!(rfc, "2023-11-14T22:13:20.000000000Z");
@@ -895,16 +960,13 @@ mod tests {
 
     #[test]
     fn timestamp_rfc3339_with_nanos() {
-        let ts = Timestamp {
-            seconds: 1_700_000_000,
-            nanos: 500_000_000,
-        };
+        let ts = Timestamp::new(1_700_000_000, 500_000_000);
         let rfc = timestamp_to_rfc3339(&ts).unwrap();
         assert_eq!(rfc, "2023-11-14T22:13:20.500000000Z");
 
         let parsed = rfc3339_to_timestamp(&rfc).unwrap();
-        assert_eq!(parsed.seconds, ts.seconds);
-        assert_eq!(parsed.nanos, ts.nanos);
+        assert_eq!(parsed.seconds(), ts.seconds());
+        assert_eq!(parsed.nanos(), ts.nanos());
     }
 
     #[test]
@@ -925,8 +987,8 @@ mod tests {
             nanos: 42,
         };
         let ts: Timestamp = prost_ts.into();
-        assert_eq!(ts.seconds, 1_000_000);
-        assert_eq!(ts.nanos, 42);
+        assert_eq!(ts.seconds(), 1_000_000);
+        assert_eq!(ts.nanos(), 42);
 
         let back: prost_types::Timestamp = ts.into();
         assert_eq!(back.seconds, 1_000_000);
@@ -937,8 +999,8 @@ mod tests {
     fn timestamp_from_system_time() {
         let st = std::time::UNIX_EPOCH + std::time::Duration::new(1_700_000_000, 123_456_789);
         let ts: Timestamp = st.into();
-        assert_eq!(ts.seconds, 1_700_000_000);
-        assert_eq!(ts.nanos, 123_456_789);
+        assert_eq!(ts.seconds(), 1_700_000_000);
+        assert_eq!(ts.nanos(), 123_456_789);
 
         let back: std::time::SystemTime = ts.try_into().unwrap();
         assert_eq!(back, st);
@@ -951,8 +1013,8 @@ mod tests {
         // 1.25 seconds before epoch → { seconds: -2, nanos: 750_000_000 }
         let st = std::time::UNIX_EPOCH - std::time::Duration::new(1, 250_000_000);
         let ts: Timestamp = st.into();
-        assert_eq!(ts.seconds, -2);
-        assert_eq!(ts.nanos, 750_000_000);
+        assert_eq!(ts.seconds(), -2);
+        assert_eq!(ts.nanos(), 750_000_000);
 
         let back: std::time::SystemTime = ts.try_into().unwrap();
         assert_eq!(back, st);
@@ -963,8 +1025,8 @@ mod tests {
         // Exactly 5 seconds before epoch
         let st = std::time::UNIX_EPOCH - std::time::Duration::new(5, 0);
         let ts: Timestamp = st.into();
-        assert_eq!(ts.seconds, -5);
-        assert_eq!(ts.nanos, 0);
+        assert_eq!(ts.seconds(), -5);
+        assert_eq!(ts.nanos(), 0);
 
         let back: std::time::SystemTime = ts.try_into().unwrap();
         assert_eq!(back, st);
@@ -972,16 +1034,13 @@ mod tests {
 
     #[test]
     fn timestamp_pre_epoch_rfc3339_round_trip() {
-        let ts = Timestamp {
-            seconds: -2,
-            nanos: 750_000_000,
-        };
+        let ts = Timestamp::new(-2, 750_000_000);
         let payload = ts
             .to_search_attribute_payload(IndexedValueType::Datetime)
             .unwrap();
         let decoded = Timestamp::from_search_attribute_payload(&payload).unwrap();
-        assert_eq!(decoded.seconds, ts.seconds);
-        assert_eq!(decoded.nanos, ts.nanos);
+        assert_eq!(decoded.seconds(), ts.seconds());
+        assert_eq!(decoded.nanos(), ts.nanos());
     }
 
     #[test]
@@ -1104,5 +1163,87 @@ mod tests {
         let key = BOOL_KEY;
         let key2 = key; // Copy, not move
         assert_eq!(key.name(), key2.name());
+    }
+
+    #[test]
+    fn timestamp_new_clamps_negative_nanos() {
+        let ts = Timestamp::new(100, -42);
+        assert_eq!(ts.seconds(), 100);
+        assert_eq!(ts.nanos(), 0); // clamped to 0
+    }
+
+    #[test]
+    fn timestamp_new_clamps_excessive_nanos() {
+        let ts = Timestamp::new(100, 2_000_000_000);
+        assert_eq!(ts.seconds(), 100);
+        assert_eq!(ts.nanos(), 999_999_999); // clamped to MAX_NANOS
+    }
+
+    #[test]
+    fn timestamp_to_prost_round_trips() {
+        let ts = Timestamp::new(1_700_000_000, 123_456_789);
+        let prost_ts = ts.to_prost();
+        assert_eq!(prost_ts.seconds, 1_700_000_000);
+        assert_eq!(prost_ts.nanos, 123_456_789);
+        let back: Timestamp = prost_ts.into();
+        assert_eq!(back, ts);
+    }
+
+    #[test]
+    fn apply_inserts_and_removes() {
+        let mut attrs = SearchAttributes::new([INT_KEY.value_set(42)]);
+        assert_eq!(attrs.get(&INT_KEY), Some(42));
+
+        // Apply an update that changes the value
+        attrs.apply(INT_KEY.value_set(99));
+        assert_eq!(attrs.get(&INT_KEY), Some(99));
+
+        // Apply an unset
+        attrs.apply(INT_KEY.value_unset());
+        assert_eq!(attrs.get(&INT_KEY), None);
+        assert!(attrs.is_empty());
+    }
+
+    #[test]
+    fn from_owned_proto_moves_without_clone() {
+        let proto = ProtoSearchAttributes {
+            indexed_fields: {
+                let mut m = HashMap::new();
+                m.insert(
+                    "k".to_string(),
+                    INT_KEY.value_set(7).payload.unwrap(),
+                );
+                m
+            },
+        };
+        let attrs: SearchAttributes = proto.into();
+        assert_eq!(attrs.get(&SearchAttributeKey::int("k")), Some(7));
+    }
+
+    #[test]
+    fn search_attributes_equality() {
+        let a = SearchAttributes::new([
+            BOOL_KEY.value_set(true),
+            INT_KEY.value_set(42),
+        ]);
+        let b = SearchAttributes::new([
+            BOOL_KEY.value_set(true),
+            INT_KEY.value_set(42),
+        ]);
+        let c = SearchAttributes::new([
+            BOOL_KEY.value_set(false),
+            INT_KEY.value_set(42),
+        ]);
+        assert_eq!(a, b);
+        assert_ne!(a, c);
+    }
+
+    #[test]
+    fn from_proto_trait_matches_from_proto_method() {
+        let updates = [INT_KEY.value_set(99), BOOL_KEY.value_set(true)];
+        let proto = SearchAttributes::new(updates).to_proto();
+        let via_method = SearchAttributes::from_proto(&proto);
+        let via_trait: SearchAttributes = proto.into();
+        assert_eq!(via_method, via_trait);
     }
 }
