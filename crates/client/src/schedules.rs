@@ -1769,7 +1769,7 @@ mod tests {
 
     #[tokio::test]
     async fn schedule_action_start_workflow_with_input_into_proto() {
-        use temporalio_common::workflow_definition::UntypedWorkflow;
+        use temporalio_client::UntypedWorkflow;
         use temporalio_common::{
             data_converters::{DataConverter, RawValue},
             protos::temporal::api::common::v1::Payload,
