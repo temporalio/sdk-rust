@@ -206,9 +206,7 @@ async fn clear_search_attributes_on_continue_as_new() {
             ClearSearchAttrsOnContinueAsNewWf::run,
             true,
             WorkflowStartOptions::new(task_queue, wf_name.to_string())
-                .search_attributes(SearchAttributes::new([
-                    SA_TXT.value_set("hello".into())
-                ]))
+                .search_attributes(SearchAttributes::new([SA_TXT.value_set("hello".into())]))
                 .build(),
         )
         .await

@@ -111,7 +111,7 @@ pub(crate) async fn eager_start(
                     .and_then(|d| d.try_into().ok()),
                 workflow_run_timeout: options.run_timeout.and_then(|d| d.try_into().ok()),
                 workflow_task_timeout: options.task_timeout.and_then(|d| d.try_into().ok()),
-                search_attributes: options.search_attributes.map(|d| d.into()),
+                search_attributes: options.search_attributes.map(|d| d.into_proto()),
                 cron_schedule: options.cron_schedule.unwrap_or_default(),
                 request_eager_execution: options.enable_eager_workflow_start,
                 retry_policy: options.retry_policy,

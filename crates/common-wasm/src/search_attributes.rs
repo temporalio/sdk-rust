@@ -355,7 +355,8 @@ fn timestamp_to_rfc3339(ts: &Timestamp) -> Result<String, SearchAttributeError> 
     let dt = DateTime::<Utc>::from_timestamp(ts.seconds(), nanos).ok_or_else(|| {
         SearchAttributeError::InvalidTimestamp(format!(
             "cannot represent seconds={} nanos={} as DateTime",
-            ts.seconds(), ts.nanos()
+            ts.seconds(),
+            ts.nanos()
         ))
     })?;
     Ok(dt.to_rfc3339_opts(chrono::SecondsFormat::Nanos, true))
@@ -931,10 +932,8 @@ mod tests {
 
     #[test]
     fn updates_to_proto_includes_empty_payload_for_unset() {
-        let proto = SearchAttributes::updates_to_proto([
-            BOOL_KEY.value_set(true),
-            INT_KEY.value_unset(),
-        ]);
+        let proto =
+            SearchAttributes::updates_to_proto([BOOL_KEY.value_set(true), INT_KEY.value_unset()]);
 
         let bool_payload = proto.indexed_fields.get("my_bool").unwrap();
         assert!(!bool_payload.data.is_empty());
@@ -1209,10 +1208,7 @@ mod tests {
         let proto = ProtoSearchAttributes {
             indexed_fields: {
                 let mut m = HashMap::new();
-                m.insert(
-                    "k".to_string(),
-                    INT_KEY.value_set(7).payload.unwrap(),
-                );
+                m.insert("k".to_string(), INT_KEY.value_set(7).payload.unwrap());
                 m
             },
         };
@@ -1222,18 +1218,9 @@ mod tests {
 
     #[test]
     fn search_attributes_equality() {
-        let a = SearchAttributes::new([
-            BOOL_KEY.value_set(true),
-            INT_KEY.value_set(42),
-        ]);
-        let b = SearchAttributes::new([
-            BOOL_KEY.value_set(true),
-            INT_KEY.value_set(42),
-        ]);
-        let c = SearchAttributes::new([
-            BOOL_KEY.value_set(false),
-            INT_KEY.value_set(42),
-        ]);
+        let a = SearchAttributes::new([BOOL_KEY.value_set(true), INT_KEY.value_set(42)]);
+        let b = SearchAttributes::new([BOOL_KEY.value_set(true), INT_KEY.value_set(42)]);
+        let c = SearchAttributes::new([BOOL_KEY.value_set(false), INT_KEY.value_set(42)]);
         assert_eq!(a, b);
         assert_ne!(a, c);
     }

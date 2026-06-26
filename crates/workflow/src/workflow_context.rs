@@ -395,7 +395,10 @@ impl WorkflowContextView {
             retry_policy: init.retry_policy.clone(),
             cron_schedule,
             memo: init.memo.clone(),
-            search_attributes: init.search_attributes.as_ref().map(SearchAttributes::from_proto),
+            search_attributes: init
+                .search_attributes
+                .as_ref()
+                .map(SearchAttributes::from_proto),
         }
     }
 }
@@ -2513,7 +2516,10 @@ mod tests {
             unreachable!()
         };
 
-        assert_eq!(cmd.search_attributes, Some(ProtoSearchAttributes::default()));
+        assert_eq!(
+            cmd.search_attributes,
+            Some(ProtoSearchAttributes::default())
+        );
     }
 
     #[test]
@@ -2703,7 +2709,9 @@ mod tests {
         let ctx = WorkflowContext::from_base(base, Rc::new(RefCell::new(TestWorkflow)));
 
         let view = ctx.view();
-        let sa = view.search_attributes.expect("should have search attributes");
+        let sa = view
+            .search_attributes
+            .expect("should have search attributes");
         assert_eq!(sa.get(&K), Some(true));
     }
 }

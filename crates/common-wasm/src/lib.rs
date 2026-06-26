@@ -24,7 +24,7 @@ pub use activity_definition::{ActivityDefinition, ActivityError};
 pub use priority::Priority;
 pub use search_attributes::{
     SearchAttributeError, SearchAttributeKey, SearchAttributeUpdate, SearchAttributeValue,
-    Timestamp, SearchAttributes,
+    SearchAttributes, Timestamp,
 };
 pub use worker::WorkerDeploymentVersion;
 pub use workflow_definition::{
