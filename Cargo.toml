@@ -30,7 +30,7 @@ thiserror = "2"
 tonic = { version = "0.14.6", default-features = false }
 tonic-prost = "0.14.6"
 tonic-prost-build = "0.14.6"
-opentelemetry = { version = "0.31", default-features = false, features = ["metrics"] }
+opentelemetry = { version = "0.32", default-features = false, features = ["metrics"] }
 prost = "0.14"
 prost-types = { version = "0.7", package = "prost-wkt-types" }
 pbjson = "0.9"
