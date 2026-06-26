@@ -13,9 +13,11 @@ use super::{
 };
 use crate::dbg_panic;
 use opentelemetry::{
-    self, Key, KeyValue, Value,
+    self, Key, KeyValue,
     metrics::{Meter, MeterProvider as MeterProviderT},
 };
+#[cfg(any(feature = "tls-ring", feature = "tls-aws-lc"))]
+use opentelemetry_otlp::tonic_types::transport::ClientTlsConfig;
 use opentelemetry_otlp::{WithExportConfig, WithHttpConfig, WithTonicConfig};
 use opentelemetry_sdk::{
     Resource, metrics,
@@ -25,7 +27,7 @@ use opentelemetry_sdk::{
     },
 };
 use std::{collections::HashMap, sync::Arc, time::Duration};
-use tonic::{metadata::MetadataMap, transport::ClientTlsConfig};
+use tonic::metadata::MetadataMap;
 
 fn histo_view(
     metric_name: &'static str,
@@ -123,12 +125,15 @@ pub fn build_otlp_metric_exporter(
 ) -> Result<CoreOtelMeter, anyhow::Error> {
     let exporter = match opts.protocol {
         OtlpProtocol::Grpc => {
-            let mut exporter = opentelemetry_otlp::MetricExporter::builder()
+            let exporter = opentelemetry_otlp::MetricExporter::builder()
                 .with_tonic()
                 .with_endpoint(opts.url.to_string());
-            if opts.url.scheme() == "https" || opts.url.scheme() == "grpcs" {
-                exporter = exporter.with_tls_config(ClientTlsConfig::new().with_native_roots());
-            }
+            #[cfg(any(feature = "tls-ring", feature = "tls-aws-lc"))]
+            let exporter = if opts.url.scheme() == "https" || opts.url.scheme() == "grpcs" {
+                exporter.with_tls_config(ClientTlsConfig::new().with_native_roots())
+            } else {
+                exporter
+            };
             exporter
                 .with_metadata(MetadataMap::from_headers((&opts.headers).try_into()?))
                 .with_temporality(metric_temporality_to_temporality(opts.metric_temporality))
@@ -308,7 +313,11 @@ fn default_resource_instance() -> &'static Resource {
     static INSTANCE: OnceLock<Resource> = OnceLock::new();
     INSTANCE.get_or_init(|| {
         let resource = Resource::builder().build();
-        if resource.get(&Key::from("service.name")) == Some(Value::from("unknown_service")) {
+        if resource.get(&Key::from("service.name")).is_some_and(|v| {
+            let service_name = v.as_str();
+            // OTel 0.32 may suffix the unknown-service fallback with the process name if available
+            service_name == "unknown_service" || service_name.starts_with("unknown_service:")
+        }) {
             // otel spec recommends to leave service.name as unknown_service but we want to
             // maintain backwards compatability with existing library behaviour
             return Resource::builder_empty()
@@ -349,7 +358,7 @@ fn metric_temporality_to_temporality(t: MetricTemporality) -> Temporality {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use opentelemetry::Key;
+    use opentelemetry::{Key, Value};
 
     #[test]
     pub(crate) fn default_resource_instance_service_name_default() {
