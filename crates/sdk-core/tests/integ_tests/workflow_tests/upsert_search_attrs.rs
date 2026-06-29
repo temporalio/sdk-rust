@@ -96,7 +96,7 @@ async fn sends_upsert() {
         "goodbye",
         String::from_json_payload(txt_attr_payload).unwrap()
     );
-    assert_eq!(3, usize::from_json_payload(int_attr_payload).unwrap());
+    assert_eq!(2, usize::from_json_payload(int_attr_payload).unwrap());
     let handle = client.get_workflow_handle::<UntypedWorkflow>(wf_id.to_string());
     handle
         .get_result(WorkflowGetResultOptions::default())

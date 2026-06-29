@@ -996,10 +996,12 @@ mod tests {
 
     #[test]
     fn timestamp_from_system_time() {
-        let st = std::time::UNIX_EPOCH + std::time::Duration::new(1_700_000_000, 123_456_789);
+        // Use nanos aligned to 100ns boundary for Windows compatibility
+        // (Windows SystemTime uses FILETIME with 100ns tick resolution)
+        let st = std::time::UNIX_EPOCH + std::time::Duration::new(1_700_000_000, 123_456_700);
         let ts: Timestamp = st.into();
         assert_eq!(ts.seconds(), 1_700_000_000);
-        assert_eq!(ts.nanos(), 123_456_789);
+        assert_eq!(ts.nanos(), 123_456_700);
 
         let back: std::time::SystemTime = ts.try_into().unwrap();
         assert_eq!(back, st);
