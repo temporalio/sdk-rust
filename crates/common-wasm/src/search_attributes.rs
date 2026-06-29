@@ -221,7 +221,6 @@ pub trait SearchAttributeValue: private::Sealed + Clone + Sized {
 // Shared JSON payload helpers (reuses the SDK's JSON payload encoding conventions)
 // ---------------------------------------------------------------------------
 
-#[allow(unreachable_patterns)] // Wildcard is intentional for forward-compat with new proto variants
 fn type_metadata_str(ivt: IndexedValueType) -> &'static str {
     match ivt {
         IndexedValueType::Bool => "Bool",
