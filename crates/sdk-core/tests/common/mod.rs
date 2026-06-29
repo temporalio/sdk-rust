@@ -212,7 +212,7 @@ pub(crate) async fn get_cloud_client() -> Client {
     get_cloud_client_with_compression(GrpcCompression::default()).await
 }
 
-async fn get_cloud_client_with_compression(compression: GrpcCompression) -> Client {
+pub(crate) async fn get_cloud_client_with_compression(compression: GrpcCompression) -> Client {
     let cloud_addr = env::var("TEMPORAL_CLOUD_ADDRESS").unwrap();
     let cloud_key = env::var("TEMPORAL_CLIENT_KEY").unwrap();
 
