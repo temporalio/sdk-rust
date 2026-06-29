@@ -231,7 +231,7 @@ fn type_metadata_str(ivt: IndexedValueType) -> &'static str {
         IndexedValueType::Text => "Text",
         IndexedValueType::Datetime => "Datetime",
         IndexedValueType::KeywordList => "KeywordList",
-        IndexedValueType::Unspecified | _ => "Unspecified",
+        IndexedValueType::Unspecified => "Unspecified",
     }
 }
 
