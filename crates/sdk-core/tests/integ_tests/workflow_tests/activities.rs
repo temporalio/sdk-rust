@@ -22,6 +22,8 @@ use temporalio_client::{
 };
 
 use temporalio_common::{
+    UntypedActivity,
+    data_converters::RawValue,
     error::{ApplicationFailure, IncomingError},
     protos::{
         coresdk::{
@@ -98,6 +100,26 @@ impl OneLocalActivityWorkflow {
             .start_local_activity(StdActivities::echo, input, LocalActivityOptions::default())
             .await?;
         Ok(r)
+    }
+}
+
+#[workflow]
+#[derive(Default)]
+struct UntypedActivityWorkflow;
+
+#[workflow_methods]
+impl UntypedActivityWorkflow {
+    #[run]
+    async fn run(ctx: &mut WorkflowContext<Self>, input: String) -> WorkflowResult<String> {
+        let raw_input = RawValue::from_value(&input, ctx.payload_converter());
+        let raw_output = ctx
+            .start_activity(
+                UntypedActivity::new("StdActivities::echo"),
+                raw_input,
+                ActivityOptions::start_to_close_timeout(Duration::from_secs(5)),
+            )
+            .await?;
+        Ok(raw_output.to_value(ctx.payload_converter()))
     }
 }
 
@@ -249,6 +271,32 @@ async fn one_activity_only() {
     let handle = worker
         .submit_workflow(
             OneActivityWorkflow::run,
+            input.clone(),
+            WorkflowStartOptions::new(task_queue, wf_name.to_owned()).build(),
+        )
+        .await
+        .unwrap();
+    worker.run_until_done().await.unwrap();
+    let r = handle.get_result(Default::default()).await.unwrap();
+    assert_eq!(r, input);
+}
+
+#[tokio::test]
+async fn untyped_activity_only() {
+    let wf_name = UntypedActivityWorkflow::name();
+    let mut starter = CoreWfStarter::new(wf_name);
+    starter.sdk_config.register_activities(StdActivities);
+    starter
+        .sdk_config
+        .register_workflow::<UntypedActivityWorkflow>()
+        .unwrap();
+    let mut worker = starter.worker().await;
+
+    let input = "hello from raw input!".to_string();
+    let task_queue = starter.get_task_queue().to_owned();
+    let handle = worker
+        .submit_workflow(
+            UntypedActivityWorkflow::run,
             input.clone(),
             WorkflowStartOptions::new(task_queue, wf_name.to_owned()).build(),
         )

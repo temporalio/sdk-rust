@@ -2,7 +2,7 @@
 //! activities, or directly by users targeting activities in other languages.
 
 use crate::{
-    data_converters::{TemporalDeserializable, TemporalSerializable},
+    data_converters::{RawValue, TemporalDeserializable, TemporalSerializable},
     error::{ApplicationFailure, FailurePayloads},
 };
 
@@ -17,9 +17,29 @@ pub trait ActivityDefinition {
     type Output: TemporalDeserializable + TemporalSerializable + 'static;
 
     /// The name that will be used for the activity type.
-    fn name() -> &'static str
-    where
-        Self: Sized;
+    fn name(&self) -> &str;
+}
+
+/// Marker type for starting activities by activity type name. Uses [`RawValue`] for both input and
+/// output.
+pub struct UntypedActivity {
+    name: String,
+}
+
+impl UntypedActivity {
+    /// Create a new `UntypedActivity` with the given activity type name.
+    pub fn new(name: impl Into<String>) -> Self {
+        Self { name: name.into() }
+    }
+}
+
+impl ActivityDefinition for UntypedActivity {
+    type Input = RawValue;
+    type Output = RawValue;
+
+    fn name(&self) -> &str {
+        &self.name
+    }
 }
 
 /// Returned as errors from activity functions.
