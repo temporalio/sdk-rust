@@ -17,6 +17,7 @@ import "temporal/api/common/v1/message.proto";
 import "temporal/api/failure/v1/message.proto";
 import "temporal/api/taskqueue/v1/message.proto";
 import "temporal/api/sdk/v1/user_metadata.proto";
+import "temporal/api/sdk/v1/event_group_marker.proto";
 
 message ScheduleActivityTaskCommandAttributes {
     string activity_id = 1;
@@ -294,6 +295,10 @@ message Command {
     //  * start_timer_command_attributes - populates temporal.api.history.v1.HistoryEvent for timer
     //    started where the summary is used to identify the timer.
     temporal.api.sdk.v1.UserMetadata user_metadata = 301;
+
+    // Event Group Markers attached to the command by the workflow author.
+    repeated temporal.api.sdk.v1.EventGroupMarker event_group_markers = 302;
+
     // The command details. The type must match that in `command_type`.
     oneof attributes {
         ScheduleActivityTaskCommandAttributes schedule_activity_task_command_attributes = 2;
