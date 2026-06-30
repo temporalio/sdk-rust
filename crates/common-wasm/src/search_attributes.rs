@@ -754,7 +754,7 @@ mod tests {
             .to_search_attribute_payload(IndexedValueType::Bool)
             .unwrap();
         assert_payload_metadata(&payload, "Bool");
-        assert_eq!(bool::from_search_attribute_payload(&payload).unwrap(), true);
+        assert!(bool::from_search_attribute_payload(&payload).unwrap());
     }
 
     #[test]
@@ -769,13 +769,13 @@ mod tests {
 
     #[test]
     fn round_trip_double() {
-        let val: f64 = 3.14;
+        let val: f64 = 1.23;
         let payload = val
             .to_search_attribute_payload(IndexedValueType::Double)
             .unwrap();
         assert_payload_metadata(&payload, "Double");
         let decoded = f64::from_search_attribute_payload(&payload).unwrap();
-        assert!((decoded - 3.14).abs() < f64::EPSILON);
+        assert!((decoded - 1.23).abs() < f64::EPSILON);
     }
 
     #[test]
