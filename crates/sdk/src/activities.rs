@@ -369,8 +369,9 @@ pub trait ActivityImplementer {
 }
 
 #[doc(hidden)]
-pub trait ExecutableActivity: ActivityDefinition {
+pub trait ExecutableActivity: ActivityDefinition + Sized {
     type Implementer: ActivityImplementer + Send + Sync + 'static;
+    fn definition() -> Self;
     fn execute(
         receiver: Option<Arc<Self::Implementer>>,
         ctx: ActivityContext,
@@ -384,7 +385,7 @@ pub trait HasOnlyStaticMethods {}
 /// Contains activity registrations in a form ready for execution by workers.
 #[derive(Default, Clone)]
 pub struct ActivityDefinitions {
-    activities: HashMap<&'static str, ActivityInvocation>,
+    activities: HashMap<String, ActivityInvocation>,
 }
 
 impl ActivityDefinitions {
@@ -402,7 +403,7 @@ impl ActivityDefinitions {
         AD::Output: Send + Sync,
     {
         self.activities.insert(
-            AD::name(),
+            AD::definition().name().to_string(),
             Arc::new(move |payloads, dc, c, activity_inbound_interceptors| {
                 let instance = instance.clone();
                 async move {
@@ -441,8 +442,8 @@ impl ActivityDefinitions {
         self.activities.get(act_type).cloned()
     }
 
-    pub(crate) fn names(&self) -> Vec<&'static str> {
-        let mut names: Vec<_> = self.activities.keys().copied().collect();
+    pub(crate) fn names(&self) -> Vec<String> {
+        let mut names: Vec<_> = self.activities.keys().cloned().collect();
         names.sort_unstable();
         names
     }
@@ -464,7 +465,7 @@ where
                 Err(_) => {
                     return ready(Err(ApplicationFailure::new(anyhow::anyhow!(
                     "Activity inbound interceptor returned arguments with wrong concrete type for activity {}",
-                    AD::name()
+                    AD::definition().name()
                 ))
                 .into()))
                 .boxed();

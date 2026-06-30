@@ -493,14 +493,14 @@ enum ActivityNotRegisteredError {
     )]
     HasAvailable {
         activity_type: String,
-        available_activities: Vec<&'static str>,
+        available_activities: Vec<String>,
     },
     #[error("Activity {activity_type} is not registered on this worker, no available activities.")]
     NoAvailable { activity_type: String },
 }
 
 impl ActivityNotRegisteredError {
-    fn new(activity_type: String, available_activities: Vec<&'static str>) -> Self {
+    fn new(activity_type: String, available_activities: Vec<String>) -> Self {
         if available_activities.is_empty() {
             Self::NoAvailable { activity_type }
         } else {

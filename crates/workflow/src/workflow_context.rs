@@ -559,7 +559,7 @@ impl BaseWorkflowContext {
     /// Request to run an activity
     pub fn start_activity<AD: ActivityDefinition>(
         &self,
-        _activity: AD,
+        activity: AD,
         input: impl Into<AD::Input>,
         mut opts: ActivityOptions,
     ) -> impl CancellableFuture<Result<AD::Output, ActivityExecutionError>>
@@ -589,7 +589,7 @@ impl BaseWorkflowContext {
         }
         self.inner.runtime.host.push_command(opts.into_command(
             seq,
-            AD::name().to_string(),
+            activity.name().to_string(),
             payloads,
         ));
         ActivityFut::running(cmd, self.inner.data_converter.clone())
@@ -598,7 +598,7 @@ impl BaseWorkflowContext {
     /// Request to run a local activity
     pub fn start_local_activity<AD: ActivityDefinition>(
         &self,
-        _activity: AD,
+        activity: AD,
         input: impl Into<AD::Input>,
         opts: LocalActivityOptions,
     ) -> impl CancellableFuture<Result<AD::Output, ActivityExecutionError>>
@@ -618,7 +618,7 @@ impl BaseWorkflowContext {
             }
         };
         ActivityFut::running(
-            LATimerBackoffFut::new(AD::name().to_string(), payloads, opts, self.clone()),
+            LATimerBackoffFut::new(activity.name().to_string(), payloads, opts, self.clone()),
             self.inner.data_converter.clone(),
         )
     }

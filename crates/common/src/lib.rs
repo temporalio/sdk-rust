@@ -19,7 +19,7 @@ pub mod telemetry;
 pub mod worker;
 pub use temporalio_common_wasm::{
     ActivityDefinition, ActivityError, HasWorkflowDefinition, Priority, QueryDefinition,
-    SignalDefinition, UntypedWorkflow, UpdateDefinition, WorkerDeploymentVersion,
+    SignalDefinition, UntypedActivity, UntypedWorkflow, UpdateDefinition, WorkerDeploymentVersion,
     WorkflowDefinition, data_converters, error, search_attributes,
 };
 

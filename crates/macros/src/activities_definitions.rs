@@ -503,8 +503,8 @@ impl ActivitiesDefinition {
         // Common methods for all marker structs
         let common_methods = quote! {
             /// Returns the activity name (delegates to ActivityDefinition::name())
-            pub fn name(&self) -> &'static str {
-                <Self as ::temporalio_common::ActivityDefinition>::name()
+            pub fn name(&self) -> &str {
+                <Self as ::temporalio_common::ActivityDefinition>::name(self)
             }
         };
 
@@ -549,7 +549,9 @@ impl ActivitiesDefinition {
             .unwrap_or(quote! { () });
 
         let activity_name = if let Some(ref definition_path) = activity.attributes.definition_path {
-            quote! { <#definition_path as ::temporalio_common::ActivityDefinition>::name() }
+            quote! {
+                <#definition_path as ::temporalio_common::ActivityDefinition>::name(&#definition_path)
+            }
         } else if let Some(ref name_expr) = activity.attributes.name_override {
             quote! { #name_expr }
         } else {
@@ -591,10 +593,7 @@ impl ActivitiesDefinition {
                 type Input = #input_type;
                 type Output = #output_type;
 
-                fn name() -> &'static str
-                where
-                    Self: Sized,
-                {
+                fn name(&self) -> &str {
                     #activity_name
                 }
             }
@@ -667,6 +666,10 @@ impl ActivitiesDefinition {
 
             impl ::temporalio_sdk::activities::ExecutableActivity for #module_ident::#struct_ident {
                 type Implementer = #impl_type;
+
+                fn definition() -> Self {
+                    #module_ident::#struct_ident
+                }
 
                 fn execute(
                     #receiver_pattern: Option<::std::sync::Arc<Self::Implementer>>,
