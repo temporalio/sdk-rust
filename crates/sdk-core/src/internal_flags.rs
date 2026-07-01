@@ -93,8 +93,8 @@ impl InternalFlags {
         }
     }
 
-    /// Returns true if this flag may currently be used. If `should_record` is true, returns true
-    /// and records the flag only when new SDK metadata can be written.
+    /// Returns true if this flag may currently be used. If `should_record` is true, and new SDK
+    /// metadata can be written, returns true and records the flag.
     pub(crate) fn try_use(&mut self, flag: CoreInternalFlags, should_record: bool) -> bool {
         if should_record {
             if self.can_write_sdk_metadata {
