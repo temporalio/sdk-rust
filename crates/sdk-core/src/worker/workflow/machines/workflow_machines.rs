@@ -1631,6 +1631,7 @@ impl WorkflowMachines {
             command_type: machine.command.as_type() as i32,
             attributes: Some(machine.command),
             user_metadata: metadata,
+            event_group_markers: vec![],
         };
         CommandAndMachine {
             command: MachineAssociatedCommand::Real(Box::new(cmd)),
