@@ -30,6 +30,9 @@ to docs, or any other relevant information.
   dependency tree free of `ring`.
 
 ### Fixed
+* `GetSystemInfo` connection initialization now only falls back to empty server capabilities when
+  `UNIMPLEMENTED` indicates the RPC method is missing. Other `UNIMPLEMENTED` responses are
+  reported as connection errors.
 * Awaiting a Nexus operation's result (`StartedNexusOperation::result()`) no longer trips
   nondeterminism detection ("a waker was invoked by a non-SDK source", TMPRL1100) on replay. The
   result future is a `Shared`, whose internal waker machinery must be polled inside an `SdkWakeGuard`

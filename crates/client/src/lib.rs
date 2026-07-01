@@ -255,7 +255,16 @@ impl Connection {
             {
                 Ok(sysinfo) => sysinfo.into_inner().capabilities,
                 Err(status) => match status.code() {
-                    Code::Unimplemented => None,
+                    Code::Unimplemented
+                        if {
+                            let msg = status.message().to_lowercase();
+                            msg.contains("unknown method")
+                                || msg.contains("unknown service")
+                                || msg.contains("method not found")
+                        } =>
+                    {
+                        None
+                    }
                     _ => return Err(ClientConnectError::SystemInfoCallError(status)),
                 },
             }
@@ -1362,8 +1371,19 @@ pub(crate) use dbg_panic;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tonic::metadata::Ascii;
+    use crate::callback_based::CallbackBasedGrpcService;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tonic::{Status, metadata::Ascii};
     use url::Url;
+
+    fn connection_options_for_system_info_test(
+        service_override: CallbackBasedGrpcService,
+    ) -> ConnectionOptions {
+        ConnectionOptions::new(Url::parse("http://localhost:7233").unwrap())
+            .service_override(service_override)
+            .dns_load_balancing(None)
+            .build()
+    }
 
     #[test]
     fn applies_headers() {
@@ -1518,6 +1538,65 @@ mod tests {
             .build();
         dbg!(&opts.keep_alive);
         assert!(opts.keep_alive.is_none());
+    }
+
+    #[tokio::test]
+    async fn get_system_info_unknown_method_falls_back_to_empty_capabilities() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let attempts_clone = attempts.clone();
+        let service_override = CallbackBasedGrpcService {
+            callback: Arc::new(move |req| {
+                let attempts = attempts_clone.clone();
+                Box::pin(async move {
+                    assert_eq!(req.rpc, "GetSystemInfo");
+                    attempts.fetch_add(1, Ordering::SeqCst);
+                    Err(Status::unimplemented(
+                        "unknown method GetSystemInfo for service \
+                        temporal.api.workflowservice.v1.WorkflowService",
+                    ))
+                })
+            }),
+        };
+
+        let connection =
+            Connection::connect(connection_options_for_system_info_test(service_override))
+                .await
+                .unwrap();
+
+        assert!(connection.capabilities().is_none());
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn get_system_info_non_missing_unimplemented_fails_connect() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let attempts_clone = attempts.clone();
+        let service_override = CallbackBasedGrpcService {
+            callback: Arc::new(move |req| {
+                let attempts = attempts_clone.clone();
+                Box::pin(async move {
+                    assert_eq!(req.rpc, "GetSystemInfo");
+                    attempts.fetch_add(1, Ordering::SeqCst);
+                    Err(Status::unimplemented("backend temporarily unimplemented"))
+                })
+            }),
+        };
+
+        let err =
+            match Connection::connect(connection_options_for_system_info_test(service_override))
+                .await
+            {
+                Ok(_) => panic!("connection should fail"),
+                Err(err) => err,
+            };
+
+        assert!(matches!(
+            err,
+            ClientConnectError::SystemInfoCallError(status)
+                if status.code() == Code::Unimplemented
+                    && status.message() == "backend temporarily unimplemented"
+        ));
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
     }
 
     mod tls_custom_verifier_tests {
