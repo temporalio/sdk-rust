@@ -172,10 +172,9 @@ impl Connection {
             && status.code() == Code::Unimplemented
             && {
                 let msg = status.message().to_lowercase();
-                msg.contains("gzip")
-                    && (msg.contains("decompress")
-                        || msg.contains("grpc-encoding")
-                        || msg.contains("compressor"))
+                msg.contains("decompress")
+                    || msg.contains("grpc-encoding")
+                    || msg.contains("compressor")
             }
         {
             options.grpc_compression = GrpcCompression::None;
