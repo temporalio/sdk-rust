@@ -114,7 +114,7 @@ async fn compression_test_server(
                 )
                 .into_http(),
                 CompressionTestBehavior::GenericGzipUnimplemented
-                    if path.ends_with("/GetSystemInfo") =>
+                    if path.ends_with("/GetSystemInfo") && encoding == "gzip" =>
                 {
                     Status::unimplemented("gzip is unavailable for this backend").into_http()
                 }
