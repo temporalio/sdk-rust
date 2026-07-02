@@ -51,9 +51,7 @@ async fn activity_cancel_delivered_without_heartbeat() {
 }
 
 #[tokio::test]
-async fn all_cloud_api_upstream_endpoints_default_client_settings() {
-    all_cloud_workflow_rpc_probes_covered();
-
+async fn all_cloud_api_upstream_endpoints() {
     let gzip_client = get_cloud_client().await;
     let uncompressed_client = get_cloud_client_with_compression(GrpcCompression::None).await;
     let failures = api_endpoint_probes::run_all(&gzip_client, &uncompressed_client).await;
