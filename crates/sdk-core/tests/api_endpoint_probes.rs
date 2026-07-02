@@ -8,7 +8,7 @@ use temporalio_client::{
 use temporalio_common::protos::grpc::health::v1::HealthCheckRequest;
 use tonic::{Code, IntoRequest, Request, Response, Status};
 
-pub(super) async fn run_all(gzip_client: &Client, uncompressed_client: &Client) -> Vec<String> {
+pub async fn run_all(gzip_client: &Client, uncompressed_client: &Client) -> Vec<String> {
     let mut failures = run_all_workflow_probes(gzip_client, uncompressed_client).await;
 
     let spec = ProbeSpec::normal();
@@ -21,10 +21,10 @@ pub(super) async fn run_all(gzip_client: &Client, uncompressed_client: &Client) 
     failures
 }
 
-pub(super) fn assert_all_workflow_rpc_probes_covered() {
+pub fn assert_all_workflow_rpc_probes_covered() {
     let probe_names = workflow_probe_names();
     let proto_def = include_str!(
-        "../../../protos/protos/api_upstream/temporal/api/workflowservice/v1/service.proto"
+        "../../protos/protos/api_upstream/temporal/api/workflowservice/v1/service.proto"
     );
     let implemented: HashSet<_> = probe_names
         .iter()

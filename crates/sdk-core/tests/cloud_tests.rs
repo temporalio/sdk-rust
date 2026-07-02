@@ -1,4 +1,3 @@
-#[path = "cloud_tests/api_endpoint_probes.rs"]
 mod api_endpoint_probes;
 // All non-main.rs tests ignore dead common code so that the linter doesn't complain about about it.
 #[allow(dead_code)]
