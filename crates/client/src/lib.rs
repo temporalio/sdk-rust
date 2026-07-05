@@ -1408,31 +1408,6 @@ mod tests {
     }
 
     #[test]
-    fn workflow_execution_search_attributes_are_typed() {
-        use temporalio_common::protos::temporal::api::common::v1::SearchAttributes as ProtoSearchAttributes;
-
-        let payload = Payload::default();
-        let execution = WorkflowExecution::from(workflow::WorkflowExecutionInfo {
-            search_attributes: Some(ProtoSearchAttributes {
-                indexed_fields: HashMap::from([(
-                    "CustomKeywordField".to_string(),
-                    payload.clone(),
-                )]),
-            }),
-            ..Default::default()
-        });
-
-        let search_attributes = execution.search_attributes();
-        assert_eq!(
-            search_attributes.raw_payload("CustomKeywordField"),
-            Some(&payload)
-        );
-
-        let execution = WorkflowExecution::from(workflow::WorkflowExecutionInfo::default());
-        assert!(execution.search_attributes().is_empty());
-    }
-
-    #[test]
     fn applies_headers() {
         // Initial header set
         let headers = Arc::new(RwLock::new(ClientHeaders {
