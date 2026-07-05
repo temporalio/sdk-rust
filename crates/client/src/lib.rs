@@ -88,7 +88,7 @@ use temporalio_common::{
         proto_ts_to_system_time,
         temporal::api::{
             cloud::cloudservice::v1::cloud_service_client::CloudServiceClient,
-            common::v1::{Memo, Payload, SearchAttributes, WorkflowType},
+            common::v1::{Memo, Payload, WorkflowType},
             enums::v1::{TaskQueueKind, WorkflowExecutionStatus},
             errordetails::v1::WorkflowExecutionAlreadyStartedFailure,
             operatorservice::v1::operator_service_client::OperatorServiceClient,
@@ -103,6 +103,7 @@ use temporalio_common::{
         },
         utilities::decode_status_detail,
     },
+    search_attributes::SearchAttributes,
 };
 use tonic::{
     Code, IntoRequest,
@@ -1000,8 +1001,12 @@ impl WorkflowExecution {
     }
 
     /// Search attributes on the workflow.
-    pub fn search_attributes(&self) -> Option<&SearchAttributes> {
-        self.raw.search_attributes.as_ref()
+    pub fn search_attributes(&self) -> SearchAttributes {
+        self.raw
+            .search_attributes
+            .as_ref()
+            .map(SearchAttributes::from_proto)
+            .unwrap_or_default()
     }
 
     /// Access the raw proto for additional fields not exposed via accessors.
@@ -1400,6 +1405,31 @@ mod tests {
             .service_override(service_override)
             .dns_load_balancing(None)
             .build()
+    }
+
+    #[test]
+    fn workflow_execution_search_attributes_are_typed() {
+        use temporalio_common::protos::temporal::api::common::v1::SearchAttributes as ProtoSearchAttributes;
+
+        let payload = Payload::default();
+        let execution = WorkflowExecution::from(workflow::WorkflowExecutionInfo {
+            search_attributes: Some(ProtoSearchAttributes {
+                indexed_fields: HashMap::from([(
+                    "CustomKeywordField".to_string(),
+                    payload.clone(),
+                )]),
+            }),
+            ..Default::default()
+        });
+
+        let search_attributes = execution.search_attributes();
+        assert_eq!(
+            search_attributes.raw_payload("CustomKeywordField"),
+            Some(&payload)
+        );
+
+        let execution = WorkflowExecution::from(workflow::WorkflowExecutionInfo::default());
+        assert!(execution.search_attributes().is_empty());
     }
 
     #[test]

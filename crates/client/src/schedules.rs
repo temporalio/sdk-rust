@@ -21,6 +21,7 @@ use temporalio_common::{
             workflowservice::v1::*,
         },
     },
+    search_attributes::SearchAttributes,
 };
 use tonic::IntoRequest;
 use uuid::Uuid;
@@ -519,8 +520,12 @@ impl ScheduleDescription {
     }
 
     /// Search attributes on the schedule.
-    pub fn search_attributes(&self) -> Option<&common_proto::SearchAttributes> {
-        self.raw.search_attributes.as_ref()
+    pub fn search_attributes(&self) -> SearchAttributes {
+        self.raw
+            .search_attributes
+            .as_ref()
+            .map(SearchAttributes::from_proto)
+            .unwrap_or_default()
     }
 
     /// Access the raw proto for additional fields not exposed via accessors.
@@ -768,8 +773,12 @@ impl ScheduleSummary {
     }
 
     /// Search attributes on the schedule.
-    pub fn search_attributes(&self) -> Option<&common_proto::SearchAttributes> {
-        self.raw.search_attributes.as_ref()
+    pub fn search_attributes(&self) -> SearchAttributes {
+        self.raw
+            .search_attributes
+            .as_ref()
+            .map(SearchAttributes::from_proto)
+            .unwrap_or_default()
     }
 
     /// Access the raw proto for additional fields not exposed via accessors.
@@ -1311,6 +1320,7 @@ mod tests {
         assert!(desc.raw().info.is_some());
         assert!(desc.raw().memo.is_some());
         assert!(desc.raw().search_attributes.is_some());
+        assert!(desc.search_attributes().is_empty());
         assert_eq!(desc.conflict_token(), conflict_token);
     }
 
@@ -1647,6 +1657,7 @@ mod tests {
         assert_eq!(summary.schedule_id(), "sched-1");
         assert!(summary.raw().memo.is_some());
         assert!(summary.raw().search_attributes.is_some());
+        assert!(summary.search_attributes().is_empty());
         assert_eq!(summary.workflow_type(), Some("MyWorkflow"));
         assert_eq!(summary.note(), Some("some note"));
         assert!(summary.paused());
@@ -1665,6 +1676,7 @@ mod tests {
         assert_eq!(summary.schedule_id(), "sched-2");
         assert!(summary.raw().memo.is_none());
         assert!(summary.raw().search_attributes.is_none());
+        assert!(summary.search_attributes().is_empty());
         assert_eq!(summary.workflow_type(), None);
         assert_eq!(summary.note(), None);
         assert!(!summary.paused());
