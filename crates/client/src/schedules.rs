@@ -526,12 +526,17 @@ impl ScheduleDescription {
     }
 
     /// The action configured on this schedule.
-    pub fn action(&self) -> Option<ScheduleDescriptionAction> {
-        self.raw
+    pub fn action(&self) -> ScheduleDescriptionAction {
+        let action = self
+            .raw
             .schedule
             .as_ref()
-            .and_then(|s| s.action.as_ref())
-            .and_then(|a| ScheduleDescriptionAction::from_proto(a, self.data_converter.clone()))
+            .expect("schedule description should contain schedule")
+            .action
+            .as_ref()
+            .expect("schedule description should contain action");
+        ScheduleDescriptionAction::from_proto(action, self.data_converter.clone())
+            .expect("schedule action should contain an action variant")
     }
 
     /// Whether the schedule is paused.
@@ -1843,8 +1848,7 @@ mod tests {
             data_converter,
         );
 
-        let ScheduleDescriptionAction::StartWorkflow(action) =
-            desc.action().expect("action should be present");
+        let ScheduleDescriptionAction::StartWorkflow(action) = desc.action();
 
         assert_eq!(action.workflow_type(), "MyWorkflow");
         assert_eq!(action.task_queue(), "task-queue");
@@ -1856,8 +1860,7 @@ mod tests {
     #[tokio::test]
     async fn schedule_description_start_workflow_args_returns_none_without_input() {
         let desc = ScheduleDescription::from(describe_response_with_start_workflow(None));
-        let ScheduleDescriptionAction::StartWorkflow(action) =
-            desc.action().expect("action should be present");
+        let ScheduleDescriptionAction::StartWorkflow(action) = desc.action();
 
         let decoded: Option<String> = action.args().await.unwrap();
         assert_eq!(decoded, None);
@@ -1875,11 +1878,27 @@ mod tests {
             ScheduleDescription::from(describe_response_with_start_workflow(Some(Payloads {
                 payloads,
             })));
-        let ScheduleDescriptionAction::StartWorkflow(action) =
-            desc.action().expect("action should be present");
+        let ScheduleDescriptionAction::StartWorkflow(action) = desc.action();
 
         let err = action.args::<i32>().await.unwrap_err();
         assert!(matches!(err, PayloadConversionError::EncodingError(_)));
+    }
+
+    #[test]
+    #[should_panic(expected = "schedule description should contain schedule")]
+    fn schedule_description_action_panics_when_schedule_is_missing() {
+        let desc = ScheduleDescription::from(DescribeScheduleResponse::default());
+        let _ = desc.action();
+    }
+
+    #[test]
+    #[should_panic(expected = "schedule description should contain action")]
+    fn schedule_description_action_panics_when_action_is_missing() {
+        let desc = ScheduleDescription::from(DescribeScheduleResponse {
+            schedule: Some(Schedule::default()),
+            ..Default::default()
+        });
+        let _ = desc.action();
     }
 
     #[test]

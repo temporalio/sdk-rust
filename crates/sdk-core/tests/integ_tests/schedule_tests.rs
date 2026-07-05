@@ -492,9 +492,7 @@ async fn create_schedule_with_workflow_input() {
     let desc = handle.describe().await.unwrap();
     assert!(desc.paused());
 
-    let ScheduleDescriptionAction::StartWorkflow(action) =
-        desc.action().expect("action should be present")
-    else {
+    let ScheduleDescriptionAction::StartWorkflow(action) = desc.action() else {
         panic!("expected start workflow action")
     };
     assert_eq!(action.workflow_type(), "MyWorkflow");
@@ -539,9 +537,7 @@ async fn schedule_action_start_workflow_encodes_typed_input() {
         .unwrap();
 
     let desc = handle.describe().await.unwrap();
-    let ScheduleDescriptionAction::StartWorkflow(action) =
-        desc.action().expect("action should be present")
-    else {
+    let ScheduleDescriptionAction::StartWorkflow(action) = desc.action() else {
         panic!("expected start workflow action")
     };
     assert_eq!(action.workflow_type(), "ScheduleInputWorkflow");
