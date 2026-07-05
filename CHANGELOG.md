@@ -17,7 +17,7 @@ to docs, or any other relevant information.
 
 # Changelog
 
-## [Unreleased]
+## [0.5.0]
 
 ### Added
 * `client()` and `workflow_handle()` helpers to `ActivityContext` for easily obtaining a Temporal client
@@ -48,3 +48,5 @@ to docs, or any other relevant information.
 
 - Rust SDK `ApplicationFailure` and `WorkflowError` APIs now use boxed `std::error::Error` values instead of
   `anyhow::Error`.
+
+## [Unreleased]
