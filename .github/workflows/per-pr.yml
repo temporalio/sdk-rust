@@ -216,7 +216,7 @@ jobs:
           key: wasm-workflow-tests
       - name: Install cargo-component
         run: cargo install --locked cargo-component
-      - run: cargo integ-test -t wasm_workflow_tests
+      - run: cargo integ-test -t wasm_workflow_tests -- --test-threads 1
 
   cloud-tests:
     if: github.event.pull_request.head.repo.full_name == '' || github.event.pull_request.head.repo.full_name == 'temporalio/sdk-rust'

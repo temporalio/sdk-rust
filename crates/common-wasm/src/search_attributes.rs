@@ -17,15 +17,20 @@
 //! let unset = MY_KW.value_unset();
 //! ```
 
-use std::collections::HashMap;
-use std::marker::PhantomData;
+use std::{collections::HashMap, marker::PhantomData};
 
 use tracing::warn;
 
-use crate::protos::temporal::api::common::v1::{
-    Payload, SearchAttributes as ProtoSearchAttributes,
+use crate::{
+    data_converters::{
+        GenericPayloadConverter, PayloadConversionError, PayloadConverter, SerializationContext,
+        SerializationContextData,
+    },
+    protos::temporal::api::{
+        common::v1::{Payload, SearchAttributes as ProtoSearchAttributes},
+        enums::v1::IndexedValueType,
+    },
 };
-use crate::protos::temporal::api::enums::v1::IndexedValueType;
 
 /// Metadata key for the search attribute value type, kept consistent across all SDKs.
 const TYPE_METADATA_KEY: &str = "type";
@@ -34,9 +39,9 @@ const TYPE_METADATA_KEY: &str = "type";
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum SearchAttributeError {
-    /// JSON serialization failed.
-    #[error("failed to serialize search attribute value: {0}")]
-    Serialization(#[from] serde_json::Error),
+    /// Payload conversion failed.
+    #[error("failed to convert search attribute payload: {0}")]
+    PayloadConversion(#[from] PayloadConversionError),
 
     /// The payload is missing required metadata or has an unexpected encoding.
     #[error("invalid search attribute payload: {reason}")]
@@ -236,52 +241,37 @@ fn type_metadata_str(ivt: IndexedValueType) -> &'static str {
 
 /// Encode a serde-serializable value into a search attribute [`Payload`].
 ///
-/// This mirrors the encoding used by the SDK's
-/// [`SerdeJsonPayloadConverter`][crate::data_converters], but adds the
-/// search-attribute `type` metadata key. By using the same `json/plain`
-/// encoding and metadata layout, payloads produced here are decode-compatible
-/// with the standard payload converter and vice-versa.
-fn encode_json_search_attr<T: serde::Serialize>(
+/// This uses the SDK's JSON payload converter, then adds the search-attribute
+/// `type` metadata key.
+fn encode_json_search_attr<T: serde::Serialize + 'static>(
     value: &T,
     indexed_value_type: IndexedValueType,
 ) -> Result<Payload, SearchAttributeError> {
-    let data = serde_json::to_vec(value)?;
-    let mut metadata = HashMap::with_capacity(2);
-    metadata.insert("encoding".to_string(), b"json/plain".to_vec());
-    metadata.insert(
+    let converter = PayloadConverter::serde_json();
+    let context = SerializationContext {
+        data: &SerializationContextData::None,
+        converter: &converter,
+    };
+    let mut payload = converter.to_payload(&context, value)?;
+    payload.metadata.insert(
         TYPE_METADATA_KEY.to_string(),
         type_metadata_str(indexed_value_type).as_bytes().to_vec(),
     );
-    Ok(Payload {
-        metadata,
-        data,
-        ..Default::default()
-    })
+    Ok(payload)
 }
 
 /// Decode a search attribute [`Payload`] back into a concrete type.
 ///
-/// Validates the `json/plain` encoding metadata (matching the standard payload
-/// converter expectation) before attempting JSON deserialization.
-fn decode_json_search_attr<T: serde::de::DeserializeOwned>(
+/// This delegates payload interpretation to the SDK's JSON payload converter.
+fn decode_json_search_attr<T: serde::de::DeserializeOwned + 'static>(
     payload: &Payload,
 ) -> Result<T, SearchAttributeError> {
-    let encoding =
-        payload
-            .metadata
-            .get("encoding")
-            .ok_or_else(|| SearchAttributeError::InvalidPayload {
-                reason: "missing encoding metadata".into(),
-            })?;
-    if encoding.as_slice() != b"json/plain" {
-        return Err(SearchAttributeError::InvalidPayload {
-            reason: format!(
-                "expected encoding 'json/plain', got '{}'",
-                String::from_utf8_lossy(encoding)
-            ),
-        });
-    }
-    Ok(serde_json::from_slice(&payload.data)?)
+    let converter = PayloadConverter::serde_json();
+    let context = SerializationContext {
+        data: &SerializationContextData::None,
+        converter: &converter,
+    };
+    Ok(converter.from_payload(&context, payload.clone())?)
 }
 
 // ---------------------------------------------------------------------------

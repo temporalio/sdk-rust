@@ -17,7 +17,7 @@ to docs, or any other relevant information.
 
 # Changelog
 
-## [Unreleased]
+## [0.5.0]
 
 ### Added
 * `client()` and `workflow_handle()` helpers to `ActivityContext` for easily obtaining a Temporal client
@@ -30,6 +30,11 @@ to docs, or any other relevant information.
   dependency tree free of `ring`.
 
 ### Fixed
+* `GetSystemInfo` connection initialization now only falls back to empty server capabilities when
+  `UNIMPLEMENTED` indicates the RPC method is missing. Other `UNIMPLEMENTED` responses are
+  reported as connection errors.
+* Connection initialization now retries once with gRPC compression disabled if the eager
+  `GetSystemInfo` call fails because the server cannot decompress gzip.
 * Awaiting a Nexus operation's result (`StartedNexusOperation::result()`) no longer trips
   nondeterminism detection ("a waker was invoked by a non-SDK source", TMPRL1100) on replay. The
   result future is a `Shared`, whose internal waker machinery must be polled inside an `SdkWakeGuard`
@@ -43,3 +48,5 @@ to docs, or any other relevant information.
 
 - Rust SDK `ApplicationFailure` and `WorkflowError` APIs now use boxed `std::error::Error` values instead of
   `anyhow::Error`.
+
+## [Unreleased]

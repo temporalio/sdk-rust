@@ -1,6 +1,6 @@
 use crate::common::{
     CoreWfStarter, NAMESPACE,
-    fake_grpc_server::{GenericService, fake_server},
+    fake_grpc_server::{FakeServer, GenericService, fake_server},
     get_integ_server_options,
     http_proxy::HttpProxy,
 };
@@ -16,20 +16,21 @@ use std::{
     collections::HashMap,
     env,
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
     },
     time::Duration,
 };
 use temporalio_client::{
-    Connection, Namespace, RETRYABLE_ERROR_CODES, RetryOptions, UntypedWorkflow,
-    grpc::WorkflowService, proxy::HttpConnectProxyOptions,
+    Connection, GrpcCompression, Namespace, RETRYABLE_ERROR_CODES, RetryOptions, UntypedWorkflow,
+    errors::ClientConnectError, grpc::WorkflowService, proxy::HttpConnectProxyOptions,
 };
 use temporalio_common::protos::temporal::api::{
     cloud::cloudservice::v1::GetNamespaceRequest,
     workflowservice::v1::{
-        DescribeNamespaceRequest, GetWorkflowExecutionHistoryRequest, ListNamespacesRequest,
-        RespondActivityTaskCanceledResponse,
+        DescribeNamespaceRequest, GetSystemInfoResponse, GetWorkflowExecutionHistoryRequest,
+        ListNamespacesRequest, RespondActivityTaskCanceledResponse, SignalWorkflowExecutionRequest,
+        SignalWorkflowExecutionResponse, get_system_info_response,
     },
 };
 #[cfg(unix)]
@@ -77,6 +78,175 @@ async fn calls_get_system_info() {
     let opts = get_integ_server_options();
     let connection = Connection::connect(opts).await.unwrap();
     assert!(connection.capabilities().is_some());
+}
+
+#[derive(Clone)]
+enum CompressionTestBehavior {
+    RejectGzipGetSystemInfo,
+    GenericGzipUnimplemented,
+    UnknownMethod,
+}
+
+async fn compression_test_server(
+    behavior: CompressionTestBehavior,
+) -> (FakeServer, Arc<Mutex<Vec<(String, String)>>>) {
+    let records = Arc::new(Mutex::new(Vec::new()));
+    let records_clone = records.clone();
+    let fs = fake_server(move |req| {
+        let path = req.uri().path().to_string();
+        let encoding = req
+            .headers()
+            .get("grpc-encoding")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
+        records_clone
+            .lock()
+            .unwrap()
+            .push((path.clone(), encoding.clone()));
+
+        let behavior = behavior.clone();
+        async move {
+            match behavior {
+                CompressionTestBehavior::UnknownMethod => Status::unimplemented(
+                    "unknown method GetSystemInfo for service \
+                     temporal.api.workflowservice.v1.WorkflowService",
+                )
+                .into_http(),
+                CompressionTestBehavior::GenericGzipUnimplemented
+                    if path.ends_with("/GetSystemInfo") && encoding == "gzip" =>
+                {
+                    Status::unimplemented("gzip is unavailable for this backend").into_http()
+                }
+                CompressionTestBehavior::RejectGzipGetSystemInfo
+                    if path.ends_with("/GetSystemInfo") && encoding == "gzip" =>
+                {
+                    Status::unimplemented(
+                        "grpc: Decompressor is not installed for grpc-encoding \"gzip\"",
+                    )
+                    .into_http()
+                }
+                _ if path.ends_with("/GetSystemInfo") => make_ok_response(GetSystemInfoResponse {
+                    capabilities: Some(get_system_info_response::Capabilities {
+                        sdk_metadata: true,
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                _ if path.ends_with("/SignalWorkflowExecution") => {
+                    make_ok_response(SignalWorkflowExecutionResponse::default())
+                }
+                _ => Response::new(Body::empty()),
+            }
+        }
+        .boxed()
+    })
+    .await;
+    (fs, records)
+}
+
+fn compression_test_options(
+    fs: &FakeServer,
+    compression: GrpcCompression,
+) -> temporalio_client::ConnectionOptions {
+    let mut opts = get_integ_server_options();
+    opts.target = format!("http://localhost:{}", fs.addr.port())
+        .parse::<url::Url>()
+        .unwrap();
+    opts.retry_options = RetryOptions::no_retries();
+    opts.grpc_compression = compression;
+    opts
+}
+
+#[tokio::test]
+async fn gzip_get_system_info_failure_reconnects_without_compression() {
+    let (fs, records) =
+        compression_test_server(CompressionTestBehavior::RejectGzipGetSystemInfo).await;
+
+    let mut connection = Connection::connect(compression_test_options(&fs, GrpcCompression::Gzip))
+        .await
+        .unwrap();
+    assert!(connection.capabilities().unwrap().sdk_metadata);
+
+    WorkflowService::signal_workflow_execution(
+        &mut connection,
+        SignalWorkflowExecutionRequest::default().into_request(),
+    )
+    .await
+    .unwrap();
+
+    let records = records.lock().unwrap().clone();
+    assert_eq!(records.len(), 3);
+    assert!(records[0].0.ends_with("/GetSystemInfo"));
+    assert_eq!(records[0].1, "gzip");
+    assert!(records[1].0.ends_with("/GetSystemInfo"));
+    assert_eq!(records[1].1, "");
+    assert!(records[2].0.ends_with("/SignalWorkflowExecution"));
+    assert_eq!(records[2].1, "");
+
+    fs.shutdown().await;
+}
+
+#[tokio::test]
+async fn compression_none_does_not_retry_compression_fallback() {
+    let (fs, records) =
+        compression_test_server(CompressionTestBehavior::RejectGzipGetSystemInfo).await;
+
+    let connection = Connection::connect(compression_test_options(&fs, GrpcCompression::None))
+        .await
+        .unwrap();
+    assert!(connection.capabilities().unwrap().sdk_metadata);
+
+    let records = records.lock().unwrap().clone();
+    assert_eq!(records.len(), 1);
+    assert!(records[0].0.ends_with("/GetSystemInfo"));
+    assert_eq!(records[0].1, "");
+
+    fs.shutdown().await;
+}
+
+#[tokio::test]
+async fn generic_gzip_unimplemented_does_not_reconnect_without_compression() {
+    let (fs, records) =
+        compression_test_server(CompressionTestBehavior::GenericGzipUnimplemented).await;
+
+    let err = match Connection::connect(compression_test_options(&fs, GrpcCompression::Gzip)).await
+    {
+        Ok(_) => panic!("connection should fail"),
+        Err(err) => err,
+    };
+
+    assert!(matches!(
+        err,
+        ClientConnectError::SystemInfoCallError(status)
+            if status.code() == Code::Unimplemented
+                && status.message() == "gzip is unavailable for this backend"
+    ));
+
+    let records = records.lock().unwrap().clone();
+    assert_eq!(records.len(), 1);
+    assert!(records[0].0.ends_with("/GetSystemInfo"));
+    assert_eq!(records[0].1, "gzip");
+
+    fs.shutdown().await;
+}
+
+#[tokio::test]
+async fn unknown_method_unimplemented_does_not_trigger_compression_reconnect() {
+    let (fs, records) = compression_test_server(CompressionTestBehavior::UnknownMethod).await;
+
+    let connection = Connection::connect(compression_test_options(&fs, GrpcCompression::Gzip))
+        .await
+        .unwrap();
+
+    assert!(connection.capabilities().is_none());
+
+    let records = records.lock().unwrap().clone();
+    assert_eq!(records.len(), 1);
+    assert!(records[0].0.ends_with("/GetSystemInfo"));
+    assert_eq!(records[0].1, "gzip");
+
+    fs.shutdown().await;
 }
 
 #[tokio::test]

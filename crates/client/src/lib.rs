@@ -161,16 +161,31 @@ struct ConnectionInner {
 
 impl Connection {
     /// Connect to a Temporal service.
-    pub async fn connect(options: ConnectionOptions) -> Result<Self, ClientConnectError> {
-        let dns_lb_opts = dns::validate_and_get_dns_lb(&options)?.cloned();
-        // The callback-based override transport cannot decode compressed request bodies, so
-        // compression is forced off whenever a service override is in use.
-        let compression = if options.service_override.is_some() {
-            GrpcCompression::None
-        } else {
-            options.grpc_compression
-        };
-        let (service, dns_task) = if let Some(service_override) = options.service_override {
+    pub async fn connect(mut options: ConnectionOptions) -> Result<Self, ClientConnectError> {
+        if options.service_override.is_some() {
+            options.grpc_compression = GrpcCompression::None;
+        }
+
+        let first_result = Self::connect_once(&options).await;
+        if options.grpc_compression == GrpcCompression::Gzip
+            && let Err(ClientConnectError::SystemInfoCallError(status)) = &first_result
+            && status.code() == Code::Unimplemented
+            && {
+                let msg = status.message().to_lowercase();
+                msg.contains("decompress")
+                    || msg.contains("grpc-encoding")
+                    || msg.contains("compressor")
+            }
+        {
+            options.grpc_compression = GrpcCompression::None;
+            return Self::connect_once(&options).await;
+        }
+        first_result
+    }
+
+    async fn connect_once(options: &ConnectionOptions) -> Result<Self, ClientConnectError> {
+        let dns_lb_opts = dns::validate_and_get_dns_lb(options)?.cloned();
+        let (service, dns_task) = if let Some(service_override) = options.service_override.clone() {
             (
                 GrpcMetricSvc {
                     inner: ChannelOrGrpcOverride::GrpcOverride(service_override),
@@ -180,7 +195,7 @@ impl Connection {
                 None,
             )
         } else if let Some(dns_opts) = &dns_lb_opts {
-            let (channel, sender) = dns::create_balanced_channel(&options).await?;
+            let (channel, sender) = dns::create_balanced_channel(options).await?;
             let handle = dns::spawn_dns_reresolution(
                 sender,
                 options.target.clone(),
@@ -246,7 +261,7 @@ impl Connection {
             headers: headers.clone(),
         };
         let svc = InterceptedService::new(service, interceptor);
-        let mut svc_client = TemporalServiceClient::new(svc, compression);
+        let mut svc_client = TemporalServiceClient::new(svc, options.grpc_compression);
 
         let capabilities = if !options.skip_get_system_info {
             match svc_client
@@ -255,7 +270,18 @@ impl Connection {
             {
                 Ok(sysinfo) => sysinfo.into_inner().capabilities,
                 Err(status) => match status.code() {
-                    Code::Unimplemented => None,
+                    Code::Unimplemented
+                        if {
+                            let msg = status.message().to_lowercase();
+                            msg.contains("unknown method")
+                                || msg.contains("unknown service")
+                                || msg.contains("method not found")
+                                || (msg.contains("getsysteminfo")
+                                    && msg.contains("is unimplemented"))
+                        } =>
+                    {
+                        None
+                    }
                     _ => return Err(ClientConnectError::SystemInfoCallError(status)),
                 },
             }
@@ -265,11 +291,11 @@ impl Connection {
         Ok(Self {
             inner: Arc::new(ConnectionInner {
                 service: svc_client,
-                retry_options: options.retry_options,
-                identity: options.identity,
+                retry_options: options.retry_options.clone(),
+                identity: options.identity.clone(),
                 headers,
-                client_name: options.client_name,
-                client_version: options.client_version,
+                client_name: options.client_name.clone(),
+                client_version: options.client_version.clone(),
                 capabilities,
                 workers: Arc::new(ClientWorkerSet::new()),
                 _dns_task: dns_task,
@@ -1362,8 +1388,19 @@ pub(crate) use dbg_panic;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tonic::metadata::Ascii;
+    use crate::callback_based::CallbackBasedGrpcService;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tonic::{Status, metadata::Ascii};
     use url::Url;
+
+    fn connection_options_for_system_info_test(
+        service_override: CallbackBasedGrpcService,
+    ) -> ConnectionOptions {
+        ConnectionOptions::new(Url::parse("http://localhost:7233").unwrap())
+            .service_override(service_override)
+            .dns_load_balancing(None)
+            .build()
+    }
 
     #[test]
     fn applies_headers() {
@@ -1518,6 +1555,69 @@ mod tests {
             .build();
         dbg!(&opts.keep_alive);
         assert!(opts.keep_alive.is_none());
+    }
+
+    #[rstest::rstest]
+    #[case(
+        "unknown method GetSystemInfo for service temporal.api.workflowservice.v1.WorkflowService"
+    )]
+    #[case("Method temporal.api.workflowservice.v1.WorkflowService/GetSystemInfo is unimplemented")]
+    #[tokio::test]
+    async fn get_system_info_missing_method_falls_back_to_empty_capabilities(
+        #[case] message: &'static str,
+    ) {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let attempts_clone = attempts.clone();
+        let service_override = CallbackBasedGrpcService {
+            callback: Arc::new(move |req| {
+                let attempts = attempts_clone.clone();
+                Box::pin(async move {
+                    assert_eq!(req.rpc, "GetSystemInfo");
+                    attempts.fetch_add(1, Ordering::SeqCst);
+                    Err(Status::unimplemented(message))
+                })
+            }),
+        };
+
+        let connection =
+            Connection::connect(connection_options_for_system_info_test(service_override))
+                .await
+                .unwrap();
+
+        assert!(connection.capabilities().is_none());
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn get_system_info_non_missing_unimplemented_fails_connect() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let attempts_clone = attempts.clone();
+        let service_override = CallbackBasedGrpcService {
+            callback: Arc::new(move |req| {
+                let attempts = attempts_clone.clone();
+                Box::pin(async move {
+                    assert_eq!(req.rpc, "GetSystemInfo");
+                    attempts.fetch_add(1, Ordering::SeqCst);
+                    Err(Status::unimplemented("backend temporarily unimplemented"))
+                })
+            }),
+        };
+
+        let err =
+            match Connection::connect(connection_options_for_system_info_test(service_override))
+                .await
+            {
+                Ok(_) => panic!("connection should fail"),
+                Err(err) => err,
+            };
+
+        assert!(matches!(
+            err,
+            ClientConnectError::SystemInfoCallError(status)
+                if status.code() == Code::Unimplemented
+                    && status.message() == "backend temporarily unimplemented"
+        ));
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
     }
 
     mod tls_custom_verifier_tests {
