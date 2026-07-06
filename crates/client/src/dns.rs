@@ -100,6 +100,7 @@ async fn build_endpoint(
 
     let channel = match tls_result {
         crate::TlsConfigResult::Standard(ep) => ep,
+        #[cfg(feature = "dynamic-tls")]
         crate::TlsConfigResult::CustomConnector { .. } => {
             return Err(ClientConnectError::InvalidConfig(
                 "client_cert_resolver is not yet supported with dns_load_balancing. \
