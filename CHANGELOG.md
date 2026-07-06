@@ -50,3 +50,7 @@ to docs, or any other relevant information.
   `anyhow::Error`.
 
 ## [Unreleased]
+
+### Fixed
+* OTLP metric export failures are now logged through Core telemetry when OpenTelemetry's periodic
+  metric reader reports an export error.
