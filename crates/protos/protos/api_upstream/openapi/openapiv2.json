@@ -2755,6 +2755,51 @@
         ]
       }
     },
+    "/api/v1/namespaces/{namespace}/worker-count": {
+      "get": {
+        "summary": "CountWorkers counts the number of workers in a specific namespace.",
+        "operationId": "CountWorkers2",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/v1CountWorkersResponse"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpcStatus"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "namespace",
+            "in": "path",
+            "required": true,
+            "type": "string"
+          },
+          {
+            "name": "query",
+            "description": "Query to filter workers before counting.\nSupported filter fields are the same as in ListWorkersRequest.",
+            "in": "query",
+            "required": false,
+            "type": "string"
+          },
+          {
+            "name": "includeSystemWorkers",
+            "description": "When true, the count will include system workers that are created implicitly\nby the server and not by the user. By default, system workers are excluded.",
+            "in": "query",
+            "required": false,
+            "type": "boolean"
+          }
+        ],
+        "tags": [
+          "WorkflowService"
+        ]
+      }
+    },
     "/api/v1/namespaces/{namespace}/worker-deployment-versions/{deploymentVersion.deploymentName}": {
       "post": {
         "summary": "Creates a new Worker Deployment Version.",
@@ -8244,6 +8289,51 @@
         ]
       }
     },
+    "/namespaces/{namespace}/worker-count": {
+      "get": {
+        "summary": "CountWorkers counts the number of workers in a specific namespace.",
+        "operationId": "CountWorkers",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/v1CountWorkersResponse"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpcStatus"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "namespace",
+            "in": "path",
+            "required": true,
+            "type": "string"
+          },
+          {
+            "name": "query",
+            "description": "Query to filter workers before counting.\nSupported filter fields are the same as in ListWorkersRequest.",
+            "in": "query",
+            "required": false,
+            "type": "string"
+          },
+          {
+            "name": "includeSystemWorkers",
+            "description": "When true, the count will include system workers that are created implicitly\nby the server and not by the user. By default, system workers are excluded.",
+            "in": "query",
+            "required": false,
+            "type": "boolean"
+          }
+        ],
+        "tags": [
+          "WorkflowService"
+        ]
+      }
+    },
     "/namespaces/{namespace}/worker-deployment-versions/{deploymentVersion.deploymentName}": {
       "post": {
         "summary": "Creates a new Worker Deployment Version.",
@@ -10667,6 +10757,21 @@
         }
       }
     },
+    "ComputeStatusProviderValidationStatus": {
+      "type": "object",
+      "properties": {
+        "errorMessage": {
+          "type": "string",
+          "description": "Human-readable error message if connectivity validation failed.\nAn empty string means validation passed."
+        },
+        "lastCheckTime": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Timestamp of the last validation check."
+        }
+      },
+      "description": "ProviderValidationStatus represents the result of the most recent\nconnectivity check between Temporal and a customer's compute provider."
+    },
     "DeploymentInfoTaskQueueInfo": {
       "type": "object",
       "properties": {
@@ -10742,6 +10847,25 @@
         }
       },
       "description": "Target a worker polling on a Nexus task queue in a specific namespace."
+    },
+    "EventGroupMarkerInboundEvent": {
+      "type": "object",
+      "properties": {
+        "inboundEventId": {
+          "type": "string",
+          "format": "int64"
+        }
+      },
+      "description": "The event ID of an event in the present workflow that triggered implicit\ncreation of this group Marker.\n\nThe target event's type must be one of the following:\n - `WORKFLOW_EXECUTION_STARTED`\n - `WORKFLOW_EXECUTION_SIGNALED`"
+    },
+    "EventGroupMarkerInboundUpdate": {
+      "type": "object",
+      "properties": {
+        "inboundUpdateId": {
+          "type": "string"
+        }
+      },
+      "description": "The identifier of an inbound Update (request.meta.update_id)\nwhose handler triggered implicit creation of this group Marker.\n\nUsed in place of `inbound_event_id` for Updates because the event ID of the\nUpdateAccepted history event is not known until the Workflow Task is\ncompleted and recorded by the server, which may be too late."
     },
     "LinkActivity": {
       "type": "object",
@@ -10988,6 +11112,16 @@
         }
       }
     },
+    "VersioningOverrideOneTimeOverride": {
+      "type": "object",
+      "properties": {
+        "targetDeploymentVersion": {
+          "$ref": "#/definitions/v1WorkerDeploymentVersion",
+          "description": "Required. Worker Deployment Version to receive the one-time Workflow Task."
+        }
+      },
+      "description": "Routes Workflow Tasks for this execution to `target_deployment_version`\nuntil a Workflow Task completes on that version, then clears the override.\n\nThis does not force the workflow's normal Versioning Behavior to become\nPinned. After the Workflow Task completes on `target_deployment_version`,\nthe workflow execution's normal Versioning Behavior and Deployment Version\nare taken from the worker's completion response.\n\nExample: if an execution is one-time moved from version X to version Y, and\nversion Z later becomes current:\n- if worker Y reports Pinned, the execution stays on Y;\n- if worker Y reports AutoUpgrade, the execution routes to Z on a future\n  Workflow Task;\n- if worker Y reports Pinned and the workflow uses upgrade-on-continue-as-new,\n  the current run stays on Y and the execution can route to Z after\n  continue-as-new.\n\nIf no Workflow Task completes on `target_deployment_version`, this override\nremains pending."
+    },
     "VersioningOverridePinnedOverride": {
       "type": "object",
       "properties": {
@@ -11098,6 +11232,10 @@
         },
         "computeConfig": {
           "$ref": "#/definitions/v1ComputeConfigSummary"
+        },
+        "computeStatus": {
+          "$ref": "#/definitions/v1ComputeStatus",
+          "description": "ComputeStatus represents compute-related configuration and healthchecks."
         }
       }
     },
@@ -14583,6 +14721,16 @@
       },
       "description": "ComputeScaler instructs the Temporal Service when to scale up or down the number of\nWorkers that comprise a WorkerDeployment."
     },
+    "v1ComputeStatus": {
+      "type": "object",
+      "properties": {
+        "providerValidation": {
+          "$ref": "#/definitions/ComputeStatusProviderValidationStatus",
+          "description": "provider_validation encapsulates the health signal for validating the compute provider."
+        }
+      },
+      "description": "ComputeStatus represents compute-related configuration and health for a Worker Deployment Version."
+    },
     "v1ConfigMetadata": {
       "type": "object",
       "properties": {
@@ -14721,6 +14869,16 @@
         "count": {
           "type": "string",
           "format": "int64"
+        }
+      }
+    },
+    "v1CountWorkersResponse": {
+      "type": "object",
+      "properties": {
+        "count": {
+          "type": "string",
+          "format": "int64",
+          "description": "Number of workers matching the query."
         }
       }
     },
@@ -15351,6 +15509,34 @@
       },
       "description": "Target to route requests to."
     },
+    "v1EventGroupMarker": {
+      "type": "object",
+      "properties": {
+        "label": {
+          "$ref": "#/definitions/v1EventGroupMarkerLabel"
+        },
+        "inboundEvent": {
+          "$ref": "#/definitions/EventGroupMarkerInboundEvent"
+        },
+        "inboundUpdate": {
+          "$ref": "#/definitions/EventGroupMarkerInboundUpdate"
+        }
+      }
+    },
+    "v1EventGroupMarkerLabel": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "description": "Opaque identifier assigned by the SDK."
+        },
+        "label": {
+          "$ref": "#/definitions/v1Payload",
+          "description": "This payload should be a \"json/plain\"-encoded payload that is a single\nJSON string for use in user interfaces. User interface formatting may not\napply to this text when used in \"label\" situations. The payload data\nsection is limited to 400 bytes by default.\n\nPayload only needs to be set on the first use of a given Marker ID;\nfurther references to an existing Marker ID reuse existing attributes of\nthe referenced Marker -- i.e. further label payloads are ignored.\n\nNote that it is valid to have distinct Markers (i.e. distinct Marker IDs)\nin a given workflow execution that carry the same label, provided that\nthey have the distinct ID."
+        }
+      },
+      "description": "A user-defined short-form string value to be used as the group's label."
+    },
     "v1EventType": {
       "type": "string",
       "enum": [
@@ -15842,6 +16028,14 @@
         "principal": {
           "$ref": "#/definitions/v1Principal",
           "description": "Server-computed authenticated caller identity associated with this event."
+        },
+        "eventGroupMarkers": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "$ref": "#/definitions/v1EventGroupMarker"
+          },
+          "description": "Event group markers attached to this event."
         },
         "workflowExecutionStartedEventAttributes": {
           "$ref": "#/definitions/v1WorkflowExecutionStartedEventAttributes"
@@ -16584,6 +16778,10 @@
         "workflowUpdateCallbacks": {
           "type": "boolean",
           "title": "True if the namespace supports attaching callbacks on workflow updates"
+        },
+        "pollerAutoscalingAutoEnroll": {
+          "type": "boolean",
+          "description": "When true, workers should use poller autoscaling by default unless explicitly configured otherwise."
         }
       },
       "description": "Namespace capability details. Should contain what features are enabled in a namespace."
@@ -19126,9 +19324,9 @@
           "$ref": "#/definitions/v1TimeSkippingConfig",
           "description": "The propagated time-skipping configuration for the child workflow."
         },
-        "initialSkippedDuration": {
-          "type": "string",
-          "description": "Propagate the duration skipped to the child workflow."
+        "timeSkippingStatePropagation": {
+          "$ref": "#/definitions/v1TimeSkippingStatePropagation",
+          "description": "The time-skipping state propagated from the parent workflow. This can be nil if no time skipping\nhas occurred or there is no previous run."
         }
       }
     },
@@ -19519,16 +19717,31 @@
           "type": "boolean",
           "description": "Enables or disables time skipping for this workflow execution."
         },
-        "maxSkippedDuration": {
+        "fastForward": {
           "type": "string",
-          "description": "Maximum total virtual time that can be skipped."
+          "description": "Optionally fast-forward the current workflow execution by this duration ahead of current workflow execution time.\nAfter the fast-forward completes, time skipping is disabled, and this\naction is recorded in the WorkflowExecutionTimeSkippingTransitionedEvent. It can be re-enabled by\nsetting `enabled` to true or setting `fast_forward` again via UpdateWorkflowExecutionOptions.\nThe current workflow execution is a chain of runs (retries, cron, continue-as-new);\nchild workflows are separate executions, so this fast_forward won't affect them.\n\nFor a given workflow execution, only one active fast-forward is allowed at a time.\nIf a new fast-forward is set via UpdateWorkflowExecutionOptions before the previous\none completes, the new one will override the previous one.\nIf the fast-forward duration exceeds the remaining execution timeout, time will only\nbe fast-forwarded up to the end of the execution."
         },
-        "maxElapsedDuration": {
-          "type": "string",
-          "description": "Maximum elapsed time since time skipping was enabled.\nThis includes both skipped time and real time elapsing."
+        "disableChildPropagation": {
+          "type": "boolean",
+          "description": "By default, child workflows inherit the \"enabled\" flag when they are started.\nThis flag disables that inheritance."
         }
       },
-      "description": "Configuration for time skipping during a workflow execution.\nWhen enabled, virtual time advances automatically whenever there is no in-flight work.\nIn-flight work includes activities, child workflows, Nexus operations, signal/cancel external workflow operations,\nand possibly other features added in the future.\nUser timers are not classified as in-flight work and will be skipped over.\nWhen time advances, it skips to the earlier of the next user timer or the configured bound, if either exists.\n\nPropagation behavior of time skipping:\nThe enabled flag, bound fields, and accumulated skipped duration are propagated to related executions as follows:\n(1) Child workflows and continue-as-new: both the configuration and the accumulated skipped duration are\n    inherited from the current execution. The configured bound is shared between the inherited skipped\n    duration and any additional duration skipped by the new run.\n(2) Retry and cron: the configuration and accumulated skipped duration are inherited as recorded when the\n    current workflow started; the accumulated skipped duration of the current run is not propagated.\n(3) Reset: the new run retains the time-skipping configuration of the current execution. Because reset replays\n    all events up to the reset point and re-applies any UpdateWorkflowExecutionOptions changes made after that\n    point, the resulting run ends up with the same final time-skipping configuration as the previous run."
+      "description": "The configuration for time skipping of a workflow execution (a chain of runs including retries, cron, continue-as-new).\nWhen time skipping is enabled, virtual time advances automatically whenever there is no in-flight work.\nIn-flight work includes activities, child workflows, Nexus operations, signal/cancel external workflow operations,\nand possibly other features added in the future.\nUser timers are not classified as in-flight work and will be skipped over; the virtual clock may also skip to the\ntime point of the registered fast forward when there is no in-flight work.\nWhen time is skipped, a WorkflowExecutionTimeSkippingTransitionedEvent will be\nadded to the workflow history to capture the state changes.\n\nFor child workflows, by default, if the parent execution is skipping time, the child execution will also skip time,\nbut a parent's fast_forward won't affect its child's execution. A flag is provided to disable propagation of the\n\"enabled\" flag to child workflows; regardless of that flag, a child workflow inherits the virtual time from the\nparent execution as its start time."
+    },
+    "v1TimeSkippingStatePropagation": {
+      "type": "object",
+      "properties": {
+        "initialSkippedDuration": {
+          "type": "string",
+          "description": "The time skipped by the previous execution that started this workflow.\nIt can happen in child workflows and a chain of runs (CaN, cron, retry)."
+        },
+        "fastForwardTargetTime": {
+          "type": "string",
+          "format": "date-time",
+          "description": "If there is a fast-forward action set for the previous run in a chain of runs,\nthe target time should be propagated to the next run as well."
+        }
+      },
+      "description": "The time-skipping state that needs to be propagated from a parent workflow to a child workflow,\nor through a chain of runs."
     },
     "v1TimeoutFailureInfo": {
       "type": "object",
@@ -19825,6 +20038,11 @@
         "workflowExecutionOptions": {
           "$ref": "#/definitions/v1WorkflowExecutionOptions",
           "description": "Workflow Execution options after update."
+        },
+        "updateTime": {
+          "type": "string",
+          "format": "date-time",
+          "description": "The Workflow Execution time when the options were updated. When time skipping is\nenabled, this is the workflow's virtual time rather than wall-clock time."
         }
       }
     },
@@ -19962,11 +20180,15 @@
       "properties": {
         "pinned": {
           "$ref": "#/definitions/VersioningOverridePinnedOverride",
-          "description": "Override the workflow to have Pinned behavior."
+          "description": "Override the workflow to have Pinned behavior. This is a sticky override:\nWorkflow Tasks continue to route according to this override until it is\nexplicitly removed."
         },
         "autoUpgrade": {
           "type": "boolean",
           "description": "Override the workflow to have AutoUpgrade behavior."
+        },
+        "oneTime": {
+          "$ref": "#/definitions/VersioningOverrideOneTimeOverride",
+          "description": "Override Workflow Task routing to a specific Worker Deployment Version until\none Workflow Task completes there. After completion, the workflow execution's\nVersioning Behavior and Deployment Version come from the worker's completion\nresponse."
         },
         "behavior": {
           "$ref": "#/definitions/v1VersioningBehavior",
@@ -20830,7 +21052,7 @@
         },
         "timeSkippingConfig": {
           "$ref": "#/definitions/v1TimeSkippingConfig",
-          "description": "Time-skipping configuration for this workflow execution.\nIf not set, the time-skipping configuration is not updated by this request;\nthe existing configuration is preserved."
+          "description": "The time-skipping configuration for this workflow execution.\nWhen `fast_forward` is set, time will be fast-forwarded to a future point relative\nto the current workflow timestamp. Each call takes effect, even if\n`fast_forward` is set to the same duration, since the target time is recalculated\nfrom the current timestamp on every call.\n\nThis field must be updated as a whole; updating individual sub-fields is not supported.\nWhen setting the update mask in `UpdateWorkflowExecutionOptionsRequest`, \n`BatchOperationUpdateWorkflowExecutionOptions`, etc., use a mask that covers the entire field."
         }
       }
     },
@@ -20867,7 +21089,11 @@
         },
         "timeSkippingConfig": {
           "$ref": "#/definitions/v1TimeSkippingConfig",
-          "description": "If set, the time-skipping configuration was changed. Contains the full updated configuration."
+          "description": "TimeSkippingConfig override upserted in this event. Represents the full config."
+        },
+        "timeSkippingConfigUpdated": {
+          "type": "boolean",
+          "description": "Indicates the time skipping config was updated by the recent call to update\nworkflow execution options."
         },
         "workflowUpdateOptions": {
           "type": "array",
@@ -21109,9 +21335,9 @@
           "$ref": "#/definitions/v1TimeSkippingConfig",
           "description": "Initial time-skipping configuration for this workflow execution, recorded at start time.\nThis may have been set explicitly via the start workflow request, or propagated from a\nparent/previous execution.\n\nThe configuration may be updated after start via UpdateWorkflowExecutionOptions, which\nwill be reflected in the WorkflowExecutionOptionsUpdatedEvent."
         },
-        "initialSkippedDuration": {
-          "type": "string",
-          "description": "The time skipped by the previous execution that started this workflow.\nIt can happen in cases of child workflows and continue-as-new workflows."
+        "timeSkippingStatePropagation": {
+          "$ref": "#/definitions/v1TimeSkippingStatePropagation",
+          "description": "The time-skipping state propagated from a previous run of this workflow. This can be nil\nif no time skipping has occurred or there is no previous run."
         }
       },
       "title": "Always the first event in workflow history"
@@ -21154,11 +21380,11 @@
         "targetTime": {
           "type": "string",
           "format": "date-time",
-          "description": "The virtual time after time skipping was applied."
+          "description": "The virtual time point that time skipping advanced to."
         },
-        "disabledAfterBound": {
+        "disabledAfterFastForward": {
           "type": "boolean",
-          "description": "when true, time skipping was disabled automatically due to a bound being reached."
+          "description": "When true, time skipping has been disabled automatically due to a call to fast_forward completing."
         },
         "wallClockTime": {
           "type": "string",
@@ -21166,7 +21392,7 @@
           "description": "The wall-clock time when the time-skipping state changed event was generated."
         }
       },
-      "description": "Attributes for an event indicating that time skipping state changed for a workflow execution,\neither time was advanced or time skipping was disabled automatically due to a bound being reached.\nThe worker_may_ignore field in HistoryEvent should always be set true for this event."
+      "description": "Attributes for an event indicating that time skipping state changed for a workflow execution,\neither time was advanced or time skipping was disabled automatically due to the fast_forward completing.\nThe worker_may_ignore field in HistoryEvent should always be set true for this event."
     },
     "v1WorkflowExecutionTimedOutEventAttributes": {
       "type": "object",

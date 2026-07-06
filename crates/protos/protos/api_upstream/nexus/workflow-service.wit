@@ -6,6 +6,8 @@ world system {
 
 /// @nexus.endpoint "__temporal_system"
 /// @nexus.service-name "temporal.api.workflowservice.v1.WorkflowService"
+/// @nexus.namespace dotnet="Temporalio.Workflows"
+/// @nexus.operations-class dotnet="Workflow"
 /// @nexus.delay-load-temporalio-workflow
 /// @nexus.experimental
 interface workflow-service {
@@ -28,11 +30,12 @@ interface workflow-service {
 
   /// @nexus.doc "Request fields for signaling a workflow, starting it first if needed."
   /// @nexus.experimental
-  /// @nexus.proto "temporal.api.workflowservice.v1.SignalWithStartWorkflowExecutionRequest" typescript-package="@temporalio/proto"
+  /// @nexus.proto "temporal.api.workflowservice.v1.SignalWithStartWorkflowExecutionRequest" typescript-import="@temporalio/proto"
   record signal-with-start-workflow-request {
     /// @nexus.doc
     ///   python="Workflow type name or callable identifying the workflow to start."
     ///   typescript="Workflow type name or workflow function identifying the workflow to start."
+    ///   dotnet="Workflow type name or workflow expression identifying the workflow to start."
     /// @nexus.proto-field "workflow_type"
     workflow: workflow-function,
     /// @nexus.doc "Unique identifier for the workflow execution."
@@ -43,6 +46,7 @@ interface workflow-service {
     /// @nexus.doc
     ///   python="Signal name or callable to send with the start request."
     ///   typescript="Signal name or signal definition to send with the start request."
+    ///   dotnet="Signal name or signal expression to send with the start request."
     /// @nexus.proto-field "signal_name"
     signal: signal-function,
     /// @nexus.doc "Total workflow execution timeout, including retries and continue-as-new."
@@ -81,7 +85,7 @@ interface workflow-service {
     /// @nexus.proto-field "workflow_start_delay"
     start-delay: option<duration>,
     user-metadata: option<user-metadata>,
-    /// @nexus.source python="workflow_namespace" typescript="workflowNamespace"
+    /// @nexus.source python="workflow_namespace" typescript="workflowNamespace" dotnet="TemporalWorkflowContext.WorkflowNamespace"
     namespace: string,
     /// @nexus.omit
     control: placeholder,
@@ -94,7 +98,7 @@ interface workflow-service {
   }
 
   /// @nexus.experimental
-  /// @nexus.proto "temporal.api.workflowservice.v1.SignalWithStartWorkflowExecutionResponse" typescript-package="@temporalio/proto"
+  /// @nexus.proto "temporal.api.workflowservice.v1.SignalWithStartWorkflowExecutionResponse" typescript-import="@temporalio/proto"
   record signal-with-start-workflow-response {
     run-id: option<string>,
     started: option<bool>,
@@ -110,7 +114,9 @@ interface workflow-service {
   ///   python="temporalio.workflow.get_external_workflow_handle(request.id, run_id=result.run_id)"
   ///   typescript-type="workflow.ExternalWorkflowHandle"
   ///   typescript="workflow.getExternalWorkflowHandle(request.id, result.runId ?? undefined)"
-  ///   typescript-package="@temporalio/workflow"
+  ///   typescript-import="@temporalio/workflow"
+  ///   dotnet-type="Temporalio.Workflows.ExternalWorkflowHandle"
+  ///   dotnet="Temporalio.Workflows.Workflow.GetExternalWorkflowHandle(request.Id, result.RunId)"
   /// @nexus.operation name="SignalWithStartWorkflowExecution"
   /// @nexus.experimental
   signal-with-start-workflow: func(

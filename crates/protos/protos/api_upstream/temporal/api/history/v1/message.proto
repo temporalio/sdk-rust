@@ -24,6 +24,7 @@ import "temporal/api/update/v1/message.proto";
 import "temporal/api/workflow/v1/message.proto";
 import "temporal/api/sdk/v1/task_complete_metadata.proto";
 import "temporal/api/sdk/v1/user_metadata.proto";
+import "temporal/api/sdk/v1/event_group_marker.proto";
 
 // Always the first event in workflow history
 message WorkflowExecutionStartedEventAttributes {
@@ -203,12 +204,17 @@ message WorkflowExecutionStartedEventAttributes {
     //
     // The configuration may be updated after start via UpdateWorkflowExecutionOptions, which
     // will be reflected in the WorkflowExecutionOptionsUpdatedEvent.
-    temporal.api.workflow.v1.TimeSkippingConfig time_skipping_config = 41;
+    temporal.api.common.v1.TimeSkippingConfig time_skipping_config = 41;
 
-    // The time skipped by the previous execution that started this workflow.
-    // It can happen in cases of child workflows and continue-as-new workflows.
-    google.protobuf.Duration initial_skipped_duration = 42;
+    reserved 42;
+    reserved "initial_skipped_duration";
+
+    // The time-skipping state propagated from a previous run of this workflow. This can be nil
+    // if no time skipping has occurred or there is no previous run.
+    temporal.api.common.v1.TimeSkippingStatePropagation time_skipping_state_propagation = 43;
+
 }
+
 
 // Wrapper for a target deployment version that the SDK declined to upgrade to.
 // See declined_target_version_upgrade on WorkflowExecutionStartedEventAttributes.
@@ -776,10 +782,14 @@ message StartChildWorkflowExecutionInitiatedEventAttributes {
     temporal.api.common.v1.Priority priority = 20;
 
     // The propagated time-skipping configuration for the child workflow.
-    temporal.api.workflow.v1.TimeSkippingConfig time_skipping_config = 21;
+    temporal.api.common.v1.TimeSkippingConfig time_skipping_config = 21;
 
-    // Propagate the duration skipped to the child workflow.
-    google.protobuf.Duration initial_skipped_duration = 30;
+    reserved 22;
+    reserved "initial_skipped_duration";
+
+    // The time-skipping state propagated from the parent workflow. This can be nil if no time skipping
+    // has occurred or there is no previous run.
+    temporal.api.common.v1.TimeSkippingStatePropagation time_skipping_state_propagation = 23;
 }
 
 message StartChildWorkflowExecutionFailedEventAttributes {
@@ -905,8 +915,14 @@ message WorkflowExecutionOptionsUpdatedEventAttributes {
     // Priority override upserted in this event. Represents the full priority; not just partial fields.
     // Ignored if nil.
     temporal.api.common.v1.Priority priority = 6;
-    // If set, the time-skipping configuration was changed. Contains the full updated configuration.
-    temporal.api.workflow.v1.TimeSkippingConfig time_skipping_config = 7;
+
+    // TimeSkippingConfig override upserted in this event. Represents the full config.
+    temporal.api.common.v1.TimeSkippingConfig time_skipping_config = 7;
+
+    // Indicates the time skipping config was updated by the recent call to update
+    // workflow execution options.
+    bool time_skipping_config_updated = 9;
+
     // Updates to workflow updates options.
     repeated WorkflowUpdateOptionsUpdate workflow_update_options = 8;
 }
@@ -1002,17 +1018,16 @@ message WorkflowExecutionUnpausedEventAttributes {
 }
 
 // Attributes for an event indicating that time skipping state changed for a workflow execution,
-// either time was advanced or time skipping was disabled automatically due to a bound being reached.
+// either time was advanced or time skipping was disabled automatically due to the fast_forward completing.
 // The worker_may_ignore field in HistoryEvent should always be set true for this event.
 message WorkflowExecutionTimeSkippingTransitionedEventAttributes {
-
-    // The virtual time after time skipping was applied.
+    // The virtual time point that time skipping advanced to.
     google.protobuf.Timestamp target_time = 1;
 
-    // when true, time skipping was disabled automatically due to a bound being reached.
+    // When true, time skipping has been disabled automatically due to a call to fast_forward completing.
     // (-- api-linter: core::0140::prepositions=disabled
     //     aip.dev/not-precedent: "after" is used to indicate temporal ordering. --)
-    bool disabled_after_bound = 2;
+    bool disabled_after_fast_forward = 2;
 
     // The wall-clock time when the time-skipping state changed event was generated.
     google.protobuf.Timestamp wall_clock_time = 3;
@@ -1193,6 +1208,8 @@ message HistoryEvent {
     repeated temporal.api.common.v1.Link links = 302;
     // Server-computed authenticated caller identity associated with this event.
     temporal.api.common.v1.Principal principal = 303;
+    // Event group markers attached to this event.
+    repeated temporal.api.sdk.v1.EventGroupMarker event_group_markers = 304;
     // The event details. The type must match that in `event_type`.
     oneof attributes {
         WorkflowExecutionStartedEventAttributes workflow_execution_started_event_attributes = 6;

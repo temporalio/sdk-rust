@@ -56,6 +56,8 @@ message NamespaceInfo {
         bool standalone_nexus_operation = 11;
         // True if the namespace supports attaching callbacks on workflow updates
         bool workflow_update_callbacks = 12;
+        // When true, workers should use poller autoscaling by default unless explicitly configured otherwise.
+        bool poller_autoscaling_auto_enroll = 13;
     }
 
     // Namespace configured limits

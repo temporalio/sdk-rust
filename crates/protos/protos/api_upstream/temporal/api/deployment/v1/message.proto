@@ -184,6 +184,21 @@ message VersionDrainageInfo {
     google.protobuf.Timestamp last_checked_time = 3;
 }
 
+// ComputeStatus represents compute-related configuration and health for a Worker Deployment Version.
+message ComputeStatus {
+    // ProviderValidationStatus represents the result of the most recent
+    // connectivity check between Temporal and a customer's compute provider.
+    message ProviderValidationStatus {
+        // Human-readable error message if connectivity validation failed.
+        // An empty string means validation passed.
+        string error_message = 1;
+        // Timestamp of the last validation check.
+        google.protobuf.Timestamp last_check_time = 2;
+    }
+    // provider_validation encapsulates the health signal for validating the compute provider.
+    ProviderValidationStatus provider_validation = 1;
+}
+
 // A Worker Deployment (Deployment, for short) represents all workers serving
 // a shared set of Task Queues. Typically, a Deployment represents one service or
 // application.
@@ -255,6 +270,8 @@ message WorkerDeploymentInfo {
         // Cleared if the version becomes current or ramping again.
         google.protobuf.Timestamp last_deactivation_time = 10;
         temporal.api.compute.v1.ComputeConfigSummary compute_config = 13;
+        // ComputeStatus represents compute-related configuration and healthchecks.
+        ComputeStatus compute_status = 14;
     }
 }
 
