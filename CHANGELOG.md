@@ -50,3 +50,8 @@ to docs, or any other relevant information.
   `anyhow::Error`.
 
 ## [Unreleased]
+
+### Added
+* Schedule descriptions now expose their configured action via `ScheduleDescription::action()`,
+  including start-workflow accessors for workflow type, task queue, workflow ID, raw argument
+  payloads, and typed argument decoding through the client's data converter.
