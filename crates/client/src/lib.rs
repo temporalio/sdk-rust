@@ -278,7 +278,8 @@ impl Connection {
                                 || msg.contains("unknown service")
                                 || msg.contains("method not found")
                                 || (msg.contains("getsysteminfo")
-                                    && msg.contains("is unimplemented"))
+                                    && (msg.contains("is unimplemented")
+                                        || msg.contains("not implement")))
                         } =>
                     {
                         None
@@ -1567,6 +1568,9 @@ mod tests {
         "unknown method GetSystemInfo for service temporal.api.workflowservice.v1.WorkflowService"
     )]
     #[case("Method temporal.api.workflowservice.v1.WorkflowService/GetSystemInfo is unimplemented")]
+    #[case(
+        "The server does not implement the method /temporal.api.workflowservice.v1.WorkflowService/GetSystemInfo"
+    )]
     #[tokio::test]
     async fn get_system_info_missing_method_falls_back_to_empty_capabilities(
         #[case] message: &'static str,
