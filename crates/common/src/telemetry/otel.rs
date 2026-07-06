@@ -414,13 +414,10 @@ pub(crate) mod tests {
         metrics::{Temporality, data::ResourceMetrics, exporter::PushMetricExporter},
     };
     use std::{
-        future::Future,
-        pin::pin,
         sync::{
             Arc,
             atomic::{AtomicBool, Ordering},
         },
-        task::{Context, Poll},
         time::Duration,
     };
     use tracing_core::{
@@ -492,8 +489,8 @@ pub(crate) mod tests {
         assert_eq!(service_name, Some(Value::from(TELEM_SERVICE_NAME)));
     }
 
-    #[test]
-    pub(crate) fn traced_exporter_enters_subscriber_while_polling_export() {
+    #[tokio::test]
+    pub(crate) async fn traced_exporter_enters_subscriber_while_polling_export() {
         let saw_export_log = Arc::new(AtomicBool::new(false));
         let saw_wrapper_warn = Arc::new(AtomicBool::new(false));
         let subscriber = Arc::new(CapturingSubscriber {
@@ -504,11 +501,8 @@ pub(crate) mod tests {
             TracingMetricExporter::new(FailingExporter)
         });
         let metrics = ResourceMetrics::default();
-        let waker = futures_util::task::noop_waker();
-        let mut cx = Context::from_waker(&waker);
-        let mut export = pin!(exporter.export(&metrics));
 
-        assert!(matches!(export.as_mut().poll(&mut cx), Poll::Ready(Err(_))));
+        assert!(exporter.export(&metrics).await.is_err());
         assert!(saw_export_log.load(Ordering::SeqCst));
     }
 
