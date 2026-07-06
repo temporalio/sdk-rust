@@ -50,3 +50,9 @@ to docs, or any other relevant information.
   `anyhow::Error`.
 
 ## [Unreleased]
+
+### Breaking Changes
+* `WorkflowExecution::search_attributes`, `WorkflowExecutionDescription::search_attributes`,
+  `ScheduleDescription::search_attributes`, and `ScheduleSummary::search_attributes` now return
+  typed `SearchAttributes` instead of raw proto search attributes. Missing search attributes are
+  returned as an empty collection instead of `None`.
