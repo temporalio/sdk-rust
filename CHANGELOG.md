@@ -56,3 +56,7 @@ to docs, or any other relevant information.
   `ScheduleDescription::search_attributes`, and `ScheduleSummary::search_attributes` now return
   typed `SearchAttributes` instead of raw proto search attributes. Missing search attributes are
   returned as an empty collection instead of `None`.
+
+### Fixed
+* OTLP metric export failures are now logged through Core telemetry when OpenTelemetry's periodic
+  metric reader reports an export error.
