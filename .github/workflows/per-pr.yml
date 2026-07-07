@@ -28,6 +28,9 @@ jobs:
         uses: jdx/mise-action@e6a8b3978addb5a52f2b4cd9d91eafa7f0ab959d # v4.2.0
         with:
           version: 2026.7.1
+      - name: Set PROTOC
+        shell: bash
+        run: printf 'PROTOC=%s\n' "$(mise which protoc)" >> "$GITHUB_ENV"
       - run: rustup component add rustfmt clippy
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
@@ -69,6 +72,9 @@ jobs:
         uses: jdx/mise-action@e6a8b3978addb5a52f2b4cd9d91eafa7f0ab959d # v4.2.0
         with:
           version: 2026.7.1
+      - name: Set PROTOC
+        shell: bash
+        run: printf 'PROTOC=%s\n' "$(mise which protoc)" >> "$GITHUB_ENV"
       # Workaround for https://github.com/actions/runner-images/issues/12432
       # from https://github.com/rust-lang/rust/issues/141626#issuecomment-2919419236
       # Visual Studio bug tracker https://developercommunity.visualstudio.com/t/Regression-from-1943:-linkexe-crashes/10912960
@@ -117,6 +123,9 @@ jobs:
         uses: jdx/mise-action@e6a8b3978addb5a52f2b4cd9d91eafa7f0ab959d # v4.2.0
         with:
           version: 2026.7.1
+      - name: Set PROTOC
+        shell: bash
+        run: printf 'PROTOC=%s\n' "$(mise which protoc)" >> "$GITHUB_ENV"
       - run: rustup component add rustfmt clippy
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
@@ -171,6 +180,9 @@ jobs:
         uses: jdx/mise-action@e6a8b3978addb5a52f2b4cd9d91eafa7f0ab959d # v4.2.0
         with:
           version: 2026.7.1
+      - name: Set PROTOC
+        shell: bash
+        run: printf 'PROTOC=%s\n' "$(mise which protoc)" >> "$GITHUB_ENV"
       # Workaround for https://github.com/actions/runner-images/issues/12432
       # from https://github.com/rust-lang/rust/issues/141626#issuecomment-2919419236
       # Visual Studio bug tracker https://developercommunity.visualstudio.com/t/Regression-from-1943:-linkexe-crashes/10912960
@@ -200,6 +212,9 @@ jobs:
         uses: jdx/mise-action@e6a8b3978addb5a52f2b4cd9d91eafa7f0ab959d # v4.2.0
         with:
           version: 2026.7.1
+      - name: Set PROTOC
+        shell: bash
+        run: printf 'PROTOC=%s\n' "$(mise which protoc)" >> "$GITHUB_ENV"
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
@@ -225,6 +240,9 @@ jobs:
         uses: jdx/mise-action@e6a8b3978addb5a52f2b4cd9d91eafa7f0ab959d # v4.2.0
         with:
           version: 2026.7.1
+      - name: Set PROTOC
+        shell: bash
+        run: printf 'PROTOC=%s\n' "$(mise which protoc)" >> "$GITHUB_ENV"
 
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
@@ -249,6 +267,9 @@ jobs:
         uses: jdx/mise-action@e6a8b3978addb5a52f2b4cd9d91eafa7f0ab959d # v4.2.0
         with:
           version: 2026.7.1
+      - name: Set PROTOC
+        shell: bash
+        run: printf 'PROTOC=%s\n' "$(mise which protoc)" >> "$GITHUB_ENV"
       - name: Start container for otel-collector and prometheus
         uses: hoverkraft-tech/compose-action@4894d2492015c1774ee5a13a95b1072093087ec3 # v2.5.0
         with:
@@ -270,6 +291,9 @@ jobs:
         uses: jdx/mise-action@e6a8b3978addb5a52f2b4cd9d91eafa7f0ab959d # v4.2.0
         with:
           version: 2026.7.1
+      - name: Set PROTOC
+        shell: bash
+        run: printf 'PROTOC=%s\n' "$(mise which protoc)" >> "$GITHUB_ENV"
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           cache-bin: false
@@ -297,6 +321,9 @@ jobs:
         uses: jdx/mise-action@e6a8b3978addb5a52f2b4cd9d91eafa7f0ab959d # v4.2.0
         with:
           version: 2026.7.1
+      - name: Set PROTOC
+        shell: bash
+        run: printf 'PROTOC=%s\n' "$(mise which protoc)" >> "$GITHUB_ENV"
 
       - name: Build crate as static library
         run: cargo rustc --package temporalio-sdk-core-c-bridge --features xz2-static -- --crate-type=staticlib

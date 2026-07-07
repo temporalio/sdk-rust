@@ -28,4 +28,7 @@ jobs:
         uses: jdx/mise-action@e6a8b3978addb5a52f2b4cd9d91eafa7f0ab959d # v4.2.0
         with:
           version: 2026.7.1
+      - name: Set PROTOC
+        shell: bash
+        run: printf 'PROTOC=%s\n' "$(mise which protoc)" >> "$GITHUB_ENV"
       - run: cargo integ-test -c "--release" -t heavy_tests -- --test-threads 1
