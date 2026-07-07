@@ -88,7 +88,7 @@ use temporalio_common::{
         proto_ts_to_system_time,
         temporal::api::{
             cloud::cloudservice::v1::cloud_service_client::CloudServiceClient,
-            common::v1::{Memo, Payload, SearchAttributes, WorkflowType},
+            common::v1::{Memo, Payload, WorkflowType},
             enums::v1::{TaskQueueKind, WorkflowExecutionStatus},
             errordetails::v1::WorkflowExecutionAlreadyStartedFailure,
             operatorservice::v1::operator_service_client::OperatorServiceClient,
@@ -103,6 +103,7 @@ use temporalio_common::{
         },
         utilities::decode_status_detail,
     },
+    search_attributes::SearchAttributes,
 };
 use tonic::{
     Code, IntoRequest,
@@ -277,7 +278,8 @@ impl Connection {
                                 || msg.contains("unknown service")
                                 || msg.contains("method not found")
                                 || (msg.contains("getsysteminfo")
-                                    && msg.contains("is unimplemented"))
+                                    && (msg.contains("is unimplemented")
+                                        || msg.contains("not implement")))
                         } =>
                     {
                         None
@@ -1000,8 +1002,12 @@ impl WorkflowExecution {
     }
 
     /// Search attributes on the workflow.
-    pub fn search_attributes(&self) -> Option<&SearchAttributes> {
-        self.raw.search_attributes.as_ref()
+    pub fn search_attributes(&self) -> SearchAttributes {
+        self.raw
+            .search_attributes
+            .as_ref()
+            .map(SearchAttributes::from_proto)
+            .unwrap_or_default()
     }
 
     /// Access the raw proto for additional fields not exposed via accessors.
@@ -1562,6 +1568,9 @@ mod tests {
         "unknown method GetSystemInfo for service temporal.api.workflowservice.v1.WorkflowService"
     )]
     #[case("Method temporal.api.workflowservice.v1.WorkflowService/GetSystemInfo is unimplemented")]
+    #[case(
+        "The server does not implement the method /temporal.api.workflowservice.v1.WorkflowService/GetSystemInfo"
+    )]
     #[tokio::test]
     async fn get_system_info_missing_method_falls_back_to_empty_capabilities(
         #[case] message: &'static str,

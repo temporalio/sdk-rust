@@ -825,6 +825,9 @@ const NOT_VALIDATED_FIELDS: &[&str] = &[
     "temporal.api.sdk.v1.UserMetadata.summary",
     "temporal.api.nexus.v1.EndpointSpec.description",
     "temporal.api.cloud.nexus.v1.EndpointSpec.description",
+    // Dedicated, non-fetchable limits (not blob/memo, not in DescribeNamespace): Event group marker
+    // label: custom 400-byte server-side limit.
+    "temporal.api.sdk.v1.EventGroupMarker.Label.label",
     // Update input args: frontend records a metric only — enforced on delivery via Message.body.
     "temporal.api.update.v1.Input.args",
     // Query/nexus failures and the nexus sync response payload: not size-checked on these paths.

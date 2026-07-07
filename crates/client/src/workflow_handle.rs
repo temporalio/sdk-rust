@@ -41,6 +41,7 @@ use temporalio_common::{
             },
         },
     },
+    search_attributes::SearchAttributes,
 };
 use tonic::IntoRequest;
 use uuid::Uuid;
@@ -225,10 +226,12 @@ impl WorkflowExecutionDescription {
     }
 
     /// Search attributes on the workflow.
-    pub fn search_attributes(
-        &self,
-    ) -> Option<&temporalio_common::protos::temporal::api::common::v1::SearchAttributes> {
-        self.workflow_info().search_attributes.as_ref()
+    pub fn search_attributes(&self) -> SearchAttributes {
+        self.workflow_info()
+            .search_attributes
+            .as_ref()
+            .map(SearchAttributes::from_proto)
+            .unwrap_or_default()
     }
 
     /// Static summary configured on the workflow, if present.
@@ -1101,9 +1104,10 @@ mod tests {
         assert_eq!(description.parent_id(), Some("parent-id"));
         assert_eq!(description.parent_run_id(), Some("parent-run-id"));
         assert_eq!(description.memo().unwrap().fields["memo-key"], memo_payload);
+        let search_attributes = description.search_attributes();
         assert_eq!(
-            description.search_attributes().unwrap().indexed_fields["CustomKeywordField"],
-            search_attr_payload
+            search_attributes.raw_payload("CustomKeywordField"),
+            Some(&search_attr_payload)
         );
         assert_eq!(description.static_summary(), Some("workflow summary"));
         assert_eq!(description.static_details(), Some("workflow details"));

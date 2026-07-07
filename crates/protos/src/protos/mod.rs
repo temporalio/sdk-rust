@@ -1711,34 +1711,40 @@ pub mod temporal {
                                     command_type: CommandType::StartTimer as i32,
                                     attributes: Some(a),
                                     user_metadata: Default::default(),
+                                    event_group_markers: Default::default(),
                                 },
                                 a @ Attributes::CancelTimerCommandAttributes(_) => Self {
                                     command_type: CommandType::CancelTimer as i32,
                                     attributes: Some(a),
                                     user_metadata: Default::default(),
+                                    event_group_markers: Default::default(),
                                 },
                                 a @ Attributes::CompleteWorkflowExecutionCommandAttributes(_) => {
                                     Self {
                                         command_type: CommandType::CompleteWorkflowExecution as i32,
                                         attributes: Some(a),
                                         user_metadata: Default::default(),
+                                        event_group_markers: Default::default(),
                                     }
                                 }
                                 a @ Attributes::FailWorkflowExecutionCommandAttributes(_) => Self {
                                     command_type: CommandType::FailWorkflowExecution as i32,
                                     attributes: Some(a),
                                     user_metadata: Default::default(),
+                                    event_group_markers: Default::default(),
                                 },
                                 a @ Attributes::ScheduleActivityTaskCommandAttributes(_) => Self {
                                     command_type: CommandType::ScheduleActivityTask as i32,
                                     attributes: Some(a),
                                     user_metadata: Default::default(),
+                                    event_group_markers: Default::default(),
                                 },
                                 a @ Attributes::RequestCancelActivityTaskCommandAttributes(_) => {
                                     Self {
                                         command_type: CommandType::RequestCancelActivityTask as i32,
                                         attributes: Some(a),
                                         user_metadata: Default::default(),
+                                        event_group_markers: Default::default(),
                                     }
                                 }
                                 a
@@ -1749,23 +1755,27 @@ pub mod temporal {
                                         as i32,
                                     attributes: Some(a),
                                     user_metadata: Default::default(),
+                                    event_group_markers: Default::default(),
                                 },
                                 a @ Attributes::CancelWorkflowExecutionCommandAttributes(_) => {
                                     Self {
                                         command_type: CommandType::CancelWorkflowExecution as i32,
                                         attributes: Some(a),
                                         user_metadata: Default::default(),
+                                        event_group_markers: Default::default(),
                                     }
                                 }
                                 a @ Attributes::RecordMarkerCommandAttributes(_) => Self {
                                     command_type: CommandType::RecordMarker as i32,
                                     attributes: Some(a),
                                     user_metadata: Default::default(),
+                                    event_group_markers: Default::default(),
                                 },
                                 a @ Attributes::ProtocolMessageCommandAttributes(_) => Self {
                                     command_type: CommandType::ProtocolMessage as i32,
                                     attributes: Some(a),
                                     user_metadata: Default::default(),
+                                    event_group_markers: Default::default(),
                                 },
                                 a @ Attributes::RequestCancelNexusOperationCommandAttributes(_) => {
                                     Self {
@@ -1773,6 +1783,7 @@ pub mod temporal {
                                             as i32,
                                         attributes: Some(a),
                                         user_metadata: Default::default(),
+                                        event_group_markers: Default::default(),
                                     }
                                 }
                                 _ => unimplemented!(),

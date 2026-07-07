@@ -1565,6 +1565,16 @@ service WorkflowService {
         };
     }
 
+    // CountWorkers counts the number of workers in a specific namespace.
+    rpc CountWorkers (CountWorkersRequest) returns (CountWorkersResponse) {
+        option (google.api.http) = {
+            get: "/namespaces/{namespace}/worker-count"
+            additional_bindings {
+                get: "/api/v1/namespaces/{namespace}/worker-count"
+            }
+        };
+    }
+
     // Updates task queue configuration.
     // For the overall queue rate limit: the rate limit set by this api overrides the worker-set rate limit,
     // which uncouples the rate limit from the worker lifecycle.

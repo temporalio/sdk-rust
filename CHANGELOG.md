@@ -55,3 +55,13 @@ to docs, or any other relevant information.
 * Schedule descriptions now expose their configured action via `ScheduleDescription::action()`,
   including start-workflow accessors for workflow type, task queue, workflow ID, raw argument
   payloads, and typed argument decoding through the client's data converter.
+
+### Breaking Changes
+* `WorkflowExecution::search_attributes`, `WorkflowExecutionDescription::search_attributes`,
+  `ScheduleDescription::search_attributes`, and `ScheduleSummary::search_attributes` now return
+  typed `SearchAttributes` instead of raw proto search attributes. Missing search attributes are
+  returned as an empty collection instead of `None`.
+
+### Fixed
+* OTLP metric export failures are now logged through Core telemetry when OpenTelemetry's periodic
+  metric reader reports an export error.

@@ -11,6 +11,7 @@ option csharp_namespace = "Temporalio.Api.Common.V1";
 
 import "google/protobuf/duration.proto";
 import "google/protobuf/empty.proto";
+import "google/protobuf/timestamp.proto";
 
 import "temporal/api/enums/v1/common.proto";
 import "temporal/api/enums/v1/event_type.proto";
@@ -392,4 +393,53 @@ message OnConflictOptions {
     bool attach_completion_callbacks = 2;
     // Attaches the links to the running execution.
     bool attach_links = 3;
+}
+
+// The configuration for time skipping of a workflow execution (a chain of runs including retries, cron, continue-as-new).
+// When time skipping is enabled, virtual time advances automatically whenever there is no in-flight work.
+// In-flight work includes activities, child workflows, Nexus operations, signal/cancel external workflow operations,
+// and possibly other features added in the future.
+// User timers are not classified as in-flight work and will be skipped over; the virtual clock may also skip to the
+// time point of the registered fast forward when there is no in-flight work.
+// When time is skipped, a WorkflowExecutionTimeSkippingTransitionedEvent will be
+// added to the workflow history to capture the state changes.
+//
+// For child workflows, by default, if the parent execution is skipping time, the child execution will also skip time,
+// but a parent's fast_forward won't affect its child's execution. A flag is provided to disable propagation of the
+// "enabled" flag to child workflows; regardless of that flag, a child workflow inherits the virtual time from the
+// parent execution as its start time.
+message TimeSkippingConfig {
+    // Enables or disables time skipping for this workflow execution.
+    bool enabled = 1;
+
+    // Optionally fast-forward the current workflow execution by this duration ahead of current workflow execution time.
+    // After the fast-forward completes, time skipping is disabled, and this
+    // action is recorded in the WorkflowExecutionTimeSkippingTransitionedEvent. It can be re-enabled by
+    // setting `enabled` to true or setting `fast_forward` again via UpdateWorkflowExecutionOptions.
+    // The current workflow execution is a chain of runs (retries, cron, continue-as-new);
+    // child workflows are separate executions, so this fast_forward won't affect them.
+    //
+    // For a given workflow execution, only one active fast-forward is allowed at a time.
+    // If a new fast-forward is set via UpdateWorkflowExecutionOptions before the previous
+    // one completes, the new one will override the previous one.
+    // If the fast-forward duration exceeds the remaining execution timeout, time will only
+    // be fast-forwarded up to the end of the execution.
+    google.protobuf.Duration fast_forward = 2;
+
+    // By default, child workflows inherit the "enabled" flag when they are started.
+    // This flag disables that inheritance.
+    bool disable_child_propagation = 3;
+}
+
+// The time-skipping state that needs to be propagated from a parent workflow to a child workflow,
+// or through a chain of runs.
+message TimeSkippingStatePropagation {
+
+    // The time skipped by the previous execution that started this workflow.
+    // It can happen in child workflows and a chain of runs (CaN, cron, retry).
+    google.protobuf.Duration initial_skipped_duration = 1;
+
+    // If there is a fast-forward action set for the previous run in a chain of runs,
+    // the target time should be propagated to the next run as well.
+    google.protobuf.Timestamp fast_forward_target_time = 2;
 }
