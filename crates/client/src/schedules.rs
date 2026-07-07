@@ -36,6 +36,14 @@ pub enum ScheduleError {
     /// Failed to encode workflow input payloads.
     #[error("Payload conversion error: {0}")]
     PayloadConversion(#[from] PayloadConversionError),
+    /// The server returned a schedule description that is missing required fields.
+    #[error("Malformed schedule description for schedule ID '{schedule_id}': {reason}")]
+    MalformedDescription {
+        /// ID of the schedule whose description was malformed.
+        schedule_id: String,
+        /// Details about the malformed response.
+        reason: String,
+    },
 }
 
 trait SerializableScheduleInput: Send + Sync {
@@ -513,10 +521,36 @@ pub struct ScheduleDescription {
 }
 
 impl ScheduleDescription {
-    pub(crate) fn new(raw: DescribeScheduleResponse, data_converter: DataConverter) -> Self {
-        Self {
+    pub(crate) fn new(
+        raw: DescribeScheduleResponse,
+        data_converter: DataConverter,
+        schedule_id: &str,
+    ) -> Result<Self, ScheduleError> {
+        let action = raw
+            .schedule
+            .as_ref()
+            .ok_or_else(|| Self::malformed_description_error(schedule_id, "missing schedule"))?
+            .action
+            .as_ref()
+            .ok_or_else(|| {
+                Self::malformed_description_error(schedule_id, "missing schedule action")
+            })?;
+        if action.action.is_none() {
+            return Err(Self::malformed_description_error(
+                schedule_id,
+                "missing schedule action variant",
+            ));
+        }
+        Ok(Self {
             raw,
             data_converter,
+        })
+    }
+
+    fn malformed_description_error(schedule_id: &str, reason: impl Into<String>) -> ScheduleError {
+        ScheduleError::MalformedDescription {
+            schedule_id: schedule_id.to_string(),
+            reason: reason.into(),
         }
     }
 
@@ -660,12 +694,6 @@ impl ScheduleDescription {
             schedule: self.raw.schedule.unwrap_or_default(),
             pending_action: None,
         }
-    }
-}
-
-impl From<DescribeScheduleResponse> for ScheduleDescription {
-    fn from(raw: DescribeScheduleResponse) -> Self {
-        Self::new(raw, DataConverter::default())
     }
 }
 
@@ -953,10 +981,11 @@ where
         .await?
         .into_inner();
 
-        Ok(ScheduleDescription::new(
+        ScheduleDescription::new(
             resp,
             self.client.data_converter().clone(),
-        ))
+            &self.schedule_id,
+        )
     }
 
     /// Update the schedule definition.
@@ -1298,11 +1327,21 @@ mod tests {
         patch: AtomicUsize,
     }
 
-    #[derive(Clone, Default)]
+    #[derive(Clone)]
     struct MockScheduleClient {
         captured: Arc<CapturedRequests>,
         describe_response: DescribeScheduleResponse,
         should_error: bool,
+    }
+
+    impl Default for MockScheduleClient {
+        fn default() -> Self {
+            Self {
+                captured: Arc::new(CapturedRequests::default()),
+                describe_response: describe_response_with_start_workflow(None),
+                should_error: false,
+            }
+        }
     }
 
     impl NamespacedClient for MockScheduleClient {
@@ -1426,6 +1465,31 @@ mod tests {
         }
     }
 
+    fn schedule_description_from_response(raw: DescribeScheduleResponse) -> ScheduleDescription {
+        ScheduleDescription::new(raw, DataConverter::default(), "test-schedule-id").unwrap()
+    }
+
+    fn describe_response_without_schedule() -> DescribeScheduleResponse {
+        DescribeScheduleResponse::default()
+    }
+
+    fn describe_response_without_action() -> DescribeScheduleResponse {
+        DescribeScheduleResponse {
+            schedule: Some(Schedule::default()),
+            ..Default::default()
+        }
+    }
+
+    fn describe_response_without_action_variant() -> DescribeScheduleResponse {
+        DescribeScheduleResponse {
+            schedule: Some(Schedule {
+                action: Some(schedule_proto::ScheduleAction::default()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
     #[test]
     fn schedule_handle_exposes_namespace_and_id() {
         let handle = make_schedule_handle(MockScheduleClient::default());
@@ -1436,19 +1500,18 @@ mod tests {
     #[tokio::test]
     async fn schedule_describe_returns_response_fields() {
         let conflict_token = b"token-123".to_vec();
+        let mut describe_response = describe_response_with_start_workflow(None);
+        describe_response.info = Some(ScheduleInfo::default());
+        describe_response.memo = Some(Memo {
+            fields: Default::default(),
+        });
+        describe_response.search_attributes = Some(SearchAttributes {
+            indexed_fields: Default::default(),
+        });
+        describe_response.conflict_token = conflict_token.clone();
 
         let client = MockScheduleClient {
-            describe_response: DescribeScheduleResponse {
-                schedule: Some(Schedule::default()),
-                info: Some(ScheduleInfo::default()),
-                memo: Some(Memo {
-                    fields: Default::default(),
-                }),
-                search_attributes: Some(SearchAttributes {
-                    indexed_fields: Default::default(),
-                }),
-                conflict_token: conflict_token.clone(),
-            },
+            describe_response,
             ..Default::default()
         };
 
@@ -1633,52 +1696,50 @@ mod tests {
 
     #[tokio::test]
     async fn schedule_describe_accessors_with_populated_fields() {
-        let client = MockScheduleClient {
-            describe_response: DescribeScheduleResponse {
-                schedule: Some(Schedule {
-                    spec: Some(ScheduleSpec {
-                        timezone_name: "US/Eastern".to_string(),
-                        ..Default::default()
-                    }),
-                    state: Some(ScheduleState {
-                        paused: true,
-                        notes: "maintenance window".to_string(),
-                        ..Default::default()
-                    }),
-                    ..Default::default()
+        let mut describe_response = describe_response_with_start_workflow(None);
+        let schedule = describe_response.schedule.as_mut().unwrap();
+        schedule.spec = Some(ScheduleSpec {
+            timezone_name: "US/Eastern".to_string(),
+            ..Default::default()
+        });
+        schedule.state = Some(ScheduleState {
+            paused: true,
+            notes: "maintenance window".to_string(),
+            ..Default::default()
+        });
+        describe_response.info = Some(ScheduleInfo {
+            action_count: 42,
+            missed_catchup_window: 3,
+            overlap_skipped: 5,
+            recent_actions: vec![ScheduleActionResult {
+                start_workflow_result: Some(ProtoWorkflowExecution {
+                    workflow_id: "ra-wf".to_string(),
+                    run_id: "ra-run".to_string(),
                 }),
-                info: Some(ScheduleInfo {
-                    action_count: 42,
-                    missed_catchup_window: 3,
-                    overlap_skipped: 5,
-                    recent_actions: vec![ScheduleActionResult {
-                        start_workflow_result: Some(ProtoWorkflowExecution {
-                            workflow_id: "ra-wf".to_string(),
-                            run_id: "ra-run".to_string(),
-                        }),
-                        ..Default::default()
-                    }],
-                    running_workflows: vec![ProtoWorkflowExecution {
-                        workflow_id: "wf-1".to_string(),
-                        run_id: "run-1".to_string(),
-                    }],
-                    create_time: Some(prost_types::Timestamp {
-                        seconds: 1_700_000_000,
-                        nanos: 0,
-                    }),
-                    update_time: Some(prost_types::Timestamp {
-                        seconds: 1_700_001_000,
-                        nanos: 0,
-                    }),
-                    future_action_times: vec![prost_types::Timestamp {
-                        seconds: 1_700_002_000,
-                        nanos: 0,
-                    }],
-                    ..Default::default()
-                }),
-                conflict_token: b"tok".to_vec(),
                 ..Default::default()
-            },
+            }],
+            running_workflows: vec![ProtoWorkflowExecution {
+                workflow_id: "wf-1".to_string(),
+                run_id: "run-1".to_string(),
+            }],
+            create_time: Some(prost_types::Timestamp {
+                seconds: 1_700_000_000,
+                nanos: 0,
+            }),
+            update_time: Some(prost_types::Timestamp {
+                seconds: 1_700_001_000,
+                nanos: 0,
+            }),
+            future_action_times: vec![prost_types::Timestamp {
+                seconds: 1_700_002_000,
+                nanos: 0,
+            }],
+            ..Default::default()
+        });
+        describe_response.conflict_token = b"tok".to_vec();
+
+        let client = MockScheduleClient {
+            describe_response,
             ..Default::default()
         };
 
@@ -1727,17 +1788,14 @@ mod tests {
 
     #[tokio::test]
     async fn schedule_note_returns_none_for_empty_string() {
+        let mut describe_response = describe_response_with_start_workflow(None);
+        describe_response.schedule.as_mut().unwrap().state = Some(ScheduleState {
+            notes: String::new(),
+            ..Default::default()
+        });
+
         let client = MockScheduleClient {
-            describe_response: DescribeScheduleResponse {
-                schedule: Some(Schedule {
-                    state: Some(ScheduleState {
-                        notes: String::new(),
-                        ..Default::default()
-                    }),
-                    ..Default::default()
-                }),
-                ..Default::default()
-            },
+            describe_response,
             ..Default::default()
         };
 
@@ -1823,12 +1881,10 @@ mod tests {
 
     #[test]
     fn schedule_description_raw_round_trip() {
-        let resp = DescribeScheduleResponse {
-            conflict_token: b"ct".to_vec(),
-            schedule: Some(Schedule::default()),
-            ..Default::default()
-        };
-        let desc = ScheduleDescription::from(resp.clone());
+        let mut resp = describe_response_with_start_workflow(None);
+        resp.conflict_token = b"ct".to_vec();
+
+        let desc = schedule_description_from_response(resp.clone());
         assert_eq!(desc.raw().conflict_token, b"ct");
         let recovered = desc.into_raw();
         assert_eq!(recovered.conflict_token, resp.conflict_token);
@@ -1846,7 +1902,9 @@ mod tests {
         let desc = ScheduleDescription::new(
             describe_response_with_start_workflow(Some(Payloads { payloads })),
             data_converter,
-        );
+            "test-schedule-id",
+        )
+        .unwrap();
 
         let ScheduleDescriptionAction::StartWorkflow(action) = desc.action();
 
@@ -1859,7 +1917,7 @@ mod tests {
 
     #[tokio::test]
     async fn schedule_description_start_workflow_args_returns_none_without_input() {
-        let desc = ScheduleDescription::from(describe_response_with_start_workflow(None));
+        let desc = schedule_description_from_response(describe_response_with_start_workflow(None));
         let ScheduleDescriptionAction::StartWorkflow(action) = desc.action();
 
         let decoded: Option<String> = action.args().await.unwrap();
@@ -1874,31 +1932,38 @@ mod tests {
             .to_payloads(&SerializationContextData::Workflow, &expected)
             .await
             .unwrap();
-        let desc =
-            ScheduleDescription::from(describe_response_with_start_workflow(Some(Payloads {
-                payloads,
-            })));
+        let desc = schedule_description_from_response(describe_response_with_start_workflow(Some(
+            Payloads { payloads },
+        )));
         let ScheduleDescriptionAction::StartWorkflow(action) = desc.action();
 
         let err = action.args::<i32>().await.unwrap_err();
         assert!(matches!(err, PayloadConversionError::EncodingError(_)));
     }
 
-    #[test]
-    #[should_panic(expected = "schedule description should contain schedule")]
-    fn schedule_description_action_panics_when_schedule_is_missing() {
-        let desc = ScheduleDescription::from(DescribeScheduleResponse::default());
-        let _ = desc.action();
-    }
-
-    #[test]
-    #[should_panic(expected = "schedule description should contain action")]
-    fn schedule_description_action_panics_when_action_is_missing() {
-        let desc = ScheduleDescription::from(DescribeScheduleResponse {
-            schedule: Some(Schedule::default()),
+    #[rstest::rstest]
+    #[case::schedule(describe_response_without_schedule(), "missing schedule")]
+    #[case::action(describe_response_without_action(), "missing schedule action")]
+    #[case::action_variant(
+        describe_response_without_action_variant(),
+        "missing schedule action variant"
+    )]
+    #[tokio::test]
+    async fn schedule_describe_errors_when_required_field_is_missing(
+        #[case] describe_response: DescribeScheduleResponse,
+        #[case] reason: &str,
+    ) {
+        let client = MockScheduleClient {
+            describe_response,
             ..Default::default()
-        });
-        let _ = desc.action();
+        };
+        let handle = make_schedule_handle(client);
+
+        let err = handle.describe().await.unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            format!("Malformed schedule description for schedule ID 'test-schedule-id': {reason}")
+        );
     }
 
     #[test]
@@ -1915,17 +1980,12 @@ mod tests {
 
     #[test]
     fn schedule_into_update_preserves_schedule() {
-        let resp = DescribeScheduleResponse {
-            schedule: Some(Schedule {
-                state: Some(ScheduleState {
-                    notes: "my notes".to_string(),
-                    ..Default::default()
-                }),
-                ..Default::default()
-            }),
+        let mut resp = describe_response_with_start_workflow(None);
+        resp.schedule.as_mut().unwrap().state = Some(ScheduleState {
+            notes: "my notes".to_string(),
             ..Default::default()
-        };
-        let desc = ScheduleDescription::from(resp);
+        });
+        let desc = schedule_description_from_response(resp);
         let update = desc.into_update();
 
         assert_eq!(update.raw().state.as_ref().unwrap().notes, "my notes");
@@ -1933,11 +1993,7 @@ mod tests {
 
     #[test]
     fn schedule_update_setters_are_chainable() {
-        let resp = DescribeScheduleResponse {
-            schedule: Some(Schedule::default()),
-            ..Default::default()
-        };
-        let desc = ScheduleDescription::from(resp);
+        let desc = schedule_description_from_response(describe_response_with_start_workflow(None));
         let mut update = desc.into_update();
         update.set_note("chained").set_paused(true);
         assert_eq!(update.raw().state.as_ref().unwrap().notes, "chained");
