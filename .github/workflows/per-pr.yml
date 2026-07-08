@@ -21,21 +21,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: ./.github/actions/setup
         with:
-          submodules: recursive
-      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
-      - name: Run mise install
-        uses: jdx/mise-action@e6a8b3978addb5a52f2b4cd9d91eafa7f0ab959d # v4.2.0
-        with:
-          version: 2026.7.1
-      - name: Set PROTOC
-        shell: bash
-        run: printf 'PROTOC=%s\n' "$(mise which protoc)" >> "$GITHUB_ENV"
-      - run: rustup component add rustfmt clippy
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-        with:
-          cache-bin: false
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+          mise-install-args: protoc
       - run: cargo fmt --all --check
       - run: cargo doc --workspace --all-features --no-deps
         env:
@@ -67,14 +55,9 @@ jobs:
     runs-on: ${{ matrix.runsOn || matrix.os }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
-      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
-      - name: Run mise install
-        uses: jdx/mise-action@e6a8b3978addb5a52f2b4cd9d91eafa7f0ab959d # v4.2.0
+      - uses: ./.github/actions/setup
         with:
-          version: 2026.7.1
-      - name: Set PROTOC
-        shell: bash
-        run: printf 'PROTOC=%s\n' "$(mise which protoc)" >> "$GITHUB_ENV"
+          mise-install-args: protoc
       # Workaround for https://github.com/actions/runner-images/issues/12432
       # from https://github.com/rust-lang/rust/issues/141626#issuecomment-2919419236
       # Visual Studio bug tracker https://developercommunity.visualstudio.com/t/Regression-from-1943:-linkexe-crashes/10912960
@@ -84,10 +67,6 @@ jobs:
         with:
           script: |
             core.exportVariable('RUSTFLAGS', '-Csymbol-mangling-version=v0');
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-        with:
-          cache-bin: false
-          save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo test -- --include-ignored --nocapture
       - name: Find test executable for cgroup tests
         id: find-cgroup-test
@@ -116,23 +95,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: ./.github/actions/setup
         with:
-          submodules: recursive
-      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
-      - name: Run mise install
-        uses: jdx/mise-action@e6a8b3978addb5a52f2b4cd9d91eafa7f0ab959d # v4.2.0
-        with:
-          version: 2026.7.1
-      - name: Set PROTOC
-        shell: bash
-        run: printf 'PROTOC=%s\n' "$(mise which protoc)" >> "$GITHUB_ENV"
-      - run: rustup component add rustfmt clippy
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-        with:
-          cache-bin: false
-          save-if: ${{ github.ref == 'refs/heads/main' }}
-          key: msrv
-      - run: cargo install cargo-msrv
+          mise-install-args: protoc cargo:cargo-msrv
+          rust-cache-key: msrv
       - run: cargo msrv verify
         working-directory: ./crates/sdk-core
 
@@ -175,14 +141,9 @@ jobs:
     runs-on: ${{ matrix.runsOn || matrix.os }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
-      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
-      - name: Run mise install
-        uses: jdx/mise-action@e6a8b3978addb5a52f2b4cd9d91eafa7f0ab959d # v4.2.0
+      - uses: ./.github/actions/setup
         with:
-          version: 2026.7.1
-      - name: Set PROTOC
-        shell: bash
-        run: printf 'PROTOC=%s\n' "$(mise which protoc)" >> "$GITHUB_ENV"
+          mise-install-args: protoc
       # Workaround for https://github.com/actions/runner-images/issues/12432
       # from https://github.com/rust-lang/rust/issues/141626#issuecomment-2919419236
       # Visual Studio bug tracker https://developercommunity.visualstudio.com/t/Regression-from-1943:-linkexe-crashes/10912960
@@ -192,10 +153,6 @@ jobs:
         with:
           script: |
             core.exportVariable('RUSTFLAGS', '-Csymbol-mangling-version=v0');
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-        with:
-          cache-bin: false
-          save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo integ-test
 
   wasm-workflow-tests:
@@ -204,23 +161,13 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
-      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+      - uses: ./.github/actions/setup
+        with:
+          mise-install-args: protoc cargo:cargo-component
+          rust-cache-key: wasm-workflow-tests
       - name: Install WASM Rust targets
-        # Install after checkout so rustup uses this repo's rust-toolchain.toml override.
+        # Install after rust-toolchain so targets are added to the correct toolchain.
         run: rustup target add wasm32-unknown-unknown wasm32-wasip1
-      - name: Run mise install
-        uses: jdx/mise-action@e6a8b3978addb5a52f2b4cd9d91eafa7f0ab959d # v4.2.0
-        with:
-          version: 2026.7.1
-      - name: Set PROTOC
-        shell: bash
-        run: printf 'PROTOC=%s\n' "$(mise which protoc)" >> "$GITHUB_ENV"
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-        with:
-          save-if: ${{ github.ref == 'refs/heads/main' }}
-          key: wasm-workflow-tests
-      - name: Install cargo-component
-        run: cargo install --locked cargo-component
       - run: cargo integ-test -t wasm_workflow_tests -- --test-threads 1
 
   cloud-tests:
@@ -235,19 +182,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
-      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
-      - name: Run mise install
-        uses: jdx/mise-action@e6a8b3978addb5a52f2b4cd9d91eafa7f0ab959d # v4.2.0
+      - uses: ./.github/actions/setup
         with:
-          version: 2026.7.1
-      - name: Set PROTOC
-        shell: bash
-        run: printf 'PROTOC=%s\n' "$(mise which protoc)" >> "$GITHUB_ENV"
-
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-        with:
-          cache-bin: false
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+          mise-install-args: protoc
       - run: cargo test --features=test-utilities --test cloud_tests
 
   docker-integ-tests:
@@ -262,22 +199,13 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
-      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
-      - name: Run mise install
-        uses: jdx/mise-action@e6a8b3978addb5a52f2b4cd9d91eafa7f0ab959d # v4.2.0
+      - uses: ./.github/actions/setup
         with:
-          version: 2026.7.1
-      - name: Set PROTOC
-        shell: bash
-        run: printf 'PROTOC=%s\n' "$(mise which protoc)" >> "$GITHUB_ENV"
+          mise-install-args: protoc
       - name: Start container for otel-collector and prometheus
         uses: hoverkraft-tech/compose-action@4894d2492015c1774ee5a13a95b1072093087ec3 # v2.5.0
         with:
           compose-file: ./etc/docker/docker-compose-ci.yaml
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-        with:
-          cache-bin: false
-          save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo integ-test docker_
 
   examples:
@@ -286,22 +214,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
-      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
-      - name: Run mise install
-        uses: jdx/mise-action@e6a8b3978addb5a52f2b4cd9d91eafa7f0ab959d # v4.2.0
+      - uses: ./.github/actions/setup
         with:
-          version: 2026.7.1
-      - name: Set PROTOC
-        shell: bash
-        run: printf 'PROTOC=%s\n' "$(mise which protoc)" >> "$GITHUB_ENV"
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-        with:
-          cache-bin: false
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+          mise-install-args: protoc temporal
       - name: Build examples
         run: cargo build --examples -p temporalio-sdk --features examples
-      - name: Install Temporal CLI
-        uses: temporalio/setup-temporal@1059a504f87e7fa2f385e3fa40d1aa7e62f1c6ca # v0
       - name: Start Temporal dev server
         run: |
           temporal server start-dev --headless &
@@ -316,14 +233,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
-      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
-      - name: Run mise install
-        uses: jdx/mise-action@e6a8b3978addb5a52f2b4cd9d91eafa7f0ab959d # v4.2.0
+      - uses: ./.github/actions/setup
         with:
-          version: 2026.7.1
-      - name: Set PROTOC
-        shell: bash
-        run: printf 'PROTOC=%s\n' "$(mise which protoc)" >> "$GITHUB_ENV"
+          mise-install-args: protoc
 
       - name: Build crate as static library
         run: cargo rustc --package temporalio-sdk-core-c-bridge --features xz2-static -- --crate-type=staticlib
