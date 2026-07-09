@@ -6,7 +6,7 @@ use crate::{
         start_timer_cmd,
     },
     worker::{
-        LEGACY_QUERY_ID, WorkerVersioningStrategy,
+        LEGACY_QUERY_ID, PollerBehavior, WorkerVersioningStrategy,
         client::{LegacyQueryResult, mocks::mock_worker_client},
     },
 };
@@ -989,6 +989,128 @@ async fn build_id_set_properly_on_query_on_first_task() {
         .await
         .unwrap();
     core.drain_pollers_and_shutdown().await;
+}
+
+#[tokio::test]
+async fn buffered_legacy_query_is_handled_before_next_wft() {
+    let wfid = "fake_wf_id";
+    let mut t = TestHistoryBuilder::default();
+    t.add_by_type(EventType::WorkflowExecutionStarted);
+    t.add_full_wf_task();
+    t.add_we_signaled("sig", vec![]);
+    t.add_full_wf_task();
+
+    let (wft_tx, wft_rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut mock = mock_worker_client();
+    mock.expect_complete_workflow_task()
+        .returning(|_| Ok(Default::default()));
+    mock.expect_respond_legacy_query()
+        .times(2)
+        .returning(|_, _| Ok(Default::default()));
+    let mut mock = MocksHolder::from_wft_stream(
+        mock,
+        tokio_stream::wrappers::UnboundedReceiverStream::new(wft_rx),
+    );
+    mock.worker_cfg(|wc| {
+        wc.max_cached_workflows = 1;
+        wc.workflow_task_poller_behavior = PollerBehavior::SimpleMaximum(5);
+        wc.max_outstanding_workflow_tasks = Some(5);
+    });
+    let core = mock_worker(mock);
+
+    wft_tx
+        .send(hist_to_poll_resp(&t, wfid.to_owned(), 1.into()).resp)
+        .unwrap();
+    let task = core.poll_workflow_activation().await.unwrap();
+    assert_matches!(
+        task.jobs.as_slice(),
+        [WorkflowActivationJob {
+            variant: Some(workflow_activation_job::Variant::InitializeWorkflow(_)),
+        }]
+    );
+    core.complete_workflow_activation(WorkflowActivationCompletion::empty(task.run_id))
+        .await
+        .unwrap();
+
+    let mut first_query_task = hist_to_poll_resp(&t, wfid.to_owned(), 1.into()).resp;
+    first_query_task.query = Some(WorkflowQuery {
+        query_type: "1".to_string(),
+        ..Default::default()
+    });
+    first_query_task.started_event_id = 0;
+    wft_tx.send(first_query_task).unwrap();
+
+    let task = core.poll_workflow_activation().await.unwrap();
+    assert_matches!(
+        task.jobs.as_slice(),
+        [WorkflowActivationJob {
+            variant: Some(workflow_activation_job::Variant::QueryWorkflow(q)),
+        }] => q.query_type == "1"
+    );
+
+    let mut second_query_task = hist_to_poll_resp(&t, wfid.to_owned(), 1.into()).resp;
+    second_query_task.query = Some(WorkflowQuery {
+        query_type: "2".to_string(),
+        ..Default::default()
+    });
+    second_query_task.started_event_id = 0;
+    wft_tx.send(second_query_task).unwrap();
+
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            if core.available_wft_permits() == Some(3) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+
+    core.complete_workflow_activation(WorkflowActivationCompletion::from_cmd(
+        task.run_id,
+        query_ok(LEGACY_QUERY_ID.to_string(), "hi"),
+    ))
+    .await
+    .unwrap();
+
+    wft_tx
+        .send(hist_to_poll_resp(&t, wfid.to_owned(), 2.into()).resp)
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            if core.available_wft_permits() == Some(3) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+
+    let task = core.poll_workflow_activation().await.unwrap();
+    assert_matches!(
+        task.jobs.as_slice(),
+        [WorkflowActivationJob {
+            variant: Some(workflow_activation_job::Variant::QueryWorkflow(q)),
+        }] => q.query_type == "2"
+    );
+    core.complete_workflow_activation(WorkflowActivationCompletion::from_cmd(
+        task.run_id,
+        query_ok(LEGACY_QUERY_ID.to_string(), "hi"),
+    ))
+    .await
+    .unwrap();
+
+    let task = core.poll_workflow_activation().await.unwrap();
+    assert_matches!(
+        task.jobs.as_slice(),
+        [WorkflowActivationJob {
+            variant: Some(workflow_activation_job::Variant::SignalWorkflow(_)),
+        }]
+    );
+    core.complete_execution(&task.run_id).await;
+    core.shutdown().await;
 }
 
 #[rstest::rstest]

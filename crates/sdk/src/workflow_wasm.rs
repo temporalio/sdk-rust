@@ -189,6 +189,11 @@ impl CompiledWasmWorkflowModule {
         &self,
         input: WorkflowExecutionInput,
     ) -> Result<Box<dyn WorkflowInstance>, anyhow::Error> {
+        if !input.workflow_inbound_interceptors.is_empty() {
+            bail!(
+                "Workflow inbound interceptors are native-only for now and cannot be used with WASM workflow components"
+            );
+        }
         let mut linker = Linker::new(&self.engine);
         WorkflowModule::add_to_linker::<_, HasSelf<_>>(&mut linker, |data| data)?;
         let WorkflowExecutionInput {
@@ -199,6 +204,7 @@ impl CompiledWasmWorkflowModule {
             data_converter,
             host,
             patch_activation_callback,
+            ..
         } = input;
         let workflow_init = wit_types::WorkflowInit {
             namespace: namespace.clone(),

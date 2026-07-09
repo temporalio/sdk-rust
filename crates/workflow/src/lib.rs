@@ -20,6 +20,7 @@ mod memo;
 #[doc(hidden)]
 pub mod runtime;
 mod workflow_context;
+pub mod workflow_interceptors;
 pub mod workflows;
 
 pub use memo::{MemoValue, MemoValues};
@@ -77,10 +78,31 @@ macro_rules! __temporalio_export_workflow_component {
 
 #[macro_export]
 /// Export one or more workflow implementations as a component-model workflow module.
+///
+/// Component-side workflow interceptors can be supplied with
+/// `interceptors = [FirstInterceptor, SecondInterceptor]`. A fresh interceptor chain is created
+/// for each workflow instance.
 macro_rules! export_workflow_module {
     ([$($workflow:ty),+ $(,)?]) => {
+        ::temporalio_workflow::export_workflow_module!(
+            [$($workflow),+],
+            interceptors = [],
+        );
+    };
+    ([$($workflow:ty),+ $(,)?], interceptors = [$($interceptor:expr),* $(,)?] $(,)?) => {
         const _: () = {
             struct __TemporalWorkflowModule;
+
+            fn __temporal_workflow_interceptors() -> ::std::vec::Vec<
+                ::std::sync::Arc<dyn ::temporalio_workflow::workflow_interceptors::WorkflowInboundInterceptor>,
+            > {
+                ::std::vec![
+                    $(
+                        ::std::sync::Arc::new($interceptor)
+                            as ::std::sync::Arc<dyn ::temporalio_workflow::workflow_interceptors::WorkflowInboundInterceptor>
+                    ),*
+                ]
+            }
 
             impl ::temporalio_workflow::component::StaticWorkflowComponent for __TemporalWorkflowModule {
                 fn list_workflows(
@@ -99,7 +121,11 @@ macro_rules! export_workflow_module {
                     match workflow_type {
                         $(
                             name if name == <$workflow as ::temporalio_workflow::runtime::entry::WorkflowImplementation>::name() => {
-                                ::temporalio_workflow::component::instantiate_component_workflow::<$workflow>(init, host)
+                                ::temporalio_workflow::component::instantiate_component_workflow_with_interceptors::<$workflow>(
+                                    init,
+                                    host,
+                                    __temporal_workflow_interceptors(),
+                                )
                             }
                         )*
                         _ => Err(::std::boxed::Box::new(

@@ -1,10 +1,11 @@
+use std::sync::Arc;
 use temporalio_workflow::{
     WorkflowContext, WorkflowResult,
     common::protos::temporal::api::{
         enums::v1::WorkflowTaskFailedCause,
         failure::v1::{ApplicationFailureInfo, Failure, failure::FailureInfo},
     },
-    component::{StaticWorkflowComponent, instantiate_component_workflow},
+    component::{StaticWorkflowComponent, instantiate_component_workflow_with_interceptors},
     runtime::{
         guest::WorkflowInstance,
         host::WorkflowHost,
@@ -14,7 +15,12 @@ use temporalio_workflow::{
             WorkflowFailure, WorkflowInit,
         },
     },
-    workflow, workflow_methods,
+    workflow,
+    workflow_interceptors::{
+        ExecuteWorkflowInput, ExecuteWorkflowResult, WorkflowInboundInterceptor,
+        WorkflowInterceptorContext, WorkflowInterceptorFuture, WorkflowNext, WorkflowOutputValue,
+    },
+    workflow_methods,
 };
 
 #[workflow]
@@ -26,6 +32,32 @@ impl HelloWorkflow {
     #[run]
     pub async fn run(_ctx: &mut WorkflowContext<Self>, name: String) -> WorkflowResult<String> {
         Ok(format!("Hello, {name}!"))
+    }
+}
+
+struct WasmWorkflowInterceptor;
+
+impl WorkflowInboundInterceptor for WasmWorkflowInterceptor {
+    fn execute<'a>(
+        &'a self,
+        _ctx: WorkflowInterceptorContext,
+        mut input: ExecuteWorkflowInput,
+        next: WorkflowNext<
+            'a,
+            ExecuteWorkflowInput,
+            WorkflowInterceptorFuture<'a, ExecuteWorkflowResult>,
+        >,
+    ) -> WorkflowInterceptorFuture<'a, ExecuteWorkflowResult> {
+        if let Some(name) = input.input_mut::<String>() {
+            name.push_str("-intercepted");
+        }
+        WorkflowInterceptorFuture::new(async move {
+            let result = next.run(input).await?;
+            let result = result
+                .downcast_ref::<String>()
+                .expect("hello workflow should return a string");
+            Ok(Box::new(format!("{result} [intercepted]")) as Box<dyn WorkflowOutputValue>)
+        })
     }
 }
 
@@ -105,7 +137,11 @@ impl StaticWorkflowComponent for WasmTestWorkflowModule {
             name if name
                 == <HelloWorkflow as temporalio_workflow::runtime::entry::WorkflowImplementation>::name() =>
             {
-                instantiate_component_workflow::<HelloWorkflow>(init, host)
+                instantiate_component_workflow_with_interceptors::<HelloWorkflow>(
+                    init,
+                    host,
+                    vec![Arc::new(WasmWorkflowInterceptor)],
+                )
             }
             "WasmTaskFailureWorkflow" => Ok(Box::new(WasmTaskFailureWorkflow)),
             _ => Err(Box::new(Failure {

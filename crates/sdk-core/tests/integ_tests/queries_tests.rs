@@ -404,8 +404,8 @@ async fn queries_handled_before_next_wft() {
                 variant: Some(workflow_activation_job::Variant::QueryWorkflow(q)),
             }] => q
         );
-        // While handling the first query, signal the workflow so a new WFT is generated and the
-        // second query is still in the buffer
+        let run_id = task.run_id.clone();
+        // Race a signal-created WFT with the second query while the first query is still open.
         WorkflowExecutionInfo {
             namespace: client.namespace(),
             workflow_id: workflow_id.to_string(),
@@ -420,7 +420,6 @@ async fn queries_handled_before_next_wft() {
         )
         .await
         .unwrap();
-        tokio::time::sleep(Duration::from_millis(500)).await;
         core.complete_workflow_activation(WorkflowActivationCompletion::from_cmd(
             task.run_id,
             QueryResult {
@@ -436,30 +435,75 @@ async fn queries_handled_before_next_wft() {
         ))
         .await
         .unwrap();
-        // We now get the second query
-        let task = core.poll_workflow_activation().await.unwrap();
-        let query = assert_matches!(
-            task.jobs.as_slice(),
-            [WorkflowActivationJob {
-                variant: Some(workflow_activation_job::Variant::QueryWorkflow(q)),
-            }] => q
-        );
-        core.complete_workflow_activation(WorkflowActivationCompletion::from_cmd(
-            task.run_id,
-            QueryResult {
-                query_id: query.query_id.clone(),
-                variant: Some(
-                    QuerySuccess {
-                        response: Some("done".into()),
+
+        let mut saw_second_query = false;
+        let mut saw_signal = false;
+        tokio::time::timeout(Duration::from_secs(30), async {
+            while !(saw_second_query && saw_signal) {
+                let task = core.poll_workflow_activation().await.unwrap();
+                match task.jobs.as_slice() {
+                    [
+                        WorkflowActivationJob {
+                            variant: Some(workflow_activation_job::Variant::QueryWorkflow(q)),
+                        },
+                    ] => {
+                        if saw_second_query {
+                            panic!("Saw second query more than once");
+                        }
+                        saw_second_query = true;
+                        let query_id = q.query_id.clone();
+                        core.complete_workflow_activation(WorkflowActivationCompletion::from_cmd(
+                            task.run_id,
+                            QueryResult {
+                                query_id,
+                                variant: Some(
+                                    QuerySuccess {
+                                        response: Some("done".into()),
+                                    }
+                                    .into(),
+                                ),
+                            }
+                            .into(),
+                        ))
+                        .await
+                        .unwrap();
                     }
-                    .into(),
-                ),
+                    [
+                        WorkflowActivationJob {
+                            variant: Some(workflow_activation_job::Variant::SignalWorkflow(_)),
+                        },
+                    ] => {
+                        if saw_signal {
+                            panic!("Saw signal more than once");
+                        }
+                        saw_signal = true;
+                        core.complete_workflow_activation(WorkflowActivationCompletion::empty(
+                            task.run_id,
+                        ))
+                        .await
+                        .unwrap();
+                    }
+                    _ => panic!("Unexpected activation jobs: {:?}", task.jobs),
+                }
             }
-            .into(),
-        ))
+        })
         .await
         .unwrap();
-        // Then the signal afterward
+
+        WorkflowExecutionInfo {
+            namespace: client.namespace(),
+            workflow_id: workflow_id.to_string(),
+            run_id: Some(run_id),
+            first_execution_run_id: None,
+        }
+        .bind_untyped(client.clone())
+        .signal(
+            UntypedSignal::new("finish"),
+            RawValue::empty(),
+            WorkflowSignalOptions::default(),
+        )
+        .await
+        .unwrap();
         let task = core.poll_workflow_activation().await.unwrap();
         assert_matches!(
             task.jobs.as_slice(),

@@ -3,6 +3,7 @@
 //! These modules collect the parts of the workflow crate that are intended for SDK/runtime glue
 //! rather than normal workflow authors.
 
+use crate::BaseWorkflowContext;
 use std::{
     cell::Cell,
     future::Future,
@@ -56,5 +57,30 @@ impl<F: Future + Unpin> Future for SdkGuardedFuture<F> {
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let _guard = SdkWakeGuard::new();
         Pin::new(&mut self.0).poll(cx)
+    }
+}
+
+pub(crate) struct ConstructionBlockedFuture<F> {
+    base_ctx: BaseWorkflowContext,
+    inner: F,
+}
+
+impl<F> ConstructionBlockedFuture<F> {
+    pub(crate) fn new(base_ctx: BaseWorkflowContext, inner: F) -> Self {
+        Self { base_ctx, inner }
+    }
+}
+
+impl<F: Future + Unpin> Future for ConstructionBlockedFuture<F> {
+    type Output = F::Output;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        if self.base_ctx.is_construction_poll() {
+            // Every newly started routine receives a normal poll after activation, so this barrier
+            // does not need to register the construction waker with the async handler.
+            Poll::Pending
+        } else {
+            Pin::new(&mut self.inner).poll(cx)
+        }
     }
 }
