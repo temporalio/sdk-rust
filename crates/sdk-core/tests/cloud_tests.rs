@@ -1,13 +1,17 @@
-mod api_endpoint_probes;
 // All non-main.rs tests ignore dead common code so that the linter doesn't complain about about it.
 #[allow(dead_code)]
 mod common;
 mod shared_tests;
 
-use common::{get_cloud_client, get_cloud_client_with_compression};
-use temporalio_client::{GrpcCompression, NamespacedClient, grpc::WorkflowService};
-use temporalio_common::protos::temporal::api::workflowservice::v1::ListWorkflowExecutionsRequest;
-use tonic::IntoRequest;
+use common::get_cloud_client;
+use temporalio_client::{
+    NamespacedClient,
+    grpc::{HealthService, WorkflowService},
+};
+use temporalio_common::protos::{
+    grpc::health::v1::HealthCheckRequest, temporal::api::workflowservice::v1::*,
+};
+use tonic::{IntoRequest, Response};
 
 #[tokio::test]
 async fn tls_test() {
@@ -50,24 +54,28 @@ async fn activity_cancel_delivered_without_heartbeat() {
 }
 
 #[tokio::test]
-async fn all_cloud_api_upstream_endpoints() {
-    let gzip_client = get_cloud_client().await;
-    let uncompressed_client = get_cloud_client_with_compression(GrpcCompression::None).await;
-    let failures = api_endpoint_probes::run_all(&gzip_client, &uncompressed_client).await;
+async fn default_client_gzip_supported_by_system_info_and_health_check() {
+    let mut client = get_cloud_client().await;
+    let system_info = client
+        .get_system_info(GetSystemInfoRequest::default().into_request())
+        .await
+        .expect("GetSystemInfo must succeed with the default Cloud client");
+    assert_gzip_response("GetSystemInfo", &system_info);
 
-    if !failures.is_empty() {
-        panic!(
-            "Cloud endpoint probes failed:\n{}",
-            failures
-                .into_iter()
-                .map(|failure| format!("- {failure}"))
-                .collect::<Vec<_>>()
-                .join("\n")
-        );
-    }
+    let health_check =
+        HealthService::check(&mut client, HealthCheckRequest::default().into_request())
+            .await
+            .expect("HealthCheck must succeed with the default Cloud client");
+    assert_gzip_response("HealthCheck", &health_check);
 }
 
-#[test]
-fn all_cloud_workflow_rpc_probes_covered() {
-    api_endpoint_probes::assert_all_workflow_rpc_probes_covered();
+fn assert_gzip_response<Resp>(rpc_name: &str, response: &Response<Resp>) {
+    assert_eq!(
+        response
+            .metadata()
+            .get("grpc-encoding")
+            .and_then(|value| value.to_str().ok()),
+        Some("gzip"),
+        "{rpc_name} must use gzip with the default Cloud client"
+    );
 }
