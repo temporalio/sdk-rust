@@ -151,21 +151,6 @@ pub fn update_validator(_attr: TokenStream, item: TokenStream) -> TokenStream {
     item
 }
 
-#[cfg(test)]
-mod tests {
-    use super::validate_workflow_attributes;
-    use quote::quote;
-
-    #[test]
-    fn workflow_attribute_rejects_name_override() {
-        let err = validate_workflow_attributes(quote!(name = "RenamedWorkflow")).unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("use #[run(name = ...)] on the workflow run method")
-        );
-    }
-}
-
 /// Parses a DSL for defining finite state machines, and produces code implementing the
 /// [StateMachine](trait.StateMachine.html) trait.
 ///
@@ -329,4 +314,19 @@ pub fn fsm(input: TokenStream) -> TokenStream {
     let def: fsm_impl::StateMachineDefinition =
         parse_macro_input!(input as fsm_impl::StateMachineDefinition);
     def.codegen()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validate_workflow_attributes;
+    use quote::quote;
+
+    #[test]
+    fn workflow_attribute_rejects_name_override() {
+        let err = validate_workflow_attributes(quote!(name = "RenamedWorkflow")).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("use #[run(name = ...)] on the workflow run method")
+        );
+    }
 }
