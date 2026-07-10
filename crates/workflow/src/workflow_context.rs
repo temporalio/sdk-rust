@@ -93,7 +93,7 @@ pub struct BaseWorkflowContext {
     inner: Rc<WorkflowContextInner>,
 }
 
-/// Input provided to a worker's experimental patch activation callback.
+/// Input provided to a worker's patch activation callback.
 #[derive(Clone, Debug)]
 #[non_exhaustive]
 pub struct PatchActivationInput {
@@ -103,7 +103,7 @@ pub struct PatchActivationInput {
     pub patch_id: String,
 }
 
-/// Experimental callback that decides whether a newly encountered patch should be activated.
+/// Callback that decides whether a newly encountered patch should be activated.
 pub type PatchActivationCallback =
     Arc<dyn Fn(PatchActivationInput) -> bool + Send + Sync + 'static>;
 
@@ -306,27 +306,6 @@ impl BaseWorkflowContext {
     /// Construct a base context from raw workflow activation initialization data.
     #[doc(hidden)]
     pub fn from_raw(
-        namespace: String,
-        task_queue: String,
-        run_id: String,
-        init_workflow_job: InitializeWorkflow,
-        data_converter: DataConverter,
-        host: Rc<dyn WorkflowHost>,
-    ) -> Self {
-        Self::new_with_patch_activation_callback(
-            namespace,
-            task_queue,
-            run_id,
-            init_workflow_job,
-            data_converter,
-            host,
-            None,
-        )
-    }
-
-    /// Create a new base context with an experimental patch activation callback.
-    #[doc(hidden)]
-    pub fn new_with_patch_activation_callback(
         namespace: String,
         task_queue: String,
         run_id: String,
@@ -905,6 +884,7 @@ impl<W> SyncWorkflowContext<W> {
         let notified = shared.notified_patches.contains(patch_id);
         drop(shared);
 
+        // Replay and deprecation must follow history; only a fresh patch consults rollout policy.
         let res = if deprecated || replaying || notified {
             !replaying || notified
         } else if let Some(callback) = &self.base.inner.patch_activation_callback {
@@ -1437,6 +1417,7 @@ impl WfCtxProtectedDat {
 struct WorkflowContextSharedData {
     /// Maps change ids -> resolved status
     changes: HashMap<String, bool>,
+    /// Kept separate from memoized decisions so replay still emits the matching patch command.
     notified_patches: HashSet<String>,
     activation: CoreWorkflowActivation,
     memo: ProtoMemo,
@@ -2425,6 +2406,7 @@ mod tests {
             init,
             DataConverter::default(),
             Rc::new(NoopHost),
+            None,
         );
         WorkflowContext::from_base(base, Rc::new(RefCell::new(TestWorkflow)))
     }
@@ -2443,7 +2425,7 @@ mod tests {
         };
         let host = Rc::new(RecordingHost::default());
         let commands = host.commands.clone();
-        let base = BaseWorkflowContext::new_with_patch_activation_callback(
+        let base = BaseWorkflowContext::new(
             "default".to_string(),
             "task-queue".to_string(),
             "run-id".to_string(),
@@ -2741,6 +2723,7 @@ mod tests {
             init,
             DataConverter::default(),
             Rc::new(NoopHost),
+            None,
         );
         let ctx = WorkflowContext::from_base(base, Rc::new(RefCell::new(FailingWorkflow)));
 
@@ -2930,6 +2913,7 @@ mod tests {
             init,
             DataConverter::default(),
             Rc::new(NoopHost),
+            None,
         );
         let ctx = WorkflowContext::from_base(base, Rc::new(RefCell::new(TestWorkflow)));
 
@@ -2960,6 +2944,7 @@ mod tests {
             init,
             DataConverter::default(),
             Rc::new(NoopHost),
+            None,
         );
         let ctx = WorkflowContext::from_base(base, Rc::new(RefCell::new(TestWorkflow)));
 

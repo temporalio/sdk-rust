@@ -218,6 +218,7 @@ where
         init.initialize_workflow,
         data_converter,
         host,
+        None,
     );
     instantiate_workflow::<W>(args, payload_converter, base_ctx).map_err(|err| {
         Box::new(Failure {
