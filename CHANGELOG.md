@@ -65,3 +65,5 @@ to docs, or any other relevant information.
 ### Fixed
 * OTLP metric export failures are now logged through Core telemetry when OpenTelemetry's periodic
   metric reader reports an export error.
+* Worker heartbeat now samples host CPU/memory at the heartbeat interval (only when enabled) rather
+  than every 100ms.
