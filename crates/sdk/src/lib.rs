@@ -93,10 +93,10 @@ pub use temporalio_workflow::{
     CancellableFuture, ChildWorkflowCancellationType, ChildWorkflowOptions, ContinueAsNewOptions,
     ContinueAsNewVersioningBehavior, ExternalWorkflowHandle, LocalActivityOptions, Memo, MemoValue,
     MemoValues, NamespacedWorkflowInfo, NexusOperationCancellationType, NexusOperationOptions,
-    ParentClosePolicy, RetryPolicy, Signal, SignalData, StartChildWorkflowExecutionFailedCause,
-    StartedChildWorkflow, SyncWorkflowContext, TimerOptions, TimerResult, VersioningIntent,
-    WorkflowContext, WorkflowContextView, WorkflowIdReusePolicy, WorkflowResult,
-    WorkflowTermination,
+    ParentClosePolicy, PatchActivationCallback, PatchActivationInput, RetryPolicy, Signal,
+    SignalData, StartChildWorkflowExecutionFailedCause, StartedChildWorkflow, SyncWorkflowContext,
+    TimerOptions, TimerResult, VersioningIntent, WorkflowContext, WorkflowContextView,
+    WorkflowIdReusePolicy, WorkflowResult, WorkflowTermination,
 };
 #[cfg(feature = "wasm-workflows")]
 pub use workflow_wasm::WasmWorkflowComponent;
@@ -267,6 +267,14 @@ pub struct WorkerOptions {
     /// NOTE: Experimental
     #[builder(default = false)]
     pub disable_payload_error_limit: bool,
+    /// Experimental callback that decides whether the first non-replay call to
+    /// [`SyncWorkflowContext::patched`] for a patch ID should activate that patch.
+    ///
+    /// The callback receives an immutable workflow information snapshot and patch ID. Returning
+    /// `true` records the patch marker; returning `false` leaves the patch inactive for the
+    /// workflow run. This option currently applies only to native Rust workflows, not registered
+    /// WASM workflow components.
+    pub patch_activation_callback: Option<PatchActivationCallback>,
 }
 
 impl<S: worker_options_builder::State> WorkerOptionsBuilder<S> {
@@ -465,6 +473,7 @@ struct WorkflowHalf {
     workflow_definitions: WorkflowDefinitions,
     workflow_removed_from_map: Notify,
     detect_nondeterministic_futures: bool,
+    patch_activation_callback: Option<PatchActivationCallback>,
 }
 struct WorkflowData {
     /// Channel used to send the workflow activations
@@ -562,6 +571,7 @@ impl Worker {
         let wasm_components = std::mem::take(&mut options.wasm_workflow_components);
         let mut me = Self::new_from_core_definitions(worker, client_options, acts, wfs);
         me.set_detect_nondeterministic_futures(options.detect_nondeterministic_futures);
+        me.workflow_half.patch_activation_callback = options.patch_activation_callback;
         #[cfg(feature = "wasm-workflows")]
         me.workflow_half
             .workflow_definitions
@@ -590,6 +600,7 @@ impl Worker {
                 workflow_definitions: workflows,
                 workflow_removed_from_map: Default::default(),
                 detect_nondeterministic_futures: false,
+                patch_activation_callback: None,
             },
             activity_half: ActivityHalf {
                 activities,
@@ -933,6 +944,7 @@ impl WorkflowHalf {
                         completions_tx.clone(),
                         common.data_converter.clone(),
                         self.detect_nondeterministic_futures,
+                        self.patch_activation_callback.clone(),
                     ) {
                         Ok(result) => result,
                         Err(e) => {

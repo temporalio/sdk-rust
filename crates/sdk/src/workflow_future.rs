@@ -32,14 +32,17 @@ use temporalio_common::{
         },
     },
 };
-use temporalio_workflow::runtime::{
-    guest::WorkflowInstance,
-    host::WorkflowHost,
-    model::{WorkflowResult, WorkflowTermination},
-    types::{
-        ActivationJobResult, ActivationResult, MainRoutineCompletion, RoutineCompletion, RoutineId,
-        RoutineKind, RoutinePollResult, TerminalOutcome, UpdateRoutineCompletion,
-        WorkflowActivation,
+use temporalio_workflow::{
+    PatchActivationCallback,
+    runtime::{
+        guest::WorkflowInstance,
+        host::WorkflowHost,
+        model::{WorkflowResult, WorkflowTermination},
+        types::{
+            ActivationJobResult, ActivationResult, MainRoutineCompletion, RoutineCompletion,
+            RoutineId, RoutineKind, RoutinePollResult, TerminalOutcome, UpdateRoutineCompletion,
+            WorkflowActivation,
+        },
     },
 };
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
@@ -62,6 +65,7 @@ pub(crate) fn start_workflow(
     outgoing_completions: UnboundedSender<WorkflowActivationCompletion>,
     data_converter: DataConverter,
     detect_nondeterministic: bool,
+    patch_activation_callback: Option<PatchActivationCallback>,
 ) -> Result<
     (
         impl Future<Output = WorkflowResult<Payload>> + use<>,
@@ -84,6 +88,7 @@ pub(crate) fn start_workflow(
         init_workflow_job,
         data_converter: data_converter.clone(),
         host: host.clone(),
+        patch_activation_callback,
     })
     .context("Failed to create workflow execution")?;
 

@@ -31,12 +31,15 @@ use futures_util::{
 };
 use std::{
     cell::{Cell, RefCell},
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     future::{self, Future},
     marker::PhantomData,
     pin::Pin,
     rc::Rc,
-    sync::atomic::{AtomicBool, Ordering},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     task::{Poll, Waker},
     time::{Duration, SystemTime},
 };
@@ -89,6 +92,21 @@ use temporalio_common_wasm::{
 pub struct BaseWorkflowContext {
     inner: Rc<WorkflowContextInner>,
 }
+
+/// Input provided to a worker's experimental patch activation callback.
+#[derive(Clone, Debug)]
+#[non_exhaustive]
+pub struct PatchActivationInput {
+    /// Information about the workflow execution calling [`SyncWorkflowContext::patched`].
+    pub workflow_info: WorkflowContextView,
+    /// Patch ID passed to [`SyncWorkflowContext::patched`].
+    pub patch_id: String,
+}
+
+/// Experimental callback that decides whether a newly encountered patch should be activated.
+pub type PatchActivationCallback =
+    Arc<dyn Fn(PatchActivationInput) -> bool + Send + Sync + 'static>;
+
 impl BaseWorkflowContext {
     pub(crate) fn apply_activation_context(&self, activation: &CoreWorkflowActivation) {
         let mut shared = self.inner.shared.borrow_mut();
@@ -106,12 +124,12 @@ impl BaseWorkflowContext {
         &self.inner.data_converter
     }
 
-    pub(crate) fn record_patch(&self, patch_id: String, present: bool) {
+    pub(crate) fn notify_patch(&self, patch_id: String) {
         self.inner
             .shared
             .borrow_mut()
-            .changes
-            .insert(patch_id, present);
+            .notified_patches
+            .insert(patch_id);
     }
 
     /// Create a read-only view of this context.
@@ -232,6 +250,7 @@ struct WorkflowContextInner {
     shared: RefCell<WorkflowContextSharedData>,
     seq_nums: RefCell<WfCtxProtectedDat>,
     data_converter: DataConverter,
+    patch_activation_callback: Option<PatchActivationCallback>,
     state_mutated: Cell<bool>,
 }
 
@@ -294,6 +313,28 @@ impl BaseWorkflowContext {
         data_converter: DataConverter,
         host: Rc<dyn WorkflowHost>,
     ) -> Self {
+        Self::new_with_patch_activation_callback(
+            namespace,
+            task_queue,
+            run_id,
+            init_workflow_job,
+            data_converter,
+            host,
+            None,
+        )
+    }
+
+    /// Create a new base context with an experimental patch activation callback.
+    #[doc(hidden)]
+    pub fn new_with_patch_activation_callback(
+        namespace: String,
+        task_queue: String,
+        run_id: String,
+        init_workflow_job: InitializeWorkflow,
+        data_converter: DataConverter,
+        host: Rc<dyn WorkflowHost>,
+        patch_activation_callback: Option<PatchActivationCallback>,
+    ) -> Self {
         Self {
             inner: Rc::new(WorkflowContextInner {
                 namespace,
@@ -321,6 +362,7 @@ impl BaseWorkflowContext {
                     next_nexus_op_sequence_number: 1,
                 }),
                 data_converter,
+                patch_activation_callback,
                 state_mutated: Cell::new(false),
             }),
         }
@@ -838,7 +880,11 @@ impl<W> SyncWorkflowContext<W> {
         self.start_child_workflow(workflow, input, opts)
     }
 
-    /// Check (or record) that this workflow history was created with the provided patch
+    /// Check (or record) that this workflow history was created with the provided patch.
+    ///
+    /// Workers can use their experimental patch activation callback to delay activating a newly
+    /// introduced patch during a rolling deployment. The callback is only consulted when the
+    /// marker would otherwise be created for the first time.
     pub fn patched(&self, patch_id: &str) -> bool {
         self.patch_impl(patch_id, false)
     }
@@ -850,21 +896,35 @@ impl<W> SyncWorkflowContext<W> {
     }
 
     fn patch_impl(&self, patch_id: &str, deprecated: bool) -> bool {
-        self.base.inner.runtime.host.push_command(
-            workflow_command::Variant::SetPatchMarker(SetPatchMarker {
-                patch_id: patch_id.to_string(),
-                deprecated,
-            })
-            .into(),
-        );
-        // See if we already know about the status of this change
         if let Some(present) = self.base.inner.shared.borrow().changes.get(patch_id) {
             return *present;
         }
 
-        // If we don't already know about the change, that means there is no marker in history,
-        // and we should return false if we are replaying
-        let res = !self.base.inner.shared.borrow().activation.is_replaying;
+        let shared = self.base.inner.shared.borrow();
+        let replaying = shared.activation.is_replaying;
+        let notified = shared.notified_patches.contains(patch_id);
+        drop(shared);
+
+        let res = if deprecated || replaying || notified {
+            !replaying || notified
+        } else if let Some(callback) = &self.base.inner.patch_activation_callback {
+            callback(PatchActivationInput {
+                workflow_info: self.base.view(),
+                patch_id: patch_id.to_string(),
+            })
+        } else {
+            true
+        };
+
+        if res {
+            self.base.inner.runtime.host.push_command(
+                workflow_command::Variant::SetPatchMarker(SetPatchMarker {
+                    patch_id: patch_id.to_string(),
+                    deprecated,
+                })
+                .into(),
+            );
+        }
 
         self.base
             .inner
@@ -1377,6 +1437,7 @@ impl WfCtxProtectedDat {
 struct WorkflowContextSharedData {
     /// Maps change ids -> resolved status
     changes: HashMap<String, bool>,
+    notified_patches: HashSet<String>,
     activation: CoreWorkflowActivation,
     memo: ProtoMemo,
     search_attributes: ProtoSearchAttributes,
@@ -2278,7 +2339,13 @@ impl StartedNexusOperation {
 mod tests {
     use super::*;
     use crate::MemoValues;
-    use std::collections::HashMap;
+    use std::{
+        collections::HashMap,
+        sync::{
+            Mutex,
+            atomic::{AtomicUsize, Ordering as AtomicOrdering},
+        },
+    };
     use temporalio_common_wasm::{
         RetryPolicy,
         data_converters::{TemporalDeserializable, TemporalSerializable},
@@ -2306,7 +2373,7 @@ mod tests {
 
     #[derive(Default)]
     struct RecordingHost {
-        commands: RefCell<Vec<WorkflowCommand>>,
+        commands: Rc<RefCell<Vec<WorkflowCommand>>>,
     }
 
     impl WorkflowHost for RecordingHost {
@@ -2360,6 +2427,107 @@ mod tests {
             Rc::new(NoopHost),
         );
         WorkflowContext::from_base(base, Rc::new(RefCell::new(TestWorkflow)))
+    }
+
+    fn patch_test_context(
+        callback: Option<PatchActivationCallback>,
+    ) -> (
+        BaseWorkflowContext,
+        WorkflowContext<TestWorkflow>,
+        Rc<RefCell<Vec<WorkflowCommand>>>,
+    ) {
+        let init = InitializeWorkflow {
+            workflow_id: "workflow-id".to_string(),
+            workflow_type: TestWorkflow.name().to_string(),
+            ..Default::default()
+        };
+        let host = Rc::new(RecordingHost::default());
+        let commands = host.commands.clone();
+        let base = BaseWorkflowContext::new_with_patch_activation_callback(
+            "default".to_string(),
+            "task-queue".to_string(),
+            "run-id".to_string(),
+            init,
+            DataConverter::default(),
+            host,
+            callback,
+        );
+        let ctx = WorkflowContext::from_base(base.clone(), Rc::new(RefCell::new(TestWorkflow)));
+        (base, ctx, commands)
+    }
+
+    #[test]
+    fn patch_activation_callback_activates_and_memoizes() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let input = Arc::new(Mutex::new(None));
+        let callback_calls = calls.clone();
+        let callback_input = input.clone();
+        let callback: PatchActivationCallback = Arc::new(move |value| {
+            callback_calls.fetch_add(1, AtomicOrdering::Relaxed);
+            *callback_input.lock().unwrap() = Some(value);
+            true
+        });
+        let (_, ctx, commands) = patch_test_context(Some(callback));
+
+        assert!(ctx.patched("my-patch"));
+        assert!(ctx.patched("my-patch"));
+        assert_eq!(calls.load(AtomicOrdering::Relaxed), 1);
+        assert_eq!(commands.borrow().len(), 1);
+        let input = input.lock().unwrap();
+        let input = input.as_ref().unwrap();
+        assert_eq!(input.workflow_info.workflow_id, "workflow-id");
+        assert_eq!(input.workflow_info.run_id, "run-id");
+        assert_eq!(input.patch_id, "my-patch");
+    }
+
+    #[test]
+    fn patch_activation_callback_can_decline_and_memoizes() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let callback_calls = calls.clone();
+        let callback: PatchActivationCallback = Arc::new(move |_| {
+            callback_calls.fetch_add(1, AtomicOrdering::Relaxed);
+            false
+        });
+        let (_, ctx, commands) = patch_test_context(Some(callback));
+
+        assert!(!ctx.patched("my-patch"));
+        assert!(!ctx.patched("my-patch"));
+        assert_eq!(calls.load(AtomicOrdering::Relaxed), 1);
+        assert!(commands.borrow().is_empty());
+    }
+
+    #[test]
+    fn patch_activation_callback_bypasses_history_and_deprecation() {
+        let callback: PatchActivationCallback = Arc::new(|_| panic!("callback must not run"));
+
+        let (base, ctx, commands) = patch_test_context(Some(callback.clone()));
+        base.apply_activation_context(&CoreWorkflowActivation {
+            is_replaying: true,
+            ..Default::default()
+        });
+        assert!(!ctx.patched("replay-patch"));
+        assert!(commands.borrow().is_empty());
+
+        let (base, ctx, commands) = patch_test_context(Some(callback.clone()));
+        base.apply_activation_context(&CoreWorkflowActivation {
+            is_replaying: true,
+            ..Default::default()
+        });
+        base.notify_patch("existing-patch".to_string());
+        assert!(ctx.patched("existing-patch"));
+        assert_eq!(commands.borrow().len(), 1);
+
+        let (_, ctx, commands) = patch_test_context(Some(callback));
+        assert!(ctx.deprecate_patch("deprecated-patch"));
+        assert_eq!(commands.borrow().len(), 1);
+    }
+
+    #[test]
+    fn patch_activation_defaults_to_active() {
+        let (_, ctx, commands) = patch_test_context(None);
+
+        assert!(ctx.patched("my-patch"));
+        assert_eq!(commands.borrow().len(), 1);
     }
 
     #[test]

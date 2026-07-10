@@ -555,7 +555,7 @@ where
                 Some(ActivationVariant::InitializeWorkflow(_))
                 | Some(ActivationVariant::UpdateRandomSeed(_)) => ActivationJobResult::None,
                 Some(ActivationVariant::NotifyHasPatch(patch)) => {
-                    self.base_ctx.record_patch(patch.patch_id, true);
+                    self.base_ctx.notify_patch(patch.patch_id);
                     ActivationJobResult::None
                 }
                 Some(ActivationVariant::CancelWorkflow(cancel)) => {

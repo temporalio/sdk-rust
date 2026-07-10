@@ -55,6 +55,8 @@ to docs, or any other relevant information.
 * Schedule descriptions now expose their configured action via `ScheduleDescription::action()`,
   including start-workflow accessors for workflow type, task queue, workflow ID, raw argument
   payloads, and typed argument decoding through the client's data converter.
+* Added the experimental `WorkerOptions::patch_activation_callback` option for controlling whether
+  newly introduced patches activate during rolling deployments.
 
 ### Breaking Changes
 * `WorkflowExecution::search_attributes`, `WorkflowExecutionDescription::search_attributes`,

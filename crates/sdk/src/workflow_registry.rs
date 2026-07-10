@@ -12,7 +12,7 @@ use temporalio_common::{
     },
 };
 use temporalio_workflow::{
-    BaseWorkflowContext,
+    BaseWorkflowContext, PatchActivationCallback,
     runtime::{
         entry::WorkflowImplementation,
         guest::WorkflowInstance,
@@ -30,6 +30,7 @@ pub(crate) struct WorkflowExecutionInput {
     pub init_workflow_job: InitializeWorkflow,
     pub data_converter: DataConverter,
     pub host: Rc<dyn WorkflowHost>,
+    pub patch_activation_callback: Option<PatchActivationCallback>,
 }
 
 /// Creates workflow execution instances from activation input payloads and context.
@@ -181,16 +182,18 @@ fn workflow_input_parts(
         init_workflow_job,
         data_converter,
         host,
+        patch_activation_callback,
     } = input;
     let payloads = init_workflow_job.arguments.clone();
     let payload_converter = data_converter.payload_converter().clone();
-    let base_ctx = BaseWorkflowContext::from_raw(
+    let base_ctx = BaseWorkflowContext::new_with_patch_activation_callback(
         namespace,
         task_queue,
         run_id,
         init_workflow_job,
         data_converter,
         host,
+        patch_activation_callback,
     );
     (payloads, payload_converter, base_ctx)
 }

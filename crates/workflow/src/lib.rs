@@ -40,9 +40,9 @@ pub use workflow_context::{
     CancellableFuture, ChildWorkflowCancellationType, ChildWorkflowOptions, ContinueAsNewOptions,
     ContinueAsNewVersioningBehavior, ExternalWorkflowHandle, LocalActivityOptions,
     NamespacedWorkflowInfo, NexusOperationCancellationType, NexusOperationOptions,
-    ParentClosePolicy, Signal, SignalData, StartChildWorkflowExecutionFailedCause,
-    StartedChildWorkflow, SyncWorkflowContext, TimerOptions, VersioningIntent, WorkflowContext,
-    WorkflowContextView, WorkflowIdReusePolicy,
+    ParentClosePolicy, PatchActivationCallback, PatchActivationInput, Signal, SignalData,
+    StartChildWorkflowExecutionFailedCause, StartedChildWorkflow, SyncWorkflowContext,
+    TimerOptions, VersioningIntent, WorkflowContext, WorkflowContextView, WorkflowIdReusePolicy,
 };
 pub use workflows::{join, join_all, select};
 
