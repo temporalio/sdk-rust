@@ -536,16 +536,26 @@ async fn idle_activity_worker_reports_zero_slots_used() {
         finish_activity.wait().await;
         handle.get_result(Default::default()).await.unwrap();
 
-        let body = get_text(format!("http://{addr}/metrics")).await;
-        let metric_line = body
-            .lines()
-            .find(|line| {
-                line.starts_with("temporal_worker_task_slots_used{")
-                    && line.contains(&format!("task_queue=\"{task_queue}\""))
-                    && line.contains("worker_type=\"ActivityWorker\"")
-            })
-            .expect("activity slots-used metric should exist")
-            .to_owned();
+        let metric_line = eventually(
+            || {
+                let endpoint = format!("http://{addr}/metrics");
+                let task_queue = task_queue.clone();
+                async move {
+                    let body = get_text(endpoint).await;
+                    body.lines()
+                        .find(|line| {
+                            line.starts_with("temporal_worker_task_slots_used{")
+                                && line.contains(&format!("task_queue=\"{task_queue}\""))
+                                && line.contains("worker_type=\"ActivityWorker\"")
+                        })
+                        .map(ToString::to_string)
+                        .ok_or_else(|| anyhow!("activity slots-used metric should exist"))
+                }
+            },
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
         core_worker.initiate_shutdown();
         metric_line
     });
