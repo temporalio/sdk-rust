@@ -52,6 +52,9 @@ pub struct WorkerOptions {
     pub nondeterminism_as_workflow_fail_for_types: ByteArrayRefArray,
     pub plugins: ByteArrayRefArray,
     pub storage_drivers: ByteArrayRefArray,
+    /// If set, the worker won't proactively fail completions whose payloads exceed the namespace
+    /// error limits; oversized payloads are sent and the server enforces the limit.
+    /// NOTE: Experimental
     pub disable_payload_error_limit: bool,
 }
 

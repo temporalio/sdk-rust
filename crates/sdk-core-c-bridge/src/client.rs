@@ -56,9 +56,11 @@ pub struct ConnectionOptions {
     pub grpc_compression: ClientGrpcCompression,
     /// Warning threshold (bytes) for the size of an outbound payload-bearing field.
     /// Over-threshold fields are logged but still sent to server. 0 disables the warning.
+    /// NOTE: Experimental
     pub payloads_warn_size: u64,
     /// Warning threshold (bytes) for outbound memo size. Over-threshold memos are logged but still
     /// sent to server. 0 disables the warning.
+    /// NOTE: Experimental
     pub memo_warn_size: u64,
 }
 

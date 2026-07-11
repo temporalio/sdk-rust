@@ -200,11 +200,13 @@ typedef struct TemporalCoreConnectionOptions {
   /**
    * Warning threshold (bytes) for the size of an outbound payload-bearing field.
    * Over-threshold fields are logged but still sent to server. 0 disables the warning.
+   * NOTE: Experimental
    */
   uint64_t payloads_warn_size;
   /**
    * Warning threshold (bytes) for outbound memo size. Over-threshold memos are logged but still
    * sent to server. 0 disables the warning.
+   * NOTE: Experimental
    */
   uint64_t memo_warn_size;
 } TemporalCoreConnectionOptions;
@@ -831,6 +833,11 @@ typedef struct TemporalCoreWorkerOptions {
   struct TemporalCoreByteArrayRefArray nondeterminism_as_workflow_fail_for_types;
   struct TemporalCoreByteArrayRefArray plugins;
   struct TemporalCoreByteArrayRefArray storage_drivers;
+  /**
+   * If set, the worker won't proactively fail completions whose payloads exceed the namespace
+   * error limits; oversized payloads are sent and the server enforces the limit.
+   * NOTE: Experimental
+   */
   bool disable_payload_error_limit;
 } TemporalCoreWorkerOptions;
 
