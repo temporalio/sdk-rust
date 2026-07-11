@@ -11,8 +11,12 @@ keywords = ["temporal", "workflow"]
 categories = ["development-tools"]
 readme = "README.md"
 
+[package.metadata.docs.rs]
+features = ["experimental"]
+
 [features]
 default = ["envconfig", "tls-ring"]
+experimental = []
 tls-ring = ["tonic/tls-ring"]
 tls-aws-lc = ["tonic/tls-aws-lc"]
 telemetry = ["dep:opentelemetry"]

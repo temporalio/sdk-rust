@@ -164,9 +164,15 @@ hyper-util = { version = "0.1", features = [
 rstest = "0.26"
 semver = "1.0"
 # A registry version here creates a cycle when Cargo orders sdk-core before sdk for workspace publishing.
-temporalio-sdk = { path = "../sdk", features = ["testing", "wasm-workflows"] }
+temporalio-sdk = { path = "../sdk", features = [
+  "experimental",
+  "testing",
+  "wasm-workflows",
+] }
 temporalio-common = { path = "../common", version = "~0.7.0", default-features = false }
-temporalio-workflow = { path = "../workflow", version = "~0.7.0" }
+temporalio-workflow = { path = "../workflow", version = "~0.7.0", features = [
+  "experimental",
+] }
 tokio = { version = "1.47", default-features = false, features = [
   "rt",
   "rt-multi-thread",

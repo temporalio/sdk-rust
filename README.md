@@ -25,8 +25,8 @@ Core SDK that can be used as a base for other Temporal SDKs. It is currently use
 
 # Documentation
 
-Rust & Core SDK documentation can be generated with `cargo doc`, output will be placed in the
-`target/doc` directory.
+Rust & Core SDK documentation can be generated with `cargo doc --workspace --all-features`, output
+will be placed in the `target/doc` directory.
 
 [Architecture](ARCHITECTURE.md) doc provides some high-level information about how Core SDK works
 and how language layers interact with it.
@@ -59,7 +59,7 @@ All the following commands are enforced for each pull request:
 
 You can build and test the project using cargo:
 `cargo build`
-`cargo test`
+`cargo test --features experimental`
 
 Run integ tests with `cargo integ-test`. By default it will start an ephemeral server. You can also
 use an already-running server by passing `-s external`.
@@ -79,7 +79,7 @@ cargo integ-test -s envconfig -- \
 `TEMPORAL_CONFIG_FILE` and `TEMPORAL_PROFILE` can select a TOML profile instead. The harness does
 not start, configure, or clean up the target server or namespace in this mode.
 
-Run load tests with `cargo test --test heavy_tests`.
+Run load tests with `cargo test --features experimental --test heavy_tests`.
 
 NOTE: Integration tests should pass locally, if running on MacOS and you see integration tests consistently failing
 with an error that mentions `Too many open files`, this is likely due to `ulimit -n` being too low. You can raise

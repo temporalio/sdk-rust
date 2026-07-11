@@ -95,17 +95,18 @@ pub use crate::{
 };
 pub use runtime::Runtime;
 pub use temporalio_client::Namespace;
+#[cfg(feature = "experimental")]
+pub use temporalio_workflow::ContinueAsNewVersioningBehavior;
 pub use temporalio_workflow::{
     ActivityCancellationType, ActivityCloseTimeouts, ActivityOptions, BaseWorkflowContext,
     CancellableFuture, CancellableFutureWithReason, ChildWorkflowCancellationType,
-    ChildWorkflowOptions, ContinueAsNewOptions, ContinueAsNewVersioningBehavior,
-    ExternalWorkflowHandle, LocalActivityOptions, MemoValue, NexusOperationCancellationType,
-    NexusOperationOptions, ParentClosePolicy, PatchActivationCallback, SignalWorkflowOptions,
-    StartChildWorkflowExecutionFailedCause, StartChildWorkflowOutput, StartedChildWorkflow,
-    StartedNexusOperation, SyncWorkflowContext, TimerOptions, TimerResult, VersioningIntent,
-    WaitConditionOptions, WorkflowCancellationError, WorkflowCancellationToken, WorkflowContext,
-    WorkflowContextView, WorkflowIdReusePolicy, WorkflowRandomValue, WorkflowResult,
-    WorkflowTermination,
+    ChildWorkflowOptions, ContinueAsNewOptions, ExternalWorkflowHandle, LocalActivityOptions,
+    MemoValue, NexusOperationCancellationType, NexusOperationOptions, ParentClosePolicy,
+    PatchActivationCallback, SignalWorkflowOptions, StartChildWorkflowExecutionFailedCause,
+    StartChildWorkflowOutput, StartedChildWorkflow, StartedNexusOperation, SyncWorkflowContext,
+    TimerOptions, TimerResult, VersioningIntent, WaitConditionOptions, WorkflowCancellationError,
+    WorkflowCancellationToken, WorkflowContext, WorkflowContextView, WorkflowIdReusePolicy,
+    WorkflowRandomValue, WorkflowResult, WorkflowTermination,
 };
 #[cfg(feature = "wasm-workflows")]
 pub use workflow_wasm::WasmWorkflowComponent;

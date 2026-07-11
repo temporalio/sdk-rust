@@ -31,6 +31,7 @@ jobs:
       - run: cargo lint
       - run: cargo test-lint
       - run: cargo check
+      - run: cargo check --features experimental
       - run: git diff --exit-code
 
   test:
@@ -67,12 +68,12 @@ jobs:
         with:
           script: |
             core.exportVariable('RUSTFLAGS', '-Csymbol-mangling-version=v0');
-      - run: cargo test -- --include-ignored --nocapture
+      - run: cargo test --features experimental -- --include-ignored --nocapture
       - name: Find test executable for cgroup tests
         id: find-cgroup-test
         if: runner.os == 'Linux' && runner.arch == 'X64'
         run: |
-          test_executable=$(cargo build --tests --message-format json | jq -r 'select(.profile?.test == true and .target?.name == "temporalio_sdk_core" and .executable) | .executable')
+          test_executable=$(cargo build --tests --features experimental --message-format json | jq -r 'select(.profile?.test == true and .target?.name == "temporalio_sdk_core" and .executable) | .executable')
           cp $test_executable ./core-tests
       - name: Upload cgroup test executable
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
@@ -186,7 +187,7 @@ jobs:
       - uses: ./.github/actions/setup
         with:
           mise-install-args: protoc
-      - run: cargo test --features=test-utilities --test cloud_tests
+      - run: cargo test --features=test-utilities,temporalio-sdk/experimental --test cloud_tests
       - name: Generate Cloud test certificates
         run: |
           umask 077

@@ -1808,6 +1808,10 @@ fn build_start_workflow_request(
     options: WorkflowStartOptions,
 ) -> StartWorkflowExecutionRequest {
     let user_metadata = options.user_metadata();
+    #[cfg(feature = "experimental")]
+    let request_eager_execution = options.enable_eager_workflow_start;
+    #[cfg(not(feature = "experimental"))]
+    let request_eager_execution = false;
     StartWorkflowExecutionRequest {
         namespace: client.namespace(),
         input,
@@ -1837,7 +1841,7 @@ fn build_start_workflow_request(
             .search_attributes
             .map(|attributes| attributes.into_proto()),
         cron_schedule: options.cron_schedule.unwrap_or_default(),
-        request_eager_execution: options.enable_eager_workflow_start,
+        request_eager_execution,
         retry_policy: options.retry_policy.map(Into::into),
         links: options.links,
         completion_callbacks: options.completion_callbacks,

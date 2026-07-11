@@ -12,6 +12,9 @@ categories = ["development-tools"]
 readme = "README.md"
 autoexamples = false
 
+[package.metadata.docs.rs]
+features = ["experimental"]
+
 [dependencies]
 async-trait = "0.1"
 anyhow = "1.0"
@@ -71,6 +74,7 @@ rstest = "0.26"
 [features]
 default = ["envconfig", "prometheus"]
 envconfig = ["temporalio-sdk-core/envconfig"]
+experimental = ["temporalio-client/experimental", "temporalio-workflow/experimental"]
 prometheus = ["temporalio-sdk-core/prometheus"]
 otel = ["temporalio-sdk-core/otel"]
 examples = ["serde/derive", "dep:serde_json", "envconfig"]

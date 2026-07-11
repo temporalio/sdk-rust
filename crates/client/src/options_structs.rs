@@ -419,6 +419,7 @@ pub struct WorkflowStartOptions {
 
     /// Optionally enable Eager Workflow Start, a latency optimization using local workers
     /// NOTE: Experimental
+    #[cfg(feature = "experimental")]
     #[builder(default)]
     pub enable_eager_workflow_start: bool,
 
@@ -619,6 +620,7 @@ impl WorkflowUpdateWithStartOptions {
                 task_timeout,
                 cron_schedule: None,
                 search_attributes,
+                #[cfg(feature = "experimental")]
                 enable_eager_workflow_start: false,
                 retry_policy,
                 links,

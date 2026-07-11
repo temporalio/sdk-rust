@@ -10,6 +10,12 @@ repository = "https://github.com/temporalio/sdk-core"
 keywords = ["temporal", "workflow"]
 categories = ["development-tools"]
 
+[package.metadata.docs.rs]
+features = ["experimental"]
+
+[features]
+experimental = []
+
 [dependencies]
 anyhow = "1.0"
 bon = { workspace = true }

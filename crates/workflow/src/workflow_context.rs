@@ -1,12 +1,13 @@
 mod options;
 mod view;
 
+#[cfg(feature = "experimental")]
+pub use options::ContinueAsNewVersioningBehavior;
 pub use options::{
     ActivityCancellationType, ActivityOptions, ChildWorkflowCancellationType, ChildWorkflowOptions,
-    ContinueAsNewOptions, ContinueAsNewVersioningBehavior, LocalActivityOptions,
-    NexusOperationCancellationType, NexusOperationOptions, ParentClosePolicy,
-    SignalWorkflowOptions, TimerOptions, VersioningIntent, WaitConditionOptions,
-    WorkflowIdReusePolicy,
+    ContinueAsNewOptions, LocalActivityOptions, NexusOperationCancellationType,
+    NexusOperationOptions, ParentClosePolicy, SignalWorkflowOptions, TimerOptions,
+    VersioningIntent, WaitConditionOptions, WorkflowIdReusePolicy,
 };
 pub use temporalio_common_wasm::protos::coresdk::child_workflow::StartChildWorkflowExecutionFailedCause;
 pub use view::{NamespacedWorkflowInfo, WorkflowContextView};
@@ -1571,6 +1572,7 @@ impl<W> SyncWorkflowContext<W> {
     /// Returns true if the workflow's target worker deployment version changed.
     ///
     /// This experimental signal is intended for workers using worker deployment versioning.
+    #[cfg(feature = "experimental")]
     pub fn target_worker_deployment_version_changed(&self) -> bool {
         self.base
             .inner
@@ -2079,6 +2081,7 @@ impl<W> WorkflowContext<W> {
     /// Returns true if the workflow's target worker deployment version changed.
     ///
     /// This experimental signal is intended for workers using worker deployment versioning.
+    #[cfg(feature = "experimental")]
     pub fn target_worker_deployment_version_changed(&self) -> bool {
         self.sync.target_worker_deployment_version_changed()
     }
