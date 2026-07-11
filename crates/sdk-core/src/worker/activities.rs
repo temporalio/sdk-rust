@@ -97,8 +97,6 @@ struct InFlightActInfo {
     workflow_id: String,
     /// Only kept for logging reasons
     workflow_run_id: String,
-    /// Only kept for logging reasons
-    attempt: i32,
     start_time: Instant,
     scheduled_time: Option<SystemTime>,
 }
@@ -134,7 +132,6 @@ impl RemoteInFlightActInfo {
                 workflow_type: poll_resp.workflow_type.clone().unwrap_or_default().name,
                 workflow_id: wec.workflow_id,
                 workflow_run_id: wec.run_id,
-                attempt: poll_resp.attempt,
                 start_time: Instant::now(),
                 scheduled_time: poll_resp.scheduled_time.and_then(|i| i.try_into().ok()),
             },
@@ -338,16 +335,12 @@ impl WorkerActivityTasks {
             outstanding_activity_tasks.remove(&task_token)
         };
         if let Some(act_info) = act_info {
-            let span = Span::current();
-            span.record("workflow_id", act_info.base.workflow_id.as_str());
-            span.record("run_id", act_info.base.workflow_run_id.as_str());
-            span.record("workflow_type", act_info.base.workflow_type.as_str());
-            span.record("activity_type", act_info.base.activity_type.as_str());
-            span.record("attempt", act_info.base.attempt as i64);
             let act_metrics = self.metrics.with_new_attrs([
                 activity_type(act_info.base.activity_type),
                 workflow_type(act_info.base.workflow_type),
             ]);
+            Span::current().record("workflow_id", act_info.base.workflow_id);
+            Span::current().record("run_id", act_info.base.workflow_run_id);
             act_metrics.act_execution_latency(act_info.base.start_time.elapsed());
             let known_not_found = act_info.known_not_found;
 

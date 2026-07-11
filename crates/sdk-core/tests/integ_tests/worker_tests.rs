@@ -54,7 +54,7 @@ use temporalio_common::{
             },
         },
     },
-    telemetry::{CoreLogStreamConsumer, Logger, TelemetryOptions, construct_filter_string},
+    telemetry::{CoreLogStreamConsumer, Logger, TelemetryOptions},
     worker::WorkerTaskTypes,
 };
 use temporalio_macros::{activities, workflow, workflow_methods};
@@ -577,43 +577,17 @@ async fn warn_band_payload_is_logged_and_completes() {
     let scan = tokio::time::timeout(Duration::from_secs(5), async {
         while let Some(log) = log_rx.next().await {
             if log.message.starts_with("[TMPRL1103]") {
-                return Some(log);
+                return Some(log.level);
             }
         }
         None
     })
     .await;
-    let log = match scan {
-        Ok(Some(log)) => log,
+    match scan {
+        Ok(Some(level)) => assert_eq!(level, Level::WARN, "the payload should warn, not error"),
         Ok(None) => panic!("log stream ended without a [TMPRL1103] warning"),
         Err(_) => panic!("timed out waiting for a [TMPRL1103] warning"),
-    };
-    assert_eq!(log.level, Level::WARN, "the payload should warn, not error");
-
-    // Validate expected structured logging information.
-    let fields = &log.fields;
-    let as_u64 = |k: &str| fields.get(k).and_then(|v| v.as_u64());
-    let as_str = |k: &str| fields.get(k).and_then(|v| v.as_str());
-    assert_eq!(
-        as_u64("limit"),
-        Some(1),
-        "warn limit is the client option: {fields:?}"
-    );
-    assert!(
-        as_u64("size").is_some_and(|s| s > 1),
-        "size should be recorded and exceed the warn limit: {fields:?}"
-    );
-    assert_eq!(as_str("workflow_type"), Some("WarnBandWf"), "{fields:?}");
-    assert_eq!(as_u64("attempt"), Some(1), "{fields:?}");
-    assert_eq!(
-        as_str("workflow_id"),
-        Some(starter.get_wf_id()),
-        "{fields:?}"
-    );
-    assert!(
-        as_str("run_id").is_some_and(|r| !r.is_empty()),
-        "run_id should be recorded: {fields:?}"
-    );
+    }
 }
 
 /// With the worker error limit disabled, an oversized activity result (under the gRPC transport

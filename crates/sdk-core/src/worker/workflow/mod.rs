@@ -340,7 +340,6 @@ impl Workflows {
         match report {
             ServerCommandsWithWorkflowInfo {
                 task_token,
-                workflow_type,
                 action:
                     ActivationAction::WftComplete {
                         mut commands,
@@ -353,9 +352,6 @@ impl Workflows {
                     },
                 metrics: run_metrics,
             } => {
-                let span = tracing::Span::current();
-                span.record("workflow_type", workflow_type.as_str());
-                span.record("attempt", attempt as i64);
                 let reserved_act_permits =
                     self.reserve_activity_slots_for_outgoing_commands(commands.as_mut_slice());
                 debug!(commands=%commands.display(), query_responses=%query_responses.display(),
@@ -1033,8 +1029,6 @@ enum FailedActivationWFTReport {
 
 struct ServerCommandsWithWorkflowInfo {
     task_token: TaskToken,
-    /// Kept for tracing context on the completion (the run's span lacks workflow type/attempt).
-    workflow_type: String,
     action: ActivationAction,
     metrics: MetricsContext,
 }

@@ -436,7 +436,6 @@ impl ManagedRun {
             self.reply_to_complete(
                 ActivationCompleteOutcome::ReportWFTSuccess(ServerCommandsWithWorkflowInfo {
                     task_token,
-                    workflow_type: self.wfm.machines.workflow_type.clone(),
                     action: ActivationAction::RespondLegacyQuery {
                         result: Box::new(qr),
                     },
@@ -1098,7 +1097,6 @@ impl ManagedRun {
         data: CompletionDataForWFT,
         due_to_heartbeat_timeout: bool,
     ) -> FulfillableActivationComplete {
-        let workflow_type = self.wfm.machines.workflow_type.clone();
         let mut machines_wft_response = self.wfm.prepare_for_wft_response();
         if data.activation_was_eviction
             && (machines_wft_response.commands().peek().is_some()
@@ -1149,7 +1147,6 @@ impl ManagedRun {
             let attempt = self.wft.as_ref().map(|t| t.info.attempt).unwrap_or(1);
             ActivationCompleteOutcome::ReportWFTSuccess(ServerCommandsWithWorkflowInfo {
                 task_token: data.task_token,
-                workflow_type,
                 action: ActivationAction::WftComplete {
                     force_new_wft,
                     commands,

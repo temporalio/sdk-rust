@@ -1235,9 +1235,8 @@ impl Worker {
     /// Tell the worker that an activity has finished executing. May (and should) be freely called
     /// concurrently.
     #[instrument(skip(self, completion),
-                 fields(task_token, status, namespace=%self.config.namespace,
-                        task_queue=%self.config.task_queue, worker_id=%self.client.identity(),
-                        workflow_id, run_id, workflow_type, activity_type, attempt))]
+                 fields(task_token, status,
+                        task_queue=%self.config.task_queue, workflow_id, run_id))]
     pub async fn complete_activity_task(
         &self,
         completion: ActivityTaskCompletion,
@@ -1310,9 +1309,8 @@ impl Worker {
     /// necessary for completion to... complete - thus SDK implementers should make sure they do
     /// not serialize completions.
     #[instrument(skip(self, completion),
-        fields(completion=%&completion, namespace=%self.config.namespace,
-               task_queue=%self.config.task_queue, worker_id=%self.client.identity(),
-               run_id, workflow_id, workflow_type, attempt))]
+        fields(completion=%&completion, run_id=%completion.run_id, workflow_id,
+               task_queue=%self.config.task_queue))]
     pub async fn complete_workflow_activation(
         &self,
         completion: WorkflowActivationCompletion,
