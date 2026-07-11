@@ -61,6 +61,16 @@ to docs, or any other relevant information.
   `ScheduleDescription::search_attributes`, and `ScheduleSummary::search_attributes` now return
   typed `SearchAttributes` instead of raw proto search attributes. Missing search attributes are
   returned as an empty collection instead of `None`.
+* Payload/memo size-limit enforcement (experimental), on by default. Workers now proactively
+  validate outbound payload/memo sizes against namespace limits before sending to the server.
+  If payload/memo-bearing fields exceed the warn threshold, the worker logs a warning; if over the
+  error limit, the task completion is failed retryably instead of sent to the server. Both cases log
+  `[TMPRL1103]` (at `WARN` and `ERROR` respectively).
+  Previously these were sent and the server terminated the workflow / failed the activity
+  non-retryably; failing retryably instead lets a corrected workflow or activity be redeployed and
+  recover. A deterministically-oversized completion now retries per its retry policy rather than
+  failing fast. Tune warn thresholds via `PayloadLimitsOptions`. Opt out of worker error enforcement
+  with `WorkerOptions::disable_payload_error_limit`.
 
 ### Fixed
 * OTLP metric export failures are now logged through Core telemetry when OpenTelemetry's periodic
