@@ -331,6 +331,39 @@ mod tests {
             .await;
     }
 
+    #[tokio::test]
+    async fn executor_drains_unconstrained_future_past_cooperative_budget() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let executor = WorkflowExecutor::new();
+                let receivers = (0..256)
+                    .map(|_| {
+                        let (tx, rx) = oneshot::channel();
+                        tx.send(()).unwrap();
+                        rx
+                    })
+                    .collect::<Vec<_>>();
+                let workflow = async move {
+                    for receiver in receivers {
+                        receiver.await.unwrap();
+                    }
+                };
+                let workflow = tokio::task::coop::unconstrained(workflow);
+                let handle = executor.spawn(async move {
+                    tokio::select! {
+                        _ = workflow => {}
+                        _ = std::future::pending::<()>() => {}
+                    }
+                });
+
+                executor.shutdown().await;
+
+                handle.await.unwrap();
+            })
+            .await;
+    }
+
     #[test]
     fn sdk_wake_guard_nesting() {
         assert!(!is_sdk_wake());

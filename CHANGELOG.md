@@ -63,6 +63,8 @@ to docs, or any other relevant information.
   returned as an empty collection instead of `None`.
 
 ### Fixed
+* Workflow tasks no longer livelock when a burst of ready async operations exhausts Tokio's
+  cooperative scheduling budget.
 * OTLP metric export failures are now logged through Core telemetry when OpenTelemetry's periodic
   metric reader reports an export error.
 * Worker heartbeat now samples host CPU/memory at the heartbeat interval (only when enabled) rather
