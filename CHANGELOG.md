@@ -66,6 +66,8 @@ to docs, or any other relevant information.
   uses the same Rust-native workflow execution type.
 * Workflow status accessors and query rejection errors now use the Rust-native
   `WorkflowExecutionStatus` enum instead of generated protobuf types.
+* Activity, child-workflow, and timeout errors now expose Rust-native `RetryState` and
+  `TimeoutType` enums instead of generated protobuf enums.
 
 ### Fixed
 * OTLP metric export failures are now logged through Core telemetry when OpenTelemetry's periodic

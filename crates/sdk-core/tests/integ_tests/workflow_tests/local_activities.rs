@@ -37,7 +37,9 @@ use temporalio_common::{
         temporal::api::{
             command::v1::{RecordMarkerCommandAttributes, command},
             common::v1::RetryPolicy,
-            enums::v1::{CommandType, EventType, TimeoutType, WorkflowTaskFailedCause},
+            enums::v1::{
+                CommandType, EventType, TimeoutType as ProtoTimeoutType, WorkflowTaskFailedCause,
+            },
             failure::v1::Failure,
             history::v1::history_event::Attributes::MarkerRecordedEventAttributes,
             query::v1::WorkflowQuery,
@@ -47,7 +49,7 @@ use temporalio_common::{
 use temporalio_macros::{activities, workflow, workflow_methods};
 use temporalio_sdk::{
     ActivityExecutionError, ActivityOptions, ApplicationFailure, CancellableFuture,
-    LocalActivityOptions, WorkflowContext, WorkflowContextView, WorkflowResult,
+    LocalActivityOptions, TimeoutType, WorkflowContext, WorkflowContextView, WorkflowResult,
     activities::{ActivityContext, ActivityError},
     interceptors::{FailOnNondeterminismInterceptor, WorkerInterceptor},
 };
@@ -636,7 +638,7 @@ async fn x_to_close_timeout(#[case] is_schedule: bool) {
         #[run]
         async fn run(
             ctx: &mut WorkflowContext<Self>,
-            (sched, start, timeout_type): (Option<Duration>, Option<Duration>, i32),
+            (sched, start, is_schedule): (Option<Duration>, Option<Duration>, bool),
         ) -> WorkflowResult<()> {
             let res = ctx
                 .start_local_activity(
@@ -659,10 +661,12 @@ async fn x_to_close_timeout(#[case] is_schedule: bool) {
                 .await;
             let err = res.unwrap_err();
             let timeout = err.as_timeout().unwrap();
-            assert_eq!(
-                timeout.timeout_type(),
-                TimeoutType::try_from(timeout_type).unwrap()
-            );
+            let expected_timeout = if is_schedule {
+                TimeoutType::ScheduleToClose
+            } else {
+                TimeoutType::StartToClose
+            };
+            assert_eq!(timeout.timeout_type(), expected_timeout);
             Ok(())
         }
     }
@@ -673,18 +677,13 @@ async fn x_to_close_timeout(#[case] is_schedule: bool) {
     } else {
         (None, Some(Duration::from_secs(2)))
     };
-    let timeout_type = if is_schedule {
-        TimeoutType::ScheduleToClose
-    } else {
-        TimeoutType::StartToClose
-    };
     worker.register_workflow::<XToCloseTimeoutWf>().unwrap();
 
     let task_queue = starter.get_task_queue().to_owned();
     worker
         .submit_workflow(
             XToCloseTimeoutWf::run,
-            (sched, start, timeout_type as i32),
+            (sched, start, is_schedule),
             WorkflowStartOptions::new(task_queue, wf_name.to_owned()).build(),
         )
         .await
@@ -2127,7 +2126,7 @@ async fn start_to_close_timeout_allows_retries(#[values(true, false)] la_complet
             1,
             "1",
             None,
-            Some(Failure::timeout(TimeoutType::StartToClose)),
+            Some(Failure::timeout(ProtoTimeoutType::StartToClose)),
             |_| {},
         );
     }

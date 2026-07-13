@@ -1155,7 +1155,7 @@ mod tests {
         assert_eq!(decoded_failure.identity(), "worker-1");
         assert_eq!(
             decoded_failure.retry_state(),
-            crate::protos::temporal::api::enums::v1::RetryState::Timeout
+            crate::error::RetryState::Timeout
         );
         assert!(matches!(
             decoded_failure.cause(),
@@ -1245,10 +1245,7 @@ mod tests {
         let IncomingError::Timeout(timeout) = decoded else {
             panic!("expected timeout error");
         };
-        assert_eq!(
-            timeout.timeout_type(),
-            crate::protos::temporal::api::enums::v1::TimeoutType::Heartbeat
-        );
+        assert_eq!(timeout.timeout_type(), crate::error::TimeoutType::Heartbeat);
         assert_eq!(
             timeout.raw_last_heartbeat_details(),
             Some(heartbeat_details.payloads.as_slice())
@@ -1342,7 +1339,7 @@ mod tests {
         assert_eq!(decoded_failure.started_event_id(), 22);
         assert_eq!(
             decoded_failure.retry_state(),
-            crate::protos::temporal::api::enums::v1::RetryState::Timeout
+            crate::error::RetryState::Timeout
         );
     }
 

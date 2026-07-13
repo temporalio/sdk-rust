@@ -85,7 +85,7 @@ pub mod workflows;
 pub use crate::error::{
     ActivityExecutionError, ApplicationFailure, ChildWorkflowExecutionError,
     ChildWorkflowStartError, OutgoingActivityError, OutgoingError, OutgoingWorkflowError,
-    WorkflowRegistrationError, WorkflowSignalError,
+    RetryState, TimeoutType, WorkflowRegistrationError, WorkflowSignalError,
 };
 pub use temporalio_client::Namespace;
 pub use temporalio_workflow::{

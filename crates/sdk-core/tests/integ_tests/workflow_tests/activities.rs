@@ -43,7 +43,7 @@ use temporalio_common::{
         },
         temporal::api::{
             common::v1::{ActivityType, Payload, Payloads, RetryPolicy},
-            enums::v1::{CommandType, EventType, RetryState, TimeoutType},
+            enums::v1::{CommandType, EventType, RetryState as ProtoRetryState},
             failure::v1::{ActivityFailureInfo, Failure, failure::FailureInfo},
             sdk::v1::UserMetadata,
         },
@@ -51,8 +51,8 @@ use temporalio_common::{
 };
 use temporalio_macros::{activities, workflow, workflow_methods};
 use temporalio_sdk::{
-    ActivityExecutionError, ActivityOptions, CancellableFuture, LocalActivityOptions,
-    WorkflowContext, WorkflowResult,
+    ActivityExecutionError, ActivityOptions, CancellableFuture, LocalActivityOptions, RetryState,
+    TimeoutType, WorkflowContext, WorkflowResult,
     activities::{ActivityContext, ActivityError},
     interceptors::{
         ActivityInboundInterceptor, ExecuteActivityInput, ExecuteActivityOutput,
@@ -955,7 +955,7 @@ async fn activity_non_retryable_failure() {
                     scheduled_event_id: 5,
                     started_event_id: 6,
                     identity: INTEG_CLIENT_IDENTITY.to_owned(),
-                    retry_state: RetryState::NonRetryableFailure as i32,
+                    retry_state: ProtoRetryState::NonRetryableFailure as i32,
                 })),
                 ..Default::default()
             });
@@ -1022,7 +1022,7 @@ async fn activity_non_retryable_failure_with_error() {
                     scheduled_event_id: 5,
                     started_event_id: 6,
                     identity: INTEG_CLIENT_IDENTITY.to_owned(),
-                    retry_state: RetryState::NonRetryableFailure as i32,
+                    retry_state: ProtoRetryState::NonRetryableFailure as i32,
                 })),
                 ..Default::default()
             });
