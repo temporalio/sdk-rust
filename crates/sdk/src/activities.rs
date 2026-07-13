@@ -74,7 +74,9 @@ pub use temporalio_common::ActivityError;
 use temporalio_common::{
     ActivityDefinition, HasWorkflowDefinition, RetryPolicy, WorkflowExecution,
     data_converters::{
-        DataConverter, GenericPayloadConverter, SerializationContext, SerializationContextData,
+        DataConverter, DecodablePayloads, GenericPayloadConverter, PayloadConversionError,
+        PayloadConverter, RawValue, SerializationContext, SerializationContextData,
+        TemporalDeserializable, TemporalSerializable,
     },
     error::ApplicationFailure,
     protos::{
@@ -92,14 +94,13 @@ pub struct ActivityContext {
     worker: Arc<CoreWorker>,
     client_options: ClientOptions,
     cancellation_token: CancellationToken,
-    heartbeat_details: Vec<Payload>,
+    heartbeat_details: ActivityHeartbeatDetails,
     header_fields: HashMap<String, Payload>,
     info: ActivityInfo,
 }
 
 impl ActivityContext {
-    /// Construct new Activity Context, returning the context and all arguments to the activity.
-    pub fn new(
+    pub(crate) fn new(
         worker: Arc<CoreWorker>,
         client_options: ClientOptions,
         cancellation_token: CancellationToken,
@@ -133,6 +134,10 @@ impl ActivityContext {
             started_time.as_ref(),
             start_to_close_timeout.as_ref(),
             schedule_to_close_timeout.as_ref(),
+        );
+        let heartbeat_details = ActivityHeartbeatDetails::new(
+            heartbeat_details,
+            client_options.data_converter.payload_converter().clone(),
         );
 
         (
@@ -180,18 +185,27 @@ impl ActivityContext {
 
     /// Extract heartbeat details from last failed attempt. This is used in combination with retry
     /// policy.
-    pub fn heartbeat_details(&self) -> &[Payload] {
+    pub fn heartbeat_details(&self) -> &ActivityHeartbeatDetails {
         &self.heartbeat_details
     }
 
-    /// RecordHeartbeat sends heartbeat for the currently executing activity
-    pub fn record_heartbeat(&self, details: Vec<Payload>) {
+    /// Record a heartbeat with typed progress details for the currently executing activity.
+    pub async fn record_heartbeat<T>(&self, details: T) -> Result<(), PayloadConversionError>
+    where
+        T: TemporalSerializable + 'static,
+    {
         if !self.info.is_local {
+            let details = self
+                .client_options
+                .data_converter
+                .to_payloads(&SerializationContextData::Activity, &details)
+                .await?;
             self.worker.record_activity_heartbeat(ActivityHeartbeat {
                 task_token: self.info.task_token.clone(),
                 details,
             })
         }
+        Ok(())
     }
 
     /// Returns activity info of the executing activity
@@ -232,6 +246,46 @@ impl ActivityContext {
 
     pub(crate) fn headers_mut(&mut self) -> &mut HashMap<String, Payload> {
         &mut self.header_fields
+    }
+}
+
+/// Heartbeat details supplied by the previous activity attempt.
+#[derive(Clone, Debug)]
+#[non_exhaustive]
+pub struct ActivityHeartbeatDetails {
+    payloads: DecodablePayloads,
+}
+
+impl ActivityHeartbeatDetails {
+    fn new(payloads: Vec<Payload>, payload_converter: PayloadConverter) -> Self {
+        Self {
+            payloads: DecodablePayloads::new(
+                payloads,
+                payload_converter,
+                SerializationContextData::Activity,
+            ),
+        }
+    }
+
+    /// Deserialize the previous heartbeat details, or return `None` when there are none.
+    pub fn deserialize<T: TemporalDeserializable + 'static>(
+        &self,
+    ) -> Result<Option<T>, PayloadConversionError> {
+        if self.payloads.raw().is_empty() {
+            Ok(None)
+        } else {
+            self.payloads.deserialize().map(Some)
+        }
+    }
+
+    /// Returns the codec-decoded raw heartbeat payloads.
+    pub fn raw(&self) -> &[Payload] {
+        self.payloads.raw()
+    }
+
+    /// Consume these details and return their codec-decoded payloads.
+    pub fn into_raw(self) -> RawValue {
+        self.payloads.into_raw()
     }
 }
 
@@ -522,6 +576,35 @@ mod test {
     use super::*;
     use rstest::rstest;
     use temporalio_common::error::{ApplicationErrorCategory, ApplicationFailure};
+
+    #[test]
+    fn activity_heartbeat_details_support_typed_decoding() {
+        let payload_converter = PayloadConverter::default();
+        let payload = payload_converter
+            .to_payload(
+                &SerializationContext {
+                    data: &SerializationContextData::Activity,
+                    converter: &payload_converter,
+                },
+                &"progress".to_owned(),
+            )
+            .unwrap();
+        let details = ActivityHeartbeatDetails::new(vec![payload.clone()], payload_converter);
+
+        assert_eq!(details.raw(), &[payload]);
+        assert_eq!(
+            details.deserialize::<String>().unwrap(),
+            Some("progress".to_owned())
+        );
+    }
+
+    #[test]
+    fn empty_activity_heartbeat_details_decode_to_none() {
+        let details = ActivityHeartbeatDetails::new(Vec::new(), PayloadConverter::default());
+
+        assert_eq!(details.deserialize::<String>().unwrap(), None);
+        assert!(details.into_raw().payloads.is_empty());
+    }
 
     #[rstest]
     #[case(true)]

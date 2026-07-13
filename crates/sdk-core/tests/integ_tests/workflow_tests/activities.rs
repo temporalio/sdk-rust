@@ -42,7 +42,7 @@ use temporalio_common::{
             workflow_completion::WorkflowActivationCompletion,
         },
         temporal::api::{
-            common::v1::{ActivityType, Payload, Payloads, RetryPolicy},
+            common::v1::{ActivityType, Payload, RetryPolicy},
             enums::v1::{CommandType, EventType, RetryState as ProtoRetryState},
             failure::v1::{ActivityFailureInfo, Failure, failure::FailureInfo},
             sdk::v1::UserMetadata,
@@ -1537,9 +1537,7 @@ async fn async_activity_completion_workflow() {
         .get_client()
         .await
         .get_async_activity_handle(ActivityIdentifier::TaskToken(task.task_token.into()))
-        .complete(Some(Payloads {
-            payloads: vec![response_payload.clone()],
-        }))
+        .complete(Some(RawValue::new(vec![response_payload.clone()])))
         .await
         .unwrap();
 

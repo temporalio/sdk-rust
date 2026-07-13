@@ -108,7 +108,7 @@ impl FailurePayloadActivities {
         loop {
             tokio::select! {
                 _ = ctx.cancelled() => break,
-                _ = ticker.tick() => ctx.record_heartbeat(vec![]),
+                _ = ticker.tick() => ctx.record_heartbeat(()).await?,
             }
         }
         Err(ActivityError::cancelled_with_details(
@@ -118,11 +118,10 @@ impl FailurePayloadActivities {
 
     #[activity]
     async fn heartbeat_then_timeout(ctx: ActivityContext) -> Result<(), ActivityError> {
-        ctx.record_heartbeat(vec![
-            TrackedValue::new("codec-heartbeat-details".to_string())
-                .as_json_payload()
-                .map_err(ActivityError::from)?,
-        ]);
+        ctx.record_heartbeat(TrackedWrapper(TrackedValue::new(
+            "codec-heartbeat-details".to_string(),
+        )))
+        .await?;
         tokio::time::sleep(Duration::from_secs(2)).await;
         Ok(())
     }

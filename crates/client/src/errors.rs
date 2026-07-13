@@ -287,6 +287,9 @@ pub enum AsyncActivityError {
     /// The activity was not found (e.g., already completed, cancelled, or never existed).
     #[error("Activity not found")]
     NotFound(#[source] tonic::Status),
+    /// Error serializing an activity result, failure, or details.
+    #[error("Payload conversion error: {0}")]
+    PayloadConversion(#[from] PayloadConversionError),
     /// An uncategorized rpc error from the server.
     #[error("Server error: {0}")]
     Rpc(#[from] tonic::Status),

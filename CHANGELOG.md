@@ -77,6 +77,9 @@ to docs, or any other relevant information.
   `RetryPolicy` type instead of the generated protobuf message.
 * Workflow result failures now expose decoded `IncomingError` values, and cancellation and
   termination details use typed `WorkflowResultDetails` instead of raw payloads.
+* Async activity completion, failure, cancellation, and heartbeat methods now convert typed Rust
+  values with the client's data converter. Activity heartbeat details are exposed through the
+  typed `ActivityHeartbeatDetails` wrapper.
 
 ### Fixed
 * OTLP metric export failures are now logged through Core telemetry when OpenTelemetry's periodic
