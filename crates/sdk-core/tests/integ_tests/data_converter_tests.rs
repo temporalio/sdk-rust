@@ -31,8 +31,8 @@ use temporalio_common::{
 };
 use temporalio_macros::{activities, workflow, workflow_methods};
 use temporalio_sdk::{
-    ActivityOptions, CancellableFuture, SyncWorkflowContext, WorkflowContext, WorkflowContextView,
-    WorkflowResult,
+    ActivityOptions, CancellableFuture, MemoValue, SyncWorkflowContext, WorkflowContext,
+    WorkflowContextView, WorkflowResult,
     activities::{ActivityContext, ActivityError},
 };
 
@@ -209,7 +209,12 @@ impl DescribeDataConverterWorkflow {
         ctx: &mut WorkflowContext<Self>,
         input: TrackedWrapper,
     ) -> WorkflowResult<TrackedWrapper> {
-        ctx.upsert_memo([("tracked".to_string(), input.0.data.as_json_payload()?)]);
+        ctx.upsert_memo([
+            ("tracked", Some(MemoValue::new(input.0.data.clone()))),
+            ("wrapped", Some(MemoValue::new(input.clone()))),
+            ("removed", Some(MemoValue::new(true))),
+        ])?;
+        ctx.upsert_memo([("removed", None)])?;
         let output = ctx
             .start_activity(
                 TestActivities::process_tracked,
@@ -956,6 +961,14 @@ async fn describe_decodes_workflow_payload_fields() {
         desc.memo().get::<String>("tracked").unwrap(),
         Some("codec-describe".to_owned())
     );
+    assert_eq!(
+        desc.memo()
+            .get::<TrackedWrapper>("wrapped")
+            .unwrap()
+            .map(|value| value.0.data),
+        Some("codec-describe".to_owned())
+    );
+    assert!(!desc.memo().contains_key("removed"));
     let raw_user_metadata = desc
         .raw_description
         .execution_config
@@ -1025,6 +1038,13 @@ async fn describe_decodes_user_metadata_with_ungated_xor_codec() {
     );
     assert_eq!(
         desc.memo().get::<String>("tracked").unwrap(),
+        Some("codec-describe".to_owned())
+    );
+    assert_eq!(
+        desc.memo()
+            .get::<TrackedWrapper>("wrapped")
+            .unwrap()
+            .map(|value| value.0.data),
         Some("codec-describe".to_owned())
     );
     // Making sure codec isn't used when decoding user metadata

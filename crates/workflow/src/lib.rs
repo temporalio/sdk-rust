@@ -16,11 +16,13 @@ pub mod __private {
 
 #[doc(hidden)]
 pub mod component;
+mod memo;
 #[doc(hidden)]
 pub mod runtime;
 mod workflow_context;
 pub mod workflows;
 
+pub use memo::{MemoValue, MemoValues};
 #[doc(hidden)]
 pub use runtime::model::{CancellableID, UnblockEvent};
 pub use runtime::model::{TimerResult, WorkflowResult, WorkflowTermination};

@@ -82,6 +82,9 @@ to docs, or any other relevant information.
   typed `ActivityHeartbeatDetails` wrapper.
 * Workflow and schedule list/description memo accessors now return the typed `Memo` wrapper
   instead of raw protobuf memos.
+* Workflow memo reads use the typed `Memo` collection. Upserts accept maps of optional
+  `MemoValue`s, where `None` removes a key, and continue-as-new memo replacements use
+  `MemoValues`.
 
 ### Fixed
 * OTLP metric export failures are now logged through Core telemetry when OpenTelemetry's periodic

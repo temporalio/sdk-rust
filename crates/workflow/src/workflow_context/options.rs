@@ -1,10 +1,11 @@
 use std::{collections::HashMap, time::Duration};
 
-use crate::runtime::types::ContinueAsNewRequest;
+use crate::{MemoValues, runtime::types::ContinueAsNewRequest};
 use temporalio_common_wasm::{
     Priority, RetryPolicy,
     data_converters::{
-        GenericPayloadConverter, PayloadConverter, SerializationContext, SerializationContextData,
+        GenericPayloadConverter, PayloadConversionError, PayloadConverter, SerializationContext,
+        SerializationContextData,
     },
     protos::{
         coresdk::{
@@ -808,8 +809,8 @@ pub struct ContinueAsNewOptions {
     pub task_timeout: Option<Duration>,
     /// Delay before the first workflow task of the continued run is scheduled.
     pub backoff_start_interval: Option<Duration>,
-    /// If set, the new workflow will have this memo. If `None`, reuses the current memo.
-    pub memo: Option<HashMap<String, Payload>>,
+    /// If set, the new workflow will have these memo values. If `None`, reuses the current memo.
+    pub memo: Option<MemoValues>,
     /// If set, the new workflow will have these headers.
     pub headers: Option<HashMap<String, Payload>>,
     /// If set, the new workflow will have these search attributes. If `None`, reuses the current
@@ -833,8 +834,14 @@ impl ContinueAsNewOptions {
         self,
         workflow_type: String,
         arguments: Vec<Payload>,
-    ) -> ContinueAsNewRequest {
-        ContinueAsNewWorkflowExecution {
+        payload_converter: &PayloadConverter,
+    ) -> Result<ContinueAsNewRequest, PayloadConversionError> {
+        let memo = self
+            .memo
+            .map(|memo| memo.encode(payload_converter))
+            .transpose()?
+            .unwrap_or_default();
+        Ok(ContinueAsNewWorkflowExecution {
             workflow_type: self.workflow_type.unwrap_or(workflow_type),
             task_queue: self.task_queue.unwrap_or_default(),
             arguments,
@@ -847,7 +854,7 @@ impl ContinueAsNewOptions {
             backoff_start_interval: self
                 .backoff_start_interval
                 .and_then(|duration| duration.try_into().ok()),
-            memo: self.memo.unwrap_or_default(),
+            memo,
             headers: self.headers.unwrap_or_default(),
             search_attributes: self.search_attributes.map(|t| t.into_proto()),
             retry_policy: self.retry_policy.map(Into::into),
@@ -861,7 +868,7 @@ impl ContinueAsNewOptions {
                     .unwrap_or(ContinueAsNewVersioningBehavior::Unspecified),
             )
             .into(),
-        }
+        })
     }
 }
 
@@ -949,7 +956,12 @@ mod tests {
             versioning_intent: Some(VersioningIntent::Compatible),
             ..Default::default()
         }
-        .into_request("test-workflow".to_string(), vec![]);
+        .into_request(
+            "test-workflow".to_string(),
+            vec![],
+            &PayloadConverter::default(),
+        )
+        .unwrap();
 
         let backoff = req
             .backoff_start_interval
