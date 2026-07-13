@@ -150,6 +150,7 @@ pub struct WorkflowExecutionDescription {
     history_length: usize,
     static_summary: Option<String>,
     static_details: Option<String>,
+    data_converter: DataConverter,
 }
 
 impl WorkflowExecutionDescription {
@@ -185,6 +186,7 @@ impl WorkflowExecutionDescription {
             history_length,
             static_summary: decoded_metadata.summary,
             static_details: decoded_metadata.details,
+            data_converter: data_converter.clone(),
         })
     }
 
@@ -242,9 +244,13 @@ impl WorkflowExecutionDescription {
         self.history_length
     }
 
-    /// Workflow memo after codec decoding.
-    pub fn memo(&self) -> Option<&temporalio_common::protos::temporal::api::common::v1::Memo> {
-        self.workflow_info().memo.as_ref()
+    /// Workflow memo decoded with the client's payload converter.
+    pub fn memo(&self) -> crate::Memo {
+        crate::Memo::from_raw(
+            self.workflow_info().memo.clone(),
+            self.data_converter.payload_converter().clone(),
+            SerializationContextData::Workflow,
+        )
     }
 
     /// Parent workflow ID, if this is a child workflow.
@@ -1153,6 +1159,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn workflow_description_memo_uses_saved_converter() {
+        let converter = DataConverter::new(
+            PayloadConverter::default(),
+            DefaultFailureConverter,
+            XorCodec,
+        );
+        let encoded = converter
+            .to_payload(
+                &SerializationContextData::Workflow,
+                &"memo-value".to_owned(),
+            )
+            .await
+            .unwrap();
+        let description = WorkflowExecutionDescription::new(
+            DescribeWorkflowExecutionResponse {
+                workflow_execution_info: Some(workflow::WorkflowExecutionInfo {
+                    memo: Some(Memo {
+                        fields: HashMap::from([("memo-key".to_owned(), encoded)]),
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            &converter,
+        )
+        .await
+        .unwrap();
+        let memo = description.memo();
+
+        assert_eq!(
+            memo.get::<String>("memo-key").unwrap(),
+            Some("memo-value".to_owned())
+        );
+    }
+
+    #[tokio::test]
     async fn workflow_description_accessors_expose_decoded_fields() {
         let converter = DataConverter::default();
         let memo_payload = converter
@@ -1234,7 +1276,12 @@ mod tests {
         assert_eq!(description.history_length(), 42);
         assert_eq!(description.parent_id(), Some("parent-id"));
         assert_eq!(description.parent_run_id(), Some("parent-run-id"));
-        assert_eq!(description.memo().unwrap().fields["memo-key"], memo_payload);
+        let memo = description.memo();
+        assert_eq!(memo.raw_value("memo-key"), Some(&memo_payload));
+        assert_eq!(
+            memo.get::<String>("memo-key").unwrap(),
+            Some("memo-value".to_owned())
+        );
         let search_attributes = description.search_attributes();
         assert_eq!(
             search_attributes.raw_payload("CustomKeywordField"),

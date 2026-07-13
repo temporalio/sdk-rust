@@ -91,7 +91,7 @@ pub use temporalio_client::Namespace;
 pub use temporalio_workflow::{
     ActivityCancellationType, ActivityCloseTimeouts, ActivityOptions, BaseWorkflowContext,
     CancellableFuture, ChildWorkflowCancellationType, ChildWorkflowOptions, ContinueAsNewOptions,
-    ContinueAsNewVersioningBehavior, ExternalWorkflowHandle, LocalActivityOptions,
+    ContinueAsNewVersioningBehavior, ExternalWorkflowHandle, LocalActivityOptions, Memo,
     NexusOperationCancellationType, NexusOperationOptions, ParentClosePolicy, ParentWorkflowInfo,
     RetryPolicy, RootWorkflowInfo, Signal, SignalData, StartChildWorkflowExecutionFailedCause,
     StartedChildWorkflow, SyncWorkflowContext, TimerOptions, TimerResult, VersioningIntent,

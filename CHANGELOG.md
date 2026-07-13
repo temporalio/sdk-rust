@@ -80,6 +80,8 @@ to docs, or any other relevant information.
 * Async activity completion, failure, cancellation, and heartbeat methods now convert typed Rust
   values with the client's data converter. Activity heartbeat details are exposed through the
   typed `ActivityHeartbeatDetails` wrapper.
+* Workflow and schedule list/description memo accessors now return the typed `Memo` wrapper
+  instead of raw protobuf memos.
 
 ### Fixed
 * OTLP metric export failures are now logged through Core telemetry when OpenTelemetry's periodic

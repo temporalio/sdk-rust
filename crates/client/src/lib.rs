@@ -41,7 +41,7 @@ pub use metrics::{LONG_REQUEST_LATENCY_HISTOGRAM_NAME, REQUEST_LATENCY_HISTOGRAM
 pub use options_structs::*;
 pub use replaceable::SharedReplaceableClient;
 pub use retry::RetryOptions;
-pub use temporalio_common::RetryPolicy;
+pub use temporalio_common::{Memo, RetryPolicy};
 /// Potentially dangerous TLS related functionality.
 pub mod danger {
     /// Re-export the `ServerCertVerifier` trait so that users can implement custom TLS
@@ -85,13 +85,14 @@ use temporalio_common::{
         DataConverter, GenericPayloadConverter, PayloadConverter, SerializationContext,
         SerializationContextData,
     },
+    payload_visitor::decode_payloads,
     protos::{
         coresdk::IntoPayloadsExt,
         grpc::health::v1::health_client::HealthClient,
         proto_ts_to_system_time,
         temporal::api::{
             cloud::cloudservice::v1::cloud_service_client::CloudServiceClient,
-            common::v1::{Memo, Payload, WorkflowType},
+            common::v1::{Payload, WorkflowType},
             enums::v1::TaskQueueKind,
             errordetails::v1::WorkflowExecutionAlreadyStartedFailure,
             operatorservice::v1::operator_service_client::OperatorServiceClient,
@@ -909,12 +910,18 @@ pub trait NamespacedClient {
 #[derive(Debug, Clone)]
 pub struct WorkflowExecution {
     raw: workflow::WorkflowExecutionInfo,
+    data_converter: DataConverter,
 }
 
 impl WorkflowExecution {
-    /// Create a new WorkflowExecution from the raw proto.
-    pub fn new(raw: workflow::WorkflowExecutionInfo) -> Self {
-        Self { raw }
+    fn new_with_data_converter(
+        raw: workflow::WorkflowExecutionInfo,
+        data_converter: DataConverter,
+    ) -> Self {
+        Self {
+            raw,
+            data_converter,
+        }
     }
 
     /// The workflow ID.
@@ -983,9 +990,13 @@ impl WorkflowExecution {
         self.raw.history_length
     }
 
-    /// Workflow memo.
-    pub fn memo(&self) -> Option<&Memo> {
-        self.raw.memo.as_ref()
+    /// Workflow memo decoded with the client's payload converter.
+    pub fn memo(&self) -> Memo {
+        Memo::from_raw(
+            self.raw.memo.clone(),
+            self.data_converter.payload_converter().clone(),
+            SerializationContextData::Workflow,
+        )
     }
 
     /// Parent workflow ID, if this is a child workflow.
@@ -1021,12 +1032,6 @@ impl WorkflowExecution {
     /// Consume the wrapper and return the raw proto.
     pub fn into_raw(self) -> workflow::WorkflowExecutionInfo {
         self.raw
-    }
-}
-
-impl From<workflow::WorkflowExecutionInfo> for WorkflowExecution {
-    fn from(raw: workflow::WorkflowExecutionInfo) -> Self {
-        Self::new(raw)
     }
 }
 
@@ -1333,14 +1338,30 @@ where
 
                     match response {
                         Ok(resp) => {
-                            let resp = resp.into_inner();
+                            let mut resp = resp.into_inner();
                             let new_exhausted = resp.next_page_token.is_empty();
                             let new_token = resp.next_page_token;
 
+                            let data_converter = client.data_converter().clone();
+                            for execution in &mut resp.executions {
+                                if let Some(memo) = execution.memo.as_mut() {
+                                    decode_payloads(
+                                        memo,
+                                        data_converter.codec(),
+                                        &SerializationContextData::Workflow,
+                                    )
+                                    .await;
+                                }
+                            }
                             buffer = resp
                                 .executions
                                 .into_iter()
-                                .map(WorkflowExecution::from)
+                                .map(|raw| {
+                                    WorkflowExecution::new_with_data_converter(
+                                        raw,
+                                        data_converter.clone(),
+                                    )
+                                })
                                 .collect();
 
                             if let Some(exec) = buffer.pop_front() {
@@ -1740,8 +1761,42 @@ mod tests {
         use super::*;
         use futures_util::{FutureExt, StreamExt};
         use std::sync::atomic::{AtomicUsize, Ordering};
-        use temporalio_common::protos::temporal::api::common::v1::WorkflowExecution as ProtoWorkflowExecution;
+        use temporalio_common::{
+            data_converters::{DefaultFailureConverter, PayloadCodec},
+            protos::temporal::api::common::v1::{
+                Memo as ProtoMemo, WorkflowExecution as ProtoWorkflowExecution,
+            },
+        };
         use tonic::{Request, Response};
+
+        struct XorCodec;
+
+        impl PayloadCodec for XorCodec {
+            fn encode(
+                &self,
+                _context: &SerializationContextData,
+                payloads: Vec<Payload>,
+            ) -> futures_util::future::BoxFuture<'static, Vec<Payload>> {
+                async move {
+                    payloads
+                        .into_iter()
+                        .map(|mut payload| {
+                            payload.data.iter_mut().for_each(|byte| *byte ^= 0x42);
+                            payload
+                        })
+                        .collect()
+                }
+                .boxed()
+            }
+
+            fn decode(
+                &self,
+                context: &SerializationContextData,
+                payloads: Vec<Payload>,
+            ) -> futures_util::future::BoxFuture<'static, Vec<Payload>> {
+                self.encode(context, payloads)
+            }
+        }
 
         #[derive(Clone)]
         struct MockListWorkflowsClient {
@@ -1750,6 +1805,8 @@ mod tests {
             page_size: usize,
             // Total workflows available
             total_workflows: usize,
+            data_converter: DataConverter,
+            memo_payload: Option<Payload>,
         }
 
         impl NamespacedClient for MockListWorkflowsClient {
@@ -1758,6 +1815,9 @@ mod tests {
             }
             fn identity(&self) -> String {
                 "test-identity".to_string()
+            }
+            fn data_converter(&self) -> &DataConverter {
+                &self.data_converter
             }
         }
 
@@ -1796,6 +1856,9 @@ mod tests {
                             name: "TestWorkflow".to_string(),
                         }),
                         task_queue: "test-queue".to_string(),
+                        memo: self.memo_payload.clone().map(|payload| ProtoMemo {
+                            fields: HashMap::from([("memo-key".to_owned(), payload)]),
+                        }),
                         ..Default::default()
                     })
                     .collect();
@@ -1823,6 +1886,8 @@ mod tests {
                 call_count: call_count.clone(),
                 page_size: 3,
                 total_workflows: 10,
+                data_converter: DataConverter::default(),
+                memo_payload: None,
             };
 
             let stream = client.list_workflows("", WorkflowListOptions::default());
@@ -1845,6 +1910,8 @@ mod tests {
                 call_count: call_count.clone(),
                 page_size: 3,
                 total_workflows: 10,
+                data_converter: DataConverter::default(),
+                memo_payload: None,
             };
 
             let opts = WorkflowListOptions::builder().limit(5).build();
@@ -1867,6 +1934,8 @@ mod tests {
                 call_count: call_count.clone(),
                 page_size: 10,
                 total_workflows: 100,
+                data_converter: DataConverter::default(),
+                memo_payload: None,
             };
 
             let opts = WorkflowListOptions::builder().limit(3).build();
@@ -1885,6 +1954,8 @@ mod tests {
                 call_count: call_count.clone(),
                 page_size: 10,
                 total_workflows: 0,
+                data_converter: DataConverter::default(),
+                memo_payload: None,
             };
 
             let stream = client.list_workflows("", WorkflowListOptions::default());
@@ -1892,6 +1963,41 @@ mod tests {
 
             assert_eq!(results.len(), 0);
             assert_eq!(call_count.load(Ordering::SeqCst), 1);
+        }
+
+        #[tokio::test]
+        async fn list_workflows_exposes_typed_memo() {
+            let data_converter = DataConverter::new(
+                PayloadConverter::default(),
+                DefaultFailureConverter,
+                XorCodec,
+            );
+            let memo_payload = data_converter
+                .to_payload(
+                    &SerializationContextData::Workflow,
+                    &"memo-value".to_owned(),
+                )
+                .await
+                .unwrap();
+            let client = MockListWorkflowsClient {
+                call_count: Arc::new(AtomicUsize::new(0)),
+                page_size: 1,
+                total_workflows: 1,
+                data_converter,
+                memo_payload: Some(memo_payload),
+            };
+
+            let workflow = client
+                .list_workflows("", WorkflowListOptions::default())
+                .next()
+                .await
+                .unwrap()
+                .unwrap();
+
+            assert_eq!(
+                workflow.memo().get::<String>("memo-key").unwrap(),
+                Some("memo-value".to_owned())
+            );
         }
     }
 }

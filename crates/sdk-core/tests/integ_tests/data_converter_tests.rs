@@ -953,8 +953,8 @@ async fn describe_decodes_workflow_payload_fields() {
         "Describe should have decoded response payloads"
     );
     assert_eq!(
-        desc.memo().unwrap().fields["tracked"],
-        "codec-describe".as_json_payload().unwrap()
+        desc.memo().get::<String>("tracked").unwrap(),
+        Some("codec-describe".to_owned())
     );
     let raw_user_metadata = desc
         .raw_description
@@ -1024,8 +1024,8 @@ async fn describe_decodes_user_metadata_with_ungated_xor_codec() {
         "Describe should have decoded response payloads"
     );
     assert_eq!(
-        desc.memo().unwrap().fields["tracked"],
-        "codec-describe".as_json_payload().unwrap()
+        desc.memo().get::<String>("tracked").unwrap(),
+        Some("codec-describe".to_owned())
     );
     // Making sure codec isn't used when decoding user metadata
     assert_eq!(desc.static_summary(), Some("codec summary"));
