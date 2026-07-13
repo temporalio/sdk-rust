@@ -18,8 +18,8 @@ use crate::{
         ExecuteWorkflowInput, ExecuteWorkflowResult, HandleQueryInput, HandleQueryResult,
         HandleSignalInput, HandleSignalResult, HandleUpdateInput, HandleUpdateResult,
         InitializeWorkflowInput, InitializeWorkflowOutput, SyncWorkflowInterceptorContext,
-        ValidateUpdateInput, ValidateUpdateResult, WorkflowInboundInterceptor,
-        WorkflowInterceptorContext, WorkflowInterceptorFuture, WorkflowNext,
+        ValidateUpdateInput, ValidateUpdateResult, WorkflowInterceptor, WorkflowInterceptorContext,
+        WorkflowInterceptorFactory, WorkflowInterceptorFuture, WorkflowNext,
         serialize_workflow_output, wrong_workflow_input_type,
     },
 };
@@ -59,7 +59,7 @@ pub struct GuestWorkflowInstance<W: WorkflowImplementation> {
     base_ctx: BaseWorkflowContext,
     ctx: WorkflowContext<W>,
     run_future: Fuse<LocalBoxFuture<'static, ExecuteWorkflowResult>>,
-    inbound_interceptors: Vec<Arc<dyn WorkflowInboundInterceptor>>,
+    interceptors: Vec<Arc<dyn WorkflowInterceptor>>,
     main_construction_polled: bool,
     next_routine_id: RoutineId,
     routines: HashMap<RoutineId, GuestRoutine>,
@@ -94,7 +94,7 @@ fn expect_resolution<T>(value: Option<T>) -> T {
 }
 
 fn call_initialize_workflow<'a>(
-    interceptors: &'a [Arc<dyn WorkflowInboundInterceptor>],
+    interceptors: &'a [Arc<dyn WorkflowInterceptor>],
     ctx: WorkflowContextView,
     input: InitializeWorkflowInput,
     next: WorkflowNext<'a, InitializeWorkflowInput, InitializeWorkflowOutput>,
@@ -112,7 +112,7 @@ fn call_initialize_workflow<'a>(
 }
 
 fn call_execute_workflow<'a>(
-    interceptors: &'a [Arc<dyn WorkflowInboundInterceptor>],
+    interceptors: &'a [Arc<dyn WorkflowInterceptor>],
     ctx: WorkflowInterceptorContext,
     input: ExecuteWorkflowInput,
     next: WorkflowNext<
@@ -134,7 +134,7 @@ fn call_execute_workflow<'a>(
 }
 
 fn call_handle_signal<'a>(
-    interceptors: &'a [Arc<dyn WorkflowInboundInterceptor>],
+    interceptors: &'a [Arc<dyn WorkflowInterceptor>],
     ctx: WorkflowInterceptorContext,
     input: HandleSignalInput,
     next: WorkflowNext<'a, HandleSignalInput, WorkflowInterceptorFuture<'a, HandleSignalResult>>,
@@ -152,7 +152,7 @@ fn call_handle_signal<'a>(
 }
 
 fn call_handle_update<'a>(
-    interceptors: &'a [Arc<dyn WorkflowInboundInterceptor>],
+    interceptors: &'a [Arc<dyn WorkflowInterceptor>],
     ctx: WorkflowInterceptorContext,
     input: HandleUpdateInput,
     next: WorkflowNext<'a, HandleUpdateInput, WorkflowInterceptorFuture<'a, HandleUpdateResult>>,
@@ -170,7 +170,7 @@ fn call_handle_update<'a>(
 }
 
 fn call_handle_query<'a>(
-    interceptors: &'a [Arc<dyn WorkflowInboundInterceptor>],
+    interceptors: &'a [Arc<dyn WorkflowInterceptor>],
     ctx: SyncWorkflowInterceptorContext,
     input: HandleQueryInput,
     next: WorkflowNext<'a, HandleQueryInput, HandleQueryResult>,
@@ -188,7 +188,7 @@ fn call_handle_query<'a>(
 }
 
 fn call_validate_update<'a>(
-    interceptors: &'a [Arc<dyn WorkflowInboundInterceptor>],
+    interceptors: &'a [Arc<dyn WorkflowInterceptor>],
     ctx: SyncWorkflowInterceptorContext,
     input: ValidateUpdateInput,
     next: WorkflowNext<'a, ValidateUpdateInput, ValidateUpdateResult>,
@@ -210,7 +210,7 @@ fn intercepted_execute_future<W>(
     base_ctx: BaseWorkflowContext,
     run_input: Option<<W::Run as WorkflowDefinition>::Input>,
     headers: HashMap<String, Payload>,
-    interceptors: Vec<Arc<dyn WorkflowInboundInterceptor>>,
+    interceptors: Vec<Arc<dyn WorkflowInterceptor>>,
 ) -> LocalBoxFuture<'static, ExecuteWorkflowResult>
 where
     W: WorkflowImplementation,
@@ -249,7 +249,7 @@ where
 fn intercepted_signal_future<W>(
     ctx: WorkflowContext<W>,
     base_ctx: BaseWorkflowContext,
-    interceptors: Vec<Arc<dyn WorkflowInboundInterceptor>>,
+    interceptors: Vec<Arc<dyn WorkflowInterceptor>>,
     input: HandleSignalInput,
 ) -> LocalBoxFuture<'static, HandleSignalResult>
 where
@@ -273,7 +273,7 @@ where
 fn intercepted_update_future<W>(
     ctx: WorkflowContext<W>,
     base_ctx: BaseWorkflowContext,
-    interceptors: Vec<Arc<dyn WorkflowInboundInterceptor>>,
+    interceptors: Vec<Arc<dyn WorkflowInterceptor>>,
     input: HandleUpdateInput,
 ) -> LocalBoxFuture<'static, HandleUpdateResult>
 where
@@ -310,8 +310,34 @@ where
         payloads: Vec<Payload>,
         converter: PayloadConverter,
         base_ctx: BaseWorkflowContext,
-        inbound_interceptors: Vec<Arc<dyn WorkflowInboundInterceptor>>,
+        interceptors: Vec<Arc<dyn WorkflowInterceptor>>,
     ) -> Result<Box<dyn WorkflowInstance>, PayloadConversionError> {
+        Self::instantiate_with_interceptor_provider(payloads, converter, base_ctx, move || {
+            interceptors
+        })
+    }
+
+    pub fn instantiate_with_interceptor_factories(
+        payloads: Vec<Payload>,
+        converter: PayloadConverter,
+        base_ctx: BaseWorkflowContext,
+        interceptor_factories: Vec<Arc<dyn WorkflowInterceptorFactory>>,
+    ) -> Result<Box<dyn WorkflowInstance>, PayloadConversionError> {
+        Self::instantiate_with_interceptor_provider(payloads, converter, base_ctx, move || {
+            interceptor_factories
+                .into_iter()
+                .flat_map(|factory| factory.create().into_inner())
+                .collect()
+        })
+    }
+
+    fn instantiate_with_interceptor_provider(
+        payloads: Vec<Payload>,
+        converter: PayloadConverter,
+        base_ctx: BaseWorkflowContext,
+        create_interceptors: impl FnOnce() -> Vec<Arc<dyn WorkflowInterceptor>>,
+    ) -> Result<Box<dyn WorkflowInstance>, PayloadConversionError> {
+        let interceptors = create_interceptors();
         let ser_ctx = SerializationContext {
             data: &SerializationContextData::Workflow,
             converter: &converter,
@@ -343,7 +369,7 @@ where
                 initialized_ref.replace(Some((W::init(init_view, input), headers)));
                 InitializeWorkflowOutput::new()
             });
-            let _ = call_initialize_workflow(&inbound_interceptors, view, input, next);
+            let _ = call_initialize_workflow(&interceptors, view, input, next);
             initialized
                 .into_inner()
                 .expect("workflow initialization interceptor must call next")
@@ -355,7 +381,7 @@ where
             base_ctx,
             run_input,
             headers,
-            inbound_interceptors,
+            interceptors,
         )))
     }
 
@@ -371,7 +397,7 @@ where
         workflow: W,
         base_ctx: BaseWorkflowContext,
         run_input: Option<<W::Run as WorkflowDefinition>::Input>,
-        inbound_interceptors: Vec<Arc<dyn WorkflowInboundInterceptor>>,
+        interceptors: Vec<Arc<dyn WorkflowInterceptor>>,
     ) -> Self {
         let headers = base_ctx.initial_headers();
         Self::new_with_workflow_interceptors_and_headers(
@@ -379,7 +405,7 @@ where
             base_ctx,
             run_input,
             headers,
-            inbound_interceptors,
+            interceptors,
         )
     }
 
@@ -388,8 +414,9 @@ where
         base_ctx: BaseWorkflowContext,
         run_input: Option<<W::Run as WorkflowDefinition>::Input>,
         headers: HashMap<String, Payload>,
-        inbound_interceptors: Vec<Arc<dyn WorkflowInboundInterceptor>>,
+        interceptors: Vec<Arc<dyn WorkflowInterceptor>>,
     ) -> Self {
+        base_ctx.set_workflow_interceptors(interceptors.clone());
         let workflow = Rc::new(RefCell::new(workflow));
         let ctx = WorkflowContext::from_base(base_ctx.clone(), workflow);
         let run_future = intercepted_execute_future::<W>(
@@ -397,14 +424,14 @@ where
             base_ctx.clone(),
             run_input,
             headers,
-            inbound_interceptors.clone(),
+            interceptors.clone(),
         )
         .fuse();
         Self {
             base_ctx,
             ctx,
             run_future,
-            inbound_interceptors,
+            interceptors,
             main_construction_polled: false,
             next_routine_id: MAIN_ROUTINE_ID + 1,
             routines: HashMap::new(),
@@ -521,7 +548,7 @@ where
                 let mut future = intercepted_signal_future::<W>(
                     self.ctx.clone(),
                     self.base_ctx.clone(),
-                    self.inbound_interceptors.clone(),
+                    self.interceptors.clone(),
                     input,
                 );
                 if let Some(result) = Self::poll_for_construction(&self.base_ctx, &mut future)? {
@@ -581,7 +608,7 @@ where
                 }
             };
             let validation_input =
-                ValidateUpdateInput::new(name.clone(), decoded_input, headers.clone());
+                ValidateUpdateInput::new(id.clone(), name.clone(), decoded_input, headers.clone());
             let validation_ctx = SyncWorkflowInterceptorContext::new(self.base_ctx.clone());
             let workflow_ctx = self.ctx.clone();
             let validation_next = WorkflowNext::new(move |input: ValidateUpdateInput| {
@@ -590,7 +617,7 @@ where
                 workflow_ctx.state(|wf| wf.validate_update(view, &name, input))
             });
             let validation = call_validate_update(
-                &self.inbound_interceptors,
+                &self.interceptors,
                 validation_ctx,
                 validation_input,
                 validation_next,
@@ -609,11 +636,11 @@ where
         let converter = self.ctx.payload_converter();
         let future = match W::decode_update_input(&name, payloads, converter) {
             Ok(Some(input)) => {
-                let input = HandleUpdateInput::new(name.clone(), input, headers);
+                let input = HandleUpdateInput::new(id.clone(), name.clone(), input, headers);
                 let mut future = intercepted_update_future::<W>(
                     self.ctx.clone(),
                     self.base_ctx.clone(),
-                    self.inbound_interceptors.clone(),
+                    self.interceptors.clone(),
                     input,
                 );
                 if let Some(result) = Self::poll_for_construction(&self.base_ctx, &mut future)? {
@@ -669,8 +696,12 @@ where
                 };
             }
         };
-        let query_input =
-            HandleQueryInput::new(query.query_type.clone(), decoded_input, query.headers);
+        let query_input = HandleQueryInput::new(
+            query.query_id,
+            query.query_type.clone(),
+            decoded_input,
+            query.headers,
+        );
         let interceptor_ctx = SyncWorkflowInterceptorContext::new(self.base_ctx.clone());
         let workflow_ctx = self.ctx.clone();
         let query_next = WorkflowNext::new(move |input: HandleQueryInput| {
@@ -679,16 +710,12 @@ where
             workflow_ctx.state(|wf| wf.dispatch_query(view, &name, input))
         });
         QueryResponse {
-            result: call_handle_query(
-                &self.inbound_interceptors,
-                interceptor_ctx,
-                query_input,
-                query_next,
-            )
-            .and_then(|output| {
-                serialize_workflow_output(output.as_ref(), converter).map_err(WorkflowError::from)
-            })
-            .map_err(|err| self.workflow_error_to_failure(err)),
+            result: call_handle_query(&self.interceptors, interceptor_ctx, query_input, query_next)
+                .and_then(|output| {
+                    serialize_workflow_output(output.as_ref(), converter)
+                        .map_err(WorkflowError::from)
+                })
+                .map_err(|err| self.workflow_error_to_failure(err)),
         }
     }
 
@@ -1048,7 +1075,7 @@ pub fn instantiate_workflow_with_interceptors<W: WorkflowImplementation>(
     payloads: Vec<Payload>,
     converter: PayloadConverter,
     base_ctx: BaseWorkflowContext,
-    inbound_interceptors: Vec<Arc<dyn WorkflowInboundInterceptor>>,
+    interceptors: Vec<Arc<dyn WorkflowInterceptor>>,
 ) -> Result<Box<dyn WorkflowInstance>, PayloadConversionError>
 where
     <W::Run as WorkflowDefinition>::Input: Send,
@@ -1057,19 +1084,43 @@ where
         payloads,
         converter,
         base_ctx,
-        inbound_interceptors,
+        interceptors,
+    )
+}
+
+pub fn instantiate_workflow_with_interceptor_factories<W: WorkflowImplementation>(
+    payloads: Vec<Payload>,
+    converter: PayloadConverter,
+    base_ctx: BaseWorkflowContext,
+    interceptor_factories: Vec<Arc<dyn WorkflowInterceptorFactory>>,
+) -> Result<Box<dyn WorkflowInstance>, PayloadConversionError>
+where
+    <W::Run as WorkflowDefinition>::Input: Send,
+{
+    GuestWorkflowInstance::<W>::instantiate_with_interceptor_factories(
+        payloads,
+        converter,
+        base_ctx,
+        interceptor_factories,
     )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::runtime::host::WorkflowHost;
-    use std::{rc::Rc, task::Waker};
+    use crate::{runtime::host::WorkflowHost, workflow_interceptors::WorkflowInterceptors};
+    use std::{
+        rc::Rc,
+        sync::atomic::{AtomicUsize, Ordering},
+        task::Waker,
+    };
     use temporalio_common_wasm::{
-        data_converters::DataConverter,
-        protos::coresdk::{
-            workflow_activation::InitializeWorkflow, workflow_commands::WorkflowCommand,
+        data_converters::{DataConverter, TemporalDeserializable, TemporalSerializable},
+        protos::{
+            coresdk::{
+                workflow_activation::InitializeWorkflow, workflow_commands::WorkflowCommand,
+            },
+            temporal::api::common::v1::Payload,
         },
     };
     use temporalio_macros::{workflow, workflow_methods};
@@ -1095,6 +1146,46 @@ mod tests {
         }
     }
 
+    struct FailingInput;
+
+    impl TemporalSerializable for FailingInput {}
+    impl TemporalDeserializable for FailingInput {}
+
+    #[workflow]
+    #[derive(Default)]
+    struct DecodeFailureWorkflow;
+
+    #[workflow_methods]
+    impl DecodeFailureWorkflow {
+        #[run]
+        async fn run(
+            _ctx: &mut WorkflowContext<Self>,
+            _input: FailingInput,
+        ) -> crate::WorkflowResult<()> {
+            unreachable!("workflow execution must not start when its input cannot be decoded")
+        }
+    }
+
+    struct CountingExecuteInterceptor {
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl WorkflowInterceptor for CountingExecuteInterceptor {
+        fn execute<'a>(
+            &'a self,
+            _ctx: WorkflowInterceptorContext,
+            input: ExecuteWorkflowInput,
+            next: WorkflowNext<
+                'a,
+                ExecuteWorkflowInput,
+                WorkflowInterceptorFuture<'a, ExecuteWorkflowResult>,
+            >,
+        ) -> WorkflowInterceptorFuture<'a, ExecuteWorkflowResult> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            next.run(input)
+        }
+    }
+
     #[test]
     fn forced_failure_set_during_ready_poll_wins_over_completion() {
         let base_ctx = BaseWorkflowContext::from_raw(
@@ -1109,6 +1200,7 @@ mod tests {
             Rc::new(NoopHost),
             None,
         );
+
         let mut instance = GuestWorkflowInstance::<ForcedFailureWorkflow>::new_with_workflow(
             ForcedFailureWorkflow,
             base_ctx,
@@ -1125,5 +1217,43 @@ mod tests {
             panic!("expected a workflow task failure, got {result:?}");
         };
         assert_eq!(failure.failure.message, "forced failure");
+    }
+
+    #[test]
+    fn interceptor_factories_run_before_workflow_input_decoding() {
+        let factory_calls = Arc::new(AtomicUsize::new(0));
+        let execute_calls = Arc::new(AtomicUsize::new(0));
+        let factory_calls_ref = factory_calls.clone();
+        let execute_calls_ref = execute_calls.clone();
+        let factory: Arc<dyn WorkflowInterceptorFactory> = Arc::new(move || {
+            factory_calls_ref.fetch_add(1, Ordering::Relaxed);
+            WorkflowInterceptors::new().with_interceptor(CountingExecuteInterceptor {
+                calls: execute_calls_ref.clone(),
+            })
+        });
+        let base_ctx = BaseWorkflowContext::from_raw(
+            "default".to_string(),
+            "task-queue".to_string(),
+            "run-id".to_string(),
+            InitializeWorkflow {
+                workflow_type: DecodeFailureWorkflow::name().to_string(),
+                ..Default::default()
+            },
+            DataConverter::default(),
+            Rc::new(NoopHost),
+            None,
+        );
+
+        let result =
+            GuestWorkflowInstance::<DecodeFailureWorkflow>::instantiate_with_interceptor_factories(
+                vec![Payload::default()],
+                PayloadConverter::default(),
+                base_ctx,
+                vec![factory],
+            );
+
+        assert!(result.is_err());
+        assert_eq!(factory_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(execute_calls.load(Ordering::Relaxed), 0);
     }
 }

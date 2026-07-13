@@ -33,7 +33,7 @@ impl ContinueAsNewWf {
     async fn run(ctx: &mut WorkflowContext<Self>, run_ct: u8) -> WorkflowResult<()> {
         ctx.timer(Duration::from_millis(500)).await;
         if run_ct < 5 {
-            ctx.continue_as_new(&(run_ct + 1), ContinueAsNewOptions::default())?;
+            ctx.continue_as_new(run_ct + 1, ContinueAsNewOptions::default())?;
         }
         Ok(())
     }
@@ -145,7 +145,7 @@ impl ContinueAsNewSuggestedWf {
         // Second WFT: flag should be true (set on WFT started event 8)
         assert!(ctx.continue_as_new_suggested());
         assert!(ctx.target_worker_deployment_version_changed());
-        ctx.continue_as_new(&(), ContinueAsNewOptions::default())?;
+        ctx.continue_as_new((), ContinueAsNewOptions::default())?;
         Ok(())
     }
 }
@@ -182,7 +182,7 @@ impl ClearSearchAttrsOnContinueAsNewWf {
         if first_run {
             let mut opts = ContinueAsNewOptions::default();
             opts.search_attributes = Some(SearchAttributes::default());
-            ctx.continue_as_new(&false, opts)?;
+            ctx.continue_as_new(false, opts)?;
         }
 
         assert!(ctx.search_attributes().is_empty());

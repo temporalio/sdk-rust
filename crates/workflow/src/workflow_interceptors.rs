@@ -1,28 +1,45 @@
 //! Workflow interceptor APIs.
 
 use crate::{
-    BaseWorkflowContext, WorkflowContextView,
+    ActivityOptions, BaseWorkflowContext, CancellableFuture, CancellableFutureWithReason,
+    ChildWorkflowOptions, ContinueAsNewOptions, ExternalWorkflowHandle, LocalActivityOptions,
+    NexusOperationOptions, StartChildWorkflowOutput, StartedChildWorkflow, StartedNexusOperation,
+    TimerOptions, WorkflowContextView,
     runtime::{
         entry::WorkflowError,
-        model::{WorkflowResult, WorkflowTermination},
+        model::{
+            CancelExternalWfResult, NexusStartResult, TimerResult, WorkflowResult,
+            WorkflowTermination,
+        },
     },
 };
-use futures_util::{FutureExt, future::LocalBoxFuture};
+use futures_util::{
+    FutureExt,
+    future::{Fuse, FusedFuture, LocalBoxFuture, Shared},
+};
 use std::{
     any::Any,
     collections::HashMap,
+    convert::Infallible,
     future::Future,
     marker::PhantomData,
     pin::Pin,
+    rc::Rc,
+    sync::Arc,
     task::{Context, Poll},
     time::SystemTime,
 };
 use temporalio_common_wasm::{
+    ActivityDefinition, WorkflowDefinition,
     data_converters::{
         GenericPayloadConverter, PayloadConversionError, PayloadConverter, SerializationContext,
-        SerializationContextData, TemporalSerializable,
+        SerializationContextData, TemporalDeserializable, TemporalSerializable,
     },
-    protos::temporal::api::common::v1::Payload,
+    error::{
+        ActivityExecutionError, ChildWorkflowExecutionError, ChildWorkflowStartError,
+        WorkflowSignalError,
+    },
+    protos::temporal::api::{common::v1::Payload, failure::v1::Failure},
     search_attributes::SearchAttributes,
 };
 
@@ -108,7 +125,7 @@ pub type ValidateUpdateResult = Result<(), WorkflowError>;
 ///
 /// The SDK polls a newly created interceptor future once while processing its activation. This
 /// runs synchronous interceptor and synchronous handler work through the first genuine
-/// [`Poll::Pending`](std::task::Poll::Pending). Async workflow and handler bodies are not entered
+/// [`Poll::Pending`]. Async workflow and handler bodies are not entered
 /// until normal routine polling. Awaiting a pending workflow future before calling
 /// [`WorkflowNext::run`] intentionally delays the underlying handler.
 ///
@@ -215,6 +232,70 @@ impl WorkflowInterceptorContext {
     pub fn payload_converter(&self) -> &PayloadConverter {
         self.base.payload_converter()
     }
+
+    /// Request to create a timer through the workflow outbound interceptor chain.
+    pub fn timer<T: Into<TimerOptions>>(
+        &self,
+        opts: T,
+    ) -> impl CancellableFuture<TimerResult> + use<T> {
+        self.base.timer(opts)
+    }
+
+    /// Request to run an activity through the workflow outbound interceptor chain.
+    pub fn start_activity<AD: ActivityDefinition>(
+        &self,
+        activity: AD,
+        input: impl Into<AD::Input>,
+        opts: ActivityOptions,
+    ) -> impl CancellableFuture<Result<AD::Output, ActivityExecutionError>>
+    where
+        AD::Output: TemporalDeserializable,
+    {
+        self.base.execute_activity(activity, input, opts)
+    }
+
+    /// Request to run a local activity through the workflow outbound interceptor chain.
+    pub fn start_local_activity<AD: ActivityDefinition>(
+        &self,
+        activity: AD,
+        input: impl Into<AD::Input>,
+        opts: LocalActivityOptions,
+    ) -> impl CancellableFuture<Result<AD::Output, ActivityExecutionError>>
+    where
+        AD::Output: TemporalDeserializable,
+    {
+        self.base.execute_local_activity(activity, input, opts)
+    }
+
+    /// Start a child workflow through the workflow outbound interceptor chain.
+    pub fn start_child_workflow<WD: WorkflowDefinition + 'static>(
+        &self,
+        workflow: WD,
+        input: impl Into<WD::Input>,
+        opts: ChildWorkflowOptions,
+    ) -> impl CancellableFutureWithReason<Result<StartedChildWorkflow<WD>, ChildWorkflowStartError>>
+    where
+        WD::Output: TemporalDeserializable,
+    {
+        self.base.start_child_workflow(workflow, input, opts)
+    }
+
+    /// Get a handle to an external workflow for signaling or requesting cancellation.
+    pub fn external_workflow(
+        &self,
+        workflow_id: impl Into<String>,
+        run_id: Option<String>,
+    ) -> ExternalWorkflowHandle {
+        self.base.external_workflow(workflow_id, run_id)
+    }
+
+    /// Start a Nexus operation through the workflow outbound interceptor chain.
+    pub fn start_nexus_operation(
+        &self,
+        opts: NexusOperationOptions,
+    ) -> impl CancellableFuture<NexusStartResult> {
+        self.base.start_nexus_operation(opts)
+    }
 }
 
 /// Workflow execution context available to sync-only inbound interceptors.
@@ -315,7 +396,7 @@ impl DecodedInput {
     }
 }
 
-/// Input passed to [`WorkflowInboundInterceptor::initialize_workflow`].
+/// Input passed to [`WorkflowInterceptor::initialize_workflow`].
 ///
 /// The decoded input is present when the workflow's `#[init]` method accepts the workflow start
 /// input.
@@ -367,11 +448,11 @@ impl InitializeWorkflowOutput {
     }
 }
 
-/// Input passed to [`WorkflowInboundInterceptor::execute`].
+/// Input passed to [`WorkflowInterceptor::execute`].
 ///
 /// The decoded input is present when the workflow's `#[run]` method accepts the workflow start
 /// input. Inputs consumed by `#[init]` are instead passed to
-/// [`WorkflowInboundInterceptor::initialize_workflow`].
+/// [`WorkflowInterceptor::initialize_workflow`].
 #[non_exhaustive]
 pub struct ExecuteWorkflowInput {
     decoded: DecodedInput,
@@ -410,21 +491,24 @@ impl ExecuteWorkflowInput {
 }
 
 macro_rules! handler_input {
-    ($name:ident, $doc:literal, $field:ident, $field_doc:literal) => {
+    ($name:ident, $doc:literal, $field:ident, $field_doc:literal $(, $id_field:ident, $id_doc:literal)?) => {
         #[doc = $doc]
         #[non_exhaustive]
         pub struct $name {
+            $($id_field: String,)?
             $field: String,
             decoded: DecodedInput,
         }
 
         impl $name {
             pub(crate) fn new(
+                $($id_field: String,)?
                 $field: String,
                 value: Box<dyn Any>,
                 headers: HashMap<String, Payload>,
             ) -> Self {
                 Self {
+                    $($id_field,)?
                     $field,
                     decoded: DecodedInput::new(Some(value), headers),
                 }
@@ -443,6 +527,13 @@ macro_rules! handler_input {
             pub fn name(&self) -> &str {
                 &self.$field
             }
+
+            $(
+                #[doc = $id_doc]
+                pub fn id(&self) -> &str {
+                    &self.$id_field
+                }
+            )?
 
             /// Attempt to access the decoded input as a concrete type.
             pub fn input_ref<T: Any>(&self) -> Option<&T> {
@@ -469,39 +560,46 @@ macro_rules! handler_input {
 
 handler_input!(
     HandleSignalInput,
-    "Input passed to [`WorkflowInboundInterceptor::handle_signal`].",
+    "Input passed to [`WorkflowInterceptor::handle_signal`].",
     signal_name,
     "Return the signal name."
 );
 
 handler_input!(
     HandleUpdateInput,
-    "Input passed to [`WorkflowInboundInterceptor::handle_update`].",
+    "Input passed to [`WorkflowInterceptor::handle_update`].",
     update_name,
-    "Return the update name."
+    "Return the update name.",
+    update_id,
+    "Return the update ID."
 );
 
 handler_input!(
     HandleQueryInput,
-    "Input passed to [`WorkflowInboundInterceptor::handle_query`].",
+    "Input passed to [`WorkflowInterceptor::handle_query`].",
     query_name,
-    "Return the query name."
+    "Return the query name.",
+    query_id,
+    "Return the query ID."
 );
 
-/// Input passed to [`WorkflowInboundInterceptor::validate_update`].
+/// Input passed to [`WorkflowInterceptor::validate_update`].
 #[non_exhaustive]
 pub struct ValidateUpdateInput {
+    update_id: String,
     update_name: String,
     decoded: DecodedInput,
 }
 
 impl ValidateUpdateInput {
     pub(crate) fn new(
+        update_id: String,
         update_name: String,
         value: Box<dyn Any>,
         headers: HashMap<String, Payload>,
     ) -> Self {
         Self {
+            update_id,
             update_name,
             decoded: DecodedInput::new(Some(value), headers),
         }
@@ -519,6 +617,11 @@ impl ValidateUpdateInput {
     /// Return the update name.
     pub fn name(&self) -> &str {
         &self.update_name
+    }
+
+    /// Return the update ID.
+    pub fn id(&self) -> &str {
+        &self.update_id
     }
 
     /// Attempt to access the decoded input as a concrete type.
@@ -542,8 +645,636 @@ impl ValidateUpdateInput {
     }
 }
 
-/// Inbound interceptor for workflow execution and message handlers.
-pub trait WorkflowInboundInterceptor: Send + Sync + 'static {
+/// Type-erased output returned by an intercepted outbound workflow call.
+pub trait WorkflowOutboundValue: Any {
+    /// Access the concrete value through [`Any`].
+    fn as_any(&self) -> &dyn Any;
+
+    /// Convert this value into [`Any`] for a consuming downcast.
+    fn into_any(self: Box<Self>) -> Box<dyn Any>;
+}
+
+impl<T: Any> WorkflowOutboundValue for T {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn into_any(self: Box<Self>) -> Box<dyn Any> {
+        self
+    }
+}
+
+impl dyn WorkflowOutboundValue {
+    /// Attempt to access the output as a concrete type.
+    pub fn downcast_ref<T: Any>(&self) -> Option<&T> {
+        self.as_any().downcast_ref()
+    }
+
+    /// Attempt to convert the output into a concrete type.
+    pub fn downcast<T: Any>(self: Box<Self>) -> Result<Box<T>, Box<dyn Any>> {
+        self.into_any().downcast()
+    }
+}
+
+/// Future returned by a non-cancellable outbound interceptor operation.
+pub struct WorkflowOutboundFuture<T> {
+    state: WorkflowOutboundFutureState<T>,
+}
+
+enum WorkflowOutboundFutureState<T> {
+    Running(Fuse<LocalBoxFuture<'static, T>>),
+    Prefetched(Option<T>),
+    Terminated,
+}
+
+impl<T> WorkflowOutboundFuture<T> {
+    /// Create an outbound future.
+    pub fn new(future: impl Future<Output = T> + 'static) -> Self {
+        Self {
+            state: WorkflowOutboundFutureState::Running(future.boxed_local().fuse()),
+        }
+    }
+
+    /// Create an immediately ready outbound future.
+    pub fn ready(value: T) -> Self
+    where
+        T: 'static,
+    {
+        Self::new(async move { value })
+    }
+
+    /// Transform the result of this future.
+    pub fn map<U>(self, map: impl FnOnce(T) -> U + 'static) -> WorkflowOutboundFuture<U>
+    where
+        T: 'static,
+        U: 'static,
+    {
+        WorkflowOutboundFuture::new(async move { map(self.await) })
+    }
+
+    pub(crate) fn into_shared(self) -> Shared<LocalBoxFuture<'static, T>>
+    where
+        T: Clone + 'static,
+    {
+        self.boxed_local().shared()
+    }
+
+    pub(crate) fn poll_for_construction(&mut self, cx: &mut Context<'_>) {
+        let WorkflowOutboundFutureState::Running(future) = &mut self.state else {
+            return;
+        };
+        if let Poll::Ready(value) = future.poll_unpin(cx) {
+            self.state = WorkflowOutboundFutureState::Prefetched(Some(value));
+        }
+    }
+}
+
+impl<T> Unpin for WorkflowOutboundFuture<T> {}
+
+impl<T> Future for WorkflowOutboundFuture<T> {
+    type Output = T;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        match &mut self.state {
+            WorkflowOutboundFutureState::Running(future) => {
+                let result = future.poll_unpin(cx);
+                if result.is_ready() {
+                    self.state = WorkflowOutboundFutureState::Terminated;
+                }
+                result
+            }
+            WorkflowOutboundFutureState::Prefetched(value) => {
+                let value = value
+                    .take()
+                    .expect("outbound future polled after completion");
+                self.state = WorkflowOutboundFutureState::Terminated;
+                Poll::Ready(value)
+            }
+            WorkflowOutboundFutureState::Terminated => {
+                panic!("outbound future polled after completion")
+            }
+        }
+    }
+}
+
+impl<T> FusedFuture for WorkflowOutboundFuture<T> {
+    fn is_terminated(&self) -> bool {
+        matches!(self.state, WorkflowOutboundFutureState::Terminated)
+    }
+}
+
+/// Cancellation callback retained when an interceptor wraps an operation future.
+#[derive(Clone)]
+pub struct WorkflowCancellationHandle {
+    cancel: Rc<dyn Fn(Option<String>)>,
+}
+
+impl WorkflowCancellationHandle {
+    /// Create a cancellation handle.
+    pub fn new(cancel: impl Fn(Option<String>) + 'static) -> Self {
+        Self {
+            cancel: Rc::new(cancel),
+        }
+    }
+
+    pub(crate) fn noop() -> Self {
+        Self::new(|_| {})
+    }
+
+    /// Cancel without a reason.
+    pub fn cancel(&self) {
+        (self.cancel)(None);
+    }
+
+    /// Cancel with a reason.
+    pub fn cancel_with_reason(&self, reason: String) {
+        (self.cancel)(Some(reason));
+    }
+}
+
+/// Future returned by a cancellable outbound interceptor operation.
+pub struct CancellableWorkflowOutboundFuture<T> {
+    inner: WorkflowOutboundFuture<T>,
+    cancellation: WorkflowCancellationHandle,
+}
+
+impl<T> CancellableWorkflowOutboundFuture<T> {
+    /// Create a cancellable outbound future.
+    pub fn new(
+        future: impl Future<Output = T> + 'static,
+        cancellation: WorkflowCancellationHandle,
+    ) -> Self {
+        Self {
+            inner: WorkflowOutboundFuture::new(future),
+            cancellation,
+        }
+    }
+
+    /// Return the operation's cancellation handle.
+    pub fn cancellation_handle(&self) -> WorkflowCancellationHandle {
+        self.cancellation.clone()
+    }
+
+    /// Transform the result while retaining cancellation behavior.
+    pub fn map<U>(self, map: impl FnOnce(T) -> U + 'static) -> CancellableWorkflowOutboundFuture<U>
+    where
+        T: 'static,
+        U: 'static,
+    {
+        let cancellation = self.cancellation.clone();
+        CancellableWorkflowOutboundFuture::new(async move { map(self.await) }, cancellation)
+    }
+
+    pub(crate) fn poll_for_construction(&mut self, cx: &mut Context<'_>) {
+        self.inner.poll_for_construction(cx);
+    }
+}
+
+impl<T> Unpin for CancellableWorkflowOutboundFuture<T> {}
+
+impl<T> Future for CancellableWorkflowOutboundFuture<T> {
+    type Output = T;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        Pin::new(&mut self.inner).poll(cx)
+    }
+}
+
+impl<T> FusedFuture for CancellableWorkflowOutboundFuture<T> {
+    fn is_terminated(&self) -> bool {
+        self.inner.is_terminated()
+    }
+}
+
+impl<T> CancellableFuture<T> for CancellableWorkflowOutboundFuture<T> {
+    fn cancel(&self) {
+        self.cancellation.cancel();
+    }
+}
+
+impl<T> CancellableFutureWithReason<T> for CancellableWorkflowOutboundFuture<T> {
+    fn cancel_with_reason(&self, reason: String) {
+        self.cancellation.cancel_with_reason(reason);
+    }
+}
+
+macro_rules! typed_outbound_input {
+    ($name:ident) => {
+        impl $name {
+            /// Attempt to access the decoded input as a concrete type.
+            pub fn input_ref<T: Any>(&self) -> Option<&T> {
+                self.decoded.input_ref()
+            }
+
+            /// Attempt to mutably access the decoded input as a concrete type.
+            pub fn input_mut<T: Any>(&mut self) -> Option<&mut T> {
+                self.decoded.input_mut()
+            }
+
+            /// Headers attached to this outbound call.
+            pub fn headers(&self) -> &HashMap<String, Payload> {
+                self.decoded.headers()
+            }
+
+            /// Mutably access headers attached to this outbound call.
+            pub fn headers_mut(&mut self) -> &mut HashMap<String, Payload> {
+                self.decoded.headers_mut()
+            }
+        }
+    };
+}
+
+/// Input passed to [`WorkflowInterceptor::start_timer`].
+#[non_exhaustive]
+pub struct StartTimerInput {
+    options: TimerOptions,
+}
+
+impl StartTimerInput {
+    pub(crate) fn new(options: TimerOptions) -> Self {
+        Self { options }
+    }
+
+    pub(crate) fn into_options(self) -> TimerOptions {
+        self.options
+    }
+
+    /// Timer options.
+    pub fn options(&self) -> &TimerOptions {
+        &self.options
+    }
+
+    /// Mutably access timer options.
+    pub fn options_mut(&mut self) -> &mut TimerOptions {
+        &mut self.options
+    }
+}
+
+/// Input passed to [`WorkflowInterceptor::schedule_activity`].
+#[non_exhaustive]
+pub struct ScheduleActivityInput {
+    activity_type: String,
+    decoded: DecodedInput,
+    options: ActivityOptions,
+}
+
+impl ScheduleActivityInput {
+    pub(crate) fn new(
+        activity_type: String,
+        input: Box<dyn Any>,
+        options: ActivityOptions,
+    ) -> Self {
+        Self {
+            activity_type,
+            decoded: DecodedInput::new(Some(input), HashMap::new()),
+            options,
+        }
+    }
+
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        String,
+        Box<dyn Any>,
+        HashMap<String, Payload>,
+        ActivityOptions,
+    ) {
+        let (input, headers) = self.decoded.into_parts();
+        (
+            self.activity_type,
+            input.expect("activity input must exist"),
+            headers,
+            self.options,
+        )
+    }
+
+    /// Activity type.
+    pub fn activity_type(&self) -> &str {
+        &self.activity_type
+    }
+
+    /// Mutably access the activity type.
+    pub fn activity_type_mut(&mut self) -> &mut String {
+        &mut self.activity_type
+    }
+
+    /// Activity options.
+    pub fn options(&self) -> &ActivityOptions {
+        &self.options
+    }
+
+    /// Mutably access activity options.
+    pub fn options_mut(&mut self) -> &mut ActivityOptions {
+        &mut self.options
+    }
+}
+
+typed_outbound_input!(ScheduleActivityInput);
+
+/// Input passed to [`WorkflowInterceptor::schedule_local_activity`].
+#[non_exhaustive]
+pub struct ScheduleLocalActivityInput {
+    activity_type: String,
+    decoded: DecodedInput,
+    options: LocalActivityOptions,
+}
+
+impl ScheduleLocalActivityInput {
+    pub(crate) fn new(
+        activity_type: String,
+        input: Box<dyn Any>,
+        options: LocalActivityOptions,
+    ) -> Self {
+        Self {
+            activity_type,
+            decoded: DecodedInput::new(Some(input), HashMap::new()),
+            options,
+        }
+    }
+
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        String,
+        Box<dyn Any>,
+        HashMap<String, Payload>,
+        LocalActivityOptions,
+    ) {
+        let (input, headers) = self.decoded.into_parts();
+        (
+            self.activity_type,
+            input.expect("local activity input must exist"),
+            headers,
+            self.options,
+        )
+    }
+
+    /// Activity type.
+    pub fn activity_type(&self) -> &str {
+        &self.activity_type
+    }
+
+    /// Mutably access the activity type.
+    pub fn activity_type_mut(&mut self) -> &mut String {
+        &mut self.activity_type
+    }
+
+    /// Local activity options.
+    pub fn options(&self) -> &LocalActivityOptions {
+        &self.options
+    }
+
+    /// Mutably access local activity options.
+    pub fn options_mut(&mut self) -> &mut LocalActivityOptions {
+        &mut self.options
+    }
+}
+
+typed_outbound_input!(ScheduleLocalActivityInput);
+
+/// Input passed to [`WorkflowInterceptor::start_child_workflow`].
+#[non_exhaustive]
+pub struct StartChildWorkflowInput {
+    workflow_type: String,
+    decoded: DecodedInput,
+    options: ChildWorkflowOptions,
+}
+
+impl StartChildWorkflowInput {
+    pub(crate) fn new(
+        workflow_type: String,
+        input: Box<dyn Any>,
+        options: ChildWorkflowOptions,
+    ) -> Self {
+        Self {
+            workflow_type,
+            decoded: DecodedInput::new(Some(input), HashMap::new()),
+            options,
+        }
+    }
+
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        String,
+        Box<dyn Any>,
+        HashMap<String, Payload>,
+        ChildWorkflowOptions,
+    ) {
+        let (input, headers) = self.decoded.into_parts();
+        (
+            self.workflow_type,
+            input.expect("child workflow input must exist"),
+            headers,
+            self.options,
+        )
+    }
+
+    /// Workflow type.
+    pub fn workflow_type(&self) -> &str {
+        &self.workflow_type
+    }
+
+    /// Mutably access the workflow type.
+    pub fn workflow_type_mut(&mut self) -> &mut String {
+        &mut self.workflow_type
+    }
+
+    /// Child workflow options.
+    pub fn options(&self) -> &ChildWorkflowOptions {
+        &self.options
+    }
+
+    /// Mutably access child workflow options.
+    pub fn options_mut(&mut self) -> &mut ChildWorkflowOptions {
+        &mut self.options
+    }
+}
+
+typed_outbound_input!(StartChildWorkflowInput);
+
+/// Workflow targeted by an outbound signal.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum SignalWorkflowTarget {
+    /// A child workflow identified by workflow ID.
+    Child {
+        /// Child workflow ID.
+        workflow_id: String,
+    },
+    /// An external workflow execution.
+    External {
+        /// Target namespace.
+        namespace: String,
+        /// Target workflow ID.
+        workflow_id: String,
+        /// Target run ID, or the latest run when absent.
+        run_id: Option<String>,
+    },
+}
+
+/// Input passed to [`WorkflowInterceptor::signal_workflow`].
+#[non_exhaustive]
+pub struct SignalWorkflowInput {
+    signal_name: String,
+    target: SignalWorkflowTarget,
+    decoded: DecodedInput,
+}
+
+impl SignalWorkflowInput {
+    pub(crate) fn new(
+        signal_name: String,
+        target: SignalWorkflowTarget,
+        input: Box<dyn Any>,
+    ) -> Self {
+        Self {
+            signal_name,
+            target,
+            decoded: DecodedInput::new(Some(input), HashMap::new()),
+        }
+    }
+
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        String,
+        SignalWorkflowTarget,
+        Box<dyn Any>,
+        HashMap<String, Payload>,
+    ) {
+        let (input, headers) = self.decoded.into_parts();
+        (
+            self.signal_name,
+            self.target,
+            input.expect("signal input must exist"),
+            headers,
+        )
+    }
+
+    /// Signal name.
+    pub fn signal_name(&self) -> &str {
+        &self.signal_name
+    }
+
+    /// Mutably access the signal name.
+    pub fn signal_name_mut(&mut self) -> &mut String {
+        &mut self.signal_name
+    }
+
+    /// Signal target.
+    pub fn target(&self) -> &SignalWorkflowTarget {
+        &self.target
+    }
+
+    /// Mutably access the signal target.
+    pub fn target_mut(&mut self) -> &mut SignalWorkflowTarget {
+        &mut self.target
+    }
+}
+
+typed_outbound_input!(SignalWorkflowInput);
+
+/// Input passed to [`WorkflowInterceptor::cancel_external_workflow`].
+#[derive(Clone, Debug)]
+#[non_exhaustive]
+pub struct CancelExternalWorkflowInput {
+    /// Target workflow ID.
+    pub workflow_id: String,
+    /// Target run ID, or the latest run when absent.
+    pub run_id: Option<String>,
+    /// Cancellation reason.
+    pub reason: Option<String>,
+}
+
+/// Input passed to [`WorkflowInterceptor::continue_as_new`].
+#[non_exhaustive]
+pub struct ContinueAsNewInput {
+    decoded: DecodedInput,
+    options: ContinueAsNewOptions,
+}
+
+impl ContinueAsNewInput {
+    pub(crate) fn new(input: Box<dyn Any>, options: ContinueAsNewOptions) -> Self {
+        Self {
+            decoded: DecodedInput::new(Some(input), HashMap::new()),
+            options,
+        }
+    }
+
+    pub(crate) fn into_parts(
+        self,
+    ) -> (Box<dyn Any>, HashMap<String, Payload>, ContinueAsNewOptions) {
+        let (input, headers) = self.decoded.into_parts();
+        (
+            input.expect("continue-as-new input must exist"),
+            headers,
+            self.options,
+        )
+    }
+
+    /// Continue-as-new options.
+    pub fn options(&self) -> &ContinueAsNewOptions {
+        &self.options
+    }
+
+    /// Mutably access continue-as-new options.
+    pub fn options_mut(&mut self) -> &mut ContinueAsNewOptions {
+        &mut self.options
+    }
+}
+
+typed_outbound_input!(ContinueAsNewInput);
+
+/// Input passed to [`WorkflowInterceptor::start_nexus_operation`].
+#[non_exhaustive]
+pub struct StartNexusOperationInput {
+    options: NexusOperationOptions,
+}
+
+impl StartNexusOperationInput {
+    pub(crate) fn new(options: NexusOperationOptions) -> Self {
+        Self { options }
+    }
+
+    pub(crate) fn into_options(self) -> NexusOperationOptions {
+        self.options
+    }
+
+    /// Nexus operation options.
+    pub fn options(&self) -> &NexusOperationOptions {
+        &self.options
+    }
+
+    /// Mutably access Nexus operation options.
+    pub fn options_mut(&mut self) -> &mut NexusOperationOptions {
+        &mut self.options
+    }
+}
+
+/// Result of an intercepted activity call.
+pub type ScheduleActivityResult = Result<Box<dyn WorkflowOutboundValue>, ActivityExecutionError>;
+
+/// Result of an intercepted child workflow completion.
+pub type ChildWorkflowOutboundResult =
+    Result<Box<dyn WorkflowOutboundValue>, ChildWorkflowExecutionError>;
+
+/// Result of an intercepted signal call.
+pub type SignalWorkflowResult = Result<(), WorkflowSignalError>;
+
+/// Result of an intercepted child workflow start.
+pub type StartChildWorkflowResult = Result<StartChildWorkflowOutput, ChildWorkflowStartError>;
+
+/// Result of an intercepted Nexus operation start.
+pub type StartNexusOperationResult = Result<StartedNexusOperation, Failure>;
+
+/// Result of an intercepted continue-as-new call.
+pub type ContinueAsNewResult = Result<Infallible, WorkflowTermination>;
+
+/// Interceptor for inbound and outbound workflow calls.
+///
+/// Every method forwards to `next` by default, so implementations only need to override the
+/// operations they intercept.
+pub trait WorkflowInterceptor: 'static {
     /// Called to invoke the workflow's `#[init]` method.
     ///
     /// It is only called for workflows that define `#[init]`, before the workflow instance exists.
@@ -616,6 +1347,245 @@ pub trait WorkflowInboundInterceptor: Send + Sync + 'static {
         next: WorkflowNext<'_, ValidateUpdateInput, ValidateUpdateResult>,
     ) -> ValidateUpdateResult {
         next.run(input)
+    }
+
+    /// Called when the workflow starts a timer.
+    fn start_timer(
+        &self,
+        _ctx: WorkflowInterceptorContext,
+        input: StartTimerInput,
+        next: WorkflowNext<
+            'static,
+            StartTimerInput,
+            CancellableWorkflowOutboundFuture<TimerResult>,
+        >,
+    ) -> CancellableWorkflowOutboundFuture<TimerResult> {
+        next.run(input)
+    }
+
+    /// Called when the workflow schedules an activity.
+    fn schedule_activity(
+        &self,
+        _ctx: WorkflowInterceptorContext,
+        input: ScheduleActivityInput,
+        next: WorkflowNext<
+            'static,
+            ScheduleActivityInput,
+            CancellableWorkflowOutboundFuture<ScheduleActivityResult>,
+        >,
+    ) -> CancellableWorkflowOutboundFuture<ScheduleActivityResult> {
+        next.run(input)
+    }
+
+    /// Called when the workflow schedules a local activity.
+    fn schedule_local_activity(
+        &self,
+        _ctx: WorkflowInterceptorContext,
+        input: ScheduleLocalActivityInput,
+        next: WorkflowNext<
+            'static,
+            ScheduleLocalActivityInput,
+            CancellableWorkflowOutboundFuture<ScheduleActivityResult>,
+        >,
+    ) -> CancellableWorkflowOutboundFuture<ScheduleActivityResult> {
+        next.run(input)
+    }
+
+    /// Called when the workflow starts a child workflow.
+    fn start_child_workflow(
+        &self,
+        _ctx: WorkflowInterceptorContext,
+        input: StartChildWorkflowInput,
+        next: WorkflowNext<
+            'static,
+            StartChildWorkflowInput,
+            CancellableWorkflowOutboundFuture<StartChildWorkflowResult>,
+        >,
+    ) -> CancellableWorkflowOutboundFuture<StartChildWorkflowResult> {
+        next.run(input)
+    }
+
+    /// Called when the workflow signals a child or external workflow.
+    fn signal_workflow(
+        &self,
+        _ctx: WorkflowInterceptorContext,
+        input: SignalWorkflowInput,
+        next: WorkflowNext<
+            'static,
+            SignalWorkflowInput,
+            CancellableWorkflowOutboundFuture<SignalWorkflowResult>,
+        >,
+    ) -> CancellableWorkflowOutboundFuture<SignalWorkflowResult> {
+        next.run(input)
+    }
+
+    /// Called when the workflow requests cancellation of an external workflow.
+    fn cancel_external_workflow(
+        &self,
+        _ctx: WorkflowInterceptorContext,
+        input: CancelExternalWorkflowInput,
+        next: WorkflowNext<
+            'static,
+            CancelExternalWorkflowInput,
+            WorkflowOutboundFuture<CancelExternalWfResult>,
+        >,
+    ) -> WorkflowOutboundFuture<CancelExternalWfResult> {
+        next.run(input)
+    }
+
+    /// Called when the workflow continues as new.
+    fn continue_as_new(
+        &self,
+        _ctx: SyncWorkflowInterceptorContext,
+        input: ContinueAsNewInput,
+        next: WorkflowNext<'static, ContinueAsNewInput, ContinueAsNewResult>,
+    ) -> ContinueAsNewResult {
+        next.run(input)
+    }
+
+    /// Called when the workflow starts a Nexus operation.
+    fn start_nexus_operation(
+        &self,
+        _ctx: WorkflowInterceptorContext,
+        input: StartNexusOperationInput,
+        next: WorkflowNext<
+            'static,
+            StartNexusOperationInput,
+            CancellableWorkflowOutboundFuture<StartNexusOperationResult>,
+        >,
+    ) -> CancellableWorkflowOutboundFuture<StartNexusOperationResult> {
+        next.run(input)
+    }
+}
+
+macro_rules! outbound_chain {
+    ($fn_name:ident, $method:ident, $context:ty, $input:ty, $output:ty) => {
+        pub(crate) fn $fn_name(
+            mut interceptors: Vec<Arc<dyn WorkflowInterceptor>>,
+            ctx: $context,
+            input: $input,
+            next: WorkflowNext<'static, $input, $output>,
+        ) -> $output {
+            if let Some(interceptor) = interceptors.pop() {
+                let next_ctx = ctx.clone();
+                let downstream =
+                    WorkflowNext::new(move |input| $fn_name(interceptors, next_ctx, input, next));
+                interceptor.$method(ctx, input, downstream)
+            } else {
+                next.run(input)
+            }
+        }
+    };
+}
+
+outbound_chain!(
+    call_start_timer,
+    start_timer,
+    WorkflowInterceptorContext,
+    StartTimerInput,
+    CancellableWorkflowOutboundFuture<TimerResult>
+);
+outbound_chain!(
+    call_schedule_activity,
+    schedule_activity,
+    WorkflowInterceptorContext,
+    ScheduleActivityInput,
+    CancellableWorkflowOutboundFuture<ScheduleActivityResult>
+);
+outbound_chain!(
+    call_schedule_local_activity,
+    schedule_local_activity,
+    WorkflowInterceptorContext,
+    ScheduleLocalActivityInput,
+    CancellableWorkflowOutboundFuture<ScheduleActivityResult>
+);
+outbound_chain!(
+    call_start_child_workflow,
+    start_child_workflow,
+    WorkflowInterceptorContext,
+    StartChildWorkflowInput,
+    CancellableWorkflowOutboundFuture<StartChildWorkflowResult>
+);
+outbound_chain!(
+    call_signal_workflow,
+    signal_workflow,
+    WorkflowInterceptorContext,
+    SignalWorkflowInput,
+    CancellableWorkflowOutboundFuture<SignalWorkflowResult>
+);
+outbound_chain!(
+    call_cancel_external_workflow,
+    cancel_external_workflow,
+    WorkflowInterceptorContext,
+    CancelExternalWorkflowInput,
+    WorkflowOutboundFuture<CancelExternalWfResult>
+);
+outbound_chain!(
+    call_continue_as_new,
+    continue_as_new,
+    SyncWorkflowInterceptorContext,
+    ContinueAsNewInput,
+    ContinueAsNewResult
+);
+outbound_chain!(
+    call_start_nexus_operation,
+    start_nexus_operation,
+    WorkflowInterceptorContext,
+    StartNexusOperationInput,
+    CancellableWorkflowOutboundFuture<StartNexusOperationResult>
+);
+
+/// An ordered collection of interceptors for one workflow instance.
+///
+/// This is returned by [`WorkflowInterceptorFactory`] for each workflow instance.
+/// Inbound calls are invoked in insertion order and outbound calls in reverse insertion order.
+#[derive(Default, Clone)]
+pub struct WorkflowInterceptors {
+    interceptors: Vec<Arc<dyn WorkflowInterceptor>>,
+}
+
+impl WorkflowInterceptors {
+    /// Create an empty interceptor collection.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Append an interceptor.
+    pub fn add(&mut self, interceptor: impl WorkflowInterceptor) -> &mut Self {
+        self.interceptors.push(Arc::new(interceptor));
+        self
+    }
+
+    /// Append an interceptor and return this collection.
+    pub fn with_interceptor(mut self, interceptor: impl WorkflowInterceptor) -> Self {
+        self.add(interceptor);
+        self
+    }
+
+    /// Append another interceptor collection.
+    pub fn extend(&mut self, other: Self) -> &mut Self {
+        self.interceptors.extend(other.interceptors);
+        self
+    }
+
+    #[doc(hidden)]
+    pub fn into_inner(self) -> Vec<Arc<dyn WorkflowInterceptor>> {
+        self.interceptors
+    }
+}
+
+/// Creates a fresh interceptor collection for each workflow instance.
+pub trait WorkflowInterceptorFactory: Send + Sync + 'static {
+    /// Create interceptors for a workflow instance.
+    fn create(&self) -> WorkflowInterceptors;
+}
+
+impl<F> WorkflowInterceptorFactory for F
+where
+    F: Fn() -> WorkflowInterceptors + Send + Sync + 'static,
+{
+    fn create(&self) -> WorkflowInterceptors {
+        self()
     }
 }
 

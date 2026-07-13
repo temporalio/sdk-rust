@@ -36,18 +36,18 @@ pub use temporalio_common_wasm::{
         TimeoutType, WorkflowSignalError,
     },
 };
-#[doc(hidden)]
-pub use workflow_context::PatchActivationCaller;
 pub use workflow_context::{
     ActivityCancellationType, ActivityCloseTimeouts, ActivityOptions, BaseWorkflowContext,
-    CancellableFuture, ChildWorkflowCancellationType, ChildWorkflowOptions, ContinueAsNewOptions,
-    ContinueAsNewVersioningBehavior, ExternalWorkflowHandle, LocalActivityOptions,
-    NamespacedWorkflowInfo, NexusOperationCancellationType, NexusOperationOptions,
-    ParentClosePolicy, PatchActivationCallback, PatchActivationInput, Signal, SignalData,
-    StartChildWorkflowExecutionFailedCause, StartedChildWorkflow, SyncWorkflowContext,
-    TimerOptions, VersioningIntent, WorkflowContext, WorkflowContextView, WorkflowIdReusePolicy,
-    WorkflowRandomValue,
+    CancellableFuture, CancellableFutureWithReason, ChildWorkflowCancellationType,
+    ChildWorkflowOptions, ContinueAsNewOptions, ContinueAsNewVersioningBehavior,
+    ExternalWorkflowHandle, LocalActivityOptions, NamespacedWorkflowInfo,
+    NexusOperationCancellationType, NexusOperationOptions, ParentClosePolicy, Signal, SignalData,
+    StartChildWorkflowExecutionFailedCause, StartChildWorkflowOutput, StartedChildWorkflow,
+    StartedNexusOperation, SyncWorkflowContext, TimerOptions, VersioningIntent, WorkflowContext,
+    WorkflowContextView, WorkflowIdReusePolicy, WorkflowRandomValue,
 };
+#[doc(hidden)]
+pub use workflow_context::{PatchActivationCallback, PatchActivationCaller};
 pub use workflows::{join, join_all, select};
 
 #[macro_export]
@@ -79,29 +79,31 @@ macro_rules! __temporalio_export_workflow_component {
 #[macro_export]
 /// Export one or more workflow implementations as a component-model workflow module.
 ///
-/// Component-side workflow interceptors can be supplied with
-/// `interceptors = [FirstInterceptor, SecondInterceptor]`. A fresh interceptor chain is created
-/// for each workflow instance.
+/// Component-side workflow interceptor factories can be supplied with
+/// `interceptor_factories = [factory]`. Each factory is invoked for every workflow instance.
 macro_rules! export_workflow_module {
     ([$($workflow:ty),+ $(,)?]) => {
         ::temporalio_workflow::export_workflow_module!(
             [$($workflow),+],
-            interceptors = [],
+            interceptor_factories = [],
         );
     };
-    ([$($workflow:ty),+ $(,)?], interceptors = [$($interceptor:expr),* $(,)?] $(,)?) => {
+    ([$($workflow:ty),+ $(,)?], interceptor_factories = [$($factory:expr),* $(,)?] $(,)?) => {
         const _: () = {
             struct __TemporalWorkflowModule;
 
             fn __temporal_workflow_interceptors() -> ::std::vec::Vec<
-                ::std::sync::Arc<dyn ::temporalio_workflow::workflow_interceptors::WorkflowInboundInterceptor>,
+                ::std::sync::Arc<dyn ::temporalio_workflow::workflow_interceptors::WorkflowInterceptor>,
             > {
-                ::std::vec![
-                    $(
-                        ::std::sync::Arc::new($interceptor)
-                            as ::std::sync::Arc<dyn ::temporalio_workflow::workflow_interceptors::WorkflowInboundInterceptor>
-                    ),*
-                ]
+                let mut interceptors = ::std::vec::Vec::new();
+                $(
+                    let factory = $factory;
+                    interceptors.extend(
+                        ::temporalio_workflow::workflow_interceptors::WorkflowInterceptorFactory::create(&factory)
+                            .into_inner(),
+                    );
+                )*
+                interceptors
             }
 
             impl ::temporalio_workflow::component::StaticWorkflowComponent for __TemporalWorkflowModule {

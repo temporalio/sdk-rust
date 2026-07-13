@@ -1,4 +1,4 @@
-use crate::common::CoreWfStarter;
+use crate::common::{CoreWfStarter, activity_functions::StdActivities};
 use std::{
     future::Future,
     pin::Pin,
@@ -7,20 +7,26 @@ use std::{
         atomic::{AtomicUsize, Ordering},
     },
     task::{Context, Poll},
+    time::Duration,
 };
 use temporalio_client::{
     WorkflowExecuteUpdateOptions, WorkflowQueryOptions, WorkflowSignalOptions, WorkflowStartOptions,
 };
-use temporalio_common::worker::WorkerTaskTypes;
+use temporalio_common::{protos::temporal::api::common::v1::Payload, worker::WorkerTaskTypes};
 use temporalio_macros::{workflow, workflow_methods};
 use temporalio_sdk::{
-    SyncWorkflowContext, WorkflowContext, WorkflowContextView, WorkflowResult,
+    ActivityOptions, ChildWorkflowOptions, LocalActivityOptions, NexusOperationOptions,
+    SyncWorkflowContext, TimerResult, WorkflowContext, WorkflowContextView, WorkflowResult,
     workflow_interceptors::{
-        ExecuteWorkflowInput, ExecuteWorkflowResult, HandleQueryInput, HandleQueryResult,
-        HandleSignalInput, HandleSignalResult, HandleUpdateInput, HandleUpdateResult,
-        InitializeWorkflowInput, InitializeWorkflowOutput, SyncWorkflowInterceptorContext,
-        ValidateUpdateInput, ValidateUpdateResult, WorkflowInboundInterceptor,
-        WorkflowInterceptorContext, WorkflowInterceptorFuture, WorkflowNext, WorkflowOutputValue,
+        CancellableWorkflowOutboundFuture, ExecuteWorkflowInput, ExecuteWorkflowResult,
+        HandleQueryInput, HandleQueryResult, HandleSignalInput, HandleSignalResult,
+        HandleUpdateInput, HandleUpdateResult, InitializeWorkflowInput, InitializeWorkflowOutput,
+        ScheduleActivityInput, ScheduleActivityResult, ScheduleLocalActivityInput,
+        StartChildWorkflowInput, StartChildWorkflowResult, StartTimerInput,
+        SyncWorkflowInterceptorContext, ValidateUpdateInput, ValidateUpdateResult,
+        WorkflowCancellationHandle, WorkflowInterceptor, WorkflowInterceptorContext,
+        WorkflowInterceptorFuture, WorkflowInterceptors, WorkflowNext, WorkflowOutboundValue,
+        WorkflowOutputValue,
     },
 };
 use tokio::{join, sync::Notify};
@@ -89,7 +95,7 @@ struct MutatingWorkflowInterceptor {
     saw_query_history_replay: Arc<Mutex<Option<bool>>>,
 }
 
-impl WorkflowInboundInterceptor for MutatingWorkflowInterceptor {
+impl WorkflowInterceptor for MutatingWorkflowInterceptor {
     fn execute<'a>(
         &'a self,
         ctx: WorkflowInterceptorContext,
@@ -151,6 +157,7 @@ impl WorkflowInboundInterceptor for MutatingWorkflowInterceptor {
             WorkflowInterceptorFuture<'a, HandleUpdateResult>,
         >,
     ) -> WorkflowInterceptorFuture<'a, HandleUpdateResult> {
+        assert_eq!(input.id(), "accepted-update-id");
         WorkflowInterceptorFuture::new(async move {
             assert!(!ctx.is_replaying_history_events());
             if let Some(input) = input.input_mut::<String>() {
@@ -173,6 +180,7 @@ impl WorkflowInboundInterceptor for MutatingWorkflowInterceptor {
         mut input: HandleQueryInput,
         next: WorkflowNext<'_, HandleQueryInput, HandleQueryResult>,
     ) -> HandleQueryResult {
+        assert!(!input.id().is_empty());
         *self.saw_query_history_replay.lock().unwrap() = Some(ctx.is_replaying_history_events());
         if let Some(input) = input.input_mut::<String>() {
             *input = "query-mutated".to_string();
@@ -192,6 +200,12 @@ impl WorkflowInboundInterceptor for MutatingWorkflowInterceptor {
         mut input: ValidateUpdateInput,
         next: WorkflowNext<'_, ValidateUpdateInput, ValidateUpdateResult>,
     ) -> ValidateUpdateResult {
+        let expected_id = match input.input_ref::<String>().map(String::as_str) {
+            Some("reject") => "rejected-update-id",
+            Some("update") => "accepted-update-id",
+            input => panic!("unexpected update validation input: {input:?}"),
+        };
+        assert_eq!(input.id(), expected_id);
         if let Some(input) = input.input_mut::<String>() {
             input.push_str("-validated");
         }
@@ -200,9 +214,8 @@ impl WorkflowInboundInterceptor for MutatingWorkflowInterceptor {
 }
 
 #[tokio::test]
-async fn workflow_inbound_interceptors_mutate_inputs_and_replace_outputs() {
-    let mut starter =
-        CoreWfStarter::new("workflow_inbound_interceptors_mutate_inputs_and_replace_outputs");
+async fn workflow_interceptors_mutate_inputs_and_replace_outputs() {
+    let mut starter = CoreWfStarter::new("workflow_interceptors_mutate_inputs_and_replace_outputs");
     starter.sdk_config.task_types = WorkerTaskTypes::workflow_only();
     let mut worker = starter.worker().await;
     worker
@@ -211,11 +224,15 @@ async fn workflow_inbound_interceptors_mutate_inputs_and_replace_outputs() {
 
     let signal_post_handler_done = Arc::new(Notify::new());
     let saw_query_history_replay = Arc::new(Mutex::new(None));
+    let signal_post_handler_done_ref = signal_post_handler_done.clone();
+    let saw_query_history_replay_ref = saw_query_history_replay.clone();
     worker
         .inner_mut()
-        .add_workflow_inbound_interceptor(MutatingWorkflowInterceptor {
-            signal_post_handler_done: signal_post_handler_done.clone(),
-            saw_query_history_replay: saw_query_history_replay.clone(),
+        .add_workflow_interceptor_factory(move || {
+            WorkflowInterceptors::new().with_interceptor(MutatingWorkflowInterceptor {
+                signal_post_handler_done: signal_post_handler_done_ref.clone(),
+                saw_query_history_replay: saw_query_history_replay_ref.clone(),
+            })
         });
 
     let task_queue = starter.get_task_queue().to_owned();
@@ -244,7 +261,9 @@ async fn workflow_inbound_interceptors_mutate_inputs_and_replace_outputs() {
             .execute_update(
                 InboundInterceptorWorkflow::set_update,
                 "reject".to_string(),
-                WorkflowExecuteUpdateOptions::default(),
+                WorkflowExecuteUpdateOptions::builder()
+                    .update_id("rejected-update-id".to_string())
+                    .build(),
             )
             .await;
         assert!(rejected.is_err());
@@ -263,7 +282,9 @@ async fn workflow_inbound_interceptors_mutate_inputs_and_replace_outputs() {
             .execute_update(
                 InboundInterceptorWorkflow::set_update,
                 "update".to_string(),
-                WorkflowExecuteUpdateOptions::default(),
+                WorkflowExecuteUpdateOptions::builder()
+                    .update_id("accepted-update-id".to_string())
+                    .build(),
             )
             .await
             .unwrap();
@@ -295,7 +316,8 @@ struct InboundInterceptorOrderWorkflow;
 #[workflow_methods]
 impl InboundInterceptorOrderWorkflow {
     #[run]
-    async fn run(_ctx: &mut WorkflowContext<Self>, input: String) -> WorkflowResult<String> {
+    async fn run(ctx: &mut WorkflowContext<Self>, input: String) -> WorkflowResult<String> {
+        ctx.timer(Duration::from_millis(1)).await;
         Ok(input)
     }
 }
@@ -305,7 +327,7 @@ struct RecordingWorkflowInterceptor {
     records: Arc<Mutex<Vec<String>>>,
 }
 
-impl WorkflowInboundInterceptor for RecordingWorkflowInterceptor {
+impl WorkflowInterceptor for RecordingWorkflowInterceptor {
     fn execute<'a>(
         &'a self,
         _ctx: WorkflowInterceptorContext,
@@ -329,11 +351,36 @@ impl WorkflowInboundInterceptor for RecordingWorkflowInterceptor {
             result
         })
     }
+
+    fn start_timer(
+        &self,
+        _ctx: WorkflowInterceptorContext,
+        input: StartTimerInput,
+        next: WorkflowNext<
+            'static,
+            StartTimerInput,
+            CancellableWorkflowOutboundFuture<TimerResult>,
+        >,
+    ) -> CancellableWorkflowOutboundFuture<TimerResult> {
+        self.records
+            .lock()
+            .unwrap()
+            .push(format!("{} outbound before", self.name));
+        let name = self.name;
+        let records = self.records.clone();
+        next.run(input).map(move |result| {
+            records
+                .lock()
+                .unwrap()
+                .push(format!("{name} outbound after"));
+            result
+        })
+    }
 }
 
 #[tokio::test]
-async fn workflow_inbound_interceptors_wrap_execute_in_order() {
-    let mut starter = CoreWfStarter::new("workflow_inbound_interceptors_wrap_execute_in_order");
+async fn workflow_interceptors_wrap_execute_in_order() {
+    let mut starter = CoreWfStarter::new("workflow_interceptors_wrap_execute_in_order");
     starter.sdk_config.task_types = WorkerTaskTypes::workflow_only();
     let mut worker = starter.worker().await;
     worker
@@ -341,17 +388,23 @@ async fn workflow_inbound_interceptors_wrap_execute_in_order() {
         .unwrap();
 
     let records = Arc::new(Mutex::new(Vec::new()));
+    let outer_records = records.clone();
     worker
         .inner_mut()
-        .add_workflow_inbound_interceptor(RecordingWorkflowInterceptor {
-            name: "outer",
-            records: records.clone(),
+        .add_workflow_interceptor_factory(move || {
+            WorkflowInterceptors::new().with_interceptor(RecordingWorkflowInterceptor {
+                name: "outer",
+                records: outer_records.clone(),
+            })
         });
+    let inner_records = records.clone();
     worker
         .inner_mut()
-        .add_workflow_inbound_interceptor(RecordingWorkflowInterceptor {
-            name: "inner",
-            records: records.clone(),
+        .add_workflow_interceptor_factory(move || {
+            WorkflowInterceptors::new().with_interceptor(RecordingWorkflowInterceptor {
+                name: "inner",
+                records: inner_records.clone(),
+            })
         });
 
     let task_queue = starter.get_task_queue().to_owned();
@@ -374,6 +427,10 @@ async fn workflow_inbound_interceptors_wrap_execute_in_order() {
         &[
             "outer before".to_string(),
             "inner before".to_string(),
+            "inner outbound before".to_string(),
+            "outer outbound before".to_string(),
+            "outer outbound after".to_string(),
+            "inner outbound after".to_string(),
             "inner after".to_string(),
             "outer after".to_string(),
         ]
@@ -402,7 +459,7 @@ struct InitInputMutationInterceptor {
     received_input: Arc<AtomicUsize>,
 }
 
-impl WorkflowInboundInterceptor for InitInputMutationInterceptor {
+impl WorkflowInterceptor for InitInputMutationInterceptor {
     fn initialize_workflow(
         &self,
         _ctx: WorkflowContextView,
@@ -441,10 +498,13 @@ async fn workflow_initialize_interceptor_mutates_init_input() {
         .unwrap();
 
     let received_input = Arc::new(AtomicUsize::new(0));
+    let received_input_ref = received_input.clone();
     worker
         .inner_mut()
-        .add_workflow_inbound_interceptor(InitInputMutationInterceptor {
-            received_input: received_input.clone(),
+        .add_workflow_interceptor_factory(move || {
+            WorkflowInterceptors::new().with_interceptor(InitInputMutationInterceptor {
+                received_input: received_input_ref.clone(),
+            })
         });
 
     let handle = worker
@@ -548,7 +608,7 @@ struct ConstructionPollingInterceptor {
     async_polls: Arc<AtomicUsize>,
 }
 
-impl WorkflowInboundInterceptor for ConstructionPollingInterceptor {
+impl WorkflowInterceptor for ConstructionPollingInterceptor {
     fn handle_signal<'a>(
         &'a self,
         _ctx: WorkflowInterceptorContext,
@@ -591,12 +651,17 @@ async fn workflow_interceptors_are_polled_once_during_construction() {
     let sync_polls = Arc::new(AtomicUsize::new(0));
     let deferred_polls = Arc::new(AtomicUsize::new(0));
     let async_polls = Arc::new(AtomicUsize::new(0));
+    let sync_polls_ref = sync_polls.clone();
+    let deferred_polls_ref = deferred_polls.clone();
+    let async_polls_ref = async_polls.clone();
     worker
         .inner_mut()
-        .add_workflow_inbound_interceptor(ConstructionPollingInterceptor {
-            sync_polls: sync_polls.clone(),
-            deferred_polls: deferred_polls.clone(),
-            async_polls: async_polls.clone(),
+        .add_workflow_interceptor_factory(move || {
+            WorkflowInterceptors::new().with_interceptor(ConstructionPollingInterceptor {
+                sync_polls: sync_polls_ref.clone(),
+                deferred_polls: deferred_polls_ref.clone(),
+                async_polls: async_polls_ref.clone(),
+            })
         });
 
     let handle = worker
@@ -645,4 +710,476 @@ async fn workflow_interceptors_are_polled_once_during_construction() {
     assert_eq!(sync_polls.load(Ordering::Relaxed), 1);
     assert_eq!(deferred_polls.load(Ordering::Relaxed), 2);
     assert_eq!(async_polls.load(Ordering::Relaxed), 2);
+}
+
+#[workflow]
+#[derive(Default)]
+struct FactoryOutboundInterceptorWorkflow;
+
+#[workflow_methods]
+impl FactoryOutboundInterceptorWorkflow {
+    #[run]
+    async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<()> {
+        assert_eq!(
+            ctx.timer(Duration::from_secs(60)).await,
+            TimerResult::Cancelled
+        );
+        Ok(())
+    }
+}
+
+#[derive(Default)]
+struct FactoryOutboundInterceptor {
+    inbound_calls: AtomicUsize,
+    timer_calls: AtomicUsize,
+}
+
+impl WorkflowInterceptor for FactoryOutboundInterceptor {
+    fn execute<'a>(
+        &'a self,
+        _ctx: WorkflowInterceptorContext,
+        input: ExecuteWorkflowInput,
+        next: WorkflowNext<
+            'a,
+            ExecuteWorkflowInput,
+            WorkflowInterceptorFuture<'a, ExecuteWorkflowResult>,
+        >,
+    ) -> WorkflowInterceptorFuture<'a, ExecuteWorkflowResult> {
+        self.inbound_calls.fetch_add(1, Ordering::Relaxed);
+        next.run(input)
+    }
+
+    fn start_timer(
+        &self,
+        _ctx: WorkflowInterceptorContext,
+        input: StartTimerInput,
+        _next: WorkflowNext<
+            'static,
+            StartTimerInput,
+            CancellableWorkflowOutboundFuture<TimerResult>,
+        >,
+    ) -> CancellableWorkflowOutboundFuture<TimerResult> {
+        assert_eq!(self.inbound_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(self.timer_calls.fetch_add(1, Ordering::Relaxed), 0);
+        assert_eq!(input.options().duration, Duration::from_secs(60));
+        CancellableWorkflowOutboundFuture::new(
+            async { TimerResult::Cancelled },
+            WorkflowCancellationHandle::new(|_| {}),
+        )
+    }
+}
+
+#[tokio::test]
+async fn workflow_interceptor_factories_create_unified_per_instance_interceptors() {
+    let mut starter = CoreWfStarter::new(
+        "workflow_interceptor_factories_create_unified_per_instance_interceptors",
+    );
+    starter.sdk_config.task_types = WorkerTaskTypes::workflow_only();
+    let mut worker = starter.worker().await;
+    worker
+        .register_workflow::<FactoryOutboundInterceptorWorkflow>()
+        .unwrap();
+
+    let factory_calls = Arc::new(AtomicUsize::new(0));
+    let factory_calls_ref = factory_calls.clone();
+    worker
+        .inner_mut()
+        .add_workflow_interceptor_factory(move || {
+            factory_calls_ref.fetch_add(1, Ordering::Relaxed);
+            WorkflowInterceptors::new().with_interceptor(FactoryOutboundInterceptor::default())
+        });
+
+    let task_queue = starter.get_task_queue().to_owned();
+    let first = worker
+        .submit_workflow(
+            FactoryOutboundInterceptorWorkflow::run,
+            (),
+            WorkflowStartOptions::new(task_queue.clone(), format!("{}-1", starter.get_wf_id()))
+                .build(),
+        )
+        .await
+        .unwrap();
+    let second = worker
+        .submit_workflow(
+            FactoryOutboundInterceptorWorkflow::run,
+            (),
+            WorkflowStartOptions::new(task_queue, format!("{}-2", starter.get_wf_id())).build(),
+        )
+        .await
+        .unwrap();
+
+    worker.run_until_done().await.unwrap();
+    first.get_result(Default::default()).await.unwrap();
+    second.get_result(Default::default()).await.unwrap();
+    assert_eq!(factory_calls.load(Ordering::Relaxed), 2);
+}
+
+#[workflow]
+#[derive(Default)]
+struct InboundContextOutboundWorkflow;
+
+#[workflow_methods]
+impl InboundContextOutboundWorkflow {
+    #[run]
+    async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<()> {
+        assert_eq!(
+            ctx.timer(Duration::from_secs(2)).await,
+            TimerResult::Cancelled
+        );
+        Ok(())
+    }
+}
+
+struct InboundContextOutboundInterceptor {
+    events: Arc<Mutex<Vec<String>>>,
+}
+
+impl WorkflowInterceptor for InboundContextOutboundInterceptor {
+    fn execute<'a>(
+        &'a self,
+        ctx: WorkflowInterceptorContext,
+        input: ExecuteWorkflowInput,
+        next: WorkflowNext<
+            'a,
+            ExecuteWorkflowInput,
+            WorkflowInterceptorFuture<'a, ExecuteWorkflowResult>,
+        >,
+    ) -> WorkflowInterceptorFuture<'a, ExecuteWorkflowResult> {
+        let events = self.events.clone();
+        WorkflowInterceptorFuture::new(async move {
+            events.lock().unwrap().push("inbound-before".to_string());
+            assert_eq!(
+                ctx.timer(Duration::from_secs(1)).await,
+                TimerResult::Cancelled
+            );
+            let result = next.run(input).await;
+            events
+                .lock()
+                .unwrap()
+                .push("inbound-next-returned".to_string());
+            assert_eq!(
+                ctx.timer(Duration::from_secs(3)).await,
+                TimerResult::Cancelled
+            );
+            events.lock().unwrap().push("inbound-after".to_string());
+            result
+        })
+    }
+
+    fn start_timer(
+        &self,
+        _ctx: WorkflowInterceptorContext,
+        input: StartTimerInput,
+        _next: WorkflowNext<
+            'static,
+            StartTimerInput,
+            CancellableWorkflowOutboundFuture<TimerResult>,
+        >,
+    ) -> CancellableWorkflowOutboundFuture<TimerResult> {
+        self.events
+            .lock()
+            .unwrap()
+            .push(format!("timer-{}", input.options().duration.as_secs()));
+        CancellableWorkflowOutboundFuture::new(
+            async { TimerResult::Cancelled },
+            WorkflowCancellationHandle::new(|_| {}),
+        )
+    }
+}
+
+#[tokio::test]
+async fn inbound_interceptor_context_operations_use_the_outbound_chain_around_next() {
+    let mut starter = CoreWfStarter::new(
+        "inbound_interceptor_context_operations_use_the_outbound_chain_around_next",
+    );
+    starter.sdk_config.task_types = WorkerTaskTypes::workflow_only();
+    let mut worker = starter.worker().await;
+    worker
+        .register_workflow::<InboundContextOutboundWorkflow>()
+        .unwrap();
+
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let events_ref = events.clone();
+    worker
+        .inner_mut()
+        .add_workflow_interceptor_factory(move || {
+            WorkflowInterceptors::new().with_interceptor(InboundContextOutboundInterceptor {
+                events: events_ref.clone(),
+            })
+        });
+
+    let handle = worker
+        .submit_workflow(
+            InboundContextOutboundWorkflow::run,
+            (),
+            WorkflowStartOptions::new(
+                starter.get_task_queue().to_owned(),
+                starter.get_wf_id().to_owned(),
+            )
+            .build(),
+        )
+        .await
+        .unwrap();
+    worker.run_until_done().await.unwrap();
+    handle.get_result(Default::default()).await.unwrap();
+
+    assert_eq!(
+        *events.lock().unwrap(),
+        [
+            "inbound-before",
+            "timer-1",
+            "timer-2",
+            "inbound-next-returned",
+            "timer-3",
+            "inbound-after",
+        ]
+    );
+}
+
+#[allow(dead_code)]
+fn assert_workflow_interceptor_context_outbound_api(ctx: &WorkflowInterceptorContext) {
+    let _timer = ctx.timer(Duration::from_secs(1));
+    let _activity = ctx.start_activity(
+        StdActivities::echo,
+        String::new(),
+        ActivityOptions::start_to_close_timeout(Duration::from_secs(1)),
+    );
+    let _local_activity = ctx.start_local_activity(
+        StdActivities::echo,
+        String::new(),
+        LocalActivityOptions {
+            start_to_close_timeout: Some(Duration::from_secs(1)),
+            ..Default::default()
+        },
+    );
+    let _child = ctx.start_child_workflow(
+        OutboundChildInterceptorChild::run,
+        String::new(),
+        ChildWorkflowOptions::workflow_id("child".into()),
+    );
+    let _external = ctx.external_workflow("external", None);
+    let _nexus = ctx.start_nexus_operation(NexusOperationOptions {
+        endpoint: "endpoint".to_string(),
+        service: "service".to_string(),
+        operation: "operation".to_string(),
+        ..Default::default()
+    });
+}
+
+#[workflow]
+#[derive(Default)]
+struct OutboundActivityInterceptorWorkflow;
+
+#[workflow_methods]
+impl OutboundActivityInterceptorWorkflow {
+    #[run]
+    async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<()> {
+        let activity = ctx
+            .start_activity(
+                StdActivities::echo,
+                "activity-original".to_string(),
+                ActivityOptions::start_to_close_timeout(Duration::from_secs(5)),
+            )
+            .await?;
+        assert_eq!(activity, "activity-wrapped");
+
+        let local_activity = ctx
+            .start_local_activity(
+                StdActivities::echo,
+                "local-original".to_string(),
+                LocalActivityOptions {
+                    start_to_close_timeout: Some(Duration::from_secs(5)),
+                    ..Default::default()
+                },
+            )
+            .await?;
+        assert_eq!(local_activity, "local-wrapped");
+        Ok(())
+    }
+}
+
+struct OutboundActivityInterceptor;
+
+#[allow(clippy::result_large_err)]
+impl WorkflowInterceptor for OutboundActivityInterceptor {
+    fn schedule_activity(
+        &self,
+        _ctx: WorkflowInterceptorContext,
+        mut input: ScheduleActivityInput,
+        next: WorkflowNext<
+            'static,
+            ScheduleActivityInput,
+            CancellableWorkflowOutboundFuture<ScheduleActivityResult>,
+        >,
+    ) -> CancellableWorkflowOutboundFuture<ScheduleActivityResult> {
+        *input.input_mut::<String>().unwrap() = "activity-mutated".to_string();
+        input
+            .headers_mut()
+            .insert("intercepted".to_string(), Payload::default());
+        next.run(input).map(|result| {
+            assert_eq!(
+                result
+                    .as_ref()
+                    .unwrap()
+                    .downcast_ref::<String>()
+                    .map(String::as_str),
+                Some("activity-mutated")
+            );
+            Ok(Box::new("activity-wrapped".to_string()) as Box<dyn WorkflowOutboundValue>)
+        })
+    }
+
+    fn schedule_local_activity(
+        &self,
+        _ctx: WorkflowInterceptorContext,
+        mut input: ScheduleLocalActivityInput,
+        next: WorkflowNext<
+            'static,
+            ScheduleLocalActivityInput,
+            CancellableWorkflowOutboundFuture<ScheduleActivityResult>,
+        >,
+    ) -> CancellableWorkflowOutboundFuture<ScheduleActivityResult> {
+        *input.input_mut::<String>().unwrap() = "local-mutated".to_string();
+        next.run(input).map(|result| {
+            assert_eq!(
+                result
+                    .as_ref()
+                    .unwrap()
+                    .downcast_ref::<String>()
+                    .map(String::as_str),
+                Some("local-mutated")
+            );
+            Ok(Box::new("local-wrapped".to_string()) as Box<dyn WorkflowOutboundValue>)
+        })
+    }
+}
+
+#[tokio::test]
+async fn workflow_outbound_interceptors_mutate_activity_calls_and_results() {
+    let mut starter =
+        CoreWfStarter::new("workflow_outbound_interceptors_mutate_activity_calls_and_results");
+    starter.sdk_config.register_activities(StdActivities);
+    let mut worker = starter.worker().await;
+    worker
+        .register_workflow::<OutboundActivityInterceptorWorkflow>()
+        .unwrap();
+    worker.inner_mut().add_workflow_interceptor_factory(|| {
+        WorkflowInterceptors::new().with_interceptor(OutboundActivityInterceptor)
+    });
+
+    let handle = worker
+        .submit_workflow(
+            OutboundActivityInterceptorWorkflow::run,
+            (),
+            WorkflowStartOptions::new(
+                starter.get_task_queue().to_owned(),
+                starter.get_wf_id().to_owned(),
+            )
+            .build(),
+        )
+        .await
+        .unwrap();
+    worker.run_until_done().await.unwrap();
+    handle.get_result(Default::default()).await.unwrap();
+}
+
+#[workflow]
+#[derive(Default)]
+struct OutboundChildInterceptorChild;
+
+#[workflow_methods]
+impl OutboundChildInterceptorChild {
+    #[run]
+    async fn run(_ctx: &mut WorkflowContext<Self>, input: String) -> WorkflowResult<String> {
+        assert_eq!(input, "child-mutated");
+        Ok("child-original-output".to_string())
+    }
+}
+
+#[workflow]
+#[derive(Default)]
+struct OutboundChildInterceptorParent;
+
+#[workflow_methods]
+impl OutboundChildInterceptorParent {
+    #[run]
+    async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<()> {
+        let child = ctx
+            .start_child_workflow(
+                OutboundChildInterceptorChild::run,
+                "child-original".to_string(),
+                ChildWorkflowOptions::workflow_id(format!("{}-child", ctx.workflow_id())),
+            )
+            .await?;
+        assert_eq!(child.result().await?, "child-wrapped-output");
+        Ok(())
+    }
+}
+
+struct OutboundChildInterceptor;
+
+impl WorkflowInterceptor for OutboundChildInterceptor {
+    fn start_child_workflow(
+        &self,
+        _ctx: WorkflowInterceptorContext,
+        mut input: StartChildWorkflowInput,
+        next: WorkflowNext<
+            'static,
+            StartChildWorkflowInput,
+            CancellableWorkflowOutboundFuture<StartChildWorkflowResult>,
+        >,
+    ) -> CancellableWorkflowOutboundFuture<StartChildWorkflowResult> {
+        *input.input_mut::<String>().unwrap() = "child-mutated".to_string();
+        input
+            .headers_mut()
+            .insert("intercepted".to_string(), Payload::default());
+        next.run(input).map(|result| {
+            result.map(|output| {
+                output.map_result(|result| {
+                    result.map(|result| {
+                        result.map(|output| {
+                            assert_eq!(
+                                output.downcast_ref::<String>().map(String::as_str),
+                                Some("child-original-output")
+                            );
+                            Box::new("child-wrapped-output".to_string())
+                                as Box<dyn WorkflowOutboundValue>
+                        })
+                    })
+                })
+            })
+        })
+    }
+}
+
+#[tokio::test]
+async fn workflow_outbound_interceptors_wrap_child_start_and_completion() {
+    let mut starter =
+        CoreWfStarter::new("workflow_outbound_interceptors_wrap_child_start_and_completion");
+    starter.sdk_config.task_types = WorkerTaskTypes::workflow_only();
+    let mut worker = starter.worker().await;
+    worker
+        .register_workflow::<OutboundChildInterceptorParent>()
+        .unwrap();
+    worker
+        .register_workflow::<OutboundChildInterceptorChild>()
+        .unwrap();
+    worker.inner_mut().add_workflow_interceptor_factory(|| {
+        WorkflowInterceptors::new().with_interceptor(OutboundChildInterceptor)
+    });
+
+    let handle = worker
+        .submit_workflow(
+            OutboundChildInterceptorParent::run,
+            (),
+            WorkflowStartOptions::new(
+                starter.get_task_queue().to_owned(),
+                starter.get_wf_id().to_owned(),
+            )
+            .build(),
+        )
+        .await
+        .unwrap();
+    worker.run_until_done().await.unwrap();
+    handle.get_result(Default::default()).await.unwrap();
 }

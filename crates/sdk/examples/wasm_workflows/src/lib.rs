@@ -17,7 +17,7 @@ use temporalio_workflow::{
     },
     workflow,
     workflow_interceptors::{
-        ExecuteWorkflowInput, ExecuteWorkflowResult, WorkflowInboundInterceptor,
+        ExecuteWorkflowInput, ExecuteWorkflowResult, WorkflowInterceptor,
         WorkflowInterceptorContext, WorkflowInterceptorFuture, WorkflowNext, WorkflowOutputValue,
     },
     workflow_methods,
@@ -37,7 +37,7 @@ impl HelloWorkflow {
 
 struct WasmWorkflowInterceptor;
 
-impl WorkflowInboundInterceptor for WasmWorkflowInterceptor {
+impl WorkflowInterceptor for WasmWorkflowInterceptor {
     fn execute<'a>(
         &'a self,
         _ctx: WorkflowInterceptorContext,

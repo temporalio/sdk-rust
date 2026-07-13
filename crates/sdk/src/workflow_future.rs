@@ -51,7 +51,7 @@ use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 use crate::{
     panic_formatter,
     workflow_executor::WakeTracker,
-    workflow_interceptors::WorkflowInboundInterceptor,
+    workflow_interceptors::WorkflowInterceptorFactory,
     workflow_registry::{WorkflowExecutionFactory, WorkflowExecutionInput},
 };
 
@@ -68,7 +68,7 @@ pub(crate) fn start_workflow(
     data_converter: DataConverter,
     detect_nondeterministic: bool,
     patch_activation_callback: Option<PatchActivationCallback>,
-    workflow_inbound_interceptors: Vec<Arc<dyn WorkflowInboundInterceptor>>,
+    workflow_interceptor_factories: Vec<Arc<dyn WorkflowInterceptorFactory>>,
 ) -> Result<
     (
         impl Future<Output = WorkflowResult<Payload>> + use<>,
@@ -92,7 +92,7 @@ pub(crate) fn start_workflow(
         data_converter: data_converter.clone(),
         host: host.clone(),
         patch_activation_callback,
-        workflow_inbound_interceptors,
+        workflow_interceptor_factories,
     })
     .context("Failed to create workflow execution")?;
 

@@ -91,13 +91,14 @@ pub use crate::error::{
 pub use temporalio_client::Namespace;
 pub use temporalio_workflow::{
     ActivityCancellationType, ActivityCloseTimeouts, ActivityOptions, BaseWorkflowContext,
-    CancellableFuture, ChildWorkflowCancellationType, ChildWorkflowOptions, ContinueAsNewOptions,
-    ContinueAsNewVersioningBehavior, ExternalWorkflowHandle, LocalActivityOptions, Memo, MemoValue,
-    MemoValues, NamespacedWorkflowInfo, NexusOperationCancellationType, NexusOperationOptions,
-    ParentClosePolicy, PatchActivationCallback, PatchActivationInput, RetryPolicy, Signal,
-    SignalData, StartChildWorkflowExecutionFailedCause, StartedChildWorkflow, SyncWorkflowContext,
-    TimerOptions, TimerResult, VersioningIntent, WorkflowContext, WorkflowContextView,
-    WorkflowIdReusePolicy, WorkflowRandomValue, WorkflowResult, WorkflowTermination,
+    CancellableFuture, CancellableFutureWithReason, ChildWorkflowCancellationType,
+    ChildWorkflowOptions, ContinueAsNewOptions, ContinueAsNewVersioningBehavior,
+    ExternalWorkflowHandle, LocalActivityOptions, MemoValue, NexusOperationCancellationType,
+    NexusOperationOptions, ParentClosePolicy, PatchActivationCallback, Signal, SignalData,
+    StartChildWorkflowExecutionFailedCause, StartChildWorkflowOutput, StartedChildWorkflow,
+    StartedNexusOperation, SyncWorkflowContext, TimerOptions, TimerResult, WorkflowContext,
+    WorkflowContextView, WorkflowIdReusePolicy, WorkflowRandomValue, WorkflowResult,
+    WorkflowTermination,
 };
 #[cfg(feature = "wasm-workflows")]
 pub use workflow_wasm::WasmWorkflowComponent;
@@ -110,7 +111,7 @@ use crate::{
     interceptors::{ActivityInboundInterceptor, WorkerInterceptor},
     workflow_executor::{TaskHandle, WorkflowExecutor},
     workflow_future::start_workflow,
-    workflow_interceptors::WorkflowInboundInterceptor,
+    workflow_interceptors::WorkflowInterceptorFactory,
     workflow_registry::WorkflowDefinitions,
 };
 use anyhow::{Context, anyhow, bail};
@@ -175,7 +176,7 @@ pub struct WorkerOptions {
     workflows: WorkflowDefinitions,
 
     #[builder(field)]
-    workflow_inbound_interceptors: Vec<Arc<dyn WorkflowInboundInterceptor>>,
+    workflow_interceptor_factories: Vec<Arc<dyn WorkflowInterceptorFactory>>,
 
     #[cfg(feature = "wasm-workflows")]
     #[builder(field)]
@@ -352,14 +353,12 @@ impl<S: worker_options_builder::State> WorkerOptionsBuilder<S> {
         Ok(self)
     }
 
-    /// Append a [WorkflowInboundInterceptor] to the chain. Interceptors run in the order they
-    /// are added, outer-most first.
-    pub fn add_workflow_inbound_interceptor(
+    /// Append a factory that creates a fresh interceptor chain for each workflow instance.
+    pub fn add_workflow_interceptor_factory(
         mut self,
-        interceptor: impl WorkflowInboundInterceptor,
+        factory: impl WorkflowInterceptorFactory,
     ) -> Self {
-        self.workflow_inbound_interceptors
-            .push(Arc::new(interceptor));
+        self.workflow_interceptor_factories.push(Arc::new(factory));
         self
     }
 
@@ -425,14 +424,12 @@ impl WorkerOptions {
         Ok(self)
     }
 
-    /// Append a [WorkflowInboundInterceptor] to the chain. Interceptors run in the order they
-    /// are added, outer-most first.
-    pub fn add_workflow_inbound_interceptor(
+    /// Append a factory that creates a fresh interceptor chain for each workflow instance.
+    pub fn add_workflow_interceptor_factory(
         &mut self,
-        interceptor: impl WorkflowInboundInterceptor,
+        factory: impl WorkflowInterceptorFactory,
     ) -> &mut Self {
-        self.workflow_inbound_interceptors
-            .push(Arc::new(interceptor));
+        self.workflow_interceptor_factories.push(Arc::new(factory));
         self
     }
 
@@ -505,7 +502,7 @@ struct CommonWorker {
     task_queue: String,
     worker_interceptor: Option<Box<dyn WorkerInterceptor>>,
     activity_inbound_interceptors: Vec<Arc<dyn ActivityInboundInterceptor>>,
-    workflow_inbound_interceptors: Vec<Arc<dyn WorkflowInboundInterceptor>>,
+    workflow_interceptor_factories: Vec<Arc<dyn WorkflowInterceptorFactory>>,
     client_options: ClientOptions,
     data_converter: DataConverter,
 }
@@ -654,8 +651,8 @@ impl Worker {
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let acts = std::mem::take(&mut options.activities);
         let wfs = std::mem::take(&mut options.workflows);
-        let workflow_inbound_interceptors =
-            std::mem::take(&mut options.workflow_inbound_interceptors);
+        let workflow_interceptor_factories =
+            std::mem::take(&mut options.workflow_interceptor_factories);
         #[cfg(feature = "wasm-workflows")]
         let wasm_components = std::mem::take(&mut options.wasm_workflow_components);
         let mut me = Self::new_from_core_definitions(
@@ -663,7 +660,7 @@ impl Worker {
             client_options,
             acts,
             wfs,
-            workflow_inbound_interceptors,
+            workflow_interceptor_factories,
         );
         me.set_detect_nondeterministic_futures(options.detect_nondeterministic_futures);
         me.workflow_half.patch_activation_callback = options.patch_activation_callback;
@@ -679,7 +676,7 @@ impl Worker {
         client_options: ClientOptions,
         activities: ActivityDefinitions,
         workflows: WorkflowDefinitions,
-        workflow_inbound_interceptors: Vec<Arc<dyn WorkflowInboundInterceptor>>,
+        workflow_interceptor_factories: Vec<Arc<dyn WorkflowInterceptorFactory>>,
     ) -> Self {
         let data_converter = client_options.data_converter.clone();
         Self {
@@ -688,7 +685,7 @@ impl Worker {
                 worker,
                 worker_interceptor: None,
                 activity_inbound_interceptors: Vec::new(),
-                workflow_inbound_interceptors,
+                workflow_interceptor_factories,
                 client_options,
                 data_converter,
             },
@@ -1004,15 +1001,11 @@ impl Worker {
             .push(Arc::new(interceptor));
     }
 
-    /// Append a [WorkflowInboundInterceptor] to the chain. Interceptors run in the order they
-    /// are added, outer-most first.
-    pub fn add_workflow_inbound_interceptor(
-        &mut self,
-        interceptor: impl WorkflowInboundInterceptor,
-    ) {
+    /// Append a factory that creates a fresh interceptor chain for each workflow instance.
+    pub fn add_workflow_interceptor_factory(&mut self, factory: impl WorkflowInterceptorFactory) {
         self.common
-            .workflow_inbound_interceptors
-            .push(Arc::new(interceptor));
+            .workflow_interceptor_factories
+            .push(Arc::new(factory));
     }
 
     /// Turns this rust worker into a new worker with all the same workflows and activities
@@ -1080,7 +1073,7 @@ impl WorkflowHalf {
                         common.data_converter.clone(),
                         self.detect_nondeterministic_futures,
                         self.patch_activation_callback.clone(),
-                        common.workflow_inbound_interceptors.clone(),
+                        common.workflow_interceptor_factories.clone(),
                     ) {
                         Ok(result) => result,
                         Err(e) => {

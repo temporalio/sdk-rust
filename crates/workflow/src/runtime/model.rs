@@ -3,7 +3,8 @@
 use crate::{
     runtime::types::ContinueAsNewRequest,
     workflow_context::{
-        ChildWfCommon, NexusUnblockData, PendingChildWorkflow, StartedNexusOperation,
+        ChildWfCommon, NexusResultFuture, NexusUnblockData, PendingChildWorkflow,
+        StartedNexusOperation,
     },
 };
 use temporalio_common_wasm::{
@@ -145,18 +146,27 @@ impl Unblockable for NexusStartResult {
     type OtherDat = NexusUnblockData;
 
     fn unblock(ue: UnblockEvent, od: Self::OtherDat) -> Self {
+        let NexusUnblockData {
+            result_future,
+            schedule_seq,
+            base_ctx,
+        } = od;
         match ue {
             UnblockEvent::NexusOperationStart(_, result) => match *result {
                 resolve_nexus_operation_start::Status::OperationToken(op_token) => {
                     Ok(StartedNexusOperation {
                         operation_token: Some(op_token),
-                        unblock_dat: od,
+                        result_future: NexusResultFuture::Raw(result_future),
+                        schedule_seq,
+                        base_ctx,
                     })
                 }
                 resolve_nexus_operation_start::Status::StartedSync(_) => {
                     Ok(StartedNexusOperation {
                         operation_token: None,
-                        unblock_dat: od,
+                        result_future: NexusResultFuture::Raw(result_future),
+                        schedule_seq,
+                        base_ctx,
                     })
                 }
                 resolve_nexus_operation_start::Status::Failed(f) => Err(f),
