@@ -1,8 +1,8 @@
 use crate::{
     NamespacedClient, WorkflowCancelOptions, WorkflowDescribeOptions, WorkflowExecuteUpdateOptions,
-    WorkflowFetchHistoryOptions, WorkflowGetResultOptions, WorkflowQueryOptions,
-    WorkflowSignalOptions, WorkflowStartUpdateOptions, WorkflowTerminateOptions,
-    WorkflowUpdateWaitStage,
+    WorkflowExecutionStatus, WorkflowFetchHistoryOptions, WorkflowGetResultOptions,
+    WorkflowQueryOptions, WorkflowSignalOptions, WorkflowStartUpdateOptions,
+    WorkflowTerminateOptions, WorkflowUpdateWaitStage,
     errors::{
         WorkflowGetResultError, WorkflowInteractionError, WorkflowQueryError, WorkflowUpdateError,
     },
@@ -164,10 +164,8 @@ impl WorkflowExecutionDescription {
     }
 
     /// The current status of the workflow execution.
-    pub fn status(
-        &self,
-    ) -> temporalio_common::protos::temporal::api::enums::v1::WorkflowExecutionStatus {
-        self.workflow_info().status()
+    pub fn status(&self) -> WorkflowExecutionStatus {
+        WorkflowExecutionStatus::from_raw(self.workflow_info().status)
     }
 
     /// When the workflow was created.
@@ -660,7 +658,10 @@ where
             .into_inner();
 
         if let Some(rejected) = response.query_rejected {
-            return Err(WorkflowQueryError::Rejected(rejected));
+            return Err(WorkflowQueryError::Rejected {
+                status: (rejected.status != 0)
+                    .then(|| WorkflowExecutionStatus::from_raw(rejected.status)),
+            });
         }
 
         let result_payloads = response
@@ -1027,7 +1028,7 @@ mod tests {
     use std::collections::HashMap;
     use temporalio_common::protos::temporal::api::{
         common::v1::{Memo, SearchAttributes},
-        enums::v1::WorkflowExecutionStatus,
+        enums::v1::WorkflowExecutionStatus as ProtoWorkflowExecutionStatus,
         sdk::v1::UserMetadata,
         workflow::v1::WorkflowExecutionConfig,
     };
@@ -1063,7 +1064,7 @@ mod tests {
                             name: "wf-type".to_string(),
                         },
                     ),
-                    status: WorkflowExecutionStatus::Completed as i32,
+                    status: ProtoWorkflowExecutionStatus::Completed as i32,
                     task_queue: "task-queue".to_string(),
                     history_length: 42,
                     memo: Some(Memo {
@@ -1099,6 +1100,17 @@ mod tests {
         assert_eq!(description.run_id(), "run-id");
         assert_eq!(description.workflow_type(), "wf-type");
         assert_eq!(description.status(), WorkflowExecutionStatus::Completed);
+        let mut unknown_status_description = description.clone();
+        unknown_status_description
+            .raw_description
+            .workflow_execution_info
+            .as_mut()
+            .unwrap()
+            .status = 123_456;
+        assert_eq!(
+            unknown_status_description.status(),
+            WorkflowExecutionStatus::Unknown
+        );
         assert_eq!(description.task_queue(), "task-queue");
         assert_eq!(description.history_length(), 42);
         assert_eq!(description.parent_id(), Some("parent-id"));

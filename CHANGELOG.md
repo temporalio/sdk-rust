@@ -64,6 +64,8 @@ to docs, or any other relevant information.
 * Activity and child-workflow failure metadata now exposes activity and workflow type names as
   strings, and workflow executions as the Rust-native `WorkflowExecution` type. `ActivityInfo`
   uses the same Rust-native workflow execution type.
+* Workflow status accessors and query rejection errors now use the Rust-native
+  `WorkflowExecutionStatus` enum instead of generated protobuf types.
 
 ### Fixed
 * OTLP metric export failures are now logged through Core telemetry when OpenTelemetry's periodic

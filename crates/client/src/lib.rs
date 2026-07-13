@@ -27,6 +27,7 @@ mod retry;
 pub mod schedules;
 pub mod worker;
 mod workflow_handle;
+mod workflow_status;
 
 pub use crate::{
     proxy::HttpConnectProxyOptions,
@@ -53,6 +54,7 @@ pub use workflow_handle::{
     WorkflowExecutionDescription, WorkflowExecutionInfo, WorkflowExecutionResult, WorkflowHandle,
     WorkflowHistory, WorkflowUpdateHandle,
 };
+pub use workflow_status::WorkflowExecutionStatus;
 
 use crate::{
     grpc::{
@@ -89,7 +91,7 @@ use temporalio_common::{
         temporal::api::{
             cloud::cloudservice::v1::cloud_service_client::CloudServiceClient,
             common::v1::{Memo, Payload, WorkflowType},
-            enums::v1::{TaskQueueKind, WorkflowExecutionStatus},
+            enums::v1::TaskQueueKind,
             errordetails::v1::WorkflowExecutionAlreadyStartedFailure,
             operatorservice::v1::operator_service_client::OperatorServiceClient,
             sdk::v1::UserMetadata,
@@ -943,7 +945,7 @@ impl WorkflowExecution {
 
     /// The current status of the workflow execution.
     pub fn status(&self) -> WorkflowExecutionStatus {
-        self.raw.status()
+        WorkflowExecutionStatus::from_raw(self.raw.status)
     }
 
     /// When the workflow was created.

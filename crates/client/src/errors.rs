@@ -1,9 +1,10 @@
 //! Contains errors that can be returned by clients.
 
+use crate::WorkflowExecutionStatus;
 use http::uri::InvalidUri;
 use temporalio_common::{
     data_converters::PayloadConversionError,
-    protos::temporal::api::{common::v1::Payload, failure::v1::Failure, query::v1::QueryRejected},
+    protos::temporal::api::{common::v1::Payload, failure::v1::Failure},
 };
 use tonic::Code;
 
@@ -100,8 +101,11 @@ pub enum WorkflowQueryError {
     NotFound(#[source] tonic::Status),
 
     /// The query was rejected based on the rejection condition.
-    #[error("Query rejected: workflow status {:?}", .0.status)]
-    Rejected(QueryRejected),
+    #[error("Query rejected: workflow status {status:?}")]
+    Rejected {
+        /// The workflow status that caused the query rejection, if reported.
+        status: Option<WorkflowExecutionStatus>,
+    },
 
     /// Error serializing input or deserializing output.
     #[error("Payload conversion error: {0}")]
