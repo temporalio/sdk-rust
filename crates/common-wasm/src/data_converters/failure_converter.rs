@@ -1149,10 +1149,7 @@ mod tests {
         };
         assert_eq!(decoded_failure.failure(), &failure);
         assert_eq!(decoded_failure.activity_id(), "act-1");
-        assert_eq!(
-            decoded_failure.activity_type().map(|ty| ty.name.as_str()),
-            Some("test-activity")
-        );
+        assert_eq!(decoded_failure.activity_type(), Some("test-activity"));
         assert_eq!(decoded_failure.scheduled_event_id(), 5);
         assert_eq!(decoded_failure.started_event_id(), 6);
         assert_eq!(decoded_failure.identity(), "worker-1");
@@ -1340,10 +1337,7 @@ mod tests {
                 .map(|wf| wf.run_id.as_str()),
             Some("run-id")
         );
-        assert_eq!(
-            decoded_failure.workflow_type().map(|wf| wf.name.as_str()),
-            Some("child-type")
-        );
+        assert_eq!(decoded_failure.workflow_type(), Some("child-type"));
         assert_eq!(decoded_failure.initiated_event_id(), 11);
         assert_eq!(decoded_failure.started_event_id(), 22);
         assert_eq!(

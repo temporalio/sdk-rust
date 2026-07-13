@@ -1067,9 +1067,7 @@ async fn workflow_observes_non_retryable_activity() {
             };
             assert_eq!(fail_err.activity_id(), "non-retryable-act");
             assert_eq!(
-                fail_err
-                    .activity_type()
-                    .map(|activity_type| activity_type.name.as_str()),
+                fail_err.activity_type(),
                 Some(NonRetryableActivityErrorActivities::fail_non_retryable.name())
             );
             assert_eq!(fail_err.retry_state(), RetryState::NonRetryableFailure);
@@ -1963,9 +1961,7 @@ async fn activity_can_be_cancelled_by_local_timeout() {
             };
             assert_eq!(timeout.timeout_type(), TimeoutType::StartToClose);
             assert_eq!(
-                fail_err
-                    .activity_type()
-                    .map(|activity_type| activity_type.name.as_str()),
+                fail_err.activity_type(),
                 Some(CancellableEchoActivities::cancellable_echo.name())
             );
             Ok(())

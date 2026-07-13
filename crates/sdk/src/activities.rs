@@ -72,14 +72,14 @@ use std::{
 use temporalio_client::{Client, ClientOptions, Priority, WorkflowExecutionInfo, WorkflowHandle};
 pub use temporalio_common::ActivityError;
 use temporalio_common::{
-    ActivityDefinition, HasWorkflowDefinition,
+    ActivityDefinition, HasWorkflowDefinition, WorkflowExecution,
     data_converters::{
         DataConverter, GenericPayloadConverter, SerializationContext, SerializationContextData,
     },
     error::ApplicationFailure,
     protos::{
         coresdk::{ActivityHeartbeat, activity_result::ActivityExecutionResult, activity_task},
-        temporal::api::common::v1::{Payload, RetryPolicy, WorkflowExecution},
+        temporal::api::common::v1::{Payload, RetryPolicy},
         utilities::TryIntoOrNone,
     },
 };
@@ -147,7 +147,7 @@ impl ActivityContext {
                     task_queue,
                     workflow_type,
                     workflow_namespace,
-                    workflow_execution,
+                    workflow_execution: workflow_execution.map(Into::into),
                     activity_id,
                     activity_type,
                     heartbeat_timeout: heartbeat_timeout.try_into_or_none(),

@@ -11,6 +11,7 @@ mod activity_definition;
 pub mod data_converters;
 pub mod error;
 mod priority;
+mod workflow_execution;
 pub mod protos {
     //! Protobuf definitions re-exported from `temporalio-protos`.
 
@@ -31,6 +32,7 @@ pub use workflow_definition::{
     HasWorkflowDefinition, QueryDefinition, SignalDefinition, UntypedWorkflow, UpdateDefinition,
     WorkflowDefinition,
 };
+pub use workflow_execution::WorkflowExecution;
 
 #[allow(unused_macros)]
 macro_rules! dbg_panic {

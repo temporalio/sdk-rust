@@ -2002,11 +2002,7 @@ async fn test_schedule_to_start_timeout() {
                     panic!("expected timeout cause, got {fail:?}");
                 };
                 assert_eq!(timeout.timeout_type(), TimeoutType::ScheduleToStart);
-                assert_eq!(
-                    fail.activity_type()
-                        .map(|activity_type| activity_type.name.as_str()),
-                    Some(StdActivities::echo.name())
-                );
+                assert_eq!(fail.activity_type(), Some(StdActivities::echo.name()));
             }
             Ok(())
         }

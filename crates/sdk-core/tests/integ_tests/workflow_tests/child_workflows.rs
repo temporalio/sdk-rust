@@ -642,7 +642,7 @@ impl GrandchildCancellationWf {
             Some(child_workflow_id.as_str())
         );
         assert_eq!(
-            failure.workflow_type().map(|wf| wf.name.as_str()),
+            failure.workflow_type(),
             Some("child_propagates_cancellation")
         );
         let grandchild_workflow_id = format!("{}-grandchild", ctx.task_queue());
@@ -656,12 +656,7 @@ impl GrandchildCancellationWf {
                 .map(|wf| wf.workflow_id.as_str()),
             Some(grandchild_workflow_id.as_str())
         );
-        assert_eq!(
-            grandchild_failure
-                .workflow_type()
-                .map(|wf| wf.name.as_str()),
-            Some("grandchild_wf")
-        );
+        assert_eq!(grandchild_failure.workflow_type(), Some("grandchild_wf"));
         let Some(cancelled) = grandchild_failure.as_cancelled() else {
             panic!("grandchild failure should retain the cancelled reason");
         };
@@ -952,10 +947,7 @@ impl ParentWf {
                         .map(|wf| wf.workflow_id.as_str()),
                     Some("child-id-1")
                 );
-                assert_eq!(
-                    failure.workflow_type().map(|wf| wf.name.as_str()),
-                    Some("child")
-                );
+                assert_eq!(failure.workflow_type(), Some("child"));
                 Ok(())
             }
             _ => Err(anyhow!("Unexpected child WF status").into()),

@@ -61,6 +61,9 @@ to docs, or any other relevant information.
   `ScheduleDescription::search_attributes`, and `ScheduleSummary::search_attributes` now return
   typed `SearchAttributes` instead of raw proto search attributes. Missing search attributes are
   returned as an empty collection instead of `None`.
+* Activity and child-workflow failure metadata now exposes activity and workflow type names as
+  strings, and workflow executions as the Rust-native `WorkflowExecution` type. `ActivityInfo`
+  uses the same Rust-native workflow execution type.
 
 ### Fixed
 * OTLP metric export failures are now logged through Core telemetry when OpenTelemetry's periodic

@@ -1,6 +1,7 @@
 //! Shared error types used across Temporal SDK crates.
 
 use crate::{
+    WorkflowExecution,
     data_converters::{
         DecodablePayloads, GenericPayloadConverter, PayloadConversionError, PayloadConverter,
         RawValue, SerializationContext, SerializationContextData, TemporalDeserializable,
@@ -705,7 +706,7 @@ pub struct ActivityFailureError {
     failure: Failure,
     cause: Option<Box<IncomingError>>,
     activity_id: String,
-    activity_type: Option<crate::protos::temporal::api::common::v1::ActivityType>,
+    activity_type: Option<String>,
     scheduled_event_id: i64,
     started_event_id: i64,
     identity: String,
@@ -724,7 +725,9 @@ impl ActivityFailureError {
             failure,
             cause: cause.map(Box::new),
             activity_id: failure_info.activity_id,
-            activity_type: failure_info.activity_type,
+            activity_type: failure_info
+                .activity_type
+                .map(|activity_type| activity_type.name),
             scheduled_event_id: failure_info.scheduled_event_id,
             started_event_id: failure_info.started_event_id,
             identity: failure_info.identity,
@@ -738,8 +741,8 @@ impl ActivityFailureError {
     }
 
     /// Returns the activity type, if present.
-    pub fn activity_type(&self) -> Option<&crate::protos::temporal::api::common::v1::ActivityType> {
-        self.activity_type.as_ref()
+    pub fn activity_type(&self) -> Option<&str> {
+        self.activity_type.as_deref()
     }
 
     /// Returns the scheduled event id.
@@ -782,8 +785,8 @@ pub struct ChildWorkflowFailureError {
     failure: Failure,
     cause: Option<Box<IncomingError>>,
     namespace: String,
-    workflow_execution: Option<crate::protos::temporal::api::common::v1::WorkflowExecution>,
-    workflow_type: Option<crate::protos::temporal::api::common::v1::WorkflowType>,
+    workflow_execution: Option<WorkflowExecution>,
+    workflow_type: Option<String>,
     initiated_event_id: i64,
     started_event_id: i64,
     retry_state: crate::protos::temporal::api::enums::v1::RetryState,
@@ -801,8 +804,10 @@ impl ChildWorkflowFailureError {
             failure,
             cause: cause.map(Box::new),
             namespace: failure_info.namespace,
-            workflow_execution: failure_info.workflow_execution,
-            workflow_type: failure_info.workflow_type,
+            workflow_execution: failure_info.workflow_execution.map(Into::into),
+            workflow_type: failure_info
+                .workflow_type
+                .map(|workflow_type| workflow_type.name),
             initiated_event_id: failure_info.initiated_event_id,
             started_event_id: failure_info.started_event_id,
             retry_state,
@@ -815,15 +820,13 @@ impl ChildWorkflowFailureError {
     }
 
     /// Returns the child workflow execution, if present.
-    pub fn workflow_execution(
-        &self,
-    ) -> Option<&crate::protos::temporal::api::common::v1::WorkflowExecution> {
+    pub fn workflow_execution(&self) -> Option<&WorkflowExecution> {
         self.workflow_execution.as_ref()
     }
 
     /// Returns the child workflow type, if present.
-    pub fn workflow_type(&self) -> Option<&crate::protos::temporal::api::common::v1::WorkflowType> {
-        self.workflow_type.as_ref()
+    pub fn workflow_type(&self) -> Option<&str> {
+        self.workflow_type.as_deref()
     }
 
     /// Returns the initiated event id.
