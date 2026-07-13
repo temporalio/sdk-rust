@@ -54,7 +54,7 @@ use temporalio_common::{
             },
         },
     },
-    telemetry::{CoreLogStreamConsumer, Logger, TelemetryOptions},
+    telemetry::{CoreLogStreamConsumer, Logger, TelemetryOptions, construct_filter_string},
     worker::WorkerTaskTypes,
 };
 use temporalio_macros::{activities, workflow, workflow_methods};
