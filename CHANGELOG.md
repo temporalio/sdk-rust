@@ -75,6 +75,8 @@ to docs, or any other relevant information.
   explicitly to retain the previous behavior.
 * Workflow and activity retry configuration and runtime information now use the Rust-native
   `RetryPolicy` type instead of the generated protobuf message.
+* Workflow result failures now expose decoded `IncomingError` values, and cancellation and
+  termination details use typed `WorkflowResultDetails` instead of raw payloads.
 
 ### Fixed
 * OTLP metric export failures are now logged through Core telemetry when OpenTelemetry's periodic

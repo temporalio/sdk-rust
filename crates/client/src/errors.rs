@@ -1,10 +1,10 @@
 //! Contains errors that can be returned by clients.
 
-use crate::WorkflowExecutionStatus;
+use crate::{WorkflowExecutionStatus, workflow_handle::WorkflowResultDetails};
 use http::uri::InvalidUri;
 use temporalio_common::{
-    data_converters::PayloadConversionError,
-    protos::temporal::api::{common::v1::Payload, failure::v1::Failure},
+    data_converters::PayloadConversionError, error::IncomingError,
+    protos::temporal::api::failure::v1::Failure,
 };
 use tonic::Code;
 
@@ -170,21 +170,21 @@ impl WorkflowUpdateError {
 #[non_exhaustive]
 pub enum WorkflowGetResultError {
     /// The workflow finished in failure.
-    #[error("Workflow failed: {0:?}")]
-    Failed(Box<Failure>),
+    #[error("Workflow failed: {0}")]
+    Failed(#[source] Box<IncomingError>),
 
     /// The workflow was cancelled.
     #[error("Workflow cancelled")]
     Cancelled {
         /// Details provided at cancellation time.
-        details: Vec<Payload>,
+        details: WorkflowResultDetails,
     },
 
     /// The workflow was terminated.
     #[error("Workflow terminated")]
     Terminated {
         /// Details provided at termination time.
-        details: Vec<Payload>,
+        details: WorkflowResultDetails,
     },
 
     /// The workflow timed out.

@@ -404,13 +404,13 @@ async fn custom_failure_converter_fallback_applied_to_workflow_failures() {
         err => panic!("unexpected workflow result error: {err:?}"),
     };
     assert_eq!(
-        failure.message,
+        failure.failure().message,
         format!(
             "Failed converting error to failure: Encoding error: {FAILURE_CONVERTER_ERROR_MESSAGE}, original error message: {WORKFLOW_FAILURE_MESSAGE}"
         )
     );
     assert!(matches!(
-        failure.failure_info,
+        failure.failure().failure_info.as_ref(),
         Some(FailureInfo::ApplicationFailureInfo(_))
     ));
 }

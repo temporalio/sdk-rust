@@ -53,7 +53,7 @@ pub use tonic;
 pub use workflow_handle::{
     UntypedQuery, UntypedSignal, UntypedUpdate, UntypedWorkflow, UntypedWorkflowHandle,
     WorkflowExecutionDescription, WorkflowExecutionInfo, WorkflowExecutionResult, WorkflowHandle,
-    WorkflowHistory, WorkflowUpdateHandle,
+    WorkflowHistory, WorkflowResultDetails, WorkflowUpdateHandle,
 };
 pub use workflow_status::WorkflowExecutionStatus;
 
