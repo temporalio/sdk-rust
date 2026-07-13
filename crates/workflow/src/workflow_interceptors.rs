@@ -1,7 +1,7 @@
 //! Workflow interceptor APIs.
 
 use crate::{
-    BaseWorkflowContext,
+    BaseWorkflowContext, WorkflowContextView,
     runtime::{
         entry::WorkflowError,
         model::{WorkflowResult, WorkflowTermination},
@@ -315,7 +315,63 @@ impl DecodedInput {
     }
 }
 
+/// Input passed to [`WorkflowInboundInterceptor::initialize_workflow`].
+///
+/// The decoded input is present when the workflow's `#[init]` method accepts the workflow start
+/// input.
+#[non_exhaustive]
+pub struct InitializeWorkflowInput {
+    decoded: DecodedInput,
+}
+
+impl InitializeWorkflowInput {
+    pub(crate) fn new(value: Option<Box<dyn Any>>, headers: HashMap<String, Payload>) -> Self {
+        Self {
+            decoded: DecodedInput::new(value, headers),
+        }
+    }
+
+    pub(crate) fn into_parts(self) -> (Option<Box<dyn Any>>, HashMap<String, Payload>) {
+        self.decoded.into_parts()
+    }
+
+    /// Attempt to access the decoded workflow input as a concrete type.
+    pub fn input_ref<T: Any>(&self) -> Option<&T> {
+        self.decoded.input_ref()
+    }
+
+    /// Attempt to mutably access the decoded workflow input as a concrete type.
+    pub fn input_mut<T: Any>(&mut self) -> Option<&mut T> {
+        self.decoded.input_mut()
+    }
+
+    /// Headers attached to the workflow execution.
+    pub fn headers(&self) -> &HashMap<String, Payload> {
+        self.decoded.headers()
+    }
+
+    /// Mutably access headers attached to the workflow execution.
+    pub fn headers_mut(&mut self) -> &mut HashMap<String, Payload> {
+        self.decoded.headers_mut()
+    }
+}
+
+/// Result of workflow initialization.
+pub struct InitializeWorkflowOutput {
+    _private: (),
+}
+
+impl InitializeWorkflowOutput {
+    pub(crate) fn new() -> Self {
+        Self { _private: () }
+    }
+}
+
 /// Input passed to [`WorkflowInboundInterceptor::execute`].
+///
+/// The decoded input is present when the workflow's `#[run]` method accepts the workflow start
+/// input. Inputs consumed by `#[init]` are instead passed to
+/// [`WorkflowInboundInterceptor::initialize_workflow`].
 #[non_exhaustive]
 pub struct ExecuteWorkflowInput {
     decoded: DecodedInput,
@@ -488,6 +544,18 @@ impl ValidateUpdateInput {
 
 /// Inbound interceptor for workflow execution and message handlers.
 pub trait WorkflowInboundInterceptor: Send + Sync + 'static {
+    /// Called to invoke the workflow's `#[init]` method.
+    ///
+    /// It is only called for workflows that define `#[init]`, before the workflow instance exists.
+    fn initialize_workflow(
+        &self,
+        _ctx: WorkflowContextView,
+        input: InitializeWorkflowInput,
+        next: WorkflowNext<'_, InitializeWorkflowInput, InitializeWorkflowOutput>,
+    ) -> InitializeWorkflowOutput {
+        next.run(input)
+    }
+
     /// Called to invoke the workflow run method.
     fn execute<'a>(
         &'a self,

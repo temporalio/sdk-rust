@@ -18,9 +18,9 @@ use temporalio_sdk::{
     workflow_interceptors::{
         ExecuteWorkflowInput, ExecuteWorkflowResult, HandleQueryInput, HandleQueryResult,
         HandleSignalInput, HandleSignalResult, HandleUpdateInput, HandleUpdateResult,
-        SyncWorkflowInterceptorContext, ValidateUpdateInput, ValidateUpdateResult,
-        WorkflowInboundInterceptor, WorkflowInterceptorContext, WorkflowInterceptorFuture,
-        WorkflowNext, WorkflowOutputValue,
+        InitializeWorkflowInput, InitializeWorkflowOutput, SyncWorkflowInterceptorContext,
+        ValidateUpdateInput, ValidateUpdateResult, WorkflowInboundInterceptor,
+        WorkflowInterceptorContext, WorkflowInterceptorFuture, WorkflowNext, WorkflowOutputValue,
     },
 };
 use tokio::{join, sync::Notify};
@@ -377,6 +377,94 @@ async fn workflow_inbound_interceptors_wrap_execute_in_order() {
             "inner after".to_string(),
             "outer after".to_string(),
         ]
+    );
+}
+
+#[workflow]
+struct InitInputInterceptorWorkflow {
+    value: String,
+}
+
+#[workflow_methods]
+impl InitInputInterceptorWorkflow {
+    #[init]
+    fn init(_ctx: &WorkflowContextView, value: String) -> Self {
+        Self { value }
+    }
+
+    #[run]
+    async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<String> {
+        Ok(ctx.state(|workflow| workflow.value.clone()))
+    }
+}
+
+struct InitInputMutationInterceptor {
+    received_input: Arc<AtomicUsize>,
+}
+
+impl WorkflowInboundInterceptor for InitInputMutationInterceptor {
+    fn initialize_workflow(
+        &self,
+        _ctx: WorkflowContextView,
+        mut input: InitializeWorkflowInput,
+        next: WorkflowNext<'_, InitializeWorkflowInput, InitializeWorkflowOutput>,
+    ) -> InitializeWorkflowOutput {
+        if let Some(value) = input.input_mut::<String>() {
+            self.received_input.fetch_add(1, Ordering::Relaxed);
+            *value = "intercepted".to_string();
+        }
+        next.run(input)
+    }
+
+    fn execute<'a>(
+        &'a self,
+        _ctx: WorkflowInterceptorContext,
+        input: ExecuteWorkflowInput,
+        next: WorkflowNext<
+            'a,
+            ExecuteWorkflowInput,
+            WorkflowInterceptorFuture<'a, ExecuteWorkflowResult>,
+        >,
+    ) -> WorkflowInterceptorFuture<'a, ExecuteWorkflowResult> {
+        assert!(input.input_ref::<String>().is_none());
+        next.run(input)
+    }
+}
+
+#[tokio::test]
+async fn workflow_initialize_interceptor_mutates_init_input() {
+    let mut starter = CoreWfStarter::new("workflow_initialize_interceptor_mutates_init_input");
+    starter.sdk_config.task_types = WorkerTaskTypes::workflow_only();
+    let mut worker = starter.worker().await;
+    worker
+        .register_workflow::<InitInputInterceptorWorkflow>()
+        .unwrap();
+
+    let received_input = Arc::new(AtomicUsize::new(0));
+    worker
+        .inner_mut()
+        .add_workflow_inbound_interceptor(InitInputMutationInterceptor {
+            received_input: received_input.clone(),
+        });
+
+    let handle = worker
+        .submit_workflow(
+            InitInputInterceptorWorkflow::run,
+            "original".to_string(),
+            WorkflowStartOptions::new(
+                starter.get_task_queue().to_owned(),
+                starter.get_wf_id().to_owned(),
+            )
+            .build(),
+        )
+        .await
+        .unwrap();
+    worker.run_until_done().await.unwrap();
+
+    assert_eq!(received_input.load(Ordering::Relaxed), 1);
+    assert_eq!(
+        handle.get_result(Default::default()).await.unwrap(),
+        "intercepted"
     );
 }
 

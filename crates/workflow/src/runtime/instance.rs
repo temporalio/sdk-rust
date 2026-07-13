@@ -1,7 +1,7 @@
 //! Guest-side workflow execution implementation used by native and future WASM hosts.
 
 use crate::{
-    BaseWorkflowContext, WorkflowContext,
+    BaseWorkflowContext, WorkflowContext, WorkflowContextView,
     runtime::{
         ConstructionBlockedFuture,
         entry::{WorkflowError, WorkflowImplementation},
@@ -17,9 +17,10 @@ use crate::{
     workflow_interceptors::{
         ExecuteWorkflowInput, ExecuteWorkflowResult, HandleQueryInput, HandleQueryResult,
         HandleSignalInput, HandleSignalResult, HandleUpdateInput, HandleUpdateResult,
-        SyncWorkflowInterceptorContext, ValidateUpdateInput, ValidateUpdateResult,
-        WorkflowInboundInterceptor, WorkflowInterceptorContext, WorkflowInterceptorFuture,
-        WorkflowNext, serialize_workflow_output, wrong_workflow_input_type,
+        InitializeWorkflowInput, InitializeWorkflowOutput, SyncWorkflowInterceptorContext,
+        ValidateUpdateInput, ValidateUpdateResult, WorkflowInboundInterceptor,
+        WorkflowInterceptorContext, WorkflowInterceptorFuture, WorkflowNext,
+        serialize_workflow_output, wrong_workflow_input_type,
     },
 };
 use futures_util::{
@@ -90,6 +91,24 @@ enum RoutinePollState<T> {
 
 fn expect_resolution<T>(value: Option<T>) -> T {
     value.expect("resolution expected payload")
+}
+
+fn call_initialize_workflow<'a>(
+    interceptors: &'a [Arc<dyn WorkflowInboundInterceptor>],
+    ctx: WorkflowContextView,
+    input: InitializeWorkflowInput,
+    next: WorkflowNext<'a, InitializeWorkflowInput, InitializeWorkflowOutput>,
+) -> InitializeWorkflowOutput {
+    if let Some((first, rest)) = interceptors.split_first() {
+        let next_ctx = ctx.clone();
+        first.initialize_workflow(
+            ctx,
+            input,
+            WorkflowNext::new(move |input| call_initialize_workflow(rest, next_ctx, input, next)),
+        )
+    } else {
+        next.run(input)
+    }
 }
 
 fn call_execute_workflow<'a>(
@@ -190,6 +209,7 @@ fn intercepted_execute_future<W>(
     ctx: WorkflowContext<W>,
     base_ctx: BaseWorkflowContext,
     run_input: Option<<W::Run as WorkflowDefinition>::Input>,
+    headers: HashMap<String, Payload>,
     interceptors: Vec<Arc<dyn WorkflowInboundInterceptor>>,
 ) -> LocalBoxFuture<'static, ExecuteWorkflowResult>
 where
@@ -199,7 +219,7 @@ where
     async move {
         let input = ExecuteWorkflowInput::new(
             run_input.map(|input| Box::new(input) as Box<dyn Any>),
-            base_ctx.initial_headers(),
+            headers,
         );
         let handler_base_ctx = base_ctx.clone();
         let interceptor_ctx = WorkflowInterceptorContext::new(base_ctx);
@@ -302,16 +322,41 @@ where
         } else {
             (None, Some(input))
         };
-        Ok(Box::new({
-            let view = base_ctx.view();
-            let workflow = W::init(view, init_input);
-            Self::new_with_workflow_and_interceptors(
-                workflow,
-                base_ctx,
-                run_input,
-                inbound_interceptors,
-            )
-        }))
+        let view = base_ctx.view();
+        let (workflow, headers) = if W::HAS_INIT {
+            let input = InitializeWorkflowInput::new(
+                init_input.map(|input| Box::new(input) as Box<dyn Any>),
+                base_ctx.initial_headers(),
+            );
+            let initialized = RefCell::new(None);
+            let initialized_ref = &initialized;
+            let init_view = view.clone();
+            let next = WorkflowNext::new(move |input: InitializeWorkflowInput| {
+                let (input, headers) = input.into_parts();
+                let input = input.map(|input| {
+                    *input
+                        .downcast::<<W::Run as WorkflowDefinition>::Input>()
+                        .unwrap_or_else(|_| {
+                            panic!("workflow initialization received the wrong concrete input type")
+                        })
+                });
+                initialized_ref.replace(Some((W::init(init_view, input), headers)));
+                InitializeWorkflowOutput::new()
+            });
+            let _ = call_initialize_workflow(&inbound_interceptors, view, input, next);
+            initialized
+                .into_inner()
+                .expect("workflow initialization interceptor must call next")
+        } else {
+            (W::init(view, init_input), base_ctx.initial_headers())
+        };
+        Ok(Box::new(Self::new_with_workflow_interceptors_and_headers(
+            workflow,
+            base_ctx,
+            run_input,
+            headers,
+            inbound_interceptors,
+        )))
     }
 
     pub fn new_with_workflow(
@@ -328,12 +373,30 @@ where
         run_input: Option<<W::Run as WorkflowDefinition>::Input>,
         inbound_interceptors: Vec<Arc<dyn WorkflowInboundInterceptor>>,
     ) -> Self {
+        let headers = base_ctx.initial_headers();
+        Self::new_with_workflow_interceptors_and_headers(
+            workflow,
+            base_ctx,
+            run_input,
+            headers,
+            inbound_interceptors,
+        )
+    }
+
+    fn new_with_workflow_interceptors_and_headers(
+        workflow: W,
+        base_ctx: BaseWorkflowContext,
+        run_input: Option<<W::Run as WorkflowDefinition>::Input>,
+        headers: HashMap<String, Payload>,
+        inbound_interceptors: Vec<Arc<dyn WorkflowInboundInterceptor>>,
+    ) -> Self {
         let workflow = Rc::new(RefCell::new(workflow));
         let ctx = WorkflowContext::from_base(base_ctx.clone(), workflow);
         let run_future = intercepted_execute_future::<W>(
             ctx.clone(),
             base_ctx.clone(),
             run_input,
+            headers,
             inbound_interceptors.clone(),
         )
         .fuse();
