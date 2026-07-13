@@ -821,21 +821,6 @@ pub enum Namespace {
     Id(String),
 }
 
-impl Namespace {
-    /// Convert into grpc request
-    pub fn into_describe_namespace_request(self) -> DescribeNamespaceRequest {
-        let (namespace, id) = match self {
-            Namespace::Name(n) => (n, "".to_owned()),
-            Namespace::Id(n) => ("".to_owned(), n),
-        };
-        DescribeNamespaceRequest {
-            namespace,
-            id,
-            weak_consistency: false,
-        }
-    }
-}
-
 /// This trait provides higher-level friendlier interaction with the server.
 /// See the [WorkflowService] trait for a lower-level client.
 pub(crate) trait WorkflowClientTrait: NamespacedClient {

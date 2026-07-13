@@ -13,7 +13,7 @@ use std::{
     time::{Duration, SystemTime},
 };
 use temporalio_client::{
-    Connection, Namespace, NamespacedClient, RetryOptions, SharedReplaceableClient,
+    Connection, NamespacedClient, RetryOptions, SharedReplaceableClient,
     grpc::WorkflowService,
     request_extensions::{IsWorkerTaskLongPoll, NoRetryOnMatching, RetryConfigForCall},
     worker::ClientWorkerSet,
@@ -738,9 +738,11 @@ impl WorkerClient for WorkerClientBag {
             .connection
             .clone()
             .describe_namespace(
-                Namespace::Name(self.namespace.clone())
-                    .into_describe_namespace_request()
-                    .into_request(),
+                DescribeNamespaceRequest {
+                    namespace: self.namespace.clone(),
+                    ..Default::default()
+                }
+                .into_request(),
             )
             .await?
             .into_inner())

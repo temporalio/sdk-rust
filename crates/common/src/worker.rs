@@ -1,9 +1,7 @@
 //! Contains types that are needed by both the client and the sdk when configuring / interacting
 //! with workers.
 
-use crate::protos::temporal::api::enums::v1::{
-    TaskQueueType, VersioningBehavior as ProtoVersioningBehavior,
-};
+use crate::protos::temporal::api::enums::v1::VersioningBehavior as ProtoVersioningBehavior;
 use std::{
     fs::File,
     io::{self, BufReader, Read},
@@ -114,21 +112,6 @@ impl WorkerTaskTypes {
             || (self.enable_local_activities && other.enable_local_activities)
             || (self.enable_remote_activities && other.enable_remote_activities)
             || (self.enable_nexus && other.enable_nexus)
-    }
-
-    /// Converts the enabled task types into the corresponding [`TaskQueueType`] values.
-    pub fn to_task_queue_types(&self) -> Vec<TaskQueueType> {
-        let mut types = Vec::new();
-        if self.enable_workflows {
-            types.push(TaskQueueType::Workflow);
-        }
-        if self.enable_remote_activities {
-            types.push(TaskQueueType::Activity);
-        }
-        if self.enable_nexus {
-            types.push(TaskQueueType::Nexus);
-        }
-        types
     }
 }
 

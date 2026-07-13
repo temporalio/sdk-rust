@@ -85,6 +85,8 @@ to docs, or any other relevant information.
 * Workflow memo reads use the typed `Memo` collection. Upserts accept maps of optional
   `MemoValue`s, where `None` removes a key, and continue-as-new memo replacements use
   `MemoValues`.
+* Removed the raw-protobuf `Namespace::into_describe_namespace_request` and
+  `WorkerTaskTypes::to_task_queue_types` helpers. These conversions are now internal plumbing.
 
 ### Fixed
 * OTLP metric export failures are now logged through Core telemetry when OpenTelemetry's periodic
