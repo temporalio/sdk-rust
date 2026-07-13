@@ -11,6 +11,7 @@ mod activity_definition;
 pub mod data_converters;
 pub mod error;
 mod priority;
+mod retry_policy;
 mod workflow_execution;
 pub mod protos {
     //! Protobuf definitions re-exported from `temporalio-protos`.
@@ -23,6 +24,7 @@ mod workflow_definition;
 
 pub use activity_definition::{ActivityDefinition, ActivityError, UntypedActivity};
 pub use priority::Priority;
+pub use retry_policy::RetryPolicy;
 pub use search_attributes::{
     SearchAttributeError, SearchAttributeKey, SearchAttributeUpdate, SearchAttributeValue,
     SearchAttributes, Timestamp,

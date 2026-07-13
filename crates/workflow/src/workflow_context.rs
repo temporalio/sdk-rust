@@ -36,7 +36,7 @@ use std::{
     time::{Duration, SystemTime},
 };
 use temporalio_common_wasm::{
-    ActivityDefinition, SignalDefinition, WorkflowDefinition,
+    ActivityDefinition, RetryPolicy, SignalDefinition, WorkflowDefinition,
     data_converters::{
         ActivityExecutionDecodeHint, ChildWorkflowExecutionDecodeHint,
         ChildWorkflowStartDecodeHint, DataConverter, GenericPayloadConverter, PayloadConverter,
@@ -311,8 +311,7 @@ pub struct WorkflowContextView {
     pub root: Option<RootWorkflowInfo>,
 
     /// The workflow's retry policy
-    pub retry_policy:
-        Option<temporalio_common_wasm::protos::temporal::api::common::v1::RetryPolicy>,
+    pub retry_policy: Option<RetryPolicy>,
     /// If this workflow runs on a cron schedule
     pub cron_schedule: Option<String>,
     /// User-defined memo
@@ -394,7 +393,7 @@ impl WorkflowContextView {
             task_timeout: init.workflow_task_timeout.and_then(|d| d.try_into().ok()),
             parent,
             root,
-            retry_policy: init.retry_policy.clone(),
+            retry_policy: init.retry_policy.clone().map(Into::into),
             cron_schedule,
             memo: init.memo.clone(),
             search_attributes: init
@@ -2461,10 +2460,13 @@ mod tests {
                     memo: Some(memo.clone()),
                     headers: Some(headers.clone()),
                     search_attributes: Some(search_attributes.clone()),
-                    retry_policy: Some(RetryPolicy {
-                        maximum_attempts: 5,
-                        ..Default::default()
-                    }),
+                    retry_policy: Some(
+                        RetryPolicy {
+                            maximum_attempts: 5,
+                            ..Default::default()
+                        }
+                        .into(),
+                    ),
                     versioning_intent: Some(ProtoVersioningIntent::Compatible.into()),
                     initial_versioning_behavior: Some(
                         ContinueAsNewVersioningBehavior::UseRampingVersion,
@@ -2493,6 +2495,8 @@ mod tests {
                 headers,
                 search_attributes: Some(proto_search_attributes),
                 retry_policy: Some(RetryPolicy {
+                    initial_interval: Some(Duration::from_secs(1).try_into().unwrap()),
+                    backoff_coefficient: 2.0,
                     maximum_attempts: 5,
                     ..Default::default()
                 }),

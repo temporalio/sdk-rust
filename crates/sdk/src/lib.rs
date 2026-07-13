@@ -93,7 +93,7 @@ pub use temporalio_workflow::{
     CancellableFuture, ChildWorkflowCancellationType, ChildWorkflowOptions, ContinueAsNewOptions,
     ContinueAsNewVersioningBehavior, ExternalWorkflowHandle, LocalActivityOptions,
     NexusOperationCancellationType, NexusOperationOptions, ParentClosePolicy, ParentWorkflowInfo,
-    RootWorkflowInfo, Signal, SignalData, StartChildWorkflowExecutionFailedCause,
+    RetryPolicy, RootWorkflowInfo, Signal, SignalData, StartChildWorkflowExecutionFailedCause,
     StartedChildWorkflow, SyncWorkflowContext, TimerOptions, TimerResult, VersioningIntent,
     WorkflowContext, WorkflowContextView, WorkflowIdReusePolicy, WorkflowResult,
     WorkflowTermination,

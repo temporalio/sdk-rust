@@ -300,7 +300,8 @@ impl LocalActRetryTimerBackoff {
                         maximum_interval: Some(prost_dur!(from_millis(1500))),
                         maximum_attempts: 4,
                         non_retryable_error_types: vec![],
-                    },
+                    }
+                    .into(),
                     timer_backoff_threshold: Some(Duration::from_secs(1)),
                     ..Default::default()
                 },
@@ -542,7 +543,8 @@ async fn cancel_after_act_starts(
                         maximum_interval: Some(bo_dur.try_into().unwrap()),
                         // Retry forever until cancelled
                         ..Default::default()
-                    },
+                    }
+                    .into(),
                     timer_backoff_threshold: Some(Duration::from_secs(1)),
                     cancel_type,
                     ..Default::default()
@@ -651,7 +653,8 @@ async fn x_to_close_timeout(#[case] is_schedule: bool) {
                             maximum_interval: Some(prost_dur!(from_millis(1500))),
                             maximum_attempts: 4,
                             non_retryable_error_types: vec![],
-                        },
+                        }
+                        .into(),
                         timer_backoff_threshold: Some(Duration::from_secs(1)),
                         schedule_to_close_timeout: sched,
                         start_to_close_timeout: start,
@@ -724,7 +727,8 @@ async fn schedule_to_close_timeout_across_timer_backoff(#[case] cached: bool) {
                             maximum_interval: Some(prost_dur!(from_millis(1000))),
                             maximum_attempts: 40,
                             non_retryable_error_types: vec![],
-                        },
+                        }
+                        .into(),
                         timer_backoff_threshold: Some(Duration::from_millis(500)),
                         schedule_to_close_timeout: Some(Duration::from_secs(2)),
                         ..Default::default()
@@ -805,7 +809,8 @@ async fn timer_backoff_concurrent_with_non_timer_backoff() {
                         maximum_interval: Some(prost_dur!(from_millis(1500))),
                         maximum_attempts: 4,
                         non_retryable_error_types: vec![],
-                    },
+                    }
+                    .into(),
                     timer_backoff_threshold: Some(Duration::from_secs(1)),
                     ..Default::default()
                 },
@@ -820,7 +825,8 @@ async fn timer_backoff_concurrent_with_non_timer_backoff() {
                         maximum_interval: Some(prost_dur!(from_millis(1500))),
                         maximum_attempts: 4,
                         non_retryable_error_types: vec![],
-                    },
+                    }
+                    .into(),
                     timer_backoff_threshold: Some(Duration::from_secs(10)),
                     ..Default::default()
                 },
@@ -874,7 +880,8 @@ async fn repro_nondeterminism_with_timer_bug() {
                         maximum_interval: Some(prost_dur!(from_millis(1500))),
                         maximum_attempts: 4,
                         non_retryable_error_types: vec![],
-                    },
+                    }
+                    .into(),
                     timer_backoff_threshold: Some(Duration::from_secs(1)),
                     ..Default::default()
                 },
@@ -1520,7 +1527,8 @@ async fn local_act_fail_and_retry(#[case] eventually_pass: bool) {
                             maximum_interval: None,
                             maximum_attempts: 5,
                             non_retryable_error_types: vec![],
-                        },
+                        }
+                        .into(),
                         ..Default::default()
                     },
                 )
@@ -1621,7 +1629,8 @@ async fn local_act_retry_long_backoff_uses_timer() {
                             maximum_interval: Some(prost_dur!(from_secs(600))),
                             maximum_attempts: 3,
                             non_retryable_error_types: vec![],
-                        },
+                        }
+                        .into(),
                         ..Default::default()
                     },
                 )
@@ -2086,7 +2095,8 @@ async fn test_schedule_to_start_timeout_not_based_on_original_time(
                             maximum_interval: None,
                             maximum_attempts: 5,
                             non_retryable_error_types: vec![],
-                        },
+                        }
+                        .into(),
                         schedule_to_start_timeout: Some(Duration::from_secs(60)),
                         schedule_to_close_timeout,
                         ..Default::default()
@@ -2162,7 +2172,8 @@ async fn start_to_close_timeout_allows_retries(#[values(true, false)] la_complet
                             maximum_interval: None,
                             maximum_attempts: 5,
                             non_retryable_error_types: vec![],
-                        },
+                        }
+                        .into(),
                         start_to_close_timeout: Some(prost_dur!(from_millis(25))),
                         ..Default::default()
                     },
@@ -2379,7 +2390,8 @@ async fn local_act_records_nonfirst_attempts_ok() {
                         maximum_interval: None,
                         maximum_attempts: 0,
                         non_retryable_error_types: vec![],
-                    },
+                    }
+                    .into(),
                     ..Default::default()
                 },
             )
@@ -2697,7 +2709,8 @@ async fn local_act_retry_explicit_delay() {
                             backoff_coefficient: 1.0,
                             maximum_attempts: 5,
                             ..Default::default()
-                        },
+                        }
+                        .into(),
                         ..Default::default()
                     },
                 )
@@ -2761,7 +2774,8 @@ impl LaWf {
                     retry_policy: RetryPolicy {
                         maximum_attempts: 1,
                         ..Default::default()
-                    },
+                    }
+                    .into(),
                     ..Default::default()
                 },
             )

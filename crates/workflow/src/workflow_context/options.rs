@@ -2,7 +2,7 @@ use std::{collections::HashMap, time::Duration};
 
 use crate::runtime::types::ContinueAsNewRequest;
 use temporalio_common_wasm::{
-    Priority,
+    Priority, RetryPolicy,
     data_converters::{
         GenericPayloadConverter, PayloadConverter, SerializationContext, SerializationContextData,
     },
@@ -23,7 +23,7 @@ use temporalio_common_wasm::{
             },
         },
         temporal::api::{
-            common::v1::{Payload, RetryPolicy},
+            common::v1::Payload,
             enums::v1::{
                 ContinueAsNewVersioningBehavior as ProtoContinueAsNewVersioningBehavior,
                 WorkflowIdReusePolicy as ProtoWorkflowIdReusePolicy,
@@ -311,6 +311,7 @@ pub struct ActivityOptions {
     #[builder(default, into)]
     pub cancellation_type: ActivityCancellationType,
     /// Activity retry policy
+    #[builder(into)]
     pub retry_policy: Option<RetryPolicy>,
     /// Summary of the activity
     pub summary: Option<String>,
@@ -412,7 +413,7 @@ impl ActivityOptions {
                     .and_then(|duration| duration.try_into().ok()),
                 cancellation_type: ProtoActivityCancellationType::from(self.cancellation_type)
                     .into(),
-                retry_policy: self.retry_policy,
+                retry_policy: self.retry_policy.map(Into::into),
                 priority: self.priority.map(Into::into),
                 do_not_eagerly_execute: self.do_not_eagerly_execute,
                 ..Default::default()
@@ -480,7 +481,7 @@ impl LocalActivityOptions {
                 activity_type,
                 activity_id: self.activity_id.unwrap_or_else(|| seq.to_string()),
                 arguments: args,
-                retry_policy: Some(self.retry_policy),
+                retry_policy: Some(self.retry_policy.into()),
                 attempt: self.attempt.unwrap_or(1),
                 original_schedule_time: self.original_schedule_time,
                 local_retry_threshold: self
@@ -815,6 +816,7 @@ pub struct ContinueAsNewOptions {
     /// search attributes.
     pub search_attributes: Option<SearchAttributes>,
     /// If set, the new workflow will have this retry policy. If `None`, reuses the current policy.
+    #[builder(into)]
     pub retry_policy: Option<RetryPolicy>,
     /// Whether the new workflow should run on a worker with a compatible build id.
     pub versioning_intent: Option<VersioningIntent>,
@@ -848,7 +850,7 @@ impl ContinueAsNewOptions {
             memo: self.memo.unwrap_or_default(),
             headers: self.headers.unwrap_or_default(),
             search_attributes: self.search_attributes.map(|t| t.into_proto()),
-            retry_policy: self.retry_policy,
+            retry_policy: self.retry_policy.map(Into::into),
             versioning_intent: ProtoVersioningIntent::from(
                 self.versioning_intent
                     .unwrap_or(VersioningIntent::Unspecified),

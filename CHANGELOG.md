@@ -73,6 +73,8 @@ to docs, or any other relevant information.
 * Child workflow cancellation now defaults to `WaitCancellationCompleted` instead of `Abandon`,
   aligning Rust with the Core-based SDKs and Java. Set `ChildWorkflowCancellationType::Abandon`
   explicitly to retain the previous behavior.
+* Workflow and activity retry configuration and runtime information now use the Rust-native
+  `RetryPolicy` type instead of the generated protobuf message.
 
 ### Fixed
 * OTLP metric export failures are now logged through Core telemetry when OpenTelemetry's periodic

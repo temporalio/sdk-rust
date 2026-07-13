@@ -41,6 +41,7 @@ pub use metrics::{LONG_REQUEST_LATENCY_HISTOGRAM_NAME, REQUEST_LATENCY_HISTOGRAM
 pub use options_structs::*;
 pub use replaceable::SharedReplaceableClient;
 pub use retry::RetryOptions;
+pub use temporalio_common::RetryPolicy;
 /// Potentially dangerous TLS related functionality.
 pub mod danger {
     /// Re-export the `ServerCertVerifier` trait so that users can implement custom TLS
@@ -1185,6 +1186,7 @@ where
                     workflow_task_timeout: options.task_timeout.and_then(|d| d.try_into().ok()),
                     search_attributes: options.search_attributes.map(|t| t.into_proto()),
                     cron_schedule: options.cron_schedule.unwrap_or_default(),
+                    retry_policy: options.retry_policy.map(Into::into),
                     header: options.header.or(start_signal.header),
                     user_metadata,
                     ..Default::default()
@@ -1222,7 +1224,7 @@ where
                         search_attributes: options.search_attributes.map(|t| t.into_proto()),
                         cron_schedule: options.cron_schedule.unwrap_or_default(),
                         request_eager_execution: options.enable_eager_workflow_start,
-                        retry_policy: options.retry_policy,
+                        retry_policy: options.retry_policy.map(Into::into),
                         links: options.links,
                         completion_callbacks: options.completion_callbacks,
                         priority: Some(options.priority.into()),

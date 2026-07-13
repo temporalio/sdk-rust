@@ -883,7 +883,8 @@ async fn activity_metrics() {
                     retry_policy: RetryPolicy {
                         maximum_attempts: 1,
                         ..Default::default()
-                    },
+                    }
+                    .into(),
                     ..Default::default()
                 },
             );
@@ -894,7 +895,8 @@ async fn activity_metrics() {
                     retry_policy: RetryPolicy {
                         maximum_attempts: 1,
                         ..Default::default()
-                    },
+                    }
+                    .into(),
                     ..Default::default()
                 },
             );
