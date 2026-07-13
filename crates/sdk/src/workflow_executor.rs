@@ -331,7 +331,6 @@ mod tests {
             .await;
     }
 
-
     #[test]
     fn sdk_wake_guard_nesting() {
         assert!(!is_sdk_wake());
