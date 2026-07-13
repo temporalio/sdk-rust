@@ -2,9 +2,8 @@ use crate::common::CoreWfStarter;
 use std::time::Duration;
 use temporalio_client::{Priority, WorkflowGetResultOptions};
 use temporalio_common::{
-    UntypedWorkflow,
-    data_converters::RawValue,
-    protos::temporal::api::{common, history::v1::history_event::Attributes},
+    UntypedWorkflow, data_converters::RawValue,
+    protos::temporal::api::history::v1::history_event::Attributes,
 };
 use temporalio_macros::{activities, workflow, workflow_methods};
 use temporalio_sdk::{
@@ -98,12 +97,12 @@ pub(crate) async fn priority_values_sent_to_server() {
         #[run(name = "child-wf")]
         async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<()> {
             assert_eq!(
-                ctx.workflow_initial_info().priority,
-                Some(common::v1::Priority {
-                    priority_key: 4,
-                    fairness_key: "fair-child".to_string(),
-                    fairness_weight: 1.23
-                })
+                ctx.info().priority,
+                Priority {
+                    priority_key: Some(4),
+                    fairness_key: Some("fair-child".to_string()),
+                    fairness_weight: Some(1.23)
+                }
             );
             Ok(())
         }

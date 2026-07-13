@@ -59,17 +59,10 @@ struct ChildWf;
 impl ChildWf {
     #[run(name = "child_wf")]
     async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<()> {
+        let info = ctx.info();
         assert_eq!(
-            ctx.workflow_initial_info()
-                .parent_workflow_info
-                .as_ref()
-                .unwrap()
-                .workflow_id,
-            ctx.workflow_initial_info()
-                .root_workflow
-                .as_ref()
-                .unwrap()
-                .workflow_id
+            info.parent.as_ref().unwrap().workflow_id,
+            info.root.as_ref().unwrap().workflow_id
         );
         Ok(())
     }

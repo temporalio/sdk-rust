@@ -87,6 +87,10 @@ to docs, or any other relevant information.
   `MemoValues`.
 * Removed the raw-protobuf `Namespace::into_describe_namespace_request` and
   `WorkerTaskTypes::to_task_queue_types` helpers. These conversions are now internal plumbing.
+* `WorkflowContext::workflow_initial_info` and its synchronous counterpart are replaced by
+  `info()`, which returns the Rust-native `WorkflowContextView` and includes typed workflow
+  priority. The internal `BaseWorkflowContext::new` raw-protobuf boundary is now explicitly named
+  `from_raw`.
 
 ### Fixed
 * OTLP metric export failures are now logged through Core telemetry when OpenTelemetry's periodic

@@ -39,7 +39,7 @@ use std::{
     time::{Duration, SystemTime},
 };
 use temporalio_common_wasm::{
-    ActivityDefinition, Memo, RetryPolicy, SignalDefinition, WorkflowDefinition,
+    ActivityDefinition, Memo, Priority, RetryPolicy, SignalDefinition, WorkflowDefinition,
     data_converters::{
         ActivityExecutionDecodeHint, ChildWorkflowExecutionDecodeHint,
         ChildWorkflowStartDecodeHint, DataConverter, GenericPayloadConverter,
@@ -119,7 +119,7 @@ impl BaseWorkflowContext {
             self.inner.namespace.clone(),
             self.inner.task_queue.clone(),
             self.inner.run_id.clone(),
-            &self.inner.inital_information,
+            &self.inner.initial_information,
             &shared.memo,
             self.inner.data_converter.payload_converter().clone(),
         )
@@ -220,7 +220,7 @@ struct WorkflowContextInner {
     namespace: String,
     task_queue: String,
     run_id: String,
-    inital_information: InitializeWorkflow,
+    initial_information: InitializeWorkflow,
     runtime: WorkflowRuntimeState,
     cancelled_reason: RefCell<Option<String>>,
     cancel_wakers: RefCell<Vec<Waker>>,
@@ -320,10 +320,13 @@ pub struct WorkflowContextView {
     pub retry_policy: Option<RetryPolicy>,
     /// If this workflow runs on a cron schedule
     pub cron_schedule: Option<String>,
+    /// Priority and fairness configuration for this workflow execution.
+    pub priority: Priority,
     /// User-defined memo values.
     pub memo: Memo,
     /// Initial search attributes as a typed collection.
     pub search_attributes: Option<SearchAttributes>,
+    raw: InitializeWorkflow,
 }
 
 /// Information about a parent workflow.
@@ -403,6 +406,7 @@ impl WorkflowContextView {
             root,
             retry_policy: init.retry_policy.clone().map(Into::into),
             cron_schedule,
+            priority: init.priority.clone().unwrap_or_default().into(),
             memo: Memo::from_raw(
                 Some(memo.clone()),
                 payload_converter,
@@ -412,14 +416,25 @@ impl WorkflowContextView {
                 .search_attributes
                 .as_ref()
                 .map(SearchAttributes::from_proto),
+            raw: init.clone(),
         }
+    }
+
+    /// Access the underlying workflow initialization protobuf.
+    pub fn raw(&self) -> &InitializeWorkflow {
+        &self.raw
+    }
+
+    /// Consume this view and return the underlying workflow initialization protobuf.
+    pub fn into_raw(self) -> InitializeWorkflow {
+        self.raw
     }
 }
 
 impl BaseWorkflowContext {
-    /// Create a new base context backed by the provided runtime host.
+    /// Construct a base context from raw workflow activation initialization data.
     #[doc(hidden)]
-    pub fn new(
+    pub fn from_raw(
         namespace: String,
         task_queue: String,
         run_id: String,
@@ -441,7 +456,7 @@ impl BaseWorkflowContext {
                         .unwrap_or_default(),
                     ..Default::default()
                 }),
-                inital_information: init_workflow_job,
+                initial_information: init_workflow_job,
                 runtime: WorkflowRuntimeState::new(host),
                 cancelled_reason: RefCell::new(None),
                 cancel_wakers: RefCell::new(Vec::new()),
@@ -759,7 +774,7 @@ impl BaseWorkflowContext {
 impl<W> SyncWorkflowContext<W> {
     /// Return the workflow's unique identifier
     pub fn workflow_id(&self) -> &str {
-        &self.base.inner.inital_information.workflow_id
+        &self.base.inner.initial_information.workflow_id
     }
 
     /// Return the run id of this workflow execution
@@ -866,10 +881,9 @@ impl<W> SyncWorkflowContext<W> {
         self.base.inner.data_converter.payload_converter()
     }
 
-    /// Return various information that the workflow was initialized with. Will eventually become
-    /// a proper non-proto workflow info struct.
-    pub fn workflow_initial_info(&self) -> &InitializeWorkflow {
-        &self.base.inner.inital_information
+    /// Return Rust-native information about this workflow execution.
+    pub fn info(&self) -> WorkflowContextView {
+        self.view()
     }
 
     /// A future that resolves if/when the workflow is cancelled, with the user provided cause
@@ -906,7 +920,7 @@ impl<W> SyncWorkflowContext<W> {
         let arguments = pc
             .to_payloads(&ctx, input)
             .map_err(WorkflowTermination::from)?;
-        let workflow_type = self.workflow_initial_info().workflow_type.clone();
+        let workflow_type = self.base.inner.initial_information.workflow_type.clone();
         let request = opts
             .into_request(workflow_type, arguments, pc)
             .map_err(WorkflowTermination::from)?;
@@ -1277,9 +1291,9 @@ impl<W> WorkflowContext<W> {
         self.sync.payload_converter()
     }
 
-    /// Return various information that the workflow was initialized with.
-    pub fn workflow_initial_info(&self) -> &InitializeWorkflow {
-        self.sync.workflow_initial_info()
+    /// Return Rust-native information about this workflow execution.
+    pub fn info(&self) -> WorkflowContextView {
+        self.sync.info()
     }
 
     /// A future that resolves if/when the workflow is cancelled, with the user provided cause
@@ -2484,7 +2498,7 @@ mod tests {
             workflow_type: TestWorkflow.name().to_string(),
             ..Default::default()
         };
-        let base = BaseWorkflowContext::new(
+        let base = BaseWorkflowContext::from_raw(
             "default".to_string(),
             "orig-task-queue".to_string(),
             "run-id".to_string(),
@@ -2705,7 +2719,7 @@ mod tests {
             workflow_type: "failing-workflow".to_string(),
             ..Default::default()
         };
-        let base = BaseWorkflowContext::new(
+        let base = BaseWorkflowContext::from_raw(
             "default".to_string(),
             "orig-task-queue".to_string(),
             "run-id".to_string(),
@@ -2774,7 +2788,7 @@ mod tests {
             ..Default::default()
         };
         let host = Rc::new(RecordingHost::default());
-        let base = BaseWorkflowContext::new(
+        let base = BaseWorkflowContext::from_raw(
             "default".to_string(),
             "orig-task-queue".to_string(),
             "run-id".to_string(),
@@ -2821,7 +2835,7 @@ mod tests {
             workflow_type: TestWorkflow.name().to_string(),
             ..Default::default()
         };
-        let base = BaseWorkflowContext::new(
+        let base = BaseWorkflowContext::from_raw(
             "default".to_string(),
             "orig-task-queue".to_string(),
             "run-id".to_string(),
@@ -2886,7 +2900,7 @@ mod tests {
             search_attributes: Some(init_sa),
             ..Default::default()
         };
-        let base = BaseWorkflowContext::new(
+        let base = BaseWorkflowContext::from_raw(
             "default".to_string(),
             "tq".to_string(),
             "run-id".to_string(),
@@ -2916,7 +2930,7 @@ mod tests {
             search_attributes: Some(init_sa),
             ..Default::default()
         };
-        let base = BaseWorkflowContext::new(
+        let base = BaseWorkflowContext::from_raw(
             "default".to_string(),
             "tq".to_string(),
             "run-id".to_string(),
@@ -2931,5 +2945,29 @@ mod tests {
             .search_attributes
             .expect("should have search attributes");
         assert_eq!(sa.get(&K), Some(true));
+    }
+
+    #[test]
+    fn workflow_info_retains_raw_initialization() {
+        let init = InitializeWorkflow {
+            workflow_type: TestWorkflow.name().to_string(),
+            identity: "raw-only-identity".to_owned(),
+            ..Default::default()
+        };
+        let expected = init.clone();
+        let base = BaseWorkflowContext::from_raw(
+            "default".to_string(),
+            "tq".to_string(),
+            "run-id".to_string(),
+            init,
+            DataConverter::default(),
+            Rc::new(NoopHost),
+        );
+        let ctx = WorkflowContext::from_base(base, Rc::new(RefCell::new(TestWorkflow)));
+        let info = ctx.info();
+
+        assert_eq!(info.raw().identity, "raw-only-identity");
+        assert_eq!(info.raw(), &expected);
+        assert_eq!(info.into_raw(), expected);
     }
 }

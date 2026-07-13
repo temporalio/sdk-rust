@@ -211,7 +211,7 @@ where
     let args = init.initialize_workflow.arguments.clone();
     let data_converter = DataConverter::default();
     let payload_converter = data_converter.payload_converter().clone();
-    let base_ctx = BaseWorkflowContext::new(
+    let base_ctx = BaseWorkflowContext::from_raw(
         init.namespace,
         init.task_queue,
         init.run_id,
