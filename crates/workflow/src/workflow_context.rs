@@ -1,9 +1,11 @@
 mod options;
 
 pub use options::{
-    ActivityCloseTimeouts, ActivityOptions, ChildWorkflowOptions, ContinueAsNewOptions,
-    ContinueAsNewVersioningBehavior, LocalActivityOptions, NexusOperationOptions, Signal,
-    SignalData, TimerOptions,
+    ActivityCancellationType, ActivityCloseTimeouts, ActivityOptions,
+    ChildWorkflowCancellationType, ChildWorkflowOptions, ContinueAsNewOptions,
+    ContinueAsNewVersioningBehavior, LocalActivityOptions, NexusOperationCancellationType,
+    NexusOperationOptions, ParentClosePolicy, Signal, SignalData, TimerOptions, VersioningIntent,
+    WorkflowIdReusePolicy,
 };
 pub use temporalio_common_wasm::protos::coresdk::child_workflow::StartChildWorkflowExecutionFailedCause;
 
@@ -2463,7 +2465,7 @@ mod tests {
                         maximum_attempts: 5,
                         ..Default::default()
                     }),
-                    versioning_intent: Some(ProtoVersioningIntent::Compatible),
+                    versioning_intent: Some(ProtoVersioningIntent::Compatible.into()),
                     initial_versioning_behavior: Some(
                         ContinueAsNewVersioningBehavior::UseRampingVersion,
                     ),

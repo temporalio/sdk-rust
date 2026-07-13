@@ -8,27 +8,275 @@ use temporalio_common_wasm::{
     },
     protos::{
         coresdk::{
-            child_workflow::{ChildWorkflowCancellationType, ParentClosePolicy},
-            common::VersioningIntent,
-            nexus::NexusOperationCancellationType,
+            child_workflow::{
+                ChildWorkflowCancellationType as ProtoChildWorkflowCancellationType,
+                ParentClosePolicy as ProtoParentClosePolicy,
+            },
+            common::VersioningIntent as ProtoVersioningIntent,
+            nexus::NexusOperationCancellationType as ProtoNexusOperationCancellationType,
             workflow_activation::SignalWorkflow,
             workflow_commands::{
-                ActivityCancellationType, ContinueAsNewWorkflowExecution, ScheduleActivity,
-                ScheduleLocalActivity, ScheduleNexusOperation, StartChildWorkflowExecution,
-                StartTimer, WorkflowCommand, workflow_command,
+                ActivityCancellationType as ProtoActivityCancellationType,
+                ContinueAsNewWorkflowExecution, ScheduleActivity, ScheduleLocalActivity,
+                ScheduleNexusOperation, StartChildWorkflowExecution, StartTimer, WorkflowCommand,
+                workflow_command,
             },
         },
         temporal::api::{
             common::v1::{Payload, RetryPolicy},
             enums::v1::{
                 ContinueAsNewVersioningBehavior as ProtoContinueAsNewVersioningBehavior,
-                WorkflowIdReusePolicy,
+                WorkflowIdReusePolicy as ProtoWorkflowIdReusePolicy,
             },
             sdk::v1::UserMetadata,
         },
     },
     search_attributes::SearchAttributes,
 };
+
+/// Controls when activity cancellation is reported back to a workflow.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, Default, serde::Serialize, serde::Deserialize,
+)]
+#[non_exhaustive]
+pub enum ActivityCancellationType {
+    /// Request cancellation and report it immediately.
+    #[default]
+    TryCancel,
+    /// Wait until cancellation has completed.
+    WaitCancellationCompleted,
+    /// Do not request cancellation.
+    Abandon,
+}
+
+impl From<ActivityCancellationType> for ProtoActivityCancellationType {
+    fn from(value: ActivityCancellationType) -> Self {
+        match value {
+            ActivityCancellationType::TryCancel => Self::TryCancel,
+            ActivityCancellationType::WaitCancellationCompleted => Self::WaitCancellationCompleted,
+            ActivityCancellationType::Abandon => Self::Abandon,
+        }
+    }
+}
+
+impl From<ProtoActivityCancellationType> for ActivityCancellationType {
+    fn from(value: ProtoActivityCancellationType) -> Self {
+        match value {
+            ProtoActivityCancellationType::TryCancel => Self::TryCancel,
+            ProtoActivityCancellationType::WaitCancellationCompleted => {
+                Self::WaitCancellationCompleted
+            }
+            ProtoActivityCancellationType::Abandon => Self::Abandon,
+        }
+    }
+}
+
+/// Controls when child-workflow cancellation is reported to its parent.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, Default, serde::Serialize, serde::Deserialize,
+)]
+#[non_exhaustive]
+pub enum ChildWorkflowCancellationType {
+    /// Do not request cancellation.
+    Abandon,
+    /// Request cancellation and report it immediately.
+    TryCancel,
+    /// Wait until cancellation has completed.
+    #[default]
+    WaitCancellationCompleted,
+    /// Wait until the cancellation request is acknowledged.
+    WaitCancellationRequested,
+}
+
+impl From<ChildWorkflowCancellationType> for ProtoChildWorkflowCancellationType {
+    fn from(value: ChildWorkflowCancellationType) -> Self {
+        match value {
+            ChildWorkflowCancellationType::Abandon => Self::Abandon,
+            ChildWorkflowCancellationType::TryCancel => Self::TryCancel,
+            ChildWorkflowCancellationType::WaitCancellationCompleted => {
+                Self::WaitCancellationCompleted
+            }
+            ChildWorkflowCancellationType::WaitCancellationRequested => {
+                Self::WaitCancellationRequested
+            }
+        }
+    }
+}
+
+impl From<ProtoChildWorkflowCancellationType> for ChildWorkflowCancellationType {
+    fn from(value: ProtoChildWorkflowCancellationType) -> Self {
+        match value {
+            ProtoChildWorkflowCancellationType::Abandon => Self::Abandon,
+            ProtoChildWorkflowCancellationType::TryCancel => Self::TryCancel,
+            ProtoChildWorkflowCancellationType::WaitCancellationCompleted => {
+                Self::WaitCancellationCompleted
+            }
+            ProtoChildWorkflowCancellationType::WaitCancellationRequested => {
+                Self::WaitCancellationRequested
+            }
+        }
+    }
+}
+
+/// Controls what happens to a child workflow when its parent closes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[non_exhaustive]
+pub enum ParentClosePolicy {
+    /// Let the server choose its default.
+    #[default]
+    Unspecified,
+    /// Terminate the child workflow.
+    Terminate,
+    /// Leave the child workflow running.
+    Abandon,
+    /// Request cancellation of the child workflow.
+    RequestCancel,
+}
+
+impl From<ParentClosePolicy> for ProtoParentClosePolicy {
+    fn from(value: ParentClosePolicy) -> Self {
+        match value {
+            ParentClosePolicy::Unspecified => Self::Unspecified,
+            ParentClosePolicy::Terminate => Self::Terminate,
+            ParentClosePolicy::Abandon => Self::Abandon,
+            ParentClosePolicy::RequestCancel => Self::RequestCancel,
+        }
+    }
+}
+
+impl From<ProtoParentClosePolicy> for ParentClosePolicy {
+    fn from(value: ProtoParentClosePolicy) -> Self {
+        match value {
+            ProtoParentClosePolicy::Unspecified => Self::Unspecified,
+            ProtoParentClosePolicy::Terminate => Self::Terminate,
+            ProtoParentClosePolicy::Abandon => Self::Abandon,
+            ProtoParentClosePolicy::RequestCancel => Self::RequestCancel,
+        }
+    }
+}
+
+/// Controls whether a closed workflow ID may be reused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[non_exhaustive]
+pub enum WorkflowIdReusePolicy {
+    /// Use the SDK default of allowing duplicate IDs.
+    #[default]
+    Unspecified,
+    /// Allow the workflow ID to be reused.
+    AllowDuplicate,
+    /// Allow reuse only when the previous execution failed.
+    AllowDuplicateFailedOnly,
+    /// Reject reuse of the workflow ID.
+    RejectDuplicate,
+    /// Terminate a running execution before reusing the ID.
+    TerminateIfRunning,
+}
+
+impl From<WorkflowIdReusePolicy> for ProtoWorkflowIdReusePolicy {
+    #[allow(deprecated)]
+    fn from(value: WorkflowIdReusePolicy) -> Self {
+        match value {
+            WorkflowIdReusePolicy::Unspecified => Self::Unspecified,
+            WorkflowIdReusePolicy::AllowDuplicate => Self::AllowDuplicate,
+            WorkflowIdReusePolicy::AllowDuplicateFailedOnly => Self::AllowDuplicateFailedOnly,
+            WorkflowIdReusePolicy::RejectDuplicate => Self::RejectDuplicate,
+            WorkflowIdReusePolicy::TerminateIfRunning => Self::TerminateIfRunning,
+        }
+    }
+}
+
+impl From<ProtoWorkflowIdReusePolicy> for WorkflowIdReusePolicy {
+    #[allow(deprecated)]
+    fn from(value: ProtoWorkflowIdReusePolicy) -> Self {
+        match value {
+            ProtoWorkflowIdReusePolicy::Unspecified => Self::Unspecified,
+            ProtoWorkflowIdReusePolicy::AllowDuplicate => Self::AllowDuplicate,
+            ProtoWorkflowIdReusePolicy::AllowDuplicateFailedOnly => Self::AllowDuplicateFailedOnly,
+            ProtoWorkflowIdReusePolicy::RejectDuplicate => Self::RejectDuplicate,
+            ProtoWorkflowIdReusePolicy::TerminateIfRunning => Self::TerminateIfRunning,
+        }
+    }
+}
+
+/// Selects the worker versioning behavior intended for a command.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[non_exhaustive]
+pub enum VersioningIntent {
+    /// Let Core choose the appropriate behavior.
+    #[default]
+    Unspecified,
+    /// Prefer a worker compatible with the current worker.
+    Compatible,
+    /// Use the target task queue's default worker version.
+    Default,
+}
+
+impl From<VersioningIntent> for ProtoVersioningIntent {
+    fn from(value: VersioningIntent) -> Self {
+        match value {
+            VersioningIntent::Unspecified => Self::Unspecified,
+            VersioningIntent::Compatible => Self::Compatible,
+            VersioningIntent::Default => Self::Default,
+        }
+    }
+}
+
+impl From<ProtoVersioningIntent> for VersioningIntent {
+    fn from(value: ProtoVersioningIntent) -> Self {
+        match value {
+            ProtoVersioningIntent::Unspecified => Self::Unspecified,
+            ProtoVersioningIntent::Compatible => Self::Compatible,
+            ProtoVersioningIntent::Default => Self::Default,
+        }
+    }
+}
+
+/// Controls when Nexus operation cancellation is reported to a workflow.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, Default, serde::Serialize, serde::Deserialize,
+)]
+#[non_exhaustive]
+pub enum NexusOperationCancellationType {
+    /// Wait until cancellation has completed.
+    #[default]
+    WaitCancellationCompleted,
+    /// Do not request cancellation.
+    Abandon,
+    /// Request cancellation and report it immediately.
+    TryCancel,
+    /// Wait until the cancellation request is acknowledged.
+    WaitCancellationRequested,
+}
+
+impl From<NexusOperationCancellationType> for ProtoNexusOperationCancellationType {
+    fn from(value: NexusOperationCancellationType) -> Self {
+        match value {
+            NexusOperationCancellationType::WaitCancellationCompleted => {
+                Self::WaitCancellationCompleted
+            }
+            NexusOperationCancellationType::Abandon => Self::Abandon,
+            NexusOperationCancellationType::TryCancel => Self::TryCancel,
+            NexusOperationCancellationType::WaitCancellationRequested => {
+                Self::WaitCancellationRequested
+            }
+        }
+    }
+}
+
+impl From<ProtoNexusOperationCancellationType> for NexusOperationCancellationType {
+    fn from(value: ProtoNexusOperationCancellationType) -> Self {
+        match value {
+            ProtoNexusOperationCancellationType::WaitCancellationCompleted => {
+                Self::WaitCancellationCompleted
+            }
+            ProtoNexusOperationCancellationType::Abandon => Self::Abandon,
+            ProtoNexusOperationCancellationType::TryCancel => Self::TryCancel,
+            ProtoNexusOperationCancellationType::WaitCancellationRequested => {
+                Self::WaitCancellationRequested
+            }
+        }
+    }
+}
 /// Options for scheduling an activity
 #[derive(Debug, bon::Builder, Clone)]
 #[non_exhaustive]
@@ -60,7 +308,7 @@ pub struct ActivityOptions {
     /// heartbeat or activity start.
     pub heartbeat_timeout: Option<Duration>,
     /// Determines what the SDK does when the Activity is cancelled.
-    #[builder(default)]
+    #[builder(default, into)]
     pub cancellation_type: ActivityCancellationType,
     /// Activity retry policy
     pub retry_policy: Option<RetryPolicy>,
@@ -162,7 +410,8 @@ impl ActivityOptions {
                 heartbeat_timeout: self
                     .heartbeat_timeout
                     .and_then(|duration| duration.try_into().ok()),
-                cancellation_type: self.cancellation_type.into(),
+                cancellation_type: ProtoActivityCancellationType::from(self.cancellation_type)
+                    .into(),
                 retry_policy: self.retry_policy,
                 priority: self.priority.map(Into::into),
                 do_not_eagerly_execute: self.do_not_eagerly_execute,
@@ -237,7 +486,7 @@ impl LocalActivityOptions {
                 local_retry_threshold: self
                     .timer_backoff_threshold
                     .and_then(|duration| duration.try_into().ok()),
-                cancellation_type: self.cancel_type.into(),
+                cancellation_type: ProtoActivityCancellationType::from(self.cancel_type).into(),
                 schedule_to_close_timeout: self
                     .schedule_to_close_timeout
                     .and_then(|duration| duration.try_into().ok()),
@@ -302,12 +551,15 @@ impl ChildWorkflowOptions {
                 workflow_id: self.workflow_id,
                 task_queue: self.task_queue.unwrap_or_default(),
                 input: args,
-                cancellation_type: self.cancel_type.into(),
-                parent_close_policy: self.parent_close_policy.into(),
-                workflow_id_reuse_policy: match self.id_reuse_policy {
-                    WorkflowIdReusePolicy::Unspecified => WorkflowIdReusePolicy::AllowDuplicate,
-                    policy => policy,
-                }
+                cancellation_type: ProtoChildWorkflowCancellationType::from(self.cancel_type)
+                    .into(),
+                parent_close_policy: ProtoParentClosePolicy::from(self.parent_close_policy).into(),
+                workflow_id_reuse_policy: ProtoWorkflowIdReusePolicy::from(
+                    match self.id_reuse_policy {
+                        WorkflowIdReusePolicy::Unspecified => WorkflowIdReusePolicy::AllowDuplicate,
+                        policy => policy,
+                    },
+                )
                 .into(),
                 workflow_execution_timeout: self
                     .execution_timeout
@@ -484,10 +736,11 @@ impl NexusOperationOptions {
                 .start_to_close_timeout
                 .and_then(|duration| duration.try_into().ok()),
             nexus_header: self.nexus_header,
-            cancellation_type: self
-                .cancellation_type
-                .unwrap_or(NexusOperationCancellationType::WaitCancellationCompleted)
-                .into(),
+            cancellation_type: ProtoNexusOperationCancellationType::from(
+                self.cancellation_type
+                    .unwrap_or(NexusOperationCancellationType::WaitCancellationCompleted),
+            )
+            .into(),
         })
         .into()
     }
@@ -596,10 +849,11 @@ impl ContinueAsNewOptions {
             headers: self.headers.unwrap_or_default(),
             search_attributes: self.search_attributes.map(|t| t.into_proto()),
             retry_policy: self.retry_policy,
-            versioning_intent: self
-                .versioning_intent
-                .unwrap_or(VersioningIntent::Unspecified)
-                .into(),
+            versioning_intent: ProtoVersioningIntent::from(
+                self.versioning_intent
+                    .unwrap_or(VersioningIntent::Unspecified),
+            )
+            .into(),
             initial_versioning_behavior: ProtoContinueAsNewVersioningBehavior::from(
                 self.initial_versioning_behavior
                     .unwrap_or(ContinueAsNewVersioningBehavior::Unspecified),
@@ -648,9 +902,49 @@ mod tests {
     use super::*;
 
     #[test]
+    fn activity_cancellation_default_preserves_sdk_behavior() {
+        assert_eq!(
+            ActivityCancellationType::default(),
+            ActivityCancellationType::TryCancel
+        );
+    }
+
+    #[test]
+    fn child_workflow_cancellation_defaults_to_wait_for_completion() {
+        assert_eq!(
+            ChildWorkflowOptions::default().cancel_type,
+            ChildWorkflowCancellationType::WaitCancellationCompleted
+        );
+        let command = ChildWorkflowOptions::default().into_command(1, "child".to_string(), vec![]);
+        let Some(workflow_command::Variant::StartChildWorkflowExecution(command)) = command.variant
+        else {
+            panic!("expected StartChildWorkflowExecution command");
+        };
+        assert_eq!(
+            command.cancellation_type,
+            ProtoChildWorkflowCancellationType::WaitCancellationCompleted as i32
+        );
+    }
+
+    #[test]
+    fn other_policy_defaults_preserve_sdk_behavior() {
+        assert_eq!(ParentClosePolicy::default(), ParentClosePolicy::Unspecified);
+        assert_eq!(
+            WorkflowIdReusePolicy::default(),
+            WorkflowIdReusePolicy::Unspecified
+        );
+        assert_eq!(VersioningIntent::default(), VersioningIntent::Unspecified);
+        assert_eq!(
+            NexusOperationCancellationType::default(),
+            NexusOperationCancellationType::WaitCancellationCompleted
+        );
+    }
+
+    #[test]
     fn continue_as_new_options_maps_backoff_start_interval_to_request() {
         let req = ContinueAsNewOptions {
             backoff_start_interval: Some(Duration::from_secs(7)),
+            versioning_intent: Some(VersioningIntent::Compatible),
             ..Default::default()
         }
         .into_request("test-workflow".to_string(), vec![]);
@@ -660,6 +954,10 @@ mod tests {
             .expect("backoff_start_interval should be set");
         assert_eq!(backoff.seconds, 7);
         assert_eq!(backoff.nanos, 0);
+        assert_eq!(
+            req.versioning_intent,
+            ProtoVersioningIntent::Compatible as i32
+        );
     }
 
     #[test]
@@ -694,6 +992,7 @@ mod tests {
             start_to_close: Duration::from_secs(3),
             schedule_to_close: Duration::from_secs(8),
         })
+        .cancellation_type(ActivityCancellationType::Abandon)
         .build()
         .into_command(7, "test".to_string(), vec![]);
         let Some(workflow_command::Variant::ScheduleActivity(req)) = req.variant else {
@@ -701,12 +1000,19 @@ mod tests {
         };
         assert_eq!(req.start_to_close_timeout.unwrap().seconds, 3);
         assert_eq!(req.schedule_to_close_timeout.unwrap().seconds, 8);
+        assert_eq!(
+            req.cancellation_type,
+            ProtoActivityCancellationType::Abandon as i32
+        );
     }
 
     #[test]
     fn child_workflow_run_timeout_uses_run_timeout_field() {
         let opts = ChildWorkflowOptions {
             workflow_id: "test-wf".to_string(),
+            cancel_type: ChildWorkflowCancellationType::WaitCancellationRequested,
+            parent_close_policy: ParentClosePolicy::RequestCancel,
+            id_reuse_policy: WorkflowIdReusePolicy::RejectDuplicate,
             execution_timeout: Some(Duration::from_secs(60)),
             run_timeout: Some(Duration::from_secs(10)),
             ..Default::default()
@@ -720,6 +1026,18 @@ mod tests {
         let run_timeout = req.workflow_run_timeout.unwrap();
         assert_eq!(exec_timeout.seconds, 60);
         assert_eq!(run_timeout.seconds, 10);
+        assert_eq!(
+            req.cancellation_type,
+            ProtoChildWorkflowCancellationType::WaitCancellationRequested as i32
+        );
+        assert_eq!(
+            req.parent_close_policy,
+            ProtoParentClosePolicy::RequestCancel as i32
+        );
+        assert_eq!(
+            req.workflow_id_reuse_policy,
+            ProtoWorkflowIdReusePolicy::RejectDuplicate as i32
+        );
     }
 
     #[test]

@@ -31,11 +31,13 @@ pub use temporalio_common_wasm::error::{
     TimeoutType, WorkflowSignalError,
 };
 pub use workflow_context::{
-    ActivityCloseTimeouts, ActivityOptions, BaseWorkflowContext, CancellableFuture,
-    ChildWorkflowOptions, ContinueAsNewOptions, ContinueAsNewVersioningBehavior,
-    ExternalWorkflowHandle, LocalActivityOptions, NexusOperationOptions, ParentWorkflowInfo,
+    ActivityCancellationType, ActivityCloseTimeouts, ActivityOptions, BaseWorkflowContext,
+    CancellableFuture, ChildWorkflowCancellationType, ChildWorkflowOptions, ContinueAsNewOptions,
+    ContinueAsNewVersioningBehavior, ExternalWorkflowHandle, LocalActivityOptions,
+    NexusOperationCancellationType, NexusOperationOptions, ParentClosePolicy, ParentWorkflowInfo,
     RootWorkflowInfo, Signal, SignalData, StartChildWorkflowExecutionFailedCause,
-    StartedChildWorkflow, SyncWorkflowContext, TimerOptions, WorkflowContext, WorkflowContextView,
+    StartedChildWorkflow, SyncWorkflowContext, TimerOptions, VersioningIntent, WorkflowContext,
+    WorkflowContextView, WorkflowIdReusePolicy,
 };
 pub use workflows::{join, join_all, select};
 

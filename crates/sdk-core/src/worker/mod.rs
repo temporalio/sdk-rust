@@ -1965,7 +1965,7 @@ impl WorkerVersioningStrategy {
     pub fn default_versioning_behavior(&self) -> Option<VersioningBehavior> {
         match self {
             WorkerVersioningStrategy::WorkerDeploymentBased(opts) => {
-                opts.default_versioning_behavior
+                opts.default_versioning_behavior.map(Into::into)
             }
             _ => None,
         }
@@ -2503,7 +2503,7 @@ mod tests {
                         build_id: "1.0".to_string(),
                     },
                     use_worker_versioning: false,
-                    default_versioning_behavior: Some(VersioningBehavior::AutoUpgrade),
+                    default_versioning_behavior: Some(VersioningBehavior::AutoUpgrade.into()),
                 },
             ))
             .task_types(WorkerTaskTypes::all())

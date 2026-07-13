@@ -11,7 +11,7 @@ use temporalio_common::{
         coresdk::{
             AsJsonPayloadExt,
             child_workflow::{
-                ChildWorkflowCancellationType, ParentClosePolicy,
+                ChildWorkflowCancellationType as ProtoChildWorkflowCancellationType,
                 StartChildWorkflowExecutionFailedCause,
             },
             workflow_activation::{WorkflowActivationJob, workflow_activation_job},
@@ -34,8 +34,9 @@ use temporalio_common::{
 };
 use temporalio_macros::{workflow, workflow_methods};
 use temporalio_sdk::{
-    CancellableFuture, ChildWorkflowExecutionError, ChildWorkflowOptions, ChildWorkflowStartError,
-    SyncWorkflowContext, WorkflowContext, WorkflowResult, WorkflowSignalError, WorkflowTermination,
+    CancellableFuture, ChildWorkflowCancellationType, ChildWorkflowExecutionError,
+    ChildWorkflowOptions, ChildWorkflowStartError, ParentClosePolicy, SyncWorkflowContext,
+    WorkflowContext, WorkflowResult, WorkflowSignalError, WorkflowTermination,
 };
 use temporalio_sdk_core::{
     replay::{DEFAULT_WORKFLOW_TYPE, TestHistoryBuilder, canned_histories},
@@ -1098,7 +1099,7 @@ async fn cancel_child_before_started_event() {
             seq: 1,
             workflow_id: "child-id-1".to_string(),
             workflow_type: "child".to_string(),
-            cancellation_type: ChildWorkflowCancellationType::WaitCancellationCompleted as i32,
+            cancellation_type: ProtoChildWorkflowCancellationType::WaitCancellationCompleted as i32,
             ..Default::default()
         }
         .into(),

@@ -28,7 +28,8 @@ use temporalio_common::{
             activity_result::ActivityExecutionResult,
             workflow_activation::{WorkflowActivationJob, workflow_activation_job},
             workflow_commands::{
-                ActivityCancellationType, ScheduleLocalActivity, workflow_command::Variant,
+                ActivityCancellationType as ProtoActivityCancellationType, ScheduleLocalActivity,
+                workflow_command::Variant,
             },
             workflow_completion::{
                 self, WorkflowActivationCompletion, workflow_activation_completion,
@@ -48,8 +49,9 @@ use temporalio_common::{
 };
 use temporalio_macros::{activities, workflow, workflow_methods};
 use temporalio_sdk::{
-    ActivityExecutionError, ActivityOptions, ApplicationFailure, CancellableFuture,
-    LocalActivityOptions, TimeoutType, WorkflowContext, WorkflowContextView, WorkflowResult,
+    ActivityCancellationType, ActivityExecutionError, ActivityOptions, ApplicationFailure,
+    CancellableFuture, LocalActivityOptions, TimeoutType, WorkflowContext, WorkflowContextView,
+    WorkflowResult,
     activities::{ActivityContext, ActivityError},
     interceptors::{FailOnNondeterminismInterceptor, WorkerInterceptor},
 };
@@ -341,8 +343,6 @@ async fn local_act_retry_timer_backoff() {
 #[case::abandon(ActivityCancellationType::Abandon)]
 #[tokio::test]
 async fn cancel_immediate(#[case] cancel_type: ActivityCancellationType) {
-    use temporalio_sdk::WorkflowContextView;
-
     let wf_name = format!("cancel_immediate_{cancel_type:?}");
     // If we don't use this, we'd hang on shutdown for abandon cancel modes.
     let manual_cancel = CancellationToken::new();
@@ -1764,7 +1764,7 @@ async fn query_during_wft_heartbeat_doesnt_accidentally_fail_to_continue_heartbe
             schedule_local_activity_cmd(
                 1,
                 "1",
-                ActivityCancellationType::TryCancel,
+                ProtoActivityCancellationType::TryCancel,
                 Duration::from_secs(60),
             ),
         ))
@@ -1907,7 +1907,7 @@ async fn la_resolve_during_legacy_query_does_not_combine(#[case] impossible_quer
             schedule_local_activity_cmd(
                 1,
                 "act-id",
-                ActivityCancellationType::TryCancel,
+                ProtoActivityCancellationType::TryCancel,
                 Duration::from_secs(60),
             ),
         ))
@@ -2521,7 +2521,7 @@ async fn queries_can_be_received_while_heartbeating() {
         schedule_local_activity_cmd(
             1,
             "act-id",
-            ActivityCancellationType::TryCancel,
+            ProtoActivityCancellationType::TryCancel,
             Duration::from_secs(60),
         ),
     ))

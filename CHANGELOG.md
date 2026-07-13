@@ -68,6 +68,11 @@ to docs, or any other relevant information.
   `WorkflowExecutionStatus` enum instead of generated protobuf types.
 * Activity, child-workflow, and timeout errors now expose Rust-native `RetryState` and
   `TimeoutType` enums instead of generated protobuf enums.
+* Workflow and worker options now use Rust-native cancellation, parent-close, workflow-ID reuse,
+  versioning, and Nexus cancellation policy enums instead of generated protobuf enums.
+* Child workflow cancellation now defaults to `WaitCancellationCompleted` instead of `Abandon`,
+  aligning Rust with the Core-based SDKs and Java. Set `ChildWorkflowCancellationType::Abandon`
+  explicitly to retain the previous behavior.
 
 ### Fixed
 * OTLP metric export failures are now logged through Core telemetry when OpenTelemetry's periodic
