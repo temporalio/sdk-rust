@@ -957,6 +957,9 @@ impl WorkflowHalf {
                     return Ok(None);
                 }
             };
+            // The executor consumes self-wakes synchronously, so cooperative budget exhaustion
+            // would otherwise re-poll the workflow forever without returning to Tokio.
+            let wff = tokio::task::coop::unconstrained(wff);
             // TODO [rust-sdk-branch]: Deadlock detection
             let jh = executor.spawn(async move {
                 tokio::select! {
