@@ -272,8 +272,8 @@ pub struct WorkerOptions {
     ///
     /// The callback receives an immutable workflow information snapshot and patch ID. Returning
     /// `true` records the patch marker; returning `false` leaves the patch inactive for the
-    /// workflow run. This option currently applies only to native Rust workflows, not registered
-    /// WASM workflow components.
+    /// workflow run. For registered WASM workflow components, the callback remains on the worker
+    /// host and is invoked through the workflow component's synchronous host interface.
     pub patch_activation_callback: Option<PatchActivationCallback>,
 }
 

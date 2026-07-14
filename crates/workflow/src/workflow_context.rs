@@ -103,6 +103,17 @@ pub struct PatchActivationInput {
     pub patch_id: String,
 }
 
+impl PatchActivationInput {
+    /// Create callback input from a workflow information snapshot and patch ID.
+    #[doc(hidden)]
+    pub fn new(workflow_info: WorkflowContextView, patch_id: String) -> Self {
+        Self {
+            workflow_info,
+            patch_id,
+        }
+    }
+}
+
 /// Callback that decides whether a newly encountered patch should be activated.
 pub type PatchActivationCallback =
     Arc<dyn Fn(PatchActivationInput) -> bool + Send + Sync + 'static>;
@@ -888,10 +899,10 @@ impl<W> SyncWorkflowContext<W> {
         let res = if deprecated || replaying || notified {
             !replaying || notified
         } else if let Some(callback) = &self.base.inner.patch_activation_callback {
-            callback(PatchActivationInput {
-                workflow_info: self.base.view(),
-                patch_id: patch_id.to_string(),
-            })
+            callback(PatchActivationInput::new(
+                self.base.view(),
+                patch_id.to_string(),
+            ))
         } else {
             true
         };
@@ -2457,8 +2468,8 @@ mod tests {
         assert_eq!(commands.borrow().len(), 1);
         let input = input.lock().unwrap();
         let input = input.as_ref().unwrap();
-        assert_eq!(input.workflow_info.workflow_id, "workflow-id");
-        assert_eq!(input.workflow_info.run_id, "run-id");
+        assert_eq!(input.workflow_info.workflow_id(), "workflow-id");
+        assert_eq!(input.workflow_info.run_id(), "run-id");
         assert_eq!(input.patch_id, "my-patch");
     }
 

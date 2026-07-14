@@ -278,7 +278,7 @@ async fn declined_patch_can_roll_out_to_old_worker() {
     let workflow_id = starter.get_task_queue().to_string();
     let expected_workflow_id = workflow_id.clone();
     let callback: PatchActivationCallback = Arc::new(move |input| {
-        assert_eq!(input.workflow_info.workflow_id, expected_workflow_id);
+        assert_eq!(input.workflow_info.workflow_id(), expected_workflow_id);
         assert_eq!(input.patch_id, ROLLOUT_PATCH_ID);
         callback_calls_clone.fetch_add(1, Ordering::Relaxed);
         false

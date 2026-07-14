@@ -24,7 +24,8 @@ pub struct WorkflowContextView {
 
 impl WorkflowContextView {
     /// Create a new view from workflow initialization data.
-    pub(crate) fn new(
+    #[doc(hidden)]
+    pub fn new(
         namespace: String,
         task_queue: String,
         run_id: String,
