@@ -22,7 +22,6 @@ use std::{
     collections::HashMap,
     convert::Infallible,
     future::Future,
-    marker::PhantomData,
     pin::Pin,
     rc::Rc,
     sync::Arc,
@@ -1596,6 +1595,3 @@ pub(crate) fn wrong_workflow_input_type(type_name: &'static str) -> WorkflowTerm
         ),
     ))
 }
-
-#[allow(dead_code)]
-struct AssertNoSendSyncBounds(PhantomData<*const ()>);
