@@ -68,7 +68,7 @@ gethostname = "1.0.2"
 hyper = { version = "1.7", optional = true }
 itertools = "0.14"
 lru = "0.18"
-mockall = "0.14"
+mockall = "0.15"
 opentelemetry = { workspace = true, features = ["metrics"], optional = true }
 opentelemetry_sdk = { version = "0.32", default-features = false, features = [
   "rt-tokio",

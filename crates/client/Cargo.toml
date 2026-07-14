@@ -59,7 +59,7 @@ default-features = false
 
 [dev-dependencies]
 assert_matches = "1"
-mockall = "0.14"
+mockall = "0.15"
 prost = "0.14"
 prost-types = { workspace = true }
 rstest = "0.26"
