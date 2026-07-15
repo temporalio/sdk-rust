@@ -39,8 +39,8 @@ pub use workflow_context::{
     ActivityCancellationType, ActivityCloseTimeouts, ActivityOptions, BaseWorkflowContext,
     CancellableFuture, ChildWorkflowCancellationType, ChildWorkflowOptions, ContinueAsNewOptions,
     ContinueAsNewVersioningBehavior, ExternalWorkflowHandle, LocalActivityOptions,
-    NexusOperationCancellationType, NexusOperationOptions, ParentClosePolicy, ParentWorkflowInfo,
-    RootWorkflowInfo, Signal, SignalData, StartChildWorkflowExecutionFailedCause,
+    NamespacedWorkflowInfo, NexusOperationCancellationType, NexusOperationOptions,
+    ParentClosePolicy, Signal, SignalData, StartChildWorkflowExecutionFailedCause,
     StartedChildWorkflow, SyncWorkflowContext, TimerOptions, VersioningIntent, WorkflowContext,
     WorkflowContextView, WorkflowIdReusePolicy,
 };

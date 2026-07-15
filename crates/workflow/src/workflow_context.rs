@@ -1,4 +1,5 @@
 mod options;
+mod view;
 
 pub use options::{
     ActivityCancellationType, ActivityCloseTimeouts, ActivityOptions,
@@ -8,6 +9,7 @@ pub use options::{
     WorkflowIdReusePolicy,
 };
 pub use temporalio_common_wasm::protos::coresdk::child_workflow::StartChildWorkflowExecutionFailedCause;
+pub use view::{NamespacedWorkflowInfo, WorkflowContextView};
 
 use crate::{
     MemoValue,
@@ -39,7 +41,7 @@ use std::{
     time::{Duration, SystemTime},
 };
 use temporalio_common_wasm::{
-    ActivityDefinition, Memo, Priority, RetryPolicy, SignalDefinition, WorkflowDefinition,
+    ActivityDefinition, Memo, SignalDefinition, WorkflowDefinition,
     data_converters::{
         ActivityExecutionDecodeHint, ChildWorkflowExecutionDecodeHint,
         ChildWorkflowStartDecodeHint, DataConverter, GenericPayloadConverter,
@@ -115,12 +117,15 @@ impl BaseWorkflowContext {
     /// Create a read-only view of this context.
     pub(crate) fn view(&self) -> WorkflowContextView {
         let shared = self.inner.shared.borrow();
+        let mut initial_information = self.inner.initial_information.clone();
+        if initial_information.memo.is_some() || !shared.memo.fields.is_empty() {
+            initial_information.memo = Some(shared.memo.clone());
+        }
         WorkflowContextView::new(
             self.inner.namespace.clone(),
             self.inner.task_queue.clone(),
             self.inner.run_id.clone(),
-            &self.inner.initial_information,
-            &shared.memo,
+            initial_information,
             self.inner.data_converter.payload_converter().clone(),
         )
     }
@@ -275,159 +280,6 @@ impl<W> Clone for WorkflowContext<W> {
             workflow_state: self.workflow_state.clone(),
             condition_wakers: self.condition_wakers.clone(),
         }
-    }
-}
-
-/// Read-only view of workflow context for use in init and query handlers.
-///
-/// This provides access to workflow information but cannot issue commands.
-#[derive(Clone, Debug)]
-#[non_exhaustive]
-pub struct WorkflowContextView {
-    /// The workflow's unique identifier
-    pub workflow_id: String,
-    /// The run id of this workflow execution
-    pub run_id: String,
-    /// The workflow type name
-    pub workflow_type: String,
-    /// The task queue this workflow is executing on
-    pub task_queue: String,
-    /// The namespace this workflow is executing in
-    pub namespace: String,
-
-    /// The current attempt number (starting from 1)
-    pub attempt: u32,
-    /// The run id of the very first execution in the chain
-    pub first_execution_run_id: String,
-    /// The run id of the previous execution if this is a continuation
-    pub continued_from_run_id: Option<String>,
-
-    /// When the workflow execution started
-    pub start_time: Option<SystemTime>,
-    /// Total workflow execution timeout including retries and continue as new
-    pub execution_timeout: Option<Duration>,
-    /// Timeout of a single workflow run
-    pub run_timeout: Option<Duration>,
-    /// Timeout of a single workflow task
-    pub task_timeout: Option<Duration>,
-
-    /// Information about the parent workflow, if this is a child workflow
-    pub parent: Option<ParentWorkflowInfo>,
-    /// Information about the root workflow in the execution chain
-    pub root: Option<RootWorkflowInfo>,
-
-    /// The workflow's retry policy
-    pub retry_policy: Option<RetryPolicy>,
-    /// If this workflow runs on a cron schedule
-    pub cron_schedule: Option<String>,
-    /// Priority and fairness configuration for this workflow execution.
-    pub priority: Priority,
-    /// User-defined memo values.
-    pub memo: Memo,
-    /// Initial search attributes as a typed collection.
-    pub search_attributes: Option<SearchAttributes>,
-    raw: InitializeWorkflow,
-}
-
-/// Information about a parent workflow.
-#[derive(Clone, Debug)]
-#[non_exhaustive]
-pub struct ParentWorkflowInfo {
-    /// The parent workflow's unique identifier
-    pub workflow_id: String,
-    /// The parent workflow's run id
-    pub run_id: String,
-    /// The parent workflow's namespace
-    pub namespace: String,
-}
-
-/// Information about the root workflow in an execution chain.
-#[derive(Clone, Debug)]
-#[non_exhaustive]
-pub struct RootWorkflowInfo {
-    /// The root workflow's unique identifier
-    pub workflow_id: String,
-    /// The root workflow's run id
-    pub run_id: String,
-}
-
-impl WorkflowContextView {
-    /// Create a new view from workflow initialization data.
-    pub(crate) fn new(
-        namespace: String,
-        task_queue: String,
-        run_id: String,
-        init: &InitializeWorkflow,
-        memo: &ProtoMemo,
-        payload_converter: PayloadConverter,
-    ) -> Self {
-        let parent = init
-            .parent_workflow_info
-            .as_ref()
-            .map(|p| ParentWorkflowInfo {
-                workflow_id: p.workflow_id.clone(),
-                run_id: p.run_id.clone(),
-                namespace: p.namespace.clone(),
-            });
-
-        let root = init.root_workflow.as_ref().map(|r| RootWorkflowInfo {
-            workflow_id: r.workflow_id.clone(),
-            run_id: r.run_id.clone(),
-        });
-
-        let continued_from_run_id = if init.continued_from_execution_run_id.is_empty() {
-            None
-        } else {
-            Some(init.continued_from_execution_run_id.clone())
-        };
-
-        let cron_schedule = if init.cron_schedule.is_empty() {
-            None
-        } else {
-            Some(init.cron_schedule.clone())
-        };
-
-        Self {
-            workflow_id: init.workflow_id.clone(),
-            run_id,
-            workflow_type: init.workflow_type.clone(),
-            task_queue,
-            namespace,
-            attempt: init.attempt as u32,
-            first_execution_run_id: init.first_execution_run_id.clone(),
-            continued_from_run_id,
-            start_time: init.start_time.and_then(|t| t.try_into().ok()),
-            execution_timeout: init
-                .workflow_execution_timeout
-                .and_then(|d| d.try_into().ok()),
-            run_timeout: init.workflow_run_timeout.and_then(|d| d.try_into().ok()),
-            task_timeout: init.workflow_task_timeout.and_then(|d| d.try_into().ok()),
-            parent,
-            root,
-            retry_policy: init.retry_policy.clone().map(Into::into),
-            cron_schedule,
-            priority: init.priority.clone().unwrap_or_default().into(),
-            memo: Memo::from_raw(
-                Some(memo.clone()),
-                payload_converter,
-                SerializationContextData::Workflow,
-            ),
-            search_attributes: init
-                .search_attributes
-                .as_ref()
-                .map(SearchAttributes::from_proto),
-            raw: init.clone(),
-        }
-    }
-
-    /// Access the underlying workflow initialization protobuf.
-    pub fn raw(&self) -> &InitializeWorkflow {
-        &self.raw
-    }
-
-    /// Consume this view and return the underlying workflow initialization protobuf.
-    pub fn into_raw(self) -> InitializeWorkflow {
-        self.raw
     }
 }
 
@@ -2803,7 +2655,15 @@ mod tests {
         let current = ctx.memo();
         assert_eq!(current.get::<u32>("new").unwrap(), Some(42));
         assert_eq!(current.get::<String>("old").unwrap(), None);
-        assert_eq!(ctx.view().memo.get::<u32>("new").unwrap(), Some(42));
+        let view = ctx.view();
+        assert_eq!(view.memo().get::<u32>("new").unwrap(), Some(42));
+        assert_eq!(
+            view.memo().raw(),
+            view.raw()
+                .memo
+                .as_ref()
+                .expect("view memo should be present")
+        );
 
         let commands = host.commands.borrow();
         let [command] = commands.as_slice() else {
@@ -2937,7 +2797,7 @@ mod tests {
 
         let view = ctx.view();
         let sa = view
-            .search_attributes
+            .search_attributes()
             .expect("should have search attributes");
         assert_eq!(sa.get(&K), Some(true));
     }

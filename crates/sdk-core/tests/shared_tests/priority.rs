@@ -97,7 +97,7 @@ pub(crate) async fn priority_values_sent_to_server() {
         #[run(name = "child-wf")]
         async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<()> {
             assert_eq!(
-                ctx.info().priority,
+                ctx.info().priority(),
                 Priority {
                     priority_key: Some(4),
                     fairness_key: Some("fair-child".to_string()),
