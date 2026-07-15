@@ -1325,13 +1325,11 @@ mod tests {
         assert_eq!(
             decoded_failure
                 .workflow_execution()
-                .map(|wf| wf.workflow_id.as_str()),
+                .map(|wf| wf.workflow_id()),
             Some("child-id")
         );
         assert_eq!(
-            decoded_failure
-                .workflow_execution()
-                .map(|wf| wf.run_id.as_str()),
+            decoded_failure.workflow_execution().map(|wf| wf.run_id()),
             Some("run-id")
         );
         assert_eq!(decoded_failure.workflow_type(), Some("child-type"));

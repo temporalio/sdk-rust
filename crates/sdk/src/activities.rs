@@ -226,13 +226,13 @@ impl ActivityContext {
     /// Return a workflow handle for the workflow execution that started this activity, if any.
     pub fn workflow_handle<W: HasWorkflowDefinition>(&self) -> Option<WorkflowHandle<Client, W>> {
         let workflow_execution = self.info.workflow_execution.as_ref()?;
-        let run_id =
-            (!workflow_execution.run_id.is_empty()).then_some(workflow_execution.run_id.clone());
+        let run_id = (!workflow_execution.run_id().is_empty())
+            .then(|| workflow_execution.run_id().to_owned());
         Some(WorkflowHandle::new(
             self.client(),
             WorkflowExecutionInfo {
                 namespace: self.client_options.namespace.clone(),
-                workflow_id: workflow_execution.workflow_id.clone(),
+                workflow_id: workflow_execution.workflow_id().to_owned(),
                 run_id: run_id.clone(),
                 first_execution_run_id: run_id,
             },

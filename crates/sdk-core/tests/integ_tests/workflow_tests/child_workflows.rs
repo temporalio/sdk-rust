@@ -630,9 +630,7 @@ impl GrandchildCancellationWf {
             panic!("child should fail with a child-workflow failure");
         };
         assert_eq!(
-            failure
-                .workflow_execution()
-                .map(|wf| wf.workflow_id.as_str()),
+            failure.workflow_execution().map(|wf| wf.workflow_id()),
             Some(child_workflow_id.as_str())
         );
         assert_eq!(
@@ -647,7 +645,7 @@ impl GrandchildCancellationWf {
         assert_eq!(
             grandchild_failure
                 .workflow_execution()
-                .map(|wf| wf.workflow_id.as_str()),
+                .map(|wf| wf.workflow_id()),
             Some(grandchild_workflow_id.as_str())
         );
         assert_eq!(grandchild_failure.workflow_type(), Some("grandchild_wf"));
@@ -936,9 +934,7 @@ impl ParentWf {
             (Expectation::Success, Ok(_)) => Ok(()),
             (Expectation::Failure, Err(ChildWorkflowExecutionError::Failed(failure))) => {
                 assert_eq!(
-                    failure
-                        .workflow_execution()
-                        .map(|wf| wf.workflow_id.as_str()),
+                    failure.workflow_execution().map(|wf| wf.workflow_id()),
                     Some("child-id-1")
                 );
                 assert_eq!(failure.workflow_type(), Some("child"));

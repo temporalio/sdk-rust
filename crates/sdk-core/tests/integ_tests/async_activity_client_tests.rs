@@ -79,8 +79,8 @@ async fn async_activity_completions(
             let wf_exec = activity_info.workflow_execution.as_ref().unwrap();
             let info = SharedActivityInfo {
                 task_token: activity_info.task_token.clone(),
-                workflow_id: wf_exec.workflow_id.clone(),
-                run_id: wf_exec.run_id.clone(),
+                workflow_id: wf_exec.workflow_id().to_owned(),
+                run_id: wf_exec.run_id().to_owned(),
                 activity_id: activity_info.activity_id.clone(),
             };
             let _ = self.info_tx.send(info).await;

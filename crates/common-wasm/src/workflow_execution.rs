@@ -1,56 +1,64 @@
 use crate::protos::temporal::api::common::v1::WorkflowExecution as ProtoWorkflowExecution;
 
 /// Identifies a workflow execution by workflow and run ID.
-#[derive(Clone, Debug, Default, bon::Builder)]
+#[derive(Clone, Debug, Default, PartialEq)]
 #[non_exhaustive]
-#[builder(on(String, into), state_mod(vis = "pub"))]
 pub struct WorkflowExecution {
-    /// The workflow ID.
-    pub workflow_id: String,
-    /// The run ID, or an empty string when targeting the latest run.
-    pub run_id: String,
-    #[builder(skip = ProtoWorkflowExecution {
-        workflow_id: workflow_id.clone(),
-        run_id: run_id.clone(),
-    })]
     raw: ProtoWorkflowExecution,
 }
 
+#[bon::bon]
 impl WorkflowExecution {
+    /// Create a workflow execution identifier.
+    #[builder(on(String, into), state_mod(vis = "pub"))]
+    pub fn new(workflow_id: String, run_id: String) -> Self {
+        let mut execution = Self::default();
+        execution.set_workflow_id(workflow_id).set_run_id(run_id);
+        execution
+    }
+
+    /// The workflow ID.
+    pub fn workflow_id(&self) -> &str {
+        &self.raw.workflow_id
+    }
+
+    /// Set the workflow ID.
+    pub fn set_workflow_id(&mut self, workflow_id: impl Into<String>) -> &mut Self {
+        self.raw.workflow_id = workflow_id.into();
+        self
+    }
+
+    /// The run ID.
+    pub fn run_id(&self) -> &str {
+        &self.raw.run_id
+    }
+
+    /// Set the run ID.
+    pub fn set_run_id(&mut self, run_id: impl Into<String>) -> &mut Self {
+        self.raw.run_id = run_id.into();
+        self
+    }
+
     /// Access the underlying workflow execution protobuf.
     pub fn raw(&self) -> &ProtoWorkflowExecution {
         &self.raw
     }
 
     /// Consume this wrapper and return the underlying workflow execution protobuf.
-    pub fn into_raw(mut self) -> ProtoWorkflowExecution {
-        self.raw.workflow_id = self.workflow_id;
-        self.raw.run_id = self.run_id;
+    pub fn into_raw(self) -> ProtoWorkflowExecution {
         self.raw
     }
 }
 
-impl PartialEq for WorkflowExecution {
-    fn eq(&self, other: &Self) -> bool {
-        self.workflow_id == other.workflow_id && self.run_id == other.run_id
-    }
-}
-
-impl Eq for WorkflowExecution {}
-
 impl From<ProtoWorkflowExecution> for WorkflowExecution {
     fn from(value: ProtoWorkflowExecution) -> Self {
-        Self {
-            workflow_id: value.workflow_id.clone(),
-            run_id: value.run_id.clone(),
-            raw: value,
-        }
+        Self { raw: value }
     }
 }
 
 impl From<WorkflowExecution> for ProtoWorkflowExecution {
     fn from(value: WorkflowExecution) -> Self {
-        value.into_raw()
+        value.raw
     }
 }
 
@@ -65,6 +73,8 @@ mod tests {
             .run_id("run-id")
             .build();
 
+        assert_eq!(execution.workflow_id(), "workflow-id");
+        assert_eq!(execution.run_id(), "run-id");
         assert_eq!(execution.raw().workflow_id, "workflow-id");
         assert_eq!(execution.raw().run_id, "run-id");
 
@@ -75,14 +85,15 @@ mod tests {
     }
 
     #[test]
-    fn retains_source_proto() {
-        let raw = ProtoWorkflowExecution {
-            workflow_id: "workflow-id".to_owned(),
-            run_id: "run-id".to_owned(),
-        };
-        let execution = WorkflowExecution::from(raw.clone());
+    fn setters_update_raw_proto() {
+        let mut execution = WorkflowExecution::default();
+        execution
+            .set_workflow_id("workflow-id")
+            .set_run_id("run-id");
 
-        assert_eq!(execution.raw(), &raw);
-        assert_eq!(execution.into_raw(), raw);
+        assert_eq!(execution.workflow_id(), "workflow-id");
+        assert_eq!(execution.run_id(), "run-id");
+        assert_eq!(execution.raw().workflow_id, "workflow-id");
+        assert_eq!(execution.raw().run_id, "run-id");
     }
 }

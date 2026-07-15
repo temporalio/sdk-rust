@@ -1068,8 +1068,8 @@ impl ActivityHalf {
                     let act_fut = async move {
                         if let Some(info) = &ctx.info().workflow_execution {
                             Span::current()
-                                .record("temporalWorkflowID", &info.workflow_id)
-                                .record("temporalRunID", &info.run_id);
+                                .record("temporalWorkflowID", info.workflow_id())
+                                .record("temporalRunID", info.run_id());
                         }
                         (act_fn)(args, data_converter, ctx, activity_inbound_interceptors).await
                     }
