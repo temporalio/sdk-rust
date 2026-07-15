@@ -23,8 +23,8 @@ use temporalio_common::{
 };
 pub use tuner::{
     FixedSizeSlotSupplier, ResourceBasedSlotsOptions, ResourceBasedSlotsOptionsBuilder,
-    ResourceBasedTuner, ResourceSlotOptions, SlotSupplierOptions, TunerBuilder, TunerHolder,
-    TunerHolderOptions,
+    ResourceBasedTuner, ResourceBasedTunerConfig, ResourceController, ResourceSlotOptions,
+    SlotSupplierOptions, TunerBuilder, TunerHolder, TunerHolderOptions,
 };
 // Re-export the generated builder (it's in the tuner module)
 pub use tuner::TunerHolderOptionsBuilder;

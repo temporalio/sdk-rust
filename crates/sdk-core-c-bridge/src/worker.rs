@@ -1345,11 +1345,13 @@ impl TryFrom<&TunerHolder> for temporalio_sdk_core::TunerHolder {
             .activity_slot_options(holder.activity_slot_supplier.try_into()?)
             .local_activity_slot_options(holder.local_activity_slot_supplier.try_into()?)
             .nexus_slot_options(holder.nexus_task_slot_supplier.try_into()?)
-            .maybe_resource_based_options(first.map(|f| {
-                temporalio_sdk_core::ResourceBasedSlotsOptions::builder()
-                    .target_mem_usage(f.target_memory_usage)
-                    .target_cpu_usage(f.target_cpu_usage)
-                    .build()
+            .maybe_resource_based_config(first.map(|f| {
+                temporalio_sdk_core::ResourceBasedTunerConfig::Options(
+                    temporalio_sdk_core::ResourceBasedSlotsOptions::builder()
+                        .target_mem_usage(f.target_memory_usage)
+                        .target_cpu_usage(f.target_cpu_usage)
+                        .build(),
+                )
             }))
             .build()
             .map_err(|e| anyhow::anyhow!("Failed building tuner holder options: {}", e))?
