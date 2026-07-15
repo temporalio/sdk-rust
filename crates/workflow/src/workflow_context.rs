@@ -2428,6 +2428,7 @@ mod tests {
     use crate::MemoValues;
     use std::collections::HashMap;
     use temporalio_common_wasm::{
+        RetryPolicy,
         data_converters::{TemporalDeserializable, TemporalSerializable},
         protos::{
             coresdk::{
@@ -2436,7 +2437,7 @@ mod tests {
                 workflow_commands::WorkflowCommand,
             },
             temporal::api::{
-                common::v1::{Payload, RetryPolicy},
+                common::v1::{Payload, RetryPolicy as ProtoRetryPolicy},
                 enums::v1::ContinueAsNewVersioningBehavior as ProtoContinueAsNewVersioningBehavior,
             },
         },
@@ -2574,13 +2575,7 @@ mod tests {
                     memo: Some(memo.clone()),
                     headers: Some(headers.clone()),
                     search_attributes: Some(search_attributes.clone()),
-                    retry_policy: Some(
-                        RetryPolicy {
-                            maximum_attempts: 5,
-                            ..Default::default()
-                        }
-                        .into(),
-                    ),
+                    retry_policy: Some(RetryPolicy::builder().maximum_attempts(5).build()),
                     versioning_intent: Some(ProtoVersioningIntent::Compatible.into()),
                     initial_versioning_behavior: Some(
                         ContinueAsNewVersioningBehavior::UseRampingVersion,
@@ -2611,7 +2606,7 @@ mod tests {
                 )]),
                 headers,
                 search_attributes: Some(proto_search_attributes),
-                retry_policy: Some(RetryPolicy {
+                retry_policy: Some(ProtoRetryPolicy {
                     initial_interval: Some(Duration::from_secs(1).try_into().unwrap()),
                     backoff_coefficient: 2.0,
                     maximum_attempts: 5,
