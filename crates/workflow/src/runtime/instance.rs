@@ -93,117 +93,82 @@ fn expect_resolution<T>(value: Option<T>) -> T {
     value.expect("resolution expected payload")
 }
 
-fn call_initialize_workflow<'a>(
-    interceptors: &'a [Arc<dyn WorkflowInterceptor>],
-    ctx: WorkflowContextView,
-    input: InitializeWorkflowInput,
-    next: WorkflowNext<'a, InitializeWorkflowInput, InitializeWorkflowOutput>,
-) -> InitializeWorkflowOutput {
-    if let Some((first, rest)) = interceptors.split_first() {
-        let next_ctx = ctx.clone();
-        first.initialize_workflow(
-            ctx,
-            input,
-            WorkflowNext::new(move |input| call_initialize_workflow(rest, next_ctx, input, next)),
-        )
-    } else {
-        next.run(input)
-    }
+// Macro for defining a function that drives forward an interceptor chain
+macro_rules! call_workflow_interceptor {
+    (
+        $function:ident<$lifetime:lifetime>,
+        $method:ident,
+        $ctx:ty,
+        $input:ty,
+        $output:ty $(,)?
+    ) => {
+        fn $function<$lifetime>(
+            interceptors: &$lifetime [Arc<dyn WorkflowInterceptor>],
+            ctx: $ctx,
+            input: $input,
+            next: WorkflowNext<$lifetime, $input, $output>,
+        ) -> $output {
+            if let Some((first, rest)) = interceptors.split_first() {
+                let next_ctx = ctx.clone();
+                first.$method(
+                    ctx,
+                    input,
+                    WorkflowNext::new(move |input| $function(rest, next_ctx, input, next)),
+                )
+            } else {
+                next.run(input)
+            }
+        }
+    };
 }
 
-fn call_execute_workflow<'a>(
-    interceptors: &'a [Arc<dyn WorkflowInterceptor>],
-    ctx: WorkflowInterceptorContext,
-    input: ExecuteWorkflowInput,
-    next: WorkflowNext<
-        'a,
-        ExecuteWorkflowInput,
-        WorkflowInterceptorFuture<'a, ExecuteWorkflowResult>,
-    >,
-) -> WorkflowInterceptorFuture<'a, ExecuteWorkflowResult> {
-    if let Some((first, rest)) = interceptors.split_first() {
-        let next_ctx = ctx.clone();
-        first.execute(
-            ctx,
-            input,
-            WorkflowNext::new(move |input| call_execute_workflow(rest, next_ctx, input, next)),
-        )
-    } else {
-        next.run(input)
-    }
-}
+call_workflow_interceptor!(
+    call_initialize_workflow<'a>,
+    initialize_workflow,
+    WorkflowContextView,
+    InitializeWorkflowInput,
+    InitializeWorkflowOutput,
+);
 
-fn call_handle_signal<'a>(
-    interceptors: &'a [Arc<dyn WorkflowInterceptor>],
-    ctx: WorkflowInterceptorContext,
-    input: HandleSignalInput,
-    next: WorkflowNext<'a, HandleSignalInput, WorkflowInterceptorFuture<'a, HandleSignalResult>>,
-) -> WorkflowInterceptorFuture<'a, HandleSignalResult> {
-    if let Some((first, rest)) = interceptors.split_first() {
-        let next_ctx = ctx.clone();
-        first.handle_signal(
-            ctx,
-            input,
-            WorkflowNext::new(move |input| call_handle_signal(rest, next_ctx, input, next)),
-        )
-    } else {
-        next.run(input)
-    }
-}
+call_workflow_interceptor!(
+    call_execute_workflow<'a>,
+    execute,
+    WorkflowInterceptorContext,
+    ExecuteWorkflowInput,
+    WorkflowInterceptorFuture<'a, ExecuteWorkflowResult>,
+);
 
-fn call_handle_update<'a>(
-    interceptors: &'a [Arc<dyn WorkflowInterceptor>],
-    ctx: WorkflowInterceptorContext,
-    input: HandleUpdateInput,
-    next: WorkflowNext<'a, HandleUpdateInput, WorkflowInterceptorFuture<'a, HandleUpdateResult>>,
-) -> WorkflowInterceptorFuture<'a, HandleUpdateResult> {
-    if let Some((first, rest)) = interceptors.split_first() {
-        let next_ctx = ctx.clone();
-        first.handle_update(
-            ctx,
-            input,
-            WorkflowNext::new(move |input| call_handle_update(rest, next_ctx, input, next)),
-        )
-    } else {
-        next.run(input)
-    }
-}
+call_workflow_interceptor!(
+    call_handle_signal<'a>,
+    handle_signal,
+    WorkflowInterceptorContext,
+    HandleSignalInput,
+    WorkflowInterceptorFuture<'a, HandleSignalResult>,
+);
 
-fn call_handle_query<'a>(
-    interceptors: &'a [Arc<dyn WorkflowInterceptor>],
-    ctx: SyncWorkflowInterceptorContext,
-    input: HandleQueryInput,
-    next: WorkflowNext<'a, HandleQueryInput, HandleQueryResult>,
-) -> HandleQueryResult {
-    if let Some((first, rest)) = interceptors.split_first() {
-        let next_ctx = ctx.clone();
-        first.handle_query(
-            ctx,
-            input,
-            WorkflowNext::new(move |input| call_handle_query(rest, next_ctx, input, next)),
-        )
-    } else {
-        next.run(input)
-    }
-}
+call_workflow_interceptor!(
+    call_handle_update<'a>,
+    handle_update,
+    WorkflowInterceptorContext,
+    HandleUpdateInput,
+    WorkflowInterceptorFuture<'a, HandleUpdateResult>,
+);
 
-fn call_validate_update<'a>(
-    interceptors: &'a [Arc<dyn WorkflowInterceptor>],
-    ctx: SyncWorkflowInterceptorContext,
-    input: ValidateUpdateInput,
-    next: WorkflowNext<'a, ValidateUpdateInput, ValidateUpdateResult>,
-) -> ValidateUpdateResult {
-    if let Some((first, rest)) = interceptors.split_first() {
-        let next_ctx = ctx.clone();
-        first.validate_update(
-            ctx,
-            input,
-            WorkflowNext::new(move |input| call_validate_update(rest, next_ctx, input, next)),
-        )
-    } else {
-        next.run(input)
-    }
-}
+call_workflow_interceptor!(
+    call_handle_query<'a>,
+    handle_query,
+    SyncWorkflowInterceptorContext,
+    HandleQueryInput,
+    HandleQueryResult,
+);
+
+call_workflow_interceptor!(
+    call_validate_update<'a>,
+    validate_update,
+    SyncWorkflowInterceptorContext,
+    ValidateUpdateInput,
+    ValidateUpdateResult,
+);
 
 fn intercepted_execute_future<W>(
     ctx: WorkflowContext<W>,
