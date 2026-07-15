@@ -1336,7 +1336,7 @@ impl Client {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{NamespacedClient, grpc::WorkflowService};
+    use crate::{NamespacedClient, grpc::WorkflowService, test_helpers::XorCodec};
     use futures_util::FutureExt;
     use std::{
         collections::HashMap,
@@ -1349,8 +1349,7 @@ mod tests {
     use temporalio_common::{
         UntypedWorkflow,
         data_converters::{
-            DataConverter, DefaultFailureConverter, MultiArgs2, PayloadCodec, PayloadConverter,
-            RawValue,
+            DataConverter, DefaultFailureConverter, MultiArgs2, PayloadConverter, RawValue,
         },
         protos::temporal::api::{
             common::v1::{
@@ -1370,35 +1369,6 @@ mod tests {
         },
     };
     use tonic::{Request, Response};
-
-    struct XorCodec;
-
-    impl PayloadCodec for XorCodec {
-        fn encode(
-            &self,
-            _context: &SerializationContextData,
-            payloads: Vec<Payload>,
-        ) -> futures_util::future::BoxFuture<'static, Vec<Payload>> {
-            async move {
-                payloads
-                    .into_iter()
-                    .map(|mut payload| {
-                        payload.data.iter_mut().for_each(|byte| *byte ^= 0x42);
-                        payload
-                    })
-                    .collect()
-            }
-            .boxed()
-        }
-
-        fn decode(
-            &self,
-            context: &SerializationContextData,
-            payloads: Vec<Payload>,
-        ) -> futures_util::future::BoxFuture<'static, Vec<Payload>> {
-            self.encode(context, payloads)
-        }
-    }
 
     fn data_converter_with_codec() -> DataConverter {
         DataConverter::new(

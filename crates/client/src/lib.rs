@@ -25,6 +25,8 @@ pub mod request_extensions;
 mod retry;
 /// Schedule operations: create, describe, update, pause, trigger, backfill, list, and delete.
 pub mod schedules;
+#[cfg(test)]
+mod test_helpers;
 pub mod worker;
 mod workflow_handle;
 mod workflow_status;
@@ -1744,44 +1746,16 @@ mod tests {
 
     mod list_workflows_tests {
         use super::*;
+        use crate::test_helpers::XorCodec;
         use futures_util::{FutureExt, StreamExt};
         use std::sync::atomic::{AtomicUsize, Ordering};
         use temporalio_common::{
-            data_converters::{DefaultFailureConverter, PayloadCodec},
+            data_converters::DefaultFailureConverter,
             protos::temporal::api::common::v1::{
                 Memo as ProtoMemo, WorkflowExecution as ProtoWorkflowExecution,
             },
         };
         use tonic::{Request, Response};
-
-        struct XorCodec;
-
-        impl PayloadCodec for XorCodec {
-            fn encode(
-                &self,
-                _context: &SerializationContextData,
-                payloads: Vec<Payload>,
-            ) -> futures_util::future::BoxFuture<'static, Vec<Payload>> {
-                async move {
-                    payloads
-                        .into_iter()
-                        .map(|mut payload| {
-                            payload.data.iter_mut().for_each(|byte| *byte ^= 0x42);
-                            payload
-                        })
-                        .collect()
-                }
-                .boxed()
-            }
-
-            fn decode(
-                &self,
-                context: &SerializationContextData,
-                payloads: Vec<Payload>,
-            ) -> futures_util::future::BoxFuture<'static, Vec<Payload>> {
-                self.encode(context, payloads)
-            }
-        }
 
         #[derive(Clone)]
         struct MockListWorkflowsClient {
