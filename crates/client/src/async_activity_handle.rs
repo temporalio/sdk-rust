@@ -160,9 +160,16 @@ impl<CT: WorkflowService + NamespacedClient + Clone> AsyncActivityHandle<CT> {
             &SerializationContextData::Activity,
         )
         .await;
-        let last_heartbeat_details = self
-            .encode_optional_payloads(last_heartbeat_details)
-            .await?;
+        let last_heartbeat_details = match last_heartbeat_details {
+            Some(details) => Some(Payloads {
+                payloads: self
+                    .client
+                    .data_converter()
+                    .to_payloads(&SerializationContextData::Activity, &details)
+                    .await?,
+            }),
+            None => None,
+        };
         match &self.identifier {
             ActivityIdentifier::TaskToken(token) => {
                 WorkflowService::respond_activity_task_failed(
@@ -211,7 +218,16 @@ impl<CT: WorkflowService + NamespacedClient + Clone> AsyncActivityHandle<CT> {
     where
         T: TemporalSerializable + 'static,
     {
-        let details = self.encode_optional_payloads(details).await?;
+        let details = match details {
+            Some(details) => Some(Payloads {
+                payloads: self
+                    .client
+                    .data_converter()
+                    .to_payloads(&SerializationContextData::Activity, &details)
+                    .await?,
+            }),
+            None => None,
+        };
         match &self.identifier {
             ActivityIdentifier::TaskToken(token) => {
                 WorkflowService::respond_activity_task_canceled(
@@ -264,7 +280,16 @@ impl<CT: WorkflowService + NamespacedClient + Clone> AsyncActivityHandle<CT> {
     where
         T: TemporalSerializable + 'static,
     {
-        let details = self.encode_optional_payloads(details).await?;
+        let details = match details {
+            Some(details) => Some(Payloads {
+                payloads: self
+                    .client
+                    .data_converter()
+                    .to_payloads(&SerializationContextData::Activity, &details)
+                    .await?,
+            }),
+            None => None,
+        };
         match &self.identifier {
             ActivityIdentifier::TaskToken(token) => {
                 let resp = WorkflowService::record_activity_task_heartbeat(
@@ -306,25 +331,6 @@ impl<CT: WorkflowService + NamespacedClient + Clone> AsyncActivityHandle<CT> {
                 .into_inner();
                 Ok(ActivityHeartbeatResponse::from(resp))
             }
-        }
-    }
-
-    async fn encode_optional_payloads<T>(
-        &self,
-        value: Option<T>,
-    ) -> Result<Option<Payloads>, AsyncActivityError>
-    where
-        T: TemporalSerializable + 'static,
-    {
-        match value {
-            Some(value) => Ok(Some(Payloads {
-                payloads: self
-                    .client
-                    .data_converter()
-                    .to_payloads(&SerializationContextData::Activity, &value)
-                    .await?,
-            })),
-            None => Ok(None),
         }
     }
 }
