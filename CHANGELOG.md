@@ -99,3 +99,5 @@ to docs, or any other relevant information.
   metric reader reports an export error.
 * Worker heartbeat now samples host CPU/memory at the heartbeat interval (only when enabled) rather
   than every 100ms.
+* Workflow replay now reports nondeterminism when a scheduled Nexus operation's service or operation
+  differs from the command that produced it.
