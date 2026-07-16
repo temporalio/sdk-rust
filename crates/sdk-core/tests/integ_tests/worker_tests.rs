@@ -470,7 +470,8 @@ async fn oversize_activity_heartbeat_fails_retryably_then_completes() {
             let attempt = ctx.info().attempt;
             self.max_attempt.fetch_max(attempt as u8, Relaxed);
             if attempt == 1 {
-                ctx.record_heartbeat("a".repeat(OVERSIZE_PAYLOAD_BYTES)).await?;
+                ctx.record_heartbeat("a".repeat(OVERSIZE_PAYLOAD_BYTES))
+                    .await?;
                 // The oversized heartbeat is rejected client-side, which fails this attempt and
                 // cancels us; wait for that cancel rather than returning a normal completion.
                 ctx.cancelled().await;
