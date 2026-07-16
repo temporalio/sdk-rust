@@ -91,6 +91,9 @@ to docs, or any other relevant information.
   `info()`, which returns the Rust-native `WorkflowContextView` and includes typed workflow
   priority. The internal `BaseWorkflowContext::new` raw-protobuf boundary is now explicitly named
   `from_raw`.
+* Workflow count aggregation groups now provide positional typed `get` and `try_get` accessors
+  for search attribute group values over raw payload access.
+
 
 ### Fixed
 * Workflow tasks no longer livelock when a burst of ready async operations exhausts Tokio's
