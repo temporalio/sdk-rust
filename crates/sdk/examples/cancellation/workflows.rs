@@ -19,7 +19,7 @@ impl CancellationActivities {
             if ctx.is_cancelled() {
                 return Err(ActivityError::cancelled());
             }
-            ctx.record_heartbeat(vec![]);
+            ctx.record_heartbeat(()).await?;
             tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         }
     }

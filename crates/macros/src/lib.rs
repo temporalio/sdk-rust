@@ -1,5 +1,6 @@
 use proc_macro::TokenStream;
-use syn::parse_macro_input;
+use proc_macro2::TokenStream as TokenStream2;
+use syn::{parse::Parser, parse_macro_input};
 
 mod activities_definitions;
 mod fsm_impl;
@@ -36,16 +37,27 @@ pub fn activity_definitions(_attr: TokenStream, item: TokenStream) -> TokenStrea
 
 /// Marks a struct as a workflow definition.
 ///
-/// This attribute can optionally specify a custom workflow name:
-/// `#[workflow(name = "my-custom-workflow")]`
-///
-/// If no name is specified, the struct name is used as the workflow type name.
+/// By default, the struct name is used as the workflow type name. To specify a custom workflow
+/// name, use `#[run(name = "my-custom-workflow")]` on the run method.
 ///
 /// This attribute must be used in conjunction with `#[workflow_methods]` on an impl block.
 #[proc_macro_attribute]
-pub fn workflow(_attr: TokenStream, item: TokenStream) -> TokenStream {
-    // Pass through - the struct is not modified, just marked for workflow_methods
-    item
+pub fn workflow(attr: TokenStream, item: TokenStream) -> TokenStream {
+    match validate_workflow_attributes(attr.into()) {
+        Ok(()) => item,
+        Err(err) => err.into_compile_error().into(),
+    }
+}
+
+fn validate_workflow_attributes(attr: TokenStream2) -> syn::Result<()> {
+    let parser = syn::meta::parser(|meta| {
+        if meta.path.is_ident("name") {
+            Err(meta.error("`name` is not supported on #[workflow]; use #[run(name = ...)] on the workflow run method"))
+        } else {
+            Err(meta.error("unsupported workflow attribute"))
+        }
+    });
+    parser.parse2(attr)
 }
 
 /// Defines workflow methods for a workflow struct. Using this macro requires that
@@ -65,7 +77,7 @@ pub fn workflow(_attr: TokenStream, item: TokenStream) -> TokenStream {
 /// ## Method Attributes
 ///
 /// - `#[init]` - Optional initialization method. Signature: `fn new(input: T, ctx: &WorkflowContext) -> Self`
-/// - `#[run]` - Required main workflow function. Signature: `async fn run(&mut self, ctx: &mut WorkflowContext) -> WorkflowResult<T>`
+/// - `#[run]` - Required main workflow function. Signature: `async fn run(&mut self, ctx: &mut WorkflowContext) -> WorkflowResult<T>`. Supports optional `name`.
 /// - `#[signal]` - Signal handler. Sync: `fn signal(&mut self, ctx: &mut SyncWorkflowContext, input: T)`. Async: `async fn signal(ctx: &mut WorkflowContext, input: T)`
 /// - `#[query]` - Query handler. Signature: `fn query(&self, ctx: &WorkflowContextView, input: T) -> R` (must NOT be async)
 /// - `#[update]` - Update handler. Sync: `fn update(&mut self, ctx: &mut SyncWorkflowContext, input: T) -> R`. Async: `async fn update(ctx: &mut WorkflowContext, input: T) -> R`
@@ -302,4 +314,19 @@ pub fn fsm(input: TokenStream) -> TokenStream {
     let def: fsm_impl::StateMachineDefinition =
         parse_macro_input!(input as fsm_impl::StateMachineDefinition);
     def.codegen()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validate_workflow_attributes;
+    use quote::quote;
+
+    #[test]
+    fn workflow_attribute_rejects_name_override() {
+        let err = validate_workflow_attributes(quote!(name = "RenamedWorkflow")).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("use #[run(name = ...)] on the workflow run method")
+        );
+    }
 }

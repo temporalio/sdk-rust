@@ -11,7 +11,7 @@ use temporalio_common::{
         },
         temporal::api::{
             common::v1::WorkflowExecution,
-            enums::v1::{RoutingConfigUpdateState, VersioningBehavior},
+            enums::v1::{RoutingConfigUpdateState, VersioningBehavior as ProtoVersioningBehavior},
             history::v1::history_event::Attributes,
             workflowservice::v1::{
                 DescribeWorkerDeploymentRequest, DescribeWorkflowExecutionRequest,
@@ -19,7 +19,9 @@ use temporalio_common::{
             },
         },
     },
-    worker::{WorkerDeploymentOptions, WorkerDeploymentVersion, WorkerTaskTypes},
+    worker::{
+        VersioningBehavior, WorkerDeploymentOptions, WorkerDeploymentVersion, WorkerTaskTypes,
+    },
 };
 use temporalio_macros::{workflow, workflow_methods};
 use temporalio_sdk::{
@@ -43,7 +45,7 @@ async fn sets_deployment_info_on_task_responses(#[values(true, false)] use_defau
     starter.sdk_config.deployment_options = WorkerDeploymentOptions {
         version: version.clone(),
         use_worker_versioning: true,
-        default_versioning_behavior: VersioningBehavior::AutoUpgrade.into(),
+        default_versioning_behavior: Some(VersioningBehavior::AutoUpgrade),
     };
     starter.sdk_config.task_types = WorkerTaskTypes::workflow_only();
     let core = starter.get_worker().await;
@@ -62,7 +64,7 @@ async fn sets_deployment_info_on_task_responses(#[values(true, false)] use_defau
             CompleteWorkflowExecution { result: None }.into(),
         ]);
         if !use_default {
-            success_complete.versioning_behavior = VersioningBehavior::Pinned.into();
+            success_complete.versioning_behavior = ProtoVersioningBehavior::Pinned.into();
         }
         core.complete_workflow_activation(WorkflowActivationCompletion {
             run_id: res.run_id.clone(),
@@ -133,12 +135,12 @@ async fn sets_deployment_info_on_task_responses(#[values(true, false)] use_defau
     if use_default {
         assert_eq!(
             wft_complete.versioning_behavior,
-            VersioningBehavior::AutoUpgrade as i32
+            ProtoVersioningBehavior::AutoUpgrade as i32
         );
     } else {
         assert_eq!(
             wft_complete.versioning_behavior,
-            VersioningBehavior::Pinned as i32
+            ProtoVersioningBehavior::Pinned as i32
         );
     }
     assert_eq!(wft_complete.worker_deployment_name, deploy_name);
@@ -177,7 +179,7 @@ async fn activity_has_deployment_stamp() {
             build_id: "1.0".to_string(),
         },
         use_worker_versioning: true,
-        default_versioning_behavior: VersioningBehavior::AutoUpgrade.into(),
+        default_versioning_behavior: Some(VersioningBehavior::AutoUpgrade),
     };
     starter.sdk_config.register_activities(StdActivities);
     let mut worker = starter.worker().await;
@@ -577,7 +579,7 @@ fn versioned_worker_options(version: WorkerDeploymentVersion) -> WorkerDeploymen
     WorkerDeploymentOptions {
         version,
         use_worker_versioning: true,
-        default_versioning_behavior: VersioningBehavior::Pinned.into(),
+        default_versioning_behavior: Some(VersioningBehavior::Pinned),
     }
 }
 

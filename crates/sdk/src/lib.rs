@@ -85,16 +85,18 @@ pub mod workflows;
 pub use crate::error::{
     ActivityExecutionError, ApplicationFailure, ChildWorkflowExecutionError,
     ChildWorkflowStartError, OutgoingActivityError, OutgoingError, OutgoingWorkflowError,
-    WorkflowRegistrationError, WorkflowSignalError,
+    RetryState, TimeoutType, WorkflowRegistrationError, WorkflowSignalError,
 };
 pub use temporalio_client::Namespace;
 pub use temporalio_workflow::{
-    ActivityCloseTimeouts, ActivityOptions, BaseWorkflowContext, CancellableFuture,
-    ChildWorkflowOptions, ContinueAsNewOptions, ContinueAsNewVersioningBehavior,
-    ExternalWorkflowHandle, LocalActivityOptions, NexusOperationOptions, ParentWorkflowInfo,
-    RootWorkflowInfo, Signal, SignalData, StartChildWorkflowExecutionFailedCause,
-    StartedChildWorkflow, SyncWorkflowContext, TimerOptions, TimerResult, WorkflowContext,
-    WorkflowContextView, WorkflowResult, WorkflowTermination,
+    ActivityCancellationType, ActivityCloseTimeouts, ActivityOptions, BaseWorkflowContext,
+    CancellableFuture, ChildWorkflowCancellationType, ChildWorkflowOptions, ContinueAsNewOptions,
+    ContinueAsNewVersioningBehavior, ExternalWorkflowHandle, LocalActivityOptions, Memo, MemoValue,
+    MemoValues, NamespacedWorkflowInfo, NexusOperationCancellationType, NexusOperationOptions,
+    ParentClosePolicy, RetryPolicy, Signal, SignalData, StartChildWorkflowExecutionFailedCause,
+    StartedChildWorkflow, SyncWorkflowContext, TimerOptions, TimerResult, VersioningIntent,
+    WorkflowContext, WorkflowContextView, WorkflowIdReusePolicy, WorkflowResult,
+    WorkflowTermination,
 };
 #[cfg(feature = "wasm-workflows")]
 pub use workflow_wasm::WasmWorkflowComponent;
@@ -950,6 +952,9 @@ impl WorkflowHalf {
                     return Ok(None);
                 }
             };
+            // The executor consumes self-wakes synchronously, so cooperative budget exhaustion
+            // would otherwise re-poll the workflow forever without returning to Tokio.
+            let wff = tokio::task::coop::unconstrained(wff);
             // TODO [rust-sdk-branch]: Deadlock detection
             let jh = executor.spawn(async move {
                 tokio::select! {
@@ -1066,8 +1071,8 @@ impl ActivityHalf {
                     let act_fut = async move {
                         if let Some(info) = &ctx.info().workflow_execution {
                             Span::current()
-                                .record("temporalWorkflowID", &info.workflow_id)
-                                .record("temporalRunID", &info.run_id);
+                                .record("temporalWorkflowID", info.workflow_id())
+                                .record("temporalRunID", info.run_id());
                         }
                         (act_fn)(args, data_converter, ctx, activity_inbound_interceptors).await
                     }

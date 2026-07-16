@@ -2,6 +2,7 @@ use crate::{HttpConnectProxyOptions, RetryOptions, VERSION, callback_based};
 use http::Uri;
 use std::{collections::HashMap, sync::Arc, time::Duration};
 use temporalio_common::{
+    RetryPolicy,
     data_converters::DataConverter,
     protos::temporal::api::{
         common::{
@@ -296,7 +297,8 @@ pub struct WorkflowStartOptions {
     pub enable_eager_workflow_start: bool,
 
     /// Optionally set a retry policy for the workflow
-    pub retry_policy: Option<common::v1::RetryPolicy>,
+    #[builder(into)]
+    pub retry_policy: Option<RetryPolicy>,
 
     /// If set, send a signal to the workflow atomically with start.
     /// The workflow will receive this signal before its first task.

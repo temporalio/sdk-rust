@@ -2,11 +2,11 @@ use crate::common::CoreWfStarter;
 use rstest::rstest;
 use std::{sync::Arc, time::Duration};
 use temporalio_client::{ActivityIdentifier, WorkflowStartOptions};
-use temporalio_common::protos::{
-    coresdk::{AsJsonPayloadExt, workflow_commands::ActivityCancellationType},
-    temporal::api::{
-        common::v1::RetryPolicy,
-        failure::v1::{ApplicationFailureInfo, Failure, failure::FailureInfo},
+use temporalio_common::{
+    error::ApplicationFailure,
+    protos::{
+        coresdk::workflow_commands::ActivityCancellationType,
+        temporal::api::common::v1::RetryPolicy,
     },
 };
 use temporalio_macros::{activities, workflow, workflow_methods};
@@ -67,7 +67,7 @@ async fn async_activity_completions(
                 tokio::select! {
                     _ = async {
                         loop {
-                            ctx.record_heartbeat(vec![]);
+                            let _ = ctx.record_heartbeat(()).await;
                             tokio::time::sleep(Duration::from_millis(500)).await;
                         }
                     } => (),
@@ -79,8 +79,8 @@ async fn async_activity_completions(
             let wf_exec = activity_info.workflow_execution.as_ref().unwrap();
             let info = SharedActivityInfo {
                 task_token: activity_info.task_token.clone(),
-                workflow_id: wf_exec.workflow_id.clone(),
-                run_id: wf_exec.run_id.clone(),
+                workflow_id: wf_exec.workflow_id().to_owned(),
+                run_id: wf_exec.run_id().to_owned(),
                 activity_id: activity_info.activity_id.clone(),
             };
             let _ = self.info_tx.send(info).await;
@@ -183,29 +183,18 @@ async fn async_activity_completions(
         eprintln!("DEBUG: Calling {:?} on handle", outcome);
 
         let result = match outcome {
-            Outcome::Success => {
-                handle
-                    .complete(Some(async_response.as_json_payload().unwrap().into()))
-                    .await
-            }
+            Outcome::Success => handle.complete(Some(async_response.to_owned())).await,
             Outcome::Failure => {
                 handle
                     .fail(
-                        Failure {
-                            message: "async failure reason".to_string(),
-                            failure_info: Some(FailureInfo::ApplicationFailureInfo(
-                                ApplicationFailureInfo {
-                                    r#type: "TestFailure".to_string(),
-                                    ..Default::default()
-                                },
-                            )),
-                            ..Default::default()
-                        },
-                        None,
+                        ApplicationFailure::builder(std::io::Error::other("async failure reason"))
+                            .type_name("TestFailure".to_owned())
+                            .build(),
+                        None::<()>,
                     )
                     .await
             }
-            Outcome::Cancellation => handle.report_cancelation(None).await,
+            Outcome::Cancellation => handle.report_cancelation(None::<()>).await,
         };
         if let Err(e) = &result {
             eprintln!(

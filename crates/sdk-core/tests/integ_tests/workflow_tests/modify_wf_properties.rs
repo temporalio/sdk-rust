@@ -4,17 +4,16 @@ use temporalio_client::{
 };
 use temporalio_common::{
     protos::{
-        coresdk::{AsJsonPayloadExt, FromJsonPayloadExt},
+        coresdk::FromJsonPayloadExt,
         temporal::api::{
             command::v1::{Command, command},
-            common::v1::Payload,
             enums::v1::EventType,
         },
     },
     worker::WorkerTaskTypes,
 };
 use temporalio_macros::{workflow, workflow_methods};
-use temporalio_sdk::{WorkflowContext, WorkflowResult};
+use temporalio_sdk::{MemoValue, WorkflowContext, WorkflowResult};
 use temporalio_sdk_core::{
     replay::{DEFAULT_WORKFLOW_TYPE, TestHistoryBuilder},
     test_help::MockPollCfg,
@@ -23,6 +22,7 @@ use uuid::Uuid;
 
 static FIELD_A: &str = "cat_name";
 static FIELD_B: &str = "cute_level";
+static REMOVED_FIELD: &str = "temporary";
 
 #[workflow]
 #[derive(Default)]
@@ -33,9 +33,14 @@ impl MemoUpserter {
     #[run(name = "can_upsert_memo")]
     async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<()> {
         ctx.upsert_memo([
-            (FIELD_A.to_string(), "enchi".as_json_payload().unwrap()),
-            (FIELD_B.to_string(), 9001.as_json_payload().unwrap()),
-        ]);
+            (FIELD_A, Some(MemoValue::new("enchi".to_string()))),
+            (FIELD_B, Some(MemoValue::new(9001))),
+            (REMOVED_FIELD, Some(MemoValue::new(true))),
+        ])?;
+        assert_eq!(ctx.memo().get::<bool>(REMOVED_FIELD)?, Some(true));
+
+        ctx.upsert_memo([(REMOVED_FIELD, None)])?;
+        assert!(!ctx.memo().contains_key(REMOVED_FIELD));
         Ok(())
     }
 }
@@ -61,7 +66,7 @@ async fn sends_modify_wf_props() {
     worker.run_until_done().await.unwrap();
 
     let client = starter.get_client().await;
-    let memo = WorkflowExecutionInfo {
+    let description = WorkflowExecutionInfo {
         namespace: client.namespace(),
         workflow_id: wf_id.to_string(),
         run_id: Some(run_id),
@@ -70,20 +75,16 @@ async fn sends_modify_wf_props() {
     .bind_untyped(client.clone())
     .describe(WorkflowDescribeOptions::default())
     .await
-    .unwrap()
-    .raw_description
-    .workflow_execution_info
-    .unwrap()
-    .memo
-    .unwrap()
-    .fields;
-    let catname = memo.get(FIELD_A).unwrap();
-    let cuteness = memo.get(FIELD_B).unwrap();
-    for payload in [catname, cuteness] {
-        assert!(payload.is_json_payload());
-    }
-    assert_eq!("enchi", String::from_json_payload(catname).unwrap());
-    assert_eq!(9001, usize::from_json_payload(cuteness).unwrap());
+    .unwrap();
+    assert_eq!(
+        description.memo().get::<String>(FIELD_A).unwrap(),
+        Some("enchi".to_string())
+    );
+    assert_eq!(
+        description.memo().get::<usize>(FIELD_B).unwrap(),
+        Some(9001)
+    );
+    assert!(!description.memo().contains_key(REMOVED_FIELD));
 }
 
 #[workflow]
@@ -95,21 +96,9 @@ impl ModifyPropsWf {
     #[run(name = DEFAULT_WORKFLOW_TYPE)]
     async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<()> {
         ctx.upsert_memo([
-            (
-                String::from("foo"),
-                Payload {
-                    data: vec![0x01],
-                    ..Default::default()
-                },
-            ),
-            (
-                String::from("bar"),
-                Payload {
-                    data: vec![0x02],
-                    ..Default::default()
-                },
-            ),
-        ]);
+            ("foo", Some(MemoValue::new(1_u8))),
+            ("bar", Some(MemoValue::new(2_u8))),
+        ])?;
         Ok(())
     }
 }
@@ -137,8 +126,8 @@ async fn workflow_modify_props() {
                     let fields = &msg.upserted_memo.as_ref().unwrap().fields;
                     let payload1 = fields.get(k1).unwrap();
                     let payload2 = fields.get(k2).unwrap();
-                    assert_eq!(payload1.data[0], 0x01);
-                    assert_eq!(payload2.data[0], 0x02);
+                    assert_eq!(u8::from_json_payload(payload1).unwrap(), 1);
+                    assert_eq!(u8::from_json_payload(payload2).unwrap(), 2);
                     assert_eq!(fields.len(), 2);
                 }
             );

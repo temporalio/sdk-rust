@@ -45,14 +45,19 @@ impl ResourceBasedTuner<RealSysInfo> {
             .target_mem_usage(target_mem_usage)
             .target_cpu_usage(target_cpu_usage)
             .build();
-        let controller = ResourceController::new_with_sysinfo(opts, Arc::new(RealSysInfo::new()));
+        let controller = ResourceController::new_with_sysinfo(
+            opts,
+            Arc::new(RealSysInfo::new(RealSysInfo::MIN_REFRESH_INTERVAL)),
+        );
         Self::new_from_controller(controller)
     }
 
     /// Create an instance using the fully configurable set of PID controller options
     pub fn new_from_options(options: ResourceBasedSlotsOptions) -> Self {
-        let controller =
-            ResourceController::new_with_sysinfo(options, Arc::new(RealSysInfo::new()));
+        let controller = ResourceController::new_with_sysinfo(
+            options,
+            Arc::new(RealSysInfo::new(RealSysInfo::MIN_REFRESH_INTERVAL)),
+        );
         Self::new_from_controller(controller)
     }
 }
@@ -535,7 +540,19 @@ pub struct RealSysInfo {
 }
 
 impl RealSysInfo {
-    pub(crate) fn new() -> Self {
+    /// Lower bound for the refresh interval.
+    pub(crate) const MIN_REFRESH_INTERVAL: Duration = Duration::from_millis(100);
+    /// Upper bound for the refresh interval.
+    pub(crate) const MAX_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
+
+    fn clamp_refresh_interval(interval: Duration) -> Duration {
+        interval.clamp(Self::MIN_REFRESH_INTERVAL, Self::MAX_REFRESH_INTERVAL)
+    }
+
+    /// Spawns a background thread refreshing host metrics every `refresh_interval` (clamped to
+    /// `[MIN_REFRESH_INTERVAL, MAX_REFRESH_INTERVAL]`).
+    pub(crate) fn new(refresh_interval: Duration) -> Self {
+        let refresh_interval = Self::clamp_refresh_interval(refresh_interval);
         let mut sys = sysinfo::System::new();
         sys.refresh_memory();
         let total_mem = sys.total_memory();
@@ -553,10 +570,9 @@ impl RealSysInfo {
         let handle = thread::Builder::new()
             .name("temporal-real-sysinfo".to_string())
             .spawn(move || {
-                const REFRESH_INTERVAL: Duration = Duration::from_millis(100);
                 loop {
                     thread_clone.refresh();
-                    let r = rx.recv_timeout(REFRESH_INTERVAL);
+                    let r = rx.recv_timeout(refresh_interval);
                     if matches!(r, Err(mpsc::RecvTimeoutError::Disconnected)) || r.is_ok() {
                         return;
                     }
@@ -768,6 +784,31 @@ mod tests {
             .target_mem_usage(0.8)
             .target_cpu_usage(1.0)
             .build()
+    }
+
+    #[test]
+    fn refresh_interval_clamped() {
+        // In-range passes through; out-of-range clamps at both ends.
+        assert_eq!(
+            RealSysInfo::clamp_refresh_interval(Duration::from_secs(30)),
+            Duration::from_secs(30)
+        );
+        assert_eq!(
+            RealSysInfo::clamp_refresh_interval(Duration::from_millis(1)),
+            RealSysInfo::MIN_REFRESH_INTERVAL
+        );
+        assert_eq!(
+            RealSysInfo::clamp_refresh_interval(Duration::from_secs(3600)),
+            RealSysInfo::MAX_REFRESH_INTERVAL
+        );
+    }
+
+    #[test]
+    fn realsysinfo_reports_sane_values() {
+        let sys_info = RealSysInfo::new(RealSysInfo::MIN_REFRESH_INTERVAL);
+        assert!(sys_info.total_mem() > 0);
+        let cpu = sys_info.used_cpu_percent();
+        assert!((0.0..=1.0).contains(&cpu), "cpu {cpu} out of range");
     }
 
     #[test]
@@ -1021,7 +1062,7 @@ mod tests {
             return;
         }
 
-        let sys_info = RealSysInfo::new();
+        let sys_info = RealSysInfo::new(RealSysInfo::MIN_REFRESH_INTERVAL);
         let cgroup_info = CGroupCpuInfo::new(CgroupV2CpuFileSystem);
         let CGroupCpuLimits { quota, period } = cgroup_info
             .read_cpus_limit()
@@ -1079,7 +1120,7 @@ mod tests {
             return;
         }
 
-        let sys_info = RealSysInfo::new();
+        let sys_info = RealSysInfo::new(RealSysInfo::MIN_REFRESH_INTERVAL);
 
         assert_eq!(
             sys_info.total_mem(),

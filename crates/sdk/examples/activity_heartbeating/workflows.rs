@@ -1,6 +1,5 @@
 #![allow(unreachable_pub)]
 use std::time::Duration;
-use temporalio_common::protos::coresdk::AsJsonPayloadExt;
 use temporalio_macros::{activities, workflow, workflow_methods};
 use temporalio_sdk::{
     ActivityOptions, WorkflowContext, WorkflowResult,
@@ -18,18 +17,14 @@ impl HeartbeatingActivities {
         ctx: ActivityContext,
         total_steps: u32,
     ) -> Result<String, ActivityError> {
-        let start_step: u32 = ctx
-            .heartbeat_details()
-            .first()
-            .and_then(|p| serde_json::from_slice(&p.data).ok())
-            .unwrap_or(0);
+        let start_step: u32 = ctx.heartbeat_details().deserialize()?.unwrap_or(0);
 
         for step in start_step..total_steps {
             if ctx.is_cancelled() {
                 return Err(ActivityError::cancelled());
             }
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-            ctx.record_heartbeat(vec![step.as_json_payload().unwrap()]);
+            ctx.record_heartbeat(step).await?;
         }
 
         Ok(format!("Completed {total_steps} steps"))

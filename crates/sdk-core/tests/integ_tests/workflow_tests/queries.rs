@@ -317,12 +317,12 @@ struct WorkflowInfo {
 impl<'a> From<&'a WorkflowContextView> for WorkflowInfo {
     fn from(ctx: &'a WorkflowContextView) -> Self {
         Self {
-            workflow_id: ctx.workflow_id.clone(),
-            workflow_type: ctx.workflow_type.clone(),
-            task_queue: ctx.task_queue.clone(),
-            namespace: ctx.namespace.clone(),
-            attempt: ctx.attempt,
-            first_execution_run_id: ctx.first_execution_run_id.clone(),
+            workflow_id: ctx.workflow_id().to_owned(),
+            workflow_type: ctx.workflow_type().to_owned(),
+            task_queue: ctx.task_queue().to_owned(),
+            namespace: ctx.namespace().to_owned(),
+            attempt: ctx.attempt(),
+            first_execution_run_id: ctx.first_execution_run_id().to_owned(),
         }
     }
 }
