@@ -35,7 +35,7 @@ use temporalio_common::{
         },
         temporal::api::{
             command::v1::command::Attributes,
-            common::v1::{Payload, RetryPolicy, WorkerVersionStamp},
+            common::v1::{RetryPolicy, WorkerVersionStamp},
             enums::v1::{
                 EventType,
                 WorkflowTaskFailedCause::{self},
@@ -470,10 +470,7 @@ async fn oversize_activity_heartbeat_fails_retryably_then_completes() {
             let attempt = ctx.info().attempt;
             self.max_attempt.fetch_max(attempt as u8, Relaxed);
             if attempt == 1 {
-                ctx.record_heartbeat(vec![Payload {
-                    data: vec![0u8; OVERSIZE_PAYLOAD_BYTES],
-                    ..Default::default()
-                }]);
+                ctx.record_heartbeat("a".repeat(OVERSIZE_PAYLOAD_BYTES)).await?;
                 // The oversized heartbeat is rejected client-side, which fails this attempt and
                 // cancels us; wait for that cancel rather than returning a normal completion.
                 ctx.cancelled().await;
