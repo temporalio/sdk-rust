@@ -45,6 +45,7 @@ pub use workflow_context::{
     ParentClosePolicy, PatchActivationCallback, PatchActivationInput, Signal, SignalData,
     StartChildWorkflowExecutionFailedCause, StartedChildWorkflow, SyncWorkflowContext,
     TimerOptions, VersioningIntent, WorkflowContext, WorkflowContextView, WorkflowIdReusePolicy,
+    WorkflowRandomValue,
 };
 pub use workflows::{join, join_all, select};
 
