@@ -31,8 +31,8 @@ use temporalio_common::{
 };
 use temporalio_macros::{activities, workflow, workflow_methods};
 use temporalio_sdk::{
-    ActivityOptions, CancellableFuture, SyncWorkflowContext, WorkflowContext, WorkflowContextView,
-    WorkflowResult,
+    ActivityOptions, CancellableFuture, MemoValue, SyncWorkflowContext, WorkflowContext,
+    WorkflowContextView, WorkflowResult,
     activities::{ActivityContext, ActivityError},
 };
 
@@ -108,7 +108,7 @@ impl FailurePayloadActivities {
         loop {
             tokio::select! {
                 _ = ctx.cancelled() => break,
-                _ = ticker.tick() => ctx.record_heartbeat(vec![]),
+                _ = ticker.tick() => ctx.record_heartbeat(()).await?,
             }
         }
         Err(ActivityError::cancelled_with_details(
@@ -118,11 +118,10 @@ impl FailurePayloadActivities {
 
     #[activity]
     async fn heartbeat_then_timeout(ctx: ActivityContext) -> Result<(), ActivityError> {
-        ctx.record_heartbeat(vec![
-            TrackedValue::new("codec-heartbeat-details".to_string())
-                .as_json_payload()
-                .map_err(ActivityError::from)?,
-        ]);
+        ctx.record_heartbeat(TrackedWrapper(TrackedValue::new(
+            "codec-heartbeat-details".to_string(),
+        )))
+        .await?;
         tokio::time::sleep(Duration::from_secs(2)).await;
         Ok(())
     }
@@ -210,7 +209,12 @@ impl DescribeDataConverterWorkflow {
         ctx: &mut WorkflowContext<Self>,
         input: TrackedWrapper,
     ) -> WorkflowResult<TrackedWrapper> {
-        ctx.upsert_memo([("tracked".to_string(), input.0.data.as_json_payload()?)]);
+        ctx.upsert_memo([
+            ("tracked", Some(MemoValue::new(input.0.data.clone()))),
+            ("wrapped", Some(MemoValue::new(input.clone()))),
+            ("removed", Some(MemoValue::new(true))),
+        ])?;
+        ctx.upsert_memo([("removed", None)])?;
         let output = ctx
             .start_activity(
                 TestActivities::process_tracked,
@@ -404,13 +408,13 @@ async fn custom_failure_converter_fallback_applied_to_workflow_failures() {
         err => panic!("unexpected workflow result error: {err:?}"),
     };
     assert_eq!(
-        failure.message,
+        failure.failure().message,
         format!(
             "Failed converting error to failure: Encoding error: {FAILURE_CONVERTER_ERROR_MESSAGE}, original error message: {WORKFLOW_FAILURE_MESSAGE}"
         )
     );
     assert!(matches!(
-        failure.failure_info,
+        failure.failure().failure_info.as_ref(),
         Some(FailureInfo::ApplicationFailureInfo(_))
     ));
 }
@@ -954,9 +958,17 @@ async fn describe_decodes_workflow_payload_fields() {
         "Describe should have decoded response payloads"
     );
     assert_eq!(
-        desc.memo().unwrap().fields["tracked"],
-        "codec-describe".as_json_payload().unwrap()
+        desc.memo().get::<String>("tracked").unwrap(),
+        Some("codec-describe".to_owned())
     );
+    assert_eq!(
+        desc.memo()
+            .get::<TrackedWrapper>("wrapped")
+            .unwrap()
+            .map(|value| value.0.data),
+        Some("codec-describe".to_owned())
+    );
+    assert!(!desc.memo().contains_key("removed"));
     let raw_user_metadata = desc
         .raw_description
         .execution_config
@@ -1025,8 +1037,15 @@ async fn describe_decodes_user_metadata_with_ungated_xor_codec() {
         "Describe should have decoded response payloads"
     );
     assert_eq!(
-        desc.memo().unwrap().fields["tracked"],
-        "codec-describe".as_json_payload().unwrap()
+        desc.memo().get::<String>("tracked").unwrap(),
+        Some("codec-describe".to_owned())
+    );
+    assert_eq!(
+        desc.memo()
+            .get::<TrackedWrapper>("wrapped")
+            .unwrap()
+            .map(|value| value.0.data),
+        Some("codec-describe".to_owned())
     );
     // Making sure codec isn't used when decoding user metadata
     assert_eq!(desc.static_summary(), Some("codec summary"));

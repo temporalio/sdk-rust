@@ -23,7 +23,8 @@ impl LaProblemWorkflow {
                     maximum_interval: Some(prost_dur!(from_millis(1500))),
                     maximum_attempts: 4,
                     non_retryable_error_types: vec![],
-                },
+                }
+                .into(),
                 timer_backoff_threshold: Some(Duration::from_secs(1)),
                 ..Default::default()
             },

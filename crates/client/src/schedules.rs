@@ -13,6 +13,7 @@ use temporalio_common::{
         DataConverter, PayloadConversionError, SerializationContextData, TemporalDeserializable,
         TemporalSerializable,
     },
+    payload_visitor::decode_payloads,
     protos::{
         coresdk::IntoPayloadsExt,
         proto_ts_to_system_time,
@@ -662,9 +663,13 @@ impl ScheduleDescription {
             .and_then(proto_ts_to_system_time)
     }
 
-    /// Memo attached to the schedule.
-    pub fn memo(&self) -> Option<&common_proto::Memo> {
-        self.raw.memo.as_ref()
+    /// Memo attached to the schedule, decoded with the client's payload converter.
+    pub fn memo(&self) -> crate::Memo {
+        crate::Memo::from_raw(
+            self.raw.memo.clone(),
+            self.data_converter.payload_converter().clone(),
+            SerializationContextData::Workflow,
+        )
     }
 
     /// Search attributes on the schedule.
@@ -857,6 +862,7 @@ impl ScheduleUpdate {
 #[derive(Debug, Clone)]
 pub struct ScheduleSummary {
     raw: schedule_proto::ScheduleListEntry,
+    data_converter: DataConverter,
 }
 
 impl ScheduleSummary {
@@ -909,9 +915,13 @@ impl ScheduleSummary {
             .unwrap_or_default()
     }
 
-    /// Memo attached to the schedule.
-    pub fn memo(&self) -> Option<&common_proto::Memo> {
-        self.raw.memo.as_ref()
+    /// Memo attached to the schedule, decoded with the client's payload converter.
+    pub fn memo(&self) -> crate::Memo {
+        crate::Memo::from_raw(
+            self.raw.memo.clone(),
+            self.data_converter.payload_converter().clone(),
+            SerializationContextData::Workflow,
+        )
     }
 
     /// Search attributes on the schedule.
@@ -940,7 +950,16 @@ impl ScheduleSummary {
 
 impl From<schedule_proto::ScheduleListEntry> for ScheduleSummary {
     fn from(raw: schedule_proto::ScheduleListEntry) -> Self {
-        Self { raw }
+        Self::new(raw, DataConverter::default())
+    }
+}
+
+impl ScheduleSummary {
+    fn new(raw: schedule_proto::ScheduleListEntry, data_converter: DataConverter) -> Self {
+        Self {
+            raw,
+            data_converter,
+        }
     }
 }
 
@@ -979,7 +998,7 @@ where
 
     /// Describe this schedule, returning its full definition, info, and conflict token.
     pub async fn describe(&self) -> Result<ScheduleDescription, ScheduleError> {
-        let resp = WorkflowService::describe_schedule(
+        let mut resp = WorkflowService::describe_schedule(
             &mut self.client.clone(),
             DescribeScheduleRequest {
                 namespace: self.namespace.clone(),
@@ -989,6 +1008,15 @@ where
         )
         .await?
         .into_inner();
+
+        if let Some(memo) = resp.memo.as_mut() {
+            decode_payloads(
+                memo,
+                self.client.data_converter().codec(),
+                &SerializationContextData::Workflow,
+            )
+            .await;
+        }
 
         ScheduleDescription::new(
             resp,
@@ -1270,14 +1298,25 @@ impl Client {
 
                     match response {
                         Ok(resp) => {
-                            let resp = resp.into_inner();
+                            let mut resp = resp.into_inner();
                             let new_exhausted = resp.next_page_token.is_empty();
                             let new_token = resp.next_page_token;
 
+                            let data_converter = client.data_converter().clone();
+                            for schedule in &mut resp.schedules {
+                                if let Some(memo) = schedule.memo.as_mut() {
+                                    decode_payloads(
+                                        memo,
+                                        data_converter.codec(),
+                                        &SerializationContextData::Workflow,
+                                    )
+                                    .await;
+                                }
+                            }
                             buffer = resp
                                 .schedules
                                 .into_iter()
-                                .map(ScheduleSummary::from)
+                                .map(|raw| ScheduleSummary::new(raw, data_converter.clone()))
                                 .collect();
 
                             buffer
@@ -1297,9 +1336,10 @@ impl Client {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{NamespacedClient, grpc::WorkflowService};
+    use crate::{NamespacedClient, grpc::WorkflowService, test_helpers::XorCodec};
     use futures_util::FutureExt;
     use std::{
+        collections::HashMap,
         sync::{
             Arc,
             atomic::{AtomicUsize, Ordering},
@@ -1308,7 +1348,9 @@ mod tests {
     };
     use temporalio_common::{
         UntypedWorkflow,
-        data_converters::{DataConverter, MultiArgs2, RawValue},
+        data_converters::{
+            DataConverter, DefaultFailureConverter, MultiArgs2, PayloadConverter, RawValue,
+        },
         protos::temporal::api::{
             common::v1::{
                 Memo, Payload, Payloads, SearchAttributes,
@@ -1328,6 +1370,14 @@ mod tests {
     };
     use tonic::{Request, Response};
 
+    fn data_converter_with_codec() -> DataConverter {
+        DataConverter::new(
+            PayloadConverter::default(),
+            DefaultFailureConverter,
+            XorCodec,
+        )
+    }
+
     #[derive(Default)]
     struct CapturedRequests {
         describe: AtomicUsize,
@@ -1340,6 +1390,7 @@ mod tests {
     struct MockScheduleClient {
         captured: Arc<CapturedRequests>,
         describe_response: DescribeScheduleResponse,
+        data_converter: DataConverter,
         should_error: bool,
     }
 
@@ -1348,6 +1399,7 @@ mod tests {
             Self {
                 captured: Arc::new(CapturedRequests::default()),
                 describe_response: describe_response_with_start_workflow(None),
+                data_converter: DataConverter::default(),
                 should_error: false,
             }
         }
@@ -1359,6 +1411,9 @@ mod tests {
         }
         fn identity(&self) -> String {
             "test-identity".to_string()
+        }
+        fn data_converter(&self) -> &DataConverter {
+            &self.data_converter
         }
     }
 
@@ -1534,6 +1589,61 @@ mod tests {
         assert!(desc.raw().search_attributes.is_some());
         assert!(desc.search_attributes().is_empty());
         assert_eq!(desc.conflict_token(), conflict_token);
+    }
+
+    #[tokio::test]
+    async fn schedule_description_exposes_typed_memo() {
+        let data_converter = data_converter_with_codec();
+        let memo_payload = data_converter
+            .to_payload(
+                &SerializationContextData::Workflow,
+                &"memo-value".to_owned(),
+            )
+            .await
+            .unwrap();
+        let mut describe_response = describe_response_with_start_workflow(None);
+        describe_response.memo = Some(Memo {
+            fields: HashMap::from([("memo-key".to_owned(), memo_payload)]),
+        });
+        let client = MockScheduleClient {
+            describe_response,
+            data_converter,
+            ..Default::default()
+        };
+
+        let description = make_schedule_handle(client).describe().await.unwrap();
+
+        assert_eq!(
+            description.memo().get::<String>("memo-key").unwrap(),
+            Some("memo-value".to_owned())
+        );
+    }
+
+    #[tokio::test]
+    async fn schedule_summary_exposes_typed_memo() {
+        let data_converter = DataConverter::default();
+        let memo_payload = data_converter
+            .to_payload(
+                &SerializationContextData::Workflow,
+                &"memo-value".to_owned(),
+            )
+            .await
+            .unwrap();
+        let summary = ScheduleSummary::new(
+            ScheduleListEntry {
+                schedule_id: "schedule-id".to_owned(),
+                memo: Some(Memo {
+                    fields: HashMap::from([("memo-key".to_owned(), memo_payload)]),
+                }),
+                ..Default::default()
+            },
+            data_converter,
+        );
+
+        assert_eq!(
+            summary.memo().get::<String>("memo-key").unwrap(),
+            Some("memo-value".to_owned())
+        );
     }
 
     #[tokio::test]

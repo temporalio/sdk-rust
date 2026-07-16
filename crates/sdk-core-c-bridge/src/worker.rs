@@ -16,7 +16,9 @@ use temporalio_common::protos::{
         ActivityHeartbeat, ActivityTaskCompletion, nexus::NexusTaskCompletion,
         workflow_completion::WorkflowActivationCompletion,
     },
-    temporal::api::history::v1::History,
+    temporal::api::{
+        enums::v1::VersioningBehavior as ProtoVersioningBehavior, history::v1::History,
+    },
 };
 use temporalio_sdk_core::{
     PollError, SlotInfoTrait, SlotKind, SlotMarkUsedContext, SlotReleaseContext,
@@ -1181,8 +1183,8 @@ impl TryFrom<&WorkerOptions> for temporalio_sdk_core::WorkerConfig {
                         let dvb = match dopts.default_versioning_behavior {
                             0 => None,
                             v => {
-                                if let Ok(behavior) = v.try_into() {
-                                    Some(behavior)
+                                if let Ok(behavior) = ProtoVersioningBehavior::try_from(v) {
+                                    Some(behavior.into())
                                 } else {
                                     bail!("Invalid default versioning behavior {}", v)
                                 }
@@ -1348,11 +1350,13 @@ impl TryFrom<&TunerHolder> for temporalio_sdk_core::TunerHolder {
             .activity_slot_options(holder.activity_slot_supplier.try_into()?)
             .local_activity_slot_options(holder.local_activity_slot_supplier.try_into()?)
             .nexus_slot_options(holder.nexus_task_slot_supplier.try_into()?)
-            .maybe_resource_based_options(first.map(|f| {
-                temporalio_sdk_core::ResourceBasedSlotsOptions::builder()
-                    .target_mem_usage(f.target_memory_usage)
-                    .target_cpu_usage(f.target_cpu_usage)
-                    .build()
+            .maybe_resource_based_config(first.map(|f| {
+                temporalio_sdk_core::ResourceBasedTunerConfig::Options(
+                    temporalio_sdk_core::ResourceBasedSlotsOptions::builder()
+                        .target_mem_usage(f.target_memory_usage)
+                        .target_cpu_usage(f.target_cpu_usage)
+                        .build(),
+                )
             }))
             .build()
             .map_err(|e| anyhow::anyhow!("Failed building tuner holder options: {}", e))?

@@ -1,13 +1,46 @@
 //! Contains types that are needed by both the client and the sdk when configuring / interacting
 //! with workers.
 
-use crate::protos::temporal::api::enums::v1::{TaskQueueType, VersioningBehavior};
+use crate::protos::temporal::api::enums::v1::VersioningBehavior as ProtoVersioningBehavior;
 use std::{
     fs::File,
     io::{self, BufReader, Read},
     sync::OnceLock,
 };
 pub use temporalio_common_wasm::worker::WorkerDeploymentVersion;
+
+/// Controls how a workflow moves between worker deployment versions.
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
+#[non_exhaustive]
+pub enum VersioningBehavior {
+    /// Do not opt into worker deployment versioning.
+    #[default]
+    Unspecified,
+    /// Pin the workflow to one deployment version.
+    Pinned,
+    /// Automatically move the workflow to its target version.
+    AutoUpgrade,
+}
+
+impl From<VersioningBehavior> for ProtoVersioningBehavior {
+    fn from(value: VersioningBehavior) -> Self {
+        match value {
+            VersioningBehavior::Unspecified => Self::Unspecified,
+            VersioningBehavior::Pinned => Self::Pinned,
+            VersioningBehavior::AutoUpgrade => Self::AutoUpgrade,
+        }
+    }
+}
+
+impl From<ProtoVersioningBehavior> for VersioningBehavior {
+    fn from(value: ProtoVersioningBehavior) -> Self {
+        match value {
+            ProtoVersioningBehavior::Unspecified => Self::Unspecified,
+            ProtoVersioningBehavior::Pinned => Self::Pinned,
+            ProtoVersioningBehavior::AutoUpgrade => Self::AutoUpgrade,
+        }
+    }
+}
 
 /// Specifies which task types a worker will poll for.
 ///
@@ -79,21 +112,6 @@ impl WorkerTaskTypes {
             || (self.enable_local_activities && other.enable_local_activities)
             || (self.enable_remote_activities && other.enable_remote_activities)
             || (self.enable_nexus && other.enable_nexus)
-    }
-
-    /// Converts the enabled task types into the corresponding [`TaskQueueType`] values.
-    pub fn to_task_queue_types(&self) -> Vec<TaskQueueType> {
-        let mut types = Vec::new();
-        if self.enable_workflows {
-            types.push(TaskQueueType::Workflow);
-        }
-        if self.enable_remote_activities {
-            types.push(TaskQueueType::Activity);
-        }
-        if self.enable_nexus {
-            types.push(TaskQueueType::Nexus);
-        }
-        types
     }
 }
 

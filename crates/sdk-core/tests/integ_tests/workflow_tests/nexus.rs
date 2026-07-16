@@ -24,8 +24,8 @@ use temporalio_common::{
         coresdk::{
             FromJsonPayloadExt,
             nexus::{
-                NexusOperationCancellationType, NexusOperationResult, NexusTaskCancelReason,
-                NexusTaskCompletion, nexus_operation_result, nexus_task, nexus_task_completion,
+                NexusOperationResult, NexusTaskCancelReason, NexusTaskCompletion,
+                nexus_operation_result, nexus_task, nexus_task_completion,
             },
         },
         temporal::api::{
@@ -43,8 +43,8 @@ use temporalio_common::{
 };
 use temporalio_macros::{workflow, workflow_methods};
 use temporalio_sdk::{
-    CancellableFuture, NexusOperationOptions, SyncWorkflowContext, WorkflowContext,
-    WorkflowContextView, WorkflowResult, WorkflowTermination,
+    CancellableFuture, NexusOperationCancellationType, NexusOperationOptions, SyncWorkflowContext,
+    WorkflowContext, WorkflowContextView, WorkflowResult, WorkflowTermination,
 };
 use temporalio_sdk_core::PollError;
 use tokio::{
@@ -922,6 +922,7 @@ async fn nexus_cancellation_types(
                 // The nexus op future should have been resolved
                 assert!(*caller_op_future_rx.borrow())
             }
+            _ => unreachable!("test only supplies known cancellation types"),
         }
         let (cancel_handler_responded_tx, _cancel_handler_responded_rx) = watch::channel(false);
         if cancellation_type != NexusOperationCancellationType::Abandon {
@@ -1038,6 +1039,7 @@ async fn nexus_cancellation_types(
         | NexusOperationCancellationType::WaitCancellationCompleted => {
             assert!(*cancellation_rx.borrow())
         }
+        _ => unreachable!("test only supplies known cancellation types"),
     }
 
     let res = client
@@ -1070,6 +1072,7 @@ async fn nexus_cancellation_types(
             assert_eq!(f.message, "nexus operation completed unsuccessfully");
             assert_eq!(f.cause.unwrap().message, "operation canceled");
         }
+        _ => unreachable!("test only supplies known cancellation types"),
     }
 
     wf_handle

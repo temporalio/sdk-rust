@@ -12,7 +12,10 @@ use std::{
     collections::HashMap,
     env,
     string::ToString,
-    sync::{Arc, OnceLock},
+    sync::{
+        Arc, OnceLock,
+        atomic::{AtomicUsize, Ordering},
+    },
     time::Duration,
 };
 use temporalio_client::{
@@ -71,17 +74,20 @@ use temporalio_sdk::{
     activities::{ActivityContext, ActivityError},
 };
 use temporalio_sdk_core::{
-    CoreRuntime, FixedSizeSlotSupplier, PollError, PollerBehavior, SlotKind, SlotMarkUsedContext,
-    SlotReleaseContext, SlotReservationContext, SlotSupplier, SlotSupplierPermit,
-    TokioRuntimeBuilder, TunerBuilder, WorkerConfig, WorkerVersioningStrategy, WorkflowSlotKind,
-    init_worker, prost_dur,
+    ActivitySlotKind, CoreRuntime, FixedSizeSlotSupplier, PollError, PollerBehavior, SlotKind,
+    SlotMarkUsedContext, SlotReleaseContext, SlotReservationContext, SlotSupplier,
+    SlotSupplierPermit, TokioRuntimeBuilder, TunerBuilder, WorkerConfig, WorkerVersioningStrategy,
+    WorkflowSlotKind, init_worker, prost_dur,
     replay::TestHistoryBuilder,
     test_help::{
         MockPollCfg, ResponseType, TemporalMeter, WorkerExt, WorkerTestHelpers, build_mock_pollers,
         mock_worker, mock_worker_client,
     },
 };
-use tokio::{join, sync::Barrier};
+use tokio::{
+    join,
+    sync::{Barrier, Notify},
+};
 use tonic::IntoRequest;
 use url::Url;
 
@@ -392,6 +398,173 @@ async fn one_slot_worker_reports_available_slot() {
         worker.initiate_shutdown();
     };
     join!(wf_polling, act_polling, nexus_polling, testing);
+}
+
+struct ReservationTrackingActivitySlotSupplier {
+    inner: FixedSizeSlotSupplier<ActivitySlotKind>,
+    reservations: AtomicUsize,
+    reservation_changed: Notify,
+}
+
+impl ReservationTrackingActivitySlotSupplier {
+    fn new(slots: usize) -> Self {
+        Self {
+            inner: FixedSizeSlotSupplier::new(slots),
+            reservations: AtomicUsize::new(0),
+            reservation_changed: Notify::new(),
+        }
+    }
+
+    fn record_reservation(&self) {
+        self.reservations.fetch_add(1, Ordering::Release);
+        self.reservation_changed.notify_waiters();
+    }
+
+    async fn wait_for_reservations(&self, expected: usize) {
+        loop {
+            let changed = self.reservation_changed.notified();
+            if self.reservations.load(Ordering::Acquire) >= expected {
+                return;
+            }
+            changed.await;
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl SlotSupplier for ReservationTrackingActivitySlotSupplier {
+    type SlotKind = ActivitySlotKind;
+
+    async fn reserve_slot(&self, ctx: &dyn SlotReservationContext) -> SlotSupplierPermit {
+        let permit = self.inner.reserve_slot(ctx).await;
+        self.record_reservation();
+        permit
+    }
+
+    fn try_reserve_slot(&self, ctx: &dyn SlotReservationContext) -> Option<SlotSupplierPermit> {
+        let permit = self.inner.try_reserve_slot(ctx)?;
+        self.record_reservation();
+        Some(permit)
+    }
+
+    fn mark_slot_used(&self, ctx: &dyn SlotMarkUsedContext<SlotKind = Self::SlotKind>) {
+        self.inner.mark_slot_used(ctx);
+    }
+
+    fn release_slot(&self, ctx: &dyn SlotReleaseContext<SlotKind = Self::SlotKind>) {
+        self.inner.release_slot(ctx);
+    }
+
+    fn available_slots(&self) -> Option<usize> {
+        self.inner.available_slots()
+    }
+
+    fn slot_supplier_kind(&self) -> String {
+        self.inner.slot_supplier_kind()
+    }
+}
+
+#[tokio::test]
+async fn idle_activity_worker_reports_zero_slots_used() {
+    let (telemopts, addr, _aborter) = prom_metrics(None);
+    let rt = CoreRuntime::new_assume_tokio(get_integ_runtime_options(telemopts)).unwrap();
+    let mut starter =
+        CoreWfStarter::new_with_runtime("idle_activity_worker_reports_zero_slots_used", rt);
+    starter.sdk_config.activity_task_poller_behavior = PollerBehavior::Autoscaling {
+        minimum: 1,
+        maximum: 1,
+        initial: 1,
+    };
+    let activity_slots = Arc::new(ReservationTrackingActivitySlotSupplier::new(3));
+    let mut tuner = TunerBuilder::default();
+    tuner.activity_slot_supplier(activity_slots.clone());
+    starter.sdk_config.tuner = Arc::new(tuner.build());
+
+    let finish_activity = Arc::new(Barrier::new(2));
+    struct BlockingActivity {
+        finish: Arc<Barrier>,
+    }
+
+    #[activities]
+    impl BlockingActivity {
+        #[activity]
+        async fn run(self: Arc<Self>, _ctx: ActivityContext) -> Result<(), ActivityError> {
+            self.finish.wait().await;
+            Ok(())
+        }
+    }
+
+    starter.sdk_config.register_activities(BlockingActivity {
+        finish: finish_activity.clone(),
+    });
+    let mut worker = starter.worker().await;
+
+    #[workflow]
+    #[derive(Default)]
+    struct OneActivity;
+
+    #[workflow_methods]
+    impl OneActivity {
+        #[run]
+        async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<()> {
+            ctx.start_activity(
+                BlockingActivity::run,
+                (),
+                ActivityOptions::with_start_to_close_timeout(Duration::from_secs(5))
+                    .do_not_eagerly_execute(true)
+                    .build(),
+            )
+            .await?;
+            Ok(())
+        }
+    }
+
+    worker.register_workflow::<OneActivity>().unwrap();
+    let task_queue = starter.get_task_queue().to_owned();
+    let handle = worker
+        .submit_workflow(
+            OneActivity::run,
+            (),
+            WorkflowStartOptions::new(task_queue.clone(), task_queue.clone()).build(),
+        )
+        .await
+        .unwrap();
+    let core_worker = worker.core_worker();
+
+    let (run_result, metric_line) = join!(worker.inner_mut().run(), async move {
+        activity_slots.wait_for_reservations(3).await;
+        finish_activity.wait().await;
+        handle.get_result(Default::default()).await.unwrap();
+
+        let metric_line = eventually(
+            || {
+                let endpoint = format!("http://{addr}/metrics");
+                let task_queue = task_queue.clone();
+                async move {
+                    let body = get_text(endpoint).await;
+                    body.lines()
+                        .find(|line| {
+                            line.starts_with("temporal_worker_task_slots_used{")
+                                && line.contains(&format!("task_queue=\"{task_queue}\""))
+                                && line.contains("worker_type=\"ActivityWorker\"")
+                        })
+                        .map(ToString::to_string)
+                        .ok_or_else(|| anyhow!("activity slots-used metric should exist"))
+                }
+            },
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
+        core_worker.initiate_shutdown();
+        metric_line
+    });
+    run_result.unwrap();
+
+    assert!(
+        metric_line.ends_with(" 0"),
+        "idle activity worker should have no used slots, got: {metric_line}"
+    );
 }
 
 #[rstest::rstest]
@@ -883,7 +1056,8 @@ async fn activity_metrics() {
                     retry_policy: RetryPolicy {
                         maximum_attempts: 1,
                         ..Default::default()
-                    },
+                    }
+                    .into(),
                     ..Default::default()
                 },
             );
@@ -894,7 +1068,8 @@ async fn activity_metrics() {
                     retry_policy: RetryPolicy {
                         maximum_attempts: 1,
                         ..Default::default()
-                    },
+                    }
+                    .into(),
                     ..Default::default()
                 },
             );

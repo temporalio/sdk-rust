@@ -42,8 +42,8 @@ use temporalio_common::{
             workflow_completion::WorkflowActivationCompletion,
         },
         temporal::api::{
-            common::v1::{ActivityType, Payload, Payloads, RetryPolicy},
-            enums::v1::{CommandType, EventType, RetryState, TimeoutType},
+            common::v1::{ActivityType, Payload, RetryPolicy},
+            enums::v1::{CommandType, EventType, RetryState as ProtoRetryState},
             failure::v1::{ActivityFailureInfo, Failure, failure::FailureInfo},
             sdk::v1::UserMetadata,
         },
@@ -51,8 +51,8 @@ use temporalio_common::{
 };
 use temporalio_macros::{activities, workflow, workflow_methods};
 use temporalio_sdk::{
-    ActivityExecutionError, ActivityOptions, CancellableFuture, LocalActivityOptions,
-    WorkflowContext, WorkflowResult,
+    ActivityExecutionError, ActivityOptions, CancellableFuture, LocalActivityOptions, RetryState,
+    TimeoutType, WorkflowContext, WorkflowResult,
     activities::{ActivityContext, ActivityError},
     interceptors::{
         ActivityInboundInterceptor, ExecuteActivityInput, ExecuteActivityOutput,
@@ -955,7 +955,7 @@ async fn activity_non_retryable_failure() {
                     scheduled_event_id: 5,
                     started_event_id: 6,
                     identity: INTEG_CLIENT_IDENTITY.to_owned(),
-                    retry_state: RetryState::NonRetryableFailure as i32,
+                    retry_state: ProtoRetryState::NonRetryableFailure as i32,
                 })),
                 ..Default::default()
             });
@@ -1022,7 +1022,7 @@ async fn activity_non_retryable_failure_with_error() {
                     scheduled_event_id: 5,
                     started_event_id: 6,
                     identity: INTEG_CLIENT_IDENTITY.to_owned(),
-                    retry_state: RetryState::NonRetryableFailure as i32,
+                    retry_state: ProtoRetryState::NonRetryableFailure as i32,
                 })),
                 ..Default::default()
             });
@@ -1067,9 +1067,7 @@ async fn workflow_observes_non_retryable_activity() {
             };
             assert_eq!(fail_err.activity_id(), "non-retryable-act");
             assert_eq!(
-                fail_err
-                    .activity_type()
-                    .map(|activity_type| activity_type.name.as_str()),
+                fail_err.activity_type(),
                 Some(NonRetryableActivityErrorActivities::fail_non_retryable.name())
             );
             assert_eq!(fail_err.retry_state(), RetryState::NonRetryableFailure);
@@ -1539,9 +1537,7 @@ async fn async_activity_completion_workflow() {
         .get_client()
         .await
         .get_async_activity_handle(ActivityIdentifier::TaskToken(task.task_token.into()))
-        .complete(Some(Payloads {
-            payloads: vec![response_payload.clone()],
-        }))
+        .complete(Some(RawValue::new(vec![response_payload.clone()])))
         .await
         .unwrap();
 
@@ -1963,9 +1959,7 @@ async fn activity_can_be_cancelled_by_local_timeout() {
             };
             assert_eq!(timeout.timeout_type(), TimeoutType::StartToClose);
             assert_eq!(
-                fail_err
-                    .activity_type()
-                    .map(|activity_type| activity_type.name.as_str()),
+                fail_err.activity_type(),
                 Some(CancellableEchoActivities::cancellable_echo.name())
             );
             Ok(())

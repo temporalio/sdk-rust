@@ -85,16 +85,18 @@ pub mod workflows;
 pub use crate::error::{
     ActivityExecutionError, ApplicationFailure, ChildWorkflowExecutionError,
     ChildWorkflowStartError, OutgoingActivityError, OutgoingError, OutgoingWorkflowError,
-    WorkflowRegistrationError, WorkflowSignalError,
+    RetryState, TimeoutType, WorkflowRegistrationError, WorkflowSignalError,
 };
 pub use temporalio_client::Namespace;
 pub use temporalio_workflow::{
-    ActivityCloseTimeouts, ActivityOptions, BaseWorkflowContext, CancellableFuture,
-    ChildWorkflowOptions, ContinueAsNewOptions, ContinueAsNewVersioningBehavior,
-    ExternalWorkflowHandle, LocalActivityOptions, NexusOperationOptions, ParentWorkflowInfo,
-    RootWorkflowInfo, Signal, SignalData, StartChildWorkflowExecutionFailedCause,
-    StartedChildWorkflow, SyncWorkflowContext, TimerOptions, TimerResult, WorkflowContext,
-    WorkflowContextView, WorkflowResult, WorkflowTermination,
+    ActivityCancellationType, ActivityCloseTimeouts, ActivityOptions, BaseWorkflowContext,
+    CancellableFuture, ChildWorkflowCancellationType, ChildWorkflowOptions, ContinueAsNewOptions,
+    ContinueAsNewVersioningBehavior, ExternalWorkflowHandle, LocalActivityOptions, Memo, MemoValue,
+    MemoValues, NamespacedWorkflowInfo, NexusOperationCancellationType, NexusOperationOptions,
+    ParentClosePolicy, RetryPolicy, Signal, SignalData, StartChildWorkflowExecutionFailedCause,
+    StartedChildWorkflow, SyncWorkflowContext, TimerOptions, TimerResult, VersioningIntent,
+    WorkflowContext, WorkflowContextView, WorkflowIdReusePolicy, WorkflowResult,
+    WorkflowTermination,
 };
 #[cfg(feature = "wasm-workflows")]
 pub use workflow_wasm::WasmWorkflowComponent;
@@ -1076,8 +1078,8 @@ impl ActivityHalf {
                     let act_fut = async move {
                         if let Some(info) = &ctx.info().workflow_execution {
                             Span::current()
-                                .record("temporalWorkflowID", &info.workflow_id)
-                                .record("temporalRunID", &info.run_id);
+                                .record("temporalWorkflowID", info.workflow_id())
+                                .record("temporalRunID", info.run_id());
                         }
                         (act_fn)(args, data_converter, ctx, activity_inbound_interceptors).await
                     }
