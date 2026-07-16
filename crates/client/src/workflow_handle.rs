@@ -1,8 +1,8 @@
 use crate::{
     NamespacedClient, WorkflowCancelOptions, WorkflowDescribeOptions, WorkflowExecuteUpdateOptions,
-    WorkflowFetchHistoryOptions, WorkflowGetResultOptions, WorkflowQueryOptions,
-    WorkflowSignalOptions, WorkflowStartUpdateOptions, WorkflowTerminateOptions,
-    WorkflowUpdateWaitStage,
+    WorkflowExecutionStatus, WorkflowFetchHistoryOptions, WorkflowGetResultOptions,
+    WorkflowQueryOptions, WorkflowSignalOptions, WorkflowStartUpdateOptions,
+    WorkflowTerminateOptions, WorkflowUpdateWaitStage,
     errors::{
         WorkflowGetResultError, WorkflowInteractionError, WorkflowQueryError, WorkflowUpdateError,
     },
@@ -13,9 +13,10 @@ pub use temporalio_common::UntypedWorkflow;
 use temporalio_common::{
     HasWorkflowDefinition, QueryDefinition, SignalDefinition, UpdateDefinition, WorkflowDefinition,
     data_converters::{
-        DataConverter, GenericPayloadConverter, PayloadConversionError, PayloadConverter, RawValue,
-        SerializationContext, SerializationContextData,
+        DataConverter, DecodablePayloads, GenericPayloadConverter, PayloadConversionError,
+        PayloadConverter, RawValue, SerializationContext, SerializationContextData,
     },
+    error::IncomingError,
     payload_visitor::decode_payloads,
     protos::{
         coresdk::FromPayloadsExt,
@@ -23,7 +24,6 @@ use temporalio_common::{
         temporal::api::{
             common::v1::{Payload, Payloads, WorkflowExecution as ProtoWorkflowExecution},
             enums::v1::{HistoryEventFilterType, UpdateWorkflowExecutionLifecycleStage},
-            failure::v1::Failure,
             history::{
                 self,
                 v1::{HistoryEvent, history_event::Attributes},
@@ -76,6 +76,46 @@ fn decode_user_metadata(
     })
 }
 
+/// Details attached to a cancelled or terminated workflow result.
+#[derive(Clone, Debug)]
+#[non_exhaustive]
+pub struct WorkflowResultDetails {
+    payloads: DecodablePayloads,
+}
+
+impl WorkflowResultDetails {
+    async fn new(payloads: Vec<Payload>, data_converter: &DataConverter) -> Self {
+        let payloads = data_converter
+            .codec()
+            .decode(&SerializationContextData::Workflow, payloads)
+            .await;
+        Self {
+            payloads: DecodablePayloads::new(
+                payloads,
+                data_converter.payload_converter().clone(),
+                SerializationContextData::Workflow,
+            ),
+        }
+    }
+
+    /// Deserialize the details into a typed value using the client's payload converter.
+    pub fn deserialize<T: temporalio_common::data_converters::TemporalDeserializable + 'static>(
+        &self,
+    ) -> Result<T, PayloadConversionError> {
+        self.payloads.deserialize()
+    }
+
+    /// Returns the codec-decoded payloads.
+    pub fn raw(&self) -> &[Payload] {
+        self.payloads.raw()
+    }
+
+    /// Consume these details and return their codec-decoded payloads.
+    pub fn into_raw(self) -> RawValue {
+        self.payloads.into_raw()
+    }
+}
+
 /// Enumerates terminal states for a particular workflow execution
 #[derive(Debug)]
 #[allow(clippy::large_enum_variant)]
@@ -83,16 +123,16 @@ pub enum WorkflowExecutionResult<T> {
     /// The workflow finished successfully
     Succeeded(T),
     /// The workflow finished in failure
-    Failed(Failure),
+    Failed(IncomingError),
     /// The workflow was cancelled
     Cancelled {
         /// Details provided at cancellation time
-        details: Vec<Payload>,
+        details: WorkflowResultDetails,
     },
     /// The workflow was terminated
     Terminated {
         /// Details provided at termination time
-        details: Vec<Payload>,
+        details: WorkflowResultDetails,
     },
     /// The workflow timed out
     TimedOut,
@@ -110,6 +150,7 @@ pub struct WorkflowExecutionDescription {
     history_length: usize,
     static_summary: Option<String>,
     static_details: Option<String>,
+    data_converter: DataConverter,
 }
 
 impl WorkflowExecutionDescription {
@@ -145,6 +186,7 @@ impl WorkflowExecutionDescription {
             history_length,
             static_summary: decoded_metadata.summary,
             static_details: decoded_metadata.details,
+            data_converter: data_converter.clone(),
         })
     }
 
@@ -164,10 +206,8 @@ impl WorkflowExecutionDescription {
     }
 
     /// The current status of the workflow execution.
-    pub fn status(
-        &self,
-    ) -> temporalio_common::protos::temporal::api::enums::v1::WorkflowExecutionStatus {
-        self.workflow_info().status()
+    pub fn status(&self) -> WorkflowExecutionStatus {
+        WorkflowExecutionStatus::from_raw(self.workflow_info().status)
     }
 
     /// When the workflow was created.
@@ -204,9 +244,13 @@ impl WorkflowExecutionDescription {
         self.history_length
     }
 
-    /// Workflow memo after codec decoding.
-    pub fn memo(&self) -> Option<&temporalio_common::protos::temporal::api::common::v1::Memo> {
-        self.workflow_info().memo.as_ref()
+    /// Workflow memo decoded with the client's payload converter.
+    pub fn memo(&self) -> crate::Memo {
+        crate::Memo::from_raw(
+            self.workflow_info().memo.clone(),
+            self.data_converter.payload_converter().clone(),
+            SerializationContextData::Workflow,
+        )
     }
 
     /// Parent workflow ID, if this is a child workflow.
@@ -534,13 +578,24 @@ where
                 }
                 Some(Attributes::WorkflowExecutionFailedEventAttributes(attrs)) => {
                     follow!(attrs);
-                    Ok(WorkflowExecutionResult::Failed(
-                        attrs.failure.unwrap_or_default(),
-                    ))
+                    let mut failure = attrs.failure.unwrap_or_default();
+                    decode_payloads(
+                        &mut failure,
+                        dc.codec(),
+                        &SerializationContextData::Workflow,
+                    )
+                    .await;
+                    let error = dc.failure_converter().to_error(
+                        failure,
+                        dc.payload_converter(),
+                        &SerializationContextData::Workflow,
+                    )?;
+                    Ok(WorkflowExecutionResult::Failed(error))
                 }
                 Some(Attributes::WorkflowExecutionCanceledEventAttributes(attrs)) => {
                     Ok(WorkflowExecutionResult::Cancelled {
-                        details: Vec::from_payloads(attrs.details),
+                        details: WorkflowResultDetails::new(Vec::from_payloads(attrs.details), dc)
+                            .await,
                     })
                 }
                 Some(Attributes::WorkflowExecutionTimedOutEventAttributes(attrs)) => {
@@ -549,7 +604,8 @@ where
                 }
                 Some(Attributes::WorkflowExecutionTerminatedEventAttributes(attrs)) => {
                     Ok(WorkflowExecutionResult::Terminated {
-                        details: Vec::from_payloads(attrs.details),
+                        details: WorkflowResultDetails::new(Vec::from_payloads(attrs.details), dc)
+                            .await,
                     })
                 }
                 Some(Attributes::WorkflowExecutionContinuedAsNewEventAttributes(attrs)) => {
@@ -660,7 +716,10 @@ where
             .into_inner();
 
         if let Some(rejected) = response.query_rejected {
-            return Err(WorkflowQueryError::Rejected(rejected));
+            return Err(WorkflowQueryError::Rejected {
+                status: (rejected.status != 0)
+                    .then(|| WorkflowExecutionStatus::from_raw(rejected.status)),
+            });
         }
 
         let result_payloads = response
@@ -1024,13 +1083,87 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_helpers::XorCodec;
     use std::collections::HashMap;
-    use temporalio_common::protos::temporal::api::{
-        common::v1::{Memo, SearchAttributes},
-        enums::v1::WorkflowExecutionStatus,
-        sdk::v1::UserMetadata,
-        workflow::v1::WorkflowExecutionConfig,
+    use temporalio_common::{
+        data_converters::DefaultFailureConverter,
+        protos::temporal::api::{
+            common::v1::{Memo, SearchAttributes},
+            enums::v1::WorkflowExecutionStatus as ProtoWorkflowExecutionStatus,
+            sdk::v1::UserMetadata,
+            workflow::v1::WorkflowExecutionConfig,
+        },
     };
+
+    #[tokio::test]
+    async fn workflow_result_details_support_typed_decoding() {
+        let converter = DataConverter::new(
+            PayloadConverter::default(),
+            DefaultFailureConverter,
+            XorCodec,
+        );
+        let payloads = converter
+            .to_payloads(
+                &SerializationContextData::Workflow,
+                &"workflow-result-details".to_owned(),
+            )
+            .await
+            .unwrap();
+        let details = WorkflowResultDetails::new(payloads.clone(), &converter).await;
+
+        assert_ne!(details.raw(), payloads);
+        let decoded_payloads = details.raw().to_vec();
+        assert_eq!(
+            details.deserialize::<String>().unwrap(),
+            "workflow-result-details"
+        );
+        assert_eq!(details.into_raw().payloads, decoded_payloads);
+    }
+
+    #[tokio::test]
+    async fn workflow_result_detail_conversion_errors_are_reported() {
+        let details =
+            WorkflowResultDetails::new(vec![Payload::default()], &DataConverter::default()).await;
+
+        assert_eq!(details.raw(), &[Payload::default()]);
+        assert!(details.deserialize::<String>().is_err());
+    }
+
+    #[tokio::test]
+    async fn workflow_description_memo_uses_saved_converter() {
+        let converter = DataConverter::new(
+            PayloadConverter::default(),
+            DefaultFailureConverter,
+            XorCodec,
+        );
+        let encoded = converter
+            .to_payload(
+                &SerializationContextData::Workflow,
+                &"memo-value".to_owned(),
+            )
+            .await
+            .unwrap();
+        let description = WorkflowExecutionDescription::new(
+            DescribeWorkflowExecutionResponse {
+                workflow_execution_info: Some(workflow::WorkflowExecutionInfo {
+                    memo: Some(Memo {
+                        fields: HashMap::from([("memo-key".to_owned(), encoded)]),
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            &converter,
+        )
+        .await
+        .unwrap();
+        let memo = description.memo();
+
+        assert_eq!(
+            memo.get::<String>("memo-key").unwrap(),
+            Some("memo-value".to_owned())
+        );
+    }
 
     #[tokio::test]
     async fn workflow_description_accessors_expose_decoded_fields() {
@@ -1063,7 +1196,7 @@ mod tests {
                             name: "wf-type".to_string(),
                         },
                     ),
-                    status: WorkflowExecutionStatus::Completed as i32,
+                    status: ProtoWorkflowExecutionStatus::Completed as i32,
                     task_queue: "task-queue".to_string(),
                     history_length: 42,
                     memo: Some(Memo {
@@ -1099,11 +1232,27 @@ mod tests {
         assert_eq!(description.run_id(), "run-id");
         assert_eq!(description.workflow_type(), "wf-type");
         assert_eq!(description.status(), WorkflowExecutionStatus::Completed);
+        let mut unknown_status_description = description.clone();
+        unknown_status_description
+            .raw_description
+            .workflow_execution_info
+            .as_mut()
+            .unwrap()
+            .status = 123_456;
+        assert_eq!(
+            unknown_status_description.status(),
+            WorkflowExecutionStatus::Unknown
+        );
         assert_eq!(description.task_queue(), "task-queue");
         assert_eq!(description.history_length(), 42);
         assert_eq!(description.parent_id(), Some("parent-id"));
         assert_eq!(description.parent_run_id(), Some("parent-run-id"));
-        assert_eq!(description.memo().unwrap().fields["memo-key"], memo_payload);
+        let memo = description.memo();
+        assert_eq!(memo.raw_value("memo-key"), Some(&memo_payload));
+        assert_eq!(
+            memo.get::<String>("memo-key").unwrap(),
+            Some("memo-value".to_owned())
+        );
         let search_attributes = description.search_attributes();
         assert_eq!(
             search_attributes.raw_payload("CustomKeywordField"),

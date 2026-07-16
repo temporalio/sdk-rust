@@ -28,7 +28,8 @@ use temporalio_common::{
             activity_result::ActivityExecutionResult,
             workflow_activation::{WorkflowActivationJob, workflow_activation_job},
             workflow_commands::{
-                ActivityCancellationType, ScheduleLocalActivity, workflow_command::Variant,
+                ActivityCancellationType as ProtoActivityCancellationType, ScheduleLocalActivity,
+                workflow_command::Variant,
             },
             workflow_completion::{
                 self, WorkflowActivationCompletion, workflow_activation_completion,
@@ -37,7 +38,9 @@ use temporalio_common::{
         temporal::api::{
             command::v1::{RecordMarkerCommandAttributes, command},
             common::v1::RetryPolicy,
-            enums::v1::{CommandType, EventType, TimeoutType, WorkflowTaskFailedCause},
+            enums::v1::{
+                CommandType, EventType, TimeoutType as ProtoTimeoutType, WorkflowTaskFailedCause,
+            },
             failure::v1::Failure,
             history::v1::history_event::Attributes::MarkerRecordedEventAttributes,
             query::v1::WorkflowQuery,
@@ -46,8 +49,9 @@ use temporalio_common::{
 };
 use temporalio_macros::{activities, workflow, workflow_methods};
 use temporalio_sdk::{
-    ActivityExecutionError, ActivityOptions, ApplicationFailure, CancellableFuture,
-    LocalActivityOptions, WorkflowContext, WorkflowContextView, WorkflowResult,
+    ActivityCancellationType, ActivityExecutionError, ActivityOptions, ApplicationFailure,
+    CancellableFuture, LocalActivityOptions, TimeoutType, WorkflowContext, WorkflowContextView,
+    WorkflowResult,
     activities::{ActivityContext, ActivityError},
     interceptors::{FailOnNondeterminismInterceptor, WorkerInterceptor},
 };
@@ -296,7 +300,8 @@ impl LocalActRetryTimerBackoff {
                         maximum_interval: Some(prost_dur!(from_millis(1500))),
                         maximum_attempts: 4,
                         non_retryable_error_types: vec![],
-                    },
+                    }
+                    .into(),
                     timer_backoff_threshold: Some(Duration::from_secs(1)),
                     ..Default::default()
                 },
@@ -339,8 +344,6 @@ async fn local_act_retry_timer_backoff() {
 #[case::abandon(ActivityCancellationType::Abandon)]
 #[tokio::test]
 async fn cancel_immediate(#[case] cancel_type: ActivityCancellationType) {
-    use temporalio_sdk::WorkflowContextView;
-
     let wf_name = format!("cancel_immediate_{cancel_type:?}");
     // If we don't use this, we'd hang on shutdown for abandon cancel modes.
     let manual_cancel = CancellationToken::new();
@@ -540,7 +543,8 @@ async fn cancel_after_act_starts(
                         maximum_interval: Some(bo_dur.try_into().unwrap()),
                         // Retry forever until cancelled
                         ..Default::default()
-                    },
+                    }
+                    .into(),
                     timer_backoff_threshold: Some(Duration::from_secs(1)),
                     cancel_type,
                     ..Default::default()
@@ -636,7 +640,7 @@ async fn x_to_close_timeout(#[case] is_schedule: bool) {
         #[run]
         async fn run(
             ctx: &mut WorkflowContext<Self>,
-            (sched, start, timeout_type): (Option<Duration>, Option<Duration>, i32),
+            (sched, start, is_schedule): (Option<Duration>, Option<Duration>, bool),
         ) -> WorkflowResult<()> {
             let res = ctx
                 .start_local_activity(
@@ -649,7 +653,8 @@ async fn x_to_close_timeout(#[case] is_schedule: bool) {
                             maximum_interval: Some(prost_dur!(from_millis(1500))),
                             maximum_attempts: 4,
                             non_retryable_error_types: vec![],
-                        },
+                        }
+                        .into(),
                         timer_backoff_threshold: Some(Duration::from_secs(1)),
                         schedule_to_close_timeout: sched,
                         start_to_close_timeout: start,
@@ -659,10 +664,12 @@ async fn x_to_close_timeout(#[case] is_schedule: bool) {
                 .await;
             let err = res.unwrap_err();
             let timeout = err.as_timeout().unwrap();
-            assert_eq!(
-                timeout.timeout_type(),
-                TimeoutType::try_from(timeout_type).unwrap()
-            );
+            let expected_timeout = if is_schedule {
+                TimeoutType::ScheduleToClose
+            } else {
+                TimeoutType::StartToClose
+            };
+            assert_eq!(timeout.timeout_type(), expected_timeout);
             Ok(())
         }
     }
@@ -673,18 +680,13 @@ async fn x_to_close_timeout(#[case] is_schedule: bool) {
     } else {
         (None, Some(Duration::from_secs(2)))
     };
-    let timeout_type = if is_schedule {
-        TimeoutType::ScheduleToClose
-    } else {
-        TimeoutType::StartToClose
-    };
     worker.register_workflow::<XToCloseTimeoutWf>().unwrap();
 
     let task_queue = starter.get_task_queue().to_owned();
     worker
         .submit_workflow(
             XToCloseTimeoutWf::run,
-            (sched, start, timeout_type as i32),
+            (sched, start, is_schedule),
             WorkflowStartOptions::new(task_queue, wf_name.to_owned()).build(),
         )
         .await
@@ -725,7 +727,8 @@ async fn schedule_to_close_timeout_across_timer_backoff(#[case] cached: bool) {
                             maximum_interval: Some(prost_dur!(from_millis(1000))),
                             maximum_attempts: 40,
                             non_retryable_error_types: vec![],
-                        },
+                        }
+                        .into(),
                         timer_backoff_threshold: Some(Duration::from_millis(500)),
                         schedule_to_close_timeout: Some(Duration::from_secs(2)),
                         ..Default::default()
@@ -806,7 +809,8 @@ async fn timer_backoff_concurrent_with_non_timer_backoff() {
                         maximum_interval: Some(prost_dur!(from_millis(1500))),
                         maximum_attempts: 4,
                         non_retryable_error_types: vec![],
-                    },
+                    }
+                    .into(),
                     timer_backoff_threshold: Some(Duration::from_secs(1)),
                     ..Default::default()
                 },
@@ -821,7 +825,8 @@ async fn timer_backoff_concurrent_with_non_timer_backoff() {
                         maximum_interval: Some(prost_dur!(from_millis(1500))),
                         maximum_attempts: 4,
                         non_retryable_error_types: vec![],
-                    },
+                    }
+                    .into(),
                     timer_backoff_threshold: Some(Duration::from_secs(10)),
                     ..Default::default()
                 },
@@ -875,7 +880,8 @@ async fn repro_nondeterminism_with_timer_bug() {
                         maximum_interval: Some(prost_dur!(from_millis(1500))),
                         maximum_attempts: 4,
                         non_retryable_error_types: vec![],
-                    },
+                    }
+                    .into(),
                     timer_backoff_threshold: Some(Duration::from_secs(1)),
                     ..Default::default()
                 },
@@ -1521,7 +1527,8 @@ async fn local_act_fail_and_retry(#[case] eventually_pass: bool) {
                             maximum_interval: None,
                             maximum_attempts: 5,
                             non_retryable_error_types: vec![],
-                        },
+                        }
+                        .into(),
                         ..Default::default()
                     },
                 )
@@ -1622,7 +1629,8 @@ async fn local_act_retry_long_backoff_uses_timer() {
                             maximum_interval: Some(prost_dur!(from_secs(600))),
                             maximum_attempts: 3,
                             non_retryable_error_types: vec![],
-                        },
+                        }
+                        .into(),
                         ..Default::default()
                     },
                 )
@@ -1765,7 +1773,7 @@ async fn query_during_wft_heartbeat_doesnt_accidentally_fail_to_continue_heartbe
             schedule_local_activity_cmd(
                 1,
                 "1",
-                ActivityCancellationType::TryCancel,
+                ProtoActivityCancellationType::TryCancel,
                 Duration::from_secs(60),
             ),
         ))
@@ -1908,7 +1916,7 @@ async fn la_resolve_during_legacy_query_does_not_combine(#[case] impossible_quer
             schedule_local_activity_cmd(
                 1,
                 "act-id",
-                ActivityCancellationType::TryCancel,
+                ProtoActivityCancellationType::TryCancel,
                 Duration::from_secs(60),
             ),
         ))
@@ -2002,11 +2010,7 @@ async fn test_schedule_to_start_timeout() {
                     panic!("expected timeout cause, got {fail:?}");
                 };
                 assert_eq!(timeout.timeout_type(), TimeoutType::ScheduleToStart);
-                assert_eq!(
-                    fail.activity_type()
-                        .map(|activity_type| activity_type.name.as_str()),
-                    Some(StdActivities::echo.name())
-                );
+                assert_eq!(fail.activity_type(), Some(StdActivities::echo.name()));
             }
             Ok(())
         }
@@ -2091,7 +2095,8 @@ async fn test_schedule_to_start_timeout_not_based_on_original_time(
                             maximum_interval: None,
                             maximum_attempts: 5,
                             non_retryable_error_types: vec![],
-                        },
+                        }
+                        .into(),
                         schedule_to_start_timeout: Some(Duration::from_secs(60)),
                         schedule_to_close_timeout,
                         ..Default::default()
@@ -2131,7 +2136,7 @@ async fn start_to_close_timeout_allows_retries(#[values(true, false)] la_complet
             1,
             "1",
             None,
-            Some(Failure::timeout(TimeoutType::StartToClose)),
+            Some(Failure::timeout(ProtoTimeoutType::StartToClose)),
             |_| {},
         );
     }
@@ -2167,7 +2172,8 @@ async fn start_to_close_timeout_allows_retries(#[values(true, false)] la_complet
                             maximum_interval: None,
                             maximum_attempts: 5,
                             non_retryable_error_types: vec![],
-                        },
+                        }
+                        .into(),
                         start_to_close_timeout: Some(prost_dur!(from_millis(25))),
                         ..Default::default()
                     },
@@ -2384,7 +2390,8 @@ async fn local_act_records_nonfirst_attempts_ok() {
                         maximum_interval: None,
                         maximum_attempts: 0,
                         non_retryable_error_types: vec![],
-                    },
+                    }
+                    .into(),
                     ..Default::default()
                 },
             )
@@ -2526,7 +2533,7 @@ async fn queries_can_be_received_while_heartbeating() {
         schedule_local_activity_cmd(
             1,
             "act-id",
-            ActivityCancellationType::TryCancel,
+            ProtoActivityCancellationType::TryCancel,
             Duration::from_secs(60),
         ),
     ))
@@ -2702,7 +2709,8 @@ async fn local_act_retry_explicit_delay() {
                             backoff_coefficient: 1.0,
                             maximum_attempts: 5,
                             ..Default::default()
-                        },
+                        }
+                        .into(),
                         ..Default::default()
                     },
                 )
@@ -2766,7 +2774,8 @@ impl LaWf {
                     retry_policy: RetryPolicy {
                         maximum_attempts: 1,
                         ..Default::default()
-                    },
+                    }
+                    .into(),
                     ..Default::default()
                 },
             )

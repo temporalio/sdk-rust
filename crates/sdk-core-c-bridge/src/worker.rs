@@ -16,7 +16,9 @@ use temporalio_common::protos::{
         ActivityHeartbeat, ActivityTaskCompletion, nexus::NexusTaskCompletion,
         workflow_completion::WorkflowActivationCompletion,
     },
-    temporal::api::history::v1::History,
+    temporal::api::{
+        enums::v1::VersioningBehavior as ProtoVersioningBehavior, history::v1::History,
+    },
 };
 use temporalio_sdk_core::{
     PollError, SlotInfoTrait, SlotKind, SlotMarkUsedContext, SlotReleaseContext,
@@ -1177,8 +1179,8 @@ impl TryFrom<&WorkerOptions> for temporalio_sdk_core::WorkerConfig {
                         let dvb = match dopts.default_versioning_behavior {
                             0 => None,
                             v => {
-                                if let Ok(behavior) = v.try_into() {
-                                    Some(behavior)
+                                if let Ok(behavior) = ProtoVersioningBehavior::try_from(v) {
+                                    Some(behavior.into())
                                 } else {
                                     bail!("Invalid default versioning behavior {}", v)
                                 }

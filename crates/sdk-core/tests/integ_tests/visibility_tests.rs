@@ -1,17 +1,15 @@
 use crate::common::{CoreWfStarter, NAMESPACE, eventually, get_integ_client};
 use assert_matches::assert_matches;
 use std::{sync::Arc, time::Duration};
-use temporalio_client::{
-    Namespace, NamespacedClient, RegisterNamespaceOptions, grpc::WorkflowService,
-};
+use temporalio_client::{NamespacedClient, RegisterNamespaceOptions, grpc::WorkflowService};
 use temporalio_common::protos::{
     coresdk::workflow_activation::{WorkflowActivationJob, workflow_activation_job},
     temporal::api::{
         filter::v1::{StartTimeFilter, WorkflowExecutionFilter},
         workflowservice::v1::{
-            ListClosedWorkflowExecutionsRequest, ListOpenWorkflowExecutionsRequest,
-            RegisterNamespaceRequest, list_closed_workflow_executions_request,
-            list_open_workflow_executions_request,
+            DescribeNamespaceRequest, ListClosedWorkflowExecutionsRequest,
+            ListOpenWorkflowExecutionsRequest, RegisterNamespaceRequest,
+            list_closed_workflow_executions_request, list_open_workflow_executions_request,
         },
     },
 };
@@ -152,9 +150,11 @@ async fn client_create_namespace() {
         attempts += 1;
         let resp = WorkflowService::describe_namespace(
             &mut client.as_ref().clone(),
-            Namespace::Name(register_options.namespace.clone())
-                .into_describe_namespace_request()
-                .into_request(),
+            DescribeNamespaceRequest {
+                namespace: register_options.namespace.clone(),
+                ..Default::default()
+            }
+            .into_request(),
         )
         .await;
 
@@ -181,9 +181,11 @@ async fn client_describe_namespace() {
 
     let namespace_result = WorkflowService::describe_namespace(
         &mut client.as_ref().clone(),
-        Namespace::Name(NAMESPACE.to_owned())
-            .into_describe_namespace_request()
-            .into_request(),
+        DescribeNamespaceRequest {
+            namespace: NAMESPACE.to_owned(),
+            ..Default::default()
+        }
+        .into_request(),
     )
     .await
     .unwrap()

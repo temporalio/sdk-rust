@@ -1,6 +1,7 @@
 //! Shared error types used across Temporal SDK crates.
 
 use crate::{
+    WorkflowExecution,
     data_converters::{
         DecodablePayloads, GenericPayloadConverter, PayloadConversionError, PayloadConverter,
         RawValue, SerializationContext, SerializationContextData, TemporalDeserializable,
@@ -10,12 +11,98 @@ use crate::{
         coresdk::child_workflow::StartChildWorkflowExecutionFailedCause,
         temporal::api::{
             common::v1::{Payload, Payloads},
-            enums::v1::{ApplicationErrorCategory as ProtoApplicationErrorCategory, TimeoutType},
+            enums::v1::{
+                ApplicationErrorCategory as ProtoApplicationErrorCategory,
+                RetryState as ProtoRetryState, TimeoutType as ProtoTimeoutType,
+            },
             failure::v1::Failure,
         },
     },
 };
 use std::time::Duration;
+
+/// Describes why a retry did or did not occur.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[non_exhaustive]
+pub enum RetryState {
+    /// No retry state was specified.
+    Unspecified,
+    /// Another retry is in progress.
+    InProgress,
+    /// The failure is not retryable.
+    NonRetryableFailure,
+    /// The retry timed out.
+    Timeout,
+    /// The retry policy's maximum attempts were reached.
+    MaximumAttemptsReached,
+    /// No retry policy was configured.
+    RetryPolicyNotSet,
+    /// An internal server error prevented retrying.
+    InternalServerError,
+    /// Cancellation was requested.
+    CancelRequested,
+    /// A state introduced by a newer server or API version.
+    Unknown,
+}
+
+impl RetryState {
+    fn from_raw(value: i32) -> Self {
+        match ProtoRetryState::try_from(value) {
+            Ok(ProtoRetryState::Unspecified) => Self::Unspecified,
+            Ok(ProtoRetryState::InProgress) => Self::InProgress,
+            Ok(ProtoRetryState::NonRetryableFailure) => Self::NonRetryableFailure,
+            Ok(ProtoRetryState::Timeout) => Self::Timeout,
+            Ok(ProtoRetryState::MaximumAttemptsReached) => Self::MaximumAttemptsReached,
+            Ok(ProtoRetryState::RetryPolicyNotSet) => Self::RetryPolicyNotSet,
+            Ok(ProtoRetryState::InternalServerError) => Self::InternalServerError,
+            Ok(ProtoRetryState::CancelRequested) => Self::CancelRequested,
+            Err(_) => Self::Unknown,
+        }
+    }
+}
+
+impl From<ProtoRetryState> for RetryState {
+    fn from(value: ProtoRetryState) -> Self {
+        Self::from_raw(value as i32)
+    }
+}
+
+/// Identifies which timeout expired.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[non_exhaustive]
+pub enum TimeoutType {
+    /// No timeout type was specified.
+    Unspecified,
+    /// The execution exceeded its start-to-close timeout.
+    StartToClose,
+    /// The task exceeded its schedule-to-start timeout.
+    ScheduleToStart,
+    /// The execution exceeded its schedule-to-close timeout.
+    ScheduleToClose,
+    /// An activity heartbeat was not received in time.
+    Heartbeat,
+    /// A timeout introduced by a newer server or API version.
+    Unknown,
+}
+
+impl TimeoutType {
+    fn from_raw(value: i32) -> Self {
+        match ProtoTimeoutType::try_from(value) {
+            Ok(ProtoTimeoutType::Unspecified) => Self::Unspecified,
+            Ok(ProtoTimeoutType::StartToClose) => Self::StartToClose,
+            Ok(ProtoTimeoutType::ScheduleToStart) => Self::ScheduleToStart,
+            Ok(ProtoTimeoutType::ScheduleToClose) => Self::ScheduleToClose,
+            Ok(ProtoTimeoutType::Heartbeat) => Self::Heartbeat,
+            Err(_) => Self::Unknown,
+        }
+    }
+}
+
+impl From<ProtoTimeoutType> for TimeoutType {
+    fn from(value: ProtoTimeoutType) -> Self {
+        Self::from_raw(value as i32)
+    }
+}
 
 // We cannot store `Box<dyn TemporalSerializable>` directly here because erased values still need
 // to be driven back through the active `PayloadConverter` to reach serde-based implementations.
@@ -619,7 +706,7 @@ impl TimeoutError {
         Self {
             failure,
             cause: cause.map(Box::new),
-            timeout_type: failure_info.timeout_type(),
+            timeout_type: TimeoutType::from_raw(failure_info.timeout_type),
             last_heartbeat_details: failure_info.last_heartbeat_details.map(|details| {
                 DecodablePayloads::new(details.payloads, payload_converter.clone(), *context)
             }),
@@ -705,11 +792,11 @@ pub struct ActivityFailureError {
     failure: Failure,
     cause: Option<Box<IncomingError>>,
     activity_id: String,
-    activity_type: Option<crate::protos::temporal::api::common::v1::ActivityType>,
+    activity_type: Option<String>,
     scheduled_event_id: i64,
     started_event_id: i64,
     identity: String,
-    retry_state: crate::protos::temporal::api::enums::v1::RetryState,
+    retry_state: RetryState,
 }
 
 impl ActivityFailureError {
@@ -719,12 +806,14 @@ impl ActivityFailureError {
         failure_info: crate::protos::temporal::api::failure::v1::ActivityFailureInfo,
         cause: Option<IncomingError>,
     ) -> Self {
-        let retry_state = failure_info.retry_state();
+        let retry_state = RetryState::from_raw(failure_info.retry_state);
         Self {
             failure,
             cause: cause.map(Box::new),
             activity_id: failure_info.activity_id,
-            activity_type: failure_info.activity_type,
+            activity_type: failure_info
+                .activity_type
+                .map(|activity_type| activity_type.name),
             scheduled_event_id: failure_info.scheduled_event_id,
             started_event_id: failure_info.started_event_id,
             identity: failure_info.identity,
@@ -738,8 +827,8 @@ impl ActivityFailureError {
     }
 
     /// Returns the activity type, if present.
-    pub fn activity_type(&self) -> Option<&crate::protos::temporal::api::common::v1::ActivityType> {
-        self.activity_type.as_ref()
+    pub fn activity_type(&self) -> Option<&str> {
+        self.activity_type.as_deref()
     }
 
     /// Returns the scheduled event id.
@@ -758,7 +847,7 @@ impl ActivityFailureError {
     }
 
     /// Returns the retry state reported by core.
-    pub fn retry_state(&self) -> crate::protos::temporal::api::enums::v1::RetryState {
+    pub fn retry_state(&self) -> RetryState {
         self.retry_state
     }
 
@@ -782,11 +871,11 @@ pub struct ChildWorkflowFailureError {
     failure: Failure,
     cause: Option<Box<IncomingError>>,
     namespace: String,
-    workflow_execution: Option<crate::protos::temporal::api::common::v1::WorkflowExecution>,
-    workflow_type: Option<crate::protos::temporal::api::common::v1::WorkflowType>,
+    workflow_execution: Option<WorkflowExecution>,
+    workflow_type: Option<String>,
     initiated_event_id: i64,
     started_event_id: i64,
-    retry_state: crate::protos::temporal::api::enums::v1::RetryState,
+    retry_state: RetryState,
 }
 
 impl ChildWorkflowFailureError {
@@ -796,13 +885,15 @@ impl ChildWorkflowFailureError {
         failure_info: crate::protos::temporal::api::failure::v1::ChildWorkflowExecutionFailureInfo,
         cause: Option<IncomingError>,
     ) -> Self {
-        let retry_state = failure_info.retry_state();
+        let retry_state = RetryState::from_raw(failure_info.retry_state);
         Self {
             failure,
             cause: cause.map(Box::new),
             namespace: failure_info.namespace,
-            workflow_execution: failure_info.workflow_execution,
-            workflow_type: failure_info.workflow_type,
+            workflow_execution: failure_info.workflow_execution.map(Into::into),
+            workflow_type: failure_info
+                .workflow_type
+                .map(|workflow_type| workflow_type.name),
             initiated_event_id: failure_info.initiated_event_id,
             started_event_id: failure_info.started_event_id,
             retry_state,
@@ -815,15 +906,13 @@ impl ChildWorkflowFailureError {
     }
 
     /// Returns the child workflow execution, if present.
-    pub fn workflow_execution(
-        &self,
-    ) -> Option<&crate::protos::temporal::api::common::v1::WorkflowExecution> {
+    pub fn workflow_execution(&self) -> Option<&WorkflowExecution> {
         self.workflow_execution.as_ref()
     }
 
     /// Returns the child workflow type, if present.
-    pub fn workflow_type(&self) -> Option<&crate::protos::temporal::api::common::v1::WorkflowType> {
-        self.workflow_type.as_ref()
+    pub fn workflow_type(&self) -> Option<&str> {
+        self.workflow_type.as_deref()
     }
 
     /// Returns the initiated event id.
@@ -837,7 +926,7 @@ impl ChildWorkflowFailureError {
     }
 
     /// Returns the retry state reported by core.
-    pub fn retry_state(&self) -> crate::protos::temporal::api::enums::v1::RetryState {
+    pub fn retry_state(&self) -> RetryState {
         self.retry_state
     }
 
@@ -1113,7 +1202,10 @@ mod tests {
             DefaultFailureConverter, FailureConverter, GenericPayloadConverter, PayloadConverter,
             SerializationContext, SerializationContextData,
         },
-        protos::temporal::api::{common::v1::Payload, failure::v1::failure::FailureInfo},
+        protos::temporal::api::{
+            common::v1::Payload,
+            failure::v1::{ActivityFailureInfo, TimeoutFailureInfo, failure::FailureInfo},
+        },
     };
 
     struct AlwaysFailsSerialize;
@@ -1122,6 +1214,52 @@ mod tests {
         fn serialize<S: serde::Serializer>(&self, _serializer: S) -> Result<S::Ok, S::Error> {
             Err(serde::ser::Error::custom("serialize boom"))
         }
+    }
+
+    #[test]
+    fn decoded_failures_hide_unknown_state_values() {
+        let failure = Failure {
+            cause: Some(Box::new(Failure {
+                failure_info: Some(FailureInfo::TimeoutFailureInfo(TimeoutFailureInfo {
+                    timeout_type: 654_321,
+                    ..Default::default()
+                })),
+                ..Default::default()
+            })),
+            failure_info: Some(FailureInfo::ActivityFailureInfo(ActivityFailureInfo {
+                retry_state: 123_456,
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+
+        let decoded = DefaultFailureConverter
+            .to_error(
+                failure,
+                &PayloadConverter::default(),
+                &SerializationContextData::Workflow,
+            )
+            .unwrap();
+        let IncomingError::Activity(activity) = decoded else {
+            panic!("expected activity failure");
+        };
+        assert_eq!(activity.retry_state(), RetryState::Unknown);
+        let Some(FailureInfo::ActivityFailureInfo(raw_activity)) =
+            activity.failure().failure_info.as_ref()
+        else {
+            panic!("expected raw activity failure info");
+        };
+        assert_eq!(raw_activity.retry_state, 123_456);
+        let Some(IncomingError::Timeout(timeout)) = activity.cause() else {
+            panic!("expected timeout cause");
+        };
+        assert_eq!(timeout.timeout_type(), TimeoutType::Unknown);
+        let Some(FailureInfo::TimeoutFailureInfo(raw_timeout)) =
+            timeout.failure().failure_info.as_ref()
+        else {
+            panic!("expected raw timeout failure info");
+        };
+        assert_eq!(raw_timeout.timeout_type, 654_321);
     }
 
     #[test]

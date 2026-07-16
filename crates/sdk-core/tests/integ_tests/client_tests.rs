@@ -22,7 +22,7 @@ use std::{
     time::Duration,
 };
 use temporalio_client::{
-    Connection, GrpcCompression, Namespace, RETRYABLE_ERROR_CODES, RetryOptions, UntypedWorkflow,
+    Connection, GrpcCompression, RETRYABLE_ERROR_CODES, RetryOptions, UntypedWorkflow,
     errors::ClientConnectError, grpc::WorkflowService, proxy::HttpConnectProxyOptions,
 };
 use temporalio_common::protos::temporal::api::{
@@ -476,9 +476,11 @@ async fn namespace_header_attached_to_relevant_calls() {
     assert_eq!("", val);
     let _ = WorkflowService::describe_namespace(
         &mut client.clone(),
-        Namespace::Name("Other".to_string())
-            .into_describe_namespace_request()
-            .into_request(),
+        DescribeNamespaceRequest {
+            namespace: "Other".to_string(),
+            ..Default::default()
+        }
+        .into_request(),
     )
     .await;
     let val = header_rx.recv().await.unwrap();

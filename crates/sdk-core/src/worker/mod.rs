@@ -93,7 +93,7 @@ use temporalio_common::{
         },
         temporal::api::{
             deployment,
-            enums::v1::{TaskQueueKind, WorkerStatus},
+            enums::v1::{TaskQueueKind, TaskQueueType, WorkerStatus},
             taskqueue::v1::{StickyExecutionAttributes, TaskQueue},
             worker::v1::{WorkerHeartbeat, WorkerHostInfo, WorkerPollerInfo, WorkerSlotsInfo},
         },
@@ -1456,7 +1456,16 @@ impl Worker {
             .and_then(|wf| wf.get_sticky_queue_name())
             .unwrap_or_default();
         let task_queue = self.config.task_queue.clone();
-        let task_queue_types = self.config.task_types.to_task_queue_types();
+        let mut task_queue_types = Vec::new();
+        if self.config.task_types.enable_workflows {
+            task_queue_types.push(TaskQueueType::Workflow);
+        }
+        if self.config.task_types.enable_remote_activities {
+            task_queue_types.push(TaskQueueType::Activity);
+        }
+        if self.config.task_types.enable_nexus {
+            task_queue_types.push(TaskQueueType::Nexus);
+        }
         let heartbeat = self
             .client_worker_registrator
             .heartbeat_manager
@@ -1965,7 +1974,7 @@ impl WorkerVersioningStrategy {
     pub fn default_versioning_behavior(&self) -> Option<VersioningBehavior> {
         match self {
             WorkerVersioningStrategy::WorkerDeploymentBased(opts) => {
-                opts.default_versioning_behavior
+                opts.default_versioning_behavior.map(Into::into)
             }
             _ => None,
         }
@@ -2503,7 +2512,7 @@ mod tests {
                         build_id: "1.0".to_string(),
                     },
                     use_worker_versioning: false,
-                    default_versioning_behavior: Some(VersioningBehavior::AutoUpgrade),
+                    default_versioning_behavior: Some(VersioningBehavior::AutoUpgrade.into()),
                 },
             ))
             .task_types(WorkerTaskTypes::all())

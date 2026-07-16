@@ -16,26 +16,33 @@ pub mod __private {
 
 #[doc(hidden)]
 pub mod component;
+mod memo;
 #[doc(hidden)]
 pub mod runtime;
 mod workflow_context;
 pub mod workflows;
 
+pub use memo::{MemoValue, MemoValues};
 #[doc(hidden)]
 pub use runtime::model::{CancellableID, UnblockEvent};
 pub use runtime::model::{TimerResult, WorkflowResult, WorkflowTermination};
 #[doc(hidden)]
 pub use runtime::{SdkWakeGuard, is_sdk_wake};
-pub use temporalio_common_wasm::error::{
-    ActivityExecutionError, ChildWorkflowExecutionError, ChildWorkflowStartError,
-    WorkflowSignalError,
+pub use temporalio_common_wasm::{
+    Memo, RetryPolicy,
+    error::{
+        ActivityExecutionError, ChildWorkflowExecutionError, ChildWorkflowStartError, RetryState,
+        TimeoutType, WorkflowSignalError,
+    },
 };
 pub use workflow_context::{
-    ActivityCloseTimeouts, ActivityOptions, BaseWorkflowContext, CancellableFuture,
-    ChildWorkflowOptions, ContinueAsNewOptions, ContinueAsNewVersioningBehavior,
-    ExternalWorkflowHandle, LocalActivityOptions, NexusOperationOptions, ParentWorkflowInfo,
-    RootWorkflowInfo, Signal, SignalData, StartChildWorkflowExecutionFailedCause,
-    StartedChildWorkflow, SyncWorkflowContext, TimerOptions, WorkflowContext, WorkflowContextView,
+    ActivityCancellationType, ActivityCloseTimeouts, ActivityOptions, BaseWorkflowContext,
+    CancellableFuture, ChildWorkflowCancellationType, ChildWorkflowOptions, ContinueAsNewOptions,
+    ContinueAsNewVersioningBehavior, ExternalWorkflowHandle, LocalActivityOptions,
+    NamespacedWorkflowInfo, NexusOperationCancellationType, NexusOperationOptions,
+    ParentClosePolicy, Signal, SignalData, StartChildWorkflowExecutionFailedCause,
+    StartedChildWorkflow, SyncWorkflowContext, TimerOptions, VersioningIntent, WorkflowContext,
+    WorkflowContextView, WorkflowIdReusePolicy,
 };
 pub use workflows::{join, join_all, select};
 

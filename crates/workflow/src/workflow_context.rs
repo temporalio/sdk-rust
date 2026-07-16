@@ -1,19 +1,26 @@
 mod options;
+mod view;
 
 pub use options::{
-    ActivityCloseTimeouts, ActivityOptions, ChildWorkflowOptions, ContinueAsNewOptions,
-    ContinueAsNewVersioningBehavior, LocalActivityOptions, NexusOperationOptions, Signal,
-    SignalData, TimerOptions,
+    ActivityCancellationType, ActivityCloseTimeouts, ActivityOptions,
+    ChildWorkflowCancellationType, ChildWorkflowOptions, ContinueAsNewOptions,
+    ContinueAsNewVersioningBehavior, LocalActivityOptions, NexusOperationCancellationType,
+    NexusOperationOptions, ParentClosePolicy, Signal, SignalData, TimerOptions, VersioningIntent,
+    WorkflowIdReusePolicy,
 };
 pub use temporalio_common_wasm::protos::coresdk::child_workflow::StartChildWorkflowExecutionFailedCause;
+pub use view::{NamespacedWorkflowInfo, WorkflowContextView};
 
-use crate::runtime::{
-    SdkGuardedFuture, SdkWakeGuard,
-    entry::WorkflowImplementation,
-    host::WorkflowHost,
-    model::{
-        CancelExternalWfResult, CancellableID, NexusStartResult, SignalExternalWfResult,
-        TimerResult, UnblockEvent, Unblockable, WorkflowTermination,
+use crate::{
+    MemoValue,
+    runtime::{
+        SdkGuardedFuture, SdkWakeGuard,
+        entry::WorkflowImplementation,
+        host::WorkflowHost,
+        model::{
+            CancelExternalWfResult, CancellableID, NexusStartResult, SignalExternalWfResult,
+            TimerResult, UnblockEvent, Unblockable, WorkflowTermination,
+        },
     },
 };
 use futures_channel::oneshot;
@@ -34,12 +41,12 @@ use std::{
     time::{Duration, SystemTime},
 };
 use temporalio_common_wasm::{
-    ActivityDefinition, SignalDefinition, WorkflowDefinition,
+    ActivityDefinition, Memo, SignalDefinition, WorkflowDefinition,
     data_converters::{
         ActivityExecutionDecodeHint, ChildWorkflowExecutionDecodeHint,
-        ChildWorkflowStartDecodeHint, DataConverter, GenericPayloadConverter, PayloadConverter,
-        SerializationContext, SerializationContextData, TemporalDeserializable,
-        WorkflowSignalDecodeHint,
+        ChildWorkflowStartDecodeHint, DataConverter, GenericPayloadConverter,
+        PayloadConversionError, PayloadConverter, SerializationContext, SerializationContextData,
+        TemporalDeserializable, WorkflowSignalDecodeHint,
     },
     error::{
         ActivityExecutionError, ChildWorkflowExecutionError, ChildWorkflowStartError,
@@ -66,7 +73,7 @@ use temporalio_common_wasm::{
             },
         },
         temporal::api::{
-            common::v1::{Memo, Payload, SearchAttributes as ProtoSearchAttributes},
+            common::v1::{Memo as ProtoMemo, Payload, SearchAttributes as ProtoSearchAttributes},
             failure::v1::{CanceledFailureInfo, Failure, failure::FailureInfo},
         },
         utilities::TryIntoOrNone,
@@ -109,11 +116,17 @@ impl BaseWorkflowContext {
 
     /// Create a read-only view of this context.
     pub(crate) fn view(&self) -> WorkflowContextView {
+        let shared = self.inner.shared.borrow();
+        let mut initial_information = self.inner.initial_information.clone();
+        if initial_information.memo.is_some() || !shared.memo.fields.is_empty() {
+            initial_information.memo = Some(shared.memo.clone());
+        }
         WorkflowContextView::new(
             self.inner.namespace.clone(),
             self.inner.task_queue.clone(),
             self.inner.run_id.clone(),
-            &self.inner.inital_information,
+            initial_information,
+            self.inner.data_converter.payload_converter().clone(),
         )
     }
 }
@@ -212,7 +225,7 @@ struct WorkflowContextInner {
     namespace: String,
     task_queue: String,
     run_id: String,
-    inital_information: InitializeWorkflow,
+    initial_information: InitializeWorkflow,
     runtime: WorkflowRuntimeState,
     cancelled_reason: RefCell<Option<String>>,
     cancel_wakers: RefCell<Vec<Waker>>,
@@ -270,143 +283,10 @@ impl<W> Clone for WorkflowContext<W> {
     }
 }
 
-/// Read-only view of workflow context for use in init and query handlers.
-///
-/// This provides access to workflow information but cannot issue commands.
-#[derive(Clone, Debug)]
-#[non_exhaustive]
-pub struct WorkflowContextView {
-    /// The workflow's unique identifier
-    pub workflow_id: String,
-    /// The run id of this workflow execution
-    pub run_id: String,
-    /// The workflow type name
-    pub workflow_type: String,
-    /// The task queue this workflow is executing on
-    pub task_queue: String,
-    /// The namespace this workflow is executing in
-    pub namespace: String,
-
-    /// The current attempt number (starting from 1)
-    pub attempt: u32,
-    /// The run id of the very first execution in the chain
-    pub first_execution_run_id: String,
-    /// The run id of the previous execution if this is a continuation
-    pub continued_from_run_id: Option<String>,
-
-    /// When the workflow execution started
-    pub start_time: Option<SystemTime>,
-    /// Total workflow execution timeout including retries and continue as new
-    pub execution_timeout: Option<Duration>,
-    /// Timeout of a single workflow run
-    pub run_timeout: Option<Duration>,
-    /// Timeout of a single workflow task
-    pub task_timeout: Option<Duration>,
-
-    /// Information about the parent workflow, if this is a child workflow
-    pub parent: Option<ParentWorkflowInfo>,
-    /// Information about the root workflow in the execution chain
-    pub root: Option<RootWorkflowInfo>,
-
-    /// The workflow's retry policy
-    pub retry_policy:
-        Option<temporalio_common_wasm::protos::temporal::api::common::v1::RetryPolicy>,
-    /// If this workflow runs on a cron schedule
-    pub cron_schedule: Option<String>,
-    /// User-defined memo
-    pub memo: Option<Memo>,
-    /// Initial search attributes as a typed collection.
-    pub search_attributes: Option<SearchAttributes>,
-}
-
-/// Information about a parent workflow.
-#[derive(Clone, Debug)]
-#[non_exhaustive]
-pub struct ParentWorkflowInfo {
-    /// The parent workflow's unique identifier
-    pub workflow_id: String,
-    /// The parent workflow's run id
-    pub run_id: String,
-    /// The parent workflow's namespace
-    pub namespace: String,
-}
-
-/// Information about the root workflow in an execution chain.
-#[derive(Clone, Debug)]
-#[non_exhaustive]
-pub struct RootWorkflowInfo {
-    /// The root workflow's unique identifier
-    pub workflow_id: String,
-    /// The root workflow's run id
-    pub run_id: String,
-}
-
-impl WorkflowContextView {
-    /// Create a new view from workflow initialization data.
-    pub(crate) fn new(
-        namespace: String,
-        task_queue: String,
-        run_id: String,
-        init: &InitializeWorkflow,
-    ) -> Self {
-        let parent = init
-            .parent_workflow_info
-            .as_ref()
-            .map(|p| ParentWorkflowInfo {
-                workflow_id: p.workflow_id.clone(),
-                run_id: p.run_id.clone(),
-                namespace: p.namespace.clone(),
-            });
-
-        let root = init.root_workflow.as_ref().map(|r| RootWorkflowInfo {
-            workflow_id: r.workflow_id.clone(),
-            run_id: r.run_id.clone(),
-        });
-
-        let continued_from_run_id = if init.continued_from_execution_run_id.is_empty() {
-            None
-        } else {
-            Some(init.continued_from_execution_run_id.clone())
-        };
-
-        let cron_schedule = if init.cron_schedule.is_empty() {
-            None
-        } else {
-            Some(init.cron_schedule.clone())
-        };
-
-        Self {
-            workflow_id: init.workflow_id.clone(),
-            run_id,
-            workflow_type: init.workflow_type.clone(),
-            task_queue,
-            namespace,
-            attempt: init.attempt as u32,
-            first_execution_run_id: init.first_execution_run_id.clone(),
-            continued_from_run_id,
-            start_time: init.start_time.and_then(|t| t.try_into().ok()),
-            execution_timeout: init
-                .workflow_execution_timeout
-                .and_then(|d| d.try_into().ok()),
-            run_timeout: init.workflow_run_timeout.and_then(|d| d.try_into().ok()),
-            task_timeout: init.workflow_task_timeout.and_then(|d| d.try_into().ok()),
-            parent,
-            root,
-            retry_policy: init.retry_policy.clone(),
-            cron_schedule,
-            memo: init.memo.clone(),
-            search_attributes: init
-                .search_attributes
-                .as_ref()
-                .map(SearchAttributes::from_proto),
-        }
-    }
-}
-
 impl BaseWorkflowContext {
-    /// Create a new base context backed by the provided runtime host.
+    /// Construct a base context from raw workflow activation initialization data.
     #[doc(hidden)]
-    pub fn new(
+    pub fn from_raw(
         namespace: String,
         task_queue: String,
         run_id: String,
@@ -421,13 +301,14 @@ impl BaseWorkflowContext {
                 run_id,
                 shared: RefCell::new(WorkflowContextSharedData {
                     random_seed: init_workflow_job.randomness_seed,
+                    memo: init_workflow_job.memo.clone().unwrap_or_default(),
                     search_attributes: init_workflow_job
                         .search_attributes
                         .clone()
                         .unwrap_or_default(),
                     ..Default::default()
                 }),
-                inital_information: init_workflow_job,
+                initial_information: init_workflow_job,
                 runtime: WorkflowRuntimeState::new(host),
                 cancelled_reason: RefCell::new(None),
                 cancel_wakers: RefCell::new(Vec::new()),
@@ -745,7 +626,7 @@ impl BaseWorkflowContext {
 impl<W> SyncWorkflowContext<W> {
     /// Return the workflow's unique identifier
     pub fn workflow_id(&self) -> &str {
-        &self.base.inner.inital_information.workflow_id
+        &self.base.inner.initial_information.workflow_id
     }
 
     /// Return the run id of this workflow execution
@@ -798,6 +679,15 @@ impl<W> SyncWorkflowContext<W> {
         SearchAttributes::from_proto(&self.base.inner.shared.borrow().search_attributes)
     }
 
+    /// Return the current workflow memo values.
+    pub fn memo(&self) -> Memo {
+        Memo::from_raw(
+            Some(self.base.inner.shared.borrow().memo.clone()),
+            self.payload_converter().clone(),
+            SerializationContextData::Workflow,
+        )
+    }
+
     /// Return the workflow's randomness seed
     pub fn random_seed(&self) -> u64 {
         self.base.inner.shared.borrow().random_seed
@@ -843,10 +733,9 @@ impl<W> SyncWorkflowContext<W> {
         self.base.inner.data_converter.payload_converter()
     }
 
-    /// Return various information that the workflow was initialized with. Will eventually become
-    /// a proper non-proto workflow info struct.
-    pub fn workflow_initial_info(&self) -> &InitializeWorkflow {
-        &self.base.inner.inital_information
+    /// Return Rust-native information about this workflow execution.
+    pub fn info(&self) -> WorkflowContextView {
+        self.view()
     }
 
     /// A future that resolves if/when the workflow is cancelled, with the user provided cause
@@ -883,8 +772,10 @@ impl<W> SyncWorkflowContext<W> {
         let arguments = pc
             .to_payloads(&ctx, input)
             .map_err(WorkflowTermination::from)?;
-        let workflow_type = self.workflow_initial_info().workflow_type.clone();
-        let request = opts.into_request(workflow_type, arguments);
+        let workflow_type = self.base.inner.initial_information.workflow_type.clone();
+        let request = opts
+            .into_request(workflow_type, arguments, pc)
+            .map_err(WorkflowTermination::from)?;
         Err(WorkflowTermination::continue_as_new(request))
     }
 
@@ -1034,16 +925,51 @@ impl<W> SyncWorkflowContext<W> {
         );
     }
 
-    /// Add or create a set of search attributes
-    pub fn upsert_memo(&self, attr_iter: impl IntoIterator<Item = (String, Payload)>) {
+    /// Add or replace memo values with `Some`; remove memo keys with `None`.
+    pub fn upsert_memo<K>(
+        &self,
+        updates: impl IntoIterator<Item = (K, Option<MemoValue>)>,
+    ) -> Result<(), PayloadConversionError>
+    where
+        K: Into<String>,
+    {
+        let mut fields = HashMap::new();
+        let mut local_updates = Vec::new();
+        for (key, value) in updates {
+            let key = key.into();
+            let (command_payload, local_payload) = match value {
+                Some(value) => {
+                    let payload = value.to_payload(self.payload_converter())?;
+                    (payload.clone(), Some(payload))
+                }
+                None => (
+                    MemoValue::new(()).to_payload(self.payload_converter())?,
+                    None,
+                ),
+            };
+            fields.insert(key.clone(), command_payload);
+            local_updates.push((key, local_payload));
+        }
+        {
+            let mut shared = self.base.inner.shared.borrow_mut();
+            for (key, payload) in local_updates {
+                match payload {
+                    Some(payload) => {
+                        shared.memo.fields.insert(key, payload);
+                    }
+                    None => {
+                        shared.memo.fields.remove(&key);
+                    }
+                }
+            }
+        }
         self.base.inner.runtime.host.push_command(
             workflow_command::Variant::ModifyWorkflowProperties(ModifyWorkflowProperties {
-                upserted_memo: Some(Memo {
-                    fields: attr_iter.into_iter().collect(),
-                }),
+                upserted_memo: Some(ProtoMemo { fields }),
             })
             .into(),
         );
+        Ok(())
     }
 
     /// Set the current details string for this workflow execution.
@@ -1180,6 +1106,11 @@ impl<W> WorkflowContext<W> {
         self.sync.search_attributes()
     }
 
+    /// Return the current workflow memo values.
+    pub fn memo(&self) -> Memo {
+        self.sync.memo()
+    }
+
     /// Return the workflow's randomness seed
     pub fn random_seed(&self) -> u64 {
         self.sync.random_seed()
@@ -1212,9 +1143,9 @@ impl<W> WorkflowContext<W> {
         self.sync.payload_converter()
     }
 
-    /// Return various information that the workflow was initialized with.
-    pub fn workflow_initial_info(&self) -> &InitializeWorkflow {
-        self.sync.workflow_initial_info()
+    /// Return Rust-native information about this workflow execution.
+    pub fn info(&self) -> WorkflowContextView {
+        self.sync.info()
     }
 
     /// A future that resolves if/when the workflow is cancelled, with the user provided cause
@@ -1308,9 +1239,15 @@ impl<W> WorkflowContext<W> {
         self.sync.upsert_search_attributes(updates)
     }
 
-    /// Add or create a set of memo fields
-    pub fn upsert_memo(&self, attr_iter: impl IntoIterator<Item = (String, Payload)>) {
-        self.sync.upsert_memo(attr_iter)
+    /// Add or replace memo values with `Some`; remove memo keys with `None`.
+    pub fn upsert_memo<K>(
+        &self,
+        updates: impl IntoIterator<Item = (K, Option<MemoValue>)>,
+    ) -> Result<(), PayloadConversionError>
+    where
+        K: Into<String>,
+    {
+        self.sync.upsert_memo(updates)
     }
 
     /// Set the current details string for this workflow execution.
@@ -1441,6 +1378,7 @@ struct WorkflowContextSharedData {
     /// Maps change ids -> resolved status
     changes: HashMap<String, bool>,
     activation: CoreWorkflowActivation,
+    memo: ProtoMemo,
     search_attributes: ProtoSearchAttributes,
     random_seed: u64,
     /// Current details string, surfaced via the workflow metadata query.
@@ -2339,16 +2277,19 @@ impl StartedNexusOperation {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::MemoValues;
     use std::collections::HashMap;
     use temporalio_common_wasm::{
+        RetryPolicy,
         data_converters::{TemporalDeserializable, TemporalSerializable},
         protos::{
             coresdk::{
-                AsJsonPayloadExt, common::VersioningIntent as ProtoVersioningIntent,
+                AsJsonPayloadExt, FromJsonPayloadExt,
+                common::VersioningIntent as ProtoVersioningIntent,
                 workflow_commands::WorkflowCommand,
             },
             temporal::api::{
-                common::v1::{Payload, RetryPolicy},
+                common::v1::{Payload, RetryPolicy as ProtoRetryPolicy},
                 enums::v1::ContinueAsNewVersioningBehavior as ProtoContinueAsNewVersioningBehavior,
             },
         },
@@ -2361,6 +2302,36 @@ mod tests {
     impl WorkflowHost for NoopHost {
         fn set_current_details(&self, _details: String) {}
         fn push_command(&self, _command: WorkflowCommand) {}
+    }
+
+    #[derive(Default)]
+    struct RecordingHost {
+        commands: RefCell<Vec<WorkflowCommand>>,
+    }
+
+    impl WorkflowHost for RecordingHost {
+        fn set_current_details(&self, _details: String) {}
+
+        fn push_command(&self, command: WorkflowCommand) {
+            self.commands.borrow_mut().push(command);
+        }
+    }
+
+    #[derive(Debug)]
+    struct FailingMemoValue;
+
+    impl TemporalSerializable for FailingMemoValue {
+        fn to_payload(
+            &self,
+            _ctx: &temporalio_common_wasm::data_converters::SerializationContext<'_>,
+        ) -> Result<Payload, temporalio_common_wasm::data_converters::PayloadConversionError>
+        {
+            Err(
+                temporalio_common_wasm::data_converters::PayloadConversionError::EncodingError(
+                    std::io::Error::other("memo serialization failure").into(),
+                ),
+            )
+        }
     }
 
     #[workflow]
@@ -2380,7 +2351,7 @@ mod tests {
             workflow_type: TestWorkflow.name().to_string(),
             ..Default::default()
         };
-        let base = BaseWorkflowContext::new(
+        let base = BaseWorkflowContext::from_raw(
             "default".to_string(),
             "orig-task-queue".to_string(),
             "run-id".to_string(),
@@ -2430,11 +2401,8 @@ mod tests {
     fn sync_workflow_context_continue_as_new_applies_options() {
         let ctx = test_context();
         let sync = ctx.sync_context();
-        let mut memo = HashMap::new();
-        memo.insert(
-            "memo-key".to_string(),
-            Payload::from(b"memo-value".as_slice()),
-        );
+        let mut memo = MemoValues::new();
+        memo.insert("memo-key", "memo-value".to_string());
         let mut headers = HashMap::new();
         headers.insert(
             "header-key".to_string(),
@@ -2459,11 +2427,8 @@ mod tests {
                     memo: Some(memo.clone()),
                     headers: Some(headers.clone()),
                     search_attributes: Some(search_attributes.clone()),
-                    retry_policy: Some(RetryPolicy {
-                        maximum_attempts: 5,
-                        ..Default::default()
-                    }),
-                    versioning_intent: Some(ProtoVersioningIntent::Compatible),
+                    retry_policy: Some(RetryPolicy::builder().maximum_attempts(5).build()),
+                    versioning_intent: Some(ProtoVersioningIntent::Compatible.into()),
                     initial_versioning_behavior: Some(
                         ContinueAsNewVersioningBehavior::UseRampingVersion,
                     ),
@@ -2487,10 +2452,15 @@ mod tests {
                 workflow_run_timeout: Some(Duration::from_secs(10).try_into().unwrap()),
                 workflow_task_timeout: Some(Duration::from_secs(3).try_into().unwrap()),
                 backoff_start_interval: Some(Duration::from_secs(4).try_into().unwrap()),
-                memo,
+                memo: HashMap::from([(
+                    "memo-key".to_string(),
+                    "memo-value".as_json_payload().unwrap(),
+                )]),
                 headers,
                 search_attributes: Some(proto_search_attributes),
-                retry_policy: Some(RetryPolicy {
+                retry_policy: Some(ProtoRetryPolicy {
+                    initial_interval: Some(Duration::from_secs(1).try_into().unwrap()),
+                    backoff_coefficient: 2.0,
                     maximum_attempts: 5,
                     ..Default::default()
                 }),
@@ -2596,7 +2566,7 @@ mod tests {
             workflow_type: "failing-workflow".to_string(),
             ..Default::default()
         };
-        let base = BaseWorkflowContext::new(
+        let base = BaseWorkflowContext::from_raw(
             "default".to_string(),
             "orig-task-queue".to_string(),
             "run-id".to_string(),
@@ -2617,6 +2587,31 @@ mod tests {
     }
 
     #[test]
+    fn continue_as_new_reports_memo_serialization_errors() {
+        let ctx = test_context();
+        let mut memo = MemoValues::new();
+        memo.insert("invalid", FailingMemoValue);
+
+        let err = ctx
+            .continue_as_new(
+                &7,
+                ContinueAsNewOptions {
+                    memo: Some(memo),
+                    ..Default::default()
+                },
+            )
+            .expect_err("memo serialization errors should be surfaced");
+
+        let WorkflowTermination::Failed(err) = err else {
+            panic!("expected failed termination, got {err:?}");
+        };
+        assert_eq!(
+            err.to_string(),
+            "Encoding error: memo serialization failure"
+        );
+    }
+
+    #[test]
     fn upsert_search_attributes_updates_local_state() {
         use temporalio_common_wasm::search_attributes::SearchAttributeKey;
 
@@ -2628,6 +2623,95 @@ mod tests {
         ctx.upsert_search_attributes([K.value_set(42)]);
         let attrs = ctx.search_attributes();
         assert_eq!(attrs.get(&K), Some(42));
+    }
+
+    #[test]
+    fn upsert_memo_updates_local_state_and_encodes_removals() {
+        let init = InitializeWorkflow {
+            workflow_type: TestWorkflow.name().to_string(),
+            memo: Some(ProtoMemo {
+                fields: HashMap::from([("old".to_string(), "before".as_json_payload().unwrap())]),
+            }),
+            ..Default::default()
+        };
+        let host = Rc::new(RecordingHost::default());
+        let base = BaseWorkflowContext::from_raw(
+            "default".to_string(),
+            "orig-task-queue".to_string(),
+            "run-id".to_string(),
+            init,
+            DataConverter::default(),
+            host.clone(),
+        );
+        let ctx = WorkflowContext::from_base(base, Rc::new(RefCell::new(TestWorkflow)));
+
+        assert_eq!(
+            ctx.memo().get::<String>("old").unwrap(),
+            Some("before".to_string())
+        );
+        ctx.upsert_memo([("new", Some(MemoValue::new(42_u32))), ("old", None)])
+            .unwrap();
+
+        let current = ctx.memo();
+        assert_eq!(current.get::<u32>("new").unwrap(), Some(42));
+        assert_eq!(current.get::<String>("old").unwrap(), None);
+        let view = ctx.view();
+        assert_eq!(view.memo().get::<u32>("new").unwrap(), Some(42));
+        assert_eq!(
+            view.memo().raw(),
+            view.raw()
+                .memo
+                .as_ref()
+                .expect("view memo should be present")
+        );
+
+        let commands = host.commands.borrow();
+        let [command] = commands.as_slice() else {
+            panic!("expected one modify-properties command");
+        };
+        let Some(workflow_command::Variant::ModifyWorkflowProperties(command)) = &command.variant
+        else {
+            panic!("expected a modify-properties command");
+        };
+        let fields = &command.upserted_memo.as_ref().unwrap().fields;
+        let payload_converter = PayloadConverter::default();
+        let removal_payload = MemoValue::new(()).to_payload(&payload_converter).unwrap();
+        assert_eq!(fields.get("old"), Some(&removal_payload));
+        assert_eq!(
+            u32::from_json_payload(fields.get("new").unwrap()).unwrap(),
+            42
+        );
+    }
+
+    #[test]
+    fn upsert_memo_conversion_failure_does_not_mutate_or_emit_command() {
+        let host = Rc::new(RecordingHost::default());
+        let init = InitializeWorkflow {
+            workflow_type: TestWorkflow.name().to_string(),
+            ..Default::default()
+        };
+        let base = BaseWorkflowContext::from_raw(
+            "default".to_string(),
+            "orig-task-queue".to_string(),
+            "run-id".to_string(),
+            init,
+            DataConverter::default(),
+            host.clone(),
+        );
+        let ctx = WorkflowContext::from_base(base, Rc::new(RefCell::new(TestWorkflow)));
+        let err = ctx
+            .upsert_memo([
+                ("valid", Some(MemoValue::new("value".to_string()))),
+                ("invalid", Some(MemoValue::new(FailingMemoValue))),
+            ])
+            .unwrap_err();
+
+        assert_eq!(
+            err.to_string(),
+            "Encoding error: memo serialization failure"
+        );
+        assert_eq!(ctx.memo().get::<String>("valid").unwrap(), None);
+        assert!(host.commands.borrow().is_empty());
     }
 
     #[test]
@@ -2671,7 +2755,7 @@ mod tests {
             search_attributes: Some(init_sa),
             ..Default::default()
         };
-        let base = BaseWorkflowContext::new(
+        let base = BaseWorkflowContext::from_raw(
             "default".to_string(),
             "tq".to_string(),
             "run-id".to_string(),
@@ -2701,7 +2785,7 @@ mod tests {
             search_attributes: Some(init_sa),
             ..Default::default()
         };
-        let base = BaseWorkflowContext::new(
+        let base = BaseWorkflowContext::from_raw(
             "default".to_string(),
             "tq".to_string(),
             "run-id".to_string(),
@@ -2713,8 +2797,32 @@ mod tests {
 
         let view = ctx.view();
         let sa = view
-            .search_attributes
+            .search_attributes()
             .expect("should have search attributes");
         assert_eq!(sa.get(&K), Some(true));
+    }
+
+    #[test]
+    fn workflow_info_retains_raw_initialization() {
+        let init = InitializeWorkflow {
+            workflow_type: TestWorkflow.name().to_string(),
+            identity: "raw-only-identity".to_owned(),
+            ..Default::default()
+        };
+        let expected = init.clone();
+        let base = BaseWorkflowContext::from_raw(
+            "default".to_string(),
+            "tq".to_string(),
+            "run-id".to_string(),
+            init,
+            DataConverter::default(),
+            Rc::new(NoopHost),
+        );
+        let ctx = WorkflowContext::from_base(base, Rc::new(RefCell::new(TestWorkflow)));
+        let info = ctx.info();
+
+        assert_eq!(info.raw().identity, "raw-only-identity");
+        assert_eq!(info.raw(), &expected);
+        assert_eq!(info.into_raw(), expected);
     }
 }

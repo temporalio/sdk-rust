@@ -11,7 +11,7 @@ use temporalio_common::{
         coresdk::{
             AsJsonPayloadExt,
             child_workflow::{
-                ChildWorkflowCancellationType, ParentClosePolicy,
+                ChildWorkflowCancellationType as ProtoChildWorkflowCancellationType,
                 StartChildWorkflowExecutionFailedCause,
             },
             workflow_activation::{WorkflowActivationJob, workflow_activation_job},
@@ -34,8 +34,9 @@ use temporalio_common::{
 };
 use temporalio_macros::{workflow, workflow_methods};
 use temporalio_sdk::{
-    CancellableFuture, ChildWorkflowExecutionError, ChildWorkflowOptions, ChildWorkflowStartError,
-    SyncWorkflowContext, WorkflowContext, WorkflowResult, WorkflowSignalError, WorkflowTermination,
+    CancellableFuture, ChildWorkflowCancellationType, ChildWorkflowExecutionError,
+    ChildWorkflowOptions, ChildWorkflowStartError, ParentClosePolicy, SyncWorkflowContext,
+    WorkflowContext, WorkflowResult, WorkflowSignalError, WorkflowTermination,
 };
 use temporalio_sdk_core::{
     replay::{DEFAULT_WORKFLOW_TYPE, TestHistoryBuilder, canned_histories},
@@ -58,17 +59,10 @@ struct ChildWf;
 impl ChildWf {
     #[run(name = "child_wf")]
     async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<()> {
+        let info = ctx.info();
         assert_eq!(
-            ctx.workflow_initial_info()
-                .parent_workflow_info
-                .as_ref()
-                .unwrap()
-                .workflow_id,
-            ctx.workflow_initial_info()
-                .root_workflow
-                .as_ref()
-                .unwrap()
-                .workflow_id
+            info.parent().as_ref().unwrap().workflow_id(),
+            info.root().as_ref().unwrap().workflow_id()
         );
         Ok(())
     }
@@ -636,13 +630,11 @@ impl GrandchildCancellationWf {
             panic!("child should fail with a child-workflow failure");
         };
         assert_eq!(
-            failure
-                .workflow_execution()
-                .map(|wf| wf.workflow_id.as_str()),
+            failure.workflow_execution().map(|wf| wf.workflow_id()),
             Some(child_workflow_id.as_str())
         );
         assert_eq!(
-            failure.workflow_type().map(|wf| wf.name.as_str()),
+            failure.workflow_type(),
             Some("child_propagates_cancellation")
         );
         let grandchild_workflow_id = format!("{}-grandchild", ctx.task_queue());
@@ -653,15 +645,10 @@ impl GrandchildCancellationWf {
         assert_eq!(
             grandchild_failure
                 .workflow_execution()
-                .map(|wf| wf.workflow_id.as_str()),
+                .map(|wf| wf.workflow_id()),
             Some(grandchild_workflow_id.as_str())
         );
-        assert_eq!(
-            grandchild_failure
-                .workflow_type()
-                .map(|wf| wf.name.as_str()),
-            Some("grandchild_wf")
-        );
+        assert_eq!(grandchild_failure.workflow_type(), Some("grandchild_wf"));
         let Some(cancelled) = grandchild_failure.as_cancelled() else {
             panic!("grandchild failure should retain the cancelled reason");
         };
@@ -947,15 +934,10 @@ impl ParentWf {
             (Expectation::Success, Ok(_)) => Ok(()),
             (Expectation::Failure, Err(ChildWorkflowExecutionError::Failed(failure))) => {
                 assert_eq!(
-                    failure
-                        .workflow_execution()
-                        .map(|wf| wf.workflow_id.as_str()),
+                    failure.workflow_execution().map(|wf| wf.workflow_id()),
                     Some("child-id-1")
                 );
-                assert_eq!(
-                    failure.workflow_type().map(|wf| wf.name.as_str()),
-                    Some("child")
-                );
+                assert_eq!(failure.workflow_type(), Some("child"));
                 Ok(())
             }
             _ => Err(anyhow!("Unexpected child WF status").into()),
@@ -1106,7 +1088,7 @@ async fn cancel_child_before_started_event() {
             seq: 1,
             workflow_id: "child-id-1".to_string(),
             workflow_type: "child".to_string(),
-            cancellation_type: ChildWorkflowCancellationType::WaitCancellationCompleted as i32,
+            cancellation_type: ProtoChildWorkflowCancellationType::WaitCancellationCompleted as i32,
             ..Default::default()
         }
         .into(),

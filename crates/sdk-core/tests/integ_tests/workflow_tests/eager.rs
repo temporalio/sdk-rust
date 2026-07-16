@@ -114,7 +114,7 @@ pub(crate) async fn eager_start(
                 search_attributes: options.search_attributes.map(|d| d.into_proto()),
                 cron_schedule: options.cron_schedule.unwrap_or_default(),
                 request_eager_execution: options.enable_eager_workflow_start,
-                retry_policy: options.retry_policy,
+                retry_policy: options.retry_policy.map(Into::into),
                 links: options.links,
                 completion_callbacks: options.completion_callbacks,
                 priority: Some(options.priority.into()),

@@ -61,6 +61,36 @@ to docs, or any other relevant information.
   `ScheduleDescription::search_attributes`, and `ScheduleSummary::search_attributes` now return
   typed `SearchAttributes` instead of raw proto search attributes. Missing search attributes are
   returned as an empty collection instead of `None`.
+* Activity and child-workflow failure metadata now exposes activity and workflow type names as
+  strings, and workflow executions as the Rust-native `WorkflowExecution` type. `ActivityInfo`
+  uses the same Rust-native workflow execution type.
+* Workflow status accessors and query rejection errors now use the Rust-native
+  `WorkflowExecutionStatus` enum instead of generated protobuf types.
+* Activity, child-workflow, and timeout errors now expose Rust-native `RetryState` and
+  `TimeoutType` enums instead of generated protobuf enums.
+* Workflow and worker options now use Rust-native cancellation, parent-close, workflow-ID reuse,
+  versioning, and Nexus cancellation policy enums instead of generated protobuf enums.
+* Child workflow cancellation now defaults to `WaitCancellationCompleted` instead of `Abandon`,
+  aligning Rust with the Core-based SDKs and Java. Set `ChildWorkflowCancellationType::Abandon`
+  explicitly to retain the previous behavior.
+* Workflow and activity retry configuration and runtime information now use the Rust-native
+  `RetryPolicy` type instead of the generated protobuf message.
+* Workflow result failures now expose decoded `IncomingError` values, and cancellation and
+  termination details use typed `WorkflowResultDetails` instead of raw payloads.
+* Async activity completion, failure, cancellation, and heartbeat methods now convert typed Rust
+  values with the client's data converter. Activity heartbeat details are exposed through the
+  typed `ActivityHeartbeatDetails` wrapper.
+* Workflow and schedule list/description memo accessors now return the typed `Memo` wrapper
+  instead of raw protobuf memos.
+* Workflow memo reads use the typed `Memo` collection. Upserts accept maps of optional
+  `MemoValue`s, where `None` removes a key, and continue-as-new memo replacements use
+  `MemoValues`.
+* Removed the raw-protobuf `Namespace::into_describe_namespace_request` and
+  `WorkerTaskTypes::to_task_queue_types` helpers. These conversions are now internal plumbing.
+* `WorkflowContext::workflow_initial_info` and its synchronous counterpart are replaced by
+  `info()`, which returns the Rust-native `WorkflowContextView` and includes typed workflow
+  priority. The internal `BaseWorkflowContext::new` raw-protobuf boundary is now explicitly named
+  `from_raw`.
 
 ### Fixed
 * Workflow tasks no longer livelock when a burst of ready async operations exhausts Tokio's
