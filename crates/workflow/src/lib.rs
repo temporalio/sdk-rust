@@ -35,6 +35,8 @@ pub use temporalio_common_wasm::{
         TimeoutType, WorkflowSignalError,
     },
 };
+#[doc(hidden)]
+pub use workflow_context::PatchActivationCaller;
 pub use workflow_context::{
     ActivityCancellationType, ActivityCloseTimeouts, ActivityOptions, BaseWorkflowContext,
     CancellableFuture, ChildWorkflowCancellationType, ChildWorkflowOptions, ContinueAsNewOptions,

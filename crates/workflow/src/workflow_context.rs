@@ -103,20 +103,47 @@ pub struct PatchActivationInput {
     pub patch_id: String,
 }
 
-impl PatchActivationInput {
-    /// Create callback input from a workflow information snapshot and patch ID.
-    #[doc(hidden)]
-    pub fn new(workflow_info: WorkflowContextView, patch_id: String) -> Self {
-        Self {
-            workflow_info,
-            patch_id,
-        }
-    }
-}
-
 /// Callback that decides whether a newly encountered patch should be activated.
 pub type PatchActivationCallback =
     Arc<dyn Fn(PatchActivationInput) -> bool + Send + Sync + 'static>;
+
+/// Invokes a patch activation callback with a workflow information snapshot.
+#[doc(hidden)]
+pub struct PatchActivationCaller {
+    callback: PatchActivationCallback,
+    workflow_info: WorkflowContextView,
+}
+
+impl PatchActivationCaller {
+    /// Creates a caller from workflow initialization data.
+    pub fn new(
+        callback: PatchActivationCallback,
+        namespace: String,
+        task_queue: String,
+        run_id: String,
+        init: InitializeWorkflow,
+        payload_converter: PayloadConverter,
+    ) -> Self {
+        Self {
+            callback,
+            workflow_info: WorkflowContextView::new(
+                namespace,
+                task_queue,
+                run_id,
+                init,
+                payload_converter,
+            ),
+        }
+    }
+
+    /// Invokes the callback for a patch ID.
+    pub fn call(&self, patch_id: String) -> bool {
+        (self.callback)(PatchActivationInput {
+            workflow_info: self.workflow_info.clone(),
+            patch_id,
+        })
+    }
+}
 
 impl BaseWorkflowContext {
     pub(crate) fn apply_activation_context(&self, activation: &CoreWorkflowActivation) {
@@ -899,10 +926,10 @@ impl<W> SyncWorkflowContext<W> {
         let res = if deprecated || replaying || notified {
             !replaying || notified
         } else if let Some(callback) = &self.base.inner.patch_activation_callback {
-            callback(PatchActivationInput::new(
-                self.base.view(),
-                patch_id.to_string(),
-            ))
+            callback(PatchActivationInput {
+                workflow_info: self.base.view(),
+                patch_id: patch_id.to_string(),
+            })
         } else {
             true
         };
@@ -2436,7 +2463,7 @@ mod tests {
         };
         let host = Rc::new(RecordingHost::default());
         let commands = host.commands.clone();
-        let base = BaseWorkflowContext::new(
+        let base = BaseWorkflowContext::from_raw(
             "default".to_string(),
             "task-queue".to_string(),
             "run-id".to_string(),
@@ -2804,6 +2831,7 @@ mod tests {
             init,
             DataConverter::default(),
             host.clone(),
+            None,
         );
         let ctx = WorkflowContext::from_base(base, Rc::new(RefCell::new(TestWorkflow)));
 
@@ -2859,6 +2887,7 @@ mod tests {
             init,
             DataConverter::default(),
             host.clone(),
+            None,
         );
         let ctx = WorkflowContext::from_base(base, Rc::new(RefCell::new(TestWorkflow)));
         let err = ctx
@@ -2981,6 +3010,7 @@ mod tests {
             init,
             DataConverter::default(),
             Rc::new(NoopHost),
+            None,
         );
         let ctx = WorkflowContext::from_base(base, Rc::new(RefCell::new(TestWorkflow)));
         let info = ctx.info();

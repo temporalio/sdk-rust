@@ -186,7 +186,7 @@ fn workflow_input_parts(
     } = input;
     let payloads = init_workflow_job.arguments.clone();
     let payload_converter = data_converter.payload_converter().clone();
-    let base_ctx = BaseWorkflowContext::new(
+    let base_ctx = BaseWorkflowContext::from_raw(
         namespace,
         task_queue,
         run_id,

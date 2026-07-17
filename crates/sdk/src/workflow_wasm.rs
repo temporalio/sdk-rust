@@ -6,7 +6,7 @@ use temporalio_common::protos::{
     coresdk::workflow_commands::WorkflowCommand, temporal::api::failure::v1::Failure,
 };
 use temporalio_workflow::{
-    PatchActivationCallback, PatchActivationInput, WorkflowContextView,
+    PatchActivationCaller,
     runtime::{
         guest::WorkflowInstance,
         host::WorkflowHost,
@@ -191,32 +191,37 @@ impl CompiledWasmWorkflowModule {
     ) -> Result<Box<dyn WorkflowInstance>, anyhow::Error> {
         let mut linker = Linker::new(&self.engine);
         WorkflowModule::add_to_linker::<_, HasSelf<_>>(&mut linker, |data| data)?;
-        let patch_activation =
-            input
-                .patch_activation_callback
-                .clone()
-                .map(|callback| WasmPatchActivation {
-                    callback,
-                    workflow_info: WorkflowContextView::new(
-                        input.namespace.clone(),
-                        input.task_queue.clone(),
-                        input.run_id.clone(),
-                        input.init_workflow_job.clone(),
-                        input.data_converter.payload_converter().clone(),
-                    ),
-                });
+        let WorkflowExecutionInput {
+            namespace,
+            task_queue,
+            run_id,
+            init_workflow_job,
+            data_converter,
+            host,
+            patch_activation_callback,
+        } = input;
+        let workflow_init = wit_types::WorkflowInit {
+            namespace: namespace.clone(),
+            task_queue: task_queue.clone(),
+            run_id: run_id.clone(),
+            initialize_workflow: init_workflow_job.encode_to_vec(),
+        };
+        let patch_activation = patch_activation_callback.map(|callback| {
+            PatchActivationCaller::new(
+                callback,
+                namespace,
+                task_queue,
+                run_id,
+                init_workflow_job,
+                data_converter.payload_converter().clone(),
+            )
+        });
         let mut store = Store::new(
             &self.engine,
-            WasmWorkflowHostState::new(input.host.clone(), patch_activation),
+            WasmWorkflowHostState::new(host, patch_activation),
         );
         let module = WorkflowModule::instantiate(&mut store, &self.component, &linker)?;
         let guest = module.temporal_workflow_runtime_workflow_guest();
-        let workflow_init = wit_types::WorkflowInit {
-            namespace: input.namespace.clone(),
-            task_queue: input.task_queue.clone(),
-            run_id: input.run_id.clone(),
-            initialize_workflow: input.init_workflow_job.encode_to_vec(),
-        };
         let workflow_instance = guest
             .call_instantiate_workflow(&mut store, &workflow_init)
             .map_err(|err| {
@@ -367,16 +372,11 @@ impl WorkflowInstance for WasmWorkflowInstance {
 
 struct WasmWorkflowHostState {
     host: Rc<dyn WorkflowHost>,
-    patch_activation: Option<WasmPatchActivation>,
-}
-
-struct WasmPatchActivation {
-    callback: PatchActivationCallback,
-    workflow_info: WorkflowContextView,
+    patch_activation: Option<PatchActivationCaller>,
 }
 
 impl WasmWorkflowHostState {
-    fn new(host: Rc<dyn WorkflowHost>, patch_activation: Option<WasmPatchActivation>) -> Self {
+    fn new(host: Rc<dyn WorkflowHost>, patch_activation: Option<PatchActivationCaller>) -> Self {
         Self {
             host,
             patch_activation,
@@ -399,10 +399,7 @@ impl wit_host::Host for WasmWorkflowHostState {
         let Some(patch_activation) = &self.patch_activation else {
             return true;
         };
-        (patch_activation.callback)(PatchActivationInput::new(
-            patch_activation.workflow_info.clone(),
-            patch_id,
-        ))
+        patch_activation.call(patch_id)
     }
 }
 
