@@ -216,7 +216,7 @@ jobs:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - uses: ./.github/actions/setup
         with:
-          mise-install-args: protoc aqua:temporalio/cli
+          mise-install-args: protoc github:temporalio/cli
       - name: Build examples
         run: cargo build --examples -p temporalio-sdk --features examples
       - name: Start Temporal dev server

@@ -3,7 +3,7 @@ description: 'Common setup: checkout, Rust toolchain, mise tools, PROTOC env, Ru
 
 inputs:
   mise-install-args:
-    description: 'Tools to install (e.g. "protoc" or "protoc aqua:temporalio/cli"). Empty installs all.'
+    description: 'Tools to install (e.g. "protoc" or "protoc github:temporalio/cli"). Empty installs all.'
     required: false
     default: ''
   rust-cache-key:
