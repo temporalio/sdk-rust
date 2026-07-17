@@ -3,11 +3,7 @@ use crate::{
     grpc::IsUserLongPoll,
     request_extensions::{IsWorkerTaskLongPoll, NoRetryOnMatching, RetryConfigForCall},
 };
-use backoff::{
-    Clock, SystemClock,
-    backoff::Backoff,
-    exponential::{self, ExponentialBackoff},
-};
+use backon::{BackoffBuilder, ExponentialBuilder};
 use futures_retry::{ErrorHandler, FutureRetry, RetryPolicy};
 use std::{
     error::Error,
@@ -131,30 +127,26 @@ impl RetryOptions {
         }
     }
 
-    pub(crate) fn into_exp_backoff<C>(self, clock: C) -> exponential::ExponentialBackoff<C> {
-        exponential::ExponentialBackoff {
-            current_interval: self.initial_interval,
-            initial_interval: self.initial_interval,
+    fn jittered_backoff(&self) -> JitteredBackoff {
+        let inner = ExponentialBuilder::new()
+            .with_min_delay(self.initial_interval)
+            .with_factor(self.multiplier as f32)
+            .with_max_delay(self.max_interval)
+            .without_max_times()
+            .build();
+        JitteredBackoff {
+            inner,
             randomization_factor: self.randomization_factor,
-            multiplier: self.multiplier,
-            max_interval: self.max_interval,
             max_elapsed_time: self.max_elapsed_time,
-            clock,
-            start_time: Instant::now(),
+            started_at: Instant::now(),
         }
-    }
-}
-
-impl From<RetryOptions> for backoff::ExponentialBackoff {
-    fn from(c: RetryOptions) -> Self {
-        c.into_exp_backoff(SystemClock::default())
     }
 }
 
 pub(crate) fn make_future_retry<R, F, Fut>(
     info: CallInfo,
     factory: F,
-) -> FutureRetry<F, TonicErrorHandler<SystemClock>>
+) -> FutureRetry<F, TonicErrorHandler>
 where
     F: FnMut() -> Fut + Unpin,
     Fut: Future<Output = Result<R, tonic::Status>>,
@@ -165,41 +157,67 @@ where
     )
 }
 
+#[doc(hidden)]
+pub fn jittered(base: Duration, randomization_factor: f64) -> Duration {
+    if randomization_factor <= 0.0 {
+        return base;
+    }
+    // Reproduce the `backoff` crate's documented jitter for backward compatibility:
+    //   randomized interval = retry_interval * (random value in range [1 - randomization_factor, 1 + randomization_factor])
+    // Docs: https://github.com/ihrwein/backoff/blob/587e2da8fb2dcfc65ca544cb9249022c51f1406e/src/lib.rs#L4
+    // Algorithm (`get_random_value_from_interval`): https://github.com/ihrwein/backoff/blob/587e2da8fb2dcfc65ca544cb9249022c51f1406e/src/exponential.rs#L61
+    let base_secs = base.as_secs_f64();
+    let spread = randomization_factor * base_secs;
+    let offset = spread * (2.0 * rand::random::<f64>() - 1.0);
+    Duration::try_from_secs_f64((base_secs + offset).max(0.0)).unwrap_or(base)
+}
+
 #[derive(Debug)]
-pub(crate) struct TonicErrorHandler<C: Clock> {
-    backoff: ExponentialBackoff<C>,
-    throttle_backoff: ExponentialBackoff<C>,
+struct JitteredBackoff {
+    inner: backon::ExponentialBackoff,
+    randomization_factor: f64,
+    max_elapsed_time: Option<Duration>,
+    started_at: Instant,
+}
+
+impl JitteredBackoff {
+    fn next_backoff(&mut self) -> Option<Duration> {
+        // `inner` never stops on its own; the total retry budget is enforced here
+        // against wall-clock time so the jittered delay we actually return is what
+        // counts toward `max_elapsed_time`.
+        let base = self.inner.next()?;
+        let delay = jittered(base, self.randomization_factor);
+        if let Some(max_elapsed_time) = self.max_elapsed_time
+            && self.started_at.elapsed() + delay > max_elapsed_time
+        {
+            return None;
+        }
+        Some(delay)
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct TonicErrorHandler {
+    backoff: JitteredBackoff,
+    throttle_backoff: JitteredBackoff,
+    max_interval: Duration,
+    retry_started_at: Instant,
     max_retries: usize,
     call_type: CallType,
     call_name: &'static str,
     retry_short_circuit: Option<NoRetryOnMatching>,
 }
-impl TonicErrorHandler<SystemClock> {
+
+impl TonicErrorHandler {
     fn new(call_info: CallInfo, throttle_cfg: RetryOptions) -> Self {
-        Self::new_with_clock(
-            call_info,
-            throttle_cfg,
-            SystemClock::default(),
-            SystemClock::default(),
-        )
-    }
-}
-impl<C> TonicErrorHandler<C>
-where
-    C: Clock,
-{
-    fn new_with_clock(
-        call_info: CallInfo,
-        throttle_cfg: RetryOptions,
-        clock: C,
-        throttle_clock: C,
-    ) -> Self {
         Self {
             call_type: call_info.call_type,
             call_name: call_info.call_name,
             max_retries: call_info.retry_cfg.max_retries,
-            backoff: call_info.retry_cfg.into_exp_backoff(clock),
-            throttle_backoff: throttle_cfg.into_exp_backoff(throttle_clock),
+            max_interval: call_info.retry_cfg.max_interval,
+            backoff: call_info.retry_cfg.jittered_backoff(),
+            throttle_backoff: throttle_cfg.jittered_backoff(),
+            retry_started_at: Instant::now(),
             retry_short_circuit: call_info.retry_short_circuit,
         }
     }
@@ -250,10 +268,7 @@ impl CallType {
     }
 }
 
-impl<C> ErrorHandler<tonic::Status> for TonicErrorHandler<C>
-where
-    C: Clock,
-{
+impl ErrorHandler<tonic::Status> for TonicErrorHandler {
     type OutError = tonic::Status;
 
     fn handle(
@@ -331,11 +346,11 @@ where
                 }
             }
         } else if self.call_type == CallType::TaskLongPoll
-            && self.backoff.get_elapsed_time() <= LONG_POLL_FATAL_GRACE
+            && self.retry_started_at.elapsed() <= LONG_POLL_FATAL_GRACE
         {
             // We permit "fatal" errors while long polling for a while, because some proxies return
             // stupid error codes while getting ready, among other weird infra issues
-            RetryPolicy::WaitRetry(self.backoff.max_interval)
+            RetryPolicy::WaitRetry(self.max_interval)
         } else {
             RetryPolicy::ForwardError(e)
         }
@@ -359,8 +374,7 @@ fn is_transport_cancelled(status: &tonic::Status) -> bool {
 mod tests {
     use super::*;
     use assert_matches::assert_matches;
-    use backoff::Clock;
-    use std::{ops::Add, time::Instant};
+    use std::time::Instant;
     use temporalio_common::protos::temporal::api::workflowservice::v1::{
         PollActivityTaskQueueRequest, PollNexusTaskQueueRequest, PollWorkflowTaskQueueRequest,
     };
@@ -380,13 +394,6 @@ mod tests {
     const POLL_ACTIVITY_METH_NAME: &str = "poll_activity_task_queue";
     const POLL_NEXUS_METH_NAME: &str = "poll_nexus_task_queue";
 
-    struct FixedClock(Instant);
-    impl Clock for FixedClock {
-        fn now(&self) -> Instant {
-            self.0
-        }
-    }
-
     #[tokio::test]
     async fn long_poll_non_retryable_errors() {
         for code in [
@@ -399,7 +406,7 @@ mod tests {
             Code::Unimplemented,
         ] {
             for call_name in [POLL_WORKFLOW_METH_NAME, POLL_ACTIVITY_METH_NAME] {
-                let mut err_handler = TonicErrorHandler::new_with_clock(
+                let mut err_handler = TonicErrorHandler::new(
                     CallInfo {
                         call_type: CallType::TaskLongPoll,
                         call_name,
@@ -407,16 +414,11 @@ mod tests {
                         retry_short_circuit: None,
                     },
                     TEST_RETRY_CONFIG,
-                    FixedClock(Instant::now()),
-                    FixedClock(Instant::now()),
                 );
                 let result = err_handler.handle(1, Status::new(code, "Ahh"));
                 assert_matches!(result, RetryPolicy::WaitRetry(_));
-                err_handler.backoff.clock.0 = err_handler
-                    .backoff
-                    .clock
-                    .0
-                    .add(LONG_POLL_FATAL_GRACE + Duration::from_secs(1));
+                err_handler.retry_started_at =
+                    Instant::now() - LONG_POLL_FATAL_GRACE - Duration::from_secs(1);
                 let result = err_handler.handle(2, Status::new(code, "Ahh"));
                 assert_matches!(result, RetryPolicy::ForwardError(_));
             }
@@ -427,7 +429,7 @@ mod tests {
     async fn long_poll_retryable_errors_never_fatal() {
         for code in RETRYABLE_ERROR_CODES {
             for call_name in [POLL_WORKFLOW_METH_NAME, POLL_ACTIVITY_METH_NAME] {
-                let mut err_handler = TonicErrorHandler::new_with_clock(
+                let mut err_handler = TonicErrorHandler::new(
                     CallInfo {
                         call_type: CallType::TaskLongPoll,
                         call_name,
@@ -435,16 +437,11 @@ mod tests {
                         retry_short_circuit: None,
                     },
                     TEST_RETRY_CONFIG,
-                    FixedClock(Instant::now()),
-                    FixedClock(Instant::now()),
                 );
                 let result = err_handler.handle(1, Status::new(code, "Ahh"));
                 assert_matches!(result, RetryPolicy::WaitRetry(_));
-                err_handler.backoff.clock.0 = err_handler
-                    .backoff
-                    .clock
-                    .0
-                    .add(LONG_POLL_FATAL_GRACE + Duration::from_secs(1));
+                err_handler.retry_started_at =
+                    Instant::now() - LONG_POLL_FATAL_GRACE - Duration::from_secs(1);
                 let result = err_handler.handle(2, Status::new(code, "Ahh"));
                 assert_matches!(result, RetryPolicy::WaitRetry(_));
             }
@@ -453,7 +450,7 @@ mod tests {
 
     #[tokio::test]
     async fn retry_resource_exhausted() {
-        let mut err_handler = TonicErrorHandler::new_with_clock(
+        let mut err_handler = TonicErrorHandler::new(
             CallInfo {
                 call_type: CallType::TaskLongPoll,
                 call_name: POLL_WORKFLOW_METH_NAME,
@@ -468,20 +465,12 @@ mod tests {
                 max_elapsed_time: None,
                 max_retries: 10,
             },
-            FixedClock(Instant::now()),
-            FixedClock(Instant::now()),
         );
         let result = err_handler.handle(1, Status::new(Code::ResourceExhausted, "leave me alone"));
         match result {
             RetryPolicy::WaitRetry(duration) => assert_eq!(duration, Duration::from_millis(2)),
             _ => panic!(),
         }
-        err_handler.backoff.clock.0 = err_handler.backoff.clock.0.add(Duration::from_millis(10));
-        err_handler.throttle_backoff.clock.0 = err_handler
-            .throttle_backoff
-            .clock
-            .0
-            .add(Duration::from_millis(10));
         let result = err_handler.handle(2, Status::new(Code::ResourceExhausted, "leave me alone"));
         match result {
             RetryPolicy::WaitRetry(duration) => assert_eq!(duration, Duration::from_millis(8)),
@@ -491,7 +480,7 @@ mod tests {
 
     #[tokio::test]
     async fn retry_short_circuit() {
-        let mut err_handler = TonicErrorHandler::new_with_clock(
+        let mut err_handler = TonicErrorHandler::new(
             CallInfo {
                 call_type: CallType::TaskLongPoll,
                 call_name: POLL_WORKFLOW_METH_NAME,
@@ -501,8 +490,6 @@ mod tests {
                 }),
             },
             TEST_RETRY_CONFIG,
-            FixedClock(Instant::now()),
-            FixedClock(Instant::now()),
         );
         let result = err_handler.handle(1, Status::new(Code::ResourceExhausted, "leave me alone"));
         let e = assert_matches!(result, RetryPolicy::ForwardError(e) => e);
@@ -515,7 +502,7 @@ mod tests {
 
     #[tokio::test]
     async fn message_too_large_not_retried() {
-        let mut err_handler = TonicErrorHandler::new_with_clock(
+        let mut err_handler = TonicErrorHandler::new(
             CallInfo {
                 call_type: CallType::TaskLongPoll,
                 call_name: POLL_WORKFLOW_METH_NAME,
@@ -523,8 +510,6 @@ mod tests {
                 retry_short_circuit: None,
             },
             TEST_RETRY_CONFIG,
-            FixedClock(Instant::now()),
-            FixedClock(Instant::now()),
         );
         let result = err_handler.handle(
             1,
@@ -625,7 +610,7 @@ mod tests {
     async fn plain_cancelled_not_retried_on_normal_call() {
         // A plain Code::Cancelled (no transport error in source chain) on a Normal call
         // must NOT be retried — this is spec-correct behavior for application-level cancels.
-        let mut err_handler = TonicErrorHandler::new_with_clock(
+        let mut err_handler = TonicErrorHandler::new(
             CallInfo {
                 call_type: CallType::Normal,
                 call_name: "respond_activity_task_completed",
@@ -633,8 +618,6 @@ mod tests {
                 retry_short_circuit: None,
             },
             TEST_RETRY_CONFIG,
-            FixedClock(Instant::now()),
-            FixedClock(Instant::now()),
         );
         let result = err_handler.handle(1, Status::new(Code::Cancelled, "caller cancelled"));
         assert_matches!(result, RetryPolicy::ForwardError(_));
@@ -660,7 +643,7 @@ mod tests {
         // For this test, we verify through the `handle` method that a transport-sourced
         // Cancelled status (created via from_error, which sets Code::Unknown but preserves
         // the transport source chain) IS retried multiple times on the standard budget.
-        let mut err_handler = TonicErrorHandler::new_with_clock(
+        let mut err_handler = TonicErrorHandler::new(
             CallInfo {
                 call_type: CallType::Normal,
                 call_name: "respond_activity_task_completed",
@@ -668,8 +651,6 @@ mod tests {
                 retry_short_circuit: None,
             },
             TEST_RETRY_CONFIG,
-            FixedClock(Instant::now()),
-            FixedClock(Instant::now()),
         );
 
         // Code::Unknown with a transport source IS retried (it's in RETRYABLE_ERROR_CODES)

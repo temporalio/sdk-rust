@@ -42,6 +42,12 @@ to docs, or any other relevant information.
   and then kept running (e.g. parked on a `wait_condition`) would fail its workflow task whenever it
   was replayed — breaking queries and durable recovery for that execution.
 
+### Security
+* Replaced the unmaintained `backoff` dependency with `backon` for exponential retry and poll
+  backoff, clearing [RUSTSEC-2025-0012](https://rustsec.org/advisories/RUSTSEC-2025-0012) from
+  downstream security audits. Retry timing is preserved: exponential growth,
+  `randomization_factor` jitter, and the total retry-time budget behave as before.
+
 ### Breaking Changes
 * The `ActivityContext` constructor now requires `ClientOptions`.
 ### Breaking Changes

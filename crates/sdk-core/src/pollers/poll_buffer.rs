@@ -9,7 +9,7 @@ use crate::{
         },
     },
 };
-use backoff::{SystemClock, backoff::Backoff, exponential::ExponentialBackoff};
+use backon::{BackoffBuilder, ExponentialBuilder};
 use crossbeam_utils::atomic::AtomicCell;
 use futures_util::{FutureExt, StreamExt, future::BoxFuture};
 use std::{
@@ -23,7 +23,7 @@ use std::{
     time::{Duration, Instant, SystemTime},
 };
 use temporalio_client::{
-    ERROR_RETURNED_DUE_TO_SHORT_CIRCUIT, request_extensions::NoRetryOnMatching,
+    ERROR_RETURNED_DUE_TO_SHORT_CIRCUIT, jittered, request_extensions::NoRetryOnMatching,
 };
 use temporalio_common::protos::temporal::api::{
     taskqueue::v1::PollerScalingDecision,
@@ -43,6 +43,22 @@ use tokio_stream::wrappers::UnboundedReceiverStream;
 use tokio_util::sync::CancellationToken;
 use tonic::Code;
 use tracing::Instrument;
+
+// Mirror the retry client's `RetryOptions::task_poll_retry_policy` and
+// `throttle_retry_policy` so poller autoscaling backs off on the same schedule.
+// Jitter is applied via `jittered` rather than backon's `with_jitter` to keep the
+// symmetric +/- factor behavior the retry client uses.
+const POLL_BACKOFF_RANDOMIZATION: f64 = 0.2;
+const TASK_POLL_BACKOFF: ExponentialBuilder = ExponentialBuilder::new()
+    .with_min_delay(Duration::from_millis(200))
+    .with_factor(2.0)
+    .with_max_delay(Duration::from_secs(10))
+    .without_max_times();
+const THROTTLE_POLL_BACKOFF: ExponentialBuilder = ExponentialBuilder::new()
+    .with_min_delay(Duration::from_secs(1))
+    .with_factor(2.0)
+    .with_max_delay(Duration::from_secs(10))
+    .without_max_times();
 
 type PollReceiver<T, SK> =
     Mutex<UnboundedReceiver<pollers::Result<(T, OwnedMeteredSemPermit<SK>)>>>;
@@ -534,28 +550,8 @@ where
             ingested_last_period: Default::default(),
             scale_up_allowed: AtomicBool::new(true),
             last_successful_poll_time,
-            exponential_backoff: parking_lot::Mutex::new(ExponentialBackoff {
-                // Copied from RetryOptions::task_poll_retry_policy()
-                current_interval: Duration::from_millis(200),
-                initial_interval: Duration::from_millis(200),
-                randomization_factor: 0.2,
-                multiplier: 2.0,
-                max_interval: Duration::from_secs(10),
-                max_elapsed_time: None,
-                clock: SystemClock::default(),
-                start_time: std::time::Instant::now(),
-            }),
-            resource_exhausted_backoff: parking_lot::Mutex::new(ExponentialBackoff {
-                // Copied from RetryOptions::throttle_retry_policy()
-                current_interval: Duration::from_secs(1),
-                initial_interval: Duration::from_secs(1),
-                randomization_factor: 0.2,
-                multiplier: 2.0,
-                max_interval: Duration::from_secs(10),
-                max_elapsed_time: None,
-                clock: SystemClock::default(),
-                start_time: std::time::Instant::now(),
-            }),
+            exponential_backoff: parking_lot::Mutex::new(TASK_POLL_BACKOFF.build()),
+            resource_exhausted_backoff: parking_lot::Mutex::new(THROTTLE_POLL_BACKOFF.build()),
         });
         let rhc = report_handle.clone();
         let ingestor_task = if behavior.is_autoscaling() {
@@ -622,8 +618,8 @@ struct PollScalerReportHandle {
     last_successful_poll_time: Arc<AtomicCell<Option<SystemTime>>>,
 
     // Exponential backoff for normal errors and resource exhausted errors
-    exponential_backoff: parking_lot::Mutex<ExponentialBackoff<SystemClock>>,
-    resource_exhausted_backoff: parking_lot::Mutex<ExponentialBackoff<SystemClock>>,
+    exponential_backoff: parking_lot::Mutex<backon::ExponentialBackoff>,
+    resource_exhausted_backoff: parking_lot::Mutex<backon::ExponentialBackoff>,
 }
 
 impl PollScalerReportHandle {
@@ -640,8 +636,8 @@ impl PollScalerReportHandle {
                     .store(Some(SystemTime::now()));
 
                 // Reset backoff on successful poll
-                self.exponential_backoff.lock().reset();
-                self.resource_exhausted_backoff.lock().reset();
+                *self.exponential_backoff.lock() = TASK_POLL_BACKOFF.build();
+                *self.resource_exhausted_backoff.lock() = THROTTLE_POLL_BACKOFF.build();
 
                 if let PollerBehavior::SimpleMaximum(_) = self.behavior {
                     // We don't do auto-scaling with the simple max
@@ -678,9 +674,17 @@ impl PollScalerReportHandle {
             Err(e) => {
                 if matches!(self.behavior, PollerBehavior::Autoscaling { .. }) {
                     // Follow the same backoff logic as the retry client
-                    let mut backoff_duration = self.exponential_backoff.lock().next_backoff();
+                    let mut backoff_duration = self
+                        .exponential_backoff
+                        .lock()
+                        .next()
+                        .map(|d| jittered(d, POLL_BACKOFF_RANDOMIZATION));
                     if e.code() == Code::ResourceExhausted {
-                        backoff_duration = self.resource_exhausted_backoff.lock().next_backoff();
+                        backoff_duration = self
+                            .resource_exhausted_backoff
+                            .lock()
+                            .next()
+                            .map(|d| jittered(d, POLL_BACKOFF_RANDOMIZATION));
                     };
 
                     // Only propagate errors out if they weren't because of the short-circuiting
@@ -1280,8 +1284,8 @@ mod tests {
             ingested_last_period: Default::default(),
             scale_up_allowed: AtomicBool::new(true),
             last_successful_poll_time: Arc::new(AtomicCell::new(None)),
-            exponential_backoff: parking_lot::Mutex::new(ExponentialBackoff::default()),
-            resource_exhausted_backoff: parking_lot::Mutex::new(ExponentialBackoff::default()),
+            exponential_backoff: parking_lot::Mutex::new(TASK_POLL_BACKOFF.build()),
+            resource_exhausted_backoff: parking_lot::Mutex::new(THROTTLE_POLL_BACKOFF.build()),
         });
 
         for _ in 0..20 {

@@ -39,6 +39,8 @@ pub use crate::{
 pub use async_activity_handle::{
     ActivityHeartbeatResponse, ActivityIdentifier, AsyncActivityHandle,
 };
+#[doc(hidden)]
+pub use retry::jittered;
 
 pub use metrics::{LONG_REQUEST_LATENCY_HISTOGRAM_NAME, REQUEST_LATENCY_HISTOGRAM_NAME};
 pub use options_structs::*;

@@ -22,7 +22,7 @@ envconfig = ["temporalio-common/envconfig"]
 [dependencies]
 anyhow = "1.0"
 async-trait = "0.1"
-backoff = "0.4"
+backon = { version = "1.6", default-features = false }
 base64 = "0.22"
 bon = { version = "3", default-features = false, features = ["alloc"] }
 derive_more = { workspace = true }
