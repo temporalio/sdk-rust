@@ -10,14 +10,18 @@ use crate::{
         self, PollerBehavior,
         client::{
             MockWorkerClient,
-            mocks::{DEFAULT_TEST_CAPABILITIES, DEFAULT_WORKERS_REGISTRY, mock_worker_client},
+            mocks::{
+                DEFAULT_TEST_CAPABILITIES, DEFAULT_WORKERS_REGISTRY, MockManualWorkerClient,
+                mock_worker_client,
+            },
         },
     },
 };
-use futures_util::{stream, stream::StreamExt};
+use futures_util::{FutureExt, stream, stream::StreamExt};
 use std::{
     cell::RefCell,
     collections::HashMap,
+    future::{Future, poll_fn},
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -61,7 +65,7 @@ use temporalio_common::{
     },
     worker::WorkerTaskTypes,
 };
-use tokio::sync::{Barrier, Notify, watch};
+use tokio::sync::{Barrier, Notify, oneshot, watch};
 use uuid::Uuid;
 
 #[tokio::test]
@@ -1324,5 +1328,163 @@ async fn graceful_shutdown_sends_shutdown_worker_rpc_during_initiate() {
         "ShutdownWorker RPC must be called during initiate_shutdown"
     );
 
+    worker.finalize_shutdown().await;
+}
+
+fn worker_with_blocked_shutdown_rpc() -> (Arc<worker::Worker>, Arc<Barrier>, watch::Sender<bool>) {
+    let rpc_started = Arc::new(Barrier::new(2));
+    let rpc_started_for_client = rpc_started.clone();
+    let (release_rpc, release_rpc_rx) = watch::channel(false);
+
+    let mut mock_client = MockManualWorkerClient::new();
+    mock_client
+        .expect_capabilities()
+        .returning(|| Some(*DEFAULT_TEST_CAPABILITIES));
+    mock_client
+        .expect_workers()
+        .returning(|| DEFAULT_WORKERS_REGISTRY.clone());
+    mock_client.expect_is_mock().returning(|| true);
+    mock_client
+        .expect_sdk_name_and_version()
+        .returning(|| ("test-core".to_string(), "0.0.0".to_string()));
+    mock_client
+        .expect_identity()
+        .returning(|| "test-identity".to_string());
+    mock_client
+        .expect_worker_grouping_key()
+        .returning(Uuid::new_v4);
+    mock_client
+        .expect_worker_instance_key()
+        .returning(Uuid::new_v4);
+    mock_client
+        .expect_shutdown_worker()
+        .times(1)
+        .returning(move |_, _, _, _| {
+            let rpc_started = rpc_started_for_client.clone();
+            let mut release_rpc = release_rpc_rx.clone();
+            async move {
+                rpc_started.wait().await;
+                release_rpc.wait_for(|released| *released).await.unwrap();
+                Ok(ShutdownWorkerResponse {})
+            }
+            .boxed()
+        });
+
+    let mw = MockWorkerInputs::new(stream::pending().boxed());
+    let mut mocks = MocksHolder::from_mock_worker(mock_client, mw);
+    // No task managers are needed here, allowing an incorrectly unblocked shutdown caller to
+    // return immediately instead of being hidden by unrelated drain waits.
+    mocks.worker_cfg(|config| {
+        config.task_types = WorkerTaskTypes::nexus_only();
+    });
+    (Arc::new(mock_worker(mocks)), rpc_started, release_rpc)
+}
+
+#[tokio::test]
+async fn concurrent_shutdown_waits_for_shared_rpc_and_only_starts_once() {
+    let (worker, rpc_started, release_rpc) = worker_with_blocked_shutdown_rpc();
+    let start = Arc::new(Barrier::new(4));
+
+    let spawn_shutdown = |worker: Arc<worker::Worker>, start: Arc<Barrier>| {
+        let (first_poll_tx, first_poll_rx) = oneshot::channel();
+        let shutdown = tokio::spawn(async move {
+            start.wait().await;
+            let shutdown = worker.shutdown();
+            tokio::pin!(shutdown);
+            let mut first_poll_tx = Some(first_poll_tx);
+            poll_fn(|cx| {
+                let result = shutdown.as_mut().poll(cx);
+                if let Some(first_poll_tx) = first_poll_tx.take() {
+                    let _ = first_poll_tx.send(result.is_pending());
+                }
+                result
+            })
+            .await;
+        });
+        (shutdown, first_poll_rx)
+    };
+
+    let initiator = {
+        let worker = worker.clone();
+        let start = start.clone();
+        tokio::spawn(async move {
+            start.wait().await;
+            worker.initiate_shutdown();
+        })
+    };
+    let (shutdown_one, shutdown_one_first_poll) = spawn_shutdown(worker.clone(), start.clone());
+    let (shutdown_two, shutdown_two_first_poll) = spawn_shutdown(worker.clone(), start.clone());
+
+    start.wait().await;
+    tokio::time::timeout(Duration::from_secs(5), rpc_started.wait())
+        .await
+        .expect("shutdown RPC should start");
+    assert!(
+        shutdown_one_first_poll.await.unwrap(),
+        "first shutdown caller completed while the RPC was blocked"
+    );
+    assert!(
+        shutdown_two_first_poll.await.unwrap(),
+        "second shutdown caller completed while the RPC was blocked"
+    );
+
+    release_rpc.send(true).unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        shutdown_one.await.unwrap();
+        shutdown_two.await.unwrap();
+    })
+    .await
+    .expect("concurrent shutdown callers should complete after the RPC");
+
+    let worker = Arc::try_unwrap(worker).unwrap_or_else(|_| panic!("worker still shared"));
+    worker.finalize_shutdown().await;
+}
+
+#[tokio::test]
+async fn shutdown_waits_for_rpc_after_handle_owner_is_cancelled() {
+    let (worker, rpc_started, release_rpc) = worker_with_blocked_shutdown_rpc();
+
+    let first_shutdown = {
+        let worker = worker.clone();
+        tokio::spawn(async move {
+            worker.shutdown().await;
+        })
+    };
+    tokio::time::timeout(Duration::from_secs(5), rpc_started.wait())
+        .await
+        .expect("shutdown RPC should start");
+    first_shutdown.abort();
+    assert!(first_shutdown.await.unwrap_err().is_cancelled());
+
+    worker.initiate_shutdown();
+    let (replacement_first_poll_tx, replacement_first_poll_rx) = oneshot::channel();
+    let replacement_shutdown = {
+        let worker = worker.clone();
+        tokio::spawn(async move {
+            let shutdown = worker.shutdown();
+            tokio::pin!(shutdown);
+            let mut replacement_first_poll_tx = Some(replacement_first_poll_tx);
+            poll_fn(|cx| {
+                let result = shutdown.as_mut().poll(cx);
+                if let Some(replacement_first_poll_tx) = replacement_first_poll_tx.take() {
+                    let _ = replacement_first_poll_tx.send(result.is_pending());
+                }
+                result
+            })
+            .await;
+        })
+    };
+    assert!(
+        replacement_first_poll_rx.await.unwrap(),
+        "replacement shutdown completed while the original RPC was blocked"
+    );
+
+    release_rpc.send(true).unwrap();
+    tokio::time::timeout(Duration::from_secs(5), replacement_shutdown)
+        .await
+        .expect("replacement shutdown should complete after the RPC")
+        .unwrap();
+
+    let worker = Arc::try_unwrap(worker).unwrap_or_else(|_| panic!("worker still shared"));
     worker.finalize_shutdown().await;
 }
