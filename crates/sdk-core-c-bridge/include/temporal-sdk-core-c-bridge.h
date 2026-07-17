@@ -5,54 +5,59 @@
 #include <stdint.h>
 #include <stdlib.h>
 
+typedef enum TemporalCoreClientGrpcCompression {
+  TemporalCoreClientGrpcCompression_Gzip = 0,
+  TemporalCoreClientGrpcCompression_None = 1,
+} TemporalCoreClientGrpcCompression;
+
 typedef enum TemporalCoreRpcService {
-  Workflow = 1,
-  Operator,
-  Cloud,
-  Test,
-  Health,
+  TemporalCoreRpcService_Workflow = 1,
+  TemporalCoreRpcService_Operator,
+  TemporalCoreRpcService_Cloud,
+  TemporalCoreRpcService_Test,
+  TemporalCoreRpcService_Health,
 } TemporalCoreRpcService;
 
 typedef enum TemporalCoreMetricAttributeValueType {
-  String = 1,
-  Int,
-  Float,
-  Bool,
+  TemporalCoreMetricAttributeValueType_String = 1,
+  TemporalCoreMetricAttributeValueType_Int,
+  TemporalCoreMetricAttributeValueType_Float,
+  TemporalCoreMetricAttributeValueType_Bool,
 } TemporalCoreMetricAttributeValueType;
 
 typedef enum TemporalCoreMetricKind {
-  CounterInteger = 1,
-  HistogramInteger,
-  HistogramFloat,
-  HistogramDuration,
-  GaugeInteger,
-  GaugeFloat,
-  UpDownCounterInteger,
+  TemporalCoreMetricKind_CounterInteger = 1,
+  TemporalCoreMetricKind_HistogramInteger,
+  TemporalCoreMetricKind_HistogramFloat,
+  TemporalCoreMetricKind_HistogramDuration,
+  TemporalCoreMetricKind_GaugeInteger,
+  TemporalCoreMetricKind_GaugeFloat,
+  TemporalCoreMetricKind_UpDownCounterInteger,
 } TemporalCoreMetricKind;
 
 typedef enum TemporalCoreForwardedLogLevel {
-  Trace = 0,
-  Debug,
-  Info,
-  Warn,
-  Error,
+  TemporalCoreForwardedLogLevel_Trace = 0,
+  TemporalCoreForwardedLogLevel_Debug,
+  TemporalCoreForwardedLogLevel_Info,
+  TemporalCoreForwardedLogLevel_Warn,
+  TemporalCoreForwardedLogLevel_Error,
 } TemporalCoreForwardedLogLevel;
 
 typedef enum TemporalCoreOpenTelemetryMetricTemporality {
-  Cumulative = 1,
-  Delta,
+  TemporalCoreOpenTelemetryMetricTemporality_Cumulative = 1,
+  TemporalCoreOpenTelemetryMetricTemporality_Delta,
 } TemporalCoreOpenTelemetryMetricTemporality;
 
 typedef enum TemporalCoreOpenTelemetryProtocol {
-  Grpc = 1,
-  Http,
+  TemporalCoreOpenTelemetryProtocol_Grpc = 1,
+  TemporalCoreOpenTelemetryProtocol_Http,
 } TemporalCoreOpenTelemetryProtocol;
 
 typedef enum TemporalCoreSlotKindType {
-  WorkflowSlotKindType,
-  ActivitySlotKindType,
-  LocalActivitySlotKindType,
-  NexusSlotKindType,
+  TemporalCoreSlotKindType_WorkflowSlotKindType,
+  TemporalCoreSlotKindType_ActivitySlotKindType,
+  TemporalCoreSlotKindType_LocalActivitySlotKindType,
+  TemporalCoreSlotKindType_NexusSlotKindType,
 } TemporalCoreSlotKindType;
 
 typedef struct TemporalCoreCancellationToken TemporalCoreCancellationToken;
@@ -145,6 +150,13 @@ typedef struct TemporalCoreClientHttpConnectProxyOptions {
 typedef void (*TemporalCoreClientGrpcOverrideCallback)(struct TemporalCoreClientGrpcOverrideRequest *request,
                                                        void *user_data);
 
+typedef struct TemporalCoreClientDnsLoadBalancingOptions {
+  /**
+   * How often, in milliseconds, to re-resolve DNS.
+   */
+  uint64_t resolution_interval_millis;
+} TemporalCoreClientDnsLoadBalancingOptions;
+
 typedef struct TemporalCoreConnectionOptions {
   struct TemporalCoreByteArrayRef target_url;
   struct TemporalCoreByteArrayRef client_name;
@@ -172,6 +184,31 @@ typedef struct TemporalCoreConnectionOptions {
    * Optional user data passed to each callback call.
    */
   void *grpc_override_callback_user_data;
+  /**
+   * If non-null, DNS-based load balancing is enabled. When the target URL resolves to multiple
+   * addresses, requests are distributed across them and the address list is periodically
+   * refreshed. If null, DNS load balancing is disabled. Ignored (forced off) when
+   * http_connect_proxy_options is also set.
+   */
+  const struct TemporalCoreClientDnsLoadBalancingOptions *dns_load_balancing_options;
+  /**
+   * Selects transport-level gRPC compression. The zero value enables gzip, which is the
+   * default. Ignored when grpc_override_callback is set, since that transport cannot decode
+   * compressed request bodies.
+   */
+  enum TemporalCoreClientGrpcCompression grpc_compression;
+  /**
+   * Warning threshold (bytes) for the size of an outbound payload-bearing field.
+   * Over-threshold fields are logged but still sent to server. 0 disables the warning.
+   * NOTE: Experimental
+   */
+  uint64_t payloads_warn_size;
+  /**
+   * Warning threshold (bytes) for outbound memo size. Over-threshold memos are logged but still
+   * sent to server. 0 disables the warning.
+   * NOTE: Experimental
+   */
+  uint64_t memo_warn_size;
 } TemporalCoreConnectionOptions;
 
 typedef struct TemporalCoreByteArray {
@@ -545,9 +582,9 @@ typedef struct TemporalCoreLegacyBuildIdBasedStrategy {
 } TemporalCoreLegacyBuildIdBasedStrategy;
 
 typedef enum TemporalCoreWorkerVersioningStrategy_Tag {
-  None,
-  DeploymentBased,
-  LegacyBuildIdBased,
+  TemporalCoreWorkerVersioningStrategy_None,
+  TemporalCoreWorkerVersioningStrategy_DeploymentBased,
+  TemporalCoreWorkerVersioningStrategy_LegacyBuildIdBased,
 } TemporalCoreWorkerVersioningStrategy_Tag;
 
 typedef struct TemporalCoreWorkerVersioningStrategy {
@@ -600,37 +637,37 @@ typedef uintptr_t (*TemporalCoreCustomSlotSupplierTryReserveCallback)(const stru
                                                                       void *user_data);
 
 typedef enum TemporalCoreSlotInfo_Tag {
-  WorkflowSlotInfo,
-  ActivitySlotInfo,
-  LocalActivitySlotInfo,
-  NexusSlotInfo,
+  TemporalCoreSlotInfo_WorkflowSlotInfo,
+  TemporalCoreSlotInfo_ActivitySlotInfo,
+  TemporalCoreSlotInfo_LocalActivitySlotInfo,
+  TemporalCoreSlotInfo_NexusSlotInfo,
 } TemporalCoreSlotInfo_Tag;
 
-typedef struct TemporalCoreWorkflowSlotInfo_Body {
+typedef struct TemporalCoreSlotInfo_TemporalCoreWorkflowSlotInfo_Body {
   struct TemporalCoreByteArrayRef workflow_type;
   bool is_sticky;
-} TemporalCoreWorkflowSlotInfo_Body;
+} TemporalCoreSlotInfo_TemporalCoreWorkflowSlotInfo_Body;
 
-typedef struct TemporalCoreActivitySlotInfo_Body {
+typedef struct TemporalCoreSlotInfo_TemporalCoreActivitySlotInfo_Body {
   struct TemporalCoreByteArrayRef activity_type;
-} TemporalCoreActivitySlotInfo_Body;
+} TemporalCoreSlotInfo_TemporalCoreActivitySlotInfo_Body;
 
-typedef struct TemporalCoreLocalActivitySlotInfo_Body {
+typedef struct TemporalCoreSlotInfo_TemporalCoreLocalActivitySlotInfo_Body {
   struct TemporalCoreByteArrayRef activity_type;
-} TemporalCoreLocalActivitySlotInfo_Body;
+} TemporalCoreSlotInfo_TemporalCoreLocalActivitySlotInfo_Body;
 
-typedef struct TemporalCoreNexusSlotInfo_Body {
+typedef struct TemporalCoreSlotInfo_TemporalCoreNexusSlotInfo_Body {
   struct TemporalCoreByteArrayRef operation;
   struct TemporalCoreByteArrayRef service;
-} TemporalCoreNexusSlotInfo_Body;
+} TemporalCoreSlotInfo_TemporalCoreNexusSlotInfo_Body;
 
 typedef struct TemporalCoreSlotInfo {
   TemporalCoreSlotInfo_Tag tag;
   union {
-    TemporalCoreWorkflowSlotInfo_Body workflow_slot_info;
-    TemporalCoreActivitySlotInfo_Body activity_slot_info;
-    TemporalCoreLocalActivitySlotInfo_Body local_activity_slot_info;
-    TemporalCoreNexusSlotInfo_Body nexus_slot_info;
+    TemporalCoreSlotInfo_TemporalCoreWorkflowSlotInfo_Body workflow_slot_info;
+    TemporalCoreSlotInfo_TemporalCoreActivitySlotInfo_Body activity_slot_info;
+    TemporalCoreSlotInfo_TemporalCoreLocalActivitySlotInfo_Body local_activity_slot_info;
+    TemporalCoreSlotInfo_TemporalCoreNexusSlotInfo_Body nexus_slot_info;
   };
 } TemporalCoreSlotInfo;
 
@@ -725,9 +762,9 @@ typedef struct TemporalCoreCustomSlotSupplierCallbacksImpl {
 } TemporalCoreCustomSlotSupplierCallbacksImpl;
 
 typedef enum TemporalCoreSlotSupplier_Tag {
-  FixedSize,
-  ResourceBased,
-  Custom,
+  TemporalCoreSlotSupplier_FixedSize,
+  TemporalCoreSlotSupplier_ResourceBased,
+  TemporalCoreSlotSupplier_Custom,
 } TemporalCoreSlotSupplier_Tag;
 
 typedef struct TemporalCoreSlotSupplier {
@@ -796,6 +833,12 @@ typedef struct TemporalCoreWorkerOptions {
   struct TemporalCoreByteArrayRefArray nondeterminism_as_workflow_fail_for_types;
   struct TemporalCoreByteArrayRefArray plugins;
   struct TemporalCoreByteArrayRefArray storage_drivers;
+  /**
+   * If set, the worker won't proactively fail completions whose payloads exceed the namespace
+   * error limits; oversized payloads are sent and the server enforces the limit.
+   * NOTE: Experimental
+   */
+  bool disable_payload_error_limit;
 } TemporalCoreWorkerOptions;
 
 /**

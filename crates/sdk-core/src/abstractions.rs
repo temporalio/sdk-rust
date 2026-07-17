@@ -160,15 +160,15 @@ where
         let supp_c_c = self.supplier.clone();
         let mets = self.metrics_ctx.clone();
         let metric_rec =
-            // When being called from the drop impl, the permit isn't actually dropped yet, so
-            // account for that with the `add_one` parameter.
-            move |add_one: bool| {
-                let extra = usize::from(add_one);
+            // The supplier permit is still alive while its drop callback runs, so suppliers backed
+            // by an RAII permit do not include the slot being released in `available_slots` yet.
+            move |permit_is_being_released: bool| {
+                let available_adjustment = usize::from(permit_is_being_released);
                 let unused = uc_c.load(Ordering::Acquire);
                 if let Some(avail) = supp.available_slots() {
-                    mets.available_task_slots(avail + unused + extra);
+                    mets.available_task_slots(avail + unused + available_adjustment);
                 }
-                mets.task_slots_used((ep_rx_c.borrow().saturating_sub(unused) + extra) as u64);
+                mets.task_slots_used(ep_rx_c.borrow().saturating_sub(unused) as u64);
             };
         let mrc = metric_rec.clone();
         mrc(false);

@@ -1,9 +1,10 @@
 //! Contains errors that can be returned by clients.
 
+use crate::{WorkflowExecutionStatus, workflow_handle::WorkflowResultDetails};
 use http::uri::InvalidUri;
 use temporalio_common::{
-    data_converters::PayloadConversionError,
-    protos::temporal::api::{common::v1::Payload, failure::v1::Failure, query::v1::QueryRejected},
+    data_converters::PayloadConversionError, error::IncomingError,
+    protos::temporal::api::failure::v1::Failure,
 };
 use tonic::Code;
 
@@ -100,8 +101,11 @@ pub enum WorkflowQueryError {
     NotFound(#[source] tonic::Status),
 
     /// The query was rejected based on the rejection condition.
-    #[error("Query rejected: workflow status {:?}", .0.status)]
-    Rejected(QueryRejected),
+    #[error("Query rejected: workflow status {status:?}")]
+    Rejected {
+        /// The workflow status that caused the query rejection, if reported.
+        status: Option<WorkflowExecutionStatus>,
+    },
 
     /// Error serializing input or deserializing output.
     #[error("Payload conversion error: {0}")]
@@ -166,21 +170,21 @@ impl WorkflowUpdateError {
 #[non_exhaustive]
 pub enum WorkflowGetResultError {
     /// The workflow finished in failure.
-    #[error("Workflow failed: {0:?}")]
-    Failed(Box<Failure>),
+    #[error("Workflow failed: {0}")]
+    Failed(#[source] Box<IncomingError>),
 
     /// The workflow was cancelled.
     #[error("Workflow cancelled")]
     Cancelled {
         /// Details provided at cancellation time.
-        details: Vec<Payload>,
+        details: WorkflowResultDetails,
     },
 
     /// The workflow was terminated.
     #[error("Workflow terminated")]
     Terminated {
         /// Details provided at termination time.
-        details: Vec<Payload>,
+        details: WorkflowResultDetails,
     },
 
     /// The workflow timed out.
@@ -283,6 +287,9 @@ pub enum AsyncActivityError {
     /// The activity was not found (e.g., already completed, cancelled, or never existed).
     #[error("Activity not found")]
     NotFound(#[source] tonic::Status),
+    /// Error serializing an activity result, failure, or details.
+    #[error("Payload conversion error: {0}")]
+    PayloadConversion(#[from] PayloadConversionError),
     /// An uncategorized rpc error from the server.
     #[error("Server error: {0}")]
     Rpc(#[from] tonic::Status),

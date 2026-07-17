@@ -27,6 +27,9 @@ use tokio::{sync::watch, task::JoinHandle};
 /// current usage levels of their respective resource as measurements. The user specifies a target
 /// threshold for each, and slots are handed out if the output of both PID controllers is above some
 /// defined threshold. See [ResourceBasedSlotsOptions] for the default PID controller settings.
+///
+/// Note that different slot types make decisions independently of each other, though they use the
+/// same underlying system information.
 pub struct ResourceBasedTuner<MI> {
     slots: Arc<ResourceController<MI>>,
     wf_opts: Option<ResourceSlotOptions>,
@@ -45,23 +48,32 @@ impl ResourceBasedTuner<RealSysInfo> {
             .target_mem_usage(target_mem_usage)
             .target_cpu_usage(target_cpu_usage)
             .build();
-        let controller = ResourceController::new_with_sysinfo(opts, Arc::new(RealSysInfo::new()));
+        let controller = ResourceController::new_with_sysinfo(
+            opts,
+            Arc::new(RealSysInfo::new(RealSysInfo::MIN_REFRESH_INTERVAL)),
+        );
         Self::new_from_controller(controller)
     }
 
     /// Create an instance using the fully configurable set of PID controller options
     pub fn new_from_options(options: ResourceBasedSlotsOptions) -> Self {
-        let controller =
-            ResourceController::new_with_sysinfo(options, Arc::new(RealSysInfo::new()));
+        let controller = ResourceController::new_with_sysinfo(
+            options,
+            Arc::new(RealSysInfo::new(RealSysInfo::MIN_REFRESH_INTERVAL)),
+        );
         Self::new_from_controller(controller)
     }
 }
 
 impl<MI> ResourceBasedTuner<MI> {
     fn new_from_controller(controller: ResourceController<MI>) -> Self {
-        let sys_info = controller.sys_info_supplier.clone();
+        Self::new_from_shared_controller(Arc::new(controller))
+    }
+
+    pub(crate) fn new_from_shared_controller(slots: Arc<ResourceController<MI>>) -> Self {
+        let sys_info = slots.sys_info_supplier.clone();
         Self {
-            slots: Arc::new(controller),
+            slots,
             wf_opts: None,
             act_opts: None,
             la_opts: None,
@@ -130,7 +142,8 @@ pub struct ResourceSlotOptions {
     ramp_throttle: Duration,
 }
 
-struct ResourceController<MI> {
+/// Coordinates resource-based slot decisions using a shared resource sampler and PID controllers.
+pub struct ResourceController<MI = RealSysInfo> {
     options: ResourceBasedSlotsOptions,
     sys_info_supplier: Arc<MI>,
     metrics: OnceLock<JoinHandle<()>>,
@@ -415,6 +428,22 @@ impl<MI: SystemResourceInfo + Sync + Send + 'static> WorkerTuner for ResourceBas
     }
 }
 
+impl<MI> std::fmt::Debug for ResourceController<MI> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ResourceController").finish_non_exhaustive()
+    }
+}
+
+impl ResourceController<RealSysInfo> {
+    /// Create a resource controller using the default system resource sampler.
+    pub fn new(options: ResourceBasedSlotsOptions) -> Self {
+        Self::new_with_sysinfo(
+            options,
+            Arc::new(RealSysInfo::new(RealSysInfo::MIN_REFRESH_INTERVAL)),
+        )
+    }
+}
+
 impl<MI: SystemResourceInfo + Sync + Send> ResourceController<MI> {
     /// Create a [ResourceBasedSlotsForType] for this instance which is willing to hand out
     /// `minimum` slots with no checks at all and `max` slots ever. Otherwise the underlying
@@ -535,7 +564,19 @@ pub struct RealSysInfo {
 }
 
 impl RealSysInfo {
-    pub(crate) fn new() -> Self {
+    /// Lower bound for the refresh interval.
+    pub(crate) const MIN_REFRESH_INTERVAL: Duration = Duration::from_millis(100);
+    /// Upper bound for the refresh interval.
+    pub(crate) const MAX_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
+
+    fn clamp_refresh_interval(interval: Duration) -> Duration {
+        interval.clamp(Self::MIN_REFRESH_INTERVAL, Self::MAX_REFRESH_INTERVAL)
+    }
+
+    /// Spawns a background thread refreshing host metrics every `refresh_interval` (clamped to
+    /// `[MIN_REFRESH_INTERVAL, MAX_REFRESH_INTERVAL]`).
+    pub(crate) fn new(refresh_interval: Duration) -> Self {
+        let refresh_interval = Self::clamp_refresh_interval(refresh_interval);
         let mut sys = sysinfo::System::new();
         sys.refresh_memory();
         let total_mem = sys.total_memory();
@@ -553,10 +594,9 @@ impl RealSysInfo {
         let handle = thread::Builder::new()
             .name("temporal-real-sysinfo".to_string())
             .spawn(move || {
-                const REFRESH_INTERVAL: Duration = Duration::from_millis(100);
                 loop {
                     thread_clone.refresh();
-                    let r = rx.recv_timeout(REFRESH_INTERVAL);
+                    let r = rx.recv_timeout(refresh_interval);
                     if matches!(r, Err(mpsc::RecvTimeoutError::Disconnected)) || r.is_ok() {
                         return;
                     }
@@ -771,6 +811,31 @@ mod tests {
     }
 
     #[test]
+    fn refresh_interval_clamped() {
+        // In-range passes through; out-of-range clamps at both ends.
+        assert_eq!(
+            RealSysInfo::clamp_refresh_interval(Duration::from_secs(30)),
+            Duration::from_secs(30)
+        );
+        assert_eq!(
+            RealSysInfo::clamp_refresh_interval(Duration::from_millis(1)),
+            RealSysInfo::MIN_REFRESH_INTERVAL
+        );
+        assert_eq!(
+            RealSysInfo::clamp_refresh_interval(Duration::from_secs(3600)),
+            RealSysInfo::MAX_REFRESH_INTERVAL
+        );
+    }
+
+    #[test]
+    fn realsysinfo_reports_sane_values() {
+        let sys_info = RealSysInfo::new(RealSysInfo::MIN_REFRESH_INTERVAL);
+        assert!(sys_info.total_mem() > 0);
+        let cpu = sys_info.used_cpu_percent();
+        assert!((0.0..=1.0).contains(&cpu), "cpu {cpu} out of range");
+    }
+
+    #[test]
     fn mem_workflow_sync() {
         let (fmis, used) = FakeMIS::new();
         let rbs = Arc::new(ResourceController::new_with_sysinfo(test_options(), fmis))
@@ -822,6 +887,45 @@ mod tests {
         used.store(0, Ordering::Release);
         // Now it's willing to hand out slots again when usage is zero
         assert!(rbs.try_reserve_slot(&pd).is_some());
+    }
+
+    #[test]
+    fn shared_controller_has_same_behavior_across_tuners() {
+        let (fmis, used) = FakeMIS::new();
+        let controller = Arc::new(ResourceController::new_with_sysinfo(test_options(), fmis));
+        let slot_options = ResourceSlotOptions {
+            min_slots: 0,
+            max_slots: 100,
+            ramp_throttle: Duration::from_millis(0),
+        };
+        let mut first_tuner = ResourceBasedTuner::new_from_shared_controller(controller.clone());
+        first_tuner.with_activity_slots_options(slot_options);
+        let mut second_tuner = ResourceBasedTuner::new_from_shared_controller(controller);
+        second_tuner.with_activity_slots_options(slot_options);
+        let first_supplier = first_tuner.activity_task_slot_supplier();
+        let second_supplier = second_tuner.activity_task_slot_supplier();
+        let first_context = MeteredPermitDealer::new(
+            first_supplier.clone(),
+            MetricsContext::no_op(),
+            None,
+            Arc::new(Default::default()),
+            None,
+        );
+        let second_context = MeteredPermitDealer::new(
+            second_supplier.clone(),
+            MetricsContext::no_op(),
+            None,
+            Arc::new(Default::default()),
+            None,
+        );
+
+        used.store(90_000, Ordering::Release);
+        assert!(first_supplier.try_reserve_slot(&first_context).is_none());
+        assert!(second_supplier.try_reserve_slot(&second_context).is_none());
+
+        used.store(0, Ordering::Release);
+        assert!(first_supplier.try_reserve_slot(&first_context).is_some());
+        assert!(second_supplier.try_reserve_slot(&second_context).is_some());
     }
 
     #[tokio::test]
@@ -1021,7 +1125,7 @@ mod tests {
             return;
         }
 
-        let sys_info = RealSysInfo::new();
+        let sys_info = RealSysInfo::new(RealSysInfo::MIN_REFRESH_INTERVAL);
         let cgroup_info = CGroupCpuInfo::new(CgroupV2CpuFileSystem);
         let CGroupCpuLimits { quota, period } = cgroup_info
             .read_cpus_limit()
@@ -1079,7 +1183,7 @@ mod tests {
             return;
         }
 
-        let sys_info = RealSysInfo::new();
+        let sys_info = RealSysInfo::new(RealSysInfo::MIN_REFRESH_INTERVAL);
 
         assert_eq!(
             sys_info.total_mem(),

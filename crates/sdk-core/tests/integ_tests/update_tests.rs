@@ -696,7 +696,7 @@ async fn update_with_local_acts() {
         }
     }
 
-    worker.register_workflow::<UpdateWithLocalActsWf>();
+    worker.register_workflow::<UpdateWithLocalActsWf>().unwrap();
     let task_queue = starter.get_task_queue().to_owned();
     let handle = worker
         .submit_workflow(
@@ -773,7 +773,7 @@ async fn update_rejection_sdk() {
         }
     }
 
-    worker.register_workflow::<UpdateRejectionSdkWf>();
+    worker.register_workflow::<UpdateRejectionSdkWf>().unwrap();
     let task_queue = starter.get_task_queue().to_owned();
     let handle = worker
         .submit_workflow(
@@ -830,7 +830,7 @@ async fn update_fail_sdk() {
         }
     }
 
-    worker.register_workflow::<UpdateFailSdkWf>();
+    worker.register_workflow::<UpdateFailSdkWf>().unwrap();
     let task_queue = starter.get_task_queue().to_owned();
     let handle = worker
         .submit_workflow(
@@ -858,6 +858,81 @@ async fn update_fail_sdk() {
         .fetch_history_and_replay(worker.inner_mut())
         .await
         .unwrap();
+}
+
+#[tokio::test]
+async fn unknown_update_rejected_sdk() {
+    let wf_name = "unknown_update_rejected_sdk";
+    let mut starter = CoreWfStarter::new(wf_name);
+    starter.sdk_config.task_types = WorkerTaskTypes::workflow_only();
+    let mut worker = starter.worker().await;
+    let client = starter.get_client().await;
+
+    #[workflow]
+    #[derive(Default)]
+    struct UnknownUpdateRejectedSdkWf {
+        done: bool,
+    }
+
+    #[workflow_methods]
+    impl UnknownUpdateRejectedSdkWf {
+        #[run]
+        async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<()> {
+            ctx.wait_condition(|s| s.done).await;
+            Ok(())
+        }
+
+        #[update]
+        async fn known_update(_ctx: &mut WorkflowContext<Self>, _: ()) {}
+
+        #[signal]
+        fn done_signal(&mut self, _ctx: &mut SyncWorkflowContext<Self>, _: ()) {
+            self.done = true;
+        }
+    }
+
+    worker
+        .register_workflow::<UnknownUpdateRejectedSdkWf>()
+        .unwrap();
+    let task_queue = starter.get_task_queue().to_owned();
+    let handle = worker
+        .submit_workflow(
+            UnknownUpdateRejectedSdkWf::run,
+            (),
+            WorkflowStartOptions::new(task_queue, starter.get_wf_id().to_owned()).build(),
+        )
+        .await
+        .unwrap();
+    let update = async {
+        let res = handle
+            .execute_update(
+                UntypedUpdate::new("missing_update"),
+                RawValue::from_value(&(), client.data_converter().payload_converter()),
+                WorkflowExecuteUpdateOptions::default(),
+            )
+            .await;
+        match res.unwrap_err() {
+            temporalio_client::errors::WorkflowUpdateError::Failed(failure) => {
+                assert_eq!(
+                    failure.message,
+                    "No update handler registered for update name missing_update"
+                )
+            }
+            _ => panic!("expected failure"),
+        }
+        handle
+            .signal(
+                UnknownUpdateRejectedSdkWf::done_signal,
+                (),
+                WorkflowSignalOptions::default(),
+            )
+            .await
+            .unwrap();
+    };
+    let run = async {
+        worker.run_until_done().await.unwrap();
+    };
+    join!(update, run);
 }
 
 #[tokio::test]
@@ -892,7 +967,7 @@ async fn update_timer_sequence() {
         }
     }
 
-    worker.register_workflow::<UpdateTimerSequenceWf>();
+    worker.register_workflow::<UpdateTimerSequenceWf>().unwrap();
     let task_queue = starter.get_task_queue().to_owned();
     let handle = worker
         .submit_workflow(
@@ -963,7 +1038,9 @@ async fn task_failure_during_validation() {
         }
     }
 
-    worker.register_workflow::<TaskFailureDuringValidationWf>();
+    worker
+        .register_workflow::<TaskFailureDuringValidationWf>()
+        .unwrap();
     let task_queue = starter.get_task_queue().to_owned();
     let handle = worker
         .submit_workflow(
@@ -1035,7 +1112,9 @@ async fn task_failure_after_update() {
         }
     }
 
-    worker.register_workflow::<TaskFailureAfterUpdateWf>();
+    worker
+        .register_workflow::<TaskFailureAfterUpdateWf>()
+        .unwrap();
     let task_queue = starter.get_task_queue().to_owned();
     let handle = worker
         .submit_workflow(
@@ -1124,7 +1203,9 @@ async fn worker_restarted_in_middle_of_update() {
         }
     }
 
-    worker.register_workflow::<WorkerRestartedInMiddleOfUpdateWf>();
+    worker
+        .register_workflow::<WorkerRestartedInMiddleOfUpdateWf>()
+        .unwrap();
     let task_queue = starter.get_task_queue().to_owned();
     let handle = worker
         .submit_workflow(
@@ -1249,7 +1330,7 @@ async fn update_after_empty_wft() {
         }
     }
 
-    worker.register_workflow::<UpdateAfterEmptyWftWf>();
+    worker.register_workflow::<UpdateAfterEmptyWftWf>().unwrap();
     let task_queue = starter.get_task_queue().to_owned();
     let handle = worker
         .submit_workflow(
@@ -1327,7 +1408,9 @@ async fn update_lost_on_activity_mismatch() {
         }
     }
 
-    worker.register_workflow::<UpdateLostOnActivityMismatchWf>();
+    worker
+        .register_workflow::<UpdateLostOnActivityMismatchWf>()
+        .unwrap();
     let core_worker = worker.core_worker();
     let task_queue = starter.get_task_queue().to_owned();
     let handle = worker

@@ -754,6 +754,7 @@ impl WorkflowMachines {
         }
 
         // Needed to delay mutation of self until after we've iterated over peeked events.
+        #[allow(clippy::large_enum_variant)]
         enum DelayedAction {
             WakeLa(MachineKey, Box<CompleteLocalActivityData>),
             ProtocolMessage(IncomingProtocolMessage),
@@ -1630,6 +1631,7 @@ impl WorkflowMachines {
             command_type: machine.command.as_type() as i32,
             attributes: Some(machine.command),
             user_metadata: metadata,
+            event_group_markers: vec![],
         };
         CommandAndMachine {
             command: MachineAssociatedCommand::Real(Box::new(cmd)),

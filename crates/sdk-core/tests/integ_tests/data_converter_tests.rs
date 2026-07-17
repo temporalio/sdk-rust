@@ -31,8 +31,8 @@ use temporalio_common::{
 };
 use temporalio_macros::{activities, workflow, workflow_methods};
 use temporalio_sdk::{
-    ActivityOptions, CancellableFuture, SyncWorkflowContext, WorkflowContext, WorkflowContextView,
-    WorkflowResult,
+    ActivityOptions, CancellableFuture, MemoValue, SyncWorkflowContext, WorkflowContext,
+    WorkflowContextView, WorkflowResult,
     activities::{ActivityContext, ActivityError},
 };
 
@@ -108,7 +108,7 @@ impl FailurePayloadActivities {
         loop {
             tokio::select! {
                 _ = ctx.cancelled() => break,
-                _ = ticker.tick() => ctx.record_heartbeat(vec![]),
+                _ = ticker.tick() => ctx.record_heartbeat(()).await?,
             }
         }
         Err(ActivityError::cancelled_with_details(
@@ -118,11 +118,10 @@ impl FailurePayloadActivities {
 
     #[activity]
     async fn heartbeat_then_timeout(ctx: ActivityContext) -> Result<(), ActivityError> {
-        ctx.record_heartbeat(vec![
-            TrackedValue::new("codec-heartbeat-details".to_string())
-                .as_json_payload()
-                .map_err(ActivityError::from)?,
-        ]);
+        ctx.record_heartbeat(TrackedWrapper(TrackedValue::new(
+            "codec-heartbeat-details".to_string(),
+        )))
+        .await?;
         tokio::time::sleep(Duration::from_secs(2)).await;
         Ok(())
     }
@@ -210,7 +209,12 @@ impl DescribeDataConverterWorkflow {
         ctx: &mut WorkflowContext<Self>,
         input: TrackedWrapper,
     ) -> WorkflowResult<TrackedWrapper> {
-        ctx.upsert_memo([("tracked".to_string(), input.0.data.as_json_payload()?)]);
+        ctx.upsert_memo([
+            ("tracked", Some(MemoValue::new(input.0.data.clone()))),
+            ("wrapped", Some(MemoValue::new(input.clone()))),
+            ("removed", Some(MemoValue::new(true))),
+        ])?;
+        ctx.upsert_memo([("removed", None)])?;
         let output = ctx
             .start_activity(
                 TestActivities::process_tracked,
@@ -383,7 +387,8 @@ async fn custom_failure_converter_fallback_applied_to_workflow_failures() {
     let mut starter = starter_with_failing_failure_converter(wf_name).await;
     starter
         .sdk_config
-        .register_workflow::<WorkflowFailureFallbackWorkflow>();
+        .register_workflow::<WorkflowFailureFallbackWorkflow>()
+        .unwrap();
     starter.sdk_config.task_types = WorkerTaskTypes::workflow_only();
     let mut worker = starter.worker().await;
 
@@ -403,13 +408,13 @@ async fn custom_failure_converter_fallback_applied_to_workflow_failures() {
         err => panic!("unexpected workflow result error: {err:?}"),
     };
     assert_eq!(
-        failure.message,
+        failure.failure().message,
         format!(
             "Failed converting error to failure: Encoding error: {FAILURE_CONVERTER_ERROR_MESSAGE}, original error message: {WORKFLOW_FAILURE_MESSAGE}"
         )
     );
     assert!(matches!(
-        failure.failure_info,
+        failure.failure().failure_info.as_ref(),
         Some(FailureInfo::ApplicationFailureInfo(_))
     ));
 }
@@ -421,7 +426,8 @@ async fn custom_failure_converter_fallback_applied_to_activity_panic_failures() 
     starter.sdk_config.register_activities(PanicActivities);
     starter
         .sdk_config
-        .register_workflow::<ActivityPanicFallbackWorkflow>();
+        .register_workflow::<ActivityPanicFallbackWorkflow>()
+        .unwrap();
     let mut worker = starter.worker().await;
 
     let task_queue = starter.get_task_queue().to_owned();
@@ -464,7 +470,8 @@ async fn custom_failure_converter_fallback_applied_to_query_failures() {
     let mut starter = starter_with_failing_failure_converter(wf_name).await;
     starter
         .sdk_config
-        .register_workflow::<QueryUpdateFailureFallbackWorkflow>();
+        .register_workflow::<QueryUpdateFailureFallbackWorkflow>()
+        .unwrap();
     starter.sdk_config.task_types = WorkerTaskTypes::workflow_only();
     let mut worker = starter.worker().await;
 
@@ -511,7 +518,8 @@ async fn custom_failure_converter_fallback_applied_to_update_validation_failures
     let mut starter = starter_with_failing_failure_converter(wf_name).await;
     starter
         .sdk_config
-        .register_workflow::<QueryUpdateFailureFallbackWorkflow>();
+        .register_workflow::<QueryUpdateFailureFallbackWorkflow>()
+        .unwrap();
     starter.sdk_config.task_types = WorkerTaskTypes::workflow_only();
     let mut worker = starter.worker().await;
 
@@ -564,7 +572,8 @@ async fn custom_failure_converter_fallback_applied_to_update_handler_failures() 
     let mut starter = starter_with_failing_failure_converter(wf_name).await;
     starter
         .sdk_config
-        .register_workflow::<QueryUpdateFailureFallbackWorkflow>();
+        .register_workflow::<QueryUpdateFailureFallbackWorkflow>()
+        .unwrap();
     starter.sdk_config.task_types = WorkerTaskTypes::workflow_only();
     let mut worker = starter.worker().await;
 
@@ -618,7 +627,8 @@ async fn data_converter_tracks_serialization_points() {
     starter.sdk_config.register_activities(TestActivities);
     starter
         .sdk_config
-        .register_workflow::<DataConverterTestWorkflow>();
+        .register_workflow::<DataConverterTestWorkflow>()
+        .unwrap();
     let mut worker = starter.worker().await;
 
     let input = TrackedValue::new("test-input".to_string());
@@ -684,7 +694,10 @@ impl MultiArgs2Workflow {
 async fn multi_args_serializes_as_multiple_payloads() {
     let wf_name = MultiArgs2Workflow::name();
     let mut starter = CoreWfStarter::new(wf_name);
-    starter.sdk_config.register_workflow::<MultiArgs2Workflow>();
+    starter
+        .sdk_config
+        .register_workflow::<MultiArgs2Workflow>()
+        .unwrap();
     starter.sdk_config.task_types = WorkerTaskTypes::workflow_only();
     let mut worker = starter.worker().await;
 
@@ -857,7 +870,8 @@ async fn codec_encodes_and_decodes_payloads() {
     starter.sdk_config.task_types = WorkerTaskTypes::all();
     starter
         .sdk_config
-        .register_workflow::<DataConverterTestWorkflow>();
+        .register_workflow::<DataConverterTestWorkflow>()
+        .unwrap();
     // Use task queue name as workflow ID to avoid collisions with parallel tests
     let wf_id = starter.get_task_queue().to_owned();
     let mut worker = starter.worker().await;
@@ -915,7 +929,8 @@ async fn describe_decodes_workflow_payload_fields() {
     starter.sdk_config.task_types = WorkerTaskTypes::all();
     starter
         .sdk_config
-        .register_workflow::<DescribeDataConverterWorkflow>();
+        .register_workflow::<DescribeDataConverterWorkflow>()
+        .unwrap();
     let wf_id = starter.get_task_queue().to_owned();
     let mut worker = starter.worker().await;
 
@@ -943,9 +958,17 @@ async fn describe_decodes_workflow_payload_fields() {
         "Describe should have decoded response payloads"
     );
     assert_eq!(
-        desc.memo().unwrap().fields["tracked"],
-        "codec-describe".as_json_payload().unwrap()
+        desc.memo().get::<String>("tracked").unwrap(),
+        Some("codec-describe".to_owned())
     );
+    assert_eq!(
+        desc.memo()
+            .get::<TrackedWrapper>("wrapped")
+            .unwrap()
+            .map(|value| value.0.data),
+        Some("codec-describe".to_owned())
+    );
+    assert!(!desc.memo().contains_key("removed"));
     let raw_user_metadata = desc
         .raw_description
         .execution_config
@@ -985,7 +1008,8 @@ async fn describe_decodes_user_metadata_with_ungated_xor_codec() {
     starter.sdk_config.task_types = WorkerTaskTypes::all();
     starter
         .sdk_config
-        .register_workflow::<DescribeDataConverterWorkflow>();
+        .register_workflow::<DescribeDataConverterWorkflow>()
+        .unwrap();
     let wf_id = starter.get_task_queue().to_owned();
     let mut worker = starter.worker().await;
 
@@ -1013,8 +1037,15 @@ async fn describe_decodes_user_metadata_with_ungated_xor_codec() {
         "Describe should have decoded response payloads"
     );
     assert_eq!(
-        desc.memo().unwrap().fields["tracked"],
-        "codec-describe".as_json_payload().unwrap()
+        desc.memo().get::<String>("tracked").unwrap(),
+        Some("codec-describe".to_owned())
+    );
+    assert_eq!(
+        desc.memo()
+            .get::<TrackedWrapper>("wrapped")
+            .unwrap()
+            .map(|value| value.0.data),
+        Some("codec-describe".to_owned())
     );
     // Making sure codec isn't used when decoding user metadata
     assert_eq!(desc.static_summary(), Some("codec summary"));
@@ -1044,7 +1075,8 @@ async fn codec_roundtrips_activity_cancellation_details() {
     starter.sdk_config.task_types = WorkerTaskTypes::all();
     starter
         .sdk_config
-        .register_workflow::<CancellationDetailsWorkflow>();
+        .register_workflow::<CancellationDetailsWorkflow>()
+        .unwrap();
     let wf_id = starter.get_task_queue().to_owned();
     let mut worker = starter.worker().await;
 
@@ -1093,7 +1125,8 @@ async fn codec_roundtrips_activity_heartbeat_timeout_details() {
     starter.sdk_config.task_types = WorkerTaskTypes::all();
     starter
         .sdk_config
-        .register_workflow::<HeartbeatDetailsWorkflow>();
+        .register_workflow::<HeartbeatDetailsWorkflow>()
+        .unwrap();
     let wf_id = starter.get_task_queue().to_owned();
     let mut worker = starter.worker().await;
 

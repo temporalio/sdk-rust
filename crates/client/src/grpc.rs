@@ -5,7 +5,7 @@
 //! or making raw gRPC calls not covered by the higher-level API.
 
 use crate::{
-    Client, Connection, LONG_POLL_TIMEOUT, RequestExt, SharedReplaceableClient,
+    Client, Connection, LONG_POLL_TIMEOUT, PayloadErrorLimits, RequestExt, SharedReplaceableClient,
     TEMPORAL_NAMESPACE_HEADER_KEY, TemporalServiceClient,
     metrics::namespace_kv,
     retry::make_future_retry,
@@ -13,8 +13,10 @@ use crate::{
 };
 use dyn_clone::DynClone;
 use futures_util::{FutureExt, TryFutureExt, future::BoxFuture};
+use parking_lot::RwLock;
 use std::{any::Any, marker::PhantomData, sync::Arc};
 use temporalio_common::{
+    payload_limits::{PayloadLimits, validate_known_payload_limits},
     protos::{
         grpc::health::v1::{health_client::HealthClient, *},
         temporal::api::{
@@ -144,6 +146,13 @@ impl RawGrpcCaller for Connection {
         F: FnMut(Request<Req>) -> BoxFuture<'static, Result<Response<Resp>, Status>>,
         F: Send + Sync + Unpin + 'static,
     {
+        // Validate payload sizes after any request mutation but before encoding/metrics.
+        validate_request_payload_limits(
+            &req,
+            self.inner.payloads_warn_size,
+            self.inner.memo_warn_size,
+        )?;
+
         let info = self
             .inner
             .retry_options
@@ -180,6 +189,32 @@ fn req_cloner<T: Clone>(cloneme: &Request<T>) -> Request<T> {
     }
     *new_req.extensions_mut() = cloneme.extensions().clone();
     new_req
+}
+
+/// `*_warn` are the connection's configured warn thresholds; per-call error limits ride a
+/// [`PayloadErrorLimits`] extension. On an error-level violation, returns a [`Status`] carrying
+/// the [`PayloadLimitViolation`] as its source (extract via [crate::payload_limit_violation_from]).
+fn validate_request_payload_limits<Req: Any>(
+    req: &Request<Req>,
+    blob_warn: usize,
+    memo_warn: usize,
+) -> Result<(), Status> {
+    let mut limits = PayloadLimits {
+        blob_warn,
+        memo_warn,
+        blob_error: 0,
+        memo_error: 0,
+    };
+    if let Some(error_limits) = req.extensions().get::<PayloadErrorLimits>() {
+        limits.blob_error = error_limits.blob;
+        limits.memo_error = error_limits.memo;
+    }
+    if let Some(violation) = validate_known_payload_limits(req.get_ref(), &limits) {
+        let mut status = Status::invalid_argument(violation.to_string());
+        status.set_source(Arc::new(violation));
+        return Err(status);
+    }
+    Ok(())
 }
 
 #[async_trait::async_trait]
@@ -366,6 +401,80 @@ where
         self.inner_mut_refreshed()
             .call(call_name, callfn, req)
             .await
+    }
+}
+
+/// Wraps a client and injects a worker's configured [`PayloadErrorLimits`] (when set) as a request
+/// extension on every gRPC call, so the gRPC layer enforces error limits uniformly across all
+/// outbound requests — current and future — without each call site having to opt in.
+///
+/// The limits are shared and may be updated after construction (e.g. once a worker learns the
+/// namespace limits) via [`set_error_limits`](Self::set_error_limits); clones observe the update.
+#[doc(hidden)]
+#[derive(Clone)]
+pub struct PayloadLimitsClient<C> {
+    inner: C,
+    error_limits: Arc<RwLock<Option<PayloadErrorLimits>>>,
+}
+
+impl<C> PayloadLimitsClient<C> {
+    /// Wrap `inner`; no limits are enforced until [`set_error_limits`](Self::set_error_limits).
+    pub fn new(inner: C) -> Self {
+        Self {
+            inner,
+            error_limits: Arc::new(RwLock::new(None)),
+        }
+    }
+
+    /// Set (or clear) the error limits injected on every call. Shared across clones.
+    pub fn set_error_limits(&self, limits: Option<PayloadErrorLimits>) {
+        *self.error_limits.write() = limits;
+    }
+}
+
+impl<C: RawClientProducer> RawClientProducer for PayloadLimitsClient<C> {
+    fn get_workers_info(&self) -> Option<Arc<ClientWorkerSet>> {
+        self.inner.get_workers_info()
+    }
+    fn workflow_client(&mut self) -> Box<dyn WorkflowService> {
+        self.inner.workflow_client()
+    }
+    fn operator_client(&mut self) -> Box<dyn OperatorService> {
+        self.inner.operator_client()
+    }
+    fn cloud_client(&mut self) -> Box<dyn CloudService> {
+        self.inner.cloud_client()
+    }
+    fn test_client(&mut self) -> Box<dyn TestService> {
+        self.inner.test_client()
+    }
+    fn health_client(&mut self) -> Box<dyn HealthService> {
+        self.inner.health_client()
+    }
+}
+
+#[async_trait::async_trait]
+impl<C> RawGrpcCaller for PayloadLimitsClient<C>
+where
+    C: RawGrpcCaller + Clone + Sync + 'static,
+{
+    async fn call<F, Req, Resp>(
+        &mut self,
+        call_name: &'static str,
+        callfn: F,
+        mut req: Request<Req>,
+    ) -> Result<Response<Resp>, Status>
+    where
+        Req: Clone + Unpin + Send + Sync + 'static,
+        Resp: Send + 'static,
+        F: FnMut(Request<Req>) -> BoxFuture<'static, Result<Response<Resp>, Status>>,
+        F: Send + Sync + Unpin + 'static,
+    {
+        let limits = *self.error_limits.read();
+        if let Some(limits) = limits {
+            req.extensions_mut().insert(limits);
+        }
+        self.inner.call(call_name, callfn, req).await
     }
 }
 
@@ -1443,6 +1552,15 @@ proxier! {
         }
     );
     (
+        count_workers,
+        CountWorkersRequest,
+        CountWorkersResponse,
+        |r| {
+            let labels = namespaced_request!(r);
+            r.extensions_mut().insert(labels);
+        }
+    );
+    (
         record_worker_heartbeat,
         RecordWorkerHeartbeatRequest,
         RecordWorkerHeartbeatResponse,
@@ -1582,6 +1700,42 @@ proxier! {
         delete_activity_execution,
         DeleteActivityExecutionRequest,
         DeleteActivityExecutionResponse,
+        |r| {
+            let labels = namespaced_request!(r);
+            r.extensions_mut().insert(labels);
+        }
+    );
+    (
+        pause_activity_execution,
+        PauseActivityExecutionRequest,
+        PauseActivityExecutionResponse,
+        |r| {
+            let labels = namespaced_request!(r);
+            r.extensions_mut().insert(labels);
+        }
+    );
+    (
+        unpause_activity_execution,
+        UnpauseActivityExecutionRequest,
+        UnpauseActivityExecutionResponse,
+        |r| {
+            let labels = namespaced_request!(r);
+            r.extensions_mut().insert(labels);
+        }
+    );
+    (
+        reset_activity_execution,
+        ResetActivityExecutionRequest,
+        ResetActivityExecutionResponse,
+        |r| {
+            let labels = namespaced_request!(r);
+            r.extensions_mut().insert(labels);
+        }
+    );
+    (
+        update_activity_execution_options,
+        UpdateActivityExecutionOptionsRequest,
+        UpdateActivityExecutionOptionsResponse,
         |r| {
             let labels = namespaced_request!(r);
             r.extensions_mut().insert(labels);
@@ -1808,6 +1962,9 @@ proxier! {
     (create_custom_role, cloudreq::CreateCustomRoleRequest, cloudreq::CreateCustomRoleResponse);
     (update_custom_role, cloudreq::UpdateCustomRoleRequest, cloudreq::UpdateCustomRoleResponse);
     (delete_custom_role, cloudreq::DeleteCustomRoleRequest, cloudreq::DeleteCustomRoleResponse);
+    (get_user_namespace_assignments, cloudreq::GetUserNamespaceAssignmentsRequest, cloudreq::GetUserNamespaceAssignmentsResponse);
+    (get_service_account_namespace_assignments, cloudreq::GetServiceAccountNamespaceAssignmentsRequest, cloudreq::GetServiceAccountNamespaceAssignmentsResponse);
+    (get_user_group_namespace_assignments, cloudreq::GetUserGroupNamespaceAssignmentsRequest, cloudreq::GetUserGroupNamespaceAssignmentsResponse);
 }
 
 proxier! {
@@ -1840,6 +1997,53 @@ mod tests {
     use tonic::IntoRequest;
     use url::Url;
     use uuid::Uuid;
+
+    #[test]
+    fn payload_limits_warn_only_vs_error() {
+        use temporalio_common::protos::temporal::api::{
+            common::v1::{Payload, Payloads},
+            workflowservice::v1::StartWorkflowExecutionRequest,
+        };
+        let big = Payloads {
+            payloads: vec![Payload {
+                data: vec![0u8; 1000],
+                ..Default::default()
+            }],
+        };
+        let new_req = || {
+            StartWorkflowExecutionRequest {
+                input: Some(big.clone()),
+                ..Default::default()
+            }
+            .into_request()
+        };
+
+        // warn thresholds = 1 byte. No per-call error limits: over-warn is allowed (warn-only).
+        assert!(validate_request_payload_limits(&new_req(), 1, 1).is_ok());
+
+        // With per-call error limits below the payload size: rejected, carrying the typed violation.
+        let mut req = new_req();
+        req.extensions_mut()
+            .insert(PayloadErrorLimits { blob: 10, memo: 10 });
+        let err = validate_request_payload_limits(&req, 1, 1).unwrap_err();
+        let violation =
+            crate::payload_limit_violation_from(&err).expect("violation carried on status");
+        assert_eq!(violation.path, "input");
+        assert_eq!(
+            violation.class,
+            temporalio_common::payload_limits::LimitClass::Blob
+        );
+        assert!(violation.size > violation.limit);
+
+        // A zero error threshold means "no limit" for that class, so it does not reject.
+        let mut req = new_req();
+        req.extensions_mut()
+            .insert(PayloadErrorLimits { blob: 0, memo: 0 });
+        assert!(validate_request_payload_limits(&req, 1, 1).is_ok());
+
+        // Zero warn thresholds disable warnings (and there are no error limits): always ok.
+        assert!(validate_request_payload_limits(&new_req(), 0, 0).is_ok());
+    }
 
     // Just to help make sure some stuff compiles. Not run.
     #[allow(dead_code)]
@@ -1932,7 +2136,7 @@ mod tests {
     fn verify_all_workflow_service_methods_implemented() {
         // This is less work than trying to hook into the codegen process
         let proto_def = include_str!(
-            "../../common/protos/api_upstream/temporal/api/workflowservice/v1/service.proto"
+            "../../protos/protos/api_upstream/temporal/api/workflowservice/v1/service.proto"
         );
         verify_methods(proto_def, ALL_IMPLEMENTED_WORKFLOW_SERVICE_RPCS);
     }
@@ -1940,7 +2144,7 @@ mod tests {
     #[test]
     fn verify_all_operator_service_methods_implemented() {
         let proto_def = include_str!(
-            "../../common/protos/api_upstream/temporal/api/operatorservice/v1/service.proto"
+            "../../protos/protos/api_upstream/temporal/api/operatorservice/v1/service.proto"
         );
         verify_methods(proto_def, ALL_IMPLEMENTED_OPERATOR_SERVICE_RPCS);
     }
@@ -1948,7 +2152,7 @@ mod tests {
     #[test]
     fn verify_all_cloud_service_methods_implemented() {
         let proto_def = include_str!(
-            "../../common/protos/api_cloud_upstream/temporal/api/cloud/cloudservice/v1/service.proto"
+            "../../protos/protos/api_cloud_upstream/temporal/api/cloud/cloudservice/v1/service.proto"
         );
         verify_methods(proto_def, ALL_IMPLEMENTED_CLOUD_SERVICE_RPCS);
     }
@@ -1956,14 +2160,14 @@ mod tests {
     #[test]
     fn verify_all_test_service_methods_implemented() {
         let proto_def = include_str!(
-            "../../common/protos/testsrv_upstream/temporal/api/testservice/v1/service.proto"
+            "../../protos/protos/testsrv_upstream/temporal/api/testservice/v1/service.proto"
         );
         verify_methods(proto_def, ALL_IMPLEMENTED_TEST_SERVICE_RPCS);
     }
 
     #[test]
     fn verify_all_health_service_methods_implemented() {
-        let proto_def = include_str!("../../common/protos/grpc/health/v1/health.proto");
+        let proto_def = include_str!("../../protos/protos/grpc/health/v1/health.proto");
         verify_methods(proto_def, ALL_IMPLEMENTED_HEALTH_SERVICE_RPCS);
     }
 

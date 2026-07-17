@@ -21,7 +21,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let client = Client::new(connection, client_opts)?;
 
     let worker_options = WorkerOptions::new("message-passing")
-        .register_workflow::<MessagePassingWorkflow>()
+        .register_workflow::<MessagePassingWorkflow>()?
         .task_types(WorkerTaskTypes::workflow_only())
         .build();
 

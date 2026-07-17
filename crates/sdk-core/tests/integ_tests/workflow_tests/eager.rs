@@ -35,7 +35,7 @@ async fn eager_wf_start() {
     // hang the test if eager task dispatch failed
     starter.workflow_options.task_timeout = Some(Duration::from_secs(1500));
     let mut worker = starter.worker().await;
-    worker.register_workflow::<EagerWf>();
+    worker.register_workflow::<EagerWf>().unwrap();
     let task_queue = starter.get_task_queue().to_string();
     let res = eager_start(
         wf_name,
@@ -60,7 +60,7 @@ async fn eager_wf_start_different_clients() {
     // hang the test if wf task needs retry
     starter.workflow_options.task_timeout = Some(Duration::from_secs(1500));
     let mut worker = starter.worker().await;
-    worker.register_workflow::<EagerWf>();
+    worker.register_workflow::<EagerWf>().unwrap();
 
     let connection = get_integ_connection(None).await;
     let client_opts = temporalio_client::ClientOptions::new(NAMESPACE).build();
@@ -111,10 +111,10 @@ pub(crate) async fn eager_start(
                     .and_then(|d| d.try_into().ok()),
                 workflow_run_timeout: options.run_timeout.and_then(|d| d.try_into().ok()),
                 workflow_task_timeout: options.task_timeout.and_then(|d| d.try_into().ok()),
-                search_attributes: options.search_attributes.map(|d| d.into()),
+                search_attributes: options.search_attributes.map(|d| d.into_proto()),
                 cron_schedule: options.cron_schedule.unwrap_or_default(),
                 request_eager_execution: options.enable_eager_workflow_start,
-                retry_policy: options.retry_policy,
+                retry_policy: options.retry_policy.map(Into::into),
                 links: options.links,
                 completion_callbacks: options.completion_callbacks,
                 priority: Some(options.priority.into()),

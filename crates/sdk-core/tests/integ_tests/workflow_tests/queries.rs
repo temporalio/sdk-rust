@@ -112,7 +112,9 @@ async fn query_only_activation_should_not_advance_workflow() {
     });
 
     let mut worker = build_fake_sdk(mock_cfg);
-    worker.register_workflow::<CompleteOnSecondPollWf>();
+    worker
+        .register_workflow::<CompleteOnSecondPollWf>()
+        .unwrap();
     worker.run().await.unwrap();
 }
 
@@ -169,7 +171,9 @@ async fn nonexistent_query_should_not_advance_workflow() {
     });
 
     let mut worker = build_fake_sdk(mock_cfg);
-    worker.register_workflow::<CompleteOnSecondPollWf>();
+    worker
+        .register_workflow::<CompleteOnSecondPollWf>()
+        .unwrap();
     worker.run().await.unwrap();
 }
 
@@ -295,7 +299,7 @@ async fn non_legacy_query_should_see_state_after_workflow_advances() {
     });
 
     let mut worker = build_fake_sdk(mock_cfg);
-    worker.register_workflow::<CounterWf>();
+    worker.register_workflow::<CounterWf>().unwrap();
     worker.run().await.unwrap();
 }
 
@@ -313,12 +317,12 @@ struct WorkflowInfo {
 impl<'a> From<&'a WorkflowContextView> for WorkflowInfo {
     fn from(ctx: &'a WorkflowContextView) -> Self {
         Self {
-            workflow_id: ctx.workflow_id.clone(),
-            workflow_type: ctx.workflow_type.clone(),
-            task_queue: ctx.task_queue.clone(),
-            namespace: ctx.namespace.clone(),
-            attempt: ctx.attempt,
-            first_execution_run_id: ctx.first_execution_run_id.clone(),
+            workflow_id: ctx.workflow_id().to_owned(),
+            workflow_type: ctx.workflow_type().to_owned(),
+            task_queue: ctx.task_queue().to_owned(),
+            namespace: ctx.namespace().to_owned(),
+            attempt: ctx.attempt(),
+            first_execution_run_id: ctx.first_execution_run_id().to_owned(),
         }
     }
 }
@@ -411,7 +415,7 @@ async fn query_returns_workflow_context_view_info() {
     });
 
     let mut worker = build_fake_sdk(mock_cfg);
-    worker.register_workflow::<ContextViewWf>();
+    worker.register_workflow::<ContextViewWf>().unwrap();
     worker.run().await.unwrap();
 }
 
@@ -505,7 +509,7 @@ async fn workflow_metadata_query_returns_current_details() {
     });
 
     let mut worker = build_fake_sdk(mock_cfg);
-    worker.register_workflow::<CurrentDetailsWf>();
+    worker.register_workflow::<CurrentDetailsWf>().unwrap();
     worker.run().await.unwrap();
 }
 
@@ -580,6 +584,6 @@ async fn workflow_metadata_query_empty_details() {
     });
 
     let mut worker = build_fake_sdk(mock_cfg);
-    worker.register_workflow::<NoCurrentDetailsWf>();
+    worker.register_workflow::<NoCurrentDetailsWf>().unwrap();
     worker.run().await.unwrap();
 }

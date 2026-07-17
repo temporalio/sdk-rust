@@ -7,25 +7,21 @@
 #[macro_use]
 extern crate tracing;
 
-mod activity_definition;
-pub mod data_converters;
 #[cfg(feature = "envconfig")]
 pub mod envconfig;
-pub mod error;
 #[doc(hidden)]
 pub mod fsm_trait;
+#[doc(hidden)]
+pub mod payload_limits;
 pub mod payload_visitor;
-mod priority;
 pub mod protos;
 pub mod telemetry;
 pub mod worker;
-mod workflow_definition;
-
-pub use activity_definition::ActivityDefinition;
-pub use priority::Priority;
-pub use workflow_definition::{
-    HasWorkflowDefinition, QueryDefinition, SignalDefinition, UntypedWorkflow, UpdateDefinition,
-    WorkflowDefinition,
+pub use temporalio_common_wasm::{
+    ActivityDefinition, ActivityError, HasWorkflowDefinition, Memo, Priority, QueryDefinition,
+    RetryPolicy, SignalDefinition, UntypedActivity, UntypedWorkflow, UpdateDefinition,
+    WorkerDeploymentVersion, WorkflowDefinition, WorkflowExecution, data_converters, error,
+    search_attributes,
 };
 
 macro_rules! dbg_panic {

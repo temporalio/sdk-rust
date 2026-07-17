@@ -11,6 +11,8 @@ use tokio::sync::mpsc;
 use tonic::transport::{Channel, Endpoint, channel::Change};
 use url::Url;
 
+const MIN_DNS_RESOLUTION_INTERVAL: Duration = Duration::from_secs(1);
+
 /// Validates DNS load balancing configuration and returns the options if DNS LB should be used.
 ///
 /// Returns `Err` if `dns_load_balancing` is set alongside `service_override` or
@@ -37,6 +39,14 @@ pub(crate) fn validate_and_get_dns_lb(
         .target
         .host()
         .ok_or_else(|| ClientConnectError::InvalidConfig("target URL has no host".to_owned()))?;
+
+    if dns_opts.resolution_interval < MIN_DNS_RESOLUTION_INTERVAL {
+        return Err(ClientConnectError::InvalidConfig(format!(
+            "dns_load_balancing.resolution_interval must be at least \
+             {MIN_DNS_RESOLUTION_INTERVAL:?}, got {:?}",
+            dns_opts.resolution_interval
+        )));
+    }
 
     match host {
         url::Host::Domain("localhost") => Ok(None),
@@ -302,5 +312,27 @@ mod tests {
     fn endpoint_uri_v6() {
         let addr: SocketAddr = "[::1]:7233".parse().unwrap();
         assert_eq!(endpoint_uri(addr, "https"), "https://[::1]:7233");
+    }
+
+    #[test]
+    fn zero_resolution_interval_is_error() {
+        let opts = ConnectionOptions::new(Url::parse("http://temporal.example.com:7233").unwrap())
+            .dns_load_balancing(Some(DnsLoadBalancingOptions {
+                resolution_interval: Duration::ZERO,
+                ..Default::default()
+            }))
+            .build();
+        assert!(validate_and_get_dns_lb(&opts).is_err());
+    }
+
+    #[test]
+    fn sub_minimum_resolution_interval_is_error() {
+        let opts = ConnectionOptions::new(Url::parse("http://temporal.example.com:7233").unwrap())
+            .dns_load_balancing(Some(DnsLoadBalancingOptions {
+                resolution_interval: Duration::from_millis(500),
+                ..Default::default()
+            }))
+            .build();
+        assert!(validate_and_get_dns_lb(&opts).is_err());
     }
 }

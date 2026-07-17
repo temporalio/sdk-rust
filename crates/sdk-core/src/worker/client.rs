@@ -1,7 +1,10 @@
 //! Worker-specific client needs
 
 pub(crate) mod mocks;
-use crate::{protosext::legacy_query_failure, worker::WorkerVersioningStrategy};
+use crate::{
+    protosext::legacy_query_failure,
+    worker::{WorkerVersioningStrategy, worker_control_task_queue},
+};
 use parking_lot::Mutex;
 use prost_types::Duration as PbDuration;
 use std::{
@@ -10,8 +13,8 @@ use std::{
     time::{Duration, SystemTime},
 };
 use temporalio_client::{
-    Connection, Namespace, NamespacedClient, RetryOptions, SharedReplaceableClient,
-    grpc::WorkflowService,
+    Connection, NamespacedClient, PayloadErrorLimits, RetryOptions, SharedReplaceableClient,
+    grpc::{PayloadLimitsClient, WorkflowService},
     request_extensions::{IsWorkerTaskLongPoll, NoRetryOnMatching, RetryConfigForCall},
     worker::ClientWorkerSet,
 };
@@ -54,7 +57,13 @@ pub enum LegacyQueryResult {
 
 /// Contains everything a worker needs to interact with the server
 pub(crate) struct WorkerClientBag {
+    /// Shared connection handle, used for management operations (capabilities, identity, client
+    /// replacement, etc.).
     connection: SharedReplaceableClient<Connection>,
+    /// Issues outbound gRPC calls, automatically attaching this worker's payload/memo error limits
+    /// (set via `set_payload_error_limits`) so the gRPC layer can enforce them. Wraps a clone of
+    /// `connection`, so a client replacement on `connection` is reflected here too.
+    client: PayloadLimitsClient<SharedReplaceableClient<Connection>>,
     namespace: String,
     worker_versioning_strategy: WorkerVersioningStrategy,
     worker_instance_key: Uuid,
@@ -69,6 +78,7 @@ impl WorkerClientBag {
         worker_instance_key: Uuid,
     ) -> Self {
         Self {
+            client: PayloadLimitsClient::new(connection.clone()),
             connection,
             namespace,
             worker_versioning_strategy,
@@ -134,6 +144,10 @@ impl WorkerClientBag {
             None
         }
     }
+
+    fn worker_control_task_queue(&self) -> String {
+        worker_control_task_queue(&self.namespace, &self.worker_grouping_key().to_string())
+    }
 }
 
 /// This trait contains everything workers need to interact with Temporal, and hence provides a
@@ -157,7 +171,7 @@ pub trait WorkerClient: Sync + Send {
     async fn poll_nexus_task(
         &self,
         poll_options: PollOptions,
-        send_heartbeat: bool,
+        nexus_options: PollNexusOptions,
     ) -> Result<PollNexusTaskQueueResponse>;
     /// Complete a workflow task
     async fn complete_workflow_task(
@@ -239,6 +253,10 @@ pub trait WorkerClient: Sync + Send {
 
     /// Replace the underlying connection
     fn replace_connection(&self, new_client: Connection);
+    /// Return a clone of the current underlying connection, if one is available.
+    fn connection(&self) -> Option<Connection> {
+        None
+    }
     /// Return server capabilities
     fn capabilities(&self) -> Option<Capabilities>;
     /// Return workers using this client
@@ -256,6 +274,8 @@ pub trait WorkerClient: Sync + Send {
     /// Sets the client-reliant fields for WorkerHeartbeat. This also updates client-level tracking
     /// of heartbeat fields, like last heartbeat timestamp.
     fn set_heartbeat_client_fields(&self, heartbeat: &mut WorkerHeartbeat);
+    /// Set the worker's payload/memo error limits
+    fn set_payload_error_limits(&self, _limits: Option<PayloadErrorLimits>) {}
 }
 
 /// Configuration options shared by workflow, activity, and Nexus polling calls
@@ -279,6 +299,13 @@ pub struct PollWorkflowOptions {
 pub struct PollActivityOptions {
     /// Optional rate limit (tasks per second) for activity polling
     pub max_tasks_per_sec: Option<f64>,
+}
+/// Additional options specific to Nexus task polling
+#[derive(Debug, Clone, Default)]
+pub struct PollNexusOptions {
+    /// If true, poll using `TaskQueueKind::WorkerCommands` — the per-process control queue used
+    /// by the shared-namespace worker to receive server-to-worker commands.
+    pub worker_commands_queue: bool,
 }
 
 #[async_trait::async_trait]
@@ -310,8 +337,8 @@ impl WorkerClient for WorkerClientBag {
             worker_version_capabilities: self.worker_version_capabilities(),
             deployment_options: self.deployment_options(),
             worker_instance_key: self.worker_instance_key.to_string(),
+            worker_control_task_queue: self.worker_control_task_queue(),
             poller_group_id: Default::default(),
-            worker_control_task_queue: Default::default(),
         }
         .into_request();
         request.extensions_mut().insert(IsWorkerTaskLongPoll);
@@ -323,7 +350,7 @@ impl WorkerClient for WorkerClientBag {
         }
 
         Ok(self
-            .connection
+            .client
             .clone()
             .poll_workflow_task_queue(request)
             .await?
@@ -350,8 +377,8 @@ impl WorkerClient for WorkerClientBag {
             worker_version_capabilities: self.worker_version_capabilities(),
             deployment_options: self.deployment_options(),
             worker_instance_key: self.worker_instance_key.to_string(),
+            worker_control_task_queue: self.worker_control_task_queue(),
             poller_group_id: Default::default(),
-            worker_control_task_queue: Default::default(),
         }
         .into_request();
         request.extensions_mut().insert(IsWorkerTaskLongPoll);
@@ -363,7 +390,7 @@ impl WorkerClient for WorkerClientBag {
         }
 
         Ok(self
-            .connection
+            .client
             .clone()
             .poll_activity_task_queue(request)
             .await?
@@ -373,19 +400,26 @@ impl WorkerClient for WorkerClientBag {
     async fn poll_nexus_task(
         &self,
         poll_options: PollOptions,
-        _send_heartbeat: bool,
+        nexus_options: PollNexusOptions,
     ) -> Result<PollNexusTaskQueueResponse> {
+        let kind = if nexus_options.worker_commands_queue {
+            TaskQueueKind::WorkerCommands
+        } else {
+            TaskQueueKind::Normal
+        };
         #[allow(deprecated)] // want to list all fields explicitly
         let mut request = PollNexusTaskQueueRequest {
             namespace: self.namespace.clone(),
             task_queue: Some(TaskQueue {
                 name: poll_options.task_queue,
-                kind: TaskQueueKind::Normal as i32,
+                kind: kind as i32,
                 normal_name: "".to_string(),
             }),
             identity: self.identity(),
             worker_version_capabilities: self.worker_version_capabilities(),
             deployment_options: self.deployment_options(),
+            // TODO: Piggyback worker heartbeats here if this is the system nexus worker and reset
+            //   heartbeating ticker when done
             worker_heartbeat: Vec::new(),
             worker_instance_key: self.worker_instance_key.to_string(),
             poller_group_id: Default::default(),
@@ -400,7 +434,7 @@ impl WorkerClient for WorkerClientBag {
         }
 
         Ok(self
-            .connection
+            .client
             .clone()
             .poll_nexus_task_queue(request)
             .await?
@@ -449,12 +483,12 @@ impl WorkerClient for WorkerClientBag {
             deployment: None,
             versioning_behavior: request.versioning_behavior.into(),
             deployment_options: self.deployment_options(),
-            resource_id: Default::default(),
             worker_instance_key: self.worker_instance_key.to_string(),
-            worker_control_task_queue: Default::default(),
+            worker_control_task_queue: self.worker_control_task_queue(),
+            resource_id: Default::default(),
         };
         Ok(self
-            .connection
+            .client
             .clone()
             .respond_workflow_task_completed(request.into_request())
             .await?
@@ -467,7 +501,7 @@ impl WorkerClient for WorkerClientBag {
         result: Option<Payloads>,
     ) -> Result<RespondActivityTaskCompletedResponse> {
         Ok(self
-            .connection
+            .client
             .clone()
             .respond_activity_task_completed(
                 #[allow(deprecated)] // want to list all fields explicitly
@@ -494,7 +528,7 @@ impl WorkerClient for WorkerClientBag {
         response: nexus::v1::Response,
     ) -> Result<RespondNexusTaskCompletedResponse> {
         Ok(self
-            .connection
+            .client
             .clone()
             .respond_nexus_task_completed(
                 RespondNexusTaskCompletedRequest {
@@ -516,7 +550,7 @@ impl WorkerClient for WorkerClientBag {
         details: Option<Payloads>,
     ) -> Result<RecordActivityTaskHeartbeatResponse> {
         Ok(self
-            .connection
+            .client
             .clone()
             .record_activity_task_heartbeat(
                 RecordActivityTaskHeartbeatRequest {
@@ -538,7 +572,7 @@ impl WorkerClient for WorkerClientBag {
         details: Option<Payloads>,
     ) -> Result<RespondActivityTaskCanceledResponse> {
         Ok(self
-            .connection
+            .client
             .clone()
             .respond_activity_task_canceled(
                 #[allow(deprecated)] // want to list all fields explicitly
@@ -565,7 +599,7 @@ impl WorkerClient for WorkerClientBag {
         failure: Option<Failure>,
     ) -> Result<RespondActivityTaskFailedResponse> {
         Ok(self
-            .connection
+            .client
             .clone()
             .respond_activity_task_failed(
                 #[allow(deprecated)] // want to list all fields explicitly
@@ -610,7 +644,7 @@ impl WorkerClient for WorkerClientBag {
             resource_id: Default::default(),
         };
         Ok(self
-            .connection
+            .client
             .clone()
             .respond_workflow_task_failed(request.into_request())
             .await?
@@ -628,7 +662,7 @@ impl WorkerClient for WorkerClientBag {
         };
 
         Ok(self
-            .connection
+            .client
             .clone()
             .respond_nexus_task_failed(
                 #[allow(deprecated)]
@@ -653,7 +687,7 @@ impl WorkerClient for WorkerClientBag {
         page_token: Vec<u8>,
     ) -> Result<GetWorkflowExecutionHistoryResponse> {
         Ok(self
-            .connection
+            .client
             .clone()
             .get_workflow_execution_history(
                 GetWorkflowExecutionHistoryRequest {
@@ -689,7 +723,7 @@ impl WorkerClient for WorkerClientBag {
         let (_, completed_type, query_result, error_message) = query_result.into_components();
 
         Ok(self
-            .connection
+            .client
             .clone()
             .respond_query_task_completed(
                 RespondQueryTaskCompletedRequest {
@@ -710,12 +744,14 @@ impl WorkerClient for WorkerClientBag {
 
     async fn describe_namespace(&self) -> Result<DescribeNamespaceResponse> {
         Ok(self
-            .connection
+            .client
             .clone()
             .describe_namespace(
-                Namespace::Name(self.namespace.clone())
-                    .into_describe_namespace_request()
-                    .into_request(),
+                DescribeNamespaceRequest {
+                    namespace: self.namespace.clone(),
+                    ..Default::default()
+                }
+                .into_request(),
             )
             .await?
             .into_inner())
@@ -748,7 +784,7 @@ impl WorkerClient for WorkerClientBag {
             .insert(RetryConfigForCall(RetryOptions::no_retries()));
 
         Ok(
-            WorkflowService::shutdown_worker(&mut self.connection.clone(), request)
+            WorkflowService::shutdown_worker(&mut self.client.clone(), request)
                 .await?
                 .into_inner(),
         )
@@ -766,7 +802,7 @@ impl WorkerClient for WorkerClientBag {
             resource_id: Default::default(),
         };
         Ok(self
-            .connection
+            .client
             .clone()
             .record_worker_heartbeat(request.into_request())
             .await?
@@ -775,6 +811,10 @@ impl WorkerClient for WorkerClientBag {
 
     fn replace_connection(&self, new_connection: Connection) {
         self.connection.replace_client(new_connection);
+    }
+
+    fn connection(&self) -> Option<Connection> {
+        Some(self.connection.inner_clone())
     }
 
     fn capabilities(&self) -> Option<Capabilities> {
@@ -851,6 +891,10 @@ impl WorkerClient for WorkerClientBag {
             &mut heartbeat.local_activity_slots_info,
             &mut client_heartbeat_data.local_activity_slots_info,
         );
+    }
+
+    fn set_payload_error_limits(&self, limits: Option<PayloadErrorLimits>) {
+        self.client.set_error_limits(limits);
     }
 }
 

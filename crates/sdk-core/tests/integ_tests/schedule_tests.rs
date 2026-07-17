@@ -1,13 +1,31 @@
 use crate::common::{NAMESPACE, eventually, get_integ_client, rand_6_chars};
 use futures::TryStreamExt;
 use std::time::{Duration, SystemTime};
-use temporalio_client::schedules::{
-    CreateScheduleOptions, ListSchedulesOptions, ScheduleAction, ScheduleBackfill,
-    ScheduleCalendarSpec, ScheduleOverlapPolicy, ScheduleSpec,
+use temporalio_client::{
+    UntypedWorkflow,
+    schedules::{
+        CreateScheduleOptions, ListSchedulesOptions, ScheduleAction, ScheduleBackfill,
+        ScheduleCalendarSpec, ScheduleDescriptionAction, ScheduleOverlapPolicy, ScheduleSpec,
+    },
 };
+use temporalio_common::{data_converters::RawValue, protos::temporal::api::common::v1::Payload};
+use temporalio_macros::{workflow, workflow_methods};
+use temporalio_sdk::{WorkflowContext, WorkflowResult};
 
 async fn test_client() -> temporalio_client::Client {
     get_integ_client(NAMESPACE.to_string(), None).await
+}
+
+#[workflow]
+#[derive(Default)]
+struct ScheduleInputWorkflow;
+
+#[workflow_methods]
+impl ScheduleInputWorkflow {
+    #[run]
+    async fn run(_ctx: &mut WorkflowContext<Self>, input: String) -> WorkflowResult<String> {
+        Ok(input)
+    }
 }
 
 #[tokio::test]
@@ -20,7 +38,8 @@ async fn create_and_describe_schedule() {
             &schedule_id,
             CreateScheduleOptions::builder()
                 .action(ScheduleAction::start_workflow(
-                    "MyWorkflow",
+                    ScheduleInputWorkflow::run,
+                    String::new(),
                     "my-task-queue",
                     format!("wf-{}", rand_6_chars()),
                 ))
@@ -52,7 +71,8 @@ async fn create_schedule_with_calendar_spec() {
             &schedule_id,
             CreateScheduleOptions::builder()
                 .action(ScheduleAction::start_workflow(
-                    "MyWorkflow",
+                    ScheduleInputWorkflow::run,
+                    String::new(),
                     "my-task-queue",
                     format!("wf-{}", rand_6_chars()),
                 ))
@@ -82,7 +102,8 @@ async fn create_schedule_with_trigger_immediately() {
             &schedule_id,
             CreateScheduleOptions::builder()
                 .action(ScheduleAction::start_workflow(
-                    "MyWorkflow",
+                    ScheduleInputWorkflow::run,
+                    String::new(),
                     "my-task-queue",
                     format!("wf-{}", rand_6_chars()),
                 ))
@@ -125,7 +146,8 @@ async fn pause_and_unpause_schedule() {
             &schedule_id,
             CreateScheduleOptions::builder()
                 .action(ScheduleAction::start_workflow(
-                    "MyWorkflow",
+                    ScheduleInputWorkflow::run,
+                    String::new(),
                     "my-task-queue",
                     format!("wf-{}", rand_6_chars()),
                 ))
@@ -167,7 +189,8 @@ async fn update_schedule() {
             &schedule_id,
             CreateScheduleOptions::builder()
                 .action(ScheduleAction::start_workflow(
-                    "MyWorkflow",
+                    ScheduleInputWorkflow::run,
+                    String::new(),
                     "my-task-queue",
                     format!("wf-{}", rand_6_chars()),
                 ))
@@ -202,7 +225,8 @@ async fn trigger_schedule() {
             &schedule_id,
             CreateScheduleOptions::builder()
                 .action(ScheduleAction::start_workflow(
-                    "MyWorkflow",
+                    ScheduleInputWorkflow::run,
+                    String::new(),
                     "my-task-queue",
                     format!("wf-{}", rand_6_chars()),
                 ))
@@ -249,7 +273,8 @@ async fn backfill_schedule() {
             &schedule_id,
             CreateScheduleOptions::builder()
                 .action(ScheduleAction::start_workflow(
-                    "MyWorkflow",
+                    ScheduleInputWorkflow::run,
+                    String::new(),
                     "my-task-queue",
                     format!("wf-{}", rand_6_chars()),
                 ))
@@ -282,7 +307,8 @@ async fn delete_schedule() {
             &schedule_id,
             CreateScheduleOptions::builder()
                 .action(ScheduleAction::start_workflow(
-                    "MyWorkflow",
+                    ScheduleInputWorkflow::run,
+                    String::new(),
                     "my-task-queue",
                     format!("wf-{}", rand_6_chars()),
                 ))
@@ -310,7 +336,8 @@ async fn get_schedule_handle_for_existing_schedule() {
             &schedule_id,
             CreateScheduleOptions::builder()
                 .action(ScheduleAction::start_workflow(
-                    "MyWorkflow",
+                    ScheduleInputWorkflow::run,
+                    String::new(),
                     "my-task-queue",
                     format!("wf-{}", rand_6_chars()),
                 ))
@@ -343,7 +370,8 @@ async fn list_schedules() {
                 &schedule_id,
                 CreateScheduleOptions::builder()
                     .action(ScheduleAction::start_workflow(
-                        "MyWorkflow",
+                        ScheduleInputWorkflow::run,
+                        String::new(),
                         "my-task-queue",
                         format!("wf-{}", rand_6_chars()),
                     ))
@@ -403,7 +431,8 @@ async fn describe_accessors_match_created_values() {
             &schedule_id,
             CreateScheduleOptions::builder()
                 .action(ScheduleAction::start_workflow(
-                    "MyWorkflow",
+                    ScheduleInputWorkflow::run,
+                    String::new(),
                     "my-task-queue",
                     format!("wf-{}", rand_6_chars()),
                 ))
@@ -425,6 +454,102 @@ async fn describe_accessors_match_created_values() {
     assert!(desc.recent_actions().is_empty());
     assert!(desc.running_actions().is_empty());
     assert!(desc.create_time().is_some());
+
+    handle.delete().await.unwrap();
+}
+
+#[tokio::test]
+async fn create_schedule_with_workflow_input() {
+    let client = test_client().await;
+    let schedule_id = format!("sched-with-input-{}", rand_6_chars());
+    let workflow_id = format!("wf-{}", rand_6_chars());
+
+    let expected_payload = Payload {
+        metadata: [("encoding".to_string(), b"json/plain".to_vec())]
+            .into_iter()
+            .collect(),
+        data: b"\"hello\"".to_vec(),
+        ..Default::default()
+    };
+
+    let handle = client
+        .create_schedule(
+            &schedule_id,
+            CreateScheduleOptions::builder()
+                .action(ScheduleAction::start_workflow(
+                    UntypedWorkflow::new("MyWorkflow"),
+                    RawValue::new(vec![expected_payload.clone()]),
+                    "my-task-queue",
+                    workflow_id.clone(),
+                ))
+                .spec(ScheduleSpec::from_interval(Duration::from_secs(3600)))
+                .paused(true)
+                .build(),
+        )
+        .await
+        .unwrap();
+
+    let desc = handle.describe().await.unwrap();
+    assert!(desc.paused());
+
+    let ScheduleDescriptionAction::StartWorkflow(action) = desc.action() else {
+        panic!("expected start workflow action")
+    };
+    assert_eq!(action.workflow_type(), "MyWorkflow");
+    assert_eq!(action.task_queue(), "my-task-queue");
+    assert_eq!(action.workflow_id(), workflow_id);
+    assert_eq!(
+        action.raw_args().expect("input should be present"),
+        std::slice::from_ref(&expected_payload)
+    );
+
+    let stored: RawValue = action
+        .args()
+        .await
+        .unwrap()
+        .expect("input should be present");
+    assert_eq!(stored.payloads, vec![expected_payload]);
+
+    handle.delete().await.unwrap();
+}
+
+#[tokio::test]
+async fn schedule_action_start_workflow_encodes_typed_input() {
+    let client = test_client().await;
+    let schedule_id = format!("sched-typed-input-{}", rand_6_chars());
+    let workflow_id = format!("wf-{}", rand_6_chars());
+
+    let handle = client
+        .create_schedule(
+            &schedule_id,
+            CreateScheduleOptions::builder()
+                .action(ScheduleAction::start_workflow(
+                    ScheduleInputWorkflow::run,
+                    "hello".to_string(),
+                    "my-task-queue",
+                    workflow_id.clone(),
+                ))
+                .spec(ScheduleSpec::from_interval(Duration::from_secs(3600)))
+                .paused(true)
+                .build(),
+        )
+        .await
+        .unwrap();
+
+    let desc = handle.describe().await.unwrap();
+    let ScheduleDescriptionAction::StartWorkflow(action) = desc.action() else {
+        panic!("expected start workflow action")
+    };
+    assert_eq!(action.workflow_type(), "ScheduleInputWorkflow");
+    assert_eq!(action.task_queue(), "my-task-queue");
+    assert_eq!(action.workflow_id(), workflow_id);
+
+    let stored: String = action
+        .args()
+        .await
+        .unwrap()
+        .expect("input should be present");
+    assert_eq!(stored, "hello");
 
     handle.delete().await.unwrap();
 }

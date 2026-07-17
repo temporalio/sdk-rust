@@ -21,7 +21,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let client = Client::new(connection, client_opts)?;
 
     let worker_options = WorkerOptions::new("schedules")
-        .register_workflow::<ScheduledWorkflow>()
+        .register_workflow::<ScheduledWorkflow>()?
         .register_activities(ScheduledActivities)
         .build();
 

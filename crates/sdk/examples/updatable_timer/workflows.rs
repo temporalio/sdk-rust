@@ -1,7 +1,9 @@
 #![allow(unreachable_pub)]
 use std::time::Duration;
 use temporalio_macros::{workflow, workflow_methods};
-use temporalio_sdk::{SyncWorkflowContext, WorkflowContext, WorkflowContextView, WorkflowResult};
+use temporalio_sdk::{
+    ApplicationFailure, SyncWorkflowContext, WorkflowContext, WorkflowContextView, WorkflowResult,
+};
 
 #[workflow]
 pub struct UpdatableTimerWorkflow {
@@ -27,7 +29,7 @@ impl UpdatableTimerWorkflow {
 
             let now_ms = ctx
                 .workflow_time()
-                .ok_or_else(|| anyhow::anyhow!("Did not find workflow time"))?
+                .ok_or_else(|| ApplicationFailure::new("Did not find workflow time"))?
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
                 .as_millis() as u64;

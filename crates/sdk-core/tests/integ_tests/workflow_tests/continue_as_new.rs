@@ -1,15 +1,15 @@
-use crate::common::{CoreWfStarter, build_fake_sdk};
+use crate::common::{CoreWfStarter, SEARCH_ATTR_TXT, build_fake_sdk};
 use std::{sync::Arc, time::Duration};
 use temporalio_client::WorkflowStartOptions;
 use temporalio_common::{
-    protos::{
-        coresdk::workflow_commands::ContinueAsNewWorkflowExecution,
-        temporal::api::{
-            command::v1::command::Attributes,
-            enums::v1::{CommandType, ContinueAsNewVersioningBehavior},
-            history::v1::history_event,
+    protos::temporal::api::{
+        command::v1::command::Attributes,
+        enums::v1::{
+            CommandType, ContinueAsNewVersioningBehavior as ProtoContinueAsNewVersioningBehavior,
         },
+        history::v1::history_event,
     },
+    search_attributes::{SearchAttributeKey, SearchAttributes},
     worker::WorkerTaskTypes,
 };
 use temporalio_macros::{workflow, workflow_methods};
@@ -19,6 +19,9 @@ use temporalio_sdk_core::{
     replay::{DEFAULT_WORKFLOW_TYPE, canned_histories},
     test_help::MockPollCfg,
 };
+use temporalio_workflow::runtime::types::ContinueAsNewRequest;
+
+const SA_TXT: SearchAttributeKey<String> = SearchAttributeKey::text(SEARCH_ATTR_TXT);
 
 #[workflow]
 #[derive(Default)]
@@ -42,7 +45,7 @@ async fn continue_as_new_happy_path() {
     let mut starter = CoreWfStarter::new(wf_name);
     starter.sdk_config.task_types = WorkerTaskTypes::workflow_only();
     let mut worker = starter.worker().await;
-    worker.register_workflow::<ContinueAsNewWf>();
+    worker.register_workflow::<ContinueAsNewWf>().unwrap();
 
     let task_queue = starter.get_task_queue().to_owned();
     worker
@@ -64,7 +67,7 @@ async fn continue_as_new_multiple_concurrent() {
     starter.sdk_config.max_cached_workflows = 5_usize;
     starter.sdk_config.tuner = Arc::new(TunerHolder::fixed_size(5, 1, 1, 1));
     let mut worker = starter.worker().await;
-    worker.register_workflow::<ContinueAsNewWf>();
+    worker.register_workflow::<ContinueAsNewWf>().unwrap();
 
     let task_queue = starter.get_task_queue().to_owned();
     let wf_names = (1..=20).map(|i| format!("{wf_name}-{i}"));
@@ -90,13 +93,11 @@ impl WfWithTimer {
     #[run(name = DEFAULT_WORKFLOW_TYPE)]
     async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<()> {
         ctx.timer(Duration::from_millis(500)).await;
-        Err(WorkflowTermination::continue_as_new(
-            ContinueAsNewWorkflowExecution {
-                arguments: vec![[1].into()],
-                initial_versioning_behavior: ContinueAsNewVersioningBehavior::AutoUpgrade.into(),
-                ..Default::default()
-            },
-        ))
+        Err(WorkflowTermination::continue_as_new(ContinueAsNewRequest {
+            arguments: vec![[1].into()],
+            initial_versioning_behavior: ProtoContinueAsNewVersioningBehavior::AutoUpgrade.into(),
+            ..Default::default()
+        }))
     }
 }
 
@@ -119,13 +120,13 @@ async fn wf_completing_with_continue_as_new() {
                 assert_matches!(
                     wft.commands[0].attributes.as_ref().unwrap(),
                     Attributes::ContinueAsNewWorkflowExecutionCommandAttributes(can_attrs)
-                        if can_attrs.initial_versioning_behavior == ContinueAsNewVersioningBehavior::AutoUpgrade as i32
+                        if can_attrs.initial_versioning_behavior == ProtoContinueAsNewVersioningBehavior::AutoUpgrade as i32
                 );
             });
     });
 
     let mut worker = build_fake_sdk(mock_cfg);
-    worker.register_workflow::<WfWithTimer>();
+    worker.register_workflow::<WfWithTimer>().unwrap();
     worker.run().await.unwrap();
 }
 
@@ -139,9 +140,11 @@ impl ContinueAsNewSuggestedWf {
     async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<()> {
         // First WFT: flag should be false
         assert!(!ctx.continue_as_new_suggested());
+        assert!(!ctx.target_worker_deployment_version_changed());
         ctx.timer(Duration::from_millis(500)).await;
         // Second WFT: flag should be true (set on WFT started event 8)
         assert!(ctx.continue_as_new_suggested());
+        assert!(ctx.target_worker_deployment_version_changed());
         ctx.continue_as_new(&(), ContinueAsNewOptions::default())?;
         Ok(())
     }
@@ -156,11 +159,57 @@ async fn continue_as_new_suggested_flag_exposed() {
             he.attributes
         {
             attrs.suggest_continue_as_new = true;
+            attrs.target_worker_deployment_version_changed = true;
         }
     });
 
     let mock_cfg = MockPollCfg::from_hist_builder(t);
     let mut worker = build_fake_sdk(mock_cfg);
-    worker.register_workflow::<ContinueAsNewSuggestedWf>();
+    worker
+        .register_workflow::<ContinueAsNewSuggestedWf>()
+        .unwrap();
     worker.run().await.unwrap();
+}
+
+#[workflow]
+#[derive(Default)]
+struct ClearSearchAttrsOnContinueAsNewWf;
+
+#[workflow_methods]
+impl ClearSearchAttrsOnContinueAsNewWf {
+    #[run(name = "clear_search_attrs_on_continue_as_new")]
+    async fn run(ctx: &mut WorkflowContext<Self>, first_run: bool) -> WorkflowResult<()> {
+        if first_run {
+            let mut opts = ContinueAsNewOptions::default();
+            opts.search_attributes = Some(SearchAttributes::default());
+            ctx.continue_as_new(&false, opts)?;
+        }
+
+        assert!(ctx.search_attributes().is_empty());
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn clear_search_attributes_on_continue_as_new() {
+    let wf_name = "clear_search_attrs_on_continue_as_new";
+    let mut starter = CoreWfStarter::new(wf_name);
+    starter.sdk_config.task_types = WorkerTaskTypes::workflow_only();
+    let mut worker = starter.worker().await;
+    worker
+        .register_workflow::<ClearSearchAttrsOnContinueAsNewWf>()
+        .unwrap();
+
+    let task_queue = starter.get_task_queue().to_owned();
+    worker
+        .submit_workflow(
+            ClearSearchAttrsOnContinueAsNewWf::run,
+            true,
+            WorkflowStartOptions::new(task_queue, wf_name.to_string())
+                .search_attributes(SearchAttributes::new([SA_TXT.value_set("hello".into())]))
+                .build(),
+        )
+        .await
+        .unwrap();
+    worker.run_until_done().await.unwrap();
 }

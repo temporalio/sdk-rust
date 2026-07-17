@@ -12,12 +12,16 @@ use std::{
     collections::HashMap,
     env,
     string::ToString,
-    sync::{Arc, OnceLock},
+    sync::{
+        Arc, OnceLock,
+        atomic::{AtomicUsize, Ordering},
+    },
     time::Duration,
 };
 use temporalio_client::{
-    Connection, NamespacedClient, REQUEST_LATENCY_HISTOGRAM_NAME, UntypedQuery, UntypedWorkflow,
-    WorkflowExecutionInfo, WorkflowQueryOptions, WorkflowStartOptions, grpc::WorkflowService,
+    Connection, MESSAGE_TOO_LARGE_KEY, NamespacedClient, REQUEST_LATENCY_HISTOGRAM_NAME,
+    UntypedQuery, UntypedWorkflow, WorkflowExecutionInfo, WorkflowQueryOptions,
+    WorkflowStartOptions, grpc::WorkflowService,
 };
 use temporalio_common::{
     data_converters::RawValue,
@@ -38,6 +42,7 @@ use temporalio_common::{
             common::v1::RetryPolicy,
             enums::v1::{
                 NexusHandlerErrorRetryBehavior, WorkflowIdConflictPolicy, WorkflowIdReusePolicy,
+                WorkflowTaskFailedCause,
             },
             failure::v1::Failure,
             nexus::{
@@ -69,17 +74,20 @@ use temporalio_sdk::{
     activities::{ActivityContext, ActivityError},
 };
 use temporalio_sdk_core::{
-    CoreRuntime, FixedSizeSlotSupplier, PollError, PollerBehavior, SlotKind, SlotMarkUsedContext,
-    SlotReleaseContext, SlotReservationContext, SlotSupplier, SlotSupplierPermit,
-    TokioRuntimeBuilder, TunerBuilder, WorkerConfig, WorkerVersioningStrategy, WorkflowSlotKind,
-    init_worker, prost_dur,
+    ActivitySlotKind, CoreRuntime, FixedSizeSlotSupplier, PollError, PollerBehavior, SlotKind,
+    SlotMarkUsedContext, SlotReleaseContext, SlotReservationContext, SlotSupplier,
+    SlotSupplierPermit, TokioRuntimeBuilder, TunerBuilder, WorkerConfig, WorkerVersioningStrategy,
+    WorkflowSlotKind, init_worker, prost_dur,
     replay::TestHistoryBuilder,
     test_help::{
         MockPollCfg, ResponseType, TemporalMeter, WorkerExt, WorkerTestHelpers, build_mock_pollers,
         mock_worker, mock_worker_client,
     },
 };
-use tokio::{join, sync::Barrier};
+use tokio::{
+    join,
+    sync::{Barrier, Notify},
+};
 use tonic::IntoRequest;
 use url::Url;
 
@@ -390,6 +398,173 @@ async fn one_slot_worker_reports_available_slot() {
         worker.initiate_shutdown();
     };
     join!(wf_polling, act_polling, nexus_polling, testing);
+}
+
+struct ReservationTrackingActivitySlotSupplier {
+    inner: FixedSizeSlotSupplier<ActivitySlotKind>,
+    reservations: AtomicUsize,
+    reservation_changed: Notify,
+}
+
+impl ReservationTrackingActivitySlotSupplier {
+    fn new(slots: usize) -> Self {
+        Self {
+            inner: FixedSizeSlotSupplier::new(slots),
+            reservations: AtomicUsize::new(0),
+            reservation_changed: Notify::new(),
+        }
+    }
+
+    fn record_reservation(&self) {
+        self.reservations.fetch_add(1, Ordering::Release);
+        self.reservation_changed.notify_waiters();
+    }
+
+    async fn wait_for_reservations(&self, expected: usize) {
+        loop {
+            let changed = self.reservation_changed.notified();
+            if self.reservations.load(Ordering::Acquire) >= expected {
+                return;
+            }
+            changed.await;
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl SlotSupplier for ReservationTrackingActivitySlotSupplier {
+    type SlotKind = ActivitySlotKind;
+
+    async fn reserve_slot(&self, ctx: &dyn SlotReservationContext) -> SlotSupplierPermit {
+        let permit = self.inner.reserve_slot(ctx).await;
+        self.record_reservation();
+        permit
+    }
+
+    fn try_reserve_slot(&self, ctx: &dyn SlotReservationContext) -> Option<SlotSupplierPermit> {
+        let permit = self.inner.try_reserve_slot(ctx)?;
+        self.record_reservation();
+        Some(permit)
+    }
+
+    fn mark_slot_used(&self, ctx: &dyn SlotMarkUsedContext<SlotKind = Self::SlotKind>) {
+        self.inner.mark_slot_used(ctx);
+    }
+
+    fn release_slot(&self, ctx: &dyn SlotReleaseContext<SlotKind = Self::SlotKind>) {
+        self.inner.release_slot(ctx);
+    }
+
+    fn available_slots(&self) -> Option<usize> {
+        self.inner.available_slots()
+    }
+
+    fn slot_supplier_kind(&self) -> String {
+        self.inner.slot_supplier_kind()
+    }
+}
+
+#[tokio::test]
+async fn idle_activity_worker_reports_zero_slots_used() {
+    let (telemopts, addr, _aborter) = prom_metrics(None);
+    let rt = CoreRuntime::new_assume_tokio(get_integ_runtime_options(telemopts)).unwrap();
+    let mut starter =
+        CoreWfStarter::new_with_runtime("idle_activity_worker_reports_zero_slots_used", rt);
+    starter.sdk_config.activity_task_poller_behavior = PollerBehavior::Autoscaling {
+        minimum: 1,
+        maximum: 1,
+        initial: 1,
+    };
+    let activity_slots = Arc::new(ReservationTrackingActivitySlotSupplier::new(3));
+    let mut tuner = TunerBuilder::default();
+    tuner.activity_slot_supplier(activity_slots.clone());
+    starter.sdk_config.tuner = Arc::new(tuner.build());
+
+    let finish_activity = Arc::new(Barrier::new(2));
+    struct BlockingActivity {
+        finish: Arc<Barrier>,
+    }
+
+    #[activities]
+    impl BlockingActivity {
+        #[activity]
+        async fn run(self: Arc<Self>, _ctx: ActivityContext) -> Result<(), ActivityError> {
+            self.finish.wait().await;
+            Ok(())
+        }
+    }
+
+    starter.sdk_config.register_activities(BlockingActivity {
+        finish: finish_activity.clone(),
+    });
+    let mut worker = starter.worker().await;
+
+    #[workflow]
+    #[derive(Default)]
+    struct OneActivity;
+
+    #[workflow_methods]
+    impl OneActivity {
+        #[run]
+        async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<()> {
+            ctx.start_activity(
+                BlockingActivity::run,
+                (),
+                ActivityOptions::with_start_to_close_timeout(Duration::from_secs(5))
+                    .do_not_eagerly_execute(true)
+                    .build(),
+            )
+            .await?;
+            Ok(())
+        }
+    }
+
+    worker.register_workflow::<OneActivity>().unwrap();
+    let task_queue = starter.get_task_queue().to_owned();
+    let handle = worker
+        .submit_workflow(
+            OneActivity::run,
+            (),
+            WorkflowStartOptions::new(task_queue.clone(), task_queue.clone()).build(),
+        )
+        .await
+        .unwrap();
+    let core_worker = worker.core_worker();
+
+    let (run_result, metric_line) = join!(worker.inner_mut().run(), async move {
+        activity_slots.wait_for_reservations(3).await;
+        finish_activity.wait().await;
+        handle.get_result(Default::default()).await.unwrap();
+
+        let metric_line = eventually(
+            || {
+                let endpoint = format!("http://{addr}/metrics");
+                let task_queue = task_queue.clone();
+                async move {
+                    let body = get_text(endpoint).await;
+                    body.lines()
+                        .find(|line| {
+                            line.starts_with("temporal_worker_task_slots_used{")
+                                && line.contains(&format!("task_queue=\"{task_queue}\""))
+                                && line.contains("worker_type=\"ActivityWorker\"")
+                        })
+                        .map(ToString::to_string)
+                        .ok_or_else(|| anyhow!("activity slots-used metric should exist"))
+                }
+            },
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
+        core_worker.initiate_shutdown();
+        metric_line
+    });
+    run_result.unwrap();
+
+    assert!(
+        metric_line.ends_with(" 0"),
+        "idle activity worker should have no used slots, got: {metric_line}"
+    );
 }
 
 #[rstest::rstest]
@@ -881,7 +1056,8 @@ async fn activity_metrics() {
                     retry_policy: RetryPolicy {
                         maximum_attempts: 1,
                         ..Default::default()
-                    },
+                    }
+                    .into(),
                     ..Default::default()
                 },
             );
@@ -892,7 +1068,8 @@ async fn activity_metrics() {
                     retry_policy: RetryPolicy {
                         maximum_attempts: 1,
                         ..Default::default()
-                    },
+                    }
+                    .into(),
                     ..Default::default()
                 },
             );
@@ -904,7 +1081,7 @@ async fn activity_metrics() {
         }
     }
 
-    worker.register_workflow::<ActivityMetricsWf>();
+    worker.register_workflow::<ActivityMetricsWf>().unwrap();
     let task_queue = starter.get_task_queue().to_owned();
     let workflow_id = wf_name.to_owned();
     worker
@@ -1042,7 +1219,7 @@ async fn nexus_metrics() {
         }
     }
 
-    worker.register_workflow::<NexusMetricsWf>();
+    worker.register_workflow::<NexusMetricsWf>().unwrap();
     let task_queue = starter.get_task_queue().to_owned();
     let workflow_id = wf_name.to_owned();
     worker
@@ -1195,7 +1372,7 @@ async fn evict_on_complete_does_not_count_as_forced_eviction() {
         }
     }
 
-    worker.register_workflow::<EvictOnCompleteWf>();
+    worker.register_workflow::<EvictOnCompleteWf>().unwrap();
     let task_queue = starter.get_task_queue().to_owned();
     let workflow_id = wf_name.to_owned();
     worker
@@ -1293,7 +1470,7 @@ async fn metrics_available_from_custom_slot_supplier() {
         }
     }
 
-    worker.register_workflow::<CustomSlotSupplierWf>();
+    worker.register_workflow::<CustomSlotSupplierWf>().unwrap();
     let task_queue = starter.get_task_queue().to_owned();
     worker
         .submit_workflow(
@@ -1466,7 +1643,9 @@ async fn sticky_queue_label_strategy(
         }
     }
 
-    worker.register_workflow::<StickyQueueLabelStrategyWf>();
+    worker
+        .register_workflow::<StickyQueueLabelStrategyWf>()
+        .unwrap();
     let task_queue = starter.get_task_queue().to_owned();
     worker
         .submit_workflow(
@@ -1554,7 +1733,9 @@ async fn resource_based_tuner_metrics() {
         }
     }
 
-    worker.register_workflow::<ResourceBasedTunerMetricsWf>();
+    worker
+        .register_workflow::<ResourceBasedTunerMetricsWf>()
+        .unwrap();
     let task_queue = starter.get_task_queue().to_owned();
     let workflow_id = wf_name.to_owned();
     worker
@@ -1747,4 +1928,161 @@ async fn wf_task_latency_recorded_on_dropped_wft() {
     )
     .await
     .unwrap();
+}
+
+#[tokio::test]
+async fn wf_task_execution_failed_metric_includes_workflow_type() {
+    let (telemopts, addr, _aborter) = prom_metrics(None);
+    let rt = CoreRuntime::new_assume_tokio(get_integ_runtime_options(telemopts)).unwrap();
+    let meter = rt.telemetry().get_temporal_metric_meter().unwrap();
+
+    let mut t = TestHistoryBuilder::default();
+    t.add_by_type(
+        temporalio_common::protos::temporal::api::enums::v1::EventType::WorkflowExecutionStarted,
+    );
+    t.add_workflow_task_scheduled_and_started();
+
+    let mut mh = MockPollCfg::from_resp_batches(
+        "fake_wf_id",
+        t,
+        [ResponseType::AllHistory, ResponseType::AllHistory],
+        mock_worker_client(),
+    );
+    mh.num_expected_fails = 1;
+    mh.num_expected_completions = Some(0.into());
+
+    let mut mock = build_mock_pollers(mh);
+    mock.worker_cfg(|wc| wc.max_cached_workflows = 1);
+    mock.set_temporal_meter(meter);
+    let core = mock_worker(mock);
+
+    let act = core.poll_workflow_activation().await.unwrap();
+    core.complete_workflow_activation(WorkflowActivationCompletion::fail(
+        act.run_id,
+        "test failure".into(),
+        None,
+    ))
+    .await
+    .unwrap();
+    core.handle_eviction().await;
+
+    // The reported WFT failure evicts the run. Consume the replayed activation so the worker can
+    // shut down cleanly without an outstanding workflow task.
+    let act = core.poll_workflow_activation().await.unwrap();
+    core.complete_workflow_activation(WorkflowActivationCompletion::fail(
+        act.run_id,
+        "test failure".into(),
+        None,
+    ))
+    .await
+    .unwrap();
+
+    core.drain_pollers_and_shutdown().await;
+
+    let metric_line = eventually(
+        || {
+            let endpoint = format!("http://{addr}/metrics");
+            async move {
+                let body = get_text(endpoint).await;
+                body.lines()
+                    .find(|l| {
+                        l.starts_with("temporal_workflow_task_execution_failed{")
+                            && l.contains("failure_reason=\"WorkflowError\"")
+                    })
+                    .map(ToString::to_string)
+                    .ok_or_else(|| anyhow!("wf_task_execution_failed metric not found"))
+            }
+        },
+        Duration::from_secs(5),
+    )
+    .await
+    .unwrap();
+
+    assert!(
+        metric_line.contains("workflow_type=\"default_wf_type\""),
+        "Expected workflow_type label on metric, got: {metric_line}"
+    );
+}
+
+#[tokio::test]
+async fn grpc_message_too_large_wf_task_execution_failed_metric_includes_workflow_type() {
+    let (telemopts, addr, _aborter) = prom_metrics(None);
+    let rt = CoreRuntime::new_assume_tokio(get_integ_runtime_options(telemopts)).unwrap();
+    let meter = rt.telemetry().get_temporal_metric_meter().unwrap();
+
+    let mut t = TestHistoryBuilder::default();
+    t.add_by_type(
+        temporalio_common::protos::temporal::api::enums::v1::EventType::WorkflowExecutionStarted,
+    );
+    t.add_workflow_task_scheduled_and_started();
+
+    let mut mh = MockPollCfg::from_resp_batches(
+        "fake_wf_id",
+        t,
+        [ResponseType::AllHistory, ResponseType::AllHistory],
+        mock_worker_client(),
+    );
+    mh.num_expected_fails = 1;
+    let mut times = 1;
+    mh.completion_mock_fn = Some(Box::new(move |_| {
+        if times == 1 {
+            let mut err = tonic::Status::new(
+                tonic::Code::ResourceExhausted,
+                "grpc: received message larger than max",
+            );
+            err.metadata_mut().insert(MESSAGE_TOO_LARGE_KEY, 1.into());
+            times += 1;
+            Err(err)
+        } else {
+            Ok(Default::default())
+        }
+    }));
+    mh.expect_fail_wft_matcher =
+        Box::new(|_, cause, _| *cause == WorkflowTaskFailedCause::GrpcMessageTooLarge);
+
+    let mut mock = build_mock_pollers(mh);
+    mock.worker_cfg(|wc| wc.max_cached_workflows = 1);
+    mock.set_temporal_meter(meter);
+    let core = mock_worker(mock);
+
+    let act = core.poll_workflow_activation().await.unwrap();
+    core.complete_workflow_activation(WorkflowActivationCompletion::empty(&act.run_id))
+        .await
+        .unwrap();
+    core.handle_eviction().await;
+
+    // The first completion records the metric and evicts the run. Complete the replayed activation
+    // so the worker has no outstanding workflow task when shutdown drains pollers.
+    let act = core.poll_workflow_activation().await.unwrap();
+    core.complete_execution(&act.run_id).await;
+
+    core.drain_pollers_and_shutdown().await;
+
+    let metric_line = eventually(
+        || {
+            let endpoint = format!("http://{addr}/metrics");
+            async move {
+                let body = get_text(endpoint).await;
+                body.lines()
+                    .find(|l| {
+                        l.starts_with("temporal_workflow_task_execution_failed{")
+                            && l.contains("failure_reason=\"GrpcMessageTooLarge\"")
+                    })
+                    .map(ToString::to_string)
+                    .ok_or_else(|| anyhow!("wf_task_execution_failed metric not found"))
+            }
+        },
+        Duration::from_secs(5),
+    )
+    .await
+    .unwrap();
+
+    assert!(
+        metric_line.contains("failure_reason=\"GrpcMessageTooLarge\""),
+        "Expected GrpcMessageTooLarge failure reason on metric, got: {metric_line}"
+    );
+    assert!(
+        metric_line.contains("workflow_type=\"default_wf_type\""),
+        "Expected workflow_type label on metric, got: {metric_line}"
+    );
 }

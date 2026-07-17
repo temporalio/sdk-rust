@@ -25,11 +25,15 @@ pub mod request_extensions;
 mod retry;
 /// Schedule operations: create, describe, update, pause, trigger, backfill, list, and delete.
 pub mod schedules;
+#[cfg(test)]
+mod test_helpers;
 pub mod worker;
 mod workflow_handle;
+mod workflow_status;
 
 pub use crate::{
     proxy::HttpConnectProxyOptions,
+    request_extensions::PayloadErrorLimits,
     retry::{CallType, RETRYABLE_ERROR_CODES},
 };
 pub use async_activity_handle::{
@@ -40,12 +44,21 @@ pub use metrics::{LONG_REQUEST_LATENCY_HISTOGRAM_NAME, REQUEST_LATENCY_HISTOGRAM
 pub use options_structs::*;
 pub use replaceable::SharedReplaceableClient;
 pub use retry::RetryOptions;
+pub use temporalio_common::{Memo, RetryPolicy};
+/// Potentially dangerous TLS related functionality.
+pub mod danger {
+    /// Re-export the `ServerCertVerifier` trait so that users can implement custom TLS
+    /// server certificate verification without depending on `tokio-rustls` directly,
+    /// while explicitly acknowledging the danger in the import path.
+    pub use tokio_rustls::rustls::client::danger::ServerCertVerifier;
+}
 pub use tonic;
 pub use workflow_handle::{
     UntypedQuery, UntypedSignal, UntypedUpdate, UntypedWorkflow, UntypedWorkflowHandle,
     WorkflowExecutionDescription, WorkflowExecutionInfo, WorkflowExecutionResult, WorkflowHandle,
-    WorkflowHistory, WorkflowUpdateHandle,
+    WorkflowHistory, WorkflowResultDetails, WorkflowUpdateHandle,
 };
+pub use workflow_status::WorkflowExecutionStatus;
 
 use crate::{
     grpc::{
@@ -75,14 +88,15 @@ use temporalio_common::{
         DataConverter, GenericPayloadConverter, PayloadConverter, SerializationContext,
         SerializationContextData,
     },
+    payload_visitor::decode_payloads,
     protos::{
         coresdk::IntoPayloadsExt,
         grpc::health::v1::health_client::HealthClient,
         proto_ts_to_system_time,
         temporal::api::{
             cloud::cloudservice::v1::cloud_service_client::CloudServiceClient,
-            common::v1::{Memo, Payload, SearchAttributes, WorkflowType},
-            enums::v1::{TaskQueueKind, WorkflowExecutionStatus},
+            common::v1::WorkflowType,
+            enums::v1::TaskQueueKind,
             errordetails::v1::WorkflowExecutionAlreadyStartedFailure,
             operatorservice::v1::operator_service_client::OperatorServiceClient,
             sdk::v1::UserMetadata,
@@ -96,18 +110,20 @@ use temporalio_common::{
         },
         utilities::decode_status_detail,
     },
+    search_attributes::{SearchAttributeError, SearchAttributeValue, SearchAttributes},
 };
 use tonic::{
     Code, IntoRequest,
     body::Body,
     client::GrpcService,
+    codec::CompressionEncoding,
     codegen::InterceptedService,
     metadata::{
         AsciiMetadataKey, AsciiMetadataValue, BinaryMetadataKey, BinaryMetadataValue, MetadataMap,
         MetadataValue,
     },
     service::Interceptor,
-    transport::{Certificate, Channel, Endpoint, Identity},
+    transport::{Certificate, Endpoint, Identity},
 };
 use tower::ServiceBuilder;
 use uuid::Uuid;
@@ -119,6 +135,14 @@ static TEMPORAL_NAMESPACE_HEADER_KEY: &str = "temporal-namespace";
 #[doc(hidden)]
 /// Key used to communicate when a GRPC message is too large
 pub static MESSAGE_TOO_LARGE_KEY: &str = "message-too-large";
+#[doc(hidden)]
+/// Returns the violation, if `status` is the client proactively rejecting an outbound request for exceeding a
+/// payload/memo error size limit.
+pub fn payload_limit_violation_from(
+    status: &tonic::Status,
+) -> Option<&temporalio_common::payload_limits::PayloadLimitViolation> {
+    std::error::Error::source(status).and_then(|src| src.downcast_ref())
+}
 #[doc(hidden)]
 /// Key used to indicate a error was returned by the retryer because of the short-circuit predicate
 pub static ERROR_RETURNED_DUE_TO_SHORT_CIRCUIT: &str = "short-circuit";
@@ -149,13 +173,54 @@ struct ConnectionInner {
     capabilities: Option<get_system_info_response::Capabilities>,
     workers: Arc<ClientWorkerSet>,
     _dns_task: Option<Arc<dns::DnsReresolutionHandle>>,
+    /// Configured payload/memo size warning thresholds (bytes); `0` disables that warning.
+    payloads_warn_size: usize,
+    memo_warn_size: usize,
+}
+
+/// Resolve a user-configured warning threshold (bytes) into the internal representation. `0`
+/// disables the warning (`None`); so does a value that doesn't fit in `usize` on this platform (a
+/// threshold larger than any addressable payload could never fire anyway), with a warning logged.
+/// `option` names the configured field, for diagnostics.
+fn resolve_warn_threshold(option: &'static str, bytes: u64) -> usize {
+    usize::try_from(bytes).unwrap_or_else(|_| {
+        warn!(
+            option,
+            configured_bytes = bytes,
+            "Configured payload size warning threshold exceeds the maximum addressable size on this \
+             platform; disabling this warning"
+        );
+        0
+    })
 }
 
 impl Connection {
     /// Connect to a Temporal service.
-    pub async fn connect(options: ConnectionOptions) -> Result<Self, ClientConnectError> {
-        let dns_lb_opts = dns::validate_and_get_dns_lb(&options)?.cloned();
-        let (service, dns_task) = if let Some(service_override) = options.service_override {
+    pub async fn connect(mut options: ConnectionOptions) -> Result<Self, ClientConnectError> {
+        if options.service_override.is_some() {
+            options.grpc_compression = GrpcCompression::None;
+        }
+
+        let first_result = Self::connect_once(&options).await;
+        if options.grpc_compression == GrpcCompression::Gzip
+            && let Err(ClientConnectError::SystemInfoCallError(status)) = &first_result
+            && status.code() == Code::Unimplemented
+            && {
+                let msg = status.message().to_lowercase();
+                msg.contains("decompress")
+                    || msg.contains("grpc-encoding")
+                    || msg.contains("compressor")
+            }
+        {
+            options.grpc_compression = GrpcCompression::None;
+            return Self::connect_once(&options).await;
+        }
+        first_result
+    }
+
+    async fn connect_once(options: &ConnectionOptions) -> Result<Self, ClientConnectError> {
+        let dns_lb_opts = dns::validate_and_get_dns_lb(options)?.cloned();
+        let (service, dns_task) = if let Some(service_override) = options.service_override.clone() {
             (
                 GrpcMetricSvc {
                     inner: ChannelOrGrpcOverride::GrpcOverride(service_override),
@@ -165,7 +230,7 @@ impl Connection {
                 None,
             )
         } else if let Some(dns_opts) = &dns_lb_opts {
-            let (channel, sender) = dns::create_balanced_channel(&options).await?;
+            let (channel, sender) = dns::create_balanced_channel(options).await?;
             let handle = dns::spawn_dns_reresolution(
                 sender,
                 options.target.clone(),
@@ -185,7 +250,7 @@ impl Connection {
                 Some(handle),
             )
         } else {
-            let channel = Channel::from_shared(options.target.to_string())?;
+            let channel = Endpoint::from_shared(options.target.to_string())?;
             let channel = add_tls_to_channel(options.tls_options.as_ref(), channel).await?;
             let channel = if let Some(keep_alive) = options.keep_alive.as_ref() {
                 channel
@@ -231,7 +296,7 @@ impl Connection {
             headers: headers.clone(),
         };
         let svc = InterceptedService::new(service, interceptor);
-        let mut svc_client = TemporalServiceClient::new(svc);
+        let mut svc_client = TemporalServiceClient::new(svc, options.grpc_compression);
 
         let capabilities = if !options.skip_get_system_info {
             match svc_client
@@ -240,7 +305,19 @@ impl Connection {
             {
                 Ok(sysinfo) => sysinfo.into_inner().capabilities,
                 Err(status) => match status.code() {
-                    Code::Unimplemented => None,
+                    Code::Unimplemented
+                        if {
+                            let msg = status.message().to_lowercase();
+                            msg.contains("unknown method")
+                                || msg.contains("unknown service")
+                                || msg.contains("method not found")
+                                || (msg.contains("getsysteminfo")
+                                    && (msg.contains("is unimplemented")
+                                        || msg.contains("not implement")))
+                        } =>
+                    {
+                        None
+                    }
                     _ => return Err(ClientConnectError::SystemInfoCallError(status)),
                 },
             }
@@ -250,14 +327,22 @@ impl Connection {
         Ok(Self {
             inner: Arc::new(ConnectionInner {
                 service: svc_client,
-                retry_options: options.retry_options,
-                identity: options.identity,
+                retry_options: options.retry_options.clone(),
+                identity: options.identity.clone(),
                 headers,
-                client_name: options.client_name,
-                client_version: options.client_version,
+                client_name: options.client_name.clone(),
+                client_version: options.client_version.clone(),
                 capabilities,
                 workers: Arc::new(ClientWorkerSet::new()),
                 _dns_task: dns_task,
+                payloads_warn_size: resolve_warn_threshold(
+                    "payloads_warn_size",
+                    options.payload_limits.payloads_warn_size,
+                ),
+                memo_warn_size: resolve_warn_threshold(
+                    "memo_warn_size",
+                    options.payload_limits.memo_warn_size,
+                ),
             }),
         })
     }
@@ -408,13 +493,21 @@ async fn add_tls_to_channel(
     mut channel: Endpoint,
 ) -> Result<Endpoint, ClientConnectError> {
     if let Some(tls_cfg) = tls_options {
+        if tls_cfg.server_cert_verifier.is_some() && tls_cfg.server_root_ca_cert.is_some() {
+            return Err(ClientConnectError::InvalidConfig(
+                "Cannot set both `server_root_ca_cert` and `server_cert_verifier`".to_owned(),
+            ));
+        }
+
         let mut tls = tonic::transport::ClientTlsConfig::new();
 
-        if let Some(root_cert) = &tls_cfg.server_root_ca_cert {
-            let server_root_ca_cert = Certificate::from_pem(root_cert);
-            tls = tls.ca_certificate(server_root_ca_cert);
-        } else {
-            tls = tls.with_native_roots();
+        if tls_cfg.server_cert_verifier.is_none() {
+            if let Some(root_cert) = &tls_cfg.server_root_ca_cert {
+                let server_root_ca_cert = Certificate::from_pem(root_cert);
+                tls = tls.ca_certificate(server_root_ca_cert);
+            } else {
+                tls = tls.with_native_roots();
+            }
         }
 
         if let Some(domain) = &tls_cfg.domain {
@@ -434,7 +527,13 @@ async fn add_tls_to_channel(
             tls = tls.identity(client_identity);
         }
 
-        return channel.tls_config(tls).map_err(Into::into);
+        return if let Some(verifier) = &tls_cfg.server_cert_verifier {
+            channel
+                .tls_config_with_verifier(tls, verifier.clone())
+                .map_err(Into::into)
+        } else {
+            channel.tls_config(tls).map_err(Into::into)
+        };
     }
     Ok(channel)
 }
@@ -553,7 +652,7 @@ fn get_decode_max_size() -> usize {
 }
 
 impl TemporalServiceClient {
-    fn new<T>(svc: T) -> Self
+    fn new<T>(svc: T, compression: GrpcCompression) -> Self
     where
         T: GrpcService<Body> + Send + Sync + Clone + 'static,
         T::ResponseBody: tonic::codegen::Body<Data = tonic::codegen::Bytes> + Send + 'static,
@@ -561,23 +660,25 @@ impl TemporalServiceClient {
         <T::ResponseBody as tonic::codegen::Body>::Error: Into<tonic::codegen::StdError> + Send,
         <T as GrpcService<Body>>::Future: Send,
     {
-        let workflow_svc_client = Box::new(
-            WorkflowServiceClient::new(svc.clone())
-                .max_decoding_message_size(get_decode_max_size()),
-        );
-        let operator_svc_client = Box::new(
-            OperatorServiceClient::new(svc.clone())
-                .max_decoding_message_size(get_decode_max_size()),
-        );
-        let cloud_svc_client = Box::new(
-            CloudServiceClient::new(svc.clone()).max_decoding_message_size(get_decode_max_size()),
-        );
-        let test_svc_client = Box::new(
-            TestServiceClient::new(svc.clone()).max_decoding_message_size(get_decode_max_size()),
-        );
-        let health_svc_client = Box::new(
-            HealthClient::new(svc.clone()).max_decoding_message_size(get_decode_max_size()),
-        );
+        // The generated service clients don't share a trait exposing the compression setters, so
+        // a macro applies the same configuration to each concrete client type.
+        macro_rules! configure {
+            ($client:expr) => {{
+                let client = $client.max_decoding_message_size(get_decode_max_size());
+                match compression {
+                    GrpcCompression::Gzip => client
+                        .send_compressed(CompressionEncoding::Gzip)
+                        .accept_compressed(CompressionEncoding::Gzip),
+                    GrpcCompression::None => client,
+                }
+            }};
+        }
+
+        let workflow_svc_client = Box::new(configure!(WorkflowServiceClient::new(svc.clone())));
+        let operator_svc_client = Box::new(configure!(OperatorServiceClient::new(svc.clone())));
+        let cloud_svc_client = Box::new(configure!(CloudServiceClient::new(svc.clone())));
+        let test_svc_client = Box::new(configure!(TestServiceClient::new(svc.clone())));
+        let health_svc_client = Box::new(configure!(HealthClient::new(svc.clone())));
 
         Self {
             workflow_svc_client,
@@ -758,17 +859,6 @@ pub enum Namespace {
     Id(String),
 }
 
-impl Namespace {
-    /// Convert into grpc request
-    pub fn into_describe_namespace_request(self) -> DescribeNamespaceRequest {
-        let (namespace, id) = match self {
-            Namespace::Name(n) => (n, "".to_owned()),
-            Namespace::Id(n) => ("".to_owned(), n),
-        };
-        DescribeNamespaceRequest { namespace, id }
-    }
-}
-
 /// This trait provides higher-level friendlier interaction with the server.
 /// See the [WorkflowService] trait for a lower-level client.
 pub(crate) trait WorkflowClientTrait: NamespacedClient {
@@ -843,12 +933,18 @@ pub trait NamespacedClient {
 #[derive(Debug, Clone)]
 pub struct WorkflowExecution {
     raw: workflow::WorkflowExecutionInfo,
+    data_converter: DataConverter,
 }
 
 impl WorkflowExecution {
-    /// Create a new WorkflowExecution from the raw proto.
-    pub fn new(raw: workflow::WorkflowExecutionInfo) -> Self {
-        Self { raw }
+    fn new_with_data_converter(
+        raw: workflow::WorkflowExecutionInfo,
+        data_converter: DataConverter,
+    ) -> Self {
+        Self {
+            raw,
+            data_converter,
+        }
     }
 
     /// The workflow ID.
@@ -880,7 +976,7 @@ impl WorkflowExecution {
 
     /// The current status of the workflow execution.
     pub fn status(&self) -> WorkflowExecutionStatus {
-        self.raw.status()
+        WorkflowExecutionStatus::from_raw(self.raw.status)
     }
 
     /// When the workflow was created.
@@ -917,9 +1013,13 @@ impl WorkflowExecution {
         self.raw.history_length
     }
 
-    /// Workflow memo.
-    pub fn memo(&self) -> Option<&Memo> {
-        self.raw.memo.as_ref()
+    /// Workflow memo decoded with the client's payload converter.
+    pub fn memo(&self) -> Memo {
+        Memo::from_raw(
+            self.raw.memo.clone(),
+            self.data_converter.payload_converter().clone(),
+            SerializationContextData::Workflow,
+        )
     }
 
     /// Parent workflow ID, if this is a child workflow.
@@ -939,8 +1039,12 @@ impl WorkflowExecution {
     }
 
     /// Search attributes on the workflow.
-    pub fn search_attributes(&self) -> Option<&SearchAttributes> {
-        self.raw.search_attributes.as_ref()
+    pub fn search_attributes(&self) -> SearchAttributes {
+        self.raw
+            .search_attributes
+            .as_ref()
+            .map(SearchAttributes::from_proto)
+            .unwrap_or_default()
     }
 
     /// Access the raw proto for additional fields not exposed via accessors.
@@ -951,12 +1055,6 @@ impl WorkflowExecution {
     /// Consume the wrapper and return the raw proto.
     pub fn into_raw(self) -> workflow::WorkflowExecutionInfo {
         self.raw
-    }
-}
-
-impl From<workflow::WorkflowExecutionInfo> for WorkflowExecution {
-    fn from(raw: workflow::WorkflowExecutionInfo) -> Self {
-        Self::new(raw)
     }
 }
 
@@ -1019,26 +1117,40 @@ impl WorkflowExecutionCount {
 /// Aggregation group from a workflow count query with a group-by clause.
 #[derive(Debug, Clone)]
 pub struct WorkflowCountAggregationGroup {
-    group_values: Vec<Payload>,
-    count: usize,
+    raw: count_workflow_executions_response::AggregationGroup,
 }
 
 impl WorkflowCountAggregationGroup {
     fn from_proto(proto: count_workflow_executions_response::AggregationGroup) -> Self {
-        Self {
-            group_values: proto.group_values,
-            count: proto.count as usize,
-        }
+        Self { raw: proto }
     }
 
-    /// The search attribute values for this group.
-    pub fn group_values(&self) -> &[Payload] {
-        &self.group_values
+    /// Retrieve a typed group value at `index`.
+    ///
+    ///  Returns `None` if the index is out of bounds or deserialization fails.
+    ///  Use [`Self::try_get`] for explicit error handling.
+    pub fn get<T: SearchAttributeValue>(&self, index: usize) -> Option<T> {
+        self.try_get(index).ok().flatten()
+    }
+
+    /// Retrieve a typed group value at `index`, preserving deserialization
+    /// errors.
+    ///
+    /// Returns `Ok(None)` if the index is out of bounds and `Err` if the
+    /// payload cannot be deserialized.
+    pub fn try_get<T: SearchAttributeValue>(
+        &self,
+        index: usize,
+    ) -> Result<Option<T>, SearchAttributeError> {
+        match self.raw.group_values.get(index) {
+            Some(payload) => T::from_search_attribute_payload(payload).map(Some),
+            None => Ok(None),
+        }
     }
 
     /// The approximate number of workflows matching for this group.
     pub fn count(&self) -> usize {
-        self.count
+        self.raw.count as usize
     }
 }
 
@@ -1114,8 +1226,9 @@ where
                         .and_then(|d| d.try_into().ok()),
                     workflow_run_timeout: options.run_timeout.and_then(|d| d.try_into().ok()),
                     workflow_task_timeout: options.task_timeout.and_then(|d| d.try_into().ok()),
-                    search_attributes: options.search_attributes.map(|d| d.into()),
+                    search_attributes: options.search_attributes.map(|t| t.into_proto()),
                     cron_schedule: options.cron_schedule.unwrap_or_default(),
+                    retry_policy: options.retry_policy.map(Into::into),
                     header: options.header.or(start_signal.header),
                     user_metadata,
                     ..Default::default()
@@ -1150,10 +1263,10 @@ where
                             .and_then(|d| d.try_into().ok()),
                         workflow_run_timeout: options.run_timeout.and_then(|d| d.try_into().ok()),
                         workflow_task_timeout: options.task_timeout.and_then(|d| d.try_into().ok()),
-                        search_attributes: options.search_attributes.map(|d| d.into()),
+                        search_attributes: options.search_attributes.map(|t| t.into_proto()),
                         cron_schedule: options.cron_schedule.unwrap_or_default(),
                         request_eager_execution: options.enable_eager_workflow_start,
-                        retry_policy: options.retry_policy,
+                        retry_policy: options.retry_policy.map(Into::into),
                         links: options.links,
                         completion_callbacks: options.completion_callbacks,
                         priority: Some(options.priority.into()),
@@ -1262,14 +1375,30 @@ where
 
                     match response {
                         Ok(resp) => {
-                            let resp = resp.into_inner();
+                            let mut resp = resp.into_inner();
                             let new_exhausted = resp.next_page_token.is_empty();
                             let new_token = resp.next_page_token;
 
+                            let data_converter = client.data_converter().clone();
+                            for execution in &mut resp.executions {
+                                if let Some(memo) = execution.memo.as_mut() {
+                                    decode_payloads(
+                                        memo,
+                                        data_converter.codec(),
+                                        &SerializationContextData::Workflow,
+                                    )
+                                    .await;
+                                }
+                            }
                             buffer = resp
                                 .executions
                                 .into_iter()
-                                .map(WorkflowExecution::from)
+                                .map(|raw| {
+                                    WorkflowExecution::new_with_data_converter(
+                                        raw,
+                                        data_converter.clone(),
+                                    )
+                                })
                                 .collect();
 
                             if let Some(exec) = buffer.pop_front() {
@@ -1327,8 +1456,36 @@ pub(crate) use dbg_panic;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tonic::metadata::Ascii;
+    use crate::callback_based::CallbackBasedGrpcService;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use temporalio_common::search_attributes::SearchAttributeKey;
+    use tonic::{Status, metadata::Ascii};
     use url::Url;
+
+    #[test]
+    fn count_aggregation_group_gets_typed_value() {
+        let attrs = SearchAttributes::new([SearchAttributeKey::int("group").value_set(42)]);
+        let group = WorkflowCountAggregationGroup {
+            raw: count_workflow_executions_response::AggregationGroup {
+                group_values: vec![attrs.raw_payload("group").unwrap().clone()],
+                count: 1,
+            },
+        };
+
+        assert_eq!(group.get::<i64>(0), Some(42));
+        assert_eq!(group.get::<i64>(1), None);
+        assert!(group.try_get::<String>(0).is_err());
+        assert_eq!(group.try_get::<i64>(1).unwrap(), None);
+    }
+
+    fn connection_options_for_system_info_test(
+        service_override: CallbackBasedGrpcService,
+    ) -> ConnectionOptions {
+        ConnectionOptions::new(Url::parse("http://localhost:7233").unwrap())
+            .service_override(service_override)
+            .dns_load_balancing(None)
+            .build()
+    }
 
     #[test]
     fn applies_headers() {
@@ -1485,11 +1642,186 @@ mod tests {
         assert!(opts.keep_alive.is_none());
     }
 
+    #[rstest::rstest]
+    #[case(
+        "unknown method GetSystemInfo for service temporal.api.workflowservice.v1.WorkflowService"
+    )]
+    #[case("Method temporal.api.workflowservice.v1.WorkflowService/GetSystemInfo is unimplemented")]
+    #[case(
+        "The server does not implement the method /temporal.api.workflowservice.v1.WorkflowService/GetSystemInfo"
+    )]
+    #[tokio::test]
+    async fn get_system_info_missing_method_falls_back_to_empty_capabilities(
+        #[case] message: &'static str,
+    ) {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let attempts_clone = attempts.clone();
+        let service_override = CallbackBasedGrpcService {
+            callback: Arc::new(move |req| {
+                let attempts = attempts_clone.clone();
+                Box::pin(async move {
+                    assert_eq!(req.rpc, "GetSystemInfo");
+                    attempts.fetch_add(1, Ordering::SeqCst);
+                    Err(Status::unimplemented(message))
+                })
+            }),
+        };
+
+        let connection =
+            Connection::connect(connection_options_for_system_info_test(service_override))
+                .await
+                .unwrap();
+
+        assert!(connection.capabilities().is_none());
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn get_system_info_non_missing_unimplemented_fails_connect() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let attempts_clone = attempts.clone();
+        let service_override = CallbackBasedGrpcService {
+            callback: Arc::new(move |req| {
+                let attempts = attempts_clone.clone();
+                Box::pin(async move {
+                    assert_eq!(req.rpc, "GetSystemInfo");
+                    attempts.fetch_add(1, Ordering::SeqCst);
+                    Err(Status::unimplemented("backend temporarily unimplemented"))
+                })
+            }),
+        };
+
+        let err =
+            match Connection::connect(connection_options_for_system_info_test(service_override))
+                .await
+            {
+                Ok(_) => panic!("connection should fail"),
+                Err(err) => err,
+            };
+
+        assert!(matches!(
+            err,
+            ClientConnectError::SystemInfoCallError(status)
+                if status.code() == Code::Unimplemented
+                    && status.message() == "backend temporarily unimplemented"
+        ));
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    }
+
+    mod tls_custom_verifier_tests {
+        use super::*;
+        use tokio_rustls::rustls::{
+            DigitallySignedStruct, Error as RustlsError, SignatureScheme,
+            client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier},
+            pki_types::{CertificateDer, ServerName, UnixTime},
+        };
+
+        /// A minimal mock verifier for testing. In production, users would
+        /// implement real certificate pinning or custom validation here.
+        #[derive(Debug)]
+        struct MockVerifier;
+
+        impl ServerCertVerifier for MockVerifier {
+            fn verify_server_cert(
+                &self,
+                _end_entity: &CertificateDer<'_>,
+                _intermediates: &[CertificateDer<'_>],
+                _server_name: &ServerName<'_>,
+                _ocsp_response: &[u8],
+                _now: UnixTime,
+            ) -> Result<ServerCertVerified, RustlsError> {
+                Ok(ServerCertVerified::assertion())
+            }
+
+            fn verify_tls12_signature(
+                &self,
+                _message: &[u8],
+                _cert: &CertificateDer<'_>,
+                _dss: &DigitallySignedStruct,
+            ) -> Result<HandshakeSignatureValid, RustlsError> {
+                Ok(HandshakeSignatureValid::assertion())
+            }
+
+            fn verify_tls13_signature(
+                &self,
+                _message: &[u8],
+                _cert: &CertificateDer<'_>,
+                _dss: &DigitallySignedStruct,
+            ) -> Result<HandshakeSignatureValid, RustlsError> {
+                Ok(HandshakeSignatureValid::assertion())
+            }
+
+            fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+                vec![
+                    SignatureScheme::ECDSA_NISTP256_SHA256,
+                    SignatureScheme::RSA_PSS_SHA256,
+                ]
+            }
+        }
+
+        #[tokio::test]
+        async fn add_tls_to_channel_with_custom_verifier() {
+            let tls_opts = TlsOptions {
+                server_cert_verifier: Some(Arc::new(MockVerifier)),
+                domain: Some("test.temporal.io".to_string()),
+                ..Default::default()
+            };
+            let endpoint = tonic::transport::Channel::from_static("https://test.temporal.io:7233");
+            let result = add_tls_to_channel(Some(&tls_opts), endpoint).await;
+            assert!(
+                result.is_ok(),
+                "add_tls_to_channel should succeed with a custom verifier: {:?}",
+                result.err()
+            );
+        }
+
+        #[tokio::test]
+        async fn add_tls_to_channel_with_verifier_and_ca_cert_fails() {
+            // When both server_cert_verifier and server_root_ca_cert are set,
+            // add_tls_to_channel should fail with InvalidConfig.
+            let tls_opts = TlsOptions {
+                server_root_ca_cert: Some(b"some-ca-cert-bytes".to_vec()),
+                server_cert_verifier: Some(Arc::new(MockVerifier)),
+                domain: Some("test.temporal.io".to_string()),
+                ..Default::default()
+            };
+            let endpoint = tonic::transport::Channel::from_static("https://test.temporal.io:7233");
+            let result = add_tls_to_channel(Some(&tls_opts), endpoint).await;
+            assert!(
+                matches!(result, Err(ClientConnectError::InvalidConfig(_))),
+                "add_tls_to_channel should fail with InvalidConfig when both CA cert and verifier are set: {:?}",
+                result
+            );
+        }
+
+        #[tokio::test]
+        async fn add_tls_to_channel_without_verifier_still_works() {
+            // Regression test: the original PEM path must still work.
+            let tls_opts = TlsOptions {
+                domain: Some("test.temporal.io".to_string()),
+                ..Default::default()
+            };
+            let endpoint = tonic::transport::Channel::from_static("https://test.temporal.io:7233");
+            let result = add_tls_to_channel(Some(&tls_opts), endpoint).await;
+            assert!(
+                result.is_ok(),
+                "add_tls_to_channel should succeed without a verifier (native roots): {:?}",
+                result.err()
+            );
+        }
+    }
+
     mod list_workflows_tests {
         use super::*;
+        use crate::test_helpers::XorCodec;
         use futures_util::{FutureExt, StreamExt};
         use std::sync::atomic::{AtomicUsize, Ordering};
-        use temporalio_common::protos::temporal::api::common::v1::WorkflowExecution as ProtoWorkflowExecution;
+        use temporalio_common::{
+            data_converters::DefaultFailureConverter,
+            protos::temporal::api::common::v1::{
+                Memo as ProtoMemo, Payload, WorkflowExecution as ProtoWorkflowExecution,
+            },
+        };
         use tonic::{Request, Response};
 
         #[derive(Clone)]
@@ -1499,6 +1831,8 @@ mod tests {
             page_size: usize,
             // Total workflows available
             total_workflows: usize,
+            data_converter: DataConverter,
+            memo_payload: Option<Payload>,
         }
 
         impl NamespacedClient for MockListWorkflowsClient {
@@ -1507,6 +1841,9 @@ mod tests {
             }
             fn identity(&self) -> String {
                 "test-identity".to_string()
+            }
+            fn data_converter(&self) -> &DataConverter {
+                &self.data_converter
             }
         }
 
@@ -1545,6 +1882,9 @@ mod tests {
                             name: "TestWorkflow".to_string(),
                         }),
                         task_queue: "test-queue".to_string(),
+                        memo: self.memo_payload.clone().map(|payload| ProtoMemo {
+                            fields: HashMap::from([("memo-key".to_owned(), payload)]),
+                        }),
                         ..Default::default()
                     })
                     .collect();
@@ -1572,6 +1912,8 @@ mod tests {
                 call_count: call_count.clone(),
                 page_size: 3,
                 total_workflows: 10,
+                data_converter: DataConverter::default(),
+                memo_payload: None,
             };
 
             let stream = client.list_workflows("", WorkflowListOptions::default());
@@ -1594,6 +1936,8 @@ mod tests {
                 call_count: call_count.clone(),
                 page_size: 3,
                 total_workflows: 10,
+                data_converter: DataConverter::default(),
+                memo_payload: None,
             };
 
             let opts = WorkflowListOptions::builder().limit(5).build();
@@ -1616,6 +1960,8 @@ mod tests {
                 call_count: call_count.clone(),
                 page_size: 10,
                 total_workflows: 100,
+                data_converter: DataConverter::default(),
+                memo_payload: None,
             };
 
             let opts = WorkflowListOptions::builder().limit(3).build();
@@ -1634,6 +1980,8 @@ mod tests {
                 call_count: call_count.clone(),
                 page_size: 10,
                 total_workflows: 0,
+                data_converter: DataConverter::default(),
+                memo_payload: None,
             };
 
             let stream = client.list_workflows("", WorkflowListOptions::default());
@@ -1641,6 +1989,41 @@ mod tests {
 
             assert_eq!(results.len(), 0);
             assert_eq!(call_count.load(Ordering::SeqCst), 1);
+        }
+
+        #[tokio::test]
+        async fn list_workflows_exposes_typed_memo() {
+            let data_converter = DataConverter::new(
+                PayloadConverter::default(),
+                DefaultFailureConverter,
+                XorCodec,
+            );
+            let memo_payload = data_converter
+                .to_payload(
+                    &SerializationContextData::Workflow,
+                    &"memo-value".to_owned(),
+                )
+                .await
+                .unwrap();
+            let client = MockListWorkflowsClient {
+                call_count: Arc::new(AtomicUsize::new(0)),
+                page_size: 1,
+                total_workflows: 1,
+                data_converter,
+                memo_payload: Some(memo_payload),
+            };
+
+            let workflow = client
+                .list_workflows("", WorkflowListOptions::default())
+                .next()
+                .await
+                .unwrap()
+                .unwrap();
+
+            assert_eq!(
+                workflow.memo().get::<String>("memo-key").unwrap(),
+                Some("memo-value".to_owned())
+            );
         }
     }
 }

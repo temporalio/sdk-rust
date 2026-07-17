@@ -13,13 +13,12 @@ use temporalio_common::protos::{
         workflow_commands::{ActivityCancellationType, ScheduleActivity},
         workflow_completion::WorkflowActivationCompletion,
     },
-    temporal::api::{
-        common::v1::{Payload, RetryPolicy},
-        enums::v1::TimeoutType,
-    },
+    temporal::api::common::v1::{Payload, RetryPolicy},
 };
 use temporalio_macros::{workflow, workflow_methods};
-use temporalio_sdk::{ActivityExecutionError, ActivityOptions, WorkflowContext, WorkflowResult};
+use temporalio_sdk::{
+    ActivityExecutionError, ActivityOptions, TimeoutType, WorkflowContext, WorkflowResult,
+};
 use temporalio_sdk_core::{
     prost_dur,
     replay::DEFAULT_ACTIVITY_TYPE,
@@ -218,7 +217,9 @@ async fn activity_doesnt_heartbeat_hits_timeout_then_completes() {
     starter.sdk_config.register_activities(StdActivities);
     let mut worker = starter.worker().await;
 
-    worker.register_workflow::<ActivityDoesntHeartbeatHitsTimeoutThenCompletesWf>();
+    worker
+        .register_workflow::<ActivityDoesntHeartbeatHitsTimeoutThenCompletesWf>()
+        .unwrap();
 
     let task_queue = starter.get_task_queue().to_owned();
     let handle = worker

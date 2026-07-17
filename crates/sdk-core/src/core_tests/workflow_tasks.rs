@@ -8,8 +8,8 @@ use crate::{
         WorkflowCachingPolicy::{self, AfterEveryReply, NonSticky},
         build_fake_worker, build_mock_pollers, build_multihist_mock_sg, fanout_tasks,
         gen_assert_and_fail, gen_assert_and_reply, hist_to_poll_resp, mock_worker, poll_and_reply,
-        poll_and_reply_clears_outstanding_evicts, single_hist_mock_sg, start_timer_cmd,
-        test_worker_cfg,
+        poll_and_reply_clears_outstanding_evicts, schedule_local_activity_cmd, single_hist_mock_sg,
+        start_timer_cmd, test_worker_cfg,
     },
     worker::{
         PollerBehavior, SlotMarkUsedContext, SlotReleaseContext, SlotReservationContext,
@@ -33,7 +33,10 @@ use temporalio_client::MESSAGE_TOO_LARGE_KEY;
 use temporalio_common::{
     protos::{
         coresdk::{
-            activity_result::{self as ar, ActivityResolution, activity_resolution},
+            ActivityTaskCompletion,
+            activity_result::{
+                self as ar, ActivityExecutionResult, ActivityResolution, activity_resolution,
+            },
             common::VersioningIntent,
             workflow_activation::{
                 FireTimer, InitializeWorkflow, ResolveActivity, UpdateRandomSeed,
@@ -1399,6 +1402,132 @@ async fn lang_slower_than_wft_timeouts() {
     core.complete_workflow_activation(WorkflowActivationCompletion::from_cmds(
         start_again.run_id,
         vec![CompleteWorkflowExecution { result: None }.into()],
+    ))
+    .await
+    .unwrap();
+    core.shutdown().await;
+}
+
+#[tokio::test]
+async fn la_resolution_after_wft_not_found_during_eviction() {
+    let wfid = "fake_wf_id";
+    let mut t = TestHistoryBuilder::default();
+    t.add_wfe_started_with_wft_timeout(Duration::from_secs(1));
+    t.add_workflow_task_scheduled_and_started();
+    let first_wft = hist_to_poll_resp(&t, wfid.to_string(), ResponseType::AllHistory).resp;
+    t.add_workflow_task_timed_out();
+    t.add_workflow_task_scheduled_and_started();
+    let second_wft = hist_to_poll_resp(&t, wfid.to_string(), ResponseType::AllHistory).resp;
+
+    let mut mock_cfg = MockPollCfg::from_resp_batches(
+        wfid,
+        t,
+        [ResponseType::Raw(first_wft), ResponseType::Raw(second_wft)],
+        mock_worker_client(),
+    );
+    mock_cfg.make_poll_stream_interminable = true;
+    let mut first_completion = true;
+    mock_cfg.completion_mock_fn = Some(Box::new(move |_| {
+        if first_completion {
+            first_completion = false;
+            Err(tonic::Status::not_found("Workflow task not found."))
+        } else {
+            Ok(Default::default())
+        }
+    }));
+    let mut mock = build_mock_pollers(mock_cfg);
+    mock.worker_cfg(|wc| wc.max_cached_workflows = 1);
+    let core = mock_worker(mock);
+    let core = Arc::new(core);
+
+    let activation = core.poll_workflow_activation().await.unwrap();
+    assert_matches!(
+        activation.jobs.as_slice(),
+        [WorkflowActivationJob {
+            variant: Some(workflow_activation_job::Variant::InitializeWorkflow(_)),
+        }]
+    );
+    let run_id = activation.run_id.clone();
+    let complete_core = core.clone();
+    let complete_activation = tokio::spawn(async move {
+        complete_core
+            .complete_workflow_activation(WorkflowActivationCompletion::from_cmds(
+                run_id,
+                vec![
+                    schedule_local_activity_cmd(
+                        1,
+                        "1",
+                        ActivityCancellationType::WaitCancellationCompleted,
+                        Duration::from_secs(30),
+                    ),
+                    start_timer_cmd(1, Duration::from_millis(10)),
+                ],
+            ))
+            .await
+    });
+
+    let act_task = time::timeout(Duration::from_millis(500), core.poll_activity_task())
+        .await
+        .unwrap()
+        .unwrap();
+
+    time::timeout(Duration::from_secs(5), complete_activation)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+
+    let eviction = time::timeout(Duration::from_secs(5), core.poll_workflow_activation())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_matches!(
+        eviction.jobs.as_slice(),
+        [WorkflowActivationJob {
+            variant: Some(workflow_activation_job::Variant::RemoveFromCache(_)),
+        }]
+    );
+    core.complete_workflow_activation(WorkflowActivationCompletion::empty(eviction.run_id))
+        .await
+        .unwrap();
+
+    let replay_activation = time::timeout(Duration::from_secs(5), core.poll_workflow_activation())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_matches!(
+        replay_activation.jobs.as_slice(),
+        [WorkflowActivationJob {
+            variant: Some(workflow_activation_job::Variant::InitializeWorkflow(_)),
+        }]
+    );
+
+    core.complete_activity_task(ActivityTaskCompletion {
+        task_token: act_task.task_token,
+        result: Some(ActivityExecutionResult::cancel_from_details(None)),
+    })
+    .await
+    .unwrap();
+
+    // The stale LA completion should have been dropped by the LA manager when the
+    // eviction activation completed, so it must not produce another activation.
+    assert!(
+        time::timeout(Duration::from_millis(500), core.poll_workflow_activation())
+            .await
+            .is_err()
+    );
+
+    core.complete_workflow_activation(WorkflowActivationCompletion::from_cmds(
+        replay_activation.run_id,
+        vec![
+            schedule_local_activity_cmd(
+                1,
+                "1",
+                ActivityCancellationType::WaitCancellationCompleted,
+                Duration::from_secs(30),
+            ),
+            start_timer_cmd(1, Duration::from_millis(10)),
+        ],
     ))
     .await
     .unwrap();

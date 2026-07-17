@@ -24,8 +24,8 @@ use temporalio_common::{
         coresdk::{
             FromJsonPayloadExt,
             nexus::{
-                NexusOperationCancellationType, NexusOperationResult, NexusTaskCancelReason,
-                NexusTaskCompletion, nexus_operation_result, nexus_task, nexus_task_completion,
+                NexusOperationResult, NexusTaskCancelReason, NexusTaskCompletion,
+                nexus_operation_result, nexus_task, nexus_task_completion,
             },
         },
         temporal::api::{
@@ -43,8 +43,8 @@ use temporalio_common::{
 };
 use temporalio_macros::{workflow, workflow_methods};
 use temporalio_sdk::{
-    CancellableFuture, NexusOperationOptions, SyncWorkflowContext, WorkflowContext,
-    WorkflowContextView, WorkflowResult, WorkflowTermination,
+    CancellableFuture, NexusOperationCancellationType, NexusOperationOptions, SyncWorkflowContext,
+    WorkflowContext, WorkflowContextView, WorkflowResult, WorkflowTermination,
 };
 use temporalio_sdk_core::PollError;
 use tokio::{
@@ -116,7 +116,7 @@ async fn nexus_basic(
 
     let endpoint = mk_nexus_endpoint(&mut starter).await;
 
-    worker.register_workflow::<NexusBasicWf>();
+    worker.register_workflow::<NexusBasicWf>().unwrap();
     let wf_handle = worker
         .submit_workflow(
             NexusBasicWf::run,
@@ -333,8 +333,8 @@ async fn nexus_async(
         Some(Duration::from_secs(5))
     };
 
-    worker.register_workflow::<NexusAsyncWf>();
-    worker.register_workflow::<AsyncCompleter>();
+    worker.register_workflow::<NexusAsyncWf>().unwrap();
+    worker.register_workflow::<AsyncCompleter>().unwrap();
     let submitter = worker.get_submitter_handle();
     let converter = PayloadConverter::default();
     let ser_ctx = SerializationContext {
@@ -571,7 +571,9 @@ async fn nexus_cancel_before_start() {
 
     let endpoint = mk_nexus_endpoint(&mut starter).await;
 
-    worker.register_workflow::<NexusCancelBeforeStartWf>();
+    worker
+        .register_workflow::<NexusCancelBeforeStartWf>()
+        .unwrap();
     let handle = worker
         .submit_workflow(
             NexusCancelBeforeStartWf::run,
@@ -638,7 +640,9 @@ async fn nexus_must_complete_task_to_shutdown(#[values(true, false)] use_grace_p
 
     let endpoint = mk_nexus_endpoint(&mut starter).await;
 
-    worker.register_workflow::<NexusMustCompleteTaskWf>();
+    worker
+        .register_workflow::<NexusMustCompleteTaskWf>()
+        .unwrap();
     let handle = worker
         .submit_workflow(
             NexusMustCompleteTaskWf::run,
@@ -815,32 +819,36 @@ async fn nexus_cancellation_types(
     let schedule_to_close_timeout = Some(Duration::from_secs(5));
 
     let (caller_op_future_tx, caller_op_future_rx) = watch::channel(false);
-    worker.register_workflow_with_factory({
-        let endpoint = endpoint.clone();
-        let caller_op_future_tx = caller_op_future_tx.clone();
-        move || NexusCancellationCallerWf {
-            endpoint: endpoint.clone(),
-            schedule_to_close_timeout,
-            cancellation_type,
-            caller_op_future_tx: caller_op_future_tx.clone(),
-        }
-    });
+    worker
+        .register_workflow_with_factory({
+            let endpoint = endpoint.clone();
+            let caller_op_future_tx = caller_op_future_tx.clone();
+            move || NexusCancellationCallerWf {
+                endpoint: endpoint.clone(),
+                schedule_to_close_timeout,
+                cancellation_type,
+                caller_op_future_tx: caller_op_future_tx.clone(),
+            }
+        })
+        .unwrap();
 
     let cancellation_wait_happened = Arc::new(AtomicBool::new(false));
     let (cancellation_tx, mut cancellation_rx) = watch::channel(false);
     let (handler_exited_tx, mut handler_exited_rx) = watch::channel(false);
-    worker.register_workflow_with_factory({
-        let cancellation_wait_happened = cancellation_wait_happened.clone();
-        let cancellation_tx = cancellation_tx.clone();
-        let handler_exited_tx = handler_exited_tx.clone();
-        move || AsyncCompleterWf {
-            cancellation_type,
-            cancellation_wait_happened: cancellation_wait_happened.clone(),
-            cancellation_tx: cancellation_tx.clone(),
-            handler_exited_tx: handler_exited_tx.clone(),
-            proceed_signal_received: false,
-        }
-    });
+    worker
+        .register_workflow_with_factory({
+            let cancellation_wait_happened = cancellation_wait_happened.clone();
+            let cancellation_tx = cancellation_tx.clone();
+            let handler_exited_tx = handler_exited_tx.clone();
+            move || AsyncCompleterWf {
+                cancellation_type,
+                cancellation_wait_happened: cancellation_wait_happened.clone(),
+                cancellation_tx: cancellation_tx.clone(),
+                handler_exited_tx: handler_exited_tx.clone(),
+                proceed_signal_received: false,
+            }
+        })
+        .unwrap();
     let submitter = worker.get_submitter_handle();
     let wf_handle = starter.start_with_worker(wf_name, &mut worker).await;
     let client = starter.get_client().await;
@@ -914,6 +922,7 @@ async fn nexus_cancellation_types(
                 // The nexus op future should have been resolved
                 assert!(*caller_op_future_rx.borrow())
             }
+            _ => unreachable!("test only supplies known cancellation types"),
         }
         let (cancel_handler_responded_tx, _cancel_handler_responded_rx) = watch::channel(false);
         if cancellation_type != NexusOperationCancellationType::Abandon {
@@ -1030,6 +1039,7 @@ async fn nexus_cancellation_types(
         | NexusOperationCancellationType::WaitCancellationCompleted => {
             assert!(*cancellation_rx.borrow())
         }
+        _ => unreachable!("test only supplies known cancellation types"),
     }
 
     let res = client
@@ -1062,6 +1072,7 @@ async fn nexus_cancellation_types(
             assert_eq!(f.message, "nexus operation completed unsuccessfully");
             assert_eq!(f.cause.unwrap().message, "operation canceled");
         }
+        _ => unreachable!("test only supplies known cancellation types"),
     }
 
     wf_handle

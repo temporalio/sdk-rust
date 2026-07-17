@@ -19,7 +19,7 @@ impl CancellationActivities {
             if ctx.is_cancelled() {
                 return Err(ActivityError::cancelled());
             }
-            ctx.record_heartbeat(vec![]);
+            ctx.record_heartbeat(()).await?;
             tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         }
     }
@@ -52,7 +52,7 @@ impl CancellationWorkflow {
 
         temporalio_sdk::workflows::select! {
             result = &mut activity_fut => {
-                let value = result.map_err(|e| anyhow::anyhow!("{e}"))?;
+                let value = result?;
                 Ok(value)
             }
             reason = ctx.cancelled() => {

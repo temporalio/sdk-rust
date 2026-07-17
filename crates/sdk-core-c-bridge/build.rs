@@ -5,7 +5,12 @@ use std::env;
 fn main() {
     let crate_dir = env::var("CARGO_MANIFEST_DIR").unwrap();
 
+    // Prefix every enum's variants with the enum's type name to avoid collisions.
+    let mut config = cbindgen::Config::default();
+    config.enumeration.prefix_with_name = true;
+
     let changed = cbindgen::Builder::new()
+        .with_config(config)
         .with_cpp_compat(true)
         .with_crate(crate_dir)
         .with_pragma_once(true)

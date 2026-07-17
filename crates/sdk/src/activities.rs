@@ -7,7 +7,7 @@
 //!     Arc,
 //!     atomic::{AtomicUsize, Ordering},
 //! };
-//! use temporalio_macros::activities;
+//! use temporalio_macros::{activities, activity_definitions};
 //! use temporalio_sdk::activities::{ActivityContext, ActivityError};
 //!
 //! struct MyActivities {
@@ -29,13 +29,15 @@
 //! }
 //!
 //! // If you need to refer to an activity that is defined externally, in a different codebase or
-//! // possibly a differenet language, you can simply leave the function body unimplemented like so:
+//! // possibly a different language, use `#[activity_definitions]`. Methods must omit the
+//! // `ActivityContext` parameter and have a body of `unimplemented!()`. Workflows can then call
+//! // these definitions just like real activities.
 //!
 //! struct ExternalActivities;
-//! #[activities]
+//! #[activity_definitions]
 //! impl ExternalActivities {
 //!     #[activity(name = "foo")]
-//!     async fn foo(_ctx: ActivityContext, _: String) -> Result<String, ActivityError> {
+//!     fn foo(_: String) -> Result<String, ActivityError> {
 //!         unimplemented!()
 //!     }
 //! }
@@ -47,24 +49,39 @@
 #[doc(inline)]
 pub use temporalio_macros::activities;
 
-use futures_util::{FutureExt, future::BoxFuture};
+use crate::{
+    OutgoingActivityError, OutgoingError,
+    interceptors::{
+        ActivityExecutionValue, ActivityInboundInterceptor, ExecuteActivityInput,
+        ExecuteActivityOutput, Next,
+    },
+    panic_formatter,
+};
+use futures_util::{
+    FutureExt,
+    future::{BoxFuture, ready},
+};
 use prost_types::{Duration, Timestamp};
 use std::{
     collections::HashMap,
     fmt::Debug,
+    panic::AssertUnwindSafe,
     sync::Arc,
     time::{Duration as StdDuration, SystemTime},
 };
-use temporalio_client::Priority;
+use temporalio_client::{Client, ClientOptions, Priority, WorkflowExecutionInfo, WorkflowHandle};
+pub use temporalio_common::ActivityError;
 use temporalio_common::{
-    ActivityDefinition,
+    ActivityDefinition, HasWorkflowDefinition, RetryPolicy, WorkflowExecution,
     data_converters::{
-        DataConverter, GenericPayloadConverter, SerializationContext, SerializationContextData,
+        DataConverter, DecodablePayloads, GenericPayloadConverter, PayloadConversionError,
+        PayloadConverter, RawValue, SerializationContext, SerializationContextData,
+        TemporalDeserializable, TemporalSerializable,
     },
-    error::{ApplicationFailure, FailurePayloads},
+    error::ApplicationFailure,
     protos::{
-        coresdk::{ActivityHeartbeat, activity_task},
-        temporal::api::common::v1::{Payload, RetryPolicy, WorkflowExecution},
+        coresdk::{ActivityHeartbeat, activity_result::ActivityExecutionResult, activity_task},
+        temporal::api::common::v1::Payload,
         utilities::TryIntoOrNone,
     },
 };
@@ -75,16 +92,17 @@ use tokio_util::sync::CancellationToken;
 #[derive(Clone)]
 pub struct ActivityContext {
     worker: Arc<CoreWorker>,
+    client_options: ClientOptions,
     cancellation_token: CancellationToken,
-    heartbeat_details: Vec<Payload>,
+    heartbeat_details: ActivityHeartbeatDetails,
     header_fields: HashMap<String, Payload>,
     info: ActivityInfo,
 }
 
 impl ActivityContext {
-    /// Construct new Activity Context, returning the context and all arguments to the activity.
-    pub fn new(
+    pub(crate) fn new(
         worker: Arc<CoreWorker>,
+        client_options: ClientOptions,
         cancellation_token: CancellationToken,
         task_queue: String,
         task_token: Vec<u8>,
@@ -117,10 +135,15 @@ impl ActivityContext {
             start_to_close_timeout.as_ref(),
             schedule_to_close_timeout.as_ref(),
         );
+        let heartbeat_details = ActivityHeartbeatDetails::new(
+            heartbeat_details,
+            client_options.data_converter.payload_converter().clone(),
+        );
 
         (
             ActivityContext {
                 worker,
+                client_options,
                 cancellation_token,
                 heartbeat_details,
                 header_fields,
@@ -129,7 +152,7 @@ impl ActivityContext {
                     task_queue,
                     workflow_type,
                     workflow_namespace,
-                    workflow_execution,
+                    workflow_execution: workflow_execution.map(Into::into),
                     activity_id,
                     activity_type,
                     heartbeat_timeout: heartbeat_timeout.try_into_or_none(),
@@ -139,7 +162,7 @@ impl ActivityContext {
                     attempt,
                     current_attempt_scheduled_time: current_attempt_scheduled_time
                         .try_into_or_none(),
-                    retry_policy,
+                    retry_policy: retry_policy.map(Into::into),
                     is_local,
                     priority: priority.map(Into::into).unwrap_or_default(),
                     run_id: (!run_id.is_empty()).then_some(run_id),
@@ -162,18 +185,27 @@ impl ActivityContext {
 
     /// Extract heartbeat details from last failed attempt. This is used in combination with retry
     /// policy.
-    pub fn heartbeat_details(&self) -> &[Payload] {
+    pub fn heartbeat_details(&self) -> &ActivityHeartbeatDetails {
         &self.heartbeat_details
     }
 
-    /// RecordHeartbeat sends heartbeat for the currently executing activity
-    pub fn record_heartbeat(&self, details: Vec<Payload>) {
+    /// Record a heartbeat with typed progress details for the currently executing activity.
+    pub async fn record_heartbeat<T>(&self, details: T) -> Result<(), PayloadConversionError>
+    where
+        T: TemporalSerializable + 'static,
+    {
         if !self.info.is_local {
+            let details = self
+                .client_options
+                .data_converter
+                .to_payloads(&SerializationContextData::Activity, &details)
+                .await?;
             self.worker.record_activity_heartbeat(ActivityHeartbeat {
                 task_token: self.info.task_token.clone(),
                 details,
             })
         }
+        Ok(())
     }
 
     /// Returns activity info of the executing activity
@@ -181,9 +213,79 @@ impl ActivityContext {
         &self.info
     }
 
+    /// Return a client targeting the same Temporal service and namespace as this activity's worker.
+    pub fn client(&self) -> Client {
+        let connection = self.worker.get_client_connection().expect(
+            "activity context client is unavailable because the worker was not created from a \
+             Temporal client",
+        );
+        Client::new(connection, self.client_options.clone())
+            .expect("client construction from a worker connection should be infallible")
+    }
+
+    /// Return a workflow handle for the workflow execution that started this activity, if any.
+    pub fn workflow_handle<W: HasWorkflowDefinition>(&self) -> Option<WorkflowHandle<Client, W>> {
+        let workflow_execution = self.info.workflow_execution.as_ref()?;
+        let run_id = (!workflow_execution.run_id().is_empty())
+            .then(|| workflow_execution.run_id().to_owned());
+        Some(WorkflowHandle::new(
+            self.client(),
+            WorkflowExecutionInfo {
+                namespace: self.client_options.namespace.clone(),
+                workflow_id: workflow_execution.workflow_id().to_owned(),
+                run_id: run_id.clone(),
+                first_execution_run_id: run_id,
+            },
+        ))
+    }
+
     /// Get headers attached to this activity
     pub fn headers(&self) -> &HashMap<String, Payload> {
         &self.header_fields
+    }
+
+    pub(crate) fn headers_mut(&mut self) -> &mut HashMap<String, Payload> {
+        &mut self.header_fields
+    }
+}
+
+/// Heartbeat details supplied by the previous activity attempt.
+#[derive(Clone, Debug)]
+#[non_exhaustive]
+pub struct ActivityHeartbeatDetails {
+    payloads: DecodablePayloads,
+}
+
+impl ActivityHeartbeatDetails {
+    fn new(payloads: Vec<Payload>, payload_converter: PayloadConverter) -> Self {
+        Self {
+            payloads: DecodablePayloads::new(
+                payloads,
+                payload_converter,
+                SerializationContextData::Activity,
+            ),
+        }
+    }
+
+    /// Deserialize the previous heartbeat details, or return `None` when there are none.
+    pub fn deserialize<T: TemporalDeserializable + 'static>(
+        &self,
+    ) -> Result<Option<T>, PayloadConversionError> {
+        if self.payloads.raw().is_empty() {
+            Ok(None)
+        } else {
+            self.payloads.deserialize().map(Some)
+        }
+    }
+
+    /// Returns the codec-decoded raw heartbeat payloads.
+    pub fn raw(&self) -> &[Payload] {
+        self.payloads.raw()
+    }
+
+    /// Consume these details and return their codec-decoded payloads.
+    pub fn into_raw(self) -> RawValue {
+        self.payloads.into_raw()
     }
 }
 
@@ -225,56 +327,6 @@ pub struct ActivityInfo {
     pub priority: Priority,
     /// Run ID of this activity execution. Only set for standalone activities.
     pub run_id: Option<String>,
-}
-
-/// Returned as errors from activity functions.
-#[derive(Debug)]
-pub enum ActivityError {
-    /// Return this error to attach application-failure metadata to an activity failure.
-    Application(Box<ApplicationFailure>),
-    /// Return this error to indicate your activity is cancelling
-    Cancelled {
-        /// Optional cancellation details.
-        details: Option<FailurePayloads>,
-    },
-    /// Return this error to indicate that the activity will be completed outside of this activity
-    /// definition, by an external client.
-    WillCompleteAsync,
-}
-
-impl ActivityError {
-    /// Construct a cancelled error without details
-    pub fn cancelled() -> Self {
-        Self::Cancelled { details: None }
-    }
-
-    /// Construct a cancelled error with details that will be converted using the active data
-    /// converter.
-    pub fn cancelled_with_details<T>(details: T) -> Self
-    where
-        T: Into<FailurePayloads>,
-    {
-        Self::Cancelled {
-            details: Some(details.into()),
-        }
-    }
-
-    /// Construct an application activity error.
-    pub fn application(err: ApplicationFailure) -> Self {
-        Self::Application(err.into())
-    }
-}
-
-impl<E> From<E> for ActivityError
-where
-    E: Into<anyhow::Error>,
-{
-    fn from(source: E) -> Self {
-        match source.into().downcast::<ApplicationFailure>() {
-            Ok(application_failure) => Self::Application(Box::new(application_failure)),
-            Err(err) => Self::Application(ApplicationFailure::new(err).into()),
-        }
-    }
 }
 
 /// Deadline calculation.  This is a port of
@@ -344,10 +396,26 @@ pub(crate) type ActivityInvocation = Arc<
             Vec<Payload>,
             DataConverter,
             ActivityContext,
-        ) -> BoxFuture<'static, Result<Payload, ActivityError>>
+            Vec<Arc<dyn ActivityInboundInterceptor>>,
+        ) -> ExecuteActivityOutput<'static>
         + Send
         + Sync,
 >;
+
+fn call_execute_activity<'a>(
+    interceptors: &'a [Arc<dyn ActivityInboundInterceptor>],
+    input: ExecuteActivityInput,
+    next: Next<'a, ExecuteActivityInput, ExecuteActivityOutput<'a>>,
+) -> ExecuteActivityOutput<'a> {
+    if let Some((first, rest)) = interceptors.split_first() {
+        first.execute_activity(
+            input,
+            Next::new(move |input| call_execute_activity(rest, input, next)),
+        )
+    } else {
+        next.run(input)
+    }
+}
 
 #[doc(hidden)]
 pub trait ActivityImplementer {
@@ -355,8 +423,9 @@ pub trait ActivityImplementer {
 }
 
 #[doc(hidden)]
-pub trait ExecutableActivity: ActivityDefinition {
+pub trait ExecutableActivity: ActivityDefinition + Sized {
     type Implementer: ActivityImplementer + Send + Sync + 'static;
+    fn definition() -> Self;
     fn execute(
         receiver: Option<Arc<Self::Implementer>>,
         ctx: ActivityContext,
@@ -370,7 +439,7 @@ pub trait HasOnlyStaticMethods {}
 /// Contains activity registrations in a form ready for execution by workers.
 #[derive(Default, Clone)]
 pub struct ActivityDefinitions {
-    activities: HashMap<&'static str, ActivityInvocation>,
+    activities: HashMap<String, ActivityInvocation>,
 }
 
 impl ActivityDefinitions {
@@ -384,26 +453,34 @@ impl ActivityDefinitions {
     pub fn register_activity<AD>(&mut self, instance: Arc<AD::Implementer>) -> &mut Self
     where
         AD: ActivityDefinition + ExecutableActivity,
+        AD::Input: Send + Sync,
         AD::Output: Send + Sync,
     {
         self.activities.insert(
-            AD::name(),
-            Arc::new(move |payloads, dc, c| {
+            AD::definition().name().to_string(),
+            Arc::new(move |payloads, dc, c, activity_inbound_interceptors| {
                 let instance = instance.clone();
-                let dc = dc.clone();
                 async move {
-                    // Use PayloadConverter (not DataConverter) since the codec is applied
-                    // at the SDK/Core boundary by the visitor, not here.
+                    // Codec application happens at the SDK/Core boundary, so activity
+                    // implementations work with the payload converter directly.
                     let pc = dc.payload_converter();
                     let ctx = SerializationContext {
                         data: &SerializationContextData::Activity,
                         converter: pc,
                     };
-                    let deserialized: AD::Input = pc
-                        .from_payloads(&ctx, payloads)
-                        .map_err(ActivityError::from)?;
-                    let result = AD::execute(Some(instance), c, deserialized).await?;
-                    pc.to_payload(&ctx, &result).map_err(ActivityError::from)
+                    let input: AD::Input = pc.from_payloads(&ctx, payloads)?;
+                    let input = ExecuteActivityInput::new(c, Box::new(input));
+                    let leaf = activity_inbound_base::<AD>(instance);
+                    let activity_execution =
+                        call_execute_activity(&activity_inbound_interceptors, input, leaf);
+                    match AssertUnwindSafe(activity_execution).catch_unwind().await {
+                        Ok(output) => output,
+                        Err(panic) => Err(ApplicationFailure::new(anyhow::anyhow!(
+                            "Activity function panicked: {}",
+                            panic_formatter(panic)
+                        ))
+                        .into()),
+                    }
                 }
                 .boxed()
             }),
@@ -417,6 +494,72 @@ impl ActivityDefinitions {
 
     pub(crate) fn get(&self, act_type: &str) -> Option<ActivityInvocation> {
         self.activities.get(act_type).cloned()
+    }
+
+    pub(crate) fn names(&self) -> Vec<String> {
+        let mut names: Vec<_> = self.activities.keys().cloned().collect();
+        names.sort_unstable();
+        names
+    }
+}
+
+fn activity_inbound_base<'a, AD>(
+    instance: Arc<AD::Implementer>,
+) -> Next<'a, ExecuteActivityInput, ExecuteActivityOutput<'a>>
+where
+    AD: ActivityDefinition + ExecutableActivity,
+    AD::Input: Send + Sync,
+    AD::Output: Send + Sync,
+{
+    Next::new(
+        move |input: ExecuteActivityInput| -> ExecuteActivityOutput<'a> {
+            let (activity_context, args) = input.into_parts();
+            let args = match args.downcast::<AD::Input>() {
+                Ok(args) => args,
+                Err(_) => {
+                    return ready(Err(ApplicationFailure::new(anyhow::anyhow!(
+                    "Activity inbound interceptor returned arguments with wrong concrete type for activity {}",
+                    AD::definition().name()
+                ))
+                .into()))
+                .boxed();
+                }
+            };
+
+            async move {
+                match AssertUnwindSafe(AD::execute(Some(instance), activity_context, *args))
+                    .catch_unwind()
+                    .await
+                {
+                    Ok(result) => {
+                        result.map(|output| Box::new(output) as Box<dyn ActivityExecutionValue>)
+                    }
+                    Err(panic) => Err(ApplicationFailure::new(anyhow::anyhow!(
+                        "Activity function panicked: {}",
+                        panic_formatter(panic)
+                    ))
+                    .into()),
+                }
+            }
+            .boxed()
+        },
+    )
+}
+
+pub(crate) fn activity_error_to_core_result(
+    dc: &DataConverter,
+    err: ActivityError,
+) -> ActivityExecutionResult {
+    match err {
+        ActivityError::Application(app) => ActivityExecutionResult::fail(dc.to_failure(
+            &SerializationContextData::Activity,
+            OutgoingError::Activity(OutgoingActivityError::Application(app)),
+        )),
+        ActivityError::Cancelled { details } => ActivityExecutionResult::cancel(dc.to_failure(
+            &SerializationContextData::Activity,
+            OutgoingError::Activity(OutgoingActivityError::Cancelled { details }),
+        )),
+        ActivityError::WillCompleteAsync => ActivityExecutionResult::will_complete_async(),
     }
 }
 
@@ -432,13 +575,41 @@ impl Debug for ActivityDefinitions {
 mod test {
     use super::*;
     use rstest::rstest;
+    use temporalio_common::error::{ApplicationErrorCategory, ApplicationFailure};
+
+    #[test]
+    fn activity_heartbeat_details_support_typed_decoding() {
+        let payload_converter = PayloadConverter::default();
+        let payload = payload_converter
+            .to_payload(
+                &SerializationContext {
+                    data: &SerializationContextData::Activity,
+                    converter: &payload_converter,
+                },
+                &"progress".to_owned(),
+            )
+            .unwrap();
+        let details = ActivityHeartbeatDetails::new(vec![payload.clone()], payload_converter);
+
+        assert_eq!(details.raw(), &[payload]);
+        assert_eq!(
+            details.deserialize::<String>().unwrap(),
+            Some("progress".to_owned())
+        );
+    }
+
+    #[test]
+    fn empty_activity_heartbeat_details_decode_to_none() {
+        let details = ActivityHeartbeatDetails::new(Vec::new(), PayloadConverter::default());
+
+        assert_eq!(details.deserialize::<String>().unwrap(), None);
+        assert!(details.into_raw().payloads.is_empty());
+    }
 
     #[rstest]
     #[case(true)]
     #[case(false)]
     fn activity_error_conversion_is_not_lossy(#[case] non_retryable: bool) {
-        use temporalio_common::protos::temporal::api::enums::v1::ApplicationErrorCategory;
-
         let original = ApplicationFailure::builder(anyhow::anyhow!("big boom"))
             .type_name("BigBoom".to_owned())
             .non_retryable(non_retryable)

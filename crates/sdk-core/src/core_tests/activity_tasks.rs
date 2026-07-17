@@ -26,6 +26,7 @@ use std::{
     time::{Duration, Instant},
 };
 use temporalio_common::{
+    payload_limits::{LimitClass, LimitSeverity, PayloadLimitViolation},
     protos::{
         coresdk::{
             ActivityTaskCompletion,
@@ -46,6 +47,7 @@ use temporalio_common::{
         temporal::api::{
             command::v1::{ScheduleActivityTaskCommandAttributes, command::Attributes},
             enums::v1::EventType,
+            failure::v1::failure::FailureInfo,
             workflowservice::v1::{
                 PollActivityTaskQueueResponse, RecordActivityTaskHeartbeatResponse,
                 RespondActivityTaskCanceledResponse, RespondActivityTaskCompletedResponse,
@@ -705,6 +707,129 @@ async fn complete_act_with_fail_flushes_heartbeat() {
     // Verify the last seen call to record a heartbeat had the last detail payload
     let last_seen_payload = &last_seen_payload.take().unwrap().payloads[0];
     assert_eq!(last_seen_payload.data, &[last_hb]);
+}
+
+/// Builds a tonic `Status` carrying a `PayloadLimitViolation` source, exactly as the gRPC client
+/// layer produces when an outbound payload exceeds the error limit.
+fn payload_too_large_status() -> tonic::Status {
+    let violation = PayloadLimitViolation {
+        path: "details".to_string(),
+        class: LimitClass::Blob,
+        severity: LimitSeverity::Error,
+        size: 1024,
+        limit: 10,
+    };
+    let mut status = tonic::Status::invalid_argument("Payload size limit exceeded");
+    status.set_source(Arc::new(violation));
+    status
+}
+
+fn assert_payloads_too_large_retryable(
+    failure: &Option<temporalio_common::protos::temporal::api::failure::v1::Failure>,
+) {
+    let failure = failure.as_ref().expect("failure present");
+    assert_matches!(
+        &failure.failure_info,
+        Some(FailureInfo::ApplicationFailureInfo(afi))
+            if afi.r#type == crate::worker::PAYLOADS_TOO_LARGE_FAILURE_TYPE && !afi.non_retryable
+    );
+}
+
+/// An oversized cancel `details` payload must be reported as a (retryable) activity task failure
+/// rather than a cancellation — mirroring the success path and the server's own behavior.
+#[tokio::test]
+async fn oversized_cancel_details_fails_activity() {
+    let mut mock_client = mock_worker_client();
+    mock_client
+        .expect_cancel_activity_task()
+        .times(1)
+        .returning(|_, _| Err(payload_too_large_status()));
+    mock_client
+        .expect_fail_activity_task()
+        .times(1)
+        .returning(|_, failure| {
+            assert_payloads_too_large_retryable(&failure);
+            Ok(RespondActivityTaskFailedResponse::default())
+        });
+
+    let core = mock_worker(MocksHolder::from_client_with_activities(
+        mock_client,
+        [PollActivityTaskQueueResponse {
+            task_token: vec![1],
+            activity_id: "act1".to_string(),
+            ..Default::default()
+        }
+        .into()],
+    ));
+
+    let act = core.poll_activity_task().await.unwrap();
+    core.complete_activity_task(ActivityTaskCompletion {
+        task_token: act.task_token,
+        result: Some(ActivityExecutionResult::cancel_from_details(Some(
+            vec![1_u8; 1024].into(),
+        ))),
+    })
+    .await
+    .unwrap();
+    core.drain_activity_poller_and_shutdown().await;
+}
+
+/// An oversized heartbeat `details` payload must fail the activity task (retryably) and stop the
+/// running activity with a `Cancelled` cancel — replicating the server, which fails the activity
+/// task and returns `cancel_requested = true`.
+#[tokio::test]
+async fn oversized_heartbeat_fails_activity() {
+    let mut mock_client = mock_worker_client();
+    mock_client
+        .expect_record_activity_heartbeat()
+        .times(1)
+        .returning(|_, _| Err(payload_too_large_status()));
+    mock_client
+        .expect_fail_activity_task()
+        .times(1)
+        .returning(|_, failure| {
+            assert_payloads_too_large_retryable(&failure);
+            Ok(RespondActivityTaskFailedResponse::default())
+        });
+    // The activity winds down after the stop-cancel and reports its cancellation, which races to a
+    // NotFound (already failed); allow that call.
+    mock_client
+        .expect_cancel_activity_task()
+        .returning(|_, _| Ok(RespondActivityTaskCanceledResponse::default()));
+
+    let core = mock_worker(MocksHolder::from_client_with_activities(
+        mock_client,
+        [PollActivityTaskQueueResponse {
+            task_token: vec![1],
+            activity_id: "act1".to_string(),
+            heartbeat_timeout: Some(prost_dur!(from_millis(1))),
+            ..Default::default()
+        }
+        .into()],
+    ));
+
+    let act = core.poll_activity_task().await.unwrap();
+    core.record_activity_heartbeat(ActivityHeartbeat {
+        task_token: act.task_token.clone(),
+        details: vec![vec![1_u8; 1024].into()],
+    });
+    // Wait for the heartbeat to be processed and the stop-cancel to be issued.
+    sleep(Duration::from_millis(10)).await;
+    let cancel = core.poll_activity_task().await.unwrap();
+    assert_matches!(
+        &cancel,
+        ActivityTask {
+            variant: Some(activity_task::Variant::Cancel(Cancel { reason, .. })),
+            ..
+        } if *reason == ActivityCancelReason::Cancelled as i32
+    );
+    core.complete_activity_task(ActivityTaskCompletion {
+        task_token: cancel.task_token,
+        result: Some(ActivityExecutionResult::cancel_from_details(None)),
+    })
+    .await
+    .unwrap();
+    core.drain_activity_poller_and_shutdown().await;
 }
 
 #[tokio::test]

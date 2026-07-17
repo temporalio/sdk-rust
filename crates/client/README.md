@@ -7,7 +7,7 @@ This crate provides a Rust client for interacting with the Temporal service. It 
 standalone to start and manage workflows, or together with the
 [`temporalio-sdk`](https://crates.io/crates/temporalio-sdk) crate to run workers.
 
-⚠️ **This crate is under active development and should be considered prerelease.** The API can and
+⚠️ **This crate is in Public Preview and under active development.** The API can and
 will continue to evolve.
 
 ## Quick Start

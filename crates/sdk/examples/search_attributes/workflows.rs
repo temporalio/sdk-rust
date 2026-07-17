@@ -1,7 +1,11 @@
 #![allow(unreachable_pub)]
-use temporalio_common::protos::coresdk::AsJsonPayloadExt;
+use temporalio_common::search_attributes::SearchAttributeKey;
 use temporalio_macros::{workflow, workflow_methods};
 use temporalio_sdk::{WorkflowContext, WorkflowResult};
+
+pub const KEYWORD_FIELD: SearchAttributeKey<String> =
+    SearchAttributeKey::keyword("CustomKeywordField");
+pub const INT_FIELD: SearchAttributeKey<i64> = SearchAttributeKey::int("CustomIntField");
 
 #[workflow]
 #[derive(Default)]
@@ -11,22 +15,14 @@ pub struct SearchAttributesWorkflow;
 impl SearchAttributesWorkflow {
     #[run]
     pub async fn run(ctx: &mut WorkflowContext<Self>, _input: ()) -> WorkflowResult<String> {
-        let initial_attrs = ctx.search_attributes();
-        let initial_keyword = initial_attrs
-            .indexed_fields
-            .get("CustomKeywordField")
-            .and_then(|p| serde_json::from_slice::<String>(&p.data).ok())
+        let initial_keyword = ctx
+            .search_attributes()
+            .get(&KEYWORD_FIELD)
             .unwrap_or_default();
 
         ctx.upsert_search_attributes([
-            (
-                "CustomKeywordField".to_string(),
-                "updated-value".as_json_payload().unwrap(),
-            ),
-            (
-                "CustomIntField".to_string(),
-                42i64.as_json_payload().unwrap(),
-            ),
+            KEYWORD_FIELD.value_set("updated-value".into()),
+            INT_FIELD.value_set(42),
         ]);
 
         Ok(format!(

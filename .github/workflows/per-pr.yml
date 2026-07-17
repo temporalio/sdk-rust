@@ -20,20 +20,10 @@ jobs:
     timeout-minutes: ${{ github.ref == 'refs/heads/main' && 15 || 10 }}
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: ./.github/actions/setup
         with:
-          submodules: recursive
-      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
-      - name: Install protoc
-        uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3
-        with:
-          # TODO: Upgrade proto once https://github.com/arduino/setup-protoc/issues/99 is fixed
-          version: "23.x"
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
-      - run: rustup component add rustfmt clippy
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-        with:
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+          mise-install-args: protoc
       - run: cargo fmt --all --check
       - run: cargo doc --workspace --all-features --no-deps
         env:
@@ -45,32 +35,29 @@ jobs:
 
   test:
     name: Unit Tests
-    # Give extra time to ensure pushes to main have time to populate the cache
-    timeout-minutes: ${{ matrix.timeoutMinutes || (github.ref == 'refs/heads/main' && 20 || 15) }}
+    timeout-minutes: ${{ matrix.timeoutMinutes || 25 }}
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, ubuntu-arm, macos-intel, macos-arm, windows-latest]
         include:
           - os: windows-latest
+            timeoutMinutes: 30
           - os: ubuntu-latest
           - os: ubuntu-arm
             runsOn: ubuntu-24.04-arm64-2-core
+            timeoutMinutes: 30
           - os: macos-arm
             runsOn: macos-14
           - os: macos-intel
-            runsOn: macos-15-intel
-            timeoutMinutes: 20
+            runsOn: macos-26-intel
+            timeoutMinutes: 40
     runs-on: ${{ matrix.runsOn || matrix.os }}
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
-      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
-      - name: Install protoc
-        uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: ./.github/actions/setup
         with:
-          # TODO: Upgrade proto once https://github.com/arduino/setup-protoc/issues/99 is fixed
-          version: "23.x"
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
+          mise-install-args: protoc
       # Workaround for https://github.com/actions/runner-images/issues/12432
       # from https://github.com/rust-lang/rust/issues/141626#issuecomment-2919419236
       # Visual Studio bug tracker https://developercommunity.visualstudio.com/t/Regression-from-1943:-linkexe-crashes/10912960
@@ -80,9 +67,6 @@ jobs:
         with:
           script: |
             core.exportVariable('RUSTFLAGS', '-Csymbol-mangling-version=v0');
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-        with:
-          save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo test -- --include-ignored --nocapture
       - name: Find test executable for cgroup tests
         id: find-cgroup-test
@@ -110,22 +94,11 @@ jobs:
     timeout-minutes: ${{ github.ref == 'refs/heads/main' && 15 || 10 }}
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: ./.github/actions/setup
         with:
-          submodules: recursive
-      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
-      - name: Install protoc
-        uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3
-        with:
-          # TODO: Upgrade proto once https://github.com/arduino/setup-protoc/issues/99 is fixed
-          version: "23.x"
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
-      - run: rustup component add rustfmt clippy
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-        with:
-          save-if: ${{ github.ref == 'refs/heads/main' }}
-          key: msrv
-      - run: cargo install cargo-msrv
+          mise-install-args: protoc cargo:cargo-msrv
+          rust-cache-key: msrv
       - run: cargo msrv verify
         working-directory: ./crates/sdk-core
 
@@ -163,17 +136,14 @@ jobs:
           - os: macos-arm
             runsOn: macos-14
           - os: macos-intel
-            runsOn: macos-15-intel
+            runsOn: macos-26-intel
+            timeoutMinutes: 40
     runs-on: ${{ matrix.runsOn || matrix.os }}
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
-      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
-      - name: Install protoc
-        uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: ./.github/actions/setup
         with:
-          # TODO: Upgrade proto once https://github.com/arduino/setup-protoc/issues/99 is fixed
-          version: "23.x"
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
+          mise-install-args: protoc
       # Workaround for https://github.com/actions/runner-images/issues/12432
       # from https://github.com/rust-lang/rust/issues/141626#issuecomment-2919419236
       # Visual Studio bug tracker https://developercommunity.visualstudio.com/t/Regression-from-1943:-linkexe-crashes/10912960
@@ -183,10 +153,22 @@ jobs:
         with:
           script: |
             core.exportVariable('RUSTFLAGS', '-Csymbol-mangling-version=v0');
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-        with:
-          save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo integ-test
+
+  wasm-workflow-tests:
+    name: WASM workflow tests
+    timeout-minutes: ${{ github.ref == 'refs/heads/main' && 30 || 25 }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: ./.github/actions/setup
+        with:
+          mise-install-args: protoc cargo:cargo-component
+          rust-cache-key: wasm-workflow-tests
+      - name: Install WASM Rust targets
+        # Install after rust-toolchain so targets are added to the correct toolchain.
+        run: rustup target add wasm32-unknown-unknown wasm32-wasip1
+      - run: cargo integ-test -t wasm_workflow_tests -- --test-threads 1
 
   cloud-tests:
     if: github.event.pull_request.head.repo.full_name == '' || github.event.pull_request.head.repo.full_name == 'temporalio/sdk-rust'
@@ -199,18 +181,10 @@ jobs:
     timeout-minutes: ${{ github.ref == 'refs/heads/main' && 25 || 20 }}
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
-      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
-      - name: Install protoc
-        uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: ./.github/actions/setup
         with:
-          # TODO: Upgrade proto once https://github.com/arduino/setup-protoc/issues/99 is fixed
-          version: "23.x"
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
-
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-        with:
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+          mise-install-args: protoc
       - run: cargo test --features=test-utilities --test cloud_tests
 
   docker-integ-tests:
@@ -224,21 +198,14 @@ jobs:
     timeout-minutes: ${{ github.ref == 'refs/heads/main' && 25 || 20 }}
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
-      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
-      - name: Install protoc
-        uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: ./.github/actions/setup
         with:
-          # TODO: Upgrade proto once https://github.com/arduino/setup-protoc/issues/99 is fixed
-          version: "23.x"
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
+          mise-install-args: protoc
       - name: Start container for otel-collector and prometheus
         uses: hoverkraft-tech/compose-action@4894d2492015c1774ee5a13a95b1072093087ec3 # v2.5.0
         with:
           compose-file: ./etc/docker/docker-compose-ci.yaml
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-        with:
-          save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo integ-test docker_
 
   examples:
@@ -246,20 +213,12 @@ jobs:
     timeout-minutes: 15
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
-      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
-      - name: Install protoc
-        uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: ./.github/actions/setup
         with:
-          version: "23.x"
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-        with:
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+          mise-install-args: protoc github:temporalio/cli
       - name: Build examples
         run: cargo build --examples -p temporalio-sdk --features examples
-      - name: Install Temporal CLI
-        uses: temporalio/setup-temporal@1059a504f87e7fa2f385e3fa40d1aa7e62f1c6ca # v0
       - name: Start Temporal dev server
         run: |
           temporal server start-dev --headless &
@@ -267,28 +226,16 @@ jobs:
           temporal operator search-attribute create --name CustomKeywordField --type Keyword
           temporal operator search-attribute create --name CustomIntField --type Int
       - name: Run examples
-        run: |
-          for dir in crates/sdk/examples/*/; do
-            sample="$(basename "$dir" | tr '_' '-')"
-            cargo run -p temporalio-sdk --features examples --example "${sample}-worker" &
-            WORKER_PID=$!
-            timeout 20 cargo run -p temporalio-sdk --features examples --example "${sample}-starter"
-            kill $WORKER_PID 2>/dev/null || true
-            wait $WORKER_PID 2>/dev/null || true
-          done
+        run: bash ./etc/run-sdk-examples.sh
 
   c-bridge-static-link-test:
     name: "C bridge static link test"
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
-      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
-      - name: Install protoc
-        uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: ./.github/actions/setup
         with:
-          # TODO: Upgrade proto once https://github.com/arduino/setup-protoc/issues/99 is fixed
-          version: "23.x"
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
+          mise-install-args: protoc
 
       - name: Build crate as static library
         run: cargo rustc --package temporalio-sdk-core-c-bridge --features xz2-static -- --crate-type=staticlib

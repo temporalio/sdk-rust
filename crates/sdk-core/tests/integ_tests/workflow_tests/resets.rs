@@ -56,10 +56,12 @@ async fn reset_workflow() {
 
     let notify = Arc::new(Notify::new());
     let notify_clone = notify.clone();
-    worker.register_workflow_with_factory(move || ResetMeWf {
-        notify: notify_clone.clone(),
-        post_reset_received: false,
-    });
+    worker
+        .register_workflow_with_factory(move || ResetMeWf {
+            notify: notify_clone.clone(),
+            post_reset_received: false,
+        })
+        .unwrap();
 
     let task_queue = starter.get_task_queue().to_owned();
     let handle = worker
@@ -115,6 +117,7 @@ async fn reset_workflow() {
 struct ResetRandomseedWf {
     did_fail: Arc<AtomicBool>,
     rand_seed: Arc<AtomicU64>,
+    saw_updated_seed: Arc<AtomicBool>,
     notify: Arc<Notify>,
     post_fail_received: bool,
     post_reset_received: bool,
@@ -147,6 +150,9 @@ impl ResetRandomseedWf {
         if ctx.state(|wf| wf.rand_seed.load(Ordering::Relaxed)) == ctx.random_seed() {
             ctx.timer(Duration::from_millis(100)).await;
         } else {
+            ctx.state(|wf| {
+                wf.saw_updated_seed.store(true, Ordering::Relaxed);
+            });
             ctx.start_local_activity(
                 StdActivities::echo,
                 "hi!".to_string(),
@@ -186,15 +192,20 @@ async fn reset_randomseed() {
 
     let did_fail = Arc::new(AtomicBool::new(false));
     let rand_seed = Arc::new(AtomicU64::new(0));
+    let saw_updated_seed = Arc::new(AtomicBool::new(false));
     let notify = Arc::new(Notify::new());
     let notify_clone = notify.clone();
-    worker.register_workflow_with_factory(move || ResetRandomseedWf {
-        did_fail: did_fail.clone(),
-        rand_seed: rand_seed.clone(),
-        notify: notify_clone.clone(),
-        post_fail_received: false,
-        post_reset_received: false,
-    });
+    let saw_updated_seed_for_wf = saw_updated_seed.clone();
+    worker
+        .register_workflow_with_factory(move || ResetRandomseedWf {
+            did_fail: did_fail.clone(),
+            rand_seed: rand_seed.clone(),
+            saw_updated_seed: saw_updated_seed_for_wf.clone(),
+            notify: notify_clone.clone(),
+            post_fail_received: false,
+            post_reset_received: false,
+        })
+        .unwrap();
     worker.register_activities(StdActivities);
 
     let task_queue = starter.get_task_queue().to_owned();
@@ -240,8 +251,9 @@ async fn reset_randomseed() {
 
         // Unblock the workflow by sending the signal. Run ID will have changed after reset so
         // we re-obtain the handle.
-        client
-            .get_workflow_handle::<reset_randomseed_wf::Run>(wf_name.to_owned())
+        let reset_handle =
+            client.get_workflow_handle::<reset_randomseed_wf::Run>(wf_name.to_owned());
+        reset_handle
             .signal(
                 ResetRandomseedWf::post_reset,
                 (),
@@ -250,9 +262,14 @@ async fn reset_randomseed() {
             .await
             .unwrap();
 
-        // Wait for the now-reset workflow to finish
+        // Wait for the original run to terminate and the reset run to finish.
         let result = handle.get_result(Default::default()).await;
         assert_matches!(result, Err(WorkflowGetResultError::Terminated { .. }));
+        reset_handle.get_result(Default::default()).await.unwrap();
+        assert!(
+            saw_updated_seed.load(Ordering::Relaxed),
+            "workflow should observe the server-supplied updated random seed after reset"
+        );
         starter.shutdown().await;
     };
     let run_fut = worker.run_until_done();

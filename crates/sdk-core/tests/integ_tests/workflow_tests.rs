@@ -99,7 +99,7 @@ async fn parallel_workflows_same_queue() {
     starter.sdk_config.task_types = WorkerTaskTypes::workflow_only();
     let mut core = starter.worker().await;
 
-    core.register_workflow::<ParallelWorkflowsWf>();
+    core.register_workflow::<ParallelWorkflowsWf>().unwrap();
     let task_queue = starter.get_task_queue().to_owned();
     for i in 0..25 {
         core.submit_workflow(
@@ -522,7 +522,7 @@ async fn slow_completes_with_small_cache() {
 
     worker.register_activities(StdActivities);
 
-    worker.register_workflow::<SlowCompletesWf>();
+    worker.register_workflow::<SlowCompletesWf>().unwrap();
     let task_queue = starter.get_task_queue().to_owned();
     for i in 0..20 {
         worker
@@ -837,7 +837,7 @@ async fn nondeterminism_errors_fail_workflow_when_configured_to(
         }
     }
 
-    worker.register_workflow::<NondeterminismTimerWf>();
+    worker.register_workflow::<NondeterminismTimerWf>().unwrap();
     let client = starter.get_client().await;
     let core_worker = worker.core_worker();
     starter.start_with_worker(wf_name, &mut worker).await;
@@ -885,7 +885,9 @@ async fn nondeterminism_errors_fail_workflow_when_configured_to(
         }
     }
 
-    worker.register_workflow::<NondeterminismActivityWf>();
+    worker
+        .register_workflow::<NondeterminismActivityWf>()
+        .unwrap();
     // We need to generate a task so that we'll encounter the error (first avoid WFT timeout)
     WorkflowService::reset_sticky_task_queue(
         &mut client.clone(),
@@ -999,10 +1001,12 @@ async fn history_out_of_order_on_restart() {
 
     worker.register_activities(StdActivities);
     worker2.register_activities(StdActivities);
-    worker.register_workflow_with_factory(move || HistoryOutOfOrderWf1 {
-        hit_sleep: hit_sleep_clone1.clone(),
-    });
-    worker2.register_workflow::<HistoryOutOfOrderWf2>();
+    worker
+        .register_workflow_with_factory(move || HistoryOutOfOrderWf1 {
+            hit_sleep: hit_sleep_clone1.clone(),
+        })
+        .unwrap();
+    worker2.register_workflow::<HistoryOutOfOrderWf2>().unwrap();
     let task_queue = starter.get_task_queue().to_owned();
     worker
         .submit_workflow(
@@ -1079,7 +1083,7 @@ async fn pass_timer_summary_to_metadata() {
     }
 
     let mut worker = mock_sdk_cfg(mock_cfg, |_| {});
-    worker.register_workflow::<PassTimerSummaryWf>();
+    worker.register_workflow::<PassTimerSummaryWf>().unwrap();
     worker
         .submit_wf(
             DEFAULT_WORKFLOW_TYPE.to_owned(),

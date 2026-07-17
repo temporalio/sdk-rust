@@ -64,6 +64,7 @@ fsm! {
 }
 
 #[derive(Debug, derive_more::Display)]
+#[allow(clippy::large_enum_variant)]
 pub(super) enum UpdateMachineCommand {
     #[display("Accept")]
     Accept(update::v1::Request),

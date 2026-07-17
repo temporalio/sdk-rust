@@ -3,10 +3,10 @@
 [![crates.io](https://img.shields.io/crates/v/temporalio-sdk.svg)](https://crates.io/crates/temporalio-sdk)
 [![docs.rs](https://docs.rs/temporalio-sdk/badge.svg)](https://docs.rs/temporalio-sdk)
 
-This crate contains a prerelease Rust SDK. The SDK is built on top of
+This crate contains a Public Preview Rust SDK. The SDK is built on top of
 Core and provides a native Rust experience for writing Temporal workflows and activities.
 
-⚠️ **The SDK is under active development and should be considered prerelease.** The API can and
+⚠️ **The SDK is in Public Preview and under active development.** The API can and
 will continue to evolve.
 
 ## Quick Start
@@ -99,7 +99,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let worker_options = WorkerOptions::new("my-task-queue")
         .register_activities(MyActivities { counter: Default::default() })
-        .register_workflow::<GreetingWorkflow>()
+        .register_workflow::<GreetingWorkflow>()?
         .build();
 
     Worker::new(&runtime, client, worker_options)?.run().await?;
@@ -235,7 +235,7 @@ ctx.timer(Duration::from_secs(60)).await;
 
 ```rust
 let started = ctx
-    .child_workflow(
+    .start_child_workflow(
         MyChildWorkflow::run,
         "input",
         ChildWorkflowOptions {
@@ -312,8 +312,9 @@ ctx.start_local_activity(
 
 ## Cancellation
 
-Workflows and activities support cancellation. Note that in an activity, you must regularly
-heartbeat with `ctx.record_heartbeat(...)` to receive cancellations.
+Workflows and activities support cancellation. Activity cancellation may be delivered independently
+from heartbeating, though long-running activities may still wish to heartbeat with
+`ctx.record_heartbeat(...)` to report progress.
 
 ```rust
 use temporalio_sdk::workflows::select;
@@ -339,7 +340,7 @@ let worker_options = WorkerOptions::new("task-queue")
     .activity_task_poller_behavior(...)
     .graceful_shutdown_period(Duration::from_secs(30))
     .register_activities(my_activities)
-    .register_workflow::<MyWorkflow>()
+    .register_workflow::<MyWorkflow>()?
     .build();
 ```
 
@@ -474,4 +475,3 @@ directly. The application failure's own message and metadata are still preserved
 This keeps the Rust SDK's `Failure`s aligned with other Temporal SDKs: SDK error types
 remain represented as Temporal failure types, while unknown Rust error types are encoded as
 application failures.
-

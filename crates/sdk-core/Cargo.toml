@@ -1,6 +1,6 @@
 [package]
 name = "temporalio-sdk-core"
-version = "0.4.0"
+version = "0.5.0"
 authors = ["Temporal Technologies Inc. <sdk@temporal.io>"]
 edition = "2024"
 license-file = { workspace = true }
@@ -16,7 +16,20 @@ rust-version = "1.88.0"
 [lib]
 
 [features]
-default = ["envconfig", "prometheus"]
+default = ["envconfig", "prometheus", "tls-ring"]
+tls-ring = [
+  "temporalio-client/tls-ring",
+  "temporalio-common/tls-ring",
+  "opentelemetry-otlp?/tls-ring",
+  "opentelemetry-otlp?/reqwest-rustls",
+  "tonic/tls-native-roots",
+]
+tls-aws-lc = [
+  "temporalio-client/tls-aws-lc",
+  "temporalio-common/tls-aws-lc",
+  "opentelemetry-otlp?/tls-aws-lc",
+  "tonic/tls-native-roots",
+]
 envconfig = ["temporalio-client/envconfig", "temporalio-common/envconfig"]
 prometheus = ["temporalio-common/prometheus"]
 otel = [
@@ -54,22 +67,20 @@ futures-util = { version = "0.3", default-features = false }
 gethostname = "1.0.2"
 hyper = { version = "1.7", optional = true }
 itertools = "0.14"
-lru = "0.16"
+lru = "0.18"
 mockall = "0.14"
 opentelemetry = { workspace = true, features = ["metrics"], optional = true }
-opentelemetry_sdk = { version = "0.31", default-features = false, features = [
+opentelemetry_sdk = { version = "0.32", default-features = false, features = [
   "rt-tokio",
   "metrics",
   "spec_unstable_metrics_views",
 ], optional = true }
-opentelemetry-otlp = { version = "0.31", default-features = false, features = [
+opentelemetry-otlp = { version = "0.32", default-features = false, features = [
   "tokio",
   "metrics",
-  "tls-roots",
   "http-proto",
   "grpc-tonic",
   "reqwest-blocking-client",
-  "reqwest-rustls",
 ], optional = true }
 parking_lot = { version = "0.12" }
 pid = "4.0"
@@ -102,7 +113,6 @@ tokio = { version = "1.47", default-features = false, features = [
 tokio-util = { version = "0.7", features = ["io", "io-util"] }
 tokio-stream = { version = "0.1", default-features = false }
 tonic = { workspace = true, default-features = false, features = [
-  "tls-ring",
   "tls-native-roots",
   "transport",
   "codegen",
@@ -120,19 +130,19 @@ zip = { version = "8.4", optional = true, default-features = false, features = [
 # 1st party local deps
 [dependencies.temporalio-common]
 path = "../common"
-version = "0.4"
+version = "0.5"
 default-features = false
-features = ["core-telemetry-bridge"]
+features = ["core-telemetry-bridge", "serde_serialize"]
 
 [dependencies.temporalio-client]
 path = "../client"
-version = "0.4"
+version = "0.5"
 default-features = false
 features = ["core-based-sdk"]
 
 [dependencies.temporalio-macros]
 path = "../macros"
-version = "0.4"
+version = "0.5"
 
 [dev-dependencies]
 assert_matches = "1.5"
@@ -141,6 +151,7 @@ bytes = "1.10"
 clap = { version = "4.5", features = ["derive"] }
 criterion = { version = "0.8", features = ["async", "async_tokio"] }
 crossbeam-queue = "0.3"
+flate2 = "1.1"
 http-body-util = { version = "0.1" }
 hyper = { version = "1.7" }
 hyper-util = { version = "0.1", features = [
@@ -151,8 +162,9 @@ hyper-util = { version = "0.1", features = [
 ] }
 rstest = "0.26"
 semver = "1.0"
-temporalio-sdk = { path = "../sdk" }
-temporalio-common = { path = "../common", version = "0.4", default-features = false }
+temporalio-sdk = { path = "../sdk", features = ["wasm-workflows"] }
+temporalio-common = { path = "../common", version = "0.5", default-features = false }
+temporalio-workflow = { path = "../workflow" }
 tokio = { version = "1.47", default-features = false, features = [
   "rt",
   "rt-multi-thread",
@@ -196,6 +208,20 @@ name = "manual_tests"
 path = "tests/manual_tests.rs"
 test = false
 required-features = ["test-utilities"]
+
+[[test]]
+name = "wasm_workflow_tests"
+path = "tests/wasm_workflow_tests.rs"
+# Prevents autodiscovery, and hence these getting run with `cargo test`. Run with
+# `cargo integ-test -t wasm_workflow_tests`. Building these requires `cargo component` plus both
+# `wasm32-unknown-unknown` and `wasm32-wasip1`; cargo-component still validates the WASIp1 target
+# even when this sample is built with an explicit unknown-unknown target.
+test = false
+required-features = [
+  "temporalio-common/serde_serialize",
+  "test-utilities",
+  "ephemeral-server",
+]
 
 [[test]]
 name = "global_metric_tests"

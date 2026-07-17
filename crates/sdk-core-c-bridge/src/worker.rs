@@ -16,7 +16,9 @@ use temporalio_common::protos::{
         ActivityHeartbeat, ActivityTaskCompletion, nexus::NexusTaskCompletion,
         workflow_completion::WorkflowActivationCompletion,
     },
-    temporal::api::history::v1::History,
+    temporal::api::{
+        enums::v1::VersioningBehavior as ProtoVersioningBehavior, history::v1::History,
+    },
 };
 use temporalio_sdk_core::{
     PollError, SlotInfoTrait, SlotKind, SlotMarkUsedContext, SlotReleaseContext,
@@ -52,6 +54,10 @@ pub struct WorkerOptions {
     pub nondeterminism_as_workflow_fail_for_types: ByteArrayRefArray,
     pub plugins: ByteArrayRefArray,
     pub storage_drivers: ByteArrayRefArray,
+    /// If set, the worker won't proactively fail completions whose payloads exceed the namespace
+    /// error limits; oversized payloads are sent and the server enforces the limit.
+    /// NOTE: Experimental
+    pub disable_payload_error_limit: bool,
 }
 
 #[repr(C)]
@@ -506,6 +512,9 @@ pub struct ResourceBasedTunerOptions {
 
 #[derive(Clone)]
 pub struct Worker {
+    // Clones of this must be dropped before waking lang: finalize_shutdown() takes sole ownership
+    // via Arc::try_unwrap, which fails if this clone is still alive when the woken thread calls it.
+    // (notify-after-release)
     worker: Option<Arc<temporalio_sdk_core::Worker>>,
     runtime: Runtime,
 }
@@ -625,6 +634,7 @@ pub extern "C" fn temporal_core_worker_validate(
                 .into_raw()
                 .cast_const(),
         };
+        drop(core_worker);
         unsafe {
             callback(user_data.into(), fail);
         }
@@ -688,6 +698,7 @@ pub extern "C" fn temporal_core_worker_poll_workflow_activation(
                     .cast_const(),
             ),
         };
+        drop(core_worker);
         unsafe {
             callback(user_data.into(), success, fail);
         }
@@ -722,6 +733,7 @@ pub extern "C" fn temporal_core_worker_poll_activity_task(
                     .cast_const(),
             ),
         };
+        drop(core_worker);
         unsafe {
             callback(user_data.into(), success, fail);
         }
@@ -756,6 +768,7 @@ pub extern "C" fn temporal_core_worker_poll_nexus_task(
                     .cast_const(),
             ),
         };
+        drop(core_worker);
         unsafe {
             callback(user_data.into(), success, fail);
         }
@@ -798,6 +811,7 @@ pub extern "C" fn temporal_core_worker_complete_workflow_activation(
                 .into_raw()
                 .cast_const(),
         };
+        drop(core_worker);
         unsafe {
             callback(user_data.into(), fail);
         }
@@ -840,6 +854,7 @@ pub extern "C" fn temporal_core_worker_complete_activity_task(
                 .into_raw()
                 .cast_const(),
         };
+        drop(core_worker);
         unsafe {
             callback(user_data.into(), fail);
         }
@@ -882,6 +897,7 @@ pub extern "C" fn temporal_core_worker_complete_nexus_task(
                 .into_raw()
                 .cast_const(),
         };
+        drop(core_worker);
         unsafe {
             callback(user_data.into(), fail);
         }
@@ -1167,8 +1183,8 @@ impl TryFrom<&WorkerOptions> for temporalio_sdk_core::WorkerConfig {
                         let dvb = match dopts.default_versioning_behavior {
                             0 => None,
                             v => {
-                                if let Ok(behavior) = v.try_into() {
-                                    Some(behavior)
+                                if let Ok(behavior) = ProtoVersioningBehavior::try_from(v) {
+                                    Some(behavior.into())
                                 } else {
                                     bail!("Invalid default versioning behavior {}", v)
                                 }
@@ -1277,6 +1293,7 @@ impl TryFrom<&WorkerOptions> for temporalio_sdk_core::WorkerConfig {
                     })
                     .collect::<HashSet<_>>(),
             )
+            .disable_payload_error_limit(opt.disable_payload_error_limit)
             .build()
             .map_err(|err| anyhow::anyhow!(err))
     }
@@ -1333,11 +1350,13 @@ impl TryFrom<&TunerHolder> for temporalio_sdk_core::TunerHolder {
             .activity_slot_options(holder.activity_slot_supplier.try_into()?)
             .local_activity_slot_options(holder.local_activity_slot_supplier.try_into()?)
             .nexus_slot_options(holder.nexus_task_slot_supplier.try_into()?)
-            .maybe_resource_based_options(first.map(|f| {
-                temporalio_sdk_core::ResourceBasedSlotsOptions::builder()
-                    .target_mem_usage(f.target_memory_usage)
-                    .target_cpu_usage(f.target_cpu_usage)
-                    .build()
+            .maybe_resource_based_config(first.map(|f| {
+                temporalio_sdk_core::ResourceBasedTunerConfig::Options(
+                    temporalio_sdk_core::ResourceBasedSlotsOptions::builder()
+                        .target_mem_usage(f.target_memory_usage)
+                        .target_cpu_usage(f.target_cpu_usage)
+                        .build(),
+                )
             }))
             .build()
             .map_err(|e| anyhow::anyhow!("Failed building tuner holder options: {}", e))?
@@ -1430,6 +1449,7 @@ mod tests {
             nondeterminism_as_workflow_fail_for_types: crate::ByteArrayRefArray::empty(),
             plugins: crate::ByteArrayRefArray::empty(),
             storage_drivers: crate::ByteArrayRefArray::empty(),
+            disable_payload_error_limit: false,
         }
     }
 

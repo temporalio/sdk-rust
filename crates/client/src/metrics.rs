@@ -132,12 +132,21 @@ impl MetricsContext {
 
     /// A request to the temporal service failed
     pub(crate) fn svc_request_failed(&self, code: Option<Code>) {
+        self.svc_request_failed_with_label(code.map(status_code_kv));
+    }
+
+    /// A request to the temporal service failed due to a transport-level error
+    /// (no gRPC status received from the server).
+    pub(crate) fn svc_request_failed_transport(&self) {
+        self.svc_request_failed_with_label(Some(transport_error_kv()));
+    }
+
+    fn svc_request_failed_with_label(&self, label: Option<MetricKeyValue>) {
         let refme: MetricAttributes;
-        let kvs = if let Some(c) = code {
-            refme = self.meter.extend_attributes(
-                self.meter.get_default_attributes().clone(),
-                [status_code_kv(c)].into(),
-            );
+        let kvs = if let Some(kv) = label {
+            refme = self
+                .meter
+                .extend_attributes(self.meter.get_default_attributes().clone(), [kv].into());
             &refme
         } else {
             self.meter.get_default_attributes()
@@ -178,6 +187,10 @@ pub(crate) fn svc_operation(op: String) -> MetricKeyValue {
 
 pub(crate) fn status_code_kv(code: Code) -> MetricKeyValue {
     MetricKeyValue::new(KEY_STATUS_CODE, code_as_screaming_snake(&code))
+}
+
+fn transport_error_kv() -> MetricKeyValue {
+    MetricKeyValue::new(KEY_STATUS_CODE, "TRANSPORT_ERROR")
 }
 
 /// This is done to match the way Java sdk labels these codes (and also matches gRPC spec)
@@ -295,21 +308,34 @@ impl Service<http::Request<Body>> for GrpcMetricSvc {
             let res = callfut.await;
             if let Some(metrics) = metrics {
                 metrics.record_svc_req_latency(started.elapsed());
-                if let Ok(ref ok_res) = res
-                    && let Some(number) = ok_res
-                        .headers()
-                        .get("grpc-status")
-                        .and_then(|s| s.to_str().ok())
-                        .and_then(|s| s.parse::<i32>().ok())
-                {
-                    let code = Code::from(number);
-                    if code != Code::Ok {
-                        let code = if errcode_label_disabled {
-                            None
+                match res {
+                    Ok(ref ok_res) => {
+                        if let Some(number) = ok_res
+                            .headers()
+                            .get("grpc-status")
+                            .and_then(|s| s.to_str().ok())
+                            .and_then(|s| s.parse::<i32>().ok())
+                        {
+                            let code = Code::from(number);
+                            if code != Code::Ok {
+                                let code = if errcode_label_disabled {
+                                    None
+                                } else {
+                                    Some(code)
+                                };
+                                metrics.svc_request_failed(code);
+                            }
+                        }
+                    }
+                    Err(_) => {
+                        // Transport-level errors (connection closed, GOAWAY, etc.) never
+                        // produce a grpc-status header. Record them so they are visible
+                        // in dashboards rather than silently disappearing.
+                        if !errcode_label_disabled {
+                            metrics.svc_request_failed_transport();
                         } else {
-                            Some(code)
-                        };
-                        metrics.svc_request_failed(code);
+                            metrics.svc_request_failed(None);
+                        }
                     }
                 }
             }

@@ -270,6 +270,133 @@ mod tests {
         assert_logs(instance.fetch_buffered_logs());
     }
 
+    /// A payload-limit log uses the `[TMPRL1103]` code and inherits execution context (workflow id,
+    /// type, namespace, …) from the enclosing span via span-field flattening — the path by which that
+    /// context reaches lang SDKs through log forwarding.
+    #[tokio::test]
+    async fn payload_limit_log_carries_span_context() {
+        use crate::payload_limits::{PayloadLimits, validate_payload_limits};
+        use crate::protos::temporal::api::{
+            common::v1::{Payload, Payloads},
+            workflowservice::v1::StartWorkflowExecutionRequest,
+        };
+
+        let opts = TelemetryOptions::builder()
+            .logging(Logger::Forward {
+                filter: construct_filter_string(Level::INFO, Level::WARN),
+            })
+            .build();
+        let instance = telemetry_init(opts).unwrap();
+        let _g = tracing::subscriber::set_default(instance.trace_subscriber().unwrap().clone());
+
+        let req = StartWorkflowExecutionRequest {
+            input: Some(Payloads {
+                payloads: vec![Payload {
+                    data: vec![0u8; 1000],
+                    ..Default::default()
+                }],
+            }),
+            ..Default::default()
+        };
+        // Warn-only limits: logs a warning, returns None.
+        let limits = PayloadLimits {
+            blob_warn: 1,
+            memo_warn: 1,
+            blob_error: 0,
+            memo_error: 0,
+        };
+        {
+            let span = span!(
+                Level::INFO,
+                "wf_completion",
+                namespace = "myns",
+                workflow_id = "wf1",
+                workflow_type = "MyWorkflow"
+            );
+            let _guard = span.enter();
+            assert!(validate_payload_limits(&req, &limits).is_none());
+        }
+
+        let logs = instance.fetch_buffered_logs();
+        let warn = logs
+            .iter()
+            .find(|l| l.message.starts_with("[TMPRL1103]"))
+            .expect("payload-limit warning was forwarded");
+        assert_eq!(warn.level, Level::WARN);
+        assert!(warn.message.contains("payloads"));
+        // Span context flattened into the forwarded record:
+        assert_eq!(warn.fields.get("namespace"), Some(&"myns".into()));
+        assert_eq!(warn.fields.get("workflow_id"), Some(&"wf1".into()));
+        assert_eq!(warn.fields.get("workflow_type"), Some(&"MyWorkflow".into()));
+        // Event fields present
+        assert!(warn.fields.contains_key("size"));
+        // Ensure high cardinality fields are not included
+        assert!(!warn.fields.contains_key("payload_path"));
+    }
+
+    /// Error-level counterpart: an over-error-limit field emits an `ERROR` `[TMPRL1103]` log carrying
+    /// the same span context.
+    #[tokio::test]
+    async fn payload_limit_error_log_carries_span_context() {
+        use crate::payload_limits::{PayloadLimits, validate_payload_limits};
+        use crate::protos::temporal::api::{
+            common::v1::{Payload, Payloads},
+            workflowservice::v1::StartWorkflowExecutionRequest,
+        };
+
+        let opts = TelemetryOptions::builder()
+            .logging(Logger::Forward {
+                filter: construct_filter_string(Level::INFO, Level::WARN),
+            })
+            .build();
+        let instance = telemetry_init(opts).unwrap();
+        let _g = tracing::subscriber::set_default(instance.trace_subscriber().unwrap().clone());
+
+        let req = StartWorkflowExecutionRequest {
+            input: Some(Payloads {
+                payloads: vec![Payload {
+                    data: vec![0u8; 1000],
+                    ..Default::default()
+                }],
+            }),
+            ..Default::default()
+        };
+        // Error limits set: the oversized input produces an error-level violation.
+        let limits = PayloadLimits {
+            blob_warn: 1,
+            memo_warn: 1,
+            blob_error: 1,
+            memo_error: 1,
+        };
+        {
+            let span = span!(
+                Level::INFO,
+                "wf_completion",
+                namespace = "myns",
+                workflow_id = "wf1",
+                workflow_type = "MyWorkflow"
+            );
+            let _guard = span.enter();
+            assert!(validate_payload_limits(&req, &limits).is_some());
+        }
+
+        let logs = instance.fetch_buffered_logs();
+        let error = logs
+            .iter()
+            .find(|l| l.message.starts_with("[TMPRL1103]"))
+            .expect("payload-limit error was forwarded");
+        assert_eq!(error.level, Level::ERROR);
+        assert!(error.message.contains("payloads"));
+        assert_eq!(error.fields.get("namespace"), Some(&"myns".into()));
+        assert_eq!(error.fields.get("workflow_id"), Some(&"wf1".into()));
+        assert_eq!(
+            error.fields.get("workflow_type"),
+            Some(&"MyWorkflow".into())
+        );
+        assert!(error.fields.contains_key("size"));
+        assert!(!error.fields.contains_key("payload_path"));
+    }
+
     struct CaptureConsumer(Mutex<Vec<CoreLog>>);
 
     impl CoreLogConsumer for CaptureConsumer {

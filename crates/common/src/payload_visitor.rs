@@ -106,6 +106,9 @@ pub struct DecodeVisitor<'a> {
 impl AsyncPayloadVisitor for DecodeVisitor<'_> {
     fn visit<'a>(&'a mut self, field: PayloadField<'a>) -> BoxFuture<'a, ()> {
         Box::pin(async move {
+            if !should_encode(field.path) {
+                return;
+            }
             match field.data {
                 PayloadFieldData::Single(payload) => {
                     let decoded = self
@@ -217,6 +220,8 @@ mod tests {
             temporal::api::{
                 common::v1::{Memo, SearchAttributes},
                 failure::v1::failure::FailureInfo,
+                workflow::v1::WorkflowExecutionInfo,
+                workflowservice::v1::DescribeWorkflowExecutionResponse,
             },
         },
     };
@@ -604,6 +609,54 @@ mod tests {
         assert!(
             !is_encoded(sa.indexed_fields.get("CustomField").unwrap()),
             "search attributes should NOT be encoded"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_search_attributes_skipped_on_decode() {
+        let mut response = DescribeWorkflowExecutionResponse {
+            workflow_execution_info: Some(WorkflowExecutionInfo {
+                memo: Some(Memo {
+                    fields: {
+                        let mut memo = HashMap::new();
+                        memo.insert("tracked".to_string(), make_payload("memo-value"));
+                        memo
+                    },
+                }),
+                search_attributes: Some(SearchAttributes {
+                    indexed_fields: {
+                        let mut sa = HashMap::new();
+                        sa.insert("CustomField".to_string(), make_payload("search-value"));
+                        sa
+                    },
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        decode_payloads(
+            &mut response,
+            &MarkingCodec,
+            &SerializationContextData::Workflow,
+        )
+        .await;
+
+        let info = response.workflow_execution_info.as_ref().unwrap();
+        assert!(
+            is_decoded(info.memo.as_ref().unwrap().fields.get("tracked").unwrap()),
+            "memo should be decoded"
+        );
+        assert!(
+            !is_decoded(
+                info.search_attributes
+                    .as_ref()
+                    .unwrap()
+                    .indexed_fields
+                    .get("CustomField")
+                    .unwrap()
+            ),
+            "search attributes should NOT be decoded"
         );
     }
 

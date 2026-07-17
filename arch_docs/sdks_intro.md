@@ -46,6 +46,51 @@ async def say_hello(name: str) -> str:
     return f"Hello, {name}!"
 ```
 
+### Nexus
+
+Nexus allows you to define and invoke functionality within and across namespaces by calling Nexus Operations. Nexus Operations can be anything from starting a new workflow to updating the state of a currently running workflow, or other arbitrary user-defined functionality. A Nexus Service is what we call the interface that abstracts sending Operations. A Nexus Service abstracts implementation details like the target Namespace and the Task Queues that the Operations run on. Like Activities, Nexus Operations get all the Temporal durable execution guarantees. Instead of interacting directly with a Nexus Service, we call a Nexus Endpoint. Nexus Endpoints are reverse proxies that take incoming Nexus Operations and map them to Nexus Services (Namespace + Task Queue). Nexus Endpoints are registered in a Nexus Registry that exposes them to your organization.
+
+**Example Nexus Service and Caller (Python):**
+
+``` python
+from dataclasses import dataclass
+import nexusrpc
+import nexusrpc.handler
+from temporalio import nexus, workflow
+
+# --- service.py: the Nexus Service ---
+@dataclass
+class GreetInput:
+    name: str
+
+@nexusrpc.service
+class GreetingService:
+    say_hello: nexusrpc.Operation[GreetInput, str]
+
+# --- handler.py: lives on a worker and handles Nexus Operations ---
+@nexusrpc.handler.service_handler(service=GreetingService)
+class GreetingServiceHandler:
+    @nexus.workflow_run_operation
+    async def say_hello(
+        self, ctx: nexus.WorkflowRunOperationContext, input: GreetInput,
+    ) -> nexus.WorkflowHandle[str]:
+        return await ctx.start_workflow(
+            SayHello.run, input.name, id=f"say-hello-{input.name}",
+        )
+
+# --- caller.py: a Workflow running in a different Namespace ---
+@workflow.defn
+class GreetingCaller:
+    @workflow.run
+    async def run(self, name: str) -> str:
+        client = workflow.create_nexus_client(
+            service=GreetingService, endpoint="my-nexus-endpoint",
+        )
+        return await client.execute_operation(
+            GreetingService.say_hello, GreetInput(name=name),
+        )
+```
+
 ### Clients
 
 Clients serve as a driver for interaction with the Temporal server. They provide a high-level API

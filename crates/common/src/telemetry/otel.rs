@@ -13,19 +13,26 @@ use super::{
 };
 use crate::dbg_panic;
 use opentelemetry::{
-    self, Key, KeyValue, Value,
+    self, Key, KeyValue,
     metrics::{Meter, MeterProvider as MeterProviderT},
 };
+#[cfg(any(feature = "tls-ring", feature = "tls-aws-lc"))]
+use opentelemetry_otlp::tonic_types::transport::ClientTlsConfig;
 use opentelemetry_otlp::{WithExportConfig, WithHttpConfig, WithTonicConfig};
 use opentelemetry_sdk::{
-    Resource, metrics,
+    Resource,
+    error::OTelSdkResult,
+    metrics,
     metrics::{
         Aggregation, Instrument, InstrumentKind, MeterProviderBuilder, PeriodicReader,
-        SdkMeterProvider, Temporality,
+        SdkMeterProvider, Temporality, data::ResourceMetrics, exporter::PushMetricExporter,
     },
 };
 use std::{collections::HashMap, sync::Arc, time::Duration};
-use tonic::{metadata::MetadataMap, transport::ClientTlsConfig};
+use tonic::metadata::MetadataMap;
+use tracing::{Dispatch, instrument::WithSubscriber};
+
+const OTLP_METRIC_EXPORT_WARN_TARGET: &str = "temporalio_common::telemetry::otel::metric_export";
 
 fn histo_view(
     metric_name: &'static str,
@@ -123,12 +130,15 @@ pub fn build_otlp_metric_exporter(
 ) -> Result<CoreOtelMeter, anyhow::Error> {
     let exporter = match opts.protocol {
         OtlpProtocol::Grpc => {
-            let mut exporter = opentelemetry_otlp::MetricExporter::builder()
+            let exporter = opentelemetry_otlp::MetricExporter::builder()
                 .with_tonic()
                 .with_endpoint(opts.url.to_string());
-            if opts.url.scheme() == "https" || opts.url.scheme() == "grpcs" {
-                exporter = exporter.with_tls_config(ClientTlsConfig::new().with_native_roots());
-            }
+            #[cfg(any(feature = "tls-ring", feature = "tls-aws-lc"))]
+            let exporter = if opts.url.scheme() == "https" || opts.url.scheme() == "grpcs" {
+                exporter.with_tls_config(ClientTlsConfig::new().with_native_roots())
+            } else {
+                exporter
+            };
             exporter
                 .with_metadata(MetadataMap::from_headers((&opts.headers).try_into()?))
                 .with_temporality(metric_temporality_to_temporality(opts.metric_temporality))
@@ -141,7 +151,7 @@ pub fn build_otlp_metric_exporter(
             .with_temporality(metric_temporality_to_temporality(opts.metric_temporality))
             .build()?,
     };
-    let reader = PeriodicReader::builder(exporter)
+    let reader = PeriodicReader::builder(TracingMetricExporter::new(exporter))
         .with_interval(opts.metric_periodicity)
         .build();
     let mp = augment_meter_provider_with_defaults(
@@ -156,6 +166,51 @@ pub fn build_otlp_metric_exporter(
         use_seconds_for_durations: opts.use_seconds_for_durations,
         _mp: mp,
     })
+}
+
+struct TracingMetricExporter<E> {
+    inner: E,
+    dispatch: Dispatch,
+}
+
+impl<E> TracingMetricExporter<E> {
+    fn new(inner: E) -> Self {
+        let dispatch = tracing::dispatcher::get_default(Clone::clone);
+        Self { inner, dispatch }
+    }
+}
+
+impl<E: PushMetricExporter> PushMetricExporter for TracingMetricExporter<E> {
+    fn export(&self, metrics: &ResourceMetrics) -> impl Future<Output = OTelSdkResult> + Send {
+        let dispatch = self.dispatch.clone();
+        let export = tracing::dispatcher::with_default(&dispatch, || self.inner.export(metrics));
+        async move {
+            let result = export.await;
+            if let Err(err) = &result {
+                tracing::warn!(
+                    target: OTLP_METRIC_EXPORT_WARN_TARGET,
+                    error = %err,
+                    "OTLP metric export failed; metrics may be dropped"
+                );
+            }
+            result
+        }
+        .with_subscriber(dispatch)
+    }
+
+    fn force_flush(&self) -> OTelSdkResult {
+        tracing::dispatcher::with_default(&self.dispatch, || self.inner.force_flush())
+    }
+
+    fn shutdown_with_timeout(&self, timeout: Duration) -> OTelSdkResult {
+        tracing::dispatcher::with_default(&self.dispatch, || {
+            self.inner.shutdown_with_timeout(timeout)
+        })
+    }
+
+    fn temporality(&self) -> Temporality {
+        tracing::dispatcher::with_default(&self.dispatch, || self.inner.temporality())
+    }
 }
 
 #[derive(Debug)]
@@ -308,7 +363,11 @@ fn default_resource_instance() -> &'static Resource {
     static INSTANCE: OnceLock<Resource> = OnceLock::new();
     INSTANCE.get_or_init(|| {
         let resource = Resource::builder().build();
-        if resource.get(&Key::from("service.name")) == Some(Value::from("unknown_service")) {
+        if resource.get(&Key::from("service.name")).is_some_and(|v| {
+            let service_name = v.as_str();
+            // OTel 0.32 may suffix the unknown-service fallback with the process name if available
+            service_name == "unknown_service" || service_name.starts_with("unknown_service:")
+        }) {
             // otel spec recommends to leave service.name as unknown_service but we want to
             // maintain backwards compatability with existing library behaviour
             return Resource::builder_empty()
@@ -349,12 +408,125 @@ fn metric_temporality_to_temporality(t: MetricTemporality) -> Temporality {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use opentelemetry::Key;
+    use opentelemetry::{Key, Value};
+    use opentelemetry_sdk::{
+        error::{OTelSdkError, OTelSdkResult},
+        metrics::{Temporality, data::ResourceMetrics, exporter::PushMetricExporter},
+    };
+    use std::{
+        sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        },
+        time::Duration,
+    };
+    use tracing_core::{
+        Event, Level, Metadata, Subscriber,
+        span::{Attributes, Id, Record},
+    };
+
+    const EXPORT_LOG_TARGET: &str = "temporalio_common_test_exporter";
+
+    struct CapturingSubscriber {
+        saw_export_log: Arc<AtomicBool>,
+        saw_wrapper_warn: Arc<AtomicBool>,
+    }
+
+    impl Subscriber for CapturingSubscriber {
+        fn enabled(&self, _metadata: &Metadata<'_>) -> bool {
+            true
+        }
+
+        fn new_span(&self, _span: &Attributes<'_>) -> Id {
+            Id::from_u64(1)
+        }
+
+        fn record(&self, _span: &Id, _values: &Record<'_>) {}
+
+        fn record_follows_from(&self, _span: &Id, _follows: &Id) {}
+
+        fn event(&self, event: &Event<'_>) {
+            if event.metadata().target() == EXPORT_LOG_TARGET {
+                self.saw_export_log.store(true, Ordering::SeqCst);
+            }
+            if *event.metadata().level() == Level::WARN
+                && event.metadata().target() == OTLP_METRIC_EXPORT_WARN_TARGET
+            {
+                self.saw_wrapper_warn.store(true, Ordering::SeqCst);
+            }
+        }
+
+        fn enter(&self, _span: &Id) {}
+
+        fn exit(&self, _span: &Id) {}
+    }
+
+    struct FailingExporter;
+
+    impl PushMetricExporter for FailingExporter {
+        async fn export(&self, _metrics: &ResourceMetrics) -> OTelSdkResult {
+            tracing::debug!(target: EXPORT_LOG_TARGET, "export polled");
+            Err(OTelSdkError::InternalFailure("export failed".to_string()))
+        }
+
+        fn force_flush(&self) -> OTelSdkResult {
+            Ok(())
+        }
+
+        fn shutdown_with_timeout(&self, _timeout: Duration) -> OTelSdkResult {
+            Ok(())
+        }
+
+        fn temporality(&self) -> Temporality {
+            Temporality::Cumulative
+        }
+    }
 
     #[test]
     pub(crate) fn default_resource_instance_service_name_default() {
         let resource = default_resource_instance();
         let service_name = resource.get(&Key::from("service.name"));
         assert_eq!(service_name, Some(Value::from(TELEM_SERVICE_NAME)));
+    }
+
+    #[tokio::test]
+    pub(crate) async fn traced_exporter_enters_subscriber_while_polling_export() {
+        let saw_export_log = Arc::new(AtomicBool::new(false));
+        let saw_wrapper_warn = Arc::new(AtomicBool::new(false));
+        let subscriber = Arc::new(CapturingSubscriber {
+            saw_export_log: saw_export_log.clone(),
+            saw_wrapper_warn,
+        });
+        let exporter = tracing::dispatcher::with_default(&Dispatch::new(subscriber), || {
+            TracingMetricExporter::new(FailingExporter)
+        });
+        let metrics = ResourceMetrics::default();
+
+        assert!(exporter.export(&metrics).await.is_err());
+        assert!(saw_export_log.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    pub(crate) fn periodic_reader_export_failure_emits_core_warn() {
+        let saw_export_log = Arc::new(AtomicBool::new(false));
+        let saw_wrapper_warn = Arc::new(AtomicBool::new(false));
+        let subscriber = Arc::new(CapturingSubscriber {
+            saw_export_log,
+            saw_wrapper_warn: saw_wrapper_warn.clone(),
+        });
+        let provider = tracing::dispatcher::with_default(&Dispatch::new(subscriber), || {
+            let reader = PeriodicReader::builder(TracingMetricExporter::new(FailingExporter))
+                .with_interval(Duration::from_secs(60))
+                .build();
+            MeterProviderBuilder::default().with_reader(reader).build()
+        });
+        let meter = provider.meter("temporalio_common_test");
+        meter
+            .u64_counter("temporalio_common_test_counter")
+            .build()
+            .add(1, &[]);
+
+        assert!(provider.force_flush().is_err());
+        assert!(saw_wrapper_warn.load(Ordering::SeqCst));
     }
 }

@@ -6,7 +6,11 @@ mod slot_provider;
 pub(crate) mod tuner;
 mod workflow;
 
-use temporalio_client::Connection;
+/// The failure `type` set on the task failures workers synthesize when an outbound payload exceeds
+/// the error limit, shared so every conversion site reports the same identifier.
+pub(crate) const PAYLOADS_TOO_LARGE_FAILURE_TYPE: &str = "PayloadsTooLarge";
+
+use temporalio_client::{Connection, PayloadErrorLimits};
 use temporalio_common::{
     protos::{
         coresdk::{
@@ -23,8 +27,8 @@ use temporalio_common::{
 };
 pub use tuner::{
     FixedSizeSlotSupplier, ResourceBasedSlotsOptions, ResourceBasedSlotsOptionsBuilder,
-    ResourceBasedTuner, ResourceSlotOptions, SlotSupplierOptions, TunerBuilder, TunerHolder,
-    TunerHolderOptions,
+    ResourceBasedTuner, ResourceBasedTunerConfig, ResourceController, ResourceSlotOptions,
+    SlotSupplierOptions, TunerBuilder, TunerHolder, TunerHolderOptions,
 };
 // Re-export the generated builder (it's in the tuner module)
 pub use tuner::TunerHolderOptionsBuilder;
@@ -78,7 +82,8 @@ use std::{
     time::{Duration, SystemTime},
 };
 use temporalio_client::worker::{
-    ClientWorker, HeartbeatCallback, SharedNamespaceWorkerTrait, Slot as SlotTrait,
+    CancelActivityCallback, ClientWorker, HeartbeatCallback, SharedNamespaceWorkerTrait,
+    Slot as SlotTrait,
 };
 use temporalio_common::{
     protos::{
@@ -92,7 +97,7 @@ use temporalio_common::{
         },
         temporal::api::{
             deployment,
-            enums::v1::{TaskQueueKind, WorkerStatus},
+            enums::v1::{TaskQueueKind, TaskQueueType, WorkerStatus},
             taskqueue::v1::{StickyExecutionAttributes, TaskQueue},
             worker::v1::{WorkerHeartbeat, WorkerHostInfo, WorkerPollerInfo, WorkerSlotsInfo},
         },
@@ -272,6 +277,13 @@ pub struct WorkerConfig {
     /// List of storage drivers used by lang.
     #[builder(default)]
     pub storage_drivers: HashSet<StorageDriverInfo>,
+
+    /// If set, the worker won't enforce server payload/memo error limits on outbound completions —
+    /// oversized payloads are still warned about, and the server still rejects them. When unset, an
+    /// oversized completion is proactively failed as a WFT/activity rather than sent.
+    /// NOTE: Experimental
+    #[builder(default = false)]
+    pub disable_payload_error_limit: bool,
 }
 
 impl WorkerConfig {
@@ -433,9 +445,11 @@ pub struct Worker {
 }
 
 /// Namespace capabilities discovered via `describe_namespace` during worker validation.
+#[derive(Default)]
 pub struct NamespaceCapabilities {
     pub(crate) graceful_poll_shutdown: AtomicBool,
     pub(crate) poller_autoscaling: AtomicBool,
+    pub(crate) worker_commands: AtomicBool,
 }
 
 impl NamespaceCapabilities {
@@ -449,6 +463,11 @@ impl NamespaceCapabilities {
     /// decision from the server.
     pub fn poller_autoscaling(&self) -> bool {
         self.poller_autoscaling.load(Ordering::Relaxed)
+    }
+
+    /// Returns true if worker commands are supported in this namespace.
+    pub fn worker_commands(&self) -> bool {
+        self.worker_commands.load(Ordering::Relaxed)
     }
 }
 
@@ -523,6 +542,17 @@ impl Worker {
                         memo_size_limit_error: api_limits.memo_size_limit_error,
                     })
                 });
+                // Install the namespace error limits on the client (enforced on completions) unless
+                // opted out; warn-level enforcement is always on, configured on the connection.
+                if !self.config.disable_payload_error_limit
+                    && let Some(limits) = limits.as_ref()
+                {
+                    self.client
+                        .set_payload_error_limits(Some(PayloadErrorLimits {
+                            blob: limits.blob_size_limit_error.max(0) as usize,
+                            memo: limits.memo_size_limit_error.max(0) as usize,
+                        }));
+                }
                 if let Some(caps) = ns_info.and_then(|ns| ns.capabilities) {
                     if caps.worker_poll_complete_on_shutdown {
                         self.capabilities
@@ -532,6 +562,11 @@ impl Worker {
                     if caps.poller_autoscaling {
                         self.capabilities
                             .poller_autoscaling
+                            .store(true, Ordering::Relaxed);
+                    }
+                    if caps.worker_commands {
+                        self.capabilities
+                            .worker_commands
                             .store(true, Ordering::Relaxed);
                     }
                 }
@@ -618,7 +653,6 @@ impl Worker {
             sys_info = tuner_builder.get_sys_info();
             Arc::new(tuner_builder.build())
         });
-        let sys_info = sys_info.unwrap_or_else(|| Arc::new(RealSysInfo::new()));
 
         metrics.worker_registered();
         let shutdown_token = CancellationToken::new();
@@ -658,6 +692,7 @@ impl Worker {
         let capabilities = Arc::new(NamespaceCapabilities {
             graceful_poll_shutdown: AtomicBool::new(false),
             poller_autoscaling: AtomicBool::new(false),
+            worker_commands: AtomicBool::new(false),
         });
 
         let nexus_slots = MeteredPermitDealer::new(
@@ -726,8 +761,8 @@ impl Worker {
                         shutdown_token.child_token(),
                         Some(move |np| np_metrics.record_num_pollers(np)),
                         nexus_last_suc_poll_time.clone(),
-                        shared_namespace_worker,
                         capabilities.clone(),
+                        shared_namespace_worker,
                     )) as BoxedNexusPoller)
                 } else {
                     None
@@ -847,6 +882,8 @@ impl Worker {
 
         let sdk_name_and_ver = client.sdk_name_and_version();
         let worker_heartbeat = worker_heartbeat_interval.map(|hb_interval| {
+            let heartbeat_sys_info =
+                sys_info.unwrap_or_else(|| Arc::new(RealSysInfo::new(hb_interval)));
             let hb_metrics = HeartbeatMetrics {
                 in_mem_metrics: metrics.in_memory_meter(),
                 wft_slots: wft_slots.clone(),
@@ -858,7 +895,7 @@ impl Worker {
                 act_last_suc_poll_time,
                 nexus_last_suc_poll_time,
                 status: worker_status.clone(),
-                sys_info,
+                sys_info: heartbeat_sys_info,
             };
             WorkerHeartbeatManager::new(
                 config.clone(),
@@ -869,10 +906,14 @@ impl Worker {
             )
         });
 
+        let cancel_activity_callback = at_task_mgr
+            .as_ref()
+            .map(|mgr| mgr.cancel_activity_callback());
         let client_worker_registrator = Arc::new(ClientWorkerRegistrator {
             worker_instance_key,
             slot_provider: provider,
             heartbeat_manager: worker_heartbeat,
+            cancel_activity_callback,
             client: RwLock::new(client.clone()),
             shared_namespace_worker,
             task_types: config.task_types,
@@ -997,7 +1038,7 @@ impl Worker {
         // Wait for all permits to be released, but don't totally hang real-world shutdown.
         tokio::select! {
             _ = async { self.all_permits_tracker.lock().await.all_done().await } => {},
-            _ = tokio::time::sleep(Duration::from_secs(1)) => {
+            _ = tokio::time::sleep(Duration::from_secs(5)) => {
                 dbg_panic!("Waiting for all slot permits to release took too long!");
             }
         }
@@ -1177,12 +1218,11 @@ impl Worker {
     /// instead send it as a separate activity task to the lang, decoupling heartbeat and
     /// cancellation processing.
     ///
-    /// For now activity still need to send heartbeats if they want to receive cancellation
-    /// requests. In the future we will change this and will dispatch cancellations more
-    /// proactively. Note that this function does not block on the server call and returns
-    /// immediately. Underlying validation errors are swallowed and logged, this has been agreed to
-    /// be optimal behavior for the user as we don't want to break activity execution due to badly
-    /// configured heartbeat options.
+    /// Activities may receive cancellation requests independently from heartbeating. Note that
+    /// this function does not block on the server call and returns immediately. Underlying
+    /// validation errors are swallowed and logged, this has been agreed to be optimal behavior for
+    /// the user as we don't want to break activity execution due to badly configured heartbeat
+    /// options.
     pub fn record_activity_heartbeat(&self, details: ActivityHeartbeat) {
         if let Some(at_mgr) = self.at_task_mgr.as_ref() {
             let tt = TaskToken(details.task_token.clone());
@@ -1366,6 +1406,11 @@ impl Worker {
         &self.config
     }
 
+    /// Return a clone of the current client connection backing this worker, if available.
+    pub fn get_client_connection(&self) -> Option<Connection> {
+        self.client.connection()
+    }
+
     /// Returns the namespace capabilities discovered during [Worker::validate].
     pub fn get_namespace_capabilities(&self) -> &NamespaceCapabilities {
         &self.capabilities
@@ -1431,7 +1476,16 @@ impl Worker {
             .and_then(|wf| wf.get_sticky_queue_name())
             .unwrap_or_default();
         let task_queue = self.config.task_queue.clone();
-        let task_queue_types = self.config.task_types.to_task_queue_types();
+        let mut task_queue_types = Vec::new();
+        if self.config.task_types.enable_workflows {
+            task_queue_types.push(TaskQueueType::Workflow);
+        }
+        if self.config.task_types.enable_remote_activities {
+            task_queue_types.push(TaskQueueType::Activity);
+        }
+        if self.config.task_types.enable_nexus {
+            task_queue_types.push(TaskQueueType::Nexus);
+        }
         let heartbeat = self
             .client_worker_registrator
             .heartbeat_manager
@@ -1940,7 +1994,7 @@ impl WorkerVersioningStrategy {
     pub fn default_versioning_behavior(&self) -> Option<VersioningBehavior> {
         match self {
             WorkerVersioningStrategy::WorkerDeploymentBased(opts) => {
-                opts.default_versioning_behavior
+                opts.default_versioning_behavior.map(Into::into)
             }
             _ => None,
         }
@@ -1951,6 +2005,7 @@ struct ClientWorkerRegistrator {
     worker_instance_key: Uuid,
     slot_provider: SlotProvider,
     heartbeat_manager: Option<WorkerHeartbeatManager>,
+    cancel_activity_callback: Option<CancelActivityCallback>,
     client: RwLock<Arc<dyn WorkerClient>>,
     shared_namespace_worker: bool,
     task_types: WorkerTaskTypes,
@@ -1986,6 +2041,10 @@ impl ClientWorker for ClientWorkerRegistrator {
         } else {
             None
         }
+    }
+
+    fn cancel_activity_callback(&self) -> Option<CancelActivityCallback> {
+        self.cancel_activity_callback.clone()
     }
 
     fn new_shared_namespace_worker(
@@ -2240,6 +2299,10 @@ where
     })
 }
 
+fn worker_control_task_queue(namespace: &str, grouping_key: &str) -> String {
+    format!("temporal-sys/worker-commands/{namespace}/{grouping_key}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2469,7 +2532,7 @@ mod tests {
                         build_id: "1.0".to_string(),
                     },
                     use_worker_versioning: false,
-                    default_versioning_behavior: Some(VersioningBehavior::AutoUpgrade),
+                    default_versioning_behavior: Some(VersioningBehavior::AutoUpgrade.into()),
                 },
             ))
             .task_types(WorkerTaskTypes::all())

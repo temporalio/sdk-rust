@@ -110,7 +110,7 @@ impl ChainWf {
 async fn run_scripted_test(name: &str, script: TestScript) {
     let mut starter = CoreWfStarter::new(name);
     let mut worker = starter.worker().await;
-    worker.register_workflow::<ChainWf>();
+    worker.register_workflow::<ChainWf>().unwrap();
 
     let num_updates = script.update_scripts.len();
     let num_signals = script.signal_scripts.len();

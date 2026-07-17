@@ -1,3 +1,19 @@
+![Temporal Rust SDK](https://raw.githubusercontent.com/temporalio/assets/main/files/w/rust.png)
+
+# Temporal Rust SDK
+
+[![crates.io](https://img.shields.io/crates/v/temporalio-sdk.svg)](https://crates.io/crates/temporalio-sdk)
+[![docs.rs](https://docs.rs/temporalio-sdk/badge.svg)](https://docs.rs/temporalio-sdk)
+
+Currently in Public Preview, see more in the [SDK README.md](crates/sdk/README.md)
+
+# Temporal Rust Client
+
+[![crates.io](https://img.shields.io/crates/v/temporalio-sdk.svg)](https://crates.io/crates/temporalio-client)
+[![docs.rs](https://docs.rs/temporalio-sdk/badge.svg)](https://docs.rs/temporalio-client)
+
+Currently in Public Preview, see more in the [client README.md](crates/client/README.md)
+
 # Temporal Core SDK
 
 Core SDK that can be used as a base for other Temporal SDKs. It is currently used as the base of:
@@ -7,23 +23,9 @@ Core SDK that can be used as a base for other Temporal SDKs. It is currently use
 - [.NET SDK](https://github.com/temporalio/sdk-dotnet/)
 - [Ruby SDK](https://github.com/temporalio/sdk-ruby/)
 
-# Temporal Rust SDK
-
-[![crates.io](https://img.shields.io/crates/v/temporalio-sdk.svg)](https://crates.io/crates/temporalio-sdk)
-[![docs.rs](https://docs.rs/temporalio-sdk/badge.svg)](https://docs.rs/temporalio-sdk)
-
-Currently prerelease, see more in the [SDK README.md](crates/sdk/README.md)
-
-# Temporal Rust Client
-
-[![crates.io](https://img.shields.io/crates/v/temporalio-sdk.svg)](https://crates.io/crates/temporalio-client)
-[![docs.rs](https://docs.rs/temporalio-sdk/badge.svg)](https://docs.rs/temporalio-client)
-
-Currently prerelease, see more in the [client README.md](crates/client/README.md)
-
 # Documentation
 
-Core SDK documentation can be generated with `cargo doc`, output will be placed in the
+Rust & Core SDK documentation can be generated with `cargo doc`, output will be placed in the
 `target/doc` directory.
 
 [Architecture](ARCHITECTURE.md) doc provides some high-level information about how Core SDK works
@@ -45,7 +47,7 @@ This repo is composed of multiple crates:
 - temporalio-sdk-core `./crates/core` - The Core implementation.
 - temporalio-sdk-core-c-bridge `./crates/core-c-bridge` - Provides C bindings for Core.
 - temporalio-macros `./crates/macros` - Implements procedural macros used by core and the SDK.
-- temporalio-sdk `./crates/sdk` - A (currently prototype) Rust SDK built on top of Core. Used for testing.
+- temporalio-sdk `./crates/sdk` - A Public Preview Rust SDK built on top of Core. Used for testing.
 
 Visualized (dev dependencies are in blue):
 
@@ -101,13 +103,13 @@ equivalent.
 
 ## Proto files
 
-This repo uses a subtree for upstream protobuf files. The path `crates/common/protos/api_upstream`
+This repo uses a subtree for upstream protobuf files. The path `crates/protos/protos/api_upstream`
 is a subtree. To update it, use:
 
-`git pull --squash --rebase=false -s subtree -X subtree=crates/common/protos/api_upstream ssh://git@github.com/temporalio/api.git master --allow-unrelated-histories`
+`git pull --squash --rebase=false -s subtree -X subtree=crates/protos/protos/api_upstream ssh://git@github.com/temporalio/api.git main --allow-unrelated-histories`
 
 Do not question why this git command is the way it is. It is not our place to interpret git's ways.
-This same approach can be taken for updating `crates/common/protos/api_cloud_upstream` from the
+This same approach can be taken for updating `crates/protos/protos/api_cloud_upstream` from the
 `api-cloud` repo.
 
 The java testserver protos are also pulled from the sdk-java repo, but since we only need a
@@ -117,9 +119,9 @@ subdirectory of that repo, we just copy the files with read-tree:
 # add sdk-java as a remote if you have not already
 git remote add -f -t master --no-tags testsrv-protos git@github.com:temporalio/sdk-java.git
 # delete existing protos
-git rm -rf crates/common/protos/testsrv_upstream
+git rm -rf crates/protos/protos/testsrv_upstream
 # pull from upstream & commit
-git read-tree --prefix crates/common/protos/testsrv_upstream -u testsrv-protos/master:temporal-test-server/src/main/proto
+git read-tree --prefix crates/protos/protos/testsrv_upstream -u testsrv-protos/master:temporal-test-server/src/main/proto
 git commit
 ```
 
