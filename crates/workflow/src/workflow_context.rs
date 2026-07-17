@@ -193,7 +193,6 @@ impl BaseWorkflowContext {
             Some(ActivationVariant::UpdateRandomSeed(attrs)) => Some(attrs.randomness_seed),
             _ => None,
         }) {
-            shared.random_seed = seed;
             shared.random = Pcg64Mcg::seed_from_u64(seed);
         }
     }
@@ -415,15 +414,13 @@ impl BaseWorkflowContext {
         host: Rc<dyn WorkflowHost>,
         patch_activation_callback: Option<PatchActivationCallback>,
     ) -> Self {
-        let random_seed = init_workflow_job.randomness_seed;
         Self {
             inner: Rc::new(WorkflowContextInner {
                 namespace,
                 task_queue,
                 run_id,
                 shared: RefCell::new(WorkflowContextSharedData {
-                    random_seed,
-                    random: Pcg64Mcg::seed_from_u64(random_seed),
+                    random: Pcg64Mcg::seed_from_u64(init_workflow_job.randomness_seed),
                     memo: init_workflow_job.memo.clone().unwrap_or_default(),
                     search_attributes: init_workflow_job
                         .search_attributes
@@ -1559,7 +1556,6 @@ struct WorkflowContextSharedData {
     activation: CoreWorkflowActivation,
     memo: ProtoMemo,
     search_attributes: ProtoSearchAttributes,
-    random_seed: u64,
     random: Pcg64Mcg,
     /// Current details string, surfaced via the workflow metadata query.
     current_details: String,
