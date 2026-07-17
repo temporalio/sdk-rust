@@ -60,7 +60,7 @@ pub(crate) async fn priority_values_sent_to_server() {
                     UntypedWorkflow::new(&child_type),
                     RawValue::new(vec![]),
                     ChildWorkflowOptions {
-                        workflow_id: format!("{}-child", ctx.task_queue()),
+                        workflow_id: Some(format!("{}-child", ctx.task_queue())),
                         priority: Some(Priority {
                             priority_key: Some(4),
                             fairness_key: Some("fair-child".to_string()),

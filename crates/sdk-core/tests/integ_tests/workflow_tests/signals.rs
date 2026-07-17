@@ -191,7 +191,7 @@ impl SignalsChild {
                 ChildSignalReceiver::run,
                 (),
                 ChildWorkflowOptions {
-                    workflow_id: "my_precious_child".to_string(),
+                    workflow_id: Some("my_precious_child".to_string()),
                     ..Default::default()
                 },
             )

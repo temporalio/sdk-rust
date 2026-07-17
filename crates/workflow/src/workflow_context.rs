@@ -198,6 +198,28 @@ impl BaseWorkflowContext {
         }
     }
 
+    fn random<T>(&self) -> T
+    where
+        T: WorkflowRandomValue,
+    {
+        let random = &mut self.inner.shared.borrow_mut().random;
+        <T as private::Sealed>::sample(random)
+    }
+
+    fn uuid4(&self) -> String {
+        let mut value = self.random::<u128>();
+        value = (value & !(0xf_u128 << 76)) | (4_u128 << 76);
+        value = (value & !(0x3_u128 << 62)) | (0x2_u128 << 62);
+        format!(
+            "{:08x}-{:04x}-{:04x}-{:04x}-{:012x}",
+            value >> 96,
+            (value >> 80) & 0xffff,
+            (value >> 64) & 0xffff,
+            (value >> 48) & 0xffff,
+            value & 0xffff_ffff_ffff,
+        )
+    }
+
     /// Returns the [`DataConverter`] associated with this workflow's worker.
     pub fn data_converter(&self) -> &DataConverter {
         &self.inner.data_converter
@@ -613,7 +635,7 @@ impl BaseWorkflowContext {
         &self,
         workflow: WD,
         input: impl Into<WD::Input>,
-        opts: ChildWorkflowOptions,
+        mut opts: ChildWorkflowOptions,
     ) -> impl CancellableFutureWithReason<Result<StartedChildWorkflow<WD>, ChildWorkflowStartError>>
     where
         WD::Output: TemporalDeserializable,
@@ -631,6 +653,11 @@ impl BaseWorkflowContext {
             }
         };
         let workflow_type = workflow.name().to_string();
+        let workflow_id = opts
+            .workflow_id
+            .take()
+            .filter(|id| !id.is_empty())
+            .unwrap_or_else(|| self.uuid4());
 
         let child_seq = self.inner.seq_nums.borrow_mut().next_child_workflow_seq();
         // Immediately create the command/future for the result, otherwise if the user does
@@ -649,7 +676,7 @@ impl BaseWorkflowContext {
         );
 
         let common = ChildWfCommon {
-            workflow_id: opts.workflow_id.clone(),
+            workflow_id: workflow_id.clone(),
             child_seq,
             result_future: result_cmd,
             base_ctx: self.clone(),
@@ -667,10 +694,12 @@ impl BaseWorkflowContext {
         self.inner
             .runtime
             .register_unblocker(PendingCommandId::ChildWorkflowStart(child_seq), unblocker);
-        self.inner
-            .runtime
-            .host
-            .push_command(opts.into_command(child_seq, workflow_type, payloads));
+        self.inner.runtime.host.push_command(opts.into_command(
+            child_seq,
+            workflow_type,
+            payloads,
+            workflow_id,
+        ));
 
         ChildWorkflowStartFut::Running(cmd)
     }
@@ -800,25 +829,14 @@ impl<W> SyncWorkflowContext<W> {
     where
         T: WorkflowRandomValue,
     {
-        let random = &mut self.base.inner.shared.borrow_mut().random;
-        <T as private::Sealed>::sample(random)
+        self.base.random()
     }
 
     /// Generates a deterministic lowercase, hyphenated version 4 UUID string.
     ///
     /// This uses [`Self::random`] and is not cryptographically secure.
     pub fn uuid4(&self) -> String {
-        let mut value = self.random::<u128>();
-        value = (value & !(0xf_u128 << 76)) | (4_u128 << 76);
-        value = (value & !(0x3_u128 << 62)) | (0x2_u128 << 62);
-        format!(
-            "{:08x}-{:04x}-{:04x}-{:04x}-{:012x}",
-            value >> 96,
-            (value >> 80) & 0xffff,
-            (value >> 64) & 0xffff,
-            (value >> 48) & 0xffff,
-            value & 0xffff_ffff_ffff,
-        )
+        self.base.uuid4()
     }
 
     /// Returns true if the current workflow task is happening under replay

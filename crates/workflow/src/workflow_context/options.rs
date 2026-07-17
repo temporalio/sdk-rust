@@ -509,8 +509,8 @@ impl LocalActivityOptions {
 /// Options for scheduling a child workflow
 #[derive(Default, Debug, Clone)]
 pub struct ChildWorkflowOptions {
-    /// Workflow ID
-    pub workflow_id: String,
+    /// Workflow ID. If unset or empty, the parent workflow generates a deterministic UUIDv4.
+    pub workflow_id: Option<String>,
     /// Task queue to schedule the workflow in
     ///
     /// If `None`, use the same task queue as the parent workflow.
@@ -545,12 +545,13 @@ impl ChildWorkflowOptions {
         seq: u32,
         workflow_type: String,
         args: Vec<Payload>,
+        workflow_id: String,
     ) -> WorkflowCommand {
         command_with_metadata(
             workflow_command::Variant::StartChildWorkflowExecution(StartChildWorkflowExecution {
                 seq,
                 workflow_type,
-                workflow_id: self.workflow_id,
+                workflow_id,
                 task_queue: self.task_queue.unwrap_or_default(),
                 input: args,
                 cancellation_type: ProtoChildWorkflowCancellationType::from(self.cancel_type)
@@ -924,7 +925,12 @@ mod tests {
             ChildWorkflowOptions::default().cancel_type,
             ChildWorkflowCancellationType::WaitCancellationCompleted
         );
-        let command = ChildWorkflowOptions::default().into_command(1, "child".to_string(), vec![]);
+        let command = ChildWorkflowOptions::default().into_command(
+            1,
+            "child".to_string(),
+            vec![],
+            "child-id".to_string(),
+        );
         let Some(workflow_command::Variant::StartChildWorkflowExecution(command)) = command.variant
         else {
             panic!("expected StartChildWorkflowExecution command");
@@ -1023,7 +1029,7 @@ mod tests {
     #[test]
     fn child_workflow_run_timeout_uses_run_timeout_field() {
         let opts = ChildWorkflowOptions {
-            workflow_id: "test-wf".to_string(),
+            workflow_id: Some("test-wf".to_string()),
             cancel_type: ChildWorkflowCancellationType::WaitCancellationRequested,
             parent_close_policy: ParentClosePolicy::RequestCancel,
             id_reuse_policy: WorkflowIdReusePolicy::RejectDuplicate,
@@ -1031,7 +1037,7 @@ mod tests {
             run_timeout: Some(Duration::from_secs(10)),
             ..Default::default()
         };
-        let command = opts.into_command(1, "TestWorkflow".to_string(), vec![]);
+        let command = opts.into_command(1, "TestWorkflow".to_string(), vec![], "test-wf".into());
         let Some(workflow_command::Variant::StartChildWorkflowExecution(req)) = command.variant
         else {
             panic!("expected StartChildWorkflowExecution command");
@@ -1057,11 +1063,11 @@ mod tests {
     #[test]
     fn child_workflow_run_timeout_none_when_unset() {
         let opts = ChildWorkflowOptions {
-            workflow_id: "test-wf".to_string(),
+            workflow_id: Some("test-wf".to_string()),
             execution_timeout: Some(Duration::from_secs(60)),
             ..Default::default()
         };
-        let command = opts.into_command(1, "TestWorkflow".to_string(), vec![]);
+        let command = opts.into_command(1, "TestWorkflow".to_string(), vec![], "test-wf".into());
         let Some(workflow_command::Variant::StartChildWorkflowExecution(req)) = command.variant
         else {
             panic!("expected StartChildWorkflowExecution command");

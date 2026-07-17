@@ -33,7 +33,7 @@ impl ParentWorkflow {
                     GreetingChildWorkflow::run,
                     name.clone(),
                     ChildWorkflowOptions {
-                        workflow_id: format!("greeting-child-{i}"),
+                        workflow_id: Some(format!("greeting-child-{i}")),
                         ..Default::default()
                     },
                 )
