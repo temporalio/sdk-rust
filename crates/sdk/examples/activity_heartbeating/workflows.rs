@@ -40,7 +40,7 @@ impl HeartbeatingWorkflow {
     #[run]
     pub async fn run(ctx: &mut WorkflowContext<Self>, total_steps: u32) -> WorkflowResult<String> {
         let result = ctx
-            .start_activity(
+            .execute_activity(
                 HeartbeatingActivities::long_running_activity,
                 total_steps,
                 ActivityOptions::with_start_to_close_timeout(Duration::from_secs(30))

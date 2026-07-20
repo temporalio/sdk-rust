@@ -65,7 +65,7 @@ impl GreetingWorkflow {
         let name = ctx.state(|s| s.name.clone());
 
         // Execute an activity
-        let greeting = ctx.start_activity(
+        let greeting = ctx.execute_activity(
             MyActivities::greet,
             name,
             ActivityOptions::start_to_close_timeout(Duration::from_secs(10))

@@ -51,7 +51,7 @@ impl FuzzyWf {
             FuzzyWfAction::Shutdown => ctx.state_mut(|s| s.done = true),
             FuzzyWfAction::DoAct => {
                 let _ = ctx
-                    .start_activity(
+                    .execute_activity(
                         StdActivities::echo,
                         "hi!".to_string(),
                         ActivityOptions::start_to_close_timeout(Duration::from_secs(5)),

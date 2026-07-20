@@ -78,7 +78,7 @@ impl OneActivityWorkflow {
     #[run]
     async fn run(ctx: &mut WorkflowContext<Self>, input: String) -> WorkflowResult<String> {
         let r = ctx
-            .start_activity(
+            .execute_activity(
                 StdActivities::echo,
                 input,
                 ActivityOptions::start_to_close_timeout(Duration::from_secs(5)),
@@ -113,7 +113,7 @@ impl UntypedActivityWorkflow {
     async fn run(ctx: &mut WorkflowContext<Self>, input: String) -> WorkflowResult<String> {
         let raw_input = RawValue::from_value(&input, ctx.payload_converter());
         let raw_output = ctx
-            .start_activity(
+            .execute_activity(
                 UntypedActivity::new("StdActivities::echo"),
                 raw_input,
                 ActivityOptions::start_to_close_timeout(Duration::from_secs(5)),
@@ -219,7 +219,7 @@ impl MultiArgActivityWorkflow {
     #[run]
     async fn run(ctx: &mut WorkflowContext<Self>, input: String) -> WorkflowResult<String> {
         let r = ctx
-            .start_activity(
+            .execute_activity(
                 StdActivities::concat,
                 (input, " world".to_string()),
                 ActivityOptions::start_to_close_timeout(Duration::from_secs(5)),
@@ -518,7 +518,7 @@ async fn activity_interceptor_observes_activity_error() {
         #[run]
         async fn run(ctx: &mut WorkflowContext<Self>, input: String) -> WorkflowResult<()> {
             let result: Result<String, ActivityExecutionError> = ctx
-                .start_activity(
+                .execute_activity(
                     FailingActivities::fail,
                     input,
                     ActivityOptions::with_start_to_close_timeout(Duration::from_secs(5))
@@ -615,7 +615,7 @@ async fn activity_interceptor_observes_activity_panic() {
         #[run]
         async fn run(ctx: &mut WorkflowContext<Self>, input: String) -> WorkflowResult<()> {
             let result: Result<String, ActivityExecutionError> = ctx
-                .start_activity(
+                .execute_activity(
                     PanickingActivities::panic_activity,
                     input,
                     ActivityOptions::with_start_to_close_timeout(Duration::from_secs(5))
@@ -713,7 +713,7 @@ async fn activity_panics_are_retryable() {
         #[run]
         async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<u32> {
             let result = ctx
-                .start_activity(
+                .execute_activity(
                     PanicOnceActivities::panic_once,
                     (),
                     ActivityOptions::with_start_to_close_timeout(Duration::from_secs(5))
@@ -774,7 +774,7 @@ async fn unregistered_activity_type_fails_activity_task_not_worker() {
         #[run]
         async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<Option<(String, String)>> {
             let result = ctx
-                .start_activity(
+                .execute_activity(
                     MissingActivities::missing,
                     (),
                     ActivityOptions::with_start_to_close_timeout(Duration::from_secs(5))
@@ -1048,7 +1048,7 @@ async fn workflow_observes_non_retryable_activity() {
         #[run]
         async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<()> {
             let err = ctx
-                .start_activity(
+                .execute_activity(
                     NonRetryableActivityErrorActivities::fail_non_retryable,
                     (),
                     ActivityOptions::with_start_to_close_timeout(Duration::from_secs(5))
@@ -1715,7 +1715,7 @@ struct OneActivityAbandonCancelledBeforeStarted;
 impl OneActivityAbandonCancelledBeforeStarted {
     #[run]
     async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<()> {
-        let act_fut = ctx.start_activity(
+        let act_fut = ctx.execute_activity(
             StdActivities::delay,
             Duration::from_secs(2),
             ActivityOptions::with_start_to_close_timeout(Duration::from_secs(5))
@@ -1760,7 +1760,7 @@ struct OneActivityAbandonCancelledAfterComplete;
 impl OneActivityAbandonCancelledAfterComplete {
     #[run]
     async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<()> {
-        let act_fut = ctx.start_activity(
+        let act_fut = ctx.execute_activity(
             StdActivities::delay,
             Duration::from_secs(2),
             ActivityOptions::with_start_to_close_timeout(Duration::from_secs(5))
@@ -1844,7 +1844,7 @@ async fn graceful_shutdown() {
         #[run]
         async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<()> {
             let act_futs = (1..=10).map(|_| {
-                ctx.start_activity(
+                ctx.execute_activity(
                     SleeperActivities::sleeper,
                     "hi".to_string(),
                     ActivityOptions::with_start_to_close_timeout(Duration::from_secs(5))
@@ -1938,7 +1938,7 @@ async fn activity_can_be_cancelled_by_local_timeout() {
         #[run]
         async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<()> {
             let res = ctx
-                .start_activity(
+                .execute_activity(
                     CancellableEchoActivities::cancellable_echo,
                     "hi!".to_string(),
                     ActivityOptions::with_start_to_close_timeout(Duration::from_secs(1))
@@ -2016,7 +2016,7 @@ async fn long_activity_timeout_repro() {
             let mut iter = 1;
             loop {
                 let res = ctx
-                    .start_activity(
+                    .execute_activity(
                         StdActivities::echo,
                         "hi!".to_string(),
                         ActivityOptions::with_start_to_close_timeout(Duration::from_secs(1))
@@ -2084,7 +2084,7 @@ async fn pass_activity_summary_to_metadata() {
     impl ActivitySummaryWorkflow {
         #[run(name = DEFAULT_WORKFLOW_TYPE)]
         async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<()> {
-            ctx.start_activity(
+            ctx.execute_activity(
                 StdActivities::default,
                 (),
                 ActivityOptions::with_start_to_close_timeout(Duration::from_secs(5))
@@ -2147,7 +2147,7 @@ async fn abandoned_activities_ignore_start_and_complete(hist_batches: &'static [
     impl AbandonedActivitiesWorkflow {
         #[run(name = DEFAULT_WORKFLOW_TYPE)]
         async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<()> {
-            let act_fut = ctx.start_activity(
+            let act_fut = ctx.execute_activity(
                 StdActivities::default,
                 (),
                 ActivityOptions::with_start_to_close_timeout(Duration::from_secs(5))
@@ -2194,7 +2194,7 @@ struct ImmediateActivityCancelationWorkflow;
 impl ImmediateActivityCancelationWorkflow {
     #[run(name = DEFAULT_WORKFLOW_TYPE)]
     async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<()> {
-        let cancel_activity_future = ctx.start_activity(
+        let cancel_activity_future = ctx.execute_activity(
             StdActivities::default,
             (),
             ActivityOptions::start_to_close_timeout(Duration::from_secs(5)),

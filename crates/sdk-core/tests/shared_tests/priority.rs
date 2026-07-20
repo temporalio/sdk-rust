@@ -70,7 +70,7 @@ pub(crate) async fn priority_values_sent_to_server() {
                     },
                 )
                 .await?;
-            let activity = ctx.start_activity(
+            let activity = ctx.execute_activity(
                 PriorityActivities::echo,
                 "hello".to_string(),
                 ActivityOptions::with_start_to_close_timeout(Duration::from_secs(5))

@@ -1026,7 +1026,7 @@ async fn la_resolve_same_time_as_other_cancel() {
     impl LaResolveSameTimeAsOtherCancelWf {
         #[run]
         async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<()> {
-            let mut normal_act = ctx.start_activity(
+            let mut normal_act = ctx.execute_activity(
                 DelayWithCancellation::delay,
                 Duration::from_secs(9),
                 ActivityOptions::with_start_to_close_timeout(Duration::from_secs(9000))

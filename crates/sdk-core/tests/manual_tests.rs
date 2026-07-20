@@ -57,7 +57,7 @@ impl PollerLoadSpikyWf {
     async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<()> {
         for _ in 0..5 {
             let _ = ctx
-                .start_activity(
+                .execute_activity(
                     JitteryEchoActivities::echo,
                     "hi!".to_string(),
                     ActivityOptions::start_to_close_timeout(Duration::from_secs(5)),
@@ -104,7 +104,7 @@ impl PollerLoadSpikeThenSustainedWf {
     async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<()> {
         for _ in 0..5 {
             let _ = ctx
-                .start_activity(
+                .execute_activity(
                     JitteryEchoActivities::echo,
                     "hi!".to_string(),
                     ActivityOptions::start_to_close_timeout(Duration::from_secs(5)),

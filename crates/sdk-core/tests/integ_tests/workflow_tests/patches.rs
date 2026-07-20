@@ -660,7 +660,7 @@ impl FakeAct {
 
 async fn v1(ctx: &mut WorkflowContext<PatchWf>) {
     let _ = ctx
-        .start_activity(
+        .execute_activity(
             FakeAct::nameless,
             (),
             ActivityOptions::with_start_to_close_timeout(Duration::from_secs(5))
@@ -673,7 +673,7 @@ async fn v1(ctx: &mut WorkflowContext<PatchWf>) {
 async fn v2(ctx: &mut WorkflowContext<PatchWf>) -> bool {
     if ctx.patched(MY_PATCH_ID) {
         let _ = ctx
-            .start_activity(
+            .execute_activity(
                 FakeAct::nameless,
                 (),
                 ActivityOptions::with_start_to_close_timeout(Duration::from_secs(5))
@@ -684,7 +684,7 @@ async fn v2(ctx: &mut WorkflowContext<PatchWf>) -> bool {
         true
     } else {
         let _ = ctx
-            .start_activity(
+            .execute_activity(
                 FakeAct::nameless,
                 (),
                 ActivityOptions::with_start_to_close_timeout(Duration::from_secs(5))
@@ -699,7 +699,7 @@ async fn v2(ctx: &mut WorkflowContext<PatchWf>) -> bool {
 async fn v3(ctx: &mut WorkflowContext<PatchWf>) {
     ctx.deprecate_patch(MY_PATCH_ID);
     let _ = ctx
-        .start_activity(
+        .execute_activity(
             FakeAct::nameless,
             (),
             ActivityOptions::with_start_to_close_timeout(Duration::from_secs(5))
@@ -711,7 +711,7 @@ async fn v3(ctx: &mut WorkflowContext<PatchWf>) {
 
 async fn v4(ctx: &mut WorkflowContext<PatchWf>) {
     let _ = ctx
-        .start_activity(
+        .execute_activity(
             FakeAct::nameless,
             (),
             ActivityOptions::with_start_to_close_timeout(Duration::from_secs(5))
@@ -934,7 +934,7 @@ impl SameChangeMultipleSpotsWf {
     async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<()> {
         if ctx.patched(MY_PATCH_ID) {
             let _ = ctx
-                .start_activity(
+                .execute_activity(
                     FakeAct::nameless,
                     (),
                     ActivityOptions::start_to_close_timeout(Duration::from_secs(5)),
@@ -946,7 +946,7 @@ impl SameChangeMultipleSpotsWf {
         ctx.timer(ONE_SECOND).await;
         if ctx.patched(MY_PATCH_ID) {
             let _ = ctx
-                .start_activity(
+                .execute_activity(
                     FakeAct::nameless,
                     (),
                     ActivityOptions::start_to_close_timeout(Duration::from_secs(5)),

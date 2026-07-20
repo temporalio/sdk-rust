@@ -188,7 +188,7 @@ impl DataConverterTestWorkflow {
         input: TrackedWrapper,
     ) -> WorkflowResult<TrackedWrapper> {
         let output = ctx
-            .start_activity(
+            .execute_activity(
                 TestActivities::process_tracked,
                 input,
                 ActivityOptions::start_to_close_timeout(Duration::from_secs(5)),
@@ -216,7 +216,7 @@ impl DescribeDataConverterWorkflow {
         ])?;
         ctx.upsert_memo([("removed", None)])?;
         let output = ctx
-            .start_activity(
+            .execute_activity(
                 TestActivities::process_tracked,
                 input,
                 ActivityOptions::start_to_close_timeout(Duration::from_secs(5)),
@@ -234,7 +234,7 @@ struct CancellationDetailsWorkflow;
 impl CancellationDetailsWorkflow {
     #[run]
     async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<TrackedWrapper> {
-        let act = ctx.start_activity(
+        let act = ctx.execute_activity(
             FailurePayloadActivities::cancel_with_tracked_details,
             (),
             ActivityOptions::with_start_to_close_timeout(Duration::from_secs(5))
@@ -268,7 +268,7 @@ impl HeartbeatDetailsWorkflow {
     #[run]
     async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<TrackedWrapper> {
         let err = ctx
-            .start_activity(
+            .execute_activity(
                 FailurePayloadActivities::heartbeat_then_timeout,
                 (),
                 ActivityOptions::with_start_to_close_timeout(Duration::from_secs(5))
@@ -317,7 +317,7 @@ impl ActivityPanicFallbackWorkflow {
     #[run]
     async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<()> {
         let _ = ctx
-            .start_activity(
+            .execute_activity(
                 PanicActivities::panic_activity,
                 String::new(),
                 ActivityOptions::with_start_to_close_timeout(Duration::from_secs(5))

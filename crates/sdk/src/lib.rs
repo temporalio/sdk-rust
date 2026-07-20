@@ -1246,22 +1246,22 @@ mod tests {
     #[allow(unused, clippy::diverging_sub_expression)]
     fn test_activity_via_workflow_context() {
         let wf_ctx: WorkflowContext<MyWorkflow> = unimplemented!();
-        wf_ctx.start_activity(
+        wf_ctx.execute_activity(
             MyActivities::my_activity,
             (),
             ActivityOptions::start_to_close_timeout(Duration::from_secs(5)),
         );
-        wf_ctx.start_activity(
+        wf_ctx.execute_activity(
             SharedActivities::greet,
             "Hi".to_owned(),
             ActivityOptions::start_to_close_timeout(Duration::from_secs(5)),
         );
-        wf_ctx.start_activity(
+        wf_ctx.execute_activity(
             MyActivities::greet,
             "Hi".to_owned(),
             ActivityOptions::start_to_close_timeout(Duration::from_secs(5)),
         );
-        wf_ctx.start_activity(
+        wf_ctx.execute_activity(
             MyActivities::takes_self,
             "Hi".to_owned(),
             ActivityOptions::start_to_close_timeout(Duration::from_secs(5)),

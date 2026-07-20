@@ -158,7 +158,7 @@ impl ActivityHasDeploymentStampWf {
     #[run(name = "activity_has_deployment_stamp")]
     async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<()> {
         let _ = ctx
-            .start_activity(
+            .execute_activity(
                 StdActivities::echo,
                 "hi!".to_string(),
                 ActivityOptions::start_to_close_timeout(Duration::from_secs(5)),

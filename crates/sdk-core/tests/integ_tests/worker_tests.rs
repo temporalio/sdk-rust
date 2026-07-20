@@ -410,7 +410,7 @@ async fn oversize_activity_result_fails_retryably_then_completes() {
     impl OversizeActResultWf {
         #[run]
         async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<()> {
-            ctx.start_activity(
+            ctx.execute_activity(
                 OversizeResultActs::maybe_oversize,
                 (),
                 ActivityOptions::with_start_to_close_timeout(Duration::from_secs(10))
@@ -492,7 +492,7 @@ async fn oversize_activity_heartbeat_fails_retryably_then_completes() {
     impl OversizeHbWf {
         #[run]
         async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<()> {
-            ctx.start_activity(
+            ctx.execute_activity(
                 OversizeHbActs::maybe_oversize_heartbeat,
                 (),
                 ActivityOptions::with_start_to_close_timeout(Duration::from_secs(60))
@@ -628,7 +628,7 @@ async fn disabled_error_limit_lets_server_hard_fail() {
     impl DisabledOversizeWf {
         #[run]
         async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<()> {
-            ctx.start_activity(
+            ctx.execute_activity(
                 DisabledOversizeActs::always_oversize,
                 (),
                 ActivityOptions::with_start_to_close_timeout(Duration::from_secs(10))
@@ -794,13 +794,13 @@ async fn activity_tasks_from_completion_reserve_slots() {
     impl ActivityTasksCompletionWf {
         #[run(name = DEFAULT_WORKFLOW_TYPE)]
         async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<()> {
-            ctx.start_activity(
+            ctx.execute_activity(
                 FakeAct::act1,
                 (),
                 ActivityOptions::start_to_close_timeout(Duration::from_secs(5)),
             )
             .await?;
-            ctx.start_activity(
+            ctx.execute_activity(
                 FakeAct::act2,
                 (),
                 ActivityOptions::start_to_close_timeout(Duration::from_secs(5)),
@@ -1167,7 +1167,7 @@ async fn test_custom_slot_supplier_simple() {
         #[run]
         async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<()> {
             let _result = ctx
-                .start_activity(
+                .execute_activity(
                     StdActivities::no_op,
                     (),
                     ActivityOptions::start_to_close_timeout(Duration::from_secs(10)),
