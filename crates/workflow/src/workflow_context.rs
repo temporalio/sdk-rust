@@ -497,7 +497,7 @@ impl BaseWorkflowContext {
     }
 
     /// Request to run an activity
-    pub fn start_activity<AD: ActivityDefinition>(
+    pub fn execute_activity<AD: ActivityDefinition>(
         &self,
         activity: AD,
         input: impl Into<AD::Input>,
@@ -844,6 +844,22 @@ impl<W> SyncWorkflowContext<W> {
     }
 
     /// Request to run an activity
+    pub fn execute_activity<AD: ActivityDefinition>(
+        &self,
+        activity: AD,
+        input: impl Into<AD::Input>,
+        opts: ActivityOptions,
+    ) -> impl CancellableFuture<Result<AD::Output, ActivityExecutionError>>
+    where
+        AD::Output: TemporalDeserializable,
+    {
+        self.base.execute_activity(activity, input, opts)
+    }
+
+    /// Request to run an activity
+    ///
+    /// Deprecated alias for [`SyncWorkflowContext::execute_activity`].
+    #[deprecated(note = "use `execute_activity` instead")]
     pub fn start_activity<AD: ActivityDefinition>(
         &self,
         activity: AD,
@@ -853,7 +869,7 @@ impl<W> SyncWorkflowContext<W> {
     where
         AD::Output: TemporalDeserializable,
     {
-        self.base.start_activity(activity, input, opts)
+        self.execute_activity(activity, input, opts)
     }
 
     /// Request to run a local activity
@@ -1237,6 +1253,22 @@ impl<W> WorkflowContext<W> {
     }
 
     /// Request to run an activity
+    pub fn execute_activity<AD: ActivityDefinition>(
+        &self,
+        activity: AD,
+        input: impl Into<AD::Input>,
+        opts: ActivityOptions,
+    ) -> impl CancellableFuture<Result<AD::Output, ActivityExecutionError>>
+    where
+        AD::Output: TemporalDeserializable,
+    {
+        self.sync.execute_activity(activity, input, opts)
+    }
+
+    /// Request to run an activity
+    ///
+    /// Deprecated alias for [`WorkflowContext::execute_activity`].
+    #[deprecated(note = "use `execute_activity` instead")]
     pub fn start_activity<AD: ActivityDefinition>(
         &self,
         activity: AD,
@@ -1246,7 +1278,7 @@ impl<W> WorkflowContext<W> {
     where
         AD::Output: TemporalDeserializable,
     {
-        self.sync.start_activity(activity, input, opts)
+        self.execute_activity(activity, input, opts)
     }
 
     /// Request to run a local activity
