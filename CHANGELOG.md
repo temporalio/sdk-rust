@@ -119,3 +119,5 @@ to docs, or any other relevant information.
   metric reader reports an export error.
 * Worker heartbeat now samples host CPU/memory at the heartbeat interval (only when enabled) rather
   than every 100ms.
+* Workers no longer advertise a worker control task queue unless the namespace supports worker
+  heartbeats and commands and the built-in Nexus command worker is running.
