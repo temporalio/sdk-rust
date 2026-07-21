@@ -64,6 +64,11 @@ to docs, or any other relevant information.
 * Added the experimental `WorkerOptions::patch_activation_callback` option for controlling whether
   newly introduced patches activate during rolling deployments.
 
+### Changed
+ * Renamed `start_activity` and `start_local_activity` to `execute_activity` and `execute_local_activity`
+   to better explain semantics. Original methods remain as deprecated aliases for the new execute
+   variants.
+
 ### Breaking Changes
 * `WorkflowExecution::search_attributes`, `WorkflowExecutionDescription::search_attributes`,
   `ScheduleDescription::search_attributes`, and `ScheduleSummary::search_attributes` now return
