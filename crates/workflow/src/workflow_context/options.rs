@@ -507,7 +507,8 @@ impl LocalActivityOptions {
 }
 
 /// Options for scheduling a child workflow
-#[derive(Default, Debug, Clone)]
+#[derive(Default, Debug, Clone, bon::Builder)]
+#[non_exhaustive]
 pub struct ChildWorkflowOptions {
     /// Workflow ID. If unset or empty, the parent workflow generates a deterministic UUIDv4.
     pub workflow_id: Option<String>,
@@ -516,14 +517,17 @@ pub struct ChildWorkflowOptions {
     /// If `None`, use the same task queue as the parent workflow.
     pub task_queue: Option<String>,
     /// Cancellation strategy for the child workflow
+    #[builder(default)]
     pub cancel_type: ChildWorkflowCancellationType,
     /// How to respond to parent workflow ending
+    #[builder(default)]
     pub parent_close_policy: ParentClosePolicy,
     /// Static summary of the child workflow
     pub static_summary: Option<String>,
     /// Static details of the child workflow
     pub static_details: Option<String>,
     /// Set the policy for reusing the workflow id
+    #[builder(default)]
     pub id_reuse_policy: WorkflowIdReusePolicy,
     /// Optionally set the execution timeout for the workflow
     pub execution_timeout: Option<Duration>,
@@ -540,6 +544,13 @@ pub struct ChildWorkflowOptions {
 }
 
 impl ChildWorkflowOptions {
+    /// Construct a `ChildWorkflowOptions` with the specified `workflow_id`.
+    ///
+    /// Shorthand for `ChildWorkflowOptions::builder().workflow_id(Some(workflow_id)).build()`
+    pub fn workflow_id(workflow_id: String) -> Self {
+        Self::builder().workflow_id(workflow_id).build()
+    }
+
     pub(crate) fn into_command(
         self,
         seq: u32,

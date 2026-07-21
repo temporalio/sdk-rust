@@ -433,20 +433,14 @@ impl ChildWfIdOrTypeChangeWf {
             ctx.start_child_workflow(
                 UntypedWorkflow::new("child"),
                 RawValue::new(vec![]),
-                ChildWorkflowOptions {
-                    workflow_id: Some("I'm bad and wrong!".to_string()),
-                    ..Default::default()
-                },
+                ChildWorkflowOptions::workflow_id("I'm bad and wrong!".to_string()),
             )
             .await?;
         } else {
             ctx.start_child_workflow(
                 UntypedWorkflow::new("not the child wf type"),
                 RawValue::new(vec![]),
-                ChildWorkflowOptions {
-                    workflow_id: Some("1".to_string()),
-                    ..Default::default()
-                },
+                ChildWorkflowOptions::workflow_id("1".to_string()),
             )
             .await?;
         }

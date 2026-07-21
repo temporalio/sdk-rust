@@ -423,6 +423,7 @@ impl BaseWorkflowContext {
                     changes: Default::default(),
                     activation: Default::default(),
                     current_details: Default::default(),
+                    notified_patches: Default::default(),
                 }),
                 initial_information: init_workflow_job,
                 runtime: WorkflowRuntimeState::new(host),
