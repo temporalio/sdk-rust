@@ -119,3 +119,4 @@ to docs, or any other relevant information.
   metric reader reports an export error.
 * Worker heartbeat now samples host CPU/memory at the heartbeat interval (only when enabled) rather
   than every 100ms.
+* `WorkflowContext::force_task_fail` calls will be respected over a completion if both happen in the same poll
