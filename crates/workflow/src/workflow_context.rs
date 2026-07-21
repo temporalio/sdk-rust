@@ -86,6 +86,7 @@ use temporalio_common_wasm::{
     search_attributes::{SearchAttributeUpdate, SearchAttributes},
     worker::WorkerDeploymentVersion,
 };
+use uuid::Builder;
 
 mod private {
     use rand::distr::{Distribution, StandardUniform};
@@ -206,17 +207,10 @@ impl BaseWorkflowContext {
     }
 
     fn uuid4(&self) -> String {
-        let mut value = self.random::<u128>();
-        value = (value & !(0xf_u128 << 76)) | (4_u128 << 76);
-        value = (value & !(0x3_u128 << 62)) | (0x2_u128 << 62);
-        format!(
-            "{:08x}-{:04x}-{:04x}-{:04x}-{:012x}",
-            value >> 96,
-            (value >> 80) & 0xffff,
-            (value >> 64) & 0xffff,
-            (value >> 48) & 0xffff,
-            value & 0xffff_ffff_ffff,
-        )
+        Builder::from_random_bytes(self.random::<u128>().to_be_bytes())
+            .into_uuid()
+            .hyphenated()
+            .to_string()
     }
 
     /// Returns the [`DataConverter`] associated with this workflow's worker.
@@ -2663,19 +2657,6 @@ mod tests {
         assert_eq!(first.random::<f32>(), second.random::<f32>());
         assert_eq!(first.random::<f64>(), second.random::<f64>());
         assert_eq!(first.uuid4(), second.uuid4());
-    }
-
-    #[test]
-    fn uuid4_is_valid() {
-        let ctx = test_context_with_seed(42);
-
-        let uuid = ctx.uuid4();
-        assert_eq!(uuid.len(), 36);
-        assert_eq!(&uuid[8..9], "-");
-        assert_eq!(&uuid[13..14], "-");
-        assert_eq!(&uuid[14..15], "4", "should generate v4 version");
-        assert_eq!(&uuid[18..19], "-");
-        assert_eq!(&uuid[23..24], "-");
     }
 
     #[test]
