@@ -948,7 +948,7 @@ async fn history_out_of_order_on_restart() {
     impl HistoryOutOfOrderWf1 {
         #[run(name = HISTORY_OUT_OF_ORDER_WF_NAME)]
         async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<()> {
-            ctx.start_local_activity(
+            ctx.execute_local_activity(
                 StdActivities::echo,
                 "hi".to_string(),
                 LocalActivityOptions {
@@ -977,7 +977,7 @@ async fn history_out_of_order_on_restart() {
     impl HistoryOutOfOrderWf2 {
         #[run(name = HISTORY_OUT_OF_ORDER_WF_NAME)]
         async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<()> {
-            ctx.start_local_activity(
+            ctx.execute_local_activity(
                 StdActivities::echo,
                 "hi".to_string(),
                 LocalActivityOptions {

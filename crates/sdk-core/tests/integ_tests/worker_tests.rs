@@ -1174,7 +1174,7 @@ async fn test_custom_slot_supplier_simple() {
                 )
                 .await;
             let _result = ctx
-                .start_local_activity(
+                .execute_local_activity(
                     StdActivities::no_op,
                     (),
                     LocalActivityOptions {

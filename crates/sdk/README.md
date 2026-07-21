@@ -300,7 +300,7 @@ Activities return `Result<T, ActivityError>` with the following error types:
 For short-lived activities that you want to run on the same worker as the workflow:
 
 ```rust
-ctx.start_local_activity(
+ctx.execute_local_activity(
     MyActivities::quick_operation,
     input,
     LocalActivityOptions {

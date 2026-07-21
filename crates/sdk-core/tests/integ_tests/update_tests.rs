@@ -686,7 +686,7 @@ async fn update_with_local_acts() {
             ctx: &mut WorkflowContext<Self>,
             _: (),
         ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-            ctx.start_local_activity(
+            ctx.execute_local_activity(
                 StdActivities::delay,
                 Duration::from_secs(3),
                 LocalActivityOptions::default(),

@@ -36,7 +36,7 @@ impl LocalActivitiesWorkflow {
             .await?;
 
         let local_result = ctx
-            .start_local_activity(
+            .execute_local_activity(
                 GreetingActivities::greet,
                 name,
                 LocalActivityOptions {

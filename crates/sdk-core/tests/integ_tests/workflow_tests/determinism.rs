@@ -289,7 +289,7 @@ impl ActivityIdOrTypeChangeWf {
     ) -> WorkflowResult<()> {
         if local_act {
             if id_change {
-                ctx.start_local_activity(
+                ctx.execute_local_activity(
                     StdActivities::default,
                     (),
                     LocalActivityOptions {
@@ -299,7 +299,7 @@ impl ActivityIdOrTypeChangeWf {
                 )
                 .await?;
             } else {
-                ctx.start_local_activity(StdActivities::no_op, (), Default::default())
+                ctx.execute_local_activity(StdActivities::no_op, (), Default::default())
                     .await?;
             }
         } else if id_change {

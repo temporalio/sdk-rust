@@ -97,7 +97,7 @@ impl OneLocalActivityWorkflow {
     #[run]
     async fn run(ctx: &mut WorkflowContext<Self>, input: String) -> WorkflowResult<String> {
         let r = ctx
-            .start_local_activity(StdActivities::echo, input, LocalActivityOptions::default())
+            .execute_local_activity(StdActivities::echo, input, LocalActivityOptions::default())
             .await?;
         Ok(r)
     }

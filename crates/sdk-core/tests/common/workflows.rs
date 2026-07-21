@@ -13,7 +13,7 @@ pub(crate) struct LaProblemWorkflow;
 impl LaProblemWorkflow {
     #[run(name = "evict_while_la_running_no_interference")]
     pub(crate) async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<()> {
-        ctx.start_local_activity(
+        ctx.execute_local_activity(
             StdActivities::delay,
             Duration::from_secs(15),
             LocalActivityOptions {

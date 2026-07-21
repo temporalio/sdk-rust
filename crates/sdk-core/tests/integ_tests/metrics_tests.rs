@@ -1044,12 +1044,12 @@ async fn activity_metrics() {
                     .build(),
             );
             let _ = join!(normal_act_pass, normal_act_fail);
-            let local_act_pass = ctx.start_local_activity(
+            let local_act_pass = ctx.execute_local_activity(
                 PassFailActivities::pass_fail_act,
                 "pass".to_string(),
                 LocalActivityOptions::default(),
             );
-            let local_act_fail = ctx.start_local_activity(
+            let local_act_fail = ctx.execute_local_activity(
                 PassFailActivities::pass_fail_act,
                 "fail".to_string(),
                 LocalActivityOptions {
@@ -1061,7 +1061,7 @@ async fn activity_metrics() {
                     ..Default::default()
                 },
             );
-            let local_act_cancel = ctx.start_local_activity(
+            let local_act_cancel = ctx.execute_local_activity(
                 PassFailActivities::pass_fail_act,
                 "cancel".to_string(),
                 LocalActivityOptions {

@@ -153,7 +153,7 @@ impl ResetRandomseedWf {
             ctx.state(|wf| {
                 wf.saw_updated_seed.store(true, Ordering::Relaxed);
             });
-            ctx.start_local_activity(
+            ctx.execute_local_activity(
                 StdActivities::echo,
                 "hi!".to_string(),
                 LocalActivityOptions::default(),

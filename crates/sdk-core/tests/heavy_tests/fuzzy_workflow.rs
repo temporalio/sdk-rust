@@ -60,7 +60,7 @@ impl FuzzyWf {
             }
             FuzzyWfAction::DoLocalAct => {
                 let _ = ctx
-                    .start_local_activity(
+                    .execute_local_activity(
                         StdActivities::echo,
                         "hi!".to_string(),
                         LocalActivityOptions {
