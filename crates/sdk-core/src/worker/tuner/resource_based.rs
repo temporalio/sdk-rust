@@ -522,10 +522,6 @@ struct RealSysInfoInner {
     cgroup_cpu_info: CGroupCpuInfo<CgroupV2CpuFileSystem>,
 }
 
-fn cgroup_used_mem(limits: &sysinfo::CGroupLimits) -> u64 {
-    limits.rss
-}
-
 impl RealSysInfoInner {
     fn refresh(&self) {
         let mut lock = self.sys.lock();
@@ -533,8 +529,11 @@ impl RealSysInfoInner {
         if let Some(cgroup_limits) = lock.cgroup_limits() {
             self.total_mem
                 .store(cgroup_limits.total_memory, Ordering::Release);
+            // Gate on anonymous memory (`rss`) rather than `memory.current`
+            // (`total - free`), which includes reclaimable page cache and can
+            // permanently starve slot admission.
             self.cur_mem_usage
-                .store(cgroup_used_mem(&cgroup_limits), Ordering::Release);
+                .store(cgroup_limits.rss, Ordering::Release);
 
             let cpu = self.cgroup_cpu_info.calc_cpu_percent().unwrap_or_else(|| {
                 // There won't be a cgroup cpu usage if there is no limit applied to the cgroup
@@ -810,22 +809,6 @@ mod tests {
             .target_mem_usage(0.8)
             .target_cpu_usage(1.0)
             .build()
-    }
-
-    #[test]
-    fn cgroup_used_mem_excludes_page_cache() {
-        const MIB: u64 = 1024 * 1024;
-        // 2 GiB limit; memory.current pinned at 1300 MiB by reclaimable page
-        // cache, but only 600 MiB is anonymous. free_memory = total - current.
-        let limits = sysinfo::CGroupLimits {
-            total_memory: 2048 * MIB,
-            free_memory: 2048 * MIB - 1300 * MIB,
-            rss: 600 * MIB,
-            ..Default::default()
-        };
-        // Stock code used total - free == memory.current (1300 MiB); we gate on
-        // anonymous memory so reclaimable cache can't starve admission.
-        assert_eq!(cgroup_used_mem(&limits), 600 * MIB);
     }
 
     #[test]
@@ -1209,9 +1192,9 @@ mod tests {
             "RealSysInfo total_mem should equal min(cgroup limit, host total)"
         );
 
-        let cur_used = current_mem
-            .total_memory
-            .saturating_sub(current_mem.free_memory);
+        // Usage is gated on anonymous memory, not `memory.current`, so page
+        // cache doesn't count against the limit.
+        let cur_used = current_mem.rss;
         let half_total = current_mem.total_memory / 2;
         let expected_percentage = if cur_used > half_total {
             cur_used as f64 / current_mem.total_memory as f64
