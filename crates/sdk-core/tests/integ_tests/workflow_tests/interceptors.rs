@@ -939,12 +939,12 @@ async fn inbound_interceptor_context_operations_use_the_outbound_chain_around_ne
 #[allow(dead_code)]
 fn assert_workflow_interceptor_context_outbound_api(ctx: &WorkflowInterceptorContext) {
     let _timer = ctx.timer(Duration::from_secs(1));
-    let _activity = ctx.start_activity(
+    let _activity = ctx.execute_activity(
         StdActivities::echo,
         String::new(),
         ActivityOptions::start_to_close_timeout(Duration::from_secs(1)),
     );
-    let _local_activity = ctx.start_local_activity(
+    let _local_activity = ctx.execute_local_activity(
         StdActivities::echo,
         String::new(),
         LocalActivityOptions {
@@ -975,7 +975,7 @@ impl OutboundActivityInterceptorWorkflow {
     #[run]
     async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<()> {
         let activity = ctx
-            .start_activity(
+            .execute_activity(
                 StdActivities::echo,
                 "activity-original".to_string(),
                 ActivityOptions::start_to_close_timeout(Duration::from_secs(5)),
@@ -984,7 +984,7 @@ impl OutboundActivityInterceptorWorkflow {
         assert_eq!(activity, "activity-wrapped");
 
         let local_activity = ctx
-            .start_local_activity(
+            .execute_local_activity(
                 StdActivities::echo,
                 "local-original".to_string(),
                 LocalActivityOptions {

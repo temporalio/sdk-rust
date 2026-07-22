@@ -814,7 +814,7 @@ impl BaseWorkflowContext {
                 }
             };
             base_ctx
-                .start_activity_unintercepted::<AD>(activity_type, input, opts, headers)
+                .execute_activity_unintercepted::<AD>(activity_type, input, opts, headers)
                 .map(|result| {
                     result.map(|output| Box::new(output) as Box<dyn WorkflowOutboundValue>)
                 })
@@ -841,7 +841,7 @@ impl BaseWorkflowContext {
         self.prepare_cancellable_outbound_future(future)
     }
 
-    fn start_activity_unintercepted<AD: ActivityDefinition>(
+    fn execute_activity_unintercepted<AD: ActivityDefinition>(
         &self,
         activity_type: String,
         input: AD::Input,
@@ -919,7 +919,7 @@ impl BaseWorkflowContext {
                 }
             };
             base_ctx
-                .start_local_activity_unintercepted::<AD>(activity_type, input, opts, headers)
+                .execute_local_activity_unintercepted::<AD>(activity_type, input, opts, headers)
                 .map(|result| {
                     result.map(|output| Box::new(output) as Box<dyn WorkflowOutboundValue>)
                 })
@@ -946,7 +946,7 @@ impl BaseWorkflowContext {
         self.prepare_cancellable_outbound_future(future)
     }
 
-    fn start_local_activity_unintercepted<AD: ActivityDefinition>(
+    fn execute_local_activity_unintercepted<AD: ActivityDefinition>(
         &self,
         activity_type: String,
         input: AD::Input,

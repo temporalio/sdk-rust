@@ -241,7 +241,7 @@ impl WorkflowInterceptorContext {
     }
 
     /// Request to run an activity through the workflow outbound interceptor chain.
-    pub fn start_activity<AD: ActivityDefinition>(
+    pub fn execute_activity<AD: ActivityDefinition>(
         &self,
         activity: AD,
         input: impl Into<AD::Input>,
@@ -254,7 +254,7 @@ impl WorkflowInterceptorContext {
     }
 
     /// Request to run a local activity through the workflow outbound interceptor chain.
-    pub fn start_local_activity<AD: ActivityDefinition>(
+    pub fn execute_local_activity<AD: ActivityDefinition>(
         &self,
         activity: AD,
         input: impl Into<AD::Input>,
