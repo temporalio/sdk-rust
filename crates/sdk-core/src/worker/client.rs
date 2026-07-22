@@ -146,7 +146,12 @@ impl WorkerClientBag {
     }
 
     fn worker_control_task_queue(&self) -> String {
-        worker_control_task_queue(&self.namespace, &self.worker_grouping_key().to_string())
+        let workers = self.connection.inner_cow().workers();
+        if workers.worker_control_task_queue_enabled(&self.namespace) {
+            worker_control_task_queue(&self.namespace, &workers.worker_grouping_key().to_string())
+        } else {
+            String::new()
+        }
     }
 }
 

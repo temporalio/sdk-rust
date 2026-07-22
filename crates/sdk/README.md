@@ -238,10 +238,7 @@ let started = ctx
     .start_child_workflow(
         MyChildWorkflow::run,
         "input",
-        ChildWorkflowOptions {
-            workflow_id: "child-1".to_string(),
-            ..Default::default()
-        },
+        ChildWorkflowOptions::workflow_id("child-1".to_string()),
     )
     .await?;
 let result = started.result().await?;
