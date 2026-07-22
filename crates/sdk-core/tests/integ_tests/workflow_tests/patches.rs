@@ -5,7 +5,7 @@ use std::{
     collections::{HashSet, VecDeque, hash_map::RandomState},
     sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::Duration,
 };
@@ -39,7 +39,7 @@ use temporalio_common::{
 use temporalio_common::worker::WorkerTaskTypes;
 use temporalio_macros::{activity_definitions, workflow, workflow_methods};
 use temporalio_sdk::{
-    ActivityOptions, SyncWorkflowContext, WorkflowContext, WorkflowResult,
+    ActivityOptions, PatchActivationCallback, SyncWorkflowContext, WorkflowContext, WorkflowResult,
     activities::ActivityError,
 };
 use temporalio_sdk_core::{
@@ -49,6 +49,7 @@ use temporalio_sdk_core::{
 use tokio::{join, sync::Notify};
 
 const MY_PATCH_ID: &str = "integ_test_change_name";
+const ROLLOUT_PATCH_ID: &str = "rollout-patch";
 
 #[workflow]
 #[derive(Default)]
@@ -165,6 +166,245 @@ async fn replaying_with_patch_marker() {
 
     starter.start_with_worker(wf_name, &mut worker).await;
     worker.run_until_done().await.unwrap();
+}
+
+#[workflow]
+#[derive(Default)]
+struct PatchActivationTwiceWf;
+
+#[workflow_methods]
+impl PatchActivationTwiceWf {
+    #[run(name = "patch_activation_twice")]
+    async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<(bool, bool)> {
+        let first = ctx.patched(ROLLOUT_PATCH_ID);
+        ctx.timer(Duration::from_millis(1)).await;
+        let second = ctx.patched(ROLLOUT_PATCH_ID);
+        Ok((first, second))
+    }
+}
+
+#[tokio::test]
+async fn patch_activation_callback_is_memoized_across_replay() {
+    let wf_name = "patch_activation_callback_is_memoized_across_replay";
+    let mut starter = CoreWfStarter::new(wf_name);
+    starter.sdk_config.task_types = WorkerTaskTypes::workflow_only();
+    starter.sdk_config.max_cached_workflows = 0;
+    let callback_calls = Arc::new(AtomicUsize::new(0));
+    let callback_calls_clone = callback_calls.clone();
+    starter.sdk_config.patch_activation_callback = Some(Arc::new(move |_| {
+        callback_calls_clone.fetch_add(1, Ordering::Relaxed);
+        false
+    }));
+    let mut worker = starter.worker().await;
+    worker
+        .register_workflow::<PatchActivationTwiceWf>()
+        .unwrap();
+    let workflow_id = starter.get_task_queue().to_string();
+    let handle = worker
+        .submit_workflow(
+            PatchActivationTwiceWf::run,
+            (),
+            WorkflowStartOptions::new(workflow_id.clone(), workflow_id).build(),
+        )
+        .await
+        .unwrap();
+
+    worker.run_until_done().await.unwrap();
+
+    assert_eq!(
+        handle.get_result(Default::default()).await.unwrap(),
+        (false, false)
+    );
+    assert_eq!(callback_calls.load(Ordering::Relaxed), 1);
+    let history = handle.fetch_history(Default::default()).await.unwrap();
+    assert!(!history.events().iter().any(|event| matches!(
+        &event.attributes,
+        Some(EventAttributes::MarkerRecordedEventAttributes(attrs))
+            if attrs.marker_name == PATCH_MARKER_NAME
+    )));
+}
+
+#[workflow]
+struct PatchActivationRolloutWf {
+    ready: Arc<Notify>,
+    released: bool,
+}
+
+#[workflow_methods(factory_only)]
+impl PatchActivationRolloutWf {
+    #[run(name = "patch_activation_rollout")]
+    async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<String> {
+        let patched = ctx.patched(ROLLOUT_PATCH_ID);
+        ctx.timer(Duration::from_millis(1)).await;
+        ctx.state(|wf| wf.ready.notify_one());
+        ctx.wait_condition(|wf| wf.released).await;
+        Ok(if patched { "new" } else { "old" }.to_string())
+    }
+
+    #[signal]
+    fn release(&mut self, _ctx: &mut SyncWorkflowContext<Self>) {
+        self.released = true;
+    }
+}
+
+#[workflow]
+#[derive(Default)]
+struct PatchActivationOldRolloutWf {
+    released: bool,
+}
+
+#[workflow_methods]
+impl PatchActivationOldRolloutWf {
+    #[run(name = "patch_activation_rollout")]
+    async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<String> {
+        ctx.timer(Duration::from_millis(1)).await;
+        ctx.wait_condition(|wf| wf.released).await;
+        Ok("old".to_string())
+    }
+
+    #[signal]
+    fn release(&mut self, _ctx: &mut SyncWorkflowContext<Self>) {
+        self.released = true;
+    }
+}
+
+#[tokio::test]
+async fn declined_patch_can_roll_out_to_old_worker() {
+    let wf_name = "declined_patch_can_roll_out_to_old_worker";
+    let mut starter = CoreWfStarter::new(wf_name);
+    starter.sdk_config.task_types = WorkerTaskTypes::workflow_only();
+    let callback_calls = Arc::new(AtomicUsize::new(0));
+    let callback_calls_clone = callback_calls.clone();
+    let workflow_id = starter.get_task_queue().to_string();
+    let expected_workflow_id = workflow_id.clone();
+    let callback: PatchActivationCallback = Arc::new(move |input| {
+        assert_eq!(input.workflow_info.workflow_id(), expected_workflow_id);
+        assert_eq!(input.patch_id, ROLLOUT_PATCH_ID);
+        callback_calls_clone.fetch_add(1, Ordering::Relaxed);
+        false
+    });
+    starter.sdk_config.patch_activation_callback = Some(callback);
+    let mut worker = starter.worker().await;
+    let ready = Arc::new(Notify::new());
+    let ready_clone = ready.clone();
+    worker
+        .register_workflow_with_factory(move || PatchActivationRolloutWf {
+            ready: ready_clone.clone(),
+            released: false,
+        })
+        .unwrap();
+    let handle = worker
+        .submit_workflow(
+            PatchActivationRolloutWf::run,
+            (),
+            WorkflowStartOptions::new(workflow_id.clone(), workflow_id.clone()).build(),
+        )
+        .await
+        .unwrap();
+    let core = worker.core_worker();
+    let (run_result, ()) = join!(worker.inner_mut().run(), async {
+        ready.notified().await;
+        core.shutdown().await;
+    });
+    run_result.unwrap();
+    assert_eq!(callback_calls.load(Ordering::Relaxed), 1);
+    let history = handle.fetch_history(Default::default()).await.unwrap();
+    assert!(!history.events().iter().any(|event| matches!(
+        &event.attributes,
+        Some(EventAttributes::MarkerRecordedEventAttributes(attrs))
+            if attrs.marker_name == PATCH_MARKER_NAME
+    )));
+
+    let mut old_starter = starter.clone_no_worker();
+    old_starter.sdk_config.patch_activation_callback = None;
+    let mut old_worker = old_starter.worker().await;
+    old_worker
+        .register_workflow::<PatchActivationOldRolloutWf>()
+        .unwrap();
+    old_worker.expect_workflow_completion(workflow_id, handle.info().run_id.clone());
+    let (signal_result, run_result) = join!(
+        handle.signal(
+            PatchActivationRolloutWf::release,
+            (),
+            WorkflowSignalOptions::default(),
+        ),
+        old_worker.run_until_done(),
+    );
+    signal_result.unwrap();
+    run_result.unwrap();
+    assert_eq!(handle.get_result(Default::default()).await.unwrap(), "old");
+}
+
+#[tokio::test]
+async fn activated_patch_replays_without_consulting_declining_callback() {
+    let wf_name = "activated_patch_replays_without_consulting_declining_callback";
+    let mut starter = CoreWfStarter::new(wf_name);
+    starter.sdk_config.task_types = WorkerTaskTypes::workflow_only();
+    let activated_calls = Arc::new(AtomicUsize::new(0));
+    let activated_calls_clone = activated_calls.clone();
+    starter.sdk_config.patch_activation_callback = Some(Arc::new(move |_| {
+        activated_calls_clone.fetch_add(1, Ordering::Relaxed);
+        true
+    }));
+    let mut worker = starter.worker().await;
+    let ready = Arc::new(Notify::new());
+    let ready_clone = ready.clone();
+    worker
+        .register_workflow_with_factory(move || PatchActivationRolloutWf {
+            ready: ready_clone.clone(),
+            released: false,
+        })
+        .unwrap();
+    let workflow_id = starter.get_task_queue().to_string();
+    let handle = worker
+        .submit_workflow(
+            PatchActivationRolloutWf::run,
+            (),
+            WorkflowStartOptions::new(workflow_id.clone(), workflow_id.clone()).build(),
+        )
+        .await
+        .unwrap();
+    let core = worker.core_worker();
+    let (run_result, ()) = join!(worker.inner_mut().run(), async {
+        ready.notified().await;
+        core.shutdown().await;
+    });
+    run_result.unwrap();
+    assert_eq!(activated_calls.load(Ordering::Relaxed), 1);
+    let history = handle.fetch_history(Default::default()).await.unwrap();
+    assert!(history.events().iter().any(|event| matches!(
+        &event.attributes,
+        Some(EventAttributes::MarkerRecordedEventAttributes(attrs))
+            if attrs.marker_name == PATCH_MARKER_NAME
+    )));
+
+    let mut declining_starter = starter.clone_no_worker();
+    let declining_calls = Arc::new(AtomicUsize::new(0));
+    let declining_calls_clone = declining_calls.clone();
+    declining_starter.sdk_config.patch_activation_callback = Some(Arc::new(move |_| {
+        declining_calls_clone.fetch_add(1, Ordering::Relaxed);
+        false
+    }));
+    let mut declining_worker = declining_starter.worker().await;
+    declining_worker
+        .register_workflow_with_factory(move || PatchActivationRolloutWf {
+            ready: Arc::new(Notify::new()),
+            released: false,
+        })
+        .unwrap();
+    declining_worker.expect_workflow_completion(workflow_id, handle.info().run_id.clone());
+    let (signal_result, run_result) = join!(
+        handle.signal(
+            PatchActivationRolloutWf::release,
+            (),
+            WorkflowSignalOptions::default(),
+        ),
+        declining_worker.run_until_done(),
+    );
+    signal_result.unwrap();
+    run_result.unwrap();
+    assert_eq!(handle.get_result(Default::default()).await.unwrap(), "new");
+    assert_eq!(declining_calls.load(Ordering::Relaxed), 0);
 }
 
 /// Test that the internal patching mechanism works on the second workflow task when replaying.
@@ -420,7 +660,7 @@ impl FakeAct {
 
 async fn v1(ctx: &mut WorkflowContext<PatchWf>) {
     let _ = ctx
-        .start_activity(
+        .execute_activity(
             FakeAct::nameless,
             (),
             ActivityOptions::with_start_to_close_timeout(Duration::from_secs(5))
@@ -433,7 +673,7 @@ async fn v1(ctx: &mut WorkflowContext<PatchWf>) {
 async fn v2(ctx: &mut WorkflowContext<PatchWf>) -> bool {
     if ctx.patched(MY_PATCH_ID) {
         let _ = ctx
-            .start_activity(
+            .execute_activity(
                 FakeAct::nameless,
                 (),
                 ActivityOptions::with_start_to_close_timeout(Duration::from_secs(5))
@@ -444,7 +684,7 @@ async fn v2(ctx: &mut WorkflowContext<PatchWf>) -> bool {
         true
     } else {
         let _ = ctx
-            .start_activity(
+            .execute_activity(
                 FakeAct::nameless,
                 (),
                 ActivityOptions::with_start_to_close_timeout(Duration::from_secs(5))
@@ -459,7 +699,7 @@ async fn v2(ctx: &mut WorkflowContext<PatchWf>) -> bool {
 async fn v3(ctx: &mut WorkflowContext<PatchWf>) {
     ctx.deprecate_patch(MY_PATCH_ID);
     let _ = ctx
-        .start_activity(
+        .execute_activity(
             FakeAct::nameless,
             (),
             ActivityOptions::with_start_to_close_timeout(Duration::from_secs(5))
@@ -471,7 +711,7 @@ async fn v3(ctx: &mut WorkflowContext<PatchWf>) {
 
 async fn v4(ctx: &mut WorkflowContext<PatchWf>) {
     let _ = ctx
-        .start_activity(
+        .execute_activity(
             FakeAct::nameless,
             (),
             ActivityOptions::with_start_to_close_timeout(Duration::from_secs(5))
@@ -694,7 +934,7 @@ impl SameChangeMultipleSpotsWf {
     async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<()> {
         if ctx.patched(MY_PATCH_ID) {
             let _ = ctx
-                .start_activity(
+                .execute_activity(
                     FakeAct::nameless,
                     (),
                     ActivityOptions::start_to_close_timeout(Duration::from_secs(5)),
@@ -706,7 +946,7 @@ impl SameChangeMultipleSpotsWf {
         ctx.timer(ONE_SECOND).await;
         if ctx.patched(MY_PATCH_ID) {
             let _ = ctx
-                .start_activity(
+                .execute_activity(
                     FakeAct::nameless,
                     (),
                     ActivityOptions::start_to_close_timeout(Duration::from_secs(5)),

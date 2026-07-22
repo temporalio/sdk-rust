@@ -190,10 +190,7 @@ impl SignalsChild {
             .start_child_workflow(
                 ChildSignalReceiver::run,
                 (),
-                ChildWorkflowOptions {
-                    workflow_id: "my_precious_child".to_string(),
-                    ..Default::default()
-                },
+                ChildWorkflowOptions::workflow_id("my_precious_child".to_string()),
             )
             .await?;
         started_child

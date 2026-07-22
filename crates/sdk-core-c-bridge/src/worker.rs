@@ -54,6 +54,10 @@ pub struct WorkerOptions {
     pub nondeterminism_as_workflow_fail_for_types: ByteArrayRefArray,
     pub plugins: ByteArrayRefArray,
     pub storage_drivers: ByteArrayRefArray,
+    /// If set, the worker won't proactively fail completions whose payloads exceed the namespace
+    /// error limits; oversized payloads are sent and the server enforces the limit.
+    /// NOTE: Experimental
+    pub disable_payload_error_limit: bool,
 }
 
 #[repr(C)]
@@ -1289,6 +1293,7 @@ impl TryFrom<&WorkerOptions> for temporalio_sdk_core::WorkerConfig {
                     })
                     .collect::<HashSet<_>>(),
             )
+            .disable_payload_error_limit(opt.disable_payload_error_limit)
             .build()
             .map_err(|err| anyhow::anyhow!(err))
     }
@@ -1345,11 +1350,13 @@ impl TryFrom<&TunerHolder> for temporalio_sdk_core::TunerHolder {
             .activity_slot_options(holder.activity_slot_supplier.try_into()?)
             .local_activity_slot_options(holder.local_activity_slot_supplier.try_into()?)
             .nexus_slot_options(holder.nexus_task_slot_supplier.try_into()?)
-            .maybe_resource_based_options(first.map(|f| {
-                temporalio_sdk_core::ResourceBasedSlotsOptions::builder()
-                    .target_mem_usage(f.target_memory_usage)
-                    .target_cpu_usage(f.target_cpu_usage)
-                    .build()
+            .maybe_resource_based_config(first.map(|f| {
+                temporalio_sdk_core::ResourceBasedTunerConfig::Options(
+                    temporalio_sdk_core::ResourceBasedSlotsOptions::builder()
+                        .target_mem_usage(f.target_memory_usage)
+                        .target_cpu_usage(f.target_cpu_usage)
+                        .build(),
+                )
             }))
             .build()
             .map_err(|e| anyhow::anyhow!("Failed building tuner holder options: {}", e))?
@@ -1442,6 +1449,7 @@ mod tests {
             nondeterminism_as_workflow_fail_for_types: crate::ByteArrayRefArray::empty(),
             plugins: crate::ByteArrayRefArray::empty(),
             storage_drivers: crate::ByteArrayRefArray::empty(),
+            disable_payload_error_limit: false,
         }
     }
 

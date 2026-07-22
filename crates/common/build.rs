@@ -969,7 +969,7 @@ fn generate_payload_limits_validator(
     output.push_str("// Generated from descriptors.bin - DO NOT EDIT\n");
     output.push_str("// Payload-limits validators. Edit the *_FIELDS tables in build.rs to classify fields.\n\n");
 
-    let mut generate_names: Vec<String> = to_generate.into_iter().collect();
+    let mut generate_names: Vec<String> = to_generate.iter().cloned().collect();
     generate_names.sort();
     for name in &generate_names {
         output.push_str(&generate_limits_impl(
@@ -980,6 +980,28 @@ fn generate_payload_limits_validator(
             &mut unclassified,
         ));
     }
+
+    // Dispatch the gRPC client layer calls for every outbound request: downcast to the payload-bearing
+    // request roots and validate or return `None` for anything else.
+    let mut root_names: Vec<&String> = roots.iter().filter(|r| to_generate.contains(*r)).collect();
+    root_names.sort();
+    root_names.dedup();
+    output.push_str(
+        "\n/// Validate `req` if it is a known payload-bearing request type; otherwise return `None`.\n\
+         #[doc(hidden)]\n\
+         pub fn validate_known_payload_limits(\n    \
+             req: &dyn ::std::any::Any,\n    \
+             limits: &PayloadLimits,\n\
+         ) -> Option<PayloadLimitViolation> {\n",
+    );
+    for name in &root_names {
+        let rust_path = proto_to_rust_path(name);
+        output.push_str(&format!(
+            "    if let Some(inner) = req.downcast_ref::<{rust_path}>() {{\n        \
+                 return validate_payload_limits(inner, limits);\n    }}\n"
+        ));
+    }
+    output.push_str("    None\n}\n");
 
     // Fail the build on any unclassified leaf field (forces an explicit decision on proto changes).
     if !unclassified.is_empty() {

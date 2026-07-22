@@ -14,7 +14,7 @@ use temporalio_common::{
     UntypedWorkflow,
     data_converters::RawValue,
     protos::{
-        coresdk::AsJsonPayloadExt,
+        coresdk::{AsJsonPayloadExt, FromJsonPayloadExt},
         temporal::api::{
             enums::v1::{EventType, WorkflowTaskFailedCause},
             failure::v1::Failure,
@@ -52,7 +52,7 @@ impl TimerWfNondeterministic {
                 }
             }
             2 => {
-                ctx.start_activity(
+                ctx.execute_activity(
                     StdActivities::default,
                     (),
                     ActivityOptions::start_to_close_timeout(Duration::from_secs(5)),
@@ -105,7 +105,7 @@ impl TaskFailReplayWf {
             assert!(ctx.is_replaying());
         }
         let _ = ctx
-            .start_activity(
+            .execute_activity(
                 StdActivities::echo,
                 "hi!".to_string(),
                 ActivityOptions::start_to_close_timeout(Duration::from_secs(2)),
@@ -149,6 +149,47 @@ async fn task_fail_causes_replay_unset_too_soon() {
         .fetch_history_and_replay(worker.inner_mut())
         .await
         .unwrap();
+}
+
+#[workflow]
+#[derive(Default)]
+struct RandomReplayWf;
+
+#[workflow_methods]
+impl RandomReplayWf {
+    #[run]
+    async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<String> {
+        Ok(format!("{}:{}", ctx.random::<u64>(), ctx.uuid4()))
+    }
+}
+
+#[tokio::test]
+async fn random_workflow_replays() {
+    let wf_name = "random_workflow_replays";
+    let mut starter = CoreWfStarter::new(wf_name);
+    starter.sdk_config.task_types = WorkerTaskTypes::workflow_only();
+    let mut worker = starter.worker().await;
+    worker.register_workflow::<RandomReplayWf>().unwrap();
+
+    let task_queue = starter.get_task_queue().to_owned();
+    let handle = worker
+        .submit_workflow(
+            RandomReplayWf::run,
+            (),
+            WorkflowStartOptions::new(task_queue, wf_name).build(),
+        )
+        .await
+        .unwrap();
+
+    worker.run_until_done().await.unwrap();
+    let result = handle.get_result(Default::default()).await.unwrap();
+    let replay_result = handle
+        .fetch_history_and_replay(worker.inner_mut())
+        .await
+        .unwrap()
+        .expect("replayed workflow should return a result");
+    assert_eq!(result, String::from_json_payload(&replay_result).unwrap());
+    starter.shutdown().await;
 }
 
 #[workflow]
@@ -289,7 +330,7 @@ impl ActivityIdOrTypeChangeWf {
     ) -> WorkflowResult<()> {
         if local_act {
             if id_change {
-                ctx.start_local_activity(
+                ctx.execute_local_activity(
                     StdActivities::default,
                     (),
                     LocalActivityOptions {
@@ -299,11 +340,11 @@ impl ActivityIdOrTypeChangeWf {
                 )
                 .await?;
             } else {
-                ctx.start_local_activity(StdActivities::no_op, (), Default::default())
+                ctx.execute_local_activity(StdActivities::no_op, (), Default::default())
                     .await?;
             }
         } else if id_change {
-            ctx.start_activity(
+            ctx.execute_activity(
                 StdActivities::default,
                 (),
                 ActivityOptions::with_start_to_close_timeout(Duration::from_secs(5))
@@ -312,7 +353,7 @@ impl ActivityIdOrTypeChangeWf {
             )
             .await?;
         } else {
-            ctx.start_activity(
+            ctx.execute_activity(
                 StdActivities::no_op,
                 (),
                 ActivityOptions::start_to_close_timeout(Duration::from_secs(5)),
@@ -392,20 +433,14 @@ impl ChildWfIdOrTypeChangeWf {
             ctx.start_child_workflow(
                 UntypedWorkflow::new("child"),
                 RawValue::new(vec![]),
-                ChildWorkflowOptions {
-                    workflow_id: "I'm bad and wrong!".to_string(),
-                    ..Default::default()
-                },
+                ChildWorkflowOptions::workflow_id("I'm bad and wrong!".to_string()),
             )
             .await?;
         } else {
             ctx.start_child_workflow(
                 UntypedWorkflow::new("not the child wf type"),
                 RawValue::new(vec![]),
-                ChildWorkflowOptions {
-                    workflow_id: "1".to_string(),
-                    ..Default::default()
-                },
+                ChildWorkflowOptions::workflow_id("1".to_string()),
             )
             .await?;
         }

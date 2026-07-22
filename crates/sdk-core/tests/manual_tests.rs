@@ -13,7 +13,7 @@ use futures_util::{
     sink, stream,
     stream::FuturesUnordered,
 };
-use rand::{RngExt, SeedableRng};
+use rand::RngExt;
 use std::{
     mem,
     net::SocketAddr,
@@ -57,7 +57,7 @@ impl PollerLoadSpikyWf {
     async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<()> {
         for _ in 0..5 {
             let _ = ctx
-                .start_activity(
+                .execute_activity(
                     JitteryEchoActivities::echo,
                     "hi!".to_string(),
                     ActivityOptions::start_to_close_timeout(Duration::from_secs(5)),
@@ -80,10 +80,8 @@ struct PollerLoadSustainedWf;
 impl PollerLoadSustainedWf {
     #[run(name = "poller_load")]
     async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<()> {
-        let rs = ctx.random_seed();
-        let mut rand = rand::rngs::SmallRng::seed_from_u64(rs);
         for _ in 0..100 {
-            let jitterms = rand.random_range(1000..3000);
+            let jitterms = 1000 + ctx.random::<u64>() % 2000;
             ctx.timer(Duration::from_millis(jitterms)).await;
         }
 
@@ -104,7 +102,7 @@ impl PollerLoadSpikeThenSustainedWf {
     async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<()> {
         for _ in 0..5 {
             let _ = ctx
-                .start_activity(
+                .execute_activity(
                     JitteryEchoActivities::echo,
                     "hi!".to_string(),
                     ActivityOptions::start_to_close_timeout(Duration::from_secs(5)),

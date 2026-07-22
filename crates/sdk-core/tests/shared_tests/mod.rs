@@ -243,6 +243,7 @@ pub(crate) async fn grpc_message_too_large() {
         .await
         .unwrap();
     starter.sdk_config.task_types = WorkerTaskTypes::workflow_only();
+    starter.sdk_config.disable_payload_error_limit = true;
     starter
         .sdk_config
         .register_workflow_with_factory(move || OversizeGrpcMessageWf {
@@ -300,7 +301,7 @@ impl ShutdownTimerActivityLoopWf {
     async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<()> {
         loop {
             ctx.timer(Duration::from_millis(10)).await;
-            ctx.start_activity(
+            ctx.execute_activity(
                 StdActivities::no_op,
                 (),
                 ActivityOptions::start_to_close_timeout(Duration::from_secs(10)),
@@ -460,7 +461,7 @@ pub(crate) async fn activity_cancel_delivered_without_heartbeat() {
     impl CancelWithoutHeartbeatWorkflow {
         #[run]
         async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<()> {
-            let act_fut = ctx.start_activity(
+            let act_fut = ctx.execute_activity(
                 WaitForCancelActivities::wait_for_cancel,
                 "hi".to_string(),
                 ActivityOptions::with_start_to_close_timeout(Duration::from_secs(30))

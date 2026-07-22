@@ -87,14 +87,14 @@ impl Saga {
     {
         let out = self
             .ctx
-            .start_activity(forward, input, self.opts.clone())
+            .execute_activity(forward, input, self.opts.clone())
             .await?;
         let cmp_input: Compensation::Input = out.clone().into();
         let ctx = self.ctx.clone();
         let opts = self.opts.clone();
         let compensation_name = compensate.name().to_owned();
         self.compensations.push(Box::pin(async move {
-            if let Err(e) = ctx.start_activity(compensate, cmp_input, opts).await {
+            if let Err(e) = ctx.execute_activity(compensate, cmp_input, opts).await {
                 eprintln!("Compensation {compensation_name} failed: {e}");
             }
         }));

@@ -759,6 +759,7 @@ pub(crate) enum FailureReason {
     NexusOperation(String),
     NexusHandlerError(String),
     GrpcMessageTooLarge,
+    PayloadsTooLarge,
 }
 impl Display for FailureReason {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -769,6 +770,7 @@ impl Display for FailureReason {
             FailureReason::NexusOperation(op) => format!("operation_{op}"),
             FailureReason::NexusHandlerError(op) => format!("handler_error_{op}"),
             FailureReason::GrpcMessageTooLarge => "GrpcMessageTooLarge".to_owned(),
+            FailureReason::PayloadsTooLarge => "PayloadsTooLarge".to_owned(),
         };
         write!(f, "{str}")
     }

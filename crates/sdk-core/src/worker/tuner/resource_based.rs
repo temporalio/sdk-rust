@@ -27,6 +27,9 @@ use tokio::{sync::watch, task::JoinHandle};
 /// current usage levels of their respective resource as measurements. The user specifies a target
 /// threshold for each, and slots are handed out if the output of both PID controllers is above some
 /// defined threshold. See [ResourceBasedSlotsOptions] for the default PID controller settings.
+///
+/// Note that different slot types make decisions independently of each other, though they use the
+/// same underlying system information.
 pub struct ResourceBasedTuner<MI> {
     slots: Arc<ResourceController<MI>>,
     wf_opts: Option<ResourceSlotOptions>,
@@ -64,9 +67,13 @@ impl ResourceBasedTuner<RealSysInfo> {
 
 impl<MI> ResourceBasedTuner<MI> {
     fn new_from_controller(controller: ResourceController<MI>) -> Self {
-        let sys_info = controller.sys_info_supplier.clone();
+        Self::new_from_shared_controller(Arc::new(controller))
+    }
+
+    pub(crate) fn new_from_shared_controller(slots: Arc<ResourceController<MI>>) -> Self {
+        let sys_info = slots.sys_info_supplier.clone();
         Self {
-            slots: Arc::new(controller),
+            slots,
             wf_opts: None,
             act_opts: None,
             la_opts: None,
@@ -135,7 +142,8 @@ pub struct ResourceSlotOptions {
     ramp_throttle: Duration,
 }
 
-struct ResourceController<MI> {
+/// Coordinates resource-based slot decisions using a shared resource sampler and PID controllers.
+pub struct ResourceController<MI = RealSysInfo> {
     options: ResourceBasedSlotsOptions,
     sys_info_supplier: Arc<MI>,
     metrics: OnceLock<JoinHandle<()>>,
@@ -417,6 +425,22 @@ impl<MI: SystemResourceInfo + Sync + Send + 'static> WorkerTuner for ResourceBas
     ) -> Arc<dyn SlotSupplier<SlotKind = NexusSlotKind> + Send + Sync> {
         let o = self.nexus_opts.unwrap_or(DEFAULT_NEXUS_SLOT_OPTS);
         self.slots.as_kind(o)
+    }
+}
+
+impl<MI> std::fmt::Debug for ResourceController<MI> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ResourceController").finish_non_exhaustive()
+    }
+}
+
+impl ResourceController<RealSysInfo> {
+    /// Create a resource controller using the default system resource sampler.
+    pub fn new(options: ResourceBasedSlotsOptions) -> Self {
+        Self::new_with_sysinfo(
+            options,
+            Arc::new(RealSysInfo::new(RealSysInfo::MIN_REFRESH_INTERVAL)),
+        )
     }
 }
 
@@ -863,6 +887,45 @@ mod tests {
         used.store(0, Ordering::Release);
         // Now it's willing to hand out slots again when usage is zero
         assert!(rbs.try_reserve_slot(&pd).is_some());
+    }
+
+    #[test]
+    fn shared_controller_has_same_behavior_across_tuners() {
+        let (fmis, used) = FakeMIS::new();
+        let controller = Arc::new(ResourceController::new_with_sysinfo(test_options(), fmis));
+        let slot_options = ResourceSlotOptions {
+            min_slots: 0,
+            max_slots: 100,
+            ramp_throttle: Duration::from_millis(0),
+        };
+        let mut first_tuner = ResourceBasedTuner::new_from_shared_controller(controller.clone());
+        first_tuner.with_activity_slots_options(slot_options);
+        let mut second_tuner = ResourceBasedTuner::new_from_shared_controller(controller);
+        second_tuner.with_activity_slots_options(slot_options);
+        let first_supplier = first_tuner.activity_task_slot_supplier();
+        let second_supplier = second_tuner.activity_task_slot_supplier();
+        let first_context = MeteredPermitDealer::new(
+            first_supplier.clone(),
+            MetricsContext::no_op(),
+            None,
+            Arc::new(Default::default()),
+            None,
+        );
+        let second_context = MeteredPermitDealer::new(
+            second_supplier.clone(),
+            MetricsContext::no_op(),
+            None,
+            Arc::new(Default::default()),
+            None,
+        );
+
+        used.store(90_000, Ordering::Release);
+        assert!(first_supplier.try_reserve_slot(&first_context).is_none());
+        assert!(second_supplier.try_reserve_slot(&second_context).is_none());
+
+        used.store(0, Ordering::Release);
+        assert!(first_supplier.try_reserve_slot(&first_context).is_some());
+        assert!(second_supplier.try_reserve_slot(&second_context).is_some());
     }
 
     #[tokio::test]

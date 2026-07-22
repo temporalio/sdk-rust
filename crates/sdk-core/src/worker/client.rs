@@ -13,8 +13,8 @@ use std::{
     time::{Duration, SystemTime},
 };
 use temporalio_client::{
-    Connection, NamespacedClient, RetryOptions, SharedReplaceableClient,
-    grpc::WorkflowService,
+    Connection, NamespacedClient, PayloadErrorLimits, RetryOptions, SharedReplaceableClient,
+    grpc::{PayloadLimitsClient, WorkflowService},
     request_extensions::{IsWorkerTaskLongPoll, NoRetryOnMatching, RetryConfigForCall},
     worker::ClientWorkerSet,
 };
@@ -57,7 +57,13 @@ pub enum LegacyQueryResult {
 
 /// Contains everything a worker needs to interact with the server
 pub(crate) struct WorkerClientBag {
+    /// Shared connection handle, used for management operations (capabilities, identity, client
+    /// replacement, etc.).
     connection: SharedReplaceableClient<Connection>,
+    /// Issues outbound gRPC calls, automatically attaching this worker's payload/memo error limits
+    /// (set via `set_payload_error_limits`) so the gRPC layer can enforce them. Wraps a clone of
+    /// `connection`, so a client replacement on `connection` is reflected here too.
+    client: PayloadLimitsClient<SharedReplaceableClient<Connection>>,
     namespace: String,
     worker_versioning_strategy: WorkerVersioningStrategy,
     worker_instance_key: Uuid,
@@ -72,6 +78,7 @@ impl WorkerClientBag {
         worker_instance_key: Uuid,
     ) -> Self {
         Self {
+            client: PayloadLimitsClient::new(connection.clone()),
             connection,
             namespace,
             worker_versioning_strategy,
@@ -139,7 +146,12 @@ impl WorkerClientBag {
     }
 
     fn worker_control_task_queue(&self) -> String {
-        worker_control_task_queue(&self.namespace, &self.worker_grouping_key().to_string())
+        let workers = self.connection.inner_cow().workers();
+        if workers.worker_control_task_queue_enabled(&self.namespace) {
+            worker_control_task_queue(&self.namespace, &workers.worker_grouping_key().to_string())
+        } else {
+            String::new()
+        }
     }
 }
 
@@ -267,6 +279,8 @@ pub trait WorkerClient: Sync + Send {
     /// Sets the client-reliant fields for WorkerHeartbeat. This also updates client-level tracking
     /// of heartbeat fields, like last heartbeat timestamp.
     fn set_heartbeat_client_fields(&self, heartbeat: &mut WorkerHeartbeat);
+    /// Set the worker's payload/memo error limits
+    fn set_payload_error_limits(&self, _limits: Option<PayloadErrorLimits>) {}
 }
 
 /// Configuration options shared by workflow, activity, and Nexus polling calls
@@ -341,7 +355,7 @@ impl WorkerClient for WorkerClientBag {
         }
 
         Ok(self
-            .connection
+            .client
             .clone()
             .poll_workflow_task_queue(request)
             .await?
@@ -381,7 +395,7 @@ impl WorkerClient for WorkerClientBag {
         }
 
         Ok(self
-            .connection
+            .client
             .clone()
             .poll_activity_task_queue(request)
             .await?
@@ -425,7 +439,7 @@ impl WorkerClient for WorkerClientBag {
         }
 
         Ok(self
-            .connection
+            .client
             .clone()
             .poll_nexus_task_queue(request)
             .await?
@@ -479,7 +493,7 @@ impl WorkerClient for WorkerClientBag {
             resource_id: Default::default(),
         };
         Ok(self
-            .connection
+            .client
             .clone()
             .respond_workflow_task_completed(request.into_request())
             .await?
@@ -492,7 +506,7 @@ impl WorkerClient for WorkerClientBag {
         result: Option<Payloads>,
     ) -> Result<RespondActivityTaskCompletedResponse> {
         Ok(self
-            .connection
+            .client
             .clone()
             .respond_activity_task_completed(
                 #[allow(deprecated)] // want to list all fields explicitly
@@ -519,7 +533,7 @@ impl WorkerClient for WorkerClientBag {
         response: nexus::v1::Response,
     ) -> Result<RespondNexusTaskCompletedResponse> {
         Ok(self
-            .connection
+            .client
             .clone()
             .respond_nexus_task_completed(
                 RespondNexusTaskCompletedRequest {
@@ -541,7 +555,7 @@ impl WorkerClient for WorkerClientBag {
         details: Option<Payloads>,
     ) -> Result<RecordActivityTaskHeartbeatResponse> {
         Ok(self
-            .connection
+            .client
             .clone()
             .record_activity_task_heartbeat(
                 RecordActivityTaskHeartbeatRequest {
@@ -563,7 +577,7 @@ impl WorkerClient for WorkerClientBag {
         details: Option<Payloads>,
     ) -> Result<RespondActivityTaskCanceledResponse> {
         Ok(self
-            .connection
+            .client
             .clone()
             .respond_activity_task_canceled(
                 #[allow(deprecated)] // want to list all fields explicitly
@@ -590,7 +604,7 @@ impl WorkerClient for WorkerClientBag {
         failure: Option<Failure>,
     ) -> Result<RespondActivityTaskFailedResponse> {
         Ok(self
-            .connection
+            .client
             .clone()
             .respond_activity_task_failed(
                 #[allow(deprecated)] // want to list all fields explicitly
@@ -635,7 +649,7 @@ impl WorkerClient for WorkerClientBag {
             resource_id: Default::default(),
         };
         Ok(self
-            .connection
+            .client
             .clone()
             .respond_workflow_task_failed(request.into_request())
             .await?
@@ -653,7 +667,7 @@ impl WorkerClient for WorkerClientBag {
         };
 
         Ok(self
-            .connection
+            .client
             .clone()
             .respond_nexus_task_failed(
                 #[allow(deprecated)]
@@ -678,7 +692,7 @@ impl WorkerClient for WorkerClientBag {
         page_token: Vec<u8>,
     ) -> Result<GetWorkflowExecutionHistoryResponse> {
         Ok(self
-            .connection
+            .client
             .clone()
             .get_workflow_execution_history(
                 GetWorkflowExecutionHistoryRequest {
@@ -714,7 +728,7 @@ impl WorkerClient for WorkerClientBag {
         let (_, completed_type, query_result, error_message) = query_result.into_components();
 
         Ok(self
-            .connection
+            .client
             .clone()
             .respond_query_task_completed(
                 RespondQueryTaskCompletedRequest {
@@ -735,7 +749,7 @@ impl WorkerClient for WorkerClientBag {
 
     async fn describe_namespace(&self) -> Result<DescribeNamespaceResponse> {
         Ok(self
-            .connection
+            .client
             .clone()
             .describe_namespace(
                 DescribeNamespaceRequest {
@@ -775,7 +789,7 @@ impl WorkerClient for WorkerClientBag {
             .insert(RetryConfigForCall(RetryOptions::no_retries()));
 
         Ok(
-            WorkflowService::shutdown_worker(&mut self.connection.clone(), request)
+            WorkflowService::shutdown_worker(&mut self.client.clone(), request)
                 .await?
                 .into_inner(),
         )
@@ -793,7 +807,7 @@ impl WorkerClient for WorkerClientBag {
             resource_id: Default::default(),
         };
         Ok(self
-            .connection
+            .client
             .clone()
             .record_worker_heartbeat(request.into_request())
             .await?
@@ -882,6 +896,10 @@ impl WorkerClient for WorkerClientBag {
             &mut heartbeat.local_activity_slots_info,
             &mut client_heartbeat_data.local_activity_slots_info,
         );
+    }
+
+    fn set_payload_error_limits(&self, limits: Option<PayloadErrorLimits>) {
+        self.client.set_error_limits(limits);
     }
 }
 

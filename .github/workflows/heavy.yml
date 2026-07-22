@@ -21,13 +21,7 @@ jobs:
     runs-on: ubuntu-latest-16-cores
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
-      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
-      - name: Run mise install
-        uses: jdx/mise-action@e6a8b3978addb5a52f2b4cd9d91eafa7f0ab959d # v4.2.0
+      - uses: ./.github/actions/setup
         with:
-          version: 2026.7.1
-          install_args: protoc
-      - name: Set PROTOC
-        shell: bash
-        run: printf 'PROTOC=%s\n' "$(mise which protoc)" >> "$GITHUB_ENV"
+          mise-install-args: protoc
       - run: cargo integ-test -c "--release" -t heavy_tests -- --test-threads 1

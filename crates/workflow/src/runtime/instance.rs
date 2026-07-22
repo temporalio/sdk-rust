@@ -397,19 +397,28 @@ where
         let mut made_progress = false;
 
         loop {
-            if let Some(failure) = base_ctx.take_forced_wft_failure().map(|err| {
-                Box::new(Failure {
-                    message: err.to_string(),
-                    ..Default::default()
-                })
-            }) {
+            if let Some(err) = base_ctx.take_forced_wft_failure() {
                 return RoutinePollState::ForcedFailure {
-                    failure,
+                    failure: Box::new(Failure {
+                        message: err.to_string(),
+                        ..Default::default()
+                    }),
                     made_progress,
                 };
             }
 
-            match future.poll_unpin(cx) {
+            let poll = future.poll_unpin(cx);
+            if let Some(err) = base_ctx.take_forced_wft_failure() {
+                return RoutinePollState::ForcedFailure {
+                    failure: Box::new(Failure {
+                        message: err.to_string(),
+                        ..Default::default()
+                    }),
+                    made_progress,
+                };
+            }
+
+            match poll {
                 Poll::Ready(result) => {
                     let state_mutated = base_ctx.take_state_mutated();
                     let runtime_progress = base_ctx.take_runtime_progress();
@@ -555,7 +564,7 @@ where
                 Some(ActivationVariant::InitializeWorkflow(_))
                 | Some(ActivationVariant::UpdateRandomSeed(_)) => ActivationJobResult::None,
                 Some(ActivationVariant::NotifyHasPatch(patch)) => {
-                    self.base_ctx.record_patch(patch.patch_id, true);
+                    self.base_ctx.notify_patch(patch.patch_id);
                     ActivationJobResult::None
                 }
                 Some(ActivationVariant::CancelWorkflow(cancel)) => {
@@ -633,4 +642,71 @@ where
     <W::Run as WorkflowDefinition>::Input: Send,
 {
     GuestWorkflowInstance::<W>::instantiate(payloads, converter, base_ctx)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::runtime::host::WorkflowHost;
+    use std::{rc::Rc, task::Waker};
+    use temporalio_common_wasm::{
+        data_converters::DataConverter,
+        protos::coresdk::{
+            workflow_activation::InitializeWorkflow, workflow_commands::WorkflowCommand,
+        },
+    };
+    use temporalio_macros::{workflow, workflow_methods};
+
+    struct NoopHost;
+
+    impl WorkflowHost for NoopHost {
+        fn set_current_details(&self, _details: String) {}
+
+        fn push_command(&self, _command: WorkflowCommand) {}
+    }
+
+    #[workflow]
+    #[derive(Default)]
+    struct ForcedFailureWorkflow;
+
+    #[workflow_methods]
+    impl ForcedFailureWorkflow {
+        #[run]
+        async fn run(ctx: &mut WorkflowContext<Self>) -> crate::WorkflowResult<()> {
+            ctx.force_task_fail(std::io::Error::other("forced failure"));
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn forced_failure_set_during_ready_poll_wins_over_completion() {
+        let base_ctx = BaseWorkflowContext::from_raw(
+            "default".to_string(),
+            "task-queue".to_string(),
+            "run-id".to_string(),
+            InitializeWorkflow {
+                workflow_type: ForcedFailureWorkflow::name().to_string(),
+                ..Default::default()
+            },
+            DataConverter::default(),
+            Rc::new(NoopHost),
+            None,
+        );
+        let mut instance = GuestWorkflowInstance::<ForcedFailureWorkflow>::new_with_workflow(
+            ForcedFailureWorkflow,
+            base_ctx,
+            None,
+        );
+
+        let result = instance
+            .poll_routine(MAIN_ROUTINE_ID, Waker::noop())
+            .unwrap();
+
+        let Some(RoutineCompletion::Main(MainRoutineCompletion::TaskFailed(failure))) =
+            result.completion
+        else {
+            panic!("expected a workflow task failure, got {result:?}");
+        };
+        assert_eq!(failure.failure.message, "forced failure");
+    }
 }

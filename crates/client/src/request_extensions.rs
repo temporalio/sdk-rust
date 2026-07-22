@@ -24,6 +24,17 @@ pub struct NoRetryOnMatching {
 #[derive(Clone, Debug)]
 pub struct RetryConfigForCall(pub RetryOptions);
 
+/// Per-call payload/memo size error limits, attached to a request's extensions by a caller that
+/// wants error-level enforcement on this call.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy)]
+pub struct PayloadErrorLimits {
+    /// Blob (payload) size error threshold, in bytes.
+    pub blob: usize,
+    /// Memo size error threshold, in bytes.
+    pub memo: usize,
+}
+
 /// Extension trait for tonic requests to set default timeouts
 pub trait RequestExt {
     /// Set a timeout for a request if one is not already specified in the metadata

@@ -6,7 +6,11 @@ mod slot_provider;
 pub(crate) mod tuner;
 mod workflow;
 
-use temporalio_client::Connection;
+/// The failure `type` set on the task failures workers synthesize when an outbound payload exceeds
+/// the error limit, shared so every conversion site reports the same identifier.
+pub(crate) const PAYLOADS_TOO_LARGE_FAILURE_TYPE: &str = "PayloadsTooLarge";
+
+use temporalio_client::{Connection, PayloadErrorLimits};
 use temporalio_common::{
     protos::{
         coresdk::{
@@ -23,8 +27,8 @@ use temporalio_common::{
 };
 pub use tuner::{
     FixedSizeSlotSupplier, ResourceBasedSlotsOptions, ResourceBasedSlotsOptionsBuilder,
-    ResourceBasedTuner, ResourceSlotOptions, SlotSupplierOptions, TunerBuilder, TunerHolder,
-    TunerHolderOptions,
+    ResourceBasedTuner, ResourceBasedTunerConfig, ResourceController, ResourceSlotOptions,
+    SlotSupplierOptions, TunerBuilder, TunerHolder, TunerHolderOptions,
 };
 // Re-export the generated builder (it's in the tuner module)
 pub use tuner::TunerHolderOptionsBuilder;
@@ -273,6 +277,13 @@ pub struct WorkerConfig {
     /// List of storage drivers used by lang.
     #[builder(default)]
     pub storage_drivers: HashSet<StorageDriverInfo>,
+
+    /// If set, the worker won't enforce server payload/memo error limits on outbound completions —
+    /// oversized payloads are still warned about, and the server still rejects them. When unset, an
+    /// oversized completion is proactively failed as a WFT/activity rather than sent.
+    /// NOTE: Experimental
+    #[builder(default = false)]
+    pub disable_payload_error_limit: bool,
 }
 
 impl WorkerConfig {
@@ -531,6 +542,17 @@ impl Worker {
                         memo_size_limit_error: api_limits.memo_size_limit_error,
                     })
                 });
+                // Install the namespace error limits on the client (enforced on completions) unless
+                // opted out; warn-level enforcement is always on, configured on the connection.
+                if !self.config.disable_payload_error_limit
+                    && let Some(limits) = limits.as_ref()
+                {
+                    self.client
+                        .set_payload_error_limits(Some(PayloadErrorLimits {
+                            blob: limits.blob_size_limit_error.max(0) as usize,
+                            memo: limits.memo_size_limit_error.max(0) as usize,
+                        }));
+                }
                 if let Some(caps) = ns_info.and_then(|ns| ns.capabilities) {
                     if caps.worker_poll_complete_on_shutdown {
                         self.capabilities

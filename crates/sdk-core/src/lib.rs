@@ -44,11 +44,12 @@ pub use worker::{
     ActivitySlotKind, CompleteActivityError, CompleteNexusError, CompleteWfError,
     FixedSizeSlotSupplier, LocalActivitySlotKind, NamespaceCapabilities, NexusSlotKind, PollError,
     PollerBehavior, ResourceBasedSlotsOptions, ResourceBasedSlotsOptionsBuilder,
-    ResourceBasedTuner, ResourceSlotOptions, SlotInfo, SlotInfoTrait, SlotKind, SlotKindType,
-    SlotMarkUsedContext, SlotReleaseContext, SlotReservationContext, SlotSupplier,
-    SlotSupplierOptions, SlotSupplierPermit, TunerBuilder, TunerHolder, TunerHolderOptions,
-    TunerHolderOptionsBuilder, Worker, WorkerConfig, WorkerConfigBuilder, WorkerTuner,
-    WorkerValidationError, WorkerVersioningStrategy, WorkflowErrorType, WorkflowSlotKind,
+    ResourceBasedTuner, ResourceBasedTunerConfig, ResourceController, ResourceSlotOptions,
+    SlotInfo, SlotInfoTrait, SlotKind, SlotKindType, SlotMarkUsedContext, SlotReleaseContext,
+    SlotReservationContext, SlotSupplier, SlotSupplierOptions, SlotSupplierPermit, TunerBuilder,
+    TunerHolder, TunerHolderOptions, TunerHolderOptionsBuilder, Worker, WorkerConfig,
+    WorkerConfigBuilder, WorkerTuner, WorkerValidationError, WorkerVersioningStrategy,
+    WorkflowErrorType, WorkflowSlotKind,
 };
 
 use crate::{

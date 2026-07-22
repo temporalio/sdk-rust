@@ -77,14 +77,7 @@ impl HappyParent {
     #[run(name = "parent_wf")]
     async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<()> {
         let started = ctx
-            .start_child_workflow(
-                ChildWf::run,
-                (),
-                ChildWorkflowOptions {
-                    workflow_id: "child-1".to_owned(),
-                    ..Default::default()
-                },
-            )
+            .start_child_workflow(ChildWf::run, (), ChildWorkflowOptions::default())
             .await
             .expect("Child should start OK");
         started.result().await?;
@@ -102,15 +95,19 @@ async fn child_workflow_happy_path() {
     worker.register_workflow::<ChildWf>().unwrap();
 
     let task_queue = starter.get_task_queue().to_owned();
-    worker
-        .submit_wf(
-            PARENT_WF_TYPE.to_owned(),
-            vec![],
+    let handle = worker
+        .submit_workflow(
+            HappyParent::run,
+            (),
             WorkflowStartOptions::new(task_queue, "parent".to_string()).build(),
         )
         .await
         .unwrap();
     worker.run_until_done().await.unwrap();
+    handle
+        .fetch_history_and_replay(worker.inner_mut())
+        .await
+        .unwrap();
 }
 
 #[workflow]
@@ -126,12 +123,11 @@ impl AbandonedChildBugReproParent {
             .start_child_workflow(
                 AbandonedChildBugReproChild::run,
                 (),
-                ChildWorkflowOptions {
-                    workflow_id: "abandoned-child".to_owned(),
-                    parent_close_policy: ParentClosePolicy::Abandon,
-                    cancel_type: ChildWorkflowCancellationType::Abandon,
-                    ..Default::default()
-                },
+                ChildWorkflowOptions::builder()
+                    .workflow_id("abandoned-child".to_owned())
+                    .parent_close_policy(ParentClosePolicy::Abandon)
+                    .cancel_type(ChildWorkflowCancellationType::Abandon)
+                    .build(),
             )
             .await
             .expect("Child should start OK");
@@ -217,12 +213,11 @@ impl AbandonedChildResolvesPostCancelParent {
             .start_child_workflow(
                 AbandonedChildResolvesPostCancelChild::run,
                 (),
-                ChildWorkflowOptions {
-                    workflow_id: "abandoned-child-resolve-post-cancel".to_owned(),
-                    parent_close_policy: ParentClosePolicy::Abandon,
-                    cancel_type: ChildWorkflowCancellationType::Abandon,
-                    ..Default::default()
-                },
+                ChildWorkflowOptions::builder()
+                    .workflow_id("abandoned-child-resolve-post-cancel".to_owned())
+                    .parent_close_policy(ParentClosePolicy::Abandon)
+                    .cancel_type(ChildWorkflowCancellationType::Abandon)
+                    .build(),
             )
             .await
             .expect("Child should start OK");
@@ -323,11 +318,10 @@ impl CancelledChildGetsReasonParent {
             .start_child_workflow(
                 CancelledChildGetsReasonChild::run,
                 (),
-                ChildWorkflowOptions {
-                    workflow_id: format!("{}-child", ctx.task_queue()),
-                    cancel_type: ChildWorkflowCancellationType::WaitCancellationRequested,
-                    ..Default::default()
-                },
+                ChildWorkflowOptions::builder()
+                    .workflow_id(format!("{}-child", ctx.task_queue()))
+                    .cancel_type(ChildWorkflowCancellationType::WaitCancellationRequested)
+                    .build(),
             )
             .await
             .expect("Child should start OK");
@@ -390,10 +384,7 @@ impl SignalChildWorkflowWf {
             .start_child_workflow(
                 UnusedChildWf::run,
                 (),
-                ChildWorkflowOptions {
-                    workflow_id: "child-id-1".to_string(),
-                    ..Default::default()
-                },
+                ChildWorkflowOptions::workflow_id("child-id-1".to_string()),
             )
             .await
             .expect("Child should get started");
@@ -475,11 +466,10 @@ impl ParentCancelsChildWf {
             .start_child_workflow(
                 UntypedWorkflow::new("child"),
                 RawValue::new(vec![]),
-                ChildWorkflowOptions {
-                    workflow_id: "child-id-1".to_string(),
-                    cancel_type: ChildWorkflowCancellationType::WaitCancellationCompleted,
-                    ..Default::default()
-                },
+                ChildWorkflowOptions::builder()
+                    .workflow_id("child-id-1".to_string())
+                    .cancel_type(ChildWorkflowCancellationType::WaitCancellationCompleted)
+                    .build(),
             )
             .await
             .expect("Child should get started");
@@ -519,11 +509,10 @@ impl RuntimeParentCancelsChildWf {
             .start_child_workflow(
                 GrandchildCancelled::run,
                 (),
-                ChildWorkflowOptions {
-                    workflow_id: format!("{}-runtime-cancelled-child", ctx.task_queue()),
-                    cancel_type: ChildWorkflowCancellationType::WaitCancellationCompleted,
-                    ..Default::default()
-                },
+                ChildWorkflowOptions::builder()
+                    .workflow_id(format!("{}-runtime-cancelled-child", ctx.task_queue()))
+                    .cancel_type(ChildWorkflowCancellationType::WaitCancellationCompleted)
+                    .build(),
             )
             .await
             .expect("child should start");
@@ -592,11 +581,10 @@ impl PropagatesChildCancellationWf {
             .start_child_workflow(
                 GrandchildCancelled::run,
                 (),
-                ChildWorkflowOptions {
-                    workflow_id: format!("{}-grandchild", ctx.task_queue()),
-                    cancel_type: ChildWorkflowCancellationType::WaitCancellationCompleted,
-                    ..Default::default()
-                },
+                ChildWorkflowOptions::builder()
+                    .workflow_id(format!("{}-grandchild", ctx.task_queue()))
+                    .cancel_type(ChildWorkflowCancellationType::WaitCancellationCompleted)
+                    .build(),
             )
             .await
             .expect("grandchild should start");
@@ -619,10 +607,7 @@ impl GrandchildCancellationWf {
             .start_child_workflow(
                 PropagatesChildCancellationWf::run,
                 (),
-                ChildWorkflowOptions {
-                    workflow_id: child_workflow_id.clone(),
-                    ..Default::default()
-                },
+                ChildWorkflowOptions::workflow_id(child_workflow_id.clone()),
             )
             .await?;
         let err = started.result().await.expect_err("child should fail");
@@ -812,12 +797,11 @@ impl PassChildWorkflowSummaryToMetadata {
         ctx.start_child_workflow(
             UntypedWorkflow::new("child"),
             RawValue::new(vec![]),
-            ChildWorkflowOptions {
-                workflow_id: child_wf_id,
-                static_summary: Some("child summary".to_string()),
-                static_details: Some("child details".to_string()),
-                ..Default::default()
-            },
+            ChildWorkflowOptions::builder()
+                .workflow_id(child_wf_id)
+                .static_summary("child summary".to_string())
+                .static_details("child details".to_string())
+                .build(),
         )
         .await?;
         Ok(())
@@ -917,10 +901,7 @@ impl ParentWf {
             .start_child_workflow(
                 UntypedWorkflow::new("child"),
                 RawValue::new(vec![]),
-                ChildWorkflowOptions {
-                    workflow_id: "child-id-1".to_string(),
-                    ..Default::default()
-                },
+                ChildWorkflowOptions::workflow_id("child-id-1".to_string()),
             )
             .await;
         if let Expectation::StartFailure = expectation {
@@ -1035,10 +1016,7 @@ impl CancelBeforeSendWf {
         let start = ctx.start_child_workflow(
             UntypedWorkflow::new("child"),
             RawValue::new(vec![]),
-            ChildWorkflowOptions {
-                workflow_id: workflow_id.to_string(),
-                ..Default::default()
-            },
+            ChildWorkflowOptions::workflow_id(workflow_id.to_string()),
         );
         start.cancel();
         match start.await {
@@ -1134,11 +1112,10 @@ impl CancelChildBeforeStartedCannedWf {
         let start = ctx.start_child_workflow(
             UntypedWorkflow::new("child"),
             RawValue::new(vec![]),
-            ChildWorkflowOptions {
-                workflow_id: "child-id-1".to_string(),
-                cancel_type: ChildWorkflowCancellationType::WaitCancellationCompleted,
-                ..Default::default()
-            },
+            ChildWorkflowOptions::builder()
+                .workflow_id("child-id-1".to_string())
+                .cancel_type(ChildWorkflowCancellationType::WaitCancellationCompleted)
+                .build(),
         );
         ctx.cancelled().await;
         start.cancel();
@@ -1183,11 +1160,10 @@ impl CancelChildBeforeStartedParent {
         let started = ctx.start_child_workflow(
             AbandonedChildBugReproChild::run,
             (),
-            ChildWorkflowOptions {
-                workflow_id: "cancel-before-started-child".to_owned(),
-                cancel_type: ChildWorkflowCancellationType::WaitCancellationCompleted,
-                ..Default::default()
-            },
+            ChildWorkflowOptions::builder()
+                .workflow_id("cancel-before-started-child".to_owned())
+                .cancel_type(ChildWorkflowCancellationType::WaitCancellationCompleted)
+                .build(),
         );
 
         ctx.state(|wf| wf.barr.notify_one());
@@ -1279,10 +1255,7 @@ impl UntypedHappyParent {
             .start_child_workflow(
                 UntypedWorkflow::new(CHILD_WF_TYPE),
                 RawValue::new(vec![]),
-                ChildWorkflowOptions {
-                    workflow_id: "untyped-child-1".to_owned(),
-                    ..Default::default()
-                },
+                ChildWorkflowOptions::workflow_id("untyped-child-1".to_owned()),
             )
             .await?;
         started.result().await?;
@@ -1373,10 +1346,7 @@ impl ChildStartSerializationFailParent {
             .start_child_workflow(
                 UnserializableStartInputChild::run,
                 AlwaysFailsSerialize,
-                ChildWorkflowOptions {
-                    workflow_id: "unserializable-child".to_owned(),
-                    ..Default::default()
-                },
+                ChildWorkflowOptions::workflow_id("unserializable-child".to_owned()),
             )
             .await;
         assert_matches!(result, Err(ChildWorkflowStartError::Serialization(_)));
@@ -1421,10 +1391,7 @@ impl ChildSignalSerializationFailParent {
             .start_child_workflow(
                 UnserializableSignalChild::run,
                 (),
-                ChildWorkflowOptions {
-                    workflow_id: "signal-ser-fail-child".to_owned(),
-                    ..Default::default()
-                },
+                ChildWorkflowOptions::workflow_id("signal-ser-fail-child".to_owned()),
             )
             .await?;
 
@@ -1489,10 +1456,7 @@ impl UnitChildParentWf {
             .start_child_workflow(
                 UnitChildWf::run,
                 (),
-                ChildWorkflowOptions {
-                    workflow_id: "child-id-1".to_string(),
-                    ..Default::default()
-                },
+                ChildWorkflowOptions::workflow_id("child-id-1".to_string()),
             )
             .await?;
         started.result().await?;
@@ -1525,11 +1489,10 @@ impl CancelResultFutureParent {
             .start_child_workflow(
                 CancelledChildGetsReasonChild::run,
                 (),
-                ChildWorkflowOptions {
-                    workflow_id: format!("{}-child", ctx.task_queue()),
-                    cancel_type: ChildWorkflowCancellationType::WaitCancellationCompleted,
-                    ..Default::default()
-                },
+                ChildWorkflowOptions::builder()
+                    .workflow_id(format!("{}-child", ctx.task_queue()))
+                    .cancel_type(ChildWorkflowCancellationType::WaitCancellationCompleted)
+                    .build(),
             )
             .await?;
 
@@ -1608,11 +1571,10 @@ impl CancelExternalThenChildParent {
             .start_child_workflow(
                 CancelledChildGetsReasonChild::run,
                 (),
-                ChildWorkflowOptions {
-                    workflow_id: format!("{}-child", ctx.task_queue()),
-                    cancel_type: ChildWorkflowCancellationType::WaitCancellationRequested,
-                    ..Default::default()
-                },
+                ChildWorkflowOptions::builder()
+                    .workflow_id(format!("{}-child", ctx.task_queue()))
+                    .cancel_type(ChildWorkflowCancellationType::WaitCancellationRequested)
+                    .build(),
             )
             .await
             .expect("Child should start OK");

@@ -1,0 +1,34 @@
+name: 'Setup Rust + mise'
+description: 'Common setup: checkout, Rust toolchain, mise tools, PROTOC env, Rust cache'
+
+inputs:
+  mise-install-args:
+    description: 'Tools to install (e.g. "protoc" or "protoc github:temporalio/cli"). Empty installs all.'
+    required: false
+    default: ''
+  rust-cache-key:
+    description: 'Extra key segment for Swatinem/rust-cache'
+    required: false
+    default: ''
+  save-cache:
+    description: 'Expression controlling when to save the Rust cache'
+    required: false
+    default: ${{ github.ref == 'refs/heads/main' }}
+
+runs:
+  using: composite
+  steps:
+    - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+    - name: Run mise install
+      uses: jdx/mise-action@e6a8b3978addb5a52f2b4cd9d91eafa7f0ab959d # v4.2.0
+      with:
+        version: 2026.7.1
+        install_args: ${{ inputs.mise-install-args }}
+    - name: Set PROTOC
+      shell: bash
+      run: printf 'PROTOC=%s\n' "$(mise which protoc)" >> "$GITHUB_ENV"
+    - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      with:
+        cache-bin: false
+        save-if: ${{ inputs.save-cache }}
+        key: ${{ inputs.rust-cache-key }}

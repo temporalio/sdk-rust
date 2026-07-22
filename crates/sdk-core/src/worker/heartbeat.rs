@@ -7,7 +7,14 @@ use crate::{
 };
 use parking_lot::RwLock;
 use prost::Message;
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Duration,
+};
 use temporalio_client::worker::{SharedNamespaceWorkerTrait, WorkerCallbacks};
 use temporalio_common::{
     protos::{
@@ -39,6 +46,7 @@ pub(crate) struct SharedNamespaceWorker {
     callbacks_map: Arc<RwLock<HashMap<Uuid, WorkerCallbacks>>>,
     namespace: String,
     cancel: CancellationToken,
+    worker_control_task_queue_enabled: Arc<AtomicBool>,
 }
 
 impl SharedNamespaceWorker {
@@ -51,12 +59,14 @@ impl SharedNamespaceWorker {
         let reset_notify = Arc::new(Notify::new());
         let cancel = CancellationToken::new();
         let callbacks_map = Arc::new(RwLock::new(HashMap::<Uuid, WorkerCallbacks>::new()));
+        let worker_control_task_queue_enabled = Arc::new(AtomicBool::new(false));
 
         tokio::spawn({
             let client = client.clone();
             let namespace = namespace.clone();
             let callbacks_map = callbacks_map.clone();
             let cancel = cancel.clone();
+            let worker_control_task_queue_enabled = worker_control_task_queue_enabled.clone();
             async move {
                 let worker_commands_supported = match client.describe_namespace().await {
                     Ok(namespace_resp) => {
@@ -153,9 +163,12 @@ impl SharedNamespaceWorker {
                         true,
                     ) {
                         Ok(worker) => {
+                            worker_control_task_queue_enabled.store(true, Ordering::Relaxed);
                             tokio::spawn({
                                 let cm = callbacks_map.clone();
                                 let cancel = cancel.clone();
+                                let worker_control_task_queue_enabled =
+                                    worker_control_task_queue_enabled.clone();
                                 async move {
                                     loop {
                                         tokio::select! {
@@ -167,6 +180,8 @@ impl SharedNamespaceWorker {
                                             _ = cancel.cancelled() => break,
                                         }
                                     }
+                                    worker_control_task_queue_enabled
+                                        .store(false, Ordering::Relaxed);
                                     worker.shutdown().await;
                                 }
                             });
@@ -198,6 +213,7 @@ impl SharedNamespaceWorker {
             callbacks_map,
             namespace,
             cancel,
+            worker_control_task_queue_enabled,
         })
     }
 }
@@ -224,6 +240,11 @@ impl SharedNamespaceWorkerTrait for SharedNamespaceWorker {
 
     fn num_workers(&self) -> usize {
         self.callbacks_map.read().len()
+    }
+
+    fn worker_control_task_queue_enabled(&self) -> bool {
+        self.worker_control_task_queue_enabled
+            .load(Ordering::Relaxed)
     }
 }
 
@@ -323,6 +344,7 @@ async fn handle_worker_command_task(
 #[cfg(test)]
 mod tests {
     use crate::{
+        WorkerClient,
         test_help::{WorkerExt, test_worker_cfg},
         worker,
         worker::{PollerBehavior, client::mocks::mock_worker_client},
@@ -468,6 +490,12 @@ mod tests {
             .await
             .expect("worker heartbeat was not recorded in time")
             .expect("heartbeat sender was dropped");
+        assert!(
+            !shared_worker
+                .worker_control_task_queue_enabled
+                .load(Ordering::Relaxed),
+            "control task queue must stay disabled without the worker_commands capability"
+        );
         shared_worker.cancel.cancel();
 
         assert!(
@@ -571,7 +599,7 @@ mod tests {
             .max_outstanding_activities(1_usize)
             .build()
             .unwrap();
-        config.namespace = namespace;
+        config.namespace = namespace.clone();
         config.task_types = WorkerTaskTypes::activity_only();
 
         let client = Arc::new(mock);
@@ -588,7 +616,19 @@ mod tests {
             .await
             .expect("nexus task was not completed in time")
             .expect("completion sender was dropped");
-        worker.drain_activity_poller_and_shutdown().await;
+        assert!(
+            client
+                .workers()
+                .worker_control_task_queue_enabled(&namespace),
+            "control task queue must be enabled while the command worker is polling"
+        );
+        worker.drain_pollers_and_shutdown().await;
+        assert!(
+            !client
+                .workers()
+                .worker_control_task_queue_enabled(&namespace),
+            "control task queue must be disabled after the command worker shuts down"
+        );
 
         let start_op = match response.variant {
             Some(response::Variant::StartOperation(s)) => s,

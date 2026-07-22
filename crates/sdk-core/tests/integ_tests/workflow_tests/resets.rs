@@ -1,8 +1,8 @@
 use crate::common::{CoreWfStarter, NAMESPACE, activity_functions::StdActivities};
 use std::{
     sync::{
-        Arc,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        Arc, OnceLock,
+        atomic::{AtomicBool, Ordering},
     },
     time::Duration,
 };
@@ -116,8 +116,9 @@ async fn reset_workflow() {
 #[workflow]
 struct ResetRandomseedWf {
     did_fail: Arc<AtomicBool>,
-    rand_seed: Arc<AtomicU64>,
-    saw_updated_seed: Arc<AtomicBool>,
+    initial_random: Arc<OnceLock<u128>>,
+    reset_started: Arc<AtomicBool>,
+    saw_updated_random: Arc<AtomicBool>,
     notify: Arc<Notify>,
     post_fail_received: bool,
     post_reset_received: bool,
@@ -127,14 +128,12 @@ struct ResetRandomseedWf {
 impl ResetRandomseedWf {
     #[run(name = "reset_randomseed")]
     async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<()> {
-        let _ = ctx.state(|wf| {
-            wf.rand_seed.compare_exchange(
-                0,
-                ctx.random_seed(),
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            )
-        });
+        if ctx.state(|wf| !wf.reset_started.load(Ordering::Relaxed)) {
+            let initial_random = ctx.random::<u128>();
+            ctx.state(|wf| {
+                let _ = wf.initial_random.set(initial_random);
+            });
+        }
         ctx.timer(Duration::from_millis(100)).await;
         ctx.timer(Duration::from_millis(100)).await;
         if ctx
@@ -147,18 +146,29 @@ impl ResetRandomseedWf {
             ctx.state(|wf| wf.notify.notify_one());
             panic!("Ahh");
         }
-        if ctx.state(|wf| wf.rand_seed.load(Ordering::Relaxed)) == ctx.random_seed() {
-            ctx.timer(Duration::from_millis(100)).await;
-        } else {
-            ctx.state(|wf| {
-                wf.saw_updated_seed.store(true, Ordering::Relaxed);
+        if ctx.state(|wf| wf.reset_started.load(Ordering::Relaxed)) {
+            // Skip the reset run's initial draw so a missing reseed repeats the original stream.
+            let initial_random = ctx.state(|wf| {
+                *wf.initial_random
+                    .get()
+                    .expect("initial random value should be recorded")
             });
-            ctx.start_local_activity(
+            assert_ne!(
+                ctx.random::<u128>(),
+                initial_random,
+                "random stream should be reseeded after reset"
+            );
+            ctx.state(|wf| {
+                wf.saw_updated_random.store(true, Ordering::Relaxed);
+            });
+            ctx.execute_local_activity(
                 StdActivities::echo,
                 "hi!".to_string(),
                 LocalActivityOptions::default(),
             )
             .await?;
+        } else {
+            ctx.timer(Duration::from_millis(100)).await;
         }
         ctx.wait_condition(|s| s.post_fail_received).await;
         ctx.state(|wf| wf.notify.notify_one());
@@ -191,16 +201,19 @@ async fn reset_randomseed() {
     worker.fetch_results = false;
 
     let did_fail = Arc::new(AtomicBool::new(false));
-    let rand_seed = Arc::new(AtomicU64::new(0));
-    let saw_updated_seed = Arc::new(AtomicBool::new(false));
+    let initial_random = Arc::new(OnceLock::new());
+    let reset_started = Arc::new(AtomicBool::new(false));
+    let saw_updated_random = Arc::new(AtomicBool::new(false));
     let notify = Arc::new(Notify::new());
     let notify_clone = notify.clone();
-    let saw_updated_seed_for_wf = saw_updated_seed.clone();
+    let reset_started_for_wf = reset_started.clone();
+    let saw_updated_random_for_wf = saw_updated_random.clone();
     worker
         .register_workflow_with_factory(move || ResetRandomseedWf {
             did_fail: did_fail.clone(),
-            rand_seed: rand_seed.clone(),
-            saw_updated_seed: saw_updated_seed_for_wf.clone(),
+            initial_random: initial_random.clone(),
+            reset_started: reset_started_for_wf.clone(),
+            saw_updated_random: saw_updated_random_for_wf.clone(),
             notify: notify_clone.clone(),
             post_fail_received: false,
             post_reset_received: false,
@@ -232,6 +245,7 @@ async fn reset_randomseed() {
             .unwrap();
         notify.notified().await;
         // Reset the workflow to be after first timer has fired
+        reset_started.store(true, Ordering::Relaxed);
         client
             .reset_workflow_execution(
                 ResetWorkflowExecutionRequest {
@@ -267,8 +281,8 @@ async fn reset_randomseed() {
         assert_matches!(result, Err(WorkflowGetResultError::Terminated { .. }));
         reset_handle.get_result(Default::default()).await.unwrap();
         assert!(
-            saw_updated_seed.load(Ordering::Relaxed),
-            "workflow should observe the server-supplied updated random seed after reset"
+            saw_updated_random.load(Ordering::Relaxed),
+            "workflow should observe a new random stream after reset"
         );
         starter.shutdown().await;
     };

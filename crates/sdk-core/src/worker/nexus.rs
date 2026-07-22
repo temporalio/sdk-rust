@@ -18,6 +18,8 @@ use std::{
     },
     time::{Duration, Instant, SystemTime},
 };
+use temporalio_client::payload_limit_violation_from;
+use temporalio_common::payload_limits::PayloadLimitViolation;
 use temporalio_common::protos::{
     TaskToken,
     coresdk::{
@@ -28,6 +30,7 @@ use temporalio_common::protos::{
         },
     },
     temporal::api::{
+        enums::v1::NexusHandlerErrorRetryBehavior,
         failure::v1::failure::FailureInfo,
         nexus::{
             self,
@@ -219,7 +222,23 @@ impl NexusManager {
                             });
                         }
                     }
-                    (true, client.complete_nexus_task(tt, c).await.err())
+                    let net_err = match client.complete_nexus_task(tt.clone(), c).await {
+                        Ok(_) => None,
+                        Err(e) => {
+                            if let Some(violation) = payload_limit_violation_from(&e) {
+                                client
+                                    .fail_nexus_task(
+                                        tt,
+                                        payloads_too_large_nexus_failure(violation),
+                                    )
+                                    .await
+                                    .err()
+                            } else {
+                                Some(e)
+                            }
+                        }
+                    };
+                    (true, net_err)
                 }
 
                 nexus_task_completion::Status::AckCancel(_) => {
@@ -534,6 +553,17 @@ enum TaskStreamInput {
     SourceComplete,
 }
 
+fn payloads_too_large_nexus_failure(violation: &PayloadLimitViolation) -> NexusTaskFailure {
+    NexusTaskFailure::Legacy(nexus::v1::HandlerError {
+        error_type: crate::worker::PAYLOADS_TOO_LARGE_FAILURE_TYPE.to_string(),
+        failure: Some(nexus::v1::Failure {
+            message: violation.to_string(),
+            ..Default::default()
+        }),
+        retry_behavior: NexusHandlerErrorRetryBehavior::Retryable as i32,
+    })
+}
+
 fn parse_request_timeout(timeout: &str) -> Result<Duration, anyhow::Error> {
     let timeout = timeout.trim();
     let (value, unit) = timeout.split_at(
@@ -562,6 +592,7 @@ fn parse_request_timeout(timeout: &str) -> Result<Duration, anyhow::Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use temporalio_common::payload_limits::{LimitClass, LimitSeverity};
 
     #[tokio::test]
     async fn test_parse_request_timeout() {
@@ -580,6 +611,29 @@ mod tests {
         assert_eq!(
             parse_request_timeout("9.155416ms").unwrap(),
             Duration::from_secs_f64(9.155416 / 1000.0)
+        );
+    }
+
+    #[test]
+    fn payloads_too_large_nexus_failure_is_retryable() {
+        let violation = PayloadLimitViolation {
+            path: "payload".to_string(),
+            class: LimitClass::Blob,
+            severity: LimitSeverity::Error,
+            size: 1024,
+            limit: 10,
+        };
+        let NexusTaskFailure::Legacy(handler_err) = payloads_too_large_nexus_failure(&violation)
+        else {
+            panic!("expected a legacy handler error");
+        };
+        assert_eq!(
+            handler_err.error_type,
+            crate::worker::PAYLOADS_TOO_LARGE_FAILURE_TYPE
+        );
+        assert_eq!(
+            handler_err.retry_behavior,
+            NexusHandlerErrorRetryBehavior::Retryable as i32
         );
     }
 }

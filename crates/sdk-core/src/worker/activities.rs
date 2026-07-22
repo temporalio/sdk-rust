@@ -36,16 +36,21 @@ use std::{
     },
     time::{Duration, Instant, SystemTime},
 };
-use temporalio_client::worker::CancelActivityCallback;
-use temporalio_common::protos::{
-    coresdk::{
-        ActivityHeartbeat, ActivitySlotInfo,
-        activity_result::{self as ar, activity_execution_result as aer},
-        activity_task::{ActivityCancelReason, ActivityCancellationDetails, ActivityTask},
-    },
-    temporal::api::{
-        failure::v1::{ApplicationFailureInfo, CanceledFailureInfo, Failure, failure::FailureInfo},
-        workflowservice::v1::PollActivityTaskQueueResponse,
+use temporalio_client::{payload_limit_violation_from, worker::CancelActivityCallback};
+use temporalio_common::{
+    payload_limits::PayloadLimitViolation,
+    protos::{
+        coresdk::{
+            ActivityHeartbeat, ActivitySlotInfo,
+            activity_result::{self as ar, activity_execution_result as aer},
+            activity_task::{ActivityCancelReason, ActivityCancellationDetails, ActivityTask},
+        },
+        temporal::api::{
+            failure::v1::{
+                ApplicationFailureInfo, CanceledFailureInfo, Failure, failure::FailureInfo,
+            },
+            workflowservice::v1::PollActivityTaskQueueResponse,
+        },
     },
 };
 use tokio::{
@@ -357,17 +362,36 @@ impl WorkerActivityTasks {
                 let maybe_net_err = match status {
                     aer::Status::WillCompleteAsync(_) => None,
                     aer::Status::Completed(ar::Success { result }) => {
-                        if let Some(sched_time) = act_info
-                            .base
-                            .scheduled_time
-                            .and_then(|st| st.elapsed().ok())
-                        {
-                            act_metrics.act_execution_succeeded(sched_time);
-                        }
-                        client
+                        // If the gRPC layer rejects an oversized result, report the activity task as failed.
+                        match client
                             .complete_activity_task(task_token.clone(), result.map(Into::into))
                             .await
-                            .err()
+                        {
+                            Ok(_) => {
+                                if let Some(sched_time) = act_info
+                                    .base
+                                    .scheduled_time
+                                    .and_then(|st| st.elapsed().ok())
+                                {
+                                    act_metrics.act_execution_succeeded(sched_time);
+                                }
+                                None
+                            }
+                            Err(e) => {
+                                if let Some(violation) = payload_limit_violation_from(&e) {
+                                    act_metrics.act_execution_failed();
+                                    client
+                                        .fail_activity_task(
+                                            task_token.clone(),
+                                            Some(make_payloads_too_large_failure(violation)),
+                                        )
+                                        .await
+                                        .err()
+                                } else {
+                                    Some(e)
+                                }
+                            }
+                        }
                     }
                     aer::Status::Failed(ar::Failure { failure }) => {
                         if should_record_failure_metric(&failure) {
@@ -409,10 +433,26 @@ impl WorkerActivityTasks {
                                     "Expected activity cancelled status with CanceledFailureInfo");
                                 None
                             };
-                            client
+                            match client
                                 .cancel_activity_task(task_token.clone(), details)
                                 .await
-                                .err()
+                            {
+                                Ok(_) => None,
+                                Err(e) => {
+                                    if let Some(violation) = payload_limit_violation_from(&e) {
+                                        act_metrics.act_execution_failed();
+                                        client
+                                            .fail_activity_task(
+                                                task_token.clone(),
+                                                Some(make_payloads_too_large_failure(violation)),
+                                            )
+                                            .await
+                                            .err()
+                                    } else {
+                                        Some(e)
+                                    }
+                                }
+                            }
                         }
                     }
                 };
@@ -749,6 +789,23 @@ fn worker_shutdown_failure() -> Failure {
                 ..Default::default()
             },
         )),
+    }
+}
+
+/// The failure is deliberately retryable: catching the violation client-side exists precisely to
+/// turn what the server would hard-fail into a recoverable activity task failure, so fixing and
+/// redeploying the activity lets the next attempt succeed.
+pub(super) fn make_payloads_too_large_failure(violation: &PayloadLimitViolation) -> Failure {
+    Failure {
+        message: violation.to_string(),
+        failure_info: Some(FailureInfo::ApplicationFailureInfo(
+            ApplicationFailureInfo {
+                r#type: crate::worker::PAYLOADS_TOO_LARGE_FAILURE_TYPE.to_string(),
+                non_retryable: false,
+                ..Default::default()
+            },
+        )),
+        ..Default::default()
     }
 }
 

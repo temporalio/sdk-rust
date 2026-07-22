@@ -65,7 +65,7 @@ impl GreetingWorkflow {
         let name = ctx.state(|s| s.name.clone());
 
         // Execute an activity
-        let greeting = ctx.start_activity(
+        let greeting = ctx.execute_activity(
             MyActivities::greet,
             name,
             ActivityOptions::start_to_close_timeout(Duration::from_secs(10))
@@ -238,10 +238,7 @@ let started = ctx
     .start_child_workflow(
         MyChildWorkflow::run,
         "input",
-        ChildWorkflowOptions {
-            workflow_id: "child-1".to_string(),
-            ..Default::default()
-        },
+        ChildWorkflowOptions::workflow_id("child-1".to_string()),
     )
     .await?;
 let result = started.result().await?;
@@ -300,7 +297,7 @@ Activities return `Result<T, ActivityError>` with the following error types:
 For short-lived activities that you want to run on the same worker as the workflow:
 
 ```rust
-ctx.start_local_activity(
+ctx.execute_local_activity(
     MyActivities::quick_operation,
     input,
     LocalActivityOptions {

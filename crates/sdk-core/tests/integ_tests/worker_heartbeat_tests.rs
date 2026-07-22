@@ -201,7 +201,7 @@ async fn docker_worker_heartbeat_basic(#[values("otel", "prom", "no_metrics")] b
         #[allow(dead_code)]
         async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<()> {
             let _ = ctx
-                .start_activity(
+                .execute_activity(
                     NotifyActivities::pass_fail_act,
                     "pass".to_string(),
                     ActivityOptions::start_to_close_timeout(Duration::from_secs(5)),
@@ -376,7 +376,7 @@ async fn docker_worker_heartbeat_tuner() {
         #[allow(dead_code)]
         async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<()> {
             let _ = ctx
-                .start_activity(
+                .execute_activity(
                     StdActivities::echo,
                     "pass".to_string(),
                     ActivityOptions::start_to_close_timeout(Duration::from_secs(1)),
@@ -662,7 +662,7 @@ async fn worker_heartbeat_sticky_cache_miss() {
         #[allow(dead_code)]
         async fn run(ctx: &mut WorkflowContext<Self>, wf_marker: String) -> WorkflowResult<()> {
             let _ = ctx
-                .start_activity(
+                .execute_activity(
                     StickyCacheActivities::sticky_cache_history_act,
                     wf_marker.clone(),
                     ActivityOptions::start_to_close_timeout(Duration::from_secs(5)),
@@ -903,7 +903,7 @@ async fn worker_heartbeat_failure_metrics() {
         #[run]
         async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<()> {
             let _ = ctx
-                .start_activity(
+                .execute_activity(
                     FailingActivities::failing_act,
                     "boom".to_string(),
                     ActivityOptions::with_start_to_close_timeout(Duration::from_secs(5))
@@ -1045,7 +1045,7 @@ async fn worker_heartbeat_no_runtime_heartbeat() {
         #[allow(dead_code)]
         async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<()> {
             let _ = ctx
-                .start_activity(
+                .execute_activity(
                     StdActivities::echo,
                     "pass".to_string(),
                     ActivityOptions::start_to_close_timeout(Duration::from_secs(1)),
@@ -1116,7 +1116,7 @@ async fn worker_heartbeat_skip_client_worker_set_check() {
         #[allow(dead_code)]
         async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<()> {
             let _ = ctx
-                .start_activity(
+                .execute_activity(
                     StdActivities::echo,
                     "pass".to_string(),
                     ActivityOptions::start_to_close_timeout(Duration::from_secs(1)),

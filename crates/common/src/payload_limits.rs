@@ -14,13 +14,9 @@
 use crate::protos::temporal::api::common::v1::{Memo, Payload, Payloads};
 use prost::Message;
 
-/// Default warning threshold for blob (payload) sizes: 512 KiB.
-pub const DEFAULT_BLOB_SIZE_WARN: usize = 512 * 1024;
-/// Default warning threshold for memo sizes: 2 KiB.
-pub const DEFAULT_MEMO_SIZE_WARN: usize = 2 * 1024;
-
 /// Which server-enforced size limit a payload field is subject to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[doc(hidden)]
 pub enum LimitClass {
     /// Subject to the blob (payload) size limit.
     Blob,
@@ -30,7 +26,7 @@ pub enum LimitClass {
 
 /// How a nested field is addressed within its parent.
 #[derive(Debug, Clone, Copy)]
-pub enum FieldIndexer<'a> {
+pub(crate) enum FieldIndexer<'a> {
     /// A singular field.
     None,
     /// The `n`-th element of a repeated field.
@@ -72,7 +68,7 @@ impl PayloadPath {
 ///
 /// The generated traversal calls `enter`/`exit` around each nested message so the sink can track a
 /// field's location for `check`.
-pub trait PayloadLimitSink {
+pub(crate) trait PayloadLimitSink {
     /// Called for each validated payload field. `field_name` is the leaf field's proto name; `size`
     /// is the field's size in bytes for the given [`LimitClass`]. When `enforce_error` is `false`,
     /// the field may warn but must not produce an error-level violation.
@@ -93,35 +89,37 @@ pub trait PayloadLimitSink {
 
 /// Implemented via codegen for every outbound request message that transitively contains validated
 /// payload fields.
-pub trait PayloadLimitsValidatable {
+pub(crate) trait PayloadLimitsValidatable {
     /// Reports each validated payload field's size and class to `sink`.
     fn validate_payload_limits(&self, sink: &mut dyn PayloadLimitSink);
 }
 
 /// Serialized size of a [`Payloads`] message, as the server measures it.
-pub fn payloads_size(payloads: &Payloads) -> usize {
+pub(crate) fn payloads_size(payloads: &Payloads) -> usize {
     payloads.encoded_len()
 }
 
 /// Serialized size of a single [`Payload`], as the server measures it.
-pub fn payload_size(payload: &Payload) -> usize {
+pub(crate) fn payload_size(payload: &Payload) -> usize {
     payload.encoded_len()
 }
 
 /// Serialized size of a [`Memo`] message, as the server measures it.
-pub fn memo_size(memo: &Memo) -> usize {
+pub(crate) fn memo_size(memo: &Memo) -> usize {
     memo.encoded_len()
 }
 
 /// Serialized size of an arbitrary proto message, as the server measures it. Used for messages the
 /// server checks as a whole rather than per-payload-field (e.g. `Failure`).
-pub fn message_size<M: Message>(message: &M) -> usize {
+pub(crate) fn message_size<M: Message>(message: &M) -> usize {
     message.encoded_len()
 }
 
 /// Aggregate size of a marker-style `map<string, Payloads>`, mirroring the server's
 /// `sum(len(key) + payloads.Size())` accounting (e.g. `RecordMarkerCommandAttributes.details`).
-pub fn map_payloads_sum<'a, K>(entries: impl IntoIterator<Item = (&'a K, &'a Payloads)>) -> usize
+pub(crate) fn map_payloads_sum<'a, K>(
+    entries: impl IntoIterator<Item = (&'a K, &'a Payloads)>,
+) -> usize
 where
     K: AsRef<str> + 'a,
 {
@@ -134,7 +132,9 @@ where
 /// Aggregate size of a search-attribute-style `map<string, Payload>`, mirroring the server's
 /// `sum(len(key) + len(payload.data))` accounting — note the server counts the **raw data** length
 /// here, not the serialized payload size (e.g. `UpsertWorkflowSearchAttributes.indexed_fields`).
-pub fn map_payload_data_sum<'a, K>(entries: impl IntoIterator<Item = (&'a K, &'a Payload)>) -> usize
+pub(crate) fn map_payload_data_sum<'a, K>(
+    entries: impl IntoIterator<Item = (&'a K, &'a Payload)>,
+) -> usize
 where
     K: AsRef<str> + 'a,
 {
@@ -144,39 +144,24 @@ where
         .sum()
 }
 
-/// Warn/error thresholds for both limit classes. An error threshold of `None` disables error
-/// enforcement for that class (warnings only).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Warn/error thresholds (bytes) for both limit classes. A `0` threshold disables that check for
+/// that class: `0` warn = no warnings, `0` error = no error enforcement (warnings only).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[doc(hidden)]
 pub struct PayloadLimits {
-    /// Blob warning threshold (bytes).
+    /// Blob warning threshold (bytes); `0` disables blob warnings.
     pub blob_warn: usize,
-    /// Blob error threshold (bytes), or `None` to warn only.
-    pub blob_error: Option<usize>,
-    /// Memo warning threshold (bytes).
+    /// Blob error threshold (bytes); `0` disables blob error enforcement.
+    pub blob_error: usize,
+    /// Memo warning threshold (bytes); `0` disables memo warnings.
     pub memo_warn: usize,
-    /// Memo error threshold (bytes), or `None` to warn only.
-    pub memo_error: Option<usize>,
-}
-
-impl Default for PayloadLimits {
-    fn default() -> Self {
-        Self {
-            blob_warn: DEFAULT_BLOB_SIZE_WARN,
-            blob_error: None,
-            memo_warn: DEFAULT_MEMO_SIZE_WARN,
-            memo_error: None,
-        }
-    }
+    /// Memo error threshold (bytes); `0` disables memo error enforcement.
+    pub memo_error: usize,
 }
 
 impl PayloadLimits {
-    /// The default warning thresholds with no error enforcement.
-    pub fn warn_only() -> Self {
-        Self::default()
-    }
-
-    /// Returns the `(warn, error)` thresholds for a given class.
-    fn thresholds(&self, class: LimitClass) -> (usize, Option<usize>) {
+    /// Returns the `(warn, error)` thresholds for a given class; `0` means disabled.
+    fn thresholds(&self, class: LimitClass) -> (usize, usize) {
         match class {
             LimitClass::Blob => (self.blob_warn, self.blob_error),
             LimitClass::Memo => (self.memo_warn, self.memo_error),
@@ -184,14 +169,27 @@ impl PayloadLimits {
     }
 }
 
+/// Whether a violation exceeded the warning threshold or the error threshold.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[doc(hidden)]
+pub enum LimitSeverity {
+    /// Exceeded the warning threshold.
+    Warning,
+    /// Exceeded the error threshold.
+    Error,
+}
+
 /// A payload field whose size exceeded one of its configured thresholds (warning or error).
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[doc(hidden)]
 pub struct PayloadLimitViolation {
     /// Path of proto field names from the root message
     /// (e.g. `commands[2].schedule_activity_task_command_attributes.input`).
     pub path: String,
     /// Which limit class the threshold belongs to.
     pub class: LimitClass,
+    /// Which threshold was exceeded.
+    pub severity: LimitSeverity,
     /// The field's measured size in bytes.
     pub size: usize,
     /// The threshold that was exceeded (warning threshold for warnings, error threshold for errors).
@@ -200,10 +198,17 @@ pub struct PayloadLimitViolation {
 
 impl std::fmt::Display for PayloadLimitViolation {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let limit_class = match self.class {
+            LimitClass::Blob => "payloads",
+            LimitClass::Memo => "memo",
+        };
+        let limit_kind = match self.severity {
+            LimitSeverity::Warning => "warning",
+            LimitSeverity::Error => "error",
+        };
         write!(
             f,
-            "payload field `{}` size {} bytes exceeds the {:?} limit of {} bytes",
-            self.path, self.size, self.class, self.limit
+            "[TMPRL1103] Attempted to upload {limit_class} with size that exceeded the {limit_kind} limit."
         )
     }
 }
@@ -216,18 +221,18 @@ impl std::error::Error for PayloadLimitViolation {}
 /// field over its error threshold (when `enforce_error` and an error threshold are set) is an error;
 /// otherwise a field over its warning threshold is a warning.
 #[derive(Debug, Clone, Default)]
-pub struct CollectingSink {
+struct CollectingSink {
     limits: PayloadLimits,
     path: PayloadPath,
     /// Fields that exceeded their warning threshold (but not an enforced error threshold).
-    pub warnings: Vec<PayloadLimitViolation>,
+    warnings: Vec<PayloadLimitViolation>,
     /// Fields that exceeded their enforced error threshold.
-    pub errors: Vec<PayloadLimitViolation>,
+    errors: Vec<PayloadLimitViolation>,
 }
 
 impl CollectingSink {
     /// A new collector that classifies fields against `limits`.
-    pub fn new(limits: PayloadLimits) -> Self {
+    fn new(limits: PayloadLimits) -> Self {
         Self {
             limits,
             ..Default::default()
@@ -244,20 +249,19 @@ impl PayloadLimitSink for CollectingSink {
         enforce_error: bool,
     ) {
         let (warn, error) = self.limits.thresholds(class);
-        if enforce_error
-            && let Some(error) = error
-            && size > error
-        {
+        if enforce_error && error > 0 && size > error {
             self.errors.push(PayloadLimitViolation {
                 path: self.path.leaf(field_name),
                 class,
+                severity: LimitSeverity::Error,
                 size,
                 limit: error,
             });
-        } else if size > warn {
+        } else if warn > 0 && size > warn {
             self.warnings.push(PayloadLimitViolation {
                 path: self.path.leaf(field_name),
                 class,
+                severity: LimitSeverity::Warning,
                 size,
                 limit: warn,
             });
@@ -277,7 +281,7 @@ impl PayloadLimitSink for CollectingSink {
 /// If any field exceeded its error threshold, logs the error(s) and returns the first one without
 /// logging warnings; otherwise logs each warning and returns `None`. With no error thresholds set,
 /// there are never errors, so this only warns and always returns `None`.
-pub fn validate_payload_limits<M: PayloadLimitsValidatable + ?Sized>(
+pub(crate) fn validate_payload_limits<M: PayloadLimitsValidatable + ?Sized>(
     msg: &M,
     limits: &PayloadLimits,
 ) -> Option<PayloadLimitViolation> {
@@ -286,25 +290,13 @@ pub fn validate_payload_limits<M: PayloadLimitsValidatable + ?Sized>(
 
     if !sink.errors.is_empty() {
         for error in &sink.errors {
-            error!(
-                payload_path = error.path.as_str(),
-                payload_size = error.size,
-                error_limit = error.limit,
-                ?error.class,
-                "Payload size exceeds the error limit"
-            );
+            error!(size = error.size, limit = error.limit, "{error}",);
         }
         return sink.errors.into_iter().next();
     }
 
     for warning in &sink.warnings {
-        warn!(
-            payload_path = warning.path.as_str(),
-            payload_size = warning.size,
-            warn_limit = warning.limit,
-            ?warning.class,
-            "Payload size exceeds the warning limit"
-        );
+        warn!(size = warning.size, limit = warning.limit, "{warning}",);
     }
     None
 }
@@ -392,9 +384,9 @@ mod tests {
     fn worker_limits(blob_error: usize, memo_error: usize) -> PayloadLimits {
         PayloadLimits {
             blob_warn: 10,
-            blob_error: Some(blob_error),
+            blob_error,
             memo_warn: 10,
-            memo_error: Some(memo_error),
+            memo_error,
         }
     }
 
@@ -421,9 +413,9 @@ mod tests {
         };
         let limits = PayloadLimits {
             blob_warn: 10,
-            blob_error: Some(1_000_000),
+            blob_error: 1_000_000,
             memo_warn: 10,
-            memo_error: Some(20),
+            memo_error: 20,
         };
         let violation = validate_payload_limits(&req, &limits).expect("memo should error");
         assert_eq!(violation.class, LimitClass::Memo);
@@ -451,6 +443,29 @@ mod tests {
             ..Default::default()
         };
         assert!(validate_payload_limits(&req, &worker_limits(100_000, 100_000)).is_none());
+    }
+
+    #[test]
+    fn zero_warn_threshold_disables_warnings() {
+        let req = StartWorkflowExecutionRequest {
+            input: Some(payloads(1000)),
+            ..Default::default()
+        };
+        // A nonzero warn threshold below the field size produces a (non-error) warning.
+        let mut sink = CollectingSink::new(PayloadLimits {
+            blob_warn: 100,
+            blob_error: 0,
+            memo_warn: 0,
+            memo_error: 0,
+        });
+        req.validate_payload_limits(&mut sink);
+        assert_eq!(sink.warnings.len(), 1);
+        assert!(sink.errors.is_empty());
+
+        // A `0` warn threshold disables the warning entirely.
+        let mut sink = CollectingSink::new(PayloadLimits::default());
+        req.validate_payload_limits(&mut sink);
+        assert!(sink.warnings.is_empty());
     }
 
     #[test]
@@ -544,8 +559,15 @@ mod tests {
 
     #[test]
     fn collecting_sink_no_error_limit_only_warns() {
-        let mut sink = CollectingSink::new(PayloadLimits::warn_only());
-        sink.check("big", LimitClass::Blob, DEFAULT_BLOB_SIZE_WARN + 1, true);
+        // Warn threshold set, no error threshold: an over-threshold field warns (never errors),
+        // even with enforce_error = true.
+        let mut sink = CollectingSink::new(PayloadLimits {
+            blob_warn: 100,
+            blob_error: 0,
+            memo_warn: 0,
+            memo_error: 0,
+        });
+        sink.check("big", LimitClass::Blob, 101, true);
         assert!(sink.errors.is_empty());
         assert_eq!(sink.warnings.len(), 1);
         assert_eq!(sink.warnings[0].path, "big");

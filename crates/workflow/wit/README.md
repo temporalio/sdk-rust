@@ -13,7 +13,7 @@ and completions into calls against this interface.
   (`list-workflows`, `instantiate-workflow`, and the `workflow-instance` resource with `activate`
   and `poll-routine`).
 - `host.wit` — `workflow-host`: the host capabilities the guest imports (e.g. `set-current-details`,
-  `push-command`).
+  `push-command`, and `patch-activation`).
 - `types.wit` — shared records and variants used by both sides (init/activation/completion shapes,
   routine kinds, terminal outcomes, etc.). Some fields are typed as `list<u8>` and carry encoded
   protobuf messages — those proto schemas are part of the ABI; see *Stability* below.

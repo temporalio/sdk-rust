@@ -28,7 +28,7 @@ impl LocalActivitiesWorkflow {
         name: String,
     ) -> WorkflowResult<(String, String)> {
         let remote_result = ctx
-            .start_activity(
+            .execute_activity(
                 GreetingActivities::greet,
                 name.clone(),
                 ActivityOptions::start_to_close_timeout(Duration::from_secs(10)),
@@ -36,7 +36,7 @@ impl LocalActivitiesWorkflow {
             .await?;
 
         let local_result = ctx
-            .start_local_activity(
+            .execute_local_activity(
                 GreetingActivities::greet,
                 name,
                 LocalActivityOptions {

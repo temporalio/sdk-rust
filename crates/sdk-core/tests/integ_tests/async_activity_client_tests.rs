@@ -107,7 +107,7 @@ async fn async_activity_completions(
             expected_outcome: Outcome,
         ) -> WorkflowResult<()> {
             let async_response = "agence";
-            let activity_future = ctx.start_activity(
+            let activity_future = ctx.execute_activity(
                 AsyncActivities::complete_async_activity,
                 expected_outcome,
                 ActivityOptions::with_start_to_close_timeout(Duration::from_secs(30))

@@ -26,14 +26,14 @@ impl ActivityInterceptorWorkflow {
     #[run]
     pub async fn run(ctx: &mut WorkflowContext<Self>, name: String) -> WorkflowResult<String> {
         let greet = ctx
-            .start_activity(
+            .execute_activity(
                 GreetingActivities::greet,
                 GreetingRequest { name: name.clone() },
                 ActivityOptions::start_to_close_timeout(Duration::from_secs(10)),
             )
             .await?;
         let shout = ctx
-            .start_activity(
+            .execute_activity(
                 GreetingActivities::shout,
                 GreetingRequest { name },
                 ActivityOptions::start_to_close_timeout(Duration::from_secs(10)),

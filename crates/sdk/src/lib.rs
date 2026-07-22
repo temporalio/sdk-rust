@@ -93,10 +93,10 @@ pub use temporalio_workflow::{
     CancellableFuture, ChildWorkflowCancellationType, ChildWorkflowOptions, ContinueAsNewOptions,
     ContinueAsNewVersioningBehavior, ExternalWorkflowHandle, LocalActivityOptions, Memo, MemoValue,
     MemoValues, NamespacedWorkflowInfo, NexusOperationCancellationType, NexusOperationOptions,
-    ParentClosePolicy, RetryPolicy, Signal, SignalData, StartChildWorkflowExecutionFailedCause,
-    StartedChildWorkflow, SyncWorkflowContext, TimerOptions, TimerResult, VersioningIntent,
-    WorkflowContext, WorkflowContextView, WorkflowIdReusePolicy, WorkflowResult,
-    WorkflowTermination,
+    ParentClosePolicy, PatchActivationCallback, PatchActivationInput, RetryPolicy, Signal,
+    SignalData, StartChildWorkflowExecutionFailedCause, StartedChildWorkflow, SyncWorkflowContext,
+    TimerOptions, TimerResult, VersioningIntent, WorkflowContext, WorkflowContextView,
+    WorkflowIdReusePolicy, WorkflowRandomValue, WorkflowResult, WorkflowTermination,
 };
 #[cfg(feature = "wasm-workflows")]
 pub use workflow_wasm::WasmWorkflowComponent;
@@ -261,6 +261,20 @@ pub struct WorkerOptions {
     /// channels, etc.) will have their tasks failed with a descriptive error.
     #[builder(default = true)]
     pub detect_nondeterministic_futures: bool,
+    /// If set true, the worker will not proactively fail workflow/activity tasks whose payloads
+    /// exceed the namespace error limits; oversized payloads are sent to server, which enforces the
+    /// limit. Defaults to false.
+    /// NOTE: Experimental
+    #[builder(default = false)]
+    pub disable_payload_error_limit: bool,
+    /// Experimental callback that decides whether the first non-replay call to
+    /// [`SyncWorkflowContext::patched`] for a patch ID should activate that patch.
+    ///
+    /// The callback receives an immutable workflow information snapshot and patch ID. Returning
+    /// `true` records the patch marker; returning `false` leaves the patch inactive for the
+    /// workflow run. For registered WASM workflow components, the callback remains on the worker
+    /// host and is invoked through the workflow component's synchronous host interface.
+    pub patch_activation_callback: Option<PatchActivationCallback>,
 }
 
 impl<S: worker_options_builder::State> WorkerOptionsBuilder<S> {
@@ -430,6 +444,7 @@ impl WorkerOptions {
             ))
             .workflow_failure_errors(self.workflow_failure_errors.clone())
             .workflow_types_to_failure_errors(self.workflow_types_to_failure_errors.clone())
+            .disable_payload_error_limit(self.disable_payload_error_limit)
             .build()
     }
 }
@@ -458,6 +473,7 @@ struct WorkflowHalf {
     workflow_definitions: WorkflowDefinitions,
     workflow_removed_from_map: Notify,
     detect_nondeterministic_futures: bool,
+    patch_activation_callback: Option<PatchActivationCallback>,
 }
 struct WorkflowData {
     /// Channel used to send the workflow activations
@@ -555,6 +571,7 @@ impl Worker {
         let wasm_components = std::mem::take(&mut options.wasm_workflow_components);
         let mut me = Self::new_from_core_definitions(worker, client_options, acts, wfs);
         me.set_detect_nondeterministic_futures(options.detect_nondeterministic_futures);
+        me.workflow_half.patch_activation_callback = options.patch_activation_callback;
         #[cfg(feature = "wasm-workflows")]
         me.workflow_half
             .workflow_definitions
@@ -583,6 +600,7 @@ impl Worker {
                 workflow_definitions: workflows,
                 workflow_removed_from_map: Default::default(),
                 detect_nondeterministic_futures: false,
+                patch_activation_callback: None,
             },
             activity_half: ActivityHalf {
                 activities,
@@ -926,6 +944,7 @@ impl WorkflowHalf {
                         completions_tx.clone(),
                         common.data_converter.clone(),
                         self.detect_nondeterministic_futures,
+                        self.patch_activation_callback.clone(),
                     ) {
                         Ok(result) => result,
                         Err(e) => {
@@ -1227,22 +1246,22 @@ mod tests {
     #[allow(unused, clippy::diverging_sub_expression)]
     fn test_activity_via_workflow_context() {
         let wf_ctx: WorkflowContext<MyWorkflow> = unimplemented!();
-        wf_ctx.start_activity(
+        wf_ctx.execute_activity(
             MyActivities::my_activity,
             (),
             ActivityOptions::start_to_close_timeout(Duration::from_secs(5)),
         );
-        wf_ctx.start_activity(
+        wf_ctx.execute_activity(
             SharedActivities::greet,
             "Hi".to_owned(),
             ActivityOptions::start_to_close_timeout(Duration::from_secs(5)),
         );
-        wf_ctx.start_activity(
+        wf_ctx.execute_activity(
             MyActivities::greet,
             "Hi".to_owned(),
             ActivityOptions::start_to_close_timeout(Duration::from_secs(5)),
         );
-        wf_ctx.start_activity(
+        wf_ctx.execute_activity(
             MyActivities::takes_self,
             "Hi".to_owned(),
             ActivityOptions::start_to_close_timeout(Duration::from_secs(5)),
@@ -1377,5 +1396,23 @@ mod tests {
             .to_core_options("ns".into(), connection_identity.into())
             .unwrap();
         assert_eq!(config.client_identity_override, expected);
+    }
+
+    #[rstest::rstest]
+    #[case::default_enforces_error_limit(None, false)]
+    #[case::opt_out_disables_error_limit(Some(true), true)]
+    #[case::explicit_enable_error_limit(Some(false), false)]
+    #[test]
+    fn disable_payload_error_limit_propagates(
+        #[case] override_value: Option<bool>,
+        #[case] expected: bool,
+    ) {
+        let config = WorkerOptions::new("task_q")
+            .task_types(WorkerTaskTypes::activity_only())
+            .maybe_disable_payload_error_limit(override_value)
+            .build()
+            .to_core_options("ns".into(), String::new())
+            .unwrap();
+        assert_eq!(config.disable_payload_error_limit, expected);
     }
 }

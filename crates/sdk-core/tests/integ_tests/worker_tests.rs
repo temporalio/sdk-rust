@@ -1,12 +1,13 @@
 use crate::{
     common::{
         CoreWfStarter, activity_functions::StdActivities, fake_grpc_server::fake_server,
-        get_integ_runtime_options, get_integ_server_options, get_integ_telem_options, mock_sdk_cfg,
+        get_integ_runtime_options, get_integ_server_options, get_integ_telem_options,
+        integ_namespace, mock_sdk_cfg,
     },
     shared_tests::{self, is_oversize_grpc_event},
 };
 use assert_matches::assert_matches;
-use futures_util::FutureExt;
+use futures_util::{FutureExt, StreamExt};
 use std::{
     cell::Cell,
     sync::{
@@ -18,7 +19,10 @@ use std::{
     },
     time::Duration,
 };
-use temporalio_client::{Connection, WorkflowStartOptions};
+use temporalio_client::{
+    Client, ClientOptions, Connection, PayloadLimitsOptions, WorkflowStartOptions,
+    errors::WorkflowGetResultError,
+};
 use temporalio_common::{
     data_converters::{DataConverter, RawValue},
     protos::{
@@ -31,14 +35,14 @@ use temporalio_common::{
         },
         temporal::api::{
             command::v1::command::Attributes,
-            common::v1::WorkerVersionStamp,
+            common::v1::{RetryPolicy, WorkerVersionStamp},
             enums::v1::{
                 EventType,
                 WorkflowTaskFailedCause::{self},
             },
             failure::v1::Failure as InnerFailure,
             history::v1::{
-                ActivityTaskScheduledEventAttributes,
+                ActivityTaskScheduledEventAttributes, HistoryEvent,
                 history_event::{
                     self,
                     Attributes::{self as EventAttributes},
@@ -50,11 +54,13 @@ use temporalio_common::{
             },
         },
     },
+    telemetry::{CoreLogStreamConsumer, Logger, TelemetryOptions, construct_filter_string},
     worker::WorkerTaskTypes,
 };
 use temporalio_macros::{activities, workflow, workflow_methods};
 use temporalio_sdk::{
     ActivityOptions, LocalActivityOptions, WorkerOptions, WorkflowContext, WorkflowResult,
+    WorkflowTermination,
     activities::{ActivityContext, ActivityError},
     interceptors::WorkerInterceptor,
 };
@@ -63,6 +69,7 @@ use temporalio_sdk_core::{
     ResourceBasedTuner, ResourceSlotOptions, SlotInfo, SlotInfoTrait, SlotMarkUsedContext,
     SlotReleaseContext, SlotReservationContext, SlotSupplier, SlotSupplierPermit, TunerBuilder,
     WorkerConfig, WorkerValidationError, WorkerVersioningStrategy, WorkflowSlotKind, init_worker,
+    prost_dur,
     replay::{DEFAULT_WORKFLOW_TYPE, TestHistoryBuilder, canned_histories},
     test_help::{
         FakeWfResponses, MockPollCfg, ResponseType, build_mock_pollers, drain_pollers_and_shutdown,
@@ -71,6 +78,7 @@ use temporalio_sdk_core::{
 };
 use tokio::sync::{Barrier, Notify, Semaphore};
 use tokio_util::sync::CancellationToken;
+use tracing::Level;
 use uuid::Uuid;
 
 #[tokio::test]
@@ -226,6 +234,7 @@ async fn oversize_grpc_message() {
     let runtime = CoreRuntime::new_assume_tokio(get_integ_runtime_options(telemopts)).unwrap();
     let mut starter = CoreWfStarter::new_with_runtime(wf_name, runtime);
     starter.sdk_config.task_types = WorkerTaskTypes::workflow_only();
+    starter.sdk_config.disable_payload_error_limit = true;
     let mut core = starter.worker().await;
 
     let has_run = Arc::new(AtomicBool::new(false));
@@ -296,6 +305,369 @@ async fn oversize_grpc_message() {
 #[tokio::test]
 async fn grpc_message_too_large_test() {
     shared_tests::grpc_message_too_large().await
+}
+
+// Serializes to between the default blob error limit (2 MiB) and the gRPC transport limit (4 MiB).
+const OVERSIZE_PAYLOAD_BYTES: usize = 3 * 1024 * 1024;
+
+/// True for a `WorkflowTaskFailed` history event caused by the payload error limit.
+fn is_wft_payloads_too_large(e: &HistoryEvent) -> bool {
+    e.event_type == EventType::WorkflowTaskFailed as i32
+        && matches!(
+            e.attributes.as_ref(),
+            Some(EventAttributes::WorkflowTaskFailedEventAttributes(attr))
+                if attr.cause == WorkflowTaskFailedCause::PayloadsTooLarge as i32
+        )
+}
+
+/// Oversized completion payload fails the WFT with `PayloadsTooLarge`, then recovers on the second
+/// attempt.
+#[tokio::test]
+async fn oversize_wft_payload_fails_retryably_then_completes() {
+    let wf_name = "oversize_wft_payload_retryable";
+    let mut starter = CoreWfStarter::new(wf_name);
+    starter.sdk_config.task_types = WorkerTaskTypes::workflow_only();
+    let mut core = starter.worker().await;
+
+    let has_run = Arc::new(AtomicBool::new(false));
+    let has_run_clone = has_run.clone();
+
+    #[workflow]
+    struct OversizeWftWf {
+        has_run: Arc<AtomicBool>,
+    }
+    #[workflow_methods(factory_only)]
+    impl OversizeWftWf {
+        #[run]
+        async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<String> {
+            if ctx.state(|wf| wf.has_run.load(Relaxed)) {
+                Ok(String::new())
+            } else {
+                ctx.state(|wf| wf.has_run.store(true, Relaxed));
+                Ok("a".repeat(OVERSIZE_PAYLOAD_BYTES))
+            }
+        }
+    }
+
+    core.register_workflow_with_factory(move || OversizeWftWf {
+        has_run: has_run_clone.clone(),
+    })
+    .unwrap();
+    let handle = core
+        .submit_workflow(OversizeWftWf::run, (), starter.workflow_options.clone())
+        .await
+        .unwrap();
+    core.run_until_done().await.unwrap();
+    // `run_until_done` reports Ok for any terminal outcome, so confirm success via the handle.
+    handle.get_result(Default::default()).await.unwrap();
+
+    // The intermediate failure isn't visible from the result, so assert it via history.
+    let events = starter.get_history().await.events;
+    assert!(
+        events.iter().any(is_wft_payloads_too_large),
+        "expected a WorkflowTaskFailed(PayloadsTooLarge) event: {events:?}"
+    );
+}
+
+/// Oversized activity result is rejected client-side as a retryable failure; the activity retries
+/// and the workflow completes. (A retried-then-succeeded activity leaves no `ActivityTaskFailed`
+/// event, so the retry is checked via the attempt count.)
+#[tokio::test]
+async fn oversize_activity_result_fails_retryably_then_completes() {
+    let wf_name = "oversize_activity_result_retryable";
+    let mut starter = CoreWfStarter::new(wf_name);
+
+    let max_attempt = Arc::new(AtomicU8::new(0));
+
+    struct OversizeResultActs {
+        max_attempt: Arc<AtomicU8>,
+    }
+    #[activities]
+    impl OversizeResultActs {
+        #[activity]
+        async fn maybe_oversize(
+            self: Arc<Self>,
+            ctx: ActivityContext,
+            _: (),
+        ) -> Result<String, ActivityError> {
+            let attempt = ctx.info().attempt;
+            self.max_attempt.fetch_max(attempt as u8, Relaxed);
+            if attempt == 1 {
+                Ok("a".repeat(OVERSIZE_PAYLOAD_BYTES))
+            } else {
+                Ok(String::new())
+            }
+        }
+    }
+    starter.sdk_config.register_activities(OversizeResultActs {
+        max_attempt: max_attempt.clone(),
+    });
+    let mut core = starter.worker().await;
+
+    #[workflow]
+    struct OversizeActResultWf;
+    #[workflow_methods(factory_only)]
+    impl OversizeActResultWf {
+        #[run]
+        async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<()> {
+            ctx.execute_activity(
+                OversizeResultActs::maybe_oversize,
+                (),
+                ActivityOptions::with_start_to_close_timeout(Duration::from_secs(10))
+                    .retry_policy(RetryPolicy {
+                        initial_interval: Some(prost_dur!(from_millis(1))),
+                        maximum_attempts: 3,
+                        ..Default::default()
+                    })
+                    .build(),
+            )
+            .await
+            .map_err(|e| WorkflowTermination::from(anyhow::Error::from(e)))?;
+            Ok(())
+        }
+    }
+
+    core.register_workflow_with_factory(|| OversizeActResultWf)
+        .unwrap();
+    let handle = core
+        .submit_workflow(
+            OversizeActResultWf::run,
+            (),
+            starter.workflow_options.clone(),
+        )
+        .await
+        .unwrap();
+    core.run_until_done().await.unwrap();
+    // `run_until_done` reports Ok for any terminal outcome, so confirm success via the handle.
+    handle.get_result(Default::default()).await.unwrap();
+
+    assert!(
+        max_attempt.load(Relaxed) >= 2,
+        "activity should have retried after the oversized first attempt was rejected"
+    );
+}
+
+/// Oversized heartbeat details fail the attempt (retryably) client-side; the activity retries and
+/// the workflow completes.
+#[tokio::test]
+async fn oversize_activity_heartbeat_fails_retryably_then_completes() {
+    let wf_name = "oversize_activity_heartbeat_retryable";
+    let mut starter = CoreWfStarter::new(wf_name);
+
+    let max_attempt = Arc::new(AtomicU8::new(0));
+
+    struct OversizeHbActs {
+        max_attempt: Arc<AtomicU8>,
+    }
+    #[activities]
+    impl OversizeHbActs {
+        #[activity]
+        async fn maybe_oversize_heartbeat(
+            self: Arc<Self>,
+            ctx: ActivityContext,
+            _: (),
+        ) -> Result<(), ActivityError> {
+            let attempt = ctx.info().attempt;
+            self.max_attempt.fetch_max(attempt as u8, Relaxed);
+            if attempt == 1 {
+                ctx.record_heartbeat("a".repeat(OVERSIZE_PAYLOAD_BYTES))
+                    .await?;
+                // The oversized heartbeat is rejected client-side, which fails this attempt and
+                // cancels us; wait for that cancel rather than returning a normal completion.
+                ctx.cancelled().await;
+                Ok(())
+            } else {
+                Ok(())
+            }
+        }
+    }
+    starter.sdk_config.register_activities(OversizeHbActs {
+        max_attempt: max_attempt.clone(),
+    });
+    let mut core = starter.worker().await;
+
+    #[workflow]
+    struct OversizeHbWf;
+    #[workflow_methods(factory_only)]
+    impl OversizeHbWf {
+        #[run]
+        async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<()> {
+            ctx.execute_activity(
+                OversizeHbActs::maybe_oversize_heartbeat,
+                (),
+                ActivityOptions::with_start_to_close_timeout(Duration::from_secs(60))
+                    .heartbeat_timeout(Duration::from_secs(10))
+                    .retry_policy(RetryPolicy {
+                        initial_interval: Some(prost_dur!(from_millis(1))),
+                        maximum_attempts: 3,
+                        ..Default::default()
+                    })
+                    .build(),
+            )
+            .await
+            .map_err(|e| WorkflowTermination::from(anyhow::Error::from(e)))?;
+            Ok(())
+        }
+    }
+
+    core.register_workflow_with_factory(|| OversizeHbWf)
+        .unwrap();
+    let handle = core
+        .submit_workflow(OversizeHbWf::run, (), starter.workflow_options.clone())
+        .await
+        .unwrap();
+    core.run_until_done().await.unwrap();
+    // `run_until_done` reports Ok for any terminal outcome, so confirm success via the handle.
+    handle.get_result(Default::default()).await.unwrap();
+
+    assert!(
+        max_attempt.load(Relaxed) >= 2,
+        "activity should have retried after the oversized heartbeat failed the first attempt"
+    );
+}
+
+/// A payload over the warn threshold but under the error limit is sent to the server, the workflow
+/// completes and the worker emits the `[TMPRL1103]` warning carrying the expected structured context.
+#[tokio::test]
+async fn warn_band_payload_is_logged_and_completes() {
+    let (log_consumer, mut log_rx) = CoreLogStreamConsumer::new(512);
+    let telem = TelemetryOptions::builder()
+        .logging(Logger::Push {
+            filter: construct_filter_string(Level::INFO, Level::WARN),
+            consumer: Arc::new(log_consumer),
+        })
+        .build();
+    let runtime = CoreRuntime::new_assume_tokio(get_integ_runtime_options(telem)).unwrap();
+
+    let mut conn_opts = get_integ_server_options();
+    conn_opts.metrics_meter = runtime.telemetry().get_temporal_metric_meter();
+    conn_opts.payload_limits = PayloadLimitsOptions {
+        payloads_warn_size: 1,
+        memo_warn_size: 1,
+    };
+    let connection = Connection::connect(conn_opts).await.unwrap();
+    let client = Client::new(connection, ClientOptions::new(integ_namespace()).build()).unwrap();
+
+    let wf_name = "warn_band_payload";
+    let mut starter = CoreWfStarter::new_with_overrides(wf_name, Some(runtime), Some(client));
+    starter.sdk_config.task_types = WorkerTaskTypes::workflow_only();
+    let mut core = starter.worker().await;
+
+    #[workflow]
+    struct WarnBandWf;
+    #[workflow_methods(factory_only)]
+    impl WarnBandWf {
+        #[run]
+        async fn run(_ctx: &mut WorkflowContext<Self>) -> WorkflowResult<Vec<u8>> {
+            // Over the 1-byte warn threshold, far under any error limit.
+            Ok(vec![0u8; 256])
+        }
+    }
+    core.register_workflow_with_factory(|| WarnBandWf).unwrap();
+    let handle = core
+        .submit_workflow(WarnBandWf::run, (), starter.workflow_options.clone())
+        .await
+        .unwrap();
+    core.run_until_done().await.unwrap();
+    // `run_until_done` reports Ok for any terminal outcome, so confirm success via the handle.
+    handle.get_result(Default::default()).await.unwrap();
+
+    let scan = tokio::time::timeout(Duration::from_secs(5), async {
+        while let Some(log) = log_rx.next().await {
+            if log.message.starts_with("[TMPRL1103]") {
+                return Some(log.level);
+            }
+        }
+        None
+    })
+    .await;
+    match scan {
+        Ok(Some(level)) => assert_eq!(level, Level::WARN, "the payload should warn, not error"),
+        Ok(None) => panic!("log stream ended without a [TMPRL1103] warning"),
+        Err(_) => panic!("timed out waiting for a [TMPRL1103] warning"),
+    }
+}
+
+/// With the worker error limit disabled, an oversized activity result (under the gRPC transport
+/// limit) reaches the server, which hard-fails it non-retryably — so the activity isn't retried and
+/// the workflow fails. Independent of how the gRPC hard limit is handled.
+#[tokio::test]
+async fn disabled_error_limit_lets_server_hard_fail() {
+    let wf_name = "disabled_error_limit_activity";
+    let mut starter = CoreWfStarter::new(wf_name);
+    starter.sdk_config.disable_payload_error_limit = true;
+
+    let max_attempt = Arc::new(AtomicU8::new(0));
+
+    struct DisabledOversizeActs {
+        max_attempt: Arc<AtomicU8>,
+    }
+    #[activities]
+    impl DisabledOversizeActs {
+        #[activity]
+        async fn always_oversize(
+            self: Arc<Self>,
+            ctx: ActivityContext,
+            _: (),
+        ) -> Result<String, ActivityError> {
+            self.max_attempt
+                .fetch_max(ctx.info().attempt as u8, Relaxed);
+            Ok("a".repeat(OVERSIZE_PAYLOAD_BYTES))
+        }
+    }
+    starter
+        .sdk_config
+        .register_activities(DisabledOversizeActs {
+            max_attempt: max_attempt.clone(),
+        });
+    let mut core = starter.worker().await;
+
+    #[workflow]
+    struct DisabledOversizeWf;
+    #[workflow_methods(factory_only)]
+    impl DisabledOversizeWf {
+        #[run]
+        async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<()> {
+            ctx.execute_activity(
+                DisabledOversizeActs::always_oversize,
+                (),
+                ActivityOptions::with_start_to_close_timeout(Duration::from_secs(10))
+                    .retry_policy(RetryPolicy {
+                        initial_interval: Some(prost_dur!(from_millis(1))),
+                        maximum_attempts: 3,
+                        ..Default::default()
+                    })
+                    .build(),
+            )
+            .await
+            .map_err(|e| WorkflowTermination::from(anyhow::Error::from(e)))?;
+            Ok(())
+        }
+    }
+    core.register_workflow_with_factory(|| DisabledOversizeWf)
+        .unwrap();
+    let handle = core
+        .submit_workflow(
+            DisabledOversizeWf::run,
+            (),
+            starter.workflow_options.clone(),
+        )
+        .await
+        .unwrap();
+
+    core.run_until_done().await.unwrap();
+    // `run_until_done` reports Ok even for a failed workflow (it ignores workflow-outcome errors),
+    // so assert the failure via the handle.
+    assert_matches!(
+        handle.get_result(Default::default()).await,
+        Err(WorkflowGetResultError::Failed(_)),
+        "the server hard-fails the oversized activity result, failing the workflow"
+    );
+    assert_eq!(
+        max_attempt.load(Relaxed),
+        1,
+        "the server's size failure is non-retryable, so the activity task isn't retried"
+    );
 }
 
 #[tokio::test]
@@ -422,13 +794,13 @@ async fn activity_tasks_from_completion_reserve_slots() {
     impl ActivityTasksCompletionWf {
         #[run(name = DEFAULT_WORKFLOW_TYPE)]
         async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<()> {
-            ctx.start_activity(
+            ctx.execute_activity(
                 FakeAct::act1,
                 (),
                 ActivityOptions::start_to_close_timeout(Duration::from_secs(5)),
             )
             .await?;
-            ctx.start_activity(
+            ctx.execute_activity(
                 FakeAct::act2,
                 (),
                 ActivityOptions::start_to_close_timeout(Duration::from_secs(5)),
@@ -795,14 +1167,14 @@ async fn test_custom_slot_supplier_simple() {
         #[run]
         async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<()> {
             let _result = ctx
-                .start_activity(
+                .execute_activity(
                     StdActivities::no_op,
                     (),
                     ActivityOptions::start_to_close_timeout(Duration::from_secs(10)),
                 )
                 .await;
             let _result = ctx
-                .start_local_activity(
+                .execute_local_activity(
                     StdActivities::no_op,
                     (),
                     LocalActivityOptions {

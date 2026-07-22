@@ -33,11 +33,14 @@ mod workflow_status;
 
 pub use crate::{
     proxy::HttpConnectProxyOptions,
+    request_extensions::PayloadErrorLimits,
     retry::{CallType, RETRYABLE_ERROR_CODES},
 };
 pub use async_activity_handle::{
     ActivityHeartbeatResponse, ActivityIdentifier, AsyncActivityHandle,
 };
+#[doc(hidden)]
+pub use retry::jittered;
 
 pub use metrics::{LONG_REQUEST_LATENCY_HISTOGRAM_NAME, REQUEST_LATENCY_HISTOGRAM_NAME};
 pub use options_structs::*;
@@ -94,7 +97,7 @@ use temporalio_common::{
         proto_ts_to_system_time,
         temporal::api::{
             cloud::cloudservice::v1::cloud_service_client::CloudServiceClient,
-            common::v1::{Payload, WorkflowType},
+            common::v1::WorkflowType,
             enums::v1::TaskQueueKind,
             errordetails::v1::WorkflowExecutionAlreadyStartedFailure,
             operatorservice::v1::operator_service_client::OperatorServiceClient,
@@ -109,7 +112,7 @@ use temporalio_common::{
         },
         utilities::decode_status_detail,
     },
-    search_attributes::SearchAttributes,
+    search_attributes::{SearchAttributeError, SearchAttributeValue, SearchAttributes},
 };
 use tonic::{
     Code, IntoRequest,
@@ -134,6 +137,14 @@ static TEMPORAL_NAMESPACE_HEADER_KEY: &str = "temporal-namespace";
 #[doc(hidden)]
 /// Key used to communicate when a GRPC message is too large
 pub static MESSAGE_TOO_LARGE_KEY: &str = "message-too-large";
+#[doc(hidden)]
+/// Returns the violation, if `status` is the client proactively rejecting an outbound request for exceeding a
+/// payload/memo error size limit.
+pub fn payload_limit_violation_from(
+    status: &tonic::Status,
+) -> Option<&temporalio_common::payload_limits::PayloadLimitViolation> {
+    std::error::Error::source(status).and_then(|src| src.downcast_ref())
+}
 #[doc(hidden)]
 /// Key used to indicate a error was returned by the retryer because of the short-circuit predicate
 pub static ERROR_RETURNED_DUE_TO_SHORT_CIRCUIT: &str = "short-circuit";
@@ -164,6 +175,25 @@ struct ConnectionInner {
     capabilities: Option<get_system_info_response::Capabilities>,
     workers: Arc<ClientWorkerSet>,
     _dns_task: Option<Arc<dns::DnsReresolutionHandle>>,
+    /// Configured payload/memo size warning thresholds (bytes); `0` disables that warning.
+    payloads_warn_size: usize,
+    memo_warn_size: usize,
+}
+
+/// Resolve a user-configured warning threshold (bytes) into the internal representation. `0`
+/// disables the warning (`None`); so does a value that doesn't fit in `usize` on this platform (a
+/// threshold larger than any addressable payload could never fire anyway), with a warning logged.
+/// `option` names the configured field, for diagnostics.
+fn resolve_warn_threshold(option: &'static str, bytes: u64) -> usize {
+    usize::try_from(bytes).unwrap_or_else(|_| {
+        warn!(
+            option,
+            configured_bytes = bytes,
+            "Configured payload size warning threshold exceeds the maximum addressable size on this \
+             platform; disabling this warning"
+        );
+        0
+    })
 }
 
 impl Connection {
@@ -307,6 +337,14 @@ impl Connection {
                 capabilities,
                 workers: Arc::new(ClientWorkerSet::new()),
                 _dns_task: dns_task,
+                payloads_warn_size: resolve_warn_threshold(
+                    "payloads_warn_size",
+                    options.payload_limits.payloads_warn_size,
+                ),
+                memo_warn_size: resolve_warn_threshold(
+                    "memo_warn_size",
+                    options.payload_limits.memo_warn_size,
+                ),
             }),
         })
     }
@@ -1081,26 +1119,40 @@ impl WorkflowExecutionCount {
 /// Aggregation group from a workflow count query with a group-by clause.
 #[derive(Debug, Clone)]
 pub struct WorkflowCountAggregationGroup {
-    group_values: Vec<Payload>,
-    count: usize,
+    raw: count_workflow_executions_response::AggregationGroup,
 }
 
 impl WorkflowCountAggregationGroup {
     fn from_proto(proto: count_workflow_executions_response::AggregationGroup) -> Self {
-        Self {
-            group_values: proto.group_values,
-            count: proto.count as usize,
-        }
+        Self { raw: proto }
     }
 
-    /// The search attribute values for this group.
-    pub fn group_values(&self) -> &[Payload] {
-        &self.group_values
+    /// Retrieve a typed group value at `index`.
+    ///
+    ///  Returns `None` if the index is out of bounds or deserialization fails.
+    ///  Use [`Self::try_get`] for explicit error handling.
+    pub fn get<T: SearchAttributeValue>(&self, index: usize) -> Option<T> {
+        self.try_get(index).ok().flatten()
+    }
+
+    /// Retrieve a typed group value at `index`, preserving deserialization
+    /// errors.
+    ///
+    /// Returns `Ok(None)` if the index is out of bounds and `Err` if the
+    /// payload cannot be deserialized.
+    pub fn try_get<T: SearchAttributeValue>(
+        &self,
+        index: usize,
+    ) -> Result<Option<T>, SearchAttributeError> {
+        match self.raw.group_values.get(index) {
+            Some(payload) => T::from_search_attribute_payload(payload).map(Some),
+            None => Ok(None),
+        }
     }
 
     /// The approximate number of workflows matching for this group.
     pub fn count(&self) -> usize {
-        self.count
+        self.raw.count as usize
     }
 }
 
@@ -1408,8 +1460,25 @@ mod tests {
     use super::*;
     use crate::callback_based::CallbackBasedGrpcService;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use temporalio_common::search_attributes::SearchAttributeKey;
     use tonic::{Status, metadata::Ascii};
     use url::Url;
+
+    #[test]
+    fn count_aggregation_group_gets_typed_value() {
+        let attrs = SearchAttributes::new([SearchAttributeKey::int("group").value_set(42)]);
+        let group = WorkflowCountAggregationGroup {
+            raw: count_workflow_executions_response::AggregationGroup {
+                group_values: vec![attrs.raw_payload("group").unwrap().clone()],
+                count: 1,
+            },
+        };
+
+        assert_eq!(group.get::<i64>(0), Some(42));
+        assert_eq!(group.get::<i64>(1), None);
+        assert!(group.try_get::<String>(0).is_err());
+        assert_eq!(group.try_get::<i64>(1).unwrap(), None);
+    }
 
     fn connection_options_for_system_info_test(
         service_override: CallbackBasedGrpcService,
@@ -1752,7 +1821,7 @@ mod tests {
         use temporalio_common::{
             data_converters::DefaultFailureConverter,
             protos::temporal::api::common::v1::{
-                Memo as ProtoMemo, WorkflowExecution as ProtoWorkflowExecution,
+                Memo as ProtoMemo, Payload, WorkflowExecution as ProtoWorkflowExecution,
             },
         };
         use tonic::{Request, Response};

@@ -35,7 +35,7 @@ impl ActivityDoesntHeartbeatHitsTimeoutThenCompletesWf {
     #[run]
     async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<()> {
         let res: Result<(), ActivityExecutionError> = ctx
-            .start_activity(
+            .execute_activity(
                 StdActivities::delay,
                 Duration::from_secs(4),
                 ActivityOptions::with_start_to_close_timeout(Duration::from_secs(10))

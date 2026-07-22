@@ -57,7 +57,7 @@ impl ActivityLoadWf {
     async fn run(ctx: &mut WorkflowContext<Self>, tq: String) -> WorkflowResult<()> {
         let input_str = "yo".to_string();
         let res = ctx
-            .start_activity(
+            .execute_activity(
                 StdActivities::echo,
                 input_str.clone(),
                 ActivityOptions::with_close_timeouts(ActivityCloseTimeouts::Both {
@@ -126,7 +126,7 @@ impl ChunkyActivityWf {
     async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<()> {
         let input_str = "yo".to_string();
         let res = ctx
-            .start_activity(
+            .execute_activity(
                 ChunkyActivities::chunky_echo,
                 input_str.clone(),
                 ActivityOptions::with_start_to_close_timeout(Duration::from_secs(30))
@@ -217,7 +217,7 @@ impl WorkflowLoadWf {
     async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<()> {
         for _ in 0..5 {
             let _ = ctx
-                .start_activity(
+                .execute_activity(
                     StdActivities::echo,
                     "hi!".to_string(),
                     ActivityOptions::start_to_close_timeout(Duration::from_secs(5)),
@@ -433,7 +433,7 @@ impl PollerLoadWf {
     async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<()> {
         for _ in 0..5 {
             let _ = ctx
-                .start_activity(
+                .execute_activity(
                     JitteryActivities::jittery_echo,
                     "hi!".to_string(),
                     ActivityOptions::start_to_close_timeout(Duration::from_secs(5)),

@@ -6,4 +6,6 @@ interface workflow-host {
   set-current-details: func(details: string);
 
   push-command: func(command: workflow-command);
+
+  patch-activation: func(patch-id: string) -> bool;
 }

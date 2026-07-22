@@ -507,7 +507,7 @@ async fn idle_activity_worker_reports_zero_slots_used() {
     impl OneActivity {
         #[run]
         async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<()> {
-            ctx.start_activity(
+            ctx.execute_activity(
                 BlockingActivity::run,
                 (),
                 ActivityOptions::with_start_to_close_timeout(Duration::from_secs(5))
@@ -1028,12 +1028,12 @@ async fn activity_metrics() {
     impl ActivityMetricsWf {
         #[run]
         async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<()> {
-            let normal_act_pass = ctx.start_activity(
+            let normal_act_pass = ctx.execute_activity(
                 PassFailActivities::pass_fail_act,
                 "pass".to_string(),
                 ActivityOptions::start_to_close_timeout(Duration::from_secs(1)),
             );
-            let normal_act_fail = ctx.start_activity(
+            let normal_act_fail = ctx.execute_activity(
                 PassFailActivities::pass_fail_act,
                 "fail".to_string(),
                 ActivityOptions::with_start_to_close_timeout(Duration::from_secs(1))
@@ -1044,12 +1044,12 @@ async fn activity_metrics() {
                     .build(),
             );
             let _ = join!(normal_act_pass, normal_act_fail);
-            let local_act_pass = ctx.start_local_activity(
+            let local_act_pass = ctx.execute_local_activity(
                 PassFailActivities::pass_fail_act,
                 "pass".to_string(),
                 LocalActivityOptions::default(),
             );
-            let local_act_fail = ctx.start_local_activity(
+            let local_act_fail = ctx.execute_local_activity(
                 PassFailActivities::pass_fail_act,
                 "fail".to_string(),
                 LocalActivityOptions {
@@ -1061,7 +1061,7 @@ async fn activity_metrics() {
                     ..Default::default()
                 },
             );
-            let local_act_cancel = ctx.start_local_activity(
+            let local_act_cancel = ctx.execute_local_activity(
                 PassFailActivities::pass_fail_act,
                 "cancel".to_string(),
                 LocalActivityOptions {

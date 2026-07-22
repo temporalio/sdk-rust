@@ -15,7 +15,7 @@ impl HelloWorldWorkflow {
     #[run]
     pub async fn run(ctx: &mut WorkflowContext<Self>, name: String) -> WorkflowResult<String> {
         let greeting = ctx
-            .start_activity(
+            .execute_activity(
                 GreetingActivities::greet,
                 name,
                 ActivityOptions::start_to_close_timeout(Duration::from_secs(10)),

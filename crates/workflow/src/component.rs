@@ -2,7 +2,7 @@
 //!
 //! Everything in this module is internal SDK/component glue.
 use crate::{
-    BaseWorkflowContext,
+    BaseWorkflowContext, PatchActivationCallback,
     runtime::{
         entry::WorkflowImplementation,
         guest::WorkflowInstance as RuntimeWorkflowInstance,
@@ -16,7 +16,7 @@ use crate::{
 };
 use futures_util::task::noop_waker;
 use prost::Message;
-use std::{cell::RefCell, marker::PhantomData, rc::Rc};
+use std::{cell::RefCell, marker::PhantomData, rc::Rc, sync::Arc};
 use temporalio_common_wasm::{
     data_converters::DataConverter,
     protos::{coresdk::workflow_commands::WorkflowCommand, temporal::api::failure::v1::Failure},
@@ -211,6 +211,8 @@ where
     let args = init.initialize_workflow.arguments.clone();
     let data_converter = DataConverter::default();
     let payload_converter = data_converter.payload_converter().clone();
+    let patch_activation_callback: PatchActivationCallback =
+        Arc::new(|input| wit_host::patch_activation(&input.patch_id));
     let base_ctx = BaseWorkflowContext::from_raw(
         init.namespace,
         init.task_queue,
@@ -218,6 +220,7 @@ where
         init.initialize_workflow,
         data_converter,
         host,
+        Some(patch_activation_callback),
     );
     instantiate_workflow::<W>(args, payload_converter, base_ctx).map_err(|err| {
         Box::new(Failure {

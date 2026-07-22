@@ -367,6 +367,8 @@ impl Context {
                 }
                 _ => crate::client::ClientGrpcCompression::Gzip,
             },
+            payloads_warn_size: 0,
+            memo_warn_size: 0,
         });
 
         let client_options_ptr = &*client_options as *const _;

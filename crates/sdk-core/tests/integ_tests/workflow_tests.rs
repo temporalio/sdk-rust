@@ -500,7 +500,7 @@ impl SlowCompletesWf {
     #[run]
     async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<()> {
         for _ in 0..3 {
-            ctx.start_activity(
+            ctx.execute_activity(
                 StdActivities::echo,
                 "hi!".to_string(),
                 ActivityOptions::start_to_close_timeout(Duration::from_secs(5)),
@@ -875,7 +875,7 @@ async fn nondeterminism_errors_fail_workflow_when_configured_to(
     impl NondeterminismActivityWf {
         #[run(name = NONDETERMINISM_WF_NAME)]
         async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<()> {
-            ctx.start_activity(
+            ctx.execute_activity(
                 StdActivities::echo,
                 "hi".to_owned(),
                 ActivityOptions::start_to_close_timeout(Duration::from_secs(5)),
@@ -948,7 +948,7 @@ async fn history_out_of_order_on_restart() {
     impl HistoryOutOfOrderWf1 {
         #[run(name = HISTORY_OUT_OF_ORDER_WF_NAME)]
         async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<()> {
-            ctx.start_local_activity(
+            ctx.execute_local_activity(
                 StdActivities::echo,
                 "hi".to_string(),
                 LocalActivityOptions {
@@ -957,7 +957,7 @@ async fn history_out_of_order_on_restart() {
                 },
             )
             .await?;
-            ctx.start_activity(
+            ctx.execute_activity(
                 StdActivities::echo,
                 "hi".to_string(),
                 ActivityOptions::start_to_close_timeout(Duration::from_secs(5)),
@@ -977,7 +977,7 @@ async fn history_out_of_order_on_restart() {
     impl HistoryOutOfOrderWf2 {
         #[run(name = HISTORY_OUT_OF_ORDER_WF_NAME)]
         async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<()> {
-            ctx.start_local_activity(
+            ctx.execute_local_activity(
                 StdActivities::echo,
                 "hi".to_string(),
                 LocalActivityOptions {
@@ -988,7 +988,7 @@ async fn history_out_of_order_on_restart() {
             .await?;
             // Timer is added after restarting workflow
             ctx.timer(Duration::from_secs(1)).await;
-            ctx.start_activity(
+            ctx.execute_activity(
                 StdActivities::echo,
                 "hi".to_string(),
                 ActivityOptions::start_to_close_timeout(Duration::from_secs(5)),

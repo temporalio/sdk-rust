@@ -122,6 +122,12 @@ impl ClientWorkerSetImpl {
         None
     }
 
+    fn worker_control_task_queue_enabled(&self, namespace: &str) -> bool {
+        self.shared_worker
+            .get(namespace)
+            .is_some_and(|worker| worker.worker_control_task_queue_enabled())
+    }
+
     fn worker_ids_in_selection_order(worker_list: &[&RegisteredWorkerInfo]) -> Vec<Uuid> {
         // For tests we return workers in the order they're registered, so we can test
         // the retry mechanism deterministically
@@ -302,6 +308,11 @@ pub trait SharedNamespaceWorkerTrait {
 
     /// Returns the number of workers registered to this shared worker.
     fn num_workers(&self) -> usize;
+
+    /// Returns whether this shared worker is polling the worker control task queue.
+    fn worker_control_task_queue_enabled(&self) -> bool {
+        false
+    }
 }
 
 /// Enables local workers to make themselves visible to a shared client instance.
@@ -375,6 +386,13 @@ impl ClientWorkerSet {
     /// Returns the worker grouping key, which is unique for each worker.
     pub fn worker_grouping_key(&self) -> Uuid {
         self.worker_grouping_key
+    }
+
+    /// Returns whether the shared worker for `namespace` is polling the worker control task queue.
+    pub fn worker_control_task_queue_enabled(&self, namespace: &str) -> bool {
+        self.worker_manager
+            .read()
+            .worker_control_task_queue_enabled(namespace)
     }
 
     #[cfg(test)]
@@ -737,6 +755,7 @@ mod tests {
     struct MockSharedNamespaceWorker {
         namespace: String,
         callbacks: Arc<RwLock<HashMap<Uuid, WorkerCallbacks>>>,
+        worker_control_task_queue_enabled: bool,
     }
 
     impl std::fmt::Debug for MockSharedNamespaceWorker {
@@ -753,7 +772,13 @@ mod tests {
             Self {
                 namespace,
                 callbacks: Arc::new(RwLock::new(HashMap::new())),
+                worker_control_task_queue_enabled: false,
             }
+        }
+
+        fn with_worker_control_task_queue_enabled(mut self) -> Self {
+            self.worker_control_task_queue_enabled = true;
+            self
         }
     }
 
@@ -781,6 +806,29 @@ mod tests {
         fn num_workers(&self) -> usize {
             self.callbacks.read().len()
         }
+
+        fn worker_control_task_queue_enabled(&self) -> bool {
+            self.worker_control_task_queue_enabled
+        }
+    }
+
+    #[test]
+    fn worker_control_task_queue_enabled_reflects_shared_worker() {
+        let manager = ClientWorkerSet::new();
+        let namespace = "test_namespace";
+
+        assert!(!manager.worker_control_task_queue_enabled(namespace));
+
+        manager.worker_manager.write().shared_worker.insert(
+            namespace.to_string(),
+            Box::new(
+                MockSharedNamespaceWorker::new(namespace.to_string())
+                    .with_worker_control_task_queue_enabled(),
+            ),
+        );
+
+        assert!(manager.worker_control_task_queue_enabled(namespace));
+        assert!(!manager.worker_control_task_queue_enabled("other_namespace"));
     }
 
     fn new_mock_provider_with_heartbeat(

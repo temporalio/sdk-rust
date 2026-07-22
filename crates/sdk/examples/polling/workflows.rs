@@ -33,7 +33,7 @@ impl PollingWorkflow {
     pub async fn run(ctx: &mut WorkflowContext<Self>, max_attempts: u32) -> WorkflowResult<String> {
         for attempt in 1..=max_attempts {
             let is_ready = ctx
-                .start_activity(PollingActivities::check_condition, attempt, activity_opts())
+                .execute_activity(PollingActivities::check_condition, attempt, activity_opts())
                 .await?;
 
             if is_ready {

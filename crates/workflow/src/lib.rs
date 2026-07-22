@@ -35,14 +35,17 @@ pub use temporalio_common_wasm::{
         TimeoutType, WorkflowSignalError,
     },
 };
+#[doc(hidden)]
+pub use workflow_context::PatchActivationCaller;
 pub use workflow_context::{
     ActivityCancellationType, ActivityCloseTimeouts, ActivityOptions, BaseWorkflowContext,
     CancellableFuture, ChildWorkflowCancellationType, ChildWorkflowOptions, ContinueAsNewOptions,
     ContinueAsNewVersioningBehavior, ExternalWorkflowHandle, LocalActivityOptions,
     NamespacedWorkflowInfo, NexusOperationCancellationType, NexusOperationOptions,
-    ParentClosePolicy, Signal, SignalData, StartChildWorkflowExecutionFailedCause,
-    StartedChildWorkflow, SyncWorkflowContext, TimerOptions, VersioningIntent, WorkflowContext,
-    WorkflowContextView, WorkflowIdReusePolicy,
+    ParentClosePolicy, PatchActivationCallback, PatchActivationInput, Signal, SignalData,
+    StartChildWorkflowExecutionFailedCause, StartedChildWorkflow, SyncWorkflowContext,
+    TimerOptions, VersioningIntent, WorkflowContext, WorkflowContextView, WorkflowIdReusePolicy,
+    WorkflowRandomValue,
 };
 pub use workflows::{join, join_all, select};
 

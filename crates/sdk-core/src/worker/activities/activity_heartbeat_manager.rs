@@ -1,7 +1,10 @@
 use crate::{
     TaskToken,
     abstractions::take_cell::TakeCell,
-    worker::{activities::PendingActivityCancel, client::WorkerClient},
+    worker::{
+        activities::{PendingActivityCancel, make_payloads_too_large_failure},
+        client::WorkerClient,
+    },
 };
 use futures_util::StreamExt;
 use std::{
@@ -9,6 +12,7 @@ use std::{
     sync::Arc,
     time::{Duration, Instant},
 };
+use temporalio_client::payload_limit_violation_from;
 use temporalio_common::protos::{
     coresdk::{
         ActivityHeartbeat, IntoPayloadsExt,
@@ -189,7 +193,34 @@ impl ActivityHeartbeatManager {
                                             .expect("Receive half of heartbeat cancels not blocked");
                                     }
                                     Err(e) => {
-                                        warn!("Error when recording heartbeat: {:?}", e);
+                                        if let Some(violation) = payload_limit_violation_from(&e) {
+                                            // Caught client-side, so we fail the activity task
+                                            // ourselves (the server otherwise would have) and stop
+                                            // the activity with the same `Cancelled`/`cancel_requested`
+                                            // signal the server uses.
+                                            if let Err(fe) = sg
+                                                .fail_activity_task(
+                                                    tt.clone(),
+                                                    Some(make_payloads_too_large_failure(violation)),
+                                                )
+                                                .await
+                                            {
+                                                warn!(task_token = %tt, error = ?fe,
+                                                    "Failed to fail activity after oversized heartbeat");
+                                            }
+                                            cancels_tx
+                                                .send(PendingActivityCancel::new(
+                                                    tt.clone(),
+                                                    ActivityCancelReason::Cancelled,
+                                                    ActivityCancellationDetails {
+                                                        is_cancelled: true,
+                                                        ..Default::default()
+                                                    },
+                                                ))
+                                                .expect("Receive half of heartbeat cancels not blocked");
+                                        } else {
+                                            warn!("Error when recording heartbeat: {:?}", e);
+                                        }
                                     }
                                 };
                                 let _ = heartbeat_tx.send(HeartbeatAction::CompleteReport(tt));

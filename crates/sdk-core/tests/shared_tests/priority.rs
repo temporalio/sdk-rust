@@ -59,18 +59,17 @@ pub(crate) async fn priority_values_sent_to_server() {
                 .start_child_workflow(
                     UntypedWorkflow::new(&child_type),
                     RawValue::new(vec![]),
-                    ChildWorkflowOptions {
-                        workflow_id: format!("{}-child", ctx.task_queue()),
-                        priority: Some(Priority {
+                    ChildWorkflowOptions::builder()
+                        .workflow_id(format!("{}-child", ctx.task_queue()))
+                        .priority(Priority {
                             priority_key: Some(4),
                             fairness_key: Some("fair-child".to_string()),
                             fairness_weight: Some(1.23),
-                        }),
-                        ..Default::default()
-                    },
+                        })
+                        .build(),
                 )
                 .await?;
-            let activity = ctx.start_activity(
+            let activity = ctx.execute_activity(
                 PriorityActivities::echo,
                 "hello".to_string(),
                 ActivityOptions::with_start_to_close_timeout(Duration::from_secs(5))

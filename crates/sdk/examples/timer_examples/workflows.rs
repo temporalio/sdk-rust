@@ -32,7 +32,7 @@ impl TimerWorkflow {
 
         let winner = temporalio_sdk::workflows::select! {
             _ = ctx.timer(Duration::from_secs(10)) => "timer",
-            result = ctx.start_activity(
+            result = ctx.execute_activity(
                 TimerActivities::slow_activity,
                 100u64,
                 ActivityOptions::start_to_close_timeout(Duration::from_secs(30)),

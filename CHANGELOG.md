@@ -42,6 +42,12 @@ to docs, or any other relevant information.
   and then kept running (e.g. parked on a `wait_condition`) would fail its workflow task whenever it
   was replayed — breaking queries and durable recovery for that execution.
 
+### Security
+* Replaced the unmaintained `backoff` dependency with `backon` for exponential retry and poll
+  backoff, clearing [RUSTSEC-2025-0012](https://rustsec.org/advisories/RUSTSEC-2025-0012) from
+  downstream security audits. Retry timing is preserved: exponential growth,
+  `randomization_factor` jitter, and the total retry-time budget behave as before.
+
 ### Breaking Changes
 * The `ActivityContext` constructor now requires `ClientOptions`.
 ### Breaking Changes
@@ -55,6 +61,16 @@ to docs, or any other relevant information.
 * Schedule descriptions now expose their configured action via `ScheduleDescription::action()`,
   including start-workflow accessors for workflow type, task queue, workflow ID, raw argument
   payloads, and typed argument decoding through the client's data converter.
+* Added the experimental `WorkerOptions::patch_activation_callback` option for controlling whether
+  newly introduced patches activate during rolling deployments.
+* `WorkflowContext::random` and `WorkflowContext::uuid4` for deterministic randomness in workflow.
+* `ChildWorkflowOptions::builder` and `ChildWorkflowOptions::workflow_id` for constructing
+  child workflow options.
+
+### Changed
+ * Renamed `start_activity` and `start_local_activity` to `execute_activity` and `execute_local_activity`
+   to better explain semantics. Original methods remain as deprecated aliases for the new execute
+   variants.
 
 ### Breaking Changes
 * `WorkflowExecution::search_attributes`, `WorkflowExecutionDescription::search_attributes`,
@@ -91,6 +107,24 @@ to docs, or any other relevant information.
   `info()`, which returns the Rust-native `WorkflowContextView` and includes typed workflow
   priority. The internal `BaseWorkflowContext::new` raw-protobuf boundary is now explicitly named
   `from_raw`.
+* Workflow count aggregation groups now provide positional typed `get` and `try_get` accessors
+  for search attribute group values over raw payload access.
+* Payload/memo size-limit enforcement (experimental), on by default. Workers now proactively
+  validate outbound payload/memo sizes against namespace limits before sending to the server.
+  If payload/memo-bearing fields exceed the warn threshold, the worker logs a warning; if over the
+  error limit, the task completion is failed retryably instead of sent to the server. Both cases log
+  `[TMPRL1103]` (at `WARN` and `ERROR` respectively).
+  Previously these were sent and the server terminated the workflow / failed the activity
+  non-retryably; failing retryably instead lets a corrected workflow or activity be redeployed and
+  recover. A deterministically-oversized completion now retries per its retry policy rather than
+  failing fast. Tune warn thresholds via `PayloadLimitsOptions`. Opt out of worker error enforcement
+  with `WorkerOptions::disable_payload_error_limit`.
+* `WorkflowContext::random_seed()` and `SyncWorkflowContext::random_seed()` have been removed.
+  Use `random::<T>()` or `uuid4()` for deterministic workflow randomness instead.
+* `ChildWorkflowOptions::workflow_id` is now `Option<String>`. Wrap explicit IDs in `Some(...)`;
+  when omitted, the parent workflow generates a UUID child workflow ID.
+* `ChildWorkflowOptions` is now tagged with `#[non_exhaustive]` so additional fields will not be breaking
+  changes. Users should switch to `ChildWorkflowOptions::builder()` for constructing these options.
 
 ### Fixed
 * Workflow tasks no longer livelock when a burst of ready async operations exhausts Tokio's
@@ -101,3 +135,6 @@ to docs, or any other relevant information.
   than every 100ms.
 * Workflow replay now reports nondeterminism when a scheduled Nexus operation's service or operation
   differs from the command that produced it.
+* `WorkflowContext::force_task_fail` calls will be respected over a completion if both happen in the same poll
+* Workers no longer advertise a worker control task queue unless the namespace supports worker
+  heartbeats and commands and the built-in Nexus command worker is running.

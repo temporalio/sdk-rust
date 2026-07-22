@@ -686,7 +686,7 @@ async fn update_with_local_acts() {
             ctx: &mut WorkflowContext<Self>,
             _: (),
         ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-            ctx.start_local_activity(
+            ctx.execute_local_activity(
                 StdActivities::delay,
                 Duration::from_secs(3),
                 LocalActivityOptions::default(),
@@ -1193,7 +1193,7 @@ async fn worker_restarted_in_middle_of_update() {
             ctx: &mut WorkflowContext<Self>,
             _: (),
         ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-            ctx.start_activity(
+            ctx.execute_activity(
                 BlockingActivities::blocks,
                 "hi!".to_string(),
                 ActivityOptions::start_to_close_timeout(Duration::from_secs(2)),
@@ -1296,7 +1296,7 @@ async fn update_after_empty_wft() {
                 ctx.wait_condition(|s| s.signal_received).await;
                 ACT_STARTED.store(true, Ordering::Release);
                 let _ = ctx
-                    .start_activity(
+                    .execute_activity(
                         StdActivities::echo,
                         "hi!".to_string(),
                         ActivityOptions::start_to_close_timeout(Duration::from_secs(2)),
@@ -1321,7 +1321,7 @@ async fn update_after_empty_wft() {
                 return;
             }
             let _ = ctx
-                .start_activity(
+                .execute_activity(
                     StdActivities::echo,
                     "hi!".to_string(),
                     ActivityOptions::start_to_close_timeout(Duration::from_secs(2)),
@@ -1391,7 +1391,7 @@ async fn update_lost_on_activity_mismatch() {
             for _ in 1..=3 {
                 ctx.wait_condition(|s| s.can_run > 0).await;
                 let _ = ctx
-                    .start_activity(
+                    .execute_activity(
                         StdActivities::echo,
                         "hi!".to_string(),
                         ActivityOptions::start_to_close_timeout(Duration::from_secs(2)),

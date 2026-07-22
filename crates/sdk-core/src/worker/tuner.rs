@@ -2,12 +2,11 @@ mod fixed_size;
 mod resource_based;
 
 pub use fixed_size::FixedSizeSlotSupplier;
+pub(crate) use resource_based::{RealSysInfo, SystemResourceInfo};
 pub use resource_based::{
     ResourceBasedSlotsOptions, ResourceBasedSlotsOptionsBuilder, ResourceBasedTuner,
-    ResourceSlotOptions,
+    ResourceController, ResourceSlotOptions,
 };
-
-pub(crate) use resource_based::{RealSysInfo, SystemResourceInfo};
 
 use crate::{
     WorkerConfig,
@@ -57,20 +56,34 @@ pub struct TunerHolderOptions {
     pub local_activity_slot_options: Option<SlotSupplierOptions<LocalActivitySlotKind>>,
     /// Options for nexus slots
     pub nexus_slot_options: Option<SlotSupplierOptions<NexusSlotKind>>,
-    /// Options that will apply to all resource based slot suppliers. Must be set if any slot
-    /// options are [SlotSupplierOptions::ResourceBased]
-    pub resource_based_options: Option<ResourceBasedSlotsOptions>,
+    /// Configuration shared by all resource-based slot suppliers.
+    pub resource_based_config: Option<ResourceBasedTunerConfig>,
+}
+
+/// Selects whether a tuner holder creates a controller or uses an existing shared controller.
+#[derive(Clone, Debug)]
+pub enum ResourceBasedTunerConfig {
+    /// Create a controller from these options.
+    Options(ResourceBasedSlotsOptions),
+    /// Use this controller for every resource-based slot supplier in the holder.
+    Controller(Arc<ResourceController>),
 }
 
 impl TunerHolderOptions {
     /// Create a [TunerHolder] from these options
     pub fn build_tuner_holder(self) -> Result<TunerHolder, anyhow::Error> {
+        validate_tuner_holder_options(&self).map_err(anyhow::Error::msg)?;
         let mut builder = TunerBuilder::default();
-        // safety note: unwraps here are OK since the builder validator guarantees options for
-        // a resource based tuner are present if any supplier is resource based
-        let mut rb_tuner = self
-            .resource_based_options
-            .map(ResourceBasedTuner::new_from_options);
+        // safety note: unwraps here are OK since the builder validator guarantees config for a
+        // resource-based tuner is present
+        let mut rb_tuner = self.resource_based_config.map(|config| match config {
+            ResourceBasedTunerConfig::Options(options) => {
+                ResourceBasedTuner::new_from_options(options)
+            }
+            ResourceBasedTunerConfig::Controller(controller) => {
+                ResourceBasedTuner::new_from_shared_controller(controller)
+            }
+        });
         match self.workflow_slot_options {
             Some(SlotSupplierOptions::FixedSize { slots }) => {
                 builder.workflow_slot_supplier(Arc::new(FixedSizeSlotSupplier::new(slots)));
@@ -194,10 +207,9 @@ fn validate_tuner_holder_options(options: &TunerHolderOptions) -> Result<(), Str
         options.nexus_slot_options,
         Some(SlotSupplierOptions::ResourceBased(_))
     );
-    if any_is_resource_based && options.resource_based_options.is_none() {
+    if any_is_resource_based && options.resource_based_config.is_none() {
         return Err(
-            "`resource_based_options` must be set if any slot options are ResourceBased"
-                .to_string(),
+            "`resource_based_config` must be set if any slot options are ResourceBased".to_string(),
         );
     }
     Ok(())
@@ -360,7 +372,7 @@ mod tests {
             activity_slot_options: None,
             local_activity_slot_options: None,
             nexus_slot_options: Some(SlotSupplierOptions::FixedSize { slots: 50 }),
-            resource_based_options: None,
+            resource_based_config: None,
         };
 
         let tuner = options.build_tuner_holder().unwrap();
@@ -382,7 +394,7 @@ mod tests {
             nexus_slot_options: Some(SlotSupplierOptions::ResourceBased(
                 ResourceSlotOptions::new(5, 100, Duration::from_millis(100)),
             )),
-            resource_based_options: Some(resource_opts),
+            resource_based_config: Some(ResourceBasedTunerConfig::Options(resource_opts)),
         };
 
         let tuner = options.build_tuner_holder().unwrap();
@@ -400,7 +412,7 @@ mod tests {
             activity_slot_options: None,
             local_activity_slot_options: None,
             nexus_slot_options: Some(SlotSupplierOptions::Custom(custom_supplier.clone())),
-            resource_based_options: None,
+            resource_based_config: None,
         };
 
         let tuner = options.build_tuner_holder().unwrap();
@@ -423,7 +435,7 @@ mod tests {
 
     #[test]
     fn tuner_holder_options_builder_validates_resource_based_requirements() {
-        // Should fail when nexus uses ResourceBased but resource_based_options is not set
+        // Should fail when nexus uses ResourceBased but resource_based_config is not set
         let result = TunerHolderOptions::builder()
             .nexus_slot_options(SlotSupplierOptions::ResourceBased(
                 ResourceSlotOptions::new(5, 100, Duration::from_millis(100)),
@@ -435,7 +447,7 @@ mod tests {
             result
                 .unwrap_err()
                 .to_string()
-                .contains("resource_based_options")
+                .contains("resource_based_config")
         );
     }
 
@@ -455,7 +467,7 @@ mod tests {
             nexus_slot_options: Some(SlotSupplierOptions::ResourceBased(
                 ResourceSlotOptions::new(5, 100, Duration::from_millis(100)),
             )),
-            resource_based_options: Some(resource_opts),
+            resource_based_config: Some(ResourceBasedTunerConfig::Options(resource_opts)),
         };
 
         let tuner = options.build_tuner_holder().unwrap();
