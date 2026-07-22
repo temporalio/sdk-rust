@@ -53,12 +53,12 @@ async fn create_and_describe_schedule() {
 
     assert_eq!(handle.schedule_id(), schedule_id);
 
-    let desc = handle.describe().await.unwrap();
+    let desc = handle.describe(Default::default()).await.unwrap();
     assert!(desc.paused());
     assert_eq!(desc.note(), Some("created paused for testing"));
     assert!(!desc.conflict_token().is_empty());
 
-    handle.delete().await.unwrap();
+    handle.delete(Default::default()).await.unwrap();
 }
 
 #[tokio::test]
@@ -85,11 +85,11 @@ async fn create_schedule_with_calendar_spec() {
         .await
         .unwrap();
 
-    let desc = handle.describe().await.unwrap();
+    let desc = handle.describe(Default::default()).await.unwrap();
     let raw_spec = desc.raw().schedule.as_ref().unwrap().spec.as_ref().unwrap();
     assert_eq!(raw_spec.structured_calendar.len(), 1);
 
-    handle.delete().await.unwrap();
+    handle.delete(Default::default()).await.unwrap();
 }
 
 #[tokio::test]
@@ -118,7 +118,10 @@ async fn create_schedule_with_trigger_immediately() {
         || {
             let handle = client.get_schedule_handle(&schedule_id);
             async move {
-                let desc = handle.describe().await.map_err(|e| e.to_string())?;
+                let desc = handle
+                    .describe(Default::default())
+                    .await
+                    .map_err(|e| e.to_string())?;
                 if desc.action_count() > 0 {
                     Ok(desc)
                 } else {
@@ -133,7 +136,7 @@ async fn create_schedule_with_trigger_immediately() {
 
     assert!(desc.action_count() >= 1);
 
-    handle.delete().await.unwrap();
+    handle.delete(Default::default()).await.unwrap();
 }
 
 #[tokio::test]
@@ -157,26 +160,35 @@ async fn pause_and_unpause_schedule() {
         .await
         .unwrap();
 
-    let desc = handle.describe().await.unwrap();
+    let desc = handle.describe(Default::default()).await.unwrap();
     assert!(!desc.paused());
 
-    handle.pause(Some("pausing for maintenance")).await.unwrap();
-    let desc = handle.describe().await.unwrap();
+    handle
+        .pause(Some("pausing for maintenance"), Default::default())
+        .await
+        .unwrap();
+    let desc = handle.describe(Default::default()).await.unwrap();
     assert!(desc.paused());
     assert_eq!(desc.note(), Some("pausing for maintenance"));
 
-    handle.unpause(Some("maintenance complete")).await.unwrap();
-    let desc = handle.describe().await.unwrap();
+    handle
+        .unpause(Some("maintenance complete"), Default::default())
+        .await
+        .unwrap();
+    let desc = handle.describe(Default::default()).await.unwrap();
     assert!(!desc.paused());
     assert_eq!(desc.note(), Some("maintenance complete"));
 
     // Verify None uses default note
-    handle.pause(None::<&str>).await.unwrap();
-    let desc = handle.describe().await.unwrap();
+    handle
+        .pause(None::<&str>, Default::default())
+        .await
+        .unwrap();
+    let desc = handle.describe(Default::default()).await.unwrap();
     assert!(desc.paused());
     assert!(desc.note().is_some());
 
-    handle.delete().await.unwrap();
+    handle.delete(Default::default()).await.unwrap();
 }
 
 #[tokio::test]
@@ -203,16 +215,19 @@ async fn update_schedule() {
         .unwrap();
 
     handle
-        .update(|u| {
-            u.set_note("updated notes");
-        })
+        .update(
+            |u| {
+                u.set_note("updated notes");
+            },
+            Default::default(),
+        )
         .await
         .unwrap();
 
-    let desc = handle.describe().await.unwrap();
+    let desc = handle.describe(Default::default()).await.unwrap();
     assert_eq!(desc.note(), Some("updated notes"));
 
-    handle.delete().await.unwrap();
+    handle.delete(Default::default()).await.unwrap();
 }
 
 #[tokio::test]
@@ -237,7 +252,7 @@ async fn trigger_schedule() {
         .unwrap();
 
     handle
-        .trigger(ScheduleOverlapPolicy::AllowAll)
+        .trigger(ScheduleOverlapPolicy::AllowAll, Default::default())
         .await
         .unwrap();
 
@@ -245,7 +260,10 @@ async fn trigger_schedule() {
         || {
             let handle = client.get_schedule_handle(&schedule_id);
             async move {
-                let desc = handle.describe().await.map_err(|e| e.to_string())?;
+                let desc = handle
+                    .describe(Default::default())
+                    .await
+                    .map_err(|e| e.to_string())?;
                 if desc.action_count() > 0 {
                     Ok(desc)
                 } else {
@@ -260,7 +278,7 @@ async fn trigger_schedule() {
 
     assert!(desc.action_count() >= 1);
 
-    handle.delete().await.unwrap();
+    handle.delete(Default::default()).await.unwrap();
 }
 
 #[tokio::test]
@@ -288,13 +306,16 @@ async fn backfill_schedule() {
     let now = SystemTime::now();
     let two_hours_ago = now - Duration::from_secs(7200);
     handle
-        .backfill([ScheduleBackfill::new(two_hours_ago, now)
-            .overlap_policy(ScheduleOverlapPolicy::AllowAll)
-            .build()])
+        .backfill(
+            [ScheduleBackfill::new(two_hours_ago, now)
+                .overlap_policy(ScheduleOverlapPolicy::AllowAll)
+                .build()],
+            Default::default(),
+        )
         .await
         .unwrap();
 
-    handle.delete().await.unwrap();
+    handle.delete(Default::default()).await.unwrap();
 }
 
 #[tokio::test]
@@ -320,9 +341,9 @@ async fn delete_schedule() {
         .unwrap();
 
     let handle = client.get_schedule_handle(&schedule_id);
-    handle.delete().await.unwrap();
+    handle.delete(Default::default()).await.unwrap();
 
-    let err = handle.describe().await.unwrap_err();
+    let err = handle.describe(Default::default()).await.unwrap_err();
     assert!(err.to_string().contains("not found") || err.to_string().contains("NotFound"));
 }
 
@@ -349,10 +370,10 @@ async fn get_schedule_handle_for_existing_schedule() {
         .unwrap();
 
     let handle = client.get_schedule_handle(&schedule_id);
-    let desc = handle.describe().await.unwrap();
+    let desc = handle.describe(Default::default()).await.unwrap();
     assert!(desc.paused());
 
-    handle.delete().await.unwrap();
+    handle.delete(Default::default()).await.unwrap();
 }
 
 #[tokio::test]
@@ -417,7 +438,11 @@ async fn list_schedules() {
     assert_eq!(found_ids.len(), num_schedules);
 
     for id in &schedule_ids {
-        client.get_schedule_handle(id).delete().await.unwrap();
+        client
+            .get_schedule_handle(id)
+            .delete(Default::default())
+            .await
+            .unwrap();
     }
 }
 
@@ -444,7 +469,7 @@ async fn describe_accessors_match_created_values() {
         .await
         .unwrap();
 
-    let desc = handle.describe().await.unwrap();
+    let desc = handle.describe(Default::default()).await.unwrap();
 
     assert!(desc.paused());
     assert_eq!(desc.note(), Some("accessors test"));
@@ -455,7 +480,7 @@ async fn describe_accessors_match_created_values() {
     assert!(desc.running_actions().is_empty());
     assert!(desc.create_time().is_some());
 
-    handle.delete().await.unwrap();
+    handle.delete(Default::default()).await.unwrap();
 }
 
 #[tokio::test]
@@ -489,7 +514,7 @@ async fn create_schedule_with_workflow_input() {
         .await
         .unwrap();
 
-    let desc = handle.describe().await.unwrap();
+    let desc = handle.describe(Default::default()).await.unwrap();
     assert!(desc.paused());
 
     let ScheduleDescriptionAction::StartWorkflow(action) = desc.action() else {
@@ -510,7 +535,7 @@ async fn create_schedule_with_workflow_input() {
         .expect("input should be present");
     assert_eq!(stored.payloads, vec![expected_payload]);
 
-    handle.delete().await.unwrap();
+    handle.delete(Default::default()).await.unwrap();
 }
 
 #[tokio::test]
@@ -536,7 +561,7 @@ async fn schedule_action_start_workflow_encodes_typed_input() {
         .await
         .unwrap();
 
-    let desc = handle.describe().await.unwrap();
+    let desc = handle.describe(Default::default()).await.unwrap();
     let ScheduleDescriptionAction::StartWorkflow(action) = desc.action() else {
         panic!("expected start workflow action")
     };
@@ -551,5 +576,5 @@ async fn schedule_action_start_workflow_encodes_typed_input() {
         .expect("input should be present");
     assert_eq!(stored, "hello");
 
-    handle.delete().await.unwrap();
+    handle.delete(Default::default()).await.unwrap();
 }

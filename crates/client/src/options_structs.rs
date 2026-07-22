@@ -1,4 +1,6 @@
-use crate::{HttpConnectProxyOptions, RetryOptions, VERSION, callback_based};
+use crate::{
+    ClientInterceptor, HttpConnectProxyOptions, RetryOptions, RpcOptions, VERSION, callback_based,
+};
 use http::Uri;
 use std::{collections::HashMap, sync::Arc, time::Duration};
 use temporalio_common::{
@@ -138,7 +140,7 @@ impl ConnectionOptions {
 }
 
 /// Options for [crate::Client::new].
-#[derive(Clone, Debug, bon::Builder)]
+#[derive(Clone, derive_more::Debug, bon::Builder)]
 #[non_exhaustive]
 #[builder(start_fn = new, on(String, into), state_mod(vis = "pub"))]
 pub struct ClientOptions {
@@ -148,6 +150,10 @@ pub struct ClientOptions {
     /// The data converter used for serializing/deserializing payloads.
     #[builder(default)]
     pub data_converter: DataConverter,
+    /// Interceptors for high-level client operations, ordered outermost to innermost.
+    #[builder(default)]
+    #[debug(skip)]
+    pub client_interceptors: Vec<Arc<dyn ClientInterceptor>>,
 }
 
 /// Selects the transport-level compression used for gRPC calls. See
@@ -356,6 +362,10 @@ pub struct WorkflowStartOptions {
 
     /// Multi-line static details for the workflow, shown in the Temporal UI.
     pub static_details: Option<String>,
+
+    /// Controls for the RPC used to start the workflow.
+    #[builder(default)]
+    pub rpc_options: RpcOptions,
 }
 
 /// A signal to send atomically when starting a workflow.
@@ -376,17 +386,23 @@ pub struct WorkflowStartSignal {
 pub use temporalio_common::Priority;
 
 /// Options for fetching workflow results
-#[derive(Debug, Clone, Copy, bon::Builder)]
+#[derive(Debug, Clone, bon::Builder)]
 #[non_exhaustive]
 pub struct WorkflowGetResultOptions {
     /// If true (the default), follows to the next workflow run in the execution chain while
     /// retrieving results.
     #[builder(default = true)]
     pub follow_runs: bool,
+    /// Controls for each history RPC used to retrieve the result.
+    #[builder(default)]
+    pub rpc_options: RpcOptions,
 }
 impl Default for WorkflowGetResultOptions {
     fn default() -> Self {
-        Self { follow_runs: true }
+        Self {
+            follow_runs: true,
+            rpc_options: RpcOptions::default(),
+        }
     }
 }
 
@@ -398,6 +414,9 @@ pub struct WorkflowExecuteUpdateOptions {
     pub update_id: Option<String>,
     /// Headers to include.
     pub header: Option<Header>,
+    /// Controls for the start-update and poll-update RPCs.
+    #[builder(default)]
+    pub rpc_options: RpcOptions,
 }
 
 /// Options for sending a signal to a workflow.
@@ -408,6 +427,9 @@ pub struct WorkflowSignalOptions {
     pub request_id: Option<String>,
     /// Headers to include with the signal.
     pub header: Option<Header>,
+    /// Controls for the signal RPC.
+    #[builder(default)]
+    pub rpc_options: RpcOptions,
 }
 
 /// Options for querying a workflow.
@@ -419,6 +441,9 @@ pub struct WorkflowQueryOptions {
     pub reject_condition: Option<QueryRejectCondition>,
     /// Headers to include with the query.
     pub header: Option<Header>,
+    /// Controls for the query RPC.
+    #[builder(default)]
+    pub rpc_options: RpcOptions,
 }
 
 /// Options for cancelling a workflow.
@@ -431,6 +456,9 @@ pub struct WorkflowCancelOptions {
     pub reason: String,
     /// Request ID for idempotency. If not provided, a UUID will be generated.
     pub request_id: Option<String>,
+    /// Controls for the cancellation RPC.
+    #[builder(default)]
+    pub rpc_options: RpcOptions,
 }
 
 /// Options for terminating a workflow.
@@ -443,12 +471,19 @@ pub struct WorkflowTerminateOptions {
     pub reason: String,
     /// Additional details to include with the termination.
     pub details: Option<Payloads>,
+    /// Controls for the termination RPC.
+    #[builder(default)]
+    pub rpc_options: RpcOptions,
 }
 
 /// Options for describing a workflow.
 #[derive(Debug, Clone, Default, bon::Builder)]
 #[non_exhaustive]
-pub struct WorkflowDescribeOptions {}
+pub struct WorkflowDescribeOptions {
+    /// Controls for the describe RPC.
+    #[builder(default)]
+    pub rpc_options: RpcOptions,
+}
 
 /// Default workflow execution retention for a Namespace is 3 days
 const DEFAULT_WORKFLOW_EXECUTION_RETENTION_PERIOD: Duration = Duration::from_secs(60 * 60 * 24 * 3);
@@ -532,6 +567,9 @@ pub struct WorkflowFetchHistoryOptions {
     /// Specifies which kind of events will be retrieved. Defaults to all events.
     #[builder(default = HistoryEventFilterType::AllEvent)]
     pub event_filter_type: HistoryEventFilterType,
+    /// Controls for each history page RPC.
+    #[builder(default)]
+    pub rpc_options: RpcOptions,
 }
 
 /// Which lifecycle stage to wait for when starting an update.
@@ -558,6 +596,9 @@ pub struct WorkflowStartUpdateOptions {
     /// The lifecycle stage to wait for before returning the handle.
     #[builder(default)]
     pub wait_for_stage: WorkflowUpdateWaitStage,
+    /// Controls for the start-update RPC.
+    #[builder(default)]
+    pub rpc_options: RpcOptions,
 }
 
 /// Options for listing workflows.
@@ -567,9 +608,16 @@ pub struct WorkflowListOptions {
     /// Maximum number of workflows to return.
     /// If not specified, returns all matching workflows.
     pub limit: Option<usize>,
+    /// Controls for each list page RPC.
+    #[builder(default)]
+    pub rpc_options: RpcOptions,
 }
 
 /// Options for counting workflows.
 #[derive(Debug, Clone, Default, bon::Builder)]
 #[non_exhaustive]
-pub struct WorkflowCountOptions {}
+pub struct WorkflowCountOptions {
+    /// Controls for the count RPC.
+    #[builder(default)]
+    pub rpc_options: RpcOptions,
+}

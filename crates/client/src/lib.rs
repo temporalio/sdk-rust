@@ -15,6 +15,8 @@ mod dns;
 pub mod envconfig;
 pub mod errors;
 pub mod grpc;
+/// Interceptors for high-level client operations.
+pub mod interceptors;
 mod metrics;
 mod options_structs;
 /// Visible only for tests
@@ -23,6 +25,7 @@ pub mod proxy;
 mod replaceable;
 pub mod request_extensions;
 mod retry;
+mod rpc_options;
 /// Schedule operations: create, describe, update, pause, trigger, backfill, list, and delete.
 pub mod schedules;
 #[cfg(test)]
@@ -42,10 +45,24 @@ pub use async_activity_handle::{
 #[doc(hidden)]
 pub use retry::jittered;
 
+pub use interceptors::{
+    BackfillScheduleInput, CancelWorkflowInput, ClientInterceptor, CompleteAsyncActivityInput,
+    CountWorkflowsInput, CountWorkflowsOutput, CreateScheduleInput, CreateScheduleOutput,
+    DeleteScheduleInput, DescribeScheduleInput, DescribeScheduleOutput, DescribeWorkflowInput,
+    DescribeWorkflowOutput, FailAsyncActivityInput, FetchWorkflowHistoryPageInput,
+    FetchWorkflowHistoryPageOutput, HeartbeatAsyncActivityInput, ListSchedulesPageInput,
+    ListSchedulesPageOutput, ListWorkflowsPageInput, ListWorkflowsPageOutput, Next,
+    PauseScheduleInput, PollWorkflowUpdateInput, PollWorkflowUpdateOutput, QueryWorkflowInput,
+    QueryWorkflowOutput, ReportAsyncActivityCancellationInput, SendScheduleUpdateInput,
+    SignalWorkflowInput, StartWorkflowInput, StartWorkflowOutput, StartWorkflowUpdateInput,
+    StartWorkflowUpdateOutput, TemporalClientValue, TerminateWorkflowInput, TriggerScheduleInput,
+    UnpauseScheduleInput, UpdateScheduleInput,
+};
 pub use metrics::{LONG_REQUEST_LATENCY_HISTOGRAM_NAME, REQUEST_LATENCY_HISTOGRAM_NAME};
 pub use options_structs::*;
 pub use replaceable::SharedReplaceableClient;
 pub use retry::RetryOptions;
+pub use rpc_options::{RpcMetadata, RpcMetadataError, RpcOptions};
 pub use temporalio_common::{Memo, RetryPolicy};
 /// Potentially dangerous TLS related functionality.
 pub mod danger {
@@ -72,7 +89,7 @@ use crate::{
     worker::ClientWorkerSet,
 };
 use errors::*;
-use futures_util::{stream, stream::Stream};
+use futures_util::{future::BoxFuture, stream, stream::Stream};
 use http::Uri;
 use parking_lot::RwLock;
 use std::{
@@ -856,6 +873,10 @@ impl NamespacedClient for Client {
     fn data_converter(&self) -> &DataConverter {
         &self.options.data_converter
     }
+
+    fn client_interceptors(&self) -> &[Arc<dyn ClientInterceptor>] {
+        &self.options.client_interceptors
+    }
 }
 
 /// Enum to help reference a namespace by either the namespace name or the namespace id
@@ -933,6 +954,16 @@ pub trait NamespacedClient {
     fn data_converter(&self) -> &DataConverter {
         static DEFAULT: OnceLock<DataConverter> = OnceLock::new();
         DEFAULT.get_or_init(DataConverter::default)
+    }
+    /// Returns the interceptors used for high-level client operations.
+    ///
+    /// # Warning
+    ///
+    /// This provider exists so SDK-owned client handles can carry interceptor configuration
+    /// through the high-level client blanket implementation. Custom client implementations should
+    /// normally retain the default empty chain unless they deliberately provide the same plumbing.
+    fn client_interceptors(&self) -> &[Arc<dyn ClientInterceptor>] {
+        &[]
     }
 }
 
@@ -1176,133 +1207,181 @@ where
         W: HasWorkflowDefinition,
         W::Input: Send,
     {
-        let payloads = self
-            .data_converter()
-            .to_payloads(&SerializationContextData::Workflow, &input)
-            .await?;
         let namespace = self.namespace();
-        let workflow_id = options.workflow_id.clone();
-        let task_queue_name = options.task_queue.clone();
+        let interceptor_output = interceptors::call_start_workflow(
+            self.client_interceptors(),
+            StartWorkflowInput::new(workflow.name().to_owned(), input, options),
+            Next::new({
+                let client = (*self).clone();
+                move |input: StartWorkflowInput| -> BoxFuture<
+                    '_,
+                    Result<StartWorkflowOutput, WorkflowStartError>,
+                > {
+                    let mut client = client;
+                    Box::pin(async move {
+                        let (workflow_type, args, options, rpc_options) = input.into_parts();
+                        let data_converter = client.data_converter().clone();
+                        let unencoded_payloads = {
+                            let payload_converter = data_converter.payload_converter();
+                            let context = SerializationContext {
+                                data: &SerializationContextData::Workflow,
+                                converter: payload_converter,
+                            };
+                            args.serialize_payloads(&context)
+                        };
+                        drop(args);
 
-        let user_metadata = if options.static_summary.is_some() || options.static_details.is_some()
-        {
-            let payload_converter = PayloadConverter::default();
-            let context = SerializationContext {
-                data: &SerializationContextData::Workflow,
-                converter: &payload_converter,
-            };
-            Some(UserMetadata {
-                summary: options.static_summary.map(|s| {
-                    payload_converter
-                        .to_payload(&context, &s)
-                        .expect("String-to-JSON payload serialization is infallible")
-                }),
-                details: options.static_details.map(|s| {
-                    payload_converter
-                        .to_payload(&context, &s)
-                        .expect("String-to-JSON payload serialization is infallible")
-                }),
-            })
-        } else {
-            None
-        };
+                        let payloads = data_converter
+                            .codec()
+                            .encode(&SerializationContextData::Workflow, unencoded_payloads?)
+                            .await;
+                        let namespace = client.namespace();
+                        let workflow_id = options.workflow_id.clone();
+                        let task_queue_name = options.task_queue.clone();
 
-        let run_id = if let Some(start_signal) = options.start_signal {
-            // Use signal-with-start when a start_signal is provided
-            let res = WorkflowService::signal_with_start_workflow_execution(
-                &mut self.clone(),
-                SignalWithStartWorkflowExecutionRequest {
-                    namespace: namespace.clone(),
-                    workflow_id: workflow_id.clone(),
-                    workflow_type: Some(WorkflowType {
-                        name: workflow.name().to_string(),
-                    }),
-                    task_queue: Some(TaskQueue {
-                        name: task_queue_name,
-                        kind: TaskQueueKind::Normal as i32,
-                        normal_name: "".to_string(),
-                    }),
-                    input: payloads.into_payloads(),
-                    signal_name: start_signal.signal_name,
-                    signal_input: start_signal.input,
-                    identity: self.identity(),
-                    request_id: Uuid::new_v4().to_string(),
-                    workflow_id_reuse_policy: options.id_reuse_policy as i32,
-                    workflow_id_conflict_policy: options.id_conflict_policy as i32,
-                    workflow_execution_timeout: options
-                        .execution_timeout
-                        .and_then(|d| d.try_into().ok()),
-                    workflow_run_timeout: options.run_timeout.and_then(|d| d.try_into().ok()),
-                    workflow_task_timeout: options.task_timeout.and_then(|d| d.try_into().ok()),
-                    search_attributes: options.search_attributes.map(|t| t.into_proto()),
-                    cron_schedule: options.cron_schedule.unwrap_or_default(),
-                    retry_policy: options.retry_policy.map(Into::into),
-                    header: options.header.or(start_signal.header),
-                    user_metadata,
-                    ..Default::default()
-                }
-                .into_request(),
-            )
-            .await?
-            .into_inner();
-            res.run_id
-        } else {
-            // Normal start workflow
-            let res = self
-                .clone()
-                .start_workflow_execution(
-                    StartWorkflowExecutionRequest {
-                        namespace: namespace.clone(),
-                        input: payloads.into_payloads(),
-                        workflow_id: workflow_id.clone(),
-                        workflow_type: Some(WorkflowType {
-                            name: workflow.name().to_string(),
-                        }),
-                        task_queue: Some(TaskQueue {
-                            name: task_queue_name,
-                            kind: TaskQueueKind::Unspecified as i32,
-                            normal_name: "".to_string(),
-                        }),
-                        request_id: Uuid::new_v4().to_string(),
-                        workflow_id_reuse_policy: options.id_reuse_policy as i32,
-                        workflow_id_conflict_policy: options.id_conflict_policy as i32,
-                        workflow_execution_timeout: options
-                            .execution_timeout
-                            .and_then(|d| d.try_into().ok()),
-                        workflow_run_timeout: options.run_timeout.and_then(|d| d.try_into().ok()),
-                        workflow_task_timeout: options.task_timeout.and_then(|d| d.try_into().ok()),
-                        search_attributes: options.search_attributes.map(|t| t.into_proto()),
-                        cron_schedule: options.cron_schedule.unwrap_or_default(),
-                        request_eager_execution: options.enable_eager_workflow_start,
-                        retry_policy: options.retry_policy.map(Into::into),
-                        links: options.links,
-                        completion_callbacks: options.completion_callbacks,
-                        priority: Some(options.priority.into()),
-                        header: options.header,
-                        user_metadata,
-                        ..Default::default()
-                    }
-                    .into_request(),
-                )
-                .await
-                .map_err(|status| {
-                    if status.code() == Code::AlreadyExists {
-                        let run_id =
-                            decode_status_detail::<WorkflowExecutionAlreadyStartedFailure>(
-                                status.details(),
+                        let user_metadata = if options.static_summary.is_some()
+                            || options.static_details.is_some()
+                        {
+                            let payload_converter = PayloadConverter::default();
+                            let context = SerializationContext {
+                                data: &SerializationContextData::Workflow,
+                                converter: &payload_converter,
+                            };
+                            Some(UserMetadata {
+                                summary: options.static_summary.map(|summary| {
+                                    payload_converter.to_payload(&context, &summary).expect(
+                                        "String-to-JSON payload serialization is infallible",
+                                    )
+                                }),
+                                details: options.static_details.map(|details| {
+                                    payload_converter.to_payload(&context, &details).expect(
+                                        "String-to-JSON payload serialization is infallible",
+                                    )
+                                }),
+                            })
+                        } else {
+                            None
+                        };
+
+                        let run_id = if let Some(start_signal) = options.start_signal {
+                            let mut request = SignalWithStartWorkflowExecutionRequest {
+                                namespace,
+                                workflow_id: workflow_id.clone(),
+                                workflow_type: Some(WorkflowType {
+                                    name: workflow_type,
+                                }),
+                                task_queue: Some(TaskQueue {
+                                    name: task_queue_name,
+                                    kind: TaskQueueKind::Normal as i32,
+                                    normal_name: String::new(),
+                                }),
+                                input: payloads.into_payloads(),
+                                signal_name: start_signal.signal_name,
+                                signal_input: start_signal.input,
+                                identity: client.identity(),
+                                request_id: Uuid::new_v4().to_string(),
+                                workflow_id_reuse_policy: options.id_reuse_policy as i32,
+                                workflow_id_conflict_policy: options.id_conflict_policy as i32,
+                                workflow_execution_timeout: options
+                                    .execution_timeout
+                                    .and_then(|duration| duration.try_into().ok()),
+                                workflow_run_timeout: options
+                                    .run_timeout
+                                    .and_then(|duration| duration.try_into().ok()),
+                                workflow_task_timeout: options
+                                    .task_timeout
+                                    .and_then(|duration| duration.try_into().ok()),
+                                search_attributes: options
+                                    .search_attributes
+                                    .map(|attributes| attributes.into_proto()),
+                                cron_schedule: options.cron_schedule.unwrap_or_default(),
+                                retry_policy: options.retry_policy.map(Into::into),
+                                header: options.header.or(start_signal.header),
+                                user_metadata,
+                                ..Default::default()
+                            }
+                            .into_request();
+                            rpc_options.apply_to(&mut request);
+                            WorkflowService::signal_with_start_workflow_execution(
+                                &mut client,
+                                request,
                             )
-                            .map(|f| f.run_id);
-                        WorkflowStartError::AlreadyStarted {
-                            run_id,
-                            source: status,
-                        }
-                    } else {
-                        WorkflowStartError::Rpc(status)
-                    }
-                })?
-                .into_inner();
-            res.run_id
-        };
+                            .await?
+                            .into_inner()
+                            .run_id
+                        } else {
+                            let mut request = StartWorkflowExecutionRequest {
+                                namespace,
+                                input: payloads.into_payloads(),
+                                workflow_id: workflow_id.clone(),
+                                workflow_type: Some(WorkflowType {
+                                    name: workflow_type,
+                                }),
+                                task_queue: Some(TaskQueue {
+                                    name: task_queue_name,
+                                    kind: TaskQueueKind::Unspecified as i32,
+                                    normal_name: String::new(),
+                                }),
+                                request_id: Uuid::new_v4().to_string(),
+                                workflow_id_reuse_policy: options.id_reuse_policy as i32,
+                                workflow_id_conflict_policy: options.id_conflict_policy as i32,
+                                workflow_execution_timeout: options
+                                    .execution_timeout
+                                    .and_then(|duration| duration.try_into().ok()),
+                                workflow_run_timeout: options
+                                    .run_timeout
+                                    .and_then(|duration| duration.try_into().ok()),
+                                workflow_task_timeout: options
+                                    .task_timeout
+                                    .and_then(|duration| duration.try_into().ok()),
+                                search_attributes: options
+                                    .search_attributes
+                                    .map(|attributes| attributes.into_proto()),
+                                cron_schedule: options.cron_schedule.unwrap_or_default(),
+                                request_eager_execution: options.enable_eager_workflow_start,
+                                retry_policy: options.retry_policy.map(Into::into),
+                                links: options.links,
+                                completion_callbacks: options.completion_callbacks,
+                                priority: Some(options.priority.into()),
+                                header: options.header,
+                                user_metadata,
+                                ..Default::default()
+                            }
+                            .into_request();
+                            rpc_options.apply_to(&mut request);
+                            client
+                                .start_workflow_execution(request)
+                                .await
+                                .map_err(|status| {
+                                    if status.code() == Code::AlreadyExists {
+                                        let run_id = decode_status_detail::<
+                                            WorkflowExecutionAlreadyStartedFailure,
+                                        >(
+                                            status.details()
+                                        )
+                                        .map(|failure| failure.run_id);
+                                        WorkflowStartError::AlreadyStarted {
+                                            run_id,
+                                            source: status,
+                                        }
+                                    } else {
+                                        WorkflowStartError::Rpc(status)
+                                    }
+                                })?
+                                .into_inner()
+                                .run_id
+                        };
+
+                        Ok(StartWorkflowOutput::new(workflow_id, run_id))
+                    })
+                }
+            }),
+        )
+        .await?;
+        let StartWorkflowOutput {
+            workflow_id,
+            run_id,
+        } = interceptor_output;
 
         Ok(WorkflowHandle::new(
             self.clone(),
@@ -1342,6 +1421,7 @@ where
         let namespace = self.namespace();
         let query = query.into();
         let limit = opts.limit;
+        let rpc_options = opts.rpc_options;
 
         // State: (next_page_token, buffer, yielded_count, exhausted)
         let initial_state = (Vec::new(), VecDeque::new(), 0, false);
@@ -1349,9 +1429,10 @@ where
         let stream = stream::unfold(
             initial_state,
             move |(next_page_token, mut buffer, mut yielded, exhausted)| {
-                let mut client = client.clone();
+                let client = client.clone();
                 let namespace = namespace.clone();
                 let query = query.clone();
+                let rpc_options = rpc_options.clone();
 
                 async move {
                     if let Some(l) = limit
@@ -1369,26 +1450,51 @@ where
                         return None;
                     }
 
-                    let response = WorkflowService::list_workflow_executions(
-                        &mut client,
-                        ListWorkflowExecutionsRequest {
-                            namespace,
-                            page_size: 0, // Use server default
-                            next_page_token: next_page_token.clone(),
+                    let response = interceptors::call_list_workflows_page(
+                        client.client_interceptors(),
+                        ListWorkflowsPageInput {
                             query,
-                        }
-                        .into_request(),
+                            next_page_token: next_page_token.clone(),
+                            rpc_options,
+                        },
+                        Next::new({
+                            let mut rpc_client = client.clone();
+                            move |input: ListWorkflowsPageInput| -> BoxFuture<
+                                '_,
+                                Result<ListWorkflowsPageOutput, ClientError>,
+                            > {
+                                Box::pin(async move {
+                                    let mut request = ListWorkflowExecutionsRequest {
+                                        namespace,
+                                        page_size: 0,
+                                        next_page_token: input.next_page_token,
+                                        query: input.query,
+                                    }
+                                    .into_request();
+                                    input.rpc_options.apply_to(&mut request);
+                                    let response = WorkflowService::list_workflow_executions(
+                                        &mut rpc_client,
+                                        request,
+                                    )
+                                    .await?
+                                    .into_inner();
+                                    Ok(ListWorkflowsPageOutput::new(
+                                        response.executions,
+                                        response.next_page_token,
+                                    ))
+                                })
+                            }
+                        }),
                     )
                     .await;
 
                     match response {
-                        Ok(resp) => {
-                            let mut resp = resp.into_inner();
-                            let new_exhausted = resp.next_page_token.is_empty();
-                            let new_token = resp.next_page_token;
+                        Ok(mut output) => {
+                            let new_exhausted = output.next_page_token.is_empty();
+                            let new_token = output.next_page_token;
 
                             let data_converter = client.data_converter().clone();
-                            for execution in &mut resp.executions {
+                            for execution in &mut output.executions {
                                 if let Some(memo) = execution.memo.as_mut() {
                                     decode_payloads(
                                         memo,
@@ -1398,7 +1504,7 @@ where
                                     .await;
                                 }
                             }
-                            buffer = resp
+                            buffer = output
                                 .executions
                                 .into_iter()
                                 .map(|raw| {
@@ -1416,7 +1522,7 @@ where
                                 None
                             }
                         }
-                        Err(e) => Some((Err(e.into()), (next_page_token, buffer, yielded, true))),
+                        Err(e) => Some((Err(e), (next_page_token, buffer, yielded, true))),
                     }
                 }
             },
@@ -1428,20 +1534,41 @@ where
     async fn count_workflows(
         &self,
         query: impl Into<String>,
-        _opts: WorkflowCountOptions,
+        opts: WorkflowCountOptions,
     ) -> Result<WorkflowExecutionCount, ClientError> {
-        let resp = WorkflowService::count_workflow_executions(
-            &mut self.clone(),
-            CountWorkflowExecutionsRequest {
-                namespace: self.namespace(),
+        let output = interceptors::call_count_workflows(
+            self.client_interceptors(),
+            CountWorkflowsInput {
                 query: query.into(),
-            }
-            .into_request(),
+                options: opts,
+            },
+            Next::new({
+                let mut client = (*self).clone();
+                move |input: CountWorkflowsInput| -> BoxFuture<
+                    '_,
+                    Result<CountWorkflowsOutput, ClientError>,
+                > {
+                    Box::pin(async move {
+                        let mut request = CountWorkflowExecutionsRequest {
+                            namespace: client.namespace(),
+                            query: input.query,
+                        }
+                        .into_request();
+                        input.options.rpc_options.apply_to(&mut request);
+                        let response = WorkflowService::count_workflow_executions(
+                            &mut client,
+                            request,
+                        )
+                        .await?
+                        .into_inner();
+                        Ok(CountWorkflowsOutput::new(response))
+                    })
+                }
+            }),
         )
-        .await?
-        .into_inner();
+        .await?;
 
-        Ok(WorkflowExecutionCount::from_response(resp))
+        Ok(WorkflowExecutionCount::from_response(output.response))
     }
 
     fn get_async_activity_handle(&self, identifier: ActivityIdentifier) -> AsyncActivityHandle<Self>
@@ -1832,6 +1959,593 @@ mod tests {
         }
     }
 
+    mod start_workflow_interceptor_tests {
+        use super::*;
+        use crate::request_extensions::RetryConfigForCall;
+        use parking_lot::Mutex;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use temporalio_common::{
+            HasWorkflowDefinition, WorkflowDefinition,
+            data_converters::{
+                DefaultFailureConverter, PayloadCodec, PayloadConversionError,
+                SerializationContext, SerializationContextData, TemporalSerializable,
+            },
+            protos::temporal::api::common::v1::Payload,
+        };
+        use tonic::{Request, Response};
+
+        struct TestWorkflow;
+
+        impl WorkflowDefinition for TestWorkflow {
+            type Input = Vec<String>;
+            type Output = ();
+
+            fn name(&self) -> &str {
+                "test-workflow"
+            }
+        }
+
+        impl HasWorkflowDefinition for TestWorkflow {
+            type Run = Self;
+        }
+
+        #[derive(Default)]
+        struct RecordedStart {
+            calls: usize,
+            workflow_type: String,
+            payloads: Vec<Payload>,
+            ascii_metadata: Option<String>,
+            binary_metadata: Option<Vec<u8>>,
+            grpc_timeout: Option<String>,
+            retry_options: Option<RetryOptions>,
+        }
+
+        struct CountingCodec {
+            encode_calls: Arc<AtomicUsize>,
+        }
+
+        impl PayloadCodec for CountingCodec {
+            fn encode(
+                &self,
+                _context: &SerializationContextData,
+                payloads: Vec<Payload>,
+            ) -> futures_util::future::BoxFuture<'static, Vec<Payload>> {
+                self.encode_calls.fetch_add(1, Ordering::SeqCst);
+                Box::pin(async move { payloads })
+            }
+
+            fn decode(
+                &self,
+                _context: &SerializationContextData,
+                payloads: Vec<Payload>,
+            ) -> futures_util::future::BoxFuture<'static, Vec<Payload>> {
+                Box::pin(async move { payloads })
+            }
+        }
+
+        #[derive(Clone)]
+        struct MockStartWorkflowClient {
+            recorded: Arc<Mutex<RecordedStart>>,
+            data_converter: DataConverter,
+        }
+
+        impl NamespacedClient for MockStartWorkflowClient {
+            fn namespace(&self) -> String {
+                "test-namespace".to_owned()
+            }
+
+            fn identity(&self) -> String {
+                "test-identity".to_owned()
+            }
+
+            fn data_converter(&self) -> &DataConverter {
+                &self.data_converter
+            }
+        }
+
+        impl WorkflowService for MockStartWorkflowClient {
+            fn start_workflow_execution(
+                &mut self,
+                request: Request<StartWorkflowExecutionRequest>,
+            ) -> futures_util::future::BoxFuture<
+                '_,
+                Result<Response<StartWorkflowExecutionResponse>, tonic::Status>,
+            > {
+                let ascii_metadata = request
+                    .metadata()
+                    .get("call-meta")
+                    .map(|value| value.to_str().unwrap().to_owned());
+                let binary_metadata = request
+                    .metadata()
+                    .get_bin("call-meta-bin")
+                    .map(|value| value.to_bytes().unwrap().to_vec());
+                let grpc_timeout = request
+                    .metadata()
+                    .get("grpc-timeout")
+                    .map(|value| value.to_str().unwrap().to_owned());
+                let retry_options = request
+                    .extensions()
+                    .get::<RetryConfigForCall>()
+                    .map(|config| config.0.clone());
+                let request = request.into_inner();
+                let mut recorded = self.recorded.lock();
+                recorded.calls += 1;
+                recorded.workflow_type = request.workflow_type.unwrap().name;
+                recorded.payloads = request.input.unwrap_or_default().payloads;
+                recorded.ascii_metadata = ascii_metadata;
+                recorded.binary_metadata = binary_metadata;
+                recorded.grpc_timeout = grpc_timeout;
+                recorded.retry_options = retry_options;
+
+                Box::pin(async {
+                    Ok(Response::new(StartWorkflowExecutionResponse {
+                        run_id: "server-run-id".to_owned(),
+                        ..Default::default()
+                    }))
+                })
+            }
+
+            fn signal_with_start_workflow_execution(
+                &mut self,
+                request: Request<SignalWithStartWorkflowExecutionRequest>,
+            ) -> futures_util::future::BoxFuture<
+                '_,
+                Result<Response<SignalWithStartWorkflowExecutionResponse>, tonic::Status>,
+            > {
+                let ascii_metadata = request
+                    .metadata()
+                    .get("call-meta")
+                    .map(|value| value.to_str().unwrap().to_owned());
+                let binary_metadata = request
+                    .metadata()
+                    .get_bin("call-meta-bin")
+                    .map(|value| value.to_bytes().unwrap().to_vec());
+                let grpc_timeout = request
+                    .metadata()
+                    .get("grpc-timeout")
+                    .map(|value| value.to_str().unwrap().to_owned());
+                let retry_options = request
+                    .extensions()
+                    .get::<RetryConfigForCall>()
+                    .map(|config| config.0.clone());
+                let request = request.into_inner();
+                let mut recorded = self.recorded.lock();
+                recorded.calls += 1;
+                recorded.workflow_type = request.workflow_type.unwrap().name;
+                recorded.payloads = request.input.unwrap_or_default().payloads;
+                recorded.ascii_metadata = ascii_metadata;
+                recorded.binary_metadata = binary_metadata;
+                recorded.grpc_timeout = grpc_timeout;
+                recorded.retry_options = retry_options;
+
+                Box::pin(async {
+                    Ok(Response::new(SignalWithStartWorkflowExecutionResponse {
+                        run_id: "signal-server-run-id".to_owned(),
+                        ..Default::default()
+                    }))
+                })
+            }
+        }
+
+        #[derive(Clone)]
+        struct InterceptedClient {
+            inner: MockStartWorkflowClient,
+            interceptors: Vec<Arc<dyn ClientInterceptor>>,
+        }
+
+        impl NamespacedClient for InterceptedClient {
+            fn namespace(&self) -> String {
+                self.inner.namespace()
+            }
+
+            fn identity(&self) -> String {
+                self.inner.identity()
+            }
+
+            fn data_converter(&self) -> &DataConverter {
+                self.inner.data_converter()
+            }
+
+            fn client_interceptors(&self) -> &[Arc<dyn ClientInterceptor>] {
+                &self.interceptors
+            }
+        }
+
+        impl WorkflowService for InterceptedClient {
+            fn start_workflow_execution(
+                &mut self,
+                request: Request<StartWorkflowExecutionRequest>,
+            ) -> futures_util::future::BoxFuture<
+                '_,
+                Result<Response<StartWorkflowExecutionResponse>, tonic::Status>,
+            > {
+                self.inner.start_workflow_execution(request)
+            }
+
+            fn signal_with_start_workflow_execution(
+                &mut self,
+                request: Request<SignalWithStartWorkflowExecutionRequest>,
+            ) -> futures_util::future::BoxFuture<
+                '_,
+                Result<Response<SignalWithStartWorkflowExecutionResponse>, tonic::Status>,
+            > {
+                self.inner.signal_with_start_workflow_execution(request)
+            }
+        }
+
+        struct OrderedInterceptor {
+            name: &'static str,
+            events: Arc<Mutex<Vec<String>>>,
+            encode_calls: Arc<AtomicUsize>,
+        }
+
+        impl ClientInterceptor for OrderedInterceptor {
+            fn start_workflow<'a>(
+                &'a self,
+                mut input: StartWorkflowInput,
+                next: Next<
+                    'a,
+                    StartWorkflowInput,
+                    BoxFuture<'a, Result<StartWorkflowOutput, WorkflowStartError>>,
+                >,
+            ) -> BoxFuture<'a, Result<StartWorkflowOutput, WorkflowStartError>> {
+                Box::pin(async move {
+                    assert_eq!(self.encode_calls.load(Ordering::SeqCst), 0);
+                    self.events.lock().push(format!("{}-pre", self.name));
+                    tokio::task::yield_now().await;
+                    if self.name == "outer" {
+                        input
+                            .args_mut::<Vec<String>>()
+                            .unwrap()
+                            .push("mutated".to_owned());
+                    } else {
+                        assert_eq!(
+                            input.args_ref::<Vec<String>>().unwrap(),
+                            &["initial".to_owned(), "mutated".to_owned()]
+                        );
+                        input.replace_args("replacement".to_owned());
+                        input.workflow_type = "replacement-workflow".to_owned();
+                    }
+                    let result = next.run(input).await;
+                    tokio::task::yield_now().await;
+                    self.events.lock().push(format!("{}-post", self.name));
+                    result
+                })
+            }
+        }
+
+        struct ShortCircuitInterceptor;
+
+        impl ClientInterceptor for ShortCircuitInterceptor {
+            fn start_workflow<'a>(
+                &'a self,
+                input: StartWorkflowInput,
+                _next: Next<
+                    'a,
+                    StartWorkflowInput,
+                    BoxFuture<'a, Result<StartWorkflowOutput, WorkflowStartError>>,
+                >,
+            ) -> BoxFuture<'a, Result<StartWorkflowOutput, WorkflowStartError>> {
+                assert_eq!(
+                    input.args_ref::<Vec<String>>().unwrap(),
+                    &["initial".to_owned()]
+                );
+                Box::pin(async {
+                    Ok(StartWorkflowOutput::new(
+                        "short-circuit-workflow-id",
+                        "short-circuit-run-id",
+                    ))
+                })
+            }
+        }
+
+        struct CountingInput {
+            conversion_calls: Arc<AtomicUsize>,
+        }
+
+        impl TemporalSerializable for CountingInput {
+            fn to_payloads(
+                &self,
+                _context: &SerializationContext<'_>,
+            ) -> Result<Vec<Payload>, PayloadConversionError> {
+                self.conversion_calls.fetch_add(1, Ordering::SeqCst);
+                Ok(vec![Payload::default()])
+            }
+        }
+
+        struct ConversionTimingInterceptor {
+            conversion_calls: Arc<AtomicUsize>,
+        }
+
+        impl ClientInterceptor for ConversionTimingInterceptor {
+            fn start_workflow<'a>(
+                &'a self,
+                mut input: StartWorkflowInput,
+                next: Next<
+                    'a,
+                    StartWorkflowInput,
+                    BoxFuture<'a, Result<StartWorkflowOutput, WorkflowStartError>>,
+                >,
+            ) -> BoxFuture<'a, Result<StartWorkflowOutput, WorkflowStartError>> {
+                input.replace_args(CountingInput {
+                    conversion_calls: self.conversion_calls.clone(),
+                });
+                let future = next.run(input);
+                assert_eq!(self.conversion_calls.load(Ordering::SeqCst), 0);
+                future
+            }
+        }
+
+        fn mock_client(
+            interceptors: Vec<Arc<dyn ClientInterceptor>>,
+            encode_calls: Arc<AtomicUsize>,
+        ) -> (InterceptedClient, Arc<Mutex<RecordedStart>>) {
+            let recorded = Arc::new(Mutex::new(RecordedStart::default()));
+            let data_converter = DataConverter::new(
+                PayloadConverter::default(),
+                DefaultFailureConverter,
+                CountingCodec {
+                    encode_calls: encode_calls.clone(),
+                },
+            );
+            (
+                InterceptedClient {
+                    inner: MockStartWorkflowClient {
+                        recorded: recorded.clone(),
+                        data_converter,
+                    },
+                    interceptors,
+                },
+                recorded,
+            )
+        }
+
+        #[tokio::test]
+        async fn interceptors_order_mutate_replace_and_defer_conversion() {
+            let events = Arc::new(Mutex::new(Vec::new()));
+            let encode_calls = Arc::new(AtomicUsize::new(0));
+            let interceptors: Vec<Arc<dyn ClientInterceptor>> = vec![
+                Arc::new(OrderedInterceptor {
+                    name: "outer",
+                    events: events.clone(),
+                    encode_calls: encode_calls.clone(),
+                }),
+                Arc::new(OrderedInterceptor {
+                    name: "inner",
+                    events: events.clone(),
+                    encode_calls: encode_calls.clone(),
+                }),
+            ];
+            let (client, recorded) = mock_client(interceptors, encode_calls.clone());
+
+            let handle = client
+                .start_workflow(
+                    TestWorkflow,
+                    vec!["initial".to_owned()],
+                    WorkflowStartOptions::new("task-queue", "workflow-id").build(),
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(
+                events.lock().as_slice(),
+                ["outer-pre", "inner-pre", "inner-post", "outer-post"]
+            );
+            assert_eq!(encode_calls.load(Ordering::SeqCst), 1);
+            assert_eq!(handle.run_id(), Some("server-run-id"));
+            let payloads = {
+                let recorded = recorded.lock();
+                assert_eq!(recorded.calls, 1);
+                assert_eq!(recorded.workflow_type, "replacement-workflow");
+                recorded.payloads.clone()
+            };
+            let replacement: String = client
+                .data_converter()
+                .from_payloads(&SerializationContextData::Workflow, payloads)
+                .await
+                .unwrap();
+            assert_eq!(replacement, "replacement");
+        }
+
+        #[tokio::test]
+        async fn interceptor_can_short_circuit() {
+            let encode_calls = Arc::new(AtomicUsize::new(0));
+            let (client, recorded) = mock_client(
+                vec![Arc::new(ShortCircuitInterceptor)],
+                encode_calls.clone(),
+            );
+            let handle = client
+                .start_workflow(
+                    TestWorkflow,
+                    vec!["initial".to_owned()],
+                    WorkflowStartOptions::new("task-queue", "ignored-workflow-id").build(),
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(handle.info().workflow_id, "short-circuit-workflow-id");
+            assert_eq!(handle.run_id(), Some("short-circuit-run-id"));
+            assert_eq!(recorded.lock().calls, 0);
+            assert_eq!(encode_calls.load(Ordering::SeqCst), 0);
+        }
+
+        #[tokio::test]
+        async fn payload_conversion_waits_for_next_future_poll() {
+            let conversion_calls = Arc::new(AtomicUsize::new(0));
+            let encode_calls = Arc::new(AtomicUsize::new(0));
+            let recorded = Arc::new(Mutex::new(RecordedStart::default()));
+            let data_converter = DataConverter::new(
+                PayloadConverter::UseWrappers,
+                DefaultFailureConverter,
+                CountingCodec {
+                    encode_calls: encode_calls.clone(),
+                },
+            );
+            let client = InterceptedClient {
+                inner: MockStartWorkflowClient {
+                    recorded: recorded.clone(),
+                    data_converter,
+                },
+                interceptors: vec![Arc::new(ConversionTimingInterceptor {
+                    conversion_calls: conversion_calls.clone(),
+                })],
+            };
+
+            client
+                .start_workflow(
+                    TestWorkflow,
+                    vec!["initial".to_owned()],
+                    WorkflowStartOptions::new("task-queue", "workflow-id").build(),
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(conversion_calls.load(Ordering::SeqCst), 1);
+            assert_eq!(encode_calls.load(Ordering::SeqCst), 1);
+            assert_eq!(recorded.lock().calls, 1);
+        }
+
+        #[tokio::test]
+        async fn custom_client_defaults_to_empty_chain() {
+            let recorded = Arc::new(Mutex::new(RecordedStart::default()));
+            let client = MockStartWorkflowClient {
+                recorded: recorded.clone(),
+                data_converter: DataConverter::default(),
+            };
+            assert!(client.client_interceptors().is_empty());
+
+            client
+                .start_workflow(
+                    TestWorkflow,
+                    vec!["initial".to_owned()],
+                    WorkflowStartOptions::new("task-queue", "workflow-id").build(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(recorded.lock().calls, 1);
+        }
+
+        #[tokio::test]
+        async fn rpc_options_reach_the_request() {
+            let (client, recorded) = mock_client(Vec::new(), Arc::new(AtomicUsize::new(0)));
+            let mut rpc_options = RpcOptions {
+                timeout: Some(Duration::from_millis(250)),
+                retry_options: Some(RetryOptions::no_retries()),
+                ..Default::default()
+            };
+            rpc_options
+                .metadata
+                .insert("call-meta", "call-value")
+                .unwrap();
+            rpc_options
+                .metadata
+                .insert_binary("call-meta-bin", vec![0, 255])
+                .unwrap();
+            let mut options = WorkflowStartOptions::new("task-queue", "workflow-id").build();
+            options.rpc_options = rpc_options.clone();
+
+            client
+                .start_workflow(TestWorkflow, vec!["initial".to_owned()], options)
+                .await
+                .unwrap();
+
+            {
+                let recorded = recorded.lock();
+                assert_eq!(recorded.ascii_metadata.as_deref(), Some("call-value"));
+                assert_eq!(recorded.binary_metadata.as_deref(), Some(&[0, 255][..]));
+                assert_eq!(recorded.grpc_timeout.as_deref(), Some("250000u"));
+                assert_eq!(recorded.retry_options, Some(RetryOptions::no_retries()));
+            }
+
+            let mut options = WorkflowStartOptions::new("task-queue", "signal-workflow-id").build();
+            options.start_signal = Some(WorkflowStartSignal::new("signal-name").build());
+            options.rpc_options = rpc_options;
+            let handle = client
+                .start_workflow(TestWorkflow, vec!["initial".to_owned()], options)
+                .await
+                .unwrap();
+
+            let recorded = recorded.lock();
+            assert_eq!(recorded.calls, 2);
+            assert_eq!(recorded.ascii_metadata.as_deref(), Some("call-value"));
+            assert_eq!(recorded.binary_metadata.as_deref(), Some(&[0, 255][..]));
+            assert_eq!(recorded.grpc_timeout.as_deref(), Some("250000u"));
+            assert_eq!(recorded.retry_options, Some(RetryOptions::no_retries()));
+            assert_eq!(handle.run_id(), Some("signal-server-run-id"));
+        }
+
+        #[test]
+        fn rpc_metadata_combines_with_and_overrides_connection_defaults() {
+            let headers = Arc::new(RwLock::new(ClientHeaders {
+                user_headers: HashMap::from([
+                    (
+                        "shared-meta".parse().unwrap(),
+                        "connection-value".parse().unwrap(),
+                    ),
+                    (
+                        "connection-meta".parse().unwrap(),
+                        "connection-only".parse().unwrap(),
+                    ),
+                ]),
+                user_binary_headers: HashMap::from([
+                    (
+                        "shared-meta-bin".parse().unwrap(),
+                        BinaryMetadataValue::from_bytes(&[1]),
+                    ),
+                    (
+                        "connection-meta-bin".parse().unwrap(),
+                        BinaryMetadataValue::from_bytes(&[2]),
+                    ),
+                ]),
+                api_key: None,
+            }));
+            let mut service_interceptor = ServiceCallInterceptor {
+                client_name: "test-client".to_owned(),
+                client_version: "test-version".to_owned(),
+                headers,
+            };
+            let mut rpc_options = RpcOptions::default();
+            rpc_options
+                .metadata
+                .insert("shared-meta", "call-value")
+                .unwrap();
+            rpc_options
+                .metadata
+                .insert("call-meta", "call-only")
+                .unwrap();
+            rpc_options
+                .metadata
+                .insert_binary("shared-meta-bin", vec![3])
+                .unwrap();
+            rpc_options
+                .metadata
+                .insert_binary("call-meta-bin", vec![4])
+                .unwrap();
+            let mut request = Request::new(());
+            rpc_options.apply_to(&mut request);
+
+            let request = service_interceptor.call(request).unwrap();
+            assert_eq!(request.metadata().get("shared-meta").unwrap(), "call-value");
+            assert_eq!(request.metadata().get("call-meta").unwrap(), "call-only");
+            assert_eq!(
+                request.metadata().get("connection-meta").unwrap(),
+                "connection-only"
+            );
+            assert_eq!(
+                request.metadata().get_bin("shared-meta-bin").unwrap(),
+                &[3][..]
+            );
+            assert_eq!(
+                request.metadata().get_bin("call-meta-bin").unwrap(),
+                &[4][..]
+            );
+            assert_eq!(
+                request.metadata().get_bin("connection-meta-bin").unwrap(),
+                &[2][..]
+            );
+        }
+    }
+
     mod list_workflows_tests {
         use super::*;
         use crate::test_helpers::XorCodec;
@@ -1854,6 +2568,7 @@ mod tests {
             total_workflows: usize,
             data_converter: DataConverter,
             memo_payload: Option<Payload>,
+            interceptors: Vec<Arc<dyn ClientInterceptor>>,
         }
 
         impl NamespacedClient for MockListWorkflowsClient {
@@ -1865,6 +2580,28 @@ mod tests {
             }
             fn data_converter(&self) -> &DataConverter {
                 &self.data_converter
+            }
+            fn client_interceptors(&self) -> &[Arc<dyn ClientInterceptor>] {
+                &self.interceptors
+            }
+        }
+
+        struct CountingListInterceptor {
+            calls: Arc<AtomicUsize>,
+        }
+
+        impl ClientInterceptor for CountingListInterceptor {
+            fn list_workflows_page<'a>(
+                &'a self,
+                input: ListWorkflowsPageInput,
+                next: Next<
+                    'a,
+                    ListWorkflowsPageInput,
+                    BoxFuture<'a, Result<ListWorkflowsPageOutput, ClientError>>,
+                >,
+            ) -> BoxFuture<'a, Result<ListWorkflowsPageOutput, ClientError>> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                next.run(input)
             }
         }
 
@@ -1929,12 +2666,16 @@ mod tests {
         #[tokio::test]
         async fn list_workflows_paginates_through_all_results() {
             let call_count = Arc::new(AtomicUsize::new(0));
+            let interceptor_calls = Arc::new(AtomicUsize::new(0));
             let client = MockListWorkflowsClient {
                 call_count: call_count.clone(),
                 page_size: 3,
                 total_workflows: 10,
                 data_converter: DataConverter::default(),
                 memo_payload: None,
+                interceptors: vec![Arc::new(CountingListInterceptor {
+                    calls: interceptor_calls.clone(),
+                })],
             };
 
             let stream = client.list_workflows("", WorkflowListOptions::default());
@@ -1948,6 +2689,7 @@ mod tests {
             }
             // Should have made 4 calls: pages of 3, 3, 3, 1
             assert_eq!(call_count.load(Ordering::SeqCst), 4);
+            assert_eq!(interceptor_calls.load(Ordering::SeqCst), 4);
         }
 
         #[tokio::test]
@@ -1959,6 +2701,7 @@ mod tests {
                 total_workflows: 10,
                 data_converter: DataConverter::default(),
                 memo_payload: None,
+                interceptors: Vec::new(),
             };
 
             let opts = WorkflowListOptions::builder().limit(5).build();
@@ -1983,6 +2726,7 @@ mod tests {
                 total_workflows: 100,
                 data_converter: DataConverter::default(),
                 memo_payload: None,
+                interceptors: Vec::new(),
             };
 
             let opts = WorkflowListOptions::builder().limit(3).build();
@@ -2003,6 +2747,7 @@ mod tests {
                 total_workflows: 0,
                 data_converter: DataConverter::default(),
                 memo_payload: None,
+                interceptors: Vec::new(),
             };
 
             let stream = client.list_workflows("", WorkflowListOptions::default());
@@ -2032,6 +2777,7 @@ mod tests {
                 total_workflows: 1,
                 data_converter,
                 memo_payload: Some(memo_payload),
+                interceptors: Vec::new(),
             };
 
             let workflow = client

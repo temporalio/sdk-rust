@@ -1537,7 +1537,10 @@ async fn async_activity_completion_workflow() {
         .get_client()
         .await
         .get_async_activity_handle(ActivityIdentifier::TaskToken(task.task_token.into()))
-        .complete(Some(RawValue::new(vec![response_payload.clone()])))
+        .complete(
+            Some(RawValue::new(vec![response_payload.clone()])),
+            Default::default(),
+        )
         .await
         .unwrap();
 

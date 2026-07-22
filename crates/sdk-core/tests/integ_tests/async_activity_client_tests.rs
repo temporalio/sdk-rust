@@ -183,7 +183,11 @@ async fn async_activity_completions(
         eprintln!("DEBUG: Calling {:?} on handle", outcome);
 
         let result = match outcome {
-            Outcome::Success => handle.complete(Some(async_response.to_owned())).await,
+            Outcome::Success => {
+                handle
+                    .complete(Some(async_response.to_owned()), Default::default())
+                    .await
+            }
             Outcome::Failure => {
                 handle
                     .fail(
@@ -191,10 +195,15 @@ async fn async_activity_completions(
                             .type_name("TestFailure".to_owned())
                             .build(),
                         None::<()>,
+                        Default::default(),
                     )
                     .await
             }
-            Outcome::Cancellation => handle.report_cancelation(None::<()>).await,
+            Outcome::Cancellation => {
+                handle
+                    .report_cancelation(None::<()>, Default::default())
+                    .await
+            }
         };
         if let Err(e) = &result {
             eprintln!(

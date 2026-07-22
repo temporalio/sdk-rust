@@ -1,9 +1,17 @@
 use crate::common::{CoreWfStarter, eventually, rand_6_chars};
-use futures::TryStreamExt;
-use std::{collections::HashSet, time::Duration};
+use futures::{TryStreamExt, future::BoxFuture};
+use std::{
+    collections::HashSet,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+    time::Duration,
+};
 use temporalio_client::{
-    UntypedWorkflow, WorkflowCountOptions, WorkflowListOptions, WorkflowStartOptions,
-    WorkflowTerminateOptions, errors::WorkflowStartError,
+    ClientInterceptor, Next, StartWorkflowInput, StartWorkflowOutput, UntypedWorkflow,
+    WorkflowCountOptions, WorkflowListOptions, WorkflowStartOptions, WorkflowTerminateOptions,
+    errors::WorkflowStartError,
 };
 use temporalio_common::{data_converters::RawValue, worker::WorkerTaskTypes};
 use temporalio_macros::{workflow, workflow_methods};
@@ -19,6 +27,68 @@ impl EmptyWorkflow {
     async fn run(_ctx: &mut WorkflowContext<Self>) -> WorkflowResult<()> {
         Ok(())
     }
+}
+
+struct StartWorkflowInterceptor {
+    calls: Arc<AtomicUsize>,
+}
+
+impl ClientInterceptor for StartWorkflowInterceptor {
+    fn start_workflow<'a>(
+        &'a self,
+        mut input: StartWorkflowInput,
+        next: Next<
+            'a,
+            StartWorkflowInput,
+            BoxFuture<'a, Result<StartWorkflowOutput, WorkflowStartError>>,
+        >,
+    ) -> BoxFuture<'a, Result<StartWorkflowOutput, WorkflowStartError>> {
+        Box::pin(async move {
+            assert_eq!(input.args_ref::<()>(), Some(&()));
+            input.replace_args(());
+            input
+                .rpc_options
+                .metadata
+                .insert("integration-interceptor", "present")
+                .unwrap();
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            tokio::task::yield_now().await;
+            let output = next.run(input).await?;
+            tokio::task::yield_now().await;
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(output)
+        })
+    }
+}
+
+#[tokio::test]
+async fn client_interceptor_start_workflow() {
+    let test_name = "client_interceptor_start_workflow";
+    let mut starter = CoreWfStarter::new(test_name);
+    let mut client = starter.get_client().await;
+    let calls = Arc::new(AtomicUsize::new(0));
+    client
+        .options_mut()
+        .client_interceptors
+        .push(Arc::new(StartWorkflowInterceptor {
+            calls: calls.clone(),
+        }));
+    let workflow_id = format!("{test_name}_{}", rand_6_chars());
+
+    let handle = client
+        .start_workflow(
+            EmptyWorkflow::run,
+            (),
+            WorkflowStartOptions::new(starter.get_task_queue(), workflow_id).build(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    handle
+        .terminate(WorkflowTerminateOptions::default())
+        .await
+        .unwrap();
 }
 
 #[rstest::rstest]

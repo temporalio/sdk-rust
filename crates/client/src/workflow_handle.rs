@@ -1,13 +1,19 @@
 use crate::{
-    NamespacedClient, WorkflowCancelOptions, WorkflowDescribeOptions, WorkflowExecuteUpdateOptions,
-    WorkflowExecutionStatus, WorkflowFetchHistoryOptions, WorkflowGetResultOptions,
-    WorkflowQueryOptions, WorkflowSignalOptions, WorkflowStartUpdateOptions,
-    WorkflowTerminateOptions, WorkflowUpdateWaitStage,
+    CancelWorkflowInput, DescribeWorkflowInput, DescribeWorkflowOutput,
+    FetchWorkflowHistoryPageInput, FetchWorkflowHistoryPageOutput, NamespacedClient, Next,
+    PollWorkflowUpdateInput, PollWorkflowUpdateOutput, QueryWorkflowInput, QueryWorkflowOutput,
+    RpcOptions, SignalWorkflowInput, StartWorkflowUpdateInput, StartWorkflowUpdateOutput,
+    TerminateWorkflowInput, WorkflowCancelOptions, WorkflowDescribeOptions,
+    WorkflowExecuteUpdateOptions, WorkflowExecutionStatus, WorkflowFetchHistoryOptions,
+    WorkflowGetResultOptions, WorkflowQueryOptions, WorkflowSignalOptions,
+    WorkflowStartUpdateOptions, WorkflowTerminateOptions, WorkflowUpdateWaitStage,
     errors::{
         WorkflowGetResultError, WorkflowInteractionError, WorkflowQueryError, WorkflowUpdateError,
     },
     grpc::WorkflowService,
+    interceptors,
 };
+use futures_util::future::BoxFuture;
 use std::{fmt::Debug, marker::PhantomData};
 pub use temporalio_common::UntypedWorkflow;
 use temporalio_common::{
@@ -541,6 +547,7 @@ where
             .skip_archival(true)
             .wait_new_event(true)
             .event_filter_type(HistoryEventFilterType::CloseEvent)
+            .rpc_options(opts.rpc_options.clone())
             .build();
 
         loop {
@@ -646,33 +653,64 @@ where
         S: SignalDefinition<Workflow = W::Run>,
         S::Input: Send,
     {
-        let payloads = self
-            .client
-            .data_converter()
-            .to_payloads(&SerializationContextData::Workflow, &input)
-            .await?;
-        WorkflowService::signal_workflow_execution(
-            &mut self.client.clone(),
-            SignalWorkflowExecutionRequest {
-                namespace: self.client.namespace(),
-                workflow_execution: Some(ProtoWorkflowExecution {
-                    workflow_id: self.info.workflow_id.clone(),
-                    run_id: self.info.run_id.clone().unwrap_or_default(),
-                }),
-                signal_name: signal.name().to_string(),
-                input: Some(Payloads { payloads }),
-                identity: self.client.identity(),
-                request_id: opts
-                    .request_id
-                    .unwrap_or_else(|| Uuid::new_v4().to_string()),
-                header: opts.header,
-                ..Default::default()
-            }
-            .into_request(),
+        interceptors::call_signal_workflow(
+            self.client.client_interceptors(),
+            SignalWorkflowInput::new(
+                self.info.workflow_id.clone(),
+                self.info.run_id.clone().unwrap_or_default(),
+                signal.name().to_string(),
+                input,
+                opts,
+            ),
+            Next::new({
+                let mut client = self.client.clone();
+                move |input: SignalWorkflowInput| -> BoxFuture<
+                    '_,
+                    Result<(), WorkflowInteractionError>,
+                > {
+                    Box::pin(async move {
+                        let (workflow_id, run_id, signal_name, args, options) =
+                            input.into_parts();
+                        let data_converter = client.data_converter().clone();
+                        let unencoded_payloads = {
+                            let payload_converter = data_converter.payload_converter();
+                            let context = SerializationContext {
+                                data: &SerializationContextData::Workflow,
+                                converter: payload_converter,
+                            };
+                            args.serialize_payloads(&context)
+                        };
+                        drop(args);
+                        let payloads = data_converter
+                            .codec()
+                            .encode(&SerializationContextData::Workflow, unencoded_payloads?)
+                            .await;
+                        let mut request = SignalWorkflowExecutionRequest {
+                            namespace: client.namespace(),
+                            workflow_execution: Some(ProtoWorkflowExecution {
+                                workflow_id,
+                                run_id,
+                            }),
+                            signal_name,
+                            input: Some(Payloads { payloads }),
+                            identity: client.identity(),
+                            request_id: options
+                                .request_id
+                                .unwrap_or_else(|| Uuid::new_v4().to_string()),
+                            header: options.header,
+                            ..Default::default()
+                        }
+                        .into_request();
+                        options.rpc_options.apply_to(&mut request);
+                        WorkflowService::signal_workflow_execution(&mut client, request)
+                            .await
+                            .map_err(WorkflowInteractionError::from_status)?;
+                        Ok(())
+                    })
+                }
+            }),
         )
         .await
-        .map_err(WorkflowInteractionError::from_status)?;
-        Ok(())
     }
 
     /// Query the workflow
@@ -687,33 +725,67 @@ where
         Q: QueryDefinition<Workflow = W::Run>,
         Q::Input: Send,
     {
-        let dc = self.client.data_converter();
-        let payloads = dc
-            .to_payloads(&SerializationContextData::Workflow, &input)
-            .await?;
-        let response = self
-            .client
-            .clone()
-            .query_workflow(
-                QueryWorkflowRequest {
-                    namespace: self.client.namespace(),
-                    execution: Some(ProtoWorkflowExecution {
-                        workflow_id: self.info.workflow_id.clone(),
-                        run_id: self.info.run_id.clone().unwrap_or_default(),
-                    }),
-                    query: Some(WorkflowQuery {
-                        query_type: query.name().to_string(),
-                        query_args: Some(Payloads { payloads }),
-                        header: opts.header,
-                    }),
-                    // Default to None (1) which means don't reject
-                    query_reject_condition: opts.reject_condition.map(|c| c as i32).unwrap_or(1),
+        let output = interceptors::call_query_workflow(
+            self.client.client_interceptors(),
+            QueryWorkflowInput::new(
+                self.info.workflow_id.clone(),
+                self.info.run_id.clone().unwrap_or_default(),
+                query.name().to_string(),
+                input,
+                opts,
+            ),
+            Next::new({
+                let mut client = self.client.clone();
+                move |input: QueryWorkflowInput| -> BoxFuture<
+                    '_,
+                    Result<QueryWorkflowOutput, WorkflowQueryError>,
+                > {
+                    Box::pin(async move {
+                        let (workflow_id, run_id, query_name, args, options) = input.into_parts();
+                        let data_converter = client.data_converter().clone();
+                        let unencoded_payloads = {
+                            let payload_converter = data_converter.payload_converter();
+                            let context = SerializationContext {
+                                data: &SerializationContextData::Workflow,
+                                converter: payload_converter,
+                            };
+                            args.serialize_payloads(&context)
+                        };
+                        drop(args);
+                        let payloads = data_converter
+                            .codec()
+                            .encode(&SerializationContextData::Workflow, unencoded_payloads?)
+                            .await;
+                        let mut request = QueryWorkflowRequest {
+                            namespace: client.namespace(),
+                            execution: Some(ProtoWorkflowExecution {
+                                workflow_id,
+                                run_id,
+                            }),
+                            query: Some(WorkflowQuery {
+                                query_type: query_name,
+                                query_args: Some(Payloads { payloads }),
+                                header: options.header,
+                            }),
+                            query_reject_condition: options
+                                .reject_condition
+                                .map(|condition| condition as i32)
+                                .unwrap_or(1),
+                        }
+                        .into_request();
+                        options.rpc_options.apply_to(&mut request);
+                        let response = client
+                            .query_workflow(request)
+                            .await
+                            .map_err(WorkflowQueryError::from_status)?
+                            .into_inner();
+                        Ok(QueryWorkflowOutput::new(response))
+                    })
                 }
-                .into_request(),
-            )
-            .await
-            .map_err(WorkflowQueryError::from_status)?
-            .into_inner();
+            }),
+        )
+        .await?;
+        let response = output.response;
 
         if let Some(rejected) = response.query_rejected {
             return Err(WorkflowQueryError::Rejected {
@@ -727,7 +799,9 @@ where
             .map(|p| p.payloads)
             .unwrap_or_default();
 
-        dc.from_payloads(&SerializationContextData::Workflow, result_payloads)
+        self.client
+            .data_converter()
+            .from_payloads(&SerializationContextData::Workflow, result_payloads)
             .await
             .map_err(WorkflowQueryError::from)
     }
@@ -745,6 +819,7 @@ where
         U::Input: Send,
         U::Output: 'static,
     {
+        let rpc_options = options.rpc_options.clone();
         let handle = self
             .start_update(
                 update,
@@ -753,10 +828,11 @@ where
                     .maybe_update_id(options.update_id)
                     .maybe_header(options.header)
                     .wait_for_stage(WorkflowUpdateWaitStage::Completed)
+                    .rpc_options(rpc_options.clone())
                     .build(),
             )
             .await?;
-        handle.get_result().await
+        handle.get_result(rpc_options).await
     }
 
     /// Start an update and return a handle without waiting for completion.
@@ -772,68 +848,107 @@ where
         U: UpdateDefinition<Workflow = W::Run>,
         U::Input: Send,
     {
-        let dc = self.client.data_converter();
-        let payloads = dc
-            .to_payloads(&SerializationContextData::Workflow, &input)
-            .await?;
-
-        let lifecycle_stage = match options.wait_for_stage {
-            WorkflowUpdateWaitStage::Admitted => UpdateWorkflowExecutionLifecycleStage::Admitted,
-            WorkflowUpdateWaitStage::Accepted => UpdateWorkflowExecutionLifecycleStage::Accepted,
-            WorkflowUpdateWaitStage::Completed => UpdateWorkflowExecutionLifecycleStage::Completed,
-        };
-
-        let update_id = options
-            .update_id
-            .unwrap_or_else(|| Uuid::new_v4().to_string());
-
-        let response = WorkflowService::update_workflow_execution(
-            &mut self.client.clone(),
-            UpdateWorkflowExecutionRequest {
-                namespace: self.client.namespace(),
-                workflow_execution: Some(ProtoWorkflowExecution {
-                    workflow_id: self.info().workflow_id.clone(),
-                    run_id: self.info().run_id.clone().unwrap_or_default(),
-                }),
-                wait_policy: Some(WaitPolicy {
-                    lifecycle_stage: lifecycle_stage.into(),
-                }),
-                request: Some(update::v1::Request {
-                    meta: Some(update::v1::Meta {
-                        update_id: update_id.clone(),
-                        identity: self.client.identity(),
-                    }),
-                    input: Some(update::v1::Input {
-                        header: options.header,
-                        name: update.name().to_string(),
-                        args: Some(Payloads { payloads }),
-                    }),
-
-                    ..Default::default()
-                }),
-                ..Default::default()
-            }
-            .into_request(),
+        let output = interceptors::call_start_workflow_update(
+            self.client.client_interceptors(),
+            StartWorkflowUpdateInput::new(
+                self.info().workflow_id.clone(),
+                self.info().run_id.clone().unwrap_or_default(),
+                update.name().to_string(),
+                input,
+                options,
+            ),
+            Next::new({
+                let mut client = self.client.clone();
+                move |input: StartWorkflowUpdateInput| -> BoxFuture<
+                    '_,
+                    Result<StartWorkflowUpdateOutput, WorkflowUpdateError>,
+                > {
+                    Box::pin(async move {
+                        let (workflow_id, run_id, update_name, args, options) = input.into_parts();
+                        let data_converter = client.data_converter().clone();
+                        let unencoded_payloads = {
+                            let payload_converter = data_converter.payload_converter();
+                            let context = SerializationContext {
+                                data: &SerializationContextData::Workflow,
+                                converter: payload_converter,
+                            };
+                            args.serialize_payloads(&context)
+                        };
+                        drop(args);
+                        let payloads = data_converter
+                            .codec()
+                            .encode(&SerializationContextData::Workflow, unencoded_payloads?)
+                            .await;
+                        let lifecycle_stage = match options.wait_for_stage {
+                            WorkflowUpdateWaitStage::Admitted => {
+                                UpdateWorkflowExecutionLifecycleStage::Admitted
+                            }
+                            WorkflowUpdateWaitStage::Accepted => {
+                                UpdateWorkflowExecutionLifecycleStage::Accepted
+                            }
+                            WorkflowUpdateWaitStage::Completed => {
+                                UpdateWorkflowExecutionLifecycleStage::Completed
+                            }
+                        };
+                        let update_id = options
+                            .update_id
+                            .unwrap_or_else(|| Uuid::new_v4().to_string());
+                        let mut request = UpdateWorkflowExecutionRequest {
+                            namespace: client.namespace(),
+                            workflow_execution: Some(ProtoWorkflowExecution {
+                                workflow_id: workflow_id.clone(),
+                                run_id,
+                            }),
+                            wait_policy: Some(WaitPolicy {
+                                lifecycle_stage: lifecycle_stage.into(),
+                            }),
+                            request: Some(update::v1::Request {
+                                meta: Some(update::v1::Meta {
+                                    update_id: update_id.clone(),
+                                    identity: client.identity(),
+                                }),
+                                input: Some(update::v1::Input {
+                                    header: options.header,
+                                    name: update_name,
+                                    args: Some(Payloads { payloads }),
+                                }),
+                                ..Default::default()
+                            }),
+                            ..Default::default()
+                        }
+                        .into_request();
+                        options.rpc_options.apply_to(&mut request);
+                        let response = WorkflowService::update_workflow_execution(
+                            &mut client,
+                            request,
+                        )
+                        .await
+                        .map_err(WorkflowUpdateError::from_status)?
+                        .into_inner();
+                        let run_id = response
+                            .update_ref
+                            .as_ref()
+                            .and_then(|reference| reference.workflow_execution.as_ref())
+                            .map(|execution| execution.run_id.clone())
+                            .filter(|run_id| !run_id.is_empty());
+                        Ok(StartWorkflowUpdateOutput::new(
+                            update_id,
+                            workflow_id,
+                            run_id,
+                            response.outcome,
+                        ))
+                    })
+                }
+            }),
         )
-        .await
-        .map_err(WorkflowUpdateError::from_status)?
-        .into_inner();
-
-        // Extract run_id from response if available
-        let run_id = response
-            .update_ref
-            .as_ref()
-            .and_then(|r| r.workflow_execution.as_ref())
-            .map(|e| e.run_id.clone())
-            .filter(|s| !s.is_empty())
-            .or_else(|| self.info().run_id.clone());
+        .await?;
 
         Ok(WorkflowUpdateHandle {
             client: self.client.clone(),
-            update_id,
-            workflow_id: self.info().workflow_id.clone(),
-            run_id,
-            known_outcome: response.outcome,
+            update_id: output.update_id,
+            workflow_id: output.workflow_id,
+            run_id: output.run_id.or_else(|| self.info().run_id.clone()),
+            known_outcome: output.known_outcome,
             _output: PhantomData,
         })
     }
@@ -843,31 +958,52 @@ where
     where
         CT: NamespacedClient,
     {
-        WorkflowService::request_cancel_workflow_execution(
-            &mut self.client.clone(),
-            RequestCancelWorkflowExecutionRequest {
-                namespace: self.client.namespace(),
-                workflow_execution: Some(ProtoWorkflowExecution {
-                    workflow_id: self.info.workflow_id.clone(),
-                    run_id: self.info.run_id.clone().unwrap_or_default(),
-                }),
-                identity: self.client.identity(),
-                request_id: opts
-                    .request_id
-                    .unwrap_or_else(|| Uuid::new_v4().to_string()),
+        interceptors::call_cancel_workflow(
+            self.client.client_interceptors(),
+            CancelWorkflowInput {
+                workflow_id: self.info.workflow_id.clone(),
+                run_id: self.info.run_id.clone().unwrap_or_default(),
                 first_execution_run_id: self
                     .info
                     .first_execution_run_id
                     .clone()
                     .unwrap_or_default(),
-                reason: opts.reason,
-                links: vec![],
-            }
-            .into_request(),
+                options: opts,
+            },
+            Next::new({
+                let mut client = self.client.clone();
+                move |input: CancelWorkflowInput| -> BoxFuture<
+                    '_,
+                    Result<(), WorkflowInteractionError>,
+                > {
+                    Box::pin(async move {
+                        let mut request = RequestCancelWorkflowExecutionRequest {
+                            namespace: client.namespace(),
+                            workflow_execution: Some(ProtoWorkflowExecution {
+                                workflow_id: input.workflow_id,
+                                run_id: input.run_id,
+                            }),
+                            identity: client.identity(),
+                            request_id: input
+                                .options
+                                .request_id
+                                .clone()
+                                .unwrap_or_else(|| Uuid::new_v4().to_string()),
+                            first_execution_run_id: input.first_execution_run_id,
+                            reason: input.options.reason.clone(),
+                            links: vec![],
+                        }
+                        .into_request();
+                        input.options.rpc_options.apply_to(&mut request);
+                        WorkflowService::request_cancel_workflow_execution(&mut client, request)
+                            .await
+                            .map_err(WorkflowInteractionError::from_status)?;
+                        Ok(())
+                    })
+                }
+            }),
         )
         .await
-        .map_err(WorkflowInteractionError::from_status)?;
-        Ok(())
     }
 
     /// Terminate this workflow.
@@ -878,54 +1014,93 @@ where
     where
         CT: NamespacedClient,
     {
-        WorkflowService::terminate_workflow_execution(
-            &mut self.client.clone(),
-            TerminateWorkflowExecutionRequest {
-                namespace: self.client.namespace(),
-                workflow_execution: Some(ProtoWorkflowExecution {
-                    workflow_id: self.info.workflow_id.clone(),
-                    run_id: self.info.run_id.clone().unwrap_or_default(),
-                }),
-                reason: opts.reason,
-                details: opts.details,
-                identity: self.client.identity(),
+        interceptors::call_terminate_workflow(
+            self.client.client_interceptors(),
+            TerminateWorkflowInput {
+                workflow_id: self.info.workflow_id.clone(),
+                run_id: self.info.run_id.clone().unwrap_or_default(),
                 first_execution_run_id: self
                     .info
                     .first_execution_run_id
                     .clone()
                     .unwrap_or_default(),
-                links: vec![],
-            }
-            .into_request(),
+                options: opts,
+            },
+            Next::new({
+                let mut client = self.client.clone();
+                move |input: TerminateWorkflowInput| -> BoxFuture<
+                    '_,
+                    Result<(), WorkflowInteractionError>,
+                > {
+                    Box::pin(async move {
+                        let mut request = TerminateWorkflowExecutionRequest {
+                            namespace: client.namespace(),
+                            workflow_execution: Some(ProtoWorkflowExecution {
+                                workflow_id: input.workflow_id,
+                                run_id: input.run_id,
+                            }),
+                            reason: input.options.reason.clone(),
+                            details: input.options.details.clone(),
+                            identity: client.identity(),
+                            first_execution_run_id: input.first_execution_run_id,
+                            links: vec![],
+                        }
+                        .into_request();
+                        input.options.rpc_options.apply_to(&mut request);
+                        WorkflowService::terminate_workflow_execution(&mut client, request)
+                            .await
+                            .map_err(WorkflowInteractionError::from_status)?;
+                        Ok(())
+                    })
+                }
+            }),
         )
         .await
-        .map_err(WorkflowInteractionError::from_status)?;
-        Ok(())
     }
 
     /// Get workflow execution description/metadata.
     pub async fn describe(
         &self,
-        _opts: WorkflowDescribeOptions,
+        opts: WorkflowDescribeOptions,
     ) -> Result<WorkflowExecutionDescription, WorkflowInteractionError>
     where
         CT: NamespacedClient,
     {
-        let response = WorkflowService::describe_workflow_execution(
-            &mut self.client.clone(),
-            DescribeWorkflowExecutionRequest {
-                namespace: self.client.namespace(),
-                execution: Some(ProtoWorkflowExecution {
-                    workflow_id: self.info.workflow_id.clone(),
-                    run_id: self.info.run_id.clone().unwrap_or_default(),
-                }),
-            }
-            .into_request(),
+        let output = interceptors::call_describe_workflow(
+            self.client.client_interceptors(),
+            DescribeWorkflowInput {
+                workflow_id: self.info.workflow_id.clone(),
+                run_id: self.info.run_id.clone().unwrap_or_default(),
+                options: opts,
+            },
+            Next::new({
+                let mut client = self.client.clone();
+                move |input: DescribeWorkflowInput| -> BoxFuture<
+                        '_,
+                        Result<DescribeWorkflowOutput, WorkflowInteractionError>,
+                    > {
+                        Box::pin(async move {
+                            let mut request = DescribeWorkflowExecutionRequest {
+                                namespace: client.namespace(),
+                                execution: Some(ProtoWorkflowExecution {
+                                    workflow_id: input.workflow_id,
+                                    run_id: input.run_id,
+                                }),
+                            }
+                            .into_request();
+                            input.options.rpc_options.apply_to(&mut request);
+                            let response =
+                                WorkflowService::describe_workflow_execution(&mut client, request)
+                                    .await
+                                    .map_err(WorkflowInteractionError::from_status)?
+                                    .into_inner();
+                            Ok(DescribeWorkflowOutput::new(response))
+                        })
+                    }
+            }),
         )
-        .await
-        .map_err(WorkflowInteractionError::from_status)?
-        .into_inner();
-        WorkflowExecutionDescription::new(response, self.client.data_converter())
+        .await?;
+        WorkflowExecutionDescription::new(output.response, self.client.data_converter())
             .await
             .map_err(WorkflowInteractionError::from)
     }
@@ -954,34 +1129,60 @@ where
         let mut next_page_token = vec![];
 
         loop {
-            let response = WorkflowService::get_workflow_execution_history(
-                &mut self.client.clone(),
-                GetWorkflowExecutionHistoryRequest {
-                    namespace: self.client.namespace(),
-                    execution: Some(ProtoWorkflowExecution {
-                        workflow_id: self.info.workflow_id.clone(),
-                        run_id: run_id.to_string(),
-                    }),
-                    next_page_token: next_page_token.clone(),
-                    skip_archival: opts.skip_archival,
-                    wait_new_event: opts.wait_new_event,
-                    history_event_filter_type: opts.event_filter_type as i32,
-                    ..Default::default()
-                }
-                .into_request(),
+            let output = interceptors::call_fetch_workflow_history_page(
+                self.client.client_interceptors(),
+                FetchWorkflowHistoryPageInput {
+                    workflow_id: self.info.workflow_id.clone(),
+                    run_id: run_id.to_string(),
+                    next_page_token,
+                    options: opts.clone(),
+                },
+                Next::new({
+                    let mut client = self.client.clone();
+                    move |input: FetchWorkflowHistoryPageInput| -> BoxFuture<
+                        '_,
+                        Result<FetchWorkflowHistoryPageOutput, WorkflowInteractionError>,
+                    > {
+                        Box::pin(async move {
+                            let mut request = GetWorkflowExecutionHistoryRequest {
+                                namespace: client.namespace(),
+                                execution: Some(ProtoWorkflowExecution {
+                                    workflow_id: input.workflow_id,
+                                    run_id: input.run_id,
+                                }),
+                                next_page_token: input.next_page_token,
+                                skip_archival: input.options.skip_archival,
+                                wait_new_event: input.options.wait_new_event,
+                                history_event_filter_type: input.options.event_filter_type as i32,
+                                ..Default::default()
+                            }
+                            .into_request();
+                            input.options.rpc_options.apply_to(&mut request);
+                            let response = WorkflowService::get_workflow_execution_history(
+                                &mut client,
+                                request,
+                            )
+                            .await
+                            .map_err(WorkflowInteractionError::from_status)?
+                            .into_inner();
+                            Ok(FetchWorkflowHistoryPageOutput::new(
+                                response
+                                    .history
+                                    .map(|history| history.events)
+                                    .unwrap_or_default(),
+                                response.next_page_token,
+                            ))
+                        })
+                    }
+                }),
             )
-            .await
-            .map_err(WorkflowInteractionError::from_status)?
-            .into_inner();
+            .await?;
 
-            if let Some(history) = response.history {
-                all_events.extend(history.events);
-            }
-
-            if response.next_page_token.is_empty() {
+            all_events.extend(output.events);
+            if output.next_page_token.is_empty() {
                 break;
             }
-            next_page_token = response.next_page_token;
+            next_page_token = output.next_page_token;
         }
 
         Ok(WorkflowHistory::new(all_events))
@@ -990,7 +1191,7 @@ where
 
 /// Handle to a workflow update that has been started but may not be complete.
 ///
-/// Use `get_result()` to wait for the update to complete and retrieve its result.
+/// Use [`get_result`](Self::get_result) to wait for the update to complete and retrieve its result.
 pub struct WorkflowUpdateHandle<CT, T> {
     client: CT,
     update_id: String,
@@ -1022,46 +1223,65 @@ impl<CT, T: 'static> WorkflowUpdateHandle<CT, T>
 where
     CT: WorkflowService + NamespacedClient + Clone,
 {
-    /// Wait for the update to complete and return the result.
-    pub async fn get_result(&self) -> Result<T, WorkflowUpdateError>
+    /// Wait for the update to complete and return the result using the provided RPC controls.
+    pub async fn get_result(&self, rpc_options: RpcOptions) -> Result<T, WorkflowUpdateError>
     where
         T: temporalio_common::data_converters::TemporalDeserializable,
     {
-        let outcome = if let Some(known) = &self.known_outcome {
-            known.clone()
-        } else {
-            // The server's internal long-poll timeout (~60s) may expire before the update
-            // completes, returning a response with outcome: None. Keep polling until we
-            // get an actual outcome.
-            loop {
-                let response = WorkflowService::poll_workflow_execution_update(
-                    &mut self.client.clone(),
-                    PollWorkflowExecutionUpdateRequest {
-                        namespace: self.client.namespace(),
-                        update_ref: Some(update::v1::UpdateRef {
-                            workflow_execution: Some(ProtoWorkflowExecution {
-                                workflow_id: self.workflow_id.clone(),
-                                run_id: self.run_id.clone().unwrap_or_default(),
-                            }),
-                            update_id: self.update_id.clone(),
-                        }),
-                        identity: self.client.identity(),
-                        wait_policy: Some(WaitPolicy {
-                            lifecycle_stage: UpdateWorkflowExecutionLifecycleStage::Completed
-                                .into(),
-                        }),
-                    }
-                    .into_request(),
-                )
-                .await
-                .map_err(WorkflowUpdateError::from_status)?
-                .into_inner();
-
-                if let Some(outcome) = response.outcome {
-                    break outcome;
+        let output = interceptors::call_poll_workflow_update(
+            self.client.client_interceptors(),
+            PollWorkflowUpdateInput {
+                update_id: self.update_id.clone(),
+                workflow_id: self.workflow_id.clone(),
+                run_id: self.run_id.clone().unwrap_or_default(),
+                rpc_options,
+            },
+            Next::new({
+                let mut client = self.client.clone();
+                let known_outcome = self.known_outcome.clone();
+                move |input: PollWorkflowUpdateInput| -> BoxFuture<
+                    '_,
+                    Result<PollWorkflowUpdateOutput, WorkflowUpdateError>,
+                > {
+                    Box::pin(async move {
+                        if let Some(outcome) = known_outcome {
+                            return Ok(PollWorkflowUpdateOutput::new(outcome));
+                        }
+                        loop {
+                            let mut request = PollWorkflowExecutionUpdateRequest {
+                                namespace: client.namespace(),
+                                update_ref: Some(update::v1::UpdateRef {
+                                    workflow_execution: Some(ProtoWorkflowExecution {
+                                        workflow_id: input.workflow_id.clone(),
+                                        run_id: input.run_id.clone(),
+                                    }),
+                                    update_id: input.update_id.clone(),
+                                }),
+                                identity: client.identity(),
+                                wait_policy: Some(WaitPolicy {
+                                    lifecycle_stage:
+                                        UpdateWorkflowExecutionLifecycleStage::Completed.into(),
+                                }),
+                            }
+                            .into_request();
+                            input.rpc_options.apply_to(&mut request);
+                            let response = WorkflowService::poll_workflow_execution_update(
+                                &mut client,
+                                request,
+                            )
+                            .await
+                            .map_err(WorkflowUpdateError::from_status)?
+                            .into_inner();
+                            if let Some(outcome) = response.outcome {
+                                return Ok(PollWorkflowUpdateOutput::new(outcome));
+                            }
+                        }
+                    })
                 }
-            }
-        };
+            }),
+        )
+        .await?;
+        let outcome = output.outcome;
 
         match outcome.value {
             Some(update::v1::outcome::Value::Success(success)) => self
