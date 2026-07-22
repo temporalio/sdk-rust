@@ -35,6 +35,7 @@ use tokio::process::Command;
 
 const WASM_COMPONENT_ID: &str = "hello-workflow-component";
 const WASM_WORKFLOW_TYPE: &str = "HelloWorkflow";
+const WASM_INTERCEPTOR_WORKFLOW_TYPE: &str = "InterceptorWorkflow";
 const WASM_PATCH_ACTIVATION_WORKFLOW_TYPE: &str = "PatchActivationWorkflow";
 const WASM_TASK_FAILURE_WORKFLOW_TYPE: &str = "WasmTaskFailureWorkflow";
 const WASM_PATCH_ID: &str = "wasm-patch-activation";
@@ -44,7 +45,13 @@ async fn wasm_workflow_component_executes() {
     let component_path = build_wasm_hello_component().await;
     let component = WasmWorkflowComponent::from_file(WASM_COMPONENT_ID, component_path)
         .expect("sample WASM component should be loadable");
-    run_hello_workflow("wasm_workflow_component_executes", component).await;
+    run_string_workflow(
+        "wasm_workflow_component_executes",
+        component,
+        WASM_WORKFLOW_TYPE,
+        "Hello, workflow!",
+    )
+    .await;
 }
 
 // Mirrors `wasm_workflow_component_executes` but loads the component bytes into memory and
@@ -58,7 +65,27 @@ async fn wasm_workflow_component_executes_from_bytes() {
         .expect("WASM component file should be readable");
     let component = WasmWorkflowComponent::from_bytes(WASM_COMPONENT_ID, bytes)
         .expect("WASM component bytes should be loadable");
-    run_hello_workflow("wasm_workflow_component_executes_from_bytes", component).await;
+    run_string_workflow(
+        "wasm_workflow_component_executes_from_bytes",
+        component,
+        WASM_WORKFLOW_TYPE,
+        "Hello, workflow!",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn wasm_workflow_interceptor_executes() {
+    let component_path = build_wasm_interceptor_component().await;
+    let component = WasmWorkflowComponent::from_file(WASM_COMPONENT_ID, component_path)
+        .expect("interceptor WASM component should be loadable");
+    run_string_workflow(
+        "wasm_workflow_interceptor_executes",
+        component,
+        WASM_INTERCEPTOR_WORKFLOW_TYPE,
+        "Hello, workflow-intercepted! [intercepted]",
+    )
+    .await;
 }
 
 #[tokio::test]
@@ -238,7 +265,12 @@ async fn wasm_task_failure_preserves_wit_failure_details() {
     assert!(app_info.non_retryable);
 }
 
-async fn run_hello_workflow(test_name: &'static str, component: WasmWorkflowComponent) {
+async fn run_string_workflow(
+    test_name: &'static str,
+    component: WasmWorkflowComponent,
+    workflow_type: &'static str,
+    expected_result: &'static str,
+) {
     let mut starter = CoreWfStarter::new(test_name);
     starter.sdk_config.task_types = WorkerTaskTypes::workflow_only();
     starter.sdk_config.register_wasm_workflow(component);
@@ -253,7 +285,7 @@ async fn run_hello_workflow(test_name: &'static str, component: WasmWorkflowComp
         WorkflowStartOptions::new(starter.get_task_queue().to_owned(), workflow_id.clone()).build();
     start_options.execution_timeout = Some(Duration::from_secs(60));
     worker
-        .submit_wf(WASM_WORKFLOW_TYPE, input.payloads, start_options)
+        .submit_wf(workflow_type, input.payloads, start_options)
         .await
         .expect("WASM workflow should start");
     worker
@@ -267,7 +299,7 @@ async fn run_hello_workflow(test_name: &'static str, component: WasmWorkflowComp
         .await
         .expect("WASM workflow result should be available");
     let greeting: String = result.to_value(&payload_converter);
-    assert_eq!(greeting, "Hello, workflow-intercepted! [intercepted]");
+    assert_eq!(greeting, expected_result);
 }
 
 async fn run_patch_activation_workflow(
@@ -349,6 +381,11 @@ async fn wasm_task_failure_attrs(
 async fn build_wasm_hello_component() -> PathBuf {
     let sample_dir = repository_root().join("crates/sdk/examples/wasm_workflows");
     build_wasm_component(sample_dir, "temporal_wasm_hello_workflow.wasm").await
+}
+
+async fn build_wasm_interceptor_component() -> PathBuf {
+    let fixture_dir = repository_root().join("crates/sdk-core/tests/fixtures/wasm_interceptor");
+    build_wasm_component(fixture_dir, "temporal_wasm_interceptor_workflow.wasm").await
 }
 
 async fn build_wasm_patch_activation_component() -> PathBuf {
