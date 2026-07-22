@@ -759,7 +759,23 @@ impl BaseWorkflowContext {
         let input = StartTimerInput::new(opts.into());
         let base_ctx = self.clone();
         let next = WorkflowNext::new(move |input: StartTimerInput| {
-            base_ctx.start_timer_unintercepted(input.into_options())
+            let opts = input.into_options();
+            let seq = base_ctx.inner.seq_nums.borrow_mut().next_timer_seq();
+            let (cmd, unblocker) =
+                CancellableWFCommandFut::new(CancellableID::Timer(seq), base_ctx.clone());
+            base_ctx
+                .inner
+                .runtime
+                .register_unblocker(PendingCommandId::Timer(seq), unblocker);
+            base_ctx
+                .inner
+                .runtime
+                .host
+                .push_command(opts.into_command(seq));
+            CancellableWorkflowOutboundFuture::new(
+                cmd,
+                base_ctx.cancellation_handle(CancellableID::Timer(seq)),
+            )
         });
         let interceptors = self.inner.workflow_interceptors.borrow().clone();
         let future = call_start_timer(
@@ -769,23 +785,6 @@ impl BaseWorkflowContext {
             next,
         );
         self.prepare_cancellable_outbound_future(future)
-    }
-
-    fn start_timer_unintercepted(
-        &self,
-        opts: TimerOptions,
-    ) -> CancellableWorkflowOutboundFuture<TimerResult> {
-        let seq = self.inner.seq_nums.borrow_mut().next_timer_seq();
-        let (cmd, unblocker) =
-            CancellableWFCommandFut::new(CancellableID::Timer(seq), self.clone());
-        self.inner
-            .runtime
-            .register_unblocker(PendingCommandId::Timer(seq), unblocker);
-        self.inner.runtime.host.push_command(opts.into_command(seq));
-        CancellableWorkflowOutboundFuture::new(
-            cmd,
-            self.cancellation_handle(CancellableID::Timer(seq)),
-        )
     }
 
     /// Request to run an activity
@@ -803,7 +802,7 @@ impl BaseWorkflowContext {
             ScheduleActivityInput::new(activity.name().to_string(), Box::new(input.into()), opts);
         let base_ctx = self.clone();
         let next = WorkflowNext::new(move |input: ScheduleActivityInput| {
-            let (activity_type, input, headers, opts) = input.into_parts();
+            let (activity_type, input, headers, mut opts) = input.into_parts();
             let input = match input.downcast::<AD::Input>() {
                 Ok(input) => *input,
                 Err(_) => {
@@ -817,11 +816,42 @@ impl BaseWorkflowContext {
                     );
                 }
             };
-            base_ctx
-                .execute_activity_unintercepted::<AD>(activity_type, input, opts, headers)
-                .map(|result| {
-                    result.map(|output| Box::new(output) as Box<dyn WorkflowOutboundValue>)
-                })
+            let payload_converter = base_ctx.inner.data_converter.payload_converter();
+            let ctx = SerializationContext {
+                data: &SerializationContextData::Workflow,
+                converter: payload_converter,
+            };
+            match payload_converter.to_payloads(&ctx, &input) {
+                Ok(payloads) => {
+                    let seq = base_ctx.inner.seq_nums.borrow_mut().next_activity_seq();
+                    let (cmd, unblocker) = CancellableWFCommandFut::new(
+                        CancellableID::Activity(seq),
+                        base_ctx.clone(),
+                    );
+                    base_ctx
+                        .inner
+                        .runtime
+                        .register_unblocker(PendingCommandId::Activity(seq), unblocker);
+                    if opts.task_queue.is_none() {
+                        opts.task_queue = Some(base_ctx.inner.task_queue.clone());
+                    }
+                    base_ctx.inner.runtime.host.push_command(opts.into_command(
+                        seq,
+                        activity_type,
+                        payloads,
+                        headers,
+                    ));
+                    CancellableWorkflowOutboundFuture::new(
+                        ActivityFut::running(cmd, base_ctx.inner.data_converter.clone()),
+                        base_ctx.cancellation_handle(CancellableID::Activity(seq)),
+                    )
+                }
+                Err(err) => CancellableWorkflowOutboundFuture::new(
+                    ActivityFut::<future::Ready<ActivityResolution>, AD::Output>::eager(err.into()),
+                    WorkflowCancellationHandle::noop(),
+                ),
+            }
+            .map(|result| result.map(|output| Box::new(output) as Box<dyn WorkflowOutboundValue>))
         });
         let interceptors = self.inner.workflow_interceptors.borrow().clone();
         let future = call_schedule_activity(
@@ -843,51 +873,6 @@ impl BaseWorkflowContext {
             })
         });
         self.prepare_cancellable_outbound_future(future)
-    }
-
-    fn execute_activity_unintercepted<AD: ActivityDefinition>(
-        &self,
-        activity_type: String,
-        input: AD::Input,
-        mut opts: ActivityOptions,
-        headers: HashMap<String, Payload>,
-    ) -> CancellableWorkflowOutboundFuture<Result<AD::Output, ActivityExecutionError>>
-    where
-        AD::Output: TemporalDeserializable,
-    {
-        let payload_converter = self.inner.data_converter.payload_converter();
-        let ctx = SerializationContext {
-            data: &SerializationContextData::Workflow,
-            converter: payload_converter,
-        };
-        let payloads = match payload_converter.to_payloads(&ctx, &input) {
-            Ok(p) => p,
-            Err(e) => {
-                return CancellableWorkflowOutboundFuture::new(
-                    ActivityFut::<future::Ready<ActivityResolution>, AD::Output>::eager(e.into()),
-                    WorkflowCancellationHandle::noop(),
-                );
-            }
-        };
-        let seq = self.inner.seq_nums.borrow_mut().next_activity_seq();
-        let (cmd, unblocker) =
-            CancellableWFCommandFut::new(CancellableID::Activity(seq), self.clone());
-        self.inner
-            .runtime
-            .register_unblocker(PendingCommandId::Activity(seq), unblocker);
-        if opts.task_queue.is_none() {
-            opts.task_queue = Some(self.inner.task_queue.clone());
-        }
-        self.inner.runtime.host.push_command(opts.into_command(
-            seq,
-            activity_type,
-            payloads,
-            headers,
-        ));
-        CancellableWorkflowOutboundFuture::new(
-            ActivityFut::running(cmd, self.inner.data_converter.clone()),
-            self.cancellation_handle(CancellableID::Activity(seq)),
-        )
     }
 
     /// Request to run a local activity
@@ -922,11 +907,31 @@ impl BaseWorkflowContext {
                     );
                 }
             };
-            base_ctx
-                .execute_local_activity_unintercepted::<AD>(activity_type, input, opts, headers)
-                .map(|result| {
-                    result.map(|output| Box::new(output) as Box<dyn WorkflowOutboundValue>)
-                })
+            let payload_converter = base_ctx.inner.data_converter.payload_converter();
+            let ctx = SerializationContext {
+                data: &SerializationContextData::Workflow,
+                converter: payload_converter,
+            };
+            match payload_converter.to_payloads(&ctx, &input) {
+                Ok(payloads) => {
+                    let future = LATimerBackoffFut::new(
+                        activity_type,
+                        payloads,
+                        headers,
+                        opts,
+                        base_ctx.clone(),
+                    );
+                    cancellable_outbound(ActivityFut::running(
+                        future,
+                        base_ctx.inner.data_converter.clone(),
+                    ))
+                }
+                Err(err) => CancellableWorkflowOutboundFuture::new(
+                    ActivityFut::<future::Ready<ActivityResolution>, AD::Output>::eager(err.into()),
+                    WorkflowCancellationHandle::noop(),
+                ),
+            }
+            .map(|result| result.map(|output| Box::new(output) as Box<dyn WorkflowOutboundValue>))
         });
         let interceptors = self.inner.workflow_interceptors.borrow().clone();
         let future = call_schedule_local_activity(
@@ -950,37 +955,6 @@ impl BaseWorkflowContext {
         self.prepare_cancellable_outbound_future(future)
     }
 
-    fn execute_local_activity_unintercepted<AD: ActivityDefinition>(
-        &self,
-        activity_type: String,
-        input: AD::Input,
-        opts: LocalActivityOptions,
-        headers: HashMap<String, Payload>,
-    ) -> CancellableWorkflowOutboundFuture<Result<AD::Output, ActivityExecutionError>>
-    where
-        AD::Output: TemporalDeserializable,
-    {
-        let payload_converter = self.inner.data_converter.payload_converter();
-        let ctx = SerializationContext {
-            data: &SerializationContextData::Workflow,
-            converter: payload_converter,
-        };
-        let payloads = match payload_converter.to_payloads(&ctx, &input) {
-            Ok(p) => p,
-            Err(e) => {
-                return CancellableWorkflowOutboundFuture::new(
-                    ActivityFut::<future::Ready<ActivityResolution>, AD::Output>::eager(e.into()),
-                    WorkflowCancellationHandle::noop(),
-                );
-            }
-        };
-        let future = LATimerBackoffFut::new(activity_type, payloads, headers, opts, self.clone());
-        cancellable_outbound(ActivityFut::running(
-            future,
-            self.inner.data_converter.clone(),
-        ))
-    }
-
     /// Start a child workflow with typed input/output.
     pub(crate) fn start_child_workflow<WD: WorkflowDefinition + 'static>(
         &self,
@@ -995,7 +969,7 @@ impl BaseWorkflowContext {
             StartChildWorkflowInput::new(workflow.name().to_string(), Box::new(input.into()), opts);
         let base_ctx = self.clone();
         let next = WorkflowNext::new(move |input: StartChildWorkflowInput| {
-            let (workflow_type, input, headers, opts) = input.into_parts();
+            let (workflow_type, input, headers, mut opts) = input.into_parts();
             let input = match input.downcast::<WD::Input>() {
                 Ok(input) => *input,
                 Err(_) => {
@@ -1009,7 +983,78 @@ impl BaseWorkflowContext {
                     );
                 }
             };
-            base_ctx.start_child_workflow_unintercepted::<WD>(workflow_type, input, opts, headers)
+            let payload_converter = base_ctx.inner.data_converter.payload_converter();
+            let ctx = SerializationContext {
+                data: &SerializationContextData::Workflow,
+                converter: payload_converter,
+            };
+            let payloads = match payload_converter.to_payloads(&ctx, &input) {
+                Ok(payloads) => payloads,
+                Err(err) => {
+                    return CancellableWorkflowOutboundFuture::new(
+                        ChildWorkflowStartFut::<future::Ready<PendingChildWorkflow<WD>>, WD>::eager(
+                            err.into(),
+                        ),
+                        WorkflowCancellationHandle::noop(),
+                    );
+                }
+            };
+            let workflow_id = opts
+                .workflow_id
+                .take()
+                .filter(|id| !id.is_empty())
+                .unwrap_or_else(|| base_ctx.uuid4());
+
+            let child_seq = base_ctx
+                .inner
+                .seq_nums
+                .borrow_mut()
+                .next_child_workflow_seq();
+            // Immediately create the command/future for the result, otherwise if the user does
+            // not await the result until *after* we receive an activation for it, there will be nothing
+            // to match when unblocking.
+            let (result_cmd, unblocker) = CancellableWFCommandFut::new(
+                CancellableID::ChildWorkflow {
+                    seqnum: child_seq,
+                    reason: String::new(),
+                },
+                base_ctx.clone(),
+            );
+            base_ctx.inner.runtime.register_unblocker(
+                PendingCommandId::ChildWorkflowComplete(child_seq),
+                unblocker,
+            );
+
+            let common = ChildWfCommon {
+                workflow_id: workflow_id.clone(),
+                child_seq,
+                result_future: result_cmd,
+                base_ctx: base_ctx.clone(),
+                data_converter: base_ctx.inner.data_converter.clone(),
+            };
+
+            let (cmd, unblocker) =
+                CancellableWFCommandFut::<PendingChildWorkflow<WD>, ChildWfCommon>::new_with_dat(
+                    CancellableID::ChildWorkflow {
+                        seqnum: child_seq,
+                        reason: String::new(),
+                    },
+                    common,
+                    base_ctx.clone(),
+                );
+            base_ctx
+                .inner
+                .runtime
+                .register_unblocker(PendingCommandId::ChildWorkflowStart(child_seq), unblocker);
+            base_ctx.inner.runtime.host.push_command(opts.into_command(
+                child_seq,
+                workflow_type,
+                payloads,
+                headers,
+                workflow_id,
+            ));
+
+            cancellable_outbound_with_reason(ChildWorkflowStartFut::Running(cmd))
         });
         let interceptors = self.inner.workflow_interceptors.borrow().clone();
         let future = call_start_child_workflow(
@@ -1020,85 +1065,6 @@ impl BaseWorkflowContext {
         )
         .map(|result| result.map(StartChildWorkflowOutput::into_started));
         self.prepare_cancellable_outbound_future(future)
-    }
-
-    fn start_child_workflow_unintercepted<WD: WorkflowDefinition + 'static>(
-        &self,
-        workflow_type: String,
-        input: WD::Input,
-        mut opts: ChildWorkflowOptions,
-        headers: HashMap<String, Payload>,
-    ) -> CancellableWorkflowOutboundFuture<StartChildWorkflowResult>
-    where
-        WD::Output: TemporalDeserializable,
-    {
-        let payload_converter = self.inner.data_converter.payload_converter();
-        let ctx = SerializationContext {
-            data: &SerializationContextData::Workflow,
-            converter: payload_converter,
-        };
-        let payloads = match payload_converter.to_payloads(&ctx, &input) {
-            Ok(p) => p,
-            Err(e) => {
-                return CancellableWorkflowOutboundFuture::new(
-                    ChildWorkflowStartFut::<future::Ready<PendingChildWorkflow<WD>>, WD>::eager(
-                        e.into(),
-                    ),
-                    WorkflowCancellationHandle::noop(),
-                );
-            }
-        };
-        let workflow_id = opts
-            .workflow_id
-            .take()
-            .filter(|id| !id.is_empty())
-            .unwrap_or_else(|| self.uuid4());
-
-        let child_seq = self.inner.seq_nums.borrow_mut().next_child_workflow_seq();
-        // Immediately create the command/future for the result, otherwise if the user does
-        // not await the result until *after* we receive an activation for it, there will be nothing
-        // to match when unblocking.
-        let (result_cmd, unblocker) = CancellableWFCommandFut::new(
-            CancellableID::ChildWorkflow {
-                seqnum: child_seq,
-                reason: String::new(),
-            },
-            self.clone(),
-        );
-        self.inner.runtime.register_unblocker(
-            PendingCommandId::ChildWorkflowComplete(child_seq),
-            unblocker,
-        );
-
-        let common = ChildWfCommon {
-            workflow_id: workflow_id.clone(),
-            child_seq,
-            result_future: result_cmd,
-            base_ctx: self.clone(),
-            data_converter: self.inner.data_converter.clone(),
-        };
-
-        let (cmd, unblocker) =
-            CancellableWFCommandFut::<PendingChildWorkflow<WD>, ChildWfCommon>::new_with_dat(
-                CancellableID::ChildWorkflow {
-                    seqnum: child_seq,
-                    reason: String::new(),
-                },
-                common,
-                self.clone(),
-            );
-        self.inner
-            .runtime
-            .register_unblocker(PendingCommandId::ChildWorkflowStart(child_seq), unblocker);
-        self.inner.runtime.host.push_command(opts.into_command(
-            child_seq,
-            workflow_type,
-            payloads,
-            headers,
-            workflow_id,
-        ));
-
-        cancellable_outbound_with_reason(ChildWorkflowStartFut::Running(cmd))
     }
 
     /// Request to run a local activity with no implementation of timer-backoff based retrying.
@@ -1147,7 +1113,68 @@ impl BaseWorkflowContext {
                     );
                 }
             };
-            base_ctx.signal_workflow_unintercepted::<S>(signal_name, target, input, headers)
+            let payload_converter = base_ctx.data_converter().payload_converter();
+            let ctx = SerializationContext {
+                data: &SerializationContextData::Workflow,
+                converter: payload_converter,
+            };
+            let payloads = match payload_converter.to_payloads(&ctx, &input) {
+                Ok(payloads) => payloads,
+                Err(err) => {
+                    return CancellableWorkflowOutboundFuture::new(
+                        async move { Err(err.into()) },
+                        WorkflowCancellationHandle::noop(),
+                    );
+                }
+            };
+            let target = match target {
+                SignalWorkflowTarget::Child { workflow_id } => {
+                    signal_external_workflow_execution::Target::ChildWorkflowId(workflow_id)
+                }
+                SignalWorkflowTarget::External {
+                    namespace,
+                    workflow_id,
+                    run_id,
+                } => signal_external_workflow_execution::Target::WorkflowExecution(
+                    NamespacedWorkflowExecution {
+                        namespace,
+                        workflow_id,
+                        run_id: run_id.unwrap_or_default(),
+                    },
+                ),
+            };
+            let mut signal = Signal::new(signal_name, payloads);
+            signal.data.headers = headers;
+            let seq = base_ctx
+                .inner
+                .seq_nums
+                .borrow_mut()
+                .next_signal_external_wf_seq();
+            let (cmd, unblocker) = CancellableWFCommandFut::new(
+                CancellableID::SignalExternalWorkflow(seq),
+                base_ctx.clone(),
+            );
+            base_ctx
+                .inner
+                .runtime
+                .register_unblocker(PendingCommandId::SignalExternal(seq), unblocker);
+            let signal = signal.into_invocation();
+            base_ctx.inner.runtime.host.push_command(
+                workflow_command::Variant::SignalExternalWorkflowExecution(
+                    SignalExternalWorkflowExecution {
+                        seq,
+                        signal_name: signal.signal_name,
+                        args: signal.input,
+                        target: Some(target),
+                        headers: signal.headers,
+                    },
+                )
+                .into(),
+            );
+            cancellable_outbound(SignalChildFut::Running {
+                inner: cmd,
+                data_converter: base_ctx.data_converter().clone(),
+            })
         });
         let interceptors = self.inner.workflow_interceptors.borrow().clone();
         let future = call_signal_workflow(
@@ -1157,82 +1184,6 @@ impl BaseWorkflowContext {
             next,
         );
         self.prepare_cancellable_outbound_future(future)
-    }
-
-    fn signal_workflow_unintercepted<S: SignalDefinition>(
-        &self,
-        signal_name: String,
-        target: SignalWorkflowTarget,
-        input: S::Input,
-        headers: HashMap<String, Payload>,
-    ) -> CancellableWorkflowOutboundFuture<SignalWorkflowResult> {
-        let payload_converter = self.data_converter().payload_converter();
-        let ctx = SerializationContext {
-            data: &SerializationContextData::Workflow,
-            converter: payload_converter,
-        };
-        let payloads = match payload_converter.to_payloads(&ctx, &input) {
-            Ok(payloads) => payloads,
-            Err(err) => {
-                return CancellableWorkflowOutboundFuture::new(
-                    async move { Err(err.into()) },
-                    WorkflowCancellationHandle::noop(),
-                );
-            }
-        };
-        let target = match target {
-            SignalWorkflowTarget::Child { workflow_id } => {
-                signal_external_workflow_execution::Target::ChildWorkflowId(workflow_id)
-            }
-            SignalWorkflowTarget::External {
-                namespace,
-                workflow_id,
-                run_id,
-            } => signal_external_workflow_execution::Target::WorkflowExecution(
-                NamespacedWorkflowExecution {
-                    namespace,
-                    workflow_id,
-                    run_id: run_id.unwrap_or_default(),
-                },
-            ),
-        };
-        let mut signal = Signal::new(signal_name, payloads);
-        signal.data.headers = headers;
-        cancellable_outbound(SignalChildFut::Running {
-            inner: self.clone().send_signal_wf_unintercepted(target, signal),
-            data_converter: self.data_converter().clone(),
-        })
-    }
-
-    fn send_signal_wf_unintercepted(
-        self,
-        target: signal_external_workflow_execution::Target,
-        signal: Signal,
-    ) -> impl CancellableFuture<SignalExternalWfResult> {
-        let seq = self
-            .inner
-            .seq_nums
-            .borrow_mut()
-            .next_signal_external_wf_seq();
-        let (cmd, unblocker) =
-            CancellableWFCommandFut::new(CancellableID::SignalExternalWorkflow(seq), self.clone());
-        self.inner
-            .runtime
-            .register_unblocker(PendingCommandId::SignalExternal(seq), unblocker);
-        let signal = signal.into_invocation();
-        self.inner.runtime.host.push_command(
-            workflow_command::Variant::SignalExternalWorkflowExecution(
-                SignalExternalWorkflowExecution {
-                    seq,
-                    signal_name: signal.signal_name,
-                    args: signal.input,
-                    target: Some(target),
-                    headers: signal.headers,
-                },
-            )
-            .into(),
-        );
-        cmd
     }
 
     pub(crate) fn external_workflow(
@@ -1254,7 +1205,31 @@ impl BaseWorkflowContext {
     ) -> WorkflowOutboundFuture<CancelExternalWfResult> {
         let base_ctx = self.clone();
         let next = WorkflowNext::new(move |input: CancelExternalWorkflowInput| {
-            base_ctx.cancel_external_workflow_unintercepted(input)
+            let seq = base_ctx
+                .inner
+                .seq_nums
+                .borrow_mut()
+                .next_cancel_external_wf_seq();
+            let (cmd, unblocker) = WFCommandFut::new();
+            base_ctx
+                .inner
+                .runtime
+                .register_unblocker(PendingCommandId::CancelExternal(seq), unblocker);
+            base_ctx.inner.runtime.host.push_command(
+                workflow_command::Variant::RequestCancelExternalWorkflowExecution(
+                    RequestCancelExternalWorkflowExecution {
+                        seq,
+                        workflow_execution: Some(NamespacedWorkflowExecution {
+                            namespace: base_ctx.inner.namespace.clone(),
+                            workflow_id: input.workflow_id,
+                            run_id: input.run_id.unwrap_or_default(),
+                        }),
+                        reason: input.reason.unwrap_or_default(),
+                    },
+                )
+                .into(),
+            );
+            WorkflowOutboundFuture::new(cmd)
         });
         let interceptors = self.inner.workflow_interceptors.borrow().clone();
         let future = call_cancel_external_workflow(
@@ -1266,36 +1241,6 @@ impl BaseWorkflowContext {
         self.prepare_outbound_future(future)
     }
 
-    fn cancel_external_workflow_unintercepted(
-        &self,
-        input: CancelExternalWorkflowInput,
-    ) -> WorkflowOutboundFuture<CancelExternalWfResult> {
-        let seq = self
-            .inner
-            .seq_nums
-            .borrow_mut()
-            .next_cancel_external_wf_seq();
-        let (cmd, unblocker) = WFCommandFut::new();
-        self.inner
-            .runtime
-            .register_unblocker(PendingCommandId::CancelExternal(seq), unblocker);
-        self.inner.runtime.host.push_command(
-            workflow_command::Variant::RequestCancelExternalWorkflowExecution(
-                RequestCancelExternalWorkflowExecution {
-                    seq,
-                    workflow_execution: Some(NamespacedWorkflowExecution {
-                        namespace: self.inner.namespace.clone(),
-                        workflow_id: input.workflow_id,
-                        run_id: input.run_id.unwrap_or_default(),
-                    }),
-                    reason: input.reason.unwrap_or_default(),
-                },
-            )
-            .into(),
-        );
-        WorkflowOutboundFuture::new(cmd)
-    }
-
     pub(crate) fn start_nexus_operation(
         &self,
         opts: NexusOperationOptions,
@@ -1303,7 +1248,32 @@ impl BaseWorkflowContext {
         let input = StartNexusOperationInput::new(opts);
         let base_ctx = self.clone();
         let next = WorkflowNext::new(move |input: StartNexusOperationInput| {
-            base_ctx.start_nexus_operation_unintercepted(input.into_options())
+            let opts = input.into_options();
+            let seq = base_ctx.inner.seq_nums.borrow_mut().next_nexus_op_seq();
+            let (result_future, unblocker) = WFCommandFut::new();
+            base_ctx
+                .inner
+                .runtime
+                .register_unblocker(PendingCommandId::NexusOpComplete(seq), unblocker);
+            let (cmd, unblocker) = CancellableWFCommandFut::new_with_dat(
+                CancellableID::NexusOp(seq),
+                NexusUnblockData {
+                    result_future: result_future.shared(),
+                    schedule_seq: seq,
+                    base_ctx: base_ctx.clone(),
+                },
+                base_ctx.clone(),
+            );
+            base_ctx
+                .inner
+                .runtime
+                .register_unblocker(PendingCommandId::NexusOpStart(seq), unblocker);
+            base_ctx
+                .inner
+                .runtime
+                .host
+                .push_command(opts.into_command(seq));
+            cancellable_outbound(cmd)
         });
         let interceptors = self.inner.workflow_interceptors.borrow().clone();
         let future = call_start_nexus_operation(
@@ -1313,31 +1283,6 @@ impl BaseWorkflowContext {
             next,
         );
         self.prepare_cancellable_outbound_future(future)
-    }
-
-    fn start_nexus_operation_unintercepted(
-        &self,
-        opts: NexusOperationOptions,
-    ) -> CancellableWorkflowOutboundFuture<NexusStartResult> {
-        let seq = self.inner.seq_nums.borrow_mut().next_nexus_op_seq();
-        let (result_future, unblocker) = WFCommandFut::new();
-        self.inner
-            .runtime
-            .register_unblocker(PendingCommandId::NexusOpComplete(seq), unblocker);
-        let (cmd, unblocker) = CancellableWFCommandFut::new_with_dat(
-            CancellableID::NexusOp(seq),
-            NexusUnblockData {
-                result_future: result_future.shared(),
-                schedule_seq: seq,
-                base_ctx: self.clone(),
-            },
-            self.clone(),
-        );
-        self.inner
-            .runtime
-            .register_unblocker(PendingCommandId::NexusOpStart(seq), unblocker);
-        self.inner.runtime.host.push_command(opts.into_command(seq));
-        cancellable_outbound(cmd)
     }
 }
 
