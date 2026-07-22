@@ -217,12 +217,12 @@ impl WorkflowInterceptorContext {
         self.base.search_attributes()
     }
 
-    /// Returns true if the current workflow task is happening under replay.
+    /// Returns true if the workflow is replaying (including during queries and update validators), false otherwise.
     pub fn is_replaying(&self) -> bool {
         self.base.is_replaying()
     }
 
-    /// Returns true if the current work is replaying history events.
+    /// Return true if the workflow is replaying history events (excluding queries and update validators), false otherwise.
     pub fn is_replaying_history_events(&self) -> bool {
         self.base.is_replaying_history_events()
     }
@@ -397,8 +397,8 @@ impl DecodedInput {
 
 /// Input passed to [`WorkflowInterceptor::initialize_workflow`].
 ///
-/// The decoded input is present when the workflow's `#[init]` method accepts the workflow start
-/// input.
+/// The decoded input provided to workflow's `#[init]` method.
+/// If a workflow has no `#[init]`, inputs are instead passed to [`WorkflowInterceptor::execute`].
 #[non_exhaustive]
 pub struct InitializeWorkflowInput {
     decoded: DecodedInput,
@@ -449,9 +449,8 @@ impl InitializeWorkflowOutput {
 
 /// Input passed to [`WorkflowInterceptor::execute`].
 ///
-/// The decoded input is present when the workflow's `#[run]` method accepts the workflow start
-/// input. Inputs consumed by `#[init]` are instead passed to
-/// [`WorkflowInterceptor::initialize_workflow`].
+/// The decoded input provided to workflow's `#[run]` method.
+/// Inputs consumed by `#[init]` are instead passed to [`WorkflowInterceptor::initialize_workflow`].
 #[non_exhaustive]
 pub struct ExecuteWorkflowInput {
     decoded: DecodedInput,
@@ -780,14 +779,9 @@ impl WorkflowCancellationHandle {
         Self::new(|_| {})
     }
 
-    /// Cancel without a reason.
-    pub fn cancel(&self) {
-        (self.cancel)(None);
-    }
-
-    /// Cancel with a reason.
-    pub fn cancel_with_reason(&self, reason: String) {
-        (self.cancel)(Some(reason));
+    /// Cancel with an optional reason.
+    pub fn cancel(&self, reason: Option<String>) {
+        (self.cancel)(reason);
     }
 }
 
@@ -847,13 +841,13 @@ impl<T> FusedFuture for CancellableWorkflowOutboundFuture<T> {
 
 impl<T> CancellableFuture<T> for CancellableWorkflowOutboundFuture<T> {
     fn cancel(&self) {
-        self.cancellation.cancel();
+        self.cancellation.cancel(None);
     }
 }
 
 impl<T> CancellableFutureWithReason<T> for CancellableWorkflowOutboundFuture<T> {
     fn cancel_with_reason(&self, reason: String) {
-        self.cancellation.cancel_with_reason(reason);
+        self.cancellation.cancel(Some(reason));
     }
 }
 
@@ -1287,6 +1281,9 @@ pub trait WorkflowInterceptor: 'static {
     }
 
     /// Called to invoke the workflow run method.
+    ///
+    /// Inputs consumed by `#[init]` are instead passed to
+    /// [`WorkflowInterceptor::initialize_workflow`].
     fn execute<'a>(
         &'a self,
         _ctx: WorkflowInterceptorContext,

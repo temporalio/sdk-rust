@@ -75,7 +75,7 @@ impl<F: Future + Unpin> Future for ConstructionBlockedFuture<F> {
     type Output = F::Output;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        if self.base_ctx.is_construction_poll() {
+        if self.base_ctx.is_construction_phase() {
             // Every newly started routine receives a normal poll after activation, so this barrier
             // does not need to register the construction waker with the async handler.
             Poll::Pending

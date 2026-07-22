@@ -329,12 +329,12 @@ impl BaseWorkflowContext {
         SearchAttributes::from_proto(&self.inner.shared.borrow().search_attributes)
     }
 
-    /// Returns true if the current workflow task is happening under replay.
+    /// Returns true if the workflow is replaying (including during queries and update validators), false otherwise.
     pub fn is_replaying(&self) -> bool {
         self.inner.shared.borrow().activation.is_replaying
     }
 
-    /// Returns true if the current work is replaying history events.
+    /// Return true if the workflow is replaying history events (excluding queries and update validators), false otherwise.
     pub fn is_replaying_history_events(&self) -> bool {
         self.inner.shared.borrow().is_replaying_history_events
     }
@@ -355,7 +355,7 @@ impl BaseWorkflowContext {
         }
     }
 
-    pub(crate) fn is_construction_poll(&self) -> bool {
+    pub(crate) fn is_construction_phase(&self) -> bool {
         self.inner.poll_phase.get() == WorkflowPollPhase::Construction
     }
 
@@ -3536,12 +3536,10 @@ mod tests {
         ) -> crate::workflow_interceptors::ContinueAsNewResult {
             *input.input_mut::<u8>().unwrap() = 42;
             input.options_mut().workflow_type = Some("mutated-workflow-type".to_string());
-            input
-                .headers_mut()
-                .insert(
-                    "continue-header".to_string(),
-                    Payload::from(b"continue-header-value".as_slice()),
-                );
+            input.headers_mut().insert(
+                "continue-header".to_string(),
+                Payload::from(b"continue-header-value".as_slice()),
+            );
             next.run(input)
         }
 
@@ -3682,12 +3680,12 @@ mod tests {
 
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let _guard = base.enter_construction_poll();
-            assert!(base.is_construction_poll());
+            assert!(base.is_construction_phase());
             panic!("test panic");
         }));
 
         assert!(result.is_err());
-        assert!(!base.is_construction_poll());
+        assert!(!base.is_construction_phase());
     }
 
     #[test]
