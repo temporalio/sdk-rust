@@ -198,16 +198,20 @@ impl PatchActivationCaller {
     }
 }
 
+/// Distinguishes polls that construct interceptor calls from polls that drive workflow routines.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-enum WorkflowPollPhase {
+enum WorkflowFuturePollPhase {
+    /// Used while pre-polling interceptor futures; user workflow and handler futures must not make
+    /// progress during these construction-only polls.
     Construction,
+    /// Used for normal routine polling, when user workflow and handler futures may make progress.
     #[default]
     Routine,
 }
 
 pub(crate) struct ConstructionPollGuard<'a> {
-    phase: &'a Cell<WorkflowPollPhase>,
-    previous: WorkflowPollPhase,
+    phase: &'a Cell<WorkflowFuturePollPhase>,
+    previous: WorkflowFuturePollPhase,
 }
 
 impl Drop for ConstructionPollGuard<'_> {
@@ -348,7 +352,7 @@ impl BaseWorkflowContext {
         let previous = self
             .inner
             .poll_phase
-            .replace(WorkflowPollPhase::Construction);
+            .replace(WorkflowFuturePollPhase::Construction);
         ConstructionPollGuard {
             phase: &self.inner.poll_phase,
             previous,
@@ -356,7 +360,7 @@ impl BaseWorkflowContext {
     }
 
     pub(crate) fn is_construction_phase(&self) -> bool {
-        self.inner.poll_phase.get() == WorkflowPollPhase::Construction
+        self.inner.poll_phase.get() == WorkflowFuturePollPhase::Construction
     }
 
     pub(crate) fn construction_waker(&self) -> Waker {
@@ -515,7 +519,7 @@ struct WorkflowContextInner {
     data_converter: DataConverter,
     patch_activation_callback: Option<PatchActivationCallback>,
     state_mutated: Cell<bool>,
-    poll_phase: Cell<WorkflowPollPhase>,
+    poll_phase: Cell<WorkflowFuturePollPhase>,
     construction_non_sdk_wake: Arc<AtomicBool>,
     workflow_interceptors: RefCell<Vec<Arc<dyn WorkflowInterceptor>>>,
 }
@@ -613,7 +617,7 @@ impl BaseWorkflowContext {
                 data_converter,
                 patch_activation_callback,
                 state_mutated: Cell::new(false),
-                poll_phase: Cell::new(WorkflowPollPhase::Routine),
+                poll_phase: Cell::new(WorkflowFuturePollPhase::Routine),
                 construction_non_sdk_wake: Arc::new(AtomicBool::new(false)),
                 workflow_interceptors: RefCell::new(Vec::new()),
             }),

@@ -60,6 +60,9 @@ impl<F: Future + Unpin> Future for SdkGuardedFuture<F> {
     }
 }
 
+/// Used to prevent workflow or async signal/update handler futures from being polled.
+/// Necessary in order to ensure inbound interceptors can receive an initial poll without entering
+/// workflow code. This allows for sync interceptors to not delay the execution of sync signal handlers.
 pub(crate) struct ConstructionBlockedFuture<F> {
     base_ctx: BaseWorkflowContext,
     inner: F,
@@ -76,8 +79,6 @@ impl<F: Future + Unpin> Future for ConstructionBlockedFuture<F> {
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         if self.base_ctx.is_construction_phase() {
-            // Every newly started routine receives a normal poll after activation, so this barrier
-            // does not need to register the construction waker with the async handler.
             Poll::Pending
         } else {
             Pin::new(&mut self.inner).poll(cx)
