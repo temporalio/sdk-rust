@@ -649,7 +649,11 @@ async fn can_heartbeat_acts_during_shutdown() {
     })
     .await
     .unwrap();
-    core.drain_activity_poller_and_shutdown().await;
+    assert_matches!(
+        core.poll_activity_task().await.unwrap_err(),
+        crate::PollError::ShutDown
+    );
+    shutdown_fut.await;
 }
 
 /// Verifies that if a user has tried to record a heartbeat and then immediately after failed the

@@ -1427,6 +1427,7 @@ async fn concurrent_shutdown_waits_for_shared_rpc_and_only_starts_once() {
         shutdown_two_first_poll.await.unwrap(),
         "second shutdown caller completed while the RPC was blocked"
     );
+    initiator.await.unwrap();
 
     release_rpc.send(true).unwrap();
     tokio::time::timeout(Duration::from_secs(5), async {
