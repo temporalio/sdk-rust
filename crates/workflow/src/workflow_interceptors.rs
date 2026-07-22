@@ -15,7 +15,7 @@ use crate::{
 };
 use futures_util::{
     FutureExt,
-    future::{Fuse, FusedFuture, LocalBoxFuture, Shared},
+    future::{Fuse, FusedFuture, LocalBoxFuture},
 };
 use std::{
     any::Any,
@@ -708,13 +708,6 @@ impl<T> WorkflowOutboundFuture<T> {
         U: 'static,
     {
         WorkflowOutboundFuture::new(async move { map(self.await) })
-    }
-
-    pub(crate) fn into_shared(self) -> Shared<LocalBoxFuture<'static, T>>
-    where
-        T: Clone + 'static,
-    {
-        self.boxed_local().shared()
     }
 
     pub(crate) fn poll_for_construction(&mut self, cx: &mut Context<'_>) {

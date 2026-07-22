@@ -38,7 +38,7 @@ use crate::{
 use futures_channel::oneshot;
 use futures_util::{
     FutureExt,
-    future::{FusedFuture, LocalBoxFuture, Shared},
+    future::{FusedFuture, Shared},
     task::Context,
 };
 use rand::SeedableRng;
@@ -3073,7 +3073,7 @@ pub struct StartedNexusOperation {
     /// The operation token, if the operation started asynchronously
     pub operation_token: Option<String>,
     #[debug(skip)]
-    pub(crate) result_future: NexusResultFuture,
+    pub(crate) result_future: Shared<WFCommandFut<NexusOperationResult, ()>>,
     pub(crate) schedule_seq: u32,
     #[debug(skip)]
     pub(crate) base_ctx: BaseWorkflowContext,
@@ -3085,38 +3085,13 @@ pub(crate) struct NexusUnblockData {
     pub(crate) base_ctx: BaseWorkflowContext,
 }
 
-pub(crate) enum NexusResultFuture {
-    Raw(Shared<WFCommandFut<NexusOperationResult, ()>>),
-    Intercepted(Shared<LocalBoxFuture<'static, NexusOperationResult>>),
-}
-
 impl StartedNexusOperation {
-    /// Replace the operation completion future while retaining the operation handle.
-    pub fn map_result(
-        mut self,
-        map: impl FnOnce(
-            WorkflowOutboundFuture<NexusOperationResult>,
-        ) -> WorkflowOutboundFuture<NexusOperationResult>,
-    ) -> Self {
-        let result = match self.result_future {
-            NexusResultFuture::Raw(result) => WorkflowOutboundFuture::new(SdkGuardedFuture(result)),
-            NexusResultFuture::Intercepted(result) => {
-                WorkflowOutboundFuture::new(SdkGuardedFuture(result))
-            }
-        };
-        self.result_future = NexusResultFuture::Intercepted(map(result).into_shared());
-        self
-    }
-
     /// Wait for the operation result.
     pub async fn result(&self) -> NexusOperationResult {
         // The result future is a `Shared`; poll it inside an `SdkWakeGuard` (via
         // `SdkGuardedFuture`) so its internal waker machinery isn't mistaken for a non-SDK wake on
         // replay (which would fail the workflow task with TMPRL1100).
-        match &self.result_future {
-            NexusResultFuture::Raw(result) => SdkGuardedFuture(result.clone()).await,
-            NexusResultFuture::Intercepted(result) => SdkGuardedFuture(result.clone()).await,
-        }
+        SdkGuardedFuture(self.result_future.clone()).await
     }
 
     /// Request cancellation of the operation.
