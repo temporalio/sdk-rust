@@ -828,8 +828,6 @@ pub struct ContinueAsNewOptions {
     pub backoff_start_interval: Option<Duration>,
     /// If set, the new workflow will have these memo values. If `None`, reuses the current memo.
     pub memo: Option<MemoValues>,
-    /// If set, the new workflow will have these headers.
-    pub headers: Option<HashMap<String, Payload>>,
     /// If set, the new workflow will have these search attributes. If `None`, reuses the current
     /// search attributes.
     pub search_attributes: Option<SearchAttributes>,

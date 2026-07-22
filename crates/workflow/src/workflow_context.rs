@@ -3538,7 +3538,10 @@ mod tests {
             input.options_mut().workflow_type = Some("mutated-workflow-type".to_string());
             input
                 .headers_mut()
-                .insert("continue-header".to_string(), Payload::default());
+                .insert(
+                    "continue-header".to_string(),
+                    Payload::from(b"continue-header-value".as_slice()),
+                );
             next.run(input)
         }
 
@@ -3652,6 +3655,28 @@ mod tests {
     }
 
     #[test]
+    fn continue_as_new_interceptor_header_reaches_proto_command() {
+        let ctx = test_context();
+        ctx.base_context()
+            .set_workflow_interceptors(vec![Arc::new(MutatingRemainingOutboundInterceptor)]);
+
+        let termination = ctx
+            .continue_as_new(7, ContinueAsNewOptions::default())
+            .expect_err("continue_as_new should terminate the workflow");
+        let WorkflowTermination::ContinueAsNew(proto_command) = termination else {
+            panic!("expected continue-as-new termination")
+        };
+
+        assert_eq!(
+            proto_command.headers,
+            HashMap::from([(
+                "continue-header".to_string(),
+                Payload::from(b"continue-header-value".as_slice()),
+            )])
+        );
+    }
+
+    #[test]
     fn construction_poll_guard_restores_phase_after_panic() {
         let base = test_context().base_context();
 
@@ -3749,11 +3774,6 @@ mod tests {
         let sync = ctx.sync_context();
         let mut memo = MemoValues::new();
         memo.insert("memo-key", "memo-value".to_string());
-        let mut headers = HashMap::new();
-        headers.insert(
-            "header-key".to_string(),
-            Payload::from(b"header-value".as_slice()),
-        );
         let mut proto_search_attributes = ProtoSearchAttributes::default();
         proto_search_attributes.indexed_fields.insert(
             "CustomKeywordField".to_string(),
@@ -3771,7 +3791,6 @@ mod tests {
                     task_timeout: Some(Duration::from_secs(3)),
                     backoff_start_interval: Some(Duration::from_secs(4)),
                     memo: Some(memo.clone()),
-                    headers: Some(headers.clone()),
                     search_attributes: Some(search_attributes.clone()),
                     retry_policy: Some(RetryPolicy::builder().maximum_attempts(5).build()),
                     versioning_intent: Some(ProtoVersioningIntent::Compatible.into()),
@@ -3802,7 +3821,7 @@ mod tests {
                     "memo-key".to_string(),
                     "memo-value".as_json_payload().unwrap(),
                 )]),
-                headers,
+                headers: HashMap::new(),
                 search_attributes: Some(proto_search_attributes),
                 retry_policy: Some(ProtoRetryPolicy {
                     initial_interval: Some(Duration::from_secs(1).try_into().unwrap()),
