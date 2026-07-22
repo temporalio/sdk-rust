@@ -74,9 +74,9 @@ mod machine_coverage_report {
         fail_workflow_state_machine::FailWorkflowMachine,
         local_activity_state_machine::LocalActivityMachine,
         modify_workflow_properties_state_machine::ModifyWorkflowPropertiesMachine,
-        nexus_operation_state_machine::NexusOperationMachine,
-        patch_state_machine::PatchMachine, signal_external_state_machine::SignalExternalMachine,
-        timer_state_machine::TimerMachine, update_state_machine::UpdateMachine,
+        nexus_operation_state_machine::NexusOperationMachine, patch_state_machine::PatchMachine,
+        signal_external_state_machine::SignalExternalMachine, timer_state_machine::TimerMachine,
+        update_state_machine::UpdateMachine,
         upsert_search_attributes_state_machine::UpsertSearchAttributesMachine,
         workflow_task_state_machine::WorkflowTaskMachine,
     };
