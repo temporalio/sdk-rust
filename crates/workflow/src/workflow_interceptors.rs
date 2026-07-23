@@ -915,13 +915,17 @@ impl<T> FusedFuture for CancellableWorkflowOutboundFuture<T> {
 
 impl<T> CancellableFuture<T> for CancellableWorkflowOutboundFuture<T> {
     fn cancel(&self) {
-        self.cancellation.cancel(None);
+        if !self.inner.is_terminated() {
+            self.cancellation.cancel(None);
+        }
     }
 }
 
 impl<T> CancellableFutureWithReason<T> for CancellableWorkflowOutboundFuture<T> {
     fn cancel_with_reason(&self, reason: String) {
-        self.cancellation.cancel(Some(reason));
+        if !self.inner.is_terminated() {
+            self.cancellation.cancel(Some(reason));
+        }
     }
 }
 

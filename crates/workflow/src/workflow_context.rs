@@ -3104,8 +3104,7 @@ impl StartedNexusOperation {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::MemoValues;
-    use crate::runtime::ConstructionBlockedFuture;
+    use crate::{MemoValues, runtime::ConstructionBlockedFuture};
     use std::{
         collections::HashMap,
         sync::{
