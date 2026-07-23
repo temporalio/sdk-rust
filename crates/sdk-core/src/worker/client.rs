@@ -402,11 +402,18 @@ impl WorkerClient for WorkerClientBag {
         poll_options: PollOptions,
         nexus_options: PollNexusOptions,
     ) -> Result<PollNexusTaskQueueResponse> {
-        let kind = if nexus_options.worker_commands_queue {
-            TaskQueueKind::WorkerCommands
-        } else {
-            TaskQueueKind::Normal
-        };
+        let (kind, worker_version_capabilities, deployment_options) =
+            if nexus_options.worker_commands_queue {
+                // Worker-command partitions do not support versioning, even when the client was
+                // created for a versioned application worker.
+                (TaskQueueKind::WorkerCommands, None, None)
+            } else {
+                (
+                    TaskQueueKind::Normal,
+                    self.worker_version_capabilities(),
+                    self.deployment_options(),
+                )
+            };
         #[allow(deprecated)] // want to list all fields explicitly
         let mut request = PollNexusTaskQueueRequest {
             namespace: self.namespace.clone(),
@@ -416,8 +423,8 @@ impl WorkerClient for WorkerClientBag {
                 normal_name: "".to_string(),
             }),
             identity: self.identity(),
-            worker_version_capabilities: self.worker_version_capabilities(),
-            deployment_options: self.deployment_options(),
+            worker_version_capabilities,
+            deployment_options,
             // TODO: Piggyback worker heartbeats here if this is the system nexus worker and reset
             //   heartbeating ticker when done
             worker_heartbeat: Vec::new(),
@@ -959,5 +966,153 @@ fn update_slots(slots_info: &mut Option<WorkerSlotsInfo>, client_heartbeat_data:
 
         client_heartbeat_data.total_processed_tasks = wft_slot_info.total_processed_tasks;
         client_heartbeat_data.total_failed_tasks = wft_slot_info.total_failed_tasks;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use prost::Message;
+    use std::sync::{Arc, Mutex};
+    use temporalio_client::{
+        ConnectionOptions,
+        callback_based::{CallbackBasedGrpcService, GrpcSuccessResponse},
+    };
+    use temporalio_common::worker::{WorkerDeploymentOptions, WorkerDeploymentVersion};
+
+    #[allow(deprecated)]
+    #[tokio::test]
+    async fn worker_command_nexus_polls_omit_versioning_metadata() {
+        let strategies = [
+            (
+                "deployment",
+                WorkerVersioningStrategy::WorkerDeploymentBased(WorkerDeploymentOptions {
+                    version: WorkerDeploymentVersion {
+                        deployment_name: "deployment".to_string(),
+                        build_id: "deployment-build".to_string(),
+                    },
+                    use_worker_versioning: true,
+                    default_versioning_behavior: None,
+                }),
+            ),
+            (
+                "legacy",
+                WorkerVersioningStrategy::LegacyBuildIdBased {
+                    build_id: "legacy-build".to_string(),
+                },
+            ),
+        ];
+
+        for (strategy_name, strategy) in strategies {
+            let requests = Arc::new(Mutex::new(Vec::new()));
+            let requests_clone = requests.clone();
+            let service_override = CallbackBasedGrpcService {
+                callback: Arc::new(move |request| {
+                    let requests = requests_clone.clone();
+                    Box::pin(async move {
+                        let proto = match request.rpc.as_str() {
+                            "GetSystemInfo" => GetSystemInfoResponse {
+                                capabilities: Some(Capabilities {
+                                    build_id_based_versioning: true,
+                                    ..Default::default()
+                                }),
+                                ..Default::default()
+                            }
+                            .encode_to_vec(),
+                            "PollNexusTaskQueue" => {
+                                requests.lock().unwrap().push(
+                                    PollNexusTaskQueueRequest::decode(request.proto)
+                                        .expect("poll request is valid"),
+                                );
+                                PollNexusTaskQueueResponse::default().encode_to_vec()
+                            }
+                            rpc => panic!("unexpected RPC: {rpc}"),
+                        };
+                        Ok(GrpcSuccessResponse {
+                            headers: Default::default(),
+                            proto,
+                        })
+                    })
+                }),
+            };
+            let connection = Connection::connect(
+                ConnectionOptions::new(url::Url::parse("http://localhost:7233").unwrap())
+                    .service_override(service_override)
+                    .dns_load_balancing(None)
+                    .build(),
+            )
+            .await
+            .unwrap();
+            let client = WorkerClientBag::new(
+                SharedReplaceableClient::new(connection),
+                "namespace".to_string(),
+                strategy,
+                Uuid::new_v4(),
+            );
+
+            client
+                .poll_nexus_task(
+                    PollOptions {
+                        task_queue: "application-queue".to_string(),
+                        no_retry: None,
+                        timeout_override: None,
+                    },
+                    PollNexusOptions {
+                        worker_commands_queue: false,
+                    },
+                )
+                .await
+                .unwrap();
+            client
+                .poll_nexus_task(
+                    PollOptions {
+                        task_queue: "worker-command-queue".to_string(),
+                        no_retry: None,
+                        timeout_override: None,
+                    },
+                    PollNexusOptions {
+                        worker_commands_queue: true,
+                    },
+                )
+                .await
+                .unwrap();
+
+            let requests = requests.lock().unwrap();
+            assert_eq!(requests.len(), 2, "{strategy_name}");
+            let normal_poll = &requests[0];
+            assert_eq!(
+                normal_poll.task_queue.as_ref().unwrap().kind,
+                TaskQueueKind::Normal as i32,
+                "{strategy_name}",
+            );
+            assert!(
+                normal_poll
+                    .worker_version_capabilities
+                    .as_ref()
+                    .is_some_and(|capabilities| capabilities.use_versioning)
+                    || normal_poll
+                        .deployment_options
+                        .as_ref()
+                        .is_some_and(|options| {
+                            options.worker_versioning_mode == WorkerVersioningMode::Versioned as i32
+                        }),
+                "{strategy_name}",
+            );
+
+            let worker_command_poll = &requests[1];
+            assert_eq!(
+                worker_command_poll.task_queue.as_ref().unwrap().kind,
+                TaskQueueKind::WorkerCommands as i32,
+                "{strategy_name}",
+            );
+            assert!(
+                worker_command_poll.worker_version_capabilities.is_none(),
+                "{strategy_name}",
+            );
+            assert!(
+                worker_command_poll.deployment_options.is_none(),
+                "{strategy_name}",
+            );
+        }
     }
 }
