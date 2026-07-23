@@ -1,12 +1,5 @@
-use std::sync::Arc;
 use temporalio_workflow::{
-    WorkflowContext, WorkflowResult,
-    component::{StaticWorkflowComponent, instantiate_component_workflow_with_interceptors},
-    runtime::{
-        guest::WorkflowInstance,
-        host::WorkflowHost,
-        types::{WorkflowDefinitionDescriptor, WorkflowFailure, WorkflowInit},
-    },
+    WorkflowContext, WorkflowContextView, WorkflowResult,
     workflow,
     workflow_interceptors::{
         ExecuteWorkflowInput, ExecuteWorkflowResult, WorkflowInterceptor,
@@ -53,38 +46,14 @@ impl WorkflowInterceptor for WasmWorkflowInterceptor {
     }
 }
 
-struct WasmInterceptorWorkflowModule;
-
-impl StaticWorkflowComponent for WasmInterceptorWorkflowModule {
-    fn list_workflows() -> Vec<WorkflowDefinitionDescriptor> {
-        vec![
-            <InterceptorWorkflow as temporalio_workflow::runtime::entry::WorkflowImplementation>::definition(),
-        ]
-    }
-
-    fn instantiate_workflow(
-        workflow_type: &str,
-        init: WorkflowInit,
-        host: std::rc::Rc<dyn WorkflowHost>,
-    ) -> Result<Box<dyn WorkflowInstance>, WorkflowFailure> {
-        match workflow_type {
-            name if name
-                == <InterceptorWorkflow as temporalio_workflow::runtime::entry::WorkflowImplementation>::name() =>
-            {
-                instantiate_component_workflow_with_interceptors::<InterceptorWorkflow>(
-                    init,
-                    host,
-                    vec![Arc::new(WasmWorkflowInterceptor)],
-                )
-            }
-            _ => unreachable!("unexpected workflow type '{workflow_type}'"),
-        }
-    }
-}
-
-type WasmInterceptorWorkflowComponentExport =
-    temporalio_workflow::component::ExportedComponent<WasmInterceptorWorkflowModule>;
-
-temporalio_workflow::__temporalio_export_workflow_component!(
-    WasmInterceptorWorkflowComponentExport
+temporalio_workflow::export_workflow_module!(
+    [InterceptorWorkflow],
+    interceptor_constructors = [|ctx: &WorkflowContextView| {
+        assert_eq!(ctx.workflow_type(), "InterceptorWorkflow");
+        assert!(!ctx.workflow_id().is_empty());
+        assert!(!ctx.run_id().is_empty());
+        assert!(!ctx.task_queue().is_empty());
+        assert!(!ctx.namespace().is_empty());
+        WasmWorkflowInterceptor
+    }],
 );

@@ -6,7 +6,6 @@ use std::{
     panic::AssertUnwindSafe,
     pin::Pin,
     rc::Rc,
-    sync::Arc,
     task::{Context, Poll},
 };
 use temporalio_common::{
@@ -51,7 +50,7 @@ use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 use crate::{
     panic_formatter,
     workflow_executor::WakeTracker,
-    workflow_interceptors::WorkflowInterceptorFactory,
+    workflow_interceptors::WorkflowInterceptorConstructor,
     workflow_registry::{WorkflowExecutionFactory, WorkflowExecutionInput},
 };
 
@@ -68,7 +67,7 @@ pub(crate) fn start_workflow(
     data_converter: DataConverter,
     detect_nondeterministic: bool,
     patch_activation_callback: Option<PatchActivationCallback>,
-    workflow_interceptor_factories: Vec<Arc<dyn WorkflowInterceptorFactory>>,
+    workflow_interceptor_constructors: Vec<WorkflowInterceptorConstructor>,
 ) -> Result<
     (
         impl Future<Output = WorkflowResult<Payload>> + use<>,
@@ -92,7 +91,7 @@ pub(crate) fn start_workflow(
         data_converter: data_converter.clone(),
         host: host.clone(),
         patch_activation_callback,
-        workflow_interceptor_factories,
+        workflow_interceptor_constructors,
     })
     .context("Failed to create workflow execution")?;
 

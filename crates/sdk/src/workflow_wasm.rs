@@ -189,7 +189,7 @@ impl CompiledWasmWorkflowModule {
         &self,
         input: WorkflowExecutionInput,
     ) -> Result<Box<dyn WorkflowInstance>, anyhow::Error> {
-        if !input.workflow_interceptor_factories.is_empty() {
+        if !input.workflow_interceptor_constructors.is_empty() {
             bail!("Native workflow interceptors cannot be used with WASM workflow components");
         }
         let mut linker = Linker::new(&self.engine);

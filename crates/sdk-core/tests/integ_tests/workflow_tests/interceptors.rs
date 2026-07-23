@@ -24,8 +24,8 @@ use temporalio_sdk::{
         ScheduleActivityInput, ScheduleActivityResult, ScheduleLocalActivityInput,
         StartChildWorkflowInput, StartChildWorkflowResult, StartTimerInput,
         SyncWorkflowInterceptorContext, ValidateUpdateInput, ValidateUpdateResult,
-        WorkflowCancellationHandle, WorkflowInterceptor, WorkflowInterceptorContext,
-        WorkflowInterceptorFuture, WorkflowInterceptors, WorkflowNext, WorkflowOutboundValue,
+        WorkflowCancellationHandle, WorkflowInterceptor, WorkflowInterceptorConstructor,
+        WorkflowInterceptorContext, WorkflowInterceptorFuture, WorkflowNext, WorkflowOutboundValue,
         WorkflowOutputValue,
     },
 };
@@ -228,12 +228,12 @@ async fn workflow_interceptors_mutate_inputs_and_replace_outputs() {
     let saw_query_history_replay_ref = saw_query_history_replay.clone();
     worker
         .inner_mut()
-        .add_workflow_interceptor_factory(move || {
-            WorkflowInterceptors::new().with_interceptor(MutatingWorkflowInterceptor {
+        .register_workflow_interceptors(vec![WorkflowInterceptorConstructor::new(move |_| {
+            MutatingWorkflowInterceptor {
                 signal_post_handler_done: signal_post_handler_done_ref.clone(),
                 saw_query_history_replay: saw_query_history_replay_ref.clone(),
-            })
-        });
+            }
+        })]);
 
     let task_queue = starter.get_task_queue().to_owned();
     let handle = worker
@@ -389,23 +389,17 @@ async fn workflow_interceptors_wrap_execute_in_order() {
 
     let records = Arc::new(Mutex::new(Vec::new()));
     let outer_records = records.clone();
-    worker
-        .inner_mut()
-        .add_workflow_interceptor_factory(move || {
-            WorkflowInterceptors::new().with_interceptor(RecordingWorkflowInterceptor {
-                name: "outer",
-                records: outer_records.clone(),
-            })
-        });
     let inner_records = records.clone();
-    worker
-        .inner_mut()
-        .add_workflow_interceptor_factory(move || {
-            WorkflowInterceptors::new().with_interceptor(RecordingWorkflowInterceptor {
-                name: "inner",
-                records: inner_records.clone(),
-            })
-        });
+    worker.inner_mut().register_workflow_interceptors(vec![
+        WorkflowInterceptorConstructor::new(move |_| RecordingWorkflowInterceptor {
+            name: "outer",
+            records: outer_records.clone(),
+        }),
+        WorkflowInterceptorConstructor::new(move |_| RecordingWorkflowInterceptor {
+            name: "inner",
+            records: inner_records.clone(),
+        }),
+    ]);
 
     let task_queue = starter.get_task_queue().to_owned();
     let handle = worker
@@ -501,11 +495,11 @@ async fn workflow_initialize_interceptor_mutates_init_input() {
     let received_input_ref = received_input.clone();
     worker
         .inner_mut()
-        .add_workflow_interceptor_factory(move || {
-            WorkflowInterceptors::new().with_interceptor(InitInputMutationInterceptor {
+        .register_workflow_interceptors(vec![WorkflowInterceptorConstructor::new(move |_| {
+            InitInputMutationInterceptor {
                 received_input: received_input_ref.clone(),
-            })
-        });
+            }
+        })]);
 
     let handle = worker
         .submit_workflow(
@@ -656,13 +650,13 @@ async fn workflow_interceptors_are_polled_once_during_construction() {
     let async_polls_ref = async_polls.clone();
     worker
         .inner_mut()
-        .add_workflow_interceptor_factory(move || {
-            WorkflowInterceptors::new().with_interceptor(ConstructionPollingInterceptor {
+        .register_workflow_interceptors(vec![WorkflowInterceptorConstructor::new(move |_| {
+            ConstructionPollingInterceptor {
                 sync_polls: sync_polls_ref.clone(),
                 deferred_polls: deferred_polls_ref.clone(),
                 async_polls: async_polls_ref.clone(),
-            })
-        });
+            }
+        })]);
 
     let handle = worker
         .submit_workflow(
@@ -714,27 +708,28 @@ async fn workflow_interceptors_are_polled_once_during_construction() {
 
 #[workflow]
 #[derive(Default)]
-struct FactoryOutboundInterceptorWorkflow;
+struct ConstructorOutboundInterceptorWorkflow;
 
 #[workflow_methods]
-impl FactoryOutboundInterceptorWorkflow {
+impl ConstructorOutboundInterceptorWorkflow {
     #[run]
-    async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<()> {
+    async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<String> {
         assert_eq!(
             ctx.timer(Duration::from_secs(60)).await,
             TimerResult::Cancelled
         );
-        Ok(())
+        Ok("result".into())
     }
 }
 
 #[derive(Default)]
-struct FactoryOutboundInterceptor {
+struct ConstructorOutboundInterceptor {
     inbound_calls: AtomicUsize,
     timer_calls: AtomicUsize,
+    workflow_id: String,
 }
 
-impl WorkflowInterceptor for FactoryOutboundInterceptor {
+impl WorkflowInterceptor for ConstructorOutboundInterceptor {
     fn execute<'a>(
         &'a self,
         _ctx: WorkflowInterceptorContext,
@@ -746,7 +741,15 @@ impl WorkflowInterceptor for FactoryOutboundInterceptor {
         >,
     ) -> WorkflowInterceptorFuture<'a, ExecuteWorkflowResult> {
         self.inbound_calls.fetch_add(1, Ordering::Relaxed);
-        next.run(input)
+        let workflow_id = self.workflow_id.clone();
+        WorkflowInterceptorFuture::new(async move {
+            let result = next.run(input).await?;
+            if let Some(result) = result.downcast_ref::<String>() {
+                Ok(Box::new(format!("{result}-{workflow_id}")) as Box<dyn WorkflowOutputValue>)
+            } else {
+                Ok(result)
+            }
+        })
     }
 
     fn start_timer(
@@ -770,48 +773,56 @@ impl WorkflowInterceptor for FactoryOutboundInterceptor {
 }
 
 #[tokio::test]
-async fn workflow_interceptor_factories_create_unified_per_instance_interceptors() {
+async fn workflow_interceptor_constructors_create_unified_per_instance_interceptors() {
     let mut starter = CoreWfStarter::new(
-        "workflow_interceptor_factories_create_unified_per_instance_interceptors",
+        "workflow_interceptor_constructors_create_unified_per_instance_interceptors",
     );
     starter.sdk_config.task_types = WorkerTaskTypes::workflow_only();
     let mut worker = starter.worker().await;
     worker
-        .register_workflow::<FactoryOutboundInterceptorWorkflow>()
+        .register_workflow::<ConstructorOutboundInterceptorWorkflow>()
         .unwrap();
 
-    let factory_calls = Arc::new(AtomicUsize::new(0));
-    let factory_calls_ref = factory_calls.clone();
+    let expected_task_queue = starter.get_task_queue().to_owned();
     worker
         .inner_mut()
-        .add_workflow_interceptor_factory(move || {
-            factory_calls_ref.fetch_add(1, Ordering::Relaxed);
-            WorkflowInterceptors::new().with_interceptor(FactoryOutboundInterceptor::default())
-        });
+        .register_workflow_interceptors(vec![WorkflowInterceptorConstructor::new(move |ctx| {
+            assert_eq!(
+                ctx.workflow_type(),
+                "ConstructorOutboundInterceptorWorkflow"
+            );
+            assert_eq!(ctx.task_queue(), expected_task_queue);
+            ConstructorOutboundInterceptor {
+                workflow_id: ctx.workflow_id().to_string(),
+                ..Default::default()
+            }
+        })]);
 
     let task_queue = starter.get_task_queue().to_owned();
+    let first_workflow_id = format!("{}-1", starter.get_wf_id());
+    let second_workflow_id = format!("{}-2", starter.get_wf_id());
     let first = worker
         .submit_workflow(
-            FactoryOutboundInterceptorWorkflow::run,
+            ConstructorOutboundInterceptorWorkflow::run,
             (),
-            WorkflowStartOptions::new(task_queue.clone(), format!("{}-1", starter.get_wf_id()))
-                .build(),
+            WorkflowStartOptions::new(task_queue.clone(), first_workflow_id.clone()).build(),
         )
         .await
         .unwrap();
     let second = worker
         .submit_workflow(
-            FactoryOutboundInterceptorWorkflow::run,
+            ConstructorOutboundInterceptorWorkflow::run,
             (),
-            WorkflowStartOptions::new(task_queue, format!("{}-2", starter.get_wf_id())).build(),
+            WorkflowStartOptions::new(task_queue, second_workflow_id.clone()).build(),
         )
         .await
         .unwrap();
 
     worker.run_until_done().await.unwrap();
-    first.get_result(Default::default()).await.unwrap();
-    second.get_result(Default::default()).await.unwrap();
-    assert_eq!(factory_calls.load(Ordering::Relaxed), 2);
+    let first_result = first.get_result(Default::default()).await.unwrap();
+    let second_result = second.get_result(Default::default()).await.unwrap();
+    assert_eq!(first_result, format!("result-{first_workflow_id}"));
+    assert_eq!(second_result, format!("result-{second_workflow_id}"));
 }
 
 #[workflow]
@@ -902,11 +913,11 @@ async fn inbound_interceptor_context_operations_use_the_outbound_chain_around_ne
     let events_ref = events.clone();
     worker
         .inner_mut()
-        .add_workflow_interceptor_factory(move || {
-            WorkflowInterceptors::new().with_interceptor(InboundContextOutboundInterceptor {
+        .register_workflow_interceptors(vec![WorkflowInterceptorConstructor::new(move |_| {
+            InboundContextOutboundInterceptor {
                 events: events_ref.clone(),
-            })
-        });
+            }
+        })]);
 
     let handle = worker
         .submit_workflow(
@@ -1063,9 +1074,11 @@ async fn workflow_outbound_interceptors_mutate_activity_calls_and_results() {
     worker
         .register_workflow::<OutboundActivityInterceptorWorkflow>()
         .unwrap();
-    worker.inner_mut().add_workflow_interceptor_factory(|| {
-        WorkflowInterceptors::new().with_interceptor(OutboundActivityInterceptor)
-    });
+    worker
+        .inner_mut()
+        .register_workflow_interceptors(vec![WorkflowInterceptorConstructor::new(|_| {
+            OutboundActivityInterceptor
+        })]);
 
     let handle = worker
         .submit_workflow(
@@ -1164,9 +1177,11 @@ async fn workflow_outbound_interceptors_wrap_child_start_and_completion() {
     worker
         .register_workflow::<OutboundChildInterceptorChild>()
         .unwrap();
-    worker.inner_mut().add_workflow_interceptor_factory(|| {
-        WorkflowInterceptors::new().with_interceptor(OutboundChildInterceptor)
-    });
+    worker
+        .inner_mut()
+        .register_workflow_interceptors(vec![WorkflowInterceptorConstructor::new(|_| {
+            OutboundChildInterceptor
+        })]);
 
     let handle = worker
         .submit_workflow(

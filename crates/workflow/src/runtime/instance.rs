@@ -18,9 +18,9 @@ use crate::{
         ExecuteWorkflowInput, ExecuteWorkflowResult, HandleQueryInput, HandleQueryResult,
         HandleSignalInput, HandleSignalResult, HandleUpdateInput, HandleUpdateResult,
         InitializeWorkflowInput, InitializeWorkflowOutput, SyncWorkflowInterceptorContext,
-        ValidateUpdateInput, ValidateUpdateResult, WorkflowInterceptor, WorkflowInterceptorContext,
-        WorkflowInterceptorFactory, WorkflowInterceptorFuture, WorkflowNext,
-        serialize_workflow_output, wrong_workflow_input_type,
+        ValidateUpdateInput, ValidateUpdateResult, WorkflowInterceptor,
+        WorkflowInterceptorConstructor, WorkflowInterceptorContext, WorkflowInterceptorFuture,
+        WorkflowNext, serialize_workflow_output, wrong_workflow_input_type,
     },
 };
 use futures_util::{
@@ -277,21 +277,21 @@ where
         base_ctx: BaseWorkflowContext,
         interceptors: Vec<Arc<dyn WorkflowInterceptor>>,
     ) -> Result<Box<dyn WorkflowInstance>, PayloadConversionError> {
-        Self::instantiate_with_interceptor_provider(payloads, converter, base_ctx, move || {
+        Self::instantiate_with_interceptor_provider(payloads, converter, base_ctx, move |_| {
             interceptors
         })
     }
 
-    pub fn instantiate_with_interceptor_factories(
+    pub fn instantiate_with_interceptor_constructors(
         payloads: Vec<Payload>,
         converter: PayloadConverter,
         base_ctx: BaseWorkflowContext,
-        interceptor_factories: Vec<Arc<dyn WorkflowInterceptorFactory>>,
+        interceptor_constructors: Vec<WorkflowInterceptorConstructor>,
     ) -> Result<Box<dyn WorkflowInstance>, PayloadConversionError> {
-        Self::instantiate_with_interceptor_provider(payloads, converter, base_ctx, move || {
-            interceptor_factories
+        Self::instantiate_with_interceptor_provider(payloads, converter, base_ctx, move |view| {
+            interceptor_constructors
                 .into_iter()
-                .flat_map(|factory| factory.create().into_inner())
+                .map(|constructor| constructor.construct(view))
                 .collect()
         })
     }
@@ -300,9 +300,10 @@ where
         payloads: Vec<Payload>,
         converter: PayloadConverter,
         base_ctx: BaseWorkflowContext,
-        create_interceptors: impl FnOnce() -> Vec<Arc<dyn WorkflowInterceptor>>,
+        create_interceptors: impl FnOnce(&WorkflowContextView) -> Vec<Arc<dyn WorkflowInterceptor>>,
     ) -> Result<Box<dyn WorkflowInstance>, PayloadConversionError> {
-        let interceptors = create_interceptors();
+        let view = base_ctx.view();
+        let interceptors = create_interceptors(&view);
         let ser_ctx = SerializationContext {
             data: &SerializationContextData::Workflow,
             converter: &converter,
@@ -313,7 +314,6 @@ where
         } else {
             (None, Some(input))
         };
-        let view = base_ctx.view();
         let (workflow, headers) = if W::HAS_INIT {
             let input = InitializeWorkflowInput::new(
                 init_input.map(|input| Box::new(input) as Box<dyn Any>),
@@ -1053,27 +1053,38 @@ where
     )
 }
 
-pub fn instantiate_workflow_with_interceptor_factories<W: WorkflowImplementation>(
+pub fn instantiate_workflow_with_interceptor_constructors<W: WorkflowImplementation>(
     payloads: Vec<Payload>,
     converter: PayloadConverter,
     base_ctx: BaseWorkflowContext,
-    interceptor_factories: Vec<Arc<dyn WorkflowInterceptorFactory>>,
+    interceptor_constructors: Vec<WorkflowInterceptorConstructor>,
 ) -> Result<Box<dyn WorkflowInstance>, PayloadConversionError>
 where
     <W::Run as WorkflowDefinition>::Input: Send,
 {
-    GuestWorkflowInstance::<W>::instantiate_with_interceptor_factories(
+    GuestWorkflowInstance::<W>::instantiate_with_interceptor_constructors(
         payloads,
         converter,
         base_ctx,
-        interceptor_factories,
+        interceptor_constructors,
     )
+}
+
+pub fn construct_workflow_interceptors(
+    base_ctx: &BaseWorkflowContext,
+    interceptor_constructors: Vec<WorkflowInterceptorConstructor>,
+) -> Vec<Arc<dyn WorkflowInterceptor>> {
+    let view = base_ctx.view();
+    interceptor_constructors
+        .into_iter()
+        .map(|constructor| constructor.construct(&view))
+        .collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{runtime::host::WorkflowHost, workflow_interceptors::WorkflowInterceptors};
+    use crate::runtime::host::WorkflowHost;
     use std::{
         rc::Rc,
         sync::atomic::{AtomicUsize, Ordering},
@@ -1185,16 +1196,20 @@ mod tests {
     }
 
     #[test]
-    fn interceptor_factories_run_before_workflow_input_decoding() {
-        let factory_calls = Arc::new(AtomicUsize::new(0));
+    fn interceptor_constructors_run_before_workflow_input_decoding() {
+        let constructor_calls = Arc::new(AtomicUsize::new(0));
         let execute_calls = Arc::new(AtomicUsize::new(0));
-        let factory_calls_ref = factory_calls.clone();
+        let constructor_calls_ref = constructor_calls.clone();
         let execute_calls_ref = execute_calls.clone();
-        let factory: Arc<dyn WorkflowInterceptorFactory> = Arc::new(move || {
-            factory_calls_ref.fetch_add(1, Ordering::Relaxed);
-            WorkflowInterceptors::new().with_interceptor(CountingExecuteInterceptor {
+        let constructor = WorkflowInterceptorConstructor::new(move |ctx| {
+            assert_eq!(ctx.namespace(), "default");
+            assert_eq!(ctx.task_queue(), "task-queue");
+            assert_eq!(ctx.run_id(), "run-id");
+            assert_eq!(ctx.workflow_type(), DecodeFailureWorkflow::name());
+            constructor_calls_ref.fetch_add(1, Ordering::Relaxed);
+            CountingExecuteInterceptor {
                 calls: execute_calls_ref.clone(),
-            })
+            }
         });
         let base_ctx = BaseWorkflowContext::from_raw(
             "default".to_string(),
@@ -1210,15 +1225,15 @@ mod tests {
         );
 
         let result =
-            GuestWorkflowInstance::<DecodeFailureWorkflow>::instantiate_with_interceptor_factories(
+            GuestWorkflowInstance::<DecodeFailureWorkflow>::instantiate_with_interceptor_constructors(
                 vec![Payload::default()],
                 PayloadConverter::default(),
                 base_ctx,
-                vec![factory],
+                vec![constructor],
             );
 
         assert!(result.is_err());
-        assert_eq!(factory_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(constructor_calls.load(Ordering::Relaxed), 1);
         assert_eq!(execute_calls.load(Ordering::Relaxed), 0);
     }
 }

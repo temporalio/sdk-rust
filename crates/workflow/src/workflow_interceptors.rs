@@ -1,4 +1,85 @@
-//! Workflow interceptor APIs.
+//! Intercept inbound and outbound calls made during workflow execution.
+//!
+//! Workflow interceptors allow observing, transforming, or short-circuit workflow
+//! operations without putting that behavior in each workflow implementation.
+//!
+//! [`WorkflowInterceptor`] has two groups of methods:
+//!
+//! - Inbound methods wrap calls into workflow code, such as executing the workflow or handling
+//!   a signal, query, or update.
+//! - Outbound methods wrap commands issued by workflow code, such as scheduling an activity,
+//!   starting a timer, or signaling another workflow.
+//!
+//! Each method receives a [`WorkflowNext`] continuation. An interceptor can change the input
+//! before calling [`WorkflowNext::run`], inspect or change the returned value, or deliberately not
+//! call `next` to short-circuit the operation. Most interceptors should call `next` exactly once.
+//!
+//! Async operation interceptors return [`WorkflowInterceptorFuture`]. Wrap an `async` block with
+//! [`WorkflowInterceptorFuture::new`] when work must happen after the next interceptor completes.
+//! Synchronous methods, including queries and update validators, cannot await workflow operations.
+//!
+//! Workers register interceptors with `register_workflow_interceptors` on their
+//! worker options. Interceptors are entered in insertion order for inbound calls and in reverse
+//! insertion order for outbound calls.
+//!
+//! # Determinism
+//!
+//! Interceptors execute as part of the workflow and are replayed with it. They must follow the same
+//! determinism rules as workflow code: do not read wall-clock time, perform network or filesystem
+//! I/O, use nondeterministic randomness, or await arbitrary futures. Use values from the
+//! interceptor context and SDK-provided workflow futures instead. [`WorkflowInterceptorFuture`]
+//! identifies a future for the workflow scheduler; it does not make an arbitrary future
+//! deterministic.
+//!
+//! [`WorkflowInterceptorContext::is_replaying`] and
+//! [`WorkflowInterceptorContext::is_replaying_history_events`] can be used to suppress duplicate external
+//! observability during replay, but replay state must not change commands or results that affect
+//! workflow behavior.
+//!
+//! # Example
+//!
+//! This interceptor wraps workflow execution and transforms string outputs after the workflow has
+//! completed. The constructor is passed to the worker during worker setup.
+//!
+//! ```
+//! # use temporalio_workflow::{
+//! #     WorkflowContextView,
+//! #     workflow_interceptors::{
+//! #         ExecuteWorkflowInput, ExecuteWorkflowResult, WorkflowInterceptor,
+//! #         WorkflowInterceptorConstructor, WorkflowInterceptorContext, WorkflowInterceptorFuture,
+//! #         WorkflowNext, WorkflowOutputValue,
+//! #     },
+//! # };
+//!
+//! struct UppercaseStringOutput;
+//!
+//! impl WorkflowInterceptor for UppercaseStringOutput {
+//!     fn execute<'a>(
+//!         &'a self,
+//!         _ctx: WorkflowInterceptorContext,
+//!         input: ExecuteWorkflowInput,
+//!         next: WorkflowNext<
+//!             'a,
+//!             ExecuteWorkflowInput,
+//!             WorkflowInterceptorFuture<'a, ExecuteWorkflowResult>,
+//!         >,
+//!     ) -> WorkflowInterceptorFuture<'a, ExecuteWorkflowResult> {
+//!         WorkflowInterceptorFuture::new(async move {
+//!             let output = next.run(input).await?;
+//!             if let Some(value) = output.downcast_ref::<String>() {
+//!                 return Ok(Box::new(value.to_uppercase()) as Box<dyn WorkflowOutputValue>);
+//!             }
+//!             Ok(output)
+//!         })
+//!     }
+//! }
+//!
+//! fn interceptor_constructor() -> WorkflowInterceptorConstructor {
+//!     WorkflowInterceptorConstructor::new(|_ctx: &WorkflowContextView| UppercaseStringOutput)
+//! }
+//!
+//! # let _ = interceptor_constructor();
+//! ```
 
 use crate::{
     ActivityOptions, BaseWorkflowContext, CancellableFuture, CancellableFutureWithReason,
@@ -1256,10 +1337,30 @@ pub type StartNexusOperationResult = Result<StartedNexusOperation, Failure>;
 /// Result of an intercepted continue-as-new call.
 pub type ContinueAsNewResult = Result<Infallible, WorkflowTermination>;
 
-/// Interceptor for inbound and outbound workflow calls.
+/// Interceptor for calls into workflow code and commands issued by workflow code.
 ///
-/// Every method forwards to `next` by default, so implementations only need to override the
-/// operations they intercept.
+/// Implement this trait for behavior that should wrap workflow operations. Inbound
+/// methods intercept operations such as workflow execution and handler dispatch;
+/// outbound methods intercept timers, activities, child workflows, external workflow calls,
+/// continue-as-new, and Nexus operations.
+///
+/// Implementations normally calls [`WorkflowNext::run`] exactly once. It may transform the input first,
+/// then inspect or transform the result. Not calling `next` short-circuits the operation, so it
+/// should only be done if intentionally skipping the operation.
+///
+/// The async inbound methods return [`WorkflowInterceptorFuture`]. Use
+/// [`WorkflowInterceptorFuture::new`] to wrap an `async` block around the downstream future:
+/// call `next.run(input).await` to call the next interceptor. See the [module-level guide](self)
+/// for a complete example and the determinism requirements.
+///
+/// Interceptors run as workflow code and are recreated when an evicted workflow is rebuilt. Their
+/// behavior and any instance-local state must remain deterministic under replay. Async methods may
+/// await only workflow scheduler primitives or SDK-provided workflow futures.
+///
+/// A [`WorkflowInterceptorConstructor`] creates one interceptor for each in-memory workflow
+/// instance. The same interceptor object handles inbound and outbound calls for that instance and
+/// is recreated if the workflow is evicted and rebuilt.
+/// Inbound interceptors are called in regsitration order and outbound interceptors are called in reverse order.
 pub trait WorkflowInterceptor: 'static {
     /// Called to invoke the workflow's `#[init]` method.
     ///
@@ -1524,57 +1625,33 @@ outbound_chain!(
     CancellableWorkflowOutboundFuture<StartNexusOperationResult>
 );
 
-/// An ordered collection of interceptors for one workflow instance.
+type WorkflowInterceptorConstructorFn =
+    dyn Fn(&WorkflowContextView) -> Arc<dyn WorkflowInterceptor> + Send + Sync + 'static;
+
+/// Creates one interceptor for each in-memory workflow instance.
 ///
-/// This is returned by [`WorkflowInterceptorFactory`] for each workflow instance.
-/// Inbound calls are invoked in insertion order and outbound calls in reverse insertion order.
-#[derive(Default, Clone)]
-pub struct WorkflowInterceptors {
-    interceptors: Vec<Arc<dyn WorkflowInterceptor>>,
+/// The constructor receives a read-only view of the workflow's initialization context. It may use
+/// that context to initialize interceptor state but must remain deterministic because it runs again
+/// when an evicted workflow is rebuilt.
+#[derive(Clone)]
+pub struct WorkflowInterceptorConstructor {
+    constructor: Arc<WorkflowInterceptorConstructorFn>,
 }
 
-impl WorkflowInterceptors {
-    /// Create an empty interceptor collection.
-    pub fn new() -> Self {
-        Self::default()
+impl WorkflowInterceptorConstructor {
+    /// Create a workflow interceptor constructor.
+    pub fn new<F, I>(constructor: F) -> Self
+    where
+        F: Fn(&WorkflowContextView) -> I + Send + Sync + 'static,
+        I: WorkflowInterceptor,
+    {
+        Self {
+            constructor: Arc::new(move |ctx| Arc::new(constructor(ctx))),
+        }
     }
 
-    /// Append an interceptor.
-    pub fn add(&mut self, interceptor: impl WorkflowInterceptor) -> &mut Self {
-        self.interceptors.push(Arc::new(interceptor));
-        self
-    }
-
-    /// Append an interceptor and return this collection.
-    pub fn with_interceptor(mut self, interceptor: impl WorkflowInterceptor) -> Self {
-        self.add(interceptor);
-        self
-    }
-
-    /// Append another interceptor collection.
-    pub fn extend(&mut self, other: Self) -> &mut Self {
-        self.interceptors.extend(other.interceptors);
-        self
-    }
-
-    #[doc(hidden)]
-    pub fn into_inner(self) -> Vec<Arc<dyn WorkflowInterceptor>> {
-        self.interceptors
-    }
-}
-
-/// Creates a fresh interceptor collection for each workflow instance.
-pub trait WorkflowInterceptorFactory: Send + Sync + 'static {
-    /// Create interceptors for a workflow instance.
-    fn create(&self) -> WorkflowInterceptors;
-}
-
-impl<F> WorkflowInterceptorFactory for F
-where
-    F: Fn() -> WorkflowInterceptors + Send + Sync + 'static,
-{
-    fn create(&self) -> WorkflowInterceptors {
-        self()
+    pub(crate) fn construct(&self, ctx: &WorkflowContextView) -> Arc<dyn WorkflowInterceptor> {
+        (self.constructor)(ctx)
     }
 }
 

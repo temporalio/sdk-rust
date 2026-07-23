@@ -7,13 +7,13 @@ use crate::{
         entry::WorkflowImplementation,
         guest::WorkflowInstance as RuntimeWorkflowInstance,
         host::WorkflowHost,
-        instance::instantiate_workflow_with_interceptors,
+        instance::instantiate_workflow_with_interceptor_constructors,
         types::{
             ActivationJobResult, MainRoutineCompletion, RoutineCompletion, TerminalOutcome,
             UpdateRoutineCompletion, WorkflowDefinitionDescriptor, WorkflowFailure, WorkflowInit,
         },
     },
-    workflow_interceptors::WorkflowInterceptor,
+    workflow_interceptors::WorkflowInterceptorConstructor,
 };
 use futures_util::task::noop_waker;
 use prost::Message;
@@ -209,13 +209,13 @@ pub fn instantiate_component_workflow<W: WorkflowImplementation>(
 where
     <W::Run as temporalio_common_wasm::WorkflowDefinition>::Input: Send,
 {
-    instantiate_component_workflow_with_interceptors::<W>(init, host, Vec::new())
+    instantiate_component_workflow_with_interceptor_constructors::<W>(init, host, Vec::new())
 }
 
-pub fn instantiate_component_workflow_with_interceptors<W: WorkflowImplementation>(
+pub fn instantiate_component_workflow_with_interceptor_constructors<W: WorkflowImplementation>(
     init: WorkflowInit,
     host: Rc<dyn WorkflowHost>,
-    interceptors: Vec<Arc<dyn WorkflowInterceptor>>,
+    interceptor_constructors: Vec<WorkflowInterceptorConstructor>,
 ) -> Result<Box<dyn RuntimeWorkflowInstance>, WorkflowFailure>
 where
     <W::Run as temporalio_common_wasm::WorkflowDefinition>::Input: Send,
@@ -234,13 +234,18 @@ where
         host,
         Some(patch_activation_callback),
     );
-    instantiate_workflow_with_interceptors::<W>(args, payload_converter, base_ctx, interceptors)
-        .map_err(|err| {
-            Box::new(Failure {
-                message: format!("Workflow input deserialization failed: {err}"),
-                ..Default::default()
-            })
+    instantiate_workflow_with_interceptor_constructors::<W>(
+        args,
+        payload_converter,
+        base_ctx,
+        interceptor_constructors,
+    )
+    .map_err(|err| {
+        Box::new(Failure {
+            message: format!("Workflow input deserialization failed: {err}"),
+            ..Default::default()
         })
+    })
 }
 
 struct ImportedWorkflowHost;
