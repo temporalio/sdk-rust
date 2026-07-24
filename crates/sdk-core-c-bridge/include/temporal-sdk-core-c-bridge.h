@@ -839,6 +839,10 @@ typedef struct TemporalCoreWorkerOptions {
    * NOTE: Experimental
    */
   bool disable_payload_error_limit;
+  /**
+   * Maximum number of eager activities that can run concurrently. Zero means unlimited.
+   */
+  uint32_t max_concurrent_eager_activity_execution_size;
 } TemporalCoreWorkerOptions;
 
 /**

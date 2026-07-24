@@ -58,6 +58,8 @@ to docs, or any other relevant information.
 ## [Unreleased]
 
 ### Added
+* Workers can limit concurrent eager activity execution with
+  `WorkerOptions::max_concurrent_eager_activity_execution_size`.
 * Schedule descriptions now expose their configured action via `ScheduleDescription::action()`,
   including start-workflow accessors for workflow type, task queue, workflow ID, raw argument
   payloads, and typed argument decoding through the client's data converter.

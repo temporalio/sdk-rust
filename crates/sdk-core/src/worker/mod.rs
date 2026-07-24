@@ -202,6 +202,13 @@ pub struct WorkerConfig {
     /// the options to fail.
     pub max_worker_activities_per_second: Option<f64>,
 
+    /// Maximum number of eager activities that can be running concurrently. When nonzero, eager
+    /// activity execution will not be requested if it would cause the number of running eager
+    /// activities to exceed this value. The default of zero means unlimited and therefore only
+    /// bound by the activity slot supplier.
+    #[builder(default = 0)]
+    pub max_concurrent_eager_activity_execution_size: usize,
+
     /// If set false (default), shutdown will not finish until all pending evictions have been
     /// issued and replied to. If set true shutdown will be considered complete when the only
     /// remaining work is pending evictions.
@@ -848,6 +855,7 @@ impl Worker {
                 metrics.clone(),
                 config.max_heartbeat_throttle_interval,
                 config.default_heartbeat_throttle_interval,
+                config.max_concurrent_eager_activity_execution_size,
                 config.graceful_shutdown_period,
                 config.local_timeout_buffer_for_activities,
             )

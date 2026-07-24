@@ -11,7 +11,7 @@ use std::{
     },
 };
 use temporalio_common::{telemetry::metrics::TemporalMeter, worker::WorkerDeploymentVersion};
-use tokio::sync::watch;
+use tokio::sync::{OwnedSemaphorePermit, watch};
 use tokio_util::sync::CancellationToken;
 
 /// Wraps a [SlotSupplier] and turns successful slot reservations into permit structs, as well
@@ -180,6 +180,7 @@ where
                 stored_info: None,
                 meter: self.meter.clone(),
             },
+            eager_activity_permit: None,
             use_fn: Box::new(move |info| {
                 supp_c.mark_slot_used(info);
                 metric_rec(false)
@@ -363,6 +364,15 @@ impl<SK: SlotKind> From<TrackedOwnedMeteredSemPermit<SK>> for OwnedMeteredSemPer
             .expect("Inner permit should be available")
     }
 }
+impl<SK: SlotKind> TrackedOwnedMeteredSemPermit<SK> {
+    pub(crate) fn with_eager_activity_permit(mut self, permit: OwnedSemaphorePermit) -> Self {
+        self.inner
+            .as_mut()
+            .expect("Inner permit should be available")
+            .eager_activity_permit = Some(permit);
+        self
+    }
+}
 impl<SK: SlotKind> Drop for TrackedOwnedMeteredSemPermit<SK> {
     fn drop(&mut self) {
         (self.on_drop)();
@@ -377,6 +387,7 @@ pub(crate) struct OwnedMeteredSemPermit<SK: SlotKind> {
     unused_claimants: Option<Arc<AtomicUsize>>,
     /// The actual [SlotSupplierPermit] is stored in here
     release_ctx: ReleaseCtx<SK>,
+    eager_activity_permit: Option<OwnedSemaphorePermit>,
     #[allow(clippy::type_complexity)] // not really tho, bud
     use_fn: Box<dyn Fn(&UseCtx<SK>) + Send + Sync>,
     #[allow(clippy::type_complexity)] // not really tho, bud

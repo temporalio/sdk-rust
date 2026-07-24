@@ -58,6 +58,8 @@ pub struct WorkerOptions {
     /// error limits; oversized payloads are sent and the server enforces the limit.
     /// NOTE: Experimental
     pub disable_payload_error_limit: bool,
+    /// Maximum number of eager activities that can run concurrently. Zero means unlimited.
+    pub max_concurrent_eager_activity_execution_size: u32,
 }
 
 #[repr(C)]
@@ -1235,6 +1237,9 @@ impl TryFrom<&WorkerOptions> for temporalio_sdk_core::WorkerConfig {
                     Some(opt.max_task_queue_activities_per_second)
                 },
             )
+            .max_concurrent_eager_activity_execution_size(
+                opt.max_concurrent_eager_activity_execution_size as usize,
+            )
             // Even though grace period is optional, if it is not set then the
             // auto-cancel-activity behavior or shutdown will not occur, so we
             // always set it even if 0.
@@ -1450,6 +1455,7 @@ mod tests {
             plugins: crate::ByteArrayRefArray::empty(),
             storage_drivers: crate::ByteArrayRefArray::empty(),
             disable_payload_error_limit: false,
+            max_concurrent_eager_activity_execution_size: 0,
         }
     }
 
