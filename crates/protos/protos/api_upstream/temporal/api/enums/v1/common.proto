@@ -106,3 +106,11 @@ enum WorkerStatus {
     WORKER_STATUS_SHUTTING_DOWN = 2;
     WORKER_STATUS_SHUTDOWN = 3;
 }
+
+enum ExecutionType {
+    EXECUTION_TYPE_UNSPECIFIED = 0;
+    // A workflow execution archetype. 
+    EXECUTION_TYPE_WORKFLOW = 1;
+    // An activity execution archetype. This is reserved for standalone activities.
+    EXECUTION_TYPE_ACTIVITY = 2;
+}

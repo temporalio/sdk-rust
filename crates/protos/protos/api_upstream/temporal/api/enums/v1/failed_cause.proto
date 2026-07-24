@@ -83,12 +83,18 @@ enum WorkflowTaskFailedCause {
     WORKFLOW_TASK_FAILED_CAUSE_GRPC_MESSAGE_TOO_LARGE = 36;
     // A workflow task failed because payloads were too large.
     WORKFLOW_TASK_FAILED_CAUSE_PAYLOADS_TOO_LARGE = 37;
+    // A workflow task failed because an external storage operation failed.
+    // Check the workflow task failure message for more information.
+    WORKFLOW_TASK_FAILED_CAUSE_EXTERNAL_STORAGE_FAILURE = 38;
+    // A workflow task is failed because the workflow is paused before the task is started.
+    WORKFLOW_TASK_FAILED_CAUSE_WORKFLOW_PAUSE_REQUESTED_BEFORE_TASK_STARTED = 39;
 }
 
 enum StartChildWorkflowExecutionFailedCause {
     START_CHILD_WORKFLOW_EXECUTION_FAILED_CAUSE_UNSPECIFIED = 0;
     START_CHILD_WORKFLOW_EXECUTION_FAILED_CAUSE_WORKFLOW_ALREADY_EXISTS = 1;
     START_CHILD_WORKFLOW_EXECUTION_FAILED_CAUSE_NAMESPACE_NOT_FOUND = 2;
+    START_CHILD_WORKFLOW_EXECUTION_FAILED_CAUSE_INVALID_VERSIONING_OVERRIDE = 3;
 }
 
 enum CancelExternalWorkflowExecutionFailedCause {
@@ -136,4 +142,3 @@ enum ResourceExhaustedScope {
     // Exhausted resource is a namespace-level resource.
     RESOURCE_EXHAUSTED_SCOPE_SYSTEM = 2;
 }
-

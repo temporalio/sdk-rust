@@ -58,6 +58,14 @@ message NamespaceInfo {
         bool workflow_update_callbacks = 12;
         // When true, workers should use poller autoscaling by default unless explicitly configured otherwise.
         bool poller_autoscaling_auto_enroll = 13;
+        // True if the namespace supports pagination of `RespondWorkflowTaskCompleted` request.
+        bool workflow_task_completion_pagination = 14;
+        // True if the namespace supports start delay for standalone activities.
+        bool standalone_activity_start_delay = 15;
+        // True if the namespace supports batch operations for standalone activities.
+        bool standalone_activity_batch_operations = 16;
+        // True if the namespace supports standalone activity operator commands.
+        bool standalone_activity_operator_commands = 17;
     }
 
     // Namespace configured limits

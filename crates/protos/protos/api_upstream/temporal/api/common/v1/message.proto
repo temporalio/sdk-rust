@@ -68,6 +68,14 @@ message WorkflowExecution {
     string run_id = 2;
 }
 
+// Identifies a specific execution within a namespace. This is used for standalone activities
+// executions in batch jobs currently.
+message Execution {
+    temporal.api.enums.v1.ExecutionType type = 1;
+    string business_id = 2;
+    string run_id = 3;
+}
+
 // Represents the identifier used by a workflow author to define the workflow. Typically, the
 // name of a function. This is sometimes referred to as the workflow's "name"
 message WorkflowType {
@@ -426,9 +434,10 @@ message TimeSkippingConfig {
     // be fast-forwarded up to the end of the execution.
     google.protobuf.Duration fast_forward = 2;
 
-    // By default, child workflows inherit the "enabled" flag when they are started.
+    // By default, executions started by another execution (e.g. a child workflow of a parent workflow or
+    // a schedule with the timeskipping policy enabled), inherit the "enabled" flag and skip time when possible.
     // This flag disables that inheritance.
-    bool disable_child_propagation = 3;
+    bool disable_propagation = 3;
 }
 
 // The time-skipping state that needs to be propagated from a parent workflow to a child workflow,

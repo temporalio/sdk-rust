@@ -9689,6 +9689,7 @@ components:
             - ACTIVITY_EXECUTION_STATUS_CANCELED
             - ACTIVITY_EXECUTION_STATUS_TERMINATED
             - ACTIVITY_EXECUTION_STATUS_TIMED_OUT
+            - ACTIVITY_EXECUTION_STATUS_PAUSED
           type: string
           description: A general status for this activity, indicates whether it is currently running or in one of the terminal statuses.
           format: enum
@@ -9769,7 +9770,9 @@ components:
           format: date-time
         expirationTime:
           type: string
-          description: Scheduled time + schedule to close timeout.
+          description: |-
+            The time at which the activity's Schedule-to-Close timeout expires.
+             Calculated as `schedule_time` + `start_delay` + `schedule_to_close_timeout`.
           format: date-time
         closeTime:
           type: string
@@ -9851,7 +9854,13 @@ components:
         startDelay:
           pattern: ^-?(?:0|[1-9][0-9]{0,11})(?:\.[0-9]{1,9})?s$
           type: string
-          description: Time to wait before dispatching the first activity task. This delay is not applied to retry attempts.
+          description: Time to wait before making the first activity task available for dispatch. This delay is not applied to retry attempts.
+        executionTime:
+          type: string
+          description: |-
+            The time at which the first activity task is made available for dispatch, computed as
+             `schedule_time + start_delay`. Same as `schedule_time` if `start_delay` is not set.
+          format: date-time
       description: Information about a standalone activity.
     ActivityExecutionListInfo:
       type: object
@@ -9883,6 +9892,7 @@ components:
             - ACTIVITY_EXECUTION_STATUS_CANCELED
             - ACTIVITY_EXECUTION_STATUS_TERMINATED
             - ACTIVITY_EXECUTION_STATUS_TIMED_OUT
+            - ACTIVITY_EXECUTION_STATUS_PAUSED
           type: string
           description: |-
             Only scheduled and terminal statuses appear here. More detailed information in PendingActivityInfo but not
@@ -9907,6 +9917,12 @@ components:
           description: |-
             The difference between close time and scheduled time.
              This field is only populated if the activity is closed.
+        executionTime:
+          type: string
+          description: |-
+            The time at which the first activity task is made available for dispatch, computed as
+             `schedule_time + start_delay`. Same as `schedule_time` if `start_delay` is not set.
+          format: date-time
       description: |-
         Limited activity information returned in the list response.
          When adding fields here, ensure that it is also present in ActivityExecutionInfo (note that it
@@ -9997,6 +10013,13 @@ components:
           description: |-
             Priority metadata. If this message is not present, or any fields are not
              present, they inherit the values from the workflow.
+        startDelay:
+          pattern: ^-?(?:0|[1-9][0-9]{0,11})(?:\.[0-9]{1,9})?s$
+          type: string
+          description: |-
+            Time to wait before making the first activity task available for dispatch. This delay is not applied to retry attempts.
+             When updated, the time is added to the original `schedule_time`, not to the current time.
+             If the resulting time is in the past, the task is made available for dispatch immediately.
     ActivityPropertiesModifiedExternallyEventAttributes:
       type: object
       properties:
@@ -10328,6 +10351,20 @@ components:
         createTime:
           type: string
           format: date-time
+    BatchOperationCancelActivities:
+      type: object
+      properties:
+        identity:
+          type: string
+          description: The identity of the worker/client
+        reason:
+          type: string
+          description: |-
+            Reason for requesting the cancellation, recorded and available via the PollActivityExecution API.
+             Not propagated to a worker if an activity attempt is currently running.
+      description: |-
+        BatchOperationCancelActivities sends cancel requests to a batch of activities.
+         Keep the parameter in sync with temporal.api.workflowservice.v1.RequestCancelActivityExecutionRequest.
     BatchOperationCancellation:
       type: object
       properties:
@@ -10338,6 +10375,12 @@ components:
         BatchOperationCancellation sends cancel requests to batch workflows.
          Keep the parameter in sync with temporal.api.workflowservice.v1.RequestCancelWorkflowExecutionRequest.
          Ignore first_execution_run_id because this is used for single workflow operation.
+    BatchOperationDeleteActivities:
+      type: object
+      properties: {}
+      description: |-
+        BatchOperationDeleteActivities sends deletion requests to a batch of activities.
+         Keep the parameter in sync with temporal.api.workflowservice.v1.DeleteActivityExecutionRequest.
     BatchOperationDeletion:
       type: object
       properties:
@@ -10370,6 +10413,30 @@ components:
           type: string
           description: Batch operation close time
           format: date-time
+        operationType:
+          enum:
+            - BATCH_OPERATION_TYPE_UNSPECIFIED
+            - BATCH_OPERATION_TYPE_TERMINATE
+            - BATCH_OPERATION_TYPE_TERMINATE_WORKFLOW
+            - BATCH_OPERATION_TYPE_CANCEL
+            - BATCH_OPERATION_TYPE_CANCEL_WORKFLOW
+            - BATCH_OPERATION_TYPE_SIGNAL
+            - BATCH_OPERATION_TYPE_SIGNAL_WORKFLOW
+            - BATCH_OPERATION_TYPE_DELETE
+            - BATCH_OPERATION_TYPE_DELETE_WORKFLOW
+            - BATCH_OPERATION_TYPE_RESET
+            - BATCH_OPERATION_TYPE_RESET_WORKFLOW
+            - BATCH_OPERATION_TYPE_UPDATE_EXECUTION_OPTIONS
+            - BATCH_OPERATION_TYPE_UPDATE_WORKFLOW_EXECUTION_OPTIONS
+            - BATCH_OPERATION_TYPE_UNPAUSE_ACTIVITY
+            - BATCH_OPERATION_TYPE_UPDATE_ACTIVITY_OPTIONS
+            - BATCH_OPERATION_TYPE_RESET_ACTIVITY
+            - BATCH_OPERATION_TYPE_TERMINATE_ACTIVITY
+            - BATCH_OPERATION_TYPE_CANCEL_ACTIVITY
+            - BATCH_OPERATION_TYPE_DELETE_ACTIVITY
+          type: string
+          description: Operation type
+          format: enum
     BatchOperationReset:
       type: object
       properties:
@@ -10464,6 +10531,20 @@ components:
       description: |-
         BatchOperationSignal sends signals to batch workflows.
          Keep the parameter in sync with temporal.api.workflowservice.v1.SignalWorkflowExecutionRequest.
+    BatchOperationTerminateActivities:
+      type: object
+      properties:
+        identity:
+          type: string
+          description: The identity of the worker/client
+        reason:
+          type: string
+          description: |-
+            Reason for requesting the termination, recorded and available via the PollActivityExecution API.
+             Not propagated to a worker if an activity attempt is currently running.
+      description: |-
+        BatchOperationTerminateActivities sends terminate requests to a batch of activities.
+         Keep the parameter in sync with temporal.api.workflowservice.v1.TerminateActivityExecutionRequest.
     BatchOperationTermination:
       type: object
       properties:
@@ -11593,14 +11674,23 @@ components:
           enum:
             - BATCH_OPERATION_TYPE_UNSPECIFIED
             - BATCH_OPERATION_TYPE_TERMINATE
+            - BATCH_OPERATION_TYPE_TERMINATE_WORKFLOW
             - BATCH_OPERATION_TYPE_CANCEL
+            - BATCH_OPERATION_TYPE_CANCEL_WORKFLOW
             - BATCH_OPERATION_TYPE_SIGNAL
+            - BATCH_OPERATION_TYPE_SIGNAL_WORKFLOW
             - BATCH_OPERATION_TYPE_DELETE
+            - BATCH_OPERATION_TYPE_DELETE_WORKFLOW
             - BATCH_OPERATION_TYPE_RESET
+            - BATCH_OPERATION_TYPE_RESET_WORKFLOW
             - BATCH_OPERATION_TYPE_UPDATE_EXECUTION_OPTIONS
+            - BATCH_OPERATION_TYPE_UPDATE_WORKFLOW_EXECUTION_OPTIONS
             - BATCH_OPERATION_TYPE_UNPAUSE_ACTIVITY
             - BATCH_OPERATION_TYPE_UPDATE_ACTIVITY_OPTIONS
             - BATCH_OPERATION_TYPE_RESET_ACTIVITY
+            - BATCH_OPERATION_TYPE_TERMINATE_ACTIVITY
+            - BATCH_OPERATION_TYPE_CANCEL_ACTIVITY
+            - BATCH_OPERATION_TYPE_DELETE_ACTIVITY
           type: string
           description: Batch operation type
           format: enum
@@ -11639,6 +11729,14 @@ components:
         reason:
           type: string
           description: Reason indicates the reason to stop a operation
+        query:
+          type: string
+          description: Query is the visibility query that defines the group of workflow to apply the batch operation
+        executions:
+          type: array
+          items:
+            $ref: '#/components/schemas/Execution'
+          description: Executions is the list of workflow OR standalone activity executions to apply the batch operation
     DescribeDeploymentResponse:
       type: object
       properties:
@@ -11670,9 +11768,18 @@ components:
           items:
             $ref: '#/components/schemas/PollerGroupInfo'
           description: |-
-            The initial info that client should use for poller group assignment. This information is
+            Deprecated. Use `poller_groups_info` instead, which carries a version so the client can
+             ignore stale updates.
+             The initial info that client should use for poller group assignment. This information is
              updated through poll response. Client is supposed to use the info received in the latest
              poll response.
+        pollerGroupsInfo:
+          allOf:
+            - $ref: '#/components/schemas/PollerGroupsInfo'
+          description: |-
+            The initial, versioned info that client should use for poller group assignment. This
+             information is updated through poll responses. Client is supposed to use the info with the
+             highest version it has received.
     DescribeNexusOperationExecutionResponse:
       type: object
       properties:
@@ -12033,6 +12140,23 @@ components:
              in a given workflow execution that carry the same label, provided that
              they have the distinct ID.
       description: A user-defined short-form string value to be used as the group's label.
+    Execution:
+      type: object
+      properties:
+        type:
+          enum:
+            - EXECUTION_TYPE_UNSPECIFIED
+            - EXECUTION_TYPE_WORKFLOW
+            - EXECUTION_TYPE_ACTIVITY
+          type: string
+          format: enum
+        businessId:
+          type: string
+        runId:
+          type: string
+      description: |-
+        Identifies a specific execution within a namespace. This is used for standalone activities
+         executions in batch jobs currently.
     ExternalWorkflowExecutionCancelRequestedEventAttributes:
       type: object
       properties:
@@ -12283,6 +12407,12 @@ components:
             True if the server supports server-scaled deployments.
              This flag is dependent both on server version and for server-scaled deployments
              to be enabled via server configuration.
+        serverScaledProviderCloudRun:
+          type: boolean
+          description: |-
+            True if the server supports the Cloud Run compute provider for
+             server-scaled deployments. Dependent on server version and the
+             provider being enabled via server configuration.
       description: System capability details.
     GetWorkerBuildIdCompatibilityResponse:
       type: object
@@ -13167,6 +13297,18 @@ components:
         pollerAutoscalingAutoEnroll:
           type: boolean
           description: When true, workers should use poller autoscaling by default unless explicitly configured otherwise.
+        workflowTaskCompletionPagination:
+          type: boolean
+          description: True if the namespace supports pagination of `RespondWorkflowTaskCompleted` request.
+        standaloneActivityStartDelay:
+          type: boolean
+          description: True if the namespace supports start delay for standalone activities.
+        standaloneActivityBatchOperations:
+          type: boolean
+          description: True if the namespace supports batch operations for standalone activities.
+        standaloneActivityOperatorCommands:
+          type: boolean
+          description: True if the namespace supports standalone activity operator commands.
       description: Namespace capability details. Should contain what features are enabled in a namespace.
     NamespaceInfo_Limits:
       type: object
@@ -14355,8 +14497,21 @@ components:
           items:
             $ref: '#/components/schemas/PollerGroupInfo'
           description: |-
-            The weighted list of poller groups IDs that client should use for future polls to this task
+            Deprecated. Use `poller_groups_info` instead, which carries a version so the client can
+             ignore stale updates.
+             The weighted list of poller groups IDs that client should use for future polls to this task
              queue. Client is expected to:
+               1. Maintain minimum number of pollers no less than the number of groups.
+               2. Try to assign the next poll to a group without any pending polls,
+               3. If every group has some pending polls, assign the next poll to a group randomly
+                 according to the weights.
+        pollerGroupsInfo:
+          allOf:
+            - $ref: '#/components/schemas/PollerGroupsInfo'
+          description: |-
+            The weighted, versioned list of poller groups IDs that client should use for future polls to
+             this task queue. Client should ignore this if it has already applied a snapshot with a
+             version greater than or equal to `poller_groups_info.version`. Client is expected to:
                1. Maintain minimum number of pollers no less than the number of groups.
                2. Try to assign the next poll to a group without any pending polls,
                3. If every group has some pending polls, assign the next poll to a group randomly
@@ -14369,6 +14524,23 @@ components:
         weight:
           type: number
           format: float
+    PollerGroupsInfo:
+      type: object
+      properties:
+        version:
+          type: string
+          description: |-
+            Monotonically increasing version of this snapshot. A client should ignore any snapshot whose
+             version is not greater than the one it last applied.
+        pollerGroups:
+          type: array
+          items:
+            $ref: '#/components/schemas/PollerGroupInfo'
+          description: The weighted list of poller groups the client should use for future polls to this task queue.
+      description: |-
+        A versioned snapshot of the poller groups the client should use for future polls to a task
+         queue. The version is monotonically increasing so that a client can ignore a snapshot that is
+         older than the one it has already applied.
     PollerInfo:
       type: object
       properties:
@@ -15051,11 +15223,6 @@ components:
         identity:
           type: string
           description: The identity of the client who initiated this request.
-        resetHeartbeat:
-          type: boolean
-          description: |-
-            Indicates that activity should reset heartbeat details.
-             This flag will be applied only to the new instance of the activity.
         keepPaused:
           type: boolean
           description: If activity is paused, it will remain paused after reset
@@ -16364,9 +16531,9 @@ components:
           pattern: ^-?(?:0|[1-9][0-9]{0,11})(?:\.[0-9]{1,9})?s$
           type: string
           description: |-
-            Time to wait before dispatching the first workflow task. Cannot be used with `cron_schedule`.
+            Time to wait before making the first workflow task available for dispatch. Cannot be used with `cron_schedule`.
              Note that the signal will be delivered with the first workflow task. If the workflow gets
-             another SignalWithStartWorkflow before the delay a workflow task will be dispatched immediately
+             another SignalWithStartWorkflow before the delay a workflow task will be made available for dispatch immediately
              and the rest of the delay period will be ignored, even if that request also had a delay.
              Signal via SignalWorkflowExecution will not unblock the workflow.
         userMetadata:
@@ -16401,6 +16568,9 @@ components:
         runId:
           type: string
           description: The run id of the workflow that was started - or just signaled, if it was already running.
+        firstExecutionRunId:
+          type: string
+          description: If the workflow was started as a result of a de-dupe, this field will contain the run id of the first execution in the chain.
         started:
           type: boolean
           description: If true, a new workflow was started.
@@ -16583,7 +16753,7 @@ components:
         startDelay:
           pattern: ^-?(?:0|[1-9][0-9]{0,11})(?:\.[0-9]{1,9})?s$
           type: string
-          description: Time to wait before dispatching the first activity task. This delay is not applied to retry attempts.
+          description: Time to wait before making the first activity task available for dispatch. This delay is not applied to retry attempts.
     StartActivityExecutionResponse:
       type: object
       properties:
@@ -16621,6 +16791,14 @@ components:
           description: |-
             Executions to apply the batch operation
              This field and `visibility_query` are mutually exclusive
+             DEPRECATED: Use `target_executions` instead.
+        targetExecutions:
+          type: array
+          items:
+            $ref: '#/components/schemas/Execution'
+          description: |-
+            Target executions to apply the batch operation. This field and `visibility_query`
+             are mutually exclusive.
         maxOperationsPerSecond:
           type: number
           description: |-
@@ -16649,6 +16827,12 @@ components:
           $ref: '#/components/schemas/BatchOperationResetActivities'
         updateActivityOptionsOperation:
           $ref: '#/components/schemas/BatchOperationUpdateActivityOptions'
+        cancelActivitiesOperation:
+          $ref: '#/components/schemas/BatchOperationCancelActivities'
+        terminateActivitiesOperation:
+          $ref: '#/components/schemas/BatchOperationTerminateActivities'
+        deleteActivitiesOperation:
+          $ref: '#/components/schemas/BatchOperationDeleteActivities'
     StartBatchOperationResponse:
       type: object
       properties: {}
@@ -16671,6 +16855,7 @@ components:
             - START_CHILD_WORKFLOW_EXECUTION_FAILED_CAUSE_UNSPECIFIED
             - START_CHILD_WORKFLOW_EXECUTION_FAILED_CAUSE_WORKFLOW_ALREADY_EXISTS
             - START_CHILD_WORKFLOW_EXECUTION_FAILED_CAUSE_NAMESPACE_NOT_FOUND
+            - START_CHILD_WORKFLOW_EXECUTION_FAILED_CAUSE_INVALID_VERSIONING_OVERRIDE
           type: string
           format: enum
         control:
@@ -16768,6 +16953,12 @@ components:
           description: |-
             The time-skipping state propagated from the parent workflow. This can be nil if no time skipping
              has occurred or there is no previous run.
+        versioningOverride:
+          allOf:
+            - $ref: '#/components/schemas/VersioningOverride'
+          description: |-
+            Versioning override requested for the child workflow. If present, this explicit override
+             takes precedence over versioning behavior inherited from the parent workflow.
     StartNexusOperationExecutionRequest:
       type: object
       properties:
@@ -16972,8 +17163,8 @@ components:
           pattern: ^-?(?:0|[1-9][0-9]{0,11})(?:\.[0-9]{1,9})?s$
           type: string
           description: |-
-            Time to wait before dispatching the first workflow task. Cannot be used with `cron_schedule`.
-             If the workflow gets a signal before the delay, a workflow task will be dispatched and the rest
+            Time to wait before making the first workflow task available for dispatch. Cannot be used with `cron_schedule`.
+             If the workflow gets a signal before the delay, a workflow task will be made available for dispatch and the rest
              of the delay will be ignored.
         completionCallbacks:
           type: array
@@ -17027,6 +17218,9 @@ components:
         runId:
           type: string
           description: The run id of the workflow that was started - or used (via WorkflowIdConflictPolicy USE_EXISTING).
+        firstExecutionRunId:
+          type: string
+          description: If the workflow was started as a result of a de-dupe, this field will contain the run id of the first execution in the chain.
         started:
           type: boolean
           description: If true, a new workflow was started.
@@ -17274,6 +17468,13 @@ components:
                workflow goes to a normal queue, and the rest workflow tasks go to the Sticky queue associated with a specific
                worker instance.
           format: float
+        rateLimitingActive:
+          type: boolean
+          description: |-
+            Whether rate limiting blocked any dispatches within the recent observation window (approximately
+             30 seconds). When true, adding more workers will not increase throughput — the bottleneck is the
+             rate limit, not worker count. This field is useful for auto-scaling systems to avoid unnecessary
+             scale-up.
       description: |-
         TaskQueueStats contains statistics about task queue backlog and activity.
 
@@ -17471,10 +17672,11 @@ components:
              one completes, the new one will override the previous one.
              If the fast-forward duration exceeds the remaining execution timeout, time will only
              be fast-forwarded up to the end of the execution.
-        disableChildPropagation:
+        disablePropagation:
           type: boolean
           description: |-
-            By default, child workflows inherit the "enabled" flag when they are started.
+            By default, executions started by another execution (e.g. a child workflow of a parent workflow or
+             a schedule with the timeskipping policy enabled), inherit the "enabled" flag and skip time when possible.
              This flag disables that inheritance.
       description: |-
         The configuration for time skipping of a workflow execution (a chain of runs including retries, cron, continue-as-new).
@@ -20541,6 +20743,8 @@ components:
             - WORKFLOW_TASK_FAILED_CAUSE_FEATURE_DISABLED
             - WORKFLOW_TASK_FAILED_CAUSE_GRPC_MESSAGE_TOO_LARGE
             - WORKFLOW_TASK_FAILED_CAUSE_PAYLOADS_TOO_LARGE
+            - WORKFLOW_TASK_FAILED_CAUSE_EXTERNAL_STORAGE_FAILURE
+            - WORKFLOW_TASK_FAILED_CAUSE_WORKFLOW_PAUSE_REQUESTED_BEFORE_TASK_STARTED
           type: string
           format: enum
         failure:

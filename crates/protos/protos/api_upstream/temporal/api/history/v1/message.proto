@@ -790,6 +790,10 @@ message StartChildWorkflowExecutionInitiatedEventAttributes {
     // The time-skipping state propagated from the parent workflow. This can be nil if no time skipping
     // has occurred or there is no previous run.
     temporal.api.common.v1.TimeSkippingStatePropagation time_skipping_state_propagation = 23;
+
+    // Versioning override requested for the child workflow. If present, this explicit override
+    // takes precedence over versioning behavior inherited from the parent workflow.
+    temporal.api.workflow.v1.VersioningOverride versioning_override = 24;
 }
 
 message StartChildWorkflowExecutionFailedEventAttributes {

@@ -102,10 +102,16 @@ message DescribeNamespaceResponse {
     // Contains the historical state of failover_versions for the cluster, truncated to contain only the last N
     // states to ensure that the list does not grow unbounded.
     repeated temporal.api.replication.v1.FailoverStatus failover_history = 6;
+    // Deprecated. Use `poller_groups_info` instead, which carries a version so the client can
+    // ignore stale updates.
     // The initial info that client should use for poller group assignment. This information is
     // updated through poll response. Client is supposed to use the info received in the latest
     // poll response.
-    repeated temporal.api.taskqueue.v1.PollerGroupInfo poller_group_infos = 7;
+    repeated temporal.api.taskqueue.v1.PollerGroupInfo poller_group_infos = 7 [deprecated = true];
+    // The initial, versioned info that client should use for poller group assignment. This
+    // information is updated through poll responses. Client is supposed to use the info with the
+    // highest version it has received.
+    temporal.api.taskqueue.v1.PollerGroupsInfo poller_groups_info = 8;
 }
 
 message UpdateNamespaceRequest {
@@ -182,8 +188,8 @@ message StartWorkflowExecutionRequest {
     // StartWorkflowExecution.
     temporal.api.failure.v1.Failure continued_failure = 18;
     temporal.api.common.v1.Payloads last_completion_result = 19;
-    // Time to wait before dispatching the first workflow task. Cannot be used with `cron_schedule`.
-    // If the workflow gets a signal before the delay, a workflow task will be dispatched and the rest
+    // Time to wait before making the first workflow task available for dispatch. Cannot be used with `cron_schedule`.
+    // If the workflow gets a signal before the delay, a workflow task will be made available for dispatch and the rest
     // of the delay will be ignored.
     google.protobuf.Duration workflow_start_delay = 20;
     // Callbacks to be called by the server when this workflow reaches a terminal state.
@@ -216,6 +222,8 @@ message StartWorkflowExecutionRequest {
 message StartWorkflowExecutionResponse {
     // The run id of the workflow that was started - or used (via WorkflowIdConflictPolicy USE_EXISTING).
     string run_id = 1;
+    // If the workflow was started as a result of a de-dupe, this field will contain the run id of the first execution in the chain.
+    string first_execution_run_id = 6;
     // If true, a new workflow was started.
     bool started = 3;
     // Current execution status of the workflow. Typically remains WORKFLOW_EXECUTION_STATUS_RUNNING
@@ -357,13 +365,23 @@ message PollWorkflowTaskQueueResponse {
     // This poller group ID identifies the owner of the workflow task awaiting for query response.
     // Corresponding RespondQueryTaskCompleted should pass this value for proper routing.
     string poller_group_id = 17;
+    // Deprecated. Use `poller_groups_info` instead, which carries a version so the client can
+    // ignore stale updates.
     // The weighted list of poller groups IDs that client should use for future polls to this task
     // queue. Client is expected to:
     //   1. Maintain minimum number of pollers no less than the number of groups.
     //   2. Try to assign the next poll to a group without any pending polls,
     //   3. If every group has some pending polls, assign the next poll to a group randomly
     //     according to the weights.
-    repeated temporal.api.taskqueue.v1.PollerGroupInfo poller_group_infos = 18;
+    repeated temporal.api.taskqueue.v1.PollerGroupInfo poller_group_infos = 18 [deprecated = true];
+    // The weighted, versioned list of poller groups IDs that client should use for future polls to
+    // this task queue. Client should ignore this if it has already applied a snapshot with a
+    // version greater than or equal to `poller_groups_info.version`. Client is expected to:
+    //   1. Maintain minimum number of pollers no less than the number of groups.
+    //   2. Try to assign the next poll to a group without any pending polls,
+    //   3. If every group has some pending polls, assign the next poll to a group randomly
+    //     according to the weights.
+    temporal.api.taskqueue.v1.PollerGroupsInfo poller_groups_info = 19;
 }
 
 message RespondWorkflowTaskCompletedRequest {
@@ -423,6 +441,16 @@ message RespondWorkflowTaskCompletedRequest {
     // A dedicated per-worker Nexus task queue on which the server sends control
     // tasks (e.g. activity cancellation) to this specific worker instance.
     string worker_control_task_queue = 20;
+
+    // 0-indexed page number when the workflow task completion is split across multiple
+    // requests ("pages"). 0 for single-page requests. May only be set to non-zero value
+    // when the namespace capability workflow_task_completion_pagination is true.
+    int32 page_number = 21;
+
+    // True for non-final pages of a paginated workflow task completion. The final page's
+    // `page_number` tells the server how many intermediate pages (0..page_number-1) preceded it.
+    // May only be used when the namespace capability workflow_task_completion_pagination is true.
+    bool intermediate_page = 22;
 
     // SDK capability details.
     message Capabilities {
@@ -573,7 +601,15 @@ message PollActivityTaskQueueResponse {
     //   2. Try to assign the next poll to a group without any pending polls,
     //   3. If every group has some pending polls, assign the next poll to a group randomly
     //     according to the weights.
-    repeated temporal.api.taskqueue.v1.PollerGroupInfo poller_group_infos = 21;
+    repeated temporal.api.taskqueue.v1.PollerGroupInfo poller_group_infos = 21 [deprecated = true];
+    // The weighted, versioned list of poller groups IDs that client should use for future polls to
+    // this task queue. Client should ignore this if it has already applied a snapshot with a
+    // version greater than or equal to `poller_groups_info.version`. Client is expected to:
+    //   1. Maintain minimum number of pollers no less than the number of groups.
+    //   2. Try to assign the next poll to a group without any pending polls,
+    //   3. If every group has some pending polls, assign the next poll to a group randomly
+    //     according to the weights.
+    temporal.api.taskqueue.v1.PollerGroupsInfo poller_groups_info = 22;
 }
 
 message RecordActivityTaskHeartbeatRequest {
@@ -879,9 +915,9 @@ message SignalWithStartWorkflowExecutionRequest {
     temporal.api.common.v1.Memo memo = 17;
     temporal.api.common.v1.SearchAttributes search_attributes = 18;
     temporal.api.common.v1.Header header = 19;
-    // Time to wait before dispatching the first workflow task. Cannot be used with `cron_schedule`.
+    // Time to wait before making the first workflow task available for dispatch. Cannot be used with `cron_schedule`.
     // Note that the signal will be delivered with the first workflow task. If the workflow gets
-    // another SignalWithStartWorkflow before the delay a workflow task will be dispatched immediately
+    // another SignalWithStartWorkflow before the delay a workflow task will be made available for dispatch immediately
     // and the rest of the delay period will be ignored, even if that request also had a delay.
     // Signal via SignalWorkflowExecution will not unblock the workflow.
     google.protobuf.Duration workflow_start_delay = 20;
@@ -905,6 +941,8 @@ message SignalWithStartWorkflowExecutionRequest {
 message SignalWithStartWorkflowExecutionResponse {
     // The run id of the workflow that was started - or just signaled, if it was already running.
     string run_id = 1;
+    // If the workflow was started as a result of a de-dupe, this field will contain the run id of the first execution in the chain.
+    string first_execution_run_id = 4;
     // If true, a new workflow was started.
     bool started = 2;
     // Link to be associated with the WorkflowExecutionSignaled event.
@@ -1342,6 +1380,11 @@ message GetSystemInfoResponse {
         // This flag is dependent both on server version and for server-scaled deployments
         // to be enabled via server configuration.
         bool server_scaled_deployments = 12;
+
+        // True if the server supports the Cloud Run compute provider for
+        // server-scaled deployments. Dependent on server version and the
+        // provider being enabled via server configuration.
+        bool server_scaled_provider_cloud_run = 13;
 
     }
 }
@@ -1830,7 +1873,11 @@ message StartBatchOperationRequest {
     string reason = 4;
     // Executions to apply the batch operation
     // This field and `visibility_query` are mutually exclusive
-    repeated temporal.api.common.v1.WorkflowExecution executions = 5;
+    // DEPRECATED: Use `target_executions` instead.
+    repeated temporal.api.common.v1.WorkflowExecution executions = 5 [deprecated = true];
+    // Target executions to apply the batch operation. This field and `visibility_query`
+    // are mutually exclusive.
+    repeated temporal.api.common.v1.Execution target_executions = 22;
     // Limit for the number of operations processed per second within this batch.
     // Its purpose is to reduce the stress on the system caused by batch operations, which helps to prevent system
     // overload and minimize potential delays in executing ongoing tasks for user workers.
@@ -1849,6 +1896,9 @@ message StartBatchOperationRequest {
         temporal.api.batch.v1.BatchOperationUnpauseActivities unpause_activities_operation = 16;
         temporal.api.batch.v1.BatchOperationResetActivities reset_activities_operation = 17;
         temporal.api.batch.v1.BatchOperationUpdateActivityOptions update_activity_options_operation = 18;
+        temporal.api.batch.v1.BatchOperationCancelActivities cancel_activities_operation = 19;
+        temporal.api.batch.v1.BatchOperationTerminateActivities terminate_activities_operation = 20;
+        temporal.api.batch.v1.BatchOperationDeleteActivities delete_activities_operation = 21;
     }
 }
 
@@ -1897,6 +1947,10 @@ message DescribeBatchOperationResponse {
     string identity = 9;
     // Reason indicates the reason to stop a operation
     string reason = 10;
+    // Query is the visibility query that defines the group of workflow to apply the batch operation
+    string query = 11;
+    // Executions is the list of workflow OR standalone activity executions to apply the batch operation
+    repeated temporal.api.common.v1.Execution executions = 12;
 }
 
 message ListBatchOperationsRequest {
@@ -1991,7 +2045,15 @@ message PollNexusTaskQueueResponse {
     //   2. Try to assign the next poll to a group without any pending polls,
     //   3. If every group has some pending polls, assign the next poll to a group randomly
     //     according to the weights.
-    repeated temporal.api.taskqueue.v1.PollerGroupInfo poller_group_infos = 5;
+    repeated temporal.api.taskqueue.v1.PollerGroupInfo poller_group_infos = 5 [deprecated = true];
+    // The weighted, versioned list of poller groups IDs that client should use for future polls to
+    // this task queue. Client should ignore this if it has already applied a snapshot with a
+    // version greater than or equal to `poller_groups_info.version`. Client is expected to:
+    //   1. Maintain minimum number of pollers no less than the number of groups.
+    //   2. Try to assign the next poll to a group without any pending polls,
+    //   3. If every group has some pending polls, assign the next poll to a group randomly
+    //     according to the weights.
+    temporal.api.taskqueue.v1.PollerGroupsInfo poller_groups_info = 6;
 }
 
 message RespondNexusTaskCompletedRequest {
@@ -2119,7 +2181,7 @@ message UpdateActivityExecutionOptionsRequest {
     // If provided, targets a workflow activity for the given workflow ID.
     // If empty, targets a standalone activity.
     string workflow_id = 2;
-    // The ID of the activity to target. 
+    // The ID of the activity to target.
     string activity_id = 3;
     // Run ID of the workflow or standalone activity.
     string run_id = 4;
@@ -2189,7 +2251,7 @@ message PauseActivityExecutionRequest {
     // If provided, pause a workflow activity (or activities) for the given workflow ID.
     // If empty, targets a standalone activity.
     string workflow_id = 2;
-    // The ID of the activity to target. 
+    // The ID of the activity to target.
     string activity_id = 3;
     // Run ID of the workflow or standalone activity.
     string run_id = 4;
@@ -2251,7 +2313,7 @@ message UnpauseActivityExecutionRequest {
     // If provided, targets a workflow activity for the given workflow ID.
     // If empty, targets a standalone activity.
     string workflow_id = 2;
-    // The ID of the activity to target. 
+    // The ID of the activity to target.
     string activity_id = 3;
     // Run ID of the workflow or standalone activity.
     string run_id = 4;
@@ -2335,24 +2397,20 @@ message ResetActivityExecutionRequest {
     // The identity of the client who initiated this request.
     string identity = 5;
 
-    // Indicates that activity should reset heartbeat details.
-    // This flag will be applied only to the new instance of the activity.
-    bool reset_heartbeat = 6;
-
     // If activity is paused, it will remain paused after reset
-    bool keep_paused = 7;
+    bool keep_paused = 6;
 
     // If set, and activity is in backoff, the activity will start at a random time within the specified jitter duration.
     // (unless it is paused and keep_paused is set)
-    google.protobuf.Duration jitter = 8;
+    google.protobuf.Duration jitter = 7;
 
     // If set, the activity options will be restored to the defaults.
     // Default options are then options activity was created with.
     // They are part of the first schedule event.
-    bool restore_original_options = 9;
+    bool restore_original_options = 8;
 
     // Resource ID for routing. Contains "workflow:{workflow_id}" for workflow activities or "activity:{activity_id}" for standalone activities.
-    string resource_id = 10;
+    string resource_id = 9;
 }
 
 // Deprecated. Use `ResetActivityExecutionRequest`.
@@ -2656,7 +2714,7 @@ message CreateWorkerDeploymentVersionRequest {
 
     // Optional. The identity of the client who initiated this request.
     string identity = 3;
-    
+
     // A unique identifier for this create request for idempotence. Typically UUIDv4.
     // If a second request with the same ID is recieved, it is considered a successful no-op.
     // Retrying with a different request ID for the same deployment name + build ID is an error.
@@ -3186,7 +3244,7 @@ message StartActivityExecutionRequest {
     repeated temporal.api.common.v1.Link links = 20;
     // Options for handling conflicts when using ACTIVITY_ID_CONFLICT_POLICY_USE_EXISTING.
     temporal.api.common.v1.OnConflictOptions on_conflict_options = 21;
-    // Time to wait before dispatching the first activity task. This delay is not applied to retry attempts.
+    // Time to wait before making the first activity task available for dispatch. This delay is not applied to retry attempts.
     google.protobuf.Duration start_delay = 22;
 }
 

@@ -498,6 +498,10 @@ impl WorkerClient for WorkerClientBag {
             worker_instance_key: self.worker_instance_key.to_string(),
             worker_control_task_queue: self.worker_control_task_queue(),
             resource_id: Default::default(),
+            // Pagination fields: default to a single, final page. Pagination logic will
+            // populate these when splitting large completions.
+            page_number: 0,
+            intermediate_page: false,
         };
         Ok(self
             .client

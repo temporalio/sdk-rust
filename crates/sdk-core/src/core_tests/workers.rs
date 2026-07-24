@@ -413,6 +413,7 @@ fn create_test_activity_task() -> PollActivityTaskQueueResponse {
     }
 }
 
+#[allow(deprecated)] // poller_group_infos is deprecated but still an explicit field
 fn create_test_nexus_task(
     header: Option<HashMap<String, String>>,
     capabilities: Option<nexus::v1::request::Capabilities>,
@@ -439,6 +440,7 @@ fn create_test_nexus_task(
         poller_scaling_decision: None,
         poller_group_id: Default::default(),
         poller_group_infos: vec![],
+        poller_groups_info: None,
     }
 }
 

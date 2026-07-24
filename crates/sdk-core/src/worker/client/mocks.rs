@@ -19,6 +19,7 @@ pub(crate) static DEFAULT_TEST_CAPABILITIES: &Capabilities = &Capabilities {
     count_group_by_execution_status: false,
     nexus: false,
     server_scaled_deployments: false,
+    server_scaled_provider_cloud_run: false,
 };
 
 #[cfg(any(feature = "test-utilities", test))]
