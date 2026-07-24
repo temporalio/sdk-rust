@@ -12,7 +12,14 @@ use std::{
 use temporalio_client::{
     WorkflowExecuteUpdateOptions, WorkflowQueryOptions, WorkflowSignalOptions, WorkflowStartOptions,
 };
-use temporalio_common::{protos::temporal::api::common::v1::Payload, worker::WorkerTaskTypes};
+use temporalio_common::{
+    protos::temporal::api::{
+        common::v1::Payload,
+        enums::v1::{EventType, WorkflowTaskFailedCause},
+        history::v1::{History, history_event::Attributes::WorkflowTaskFailedEventAttributes},
+    },
+    worker::WorkerTaskTypes,
+};
 use temporalio_macros::{workflow, workflow_methods};
 use temporalio_sdk::{
     ActivityOptions, ChildWorkflowOptions, LocalActivityOptions, NexusOperationOptions,
@@ -600,6 +607,309 @@ struct ConstructionPollingInterceptor {
     sync_polls: Arc<AtomicUsize>,
     deferred_polls: Arc<AtomicUsize>,
     async_polls: Arc<AtomicUsize>,
+}
+
+#[workflow]
+#[derive(Default)]
+struct ConstructionWakeWorkflow;
+
+#[workflow_methods]
+impl ConstructionWakeWorkflow {
+    #[run]
+    async fn run(_ctx: &mut WorkflowContext<Self>) -> WorkflowResult<()> {
+        Ok(())
+    }
+}
+
+#[workflow]
+#[derive(Default)]
+struct ConstructionWakeHandlerWorkflow {
+    handled: bool,
+}
+
+#[workflow_methods]
+impl ConstructionWakeHandlerWorkflow {
+    #[run]
+    async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<()> {
+        ctx.wait_condition(|state| state.handled).await;
+        Ok(())
+    }
+
+    #[signal]
+    async fn async_signal(ctx: &mut WorkflowContext<Self>) {
+        ctx.state_mut(|state| state.handled = true);
+    }
+
+    #[update]
+    async fn async_update(ctx: &mut WorkflowContext<Self>) {
+        ctx.state_mut(|state| state.handled = true);
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ConstructionWakePoint {
+    Execute,
+    Signal,
+    Update,
+}
+
+struct ConstructionWakeInterceptor {
+    wake_point: ConstructionWakePoint,
+}
+
+impl WorkflowInterceptor for ConstructionWakeInterceptor {
+    fn execute<'a>(
+        &'a self,
+        _ctx: WorkflowInterceptorContext,
+        input: ExecuteWorkflowInput,
+        next: WorkflowNext<
+            'a,
+            ExecuteWorkflowInput,
+            WorkflowInterceptorFuture<'a, ExecuteWorkflowResult>,
+        >,
+    ) -> WorkflowInterceptorFuture<'a, ExecuteWorkflowResult> {
+        if self.wake_point != ConstructionWakePoint::Execute {
+            return next.run(input);
+        }
+        WorkflowInterceptorFuture::new(async move {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+            next.run(input).await
+        })
+    }
+
+    fn handle_signal<'a>(
+        &'a self,
+        _ctx: WorkflowInterceptorContext,
+        input: HandleSignalInput,
+        next: WorkflowNext<
+            'a,
+            HandleSignalInput,
+            WorkflowInterceptorFuture<'a, HandleSignalResult>,
+        >,
+    ) -> WorkflowInterceptorFuture<'a, HandleSignalResult> {
+        if self.wake_point != ConstructionWakePoint::Signal {
+            return next.run(input);
+        }
+        WorkflowInterceptorFuture::new(async move {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+            next.run(input).await
+        })
+    }
+
+    fn handle_update<'a>(
+        &'a self,
+        _ctx: WorkflowInterceptorContext,
+        input: HandleUpdateInput,
+        next: WorkflowNext<
+            'a,
+            HandleUpdateInput,
+            WorkflowInterceptorFuture<'a, HandleUpdateResult>,
+        >,
+    ) -> WorkflowInterceptorFuture<'a, HandleUpdateResult> {
+        if self.wake_point != ConstructionWakePoint::Update {
+            return next.run(input);
+        }
+        WorkflowInterceptorFuture::new(async move {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+            next.run(input).await
+        })
+    }
+}
+
+fn nondeterministic_future_failure_count(history: &History) -> usize {
+    history
+        .events
+        .iter()
+        .filter(|event| {
+            event.event_type() == EventType::WorkflowTaskFailed
+                && matches!(
+                    event.attributes.as_ref(),
+                    Some(WorkflowTaskFailedEventAttributes(attributes))
+                        if attributes.cause
+                            == WorkflowTaskFailedCause::NonDeterministicError as i32
+                            && attributes.failure.as_ref().is_some_and(|failure|
+                                failure.message.contains("Nondeterministic future detected"))
+                )
+        })
+        .count()
+}
+
+#[rstest::rstest]
+#[case::enabled(true)]
+#[case::disabled(false)]
+#[tokio::test]
+async fn nondeterministic_future_detection_is_respected_for_interceptors(
+    #[case] detect_nondeterministic_futures: bool,
+) {
+    let mut starter = CoreWfStarter::new(&format!(
+        "nde_future_detection_{}",
+        detect_nondeterministic_futures
+    ));
+    starter.sdk_config.task_types = WorkerTaskTypes::workflow_only();
+    starter.sdk_config.detect_nondeterministic_futures = detect_nondeterministic_futures;
+    let mut worker = starter.worker().await;
+    worker
+        .register_workflow::<ConstructionWakeWorkflow>()
+        .unwrap();
+    worker
+        .inner_mut()
+        .register_workflow_interceptors(vec![WorkflowInterceptorConstructor::new(move |_| {
+            ConstructionWakeInterceptor {
+                wake_point: ConstructionWakePoint::Execute,
+            }
+        })]);
+
+    let handle = worker
+        .submit_workflow(
+            ConstructionWakeWorkflow::run,
+            (),
+            WorkflowStartOptions::new(
+                starter.get_task_queue().to_owned(),
+                starter.get_wf_id().to_owned(),
+            )
+            .build(),
+        )
+        .await
+        .unwrap();
+
+    let (result, worker_result) = join!(
+        async {
+            let res = handle.get_result(Default::default()).await;
+            println!("done with handle");
+            res
+        },
+        async {
+            let res = worker.run_until_done().await;
+            println!("done with worker");
+            res
+        }
+    );
+    result.unwrap();
+    worker_result.unwrap();
+
+    let history = starter.get_history().await;
+    assert_eq!(
+        nondeterministic_future_failure_count(&history),
+        usize::from(detect_nondeterministic_futures)
+    );
+}
+
+#[rstest::rstest]
+#[case::enabled(true)]
+#[case::disabled(false)]
+#[tokio::test]
+async fn nondeterministic_future_detection_is_respected_for_async_signal_interceptors(
+    #[case] detect_nondeterministic_futures: bool,
+) {
+    let mut starter = CoreWfStarter::new(&format!(
+        "async_signal_nde_future_detection_{}",
+        detect_nondeterministic_futures
+    ));
+    starter.sdk_config.task_types = WorkerTaskTypes::workflow_only();
+    starter.sdk_config.detect_nondeterministic_futures = detect_nondeterministic_futures;
+    let mut worker = starter.worker().await;
+    worker
+        .register_workflow::<ConstructionWakeHandlerWorkflow>()
+        .unwrap();
+    worker
+        .inner_mut()
+        .register_workflow_interceptors(vec![WorkflowInterceptorConstructor::new(move |_| {
+            ConstructionWakeInterceptor {
+                wake_point: ConstructionWakePoint::Signal,
+            }
+        })]);
+
+    let handle = worker
+        .submit_workflow(
+            ConstructionWakeHandlerWorkflow::run,
+            (),
+            WorkflowStartOptions::new(
+                starter.get_task_queue().to_owned(),
+                starter.get_wf_id().to_owned(),
+            )
+            .build(),
+        )
+        .await
+        .unwrap();
+
+    let driver = async {
+        handle
+            .signal(
+                ConstructionWakeHandlerWorkflow::async_signal,
+                (),
+                WorkflowSignalOptions::default(),
+            )
+            .await
+            .unwrap();
+        handle.get_result(Default::default()).await.unwrap();
+    };
+    let (_, worker_result) = join!(driver, worker.run_until_done());
+    worker_result.unwrap();
+
+    let history = starter.get_history().await;
+    assert_eq!(
+        nondeterministic_future_failure_count(&history),
+        usize::from(detect_nondeterministic_futures)
+    );
+}
+
+#[rstest::rstest]
+#[case::enabled(true)]
+#[case::disabled(false)]
+#[tokio::test]
+async fn nondeterministic_future_detection_is_respected_for_async_update_interceptors(
+    #[case] detect_nondeterministic_futures: bool,
+) {
+    let mut starter = CoreWfStarter::new(&format!(
+        "async_update_nde_future_detection_{}",
+        detect_nondeterministic_futures
+    ));
+    starter.sdk_config.task_types = WorkerTaskTypes::workflow_only();
+    starter.sdk_config.detect_nondeterministic_futures = detect_nondeterministic_futures;
+    let mut worker = starter.worker().await;
+    worker
+        .register_workflow::<ConstructionWakeHandlerWorkflow>()
+        .unwrap();
+    worker
+        .inner_mut()
+        .register_workflow_interceptors(vec![WorkflowInterceptorConstructor::new(move |_| {
+            ConstructionWakeInterceptor {
+                wake_point: ConstructionWakePoint::Update,
+            }
+        })]);
+
+    let handle = worker
+        .submit_workflow(
+            ConstructionWakeHandlerWorkflow::run,
+            (),
+            WorkflowStartOptions::new(
+                starter.get_task_queue().to_owned(),
+                starter.get_wf_id().to_owned(),
+            )
+            .build(),
+        )
+        .await
+        .unwrap();
+
+    let driver = async {
+        handle
+            .execute_update(
+                ConstructionWakeHandlerWorkflow::async_update,
+                (),
+                WorkflowExecuteUpdateOptions::default(),
+            )
+            .await
+            .unwrap();
+        handle.get_result(Default::default()).await.unwrap();
+    };
+    let (_, worker_result) = join!(driver, worker.run_until_done());
+    worker_result.unwrap();
+
+    let history = starter.get_history().await;
+    assert_eq!(
+        nondeterministic_future_failure_count(&history),
+        usize::from(detect_nondeterministic_futures)
+    );
 }
 
 impl WorkflowInterceptor for ConstructionPollingInterceptor {

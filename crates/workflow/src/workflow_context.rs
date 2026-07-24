@@ -17,7 +17,6 @@ use crate::{
         SdkGuardedFuture, SdkWakeGuard,
         entry::WorkflowImplementation,
         host::WorkflowHost,
-        is_sdk_wake,
         model::{
             CancelExternalWfResult, CancellableID, NexusStartResult, SignalExternalWfResult,
             TimerResult, UnblockEvent, Unblockable, WorkflowTermination,
@@ -54,7 +53,7 @@ use std::{
         Arc,
         atomic::{AtomicBool, Ordering},
     },
-    task::{Poll, Wake, Waker},
+    task::{Poll, Waker},
     time::{Duration, SystemTime},
 };
 use temporalio_common_wasm::{
@@ -220,19 +219,14 @@ impl Drop for ConstructionPollGuard<'_> {
     }
 }
 
-struct ConstructionWake {
-    non_sdk_wake: Arc<AtomicBool>,
+pub(crate) struct WorkflowPollWakerGuard<'a> {
+    current_waker: &'a RefCell<Option<Waker>>,
+    previous: Option<Waker>,
 }
 
-impl Wake for ConstructionWake {
-    fn wake(self: Arc<Self>) {
-        self.wake_by_ref();
-    }
-
-    fn wake_by_ref(self: &Arc<Self>) {
-        if !is_sdk_wake() {
-            self.non_sdk_wake.store(true, Ordering::Release);
-        }
+impl Drop for WorkflowPollWakerGuard<'_> {
+    fn drop(&mut self) {
+        self.current_waker.replace(self.previous.take());
     }
 }
 
@@ -364,9 +358,18 @@ impl BaseWorkflowContext {
     }
 
     pub(crate) fn construction_waker(&self) -> Waker {
-        Waker::from(Arc::new(ConstructionWake {
-            non_sdk_wake: self.inner.construction_non_sdk_wake.clone(),
-        }))
+        self.inner
+            .current_waker
+            .borrow()
+            .clone()
+            .unwrap_or_else(|| Waker::noop().clone())
+    }
+
+    pub(crate) fn enter_runtime_poll<'a>(&'a self, waker: &Waker) -> WorkflowPollWakerGuard<'a> {
+        WorkflowPollWakerGuard {
+            previous: self.inner.current_waker.replace(Some(waker.clone())),
+            current_waker: &self.inner.current_waker,
+        }
     }
 
     pub(crate) fn notify_patch(&self, patch_id: String) {
@@ -520,7 +523,7 @@ struct WorkflowContextInner {
     patch_activation_callback: Option<PatchActivationCallback>,
     state_mutated: Cell<bool>,
     poll_phase: Cell<WorkflowFuturePollPhase>,
-    construction_non_sdk_wake: Arc<AtomicBool>,
+    current_waker: RefCell<Option<Waker>>,
     workflow_interceptors: RefCell<Vec<Arc<dyn WorkflowInterceptor>>>,
 }
 
@@ -618,7 +621,7 @@ impl BaseWorkflowContext {
                 patch_activation_callback,
                 state_mutated: Cell::new(false),
                 poll_phase: Cell::new(WorkflowFuturePollPhase::Routine),
-                construction_non_sdk_wake: Arc::new(AtomicBool::new(false)),
+                current_waker: RefCell::new(None),
                 workflow_interceptors: RefCell::new(Vec::new()),
             }),
         }
@@ -654,15 +657,6 @@ impl BaseWorkflowContext {
     pub(crate) fn take_forced_wft_failure(
         &self,
     ) -> Option<Box<dyn std::error::Error + Send + Sync>> {
-        if self
-            .inner
-            .construction_non_sdk_wake
-            .swap(false, Ordering::AcqRel)
-        {
-            self.inner.runtime.set_forced_wft_failure(Box::new(std::io::Error::other(
-                "[TMPRL1100] Nondeterministic future detected while constructing a workflow interceptor",
-            )));
-        }
         self.inner.runtime.take_forced_wft_failure()
     }
 
@@ -3111,7 +3105,7 @@ mod tests {
             Mutex,
             atomic::{AtomicUsize, Ordering as AtomicOrdering},
         },
-        task::Context,
+        task::{Context, Wake},
     };
     use temporalio_common_wasm::{
         RetryPolicy,
@@ -3133,6 +3127,18 @@ mod tests {
 
     #[derive(Default)]
     struct NoopHost;
+
+    struct CountingWake(Arc<AtomicUsize>);
+
+    impl Wake for CountingWake {
+        fn wake(self: Arc<Self>) {
+            self.wake_by_ref();
+        }
+
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.0.fetch_add(1, AtomicOrdering::Relaxed);
+        }
+    }
 
     impl WorkflowHost for NoopHost {
         fn set_current_details(&self, _details: String) {}
@@ -3636,22 +3642,13 @@ mod tests {
     }
 
     #[test]
-    fn construction_waker_flags_only_non_sdk_wakes() {
+    fn construction_waker_uses_runtime_poll_waker() {
         let base = test_context().base_context();
+        let wakes = Arc::new(AtomicUsize::new(0));
+        let waker = Waker::from(Arc::new(CountingWake(wakes.clone())));
+        let _guard = base.enter_runtime_poll(&waker);
         base.construction_waker().wake_by_ref();
-        assert!(
-            base.take_forced_wft_failure()
-                .expect("non-SDK wake should force a workflow task failure")
-                .to_string()
-                .contains("TMPRL1100")
-        );
-
-        let base = test_context().base_context();
-        let waker = base.construction_waker();
-        let _guard = SdkWakeGuard::new();
-        waker.wake_by_ref();
-        drop(_guard);
-        assert!(base.take_forced_wft_failure().is_none());
+        assert_eq!(wakes.load(AtomicOrdering::Relaxed), 1);
     }
 
     #[test]

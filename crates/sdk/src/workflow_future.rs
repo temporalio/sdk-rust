@@ -6,7 +6,7 @@ use std::{
     panic::AssertUnwindSafe,
     pin::Pin,
     rc::Rc,
-    task::{Context, Poll},
+    task::{Context, Poll, Waker},
 };
 use temporalio_common::{
     data_converters::DataConverter,
@@ -170,6 +170,34 @@ enum ActivationJobContext {
 }
 
 impl WorkflowFuture {
+    fn tracked_waker(&self, parent: &Waker) -> Option<Waker> {
+        self.wake_tracking
+            .as_ref()
+            .map(|tracker| tracker.new_per_poll_waker(parent))
+    }
+
+    fn fail_on_non_sdk_wake(&self, run_id: &str) -> bool {
+        if !self
+            .wake_tracking
+            .as_ref()
+            .is_some_and(WakeTracker::take_non_sdk_wake)
+        {
+            return false;
+        }
+        self.fail_wft(
+            run_id.to_owned(),
+            anyhow!(
+                "[TMPRL1100] Nondeterministic future detected: a waker was invoked by a \
+                 non-SDK source. This usually means workflow code is using nondeterministic \
+                 operations like tokio async functions or channels, other async libraries, \
+                 or std::thread. Use SDK-provided alternatives \
+                 (ctx.timer(), ctx.state_mut() + ctx.wait_condition(), etc.) instead."
+            ),
+            Some(WorkflowTaskFailedCause::NonDeterministicError),
+        );
+        true
+    }
+
     fn fail_wft(&self, run_id: String, fail: Error, cause: Option<WorkflowTaskFailedCause>) {
         self.fail_wft_with_failure(run_id, fail.into(), cause);
     }
@@ -399,10 +427,7 @@ impl WorkflowFuture {
     ) -> Result<RoutinePollResult, Error> {
         let span = self.span.clone();
         let _guard = span.enter();
-        let tracked_waker = self
-            .wake_tracking
-            .as_ref()
-            .map(|tracker| tracker.new_per_poll_waker(cx.waker()));
+        let tracked_waker = self.tracked_waker(cx.waker());
         let waker = tracked_waker.as_ref().unwrap_or(cx.waker());
         match panic::catch_unwind(AssertUnwindSafe(|| {
             self.execution.poll_routine(routine_id, waker)
@@ -444,22 +469,7 @@ impl Future for WorkflowFuture {
                 return Err(WorkflowTermination::Evicted).into();
             }
 
-            if self
-                .wake_tracking
-                .as_mut()
-                .is_some_and(|t| t.take_non_sdk_wake())
-            {
-                self.fail_wft(
-                    run_id,
-                    anyhow!(
-                        "[TMPRL1100] Nondeterministic future detected: a waker was invoked by a \
-                         non-SDK source. This usually means workflow code is using nondeterministic \
-                         operations like tokio async functions or channels, other async libraries, \
-                         or std::thread. Use SDK-provided alternatives \
-                         (ctx.timer(), ctx.state_mut() + ctx.wait_condition(), etc.) instead."
-                    ),
-                    Some(WorkflowTaskFailedCause::NonDeterministicError),
-                );
+            if self.fail_on_non_sdk_wake(&run_id) {
                 continue 'activations;
             }
 
@@ -472,8 +482,10 @@ impl Future for WorkflowFuture {
                     }
                 };
 
+            let tracked_waker = self.tracked_waker(cx.waker());
+            let waker = tracked_waker.as_ref().unwrap_or(cx.waker());
             let activation_result = match panic::catch_unwind(AssertUnwindSafe(|| {
-                self.execution.activate(guest_activation)
+                self.execution.activate(guest_activation, waker)
             })) {
                 Ok(Ok(result)) => result,
                 Ok(Err(err)) => {
@@ -489,6 +501,9 @@ impl Future for WorkflowFuture {
                     continue 'activations;
                 }
             };
+            if self.fail_on_non_sdk_wake(&run_id) {
+                continue 'activations;
+            }
 
             if let Err(e) = self.process_activation_results(
                 job_contexts,
@@ -512,6 +527,9 @@ impl Future for WorkflowFuture {
                                 continue 'activations;
                             }
                         };
+                        if self.fail_on_non_sdk_wake(&run_id) {
+                            continue 'activations;
+                        }
                         pass_made_progress |= poll_result.made_progress;
                         match poll_result.completion {
                             None => still_active.push(routine_id),
@@ -564,6 +582,9 @@ impl Future for WorkflowFuture {
                             continue 'activations;
                         }
                     };
+                    if self.fail_on_non_sdk_wake(&run_id) {
+                        continue 'activations;
+                    }
                     pass_made_progress |= main_poll_result.made_progress;
 
                     match main_poll_result.completion {

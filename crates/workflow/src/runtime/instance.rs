@@ -932,7 +932,10 @@ where
     fn activate(
         &mut self,
         activation: WorkflowActivation,
+        waker: &Waker,
     ) -> Result<ActivationResult, WorkflowFailure> {
+        let base_ctx = self.base_ctx.clone();
+        let _waker_guard = base_ctx.enter_runtime_poll(waker);
         let is_replaying_history_events = activation.is_replaying
             && activation
                 .jobs
@@ -1001,6 +1004,8 @@ where
         routine_id: RoutineId,
         waker: &Waker,
     ) -> Result<RoutinePollResult, WorkflowFailure> {
+        let base_ctx = self.base_ctx.clone();
+        let _waker_guard = base_ctx.enter_runtime_poll(waker);
         let mut cx = Context::from_waker(waker);
         if routine_id == MAIN_ROUTINE_ID {
             return self.poll_main_routine(&mut cx);

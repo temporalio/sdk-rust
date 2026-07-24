@@ -91,7 +91,7 @@ impl wit_guest::GuestWorkflowInstance for ExportedWorkflowInstance {
     ) -> Result<wit_guest::ActivationResult, wit_guest::Failure> {
         self.0
             .borrow_mut()
-            .activate(decode_proto(activation))
+            .activate(decode_proto(activation), &noop_waker())
             .map(|result| wit_types::ActivationResult {
                 job_results: result
                     .job_results

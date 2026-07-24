@@ -257,6 +257,7 @@ impl WorkflowInstance for WasmWorkflowInstance {
     fn activate(
         &mut self,
         activation: WorkflowActivation,
+        _waker: &std::task::Waker,
     ) -> Result<ActivationResult, WorkflowFailure> {
         let result = self.guest.workflow_instance().call_activate(
             &mut self.store,
