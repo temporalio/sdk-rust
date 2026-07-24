@@ -979,8 +979,7 @@ async fn no_eager_activities_requested_when_worker_options_disable_it(
 #[tokio::test]
 async fn activity_tasks_from_completion_are_delivered() {
     // Construct the history - one task with 5 activities, 4 on the same task queue, and 1 on a
-    // different queue, 3 activities will be executed eagerly as specified by the
-    // MAX_EAGER_ACTIVITY_RESERVATIONS_PER_WORKFLOW_TASK constant.
+    // different queue. Two activities will be executed eagerly as configured below.
     let wfid = "fake_wf_id";
     let mut t = TestHistoryBuilder::default();
     t.add_by_type(EventType::WorkflowExecutionStarted);
@@ -1022,7 +1021,7 @@ async fn activity_tasks_from_completion_are_delivered() {
             num_eager_requested_clone.store(count, Ordering::Relaxed);
             Ok(RespondWorkflowTaskCompletedResponse {
                 workflow_task: None,
-                activity_tasks: (1..4)
+                activity_tasks: (1..3)
                     .map(|i| PollActivityTaskQueueResponse {
                         task_token: vec![i],
                         activity_id: format!("act_id_{i}_same_queue"),
@@ -1033,14 +1032,17 @@ async fn activity_tasks_from_completion_are_delivered() {
             })
         });
     mock.expect_complete_activity_task()
-        .times(3)
+        .times(2)
         .returning(|_, _| Ok(RespondActivityTaskCompletedResponse::default()));
     let act_tasks: Vec<QueueResponse<PollActivityTaskQueueResponse>> = vec![];
     let mut mh = MockPollCfg::from_resp_batches(wfid, t, [1], mock);
     mh.enforce_correct_number_of_polls = true;
     mh.activity_responses = Some(act_tasks);
     let mut mock = build_mock_pollers(mh);
-    mock.worker_cfg(|wc| wc.max_cached_workflows = 2);
+    mock.worker_cfg(|wc| {
+        wc.max_cached_workflows = 2;
+        wc.max_eager_activity_reservations_per_workflow_task = 2;
+    });
     let core = mock_worker(mock);
     let task_queue = core.get_config().task_queue.clone();
 
@@ -1086,8 +1088,8 @@ async fn activity_tasks_from_completion_are_delivered() {
     .await
     .unwrap();
 
-    // We should see the 3 eager activities when we poll now
-    for i in 1..4 {
+    // We should see the 2 eager activities when we poll now
+    for i in 1..3 {
         let act_task = core.poll_activity_task().await.unwrap();
         assert_eq!(act_task.task_token, vec![i]);
 
@@ -1101,8 +1103,8 @@ async fn activity_tasks_from_completion_are_delivered() {
 
     core.drain_pollers_and_shutdown().await;
 
-    // Verify only a single eager activity was scheduled (the one on our worker's task queue)
-    assert_eq!(num_eager_requested.load(Ordering::Relaxed), 3);
+    // Verify the configured number of eager activities were requested.
+    assert_eq!(num_eager_requested.load(Ordering::Relaxed), 2);
 }
 
 #[tokio::test]

@@ -245,12 +245,10 @@ pub struct WorkerOptions {
     /// would cause it to exceed this limit. Negative, zero, or NaN values will cause building
     /// the options to fail.
     pub max_worker_activities_per_second: Option<f64>,
-    /// Maximum number of eager activities that can be running concurrently. When nonzero, eager
-    /// activity execution will not be requested if it would cause the number of running eager
-    /// activities to exceed this value. The default of zero means unlimited and therefore only
-    /// bound by the activity slot supplier.
-    #[builder(default = 0)]
-    pub max_concurrent_eager_activity_execution_size: usize,
+    /// Maximum number of activity slots that may be reserved for eager execution when completing
+    /// a workflow task. The default is 3. Setting this to zero disables eager activity execution.
+    #[builder(default = 3)]
+    pub max_eager_activity_reservations_per_workflow_task: usize,
     /// Any error types listed here will cause any workflow being processed by this worker to fail,
     /// rather than simply failing the workflow task.
     #[builder(default)]
@@ -444,8 +442,8 @@ impl WorkerOptions {
             .default_heartbeat_throttle_interval(self.default_heartbeat_throttle_interval)
             .maybe_max_task_queue_activities_per_second(self.max_task_queue_activities_per_second)
             .maybe_max_worker_activities_per_second(self.max_worker_activities_per_second)
-            .max_concurrent_eager_activity_execution_size(
-                self.max_concurrent_eager_activity_execution_size,
+            .max_eager_activity_reservations_per_workflow_task(
+                self.max_eager_activity_reservations_per_workflow_task,
             )
             .maybe_graceful_shutdown_period(self.graceful_shutdown_period)
             .versioning_strategy(WorkerVersioningStrategy::WorkerDeploymentBased(
@@ -1426,13 +1424,13 @@ mod tests {
     }
 
     #[test]
-    fn max_concurrent_eager_activity_execution_size_propagates() {
+    fn max_eager_activity_reservations_per_workflow_task_propagates() {
         let config = WorkerOptions::new("task_q")
             .task_types(WorkerTaskTypes::activity_only())
-            .max_concurrent_eager_activity_execution_size(7)
+            .max_eager_activity_reservations_per_workflow_task(7)
             .build()
             .to_core_options("ns".into(), String::new())
             .unwrap();
-        assert_eq!(config.max_concurrent_eager_activity_execution_size, 7);
+        assert_eq!(config.max_eager_activity_reservations_per_workflow_task, 7);
     }
 }

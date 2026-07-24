@@ -108,7 +108,6 @@ pub const LEGACY_QUERY_ID: &str = "legacy_query";
 /// What percentage of a WFT timeout we are willing to wait before sending a WFT heartbeat when
 /// necessary.
 const WFT_HEARTBEAT_TIMEOUT_FRACTION: f32 = 0.8;
-const MAX_EAGER_ACTIVITY_RESERVATIONS_PER_WORKFLOW_TASK: usize = 3;
 
 type Result<T, E = WFMachinesError> = result::Result<T, E>;
 type BoxedActivationStream = BoxStream<'static, Result<ActivationOrAuto, PollError>>;
@@ -130,6 +129,8 @@ pub(crate) struct Workflows {
     sticky_attrs: Option<StickyExecutionAttributes>,
     /// If set, can be used to reserve activity task slots for eager-return of new activity tasks.
     activity_tasks_handle: Option<ActivitiesFromWFTsHandle>,
+    /// Maximum number of activity slots to reserve for eager execution per workflow task.
+    max_eager_activity_reservations_per_workflow_task: usize,
     /// Ensures we stay at or below this worker's maximum concurrent workflow task limit
     wft_semaphore: MeteredPermitDealer<WorkflowSlotKind>,
     local_act_mgr: Option<Arc<LocalActivityManager>>,
@@ -177,6 +178,9 @@ impl Workflows {
         let (fetch_tx, fetch_rx) = unbounded_channel();
         let shutdown_tok = basics.shutdown_token.clone();
         let task_queue = basics.worker_config.task_queue.clone();
+        let max_eager_activity_reservations_per_workflow_task = basics
+            .worker_config
+            .max_eager_activity_reservations_per_workflow_task;
         let default_versioning_behavior = basics.default_versioning_behavior;
         let extracted_wft_stream = WFTExtractor::build(
             client.clone(),
@@ -264,6 +268,7 @@ impl Workflows {
             client,
             sticky_attrs,
             activity_tasks_handle,
+            max_eager_activity_reservations_per_workflow_task,
             wft_semaphore,
             local_act_mgr,
             ever_polled: AtomicBool::new(false),
@@ -826,7 +831,7 @@ impl Workflows {
                         .map(|q| q.name == self.task_queue)
                         .unwrap_or_default();
                     if same_task_queue
-                        && reserved.len() < MAX_EAGER_ACTIVITY_RESERVATIONS_PER_WORKFLOW_TASK
+                        && reserved.len() < self.max_eager_activity_reservations_per_workflow_task
                     {
                         if let Some(p) = self
                             .activity_tasks_handle
@@ -1761,8 +1766,10 @@ fn make_payloads_too_large_failure(violation: &PayloadLimitViolation) -> Failure
 mod tests {
     use super::*;
     use itertools::Itertools;
-    use temporalio_common::payload_limits::{LimitClass, LimitSeverity};
-    use temporalio_common::protos::coresdk::workflow_activation::SignalWorkflow;
+    use temporalio_common::{
+        payload_limits::{LimitClass, LimitSeverity},
+        protos::coresdk::workflow_activation::SignalWorkflow,
+    };
 
     #[test]
     fn payloads_too_large_wft_failure_is_retryable() {

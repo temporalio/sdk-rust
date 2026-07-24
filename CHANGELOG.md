@@ -58,8 +58,8 @@ to docs, or any other relevant information.
 ## [Unreleased]
 
 ### Added
-* Workers can limit concurrent eager activity execution with
-  `WorkerOptions::max_concurrent_eager_activity_execution_size`.
+* Workers can configure the maximum number of activity slots reserved for eager execution per
+  workflow task with `WorkerOptions::max_eager_activity_reservations_per_workflow_task`.
 * Schedule descriptions now expose their configured action via `ScheduleDescription::action()`,
   including start-workflow accessors for workflow type, task queue, workflow ID, raw argument
   payloads, and typed argument decoding through the client's data converter.

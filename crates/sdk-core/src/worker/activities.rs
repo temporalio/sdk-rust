@@ -56,7 +56,7 @@ use temporalio_common::{
 use tokio::{
     join,
     sync::{
-        Mutex, Notify, Semaphore,
+        Mutex, Notify,
         mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel},
     },
     task::JoinHandle,
@@ -159,7 +159,6 @@ pub(crate) struct WorkerActivityTasks {
     /// semaphore is used to limit eager activities but shares the same underlying
     /// [MeteredPermitDealer] that is used to limit the concurrency for non-eager activities.
     eager_activities_semaphore: Arc<ClosableMeteredPermitDealer<ActivitySlotKind>>,
-    eager_activity_limit_semaphore: Option<Arc<Semaphore>>,
     /// Holds activity tasks we have received in direct response to workflow task completion (a.k.a
     /// eager activities). Tasks received in this stream hold a "tracked" permit that is issued by
     /// the `eager_activities_semaphore`.
@@ -196,7 +195,6 @@ impl WorkerActivityTasks {
         metrics: MetricsContext,
         max_heartbeat_throttle_interval: Duration,
         default_heartbeat_throttle_interval: Duration,
-        max_concurrent_eager_activity_execution_size: usize,
         graceful_shutdown: Option<Duration>,
         local_timeout_buffer: Duration,
     ) -> Self {
@@ -206,8 +204,6 @@ impl WorkerActivityTasks {
             new_activity_task_poller(poller, metrics.clone(), shutdown_initiated_token.clone());
         let (eager_activities_tx, eager_activities_rx) = unbounded_channel();
         let eager_activities_semaphore = ClosableMeteredPermitDealer::new_arc(Arc::new(semaphore));
-        let eager_activity_limit_semaphore = (max_concurrent_eager_activity_execution_size > 0)
-            .then(|| Arc::new(Semaphore::new(max_concurrent_eager_activity_execution_size)));
 
         let start_tasks_stream_complete = CancellationToken::new();
         let starts_stream = Self::merge_start_task_sources(
@@ -245,7 +241,6 @@ impl WorkerActivityTasks {
             heartbeat_manager,
             activity_task_stream: Mutex::new(activity_task_stream.boxed()),
             eager_activities_semaphore,
-            eager_activity_limit_semaphore,
             complete_notify,
             metrics,
             max_heartbeat_throttle_interval,
@@ -521,7 +516,6 @@ impl WorkerActivityTasks {
     pub(crate) fn get_handle_for_workflows(&self) -> ActivitiesFromWFTsHandle {
         ActivitiesFromWFTsHandle {
             sem: self.eager_activities_semaphore.clone(),
-            eager_activity_limit_sem: self.eager_activity_limit_semaphore.clone(),
             tx: self.eager_activities_tx.clone(),
         }
     }
@@ -756,7 +750,6 @@ where
 /// Allows for the handling of activities returned by WFT completions.
 pub(crate) struct ActivitiesFromWFTsHandle {
     sem: Arc<ClosableMeteredPermitDealer<ActivitySlotKind>>,
-    eager_activity_limit_sem: Option<Arc<Semaphore>>,
     tx: UnboundedSender<TrackedPermittedTqResp<PollActivityTaskQueueResponse>>,
 }
 
@@ -765,17 +758,7 @@ impl ActivitiesFromWFTsHandle {
     /// dispatch of an activity to this worker upon workflow task completion
     pub(crate) fn reserve_slot(&self) -> Option<TrackedOwnedMeteredSemPermit<ActivitySlotKind>> {
         // TODO: check if rate limit is not exceeded and count this reservation towards the rate limit
-        let eager_activity_permit = self
-            .eager_activity_limit_sem
-            .as_ref()
-            .map(|sem| sem.clone().try_acquire_owned())
-            .transpose()
-            .ok()?;
-        let permit = self.sem.try_acquire_owned().ok()?;
-        Some(match eager_activity_permit {
-            Some(eager_activity_permit) => permit.with_eager_activity_permit(eager_activity_permit),
-            None => permit,
-        })
+        self.sem.try_acquire_owned().ok()
     }
 
     /// Queue new activity tasks for dispatch received from non-polling sources (ex: eager returns
@@ -959,28 +942,9 @@ mod tests {
             MetricsContext::no_op(),
             Duration::from_secs(1),
             Duration::from_secs(1),
-            0,
             None,
             local_timeout_buffer,
         )
-    }
-
-    #[test]
-    fn eager_activity_limit_is_enforced_until_permit_release() {
-        let sem = fixed_size_permit_dealer(10);
-        let (tx, _rx) = unbounded_channel();
-        let handle = ActivitiesFromWFTsHandle {
-            sem: ClosableMeteredPermitDealer::new_arc(Arc::new(sem)),
-            eager_activity_limit_sem: Some(Arc::new(Semaphore::new(2))),
-            tx,
-        };
-
-        let first = handle.reserve_slot().expect("first reservation");
-        let _second = handle.reserve_slot().expect("second reservation");
-        assert!(handle.reserve_slot().is_none());
-
-        drop(first);
-        assert!(handle.reserve_slot().is_some());
     }
 
     // Confirms that a repeatedly-resetting heartbeat timer does not
@@ -1065,7 +1029,6 @@ mod tests {
             MetricsContext::no_op(),
             Duration::from_secs(1),
             Duration::from_secs(1),
-            0,
             None,
             Duration::from_secs(5),
         );
