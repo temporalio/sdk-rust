@@ -119,10 +119,18 @@ pub enum RoutineCompletion {
     Update(UpdateRoutineCompletion),
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RoutinePendingState {
+    Handler,
+    Interceptor,
+    InterceptorWithActivation,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct RoutinePollResult {
     pub completion: Option<RoutineCompletion>,
     pub made_progress: bool,
+    pub pending_state: Option<RoutinePendingState>,
 }
 
 pub type WorkflowFailure = Box<Failure>;

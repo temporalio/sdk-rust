@@ -3,15 +3,16 @@
 use crate::{
     BaseWorkflowContext, WorkflowContext, WorkflowContextView,
     runtime::{
-        ConstructionBlockedFuture,
+        InterceptedFuturePollGuard, InterceptedFuturePollKind, InterceptedFutureState,
+        InterceptedFutureStatus,
         entry::{WorkflowError, WorkflowImplementation},
         guest::WorkflowInstance,
         model::{TimerResult, UnblockEvent, WorkflowTermination},
         types::{
             ActivationJobResult, ActivationResult, MAIN_ROUTINE_ID, MainRoutineCompletion,
-            QueryResponse, RoutineCompletion, RoutineId, RoutineKind, RoutinePollResult,
-            StartedRoutine, UpdateRoutineCompletion, UpdateRoutineKind, WorkflowActivation,
-            WorkflowFailure,
+            QueryResponse, RoutineCompletion, RoutineId, RoutineKind, RoutinePendingState,
+            RoutinePollResult, StartedRoutine, UpdateRoutineCompletion, UpdateRoutineKind,
+            WorkflowActivation, WorkflowFailure,
         },
     },
     workflow_interceptors::{
@@ -31,7 +32,8 @@ use std::{
     any::Any,
     cell::RefCell,
     collections::HashMap,
-    future::ready,
+    future::{Future, ready},
+    pin::Pin,
     rc::Rc,
     sync::Arc,
     task::{Context, Poll, Waker},
@@ -58,7 +60,7 @@ use temporalio_common_wasm::{
 pub struct GuestWorkflowInstance<W: WorkflowImplementation> {
     base_ctx: BaseWorkflowContext,
     ctx: WorkflowContext<W>,
-    run_future: Fuse<LocalBoxFuture<'static, ExecuteWorkflowResult>>,
+    run_future: InterceptedFuture<ExecuteWorkflowResult>,
     interceptors: Vec<Arc<dyn WorkflowInterceptor>>,
     main_construction_polled: bool,
     next_routine_id: RoutineId,
@@ -67,12 +69,95 @@ pub struct GuestWorkflowInstance<W: WorkflowImplementation> {
 
 enum GuestRoutine {
     Signal {
-        future: LocalBoxFuture<'static, HandleSignalResult>,
+        future: InterceptedFuture<HandleSignalResult>,
     },
     Update {
         protocol_instance_id: String,
-        future: LocalBoxFuture<'static, HandleUpdateResult>,
+        future: InterceptedFuture<HandleUpdateResult>,
     },
+}
+
+struct InterceptedFuture<T> {
+    inner: Fuse<LocalBoxFuture<'static, T>>,
+    status: InterceptedFutureStatus,
+}
+
+impl<T> InterceptedFuture<T> {
+    fn new(inner: LocalBoxFuture<'static, T>, status: InterceptedFutureStatus) -> Self {
+        Self {
+            inner: inner.fuse(),
+            status,
+        }
+    }
+
+    fn ready(value: T) -> Self
+    where
+        T: 'static,
+    {
+        Self::new(ready(value).boxed_local(), InterceptedFutureStatus::new())
+    }
+
+    fn pending_state(&self) -> RoutinePendingState {
+        match self.status.state() {
+            InterceptedFutureState::Interceptor => RoutinePendingState::Interceptor,
+            InterceptedFutureState::InterceptorWithActivation => {
+                RoutinePendingState::InterceptorWithActivation
+            }
+            InterceptedFutureState::Handler => RoutinePendingState::Handler,
+        }
+    }
+
+    fn poll_for_construction(&mut self, cx: &mut Context<'_>) -> Poll<T> {
+        self.poll_with_kind(cx, InterceptedFuturePollKind::Construction)
+    }
+
+    fn poll_with_kind(
+        &mut self,
+        cx: &mut Context<'_>,
+        poll_kind: InterceptedFuturePollKind,
+    ) -> Poll<T> {
+        self.status.reset_for_poll();
+        let _guard = InterceptedFuturePollGuard::new(self.status.clone(), poll_kind);
+        self.inner.poll_unpin(cx)
+    }
+}
+
+impl<T> Future for InterceptedFuture<T> {
+    type Output = T;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        self.poll_with_kind(cx, InterceptedFuturePollKind::Routine)
+    }
+}
+
+struct HandlerBoundaryFuture<F> {
+    inner: F,
+    status: InterceptedFutureStatus,
+}
+
+impl<F> HandlerBoundaryFuture<F> {
+    fn new(inner: F, status: InterceptedFutureStatus) -> Self {
+        Self { inner, status }
+    }
+}
+
+impl<F: Future + Unpin> Future for HandlerBoundaryFuture<F> {
+    type Output = F::Output;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        self.status.mark_handler();
+        if self.status.poll_kind() == InterceptedFuturePollKind::Construction
+            && !self.status.handler_result_ready()
+        {
+            return Poll::Pending;
+        }
+        Pin::new(&mut self.inner).poll(cx)
+    }
+}
+
+enum ConstructionPoll<T> {
+    Ready(T),
+    Pending,
 }
 
 enum RoutinePollState<T> {
@@ -86,6 +171,7 @@ enum RoutinePollState<T> {
     },
     Stalled {
         made_progress: bool,
+        pending_state: RoutinePendingState,
     },
 }
 
@@ -176,39 +262,37 @@ fn intercepted_execute_future<W>(
     run_input: Option<<W::Run as WorkflowDefinition>::Input>,
     headers: HashMap<String, Payload>,
     interceptors: Vec<Arc<dyn WorkflowInterceptor>>,
-) -> LocalBoxFuture<'static, ExecuteWorkflowResult>
+) -> InterceptedFuture<ExecuteWorkflowResult>
 where
     W: WorkflowImplementation,
     <W::Run as WorkflowDefinition>::Input: Send,
 {
-    async move {
+    let status = InterceptedFutureStatus::new();
+    let handler_status = status.clone();
+    let future = async move {
         let input = ExecuteWorkflowInput::new(
             run_input.map(|input| Box::new(input) as Box<dyn Any>),
             headers,
         );
-        let handler_base_ctx = base_ctx.clone();
         let interceptor_ctx = WorkflowInterceptorContext::new(base_ctx);
         let next = WorkflowNext::new(move |input: ExecuteWorkflowInput| {
             let (input, headers) = input.into_parts();
-            let run_input = match input {
+            let handler: LocalBoxFuture<'static, ExecuteWorkflowResult> = match input {
                 Some(input) => match input.downcast::<<W::Run as WorkflowDefinition>::Input>() {
-                    Ok(input) => Some(*input),
+                    Ok(input) => W::run(ctx.with_headers(headers), Some(*input)),
                     Err(_) => {
-                        return WorkflowInterceptorFuture::new(ready(Err(
-                            wrong_workflow_input_type(W::name()),
-                        )));
+                        handler_status.mark_handler_result_ready();
+                        ready(Err(wrong_workflow_input_type(W::name()))).boxed_local()
                     }
                 },
-                None => None,
+                None => W::run(ctx.with_headers(headers), None),
             };
-            WorkflowInterceptorFuture::new(ConstructionBlockedFuture::new(
-                handler_base_ctx,
-                W::run(ctx.with_headers(headers), run_input),
-            ))
+            WorkflowInterceptorFuture::new(HandlerBoundaryFuture::new(handler, handler_status))
         });
         call_execute_workflow(&interceptors, interceptor_ctx, input, next).await
     }
-    .boxed_local()
+    .boxed_local();
+    InterceptedFuture::new(future, status)
 }
 
 fn intercepted_signal_future<W>(
@@ -216,23 +300,25 @@ fn intercepted_signal_future<W>(
     base_ctx: BaseWorkflowContext,
     interceptors: Vec<Arc<dyn WorkflowInterceptor>>,
     input: HandleSignalInput,
-) -> LocalBoxFuture<'static, HandleSignalResult>
+) -> InterceptedFuture<HandleSignalResult>
 where
     W: WorkflowImplementation,
 {
-    async move {
+    let status = InterceptedFutureStatus::new();
+    let handler_status = status.clone();
+    let future = async move {
         let interceptor_ctx = WorkflowInterceptorContext::new(base_ctx);
         let next = WorkflowNext::new(move |input: HandleSignalInput| {
             let (name, input, headers) = input.into_parts();
-            WorkflowInterceptorFuture::new(W::dispatch_signal(
-                ctx.with_headers(headers),
-                &name,
-                input,
+            WorkflowInterceptorFuture::new(HandlerBoundaryFuture::new(
+                W::dispatch_signal(ctx.with_headers(headers), &name, input),
+                handler_status,
             ))
         });
         call_handle_signal(&interceptors, interceptor_ctx, input, next).await
     }
-    .boxed_local()
+    .boxed_local();
+    InterceptedFuture::new(future, status)
 }
 
 fn intercepted_update_future<W>(
@@ -240,23 +326,25 @@ fn intercepted_update_future<W>(
     base_ctx: BaseWorkflowContext,
     interceptors: Vec<Arc<dyn WorkflowInterceptor>>,
     input: HandleUpdateInput,
-) -> LocalBoxFuture<'static, HandleUpdateResult>
+) -> InterceptedFuture<HandleUpdateResult>
 where
     W: WorkflowImplementation,
 {
-    async move {
+    let status = InterceptedFutureStatus::new();
+    let handler_status = status.clone();
+    let future = async move {
         let interceptor_ctx = WorkflowInterceptorContext::new(base_ctx);
         let next = WorkflowNext::new(move |input: HandleUpdateInput| {
             let (name, input, headers) = input.into_parts();
-            WorkflowInterceptorFuture::new(W::dispatch_update(
-                ctx.with_headers(headers),
-                &name,
-                input,
+            WorkflowInterceptorFuture::new(HandlerBoundaryFuture::new(
+                W::dispatch_update(ctx.with_headers(headers), &name, input),
+                handler_status,
             ))
         });
         call_handle_update(&interceptors, interceptor_ctx, input, next).await
     }
-    .boxed_local()
+    .boxed_local();
+    InterceptedFuture::new(future, status)
 }
 
 impl<W: WorkflowImplementation> GuestWorkflowInstance<W>
@@ -390,8 +478,7 @@ where
             run_input,
             headers,
             interceptors.clone(),
-        )
-        .fuse();
+        );
         Self {
             base_ctx,
             ctx,
@@ -464,28 +551,25 @@ where
         id
     }
 
-    fn poll_for_construction<F: Future + Unpin>(
+    fn poll_for_construction<T>(
         base_ctx: &BaseWorkflowContext,
-        future: &mut F,
-    ) -> Result<Option<F::Output>, WorkflowFailure> {
+        future: &mut InterceptedFuture<T>,
+    ) -> Result<ConstructionPoll<T>, WorkflowFailure> {
         if let Some(failure) = Self::take_forced_wft_failure(base_ctx) {
             return Err(failure);
         }
 
         let waker = base_ctx.construction_waker();
         let mut cx = Context::from_waker(&waker);
-        let poll = {
-            let _guard = base_ctx.enter_construction_poll();
-            future.poll_unpin(&mut cx)
-        };
+        let poll = future.poll_for_construction(&mut cx);
 
         if let Some(failure) = Self::take_forced_wft_failure(base_ctx) {
             return Err(failure);
         }
 
         match poll {
-            Poll::Ready(result) => Ok(Some(result)),
-            Poll::Pending => Ok(None),
+            Poll::Ready(result) => Ok(ConstructionPoll::Ready(result)),
+            Poll::Pending => Ok(ConstructionPoll::Pending),
         }
     }
 
@@ -516,12 +600,14 @@ where
                     self.interceptors.clone(),
                     input,
                 );
-                if let Some(result) = Self::poll_for_construction(&self.base_ctx, &mut future)? {
-                    future = ready(result).boxed_local();
+                if let ConstructionPoll::Ready(result) =
+                    Self::poll_for_construction(&self.base_ctx, &mut future)?
+                {
+                    future = InterceptedFuture::ready(result);
                 }
                 future
             }
-            Err(err) => ready(Err(err)).boxed_local(),
+            Err(err) => InterceptedFuture::ready(Err(err)),
             Ok(None) => return Ok(ActivationJobResult::None),
         };
         let routine_id = self.next_routine_id();
@@ -608,12 +694,14 @@ where
                     self.interceptors.clone(),
                     input,
                 );
-                if let Some(result) = Self::poll_for_construction(&self.base_ctx, &mut future)? {
-                    future = ready(result).boxed_local();
+                if let ConstructionPoll::Ready(result) =
+                    Self::poll_for_construction(&self.base_ctx, &mut future)?
+                {
+                    future = InterceptedFuture::ready(result);
                 }
                 future
             }
-            Err(err) => ready(Err(err)).boxed_local(),
+            Err(err) => InterceptedFuture::ready(Err(err)),
             Ok(None) => {
                 return Ok(self.rejection_for_missing_update_handler(name));
             }
@@ -752,11 +840,11 @@ where
         }
     }
 
-    fn poll_routine_loop<F: Future + Unpin>(
+    fn poll_routine_loop<T>(
         base_ctx: &BaseWorkflowContext,
         cx: &mut Context<'_>,
-        future: &mut F,
-    ) -> RoutinePollState<F::Output> {
+        future: &mut InterceptedFuture<T>,
+    ) -> RoutinePollState<T> {
         base_ctx.take_state_mutated();
         base_ctx.take_runtime_progress();
         let mut made_progress = false;
@@ -798,7 +886,10 @@ where
                     let runtime_progress = base_ctx.take_runtime_progress();
                     made_progress |= state_mutated || runtime_progress;
                     if !(state_mutated || runtime_progress) {
-                        return RoutinePollState::Stalled { made_progress };
+                        return RoutinePollState::Stalled {
+                            made_progress,
+                            pending_state: future.pending_state(),
+                        };
                     }
                 }
             }
@@ -819,6 +910,7 @@ where
                         Box::new(self.terminal_outcome_from_result(result)),
                     ))),
                     made_progress,
+                    pending_state: None,
                 },
                 RoutinePollState::ForcedFailure {
                     failure,
@@ -831,10 +923,15 @@ where
                         },
                     ))),
                     made_progress,
+                    pending_state: None,
                 },
-                RoutinePollState::Stalled { made_progress } => RoutinePollResult {
+                RoutinePollState::Stalled {
+                    made_progress,
+                    pending_state,
+                } => RoutinePollResult {
                     completion: Some(RoutineCompletion::Main(MainRoutineCompletion::Blocked)),
                     made_progress,
+                    pending_state: Some(pending_state),
                 },
             },
         )
@@ -843,7 +940,7 @@ where
     fn poll_signal_routine(
         &mut self,
         routine_id: RoutineId,
-        mut future: LocalBoxFuture<'static, HandleSignalResult>,
+        mut future: InterceptedFuture<HandleSignalResult>,
         cx: &mut Context<'_>,
     ) -> Result<RoutinePollResult, WorkflowFailure> {
         match Self::poll_routine_loop(&self.base_ctx, cx, &mut future) {
@@ -855,15 +952,20 @@ where
                 Ok(RoutinePollResult {
                     completion: Some(RoutineCompletion::Signal(result)),
                     made_progress,
+                    pending_state: None,
                 })
             }
             RoutinePollState::ForcedFailure { failure, .. } => Err(failure),
-            RoutinePollState::Stalled { made_progress } => {
+            RoutinePollState::Stalled {
+                made_progress,
+                pending_state,
+            } => {
                 self.routines
                     .insert(routine_id, GuestRoutine::Signal { future });
                 Ok(RoutinePollResult {
                     completion: None,
                     made_progress,
+                    pending_state: Some(pending_state),
                 })
             }
         }
@@ -873,7 +975,7 @@ where
         &mut self,
         routine_id: RoutineId,
         protocol_instance_id: String,
-        mut future: LocalBoxFuture<'static, HandleUpdateResult>,
+        mut future: InterceptedFuture<HandleUpdateResult>,
         cx: &mut Context<'_>,
     ) -> Result<RoutinePollResult, WorkflowFailure> {
         match Self::poll_routine_loop(&self.base_ctx, cx, &mut future) {
@@ -905,10 +1007,14 @@ where
                 Ok(RoutinePollResult {
                     completion: Some(RoutineCompletion::Update(completion)),
                     made_progress,
+                    pending_state: None,
                 })
             }
             RoutinePollState::ForcedFailure { failure, .. } => Err(failure),
-            RoutinePollState::Stalled { made_progress } => {
+            RoutinePollState::Stalled {
+                made_progress,
+                pending_state,
+            } => {
                 self.routines.insert(
                     routine_id,
                     GuestRoutine::Update {
@@ -919,6 +1025,7 @@ where
                 Ok(RoutinePollResult {
                     completion: None,
                     made_progress,
+                    pending_state: Some(pending_state),
                 })
             }
         }
@@ -948,10 +1055,10 @@ where
             let result = match job.variant {
                 Some(ActivationVariant::InitializeWorkflow(_)) => {
                     if !self.main_construction_polled {
-                        if let Some(result) =
+                        if let ConstructionPoll::Ready(result) =
                             Self::poll_for_construction(&self.base_ctx, &mut self.run_future)?
                         {
-                            self.run_future = ready(result).boxed_local().fuse();
+                            self.run_future = InterceptedFuture::ready(result);
                         }
                         self.main_construction_polled = true;
                     }
@@ -1091,6 +1198,7 @@ mod tests {
     use super::*;
     use crate::runtime::host::WorkflowHost;
     use std::{
+        cell::Cell,
         rc::Rc,
         sync::atomic::{AtomicUsize, Ordering},
         task::Waker,
@@ -1165,6 +1273,133 @@ mod tests {
             self.calls.fetch_add(1, Ordering::Relaxed);
             next.run(input)
         }
+    }
+
+    #[test]
+    fn intercepted_future_reports_interceptor_pending() {
+        let status = InterceptedFutureStatus::new();
+        let mut future = InterceptedFuture::new(std::future::pending::<()>().boxed_local(), status);
+        let mut cx = Context::from_waker(Waker::noop());
+
+        assert!(future.poll_unpin(&mut cx).is_pending());
+        assert_eq!(future.pending_state(), RoutinePendingState::Interceptor);
+    }
+
+    #[test]
+    fn intercepted_future_reports_sdk_activation() {
+        let status = InterceptedFutureStatus::new();
+        let inner = std::future::poll_fn(|_| {
+            crate::runtime::mark_intercepted_future_activation();
+            Poll::<()>::Pending
+        });
+        let mut future = InterceptedFuture::new(inner.boxed_local(), status);
+        let mut cx = Context::from_waker(Waker::noop());
+
+        assert!(future.poll_unpin(&mut cx).is_pending());
+        assert_eq!(
+            future.pending_state(),
+            RoutinePendingState::InterceptorWithActivation
+        );
+    }
+
+    #[test]
+    fn intercepted_future_reports_polled_handler_boundary() {
+        let status = InterceptedFutureStatus::new();
+        let boundary = HandlerBoundaryFuture::new(std::future::pending::<()>(), status.clone());
+        let mut future = InterceptedFuture::new(boundary.boxed_local(), status);
+        let mut cx = Context::from_waker(Waker::noop());
+
+        assert!(future.poll_unpin(&mut cx).is_pending());
+        assert_eq!(future.pending_state(), RoutinePendingState::Handler);
+    }
+
+    #[test]
+    fn construction_poll_stops_at_async_handler_boundary() {
+        let status = InterceptedFutureStatus::new();
+        let polls = Rc::new(Cell::new(0));
+        let poll_count = polls.clone();
+        let inner = std::future::poll_fn(move |_| {
+            poll_count.set(poll_count.get() + 1);
+            Poll::Ready(42)
+        });
+        let boundary = HandlerBoundaryFuture::new(inner, status.clone());
+        let mut future = InterceptedFuture::new(boundary.boxed_local(), status);
+        let mut cx = Context::from_waker(Waker::noop());
+
+        assert_eq!(future.poll_for_construction(&mut cx), Poll::Pending);
+        assert_eq!(polls.get(), 0);
+        assert_eq!(future.poll_unpin(&mut cx), Poll::Ready(42));
+        assert_eq!(polls.get(), 1);
+    }
+
+    #[test]
+    fn construction_poll_drives_ready_handler_result() {
+        let status = InterceptedFutureStatus::new();
+        let boundary_status = status.clone();
+        let polls = Rc::new(Cell::new(0));
+        let poll_count = polls.clone();
+        let inner = async move {
+            crate::runtime::mark_intercepted_handler_ready();
+            HandlerBoundaryFuture::new(
+                std::future::poll_fn(move |_| {
+                    poll_count.set(poll_count.get() + 1);
+                    Poll::Ready(42)
+                }),
+                boundary_status,
+            )
+            .await
+        };
+        let mut future = InterceptedFuture::new(inner.boxed_local(), status);
+        let mut cx = Context::from_waker(Waker::noop());
+
+        assert_eq!(future.poll_for_construction(&mut cx), Poll::Ready(42));
+        assert_eq!(polls.get(), 1);
+    }
+
+    #[test]
+    fn handler_boundary_first_reached_during_routine_poll_does_not_block() {
+        let status = InterceptedFutureStatus::new();
+        let boundary_status = status.clone();
+        let first_poll = Rc::new(Cell::new(true));
+        let defer = first_poll.clone();
+        let inner = async move {
+            std::future::poll_fn(move |_| {
+                if defer.replace(false) {
+                    Poll::Pending
+                } else {
+                    Poll::Ready(())
+                }
+            })
+            .await;
+            HandlerBoundaryFuture::new(ready(42), boundary_status).await
+        };
+        let mut future = InterceptedFuture::new(inner.boxed_local(), status);
+        let mut cx = Context::from_waker(Waker::noop());
+
+        assert_eq!(future.poll_for_construction(&mut cx), Poll::Pending);
+        assert_eq!(future.poll_unpin(&mut cx), Poll::Ready(42));
+    }
+
+    #[test]
+    fn construction_poll_kind_is_restored_after_panic() {
+        let status = InterceptedFutureStatus::new();
+        let polled_status = status.clone();
+        let inner = std::future::poll_fn(move |_| -> Poll<()> {
+            assert_eq!(
+                polled_status.poll_kind(),
+                InterceptedFuturePollKind::Construction
+            );
+            panic!("test panic");
+        });
+        let mut future = InterceptedFuture::new(inner.boxed_local(), status.clone());
+        let mut cx = Context::from_waker(Waker::noop());
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            future.poll_for_construction(&mut cx)
+        }));
+
+        assert!(result.is_err());
+        assert_eq!(status.poll_kind(), InterceptedFuturePollKind::Routine);
     }
 
     #[test]

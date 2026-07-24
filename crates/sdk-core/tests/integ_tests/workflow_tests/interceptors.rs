@@ -655,6 +655,10 @@ enum ConstructionWakePoint {
 
 struct ConstructionWakeInterceptor {
     wake_point: ConstructionWakePoint,
+    // Only inject a sleep on first attempt so if ND future detection is enabled
+    // we succeed the wft on next attempt.
+    attempts: Arc<AtomicUsize>,
+    tx: Option<tokio::sync::mpsc::Sender<()>>,
 }
 
 impl WorkflowInterceptor for ConstructionWakeInterceptor {
@@ -671,8 +675,11 @@ impl WorkflowInterceptor for ConstructionWakeInterceptor {
         if self.wake_point != ConstructionWakePoint::Execute {
             return next.run(input);
         }
+        let should_sleep = self.attempts.fetch_add(1, Ordering::Relaxed) == 0;
         WorkflowInterceptorFuture::new(async move {
-            tokio::time::sleep(Duration::from_millis(1)).await;
+            if should_sleep {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
             next.run(input).await
         })
     }
@@ -690,9 +697,19 @@ impl WorkflowInterceptor for ConstructionWakeInterceptor {
         if self.wake_point != ConstructionWakePoint::Signal {
             return next.run(input);
         }
+        let attempts = self.attempts.fetch_add(1, Ordering::Relaxed);
+        let tx = self.tx.clone();
         WorkflowInterceptorFuture::new(async move {
-            tokio::time::sleep(Duration::from_millis(1)).await;
-            next.run(input).await
+            if attempts < 1 {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+            let result = next.run(input).await;
+            if attempts < 2 {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                tx.unwrap().send(()).await;
+                println!("finished send")
+            }
+            result
         })
     }
 
@@ -709,8 +726,11 @@ impl WorkflowInterceptor for ConstructionWakeInterceptor {
         if self.wake_point != ConstructionWakePoint::Update {
             return next.run(input);
         }
+        let should_sleep = self.attempts.fetch_add(1, Ordering::Relaxed) == 0;
         WorkflowInterceptorFuture::new(async move {
-            tokio::time::sleep(Duration::from_millis(1)).await;
+            if should_sleep {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
             next.run(input).await
         })
     }
@@ -734,6 +754,64 @@ fn nondeterministic_future_failure_count(history: &History) -> usize {
         .count()
 }
 
+struct SdkTimerBeforeNextInterceptor;
+
+impl WorkflowInterceptor for SdkTimerBeforeNextInterceptor {
+    fn execute<'a>(
+        &'a self,
+        ctx: WorkflowInterceptorContext,
+        input: ExecuteWorkflowInput,
+        next: WorkflowNext<
+            'a,
+            ExecuteWorkflowInput,
+            WorkflowInterceptorFuture<'a, ExecuteWorkflowResult>,
+        >,
+    ) -> WorkflowInterceptorFuture<'a, ExecuteWorkflowResult> {
+        WorkflowInterceptorFuture::new(async move {
+            ctx.timer(Duration::from_millis(1)).await;
+            next.run(input).await
+        })
+    }
+}
+
+#[tokio::test]
+async fn sdk_future_before_next_produces_an_activation() {
+    let mut starter = CoreWfStarter::new("sdk_future_before_next_produces_an_activation");
+    starter.sdk_config.task_types = WorkerTaskTypes::workflow_only();
+    let mut worker = starter.worker().await;
+    worker
+        .register_workflow::<ConstructionWakeWorkflow>()
+        .unwrap();
+    worker
+        .inner_mut()
+        .register_workflow_interceptors(vec![WorkflowInterceptorConstructor::new(|_| {
+            SdkTimerBeforeNextInterceptor
+        })]);
+
+    let handle = worker
+        .submit_workflow(
+            ConstructionWakeWorkflow::run,
+            (),
+            WorkflowStartOptions::new(
+                starter.get_task_queue().to_owned(),
+                starter.get_wf_id().to_owned(),
+            )
+            .build(),
+        )
+        .await
+        .unwrap();
+
+    let (result, worker_result) = join!(
+        handle.get_result(Default::default()),
+        worker.run_until_done()
+    );
+    result.unwrap();
+    worker_result.unwrap();
+
+    let history = starter.get_history().await;
+    assert_eq!(nondeterministic_future_failure_count(&history), 0);
+}
+
 #[rstest::rstest]
 #[case::enabled(true)]
 #[case::disabled(false)]
@@ -751,11 +829,15 @@ async fn nondeterministic_future_detection_is_respected_for_interceptors(
     worker
         .register_workflow::<ConstructionWakeWorkflow>()
         .unwrap();
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let interceptor_attempts = attempts.clone();
     worker
         .inner_mut()
         .register_workflow_interceptors(vec![WorkflowInterceptorConstructor::new(move |_| {
             ConstructionWakeInterceptor {
                 wake_point: ConstructionWakePoint::Execute,
+                attempts: interceptor_attempts.clone(),
+                tx: None,
             }
         })]);
 
@@ -773,16 +855,8 @@ async fn nondeterministic_future_detection_is_respected_for_interceptors(
         .unwrap();
 
     let (result, worker_result) = join!(
-        async {
-            let res = handle.get_result(Default::default()).await;
-            println!("done with handle");
-            res
-        },
-        async {
-            let res = worker.run_until_done().await;
-            println!("done with worker");
-            res
-        }
+        handle.get_result(Default::default()),
+        worker.run_until_done()
     );
     result.unwrap();
     worker_result.unwrap();
@@ -811,11 +885,16 @@ async fn nondeterministic_future_detection_is_respected_for_async_signal_interce
     worker
         .register_workflow::<ConstructionWakeHandlerWorkflow>()
         .unwrap();
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+    let interceptor_attempts = attempts.clone();
     worker
         .inner_mut()
         .register_workflow_interceptors(vec![WorkflowInterceptorConstructor::new(move |_| {
             ConstructionWakeInterceptor {
                 wake_point: ConstructionWakePoint::Signal,
+                attempts: interceptor_attempts.clone(),
+                tx: Some(tx.clone()),
             }
         })]);
 
@@ -845,12 +924,14 @@ async fn nondeterministic_future_detection_is_respected_for_async_signal_interce
     };
     let (_, worker_result) = join!(driver, worker.run_until_done());
     worker_result.unwrap();
-
     let history = starter.get_history().await;
     assert_eq!(
         nondeterministic_future_failure_count(&history),
         usize::from(detect_nondeterministic_futures)
     );
+    if !detect_nondeterministic_futures {
+        assert_eq!(rx.try_recv(), Ok(()));
+    }
 }
 
 #[rstest::rstest]
@@ -870,11 +951,15 @@ async fn nondeterministic_future_detection_is_respected_for_async_update_interce
     worker
         .register_workflow::<ConstructionWakeHandlerWorkflow>()
         .unwrap();
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let interceptor_attempts = attempts.clone();
     worker
         .inner_mut()
         .register_workflow_interceptors(vec![WorkflowInterceptorConstructor::new(move |_| {
             ConstructionWakeInterceptor {
                 wake_point: ConstructionWakePoint::Update,
+                attempts: interceptor_attempts.clone(),
+                tx: None,
             }
         })]);
 

@@ -3,7 +3,8 @@
 use crate::{
     SyncWorkflowContext, WorkflowContext, WorkflowContextView,
     runtime::{
-        ConstructionBlockedFuture, model::WorkflowTermination, types::WorkflowDefinitionDescriptor,
+        mark_intercepted_handler_ready, model::WorkflowTermination,
+        types::WorkflowDefinitionDescriptor,
     },
     workflow_interceptors::WorkflowOutputValue,
 };
@@ -153,6 +154,7 @@ pub trait ExecutableSyncSignal<S: SignalDefinition>: WorkflowImplementation {
         let input = downcast_handler_input::<S::Input>(input, "signal");
         let mut sync_ctx = ctx.sync_context();
         ctx.state_mut(|wf| Self::handle(wf, &mut sync_ctx, input));
+        mark_intercepted_handler_ready();
         std::future::ready(Ok(())).boxed_local()
     }
 }
@@ -168,9 +170,7 @@ pub trait ExecutableAsyncSignal<S: SignalDefinition>: WorkflowImplementation {
         input: Box<dyn Any>,
     ) -> LocalBoxFuture<'static, Result<(), WorkflowError>> {
         let input = downcast_handler_input::<S::Input>(input, "signal");
-        let base_ctx = ctx.base_context();
-        ConstructionBlockedFuture::new(base_ctx, Self::handle(ctx, input).map(|()| Ok(())))
-            .boxed_local()
+        Self::handle(ctx, input).map(|()| Ok(())).boxed_local()
     }
 }
 
@@ -221,6 +221,7 @@ pub trait ExecutableSyncUpdate<U: UpdateDefinition>: WorkflowImplementation {
         let input = downcast_handler_input::<U::Input>(input, "update");
         let mut sync_ctx = ctx.sync_context();
         let result = ctx.state_mut(|wf| Self::handle(wf, &mut sync_ctx, input));
+        mark_intercepted_handler_ready();
         match result {
             Ok(output) => std::future::ready(Ok(Box::new(output) as Box<dyn WorkflowOutputValue>))
                 .boxed_local(),
@@ -262,14 +263,13 @@ pub trait ExecutableAsyncUpdate<U: UpdateDefinition>: WorkflowImplementation {
         input: Box<dyn Any>,
     ) -> LocalBoxFuture<'static, Result<Box<dyn WorkflowOutputValue>, WorkflowError>> {
         let input = downcast_handler_input::<U::Input>(input, "update");
-        let base_ctx = ctx.base_context();
         let future = async move {
             let output = Self::handle(ctx, input)
                 .await
                 .map_err(WorkflowError::Execution)?;
             Ok(Box::new(output) as Box<dyn WorkflowOutputValue>)
         };
-        ConstructionBlockedFuture::new(base_ctx, future.boxed_local()).boxed_local()
+        future.boxed_local()
     }
 
     /// Dispatch validation with an already decoded input.

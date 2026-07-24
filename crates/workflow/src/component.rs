@@ -9,8 +9,9 @@ use crate::{
         host::WorkflowHost,
         instance::instantiate_workflow_with_interceptor_constructors,
         types::{
-            ActivationJobResult, MainRoutineCompletion, RoutineCompletion, TerminalOutcome,
-            UpdateRoutineCompletion, WorkflowDefinitionDescriptor, WorkflowFailure, WorkflowInit,
+            ActivationJobResult, MainRoutineCompletion, RoutineCompletion, RoutinePendingState,
+            TerminalOutcome, UpdateRoutineCompletion, WorkflowDefinitionDescriptor,
+            WorkflowFailure, WorkflowInit,
         },
     },
     workflow_interceptors::WorkflowInterceptorConstructor,
@@ -197,6 +198,13 @@ impl wit_guest::GuestWorkflowInstance for ExportedWorkflowInstance {
                     }
                 }),
                 made_progress: result.made_progress,
+                pending_state: result.pending_state.map(|state| match state {
+                    RoutinePendingState::Handler => wit_types::RoutinePendingState::Handler,
+                    RoutinePendingState::Interceptor => wit_types::RoutinePendingState::Interceptor,
+                    RoutinePendingState::InterceptorWithActivation => {
+                        wit_types::RoutinePendingState::InterceptorWithActivation
+                    }
+                }),
             })
             .map_err(|e| e.encode_to_vec())
     }

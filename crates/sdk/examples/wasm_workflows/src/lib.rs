@@ -76,6 +76,7 @@ impl WorkflowInstance for WasmTaskFailureWorkflow {
                 },
             ))),
             made_progress: true,
+            pending_state: None,
         })
     }
 }

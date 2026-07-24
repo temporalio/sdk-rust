@@ -17,6 +17,7 @@ use crate::{
         SdkGuardedFuture, SdkWakeGuard,
         entry::WorkflowImplementation,
         host::WorkflowHost,
+        mark_intercepted_future_activation,
         model::{
             CancelExternalWfResult, CancellableID, NexusStartResult, SignalExternalWfResult,
             TimerResult, UnblockEvent, Unblockable, WorkflowTermination,
@@ -197,28 +198,6 @@ impl PatchActivationCaller {
     }
 }
 
-/// Distinguishes polls that construct interceptor calls from polls that drive workflow routines.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-enum WorkflowFuturePollPhase {
-    /// Used while pre-polling interceptor futures; user workflow and handler futures must not make
-    /// progress during these construction-only polls.
-    Construction,
-    /// Used for normal routine polling, when user workflow and handler futures may make progress.
-    #[default]
-    Routine,
-}
-
-pub(crate) struct ConstructionPollGuard<'a> {
-    phase: &'a Cell<WorkflowFuturePollPhase>,
-    previous: WorkflowFuturePollPhase,
-}
-
-impl Drop for ConstructionPollGuard<'_> {
-    fn drop(&mut self) {
-        self.phase.set(self.previous);
-    }
-}
-
 pub(crate) struct WorkflowPollWakerGuard<'a> {
     current_waker: &'a RefCell<Option<Waker>>,
     previous: Option<Waker>,
@@ -342,21 +321,6 @@ impl BaseWorkflowContext {
         self.inner.data_converter.payload_converter()
     }
 
-    pub(crate) fn enter_construction_poll(&self) -> ConstructionPollGuard<'_> {
-        let previous = self
-            .inner
-            .poll_phase
-            .replace(WorkflowFuturePollPhase::Construction);
-        ConstructionPollGuard {
-            phase: &self.inner.poll_phase,
-            previous,
-        }
-    }
-
-    pub(crate) fn is_construction_phase(&self) -> bool {
-        self.inner.poll_phase.get() == WorkflowFuturePollPhase::Construction
-    }
-
     pub(crate) fn construction_waker(&self) -> Waker {
         self.inner
             .current_waker
@@ -386,7 +350,6 @@ impl BaseWorkflowContext {
     ) -> WorkflowOutboundFuture<T> {
         let waker = self.construction_waker();
         let mut cx = Context::from_waker(&waker);
-        let _guard = self.enter_construction_poll();
         future.poll_for_construction(&mut cx);
         future
     }
@@ -397,7 +360,6 @@ impl BaseWorkflowContext {
     ) -> CancellableWorkflowOutboundFuture<T> {
         let waker = self.construction_waker();
         let mut cx = Context::from_waker(&waker);
-        let _guard = self.enter_construction_poll();
         future.poll_for_construction(&mut cx);
         future
     }
@@ -522,7 +484,6 @@ struct WorkflowContextInner {
     data_converter: DataConverter,
     patch_activation_callback: Option<PatchActivationCallback>,
     state_mutated: Cell<bool>,
-    poll_phase: Cell<WorkflowFuturePollPhase>,
     current_waker: RefCell<Option<Waker>>,
     workflow_interceptors: RefCell<Vec<Arc<dyn WorkflowInterceptor>>>,
 }
@@ -620,7 +581,6 @@ impl BaseWorkflowContext {
                 data_converter,
                 patch_activation_callback,
                 state_mutated: Cell::new(false),
-                poll_phase: Cell::new(WorkflowFuturePollPhase::Routine),
                 current_waker: RefCell::new(None),
                 workflow_interceptors: RefCell::new(Vec::new()),
             }),
@@ -1768,10 +1728,6 @@ impl<W> WorkflowContext<W> {
         self.sync.clone()
     }
 
-    pub(crate) fn base_context(&self) -> BaseWorkflowContext {
-        self.sync.base.clone()
-    }
-
     /// Create a read-only view of this context.
     pub(crate) fn view(&self) -> WorkflowContextView {
         self.sync.view()
@@ -2232,13 +2188,17 @@ where
     type Output = T;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        self.result_rx.poll_unpin(cx).map(|x| {
+        let poll = self.result_rx.poll_unpin(cx).map(|x| {
             let od = self
                 .other_dat
                 .take()
                 .expect("Other data must exist when resolving command future");
             Unblockable::unblock(x.unwrap(), od)
-        })
+        });
+        if poll.is_pending() {
+            mark_intercepted_future_activation();
+        }
+        poll
     }
 }
 impl<T, D> FusedFuture for WFCommandFut<T, D>
@@ -3098,14 +3058,14 @@ impl StartedNexusOperation {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{MemoValues, runtime::ConstructionBlockedFuture};
+    use crate::MemoValues;
     use std::{
         collections::HashMap,
         sync::{
             Mutex,
             atomic::{AtomicUsize, Ordering as AtomicOrdering},
         },
-        task::{Context, Wake},
+        task::Wake,
     };
     use temporalio_common_wasm::{
         RetryPolicy,
@@ -3584,7 +3544,8 @@ mod tests {
     #[test]
     fn continue_as_new_interceptor_header_reaches_proto_command() {
         let ctx = test_context();
-        ctx.base_context()
+        ctx.sync
+            .base
             .set_workflow_interceptors(vec![Arc::new(MutatingRemainingOutboundInterceptor)]);
 
         let termination = ctx
@@ -3604,46 +3565,8 @@ mod tests {
     }
 
     #[test]
-    fn construction_poll_guard_restores_phase_after_panic() {
-        let base = test_context().base_context();
-
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _guard = base.enter_construction_poll();
-            assert!(base.is_construction_phase());
-            panic!("test panic");
-        }));
-
-        assert!(result.is_err());
-        assert!(!base.is_construction_phase());
-    }
-
-    #[test]
-    fn construction_blocked_future_does_not_poll_inner_future() {
-        let base = test_context().base_context();
-        let polls = Rc::new(Cell::new(0));
-        let poll_counter = polls.clone();
-        let mut future = ConstructionBlockedFuture::new(
-            base.clone(),
-            future::poll_fn(move |_| {
-                poll_counter.set(poll_counter.get() + 1);
-                Poll::Ready(42)
-            }),
-        );
-        let waker = base.construction_waker();
-        let mut cx = Context::from_waker(&waker);
-
-        {
-            let _guard = base.enter_construction_poll();
-            assert_eq!(Pin::new(&mut future).poll(&mut cx), Poll::Pending);
-        }
-        assert_eq!(polls.get(), 0);
-        assert_eq!(Pin::new(&mut future).poll(&mut cx), Poll::Ready(42));
-        assert_eq!(polls.get(), 1);
-    }
-
-    #[test]
     fn construction_waker_uses_runtime_poll_waker() {
-        let base = test_context().base_context();
+        let base = test_context().sync.base;
         let wakes = Arc::new(AtomicUsize::new(0));
         let waker = Waker::from(Arc::new(CountingWake(wakes.clone())));
         let _guard = base.enter_runtime_poll(&waker);

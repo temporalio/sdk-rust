@@ -894,9 +894,6 @@ impl Worker {
                                     "Receive half of completion processor channel cannot be dropped"
                                 );
                             }
-                            // Drive the executor so spawned tasks and sent activations make
-                            // progress.
-                            executor.process_tasks();
                         }
                         // Tell still-alive workflows to evict themselves
                         shutdown_token.cancel();
@@ -904,10 +901,17 @@ impl Worker {
                         // terminate.
                         drop(wf_future_tx);
                         drop(completions_tx);
-                        executor.shutdown().await;
                         Result::<_, anyhow::Error>::Ok(())
                     },
                     wf_future_joiner,
+                    async {
+                        tokio::select! {
+                            _ = executor.drive() => unreachable!("executor driver cannot finish"),
+                            _ = shutdown_token.cancelled() => {}
+                        }
+                        executor.shutdown().await;
+                        Result::<_, anyhow::Error>::Ok(())
+                    },
                 )
                 }).await
             },
