@@ -1328,3 +1328,61 @@ async fn graceful_shutdown_sends_shutdown_worker_rpc_during_initiate() {
 
     worker.finalize_shutdown().await;
 }
+
+#[tokio::test]
+async fn validate_enables_auto_enroll_capability() {
+    let mut mock = mock_worker_client();
+    mock.expect_describe_namespace().returning(|| {
+        Ok(DescribeNamespaceResponse {
+            namespace_info: Some(NamespaceInfo {
+                capabilities: Some(Capabilities {
+                    poller_autoscaling_auto_enroll: true,
+                    ..Capabilities::default()
+                }),
+                ..NamespaceInfo::default()
+            }),
+            ..DescribeNamespaceResponse::default()
+        })
+    });
+    let t = canned_histories::single_timer("1");
+    let mut mh = MockPollCfg::from_resp_batches("fakeid", t, [1], mock);
+    mh.enforce_correct_number_of_polls = false;
+    let worker = mock_worker(build_mock_pollers(mh));
+
+    worker.validate().await.unwrap();
+    let caps = worker.get_namespace_capabilities();
+    assert!(caps.poller_autoscaling_auto_enroll());
+    // The two capabilities are independent: advertising auto-enroll alone does not imply the
+    // `poller_autoscaling` capability (the server advertises each on its own).
+    assert!(!caps.poller_autoscaling());
+
+    worker.drain_pollers_and_shutdown().await;
+}
+
+#[tokio::test]
+async fn validate_without_auto_enroll_leaves_capabilities_off() {
+    let mut mock = mock_worker_client();
+    mock.expect_describe_namespace().returning(|| {
+        Ok(DescribeNamespaceResponse {
+            namespace_info: Some(NamespaceInfo {
+                capabilities: Some(Capabilities {
+                    poller_autoscaling_auto_enroll: false,
+                    ..Capabilities::default()
+                }),
+                ..NamespaceInfo::default()
+            }),
+            ..DescribeNamespaceResponse::default()
+        })
+    });
+    let t = canned_histories::single_timer("1");
+    let mut mh = MockPollCfg::from_resp_batches("fakeid", t, [1], mock);
+    mh.enforce_correct_number_of_polls = false;
+    let worker = mock_worker(build_mock_pollers(mh));
+
+    worker.validate().await.unwrap();
+    let caps = worker.get_namespace_capabilities();
+    assert!(!caps.poller_autoscaling_auto_enroll());
+    assert!(!caps.poller_autoscaling());
+
+    worker.drain_pollers_and_shutdown().await;
+}

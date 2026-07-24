@@ -20,6 +20,10 @@ to docs, or any other relevant information.
 ## [0.5.0]
 
 ### Added
+* Workers are now automatically enrolled into poller autoscaling when the namespace advertises the
+  `poller_autoscaling_auto_enroll` capability. This only applies to poller types left at their
+  default (the worker set neither a fixed poller count nor a poller behavior); explicitly
+  configured pollers are left unchanged.
 * `client()` and `workflow_handle()` helpers to `ActivityContext` for easily obtaining a Temporal client
 * Exposed `backoff_start_interval` when continuing as new, which will delay the first task of the
   continued workflow by the configured interval.

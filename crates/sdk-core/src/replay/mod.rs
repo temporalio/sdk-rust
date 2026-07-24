@@ -75,7 +75,7 @@ where
 
     pub(crate) fn into_core_worker(mut self) -> Result<Worker, anyhow::Error> {
         self.config.max_cached_workflows = 1;
-        self.config.workflow_task_poller_behavior = PollerBehavior::SimpleMaximum(1);
+        self.config.workflow_task_poller_behavior = Some(PollerBehavior::SimpleMaximum(1));
         self.config.task_types = WorkerTaskTypes::workflow_only();
         self.config.skip_client_worker_set_check = true;
         let historator = Historator::new(self.history_stream);

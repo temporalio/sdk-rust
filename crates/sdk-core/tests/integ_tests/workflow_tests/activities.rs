@@ -1990,16 +1990,16 @@ async fn activity_can_be_cancelled_by_local_timeout() {
 async fn long_activity_timeout_repro() {
     let wf_name = "long_activity_timeout_repro";
     let mut starter = CoreWfStarter::new(wf_name);
-    starter.sdk_config.workflow_task_poller_behavior = PollerBehavior::Autoscaling {
+    starter.sdk_config.workflow_task_poller_behavior = Some(PollerBehavior::Autoscaling {
         minimum: 1,
         maximum: 10,
         initial: 5,
-    };
-    starter.sdk_config.activity_task_poller_behavior = PollerBehavior::Autoscaling {
+    });
+    starter.sdk_config.activity_task_poller_behavior = Some(PollerBehavior::Autoscaling {
         minimum: 1,
         maximum: 10,
         initial: 5,
-    };
+    });
     starter
         .set_core_cfg_mutator(|m| m.local_timeout_buffer_for_activities = Duration::from_secs(0));
     starter.sdk_config.register_activities(StdActivities);

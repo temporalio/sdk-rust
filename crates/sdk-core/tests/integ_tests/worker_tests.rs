@@ -199,7 +199,7 @@ async fn resource_based_few_pollers_guarantees_non_sticky_poll() {
     let mut starter = CoreWfStarter::new(wf_name);
     starter.sdk_config.task_types = WorkerTaskTypes::workflow_only();
     // 3 pollers so the minimum slots of 2 can both be handed out to a sticky poller
-    starter.sdk_config.workflow_task_poller_behavior = PollerBehavior::SimpleMaximum(3_usize);
+    starter.sdk_config.workflow_task_poller_behavior = Some(PollerBehavior::SimpleMaximum(3_usize));
     // Set the limits to zero so it's essentially unwilling to hand out slots
     let mut tuner = ResourceBasedTuner::new(0.0, 0.0);
     tuner.with_workflow_slots_options(ResourceSlotOptions::new(2, 10, Duration::from_millis(0)));

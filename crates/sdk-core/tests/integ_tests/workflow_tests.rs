@@ -388,7 +388,8 @@ async fn wft_timeout_doesnt_create_unsolvable_autocomplete() {
     // Test needs eviction on and a short timeout
     wf_starter.sdk_config.max_cached_workflows = 0_usize;
     wf_starter.sdk_config.tuner = Arc::new(TunerHolder::fixed_size(1, 1, 1, 1));
-    wf_starter.sdk_config.workflow_task_poller_behavior = PollerBehavior::SimpleMaximum(1_usize);
+    wf_starter.sdk_config.workflow_task_poller_behavior =
+        Some(PollerBehavior::SimpleMaximum(1_usize));
     wf_starter.workflow_options.task_timeout = Some(Duration::from_secs(1));
     let core = wf_starter.get_worker().await;
     let client = wf_starter.get_client().await;

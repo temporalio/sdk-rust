@@ -351,16 +351,16 @@ async fn docker_worker_heartbeat_tuner() {
     tuner
         .with_workflow_slots_options(ResourceSlotOptions::new(2, 10, Duration::from_millis(0)))
         .with_activity_slots_options(ResourceSlotOptions::new(5, 10, Duration::from_millis(50)));
-    starter.sdk_config.workflow_task_poller_behavior = PollerBehavior::Autoscaling {
+    starter.sdk_config.workflow_task_poller_behavior = Some(PollerBehavior::Autoscaling {
         minimum: 1,
         maximum: 200,
         initial: 5,
-    };
-    starter.sdk_config.nexus_task_poller_behavior = PollerBehavior::Autoscaling {
+    });
+    starter.sdk_config.nexus_task_poller_behavior = Some(PollerBehavior::Autoscaling {
         minimum: 1,
         maximum: 200,
         initial: 5,
-    };
+    });
     starter.sdk_config.tuner = Arc::new(tuner);
     starter.sdk_config.register_activities(StdActivities);
     let mut worker = starter.worker().await;

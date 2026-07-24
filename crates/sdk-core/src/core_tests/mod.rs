@@ -89,7 +89,7 @@ async fn shutdown_interrupts_both_polls() {
                 .activity_task_poller_behavior(PollerBehavior::SimpleMaximum(1_usize))
                 .build()
                 .unwrap();
-            cfg.workflow_task_poller_behavior = PollerBehavior::SimpleMaximum(1_usize);
+            cfg.workflow_task_poller_behavior = Some(PollerBehavior::SimpleMaximum(1_usize));
             cfg
         },
         mock_client,
