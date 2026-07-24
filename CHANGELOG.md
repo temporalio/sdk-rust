@@ -66,6 +66,8 @@ to docs, or any other relevant information.
 * `WorkflowContext::random` and `WorkflowContext::uuid4` for deterministic randomness in workflow.
 * `ChildWorkflowOptions::builder` and `ChildWorkflowOptions::workflow_id` for constructing
   child workflow options.
+* Added `connect_timeout: Option<Duration>` to ConnectionOptions and implemented in 
+  `Connection::connect_once()`, `dns::build_endpoint()` and `dns::create_balanced_channel()`.
 
 ### Changed
  * Renamed `start_activity` and `start_local_activity` to `execute_activity` and `execute_local_activity`

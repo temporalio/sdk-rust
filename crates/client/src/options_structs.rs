@@ -49,6 +49,11 @@ pub struct ConnectionOptions {
     /// An API key to use for auth. If set, TLS will be enabled by default, but without any mTLS
     /// specific settings.
     pub api_key: Option<String>,
+    /// When set, limits the time allowed to establish the initial TCP/TLS connection to the
+    /// server. If the connection cannot be established within this duration, `connect` will
+    /// return an error. When `None` (the default), no explicit timeout is applied and the
+    /// connection attempt may block indefinitely (subject to OS-level TCP timeouts).
+    pub connect_timeout: Option<Duration>,
     /// Retry configuration for the server client. Default is [RetryOptions::default]
     #[builder(default)]
     pub retry_options: RetryOptions,

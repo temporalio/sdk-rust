@@ -75,9 +75,16 @@ async fn build_endpoint(
     tls_options: Option<&TlsOptions>,
     keep_alive: Option<&ClientKeepAliveOptions>,
     override_origin: Option<&Uri>,
+    connect_timeout: Option<Duration>,
 ) -> Result<Endpoint, ClientConnectError> {
     let uri = endpoint_uri(addr, scheme);
     let channel = Channel::from_shared(uri)?;
+
+    let channel = if let Some(timeout) = connect_timeout {
+        channel.connect_timeout(timeout)
+    } else {
+        channel
+    };
 
     // When connecting to an IP with TLS, SNI must use the original hostname.
     let tls_for_ip = tls_options.map(|tls| {
@@ -146,6 +153,7 @@ pub(crate) async fn create_balanced_channel(
             options.tls_options.as_ref(),
             options.keep_alive.as_ref(),
             options.override_origin.as_ref(),
+            options.connect_timeout,
         )
         .await?;
         // Unbounded-ish send into the freshly-created channel; can't realistically fail.
@@ -174,6 +182,7 @@ pub(crate) fn spawn_dns_reresolution(
     keep_alive: Option<ClientKeepAliveOptions>,
     override_origin: Option<Uri>,
     resolution_interval: Duration,
+    connect_timeout: Option<Duration>,
 ) -> Arc<DnsReresolutionHandle> {
     let host = target.host_str().unwrap_or("").to_owned();
     let port = target.port_or_known_default().unwrap_or(7233);
@@ -225,6 +234,7 @@ pub(crate) fn spawn_dns_reresolution(
                     tls_options.as_ref(),
                     keep_alive.as_ref(),
                     override_origin.as_ref(),
+                    connect_timeout,
                 )
                 .await
                 {
