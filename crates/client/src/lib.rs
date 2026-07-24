@@ -82,7 +82,7 @@ use std::{
     str::FromStr,
     sync::{Arc, OnceLock},
     task::{Context, Poll},
-    time::{Duration, Instant, SystemTime},
+    time::{Duration, SystemTime},
 };
 use temporalio_common::{
     HasWorkflowDefinition,
@@ -1466,6 +1466,7 @@ mod tests {
     use super::*;
     use crate::callback_based::CallbackBasedGrpcService;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Instant;
     use temporalio_common::search_attributes::SearchAttributeKey;
     use tonic::{Status, metadata::Ascii};
     use url::Url;
