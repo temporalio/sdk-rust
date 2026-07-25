@@ -445,8 +445,18 @@ pub struct Worker {
     /// Capabilities as returned by a describe namespace rpc. Not set until after validate() is
     /// called.
     capabilities: Arc<NamespaceCapabilities>,
-    /// Handle for the spawned ShutdownWorker RPC task, awaited during shutdown.
-    shutdown_rpc_handle: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// Keeps initiation atomic even after a shutdown caller has taken the RPC handle.
+    shutdown_rpc_state: Mutex<ShutdownRpcState>,
+    /// Allows a subsequent shutdown caller to wait for the in-flight RPC when the caller that took
+    /// its join handle is cancelled.
+    shutdown_rpc_complete: CancellationToken,
+    /// Serializes shutdown because several downstream shutdown routines consume join handles.
+    shutdown_complete: tokio::sync::Mutex<bool>,
+}
+
+enum ShutdownRpcState {
+    NotStarted,
+    Started(Option<tokio::task::JoinHandle<()>>),
 }
 
 /// Namespace capabilities discovered via `describe_namespace` during worker validation.
@@ -994,7 +1004,9 @@ impl Worker {
             client_worker_registrator,
             status: worker_status,
             capabilities,
-            shutdown_rpc_handle: Mutex::new(None),
+            shutdown_rpc_state: Mutex::new(ShutdownRpcState::NotStarted),
+            shutdown_rpc_complete: CancellationToken::new(),
+            shutdown_complete: tokio::sync::Mutex::new(false),
         })
     }
 
@@ -1011,13 +1023,23 @@ impl Worker {
     /// Lang implementations should use [Worker::initiate_shutdown] followed by
     /// [Worker::finalize_shutdown].
     pub async fn shutdown(&self) {
+        let mut shutdown_complete = self.shutdown_complete.lock().await;
+        if *shutdown_complete {
+            return;
+        }
+
         self.initiate_shutdown();
 
         // Ensure the ShutdownWorker RPC completes before waiting for polls to drain,
         // otherwise graceful poll shutdown deadlocks.
-        let handle = self.shutdown_rpc_handle.lock().take();
+        let handle = match &mut *self.shutdown_rpc_state.lock() {
+            ShutdownRpcState::NotStarted => unreachable!("shutdown RPC must have been started"),
+            ShutdownRpcState::Started(handle) => handle.take(),
+        };
         if let Some(handle) = handle {
             let _ = handle.await;
+        } else {
+            self.shutdown_rpc_complete.cancelled().await;
         }
 
         // We need to wait for all local activities to finish so no more workflow task heartbeats
@@ -1047,6 +1069,7 @@ impl Worker {
                 dbg_panic!("Waiting for all slot permits to release took too long!");
             }
         }
+        *shutdown_complete = true;
     }
 
     /// Completes shutdown and frees all resources. You should avoid simply dropping workers, as
@@ -1426,6 +1449,11 @@ impl Worker {
     ///
     /// You can then wait on `shutdown` or [Worker::finalize_shutdown].
     pub fn initiate_shutdown(&self) {
+        let mut shutdown_rpc_state = self.shutdown_rpc_state.lock();
+        if matches!(*shutdown_rpc_state, ShutdownRpcState::Started(_)) {
+            return;
+        }
+
         if !self.shutdown_token.is_cancelled() {
             info!(
                 task_queue=%self.config.task_queue,
@@ -1433,7 +1461,6 @@ impl Worker {
                 "Initiated shutdown",
             );
         }
-        let already_initiated_shutdown = self.shutdown_token.is_cancelled();
         self.shutdown_token.cancel();
         {
             *self.status.write() = WorkerStatus::ShuttingDown;
@@ -1469,13 +1496,6 @@ impl Worker {
             }
         }
 
-        // Spawn the ShutdownWorker RPC so the server can complete in-flight polls.
-        // The handle is stored and awaited in shutdown() to ensure completion.
-        let mut guard = self.shutdown_rpc_handle.lock();
-        if guard.is_some() || already_initiated_shutdown {
-            return;
-        }
-
         let client = self.client.clone();
         let sticky_name = self
             .workflows
@@ -1498,7 +1518,9 @@ impl Worker {
             .heartbeat_manager
             .as_ref()
             .map(|hm| hm.heartbeat_callback.clone()());
+        let shutdown_rpc_complete = self.shutdown_rpc_complete.clone();
         let handle = tokio::spawn(async move {
+            let _complete_on_drop = shutdown_rpc_complete.drop_guard();
             match client
                 .shutdown_worker(sticky_name, task_queue, task_queue_types, heartbeat)
                 .await
@@ -1517,7 +1539,7 @@ impl Worker {
                 _ => {}
             }
         });
-        *guard = Some(handle);
+        *shutdown_rpc_state = ShutdownRpcState::Started(Some(handle));
     }
 
     /// Unique identifier for this worker instance.
