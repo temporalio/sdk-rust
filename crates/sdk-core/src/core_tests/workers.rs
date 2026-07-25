@@ -10,11 +10,14 @@ use crate::{
         self, PollerBehavior,
         client::{
             MockWorkerClient,
-            mocks::{DEFAULT_TEST_CAPABILITIES, DEFAULT_WORKERS_REGISTRY, mock_worker_client},
+            mocks::{
+                DEFAULT_TEST_CAPABILITIES, DEFAULT_WORKERS_REGISTRY, mock_manual_worker_client,
+                mock_worker_client,
+            },
         },
     },
 };
-use futures_util::{stream, stream::StreamExt};
+use futures_util::{FutureExt, future, stream, stream::StreamExt};
 use std::{
     cell::RefCell,
     collections::HashMap,
@@ -59,6 +62,7 @@ use temporalio_common::{
             },
         },
     },
+    telemetry::{CoreTelemetry, Logger, TelemetryOptions, telemetry_init},
     worker::WorkerTaskTypes,
 };
 use tokio::sync::{Barrier, Notify, watch};
@@ -1326,5 +1330,107 @@ async fn graceful_shutdown_sends_shutdown_worker_rpc_during_initiate() {
         "ShutdownWorker RPC must be called during initiate_shutdown"
     );
 
+    worker.finalize_shutdown().await;
+}
+
+/// Verifies that even if the a nexus task completion is dropped, the nexus worker
+/// is able to trigger PollShutdown.
+#[tokio::test(start_paused = true)]
+async fn nexus_shutdown_does_not_hang_when_pending_completion_is_cancelled() {
+    let telemetry = telemetry_init(
+        TelemetryOptions::builder()
+            .logging(Logger::Forward {
+                filter: "OFF,temporalio_sdk_core::worker::nexus=ERROR".to_string(),
+            })
+            .build(),
+    )
+    .unwrap();
+    let _guard = tracing::subscriber::set_default(telemetry.trace_subscriber().unwrap().clone());
+
+    let mut client = mock_manual_worker_client();
+    let completion_rpc_started = Arc::new(Barrier::new(2));
+    let completion_rpc_started_clone = completion_rpc_started.clone();
+
+    // Create a client that will hang on complete_nexus_task
+    client
+        .expect_complete_nexus_task()
+        .times(1)
+        .returning(move |_, _| {
+            let completion_rpc_started = completion_rpc_started_clone.clone();
+            async move {
+                completion_rpc_started.wait().await;
+                future::pending::<Result<RespondNexusTaskCompletedResponse, tonic::Status>>().await
+            }
+            .boxed()
+        });
+
+    let mut mocks = MocksHolder::from_client_with_custom(
+        client,
+        None::<stream::Empty<PollWorkflowTaskQueueResponse>>,
+        None::<Vec<QueueResponse<PollActivityTaskQueueResponse>>>,
+        Some(vec![QueueResponse::from(create_test_nexus_task(
+            None,
+            Some(nexus::v1::request::Capabilities {
+                temporal_failure_responses: true,
+            }),
+        ))]),
+    );
+    mocks.worker_cfg(|w| {
+        w.task_queue = "nexus-shutdown-cancelled-completion".to_string();
+        w.task_types = WorkerTaskTypes {
+            enable_workflows: false,
+            enable_local_activities: false,
+            enable_remote_activities: false,
+            enable_nexus: true,
+        };
+        w.skip_client_worker_set_check = true;
+    });
+    let worker = mock_worker(mocks);
+
+    // Poll the first task from the stream and initiate shutdown
+    let nexus_task = worker.poll_nexus_task().await.unwrap();
+    worker.initiate_shutdown();
+
+    // Poll the stream again and expect it to wait for the task to complete
+    let mut poll_future = Box::pin(worker.poll_nexus_task());
+    tokio::time::timeout(Duration::from_millis(50), poll_future.as_mut())
+        .await
+        .expect_err("poll should wait for the outstanding Nexus task");
+
+    // Send completion that we know will hang indefinitely before notifying waiters
+    let mut completion =
+        Box::pin(worker.complete_nexus_task(create_test_nexus_completion(nexus_task.task_token())));
+
+    // Wait for the completion to start then drop it before notify_waiters is triggered
+    // Use select so the completion future is polled and completion actually starts
+    tokio::select! {
+        _ = completion_rpc_started.wait() => {}
+        result = completion.as_mut() => {
+            panic!("completion should stay pending, got {result:?}");
+        }
+    }
+    drop(completion);
+
+    let logs = telemetry.fetch_buffered_logs();
+    assert!(
+        logs.iter().any(|log| {
+            log.level == tracing::Level::ERROR
+                && log.target == "temporalio_sdk_core::worker::nexus"
+                && log
+                    .message
+                    .starts_with("TaskCompletedGuard triggered notify on drop")
+        }),
+        "expected TaskCompletedGuard error log, got {logs:#?}"
+    );
+
+    // Polling again should now return PollError::ShutDown because the outstanding task map is empty
+    // and waiters should have been notified.
+    let poll_result = tokio::time::timeout(Duration::from_secs(1), poll_future.as_mut())
+        .await
+        .expect("shutdown poll should finish when a pending completion future is cancelled");
+    assert_matches!(poll_result, Err(PollError::ShutDown));
+    drop(poll_future);
+
+    worker.shutdown().await;
     worker.finalize_shutdown().await;
 }
