@@ -95,7 +95,14 @@ impl WorkflowDefinitions {
     pub(crate) fn register_wasm_workflows(
         &mut self,
         components: Vec<WasmWorkflowComponent>,
+        has_native_workflow_interceptors: bool,
     ) -> Result<(), anyhow::Error> {
+        if !components.is_empty() && has_native_workflow_interceptors {
+            tracing::warn!(
+                "Native workflow interceptors will not be applied to WASM workflow components; \
+                 define interceptors in the WASM bundle instead"
+            );
+        }
         for component in components {
             let module = Arc::new(CompiledWasmWorkflowModule::new(component)?);
             for definition in &module.definitions {
@@ -189,9 +196,6 @@ impl CompiledWasmWorkflowModule {
         &self,
         input: WorkflowExecutionInput,
     ) -> Result<Box<dyn WorkflowInstance>, anyhow::Error> {
-        if !input.workflow_interceptor_constructors.is_empty() {
-            bail!("Native workflow interceptors cannot be used with WASM workflow components");
-        }
         let mut linker = Linker::new(&self.engine);
         WorkflowModule::add_to_linker::<_, HasSelf<_>>(&mut linker, |data| data)?;
         let WorkflowExecutionInput {

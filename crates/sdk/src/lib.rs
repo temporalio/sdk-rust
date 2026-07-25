@@ -671,7 +671,10 @@ impl Worker {
         #[cfg(feature = "wasm-workflows")]
         me.workflow_half
             .workflow_definitions
-            .register_wasm_workflows(wasm_components)?;
+            .register_wasm_workflows(
+                wasm_components,
+                !me.common.workflow_interceptor_constructors.is_empty(),
+            )?;
         Ok(me)
     }
 
