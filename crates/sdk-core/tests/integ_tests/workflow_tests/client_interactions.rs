@@ -1,8 +1,11 @@
-use crate::common::CoreWfStarter;
+use crate::common::{CoreWfStarter, rand_6_chars};
+use futures::future::BoxFuture;
+use parking_lot::Mutex;
+use std::sync::Arc;
 use temporalio_client::{
-    UntypedQuery, UntypedSignal, UntypedUpdate, WorkflowDescribeOptions,
-    WorkflowExecuteUpdateOptions, WorkflowQueryOptions, WorkflowSignalOptions,
-    WorkflowStartOptions,
+    Client, ClientInterceptor, Next, StartWorkflowInput, StartWorkflowOutput, UntypedQuery,
+    UntypedSignal, UntypedUpdate, WorkflowDescribeOptions, WorkflowExecuteUpdateOptions,
+    WorkflowQueryOptions, WorkflowSignalOptions, WorkflowStartOptions, errors::WorkflowStartError,
 };
 use temporalio_common::{
     data_converters::{PayloadConverter, RawValue},
@@ -671,4 +674,91 @@ async fn static_summary_and_details_visible_after_start() {
 
     let details = description.static_details().expect("details present");
     assert_eq!(details, "my static details",);
+}
+
+struct RecordingClientInterceptor {
+    name: &'static str,
+    events: Arc<Mutex<Vec<String>>>,
+}
+
+impl ClientInterceptor for RecordingClientInterceptor {
+    fn start_workflow<'a>(
+        &'a self,
+        input: StartWorkflowInput,
+        next: Next<
+            'a,
+            StartWorkflowInput,
+            BoxFuture<'a, Result<StartWorkflowOutput, WorkflowStartError>>,
+        >,
+    ) -> BoxFuture<'a, Result<StartWorkflowOutput, WorkflowStartError>> {
+        self.events
+            .lock()
+            .push(format!("{}:start_workflow", self.name));
+        next.run(input)
+    }
+}
+
+fn client_with_interceptors(
+    client: &Client,
+    names: [&'static str; 2],
+    events: Arc<Mutex<Vec<String>>>,
+) -> Client {
+    let mut client = client.clone();
+    client.options_mut().client_interceptors = names
+        .into_iter()
+        .map(|name| {
+            Arc::new(RecordingClientInterceptor {
+                name,
+                events: events.clone(),
+            }) as Arc<dyn ClientInterceptor>
+        })
+        .collect();
+    client
+}
+
+#[tokio::test]
+async fn client_interceptors_respect_registration_order() {
+    let test_name = "client_interceptors_respect_registration_order";
+    let mut starter = CoreWfStarter::new(test_name);
+    starter.sdk_config.task_types = WorkerTaskTypes::workflow_only();
+    let client = starter.get_client().await;
+    let mut worker = starter.worker().await;
+    worker
+        .register_workflow::<ImmediatelyCompletingWf>()
+        .unwrap();
+    let task_queue = starter.get_task_queue().to_owned();
+    let events = Arc::new(Mutex::new(Vec::new()));
+
+    let workflow_id = format!("{test_name}_ab_{}", rand_6_chars());
+    let handle = client_with_interceptors(&client, ["A", "B"], events.clone())
+        .start_workflow(
+            ImmediatelyCompletingWf::run,
+            (),
+            WorkflowStartOptions::new(task_queue.clone(), workflow_id.clone()).build(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        events.lock().as_slice(),
+        ["A:start_workflow", "B:start_workflow"]
+    );
+    events.lock().clear();
+    worker.expect_workflow_completion(workflow_id, handle.run_id().map(str::to_owned));
+
+    let workflow_id = format!("{test_name}_ba_{}", rand_6_chars());
+    let handle = client_with_interceptors(&client, ["B", "A"], events.clone())
+        .start_workflow(
+            ImmediatelyCompletingWf::run,
+            (),
+            WorkflowStartOptions::new(task_queue, workflow_id.clone()).build(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        events.lock().as_slice(),
+        ["B:start_workflow", "A:start_workflow"]
+    );
+    worker.expect_workflow_completion(workflow_id, handle.run_id().map(str::to_owned));
+
+    worker.run_until_done().await.unwrap();
 }
