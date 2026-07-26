@@ -22,6 +22,7 @@ use crate::{
             CancelExternalWfResult, CancellableID, NexusStartResult, SignalExternalWfResult,
             TimerResult, UnblockEvent, Unblockable, WorkflowTermination,
         },
+        types::WorkflowInit,
     },
     workflow_interceptors::{
         CancelExternalWorkflowInput, CancellableWorkflowOutboundFuture,
@@ -29,10 +30,11 @@ use crate::{
         ScheduleLocalActivityInput, SignalWorkflowInput, SignalWorkflowResult,
         SignalWorkflowTarget, StartChildWorkflowInput, StartChildWorkflowResult,
         StartNexusOperationInput, StartTimerInput, WorkflowCancellationHandle, WorkflowInterceptor,
-        WorkflowInterceptorContext, WorkflowNext, WorkflowOutboundFuture, WorkflowOutboundValue,
-        call_cancel_external_workflow, call_continue_as_new, call_schedule_activity,
-        call_schedule_local_activity, call_signal_workflow, call_start_child_workflow,
-        call_start_nexus_operation, call_start_timer,
+        WorkflowInterceptorConstructor, WorkflowInterceptorContext, WorkflowNext,
+        WorkflowOutboundFuture, WorkflowOutboundValue, call_cancel_external_workflow,
+        call_continue_as_new, call_schedule_activity, call_schedule_local_activity,
+        call_signal_workflow, call_start_child_workflow, call_start_nexus_operation,
+        call_start_timer,
     },
 };
 use futures_channel::oneshot;
@@ -485,7 +487,7 @@ struct WorkflowContextInner {
     patch_activation_callback: Option<PatchActivationCallback>,
     state_mutated: Cell<bool>,
     current_waker: RefCell<Option<Waker>>,
-    workflow_interceptors: RefCell<Vec<Arc<dyn WorkflowInterceptor>>>,
+    workflow_interceptors: Rc<[Arc<dyn WorkflowInterceptor>]>,
 }
 
 /// Context provided to synchronous signal and update handlers.
@@ -537,17 +539,34 @@ impl<W> Clone for WorkflowContext<W> {
 }
 
 impl BaseWorkflowContext {
-    /// Construct a base context from raw workflow activation initialization data.
+    /// Construct a base context and its interceptors from initial workflow information.
     #[doc(hidden)]
     pub fn from_raw(
-        namespace: String,
-        task_queue: String,
-        run_id: String,
-        init_workflow_job: InitializeWorkflow,
+        init: WorkflowInit,
         data_converter: DataConverter,
         host: Rc<dyn WorkflowHost>,
         patch_activation_callback: Option<PatchActivationCallback>,
+        workflow_interceptor_constructors: Vec<WorkflowInterceptorConstructor>,
     ) -> Self {
+        let WorkflowInit {
+            namespace,
+            task_queue,
+            run_id,
+            initialize_workflow,
+        } = init;
+        let view = WorkflowContextView::new(
+            namespace,
+            task_queue,
+            run_id,
+            initialize_workflow,
+            data_converter.payload_converter().clone(),
+        );
+        let workflow_interceptors = workflow_interceptor_constructors
+            .into_iter()
+            .map(|constructor| constructor.construct(&view))
+            .collect::<Vec<_>>()
+            .into();
+        let (namespace, task_queue, run_id, init_workflow_job) = view.into_parts();
         Self {
             inner: Rc::new(WorkflowContextInner {
                 namespace,
@@ -582,21 +601,13 @@ impl BaseWorkflowContext {
                 patch_activation_callback,
                 state_mutated: Cell::new(false),
                 current_waker: RefCell::new(None),
-                workflow_interceptors: RefCell::new(Vec::new()),
+                workflow_interceptors,
             }),
         }
     }
 
-    pub(crate) fn set_workflow_interceptors(
-        &self,
-        interceptors: Vec<Arc<dyn WorkflowInterceptor>>,
-    ) {
-        let mut current = self.inner.workflow_interceptors.borrow_mut();
-        assert!(
-            current.is_empty(),
-            "workflow interceptors already initialized"
-        );
-        *current = interceptors;
+    pub(crate) fn workflow_interceptors(&self) -> Rc<[Arc<dyn WorkflowInterceptor>]> {
+        self.inner.workflow_interceptors.clone()
     }
 
     /// Check and clear the state_mutated flag. Returns `true` if `state_mut`
@@ -731,7 +742,7 @@ impl BaseWorkflowContext {
                 base_ctx.cancellation_handle(CancellableID::Timer(seq)),
             )
         });
-        let interceptors = self.inner.workflow_interceptors.borrow().clone();
+        let interceptors = self.inner.workflow_interceptors.clone();
         let future = call_start_timer(
             interceptors,
             WorkflowInterceptorContext::new(self.clone()),
@@ -807,7 +818,7 @@ impl BaseWorkflowContext {
             }
             .map(|result| result.map(|output| Box::new(output) as Box<dyn WorkflowOutboundValue>))
         });
-        let interceptors = self.inner.workflow_interceptors.borrow().clone();
+        let interceptors = self.inner.workflow_interceptors.clone();
         let future = call_schedule_activity(
             interceptors,
             WorkflowInterceptorContext::new(self.clone()),
@@ -887,7 +898,7 @@ impl BaseWorkflowContext {
             }
             .map(|result| result.map(|output| Box::new(output) as Box<dyn WorkflowOutboundValue>))
         });
-        let interceptors = self.inner.workflow_interceptors.borrow().clone();
+        let interceptors = self.inner.workflow_interceptors.clone();
         let future = call_schedule_local_activity(
             interceptors,
             WorkflowInterceptorContext::new(self.clone()),
@@ -1010,7 +1021,7 @@ impl BaseWorkflowContext {
 
             cancellable_outbound_with_reason(ChildWorkflowStartFut::Running(cmd))
         });
-        let interceptors = self.inner.workflow_interceptors.borrow().clone();
+        let interceptors = self.inner.workflow_interceptors.clone();
         let future = call_start_child_workflow(
             interceptors,
             WorkflowInterceptorContext::new(self.clone()),
@@ -1130,7 +1141,7 @@ impl BaseWorkflowContext {
                 data_converter: base_ctx.data_converter().clone(),
             })
         });
-        let interceptors = self.inner.workflow_interceptors.borrow().clone();
+        let interceptors = self.inner.workflow_interceptors.clone();
         let future = call_signal_workflow(
             interceptors,
             WorkflowInterceptorContext::new(self.clone()),
@@ -1185,7 +1196,7 @@ impl BaseWorkflowContext {
             );
             WorkflowOutboundFuture::new(cmd)
         });
-        let interceptors = self.inner.workflow_interceptors.borrow().clone();
+        let interceptors = self.inner.workflow_interceptors.clone();
         let future = call_cancel_external_workflow(
             interceptors,
             WorkflowInterceptorContext::new(self.clone()),
@@ -1229,7 +1240,7 @@ impl BaseWorkflowContext {
                 .push_command(opts.into_command(seq));
             cancellable_outbound(cmd)
         });
-        let interceptors = self.inner.workflow_interceptors.borrow().clone();
+        let interceptors = self.inner.workflow_interceptors.clone();
         let future = call_start_nexus_operation(
             interceptors,
             WorkflowInterceptorContext::new(self.clone()),
@@ -1419,7 +1430,7 @@ impl<W> SyncWorkflowContext<W> {
             let request = opts.into_request(workflow_type, arguments, headers, pc)?;
             Err(WorkflowTermination::continue_as_new(request))
         });
-        let interceptors = self.base.inner.workflow_interceptors.borrow().clone();
+        let interceptors = self.base.inner.workflow_interceptors.clone();
         call_continue_as_new(
             interceptors,
             crate::workflow_interceptors::SyncWorkflowInterceptorContext::new(self.base.clone()),
@@ -3162,14 +3173,18 @@ mod tests {
             randomness_seed,
             ..Default::default()
         };
+        let init = WorkflowInit {
+            namespace: "default".to_string(),
+            task_queue: "orig-task-queue".to_string(),
+            run_id: "run-id".to_string(),
+            initialize_workflow: init,
+        };
         let base = BaseWorkflowContext::from_raw(
-            "default".to_string(),
-            "orig-task-queue".to_string(),
-            "run-id".to_string(),
             init,
             DataConverter::default(),
             Rc::new(NoopHost),
             None,
+            Vec::new(),
         );
         WorkflowContext::from_base(base, Rc::new(RefCell::new(TestWorkflow)))
     }
@@ -3188,14 +3203,18 @@ mod tests {
         };
         let host = Rc::new(RecordingHost::default());
         let commands = host.commands.clone();
+        let init = WorkflowInit {
+            namespace: "default".to_string(),
+            task_queue: "task-queue".to_string(),
+            run_id: "run-id".to_string(),
+            initialize_workflow: init,
+        };
         let base = BaseWorkflowContext::from_raw(
-            "default".to_string(),
-            "task-queue".to_string(),
-            "run-id".to_string(),
             init,
             DataConverter::default(),
             host,
             callback,
+            Vec::new(),
         );
 
         let ctx = WorkflowContext::from_base(base.clone(), Rc::new(RefCell::new(TestWorkflow)));
@@ -3235,18 +3254,23 @@ mod tests {
             workflow_type: TestWorkflow.name().to_string(),
             ..Default::default()
         };
+        let init = WorkflowInit {
+            namespace: "default".to_string(),
+            task_queue: "task-queue".to_string(),
+            run_id: "run-id".to_string(),
+            initialize_workflow: init,
+        };
         let base = BaseWorkflowContext::from_raw(
-            "default".to_string(),
-            "task-queue".to_string(),
-            "run-id".to_string(),
             init,
             DataConverter::default(),
             host.clone(),
             None,
+            vec![WorkflowInterceptorConstructor::new(|_| {
+                ShortCircuitFirstTimer {
+                    calls: AtomicUsize::new(0),
+                }
+            })],
         );
-        base.set_workflow_interceptors(vec![Arc::new(ShortCircuitFirstTimer {
-            calls: AtomicUsize::new(0),
-        })]);
 
         let first = base.timer(Duration::from_secs(1));
         assert_eq!(first.now_or_never(), Some(TimerResult::Cancelled));
@@ -3460,16 +3484,21 @@ mod tests {
             workflow_type: TestWorkflow.name().to_string(),
             ..Default::default()
         };
+        let init = WorkflowInit {
+            namespace: "default".to_string(),
+            task_queue: "task-queue".to_string(),
+            run_id: "run-id".to_string(),
+            initialize_workflow: init,
+        };
         let base = BaseWorkflowContext::from_raw(
-            "default".to_string(),
-            "task-queue".to_string(),
-            "run-id".to_string(),
             init,
             DataConverter::default(),
             host.clone(),
             None,
+            vec![WorkflowInterceptorConstructor::new(|_| {
+                MutatingRemainingOutboundInterceptor
+            })],
         );
-        base.set_workflow_interceptors(vec![Arc::new(MutatingRemainingOutboundInterceptor)]);
         let ctx = WorkflowContext::from_base(base, Rc::new(RefCell::new(TestWorkflow)));
 
         let signal = ctx
@@ -3543,10 +3572,26 @@ mod tests {
 
     #[test]
     fn continue_as_new_interceptor_header_reaches_proto_command() {
-        let ctx = test_context();
-        ctx.sync
-            .base
-            .set_workflow_interceptors(vec![Arc::new(MutatingRemainingOutboundInterceptor)]);
+        let init = InitializeWorkflow {
+            workflow_type: TestWorkflow.name().to_string(),
+            ..Default::default()
+        };
+        let init = WorkflowInit {
+            namespace: "default".to_string(),
+            task_queue: "task-queue".to_string(),
+            run_id: "run-id".to_string(),
+            initialize_workflow: init,
+        };
+        let base = BaseWorkflowContext::from_raw(
+            init,
+            DataConverter::default(),
+            Rc::new(NoopHost),
+            None,
+            vec![WorkflowInterceptorConstructor::new(|_| {
+                MutatingRemainingOutboundInterceptor
+            })],
+        );
+        let ctx = WorkflowContext::from_base(base, Rc::new(RefCell::new(TestWorkflow)));
 
         let termination = ctx
             .continue_as_new(7, ContinueAsNewOptions::default())
@@ -3772,14 +3817,18 @@ mod tests {
             workflow_type: "failing-workflow".to_string(),
             ..Default::default()
         };
+        let init = WorkflowInit {
+            namespace: "default".to_string(),
+            task_queue: "orig-task-queue".to_string(),
+            run_id: "run-id".to_string(),
+            initialize_workflow: init,
+        };
         let base = BaseWorkflowContext::from_raw(
-            "default".to_string(),
-            "orig-task-queue".to_string(),
-            "run-id".to_string(),
             init,
             DataConverter::default(),
             Rc::new(NoopHost),
             None,
+            Vec::new(),
         );
         let ctx = WorkflowContext::from_base(base, Rc::new(RefCell::new(FailingWorkflow)));
 
@@ -3842,14 +3891,18 @@ mod tests {
             ..Default::default()
         };
         let host = Rc::new(RecordingHost::default());
+        let init = WorkflowInit {
+            namespace: "default".to_string(),
+            task_queue: "orig-task-queue".to_string(),
+            run_id: "run-id".to_string(),
+            initialize_workflow: init,
+        };
         let base = BaseWorkflowContext::from_raw(
-            "default".to_string(),
-            "orig-task-queue".to_string(),
-            "run-id".to_string(),
             init,
             DataConverter::default(),
             host.clone(),
             None,
+            Vec::new(),
         );
         let ctx = WorkflowContext::from_base(base, Rc::new(RefCell::new(TestWorkflow)));
 
@@ -3898,14 +3951,18 @@ mod tests {
             workflow_type: TestWorkflow.name().to_string(),
             ..Default::default()
         };
+        let init = WorkflowInit {
+            namespace: "default".to_string(),
+            task_queue: "orig-task-queue".to_string(),
+            run_id: "run-id".to_string(),
+            initialize_workflow: init,
+        };
         let base = BaseWorkflowContext::from_raw(
-            "default".to_string(),
-            "orig-task-queue".to_string(),
-            "run-id".to_string(),
             init,
             DataConverter::default(),
             host.clone(),
             None,
+            Vec::new(),
         );
         let ctx = WorkflowContext::from_base(base, Rc::new(RefCell::new(TestWorkflow)));
         let err = ctx
@@ -3964,14 +4021,18 @@ mod tests {
             search_attributes: Some(init_sa),
             ..Default::default()
         };
+        let init = WorkflowInit {
+            namespace: "default".to_string(),
+            task_queue: "tq".to_string(),
+            run_id: "run-id".to_string(),
+            initialize_workflow: init,
+        };
         let base = BaseWorkflowContext::from_raw(
-            "default".to_string(),
-            "tq".to_string(),
-            "run-id".to_string(),
             init,
             DataConverter::default(),
             Rc::new(NoopHost),
             None,
+            Vec::new(),
         );
         let ctx = WorkflowContext::from_base(base, Rc::new(RefCell::new(TestWorkflow)));
 
@@ -3995,14 +4056,18 @@ mod tests {
             search_attributes: Some(init_sa),
             ..Default::default()
         };
+        let init = WorkflowInit {
+            namespace: "default".to_string(),
+            task_queue: "tq".to_string(),
+            run_id: "run-id".to_string(),
+            initialize_workflow: init,
+        };
         let base = BaseWorkflowContext::from_raw(
-            "default".to_string(),
-            "tq".to_string(),
-            "run-id".to_string(),
             init,
             DataConverter::default(),
             Rc::new(NoopHost),
             None,
+            Vec::new(),
         );
         let ctx = WorkflowContext::from_base(base, Rc::new(RefCell::new(TestWorkflow)));
 
@@ -4021,14 +4086,18 @@ mod tests {
             ..Default::default()
         };
         let expected = init.clone();
+        let init = WorkflowInit {
+            namespace: "default".to_string(),
+            task_queue: "tq".to_string(),
+            run_id: "run-id".to_string(),
+            initialize_workflow: init,
+        };
         let base = BaseWorkflowContext::from_raw(
-            "default".to_string(),
-            "tq".to_string(),
-            "run-id".to_string(),
             init,
             DataConverter::default(),
             Rc::new(NoopHost),
             None,
+            Vec::new(),
         );
         let ctx = WorkflowContext::from_base(base, Rc::new(RefCell::new(TestWorkflow)));
         let info = ctx.info();

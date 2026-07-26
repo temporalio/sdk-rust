@@ -1555,19 +1555,32 @@ pub trait WorkflowInterceptor: 'static {
 macro_rules! outbound_chain {
     ($fn_name:ident, $method:ident, $context:ty, $input:ty, $output:ty) => {
         pub(crate) fn $fn_name(
-            mut interceptors: Vec<Arc<dyn WorkflowInterceptor>>,
+            interceptors: Rc<[Arc<dyn WorkflowInterceptor>]>,
             ctx: $context,
             input: $input,
             next: WorkflowNext<'static, $input, $output>,
         ) -> $output {
-            if let Some(interceptor) = interceptors.pop() {
-                let next_ctx = ctx.clone();
-                let downstream =
-                    WorkflowNext::new(move |input| $fn_name(interceptors, next_ctx, input, next));
-                interceptor.$method(ctx, input, downstream)
-            } else {
-                next.run(input)
+            fn call(
+                interceptors: Rc<[Arc<dyn WorkflowInterceptor>]>,
+                interceptor_count: usize,
+                ctx: $context,
+                input: $input,
+                next: WorkflowNext<'static, $input, $output>,
+            ) -> $output {
+                if let Some(interceptor_index) = interceptor_count.checked_sub(1) {
+                    let interceptor = interceptors[interceptor_index].clone();
+                    let next_ctx = ctx.clone();
+                    let downstream = WorkflowNext::new(move |input| {
+                        call(interceptors, interceptor_index, next_ctx, input, next)
+                    });
+                    interceptor.$method(ctx, input, downstream)
+                } else {
+                    next.run(input)
+                }
             }
+
+            let interceptor_count = interceptors.len();
+            call(interceptors, interceptor_count, ctx, input, next)
         }
     };
 }

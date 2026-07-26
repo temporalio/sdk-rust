@@ -17,11 +17,8 @@ use temporalio_workflow::{
         entry::WorkflowImplementation,
         guest::WorkflowInstance,
         host::WorkflowHost,
-        instance::{
-            GuestWorkflowInstance, construct_workflow_interceptors,
-            instantiate_workflow_with_interceptor_constructors,
-        },
-        types::WorkflowDefinitionDescriptor,
+        instance::{GuestWorkflowInstance, instantiate_workflow},
+        types::{WorkflowDefinitionDescriptor, WorkflowInit},
     },
     workflow_interceptors::WorkflowInterceptorConstructor,
 };
@@ -93,15 +90,9 @@ impl WorkflowDefinitions {
         <W::Run as WorkflowDefinition>::Input: Send,
     {
         let factory = Arc::new(move |input| {
-            let (payloads, payload_converter, base_ctx, workflow_interceptor_constructors) =
-                workflow_input_parts(input);
-            instantiate_workflow_with_interceptor_constructors::<W>(
-                payloads,
-                payload_converter,
-                base_ctx,
-                workflow_interceptor_constructors,
-            )
-            .context("Failed to instantiate native workflow")
+            let (payloads, payload_converter, base_ctx) = workflow_input_parts(input);
+            instantiate_workflow::<W>(payloads, payload_converter, base_ctx)
+                .context("Failed to instantiate native workflow")
         });
         self.insert_workflow(W::definition(), factory)?;
         Ok(self)
@@ -127,10 +118,7 @@ impl WorkflowDefinitions {
         }
 
         let factory = Arc::new(move |input| {
-            let (payloads, payload_converter, base_ctx, workflow_interceptor_constructors) =
-                workflow_input_parts(input);
-            let workflow_interceptors =
-                construct_workflow_interceptors(&base_ctx, workflow_interceptor_constructors);
+            let (payloads, payload_converter, base_ctx) = workflow_input_parts(input);
             let ser_ctx = SerializationContext {
                 data: &SerializationContextData::Workflow,
                 converter: &payload_converter,
@@ -139,14 +127,11 @@ impl WorkflowDefinitions {
                 payload_converter.from_payloads(&ser_ctx, payloads)?;
 
             let workflow = user_factory();
-            Ok(Box::new(
-                GuestWorkflowInstance::<W>::new_with_workflow_and_interceptors(
-                    workflow,
-                    base_ctx,
-                    Some(input),
-                    workflow_interceptors,
-                ),
-            ) as Box<dyn WorkflowInstance>)
+            Ok(Box::new(GuestWorkflowInstance::<W>::new_with_workflow(
+                workflow,
+                base_ctx,
+                Some(input),
+            )) as Box<dyn WorkflowInstance>)
         });
 
         self.insert_workflow(W::definition(), factory)?;
@@ -191,12 +176,7 @@ impl WorkflowDefinitions {
 
 fn workflow_input_parts(
     input: WorkflowExecutionInput,
-) -> (
-    Vec<Payload>,
-    PayloadConverter,
-    BaseWorkflowContext,
-    Vec<WorkflowInterceptorConstructor>,
-) {
+) -> (Vec<Payload>, PayloadConverter, BaseWorkflowContext) {
     let WorkflowExecutionInput {
         namespace,
         task_queue,
@@ -209,21 +189,20 @@ fn workflow_input_parts(
     } = input;
     let payloads = init_workflow_job.arguments.clone();
     let payload_converter = data_converter.payload_converter().clone();
-    let base_ctx = BaseWorkflowContext::from_raw(
+    let init = WorkflowInit {
         namespace,
         task_queue,
         run_id,
-        init_workflow_job,
+        initialize_workflow: init_workflow_job,
+    };
+    let base_ctx = BaseWorkflowContext::from_raw(
+        init,
         data_converter,
         host,
         patch_activation_callback,
-    );
-    (
-        payloads,
-        payload_converter,
-        base_ctx,
         workflow_interceptor_constructors,
-    )
+    );
+    (payloads, payload_converter, base_ctx)
 }
 
 impl Debug for WorkflowDefinitions {

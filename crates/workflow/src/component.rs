@@ -7,7 +7,7 @@ use crate::{
         entry::WorkflowImplementation,
         guest::WorkflowInstance as RuntimeWorkflowInstance,
         host::WorkflowHost,
-        instance::instantiate_workflow_with_interceptor_constructors,
+        instance::instantiate_workflow,
         types::{
             ActivationJobResult, MainRoutineCompletion, RoutineCompletion, RoutinePendingState,
             TerminalOutcome, UpdateRoutineCompletion, WorkflowDefinitionDescriptor,
@@ -234,21 +234,13 @@ where
     let patch_activation_callback: PatchActivationCallback =
         Arc::new(|input| wit_host::patch_activation(&input.patch_id));
     let base_ctx = BaseWorkflowContext::from_raw(
-        init.namespace,
-        init.task_queue,
-        init.run_id,
-        init.initialize_workflow,
+        init,
         data_converter,
         host,
         Some(patch_activation_callback),
-    );
-    instantiate_workflow_with_interceptor_constructors::<W>(
-        args,
-        payload_converter,
-        base_ctx,
         interceptor_constructors,
-    )
-    .map_err(|err| {
+    );
+    instantiate_workflow::<W>(args, payload_converter, base_ctx).map_err(|err| {
         Box::new(Failure {
             message: format!("Workflow input deserialization failed: {err}"),
             ..Default::default()

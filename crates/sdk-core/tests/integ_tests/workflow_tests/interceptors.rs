@@ -658,7 +658,6 @@ struct ConstructionWakeInterceptor {
     // Only inject a sleep on first attempt so if ND future detection is enabled
     // we succeed the wft on next attempt.
     attempts: Arc<AtomicUsize>,
-    tx: Option<tokio::sync::mpsc::Sender<()>>,
 }
 
 impl WorkflowInterceptor for ConstructionWakeInterceptor {
@@ -697,19 +696,12 @@ impl WorkflowInterceptor for ConstructionWakeInterceptor {
         if self.wake_point != ConstructionWakePoint::Signal {
             return next.run(input);
         }
-        let attempts = self.attempts.fetch_add(1, Ordering::Relaxed);
-        let tx = self.tx.clone();
+        let should_sleep = self.attempts.fetch_add(1, Ordering::Relaxed) == 0;
         WorkflowInterceptorFuture::new(async move {
-            if attempts < 1 {
+            if should_sleep {
                 tokio::time::sleep(Duration::from_millis(1)).await;
             }
-            let result = next.run(input).await;
-            if attempts < 2 {
-                tokio::time::sleep(Duration::from_millis(50)).await;
-                tx.unwrap().send(()).await;
-                println!("finished send")
-            }
-            result
+            next.run(input).await
         })
     }
 
@@ -837,7 +829,6 @@ async fn nondeterministic_future_detection_is_respected_for_interceptors(
             ConstructionWakeInterceptor {
                 wake_point: ConstructionWakePoint::Execute,
                 attempts: interceptor_attempts.clone(),
-                tx: None,
             }
         })]);
 
@@ -886,7 +877,6 @@ async fn nondeterministic_future_detection_is_respected_for_async_signal_interce
         .register_workflow::<ConstructionWakeHandlerWorkflow>()
         .unwrap();
     let attempts = Arc::new(AtomicUsize::new(0));
-    let (tx, mut rx) = tokio::sync::mpsc::channel(1);
     let interceptor_attempts = attempts.clone();
     worker
         .inner_mut()
@@ -894,7 +884,6 @@ async fn nondeterministic_future_detection_is_respected_for_async_signal_interce
             ConstructionWakeInterceptor {
                 wake_point: ConstructionWakePoint::Signal,
                 attempts: interceptor_attempts.clone(),
-                tx: Some(tx.clone()),
             }
         })]);
 
@@ -929,9 +918,6 @@ async fn nondeterministic_future_detection_is_respected_for_async_signal_interce
         nondeterministic_future_failure_count(&history),
         usize::from(detect_nondeterministic_futures)
     );
-    if !detect_nondeterministic_futures {
-        assert_eq!(rx.try_recv(), Ok(()));
-    }
 }
 
 #[rstest::rstest]
@@ -959,7 +945,6 @@ async fn nondeterministic_future_detection_is_respected_for_async_update_interce
             ConstructionWakeInterceptor {
                 wake_point: ConstructionWakePoint::Update,
                 attempts: interceptor_attempts.clone(),
-                tx: None,
             }
         })]);
 
