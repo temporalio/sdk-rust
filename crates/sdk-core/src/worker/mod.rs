@@ -10,7 +10,7 @@ mod workflow;
 /// the error limit, shared so every conversion site reports the same identifier.
 pub(crate) const PAYLOADS_TOO_LARGE_FAILURE_TYPE: &str = "PayloadsTooLarge";
 
-use temporalio_client::{Connection, PayloadErrorLimits};
+use temporalio_client::{Connection, PayloadErrorLimits, worker::NamespaceDescriptionSource};
 use temporalio_common::{
     protos::{
         coresdk::{
@@ -85,6 +85,8 @@ use temporalio_client::worker::{
     CancelActivityCallback, ClientWorker, HeartbeatCallback, SharedNamespaceWorkerTrait,
     Slot as SlotTrait,
 };
+#[cfg(test)]
+use temporalio_common::protos::temporal::api::namespace::v1::NamespaceInfo as ApiNamespaceInfo;
 use temporalio_common::{
     protos::{
         TaskToken,
@@ -98,8 +100,10 @@ use temporalio_common::{
         temporal::api::{
             deployment,
             enums::v1::{TaskQueueKind, TaskQueueType, WorkerStatus},
+            namespace::v1::namespace_info::Capabilities as ApiNamespaceCapabilities,
             taskqueue::v1::{StickyExecutionAttributes, TaskQueue},
             worker::v1::{WorkerHeartbeat, WorkerHostInfo, WorkerPollerInfo, WorkerSlotsInfo},
+            workflowservice::v1::DescribeNamespaceResponse,
         },
     },
     telemetry::metrics::TemporalMeter,
@@ -450,44 +454,77 @@ pub struct Worker {
     client_worker_registrator: Arc<ClientWorkerRegistrator>,
     /// Status of the worker
     status: Arc<RwLock<WorkerStatus>>,
-    /// Capabilities as returned by a describe namespace rpc. Not set until after validate() is
-    /// called.
+    /// Capabilities from the namespace description shared by workers on this connection.
     capabilities: Arc<NamespaceCapabilities>,
     /// Handle for the spawned ShutdownWorker RPC task, awaited during shutdown.
     shutdown_rpc_handle: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
-/// Namespace capabilities discovered via `describe_namespace` during worker validation.
-#[derive(Default)]
+/// Namespace capabilities discovered via `describe_namespace`.
 pub struct NamespaceCapabilities {
-    pub(crate) graceful_poll_shutdown: AtomicBool,
-    pub(crate) poller_autoscaling: AtomicBool,
-    pub(crate) poller_autoscaling_auto_enroll: AtomicBool,
-    pub(crate) worker_commands: AtomicBool,
+    description: Arc<NamespaceDescriptionSource>,
+}
+
+impl Default for NamespaceCapabilities {
+    fn default() -> Self {
+        Self {
+            description: Arc::new(NamespaceDescriptionSource::resolved(
+                DescribeNamespaceResponse::default(),
+            )),
+        }
+    }
 }
 
 impl NamespaceCapabilities {
+    fn new(description: Arc<NamespaceDescriptionSource>) -> Self {
+        Self { description }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn resolved(capabilities: ApiNamespaceCapabilities) -> Self {
+        Self::new(Arc::new(NamespaceDescriptionSource::resolved(
+            DescribeNamespaceResponse {
+                namespace_info: Some(ApiNamespaceInfo {
+                    capabilities: Some(capabilities),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        )))
+    }
+
+    fn capabilities(&self) -> Option<&ApiNamespaceCapabilities> {
+        self.description
+            .get()
+            .and_then(|description| description.namespace_info.as_ref())
+            .and_then(|namespace_info| namespace_info.capabilities.as_ref())
+    }
+
     /// Returns true if the server supports graceful poll cancellation on shutdown, so pollers
     /// can let in-flight polls complete rather than hard-killing them.
     pub fn graceful_poll_shutdown(&self) -> bool {
-        self.graceful_poll_shutdown.load(Ordering::Relaxed)
+        self.capabilities()
+            .is_some_and(|capabilities| capabilities.worker_poll_complete_on_shutdown)
     }
 
     /// Returns true if pollers may scale down on poll timeout even without an explicit scaling
     /// decision from the server.
     pub fn poller_autoscaling(&self) -> bool {
-        self.poller_autoscaling.load(Ordering::Relaxed)
+        self.capabilities()
+            .is_some_and(|capabilities| capabilities.poller_autoscaling)
     }
 
     /// Returns true if the namespace opts workers into poller autoscaling by default. Poller types
     /// left at their default are automatically enrolled into autoscaling when this is set.
     pub fn poller_autoscaling_auto_enroll(&self) -> bool {
-        self.poller_autoscaling_auto_enroll.load(Ordering::Relaxed)
+        self.capabilities()
+            .is_some_and(|capabilities| capabilities.poller_autoscaling_auto_enroll)
     }
 
     /// Returns true if worker commands are supported in this namespace.
     pub fn worker_commands(&self) -> bool {
-        self.worker_commands.load(Ordering::Relaxed)
+        self.capabilities()
+            .is_some_and(|capabilities| capabilities.worker_commands)
     }
 }
 
@@ -580,14 +617,21 @@ impl Worker {
     /// needs to be done asynchronously. Lang SDKs should call this function once before calling
     /// any others.
     pub async fn validate(&self) -> Result<NamespaceInfo, WorkerValidationError> {
-        match self.client.describe_namespace().await {
+        match self
+            .capabilities
+            .description
+            .resolve(|| self.client.describe_namespace())
+            .await
+        {
             Ok(info) => {
-                let ns_info = info.namespace_info;
-                let limits = ns_info.as_ref().and_then(|ns_info| {
-                    ns_info.limits.map(|api_limits| namespace_info::Limits {
-                        blob_size_limit_error: api_limits.blob_size_limit_error,
-                        memo_size_limit_error: api_limits.memo_size_limit_error,
-                    })
+                let limits = info.namespace_info.as_ref().and_then(|api_namespace_info| {
+                    api_namespace_info
+                        .limits
+                        .as_ref()
+                        .map(|api_limits| namespace_info::Limits {
+                            blob_size_limit_error: api_limits.blob_size_limit_error,
+                            memo_size_limit_error: api_limits.memo_size_limit_error,
+                        })
                 });
                 // Install the namespace error limits on the client (enforced on completions) unless
                 // opted out; warn-level enforcement is always on, configured on the connection.
@@ -600,37 +644,10 @@ impl Worker {
                             memo: limits.memo_size_limit_error.max(0) as usize,
                         }));
                 }
-                if let Some(caps) = ns_info.and_then(|ns| ns.capabilities) {
-                    if caps.worker_poll_complete_on_shutdown {
-                        self.capabilities
-                            .graceful_poll_shutdown
-                            .store(true, Ordering::Relaxed);
-                    }
-                    if caps.poller_autoscaling {
-                        self.capabilities
-                            .poller_autoscaling
-                            .store(true, Ordering::Relaxed);
-                    }
-                    if caps.poller_autoscaling_auto_enroll {
-                        self.capabilities
-                            .poller_autoscaling_auto_enroll
-                            .store(true, Ordering::Relaxed);
-                    }
-                    if caps.worker_commands {
-                        self.capabilities
-                            .worker_commands
-                            .store(true, Ordering::Relaxed);
-                    }
-                }
                 // Now that capabilities are known, eagerly build the pollers so effective poller
                 // behavior is resolved during the normal check-in path.
                 LazyLock::force(&self.task_subsystems);
                 Ok(NamespaceInfo { limits })
-            }
-            Err(e) if e.code() == tonic::Code::Unimplemented => {
-                // Ignore if unimplemented since we wouldn't want to fail against an old server, for
-                // example.
-                Ok(NamespaceInfo::default())
             }
             Err(e) => Err(WorkerValidationError::NamespaceDescribeError {
                 source: e,
@@ -744,12 +761,10 @@ impl Worker {
         let wf_sticky_last_suc_poll_time = Arc::new(AtomicCell::new(None));
         let act_last_suc_poll_time = Arc::new(AtomicCell::new(None));
         let nexus_last_suc_poll_time = Arc::new(AtomicCell::new(None));
-        let capabilities = Arc::new(NamespaceCapabilities {
-            graceful_poll_shutdown: AtomicBool::new(false),
-            poller_autoscaling: AtomicBool::new(false),
-            poller_autoscaling_auto_enroll: AtomicBool::new(false),
-            worker_commands: AtomicBool::new(false),
-        });
+        let namespace_description = client
+            .workers()
+            .namespace_description_source(config.namespace.as_str());
+        let capabilities = Arc::new(NamespaceCapabilities::new(namespace_description.clone()));
 
         let nexus_slots = MeteredPermitDealer::new(
             tuner.nexus_task_slot_supplier(),
@@ -846,6 +861,7 @@ impl Worker {
             heartbeat_manager: worker_heartbeat,
             cancel_activity_slot: cancel_activity_slot.clone(),
             client: RwLock::new(client.clone()),
+            namespace_description,
             shared_namespace_worker,
             task_types: config.task_types,
         });
@@ -1518,7 +1534,10 @@ impl Worker {
         self.client.connection()
     }
 
-    /// Returns the namespace capabilities discovered during [Worker::validate].
+    /// Returns the namespace capabilities discovered during worker initialization.
+    ///
+    /// Lang SDKs should call [Worker::validate] before reading these capabilities when worker
+    /// heartbeating is disabled, since validation is then what resolves the namespace description.
     pub fn get_namespace_capabilities(&self) -> &NamespaceCapabilities {
         &self.capabilities
     }
@@ -2124,6 +2143,7 @@ struct ClientWorkerRegistrator {
     /// with the worker so it can be resolved lazily once the activity task manager is constructed.
     cancel_activity_slot: Arc<OnceLock<CancelActivityCallback>>,
     client: RwLock<Arc<dyn WorkerClient>>,
+    namespace_description: Arc<NamespaceDescriptionSource>,
     shared_namespace_worker: bool,
     task_types: WorkerTaskTypes,
 }
@@ -2178,6 +2198,7 @@ impl ClientWorker for ClientWorkerRegistrator {
                 self.namespace().to_string(),
                 hb_mgr.heartbeat_interval,
                 hb_mgr.telemetry.clone(),
+                self.namespace_description.clone(),
             )?))
         } else {
             bail!("Shared namespace worker creation never be called without a heartbeat manager");
@@ -2461,7 +2482,10 @@ mod tests {
         },
     };
     use futures_util::FutureExt;
-    use temporalio_common::protos::temporal::api::workflowservice::v1::PollActivityTaskQueueResponse;
+    use temporalio_common::protos::temporal::api::{
+        namespace::v1::namespace_info::Capabilities,
+        workflowservice::v1::PollActivityTaskQueueResponse,
+    };
 
     #[tokio::test]
     async fn activity_timeouts_maintain_permit() {
@@ -2705,10 +2729,10 @@ mod tests {
     }
 
     fn auto_enroll_caps() -> NamespaceCapabilities {
-        let caps = NamespaceCapabilities::default();
-        caps.poller_autoscaling_auto_enroll
-            .store(true, Ordering::Relaxed);
-        caps
+        NamespaceCapabilities::resolved(Capabilities {
+            poller_autoscaling_auto_enroll: true,
+            ..Default::default()
+        })
     }
 
     #[test]

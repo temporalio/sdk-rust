@@ -864,6 +864,7 @@ mod tests {
     use futures_util::FutureExt;
     use rstest::rstest;
     use std::time::Duration;
+    use temporalio_common::protos::temporal::api::namespace::v1::namespace_info::Capabilities;
     use tokio::{select, sync::Notify};
 
     #[tokio::test]
@@ -1213,11 +1214,10 @@ mod tests {
                 wft_poller_shared: None,
             },
             Arc::new(AtomicCell::new(None)),
-            Arc::new({
-                let ns = NamespaceCapabilities::default();
-                ns.graceful_poll_shutdown.store(graceful, Ordering::Relaxed);
-                ns
-            }),
+            Arc::new(NamespaceCapabilities::resolved(Capabilities {
+                worker_poll_complete_on_shutdown: graceful,
+                ..Default::default()
+            })),
         );
 
         let first = pb.poll().await.unwrap().unwrap();
@@ -1269,12 +1269,10 @@ mod tests {
             min: minimum,
             target: AtomicUsize::new(10),
             ever_saw_scaling_decision: AtomicBool::new(false),
-            capabilities: Arc::new({
-                let ns = NamespaceCapabilities::default();
-                ns.poller_autoscaling
-                    .store(supports_autoscaling, Ordering::Relaxed);
-                ns
-            }),
+            capabilities: Arc::new(NamespaceCapabilities::resolved(Capabilities {
+                poller_autoscaling: supports_autoscaling,
+                ..Default::default()
+            })),
             behavior: PollerBehavior::Autoscaling {
                 minimum,
                 maximum: 10,

@@ -10,7 +10,7 @@ use crate::{
         self, PollerBehavior,
         client::{
             MockWorkerClient,
-            mocks::{DEFAULT_TEST_CAPABILITIES, DEFAULT_WORKERS_REGISTRY, mock_worker_client},
+            mocks::{DEFAULT_TEST_CAPABILITIES, mock_worker_client},
         },
     },
 };
@@ -24,6 +24,7 @@ use std::{
     },
     time::Duration,
 };
+use temporalio_client::worker::ClientWorkerSet;
 use temporalio_common::{
     protos::{
         coresdk::{
@@ -343,10 +344,10 @@ async fn worker_shutdown_api(#[case] use_cache: bool, #[case] api_success: bool)
     // This will no longer be needed if
     // https://github.com/asomers/mockall/issues/283 is implemented.
     let mut mock = MockWorkerClient::new();
+    let workers = Arc::new(ClientWorkerSet::new());
     mock.expect_capabilities()
         .returning(|| Some(*DEFAULT_TEST_CAPABILITIES));
-    mock.expect_workers()
-        .returning(|| DEFAULT_WORKERS_REGISTRY.clone());
+    mock.expect_workers().returning(move || workers.clone());
     mock.expect_is_mock().returning(|| true);
     mock.expect_sdk_name_and_version()
         .returning(|| ("test-core".to_string(), "0.0.0".to_string()));
@@ -1239,12 +1240,13 @@ async fn graceful_shutdown_sends_shutdown_worker_rpc_during_initiate() {
     let poll_releaser_for_rpc = poll_releaser.clone();
 
     let mut mock_client = MockWorkerClient::new();
+    let workers = Arc::new(ClientWorkerSet::new());
     mock_client
         .expect_capabilities()
         .returning(|| Some(*DEFAULT_TEST_CAPABILITIES));
     mock_client
         .expect_workers()
-        .returning(|| DEFAULT_WORKERS_REGISTRY.clone());
+        .returning(move || workers.clone());
     mock_client.expect_is_mock().returning(|| true);
     mock_client
         .expect_sdk_name_and_version()
@@ -1266,7 +1268,7 @@ async fn graceful_shutdown_sends_shutdown_worker_rpc_during_initiate() {
             hb.worker_identity = "test-identity".to_string();
             hb.heartbeat_time = Some(std::time::SystemTime::now().into());
         });
-    // Return the worker_poll_complete_on_shutdown capability so validate() enables graceful mode
+    // Return the worker_poll_complete_on_shutdown capability so graceful mode is enabled.
     mock_client.expect_describe_namespace().returning(move || {
         Ok(DescribeNamespaceResponse {
             namespace_info: Some(NamespaceInfo {

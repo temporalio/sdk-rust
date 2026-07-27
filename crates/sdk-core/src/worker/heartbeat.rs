@@ -15,7 +15,9 @@ use std::{
     },
     time::Duration,
 };
-use temporalio_client::worker::{SharedNamespaceWorkerTrait, WorkerCallbacks};
+use temporalio_client::worker::{
+    NamespaceDescriptionSource, SharedNamespaceWorkerTrait, WorkerCallbacks,
+};
 use temporalio_common::{
     protos::{
         TaskToken,
@@ -55,6 +57,7 @@ impl SharedNamespaceWorker {
         namespace: String,
         heartbeat_interval: Duration,
         telemetry: Option<WorkerTelemetry>,
+        namespace_description: Arc<NamespaceDescriptionSource>,
     ) -> Result<Self, anyhow::Error> {
         let reset_notify = Arc::new(Notify::new());
         let cancel = CancellationToken::new();
@@ -68,12 +71,16 @@ impl SharedNamespaceWorker {
             let cancel = cancel.clone();
             let worker_control_task_queue_enabled = worker_control_task_queue_enabled.clone();
             async move {
-                let worker_commands_supported = match client.describe_namespace().await {
+                let worker_commands_supported = match namespace_description
+                    .resolve(|| client.describe_namespace())
+                    .await
+                {
                     Ok(namespace_resp) => {
                         let caps = namespace_resp
                             .namespace_info
-                            .and_then(|info| info.capabilities);
-                        if caps.as_ref().map(|c| c.worker_heartbeats) != Some(true) {
+                            .as_ref()
+                            .and_then(|info| info.capabilities.as_ref());
+                        if caps.map(|c| c.worker_heartbeats) != Some(true) {
                             debug!(
                                 "Worker heartbeating configured for runtime, but server version does not support it."
                             );
@@ -460,7 +467,7 @@ mod tests {
                 }
                 Ok(RecordWorkerHeartbeatResponse {})
             });
-        mock.expect_describe_namespace().times(2).returning(|| {
+        mock.expect_describe_namespace().times(1).returning(|| {
             Ok(DescribeNamespaceResponse {
                 namespace_info: Some(NamespaceInfo {
                     capabilities: Some(Capabilities {
@@ -538,6 +545,7 @@ mod tests {
             namespace,
             Duration::from_millis(100),
             None,
+            Arc::new(temporalio_client::worker::NamespaceDescriptionSource::unresolved()),
         )
         .unwrap();
 
