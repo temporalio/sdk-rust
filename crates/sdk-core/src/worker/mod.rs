@@ -802,26 +802,71 @@ impl Worker {
         // exist until the pollers are built).
         let cancel_activity_slot: Arc<OnceLock<CancelActivityCallback>> = Arc::new(OnceLock::new());
 
+        let deployment_options = match &config.versioning_strategy {
+            WorkerVersioningStrategy::WorkerDeploymentBased(opts) => Some(opts.clone()),
+            _ => None,
+        };
+        let provider = SlotProvider::new(
+            config.namespace.clone(),
+            config.task_queue.clone(),
+            wft_slots.clone(),
+            external_wft_tx,
+            deployment_options,
+        );
+
+        let worker_heartbeat = worker_heartbeat_interval.map(|hb_interval| {
+            let heartbeat_sys_info =
+                sys_info.unwrap_or_else(|| Arc::new(RealSysInfo::new(hb_interval)));
+            let hb_metrics = HeartbeatMetrics {
+                in_mem_metrics: metrics.in_memory_meter(),
+                wft_slots: wft_slots.clone(),
+                act_slots: act_slots.clone(),
+                nexus_slots: nexus_slots.clone(),
+                la_slots: la_permit_dealer,
+                wf_last_suc_poll_time: wf_last_suc_poll_time.clone(),
+                wf_sticky_last_suc_poll_time: wf_sticky_last_suc_poll_time.clone(),
+                act_last_suc_poll_time: act_last_suc_poll_time.clone(),
+                nexus_last_suc_poll_time: nexus_last_suc_poll_time.clone(),
+                status: worker_status.clone(),
+                sys_info: heartbeat_sys_info,
+            };
+            WorkerHeartbeatManager::new(
+                config.clone(),
+                worker_instance_key,
+                hb_interval,
+                worker_telemetry.clone(),
+                hb_metrics,
+                capabilities.clone(),
+            )
+        });
+
+        let client_worker_registrator = Arc::new(ClientWorkerRegistrator {
+            worker_instance_key,
+            slot_provider: provider,
+            heartbeat_manager: worker_heartbeat,
+            cancel_activity_slot: cancel_activity_slot.clone(),
+            client: RwLock::new(client.clone()),
+            shared_namespace_worker,
+            task_types: config.task_types,
+        });
+
+        if !shared_namespace_worker {
+            client.workers().register_worker(
+                client_worker_registrator.clone(),
+                config.skip_client_worker_set_check,
+            )?;
+        }
+
+        let worker_config = config.clone();
+        let worker_client = client.clone();
+        let worker_shutdown_token = shutdown_token.clone();
+        let worker_local_act_mgr = local_act_mgr.clone();
+        let worker_capabilities = capabilities.clone();
+
         // Build the poller-dependent subsystems lazily. This closure runs once, after namespace
         // capabilities have been fetched (see `Worker::validate`), so the effective poller behavior
-        // can be resolved with knowledge of those capabilities. Everything it needs is captured by
-        // clone (or moved) *before* the synchronous heartbeat manager below consumes the originals.
-        let task_subsystems_builder: Box<dyn FnOnce() -> TaskSubsystems + Send> = {
-            let config = config.clone();
-            let client = client.clone();
-            let capabilities = capabilities.clone();
-            let shutdown_token = shutdown_token.clone();
-            let metrics = metrics.clone();
-            let wft_slots = wft_slots.clone();
-            let act_slots = act_slots.clone();
-            let nexus_slots = nexus_slots.clone();
-            let wf_last_suc_poll_time = wf_last_suc_poll_time.clone();
-            let wf_sticky_last_suc_poll_time = wf_sticky_last_suc_poll_time.clone();
-            let act_last_suc_poll_time = act_last_suc_poll_time.clone();
-            let nexus_last_suc_poll_time = nexus_last_suc_poll_time.clone();
-            let worker_telemetry = worker_telemetry.clone();
-            let local_act_mgr = local_act_mgr.clone();
-            let cancel_activity_slot = cancel_activity_slot.clone();
+        // can be resolved with knowledge of those capabilities.
+        let task_subsystems_builder: Box<dyn FnOnce() -> TaskSubsystems + Send> =
             Box::new(move || {
                 let (wft_stream, act_poller, nexus_poller) = match task_pollers {
                     TaskPollers::Real => {
@@ -891,8 +936,8 @@ impl Worker {
                                 nexus_slots.clone(),
                                 shutdown_token.child_token(),
                                 Some(move |np| np_metrics.record_num_pollers(np)),
-                                nexus_last_suc_poll_time.clone(),
-                                capabilities.clone(),
+                                nexus_last_suc_poll_time,
+                                capabilities,
                                 shared_namespace_worker,
                             )) as BoxedNexusPoller)
                         } else {
@@ -993,7 +1038,7 @@ impl Worker {
                             worker_task_queue: Some(TaskQueue {
                                 name: sq,
                                 kind: TaskQueueKind::Sticky as i32,
-                                normal_name: config.task_queue.clone(),
+                                normal_name: config.task_queue,
                             }),
                             schedule_to_start_timeout: Some(
                                 config
@@ -1006,7 +1051,7 @@ impl Worker {
                         wft_slots,
                         stream,
                         la_sink,
-                        local_act_mgr.clone(),
+                        local_act_mgr,
                         hb_rx,
                         at_task_mgr.as_ref().and_then(|mgr| {
                             match config.max_task_queue_activities_per_second {
@@ -1024,70 +1069,15 @@ impl Worker {
                     at_task_mgr,
                     nexus_mgr,
                 }
-            })
-        };
-        let deployment_options = match &config.versioning_strategy {
-            WorkerVersioningStrategy::WorkerDeploymentBased(opts) => Some(opts.clone()),
-            _ => None,
-        };
-        let provider = SlotProvider::new(
-            config.namespace.clone(),
-            config.task_queue.clone(),
-            wft_slots.clone(),
-            external_wft_tx,
-            deployment_options,
-        );
-
-        let worker_heartbeat = worker_heartbeat_interval.map(|hb_interval| {
-            let heartbeat_sys_info =
-                sys_info.unwrap_or_else(|| Arc::new(RealSysInfo::new(hb_interval)));
-            let hb_metrics = HeartbeatMetrics {
-                in_mem_metrics: metrics.in_memory_meter(),
-                wft_slots: wft_slots.clone(),
-                act_slots,
-                nexus_slots,
-                la_slots: la_permit_dealer,
-                wf_last_suc_poll_time,
-                wf_sticky_last_suc_poll_time,
-                act_last_suc_poll_time,
-                nexus_last_suc_poll_time,
-                status: worker_status.clone(),
-                sys_info: heartbeat_sys_info,
-            };
-            WorkerHeartbeatManager::new(
-                config.clone(),
-                worker_instance_key,
-                hb_interval,
-                worker_telemetry.clone(),
-                hb_metrics,
-                capabilities.clone(),
-            )
-        });
-
-        let client_worker_registrator = Arc::new(ClientWorkerRegistrator {
-            worker_instance_key,
-            slot_provider: provider,
-            heartbeat_manager: worker_heartbeat,
-            cancel_activity_slot: cancel_activity_slot.clone(),
-            client: RwLock::new(client.clone()),
-            shared_namespace_worker,
-            task_types: config.task_types,
-        });
-
-        if !shared_namespace_worker {
-            client.workers().register_worker(
-                client_worker_registrator.clone(),
-                config.skip_client_worker_set_check,
-            )?;
-        }
+            });
 
         Ok(Self {
             worker_instance_key,
-            client: client.clone(),
+            client: worker_client,
             task_subsystems: LazyLock::new(task_subsystems_builder),
-            local_act_mgr,
-            config,
-            shutdown_token,
+            local_act_mgr: worker_local_act_mgr,
+            config: worker_config,
+            shutdown_token: worker_shutdown_token,
             post_activate_hook: None,
             // Non-local activities are already complete if configured not to poll for them.
             non_local_activities_complete: Arc::new(AtomicBool::new(!poll_on_non_local_activities)),
@@ -1099,7 +1089,7 @@ impl Worker {
             }),
             client_worker_registrator,
             status: worker_status,
-            capabilities,
+            capabilities: worker_capabilities,
             shutdown_rpc_handle: Mutex::new(None),
         })
     }
