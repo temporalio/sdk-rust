@@ -34,7 +34,8 @@ use temporalio_common::{
             common::v1::WorkflowExecution,
             history::v1::History,
             workflowservice::v1::{
-                RespondWorkflowTaskCompletedResponse, RespondWorkflowTaskFailedResponse,
+                DescribeNamespaceResponse, RespondWorkflowTaskCompletedResponse,
+                RespondWorkflowTaskFailedResponse,
             },
         },
     },
@@ -92,6 +93,12 @@ where
         } else {
             mock_manual_worker_client()
         };
+        // Worker::run validates before polling. Installing this after an optional client override
+        // lets a test-provided describe expectation take precedence over the fallback.
+        client
+            .expect_describe_namespace()
+            .times(0..)
+            .returning(|| async { Ok(DescribeNamespaceResponse::default()) }.boxed());
 
         let hist_allow_tx = historator.replay_done_tx.clone();
         let historator = Arc::new(TokioMutex::new(historator));
@@ -135,6 +142,27 @@ where
         worker.set_post_activate_hook(post_activate);
         shutdown_tok(worker.shutdown_token());
         Ok(worker)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_help::test_worker_cfg;
+    use futures_util::{FutureExt, stream};
+
+    #[tokio::test]
+    async fn client_override_describe_namespace_precedes_fallback() {
+        let mut client = mock_manual_worker_client();
+        client
+            .expect_describe_namespace()
+            .times(1)
+            .returning(|| async { Ok(DescribeNamespaceResponse::default()) }.boxed());
+
+        let mut input = ReplayWorkerInput::new(test_worker_cfg().build().unwrap(), stream::empty());
+        input.client_override = Some(client);
+
+        input.into_core_worker().unwrap().validate().await.unwrap();
     }
 }
 

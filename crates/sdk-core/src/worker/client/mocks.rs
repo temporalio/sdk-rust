@@ -56,12 +56,6 @@ pub(crate) fn mock_manual_worker_client() -> MockManualWorkerClient {
     r.expect_workers()
         .returning(|| DEFAULT_WORKERS_REGISTRY.clone());
     r.expect_is_mock().returning(|| true);
-    // Fallback so worker validation (which describes the namespace to discover capabilities) works
-    // for mock-based workers (e.g. replay) that don't care about capabilities. Open call count so
-    // workers that never validate don't trip an unsatisfied expectation.
-    r.expect_describe_namespace()
-        .times(0..)
-        .returning(|| async { Ok(DescribeNamespaceResponse::default()) }.boxed());
     r.expect_shutdown_worker()
         .returning(|_, _, _, _| async { Ok(ShutdownWorkerResponse {}) }.boxed());
     r.expect_sdk_name_and_version()

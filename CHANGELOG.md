@@ -54,6 +54,9 @@ to docs, or any other relevant information.
 
 ### Breaking Changes
 * The `ActivityContext` constructor now requires `ClientOptions`.
+* `WorkerConfig::{workflow,activity,nexus}_task_poller_behavior` and the corresponding Rust SDK
+  `WorkerOptions` fields are now `Option<PollerBehavior>`. `None` means the poller was not explicitly
+  configured and is eligible for automatic enrollment into poller autoscaling.
 ### Breaking Changes
 
 - Rust SDK `ApplicationFailure` and `WorkflowError` APIs now use boxed `std::error::Error` values instead of
