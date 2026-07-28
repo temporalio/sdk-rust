@@ -1517,17 +1517,8 @@ async fn la_resolution_after_wft_not_found_during_eviction() {
             .is_err()
     );
 
-    core.complete_workflow_activation(WorkflowActivationCompletion::from_cmds(
+    core.complete_workflow_activation(WorkflowActivationCompletion::empty(
         replay_activation.run_id,
-        vec![
-            schedule_local_activity_cmd(
-                1,
-                "1",
-                ActivityCancellationType::WaitCancellationCompleted,
-                Duration::from_secs(30),
-            ),
-            start_timer_cmd(1, Duration::from_millis(10)),
-        ],
     ))
     .await
     .unwrap();
