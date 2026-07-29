@@ -32,8 +32,11 @@ pub enum PayloadFieldData<'a> {
 
 /// Async visitor for transforming payload fields.
 pub trait AsyncPayloadVisitor {
-    /// Visit a payload field, potentially transforming it.
-    fn visit<'a>(&'a mut self, field: PayloadField<'a>) -> BoxFuture<'a, ()>;
+    /// Visit a payload field, potentially transforming it. Returning an error stops traversal.
+    fn visit<'a>(
+        &'a mut self,
+        field: PayloadField<'a>,
+    ) -> BoxFuture<'a, Result<(), PayloadConversionError>>;
 }
 
 /// Trait for messages that contain Payload fields (directly or transitively).
@@ -41,10 +44,11 @@ pub trait AsyncPayloadVisitor {
 pub trait PayloadVisitable: Send {
     /// Visit all payload fields in this message.
     /// The visitor is called once per field, receiving the field's payload(s).
+    /// Traversal stops and returns the first visitor error.
     fn visit_payloads_mut<'a>(
         &'a mut self,
         visitor: &'a mut (dyn AsyncPayloadVisitor + Send),
-    ) -> BoxFuture<'a, ()>;
+    ) -> BoxFuture<'a, Result<(), PayloadConversionError>>;
 }
 
 /// Check if a field path represents search attributes that should not be encoded.
@@ -62,51 +66,41 @@ fn should_encode(path: &str) -> bool {
 pub struct EncodeVisitor<'a> {
     codec: &'a (dyn PayloadCodec + Send + Sync),
     context: &'a SerializationContextData,
-    error: Option<PayloadConversionError>,
 }
 
 impl AsyncPayloadVisitor for EncodeVisitor<'_> {
-    fn visit<'a>(&'a mut self, field: PayloadField<'a>) -> BoxFuture<'a, ()> {
+    fn visit<'a>(
+        &'a mut self,
+        field: PayloadField<'a>,
+    ) -> BoxFuture<'a, Result<(), PayloadConversionError>> {
         Box::pin(async move {
-            if self.error.is_some() || !should_encode(field.path) {
-                return;
+            if !should_encode(field.path) {
+                return Ok(());
             }
             match field.data {
                 PayloadFieldData::Single(payload) => {
                     let encoded = self
                         .codec
                         .encode(self.context, vec![std::mem::take(payload)])
-                        .await;
-                    match encoded {
-                        Ok(encoded) => {
-                            if let Some(p) = encoded.into_iter().next() {
-                                *payload = p;
-                            }
-                        }
-                        Err(err) => self.error = Some(err),
+                        .await?;
+                    if let Some(p) = encoded.into_iter().next() {
+                        *payload = p;
                     }
                 }
                 PayloadFieldData::Repeated(payloads) => {
-                    match self
+                    *payloads = self
                         .codec
                         .encode(self.context, std::mem::take(payloads))
-                        .await
-                    {
-                        Ok(encoded) => *payloads = encoded,
-                        Err(err) => self.error = Some(err),
-                    }
+                        .await?;
                 }
                 PayloadFieldData::Payloads(payloads_msg) => {
-                    match self
+                    payloads_msg.payloads = self
                         .codec
                         .encode(self.context, std::mem::take(&mut payloads_msg.payloads))
-                        .await
-                    {
-                        Ok(encoded) => payloads_msg.payloads = encoded,
-                        Err(err) => self.error = Some(err),
-                    }
+                        .await?;
                 }
             }
+            Ok(())
         })
     }
 }
@@ -115,51 +109,41 @@ impl AsyncPayloadVisitor for EncodeVisitor<'_> {
 pub struct DecodeVisitor<'a> {
     codec: &'a (dyn PayloadCodec + Send + Sync),
     context: &'a SerializationContextData,
-    error: Option<PayloadConversionError>,
 }
 
 impl AsyncPayloadVisitor for DecodeVisitor<'_> {
-    fn visit<'a>(&'a mut self, field: PayloadField<'a>) -> BoxFuture<'a, ()> {
+    fn visit<'a>(
+        &'a mut self,
+        field: PayloadField<'a>,
+    ) -> BoxFuture<'a, Result<(), PayloadConversionError>> {
         Box::pin(async move {
-            if self.error.is_some() || !should_encode(field.path) {
-                return;
+            if !should_encode(field.path) {
+                return Ok(());
             }
             match field.data {
                 PayloadFieldData::Single(payload) => {
                     let decoded = self
                         .codec
                         .decode(self.context, vec![std::mem::take(payload)])
-                        .await;
-                    match decoded {
-                        Ok(decoded) => {
-                            if let Some(p) = decoded.into_iter().next() {
-                                *payload = p;
-                            }
-                        }
-                        Err(err) => self.error = Some(err),
+                        .await?;
+                    if let Some(p) = decoded.into_iter().next() {
+                        *payload = p;
                     }
                 }
                 PayloadFieldData::Repeated(payloads) => {
-                    match self
+                    *payloads = self
                         .codec
                         .decode(self.context, std::mem::take(payloads))
-                        .await
-                    {
-                        Ok(decoded) => *payloads = decoded,
-                        Err(err) => self.error = Some(err),
-                    }
+                        .await?;
                 }
                 PayloadFieldData::Payloads(payloads_msg) => {
-                    match self
+                    payloads_msg.payloads = self
                         .codec
                         .decode(self.context, std::mem::take(&mut payloads_msg.payloads))
-                        .await
-                    {
-                        Ok(decoded) => payloads_msg.payloads = decoded,
-                        Err(err) => self.error = Some(err),
-                    }
+                        .await?;
                 }
             }
+            Ok(())
         })
     }
 }
@@ -170,13 +154,8 @@ pub async fn encode_payloads<M: PayloadVisitable + Send>(
     codec: &(dyn PayloadCodec + Send + Sync),
     context: &SerializationContextData,
 ) -> Result<(), PayloadConversionError> {
-    let mut visitor = EncodeVisitor {
-        codec,
-        context,
-        error: None,
-    };
-    msg.visit_payloads_mut(&mut visitor).await;
-    visitor.error.map_or(Ok(()), Err)
+    let mut visitor = EncodeVisitor { codec, context };
+    msg.visit_payloads_mut(&mut visitor).await
 }
 
 /// Decode all payloads in a message using the given codec.
@@ -185,13 +164,8 @@ pub async fn decode_payloads<M: PayloadVisitable + Send>(
     codec: &(dyn PayloadCodec + Send + Sync),
     context: &SerializationContextData,
 ) -> Result<(), PayloadConversionError> {
-    let mut visitor = DecodeVisitor {
-        codec,
-        context,
-        error: None,
-    };
-    msg.visit_payloads_mut(&mut visitor).await;
-    visitor.error.map_or(Ok(()), Err)
+    let mut visitor = DecodeVisitor { codec, context };
+    msg.visit_payloads_mut(&mut visitor).await
 }
 
 // Manual impl for Payload - visits itself as a single payload
@@ -199,14 +173,14 @@ impl PayloadVisitable for Payload {
     fn visit_payloads_mut<'a>(
         &'a mut self,
         visitor: &'a mut (dyn AsyncPayloadVisitor + Send),
-    ) -> BoxFuture<'a, ()> {
+    ) -> BoxFuture<'a, Result<(), PayloadConversionError>> {
         Box::pin(async move {
             visitor
                 .visit(PayloadField {
                     path: "temporal.api.common.v1.Payload",
                     data: PayloadFieldData::Single(self),
                 })
-                .await;
+                .await
         })
     }
 }
@@ -216,14 +190,14 @@ impl PayloadVisitable for Payloads {
     fn visit_payloads_mut<'a>(
         &'a mut self,
         visitor: &'a mut (dyn AsyncPayloadVisitor + Send),
-    ) -> BoxFuture<'a, ()> {
+    ) -> BoxFuture<'a, Result<(), PayloadConversionError>> {
         Box::pin(async move {
             visitor
                 .visit(PayloadField {
                     path: "temporal.api.common.v1.Payloads",
                     data: PayloadFieldData::Payloads(self),
                 })
-                .await;
+                .await
         })
     }
 }
@@ -357,10 +331,13 @@ mod tests {
     }
 
     impl AsyncPayloadVisitor for PathRecordingVisitor {
-        fn visit<'a>(&'a mut self, field: PayloadField<'a>) -> BoxFuture<'a, ()> {
+        fn visit<'a>(
+            &'a mut self,
+            field: PayloadField<'a>,
+        ) -> BoxFuture<'a, Result<(), PayloadConversionError>> {
             let path = field.path.to_string();
             self.visited_paths.push(path);
-            async move {}.boxed()
+            async move { Ok(()) }.boxed()
         }
     }
 
@@ -430,7 +407,7 @@ mod tests {
         };
 
         let mut visitor = PathRecordingVisitor::new();
-        activation.visit_payloads_mut(&mut visitor).await;
+        activation.visit_payloads_mut(&mut visitor).await.unwrap();
 
         let paths = visitor.paths();
         assert!(
