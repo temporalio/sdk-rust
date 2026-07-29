@@ -329,9 +329,12 @@ mod tests {
                 });
 
                 tokio::select! {
+                    // Keep polling executor to make sure we make progress
                     _ = executor.drive() => unreachable!("executor driver cannot finish"),
                     result = async {
+                        // Ensure spawned task has started and is waiting
                         polled_rx.await.unwrap();
+                        // Release spawned task
                         tx.send(()).unwrap();
                         handle.await.unwrap()
                     } => assert_eq!(result, 42),
