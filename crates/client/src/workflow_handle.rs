@@ -1247,6 +1247,9 @@ where
                         if let Some(outcome) = known_outcome {
                             return Ok(PollWorkflowUpdateOutput::new(outcome));
                         }
+                        // The server's internal long-poll timeout (~60s) may expire before the update
+                        // completes, returning a response with outcome: None. Keep polling until we
+                        // get an actual outcome.
                         loop {
                             let mut request = PollWorkflowExecutionUpdateRequest {
                                 namespace: client.namespace(),
