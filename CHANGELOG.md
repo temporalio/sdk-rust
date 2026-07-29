@@ -136,6 +136,7 @@ to docs, or any other relevant information.
   when omitted, the parent workflow generates a UUID child workflow ID.
 * `ChildWorkflowOptions` is now tagged with `#[non_exhaustive]` so additional fields will not be breaking
   changes. Users should switch to `ChildWorkflowOptions::builder()` for constructing these options.
+* `PayloadCodec::{encode, decode}` now return `Result<_, PayloadConversionError>`, allowing codecs to fail.
 
 ### Fixed
 * Workflow tasks no longer livelock when a burst of ready async operations exhausts Tokio's
