@@ -1004,10 +1004,8 @@ async fn history_length_with_fail_and_timeout(
             }
             allow_failed_fetch.cancel();
         };
-        let run_worker =
-            worker.run_until_done_intercepted(Some(FirstCompletionNotifier(
-                first_completion.clone(),
-            )));
+        let run_worker = worker
+            .run_until_done_intercepted(Some(FirstCompletionNotifier(first_completion.clone())));
 
         tokio::time::timeout(Duration::from_secs(5), async {
             tokio::join!(run_worker, wait_for_eviction).0.unwrap();
