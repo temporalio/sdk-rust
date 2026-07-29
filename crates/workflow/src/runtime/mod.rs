@@ -3,6 +3,7 @@
 //! These modules collect the parts of the workflow crate that are intended for SDK/runtime glue
 //! rather than normal workflow authors.
 
+use crate::runtime::types::RoutinePendingState;
 use std::{
     cell::{Cell, RefCell},
     future::Future,
@@ -24,23 +25,6 @@ thread_local! {
         const { RefCell::new(None) };
 }
 
-/// Describes why the outer inbound interceptor future remained pending after its latest poll.
-///
-/// A plain [`Poll::Pending`] cannot tell the SDK whether completing the current activation will
-/// provide another opportunity to poll the chain, so the runtime records that distinction here.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum InterceptedFutureState {
-    /// No handler boundary or command-backed SDK future was polled, so Core cannot produce the
-    /// activation needed to make progress.
-    Interceptor,
-    /// A command-backed SDK future was polled, allowing the current activation to complete because
-    /// its resolution will produce another activation.
-    InterceptorWithActivation,
-    /// The underlying handler future was polled, after which normal workflow blocking semantics
-    /// determine when another activation is needed.
-    Handler,
-}
-
 /// Distinguishes the construction pre-poll from routine polls so the we can avoid
 /// entering async handler code during construction.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -51,7 +35,7 @@ pub(crate) enum InterceptedFuturePollKind {
 
 #[derive(Clone, Copy)]
 struct InterceptedFutureStatusInner {
-    state: InterceptedFutureState,
+    state: RoutinePendingState,
     poll_kind: InterceptedFuturePollKind,
     handler_result_ready: bool,
 }
@@ -68,7 +52,7 @@ impl InterceptedFutureStatus {
     /// Starts above the terminal boundary because no part of the chain has been polled yet.
     pub(crate) fn new() -> Self {
         Self(Rc::new(Cell::new(InterceptedFutureStatusInner {
-            state: InterceptedFutureState::Interceptor,
+            state: RoutinePendingState::Interceptor,
             poll_kind: InterceptedFuturePollKind::Routine,
             handler_result_ready: false,
         })))
@@ -80,8 +64,8 @@ impl InterceptedFutureStatus {
     /// Reaching the handler is permanent, so that state is intentionally preserved.
     pub(crate) fn reset_for_poll(&self) {
         let mut status = self.0.get();
-        if status.state != InterceptedFutureState::Handler {
-            status.state = InterceptedFutureState::Interceptor;
+        if status.state != RoutinePendingState::Handler {
+            status.state = RoutinePendingState::Interceptor;
             self.0.set(status);
         }
     }
@@ -90,12 +74,12 @@ impl InterceptedFutureStatus {
     /// normal workflow or handler execution rather than interceptor construction.
     pub(crate) fn mark_handler(&self) {
         let mut status = self.0.get();
-        status.state = InterceptedFutureState::Handler;
+        status.state = RoutinePendingState::Handler;
         self.0.set(status);
     }
 
     /// Returns the evidence collected during the latest poll for activation-completion decisions.
-    pub(crate) fn state(&self) -> InterceptedFutureState {
+    pub(crate) fn state(&self) -> RoutinePendingState {
         self.0.get().state
     }
 
@@ -122,8 +106,8 @@ impl InterceptedFutureStatus {
     /// Records an activation-producing SDK wait without overwriting the stronger handler state.
     fn mark_activation(&self) {
         let mut status = self.0.get();
-        if status.state == InterceptedFutureState::Interceptor {
-            status.state = InterceptedFutureState::InterceptorWithActivation;
+        if status.state == RoutinePendingState::Interceptor {
+            status.state = RoutinePendingState::InterceptorWithActivation;
             self.0.set(status);
         }
     }

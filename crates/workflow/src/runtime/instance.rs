@@ -3,8 +3,7 @@
 use crate::{
     BaseWorkflowContext, WorkflowContext, WorkflowContextView,
     runtime::{
-        InterceptedFuturePollGuard, InterceptedFuturePollKind, InterceptedFutureState,
-        InterceptedFutureStatus,
+        InterceptedFuturePollGuard, InterceptedFuturePollKind, InterceptedFutureStatus,
         entry::{WorkflowError, WorkflowImplementation},
         guest::WorkflowInstance,
         model::{TimerResult, UnblockEvent, WorkflowTermination},
@@ -98,13 +97,7 @@ impl<T> InterceptedFuture<T> {
     }
 
     fn pending_state(&self) -> RoutinePendingState {
-        match self.status.state() {
-            InterceptedFutureState::Interceptor => RoutinePendingState::Interceptor,
-            InterceptedFutureState::InterceptorWithActivation => {
-                RoutinePendingState::InterceptorWithActivation
-            }
-            InterceptedFutureState::Handler => RoutinePendingState::Handler,
-        }
+        self.status.state()
     }
 
     fn poll_for_construction(&mut self, cx: &mut Context<'_>) -> Poll<T> {
