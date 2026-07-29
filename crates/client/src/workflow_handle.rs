@@ -1309,7 +1309,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_helpers::{FailingCodec, XorCodec};
+    use crate::test_helpers::XorCodec;
     use std::collections::HashMap;
     use temporalio_common::{
         data_converters::DefaultFailureConverter,
