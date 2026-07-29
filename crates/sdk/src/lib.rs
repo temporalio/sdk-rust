@@ -364,6 +364,13 @@ impl<S: worker_options_builder::State> WorkerOptionsBuilder<S> {
         self
     }
 
+    /// Get a mutable reference to the workflow interceptor constructors list.
+    pub fn workflow_interceptor_constructors_mut(
+        &mut self,
+    ) -> &mut Vec<WorkflowInterceptorConstructor> {
+        &mut self.workflow_interceptor_constructors
+    }
+
     /// Register a prebuilt WASM workflow component that exports one or more workflows.
     #[cfg(feature = "wasm-workflows")]
     pub fn register_wasm_workflow(mut self, component: WasmWorkflowComponent) -> Self {
