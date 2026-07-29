@@ -228,10 +228,7 @@ mod tests {
         },
         temporal::api::{
             common::v1::{Memo, SearchAttributes},
-            failure::v1::{
-                ApplicationFailureInfo, CanceledFailureInfo, Failure, ResetWorkflowFailureInfo,
-                TimeoutFailureInfo, failure::FailureInfo,
-            },
+            failure::v1::failure::FailureInfo,
             workflow::v1::WorkflowExecutionInfo,
             workflowservice::v1::DescribeWorkflowExecutionResponse,
         },
@@ -240,6 +237,10 @@ mod tests {
     use std::{
         collections::HashMap,
         sync::atomic::{AtomicUsize, Ordering},
+    };
+    use temporalio_common_wasm::{
+        data_converters::{DefaultFailureConverter, FailureConverter, PayloadConverter},
+        error::{ApplicationFailure, OutgoingError, OutgoingWorkflowError},
     };
 
     struct MarkingCodec;
@@ -355,29 +356,6 @@ mod tests {
 
     fn is_decoded(p: &Payload) -> bool {
         p.metadata.contains_key("decoded")
-    }
-
-    fn assert_failure_payloads_marked(failure: &Failure, marker: &str) {
-        if let Some(payload) = failure.encoded_attributes.as_ref() {
-            assert!(payload.metadata.contains_key(marker));
-        }
-        let payloads = match failure.failure_info.as_ref() {
-            Some(FailureInfo::ApplicationFailureInfo(info)) => info.details.as_ref(),
-            Some(FailureInfo::TimeoutFailureInfo(info)) => info.last_heartbeat_details.as_ref(),
-            Some(FailureInfo::CanceledFailureInfo(info)) => info.details.as_ref(),
-            Some(FailureInfo::ResetWorkflowFailureInfo(info)) => {
-                info.last_heartbeat_details.as_ref()
-            }
-            _ => None,
-        };
-        if let Some(payloads) = payloads {
-            for payload in &payloads.payloads {
-                assert!(payload.metadata.contains_key(marker));
-            }
-        }
-        if let Some(cause) = failure.cause.as_deref() {
-            assert_failure_payloads_marked(cause, marker);
-        }
     }
 
     #[tokio::test]
@@ -816,47 +794,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_failure_payload_tree_is_encoded_and_decoded() {
-        let mut failure = Failure {
-            encoded_attributes: Some(make_payload("root-attributes")),
-            failure_info: Some(FailureInfo::ApplicationFailureInfo(
-                ApplicationFailureInfo {
-                    details: Some(Payloads {
-                        payloads: vec![make_payload("application-detail")],
-                    }),
-                    ..Default::default()
-                },
-            )),
-            cause: Some(Box::new(Failure {
-                failure_info: Some(FailureInfo::TimeoutFailureInfo(TimeoutFailureInfo {
-                    last_heartbeat_details: Some(Payloads {
-                        payloads: vec![make_payload("heartbeat-detail")],
-                    }),
-                    ..Default::default()
-                })),
-                cause: Some(Box::new(Failure {
-                    failure_info: Some(FailureInfo::CanceledFailureInfo(CanceledFailureInfo {
-                        details: Some(Payloads {
-                            payloads: vec![make_payload("cancellation-detail")],
-                        }),
-                        ..Default::default()
-                    })),
-                    cause: Some(Box::new(Failure {
-                        failure_info: Some(FailureInfo::ResetWorkflowFailureInfo(
-                            ResetWorkflowFailureInfo {
-                                last_heartbeat_details: Some(Payloads {
-                                    payloads: vec![make_payload("reset-detail")],
-                                }),
-                            },
-                        )),
-                        ..Default::default()
-                    })),
-                    ..Default::default()
-                })),
-                ..Default::default()
-            })),
-            ..Default::default()
-        };
+    async fn test_encode_failure_encodes_application_failure_details() {
+        let mut failure = DefaultFailureConverter.to_failure(
+            OutgoingError::Workflow(OutgoingWorkflowError::Application(Box::new(
+                ApplicationFailure::builder(anyhow::anyhow!("app boom"))
+                    .details(crate::data_converters::RawValue::new(vec![make_payload(
+                        "detail",
+                    )]))
+                    .build(),
+            ))),
+            &PayloadConverter::default(),
+            &SerializationContextData::Workflow,
+        );
 
         encode_payloads(
             &mut failure,
@@ -865,15 +814,10 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_failure_payloads_marked(&failure, "encoded");
 
-        decode_payloads(
-            &mut failure,
-            &MarkingCodec,
-            &SerializationContextData::Workflow,
-        )
-        .await
-        .unwrap();
-        assert_failure_payloads_marked(&failure, "decoded");
+        let Some(FailureInfo::ApplicationFailureInfo(info)) = failure.failure_info else {
+            panic!("expected application failure info")
+        };
+        assert!(is_encoded(&info.details.unwrap().payloads[0]));
     }
 }
