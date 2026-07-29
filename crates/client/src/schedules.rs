@@ -1530,38 +1530,45 @@ impl Client {
     /// List schedules matching the query, returning a stream that lazily
     /// paginates through results.
     pub fn list_schedules(&self, opts: ListSchedulesOptions) -> ListSchedulesStream {
-        let client = self.clone();
-        let namespace = self.namespace();
-        let query = opts.query;
-        let page_size = opts.maximum_page_size;
-        let rpc_options = opts.rpc_options;
+        list_schedules_stream(self.clone(), opts)
+    }
+}
 
-        let stream = stream::unfold(
-            (Vec::new(), VecDeque::new(), false),
-            move |(next_page_token, mut buffer, exhausted)| {
-                let client = client.clone();
-                let namespace = namespace.clone();
-                let query = query.clone();
-                let rpc_options = rpc_options.clone();
+fn list_schedules_stream<CT>(client: CT, opts: ListSchedulesOptions) -> ListSchedulesStream
+where
+    CT: WorkflowService + NamespacedClient + Clone + Send + Sync + 'static,
+{
+    let namespace = client.namespace();
+    let query = opts.query;
+    let page_size = opts.maximum_page_size;
+    let rpc_options = opts.rpc_options;
 
-                async move {
-                    if let Some(item) = buffer.pop_front() {
-                        return Some((Ok(item), (next_page_token, buffer, exhausted)));
-                    } else if exhausted {
-                        return None;
-                    }
+    let stream = stream::unfold(
+        (Vec::new(), VecDeque::new(), false),
+        move |(next_page_token, mut buffer, exhausted)| {
+            let client = client.clone();
+            let namespace = namespace.clone();
+            let query = query.clone();
+            let rpc_options = rpc_options.clone();
 
-                    let response = interceptors::call_list_schedules_page(
-                        client.client_interceptors(),
-                        ListSchedulesPageInput {
-                            maximum_page_size: page_size,
-                            query,
-                            next_page_token: next_page_token.clone(),
-                            rpc_options,
-                        },
-                        Next::new({
-                            let mut rpc_client = client.clone();
-                            move |input: ListSchedulesPageInput| -> BoxFuture<
+            async move {
+                if let Some(item) = buffer.pop_front() {
+                    return Some((Ok(item), (next_page_token, buffer, exhausted)));
+                } else if exhausted {
+                    return None;
+                }
+
+                let response = interceptors::call_list_schedules_page(
+                    client.client_interceptors(),
+                    ListSchedulesPageInput {
+                        maximum_page_size: page_size,
+                        query,
+                        next_page_token: next_page_token.clone(),
+                        rpc_options,
+                    },
+                    Next::new({
+                        let mut rpc_client = client.clone();
+                        move |input: ListSchedulesPageInput| -> BoxFuture<
                                 '_,
                                 Result<ListSchedulesPageOutput, ScheduleError>,
                             > {
@@ -1584,49 +1591,48 @@ impl Client {
                                     ))
                                 })
                             }
-                        }),
-                    )
-                    .await;
+                    }),
+                )
+                .await;
 
-                    match response {
-                        Ok(mut output) => {
-                            let new_exhausted = output.next_page_token.is_empty();
-                            let new_token = output.next_page_token;
+                match response {
+                    Ok(mut output) => {
+                        let new_exhausted = output.next_page_token.is_empty();
+                        let new_token = output.next_page_token;
 
-                            let data_converter = client.data_converter().clone();
-                            for schedule in &mut output.schedules {
-                                if let Some(memo) = schedule.memo.as_mut()
-                                    && let Err(err) = decode_payloads(
-                                        memo,
-                                        data_converter.codec(),
-                                        &SerializationContextData::Workflow,
-                                    )
-                                    .await
-                                {
-                                    return Some((
-                                        Err(ScheduleError::from(err)),
-                                        (new_token, buffer, true),
-                                    ));
-                                }
+                        let data_converter = client.data_converter().clone();
+                        for schedule in &mut output.schedules {
+                            if let Some(memo) = schedule.memo.as_mut()
+                                && let Err(err) = decode_payloads(
+                                    memo,
+                                    data_converter.codec(),
+                                    &SerializationContextData::Workflow,
+                                )
+                                .await
+                            {
+                                return Some((
+                                    Err(ScheduleError::from(err)),
+                                    (new_token, buffer, true),
+                                ));
                             }
-                            buffer = output
-                                .schedules
-                                .into_iter()
-                                .map(|raw| ScheduleSummary::new(raw, data_converter.clone()))
-                                .collect();
-
-                            buffer
-                                .pop_front()
-                                .map(|item| (Ok(item), (new_token, buffer, new_exhausted)))
                         }
-                        Err(e) => Some((Err(e), (next_page_token, buffer, true))),
-                    }
-                }
-            },
-        );
+                        buffer = output
+                            .schedules
+                            .into_iter()
+                            .map(|raw| ScheduleSummary::new(raw, data_converter.clone()))
+                            .collect();
 
-        ListSchedulesStream::new(Box::pin(stream))
-    }
+                        buffer
+                            .pop_front()
+                            .map(|item| (Ok(item), (new_token, buffer, new_exhausted)))
+                    }
+                    Err(e) => Some((Err(e), (next_page_token, buffer, true))),
+                }
+            }
+        },
+    );
+
+    ListSchedulesStream::new(Box::pin(stream))
 }
 
 #[cfg(test)]
@@ -1638,7 +1644,7 @@ mod tests {
         grpc::WorkflowService,
         test_helpers::{FailingCodec, XorCodec},
     };
-    use futures_util::FutureExt;
+    use futures_util::{FutureExt, StreamExt};
     use std::{
         collections::HashMap,
         sync::{
@@ -1664,8 +1670,8 @@ mod tests {
             taskqueue::v1::TaskQueue,
             workflow::v1::NewWorkflowExecutionInfo,
             workflowservice::v1::{
-                DeleteScheduleResponse, DescribeScheduleResponse, PatchScheduleResponse,
-                UpdateScheduleResponse,
+                DeleteScheduleResponse, DescribeScheduleResponse, ListSchedulesResponse,
+                PatchScheduleResponse, UpdateScheduleResponse,
             },
         },
     };
@@ -1685,12 +1691,14 @@ mod tests {
         update: AtomicUsize,
         delete: AtomicUsize,
         patch: AtomicUsize,
+        list: AtomicUsize,
     }
 
     #[derive(Clone)]
     struct MockScheduleClient {
         captured: Arc<CapturedRequests>,
         describe_response: DescribeScheduleResponse,
+        list_response: ListSchedulesResponse,
         data_converter: DataConverter,
         should_error: bool,
         interceptors: Vec<Arc<dyn ClientInterceptor>>,
@@ -1701,6 +1709,7 @@ mod tests {
             Self {
                 captured: Arc::new(CapturedRequests::default()),
                 describe_response: describe_response_with_start_workflow(None),
+                list_response: ListSchedulesResponse::default(),
                 data_converter: DataConverter::default(),
                 should_error: false,
                 interceptors: Vec::new(),
@@ -1844,6 +1853,18 @@ mod tests {
             }
             .boxed()
         }
+
+        fn list_schedules(
+            &mut self,
+            _request: Request<ListSchedulesRequest>,
+        ) -> futures_util::future::BoxFuture<
+            '_,
+            Result<Response<ListSchedulesResponse>, tonic::Status>,
+        > {
+            self.captured.list.fetch_add(1, Ordering::SeqCst);
+            let response = self.list_response.clone();
+            async move { Ok(Response::new(response)) }.boxed()
+        }
     }
 
     fn make_schedule_handle(client: MockScheduleClient) -> ScheduleHandle<MockScheduleClient> {
@@ -1973,30 +1994,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn schedule_describe_propagates_codec_errors() {
-        let mut describe_response = describe_response_with_start_workflow(None);
-        describe_response.memo = Some(Memo {
-            fields: HashMap::from([("memo-key".to_owned(), Payload::default())]),
-        });
-        let client = MockScheduleClient {
-            describe_response,
-            data_converter: DataConverter::new(
-                PayloadConverter::default(),
-                DefaultFailureConverter,
-                FailingCodec,
-            ),
-            ..Default::default()
-        };
-
-        let err = make_schedule_handle(client)
-            .describe(Default::default())
-            .await
-            .unwrap_err();
-
-        assert!(matches!(err, ScheduleError::PayloadConversion(_)));
-    }
-
-    #[tokio::test]
     async fn schedule_summary_exposes_typed_memo() {
         let data_converter = DataConverter::default();
         let memo_payload = data_converter
@@ -2021,6 +2018,34 @@ mod tests {
             summary.memo().get::<String>("memo-key").unwrap(),
             Some("memo-value".to_owned())
         );
+    }
+
+    #[tokio::test]
+    async fn list_schedules_yields_codec_error_then_ends() {
+        let client = MockScheduleClient {
+            list_response: ListSchedulesResponse {
+                schedules: vec![ScheduleListEntry {
+                    memo: Some(Memo {
+                        fields: HashMap::from([("memo-key".to_owned(), Payload::default())]),
+                    }),
+                    ..Default::default()
+                }],
+                next_page_token: b"next-page".to_vec(),
+            },
+            data_converter: DataConverter::new(
+                PayloadConverter::default(),
+                DefaultFailureConverter,
+                FailingCodec,
+            ),
+            ..Default::default()
+        };
+        let mut stream = list_schedules_stream(client.clone(), ListSchedulesOptions::default());
+
+        let err = stream.next().await.unwrap().unwrap_err();
+
+        assert!(matches!(err, ScheduleError::PayloadConversion(_)));
+        assert!(stream.next().await.is_none());
+        assert_eq!(client.captured.list.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

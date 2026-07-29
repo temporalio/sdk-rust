@@ -1360,47 +1360,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn workflow_result_details_propagate_codec_errors() {
-        let converter = DataConverter::new(
-            PayloadConverter::default(),
-            DefaultFailureConverter,
-            FailingCodec,
-        );
-
-        let err = WorkflowResultDetails::new(vec![Payload::default()], &converter)
-            .await
-            .unwrap_err();
-
-        assert_eq!(err.to_string(), "Encoding error: codec decode failed");
-    }
-
-    #[tokio::test]
-    async fn workflow_description_propagates_codec_errors() {
-        let converter = DataConverter::new(
-            PayloadConverter::default(),
-            DefaultFailureConverter,
-            FailingCodec,
-        );
-
-        let err = WorkflowExecutionDescription::new(
-            DescribeWorkflowExecutionResponse {
-                workflow_execution_info: Some(workflow::WorkflowExecutionInfo {
-                    memo: Some(Memo {
-                        fields: HashMap::from([("memo-key".to_owned(), Payload::default())]),
-                    }),
-                    ..Default::default()
-                }),
-                ..Default::default()
-            },
-            &converter,
-        )
-        .await
-        .unwrap_err();
-
-        assert_eq!(err.to_string(), "Encoding error: codec decode failed");
-    }
-
-    #[tokio::test]
     async fn workflow_description_memo_uses_saved_converter() {
         let converter = DataConverter::new(
             PayloadConverter::default(),

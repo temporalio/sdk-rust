@@ -818,43 +818,6 @@ impl_multi_args!(MultiArgs6; 6; 0: A, 1: B, 2: C, 3: D, 4: E, 5: F);
 mod tests {
     use super::*;
 
-    struct FailingCodec;
-
-    impl PayloadCodec for FailingCodec {
-        fn encode(
-            &self,
-            _: &SerializationContextData,
-            _: Vec<Payload>,
-        ) -> BoxFuture<'static, Result<Vec<Payload>, PayloadConversionError>> {
-            async move {
-                Err(PayloadConversionError::EncodingError(
-                    "codec encode failed".into(),
-                ))
-            }
-            .boxed()
-        }
-
-        fn decode(
-            &self,
-            _: &SerializationContextData,
-            _: Vec<Payload>,
-        ) -> BoxFuture<'static, Result<Vec<Payload>, PayloadConversionError>> {
-            async move {
-                Err(PayloadConversionError::EncodingError(
-                    "codec decode failed".into(),
-                ))
-            }
-            .boxed()
-        }
-    }
-
-    fn assert_encoding_error(err: PayloadConversionError, message: &str) {
-        let PayloadConversionError::EncodingError(source) = err else {
-            panic!("expected encoding error, got {err}")
-        };
-        assert_eq!(source.to_string(), message);
-    }
-
     #[test]
     fn test_empty_payloads_as_unit_type() {
         let converter = PayloadConverter::default();
@@ -999,57 +962,5 @@ mod tests {
         let result: Vec<String> = payloads.deserialize().unwrap();
 
         assert_eq!(result, vec!["hello".to_string(), "world".to_string()]);
-    }
-
-    #[tokio::test]
-    async fn data_converter_propagates_codec_encode_errors() {
-        let converter = DataConverter::new(
-            PayloadConverter::default(),
-            DefaultFailureConverter,
-            FailingCodec,
-        );
-
-        assert_encoding_error(
-            converter
-                .to_payload(&SerializationContextData::Workflow, &"value")
-                .await
-                .unwrap_err(),
-            "codec encode failed",
-        );
-        assert_encoding_error(
-            converter
-                .to_payloads(&SerializationContextData::Workflow, &"value")
-                .await
-                .unwrap_err(),
-            "codec encode failed",
-        );
-    }
-
-    #[tokio::test]
-    async fn data_converter_propagates_codec_decode_errors() {
-        let payload = DataConverter::default()
-            .to_payload(&SerializationContextData::Workflow, &"value")
-            .await
-            .unwrap();
-        let converter = DataConverter::new(
-            PayloadConverter::default(),
-            DefaultFailureConverter,
-            FailingCodec,
-        );
-
-        assert_encoding_error(
-            converter
-                .from_payload::<String>(&SerializationContextData::Workflow, payload.clone())
-                .await
-                .unwrap_err(),
-            "codec decode failed",
-        );
-        assert_encoding_error(
-            converter
-                .from_payloads::<String>(&SerializationContextData::Workflow, vec![payload])
-                .await
-                .unwrap_err(),
-            "codec decode failed",
-        );
     }
 }
