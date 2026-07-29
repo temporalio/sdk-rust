@@ -5,7 +5,7 @@
 //! boundary between the SDK and Core.
 
 use crate::{
-    data_converters::{PayloadCodec, SerializationContextData},
+    data_converters::{PayloadCodec, PayloadConversionError, SerializationContextData},
     protos::temporal::api::common::v1::{Payload, Payloads},
 };
 use futures::future::BoxFuture;
@@ -62,12 +62,13 @@ fn should_encode(path: &str) -> bool {
 pub struct EncodeVisitor<'a> {
     codec: &'a (dyn PayloadCodec + Send + Sync),
     context: &'a SerializationContextData,
+    error: Option<PayloadConversionError>,
 }
 
 impl AsyncPayloadVisitor for EncodeVisitor<'_> {
     fn visit<'a>(&'a mut self, field: PayloadField<'a>) -> BoxFuture<'a, ()> {
         Box::pin(async move {
-            if !should_encode(field.path) {
+            if self.error.is_some() || !should_encode(field.path) {
                 return;
             }
             match field.data {
@@ -76,21 +77,34 @@ impl AsyncPayloadVisitor for EncodeVisitor<'_> {
                         .codec
                         .encode(self.context, vec![std::mem::take(payload)])
                         .await;
-                    if let Some(p) = encoded.into_iter().next() {
-                        *payload = p;
+                    match encoded {
+                        Ok(encoded) => {
+                            if let Some(p) = encoded.into_iter().next() {
+                                *payload = p;
+                            }
+                        }
+                        Err(err) => self.error = Some(err),
                     }
                 }
                 PayloadFieldData::Repeated(payloads) => {
-                    *payloads = self
+                    match self
                         .codec
                         .encode(self.context, std::mem::take(payloads))
-                        .await;
+                        .await
+                    {
+                        Ok(encoded) => *payloads = encoded,
+                        Err(err) => self.error = Some(err),
+                    }
                 }
                 PayloadFieldData::Payloads(payloads_msg) => {
-                    payloads_msg.payloads = self
+                    match self
                         .codec
                         .encode(self.context, std::mem::take(&mut payloads_msg.payloads))
-                        .await;
+                        .await
+                    {
+                        Ok(encoded) => payloads_msg.payloads = encoded,
+                        Err(err) => self.error = Some(err),
+                    }
                 }
             }
         })
@@ -101,12 +115,13 @@ impl AsyncPayloadVisitor for EncodeVisitor<'_> {
 pub struct DecodeVisitor<'a> {
     codec: &'a (dyn PayloadCodec + Send + Sync),
     context: &'a SerializationContextData,
+    error: Option<PayloadConversionError>,
 }
 
 impl AsyncPayloadVisitor for DecodeVisitor<'_> {
     fn visit<'a>(&'a mut self, field: PayloadField<'a>) -> BoxFuture<'a, ()> {
         Box::pin(async move {
-            if !should_encode(field.path) {
+            if self.error.is_some() || !should_encode(field.path) {
                 return;
             }
             match field.data {
@@ -115,21 +130,34 @@ impl AsyncPayloadVisitor for DecodeVisitor<'_> {
                         .codec
                         .decode(self.context, vec![std::mem::take(payload)])
                         .await;
-                    if let Some(p) = decoded.into_iter().next() {
-                        *payload = p;
+                    match decoded {
+                        Ok(decoded) => {
+                            if let Some(p) = decoded.into_iter().next() {
+                                *payload = p;
+                            }
+                        }
+                        Err(err) => self.error = Some(err),
                     }
                 }
                 PayloadFieldData::Repeated(payloads) => {
-                    *payloads = self
+                    match self
                         .codec
                         .decode(self.context, std::mem::take(payloads))
-                        .await;
+                        .await
+                    {
+                        Ok(decoded) => *payloads = decoded,
+                        Err(err) => self.error = Some(err),
+                    }
                 }
                 PayloadFieldData::Payloads(payloads_msg) => {
-                    payloads_msg.payloads = self
+                    match self
                         .codec
                         .decode(self.context, std::mem::take(&mut payloads_msg.payloads))
-                        .await;
+                        .await
+                    {
+                        Ok(decoded) => payloads_msg.payloads = decoded,
+                        Err(err) => self.error = Some(err),
+                    }
                 }
             }
         })
@@ -141,9 +169,14 @@ pub async fn encode_payloads<M: PayloadVisitable + Send>(
     msg: &mut M,
     codec: &(dyn PayloadCodec + Send + Sync),
     context: &SerializationContextData,
-) {
-    let mut visitor = EncodeVisitor { codec, context };
+) -> Result<(), PayloadConversionError> {
+    let mut visitor = EncodeVisitor {
+        codec,
+        context,
+        error: None,
+    };
     msg.visit_payloads_mut(&mut visitor).await;
+    visitor.error.map_or(Ok(()), Err)
 }
 
 /// Decode all payloads in a message using the given codec.
@@ -151,9 +184,14 @@ pub async fn decode_payloads<M: PayloadVisitable + Send>(
     msg: &mut M,
     codec: &(dyn PayloadCodec + Send + Sync),
     context: &SerializationContextData,
-) {
-    let mut visitor = DecodeVisitor { codec, context };
+) -> Result<(), PayloadConversionError> {
+    let mut visitor = DecodeVisitor {
+        codec,
+        context,
+        error: None,
+    };
     msg.visit_payloads_mut(&mut visitor).await;
+    visitor.error.map_or(Ok(()), Err)
 }
 
 // Manual impl for Payload - visits itself as a single payload
@@ -196,37 +234,39 @@ include!(concat!(env!("OUT_DIR"), "/payload_visitor_impl.rs"));
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{
-        data_converters::{DefaultFailureConverter, FailureConverter, PayloadConverter},
-        error::{ApplicationFailure, OutgoingError, OutgoingWorkflowError},
-        protos::{
-            coresdk::{
-                activity_result::{
-                    ActivityResolution, Success, activity_resolution::Status as ActivityStatus,
-                },
-                workflow_activation::{
-                    InitializeWorkflow, ResolveActivity, WorkflowActivation, WorkflowActivationJob,
-                    workflow_activation_job::Variant,
-                },
-                workflow_commands::{
-                    ContinueAsNewWorkflowExecution, ScheduleActivity, StartChildWorkflowExecution,
-                    UpsertWorkflowSearchAttributes, WorkflowCommand,
-                    workflow_command::Variant as CmdVariant,
-                },
-                workflow_completion::{
-                    WorkflowActivationCompletion, workflow_activation_completion::Status,
-                },
+    use crate::protos::{
+        coresdk::{
+            activity_result::{
+                ActivityResolution, Success, activity_resolution::Status as ActivityStatus,
             },
-            temporal::api::{
-                common::v1::{Memo, SearchAttributes},
-                failure::v1::failure::FailureInfo,
-                workflow::v1::WorkflowExecutionInfo,
-                workflowservice::v1::DescribeWorkflowExecutionResponse,
+            workflow_activation::{
+                InitializeWorkflow, ResolveActivity, WorkflowActivation, WorkflowActivationJob,
+                workflow_activation_job::Variant,
             },
+            workflow_commands::{
+                ContinueAsNewWorkflowExecution, ScheduleActivity, StartChildWorkflowExecution,
+                UpsertWorkflowSearchAttributes, WorkflowCommand,
+                workflow_command::Variant as CmdVariant,
+            },
+            workflow_completion::{
+                WorkflowActivationCompletion, workflow_activation_completion::Status,
+            },
+        },
+        temporal::api::{
+            common::v1::{Memo, SearchAttributes},
+            failure::v1::{
+                ApplicationFailureInfo, CanceledFailureInfo, Failure, ResetWorkflowFailureInfo,
+                TimeoutFailureInfo, failure::FailureInfo,
+            },
+            workflow::v1::WorkflowExecutionInfo,
+            workflowservice::v1::DescribeWorkflowExecutionResponse,
         },
     };
     use futures::FutureExt;
-    use std::collections::HashMap;
+    use std::{
+        collections::HashMap,
+        sync::atomic::{AtomicUsize, Ordering},
+    };
 
     struct MarkingCodec;
     impl PayloadCodec for MarkingCodec {
@@ -234,15 +274,15 @@ mod tests {
             &self,
             _: &SerializationContextData,
             payloads: Vec<Payload>,
-        ) -> BoxFuture<'static, Vec<Payload>> {
+        ) -> BoxFuture<'static, Result<Vec<Payload>, PayloadConversionError>> {
             async move {
-                payloads
+                Ok(payloads
                     .into_iter()
                     .map(|mut p| {
                         p.metadata.insert("encoded".to_string(), b"true".to_vec());
                         p
                     })
-                    .collect()
+                    .collect())
             }
             .boxed()
         }
@@ -251,15 +291,51 @@ mod tests {
             &self,
             _: &SerializationContextData,
             payloads: Vec<Payload>,
-        ) -> BoxFuture<'static, Vec<Payload>> {
+        ) -> BoxFuture<'static, Result<Vec<Payload>, PayloadConversionError>> {
             async move {
-                payloads
+                Ok(payloads
                     .into_iter()
                     .map(|mut p| {
                         p.metadata.insert("decoded".to_string(), b"true".to_vec());
                         p
                     })
-                    .collect()
+                    .collect())
+            }
+            .boxed()
+        }
+    }
+
+    #[derive(Default)]
+    struct FailingCodec {
+        encode_calls: AtomicUsize,
+        decode_calls: AtomicUsize,
+    }
+
+    impl PayloadCodec for FailingCodec {
+        fn encode(
+            &self,
+            _: &SerializationContextData,
+            _: Vec<Payload>,
+        ) -> BoxFuture<'static, Result<Vec<Payload>, PayloadConversionError>> {
+            self.encode_calls.fetch_add(1, Ordering::SeqCst);
+            async move {
+                Err(PayloadConversionError::EncodingError(
+                    "visitor encode failed".into(),
+                ))
+            }
+            .boxed()
+        }
+
+        fn decode(
+            &self,
+            _: &SerializationContextData,
+            _: Vec<Payload>,
+        ) -> BoxFuture<'static, Result<Vec<Payload>, PayloadConversionError>> {
+            self.decode_calls.fetch_add(1, Ordering::SeqCst);
+            async move {
+                Err(PayloadConversionError::EncodingError(
+                    "visitor decode failed".into(),
+                ))
             }
             .boxed()
         }
@@ -302,6 +378,29 @@ mod tests {
 
     fn is_decoded(p: &Payload) -> bool {
         p.metadata.contains_key("decoded")
+    }
+
+    fn assert_failure_payloads_marked(failure: &Failure, marker: &str) {
+        if let Some(payload) = failure.encoded_attributes.as_ref() {
+            assert!(payload.metadata.contains_key(marker));
+        }
+        let payloads = match failure.failure_info.as_ref() {
+            Some(FailureInfo::ApplicationFailureInfo(info)) => info.details.as_ref(),
+            Some(FailureInfo::TimeoutFailureInfo(info)) => info.last_heartbeat_details.as_ref(),
+            Some(FailureInfo::CanceledFailureInfo(info)) => info.details.as_ref(),
+            Some(FailureInfo::ResetWorkflowFailureInfo(info)) => {
+                info.last_heartbeat_details.as_ref()
+            }
+            _ => None,
+        };
+        if let Some(payloads) = payloads {
+            for payload in &payloads.payloads {
+                assert!(payload.metadata.contains_key(marker));
+            }
+        }
+        if let Some(cause) = failure.cause.as_deref() {
+            assert_failure_payloads_marked(cause, marker);
+        }
     }
 
     #[tokio::test]
@@ -385,7 +484,8 @@ mod tests {
             &MarkingCodec,
             &SerializationContextData::Workflow,
         )
-        .await;
+        .await
+        .unwrap();
 
         let status = completion.status.as_ref().unwrap();
         let Status::Successful(success) = status else {
@@ -428,7 +528,8 @@ mod tests {
             &MarkingCodec,
             &SerializationContextData::Workflow,
         )
-        .await;
+        .await
+        .unwrap();
 
         let job = &activation.jobs[0];
         let Variant::InitializeWorkflow(init) = job.variant.as_ref().unwrap() else {
@@ -466,7 +567,8 @@ mod tests {
             &MarkingCodec,
             &SerializationContextData::Workflow,
         )
-        .await;
+        .await
+        .unwrap();
 
         let job = &activation.jobs[0];
         let Variant::ResolveActivity(resolve) = job.variant.as_ref().unwrap() else {
@@ -563,7 +665,8 @@ mod tests {
             &MarkingCodec,
             &SerializationContextData::Workflow,
         )
-        .await;
+        .await
+        .unwrap();
 
         let status = completion.status.as_ref().unwrap();
         let Status::Successful(success) = status else {
@@ -640,7 +743,8 @@ mod tests {
             &MarkingCodec,
             &SerializationContextData::Workflow,
         )
-        .await;
+        .await
+        .unwrap();
 
         let info = response.workflow_execution_info.as_ref().unwrap();
         assert!(
@@ -669,7 +773,8 @@ mod tests {
             &MarkingCodec,
             &SerializationContextData::Workflow,
         )
-        .await;
+        .await
+        .unwrap();
 
         assert!(is_encoded(&payload), "single payload should be encoded");
     }
@@ -683,7 +788,8 @@ mod tests {
             &MarkingCodec,
             &SerializationContextData::Workflow,
         )
-        .await;
+        .await
+        .unwrap();
 
         assert!(is_decoded(&payload), "single payload should be decoded");
     }
@@ -699,7 +805,8 @@ mod tests {
             &MarkingCodec,
             &SerializationContextData::Workflow,
         )
-        .await;
+        .await
+        .unwrap();
 
         for (i, p) in payloads.payloads.iter().enumerate() {
             assert!(is_encoded(p), "payload {} should be encoded", i);
@@ -707,29 +814,89 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_encode_failure_encodes_application_failure_details() {
-        let mut failure = DefaultFailureConverter.to_failure(
-            OutgoingError::Workflow(OutgoingWorkflowError::Application(Box::new(
-                ApplicationFailure::builder(anyhow::anyhow!("app boom"))
-                    .details(crate::data_converters::RawValue::new(vec![make_payload(
-                        "detail",
-                    )]))
-                    .build(),
-            ))),
-            &PayloadConverter::default(),
-            &SerializationContextData::Workflow,
-        );
+    async fn test_codec_errors_stop_subsequent_codec_invocations() {
+        let codec = FailingCodec::default();
+        let mut activation = WorkflowActivation {
+            jobs: vec![WorkflowActivationJob {
+                variant: Some(Variant::InitializeWorkflow(InitializeWorkflow {
+                    arguments: vec![make_payload("input")],
+                    headers: HashMap::from([("header".to_string(), make_payload("value"))]),
+                    memo: Some(Memo {
+                        fields: HashMap::from([("memo".to_string(), make_payload("memo-value"))]),
+                    }),
+                    ..Default::default()
+                })),
+            }],
+            ..Default::default()
+        };
+
+        let err = decode_payloads(&mut activation, &codec, &SerializationContextData::Workflow)
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.to_string(), "Encoding error: visitor decode failed");
+        assert_eq!(codec.decode_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn test_failure_payload_tree_is_encoded_and_decoded() {
+        let mut failure = Failure {
+            encoded_attributes: Some(make_payload("root-attributes")),
+            failure_info: Some(FailureInfo::ApplicationFailureInfo(
+                ApplicationFailureInfo {
+                    details: Some(Payloads {
+                        payloads: vec![make_payload("application-detail")],
+                    }),
+                    ..Default::default()
+                },
+            )),
+            cause: Some(Box::new(Failure {
+                failure_info: Some(FailureInfo::TimeoutFailureInfo(TimeoutFailureInfo {
+                    last_heartbeat_details: Some(Payloads {
+                        payloads: vec![make_payload("heartbeat-detail")],
+                    }),
+                    ..Default::default()
+                })),
+                cause: Some(Box::new(Failure {
+                    failure_info: Some(FailureInfo::CanceledFailureInfo(CanceledFailureInfo {
+                        details: Some(Payloads {
+                            payloads: vec![make_payload("cancellation-detail")],
+                        }),
+                        ..Default::default()
+                    })),
+                    cause: Some(Box::new(Failure {
+                        failure_info: Some(FailureInfo::ResetWorkflowFailureInfo(
+                            ResetWorkflowFailureInfo {
+                                last_heartbeat_details: Some(Payloads {
+                                    payloads: vec![make_payload("reset-detail")],
+                                }),
+                            },
+                        )),
+                        ..Default::default()
+                    })),
+                    ..Default::default()
+                })),
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
 
         encode_payloads(
             &mut failure,
             &MarkingCodec,
             &SerializationContextData::Workflow,
         )
-        .await;
+        .await
+        .unwrap();
+        assert_failure_payloads_marked(&failure, "encoded");
 
-        let Some(FailureInfo::ApplicationFailureInfo(info)) = failure.failure_info else {
-            panic!("expected application failure info")
-        };
-        assert!(is_encoded(&info.details.unwrap().payloads[0]));
+        decode_payloads(
+            &mut failure,
+            &MarkingCodec,
+            &SerializationContextData::Workflow,
+        )
+        .await
+        .unwrap();
+        assert_failure_payloads_marked(&failure, "decoded");
     }
 }

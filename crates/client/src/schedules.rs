@@ -1088,7 +1088,7 @@ where
                 self.client.data_converter().codec(),
                 &SerializationContextData::Workflow,
             )
-            .await;
+            .await?;
         }
 
         ScheduleDescription::new(
@@ -1143,7 +1143,7 @@ where
                             handle.client.data_converter().codec(),
                             &SerializationContextData::Workflow,
                         )
-                        .await;
+                        .await?;
                         let description = ScheduleDescription::new(
                             response,
                             handle.client.data_converter().clone(),
@@ -1595,13 +1595,18 @@ impl Client {
 
                             let data_converter = client.data_converter().clone();
                             for schedule in &mut output.schedules {
-                                if let Some(memo) = schedule.memo.as_mut() {
-                                    decode_payloads(
+                                if let Some(memo) = schedule.memo.as_mut()
+                                    && let Err(err) = decode_payloads(
                                         memo,
                                         data_converter.codec(),
                                         &SerializationContextData::Workflow,
                                     )
-                                    .await;
+                                    .await
+                                {
+                                    return Some((
+                                        Err(ScheduleError::from(err)),
+                                        (new_token, buffer, true),
+                                    ));
                                 }
                             }
                             buffer = output
@@ -1629,8 +1634,9 @@ mod tests {
     use super::*;
     use crate::{
         ClientInterceptor, DescribeScheduleInput, DescribeScheduleOutput, NamespacedClient, Next,
-        SendScheduleUpdateInput, UpdateScheduleInput, grpc::WorkflowService,
-        test_helpers::XorCodec,
+        SendScheduleUpdateInput, UpdateScheduleInput,
+        grpc::WorkflowService,
+        test_helpers::{FailingCodec, XorCodec},
     };
     use futures_util::FutureExt;
     use std::{
@@ -1964,6 +1970,30 @@ mod tests {
             description.memo().get::<String>("memo-key").unwrap(),
             Some("memo-value".to_owned())
         );
+    }
+
+    #[tokio::test]
+    async fn schedule_describe_propagates_codec_errors() {
+        let mut describe_response = describe_response_with_start_workflow(None);
+        describe_response.memo = Some(Memo {
+            fields: HashMap::from([("memo-key".to_owned(), Payload::default())]),
+        });
+        let client = MockScheduleClient {
+            describe_response,
+            data_converter: DataConverter::new(
+                PayloadConverter::default(),
+                DefaultFailureConverter,
+                FailingCodec,
+            ),
+            ..Default::default()
+        };
+
+        let err = make_schedule_handle(client)
+            .describe(Default::default())
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, ScheduleError::PayloadConversion(_)));
     }
 
     #[tokio::test]

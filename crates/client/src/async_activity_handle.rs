@@ -45,7 +45,7 @@ async fn encode_optional_value(
     let payloads = data_converter
         .codec()
         .encode(&SerializationContextData::Activity, unencoded_payloads)
-        .await;
+        .await?;
     Ok(Some(Payloads { payloads }))
 }
 
@@ -221,7 +221,7 @@ impl<CT: WorkflowService + NamespacedClient + Clone> AsyncActivityHandle<CT> {
                             data_converter.codec(),
                             &SerializationContextData::Activity,
                         )
-                        .await;
+                        .await?;
                         let last_heartbeat_details =
                             encode_optional_value(details, &data_converter).await?;
                         match identifier {

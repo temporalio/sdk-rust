@@ -243,6 +243,9 @@ impl WorkflowGetResultError {
 #[derive(thiserror::Error, Debug)]
 #[non_exhaustive]
 pub enum ClientError {
+    /// Error decoding payloads returned by the server.
+    #[error("Payload conversion error: {0}")]
+    PayloadConversion(#[from] PayloadConversionError),
     /// An uncategorized rpc error from the server.
     #[error("Server error: {0}")]
     Rpc(#[from] tonic::Status),

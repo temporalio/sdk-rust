@@ -90,18 +90,21 @@ pub struct WorkflowResultDetails {
 }
 
 impl WorkflowResultDetails {
-    async fn new(payloads: Vec<Payload>, data_converter: &DataConverter) -> Self {
+    async fn new(
+        payloads: Vec<Payload>,
+        data_converter: &DataConverter,
+    ) -> Result<Self, PayloadConversionError> {
         let payloads = data_converter
             .codec()
             .decode(&SerializationContextData::Workflow, payloads)
-            .await;
-        Self {
+            .await?;
+        Ok(Self {
             payloads: DecodablePayloads::new(
                 payloads,
                 data_converter.payload_converter().clone(),
                 SerializationContextData::Workflow,
             ),
-        }
+        })
     }
 
     /// Deserialize the details into a typed value using the client's payload converter.
@@ -173,7 +176,7 @@ impl WorkflowExecutionDescription {
             data_converter.codec(),
             &SerializationContextData::Workflow,
         )
-        .await;
+        .await?;
         let decoded_metadata =
             decode_user_metadata(&SerializationContextData::Workflow, raw_user_metadata)?;
         let history_length_raw = raw_description
@@ -591,7 +594,7 @@ where
                         dc.codec(),
                         &SerializationContextData::Workflow,
                     )
-                    .await;
+                    .await?;
                     let error = dc.failure_converter().to_error(
                         failure,
                         dc.payload_converter(),
@@ -602,7 +605,7 @@ where
                 Some(Attributes::WorkflowExecutionCanceledEventAttributes(attrs)) => {
                     Ok(WorkflowExecutionResult::Cancelled {
                         details: WorkflowResultDetails::new(Vec::from_payloads(attrs.details), dc)
-                            .await,
+                            .await?,
                     })
                 }
                 Some(Attributes::WorkflowExecutionTimedOutEventAttributes(attrs)) => {
@@ -612,7 +615,7 @@ where
                 Some(Attributes::WorkflowExecutionTerminatedEventAttributes(attrs)) => {
                     Ok(WorkflowExecutionResult::Terminated {
                         details: WorkflowResultDetails::new(Vec::from_payloads(attrs.details), dc)
-                            .await,
+                            .await?,
                     })
                 }
                 Some(Attributes::WorkflowExecutionContinuedAsNewEventAttributes(attrs)) => {
@@ -684,7 +687,7 @@ where
                         let payloads = data_converter
                             .codec()
                             .encode(&SerializationContextData::Workflow, unencoded_payloads?)
-                            .await;
+                            .await?;
                         let mut request = SignalWorkflowExecutionRequest {
                             namespace: client.namespace(),
                             workflow_execution: Some(ProtoWorkflowExecution {
@@ -755,7 +758,7 @@ where
                         let payloads = data_converter
                             .codec()
                             .encode(&SerializationContextData::Workflow, unencoded_payloads?)
-                            .await;
+                            .await?;
                         let mut request = QueryWorkflowRequest {
                             namespace: client.namespace(),
                             execution: Some(ProtoWorkflowExecution {
@@ -878,7 +881,7 @@ where
                         let payloads = data_converter
                             .codec()
                             .encode(&SerializationContextData::Workflow, unencoded_payloads?)
-                            .await;
+                            .await?;
                         let lifecycle_stage = match options.wait_for_stage {
                             WorkflowUpdateWaitStage::Admitted => {
                                 UpdateWorkflowExecutionLifecycleStage::Admitted
@@ -1306,7 +1309,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_helpers::XorCodec;
+    use crate::test_helpers::{FailingCodec, XorCodec};
     use std::collections::HashMap;
     use temporalio_common::{
         data_converters::DefaultFailureConverter,
@@ -1332,7 +1335,9 @@ mod tests {
             )
             .await
             .unwrap();
-        let details = WorkflowResultDetails::new(payloads.clone(), &converter).await;
+        let details = WorkflowResultDetails::new(payloads.clone(), &converter)
+            .await
+            .unwrap();
 
         assert_ne!(details.raw(), payloads);
         let decoded_payloads = details.raw().to_vec();
@@ -1346,10 +1351,53 @@ mod tests {
     #[tokio::test]
     async fn workflow_result_detail_conversion_errors_are_reported() {
         let details =
-            WorkflowResultDetails::new(vec![Payload::default()], &DataConverter::default()).await;
+            WorkflowResultDetails::new(vec![Payload::default()], &DataConverter::default())
+                .await
+                .unwrap();
 
         assert_eq!(details.raw(), &[Payload::default()]);
         assert!(details.deserialize::<String>().is_err());
+    }
+
+    #[tokio::test]
+    async fn workflow_result_details_propagate_codec_errors() {
+        let converter = DataConverter::new(
+            PayloadConverter::default(),
+            DefaultFailureConverter,
+            FailingCodec,
+        );
+
+        let err = WorkflowResultDetails::new(vec![Payload::default()], &converter)
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.to_string(), "Encoding error: codec decode failed");
+    }
+
+    #[tokio::test]
+    async fn workflow_description_propagates_codec_errors() {
+        let converter = DataConverter::new(
+            PayloadConverter::default(),
+            DefaultFailureConverter,
+            FailingCodec,
+        );
+
+        let err = WorkflowExecutionDescription::new(
+            DescribeWorkflowExecutionResponse {
+                workflow_execution_info: Some(workflow::WorkflowExecutionInfo {
+                    memo: Some(Memo {
+                        fields: HashMap::from([("memo-key".to_owned(), Payload::default())]),
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            &converter,
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(err.to_string(), "Encoding error: codec decode failed");
     }
 
     #[tokio::test]

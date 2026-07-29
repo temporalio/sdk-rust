@@ -1234,7 +1234,7 @@ where
                         let payloads = data_converter
                             .codec()
                             .encode(&SerializationContextData::Workflow, unencoded_payloads?)
-                            .await;
+                            .await?;
                         let namespace = client.namespace();
                         let workflow_id = options.workflow_id.clone();
                         let task_queue_name = options.task_queue.clone();
@@ -1495,13 +1495,18 @@ where
 
                             let data_converter = client.data_converter().clone();
                             for execution in &mut output.executions {
-                                if let Some(memo) = execution.memo.as_mut() {
-                                    decode_payloads(
+                                if let Some(memo) = execution.memo.as_mut()
+                                    && let Err(err) = decode_payloads(
                                         memo,
                                         data_converter.codec(),
                                         &SerializationContextData::Workflow,
                                     )
-                                    .await;
+                                    .await
+                                {
+                                    return Some((
+                                        Err(ClientError::from(err)),
+                                        (new_token, buffer, yielded, true),
+                                    ));
                                 }
                             }
                             buffer = output
@@ -2009,17 +2014,23 @@ mod tests {
                 &self,
                 _context: &SerializationContextData,
                 payloads: Vec<Payload>,
-            ) -> futures_util::future::BoxFuture<'static, Vec<Payload>> {
+            ) -> futures_util::future::BoxFuture<
+                'static,
+                Result<Vec<Payload>, PayloadConversionError>,
+            > {
                 self.encode_calls.fetch_add(1, Ordering::SeqCst);
-                Box::pin(async move { payloads })
+                Box::pin(async move { Ok(payloads) })
             }
 
             fn decode(
                 &self,
                 _context: &SerializationContextData,
                 payloads: Vec<Payload>,
-            ) -> futures_util::future::BoxFuture<'static, Vec<Payload>> {
-                Box::pin(async move { payloads })
+            ) -> futures_util::future::BoxFuture<
+                'static,
+                Result<Vec<Payload>, PayloadConversionError>,
+            > {
+                Box::pin(async move { Ok(payloads) })
             }
         }
 
@@ -2548,7 +2559,7 @@ mod tests {
 
     mod list_workflows_tests {
         use super::*;
-        use crate::test_helpers::XorCodec;
+        use crate::test_helpers::{FailingCodec, XorCodec};
         use futures_util::{FutureExt, StreamExt};
         use std::sync::atomic::{AtomicUsize, Ordering};
         use temporalio_common::{
@@ -2791,6 +2802,28 @@ mod tests {
                 workflow.memo().get::<String>("memo-key").unwrap(),
                 Some("memo-value".to_owned())
             );
+        }
+
+        #[tokio::test]
+        async fn list_workflows_yields_codec_error_then_ends() {
+            let client = MockListWorkflowsClient {
+                call_count: Arc::new(AtomicUsize::new(0)),
+                page_size: 1,
+                total_workflows: 1,
+                data_converter: DataConverter::new(
+                    PayloadConverter::default(),
+                    DefaultFailureConverter,
+                    FailingCodec,
+                ),
+                memo_payload: Some(Payload::default()),
+                interceptors: Vec::new(),
+            };
+            let mut stream = client.list_workflows("", WorkflowListOptions::default());
+
+            let err = stream.next().await.unwrap().unwrap_err();
+
+            assert!(matches!(err, ClientError::PayloadConversion(_)));
+            assert!(stream.next().await.is_none());
         }
     }
 }

@@ -136,7 +136,9 @@ use temporalio_common::{
             workflow_activation::{WorkflowActivation, workflow_activation_job::Variant},
             workflow_completion::WorkflowActivationCompletion,
         },
-        temporal::api::{common::v1::Payload, enums::v1::WorkflowTaskFailedCause},
+        temporal::api::{
+            common::v1::Payload, enums::v1::WorkflowTaskFailedCause, failure::v1::Failure,
+        },
     },
     worker::{WorkerDeploymentOptions, WorkerTaskTypes, build_id_from_current_exe},
 };
@@ -543,6 +545,49 @@ impl ActivityNotRegisteredError {
     }
 }
 
+async fn encode_workflow_completion(
+    completion: &mut WorkflowActivationCompletion,
+    data_converter: &DataConverter,
+) {
+    let run_id = completion.run_id.clone();
+    if let Err(err) = encode_payloads(
+        completion,
+        data_converter.codec(),
+        &SerializationContextData::Workflow,
+    )
+    .await
+    {
+        error!(run_id, error = %err, "Failed encoding workflow activation completion");
+        *completion = WorkflowActivationCompletion::fail(
+            run_id,
+            Failure {
+                message: format!("Failed encoding completion: {err}"),
+                ..Default::default()
+            },
+            Some(WorkflowTaskFailedCause::WorkflowWorkerUnhandledFailure),
+        );
+    }
+}
+
+async fn encode_activity_completion(
+    completion: &mut ActivityTaskCompletion,
+    data_converter: &DataConverter,
+) {
+    if let Err(err) = encode_payloads(
+        completion,
+        data_converter.codec(),
+        &SerializationContextData::Activity,
+    )
+    .await
+    {
+        error!(error = %err, "Failed encoding activity task completion");
+        completion.result = Some(ActivityExecutionResult::fail(Failure::application_failure(
+            format!("Failed encoding activity completion: {err}"),
+            false,
+        )));
+    }
+}
+
 impl Worker {
     /// Create a new worker from an existing client, and options.
     pub fn new(
@@ -743,12 +788,7 @@ impl Worker {
             UnboundedReceiverStream::new(completions_rx)
                 .map(Ok)
                 .try_for_each_concurrent(None, |mut completion| async {
-                    encode_payloads(
-                        &mut completion,
-                        common.data_converter.codec(),
-                        &SerializationContextData::Workflow,
-                    )
-                    .await;
+                    encode_workflow_completion(&mut completion, &common.data_converter).await;
                     if let Some(ref i) = common.worker_interceptor {
                         i.on_workflow_activation_completion(&completion).await;
                     }
@@ -773,12 +813,29 @@ impl Worker {
                                     }
                                     o => o?,
                                 };
-                            decode_payloads(
+                            if let Err(err) = decode_payloads(
                                 &mut activation,
                                 common.data_converter.codec(),
                                 &SerializationContextData::Workflow,
                             )
-                            .await;
+                            .await
+                            {
+                                let run_id = activation.run_id;
+                                error!(run_id, error = %err, "Failed decoding workflow activation");
+                                completions_tx
+                                    .send(WorkflowActivationCompletion::fail(
+                                        run_id,
+                                        Failure {
+                                            message: format!("Failed decoding activation: {err}"),
+                                            ..Default::default()
+                                        },
+                                        Some(
+                                            WorkflowTaskFailedCause::WorkflowWorkerUnhandledFailure,
+                                        ),
+                                    ))
+                                    .expect("Completion channel intact");
+                                continue;
+                            }
                             if let Some(ref i) = common.worker_interceptor {
                                 i.on_workflow_activation(&activation).await?;
                             }
@@ -824,12 +881,28 @@ impl Worker {
                             break;
                         }
                         let mut activity = activity?;
-                        decode_payloads(
+                        if let Err(err) = decode_payloads(
                             &mut activity,
                             common.data_converter.codec(),
                             &SerializationContextData::Activity,
                         )
-                        .await;
+                        .await
+                        {
+                            error!(error = %err, "Failed decoding activity task");
+                            let mut completion = ActivityTaskCompletion {
+                                task_token: activity.task_token,
+                                result: Some(ActivityExecutionResult::fail(
+                                    Failure::application_failure(
+                                        format!("Failed decoding activity task: {err}"),
+                                        false,
+                                    ),
+                                )),
+                            };
+                            encode_activity_completion(&mut completion, &common.data_converter)
+                                .await;
+                            common.worker.complete_activity_task(completion).await?;
+                            continue;
+                        }
                         match act_half.activity_task_handler(
                             common.worker.clone(),
                             common.client_options.clone(),
@@ -856,12 +929,8 @@ impl Worker {
                                     task_token,
                                     result: Some(ActivityExecutionResult::fail(failure)),
                                 };
-                                encode_payloads(
-                                    &mut completion,
-                                    common.data_converter.codec(),
-                                    &SerializationContextData::Activity,
-                                )
-                                .await;
+                                encode_activity_completion(&mut completion, &common.data_converter)
+                                    .await;
                                 common.worker.complete_activity_task(completion).await?;
                             }
                             Err(ActivityTaskHandlerError::Fatal(err)) => return Err(err),
@@ -1135,12 +1204,7 @@ impl ActivityHalf {
                         task_token,
                         result: Some(result),
                     };
-                    encode_payloads(
-                        &mut completion,
-                        codec_data_converter.codec(),
-                        &SerializationContextData::Activity,
-                    )
-                    .await;
+                    encode_activity_completion(&mut completion, &codec_data_converter).await;
                     worker.complete_activity_task(completion).await?;
                     Ok::<_, anyhow::Error>(())
                 });
@@ -1217,7 +1281,48 @@ impl PrintablePanicType for EndPrintingAttempts {
 mod tests {
     use super::*;
     use crate::activities::ActivityError;
+    use futures_util::future::BoxFuture;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use temporalio_common::{
+        data_converters::{
+            DefaultFailureConverter, PayloadCodec, PayloadConversionError, PayloadConverter,
+        },
+        protos::coresdk::{
+            activity_result::activity_execution_result,
+            workflow_commands::{CompleteWorkflowExecution, workflow_command},
+            workflow_completion::workflow_activation_completion,
+        },
+    };
     use temporalio_macros::{activities, activity_definitions, workflow, workflow_methods};
+
+    #[derive(Default)]
+    struct FailingEncodeCodec {
+        calls: AtomicUsize,
+    }
+
+    impl PayloadCodec for FailingEncodeCodec {
+        fn encode(
+            &self,
+            _: &SerializationContextData,
+            _: Vec<Payload>,
+        ) -> BoxFuture<'static, Result<Vec<Payload>, PayloadConversionError>> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            async move {
+                Err(PayloadConversionError::EncodingError(
+                    "codec encode failed".into(),
+                ))
+            }
+            .boxed()
+        }
+
+        fn decode(
+            &self,
+            _: &SerializationContextData,
+            payloads: Vec<Payload>,
+        ) -> BoxFuture<'static, Result<Vec<Payload>, PayloadConversionError>> {
+            async move { Ok(payloads) }.boxed()
+        }
+    }
 
     struct MyActivities {}
 
@@ -1256,6 +1361,71 @@ mod tests {
     fn test_activity_registration() {
         let act_instance = MyActivities {};
         let _ = WorkerOptions::new("task_q").register_activities(act_instance);
+    }
+
+    #[tokio::test]
+    async fn workflow_completion_codec_error_uses_unencoded_failure() {
+        let codec = Arc::new(FailingEncodeCodec::default());
+        let data_converter = DataConverter::new(
+            PayloadConverter::default(),
+            DefaultFailureConverter,
+            codec.clone(),
+        );
+        let mut completion = WorkflowActivationCompletion::from_cmd(
+            "run-id",
+            workflow_command::Variant::CompleteWorkflowExecution(CompleteWorkflowExecution {
+                result: Some(Payload::default()),
+            }),
+        );
+
+        encode_workflow_completion(&mut completion, &data_converter).await;
+
+        let Some(workflow_activation_completion::Status::Failed(failed)) = completion.status else {
+            panic!("expected failed workflow completion")
+        };
+        assert_eq!(
+            failed.failure.unwrap().message,
+            "Failed encoding completion: Encoding error: codec encode failed"
+        );
+        assert_eq!(
+            failed.force_cause,
+            WorkflowTaskFailedCause::WorkflowWorkerUnhandledFailure as i32
+        );
+        assert_eq!(codec.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn activity_completion_codec_error_uses_unencoded_failure() {
+        let codec = Arc::new(FailingEncodeCodec::default());
+        let data_converter = DataConverter::new(
+            PayloadConverter::default(),
+            DefaultFailureConverter,
+            codec.clone(),
+        );
+        let mut completion = ActivityTaskCompletion {
+            task_token: vec![],
+            result: Some(ActivityExecutionResult::ok(Payload::default())),
+        };
+
+        encode_activity_completion(&mut completion, &data_converter).await;
+
+        let Some(activity_execution_result::Status::Failed(failed)) =
+            completion.result.unwrap().status
+        else {
+            panic!("expected failed activity completion")
+        };
+        let failure = failed.failure.unwrap();
+        assert_eq!(
+            failure.message,
+            "Failed encoding activity completion: Encoding error: codec encode failed"
+        );
+        assert!(matches!(
+            failure.failure_info,
+            Some(
+                temporalio_common::protos::temporal::api::failure::v1::failure::FailureInfo::ApplicationFailureInfo(info)
+            ) if !info.non_retryable
+        ));
+        assert_eq!(codec.calls.load(Ordering::SeqCst), 1);
     }
 
     // Compile-only test for workflow context invocation
