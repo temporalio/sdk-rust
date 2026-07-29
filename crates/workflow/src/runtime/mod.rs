@@ -33,11 +33,52 @@ pub(crate) enum InterceptedFuturePollKind {
     Routine,
 }
 
+/// Tracks whether polling is still in the interceptor chain or has crossed the handler
+/// boundary.
+///
+/// ```text
+/// new
+///  |
+///  v
+/// Interceptor { has_activation: false, handler_result_ready: false }
+///  |
+///  |-- reset_for_poll ------------> Interceptor { has_activation: false, handler_result_ready }
+///  |-- mark_activation -----------> Interceptor { has_activation: true,  handler_result_ready }
+///  |-- mark_handler_result_ready -> Interceptor { has_activation,        handler_result_ready: true }
+///  `-- enter_handler -------------> Handler
+/// ```
+///
+/// [`InterceptedFuturePollKind`] changes only for the duration of a poll and does
+/// not otherwise affect these transitions.
+#[derive(Clone, Copy)]
+enum InterceptedFutureState {
+    Interceptor {
+        has_activation: bool,
+        handler_result_ready: bool,
+    },
+    Handler,
+}
+
+impl InterceptedFutureState {
+    fn pending_state(self) -> RoutinePendingState {
+        match self {
+            Self::Interceptor {
+                has_activation: false,
+                ..
+            } => RoutinePendingState::Interceptor,
+            Self::Interceptor {
+                has_activation: true,
+                ..
+            } => RoutinePendingState::InterceptorWithActivation,
+            Self::Handler => RoutinePendingState::Handler,
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 struct InterceptedFutureStatusInner {
-    state: RoutinePendingState,
+    state: InterceptedFutureState,
     poll_kind: InterceptedFuturePollKind,
-    handler_result_ready: bool,
 }
 
 /// Shares poll progress between the outer chain, its terminal handler boundary, and SDK command
@@ -52,9 +93,11 @@ impl InterceptedFutureStatus {
     /// Starts above the terminal boundary because no part of the chain has been polled yet.
     pub(crate) fn new() -> Self {
         Self(Rc::new(Cell::new(InterceptedFutureStatusInner {
-            state: RoutinePendingState::Interceptor,
+            state: InterceptedFutureState::Interceptor {
+                has_activation: false,
+                handler_result_ready: false,
+            },
             poll_kind: InterceptedFuturePollKind::Routine,
-            handler_result_ready: false,
         })))
     }
 
@@ -64,41 +107,56 @@ impl InterceptedFutureStatus {
     /// Reaching the handler is permanent, so that state is intentionally preserved.
     pub(crate) fn reset_for_poll(&self) {
         let mut status = self.0.get();
-        if status.state != RoutinePendingState::Handler {
-            status.state = RoutinePendingState::Interceptor;
+        if let InterceptedFutureState::Interceptor {
+            handler_result_ready,
+            ..
+        } = status.state
+        {
+            status.state = InterceptedFutureState::Interceptor {
+                has_activation: false,
+                handler_result_ready,
+            };
             self.0.set(status);
         }
     }
 
-    /// Makes the terminal-boundary transition sticky because subsequent pending work belongs to
-    /// normal workflow or handler execution rather than interceptor construction.
-    pub(crate) fn mark_handler(&self) {
+    /// Makes reaching the terminal handler sticky while letting known-ready synchronous results
+    /// finish during construction without probing arbitrary handler futures.
+    pub(crate) fn enter_handler(&self) -> bool {
         let mut status = self.0.get();
-        status.state = RoutinePendingState::Handler;
+        let handler_result_ready = match status.state {
+            InterceptedFutureState::Interceptor {
+                handler_result_ready,
+                ..
+            } => handler_result_ready,
+            InterceptedFutureState::Handler => false,
+        };
+        let should_poll =
+            handler_result_ready || status.poll_kind == InterceptedFuturePollKind::Routine;
+        status.state = InterceptedFutureState::Handler;
         self.0.set(status);
+        should_poll
     }
 
     /// Returns the evidence collected during the latest poll for activation-completion decisions.
     pub(crate) fn state(&self) -> RoutinePendingState {
-        self.0.get().state
+        self.0.get().state.pending_state()
     }
 
     /// Allows an already-computed synchronous handler result to flow through construction without
     /// requiring the boundary to probe an arbitrary handler future.
     pub(crate) fn mark_handler_result_ready(&self) {
         let mut status = self.0.get();
-        status.handler_result_ready = true;
-        self.0.set(status);
+        if let InterceptedFutureState::Interceptor { has_activation, .. } = status.state {
+            status.state = InterceptedFutureState::Interceptor {
+                has_activation,
+                handler_result_ready: true,
+            };
+            self.0.set(status);
+        }
     }
 
-    /// Lets the terminal boundary distinguish a known-ready result from an arbitrary future that
-    /// must not be probed during construction.
-    pub(crate) fn handler_result_ready(&self) -> bool {
-        self.0.get().handler_result_ready
-    }
-
-    /// Lets the terminal boundary block only the construction pre-poll, not the first routine poll
-    /// that happens to reach the boundary.
+    #[cfg(test)]
     pub(crate) fn poll_kind(&self) -> InterceptedFuturePollKind {
         self.0.get().poll_kind
     }
@@ -106,8 +164,15 @@ impl InterceptedFutureStatus {
     /// Records an activation-producing SDK wait without overwriting the stronger handler state.
     fn mark_activation(&self) {
         let mut status = self.0.get();
-        if status.state == RoutinePendingState::Interceptor {
-            status.state = RoutinePendingState::InterceptorWithActivation;
+        if let InterceptedFutureState::Interceptor {
+            handler_result_ready,
+            ..
+        } = status.state
+        {
+            status.state = InterceptedFutureState::Interceptor {
+                has_activation: true,
+                handler_result_ready,
+            };
             self.0.set(status);
         }
     }

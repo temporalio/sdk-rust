@@ -138,10 +138,7 @@ impl<F: Future + Unpin> Future for HandlerBoundaryFuture<F> {
     type Output = F::Output;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        self.status.mark_handler();
-        if self.status.poll_kind() == InterceptedFuturePollKind::Construction
-            && !self.status.handler_result_ready()
-        {
+        if !self.status.enter_handler() {
             return Poll::Pending;
         }
         Pin::new(&mut self.inner).poll(cx)
@@ -1251,6 +1248,24 @@ mod tests {
 
         assert_eq!(future.poll_for_construction(&mut cx), Poll::Ready(42));
         assert_eq!(polls.get(), 1);
+        assert_eq!(future.pending_state(), RoutinePendingState::Handler);
+    }
+
+    #[test]
+    fn unpolled_ready_handler_still_reports_interceptor_pending() {
+        let status = InterceptedFutureStatus::new();
+        let boundary_status = status.clone();
+        let inner = async move {
+            crate::runtime::mark_intercepted_handler_ready();
+            let boundary = HandlerBoundaryFuture::new(ready(42), boundary_status);
+            std::future::pending::<()>().await;
+            boundary.await
+        };
+        let mut future = InterceptedFuture::new(inner.boxed_local(), status);
+        let mut cx = Context::from_waker(Waker::noop());
+
+        assert_eq!(future.poll_for_construction(&mut cx), Poll::Pending);
+        assert_eq!(future.pending_state(), RoutinePendingState::Interceptor);
     }
 
     #[test]
