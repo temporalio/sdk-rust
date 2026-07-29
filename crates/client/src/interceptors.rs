@@ -1045,7 +1045,7 @@ impl HeartbeatAsyncActivityInput {
 /// }
 ///
 /// let _options = ClientOptions::new("my-namespace")
-///     .client_interceptors(vec![Arc::new(StartTimeout) as Arc<dyn ClientInterceptor>])
+///     .client_interceptors(vec![Arc::new(StartTimeout)])
 ///     .build();
 /// ```
 pub trait ClientInterceptor: Send + Sync + 'static {
