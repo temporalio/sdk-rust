@@ -67,6 +67,8 @@ to docs, or any other relevant information.
 ### Added
 * Workers can configure the maximum number of activity slots reserved for eager execution per
   workflow task with `WorkerOptions::max_eager_activity_reservations_per_workflow_task`.
+* `WorkflowInterceptor` for observing, transforming, or short-circuiting inbound workflow calls
+  and outbound operations.
 * Schedule descriptions now expose their configured action via `ScheduleDescription::action()`,
   including start-workflow accessors for workflow type, task queue, workflow ID, raw argument
   payloads, and typed argument decoding through the client's data converter.
