@@ -87,6 +87,41 @@ impl dyn TemporalClientValue {
     }
 }
 
+/// Provides access to the arguments carried by a client interceptor input.
+pub trait HasArgs {
+    /// Attempt to access the arguments as a concrete type.
+    fn args_ref<T: Any>(&self) -> Option<&T>;
+
+    /// Attempt to mutably access the arguments as a concrete type.
+    fn args_mut<T: Any>(&mut self) -> Option<&mut T>;
+
+    /// Replace the arguments with another serializable value.
+    fn replace_args<T>(&mut self, args: T)
+    where
+        T: TemporalSerializable + Send + 'static;
+}
+
+macro_rules! impl_with_args {
+    ($input:ty) => {
+        impl HasArgs for $input {
+            fn args_ref<T: Any>(&self) -> Option<&T> {
+                self.args.as_any().downcast_ref()
+            }
+
+            fn args_mut<T: Any>(&mut self) -> Option<&mut T> {
+                self.args.as_any_mut().downcast_mut()
+            }
+
+            fn replace_args<T>(&mut self, args: T)
+            where
+                T: TemporalSerializable + Send + 'static,
+            {
+                self.args = Box::new(args);
+            }
+        }
+    };
+}
+
 /// Continuation for an intercepted client operation.
 ///
 /// A continuation can be invoked at most once because [`run`](Self::run) consumes it.
@@ -148,25 +183,9 @@ impl StartWorkflowInput {
             self.rpc_options,
         )
     }
-
-    /// Attempt to access the workflow arguments as a concrete type.
-    pub fn args_ref<T: Any>(&self) -> Option<&T> {
-        self.args.as_any().downcast_ref()
-    }
-
-    /// Attempt to mutably access the workflow arguments as a concrete type.
-    pub fn args_mut<T: Any>(&mut self) -> Option<&mut T> {
-        self.args.as_any_mut().downcast_mut()
-    }
-
-    /// Replace the workflow arguments with another serializable value.
-    pub fn replace_args<T>(&mut self, args: T)
-    where
-        T: TemporalSerializable + Send + 'static,
-    {
-        self.args = Box::new(args);
-    }
 }
+
+impl_with_args!(StartWorkflowInput);
 
 /// Result of a successful intercepted workflow start.
 #[non_exhaustive]
@@ -354,25 +373,9 @@ impl SignalWorkflowInput {
             self.options,
         )
     }
-
-    /// Attempt to access the signal arguments as a concrete type.
-    pub fn args_ref<T: Any>(&self) -> Option<&T> {
-        self.args.as_any().downcast_ref()
-    }
-
-    /// Attempt to mutably access the signal arguments as a concrete type.
-    pub fn args_mut<T: Any>(&mut self) -> Option<&mut T> {
-        self.args.as_any_mut().downcast_mut()
-    }
-
-    /// Replace the signal arguments with another serializable value.
-    pub fn replace_args<T>(&mut self, args: T)
-    where
-        T: TemporalSerializable + Send + 'static,
-    {
-        self.args = Box::new(args);
-    }
 }
+
+impl_with_args!(SignalWorkflowInput);
 
 /// Input to [`ClientInterceptor::query_workflow`].
 #[non_exhaustive]
@@ -427,25 +430,9 @@ impl QueryWorkflowInput {
             self.options,
         )
     }
-
-    /// Attempt to access the query arguments as a concrete type.
-    pub fn args_ref<T: Any>(&self) -> Option<&T> {
-        self.args.as_any().downcast_ref()
-    }
-
-    /// Attempt to mutably access the query arguments as a concrete type.
-    pub fn args_mut<T: Any>(&mut self) -> Option<&mut T> {
-        self.args.as_any_mut().downcast_mut()
-    }
-
-    /// Replace the query arguments with another serializable value.
-    pub fn replace_args<T>(&mut self, args: T)
-    where
-        T: TemporalSerializable + Send + 'static,
-    {
-        self.args = Box::new(args);
-    }
 }
+
+impl_with_args!(QueryWorkflowInput);
 
 /// Result of an intercepted workflow query before typed result conversion.
 #[non_exhaustive]
@@ -514,25 +501,9 @@ impl StartWorkflowUpdateInput {
             self.options,
         )
     }
-
-    /// Attempt to access the update arguments as a concrete type.
-    pub fn args_ref<T: Any>(&self) -> Option<&T> {
-        self.args.as_any().downcast_ref()
-    }
-
-    /// Attempt to mutably access the update arguments as a concrete type.
-    pub fn args_mut<T: Any>(&mut self) -> Option<&mut T> {
-        self.args.as_any_mut().downcast_mut()
-    }
-
-    /// Replace the update arguments with another serializable value.
-    pub fn replace_args<T>(&mut self, args: T)
-    where
-        T: TemporalSerializable + Send + 'static,
-    {
-        self.args = Box::new(args);
-    }
 }
+
+impl_with_args!(StartWorkflowUpdateInput);
 
 /// Result of an intercepted workflow-update start.
 #[non_exhaustive]

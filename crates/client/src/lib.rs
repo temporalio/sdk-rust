@@ -50,7 +50,7 @@ pub use interceptors::{
     CountWorkflowsInput, CountWorkflowsOutput, CreateScheduleInput, CreateScheduleOutput,
     DeleteScheduleInput, DescribeScheduleInput, DescribeScheduleOutput, DescribeWorkflowInput,
     DescribeWorkflowOutput, FailAsyncActivityInput, FetchWorkflowHistoryPageInput,
-    FetchWorkflowHistoryPageOutput, HeartbeatAsyncActivityInput, ListSchedulesPageInput,
+    FetchWorkflowHistoryPageOutput, HasArgs, HeartbeatAsyncActivityInput, ListSchedulesPageInput,
     ListSchedulesPageOutput, ListWorkflowsPageInput, ListWorkflowsPageOutput, Next,
     PauseScheduleInput, PollWorkflowUpdateInput, PollWorkflowUpdateOutput, QueryWorkflowInput,
     QueryWorkflowOutput, ReportAsyncActivityCancellationInput, SendScheduleUpdateInput,

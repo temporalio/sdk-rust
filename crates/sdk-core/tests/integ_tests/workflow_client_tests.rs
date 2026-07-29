@@ -9,7 +9,7 @@ use std::{
     time::Duration,
 };
 use temporalio_client::{
-    ClientInterceptor, Next, StartWorkflowInput, StartWorkflowOutput, UntypedWorkflow,
+    ClientInterceptor, HasArgs, Next, StartWorkflowInput, StartWorkflowOutput, UntypedWorkflow,
     WorkflowCountOptions, WorkflowListOptions, WorkflowStartOptions, WorkflowTerminateOptions,
     errors::WorkflowStartError,
 };
