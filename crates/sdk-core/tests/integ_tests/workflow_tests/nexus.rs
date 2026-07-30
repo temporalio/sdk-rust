@@ -225,7 +225,7 @@ async fn nexus_basic(
         _ => unreachable!(),
     }
     wf_handle
-        .fetch_history_and_replay(worker.inner_mut())
+        .fetch_history_and_replay(&mut worker)
         .await
         .unwrap();
 }
@@ -520,7 +520,7 @@ async fn nexus_async(
         }
     }
     wf_handle
-        .fetch_history_and_replay(worker.inner_mut())
+        .fetch_history_and_replay(&mut worker)
         .await
         .unwrap();
 }
@@ -588,10 +588,7 @@ async fn nexus_cancel_before_start() {
 
     worker.run_until_done().await.unwrap();
 
-    handle
-        .fetch_history_and_replay(worker.inner_mut())
-        .await
-        .unwrap();
+    handle.fetch_history_and_replay(&mut worker).await.unwrap();
 }
 
 #[workflow]
@@ -707,10 +704,7 @@ async fn nexus_must_complete_task_to_shutdown(#[values(true, false)] use_grace_p
     // The first thing to finish needs to have been the nexus task completion
     assert_eq!(complete_order_rx.recv().await.unwrap(), "t");
 
-    handle
-        .fetch_history_and_replay(worker.inner_mut())
-        .await
-        .unwrap();
+    handle.fetch_history_and_replay(&mut worker).await.unwrap();
 }
 
 #[workflow]
@@ -1081,7 +1075,7 @@ async fn nexus_cancellation_types(
     }
 
     wf_handle
-        .fetch_history_and_replay(worker.inner_mut())
+        .fetch_history_and_replay(&mut worker)
         .await
         .unwrap();
 }

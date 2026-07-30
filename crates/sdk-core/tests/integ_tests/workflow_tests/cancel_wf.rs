@@ -1,4 +1,4 @@
-use crate::common::{ActivationAssertionsInterceptor, CoreWfStarter, build_fake_sdk};
+use crate::common::{ActivationAssertionsInterceptor, CoreWfStarter, build_fake_sdk_intercepted};
 use std::time::Duration;
 use temporalio_client::{
     UntypedWorkflow, WorkflowCancelOptions, WorkflowDescribeOptions, WorkflowStartOptions,
@@ -142,8 +142,7 @@ async fn wf_completing_with_cancelled() {
             });
     });
 
-    let mut worker = build_fake_sdk(mock_cfg);
+    let mut worker = build_fake_sdk_intercepted(mock_cfg, aai);
     worker.register_workflow::<WfWithTimer>().unwrap();
-    worker.set_worker_interceptor(aai);
     worker.run().await.unwrap();
 }

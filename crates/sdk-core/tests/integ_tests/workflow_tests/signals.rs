@@ -1,4 +1,6 @@
-use crate::common::{ActivationAssertionsInterceptor, CoreWfStarter, build_fake_sdk};
+use crate::common::{
+    ActivationAssertionsInterceptor, CoreWfStarter, build_fake_sdk, build_fake_sdk_intercepted,
+};
 use std::collections::HashMap;
 use temporalio_client::{WorkflowStartOptions, WorkflowStartSignal};
 use temporalio_common::protos::{
@@ -356,8 +358,7 @@ async fn cancels_before_sending() {
         });
     });
 
-    let mut worker = build_fake_sdk(mock_cfg);
-    worker.set_worker_interceptor(aai);
+    let mut worker = build_fake_sdk_intercepted(mock_cfg, aai);
     worker.register_workflow::<CancelsBeforeSending>().unwrap();
     worker.run().await.unwrap();
 }

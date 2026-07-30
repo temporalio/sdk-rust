@@ -189,6 +189,12 @@ pub struct WorkerOptions {
     workflows: WorkflowDefinitions,
 
     #[builder(field)]
+    worker_interceptors: Vec<Arc<dyn WorkerInterceptor>>,
+
+    #[builder(field)]
+    activity_inbound_interceptors: Vec<Arc<dyn ActivityInboundInterceptor>>,
+
+    #[builder(field)]
     workflow_interceptor_constructors: Vec<WorkflowInterceptorConstructor>,
 
     #[cfg(feature = "wasm-workflows")]
@@ -309,6 +315,35 @@ pub struct WorkerOptions {
 }
 
 impl<S: worker_options_builder::State> WorkerOptionsBuilder<S> {
+    /// Append a worker interceptor. Interceptors run in registration order.
+    ///
+    /// **Experimental:** This API may change or be removed.
+    pub fn worker_interceptor<I: WorkerInterceptor + 'static>(mut self, interceptor: I) -> Self {
+        self.worker_interceptors.push(Arc::new(interceptor));
+        self
+    }
+
+    /// Append an activity inbound interceptor. Interceptors run outermost-first in registration
+    /// order.
+    ///
+    /// **Experimental:** This API may change or be removed.
+    pub fn activity_inbound_interceptor<I: ActivityInboundInterceptor>(
+        mut self,
+        interceptor: I,
+    ) -> Self {
+        self.activity_inbound_interceptors
+            .push(Arc::new(interceptor));
+        self
+    }
+
+    /// Append a workflow interceptor constructor.
+    ///
+    /// **Experimental:** This API may change or be removed.
+    pub fn workflow_interceptor(mut self, constructor: WorkflowInterceptorConstructor) -> Self {
+        self.workflow_interceptor_constructors.push(constructor);
+        self
+    }
+
     /// Registers all activities on an activity implementer.
     pub fn register_activities<AI: ActivityImplementer>(mut self, instance: AI) -> Self {
         self.activities.register_activities::<AI>(instance);
@@ -398,6 +433,41 @@ fn def_build_id() -> WorkerDeploymentOptions {
 }
 
 impl WorkerOptions {
+    /// Append a worker interceptor. Interceptors run in registration order.
+    ///
+    /// **Experimental:** This API may change or be removed.
+    pub fn worker_interceptor<I: WorkerInterceptor + 'static>(
+        &mut self,
+        interceptor: I,
+    ) -> &mut Self {
+        self.worker_interceptors.push(Arc::new(interceptor));
+        self
+    }
+
+    /// Append an activity inbound interceptor. Interceptors run outermost-first in registration
+    /// order.
+    ///
+    /// **Experimental:** This API may change or be removed.
+    pub fn activity_inbound_interceptor<I: ActivityInboundInterceptor>(
+        &mut self,
+        interceptor: I,
+    ) -> &mut Self {
+        self.activity_inbound_interceptors
+            .push(Arc::new(interceptor));
+        self
+    }
+
+    /// Append a workflow interceptor constructor.
+    ///
+    /// **Experimental:** This API may change or be removed.
+    pub fn workflow_interceptor(
+        &mut self,
+        constructor: WorkflowInterceptorConstructor,
+    ) -> &mut Self {
+        self.workflow_interceptor_constructors.push(constructor);
+        self
+    }
+
     /// Registers all activities on an activity implementer.
     pub fn register_activities<AI: ActivityImplementer>(&mut self, instance: AI) -> &mut Self {
         self.activities.register_activities::<AI>(instance);
@@ -524,7 +594,7 @@ pub struct Worker {
 struct CommonWorker {
     worker: Arc<CoreWorker>,
     task_queue: String,
-    worker_interceptor: Option<Box<dyn WorkerInterceptor>>,
+    worker_interceptors: Vec<Arc<dyn WorkerInterceptor>>,
     activity_inbound_interceptors: Vec<Arc<dyn ActivityInboundInterceptor>>,
     workflow_interceptor_constructors: Vec<WorkflowInterceptorConstructor>,
     client_options: ClientOptions,
@@ -663,6 +733,8 @@ impl Worker {
             Default::default(),
             Default::default(),
             Default::default(),
+            Default::default(),
+            Default::default(),
         )
     }
 
@@ -675,6 +747,9 @@ impl Worker {
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let acts = std::mem::take(&mut options.activities);
         let wfs = std::mem::take(&mut options.workflows);
+        let worker_interceptors = std::mem::take(&mut options.worker_interceptors);
+        let activity_inbound_interceptors =
+            std::mem::take(&mut options.activity_inbound_interceptors);
         let workflow_interceptor_constructors =
             std::mem::take(&mut options.workflow_interceptor_constructors);
         #[cfg(feature = "wasm-workflows")]
@@ -684,6 +759,8 @@ impl Worker {
             client_options,
             acts,
             wfs,
+            worker_interceptors,
+            activity_inbound_interceptors,
             workflow_interceptor_constructors,
         );
         me.set_detect_nondeterministic_futures(options.detect_nondeterministic_futures);
@@ -703,6 +780,8 @@ impl Worker {
         client_options: ClientOptions,
         activities: ActivityDefinitions,
         workflows: WorkflowDefinitions,
+        worker_interceptors: Vec<Arc<dyn WorkerInterceptor>>,
+        activity_inbound_interceptors: Vec<Arc<dyn ActivityInboundInterceptor>>,
         workflow_interceptor_constructors: Vec<WorkflowInterceptorConstructor>,
     ) -> Self {
         let data_converter = client_options.data_converter.clone();
@@ -710,8 +789,8 @@ impl Worker {
             common: CommonWorker {
                 task_queue: worker.get_config().task_queue.clone(),
                 worker,
-                worker_interceptor: None,
-                activity_inbound_interceptors: Vec::new(),
+                worker_interceptors,
+                activity_inbound_interceptors,
                 workflow_interceptor_constructors,
                 client_options,
                 data_converter,
@@ -852,7 +931,7 @@ impl Worker {
                 .map(Ok)
                 .try_for_each_concurrent(None, |mut completion| async {
                     encode_workflow_completion(&mut completion, &common.data_converter).await;
-                    if let Some(ref i) = common.worker_interceptor {
+                    for i in &common.worker_interceptors {
                         i.on_workflow_activation_completion(&completion).await;
                     }
                     common.worker.complete_workflow_activation(completion).await
@@ -899,7 +978,7 @@ impl Worker {
                                     .expect("Completion channel intact");
                                 continue;
                             }
-                            if let Some(ref i) = common.worker_interceptor {
+                            for i in &common.worker_interceptors {
                                 i.on_workflow_activation(&activation).await?;
                             }
                             if let Some(wf_fut) = wf_half
@@ -1009,38 +1088,11 @@ impl Worker {
             wf_completion_processor,
         )?;
 
-        if let Some(i) = self.common.worker_interceptor.as_ref() {
+        for i in &self.common.worker_interceptors {
             i.on_shutdown(self);
         }
         self.common.worker.shutdown().await;
         Ok(())
-    }
-
-    /// Set a [WorkerInterceptor]
-    pub fn set_worker_interceptor(&mut self, interceptor: impl WorkerInterceptor + 'static) {
-        self.common.worker_interceptor = Some(Box::new(interceptor));
-    }
-
-    /// Append an [ActivityInboundInterceptor] to the chain. Interceptors run in the order they
-    /// are added, outer-most first.
-    pub fn add_activity_inbound_interceptor(
-        &mut self,
-        interceptor: impl ActivityInboundInterceptor,
-    ) {
-        self.common
-            .activity_inbound_interceptors
-            .push(Arc::new(interceptor));
-    }
-
-    /// Set the ordered constructors used to create workflow interceptors for each workflow instance.
-    ///
-    /// This replaces any previously configured constructors. Existing workflow instances retain
-    /// their current interceptors; the new constructors apply when later instances are created.
-    pub fn register_workflow_interceptors(
-        &mut self,
-        constructors: Vec<WorkflowInterceptorConstructor>,
-    ) {
-        self.common.workflow_interceptor_constructors = constructors;
     }
 
     /// Turns this rust worker into a new worker with all the same workflows and activities

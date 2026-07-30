@@ -731,10 +731,7 @@ async fn update_with_local_acts() {
         worker.run_until_done().await.unwrap();
     };
     join!(update, run);
-    handle
-        .fetch_history_and_replay(worker.inner_mut())
-        .await
-        .unwrap();
+    handle.fetch_history_and_replay(&mut worker).await.unwrap();
 }
 
 #[tokio::test]
@@ -797,10 +794,7 @@ async fn update_rejection_sdk() {
         worker.run_until_done().await.unwrap();
     };
     join!(update, run);
-    handle
-        .fetch_history_and_replay(worker.inner_mut())
-        .await
-        .unwrap();
+    handle.fetch_history_and_replay(&mut worker).await.unwrap();
 }
 
 #[tokio::test]
@@ -854,10 +848,7 @@ async fn update_fail_sdk() {
         worker.run_until_done().await.unwrap();
     };
     join!(update, run);
-    handle
-        .fetch_history_and_replay(worker.inner_mut())
-        .await
-        .unwrap();
+    handle.fetch_history_and_replay(&mut worker).await.unwrap();
 }
 
 #[tokio::test]
@@ -991,10 +982,7 @@ async fn update_timer_sequence() {
         worker.run_until_done().await.unwrap();
     };
     join!(update, run);
-    handle
-        .fetch_history_and_replay(worker.inner_mut())
-        .await
-        .unwrap();
+    handle.fetch_history_and_replay(&mut worker).await.unwrap();
 }
 
 #[tokio::test]
@@ -1064,10 +1052,7 @@ async fn task_failure_during_validation() {
         worker.run_until_done().await.unwrap();
     };
     join!(update, run);
-    handle
-        .fetch_history_and_replay(worker.inner_mut())
-        .await
-        .unwrap();
+    handle.fetch_history_and_replay(&mut worker).await.unwrap();
     // Verify we did not spam task failures. There should only be one.
     let history = starter.get_history().await;
     assert_eq!(
@@ -1138,10 +1123,7 @@ async fn task_failure_after_update() {
         worker.run_until_done().await.unwrap();
     };
     join!(update, run);
-    handle
-        .fetch_history_and_replay(worker.inner_mut())
-        .await
-        .unwrap();
+    handle.fetch_history_and_replay(&mut worker).await.unwrap();
 }
 
 static BARR: LazyLock<Barrier> = LazyLock::new(|| Barrier::new(2));
@@ -1267,10 +1249,7 @@ async fn worker_restarted_in_middle_of_update() {
         worker.run_until_done().await.unwrap();
     };
     join!(update, run, stopper);
-    handle
-        .fetch_history_and_replay(worker.inner_mut())
-        .await
-        .unwrap();
+    handle.fetch_history_and_replay(&mut worker).await.unwrap();
 }
 
 #[tokio::test]
@@ -1364,10 +1343,7 @@ async fn update_after_empty_wft() {
         worker.run_until_done().await.unwrap();
     };
     join!(update, runner);
-    handle
-        .fetch_history_and_replay(worker.inner_mut())
-        .await
-        .unwrap();
+    handle.fetch_history_and_replay(&mut worker).await.unwrap();
 }
 
 #[tokio::test]
@@ -1442,8 +1418,5 @@ async fn update_lost_on_activity_mismatch() {
         worker.run_until_done().await.unwrap();
     };
     join!(update, runner);
-    handle
-        .fetch_history_and_replay(worker.inner_mut())
-        .await
-        .unwrap();
+    handle.fetch_history_and_replay(&mut worker).await.unwrap();
 }
