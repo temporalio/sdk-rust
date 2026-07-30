@@ -19,6 +19,8 @@ pub mod grpc;
 pub mod interceptors;
 mod metrics;
 mod options_structs;
+/// Experimental APIs for configuring clients with reusable plugins.
+pub mod plugins;
 /// Visible only for tests
 #[doc(hidden)]
 pub mod proxy;
@@ -60,6 +62,10 @@ pub use interceptors::{
 };
 pub use metrics::{LONG_REQUEST_LATENCY_HISTOGRAM_NAME, REQUEST_LATENCY_HISTOGRAM_NAME};
 pub use options_structs::*;
+pub use plugins::{
+    ClientPlugin, ClientPluginRegistration, PluginApplyError, PluginError, PluginResult,
+    PluginTarget,
+};
 pub use replaceable::SharedReplaceableClient;
 pub use retry::RetryOptions;
 pub use rpc_options::{RpcMetadata, RpcMetadataError, RpcOptions};
@@ -764,11 +770,27 @@ pub struct Client {
 }
 
 impl Client {
+    /// Connect to a Temporal service and create a namespace-bound client, applying registered
+    /// plugins to connection and client options in registration order.
+    ///
+    /// **Experimental:** This API may change or be removed.
+    pub async fn connect(
+        mut connection_options: ConnectionOptions,
+        client_options: ClientOptions,
+    ) -> Result<Self, ClientConnectError> {
+        plugins::apply_connection_plugins(&client_options, &mut connection_options)?;
+        let connection = Connection::connect(connection_options).await?;
+        Self::new(connection, client_options).map_err(|err| match err {
+            ClientNewError::Plugin(err) => ClientConnectError::Plugin(err),
+        })
+    }
+
     /// Create a new client from a connection and options.
     ///
-    /// Currently infallible, but returns a `Result` for future extensibility
-    /// (e.g., interceptor or plugin validation).
-    pub fn new(connection: Connection, options: ClientOptions) -> Result<Self, ClientNewError> {
+    /// Registered client plugins are applied here. Connection plugin hooks only run when using
+    /// [`Client::connect`].
+    pub fn new(connection: Connection, mut options: ClientOptions) -> Result<Self, ClientNewError> {
+        plugins::apply_client_plugins(&mut options)?;
         Ok(Client {
             connection,
             options: Arc::new(options),

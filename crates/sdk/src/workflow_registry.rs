@@ -75,6 +75,13 @@ pub struct WorkflowDefinitions {
 }
 
 impl WorkflowDefinitions {
+    pub(crate) fn extend(&mut self, other: &Self) -> Result<(), WorkflowRegistrationError> {
+        for workflow in other.workflows.values() {
+            self.insert_workflow(workflow.definition.clone(), workflow.factory.clone())?;
+        }
+        Ok(())
+    }
+
     /// Creates a new empty `WorkflowDefinitions`.
     pub fn new() -> Self {
         Self::default()

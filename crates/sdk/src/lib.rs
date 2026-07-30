@@ -67,6 +67,8 @@ extern crate self as temporalio_sdk;
 pub mod activities;
 pub mod error;
 pub mod interceptors;
+/// Experimental APIs for configuring clients and workers with reusable plugins.
+pub mod plugins;
 /// Runtime configuration and low-level Core worker building blocks.
 ///
 /// These types are grouped here to keep Core-specific configuration separate from the SDK's
@@ -93,10 +95,16 @@ mod workflow_registry;
 mod workflow_wasm;
 pub mod workflows;
 
-pub use crate::error::{
-    ActivityExecutionError, ApplicationFailure, ChildWorkflowExecutionError,
-    ChildWorkflowStartError, OutgoingActivityError, OutgoingError, OutgoingWorkflowError,
-    RetryState, TimeoutType, WorkflowRegistrationError, WorkflowSignalError,
+pub use crate::{
+    error::{
+        ActivityExecutionError, ApplicationFailure, ChildWorkflowExecutionError,
+        ChildWorkflowStartError, OutgoingActivityError, OutgoingError, OutgoingWorkflowError,
+        RetryState, TimeoutType, WorkerCreateError, WorkflowRegistrationError, WorkflowSignalError,
+    },
+    plugins::{
+        ClientAndWorkerPlugin, SimplePlugin, SimplePluginBuilder, WorkerPlugin,
+        WorkerPluginRegistration,
+    },
 };
 pub use temporalio_client::Namespace;
 pub use temporalio_sdk_core::CoreRuntime as Runtime;
@@ -152,6 +160,7 @@ use temporalio_common::{
         },
         temporal::api::{
             common::v1::Payload, enums::v1::WorkflowTaskFailedCause, failure::v1::Failure,
+            worker::v1::PluginInfo,
         },
     },
     worker::{WorkerDeploymentOptions, WorkerTaskTypes, build_id_from_current_exe},
@@ -196,6 +205,12 @@ pub struct WorkerOptions {
 
     #[builder(field)]
     workflow_interceptor_constructors: Vec<WorkflowInterceptorConstructor>,
+
+    #[builder(field)]
+    worker_plugins: Vec<WorkerPluginRegistration>,
+
+    #[builder(field)]
+    plugins_applied: bool,
 
     #[cfg(feature = "wasm-workflows")]
     #[builder(field)]
@@ -315,6 +330,27 @@ pub struct WorkerOptions {
 }
 
 impl<S: worker_options_builder::State> WorkerOptionsBuilder<S> {
+    /// Register a type-erased worker plugin.
+    ///
+    /// **Experimental:** This API may change or be removed.
+    pub fn worker_plugin<P: Into<WorkerPluginRegistration>>(mut self, plugin: P) -> Self {
+        self.worker_plugins.push(plugin.into());
+        self
+    }
+
+    /// Register type-erased worker plugins in iteration order.
+    ///
+    /// **Experimental:** This API may change or be removed.
+    pub fn worker_plugins<I, P>(mut self, plugins: I) -> Self
+    where
+        I: IntoIterator<Item = P>,
+        P: Into<WorkerPluginRegistration>,
+    {
+        self.worker_plugins
+            .extend(plugins.into_iter().map(Into::into));
+        self
+    }
+
     /// Append a worker interceptor. Interceptors run in registration order.
     ///
     /// **Experimental:** This API may change or be removed.
@@ -577,6 +613,15 @@ impl WorkerOptions {
             ))
             .workflow_failure_errors(self.workflow_failure_errors.clone())
             .workflow_types_to_failure_errors(self.workflow_types_to_failure_errors.clone())
+            .plugins(
+                self.worker_plugins
+                    .iter()
+                    .map(|registration| PluginInfo {
+                        name: registration.plugin().name().to_owned(),
+                        version: String::new(),
+                    })
+                    .collect(),
+            )
             .disable_payload_error_limit(self.disable_payload_error_limit)
             .build()
     }
@@ -712,12 +757,14 @@ impl Worker {
     pub fn new(
         runtime: &Runtime,
         client: Client,
-        options: WorkerOptions,
-    ) -> Result<Self, Box<dyn std::error::Error>> {
+        mut options: WorkerOptions,
+    ) -> Result<Self, WorkerCreateError> {
+        plugins::apply_worker_plugins(client.options(), &mut options)?;
         let wc = options
             .to_core_options(client.namespace(), client.identity())
-            .map_err(|s| anyhow::anyhow!("{s}"))?;
-        let core = init_worker(runtime, wc, client.connection().clone())?;
+            .map_err(|error| WorkerCreateError::Initialization(anyhow!(error)))?;
+        let core = init_worker(runtime, wc, client.connection().clone())
+            .map_err(WorkerCreateError::Initialization)?;
         Self::new_from_core_options(Arc::new(core), client.options().clone(), options)
     }
 
@@ -744,7 +791,8 @@ impl Worker {
         worker: Arc<CoreWorker>,
         client_options: ClientOptions,
         mut options: WorkerOptions,
-    ) -> Result<Self, Box<dyn std::error::Error>> {
+    ) -> Result<Self, WorkerCreateError> {
+        plugins::apply_worker_plugins(&client_options, &mut options)?;
         let acts = std::mem::take(&mut options.activities);
         let wfs = std::mem::take(&mut options.workflows);
         let worker_interceptors = std::mem::take(&mut options.worker_interceptors);
@@ -771,7 +819,8 @@ impl Worker {
             .register_wasm_workflows(
                 wasm_components,
                 !me.common.workflow_interceptor_constructors.is_empty(),
-            )?;
+            )
+            .map_err(|error| WorkerCreateError::Initialization(anyhow!(error)))?;
         Ok(me)
     }
 
