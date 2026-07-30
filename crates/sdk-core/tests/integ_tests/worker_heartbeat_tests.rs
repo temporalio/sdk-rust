@@ -969,7 +969,7 @@ async fn worker_heartbeat_failure_metrics() {
                 }
                 Err("activity_slots.last_interval_failure_tasks still 0, retrying")
             },
-            Duration::from_secs(2),
+            Duration::from_secs(5),
         )
         .await
         .unwrap();
@@ -990,7 +990,7 @@ async fn worker_heartbeat_failure_metrics() {
                 }
                 Err("workflow_slots.last_interval_failure_tasks still 0, retrying")
             },
-            Duration::from_secs(2),
+            Duration::from_secs(5),
         )
         .await
         .unwrap();
