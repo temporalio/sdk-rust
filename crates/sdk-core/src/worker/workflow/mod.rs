@@ -549,10 +549,7 @@ impl Workflows {
         post_activate_hook: Option<impl Fn(PostActivateHookData)>,
     ) -> Result<(), CompleteWfError> {
         let is_empty_completion = completion.is_empty();
-        let task_storage_metrics = TaskStorageMetrics {
-            download: completion.payload_download_metrics.clone(),
-            upload: completion.payload_upload_metrics.clone(),
-        };
+        let task_storage_metrics = TaskStorageMetrics::from_completion(&completion);
         let completion = validate_completion(completion, is_autocomplete)?;
         let run_id = completion.run_id().to_string();
         let (tx, rx) = oneshot::channel();
@@ -1146,6 +1143,15 @@ struct PostActivationMsg {
 struct TaskStorageMetrics {
     download: Option<ExternalStorageMetrics>,
     upload: Option<ExternalStorageMetrics>,
+}
+
+impl TaskStorageMetrics {
+    fn from_completion(completion: &WorkflowActivationCompletion) -> Self {
+        Self {
+            download: completion.payload_download_metrics.clone(),
+            upload: completion.payload_upload_metrics.clone(),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1786,6 +1792,30 @@ mod tests {
         payload_limits::{LimitClass, LimitSeverity},
         protos::coresdk::workflow_activation::SignalWorkflow,
     };
+
+    #[test]
+    fn task_storage_metrics_from_completion_keeps_directions_distinct() {
+        let download = ExternalStorageMetrics {
+            payload_count: 2,
+            total_size_bytes: 1024,
+            driver_names: vec!["s3".to_string()],
+            ..Default::default()
+        };
+        let upload = ExternalStorageMetrics {
+            payload_count: 3,
+            total_size_bytes: 2048,
+            driver_names: vec!["gcs".to_string()],
+            ..Default::default()
+        };
+        let completion = WorkflowActivationCompletion {
+            payload_download_metrics: Some(download.clone()),
+            payload_upload_metrics: Some(upload.clone()),
+            ..Default::default()
+        };
+        let metrics = TaskStorageMetrics::from_completion(&completion);
+        assert_eq!(metrics.download, Some(download));
+        assert_eq!(metrics.upload, Some(upload));
+    }
 
     #[test]
     fn payloads_too_large_wft_failure_is_retryable() {

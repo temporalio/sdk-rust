@@ -1551,6 +1551,10 @@ fn log_workflow_task_duration(
     duration: Duration,
     storage: &TaskStorageMetrics,
 ) {
+    let threshold = wft_duration_warn_threshold();
+    if duration <= threshold {
+        return;
+    }
     let dl = storage.download.as_ref();
     let ul = storage.upload.as_ref();
     let duration_millis = |d: Duration| d.as_millis() as u64;
@@ -1560,36 +1564,41 @@ fn log_workflow_task_duration(
             .map(duration_millis)
             .unwrap_or_default()
     };
+    warn!(
+        workflow_type = %workflow_type,
+        event_id = event_id,
+        attempt = attempt,
+        workflow_task_duration = duration_millis(duration),
+        workflow_history_size = history_size_bytes,
+        payload_download_count = dl.map(|m| m.payload_count).unwrap_or_default(),
+        payload_download_size = dl.map(|m| m.total_size_bytes).unwrap_or_default(),
+        payload_download_duration = storage_millis(dl),
+        payload_download_drivers = ?dl.map(|m| sorted(&m.driver_names)).unwrap_or_default(),
+        payload_upload_count = ul.map(|m| m.payload_count).unwrap_or_default(),
+        payload_upload_size = ul.map(|m| m.total_size_bytes).unwrap_or_default(),
+        payload_upload_duration = storage_millis(ul),
+        payload_upload_drivers = ?ul.map(|m| sorted(&m.driver_names)).unwrap_or_default(),
+        "[TMPRL1104] {run_id}:{event_id}:{attempt} Workflow task duration exceeded {} seconds.",
+        threshold.as_secs()
+    );
+}
 
-    macro_rules! emit {
-        ($lvl:ident, $msg:literal) => {
-            $lvl!(
-                workflow_type = %workflow_type,
-                event_id = event_id,
-                attempt = attempt,
-                workflow_task_duration = duration_millis(duration),
-                workflow_history_size = history_size_bytes,
-                payload_download_count = dl.map(|m| m.payload_count).unwrap_or_default(),
-                payload_download_size = dl.map(|m| m.total_size_bytes).unwrap_or_default(),
-                payload_download_duration = storage_millis(dl),
-                payload_download_drivers = ?dl.map(|m| sorted(&m.driver_names)).unwrap_or_default(),
-                payload_upload_count = ul.map(|m| m.payload_count).unwrap_or_default(),
-                payload_upload_size = ul.map(|m| m.total_size_bytes).unwrap_or_default(),
-                payload_upload_duration = storage_millis(ul),
-                payload_upload_drivers = ?ul.map(|m| sorted(&m.driver_names)).unwrap_or_default(),
-                $msg,
-            )
-        };
-    }
+fn wft_duration_warn_threshold() -> Duration {
+    static THRESHOLD: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
+    *THRESHOLD.get_or_init(|| {
+        parse_wft_duration_warn_threshold(
+            std::env::var("TEMPORAL_WORKFLOW_TASK_DURATION_WARN_SECONDS").ok(),
+        )
+    })
+}
 
-    if duration > Duration::from_secs(5) {
-        emit!(
-            warn,
-            "[TMPRL1104] {run_id}:{event_id}:{attempt} Workflow task duration exceeded 5 seconds."
-        );
-    } else {
-        emit!(trace, "Workflow task duration information.");
-    }
+// Separated from the env read so the parse + default fallback can be unit-tested without mutating
+// the process environment.
+fn parse_wft_duration_warn_threshold(value: Option<String>) -> Duration {
+    value
+        .and_then(|s| s.parse::<u64>().ok())
+        .map(Duration::from_secs)
+        .unwrap_or(Duration::from_secs(5))
 }
 
 fn sorted(names: &[String]) -> Vec<String> {
@@ -1600,7 +1609,9 @@ fn sorted(names: &[String]) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{TaskStorageMetrics, log_workflow_task_duration};
+    use super::{
+        TaskStorageMetrics, log_workflow_task_duration, parse_wft_duration_warn_threshold,
+    };
     use crate::worker::workflow::{WFCommand, WFCommandVariant};
     use std::{
         fmt::Write,
@@ -1658,35 +1669,54 @@ mod tests {
         fn exit(&self, _: &span::Id) {}
     }
 
-    fn capture(duration: Duration, storage: &TaskStorageMetrics) -> CapturedEvent {
+    fn capture(duration: Duration, storage: &TaskStorageMetrics) -> Option<CapturedEvent> {
         let sub = CapturingSub::default();
         tracing::subscriber::with_default(sub.clone(), || {
             log_workflow_task_duration("run-1", "MyWorkflow", 12, 3, 4096, duration, storage);
         });
-        sub.events
-            .lock()
-            .unwrap()
-            .drain(..)
-            .next()
-            .expect("one event emitted")
+        sub.events.lock().unwrap().drain(..).next()
     }
 
     #[test]
-    fn tmprl1104_levels_follow_thresholds() {
+    fn tmprl1104_warns_only_over_threshold() {
         let none = TaskStorageMetrics::default();
-        let trace_ev = capture(Duration::from_secs(2), &none);
-        assert_eq!(trace_ev.level, Some(Level::TRACE));
-        assert!(
-            !trace_ev.fields.contains("TMPRL1104"),
-            "fields: {}",
-            trace_ev.fields
-        );
-        let warn_ev = capture(Duration::from_secs(7), &none);
+        assert!(capture(Duration::from_secs(2), &none).is_none());
+        let warn_ev = capture(Duration::from_secs(7), &none).expect("warn emitted");
         assert_eq!(warn_ev.level, Some(Level::WARN));
         assert!(
             warn_ev.fields.contains("[TMPRL1104]"),
             "fields: {}",
             warn_ev.fields
+        );
+    }
+
+    #[test]
+    fn tmprl1104_threshold_parsing() {
+        assert_eq!(
+            parse_wft_duration_warn_threshold(None),
+            Duration::from_secs(5)
+        );
+        assert_eq!(
+            parse_wft_duration_warn_threshold(Some("10".to_string())),
+            Duration::from_secs(10)
+        );
+        assert_eq!(
+            parse_wft_duration_warn_threshold(Some("0".to_string())),
+            Duration::from_secs(0)
+        );
+        // Unparseable / empty / negative values fall back to the default (parsed as u64, so a
+        // negative can never yield a threshold).
+        assert_eq!(
+            parse_wft_duration_warn_threshold(Some("nope".to_string())),
+            Duration::from_secs(5)
+        );
+        assert_eq!(
+            parse_wft_duration_warn_threshold(Some(String::new())),
+            Duration::from_secs(5)
+        );
+        assert_eq!(
+            parse_wft_duration_warn_threshold(Some("-5".to_string())),
+            Duration::from_secs(5)
         );
     }
 
@@ -1704,11 +1734,16 @@ mod tests {
             }),
             upload: None,
         };
-        // Only the warn-level message carries the identifier, so exceed the 5s threshold.
-        let ev = capture(Duration::from_secs(6), &storage);
+        let ev = capture(Duration::from_secs(6), &storage).expect("warn emitted");
         assert!(ev.fields.contains("attempt=3"), "fields: {}", ev.fields);
         assert!(
             ev.fields.contains("[TMPRL1104] run-1:12:3"),
+            "fields: {}",
+            ev.fields
+        );
+        // The message names the (default) threshold it exceeded.
+        assert!(
+            ev.fields.contains("exceeded 5 seconds"),
             "fields: {}",
             ev.fields
         );

@@ -275,11 +275,6 @@ impl MocksHolder {
         self.worker_telemetry = Some(WorkerTelemetry::from_meter(meter));
     }
 
-    #[cfg(test)]
-    pub(crate) fn set_trace_subscriber(&mut self, sub: Arc<dyn tracing::Subscriber + Send + Sync>) {
-        self.worker_telemetry = Some(WorkerTelemetry::from_trace_subscriber(sub));
-    }
-
     /// Can be used for tests that need to avoid auto-shutdown due to running out of mock responses
     pub fn make_wft_stream_interminable(&mut self) {
         if let Some(old_stream) = self.inputs.wft_stream.take() {
