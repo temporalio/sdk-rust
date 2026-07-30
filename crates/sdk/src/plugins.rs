@@ -9,55 +9,44 @@ use crate::{
     workflow_interceptors::WorkflowInterceptorConstructor,
     workflow_registry::WorkflowDefinitions,
 };
-use std::sync::Arc;
+use std::{any::Any, sync::Arc};
 use temporalio_client::{
-    ClientInterceptor, ClientOptions, ClientPlugin, ClientPluginRegistration, ConnectionOptions,
-    PluginApplyError, PluginError, PluginResult, PluginTarget,
+    ClientInterceptor, ClientOptions, ClientPlugin, ConnectionOptions, ErasedClientPlugin,
+    PluginApplyError, PluginError, PluginTarget, WorkerPluginData,
 };
 use temporalio_common::{WorkflowDefinition, data_converters::DataConverter};
 use temporalio_workflow::runtime::entry::WorkflowImplementation;
 
-/// Configures worker options before the underlying Core worker is created.
+/// Configures worker options before the worker is created.
+///
+/// Use [`ClientAndWorkerPlugin`] for plugins that target both clients and workers.
 ///
 /// **Experimental:** This API may change or be removed.
 pub trait WorkerPlugin: Send + Sync + 'static {
-    /// Return the stable name used to identify this plugin in diagnostics and worker heartbeats.
-    ///
-    /// **Experimental:** This API may change or be removed.
+    /// Name used to identify this plugin.
     fn name(&self) -> &str;
 
     /// Configure worker options.
-    ///
-    /// **Experimental:** This API may change or be removed.
-    fn configure_worker_options(&self, _options: &mut WorkerOptions) -> PluginResult {
+    fn configure_worker_options(&self, _options: &mut WorkerOptions) -> Result<(), PluginError> {
         Ok(())
     }
 }
 
-/// A type-erased worker plugin with an identity used to diagnose duplicate registration.
+/// A type-erased worker plugin.
 ///
 /// **Experimental:** This API may change or be removed.
 #[derive(Clone)]
-pub struct WorkerPluginRegistration {
+pub struct ErasedWorkerPlugin {
     worker: Arc<dyn WorkerPlugin>,
-    instance_id: Arc<()>,
 }
 
-impl WorkerPluginRegistration {
+impl ErasedWorkerPlugin {
     /// Type-erase a worker plugin for registration on [`WorkerOptions`].
     ///
     /// **Experimental:** This API may change or be removed.
     pub fn new<P: WorkerPlugin>(plugin: P) -> Self {
         Self {
             worker: Arc::new(plugin),
-            instance_id: Arc::new(()),
-        }
-    }
-
-    fn with_instance_id<P: WorkerPlugin>(plugin: P, instance_id: Arc<()>) -> Self {
-        Self {
-            worker: Arc::new(plugin),
-            instance_id,
         }
     }
 
@@ -67,48 +56,64 @@ impl WorkerPluginRegistration {
 }
 
 #[derive(Clone)]
-struct PropagatedWorkerPlugin(WorkerPluginRegistration);
+struct PropagatedWorkerPlugin(ErasedWorkerPlugin);
 
-/// A type-erased registration for one value that implements both [`ClientPlugin`] and
+impl WorkerPluginData for PropagatedWorkerPlugin {}
+
+/// A container for a plugin that implements both [`ClientPlugin`] and
 /// [`WorkerPlugin`].
 ///
-/// This wrapper is only needed when the same plugin configures both a client and its workers. Use
-/// [`ClientPluginRegistration`] or [`WorkerPluginRegistration`] for one-sided plugins.
+/// This wrapper is only needed when the same plugin configures both a client and workers. Use
+/// [`ErasedClientPlugin`] or [`ErasedWorkerPlugin`] for one-sided plugins.
+///
+/// When registered on [`ClientOptions`], the resulting client carries the worker plugin and
+/// automatically applies it to workers created from that client. Do not also register the plugin
+/// on [`WorkerOptions`], or its worker configuration will be applied twice.
+///
+/// ```
+/// # use temporalio_client::{ClientOptions, ClientPlugin};
+/// # use temporalio_sdk::{ClientAndWorkerPlugin, WorkerPlugin};
+/// # struct MyPlugin;
+/// # impl ClientPlugin for MyPlugin {
+/// #     fn name(&self) -> &str { "my-plugin" }
+/// # }
+/// # impl WorkerPlugin for MyPlugin {
+/// #     fn name(&self) -> &str { "my-plugin" }
+/// # }
+/// let plugin = ClientAndWorkerPlugin::new(MyPlugin);
+/// let client_options = ClientOptions::new("default").plugin(plugin).build();
+/// # let _ = client_options;
+/// ```
 ///
 /// **Experimental:** This API may change or be removed.
 #[derive(Clone)]
 pub struct ClientAndWorkerPlugin {
-    client: ClientPluginRegistration,
-    worker: WorkerPluginRegistration,
+    client: ErasedClientPlugin,
+    worker: ErasedWorkerPlugin,
 }
 
 impl ClientAndWorkerPlugin {
     /// Type-erase one plugin value for client registration, automatic worker propagation, and
     /// optional explicit worker registration.
-    ///
-    /// **Experimental:** This API may change or be removed.
     pub fn new<P>(plugin: P) -> Self
     where
         P: ClientPlugin + WorkerPlugin,
     {
         let plugin = Arc::new(plugin);
-        let mut client = ClientPluginRegistration::new(SharedClientPlugin(plugin.clone()));
-        let worker = WorkerPluginRegistration::with_instance_id(
-            SharedWorkerPlugin(plugin),
-            client.instance_id(),
-        );
+        let mut client = ErasedClientPlugin::new(SharedClientPlugin(plugin.clone()));
+        let worker = ErasedWorkerPlugin::new(SharedWorkerPlugin(plugin));
         client = client.with_worker_plugin(PropagatedWorkerPlugin(worker.clone()));
         Self { client, worker }
     }
 }
 
-impl From<ClientAndWorkerPlugin> for ClientPluginRegistration {
+impl From<ClientAndWorkerPlugin> for ErasedClientPlugin {
     fn from(plugin: ClientAndWorkerPlugin) -> Self {
         plugin.client
     }
 }
 
-impl From<ClientAndWorkerPlugin> for WorkerPluginRegistration {
+impl From<ClientAndWorkerPlugin> for ErasedWorkerPlugin {
     fn from(plugin: ClientAndWorkerPlugin) -> Self {
         plugin.worker
     }
@@ -143,7 +148,7 @@ pub struct SimplePlugin {
 }
 
 impl SimplePlugin {
-    /// Begin declaring a simple plugin with the name used in diagnostics and worker heartbeats.
+    /// Construct a new `SimplePluginBuilder` with a given name.
     ///
     /// **Experimental:** This API may change or be removed.
     #[allow(clippy::new_ret_no_self)]
@@ -157,22 +162,19 @@ impl SimplePlugin {
     }
 }
 
-impl From<SimplePlugin> for ClientPluginRegistration {
+impl From<SimplePlugin> for ErasedClientPlugin {
     fn from(plugin: SimplePlugin) -> Self {
         plugin.combined.into()
     }
 }
 
-impl From<SimplePlugin> for WorkerPluginRegistration {
+impl From<SimplePlugin> for ErasedWorkerPlugin {
     fn from(plugin: SimplePlugin) -> Self {
         plugin.combined.into()
     }
 }
 
-type ConnectionCustomizer =
-    Arc<dyn Fn(&mut ConnectionOptions) -> PluginResult + Send + Sync + 'static>;
-type ClientCustomizer = Arc<dyn Fn(&mut ClientOptions) -> PluginResult + Send + Sync + 'static>;
-type WorkerCustomizer = Arc<dyn Fn(&mut WorkerOptions) -> PluginResult + Send + Sync + 'static>;
+type Customizer<T> = Arc<dyn Fn(&mut T) -> Result<(), PluginError> + Send + Sync + 'static>;
 
 #[derive(Default)]
 struct SimplePluginDefinition {
@@ -186,9 +188,9 @@ struct SimplePluginDefinition {
     workflows: WorkflowDefinitions,
     #[cfg(feature = "wasm-workflows")]
     wasm_workflow_components: Vec<WasmWorkflowComponent>,
-    connection_customizers: Vec<ConnectionCustomizer>,
-    client_customizers: Vec<ClientCustomizer>,
-    worker_customizers: Vec<WorkerCustomizer>,
+    connection_customizers: Vec<Customizer<ConnectionOptions>>,
+    client_customizers: Vec<Customizer<ClientOptions>>,
+    worker_customizers: Vec<Customizer<WorkerOptions>>,
 }
 
 impl ClientPlugin for SimplePluginDefinition {
@@ -196,14 +198,17 @@ impl ClientPlugin for SimplePluginDefinition {
         &self.name
     }
 
-    fn configure_connection_options(&self, options: &mut ConnectionOptions) -> PluginResult {
+    fn configure_connection_options(
+        &self,
+        options: &mut ConnectionOptions,
+    ) -> Result<(), PluginError> {
         for configure in &self.connection_customizers {
             configure(options)?;
         }
         Ok(())
     }
 
-    fn configure_client_options(&self, options: &mut ClientOptions) -> PluginResult {
+    fn configure_client_options(&self, options: &mut ClientOptions) -> Result<(), PluginError> {
         if let Some(data_converter) = &self.data_converter {
             options.data_converter = data_converter.clone();
         }
@@ -222,7 +227,7 @@ impl WorkerPlugin for SimplePluginDefinition {
         &self.name
     }
 
-    fn configure_worker_options(&self, options: &mut WorkerOptions) -> PluginResult {
+    fn configure_worker_options(&self, options: &mut WorkerOptions) -> Result<(), PluginError> {
         options.activities.extend(&self.activities);
         options
             .workflows
@@ -339,7 +344,7 @@ impl SimplePluginBuilder {
     /// **Experimental:** This API may change or be removed.
     pub fn configure_connection_options<F>(mut self, configure: F) -> Self
     where
-        F: Fn(&mut ConnectionOptions) -> PluginResult + Send + Sync + 'static,
+        F: Fn(&mut ConnectionOptions) -> Result<(), PluginError> + Send + Sync + 'static,
     {
         self.definition
             .connection_customizers
@@ -352,7 +357,7 @@ impl SimplePluginBuilder {
     /// **Experimental:** This API may change or be removed.
     pub fn configure_client_options<F>(mut self, configure: F) -> Self
     where
-        F: Fn(&mut ClientOptions) -> PluginResult + Send + Sync + 'static,
+        F: Fn(&mut ClientOptions) -> Result<(), PluginError> + Send + Sync + 'static,
     {
         self.definition.client_customizers.push(Arc::new(configure));
         self
@@ -363,7 +368,7 @@ impl SimplePluginBuilder {
     /// **Experimental:** This API may change or be removed.
     pub fn configure_worker_options<F>(mut self, configure: F) -> Self
     where
-        F: Fn(&mut WorkerOptions) -> PluginResult + Send + Sync + 'static,
+        F: Fn(&mut WorkerOptions) -> Result<(), PluginError> + Send + Sync + 'static,
     {
         self.definition.worker_customizers.push(Arc::new(configure));
         self
@@ -389,11 +394,14 @@ where
         ClientPlugin::name(self.0.as_ref())
     }
 
-    fn configure_connection_options(&self, options: &mut ConnectionOptions) -> PluginResult {
+    fn configure_connection_options(
+        &self,
+        options: &mut ConnectionOptions,
+    ) -> Result<(), PluginError> {
         self.0.configure_connection_options(options)
     }
 
-    fn configure_client_options(&self, options: &mut ClientOptions) -> PluginResult {
+    fn configure_client_options(&self, options: &mut ClientOptions) -> Result<(), PluginError> {
         self.0.configure_client_options(options)
     }
 }
@@ -408,9 +416,29 @@ where
         ClientPlugin::name(self.0.as_ref())
     }
 
-    fn configure_worker_options(&self, options: &mut WorkerOptions) -> PluginResult {
+    fn configure_worker_options(&self, options: &mut WorkerOptions) -> Result<(), PluginError> {
         self.0.configure_worker_options(options)
     }
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct WorkerPluginWarning<'a> {
+    plugin_name: &'a str,
+    message: &'static str,
+}
+
+fn worker_plugin_warnings(
+    plugins: &[ErasedWorkerPlugin],
+) -> impl Iterator<Item = WorkerPluginWarning<'_>> {
+    plugins.iter().enumerate().filter_map(|(index, plugin)| {
+        plugins[index + 1..]
+            .iter()
+            .any(|other| Arc::ptr_eq(&plugin.worker, &other.worker))
+            .then_some(WorkerPluginWarning {
+                plugin_name: plugin.plugin().name(),
+                message: "The same combined client and worker plugin was registered both through the client and directly on the worker",
+            })
+    })
 }
 
 pub(crate) fn apply_worker_plugins(
@@ -424,32 +452,22 @@ pub(crate) fn apply_worker_plugins(
     let mut plugins = client_options
         .plugins()
         .iter()
-        .flat_map(ClientPluginRegistration::worker_plugins)
-        .filter_map(|plugin| plugin.downcast_ref::<PropagatedWorkerPlugin>())
+        .flat_map(ErasedClientPlugin::worker_plugins)
+        .filter_map(|plugin| (plugin as &dyn Any).downcast_ref::<PropagatedWorkerPlugin>())
         .map(|plugin| plugin.0.clone())
         .collect::<Vec<_>>();
     plugins.append(&mut options.worker_plugins);
 
-    for (index, plugin) in plugins.iter().enumerate() {
-        if plugins[index + 1..]
-            .iter()
-            .any(|other| Arc::ptr_eq(&plugin.instance_id, &other.instance_id))
-        {
-            warn!(
-                plugin = plugin.plugin().name(),
-                "The same combined client and worker plugin was registered both through the client and directly on the worker"
-            );
-        }
+    for warning in worker_plugin_warnings(&plugins) {
+        warn!(plugin = warning.plugin_name, "{}", warning.message);
     }
 
     for registration in &plugins {
         registration
             .plugin()
             .configure_worker_options(options)
-            .map_err(|source| PluginApplyError {
-                plugin_name: registration.plugin().name().to_owned(),
-                target: PluginTarget::Worker,
-                source,
+            .map_err(|source| {
+                PluginApplyError::new(registration.plugin().name(), PluginTarget::Worker, source)
             })?;
     }
     options.worker_plugins = plugins;
@@ -478,7 +496,10 @@ mod tests {
             "combined"
         }
 
-        fn configure_worker_options(&self, _options: &mut WorkerOptions) -> PluginResult {
+        fn configure_worker_options(
+            &self,
+            _options: &mut WorkerOptions,
+        ) -> Result<(), PluginError> {
             self.order.lock().unwrap().push("propagated");
             Ok(())
         }
@@ -495,7 +516,10 @@ mod tests {
             self.name
         }
 
-        fn configure_worker_options(&self, _options: &mut WorkerOptions) -> PluginResult {
+        fn configure_worker_options(
+            &self,
+            _options: &mut WorkerOptions,
+        ) -> Result<(), PluginError> {
             self.order.lock().unwrap().push(self.value);
             Ok(())
         }
@@ -509,11 +533,11 @@ mod tests {
         });
         let client_options = ClientOptions::new("namespace").plugin(combined).build();
         let mut worker_options = WorkerOptions::new("queue")
-            .worker_plugin(WorkerPluginRegistration::new(RecordingWorkerPlugin {
+            .worker_plugin(RecordingWorkerPlugin {
                 name: "local",
                 value: "local",
                 order: order.clone(),
-            }))
+            })
             .build();
 
         apply_worker_plugins(&client_options, &mut worker_options).unwrap();
@@ -522,30 +546,25 @@ mod tests {
     }
 
     #[test]
-    fn explicitly_reusing_a_combined_registration_applies_both_registrations() {
+    fn explicitly_reusing_a_combined_registration_warns_and_applies_both() {
         let order = Arc::new(Mutex::new(Vec::new()));
         let combined = ClientAndWorkerPlugin::new(RecordingCombinedPlugin {
             order: order.clone(),
         });
-        let client_registration: ClientPluginRegistration = combined.clone().into();
-        let worker_registration: WorkerPluginRegistration = combined.into();
-        let propagated_registration = client_registration
-            .worker_plugins()
-            .find_map(|plugin| plugin.downcast_ref::<PropagatedWorkerPlugin>())
-            .unwrap();
-        assert!(Arc::ptr_eq(
-            &propagated_registration.0.instance_id,
-            &worker_registration.instance_id
-        ));
         let client_options = ClientOptions::new("namespace")
-            .plugin(client_registration)
+            .plugin(combined.clone())
             .build();
-        let mut worker_options = WorkerOptions::new("queue")
-            .worker_plugin(worker_registration)
-            .build();
+        let mut worker_options = WorkerOptions::new("queue").plugin(combined).build();
 
         apply_worker_plugins(&client_options, &mut worker_options).unwrap();
 
+        assert_eq!(
+            worker_plugin_warnings(&worker_options.worker_plugins).collect::<Vec<_>>(),
+            [WorkerPluginWarning {
+                plugin_name: "combined",
+                message: "The same combined client and worker plugin was registered both through the client and directly on the worker",
+            }]
+        );
         assert_eq!(*order.lock().unwrap(), ["propagated", "propagated"]);
     }
 
@@ -557,15 +576,24 @@ mod tests {
         }
     }
 
+    struct UnrecognizedWorkerPluginExtension {
+        _registration: ErasedWorkerPlugin,
+    }
+
+    impl WorkerPluginData for UnrecognizedWorkerPluginExtension {}
+
     #[test]
     fn arbitrary_opaque_data_cannot_impersonate_propagated_plugin() {
         let order = Arc::new(Mutex::new(Vec::new()));
-        let client_registration = ClientPluginRegistration::new(ClientOnlyPlugin)
-            .with_worker_plugin(WorkerPluginRegistration::new(RecordingWorkerPlugin {
-                name: "unrecognized",
-                value: "should-not-run",
-                order: order.clone(),
-            }));
+        let client_registration = ErasedClientPlugin::new(ClientOnlyPlugin).with_worker_plugin(
+            UnrecognizedWorkerPluginExtension {
+                _registration: ErasedWorkerPlugin::new(RecordingWorkerPlugin {
+                    name: "unrecognized",
+                    value: "should-not-run",
+                    order: order.clone(),
+                }),
+            },
+        );
         let client_options = ClientOptions::new("namespace")
             .plugin(client_registration)
             .build();
@@ -581,21 +609,23 @@ mod tests {
         let order = Arc::new(Mutex::new(Vec::new()));
         let client_options = ClientOptions::new("namespace").build();
         let mut worker_options = WorkerOptions::new("queue")
-            .worker_plugins([
-                WorkerPluginRegistration::new(RecordingWorkerPlugin {
-                    name: "same-name",
-                    value: "first",
-                    order: order.clone(),
-                }),
-                WorkerPluginRegistration::new(RecordingWorkerPlugin {
-                    name: "same-name",
-                    value: "second",
-                    order,
-                }),
-            ])
+            .worker_plugin(RecordingWorkerPlugin {
+                name: "same-name",
+                value: "first",
+                order: order.clone(),
+            })
+            .worker_plugin(RecordingWorkerPlugin {
+                name: "same-name",
+                value: "second",
+                order,
+            })
             .build();
         apply_worker_plugins(&client_options, &mut worker_options).unwrap();
 
+        assert_eq!(
+            worker_plugin_warnings(&worker_options.worker_plugins).count(),
+            0
+        );
         let core_options = worker_options
             .to_core_options("namespace".to_owned(), "identity".to_owned())
             .unwrap();
@@ -640,7 +670,7 @@ mod tests {
             })
             .build();
         let client_options = ClientOptions::new("namespace").build();
-        let mut worker_options = WorkerOptions::new("queue").worker_plugin(plugin).build();
+        let mut worker_options = WorkerOptions::new("queue").plugin(plugin).build();
         apply_worker_plugins(&client_options, &mut worker_options).unwrap();
 
         assert_eq!(worker_options.max_cached_workflows, 0);
@@ -654,8 +684,11 @@ mod tests {
             "failing-worker"
         }
 
-        fn configure_worker_options(&self, _options: &mut WorkerOptions) -> PluginResult {
-            Err(PluginError::message("worker failure"))
+        fn configure_worker_options(
+            &self,
+            _options: &mut WorkerOptions,
+        ) -> Result<(), PluginError> {
+            Err(PluginError::new("worker failure"))
         }
     }
 
@@ -663,7 +696,7 @@ mod tests {
     fn worker_application_errors_include_context() {
         let client_options = ClientOptions::new("namespace").build();
         let mut worker_options = WorkerOptions::new("queue")
-            .worker_plugin(WorkerPluginRegistration::new(FailingWorkerPlugin))
+            .worker_plugin(FailingWorkerPlugin)
             .build();
 
         let error = apply_worker_plugins(&client_options, &mut worker_options).unwrap_err();

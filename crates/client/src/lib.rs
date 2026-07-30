@@ -63,8 +63,7 @@ pub use interceptors::{
 pub use metrics::{LONG_REQUEST_LATENCY_HISTOGRAM_NAME, REQUEST_LATENCY_HISTOGRAM_NAME};
 pub use options_structs::*;
 pub use plugins::{
-    ClientPlugin, ClientPluginRegistration, PluginApplyError, PluginError, PluginResult,
-    PluginTarget,
+    ClientPlugin, ErasedClientPlugin, PluginApplyError, PluginError, PluginTarget, WorkerPluginData,
 };
 pub use replaceable::SharedReplaceableClient;
 pub use retry::RetryOptions;
@@ -780,9 +779,7 @@ impl Client {
     ) -> Result<Self, ClientConnectError> {
         plugins::apply_connection_plugins(&client_options, &mut connection_options)?;
         let connection = Connection::connect(connection_options).await?;
-        Self::new(connection, client_options).map_err(|err| match err {
-            ClientNewError::Plugin(err) => ClientConnectError::Plugin(err),
-        })
+        Ok(Self::new(connection, client_options)?)
     }
 
     /// Create a new client from a connection and options.

@@ -1,6 +1,6 @@
 use crate::{
-    ClientInterceptor, ClientPlugin, ClientPluginRegistration, HttpConnectProxyOptions,
-    RetryOptions, RpcOptions, VERSION, callback_based,
+    ClientInterceptor, ClientPlugin, ErasedClientPlugin, HttpConnectProxyOptions, RetryOptions,
+    RpcOptions, VERSION, callback_based,
 };
 use http::Uri;
 use std::{collections::HashMap, sync::Arc, time::Duration};
@@ -151,7 +151,7 @@ pub struct ClientOptions {
 
     #[builder(field)]
     #[debug(skip)]
-    plugins: Vec<ClientPluginRegistration>,
+    plugins: Vec<ErasedClientPlugin>,
 
     #[builder(field)]
     plugins_applied: bool,
@@ -169,7 +169,7 @@ impl<S: client_options_builder::State> ClientOptionsBuilder<S> {
     /// Register a type-erased client plugin.
     ///
     /// **Experimental:** This API may change or be removed.
-    pub fn plugin<P: Into<ClientPluginRegistration>>(mut self, plugin: P) -> Self {
+    pub fn plugin<P: Into<ErasedClientPlugin>>(mut self, plugin: P) -> Self {
         self.plugins.push(plugin.into());
         self
     }
@@ -180,7 +180,7 @@ impl<S: client_options_builder::State> ClientOptionsBuilder<S> {
     pub fn plugins<I, P>(mut self, plugins: I) -> Self
     where
         I: IntoIterator<Item = P>,
-        P: Into<ClientPluginRegistration>,
+        P: Into<ErasedClientPlugin>,
     {
         self.plugins.extend(plugins.into_iter().map(Into::into));
         self
@@ -190,7 +190,7 @@ impl<S: client_options_builder::State> ClientOptionsBuilder<S> {
     ///
     /// **Experimental:** This API may change or be removed.
     pub fn client_plugin<P: ClientPlugin>(mut self, plugin: P) -> Self {
-        self.plugins.push(ClientPluginRegistration::new(plugin));
+        self.plugins.push(ErasedClientPlugin::new(plugin));
         self
     }
 }
@@ -201,7 +201,7 @@ impl ClientOptions {
     /// This is intended for SDK integrations that propagate worker plugin registrations.
     ///
     /// **Experimental:** This API may change or be removed.
-    pub fn plugins(&self) -> &[ClientPluginRegistration] {
+    pub fn plugins(&self) -> &[ErasedClientPlugin] {
         &self.plugins
     }
 

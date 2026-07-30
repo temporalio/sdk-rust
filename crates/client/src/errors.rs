@@ -42,6 +42,14 @@ pub enum ClientConnectError {
     InvalidConfig(String),
 }
 
+impl From<ClientNewError> for ClientConnectError {
+    fn from(value: ClientNewError) -> Self {
+        match value {
+            ClientNewError::Plugin(err) => Self::Plugin(err),
+        }
+    }
+}
+
 /// Errors thrown when a gRPC metadata header is invalid.
 #[derive(thiserror::Error, Debug)]
 #[non_exhaustive]

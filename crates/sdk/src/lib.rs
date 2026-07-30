@@ -102,8 +102,7 @@ pub use crate::{
         RetryState, TimeoutType, WorkerCreateError, WorkflowRegistrationError, WorkflowSignalError,
     },
     plugins::{
-        ClientAndWorkerPlugin, SimplePlugin, SimplePluginBuilder, WorkerPlugin,
-        WorkerPluginRegistration,
+        ClientAndWorkerPlugin, ErasedWorkerPlugin, SimplePlugin, SimplePluginBuilder, WorkerPlugin,
     },
 };
 pub use temporalio_client::Namespace;
@@ -207,7 +206,7 @@ pub struct WorkerOptions {
     workflow_interceptor_constructors: Vec<WorkflowInterceptorConstructor>,
 
     #[builder(field)]
-    worker_plugins: Vec<WorkerPluginRegistration>,
+    worker_plugins: Vec<ErasedWorkerPlugin>,
 
     #[builder(field)]
     plugins_applied: bool,
@@ -333,8 +332,16 @@ impl<S: worker_options_builder::State> WorkerOptionsBuilder<S> {
     /// Register a type-erased worker plugin.
     ///
     /// **Experimental:** This API may change or be removed.
-    pub fn worker_plugin<P: Into<WorkerPluginRegistration>>(mut self, plugin: P) -> Self {
+    pub fn plugin<P: Into<ErasedWorkerPlugin>>(mut self, plugin: P) -> Self {
         self.worker_plugins.push(plugin.into());
+        self
+    }
+
+    /// Register a worker-only plugin.
+    ///
+    /// **Experimental:** This API may change or be removed.
+    pub fn worker_plugin<P: WorkerPlugin>(mut self, plugin: P) -> Self {
+        self.worker_plugins.push(ErasedWorkerPlugin::new(plugin));
         self
     }
 
@@ -344,7 +351,7 @@ impl<S: worker_options_builder::State> WorkerOptionsBuilder<S> {
     pub fn worker_plugins<I, P>(mut self, plugins: I) -> Self
     where
         I: IntoIterator<Item = P>,
-        P: Into<WorkerPluginRegistration>,
+        P: Into<ErasedWorkerPlugin>,
     {
         self.worker_plugins
             .extend(plugins.into_iter().map(Into::into));

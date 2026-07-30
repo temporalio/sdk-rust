@@ -20,7 +20,7 @@ use std::{
 };
 use temporalio_client::{
     Client, ClientOptions, ClientPlugin, Connection, ConnectionOptions, PayloadLimitsOptions,
-    PluginResult, WorkflowStartOptions, errors::WorkflowGetResultError,
+    PluginError, WorkflowStartOptions, errors::WorkflowGetResultError,
 };
 use temporalio_common::{
     data_converters::{DataConverter, RawValue},
@@ -92,13 +92,16 @@ impl ClientPlugin for IntegrationPlugin {
         "integration-plugin"
     }
 
-    fn configure_connection_options(&self, options: &mut ConnectionOptions) -> PluginResult {
+    fn configure_connection_options(
+        &self,
+        options: &mut ConnectionOptions,
+    ) -> Result<(), PluginError> {
         self.connection_calls.fetch_add(1, Relaxed);
         options.identity = "integration-plugin-client".to_owned();
         Ok(())
     }
 
-    fn configure_client_options(&self, _options: &mut ClientOptions) -> PluginResult {
+    fn configure_client_options(&self, _options: &mut ClientOptions) -> Result<(), PluginError> {
         self.client_calls.fetch_add(1, Relaxed);
         Ok(())
     }
@@ -109,7 +112,7 @@ impl WorkerPlugin for IntegrationPlugin {
         "integration-plugin"
     }
 
-    fn configure_worker_options(&self, options: &mut WorkerOptions) -> PluginResult {
+    fn configure_worker_options(&self, options: &mut WorkerOptions) -> Result<(), PluginError> {
         self.worker_calls.fetch_add(1, Relaxed);
         options.max_cached_workflows = 0;
         Ok(())
