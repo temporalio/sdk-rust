@@ -583,6 +583,14 @@ impl WorkerTelemetry {
             trace_subscriber: None,
         }
     }
+
+    #[cfg(test)]
+    pub(crate) fn from_trace_subscriber(sub: Arc<dyn Subscriber + Send + Sync>) -> Self {
+        Self {
+            temporal_metric_meter: None,
+            trace_subscriber: Some(sub),
+        }
+    }
 }
 
 impl Worker {
