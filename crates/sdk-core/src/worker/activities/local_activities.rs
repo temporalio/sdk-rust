@@ -467,17 +467,15 @@ impl LocalActivityManager {
             let sa = new_la.schedule_cmd;
 
             let mut dat = self.dat.lock();
-            if !dat.la_info.contains_key(&id) {
-                debug!(id=?id, "Dropping invalidated local activity request");
-                continue;
-            }
-            {
-                let la_info = dat.la_info.get_mut(&id).expect("Activity must exist");
+            if let Some(la_info) = dat.la_info.get_mut(&id) {
                 la_info.queued_for_dispatch = false;
                 // If this request originated from a local backoff task, clear the entry for it. We
                 // don't await the handle because we know it must already be done, and there's no
                 // meaningful value.
                 la_info.backing_off_task.take();
+            } else {
+                debug!(id=?id, "Dropping invalidated local activity request");
+                continue;
             }
 
             // If this task sat in the queue for too long, return a timeout for it instead
