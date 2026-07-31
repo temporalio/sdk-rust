@@ -2260,7 +2260,9 @@ async fn activity_cancel_delivered_without_heartbeat() {
     shared_tests::activity_cancel_delivered_without_heartbeat().await
 }
 
-/// Like `activity_cancel_delivered_without_heartbeat` but with eager activity dispatch.
+/// Verifies that eagerly dispatched activity cancellation is delivered via worker commands
+/// even when the activity does not heartbeat. Like
+/// `activity_cancel_delivered_without_heartbeat` but with eager dispatch enabled.
 #[tokio::test]
 async fn activity_cancel_delivered_without_heartbeat_eager() {
     shared_tests::activity_cancel_delivered_without_heartbeat_eager().await

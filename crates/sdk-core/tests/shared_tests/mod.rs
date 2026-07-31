@@ -470,6 +470,7 @@ pub(crate) async fn activity_cancel_delivered_without_heartbeat() {
                         ..Default::default()
                     })
                     .cancellation_type(ActivityCancellationType::WaitCancellationCompleted)
+                    // Eager variant: activity_cancel_delivered_without_heartbeat_eager
                     .do_not_eagerly_execute(true)
                     .build(),
             );
@@ -509,7 +510,9 @@ pub(crate) async fn activity_cancel_delivered_without_heartbeat() {
     handle.get_result(Default::default()).await.unwrap();
 }
 
-/// Like `activity_cancel_delivered_without_heartbeat` but with eager activity dispatch.
+/// Verifies that eagerly dispatched activity cancellation is delivered via worker commands
+/// even when the activity does not heartbeat. Like
+/// `activity_cancel_delivered_without_heartbeat` but with eager dispatch enabled.
 pub(crate) async fn activity_cancel_delivered_without_heartbeat_eager() {
     let wf_name = "activity_cancel_delivered_without_heartbeat_eager";
     let mut starter = CoreWfStarter::new_cloud_or_local(wf_name, "")
