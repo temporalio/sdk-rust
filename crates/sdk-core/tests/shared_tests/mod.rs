@@ -509,7 +509,8 @@ pub(crate) async fn activity_cancel_delivered_without_heartbeat() {
     handle.get_result(Default::default()).await.unwrap();
 }
 
-/// Same as above but with eager activity dispatch.
+/// Verifies that eagerly dispatched activity cancellation is delivered via worker commands
+/// even when the activity does not heartbeat.
 pub(crate) async fn activity_cancel_delivered_without_heartbeat_eager() {
     let wf_name = "activity_cancel_delivered_without_heartbeat_eager";
     let mut starter = CoreWfStarter::new_cloud_or_local(wf_name, "")
