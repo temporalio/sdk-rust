@@ -2259,3 +2259,9 @@ async fn immediate_activity_cancelation() {
 async fn activity_cancel_delivered_without_heartbeat() {
     shared_tests::activity_cancel_delivered_without_heartbeat().await
 }
+
+/// Same as above but with eager activity dispatch.
+#[tokio::test]
+async fn activity_cancel_delivered_without_heartbeat_eager() {
+    shared_tests::activity_cancel_delivered_without_heartbeat_eager().await
+}

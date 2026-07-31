@@ -54,6 +54,11 @@ async fn activity_cancel_delivered_without_heartbeat() {
 }
 
 #[tokio::test]
+async fn activity_cancel_delivered_without_heartbeat_eager() {
+    shared_tests::activity_cancel_delivered_without_heartbeat_eager().await
+}
+
+#[tokio::test]
 async fn default_client_gzip_supported_by_system_info_and_health_check() {
     let mut client = get_cloud_client().await;
     let system_info = client
