@@ -470,7 +470,6 @@ pub(crate) async fn activity_cancel_delivered_without_heartbeat() {
                         ..Default::default()
                     })
                     .cancellation_type(ActivityCancellationType::WaitCancellationCompleted)
-                    // Eager variant: activity_cancel_delivered_without_heartbeat_eager
                     .do_not_eagerly_execute(true)
                     .build(),
             );
