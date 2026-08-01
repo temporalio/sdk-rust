@@ -119,20 +119,17 @@ impl From<ClientAndWorkerPlugin> for ErasedWorkerPlugin {
     }
 }
 
-/// A plugin assembled from declarative values and optional fallible configuration callbacks.
+/// A plugin assembled from declarative values.
 ///
-/// Scalar values replace the corresponding option, while interceptors and definitions append in
-/// registration order. Declarative values are applied before configuration callbacks.
+/// Scalar values replace the corresponding option, while array values append.
 ///
 /// ```
 /// use temporalio_client::ClientOptions;
+/// use temporalio_common::data_converters::DataConverter;
 /// use temporalio_sdk::SimplePlugin;
 ///
-/// let plugin = SimplePlugin::new("acme.standard-library")
-///     .configure_worker_options(|options| {
-///         options.max_cached_workflows = 0;
-///         Ok(())
-///     })
+/// let plugin = SimplePlugin::new("my-plugin")
+///     .data_converter(DataConverter::default())
 ///     .build();
 /// let client_options = ClientOptions::new("default").plugin(plugin).build();
 /// # let _ = client_options;
@@ -174,8 +171,6 @@ impl From<SimplePlugin> for ErasedWorkerPlugin {
     }
 }
 
-type Customizer<T> = Arc<dyn Fn(&mut T) -> Result<(), PluginError> + Send + Sync + 'static>;
-
 #[derive(Default)]
 struct SimplePluginDefinition {
     name: String,
@@ -188,24 +183,11 @@ struct SimplePluginDefinition {
     workflows: WorkflowDefinitions,
     #[cfg(feature = "wasm-workflows")]
     wasm_workflow_components: Vec<WasmWorkflowComponent>,
-    connection_customizers: Vec<Customizer<ConnectionOptions>>,
-    client_customizers: Vec<Customizer<ClientOptions>>,
-    worker_customizers: Vec<Customizer<WorkerOptions>>,
 }
 
 impl ClientPlugin for SimplePluginDefinition {
     fn name(&self) -> &str {
         &self.name
-    }
-
-    fn configure_connection_options(
-        &self,
-        options: &mut ConnectionOptions,
-    ) -> Result<(), PluginError> {
-        for configure in &self.connection_customizers {
-            configure(options)?;
-        }
-        Ok(())
     }
 
     fn configure_client_options(&self, options: &mut ClientOptions) -> Result<(), PluginError> {
@@ -215,9 +197,6 @@ impl ClientPlugin for SimplePluginDefinition {
         options
             .client_interceptors
             .extend(self.client_interceptors.iter().cloned());
-        for configure in &self.client_customizers {
-            configure(options)?;
-        }
         Ok(())
     }
 }
@@ -246,9 +225,6 @@ impl WorkerPlugin for SimplePluginDefinition {
         options
             .wasm_workflow_components
             .extend(self.wasm_workflow_components.iter().cloned());
-        for configure in &self.worker_customizers {
-            configure(options)?;
-        }
         Ok(())
     }
 }
@@ -336,41 +312,6 @@ impl SimplePluginBuilder {
     #[cfg(feature = "wasm-workflows")]
     pub fn register_wasm_workflow(mut self, component: WasmWorkflowComponent) -> Self {
         self.definition.wasm_workflow_components.push(component);
-        self
-    }
-
-    /// Append a fallible connection-options callback.
-    ///
-    /// **Experimental:** This API may change or be removed.
-    pub fn configure_connection_options<F>(mut self, configure: F) -> Self
-    where
-        F: Fn(&mut ConnectionOptions) -> Result<(), PluginError> + Send + Sync + 'static,
-    {
-        self.definition
-            .connection_customizers
-            .push(Arc::new(configure));
-        self
-    }
-
-    /// Append a fallible client-options callback.
-    ///
-    /// **Experimental:** This API may change or be removed.
-    pub fn configure_client_options<F>(mut self, configure: F) -> Self
-    where
-        F: Fn(&mut ClientOptions) -> Result<(), PluginError> + Send + Sync + 'static,
-    {
-        self.definition.client_customizers.push(Arc::new(configure));
-        self
-    }
-
-    /// Append a fallible worker-options callback.
-    ///
-    /// **Experimental:** This API may change or be removed.
-    pub fn configure_worker_options<F>(mut self, configure: F) -> Self
-    where
-        F: Fn(&mut WorkerOptions) -> Result<(), PluginError> + Send + Sync + 'static,
-    {
-        self.definition.worker_customizers.push(Arc::new(configure));
         self
     }
 
@@ -672,34 +613,22 @@ mod tests {
     impl WorkerInterceptor for EmptyWorkerInterceptor {}
 
     #[test]
-    fn simple_plugin_applies_declarative_values_before_customizers() {
-        let client_builder = SimplePlugin::new("simple")
-            .client_interceptor(EmptyClientInterceptor)
-            .configure_client_options(|options| {
-                assert_eq!(options.client_interceptors.len(), 1);
-                options.namespace.push_str("-customized");
-                Ok(())
-            });
+    fn simple_plugin_applies_declarative_values() {
+        let client_builder = SimplePlugin::new("simple").client_interceptor(EmptyClientInterceptor);
         let mut client_options = ClientOptions::new("namespace").build();
         client_builder
             .definition
             .configure_client_options(&mut client_options)
             .unwrap();
-        assert_eq!(client_options.namespace, "namespace-customized");
+        assert_eq!(client_options.client_interceptors.len(), 1);
 
         let plugin = SimplePlugin::new("simple")
             .worker_interceptor(EmptyWorkerInterceptor)
-            .configure_worker_options(|options| {
-                assert_eq!(options.worker_interceptors.len(), 1);
-                options.max_cached_workflows = 0;
-                Ok(())
-            })
             .build();
         let client_options = ClientOptions::new("namespace").build();
         let mut worker_options = WorkerOptions::new("queue").plugin(plugin).build();
         apply_worker_plugins(&client_options, &mut worker_options).unwrap();
 
-        assert_eq!(worker_options.max_cached_workflows, 0);
         assert_eq!(worker_options.worker_interceptors.len(), 1);
     }
 }

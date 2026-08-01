@@ -267,13 +267,10 @@ async fn simple_plugin_configures_working_client_and_worker() {
 
 #[tokio::test]
 async fn plugin_errors_surface() {
-    let connection_plugin = SimplePlugin::new("failing-connection")
-        .configure_connection_options(|_| Err(PluginError::new("connection failure")))
-        .build();
     let connection_result = Client::connect(
         get_integ_server_options(),
         ClientOptions::new(integ_namespace())
-            .plugin(connection_plugin)
+            .client_plugin(FailingConnectionPlugin)
             .build(),
     )
     .await;
@@ -282,13 +279,10 @@ async fn plugin_errors_surface() {
         "plugin 'failing-connection' failed to configure connection options: connection failure"
     );
 
-    let client_plugin = SimplePlugin::new("failing-client")
-        .configure_client_options(|_| Err(PluginError::new("client failure")))
-        .build();
     let client_result = Client::connect(
         get_integ_server_options(),
         ClientOptions::new(integ_namespace())
-            .plugin(client_plugin)
+            .client_plugin(FailingClientPlugin)
             .build(),
     )
     .await;
@@ -303,21 +297,57 @@ async fn plugin_errors_surface() {
     )
     .await
     .unwrap();
-    let worker_plugin = SimplePlugin::new("failing-worker")
-        .configure_worker_options(|_| Err(PluginError::new("worker failure")))
-        .build();
     let worker_result = Worker::new(
         &CoreRuntime::new_assume_tokio(get_integ_runtime_options(get_integ_telem_options()))
             .unwrap(),
         client,
         WorkerOptions::new(format!("failing-plugin-{}", Uuid::new_v4()))
-            .plugin(worker_plugin)
+            .worker_plugin(FailingWorkerPlugin)
             .build(),
     );
     assert_eq!(
         worker_result.unwrap_err().to_string(),
         "plugin 'failing-worker' failed to configure worker options: worker failure"
     );
+}
+
+struct FailingConnectionPlugin;
+
+impl ClientPlugin for FailingConnectionPlugin {
+    fn name(&self) -> &str {
+        "failing-connection"
+    }
+
+    fn configure_connection_options(
+        &self,
+        _options: &mut ConnectionOptions,
+    ) -> Result<(), PluginError> {
+        Err(PluginError::new("connection failure"))
+    }
+}
+
+struct FailingClientPlugin;
+
+impl ClientPlugin for FailingClientPlugin {
+    fn name(&self) -> &str {
+        "failing-client"
+    }
+
+    fn configure_client_options(&self, _options: &mut ClientOptions) -> Result<(), PluginError> {
+        Err(PluginError::new("client failure"))
+    }
+}
+
+struct FailingWorkerPlugin;
+
+impl WorkerPlugin for FailingWorkerPlugin {
+    fn name(&self) -> &str {
+        "failing-worker"
+    }
+
+    fn configure_worker_options(&self, _options: &mut WorkerOptions) -> Result<(), PluginError> {
+        Err(PluginError::new("worker failure"))
+    }
 }
 
 struct ClientOnlyMetadataPlugin;
