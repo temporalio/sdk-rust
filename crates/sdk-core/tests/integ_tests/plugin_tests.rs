@@ -1,0 +1,370 @@
+use crate::common::{
+    CoreWfStarter, get_integ_runtime_options, get_integ_server_options, get_integ_telem_options,
+    integ_namespace,
+};
+use futures_util::future::BoxFuture;
+use std::{
+    sync::{
+        Arc,
+        atomic::{
+            AtomicU8, AtomicUsize,
+            Ordering::{self, Relaxed},
+        },
+    },
+    time::Duration,
+};
+use temporalio_client::{
+    Client, ClientInterceptor, ClientOptions, ClientPlugin, ConnectionOptions, NamespacedClient,
+    Next, PluginError, StartWorkflowInput, StartWorkflowOutput, WorkflowStartOptions,
+    errors::WorkflowStartError,
+};
+use temporalio_common::{
+    data_converters::{
+        DataConverter, DefaultFailureConverter, PayloadCodec, PayloadConversionError,
+        PayloadConverter, SerializationContextData,
+    },
+    protos::{
+        coresdk::workflow_activation::WorkflowActivation, temporal::api::common::v1::Payload,
+    },
+    worker::WorkerTaskTypes,
+};
+use temporalio_macros::{activities, workflow, workflow_methods};
+use temporalio_sdk::{
+    ActivityOptions, ClientAndWorkerPlugin, SimplePlugin, Worker, WorkerOptions, WorkerPlugin,
+    WorkflowContext, WorkflowResult,
+    activities::{ActivityContext, ActivityError},
+    interceptors::WorkerInterceptor,
+};
+use temporalio_sdk_core::CoreRuntime;
+use url::Url;
+use uuid::Uuid;
+
+#[derive(Clone)]
+struct IntegrationPlugin {
+    connection_calls: Arc<AtomicU8>,
+    client_calls: Arc<AtomicU8>,
+    worker_calls: Arc<AtomicU8>,
+    target: Url,
+}
+
+impl ClientPlugin for IntegrationPlugin {
+    fn name(&self) -> &str {
+        "integration-plugin"
+    }
+
+    fn configure_connection_options(
+        &self,
+        options: &mut ConnectionOptions,
+    ) -> Result<(), PluginError> {
+        self.connection_calls.fetch_add(1, Relaxed);
+        options.target = self.target.clone();
+        options.identity = "integration-plugin-client".to_owned();
+        Ok(())
+    }
+
+    fn configure_client_options(&self, options: &mut ClientOptions) -> Result<(), PluginError> {
+        self.client_calls.fetch_add(1, Relaxed);
+        options.namespace = integ_namespace();
+        Ok(())
+    }
+}
+
+impl WorkerPlugin for IntegrationPlugin {
+    fn name(&self) -> &str {
+        "integration-plugin"
+    }
+
+    fn configure_worker_options(&self, options: &mut WorkerOptions) -> Result<(), PluginError> {
+        self.worker_calls.fetch_add(1, Relaxed);
+        options.max_cached_workflows = 0;
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn plugins_configure_client_and_worker() {
+    let runtime =
+        CoreRuntime::new_assume_tokio(get_integ_runtime_options(get_integ_telem_options()))
+            .unwrap();
+    let connection_calls = Arc::new(AtomicU8::new(0));
+    let client_calls = Arc::new(AtomicU8::new(0));
+    let worker_calls = Arc::new(AtomicU8::new(0));
+    let server_options = get_integ_server_options();
+    let plugin = ClientAndWorkerPlugin::new(IntegrationPlugin {
+        connection_calls: connection_calls.clone(),
+        client_calls: client_calls.clone(),
+        worker_calls: worker_calls.clone(),
+        target: server_options.target,
+    });
+    let client_options = ClientOptions::new("plugin-replaces-this-namespace")
+        .plugin(plugin)
+        .build();
+    let connection_options =
+        ConnectionOptions::new(Url::parse("http://127.0.0.1:1").unwrap()).build();
+    let client = Client::connect(connection_options, client_options)
+        .await
+        .unwrap();
+    assert_eq!(client.connection().identity(), "integration-plugin-client");
+    assert_eq!(client.namespace(), integ_namespace());
+    let worker_options = WorkerOptions::new(format!("plugins-{}", Uuid::new_v4())).build();
+    let worker = Worker::new(&runtime, client, worker_options).unwrap();
+
+    assert_eq!(connection_calls.load(Relaxed), 1);
+    assert_eq!(client_calls.load(Relaxed), 1);
+    assert_eq!(worker_calls.load(Relaxed), 1);
+    assert_eq!(worker.core_worker().get_config().max_cached_workflows, 0);
+    assert_eq!(worker.core_worker().get_config().plugins.len(), 1);
+}
+
+struct CountingPayloadCodec {
+    encode_calls: Arc<AtomicUsize>,
+    decode_calls: Arc<AtomicUsize>,
+}
+
+impl PayloadCodec for CountingPayloadCodec {
+    fn encode(
+        &self,
+        _context: &SerializationContextData,
+        payloads: Vec<Payload>,
+    ) -> BoxFuture<'static, Result<Vec<Payload>, PayloadConversionError>> {
+        self.encode_calls.fetch_add(1, Ordering::Relaxed);
+        Box::pin(async move { Ok(payloads) })
+    }
+
+    fn decode(
+        &self,
+        _context: &SerializationContextData,
+        payloads: Vec<Payload>,
+    ) -> BoxFuture<'static, Result<Vec<Payload>, PayloadConversionError>> {
+        self.decode_calls.fetch_add(1, Ordering::Relaxed);
+        Box::pin(async move { Ok(payloads) })
+    }
+}
+
+struct CountingClientInterceptor {
+    calls: Arc<AtomicUsize>,
+}
+
+impl ClientInterceptor for CountingClientInterceptor {
+    fn start_workflow<'a>(
+        &'a self,
+        input: StartWorkflowInput,
+        next: Next<
+            'a,
+            StartWorkflowInput,
+            BoxFuture<'a, Result<StartWorkflowOutput, WorkflowStartError>>,
+        >,
+    ) -> BoxFuture<'a, Result<StartWorkflowOutput, WorkflowStartError>> {
+        self.calls.fetch_add(1, Ordering::Relaxed);
+        next.run(input)
+    }
+}
+
+struct CountingWorkerInterceptor {
+    calls: Arc<AtomicUsize>,
+}
+
+#[async_trait::async_trait(?Send)]
+impl WorkerInterceptor for CountingWorkerInterceptor {
+    async fn on_workflow_activation(
+        &self,
+        _activation: &WorkflowActivation,
+    ) -> Result<(), anyhow::Error> {
+        self.calls.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
+}
+
+#[workflow]
+#[derive(Default)]
+struct SimplePluginWorkflow;
+
+struct SimplePluginActivities;
+
+#[activities]
+impl SimplePluginActivities {
+    #[activity]
+    async fn greet(_ctx: ActivityContext, name: String) -> Result<String, ActivityError> {
+        Ok(format!("Hello, {name}!"))
+    }
+}
+
+#[workflow_methods]
+impl SimplePluginWorkflow {
+    #[run]
+    async fn run(ctx: &mut WorkflowContext<Self>, name: String) -> WorkflowResult<String> {
+        Ok(ctx
+            .execute_activity(
+                SimplePluginActivities::greet,
+                name,
+                ActivityOptions::start_to_close_timeout(Duration::from_secs(5)),
+            )
+            .await?)
+    }
+}
+
+#[tokio::test]
+async fn simple_plugin_configures_working_client_and_worker() {
+    let encode_calls = Arc::new(AtomicUsize::new(0));
+    let decode_calls = Arc::new(AtomicUsize::new(0));
+    let client_interceptor_calls = Arc::new(AtomicUsize::new(0));
+    let worker_interceptor_calls = Arc::new(AtomicUsize::new(0));
+    let data_converter = DataConverter::new(
+        PayloadConverter::default(),
+        DefaultFailureConverter,
+        CountingPayloadCodec {
+            encode_calls: encode_calls.clone(),
+            decode_calls: decode_calls.clone(),
+        },
+    );
+    let plugin = SimplePlugin::new("simple-integration-plugin")
+        .data_converter(data_converter)
+        .client_interceptor(CountingClientInterceptor {
+            calls: client_interceptor_calls.clone(),
+        })
+        .worker_interceptor(CountingWorkerInterceptor {
+            calls: worker_interceptor_calls.clone(),
+        })
+        .register_activities(SimplePluginActivities)
+        .register_workflow::<SimplePluginWorkflow>()
+        .unwrap()
+        .build();
+    let client_options = ClientOptions::new(integ_namespace()).plugin(plugin).build();
+    let client = Client::connect(get_integ_server_options(), client_options)
+        .await
+        .unwrap();
+    let mut starter = CoreWfStarter::new_with_overrides(
+        "simple_plugin_configures_working_client_and_worker",
+        None,
+        Some(client),
+    );
+    starter.sdk_config.task_types = WorkerTaskTypes {
+        enable_workflows: true,
+        enable_local_activities: true,
+        enable_remote_activities: true,
+        enable_nexus: false,
+    };
+    let task_queue = starter.get_task_queue().to_owned();
+    let mut worker = starter.worker().await;
+    let workflow_id = format!("simple-plugin-{}", Uuid::new_v4());
+    let handle = worker
+        .submit_workflow(
+            SimplePluginWorkflow::run,
+            "Temporal".to_owned(),
+            WorkflowStartOptions::new(task_queue, workflow_id).build(),
+        )
+        .await
+        .unwrap();
+
+    worker.run_until_done().await.unwrap();
+    let workflow_result = handle.get_result(Default::default()).await.unwrap();
+    assert_eq!(workflow_result, "Hello, Temporal!");
+    assert_eq!(client_interceptor_calls.load(Ordering::Relaxed), 1);
+    assert!(worker_interceptor_calls.load(Ordering::Relaxed) > 0);
+    assert!(encode_calls.load(Ordering::Relaxed) > 0);
+    assert!(decode_calls.load(Ordering::Relaxed) > 0);
+}
+
+#[tokio::test]
+async fn plugin_errors_surface() {
+    let connection_plugin = SimplePlugin::new("failing-connection")
+        .configure_connection_options(|_| Err(PluginError::new("connection failure")))
+        .build();
+    let connection_result = Client::connect(
+        get_integ_server_options(),
+        ClientOptions::new(integ_namespace())
+            .plugin(connection_plugin)
+            .build(),
+    )
+    .await;
+    assert_eq!(
+        connection_result.unwrap_err().to_string(),
+        "plugin 'failing-connection' failed to configure connection options: connection failure"
+    );
+
+    let client_plugin = SimplePlugin::new("failing-client")
+        .configure_client_options(|_| Err(PluginError::new("client failure")))
+        .build();
+    let client_result = Client::connect(
+        get_integ_server_options(),
+        ClientOptions::new(integ_namespace())
+            .plugin(client_plugin)
+            .build(),
+    )
+    .await;
+    assert_eq!(
+        client_result.unwrap_err().to_string(),
+        "plugin 'failing-client' failed to configure client options: client failure"
+    );
+
+    let client = Client::connect(
+        get_integ_server_options(),
+        ClientOptions::new(integ_namespace()).build(),
+    )
+    .await
+    .unwrap();
+    let worker_plugin = SimplePlugin::new("failing-worker")
+        .configure_worker_options(|_| Err(PluginError::new("worker failure")))
+        .build();
+    let worker_result = Worker::new(
+        &CoreRuntime::new_assume_tokio(get_integ_runtime_options(get_integ_telem_options()))
+            .unwrap(),
+        client,
+        WorkerOptions::new(format!("failing-plugin-{}", Uuid::new_v4()))
+            .plugin(worker_plugin)
+            .build(),
+    );
+    assert_eq!(
+        worker_result.unwrap_err().to_string(),
+        "plugin 'failing-worker' failed to configure worker options: worker failure"
+    );
+}
+
+struct ClientOnlyMetadataPlugin;
+
+impl ClientPlugin for ClientOnlyMetadataPlugin {
+    fn name(&self) -> &str {
+        "client-only-plugin"
+    }
+}
+
+struct WorkerOnlyMetadataPlugin;
+
+impl WorkerPlugin for WorkerOnlyMetadataPlugin {
+    fn name(&self) -> &str {
+        "worker-only-plugin"
+    }
+}
+
+#[tokio::test]
+async fn worker_metadata_includes_client_and_worker_plugin_names() {
+    let runtime =
+        CoreRuntime::new_assume_tokio(get_integ_runtime_options(get_integ_telem_options()))
+            .unwrap();
+    let client = Client::connect(
+        get_integ_server_options(),
+        ClientOptions::new(integ_namespace())
+            .client_plugin(ClientOnlyMetadataPlugin)
+            .build(),
+    )
+    .await
+    .unwrap();
+    let worker = Worker::new(
+        &runtime,
+        client,
+        WorkerOptions::new(format!("plugin-metadata-{}", Uuid::new_v4()))
+            .worker_plugin(WorkerOnlyMetadataPlugin)
+            .build(),
+    )
+    .unwrap();
+    let core_worker = worker.core_worker();
+    let mut names = core_worker
+        .get_config()
+        .plugins
+        .iter()
+        .map(|plugin| plugin.name.clone())
+        .collect::<Vec<_>>();
+    names.sort_unstable();
+
+    assert_eq!(names, ["client-only-plugin", "worker-only-plugin"]);
+}

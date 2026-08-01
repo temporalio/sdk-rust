@@ -209,6 +209,9 @@ pub struct WorkerOptions {
     worker_plugins: Vec<ErasedWorkerPlugin>,
 
     #[builder(field)]
+    client_plugin_names: HashSet<String>,
+
+    #[builder(field)]
     plugins_applied: bool,
 
     #[cfg(feature = "wasm-workflows")]
@@ -621,12 +624,16 @@ impl WorkerOptions {
             .workflow_failure_errors(self.workflow_failure_errors.clone())
             .workflow_types_to_failure_errors(self.workflow_types_to_failure_errors.clone())
             .plugins(
-                self.worker_plugins
+                self.client_plugin_names
                     .iter()
-                    .map(|registration| PluginInfo {
-                        name: registration.plugin().name().to_owned(),
+                    .map(|name| PluginInfo {
+                        name: name.clone(),
                         version: String::new(),
                     })
+                    .chain(self.worker_plugins.iter().map(|registration| PluginInfo {
+                        name: registration.plugin().name().to_owned(),
+                        version: String::new(),
+                    }))
                     .collect(),
             )
             .disable_payload_error_limit(self.disable_payload_error_limit)
@@ -637,30 +644,39 @@ impl WorkerOptions {
 /// A worker that can poll for and respond to workflow tasks by using
 /// [temporalio_macros::workflow], and activity tasks by using activities defined with
 /// [temporalio_macros::activities].
+#[derive(Debug)]
 pub struct Worker {
     common: CommonWorker,
     workflow_half: WorkflowHalf,
     activity_half: ActivityHalf,
 }
 
+#[derive(derive_more::Debug)]
 struct CommonWorker {
+    #[debug(skip)]
     worker: Arc<CoreWorker>,
     task_queue: String,
+    #[debug(skip)]
     worker_interceptors: Vec<Arc<dyn WorkerInterceptor>>,
+    #[debug(skip)]
     activity_inbound_interceptors: Vec<Arc<dyn ActivityInboundInterceptor>>,
+    #[debug(skip)]
     workflow_interceptor_constructors: Vec<WorkflowInterceptorConstructor>,
     client_options: ClientOptions,
     data_converter: DataConverter,
 }
 
+#[derive(derive_more::Debug)]
 struct WorkflowHalf {
     /// Maps run id to cached workflow state
     workflows: RefCell<HashMap<String, WorkflowData>>,
     workflow_definitions: WorkflowDefinitions,
     workflow_removed_from_map: Notify,
     detect_nondeterministic_futures: bool,
+    #[debug(skip)]
     patch_activation_callback: Option<PatchActivationCallback>,
 }
+#[derive(Debug)]
 struct WorkflowData {
     /// Channel used to send the workflow activations
     activation_chan: UnboundedSender<WorkflowActivation>,
@@ -671,7 +687,7 @@ struct WorkflowFutureHandle<F: Future> {
     run_id: String,
 }
 
-#[derive(Default)]
+#[derive(Debug, Default)]
 struct ActivityHalf {
     /// Maps activity type to the function for executing activities of that type
     activities: ActivityDefinitions,

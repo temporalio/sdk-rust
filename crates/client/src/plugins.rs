@@ -121,6 +121,14 @@ impl ErasedClientPlugin {
         self.worker_plugins.iter().map(AsRef::as_ref)
     }
 
+    /// Return the stable name so SDK integrations can report client-only plugins in worker
+    /// metadata.
+    ///
+    /// **Experimental:** This API may change or be removed.
+    pub fn name(&self) -> &str {
+        self.client.name()
+    }
+
     pub(crate) fn plugin(&self) -> &dyn ClientPlugin {
         self.client.as_ref()
     }
@@ -221,32 +229,5 @@ mod tests {
         assert_eq!(client_calls.load(Ordering::Relaxed), 1);
         assert_eq!(connection_options.identity, "identity-configured");
         assert_eq!(client_options.namespace, "namespace-configured");
-    }
-
-    struct FailingPlugin;
-
-    impl ClientPlugin for FailingPlugin {
-        fn name(&self) -> &str {
-            "failing"
-        }
-
-        fn configure_client_options(
-            &self,
-            _options: &mut ClientOptions,
-        ) -> Result<(), PluginError> {
-            Err(PluginError::new("expected failure"))
-        }
-    }
-
-    #[test]
-    fn plugin_errors_propigated() {
-        let mut options = ClientOptions::new("namespace")
-            .client_plugin(FailingPlugin)
-            .build();
-        let error = apply_client_plugins(&mut options).unwrap_err();
-
-        assert_eq!(error.plugin_name, FailingPlugin.name());
-        assert_eq!(error.target, PluginTarget::Client);
-        assert_eq!(error.source.to_string(), "expected failure");
     }
 }

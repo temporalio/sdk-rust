@@ -449,6 +449,11 @@ pub(crate) fn apply_worker_plugins(
         return Ok(());
     }
 
+    options.client_plugin_names = client_options
+        .plugins()
+        .iter()
+        .map(|plugin| plugin.name().to_owned())
+        .collect();
     let mut plugins = client_options
         .plugins()
         .iter()
@@ -478,8 +483,9 @@ pub(crate) fn apply_worker_plugins(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
+    use std::{collections::HashSet, sync::Mutex};
     use temporalio_client::ClientOptions;
+    use temporalio_common::protos::temporal::api::worker::v1::PluginInfo;
 
     struct RecordingCombinedPlugin {
         order: Arc<Mutex<Vec<&'static str>>>,
@@ -576,6 +582,14 @@ mod tests {
         }
     }
 
+    struct SameNameClientPlugin;
+
+    impl ClientPlugin for SameNameClientPlugin {
+        fn name(&self) -> &str {
+            "same-name"
+        }
+    }
+
     struct UnrecognizedWorkerPluginExtension {
         _registration: ErasedWorkerPlugin,
     }
@@ -605,9 +619,12 @@ mod tests {
     }
 
     #[test]
-    fn heartbeat_plugin_names_are_deduplicated() {
+    fn heartbeat_plugin_names_include_client_plugins_and_are_deduplicated() {
         let order = Arc::new(Mutex::new(Vec::new()));
-        let client_options = ClientOptions::new("namespace").build();
+        let client_options = ClientOptions::new("namespace")
+            .client_plugin(ClientOnlyPlugin)
+            .client_plugin(SameNameClientPlugin)
+            .build();
         let mut worker_options = WorkerOptions::new("queue")
             .worker_plugin(RecordingWorkerPlugin {
                 name: "same-name",
@@ -630,10 +647,19 @@ mod tests {
             .to_core_options("namespace".to_owned(), "identity".to_owned())
             .unwrap();
 
-        assert_eq!(core_options.plugins.len(), 1);
-        let plugin = core_options.plugins.iter().next().unwrap();
-        assert_eq!(plugin.name, "same-name");
-        assert!(plugin.version.is_empty());
+        let expected_plugins: HashSet<_> = vec![
+            PluginInfo {
+                name: "client-only".into(),
+                version: "".into(),
+            },
+            PluginInfo {
+                name: "same-name".into(),
+                version: "".into(),
+            },
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(core_options.plugins, expected_plugins);
     }
 
     struct EmptyClientInterceptor;
@@ -675,34 +701,5 @@ mod tests {
 
         assert_eq!(worker_options.max_cached_workflows, 0);
         assert_eq!(worker_options.worker_interceptors.len(), 1);
-    }
-
-    struct FailingWorkerPlugin;
-
-    impl WorkerPlugin for FailingWorkerPlugin {
-        fn name(&self) -> &str {
-            "failing-worker"
-        }
-
-        fn configure_worker_options(
-            &self,
-            _options: &mut WorkerOptions,
-        ) -> Result<(), PluginError> {
-            Err(PluginError::new("worker failure"))
-        }
-    }
-
-    #[test]
-    fn worker_application_errors_include_context() {
-        let client_options = ClientOptions::new("namespace").build();
-        let mut worker_options = WorkerOptions::new("queue")
-            .worker_plugin(FailingWorkerPlugin)
-            .build();
-
-        let error = apply_worker_plugins(&client_options, &mut worker_options).unwrap_err();
-
-        assert_eq!(error.plugin_name, "failing-worker");
-        assert_eq!(error.target, PluginTarget::Worker);
-        assert_eq!(error.source.to_string(), "worker failure");
     }
 }

@@ -181,13 +181,14 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 ///
 /// Cloning a connection is cheap (single Arc increment). The underlying connection is shared
 /// between clones.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct Connection {
     inner: Arc<ConnectionInner>,
 }
 
-#[derive(Clone)]
+#[derive(Clone, derive_more::Debug)]
 struct ConnectionInner {
+    #[debug(skip)]
     service: TemporalServiceClient,
     retry_options: RetryOptions,
     identity: String,
@@ -762,7 +763,7 @@ impl TemporalServiceClient {
 
 /// Contains an instance of a namespace-bound client for interacting with the Temporal server.
 /// Cheap to clone.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct Client {
     connection: Connection,
     options: Arc<ClientOptions>,
@@ -771,8 +772,6 @@ pub struct Client {
 impl Client {
     /// Connect to a Temporal service and create a namespace-bound client, applying registered
     /// plugins to connection and client options in registration order.
-    ///
-    /// **Experimental:** This API may change or be removed.
     pub async fn connect(
         mut connection_options: ConnectionOptions,
         client_options: ClientOptions,

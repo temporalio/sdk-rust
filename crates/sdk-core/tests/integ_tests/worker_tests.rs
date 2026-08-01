@@ -19,8 +19,8 @@ use std::{
     time::Duration,
 };
 use temporalio_client::{
-    Client, ClientOptions, ClientPlugin, Connection, ConnectionOptions, PayloadLimitsOptions,
-    PluginError, WorkflowStartOptions, errors::WorkflowGetResultError,
+    Client, ClientOptions, Connection, PayloadLimitsOptions, WorkflowStartOptions,
+    errors::WorkflowGetResultError,
 };
 use temporalio_common::{
     data_converters::{DataConverter, RawValue},
@@ -58,8 +58,8 @@ use temporalio_common::{
 };
 use temporalio_macros::{activities, workflow, workflow_methods};
 use temporalio_sdk::{
-    ActivityOptions, ClientAndWorkerPlugin, LocalActivityOptions, Worker, WorkerOptions,
-    WorkerPlugin, WorkflowContext, WorkflowResult, WorkflowTermination,
+    ActivityOptions, LocalActivityOptions, WorkerOptions, WorkflowContext, WorkflowResult,
+    WorkflowTermination,
     activities::{ActivityContext, ActivityError},
     interceptors::WorkerInterceptor,
 };
@@ -79,71 +79,6 @@ use tokio::sync::{Barrier, Notify, Semaphore};
 use tokio_util::sync::CancellationToken;
 use tracing::Level;
 use uuid::Uuid;
-
-#[derive(Clone)]
-struct IntegrationPlugin {
-    connection_calls: Arc<AtomicU8>,
-    client_calls: Arc<AtomicU8>,
-    worker_calls: Arc<AtomicU8>,
-}
-
-impl ClientPlugin for IntegrationPlugin {
-    fn name(&self) -> &str {
-        "integration-plugin"
-    }
-
-    fn configure_connection_options(
-        &self,
-        options: &mut ConnectionOptions,
-    ) -> Result<(), PluginError> {
-        self.connection_calls.fetch_add(1, Relaxed);
-        options.identity = "integration-plugin-client".to_owned();
-        Ok(())
-    }
-
-    fn configure_client_options(&self, _options: &mut ClientOptions) -> Result<(), PluginError> {
-        self.client_calls.fetch_add(1, Relaxed);
-        Ok(())
-    }
-}
-
-impl WorkerPlugin for IntegrationPlugin {
-    fn name(&self) -> &str {
-        "integration-plugin"
-    }
-
-    fn configure_worker_options(&self, options: &mut WorkerOptions) -> Result<(), PluginError> {
-        self.worker_calls.fetch_add(1, Relaxed);
-        options.max_cached_workflows = 0;
-        Ok(())
-    }
-}
-
-#[tokio::test]
-async fn plugins_configure_client_and_worker() {
-    let runtime =
-        CoreRuntime::new_assume_tokio(get_integ_runtime_options(get_integ_telem_options()))
-            .unwrap();
-    let connection_calls = Arc::new(AtomicU8::new(0));
-    let client_calls = Arc::new(AtomicU8::new(0));
-    let worker_calls = Arc::new(AtomicU8::new(0));
-    let plugin = ClientAndWorkerPlugin::new(IntegrationPlugin {
-        connection_calls: connection_calls.clone(),
-        client_calls: client_calls.clone(),
-        worker_calls: worker_calls.clone(),
-    });
-    let client_options = ClientOptions::new(integ_namespace()).plugin(plugin).build();
-    let client = Client::connect(get_integ_server_options(), client_options)
-        .await
-        .unwrap();
-    let worker_options = WorkerOptions::new(format!("plugins-{}", Uuid::new_v4())).build();
-    let worker = Worker::new(&runtime, client, worker_options).unwrap();
-
-    assert_eq!(connection_calls.load(Relaxed), 1);
-    assert_eq!(client_calls.load(Relaxed), 1);
-    assert_eq!(worker_calls.load(Relaxed), 1);
-    assert_eq!(worker.core_worker().get_config().plugins.len(), 1);
-}
 
 #[tokio::test]
 async fn worker_validation_fails_on_nonexistent_namespace() {
