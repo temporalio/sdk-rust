@@ -319,24 +319,24 @@ struct InitializedWorker {
 
 #[derive(Clone, Default)]
 struct TestWorkerInterceptorRouter {
-    interceptors: Arc<RwLock<Vec<Arc<dyn WorkerInterceptor>>>>,
+    interceptor: Arc<RwLock<Option<Arc<dyn WorkerInterceptor>>>>,
 }
 
 impl TestWorkerInterceptorRouter {
     fn set(&self, interceptor: impl WorkerInterceptor + 'static) {
-        *self.interceptors.write() = vec![Arc::new(interceptor)];
+        *self.interceptor.write() = Some(Arc::new(interceptor));
     }
 
     fn clear(&self) {
-        self.interceptors.write().clear();
+        *self.interceptor.write() = None;
     }
 }
 
 #[async_trait::async_trait(?Send)]
 impl WorkerInterceptor for TestWorkerInterceptorRouter {
     async fn on_workflow_activation_completion(&self, completion: &WorkflowActivationCompletion) {
-        let interceptors = self.interceptors.read().clone();
-        for interceptor in interceptors {
+        let interceptor = self.interceptor.read().clone();
+        if let Some(interceptor) = interceptor {
             interceptor
                 .on_workflow_activation_completion(completion)
                 .await;
@@ -344,14 +344,15 @@ impl WorkerInterceptor for TestWorkerInterceptorRouter {
     }
 
     fn on_shutdown(&self, sdk_worker: &Worker) {
-        for interceptor in self.interceptors.read().iter() {
+        let interceptor = self.interceptor.read().clone();
+        if let Some(interceptor) = interceptor {
             interceptor.on_shutdown(sdk_worker);
         }
     }
 
     async fn on_workflow_activation(&self, activation: &WorkflowActivation) -> anyhow::Result<()> {
-        let interceptors = self.interceptors.read().clone();
-        for interceptor in interceptors {
+        let interceptor = self.interceptor.read().clone();
+        if let Some(interceptor) = interceptor {
             interceptor.on_workflow_activation(activation).await?;
         }
         Ok(())
@@ -1141,10 +1142,16 @@ pub(crate) fn mock_sdk_cfg(
     let mut mock = build_mock_pollers(poll_cfg);
     mock.worker_cfg(mutator);
     let core = mock_worker(mock);
-    TestWorker::new(temporalio_sdk::Worker::new_from_core(
-        Arc::new(core),
-        DataConverter::default(),
-    ))
+    let interceptor_router = TestWorkerInterceptorRouter::default();
+    let client_options = ClientOptions::new(core.get_config().namespace.clone())
+        .data_converter(DataConverter::default())
+        .build();
+    let worker_options = WorkerOptions::new(core.get_config().task_queue.clone())
+        .worker_interceptor(interceptor_router.clone())
+        .build();
+    let sdk = Worker::new_from_core_options(Arc::new(core), client_options, worker_options)
+        .expect("mock worker options are valid");
+    TestWorker::new_with_interceptor_router(sdk, interceptor_router)
 }
 
 #[derive(Default)]
