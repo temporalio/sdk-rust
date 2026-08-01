@@ -348,22 +348,7 @@ impl<S: worker_options_builder::State> WorkerOptionsBuilder<S> {
         self
     }
 
-    /// Register type-erased worker plugins in iteration order.
-    ///
-    /// **Experimental:** This API may change or be removed.
-    pub fn worker_plugins<I, P>(mut self, plugins: I) -> Self
-    where
-        I: IntoIterator<Item = P>,
-        P: Into<ErasedWorkerPlugin>,
-    {
-        self.worker_plugins
-            .extend(plugins.into_iter().map(Into::into));
-        self
-    }
-
     /// Append a worker interceptor. Interceptors run in registration order.
-    ///
-    /// **Experimental:** This API may change or be removed.
     pub fn worker_interceptor<I: WorkerInterceptor + 'static>(mut self, interceptor: I) -> Self {
         self.worker_interceptors.push(Arc::new(interceptor));
         self
@@ -371,8 +356,6 @@ impl<S: worker_options_builder::State> WorkerOptionsBuilder<S> {
 
     /// Append an activity inbound interceptor. Interceptors run outermost-first in registration
     /// order.
-    ///
-    /// **Experimental:** This API may change or be removed.
     pub fn activity_inbound_interceptor<I: ActivityInboundInterceptor>(
         mut self,
         interceptor: I,
@@ -383,8 +366,6 @@ impl<S: worker_options_builder::State> WorkerOptionsBuilder<S> {
     }
 
     /// Append a workflow interceptor constructor.
-    ///
-    /// **Experimental:** This API may change or be removed.
     pub fn workflow_interceptor(mut self, constructor: WorkflowInterceptorConstructor) -> Self {
         self.workflow_interceptor_constructors.push(constructor);
         self
@@ -480,8 +461,6 @@ fn def_build_id() -> WorkerDeploymentOptions {
 
 impl WorkerOptions {
     /// Append a worker interceptor. Interceptors run in registration order.
-    ///
-    /// **Experimental:** This API may change or be removed.
     pub fn worker_interceptor<I: WorkerInterceptor + 'static>(
         &mut self,
         interceptor: I,
@@ -492,8 +471,6 @@ impl WorkerOptions {
 
     /// Append an activity inbound interceptor. Interceptors run outermost-first in registration
     /// order.
-    ///
-    /// **Experimental:** This API may change or be removed.
     pub fn activity_inbound_interceptor<I: ActivityInboundInterceptor>(
         &mut self,
         interceptor: I,
@@ -504,8 +481,6 @@ impl WorkerOptions {
     }
 
     /// Append a workflow interceptor constructor.
-    ///
-    /// **Experimental:** This API may change or be removed.
     pub fn workflow_interceptor(
         &mut self,
         constructor: WorkflowInterceptorConstructor,
