@@ -172,7 +172,7 @@ pub struct CoreRuntime {
 
 /// Holds telemetry options, as well as worker heartbeat_interval. Construct with
 /// [RuntimeOptions::builder]
-#[derive(Default, bon::Builder)]
+#[derive(bon::Builder)]
 #[builder(finish_fn(vis = "", name = build_internal))]
 #[non_exhaustive]
 pub struct RuntimeOptions {
@@ -185,6 +185,12 @@ pub struct RuntimeOptions {
     /// Interval must be between 1s and 60s, inclusive.
     #[builder(required, default = Some(Duration::from_secs(60)))]
     heartbeat_interval: Option<Duration>,
+}
+
+impl Default for RuntimeOptions {
+    fn default() -> Self {
+        Self::builder().build().expect("builder defaults are valid")
+    }
 }
 
 impl<S: runtime_options_builder::State> RuntimeOptionsBuilder<S> {
@@ -320,5 +326,16 @@ impl CoreRuntime {
 impl Drop for CoreRuntime {
     fn drop(&mut self) {
         remove_trace_subscriber_for_current_thread();
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+    #[test]
+    fn runtime_options_default_matches_builder_default() {
+        let default = RuntimeOptions::default();
+        let built = RuntimeOptions::builder().build().unwrap();
+        assert_eq!(default.heartbeat_interval, built.heartbeat_interval);
     }
 }

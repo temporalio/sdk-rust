@@ -84,18 +84,16 @@ the TOML format.
 
 ```rust
 use temporalio_client::{Client, ClientOptions, Connection, envconfig::LoadClientConfigProfileOptions};
-use temporalio_sdk::{Worker, WorkerOptions};
-use temporalio_sdk_core::{CoreRuntime, RuntimeOptions};
+use temporalio_sdk::{Runtime, Worker, WorkerOptions};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let runtime = CoreRuntime::new_assume_tokio(RuntimeOptions::builder().build()?)?;
-
+    let runtime = Runtime::new_assume_tokio(Default::default())?;
     let (conn_options, client_options) = ClientOptions::load_from_config(
         LoadClientConfigProfileOptions::default()
     )?;
     let connection = Connection::connect(conn_options).await?;
-    let client = Client::new(connection, client_options);
+    let client = Client::new(connection, client_options)?;
 
     let worker_options = WorkerOptions::new("my-task-queue")
         .register_activities(MyActivities { counter: Default::default() })

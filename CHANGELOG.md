@@ -65,6 +65,10 @@ to docs, or any other relevant information.
 ## [Unreleased]
 
 ### Added
+* `CoreRuntime` is now re-exported from `temporalio_sdk` as `Runtime`, with the remaining Core
+  runtime and worker configuration types under `temporalio_sdk::runtime`, so workers no
+  longer need a direct `temporalio-sdk-core` dependency. `Url` is also re-exported from
+  `temporalio_client`.
 * Workers can configure the maximum number of activity slots reserved for eager execution per
   workflow task with `WorkerOptions::max_eager_activity_reservations_per_workflow_task`.
 * `WorkflowInterceptor` for observing, transforming, or short-circuiting inbound workflow calls
@@ -141,6 +145,8 @@ to docs, or any other relevant information.
 * `PayloadCodec::{encode, decode}` now return `Result<_, PayloadConversionError>`, allowing codecs to fail.
 
 ### Fixed
+* `RuntimeOptions::default()` now uses the same 60-second worker heartbeat interval as the
+  builder default.
 * Workflow tasks no longer livelock when a burst of ready async operations exhausts Tokio's
   cooperative scheduling budget.
 * OTLP metric export failures are now logged through Core telemetry when OpenTelemetry's periodic
