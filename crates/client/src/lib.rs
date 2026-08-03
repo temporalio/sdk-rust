@@ -585,6 +585,8 @@ enum TlsConfigResult {
     Standard(Endpoint),
     /// A custom rustls::ClientConfig is needed. The endpoint has no TLS configured;
     /// the caller must use `connect_with_connector` with a custom TLS connector.
+    ///
+    /// Experimental API subject to change
     #[cfg(feature = "dynamic-tls")]
     CustomConnector {
         endpoint: Endpoint,
