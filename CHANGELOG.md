@@ -83,6 +83,9 @@ to docs, or any other relevant information.
   runtime and worker configuration types under `temporalio_sdk::runtime`, so workers no
   longer need a direct `temporalio-sdk-core` dependency. `Url` is also re-exported from
   `temporalio_client`.
+* Experimental plugin APIs for packaging reusable client and worker configuration, including data
+  converters, interceptors, activities, workflows, and automatic propagation from clients to
+  workers.
 * Workers can configure the maximum number of activity slots reserved for eager execution per
   workflow task with `WorkerOptions::max_eager_activity_reservations_per_workflow_task`.
 * `WorkflowInterceptor` for observing, transforming, or short-circuiting inbound workflow calls
