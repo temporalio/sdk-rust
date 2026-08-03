@@ -824,6 +824,14 @@ async fn call_workflow_service(
                 poll_nexus_operation_execution
             )
         }
+        "PollWorkflowExecutionTimeSkipping" => {
+            rpc_call_on_trait!(
+                client,
+                call,
+                WorkflowService,
+                poll_workflow_execution_time_skipping
+            )
+        }
         "PollNexusTaskQueue" => {
             rpc_call_on_trait!(client, call, WorkflowService, poll_nexus_task_queue)
         }
