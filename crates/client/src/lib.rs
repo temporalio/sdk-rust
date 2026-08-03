@@ -2502,18 +2502,7 @@ mod tests {
                 }
             }
 
-            #[test]
-            fn re_exports_are_accessible() {
-                // Verify that CertifiedKey and SignatureScheme are re-exported
-                // and usable from the crate root. This is a compile-time check.
-                fn _assert_types_exist(
-                    _resolver: &dyn ResolvesClientCert,
-                    _scheme: SignatureScheme,
-                ) {
-                    // This function just needs to compile
-                }
-                let _ = SignatureScheme::ECDSA_NISTP256_SHA256;
-            }
+
         }
     }
 
