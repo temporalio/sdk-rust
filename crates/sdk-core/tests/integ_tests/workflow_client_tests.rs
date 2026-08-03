@@ -1,7 +1,7 @@
 use crate::common::{CoreWfStarter, eventually, rand_6_chars};
 use futures::{TryStreamExt, future::BoxFuture};
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
@@ -13,7 +13,11 @@ use temporalio_client::{
     WorkflowCountOptions, WorkflowListOptions, WorkflowStartOptions, WorkflowTerminateOptions,
     errors::WorkflowStartError,
 };
-use temporalio_common::{data_converters::RawValue, worker::WorkerTaskTypes};
+use temporalio_common::{
+    data_converters::RawValue,
+    protos::{coresdk::AsJsonPayloadExt, temporal::api::common::v1::Memo as ProtoMemo},
+    worker::WorkerTaskTypes,
+};
 use temporalio_macros::{workflow, workflow_methods};
 use temporalio_sdk::{WorkflowContext, WorkflowResult};
 
@@ -242,6 +246,73 @@ async fn already_started_error_contains_run_id() {
         }
         other => panic!("Expected AlreadyStarted, got: {other}"),
     }
+
+    handle
+        .terminate(WorkflowTerminateOptions::default())
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn start_workflow_with_memo() {
+    let test_name = "start_workflow_with_memo";
+    let mut starter = CoreWfStarter::new(test_name);
+    let client = starter.get_client().await;
+    let task_queue = starter.get_task_queue().to_owned();
+    let wf_id = format!("{test_name}_{}", rand_6_chars());
+
+    let handle = client
+        .start_workflow(
+            UntypedWorkflow::new(test_name),
+            RawValue::empty(),
+            WorkflowStartOptions::new(task_queue, wf_id)
+                .memo(ProtoMemo {
+                    fields: HashMap::from([
+                        (
+                            "memo-key".to_string(),
+                            "memo-value".as_json_payload().unwrap(),
+                        ),
+                        ("other-key".to_string(), 42.as_json_payload().unwrap()),
+                    ]),
+                })
+                .build(),
+        )
+        .await
+        .unwrap();
+
+    let desc = handle.describe(Default::default()).await.unwrap();
+    let memo = desc.memo();
+    assert_eq!(
+        memo.get::<String>("memo-key").unwrap(),
+        Some("memo-value".to_string())
+    );
+    assert_eq!(memo.get::<u32>("other-key").unwrap(), Some(42));
+
+    handle
+        .terminate(WorkflowTerminateOptions::default())
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn start_workflow_without_memo_is_empty() {
+    let test_name = "start_workflow_without_memo_is_empty";
+    let mut starter = CoreWfStarter::new(test_name);
+    let client = starter.get_client().await;
+    let task_queue = starter.get_task_queue().to_owned();
+    let wf_id = format!("{test_name}_{}", rand_6_chars());
+
+    let handle = client
+        .start_workflow(
+            UntypedWorkflow::new(test_name),
+            RawValue::empty(),
+            WorkflowStartOptions::new(task_queue, wf_id).build(),
+        )
+        .await
+        .unwrap();
+
+    let desc = handle.describe(Default::default()).await.unwrap();
+    assert!(desc.memo().is_empty());
 
     handle
         .terminate(WorkflowTerminateOptions::default())

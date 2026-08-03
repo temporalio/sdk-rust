@@ -1297,6 +1297,7 @@ where
                                     .map(|attributes| attributes.into_proto()),
                                 cron_schedule: options.cron_schedule.unwrap_or_default(),
                                 retry_policy: options.retry_policy.map(Into::into),
+                                memo: options.memo,
                                 header: options.header.or(start_signal.header),
                                 user_metadata,
                                 ..Default::default()
@@ -1344,6 +1345,7 @@ where
                                 links: options.links,
                                 completion_callbacks: options.completion_callbacks,
                                 priority: Some(options.priority.into()),
+                                memo: options.memo,
                                 header: options.header,
                                 user_metadata,
                                 ..Default::default()

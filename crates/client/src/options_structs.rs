@@ -9,7 +9,7 @@ use temporalio_common::{
     protos::temporal::api::{
         common::{
             self,
-            v1::{Header, Payloads},
+            v1::{Header, Memo as ProtoMemo, Payloads},
         },
         enums::v1::{
             ArchivalState, HistoryEventFilterType, QueryRejectCondition, WorkflowIdConflictPolicy,
@@ -356,6 +356,9 @@ pub struct WorkflowStartOptions {
 
     /// Headers to include with the start request.
     pub header: Option<Header>,
+
+    /// Optionally attach a non-indexed memo to the workflow
+    pub memo: Option<ProtoMemo>,
 
     /// Single-line static summary for the workflow, shown in the Temporal UI.
     pub static_summary: Option<String>,
