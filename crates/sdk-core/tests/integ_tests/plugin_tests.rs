@@ -217,7 +217,7 @@ async fn simple_plugin_configures_working_client_and_worker() {
             decode_calls: decode_calls.clone(),
         },
     );
-    let plugin = SimplePlugin::new("simple-integration-plugin")
+    let plugin = SimplePlugin::builder("simple-integration-plugin")
         .data_converter(data_converter)
         .client_interceptor(CountingClientInterceptor {
             calls: client_interceptor_calls.clone(),

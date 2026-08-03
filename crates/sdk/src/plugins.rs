@@ -128,7 +128,7 @@ impl From<ClientAndWorkerPlugin> for ErasedWorkerPlugin {
 /// use temporalio_common::data_converters::DataConverter;
 /// use temporalio_sdk::SimplePlugin;
 ///
-/// let plugin = SimplePlugin::new("my-plugin")
+/// let plugin = SimplePlugin::builder("my-plugin")
 ///     .data_converter(DataConverter::default())
 ///     .build();
 /// let client_options = ClientOptions::new("default").plugin(plugin).build();
@@ -139,53 +139,43 @@ impl From<ClientAndWorkerPlugin> for ErasedWorkerPlugin {
 /// configured client when a worker is created.
 ///
 /// **Experimental:** This API may change or be removed.
-#[derive(Clone)]
+#[derive(Clone, bon::Builder)]
+#[builder(state_mod(vis = "pub"))]
 pub struct SimplePlugin {
-    combined: ClientAndWorkerPlugin,
-}
-
-impl SimplePlugin {
-    /// Construct a new `SimplePluginBuilder` with a given name.
-    ///
-    /// **Experimental:** This API may change or be removed.
-    #[allow(clippy::new_ret_no_self)]
-    pub fn new(name: impl Into<String>) -> SimplePluginBuilder {
-        SimplePluginBuilder {
-            definition: SimplePluginDefinition {
-                name: name.into(),
-                ..Default::default()
-            },
-        }
-    }
+    #[builder(start_fn, into)]
+    name: String,
+    #[builder(field)]
+    data_converter: Option<DataConverter>,
+    #[builder(field)]
+    client_interceptors: Vec<Arc<dyn ClientInterceptor>>,
+    #[builder(field)]
+    worker_interceptors: Vec<Arc<dyn WorkerInterceptor>>,
+    #[builder(field)]
+    activity_inbound_interceptors: Vec<Arc<dyn ActivityInboundInterceptor>>,
+    #[builder(field)]
+    workflow_interceptors: Vec<WorkflowInterceptorConstructor>,
+    #[builder(field)]
+    activities: ActivityDefinitions,
+    #[builder(field)]
+    workflows: WorkflowDefinitions,
+    #[cfg(feature = "wasm-workflows")]
+    #[builder(field)]
+    wasm_workflow_components: Vec<WasmWorkflowComponent>,
 }
 
 impl From<SimplePlugin> for ErasedClientPlugin {
     fn from(plugin: SimplePlugin) -> Self {
-        plugin.combined.into()
+        ClientAndWorkerPlugin::new(plugin).into()
     }
 }
 
 impl From<SimplePlugin> for ErasedWorkerPlugin {
     fn from(plugin: SimplePlugin) -> Self {
-        plugin.combined.into()
+        ErasedWorkerPlugin::new(plugin)
     }
 }
 
-#[derive(Default)]
-struct SimplePluginDefinition {
-    name: String,
-    data_converter: Option<DataConverter>,
-    client_interceptors: Vec<Arc<dyn ClientInterceptor>>,
-    worker_interceptors: Vec<Arc<dyn WorkerInterceptor>>,
-    activity_inbound_interceptors: Vec<Arc<dyn ActivityInboundInterceptor>>,
-    workflow_interceptors: Vec<WorkflowInterceptorConstructor>,
-    activities: ActivityDefinitions,
-    workflows: WorkflowDefinitions,
-    #[cfg(feature = "wasm-workflows")]
-    wasm_workflow_components: Vec<WasmWorkflowComponent>,
-}
-
-impl ClientPlugin for SimplePluginDefinition {
+impl ClientPlugin for SimplePlugin {
     fn name(&self) -> &str {
         &self.name
     }
@@ -201,7 +191,7 @@ impl ClientPlugin for SimplePluginDefinition {
     }
 }
 
-impl WorkerPlugin for SimplePluginDefinition {
+impl WorkerPlugin for SimplePlugin {
     fn name(&self) -> &str {
         &self.name
     }
@@ -229,19 +219,12 @@ impl WorkerPlugin for SimplePluginDefinition {
     }
 }
 
-/// Builds a [`SimplePlugin`] from common SDK configuration values.
-///
-/// **Experimental:** This API may change or be removed.
-pub struct SimplePluginBuilder {
-    definition: SimplePluginDefinition,
-}
-
-impl SimplePluginBuilder {
+impl<S: simple_plugin_builder::State> SimplePluginBuilder<S> {
     /// Set the data converter installed on configured clients.
     ///
     /// **Experimental:** This API may change or be removed.
     pub fn data_converter(mut self, data_converter: DataConverter) -> Self {
-        self.definition.data_converter = Some(data_converter);
+        self.data_converter = Some(data_converter);
         self
     }
 
@@ -249,9 +232,7 @@ impl SimplePluginBuilder {
     ///
     /// **Experimental:** This API may change or be removed.
     pub fn client_interceptor<I: ClientInterceptor>(mut self, interceptor: I) -> Self {
-        self.definition
-            .client_interceptors
-            .push(Arc::new(interceptor));
+        self.client_interceptors.push(Arc::new(interceptor));
         self
     }
 
@@ -259,9 +240,7 @@ impl SimplePluginBuilder {
     ///
     /// **Experimental:** This API may change or be removed.
     pub fn worker_interceptor<I: WorkerInterceptor + 'static>(mut self, interceptor: I) -> Self {
-        self.definition
-            .worker_interceptors
-            .push(Arc::new(interceptor));
+        self.worker_interceptors.push(Arc::new(interceptor));
         self
     }
 
@@ -272,8 +251,7 @@ impl SimplePluginBuilder {
         mut self,
         interceptor: I,
     ) -> Self {
-        self.definition
-            .activity_inbound_interceptors
+        self.activity_inbound_interceptors
             .push(Arc::new(interceptor));
         self
     }
@@ -282,7 +260,7 @@ impl SimplePluginBuilder {
     ///
     /// **Experimental:** This API may change or be removed.
     pub fn workflow_interceptor(mut self, constructor: WorkflowInterceptorConstructor) -> Self {
-        self.definition.workflow_interceptors.push(constructor);
+        self.workflow_interceptors.push(constructor);
         self
     }
 
@@ -290,7 +268,7 @@ impl SimplePluginBuilder {
     ///
     /// **Experimental:** This API may change or be removed.
     pub fn register_activities<AI: ActivityImplementer>(mut self, instance: AI) -> Self {
-        self.definition.activities.register_activities(instance);
+        self.activities.register_activities(instance);
         self
     }
 
@@ -302,7 +280,7 @@ impl SimplePluginBuilder {
         W: WorkflowImplementation,
         <W::Run as WorkflowDefinition>::Input: Send,
     {
-        self.definition.workflows.register_workflow::<W>()?;
+        self.workflows.register_workflow::<W>()?;
         Ok(self)
     }
 
@@ -311,17 +289,8 @@ impl SimplePluginBuilder {
     /// **Experimental:** This API may change or be removed.
     #[cfg(feature = "wasm-workflows")]
     pub fn register_wasm_workflow(mut self, component: WasmWorkflowComponent) -> Self {
-        self.definition.wasm_workflow_components.push(component);
+        self.wasm_workflow_components.push(component);
         self
-    }
-
-    /// Build the reusable plugin registration.
-    ///
-    /// **Experimental:** This API may change or be removed.
-    pub fn build(self) -> SimplePlugin {
-        SimplePlugin {
-            combined: ClientAndWorkerPlugin::new(self.definition),
-        }
     }
 }
 
@@ -614,15 +583,16 @@ mod tests {
 
     #[test]
     fn simple_plugin_applies_declarative_values() {
-        let client_builder = SimplePlugin::new("simple").client_interceptor(EmptyClientInterceptor);
+        let plugin = SimplePlugin::builder("simple")
+            .client_interceptor(EmptyClientInterceptor)
+            .build();
         let mut client_options = ClientOptions::new("namespace").build();
-        client_builder
-            .definition
+        plugin
             .configure_client_options(&mut client_options)
             .unwrap();
         assert_eq!(client_options.client_interceptors.len(), 1);
 
-        let plugin = SimplePlugin::new("simple")
+        let plugin = SimplePlugin::builder("simple")
             .worker_interceptor(EmptyWorkerInterceptor)
             .build();
         let client_options = ClientOptions::new("namespace").build();
