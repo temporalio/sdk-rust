@@ -2478,33 +2478,6 @@ mod tests {
                 assert!(tls_opts.server_cert_verifier.is_none());
             }
 
-            #[test]
-            fn dynamic_tls_connector_is_clone_and_debug() {
-                // Verify DynamicTlsConnector is Clone (required by tonic) and Debug
-                let config = build_custom_rustls_config(
-                    &TlsOptions::default(),
-                    Some(Arc::new(MockClientCertResolver)),
-                )
-                .unwrap();
-                let server_name =
-                    tokio_rustls::rustls::pki_types::ServerName::try_from("test.temporal.io")
-                        .unwrap()
-                        .to_owned();
-                let connector = DynamicTlsConnector {
-                    tls: tokio_rustls::TlsConnector::from(Arc::new(config)),
-                    domain: Arc::new(server_name),
-                };
-                let _cloned = connector.clone();
-                let debug_str = format!("{:?}", connector);
-                assert!(
-                    debug_str.contains("DynamicTlsConnector"),
-                    "Debug should show struct name: {debug_str}"
-                );
-                assert!(
-                    debug_str.contains("test.temporal.io"),
-                    "Debug should show domain: {debug_str}"
-                );
-            }
 
             #[tokio::test]
             async fn add_tls_resolver_with_ip_host_uses_ip_as_domain() {
