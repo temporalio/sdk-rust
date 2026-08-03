@@ -2039,4 +2039,17 @@ service WorkflowService {
     // (-- api-linter: core::0127::http-annotation=disabled
     //     aip.dev/not-precedent: Nexus operation deletion not exposed to HTTP, users should use cancel or terminate. --)
     rpc DeleteNexusOperationExecution (DeleteNexusOperationExecutionRequest) returns (DeleteNexusOperationExecutionResponse) {}
+
+    rpc PollWorkflowExecutionTimeSkipping (PollWorkflowExecutionTimeSkippingRequest) returns (PollWorkflowExecutionTimeSkippingResponse) {
+        option (google.api.http) = {
+            get: "/namespaces/{namespace}/workflows/{workflow_execution.workflow_id}/time-skipping/poll"
+            additional_bindings {
+                get: "/api/v1/namespaces/{namespace}/workflows/{workflow_execution.workflow_id}/time-skipping/poll"
+            }
+        };
+        option (temporal.api.protometa.v1.request_header) = {
+            header: "temporal-resource-id"
+            value: "workflow:{workflow_execution.workflow_id}"
+        };
+    }
 }

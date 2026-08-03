@@ -19,6 +19,7 @@ import "temporal/api/enums/v1/reset.proto";
 import "temporal/api/enums/v1/task_queue.proto";
 import "temporal/api/enums/v1/deployment.proto";
 import "temporal/api/enums/v1/update.proto";
+import "temporal/api/enums/v1/time_skipping.proto";
 import "temporal/api/enums/v1/activity.proto";
 import "temporal/api/enums/v1/nexus.proto";
 import "temporal/api/activity/v1/message.proto";
@@ -1187,6 +1188,8 @@ message QueryWorkflowRequest {
 message QueryWorkflowResponse {
     temporal.api.common.v1.Payloads query_result = 1;
     temporal.api.query.v1.QueryRejected query_rejected = 2;
+    // Holds the link to the Workflow execution that processed the Query. 
+    temporal.api.common.v1.Link link = 3;
 }
 
 message DescribeWorkflowExecutionRequest {
@@ -2183,7 +2186,7 @@ message UpdateActivityExecutionOptionsRequest {
     string workflow_id = 2;
     // The ID of the activity to target.
     string activity_id = 3;
-    // Run ID of the workflow or standalone activity.
+    // Run ID of the workflow or standalone activity. If empty, targets the latest run.
     string run_id = 4;
 
     // The identity of the client who initiated this request
@@ -2204,6 +2207,9 @@ message UpdateActivityExecutionOptionsRequest {
 
     // Resource ID for routing. Contains "workflow:{workflow_id}" for workflow activities or "activity:{activity_id}" for standalone activities.
     string resource_id = 9;
+
+    // Used to de-dupe update requests.
+    string request_id = 10;
 }
 
 // Deprecated. Use `UpdateActivityExecutionOptionsResponse`.
@@ -2253,7 +2259,7 @@ message PauseActivityExecutionRequest {
     string workflow_id = 2;
     // The ID of the activity to target.
     string activity_id = 3;
-    // Run ID of the workflow or standalone activity.
+    // Run ID of the workflow or standalone activity. If empty, targets the latest run.
     string run_id = 4;
 
     // The identity of the client who initiated this request.
@@ -2315,17 +2321,14 @@ message UnpauseActivityExecutionRequest {
     string workflow_id = 2;
     // The ID of the activity to target.
     string activity_id = 3;
-    // Run ID of the workflow or standalone activity.
+    // Run ID of the workflow or standalone activity. If empty, targets the latest run.
     string run_id = 4;
 
     // The identity of the client who initiated this request.
     string identity = 5;
 
-    // Providing this flag will also reset the number of attempts.
-    bool reset_attempts = 6;
-
-    // Providing this flag will also reset the heartbeat details.
-    bool reset_heartbeat = 7;
+    reserved 6, 7;
+    reserved "reset_attempts", "reset_heartbeat";
 
     // Reason to unpause the activity.
     string reason = 8;
@@ -2335,6 +2338,9 @@ message UnpauseActivityExecutionRequest {
 
     // Resource ID for routing. Contains "workflow:{workflow_id}" for workflow activities or "activity:{activity_id}" for standalone activities.
     string resource_id = 10;
+
+    // Used to de-dupe unpause requests.
+    string request_id = 11;
 }
 
 // Deprecated. Use `UnpauseActivityExecutionResponse`.
@@ -2391,7 +2397,7 @@ message ResetActivityExecutionRequest {
     string workflow_id = 2;
     // The ID of the activity to target.
     string activity_id = 3;
-    // Run ID of the workflow or standalone activity.
+    // Run ID of the workflow or standalone activity. If empty, targets the latest run.
     string run_id = 4;
 
     // The identity of the client who initiated this request.
@@ -2411,6 +2417,9 @@ message ResetActivityExecutionRequest {
 
     // Resource ID for routing. Contains "workflow:{workflow_id}" for workflow activities or "activity:{activity_id}" for standalone activities.
     string resource_id = 9;
+
+    // Used to de-dupe reset requests.
+    string request_id = 10;
 }
 
 // Deprecated. Use `ResetActivityExecutionRequest`.
@@ -2448,6 +2457,9 @@ message UpdateWorkflowExecutionOptionsResponse {
 
     // The Workflow Execution time when the options were updated. When time skipping is
     // enabled, this is the workflow's virtual time rather than wall-clock time.
+    //
+    // This timestamp cannot be used for time-skipping fast-forward verification,
+    // use `fast_forward_id` in `PollWorkflowExecutionTimeSkippingRequest` instead.
     google.protobuf.Timestamp update_time = 2;
 }
 
@@ -3553,7 +3565,7 @@ message CountNexusOperationExecutionsResponse {
 message RequestCancelActivityExecutionRequest {
     string namespace = 1;
     string activity_id = 2;
-    // Activity run ID, targets the latest run if run_id is empty.
+    // Activity run ID. If empty, targets the latest run.
     string run_id = 3;
     // The identity of the worker/client.
     string identity = 4;
@@ -3570,7 +3582,7 @@ message RequestCancelActivityExecutionResponse {
 message TerminateActivityExecutionRequest {
     string namespace = 1;
     string activity_id = 2;
-    // Activity run ID, targets the latest run if run_id is empty.
+    // Activity run ID. If empty, targets the latest run.
     string run_id = 3;
     // The identity of the worker/client.
     string identity = 4;
@@ -3633,4 +3645,26 @@ message DeleteNexusOperationExecutionRequest {
 }
 
 message DeleteNexusOperationExecutionResponse {
+}
+
+// A long-poll request that blocks according to a time-skipping waiting policy on the workflow
+// execution. Currently the only supported policy is waiting for completion of the fast-forward
+// identified by `fast_forward_id`; the poll also returns once anything else settles that outcome
+// (e.g. the execution ends or time skipping is disabled).
+message PollWorkflowExecutionTimeSkippingRequest {
+  string namespace = 1;
+  temporal.api.common.v1.WorkflowExecution workflow_execution = 2;
+  // Required. Identifies the fast-forward whose completion the caller wants to wait for.
+  // Must match the `fast_forward_id` set in the execution's TimeSkippingConfig.
+  string fast_forward_id = 3;
+}
+
+message PollWorkflowExecutionTimeSkippingResponse {
+  // The outcome of the poll for the fast-forward identified by the request's `fast_forward_id`.
+  temporal.api.enums.v1.FastForwardPollingResult fast_forward_polling_result = 1;
+  // Set only when the result is FAST_FORWARD_POLLING_RESULT_FAST_FORWARD_FAILED; explains why
+  // the fast-forward can no longer complete.
+  string failed_reason = 2;
+  // The execution's current fast-forward, if any.
+  temporal.api.common.v1.TimeSkippingFastForwardInfo fast_forward_info = 3;
 }
