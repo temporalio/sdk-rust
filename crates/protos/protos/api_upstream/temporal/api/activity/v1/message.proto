@@ -29,6 +29,10 @@ message ActivityExecutionOutcome {
         // The failure if the activity completed unsuccessfully.
         temporal.api.failure.v1.Failure failure = 2;
     }
+
+    // The retry state associated with an unsuccessful activity execution.
+    // This field is only meaningful when `failure` is set.
+    temporal.api.enums.v1.RetryState retry_state = 3;
 }
 
 message ActivityOptions {
