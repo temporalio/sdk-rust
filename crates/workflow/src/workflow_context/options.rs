@@ -1,6 +1,6 @@
 use std::{collections::HashMap, time::Duration};
 
-use crate::{MemoValues, runtime::types::ContinueAsNewRequest};
+use crate::{MemoValues, WorkflowCancellationToken, runtime::types::ContinueAsNewRequest};
 use temporalio_common_wasm::{
     Priority, RetryPolicy,
     data_converters::{
@@ -311,6 +311,8 @@ pub struct ActivityOptions {
     /// Determines what the SDK does when the Activity is cancelled.
     #[builder(default, into)]
     pub cancellation_type: ActivityCancellationType,
+    /// Cancellation token for this activity. `None` inherits workflow cancellation.
+    pub cancellation_token: Option<WorkflowCancellationToken>,
     /// Activity retry policy
     #[builder(into)]
     pub retry_policy: Option<RetryPolicy>,
@@ -451,6 +453,8 @@ pub struct LocalActivityOptions {
     /// How the activity will cancel
     #[builder(default)]
     pub cancel_type: ActivityCancellationType,
+    /// Cancellation token for this local activity. `None` inherits workflow cancellation.
+    pub cancellation_token: Option<WorkflowCancellationToken>,
     /// Indicates how long the caller is willing to wait for local activity completion. Limits how
     /// long retries will be attempted. When not specified defaults to the workflow execution
     /// timeout (which may be unset).
@@ -531,6 +535,8 @@ pub struct ChildWorkflowOptions {
     /// Cancellation strategy for the child workflow
     #[builder(default)]
     pub cancel_type: ChildWorkflowCancellationType,
+    /// Cancellation token for this child workflow. `None` inherits workflow cancellation.
+    pub cancellation_token: Option<WorkflowCancellationToken>,
     /// How to respond to parent workflow ending
     #[builder(default)]
     pub parent_close_policy: ParentClosePolicy,
@@ -676,6 +682,8 @@ pub struct TimerOptions {
     /// Duration for the timer
     #[builder(start_fn)]
     pub duration: Duration,
+    /// Cancellation token for this timer. `None` inherits workflow cancellation.
+    pub cancellation_token: Option<WorkflowCancellationToken>,
     /// Summary of the timer
     pub summary: Option<String>,
 }
@@ -742,6 +750,8 @@ pub struct NexusOperationOptions {
     pub nexus_header: HashMap<String, String>,
     /// Cancellation type for the operation
     pub cancellation_type: Option<NexusOperationCancellationType>,
+    /// Cancellation token for this operation. `None` inherits workflow cancellation.
+    pub cancellation_token: Option<WorkflowCancellationToken>,
     /// Schedule-to-start timeout for this operation.
     /// Indicates how long the caller is willing to wait for the operation to be started (or completed if synchronous)
     /// by the handler. If the operation is not started within this timeout, it will fail with

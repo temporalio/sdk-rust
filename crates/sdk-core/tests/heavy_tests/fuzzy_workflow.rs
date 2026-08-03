@@ -41,7 +41,7 @@ struct FuzzyWf {
 impl FuzzyWf {
     #[run(name = "fuzzy_wf")]
     async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<()> {
-        ctx.wait_condition(|s| s.done).await;
+        ctx.wait_condition(|s| s.done, None).await?;
         Ok(())
     }
 

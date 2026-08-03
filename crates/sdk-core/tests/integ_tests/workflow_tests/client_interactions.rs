@@ -35,7 +35,8 @@ impl InteractionWorkflow {
         wait_for_value: i32,
     ) -> WorkflowResult<ReturnVal> {
         ctx.state_mut(|s| s.log.push("run"));
-        ctx.wait_condition(|s| s.counter == wait_for_value).await;
+        ctx.wait_condition(|s| s.counter == wait_for_value, None)
+            .await?;
         let rval = ctx.state_mut(|s| {
             s.log.push("run_done");
             ReturnVal {
@@ -57,8 +58,9 @@ impl InteractionWorkflow {
     #[signal]
     async fn increment_and_wait(ctx: &mut WorkflowContext<Self>, amount_and_target: (i32, i32)) {
         ctx.state_mut(|s| s.counter += amount_and_target.0);
-        ctx.wait_condition(|s| s.counter >= amount_and_target.1)
-            .await;
+        ctx.wait_condition(|s| s.counter >= amount_and_target.1, None)
+            .await
+            .expect("workflow was not cancelled");
         ctx.state_mut(|s| s.log.push("async signal done"));
     }
 
@@ -99,7 +101,9 @@ impl InteractionWorkflow {
             s.log.push("starting change_and_wait");
             s.counter += amount_and_wait.0;
         });
-        ctx.wait_condition(|s| s.counter == amount_and_wait.1).await;
+        ctx.wait_condition(|s| s.counter == amount_and_wait.1, None)
+            .await
+            .expect("workflow was not cancelled");
         ctx.state_mut(|s| s.log.push("done change_and_wait"));
     }
 

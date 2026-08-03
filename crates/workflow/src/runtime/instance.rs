@@ -1,7 +1,7 @@
 //! Guest-side workflow execution implementation used by native and future WASM hosts.
 
 use crate::{
-    BaseWorkflowContext, WorkflowContext, WorkflowContextView,
+    BaseWorkflowContext, WorkflowCancellationError, WorkflowContext, WorkflowContextView,
     runtime::{
         InterceptedFuturePollGuard, InterceptedFuturePollKind, InterceptedFutureStatus,
         entry::{WorkflowError, WorkflowImplementation},
@@ -767,6 +767,10 @@ where
                 panic!("workflow instances must not explicitly return eviction")
             }
             Err(WorkflowTermination::Failed(err)) => {
+                if self.base_ctx.cancellation_token().is_cancelled() && is_cancellation_error(&err)
+                {
+                    return crate::runtime::types::TerminalOutcome::Cancelled;
+                }
                 let failure = self.base_ctx.data_converter().to_failure(
                     &SerializationContextData::Workflow,
                     temporalio_common_wasm::error::OutgoingError::Workflow(err),
@@ -968,6 +972,30 @@ where
     }
 }
 
+fn is_cancellation_error(err: &OutgoingWorkflowError) -> bool {
+    match err {
+        OutgoingWorkflowError::Application(err) => {
+            err.as_cancelled().is_some()
+                || err
+                    .source_error()
+                    .downcast_ref::<WorkflowCancellationError>()
+                    .is_some()
+        }
+        OutgoingWorkflowError::ActivityExecution(err) => err.as_cancelled().is_some(),
+        OutgoingWorkflowError::ChildWorkflowExecution(err) => err.as_cancelled().is_some(),
+        OutgoingWorkflowError::ChildWorkflowStart(err) => {
+            matches!(
+                **err,
+                temporalio_common_wasm::error::ChildWorkflowStartError::Cancelled(_)
+            )
+        }
+        OutgoingWorkflowError::WorkflowSignal(err) => err
+            .reason()
+            .and_then(temporalio_common_wasm::error::IncomingError::as_cancelled)
+            .is_some(),
+    }
+}
+
 impl<W: WorkflowImplementation> WorkflowInstance for GuestWorkflowInstance<W>
 where
     <W::Run as WorkflowDefinition>::Input: Send,
@@ -1114,6 +1142,19 @@ mod tests {
         fn set_current_details(&self, _details: String) {}
 
         fn push_command(&self, _command: WorkflowCommand) {}
+    }
+
+    #[test]
+    fn workflow_cancellation_error_is_classified_as_cancellation() {
+        let cancellation = OutgoingWorkflowError::Application(Box::new(ApplicationFailure::new(
+            WorkflowCancellationError::new(Some("reason".to_string())),
+        )));
+        let unrelated = OutgoingWorkflowError::Application(Box::new(ApplicationFailure::new(
+            std::io::Error::other("unrelated"),
+        )));
+
+        assert!(is_cancellation_error(&cancellation));
+        assert!(!is_cancellation_error(&unrelated));
     }
 
     #[workflow]

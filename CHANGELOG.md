@@ -67,6 +67,8 @@ to docs, or any other relevant information.
   `LocalActivityOptions::builder()` to construct local activity options.
 * `NexusOperationOptions` is now tagged with `#[non_exhaustive]`. Use
   `NexusOperationOptions::builder()` to construct Nexus operation options.
+### Added
+* `WorkflowCancellationToken` for deterministic cancellation of workflow operations.
 
 ## [0.6.0] - 2026-08-04
 

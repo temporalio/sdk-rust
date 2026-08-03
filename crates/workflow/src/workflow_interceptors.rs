@@ -85,7 +85,8 @@ use crate::{
     ActivityOptions, BaseWorkflowContext, CancellableFuture, CancellableFutureWithReason,
     ChildWorkflowOptions, ContinueAsNewOptions, ExternalWorkflowHandle, LocalActivityOptions,
     NexusOperationOptions, StartChildWorkflowOutput, StartedChildWorkflow, StartedNexusOperation,
-    TimerOptions, WorkflowContextView,
+    TimerOptions, WorkflowCancellationToken, WorkflowContextView,
+    cancellation::WorkflowCancellationRegistration,
     runtime::{
         entry::WorkflowError,
         model::{
@@ -313,6 +314,11 @@ impl WorkflowInterceptorContext {
         self.base.payload_converter()
     }
 
+    /// Return the workflow's root cancellation token.
+    pub fn cancellation_token(&self) -> WorkflowCancellationToken {
+        self.base.cancellation_token()
+    }
+
     /// Request to create a timer through the workflow outbound interceptor chain.
     pub fn timer<T: Into<TimerOptions>>(
         &self,
@@ -414,6 +420,11 @@ impl SyncWorkflowInterceptorContext {
     /// Return the workflow type name.
     pub fn workflow_type(&self) -> &str {
         self.base.workflow_type()
+    }
+
+    /// Return the workflow's root cancellation token.
+    pub fn cancellation_token(&self) -> WorkflowCancellationToken {
+        self.base.cancellation_token()
     }
 
     /// Return the current time according to the workflow.
@@ -865,6 +876,7 @@ impl WorkflowCancellationHandle {
 pub struct CancellableWorkflowOutboundFuture<T> {
     inner: WorkflowOutboundFuture<T>,
     cancellation: WorkflowCancellationHandle,
+    cancellation_registration: Option<WorkflowCancellationRegistration>,
 }
 
 impl<T> CancellableWorkflowOutboundFuture<T> {
@@ -876,6 +888,21 @@ impl<T> CancellableWorkflowOutboundFuture<T> {
         Self {
             inner: WorkflowOutboundFuture::new(future),
             cancellation,
+            cancellation_registration: None,
+        }
+    }
+
+    pub(crate) fn with_cancellation_token(mut self, token: WorkflowCancellationToken) -> Self {
+        let cancellation = self.cancellation.clone();
+        self.cancellation_registration = Some(token.register(move |reason| {
+            cancellation.cancel(reason);
+        }));
+        self
+    }
+
+    pub(crate) fn unregister_cancellation(&mut self) {
+        if let Some(registration) = &mut self.cancellation_registration {
+            registration.unregister();
         }
     }
 
@@ -905,7 +932,11 @@ impl<T> Future for CancellableWorkflowOutboundFuture<T> {
     type Output = T;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        Pin::new(&mut self.inner).poll(cx)
+        let result = Pin::new(&mut self.inner).poll(cx);
+        if result.is_ready() {
+            self.unregister_cancellation();
+        }
+        result
     }
 }
 
@@ -1192,6 +1223,7 @@ pub struct SignalWorkflowInput {
     signal_name: String,
     target: SignalWorkflowTarget,
     decoded: DecodedInput,
+    cancellation_token: Option<WorkflowCancellationToken>,
 }
 
 impl SignalWorkflowInput {
@@ -1199,14 +1231,17 @@ impl SignalWorkflowInput {
         signal_name: String,
         target: SignalWorkflowTarget,
         input: Box<dyn Any>,
+        cancellation_token: Option<WorkflowCancellationToken>,
     ) -> Self {
         Self {
             signal_name,
             target,
             decoded: DecodedInput::new(Some(input), HashMap::new()),
+            cancellation_token,
         }
     }
 
+    #[allow(clippy::type_complexity)]
     pub(crate) fn into_parts(
         self,
     ) -> (
@@ -1214,6 +1249,7 @@ impl SignalWorkflowInput {
         SignalWorkflowTarget,
         Box<dyn Any>,
         HashMap<String, Payload>,
+        Option<WorkflowCancellationToken>,
     ) {
         let (input, headers) = self.decoded.into_parts();
         (
@@ -1221,6 +1257,7 @@ impl SignalWorkflowInput {
             self.target,
             input.expect("signal input must exist"),
             headers,
+            self.cancellation_token,
         )
     }
 
@@ -1242,6 +1279,16 @@ impl SignalWorkflowInput {
     /// Mutably access the signal target.
     pub fn target_mut(&mut self) -> &mut SignalWorkflowTarget {
         &mut self.target
+    }
+
+    /// Cancellation token for this signal. `None` inherits workflow cancellation.
+    pub fn cancellation_token(&self) -> Option<&WorkflowCancellationToken> {
+        self.cancellation_token.as_ref()
+    }
+
+    /// Mutably access the signal cancellation token.
+    pub fn cancellation_token_mut(&mut self) -> &mut Option<WorkflowCancellationToken> {
+        &mut self.cancellation_token
     }
 }
 

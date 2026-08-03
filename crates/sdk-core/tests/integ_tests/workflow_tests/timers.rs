@@ -357,7 +357,9 @@ impl WaitConditionWakerWf {
         // Future 2: wait_condition on the flag (waker-dependent inside FuturesUnordered)
         let ctx2 = ctx.clone();
         futs.push(Box::pin(async move {
-            ctx2.wait_condition(|s| s.done).await;
+            ctx2.wait_condition(|s| s.done, None)
+                .await
+                .expect("workflow was not cancelled");
         }));
 
         // Drive both to completion

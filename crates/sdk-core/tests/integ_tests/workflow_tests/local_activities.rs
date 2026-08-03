@@ -1214,7 +1214,7 @@ async fn local_activity_with_heartbeat_only_causes_one_wakeup() {
             // Interestingly LA munst come first because if the condition is polled first, we won't
             // see that resolved is true.
             // TODO [rust-sdk-branch] - See if we can fix this and know that we should re-poll.
-            temporalio_sdk::workflows::join!(
+            let (_, wait_result) = temporalio_sdk::workflows::join!(
                 async {
                     ctx.execute_local_activity(
                         StdActivities::delay,
@@ -1225,11 +1225,15 @@ async fn local_activity_with_heartbeat_only_causes_one_wakeup() {
                     .ok();
                     ctx.state_mut(|s| s.la_resolved = true);
                 },
-                ctx.wait_condition(|_| {
-                    wakeup_counter += 1;
-                    ctx.state(|s| s.la_resolved)
-                })
+                ctx.wait_condition(
+                    |_| {
+                        wakeup_counter += 1;
+                        ctx.state(|s| s.la_resolved)
+                    },
+                    None
+                )
             );
+            wait_result?;
             Ok(wakeup_counter as usize)
         }
     }

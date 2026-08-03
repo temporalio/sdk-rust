@@ -344,7 +344,7 @@ struct QueryUpdateFailureFallbackWorkflow {
 impl QueryUpdateFailureFallbackWorkflow {
     #[run]
     async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<()> {
-        ctx.wait_condition(|s| s.finish).await;
+        ctx.wait_condition(|s| s.finish, None).await?;
         Ok(())
     }
 

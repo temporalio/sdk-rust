@@ -1,6 +1,7 @@
 //! Runtime protocol and execution model types shared by workflow code and native hosts.
 
 use crate::{
+    WorkflowCancellationError,
     runtime::types::ContinueAsNewRequest,
     workflow_context::{
         ChildWfCommon, NexusUnblockData, PendingChildWorkflow, StartedNexusOperation,
@@ -237,6 +238,12 @@ impl WorkflowTermination {
 impl From<anyhow::Error> for WorkflowTermination {
     fn from(err: anyhow::Error) -> Self {
         Self::Failed(err.into())
+    }
+}
+
+impl From<WorkflowCancellationError> for WorkflowTermination {
+    fn from(value: WorkflowCancellationError) -> Self {
+        Self::Failed(ApplicationFailure::new(value).into())
     }
 }
 

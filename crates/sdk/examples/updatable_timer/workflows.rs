@@ -45,7 +45,7 @@ impl UpdatableTimerWorkflow {
                     let final_deadline = ctx.state(|s| s.deadline_ms);
                     return Ok(format!("Timer fired at deadline {final_deadline}"));
                 }
-                _ = ctx.wait_condition(|s: &Self| s.deadline_version != current_version) => {
+                _ = ctx.wait_condition(|s: &Self| s.deadline_version != current_version, None) => {
                 }
             }
         }

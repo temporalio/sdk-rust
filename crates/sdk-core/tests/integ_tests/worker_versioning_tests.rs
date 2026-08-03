@@ -326,8 +326,8 @@ impl ContinueAsNewAutoUpgradeV1 {
         if attempt > 0 {
             return Ok("v1.0".to_string());
         }
-        ctx.wait_condition(|state| state.should_continue_as_new)
-            .await;
+        ctx.wait_condition(|state| state.should_continue_as_new, None)
+            .await?;
         assert!(ctx.target_worker_deployment_version_changed());
         let mut options = ContinueAsNewOptions::default();
         options.initial_versioning_behavior = Some(ContinueAsNewVersioningBehavior::AutoUpgrade);
@@ -454,8 +454,8 @@ impl ContinueAsNewUseRampingVersionV1 {
         if attempt > 0 {
             return Ok("v1.0".to_string());
         }
-        ctx.wait_condition(|state| state.should_continue_as_new)
-            .await;
+        ctx.wait_condition(|state| state.should_continue_as_new, None)
+            .await?;
         let mut options = ContinueAsNewOptions::default();
         options.initial_versioning_behavior =
             Some(ContinueAsNewVersioningBehavior::UseRampingVersion);

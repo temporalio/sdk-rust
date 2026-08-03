@@ -116,8 +116,8 @@ pub use temporalio_workflow::{
     NexusOperationOptions, ParentClosePolicy, PatchActivationCallback, Signal, SignalData,
     StartChildWorkflowExecutionFailedCause, StartChildWorkflowOutput, StartedChildWorkflow,
     StartedNexusOperation, SyncWorkflowContext, TimerOptions, TimerResult, VersioningIntent,
-    WorkflowContext, WorkflowContextView, WorkflowIdReusePolicy, WorkflowRandomValue,
-    WorkflowResult, WorkflowTermination,
+    WorkflowCancellationError, WorkflowCancellationToken, WorkflowContext, WorkflowContextView,
+    WorkflowIdReusePolicy, WorkflowRandomValue, WorkflowResult, WorkflowTermination,
 };
 #[cfg(feature = "wasm-workflows")]
 pub use workflow_wasm::WasmWorkflowComponent;

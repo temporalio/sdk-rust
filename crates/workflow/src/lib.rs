@@ -14,6 +14,7 @@ pub mod __private {
     pub use futures_util;
 }
 
+mod cancellation;
 #[doc(hidden)]
 pub mod component;
 mod memo;
@@ -23,6 +24,7 @@ mod workflow_context;
 pub mod workflow_interceptors;
 pub mod workflows;
 
+pub use cancellation::{WorkflowCancellationError, WorkflowCancellationToken};
 pub use memo::{MemoValue, MemoValues};
 #[doc(hidden)]
 pub use runtime::model::{CancellableID, UnblockEvent};
