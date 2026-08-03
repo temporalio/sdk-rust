@@ -28,7 +28,7 @@ use temporalio_common::{
         coresdk::FromPayloadsExt,
         proto_ts_to_system_time,
         temporal::api::{
-            common::v1::{Payload, Payloads, WorkflowExecution as ProtoWorkflowExecution},
+            common::v1::{Header, Payload, Payloads, WorkflowExecution as ProtoWorkflowExecution},
             enums::v1::{HistoryEventFilterType, UpdateWorkflowExecutionLifecycleStage},
             history::{
                 self,
@@ -526,6 +526,45 @@ impl<W: WorkflowDefinition> UpdateDefinition for UntypedUpdate<W> {
     }
 }
 
+/// Shared by [WorkflowHandle::start_update] and the client's update-with-start, which sends the
+/// same update request as one of its operations. Update starts always wait for the update to be
+/// accepted; results are waited on separately via the update handle.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn build_update_workflow_request(
+    namespace: String,
+    identity: String,
+    workflow_id: String,
+    run_id: String,
+    update_id: String,
+    update_name: String,
+    header: Option<Header>,
+    payloads: Vec<Payload>,
+) -> UpdateWorkflowExecutionRequest {
+    UpdateWorkflowExecutionRequest {
+        namespace,
+        workflow_execution: Some(ProtoWorkflowExecution {
+            workflow_id,
+            run_id,
+        }),
+        wait_policy: Some(WaitPolicy {
+            lifecycle_stage: UpdateWorkflowExecutionLifecycleStage::Accepted.into(),
+        }),
+        request: Some(update::v1::Request {
+            meta: Some(update::v1::Meta {
+                update_id,
+                identity,
+            }),
+            input: Some(update::v1::Input {
+                header,
+                name: update_name,
+                args: Some(Payloads { payloads }),
+            }),
+            ..Default::default()
+        }),
+        ..Default::default()
+    }
+}
+
 impl<CT, W> WorkflowHandle<CT, W>
 where
     CT: WorkflowService + Clone,
@@ -861,17 +900,7 @@ where
         U::Output: 'static,
     {
         let rpc_options = options.rpc_options.clone();
-        let handle = self
-            .start_update(
-                update,
-                input,
-                WorkflowStartUpdateOptions::builder()
-                    .maybe_update_id(options.update_id)
-                    .maybe_header(options.header)
-                    .rpc_options(rpc_options.clone())
-                    .build(),
-            )
-            .await?;
+        let handle = self.start_update(update, input, options.into()).await?;
         handle.get_result(rpc_options).await
     }
 
@@ -922,30 +951,16 @@ where
                         let update_id = options
                             .update_id
                             .unwrap_or_else(|| Uuid::new_v4().to_string());
-                        let mut request = UpdateWorkflowExecutionRequest {
-                            namespace: client.namespace(),
-                            workflow_execution: Some(ProtoWorkflowExecution {
-                                workflow_id: workflow_id.clone(),
-                                run_id,
-                            }),
-                            wait_policy: Some(WaitPolicy {
-                                lifecycle_stage:
-                                    UpdateWorkflowExecutionLifecycleStage::Accepted.into(),
-                            }),
-                            request: Some(update::v1::Request {
-                                meta: Some(update::v1::Meta {
-                                    update_id: update_id.clone(),
-                                    identity: client.identity(),
-                                }),
-                                input: Some(update::v1::Input {
-                                    header: options.header,
-                                    name: update_name,
-                                    args: Some(Payloads { payloads }),
-                                }),
-                                ..Default::default()
-                            }),
-                            ..Default::default()
-                        }
+                        let mut request = build_update_workflow_request(
+                            client.namespace(),
+                            client.identity(),
+                            workflow_id.clone(),
+                            run_id,
+                            update_id.clone(),
+                            update_name,
+                            options.header,
+                            payloads,
+                        )
                         .into_request();
                         options.rpc_options.apply_to(&mut request);
                         let response = WorkflowService::update_workflow_execution(
@@ -973,14 +988,13 @@ where
         )
         .await?;
 
-        Ok(WorkflowUpdateHandle {
-            client: self.client.clone(),
-            update_id: output.update_id,
-            workflow_id: output.workflow_id,
-            run_id: output.run_id.or_else(|| self.info().run_id.clone()),
-            known_outcome: output.known_outcome,
-            _output: PhantomData,
-        })
+        Ok(WorkflowUpdateHandle::new(
+            self.client.clone(),
+            output.update_id,
+            output.workflow_id,
+            output.run_id.or_else(|| self.info().run_id.clone()),
+            output.known_outcome,
+        ))
     }
 
     /// Request cancellation of this workflow.
@@ -1236,6 +1250,23 @@ pub struct WorkflowUpdateHandle<CT, T> {
 }
 
 impl<CT, T> WorkflowUpdateHandle<CT, T> {
+    pub(crate) fn new(
+        client: CT,
+        update_id: String,
+        workflow_id: String,
+        run_id: Option<String>,
+        known_outcome: Option<update::v1::Outcome>,
+    ) -> Self {
+        Self {
+            client,
+            update_id,
+            workflow_id,
+            run_id,
+            known_outcome,
+            _output: PhantomData,
+        }
+    }
+
     /// Get the update ID.
     pub fn id(&self) -> &str {
         &self.update_id

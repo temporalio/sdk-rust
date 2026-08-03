@@ -4,10 +4,10 @@ use crate::{
     ActivityHeartbeatResponse, ActivityIdentifier, WorkflowCancelOptions, WorkflowCountOptions,
     WorkflowDescribeOptions, WorkflowFetchHistoryOptions, WorkflowQueryOptions,
     WorkflowSignalOptions, WorkflowStartError, WorkflowStartOptions, WorkflowStartUpdateOptions,
-    WorkflowTerminateOptions,
+    WorkflowTerminateOptions, WorkflowUpdateWithStartOptions,
     errors::{
         AsyncActivityError, ClientError, WorkflowInteractionError, WorkflowQueryError,
-        WorkflowUpdateError,
+        WorkflowUpdateError, WorkflowUpdateWithStartError,
     },
     schedules::{
         CreateScheduleOptions, ScheduleBackfill, ScheduleError, ScheduleOverlapPolicy,
@@ -629,6 +629,114 @@ impl StartWorkflowUpdateOutput {
         Self {
             update_id: update_id.into(),
             workflow_id: workflow_id.into(),
+            run_id,
+            known_outcome,
+        }
+    }
+}
+
+/// Input to [`ClientInterceptor::update_with_start_workflow`].
+#[non_exhaustive]
+#[derive(derive_more::Debug)]
+pub struct UpdateWithStartWorkflowInput {
+    /// The workflow type sent to the server.
+    pub workflow_type: String,
+    /// Update name sent to the workflow.
+    pub update_name: String,
+    /// Options for the atomic start-and-update operation.
+    pub options: WorkflowUpdateWithStartOptions,
+    /// Controls for the multi-operation RPC.
+    pub rpc_options: crate::RpcOptions,
+    #[debug(skip)]
+    pub(crate) workflow_args: Box<dyn TemporalClientValue>,
+    #[debug(skip)]
+    pub(crate) update_args: Box<dyn TemporalClientValue>,
+}
+
+impl UpdateWithStartWorkflowInput {
+    pub(crate) fn new<WA, UA>(
+        workflow_type: String,
+        workflow_args: WA,
+        update_name: String,
+        update_args: UA,
+        mut options: WorkflowUpdateWithStartOptions,
+    ) -> Self
+    where
+        WA: TemporalSerializable + Send + 'static,
+        UA: TemporalSerializable + Send + 'static,
+    {
+        let rpc_options = std::mem::take(&mut options.rpc_options);
+        Self {
+            workflow_type,
+            update_name,
+            options,
+            rpc_options,
+            workflow_args: Box::new(workflow_args),
+            update_args: Box::new(update_args),
+        }
+    }
+
+    /// Attempt to access the workflow start arguments as a concrete type.
+    pub fn workflow_args_ref<T: Any>(&self) -> Option<&T> {
+        self.workflow_args.as_any().downcast_ref()
+    }
+
+    /// Attempt to mutably access the workflow start arguments as a concrete type.
+    pub fn workflow_args_mut<T: Any>(&mut self) -> Option<&mut T> {
+        self.workflow_args.as_any_mut().downcast_mut()
+    }
+
+    /// Replace the workflow start arguments with another serializable value.
+    pub fn replace_workflow_args<T>(&mut self, args: T)
+    where
+        T: TemporalSerializable + Send + 'static,
+    {
+        self.workflow_args = Box::new(args);
+    }
+
+    /// Attempt to access the update arguments as a concrete type.
+    pub fn update_args_ref<T: Any>(&self) -> Option<&T> {
+        self.update_args.as_any().downcast_ref()
+    }
+
+    /// Attempt to mutably access the update arguments as a concrete type.
+    pub fn update_args_mut<T: Any>(&mut self) -> Option<&mut T> {
+        self.update_args.as_any_mut().downcast_mut()
+    }
+
+    /// Replace the update arguments with another serializable value.
+    pub fn replace_update_args<T>(&mut self, args: T)
+    where
+        T: TemporalSerializable + Send + 'static,
+    {
+        self.update_args = Box::new(args);
+    }
+}
+
+/// Result of an intercepted update-with-start operation.
+#[non_exhaustive]
+#[derive(Clone, Debug)]
+pub struct UpdateWithStartWorkflowOutput {
+    /// Workflow ID used by the operation.
+    pub workflow_id: String,
+    /// Update ID used by the operation.
+    pub update_id: String,
+    /// Run ID associated with the update, when available.
+    pub run_id: Option<String>,
+    /// Outcome returned when the requested wait stage completed the update.
+    pub known_outcome: Option<Outcome>,
+}
+
+impl UpdateWithStartWorkflowOutput {
+    pub(crate) fn new(
+        workflow_id: impl Into<String>,
+        update_id: impl Into<String>,
+        run_id: Option<String>,
+        known_outcome: Option<Outcome>,
+    ) -> Self {
+        Self {
+            workflow_id: workflow_id.into(),
+            update_id: update_id.into(),
             run_id,
             known_outcome,
         }
@@ -1262,6 +1370,19 @@ pub trait ClientInterceptor: Send + Sync + 'static {
         next.run(input)
     }
 
+    /// Intercept an `update_with_start_workflow` operation.
+    fn update_with_start_workflow<'a>(
+        &'a self,
+        input: UpdateWithStartWorkflowInput,
+        next: Next<
+            'a,
+            UpdateWithStartWorkflowInput,
+            BoxFuture<'a, Result<UpdateWithStartWorkflowOutput, WorkflowUpdateWithStartError>>,
+        >,
+    ) -> BoxFuture<'a, Result<UpdateWithStartWorkflowOutput, WorkflowUpdateWithStartError>> {
+        next.run(input)
+    }
+
     /// Intercept a `poll_workflow_update` operation.
     fn poll_workflow_update<'a>(
         &'a self,
@@ -1518,6 +1639,13 @@ interceptor_chain!(
     start_workflow_update,
     StartWorkflowUpdateInput,
     BoxFuture<'a, Result<StartWorkflowUpdateOutput, WorkflowUpdateError>>
+);
+
+interceptor_chain!(
+    call_update_with_start_workflow,
+    update_with_start_workflow,
+    UpdateWithStartWorkflowInput,
+    BoxFuture<'a, Result<UpdateWithStartWorkflowOutput, WorkflowUpdateWithStartError>>
 );
 
 interceptor_chain!(

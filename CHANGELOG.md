@@ -46,6 +46,12 @@ relevant information.
 * The `temporal_activity_execution_failed` and `temporal_local_activity_execution_failed` worker
   metrics now carry a `failure_reason` attribute. Each is now split into one time series per
   reason, which may affect existing dashboards.
+* Update-with-Start support: `Client::start_update_with_start_workflow` and
+  `Client::execute_update_with_start_workflow` start a workflow and send it an update in one atomic
+  operation. `WorkflowUpdateWithStartOptions` requires an ID conflict policy (use `UseExisting` to
+  attach an update to an already-running workflow), provides distinct start and update headers,
+  and controls the atomic RPC. The operation can be intercepted via
+  `ClientInterceptor::update_with_start_workflow`.
 
 ### Breaking Changes :boom:
 * Values stored in a `MemoValue` must now be `Send + Sync`. It previously held its value in an

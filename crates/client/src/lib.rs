@@ -61,6 +61,7 @@ pub use interceptors::{
     SignalWithStartWorkflowInput, SignalWorkflowInput, StartWorkflowInput, StartWorkflowOutput,
     StartWorkflowUpdateInput, StartWorkflowUpdateOutput, TemporalClientValue,
     TerminateWorkflowInput, TriggerScheduleInput, UnpauseScheduleInput, UpdateScheduleInput,
+    UpdateWithStartWorkflowInput, UpdateWithStartWorkflowOutput,
 };
 pub use metrics::{LONG_REQUEST_LATENCY_HISTOGRAM_NAME, REQUEST_LATENCY_HISTOGRAM_NAME};
 pub use options_structs::*;
@@ -115,7 +116,11 @@ use crate::{
     worker::ClientWorkerSet,
 };
 use errors::*;
-use futures_util::{future::BoxFuture, stream, stream::Stream};
+use futures_util::{
+    future::{BoxFuture, try_join},
+    stream,
+    stream::Stream,
+};
 use http::Uri;
 use parking_lot::RwLock;
 use std::{
@@ -129,7 +134,7 @@ use std::{
     time::{Duration, SystemTime},
 };
 use temporalio_common::{
-    ActivityDefinition, HasWorkflowDefinition, SignalDefinition, UntypedActivity,
+    ActivityDefinition, HasWorkflowDefinition, SignalDefinition, UntypedActivity, UpdateDefinition,
     data_converters::{DataConverter, SerializationContext, SerializationContextData},
     payload_visitor::decode_payloads,
     protos::{
@@ -138,23 +143,23 @@ use temporalio_common::{
         proto_ts_to_system_time,
         temporal::api::{
             cloud::cloudservice::v1::cloud_service_client::CloudServiceClient,
-            common::v1::{ActivityType, Payloads, WorkflowType},
+            common::v1::{ActivityType, Memo as ProtoMemo, Payloads, WorkflowType},
             enums::v1::{
                 ActivityIdConflictPolicy as ProtoActivityIdConflictPolicy,
                 ActivityIdReusePolicy as ProtoActivityIdReusePolicy, TaskQueueKind,
             },
-            errordetails::v1::WorkflowExecutionAlreadyStartedFailure,
             operatorservice::v1::operator_service_client::OperatorServiceClient,
             sdk::v1::UserMetadata,
             taskqueue::v1::TaskQueue,
             testservice::v1::test_service_client::TestServiceClient,
             workflow::v1 as workflow,
             workflowservice::v1::{
-                count_workflow_executions_response, workflow_service_client::WorkflowServiceClient,
-                *,
+                count_workflow_executions_response,
+                execute_multi_operation_request::operation::Operation as MultiOperationRequest,
+                execute_multi_operation_response::response::Response as MultiOperationResponse,
+                workflow_service_client::WorkflowServiceClient, *,
             },
         },
-        utilities::decode_status_detail,
     },
     search_attributes::{SearchAttributeError, SearchAttributeValue, SearchAttributes},
 };
@@ -1181,6 +1186,64 @@ impl Client {
         .await
     }
 
+    /// Start a workflow and send it an update as a single atomic operation.
+    ///
+    /// Returns once the update has been accepted by the workflow, yielding a
+    /// [`WorkflowUpdateHandle`] that can be used to wait for the update result.
+    pub async fn start_update_with_start_workflow<W, U>(
+        &self,
+        workflow: W,
+        workflow_input: W::Input,
+        update: U,
+        update_input: U::Input,
+        options: WorkflowUpdateWithStartOptions,
+    ) -> Result<WorkflowUpdateHandle<Self, U::Output>, WorkflowUpdateWithStartError>
+    where
+        W: HasWorkflowDefinition,
+        W::Input: Send,
+        U: UpdateDefinition<Workflow = W::Run>,
+        U::Input: Send,
+    {
+        WorkflowClientTrait::start_update_with_start_workflow(
+            self,
+            workflow,
+            workflow_input,
+            update,
+            update_input,
+            options,
+        )
+        .await
+    }
+
+    /// Start a workflow and send it an update as a single atomic operation, waiting for the
+    /// update to complete and returning its result.
+    ///
+    /// See [Client::start_update_with_start_workflow] for details on option requirements.
+    pub async fn execute_update_with_start_workflow<W, U>(
+        &self,
+        workflow: W,
+        workflow_input: W::Input,
+        update: U,
+        update_input: U::Input,
+        options: WorkflowUpdateWithStartOptions,
+    ) -> Result<U::Output, WorkflowUpdateWithStartError>
+    where
+        W: HasWorkflowDefinition,
+        W::Input: Send,
+        U: UpdateDefinition<Workflow = W::Run>,
+        U::Input: Send,
+    {
+        WorkflowClientTrait::execute_update_with_start_workflow(
+            self,
+            workflow,
+            workflow_input,
+            update,
+            update_input,
+            options,
+        )
+        .await
+    }
+
     /// Get a handle to an existing workflow.
     ///
     /// For untyped access, use `get_workflow_handle::<UntypedWorkflow>(...)`.
@@ -1361,6 +1424,40 @@ pub(crate) trait WorkflowClientTrait: NamespacedClient {
         W::Input: Send,
         S: SignalDefinition<Workflow = W::Run>,
         S::Input: Send;
+
+    /// Start a workflow and send it an update as a single atomic operation, returning once the
+    /// update reaches the requested wait stage.
+    fn start_update_with_start_workflow<W, U>(
+        &self,
+        workflow: W,
+        workflow_input: W::Input,
+        update: U,
+        update_input: U::Input,
+        options: WorkflowUpdateWithStartOptions,
+    ) -> impl Future<Output = Result<WorkflowUpdateHandle<Self, U::Output>, WorkflowUpdateWithStartError>>
+    where
+        Self: Sized,
+        W: HasWorkflowDefinition,
+        W::Input: Send,
+        U: UpdateDefinition<Workflow = W::Run>,
+        U::Input: Send;
+
+    /// Start a workflow and send it an update as a single atomic operation, waiting for the
+    /// update to complete and returning its result.
+    fn execute_update_with_start_workflow<W, U>(
+        &self,
+        workflow: W,
+        workflow_input: W::Input,
+        update: U,
+        update_input: U::Input,
+        options: WorkflowUpdateWithStartOptions,
+    ) -> impl Future<Output = Result<U::Output, WorkflowUpdateWithStartError>>
+    where
+        Self: Sized,
+        W: HasWorkflowDefinition,
+        W::Input: Send,
+        U: UpdateDefinition<Workflow = W::Run>,
+        U::Input: Send;
 
     /// Get a handle to an existing workflow. `run_id` may be left blank to specify the most recent
     /// execution having the provided `workflow_id`.
@@ -1697,6 +1794,56 @@ impl WorkflowCountAggregationGroup {
     }
 }
 
+/// Shared by `start_workflow` and update-with-start, which sends the same start request as one of
+/// its operations. `identity` is left unset because the two RPC paths populate it differently.
+fn build_start_workflow_request(
+    namespace: String,
+    workflow_type: String,
+    input: Option<Payloads>,
+    memo: Option<ProtoMemo>,
+    user_metadata: Option<UserMetadata>,
+    options: WorkflowStartOptions,
+) -> StartWorkflowExecutionRequest {
+    StartWorkflowExecutionRequest {
+        namespace,
+        input,
+        workflow_id: options.workflow_id,
+        workflow_type: Some(WorkflowType {
+            name: workflow_type,
+        }),
+        task_queue: Some(TaskQueue {
+            name: options.task_queue,
+            kind: TaskQueueKind::Unspecified as i32,
+            normal_name: String::new(),
+        }),
+        request_id: Uuid::new_v4().to_string(),
+        workflow_id_reuse_policy: options.id_reuse_policy as i32,
+        workflow_id_conflict_policy: options.id_conflict_policy as i32,
+        workflow_execution_timeout: options
+            .execution_timeout
+            .and_then(|duration| duration.try_into().ok()),
+        workflow_run_timeout: options
+            .run_timeout
+            .and_then(|duration| duration.try_into().ok()),
+        workflow_task_timeout: options
+            .task_timeout
+            .and_then(|duration| duration.try_into().ok()),
+        search_attributes: options
+            .search_attributes
+            .map(|attributes| attributes.into_proto()),
+        cron_schedule: options.cron_schedule.unwrap_or_default(),
+        request_eager_execution: options.enable_eager_workflow_start,
+        retry_policy: options.retry_policy.map(Into::into),
+        links: options.links,
+        completion_callbacks: options.completion_callbacks,
+        priority: Some(options.priority.into()),
+        memo,
+        header: options.header,
+        user_metadata,
+        ..Default::default()
+    }
+}
+
 impl<T> WorkflowClientTrait for T
 where
     T: WorkflowService + NamespacedClient + Clone + Send + Sync + 'static,
@@ -1741,75 +1888,24 @@ where
                             .await?;
                         let namespace = client.namespace();
                         let workflow_id = options.workflow_id.clone();
-                        let task_queue_name = options.task_queue.clone();
-
                         let user_metadata = options.user_metadata();
-
                         let memo = options.encoded_memo(&data_converter).await?;
-
-                        let run_id = {
-                            let mut request = StartWorkflowExecutionRequest {
-                                namespace,
-                                input: payloads.into_payloads(),
-                                workflow_id: workflow_id.clone(),
-                                workflow_type: Some(WorkflowType {
-                                    name: workflow_type,
-                                }),
-                                task_queue: Some(TaskQueue {
-                                    name: task_queue_name,
-                                    kind: TaskQueueKind::Unspecified as i32,
-                                    normal_name: String::new(),
-                                }),
-                                request_id: Uuid::new_v4().to_string(),
-                                workflow_id_reuse_policy: options.id_reuse_policy as i32,
-                                workflow_id_conflict_policy: options.id_conflict_policy as i32,
-                                workflow_execution_timeout: options
-                                    .execution_timeout
-                                    .and_then(|duration| duration.try_into().ok()),
-                                workflow_run_timeout: options
-                                    .run_timeout
-                                    .and_then(|duration| duration.try_into().ok()),
-                                workflow_task_timeout: options
-                                    .task_timeout
-                                    .and_then(|duration| duration.try_into().ok()),
-                                search_attributes: options
-                                    .search_attributes
-                                    .map(|attributes| attributes.into_proto()),
-                                cron_schedule: options.cron_schedule.unwrap_or_default(),
-                                request_eager_execution: options.enable_eager_workflow_start,
-                                retry_policy: options.retry_policy.map(Into::into),
-                                links: options.links,
-                                completion_callbacks: options.completion_callbacks,
-                                priority: Some(options.priority.into()),
-                                memo,
-                                header: options.header,
-                                user_metadata,
-                                ..Default::default()
-                            }
-                            .into_request();
-                            rpc_options.apply_to(&mut request);
-                            client
-                                .start_workflow_execution(request)
-                                .await
-                                .map_err(|status| {
-                                    if status.code() == Code::AlreadyExists {
-                                        let run_id = decode_status_detail::<
-                                            WorkflowExecutionAlreadyStartedFailure,
-                                        >(
-                                            status.details()
-                                        )
-                                        .map(|failure| failure.run_id);
-                                        WorkflowStartError::AlreadyStarted {
-                                            run_id,
-                                            source: status,
-                                        }
-                                    } else {
-                                        WorkflowStartError::Rpc(status)
-                                    }
-                                })?
-                                .into_inner()
-                            .run_id
-                        };
+                        let mut request = build_start_workflow_request(
+                            namespace,
+                            workflow_type,
+                            payloads.into_payloads(),
+                            memo,
+                            user_metadata,
+                            options,
+                        )
+                        .into_request();
+                        rpc_options.apply_to(&mut request);
+                        let run_id = client
+                            .start_workflow_execution(request)
+                            .await
+                            .map_err(WorkflowStartError::from_status)?
+                            .into_inner()
+                            .run_id;
 
                         Ok(StartWorkflowOutput::new(workflow_id, run_id))
                     })
@@ -1966,6 +2062,201 @@ where
                 first_execution_run_id: Some(run_id),
             },
         ))
+    }
+
+    async fn start_update_with_start_workflow<W, U>(
+        &self,
+        workflow: W,
+        workflow_input: W::Input,
+        update: U,
+        update_input: U::Input,
+        options: WorkflowUpdateWithStartOptions,
+    ) -> Result<WorkflowUpdateHandle<Self, U::Output>, WorkflowUpdateWithStartError>
+    where
+        W: HasWorkflowDefinition,
+        W::Input: Send,
+        U: UpdateDefinition<Workflow = W::Run>,
+        U::Input: Send,
+    {
+        let output = interceptors::call_update_with_start_workflow(
+            self.client_interceptors(),
+            UpdateWithStartWorkflowInput::new(
+                workflow.name().to_owned(),
+                workflow_input,
+                update.name().to_owned(),
+                update_input,
+                options,
+            ),
+            Next::new({
+                let client = (*self).clone();
+                move |input: UpdateWithStartWorkflowInput| -> BoxFuture<
+                    '_,
+                    Result<UpdateWithStartWorkflowOutput, WorkflowUpdateWithStartError>,
+                > {
+                    let mut client = client;
+                    Box::pin(async move {
+                        let UpdateWithStartWorkflowInput {
+                            workflow_type,
+                            update_name,
+                            options,
+                            rpc_options,
+                            workflow_args,
+                            update_args,
+                        } = input;
+                        let (start_options, update_id, update_header) = options.into_parts();
+
+                        let data_converter = client.data_converter().clone();
+                        let (unencoded_workflow_payloads, unencoded_update_payloads) = {
+                            let payload_converter = data_converter.payload_converter();
+                            let context = SerializationContext {
+                                data: &SerializationContextData::Workflow,
+                                converter: payload_converter,
+                            };
+                            (
+                                workflow_args.serialize_payloads(&context),
+                                update_args.serialize_payloads(&context),
+                            )
+                        };
+                        drop(workflow_args);
+                        drop(update_args);
+                        // The codec may do expensive work per call (e.g. remote encryption), so
+                        // encode both payload sets concurrently.
+                        let (workflow_payloads, update_payloads) = try_join(
+                            data_converter.codec().encode(
+                                &SerializationContextData::Workflow,
+                                unencoded_workflow_payloads?,
+                            ),
+                            data_converter.codec().encode(
+                                &SerializationContextData::Workflow,
+                                unencoded_update_payloads?,
+                            ),
+                        )
+                        .await?;
+
+                        let namespace = client.namespace();
+                        let workflow_id = start_options.workflow_id.clone();
+                        let user_metadata = start_options.user_metadata();
+                        let memo = start_options.encoded_memo(&data_converter).await?;
+                        let mut start_request = build_start_workflow_request(
+                            namespace.clone(),
+                            workflow_type,
+                            workflow_payloads.into_payloads(),
+                            memo,
+                            user_metadata,
+                            start_options,
+                        );
+                        start_request.identity = client.identity();
+
+                        let update_id = update_id.unwrap_or_else(|| Uuid::new_v4().to_string());
+                        let update_request = workflow_handle::build_update_workflow_request(
+                            namespace.clone(),
+                            client.identity(),
+                            workflow_id.clone(),
+                            String::new(),
+                            update_id.clone(),
+                            update_name,
+                            update_header,
+                            update_payloads,
+                        );
+
+                        let mut request = ExecuteMultiOperationRequest {
+                            namespace,
+                            operations: vec![
+                                execute_multi_operation_request::Operation {
+                                    operation: Some(MultiOperationRequest::StartWorkflow(
+                                        start_request,
+                                    )),
+                                },
+                                execute_multi_operation_request::Operation {
+                                    operation: Some(MultiOperationRequest::UpdateWorkflow(
+                                        update_request,
+                                    )),
+                                },
+                            ],
+                            resource_id: workflow_id.clone(),
+                        }
+                        .into_request();
+                        rpc_options.apply_to(&mut request);
+
+                        let response =
+                            WorkflowService::execute_multi_operation(&mut client, request)
+                                .await
+                                .map_err(WorkflowUpdateWithStartError::from_status)?
+                                .into_inner();
+
+                        // Responses mirror the order of the request's operations.
+                        let mut responses =
+                            response.responses.into_iter().filter_map(|r| r.response);
+                        let (
+                            Some(MultiOperationResponse::StartWorkflow(start_response)),
+                            Some(MultiOperationResponse::UpdateWorkflow(update_response)),
+                        ) = (responses.next(), responses.next())
+                        else {
+                            return Err(WorkflowUpdateWithStartError::Other(
+                                "Server response did not include both start and update \
+                                 operation responses"
+                                    .into(),
+                            ));
+                        };
+
+                        let run_id = update_response
+                            .update_ref
+                            .as_ref()
+                            .and_then(|reference| reference.workflow_execution.as_ref())
+                            .map(|execution| execution.run_id.clone())
+                            .filter(|run_id| !run_id.is_empty())
+                            .or_else(|| {
+                                (!start_response.run_id.is_empty()).then_some(start_response.run_id)
+                            });
+                        Ok(UpdateWithStartWorkflowOutput::new(
+                            workflow_id,
+                            update_id,
+                            run_id,
+                            update_response.outcome,
+                        ))
+                    })
+                }
+            }),
+        )
+        .await?;
+        Ok(WorkflowUpdateHandle::new(
+            self.clone(),
+            output.update_id,
+            output.workflow_id,
+            output.run_id,
+            output.known_outcome,
+        ))
+    }
+
+    async fn execute_update_with_start_workflow<W, U>(
+        &self,
+        workflow: W,
+        workflow_input: W::Input,
+        update: U,
+        update_input: U::Input,
+        options: WorkflowUpdateWithStartOptions,
+    ) -> Result<U::Output, WorkflowUpdateWithStartError>
+    where
+        W: HasWorkflowDefinition,
+        W::Input: Send,
+        U: UpdateDefinition<Workflow = W::Run>,
+        U::Input: Send,
+    {
+        let rpc_options = options.rpc_options.clone();
+        let update_handle = WorkflowClientTrait::start_update_with_start_workflow(
+            self,
+            workflow,
+            workflow_input,
+            update,
+            update_input,
+            options,
+        )
+        .await?;
+        let result = update_handle
+            .get_result(rpc_options)
+            .await
+            .map_err(WorkflowUpdateWithStartError::Update)?;
+        Ok(result)
     }
 
     fn get_workflow_handle<W: HasWorkflowDefinition>(
@@ -3823,6 +4114,313 @@ mod tests {
                 request.metadata().get_bin("connection-meta-bin").unwrap(),
                 &[2][..]
             );
+        }
+    }
+
+    mod update_with_start_tests {
+        use super::*;
+        use assert_matches::assert_matches;
+        use parking_lot::Mutex;
+        use temporalio_common::{
+            UpdateDefinition, WorkflowDefinition,
+            data_converters::{GenericPayloadConverter, PayloadConverter},
+            protos::temporal::api::{
+                common::v1::{
+                    Header, Payload, Payloads, WorkflowExecution as ProtoWorkflowExecution,
+                },
+                enums::v1::{UpdateWorkflowExecutionLifecycleStage, WorkflowIdConflictPolicy},
+                update::v1::{Outcome, UpdateRef, outcome},
+            },
+        };
+        use tonic::{Request, Response};
+
+        struct TestWorkflow;
+
+        impl WorkflowDefinition for TestWorkflow {
+            type Input = String;
+            type Output = ();
+
+            fn name(&self) -> &str {
+                "test-workflow"
+            }
+        }
+
+        impl HasWorkflowDefinition for TestWorkflow {
+            type Run = Self;
+        }
+
+        struct TestUpdate;
+
+        impl UpdateDefinition for TestUpdate {
+            type Workflow = TestWorkflow;
+            type Input = String;
+            type Output = String;
+
+            fn name(&self) -> &str {
+                "test-update"
+            }
+        }
+
+        #[derive(Clone)]
+        struct MockMultiOperationClient {
+            recorded: Arc<Mutex<Option<ExecuteMultiOperationRequest>>>,
+            interceptors: Vec<Arc<dyn ClientInterceptor>>,
+        }
+
+        impl NamespacedClient for MockMultiOperationClient {
+            fn namespace(&self) -> String {
+                "test-namespace".to_owned()
+            }
+
+            fn identity(&self) -> String {
+                "test-identity".to_owned()
+            }
+
+            fn client_interceptors(&self) -> &[Arc<dyn ClientInterceptor>] {
+                &self.interceptors
+            }
+        }
+
+        impl WorkflowService for MockMultiOperationClient {
+            fn execute_multi_operation(
+                &mut self,
+                request: Request<ExecuteMultiOperationRequest>,
+            ) -> futures_util::future::BoxFuture<
+                '_,
+                Result<Response<ExecuteMultiOperationResponse>, tonic::Status>,
+            > {
+                *self.recorded.lock() = Some(request.into_inner());
+                let payload_converter = PayloadConverter::default();
+                let result_payloads = payload_converter
+                    .to_payloads(
+                        &SerializationContext {
+                            data: &SerializationContextData::Workflow,
+                            converter: &payload_converter,
+                        },
+                        &"update-result".to_owned(),
+                    )
+                    .unwrap();
+                Box::pin(async {
+                    Ok(Response::new(ExecuteMultiOperationResponse {
+                        responses: vec![
+                            execute_multi_operation_response::Response {
+                                response: Some(
+                                    execute_multi_operation_response::response::Response::StartWorkflow(
+                                        StartWorkflowExecutionResponse {
+                                            run_id: "started-run-id".to_owned(),
+                                            first_execution_run_id: "first-run-id".to_owned(),
+                                            started: true,
+                                            ..Default::default()
+                                        },
+                                    ),
+                                ),
+                            },
+                            execute_multi_operation_response::Response {
+                                response: Some(
+                                    execute_multi_operation_response::response::Response::UpdateWorkflow(
+                                        UpdateWorkflowExecutionResponse {
+                                            update_ref: Some(UpdateRef {
+                                                workflow_execution: Some(ProtoWorkflowExecution {
+                                                    workflow_id: "workflow-id".to_owned(),
+                                                    run_id: "update-run-id".to_owned(),
+                                                }),
+                                                update_id: "server-update-id".to_owned(),
+                                            }),
+                                            outcome: Some(Outcome {
+                                                value: Some(outcome::Value::Success(Payloads {
+                                                    payloads: result_payloads,
+                                                })),
+                                            }),
+                                            ..Default::default()
+                                        },
+                                    ),
+                                ),
+                            },
+                        ],
+                    }))
+                })
+            }
+        }
+
+        fn update_with_start_options(
+            conflict_policy: WorkflowIdConflictPolicy,
+        ) -> WorkflowUpdateWithStartOptions {
+            WorkflowUpdateWithStartOptions::new("task-queue", "workflow-id", conflict_policy)
+                .build()
+        }
+
+        #[tokio::test]
+        async fn update_with_start_builds_multi_operation_request() {
+            let recorded = Arc::new(Mutex::new(None));
+            let client = MockMultiOperationClient {
+                recorded: recorded.clone(),
+                interceptors: Vec::new(),
+            };
+
+            let start_header = Header {
+                fields: HashMap::from([("start-header".to_owned(), Payload::default())]),
+            };
+            let update_header = Header {
+                fields: HashMap::from([("update-header".to_owned(), Payload::default())]),
+            };
+            let update_handle = client
+                .start_update_with_start_workflow(
+                    TestWorkflow,
+                    "workflow-input".to_owned(),
+                    TestUpdate,
+                    "update-input".to_owned(),
+                    WorkflowUpdateWithStartOptions::new(
+                        "task-queue",
+                        "workflow-id",
+                        WorkflowIdConflictPolicy::UseExisting,
+                    )
+                    .update_id("my-update-id".to_owned())
+                    .start_header(start_header.clone())
+                    .update_header(update_header.clone())
+                    .build(),
+                )
+                .await
+                .unwrap();
+
+            let request = recorded.lock().take().unwrap();
+            assert_eq!(request.namespace, "test-namespace");
+            assert_eq!(request.resource_id, "workflow-id");
+            assert_eq!(request.operations.len(), 2);
+            let start_request = assert_matches!(
+                &request.operations[0].operation,
+                Some(execute_multi_operation_request::operation::Operation::StartWorkflow(r)) => r
+            );
+            assert_eq!(start_request.workflow_id, "workflow-id");
+            assert_eq!(start_request.identity, "test-identity");
+            assert_eq!(
+                start_request.workflow_type.as_ref().unwrap().name,
+                "test-workflow"
+            );
+            assert_eq!(
+                start_request.task_queue.as_ref().unwrap().name,
+                "task-queue"
+            );
+            assert_eq!(
+                start_request.workflow_id_conflict_policy,
+                WorkflowIdConflictPolicy::UseExisting as i32
+            );
+            assert_eq!(start_request.header.as_ref(), Some(&start_header));
+            let update_request = assert_matches!(
+                &request.operations[1].operation,
+                Some(execute_multi_operation_request::operation::Operation::UpdateWorkflow(r)) => r
+            );
+            let workflow_execution = update_request.workflow_execution.as_ref().unwrap();
+            assert_eq!(workflow_execution.workflow_id, "workflow-id");
+            assert_eq!(workflow_execution.run_id, "");
+            let update_inner = update_request.request.as_ref().unwrap();
+            assert_eq!(
+                update_inner.meta.as_ref().unwrap().update_id,
+                "my-update-id"
+            );
+            assert_eq!(update_inner.input.as_ref().unwrap().name, "test-update");
+            assert_eq!(
+                update_inner.input.as_ref().unwrap().header.as_ref(),
+                Some(&update_header)
+            );
+            assert_eq!(
+                update_request.wait_policy.as_ref().unwrap().lifecycle_stage,
+                UpdateWorkflowExecutionLifecycleStage::Accepted as i32
+            );
+
+            assert_eq!(update_handle.id(), "my-update-id");
+            assert_eq!(update_handle.workflow_run_id(), Some("update-run-id"));
+            // The outcome came back with the multi-operation response, so no poll RPC is needed
+            // (the mock would fail it).
+            let result: String = update_handle
+                .get_result(RpcOptions::default())
+                .await
+                .unwrap();
+            assert_eq!(result, "update-result");
+        }
+
+        #[tokio::test]
+        async fn update_with_start_interceptor_can_mutate_args() {
+            struct ReplaceArgsInterceptor;
+
+            impl ClientInterceptor for ReplaceArgsInterceptor {
+                fn update_with_start_workflow<'a>(
+                    &'a self,
+                    mut input: UpdateWithStartWorkflowInput,
+                    next: Next<
+                        'a,
+                        UpdateWithStartWorkflowInput,
+                        BoxFuture<
+                            'a,
+                            Result<UpdateWithStartWorkflowOutput, WorkflowUpdateWithStartError>,
+                        >,
+                    >,
+                ) -> BoxFuture<
+                    'a,
+                    Result<UpdateWithStartWorkflowOutput, WorkflowUpdateWithStartError>,
+                > {
+                    assert_eq!(
+                        input.workflow_args_ref::<String>().unwrap(),
+                        "workflow-input"
+                    );
+                    input.replace_workflow_args("replaced-workflow-input".to_owned());
+                    *input.update_args_mut::<String>().unwrap() =
+                        "replaced-update-input".to_owned();
+                    next.run(input)
+                }
+            }
+
+            let recorded = Arc::new(Mutex::new(None));
+            let client = MockMultiOperationClient {
+                recorded: recorded.clone(),
+                interceptors: vec![Arc::new(ReplaceArgsInterceptor)],
+            };
+
+            client
+                .start_update_with_start_workflow(
+                    TestWorkflow,
+                    "workflow-input".to_owned(),
+                    TestUpdate,
+                    "update-input".to_owned(),
+                    update_with_start_options(WorkflowIdConflictPolicy::Fail),
+                )
+                .await
+                .unwrap();
+
+            let request = recorded.lock().take().unwrap();
+            let start_request = assert_matches!(
+                &request.operations[0].operation,
+                Some(execute_multi_operation_request::operation::Operation::StartWorkflow(r)) => r
+            );
+            let workflow_input: String = client
+                .data_converter()
+                .from_payloads(
+                    &SerializationContextData::Workflow,
+                    start_request.input.clone().unwrap().payloads,
+                )
+                .await
+                .unwrap();
+            assert_eq!(workflow_input, "replaced-workflow-input");
+            let update_request = assert_matches!(
+                &request.operations[1].operation,
+                Some(execute_multi_operation_request::operation::Operation::UpdateWorkflow(r)) => r
+            );
+            let update_input: String = client
+                .data_converter()
+                .from_payloads(
+                    &SerializationContextData::Workflow,
+                    update_request
+                        .request
+                        .clone()
+                        .unwrap()
+                        .input
+                        .unwrap()
+                        .args
+                        .unwrap()
+                        .payloads,
+                )
+                .await
+                .unwrap();
+            assert_eq!(update_input, "replaced-update-input");
         }
     }
 
