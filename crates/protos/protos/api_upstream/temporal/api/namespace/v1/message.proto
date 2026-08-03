@@ -77,6 +77,10 @@ message NamespaceInfo {
         int64 blob_size_limit_error = 1;
         // Maximum total memo size in bytes per workflow execution.
         int64 memo_size_limit_error = 2;
+        // Maximum total size in bytes of a single RespondWorkflowTaskCompleted request.
+        // Requests exceeding this fail the workflow task with
+        // WORKFLOW_TASK_FAILED_CAUSE_REQUEST_TOO_LARGE. 0 means no explicit limit.
+        int64 workflow_task_completion_size_limit_error = 3;
     }
 
     // Whether scheduled workflows are supported on this namespace. This is only needed
