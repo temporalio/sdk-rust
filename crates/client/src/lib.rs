@@ -634,8 +634,15 @@ async fn add_tls_to_channel(
         #[cfg(feature = "dynamic-tls")]
         if let Some(resolver) = &tls_cfg.client_cert_resolver {
             let rustls_config = build_custom_rustls_config(tls_cfg, Some(resolver.clone()))?;
+            // Strip brackets from IPv6 literals (e.g. "[::1]" -> "::1")
+            // since ServerName::try_from expects raw IP addresses
             let sni_domain = domain_override
-                .or_else(|| channel.uri().host().map(str::to_owned))
+                .or_else(|| {
+                    channel
+                        .uri()
+                        .host()
+                        .map(|h| h.trim_matches(|c| c == '[' || c == ']').to_owned())
+                })
                 .ok_or_else(|| {
                     ClientConnectError::InvalidConfig(
                         "Cannot determine TLS server name for dynamic cert resolution: \
@@ -835,34 +842,36 @@ impl tower::Service<Uri> for DynamicTlsConnector {
                     format!("URI has no host for TLS connection: {uri}").into()
                 })?;
             let port = uri.port_u16().unwrap_or(443);
-            let addr = format!("{host}:{port}");
+            // Use (host, port) tuple to correctly handle IPv6 addresses
+            // (e.g. "::1" would break if formatted as "::1:443")
+            let addr_display = format!("{}:{}", host, port);
 
-            debug!(target: "temporal_client", %uri, %addr, "DynamicTlsConnector: establishing TCP+TLS connection");
+            debug!(target: "temporal_client", %uri, addr = %addr_display, "DynamicTlsConnector: establishing TCP+TLS connection");
 
             // Use a timeout to prevent hanging on unreachable hosts.
             // Tonic's built-in connector respects Endpoint::connect_timeout(),
             // but custom connectors must handle timeouts themselves.
             let tcp = tokio::time::timeout(
                 DYNAMIC_TLS_CONNECT_TIMEOUT,
-                tokio::net::TcpStream::connect(&addr),
+                tokio::net::TcpStream::connect((host, port)),
             )
             .await
             .map_err(|_| -> Box<dyn std::error::Error + Send + Sync> {
                 format!(
-                    "TCP connect to {addr} timed out after {}s",
+                    "TCP connect to {addr_display} timed out after {}s",
                     DYNAMIC_TLS_CONNECT_TIMEOUT.as_secs()
                 )
                 .into()
             })?
             .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
-                format!("TCP connect to {addr} failed: {e}").into()
+                format!("TCP connect to {addr_display} failed: {e}").into()
             })?;
 
             // Disable Nagle's algorithm for low-latency gRPC messaging
             tcp.set_nodelay(true)?;
 
             let tls_stream = tls.connect(domain.as_ref().to_owned(), tcp).await?;
-            debug!(target: "temporal_client", %addr, "DynamicTlsConnector: TLS handshake complete");
+            debug!(target: "temporal_client", addr = %addr_display, "DynamicTlsConnector: TLS handshake complete");
             Ok(hyper_util::rt::TokioIo::new(tls_stream))
         })
     }
