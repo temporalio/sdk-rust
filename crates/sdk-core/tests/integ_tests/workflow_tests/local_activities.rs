@@ -67,7 +67,10 @@ use temporalio_sdk_core::{
         schedule_local_activity_cmd, single_hist_mock_sg, start_timer_cmd,
     },
 };
-use tokio::{join, select, sync::Barrier};
+use tokio::{
+    join, select,
+    sync::{Barrier, Notify},
+};
 use tokio_util::sync::CancellationToken;
 
 #[workflow]
@@ -1927,32 +1930,32 @@ async fn la_resolve_during_legacy_query_does_not_combine(#[case] impossible_quer
         .await
         .unwrap();
 
-        let task = core.poll_workflow_activation().await.unwrap();
-        // The next task needs to be resolve, since the LA is completed immediately
-        assert_matches!(
-            task.jobs.as_slice(),
-            [WorkflowActivationJob {
-                variant: Some(workflow_activation_job::Variant::ResolveActivity(_)),
-            }]
-        );
-        // Complete workflow
-        core.complete_execution(&task.run_id).await;
-
-        // Now we will get the query
-        let task = core.poll_workflow_activation().await.unwrap();
-        assert_matches!(
-            task.jobs.as_slice(),
-            &[WorkflowActivationJob {
-                variant: Some(workflow_activation_job::Variant::QueryWorkflow(ref q)),
-            }]
-            if q.query_id == "q1"
-        );
-        core.complete_workflow_activation(WorkflowActivationCompletion::from_cmd(
-            task.run_id,
-            query_ok("q1", "whatev"),
-        ))
-        .await
-        .unwrap();
+        let mut resolved_activity = false;
+        let mut answered_query = false;
+        for _ in 0..2 {
+            let task = core.poll_workflow_activation().await.unwrap();
+            assert_eq!(task.jobs.len(), 1);
+            let run_id = task.run_id.clone();
+            match task.jobs[0].variant.as_ref() {
+                Some(workflow_activation_job::Variant::ResolveActivity(_)) => {
+                    assert!(!resolved_activity);
+                    resolved_activity = true;
+                    core.complete_execution(&run_id).await;
+                }
+                Some(workflow_activation_job::Variant::QueryWorkflow(q)) if q.query_id == "q1" => {
+                    assert!(!answered_query);
+                    answered_query = true;
+                    core.complete_workflow_activation(WorkflowActivationCompletion::from_cmd(
+                        run_id,
+                        query_ok("q1", "whatev"),
+                    ))
+                    .await
+                    .unwrap();
+                }
+                unexpected => panic!("Unexpected activation job: {unexpected:?}"),
+            }
+        }
+        assert!(resolved_activity && answered_query);
 
         if impossible_query_in_task {
             // finish last query
@@ -2591,30 +2594,20 @@ async fn local_activity_after_wf_complete_is_discarded() {
     let wfid = "fake_wf_id";
     let mut t = TestHistoryBuilder::default();
     t.add_wfe_started_with_wft_timeout(Duration::from_millis(200));
-    t.add_full_wf_task();
     t.add_workflow_task_scheduled_and_started();
 
     let mock = mock_worker_client();
-    let mut mock_cfg = MockPollCfg::from_resp_batches(
-        wfid,
-        t,
-        [ResponseType::ToTaskNum(1), ResponseType::ToTaskNum(2)],
-        mock,
-    );
+    let mut mock_cfg = MockPollCfg::from_resp_batches(wfid, t, [ResponseType::ToTaskNum(1)], mock);
     mock_cfg.make_poll_stream_interminable = true;
     mock_cfg.completion_asserts_from_expectations(|mut asserts| {
-        asserts
-            .then(move |wft| {
-                assert_eq!(wft.commands.len(), 0);
-            })
-            .then(move |wft| {
-                assert_eq!(wft.commands.len(), 2);
-                assert_eq!(wft.commands[0].command_type(), CommandType::RecordMarker);
-                assert_eq!(
-                    wft.commands[1].command_type(),
-                    CommandType::CompleteWorkflowExecution
-                );
-            });
+        asserts.then(move |wft| {
+            assert_eq!(wft.commands.len(), 2);
+            assert_eq!(wft.commands[0].command_type(), CommandType::RecordMarker);
+            assert_eq!(
+                wft.commands[1].command_type(),
+                CommandType::CompleteWorkflowExecution
+            );
+        });
     });
     let mut mock = build_mock_pollers(mock_cfg);
     mock.worker_cfg(|wc| {
@@ -2917,6 +2910,190 @@ impl TwoLaWfParallel {
         );
         Ok(())
     }
+}
+
+#[workflow]
+#[derive(Default)]
+struct IncrementalLocalActivityResolutionWf;
+
+#[workflow_methods]
+impl IncrementalLocalActivityResolutionWf {
+    #[run]
+    async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<()> {
+        let long = ctx.execute_local_activity(
+            IncrementalLocalActivityResolutionActivities::run,
+            true,
+            LocalActivityOptions::default(),
+        );
+        let short_sequence = async {
+            for _ in 0..3 {
+                ctx.execute_local_activity(
+                    IncrementalLocalActivityResolutionActivities::run,
+                    false,
+                    LocalActivityOptions::default(),
+                )
+                .await?;
+            }
+            Ok::<_, ActivityExecutionError>(())
+        };
+        let (long_result, short_result) = temporalio_sdk::workflows::join!(long, short_sequence);
+        long_result?;
+        short_result?;
+        Ok(())
+    }
+}
+
+struct IncrementalLocalActivityResolutionActivities {
+    long_started: Arc<Notify>,
+    release_long: Arc<Notify>,
+    short_completed: Arc<AtomicUsize>,
+    short_sequence_completed: Arc<Notify>,
+}
+
+#[activities]
+impl IncrementalLocalActivityResolutionActivities {
+    #[activity]
+    async fn run(self: Arc<Self>, _: ActivityContext, is_long: bool) -> Result<(), ActivityError> {
+        if is_long {
+            self.long_started.notify_one();
+            self.release_long.notified().await;
+        } else if self.short_completed.fetch_add(1, Ordering::Relaxed) == 2 {
+            self.short_sequence_completed.notify_one();
+        }
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn local_activity_resolutions_are_delivered_incrementally() {
+    let wf_name = "local_activity_resolutions_are_delivered_incrementally";
+    let long_started = Arc::new(Notify::new());
+    let release_long = Arc::new(Notify::new());
+    let short_sequence_completed = Arc::new(Notify::new());
+    let mut starter = CoreWfStarter::new(wf_name);
+    starter
+        .sdk_config
+        .register_activities(IncrementalLocalActivityResolutionActivities {
+            long_started: long_started.clone(),
+            release_long: release_long.clone(),
+            short_completed: Arc::new(AtomicUsize::new(0)),
+            short_sequence_completed: short_sequence_completed.clone(),
+        });
+    let mut worker = starter.worker().await;
+    worker
+        .register_workflow::<IncrementalLocalActivityResolutionWf>()
+        .unwrap();
+    let task_queue = starter.get_task_queue().to_owned();
+    let handle = worker
+        .submit_workflow(
+            IncrementalLocalActivityResolutionWf::run,
+            (),
+            WorkflowStartOptions::new(task_queue, wf_name.to_owned()).build(),
+        )
+        .await
+        .unwrap();
+
+    let verify_short_sequence = async {
+        long_started.notified().await;
+        let completed_while_long_was_running =
+            tokio::time::timeout(Duration::from_secs(2), short_sequence_completed.notified())
+                .await
+                .is_ok();
+        release_long.notify_one();
+        completed_while_long_was_running
+    };
+    let (completed_while_long_was_running, worker_result) =
+        join!(verify_short_sequence, worker.run_until_done());
+
+    worker_result.unwrap();
+    assert!(
+        completed_while_long_was_running,
+        "the short LA sequence did not complete while the long LA was still running"
+    );
+    handle
+        .fetch_history_and_replay(worker.inner_mut())
+        .await
+        .unwrap();
+}
+
+#[workflow]
+#[derive(Default)]
+struct OldBatchedLocalActivityHistoryWf;
+
+#[workflow_methods]
+impl OldBatchedLocalActivityHistoryWf {
+    #[run(name = DEFAULT_WORKFLOW_TYPE)]
+    async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<()> {
+        let long =
+            ctx.execute_local_activity(StdActivities::default, (), LocalActivityOptions::default());
+        let short_sequence = async {
+            ctx.execute_local_activity(StdActivities::default, (), LocalActivityOptions::default())
+                .await?;
+            ctx.execute_local_activity(StdActivities::default, (), LocalActivityOptions::default())
+                .await?;
+            Ok::<_, ActivityExecutionError>(())
+        };
+        let (long_result, short_result) = temporalio_sdk::workflows::join!(long, short_sequence);
+        long_result?;
+        short_result?;
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn old_batched_local_activity_history_replays() {
+    let mut history = TestHistoryBuilder::default();
+    history.add_by_type(EventType::WorkflowExecutionStarted);
+    history.add_full_wf_task();
+    history.add_local_activity_result_marker(2, "2", b"short".into());
+    history.add_local_activity_result_marker(1, "1", b"long".into());
+    history.add_local_activity_result_marker(3, "3", b"short".into());
+    history.add_workflow_task_scheduled_and_started();
+    let mut mock_cfg = MockPollCfg::from_resps(history, [ResponseType::AllHistory]);
+
+    let mut activation_assertions = ActivationAssertionsInterceptor::default();
+    activation_assertions
+        .skip_one()
+        .then(|activation| {
+            assert_matches!(
+                activation.jobs.as_slice(),
+                [
+                    WorkflowActivationJob {
+                        variant: Some(workflow_activation_job::Variant::ResolveActivity(first))
+                    },
+                    WorkflowActivationJob {
+                        variant: Some(workflow_activation_job::Variant::ResolveActivity(second))
+                    }
+                ] => {
+                    assert_eq!(first.seq, 2);
+                    assert_eq!(second.seq, 1);
+                }
+            );
+        })
+        .then(|activation| {
+            assert_matches!(
+                activation.jobs.as_slice(),
+                [WorkflowActivationJob {
+                    variant: Some(workflow_activation_job::Variant::ResolveActivity(resolution))
+                }] => assert_eq!(resolution.seq, 3)
+            );
+        });
+    mock_cfg.completion_asserts_from_expectations(|mut assertions| {
+        assertions.then(|completion| {
+            assert_matches!(
+                completion.commands.as_slice(),
+                [command] if command.command_type() == CommandType::CompleteWorkflowExecution
+            );
+        });
+    });
+
+    let mut worker = build_fake_sdk(mock_cfg);
+    worker.set_worker_interceptor(activation_assertions);
+    worker
+        .register_workflow::<OldBatchedLocalActivityHistoryWf>()
+        .unwrap();
+    worker.register_activities(ResolvedActivity);
+    worker.run().await.unwrap();
 }
 
 struct ResolvedActivity;
