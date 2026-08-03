@@ -4427,55 +4427,6 @@
         ]
       }
     },
-    "/api/v1/namespaces/{namespace}/workflows/{workflowExecution.workflowId}/time-skipping/poll": {
-      "get": {
-        "operationId": "PollWorkflowExecutionTimeSkipping2",
-        "responses": {
-          "200": {
-            "description": "A successful response.",
-            "schema": {
-              "$ref": "#/definitions/v1PollWorkflowExecutionTimeSkippingResponse"
-            }
-          },
-          "default": {
-            "description": "An unexpected error response.",
-            "schema": {
-              "$ref": "#/definitions/rpcStatus"
-            }
-          }
-        },
-        "parameters": [
-          {
-            "name": "namespace",
-            "in": "path",
-            "required": true,
-            "type": "string"
-          },
-          {
-            "name": "workflowExecution.workflowId",
-            "in": "path",
-            "required": true,
-            "type": "string"
-          },
-          {
-            "name": "workflowExecution.runId",
-            "in": "query",
-            "required": false,
-            "type": "string"
-          },
-          {
-            "name": "fastForwardId",
-            "description": "Required. Identifies the fast-forward whose completion the caller wants to wait for.\nMust match the `fast_forward_id` set in the execution's TimeSkippingConfig.",
-            "in": "query",
-            "required": false,
-            "type": "string"
-          }
-        ],
-        "tags": [
-          "WorkflowService"
-        ]
-      }
-    },
     "/api/v1/namespaces/{namespace}/workflows/{workflowExecution.workflowId}/update-options": {
       "post": {
         "summary": "UpdateWorkflowExecutionOptions partially updates the WorkflowExecutionOptions of an existing workflow execution.",
@@ -10010,55 +9961,6 @@
         ]
       }
     },
-    "/namespaces/{namespace}/workflows/{workflowExecution.workflowId}/time-skipping/poll": {
-      "get": {
-        "operationId": "PollWorkflowExecutionTimeSkipping",
-        "responses": {
-          "200": {
-            "description": "A successful response.",
-            "schema": {
-              "$ref": "#/definitions/v1PollWorkflowExecutionTimeSkippingResponse"
-            }
-          },
-          "default": {
-            "description": "An unexpected error response.",
-            "schema": {
-              "$ref": "#/definitions/rpcStatus"
-            }
-          }
-        },
-        "parameters": [
-          {
-            "name": "namespace",
-            "in": "path",
-            "required": true,
-            "type": "string"
-          },
-          {
-            "name": "workflowExecution.workflowId",
-            "in": "path",
-            "required": true,
-            "type": "string"
-          },
-          {
-            "name": "workflowExecution.runId",
-            "in": "query",
-            "required": false,
-            "type": "string"
-          },
-          {
-            "name": "fastForwardId",
-            "description": "Required. Identifies the fast-forward whose completion the caller wants to wait for.\nMust match the `fast_forward_id` set in the execution's TimeSkippingConfig.",
-            "in": "query",
-            "required": false,
-            "type": "string"
-          }
-        ],
-        "tags": [
-          "WorkflowService"
-        ]
-      }
-    },
     "/namespaces/{namespace}/workflows/{workflowExecution.workflowId}/update-options": {
       "post": {
         "summary": "UpdateWorkflowExecutionOptions partially updates the WorkflowExecutionOptions of an existing workflow execution.",
@@ -10946,102 +10848,6 @@
       },
       "description": "Target a worker polling on a Nexus task queue in a specific namespace."
     },
-    "EnvironmentInfoArchitecture": {
-      "type": "string",
-      "enum": [
-        "ARCHITECTURE_UNSPECIFIED",
-        "ARCHITECTURE_AMD64",
-        "ARCHITECTURE_ARM64"
-      ],
-      "default": "ARCHITECTURE_UNSPECIFIED"
-    },
-    "EnvironmentInfoHostingEnvironment": {
-      "type": "object",
-      "properties": {
-        "type": {
-          "$ref": "#/definitions/HostingEnvironmentHostingEnvironmentType",
-          "description": "The type of hosting environment."
-        },
-        "version": {
-          "type": "string",
-          "description": "The version of the hosting environment, if obtainable."
-        }
-      }
-    },
-    "EnvironmentInfoLinuxPlatform": {
-      "type": "object",
-      "properties": {
-        "version": {
-          "type": "string",
-          "description": "The Linux kernel or distribution version, if obtainable."
-        },
-        "architecture": {
-          "$ref": "#/definitions/EnvironmentInfoArchitecture",
-          "description": "The architecture of the worker process."
-        },
-        "libc": {
-          "$ref": "#/definitions/LinuxPlatformLibc",
-          "description": "The libc used by the worker process."
-        }
-      }
-    },
-    "EnvironmentInfoMacOSPlatform": {
-      "type": "object",
-      "properties": {
-        "version": {
-          "type": "string",
-          "description": "The macOS version, if obtainable."
-        },
-        "architecture": {
-          "$ref": "#/definitions/EnvironmentInfoArchitecture",
-          "description": "The architecture of the worker process."
-        }
-      }
-    },
-    "EnvironmentInfoPlatform": {
-      "type": "object",
-      "properties": {
-        "linux": {
-          "$ref": "#/definitions/EnvironmentInfoLinuxPlatform"
-        },
-        "macos": {
-          "$ref": "#/definitions/EnvironmentInfoMacOSPlatform"
-        },
-        "windows": {
-          "$ref": "#/definitions/EnvironmentInfoWindowsPlatform"
-        }
-      }
-    },
-    "EnvironmentInfoRuntime": {
-      "type": "object",
-      "properties": {
-        "type": {
-          "$ref": "#/definitions/RuntimeRuntimeType",
-          "description": "The type of the runtime."
-        },
-        "version": {
-          "type": "string",
-          "description": "The version of the runtime, if obtainable."
-        }
-      }
-    },
-    "EnvironmentInfoWindowsPlatform": {
-      "type": "object",
-      "properties": {
-        "version": {
-          "type": "string",
-          "description": "The Windows version, if obtainable."
-        },
-        "architecture": {
-          "$ref": "#/definitions/EnvironmentInfoArchitecture",
-          "description": "The architecture of the worker process."
-        },
-        "crt": {
-          "$ref": "#/definitions/WindowsPlatformCrt",
-          "description": "The C runtime used by the worker process, if obtainable."
-        }
-      }
-    },
     "EventGroupMarkerInboundEvent": {
       "type": "object",
       "properties": {
@@ -11060,23 +10866,6 @@
         }
       },
       "description": "The identifier of an inbound Update (request.meta.update_id)\nwhose handler triggered implicit creation of this group Marker.\n\nUsed in place of `inbound_event_id` for Updates because the event ID of the\nUpdateAccepted history event is not known until the Workflow Task is\ncompleted and recorded by the server, which may be too late."
-    },
-    "HostingEnvironmentHostingEnvironmentType": {
-      "type": "string",
-      "enum": [
-        "HOSTING_ENVIRONMENT_TYPE_UNSPECIFIED",
-        "HOSTING_ENVIRONMENT_TYPE_DOCKER",
-        "HOSTING_ENVIRONMENT_TYPE_K8S",
-        "HOSTING_ENVIRONMENT_TYPE_AWS_LAMBDA",
-        "HOSTING_ENVIRONMENT_TYPE_AWS_ECS",
-        "HOSTING_ENVIRONMENT_TYPE_GOOGLE_CLOUD_RUN",
-        "HOSTING_ENVIRONMENT_TYPE_GOOGLE_APP_ENGINE",
-        "HOSTING_ENVIRONMENT_TYPE_AZURE_APP_SERVICE",
-        "HOSTING_ENVIRONMENT_TYPE_AZURE_FUNCTIONS",
-        "HOSTING_ENVIRONMENT_TYPE_AZURE_CONTAINER_APPS"
-      ],
-      "default": "HOSTING_ENVIRONMENT_TYPE_UNSPECIFIED",
-      "description": "What kind of hosting environment we're running in. This list is about what can actually be\ndetected reliably and is unrelated to what SDKs can actually run in.\n\n - HOSTING_ENVIRONMENT_TYPE_UNSPECIFIED: Should never actually be set, exists to follow convention of having a default.\nSDKs should just leave `hosting_environments` empty if none can be determined.\n - HOSTING_ENVIRONMENT_TYPE_DOCKER: Should always be in the list if we're running inside a docker container\n - HOSTING_ENVIRONMENT_TYPE_K8S: Should always be in the list if we're running inside any k8s environment\n - HOSTING_ENVIRONMENT_TYPE_AWS_LAMBDA: Detect via `AWS_LAMBDA_FUNCTION_NAME`\n - HOSTING_ENVIRONMENT_TYPE_AWS_ECS: Detect via `ECS_CONTAINER_METADATA_URI_V4` or `ECS_CONTAINER_METADATA_URI`\n - HOSTING_ENVIRONMENT_TYPE_GOOGLE_CLOUD_RUN: Detect via `K_SERVICE`\n - HOSTING_ENVIRONMENT_TYPE_GOOGLE_APP_ENGINE: Detect via `GAE_SERVICE`\n - HOSTING_ENVIRONMENT_TYPE_AZURE_APP_SERVICE: Detect via `WEBSITE_SITE_NAME`\n - HOSTING_ENVIRONMENT_TYPE_AZURE_FUNCTIONS: Detect via `FUNCTIONS_EXTENSION_VERSION`\n - HOSTING_ENVIRONMENT_TYPE_AZURE_CONTAINER_APPS: Detect via `CONTAINER_APP_NAME`"
     },
     "LinkActivity": {
       "type": "object",
@@ -11155,15 +10944,6 @@
         }
       }
     },
-    "LinuxPlatformLibc": {
-      "type": "string",
-      "enum": [
-        "LIBC_UNSPECIFIED",
-        "LIBC_GLIBC",
-        "LIBC_MUSL"
-      ],
-      "default": "LIBC_UNSPECIFIED"
-    },
     "ListWorkerDeploymentsResponseWorkerDeploymentSummary": {
       "type": "object",
       "properties": {
@@ -11204,11 +10984,6 @@
           "type": "string",
           "format": "int64",
           "description": "Maximum total memo size in bytes per workflow execution."
-        },
-        "workflowTaskCompletionSizeLimitError": {
-          "type": "string",
-          "format": "int64",
-          "description": "Maximum total size in bytes of a single RespondWorkflowTaskCompleted request.\nRequests exceeding this fail the workflow task with\nWORKFLOW_TASK_FAILED_CAUSE_REQUEST_TOO_LARGE. 0 means no explicit limit."
         }
       }
     },
@@ -11324,24 +11099,6 @@
       },
       "description": "UpdateWorkflowOptions represents updating workflow execution options after a workflow reset.\nKeep the parameters in sync with temporal.api.workflowservice.v1.UpdateWorkflowExecutionOptionsRequest."
     },
-    "RuntimeRuntimeType": {
-      "type": "string",
-      "enum": [
-        "RUNTIME_TYPE_UNSPECIFIED",
-        "RUNTIME_TYPE_JVM",
-        "RUNTIME_TYPE_CPYTHON",
-        "RUNTIME_TYPE_NODE",
-        "RUNTIME_TYPE_BUN",
-        "RUNTIME_TYPE_CRUBY",
-        "RUNTIME_TYPE_GO",
-        "RUNTIME_TYPE_DOTNET_FRAMEWORK",
-        "RUNTIME_TYPE_DOTNET_CORE",
-        "RUNTIME_TYPE_NATIVE",
-        "RUNTIME_TYPE_ROADRUNNER"
-      ],
-      "default": "RUNTIME_TYPE_UNSPECIFIED",
-      "description": " - RUNTIME_TYPE_UNSPECIFIED: Should never actually be set, exists to follow convention of having a default.\nSDKs should just leave `runtimes` empty if none can be determined."
-    },
     "UpdateTaskQueueConfigRequestRateLimitUpdate": {
       "type": "object",
       "properties": {
@@ -11386,17 +11143,6 @@
       ],
       "default": "PINNED_OVERRIDE_BEHAVIOR_UNSPECIFIED",
       "description": " - PINNED_OVERRIDE_BEHAVIOR_UNSPECIFIED: Unspecified.\n - PINNED_OVERRIDE_BEHAVIOR_PINNED: Override workflow behavior to be Pinned."
-    },
-    "WindowsPlatformCrt": {
-      "type": "string",
-      "enum": [
-        "CRT_UNSPECIFIED",
-        "CRT_UCRT",
-        "CRT_MSVCRT",
-        "CRT_MINGW",
-        "CRT_CYGWIN"
-      ],
-      "default": "CRT_UNSPECIFIED"
     },
     "WorkerConfigAutoscalingPollerBehavior": {
       "type": "object",
@@ -11731,7 +11477,7 @@
       "properties": {
         "runId": {
           "type": "string",
-          "description": "Run ID of the workflow or standalone activity. If empty, targets the latest run."
+          "description": "Run ID of the workflow or standalone activity."
         },
         "identity": {
           "type": "string",
@@ -11873,7 +11619,7 @@
       "properties": {
         "runId": {
           "type": "string",
-          "description": "Activity run ID. If empty, targets the latest run."
+          "description": "Activity run ID, targets the latest run if run_id is empty."
         },
         "identity": {
           "type": "string",
@@ -11995,7 +11741,7 @@
       "properties": {
         "runId": {
           "type": "string",
-          "description": "Run ID of the workflow or standalone activity. If empty, targets the latest run."
+          "description": "Run ID of the workflow or standalone activity."
         },
         "identity": {
           "type": "string",
@@ -12016,10 +11762,6 @@
         "resourceId": {
           "type": "string",
           "description": "Resource ID for routing. Contains \"workflow:{workflow_id}\" for workflow activities or \"activity:{activity_id}\" for standalone activities."
-        },
-        "requestId": {
-          "type": "string",
-          "description": "Used to de-dupe reset requests."
         }
       }
     },
@@ -12863,7 +12605,7 @@
       "properties": {
         "runId": {
           "type": "string",
-          "description": "Activity run ID. If empty, targets the latest run."
+          "description": "Activity run ID, targets the latest run if run_id is empty."
         },
         "identity": {
           "type": "string",
@@ -13005,11 +12747,19 @@
       "properties": {
         "runId": {
           "type": "string",
-          "description": "Run ID of the workflow or standalone activity. If empty, targets the latest run."
+          "description": "Run ID of the workflow or standalone activity."
         },
         "identity": {
           "type": "string",
           "description": "The identity of the client who initiated this request."
+        },
+        "resetAttempts": {
+          "type": "boolean",
+          "description": "Providing this flag will also reset the number of attempts."
+        },
+        "resetHeartbeat": {
+          "type": "boolean",
+          "description": "Providing this flag will also reset the heartbeat details."
         },
         "reason": {
           "type": "string",
@@ -13022,10 +12772,6 @@
         "resourceId": {
           "type": "string",
           "description": "Resource ID for routing. Contains \"workflow:{workflow_id}\" for workflow activities or \"activity:{activity_id}\" for standalone activities."
-        },
-        "requestId": {
-          "type": "string",
-          "description": "Used to de-dupe unpause requests."
         }
       }
     },
@@ -13055,7 +12801,7 @@
       "properties": {
         "runId": {
           "type": "string",
-          "description": "Run ID of the workflow or standalone activity. If empty, targets the latest run."
+          "description": "Run ID of the workflow or standalone activity."
         },
         "identity": {
           "type": "string",
@@ -13076,10 +12822,6 @@
         "resourceId": {
           "type": "string",
           "description": "Resource ID for routing. Contains \"workflow:{workflow_id}\" for workflow activities or \"activity:{activity_id}\" for standalone activities."
-        },
-        "requestId": {
-          "type": "string",
-          "description": "Used to de-dupe update requests."
         }
       }
     },
@@ -13849,10 +13591,6 @@
         "failure": {
           "$ref": "#/definitions/v1Failure",
           "description": "The failure if the activity completed unsuccessfully."
-        },
-        "retryState": {
-          "$ref": "#/definitions/v1RetryState",
-          "description": "The retry state associated with an unsuccessful activity execution.\nThis field is only meaningful when `failure` is set."
         }
       },
       "description": "The outcome of a completed activity execution: either a successful result or a failure."
@@ -15861,31 +15599,6 @@
       },
       "description": "Target to route requests to."
     },
-    "v1EnvironmentInfo": {
-      "type": "object",
-      "properties": {
-        "runtimes": {
-          "type": "array",
-          "items": {
-            "type": "object",
-            "$ref": "#/definitions/EnvironmentInfoRuntime"
-          },
-          "description": "The runtime(s) the SDK is operating in."
-        },
-        "hostingEnvironments": {
-          "type": "array",
-          "items": {
-            "type": "object",
-            "$ref": "#/definitions/EnvironmentInfoHostingEnvironment"
-          },
-          "description": "The hosting environment(s) the SDK is operating in. Repeated to allow for layering (ex: Docker inside k8s)."
-        },
-        "platform": {
-          "$ref": "#/definitions/EnvironmentInfoPlatform",
-          "description": "The platform the SDK is operating on."
-        }
-      }
-    },
     "v1EventGroupMarker": {
       "type": "object",
       "properties": {
@@ -16118,30 +15831,6 @@
           "$ref": "#/definitions/v1NexusHandlerFailureInfo"
         }
       }
-    },
-    "v1FastForwardConfig": {
-      "type": "object",
-      "properties": {
-        "id": {
-          "type": "string",
-          "description": "A client-supplied ID, required field, set alongside `duration`. It is used to poll for\nfast-forward completion via PollWorkflowExecutionTimeSkipping.\nThe server performs no idempotency check on this ID; the client is responsible for managing it."
-        },
-        "duration": {
-          "type": "string",
-          "description": "Fast-forward the current execution by this duration ahead of the current execution time; required field.\nThe duration yields a target time (current execution time + duration), surfaced as `target_time` in\nTimeSkippingFastForwardInfo. Once virtual time reaches that target, the fast-forward completes, time\nskipping is disabled, and no further time is skipped. Time skipping can be resumed either\nby updating the TimeSkippingConfig with a new FastForwardConfig, or by clearing the FastForwardConfig\nto skip through to the end of the execution.\n\nIf this duration exceeds the remaining execution timeout, time will not pass beyond the end\nof the execution, and the fast-forward won't have a chance to complete."
-        }
-      }
-    },
-    "v1FastForwardPollingResult": {
-      "type": "string",
-      "enum": [
-        "FAST_FORWARD_POLLING_RESULT_UNSPECIFIED",
-        "FAST_FORWARD_POLLING_RESULT_POLL_TIMEOUT",
-        "FAST_FORWARD_POLLING_RESULT_FAST_FORWARD_COMPLETED",
-        "FAST_FORWARD_POLLING_RESULT_FAST_FORWARD_FAILED"
-      ],
-      "default": "FAST_FORWARD_POLLING_RESULT_UNSPECIFIED",
-      "description": "FastForwardPollingResult is the result of polling and waiting for a fast-forward to complete\non a time-skipping execution.\nFAST_FORWARD_POLLING_RESULT_POLL_TIMEOUT and FAST_FORWARD_POLLING_RESULT_FAST_FORWARD_COMPLETED\nare the normal poll outcomes; FAST_FORWARD_POLLING_RESULT_FAST_FORWARD_FAILED means the\nfast-forward can no longer complete.\n\n - FAST_FORWARD_POLLING_RESULT_UNSPECIFIED: Never returned; guards against an unset result.\n - FAST_FORWARD_POLLING_RESULT_POLL_TIMEOUT: The poll timed out server-side before the fast-forward completed. The caller may poll again.\n - FAST_FORWARD_POLLING_RESULT_FAST_FORWARD_COMPLETED: The fast-forward identified by the request's `fast_forward_id` reached its target time and completed.\n - FAST_FORWARD_POLLING_RESULT_FAST_FORWARD_FAILED: The fast-forward can no longer complete, which usually indicates improper usage of\nfast-forward on the client side. Possible reasons: the `fast_forward_id` does not match\nthe execution's current fast-forward, the execution ended before the fast-forward\ncompleted, the fast-forward config was updated while the poll was in flight, etc.\nSee `failed_reason` in the response for the specific cause."
     },
     "v1FetchWorkerConfigResponse": {
       "type": "object",
@@ -18282,23 +17971,6 @@
         }
       }
     },
-    "v1PollWorkflowExecutionTimeSkippingResponse": {
-      "type": "object",
-      "properties": {
-        "fastForwardPollingResult": {
-          "$ref": "#/definitions/v1FastForwardPollingResult",
-          "description": "The outcome of the poll for the fast-forward identified by the request's `fast_forward_id`."
-        },
-        "failedReason": {
-          "type": "string",
-          "description": "Set only when the result is FAST_FORWARD_POLLING_RESULT_FAST_FORWARD_FAILED; explains why\nthe fast-forward can no longer complete."
-        },
-        "fastForwardInfo": {
-          "$ref": "#/definitions/v1TimeSkippingFastForwardInfo",
-          "description": "The execution's current fast-forward, if any."
-        }
-      }
-    },
     "v1PollWorkflowTaskQueueResponse": {
       "type": "object",
       "properties": {
@@ -20224,88 +19896,31 @@
           "type": "boolean",
           "description": "Enables or disables time skipping for this workflow execution."
         },
-        "fastForwardConfig": {
-          "$ref": "#/definitions/v1FastForwardConfig",
-          "description": "An optional opt-in to control time-skipping behavior through fast-forward; see its definition for details."
+        "fastForward": {
+          "type": "string",
+          "description": "Optionally fast-forward the current workflow execution by this duration ahead of current workflow execution time.\nAfter the fast-forward completes, time skipping is disabled, and this\naction is recorded in the WorkflowExecutionTimeSkippingTransitionedEvent. It can be re-enabled by\nsetting `enabled` to true or setting `fast_forward` again via UpdateWorkflowExecutionOptions.\nThe current workflow execution is a chain of runs (retries, cron, continue-as-new);\nchild workflows are separate executions, so this fast_forward won't affect them.\n\nFor a given workflow execution, only one active fast-forward is allowed at a time.\nIf a new fast-forward is set via UpdateWorkflowExecutionOptions before the previous\none completes, the new one will override the previous one.\nIf the fast-forward duration exceeds the remaining execution timeout, time will only\nbe fast-forwarded up to the end of the execution."
         },
         "disablePropagation": {
           "type": "boolean",
-          "description": "By default, executions started by another execution (e.g. a child workflow of a parent workflow or\na schedule with the time-skipping policy enabled) inherit the \"enabled\" flag and skip time when possible.\nThis flag disables that inheritance."
-        },
-        "maxSessionSkipCount": {
-          "type": "integer",
-          "format": "int32",
-          "description": "The maximum number of skips allowed every time this field is updated. It protects the execution from\nsituations like unlimited retries when backoff is skipped.\n\nEvery time the execution skips time, the skip count is incremented by one, and when it reaches\nmax_session_skip_count, time skipping stops. Whenever this config field is updated, the accumulated\nskip count is cleared, marking the start of a new session.\nFor an execution with a chain of runs (retry, cron, continue-as-new), the count is accumulated\nacross all runs within the same session.\n\nIf this field is not set, the server applies a large default value (e.g. 100). The default can\nbe changed through dynamic config, and is overridden by this field when set."
+          "description": "By default, executions started by another execution (e.g. a child workflow of a parent workflow or\na schedule with the timeskipping policy enabled), inherit the \"enabled\" flag and skip time when possible.\nThis flag disables that inheritance."
         }
       },
-      "description": "The configuration for time skipping of an execution.\nWhen time skipping is enabled, virtual time advances automatically whenever there is no in-flight work.\nOptions like fast_forward, disable_propagation, and max_session_skip_count are provided for granular\ncontrol of the execution's time skipping behavior. See each field's comment for a detailed explanation.\n\nAn example of workflows with time skipping:\nFor workflows, an execution is a chain of runs including retries, cron, and continue-as-new.\nIn-flight work includes activities, child workflows, Nexus operations, signal/cancel external workflow operations, etc.\nUser timers are not classified as in-flight work and will be skipped over; the virtual clock may also skip to the\ntime point of the registered fast-forward when there is no in-flight work.\nWhenever time is skipped, the skip count is incremented by one; max_session_skip_count bounds the number of skips allowed within a single time-skipping session.\nFor child workflows, by default, if the parent execution is skipping time, the child execution will also skip time,\nbut a parent's fast_forward won't affect its child's execution. A flag is provided to disable propagation of the\n\"enabled\" flag to child workflows; regardless of that flag, a child workflow inherits the virtual time from the\nparent execution as its start time."
-    },
-    "v1TimeSkippingFastForwardInfo": {
-      "type": "object",
-      "properties": {
-        "fastForwardDuration": {
-          "type": "string",
-          "description": "The client-supplied `fast_forward` duration."
-        },
-        "fastForwardId": {
-          "type": "string",
-          "description": "The client-supplied ID set alongside `fast_forward` duration."
-        },
-        "targetTime": {
-          "type": "string",
-          "format": "date-time",
-          "description": "The target virtual time at which the fast-forward completes."
-        },
-        "hasCompleted": {
-          "type": "boolean",
-          "description": "True once `target_time` has been reached."
-        }
-      },
-      "description": "TimeSkippingFastForwardInfo describes the current time-skipping fast-forward on an execution."
-    },
-    "v1TimeSkippingInfo": {
-      "type": "object",
-      "properties": {
-        "currentTime": {
-          "type": "string",
-          "format": "date-time",
-          "description": "Current virtual time of the execution. If the execution hasn't skipped\nany time yet, it will be the same as wall clock time."
-        },
-        "effectiveConfig": {
-          "$ref": "#/definitions/v1TimeSkippingConfig",
-          "description": "The current effective time-skipping config, which can differ from the config the user last set:\ninternally-defaulted fields are populated, and `enabled` reflects whether the execution is still\nskipping time — e.g. it is set to false once `max_session_skip_count` is reached, the fast-forward\ncompletes, or a client call disables time skipping."
-        },
-        "fastForwardInfo": {
-          "$ref": "#/definitions/v1TimeSkippingFastForwardInfo",
-          "description": "The execution's current fast-forward, if any. Unset if time skipping is enabled without a fast-forward."
-        },
-        "currentSessionSkipCount": {
-          "type": "integer",
-          "format": "int32",
-          "description": "The number of skips accumulated in the current session, bounded by `max_session_skip_count`.\nA new session begins — and this resets to 0 — each time `max_session_skip_count` is updated."
-        }
-      },
-      "description": "Describes the current time-skipping state of a workflow execution."
+      "description": "The configuration for time skipping of a workflow execution (a chain of runs including retries, cron, continue-as-new).\nWhen time skipping is enabled, virtual time advances automatically whenever there is no in-flight work.\nIn-flight work includes activities, child workflows, Nexus operations, signal/cancel external workflow operations,\nand possibly other features added in the future.\nUser timers are not classified as in-flight work and will be skipped over; the virtual clock may also skip to the\ntime point of the registered fast forward when there is no in-flight work.\nWhen time is skipped, a WorkflowExecutionTimeSkippingTransitionedEvent will be\nadded to the workflow history to capture the state changes.\n\nFor child workflows, by default, if the parent execution is skipping time, the child execution will also skip time,\nbut a parent's fast_forward won't affect its child's execution. A flag is provided to disable propagation of the\n\"enabled\" flag to child workflows; regardless of that flag, a child workflow inherits the virtual time from the\nparent execution as its start time."
     },
     "v1TimeSkippingStatePropagation": {
       "type": "object",
       "properties": {
         "initialSkippedDuration": {
           "type": "string",
-          "description": "The time skipped by the previous run. It is propagated both to executions started by the\ncurrent execution and through a chain of runs (CaN, cron, retry)."
+          "description": "The time skipped by the previous execution that started this workflow.\nIt can happen in child workflows and a chain of runs (CaN, cron, retry)."
         },
         "fastForwardTargetTime": {
           "type": "string",
           "format": "date-time",
-          "description": "The fast-forward target time. It only propagates across a chain of runs within the same execution."
-        },
-        "initialSkipCount": {
-          "type": "integer",
-          "format": "int32",
-          "description": "The initial skip count. It only propagates across a chain of runs within the same execution."
+          "description": "If there is a fast-forward action set for the previous run in a chain of runs,\nthe target time should be propagated to the next run as well."
         }
       },
-      "description": "The time-skipping state that needs to be propagated from one execution to another, or through a chain of runs\nwithin the same execution."
+      "description": "The time-skipping state that needs to be propagated from a parent workflow to a child workflow,\nor through a chain of runs."
     },
     "v1TimeoutFailureInfo": {
       "type": "object",
@@ -20606,7 +20221,7 @@
         "updateTime": {
           "type": "string",
           "format": "date-time",
-          "description": "The Workflow Execution time when the options were updated. When time skipping is\nenabled, this is the workflow's virtual time rather than wall-clock time.\n\nThis timestamp cannot be used for time-skipping fast-forward verification,\nuse `fast_forward_id` in `PollWorkflowExecutionTimeSkippingRequest` instead."
+          "description": "The Workflow Execution time when the options were updated. When time skipping is\nenabled, this is the workflow's virtual time rather than wall-clock time."
         }
       }
     },
@@ -21062,10 +20677,6 @@
             "$ref": "#/definitions/v1StorageDriverInfo"
           },
           "description": "Storage drivers in use by this SDK."
-        },
-        "environment": {
-          "$ref": "#/definitions/v1EnvironmentInfo",
-          "description": "Information about the environment this SDK is running in."
         }
       },
       "description": "Worker info message, contains information about the worker and its current state.\nAll information is provided by the worker itself."
@@ -21479,10 +21090,6 @@
         "pauseInfo": {
           "$ref": "#/definitions/v1WorkflowExecutionPauseInfo",
           "description": "Information about the workflow execution pause operation."
-        },
-        "timeSkippingInfo": {
-          "$ref": "#/definitions/v1TimeSkippingInfo",
-          "description": "Information about time skipping of the workflow execution.\nIf the execution has never enabled time skipping, it will be nil."
         }
       },
       "description": "Holds all the extra information about workflow execution that is not part of Visibility."
@@ -21956,7 +21563,7 @@
         },
         "disabledAfterFastForward": {
           "type": "boolean",
-          "description": "When true, time skipping has been stopped automatically due to a call to fast_forward completing."
+          "description": "When true, time skipping has been disabled automatically due to a call to fast_forward completing."
         },
         "wallClockTime": {
           "type": "string",
@@ -21964,7 +21571,7 @@
           "description": "The wall-clock time when the time-skipping state changed event was generated."
         }
       },
-      "description": "Attributes for an event indicating that time skipping state changed for a workflow execution:\neither time was advanced, or time skipping was stopped automatically due to the fast_forward completing.\nThe worker_may_ignore field in HistoryEvent should always be set true for this event."
+      "description": "Attributes for an event indicating that time skipping state changed for a workflow execution,\neither time was advanced or time skipping was disabled automatically due to the fast_forward completing.\nThe worker_may_ignore field in HistoryEvent should always be set true for this event."
     },
     "v1WorkflowExecutionTimedOutEventAttributes": {
       "type": "object",
@@ -22386,11 +21993,10 @@
         "WORKFLOW_TASK_FAILED_CAUSE_GRPC_MESSAGE_TOO_LARGE",
         "WORKFLOW_TASK_FAILED_CAUSE_PAYLOADS_TOO_LARGE",
         "WORKFLOW_TASK_FAILED_CAUSE_EXTERNAL_STORAGE_FAILURE",
-        "WORKFLOW_TASK_FAILED_CAUSE_WORKFLOW_PAUSE_REQUESTED_BEFORE_TASK_STARTED",
-        "WORKFLOW_TASK_FAILED_CAUSE_REQUEST_TOO_LARGE"
+        "WORKFLOW_TASK_FAILED_CAUSE_WORKFLOW_PAUSE_REQUESTED_BEFORE_TASK_STARTED"
       ],
       "default": "WORKFLOW_TASK_FAILED_CAUSE_UNSPECIFIED",
-      "description": "Workflow tasks can fail for various reasons. Note that some of these reasons can only originate\nfrom the server, and some of them can only originate from the SDK/worker.\n\n - WORKFLOW_TASK_FAILED_CAUSE_UNHANDLED_COMMAND: Between starting and completing the workflow task (with a workflow completion command), some\nnew command (like a signal) was processed into workflow history. The outstanding task will be\nfailed with this reason, and a worker must pick up a new task.\n - WORKFLOW_TASK_FAILED_CAUSE_RESET_STICKY_TASK_QUEUE: The worker wishes to fail the task and have the next one be generated on a normal, not sticky\nqueue. Generally workers should prefer to use the explicit `ResetStickyTaskQueue` RPC call.\n - WORKFLOW_TASK_FAILED_CAUSE_NON_DETERMINISTIC_ERROR: The worker encountered a mismatch while replaying history between what was expected, and\nwhat the workflow code actually did.\n - WORKFLOW_TASK_FAILED_CAUSE_PENDING_CHILD_WORKFLOWS_LIMIT_EXCEEDED: We send the below error codes to users when their requests would violate a size constraint\nof their workflow. We do this to ensure that the state of their workflow does not become too\nlarge because that can cause severe performance degradation. You can modify the thresholds for\neach of these errors within your dynamic config.\n\nSpawning a new child workflow would cause this workflow to exceed its limit of pending child\nworkflows.\n - WORKFLOW_TASK_FAILED_CAUSE_PENDING_ACTIVITIES_LIMIT_EXCEEDED: Starting a new activity would cause this workflow to exceed its limit of pending activities\nthat we track.\n - WORKFLOW_TASK_FAILED_CAUSE_PENDING_SIGNALS_LIMIT_EXCEEDED: A workflow has a buffer of signals that have not yet reached their destination. We return this\nerror when sending a new signal would exceed the capacity of this buffer.\n - WORKFLOW_TASK_FAILED_CAUSE_PENDING_REQUEST_CANCEL_LIMIT_EXCEEDED: Similarly, we have a buffer of pending requests to cancel other workflows. We return this error\nwhen our capacity for pending cancel requests is already reached.\n - WORKFLOW_TASK_FAILED_CAUSE_BAD_UPDATE_WORKFLOW_EXECUTION_MESSAGE: Workflow execution update message (update.Acceptance, update.Rejection, or update.Response)\nhas wrong format, or missing required fields.\n - WORKFLOW_TASK_FAILED_CAUSE_UNHANDLED_UPDATE: Similar to WORKFLOW_TASK_FAILED_CAUSE_UNHANDLED_COMMAND, but for updates.\n - WORKFLOW_TASK_FAILED_CAUSE_BAD_SCHEDULE_NEXUS_OPERATION_ATTRIBUTES: A workflow task completed with an invalid ScheduleNexusOperation command.\n - WORKFLOW_TASK_FAILED_CAUSE_PENDING_NEXUS_OPERATIONS_LIMIT_EXCEEDED: A workflow task completed requesting to schedule a Nexus Operation exceeding the server configured limit.\n - WORKFLOW_TASK_FAILED_CAUSE_BAD_REQUEST_CANCEL_NEXUS_OPERATION_ATTRIBUTES: A workflow task completed with an invalid RequestCancelNexusOperation command.\n - WORKFLOW_TASK_FAILED_CAUSE_FEATURE_DISABLED: A workflow task completed requesting a feature that's disabled on the server (either system wide or - typically -\nfor the workflow's namespace).\nCheck the workflow task failure message for more information.\n - WORKFLOW_TASK_FAILED_CAUSE_GRPC_MESSAGE_TOO_LARGE: A workflow task failed because a grpc message was too large.\n - WORKFLOW_TASK_FAILED_CAUSE_PAYLOADS_TOO_LARGE: A workflow task failed because payloads were too large.\n - WORKFLOW_TASK_FAILED_CAUSE_EXTERNAL_STORAGE_FAILURE: A workflow task failed because an external storage operation failed.\nCheck the workflow task failure message for more information.\n - WORKFLOW_TASK_FAILED_CAUSE_WORKFLOW_PAUSE_REQUESTED_BEFORE_TASK_STARTED: A workflow task is failed because the workflow is paused before the task is started.\n - WORKFLOW_TASK_FAILED_CAUSE_REQUEST_TOO_LARGE: A workflow task failed because the request exceeded a size limit."
+      "description": "Workflow tasks can fail for various reasons. Note that some of these reasons can only originate\nfrom the server, and some of them can only originate from the SDK/worker.\n\n - WORKFLOW_TASK_FAILED_CAUSE_UNHANDLED_COMMAND: Between starting and completing the workflow task (with a workflow completion command), some\nnew command (like a signal) was processed into workflow history. The outstanding task will be\nfailed with this reason, and a worker must pick up a new task.\n - WORKFLOW_TASK_FAILED_CAUSE_RESET_STICKY_TASK_QUEUE: The worker wishes to fail the task and have the next one be generated on a normal, not sticky\nqueue. Generally workers should prefer to use the explicit `ResetStickyTaskQueue` RPC call.\n - WORKFLOW_TASK_FAILED_CAUSE_NON_DETERMINISTIC_ERROR: The worker encountered a mismatch while replaying history between what was expected, and\nwhat the workflow code actually did.\n - WORKFLOW_TASK_FAILED_CAUSE_PENDING_CHILD_WORKFLOWS_LIMIT_EXCEEDED: We send the below error codes to users when their requests would violate a size constraint\nof their workflow. We do this to ensure that the state of their workflow does not become too\nlarge because that can cause severe performance degradation. You can modify the thresholds for\neach of these errors within your dynamic config.\n\nSpawning a new child workflow would cause this workflow to exceed its limit of pending child\nworkflows.\n - WORKFLOW_TASK_FAILED_CAUSE_PENDING_ACTIVITIES_LIMIT_EXCEEDED: Starting a new activity would cause this workflow to exceed its limit of pending activities\nthat we track.\n - WORKFLOW_TASK_FAILED_CAUSE_PENDING_SIGNALS_LIMIT_EXCEEDED: A workflow has a buffer of signals that have not yet reached their destination. We return this\nerror when sending a new signal would exceed the capacity of this buffer.\n - WORKFLOW_TASK_FAILED_CAUSE_PENDING_REQUEST_CANCEL_LIMIT_EXCEEDED: Similarly, we have a buffer of pending requests to cancel other workflows. We return this error\nwhen our capacity for pending cancel requests is already reached.\n - WORKFLOW_TASK_FAILED_CAUSE_BAD_UPDATE_WORKFLOW_EXECUTION_MESSAGE: Workflow execution update message (update.Acceptance, update.Rejection, or update.Response)\nhas wrong format, or missing required fields.\n - WORKFLOW_TASK_FAILED_CAUSE_UNHANDLED_UPDATE: Similar to WORKFLOW_TASK_FAILED_CAUSE_UNHANDLED_COMMAND, but for updates.\n - WORKFLOW_TASK_FAILED_CAUSE_BAD_SCHEDULE_NEXUS_OPERATION_ATTRIBUTES: A workflow task completed with an invalid ScheduleNexusOperation command.\n - WORKFLOW_TASK_FAILED_CAUSE_PENDING_NEXUS_OPERATIONS_LIMIT_EXCEEDED: A workflow task completed requesting to schedule a Nexus Operation exceeding the server configured limit.\n - WORKFLOW_TASK_FAILED_CAUSE_BAD_REQUEST_CANCEL_NEXUS_OPERATION_ATTRIBUTES: A workflow task completed with an invalid RequestCancelNexusOperation command.\n - WORKFLOW_TASK_FAILED_CAUSE_FEATURE_DISABLED: A workflow task completed requesting a feature that's disabled on the server (either system wide or - typically -\nfor the workflow's namespace).\nCheck the workflow task failure message for more information.\n - WORKFLOW_TASK_FAILED_CAUSE_GRPC_MESSAGE_TOO_LARGE: A workflow task failed because a grpc message was too large.\n - WORKFLOW_TASK_FAILED_CAUSE_PAYLOADS_TOO_LARGE: A workflow task failed because payloads were too large.\n - WORKFLOW_TASK_FAILED_CAUSE_EXTERNAL_STORAGE_FAILURE: A workflow task failed because an external storage operation failed.\nCheck the workflow task failure message for more information.\n - WORKFLOW_TASK_FAILED_CAUSE_WORKFLOW_PAUSE_REQUESTED_BEFORE_TASK_STARTED: A workflow task is failed because the workflow is paused before the task is started."
     },
     "v1WorkflowTaskFailedEventAttributes": {
       "type": "object",

@@ -4572,50 +4572,6 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Status'
-  /api/v1/namespaces/{namespace}/workflows/{workflow_execution.workflow_id}/time-skipping/poll:
-    get:
-      tags:
-        - WorkflowService
-      operationId: PollWorkflowExecutionTimeSkipping
-      parameters:
-        - name: namespace
-          in: path
-          required: true
-          schema:
-            type: string
-        - name: workflow_execution.workflow_id
-          in: path
-          required: true
-          schema:
-            type: string
-        - name: workflowExecution.workflowId
-          in: query
-          schema:
-            type: string
-        - name: workflowExecution.runId
-          in: query
-          schema:
-            type: string
-        - name: fastForwardId
-          in: query
-          description: |-
-            Required. Identifies the fast-forward whose completion the caller wants to wait for.
-             Must match the `fast_forward_id` set in the execution's TimeSkippingConfig.
-          schema:
-            type: string
-      responses:
-        "200":
-          description: OK
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/PollWorkflowExecutionTimeSkippingResponse'
-        default:
-          description: Default error response
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/Status'
   /api/v1/namespaces/{namespace}/workflows/{workflow_execution.workflow_id}/update-options:
     post:
       tags:
@@ -9612,50 +9568,6 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Status'
-  /namespaces/{namespace}/workflows/{workflow_execution.workflow_id}/time-skipping/poll:
-    get:
-      tags:
-        - WorkflowService
-      operationId: PollWorkflowExecutionTimeSkipping
-      parameters:
-        - name: namespace
-          in: path
-          required: true
-          schema:
-            type: string
-        - name: workflow_execution.workflow_id
-          in: path
-          required: true
-          schema:
-            type: string
-        - name: workflowExecution.workflowId
-          in: query
-          schema:
-            type: string
-        - name: workflowExecution.runId
-          in: query
-          schema:
-            type: string
-        - name: fastForwardId
-          in: query
-          description: |-
-            Required. Identifies the fast-forward whose completion the caller wants to wait for.
-             Must match the `fast_forward_id` set in the execution's TimeSkippingConfig.
-          schema:
-            type: string
-      responses:
-        "200":
-          description: OK
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/PollWorkflowExecutionTimeSkippingResponse'
-        default:
-          description: Default error response
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/Status'
   /namespaces/{namespace}/workflows/{workflow_execution.workflow_id}/update-options:
     post:
       tags:
@@ -10026,21 +9938,6 @@ components:
           allOf:
             - $ref: '#/components/schemas/Failure'
           description: The failure if the activity completed unsuccessfully.
-        retryState:
-          enum:
-            - RETRY_STATE_UNSPECIFIED
-            - RETRY_STATE_IN_PROGRESS
-            - RETRY_STATE_NON_RETRYABLE_FAILURE
-            - RETRY_STATE_TIMEOUT
-            - RETRY_STATE_MAXIMUM_ATTEMPTS_REACHED
-            - RETRY_STATE_RETRY_POLICY_NOT_SET
-            - RETRY_STATE_INTERNAL_SERVER_ERROR
-            - RETRY_STATE_CANCEL_REQUESTED
-          type: string
-          description: |-
-            The retry state associated with an unsuccessful activity execution.
-             This field is only meaningful when `failure` is set.
-          format: enum
       description: 'The outcome of a completed activity execution: either a successful result or a failure.'
     ActivityFailureInfo:
       type: object
@@ -12187,135 +12084,6 @@ components:
           type: string
           description: Nexus task queue to route requests to.
       description: Target a worker polling on a Nexus task queue in a specific namespace.
-    EnvironmentInfo:
-      type: object
-      properties:
-        runtimes:
-          type: array
-          items:
-            $ref: '#/components/schemas/EnvironmentInfo_Runtime'
-          description: The runtime(s) the SDK is operating in.
-        hostingEnvironments:
-          type: array
-          items:
-            $ref: '#/components/schemas/EnvironmentInfo_HostingEnvironment'
-          description: 'The hosting environment(s) the SDK is operating in. Repeated to allow for layering (ex: Docker inside k8s).'
-        platform:
-          allOf:
-            - $ref: '#/components/schemas/EnvironmentInfo_Platform'
-          description: The platform the SDK is operating on.
-    EnvironmentInfo_HostingEnvironment:
-      type: object
-      properties:
-        type:
-          enum:
-            - HOSTING_ENVIRONMENT_TYPE_UNSPECIFIED
-            - HOSTING_ENVIRONMENT_TYPE_DOCKER
-            - HOSTING_ENVIRONMENT_TYPE_K8S
-            - HOSTING_ENVIRONMENT_TYPE_AWS_LAMBDA
-            - HOSTING_ENVIRONMENT_TYPE_AWS_ECS
-            - HOSTING_ENVIRONMENT_TYPE_GOOGLE_CLOUD_RUN
-            - HOSTING_ENVIRONMENT_TYPE_GOOGLE_APP_ENGINE
-            - HOSTING_ENVIRONMENT_TYPE_AZURE_APP_SERVICE
-            - HOSTING_ENVIRONMENT_TYPE_AZURE_FUNCTIONS
-            - HOSTING_ENVIRONMENT_TYPE_AZURE_CONTAINER_APPS
-          type: string
-          description: The type of hosting environment.
-          format: enum
-        version:
-          type: string
-          description: The version of the hosting environment, if obtainable.
-    EnvironmentInfo_LinuxPlatform:
-      type: object
-      properties:
-        version:
-          type: string
-          description: The Linux kernel or distribution version, if obtainable.
-        architecture:
-          enum:
-            - ARCHITECTURE_UNSPECIFIED
-            - ARCHITECTURE_AMD64
-            - ARCHITECTURE_ARM64
-          type: string
-          description: The architecture of the worker process.
-          format: enum
-        libc:
-          enum:
-            - LIBC_UNSPECIFIED
-            - LIBC_GLIBC
-            - LIBC_MUSL
-          type: string
-          description: The libc used by the worker process.
-          format: enum
-    EnvironmentInfo_MacOSPlatform:
-      type: object
-      properties:
-        version:
-          type: string
-          description: The macOS version, if obtainable.
-        architecture:
-          enum:
-            - ARCHITECTURE_UNSPECIFIED
-            - ARCHITECTURE_AMD64
-            - ARCHITECTURE_ARM64
-          type: string
-          description: The architecture of the worker process.
-          format: enum
-    EnvironmentInfo_Platform:
-      type: object
-      properties:
-        linux:
-          $ref: '#/components/schemas/EnvironmentInfo_LinuxPlatform'
-        macos:
-          $ref: '#/components/schemas/EnvironmentInfo_MacOSPlatform'
-        windows:
-          $ref: '#/components/schemas/EnvironmentInfo_WindowsPlatform'
-    EnvironmentInfo_Runtime:
-      type: object
-      properties:
-        type:
-          enum:
-            - RUNTIME_TYPE_UNSPECIFIED
-            - RUNTIME_TYPE_JVM
-            - RUNTIME_TYPE_CPYTHON
-            - RUNTIME_TYPE_NODE
-            - RUNTIME_TYPE_BUN
-            - RUNTIME_TYPE_CRUBY
-            - RUNTIME_TYPE_GO
-            - RUNTIME_TYPE_DOTNET_FRAMEWORK
-            - RUNTIME_TYPE_DOTNET_CORE
-            - RUNTIME_TYPE_NATIVE
-            - RUNTIME_TYPE_ROADRUNNER
-          type: string
-          description: The type of the runtime.
-          format: enum
-        version:
-          type: string
-          description: The version of the runtime, if obtainable.
-    EnvironmentInfo_WindowsPlatform:
-      type: object
-      properties:
-        version:
-          type: string
-          description: The Windows version, if obtainable.
-        architecture:
-          enum:
-            - ARCHITECTURE_UNSPECIFIED
-            - ARCHITECTURE_AMD64
-            - ARCHITECTURE_ARM64
-          type: string
-          description: The architecture of the worker process.
-          format: enum
-        crt:
-          enum:
-            - CRT_UNSPECIFIED
-            - CRT_UCRT
-            - CRT_MSVCRT
-            - CRT_MINGW
-            - CRT_CYGWIN
-          type: string
-          description: The C runtime used by the worker process, if obtainable.
-          format: enum
     EventGroupMarker:
       type: object
       properties:
@@ -12486,28 +12254,6 @@ components:
           $ref: '#/components/schemas/NexusOperationFailureInfo'
         nexusHandlerFailureInfo:
           $ref: '#/components/schemas/NexusHandlerFailureInfo'
-    FastForwardConfig:
-      type: object
-      properties:
-        id:
-          type: string
-          description: |-
-            A client-supplied ID, required field, set alongside `duration`. It is used to poll for
-             fast-forward completion via PollWorkflowExecutionTimeSkipping.
-             The server performs no idempotency check on this ID; the client is responsible for managing it.
-        duration:
-          pattern: ^-?(?:0|[1-9][0-9]{0,11})(?:\.[0-9]{1,9})?s$
-          type: string
-          description: |-
-            Fast-forward the current execution by this duration ahead of the current execution time; required field.
-             The duration yields a target time (current execution time + duration), surfaced as `target_time` in
-             TimeSkippingFastForwardInfo. Once virtual time reaches that target, the fast-forward completes, time
-             skipping is disabled, and no further time is skipped. Time skipping can be resumed either
-             by updating the TimeSkippingConfig with a new FastForwardConfig, or by clearing the FastForwardConfig
-             to skip through to the end of the execution.
-
-             If this duration exceeds the remaining execution timeout, time will not pass beyond the end
-             of the execution, and the fast-forward won't have a chance to complete.
     FetchWorkerConfigRequest:
       type: object
       properties:
@@ -13576,12 +13322,6 @@ components:
         memoSizeLimitError:
           type: string
           description: Maximum total memo size in bytes per workflow execution.
-        workflowTaskCompletionSizeLimitError:
-          type: string
-          description: |-
-            Maximum total size in bytes of a single RespondWorkflowTaskCompleted request.
-             Requests exceeding this fail the workflow task with
-             WORKFLOW_TASK_FAILED_CAUSE_REQUEST_TOO_LARGE. 0 means no explicit limit.
     NamespaceReplicationConfig:
       type: object
       properties:
@@ -14243,7 +13983,7 @@ components:
           description: The ID of the activity to target.
         runId:
           type: string
-          description: Run ID of the workflow or standalone activity. If empty, targets the latest run.
+          description: Run ID of the workflow or standalone activity.
         identity:
           type: string
           description: The identity of the client who initiated this request.
@@ -14656,27 +14396,6 @@ components:
           allOf:
             - $ref: '#/components/schemas/Failure'
           description: The failure if the operation completed unsuccessfully.
-    PollWorkflowExecutionTimeSkippingResponse:
-      type: object
-      properties:
-        fastForwardPollingResult:
-          enum:
-            - FAST_FORWARD_POLLING_RESULT_UNSPECIFIED
-            - FAST_FORWARD_POLLING_RESULT_POLL_TIMEOUT
-            - FAST_FORWARD_POLLING_RESULT_FAST_FORWARD_COMPLETED
-            - FAST_FORWARD_POLLING_RESULT_FAST_FORWARD_FAILED
-          type: string
-          description: The outcome of the poll for the fast-forward identified by the request's `fast_forward_id`.
-          format: enum
-        failedReason:
-          type: string
-          description: |-
-            Set only when the result is FAST_FORWARD_POLLING_RESULT_FAST_FORWARD_FAILED; explains why
-             the fast-forward can no longer complete.
-        fastForwardInfo:
-          allOf:
-            - $ref: '#/components/schemas/TimeSkippingFastForwardInfo'
-          description: The execution's current fast-forward, if any.
     PollWorkflowTaskQueueResponse:
       type: object
       properties:
@@ -15284,7 +15003,7 @@ components:
           type: string
         runId:
           type: string
-          description: Activity run ID. If empty, targets the latest run.
+          description: Activity run ID, targets the latest run if run_id is empty.
         identity:
           type: string
           description: The identity of the worker/client.
@@ -15504,7 +15223,7 @@ components:
           description: The ID of the activity to target.
         runId:
           type: string
-          description: Run ID of the workflow or standalone activity. If empty, targets the latest run.
+          description: Run ID of the workflow or standalone activity.
         identity:
           type: string
           description: The identity of the client who initiated this request.
@@ -15526,9 +15245,6 @@ components:
         resourceId:
           type: string
           description: Resource ID for routing. Contains "workflow:{workflow_id}" for workflow activities or "activity:{activity_id}" for standalone activities.
-        requestId:
-          type: string
-          description: Used to de-dupe reset requests.
     ResetActivityExecutionResponse:
       type: object
       properties: {}
@@ -17867,7 +17583,7 @@ components:
           type: string
         runId:
           type: string
-          description: Activity run ID. If empty, targets the latest run.
+          description: Activity run ID, targets the latest run if run_id is empty.
         identity:
           type: string
           description: The identity of the worker/client.
@@ -17944,93 +17660,42 @@ components:
         enabled:
           type: boolean
           description: Enables or disables time skipping for this workflow execution.
-        fastForwardConfig:
-          allOf:
-            - $ref: '#/components/schemas/FastForwardConfig'
-          description: An optional opt-in to control time-skipping behavior through fast-forward; see its definition for details.
+        fastForward:
+          pattern: ^-?(?:0|[1-9][0-9]{0,11})(?:\.[0-9]{1,9})?s$
+          type: string
+          description: |-
+            Optionally fast-forward the current workflow execution by this duration ahead of current workflow execution time.
+             After the fast-forward completes, time skipping is disabled, and this
+             action is recorded in the WorkflowExecutionTimeSkippingTransitionedEvent. It can be re-enabled by
+             setting `enabled` to true or setting `fast_forward` again via UpdateWorkflowExecutionOptions.
+             The current workflow execution is a chain of runs (retries, cron, continue-as-new);
+             child workflows are separate executions, so this fast_forward won't affect them.
+
+             For a given workflow execution, only one active fast-forward is allowed at a time.
+             If a new fast-forward is set via UpdateWorkflowExecutionOptions before the previous
+             one completes, the new one will override the previous one.
+             If the fast-forward duration exceeds the remaining execution timeout, time will only
+             be fast-forwarded up to the end of the execution.
         disablePropagation:
           type: boolean
           description: |-
             By default, executions started by another execution (e.g. a child workflow of a parent workflow or
-             a schedule with the time-skipping policy enabled) inherit the "enabled" flag and skip time when possible.
+             a schedule with the timeskipping policy enabled), inherit the "enabled" flag and skip time when possible.
              This flag disables that inheritance.
-        maxSessionSkipCount:
-          type: integer
-          description: |-
-            The maximum number of skips allowed every time this field is updated. It protects the execution from
-             situations like unlimited retries when backoff is skipped.
-
-             Every time the execution skips time, the skip count is incremented by one, and when it reaches
-             max_session_skip_count, time skipping stops. Whenever this config field is updated, the accumulated
-             skip count is cleared, marking the start of a new session.
-             For an execution with a chain of runs (retry, cron, continue-as-new), the count is accumulated
-             across all runs within the same session.
-
-             If this field is not set, the server applies a large default value (e.g. 100). The default can
-             be changed through dynamic config, and is overridden by this field when set.
-          format: int32
       description: |-
-        The configuration for time skipping of an execution.
+        The configuration for time skipping of a workflow execution (a chain of runs including retries, cron, continue-as-new).
          When time skipping is enabled, virtual time advances automatically whenever there is no in-flight work.
-         Options like fast_forward, disable_propagation, and max_session_skip_count are provided for granular
-         control of the execution's time skipping behavior. See each field's comment for a detailed explanation.
-
-         An example of workflows with time skipping:
-         For workflows, an execution is a chain of runs including retries, cron, and continue-as-new.
-         In-flight work includes activities, child workflows, Nexus operations, signal/cancel external workflow operations, etc.
+         In-flight work includes activities, child workflows, Nexus operations, signal/cancel external workflow operations,
+         and possibly other features added in the future.
          User timers are not classified as in-flight work and will be skipped over; the virtual clock may also skip to the
-         time point of the registered fast-forward when there is no in-flight work.
-         Whenever time is skipped, the skip count is incremented by one; max_session_skip_count bounds the number of skips allowed within a single time-skipping session.
+         time point of the registered fast forward when there is no in-flight work.
+         When time is skipped, a WorkflowExecutionTimeSkippingTransitionedEvent will be
+         added to the workflow history to capture the state changes.
+
          For child workflows, by default, if the parent execution is skipping time, the child execution will also skip time,
          but a parent's fast_forward won't affect its child's execution. A flag is provided to disable propagation of the
          "enabled" flag to child workflows; regardless of that flag, a child workflow inherits the virtual time from the
          parent execution as its start time.
-    TimeSkippingFastForwardInfo:
-      type: object
-      properties:
-        fastForwardDuration:
-          pattern: ^-?(?:0|[1-9][0-9]{0,11})(?:\.[0-9]{1,9})?s$
-          type: string
-          description: The client-supplied `fast_forward` duration.
-        fastForwardId:
-          type: string
-          description: The client-supplied ID set alongside `fast_forward` duration.
-        targetTime:
-          type: string
-          description: The target virtual time at which the fast-forward completes.
-          format: date-time
-        hasCompleted:
-          type: boolean
-          description: True once `target_time` has been reached.
-      description: TimeSkippingFastForwardInfo describes the current time-skipping fast-forward on an execution.
-    TimeSkippingInfo:
-      type: object
-      properties:
-        currentTime:
-          type: string
-          description: |-
-            Current virtual time of the execution. If the execution hasn't skipped
-             any time yet, it will be the same as wall clock time.
-          format: date-time
-        effectiveConfig:
-          allOf:
-            - $ref: '#/components/schemas/TimeSkippingConfig'
-          description: |-
-            The current effective time-skipping config, which can differ from the config the user last set:
-             internally-defaulted fields are populated, and `enabled` reflects whether the execution is still
-             skipping time — e.g. it is set to false once `max_session_skip_count` is reached, the fast-forward
-             completes, or a client call disables time skipping.
-        fastForwardInfo:
-          allOf:
-            - $ref: '#/components/schemas/TimeSkippingFastForwardInfo'
-          description: The execution's current fast-forward, if any. Unset if time skipping is enabled without a fast-forward.
-        currentSessionSkipCount:
-          type: integer
-          description: |-
-            The number of skips accumulated in the current session, bounded by `max_session_skip_count`.
-             A new session begins — and this resets to 0 — each time `max_session_skip_count` is updated.
-          format: int32
-      description: Describes the current time-skipping state of a workflow execution.
     TimeSkippingStatePropagation:
       type: object
       properties:
@@ -18038,19 +17703,17 @@ components:
           pattern: ^-?(?:0|[1-9][0-9]{0,11})(?:\.[0-9]{1,9})?s$
           type: string
           description: |-
-            The time skipped by the previous run. It is propagated both to executions started by the
-             current execution and through a chain of runs (CaN, cron, retry).
+            The time skipped by the previous execution that started this workflow.
+             It can happen in child workflows and a chain of runs (CaN, cron, retry).
         fastForwardTargetTime:
           type: string
-          description: The fast-forward target time. It only propagates across a chain of runs within the same execution.
+          description: |-
+            If there is a fast-forward action set for the previous run in a chain of runs,
+             the target time should be propagated to the next run as well.
           format: date-time
-        initialSkipCount:
-          type: integer
-          description: The initial skip count. It only propagates across a chain of runs within the same execution.
-          format: int32
       description: |-
-        The time-skipping state that needs to be propagated from one execution to another, or through a chain of runs
-         within the same execution.
+        The time-skipping state that needs to be propagated from a parent workflow to a child workflow,
+         or through a chain of runs.
     TimeoutFailureInfo:
       type: object
       properties:
@@ -18183,10 +17846,16 @@ components:
           description: The ID of the activity to target.
         runId:
           type: string
-          description: Run ID of the workflow or standalone activity. If empty, targets the latest run.
+          description: Run ID of the workflow or standalone activity.
         identity:
           type: string
           description: The identity of the client who initiated this request.
+        resetAttempts:
+          type: boolean
+          description: Providing this flag will also reset the number of attempts.
+        resetHeartbeat:
+          type: boolean
+          description: Providing this flag will also reset the heartbeat details.
         reason:
           type: string
           description: Reason to unpause the activity.
@@ -18197,9 +17866,6 @@ components:
         resourceId:
           type: string
           description: Resource ID for routing. Contains "workflow:{workflow_id}" for workflow activities or "activity:{activity_id}" for standalone activities.
-        requestId:
-          type: string
-          description: Used to de-dupe unpause requests.
     UnpauseActivityExecutionResponse:
       type: object
       properties: {}
@@ -18281,7 +17947,7 @@ components:
           description: The ID of the activity to target.
         runId:
           type: string
-          description: Run ID of the workflow or standalone activity. If empty, targets the latest run.
+          description: Run ID of the workflow or standalone activity.
         identity:
           type: string
           description: The identity of the client who initiated this request
@@ -18304,9 +17970,6 @@ components:
         resourceId:
           type: string
           description: Resource ID for routing. Contains "workflow:{workflow_id}" for workflow activities or "activity:{activity_id}" for standalone activities.
-        requestId:
-          type: string
-          description: Used to de-dupe update requests.
     UpdateActivityExecutionOptionsResponse:
       type: object
       properties:
@@ -18720,9 +18383,6 @@ components:
           description: |-
             The Workflow Execution time when the options were updated. When time skipping is
              enabled, this is the workflow's virtual time rather than wall-clock time.
-
-             This timestamp cannot be used for time-skipping fast-forward verification,
-             use `fast_forward_id` in `PollWorkflowExecutionTimeSkippingRequest` instead.
           format: date-time
     UpdateWorkflowExecutionRequest:
       type: object
@@ -19455,10 +19115,6 @@ components:
           items:
             $ref: '#/components/schemas/StorageDriverInfo'
           description: Storage drivers in use by this SDK.
-        environment:
-          allOf:
-            - $ref: '#/components/schemas/EnvironmentInfo'
-          description: Information about the environment this SDK is running in.
       description: |-
         Worker info message, contains information about the worker and its current state.
          All information is provided by the worker itself.
@@ -19983,12 +19639,6 @@ components:
           allOf:
             - $ref: '#/components/schemas/WorkflowExecutionPauseInfo'
           description: Information about the workflow execution pause operation.
-        timeSkippingInfo:
-          allOf:
-            - $ref: '#/components/schemas/TimeSkippingInfo'
-          description: |-
-            Information about time skipping of the workflow execution.
-             If the execution has never enabled time skipping, it will be nil.
       description: Holds all the extra information about workflow execution that is not part of Visibility.
     WorkflowExecutionFailedEventAttributes:
       type: object
@@ -20555,7 +20205,7 @@ components:
         disabledAfterFastForward:
           type: boolean
           description: |-
-            When true, time skipping has been stopped automatically due to a call to fast_forward completing.
+            When true, time skipping has been disabled automatically due to a call to fast_forward completing.
              (-- api-linter: core::0140::prepositions=disabled
                  aip.dev/not-precedent: "after" is used to indicate temporal ordering. --)
         wallClockTime:
@@ -20563,8 +20213,8 @@ components:
           description: The wall-clock time when the time-skipping state changed event was generated.
           format: date-time
       description: |-
-        Attributes for an event indicating that time skipping state changed for a workflow execution:
-         either time was advanced, or time skipping was stopped automatically due to the fast_forward completing.
+        Attributes for an event indicating that time skipping state changed for a workflow execution,
+         either time was advanced or time skipping was disabled automatically due to the fast_forward completing.
          The worker_may_ignore field in HistoryEvent should always be set true for this event.
     WorkflowExecutionTimedOutEventAttributes:
       type: object
@@ -21099,7 +20749,6 @@ components:
             - WORKFLOW_TASK_FAILED_CAUSE_PAYLOADS_TOO_LARGE
             - WORKFLOW_TASK_FAILED_CAUSE_EXTERNAL_STORAGE_FAILURE
             - WORKFLOW_TASK_FAILED_CAUSE_WORKFLOW_PAUSE_REQUESTED_BEFORE_TASK_STARTED
-            - WORKFLOW_TASK_FAILED_CAUSE_REQUEST_TOO_LARGE
           type: string
           format: enum
         failure:
