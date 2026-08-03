@@ -7,7 +7,7 @@ mod workflow_cancels;
 mod workflow_tasks;
 
 use crate::{
-    PollError, RuntimeOptions, Worker,
+    PollError, Worker,
     replay::{TestHistoryBuilder, canned_histories},
     test_help::{
         MockPollCfg, build_mock_pollers, mock_worker, single_hist_mock_sg, test_worker_cfg,
