@@ -2589,15 +2589,26 @@ async fn queries_can_be_received_while_heartbeating() {
     core.drain_pollers_and_shutdown().await;
 }
 
+#[rstest]
+#[case::current_history(false)]
+#[case::old_heartbeat_history_replay(true)]
 #[tokio::test]
-async fn local_activity_after_wf_complete_is_discarded() {
+async fn local_activity_after_wf_complete_is_discarded(#[case] old_heartbeat_history: bool) {
     let wfid = "fake_wf_id";
     let mut t = TestHistoryBuilder::default();
     t.add_wfe_started_with_wft_timeout(Duration::from_millis(200));
+    if old_heartbeat_history {
+        t.add_full_wf_task();
+    }
     t.add_workflow_task_scheduled_and_started();
 
     let mock = mock_worker_client();
-    let mut mock_cfg = MockPollCfg::from_resp_batches(wfid, t, [ResponseType::ToTaskNum(1)], mock);
+    let response = if old_heartbeat_history {
+        ResponseType::AllHistory
+    } else {
+        ResponseType::ToTaskNum(1)
+    };
+    let mut mock_cfg = MockPollCfg::from_resp_batches(wfid, t, [response], mock);
     mock_cfg.make_poll_stream_interminable = true;
     mock_cfg.completion_asserts_from_expectations(|mut asserts| {
         asserts.then(move |wft| {
