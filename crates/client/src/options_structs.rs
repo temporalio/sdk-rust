@@ -247,10 +247,11 @@ impl Default for ClientKeepAliveOptions {
 }
 
 /// Options for DNS-based load balancing.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, bon::Builder)]
 #[non_exhaustive]
 pub struct DnsLoadBalancingOptions {
     /// How often to re-resolve DNS. Defaults to 30 seconds.
+    #[builder(default = Duration::from_secs(30))]
     pub resolution_interval: Duration,
 }
 

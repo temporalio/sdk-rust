@@ -21,6 +21,7 @@ to docs, or any other relevant information.
 
 ### Added
 * `RpcOptions::builder()` for constructing per-call RPC options.
+* `DnsLoadBalancingOptions::builder()` for configuring DNS re-resolution intervals.
 
 ### Breaking Changes :boom:
 * `CancellableFuture` and `CancellableFutureWithReason` now use the inherited `Future::Output`

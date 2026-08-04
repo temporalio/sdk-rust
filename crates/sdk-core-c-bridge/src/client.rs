@@ -1537,9 +1537,9 @@ impl From<&ClientKeepAliveOptions> for temporalio_client::ClientKeepAliveOptions
 
 impl From<&ClientDnsLoadBalancingOptions> for temporalio_client::DnsLoadBalancingOptions {
     fn from(opts: &ClientDnsLoadBalancingOptions) -> Self {
-        let mut out = temporalio_client::DnsLoadBalancingOptions::default();
-        out.resolution_interval = Duration::from_millis(opts.resolution_interval_millis);
-        out
+        temporalio_client::DnsLoadBalancingOptions::builder()
+            .resolution_interval(Duration::from_millis(opts.resolution_interval_millis))
+            .build()
     }
 }
 
