@@ -941,10 +941,9 @@ async fn history_out_of_order_on_restart() {
             ctx.execute_local_activity(
                 StdActivities::echo,
                 "hi".to_string(),
-                LocalActivityOptions {
-                    start_to_close_timeout: Some(Duration::from_secs(5)),
-                    ..Default::default()
-                },
+                LocalActivityOptions::builder()
+                    .start_to_close_timeout(Duration::from_secs(5))
+                    .build(),
             )
             .await?;
             ctx.execute_activity(
@@ -970,10 +969,9 @@ async fn history_out_of_order_on_restart() {
             ctx.execute_local_activity(
                 StdActivities::echo,
                 "hi".to_string(),
-                LocalActivityOptions {
-                    start_to_close_timeout: Some(Duration::from_secs(5)),
-                    ..Default::default()
-                },
+                LocalActivityOptions::builder()
+                    .start_to_close_timeout(Duration::from_secs(5))
+                    .build(),
             )
             .await?;
             // Timer is added after restarting workflow

@@ -1052,26 +1052,28 @@ async fn activity_metrics() {
             let local_act_fail = ctx.execute_local_activity(
                 PassFailActivities::pass_fail_act,
                 "fail".to_string(),
-                LocalActivityOptions {
-                    retry_policy: RetryPolicy {
-                        maximum_attempts: 1,
-                        ..Default::default()
-                    }
-                    .into(),
-                    ..Default::default()
-                },
+                LocalActivityOptions::builder()
+                    .retry_policy(
+                        RetryPolicy {
+                            maximum_attempts: 1,
+                            ..Default::default()
+                        }
+                        .into(),
+                    )
+                    .build(),
             );
             let local_act_cancel = ctx.execute_local_activity(
                 PassFailActivities::pass_fail_act,
                 "cancel".to_string(),
-                LocalActivityOptions {
-                    retry_policy: RetryPolicy {
-                        maximum_attempts: 1,
-                        ..Default::default()
-                    }
-                    .into(),
-                    ..Default::default()
-                },
+                LocalActivityOptions::builder()
+                    .retry_policy(
+                        RetryPolicy {
+                            maximum_attempts: 1,
+                            ..Default::default()
+                        }
+                        .into(),
+                    )
+                    .build(),
             );
             let _ = join!(local_act_pass, local_act_fail);
             // TODO: Currently takes a WFT b/c of https://github.com/temporalio/sdk-core/issues/856

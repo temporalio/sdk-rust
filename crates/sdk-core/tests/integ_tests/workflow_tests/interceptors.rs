@@ -1338,10 +1338,9 @@ fn assert_workflow_interceptor_context_outbound_api(ctx: &WorkflowInterceptorCon
     let _local_activity = ctx.execute_local_activity(
         StdActivities::echo,
         String::new(),
-        LocalActivityOptions {
-            start_to_close_timeout: Some(Duration::from_secs(1)),
-            ..Default::default()
-        },
+        LocalActivityOptions::builder()
+            .start_to_close_timeout(Duration::from_secs(1))
+            .build(),
     );
     let _child = ctx.start_child_workflow(
         OutboundChildInterceptorChild::run,
@@ -1378,10 +1377,9 @@ impl OutboundActivityInterceptorWorkflow {
             .execute_local_activity(
                 StdActivities::echo,
                 "local-original".to_string(),
-                LocalActivityOptions {
-                    start_to_close_timeout: Some(Duration::from_secs(5)),
-                    ..Default::default()
-                },
+                LocalActivityOptions::builder()
+                    .start_to_close_timeout(Duration::from_secs(5))
+                    .build(),
             )
             .await?;
         assert_eq!(local_activity, "local-wrapped");

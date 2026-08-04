@@ -333,10 +333,9 @@ impl ActivityIdOrTypeChangeWf {
                 ctx.execute_local_activity(
                     StdActivities::default,
                     (),
-                    LocalActivityOptions {
-                        activity_id: Some("I'm bad and wrong!".to_string()),
-                        ..Default::default()
-                    },
+                    LocalActivityOptions::builder()
+                        .activity_id("I'm bad and wrong!".to_string())
+                        .build(),
                 )
                 .await?;
             } else {

@@ -1216,10 +1216,9 @@ async fn test_custom_slot_supplier_simple() {
                 .execute_local_activity(
                     StdActivities::no_op,
                     (),
-                    LocalActivityOptions {
-                        start_to_close_timeout: Some(Duration::from_secs(10)),
-                        ..Default::default()
-                    },
+                    LocalActivityOptions::builder()
+                        .start_to_close_timeout(Duration::from_secs(10))
+                        .build(),
                 )
                 .await;
             Ok(())

@@ -428,7 +428,8 @@ impl ActivityOptions {
 }
 
 /// Options for scheduling a local activity
-#[derive(Default, Debug, Clone)]
+#[derive(Default, Debug, Clone, bon::Builder)]
+#[non_exhaustive]
 pub struct LocalActivityOptions {
     /// Identifier to use for tracking the activity in Workflow history.
     /// The `activityId` can be accessed by the activity function.
@@ -437,6 +438,7 @@ pub struct LocalActivityOptions {
     /// If `None` use the context's sequence number
     pub activity_id: Option<String>,
     /// Retry policy
+    #[builder(default)]
     pub retry_policy: RetryPolicy,
     /// Override attempt number rather than using 1.
     /// Ideally we would not expose this in a released Rust SDK, but it's needed for test.
@@ -447,6 +449,7 @@ pub struct LocalActivityOptions {
     /// Retry backoffs over this amount will use a timer rather than a local retry
     pub timer_backoff_threshold: Option<Duration>,
     /// How the activity will cancel
+    #[builder(default)]
     pub cancel_type: ActivityCancellationType,
     /// Indicates how long the caller is willing to wait for local activity completion. Limits how
     /// long retries will be attempted. When not specified defaults to the workflow execution

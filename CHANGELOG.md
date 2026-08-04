@@ -55,6 +55,16 @@ to docs, or any other relevant information.
   `PrometheusExporterOptions::builder()` to construct Prometheus exporter options.
 * `WorkerDeploymentOptions` is now tagged with `#[non_exhaustive]`. Use
   `WorkerDeploymentOptions::new(version)` to construct worker deployment options.
+* `PollOptions` is now tagged with `#[non_exhaustive]`. Use `PollOptions::new(task_queue)` to
+  construct polling options.
+* `PollWorkflowOptions` is now tagged with `#[non_exhaustive]`. Use
+  `PollWorkflowOptions::builder()` to construct workflow polling options.
+* `PollActivityOptions` is now tagged with `#[non_exhaustive]`. Use
+  `PollActivityOptions::builder()` to construct activity polling options.
+* `PollNexusOptions` is now tagged with `#[non_exhaustive]`. Use
+  `PollNexusOptions::builder()` to construct Nexus polling options.
+* `LocalActivityOptions` is now tagged with `#[non_exhaustive]`. Use
+  `LocalActivityOptions::builder()` to construct local activity options.
 
 ## [0.6.0] - 2026-08-04
 
