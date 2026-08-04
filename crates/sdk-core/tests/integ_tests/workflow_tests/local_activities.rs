@@ -3144,7 +3144,7 @@ async fn two_sequential_las(
                     variant: Some(workflow_activation_job::Variant::ResolveActivity(ra))
                 }] => assert_eq!(ra.seq, 1)
             );
-        } else {
+        } else if replay {
             assert_matches!(
                 a.jobs.as_slice(),
                 [WorkflowActivationJob {
@@ -3153,6 +3153,19 @@ async fn two_sequential_las(
                     variant: Some(workflow_activation_job::Variant::ResolveActivity(ra2))
                 }] => {assert_eq!(ra.seq, 1); assert_eq!(ra2.seq, 2)}
             );
+        } else {
+            // Incremental delivery can race parallel LA completion, so lang may see the first
+            // resolution alone or both resolutions after they are already available.
+            let mut resolution_seqs = a
+                .jobs
+                .iter()
+                .map(|job| match job.variant.as_ref() {
+                    Some(workflow_activation_job::Variant::ResolveActivity(ra)) => ra.seq,
+                    unexpected => panic!("Unexpected activation job: {unexpected:?}"),
+                })
+                .collect::<Vec<_>>();
+            resolution_seqs.sort_unstable();
+            assert_matches!(resolution_seqs.as_slice(), [1] | [2] | [1, 2]);
         }
         if replay {
             assert!(
