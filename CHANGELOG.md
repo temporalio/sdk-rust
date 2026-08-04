@@ -19,6 +19,9 @@ to docs, or any other relevant information.
 
 ## Unreleased
 
+### Added
+* `RpcOptions::builder()` for constructing per-call RPC options.
+
 ### Breaking Changes :boom:
 * `CancellableFuture` and `CancellableFutureWithReason` now use the inherited `Future::Output`
   associated type instead of a generic output parameter.

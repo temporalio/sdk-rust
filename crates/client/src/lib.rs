@@ -2440,19 +2440,18 @@ mod tests {
         #[tokio::test]
         async fn rpc_options_reach_the_request() {
             let (client, recorded) = mock_client(Vec::new(), Arc::new(AtomicUsize::new(0)));
-            let mut rpc_options = RpcOptions {
-                timeout: Some(Duration::from_millis(250)),
-                retry_options: Some(RetryOptions::no_retries()),
-                ..Default::default()
-            };
-            rpc_options
-                .metadata
+            let mut metadata = RpcMetadata::new();
+            metadata
                 .insert("call-meta", "call-value")
                 .unwrap();
-            rpc_options
-                .metadata
+            metadata
                 .insert_binary("call-meta-bin", vec![0, 255])
                 .unwrap();
+            let rpc_options = RpcOptions::builder()
+                .metadata(metadata)
+                .timeout(Duration::from_millis(250))
+                .retry_options(RetryOptions::no_retries())
+                .build();
             let mut options = WorkflowStartOptions::new("task-queue", "workflow-id").build();
             options.rpc_options = rpc_options.clone();
 
