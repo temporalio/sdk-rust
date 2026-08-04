@@ -51,6 +51,8 @@ to docs, or any other relevant information.
   `ClientConfigFromTOMLOptions::builder()` to construct TOML parsing options.
 * `OtelCollectorOptions` is now tagged with `#[non_exhaustive]`. Use
   `OtelCollectorOptions::builder()` to construct OpenTelemetry collector options.
+* `PrometheusExporterOptions` is now tagged with `#[non_exhaustive]`. Use
+  `PrometheusExporterOptions::builder()` to construct Prometheus exporter options.
 
 ## [0.6.0] - 2026-08-04
 

@@ -157,6 +157,7 @@ pub struct OtelCollectorOptions {
 
 /// Options for exporting metrics to Prometheus
 #[derive(Debug, Clone, bon::Builder)]
+#[non_exhaustive]
 pub struct PrometheusExporterOptions {
     /// The address the Prometheus exporter HTTP server will bind to.
     pub socket_addr: SocketAddr,
