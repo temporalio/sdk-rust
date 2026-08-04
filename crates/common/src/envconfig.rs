@@ -174,12 +174,14 @@ pub struct ClientConfigCodec {
 }
 
 /// Options for loading client configuration
-#[derive(Debug, Default)]
+#[derive(Debug, Default, bon::Builder)]
+#[non_exhaustive]
 pub struct LoadClientConfigOptions {
     /// Where to load config from. If unset, will try env vars then default path.
     pub config_source: Option<DataSource>,
 
     /// If true, will error if there are unrecognized keys
+    #[builder(default)]
     pub config_file_strict: bool,
 }
 
@@ -339,10 +341,10 @@ pub fn load_client_config_profile(
     } else {
         // Load the full config
         let config = load_client_config(
-            LoadClientConfigOptions {
-                config_source: options.config_source,
-                config_file_strict: options.config_file_strict,
-            },
+            LoadClientConfigOptions::builder()
+                .maybe_config_source(options.config_source)
+                .config_file_strict(options.config_file_strict)
+                .build(),
             env_vars,
         )?;
 

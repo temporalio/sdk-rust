@@ -43,6 +43,8 @@ to docs, or any other relevant information.
   `PayloadLimitsOptions::builder()` to construct payload limit options.
 * `RegisterNamespaceOptions` is now tagged with `#[non_exhaustive]`. Continue using
   `RegisterNamespaceOptions::builder()` to construct namespace registration options.
+* `LoadClientConfigOptions` is now tagged with `#[non_exhaustive]`. Use
+  `LoadClientConfigOptions::builder()` to construct client configuration loading options.
 
 ## [0.6.0] - 2026-08-04
 

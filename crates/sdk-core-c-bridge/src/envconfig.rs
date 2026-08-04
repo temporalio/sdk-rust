@@ -219,10 +219,10 @@ pub extern "C" fn temporal_core_client_env_config_load(
         let opts = unsafe { &*options };
         let env_vars_map = parse_env_vars(&opts.env_vars)?;
 
-        let load_options = LoadClientConfigOptions {
-            config_source: parse_config_source(&opts.path, &opts.data)?,
-            config_file_strict: opts.config_file_strict,
-        };
+        let load_options = LoadClientConfigOptions::builder()
+            .maybe_config_source(parse_config_source(&opts.path, &opts.data)?)
+            .config_file_strict(opts.config_file_strict)
+            .build();
 
         let core_config = envconfig::load_client_config(load_options, env_vars_map.as_ref())
             .map_err(|e| e.to_string())?;
