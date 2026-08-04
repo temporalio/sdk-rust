@@ -1177,12 +1177,11 @@ async fn nexus_metrics() {
     impl NexusMetricsWf {
         #[run]
         async fn run(ctx: &mut WorkflowContext<Self>, endpoint: String) -> WorkflowResult<()> {
-            let partial_op = NexusOperationOptions {
-                endpoint: endpoint.clone(),
-                service: "mysvc".to_string(),
-                operation: "myop".to_string(),
-                ..Default::default()
-            };
+            let partial_op = NexusOperationOptions::builder()
+                .endpoint(endpoint.clone())
+                .service("mysvc")
+                .operation("myop")
+                .build();
             join!(
                 async {
                     ctx.start_nexus_operation(partial_op.clone())
@@ -1192,29 +1191,20 @@ async fn nexus_metrics() {
                         .await
                 },
                 async {
-                    let _ = ctx
-                        .start_nexus_operation(NexusOperationOptions {
-                            input: Some("fail".into()),
-                            ..partial_op.clone()
-                        })
-                        .await;
+                    let mut options = partial_op.clone();
+                    options.input = Some("fail".into());
+                    let _ = ctx.start_nexus_operation(options).await;
                 },
                 async {
-                    let _ = ctx
-                        .start_nexus_operation(NexusOperationOptions {
-                            input: Some("handler-fail".into()),
-                            ..partial_op.clone()
-                        })
-                        .await;
+                    let mut options = partial_op.clone();
+                    options.input = Some("handler-fail".into());
+                    let _ = ctx.start_nexus_operation(options).await;
                 },
                 async {
-                    let _ = ctx
-                        .start_nexus_operation(NexusOperationOptions {
-                            input: Some("timeout".into()),
-                            schedule_to_close_timeout: Some(Duration::from_secs(2)),
-                            ..partial_op.clone()
-                        })
-                        .await;
+                    let mut options = partial_op.clone();
+                    options.input = Some("timeout".into());
+                    options.schedule_to_close_timeout = Some(Duration::from_secs(2));
+                    let _ = ctx.start_nexus_operation(options).await;
                 }
             );
             Ok(())

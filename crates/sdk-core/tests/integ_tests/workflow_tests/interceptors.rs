@@ -1348,12 +1348,13 @@ fn assert_workflow_interceptor_context_outbound_api(ctx: &WorkflowInterceptorCon
         ChildWorkflowOptions::workflow_id("child".into()),
     );
     let _external = ctx.external_workflow("external", None);
-    let _nexus = ctx.start_nexus_operation(NexusOperationOptions {
-        endpoint: "endpoint".to_string(),
-        service: "service".to_string(),
-        operation: "operation".to_string(),
-        ..Default::default()
-    });
+    let _nexus = ctx.start_nexus_operation(
+        NexusOperationOptions::builder()
+            .endpoint("endpoint")
+            .service("service")
+            .operation("operation")
+            .build(),
+    );
 }
 
 #[workflow]

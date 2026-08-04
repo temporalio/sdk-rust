@@ -65,6 +65,8 @@ to docs, or any other relevant information.
   `PollNexusOptions::builder()` to construct Nexus polling options.
 * `LocalActivityOptions` is now tagged with `#[non_exhaustive]`. Use
   `LocalActivityOptions::builder()` to construct local activity options.
+* `NexusOperationOptions` is now tagged with `#[non_exhaustive]`. Use
+  `NexusOperationOptions::builder()` to construct Nexus operation options.
 
 ## [0.6.0] - 2026-08-04
 

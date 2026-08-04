@@ -701,7 +701,9 @@ impl TimerOptions {
 }
 
 /// Options for Nexus Operations
-#[derive(Default, Debug, Clone)]
+#[derive(Default, Debug, Clone, bon::Builder)]
+#[builder(on(String, into))]
+#[non_exhaustive]
 pub struct NexusOperationOptions {
     /// Endpoint name, must exist in the endpoint registry or this command will fail.
     pub endpoint: String,
@@ -724,6 +726,7 @@ pub struct NexusOperationOptions {
     /// tracing information. Note these headers are not the same as Temporal headers on internal
     /// activities and child workflows, these are transmitted to Nexus operations that may be
     /// external and are not traditional payloads.
+    #[builder(default)]
     pub nexus_header: HashMap<String, String>,
     /// Cancellation type for the operation
     pub cancellation_type: Option<NexusOperationCancellationType>,

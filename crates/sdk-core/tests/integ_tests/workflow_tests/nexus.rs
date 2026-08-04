@@ -79,13 +79,14 @@ impl NexusBasicWf {
         ctx: &mut WorkflowContext<Self>,
     ) -> WorkflowResult<Result<NexusOperationResult, Failure>> {
         match ctx
-            .start_nexus_operation(NexusOperationOptions {
-                endpoint: ctx.state(|wf| wf.endpoint.clone()),
-                service: "svc".to_string(),
-                operation: "op".to_string(),
-                schedule_to_close_timeout: Some(Duration::from_secs(3)),
-                ..Default::default()
-            })
+            .start_nexus_operation(
+                NexusOperationOptions::builder()
+                    .endpoint(ctx.state(|wf| wf.endpoint.clone()))
+                    .service("svc")
+                    .operation("op")
+                    .schedule_to_close_timeout(Duration::from_secs(3))
+                    .build(),
+            )
             .await
         {
             Ok(started) => {
@@ -254,13 +255,14 @@ impl NexusAsyncWf {
     pub(crate) async fn run(
         ctx: &mut WorkflowContext<Self>,
     ) -> WorkflowResult<NexusOperationResult> {
-        let started = ctx.start_nexus_operation(NexusOperationOptions {
-            endpoint: ctx.state(|wf| wf.endpoint.clone()),
-            service: "svc".to_string(),
-            operation: "op".to_string(),
-            schedule_to_close_timeout: ctx.state(|wf| wf.schedule_to_close_timeout),
-            ..Default::default()
-        });
+        let started = ctx.start_nexus_operation(
+            NexusOperationOptions::builder()
+                .endpoint(ctx.state(|wf| wf.endpoint.clone()))
+                .service("svc")
+                .operation("op")
+                .maybe_schedule_to_close_timeout(ctx.state(|wf| wf.schedule_to_close_timeout))
+                .build(),
+        );
         if ctx.state(|wf| wf.outcome) == Outcome::CancelAfterRecordedBeforeStarted {
             ctx.timer(Duration::from_millis(1)).await;
             started.cancel();
@@ -537,12 +539,13 @@ impl NexusCancelBeforeStartWf {
 
     #[run]
     pub(crate) async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<()> {
-        let started = ctx.start_nexus_operation(NexusOperationOptions {
-            endpoint: ctx.state(|wf| wf.endpoint.clone()),
-            service: "svc".to_string(),
-            operation: "op".to_string(),
-            ..Default::default()
-        });
+        let started = ctx.start_nexus_operation(
+            NexusOperationOptions::builder()
+                .endpoint(ctx.state(|wf| wf.endpoint.clone()))
+                .service("svc")
+                .operation("op")
+                .build(),
+        );
         started.cancel();
         let res = started.await.unwrap_err();
         assert_eq!(res.message, "Nexus Operation cancelled before scheduled");
@@ -607,12 +610,15 @@ impl NexusMustCompleteTaskWf {
     #[run]
     pub(crate) async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<()> {
         // We just need to create the command, not await it.
-        drop(ctx.start_nexus_operation(NexusOperationOptions {
-            endpoint: ctx.state(|wf| wf.endpoint.clone()),
-            service: "svc".to_string(),
-            operation: "op".to_string(),
-            ..Default::default()
-        }));
+        drop(
+            ctx.start_nexus_operation(
+                NexusOperationOptions::builder()
+                    .endpoint(ctx.state(|wf| wf.endpoint.clone()))
+                    .service("svc")
+                    .operation("op")
+                    .build(),
+            ),
+        );
         // Workflow completes right away, only having scheduled the operation. We need a timer
         // to make sure the nexus task actually gets scheduled.
         ctx.timer(Duration::from_millis(1)).await;
@@ -719,14 +725,13 @@ struct NexusCancellationCallerWf {
 impl NexusCancellationCallerWf {
     #[run(name = "nexus_cancellation_types")]
     async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<NexusOperationResult> {
-        let options = NexusOperationOptions {
-            endpoint: ctx.state(|wf| wf.endpoint.clone()),
-            service: "svc".to_string(),
-            operation: "op".to_string(),
-            schedule_to_close_timeout: ctx.state(|wf| wf.schedule_to_close_timeout),
-            cancellation_type: Some(ctx.state(|wf| wf.cancellation_type)),
-            ..Default::default()
-        };
+        let options = NexusOperationOptions::builder()
+            .endpoint(ctx.state(|wf| wf.endpoint.clone()))
+            .service("svc")
+            .operation("op")
+            .maybe_schedule_to_close_timeout(ctx.state(|wf| wf.schedule_to_close_timeout))
+            .cancellation_type(ctx.state(|wf| wf.cancellation_type))
+            .build();
         let started = ctx.start_nexus_operation(options);
         let started = started.await.unwrap();
         let result = started.result();
