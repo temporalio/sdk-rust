@@ -3107,6 +3107,237 @@ async fn old_batched_local_activity_history_replays() {
     worker.run().await.unwrap();
 }
 
+struct MixedCompletionTimesActivity {
+    release_slow: CancellationToken,
+}
+
+#[activities]
+impl MixedCompletionTimesActivity {
+    #[allow(unused)]
+    #[activity(name = DEFAULT_ACTIVITY_TYPE)]
+    async fn run(
+        self: Arc<Self>,
+        _: ActivityContext,
+        wait_for_heartbeat: bool,
+    ) -> Result<String, ActivityError> {
+        if wait_for_heartbeat {
+            self.release_slow.cancelled().await;
+        }
+        Ok("Result".to_string())
+    }
+}
+
+#[workflow]
+#[derive(Default)]
+struct MixedCompletionTimesWf;
+
+#[workflow_methods]
+impl MixedCompletionTimesWf {
+    #[run(name = DEFAULT_WORKFLOW_TYPE)]
+    async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<()> {
+        let _ = temporalio_sdk::workflows::join!(
+            ctx.execute_local_activity(
+                MixedCompletionTimesActivity::run,
+                true,
+                LocalActivityOptions::default()
+            ),
+            ctx.execute_local_activity(
+                MixedCompletionTimesActivity::run,
+                false,
+                LocalActivityOptions::default()
+            )
+        );
+        Ok(())
+    }
+}
+
+struct HeartbeatGatedActivity {
+    release: CancellationToken,
+}
+
+#[activities]
+impl HeartbeatGatedActivity {
+    #[allow(unused)]
+    #[activity(name = DEFAULT_ACTIVITY_TYPE)]
+    async fn run(self: Arc<Self>, _: ActivityContext, _: ()) -> Result<String, ActivityError> {
+        self.release.cancelled().await;
+        Ok("hi".to_string())
+    }
+}
+
+/// Verifies lookahead preserves completion order when one LA resolves before a heartbeat and the
+/// other resolves after it.
+#[rstest]
+#[tokio::test]
+async fn mixed_la_completion_times(#[values(true, false)] replay: bool) {
+    let wft_timeout = Duration::from_millis(500);
+    let mut history = TestHistoryBuilder::default();
+    history.add_wfe_started_with_wft_timeout(wft_timeout);
+    history.add_full_wf_task();
+    history.add_local_activity_result_marker(2, "2", b"Result".into());
+    history.add_full_wf_task();
+    history.add_local_activity_result_marker(1, "1", b"Result".into());
+    history.add_workflow_task_scheduled_and_started();
+
+    let mut mock_cfg = if replay {
+        MockPollCfg::from_resps(history, [ResponseType::AllHistory])
+    } else {
+        MockPollCfg::from_hist_builder(history)
+    };
+
+    let mut activation_assertions = ActivationAssertionsInterceptor::default();
+    activation_assertions
+        .skip_one()
+        .then(|activation| {
+            assert_matches!(
+                activation.jobs.as_slice(),
+                [WorkflowActivationJob {
+                    variant: Some(workflow_activation_job::Variant::ResolveActivity(resolution)),
+                }] => assert_eq!(resolution.seq, 2)
+            );
+        })
+        .then(|activation| {
+            assert_matches!(
+                activation.jobs.as_slice(),
+                [WorkflowActivationJob {
+                    variant: Some(workflow_activation_job::Variant::ResolveActivity(resolution)),
+                }] => assert_eq!(resolution.seq, 1)
+            );
+        });
+
+    let release_slow = CancellationToken::new();
+    let release_slow_after_heartbeat = release_slow.clone();
+    mock_cfg.completion_asserts_from_expectations(|mut assertions| {
+        if replay {
+            assertions.then(|completion| {
+                assert_matches!(
+                    completion.commands.as_slice(),
+                    [command] if command.command_type() == CommandType::CompleteWorkflowExecution
+                );
+            });
+        } else {
+            assertions
+                .then(move |completion| {
+                    assert_matches!(
+                        completion.commands.as_slice(),
+                        [command] if command.command_type() == CommandType::RecordMarker
+                    );
+                    // Releasing here ensures LA1 cannot complete until Core has reported the
+                    // heartbeat containing LA2's marker.
+                    release_slow_after_heartbeat.cancel();
+                })
+                .then(|completion| {
+                    assert_matches!(
+                        completion.commands.as_slice(),
+                        [marker, complete]
+                            if marker.command_type() == CommandType::RecordMarker
+                                && complete.command_type()
+                                    == CommandType::CompleteWorkflowExecution
+                    );
+                });
+        }
+    });
+
+    let mut worker = build_fake_sdk(mock_cfg);
+    worker.set_worker_interceptor(activation_assertions);
+    worker
+        .register_workflow::<MixedCompletionTimesWf>()
+        .unwrap();
+    worker.register_activities(MixedCompletionTimesActivity { release_slow });
+    worker.run().await.unwrap();
+}
+
+/// Both LAs remain outstanding through a heartbeat, then resolve in the following WFT. Replay must
+/// deliver their resolutions in marker order, even when that differs from schedule order.
+#[rstest]
+#[tokio::test]
+async fn two_las_with_heartbeat(
+    #[values(true, false)] replay: bool,
+    #[values(true, false)] complete_in_schedule_order: bool,
+) {
+    let mut history = TestHistoryBuilder::default();
+    history.add_wfe_started_with_wft_timeout(Duration::from_millis(500));
+    history.add_full_wf_task();
+    history.add_full_wf_task();
+    if complete_in_schedule_order {
+        history.add_local_activity_result_marker(1, "1", b"hi".into());
+        history.add_local_activity_result_marker(2, "2", b"hi".into());
+    } else {
+        history.add_local_activity_result_marker(2, "2", b"hi".into());
+        history.add_local_activity_result_marker(1, "1", b"hi".into());
+    }
+    history.add_workflow_task_scheduled_and_started();
+
+    let mut mock_cfg = if replay {
+        MockPollCfg::from_resps(history, [ResponseType::AllHistory])
+    } else {
+        MockPollCfg::from_hist_builder(history)
+    };
+
+    let mut activation_assertions = ActivationAssertionsInterceptor::default();
+    activation_assertions.skip_one().then(move |activation| {
+        if replay {
+            let (first_expected_seq, second_expected_seq) = if complete_in_schedule_order {
+                (1, 2)
+            } else {
+                (2, 1)
+            };
+            assert_matches!(
+                activation.jobs.as_slice(),
+                [
+                    WorkflowActivationJob {
+                        variant: Some(workflow_activation_job::Variant::ResolveActivity(first))
+                    },
+                    WorkflowActivationJob {
+                        variant: Some(workflow_activation_job::Variant::ResolveActivity(second))
+                    }
+                ] => {
+                    assert_eq!(first.seq, first_expected_seq);
+                    assert_eq!(second.seq, second_expected_seq);
+                }
+            );
+        }
+    });
+
+    let release_activities = CancellationToken::new();
+    let release_activities_after_heartbeat = release_activities.clone();
+    mock_cfg.completion_asserts_from_expectations(|mut assertions| {
+        if replay {
+            assertions.then(|completion| {
+                assert_matches!(
+                    completion.commands.as_slice(),
+                    [command] if command.command_type() == CommandType::CompleteWorkflowExecution
+                );
+            });
+        } else {
+            assertions
+                .then(move |completion| {
+                    assert!(completion.commands.is_empty());
+                    // Both activities stay blocked until the empty heartbeat WFT is reported.
+                    release_activities_after_heartbeat.cancel();
+                })
+                .then(|completion| {
+                    assert_matches!(
+                        completion.commands.as_slice(),
+                        [first_marker, second_marker, complete]
+                            if first_marker.command_type() == CommandType::RecordMarker
+                                && second_marker.command_type() == CommandType::RecordMarker
+                                && complete.command_type()
+                                    == CommandType::CompleteWorkflowExecution
+                    );
+                });
+        }
+    });
+
+    let mut worker = build_fake_sdk(mock_cfg);
+    worker.set_worker_interceptor(activation_assertions);
+    worker.register_workflow::<TwoLaWfParallel>().unwrap();
+    worker.register_activities(HeartbeatGatedActivity {
+        release: release_activities,
+    });
+    worker.run().await.unwrap();
+}
+
 struct ResolvedActivity;
 #[activities]
 impl ResolvedActivity {
