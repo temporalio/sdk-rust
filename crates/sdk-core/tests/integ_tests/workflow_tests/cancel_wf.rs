@@ -2,6 +2,7 @@ use crate::common::{ActivationAssertionsInterceptor, CoreWfStarter, build_fake_s
 use std::{sync::Arc, time::Duration};
 use temporalio_client::{
     UntypedWorkflow, WorkflowCancelOptions, WorkflowDescribeOptions, WorkflowStartOptions,
+    errors::WorkflowGetResultError,
 };
 use temporalio_common::{
     protos::{
@@ -251,11 +252,12 @@ impl CancellationPropagationParent {
         );
 
         assert_eq!(timer_result, TimerResult::Cancelled);
-        assert!(activity_result.unwrap_err().as_cancelled().is_some());
+        let activity_error = activity_result.unwrap_err();
+        assert!(activity_error.as_cancelled().is_some());
         assert!(local_activity_result.unwrap_err().as_cancelled().is_some());
         assert!(child_result.unwrap_err().as_cancelled().is_some());
         assert_eq!(condition_result.unwrap_err().reason(), Some("propagate"));
-        Err(WorkflowTermination::Cancelled)
+        Err(activity_error.into())
     }
 }
 
@@ -301,6 +303,11 @@ async fn workflow_cancellation_propagates_to_operations() {
     };
     let (_, worker_result) = tokio::join!(canceller, worker.run_until_done());
     worker_result.unwrap();
+
+    assert_matches!(
+        wf_handle.get_result(Default::default()).await,
+        Err(WorkflowGetResultError::Cancelled { .. })
+    );
 }
 
 #[workflow]

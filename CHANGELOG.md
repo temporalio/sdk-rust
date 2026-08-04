@@ -70,6 +70,10 @@ to docs, or any other relevant information.
 ### Added
 * `WorkflowCancellationToken` for deterministic cancellation of workflow operations.
 
+### Changed
+* Cancellation errors propagated after workflow cancellation now complete the workflow as cancelled
+  instead of failed.
+
 ## [0.6.0] - 2026-08-04
 
 ### Added

@@ -308,9 +308,9 @@ ctx.execute_local_activity(
 ## Cancellation
 
 Workflow operations inherit the workflow's root cancellation token by default. This includes
-timers, activities, local activities, child workflows, signals, Nexus operations, and condition
-waits. Activity cancellation may be delivered independently from heartbeating, though long-running
-activities may still wish to heartbeat with `ctx.record_heartbeat(...)` to report progress.
+timers, activities, local activities, child workflows, signals, Nexus operations, and wait
+conditions. Long-running activities should heartbeat with `ctx.record_heartbeat(...)` to ensure they
+receive cancellation notifications and report progress.
 
 ```rust
 // None inherits workflow cancellation.
