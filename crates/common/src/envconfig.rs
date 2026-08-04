@@ -209,9 +209,11 @@ pub struct LoadClientConfigProfileOptions {
 }
 
 /// Options for parsing TOML configuration
-#[derive(Debug, Default)]
+#[derive(Debug, Default, bon::Builder)]
+#[non_exhaustive]
 pub struct ClientConfigFromTOMLOptions {
     /// If true, will error if there are unrecognized keys.
+    #[builder(default)]
     pub strict: bool,
 }
 
@@ -298,9 +300,9 @@ fn load_client_config_inner(
     if let Some(data) = toml_data {
         ClientConfig::from_toml(
             &data,
-            ClientConfigFromTOMLOptions {
-                strict: options.config_file_strict,
-            },
+            ClientConfigFromTOMLOptions::builder()
+                .strict(options.config_file_strict)
+                .build(),
         )
     } else {
         Ok(ClientConfig::default())
@@ -1418,7 +1420,9 @@ unrecognized_field = "is-bad"
 "#;
         let err = ClientConfig::from_toml(
             toml_str.as_bytes(),
-            ClientConfigFromTOMLOptions { strict: true },
+            ClientConfigFromTOMLOptions::builder()
+                .strict(true)
+                .build(),
         )
         .unwrap_err();
         let err_str = err.to_string();
@@ -1433,7 +1437,9 @@ foo = "bar"
 "#;
         let err = ClientConfig::from_toml(
             toml_str.as_bytes(),
-            ClientConfigFromTOMLOptions { strict: true },
+            ClientConfigFromTOMLOptions::builder()
+                .strict(true)
+                .build(),
         )
         .unwrap_err();
         let err_str = err.to_string();
