@@ -17,56 +17,27 @@ to docs, or any other relevant information.
 
 # Changelog
 
-## [0.5.0]
+## Unreleased
+
+## [0.6.0] - 2026-08-04
 
 ### Added
-* Workers are now automatically enrolled into poller autoscaling when the namespace advertises the
-  `poller_autoscaling_auto_enroll` capability. This only applies to poller types left at their
-  default (the worker set neither a fixed poller count nor a poller behavior); explicitly
-  configured pollers are left unchanged.
-* `client()` and `workflow_handle()` helpers to `ActivityContext` for easily obtaining a Temporal client
-* Exposed `backoff_start_interval` when continuing as new, which will delay the first task of the
-  continued workflow by the configured interval.
-* The `tls-ring` / `tls-aws-lc` features now also select the TLS crypto backend for the OTLP metric
-  exporter (in addition to the gRPC service client). Previously the OTLP exporter hardcoded the `ring`
-  backend regardless of the selected feature, which prevented producing a `ring`-free, `aws-lc-rs`-only
-  (FIPS-capable) build. Building with `--no-default-features --features tls-aws-lc,otel` now yields a
-  dependency tree free of `ring`.
-
-### Fixed
-* `GetSystemInfo` connection initialization now only falls back to empty server capabilities when
-  `UNIMPLEMENTED` indicates the RPC method is missing. Other `UNIMPLEMENTED` responses are
-  reported as connection errors.
-* Connection initialization now retries once with gRPC compression disabled if the eager
-  `GetSystemInfo` call fails because the server cannot decompress gzip.
-* Awaiting a Nexus operation's result (`StartedNexusOperation::result()`) no longer trips
-  nondeterminism detection ("a waker was invoked by a non-SDK source", TMPRL1100) on replay. The
-  result future is a `Shared`, whose internal waker machinery must be polled inside an `SdkWakeGuard`
-  (as `join_all` already is); it now is. Previously, a workflow that awaited a Nexus operation result
-  and then kept running (e.g. parked on a `wait_condition`) would fail its workflow task whenever it
-  was replayed — breaking queries and durable recovery for that execution.
-
-### Security
-* Replaced the unmaintained `backoff` dependency with `backon` for exponential retry and poll
-  backoff, clearing [RUSTSEC-2025-0012](https://rustsec.org/advisories/RUSTSEC-2025-0012) from
-  downstream security audits. Retry timing is preserved: exponential growth,
-  `randomization_factor` jitter, and the total retry-time budget behave as before.
-
-### Breaking Changes
-* The `ActivityContext` constructor now requires `ClientOptions`.
-* `WorkerConfig::{workflow,activity,nexus}_task_poller_behavior` and the corresponding Rust SDK
-  `WorkerOptions` fields are now `Option<PollerBehavior>`. `None` means the poller was not explicitly
-  configured and is eligible for automatic enrollment into poller autoscaling.
-### Breaking Changes
-
-- Rust SDK `ApplicationFailure` and `WorkflowError` APIs now use boxed `std::error::Error` values instead of
-  `anyhow::Error`.
-
-## [Unreleased]
-
-### Added
+* `UntypedActivity` for invoking activities by a runtime activity type name with raw input and
+  output payloads.
+* Typed search attributes through `SearchAttributeKey`, `SearchAttributeUpdate`,
+  `SearchAttributes`, and `Timestamp`. Workflow starts, child workflows, continue-as-new,
+  workflow reads, and upserts now share this type-safe API.
+* `ClientInterceptor` for observing, transforming, or short-circuiting high-level workflow,
+  schedule, and async-activity client operations. Per-call `RpcOptions` can set gRPC metadata,
+  timeouts, and retry behavior.
+* `CoreRuntime` is now re-exported from `temporalio_sdk` as `Runtime`, with the remaining Core
+  runtime and worker configuration types under `temporalio_sdk::runtime`, so workers no
+  longer need a direct `temporalio-sdk-core` dependency. `Url` is also re-exported from
+  `temporalio_client`.
 * Workers can configure the maximum number of activity slots reserved for eager execution per
   workflow task with `WorkerOptions::max_eager_activity_reservations_per_workflow_task`.
+* `WorkflowInterceptor` for observing, transforming, or short-circuiting inbound workflow calls
+  and outbound operations.
 * Schedule descriptions now expose their configured action via `ScheduleDescription::action()`,
   including start-workflow accessors for workflow type, task queue, workflow ID, raw argument
   payloads, and typed argument decoding through the client's data converter.
@@ -75,15 +46,29 @@ to docs, or any other relevant information.
 * `WorkflowContext::random` and `WorkflowContext::uuid4` for deterministic randomness in workflow.
 * `ChildWorkflowOptions::builder` and `ChildWorkflowOptions::workflow_id` for constructing
   child workflow options.
-* Added `connect_timeout: Option<Duration>` to ConnectionOptions and implemented in 
-  `Connection::connect_once()`, `dns::build_endpoint()` and `dns::create_balanced_channel()`.
+* Added `connect_timeout: Option<Duration>` to `ConnectionOptions`.
+* `ResourceController` and `ResourceBasedTunerConfig` allow resource controllers to be shared
+  across multiple resource-based tuners.
+* Workers are now automatically enrolled into poller autoscaling when the namespace advertises the
+  `poller_autoscaling_auto_enroll` capability. This only applies to poller types left at their
+  default (the worker set neither a fixed poller count nor a poller behavior); explicitly
+  configured pollers are left unchanged.
+* Updated the bundled Temporal API definitions through API 1.63.4
 
 ### Changed
- * Renamed `start_activity` and `start_local_activity` to `execute_activity` and `execute_local_activity`
-   to better explain semantics. Original methods remain as deprecated aliases for the new execute
-   variants.
+* Renamed `start_activity` and `start_local_activity` to `execute_activity` and
+  `execute_local_activity` to better explain semantics. Original methods remain as deprecated
+  aliases for the new execute variants.
+* `#[workflow(name = ...)]` is now rejected at compile time because it did not override the
+  workflow type name. Use `#[run(name = ...)]` instead.
 
-### Breaking Changes
+### Breaking Changes :boom:
+* `ActivityDefinition::name` is now an instance method returning `&str` instead of an associated
+  function returning `&'static str`. Manual implementations must update their method signature.
+* `WorkflowStartOptions::search_attributes`, `ChildWorkflowOptions::search_attributes`, and
+  `ContinueAsNewOptions::search_attributes` now use typed `SearchAttributes` instead of raw maps or
+  protobuf values. `WorkflowContext::upsert_search_attributes` now accepts
+  `SearchAttributeUpdate` values.
 * `WorkflowExecution::search_attributes`, `WorkflowExecutionDescription::search_attributes`,
   `ScheduleDescription::search_attributes`, and `ScheduleSummary::search_attributes` now return
   typed `SearchAttributes` instead of raw proto search attributes. Missing search attributes are
@@ -112,12 +97,18 @@ to docs, or any other relevant information.
 * Workflow memo reads use the typed `Memo` collection. Upserts accept maps of optional
   `MemoValue`s, where `None` removes a key, and continue-as-new memo replacements use
   `MemoValues`.
+* `ContinueAsNewOptions::headers` has been removed. Workflow interceptors can inspect or modify
+  continue-as-new headers through `ContinueAsNewInput`.
 * Removed the raw-protobuf `Namespace::into_describe_namespace_request` and
   `WorkerTaskTypes::to_task_queue_types` helpers. These conversions are now internal plumbing.
+* `ActivityContext::new` and the raw-protobuf `WorkflowExecution::new` constructor are no longer public.
 * `WorkflowContext::workflow_initial_info` and its synchronous counterpart are replaced by
   `info()`, which returns the Rust-native `WorkflowContextView` and includes typed workflow
   priority. The internal `BaseWorkflowContext::new` raw-protobuf boundary is now explicitly named
   `from_raw`.
+* `WorkflowContextView` fields are now private and exposed through accessors. Parent workflow
+  information now uses `NamespacedWorkflowInfo`, and root workflow information uses
+  `WorkflowExecution`.
 * Workflow count aggregation groups now provide positional typed `get` and `try_get` accessors
   for search attribute group values over raw payload access.
 * Payload/memo size-limit enforcement (experimental), on by default. Workers now proactively
@@ -130,6 +121,10 @@ to docs, or any other relevant information.
   recover. A deterministically-oversized completion now retries per its retry policy rather than
   failing fast. Tune warn thresholds via `PayloadLimitsOptions`. Opt out of worker error enforcement
   with `WorkerOptions::disable_payload_error_limit`.
+* Most of the low-level `temporalio_common::payload_limits` validation API is now internal,
+  including the sink/validation traits, `CollectingSink`, and sizing helpers. `PayloadLimits` error
+  thresholds are now byte counts where zero disables enforcement, rather than `Option<usize>`, and
+  its default now disables all thresholds.
 * `WorkflowContext::random_seed()` and `SyncWorkflowContext::random_seed()` have been removed.
   Use `random::<T>()` or `uuid4()` for deterministic workflow randomness instead.
 * `ChildWorkflowOptions::workflow_id` is now `Option<String>`. Wrap explicit IDs in `Some(...)`;
@@ -137,8 +132,18 @@ to docs, or any other relevant information.
 * `ChildWorkflowOptions` is now tagged with `#[non_exhaustive]` so additional fields will not be breaking
   changes. Users should switch to `ChildWorkflowOptions::builder()` for constructing these options.
 * `PayloadCodec::{encode, decode}` now return `Result<_, PayloadConversionError>`, allowing codecs to fail.
+* `TunerHolderOptions::resource_based_options` has been replaced by
+  `resource_based_config: Option<ResourceBasedTunerConfig>`.
+* `WorkerConfig::{workflow,activity,nexus}_task_poller_behavior` and the corresponding Rust SDK
+  `WorkerOptions` fields are now `Option<PollerBehavior>`. `None` means the poller was not explicitly
+  configured and is eligible for automatic enrollment into poller autoscaling.
+* High-level client methods that previously had no per-call controls now require `RpcOptions` or a
+  new options type. This includes schedule handle operations, async-activity completion, failure,
+  cancellation, and heartbeat, and `WorkflowUpdateHandle::get_result`.
 
 ### Fixed
+* `RuntimeOptions::default()` now uses the same 60-second worker heartbeat interval as the
+  builder default.
 * Workflow tasks no longer livelock when a burst of ready async operations exhausts Tokio's
   cooperative scheduling budget.
 * OTLP metric export failures are now logged through Core telemetry when OpenTelemetry's periodic
@@ -148,3 +153,51 @@ to docs, or any other relevant information.
 * `WorkflowContext::force_task_fail` calls will be respected over a completion if both happen in the same poll
 * Workers no longer advertise a worker control task queue unless the namespace supports worker
   heartbeats and commands and the built-in Nexus command worker is running.
+* `GetSystemInfo` connection initialization now only falls back to empty server capabilities when
+  `UNIMPLEMENTED` indicates the RPC method is missing, including the message format produced by
+  Node gRPC servers. Other `UNIMPLEMENTED` responses are reported as connection errors.
+* Connection initialization now retries once with gRPC compression disabled if the eager
+  `GetSystemInfo` call fails because the server cannot decompress gzip.
+* SDK flags already recorded in workflow history are honored even when current server capabilities
+  do not advertise SDK metadata support.
+* C-bridge worker shutdown no longer intermittently fails finalization because an asynchronous
+  poll, completion, or validation callback still holds a worker reference.
+* The `task_slots_used` metric no longer reports a stale, off-by-one value when a task slot is
+  released.
+* The internal Nexus worker-command poller no longer sends unsupported worker-versioning metadata.
+* Resource-based tuners running in cgroups now gate slot admission on anonymous memory instead of
+  total current memory, so reclaimable page cache does not permanently starve slot admission.
+* Worker shutdown waits for local activities already queued for dispatch instead of dropping them.
+* Failed workflow-history fetches that finish after zero-cache eviction now fail the workflow task
+  with its preserved task token instead of dropping the token and blocking subsequent polls.
+
+### Security
+* Replaced the unmaintained `backoff` dependency with `backon` for exponential retry and poll
+  backoff, clearing [RUSTSEC-2025-0012](https://rustsec.org/advisories/RUSTSEC-2025-0012) from
+  downstream security audits. Retry timing is preserved: exponential growth,
+  `randomization_factor` jitter, and the total retry-time budget behave as before.
+
+## [0.5.0]
+
+### Added
+* `client()` and `workflow_handle()` helpers to `ActivityContext` for easily obtaining a Temporal client
+* Exposed `backoff_start_interval` when continuing as new, which will delay the first task of the
+  continued workflow by the configured interval.
+* The `tls-ring` / `tls-aws-lc` features now also select the TLS crypto backend for the OTLP metric
+  exporter (in addition to the gRPC service client). Previously the OTLP exporter hardcoded the `ring`
+  backend regardless of the selected feature, which prevented producing a `ring`-free, `aws-lc-rs`-only
+  (FIPS-capable) build. Building with `--no-default-features --features tls-aws-lc,otel` now yields a
+  dependency tree free of `ring`.
+
+### Fixed
+* Awaiting a Nexus operation's result (`StartedNexusOperation::result()`) no longer trips
+  nondeterminism detection ("a waker was invoked by a non-SDK source", TMPRL1100) on replay. The
+  result future is a `Shared`, whose internal waker machinery must be polled inside an `SdkWakeGuard`
+  (as `join_all` already is); it now is. Previously, a workflow that awaited a Nexus operation result
+  and then kept running (e.g. parked on a `wait_condition`) would fail its workflow task whenever it
+  was replayed — breaking queries and durable recovery for that execution.
+
+### Breaking Changes
+* The `ActivityContext` constructor now requires `ClientOptions`.
+* Rust SDK `ApplicationFailure` and `WorkflowError` APIs now use boxed `std::error::Error` values instead of
+  `anyhow::Error`.

@@ -111,12 +111,13 @@ impl WFTExtractor {
                         // failure. We'll just proceed with shutdown.
                         HistoryFetchReq::Full(req, rc) => {
                             let run_id = req.original_wft.work.execution.run_id.clone();
+                            let task_token = req.original_wft.work.task_token.clone();
                             match HistoryPaginator::from_fetchreq(req, client).await {
                                 Ok(r) => WFTExtractorOutput::FetchResult(r, rc),
                                 Err(err) => WFTExtractorOutput::FailedFetch {
                                     run_id,
                                     err,
-                                    auto_reply_fail_tt: None,
+                                    auto_reply_fail_tt: Some(task_token),
                                 },
                             }
                         }

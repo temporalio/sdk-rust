@@ -1213,8 +1213,9 @@ mod tests {
 
         assert!(
             diff < 0.2,
-            "RealSysInfo used_mem_percentage should be ~= {}%",
-            expected_percentage * 100.0
+            "RealSysInfo used_mem_percentage should be ~= {}% but was {}",
+            expected_percentage * 100.0,
+            percentage * 100.0
         );
     }
 

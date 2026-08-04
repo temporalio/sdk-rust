@@ -35,6 +35,7 @@ impl WorkflowInstance for WasmTaskFailureWorkflow {
     fn activate(
         &mut self,
         activation: temporalio_workflow::runtime::types::WorkflowActivation,
+        _waker: &std::task::Waker,
     ) -> Result<ActivationResult, WorkflowFailure> {
         Ok(ActivationResult {
             job_results: activation
@@ -75,6 +76,7 @@ impl WorkflowInstance for WasmTaskFailureWorkflow {
                 },
             ))),
             made_progress: true,
+            pending_state: None,
         })
     }
 }

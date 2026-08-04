@@ -7,10 +7,12 @@ use std::task::Waker;
 
 /// Runtime-facing single-workflow execution interface for native and WASM backends.
 pub trait WorkflowInstance {
-    /// Apply one ordered workflow activation without polling any routines.
+    /// Apply one ordered workflow activation, using the provided waker for any construction-only
+    /// interceptor polls.
     fn activate(
         &mut self,
         activation: WorkflowActivation,
+        waker: &Waker,
     ) -> Result<ActivationResult, WorkflowFailure>;
     /// Poll exactly one guest routine, using the provided waker for native integrations that need
     /// wake tracking.

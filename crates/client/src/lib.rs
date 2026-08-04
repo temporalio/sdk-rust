@@ -64,6 +64,7 @@ pub use replaceable::SharedReplaceableClient;
 pub use retry::RetryOptions;
 pub use rpc_options::{RpcMetadata, RpcMetadataError, RpcOptions};
 pub use temporalio_common::{Memo, RetryPolicy};
+pub use url::Url;
 /// Potentially dangerous TLS related functionality.
 pub mod danger {
     /// Re-export the `ServerCertVerifier` trait so that users can implement custom TLS

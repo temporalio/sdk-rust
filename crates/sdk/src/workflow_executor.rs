@@ -60,8 +60,8 @@ impl Wake for PerPollWakeTracker {
 
 struct ExecutorShared {
     ready_queue: parking_lot::Mutex<VecDeque<u64>>,
-    /// Waker to notify when tasks are enqueued. Set by `shutdown` so it can park instead of
-    /// busy-polling when tasks are waiting on external events.
+    /// Waker to notify when tasks are enqueued so the driver can park while tasks wait on external
+    /// events.
     waker: parking_lot::Mutex<Option<Waker>>,
 }
 
@@ -209,6 +209,15 @@ impl WorkflowExecutor {
         self.tasks.borrow().is_empty()
     }
 
+    pub(crate) async fn drive(&self) {
+        std::future::poll_fn(|cx| {
+            *self.shared.waker.lock() = Some(cx.waker().clone());
+            self.process_tasks();
+            Poll::<()>::Pending
+        })
+        .await
+    }
+
     /// Keep draining until no tasks remain because workflow shutdown must flush spawned handlers
     /// before the activation can be considered quiescent.
     pub(crate) async fn shutdown(&self) {
@@ -311,22 +320,25 @@ mod tests {
         local
             .run_until(async {
                 let executor = WorkflowExecutor::new();
-
-                // Spawn a task and drain it. The oneshot isn't ready yet so the
-                // task will park.
                 let (tx, rx) = oneshot::channel::<()>();
+                let (polled_tx, polled_rx) = oneshot::channel::<()>();
                 let handle = executor.spawn(async move {
+                    polled_tx.send(()).unwrap();
                     rx.await.unwrap();
                     42
                 });
-                executor.process_tasks();
 
-                // Resolve the oneshot, then drain again to complete the task.
-                tx.send(()).unwrap();
-                executor.process_tasks();
-
-                let result = handle.await.unwrap();
-                assert_eq!(result, 42);
+                tokio::select! {
+                    // Keep polling executor to make sure we make progress
+                    _ = executor.drive() => unreachable!("executor driver cannot finish"),
+                    result = async {
+                        // Ensure spawned task has started and is waiting
+                        polled_rx.await.unwrap();
+                        // Release spawned task
+                        tx.send(()).unwrap();
+                        handle.await.unwrap()
+                    } => assert_eq!(result, 42),
+                }
             })
             .await;
     }

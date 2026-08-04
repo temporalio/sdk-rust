@@ -134,6 +134,10 @@ message WorkflowExecutionExtendedInfo {
 
     // Information about the workflow execution pause operation.
     WorkflowExecutionPauseInfo pause_info = 8;
+
+    // Information about time skipping of the workflow execution.
+    // If the execution has never enabled time skipping, it will be nil.
+    temporal.api.common.v1.TimeSkippingInfo time_skipping_info = 9;
 }
 
 // Holds all the information about worker versioning for a particular workflow execution.

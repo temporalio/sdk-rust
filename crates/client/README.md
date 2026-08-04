@@ -54,9 +54,8 @@ supported variables and the TOML file format.
 ```rust
 use temporalio_client::{
     Client, ClientOptions, Connection, ConnectionOptions,
-    WorkflowOptions, GetWorkflowResultOptions,
+    WorkflowOptions, GetWorkflowResultOptions, Url,
 };
-use temporalio_sdk_core::{Url, CoreRuntime, RuntimeOptions};
 use std::str::FromStr;
 
 #[tokio::main]

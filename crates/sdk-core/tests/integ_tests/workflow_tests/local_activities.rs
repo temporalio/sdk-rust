@@ -2465,22 +2465,22 @@ async fn local_activities_can_be_delivered_during_shutdown() {
     .await
     .unwrap();
 
-    let wf_poller = async { core.poll_workflow_activation().await };
+    assert_matches!(
+        core.poll_workflow_activation().await.unwrap_err(),
+        PollError::ShutDown
+    );
 
-    let at_poller = async {
-        let act_task = core.poll_activity_task().await.unwrap();
-        core.complete_activity_task(ActivityTaskCompletion {
-            task_token: act_task.task_token,
-            result: Some(ActivityExecutionResult::ok(vec![1].into())),
-        })
-        .await
-        .unwrap();
-        core.poll_activity_task().await
-    };
-
-    let (wf_r, act_r) = join!(wf_poller, at_poller);
-    assert_matches!(wf_r.unwrap_err(), PollError::ShutDown);
-    assert_matches!(act_r.unwrap_err(), PollError::ShutDown);
+    let act_task = core.poll_activity_task().await.unwrap();
+    core.complete_activity_task(ActivityTaskCompletion {
+        task_token: act_task.task_token,
+        result: Some(ActivityExecutionResult::ok(vec![1].into())),
+    })
+    .await
+    .unwrap();
+    assert_matches!(
+        core.poll_activity_task().await.unwrap_err(),
+        PollError::ShutDown
+    );
 }
 
 #[tokio::test]

@@ -896,13 +896,13 @@ async fn history_length_with_fail_and_timeout(
     #[values(true, false)] use_cache: bool,
     #[values(1, 2, 3)] history_responses_case: u8,
 ) {
-    if !use_cache && history_responses_case == 3 {
-        eprintln!(
-            "Skipping history_length_with_fail_and_timeout::use_cache_2_false::history_responses_case_3_3 due to flaky hang"
-        );
-        return;
-    }
     let wfid = "fake_wf_id";
+    // This variant combines a zero-sized cache with a malformed paginated response. Delay that
+    // response until the first WFT's automatic eviction has removed the run, forcing Core to
+    // handle the failed fetch without a cached run. Core must still fail the WFT task token;
+    // otherwise the mock server withholds later responses and the worker hangs.
+    let force_failed_fetch_after_eviction = !use_cache && history_responses_case == 3;
+    let allow_failed_fetch = CancellationToken::new();
     let mut t = TestHistoryBuilder::default();
     t.add_by_type(EventType::WorkflowExecutionStarted);
     t.add_full_wf_task();
@@ -931,7 +931,14 @@ async fn history_length_with_fail_and_timeout(
             needs_fetch.next_page_token = vec![1];
             // Truncate the history a bit in order to force incomplete WFT
             needs_fetch.history.as_mut().unwrap().events.truncate(6);
-            let needs_fetch_resp = ResponseType::Raw(needs_fetch);
+            let needs_fetch_resp = if force_failed_fetch_after_eviction {
+                ResponseType::UntilResolvedRaw(
+                    allow_failed_fetch.clone().cancelled_owned().boxed(),
+                    needs_fetch,
+                )
+            } else {
+                ResponseType::Raw(needs_fetch)
+            };
             let mut empty_fetch_resp: GetWorkflowExecutionHistoryResponse =
                 t.get_history_info(1).unwrap().into();
             empty_fetch_resp.history.as_mut().unwrap().events = vec![];
@@ -977,7 +984,39 @@ async fn history_length_with_fail_and_timeout(
     }
 
     worker.register_workflow::<HistoryLengthWf>().unwrap();
-    worker.run_until_done().await.unwrap();
+    if force_failed_fetch_after_eviction {
+        struct FirstCompletionNotifier(CancellationToken);
+
+        #[async_trait::async_trait(?Send)]
+        impl WorkerInterceptor for FirstCompletionNotifier {
+            async fn on_workflow_activation_completion(
+                &self,
+                _completion: &WorkflowActivationCompletion,
+            ) {
+                self.0.cancel();
+            }
+        }
+
+        let core = worker.core_worker();
+        let first_completion = CancellationToken::new();
+        let wait_for_eviction = async {
+            first_completion.cancelled().await;
+            while core.cached_workflows().await != 0 {
+                tokio::task::yield_now().await;
+            }
+            allow_failed_fetch.cancel();
+        };
+        let run_worker = worker
+            .run_until_done_intercepted(Some(FirstCompletionNotifier(first_completion.clone())));
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(run_worker, wait_for_eviction).0.unwrap();
+        })
+        .await
+        .expect("worker should fail the workflow task after the history fetch fails");
+    } else {
+        worker.run_until_done().await.unwrap();
+    }
 }
 
 #[allow(deprecated)]

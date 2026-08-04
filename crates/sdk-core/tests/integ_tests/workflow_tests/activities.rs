@@ -2034,7 +2034,7 @@ async fn long_activity_timeout_repro() {
                 ctx.timer(Duration::from_secs(60 * 3)).await;
                 iter += 1;
                 if iter > 5000 {
-                    ctx.continue_as_new(&(), Default::default())?;
+                    ctx.continue_as_new((), Default::default())?;
                 }
             }
         }

@@ -392,6 +392,7 @@ impl ActivityOptions {
         seq: u32,
         activity_type: String,
         args: Vec<Payload>,
+        headers: HashMap<String, Payload>,
     ) -> WorkflowCommand {
         let (start_to_close_timeout, schedule_to_close_timeout) =
             self.close_timeouts.into_durations();
@@ -402,6 +403,7 @@ impl ActivityOptions {
                 activity_id: self.activity_id.unwrap_or_else(|| seq.to_string()),
                 task_queue: self.task_queue.unwrap_or_default(),
                 arguments: args,
+                headers,
                 schedule_to_close_timeout: schedule_to_close_timeout
                     .and_then(|duration| duration.try_into().ok()),
                 schedule_to_start_timeout: self
@@ -471,6 +473,7 @@ impl LocalActivityOptions {
         seq: u32,
         activity_type: String,
         args: Vec<Payload>,
+        headers: HashMap<String, Payload>,
     ) -> WorkflowCommand {
         // Tests and some workflow code rely on the historical SDK behavior where omitted local
         // activity timeouts are normalized before the command is emitted.
@@ -482,6 +485,7 @@ impl LocalActivityOptions {
                 activity_type,
                 activity_id: self.activity_id.unwrap_or_else(|| seq.to_string()),
                 arguments: args,
+                headers,
                 retry_policy: Some(self.retry_policy.into()),
                 attempt: self.attempt.unwrap_or(1),
                 original_schedule_time: self.original_schedule_time,
@@ -498,7 +502,6 @@ impl LocalActivityOptions {
                 start_to_close_timeout: self
                     .start_to_close_timeout
                     .and_then(|duration| duration.try_into().ok()),
-                ..Default::default()
             }),
             self.summary,
             None,
@@ -556,6 +559,7 @@ impl ChildWorkflowOptions {
         seq: u32,
         workflow_type: String,
         args: Vec<Payload>,
+        headers: HashMap<String, Payload>,
         workflow_id: String,
     ) -> WorkflowCommand {
         command_with_metadata(
@@ -565,6 +569,7 @@ impl ChildWorkflowOptions {
                 workflow_id,
                 task_queue: self.task_queue.unwrap_or_default(),
                 input: args,
+                headers,
                 cancellation_type: ProtoChildWorkflowCancellationType::from(self.cancel_type)
                     .into(),
                 parent_close_policy: ProtoParentClosePolicy::from(self.parent_close_policy).into(),
@@ -823,8 +828,6 @@ pub struct ContinueAsNewOptions {
     pub backoff_start_interval: Option<Duration>,
     /// If set, the new workflow will have these memo values. If `None`, reuses the current memo.
     pub memo: Option<MemoValues>,
-    /// If set, the new workflow will have these headers.
-    pub headers: Option<HashMap<String, Payload>>,
     /// If set, the new workflow will have these search attributes. If `None`, reuses the current
     /// search attributes.
     pub search_attributes: Option<SearchAttributes>,
@@ -846,6 +849,7 @@ impl ContinueAsNewOptions {
         self,
         workflow_type: String,
         arguments: Vec<Payload>,
+        headers: HashMap<String, Payload>,
         payload_converter: &PayloadConverter,
     ) -> Result<ContinueAsNewRequest, PayloadConversionError> {
         let memo = self
@@ -867,7 +871,7 @@ impl ContinueAsNewOptions {
                 .backoff_start_interval
                 .and_then(|duration| duration.try_into().ok()),
             memo,
-            headers: self.headers.unwrap_or_default(),
+            headers,
             search_attributes: self.search_attributes.map(|t| t.into_proto()),
             retry_policy: self.retry_policy.map(Into::into),
             versioning_intent: ProtoVersioningIntent::from(
@@ -940,6 +944,7 @@ mod tests {
             1,
             "child".to_string(),
             vec![],
+            HashMap::new(),
             "child-id".to_string(),
         );
         let Some(workflow_command::Variant::StartChildWorkflowExecution(command)) = command.variant
@@ -976,6 +981,7 @@ mod tests {
         .into_request(
             "test-workflow".to_string(),
             vec![],
+            HashMap::new(),
             &PayloadConverter::default(),
         )
         .unwrap();
@@ -1025,7 +1031,7 @@ mod tests {
         })
         .cancellation_type(ActivityCancellationType::Abandon)
         .build()
-        .into_command(7, "test".to_string(), vec![]);
+        .into_command(7, "test".to_string(), vec![], HashMap::new());
         let Some(workflow_command::Variant::ScheduleActivity(req)) = req.variant else {
             panic!("expected ScheduleActivity command");
         };
@@ -1048,7 +1054,13 @@ mod tests {
             run_timeout: Some(Duration::from_secs(10)),
             ..Default::default()
         };
-        let command = opts.into_command(1, "TestWorkflow".to_string(), vec![], "test-wf".into());
+        let command = opts.into_command(
+            1,
+            "TestWorkflow".to_string(),
+            vec![],
+            HashMap::new(),
+            "test-wf".into(),
+        );
         let Some(workflow_command::Variant::StartChildWorkflowExecution(req)) = command.variant
         else {
             panic!("expected StartChildWorkflowExecution command");
@@ -1078,7 +1090,13 @@ mod tests {
             execution_timeout: Some(Duration::from_secs(60)),
             ..Default::default()
         };
-        let command = opts.into_command(1, "TestWorkflow".to_string(), vec![], "test-wf".into());
+        let command = opts.into_command(
+            1,
+            "TestWorkflow".to_string(),
+            vec![],
+            HashMap::new(),
+            "test-wf".into(),
+        );
         let Some(workflow_command::Variant::StartChildWorkflowExecution(req)) = command.variant
         else {
             panic!("expected StartChildWorkflowExecution command");
