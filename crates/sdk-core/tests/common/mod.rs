@@ -225,13 +225,14 @@ async fn get_cloud_client_with_compression(compression: GrpcCompression) -> Clie
         .client_name("sdk-core-integ-tests")
         .client_version("clientver")
         .identity("sdk-test-client")
-        .tls_options(TlsOptions {
-            client_tls_options: Some(ClientTlsOptions {
-                client_cert,
-                client_private_key,
-            }),
-            ..Default::default()
-        })
+        .tls_options(
+            TlsOptions::builder()
+                .client_tls_options(ClientTlsOptions {
+                    client_cert,
+                    client_private_key,
+                })
+                .build(),
+        )
         .grpc_compression(compression)
         .build();
     let connection = Connection::connect(connection_opts).await.unwrap();
@@ -846,15 +847,15 @@ pub(crate) fn get_integ_tls_config() -> Option<TlsOptions> {
         let root = std::fs::read("../.cloud_certs/ca.pem").unwrap();
         let client_cert = std::fs::read("../.cloud_certs/client.pem").unwrap();
         let client_private_key = std::fs::read("../.cloud_certs/client.key").unwrap();
-        Some(TlsOptions {
-            server_root_ca_cert: Some(root),
-            domain: None,
-            client_tls_options: Some(ClientTlsOptions {
-                client_cert,
-                client_private_key,
-            }),
-            server_cert_verifier: None,
-        })
+        Some(
+            TlsOptions::builder()
+                .server_root_ca_cert(root)
+                .client_tls_options(ClientTlsOptions {
+                    client_cert,
+                    client_private_key,
+                })
+                .build(),
+        )
     } else {
         None
     }

@@ -33,6 +33,8 @@ to docs, or any other relevant information.
   construct retry options.
 * `HttpConnectProxyOptions` is now tagged with `#[non_exhaustive]`. Use
   `HttpConnectProxyOptions::new(target_addr)` to construct proxy options.
+* `TlsOptions` is now tagged with `#[non_exhaustive]`. Use `TlsOptions::builder()` to construct
+  TLS options.
 
 ## [0.6.0] - 2026-08-04
 

@@ -85,12 +85,11 @@ fn build_tls_options(tls: ClientConfigTLS) -> Result<TlsOptions, ConfigError> {
         .transpose()
         .map_err(|e| ConfigError::LoadError(e.into()))?;
 
-    Ok(TlsOptions {
-        server_root_ca_cert,
-        domain: tls.server_name,
-        client_tls_options,
-        server_cert_verifier: None,
-    })
+    Ok(TlsOptions::builder()
+        .maybe_server_root_ca_cert(server_root_ca_cert)
+        .maybe_domain(tls.server_name)
+        .maybe_client_tls_options(client_tls_options)
+        .build())
 }
 
 /// Determine whether TLS should be enabled based on the profile's TLS config and API key.

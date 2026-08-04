@@ -169,7 +169,8 @@ pub enum GrpcCompression {
 }
 
 /// Configuration options for TLS
-#[derive(Clone, Default)]
+#[derive(Clone, Default, bon::Builder)]
+#[non_exhaustive]
 pub struct TlsOptions {
     /// Bytes representing the root CA certificate used by the server. If not set, and the server's
     /// cert is issued by someone the operating system trusts, verification will still work (ex:

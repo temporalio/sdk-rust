@@ -1484,28 +1484,28 @@ impl TryFrom<&ClientTlsOptions> for temporalio_client::TlsOptions {
     type Error = anyhow::Error;
 
     fn try_from(opts: &ClientTlsOptions) -> anyhow::Result<Self> {
-        Ok(temporalio_client::TlsOptions {
-            server_root_ca_cert: opts.server_root_ca_cert.to_option_vec(),
-            domain: opts.domain.to_option_string(),
-            client_tls_options: match (
-                opts.client_cert.to_option_vec(),
-                opts.client_private_key.to_option_vec(),
-            ) {
-                (None, None) => None,
-                (Some(client_cert), Some(client_private_key)) => {
-                    Some(temporalio_client::ClientTlsOptions {
-                        client_cert,
-                        client_private_key,
-                    })
-                }
-                _ => {
-                    return Err(anyhow::anyhow!(
-                        "Must have both client cert and private key or neither"
-                    ));
-                }
-            },
-            server_cert_verifier: None,
-        })
+        let client_tls_options = match (
+            opts.client_cert.to_option_vec(),
+            opts.client_private_key.to_option_vec(),
+        ) {
+            (None, None) => None,
+            (Some(client_cert), Some(client_private_key)) => {
+                Some(temporalio_client::ClientTlsOptions {
+                    client_cert,
+                    client_private_key,
+                })
+            }
+            _ => {
+                return Err(anyhow::anyhow!(
+                    "Must have both client cert and private key or neither"
+                ));
+            }
+        };
+        Ok(temporalio_client::TlsOptions::builder()
+            .maybe_server_root_ca_cert(opts.server_root_ca_cert.to_option_vec())
+            .maybe_domain(opts.domain.to_option_string())
+            .maybe_client_tls_options(client_tls_options)
+            .build())
     }
 }
 

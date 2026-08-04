@@ -1915,11 +1915,10 @@ mod tests {
 
         #[tokio::test]
         async fn add_tls_to_channel_with_custom_verifier() {
-            let tls_opts = TlsOptions {
-                server_cert_verifier: Some(Arc::new(MockVerifier)),
-                domain: Some("test.temporal.io".to_string()),
-                ..Default::default()
-            };
+            let tls_opts = TlsOptions::builder()
+                .server_cert_verifier(Arc::new(MockVerifier))
+                .domain("test.temporal.io".to_string())
+                .build();
             let endpoint = tonic::transport::Channel::from_static("https://test.temporal.io:7233");
             let result = add_tls_to_channel(Some(&tls_opts), endpoint).await;
             assert!(
@@ -1933,12 +1932,11 @@ mod tests {
         async fn add_tls_to_channel_with_verifier_and_ca_cert_fails() {
             // When both server_cert_verifier and server_root_ca_cert are set,
             // add_tls_to_channel should fail with InvalidConfig.
-            let tls_opts = TlsOptions {
-                server_root_ca_cert: Some(b"some-ca-cert-bytes".to_vec()),
-                server_cert_verifier: Some(Arc::new(MockVerifier)),
-                domain: Some("test.temporal.io".to_string()),
-                ..Default::default()
-            };
+            let tls_opts = TlsOptions::builder()
+                .server_root_ca_cert(b"some-ca-cert-bytes".to_vec())
+                .server_cert_verifier(Arc::new(MockVerifier))
+                .domain("test.temporal.io".to_string())
+                .build();
             let endpoint = tonic::transport::Channel::from_static("https://test.temporal.io:7233");
             let result = add_tls_to_channel(Some(&tls_opts), endpoint).await;
             assert!(
@@ -1951,10 +1949,9 @@ mod tests {
         #[tokio::test]
         async fn add_tls_to_channel_without_verifier_still_works() {
             // Regression test: the original PEM path must still work.
-            let tls_opts = TlsOptions {
-                domain: Some("test.temporal.io".to_string()),
-                ..Default::default()
-            };
+            let tls_opts = TlsOptions::builder()
+                .domain("test.temporal.io".to_string())
+                .build();
             let endpoint = tonic::transport::Channel::from_static("https://test.temporal.io:7233");
             let result = add_tls_to_channel(Some(&tls_opts), endpoint).await;
             assert!(
