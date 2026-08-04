@@ -29,6 +29,8 @@ to docs, or any other relevant information.
 * `TimerOptions` is now tagged with `#[non_exhaustive]`. Use
   `TimerOptions::builder(duration)` to construct timer options. Passing a `Duration` directly to
   `WorkflowContext::timer` remains supported.
+* `RetryOptions` is now tagged with `#[non_exhaustive]`. Use `RetryOptions::builder()` to
+  construct retry options.
 
 ## [0.6.0] - 2026-08-04
 

@@ -1511,18 +1511,16 @@ impl TryFrom<&ClientTlsOptions> for temporalio_client::TlsOptions {
 
 impl From<&ClientRetryOptions> for temporalio_client::RetryOptions {
     fn from(opts: &ClientRetryOptions) -> Self {
-        temporalio_client::RetryOptions {
-            initial_interval: Duration::from_millis(opts.initial_interval_millis),
-            randomization_factor: opts.randomization_factor,
-            multiplier: opts.multiplier,
-            max_interval: Duration::from_millis(opts.max_interval_millis),
-            max_elapsed_time: if opts.max_elapsed_time_millis == 0 {
-                None
-            } else {
-                Some(Duration::from_millis(opts.max_elapsed_time_millis))
-            },
-            max_retries: opts.max_retries,
-        }
+        temporalio_client::RetryOptions::builder()
+            .initial_interval(Duration::from_millis(opts.initial_interval_millis))
+            .randomization_factor(opts.randomization_factor)
+            .multiplier(opts.multiplier)
+            .max_interval(Duration::from_millis(opts.max_interval_millis))
+            .max_elapsed_time((opts.max_elapsed_time_millis != 0).then(|| {
+                Duration::from_millis(opts.max_elapsed_time_millis)
+            }))
+            .max_retries(opts.max_retries)
+            .build()
     }
 }
 

@@ -27,21 +27,28 @@ pub const RETRYABLE_ERROR_CODES: [Code; 7] = [
 const LONG_POLL_FATAL_GRACE: Duration = Duration::from_secs(60);
 
 /// Configuration for retrying requests to the server
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, bon::Builder)]
+#[non_exhaustive]
 pub struct RetryOptions {
     /// initial wait time before the first retry.
+    #[builder(default = Duration::from_millis(100))]
     pub initial_interval: Duration,
     /// randomization jitter that is used as a multiplier for the current retry interval
     /// and is added or subtracted from the interval length.
+    #[builder(default = 0.2)]
     pub randomization_factor: f64,
     /// rate at which retry time should be increased, until it reaches max_interval.
+    #[builder(default = 1.7)]
     pub multiplier: f64,
     /// maximum amount of time to wait between retries.
+    #[builder(default = Duration::from_secs(5))]
     pub max_interval: Duration,
     /// maximum total amount of time requests should be retried for, if None is set then no limit
     /// will be used.
+    #[builder(required, default = Some(Duration::from_secs(10)))]
     pub max_elapsed_time: Option<Duration>,
     /// maximum number of retry attempts.
+    #[builder(default = 10)]
     pub max_retries: usize,
 }
 
