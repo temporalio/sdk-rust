@@ -1,6 +1,6 @@
 [package]
 name = "temporalio-sdk-core-c-bridge"
-version = "0.6.0"
+version = "0.1.0"
 edition = "2024"
 authors = ["Spencer Judge <spencer@temporal.io>"]
 license-file = { workspace = true }
