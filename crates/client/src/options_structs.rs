@@ -231,11 +231,14 @@ pub struct ClientTlsOptions {
 }
 
 /// Client keep alive configuration.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, bon::Builder)]
+#[non_exhaustive]
 pub struct ClientKeepAliveOptions {
     /// Interval to send HTTP2 keep alive pings.
+    #[builder(default = Duration::from_secs(30))]
     pub interval: Duration,
     /// Timeout that the keep alive must be responded to within or the connection will be closed.
+    #[builder(default = Duration::from_secs(15))]
     pub timeout: Duration,
 }
 

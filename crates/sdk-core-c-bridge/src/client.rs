@@ -1528,10 +1528,10 @@ impl From<&ClientRetryOptions> for temporalio_client::RetryOptions {
 
 impl From<&ClientKeepAliveOptions> for temporalio_client::ClientKeepAliveOptions {
     fn from(opts: &ClientKeepAliveOptions) -> Self {
-        temporalio_client::ClientKeepAliveOptions {
-            interval: Duration::from_millis(opts.interval_millis),
-            timeout: Duration::from_millis(opts.timeout_millis),
-        }
+        temporalio_client::ClientKeepAliveOptions::builder()
+            .interval(Duration::from_millis(opts.interval_millis))
+            .timeout(Duration::from_millis(opts.timeout_millis))
+            .build()
     }
 }
 
