@@ -205,10 +205,9 @@ mod tests {
     #[test]
     fn empty_profile_defaults() {
         let env = HashMap::new();
-        let opts = LoadClientConfigProfileOptions {
-            disable_file: true,
-            ..Default::default()
-        };
+        let opts = LoadClientConfigProfileOptions::builder()
+            .disable_file(true)
+            .build();
         let (conn, client) = load_from_config_with_env(opts, Some(&env)).unwrap();
 
         assert_eq!(conn.target.as_str(), "http://localhost:7233/");
@@ -222,10 +221,9 @@ mod tests {
     fn namespace_override() {
         let mut env = HashMap::new();
         env.insert("TEMPORAL_NAMESPACE".to_string(), "my-namespace".to_string());
-        let opts = LoadClientConfigProfileOptions {
-            disable_file: true,
-            ..Default::default()
-        };
+        let opts = LoadClientConfigProfileOptions::builder()
+            .disable_file(true)
+            .build();
         let (_, client) = load_from_config_with_env(opts, Some(&env)).unwrap();
         assert_eq!(client.namespace, "my-namespace");
     }
@@ -383,11 +381,10 @@ namespace = "custom-ns"
         );
 
         // Default profile
-        let opts = LoadClientConfigProfileOptions {
-            config_source: Some(DataSource::Path(config_path.to_str().unwrap().to_string())),
-            disable_env: true,
-            ..Default::default()
-        };
+        let opts = LoadClientConfigProfileOptions::builder()
+            .config_source(DataSource::Path(config_path.to_str().unwrap().to_string()))
+            .disable_env(true)
+            .build();
         let (conn, client) = ClientOptions::load_from_config(opts).unwrap();
         assert_eq!(conn.target.as_str(), "https://toml-server:7233/");
         assert_eq!(client.namespace, "toml-ns");
@@ -399,12 +396,11 @@ namespace = "custom-ns"
         );
 
         // Custom profile
-        let opts = LoadClientConfigProfileOptions {
-            config_source: Some(DataSource::Path(config_path.to_str().unwrap().to_string())),
-            config_file_profile: Some("custom".to_string()),
-            disable_env: true,
-            ..Default::default()
-        };
+        let opts = LoadClientConfigProfileOptions::builder()
+            .config_source(DataSource::Path(config_path.to_str().unwrap().to_string()))
+            .config_file_profile("custom".to_string())
+            .disable_env(true)
+            .build();
         let (conn, client) = ClientOptions::load_from_config(opts).unwrap();
         assert_eq!(conn.target.as_str(), "http://custom-server:9090/");
         assert_eq!(client.namespace, "custom-ns");

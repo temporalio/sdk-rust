@@ -186,7 +186,8 @@ pub struct LoadClientConfigOptions {
 }
 
 /// Options for loading a client configuration profile
-#[derive(Debug, Default)]
+#[derive(Debug, Default, bon::Builder)]
+#[non_exhaustive]
 pub struct LoadClientConfigProfileOptions {
     /// Where to load config from. If unset, will try env vars then default path.
     pub config_source: Option<DataSource>,
@@ -195,12 +196,15 @@ pub struct LoadClientConfigProfileOptions {
     pub config_file_profile: Option<String>,
 
     /// If true, will error if there are unrecognized keys.
+    #[builder(default)]
     pub config_file_strict: bool,
 
     /// Disable loading from file
+    #[builder(default)]
     pub disable_file: bool,
 
     /// Disable loading from environment variables
+    #[builder(default)]
     pub disable_env: bool,
 }
 

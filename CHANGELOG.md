@@ -45,6 +45,8 @@ to docs, or any other relevant information.
   `RegisterNamespaceOptions::builder()` to construct namespace registration options.
 * `LoadClientConfigOptions` is now tagged with `#[non_exhaustive]`. Use
   `LoadClientConfigOptions::builder()` to construct client configuration loading options.
+* `LoadClientConfigProfileOptions` is now tagged with `#[non_exhaustive]`. Use
+  `LoadClientConfigProfileOptions::builder()` to construct profile loading options.
 
 ## [0.6.0] - 2026-08-04
 
