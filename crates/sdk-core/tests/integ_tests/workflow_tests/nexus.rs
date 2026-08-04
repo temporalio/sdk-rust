@@ -899,7 +899,7 @@ impl AsyncCompleterWf {
         {
             ctx.wait_condition(
                 |wf| wf.cancellation_wait_happened.load(Ordering::Relaxed),
-                None,
+                Default::default(),
             )
             .await?;
         } else if ctx.state(|wf| wf.cancellation_type)
@@ -910,7 +910,7 @@ impl AsyncCompleterWf {
             // NexusOperationCancelRequestCompleted (written after cancel handler responds)
             // rather than NexusOperationCanceled (written after handler workflow completes as
             // cancelled).
-            ctx.wait_condition(|wf| wf.proceed_signal_received, None)
+            ctx.wait_condition(|wf| wf.proceed_signal_received, Default::default())
                 .await?;
         }
 

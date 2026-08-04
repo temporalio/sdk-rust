@@ -44,9 +44,10 @@ pub use workflow_context::{
     ChildWorkflowOptions, ContinueAsNewOptions, ContinueAsNewVersioningBehavior,
     ExternalWorkflowHandle, LocalActivityOptions, NamespacedWorkflowInfo,
     NexusOperationCancellationType, NexusOperationOptions, ParentClosePolicy, Signal, SignalData,
-    StartChildWorkflowExecutionFailedCause, StartChildWorkflowOutput, StartedChildWorkflow,
-    StartedNexusOperation, SyncWorkflowContext, TimerOptions, VersioningIntent, WorkflowContext,
-    WorkflowContextView, WorkflowIdReusePolicy, WorkflowRandomValue,
+    SignalWorkflowOptions, StartChildWorkflowExecutionFailedCause, StartChildWorkflowOutput,
+    StartedChildWorkflow, StartedNexusOperation, SyncWorkflowContext, TimerOptions,
+    VersioningIntent, WaitConditionOptions, WorkflowContext, WorkflowContextView,
+    WorkflowIdReusePolicy, WorkflowRandomValue,
 };
 #[doc(hidden)]
 pub use workflow_context::{PatchActivationCallback, PatchActivationCaller};

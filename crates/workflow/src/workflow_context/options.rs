@@ -720,6 +720,22 @@ impl TimerOptions {
     }
 }
 
+/// Options for waiting on a workflow condition.
+#[derive(Default, Debug, Clone, bon::Builder)]
+#[non_exhaustive]
+pub struct WaitConditionOptions {
+    /// Cancellation token for this wait. `None` inherits workflow cancellation.
+    pub cancellation_token: Option<WorkflowCancellationToken>,
+}
+
+/// Options for signaling a workflow from another workflow.
+#[derive(Default, Debug, Clone, bon::Builder)]
+#[non_exhaustive]
+pub struct SignalWorkflowOptions {
+    /// Cancellation token for this signal. `None` inherits workflow cancellation.
+    pub cancellation_token: Option<WorkflowCancellationToken>,
+}
+
 /// Options for Nexus Operations
 #[derive(Debug, Clone, PartialEq, bon::Builder)]
 #[builder(on(String, into))]

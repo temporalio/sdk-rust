@@ -5,8 +5,8 @@ pub use options::{
     ActivityCancellationType, ActivityCloseTimeouts, ActivityOptions,
     ChildWorkflowCancellationType, ChildWorkflowOptions, ContinueAsNewOptions,
     ContinueAsNewVersioningBehavior, LocalActivityOptions, NexusOperationCancellationType,
-    NexusOperationOptions, ParentClosePolicy, Signal, SignalData, TimerOptions, VersioningIntent,
-    WorkflowIdReusePolicy,
+    NexusOperationOptions, ParentClosePolicy, Signal, SignalData, SignalWorkflowOptions,
+    TimerOptions, VersioningIntent, WaitConditionOptions, WorkflowIdReusePolicy,
 };
 pub use temporalio_common_wasm::protos::coresdk::child_workflow::StartChildWorkflowExecutionFailedCause;
 pub use view::{NamespacedWorkflowInfo, WorkflowContextView};
@@ -2121,13 +2121,15 @@ impl<W> WorkflowContext<W> {
     ///
     /// The condition closure receives an immutable reference to the workflow state,
     /// which is borrowed only for the duration of each poll (not across await points).
-    /// `None` inherits workflow cancellation.
+    /// By default, the wait inherits workflow cancellation.
     pub fn wait_condition<'a>(
         &'a self,
         mut condition: impl FnMut(&W) -> bool + 'a,
-        cancellation_token: Option<WorkflowCancellationToken>,
+        options: WaitConditionOptions,
     ) -> impl FusedFuture<Output = Result<(), WorkflowCancellationError>> + 'a {
-        let token = cancellation_token.unwrap_or_else(|| self.cancellation_token());
+        let token = options
+            .cancellation_token
+            .unwrap_or_else(|| self.cancellation_token());
         let wait_token = token.clone();
         let mut cancelled = Box::pin(async move {
             wait_token.cancelled().await;
@@ -3045,12 +3047,12 @@ where
 
     /// Send a typed signal to the child workflow.
     ///
-    /// `None` inherits workflow cancellation.
+    /// By default, the signal inherits workflow cancellation.
     pub fn signal<S: SignalDefinition<Workflow = WD> + 'static>(
         &self,
         signal: S,
         input: S::Input,
-        cancellation_token: Option<WorkflowCancellationToken>,
+        options: SignalWorkflowOptions,
     ) -> impl CancellableFuture<Output = Result<(), WorkflowSignalError>> + 'static {
         self.base_ctx.signal_workflow(
             SignalWorkflowTarget::Child {
@@ -3058,7 +3060,7 @@ where
             },
             signal,
             input,
-            cancellation_token,
+            options.cancellation_token,
         )
     }
 }
@@ -3090,12 +3092,12 @@ impl ExternalWorkflowHandle {
 
     /// Send a signal to the external workflow.
     ///
-    /// `None` inherits workflow cancellation.
+    /// By default, the signal inherits workflow cancellation.
     pub fn signal<S: SignalDefinition + 'static>(
         &self,
         signal: S,
         input: S::Input,
-        cancellation_token: Option<WorkflowCancellationToken>,
+        options: SignalWorkflowOptions,
     ) -> impl CancellableFuture<Output = Result<(), WorkflowSignalError>> + 'static {
         self.base_ctx.signal_workflow(
             SignalWorkflowTarget::External {
@@ -3105,7 +3107,7 @@ impl ExternalWorkflowHandle {
             },
             signal,
             input,
-            cancellation_token,
+            options.cancellation_token,
         )
     }
 
@@ -3512,7 +3514,12 @@ mod tests {
         token.cancel_with_reason("group cancelled");
 
         let result = ctx
-            .wait_condition(|_| false, Some(token))
+            .wait_condition(
+                |_| false,
+                WaitConditionOptions::builder()
+                    .cancellation_token(token)
+                    .build(),
+            )
             .now_or_never()
             .expect("cancelled wait should resolve");
 
@@ -3560,7 +3567,9 @@ mod tests {
         let _signal = base.external_workflow("external", None).signal(
             TestWorkflow::test_signal,
             "input".to_string(),
-            Some(token.clone()),
+            SignalWorkflowOptions::builder()
+                .cancellation_token(token.clone())
+                .build(),
         );
 
         let mut nexus_options = NexusOperationOptions {
@@ -3948,7 +3957,7 @@ mod tests {
             .signal(
                 TestWorkflow::test_signal,
                 "original-input".to_string(),
-                None,
+                Default::default(),
             );
         let cancel_target =
             ctx.external_workflow("cancel-workflow", Some("cancel-run".to_string()));

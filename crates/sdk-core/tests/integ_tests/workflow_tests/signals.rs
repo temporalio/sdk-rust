@@ -42,7 +42,11 @@ impl SignalSender {
     ) -> WorkflowResult<()> {
         let handle = ctx.external_workflow(RECEIVER_WFID, Some(run_id));
         let sigres = handle
-            .signal(SignalReceiver::handle_signal, "hi!".into(), None)
+            .signal(
+                SignalReceiver::handle_signal,
+                "hi!".into(),
+                Default::default(),
+            )
             .await;
         if expect_failure {
             assert!(sigres.is_err());
@@ -83,7 +87,8 @@ struct SignalReceiver {
 impl SignalReceiver {
     #[run(name = "receiver")]
     async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<()> {
-        ctx.wait_condition(|s| s.received, None).await?;
+        ctx.wait_condition(|s| s.received, Default::default())
+            .await?;
         Ok(())
     }
 
@@ -104,7 +109,8 @@ struct SignalWithCreateWfReceiver {
 impl SignalWithCreateWfReceiver {
     #[run]
     async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<()> {
-        ctx.wait_condition(|s| s.received, None).await?;
+        ctx.wait_condition(|s| s.received, Default::default())
+            .await?;
         Ok(())
     }
 
@@ -196,7 +202,11 @@ impl SignalsChild {
             )
             .await?;
         started_child
-            .signal(ChildSignalReceiver::handle_signal, "hi!".into(), None)
+            .signal(
+                ChildSignalReceiver::handle_signal,
+                "hi!".into(),
+                Default::default(),
+            )
             .await?;
         started_child.result().await.expect("child wf result is ok");
         Ok(())
@@ -213,7 +223,8 @@ struct ChildSignalReceiver {
 impl ChildSignalReceiver {
     #[run]
     async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<()> {
-        ctx.wait_condition(|s| s.received, None).await?;
+        ctx.wait_condition(|s| s.received, Default::default())
+            .await?;
         Ok(())
     }
 
@@ -254,7 +265,11 @@ impl SignalSenderCanned {
     async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<()> {
         let handle = ctx.external_workflow("fake_wid", Some("fake_rid".into()));
         let res = handle
-            .signal(SignalReceiver::handle_signal, "hi!".into(), None)
+            .signal(
+                SignalReceiver::handle_signal,
+                "hi!".into(),
+                Default::default(),
+            )
             .await;
         if res.is_err() {
             Err(anyhow::anyhow!("Signal fail!").into())
@@ -319,7 +334,11 @@ impl CancelsBeforeSending {
     #[run(name = DEFAULT_WORKFLOW_TYPE)]
     async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<()> {
         let handle = ctx.external_workflow("fake_wid", Some("fake_rid".into()));
-        let sig = handle.signal(SignalReceiver::handle_signal, "hi!".into(), None);
+        let sig = handle.signal(
+            SignalReceiver::handle_signal,
+            "hi!".into(),
+            Default::default(),
+        );
         sig.cancel();
         let _res = sig.await;
         Ok(())
@@ -384,7 +403,11 @@ impl SignalSerializationFailure {
     async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<String> {
         let handle = ctx.external_workflow("irrelevant", None);
         let result = handle
-            .signal(SignalSerializationFailure::bad_signal, BadSignalInput, None)
+            .signal(
+                SignalSerializationFailure::bad_signal,
+                BadSignalInput,
+                Default::default(),
+            )
             .await;
         Ok(result.unwrap_err().to_string())
     }
@@ -434,7 +457,11 @@ impl CrossTypeSignalSender {
     ) -> WorkflowResult<()> {
         let handle = ctx.external_workflow(workflow_id, Some(run_id));
         handle
-            .signal(CrossTypeSignalReceiver::handle_signal, "hi!".into(), None)
+            .signal(
+                CrossTypeSignalReceiver::handle_signal,
+                "hi!".into(),
+                Default::default(),
+            )
             .await
             .unwrap();
         Ok(())
@@ -451,7 +478,8 @@ struct CrossTypeSignalReceiver {
 impl CrossTypeSignalReceiver {
     #[run]
     async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<()> {
-        ctx.wait_condition(|s| s.received, None).await?;
+        ctx.wait_condition(|s| s.received, Default::default())
+            .await?;
         Ok(())
     }
 
