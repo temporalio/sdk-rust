@@ -31,6 +31,8 @@ to docs, or any other relevant information.
   `WorkflowContext::timer` remains supported.
 * `RetryOptions` is now tagged with `#[non_exhaustive]`. Use `RetryOptions::builder()` to
   construct retry options.
+* `HttpConnectProxyOptions` is now tagged with `#[non_exhaustive]`. Use
+  `HttpConnectProxyOptions::new(target_addr)` to construct proxy options.
 
 ## [0.6.0] - 2026-08-04
 
