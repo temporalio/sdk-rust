@@ -27,6 +27,9 @@ pub trait WorkerPlugin: Send + Sync + 'static {
     fn name(&self) -> &str;
 
     /// Configure worker options.
+    ///
+    /// Worker plugin registrations are captured before this method is called. Altering plugins in
+    /// this method does not change which plugins are applied.
     fn configure_worker_options(&self, _options: &mut WorkerOptions) -> Result<(), PluginError> {
         Ok(())
     }
@@ -393,7 +396,13 @@ pub(crate) fn apply_worker_plugins(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{collections::HashSet, sync::Mutex};
+    use std::{
+        collections::HashSet,
+        sync::{
+            Mutex,
+            atomic::{AtomicU8, Ordering},
+        },
+    };
     use temporalio_client::ClientOptions;
     use temporalio_common::protos::temporal::api::worker::v1::PluginInfo;
 
@@ -600,5 +609,32 @@ mod tests {
         apply_worker_plugins(&client_options, &mut worker_options).unwrap();
 
         assert_eq!(worker_options.worker_interceptors.len(), 1);
+    }
+
+    struct RecursivePlugin(Arc<AtomicU8>);
+
+    impl WorkerPlugin for RecursivePlugin {
+        fn name(&self) -> &str {
+            "recursive"
+        }
+
+        fn configure_worker_options(&self, options: &mut WorkerOptions) -> Result<(), PluginError> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            *options = WorkerOptions::new(options.task_queue.clone())
+                .worker_plugin(RecursivePlugin(self.0.clone()))
+                .worker_plugin(RecursivePlugin(self.0.clone()))
+                .build();
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn test_plugins_cannot_recurse() {
+        let count = Arc::new(AtomicU8::new(0));
+        let mut worker_opts = WorkerOptions::new("my-task-queue")
+            .worker_plugin(RecursivePlugin(count.clone()))
+            .build();
+        apply_worker_plugins(&ClientOptions::new("my-ns").build(), &mut worker_opts).unwrap();
+        assert_eq!(count.load(Ordering::SeqCst), 1);
     }
 }
