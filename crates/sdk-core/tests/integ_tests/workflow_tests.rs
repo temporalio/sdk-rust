@@ -1075,10 +1075,11 @@ async fn pass_timer_summary_to_metadata() {
     impl PassTimerSummaryWf {
         #[run(name = DEFAULT_WORKFLOW_TYPE)]
         async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<()> {
-            ctx.timer(TimerOptions {
-                duration: Duration::from_secs(1),
-                summary: Some("timer summary".to_string()),
-            })
+            ctx.timer(
+                TimerOptions::builder(Duration::from_secs(1))
+                    .summary("timer summary".to_string())
+                    .build(),
+            )
             .await;
             Ok(())
         }

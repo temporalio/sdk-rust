@@ -661,9 +661,11 @@ impl SignalData {
 }
 
 /// Options for timer
-#[derive(Default, Debug, Clone)]
+#[derive(Default, Debug, Clone, bon::Builder)]
+#[non_exhaustive]
 pub struct TimerOptions {
     /// Duration for the timer
+    #[builder(start_fn)]
     pub duration: Duration,
     /// Summary of the timer
     pub summary: Option<String>,

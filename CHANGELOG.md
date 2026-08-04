@@ -22,6 +22,9 @@ to docs, or any other relevant information.
 ### Breaking Changes :boom:
 * `CancellableFuture` and `CancellableFutureWithReason` now use the inherited `Future::Output`
   associated type instead of a generic output parameter.
+* `TimerOptions` is now tagged with `#[non_exhaustive]`. Use
+  `TimerOptions::builder(duration)` to construct timer options. Passing a `Duration` directly to
+  `WorkflowContext::timer` remains supported.
 
 ## [0.6.0] - 2026-08-04
 
