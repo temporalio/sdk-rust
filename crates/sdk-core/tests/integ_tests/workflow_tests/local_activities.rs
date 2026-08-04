@@ -26,6 +26,7 @@ use temporalio_common::{
         coresdk::{
             ActivityTaskCompletion, AsJsonPayloadExt, FromJsonPayloadExt,
             activity_result::ActivityExecutionResult,
+            common::extract_local_activity_marker_data,
             workflow_activation::{
                 WorkflowActivation, WorkflowActivationJob, workflow_activation_job,
             },
@@ -44,7 +45,7 @@ use temporalio_common::{
                 CommandType, EventType, TimeoutType as ProtoTimeoutType, WorkflowTaskFailedCause,
             },
             failure::v1::Failure,
-            history::v1::history_event::Attributes::MarkerRecordedEventAttributes,
+            history::v1::history_event::{self, Attributes::MarkerRecordedEventAttributes},
             query::v1::WorkflowQuery,
         },
     },
@@ -3947,4 +3948,152 @@ async fn heartbeat_timeout_does_not_overlap_local_activity_resolution_activation
     );
 
     worker_result.unwrap();
+}
+
+#[workflow]
+#[derive(Default)]
+struct OutOfOrderMarkerWorkflow;
+
+#[workflow_methods]
+impl OutOfOrderMarkerWorkflow {
+    #[run]
+    async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<()> {
+        let mut first = ctx.execute_local_activity(
+            OutOfOrderMarkerActivities::run,
+            true,
+            LocalActivityOptions::default(),
+        );
+        let mut timer = ctx.timer(Duration::from_millis(100));
+
+        let timer_won = temporalio_sdk::workflows::select! {
+            _ = first => false,
+            _ = timer => true,
+        };
+        if !timer_won {
+            return Ok(());
+        }
+
+        ctx.execute_local_activity(
+            OutOfOrderMarkerActivities::run,
+            false,
+            LocalActivityOptions::default(),
+        )
+        .await?;
+        first.await?;
+        Ok(())
+    }
+}
+
+struct OutOfOrderMarkerActivities {
+    release_first: Arc<Notify>,
+}
+
+#[activities]
+impl OutOfOrderMarkerActivities {
+    #[activity]
+    async fn run(
+        self: Arc<Self>,
+        _ctx: ActivityContext,
+        wait_for_release: bool,
+    ) -> Result<(), ActivityError> {
+        if wait_for_release {
+            self.release_first.notified().await;
+        }
+        Ok(())
+    }
+}
+
+struct ReleaseFirstAfterSecondResolved {
+    release_first: Arc<Notify>,
+    release_after_completion: AtomicBool,
+}
+
+#[async_trait::async_trait(?Send)]
+impl WorkerInterceptor for ReleaseFirstAfterSecondResolved {
+    async fn on_workflow_activation(
+        &self,
+        activation: &WorkflowActivation,
+    ) -> Result<(), anyhow::Error> {
+        let resolves_second = activation.jobs.iter().any(|job| {
+            matches!(
+                job.variant.as_ref(),
+                Some(workflow_activation_job::Variant::ResolveActivity(resolution))
+                    if resolution.seq == 2
+            )
+        });
+        if resolves_second {
+            self.release_after_completion.store(true, Ordering::SeqCst);
+        }
+        Ok(())
+    }
+
+    async fn on_workflow_activation_completion(&self, _completion: &WorkflowActivationCompletion) {
+        if self.release_after_completion.swap(false, Ordering::SeqCst) {
+            self.release_first.notify_one();
+        }
+    }
+}
+
+/// Replay lookahead must honor marker order when a later marker belongs to an already-scheduled LA.
+/// Resolving LA1 past LA2's earlier marker can change the timer/LA select outcome, skip scheduling
+/// LA2, and make the live history nondeterministic on replay.
+#[tokio::test]
+async fn replay_out_of_order_local_activity_markers_is_deterministic() {
+    let test_name = "replay_out_of_order_local_activity_markers_is_deterministic";
+    let mut starter = CoreWfStarter::new(test_name);
+    starter.workflow_options.task_timeout = Some(Duration::from_secs(1));
+
+    let release_first = Arc::new(Notify::new());
+    starter
+        .sdk_config
+        .register_activities(OutOfOrderMarkerActivities {
+            release_first: release_first.clone(),
+        });
+
+    let mut worker = starter.worker().await;
+    worker
+        .register_workflow::<OutOfOrderMarkerWorkflow>()
+        .unwrap();
+
+    let task_queue = starter.get_task_queue().to_owned();
+    let handle = worker
+        .submit_workflow(
+            OutOfOrderMarkerWorkflow::run,
+            (),
+            WorkflowStartOptions::new(task_queue.clone(), test_name.to_owned()).build(),
+        )
+        .await
+        .unwrap();
+
+    worker
+        .run_until_done_intercepted(Some(ReleaseFirstAfterSecondResolved {
+            release_first,
+            release_after_completion: AtomicBool::new(false),
+        }))
+        .await
+        .unwrap();
+
+    let workflow_id = handle.info().workflow_id.clone();
+    let events = handle
+        .fetch_history(Default::default())
+        .await
+        .unwrap()
+        .into_events();
+    let marker_order = events
+        .iter()
+        .filter_map(|event| match event.attributes.as_ref() {
+            Some(history_event::Attributes::MarkerRecordedEventAttributes(attributes)) => {
+                extract_local_activity_marker_data(&attributes.details).map(|data| data.seq)
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(marker_order, [2, 1]);
+
+    let replay_core =
+        init_core_replay_preloaded(&task_queue, [HistoryForReplay::new(events, workflow_id)]);
+    let inner = worker.inner_mut();
+    inner.with_new_core_worker(Arc::new(replay_core));
+    inner.set_worker_interceptor(FailOnNondeterminismInterceptor {});
+    inner.run().await.unwrap();
 }

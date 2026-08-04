@@ -742,7 +742,7 @@ impl WorkflowMachines {
         // Needed to delay mutation of self until after we've iterated over peeked events.
         #[allow(clippy::large_enum_variant)]
         enum DelayedAction {
-            WakeLa(MachineKey, Box<CompleteLocalActivityData>),
+            LocalActivityMarker(Box<CompleteLocalActivityData>),
             ProtocolMessage(IncomingProtocolMessage),
         }
         let mut delayed_actions = vec![];
@@ -775,13 +775,7 @@ impl WorkflowMachines {
                 );
             } else if e.is_local_activity_marker() {
                 if let Some(la_dat) = e.clone().into_local_activity_marker_details() {
-                    if let Ok(mk) =
-                        self.get_machine_key(CommandID::LocalActivity(la_dat.marker_dat.seq))
-                    {
-                        delayed_actions.push(DelayedAction::WakeLa(mk, Box::new(la_dat)));
-                    } else {
-                        self.local_activity_data.insert_peeked_marker(la_dat);
-                    }
+                    delayed_actions.push(DelayedAction::LocalActivityMarker(Box::new(la_dat)));
                 } else {
                     return Err(fatal!("Local activity marker was unparsable: {e:?}"));
                 }
@@ -804,13 +798,18 @@ impl WorkflowMachines {
         }
         for action in delayed_actions {
             match action {
-                DelayedAction::WakeLa(mk, la_dat) => {
-                    let mach = self.machine_mut(mk);
-                    if let Machines::LocalActivityMachine(ref mut lam) = *mach
-                        && lam.will_accept_resolve_marker()
-                    {
-                        let resps = lam.try_resolve_with_dat((*la_dat).into())?;
-                        self.process_machine_responses(mk, resps)?;
+                DelayedAction::LocalActivityMarker(la_dat) => {
+                    let seq = la_dat.marker_dat.seq;
+                    let should_queue = self
+                        .get_machine_key(CommandID::LocalActivity(seq))
+                        .map(|mk| {
+                            matches!(self.machine(mk), Machines::LocalActivityMachine(lam)
+                                if lam.will_accept_resolve_marker())
+                        })
+                        .unwrap_or(true);
+                    if should_queue {
+                        self.local_activity_data.insert_peeked_marker(*la_dat);
+                        self.apply_local_activity_peeked_resolutions()?;
                     }
                 }
                 DelayedAction::ProtocolMessage(pm) => {
