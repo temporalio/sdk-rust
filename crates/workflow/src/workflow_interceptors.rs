@@ -1728,3 +1728,73 @@ pub(crate) fn wrong_workflow_input_type(type_name: &'static str) -> WorkflowTerm
         ),
     ))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::Cell;
+
+    fn cancellable_future<T: 'static>(
+        future: impl Future<Output = T> + 'static,
+        token: &WorkflowCancellationToken,
+        cancellation_count: &Rc<Cell<usize>>,
+    ) -> CancellableWorkflowOutboundFuture<T> {
+        let cancellation_count = cancellation_count.clone();
+        CancellableWorkflowOutboundFuture::new(
+            future,
+            WorkflowCancellationHandle::new(move |_| {
+                cancellation_count.set(cancellation_count.get() + 1);
+            }),
+        )
+        .with_cancellation_token(token.clone())
+    }
+
+    #[test]
+    fn pending_cancellable_future_observes_token_cancellation() {
+        let token = WorkflowCancellationToken::new();
+        let cancellation_count = Rc::new(Cell::new(0));
+        let _future = cancellable_future(std::future::pending::<()>(), &token, &cancellation_count);
+
+        token.cancel();
+
+        assert_eq!(cancellation_count.get(), 1);
+    }
+
+    #[test]
+    fn completed_cancellable_future_unregisters_from_token() {
+        let token = WorkflowCancellationToken::new();
+        let cancellation_count = Rc::new(Cell::new(0));
+        let future = cancellable_future(std::future::ready(()), &token, &cancellation_count);
+
+        assert_eq!(future.now_or_never(), Some(()));
+        token.cancel();
+
+        assert_eq!(cancellation_count.get(), 0);
+    }
+
+    #[test]
+    fn mapped_cancellable_future_unregisters_from_token() {
+        let token = WorkflowCancellationToken::new();
+        let cancellation_count = Rc::new(Cell::new(0));
+        let future = cancellable_future(std::future::ready(1), &token, &cancellation_count)
+            .map(|value| value + 1);
+
+        assert_eq!(future.now_or_never(), Some(2));
+        token.cancel();
+
+        assert_eq!(cancellation_count.get(), 0);
+    }
+
+    #[test]
+    fn shared_cancellable_future_unregisters_from_token() {
+        let token = WorkflowCancellationToken::new();
+        let cancellation_count = Rc::new(Cell::new(0));
+        let future =
+            cancellable_future(std::future::ready(1), &token, &cancellation_count).shared();
+
+        assert_eq!(future.clone().now_or_never(), Some(1));
+        token.cancel();
+
+        assert_eq!(cancellation_count.get(), 0);
+    }
+}
