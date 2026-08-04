@@ -19,6 +19,10 @@ to docs, or any other relevant information.
 
 ## Unreleased
 
+### Breaking Changes :boom:
+* `CancellableFuture` and `CancellableFutureWithReason` now use the inherited `Future::Output`
+  associated type instead of a generic output parameter.
+
 ## [0.6.0] - 2026-08-04
 
 ### Added
