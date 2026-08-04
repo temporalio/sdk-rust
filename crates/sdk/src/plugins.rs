@@ -23,7 +23,7 @@ use temporalio_workflow::runtime::entry::WorkflowImplementation;
 ///
 /// **Experimental:** This API may change or be removed.
 pub trait WorkerPlugin: Send + Sync + 'static {
-    /// Name used to identify this plugin.
+    /// Stable, unique name used to identify this plugin.
     fn name(&self) -> &str;
 
     /// Configure worker options.
@@ -35,39 +35,16 @@ pub trait WorkerPlugin: Send + Sync + 'static {
     }
 }
 
-/// A type-erased worker plugin.
-///
-/// **Experimental:** This API may change or be removed.
 #[derive(Clone)]
-pub struct ErasedWorkerPlugin {
-    worker: Arc<dyn WorkerPlugin>,
-}
-
-impl ErasedWorkerPlugin {
-    /// Type-erase a worker plugin for registration on [`WorkerOptions`].
-    ///
-    /// **Experimental:** This API may change or be removed.
-    pub fn new<P: WorkerPlugin>(plugin: P) -> Self {
-        Self {
-            worker: Arc::new(plugin),
-        }
-    }
-
-    pub(crate) fn plugin(&self) -> &dyn WorkerPlugin {
-        self.worker.as_ref()
-    }
-}
-
-#[derive(Clone)]
-struct PropagatedWorkerPlugin(ErasedWorkerPlugin);
+struct PropagatedWorkerPlugin(Arc<dyn WorkerPlugin>);
 
 impl WorkerPluginData for PropagatedWorkerPlugin {}
 
 /// A container for a plugin that implements both [`ClientPlugin`] and
 /// [`WorkerPlugin`].
 ///
-/// This wrapper is only needed when the same plugin configures both a client and workers. Use
-/// [`ErasedClientPlugin`] or [`ErasedWorkerPlugin`] for one-sided plugins.
+/// This wrapper is only needed when the same plugin configures both a client and workers.
+/// One-sided plugins can implement [`ClientPlugin`] or [`WorkerPlugin`] directly.
 ///
 /// When registered on [`ClientOptions`], the resulting client carries the worker plugin and
 /// automatically applies it to workers created from that client. Do not also register the plugin
@@ -92,7 +69,7 @@ impl WorkerPluginData for PropagatedWorkerPlugin {}
 #[derive(Clone)]
 pub struct ClientAndWorkerPlugin {
     client: ErasedClientPlugin,
-    worker: ErasedWorkerPlugin,
+    worker: Arc<dyn WorkerPlugin>,
 }
 
 impl ClientAndWorkerPlugin {
@@ -104,7 +81,7 @@ impl ClientAndWorkerPlugin {
     {
         let plugin = Arc::new(plugin);
         let mut client = ErasedClientPlugin::new(SharedClientPlugin(plugin.clone()));
-        let worker = ErasedWorkerPlugin::new(SharedWorkerPlugin(plugin));
+        let worker: Arc<dyn WorkerPlugin> = Arc::new(SharedWorkerPlugin(plugin));
         client = client.with_worker_plugin(PropagatedWorkerPlugin(worker.clone()));
         Self { client, worker }
     }
@@ -116,9 +93,13 @@ impl From<ClientAndWorkerPlugin> for ErasedClientPlugin {
     }
 }
 
-impl From<ClientAndWorkerPlugin> for ErasedWorkerPlugin {
-    fn from(plugin: ClientAndWorkerPlugin) -> Self {
-        plugin.worker
+impl WorkerPlugin for ClientAndWorkerPlugin {
+    fn name(&self) -> &str {
+        self.worker.name()
+    }
+
+    fn configure_worker_options(&self, options: &mut WorkerOptions) -> Result<(), PluginError> {
+        self.worker.configure_worker_options(options)
     }
 }
 
@@ -169,12 +150,6 @@ pub struct SimplePlugin {
 impl From<SimplePlugin> for ErasedClientPlugin {
     fn from(plugin: SimplePlugin) -> Self {
         ClientAndWorkerPlugin::new(plugin).into()
-    }
-}
-
-impl From<SimplePlugin> for ErasedWorkerPlugin {
-    fn from(plugin: SimplePlugin) -> Self {
-        ErasedWorkerPlugin::new(plugin)
     }
 }
 
@@ -341,15 +316,15 @@ struct WorkerPluginWarning<'a> {
 }
 
 fn worker_plugin_warnings(
-    plugins: &[ErasedWorkerPlugin],
+    plugins: &[Arc<dyn WorkerPlugin>],
 ) -> impl Iterator<Item = WorkerPluginWarning<'_>> {
     plugins.iter().enumerate().filter_map(|(index, plugin)| {
         plugins[index + 1..]
             .iter()
-            .any(|other| Arc::ptr_eq(&plugin.worker, &other.worker))
+            .any(|other| plugin.name() == other.name())
             .then_some(WorkerPluginWarning {
-                plugin_name: plugin.plugin().name(),
-                message: "The same combined client and worker plugin was registered both through the client and directly on the worker",
+                plugin_name: plugin.name(),
+                message: "Multiple worker plugins with the same name were registered",
             })
     })
 }
@@ -382,10 +357,9 @@ pub(crate) fn apply_worker_plugins(
 
     for registration in &plugins {
         registration
-            .plugin()
             .configure_worker_options(options)
             .map_err(|source| {
-                PluginApplyError::new(registration.plugin().name(), PluginTarget::Worker, source)
+                PluginApplyError::new(registration.name(), PluginTarget::Worker, source)
             })?;
     }
     options.worker_plugins = plugins;
@@ -479,7 +453,7 @@ mod tests {
         let client_options = ClientOptions::new("namespace")
             .plugin(combined.clone())
             .build();
-        let mut worker_options = WorkerOptions::new("queue").plugin(combined).build();
+        let mut worker_options = WorkerOptions::new("queue").worker_plugin(combined).build();
 
         apply_worker_plugins(&client_options, &mut worker_options).unwrap();
 
@@ -487,7 +461,7 @@ mod tests {
             worker_plugin_warnings(&worker_options.worker_plugins).collect::<Vec<_>>(),
             [WorkerPluginWarning {
                 plugin_name: "combined",
-                message: "The same combined client and worker plugin was registered both through the client and directly on the worker",
+                message: "Multiple worker plugins with the same name were registered",
             }]
         );
         assert_eq!(*order.lock().unwrap(), ["propagated", "propagated"]);
@@ -510,7 +484,7 @@ mod tests {
     }
 
     struct UnrecognizedWorkerPluginExtension {
-        _registration: ErasedWorkerPlugin,
+        _registration: Arc<dyn WorkerPlugin>,
     }
 
     impl WorkerPluginData for UnrecognizedWorkerPluginExtension {}
@@ -520,7 +494,7 @@ mod tests {
         let order = Arc::new(Mutex::new(Vec::new()));
         let client_registration = ErasedClientPlugin::new(ClientOnlyPlugin).with_worker_plugin(
             UnrecognizedWorkerPluginExtension {
-                _registration: ErasedWorkerPlugin::new(RecordingWorkerPlugin {
+                _registration: Arc::new(RecordingWorkerPlugin {
                     name: "unrecognized",
                     value: "should-not-run",
                     order: order.clone(),
@@ -538,7 +512,7 @@ mod tests {
     }
 
     #[test]
-    fn heartbeat_plugin_names_include_client_plugins_and_are_deduplicated() {
+    fn duplicate_worker_plugin_names_warn_and_heartbeat_names_are_deduplicated() {
         let order = Arc::new(Mutex::new(Vec::new()));
         let client_options = ClientOptions::new("namespace")
             .client_plugin(ClientOnlyPlugin)
@@ -559,8 +533,11 @@ mod tests {
         apply_worker_plugins(&client_options, &mut worker_options).unwrap();
 
         assert_eq!(
-            worker_plugin_warnings(&worker_options.worker_plugins).count(),
-            0
+            worker_plugin_warnings(&worker_options.worker_plugins).collect::<Vec<_>>(),
+            [WorkerPluginWarning {
+                plugin_name: "same-name",
+                message: "Multiple worker plugins with the same name were registered",
+            }]
         );
         let core_options = worker_options
             .to_core_options("namespace".to_owned(), "identity".to_owned())
@@ -605,7 +582,7 @@ mod tests {
             .worker_interceptor(EmptyWorkerInterceptor)
             .build();
         let client_options = ClientOptions::new("namespace").build();
-        let mut worker_options = WorkerOptions::new("queue").plugin(plugin).build();
+        let mut worker_options = WorkerOptions::new("queue").worker_plugin(plugin).build();
         apply_worker_plugins(&client_options, &mut worker_options).unwrap();
 
         assert_eq!(worker_options.worker_interceptors.len(), 1);

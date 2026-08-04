@@ -62,7 +62,8 @@ impl PluginApplyError {
 ///
 /// **Experimental:** This API may change or be removed.
 pub trait ClientPlugin: Send + Sync + 'static {
-    /// Return the stable name used to identify this plugin in diagnostics and worker heartbeats.
+    /// Return the stable, unique name used to identify this plugin in diagnostics and worker
+    /// heartbeats.
     fn name(&self) -> &str;
 
     /// Configure options before the connection is established.

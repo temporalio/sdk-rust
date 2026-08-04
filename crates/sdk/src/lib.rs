@@ -101,9 +101,7 @@ pub use crate::{
         ChildWorkflowStartError, OutgoingActivityError, OutgoingError, OutgoingWorkflowError,
         RetryState, TimeoutType, WorkerCreateError, WorkflowRegistrationError, WorkflowSignalError,
     },
-    plugins::{
-        ClientAndWorkerPlugin, ErasedWorkerPlugin, SimplePlugin, SimplePluginBuilder, WorkerPlugin,
-    },
+    plugins::{ClientAndWorkerPlugin, SimplePlugin, SimplePluginBuilder, WorkerPlugin},
 };
 pub use temporalio_client::Namespace;
 pub use temporalio_sdk_core::CoreRuntime as Runtime;
@@ -206,7 +204,7 @@ pub struct WorkerOptions {
     workflow_interceptor_constructors: Vec<WorkflowInterceptorConstructor>,
 
     #[builder(field)]
-    worker_plugins: Vec<ErasedWorkerPlugin>,
+    worker_plugins: Vec<Arc<dyn WorkerPlugin>>,
 
     #[builder(field)]
     client_plugin_names: HashSet<String>,
@@ -332,19 +330,11 @@ pub struct WorkerOptions {
 }
 
 impl<S: worker_options_builder::State> WorkerOptionsBuilder<S> {
-    /// Register a type-erased worker plugin.
-    ///
-    /// **Experimental:** This API may change or be removed.
-    pub fn plugin<P: Into<ErasedWorkerPlugin>>(mut self, plugin: P) -> Self {
-        self.worker_plugins.push(plugin.into());
-        self
-    }
-
-    /// Register a worker-only plugin.
+    /// Register a worker plugin.
     ///
     /// **Experimental:** This API may change or be removed.
     pub fn worker_plugin<P: WorkerPlugin>(mut self, plugin: P) -> Self {
-        self.worker_plugins.push(ErasedWorkerPlugin::new(plugin));
+        self.worker_plugins.push(Arc::new(plugin));
         self
     }
 
@@ -606,7 +596,7 @@ impl WorkerOptions {
                         version: String::new(),
                     })
                     .chain(self.worker_plugins.iter().map(|registration| PluginInfo {
-                        name: registration.plugin().name().to_owned(),
+                        name: registration.name().to_owned(),
                         version: String::new(),
                     }))
                     .collect(),
