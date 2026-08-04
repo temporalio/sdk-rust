@@ -226,6 +226,10 @@ impl ManagedRun {
             start_time,
             permit: pwft.permit,
         });
+        if let Some(waiting) = self.waiting_on_la.as_mut() {
+            waiting.hb_timeout_handle.abort();
+            waiting.heartbeat_timeout_pending = false;
+        }
 
         if was_legacy_query
             && work.update.wft_started_id == 0
@@ -375,7 +379,15 @@ impl ManagedRun {
                     )));
                 }
             }
-            if let Some(wte) = self.trying_to_evict.clone() {
+            if self
+                .waiting_on_la
+                .as_ref()
+                .is_some_and(|waiting| waiting.heartbeat_timeout_pending)
+            {
+                Ok(Some(ActivationOrAuto::Autocomplete {
+                    run_id: self.run_id().to_string(),
+                }))
+            } else if let Some(wte) = self.trying_to_evict.clone() {
                 let act =
                     create_evict_activation(self.run_id().to_string(), wte.message, wte.reason);
                 Ok(Some(ActivationOrAuto::LangActivation(act)))
@@ -719,9 +731,14 @@ impl ManagedRun {
         completion: RunActivationCompletion,
         update_from_new_page: Option<HistoryUpdate>,
     ) -> Result<Option<FulfillableActivationComplete>, RunUpdateErr> {
-        let completing_la_heartbeat =
+        let completing_heartbeat_autocomplete =
             matches!(self.activation, Some(OutstandingActivation::Autocomplete))
                 && self.waiting_on_la.is_some();
+        let completing_la_heartbeat = completing_heartbeat_autocomplete
+            || self
+                .waiting_on_la
+                .as_ref()
+                .is_some_and(|waiting| waiting.heartbeat_timeout_pending);
         let data = CompletionDataForWFT {
             task_token: completion.task_token,
             query_responses: completion.query_responses,
@@ -784,7 +801,7 @@ impl ManagedRun {
                 Ok(Some(self.prepare_complete_resp(
                     completion.resp_chan,
                     data,
-                    completing_la_heartbeat,
+                    completing_heartbeat_autocomplete,
                 )))
             }
             Ok(Some((start_t, wft_timeout))) => {
@@ -804,6 +821,10 @@ impl ManagedRun {
                     self.waiting_on_la = Some(WaitingOnLAs {
                         wft_timeout,
                         hb_timeout_handle,
+                        // Keep this set until the replacement WFT arrives. If pending workflow
+                        // jobs prevent this completion from being reported, the heartbeat still
+                        // needs to be honored after those jobs are processed.
+                        heartbeat_timeout_pending: completing_la_heartbeat,
                     });
                     Ok(Some(self.prepare_complete_resp(
                         completion.resp_chan,
@@ -819,6 +840,7 @@ impl ManagedRun {
                             start_t,
                             wft_timeout,
                         ),
+                        heartbeat_timeout_pending: false,
                     });
                     Ok(Some(FulfillableActivationComplete {
                         result: ActivationCompleteResult {
@@ -863,7 +885,8 @@ impl ManagedRun {
     fn _heartbeat_timeout(&mut self) -> bool {
         if let Some(ref mut wait_dat) = self.waiting_on_la {
             wait_dat.hb_timeout_handle.abort();
-            return true;
+            wait_dat.heartbeat_timeout_pending = true;
+            return self.activation.is_none();
         }
         false
     }
@@ -1370,6 +1393,9 @@ struct WaitingOnLAs {
     wft_timeout: Duration,
     /// Can be used to abort heartbeat timeouts
     hb_timeout_handle: AbortHandle,
+    /// Defers the heartbeat when lang must finish an outstanding activation before Core can safely
+    /// complete the workflow task.
+    heartbeat_timeout_pending: bool,
 }
 #[derive(Debug)]
 struct CompletionDataForWFT {

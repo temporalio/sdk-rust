@@ -12,8 +12,8 @@ use std::{
     collections::HashMap,
     ops::Sub,
     sync::{
-        Arc,
-        atomic::{AtomicI64, AtomicU8, AtomicUsize, Ordering},
+        Arc, OnceLock,
+        atomic::{AtomicBool, AtomicI64, AtomicU8, AtomicUsize, Ordering},
     },
     time::{Duration, Instant, SystemTime},
 };
@@ -26,7 +26,9 @@ use temporalio_common::{
         coresdk::{
             ActivityTaskCompletion, AsJsonPayloadExt, FromJsonPayloadExt,
             activity_result::ActivityExecutionResult,
-            workflow_activation::{WorkflowActivationJob, workflow_activation_job},
+            workflow_activation::{
+                WorkflowActivation, WorkflowActivationJob, workflow_activation_job,
+            },
             workflow_commands::{
                 ActivityCancellationType as ProtoActivityCancellationType, ScheduleLocalActivity,
                 workflow_command::Variant,
@@ -50,8 +52,8 @@ use temporalio_common::{
 use temporalio_macros::{activities, workflow, workflow_methods};
 use temporalio_sdk::{
     ActivityCancellationType, ActivityExecutionError, ActivityOptions, ApplicationFailure,
-    CancellableFuture, LocalActivityOptions, TimeoutType, WorkflowContext, WorkflowContextView,
-    WorkflowResult,
+    CancellableFuture, LocalActivityOptions, TimeoutType, Worker, WorkflowContext,
+    WorkflowContextView, WorkflowResult,
     activities::{ActivityContext, ActivityError},
     interceptors::{FailOnNondeterminismInterceptor, WorkerInterceptor},
 };
@@ -3782,4 +3784,167 @@ async fn cancel_after_act_starts_canned(
         allow_cancel_barr: allow_cancel_barr_clone,
     });
     worker.run().await.unwrap();
+}
+
+#[workflow]
+#[derive(Default)]
+struct HeartbeatTimeoutOverlapWf;
+
+#[workflow_methods]
+impl HeartbeatTimeoutOverlapWf {
+    #[run]
+    async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<()> {
+        let long = ctx.execute_local_activity(
+            HeartbeatTimeoutOverlapActivities::run,
+            true,
+            LocalActivityOptions::default(),
+        );
+        let short = ctx.execute_local_activity(
+            HeartbeatTimeoutOverlapActivities::run,
+            false,
+            LocalActivityOptions::default(),
+        );
+
+        let (long_result, short_result) = temporalio_sdk::workflows::join!(long, short);
+        long_result?;
+        short_result?;
+        Ok(())
+    }
+}
+
+struct HeartbeatTimeoutOverlapActivities {
+    long_started: Arc<Notify>,
+    release_long: Arc<Notify>,
+}
+
+#[activities]
+impl HeartbeatTimeoutOverlapActivities {
+    #[activity]
+    async fn run(self: Arc<Self>, _: ActivityContext, is_long: bool) -> Result<(), ActivityError> {
+        if is_long {
+            self.long_started.notify_one();
+            self.release_long.notified().await;
+        }
+        Ok(())
+    }
+}
+
+struct HoldFirstLocalActivityResolutionCompletion {
+    initial_activation_at: Arc<OnceLock<Instant>>,
+    resolution_activation_seen: Arc<Notify>,
+    release_resolution_activation: Arc<Notify>,
+    saw_resolution: AtomicBool,
+    hold_next_completion: AtomicBool,
+}
+
+#[async_trait::async_trait(?Send)]
+impl WorkerInterceptor for HoldFirstLocalActivityResolutionCompletion {
+    async fn on_workflow_activation(
+        &self,
+        activation: &WorkflowActivation,
+    ) -> Result<(), anyhow::Error> {
+        if activation.jobs.iter().any(|job| {
+            matches!(
+                job.variant.as_ref(),
+                Some(workflow_activation_job::Variant::InitializeWorkflow(_))
+            )
+        }) {
+            self.initial_activation_at
+                .set(Instant::now())
+                .expect("initial activation must only be observed once");
+        }
+
+        if activation.jobs.iter().any(|job| {
+            matches!(
+                job.variant.as_ref(),
+                Some(workflow_activation_job::Variant::ResolveActivity(_))
+            )
+        }) && !self.saw_resolution.swap(true, Ordering::SeqCst)
+        {
+            self.hold_next_completion.store(true, Ordering::SeqCst);
+            self.resolution_activation_seen.notify_one();
+        }
+
+        Ok(())
+    }
+
+    async fn on_workflow_activation_completion(&self, _: &WorkflowActivationCompletion) {
+        if self.hold_next_completion.swap(false, Ordering::SeqCst) {
+            self.release_resolution_activation.notified().await;
+        }
+    }
+
+    fn on_shutdown(&self, _: &Worker) {}
+}
+
+/// The heartbeat deadline can expire while lang still owns an LA-resolution activation. Core must
+/// not issue the heartbeat autocomplete until that activation has completed, since doing so would
+/// create two outstanding activations for the same run and panic.
+#[tokio::test]
+async fn heartbeat_timeout_does_not_overlap_local_activity_resolution_activation() {
+    let wf_name = "heartbeat_timeout_does_not_overlap_local_activity_resolution_activation";
+    let wft_timeout = Duration::from_secs(4);
+
+    let long_started = Arc::new(Notify::new());
+    let release_long = Arc::new(Notify::new());
+    let initial_activation_at = Arc::new(OnceLock::new());
+    let resolution_activation_seen = Arc::new(Notify::new());
+    let release_resolution_activation = Arc::new(Notify::new());
+
+    let mut starter = CoreWfStarter::new(wf_name);
+    starter
+        .sdk_config
+        .register_activities(HeartbeatTimeoutOverlapActivities {
+            long_started: long_started.clone(),
+            release_long: release_long.clone(),
+        });
+
+    let mut worker = starter.worker().await;
+    worker
+        .register_workflow::<HeartbeatTimeoutOverlapWf>()
+        .unwrap();
+
+    let task_queue = starter.get_task_queue().to_owned();
+    worker
+        .submit_workflow(
+            HeartbeatTimeoutOverlapWf::run,
+            (),
+            WorkflowStartOptions::new(task_queue, wf_name.to_owned())
+                .task_timeout(wft_timeout)
+                .build(),
+        )
+        .await
+        .unwrap();
+
+    let interceptor = HoldFirstLocalActivityResolutionCompletion {
+        initial_activation_at: initial_activation_at.clone(),
+        resolution_activation_seen: resolution_activation_seen.clone(),
+        release_resolution_activation: release_resolution_activation.clone(),
+        saw_resolution: AtomicBool::new(false),
+        hold_next_completion: AtomicBool::new(false),
+    };
+
+    let cross_heartbeat_deadline = async {
+        long_started.notified().await;
+        resolution_activation_seen.notified().await;
+
+        let initial_activation_at = *initial_activation_at
+            .get()
+            .expect("initial activation timestamp must be recorded");
+
+        // Core's heartbeat deadline is 80% of the WFT timeout. Keep the
+        // resolution activation outstanding until the real timer elapses.
+        tokio::time::sleep_until((initial_activation_at + wft_timeout.mul_f32(0.85)).into()).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        release_resolution_activation.notify_one();
+        release_long.notify_one();
+    };
+
+    let (_, worker_result) = tokio::join!(
+        cross_heartbeat_deadline,
+        worker.run_until_done_intercepted(Some(interceptor))
+    );
+
+    worker_result.unwrap();
 }
