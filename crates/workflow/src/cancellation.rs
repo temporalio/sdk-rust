@@ -113,7 +113,7 @@ impl WorkflowCancellationToken {
     ) -> WorkflowCancellationRegistration {
         if self.is_cancelled() {
             callback(self.reason());
-            return WorkflowCancellationRegistration::empty();
+            return WorkflowCancellationRegistration::default();
         }
 
         let id = self.inner.next_callback_id.get();
@@ -130,19 +130,13 @@ impl WorkflowCancellationToken {
     }
 }
 
+#[derive(Debug, Default)]
 pub(crate) struct WorkflowCancellationRegistration {
     token: Weak<WorkflowCancellationState>,
     callback_id: Option<u64>,
 }
 
 impl WorkflowCancellationRegistration {
-    fn empty() -> Self {
-        Self {
-            token: Weak::new(),
-            callback_id: None,
-        }
-    }
-
     pub(crate) fn unregister(&mut self) {
         let Some(callback_id) = self.callback_id.take() else {
             return;

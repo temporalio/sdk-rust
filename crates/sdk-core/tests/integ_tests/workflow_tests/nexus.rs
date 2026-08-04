@@ -44,7 +44,8 @@ use temporalio_common::{
 use temporalio_macros::{workflow, workflow_methods};
 use temporalio_sdk::{
     CancellableFuture, NexusOperationCancellationType, NexusOperationOptions, SyncWorkflowContext,
-    WorkflowContext, WorkflowContextView, WorkflowResult, WorkflowTermination,
+    WaitConditionOptions, WorkflowCancellationToken, WorkflowContext, WorkflowContextView,
+    WorkflowResult, WorkflowTermination,
 };
 use temporalio_sdk_core::PollError;
 use tokio::{
@@ -894,12 +895,15 @@ impl AsyncCompleterWf {
         ctx.cancelled().await;
         ctx.state(|wf| wf.cancellation_tx.send(true).unwrap());
 
+        // These waits coordinate cancellation completion, so they must outlive workflow cancellation.
         if ctx.state(|wf| wf.cancellation_type)
             == NexusOperationCancellationType::WaitCancellationCompleted
         {
             ctx.wait_condition(
                 |wf| wf.cancellation_wait_happened.load(Ordering::Relaxed),
-                Default::default(),
+                WaitConditionOptions::builder()
+                    .cancellation_token(WorkflowCancellationToken::new())
+                    .build(),
             )
             .await?;
         } else if ctx.state(|wf| wf.cancellation_type)
@@ -910,8 +914,13 @@ impl AsyncCompleterWf {
             // NexusOperationCancelRequestCompleted (written after cancel handler responds)
             // rather than NexusOperationCanceled (written after handler workflow completes as
             // cancelled).
-            ctx.wait_condition(|wf| wf.proceed_signal_received, Default::default())
-                .await?;
+            ctx.wait_condition(
+                |wf| wf.proceed_signal_received,
+                WaitConditionOptions::builder()
+                    .cancellation_token(WorkflowCancellationToken::new())
+                    .build(),
+            )
+            .await?;
         }
 
         ctx.state(|wf| wf.handler_exited_tx.send(true).unwrap());
