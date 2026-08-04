@@ -317,7 +317,7 @@ impl WorkflowInterceptorContext {
     pub fn timer<T: Into<TimerOptions>>(
         &self,
         opts: T,
-    ) -> impl CancellableFuture<TimerResult> + use<T> {
+    ) -> impl CancellableFuture<Output = TimerResult> + use<T> {
         self.base.timer(opts)
     }
 
@@ -327,7 +327,7 @@ impl WorkflowInterceptorContext {
         activity: AD,
         input: impl Into<AD::Input>,
         opts: ActivityOptions,
-    ) -> impl CancellableFuture<Result<AD::Output, ActivityExecutionError>>
+    ) -> impl CancellableFuture<Output = Result<AD::Output, ActivityExecutionError>>
     where
         AD::Output: TemporalDeserializable,
     {
@@ -340,7 +340,7 @@ impl WorkflowInterceptorContext {
         activity: AD,
         input: impl Into<AD::Input>,
         opts: LocalActivityOptions,
-    ) -> impl CancellableFuture<Result<AD::Output, ActivityExecutionError>>
+    ) -> impl CancellableFuture<Output = Result<AD::Output, ActivityExecutionError>>
     where
         AD::Output: TemporalDeserializable,
     {
@@ -353,7 +353,9 @@ impl WorkflowInterceptorContext {
         workflow: WD,
         input: impl Into<WD::Input>,
         opts: ChildWorkflowOptions,
-    ) -> impl CancellableFutureWithReason<Result<StartedChildWorkflow<WD>, ChildWorkflowStartError>>
+    ) -> impl CancellableFutureWithReason<
+        Output = Result<StartedChildWorkflow<WD>, ChildWorkflowStartError>,
+    >
     where
         WD::Output: TemporalDeserializable,
     {
@@ -373,7 +375,7 @@ impl WorkflowInterceptorContext {
     pub fn start_nexus_operation(
         &self,
         opts: NexusOperationOptions,
-    ) -> impl CancellableFuture<NexusStartResult> {
+    ) -> impl CancellableFuture<Output = NexusStartResult> {
         self.base.start_nexus_operation(opts)
     }
 }
@@ -913,7 +915,7 @@ impl<T> FusedFuture for CancellableWorkflowOutboundFuture<T> {
     }
 }
 
-impl<T> CancellableFuture<T> for CancellableWorkflowOutboundFuture<T> {
+impl<T> CancellableFuture for CancellableWorkflowOutboundFuture<T> {
     fn cancel(&self) {
         if !self.inner.is_terminated() {
             self.cancellation.cancel(None);
@@ -921,7 +923,7 @@ impl<T> CancellableFuture<T> for CancellableWorkflowOutboundFuture<T> {
     }
 }
 
-impl<T> CancellableFutureWithReason<T> for CancellableWorkflowOutboundFuture<T> {
+impl<T> CancellableFutureWithReason for CancellableWorkflowOutboundFuture<T> {
     fn cancel_with_reason(&self, reason: String) {
         if !self.inner.is_terminated() {
             self.cancellation.cancel(Some(reason));

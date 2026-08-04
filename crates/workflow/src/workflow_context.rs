@@ -720,7 +720,7 @@ impl BaseWorkflowContext {
     pub fn timer<T: Into<TimerOptions>>(
         &self,
         opts: T,
-    ) -> impl CancellableFuture<TimerResult> + use<T> {
+    ) -> impl CancellableFuture<Output = TimerResult> + use<T> {
         let input = StartTimerInput::new(opts.into());
         let base_ctx = self.clone();
         let next = WorkflowNext::new(move |input: StartTimerInput| {
@@ -759,7 +759,7 @@ impl BaseWorkflowContext {
         activity: AD,
         input: impl Into<AD::Input>,
         opts: ActivityOptions,
-    ) -> impl CancellableFuture<Result<AD::Output, ActivityExecutionError>>
+    ) -> impl CancellableFuture<Output = Result<AD::Output, ActivityExecutionError>>
     where
         AD::Output: TemporalDeserializable,
     {
@@ -847,7 +847,7 @@ impl BaseWorkflowContext {
         activity: AD,
         input: impl Into<AD::Input>,
         opts: LocalActivityOptions,
-    ) -> impl CancellableFuture<Result<AD::Output, ActivityExecutionError>>
+    ) -> impl CancellableFuture<Output = Result<AD::Output, ActivityExecutionError>>
     where
         AD::Output: TemporalDeserializable,
     {
@@ -926,7 +926,9 @@ impl BaseWorkflowContext {
         workflow: WD,
         input: impl Into<WD::Input>,
         opts: ChildWorkflowOptions,
-    ) -> impl CancellableFutureWithReason<Result<StartedChildWorkflow<WD>, ChildWorkflowStartError>>
+    ) -> impl CancellableFutureWithReason<
+        Output = Result<StartedChildWorkflow<WD>, ChildWorkflowStartError>,
+    >
     where
         WD::Output: TemporalDeserializable,
     {
@@ -1039,7 +1041,7 @@ impl BaseWorkflowContext {
         arguments: Vec<Payload>,
         headers: HashMap<String, Payload>,
         opts: LocalActivityOptions,
-    ) -> impl CancellableFuture<ActivityResolution> {
+    ) -> impl CancellableFuture<Output = ActivityResolution> {
         let seq = self.inner.seq_nums.borrow_mut().next_activity_seq();
         let (cmd, unblocker) =
             CancellableWFCommandFut::new(CancellableID::LocalActivity(seq), self.clone());
@@ -1209,7 +1211,7 @@ impl BaseWorkflowContext {
     pub(crate) fn start_nexus_operation(
         &self,
         opts: NexusOperationOptions,
-    ) -> impl CancellableFuture<NexusStartResult> {
+    ) -> impl CancellableFuture<Output = NexusStartResult> {
         let input = StartNexusOperationInput::new(opts);
         let base_ctx = self.clone();
         let next = WorkflowNext::new(move |input: StartNexusOperationInput| {
@@ -1440,7 +1442,10 @@ impl<W> SyncWorkflowContext<W> {
     }
 
     /// Request to create a timer
-    pub fn timer<T: Into<TimerOptions>>(&self, opts: T) -> impl CancellableFuture<TimerResult> {
+    pub fn timer<T: Into<TimerOptions>>(
+        &self,
+        opts: T,
+    ) -> impl CancellableFuture<Output = TimerResult> {
         self.base.timer(opts)
     }
 
@@ -1450,7 +1455,7 @@ impl<W> SyncWorkflowContext<W> {
         activity: AD,
         input: impl Into<AD::Input>,
         opts: ActivityOptions,
-    ) -> impl CancellableFuture<Result<AD::Output, ActivityExecutionError>>
+    ) -> impl CancellableFuture<Output = Result<AD::Output, ActivityExecutionError>>
     where
         AD::Output: TemporalDeserializable,
     {
@@ -1466,7 +1471,7 @@ impl<W> SyncWorkflowContext<W> {
         activity: AD,
         input: impl Into<AD::Input>,
         opts: ActivityOptions,
-    ) -> impl CancellableFuture<Result<AD::Output, ActivityExecutionError>>
+    ) -> impl CancellableFuture<Output = Result<AD::Output, ActivityExecutionError>>
     where
         AD::Output: TemporalDeserializable,
     {
@@ -1479,7 +1484,7 @@ impl<W> SyncWorkflowContext<W> {
         activity: AD,
         input: impl Into<AD::Input>,
         opts: LocalActivityOptions,
-    ) -> impl CancellableFuture<Result<AD::Output, ActivityExecutionError>>
+    ) -> impl CancellableFuture<Output = Result<AD::Output, ActivityExecutionError>>
     where
         AD::Output: TemporalDeserializable,
     {
@@ -1495,7 +1500,7 @@ impl<W> SyncWorkflowContext<W> {
         activity: AD,
         input: impl Into<AD::Input>,
         opts: LocalActivityOptions,
-    ) -> impl CancellableFuture<Result<AD::Output, ActivityExecutionError>>
+    ) -> impl CancellableFuture<Output = Result<AD::Output, ActivityExecutionError>>
     where
         AD::Output: TemporalDeserializable,
     {
@@ -1509,7 +1514,9 @@ impl<W> SyncWorkflowContext<W> {
         workflow: WD,
         input: impl Into<WD::Input>,
         opts: ChildWorkflowOptions,
-    ) -> impl CancellableFutureWithReason<Result<StartedChildWorkflow<WD>, ChildWorkflowStartError>>
+    ) -> impl CancellableFutureWithReason<
+        Output = Result<StartedChildWorkflow<WD>, ChildWorkflowStartError>,
+    >
     where
         WD::Output: TemporalDeserializable,
     {
@@ -1523,7 +1530,9 @@ impl<W> SyncWorkflowContext<W> {
         workflow: WD,
         input: impl Into<WD::Input>,
         opts: ChildWorkflowOptions,
-    ) -> impl CancellableFutureWithReason<Result<StartedChildWorkflow<WD>, ChildWorkflowStartError>>
+    ) -> impl CancellableFutureWithReason<
+        Output = Result<StartedChildWorkflow<WD>, ChildWorkflowStartError>,
+    >
     where
         WD::Output: TemporalDeserializable,
     {
@@ -1697,7 +1706,7 @@ impl<W> SyncWorkflowContext<W> {
     pub fn start_nexus_operation(
         &self,
         opts: NexusOperationOptions,
-    ) -> impl CancellableFuture<NexusStartResult> {
+    ) -> impl CancellableFuture<Output = NexusStartResult> {
         self.base.start_nexus_operation(opts)
     }
 
@@ -1853,7 +1862,10 @@ impl<W> WorkflowContext<W> {
     }
 
     /// Request to create a timer
-    pub fn timer<T: Into<TimerOptions>>(&self, opts: T) -> impl CancellableFuture<TimerResult> {
+    pub fn timer<T: Into<TimerOptions>>(
+        &self,
+        opts: T,
+    ) -> impl CancellableFuture<Output = TimerResult> {
         self.sync.timer(opts)
     }
 
@@ -1863,7 +1875,7 @@ impl<W> WorkflowContext<W> {
         activity: AD,
         input: impl Into<AD::Input>,
         opts: ActivityOptions,
-    ) -> impl CancellableFuture<Result<AD::Output, ActivityExecutionError>>
+    ) -> impl CancellableFuture<Output = Result<AD::Output, ActivityExecutionError>>
     where
         AD::Output: TemporalDeserializable,
     {
@@ -1879,7 +1891,7 @@ impl<W> WorkflowContext<W> {
         activity: AD,
         input: impl Into<AD::Input>,
         opts: ActivityOptions,
-    ) -> impl CancellableFuture<Result<AD::Output, ActivityExecutionError>>
+    ) -> impl CancellableFuture<Output = Result<AD::Output, ActivityExecutionError>>
     where
         AD::Output: TemporalDeserializable,
     {
@@ -1892,7 +1904,7 @@ impl<W> WorkflowContext<W> {
         activity: AD,
         input: impl Into<AD::Input>,
         opts: LocalActivityOptions,
-    ) -> impl CancellableFuture<Result<AD::Output, ActivityExecutionError>>
+    ) -> impl CancellableFuture<Output = Result<AD::Output, ActivityExecutionError>>
     where
         AD::Output: TemporalDeserializable,
     {
@@ -1908,7 +1920,7 @@ impl<W> WorkflowContext<W> {
         activity: AD,
         input: impl Into<AD::Input>,
         opts: LocalActivityOptions,
-    ) -> impl CancellableFuture<Result<AD::Output, ActivityExecutionError>>
+    ) -> impl CancellableFuture<Output = Result<AD::Output, ActivityExecutionError>>
     where
         AD::Output: TemporalDeserializable,
     {
@@ -1921,7 +1933,9 @@ impl<W> WorkflowContext<W> {
         workflow: WD,
         input: impl Into<WD::Input>,
         opts: ChildWorkflowOptions,
-    ) -> impl CancellableFutureWithReason<Result<StartedChildWorkflow<WD>, ChildWorkflowStartError>>
+    ) -> impl CancellableFutureWithReason<
+        Output = Result<StartedChildWorkflow<WD>, ChildWorkflowStartError>,
+    >
     where
         WD::Output: TemporalDeserializable,
     {
@@ -1935,7 +1949,9 @@ impl<W> WorkflowContext<W> {
         workflow: WD,
         input: impl Into<WD::Input>,
         opts: ChildWorkflowOptions,
-    ) -> impl CancellableFutureWithReason<Result<StartedChildWorkflow<WD>, ChildWorkflowStartError>>
+    ) -> impl CancellableFutureWithReason<
+        Output = Result<StartedChildWorkflow<WD>, ChildWorkflowStartError>,
+    >
     where
         WD::Output: TemporalDeserializable,
     {
@@ -1997,7 +2013,7 @@ impl<W> WorkflowContext<W> {
     pub fn start_nexus_operation(
         &self,
         opts: NexusOperationOptions,
-    ) -> impl CancellableFuture<NexusStartResult> {
+    ) -> impl CancellableFuture<Output = NexusStartResult> {
         self.sync.start_nexus_operation(opts)
     }
 
@@ -2121,19 +2137,19 @@ struct WorkflowContextSharedData {
 
 /// A Future that can be cancelled.
 /// Used in the prototype SDK for cancelling operations like timers and activities.
-pub trait CancellableFuture<T>: Future<Output = T> + FusedFuture {
+pub trait CancellableFuture: FusedFuture {
     /// Cancel this Future
     fn cancel(&self);
 }
 
 /// A Future that can be cancelled with a reason
-pub trait CancellableFutureWithReason<T>: CancellableFuture<T> {
+pub trait CancellableFutureWithReason: CancellableFuture {
     /// Cancel this Future with a reason
     fn cancel_with_reason(&self, reason: String);
 }
 
 fn cancellable_outbound<T: 'static>(
-    future: impl CancellableFuture<T> + 'static,
+    future: impl CancellableFuture<Output = T> + 'static,
 ) -> CancellableWorkflowOutboundFuture<T> {
     let future = Rc::new(RefCell::new(Box::pin(future)));
     let polled = future.clone();
@@ -2147,7 +2163,7 @@ fn cancellable_outbound<T: 'static>(
 }
 
 fn cancellable_outbound_with_reason<T: 'static>(
-    future: impl CancellableFutureWithReason<T> + 'static,
+    future: impl CancellableFutureWithReason<Output = T> + 'static,
 ) -> CancellableWorkflowOutboundFuture<T> {
     let future = Rc::new(RefCell::new(Box::pin(future)));
     let polled = future.clone();
@@ -2271,7 +2287,7 @@ where
     }
 }
 
-impl<T, D> CancellableFuture<T> for CancellableWFCommandFut<T, D>
+impl<T, D> CancellableFuture for CancellableWFCommandFut<T, D>
 where
     T: Unblockable<OtherDat = D>,
 {
@@ -2279,7 +2295,7 @@ where
         self.base_ctx.cancel(self.cancellable_id.clone());
     }
 }
-impl<T, D> CancellableFutureWithReason<T> for CancellableWFCommandFut<T, D>
+impl<T, D> CancellableFutureWithReason for CancellableWFCommandFut<T, D>
 where
     T: Unblockable<OtherDat = D>,
 {
@@ -2294,8 +2310,8 @@ struct LATimerBackoffFut {
     activity_type: String,
     arguments: Vec<Payload>,
     headers: HashMap<String, Payload>,
-    current_fut: Pin<Box<dyn CancellableFuture<ActivityResolution> + Unpin>>,
-    timer_fut: Option<Pin<Box<dyn CancellableFuture<TimerResult> + Unpin>>>,
+    current_fut: Pin<Box<dyn CancellableFuture<Output = ActivityResolution> + Unpin>>,
+    timer_fut: Option<Pin<Box<dyn CancellableFuture<Output = TimerResult> + Unpin>>>,
     base_ctx: BaseWorkflowContext,
     next_attempt: u32,
     next_sched_time: Option<prost_types::Timestamp>,
@@ -2417,7 +2433,7 @@ impl FusedFuture for LATimerBackoffFut {
         self.terminated
     }
 }
-impl CancellableFuture<ActivityResolution> for LATimerBackoffFut {
+impl CancellableFuture for LATimerBackoffFut {
     fn cancel(&self) {
         self.did_cancel.store(true, Ordering::Release);
         if let Some(tf) = self.timer_fut.as_ref() {
@@ -2542,9 +2558,9 @@ where
     }
 }
 
-impl<F, Output> CancellableFuture<Result<Output, ActivityExecutionError>> for ActivityFut<F, Output>
+impl<F, Output> CancellableFuture for ActivityFut<F, Output>
 where
-    F: CancellableFuture<ActivityResolution> + Unpin,
+    F: CancellableFuture<Output = ActivityResolution> + Unpin,
     Output: TemporalDeserializable + 'static,
 {
     fn cancel(&self) {
@@ -2712,10 +2728,9 @@ where
     }
 }
 
-impl<F, Output> CancellableFutureWithReason<Result<Output, ChildWorkflowExecutionError>>
-    for ChildWorkflowFut<F, Output>
+impl<F, Output> CancellableFutureWithReason for ChildWorkflowFut<F, Output>
 where
-    F: CancellableFutureWithReason<ChildWorkflowResult> + Unpin,
+    F: CancellableFutureWithReason<Output = ChildWorkflowResult> + Unpin,
     Output: TemporalDeserializable + 'static,
 {
     fn cancel_with_reason(&self, reason: String) {
@@ -2725,10 +2740,9 @@ where
     }
 }
 
-impl<F, Output> CancellableFuture<Result<Output, ChildWorkflowExecutionError>>
-    for ChildWorkflowFut<F, Output>
+impl<F, Output> CancellableFuture for ChildWorkflowFut<F, Output>
 where
-    F: CancellableFutureWithReason<ChildWorkflowResult> + Unpin,
+    F: CancellableFutureWithReason<Output = ChildWorkflowResult> + Unpin,
     Output: TemporalDeserializable + 'static,
 {
     fn cancel(&self) {
@@ -2840,9 +2854,9 @@ where
     }
 }
 
-impl<F, WD> CancellableFuture<StartChildWorkflowResult> for ChildWorkflowStartFut<F, WD>
+impl<F, WD> CancellableFuture for ChildWorkflowStartFut<F, WD>
 where
-    F: CancellableFutureWithReason<PendingChildWorkflow<WD>> + Unpin,
+    F: CancellableFutureWithReason<Output = PendingChildWorkflow<WD>> + Unpin,
     WD: WorkflowDefinition,
 {
     fn cancel(&self) {
@@ -2852,9 +2866,9 @@ where
     }
 }
 
-impl<F, WD> CancellableFutureWithReason<StartChildWorkflowResult> for ChildWorkflowStartFut<F, WD>
+impl<F, WD> CancellableFutureWithReason for ChildWorkflowStartFut<F, WD>
 where
-    F: CancellableFutureWithReason<PendingChildWorkflow<WD>> + Unpin,
+    F: CancellableFutureWithReason<Output = PendingChildWorkflow<WD>> + Unpin,
     WD: WorkflowDefinition,
 {
     fn cancel_with_reason(&self, reason: String) {
@@ -2914,9 +2928,9 @@ where
     }
 }
 
-impl<F> CancellableFuture<Result<(), WorkflowSignalError>> for SignalChildFut<F>
+impl<F> CancellableFuture for SignalChildFut<F>
 where
-    F: CancellableFuture<SignalExternalWfResult> + Unpin,
+    F: CancellableFuture<Output = SignalExternalWfResult> + Unpin,
 {
     fn cancel(&self) {
         if let SignalChildFut::Running { inner, .. } = self {
@@ -2933,7 +2947,8 @@ where
     /// into `WD::Output`.
     pub fn result(
         self,
-    ) -> impl CancellableFutureWithReason<Result<WD::Output, ChildWorkflowExecutionError>> {
+    ) -> impl CancellableFutureWithReason<Output = Result<WD::Output, ChildWorkflowExecutionError>>
+    {
         self.result_future.map(|result| {
             result.and_then(|output| {
                 output
@@ -2964,7 +2979,7 @@ where
         &self,
         signal: S,
         input: S::Input,
-    ) -> impl CancellableFuture<Result<(), WorkflowSignalError>> + 'static {
+    ) -> impl CancellableFuture<Output = Result<(), WorkflowSignalError>> + 'static {
         self.base_ctx.signal_workflow(
             SignalWorkflowTarget::Child {
                 workflow_id: self.workflow_id.clone(),
@@ -3005,7 +3020,7 @@ impl ExternalWorkflowHandle {
         &self,
         signal: S,
         input: S::Input,
-    ) -> impl CancellableFuture<Result<(), WorkflowSignalError>> + 'static {
+    ) -> impl CancellableFuture<Output = Result<(), WorkflowSignalError>> + 'static {
         self.base_ctx.signal_workflow(
             SignalWorkflowTarget::External {
                 namespace: self.namespace.clone(),
