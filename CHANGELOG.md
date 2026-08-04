@@ -39,6 +39,8 @@ to docs, or any other relevant information.
   construct client TLS options.
 * `ClientKeepAliveOptions` is now tagged with `#[non_exhaustive]`. Use
   `ClientKeepAliveOptions::builder()` to construct keep-alive options.
+* `PayloadLimitsOptions` is now tagged with `#[non_exhaustive]`. Use
+  `PayloadLimitsOptions::builder()` to construct payload limit options.
 
 ## [0.6.0] - 2026-08-04
 

@@ -1471,10 +1471,12 @@ impl TryFrom<&ConnectionOptions> for temporalio_client::ConnectionOptions {
                     ClientGrpcCompression::Gzip => temporalio_client::GrpcCompression::Gzip,
                     ClientGrpcCompression::None => temporalio_client::GrpcCompression::None,
                 })
-                .payload_limits(temporalio_client::PayloadLimitsOptions {
-                    payloads_warn_size: opts.payloads_warn_size,
-                    memo_warn_size: opts.memo_warn_size,
-                })
+                .payload_limits(
+                    temporalio_client::PayloadLimitsOptions::builder()
+                        .payloads_warn_size(opts.payloads_warn_size)
+                        .memo_warn_size(opts.memo_warn_size)
+                        .build(),
+                )
                 .build(),
         )
     }

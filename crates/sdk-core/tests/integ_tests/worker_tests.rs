@@ -541,10 +541,10 @@ async fn warn_band_payload_is_logged_and_completes() {
 
     let mut conn_opts = get_integ_server_options();
     conn_opts.metrics_meter = runtime.telemetry().get_temporal_metric_meter();
-    conn_opts.payload_limits = PayloadLimitsOptions {
-        payloads_warn_size: 1,
-        memo_warn_size: 1,
-    };
+    conn_opts.payload_limits = PayloadLimitsOptions::builder()
+        .payloads_warn_size(1)
+        .memo_warn_size(1)
+        .build();
     let connection = Connection::connect(conn_opts).await.unwrap();
     let client = Client::new(connection, ClientOptions::new(integ_namespace()).build()).unwrap();
 
