@@ -66,10 +66,12 @@ fn build_tls_options(tls: ClientConfigTLS) -> Result<TlsOptions, ConfigError> {
                 resolve_datasource(cert).map_err(|e| ConfigError::LoadError(e.into()))?;
             let key_bytes =
                 resolve_datasource(key).map_err(|e| ConfigError::LoadError(e.into()))?;
-            Some(ClientTlsOptions {
-                client_cert: cert_bytes,
-                client_private_key: key_bytes,
-            })
+            Some(
+                ClientTlsOptions::builder()
+                    .client_cert(cert_bytes)
+                    .client_private_key(key_bytes)
+                    .build(),
+            )
         }
         (Some(_), None) | (None, Some(_)) => {
             return Err(ConfigError::InvalidConfig(

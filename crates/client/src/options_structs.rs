@@ -221,7 +221,8 @@ impl std::fmt::Debug for TlsOptions {
 }
 
 /// If using mTLS, both the client cert and private key must be specified, this contains them.
-#[derive(Clone)]
+#[derive(Clone, bon::Builder)]
+#[non_exhaustive]
 pub struct ClientTlsOptions {
     /// The certificate for this client, encoded as PEM
     pub client_cert: Vec<u8>,

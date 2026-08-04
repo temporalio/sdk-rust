@@ -227,10 +227,12 @@ async fn get_cloud_client_with_compression(compression: GrpcCompression) -> Clie
         .identity("sdk-test-client")
         .tls_options(
             TlsOptions::builder()
-                .client_tls_options(ClientTlsOptions {
-                    client_cert,
-                    client_private_key,
-                })
+                .client_tls_options(
+                    ClientTlsOptions::builder()
+                        .client_cert(client_cert)
+                        .client_private_key(client_private_key)
+                        .build(),
+                )
                 .build(),
         )
         .grpc_compression(compression)
@@ -850,10 +852,12 @@ pub(crate) fn get_integ_tls_config() -> Option<TlsOptions> {
         Some(
             TlsOptions::builder()
                 .server_root_ca_cert(root)
-                .client_tls_options(ClientTlsOptions {
-                    client_cert,
-                    client_private_key,
-                })
+                .client_tls_options(
+                    ClientTlsOptions::builder()
+                        .client_cert(client_cert)
+                        .client_private_key(client_private_key)
+                        .build(),
+                )
                 .build(),
         )
     } else {

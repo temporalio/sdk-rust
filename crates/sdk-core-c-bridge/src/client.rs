@@ -1490,10 +1490,12 @@ impl TryFrom<&ClientTlsOptions> for temporalio_client::TlsOptions {
         ) {
             (None, None) => None,
             (Some(client_cert), Some(client_private_key)) => {
-                Some(temporalio_client::ClientTlsOptions {
-                    client_cert,
-                    client_private_key,
-                })
+                Some(
+                    temporalio_client::ClientTlsOptions::builder()
+                        .client_cert(client_cert)
+                        .client_private_key(client_private_key)
+                        .build(),
+                )
             }
             _ => {
                 return Err(anyhow::anyhow!(

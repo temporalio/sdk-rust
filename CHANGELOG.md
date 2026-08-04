@@ -35,6 +35,8 @@ to docs, or any other relevant information.
   `HttpConnectProxyOptions::new(target_addr)` to construct proxy options.
 * `TlsOptions` is now tagged with `#[non_exhaustive]`. Use `TlsOptions::builder()` to construct
   TLS options.
+* `ClientTlsOptions` is now tagged with `#[non_exhaustive]`. Use `ClientTlsOptions::builder()` to
+  construct client TLS options.
 
 ## [0.6.0] - 2026-08-04
 
