@@ -571,7 +571,8 @@ async fn http_proxy() {
     assert!(tcp_proxy.hit_count() == 0);
 
     // Connect client to proxy and make call and confirm reached
-    opts.http_connect_proxy = Some(HttpConnectProxyOptions::new(tcp_proxy_addr.to_string()).build());
+    opts.http_connect_proxy =
+        Some(HttpConnectProxyOptions::new(tcp_proxy_addr.to_string()).build());
     opts.dns_load_balancing = None;
     let connection = Connection::connect(opts.clone()).await.unwrap();
     let client_opts = temporalio_client::ClientOptions::new("my-namespace").build();

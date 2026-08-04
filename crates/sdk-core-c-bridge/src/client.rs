@@ -1491,14 +1491,12 @@ impl TryFrom<&ClientTlsOptions> for temporalio_client::TlsOptions {
             opts.client_private_key.to_option_vec(),
         ) {
             (None, None) => None,
-            (Some(client_cert), Some(client_private_key)) => {
-                Some(
-                    temporalio_client::ClientTlsOptions::builder()
-                        .client_cert(client_cert)
-                        .client_private_key(client_private_key)
-                        .build(),
-                )
-            }
+            (Some(client_cert), Some(client_private_key)) => Some(
+                temporalio_client::ClientTlsOptions::builder()
+                    .client_cert(client_cert)
+                    .client_private_key(client_private_key)
+                    .build(),
+            ),
             _ => {
                 return Err(anyhow::anyhow!(
                     "Must have both client cert and private key or neither"
@@ -1520,9 +1518,10 @@ impl From<&ClientRetryOptions> for temporalio_client::RetryOptions {
             .randomization_factor(opts.randomization_factor)
             .multiplier(opts.multiplier)
             .max_interval(Duration::from_millis(opts.max_interval_millis))
-            .max_elapsed_time((opts.max_elapsed_time_millis != 0).then(|| {
-                Duration::from_millis(opts.max_elapsed_time_millis)
-            }))
+            .max_elapsed_time(
+                (opts.max_elapsed_time_millis != 0)
+                    .then(|| Duration::from_millis(opts.max_elapsed_time_millis)),
+            )
             .max_retries(opts.max_retries)
             .build()
     }

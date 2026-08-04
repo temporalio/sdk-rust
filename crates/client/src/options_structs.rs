@@ -231,7 +231,7 @@ pub struct ClientTlsOptions {
 }
 
 /// Client keep alive configuration.
-#[derive(Clone, Debug, bon::Builder)]
+#[derive(Clone, Debug, PartialEq, bon::Builder)]
 #[non_exhaustive]
 pub struct ClientKeepAliveOptions {
     /// Interval to send HTTP2 keep alive pings.
@@ -252,7 +252,7 @@ impl Default for ClientKeepAliveOptions {
 }
 
 /// Options for DNS-based load balancing.
-#[derive(Clone, Debug, bon::Builder)]
+#[derive(Clone, Debug, PartialEq, bon::Builder)]
 #[non_exhaustive]
 pub struct DnsLoadBalancingOptions {
     /// How often to re-resolve DNS. Defaults to 30 seconds.
@@ -270,7 +270,7 @@ impl Default for DnsLoadBalancingOptions {
 
 /// Payload size limit options for a connection.
 /// NOTE: Experimental
-#[derive(Clone, Debug, bon::Builder)]
+#[derive(Clone, Debug, PartialEq, bon::Builder)]
 #[non_exhaustive]
 pub struct PayloadLimitsOptions {
     /// Warning threshold (bytes) for the size of an outbound payload-bearing field; over-threshold
@@ -630,4 +630,61 @@ pub struct WorkflowCountOptions {
     /// Controls for the count RPC.
     #[builder(default)]
     pub rpc_options: RpcOptions,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tls_options_default_matches_builder_default() {
+        let TlsOptions {
+            server_root_ca_cert,
+            domain,
+            client_tls_options,
+            server_cert_verifier,
+        } = TlsOptions::default();
+        let TlsOptions {
+            server_root_ca_cert: built_server_root_ca_cert,
+            domain: built_domain,
+            client_tls_options: built_client_tls_options,
+            server_cert_verifier: built_server_cert_verifier,
+        } = TlsOptions::builder().build();
+
+        assert_eq!(server_root_ca_cert, built_server_root_ca_cert);
+        assert_eq!(domain, built_domain);
+        assert_eq!(
+            client_tls_options.map(|options| { (options.client_cert, options.client_private_key) }),
+            built_client_tls_options
+                .map(|options| { (options.client_cert, options.client_private_key) })
+        );
+        assert_eq!(
+            server_cert_verifier.is_some(),
+            built_server_cert_verifier.is_some()
+        );
+    }
+
+    #[test]
+    fn client_keep_alive_options_default_matches_builder_default() {
+        assert_eq!(
+            ClientKeepAliveOptions::default(),
+            ClientKeepAliveOptions::builder().build()
+        );
+    }
+
+    #[test]
+    fn dns_load_balancing_options_default_matches_builder_default() {
+        assert_eq!(
+            DnsLoadBalancingOptions::default(),
+            DnsLoadBalancingOptions::builder().build()
+        );
+    }
+
+    #[test]
+    fn payload_limits_options_default_matches_builder_default() {
+        assert_eq!(
+            PayloadLimitsOptions::default(),
+            PayloadLimitsOptions::builder().build()
+        );
+    }
 }

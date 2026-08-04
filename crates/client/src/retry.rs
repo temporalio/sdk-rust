@@ -387,6 +387,11 @@ mod tests {
     };
     use tonic::{IntoRequest, Status};
 
+    #[test]
+    fn retry_options_default_matches_builder_default() {
+        assert_eq!(RetryOptions::default(), RetryOptions::builder().build());
+    }
+
     /// Predefined retry configs with low durations to make unit tests faster
     const TEST_RETRY_CONFIG: RetryOptions = RetryOptions {
         initial_interval: Duration::from_millis(1),

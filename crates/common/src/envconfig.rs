@@ -174,7 +174,7 @@ pub struct ClientConfigCodec {
 }
 
 /// Options for loading client configuration
-#[derive(Debug, Default, bon::Builder)]
+#[derive(Debug, Default, PartialEq, bon::Builder)]
 #[non_exhaustive]
 pub struct LoadClientConfigOptions {
     /// Where to load config from. If unset, will try env vars then default path.
@@ -186,7 +186,7 @@ pub struct LoadClientConfigOptions {
 }
 
 /// Options for loading a client configuration profile
-#[derive(Debug, Default, bon::Builder)]
+#[derive(Debug, Default, PartialEq, bon::Builder)]
 #[non_exhaustive]
 pub struct LoadClientConfigProfileOptions {
     /// Where to load config from. If unset, will try env vars then default path.
@@ -209,7 +209,7 @@ pub struct LoadClientConfigProfileOptions {
 }
 
 /// Options for parsing TOML configuration
-#[derive(Debug, Default, bon::Builder)]
+#[derive(Debug, Default, PartialEq, bon::Builder)]
 #[non_exhaustive]
 pub struct ClientConfigFromTOMLOptions {
     /// If true, will error if there are unrecognized keys.
@@ -1058,6 +1058,30 @@ mod tests {
     use tempfile::NamedTempFile;
 
     #[test]
+    fn load_client_config_options_default_matches_builder_default() {
+        assert_eq!(
+            LoadClientConfigOptions::default(),
+            LoadClientConfigOptions::builder().build()
+        );
+    }
+
+    #[test]
+    fn load_client_config_profile_options_default_matches_builder_default() {
+        assert_eq!(
+            LoadClientConfigProfileOptions::default(),
+            LoadClientConfigProfileOptions::builder().build()
+        );
+    }
+
+    #[test]
+    fn client_config_from_toml_options_default_matches_builder_default() {
+        assert_eq!(
+            ClientConfigFromTOMLOptions::default(),
+            ClientConfigFromTOMLOptions::builder().build()
+        );
+    }
+
+    #[test]
     fn test_client_config_toml_multiple_profiles() {
         let toml_str = r#"
 [profile.default]
@@ -1420,9 +1444,7 @@ unrecognized_field = "is-bad"
 "#;
         let err = ClientConfig::from_toml(
             toml_str.as_bytes(),
-            ClientConfigFromTOMLOptions::builder()
-                .strict(true)
-                .build(),
+            ClientConfigFromTOMLOptions::builder().strict(true).build(),
         )
         .unwrap_err();
         let err_str = err.to_string();
@@ -1437,9 +1459,7 @@ foo = "bar"
 "#;
         let err = ClientConfig::from_toml(
             toml_str.as_bytes(),
-            ClientConfigFromTOMLOptions::builder()
-                .strict(true)
-                .build(),
+            ClientConfigFromTOMLOptions::builder().strict(true).build(),
         )
         .unwrap_err();
         let err_str = err.to_string();

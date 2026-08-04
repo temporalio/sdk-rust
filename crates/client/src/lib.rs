@@ -2438,9 +2438,7 @@ mod tests {
         async fn rpc_options_reach_the_request() {
             let (client, recorded) = mock_client(Vec::new(), Arc::new(AtomicUsize::new(0)));
             let mut metadata = RpcMetadata::new();
-            metadata
-                .insert("call-meta", "call-value")
-                .unwrap();
+            metadata.insert("call-meta", "call-value").unwrap();
             metadata
                 .insert_binary("call-meta-bin", vec![0, 255])
                 .unwrap();

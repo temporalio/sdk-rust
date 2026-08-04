@@ -176,7 +176,7 @@ pub enum RpcMetadataError {
 }
 
 /// Controls applied to a single high-level client RPC.
-#[derive(Clone, Debug, Default, bon::Builder)]
+#[derive(Clone, Debug, Default, PartialEq, bon::Builder)]
 #[non_exhaustive]
 pub struct RpcOptions {
     /// Metadata attached to the RPC.
@@ -205,6 +205,11 @@ impl RpcOptions {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rpc_options_default_matches_builder_default() {
+        assert_eq!(RpcOptions::default(), RpcOptions::builder().build());
+    }
 
     #[test]
     fn metadata_validates_and_exposes_values() {
