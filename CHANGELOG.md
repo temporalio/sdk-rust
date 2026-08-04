@@ -19,9 +19,21 @@ to docs, or any other relevant information.
 
 ## Unreleased
 
+### Added
+* `WorkflowStartOptions::memo` attaches a non-indexed memo when starting a workflow, using the
+  same `MemoValues` type already used by continue-as-new and `WorkflowContext::upsert_memo`.
+  Values are serialized with the client's payload converter and codec, matching how `describe`
+  and `list` read them back.
+* `MemoValue` and `MemoValues` are now exported from `temporalio_common` as well as
+  `temporalio_workflow`, so the same types can be used from clients and workflows.
+
 ### Breaking Changes :boom:
 * `CancellableFuture` and `CancellableFutureWithReason` now use the inherited `Future::Output`
   associated type instead of a generic output parameter.
+* Values stored in a `MemoValue` must now be `Send + Sync`. It previously held its value in an
+  `Rc` and now uses an `Arc`, so that memos can be built outside a workflow and handed to the
+  client. Only affects memo values that are themselves non-`Send`/non-`Sync`, such as those
+  holding an `Rc` or `RefCell`.
 
 ## [0.6.0] - 2026-08-04
 

@@ -108,14 +108,14 @@ use temporalio_common::{
         DataConverter, GenericPayloadConverter, PayloadConverter, SerializationContext,
         SerializationContextData,
     },
-    payload_visitor::decode_payloads,
+    payload_visitor::{decode_payloads, encode_payloads},
     protos::{
         coresdk::IntoPayloadsExt,
         grpc::health::v1::health_client::HealthClient,
         proto_ts_to_system_time,
         temporal::api::{
             cloud::cloudservice::v1::cloud_service_client::CloudServiceClient,
-            common::v1::WorkflowType,
+            common::v1::{Memo as ProtoMemo, WorkflowType},
             enums::v1::TaskQueueKind,
             errordetails::v1::WorkflowExecutionAlreadyStartedFailure,
             operatorservice::v1::operator_service_client::OperatorServiceClient,
@@ -1240,6 +1240,25 @@ where
                         let workflow_id = options.workflow_id.clone();
                         let task_queue_name = options.task_queue.clone();
 
+                        // Memo values are serialized with the payload converter and then run
+                        // through the codec, since the read side (describe/list) codec-decodes
+                        // them.
+                        let memo = match options.memo {
+                            Some(memo) => {
+                                let mut memo = ProtoMemo {
+                                    fields: memo.encode(data_converter.payload_converter())?,
+                                };
+                                encode_payloads(
+                                    &mut memo,
+                                    data_converter.codec(),
+                                    &SerializationContextData::Workflow,
+                                )
+                                .await?;
+                                Some(memo)
+                            }
+                            None => None,
+                        };
+
                         let user_metadata = if options.static_summary.is_some()
                             || options.static_details.is_some()
                         {
@@ -1297,7 +1316,7 @@ where
                                     .map(|attributes| attributes.into_proto()),
                                 cron_schedule: options.cron_schedule.unwrap_or_default(),
                                 retry_policy: options.retry_policy.map(Into::into),
-                                memo: options.memo,
+                                memo,
                                 header: options.header.or(start_signal.header),
                                 user_metadata,
                                 ..Default::default()
@@ -1345,7 +1364,7 @@ where
                                 links: options.links,
                                 completion_callbacks: options.completion_callbacks,
                                 priority: Some(options.priority.into()),
-                                memo: options.memo,
+                                memo,
                                 header: options.header,
                                 user_metadata,
                                 ..Default::default()
@@ -1969,11 +1988,11 @@ mod tests {
 
     mod start_workflow_interceptor_tests {
         use super::*;
-        use crate::request_extensions::RetryConfigForCall;
+        use crate::{request_extensions::RetryConfigForCall, test_helpers::XorCodec};
         use parking_lot::Mutex;
         use std::sync::atomic::{AtomicUsize, Ordering};
         use temporalio_common::{
-            HasWorkflowDefinition, WorkflowDefinition,
+            HasWorkflowDefinition, MemoValues, WorkflowDefinition,
             data_converters::{
                 DefaultFailureConverter, PayloadCodec, PayloadConversionError,
                 SerializationContext, SerializationContextData, TemporalSerializable,
@@ -2001,6 +2020,7 @@ mod tests {
         struct RecordedStart {
             calls: usize,
             workflow_type: String,
+            memo: Option<ProtoMemo>,
             payloads: Vec<Payload>,
             ascii_metadata: Option<String>,
             binary_metadata: Option<Vec<u8>>,
@@ -2085,6 +2105,7 @@ mod tests {
                 let mut recorded = self.recorded.lock();
                 recorded.calls += 1;
                 recorded.workflow_type = request.workflow_type.unwrap().name;
+                recorded.memo = request.memo;
                 recorded.payloads = request.input.unwrap_or_default().payloads;
                 recorded.ascii_metadata = ascii_metadata;
                 recorded.binary_metadata = binary_metadata;
@@ -2126,6 +2147,7 @@ mod tests {
                 let mut recorded = self.recorded.lock();
                 recorded.calls += 1;
                 recorded.workflow_type = request.workflow_type.unwrap().name;
+                recorded.memo = request.memo;
                 recorded.payloads = request.input.unwrap_or_default().payloads;
                 recorded.ascii_metadata = ascii_metadata;
                 recorded.binary_metadata = binary_metadata;
@@ -2312,6 +2334,151 @@ mod tests {
                 },
                 recorded,
             )
+        }
+
+        /// A mock client whose data converter uses `codec`, for asserting on what reaches the
+        /// wire.
+        fn mock_client_with_codec(
+            codec: impl PayloadCodec + Send + Sync + 'static,
+        ) -> (MockStartWorkflowClient, Arc<Mutex<RecordedStart>>) {
+            let recorded = Arc::new(Mutex::new(RecordedStart::default()));
+            let data_converter =
+                DataConverter::new(PayloadConverter::default(), DefaultFailureConverter, codec);
+            (
+                MockStartWorkflowClient {
+                    recorded: recorded.clone(),
+                    data_converter,
+                },
+                recorded,
+            )
+        }
+
+        fn memo_with(key: &str, value: &str) -> MemoValues {
+            let mut memo = MemoValues::new();
+            memo.insert(key.to_owned(), value.to_owned());
+            memo
+        }
+
+        /// Decode a sent memo the same way `describe`/`list` do, and read it back.
+        async fn read_back(sent: ProtoMemo) -> Memo {
+            let mut sent = sent;
+            decode_payloads(&mut sent, &XorCodec, &SerializationContextData::Workflow)
+                .await
+                .unwrap();
+            Memo::from_raw(
+                Some(sent),
+                PayloadConverter::default(),
+                SerializationContextData::Workflow,
+            )
+        }
+
+        #[tokio::test]
+        async fn start_workflow_encodes_memo_with_payload_converter_and_codec() {
+            let (client, recorded) = mock_client_with_codec(XorCodec);
+
+            client
+                .start_workflow(
+                    TestWorkflow,
+                    vec!["initial".to_owned()],
+                    WorkflowStartOptions::new("task-queue", "workflow-id")
+                        .memo(memo_with("memo-key", "memo-value"))
+                        .build(),
+                )
+                .await
+                .unwrap();
+
+            let sent = recorded.lock().memo.clone().expect("memo should be sent");
+            // The codec ran, so the value is not readable as plain JSON on the wire.
+            let raw = sent.fields.get("memo-key").expect("key should be present");
+            assert_ne!(raw.data, br#""memo-value""#);
+
+            assert_eq!(
+                read_back(sent).await.get::<String>("memo-key").unwrap(),
+                Some("memo-value".to_owned())
+            );
+        }
+
+        #[tokio::test]
+        async fn signal_with_start_workflow_encodes_memo() {
+            let (client, recorded) = mock_client_with_codec(XorCodec);
+
+            client
+                .start_workflow(
+                    TestWorkflow,
+                    vec!["initial".to_owned()],
+                    WorkflowStartOptions::new("task-queue", "workflow-id")
+                        .memo(memo_with("memo-key", "memo-value"))
+                        .start_signal(WorkflowStartSignal::new("some-signal").build())
+                        .build(),
+                )
+                .await
+                .unwrap();
+
+            let sent = recorded.lock().memo.clone().expect("memo should be sent");
+            assert_eq!(
+                read_back(sent).await.get::<String>("memo-key").unwrap(),
+                Some("memo-value".to_owned())
+            );
+        }
+
+        #[tokio::test]
+        async fn start_workflow_without_memo_sends_none() {
+            let (client, recorded) = mock_client_with_codec(XorCodec);
+
+            client
+                .start_workflow(
+                    TestWorkflow,
+                    vec!["initial".to_owned()],
+                    WorkflowStartOptions::new("task-queue", "workflow-id").build(),
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(recorded.lock().memo, None);
+        }
+
+        #[tokio::test]
+        async fn start_workflow_reports_memo_serialization_errors() {
+            #[derive(Debug)]
+            struct FailingMemoValue;
+
+            impl TemporalSerializable for FailingMemoValue {
+                fn to_payload(
+                    &self,
+                    _ctx: &SerializationContext<'_>,
+                ) -> Result<Payload, PayloadConversionError> {
+                    Err(PayloadConversionError::EncodingError(
+                        std::io::Error::other("memo serialization failure").into(),
+                    ))
+                }
+            }
+
+            let (client, recorded) = mock_client_with_codec(XorCodec);
+            let mut memo = MemoValues::new();
+            memo.insert("invalid", FailingMemoValue);
+
+            let err = client
+                .start_workflow(
+                    TestWorkflow,
+                    vec!["initial".to_owned()],
+                    WorkflowStartOptions::new("task-queue", "workflow-id")
+                        .memo(memo)
+                        .build(),
+                )
+                .await
+                .map(|_| ())
+                .expect_err("memo serialization errors should be surfaced");
+
+            assert!(
+                matches!(err, WorkflowStartError::PayloadConversion(_)),
+                "expected a payload conversion error, got {err:?}"
+            );
+            assert!(
+                err.to_string().contains("memo serialization failure"),
+                "error should surface the underlying cause, got {err}"
+            );
+            // The request must not have been sent.
+            assert_eq!(recorded.lock().calls, 0);
         }
 
         #[tokio::test]

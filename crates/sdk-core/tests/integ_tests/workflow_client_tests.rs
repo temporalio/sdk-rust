@@ -1,7 +1,7 @@
 use crate::common::{CoreWfStarter, eventually, rand_6_chars};
 use futures::{TryStreamExt, future::BoxFuture};
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashSet,
     sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
@@ -13,11 +13,7 @@ use temporalio_client::{
     WorkflowCountOptions, WorkflowListOptions, WorkflowStartOptions, WorkflowTerminateOptions,
     errors::WorkflowStartError,
 };
-use temporalio_common::{
-    data_converters::RawValue,
-    protos::{coresdk::AsJsonPayloadExt, temporal::api::common::v1::Memo as ProtoMemo},
-    worker::WorkerTaskTypes,
-};
+use temporalio_common::{MemoValues, data_converters::RawValue, worker::WorkerTaskTypes};
 use temporalio_macros::{workflow, workflow_methods};
 use temporalio_sdk::{WorkflowContext, WorkflowResult};
 
@@ -261,20 +257,16 @@ async fn start_workflow_with_memo() {
     let task_queue = starter.get_task_queue().to_owned();
     let wf_id = format!("{test_name}_{}", rand_6_chars());
 
+    let mut memo = MemoValues::new();
+    memo.insert("memo-key", "memo-value".to_string())
+        .insert("other-key", 42_u32);
+
     let handle = client
         .start_workflow(
             UntypedWorkflow::new(test_name),
             RawValue::empty(),
             WorkflowStartOptions::new(task_queue, wf_id)
-                .memo(ProtoMemo {
-                    fields: HashMap::from([
-                        (
-                            "memo-key".to_string(),
-                            "memo-value".as_json_payload().unwrap(),
-                        ),
-                        ("other-key".to_string(), 42.as_json_payload().unwrap()),
-                    ]),
-                })
+                .memo(memo)
                 .build(),
         )
         .await

@@ -4,12 +4,12 @@ use crate::{
 use http::Uri;
 use std::{collections::HashMap, sync::Arc, time::Duration};
 use temporalio_common::{
-    RetryPolicy,
+    MemoValues, RetryPolicy,
     data_converters::DataConverter,
     protos::temporal::api::{
         common::{
             self,
-            v1::{Header, Memo as ProtoMemo, Payloads},
+            v1::{Header, Payloads},
         },
         enums::v1::{
             ArchivalState, HistoryEventFilterType, QueryRejectCondition, WorkflowIdConflictPolicy,
@@ -357,8 +357,8 @@ pub struct WorkflowStartOptions {
     /// Headers to include with the start request.
     pub header: Option<Header>,
 
-    /// Optionally attach a non-indexed memo to the workflow
-    pub memo: Option<ProtoMemo>,
+    /// Non-indexed values attached to the workflow, serialized with the client's data converter.
+    pub memo: Option<MemoValues>,
 
     /// Single-line static summary for the workflow, shown in the Temporal UI.
     pub static_summary: Option<String>,
