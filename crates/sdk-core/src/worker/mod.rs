@@ -2709,14 +2709,12 @@ mod tests {
             .namespace("default")
             .task_queue("test-queue")
             .versioning_strategy(WorkerVersioningStrategy::WorkerDeploymentBased(
-                WorkerDeploymentOptions {
-                    version: WorkerDeploymentVersion {
-                        deployment_name: "deployment".to_string(),
-                        build_id: "1.0".to_string(),
-                    },
-                    use_worker_versioning: false,
-                    default_versioning_behavior: Some(VersioningBehavior::AutoUpgrade.into()),
-                },
+                WorkerDeploymentOptions::new(WorkerDeploymentVersion {
+                    deployment_name: "deployment".to_string(),
+                    build_id: "1.0".to_string(),
+                })
+                .default_versioning_behavior(VersioningBehavior::AutoUpgrade.into())
+                .build(),
             ))
             .task_types(WorkerTaskTypes::all())
             .build();

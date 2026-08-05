@@ -558,23 +558,17 @@ async fn deployment_version_correct_in_wf_info(#[values(true, false)] use_only_b
     let wf_type = "deployment_version_correct_in_wf_info";
     let mut starter = CoreWfStarter::new(wf_type);
     starter.sdk_config.deployment_options = if use_only_build_id {
-        WorkerDeploymentOptions {
-            version: WorkerDeploymentVersion {
-                deployment_name: "".to_string(),
-                build_id: "1.0".to_string(),
-            },
-            use_worker_versioning: false,
-            default_versioning_behavior: None,
-        }
+        WorkerDeploymentOptions::new(WorkerDeploymentVersion {
+            deployment_name: "".to_string(),
+            build_id: "1.0".to_string(),
+        })
+        .build()
     } else {
-        WorkerDeploymentOptions {
-            version: WorkerDeploymentVersion {
-                deployment_name: "deployment-1".to_string(),
-                build_id: "1.0".to_string(),
-            },
-            use_worker_versioning: false,
-            default_versioning_behavior: None,
-        }
+        WorkerDeploymentOptions::new(WorkerDeploymentVersion {
+            deployment_name: "deployment-1".to_string(),
+            build_id: "1.0".to_string(),
+        })
+        .build()
     };
     starter.sdk_config.task_types = WorkerTaskTypes::workflow_only();
     let core = starter.get_worker().await;
@@ -680,23 +674,17 @@ async fn deployment_version_correct_in_wf_info(#[values(true, false)] use_only_b
 
     let mut starter = starter.clone_no_worker();
     starter.sdk_config.deployment_options = if use_only_build_id {
-        WorkerDeploymentOptions {
-            version: WorkerDeploymentVersion {
-                deployment_name: "".to_string(),
-                build_id: "2.0".to_string(),
-            },
-            use_worker_versioning: false,
-            default_versioning_behavior: None,
-        }
+        WorkerDeploymentOptions::new(WorkerDeploymentVersion {
+            deployment_name: "".to_string(),
+            build_id: "2.0".to_string(),
+        })
+        .build()
     } else {
-        WorkerDeploymentOptions {
-            version: WorkerDeploymentVersion {
-                deployment_name: "deployment-1".to_string(),
-                build_id: "2.0".to_string(),
-            },
-            use_worker_versioning: false,
-            default_versioning_behavior: None,
-        }
+        WorkerDeploymentOptions::new(WorkerDeploymentVersion {
+            deployment_name: "deployment-1".to_string(),
+            build_id: "2.0".to_string(),
+        })
+        .build()
     };
 
     let core = starter.get_worker().await;

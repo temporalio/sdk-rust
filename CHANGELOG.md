@@ -53,6 +53,8 @@ to docs, or any other relevant information.
   `OtelCollectorOptions::builder()` to construct OpenTelemetry collector options.
 * `PrometheusExporterOptions` is now tagged with `#[non_exhaustive]`. Use
   `PrometheusExporterOptions::builder()` to construct Prometheus exporter options.
+* `WorkerDeploymentOptions` is now tagged with `#[non_exhaustive]`. Use
+  `WorkerDeploymentOptions::new(version)` to construct worker deployment options.
 
 ## [0.6.0] - 2026-08-04
 

@@ -995,14 +995,14 @@ mod tests {
         let strategies = [
             (
                 "deployment",
-                WorkerVersioningStrategy::WorkerDeploymentBased(WorkerDeploymentOptions {
-                    version: WorkerDeploymentVersion {
+                WorkerVersioningStrategy::WorkerDeploymentBased(
+                    WorkerDeploymentOptions::new(WorkerDeploymentVersion {
                         deployment_name: "deployment".to_string(),
                         build_id: "deployment-build".to_string(),
-                    },
-                    use_worker_versioning: true,
-                    default_versioning_behavior: None,
-                }),
+                    })
+                    .use_worker_versioning(true)
+                    .build(),
+                ),
             ),
             (
                 "legacy",
