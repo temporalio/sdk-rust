@@ -59,6 +59,7 @@ Documentation can be generated with `cargo doc`.
 - Keep commit messages short and in the imperative mood.
 - Provide a clear PR description outlining what changed and why.
 - Reviewers expect new features or fixes to include corresponding tests when applicable.
+- Always add an entry to CHANGELOG.md for each relevant change in a PR.
 
 ## Review Checklist
 

@@ -160,6 +160,10 @@ to docs, or any other relevant information.
 ### Fixed
 * `RuntimeOptions::default()` now uses the same 60-second worker heartbeat interval as the
   builder default.
+* Local activity resolutions are now delivered to workflows as each activity completes instead of
+  waiting for every local activity in the workflow task. This allows sequences of short local
+  activities to make progress while a long-running local activity executes in parallel, while
+  preserving the resolution ordering recorded in existing histories during replay.
 * Workflow tasks no longer livelock when a burst of ready async operations exhausts Tokio's
   cooperative scheduling budget.
 * OTLP metric export failures are now logged through Core telemetry when OpenTelemetry's periodic
