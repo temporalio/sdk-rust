@@ -154,7 +154,8 @@ pub struct ClientOptions {
     plugins: Vec<ErasedClientPlugin>,
 
     #[builder(field)]
-    plugins_applied: bool,
+    #[debug(skip)]
+    client_plugins_applied: bool,
 
     /// The data converter used for serializing/deserializing payloads.
     #[builder(default)]
@@ -205,12 +206,12 @@ impl ClientOptions {
         &self.plugins
     }
 
-    pub(crate) fn plugins_applied(&self) -> bool {
-        self.plugins_applied
+    pub(crate) fn client_plugins_applied(&self) -> bool {
+        self.client_plugins_applied
     }
 
-    pub(crate) fn mark_plugins_applied(&mut self) {
-        self.plugins_applied = true;
+    pub(crate) fn mark_client_plugins_applied(&mut self) {
+        self.client_plugins_applied = true;
     }
 }
 

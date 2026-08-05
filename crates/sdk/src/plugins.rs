@@ -333,10 +333,6 @@ pub(crate) fn apply_worker_plugins(
     client_options: &ClientOptions,
     options: &mut WorkerOptions,
 ) -> Result<(), PluginApplyError> {
-    if options.plugins_applied {
-        return Ok(());
-    }
-
     options.client_plugin_names = client_options
         .plugins()
         .iter()
@@ -363,7 +359,6 @@ pub(crate) fn apply_worker_plugins(
             })?;
     }
     options.worker_plugins = plugins;
-    options.plugins_applied = true;
     Ok(())
 }
 

@@ -139,9 +139,6 @@ pub(crate) fn apply_connection_plugins(
     client_options: &ClientOptions,
     connection_options: &mut ConnectionOptions,
 ) -> Result<(), PluginApplyError> {
-    if client_options.plugins_applied() {
-        return Ok(());
-    }
     for registration in client_options.plugins() {
         registration
             .plugin()
@@ -158,7 +155,7 @@ pub(crate) fn apply_connection_plugins(
 }
 
 pub(crate) fn apply_client_plugins(options: &mut ClientOptions) -> Result<(), PluginApplyError> {
-    if options.plugins_applied() {
+    if options.client_plugins_applied() {
         return Ok(());
     }
     let plugins = options.plugins().to_vec();
@@ -170,7 +167,7 @@ pub(crate) fn apply_client_plugins(options: &mut ClientOptions) -> Result<(), Pl
                 PluginApplyError::new(registration.plugin().name(), PluginTarget::Client, source)
             })?;
     }
-    options.mark_plugins_applied();
+    options.mark_client_plugins_applied();
     Ok(())
 }
 
@@ -207,7 +204,7 @@ mod tests {
     }
 
     #[test]
-    fn plugins_apply_once() {
+    fn plugins_follow_target_lifecycles() {
         let connection_calls = Arc::new(AtomicUsize::new(0));
         let client_calls = Arc::new(AtomicUsize::new(0));
         let mut client_options = ClientOptions::new("namespace")
@@ -216,19 +213,24 @@ mod tests {
                 client_calls: client_calls.clone(),
             })
             .build();
-        let mut connection_options =
+        let mut first_connection_options =
             ConnectionOptions::new(Url::parse("http://localhost:7233").unwrap())
-                .identity("identity")
+                .identity("first")
+                .build();
+        let mut second_connection_options =
+            ConnectionOptions::new(Url::parse("http://localhost:7233").unwrap())
+                .identity("second")
                 .build();
 
-        apply_connection_plugins(&client_options, &mut connection_options).unwrap();
+        apply_connection_plugins(&client_options, &mut first_connection_options).unwrap();
         apply_client_plugins(&mut client_options).unwrap();
-        apply_connection_plugins(&client_options, &mut connection_options).unwrap();
+        apply_connection_plugins(&client_options, &mut second_connection_options).unwrap();
         apply_client_plugins(&mut client_options).unwrap();
 
-        assert_eq!(connection_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(connection_calls.load(Ordering::Relaxed), 2);
         assert_eq!(client_calls.load(Ordering::Relaxed), 1);
-        assert_eq!(connection_options.identity, "identity-configured");
+        assert_eq!(first_connection_options.identity, "first-configured");
+        assert_eq!(second_connection_options.identity, "second-configured");
         assert_eq!(client_options.namespace, "namespace-configured");
     }
 }

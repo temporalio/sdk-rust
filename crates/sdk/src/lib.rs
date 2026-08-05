@@ -209,9 +209,6 @@ pub struct WorkerOptions {
     #[builder(field)]
     client_plugin_names: HashSet<String>,
 
-    #[builder(field)]
-    plugins_applied: bool,
-
     #[cfg(feature = "wasm-workflows")]
     #[builder(field)]
     wasm_workflow_components: Vec<WasmWorkflowComponent>,
@@ -753,7 +750,7 @@ impl Worker {
             .map_err(|error| WorkerCreateError::Initialization(anyhow!(error)))?;
         let core = init_worker(runtime, wc, client.connection().clone())
             .map_err(WorkerCreateError::Initialization)?;
-        Self::new_from_core_options(Arc::new(core), client.options().clone(), options)
+        Self::new_from_core_options_prepared(Arc::new(core), client.options().clone(), options)
     }
 
     // TODO [rust-sdk-branch]: Eliminate this constructor in favor of passing in fake connection
@@ -781,6 +778,14 @@ impl Worker {
         mut options: WorkerOptions,
     ) -> Result<Self, WorkerCreateError> {
         plugins::apply_worker_plugins(&client_options, &mut options)?;
+        Self::new_from_core_options_prepared(worker, client_options, options)
+    }
+
+    fn new_from_core_options_prepared(
+        worker: Arc<CoreWorker>,
+        client_options: ClientOptions,
+        mut options: WorkerOptions,
+    ) -> Result<Self, WorkerCreateError> {
         let acts = std::mem::take(&mut options.activities);
         let wfs = std::mem::take(&mut options.workflows);
         let worker_interceptors = std::mem::take(&mut options.worker_interceptors);
