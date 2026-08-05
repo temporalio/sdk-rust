@@ -408,9 +408,14 @@ pub(crate) async fn shutdown_during_active_timer_activity_workflows() {
 }
 
 /// Verifies that activity cancellation is delivered via the nexus worker command channel
-/// even when the activity does not heartbeat.
-pub(crate) async fn activity_cancel_delivered_without_heartbeat() {
-    let wf_name = "activity_cancel_delivered_without_heartbeat";
+/// even when the activity does not heartbeat. When `disable_eager` is false, the activity
+/// is eagerly dispatched.
+pub(crate) async fn activity_cancel_delivered_without_heartbeat(disable_eager: bool) {
+    let wf_name = if disable_eager {
+        "activity_cancel_delivered_without_heartbeat"
+    } else {
+        "activity_cancel_delivered_without_heartbeat_eager"
+    };
     let mut starter = CoreWfStarter::new_cloud_or_local(wf_name, "")
         .await
         .unwrap();
@@ -460,7 +465,10 @@ pub(crate) async fn activity_cancel_delivered_without_heartbeat() {
     #[workflow_methods]
     impl CancelWithoutHeartbeatWorkflow {
         #[run]
-        async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<()> {
+        async fn run(
+            ctx: &mut WorkflowContext<Self>,
+            disable_eager: bool,
+        ) -> WorkflowResult<()> {
             let act_fut = ctx.execute_activity(
                 WaitForCancelActivities::wait_for_cancel,
                 "hi".to_string(),
@@ -470,7 +478,7 @@ pub(crate) async fn activity_cancel_delivered_without_heartbeat() {
                         ..Default::default()
                     })
                     .cancellation_type(ActivityCancellationType::WaitCancellationCompleted)
-                    .do_not_eagerly_execute(true)
+                    .do_not_eagerly_execute(disable_eager)
                     .build(),
             );
             // ensure the activity is started on a worker before cancelling, so the cancel goes
@@ -497,109 +505,7 @@ pub(crate) async fn activity_cancel_delivered_without_heartbeat() {
     let handle = worker
         .submit_workflow(
             CancelWithoutHeartbeatWorkflow::run,
-            (),
-            WorkflowStartOptions::new(task_queue, wf_name.to_owned())
-                .run_timeout(Duration::from_secs(10))
-                .build(),
-        )
-        .await
-        .unwrap();
-    // Fails with workflow timeout if cancel via worker commands doesn't work
-    worker.run_until_done().await.unwrap();
-    handle.get_result(Default::default()).await.unwrap();
-}
-
-/// Verifies that eagerly dispatched activity cancellation is delivered via worker commands
-/// even when the activity does not heartbeat. Like
-/// `activity_cancel_delivered_without_heartbeat` but with eager dispatch enabled.
-pub(crate) async fn activity_cancel_delivered_without_heartbeat_eager() {
-    let wf_name = "activity_cancel_delivered_without_heartbeat_eager";
-    let mut starter = CoreWfStarter::new_cloud_or_local(wf_name, "")
-        .await
-        .unwrap();
-
-    struct WaitForCancelEagerActivities;
-    #[activities]
-    impl WaitForCancelEagerActivities {
-        #[activity]
-        async fn wait_for_cancel_eager(
-            self: Arc<Self>,
-            ctx: ActivityContext,
-            _: String,
-        ) -> Result<String, ActivityError> {
-            ctx.workflow_handle::<CancelWithoutHeartbeatEagerWorkflow>()
-                .unwrap()
-                .signal(
-                    CancelWithoutHeartbeatEagerWorkflow::act_started,
-                    (),
-                    WorkflowSignalOptions::default(),
-                )
-                .await
-                .unwrap();
-            ctx.cancelled().await;
-            Ok("done".to_string())
-        }
-    }
-
-    starter
-        .sdk_config
-        .register_activities(WaitForCancelEagerActivities);
-    let mut worker = starter.worker().await;
-    if !worker
-        .core_worker()
-        .get_namespace_capabilities()
-        .worker_commands()
-    {
-        warn!("Skipping test: worker_commands not supported in this namespace");
-        return;
-    }
-
-    #[workflow]
-    #[derive(Default)]
-    struct CancelWithoutHeartbeatEagerWorkflow {
-        act_started: bool,
-    }
-
-    #[workflow_methods]
-    impl CancelWithoutHeartbeatEagerWorkflow {
-        #[run]
-        async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<()> {
-            let act_fut = ctx.execute_activity(
-                WaitForCancelEagerActivities::wait_for_cancel_eager,
-                "hi".to_string(),
-                ActivityOptions::with_start_to_close_timeout(Duration::from_secs(30))
-                    .retry_policy(RetryPolicy {
-                        maximum_attempts: 1,
-                        ..Default::default()
-                    })
-                    .cancellation_type(ActivityCancellationType::WaitCancellationCompleted)
-                    .build(),
-            );
-            // ensure the activity is started on a worker before cancelling, so the cancel goes
-            // through the worker commands path.
-            ctx.wait_condition(|s| s.act_started).await;
-            act_fut.cancel();
-            act_fut
-                .await
-                .map_err(|e| WorkflowTermination::from(anyhow::Error::from(e)))?;
-            Ok(())
-        }
-
-        #[signal]
-        fn act_started(&mut self, _ctx: &mut SyncWorkflowContext<Self>) {
-            self.act_started = true;
-        }
-    }
-
-    worker
-        .register_workflow::<CancelWithoutHeartbeatEagerWorkflow>()
-        .unwrap();
-
-    let task_queue = starter.get_task_queue().to_owned();
-    let handle = worker
-        .submit_workflow(
-            CancelWithoutHeartbeatEagerWorkflow::run,
-            (),
+            disable_eager,
             WorkflowStartOptions::new(task_queue, wf_name.to_owned())
                 .run_timeout(Duration::from_secs(10))
                 .build(),

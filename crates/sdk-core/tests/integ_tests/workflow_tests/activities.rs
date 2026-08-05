@@ -2254,16 +2254,11 @@ async fn immediate_activity_cancelation() {
 }
 
 /// Verifies that activity cancellation is delivered via the nexus worker command channel
-/// even when the activity does not heartbeat.
+/// even when the activity does not heartbeat, with and without eager dispatch.
+#[rstest::rstest]
+#[case::no_eager(true)]
+#[case::eager(false)]
 #[tokio::test]
-async fn activity_cancel_delivered_without_heartbeat() {
-    shared_tests::activity_cancel_delivered_without_heartbeat().await
-}
-
-/// Verifies that eagerly dispatched activity cancellation is delivered via worker commands
-/// even when the activity does not heartbeat. Like
-/// `activity_cancel_delivered_without_heartbeat` but with eager dispatch enabled.
-#[tokio::test]
-async fn activity_cancel_delivered_without_heartbeat_eager() {
-    shared_tests::activity_cancel_delivered_without_heartbeat_eager().await
+async fn activity_cancel_delivered_without_heartbeat(#[case] disable_eager: bool) {
+    shared_tests::activity_cancel_delivered_without_heartbeat(disable_eager).await
 }
