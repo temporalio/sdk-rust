@@ -465,10 +465,7 @@ pub(crate) async fn activity_cancel_delivered_without_heartbeat(disable_eager: b
     #[workflow_methods]
     impl CancelWithoutHeartbeatWorkflow {
         #[run]
-        async fn run(
-            ctx: &mut WorkflowContext<Self>,
-            disable_eager: bool,
-        ) -> WorkflowResult<()> {
+        async fn run(ctx: &mut WorkflowContext<Self>, disable_eager: bool) -> WorkflowResult<()> {
             let act_fut = ctx.execute_activity(
                 WaitForCancelActivities::wait_for_cancel,
                 "hi".to_string(),
