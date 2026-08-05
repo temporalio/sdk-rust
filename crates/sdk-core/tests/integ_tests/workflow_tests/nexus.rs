@@ -899,7 +899,7 @@ impl AsyncCompleterWf {
         if ctx.state(|wf| wf.cancellation_type)
             == NexusOperationCancellationType::WaitCancellationCompleted
         {
-            ctx.wait_condition(
+            ctx.wait_condition_with_options(
                 |wf| wf.cancellation_wait_happened.load(Ordering::Relaxed),
                 WaitConditionOptions::builder()
                     .cancellation_token(WorkflowCancellationToken::new())
@@ -914,7 +914,7 @@ impl AsyncCompleterWf {
             // NexusOperationCancelRequestCompleted (written after cancel handler responds)
             // rather than NexusOperationCanceled (written after handler workflow completes as
             // cancelled).
-            ctx.wait_condition(
+            ctx.wait_condition_with_options(
                 |wf| wf.proceed_signal_received,
                 WaitConditionOptions::builder()
                     .cancellation_token(WorkflowCancellationToken::new())

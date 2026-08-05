@@ -51,10 +51,9 @@ impl InboundInterceptorWorkflow {
     #[run]
     async fn run(ctx: &mut WorkflowContext<Self>, input: String) -> WorkflowResult<String> {
         assert_eq!(input, "run-mutated");
-        ctx.wait_condition(
-            |state| state.signal_value.is_some() && state.update_value.is_some() && state.finish,
-            Default::default(),
-        )
+        ctx.wait_condition(|state| {
+            state.signal_value.is_some() && state.update_value.is_some() && state.finish
+        })
         .await?;
         Ok("run-original-output".to_string())
     }
@@ -545,14 +544,9 @@ struct InterceptorConstructionPollingWorkflow {
 impl InterceptorConstructionPollingWorkflow {
     #[run]
     async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<()> {
-        ctx.wait_condition(
-            |state| {
-                state.sync_signal_handled
-                    && state.deferred_signal_handled
-                    && state.async_signal_handled
-            },
-            Default::default(),
-        )
+        ctx.wait_condition(|state| {
+            state.sync_signal_handled && state.deferred_signal_handled && state.async_signal_handled
+        })
         .await?;
         Ok(())
     }
@@ -640,8 +634,7 @@ struct ConstructionWakeHandlerWorkflow {
 impl ConstructionWakeHandlerWorkflow {
     #[run]
     async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<()> {
-        ctx.wait_condition(|state| state.handled, Default::default())
-            .await?;
+        ctx.wait_condition(|state| state.handled).await?;
         Ok(())
     }
 

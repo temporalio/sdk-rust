@@ -191,8 +191,7 @@ impl CounterWf {
     #[run(name = DEFAULT_WORKFLOW_TYPE)]
     async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<()> {
         ctx.state_mut(|s| s.counter += 1);
-        ctx.wait_condition(|s| s.got_signal, Default::default())
-            .await?;
+        ctx.wait_condition(|s| s.got_signal).await?;
         ctx.state_mut(|s| s.counter += 1);
         Ok(())
     }
@@ -431,7 +430,7 @@ impl CurrentDetailsWf {
     #[run(name = DEFAULT_WORKFLOW_TYPE)]
     async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<()> {
         ctx.set_current_details("details from workflow");
-        ctx.wait_condition(|_| false, Default::default()).await?;
+        ctx.wait_condition(|_| false).await?;
         Ok(())
     }
 }
@@ -523,7 +522,7 @@ struct NoCurrentDetailsWf;
 impl NoCurrentDetailsWf {
     #[run(name = DEFAULT_WORKFLOW_TYPE)]
     async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<()> {
-        ctx.wait_condition(|_| false, Default::default()).await?;
+        ctx.wait_condition(|_| false).await?;
         Ok(())
     }
 }

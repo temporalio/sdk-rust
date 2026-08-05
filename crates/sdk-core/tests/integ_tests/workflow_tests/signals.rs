@@ -87,8 +87,7 @@ struct SignalReceiver {
 impl SignalReceiver {
     #[run(name = "receiver")]
     async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<()> {
-        ctx.wait_condition(|s| s.received, Default::default())
-            .await?;
+        ctx.wait_condition(|s| s.received).await?;
         Ok(())
     }
 
@@ -109,8 +108,7 @@ struct SignalWithCreateWfReceiver {
 impl SignalWithCreateWfReceiver {
     #[run]
     async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<()> {
-        ctx.wait_condition(|s| s.received, Default::default())
-            .await?;
+        ctx.wait_condition(|s| s.received).await?;
         Ok(())
     }
 
@@ -223,8 +221,7 @@ struct ChildSignalReceiver {
 impl ChildSignalReceiver {
     #[run]
     async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<()> {
-        ctx.wait_condition(|s| s.received, Default::default())
-            .await?;
+        ctx.wait_condition(|s| s.received).await?;
         Ok(())
     }
 
@@ -478,8 +475,7 @@ struct CrossTypeSignalReceiver {
 impl CrossTypeSignalReceiver {
     #[run]
     async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<()> {
-        ctx.wait_condition(|s| s.received, Default::default())
-            .await?;
+        ctx.wait_condition(|s| s.received).await?;
         Ok(())
     }
 

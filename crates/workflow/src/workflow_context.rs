@@ -2158,6 +2158,14 @@ impl<W> WorkflowContext<W> {
     /// By default, the wait inherits workflow cancellation.
     pub fn wait_condition<'a>(
         &'a self,
+        condition: impl FnMut(&W) -> bool + 'a,
+    ) -> impl FusedFuture<Output = Result<(), WorkflowCancellationError>> + 'a {
+        self.wait_condition_with_options(condition, Default::default())
+    }
+
+    /// Wait for some condition on workflow state to become true with the provided options.
+    pub fn wait_condition_with_options<'a>(
+        &'a self,
         mut condition: impl FnMut(&W) -> bool + 'a,
         options: WaitConditionOptions,
     ) -> impl FusedFuture<Output = Result<(), WorkflowCancellationError>> + 'a {

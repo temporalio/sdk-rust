@@ -67,8 +67,13 @@ to docs, or any other relevant information.
   `LocalActivityOptions::builder()` to construct local activity options.
 * `NexusOperationOptions` is now tagged with `#[non_exhaustive]`. Use
   `NexusOperationOptions::builder()` to construct Nexus operation options.
+* `WorkflowContext::wait_condition` now returns `Result<(), WorkflowCancellationError>` instead of
+  `()` so that workflow cancellation can be propagated to the caller.
+
 ### Added
 * `WorkflowCancellationToken` for deterministic cancellation of workflow operations.
+* `WorkflowContext::wait_condition_with_options` and `WaitConditionOptions` for waiting with a
+  custom cancellation token.
 
 ### Changed
 * Cancellation errors propagated after workflow cancellation now complete the workflow as cancelled

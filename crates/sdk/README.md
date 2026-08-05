@@ -147,7 +147,7 @@ impl MyWorkflow {
     #[run]
     async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<Vec<u32>> {
         // Wait until we have at least 3 values
-        ctx.wait_condition(|s| s.values.len() >= 3, Default::default())
+        ctx.wait_condition(|s| s.values.len() >= 3)
             .await?;
         Ok(ctx.state(|s| s.values.clone()))
     }
@@ -314,8 +314,8 @@ conditions. Long-running activities should heartbeat with `ctx.record_heartbeat(
 receive cancellation notifications and report progress.
 
 ```rust
-// Default options inherit workflow cancellation.
-ctx.wait_condition(|state| state.ready, Default::default()).await?;
+// Condition waits inherit workflow cancellation.
+ctx.wait_condition(|state| state.ready).await?;
 
 // A child token cancels a related group of operations together.
 let group = ctx.cancellation_token().child_token();

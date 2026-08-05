@@ -33,7 +33,7 @@ impl CancelledWf {
     #[run]
     async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<()> {
         let err = ctx
-            .wait_condition(|_| false, Default::default())
+            .wait_condition(|_| false)
             .await
             .expect_err("condition wait should inherit workflow cancellation");
         assert_eq!(err.reason(), Some("Dieee"));
@@ -214,7 +214,7 @@ impl CancellationPropagationParent {
                 .cancel_type(ChildWorkflowCancellationType::WaitCancellationCompleted)
                 .build(),
         );
-        let condition = ctx.wait_condition(|_| false, Default::default());
+        let condition = ctx.wait_condition(|_| false);
         let child_and_signals = async {
             let started_child = child.await.expect("child should start");
             ctx.cancelled().await;

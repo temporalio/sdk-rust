@@ -56,7 +56,7 @@ async fn execute_steps(ctx: &mut WorkflowContext<ChainWf>, steps: Vec<Step>) {
     for step in steps {
         match step {
             Step::Wait(w) => {
-                ctx.wait_condition(move |s| s.flags[w], Default::default())
+                ctx.wait_condition(move |s| s.flags[w])
                     .await
                     .expect("workflow was not cancelled");
             }
@@ -85,8 +85,7 @@ impl ChainWf {
         ctx: &mut WorkflowContext<Self>,
         _: (),
     ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-        ctx.wait_condition(|s| s.script_ready, Default::default())
-            .await?;
+        ctx.wait_condition(|s| s.script_ready).await?;
         let steps = ctx.state_mut(|s| {
             let idx = s.next_update;
             s.next_update += 1;
@@ -98,7 +97,7 @@ impl ChainWf {
 
     #[signal]
     async fn trigger(ctx: &mut WorkflowContext<Self>, _: ()) {
-        ctx.wait_condition(|s| s.script_ready, Default::default())
+        ctx.wait_condition(|s| s.script_ready)
             .await
             .expect("workflow was not cancelled");
         let steps = ctx.state_mut(|s| {

@@ -923,8 +923,7 @@ async fn worker_heartbeat_failure_metrics() {
                 panic!("expected WF panic");
             }
 
-            ctx.wait_condition(|s| s.signal_received, Default::default())
-                .await?;
+            ctx.wait_condition(|s| s.signal_received).await?;
             Ok(())
         }
 

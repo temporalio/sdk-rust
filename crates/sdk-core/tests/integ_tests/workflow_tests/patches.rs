@@ -238,8 +238,7 @@ impl PatchActivationRolloutWf {
         let patched = ctx.patched(ROLLOUT_PATCH_ID);
         ctx.timer(Duration::from_millis(1)).await;
         ctx.state(|wf| wf.ready.notify_one());
-        ctx.wait_condition(|wf| wf.released, Default::default())
-            .await?;
+        ctx.wait_condition(|wf| wf.released).await?;
         Ok(if patched { "new" } else { "old" }.to_string())
     }
 
@@ -260,8 +259,7 @@ impl PatchActivationOldRolloutWf {
     #[run(name = "patch_activation_rollout")]
     async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<String> {
         ctx.timer(Duration::from_millis(1)).await;
-        ctx.wait_condition(|wf| wf.released, Default::default())
-            .await?;
+        ctx.wait_condition(|wf| wf.released).await?;
         Ok("old".to_string())
     }
 
@@ -510,8 +508,7 @@ impl DeprecatedPatchRemovalWf {
             assert!(ctx.deprecate_patch("getting-deprecated"));
         }
         ctx.state(|wf| wf.notify.notify_one());
-        ctx.wait_condition(|s| s.signal_received, Default::default())
-            .await?;
+        ctx.wait_condition(|s| s.signal_received).await?;
 
         ctx.timer(Duration::from_millis(1)).await;
 

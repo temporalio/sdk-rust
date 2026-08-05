@@ -672,7 +672,7 @@ async fn update_with_local_acts() {
     impl UpdateWithLocalActsWf {
         #[run]
         async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<()> {
-            ctx.wait_condition(|s| s.done, Default::default()).await?;
+            ctx.wait_condition(|s| s.done).await?;
             Ok(())
         }
 
@@ -869,7 +869,7 @@ async fn unknown_update_rejected_sdk() {
     impl UnknownUpdateRejectedSdkWf {
         #[run]
         async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<()> {
-            ctx.wait_condition(|s| s.done, Default::default()).await?;
+            ctx.wait_condition(|s| s.done).await?;
             Ok(())
         }
 
@@ -942,7 +942,7 @@ async fn update_timer_sequence() {
     impl UpdateTimerSequenceWf {
         #[run]
         async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<()> {
-            ctx.wait_condition(|s| s.done, Default::default()).await?;
+            ctx.wait_condition(|s| s.done).await?;
             Ok(())
         }
 
@@ -1161,7 +1161,7 @@ async fn worker_restarted_in_middle_of_update() {
     impl WorkerRestartedInMiddleOfUpdateWf {
         #[run]
         async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<()> {
-            ctx.wait_condition(|s| s.done, Default::default()).await?;
+            ctx.wait_condition(|s| s.done).await?;
             Ok(())
         }
 
@@ -1272,7 +1272,7 @@ async fn update_after_empty_wft() {
         #[run]
         async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<()> {
             let sig_handle = async {
-                ctx.wait_condition(|s| s.signal_received, Default::default())
+                ctx.wait_condition(|s| s.signal_received)
                     .await
                     .expect("workflow was not cancelled");
                 ACT_STARTED.store(true, Ordering::Release);
@@ -1367,8 +1367,7 @@ async fn update_lost_on_activity_mismatch() {
         async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<()> {
             ctx.state_mut(|s| s.can_run = 1);
             for _ in 1..=3 {
-                ctx.wait_condition(|s| s.can_run > 0, Default::default())
-                    .await?;
+                ctx.wait_condition(|s| s.can_run > 0).await?;
                 let _ = ctx
                     .execute_activity(
                         StdActivities::echo,

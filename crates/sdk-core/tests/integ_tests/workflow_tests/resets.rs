@@ -36,8 +36,7 @@ impl ResetMeWf {
         ctx.timer(Duration::from_secs(1)).await;
         ctx.timer(Duration::from_secs(1)).await;
         ctx.state(|wf| wf.notify.notify_one());
-        ctx.wait_condition(|s| s.post_reset_received, Default::default())
-            .await?;
+        ctx.wait_condition(|s| s.post_reset_received).await?;
         Ok(())
     }
 
@@ -171,11 +170,9 @@ impl ResetRandomseedWf {
         } else {
             ctx.timer(Duration::from_millis(100)).await;
         }
-        ctx.wait_condition(|s| s.post_fail_received, Default::default())
-            .await?;
+        ctx.wait_condition(|s| s.post_fail_received).await?;
         ctx.state(|wf| wf.notify.notify_one());
-        ctx.wait_condition(|s| s.post_reset_received, Default::default())
-            .await?;
+        ctx.wait_condition(|s| s.post_reset_received).await?;
         Ok(())
     }
 

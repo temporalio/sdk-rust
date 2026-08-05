@@ -1225,13 +1225,10 @@ async fn local_activity_with_heartbeat_only_causes_one_wakeup() {
                     .ok();
                     ctx.state_mut(|s| s.la_resolved = true);
                 },
-                ctx.wait_condition(
-                    |_| {
-                        wakeup_counter += 1;
-                        ctx.state(|s| s.la_resolved)
-                    },
-                    Default::default()
-                )
+                ctx.wait_condition(|_| {
+                    wakeup_counter += 1;
+                    ctx.state(|s| s.la_resolved)
+                })
             );
             wait_result?;
             Ok(wakeup_counter as usize)

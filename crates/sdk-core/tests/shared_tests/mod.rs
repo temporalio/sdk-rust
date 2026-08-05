@@ -480,8 +480,7 @@ pub(crate) async fn activity_cancel_delivered_without_heartbeat(disable_eager: b
             );
             // ensure the activity is started on a worker before cancelling, so the cancel goes
             // through the worker commands path.
-            ctx.wait_condition(|s| s.act_started, Default::default())
-                .await?;
+            ctx.wait_condition(|s| s.act_started).await?;
             act_fut.cancel();
             act_fut
                 .await
