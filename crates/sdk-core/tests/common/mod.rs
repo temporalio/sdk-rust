@@ -125,14 +125,13 @@ pub(crate) fn integ_worker_config(tq: &str) -> WorkerConfig {
 
 pub(crate) fn integ_sdk_config(tq: &str) -> WorkerOptions {
     WorkerOptions::new(tq)
-        .deployment_options(WorkerDeploymentOptions {
-            version: WorkerDeploymentVersion {
+        .deployment_options(
+            WorkerDeploymentOptions::new(WorkerDeploymentVersion {
                 deployment_name: "".to_owned(),
                 build_id: "test_build_id".to_owned(),
-            },
-            use_worker_versioning: false,
-            default_versioning_behavior: None,
-        })
+            })
+            .build(),
+        )
         .build()
 }
 
@@ -225,13 +224,16 @@ async fn get_cloud_client_with_compression(compression: GrpcCompression) -> Clie
         .client_name("sdk-core-integ-tests")
         .client_version("clientver")
         .identity("sdk-test-client")
-        .tls_options(TlsOptions {
-            client_tls_options: Some(ClientTlsOptions {
-                client_cert,
-                client_private_key,
-            }),
-            ..Default::default()
-        })
+        .tls_options(
+            TlsOptions::builder()
+                .client_tls_options(
+                    ClientTlsOptions::builder()
+                        .client_cert(client_cert)
+                        .client_private_key(client_private_key)
+                        .build(),
+                )
+                .build(),
+        )
         .grpc_compression(compression)
         .build();
     let connection = Connection::connect(connection_opts).await.unwrap();
@@ -846,15 +848,17 @@ pub(crate) fn get_integ_tls_config() -> Option<TlsOptions> {
         let root = std::fs::read("../.cloud_certs/ca.pem").unwrap();
         let client_cert = std::fs::read("../.cloud_certs/client.pem").unwrap();
         let client_private_key = std::fs::read("../.cloud_certs/client.key").unwrap();
-        Some(TlsOptions {
-            server_root_ca_cert: Some(root),
-            domain: None,
-            client_tls_options: Some(ClientTlsOptions {
-                client_cert,
-                client_private_key,
-            }),
-            server_cert_verifier: None,
-        })
+        Some(
+            TlsOptions::builder()
+                .server_root_ca_cert(root)
+                .client_tls_options(
+                    ClientTlsOptions::builder()
+                        .client_cert(client_cert)
+                        .client_private_key(client_private_key)
+                        .build(),
+                )
+                .build(),
+        )
     } else {
         None
     }

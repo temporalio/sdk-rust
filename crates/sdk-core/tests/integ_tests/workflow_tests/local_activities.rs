@@ -302,19 +302,20 @@ impl LocalActRetryTimerBackoff {
             .execute_local_activity(
                 StdActivities::always_fail,
                 (),
-                LocalActivityOptions {
-                    retry_policy: RetryPolicy {
-                        initial_interval: Some(prost_dur!(from_micros(15))),
-                        // We want two local backoffs that are short. Third backoff will use timer
-                        backoff_coefficient: 1_000.,
-                        maximum_interval: Some(prost_dur!(from_millis(1500))),
-                        maximum_attempts: 4,
-                        non_retryable_error_types: vec![],
-                    }
-                    .into(),
-                    timer_backoff_threshold: Some(Duration::from_secs(1)),
-                    ..Default::default()
-                },
+                LocalActivityOptions::builder()
+                    .retry_policy(
+                        RetryPolicy {
+                            initial_interval: Some(prost_dur!(from_micros(15))),
+                            // We want two local backoffs that are short. Third backoff will use timer
+                            backoff_coefficient: 1_000.,
+                            maximum_interval: Some(prost_dur!(from_millis(1500))),
+                            maximum_attempts: 4,
+                            non_retryable_error_types: vec![],
+                        }
+                        .into(),
+                    )
+                    .timer_backoff_threshold(Duration::from_secs(1))
+                    .build(),
             )
             .await;
         assert!(matches!(res, Err(ActivityExecutionError::Failed(_))));
@@ -405,10 +406,9 @@ async fn cancel_immediate(#[case] cancel_type: ActivityCancellationType) {
             let la = ctx.execute_local_activity(
                 EchoWithManualCancel::echo,
                 "hi".to_string(),
-                LocalActivityOptions {
-                    cancel_type,
-                    ..Default::default()
-                },
+                LocalActivityOptions::builder()
+                    .cancel_type(cancel_type)
+                    .build(),
             );
             la.cancel();
             let resolution = la.await;
@@ -546,19 +546,20 @@ async fn cancel_after_act_starts(
             let la = ctx.execute_local_activity(
                 EchoWithManualCancelAndBackoff::echo,
                 "hi".to_string(),
-                LocalActivityOptions {
-                    retry_policy: RetryPolicy {
-                        initial_interval: Some(bo_dur.try_into().unwrap()),
-                        backoff_coefficient: 1.,
-                        maximum_interval: Some(bo_dur.try_into().unwrap()),
-                        // Retry forever until cancelled
-                        ..Default::default()
-                    }
-                    .into(),
-                    timer_backoff_threshold: Some(Duration::from_secs(1)),
-                    cancel_type,
-                    ..Default::default()
-                },
+                LocalActivityOptions::builder()
+                    .retry_policy(
+                        RetryPolicy {
+                            initial_interval: Some(bo_dur.try_into().unwrap()),
+                            backoff_coefficient: 1.,
+                            maximum_interval: Some(bo_dur.try_into().unwrap()),
+                            // Retry forever until cancelled
+                            ..Default::default()
+                        }
+                        .into(),
+                    )
+                    .timer_backoff_threshold(Duration::from_secs(1))
+                    .cancel_type(cancel_type)
+                    .build(),
             );
             ctx.timer(Duration::from_secs(1)).await;
             // Note that this cancel can't go through for *two* WF tasks, because we do a full heartbeat
@@ -656,20 +657,21 @@ async fn x_to_close_timeout(#[case] is_schedule: bool) {
                 .execute_local_activity(
                     LongRunningWithCancellation::go,
                     (),
-                    LocalActivityOptions {
-                        retry_policy: RetryPolicy {
-                            initial_interval: Some(prost_dur!(from_micros(15))),
-                            backoff_coefficient: 1_000.,
-                            maximum_interval: Some(prost_dur!(from_millis(1500))),
-                            maximum_attempts: 4,
-                            non_retryable_error_types: vec![],
-                        }
-                        .into(),
-                        timer_backoff_threshold: Some(Duration::from_secs(1)),
-                        schedule_to_close_timeout: sched,
-                        start_to_close_timeout: start,
-                        ..Default::default()
-                    },
+                    LocalActivityOptions::builder()
+                        .retry_policy(
+                            RetryPolicy {
+                                initial_interval: Some(prost_dur!(from_micros(15))),
+                                backoff_coefficient: 1_000.,
+                                maximum_interval: Some(prost_dur!(from_millis(1500))),
+                                maximum_attempts: 4,
+                                non_retryable_error_types: vec![],
+                            }
+                            .into(),
+                        )
+                        .timer_backoff_threshold(Duration::from_secs(1))
+                        .maybe_schedule_to_close_timeout(sched)
+                        .maybe_start_to_close_timeout(start)
+                        .build(),
                 )
                 .await;
             let err = res.unwrap_err();
@@ -730,19 +732,20 @@ async fn schedule_to_close_timeout_across_timer_backoff(#[case] cached: bool) {
                 .execute_local_activity(
                     FailWithAtomicCounter::go,
                     "hi".to_string(),
-                    LocalActivityOptions {
-                        retry_policy: RetryPolicy {
-                            initial_interval: Some(prost_dur!(from_millis(15))),
-                            backoff_coefficient: 1_000.,
-                            maximum_interval: Some(prost_dur!(from_millis(1000))),
-                            maximum_attempts: 40,
-                            non_retryable_error_types: vec![],
-                        }
-                        .into(),
-                        timer_backoff_threshold: Some(Duration::from_millis(500)),
-                        schedule_to_close_timeout: Some(Duration::from_secs(2)),
-                        ..Default::default()
-                    },
+                    LocalActivityOptions::builder()
+                        .retry_policy(
+                            RetryPolicy {
+                                initial_interval: Some(prost_dur!(from_millis(15))),
+                                backoff_coefficient: 1_000.,
+                                maximum_interval: Some(prost_dur!(from_millis(1000))),
+                                maximum_attempts: 40,
+                                non_retryable_error_types: vec![],
+                            }
+                            .into(),
+                        )
+                        .timer_backoff_threshold(Duration::from_millis(500))
+                        .schedule_to_close_timeout(Duration::from_secs(2))
+                        .build(),
                 )
                 .await;
             let err = res.unwrap_err();
@@ -812,34 +815,36 @@ async fn timer_backoff_concurrent_with_non_timer_backoff() {
             let r1 = ctx.execute_local_activity(
                 StdActivities::always_fail,
                 (),
-                LocalActivityOptions {
-                    retry_policy: RetryPolicy {
-                        initial_interval: Some(prost_dur!(from_micros(15))),
-                        backoff_coefficient: 1_000.,
-                        maximum_interval: Some(prost_dur!(from_millis(1500))),
-                        maximum_attempts: 4,
-                        non_retryable_error_types: vec![],
-                    }
-                    .into(),
-                    timer_backoff_threshold: Some(Duration::from_secs(1)),
-                    ..Default::default()
-                },
+                LocalActivityOptions::builder()
+                    .retry_policy(
+                        RetryPolicy {
+                            initial_interval: Some(prost_dur!(from_micros(15))),
+                            backoff_coefficient: 1_000.,
+                            maximum_interval: Some(prost_dur!(from_millis(1500))),
+                            maximum_attempts: 4,
+                            non_retryable_error_types: vec![],
+                        }
+                        .into(),
+                    )
+                    .timer_backoff_threshold(Duration::from_secs(1))
+                    .build(),
             );
             let r2 = ctx.execute_local_activity(
                 StdActivities::always_fail,
                 (),
-                LocalActivityOptions {
-                    retry_policy: RetryPolicy {
-                        initial_interval: Some(prost_dur!(from_millis(15))),
-                        backoff_coefficient: 10.,
-                        maximum_interval: Some(prost_dur!(from_millis(1500))),
-                        maximum_attempts: 4,
-                        non_retryable_error_types: vec![],
-                    }
-                    .into(),
-                    timer_backoff_threshold: Some(Duration::from_secs(10)),
-                    ..Default::default()
-                },
+                LocalActivityOptions::builder()
+                    .retry_policy(
+                        RetryPolicy {
+                            initial_interval: Some(prost_dur!(from_millis(15))),
+                            backoff_coefficient: 10.,
+                            maximum_interval: Some(prost_dur!(from_millis(1500))),
+                            maximum_attempts: 4,
+                            non_retryable_error_types: vec![],
+                        }
+                        .into(),
+                    )
+                    .timer_backoff_threshold(Duration::from_secs(10))
+                    .build(),
             );
             let (r1, r2) = temporalio_sdk::workflows::join!(r1, r2);
             assert!(matches!(r1, Err(ActivityExecutionError::Failed(_))));
@@ -883,18 +888,19 @@ async fn repro_nondeterminism_with_timer_bug() {
             let mut r1 = ctx.execute_local_activity(
                 StdActivities::delay,
                 Duration::from_secs(2),
-                LocalActivityOptions {
-                    retry_policy: RetryPolicy {
-                        initial_interval: Some(prost_dur!(from_micros(15))),
-                        backoff_coefficient: 1_000.,
-                        maximum_interval: Some(prost_dur!(from_millis(1500))),
-                        maximum_attempts: 4,
-                        non_retryable_error_types: vec![],
-                    }
-                    .into(),
-                    timer_backoff_threshold: Some(Duration::from_secs(1)),
-                    ..Default::default()
-                },
+                LocalActivityOptions::builder()
+                    .retry_policy(
+                        RetryPolicy {
+                            initial_interval: Some(prost_dur!(from_micros(15))),
+                            backoff_coefficient: 1_000.,
+                            maximum_interval: Some(prost_dur!(from_millis(1500))),
+                            maximum_attempts: 4,
+                            non_retryable_error_types: vec![],
+                        }
+                        .into(),
+                    )
+                    .timer_backoff_threshold(Duration::from_secs(1))
+                    .build(),
             );
             temporalio_sdk::workflows::select! {
                 _ = t1 => {},
@@ -1050,9 +1056,7 @@ async fn la_resolve_same_time_as_other_cancel() {
             let mut local_act = ctx.execute_local_activity(
                 DelayWithCancellation::delay,
                 Duration::from_millis(100),
-                LocalActivityOptions {
-                    ..Default::default()
-                },
+                LocalActivityOptions::builder().build(),
             );
             normal_act.cancel();
             // Race them, starting a timer if LA completes first
@@ -1278,10 +1282,9 @@ impl LocalActivityWithSummaryWf {
         ctx.execute_local_activity(
             StdActivities::echo,
             "hi".to_string(),
-            LocalActivityOptions {
-                summary: Some("Echo summary".to_string()),
-                ..Default::default()
-            },
+            LocalActivityOptions::builder()
+                .summary("Echo summary".to_string())
+                .build(),
         )
         .await?;
         Ok(())
@@ -1530,17 +1533,18 @@ async fn local_act_fail_and_retry(#[case] eventually_pass: bool) {
                 .execute_local_activity(
                     EventuallyPassingActivity::echo,
                     "hi".to_string(),
-                    LocalActivityOptions {
-                        retry_policy: RetryPolicy {
-                            initial_interval: Some(prost_dur!(from_millis(50))),
-                            backoff_coefficient: 1.2,
-                            maximum_interval: None,
-                            maximum_attempts: 5,
-                            non_retryable_error_types: vec![],
-                        }
-                        .into(),
-                        ..Default::default()
-                    },
+                    LocalActivityOptions::builder()
+                        .retry_policy(
+                            RetryPolicy {
+                                initial_interval: Some(prost_dur!(from_millis(50))),
+                                backoff_coefficient: 1.2,
+                                maximum_interval: None,
+                                maximum_attempts: 5,
+                                non_retryable_error_types: vec![],
+                            }
+                            .into(),
+                        )
+                        .build(),
                 )
                 .await;
             if eventually_pass {
@@ -1632,17 +1636,18 @@ async fn local_act_retry_long_backoff_uses_timer() {
                 .execute_local_activity(
                     StdActivities::always_fail,
                     (),
-                    LocalActivityOptions {
-                        retry_policy: RetryPolicy {
-                            initial_interval: Some(prost_dur!(from_millis(65))),
-                            backoff_coefficient: 1_000.,
-                            maximum_interval: Some(prost_dur!(from_secs(600))),
-                            maximum_attempts: 3,
-                            non_retryable_error_types: vec![],
-                        }
-                        .into(),
-                        ..Default::default()
-                    },
+                    LocalActivityOptions::builder()
+                        .retry_policy(
+                            RetryPolicy {
+                                initial_interval: Some(prost_dur!(from_millis(65))),
+                                backoff_coefficient: 1_000.,
+                                maximum_interval: Some(prost_dur!(from_secs(600))),
+                                maximum_attempts: 3,
+                                non_retryable_error_types: vec![],
+                            }
+                            .into(),
+                        )
+                        .build(),
                 )
                 .await;
             assert!(matches!(la_res, Err(ActivityExecutionError::Failed(_))));
@@ -2008,10 +2013,9 @@ async fn test_schedule_to_start_timeout() {
                 .execute_local_activity(
                     StdActivities::echo,
                     "hi".to_string(),
-                    LocalActivityOptions {
-                        schedule_to_start_timeout: prost_dur!(from_nanos(1)),
-                        ..Default::default()
-                    },
+                    LocalActivityOptions::builder()
+                        .maybe_schedule_to_start_timeout(prost_dur!(from_nanos(1)))
+                        .build(),
                 )
                 .await;
             assert!(la_res.is_err());
@@ -2098,19 +2102,20 @@ async fn test_schedule_to_start_timeout_not_based_on_original_time(
                 .execute_local_activity(
                     StdActivities::echo,
                     "hi".to_string(),
-                    LocalActivityOptions {
-                        retry_policy: RetryPolicy {
-                            initial_interval: Some(prost_dur!(from_millis(50))),
-                            backoff_coefficient: 1.2,
-                            maximum_interval: None,
-                            maximum_attempts: 5,
-                            non_retryable_error_types: vec![],
-                        }
-                        .into(),
-                        schedule_to_start_timeout: Some(Duration::from_secs(60)),
-                        schedule_to_close_timeout,
-                        ..Default::default()
-                    },
+                    LocalActivityOptions::builder()
+                        .retry_policy(
+                            RetryPolicy {
+                                initial_interval: Some(prost_dur!(from_millis(50))),
+                                backoff_coefficient: 1.2,
+                                maximum_interval: None,
+                                maximum_attempts: 5,
+                                non_retryable_error_types: vec![],
+                            }
+                            .into(),
+                        )
+                        .schedule_to_start_timeout(Duration::from_secs(60))
+                        .maybe_schedule_to_close_timeout(schedule_to_close_timeout)
+                        .build(),
                 )
                 .await;
             if is_sched_to_start {
@@ -2175,18 +2180,19 @@ async fn start_to_close_timeout_allows_retries(#[values(true, false)] la_complet
                 .execute_local_activity(
                     ActivityWithRetriesAndCancellation::go,
                     (),
-                    LocalActivityOptions {
-                        retry_policy: RetryPolicy {
-                            initial_interval: Some(prost_dur!(from_millis(20))),
-                            backoff_coefficient: 1.0,
-                            maximum_interval: None,
-                            maximum_attempts: 5,
-                            non_retryable_error_types: vec![],
-                        }
-                        .into(),
-                        start_to_close_timeout: Some(prost_dur!(from_millis(25))),
-                        ..Default::default()
-                    },
+                    LocalActivityOptions::builder()
+                        .retry_policy(
+                            RetryPolicy {
+                                initial_interval: Some(prost_dur!(from_millis(20))),
+                                backoff_coefficient: 1.0,
+                                maximum_interval: None,
+                                maximum_attempts: 5,
+                                non_retryable_error_types: vec![],
+                            }
+                            .into(),
+                        )
+                        .start_to_close_timeout(prost_dur!(from_millis(25)))
+                        .build(),
                 )
                 .await;
             if la_completes {
@@ -2339,9 +2345,7 @@ async fn resolved_las_not_recorded_if_wft_fails_many_times() {
             ctx.execute_local_activity(
                 StdActivities::echo,
                 "hi".to_string(),
-                LocalActivityOptions {
-                    ..Default::default()
-                },
+                LocalActivityOptions::builder().build(),
             )
             .await?;
             panic!()
@@ -2393,17 +2397,18 @@ async fn local_act_records_nonfirst_attempts_ok() {
             ctx.execute_local_activity(
                 StdActivities::always_fail,
                 (),
-                LocalActivityOptions {
-                    retry_policy: RetryPolicy {
-                        initial_interval: Some(prost_dur!(from_millis(10))),
-                        backoff_coefficient: 1.0,
-                        maximum_interval: None,
-                        maximum_attempts: 0,
-                        non_retryable_error_types: vec![],
-                    }
-                    .into(),
-                    ..Default::default()
-                },
+                LocalActivityOptions::builder()
+                    .retry_policy(
+                        RetryPolicy {
+                            initial_interval: Some(prost_dur!(from_millis(10))),
+                            backoff_coefficient: 1.0,
+                            maximum_interval: None,
+                            maximum_attempts: 0,
+                            non_retryable_error_types: vec![],
+                        }
+                        .into(),
+                    )
+                    .build(),
             )
             .await
             .ok();
@@ -2714,16 +2719,17 @@ async fn local_act_retry_explicit_delay() {
                 .execute_local_activity(
                     ActivityWithExplicitBackoff::go,
                     (),
-                    LocalActivityOptions {
-                        retry_policy: RetryPolicy {
-                            initial_interval: Some(prost_dur!(from_millis(50))),
-                            backoff_coefficient: 1.0,
-                            maximum_attempts: 5,
-                            ..Default::default()
-                        }
-                        .into(),
-                        ..Default::default()
-                    },
+                    LocalActivityOptions::builder()
+                        .retry_policy(
+                            RetryPolicy {
+                                initial_interval: Some(prost_dur!(from_millis(50))),
+                                backoff_coefficient: 1.0,
+                                maximum_attempts: 5,
+                                ..Default::default()
+                            }
+                            .into(),
+                        )
+                        .build(),
                 )
                 .await;
             assert!(la_res.is_ok());
@@ -2781,14 +2787,15 @@ impl LaWf {
             .execute_local_activity(
                 StdActivities::default,
                 (),
-                LocalActivityOptions {
-                    retry_policy: RetryPolicy {
-                        maximum_attempts: 1,
-                        ..Default::default()
-                    }
-                    .into(),
-                    ..Default::default()
-                },
+                LocalActivityOptions::builder()
+                    .retry_policy(
+                        RetryPolicy {
+                            maximum_attempts: 1,
+                            ..Default::default()
+                        }
+                        .into(),
+                    )
+                    .build(),
             )
             .await;
         Ok(())
@@ -3626,10 +3633,9 @@ async fn immediate_cancel(
             let la = ctx.execute_local_activity(
                 StdActivities::default,
                 (),
-                LocalActivityOptions {
-                    cancel_type,
-                    ..Default::default()
-                },
+                LocalActivityOptions::builder()
+                    .cancel_type(cancel_type)
+                    .build(),
             );
             la.cancel();
             la.await.ok();
@@ -3743,10 +3749,9 @@ async fn cancel_after_act_starts_canned(
             let la = ctx.execute_local_activity(
                 ActivityWithConditionalCancelWait::echo,
                 (),
-                LocalActivityOptions {
-                    cancel_type,
-                    ..Default::default()
-                },
+                LocalActivityOptions::builder()
+                    .cancel_type(cancel_type)
+                    .build(),
             );
             ctx.timer(Duration::from_secs(1)).await;
             la.cancel();

@@ -3526,12 +3526,13 @@ mod tests {
             .continue_as_new(7, ContinueAsNewOptions::default())
             .expect_err("continue_as_new should terminate the workflow");
         let sync_ctx = ctx.sync_context();
-        let nexus = sync_ctx.start_nexus_operation(NexusOperationOptions {
-            endpoint: "original-endpoint".to_string(),
-            service: "original-service".to_string(),
-            operation: "original-operation".to_string(),
-            ..Default::default()
-        });
+        let nexus = sync_ctx.start_nexus_operation(
+            NexusOperationOptions::builder()
+                .endpoint("original-endpoint")
+                .service("original-service")
+                .operation("original-operation")
+                .build(),
+        );
         drop((signal, cancel, nexus));
 
         let WorkflowTermination::ContinueAsNew(continue_as_new) = termination else {

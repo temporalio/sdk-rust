@@ -558,23 +558,17 @@ async fn deployment_version_correct_in_wf_info(#[values(true, false)] use_only_b
     let wf_type = "deployment_version_correct_in_wf_info";
     let mut starter = CoreWfStarter::new(wf_type);
     starter.sdk_config.deployment_options = if use_only_build_id {
-        WorkerDeploymentOptions {
-            version: WorkerDeploymentVersion {
-                deployment_name: "".to_string(),
-                build_id: "1.0".to_string(),
-            },
-            use_worker_versioning: false,
-            default_versioning_behavior: None,
-        }
+        WorkerDeploymentOptions::new(WorkerDeploymentVersion {
+            deployment_name: "".to_string(),
+            build_id: "1.0".to_string(),
+        })
+        .build()
     } else {
-        WorkerDeploymentOptions {
-            version: WorkerDeploymentVersion {
-                deployment_name: "deployment-1".to_string(),
-                build_id: "1.0".to_string(),
-            },
-            use_worker_versioning: false,
-            default_versioning_behavior: None,
-        }
+        WorkerDeploymentOptions::new(WorkerDeploymentVersion {
+            deployment_name: "deployment-1".to_string(),
+            build_id: "1.0".to_string(),
+        })
+        .build()
     };
     starter.sdk_config.task_types = WorkerTaskTypes::workflow_only();
     let core = starter.get_worker().await;
@@ -680,23 +674,17 @@ async fn deployment_version_correct_in_wf_info(#[values(true, false)] use_only_b
 
     let mut starter = starter.clone_no_worker();
     starter.sdk_config.deployment_options = if use_only_build_id {
-        WorkerDeploymentOptions {
-            version: WorkerDeploymentVersion {
-                deployment_name: "".to_string(),
-                build_id: "2.0".to_string(),
-            },
-            use_worker_versioning: false,
-            default_versioning_behavior: None,
-        }
+        WorkerDeploymentOptions::new(WorkerDeploymentVersion {
+            deployment_name: "".to_string(),
+            build_id: "2.0".to_string(),
+        })
+        .build()
     } else {
-        WorkerDeploymentOptions {
-            version: WorkerDeploymentVersion {
-                deployment_name: "deployment-1".to_string(),
-                build_id: "2.0".to_string(),
-            },
-            use_worker_versioning: false,
-            default_versioning_behavior: None,
-        }
+        WorkerDeploymentOptions::new(WorkerDeploymentVersion {
+            deployment_name: "deployment-1".to_string(),
+            build_id: "2.0".to_string(),
+        })
+        .build()
     };
 
     let core = starter.get_worker().await;
@@ -953,10 +941,9 @@ async fn history_out_of_order_on_restart() {
             ctx.execute_local_activity(
                 StdActivities::echo,
                 "hi".to_string(),
-                LocalActivityOptions {
-                    start_to_close_timeout: Some(Duration::from_secs(5)),
-                    ..Default::default()
-                },
+                LocalActivityOptions::builder()
+                    .start_to_close_timeout(Duration::from_secs(5))
+                    .build(),
             )
             .await?;
             ctx.execute_activity(
@@ -982,10 +969,9 @@ async fn history_out_of_order_on_restart() {
             ctx.execute_local_activity(
                 StdActivities::echo,
                 "hi".to_string(),
-                LocalActivityOptions {
-                    start_to_close_timeout: Some(Duration::from_secs(5)),
-                    ..Default::default()
-                },
+                LocalActivityOptions::builder()
+                    .start_to_close_timeout(Duration::from_secs(5))
+                    .build(),
             )
             .await?;
             // Timer is added after restarting workflow
@@ -1075,10 +1061,11 @@ async fn pass_timer_summary_to_metadata() {
     impl PassTimerSummaryWf {
         #[run(name = DEFAULT_WORKFLOW_TYPE)]
         async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<()> {
-            ctx.timer(TimerOptions {
-                duration: Duration::from_secs(1),
-                summary: Some("timer summary".to_string()),
-            })
+            ctx.timer(
+                TimerOptions::builder(Duration::from_secs(1))
+                    .summary("timer summary".to_string())
+                    .build(),
+            )
             .await;
             Ok(())
         }

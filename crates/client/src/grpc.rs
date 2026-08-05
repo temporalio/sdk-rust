@@ -2288,14 +2288,12 @@ mod tests {
             }
         }
 
-        let deployment_opts = WorkerDeploymentOptions {
-            version: WorkerDeploymentVersion {
-                deployment_name: "test-deployment".to_string(),
-                build_id: "test-build-123".to_string(),
-            },
-            use_worker_versioning,
-            default_versioning_behavior: None,
-        };
+        let deployment_opts = WorkerDeploymentOptions::new(WorkerDeploymentVersion {
+            deployment_name: "test-deployment".to_string(),
+            build_id: "test-build-123".to_string(),
+        })
+        .use_worker_versioning(use_worker_versioning)
+        .build();
 
         let mut mock_provider = MockClientWorker::new();
         mock_provider

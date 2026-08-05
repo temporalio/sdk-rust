@@ -116,12 +116,16 @@ impl WorkerTaskTypes {
 }
 
 /// Configuration for worker deployment versioning.
-#[derive(Clone, Debug, Eq, PartialEq, Hash)]
+#[derive(Clone, Debug, Eq, PartialEq, Hash, bon::Builder)]
+#[builder(start_fn = new)]
+#[non_exhaustive]
 pub struct WorkerDeploymentOptions {
     /// The deployment version of this worker.
+    #[builder(start_fn)]
     pub version: WorkerDeploymentVersion,
     /// If set, opts in to the Worker Deployment Versioning feature, meaning this worker will only
     /// receive tasks for workflows it claims to be compatible with.
+    #[builder(default)]
     pub use_worker_versioning: bool,
     /// The default versioning behavior to use for workflows that do not pass one to Core.
     /// It is a startup-time error to specify `Some(Unspecified)` here.
@@ -131,14 +135,11 @@ pub struct WorkerDeploymentOptions {
 impl WorkerDeploymentOptions {
     /// Create deployment options from just a build ID, without opting into worker versioning.
     pub fn from_build_id(build_id: String) -> Self {
-        Self {
-            version: WorkerDeploymentVersion {
-                deployment_name: "".to_owned(),
-                build_id,
-            },
-            use_worker_versioning: false,
-            default_versioning_behavior: None,
-        }
+        Self::new(WorkerDeploymentVersion {
+            deployment_name: "".to_owned(),
+            build_id,
+        })
+        .build()
     }
 }
 

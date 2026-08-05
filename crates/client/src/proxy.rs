@@ -25,10 +25,13 @@ use tower::{Service, service_fn};
 use tokio::net::UnixStream;
 
 /// Options for HTTP CONNECT proxy.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, bon::Builder)]
+#[builder(start_fn = new, on(String, into))]
+#[non_exhaustive]
 pub struct HttpConnectProxyOptions {
     /// The host:port to proxy through for TCP, or unix:/path/to/unix.sock for
     /// Unix socket (which means it must start with "unix:/").
+    #[builder(start_fn)]
     pub target_addr: String,
     /// Optional HTTP basic auth for the proxy as user/pass tuple.
     pub basic_auth: Option<(String, String)>,
@@ -279,10 +282,7 @@ mod tests {
     #[tokio::test]
     async fn connect_request_line(#[case] uri: &str, #[case] expected: &str) {
         let (proxy_addr, handle) = mock_proxy().await;
-        let opts = HttpConnectProxyOptions {
-            target_addr: proxy_addr,
-            basic_auth: None,
-        };
+        let opts = HttpConnectProxyOptions::new(proxy_addr).build();
         let uri: tonic::transport::Uri = uri.parse().unwrap();
         let _ = opts.connect(uri).await;
 
@@ -293,10 +293,9 @@ mod tests {
     #[tokio::test]
     async fn connect_includes_basic_auth() {
         let (proxy_addr, handle) = mock_proxy().await;
-        let opts = HttpConnectProxyOptions {
-            target_addr: proxy_addr,
-            basic_auth: Some(("user".to_string(), "pass".to_string())),
-        };
+        let opts = HttpConnectProxyOptions::new(proxy_addr)
+            .basic_auth(("user".to_string(), "pass".to_string()))
+            .build();
         let uri: tonic::transport::Uri = "https://example.com:7233".parse().unwrap();
         let _ = opts.connect(uri).await;
 

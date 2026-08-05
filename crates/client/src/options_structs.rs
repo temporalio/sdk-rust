@@ -169,7 +169,8 @@ pub enum GrpcCompression {
 }
 
 /// Configuration options for TLS
-#[derive(Clone, Default)]
+#[derive(Clone, bon::Builder)]
+#[non_exhaustive]
 pub struct TlsOptions {
     /// Bytes representing the root CA certificate used by the server. If not set, and the server's
     /// cert is issued by someone the operating system trusts, verification will still work (ex:
@@ -199,6 +200,12 @@ pub struct TlsOptions {
     pub server_cert_verifier: Option<Arc<dyn ServerCertVerifier>>,
 }
 
+impl Default for TlsOptions {
+    fn default() -> Self {
+        Self::builder().build()
+    }
+}
+
 impl std::fmt::Debug for TlsOptions {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("TlsOptions")
@@ -220,7 +227,8 @@ impl std::fmt::Debug for TlsOptions {
 }
 
 /// If using mTLS, both the client cert and private key must be specified, this contains them.
-#[derive(Clone)]
+#[derive(Clone, bon::Builder)]
+#[non_exhaustive]
 pub struct ClientTlsOptions {
     /// The certificate for this client, encoded as PEM
     pub client_cert: Vec<u8>,
@@ -229,57 +237,56 @@ pub struct ClientTlsOptions {
 }
 
 /// Client keep alive configuration.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, bon::Builder)]
+#[non_exhaustive]
 pub struct ClientKeepAliveOptions {
     /// Interval to send HTTP2 keep alive pings.
+    #[builder(default = Duration::from_secs(30))]
     pub interval: Duration,
     /// Timeout that the keep alive must be responded to within or the connection will be closed.
+    #[builder(default = Duration::from_secs(15))]
     pub timeout: Duration,
 }
 
 impl Default for ClientKeepAliveOptions {
     fn default() -> Self {
-        Self {
-            interval: Duration::from_secs(30),
-            timeout: Duration::from_secs(15),
-        }
+        Self::builder().build()
     }
 }
 
 /// Options for DNS-based load balancing.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, bon::Builder)]
 #[non_exhaustive]
 pub struct DnsLoadBalancingOptions {
     /// How often to re-resolve DNS. Defaults to 30 seconds.
+    #[builder(default = Duration::from_secs(30))]
     pub resolution_interval: Duration,
 }
 
 impl Default for DnsLoadBalancingOptions {
     fn default() -> Self {
-        Self {
-            resolution_interval: Duration::from_secs(30),
-        }
+        Self::builder().build()
     }
 }
 
 /// Payload size limit options for a connection.
 /// NOTE: Experimental
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, bon::Builder)]
+#[non_exhaustive]
 pub struct PayloadLimitsOptions {
     /// Warning threshold (bytes) for the size of an outbound payload-bearing field; over-threshold
     /// fields are logged but still sent to server. Defaults to 512 KiB. Set to `0` to disable.
+    #[builder(default = 512 * 1024)]
     pub payloads_warn_size: u64,
     /// Warning threshold (bytes) for outbound memo sizes; over-threshold memos are logged but still
     /// sent to server. Defaults to 2 KiB. Set to `0` to disable.
+    #[builder(default = 2 * 1024)]
     pub memo_warn_size: u64,
 }
 
 impl Default for PayloadLimitsOptions {
     fn default() -> Self {
-        Self {
-            payloads_warn_size: 512 * 1024,
-            memo_warn_size: 2 * 1024,
-        }
+        Self::builder().build()
     }
 }
 
@@ -494,6 +501,7 @@ const DEFAULT_WORKFLOW_EXECUTION_RETENTION_PERIOD: Duration = Duration::from_sec
 /// Helper struct for `register_namespace`.
 #[derive(Clone, Debug, bon::Builder)]
 #[builder(on(String, into))]
+#[non_exhaustive]
 pub struct RegisterNamespaceOptions {
     /// Name (required)
     pub namespace: String,

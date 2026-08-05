@@ -92,7 +92,7 @@ fsm! {
     Cancelled --(CommandRequestCancelExternalWorkflowExecution) --> Cancelled;
     Cancelled --(ChildWorkflowExecutionCancelled,
         on_child_workflow_execution_cancelled) --> Cancelled;
-    // Completions of any kind after cancellation are acceptable for abandoned children
+    // Late terminal events cannot affect children whose result was resolved on cancellation.
     Cancelled --(ChildWorkflowExecutionCompleted(Option<Payloads>),
         shared on_child_workflow_execution_completed) --> Cancelled;
     Cancelled --(ChildWorkflowExecutionFailed(ChildWorkflowExecutionFailedEventAttributes),
@@ -142,9 +142,9 @@ pub(super) struct Cancelled {
     seen_cancelled_event: bool,
 }
 
-fn completion_of_not_abandoned_err() -> WFMachinesError {
+fn completion_after_non_immediate_cancel_err() -> WFMachinesError {
     nondeterminism!(
-        "Child workflows which don't have the ABANDON cancellation type cannot complete after \
+        "Child workflows which don't resolve immediately on cancellation cannot complete after \
          being cancelled."
     )
 }
@@ -173,8 +173,8 @@ impl Cancelled {
         state: &mut SharedState,
         _: Option<Payloads>,
     ) -> ChildWorkflowMachineTransition<Cancelled> {
-        if !state.abandons() {
-            return ChildWorkflowMachineTransition::Err(completion_of_not_abandoned_err());
+        if !state.resolves_immediately_on_cancel() {
+            return ChildWorkflowMachineTransition::Err(completion_after_non_immediate_cancel_err());
         }
         ChildWorkflowMachineTransition::ok([], self)
     }
@@ -184,8 +184,8 @@ impl Cancelled {
         state: &mut SharedState,
         _: ChildWorkflowExecutionFailedEventAttributes,
     ) -> ChildWorkflowMachineTransition<Cancelled> {
-        if !state.abandons() {
-            return ChildWorkflowMachineTransition::Err(completion_of_not_abandoned_err());
+        if !state.resolves_immediately_on_cancel() {
+            return ChildWorkflowMachineTransition::Err(completion_after_non_immediate_cancel_err());
         }
         ChildWorkflowMachineTransition::ok([], self)
     }
@@ -195,8 +195,8 @@ impl Cancelled {
         state: &mut SharedState,
         _: RetryState,
     ) -> ChildWorkflowMachineTransition<Cancelled> {
-        if !state.abandons() {
-            return ChildWorkflowMachineTransition::Err(completion_of_not_abandoned_err());
+        if !state.resolves_immediately_on_cancel() {
+            return ChildWorkflowMachineTransition::Err(completion_after_non_immediate_cancel_err());
         }
         ChildWorkflowMachineTransition::ok([], self)
     }
@@ -205,8 +205,8 @@ impl Cancelled {
         self,
         state: &mut SharedState,
     ) -> ChildWorkflowMachineTransition<Cancelled> {
-        if !state.abandons() {
-            return ChildWorkflowMachineTransition::Err(completion_of_not_abandoned_err());
+        if !state.resolves_immediately_on_cancel() {
+            return ChildWorkflowMachineTransition::Err(completion_after_non_immediate_cancel_err());
         }
         ChildWorkflowMachineTransition::ok([], self)
     }
@@ -313,11 +313,10 @@ impl StartEventRecorded {
         state: &mut SharedState,
         reason: String,
     ) -> ChildWorkflowMachineTransition<StartEventRecordedOrCancelled> {
-        let dest = match state.cancel_type {
-            ChildWorkflowCancellationType::Abandon | ChildWorkflowCancellationType::TryCancel => {
-                StartEventRecordedOrCancelled::Cancelled(Default::default())
-            }
-            _ => StartEventRecordedOrCancelled::StartEventRecorded(Default::default()),
+        let dest = if state.resolves_immediately_on_cancel() {
+            StartEventRecordedOrCancelled::Cancelled(Default::default())
+        } else {
+            StartEventRecordedOrCancelled::StartEventRecorded(Default::default())
         };
         TransitionResult::ok(
             [ChildWorkflowCommand::IssueCancelAfterStarted { reason }],
@@ -416,11 +415,10 @@ impl Started {
         state: &mut SharedState,
         reason: String,
     ) -> ChildWorkflowMachineTransition<StartedOrCancelled> {
-        let dest = match state.cancel_type {
-            ChildWorkflowCancellationType::Abandon | ChildWorkflowCancellationType::TryCancel => {
-                StartedOrCancelled::Cancelled(Default::default())
-            }
-            _ => StartedOrCancelled::Started(Default::default()),
+        let dest = if state.resolves_immediately_on_cancel() {
+            StartedOrCancelled::Cancelled(Default::default())
+        } else {
+            StartedOrCancelled::Started(Default::default())
         };
         TransitionResult::ok(
             [ChildWorkflowCommand::IssueCancelAfterStarted { reason }],
@@ -450,8 +448,11 @@ pub(super) struct SharedState {
 }
 
 impl SharedState {
-    fn abandons(&self) -> bool {
-        matches!(self.cancel_type, ChildWorkflowCancellationType::Abandon)
+    fn resolves_immediately_on_cancel(&self) -> bool {
+        matches!(
+            self.cancel_type,
+            ChildWorkflowCancellationType::Abandon | ChildWorkflowCancellationType::TryCancel
+        )
     }
 }
 
@@ -744,12 +745,7 @@ impl WFMachinesAdapter for ChildWorkflowMachine {
                         .into(),
                     ))
                 }
-                // Immediately resolve abandon/trycancel modes
-                if matches!(
-                    self.shared_state.cancel_type,
-                    ChildWorkflowCancellationType::Abandon
-                        | ChildWorkflowCancellationType::TryCancel
-                ) {
+                if self.shared_state.resolves_immediately_on_cancel() {
                     resps.push(self.resolve_cancelled_msg().into())
                 }
                 resps
@@ -838,8 +834,12 @@ mod test {
         }
     }
 
-    #[test]
-    fn abandoned_ok_with_completions() {
+    #[rstest]
+    #[case::abandon(ChildWorkflowCancellationType::Abandon)]
+    #[case::try_cancel(ChildWorkflowCancellationType::TryCancel)]
+    fn immediately_cancelled_ok_with_terminal_events(
+        #[case] cancel_type: ChildWorkflowCancellationType,
+    ) {
         let mut shared = SharedState {
             initiated_event_id: 0,
             started_event_id: 0,
@@ -849,12 +849,10 @@ mod test {
             run_id: "".to_string(),
             workflow_type: "".to_string(),
             cancelled_before_sent: false,
-            cancel_type: ChildWorkflowCancellationType::Abandon,
+            cancel_type,
             internal_flags: Rc::new(RefCell::new(InternalFlags::default())),
         };
-        let state = Cancelled {
-            seen_cancelled_event: true,
-        };
+        let state = Cancelled::default();
         let res = state.on_child_workflow_execution_completed(&mut shared, None);
         // Can't use assert_matches b/c not Debug.
         assert!(matches!(
@@ -865,9 +863,7 @@ mod test {
             }
             if commands.is_empty()
         ));
-        let state = Cancelled {
-            seen_cancelled_event: true,
-        };
+        let state = Cancelled::default();
         let res = state.on_child_workflow_execution_failed(&mut shared, Default::default());
         assert!(matches!(
             res,
@@ -877,9 +873,7 @@ mod test {
             }
             if commands.is_empty()
         ));
-        let state = Cancelled {
-            seen_cancelled_event: true,
-        };
+        let state = Cancelled::default();
         let res = state.on_child_workflow_execution_timed_out(&mut shared, Default::default());
         assert!(matches!(
             res,
@@ -889,9 +883,7 @@ mod test {
             }
             if commands.is_empty()
         ));
-        let state = Cancelled {
-            seen_cancelled_event: true,
-        };
+        let state = Cancelled::default();
         let res = state.on_child_workflow_execution_terminated(&mut shared);
         assert!(matches!(
             res,

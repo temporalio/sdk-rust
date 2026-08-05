@@ -428,7 +428,8 @@ impl ActivityOptions {
 }
 
 /// Options for scheduling a local activity
-#[derive(Default, Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, bon::Builder)]
+#[non_exhaustive]
 pub struct LocalActivityOptions {
     /// Identifier to use for tracking the activity in Workflow history.
     /// The `activityId` can be accessed by the activity function.
@@ -437,6 +438,7 @@ pub struct LocalActivityOptions {
     /// If `None` use the context's sequence number
     pub activity_id: Option<String>,
     /// Retry policy
+    #[builder(default)]
     pub retry_policy: RetryPolicy,
     /// Override attempt number rather than using 1.
     /// Ideally we would not expose this in a released Rust SDK, but it's needed for test.
@@ -447,6 +449,7 @@ pub struct LocalActivityOptions {
     /// Retry backoffs over this amount will use a timer rather than a local retry
     pub timer_backoff_threshold: Option<Duration>,
     /// How the activity will cancel
+    #[builder(default)]
     pub cancel_type: ActivityCancellationType,
     /// Indicates how long the caller is willing to wait for local activity completion. Limits how
     /// long retries will be attempted. When not specified defaults to the workflow execution
@@ -465,6 +468,12 @@ pub struct LocalActivityOptions {
     pub start_to_close_timeout: Option<Duration>,
     /// Single-line summary for this activity that will appear in UI/CLI.
     pub summary: Option<String>,
+}
+
+impl Default for LocalActivityOptions {
+    fn default() -> Self {
+        Self::builder().build()
+    }
 }
 
 impl LocalActivityOptions {
@@ -661,12 +670,20 @@ impl SignalData {
 }
 
 /// Options for timer
-#[derive(Default, Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, bon::Builder)]
+#[non_exhaustive]
 pub struct TimerOptions {
     /// Duration for the timer
+    #[builder(start_fn)]
     pub duration: Duration,
     /// Summary of the timer
     pub summary: Option<String>,
+}
+
+impl Default for TimerOptions {
+    fn default() -> Self {
+        Self::builder(Duration::default()).build()
+    }
 }
 
 impl From<Duration> for TimerOptions {
@@ -696,7 +713,9 @@ impl TimerOptions {
 }
 
 /// Options for Nexus Operations
-#[derive(Default, Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, bon::Builder)]
+#[builder(on(String, into))]
+#[non_exhaustive]
 pub struct NexusOperationOptions {
     /// Endpoint name, must exist in the endpoint registry or this command will fail.
     pub endpoint: String,
@@ -719,6 +738,7 @@ pub struct NexusOperationOptions {
     /// tracing information. Note these headers are not the same as Temporal headers on internal
     /// activities and child workflows, these are transmitted to Nexus operations that may be
     /// external and are not traditional payloads.
+    #[builder(default)]
     pub nexus_header: HashMap<String, String>,
     /// Cancellation type for the operation
     pub cancellation_type: Option<NexusOperationCancellationType>,

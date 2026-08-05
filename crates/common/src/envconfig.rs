@@ -174,17 +174,26 @@ pub struct ClientConfigCodec {
 }
 
 /// Options for loading client configuration
-#[derive(Debug, Default)]
+#[derive(Debug, PartialEq, bon::Builder)]
+#[non_exhaustive]
 pub struct LoadClientConfigOptions {
     /// Where to load config from. If unset, will try env vars then default path.
     pub config_source: Option<DataSource>,
 
     /// If true, will error if there are unrecognized keys
+    #[builder(default)]
     pub config_file_strict: bool,
 }
 
+impl Default for LoadClientConfigOptions {
+    fn default() -> Self {
+        Self::builder().build()
+    }
+}
+
 /// Options for loading a client configuration profile
-#[derive(Debug, Default)]
+#[derive(Debug, PartialEq, bon::Builder)]
+#[non_exhaustive]
 pub struct LoadClientConfigProfileOptions {
     /// Where to load config from. If unset, will try env vars then default path.
     pub config_source: Option<DataSource>,
@@ -193,20 +202,37 @@ pub struct LoadClientConfigProfileOptions {
     pub config_file_profile: Option<String>,
 
     /// If true, will error if there are unrecognized keys.
+    #[builder(default)]
     pub config_file_strict: bool,
 
     /// Disable loading from file
+    #[builder(default)]
     pub disable_file: bool,
 
     /// Disable loading from environment variables
+    #[builder(default)]
     pub disable_env: bool,
 }
 
+impl Default for LoadClientConfigProfileOptions {
+    fn default() -> Self {
+        Self::builder().build()
+    }
+}
+
 /// Options for parsing TOML configuration
-#[derive(Debug, Default)]
+#[derive(Debug, PartialEq, bon::Builder)]
+#[non_exhaustive]
 pub struct ClientConfigFromTOMLOptions {
     /// If true, will error if there are unrecognized keys.
+    #[builder(default)]
     pub strict: bool,
+}
+
+impl Default for ClientConfigFromTOMLOptions {
+    fn default() -> Self {
+        Self::builder().build()
+    }
 }
 
 /// A source for environment variables, which can be either a provided HashMap or the system's
@@ -292,9 +318,9 @@ fn load_client_config_inner(
     if let Some(data) = toml_data {
         ClientConfig::from_toml(
             &data,
-            ClientConfigFromTOMLOptions {
-                strict: options.config_file_strict,
-            },
+            ClientConfigFromTOMLOptions::builder()
+                .strict(options.config_file_strict)
+                .build(),
         )
     } else {
         Ok(ClientConfig::default())
@@ -339,10 +365,10 @@ pub fn load_client_config_profile(
     } else {
         // Load the full config
         let config = load_client_config(
-            LoadClientConfigOptions {
-                config_source: options.config_source,
-                config_file_strict: options.config_file_strict,
-            },
+            LoadClientConfigOptions::builder()
+                .maybe_config_source(options.config_source)
+                .config_file_strict(options.config_file_strict)
+                .build(),
             env_vars,
         )?;
 
@@ -1412,7 +1438,7 @@ unrecognized_field = "is-bad"
 "#;
         let err = ClientConfig::from_toml(
             toml_str.as_bytes(),
-            ClientConfigFromTOMLOptions { strict: true },
+            ClientConfigFromTOMLOptions::builder().strict(true).build(),
         )
         .unwrap_err();
         let err_str = err.to_string();
@@ -1427,7 +1453,7 @@ foo = "bar"
 "#;
         let err = ClientConfig::from_toml(
             toml_str.as_bytes(),
-            ClientConfigFromTOMLOptions { strict: true },
+            ClientConfigFromTOMLOptions::builder().strict(true).build(),
         )
         .unwrap_err();
         let err_str = err.to_string();

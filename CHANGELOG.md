@@ -26,6 +26,8 @@ to docs, or any other relevant information.
   and `list` read them back.
 * `MemoValue` and `MemoValues` are now exported from `temporalio_common` as well as
   `temporalio_workflow`, so the same types can be used from clients and workflows.
+* `RpcOptions::builder()` for constructing per-call RPC options.
+* `DnsLoadBalancingOptions::builder()` for configuring DNS re-resolution intervals.
 
 ### Breaking Changes :boom:
 * `CancellableFuture` and `CancellableFutureWithReason` now use the inherited `Future::Output`
@@ -34,6 +36,47 @@ to docs, or any other relevant information.
   `Rc` and now uses an `Arc`, so that memos can be built outside a workflow and handed to the
   client. Only affects memo values that are themselves non-`Send`/non-`Sync`, such as those
   holding an `Rc` or `RefCell`.
+* `TimerOptions` is now tagged with `#[non_exhaustive]`. Use
+  `TimerOptions::builder(duration)` to construct timer options. Passing a `Duration` directly to
+  `WorkflowContext::timer` remains supported.
+* `RetryOptions` is now tagged with `#[non_exhaustive]`. Use `RetryOptions::builder()` to
+  construct retry options.
+* `HttpConnectProxyOptions` is now tagged with `#[non_exhaustive]`. Use
+  `HttpConnectProxyOptions::new(target_addr)` to construct proxy options.
+* `TlsOptions` is now tagged with `#[non_exhaustive]`. Use `TlsOptions::builder()` to construct
+  TLS options.
+* `ClientTlsOptions` is now tagged with `#[non_exhaustive]`. Use `ClientTlsOptions::builder()` to
+  construct client TLS options.
+* `ClientKeepAliveOptions` is now tagged with `#[non_exhaustive]`. Use
+  `ClientKeepAliveOptions::builder()` to construct keep-alive options.
+* `PayloadLimitsOptions` is now tagged with `#[non_exhaustive]`. Use
+  `PayloadLimitsOptions::builder()` to construct payload limit options.
+* `RegisterNamespaceOptions` is now tagged with `#[non_exhaustive]`. Continue using
+  `RegisterNamespaceOptions::builder()` to construct namespace registration options.
+* `LoadClientConfigOptions` is now tagged with `#[non_exhaustive]`. Use
+  `LoadClientConfigOptions::builder()` to construct client configuration loading options.
+* `LoadClientConfigProfileOptions` is now tagged with `#[non_exhaustive]`. Use
+  `LoadClientConfigProfileOptions::builder()` to construct profile loading options.
+* `ClientConfigFromTOMLOptions` is now tagged with `#[non_exhaustive]`. Use
+  `ClientConfigFromTOMLOptions::builder()` to construct TOML parsing options.
+* `OtelCollectorOptions` is now tagged with `#[non_exhaustive]`. Use
+  `OtelCollectorOptions::builder()` to construct OpenTelemetry collector options.
+* `PrometheusExporterOptions` is now tagged with `#[non_exhaustive]`. Use
+  `PrometheusExporterOptions::builder()` to construct Prometheus exporter options.
+* `WorkerDeploymentOptions` is now tagged with `#[non_exhaustive]`. Use
+  `WorkerDeploymentOptions::new(version)` to construct worker deployment options.
+* `PollOptions` is now tagged with `#[non_exhaustive]`. Use `PollOptions::new(task_queue)` to
+  construct polling options.
+* `PollWorkflowOptions` is now tagged with `#[non_exhaustive]`. Use
+  `PollWorkflowOptions::builder()` to construct workflow polling options.
+* `PollActivityOptions` is now tagged with `#[non_exhaustive]`. Use
+  `PollActivityOptions::builder()` to construct activity polling options.
+* `PollNexusOptions` is now tagged with `#[non_exhaustive]`. Use
+  `PollNexusOptions::builder()` to construct Nexus polling options.
+* `LocalActivityOptions` is now tagged with `#[non_exhaustive]`. Use
+  `LocalActivityOptions::builder()` to construct local activity options.
+* `NexusOperationOptions` is now tagged with `#[non_exhaustive]`. Use
+  `NexusOperationOptions::builder()` to construct Nexus operation options.
 
 ## [0.6.0] - 2026-08-04
 
@@ -158,6 +201,8 @@ to docs, or any other relevant information.
   cancellation, and heartbeat, and `WorkflowUpdateHandle::get_result`.
 
 ### Fixed
+* Try-cancel child workflows no longer cause nondeterminism when they complete or fail after their
+  cancellation was requested.
 * `RuntimeOptions::default()` now uses the same 60-second worker heartbeat interval as the
   builder default.
 * Local activity resolutions are now delivered to workflows as each activity completes instead of

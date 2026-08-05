@@ -327,10 +327,11 @@ mod tests {
     #[test]
     fn zero_resolution_interval_is_error() {
         let opts = ConnectionOptions::new(Url::parse("http://temporal.example.com:7233").unwrap())
-            .dns_load_balancing(Some(DnsLoadBalancingOptions {
-                resolution_interval: Duration::ZERO,
-                ..Default::default()
-            }))
+            .dns_load_balancing(Some(
+                DnsLoadBalancingOptions::builder()
+                    .resolution_interval(Duration::ZERO)
+                    .build(),
+            ))
             .build();
         assert!(validate_and_get_dns_lb(&opts).is_err());
     }
@@ -338,10 +339,11 @@ mod tests {
     #[test]
     fn sub_minimum_resolution_interval_is_error() {
         let opts = ConnectionOptions::new(Url::parse("http://temporal.example.com:7233").unwrap())
-            .dns_load_balancing(Some(DnsLoadBalancingOptions {
-                resolution_interval: Duration::from_millis(500),
-                ..Default::default()
-            }))
+            .dns_load_balancing(Some(
+                DnsLoadBalancingOptions::builder()
+                    .resolution_interval(Duration::from_millis(500))
+                    .build(),
+            ))
             .build();
         assert!(validate_and_get_dns_lb(&opts).is_err());
     }

@@ -408,9 +408,14 @@ pub(crate) async fn shutdown_during_active_timer_activity_workflows() {
 }
 
 /// Verifies that activity cancellation is delivered via the nexus worker command channel
-/// even when the activity does not heartbeat.
-pub(crate) async fn activity_cancel_delivered_without_heartbeat() {
-    let wf_name = "activity_cancel_delivered_without_heartbeat";
+/// even when the activity does not heartbeat. When `disable_eager` is false, the activity
+/// is eagerly dispatched.
+pub(crate) async fn activity_cancel_delivered_without_heartbeat(disable_eager: bool) {
+    let wf_name = if disable_eager {
+        "activity_cancel_delivered_without_heartbeat"
+    } else {
+        "activity_cancel_delivered_without_heartbeat_eager"
+    };
     let mut starter = CoreWfStarter::new_cloud_or_local(wf_name, "")
         .await
         .unwrap();
@@ -460,7 +465,7 @@ pub(crate) async fn activity_cancel_delivered_without_heartbeat() {
     #[workflow_methods]
     impl CancelWithoutHeartbeatWorkflow {
         #[run]
-        async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<()> {
+        async fn run(ctx: &mut WorkflowContext<Self>, disable_eager: bool) -> WorkflowResult<()> {
             let act_fut = ctx.execute_activity(
                 WaitForCancelActivities::wait_for_cancel,
                 "hi".to_string(),
@@ -470,8 +475,7 @@ pub(crate) async fn activity_cancel_delivered_without_heartbeat() {
                         ..Default::default()
                     })
                     .cancellation_type(ActivityCancellationType::WaitCancellationCompleted)
-                    // TODO: enable eager dispatch once server supports it for worker commands.
-                    .do_not_eagerly_execute(true)
+                    .do_not_eagerly_execute(disable_eager)
                     .build(),
             );
             // ensure the activity is started on a worker before cancelling, so the cancel goes
@@ -498,7 +502,7 @@ pub(crate) async fn activity_cancel_delivered_without_heartbeat() {
     let handle = worker
         .submit_workflow(
             CancelWithoutHeartbeatWorkflow::run,
-            (),
+            disable_eager,
             WorkflowStartOptions::new(task_queue, wf_name.to_owned())
                 .run_timeout(Duration::from_secs(10))
                 .build(),

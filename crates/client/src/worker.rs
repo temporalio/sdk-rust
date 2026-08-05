@@ -672,16 +672,14 @@ mod tests {
         failing_worker
             .expect_task_queue()
             .return_const(task_queue.clone());
-        failing_worker
-            .expect_deployment_options()
-            .return_const(WorkerDeploymentOptions {
-                version: temporalio_common::worker::WorkerDeploymentVersion {
-                    deployment_name: "test-deployment".to_string(),
-                    build_id: "build-fail".to_string(),
-                },
-                use_worker_versioning: true,
-                default_versioning_behavior: None,
-            });
+        failing_worker.expect_deployment_options().return_const(
+            WorkerDeploymentOptions::new(temporalio_common::worker::WorkerDeploymentVersion {
+                deployment_name: "test-deployment".to_string(),
+                build_id: "build-fail".to_string(),
+            })
+            .use_worker_versioning(true)
+            .build(),
+        );
         failing_worker
             .expect_worker_instance_key()
             .return_const(failing_worker_id);
@@ -709,14 +707,13 @@ mod tests {
         succeeding_worker
             .expect_task_queue()
             .return_const(task_queue.clone());
-        let success_deployment_options = WorkerDeploymentOptions {
-            version: temporalio_common::worker::WorkerDeploymentVersion {
+        let success_deployment_options =
+            WorkerDeploymentOptions::new(temporalio_common::worker::WorkerDeploymentVersion {
                 deployment_name: "test-deployment".to_string(),
                 build_id: "build-success".to_string(),
-            },
-            use_worker_versioning: true,
-            default_versioning_behavior: None,
-        };
+            })
+            .use_worker_versioning(true)
+            .build();
         succeeding_worker
             .expect_deployment_options()
             .return_const(success_deployment_options.clone());
@@ -772,16 +769,14 @@ mod tests {
         failing_worker
             .expect_task_queue()
             .return_const(task_queue.clone());
-        failing_worker
-            .expect_deployment_options()
-            .return_const(WorkerDeploymentOptions {
-                version: temporalio_common::worker::WorkerDeploymentVersion {
-                    deployment_name: "test-deployment".to_string(),
-                    build_id: "build-fail".to_string(),
-                },
-                use_worker_versioning: true,
-                default_versioning_behavior: None,
-            });
+        failing_worker.expect_deployment_options().return_const(
+            WorkerDeploymentOptions::new(temporalio_common::worker::WorkerDeploymentVersion {
+                deployment_name: "test-deployment".to_string(),
+                build_id: "build-fail".to_string(),
+            })
+            .use_worker_versioning(true)
+            .build(),
+        );
         failing_worker
             .expect_worker_instance_key()
             .return_const(failing_worker_id);
@@ -984,16 +979,16 @@ mod tests {
         mock_provider
             .expect_deployment_options()
             .returning(move || {
-                build_id_for_closure
-                    .as_ref()
-                    .map(|build_id| WorkerDeploymentOptions {
-                        version: temporalio_common::worker::WorkerDeploymentVersion {
+                build_id_for_closure.as_ref().map(|build_id| {
+                    WorkerDeploymentOptions::new(
+                        temporalio_common::worker::WorkerDeploymentVersion {
                             deployment_name: deployment_name.clone(),
                             build_id: build_id.clone(),
                         },
-                        use_worker_versioning: true,
-                        default_versioning_behavior: None,
-                    })
+                    )
+                    .use_worker_versioning(true)
+                    .build()
+                })
             });
 
         if heartbeat_enabled {

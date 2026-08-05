@@ -43,14 +43,13 @@
 //!
 //!     let worker_options = WorkerOptions::new("task_queue")
 //!         .task_types(WorkerTaskTypes::activity_only())
-//!         .deployment_options(WorkerDeploymentOptions {
-//!             version: WorkerDeploymentVersion {
+//!         .deployment_options(
+//!             WorkerDeploymentOptions::new(WorkerDeploymentVersion {
 //!                 deployment_name: "my_deployment".to_owned(),
 //!                 build_id: "my_build_id".to_owned(),
-//!             },
-//!             use_worker_versioning: false,
-//!             default_versioning_behavior: None,
-//!         })
+//!             })
+//!             .build(),
+//!         )
 //!         .register_activities(MyActivities)
 //!         .build();
 //!

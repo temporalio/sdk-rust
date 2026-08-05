@@ -127,6 +127,7 @@ pub enum TaskQueueLabelStrategy {
 
 /// Options for exporting to an OpenTelemetry Collector
 #[derive(Debug, Clone, bon::Builder)]
+#[non_exhaustive]
 pub struct OtelCollectorOptions {
     /// The url of the OTel collector to export telemetry and metrics to. Lang SDK should also
     /// export to this same collector.
@@ -156,6 +157,7 @@ pub struct OtelCollectorOptions {
 
 /// Options for exporting metrics to Prometheus
 #[derive(Debug, Clone, bon::Builder)]
+#[non_exhaustive]
 pub struct PrometheusExporterOptions {
     /// The address the Prometheus exporter HTTP server will bind to.
     pub socket_addr: SocketAddr,
