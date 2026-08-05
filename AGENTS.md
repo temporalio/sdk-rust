@@ -14,7 +14,8 @@ document as your quick reference when submitting pull requests.
 - It is EXTREMELY IMPORTANT that any added comments should explain why something needs to be done,
   rather than what it is. Comments that simply state a fact easily understood from type signatures
   or other context should NEVER be added. Always prefer to avoid a comment unless it truly is 
-  clarifying something nonobvious.
+  clarifying something nonobvious. This does _NOT_ mean you should _remove_ any existing comments
+  unless they are no longer accurate.
 - Always make every attempt to avoid explicit sleeps in test code. Instead rely on synchronization
   techniques like channels, Notify, etc.
 - Rust compilation can take some time. Do not interrupt builds or tests unless they are taking more

@@ -882,8 +882,8 @@ impl Worker {
         // Build the poller-dependent subsystems lazily. This closure runs once, after namespace
         // capabilities have been fetched (see `Worker::validate`), so the effective poller behavior
         // can be resolved with knowledge of those capabilities.
-        let task_subsystems_builder: Box<dyn FnOnce() -> TaskSubsystems + Send> =
-            Box::new(move || {
+        let task_subsystems_builder: Box<dyn FnOnce() -> TaskSubsystems + Send> = Box::new(
+            move || {
                 let (wft_stream, act_poller, nexus_poller) = match task_pollers {
                     TaskPollers::Real => {
                         let wft_stream = if config.task_types.enable_workflows {
@@ -1011,6 +1011,15 @@ impl Worker {
                     }
                 };
 
+                if act_poller.is_some()
+                    && !client
+                        .capabilities()
+                        .is_some_and(|caps| caps.activity_failure_include_heartbeat)
+                {
+                    warn!(
+                        "Temporal Server 1.16.0 or newer is required to guarantee that the latest heartbeat details are preserved when an activity fails; the server did not advertise the activity_failure_include_heartbeat capability, so heartbeat details may be lost on failure"
+                    );
+                }
                 let at_task_mgr = act_poller.map(|ap| {
                     WorkerActivityTasks::new(
                         act_slots.clone(),
@@ -1085,7 +1094,8 @@ impl Worker {
                     at_task_mgr,
                     nexus_mgr,
                 }
-            });
+            },
+        );
 
         Ok(Self {
             worker_instance_key,

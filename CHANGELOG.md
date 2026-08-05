@@ -207,6 +207,9 @@ to docs, or any other relevant information.
 ### Fixed
 * Try-cancel child workflows no longer cause nondeterminism when they complete or fail after their
   cancellation was requested.
+* Activity failures now include the latest heartbeat details atomically instead of force-flushing a
+  throttled heartbeat first. Temporal Server 1.16.0 or newer is required to guarantee those details
+  are preserved on failure; workers warn when the server does not advertise support.
 * `RuntimeOptions::default()` now uses the same 60-second worker heartbeat interval as the
   builder default.
 * Local activity resolutions are now delivered to workflows as each activity completes instead of

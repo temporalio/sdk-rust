@@ -212,6 +212,7 @@ pub trait WorkerClient: Sync + Send {
         &self,
         task_token: TaskToken,
         failure: Option<Failure>,
+        last_heartbeat_details: Option<Payloads>,
     ) -> Result<RespondActivityTaskFailedResponse>;
     /// Fail a workflow task
     async fn fail_workflow_task(
@@ -613,6 +614,7 @@ impl WorkerClient for WorkerClientBag {
         &self,
         task_token: TaskToken,
         failure: Option<Failure>,
+        last_heartbeat_details: Option<Payloads>,
     ) -> Result<RespondActivityTaskFailedResponse> {
         Ok(self
             .client
@@ -624,8 +626,7 @@ impl WorkerClient for WorkerClientBag {
                     failure,
                     identity: self.identity(),
                     namespace: self.namespace.clone(),
-                    // TODO: Implement - https://github.com/temporalio/sdk-core/issues/293
-                    last_heartbeat_details: None,
+                    last_heartbeat_details,
                     worker_version: self.worker_version_stamp(),
                     // Will never be set, deprecated.
                     deployment: None,
@@ -988,6 +989,72 @@ mod tests {
         callback_based::{CallbackBasedGrpcService, GrpcSuccessResponse},
     };
     use temporalio_common::worker::{WorkerDeploymentOptions, WorkerDeploymentVersion};
+
+    #[tokio::test]
+    async fn activity_failure_request_includes_last_heartbeat_details() {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let requests_clone = requests.clone();
+        let service_override = CallbackBasedGrpcService {
+            callback: Arc::new(move |request| {
+                let requests = requests_clone.clone();
+                Box::pin(async move {
+                    let proto = match request.rpc.as_str() {
+                        "GetSystemInfo" => GetSystemInfoResponse::default().encode_to_vec(),
+                        "RespondActivityTaskFailed" => {
+                            requests.lock().unwrap().push(
+                                RespondActivityTaskFailedRequest::decode(request.proto)
+                                    .expect("failure request is valid"),
+                            );
+                            RespondActivityTaskFailedResponse::default().encode_to_vec()
+                        }
+                        rpc => panic!("unexpected RPC: {rpc}"),
+                    };
+                    Ok(GrpcSuccessResponse {
+                        headers: Default::default(),
+                        proto,
+                    })
+                })
+            }),
+        };
+        let connection = Connection::connect(
+            ConnectionOptions::new(url::Url::parse("http://localhost:7233").unwrap())
+                .service_override(service_override)
+                .dns_load_balancing(None)
+                .build(),
+        )
+        .await
+        .unwrap();
+        let client = WorkerClientBag::new(
+            SharedReplaceableClient::new(connection),
+            "namespace".to_string(),
+            WorkerVersioningStrategy::None {
+                build_id: String::new(),
+            },
+            Uuid::new_v4(),
+        );
+        let last_heartbeat_details = Payloads {
+            payloads: vec![
+                temporalio_common::protos::temporal::api::common::v1::Payload {
+                    data: vec![1, 2, 3],
+                    ..Default::default()
+                },
+            ],
+        };
+
+        client
+            .fail_activity_task(
+                TaskToken(vec![1]),
+                None,
+                Some(last_heartbeat_details.clone()),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            requests.lock().unwrap()[0].last_heartbeat_details,
+            Some(last_heartbeat_details)
+        );
+    }
 
     #[allow(deprecated)]
     #[tokio::test]

@@ -1,8 +1,7 @@
 use crate::{
     common::{
         ActivationAssertionsInterceptor, CoreWfStarter, INTEG_CLIENT_IDENTITY,
-        activity_functions::StdActivities, build_fake_sdk_intercepted, eventually,
-        init_core_and_create_wf, mock_sdk, mock_sdk_cfg,
+        activity_functions::StdActivities, build_fake_sdk_intercepted, init_core_and_create_wf, mock_sdk, mock_sdk_cfg,
     },
     shared_tests,
 };
@@ -17,8 +16,7 @@ use std::{
     time::Duration,
 };
 use temporalio_client::{
-    ActivityIdentifier, UntypedWorkflow, WorkflowDescribeOptions, WorkflowStartOptions,
-    WorkflowTerminateOptions,
+    ActivityIdentifier, UntypedWorkflow, WorkflowStartOptions, WorkflowTerminateOptions,
 };
 
 use temporalio_common::{
@@ -28,7 +26,6 @@ use temporalio_common::{
     protos::{
         coresdk::{
             ActivityHeartbeat, ActivityTaskCompletion, AsJsonPayloadExt, IntoCompletion,
-            IntoPayloadsExt,
             activity_result::{
                 self, ActivityExecutionResult, ActivityResolution, activity_resolution as act_res,
             },
@@ -1622,26 +1619,25 @@ async fn activity_cancelled_after_heartbeat_times_out() {
         .unwrap();
 }
 
-#[ignore] // Currently skipped because of https://github.com/temporalio/temporal/issues/8376
 #[tokio::test]
-async fn activity_heartbeat_not_flushed_on_success() {
-    let mut starter = init_core_and_create_wf("activity_heartbeat_not_flushed_on_success").await;
+async fn activity_failure_includes_latest_heartbeat_on_retry() {
+    let mut starter =
+        init_core_and_create_wf("activity_failure_includes_latest_heartbeat_on_retry").await;
     let core = starter.get_worker().await;
     let task_q = starter.get_task_queue().to_string();
-    let activity_id = "act-1";
     let task = core.poll_workflow_activation().await.unwrap();
     core.complete_workflow_activation(WorkflowActivationCompletion::from_cmd(
         task.run_id,
         ScheduleActivity {
             seq: 0,
-            activity_id: activity_id.to_string(),
+            activity_id: "act-1".to_string(),
             activity_type: "dontcare".to_string(),
             task_queue: task_q.clone(),
             schedule_to_close_timeout: Some(prost_dur!(from_secs(60))),
             heartbeat_timeout: Some(prost_dur!(from_secs(10))),
             retry_policy: Some(RetryPolicy {
                 maximum_attempts: 2,
-                initial_interval: Some(prost_dur!(from_secs(5))),
+                initial_interval: Some(prost_dur!(from_millis(10))),
                 ..Default::default()
             }),
             ..Default::default()
@@ -1663,45 +1659,45 @@ async fn activity_heartbeat_not_flushed_on_success() {
         task_token: task.task_token.clone(),
         details: vec!["two".into()],
     });
-    // Complete activity with fail
-    let failure = Failure::application_failure("activity failed".to_string(), false);
     core.complete_activity_task(ActivityTaskCompletion {
         task_token: task.task_token,
-        result: Some(ActivityExecutionResult::fail(failure)),
+        result: Some(ActivityExecutionResult::fail(Failure::application_failure(
+            "activity failed".to_string(),
+            false,
+        ))),
     })
     .await
     .unwrap();
-    // The activity is still in the pending state since it has retries left
-    let client = starter.get_client().await;
-    eventually(
-        || async {
-            // Verify pending details has the flushed heartbeat
-            let details = client
-                .get_workflow_handle::<UntypedWorkflow>(starter.get_wf_id().to_string())
-                .describe(WorkflowDescribeOptions::default())
-                .await
-                .unwrap();
-            let last_deets = details
-                .raw_description
-                .pending_activities
-                .into_iter()
-                .find(|i| i.activity_id == activity_id)
-                .and_then(|i| i.heartbeat_details);
-            if last_deets == ["two".into()].into_payloads() {
-                Ok(())
-            } else {
-                Err("details don't yet match")
-            }
-        },
-        Duration::from_secs(5),
-    )
+
+    let retry = core.poll_activity_task().await.unwrap();
+    let retry_task_token = retry.task_token;
+    let retry_start =
+        assert_matches!(retry.variant, Some(act_task::Variant::Start(start)) => start);
+    assert_eq!(retry_start.heartbeat_details, ["two".into()]);
+    core.complete_activity_task(ActivityTaskCompletion {
+        task_token: retry_task_token,
+        result: Some(ActivityExecutionResult::ok("done".into())),
+    })
     .await
     .unwrap();
-    client
-        .get_workflow_handle::<UntypedWorkflow>(task_q)
-        .terminate(WorkflowTerminateOptions::default())
-        .await
-        .unwrap();
+
+    let task = core.poll_workflow_activation().await.unwrap();
+    assert_matches!(
+        task.jobs.as_slice(),
+        [WorkflowActivationJob {
+            variant: Some(workflow_activation_job::Variant::ResolveActivity(
+                ResolveActivity {
+                    result: Some(ActivityResolution {
+                        status: Some(act_res::Status::Completed(_)),
+                        ..
+                    }),
+                    ..
+                }
+            )),
+        }]
+    );
+    core.complete_execution(&task.run_id).await;
+    core.handle_eviction().await;
     drain_pollers_and_shutdown(&core).await;
 }
 
