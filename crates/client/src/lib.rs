@@ -1598,8 +1598,10 @@ pub(crate) use dbg_panic;
 mod tests {
     use super::*;
     use crate::callback_based::CallbackBasedGrpcService;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::time::Instant;
+    use std::{
+        sync::atomic::{AtomicUsize, Ordering},
+        time::Instant,
+    };
     use temporalio_common::search_attributes::SearchAttributeKey;
     use tonic::{Status, metadata::Ascii};
     use url::Url;

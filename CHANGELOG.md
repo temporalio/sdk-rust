@@ -146,6 +146,8 @@ to docs, or any other relevant information.
   cancellation, and heartbeat, and `WorkflowUpdateHandle::get_result`.
 
 ### Fixed
+* Try-cancel child workflows no longer cause nondeterminism when they complete or fail after their
+  cancellation was requested.
 * `RuntimeOptions::default()` now uses the same 60-second worker heartbeat interval as the
   builder default.
 * Local activity resolutions are now delivered to workflows as each activity completes instead of
