@@ -169,7 +169,7 @@ pub enum GrpcCompression {
 }
 
 /// Configuration options for TLS
-#[derive(Clone, Default, bon::Builder)]
+#[derive(Clone, bon::Builder)]
 #[non_exhaustive]
 pub struct TlsOptions {
     /// Bytes representing the root CA certificate used by the server. If not set, and the server's
@@ -198,6 +198,12 @@ pub struct TlsOptions {
     /// Note that `domain` is still respected for the `:authority` header / origin override
     /// even when a custom verifier is set.
     pub server_cert_verifier: Option<Arc<dyn ServerCertVerifier>>,
+}
+
+impl Default for TlsOptions {
+    fn default() -> Self {
+        Self::builder().build()
+    }
 }
 
 impl std::fmt::Debug for TlsOptions {
@@ -244,10 +250,7 @@ pub struct ClientKeepAliveOptions {
 
 impl Default for ClientKeepAliveOptions {
     fn default() -> Self {
-        Self {
-            interval: Duration::from_secs(30),
-            timeout: Duration::from_secs(15),
-        }
+        Self::builder().build()
     }
 }
 
@@ -262,9 +265,7 @@ pub struct DnsLoadBalancingOptions {
 
 impl Default for DnsLoadBalancingOptions {
     fn default() -> Self {
-        Self {
-            resolution_interval: Duration::from_secs(30),
-        }
+        Self::builder().build()
     }
 }
 
@@ -285,10 +286,7 @@ pub struct PayloadLimitsOptions {
 
 impl Default for PayloadLimitsOptions {
     fn default() -> Self {
-        Self {
-            payloads_warn_size: 512 * 1024,
-            memo_warn_size: 2 * 1024,
-        }
+        Self::builder().build()
     }
 }
 
@@ -630,61 +628,4 @@ pub struct WorkflowCountOptions {
     /// Controls for the count RPC.
     #[builder(default)]
     pub rpc_options: RpcOptions,
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn tls_options_default_matches_builder_default() {
-        let TlsOptions {
-            server_root_ca_cert,
-            domain,
-            client_tls_options,
-            server_cert_verifier,
-        } = TlsOptions::default();
-        let TlsOptions {
-            server_root_ca_cert: built_server_root_ca_cert,
-            domain: built_domain,
-            client_tls_options: built_client_tls_options,
-            server_cert_verifier: built_server_cert_verifier,
-        } = TlsOptions::builder().build();
-
-        assert_eq!(server_root_ca_cert, built_server_root_ca_cert);
-        assert_eq!(domain, built_domain);
-        assert_eq!(
-            client_tls_options.map(|options| { (options.client_cert, options.client_private_key) }),
-            built_client_tls_options
-                .map(|options| { (options.client_cert, options.client_private_key) })
-        );
-        assert_eq!(
-            server_cert_verifier.is_some(),
-            built_server_cert_verifier.is_some()
-        );
-    }
-
-    #[test]
-    fn client_keep_alive_options_default_matches_builder_default() {
-        assert_eq!(
-            ClientKeepAliveOptions::default(),
-            ClientKeepAliveOptions::builder().build()
-        );
-    }
-
-    #[test]
-    fn dns_load_balancing_options_default_matches_builder_default() {
-        assert_eq!(
-            DnsLoadBalancingOptions::default(),
-            DnsLoadBalancingOptions::builder().build()
-        );
-    }
-
-    #[test]
-    fn payload_limits_options_default_matches_builder_default() {
-        assert_eq!(
-            PayloadLimitsOptions::default(),
-            PayloadLimitsOptions::builder().build()
-        );
-    }
 }

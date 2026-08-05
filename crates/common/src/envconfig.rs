@@ -174,7 +174,7 @@ pub struct ClientConfigCodec {
 }
 
 /// Options for loading client configuration
-#[derive(Debug, Default, PartialEq, bon::Builder)]
+#[derive(Debug, PartialEq, bon::Builder)]
 #[non_exhaustive]
 pub struct LoadClientConfigOptions {
     /// Where to load config from. If unset, will try env vars then default path.
@@ -185,8 +185,14 @@ pub struct LoadClientConfigOptions {
     pub config_file_strict: bool,
 }
 
+impl Default for LoadClientConfigOptions {
+    fn default() -> Self {
+        Self::builder().build()
+    }
+}
+
 /// Options for loading a client configuration profile
-#[derive(Debug, Default, PartialEq, bon::Builder)]
+#[derive(Debug, PartialEq, bon::Builder)]
 #[non_exhaustive]
 pub struct LoadClientConfigProfileOptions {
     /// Where to load config from. If unset, will try env vars then default path.
@@ -208,13 +214,25 @@ pub struct LoadClientConfigProfileOptions {
     pub disable_env: bool,
 }
 
+impl Default for LoadClientConfigProfileOptions {
+    fn default() -> Self {
+        Self::builder().build()
+    }
+}
+
 /// Options for parsing TOML configuration
-#[derive(Debug, Default, PartialEq, bon::Builder)]
+#[derive(Debug, PartialEq, bon::Builder)]
 #[non_exhaustive]
 pub struct ClientConfigFromTOMLOptions {
     /// If true, will error if there are unrecognized keys.
     #[builder(default)]
     pub strict: bool,
+}
+
+impl Default for ClientConfigFromTOMLOptions {
+    fn default() -> Self {
+        Self::builder().build()
+    }
 }
 
 /// A source for environment variables, which can be either a provided HashMap or the system's
@@ -1056,30 +1074,6 @@ mod tests {
     use super::*;
     use std::io::Write;
     use tempfile::NamedTempFile;
-
-    #[test]
-    fn load_client_config_options_default_matches_builder_default() {
-        assert_eq!(
-            LoadClientConfigOptions::default(),
-            LoadClientConfigOptions::builder().build()
-        );
-    }
-
-    #[test]
-    fn load_client_config_profile_options_default_matches_builder_default() {
-        assert_eq!(
-            LoadClientConfigProfileOptions::default(),
-            LoadClientConfigProfileOptions::builder().build()
-        );
-    }
-
-    #[test]
-    fn client_config_from_toml_options_default_matches_builder_default() {
-        assert_eq!(
-            ClientConfigFromTOMLOptions::default(),
-            ClientConfigFromTOMLOptions::builder().build()
-        );
-    }
 
     #[test]
     fn test_client_config_toml_multiple_profiles() {

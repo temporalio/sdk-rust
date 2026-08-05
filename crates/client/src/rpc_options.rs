@@ -176,7 +176,7 @@ pub enum RpcMetadataError {
 }
 
 /// Controls applied to a single high-level client RPC.
-#[derive(Clone, Debug, Default, PartialEq, bon::Builder)]
+#[derive(Clone, Debug, PartialEq, bon::Builder)]
 #[non_exhaustive]
 pub struct RpcOptions {
     /// Metadata attached to the RPC.
@@ -186,6 +186,12 @@ pub struct RpcOptions {
     pub timeout: Option<Duration>,
     /// Retry behavior for the RPC, overriding the connection's retry configuration.
     pub retry_options: Option<RetryOptions>,
+}
+
+impl Default for RpcOptions {
+    fn default() -> Self {
+        Self::builder().build()
+    }
 }
 
 impl RpcOptions {
@@ -205,11 +211,6 @@ impl RpcOptions {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn rpc_options_default_matches_builder_default() {
-        assert_eq!(RpcOptions::default(), RpcOptions::builder().build());
-    }
 
     #[test]
     fn metadata_validates_and_exposes_values() {

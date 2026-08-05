@@ -428,7 +428,7 @@ impl ActivityOptions {
 }
 
 /// Options for scheduling a local activity
-#[derive(Default, Debug, Clone, PartialEq, bon::Builder)]
+#[derive(Debug, Clone, PartialEq, bon::Builder)]
 #[non_exhaustive]
 pub struct LocalActivityOptions {
     /// Identifier to use for tracking the activity in Workflow history.
@@ -468,6 +468,12 @@ pub struct LocalActivityOptions {
     pub start_to_close_timeout: Option<Duration>,
     /// Single-line summary for this activity that will appear in UI/CLI.
     pub summary: Option<String>,
+}
+
+impl Default for LocalActivityOptions {
+    fn default() -> Self {
+        Self::builder().build()
+    }
 }
 
 impl LocalActivityOptions {
@@ -664,7 +670,7 @@ impl SignalData {
 }
 
 /// Options for timer
-#[derive(Default, Debug, Clone, PartialEq, bon::Builder)]
+#[derive(Debug, Clone, PartialEq, bon::Builder)]
 #[non_exhaustive]
 pub struct TimerOptions {
     /// Duration for the timer
@@ -672,6 +678,12 @@ pub struct TimerOptions {
     pub duration: Duration,
     /// Summary of the timer
     pub summary: Option<String>,
+}
+
+impl Default for TimerOptions {
+    fn default() -> Self {
+        Self::builder(Duration::default()).build()
+    }
 }
 
 impl From<Duration> for TimerOptions {
@@ -933,22 +945,6 @@ fn string_user_metadata(summary: Option<String>, details: Option<String>) -> Opt
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn local_activity_options_default_matches_builder_default() {
-        assert_eq!(
-            LocalActivityOptions::default(),
-            LocalActivityOptions::builder().build()
-        );
-    }
-
-    #[test]
-    fn timer_options_default_matches_builder_default() {
-        assert_eq!(
-            TimerOptions::default(),
-            TimerOptions::builder(Duration::default()).build()
-        );
-    }
 
     #[test]
     fn activity_cancellation_default_preserves_sdk_behavior() {
