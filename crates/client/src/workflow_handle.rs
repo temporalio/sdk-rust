@@ -6,7 +6,7 @@ use crate::{
     TerminateWorkflowInput, WorkflowCancelOptions, WorkflowDescribeOptions,
     WorkflowExecuteUpdateOptions, WorkflowExecutionStatus, WorkflowFetchHistoryOptions,
     WorkflowGetResultOptions, WorkflowQueryOptions, WorkflowSignalOptions,
-    WorkflowStartUpdateOptions, WorkflowTerminateOptions, WorkflowUpdateWaitStage,
+    WorkflowStartUpdateOptions, WorkflowTerminateOptions,
     errors::{
         WorkflowGetResultError, WorkflowInteractionError, WorkflowQueryError, WorkflowUpdateError,
     },
@@ -830,7 +830,6 @@ where
                 WorkflowStartUpdateOptions::builder()
                     .maybe_update_id(options.update_id)
                     .maybe_header(options.header)
-                    .wait_for_stage(WorkflowUpdateWaitStage::Completed)
                     .rpc_options(rpc_options.clone())
                     .build(),
             )
@@ -838,7 +837,7 @@ where
         handle.get_result(rpc_options).await
     }
 
-    /// Start an update and return a handle without waiting for completion.
+    /// Start an update and return a handle after the workflow accepts it.
     /// Use `execute_update()` if you want to wait for the result immediately.
     pub async fn start_update<U>(
         &self,
@@ -882,17 +881,6 @@ where
                             .codec()
                             .encode(&SerializationContextData::Workflow, unencoded_payloads?)
                             .await?;
-                        let lifecycle_stage = match options.wait_for_stage {
-                            WorkflowUpdateWaitStage::Admitted => {
-                                UpdateWorkflowExecutionLifecycleStage::Admitted
-                            }
-                            WorkflowUpdateWaitStage::Accepted => {
-                                UpdateWorkflowExecutionLifecycleStage::Accepted
-                            }
-                            WorkflowUpdateWaitStage::Completed => {
-                                UpdateWorkflowExecutionLifecycleStage::Completed
-                            }
-                        };
                         let update_id = options
                             .update_id
                             .unwrap_or_else(|| Uuid::new_v4().to_string());
@@ -903,7 +891,8 @@ where
                                 run_id,
                             }),
                             wait_policy: Some(WaitPolicy {
-                                lifecycle_stage: lifecycle_stage.into(),
+                                lifecycle_stage:
+                                    UpdateWorkflowExecutionLifecycleStage::Accepted.into(),
                             }),
                             request: Some(update::v1::Request {
                                 meta: Some(update::v1::Meta {
@@ -1200,7 +1189,7 @@ pub struct WorkflowUpdateHandle<CT, T> {
     update_id: String,
     workflow_id: String,
     run_id: Option<String>,
-    /// If the update was started with `Completed` wait stage, the outcome is already available.
+    /// Outcome returned if the update completed before the start call returned.
     known_outcome: Option<update::v1::Outcome>,
     _output: PhantomData<T>,
 }

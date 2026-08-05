@@ -73,6 +73,9 @@ to docs, or any other relevant information.
   `NexusOperationOptions::builder()` to construct Nexus operation options.
 * `WorkflowContext::wait_condition` now returns `Result<(), WorkflowCancellationError>` instead of
   `()` so that workflow cancellation can be propagated to the caller.
+* `WorkflowUpdateWaitStage` and `WorkflowStartUpdateOptions::wait_for_stage` have been removed.
+  `start_update` now always waits for the update to be accepted; use `execute_update` to wait for
+  completion.
 
 ### Added
 * `WorkflowCancellationToken` for deterministic cancellation of workflow operations.
@@ -86,6 +89,7 @@ to docs, or any other relevant information.
 ### Fixed
 * Panics from update validators now reject the update instead of repeatedly failing workflow
   tasks.
+* Update result RPC timeouts now report `DeadlineExceeded` instead of `Cancelled`.
 
 ## [0.6.0] - 2026-08-04
 ## [0.5.0]

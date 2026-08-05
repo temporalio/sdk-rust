@@ -515,7 +515,7 @@ pub struct StartWorkflowUpdateOutput {
     pub workflow_id: String,
     /// Run ID returned by the service, when available.
     pub run_id: Option<String>,
-    /// Outcome returned when the requested wait stage completed the update.
+    /// Outcome returned if the update completed before the start call returned.
     pub known_outcome: Option<Outcome>,
 }
 

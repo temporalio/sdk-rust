@@ -90,7 +90,7 @@ Once you have a workflow handle, you can interact with the running workflow:
 ```rust
 use temporalio_client::{
     SignalOptions, QueryOptions, UpdateOptions,
-    StartUpdateOptions, WorkflowUpdateWaitStage,
+    StartUpdateOptions,
     UntypedSignal,
 };
 use temporalio_common::data_converters::{PayloadConverter, RawValue};
@@ -116,9 +116,7 @@ let update_handle = handle
     .start_update(
         MyWorkflow::add_wait_return,
         50,
-        StartUpdateOptions::builder()
-            .wait_for_stage(WorkflowUpdateWaitStage::Accepted)
-            .build()
+        StartUpdateOptions::default()
     )
     .await?;
 update_handle.get_result().await?;
