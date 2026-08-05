@@ -1805,6 +1805,16 @@ proxier! {
         }
     );
     (
+        poll_workflow_execution_time_skipping,
+        PollWorkflowExecutionTimeSkippingRequest,
+        PollWorkflowExecutionTimeSkippingResponse,
+        |r| {
+            let labels = namespaced_request!(r);
+            r.extensions_mut().insert(labels);
+            r.extensions_mut().insert(IsUserLongPoll);
+        }
+    );
+    (
         request_cancel_nexus_operation_execution,
         RequestCancelNexusOperationExecutionRequest,
         RequestCancelNexusOperationExecutionResponse,

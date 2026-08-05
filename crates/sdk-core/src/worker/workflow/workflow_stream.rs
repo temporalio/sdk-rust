@@ -281,6 +281,7 @@ impl WFStream {
     }
 
     fn process_completion(&mut self, complete: NewOrFetchedComplete) -> Vec<ActivationOrAuto> {
+        let has_zero_sized_cache = self.runs.cache_capacity() == 0;
         let rh = if let Some(rh) = self.runs.get_mut(complete.run_id()) {
             rh
         } else {
@@ -340,8 +341,9 @@ impl WFStream {
         }
         .into_iter()
         .collect();
-        // Always queue evictions after completion when we have a zero-size cache
-        if self.runs.cache_capacity() == 0 {
+        // Keeping the run until its LAs resolve lets their incremental activations share the
+        // current WFT. The final completion will queue the zero-cache eviction as usual.
+        if has_zero_sized_cache && !rh.waiting_on_local_activities() {
             acts.extend(self.request_eviction_of_lru_run().into_run_update_resp())
         }
         acts

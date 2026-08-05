@@ -88,6 +88,8 @@ enum WorkflowTaskFailedCause {
     WORKFLOW_TASK_FAILED_CAUSE_EXTERNAL_STORAGE_FAILURE = 38;
     // A workflow task is failed because the workflow is paused before the task is started.
     WORKFLOW_TASK_FAILED_CAUSE_WORKFLOW_PAUSE_REQUESTED_BEFORE_TASK_STARTED = 39;
+    // A workflow task failed because the request exceeded a size limit.
+    WORKFLOW_TASK_FAILED_CAUSE_REQUEST_TOO_LARGE = 40;
 }
 
 enum StartChildWorkflowExecutionFailedCause {

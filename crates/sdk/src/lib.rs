@@ -10,17 +10,15 @@
 //! An example of running an activity worker:
 //! ```no_run
 //! use std::str::FromStr;
-//! use temporalio_client::{Client, ClientOptions, Connection, ConnectionOptions};
-//! use temporalio_common::{
-//!     telemetry::TelemetryOptions,
-//!     worker::{WorkerDeploymentOptions, WorkerDeploymentVersion, WorkerTaskTypes},
+//! use temporalio_client::{Client, ClientOptions, Connection, ConnectionOptions, Url};
+//! use temporalio_common::worker::{
+//!     WorkerDeploymentOptions, WorkerDeploymentVersion, WorkerTaskTypes,
 //! };
 //! use temporalio_macros::activities;
 //! use temporalio_sdk::{
-//!     Worker, WorkerOptions,
+//!     Runtime, Worker, WorkerOptions,
 //!     activities::{ActivityContext, ActivityError},
 //! };
-//! use temporalio_sdk_core::{CoreRuntime, RuntimeOptions, Url};
 //!
 //! struct MyActivities;
 //!
@@ -39,12 +37,7 @@
 //! async fn main() -> Result<(), Box<dyn std::error::Error>> {
 //!     let connection_options =
 //!         ConnectionOptions::new(Url::from_str("http://localhost:7233")?).build();
-//!     let telemetry_options = TelemetryOptions::builder().build();
-//!     let runtime_options = RuntimeOptions::builder()
-//!         .telemetry_options(telemetry_options)
-//!         .build()?;
-//!     let runtime = CoreRuntime::new_assume_tokio(runtime_options)?;
-//!
+//!     let runtime = Runtime::new_assume_tokio(Default::default())?;
 //!     let connection = Connection::connect(connection_options).await?;
 //!     let client = Client::new(connection, ClientOptions::new("my_namespace").build())?;
 //!
@@ -75,6 +68,24 @@ extern crate self as temporalio_sdk;
 pub mod activities;
 pub mod error;
 pub mod interceptors;
+/// Runtime configuration and low-level Core worker building blocks.
+///
+/// These types are grouped here to keep Core-specific configuration separate from the SDK's
+/// primary workflow and activity APIs. Create a [`crate::Runtime`] before connecting a client,
+/// then pass it to [`crate::Worker::new`].
+pub mod runtime {
+    pub use temporalio_sdk_core::{
+        ActivitySlotKind, FixedSizeSlotSupplier, LocalActivitySlotKind, NexusSlotKind,
+        PollerBehavior, ResourceBasedSlotsOptions, ResourceBasedSlotsOptionsBuilder,
+        ResourceBasedTuner, ResourceBasedTunerConfig, ResourceController, ResourceSlotOptions,
+        RuntimeOptions, RuntimeOptionsBuilder, SlotInfo, SlotInfoTrait, SlotKind, SlotKindType,
+        SlotMarkUsedContext, SlotReleaseContext, SlotReservationContext, SlotSupplier,
+        SlotSupplierOptions, SlotSupplierPermit, TokioRuntimeBuilder, TunerBuilder, TunerHolder,
+        TunerHolderOptions, TunerHolderOptionsBuilder, Worker as CoreWorker, WorkerConfig,
+        WorkerConfigBuilder, WorkerTuner, WorkerVersioningStrategy, WorkflowErrorType,
+        WorkflowSlotKind, init_replay_worker, replay,
+    };
+}
 mod workflow_executor;
 mod workflow_future;
 pub mod workflow_interceptors;
@@ -89,6 +100,7 @@ pub use crate::error::{
     RetryState, TimeoutType, WorkflowRegistrationError, WorkflowSignalError,
 };
 pub use temporalio_client::Namespace;
+pub use temporalio_sdk_core::CoreRuntime as Runtime;
 pub use temporalio_workflow::{
     ActivityCancellationType, ActivityCloseTimeouts, ActivityOptions, BaseWorkflowContext,
     CancellableFuture, CancellableFutureWithReason, ChildWorkflowCancellationType,
@@ -145,10 +157,7 @@ use temporalio_common::{
     },
     worker::{WorkerDeploymentOptions, WorkerTaskTypes, build_id_from_current_exe},
 };
-use temporalio_sdk_core::{
-    CoreRuntime, PollError, PollerBehavior, TunerBuilder, Worker as CoreWorker, WorkerConfig,
-    WorkerTuner, WorkerVersioningStrategy, WorkflowErrorType, init_worker,
-};
+use temporalio_sdk_core::{PollError, init_worker};
 use temporalio_workflow::runtime::entry::WorkflowImplementation;
 use tokio::sync::{
     Notify,
@@ -158,6 +167,11 @@ use tokio_stream::wrappers::UnboundedReceiverStream;
 use tokio_util::sync::CancellationToken;
 use tracing::{Instrument, Span, field};
 use uuid::Uuid;
+
+use crate::runtime::{
+    CoreWorker, PollerBehavior, TunerBuilder, WorkerConfig, WorkerTuner, WorkerVersioningStrategy,
+    WorkflowErrorType,
+};
 
 /// Contains options for configuring a worker.
 #[derive(bon::Builder, Clone)]
@@ -627,7 +641,7 @@ async fn encode_activity_completion(
 impl Worker {
     /// Create a new worker from an existing client, and options.
     pub fn new(
-        runtime: &CoreRuntime,
+        runtime: &Runtime,
         client: Client,
         options: WorkerOptions,
     ) -> Result<Self, Box<dyn std::error::Error>> {
