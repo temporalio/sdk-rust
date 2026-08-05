@@ -480,6 +480,7 @@ struct WorkflowContextInner {
     initial_information: InitializeWorkflow,
     runtime: WorkflowRuntimeState,
     cancellation_token: WorkflowCancellationToken,
+    cancelled_operations: RefCell<HashSet<CancellableSeqNum>>,
     shared: RefCell<WorkflowContextSharedData>,
     seq_nums: RefCell<WfCtxProtectedDat>,
     data_converter: DataConverter,
@@ -487,6 +488,30 @@ struct WorkflowContextInner {
     state_mutated: Cell<bool>,
     current_waker: RefCell<Option<Waker>>,
     workflow_interceptors: Rc<[Arc<dyn WorkflowInterceptor>]>,
+}
+
+/// Identical to [`CancellableID`], but only containing command type and seq number, omitting any reason.
+#[derive(Eq, Hash, PartialEq)]
+enum CancellableSeqNum {
+    Timer(u32),
+    Activity(u32),
+    LocalActivity(u32),
+    ChildWorkflow(u32),
+    SignalExternalWorkflow(u32),
+    NexusOp(u32),
+}
+
+impl From<&CancellableID> for CancellableSeqNum {
+    fn from(value: &CancellableID) -> Self {
+        match value {
+            CancellableID::Timer(seq) => Self::Timer(*seq),
+            CancellableID::Activity(seq) => Self::Activity(*seq),
+            CancellableID::LocalActivity(seq) => Self::LocalActivity(*seq),
+            CancellableID::ChildWorkflow { seqnum, .. } => Self::ChildWorkflow(*seqnum),
+            CancellableID::SignalExternalWorkflow(seq) => Self::SignalExternalWorkflow(*seq),
+            CancellableID::NexusOp(seq) => Self::NexusOp(*seq),
+        }
+    }
 }
 
 /// Context provided to synchronous signal and update handlers.
@@ -587,6 +612,7 @@ impl BaseWorkflowContext {
                 initial_information: init_workflow_job,
                 runtime: WorkflowRuntimeState::new(host),
                 cancellation_token: WorkflowCancellationToken::new(),
+                cancelled_operations: Default::default(),
                 seq_nums: RefCell::new(WfCtxProtectedDat {
                     next_timer_sequence_number: 1,
                     next_activity_sequence_number: 1,
@@ -649,6 +675,14 @@ impl BaseWorkflowContext {
 
     /// Cancel any cancellable operation by ID
     fn cancel(&self, cancellable_id: CancellableID) {
+        if !self
+            .inner
+            .cancelled_operations
+            .borrow_mut()
+            .insert((&cancellable_id).into())
+        {
+            return;
+        }
         match cancellable_id {
             CancellableID::Timer(seq) => {
                 if self
@@ -3036,13 +3070,10 @@ where
 
     /// Cancel the child workflow
     pub fn cancel(&self, reason: String) {
-        self.base_ctx.inner.runtime.host.push_command(
-            workflow_command::Variant::CancelChildWorkflowExecution(CancelChildWorkflowExecution {
-                child_workflow_seq: self.child_seq,
-                reason,
-            })
-            .into(),
-        );
+        self.base_ctx.cancel(CancellableID::ChildWorkflow {
+            seqnum: self.child_seq,
+            reason,
+        });
     }
 
     /// Send a typed signal to the child workflow.
@@ -3414,24 +3445,30 @@ mod tests {
         );
         let token = WorkflowCancellationToken::new();
 
+        let timer = base.timer(TimerOptions {
+            duration: Duration::from_secs(1),
+            cancellation_token: Some(token.clone()),
+            summary: None,
+        });
+
         let mut activity_options = ActivityOptions::start_to_close_timeout(Duration::from_secs(1));
         activity_options.cancellation_token = Some(token.clone());
-        let _activity = base.execute_activity(TestActivity, (), activity_options);
+        let activity = base.execute_activity(TestActivity, (), activity_options);
 
         let mut local_activity_options = LocalActivityOptions {
             schedule_to_close_timeout: Some(Duration::from_secs(1)),
             ..Default::default()
         };
         local_activity_options.cancellation_token = Some(token.clone());
-        let _local_activity = base.execute_local_activity(TestActivity, (), local_activity_options);
+        let local_activity = base.execute_local_activity(TestActivity, (), local_activity_options);
 
         let child_options = ChildWorkflowOptions {
             cancellation_token: Some(token.clone()),
             ..Default::default()
         };
-        let _child = base.start_child_workflow(TestWorkflow::run, 1, child_options);
+        let child = base.start_child_workflow(TestWorkflow::run, 1, child_options);
 
-        let _signal = base.external_workflow("external", None).signal(
+        let signal = base.external_workflow("external", None).signal(
             TestWorkflow::test_signal,
             "input".to_string(),
             SignalWorkflowOptions::builder()
@@ -3446,31 +3483,78 @@ mod tests {
             ..Default::default()
         };
         nexus_options.cancellation_token = Some(token.clone());
-        let _nexus = base.start_nexus_operation(nexus_options);
+        let nexus = base.start_nexus_operation(nexus_options);
 
         token.cancel_with_reason("group cancelled");
+        timer.cancel();
+        activity.cancel();
+        local_activity.cancel();
+        child.cancel_with_reason("explicit cancellation".to_string());
+        signal.cancel();
+        nexus.cancel();
 
         let commands = host.commands.borrow();
-        assert!(commands.iter().any(|command| matches!(
-            &command.variant,
-            Some(workflow_command::Variant::RequestCancelActivity(_))
-        )));
-        assert!(commands.iter().any(|command| matches!(
-            &command.variant,
-            Some(workflow_command::Variant::RequestCancelLocalActivity(_))
-        )));
-        assert!(commands.iter().any(|command| matches!(
-            &command.variant,
-            Some(workflow_command::Variant::CancelChildWorkflowExecution(_))
-        )));
-        assert!(commands.iter().any(|command| matches!(
-            &command.variant,
-            Some(workflow_command::Variant::CancelSignalWorkflow(_))
-        )));
-        assert!(commands.iter().any(|command| matches!(
-            &command.variant,
-            Some(workflow_command::Variant::RequestCancelNexusOperation(_))
-        )));
+        assert_eq!(
+            commands
+                .iter()
+                .filter(|command| matches!(
+                    &command.variant,
+                    Some(workflow_command::Variant::CancelTimer(_))
+                ))
+                .count(),
+            1
+        );
+        assert_eq!(
+            commands
+                .iter()
+                .filter(|command| matches!(
+                    &command.variant,
+                    Some(workflow_command::Variant::RequestCancelActivity(_))
+                ))
+                .count(),
+            1
+        );
+        assert_eq!(
+            commands
+                .iter()
+                .filter(|command| matches!(
+                    &command.variant,
+                    Some(workflow_command::Variant::RequestCancelLocalActivity(_))
+                ))
+                .count(),
+            1
+        );
+        let child_cancellations = commands
+            .iter()
+            .filter_map(|command| match &command.variant {
+                Some(workflow_command::Variant::CancelChildWorkflowExecution(cancel)) => {
+                    Some(cancel)
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(child_cancellations.len(), 1);
+        assert_eq!(child_cancellations[0].reason, "group cancelled");
+        assert_eq!(
+            commands
+                .iter()
+                .filter(|command| matches!(
+                    &command.variant,
+                    Some(workflow_command::Variant::CancelSignalWorkflow(_))
+                ))
+                .count(),
+            1
+        );
+        assert_eq!(
+            commands
+                .iter()
+                .filter(|command| matches!(
+                    &command.variant,
+                    Some(workflow_command::Variant::RequestCancelNexusOperation(_))
+                ))
+                .count(),
+            1
+        );
     }
 
     #[test]
@@ -3508,11 +3592,12 @@ mod tests {
             )),
         ))
         .unwrap();
-        let _started_child = child
+        let started_child = child
             .now_or_never()
             .expect("child start should resolve")
             .unwrap();
         child_token.cancel();
+        started_child.cancel("explicit cancellation".to_string());
 
         let nexus_token = WorkflowCancellationToken::new();
         let mut nexus_options = NexusOperationOptions {
@@ -3530,21 +3615,34 @@ mod tests {
             )),
         ))
         .unwrap();
-        let _started_nexus = nexus
+        let started_nexus = nexus
             .now_or_never()
             .expect("Nexus start should resolve")
             .unwrap();
         nexus_token.cancel();
+        started_nexus.cancel();
 
         let commands = host.commands.borrow();
-        assert!(commands.iter().any(|command| matches!(
-            &command.variant,
-            Some(workflow_command::Variant::CancelChildWorkflowExecution(_))
-        )));
-        assert!(commands.iter().any(|command| matches!(
-            &command.variant,
-            Some(workflow_command::Variant::RequestCancelNexusOperation(_))
-        )));
+        assert_eq!(
+            commands
+                .iter()
+                .filter(|command| matches!(
+                    &command.variant,
+                    Some(workflow_command::Variant::CancelChildWorkflowExecution(_))
+                ))
+                .count(),
+            1
+        );
+        assert_eq!(
+            commands
+                .iter()
+                .filter(|command| matches!(
+                    &command.variant,
+                    Some(workflow_command::Variant::RequestCancelNexusOperation(_))
+                ))
+                .count(),
+            1
+        );
     }
 
     #[test]
