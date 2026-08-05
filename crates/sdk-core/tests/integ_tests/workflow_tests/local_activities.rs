@@ -1,8 +1,7 @@
 use crate::common::{
     ActivationAssertionsInterceptor, CoreWfStarter, WorkflowHandleExt,
-    activity_functions::StdActivities, build_fake_sdk, build_fake_sdk_intercepted,
-    history_from_proto_binary, init_core_replay_preloaded, mock_sdk, mock_sdk_cfg,
-    replay_sdk_worker, workflows::LaProblemWorkflow,
+    activity_functions::StdActivities, history_from_proto_binary, init_core_replay_preloaded,
+    workflows::LaProblemWorkflow,
 };
 use anyhow::anyhow;
 use crossbeam_queue::SegQueue;
@@ -101,8 +100,11 @@ async fn one_local_activity() {
     let wf_name = "one_local_activity";
     let mut starter = CoreWfStarter::new(wf_name);
     starter.sdk_config.register_activities(StdActivities);
+    starter
+        .sdk_config
+        .register_workflow::<OneLocalActivityWf>()
+        .unwrap();
     let mut worker = starter.worker().await;
-    worker.register_workflow::<OneLocalActivityWf>().unwrap();
 
     let task_queue = starter.get_task_queue().to_owned();
     let handle = worker
@@ -141,10 +143,11 @@ async fn local_act_concurrent_with_timer() {
     let wf_name = "local_act_concurrent_with_timer";
     let mut starter = CoreWfStarter::new(wf_name);
     starter.sdk_config.register_activities(StdActivities);
-    let mut worker = starter.worker().await;
-    worker
+    starter
+        .sdk_config
         .register_workflow::<LocalActConcurrentWithTimerWf>()
         .unwrap();
+    let mut worker = starter.worker().await;
 
     let task_queue = starter.get_task_queue().to_owned();
     worker
@@ -183,10 +186,11 @@ async fn local_act_then_timer_then_wait_result() {
     let wf_name = "local_act_then_timer_then_wait_result";
     let mut starter = CoreWfStarter::new(wf_name);
     starter.sdk_config.register_activities(StdActivities);
-    let mut worker = starter.worker().await;
-    worker
+    starter
+        .sdk_config
         .register_workflow::<LocalActThenTimerThenWaitResult>()
         .unwrap();
+    let mut worker = starter.worker().await;
 
     let task_queue = starter.get_task_queue().to_owned();
     worker
@@ -226,10 +230,11 @@ async fn long_running_local_act_with_timer() {
     let mut starter = CoreWfStarter::new(wf_name);
     starter.workflow_options.task_timeout = Some(Duration::from_secs(1));
     starter.sdk_config.register_activities(StdActivities);
-    let mut worker = starter.worker().await;
-    worker
+    starter
+        .sdk_config
         .register_workflow::<LocalActThenTimerThenWait>()
         .unwrap();
+    let mut worker = starter.worker().await;
 
     let task_queue = starter.get_task_queue().to_owned();
     worker
@@ -272,8 +277,11 @@ async fn local_act_fanout() {
     let mut starter = CoreWfStarter::new(wf_name);
     starter.sdk_config.tuner = Arc::new(TunerHolder::fixed_size(5, 1, 1, 1));
     starter.sdk_config.register_activities(StdActivities);
+    starter
+        .sdk_config
+        .register_workflow::<LocalActFanoutWf>()
+        .unwrap();
     let mut worker = starter.worker().await;
-    worker.register_workflow::<LocalActFanoutWf>().unwrap();
 
     let task_queue = starter.get_task_queue().to_owned();
     worker
@@ -325,10 +333,11 @@ async fn local_act_retry_timer_backoff() {
     let wf_name = "local_act_retry_timer_backoff";
     let mut starter = CoreWfStarter::new(wf_name);
     starter.sdk_config.register_activities(StdActivities);
-    let mut worker = starter.worker().await;
-    worker
+    starter
+        .sdk_config
         .register_workflow::<LocalActRetryTimerBackoff>()
         .unwrap();
+    let mut worker = starter.worker().await;
 
     let task_queue = starter.get_task_queue().to_owned();
     let handle = worker
@@ -414,8 +423,11 @@ async fn cancel_immediate(#[case] cancel_type: ActivityCancellationType) {
         }
     }
 
+    starter
+        .sdk_config
+        .register_workflow::<CancelImmediate>()
+        .unwrap();
     let mut worker = starter.worker().await;
-    worker.register_workflow::<CancelImmediate>().unwrap();
 
     let task_queue = starter.get_task_queue().to_owned();
     worker
@@ -580,11 +592,12 @@ async fn cancel_after_act_starts(
         }
     }
 
-    let mut worker = starter.worker().await;
     let bo_dur = cancel_on_backoff.unwrap_or_else(|| Duration::from_secs(1));
-    worker
+    starter
+        .sdk_config
         .register_workflow::<CancelAfterActStartsWf>()
         .unwrap();
+    let mut worker = starter.worker().await;
 
     let task_queue = starter.get_task_queue().to_owned();
     worker
@@ -680,13 +693,16 @@ async fn x_to_close_timeout(#[case] is_schedule: bool) {
         }
     }
 
-    let mut worker = starter.worker().await;
     let (sched, start) = if is_schedule {
         (Some(Duration::from_secs(2)), None)
     } else {
         (None, Some(Duration::from_secs(2)))
     };
-    worker.register_workflow::<XToCloseTimeoutWf>().unwrap();
+    starter
+        .sdk_config
+        .register_workflow::<XToCloseTimeoutWf>()
+        .unwrap();
+    let mut worker = starter.worker().await;
 
     let task_queue = starter.get_task_queue().to_owned();
     worker
@@ -754,11 +770,6 @@ async fn schedule_to_close_timeout_across_timer_backoff(#[case] cached: bool) {
         }
     }
 
-    let mut worker = starter.worker().await;
-    worker
-        .register_workflow::<ScheduleToCloseTimeoutAcrossTimerBackoff>()
-        .unwrap();
-
     let num_attempts = Arc::new(AtomicU8::new(0));
 
     struct FailWithAtomicCounter {
@@ -773,9 +784,16 @@ async fn schedule_to_close_timeout_across_timer_backoff(#[case] cached: bool) {
         }
     }
 
-    worker.register_activities(FailWithAtomicCounter {
-        counter: num_attempts.clone(),
-    });
+    starter
+        .sdk_config
+        .register_activities(FailWithAtomicCounter {
+            counter: num_attempts.clone(),
+        });
+    starter
+        .sdk_config
+        .register_workflow::<ScheduleToCloseTimeoutAcrossTimerBackoff>()
+        .unwrap();
+    let mut worker = starter.worker().await;
 
     let task_queue = starter.get_task_queue().to_owned();
     worker
@@ -847,10 +865,11 @@ async fn timer_backoff_concurrent_with_non_timer_backoff() {
         }
     }
 
-    let mut worker = starter.worker().await;
-    worker
+    starter
+        .sdk_config
         .register_workflow::<TimerBackoffConcurrentWf>()
         .unwrap();
+    let mut worker = starter.worker().await;
 
     let task_queue = starter.get_task_queue().to_owned();
     worker
@@ -907,10 +926,11 @@ async fn repro_nondeterminism_with_timer_bug() {
         }
     }
 
-    let mut worker = starter.worker().await;
-    worker
+    starter
+        .sdk_config
         .register_workflow::<ReproNondeterminismWithTimerBugWf>()
         .unwrap();
+    let mut worker = starter.worker().await;
 
     let task_queue = starter.get_task_queue().to_owned();
     let handle = worker
@@ -949,9 +969,13 @@ async fn weird_la_nondeterminism_repro(#[values(true, false)] fix_hist: bool) {
         hist = thb.get_full_history_info().unwrap().into();
     }
 
-    let mut worker = replay_sdk_worker([HistoryForReplay::new(hist, "fake".to_owned())]);
-    worker.register_workflow::<LaProblemWorkflow>().unwrap();
-    worker.register_activities(StdActivities);
+    let mut worker = crate::common::replay_sdk_worker_with_options(
+        [HistoryForReplay::new(hist, "fake".to_owned())],
+        |options| {
+            options.register_workflow::<LaProblemWorkflow>().unwrap();
+            options.register_activities(StdActivities);
+        },
+    );
     worker.run().await.unwrap();
 }
 
@@ -967,9 +991,13 @@ async fn second_weird_la_nondeterminism_repro() {
     thb.add_workflow_execution_completed();
     hist = thb.get_full_history_info().unwrap().into();
 
-    let mut worker = replay_sdk_worker([HistoryForReplay::new(hist, "fake".to_owned())]);
-    worker.register_workflow::<LaProblemWorkflow>().unwrap();
-    worker.register_activities(StdActivities);
+    let mut worker = crate::common::replay_sdk_worker_with_options(
+        [HistoryForReplay::new(hist, "fake".to_owned())],
+        |options| {
+            options.register_workflow::<LaProblemWorkflow>().unwrap();
+            options.register_activities(StdActivities);
+        },
+    );
     worker.run().await.unwrap();
 }
 
@@ -983,9 +1011,13 @@ async fn third_weird_la_nondeterminism_repro() {
     thb.add_workflow_task_scheduled_and_started();
     hist = thb.get_full_history_info().unwrap().into();
 
-    let mut worker = replay_sdk_worker([HistoryForReplay::new(hist, "fake".to_owned())]);
-    worker.register_workflow::<LaProblemWorkflow>().unwrap();
-    worker.register_activities(StdActivities);
+    let mut worker = crate::common::replay_sdk_worker_with_options(
+        [HistoryForReplay::new(hist, "fake".to_owned())],
+        |options| {
+            options.register_workflow::<LaProblemWorkflow>().unwrap();
+            options.register_activities(StdActivities);
+        },
+    );
     worker.run().await.unwrap();
 }
 
@@ -1061,10 +1093,11 @@ async fn la_resolve_same_time_as_other_cancel() {
         }
     }
 
-    let mut worker = starter.worker().await;
-    worker
+    starter
+        .sdk_config
         .register_workflow::<LaResolveSameTimeAsOtherCancelWf>()
         .unwrap();
+    let mut worker = starter.worker().await;
 
     let task_queue = starter.get_task_queue().to_owned();
     let handle = worker
@@ -1141,10 +1174,11 @@ async fn long_local_activity_with_update(
         }
     }
 
-    let mut worker = starter.worker().await;
-    worker
+    starter
+        .sdk_config
         .register_workflow::<LongLocalActivityWithUpdateWf>()
         .unwrap();
+    let mut worker = starter.worker().await;
 
     let task_queue = starter.get_task_queue().to_owned();
     let handle = worker
@@ -1235,10 +1269,11 @@ async fn local_activity_with_heartbeat_only_causes_one_wakeup() {
         }
     }
 
-    let mut worker = starter.worker().await;
-    worker
+    starter
+        .sdk_config
         .register_workflow::<LocalActivityWithHeartbeatOnlyCausesOneWakeupWf>()
         .unwrap();
+    let mut worker = starter.worker().await;
 
     let task_queue = starter.get_task_queue().to_owned();
     let handle = worker
@@ -1280,10 +1315,11 @@ async fn local_activity_with_summary() {
     let wf_name = "local_activity_with_summary";
     let mut starter = CoreWfStarter::new(wf_name);
     starter.sdk_config.register_activities(StdActivities);
-    let mut worker = starter.worker().await;
-    worker
+    starter
+        .sdk_config
         .register_workflow::<LocalActivityWithSummaryWf>()
         .unwrap();
+    let mut worker = starter.worker().await;
 
     let handle = starter.start_with_worker(wf_name, &mut worker).await;
     worker.run_until_done().await.unwrap();
@@ -1340,12 +1376,6 @@ async fn local_act_two_wfts_before_marker(#[case] replay: bool, #[case] cached: 
         vec![1.into(), 2.into(), ResponseType::AllHistory]
     };
     let mh = MockPollCfg::from_resp_batches(wf_id, t, resps, mock);
-    let mut worker = mock_sdk_cfg(mh, |cfg| {
-        if cached {
-            cfg.max_cached_workflows = 1;
-        }
-    });
-
     #[workflow]
     #[derive(Default)]
     struct LocalActTwoWftsBeforeMarkerWf;
@@ -1361,10 +1391,20 @@ async fn local_act_two_wfts_before_marker(#[case] replay: bool, #[case] cached: 
         }
     }
 
-    worker
-        .register_workflow::<LocalActTwoWftsBeforeMarkerWf>()
-        .unwrap();
-    worker.register_activities(StdActivities);
+    let mut worker = crate::common::mock_sdk_cfg_with_options(
+        mh,
+        |cfg| {
+            if cached {
+                cfg.max_cached_workflows = 1;
+            }
+        },
+        |options| {
+            options
+                .register_workflow::<LocalActTwoWftsBeforeMarkerWf>()
+                .unwrap();
+            options.register_activities(StdActivities);
+        },
+    );
     worker.run_until_done().await.unwrap();
 }
 
@@ -1385,10 +1425,14 @@ async fn local_act_many_concurrent() {
     let wf_id = "fakeid";
     let mock = mock_worker_client();
     let mh = MockPollCfg::from_resp_batches(wf_id, t, [1, 2, 3], mock);
-    let mut worker = mock_sdk(mh);
-
-    worker.register_workflow::<LocalActFanoutWf>().unwrap();
-    worker.register_activities(StdActivities);
+    let mut worker = crate::common::mock_sdk_cfg_with_options(
+        mh,
+        |_| {},
+        |options| {
+            options.register_workflow::<LocalActFanoutWf>().unwrap();
+            options.register_activities(StdActivities);
+        },
+    );
     worker.run_until_done().await.unwrap();
 }
 
@@ -1415,12 +1459,6 @@ async fn local_act_heartbeat(#[case] shutdown_middle: bool) {
     let mock = mock_worker_client();
     let mut mh = MockPollCfg::from_resp_batches(wf_id, t, [1, 2, 2, 2], mock);
     mh.enforce_correct_number_of_polls = false;
-    let mut worker = mock_sdk_cfg(mh, |wc| {
-        wc.max_cached_workflows = 1;
-        wc.max_outstanding_workflow_tasks = Some(1);
-    });
-    let core = worker.core_worker();
-
     let shutdown_barr = Arc::new(Barrier::new(2));
 
     #[workflow]
@@ -1441,8 +1479,6 @@ async fn local_act_heartbeat(#[case] shutdown_middle: bool) {
             Ok(())
         }
     }
-
-    worker.register_workflow::<LocalActHeartbeatWf>().unwrap();
 
     struct EchoWithConditionalBarrier {
         shutdown_barr: Option<Arc<Barrier>>,
@@ -1466,14 +1502,25 @@ async fn local_act_heartbeat(#[case] shutdown_middle: bool) {
         }
     }
 
-    worker.register_activities(EchoWithConditionalBarrier {
-        shutdown_barr: if shutdown_middle {
-            Some(shutdown_barr.clone())
-        } else {
-            None
+    let mut worker = crate::common::mock_sdk_cfg_with_options(
+        mh,
+        |wc| {
+            wc.max_cached_workflows = 1;
+            wc.max_outstanding_workflow_tasks = Some(1);
         },
-        wft_timeout,
-    });
+        |options| {
+            options.register_workflow::<LocalActHeartbeatWf>().unwrap();
+            options.register_activities(EchoWithConditionalBarrier {
+                shutdown_barr: if shutdown_middle {
+                    Some(shutdown_barr.clone())
+                } else {
+                    None
+                },
+                wft_timeout,
+            });
+        },
+    );
+    let core = worker.core_worker();
     let (_, runres) = tokio::join!(
         async {
             if shutdown_middle {
@@ -1500,8 +1547,6 @@ async fn local_act_fail_and_retry(#[case] eventually_pass: bool) {
     let wf_id = "fakeid";
     let mock = mock_worker_client();
     let mh = MockPollCfg::from_resp_batches(wf_id, t, [1], mock);
-    let mut worker = mock_sdk(mh);
-
     #[workflow]
     #[derive(Default)]
     struct LocalActFailAndRetryWf;
@@ -1537,9 +1582,6 @@ async fn local_act_fail_and_retry(#[case] eventually_pass: bool) {
         }
     }
 
-    worker
-        .register_workflow::<LocalActFailAndRetryWf>()
-        .unwrap();
     let attempts = Arc::new(AtomicUsize::new(0));
 
     struct EventuallyPassingActivity {
@@ -1559,10 +1601,19 @@ async fn local_act_fail_and_retry(#[case] eventually_pass: bool) {
         }
     }
 
-    worker.register_activities(EventuallyPassingActivity {
-        attempts: attempts.clone(),
-        eventually_pass,
-    });
+    let mut worker = crate::common::mock_sdk_cfg_with_options(
+        mh,
+        |_| {},
+        |options| {
+            options
+                .register_workflow::<LocalActFailAndRetryWf>()
+                .unwrap();
+            options.register_activities(EventuallyPassingActivity {
+                attempts: attempts.clone(),
+                eventually_pass,
+            });
+        },
+    );
     worker.run_until_done().await.unwrap();
     let expected_attempts = if eventually_pass { 3 } else { 5 };
     assert_eq!(expected_attempts, attempts.load(Ordering::Relaxed));
@@ -1603,8 +1654,6 @@ async fn local_act_retry_long_backoff_uses_timer() {
         [1.into(), 2.into(), ResponseType::AllHistory],
         mock,
     );
-    let mut worker = mock_sdk_cfg(mh, |w| w.max_cached_workflows = 1);
-
     #[workflow]
     #[derive(Default)]
     struct LocalActRetryLongBackoffUsesTimerWf;
@@ -1637,10 +1686,16 @@ async fn local_act_retry_long_backoff_uses_timer() {
         }
     }
 
-    worker
-        .register_workflow::<LocalActRetryLongBackoffUsesTimerWf>()
-        .unwrap();
-    worker.register_activities(StdActivities);
+    let mut worker = crate::common::mock_sdk_cfg_with_options(
+        mh,
+        |w| w.max_cached_workflows = 1,
+        |options| {
+            options
+                .register_workflow::<LocalActRetryLongBackoffUsesTimerWf>()
+                .unwrap();
+            options.register_activities(StdActivities);
+        },
+    );
     worker.run_until_done().await.unwrap();
 }
 
@@ -1655,8 +1710,6 @@ async fn local_act_null_result() {
     let wf_id = "fakeid";
     let mock = mock_worker_client();
     let mh = MockPollCfg::from_resp_batches(wf_id, t, [ResponseType::AllHistory], mock);
-    let mut worker = mock_sdk_cfg(mh, |w| w.max_cached_workflows = 1);
-
     #[workflow]
     #[derive(Default)]
     struct LocalActNullResultWf;
@@ -1671,8 +1724,14 @@ async fn local_act_null_result() {
         }
     }
 
-    worker.register_workflow::<LocalActNullResultWf>().unwrap();
-    worker.register_activities(StdActivities);
+    let mut worker = crate::common::mock_sdk_cfg_with_options(
+        mh,
+        |w| w.max_cached_workflows = 1,
+        |options| {
+            options.register_workflow::<LocalActNullResultWf>().unwrap();
+            options.register_activities(StdActivities);
+        },
+    );
     worker.run_until_done().await.unwrap();
 }
 
@@ -1691,8 +1750,6 @@ async fn local_act_command_immediately_follows_la_marker() {
     let wf_id = "fakeid";
     let mock = mock_worker_client();
     let mh = MockPollCfg::from_resp_batches(wf_id, t, [3], mock);
-    let mut worker = mock_sdk_cfg(mh, |w| w.max_cached_workflows = 0);
-
     #[workflow]
     #[derive(Default)]
     struct LocalActCommandImmediatelyFollowsLaMarkerWf;
@@ -1708,10 +1765,16 @@ async fn local_act_command_immediately_follows_la_marker() {
         }
     }
 
-    worker
-        .register_workflow::<LocalActCommandImmediatelyFollowsLaMarkerWf>()
-        .unwrap();
-    worker.register_activities(StdActivities);
+    let mut worker = crate::common::mock_sdk_cfg_with_options(
+        mh,
+        |w| w.max_cached_workflows = 0,
+        |options| {
+            options
+                .register_workflow::<LocalActCommandImmediatelyFollowsLaMarkerWf>()
+                .unwrap();
+            options.register_activities(StdActivities);
+        },
+    );
     worker.run_until_done().await.unwrap();
 }
 
@@ -1980,7 +2043,6 @@ async fn test_schedule_to_start_timeout() {
     let wf_id = "fakeid";
     let mock = mock_worker_client();
     let mh = MockPollCfg::from_resp_batches(wf_id, t, [ResponseType::ToTaskNum(1)], mock);
-    let mut worker = mock_sdk_cfg(mh, |w| w.max_cached_workflows = 1);
 
     #[workflow]
     #[derive(Default)]
@@ -2011,10 +2073,16 @@ async fn test_schedule_to_start_timeout() {
         }
     }
 
-    worker
-        .register_workflow::<TestScheduleToStartTimeoutWf>()
-        .unwrap();
-    worker.register_activities(StdActivities);
+    let mut worker = crate::common::mock_sdk_cfg_with_options(
+        mh,
+        |w| w.max_cached_workflows = 1,
+        |options| {
+            options
+                .register_workflow::<TestScheduleToStartTimeoutWf>()
+                .unwrap();
+            options.register_activities(StdActivities);
+        },
+    );
     worker.run_until_done().await.unwrap();
 }
 
@@ -2065,7 +2133,6 @@ async fn test_schedule_to_start_timeout_not_based_on_original_time(
     let wf_id = "fakeid";
     let mock = mock_worker_client();
     let mh = MockPollCfg::from_resp_batches(wf_id, t, [ResponseType::AllHistory], mock);
-    let mut worker = mock_sdk_cfg(mh, |w| w.max_cached_workflows = 1);
 
     #[workflow]
     #[derive(Default)]
@@ -2111,10 +2178,16 @@ async fn test_schedule_to_start_timeout_not_based_on_original_time(
         }
     }
 
-    worker
-        .register_workflow::<TestScheduleToStartTimeoutNotBasedOnOriginalTimeWf>()
-        .unwrap();
-    worker.register_activities(StdActivities);
+    let mut worker = crate::common::mock_sdk_cfg_with_options(
+        mh,
+        |w| w.max_cached_workflows = 1,
+        |options| {
+            options
+                .register_workflow::<TestScheduleToStartTimeoutNotBasedOnOriginalTimeWf>()
+                .unwrap();
+            options.register_activities(StdActivities);
+        },
+    );
     worker.run_until_done().await.unwrap();
 }
 
@@ -2147,7 +2220,6 @@ async fn start_to_close_timeout_allows_retries(#[values(true, false)] la_complet
         [ResponseType::ToTaskNum(1), ResponseType::AllHistory],
         mock,
     );
-    let mut worker = mock_sdk_cfg(mh, |w| w.max_cached_workflows = 1);
 
     #[workflow]
     #[derive(Default)]
@@ -2188,9 +2260,6 @@ async fn start_to_close_timeout_allows_retries(#[values(true, false)] la_complet
         }
     }
 
-    worker
-        .register_workflow::<StartToCloseTimeoutAllowsRetriesWf>()
-        .unwrap();
     let attempts = Arc::new(AtomicUsize::new(0));
     let cancels = Arc::new(AtomicUsize::new(0));
 
@@ -2217,11 +2286,20 @@ async fn start_to_close_timeout_allows_retries(#[values(true, false)] la_complet
         }
     }
 
-    worker.register_activities(ActivityWithRetriesAndCancellation {
-        attempts: attempts.clone(),
-        cancels: cancels.clone(),
-        la_completes,
-    });
+    let mut worker = crate::common::mock_sdk_cfg_with_options(
+        mh,
+        |w| w.max_cached_workflows = 1,
+        |options| {
+            options
+                .register_workflow::<StartToCloseTimeoutAllowsRetriesWf>()
+                .unwrap();
+            options.register_activities(ActivityWithRetriesAndCancellation {
+                attempts: attempts.clone(),
+                cancels: cancels.clone(),
+                la_completes,
+            });
+        },
+    );
     worker.run_until_done().await.unwrap();
     assert_eq!(attempts.load(Ordering::Acquire), 5);
     let num_cancels = if la_completes { 4 } else { 5 };
@@ -2241,7 +2319,6 @@ async fn wft_failure_cancels_running_las() {
     let mock = mock_worker_client();
     let mut mh = MockPollCfg::from_resp_batches(wf_id, t, [1, 2], mock);
     mh.num_expected_fails = 1;
-    let mut worker = mock_sdk_cfg(mh, |w| w.max_cached_workflows = 1);
 
     #[workflow]
     #[derive(Default)]
@@ -2267,10 +2344,6 @@ async fn wft_failure_cancels_running_las() {
         }
     }
 
-    worker
-        .register_workflow::<WftFailureCancelsRunningLasWf>()
-        .unwrap();
-
     struct ActivityThatExpectsCancellation;
     #[activities]
     impl ActivityThatExpectsCancellation {
@@ -2284,7 +2357,16 @@ async fn wft_failure_cancels_running_las() {
         }
     }
 
-    worker.register_activities(ActivityThatExpectsCancellation);
+    let mut worker = crate::common::mock_sdk_cfg_with_options(
+        mh,
+        |w| w.max_cached_workflows = 1,
+        |options| {
+            options
+                .register_workflow::<WftFailureCancelsRunningLasWf>()
+                .unwrap();
+            options.register_activities(ActivityThatExpectsCancellation);
+        },
+    );
     worker.run_until_done().await.unwrap();
 }
 
@@ -2312,7 +2394,6 @@ async fn resolved_las_not_recorded_if_wft_fails_many_times() {
     );
     mh.num_expected_fails = 2;
     mh.num_expected_completions = Some(0.into());
-    let mut worker = mock_sdk_cfg(mh, |w| w.max_cached_workflows = 1);
 
     #[workflow]
     #[derive(Default)]
@@ -2333,10 +2414,16 @@ async fn resolved_las_not_recorded_if_wft_fails_many_times() {
         }
     }
 
-    worker
-        .register_workflow::<ResolvedLasNotRecordedIfWftFailsManyTimesWf>()
-        .unwrap();
-    worker.register_activities(StdActivities);
+    let mut worker = crate::common::mock_sdk_cfg_with_options(
+        mh,
+        |w| w.max_cached_workflows = 1,
+        |options| {
+            options
+                .register_workflow::<ResolvedLasNotRecordedIfWftFailsManyTimesWf>()
+                .unwrap();
+            options.register_activities(StdActivities);
+        },
+    );
     worker.run_until_done().await.unwrap();
 }
 
@@ -2362,10 +2449,6 @@ async fn local_act_records_nonfirst_attempts_ok() {
         );
         Ok(Default::default())
     }));
-    let mut worker = mock_sdk_cfg(mh, |wc| {
-        wc.max_cached_workflows = 1;
-        wc.max_outstanding_workflow_tasks = Some(1);
-    });
 
     #[workflow]
     #[derive(Default)]
@@ -2397,10 +2480,19 @@ async fn local_act_records_nonfirst_attempts_ok() {
         }
     }
 
-    worker
-        .register_workflow::<LocalActRecordsNonfirstAttemptsOkWf>()
-        .unwrap();
-    worker.register_activities(StdActivities);
+    let mut worker = crate::common::mock_sdk_cfg_with_options(
+        mh,
+        |wc| {
+            wc.max_cached_workflows = 1;
+            wc.max_outstanding_workflow_tasks = Some(1);
+        },
+        |options| {
+            options
+                .register_workflow::<LocalActRecordsNonfirstAttemptsOkWf>()
+                .unwrap();
+            options.register_activities(StdActivities);
+        },
+    );
     worker.run_until_done().await.unwrap();
     assert_eq!(nonfirst_counts.len(), 3);
     // First task's non-first count should, of course, be 0
@@ -2686,7 +2778,6 @@ async fn local_act_retry_explicit_delay() {
     let wf_id = "fakeid";
     let mock = mock_worker_client();
     let mh = MockPollCfg::from_resp_batches(wf_id, t, [1], mock);
-    let mut worker = mock_sdk(mh);
 
     #[workflow]
     #[derive(Default)]
@@ -2718,9 +2809,6 @@ async fn local_act_retry_explicit_delay() {
         }
     }
 
-    worker
-        .register_workflow::<LocalActRetryExplicitDelayWf>()
-        .unwrap();
     let attempts = Arc::new(AtomicUsize::new(0));
 
     struct ActivityWithExplicitBackoff {
@@ -2746,9 +2834,18 @@ async fn local_act_retry_explicit_delay() {
         }
     }
 
-    worker.register_activities(ActivityWithExplicitBackoff {
-        attempts: attempts.clone(),
-    });
+    let mut worker = crate::common::mock_sdk_cfg_with_options(
+        mh,
+        |_| {},
+        |options| {
+            options
+                .register_workflow::<LocalActRetryExplicitDelayWf>()
+                .unwrap();
+            options.register_activities(ActivityWithExplicitBackoff {
+                attempts: attempts.clone(),
+            });
+        },
+    );
     let start = Instant::now();
     worker.run_until_done().await.unwrap();
     let expected_attempts = 3;
@@ -2848,8 +2945,13 @@ async fn one_la_success(#[case] replay: bool, #[case] completes_ok: bool) {
         });
     });
 
-    let mut worker = build_fake_sdk(mock_cfg);
-    worker.register_workflow::<LaWf>().unwrap();
+    let mut worker = crate::common::build_fake_sdk_with_options(mock_cfg, |options| {
+        options.register_workflow::<LaWf>().unwrap();
+        options.register_activities(ActivityWithReplayCheck {
+            replay,
+            completes_ok,
+        });
+    });
 
     struct ActivityWithReplayCheck {
         replay: bool,
@@ -2875,10 +2977,6 @@ async fn one_la_success(#[case] replay: bool, #[case] completes_ok: bool) {
         }
     }
 
-    worker.register_activities(ActivityWithReplayCheck {
-        replay,
-        completes_ok,
-    });
     worker.run().await.unwrap();
 }
 
@@ -2981,10 +3079,11 @@ async fn local_activity_resolutions_are_delivered_incrementally() {
             short_completed: Arc::new(AtomicUsize::new(0)),
             short_sequence_completed: short_sequence_completed.clone(),
         });
-    let mut worker = starter.worker().await;
-    worker
+    starter
+        .sdk_config
         .register_workflow::<IncrementalLocalActivityResolutionWf>()
         .unwrap();
+    let mut worker = starter.worker().await;
     let task_queue = starter.get_task_queue().to_owned();
     let handle = worker
         .submit_workflow(
@@ -3086,11 +3185,16 @@ async fn old_batched_local_activity_history_replays() {
         });
     });
 
-    let mut worker = build_fake_sdk_intercepted(mock_cfg, activation_assertions);
-    worker
-        .register_workflow::<OldBatchedLocalActivityHistoryWf>()
-        .unwrap();
-    worker.register_activities(ResolvedActivity);
+    let mut worker = crate::common::build_fake_sdk_intercepted_with_options(
+        mock_cfg,
+        activation_assertions,
+        |options| {
+            options
+                .register_workflow::<OldBatchedLocalActivityHistoryWf>()
+                .unwrap();
+            options.register_activities(ResolvedActivity);
+        },
+    );
     worker.run().await.unwrap();
 }
 
@@ -3225,11 +3329,16 @@ async fn mixed_la_completion_times(#[values(true, false)] replay: bool) {
         }
     });
 
-    let mut worker = build_fake_sdk_intercepted(mock_cfg, activation_assertions);
-    worker
-        .register_workflow::<MixedCompletionTimesWf>()
-        .unwrap();
-    worker.register_activities(MixedCompletionTimesActivity { release_slow });
+    let mut worker = crate::common::build_fake_sdk_intercepted_with_options(
+        mock_cfg,
+        activation_assertions,
+        |options| {
+            options
+                .register_workflow::<MixedCompletionTimesWf>()
+                .unwrap();
+            options.register_activities(MixedCompletionTimesActivity { release_slow });
+        },
+    );
     worker.run().await.unwrap();
 }
 
@@ -3315,11 +3424,16 @@ async fn two_las_with_heartbeat(
         }
     });
 
-    let mut worker = build_fake_sdk_intercepted(mock_cfg, activation_assertions);
-    worker.register_workflow::<TwoLaWfParallel>().unwrap();
-    worker.register_activities(HeartbeatGatedActivity {
-        release: release_activities,
-    });
+    let mut worker = crate::common::build_fake_sdk_intercepted_with_options(
+        mock_cfg,
+        activation_assertions,
+        |options| {
+            options.register_workflow::<TwoLaWfParallel>().unwrap();
+            options.register_activities(HeartbeatGatedActivity {
+                release: release_activities,
+            });
+        },
+    );
     worker.run().await.unwrap();
 }
 
@@ -3428,13 +3542,15 @@ async fn two_sequential_las(
         });
     });
 
-    let mut worker = build_fake_sdk_intercepted(mock_cfg, aai);
-    if parallel {
-        worker.register_workflow::<TwoLaWfParallel>().unwrap();
-    } else {
-        worker.register_workflow::<TwoLaWf>().unwrap();
-    }
-    worker.register_activities(ResolvedActivity);
+    let mut worker =
+        crate::common::build_fake_sdk_intercepted_with_options(mock_cfg, aai, |options| {
+            if parallel {
+                options.register_workflow::<TwoLaWfParallel>().unwrap();
+            } else {
+                options.register_workflow::<TwoLaWf>().unwrap();
+            }
+            options.register_activities(ResolvedActivity);
+        });
     worker.run().await.unwrap();
 }
 
@@ -3523,9 +3639,11 @@ async fn las_separated_by_timer(#[case] replay: bool) {
         }
     });
 
-    let mut worker = build_fake_sdk_intercepted(mock_cfg, aai);
-    worker.register_workflow::<LaTimerLaWf>().unwrap();
-    worker.register_activities(ResolvedActivity);
+    let mut worker =
+        crate::common::build_fake_sdk_intercepted_with_options(mock_cfg, aai, |options| {
+            options.register_workflow::<LaTimerLaWf>().unwrap();
+            options.register_activities(ResolvedActivity);
+        });
     worker.run().await.unwrap();
 }
 
@@ -3555,9 +3673,10 @@ async fn one_la_heartbeating_wft_failure_still_executes() {
         });
     });
 
-    let mut worker = build_fake_sdk(mock_cfg);
-    worker.register_workflow::<LaWf>().unwrap();
-    worker.register_activities(ResolvedActivity);
+    let mut worker = crate::common::build_fake_sdk_with_options(mock_cfg, |options| {
+        options.register_workflow::<LaWf>().unwrap();
+        options.register_activities(ResolvedActivity);
+    });
     worker.run().await.unwrap();
 }
 
@@ -3590,8 +3709,6 @@ async fn immediate_cancel(
         });
     });
 
-    let mut worker = build_fake_sdk(mock_cfg);
-
     #[workflow]
     #[derive(Default)]
     struct CancelBeforeActStartsWf;
@@ -3616,9 +3733,11 @@ async fn immediate_cancel(
         }
     }
 
-    worker
-        .register_workflow::<CancelBeforeActStartsWf>()
-        .unwrap();
+    let mut worker = crate::common::build_fake_sdk_with_options(mock_cfg, |options| {
+        options
+            .register_workflow::<CancelBeforeActStartsWf>()
+            .unwrap();
+    });
     worker.run().await.unwrap();
 }
 
@@ -3706,8 +3825,6 @@ async fn cancel_after_act_starts_canned(
         });
     }
 
-    let mut worker = build_fake_sdk(mock_cfg);
-
     #[workflow]
     #[derive(Default)]
     struct CancelAfterActStartsCannedWf;
@@ -3738,10 +3855,6 @@ async fn cancel_after_act_starts_canned(
         }
     }
 
-    worker
-        .register_workflow::<CancelAfterActStartsCannedWf>()
-        .unwrap();
-
     struct ActivityWithConditionalCancelWait {
         cancel_type: ActivityCancellationType,
         allow_cancel_barr: CancellationToken,
@@ -3758,9 +3871,14 @@ async fn cancel_after_act_starts_canned(
         }
     }
 
-    worker.register_activities(ActivityWithConditionalCancelWait {
-        cancel_type,
-        allow_cancel_barr: allow_cancel_barr_clone,
+    let mut worker = crate::common::build_fake_sdk_with_options(mock_cfg, |options| {
+        options
+            .register_workflow::<CancelAfterActStartsCannedWf>()
+            .unwrap();
+        options.register_activities(ActivityWithConditionalCancelWait {
+            cancel_type,
+            allow_cancel_barr: allow_cancel_barr_clone,
+        });
     });
     worker.run().await.unwrap();
 }
@@ -3877,11 +3995,11 @@ async fn heartbeat_timeout_does_not_overlap_local_activity_resolution_activation
             long_started: long_started.clone(),
             release_long: release_long.clone(),
         });
-
-    let mut worker = starter.worker().await;
-    worker
+    starter
+        .sdk_config
         .register_workflow::<HeartbeatTimeoutOverlapWf>()
         .unwrap();
+    let mut worker = starter.worker().await;
 
     let task_queue = starter.get_task_queue().to_owned();
     worker
@@ -4030,11 +4148,11 @@ async fn replay_out_of_order_local_activity_markers_is_deterministic() {
         .register_activities(OutOfOrderMarkerActivities {
             release_first: release_first.clone(),
         });
-
-    let mut worker = starter.worker().await;
-    worker
+    starter
+        .sdk_config
         .register_workflow::<OutOfOrderMarkerWorkflow>()
         .unwrap();
+    let mut worker = starter.worker().await;
 
     let task_queue = starter.get_task_queue().to_owned();
     let handle = worker

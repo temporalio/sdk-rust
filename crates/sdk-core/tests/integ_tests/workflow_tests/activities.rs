@@ -1,8 +1,8 @@
 use crate::{
     common::{
         ActivationAssertionsInterceptor, CoreWfStarter, INTEG_CLIENT_IDENTITY,
-        activity_functions::StdActivities, build_fake_sdk_intercepted, init_core_and_create_wf,
-        mock_sdk, mock_sdk_cfg,
+        activity_functions::StdActivities, build_fake_sdk_intercepted, eventually,
+        init_core_and_create_wf, mock_sdk, mock_sdk_cfg,
     },
     shared_tests,
 };
@@ -1030,6 +1030,10 @@ async fn workflow_observes_non_retryable_activity() {
     starter
         .sdk_config
         .register_activities(NonRetryableActivityErrorActivities);
+    starter
+        .sdk_config
+        .register_workflow::<NonRetryableActivityFailureWorkflow>()
+        .unwrap();
     let mut worker = starter.worker().await;
 
     #[workflow]
@@ -1086,10 +1090,6 @@ async fn workflow_observes_non_retryable_activity() {
             ))
         }
     }
-
-    worker
-        .register_workflow::<NonRetryableActivityFailureWorkflow>()
-        .unwrap();
 
     let task_queue = starter.get_task_queue().to_owned();
     worker
@@ -1827,6 +1827,10 @@ async fn graceful_shutdown() {
         acts_started: acts_started.clone(),
         acts_done: acts_done.clone(),
     });
+    starter
+        .sdk_config
+        .register_workflow::<GracefulShutdownWorkflow>()
+        .unwrap();
     let mut worker = starter.worker().await;
     let client = starter.get_client().await;
 
@@ -1855,10 +1859,6 @@ async fn graceful_shutdown() {
             Ok(())
         }
     }
-
-    worker
-        .register_workflow::<GracefulShutdownWorkflow>()
-        .unwrap();
 
     let task_queue = starter.get_task_queue().to_owned();
     worker
@@ -1922,6 +1922,10 @@ async fn activity_can_be_cancelled_by_local_timeout() {
         .register_activities(CancellableEchoActivities {
             was_cancelled: was_cancelled.clone(),
         });
+    starter
+        .sdk_config
+        .register_workflow::<ActivityLocalTimeoutWorkflow>()
+        .unwrap();
     let mut worker = starter.worker().await;
 
     #[workflow]
@@ -1961,10 +1965,6 @@ async fn activity_can_be_cancelled_by_local_timeout() {
         }
     }
 
-    worker
-        .register_workflow::<ActivityLocalTimeoutWorkflow>()
-        .unwrap();
-
     let task_queue = starter.get_task_queue().to_owned();
     worker
         .submit_workflow(
@@ -1998,6 +1998,10 @@ async fn long_activity_timeout_repro() {
     starter
         .set_core_cfg_mutator(|m| m.local_timeout_buffer_for_activities = Duration::from_secs(0));
     starter.sdk_config.register_activities(StdActivities);
+    starter
+        .sdk_config
+        .register_workflow::<LongActivityTimeoutReproWorkflow>()
+        .unwrap();
     let mut worker = starter.worker().await;
 
     #[workflow]
@@ -2032,10 +2036,6 @@ async fn long_activity_timeout_repro() {
         }
     }
 
-    worker
-        .register_workflow::<LongActivityTimeoutReproWorkflow>()
-        .unwrap();
-
     starter.start_with_worker(wf_name, &mut worker).await;
     worker.run_until_done().await.unwrap();
 }
@@ -2069,8 +2069,6 @@ async fn pass_activity_summary_to_metadata() {
             });
     });
 
-    let mut worker = mock_sdk_cfg(mock_cfg, |_| {});
-
     #[workflow]
     #[derive(Default)]
     struct ActivitySummaryWorkflow;
@@ -2091,9 +2089,15 @@ async fn pass_activity_summary_to_metadata() {
         }
     }
 
-    worker
-        .register_workflow::<ActivitySummaryWorkflow>()
-        .unwrap();
+    let mut worker = crate::common::mock_sdk_cfg_with_options(
+        mock_cfg,
+        |_| {},
+        |options| {
+            options
+                .register_workflow::<ActivitySummaryWorkflow>()
+                .unwrap();
+        },
+    );
     let task_queue = worker.inner_mut().task_queue().to_owned();
     worker
         .submit_wf(
@@ -2132,8 +2136,6 @@ async fn abandoned_activities_ignore_start_and_complete(hist_batches: &'static [
     t.add_full_wf_task();
     t.add_workflow_execution_completed();
     let mock = mock_worker_client();
-    let mut worker = mock_sdk(MockPollCfg::from_resp_batches(wfid, t, hist_batches, mock));
-
     #[workflow]
     #[derive(Default)]
     struct AbandonedActivitiesWorkflow;
@@ -2166,9 +2168,15 @@ async fn abandoned_activities_ignore_start_and_complete(hist_batches: &'static [
         }
     }
 
-    worker
-        .register_workflow::<AbandonedActivitiesWorkflow>()
-        .unwrap();
+    let mut worker = crate::common::mock_sdk_cfg_with_options(
+        MockPollCfg::from_resp_batches(wfid, t, hist_batches, mock),
+        |_| {},
+        |options| {
+            options
+                .register_workflow::<AbandonedActivitiesWorkflow>()
+                .unwrap();
+        },
+    );
     let task_queue = worker.inner_mut().task_queue().to_owned();
     worker
         .submit_wf(
@@ -2237,11 +2245,15 @@ async fn immediate_activity_cancelation() {
         )
     });
 
-    let mut worker =
-        build_fake_sdk_intercepted(MockPollCfg::from_resps(t, [ResponseType::AllHistory]), aai);
-    worker
-        .register_workflow::<ImmediateActivityCancelationWorkflow>()
-        .unwrap();
+    let mut worker = crate::common::build_fake_sdk_intercepted_with_options(
+        MockPollCfg::from_resps(t, [ResponseType::AllHistory]),
+        aai,
+        |options| {
+            options
+                .register_workflow::<ImmediateActivityCancelationWorkflow>()
+                .unwrap();
+        },
+    );
 
     worker.run().await.unwrap();
 }

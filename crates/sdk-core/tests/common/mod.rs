@@ -36,7 +36,7 @@ use temporalio_client::{
     grpc::WorkflowService,
 };
 use temporalio_common::{
-    HasWorkflowDefinition, WorkflowDefinition,
+    HasWorkflowDefinition,
     data_converters::{DataConverter, RawValue},
     protos::{
         coresdk::{
@@ -54,13 +54,11 @@ use temporalio_common::{
     worker::{WorkerDeploymentOptions, WorkerDeploymentVersion, WorkerTaskTypes},
 };
 use temporalio_sdk::{
-    Worker, WorkerOptions, WorkflowRegistrationError,
-    activities::ActivityImplementer,
+    Worker, WorkerOptions,
     interceptors::{
         FailOnNondeterminismInterceptor, InterceptorWithNext, ReturnWorkflowExitValueInterceptor,
         WorkerInterceptor,
     },
-    workflows::WorkflowImplementation,
 };
 #[cfg(any(feature = "test-utilities", test))]
 pub(crate) use temporalio_sdk_core::test_help::NAMESPACE;
@@ -152,16 +150,20 @@ where
     init_replay_worker(ReplayWorkerInput::new(worker_cfg, histories))
         .expect("Replay worker must init properly")
 }
-pub(crate) fn replay_sdk_worker<I>(histories: I) -> Worker
+pub(crate) fn replay_sdk_worker_with_options<I>(
+    histories: I,
+    options_mutator: impl FnOnce(&mut WorkerOptions),
+) -> Worker
 where
     I: IntoIterator<Item = HistoryForReplay> + 'static,
     <I as IntoIterator>::IntoIter: Send,
 {
-    replay_sdk_worker_stream(stream::iter(histories))
+    replay_sdk_worker_stream_with_options(stream::iter(histories), options_mutator)
 }
-pub(crate) fn replay_sdk_worker_intercepted<I>(
+pub(crate) fn replay_sdk_worker_intercepted_with_options<I>(
     histories: I,
     interceptor: impl WorkerInterceptor + 'static,
+    options_mutator: impl FnOnce(&mut WorkerOptions),
 ) -> Worker
 where
     I: IntoIterator<Item = HistoryForReplay> + 'static,
@@ -171,30 +173,17 @@ where
     let client_options = ClientOptions::new(core.get_config().namespace.clone())
         .data_converter(DataConverter::default())
         .build();
-    let worker_options = WorkerOptions::new(core.get_config().task_queue.clone())
+    let mut worker_options = WorkerOptions::new(core.get_config().task_queue.clone())
         .worker_interceptor(interceptor)
         .build();
+    options_mutator(&mut worker_options);
     Worker::new_from_core_options(Arc::new(core), client_options, worker_options)
         .expect("replay worker options are valid")
 }
 
-pub(crate) fn replay_sdk_worker_stream<I>(histories: I) -> Worker
-where
-    I: Stream<Item = HistoryForReplay> + Send + 'static,
-{
-    let core = init_core_replay_stream("replay_worker_test", histories);
-    let client_options = ClientOptions::new(core.get_config().namespace.clone())
-        .data_converter(DataConverter::default())
-        .build();
-    let worker_options = WorkerOptions::new(core.get_config().task_queue.clone())
-        .worker_interceptor(FailOnNondeterminismInterceptor {})
-        .build();
-    Worker::new_from_core_options(Arc::new(core), client_options, worker_options)
-        .expect("replay worker options are valid")
-}
-pub(crate) fn replay_sdk_worker_stream_intercepted<I>(
+pub(crate) fn replay_sdk_worker_stream_with_options<I>(
     histories: I,
-    interceptor: impl WorkerInterceptor + 'static,
+    options_mutator: impl FnOnce(&mut WorkerOptions),
 ) -> Worker
 where
     I: Stream<Item = HistoryForReplay> + Send + 'static,
@@ -203,9 +192,29 @@ where
     let client_options = ClientOptions::new(core.get_config().namespace.clone())
         .data_converter(DataConverter::default())
         .build();
-    let worker_options = WorkerOptions::new(core.get_config().task_queue.clone())
+    let mut worker_options = WorkerOptions::new(core.get_config().task_queue.clone())
+        .worker_interceptor(FailOnNondeterminismInterceptor {})
+        .build();
+    options_mutator(&mut worker_options);
+    Worker::new_from_core_options(Arc::new(core), client_options, worker_options)
+        .expect("replay worker options are valid")
+}
+pub(crate) fn replay_sdk_worker_stream_intercepted_with_options<I>(
+    histories: I,
+    interceptor: impl WorkerInterceptor + 'static,
+    options_mutator: impl FnOnce(&mut WorkerOptions),
+) -> Worker
+where
+    I: Stream<Item = HistoryForReplay> + Send + 'static,
+{
+    let core = init_core_replay_stream("replay_worker_test", histories);
+    let client_options = ClientOptions::new(core.get_config().namespace.clone())
+        .data_converter(DataConverter::default())
+        .build();
+    let mut worker_options = WorkerOptions::new(core.get_config().task_queue.clone())
         .worker_interceptor(interceptor)
         .build();
+    options_mutator(&mut worker_options);
     Worker::new_from_core_options(Arc::new(core), client_options, worker_options)
         .expect("replay worker options are valid")
 }
@@ -311,6 +320,7 @@ pub(crate) struct CoreWfStarter {
     /// Run when initializing, allows for altering the config used to init the core worker
     #[allow(clippy::type_complexity)] // It's not tho
     core_config_mutator: Option<Arc<dyn Fn(&mut WorkerConfig)>>,
+    core_task_types: Option<WorkerTaskTypes>,
 }
 struct InitializedWorker {
     worker: Arc<CoreWorker>,
@@ -429,6 +439,7 @@ impl CoreWfStarter {
             client_override,
             min_local_server_version: None,
             core_config_mutator: None,
+            core_task_types: None,
         }
     }
 
@@ -444,6 +455,7 @@ impl CoreWfStarter {
             min_local_server_version: self.min_local_server_version.clone(),
             initted_worker: Default::default(),
             core_config_mutator: self.core_config_mutator.clone(),
+            core_task_types: self.core_task_types,
         }
     }
 
@@ -467,6 +479,10 @@ impl CoreWfStarter {
 
     pub(crate) fn set_core_cfg_mutator(&mut self, mutator: impl Fn(&mut WorkerConfig) + 'static) {
         self.core_config_mutator = Some(Arc::new(mutator))
+    }
+
+    pub(crate) fn set_core_task_types(&mut self, task_types: WorkerTaskTypes) {
+        self.core_task_types = Some(task_types);
     }
 
     pub(crate) async fn shutdown(&mut self) {
@@ -587,10 +603,25 @@ impl CoreWfStarter {
                     let client = Client::new(connection.clone(), client_opts).unwrap();
                     (connection, client)
                 };
-                let mut core_config = self
-                    .sdk_config
+                let mut sdk_config = self.sdk_config.clone();
+                let has_registrations =
+                    !sdk_config.workflows().is_empty() || !sdk_config.activities().is_empty();
+                if !has_registrations {
+                    // Core-only tests need a worker without language definitions, but converting
+                    // WorkerOptions rejects that public API configuration. The placeholder exists
+                    // only in this conversion clone and is never visible to an SDK worker.
+                    sdk_config
+                        .register_workflow::<workflows::LaProblemWorkflow>()
+                        .expect("placeholder workflow registers");
+                }
+                let mut core_config = sdk_config
                     .to_core_options(client.namespace(), client.identity())
                     .expect("sdk config converts to core config");
+                if let Some(task_types) = self.core_task_types {
+                    core_config.task_types = task_types;
+                } else if !has_registrations {
+                    core_config.task_types = WorkerTaskTypes::all();
+                }
                 if let Some(ref ccm) = self.core_config_mutator {
                     ccm(&mut core_config);
                 }
@@ -650,37 +681,6 @@ impl TestWorker {
 
     pub(crate) fn worker_instance_key(&self) -> Uuid {
         self.inner.worker_instance_key()
-    }
-
-    pub(crate) fn register_activities<AI: ActivityImplementer>(
-        &mut self,
-        instance: AI,
-    ) -> &mut Self {
-        self.inner.register_activities::<AI>(instance);
-        self
-    }
-
-    #[allow(unused)]
-    pub(crate) fn register_workflow<W>(&mut self) -> Result<&mut Self, WorkflowRegistrationError>
-    where
-        W: WorkflowImplementation,
-        <W::Run as WorkflowDefinition>::Input: Send,
-    {
-        self.inner.register_workflow::<W>()?;
-        Ok(self)
-    }
-
-    pub(crate) fn register_workflow_with_factory<W, F>(
-        &mut self,
-        factory: F,
-    ) -> Result<&mut Self, WorkflowRegistrationError>
-    where
-        W: WorkflowImplementation,
-        <W::Run as WorkflowDefinition>::Input: Send,
-        F: Fn() -> W + Send + Sync + 'static,
-    {
-        self.inner.register_workflow_with_factory::<W, F>(factory)?;
-        Ok(self)
     }
 
     /// Create a handle that can be used to submit workflows. Useful when workflows need to be
@@ -1093,26 +1093,9 @@ where
     }
 }
 
-pub(crate) fn build_fake_sdk(mock_cfg: MockPollCfg) -> temporalio_sdk::Worker {
-    let mut mock = build_mock_pollers(mock_cfg);
-    mock.worker_cfg(|c| {
-        c.max_cached_workflows = 1;
-        c.ignore_evicts_on_shutdown = false;
-    });
-    let core = mock_worker(mock);
-    let client_options = ClientOptions::new(core.get_config().namespace.clone())
-        .data_converter(DataConverter::default())
-        .build();
-    let worker_options = WorkerOptions::new(core.get_config().task_queue.clone())
-        .worker_interceptor(FailOnNondeterminismInterceptor {})
-        .build();
-    Worker::new_from_core_options(Arc::new(core), client_options, worker_options)
-        .expect("mock worker options are valid")
-}
-
-pub(crate) fn build_fake_sdk_intercepted(
+pub(crate) fn build_fake_sdk_with_options(
     mock_cfg: MockPollCfg,
-    interceptor: impl WorkerInterceptor + 'static,
+    options_mutator: impl FnOnce(&mut WorkerOptions),
 ) -> temporalio_sdk::Worker {
     let mut mock = build_mock_pollers(mock_cfg);
     mock.worker_cfg(|c| {
@@ -1123,20 +1106,40 @@ pub(crate) fn build_fake_sdk_intercepted(
     let client_options = ClientOptions::new(core.get_config().namespace.clone())
         .data_converter(DataConverter::default())
         .build();
-    let worker_options = WorkerOptions::new(core.get_config().task_queue.clone())
-        .worker_interceptor(interceptor)
+    let mut worker_options = WorkerOptions::new(core.get_config().task_queue.clone())
+        .worker_interceptor(FailOnNondeterminismInterceptor {})
         .build();
+    options_mutator(&mut worker_options);
     Worker::new_from_core_options(Arc::new(core), client_options, worker_options)
         .expect("mock worker options are valid")
 }
 
-pub(crate) fn mock_sdk(poll_cfg: MockPollCfg) -> TestWorker {
-    mock_sdk_cfg(poll_cfg, |_| {})
+pub(crate) fn build_fake_sdk_intercepted_with_options(
+    mock_cfg: MockPollCfg,
+    interceptor: impl WorkerInterceptor + 'static,
+    options_mutator: impl FnOnce(&mut WorkerOptions),
+) -> temporalio_sdk::Worker {
+    let mut mock = build_mock_pollers(mock_cfg);
+    mock.worker_cfg(|c| {
+        c.max_cached_workflows = 1;
+        c.ignore_evicts_on_shutdown = false;
+    });
+    let core = mock_worker(mock);
+    let client_options = ClientOptions::new(core.get_config().namespace.clone())
+        .data_converter(DataConverter::default())
+        .build();
+    let mut worker_options = WorkerOptions::new(core.get_config().task_queue.clone())
+        .worker_interceptor(interceptor)
+        .build();
+    options_mutator(&mut worker_options);
+    Worker::new_from_core_options(Arc::new(core), client_options, worker_options)
+        .expect("mock worker options are valid")
 }
 
-pub(crate) fn mock_sdk_cfg(
+pub(crate) fn mock_sdk_cfg_with_options(
     mut poll_cfg: MockPollCfg,
     mutator: impl FnOnce(&mut WorkerConfig),
+    options_mutator: impl FnOnce(&mut WorkerOptions),
 ) -> TestWorker {
     poll_cfg.using_rust_sdk = true;
     let mut mock = build_mock_pollers(poll_cfg);
@@ -1146,9 +1149,10 @@ pub(crate) fn mock_sdk_cfg(
     let client_options = ClientOptions::new(core.get_config().namespace.clone())
         .data_converter(DataConverter::default())
         .build();
-    let worker_options = WorkerOptions::new(core.get_config().task_queue.clone())
+    let mut worker_options = WorkerOptions::new(core.get_config().task_queue.clone())
         .worker_interceptor(interceptor_router.clone())
         .build();
+    options_mutator(&mut worker_options);
     let sdk = Worker::new_from_core_options(Arc::new(core), client_options, worker_options)
         .expect("mock worker options are valid");
     TestWorker::new_with_interceptor_router(sdk, interceptor_router)

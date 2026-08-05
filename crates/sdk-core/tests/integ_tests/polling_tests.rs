@@ -287,12 +287,12 @@ async fn small_workflow_slots_and_pollers(#[values(false, true)] use_autoscaling
     }
     starter.sdk_config.activity_task_poller_behavior = Some(PollerBehavior::SimpleMaximum(1));
     starter.sdk_config.tuner = Arc::new(TunerHolder::fixed_size(2, 1, 1, 1));
-    starter.sdk_config.register_activities(StdActivities);
-    let mut worker = starter.worker().await;
-
-    worker
+    starter
+        .sdk_config
+        .register_activities(StdActivities)
         .register_workflow::<OnlyOneWorkflowSlotAndTwoPollers>()
         .unwrap();
+    let mut worker = starter.worker().await;
     let task_queue = starter.get_task_queue().to_owned();
     worker
         .submit_workflow(

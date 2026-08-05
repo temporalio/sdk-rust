@@ -37,7 +37,6 @@ use temporalio_common::{
             workflowservice::v1::{ResetStickyTaskQueueRequest, ResetWorkflowExecutionRequest},
         },
     },
-    worker::WorkerTaskTypes,
 };
 use temporalio_macros::{activities, workflow, workflow_methods};
 use temporalio_sdk::{
@@ -660,7 +659,6 @@ async fn update_with_local_acts() {
     // Short task timeout to get activities to heartbeat without taking ages
     starter.workflow_options.task_timeout = Some(Duration::from_secs(1));
     starter.sdk_config.register_activities(StdActivities);
-    let mut worker = starter.worker().await;
 
     #[workflow]
     #[derive(Default)]
@@ -696,7 +694,11 @@ async fn update_with_local_acts() {
         }
     }
 
-    worker.register_workflow::<UpdateWithLocalActsWf>().unwrap();
+    starter
+        .sdk_config
+        .register_workflow::<UpdateWithLocalActsWf>()
+        .unwrap();
+    let mut worker = starter.worker().await;
     let task_queue = starter.get_task_queue().to_owned();
     let handle = worker
         .submit_workflow(
@@ -738,8 +740,6 @@ async fn update_with_local_acts() {
 async fn update_rejection_sdk() {
     let wf_name = "update_rejection_sdk";
     let mut starter = CoreWfStarter::new(wf_name);
-    starter.sdk_config.task_types = WorkerTaskTypes::workflow_only();
-    let mut worker = starter.worker().await;
     #[workflow]
     #[derive(Default)]
     struct UpdateRejectionSdkWf;
@@ -770,7 +770,11 @@ async fn update_rejection_sdk() {
         }
     }
 
-    worker.register_workflow::<UpdateRejectionSdkWf>().unwrap();
+    starter
+        .sdk_config
+        .register_workflow::<UpdateRejectionSdkWf>()
+        .unwrap();
+    let mut worker = starter.worker().await;
     let task_queue = starter.get_task_queue().to_owned();
     let handle = worker
         .submit_workflow(
@@ -801,8 +805,6 @@ async fn update_rejection_sdk() {
 async fn update_fail_sdk() {
     let wf_name = "update_fail_sdk";
     let mut starter = CoreWfStarter::new(wf_name);
-    starter.sdk_config.task_types = WorkerTaskTypes::workflow_only();
-    let mut worker = starter.worker().await;
     #[workflow]
     #[derive(Default)]
     struct UpdateFailSdkWf;
@@ -824,7 +826,11 @@ async fn update_fail_sdk() {
         }
     }
 
-    worker.register_workflow::<UpdateFailSdkWf>().unwrap();
+    starter
+        .sdk_config
+        .register_workflow::<UpdateFailSdkWf>()
+        .unwrap();
+    let mut worker = starter.worker().await;
     let task_queue = starter.get_task_queue().to_owned();
     let handle = worker
         .submit_workflow(
@@ -855,7 +861,10 @@ async fn update_fail_sdk() {
 async fn unknown_update_rejected_sdk() {
     let wf_name = "unknown_update_rejected_sdk";
     let mut starter = CoreWfStarter::new(wf_name);
-    starter.sdk_config.task_types = WorkerTaskTypes::workflow_only();
+    starter
+        .sdk_config
+        .register_workflow::<UnknownUpdateRejectedSdkWf>()
+        .unwrap();
     let mut worker = starter.worker().await;
     let client = starter.get_client().await;
 
@@ -882,9 +891,6 @@ async fn unknown_update_rejected_sdk() {
         }
     }
 
-    worker
-        .register_workflow::<UnknownUpdateRejectedSdkWf>()
-        .unwrap();
     let task_queue = starter.get_task_queue().to_owned();
     let handle = worker
         .submit_workflow(
@@ -930,8 +936,6 @@ async fn unknown_update_rejected_sdk() {
 async fn update_timer_sequence() {
     let wf_name = "update_timer_sequence";
     let mut starter = CoreWfStarter::new(wf_name);
-    starter.sdk_config.task_types = WorkerTaskTypes::workflow_only();
-    let mut worker = starter.worker().await;
     #[workflow]
     #[derive(Default)]
     struct UpdateTimerSequenceWf {
@@ -958,7 +962,11 @@ async fn update_timer_sequence() {
         }
     }
 
-    worker.register_workflow::<UpdateTimerSequenceWf>().unwrap();
+    starter
+        .sdk_config
+        .register_workflow::<UpdateTimerSequenceWf>()
+        .unwrap();
+    let mut worker = starter.worker().await;
     let task_queue = starter.get_task_queue().to_owned();
     let handle = worker
         .submit_workflow(
@@ -989,8 +997,11 @@ async fn update_timer_sequence() {
 async fn task_failure_during_validation() {
     let wf_name = "task_failure_during_validation";
     let mut starter = CoreWfStarter::new(wf_name);
-    starter.sdk_config.task_types = WorkerTaskTypes::workflow_only();
     starter.workflow_options.task_timeout = Some(Duration::from_secs(1));
+    starter
+        .sdk_config
+        .register_workflow::<TaskFailureDuringValidationWf>()
+        .unwrap();
     let mut worker = starter.worker().await;
     #[workflow]
     #[derive(Default)]
@@ -1029,9 +1040,6 @@ async fn task_failure_during_validation() {
         }
     }
 
-    worker
-        .register_workflow::<TaskFailureDuringValidationWf>()
-        .unwrap();
     let task_queue = starter.get_task_queue().to_owned();
     let handle = worker
         .submit_workflow(
@@ -1161,8 +1169,11 @@ async fn task_failure_during_update_handler() {
 async fn task_failure_after_update() {
     let wf_name = "task_failure_after_update";
     let mut starter = CoreWfStarter::new(wf_name);
-    starter.sdk_config.task_types = WorkerTaskTypes::workflow_only();
     starter.workflow_options.task_timeout = Some(Duration::from_secs(1));
+    starter
+        .sdk_config
+        .register_workflow::<TaskFailureAfterUpdateWf>()
+        .unwrap();
     let mut worker = starter.worker().await;
     #[workflow]
     #[derive(Default)]
@@ -1189,9 +1200,6 @@ async fn task_failure_after_update() {
         }
     }
 
-    worker
-        .register_workflow::<TaskFailureAfterUpdateWf>()
-        .unwrap();
     let task_queue = starter.get_task_queue().to_owned();
     let handle = worker
         .submit_workflow(
@@ -1240,6 +1248,10 @@ async fn worker_restarted_in_middle_of_update() {
     }
 
     starter.sdk_config.register_activities(BlockingActivities);
+    starter
+        .sdk_config
+        .register_workflow::<WorkerRestartedInMiddleOfUpdateWf>()
+        .unwrap();
     let mut worker = starter.worker().await;
     let client = starter.get_client().await;
 
@@ -1277,9 +1289,6 @@ async fn worker_restarted_in_middle_of_update() {
         }
     }
 
-    worker
-        .register_workflow::<WorkerRestartedInMiddleOfUpdateWf>()
-        .unwrap();
     let task_queue = starter.get_task_queue().to_owned();
     let handle = worker
         .submit_workflow(
@@ -1349,7 +1358,6 @@ async fn update_after_empty_wft() {
     let wf_name = "update_after_empty_wft";
     let mut starter = CoreWfStarter::new(wf_name);
     starter.sdk_config.register_activities(StdActivities);
-    let mut worker = starter.worker().await;
 
     static ACT_STARTED: AtomicBool = AtomicBool::new(false);
 
@@ -1403,7 +1411,11 @@ async fn update_after_empty_wft() {
         }
     }
 
-    worker.register_workflow::<UpdateAfterEmptyWftWf>().unwrap();
+    starter
+        .sdk_config
+        .register_workflow::<UpdateAfterEmptyWftWf>()
+        .unwrap();
+    let mut worker = starter.worker().await;
     let task_queue = starter.get_task_queue().to_owned();
     let handle = worker
         .submit_workflow(
@@ -1445,6 +1457,10 @@ async fn update_lost_on_activity_mismatch() {
     let wf_name = "update_lost_on_activity_mismatch";
     let mut starter = CoreWfStarter::new(wf_name);
     starter.sdk_config.register_activities(StdActivities);
+    starter
+        .sdk_config
+        .register_workflow::<UpdateLostOnActivityMismatchWf>()
+        .unwrap();
     let mut worker = starter.worker().await;
 
     #[workflow]
@@ -1478,9 +1494,6 @@ async fn update_lost_on_activity_mismatch() {
         }
     }
 
-    worker
-        .register_workflow::<UpdateLostOnActivityMismatchWf>()
-        .unwrap();
     let core_worker = worker.core_worker();
     let task_queue = starter.get_task_queue().to_owned();
     let handle = worker

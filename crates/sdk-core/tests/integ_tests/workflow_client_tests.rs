@@ -13,7 +13,7 @@ use temporalio_client::{
     WorkflowCountOptions, WorkflowListOptions, WorkflowStartOptions, WorkflowTerminateOptions,
     errors::WorkflowStartError,
 };
-use temporalio_common::{data_converters::RawValue, worker::WorkerTaskTypes};
+use temporalio_common::data_converters::RawValue;
 use temporalio_macros::{workflow, workflow_methods};
 use temporalio_sdk::{WorkflowContext, WorkflowResult};
 
@@ -98,10 +98,12 @@ async fn client_interceptor_start_workflow() {
 async fn list_workflows(#[case] limit: Option<usize>) {
     let test_name = "list_workflows_returns_started_workflows";
     let mut starter = CoreWfStarter::new(test_name);
-    starter.sdk_config.task_types = WorkerTaskTypes::workflow_only();
+    starter
+        .sdk_config
+        .register_workflow::<EmptyWorkflow>()
+        .unwrap();
     let client = starter.get_client().await;
     let mut worker = starter.worker().await;
-    worker.register_workflow::<EmptyWorkflow>().unwrap();
 
     let suffix = rand_6_chars();
     let num_workflows = 5;

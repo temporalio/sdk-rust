@@ -73,6 +73,8 @@ to docs, or any other relevant information.
   `NexusOperationOptions::builder()` to construct Nexus operation options.
 * `WorkflowContext::wait_condition` now returns `Result<(), WorkflowCancellationError>` instead of
   `()` so that workflow cancellation can be propagated to the caller.
+* Workflow and activity implementations must now be registered through `WorkerOptions` before
+  constructing a `Worker`; the corresponding registration methods on `Worker` have been removed.
 
 ### Added
 * `WorkflowCancellationToken` for deterministic cancellation of workflow operations.
@@ -86,6 +88,9 @@ to docs, or any other relevant information.
 ### Fixed
 * Panics from update validators now reject the update instead of repeatedly failing workflow
   tasks.
+* Rust SDK workers now derive enabled task types from registered workflows and activities. The
+  task types can no longer be configured separately, preventing mismatched poll loops from hanging
+  worker shutdown.
 
 ## [0.6.0] - 2026-08-04
 ## [0.5.0]

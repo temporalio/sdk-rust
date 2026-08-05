@@ -1,19 +1,16 @@
-use crate::common::{CoreWfStarter, build_fake_sdk, init_core_and_create_wf};
+use crate::common::{CoreWfStarter, init_core_and_create_wf};
 use futures_util::{StreamExt, stream::FuturesUnordered};
 use std::{future::Future, pin::Pin, time::Duration};
 use temporalio_client::WorkflowStartOptions;
-use temporalio_common::{
-    protos::{
-        coresdk::{
-            workflow_commands::{CancelTimer, CompleteWorkflowExecution, StartTimer},
-            workflow_completion::WorkflowActivationCompletion,
-        },
-        temporal::api::{
-            enums::v1::{CommandType, EventType, WorkflowTaskFailedCause},
-            failure::v1::Failure,
-        },
+use temporalio_common::protos::{
+    coresdk::{
+        workflow_commands::{CancelTimer, CompleteWorkflowExecution, StartTimer},
+        workflow_completion::WorkflowActivationCompletion,
     },
-    worker::WorkerTaskTypes,
+    temporal::api::{
+        enums::v1::{CommandType, EventType, WorkflowTaskFailedCause},
+        failure::v1::Failure,
+    },
 };
 use temporalio_macros::{workflow, workflow_methods};
 use temporalio_sdk::{CancellableFuture, WorkflowContext, WorkflowResult};
@@ -40,9 +37,8 @@ impl TimerWf {
 async fn timer_workflow_workflow_driver() {
     let wf_name = "timer_wf_new";
     let mut starter = CoreWfStarter::new(wf_name);
-    starter.sdk_config.task_types = WorkerTaskTypes::workflow_only();
+    starter.sdk_config.register_workflow::<TimerWf>().unwrap();
     let mut worker = starter.worker().await;
-    worker.register_workflow::<TimerWf>().unwrap();
 
     let task_queue = starter.get_task_queue().to_owned();
     let workflow_id = starter.get_task_queue().to_owned();
@@ -61,7 +57,6 @@ async fn timer_workflow_workflow_driver() {
 async fn timer_workflow_manual() {
     let mut starter = init_core_and_create_wf("timer_workflow").await;
     let core = starter.get_worker().await;
-    starter.sdk_config.task_types = WorkerTaskTypes::workflow_only();
     let task = core.poll_workflow_activation().await.unwrap();
     core.complete_workflow_activation(WorkflowActivationCompletion::from_cmds(
         task.run_id,
@@ -85,7 +80,6 @@ async fn timer_workflow_manual() {
 async fn timer_cancel_workflow() {
     let mut starter = init_core_and_create_wf("timer_cancel_workflow").await;
     let core = starter.get_worker().await;
-    starter.sdk_config.task_types = WorkerTaskTypes::workflow_only();
     let task = core.poll_workflow_activation().await.unwrap();
     core.complete_workflow_activation(WorkflowActivationCompletion::from_cmds(
         task.run_id,
@@ -152,9 +146,11 @@ impl ParallelTimerWf {
 async fn parallel_timers() {
     let wf_name = "parallel_timers";
     let mut starter = CoreWfStarter::new(wf_name);
-    starter.sdk_config.task_types = WorkerTaskTypes::workflow_only();
+    starter
+        .sdk_config
+        .register_workflow::<ParallelTimerWf>()
+        .unwrap();
     let mut worker = starter.worker().await;
-    worker.register_workflow::<ParallelTimerWf>().unwrap();
 
     starter.start_with_worker(wf_name, &mut worker).await;
     worker.run_until_done().await.unwrap();
@@ -185,10 +181,12 @@ async fn cancel_unpolled_timer_after_both_timers_fire_same_activation() {
     t.add_workflow_task_completed();
     t.add_workflow_execution_completed();
 
-    let mut worker = build_fake_sdk(MockPollCfg::from_hist_builder(t));
-    worker
-        .register_workflow::<CancelAlreadyFiredTimerWf>()
-        .unwrap();
+    let mut worker =
+        crate::common::build_fake_sdk_with_options(MockPollCfg::from_hist_builder(t), |options| {
+            options
+                .register_workflow::<CancelAlreadyFiredTimerWf>()
+                .unwrap();
+        });
     worker.run().await.unwrap();
 }
 
@@ -224,8 +222,9 @@ async fn test_fire_happy_path_inc() {
             });
     });
 
-    let mut worker = build_fake_sdk(mock_cfg);
-    worker.register_workflow::<HappyTimerWf>().unwrap();
+    let mut worker = crate::common::build_fake_sdk_with_options(mock_cfg, |options| {
+        options.register_workflow::<HappyTimerWf>().unwrap();
+    });
     worker.run().await.unwrap();
 }
 
@@ -252,8 +251,9 @@ async fn mismatched_timer_ids_errors() {
             && matches!(f, Some(Failure {message, .. })
         if message.contains("Timer fired event did not have expected timer id 1"))
     });
-    let mut worker = build_fake_sdk(mock_cfg);
-    worker.register_workflow::<MismatchedTimerWf>().unwrap();
+    let mut worker = crate::common::build_fake_sdk_with_options(mock_cfg, |options| {
+        options.register_workflow::<MismatchedTimerWf>().unwrap();
+    });
     worker.run().await.unwrap();
 }
 
@@ -294,8 +294,9 @@ async fn incremental_cancellation() {
             });
     });
 
-    let mut worker = build_fake_sdk(mock_cfg);
-    worker.register_workflow::<CancelTimerWf>().unwrap();
+    let mut worker = crate::common::build_fake_sdk_with_options(mock_cfg, |options| {
+        options.register_workflow::<CancelTimerWf>().unwrap();
+    });
     worker.run().await.unwrap();
 }
 
@@ -330,8 +331,9 @@ async fn cancel_before_sent_to_server() {
             );
         });
     });
-    let mut worker = build_fake_sdk(mock_cfg);
-    worker.register_workflow::<CancelBeforeSentWf>().unwrap();
+    let mut worker = crate::common::build_fake_sdk_with_options(mock_cfg, |options| {
+        options.register_workflow::<CancelBeforeSentWf>().unwrap();
+    });
     worker.run().await.unwrap();
 }
 
@@ -372,10 +374,11 @@ impl WaitConditionWakerWf {
 async fn wait_condition_waker_in_futures_unordered() {
     let t = canned_histories::single_timer_wf_completes("1");
     let mock_cfg = MockPollCfg::from_hist_builder(t);
-    let mut worker = build_fake_sdk(mock_cfg);
+    let mut worker = crate::common::build_fake_sdk_with_options(mock_cfg, |options| {
+        options.register_workflow::<WaitConditionWakerWf>().unwrap();
+    });
     // FuturesUnordered uses internal wakers that forward wake calls outside the
     // SdkWakeGuard scope.
     worker.set_detect_nondeterministic_futures(false);
-    worker.register_workflow::<WaitConditionWakerWf>().unwrap();
     worker.run().await.unwrap();
 }

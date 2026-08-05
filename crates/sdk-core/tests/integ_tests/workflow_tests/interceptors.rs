@@ -12,13 +12,10 @@ use std::{
 use temporalio_client::{
     WorkflowExecuteUpdateOptions, WorkflowQueryOptions, WorkflowSignalOptions, WorkflowStartOptions,
 };
-use temporalio_common::{
-    protos::temporal::api::{
-        common::v1::Payload,
-        enums::v1::{EventType, WorkflowTaskFailedCause},
-        history::v1::{History, history_event::Attributes::WorkflowTaskFailedEventAttributes},
-    },
-    worker::WorkerTaskTypes,
+use temporalio_common::protos::temporal::api::{
+    common::v1::Payload,
+    enums::v1::{EventType, WorkflowTaskFailedCause},
+    history::v1::{History, history_event::Attributes::WorkflowTaskFailedEventAttributes},
 };
 use temporalio_macros::{workflow, workflow_methods};
 use temporalio_sdk::{
@@ -223,18 +220,14 @@ impl WorkflowInterceptor for MutatingWorkflowInterceptor {
 #[tokio::test]
 async fn workflow_interceptors_mutate_inputs_and_replace_outputs() {
     let mut starter = CoreWfStarter::new("workflow_interceptors_mutate_inputs_and_replace_outputs");
-    starter.sdk_config.task_types = WorkerTaskTypes::workflow_only();
-    starter
-        .sdk_config
-        .register_workflow::<InboundInterceptorWorkflow>()
-        .unwrap();
-
     let signal_post_handler_done = Arc::new(Notify::new());
     let saw_query_history_replay = Arc::new(Mutex::new(None));
     let signal_post_handler_done_ref = signal_post_handler_done.clone();
     let saw_query_history_replay_ref = saw_query_history_replay.clone();
     starter
         .sdk_config
+        .register_workflow::<InboundInterceptorWorkflow>()
+        .unwrap()
         .register_workflow_interceptors(vec![WorkflowInterceptorConstructor::new(move |_| {
             MutatingWorkflowInterceptor {
                 signal_post_handler_done: signal_post_handler_done_ref.clone(),
@@ -389,25 +382,24 @@ impl WorkflowInterceptor for RecordingWorkflowInterceptor {
 #[tokio::test]
 async fn workflow_interceptors_wrap_execute_in_order() {
     let mut starter = CoreWfStarter::new("workflow_interceptors_wrap_execute_in_order");
-    starter.sdk_config.task_types = WorkerTaskTypes::workflow_only();
-    starter
-        .sdk_config
-        .register_workflow::<InboundInterceptorOrderWorkflow>()
-        .unwrap();
 
     let records = Arc::new(Mutex::new(Vec::new()));
     let outer_records = records.clone();
     let inner_records = records.clone();
-    starter.sdk_config.register_workflow_interceptors(vec![
-        WorkflowInterceptorConstructor::new(move |_| RecordingWorkflowInterceptor {
-            name: "outer",
-            records: outer_records.clone(),
-        }),
-        WorkflowInterceptorConstructor::new(move |_| RecordingWorkflowInterceptor {
-            name: "inner",
-            records: inner_records.clone(),
-        }),
-    ]);
+    starter
+        .sdk_config
+        .register_workflow::<InboundInterceptorOrderWorkflow>()
+        .unwrap()
+        .register_workflow_interceptors(vec![
+            WorkflowInterceptorConstructor::new(move |_| RecordingWorkflowInterceptor {
+                name: "outer",
+                records: outer_records.clone(),
+            }),
+            WorkflowInterceptorConstructor::new(move |_| RecordingWorkflowInterceptor {
+                name: "inner",
+                records: inner_records.clone(),
+            }),
+        ]);
     let mut worker = starter.worker().await;
 
     let task_queue = starter.get_task_queue().to_owned();
@@ -494,16 +486,13 @@ impl WorkflowInterceptor for InitInputMutationInterceptor {
 #[tokio::test]
 async fn workflow_initialize_interceptor_mutates_init_input() {
     let mut starter = CoreWfStarter::new("workflow_initialize_interceptor_mutates_init_input");
-    starter.sdk_config.task_types = WorkerTaskTypes::workflow_only();
-    starter
-        .sdk_config
-        .register_workflow::<InitInputInterceptorWorkflow>()
-        .unwrap();
 
     let received_input = Arc::new(AtomicUsize::new(0));
     let received_input_ref = received_input.clone();
     starter
         .sdk_config
+        .register_workflow::<InitInputInterceptorWorkflow>()
+        .unwrap()
         .register_workflow_interceptors(vec![WorkflowInterceptorConstructor::new(move |_| {
             InitInputMutationInterceptor {
                 received_input: received_input_ref.clone(),
@@ -772,13 +761,11 @@ impl WorkflowInterceptor for SdkTimerBeforeNextInterceptor {
 #[tokio::test]
 async fn sdk_future_before_next_produces_an_activation() {
     let mut starter = CoreWfStarter::new("sdk_future_before_next_produces_an_activation");
-    starter.sdk_config.task_types = WorkerTaskTypes::workflow_only();
+
     starter
         .sdk_config
         .register_workflow::<ConstructionWakeWorkflow>()
-        .unwrap();
-    starter
-        .sdk_config
+        .unwrap()
         .register_workflow_interceptors(vec![WorkflowInterceptorConstructor::new(|_| {
             SdkTimerBeforeNextInterceptor
         })]);
@@ -819,7 +806,6 @@ async fn nondeterministic_future_detection_is_respected_for_interceptors(
         "nde_future_detection_{}",
         detect_nondeterministic_futures
     ));
-    starter.sdk_config.task_types = WorkerTaskTypes::workflow_only();
     starter.sdk_config.detect_nondeterministic_futures = detect_nondeterministic_futures;
     starter
         .sdk_config
@@ -875,7 +861,6 @@ async fn nondeterministic_future_detection_is_respected_for_async_signal_interce
         "async_signal_nde_future_detection_{}",
         detect_nondeterministic_futures
     ));
-    starter.sdk_config.task_types = WorkerTaskTypes::workflow_only();
     starter.sdk_config.detect_nondeterministic_futures = detect_nondeterministic_futures;
     starter
         .sdk_config
@@ -937,7 +922,6 @@ async fn nondeterministic_future_detection_is_respected_for_async_update_interce
         "async_update_nde_future_detection_{}",
         detect_nondeterministic_futures
     ));
-    starter.sdk_config.task_types = WorkerTaskTypes::workflow_only();
     starter.sdk_config.detect_nondeterministic_futures = detect_nondeterministic_futures;
     starter
         .sdk_config
@@ -1023,11 +1007,6 @@ impl WorkflowInterceptor for ConstructionPollingInterceptor {
 async fn workflow_interceptors_are_polled_once_during_construction() {
     let mut starter =
         CoreWfStarter::new("workflow_interceptors_are_polled_once_during_construction");
-    starter.sdk_config.task_types = WorkerTaskTypes::workflow_only();
-    starter
-        .sdk_config
-        .register_workflow::<InterceptorConstructionPollingWorkflow>()
-        .unwrap();
 
     let sync_polls = Arc::new(AtomicUsize::new(0));
     let deferred_polls = Arc::new(AtomicUsize::new(0));
@@ -1037,6 +1016,8 @@ async fn workflow_interceptors_are_polled_once_during_construction() {
     let async_polls_ref = async_polls.clone();
     starter
         .sdk_config
+        .register_workflow::<InterceptorConstructionPollingWorkflow>()
+        .unwrap()
         .register_workflow_interceptors(vec![WorkflowInterceptorConstructor::new(move |_| {
             ConstructionPollingInterceptor {
                 sync_polls: sync_polls_ref.clone(),
@@ -1165,15 +1146,12 @@ async fn workflow_interceptor_constructors_create_unified_per_instance_intercept
     let mut starter = CoreWfStarter::new(
         "workflow_interceptor_constructors_create_unified_per_instance_interceptors",
     );
-    starter.sdk_config.task_types = WorkerTaskTypes::workflow_only();
-    starter
-        .sdk_config
-        .register_workflow::<ConstructorOutboundInterceptorWorkflow>()
-        .unwrap();
 
     let expected_task_queue = starter.get_task_queue().to_owned();
     starter
         .sdk_config
+        .register_workflow::<ConstructorOutboundInterceptorWorkflow>()
+        .unwrap()
         .register_workflow_interceptors(vec![WorkflowInterceptorConstructor::new(move |ctx| {
             assert_eq!(
                 ctx.workflow_type(),
@@ -1292,16 +1270,13 @@ async fn inbound_interceptor_context_operations_use_the_outbound_chain_around_ne
     let mut starter = CoreWfStarter::new(
         "inbound_interceptor_context_operations_use_the_outbound_chain_around_next",
     );
-    starter.sdk_config.task_types = WorkerTaskTypes::workflow_only();
-    starter
-        .sdk_config
-        .register_workflow::<InboundContextOutboundWorkflow>()
-        .unwrap();
 
     let events = Arc::new(Mutex::new(Vec::new()));
     let events_ref = events.clone();
     starter
         .sdk_config
+        .register_workflow::<InboundContextOutboundWorkflow>()
+        .unwrap()
         .register_workflow_interceptors(vec![WorkflowInterceptorConstructor::new(move |_| {
             InboundContextOutboundInterceptor {
                 events: events_ref.clone(),
@@ -1458,13 +1433,11 @@ impl WorkflowInterceptor for OutboundActivityInterceptor {
 async fn workflow_outbound_interceptors_mutate_activity_calls_and_results() {
     let mut starter =
         CoreWfStarter::new("workflow_outbound_interceptors_mutate_activity_calls_and_results");
-    starter.sdk_config.register_activities(StdActivities);
     starter
         .sdk_config
+        .register_activities(StdActivities)
         .register_workflow::<OutboundActivityInterceptorWorkflow>()
-        .unwrap();
-    starter
-        .sdk_config
+        .unwrap()
         .register_workflow_interceptors(vec![WorkflowInterceptorConstructor::new(|_| {
             OutboundActivityInterceptor
         })]);
@@ -1559,20 +1532,17 @@ impl WorkflowInterceptor for OutboundChildInterceptor {
 async fn workflow_outbound_interceptors_wrap_child_start_and_completion() {
     let mut starter =
         CoreWfStarter::new("workflow_outbound_interceptors_wrap_child_start_and_completion");
-    starter.sdk_config.task_types = WorkerTaskTypes::workflow_only();
+
     starter
         .sdk_config
         .register_workflow::<OutboundChildInterceptorParent>()
-        .unwrap();
-    starter
-        .sdk_config
+        .unwrap()
         .register_workflow::<OutboundChildInterceptorChild>()
-        .unwrap();
-    starter
-        .sdk_config
+        .unwrap()
         .register_workflow_interceptors(vec![WorkflowInterceptorConstructor::new(|_| {
             OutboundChildInterceptor
         })]);
+
     let mut worker = starter.worker().await;
 
     let handle = worker

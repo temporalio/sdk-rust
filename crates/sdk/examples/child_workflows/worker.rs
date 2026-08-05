@@ -3,7 +3,6 @@ mod workflows;
 use temporalio_client::{
     Client, ClientOptions, Connection, envconfig::LoadClientConfigProfileOptions,
 };
-use temporalio_common::worker::WorkerTaskTypes;
 use temporalio_sdk::{Runtime, Worker, WorkerOptions};
 use workflows::{GreetingChildWorkflow, ParentWorkflow};
 
@@ -18,7 +17,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let worker_options = WorkerOptions::new("child-workflows")
         .register_workflow::<ParentWorkflow>()?
         .register_workflow::<GreetingChildWorkflow>()?
-        .task_types(WorkerTaskTypes::workflow_only())
         .build();
 
     let mut worker = Worker::new(&runtime, client, worker_options)?;

@@ -492,7 +492,8 @@ impl ActivityDefinitions {
         self
     }
 
-    pub(crate) fn is_empty(&self) -> bool {
+    /// Returns whether no activities are registered.
+    pub fn is_empty(&self) -> bool {
         self.activities.is_empty()
     }
 

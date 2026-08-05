@@ -7,10 +7,7 @@ use temporalio_client::{
     UntypedSignal, UntypedUpdate, WorkflowDescribeOptions, WorkflowExecuteUpdateOptions,
     WorkflowQueryOptions, WorkflowSignalOptions, WorkflowStartOptions, errors::WorkflowStartError,
 };
-use temporalio_common::{
-    data_converters::{PayloadConverter, RawValue},
-    worker::WorkerTaskTypes,
-};
+use temporalio_common::data_converters::{PayloadConverter, RawValue};
 use temporalio_macros::{workflow, workflow_methods};
 use temporalio_sdk::{SyncWorkflowContext, WorkflowContext, WorkflowContextView, WorkflowResult};
 
@@ -133,9 +130,11 @@ impl InteractionWorkflow {
 async fn test_typed_signal() {
     let wf_name = InteractionWorkflow::name();
     let mut starter = CoreWfStarter::new(wf_name);
-    starter.sdk_config.task_types = WorkerTaskTypes::workflow_only();
+    starter
+        .sdk_config
+        .register_workflow::<InteractionWorkflow>()
+        .unwrap();
     let mut worker = starter.worker().await;
-    worker.register_workflow::<InteractionWorkflow>().unwrap();
 
     let task_queue = starter.get_task_queue().to_owned();
     let handle = worker
@@ -174,9 +173,11 @@ async fn test_typed_signal() {
 async fn test_typed_update() {
     let wf_name = InteractionWorkflow::name();
     let mut starter = CoreWfStarter::new(wf_name);
-    starter.sdk_config.task_types = WorkerTaskTypes::workflow_only();
+    starter
+        .sdk_config
+        .register_workflow::<InteractionWorkflow>()
+        .unwrap();
     let mut worker = starter.worker().await;
-    worker.register_workflow::<InteractionWorkflow>().unwrap();
 
     let task_queue = starter.get_task_queue().to_owned();
     let handle = worker
@@ -231,9 +232,11 @@ async fn test_typed_update() {
 async fn test_typed_query() {
     let wf_name = InteractionWorkflow::name();
     let mut starter = CoreWfStarter::new(wf_name);
-    starter.sdk_config.task_types = WorkerTaskTypes::workflow_only();
+    starter
+        .sdk_config
+        .register_workflow::<InteractionWorkflow>()
+        .unwrap();
     let mut worker = starter.worker().await;
-    worker.register_workflow::<InteractionWorkflow>().unwrap();
 
     let task_queue = starter.get_task_queue().to_owned();
     let handle = worker
@@ -298,9 +301,11 @@ async fn test_typed_query() {
 async fn test_update_validation() {
     let wf_name = InteractionWorkflow::name();
     let mut starter = CoreWfStarter::new(wf_name);
-    starter.sdk_config.task_types = WorkerTaskTypes::workflow_only();
+    starter
+        .sdk_config
+        .register_workflow::<InteractionWorkflow>()
+        .unwrap();
     let mut worker = starter.worker().await;
-    worker.register_workflow::<InteractionWorkflow>().unwrap();
 
     let task_queue = starter.get_task_queue().to_owned();
     let handle = worker
@@ -360,9 +365,11 @@ async fn test_update_validation() {
 async fn test_async_signal() {
     let wf_name = InteractionWorkflow::name();
     let mut starter = CoreWfStarter::new(wf_name);
-    starter.sdk_config.task_types = WorkerTaskTypes::workflow_only();
+    starter
+        .sdk_config
+        .register_workflow::<InteractionWorkflow>()
+        .unwrap();
     let mut worker = starter.worker().await;
-    worker.register_workflow::<InteractionWorkflow>().unwrap();
 
     let task_queue = starter.get_task_queue().to_owned();
     let handle = worker
@@ -422,9 +429,11 @@ async fn test_async_signal() {
 async fn test_fallible_query() {
     let wf_name = InteractionWorkflow::name();
     let mut starter = CoreWfStarter::new(wf_name);
-    starter.sdk_config.task_types = WorkerTaskTypes::workflow_only();
+    starter
+        .sdk_config
+        .register_workflow::<InteractionWorkflow>()
+        .unwrap();
     let mut worker = starter.worker().await;
-    worker.register_workflow::<InteractionWorkflow>().unwrap();
 
     let task_queue = starter.get_task_queue().to_owned();
     let handle = worker
@@ -489,9 +498,11 @@ async fn test_fallible_query() {
 async fn test_untyped_signal_query_update() {
     let wf_name = InteractionWorkflow::name();
     let mut starter = CoreWfStarter::new(wf_name);
-    starter.sdk_config.task_types = WorkerTaskTypes::workflow_only();
+    starter
+        .sdk_config
+        .register_workflow::<InteractionWorkflow>()
+        .unwrap();
     let mut worker = starter.worker().await;
-    worker.register_workflow::<InteractionWorkflow>().unwrap();
 
     let task_queue = starter.get_task_queue().to_owned();
     let handle = worker
@@ -562,9 +573,11 @@ async fn test_untyped_signal_query_update() {
 async fn test_typed_signal_query_update() {
     let wf_name = InteractionWorkflow::name();
     let mut starter = CoreWfStarter::new(wf_name);
-    starter.sdk_config.task_types = WorkerTaskTypes::workflow_only();
+    starter
+        .sdk_config
+        .register_workflow::<InteractionWorkflow>()
+        .unwrap();
     let mut worker = starter.worker().await;
-    worker.register_workflow::<InteractionWorkflow>().unwrap();
 
     let task_queue = starter.get_task_queue().to_owned();
     let wfid = format!("{}_typed", starter.get_task_queue());
@@ -646,11 +659,11 @@ impl ImmediatelyCompletingWf {
 async fn static_summary_and_details_visible_after_start() {
     let wf_name = "static_summary_and_details_visible_after_start";
     let mut starter = CoreWfStarter::new(wf_name);
-    starter.sdk_config.task_types = WorkerTaskTypes::workflow_only();
-    let mut worker = starter.worker().await;
-    worker
+    starter
+        .sdk_config
         .register_workflow::<ImmediatelyCompletingWf>()
         .unwrap();
+    let mut worker = starter.worker().await;
 
     let task_queue = starter.get_task_queue().to_owned();
     let handle = worker
@@ -723,12 +736,12 @@ fn client_with_interceptors(
 async fn client_interceptors_respect_registration_order() {
     let test_name = "client_interceptors_respect_registration_order";
     let mut starter = CoreWfStarter::new(test_name);
-    starter.sdk_config.task_types = WorkerTaskTypes::workflow_only();
-    let client = starter.get_client().await;
-    let mut worker = starter.worker().await;
-    worker
+    starter
+        .sdk_config
         .register_workflow::<ImmediatelyCompletingWf>()
         .unwrap();
+    let client = starter.get_client().await;
+    let mut worker = starter.worker().await;
     let task_queue = starter.get_task_queue().to_owned();
     let events = Arc::new(Mutex::new(Vec::new()));
 

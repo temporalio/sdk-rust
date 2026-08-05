@@ -250,12 +250,12 @@ async fn simple_plugin_configures_working_client_and_worker() {
         None,
         Some(client),
     );
-    starter.sdk_config.task_types = WorkerTaskTypes {
+    starter.set_core_task_types(WorkerTaskTypes {
         enable_workflows: true,
         enable_local_activities: true,
         enable_remote_activities: true,
         enable_nexus: false,
-    };
+    });
     let task_queue = starter.get_task_queue().to_owned();
     let mut worker = starter.worker().await;
     let workflow_id = format!("simple-plugin-{}", Uuid::new_v4());

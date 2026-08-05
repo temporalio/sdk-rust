@@ -387,6 +387,18 @@ mod tests {
     use temporalio_client::ClientOptions;
     use temporalio_common::protos::temporal::api::worker::v1::PluginInfo;
 
+    #[temporalio_macros::workflow]
+    #[derive(Default)]
+    struct PluginTestWorkflow;
+
+    #[temporalio_macros::workflow_methods]
+    impl PluginTestWorkflow {
+        #[run]
+        async fn run(_ctx: &mut crate::WorkflowContext<Self>) -> crate::WorkflowResult<()> {
+            Ok(())
+        }
+    }
+
     struct RecordingCombinedPlugin {
         order: Arc<Mutex<Vec<&'static str>>>,
     }
@@ -526,6 +538,8 @@ mod tests {
             .client_plugin(SameNameClientPlugin)
             .build();
         let mut worker_options = WorkerOptions::new("queue")
+            .register_workflow::<PluginTestWorkflow>()
+            .unwrap()
             .worker_plugin(RecordingWorkerPlugin {
                 name: "same-name",
                 value: "first",

@@ -7,7 +7,7 @@ use std::{
     time::Duration,
 };
 use temporalio_client::WorkflowStartOptions;
-use temporalio_common::{protos::temporal::api::enums::v1::EventType, worker::WorkerTaskTypes};
+use temporalio_common::protos::temporal::api::enums::v1::EventType;
 use temporalio_macros::{workflow, workflow_methods};
 use temporalio_sdk::{WorkflowContext, WorkflowResult};
 use temporalio_sdk_core::{PollerBehavior, TunerHolder};
@@ -17,10 +17,9 @@ use tokio::sync::Barrier;
 async fn timer_workflow_not_sticky() {
     let wf_name = "timer_wf_not_sticky";
     let mut starter = CoreWfStarter::new(wf_name);
-    starter.sdk_config.task_types = WorkerTaskTypes::workflow_only();
     starter.sdk_config.max_cached_workflows = 0_usize;
+    starter.sdk_config.register_workflow::<TimerWf>().unwrap();
     let mut worker = starter.worker().await;
-    worker.register_workflow::<TimerWf>().unwrap();
 
     let task_queue = starter.get_task_queue().to_owned();
     let workflow_id = starter.get_task_queue().to_owned();
@@ -62,19 +61,19 @@ async fn timer_workflow_timeout_on_sticky() {
     // on a not-sticky queue
     let wf_name = "timer_workflow_timeout_on_sticky";
     let mut starter = CoreWfStarter::new(wf_name);
-    starter.sdk_config.task_types = WorkerTaskTypes::workflow_only();
     starter.workflow_options.task_timeout = Some(Duration::from_secs(2));
-    let mut worker = starter.worker().await;
 
     let timed_out_once = Arc::new(AtomicBool::new(false));
     let run_ct = Arc::new(AtomicUsize::new(0));
     let run_ct_clone = run_ct.clone();
-    worker
+    starter
+        .sdk_config
         .register_workflow_with_factory(move || TimerTimeoutWf {
             timed_out_once: timed_out_once.clone(),
             run_ct: run_ct_clone.clone(),
         })
         .unwrap();
+    let mut worker = starter.worker().await;
 
     worker
         .submit_workflow(TimerTimeoutWf::run, (), starter.workflow_options.clone())
@@ -122,19 +121,19 @@ impl CacheMissWf {
 async fn cache_miss_ok() {
     let wf_name = "cache_miss_ok";
     let mut starter = CoreWfStarter::new(wf_name);
-    starter.sdk_config.task_types = WorkerTaskTypes::workflow_only();
     starter.sdk_config.tuner = Arc::new(TunerHolder::fixed_size(2, 1, 1, 1));
     starter.sdk_config.max_cached_workflows = 0_usize;
     starter.sdk_config.workflow_task_poller_behavior = Some(PollerBehavior::SimpleMaximum(1_usize));
-    let mut worker = starter.worker().await;
 
     let barr = Arc::new(Barrier::new(2));
     let barr_clone = barr.clone();
-    worker
+    starter
+        .sdk_config
         .register_workflow_with_factory(move || CacheMissWf {
             barr: barr_clone.clone(),
         })
         .unwrap();
+    let mut worker = starter.worker().await;
 
     let task_queue = starter.get_task_queue().to_owned();
     let handle = worker

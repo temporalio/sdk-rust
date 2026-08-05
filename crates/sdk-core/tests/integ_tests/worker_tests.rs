@@ -1,8 +1,9 @@
+use super::client_tests::make_ok_response;
 use crate::{
     common::{
         CoreWfStarter, activity_functions::StdActivities, fake_grpc_server::fake_server,
         get_integ_runtime_options, get_integ_server_options, get_integ_telem_options,
-        integ_namespace, mock_sdk_cfg,
+        integ_namespace,
     },
     shared_tests::{self, is_oversize_grpc_event},
 };
@@ -19,7 +20,7 @@ use std::{
     time::Duration,
 };
 use temporalio_client::{
-    Client, ClientOptions, Connection, PayloadLimitsOptions, WorkflowStartOptions,
+    Client, ClientOptions, Connection, PayloadLimitsOptions, RetryOptions, WorkflowStartOptions,
     errors::WorkflowGetResultError,
 };
 use temporalio_common::{
@@ -47,9 +48,11 @@ use temporalio_common::{
                     Attributes::{self as EventAttributes},
                 },
             },
+            namespace::v1::{NamespaceInfo, namespace_info::Capabilities},
             workflowservice::v1::{
-                GetWorkflowExecutionHistoryResponse, PollActivityTaskQueueResponse,
-                RespondActivityTaskCompletedResponse,
+                DescribeNamespaceResponse, GetWorkflowExecutionHistoryResponse,
+                PollActivityTaskQueueResponse, PollWorkflowTaskQueueResponse,
+                RespondActivityTaskCompletedResponse, ShutdownWorkerResponse,
             },
         },
     },
@@ -199,20 +202,20 @@ impl ResourceBasedNonStickyWf {
 async fn resource_based_few_pollers_guarantees_non_sticky_poll() {
     let wf_name = "resource_based_few_pollers_guarantees_non_sticky_poll";
     let mut starter = CoreWfStarter::new(wf_name);
-    starter.sdk_config.task_types = WorkerTaskTypes::workflow_only();
     // 3 pollers so the minimum slots of 2 can both be handed out to a sticky poller
     starter.sdk_config.workflow_task_poller_behavior = Some(PollerBehavior::SimpleMaximum(3_usize));
     // Set the limits to zero so it's essentially unwilling to hand out slots
     let mut tuner = ResourceBasedTuner::new(0.0, 0.0);
     tuner.with_workflow_slots_options(ResourceSlotOptions::new(2, 10, Duration::from_millis(0)));
     starter.sdk_config.tuner = Arc::new(tuner);
+    starter
+        .sdk_config
+        .register_workflow::<ResourceBasedNonStickyWf>()
+        .unwrap();
     let mut worker = starter.worker().await;
 
     // Workflow doesn't actually need to do anything. We just need to see that we don't get stuck
     // by assigning all slots to sticky pollers.
-    worker
-        .register_workflow::<ResourceBasedNonStickyWf>()
-        .unwrap();
     let task_queue = starter.get_task_queue().to_owned();
     for i in 0..20 {
         worker
@@ -235,9 +238,7 @@ async fn oversize_grpc_message() {
     let (telemopts, addr, _aborter) = prom_metrics(None);
     let runtime = CoreRuntime::new_assume_tokio(get_integ_runtime_options(telemopts)).unwrap();
     let mut starter = CoreWfStarter::new_with_runtime(wf_name, runtime);
-    starter.sdk_config.task_types = WorkerTaskTypes::workflow_only();
     starter.sdk_config.disable_payload_error_limit = true;
-    let mut core = starter.worker().await;
 
     let has_run = Arc::new(AtomicBool::new(false));
     let has_run_clone = has_run.clone();
@@ -261,10 +262,13 @@ async fn oversize_grpc_message() {
         }
     }
 
-    core.register_workflow_with_factory(move || OversizeGrpcMessageWf {
-        has_run: has_run_clone.clone(),
-    })
-    .unwrap();
+    starter
+        .sdk_config
+        .register_workflow_with_factory(move || OversizeGrpcMessageWf {
+            has_run: has_run_clone.clone(),
+        })
+        .unwrap();
+    let mut core = starter.worker().await;
     starter
         .start_with_worker(OversizeGrpcMessageWf::name(), &mut core)
         .await;
@@ -328,8 +332,6 @@ fn is_wft_payloads_too_large(e: &HistoryEvent) -> bool {
 async fn oversize_wft_payload_fails_retryably_then_completes() {
     let wf_name = "oversize_wft_payload_retryable";
     let mut starter = CoreWfStarter::new(wf_name);
-    starter.sdk_config.task_types = WorkerTaskTypes::workflow_only();
-    let mut core = starter.worker().await;
 
     let has_run = Arc::new(AtomicBool::new(false));
     let has_run_clone = has_run.clone();
@@ -351,10 +353,13 @@ async fn oversize_wft_payload_fails_retryably_then_completes() {
         }
     }
 
-    core.register_workflow_with_factory(move || OversizeWftWf {
-        has_run: has_run_clone.clone(),
-    })
-    .unwrap();
+    starter
+        .sdk_config
+        .register_workflow_with_factory(move || OversizeWftWf {
+            has_run: has_run_clone.clone(),
+        })
+        .unwrap();
+    let mut core = starter.worker().await;
     let handle = core
         .submit_workflow(OversizeWftWf::run, (), starter.workflow_options.clone())
         .await
@@ -404,6 +409,10 @@ async fn oversize_activity_result_fails_retryably_then_completes() {
     starter.sdk_config.register_activities(OversizeResultActs {
         max_attempt: max_attempt.clone(),
     });
+    starter
+        .sdk_config
+        .register_workflow_with_factory(|| OversizeActResultWf)
+        .unwrap();
     let mut core = starter.worker().await;
 
     #[workflow]
@@ -429,8 +438,6 @@ async fn oversize_activity_result_fails_retryably_then_completes() {
         }
     }
 
-    core.register_workflow_with_factory(|| OversizeActResultWf)
-        .unwrap();
     let handle = core
         .submit_workflow(
             OversizeActResultWf::run,
@@ -486,6 +493,10 @@ async fn oversize_activity_heartbeat_fails_retryably_then_completes() {
     starter.sdk_config.register_activities(OversizeHbActs {
         max_attempt: max_attempt.clone(),
     });
+    starter
+        .sdk_config
+        .register_workflow_with_factory(|| OversizeHbWf)
+        .unwrap();
     let mut core = starter.worker().await;
 
     #[workflow]
@@ -512,8 +523,6 @@ async fn oversize_activity_heartbeat_fails_retryably_then_completes() {
         }
     }
 
-    core.register_workflow_with_factory(|| OversizeHbWf)
-        .unwrap();
     let handle = core
         .submit_workflow(OversizeHbWf::run, (), starter.workflow_options.clone())
         .await
@@ -552,7 +561,10 @@ async fn warn_band_payload_is_logged_and_completes() {
 
     let wf_name = "warn_band_payload";
     let mut starter = CoreWfStarter::new_with_overrides(wf_name, Some(runtime), Some(client));
-    starter.sdk_config.task_types = WorkerTaskTypes::workflow_only();
+    starter
+        .sdk_config
+        .register_workflow_with_factory(|| WarnBandWf)
+        .unwrap();
     let mut core = starter.worker().await;
 
     #[workflow]
@@ -565,7 +577,6 @@ async fn warn_band_payload_is_logged_and_completes() {
             Ok(vec![0u8; 256])
         }
     }
-    core.register_workflow_with_factory(|| WarnBandWf).unwrap();
     let handle = core
         .submit_workflow(WarnBandWf::run, (), starter.workflow_options.clone())
         .await
@@ -622,6 +633,10 @@ async fn disabled_error_limit_lets_server_hard_fail() {
         .register_activities(DisabledOversizeActs {
             max_attempt: max_attempt.clone(),
         });
+    starter
+        .sdk_config
+        .register_workflow_with_factory(|| DisabledOversizeWf)
+        .unwrap();
     let mut core = starter.worker().await;
 
     #[workflow]
@@ -646,8 +661,6 @@ async fn disabled_error_limit_lets_server_hard_fail() {
             Ok(())
         }
     }
-    core.register_workflow_with_factory(|| DisabledOversizeWf)
-        .unwrap();
     let handle = core
         .submit_workflow(
             DisabledOversizeWf::run,
@@ -762,16 +775,26 @@ async fn activity_tasks_from_completion_reserve_slots() {
         cfg.max_outstanding_activities = Some(2);
     });
     let core = Arc::new(mock_worker(mock));
-    let mut worker = crate::common::TestWorker::new(temporalio_sdk::Worker::new_from_core(
-        core.clone(),
-        DataConverter::default(),
-    ));
+    let workflow_complete_token = CancellationToken::new();
+    let workflow_complete_token_clone = workflow_complete_token.clone();
+    let wf_token = workflow_complete_token.clone();
+    let client_options = ClientOptions::new(core.get_config().namespace.clone())
+        .data_converter(DataConverter::default())
+        .build();
+    let worker_options = WorkerOptions::new(core.get_config().task_queue.clone())
+        .register_workflow_with_factory(move || ActivityTasksCompletionWf {
+            complete_token: wf_token.clone(),
+        })
+        .unwrap()
+        .build();
+    let mut worker = crate::common::TestWorker::new(
+        temporalio_sdk::Worker::new_from_core_options(core.clone(), client_options, worker_options)
+            .unwrap(),
+    );
 
     // First poll for activities twice, occupying both slots
     let at1 = core.poll_activity_task().await.unwrap();
     let at2 = core.poll_activity_task().await.unwrap();
-    let workflow_complete_token = CancellationToken::new();
-    let workflow_complete_token_clone = workflow_complete_token.clone();
 
     struct FakeAct;
     #[activities]
@@ -812,13 +835,6 @@ async fn activity_tasks_from_completion_reserve_slots() {
             Ok(())
         }
     }
-
-    let wf_token = workflow_complete_token.clone();
-    worker
-        .register_workflow_with_factory(move || ActivityTasksCompletionWf {
-            complete_token: wf_token.clone(),
-        })
-        .unwrap();
 
     let act_completer = async {
         barr.wait().await;
@@ -862,10 +878,6 @@ async fn max_wft_respected() {
         }
     });
     let mh = MockPollCfg::new(hists.into_iter().collect(), true, 0);
-    let mut worker = mock_sdk_cfg(mh, |cfg| {
-        cfg.max_cached_workflows = total_wfs as usize;
-        cfg.max_outstanding_workflow_tasks = Some(1);
-    });
     static ACTIVE_COUNT: Semaphore = Semaphore::const_new(1);
 
     #[workflow]
@@ -886,7 +898,16 @@ async fn max_wft_respected() {
         }
     }
 
-    worker.register_workflow::<MaxWftWf>().unwrap();
+    let mut worker = crate::common::mock_sdk_cfg_with_options(
+        mh,
+        |cfg| {
+            cfg.max_cached_workflows = total_wfs as usize;
+            cfg.max_outstanding_workflow_tasks = Some(1);
+        },
+        |options| {
+            options.register_workflow::<MaxWftWf>().unwrap();
+        },
+    );
     worker.run_until_done().await.unwrap();
 }
 
@@ -961,11 +982,6 @@ async fn history_length_with_fail_and_timeout(
         // Expect the failed pagination fetch
         mh.num_expected_fails = 1;
     }
-    let mut worker = mock_sdk_cfg(mh, |wc| {
-        if use_cache {
-            wc.max_cached_workflows = 1;
-        }
-    });
     #[workflow]
     #[derive(Default)]
     struct HistoryLengthWf;
@@ -983,7 +999,17 @@ async fn history_length_with_fail_and_timeout(
         }
     }
 
-    worker.register_workflow::<HistoryLengthWf>().unwrap();
+    let mut worker = crate::common::mock_sdk_cfg_with_options(
+        mh,
+        |wc| {
+            if use_cache {
+                wc.max_cached_workflows = 1;
+            }
+        },
+        |options| {
+            options.register_workflow::<HistoryLengthWf>().unwrap();
+        },
+    );
     if force_failed_fetch_after_eviction {
         struct FirstCompletionNotifier(CancellationToken);
 
@@ -1045,13 +1071,16 @@ async fn sets_build_id_from_wft_complete() {
     t.add_workflow_task_scheduled_and_started();
 
     let mock = mock_worker_client();
-    let mut worker = mock_sdk_cfg(
+    let mut worker = crate::common::mock_sdk_cfg_with_options(
         MockPollCfg::from_resp_batches(wfid, t, [ResponseType::AllHistory], mock),
         |cfg| {
             cfg.versioning_strategy = WorkerVersioningStrategy::None {
                 build_id: "fierce-predator".to_string(),
             };
             cfg.max_cached_workflows = 1;
+        },
+        |options| {
+            options.register_workflow::<BuildIdWf>().unwrap();
         },
     );
 
@@ -1085,7 +1114,6 @@ async fn sets_build_id_from_wft_complete() {
         }
     }
 
-    worker.register_workflow::<BuildIdWf>().unwrap();
     worker.run_until_done().await.unwrap();
 }
 
@@ -1196,6 +1224,10 @@ async fn test_custom_slot_supplier_simple() {
     tb.activity_slot_supplier(activity_supplier.clone());
     tb.local_activity_slot_supplier(local_activity_supplier.clone());
     starter.sdk_config.tuner = Arc::new(tb.build());
+    starter
+        .sdk_config
+        .register_workflow::<SlotSupplierWorkflow>()
+        .unwrap();
 
     let mut worker = starter.worker().await;
 
@@ -1226,8 +1258,6 @@ async fn test_custom_slot_supplier_simple() {
             Ok(())
         }
     }
-
-    worker.register_workflow::<SlotSupplierWorkflow>().unwrap();
 
     let task_queue = starter.get_task_queue().to_owned();
     worker
@@ -1400,6 +1430,80 @@ async fn shutdown_worker_not_retried() {
     let worker = starter.get_worker().await;
     drain_pollers_and_shutdown(&worker).await;
     assert_eq!(shutdown_call_count.load(Ordering::Relaxed), 1);
+}
+
+#[tokio::test]
+async fn high_level_workflow_only_worker_shuts_down() {
+    let workflow_poll_started = Arc::new(Notify::new());
+    let workflow_poll_started_for_server = workflow_poll_started.clone();
+    let shutdown_rpc_started = Arc::new(AtomicBool::new(false));
+    let shutdown_rpc_started_for_server = shutdown_rpc_started.clone();
+    let release_workflow_polls = Arc::new(Notify::new());
+    let release_workflow_polls_for_server = release_workflow_polls.clone();
+    let fs = fake_server(move |req| {
+        let workflow_poll_started = workflow_poll_started_for_server.clone();
+        let shutdown_rpc_started = shutdown_rpc_started_for_server.clone();
+        let release_workflow_polls = release_workflow_polls_for_server.clone();
+        async move {
+            let path = req.uri().path();
+            if path.contains("DescribeNamespace") {
+                make_ok_response(DescribeNamespaceResponse {
+                    namespace_info: Some(NamespaceInfo {
+                        capabilities: Some(Capabilities {
+                            worker_poll_complete_on_shutdown: true,
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                })
+            } else if path.contains("PollWorkflowTaskQueue") {
+                workflow_poll_started.notify_one();
+                release_workflow_polls.notified().await;
+                make_ok_response(PollWorkflowTaskQueueResponse::default())
+            } else if path.contains("ShutdownWorker") {
+                shutdown_rpc_started.store(true, Ordering::Relaxed);
+                release_workflow_polls.notify_waiters();
+                make_ok_response(ShutdownWorkerResponse::default())
+            } else {
+                tonic::Status::unimplemented(path.to_owned()).into_http()
+            }
+        }
+        .boxed()
+    })
+    .await;
+
+    let mut connection_options = get_integ_server_options();
+    connection_options.target = format!("http://localhost:{}", fs.addr.port())
+        .parse::<url::Url>()
+        .unwrap();
+    connection_options.set_skip_get_system_info(true);
+    connection_options.retry_options = RetryOptions::no_retries();
+    let connection = Connection::connect(connection_options).await.unwrap();
+    let client = Client::new(connection, ClientOptions::new("default").build()).unwrap();
+    let runtime =
+        CoreRuntime::new_assume_tokio(get_integ_runtime_options(get_integ_telem_options()))
+            .unwrap();
+    let options = WorkerOptions::new("workflow_only_shutdown")
+        .register_workflow::<ResourceBasedNonStickyWf>()
+        .unwrap()
+        .build();
+    let mut worker = temporalio_sdk::Worker::new(&runtime, client, options).unwrap();
+    let shutdown = worker.shutdown_handle();
+    let mut worker_run = Box::pin(worker.run());
+
+    tokio::select! {
+        _ = workflow_poll_started.notified() => {}
+        result = &mut worker_run => panic!("worker stopped before shutdown: {result:?}"),
+    }
+    shutdown();
+    let shutdown_result = tokio::time::timeout(Duration::from_secs(1), &mut worker_run).await;
+    fs.server_handle.abort();
+
+    shutdown_result
+        .expect("workflow-only worker should shut down without an activity poll loop")
+        .unwrap();
+    assert!(shutdown_rpc_started.load(Ordering::Relaxed));
 }
 
 #[test]

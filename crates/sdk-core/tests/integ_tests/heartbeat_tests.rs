@@ -215,11 +215,11 @@ async fn activity_doesnt_heartbeat_hits_timeout_then_completes() {
     let wf_name = "activity_doesnt_heartbeat_hits_timeout_then_completes";
     let mut starter = CoreWfStarter::new(wf_name);
     starter.sdk_config.register_activities(StdActivities);
-    let mut worker = starter.worker().await;
-
-    worker
+    starter
+        .sdk_config
         .register_workflow::<ActivityDoesntHeartbeatHitsTimeoutThenCompletesWf>()
         .unwrap();
+    let mut worker = starter.worker().await;
 
     let task_queue = starter.get_task_queue().to_owned();
     let handle = worker

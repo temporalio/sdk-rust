@@ -37,7 +37,6 @@ use temporalio_common::{
             workflowservice::v1::{DescribeNamespaceRequest, ListWorkflowExecutionsRequest},
         },
     },
-    worker::WorkerTaskTypes,
 };
 use temporalio_macros::{activities, workflow, workflow_methods};
 use temporalio_sdk::{
@@ -242,7 +241,6 @@ pub(crate) async fn grpc_message_too_large() {
     let mut starter = CoreWfStarter::new_cloud_or_local(wf_name, "")
         .await
         .unwrap();
-    starter.sdk_config.task_types = WorkerTaskTypes::workflow_only();
     starter.sdk_config.disable_payload_error_limit = true;
     starter
         .sdk_config
@@ -326,11 +324,12 @@ pub(crate) async fn shutdown_during_active_timer_activity_workflows() {
         } else {
             return;
         };
-    starter.sdk_config.register_activities(StdActivities);
-    let mut worker = starter.worker().await;
-    worker
+    starter
+        .sdk_config
+        .register_activities(StdActivities)
         .register_workflow::<ShutdownTimerActivityLoopWf>()
         .unwrap();
+    let mut worker = starter.worker().await;
 
     let core = worker.core_worker();
     core.validate().await.unwrap();
@@ -446,15 +445,6 @@ pub(crate) async fn activity_cancel_delivered_without_heartbeat(disable_eager: b
     starter
         .sdk_config
         .register_activities(WaitForCancelActivities);
-    let mut worker = starter.worker().await;
-    if !worker
-        .core_worker()
-        .get_namespace_capabilities()
-        .worker_commands()
-    {
-        warn!("Skipping test: worker_commands not supported in this namespace");
-        return;
-    }
 
     #[workflow]
     #[derive(Default)]
@@ -494,9 +484,19 @@ pub(crate) async fn activity_cancel_delivered_without_heartbeat(disable_eager: b
         }
     }
 
-    worker
+    starter
+        .sdk_config
         .register_workflow::<CancelWithoutHeartbeatWorkflow>()
         .unwrap();
+    let mut worker = starter.worker().await;
+    if !worker
+        .core_worker()
+        .get_namespace_capabilities()
+        .worker_commands()
+    {
+        warn!("Skipping test: worker_commands not supported in this namespace");
+        return;
+    }
 
     let task_queue = starter.get_task_queue().to_owned();
     let handle = worker

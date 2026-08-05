@@ -27,7 +27,6 @@ use temporalio_common::{
             history::v1::history_event::Attributes,
         },
     },
-    worker::WorkerTaskTypes,
 };
 use temporalio_macros::{activities, workflow, workflow_methods};
 use temporalio_sdk::{
@@ -390,7 +389,6 @@ async fn custom_failure_converter_fallback_applied_to_workflow_failures() {
         .sdk_config
         .register_workflow::<WorkflowFailureFallbackWorkflow>()
         .unwrap();
-    starter.sdk_config.task_types = WorkerTaskTypes::workflow_only();
     let mut worker = starter.worker().await;
 
     let task_queue = starter.get_task_queue().to_owned();
@@ -473,7 +471,6 @@ async fn custom_failure_converter_fallback_applied_to_query_failures() {
         .sdk_config
         .register_workflow::<QueryUpdateFailureFallbackWorkflow>()
         .unwrap();
-    starter.sdk_config.task_types = WorkerTaskTypes::workflow_only();
     let mut worker = starter.worker().await;
 
     let task_queue = starter.get_task_queue().to_owned();
@@ -521,7 +518,6 @@ async fn custom_failure_converter_fallback_applied_to_update_validation_failures
         .sdk_config
         .register_workflow::<QueryUpdateFailureFallbackWorkflow>()
         .unwrap();
-    starter.sdk_config.task_types = WorkerTaskTypes::workflow_only();
     let mut worker = starter.worker().await;
 
     let task_queue = starter.get_task_queue().to_owned();
@@ -575,7 +571,6 @@ async fn custom_failure_converter_fallback_applied_to_update_handler_failures() 
         .sdk_config
         .register_workflow::<QueryUpdateFailureFallbackWorkflow>()
         .unwrap();
-    starter.sdk_config.task_types = WorkerTaskTypes::workflow_only();
     let mut worker = starter.worker().await;
 
     let task_queue = starter.get_task_queue().to_owned();
@@ -699,7 +694,6 @@ async fn multi_args_serializes_as_multiple_payloads() {
         .sdk_config
         .register_workflow::<MultiArgs2Workflow>()
         .unwrap();
-    starter.sdk_config.task_types = WorkerTaskTypes::workflow_only();
     let mut worker = starter.worker().await;
 
     let input = MultiArgs2("hello".to_string(), 42);
@@ -980,7 +974,6 @@ async fn codec_errors_fail_tasks_and_retry(#[case] failure_point: CodecFailurePo
         Some(client),
     );
     starter.sdk_config.register_activities(TestActivities);
-    starter.sdk_config.task_types = WorkerTaskTypes::all();
     starter
         .sdk_config
         .register_workflow::<DataConverterTestWorkflow>()
@@ -1026,7 +1019,6 @@ async fn codec_encodes_and_decodes_payloads() {
 
     let mut starter = CoreWfStarter::new_with_overrides(wf_name, None, Some(client));
     starter.sdk_config.register_activities(TestActivities);
-    starter.sdk_config.task_types = WorkerTaskTypes::all();
     starter
         .sdk_config
         .register_workflow::<DataConverterTestWorkflow>()
@@ -1085,7 +1077,6 @@ async fn describe_decodes_workflow_payload_fields() {
 
     let mut starter = CoreWfStarter::new_with_overrides(wf_name, None, Some(client));
     starter.sdk_config.register_activities(TestActivities);
-    starter.sdk_config.task_types = WorkerTaskTypes::all();
     starter
         .sdk_config
         .register_workflow::<DescribeDataConverterWorkflow>()
@@ -1164,7 +1155,6 @@ async fn describe_decodes_user_metadata_with_ungated_xor_codec() {
 
     let mut starter = CoreWfStarter::new_with_overrides(wf_name, None, Some(client));
     starter.sdk_config.register_activities(TestActivities);
-    starter.sdk_config.task_types = WorkerTaskTypes::all();
     starter
         .sdk_config
         .register_workflow::<DescribeDataConverterWorkflow>()
@@ -1231,7 +1221,6 @@ async fn codec_roundtrips_activity_cancellation_details() {
     starter
         .sdk_config
         .register_activities(FailurePayloadActivities);
-    starter.sdk_config.task_types = WorkerTaskTypes::all();
     starter
         .sdk_config
         .register_workflow::<CancellationDetailsWorkflow>()
@@ -1281,7 +1270,6 @@ async fn codec_roundtrips_activity_heartbeat_timeout_details() {
     starter
         .sdk_config
         .register_activities(FailurePayloadActivities);
-    starter.sdk_config.task_types = WorkerTaskTypes::all();
     starter
         .sdk_config
         .register_workflow::<HeartbeatDetailsWorkflow>()

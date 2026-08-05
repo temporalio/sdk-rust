@@ -706,7 +706,7 @@ async fn update_get_result_retries_on_empty_outcome() {
     fs.shutdown().await;
 }
 
-fn make_ok_response<T>(message: T) -> Response<Body>
+pub(super) fn make_ok_response<T>(message: T) -> Response<Body>
 where
     T: Message,
 {
