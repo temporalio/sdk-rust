@@ -21,13 +21,15 @@ tls-ring = [
   "temporalio-client/tls-ring",
   "temporalio-common/tls-ring",
   "opentelemetry-otlp?/tls-ring",
-  "opentelemetry-otlp?/reqwest-rustls",
+  "opentelemetry-otlp?/reqwest-client",
+  "reqwest?/rustls-no-provider",
   "tonic/tls-native-roots",
 ]
 tls-aws-lc = [
   "temporalio-client/tls-aws-lc",
   "temporalio-common/tls-aws-lc",
   "opentelemetry-otlp?/tls-aws-lc",
+  "reqwest?/rustls",
   "tonic/tls-native-roots",
 ]
 envconfig = ["temporalio-client/envconfig", "temporalio-common/envconfig"]
@@ -92,7 +94,6 @@ reqwest = { version = "0.13", features = [
   "json",
   "stream",
   "query",
-  "rustls",
 ], default-features = false, optional = true }
 serde = "1.0"
 serde_json = { workspace = true }

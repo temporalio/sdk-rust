@@ -381,6 +381,8 @@ impl EphemeralExe {
                     }
                     EphemeralExeVersion::Fixed(version) => version,
                 };
+                // The download client resolves its rustls provider from the process default.
+                temporalio_common::telemetry::ensure_default_crypto_provider();
                 let client = reqwest::Client::new();
                 let resp = client
                     .get(format!(
