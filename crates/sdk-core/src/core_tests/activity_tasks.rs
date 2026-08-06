@@ -8,20 +8,28 @@ use crate::{
         poll_and_reply, single_hist_mock_sg, start_timer_cmd, test_worker_cfg,
     },
     worker::{
-        PollerBehavior,
-        client::mocks::{mock_manual_worker_client, mock_worker_client},
+        PollerBehavior, WorkerVersioningStrategy,
+        client::{
+            WorkerClient, WorkerClientBag,
+            mocks::{mock_manual_worker_client, mock_worker_client},
+        },
     },
 };
 use futures_util::FutureExt;
 use itertools::Itertools;
+use prost::Message;
 use std::{
     collections::{HashMap, HashSet, VecDeque, hash_map::Entry},
     future,
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::{Duration, Instant},
+};
+use temporalio_client::{
+    Connection, ConnectionOptions, PayloadErrorLimits, SharedReplaceableClient,
+    callback_based::{CallbackBasedGrpcService, GrpcSuccessResponse},
 };
 use temporalio_common::{
     payload_limits::{LimitClass, LimitSeverity, PayloadLimitViolation},
@@ -47,16 +55,19 @@ use temporalio_common::{
             enums::v1::EventType,
             failure::v1::failure::FailureInfo,
             workflowservice::v1::{
-                PollActivityTaskQueueResponse, RecordActivityTaskHeartbeatResponse,
+                GetSystemInfoResponse, PollActivityTaskQueueResponse,
+                RecordActivityTaskHeartbeatRequest, RecordActivityTaskHeartbeatResponse,
                 RespondActivityTaskCanceledResponse, RespondActivityTaskCompletedResponse,
-                RespondActivityTaskFailedResponse, RespondWorkflowTaskCompletedResponse,
+                RespondActivityTaskFailedRequest, RespondActivityTaskFailedResponse,
+                RespondWorkflowTaskCompletedResponse, ShutdownWorkerResponse,
             },
         },
     },
     worker::WorkerTaskTypes,
 };
-use tokio::{join, time::sleep};
+use tokio::{join, sync::oneshot, time::sleep};
 use tokio_util::sync::CancellationToken;
+use uuid::Uuid;
 
 fn three_tasks() -> VecDeque<PollActivityTaskQueueResponse> {
     VecDeque::from(vec![
@@ -700,6 +711,124 @@ async fn complete_act_with_fail_includes_latest_heartbeat() {
     .await
     .unwrap();
     core.drain_activity_poller_and_shutdown().await;
+}
+
+#[tokio::test]
+async fn oversized_throttled_heartbeat_failure_is_reported() {
+    let heartbeat_requests = Arc::new(Mutex::new(Vec::new()));
+    let failure_requests = Arc::new(Mutex::new(Vec::new()));
+    let (first_heartbeat_tx, first_heartbeat_rx) = oneshot::channel();
+    let first_heartbeat_tx = Arc::new(Mutex::new(Some(first_heartbeat_tx)));
+    let heartbeat_requests_clone = heartbeat_requests.clone();
+    let failure_requests_clone = failure_requests.clone();
+    let first_heartbeat_tx_clone = first_heartbeat_tx.clone();
+
+    let service_override = CallbackBasedGrpcService {
+        callback: Arc::new(move |request| {
+            let heartbeat_requests = heartbeat_requests_clone.clone();
+            let failure_requests = failure_requests_clone.clone();
+            let first_heartbeat_tx = first_heartbeat_tx_clone.clone();
+            Box::pin(async move {
+                let proto = match request.rpc.as_str() {
+                    "GetSystemInfo" => GetSystemInfoResponse::default().encode_to_vec(),
+                    "RecordActivityTaskHeartbeat" => {
+                        heartbeat_requests.lock().unwrap().push(
+                            RecordActivityTaskHeartbeatRequest::decode(request.proto)
+                                .expect("heartbeat request is valid"),
+                        );
+                        if let Some(tx) = first_heartbeat_tx.lock().unwrap().take() {
+                            let _ = tx.send(());
+                        }
+                        RecordActivityTaskHeartbeatResponse::default().encode_to_vec()
+                    }
+                    "RespondActivityTaskFailed" => {
+                        failure_requests.lock().unwrap().push(
+                            RespondActivityTaskFailedRequest::decode(request.proto)
+                                .expect("failure request is valid"),
+                        );
+                        RespondActivityTaskFailedResponse::default().encode_to_vec()
+                    }
+                    "ShutdownWorker" => ShutdownWorkerResponse::default().encode_to_vec(),
+                    rpc => panic!("unexpected RPC: {rpc}"),
+                };
+                Ok(GrpcSuccessResponse {
+                    headers: Default::default(),
+                    proto,
+                })
+            })
+        }),
+    };
+    let connection = Connection::connect(
+        ConnectionOptions::new(url::Url::parse("http://localhost:7233").unwrap())
+            .service_override(service_override)
+            .dns_load_balancing(None)
+            .build(),
+    )
+    .await
+    .unwrap();
+    let client = WorkerClientBag::new(
+        SharedReplaceableClient::new(connection),
+        "namespace".to_string(),
+        WorkerVersioningStrategy::None {
+            build_id: String::new(),
+        },
+        Uuid::new_v4(),
+    );
+    client.set_payload_error_limits(Some(PayloadErrorLimits { blob: 100, memo: 0 }));
+    let core = mock_worker(MocksHolder::from_client_with_activities(
+        client,
+        [PollActivityTaskQueueResponse {
+            task_token: vec![1],
+            activity_id: "act1".to_string(),
+            heartbeat_timeout: Some(prost_dur!(from_secs(10))),
+            ..Default::default()
+        }
+        .into()],
+    ));
+
+    let act = core.poll_activity_task().await.unwrap();
+    core.record_activity_heartbeat(ActivityHeartbeat {
+        task_token: act.task_token.clone(),
+        details: vec![vec![1].into()],
+    });
+    // Ensure the first heartbeat has opened the throttle window before recording the pending one.
+    tokio::time::timeout(Duration::from_secs(5), first_heartbeat_rx)
+        .await
+        .expect("first heartbeat was not sent")
+        .unwrap();
+    core.record_activity_heartbeat(ActivityHeartbeat {
+        task_token: act.task_token.clone(),
+        details: vec![vec![0; 1024].into()],
+    });
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        core.complete_activity_task(ActivityTaskCompletion {
+            task_token: act.task_token,
+            result: Some(ActivityExecutionResult::fail(
+                "original activity failure".into(),
+            )),
+        }),
+    )
+    .await
+    .expect("activity completion did not finish")
+    .unwrap();
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        core.drain_activity_poller_and_shutdown(),
+    )
+    .await
+    .expect("activity worker did not shut down");
+
+    let heartbeat_requests = heartbeat_requests.lock().unwrap();
+    assert_eq!(heartbeat_requests.len(), 1);
+    assert_eq!(
+        heartbeat_requests[0].details.as_ref().unwrap().payloads[0].data,
+        [1]
+    );
+    let failure_requests = failure_requests.lock().unwrap();
+    assert_eq!(failure_requests.len(), 1);
+    assert!(failure_requests[0].last_heartbeat_details.is_none());
+    assert_payloads_too_large_retryable(&failure_requests[0].failure);
 }
 
 #[tokio::test]

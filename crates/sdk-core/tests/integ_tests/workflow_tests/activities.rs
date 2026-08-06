@@ -1,7 +1,8 @@
 use crate::{
     common::{
         ActivationAssertionsInterceptor, CoreWfStarter, INTEG_CLIENT_IDENTITY,
-        activity_functions::StdActivities, build_fake_sdk_intercepted, init_core_and_create_wf, mock_sdk, mock_sdk_cfg,
+        activity_functions::StdActivities, build_fake_sdk_intercepted, init_core_and_create_wf,
+        mock_sdk, mock_sdk_cfg,
     },
     shared_tests,
 };

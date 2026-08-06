@@ -613,9 +613,34 @@ impl WorkerClient for WorkerClientBag {
     async fn fail_activity_task(
         &self,
         task_token: TaskToken,
-        failure: Option<Failure>,
-        last_heartbeat_details: Option<Payloads>,
+        mut failure: Option<Failure>,
+        mut last_heartbeat_details: Option<Payloads>,
     ) -> Result<RespondActivityTaskFailedResponse> {
+        let payload_error_limits = self.client.error_limits();
+        if let (Some(details), Some(limits)) =
+            (last_heartbeat_details.as_ref(), payload_error_limits)
+        {
+            let heartbeat_request = RecordActivityTaskHeartbeatRequest {
+                details: Some(details.clone()),
+                ..Default::default()
+            };
+            let payload_limits = temporalio_common::payload_limits::PayloadLimits {
+                blob_error: limits.blob,
+                memo_error: limits.memo,
+                ..Default::default()
+            };
+            if let Some(violation) =
+                temporalio_common::payload_limits::validate_known_payload_limits(
+                    &heartbeat_request,
+                    &payload_limits,
+                )
+            {
+                failure = Some(crate::worker::activities::make_payloads_too_large_failure(
+                    &violation,
+                ));
+                last_heartbeat_details = None;
+            }
+        }
         Ok(self
             .client
             .clone()
