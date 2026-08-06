@@ -27,7 +27,7 @@ use temporalio_common::{
             nexus,
             nexusservices::workerservice::v1::{ExecuteCommandsRequest, ExecuteCommandsResponse},
             worker::v1::{
-                WorkerCommandResult, WorkerHeartbeat, worker_command::Type as WorkerCommandType,
+                WorkerCommandResult, worker_command::Type as WorkerCommandType,
                 worker_command_result::Type as WorkerCommandResultType,
             },
         },
@@ -37,9 +37,6 @@ use temporalio_common::{
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
-
-/// Callback used to collect heartbeat data from each worker at the time of heartbeat
-pub(crate) type HeartbeatFn = Arc<dyn Fn() -> WorkerHeartbeat + Send + Sync>;
 
 /// SharedNamespaceWorker is responsible for polling nexus-delivered worker commands and sending
 /// worker heartbeats to the server. This invokes callbacks on all workers in the same process that
@@ -104,9 +101,9 @@ impl SharedNamespaceWorker {
                     let hb_callbacks: Vec<_> = callbacks_map
                         .read()
                         .values()
-                        .map(|cb| cb.heartbeat.clone())
+                        .map(|cb| (cb.heartbeat.clone(), cb.heartbeat_success.clone()))
                         .collect();
-                    for heartbeat_callback in hb_callbacks {
+                    for (heartbeat_callback, _) in &hb_callbacks {
                         let mut heartbeat = heartbeat_callback();
                         // All of these heartbeat details rely on a client. To avoid circular
                         // dependencies, this must be populated from within SharedNamespaceWorker
@@ -122,6 +119,12 @@ impl SharedNamespaceWorker {
                             return true;
                         }
                         warn!(error=?e, "Network error while sending worker heartbeat");
+                    } else {
+                        for (_, heartbeat_success) in hb_callbacks {
+                            if let Some(heartbeat_success) = heartbeat_success {
+                                heartbeat_success();
+                            }
+                        }
                     }
                     false
                 }
@@ -373,7 +376,8 @@ mod tests {
             },
             nexusservices::workerservice::v1::{ExecuteCommandsRequest, ExecuteCommandsResponse},
             worker::v1::{
-                CancelActivityCommand, WorkerCommand, worker_command, worker_command_result,
+                CancelActivityCommand, EnvironmentInfo, WorkerCommand, worker_command,
+                worker_command_result,
             },
             workflowservice::v1::{
                 DescribeNamespaceResponse, PollNexusTaskQueueResponse,
@@ -397,6 +401,8 @@ mod tests {
             move |_namespace, worker_heartbeat| {
                 assert_eq!(1, worker_heartbeat.len());
                 let heartbeat = worker_heartbeat[0].clone();
+                let heartbeat_index = heartbeat_count_clone.fetch_add(1, Ordering::Relaxed);
+                assert_eq!(heartbeat.environment.is_some(), heartbeat_index < 2);
                 let host_info = heartbeat.host_info.clone().unwrap();
                 assert_eq!("test-identity", heartbeat.worker_identity);
                 assert!(!heartbeat.worker_instance_key.is_empty());
@@ -410,9 +416,11 @@ mod tests {
                 assert!(heartbeat.heartbeat_time.is_some());
                 assert!(heartbeat.start_time.is_some());
 
-                heartbeat_count_clone.fetch_add(1, Ordering::Relaxed);
-
-                Ok(RecordWorkerHeartbeatResponse {})
+                if heartbeat_index == 0 {
+                    Err(tonic::Status::unavailable("heartbeat retry"))
+                } else {
+                    Ok(RecordWorkerHeartbeatResponse {})
+                }
             },
         );
         mock.expect_describe_namespace().returning(move || {
@@ -441,6 +449,7 @@ mod tests {
             client.clone(),
             None,
             Some(Duration::from_millis(100)),
+            Some(Arc::new(EnvironmentInfo::default())),
         )
         .unwrap();
 
@@ -489,6 +498,7 @@ mod tests {
             Arc::new(mock),
             None,
             Some(Duration::from_secs(60)),
+            None,
         )
         .unwrap();
 
@@ -672,6 +682,7 @@ mod tests {
             client.clone(),
             None,
             Some(Duration::from_millis(100)),
+            None,
         )
         .unwrap();
 

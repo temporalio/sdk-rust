@@ -207,6 +207,20 @@ jobs:
         with:
           compose-file: ./etc/docker/docker-compose-ci.yaml
       - run: cargo integ-test docker_
+      - name: Verify worker environment detection inside Docker
+        run: |
+          docker run --rm \
+            --user "$(id -u):$(id -g)" \
+            --env HOME="$HOME" \
+            --env CARGO_HOME="$HOME/.cargo" \
+            --env RUSTUP_HOME="$HOME/.rustup" \
+            --env PROTOC \
+            --env TEMPORAL_TEST_EXPECT_DOCKER=true \
+            --volume "$HOME:$HOME" \
+            --volume "$GITHUB_WORKSPACE:$GITHUB_WORKSPACE" \
+            --workdir "$GITHUB_WORKSPACE" \
+            ubuntu:24.04 \
+            "$HOME/.cargo/bin/cargo" integ-test worker_heartbeat_multiple_workers
 
   examples:
     name: "Build and run examples"

@@ -18,6 +18,7 @@ mod abstractions;
 mod antithesis;
 #[cfg(feature = "debug-plugin")]
 pub mod debug_client;
+mod environment;
 #[cfg(feature = "ephemeral-server")]
 pub mod ephemeral_server;
 mod internal_flags;
@@ -62,7 +63,10 @@ use futures_util::Stream;
 use std::{sync::Arc, time::Duration};
 use temporalio_client::{Connection, SharedReplaceableClient};
 use temporalio_common::{
-    protos::coresdk::ActivityHeartbeat,
+    protos::{
+        coresdk::ActivityHeartbeat,
+        temporal::api::worker::v1::{EnvironmentInfo, environment_info::Runtime},
+    },
     telemetry::{
         TelemetryInstance, TelemetryOptions, remove_trace_subscriber_for_current_thread,
         set_trace_subscriber_for_current_thread, telemetry_init,
@@ -114,6 +118,7 @@ pub fn init_worker(
         client_bag.clone(),
         Some(&runtime.telemetry),
         runtime.heartbeat_interval,
+        runtime.environment_info.clone(),
     )
 }
 
@@ -168,10 +173,10 @@ pub struct CoreRuntime {
     runtime: Option<tokio::runtime::Runtime>,
     runtime_handle: tokio::runtime::Handle,
     heartbeat_interval: Option<Duration>,
+    environment_info: Option<Arc<EnvironmentInfo>>,
 }
 
-/// Holds telemetry options, as well as worker heartbeat_interval. Construct with
-/// [RuntimeOptions::builder]
+/// Holds telemetry and process-wide worker options. Construct with [RuntimeOptions::builder].
 #[derive(bon::Builder)]
 #[builder(finish_fn(vis = "", name = build_internal))]
 #[non_exhaustive]
@@ -185,6 +190,22 @@ pub struct RuntimeOptions {
     /// Interval must be between 1s and 60s, inclusive.
     #[builder(required, default = Some(Duration::from_secs(60)))]
     heartbeat_interval: Option<Duration>,
+    /// Disable including runtime, hosting, and platform information in worker heartbeats.
+    #[builder(default)]
+    disable_environment_info: bool,
+    /// Runtime information supplied by language SDK bridges.
+    #[doc(hidden)]
+    #[builder(skip = vec![environment::native_runtime()])]
+    runtimes: Vec<Runtime>,
+}
+
+impl RuntimeOptions {
+    /// Supplies runtime information from a language SDK bridge.
+    #[doc(hidden)]
+    pub fn with_runtimes(mut self, runtimes: Vec<Runtime>) -> Self {
+        self.runtimes = runtimes;
+        self
+    }
 }
 
 impl Default for RuntimeOptions {
@@ -252,7 +273,13 @@ impl CoreRuntime {
     where
         F: Fn() + Send + Sync + 'static,
     {
-        let telemetry = telemetry_init(runtime_options.telemetry_options)?;
+        let RuntimeOptions {
+            telemetry_options,
+            heartbeat_interval,
+            disable_environment_info,
+            runtimes,
+        } = runtime_options;
+        let telemetry = telemetry_init(telemetry_options)?;
         let subscriber = telemetry.trace_subscriber();
         let runtime = tokio_builder
             .inner
@@ -267,8 +294,12 @@ impl CoreRuntime {
             })
             .build()?;
         let _rg = runtime.enter();
-        let mut me =
-            Self::new_assume_tokio_initialized_telem(telemetry, runtime_options.heartbeat_interval);
+        let mut me = Self::new_assume_tokio_initialized_telem_with_environment(
+            telemetry,
+            heartbeat_interval,
+            disable_environment_info,
+            runtimes,
+        );
         me.runtime = Some(runtime);
         Ok(me)
     }
@@ -279,10 +310,18 @@ impl CoreRuntime {
     /// # Panics
     /// If there is no currently active Tokio runtime
     pub fn new_assume_tokio(runtime_options: RuntimeOptions) -> Result<Self, anyhow::Error> {
-        let telemetry = telemetry_init(runtime_options.telemetry_options)?;
-        Ok(Self::new_assume_tokio_initialized_telem(
+        let RuntimeOptions {
+            telemetry_options,
+            heartbeat_interval,
+            disable_environment_info,
+            runtimes,
+        } = runtime_options;
+        let telemetry = telemetry_init(telemetry_options)?;
+        Ok(Self::new_assume_tokio_initialized_telem_with_environment(
             telemetry,
-            runtime_options.heartbeat_interval,
+            heartbeat_interval,
+            disable_environment_info,
+            runtimes,
         ))
     }
 
@@ -295,15 +334,33 @@ impl CoreRuntime {
         telemetry: TelemetryInstance,
         heartbeat_interval: Option<Duration>,
     ) -> Self {
+        Self::new_assume_tokio_initialized_telem_with_environment(
+            telemetry,
+            heartbeat_interval,
+            false,
+            vec![environment::native_runtime()],
+        )
+    }
+
+    fn new_assume_tokio_initialized_telem_with_environment(
+        telemetry: TelemetryInstance,
+        heartbeat_interval: Option<Duration>,
+        disable_environment_info: bool,
+        runtimes: Vec<Runtime>,
+    ) -> Self {
         let runtime_handle = tokio::runtime::Handle::current();
         if let Some(sub) = telemetry.trace_subscriber() {
             set_trace_subscriber_for_current_thread(sub);
         }
+        let environment_info = heartbeat_interval
+            .filter(|_| !disable_environment_info)
+            .map(|_| Arc::new(environment::detect(runtimes)));
         Self {
             telemetry,
             runtime: None,
             runtime_handle,
             heartbeat_interval,
+            environment_info,
         }
     }
 

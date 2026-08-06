@@ -26,6 +26,8 @@ document as your quick reference when submitting pull requests.
   `cargo +nightly fmt`, because some settings require the nightly formatter.
 - Do not extract functions for relatively simple helpers that are only used in one location.
 - Use custom error types leveraging `thiserror` for any public facing error types
+- Don't add pro-forma unit tests that simply check values are passed through some very obviously
+  correct machinery, or that defaults equal the same hardcoded values in the test, etc.
 
 
 ## Repo Specific Utilities

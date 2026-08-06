@@ -229,6 +229,7 @@ impl ClientWorkerSetImpl {
                 worker_instance_key,
                 WorkerCallbacks {
                     heartbeat: heartbeat_callback,
+                    heartbeat_success: worker.heartbeat_success_callback(),
                     cancel_activity: worker.cancel_activity_callback(),
                 },
             );
@@ -496,8 +497,11 @@ impl std::fmt::Debug for ClientWorkerSet {
     }
 }
 
-/// Contains a worker heartbeat callback, wrapped for mocking
+/// Contains a worker heartbeat callback, wrapped for mocking.
 pub type HeartbeatCallback = Arc<dyn Fn() -> WorkerHeartbeat + Send + Sync>;
+
+/// Callback invoked after a worker heartbeat has been accepted by the server.
+pub type HeartbeatSuccessCallback = Arc<dyn Fn() + Send + Sync>;
 
 /// Callback to cancel an activity by task token. Returns true if the activity was found.
 pub type CancelActivityCallback = Arc<dyn Fn(TaskToken) -> bool + Send + Sync>;
@@ -506,6 +510,8 @@ pub type CancelActivityCallback = Arc<dyn Fn(TaskToken) -> bool + Send + Sync>;
 pub struct WorkerCallbacks {
     /// Callback to collect heartbeat data from the worker.
     pub heartbeat: HeartbeatCallback,
+    /// Callback acknowledging successful delivery of the collected heartbeat.
+    pub heartbeat_success: Option<HeartbeatSuccessCallback>,
     /// Callback to cancel an activity by task token.
     pub cancel_activity: Option<CancelActivityCallback>,
 }
@@ -539,6 +545,11 @@ pub trait ClientWorker: Send + Sync {
 
     /// Returns the heartbeat callback that can be used to get WorkerHeartbeat data.
     fn heartbeat_callback(&self) -> Option<HeartbeatCallback>;
+
+    /// Returns a callback notified after the heartbeat is accepted by the server.
+    fn heartbeat_success_callback(&self) -> Option<HeartbeatSuccessCallback> {
+        None
+    }
 
     /// Returns a callback that can cancel an activity by task token.
     fn cancel_activity_callback(&self) -> Option<CancelActivityCallback>;
@@ -995,6 +1006,9 @@ mod tests {
             mock_provider
                 .expect_heartbeat_callback()
                 .returning(|| Some(Arc::new(WorkerHeartbeat::default)));
+            mock_provider
+                .expect_heartbeat_success_callback()
+                .returning(|| None);
             mock_provider
                 .expect_cancel_activity_callback()
                 .returning(|| None);

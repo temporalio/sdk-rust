@@ -138,7 +138,7 @@ where
                 hist_allow_tx.send("Failed".to_string()).unwrap();
                 async move { Ok(RespondWorkflowTaskFailedResponse::default()) }.boxed()
             });
-        let mut worker = Worker::new(self.config, None, Arc::new(client), None, None)?;
+        let mut worker = Worker::new(self.config, None, Arc::new(client), None, None, None)?;
         worker.set_post_activate_hook(post_activate);
         shutdown_tok(worker.shutdown_token());
         Ok(worker)

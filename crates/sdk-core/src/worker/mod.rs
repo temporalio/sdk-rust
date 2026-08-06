@@ -55,7 +55,7 @@ use crate::{
     worker::{
         activities::{LACompleteAction, LocalActivityManager, NextPendingLAAction},
         client::WorkerClient,
-        heartbeat::{HeartbeatFn, SharedNamespaceWorker},
+        heartbeat::SharedNamespaceWorker,
         nexus::NexusManager,
         workflow::{
             LAReqSink, LocalResolution, WorkflowBasics, Workflows, wft_poller,
@@ -82,8 +82,8 @@ use std::{
     time::{Duration, SystemTime},
 };
 use temporalio_client::worker::{
-    CancelActivityCallback, ClientWorker, HeartbeatCallback, SharedNamespaceWorkerTrait,
-    Slot as SlotTrait,
+    CancelActivityCallback, ClientWorker, HeartbeatCallback, HeartbeatSuccessCallback,
+    SharedNamespaceWorkerTrait, Slot as SlotTrait,
 };
 #[cfg(test)]
 use temporalio_common::protos::temporal::api::namespace::v1::NamespaceInfo as ApiNamespaceInfo;
@@ -102,7 +102,9 @@ use temporalio_common::{
             enums::v1::{TaskQueueKind, TaskQueueType, WorkerStatus},
             namespace::v1::namespace_info::Capabilities as ApiNamespaceCapabilities,
             taskqueue::v1::{StickyExecutionAttributes, TaskQueue},
-            worker::v1::{WorkerHeartbeat, WorkerHostInfo, WorkerPollerInfo, WorkerSlotsInfo},
+            worker::v1::{
+                EnvironmentInfo, WorkerHeartbeat, WorkerHostInfo, WorkerPollerInfo, WorkerSlotsInfo,
+            },
             workflowservice::v1::DescribeNamespaceResponse,
         },
     },
@@ -575,6 +577,11 @@ pub(crate) struct WorkerTelemetry {
     trace_subscriber: Option<Arc<dyn Subscriber + Send + Sync>>,
 }
 
+pub(crate) struct WorkerHeartbeatOptions {
+    interval: Duration,
+    environment_info: Option<Arc<EnvironmentInfo>>,
+}
+
 impl WorkerTelemetry {
     #[cfg(any(feature = "test-utilities", test))]
     pub(crate) fn from_meter(meter: TemporalMeter) -> Self {
@@ -594,6 +601,7 @@ impl Worker {
         client: Arc<dyn WorkerClient>,
         telem_instance: Option<&TelemetryInstance>,
         worker_heartbeat_interval: Option<Duration>,
+        environment_info: Option<Arc<EnvironmentInfo>>,
     ) -> Result<Worker, anyhow::Error> {
         info!(task_queue=%config.task_queue, namespace=%config.namespace, "Initializing worker");
 
@@ -602,13 +610,19 @@ impl Worker {
             trace_subscriber: telem.trace_subscriber(),
         });
 
+        let worker_heartbeat_options =
+            worker_heartbeat_interval.map(|interval| WorkerHeartbeatOptions {
+                interval,
+                environment_info,
+            });
+
         Self::new_with_pollers(
             config,
             sticky_queue_name,
             client,
             TaskPollers::Real,
             worker_telemetry,
-            worker_heartbeat_interval,
+            worker_heartbeat_options,
             false,
         )
     }
@@ -694,7 +708,15 @@ impl Worker {
         } else {
             None
         };
-        Self::new(config, sticky_queue_name, Arc::new(client), None, None).unwrap()
+        Self::new(
+            config,
+            sticky_queue_name,
+            Arc::new(client),
+            None,
+            None,
+            None,
+        )
+        .unwrap()
     }
 
     pub(crate) fn new_with_pollers(
@@ -703,7 +725,7 @@ impl Worker {
         client: Arc<dyn WorkerClient>,
         task_pollers: TaskPollers,
         worker_telemetry: Option<WorkerTelemetry>,
-        worker_heartbeat_interval: Option<Duration>,
+        worker_heartbeat_options: Option<WorkerHeartbeatOptions>,
         shared_namespace_worker: bool,
     ) -> Result<Worker, anyhow::Error> {
         let (metrics, meter) = if let Some(wt) = worker_telemetry.as_ref() {
@@ -829,7 +851,8 @@ impl Worker {
             deployment_options,
         );
 
-        let worker_heartbeat = worker_heartbeat_interval.map(|hb_interval| {
+        let worker_heartbeat = worker_heartbeat_options.map(|heartbeat_options| {
+            let hb_interval = heartbeat_options.interval;
             let heartbeat_sys_info =
                 sys_info.unwrap_or_else(|| Arc::new(RealSysInfo::new(hb_interval)));
             let hb_metrics = HeartbeatMetrics {
@@ -852,6 +875,7 @@ impl Worker {
                 worker_telemetry.clone(),
                 hb_metrics,
                 capabilities.clone(),
+                heartbeat_options.environment_info,
             )
         });
 
@@ -1624,7 +1648,7 @@ impl Worker {
             .client_worker_registrator
             .heartbeat_manager
             .as_ref()
-            .map(|hm| hm.heartbeat_callback.clone()());
+            .map(|hm| (hm.heartbeat_callback)());
         let handle = tokio::spawn(async move {
             match client
                 .shutdown_worker(sticky_name, task_queue, task_queue_types, heartbeat)
@@ -2180,6 +2204,12 @@ impl ClientWorker for ClientWorkerRegistrator {
         }
     }
 
+    fn heartbeat_success_callback(&self) -> Option<HeartbeatSuccessCallback> {
+        self.heartbeat_manager
+            .as_ref()
+            .map(|hb_mgr| hb_mgr.heartbeat_success_callback.clone())
+    }
+
     fn cancel_activity_callback(&self) -> Option<CancelActivityCallback> {
         // When activities are disabled the slot is never filled, so the wrapper returns false (a
         // harmless no-op); no need to gate on whether activities are enabled.
@@ -2230,7 +2260,8 @@ struct WorkerHeartbeatManager {
     /// Telemetry instance, needed to initialize [SharedNamespaceWorker] when replacing client
     telemetry: Option<WorkerTelemetry>,
     /// Heartbeat callback
-    heartbeat_callback: Arc<dyn Fn() -> WorkerHeartbeat + Send + Sync>,
+    heartbeat_callback: HeartbeatCallback,
+    heartbeat_success_callback: HeartbeatSuccessCallback,
 }
 
 impl WorkerHeartbeatManager {
@@ -2241,9 +2272,12 @@ impl WorkerHeartbeatManager {
         telemetry_instance: Option<WorkerTelemetry>,
         heartbeat_manager_metrics: HeartbeatMetrics,
         capabilities: Arc<NamespaceCapabilities>,
+        environment_info: Option<Arc<EnvironmentInfo>>,
     ) -> Self {
         let start_time = Some(SystemTime::now().into());
-        let worker_heartbeat_callback: HeartbeatFn = Arc::new(move || {
+        let environment_info = Arc::new(Mutex::new(environment_info));
+        let heartbeat_environment_info = environment_info.clone();
+        let worker_heartbeat_callback: HeartbeatCallback = Arc::new(move || {
             let deployment_version = config.computed_deployment_version().map(|dv| {
                 deployment::v1::WorkerDeploymentVersion {
                     deployment_name: dv.deployment_name,
@@ -2277,6 +2311,7 @@ impl WorkerHeartbeatManager {
                 start_time,
                 plugins,
                 drivers,
+                environment: heartbeat_environment_info.lock().as_deref().cloned(),
 
                 // Some Metrics dependent fields are set below, and
                 // some fields like sdk_name, sdk_version, and worker_identity, must be set by
@@ -2388,11 +2423,15 @@ impl WorkerHeartbeatManager {
             }
             worker_heartbeat
         });
+        let heartbeat_success_callback: HeartbeatSuccessCallback = Arc::new(move || {
+            environment_info.lock().take();
+        });
 
         WorkerHeartbeatManager {
             heartbeat_interval,
             telemetry: telemetry_instance,
             heartbeat_callback: worker_heartbeat_callback,
+            heartbeat_success_callback,
         }
     }
 }
