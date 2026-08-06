@@ -430,7 +430,7 @@ impl ActivityOptions {
 }
 
 /// Options for scheduling a local activity
-#[derive(Debug, Clone, PartialEq, bon::Builder)]
+#[derive(Debug, Clone, bon::Builder)]
 #[non_exhaustive]
 pub struct LocalActivityOptions {
     /// Identifier to use for tracking the activity in Workflow history.
@@ -676,7 +676,7 @@ impl SignalData {
 }
 
 /// Options for timer
-#[derive(Debug, Clone, PartialEq, bon::Builder)]
+#[derive(Debug, Clone, bon::Builder)]
 #[non_exhaustive]
 pub struct TimerOptions {
     /// Duration for the timer
@@ -737,7 +737,7 @@ pub struct SignalWorkflowOptions {
 }
 
 /// Options for Nexus Operations
-#[derive(Debug, Clone, PartialEq, bon::Builder)]
+#[derive(Debug, Clone, bon::Builder)]
 #[builder(on(String, into))]
 #[non_exhaustive]
 pub struct NexusOperationOptions {

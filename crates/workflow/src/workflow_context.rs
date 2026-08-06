@@ -3484,13 +3484,12 @@ mod tests {
                 .build(),
         );
 
-        let mut nexus_options = NexusOperationOptions {
-            endpoint: "endpoint".to_string(),
-            service: "service".to_string(),
-            operation: "operation".to_string(),
-            ..Default::default()
-        };
-        nexus_options.cancellation_token = Some(token.clone());
+        let nexus_options = NexusOperationOptions::builder()
+            .endpoint("endpoint")
+            .service("service")
+            .operation("operation")
+            .cancellation_token(token.clone())
+            .build();
         let nexus = base.start_nexus_operation(nexus_options);
 
         token.cancel_with_reason("group cancelled");
@@ -3608,13 +3607,12 @@ mod tests {
         started_child.cancel("explicit cancellation".to_string());
 
         let nexus_token = WorkflowCancellationToken::new();
-        let mut nexus_options = NexusOperationOptions {
-            endpoint: "endpoint".to_string(),
-            service: "service".to_string(),
-            operation: "operation".to_string(),
-            ..Default::default()
-        };
-        nexus_options.cancellation_token = Some(nexus_token.clone());
+        let nexus_options = NexusOperationOptions::builder()
+            .endpoint("endpoint")
+            .service("service")
+            .operation("operation")
+            .cancellation_token(nexus_token.clone())
+            .build();
         let nexus = base.start_nexus_operation(nexus_options);
         base.unblock(UnblockEvent::NexusOperationStart(
             1,

@@ -95,11 +95,11 @@ impl ShieldedCancellationWf {
         assert_eq!(reason.as_deref(), Some("shield me"));
         let shield = WorkflowCancellationToken::new();
         let timer_result = ctx
-            .timer(TimerOptions {
-                duration: Duration::from_millis(10),
-                cancellation_token: Some(shield.clone()),
-                summary: None,
-            })
+            .timer(
+                TimerOptions::builder(Duration::from_millis(10))
+                    .cancellation_token(shield.clone())
+                    .build(),
+            )
             .await;
 
         assert_eq!(timer_result, TimerResult::Fired);
@@ -202,10 +202,9 @@ impl CancellationPropagationParent {
         let local_activity = ctx.execute_local_activity(
             CancellationPropagationActivities::wait_for_cancellation,
             (),
-            LocalActivityOptions {
-                cancel_type: ActivityCancellationType::WaitCancellationCompleted,
-                ..Default::default()
-            },
+            LocalActivityOptions::builder()
+                .cancel_type(ActivityCancellationType::WaitCancellationCompleted)
+                .build(),
         );
         let child = ctx.start_child_workflow(
             CancellationPropagationChild::run,

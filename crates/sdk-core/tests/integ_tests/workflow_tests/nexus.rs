@@ -603,13 +603,14 @@ impl NexusRootCancellationWf {
     #[run]
     async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<()> {
         let started = ctx
-            .start_nexus_operation(NexusOperationOptions {
-                endpoint: ctx.state(|wf| wf.endpoint.clone()),
-                service: "svc".to_string(),
-                operation: "op".to_string(),
-                cancellation_type: Some(NexusOperationCancellationType::WaitCancellationRequested),
-                ..Default::default()
-            })
+            .start_nexus_operation(
+                NexusOperationOptions::builder()
+                    .endpoint(ctx.state(|wf| wf.endpoint.clone()))
+                    .service("svc")
+                    .operation("op")
+                    .cancellation_type(NexusOperationCancellationType::WaitCancellationRequested)
+                    .build(),
+            )
             .await
             .expect("Nexus operation should start");
         ctx.state(|wf| wf.started.add_permits(1));
