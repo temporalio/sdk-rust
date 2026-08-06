@@ -31,8 +31,8 @@ use temporalio_common::{
 use temporalio_macros::{activities, workflow, workflow_methods};
 use temporalio_sdk::{
     ActivityOptions, ClientAndWorkerPlugin, SimplePlugin, Worker, WorkerOptions, WorkerPlugin,
-    WorkflowContext, WorkflowResult,
-    activities::{ActivityContext, ActivityError},
+    WorkflowContext, WorkflowDefinitions, WorkflowResult,
+    activities::{ActivityContext, ActivityDefinitions, ActivityError},
     interceptors::WorkerInterceptor,
 };
 use temporalio_sdk_core::CoreRuntime;
@@ -217,17 +217,22 @@ async fn simple_plugin_configures_working_client_and_worker() {
             decode_calls: decode_calls.clone(),
         },
     );
+    let mut activities = ActivityDefinitions::default();
+    activities.register_activities(SimplePluginActivities);
+    let mut workflows = WorkflowDefinitions::new();
+    workflows
+        .register_workflow::<SimplePluginWorkflow>()
+        .unwrap();
     let plugin = SimplePlugin::builder("simple-integration-plugin")
         .data_converter(data_converter)
-        .client_interceptor(CountingClientInterceptor {
+        .client_interceptors(vec![Arc::new(CountingClientInterceptor {
             calls: client_interceptor_calls.clone(),
-        })
-        .worker_interceptor(CountingWorkerInterceptor {
+        }) as Arc<dyn ClientInterceptor>])
+        .worker_interceptors(vec![Arc::new(CountingWorkerInterceptor {
             calls: worker_interceptor_calls.clone(),
-        })
-        .register_activities(SimplePluginActivities)
-        .register_workflow::<SimplePluginWorkflow>()
-        .unwrap()
+        }) as Arc<dyn WorkerInterceptor>])
+        .activities(activities)
+        .workflows(workflows)
         .build();
     let client_options = ClientOptions::new(integ_namespace()).plugin(plugin).build();
     let client = Client::connect(get_integ_server_options(), client_options)

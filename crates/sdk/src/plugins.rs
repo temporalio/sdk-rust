@@ -2,20 +2,19 @@
 
 #[cfg(feature = "wasm-workflows")]
 use crate::WasmWorkflowComponent;
+pub use crate::workflow_registry::WorkflowDefinitions;
 use crate::{
-    WorkerOptions, WorkflowRegistrationError,
-    activities::{ActivityDefinitions, ActivityImplementer},
+    WorkerOptions,
+    activities::ActivityDefinitions,
     interceptors::{ActivityInboundInterceptor, WorkerInterceptor},
     workflow_interceptors::WorkflowInterceptorConstructor,
-    workflow_registry::WorkflowDefinitions,
 };
 use std::{any::Any, sync::Arc};
 use temporalio_client::{
     ClientInterceptor, ClientOptions, ClientPlugin, ConnectionOptions, ErasedClientPlugin,
     PluginApplyError, PluginError, PluginTarget, WorkerPluginData,
 };
-use temporalio_common::{WorkflowDefinition, data_converters::DataConverter};
-use temporalio_workflow::runtime::entry::WorkflowImplementation;
+use temporalio_common::data_converters::DataConverter;
 
 /// Configures worker options before the worker is created.
 ///
@@ -103,9 +102,78 @@ impl WorkerPlugin for ClientAndWorkerPlugin {
     }
 }
 
-/// A plugin assembled from declarative values.
+/// A simple plugin field that either supplies a value or customizes the existing value.
 ///
-/// Scalar values replace the corresponding option, while array values append.
+/// Builder methods on [`SimplePluginBuilder`] automatically convert supported values and
+/// functions into this type.
+///
+/// **Experimental:** This API may change or be removed.
+#[derive(Clone)]
+pub enum SimplePluginOption<T> {
+    /// A value that replaces a scalar field or appends to a collection field.
+    Value(T),
+    /// A function that receives the existing field and returns a configured value.
+    Function(Arc<dyn Fn(Option<T>) -> T + Send + Sync>),
+}
+
+macro_rules! impl_simple_plugin_option_conversions {
+    ($type:ty) => {
+        impl From<$type> for SimplePluginOption<$type> {
+            fn from(value: $type) -> Self {
+                Self::Value(value)
+            }
+        }
+
+        impl<F> From<F> for SimplePluginOption<$type>
+        where
+            F: Fn(Option<$type>) -> $type + Send + Sync + 'static,
+        {
+            fn from(function: F) -> Self {
+                Self::Function(Arc::new(function))
+            }
+        }
+    };
+}
+
+impl_simple_plugin_option_conversions!(DataConverter);
+impl_simple_plugin_option_conversions!(Vec<Arc<dyn ClientInterceptor>>);
+impl_simple_plugin_option_conversions!(Vec<Arc<dyn WorkerInterceptor>>);
+impl_simple_plugin_option_conversions!(Vec<Arc<dyn ActivityInboundInterceptor>>);
+impl_simple_plugin_option_conversions!(Vec<WorkflowInterceptorConstructor>);
+impl_simple_plugin_option_conversions!(ActivityDefinitions);
+impl_simple_plugin_option_conversions!(WorkflowDefinitions);
+#[cfg(feature = "wasm-workflows")]
+impl_simple_plugin_option_conversions!(Vec<WasmWorkflowComponent>);
+
+fn apply_replacing<T: Clone>(target: &mut T, option: Option<&SimplePluginOption<T>>) {
+    let Some(option) = option else {
+        return;
+    };
+    *target = match option {
+        SimplePluginOption::Value(value) => value.clone(),
+        SimplePluginOption::Function(function) => function(Some(target.clone())),
+    };
+}
+
+fn apply_appending<T: Clone>(
+    target: &mut T,
+    option: Option<&SimplePluginOption<T>>,
+    append: impl Fn(&mut T, &T),
+) {
+    let Some(option) = option else {
+        return;
+    };
+    match option {
+        SimplePluginOption::Value(value) => append(target, value),
+        SimplePluginOption::Function(function) => *target = function(Some(target.clone())),
+    }
+}
+
+/// A plugin assembled from declarative values or functions of existing values.
+///
+/// Scalar values replace the corresponding option, while collection values append. Functions
+/// receive the existing field and replace it with their return value, except that returned
+/// workflow definitions are merged into the existing definitions.
 ///
 /// ```
 /// use temporalio_client::ClientOptions;
@@ -113,7 +181,7 @@ impl WorkerPlugin for ClientAndWorkerPlugin {
 /// use temporalio_sdk::SimplePlugin;
 ///
 /// let plugin = SimplePlugin::builder("my-plugin")
-///     .data_converter(DataConverter::default())
+///     .data_converter(|existing: Option<DataConverter>| existing.unwrap_or_default())
 ///     .build();
 /// let client_options = ClientOptions::new("default").plugin(plugin).build();
 /// # let _ = client_options;
@@ -128,23 +196,24 @@ impl WorkerPlugin for ClientAndWorkerPlugin {
 pub struct SimplePlugin {
     #[builder(start_fn, into)]
     name: String,
-    #[builder(field)]
-    data_converter: Option<DataConverter>,
-    #[builder(field)]
-    client_interceptors: Vec<Arc<dyn ClientInterceptor>>,
-    #[builder(field)]
-    worker_interceptors: Vec<Arc<dyn WorkerInterceptor>>,
-    #[builder(field)]
-    activity_inbound_interceptors: Vec<Arc<dyn ActivityInboundInterceptor>>,
-    #[builder(field)]
-    workflow_interceptors: Vec<WorkflowInterceptorConstructor>,
-    #[builder(field)]
-    activities: ActivityDefinitions,
-    #[builder(field)]
-    workflows: WorkflowDefinitions,
+    #[builder(into)]
+    data_converter: Option<SimplePluginOption<DataConverter>>,
+    #[builder(into)]
+    client_interceptors: Option<SimplePluginOption<Vec<Arc<dyn ClientInterceptor>>>>,
+    #[builder(into)]
+    worker_interceptors: Option<SimplePluginOption<Vec<Arc<dyn WorkerInterceptor>>>>,
+    #[builder(into)]
+    activity_inbound_interceptors:
+        Option<SimplePluginOption<Vec<Arc<dyn ActivityInboundInterceptor>>>>,
+    #[builder(into)]
+    workflow_interceptors: Option<SimplePluginOption<Vec<WorkflowInterceptorConstructor>>>,
+    #[builder(into)]
+    activities: Option<SimplePluginOption<ActivityDefinitions>>,
+    #[builder(into)]
+    workflows: Option<SimplePluginOption<WorkflowDefinitions>>,
     #[cfg(feature = "wasm-workflows")]
-    #[builder(field)]
-    wasm_workflow_components: Vec<WasmWorkflowComponent>,
+    #[builder(into)]
+    wasm_workflow_components: Option<SimplePluginOption<Vec<WasmWorkflowComponent>>>,
 }
 
 impl From<SimplePlugin> for ErasedClientPlugin {
@@ -159,12 +228,12 @@ impl ClientPlugin for SimplePlugin {
     }
 
     fn configure_client_options(&self, options: &mut ClientOptions) -> Result<(), PluginError> {
-        if let Some(data_converter) = &self.data_converter {
-            options.data_converter = data_converter.clone();
-        }
-        options
-            .client_interceptors
-            .extend(self.client_interceptors.iter().cloned());
+        apply_replacing(&mut options.data_converter, self.data_converter.as_ref());
+        apply_appending(
+            &mut options.client_interceptors,
+            self.client_interceptors.as_ref(),
+            |existing, value| existing.extend(value.iter().cloned()),
+        );
         Ok(())
     }
 }
@@ -175,100 +244,43 @@ impl WorkerPlugin for SimplePlugin {
     }
 
     fn configure_worker_options(&self, options: &mut WorkerOptions) -> Result<(), PluginError> {
-        options.activities.extend(&self.activities);
-        options
-            .workflows
-            .extend(&self.workflows)
+        apply_appending(
+            &mut options.activities,
+            self.activities.as_ref(),
+            |existing, value| existing.extend(value),
+        );
+        if let Some(workflows) = &self.workflows {
+            match workflows {
+                SimplePluginOption::Value(value) => options.workflows.extend(value),
+                SimplePluginOption::Function(function) => {
+                    let workflows = function(Some(options.workflows.clone()));
+                    options.workflows.extend(&workflows)
+                }
+            }
             .map_err(PluginError::new)?;
-        options
-            .worker_interceptors
-            .extend(self.worker_interceptors.iter().cloned());
-        options
-            .activity_inbound_interceptors
-            .extend(self.activity_inbound_interceptors.iter().cloned());
-        options
-            .workflow_interceptor_constructors
-            .extend(self.workflow_interceptors.iter().cloned());
+        }
+        apply_appending(
+            &mut options.worker_interceptors,
+            self.worker_interceptors.as_ref(),
+            |existing, value| existing.extend(value.iter().cloned()),
+        );
+        apply_appending(
+            &mut options.activity_inbound_interceptors,
+            self.activity_inbound_interceptors.as_ref(),
+            |existing, value| existing.extend(value.iter().cloned()),
+        );
+        apply_appending(
+            &mut options.workflow_interceptor_constructors,
+            self.workflow_interceptors.as_ref(),
+            |existing, value| existing.extend(value.iter().cloned()),
+        );
         #[cfg(feature = "wasm-workflows")]
-        options
-            .wasm_workflow_components
-            .extend(self.wasm_workflow_components.iter().cloned());
+        apply_appending(
+            &mut options.wasm_workflow_components,
+            self.wasm_workflow_components.as_ref(),
+            |existing, value| existing.extend(value.iter().cloned()),
+        );
         Ok(())
-    }
-}
-
-impl<S: simple_plugin_builder::State> SimplePluginBuilder<S> {
-    /// Set the data converter installed on configured clients.
-    ///
-    /// **Experimental:** This API may change or be removed.
-    pub fn data_converter(mut self, data_converter: DataConverter) -> Self {
-        self.data_converter = Some(data_converter);
-        self
-    }
-
-    /// Append a client interceptor.
-    ///
-    /// **Experimental:** This API may change or be removed.
-    pub fn client_interceptor<I: ClientInterceptor>(mut self, interceptor: I) -> Self {
-        self.client_interceptors.push(Arc::new(interceptor));
-        self
-    }
-
-    /// Append a worker interceptor.
-    ///
-    /// **Experimental:** This API may change or be removed.
-    pub fn worker_interceptor<I: WorkerInterceptor + 'static>(mut self, interceptor: I) -> Self {
-        self.worker_interceptors.push(Arc::new(interceptor));
-        self
-    }
-
-    /// Append an activity inbound interceptor.
-    ///
-    /// **Experimental:** This API may change or be removed.
-    pub fn activity_inbound_interceptor<I: ActivityInboundInterceptor>(
-        mut self,
-        interceptor: I,
-    ) -> Self {
-        self.activity_inbound_interceptors
-            .push(Arc::new(interceptor));
-        self
-    }
-
-    /// Append a workflow interceptor constructor.
-    ///
-    /// **Experimental:** This API may change or be removed.
-    pub fn workflow_interceptor(mut self, constructor: WorkflowInterceptorConstructor) -> Self {
-        self.workflow_interceptors.push(constructor);
-        self
-    }
-
-    /// Append every activity defined by an activity implementer.
-    ///
-    /// **Experimental:** This API may change or be removed.
-    pub fn register_activities<AI: ActivityImplementer>(mut self, instance: AI) -> Self {
-        self.activities.register_activities(instance);
-        self
-    }
-
-    /// Append a workflow definition.
-    ///
-    /// **Experimental:** This API may change or be removed.
-    pub fn register_workflow<W>(mut self) -> Result<Self, WorkflowRegistrationError>
-    where
-        W: WorkflowImplementation,
-        <W::Run as WorkflowDefinition>::Input: Send,
-    {
-        self.workflows.register_workflow::<W>()?;
-        Ok(self)
-    }
-
-    /// Append a prebuilt WASM workflow component.
-    ///
-    /// **Experimental:** This API may change or be removed.
-    #[cfg(feature = "wasm-workflows")]
-    pub fn register_wasm_workflow(mut self, component: WasmWorkflowComponent) -> Self {
-        self.wasm_workflow_components.push(component);
-        self
     }
 }
 
@@ -565,22 +577,111 @@ mod tests {
     #[test]
     fn simple_plugin_applies_declarative_values() {
         let plugin = SimplePlugin::builder("simple")
-            .client_interceptor(EmptyClientInterceptor)
+            .client_interceptors(vec![
+                Arc::new(EmptyClientInterceptor) as Arc<dyn ClientInterceptor>
+            ])
             .build();
         let mut client_options = ClientOptions::new("namespace").build();
+        client_options
+            .client_interceptors
+            .push(Arc::new(EmptyClientInterceptor));
         plugin
             .configure_client_options(&mut client_options)
             .unwrap();
-        assert_eq!(client_options.client_interceptors.len(), 1);
+        assert_eq!(client_options.client_interceptors.len(), 2);
 
         let plugin = SimplePlugin::builder("simple")
-            .worker_interceptor(EmptyWorkerInterceptor)
+            .worker_interceptors(vec![
+                Arc::new(EmptyWorkerInterceptor) as Arc<dyn WorkerInterceptor>
+            ])
             .build();
         let client_options = ClientOptions::new("namespace").build();
-        let mut worker_options = WorkerOptions::new("queue").worker_plugin(plugin).build();
+        let mut worker_options = WorkerOptions::new("queue")
+            .worker_interceptor(EmptyWorkerInterceptor)
+            .worker_plugin(plugin)
+            .build();
         apply_worker_plugins(&client_options, &mut worker_options).unwrap();
 
-        assert_eq!(worker_options.worker_interceptors.len(), 1);
+        assert_eq!(worker_options.worker_interceptors.len(), 2);
+    }
+
+    #[test]
+    fn simple_plugin_options_accept_values_and_functions() {
+        let calls = Arc::new(AtomicU8::new(0));
+        let plugin = SimplePlugin::builder("simple")
+            .data_converter({
+                let calls = calls.clone();
+                move |existing: Option<DataConverter>| {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    existing.unwrap()
+                }
+            })
+            .client_interceptors({
+                let calls = calls.clone();
+                move |existing: Option<Vec<Arc<dyn ClientInterceptor>>>| {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    assert_eq!(existing.unwrap().len(), 1);
+                    Vec::new()
+                }
+            })
+            .worker_interceptors({
+                let calls = calls.clone();
+                move |existing: Option<Vec<Arc<dyn WorkerInterceptor>>>| {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    assert_eq!(existing.unwrap().len(), 1);
+                    Vec::new()
+                }
+            })
+            .activity_inbound_interceptors({
+                let calls = calls.clone();
+                move |existing: Option<Vec<Arc<dyn ActivityInboundInterceptor>>>| {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    existing.unwrap()
+                }
+            })
+            .workflow_interceptors({
+                let calls = calls.clone();
+                move |existing: Option<Vec<WorkflowInterceptorConstructor>>| {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    existing.unwrap()
+                }
+            })
+            .activities({
+                let calls = calls.clone();
+                move |existing: Option<ActivityDefinitions>| {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    existing.unwrap()
+                }
+            })
+            .workflows({
+                let calls = calls.clone();
+                move |existing: Option<WorkflowDefinitions>| {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    existing.unwrap()
+                }
+            })
+            .build();
+
+        let mut client_options = ClientOptions::new("namespace").build();
+        client_options
+            .client_interceptors
+            .push(Arc::new(EmptyClientInterceptor));
+        plugin
+            .configure_client_options(&mut client_options)
+            .unwrap();
+        assert!(client_options.client_interceptors.is_empty());
+
+        let mut worker_options = WorkerOptions::new("queue")
+            .worker_interceptor(EmptyWorkerInterceptor)
+            .worker_plugin(plugin)
+            .build();
+        apply_worker_plugins(
+            &ClientOptions::new("namespace").build(),
+            &mut worker_options,
+        )
+        .unwrap();
+        assert!(worker_options.worker_interceptors.is_empty());
+        assert_eq!(calls.load(Ordering::SeqCst), 7);
     }
 
     struct RecursivePlugin(Arc<AtomicU8>);

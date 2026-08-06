@@ -101,7 +101,10 @@ pub use crate::{
         ChildWorkflowStartError, OutgoingActivityError, OutgoingError, OutgoingWorkflowError,
         RetryState, TimeoutType, WorkerCreateError, WorkflowRegistrationError, WorkflowSignalError,
     },
-    plugins::{ClientAndWorkerPlugin, SimplePlugin, SimplePluginBuilder, WorkerPlugin},
+    plugins::{
+        ClientAndWorkerPlugin, SimplePlugin, SimplePluginBuilder, SimplePluginOption, WorkerPlugin,
+        WorkflowDefinitions,
+    },
 };
 pub use temporalio_client::Namespace;
 pub use temporalio_sdk_core::CoreRuntime as Runtime;
@@ -128,7 +131,6 @@ use crate::{
     workflow_executor::{TaskHandle, WorkflowExecutor},
     workflow_future::start_workflow,
     workflow_interceptors::WorkflowInterceptorConstructor,
-    workflow_registry::WorkflowDefinitions,
 };
 use anyhow::{Context, anyhow, bail};
 use futures_util::{FutureExt, StreamExt, TryFutureExt, TryStreamExt};
@@ -1681,11 +1683,47 @@ mod tests {
         }
     }
 
+    #[workflow]
+    #[derive(Default)]
+    struct OtherWorkflow;
+
+    #[workflow_methods]
+    impl OtherWorkflow {
+        #[run]
+        async fn run(_ctx: &mut WorkflowContext<Self>) -> WorkflowResult<()> {
+            Ok(())
+        }
+    }
+
     #[test]
     fn test_workflow_registration() {
         let _ = WorkerOptions::new("task_q")
             .register_workflow::<MyWorkflow>()
             .unwrap();
+    }
+
+    #[test]
+    fn simple_plugin_workflow_function_merges_definitions() {
+        let plugin = SimplePlugin::builder("simple")
+            .workflows(|existing: Option<WorkflowDefinitions>| {
+                assert!(existing.is_some());
+                let mut workflows = WorkflowDefinitions::new();
+                workflows.register_workflow::<OtherWorkflow>().unwrap();
+                workflows
+            })
+            .build();
+        let client_options = ClientOptions::new("namespace").build();
+        let mut worker_options = WorkerOptions::new("task_q")
+            .register_workflow::<MyWorkflow>()
+            .unwrap()
+            .worker_plugin(plugin)
+            .build();
+
+        crate::plugins::apply_worker_plugins(&client_options, &mut worker_options).unwrap();
+
+        let workflows = format!("{:?}", worker_options.workflows());
+        assert!(workflows.contains("MyWorkflow"));
+        assert!(workflows.contains("OtherWorkflow"));
     }
 
     #[test]
