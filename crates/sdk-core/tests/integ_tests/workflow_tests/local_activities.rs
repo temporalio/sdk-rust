@@ -3011,10 +3011,7 @@ async fn local_activity_resolutions_are_delivered_incrementally() {
         completed_while_long_was_running,
         "the short LA sequence did not complete while the long LA was still running"
     );
-    handle
-        .fetch_history_and_replay(worker.inner_mut())
-        .await
-        .unwrap();
+    handle.fetch_history_and_replay(&mut worker).await.unwrap();
 }
 
 #[workflow]
@@ -3088,8 +3085,7 @@ async fn old_batched_local_activity_history_replays() {
         });
     });
 
-    let mut worker = build_fake_sdk(mock_cfg);
-    worker.set_worker_interceptor(activation_assertions);
+    let mut worker = build_fake_sdk_intercepted(mock_cfg, activation_assertions);
     worker
         .register_workflow::<OldBatchedLocalActivityHistoryWf>()
         .unwrap();
@@ -3228,8 +3224,7 @@ async fn mixed_la_completion_times(#[values(true, false)] replay: bool) {
         }
     });
 
-    let mut worker = build_fake_sdk(mock_cfg);
-    worker.set_worker_interceptor(activation_assertions);
+    let mut worker = build_fake_sdk_intercepted(mock_cfg, activation_assertions);
     worker
         .register_workflow::<MixedCompletionTimesWf>()
         .unwrap();
@@ -3319,8 +3314,7 @@ async fn two_las_with_heartbeat(
         }
     });
 
-    let mut worker = build_fake_sdk(mock_cfg);
-    worker.set_worker_interceptor(activation_assertions);
+    let mut worker = build_fake_sdk_intercepted(mock_cfg, activation_assertions);
     worker.register_workflow::<TwoLaWfParallel>().unwrap();
     worker.register_activities(HeartbeatGatedActivity {
         release: release_activities,
@@ -4025,6 +4019,9 @@ async fn replay_out_of_order_local_activity_markers_is_deterministic() {
     let test_name = "replay_out_of_order_local_activity_markers_is_deterministic";
     let mut starter = CoreWfStarter::new(test_name);
     starter.workflow_options.task_timeout = Some(Duration::from_secs(1));
+    starter
+        .sdk_config
+        .worker_interceptor(FailOnNondeterminismInterceptor {});
 
     let release_first = Arc::new(Notify::new());
     starter
@@ -4075,8 +4072,8 @@ async fn replay_out_of_order_local_activity_markers_is_deterministic() {
 
     let replay_core =
         init_core_replay_preloaded(&task_queue, [HistoryForReplay::new(events, workflow_id)]);
-    let inner = worker.inner_mut();
-    inner.with_new_core_worker(Arc::new(replay_core));
-    inner.set_worker_interceptor(FailOnNondeterminismInterceptor {});
-    inner.run().await.unwrap();
+    worker
+        .inner_mut()
+        .with_new_core_worker(Arc::new(replay_core));
+    worker.inner_mut().run().await.unwrap();
 }
