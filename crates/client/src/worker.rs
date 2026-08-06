@@ -1,4 +1,7 @@
-//! Contains types and logic for interactions between clients and Core/SDK workers
+//! Contains types and logic for interactions between clients and Core/SDK workers.
+//!
+//! This module is public for use by `temporalio-sdk-core` and is not intended to be used directly
+//! by SDK users.
 
 use anyhow::bail;
 use parking_lot::RwLock;

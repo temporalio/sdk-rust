@@ -97,10 +97,35 @@ impl RuntimeInfoArray {
                 };
                 Some(CoreEnvironmentRuntime {
                     r#type: runtime_type as i32,
-                    version: runtime.version.to_string(),
+                    version: runtime.version.to_option_string().unwrap_or_default(),
                 })
             })
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn empty_runtime_version_with_null_data_is_supported() {
+        let runtime_info = [RuntimeInfo {
+            runtime_type: RuntimeType::Native,
+            version: ByteArrayRef {
+                data: std::ptr::null(),
+                size: 0,
+            },
+        }];
+        let runtimes = RuntimeInfoArray {
+            data: runtime_info.as_ptr(),
+            size: runtime_info.len(),
+        }
+        .to_core_runtimes();
+
+        assert_eq!(runtimes.len(), 1);
+        assert_eq!(runtimes[0].r#type, CoreRuntimeType::Native as i32);
+        assert!(runtimes[0].version.is_empty());
     }
 }
 
