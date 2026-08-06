@@ -236,21 +236,24 @@ impl Workflows {
                     while let Some(output) = stream.next().await {
                         match output {
                             Ok(o) => {
-                                for fetchreq in o.fetch_histories {
-                                    fetch_tx
-                                        .send(fetchreq)
-                                        .expect("Fetch channel must not be dropped");
-                                }
-                                for action in o.actions {
-                                    activation_tx
-                                        .send(Ok(action))
-                                        .expect("Activation processor channel not dropped");
+                                if !forward_stream_output(
+                                    &fetch_tx,
+                                    &activation_tx,
+                                    &shutdown_tok,
+                                    o,
+                                ) {
+                                    return;
                                 }
                             }
                             Err(e) => {
-                                let _ = activation_tx.send(Err(e)).inspect_err(|e| {
-                                    error!(activation=?e.0, "Activation processor channel dropped");
-                                });
+                                if activation_tx.send(Err(e)).is_err()
+                                    && !on_dropped_downstream_channel(
+                                        &shutdown_tok,
+                                        "Activation processor",
+                                    )
+                                {
+                                    return;
+                                }
                             }
                         }
                     }
@@ -898,6 +901,54 @@ impl Workflows {
             .as_ref()
             .and_then(|sa| sa.worker_task_queue.as_ref())
             .map(|tq| tq.name.clone())
+    }
+}
+
+/// Forwards a batch of workflow-stream output to the fetch and activation channels, whose
+/// receivers live in [Workflows].
+///
+/// Returns `false` when a receiver has been dropped as part of shutdown, signalling the
+/// processing loop to stop. A receiver dropping while the worker is *not* shutting down means
+/// activations would be silently lost, so that case panics instead — see
+/// <https://github.com/temporalio/sdk-core/issues/692>, where an unauthorized worker failing to
+/// start would drop the activation receiver during shutdown and previously trigger a panic.
+fn forward_stream_output(
+    fetch_tx: &UnboundedSender<HistoryFetchReq>,
+    activation_tx: &UnboundedSender<Result<WorkflowStreamAction, PollError>>,
+    shutdown_tok: &CancellationToken,
+    output: WFStreamOutput,
+) -> bool {
+    for fetchreq in output.fetch_histories {
+        if fetch_tx.send(fetchreq).is_err() {
+            return on_dropped_downstream_channel(shutdown_tok, "Fetch");
+        }
+    }
+    for action in output.actions {
+        if activation_tx.send(Ok(action)).is_err() {
+            return on_dropped_downstream_channel(shutdown_tok, "Activation processor");
+        }
+    }
+    true
+}
+
+/// Decides how to react when a downstream channel's receiver has been dropped.
+///
+/// During shutdown the receiver in [Workflows] is expected to go away before the processing loop
+/// notices, so we stop quietly (returning `false`). Outside of shutdown a dropped receiver would
+/// silently discard activations and indicates a bug, so we panic rather than hide it.
+#[cold]
+fn on_dropped_downstream_channel(shutdown_tok: &CancellationToken, channel: &str) -> bool {
+    if shutdown_tok.is_cancelled() {
+        debug!(
+            channel,
+            "Downstream channel dropped during shutdown, stopping workflow processing"
+        );
+        false
+    } else {
+        panic!(
+            "{channel} channel receiver was dropped while the worker was still running. \
+             This should never happen and is a bug in sdk-core."
+        );
     }
 }
 
@@ -1910,5 +1961,67 @@ mod tests {
             ..Default::default()
         };
         prepare_to_ship_activation(&mut act);
+    }
+
+    fn single_activation_output() -> WFStreamOutput {
+        WFStreamOutput {
+            actions: vec![WorkflowStreamAction::Activation(
+                ActivationOrAuto::Autocomplete {
+                    run_id: "run-id".to_string(),
+                },
+            )]
+            .into_iter()
+            .collect(),
+            fetch_histories: Default::default(),
+        }
+    }
+
+    #[test]
+    fn forwarding_output_stops_when_activation_channel_dropped_during_shutdown() {
+        let (fetch_tx, _fetch_rx) = unbounded_channel();
+        let (activation_tx, activation_rx) = unbounded_channel();
+        drop(activation_rx);
+        // A dropped receiver is only tolerated once shutdown has begun.
+        let shutdown_tok = CancellationToken::new();
+        shutdown_tok.cancel();
+
+        assert!(!forward_stream_output(
+            &fetch_tx,
+            &activation_tx,
+            &shutdown_tok,
+            single_activation_output(),
+        ));
+    }
+
+    #[test]
+    #[should_panic(expected = "worker was still running")]
+    fn forwarding_output_panics_when_activation_channel_dropped_outside_shutdown() {
+        let (fetch_tx, _fetch_rx) = unbounded_channel();
+        let (activation_tx, activation_rx) = unbounded_channel();
+        drop(activation_rx);
+        // Not shutting down: losing the receiver is a bug and must not be silently ignored.
+        let shutdown_tok = CancellationToken::new();
+
+        forward_stream_output(
+            &fetch_tx,
+            &activation_tx,
+            &shutdown_tok,
+            single_activation_output(),
+        );
+    }
+
+    #[test]
+    fn forwarding_output_succeeds_with_live_channels() {
+        let (fetch_tx, _fetch_rx) = unbounded_channel();
+        let (activation_tx, mut activation_rx) = unbounded_channel();
+        let shutdown_tok = CancellationToken::new();
+
+        assert!(forward_stream_output(
+            &fetch_tx,
+            &activation_tx,
+            &shutdown_tok,
+            single_activation_output(),
+        ));
+        assert!(activation_rx.try_recv().is_ok());
     }
 }
