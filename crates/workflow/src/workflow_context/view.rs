@@ -40,6 +40,10 @@ impl WorkflowContextView {
         }
     }
 
+    pub(super) fn into_parts(self) -> (String, String, String, InitializeWorkflow) {
+        (self.namespace, self.task_queue, self.run_id, self.raw)
+    }
+
     /// Returns the workflow's unique identifier.
     pub fn workflow_id(&self) -> &str {
         &self.raw.workflow_id

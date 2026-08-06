@@ -4572,6 +4572,50 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Status'
+  /api/v1/namespaces/{namespace}/workflows/{workflow_execution.workflow_id}/time-skipping/poll:
+    get:
+      tags:
+        - WorkflowService
+      operationId: PollWorkflowExecutionTimeSkipping
+      parameters:
+        - name: namespace
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: workflow_execution.workflow_id
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: workflowExecution.workflowId
+          in: query
+          schema:
+            type: string
+        - name: workflowExecution.runId
+          in: query
+          schema:
+            type: string
+        - name: fastForwardId
+          in: query
+          description: |-
+            Required. Identifies the fast-forward whose completion the caller wants to wait for.
+             Must match the `fast_forward_id` set in the execution's TimeSkippingConfig.
+          schema:
+            type: string
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PollWorkflowExecutionTimeSkippingResponse'
+        default:
+          description: Default error response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Status'
   /api/v1/namespaces/{namespace}/workflows/{workflow_execution.workflow_id}/update-options:
     post:
       tags:
@@ -9568,6 +9612,50 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Status'
+  /namespaces/{namespace}/workflows/{workflow_execution.workflow_id}/time-skipping/poll:
+    get:
+      tags:
+        - WorkflowService
+      operationId: PollWorkflowExecutionTimeSkipping
+      parameters:
+        - name: namespace
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: workflow_execution.workflow_id
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: workflowExecution.workflowId
+          in: query
+          schema:
+            type: string
+        - name: workflowExecution.runId
+          in: query
+          schema:
+            type: string
+        - name: fastForwardId
+          in: query
+          description: |-
+            Required. Identifies the fast-forward whose completion the caller wants to wait for.
+             Must match the `fast_forward_id` set in the execution's TimeSkippingConfig.
+          schema:
+            type: string
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PollWorkflowExecutionTimeSkippingResponse'
+        default:
+          description: Default error response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Status'
   /namespaces/{namespace}/workflows/{workflow_execution.workflow_id}/update-options:
     post:
       tags:
@@ -9689,6 +9777,7 @@ components:
             - ACTIVITY_EXECUTION_STATUS_CANCELED
             - ACTIVITY_EXECUTION_STATUS_TERMINATED
             - ACTIVITY_EXECUTION_STATUS_TIMED_OUT
+            - ACTIVITY_EXECUTION_STATUS_PAUSED
           type: string
           description: A general status for this activity, indicates whether it is currently running or in one of the terminal statuses.
           format: enum
@@ -9769,7 +9858,9 @@ components:
           format: date-time
         expirationTime:
           type: string
-          description: Scheduled time + schedule to close timeout.
+          description: |-
+            The time at which the activity's Schedule-to-Close timeout expires.
+             Calculated as `schedule_time` + `start_delay` + `schedule_to_close_timeout`.
           format: date-time
         closeTime:
           type: string
@@ -9851,7 +9942,13 @@ components:
         startDelay:
           pattern: ^-?(?:0|[1-9][0-9]{0,11})(?:\.[0-9]{1,9})?s$
           type: string
-          description: Time to wait before dispatching the first activity task. This delay is not applied to retry attempts.
+          description: Time to wait before making the first activity task available for dispatch. This delay is not applied to retry attempts.
+        executionTime:
+          type: string
+          description: |-
+            The time at which the first activity task is made available for dispatch, computed as
+             `schedule_time + start_delay`. Same as `schedule_time` if `start_delay` is not set.
+          format: date-time
       description: Information about a standalone activity.
     ActivityExecutionListInfo:
       type: object
@@ -9883,6 +9980,7 @@ components:
             - ACTIVITY_EXECUTION_STATUS_CANCELED
             - ACTIVITY_EXECUTION_STATUS_TERMINATED
             - ACTIVITY_EXECUTION_STATUS_TIMED_OUT
+            - ACTIVITY_EXECUTION_STATUS_PAUSED
           type: string
           description: |-
             Only scheduled and terminal statuses appear here. More detailed information in PendingActivityInfo but not
@@ -9907,6 +10005,12 @@ components:
           description: |-
             The difference between close time and scheduled time.
              This field is only populated if the activity is closed.
+        executionTime:
+          type: string
+          description: |-
+            The time at which the first activity task is made available for dispatch, computed as
+             `schedule_time + start_delay`. Same as `schedule_time` if `start_delay` is not set.
+          format: date-time
       description: |-
         Limited activity information returned in the list response.
          When adding fields here, ensure that it is also present in ActivityExecutionInfo (note that it
@@ -9922,6 +10026,21 @@ components:
           allOf:
             - $ref: '#/components/schemas/Failure'
           description: The failure if the activity completed unsuccessfully.
+        retryState:
+          enum:
+            - RETRY_STATE_UNSPECIFIED
+            - RETRY_STATE_IN_PROGRESS
+            - RETRY_STATE_NON_RETRYABLE_FAILURE
+            - RETRY_STATE_TIMEOUT
+            - RETRY_STATE_MAXIMUM_ATTEMPTS_REACHED
+            - RETRY_STATE_RETRY_POLICY_NOT_SET
+            - RETRY_STATE_INTERNAL_SERVER_ERROR
+            - RETRY_STATE_CANCEL_REQUESTED
+          type: string
+          description: |-
+            The retry state associated with an unsuccessful activity execution.
+             This field is only meaningful when `failure` is set.
+          format: enum
       description: 'The outcome of a completed activity execution: either a successful result or a failure.'
     ActivityFailureInfo:
       type: object
@@ -9997,6 +10116,13 @@ components:
           description: |-
             Priority metadata. If this message is not present, or any fields are not
              present, they inherit the values from the workflow.
+        startDelay:
+          pattern: ^-?(?:0|[1-9][0-9]{0,11})(?:\.[0-9]{1,9})?s$
+          type: string
+          description: |-
+            Time to wait before making the first activity task available for dispatch. This delay is not applied to retry attempts.
+             When updated, the time is added to the original `schedule_time`, not to the current time.
+             If the resulting time is in the past, the task is made available for dispatch immediately.
     ActivityPropertiesModifiedExternallyEventAttributes:
       type: object
       properties:
@@ -10328,6 +10454,20 @@ components:
         createTime:
           type: string
           format: date-time
+    BatchOperationCancelActivities:
+      type: object
+      properties:
+        identity:
+          type: string
+          description: The identity of the worker/client
+        reason:
+          type: string
+          description: |-
+            Reason for requesting the cancellation, recorded and available via the PollActivityExecution API.
+             Not propagated to a worker if an activity attempt is currently running.
+      description: |-
+        BatchOperationCancelActivities sends cancel requests to a batch of activities.
+         Keep the parameter in sync with temporal.api.workflowservice.v1.RequestCancelActivityExecutionRequest.
     BatchOperationCancellation:
       type: object
       properties:
@@ -10338,6 +10478,12 @@ components:
         BatchOperationCancellation sends cancel requests to batch workflows.
          Keep the parameter in sync with temporal.api.workflowservice.v1.RequestCancelWorkflowExecutionRequest.
          Ignore first_execution_run_id because this is used for single workflow operation.
+    BatchOperationDeleteActivities:
+      type: object
+      properties: {}
+      description: |-
+        BatchOperationDeleteActivities sends deletion requests to a batch of activities.
+         Keep the parameter in sync with temporal.api.workflowservice.v1.DeleteActivityExecutionRequest.
     BatchOperationDeletion:
       type: object
       properties:
@@ -10370,6 +10516,30 @@ components:
           type: string
           description: Batch operation close time
           format: date-time
+        operationType:
+          enum:
+            - BATCH_OPERATION_TYPE_UNSPECIFIED
+            - BATCH_OPERATION_TYPE_TERMINATE
+            - BATCH_OPERATION_TYPE_TERMINATE_WORKFLOW
+            - BATCH_OPERATION_TYPE_CANCEL
+            - BATCH_OPERATION_TYPE_CANCEL_WORKFLOW
+            - BATCH_OPERATION_TYPE_SIGNAL
+            - BATCH_OPERATION_TYPE_SIGNAL_WORKFLOW
+            - BATCH_OPERATION_TYPE_DELETE
+            - BATCH_OPERATION_TYPE_DELETE_WORKFLOW
+            - BATCH_OPERATION_TYPE_RESET
+            - BATCH_OPERATION_TYPE_RESET_WORKFLOW
+            - BATCH_OPERATION_TYPE_UPDATE_EXECUTION_OPTIONS
+            - BATCH_OPERATION_TYPE_UPDATE_WORKFLOW_EXECUTION_OPTIONS
+            - BATCH_OPERATION_TYPE_UNPAUSE_ACTIVITY
+            - BATCH_OPERATION_TYPE_UPDATE_ACTIVITY_OPTIONS
+            - BATCH_OPERATION_TYPE_RESET_ACTIVITY
+            - BATCH_OPERATION_TYPE_TERMINATE_ACTIVITY
+            - BATCH_OPERATION_TYPE_CANCEL_ACTIVITY
+            - BATCH_OPERATION_TYPE_DELETE_ACTIVITY
+          type: string
+          description: Operation type
+          format: enum
     BatchOperationReset:
       type: object
       properties:
@@ -10464,6 +10634,20 @@ components:
       description: |-
         BatchOperationSignal sends signals to batch workflows.
          Keep the parameter in sync with temporal.api.workflowservice.v1.SignalWorkflowExecutionRequest.
+    BatchOperationTerminateActivities:
+      type: object
+      properties:
+        identity:
+          type: string
+          description: The identity of the worker/client
+        reason:
+          type: string
+          description: |-
+            Reason for requesting the termination, recorded and available via the PollActivityExecution API.
+             Not propagated to a worker if an activity attempt is currently running.
+      description: |-
+        BatchOperationTerminateActivities sends terminate requests to a batch of activities.
+         Keep the parameter in sync with temporal.api.workflowservice.v1.TerminateActivityExecutionRequest.
     BatchOperationTermination:
       type: object
       properties:
@@ -11593,14 +11777,23 @@ components:
           enum:
             - BATCH_OPERATION_TYPE_UNSPECIFIED
             - BATCH_OPERATION_TYPE_TERMINATE
+            - BATCH_OPERATION_TYPE_TERMINATE_WORKFLOW
             - BATCH_OPERATION_TYPE_CANCEL
+            - BATCH_OPERATION_TYPE_CANCEL_WORKFLOW
             - BATCH_OPERATION_TYPE_SIGNAL
+            - BATCH_OPERATION_TYPE_SIGNAL_WORKFLOW
             - BATCH_OPERATION_TYPE_DELETE
+            - BATCH_OPERATION_TYPE_DELETE_WORKFLOW
             - BATCH_OPERATION_TYPE_RESET
+            - BATCH_OPERATION_TYPE_RESET_WORKFLOW
             - BATCH_OPERATION_TYPE_UPDATE_EXECUTION_OPTIONS
+            - BATCH_OPERATION_TYPE_UPDATE_WORKFLOW_EXECUTION_OPTIONS
             - BATCH_OPERATION_TYPE_UNPAUSE_ACTIVITY
             - BATCH_OPERATION_TYPE_UPDATE_ACTIVITY_OPTIONS
             - BATCH_OPERATION_TYPE_RESET_ACTIVITY
+            - BATCH_OPERATION_TYPE_TERMINATE_ACTIVITY
+            - BATCH_OPERATION_TYPE_CANCEL_ACTIVITY
+            - BATCH_OPERATION_TYPE_DELETE_ACTIVITY
           type: string
           description: Batch operation type
           format: enum
@@ -11639,6 +11832,14 @@ components:
         reason:
           type: string
           description: Reason indicates the reason to stop a operation
+        query:
+          type: string
+          description: Query is the visibility query that defines the group of workflow to apply the batch operation
+        executions:
+          type: array
+          items:
+            $ref: '#/components/schemas/Execution'
+          description: Executions is the list of workflow OR standalone activity executions to apply the batch operation
     DescribeDeploymentResponse:
       type: object
       properties:
@@ -11670,9 +11871,18 @@ components:
           items:
             $ref: '#/components/schemas/PollerGroupInfo'
           description: |-
-            The initial info that client should use for poller group assignment. This information is
+            Deprecated. Use `poller_groups_info` instead, which carries a version so the client can
+             ignore stale updates.
+             The initial info that client should use for poller group assignment. This information is
              updated through poll response. Client is supposed to use the info received in the latest
              poll response.
+        pollerGroupsInfo:
+          allOf:
+            - $ref: '#/components/schemas/PollerGroupsInfo'
+          description: |-
+            The initial, versioned info that client should use for poller group assignment. This
+             information is updated through poll responses. Client is supposed to use the info with the
+             highest version it has received.
     DescribeNexusOperationExecutionResponse:
       type: object
       properties:
@@ -11977,6 +12187,135 @@ components:
           type: string
           description: Nexus task queue to route requests to.
       description: Target a worker polling on a Nexus task queue in a specific namespace.
+    EnvironmentInfo:
+      type: object
+      properties:
+        runtimes:
+          type: array
+          items:
+            $ref: '#/components/schemas/EnvironmentInfo_Runtime'
+          description: The runtime(s) the SDK is operating in.
+        hostingEnvironments:
+          type: array
+          items:
+            $ref: '#/components/schemas/EnvironmentInfo_HostingEnvironment'
+          description: 'The hosting environment(s) the SDK is operating in. Repeated to allow for layering (ex: Docker inside k8s).'
+        platform:
+          allOf:
+            - $ref: '#/components/schemas/EnvironmentInfo_Platform'
+          description: The platform the SDK is operating on.
+    EnvironmentInfo_HostingEnvironment:
+      type: object
+      properties:
+        type:
+          enum:
+            - HOSTING_ENVIRONMENT_TYPE_UNSPECIFIED
+            - HOSTING_ENVIRONMENT_TYPE_DOCKER
+            - HOSTING_ENVIRONMENT_TYPE_K8S
+            - HOSTING_ENVIRONMENT_TYPE_AWS_LAMBDA
+            - HOSTING_ENVIRONMENT_TYPE_AWS_ECS
+            - HOSTING_ENVIRONMENT_TYPE_GOOGLE_CLOUD_RUN
+            - HOSTING_ENVIRONMENT_TYPE_GOOGLE_APP_ENGINE
+            - HOSTING_ENVIRONMENT_TYPE_AZURE_APP_SERVICE
+            - HOSTING_ENVIRONMENT_TYPE_AZURE_FUNCTIONS
+            - HOSTING_ENVIRONMENT_TYPE_AZURE_CONTAINER_APPS
+          type: string
+          description: The type of hosting environment.
+          format: enum
+        version:
+          type: string
+          description: The version of the hosting environment, if obtainable.
+    EnvironmentInfo_LinuxPlatform:
+      type: object
+      properties:
+        version:
+          type: string
+          description: The Linux kernel or distribution version, if obtainable.
+        architecture:
+          enum:
+            - ARCHITECTURE_UNSPECIFIED
+            - ARCHITECTURE_AMD64
+            - ARCHITECTURE_ARM64
+          type: string
+          description: The architecture of the worker process.
+          format: enum
+        libc:
+          enum:
+            - LIBC_UNSPECIFIED
+            - LIBC_GLIBC
+            - LIBC_MUSL
+          type: string
+          description: The libc used by the worker process.
+          format: enum
+    EnvironmentInfo_MacOSPlatform:
+      type: object
+      properties:
+        version:
+          type: string
+          description: The macOS version, if obtainable.
+        architecture:
+          enum:
+            - ARCHITECTURE_UNSPECIFIED
+            - ARCHITECTURE_AMD64
+            - ARCHITECTURE_ARM64
+          type: string
+          description: The architecture of the worker process.
+          format: enum
+    EnvironmentInfo_Platform:
+      type: object
+      properties:
+        linux:
+          $ref: '#/components/schemas/EnvironmentInfo_LinuxPlatform'
+        macos:
+          $ref: '#/components/schemas/EnvironmentInfo_MacOSPlatform'
+        windows:
+          $ref: '#/components/schemas/EnvironmentInfo_WindowsPlatform'
+    EnvironmentInfo_Runtime:
+      type: object
+      properties:
+        type:
+          enum:
+            - RUNTIME_TYPE_UNSPECIFIED
+            - RUNTIME_TYPE_JVM
+            - RUNTIME_TYPE_CPYTHON
+            - RUNTIME_TYPE_NODE
+            - RUNTIME_TYPE_BUN
+            - RUNTIME_TYPE_CRUBY
+            - RUNTIME_TYPE_GO
+            - RUNTIME_TYPE_DOTNET_FRAMEWORK
+            - RUNTIME_TYPE_DOTNET_CORE
+            - RUNTIME_TYPE_NATIVE
+            - RUNTIME_TYPE_ROADRUNNER
+          type: string
+          description: The type of the runtime.
+          format: enum
+        version:
+          type: string
+          description: The version of the runtime, if obtainable.
+    EnvironmentInfo_WindowsPlatform:
+      type: object
+      properties:
+        version:
+          type: string
+          description: The Windows version, if obtainable.
+        architecture:
+          enum:
+            - ARCHITECTURE_UNSPECIFIED
+            - ARCHITECTURE_AMD64
+            - ARCHITECTURE_ARM64
+          type: string
+          description: The architecture of the worker process.
+          format: enum
+        crt:
+          enum:
+            - CRT_UNSPECIFIED
+            - CRT_UCRT
+            - CRT_MSVCRT
+            - CRT_MINGW
+            - CRT_CYGWIN
+          type: string
+          description: The C runtime used by the worker process, if obtainable.
+          format: enum
     EventGroupMarker:
       type: object
       properties:
@@ -12033,6 +12372,23 @@ components:
              in a given workflow execution that carry the same label, provided that
              they have the distinct ID.
       description: A user-defined short-form string value to be used as the group's label.
+    Execution:
+      type: object
+      properties:
+        type:
+          enum:
+            - EXECUTION_TYPE_UNSPECIFIED
+            - EXECUTION_TYPE_WORKFLOW
+            - EXECUTION_TYPE_ACTIVITY
+          type: string
+          format: enum
+        businessId:
+          type: string
+        runId:
+          type: string
+      description: |-
+        Identifies a specific execution within a namespace. This is used for standalone activities
+         executions in batch jobs currently.
     ExternalWorkflowExecutionCancelRequestedEventAttributes:
       type: object
       properties:
@@ -12130,6 +12486,28 @@ components:
           $ref: '#/components/schemas/NexusOperationFailureInfo'
         nexusHandlerFailureInfo:
           $ref: '#/components/schemas/NexusHandlerFailureInfo'
+    FastForwardConfig:
+      type: object
+      properties:
+        id:
+          type: string
+          description: |-
+            A client-supplied ID, required field, set alongside `duration`. It is used to poll for
+             fast-forward completion via PollWorkflowExecutionTimeSkipping.
+             The server performs no idempotency check on this ID; the client is responsible for managing it.
+        duration:
+          pattern: ^-?(?:0|[1-9][0-9]{0,11})(?:\.[0-9]{1,9})?s$
+          type: string
+          description: |-
+            Fast-forward the current execution by this duration ahead of the current execution time; required field.
+             The duration yields a target time (current execution time + duration), surfaced as `target_time` in
+             TimeSkippingFastForwardInfo. Once virtual time reaches that target, the fast-forward completes, time
+             skipping is disabled, and no further time is skipped. Time skipping can be resumed either
+             by updating the TimeSkippingConfig with a new FastForwardConfig, or by clearing the FastForwardConfig
+             to skip through to the end of the execution.
+
+             If this duration exceeds the remaining execution timeout, time will not pass beyond the end
+             of the execution, and the fast-forward won't have a chance to complete.
     FetchWorkerConfigRequest:
       type: object
       properties:
@@ -12283,6 +12661,12 @@ components:
             True if the server supports server-scaled deployments.
              This flag is dependent both on server version and for server-scaled deployments
              to be enabled via server configuration.
+        serverScaledProviderCloudRun:
+          type: boolean
+          description: |-
+            True if the server supports the Cloud Run compute provider for
+             server-scaled deployments. Dependent on server version and the
+             provider being enabled via server configuration.
       description: System capability details.
     GetWorkerBuildIdCompatibilityResponse:
       type: object
@@ -13167,6 +13551,18 @@ components:
         pollerAutoscalingAutoEnroll:
           type: boolean
           description: When true, workers should use poller autoscaling by default unless explicitly configured otherwise.
+        workflowTaskCompletionPagination:
+          type: boolean
+          description: True if the namespace supports pagination of `RespondWorkflowTaskCompleted` request.
+        standaloneActivityStartDelay:
+          type: boolean
+          description: True if the namespace supports start delay for standalone activities.
+        standaloneActivityBatchOperations:
+          type: boolean
+          description: True if the namespace supports batch operations for standalone activities.
+        standaloneActivityOperatorCommands:
+          type: boolean
+          description: True if the namespace supports standalone activity operator commands.
       description: Namespace capability details. Should contain what features are enabled in a namespace.
     NamespaceInfo_Limits:
       type: object
@@ -13180,6 +13576,12 @@ components:
         memoSizeLimitError:
           type: string
           description: Maximum total memo size in bytes per workflow execution.
+        workflowTaskCompletionSizeLimitError:
+          type: string
+          description: |-
+            Maximum total size in bytes of a single RespondWorkflowTaskCompleted request.
+             Requests exceeding this fail the workflow task with
+             WORKFLOW_TASK_FAILED_CAUSE_REQUEST_TOO_LARGE. 0 means no explicit limit.
     NamespaceReplicationConfig:
       type: object
       properties:
@@ -13841,7 +14243,7 @@ components:
           description: The ID of the activity to target.
         runId:
           type: string
-          description: Run ID of the workflow or standalone activity.
+          description: Run ID of the workflow or standalone activity. If empty, targets the latest run.
         identity:
           type: string
           description: The identity of the client who initiated this request.
@@ -14254,6 +14656,27 @@ components:
           allOf:
             - $ref: '#/components/schemas/Failure'
           description: The failure if the operation completed unsuccessfully.
+    PollWorkflowExecutionTimeSkippingResponse:
+      type: object
+      properties:
+        fastForwardPollingResult:
+          enum:
+            - FAST_FORWARD_POLLING_RESULT_UNSPECIFIED
+            - FAST_FORWARD_POLLING_RESULT_POLL_TIMEOUT
+            - FAST_FORWARD_POLLING_RESULT_FAST_FORWARD_COMPLETED
+            - FAST_FORWARD_POLLING_RESULT_FAST_FORWARD_FAILED
+          type: string
+          description: The outcome of the poll for the fast-forward identified by the request's `fast_forward_id`.
+          format: enum
+        failedReason:
+          type: string
+          description: |-
+            Set only when the result is FAST_FORWARD_POLLING_RESULT_FAST_FORWARD_FAILED; explains why
+             the fast-forward can no longer complete.
+        fastForwardInfo:
+          allOf:
+            - $ref: '#/components/schemas/TimeSkippingFastForwardInfo'
+          description: The execution's current fast-forward, if any.
     PollWorkflowTaskQueueResponse:
       type: object
       properties:
@@ -14355,8 +14778,21 @@ components:
           items:
             $ref: '#/components/schemas/PollerGroupInfo'
           description: |-
-            The weighted list of poller groups IDs that client should use for future polls to this task
+            Deprecated. Use `poller_groups_info` instead, which carries a version so the client can
+             ignore stale updates.
+             The weighted list of poller groups IDs that client should use for future polls to this task
              queue. Client is expected to:
+               1. Maintain minimum number of pollers no less than the number of groups.
+               2. Try to assign the next poll to a group without any pending polls,
+               3. If every group has some pending polls, assign the next poll to a group randomly
+                 according to the weights.
+        pollerGroupsInfo:
+          allOf:
+            - $ref: '#/components/schemas/PollerGroupsInfo'
+          description: |-
+            The weighted, versioned list of poller groups IDs that client should use for future polls to
+             this task queue. Client should ignore this if it has already applied a snapshot with a
+             version greater than or equal to `poller_groups_info.version`. Client is expected to:
                1. Maintain minimum number of pollers no less than the number of groups.
                2. Try to assign the next poll to a group without any pending polls,
                3. If every group has some pending polls, assign the next poll to a group randomly
@@ -14369,6 +14805,23 @@ components:
         weight:
           type: number
           format: float
+    PollerGroupsInfo:
+      type: object
+      properties:
+        version:
+          type: string
+          description: |-
+            Monotonically increasing version of this snapshot. A client should ignore any snapshot whose
+             version is not greater than the one it last applied.
+        pollerGroups:
+          type: array
+          items:
+            $ref: '#/components/schemas/PollerGroupInfo'
+          description: The weighted list of poller groups the client should use for future polls to this task queue.
+      description: |-
+        A versioned snapshot of the poller groups the client should use for future polls to a task
+         queue. The version is monotonically increasing so that a client can ignore a snapshot that is
+         older than the one it has already applied.
     PollerInfo:
       type: object
       properties:
@@ -14598,6 +15051,10 @@ components:
           $ref: '#/components/schemas/Payloads'
         queryRejected:
           $ref: '#/components/schemas/QueryRejected'
+        link:
+          allOf:
+            - $ref: '#/components/schemas/Link'
+          description: Holds the link to the Workflow execution that processed the Query.
     RampByPercentage:
       type: object
       properties:
@@ -14827,7 +15284,7 @@ components:
           type: string
         runId:
           type: string
-          description: Activity run ID, targets the latest run if run_id is empty.
+          description: Activity run ID. If empty, targets the latest run.
         identity:
           type: string
           description: The identity of the worker/client.
@@ -15047,15 +15504,10 @@ components:
           description: The ID of the activity to target.
         runId:
           type: string
-          description: Run ID of the workflow or standalone activity.
+          description: Run ID of the workflow or standalone activity. If empty, targets the latest run.
         identity:
           type: string
           description: The identity of the client who initiated this request.
-        resetHeartbeat:
-          type: boolean
-          description: |-
-            Indicates that activity should reset heartbeat details.
-             This flag will be applied only to the new instance of the activity.
         keepPaused:
           type: boolean
           description: If activity is paused, it will remain paused after reset
@@ -15074,6 +15526,9 @@ components:
         resourceId:
           type: string
           description: Resource ID for routing. Contains "workflow:{workflow_id}" for workflow activities or "activity:{activity_id}" for standalone activities.
+        requestId:
+          type: string
+          description: Used to de-dupe reset requests.
     ResetActivityExecutionResponse:
       type: object
       properties: {}
@@ -16364,9 +16819,9 @@ components:
           pattern: ^-?(?:0|[1-9][0-9]{0,11})(?:\.[0-9]{1,9})?s$
           type: string
           description: |-
-            Time to wait before dispatching the first workflow task. Cannot be used with `cron_schedule`.
+            Time to wait before making the first workflow task available for dispatch. Cannot be used with `cron_schedule`.
              Note that the signal will be delivered with the first workflow task. If the workflow gets
-             another SignalWithStartWorkflow before the delay a workflow task will be dispatched immediately
+             another SignalWithStartWorkflow before the delay a workflow task will be made available for dispatch immediately
              and the rest of the delay period will be ignored, even if that request also had a delay.
              Signal via SignalWorkflowExecution will not unblock the workflow.
         userMetadata:
@@ -16401,6 +16856,9 @@ components:
         runId:
           type: string
           description: The run id of the workflow that was started - or just signaled, if it was already running.
+        firstExecutionRunId:
+          type: string
+          description: If the workflow was started as a result of a de-dupe, this field will contain the run id of the first execution in the chain.
         started:
           type: boolean
           description: If true, a new workflow was started.
@@ -16583,7 +17041,7 @@ components:
         startDelay:
           pattern: ^-?(?:0|[1-9][0-9]{0,11})(?:\.[0-9]{1,9})?s$
           type: string
-          description: Time to wait before dispatching the first activity task. This delay is not applied to retry attempts.
+          description: Time to wait before making the first activity task available for dispatch. This delay is not applied to retry attempts.
     StartActivityExecutionResponse:
       type: object
       properties:
@@ -16621,6 +17079,14 @@ components:
           description: |-
             Executions to apply the batch operation
              This field and `visibility_query` are mutually exclusive
+             DEPRECATED: Use `target_executions` instead.
+        targetExecutions:
+          type: array
+          items:
+            $ref: '#/components/schemas/Execution'
+          description: |-
+            Target executions to apply the batch operation. This field and `visibility_query`
+             are mutually exclusive.
         maxOperationsPerSecond:
           type: number
           description: |-
@@ -16649,6 +17115,12 @@ components:
           $ref: '#/components/schemas/BatchOperationResetActivities'
         updateActivityOptionsOperation:
           $ref: '#/components/schemas/BatchOperationUpdateActivityOptions'
+        cancelActivitiesOperation:
+          $ref: '#/components/schemas/BatchOperationCancelActivities'
+        terminateActivitiesOperation:
+          $ref: '#/components/schemas/BatchOperationTerminateActivities'
+        deleteActivitiesOperation:
+          $ref: '#/components/schemas/BatchOperationDeleteActivities'
     StartBatchOperationResponse:
       type: object
       properties: {}
@@ -16671,6 +17143,7 @@ components:
             - START_CHILD_WORKFLOW_EXECUTION_FAILED_CAUSE_UNSPECIFIED
             - START_CHILD_WORKFLOW_EXECUTION_FAILED_CAUSE_WORKFLOW_ALREADY_EXISTS
             - START_CHILD_WORKFLOW_EXECUTION_FAILED_CAUSE_NAMESPACE_NOT_FOUND
+            - START_CHILD_WORKFLOW_EXECUTION_FAILED_CAUSE_INVALID_VERSIONING_OVERRIDE
           type: string
           format: enum
         control:
@@ -16768,6 +17241,12 @@ components:
           description: |-
             The time-skipping state propagated from the parent workflow. This can be nil if no time skipping
              has occurred or there is no previous run.
+        versioningOverride:
+          allOf:
+            - $ref: '#/components/schemas/VersioningOverride'
+          description: |-
+            Versioning override requested for the child workflow. If present, this explicit override
+             takes precedence over versioning behavior inherited from the parent workflow.
     StartNexusOperationExecutionRequest:
       type: object
       properties:
@@ -16972,8 +17451,8 @@ components:
           pattern: ^-?(?:0|[1-9][0-9]{0,11})(?:\.[0-9]{1,9})?s$
           type: string
           description: |-
-            Time to wait before dispatching the first workflow task. Cannot be used with `cron_schedule`.
-             If the workflow gets a signal before the delay, a workflow task will be dispatched and the rest
+            Time to wait before making the first workflow task available for dispatch. Cannot be used with `cron_schedule`.
+             If the workflow gets a signal before the delay, a workflow task will be made available for dispatch and the rest
              of the delay will be ignored.
         completionCallbacks:
           type: array
@@ -17027,6 +17506,9 @@ components:
         runId:
           type: string
           description: The run id of the workflow that was started - or used (via WorkflowIdConflictPolicy USE_EXISTING).
+        firstExecutionRunId:
+          type: string
+          description: If the workflow was started as a result of a de-dupe, this field will contain the run id of the first execution in the chain.
         started:
           type: boolean
           description: If true, a new workflow was started.
@@ -17274,6 +17756,13 @@ components:
                workflow goes to a normal queue, and the rest workflow tasks go to the Sticky queue associated with a specific
                worker instance.
           format: float
+        rateLimitingActive:
+          type: boolean
+          description: |-
+            Whether rate limiting blocked any dispatches within the recent observation window (approximately
+             30 seconds). When true, adding more workers will not increase throughput — the bottleneck is the
+             rate limit, not worker count. This field is useful for auto-scaling systems to avoid unnecessary
+             scale-up.
       description: |-
         TaskQueueStats contains statistics about task queue backlog and activity.
 
@@ -17378,7 +17867,7 @@ components:
           type: string
         runId:
           type: string
-          description: Activity run ID, targets the latest run if run_id is empty.
+          description: Activity run ID. If empty, targets the latest run.
         identity:
           type: string
           description: The identity of the worker/client.
@@ -17455,41 +17944,93 @@ components:
         enabled:
           type: boolean
           description: Enables or disables time skipping for this workflow execution.
-        fastForward:
-          pattern: ^-?(?:0|[1-9][0-9]{0,11})(?:\.[0-9]{1,9})?s$
-          type: string
-          description: |-
-            Optionally fast-forward the current workflow execution by this duration ahead of current workflow execution time.
-             After the fast-forward completes, time skipping is disabled, and this
-             action is recorded in the WorkflowExecutionTimeSkippingTransitionedEvent. It can be re-enabled by
-             setting `enabled` to true or setting `fast_forward` again via UpdateWorkflowExecutionOptions.
-             The current workflow execution is a chain of runs (retries, cron, continue-as-new);
-             child workflows are separate executions, so this fast_forward won't affect them.
-
-             For a given workflow execution, only one active fast-forward is allowed at a time.
-             If a new fast-forward is set via UpdateWorkflowExecutionOptions before the previous
-             one completes, the new one will override the previous one.
-             If the fast-forward duration exceeds the remaining execution timeout, time will only
-             be fast-forwarded up to the end of the execution.
-        disableChildPropagation:
+        fastForwardConfig:
+          allOf:
+            - $ref: '#/components/schemas/FastForwardConfig'
+          description: An optional opt-in to control time-skipping behavior through fast-forward; see its definition for details.
+        disablePropagation:
           type: boolean
           description: |-
-            By default, child workflows inherit the "enabled" flag when they are started.
+            By default, executions started by another execution (e.g. a child workflow of a parent workflow or
+             a schedule with the time-skipping policy enabled) inherit the "enabled" flag and skip time when possible.
              This flag disables that inheritance.
-      description: |-
-        The configuration for time skipping of a workflow execution (a chain of runs including retries, cron, continue-as-new).
-         When time skipping is enabled, virtual time advances automatically whenever there is no in-flight work.
-         In-flight work includes activities, child workflows, Nexus operations, signal/cancel external workflow operations,
-         and possibly other features added in the future.
-         User timers are not classified as in-flight work and will be skipped over; the virtual clock may also skip to the
-         time point of the registered fast forward when there is no in-flight work.
-         When time is skipped, a WorkflowExecutionTimeSkippingTransitionedEvent will be
-         added to the workflow history to capture the state changes.
+        maxSessionSkipCount:
+          type: integer
+          description: |-
+            The maximum number of skips allowed every time this field is updated. It protects the execution from
+             situations like unlimited retries when backoff is skipped.
 
+             Every time the execution skips time, the skip count is incremented by one, and when it reaches
+             max_session_skip_count, time skipping stops. Whenever this config field is updated, the accumulated
+             skip count is cleared, marking the start of a new session.
+             For an execution with a chain of runs (retry, cron, continue-as-new), the count is accumulated
+             across all runs within the same session.
+
+             If this field is not set, the server applies a large default value (e.g. 100). The default can
+             be changed through dynamic config, and is overridden by this field when set.
+          format: int32
+      description: |-
+        The configuration for time skipping of an execution.
+         When time skipping is enabled, virtual time advances automatically whenever there is no in-flight work.
+         Options like fast_forward, disable_propagation, and max_session_skip_count are provided for granular
+         control of the execution's time skipping behavior. See each field's comment for a detailed explanation.
+
+         An example of workflows with time skipping:
+         For workflows, an execution is a chain of runs including retries, cron, and continue-as-new.
+         In-flight work includes activities, child workflows, Nexus operations, signal/cancel external workflow operations, etc.
+         User timers are not classified as in-flight work and will be skipped over; the virtual clock may also skip to the
+         time point of the registered fast-forward when there is no in-flight work.
+         Whenever time is skipped, the skip count is incremented by one; max_session_skip_count bounds the number of skips allowed within a single time-skipping session.
          For child workflows, by default, if the parent execution is skipping time, the child execution will also skip time,
          but a parent's fast_forward won't affect its child's execution. A flag is provided to disable propagation of the
          "enabled" flag to child workflows; regardless of that flag, a child workflow inherits the virtual time from the
          parent execution as its start time.
+    TimeSkippingFastForwardInfo:
+      type: object
+      properties:
+        fastForwardDuration:
+          pattern: ^-?(?:0|[1-9][0-9]{0,11})(?:\.[0-9]{1,9})?s$
+          type: string
+          description: The client-supplied `fast_forward` duration.
+        fastForwardId:
+          type: string
+          description: The client-supplied ID set alongside `fast_forward` duration.
+        targetTime:
+          type: string
+          description: The target virtual time at which the fast-forward completes.
+          format: date-time
+        hasCompleted:
+          type: boolean
+          description: True once `target_time` has been reached.
+      description: TimeSkippingFastForwardInfo describes the current time-skipping fast-forward on an execution.
+    TimeSkippingInfo:
+      type: object
+      properties:
+        currentTime:
+          type: string
+          description: |-
+            Current virtual time of the execution. If the execution hasn't skipped
+             any time yet, it will be the same as wall clock time.
+          format: date-time
+        effectiveConfig:
+          allOf:
+            - $ref: '#/components/schemas/TimeSkippingConfig'
+          description: |-
+            The current effective time-skipping config, which can differ from the config the user last set:
+             internally-defaulted fields are populated, and `enabled` reflects whether the execution is still
+             skipping time — e.g. it is set to false once `max_session_skip_count` is reached, the fast-forward
+             completes, or a client call disables time skipping.
+        fastForwardInfo:
+          allOf:
+            - $ref: '#/components/schemas/TimeSkippingFastForwardInfo'
+          description: The execution's current fast-forward, if any. Unset if time skipping is enabled without a fast-forward.
+        currentSessionSkipCount:
+          type: integer
+          description: |-
+            The number of skips accumulated in the current session, bounded by `max_session_skip_count`.
+             A new session begins — and this resets to 0 — each time `max_session_skip_count` is updated.
+          format: int32
+      description: Describes the current time-skipping state of a workflow execution.
     TimeSkippingStatePropagation:
       type: object
       properties:
@@ -17497,17 +18038,19 @@ components:
           pattern: ^-?(?:0|[1-9][0-9]{0,11})(?:\.[0-9]{1,9})?s$
           type: string
           description: |-
-            The time skipped by the previous execution that started this workflow.
-             It can happen in child workflows and a chain of runs (CaN, cron, retry).
+            The time skipped by the previous run. It is propagated both to executions started by the
+             current execution and through a chain of runs (CaN, cron, retry).
         fastForwardTargetTime:
           type: string
-          description: |-
-            If there is a fast-forward action set for the previous run in a chain of runs,
-             the target time should be propagated to the next run as well.
+          description: The fast-forward target time. It only propagates across a chain of runs within the same execution.
           format: date-time
+        initialSkipCount:
+          type: integer
+          description: The initial skip count. It only propagates across a chain of runs within the same execution.
+          format: int32
       description: |-
-        The time-skipping state that needs to be propagated from a parent workflow to a child workflow,
-         or through a chain of runs.
+        The time-skipping state that needs to be propagated from one execution to another, or through a chain of runs
+         within the same execution.
     TimeoutFailureInfo:
       type: object
       properties:
@@ -17640,16 +18183,10 @@ components:
           description: The ID of the activity to target.
         runId:
           type: string
-          description: Run ID of the workflow or standalone activity.
+          description: Run ID of the workflow or standalone activity. If empty, targets the latest run.
         identity:
           type: string
           description: The identity of the client who initiated this request.
-        resetAttempts:
-          type: boolean
-          description: Providing this flag will also reset the number of attempts.
-        resetHeartbeat:
-          type: boolean
-          description: Providing this flag will also reset the heartbeat details.
         reason:
           type: string
           description: Reason to unpause the activity.
@@ -17660,6 +18197,9 @@ components:
         resourceId:
           type: string
           description: Resource ID for routing. Contains "workflow:{workflow_id}" for workflow activities or "activity:{activity_id}" for standalone activities.
+        requestId:
+          type: string
+          description: Used to de-dupe unpause requests.
     UnpauseActivityExecutionResponse:
       type: object
       properties: {}
@@ -17741,7 +18281,7 @@ components:
           description: The ID of the activity to target.
         runId:
           type: string
-          description: Run ID of the workflow or standalone activity.
+          description: Run ID of the workflow or standalone activity. If empty, targets the latest run.
         identity:
           type: string
           description: The identity of the client who initiated this request
@@ -17764,6 +18304,9 @@ components:
         resourceId:
           type: string
           description: Resource ID for routing. Contains "workflow:{workflow_id}" for workflow activities or "activity:{activity_id}" for standalone activities.
+        requestId:
+          type: string
+          description: Used to de-dupe update requests.
     UpdateActivityExecutionOptionsResponse:
       type: object
       properties:
@@ -18177,6 +18720,9 @@ components:
           description: |-
             The Workflow Execution time when the options were updated. When time skipping is
              enabled, this is the workflow's virtual time rather than wall-clock time.
+
+             This timestamp cannot be used for time-skipping fast-forward verification,
+             use `fast_forward_id` in `PollWorkflowExecutionTimeSkippingRequest` instead.
           format: date-time
     UpdateWorkflowExecutionRequest:
       type: object
@@ -18909,6 +19455,10 @@ components:
           items:
             $ref: '#/components/schemas/StorageDriverInfo'
           description: Storage drivers in use by this SDK.
+        environment:
+          allOf:
+            - $ref: '#/components/schemas/EnvironmentInfo'
+          description: Information about the environment this SDK is running in.
       description: |-
         Worker info message, contains information about the worker and its current state.
          All information is provided by the worker itself.
@@ -19433,6 +19983,12 @@ components:
           allOf:
             - $ref: '#/components/schemas/WorkflowExecutionPauseInfo'
           description: Information about the workflow execution pause operation.
+        timeSkippingInfo:
+          allOf:
+            - $ref: '#/components/schemas/TimeSkippingInfo'
+          description: |-
+            Information about time skipping of the workflow execution.
+             If the execution has never enabled time skipping, it will be nil.
       description: Holds all the extra information about workflow execution that is not part of Visibility.
     WorkflowExecutionFailedEventAttributes:
       type: object
@@ -19999,7 +20555,7 @@ components:
         disabledAfterFastForward:
           type: boolean
           description: |-
-            When true, time skipping has been disabled automatically due to a call to fast_forward completing.
+            When true, time skipping has been stopped automatically due to a call to fast_forward completing.
              (-- api-linter: core::0140::prepositions=disabled
                  aip.dev/not-precedent: "after" is used to indicate temporal ordering. --)
         wallClockTime:
@@ -20007,8 +20563,8 @@ components:
           description: The wall-clock time when the time-skipping state changed event was generated.
           format: date-time
       description: |-
-        Attributes for an event indicating that time skipping state changed for a workflow execution,
-         either time was advanced or time skipping was disabled automatically due to the fast_forward completing.
+        Attributes for an event indicating that time skipping state changed for a workflow execution:
+         either time was advanced, or time skipping was stopped automatically due to the fast_forward completing.
          The worker_may_ignore field in HistoryEvent should always be set true for this event.
     WorkflowExecutionTimedOutEventAttributes:
       type: object
@@ -20541,6 +21097,9 @@ components:
             - WORKFLOW_TASK_FAILED_CAUSE_FEATURE_DISABLED
             - WORKFLOW_TASK_FAILED_CAUSE_GRPC_MESSAGE_TOO_LARGE
             - WORKFLOW_TASK_FAILED_CAUSE_PAYLOADS_TOO_LARGE
+            - WORKFLOW_TASK_FAILED_CAUSE_EXTERNAL_STORAGE_FAILURE
+            - WORKFLOW_TASK_FAILED_CAUSE_WORKFLOW_PAUSE_REQUESTED_BEFORE_TASK_STARTED
+            - WORKFLOW_TASK_FAILED_CAUSE_REQUEST_TOO_LARGE
           type: string
           format: enum
         failure:

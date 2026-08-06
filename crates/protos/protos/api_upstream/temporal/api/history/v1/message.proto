@@ -790,6 +790,10 @@ message StartChildWorkflowExecutionInitiatedEventAttributes {
     // The time-skipping state propagated from the parent workflow. This can be nil if no time skipping
     // has occurred or there is no previous run.
     temporal.api.common.v1.TimeSkippingStatePropagation time_skipping_state_propagation = 23;
+
+    // Versioning override requested for the child workflow. If present, this explicit override
+    // takes precedence over versioning behavior inherited from the parent workflow.
+    temporal.api.workflow.v1.VersioningOverride versioning_override = 24;
 }
 
 message StartChildWorkflowExecutionFailedEventAttributes {
@@ -1017,14 +1021,14 @@ message WorkflowExecutionUnpausedEventAttributes {
     string request_id = 3;
 }
 
-// Attributes for an event indicating that time skipping state changed for a workflow execution,
-// either time was advanced or time skipping was disabled automatically due to the fast_forward completing.
+// Attributes for an event indicating that time skipping state changed for a workflow execution:
+// either time was advanced, or time skipping was stopped automatically due to the fast_forward completing.
 // The worker_may_ignore field in HistoryEvent should always be set true for this event.
 message WorkflowExecutionTimeSkippingTransitionedEventAttributes {
     // The virtual time point that time skipping advanced to.
     google.protobuf.Timestamp target_time = 1;
 
-    // When true, time skipping has been disabled automatically due to a call to fast_forward completing.
+    // When true, time skipping has been stopped automatically due to a call to fast_forward completing.
     // (-- api-linter: core::0140::prepositions=disabled
     //     aip.dev/not-precedent: "after" is used to indicate temporal ordering. --)
     bool disabled_after_fast_forward = 2;

@@ -183,6 +183,9 @@ pub(crate) struct LocalActivityManager {
 
 struct LocalActivityInfo {
     task_token: TaskToken,
+    /// Prevents shutdown from dropping work already requested by a workflow while allowing retry
+    /// backoffs to be abandoned after workflows stop.
+    queued_for_dispatch: bool,
     /// Tasks for the current backoff until the next retry, if any.
     backing_off_task: Option<JoinHandle<()>>,
     /// Tasks / info about timeouts associated with this LA. May be empty for very brief periods
@@ -311,6 +314,7 @@ impl LocalActivityManager {
                             // ending up in the queue at once.
                             let lai = ve.insert(LocalActivityInfo {
                                 task_token: tt,
+                                queued_for_dispatch: false,
                                 backing_off_task: None,
                                 timeout_bag: None,
                                 first_wft_has_ended: false,
@@ -321,6 +325,7 @@ impl LocalActivityManager {
                             match TimeoutBag::new(&act, self.cancels_req_tx.clone()) {
                                 Ok(tb) => {
                                     lai.timeout_bag = Some(tb);
+                                    lai.queued_for_dispatch = true;
 
                                     self.act_req_tx.send(NewOrRetry::New(act)).expect(
                                         "Receive half of LA request channel cannot be dropped",
@@ -462,21 +467,23 @@ impl LocalActivityManager {
             let sa = new_la.schedule_cmd;
 
             let mut dat = self.dat.lock();
-            if !dat.la_info.contains_key(&id) {
+            if let Some(la_info) = dat.la_info.get_mut(&id) {
+                la_info.queued_for_dispatch = false;
+                // If this request originated from a local backoff task, clear the entry for it. We
+                // don't await the handle because we know it must already be done, and there's no
+                // meaningful value.
+                la_info.backing_off_task.take();
+            } else {
                 debug!(id=?id, "Dropping invalidated local activity request");
                 continue;
             }
-            // If this request originated from a local backoff task, clear the entry for it. We
-            // don't await the handle because we know it must already be done, and there's no
-            // meaningful value.
-            dat.la_info
-                .get_mut(&id)
-                .map(|lai| lai.backing_off_task.take());
 
             // If this task sat in the queue for too long, return a timeout for it instead
             if let Some(s2s) = sa.schedule_to_start_timeout.as_ref() {
                 let sat_for = new_la.schedule_time.elapsed().unwrap_or_default();
                 if sat_for > *s2s {
+                    self.set_shutdown_complete_if_ready(&mut dat);
+                    self.complete_notify.notify_one();
                     return Some(NextPendingLAAction::Autocomplete(
                         LACompleteAction::Report {
                             run_id: new_la.workflow_exec_info.run_id,
@@ -708,6 +715,7 @@ impl LocalActivityManager {
                             exec_id,
                             LocalActivityInfo {
                                 task_token: tt,
+                                queued_for_dispatch: false,
                                 backing_off_task: Some(jh),
                                 first_wft_has_ended: maybe_old_lai
                                     .as_ref()
@@ -781,11 +789,12 @@ impl LocalActivityManager {
     }
 
     fn set_shutdown_complete_if_ready(&self, dlock: &mut MutexGuard<LAMData>) -> bool {
-        let nothing_outstanding = dlock.outstanding_activity_tasks.is_empty();
-        if nothing_outstanding && self.workflows_have_shut_down.is_cancelled() {
+        let nothing_pending = dlock.outstanding_activity_tasks.is_empty()
+            && dlock.la_info.values().all(|info| !info.queued_for_dispatch);
+        if nothing_pending && self.workflows_have_shut_down.is_cancelled() {
             self.shutdown_complete_tok.cancel();
         }
-        nothing_outstanding
+        nothing_pending
     }
 
     fn cancel_one_la(
@@ -1061,6 +1070,32 @@ mod tests {
                 _ = complete_branch => {}
             }
         }
+    }
+
+    #[tokio::test]
+    async fn queued_activity_is_dispatched_after_workflows_shutdown() {
+        let lam = LocalActivityManager::test(1);
+        lam.enqueue([NewLocalAct {
+            schedule_cmd: ValidScheduleLA {
+                seq: 1,
+                activity_id: "1".to_string(),
+                ..Default::default()
+            },
+            workflow_type: "".to_string(),
+            workflow_exec_info: Default::default(),
+            schedule_time: SystemTime::now(),
+        }
+        .into()]);
+
+        lam.workflows_have_shutdown();
+
+        let task = lam.next_pending().await.unwrap().unwrap();
+        let task_token = TaskToken(task.task_token);
+        lam.complete(
+            &task_token,
+            LocalActivityExecutionResult::Completed(Default::default()),
+        );
+        assert!(lam.next_pending().await.is_none());
     }
 
     #[tokio::test]

@@ -1,10 +1,7 @@
 use super::*;
 use futures_util::{Future, FutureExt};
-use std::sync::{Arc, LazyLock};
+use std::sync::Arc;
 use temporalio_client::worker::ClientWorkerSet;
-
-pub(crate) static DEFAULT_WORKERS_REGISTRY: LazyLock<Arc<ClientWorkerSet>> =
-    LazyLock::new(|| Arc::new(ClientWorkerSet::new()));
 
 pub(crate) static DEFAULT_TEST_CAPABILITIES: &Capabilities = &Capabilities {
     signal_and_query_header: true,
@@ -19,16 +16,17 @@ pub(crate) static DEFAULT_TEST_CAPABILITIES: &Capabilities = &Capabilities {
     count_group_by_execution_status: false,
     nexus: false,
     server_scaled_deployments: false,
+    server_scaled_provider_cloud_run: false,
 };
 
 #[cfg(any(feature = "test-utilities", test))]
 /// Create a mock client primed with basic necessary expectations
 pub fn mock_worker_client() -> MockWorkerClient {
     let mut r = MockWorkerClient::new();
+    let workers = Arc::new(ClientWorkerSet::new());
     r.expect_capabilities()
         .returning(|| Some(*DEFAULT_TEST_CAPABILITIES));
-    r.expect_workers()
-        .returning(|| DEFAULT_WORKERS_REGISTRY.clone());
+    r.expect_workers().returning(move || workers.clone());
     r.expect_is_mock().returning(|| true);
     r.expect_shutdown_worker()
         .returning(|_, _, _, _| Ok(ShutdownWorkerResponse {}));
@@ -50,10 +48,10 @@ pub fn mock_worker_client() -> MockWorkerClient {
 /// Create a mock manual client primed with basic necessary expectations
 pub(crate) fn mock_manual_worker_client() -> MockManualWorkerClient {
     let mut r = MockManualWorkerClient::new();
+    let workers = Arc::new(ClientWorkerSet::new());
     r.expect_capabilities()
         .returning(|| Some(*DEFAULT_TEST_CAPABILITIES));
-    r.expect_workers()
-        .returning(|| DEFAULT_WORKERS_REGISTRY.clone());
+    r.expect_workers().returning(move || workers.clone());
     r.expect_is_mock().returning(|| true);
     r.expect_shutdown_worker()
         .returning(|_, _, _, _| async { Ok(ShutdownWorkerResponse {}) }.boxed());

@@ -6,7 +6,7 @@ use std::{
     panic::AssertUnwindSafe,
     pin::Pin,
     rc::Rc,
-    task::{Context, Poll},
+    task::{Context, Poll, Waker},
 };
 use temporalio_common::{
     data_converters::DataConverter,
@@ -40,8 +40,8 @@ use temporalio_workflow::{
         model::{WorkflowResult, WorkflowTermination},
         types::{
             ActivationJobResult, ActivationResult, MainRoutineCompletion, RoutineCompletion,
-            RoutineId, RoutineKind, RoutinePollResult, TerminalOutcome, UpdateRoutineCompletion,
-            WorkflowActivation,
+            RoutineId, RoutineKind, RoutinePendingState, RoutinePollResult, TerminalOutcome,
+            UpdateRoutineCompletion, WorkflowActivation,
         },
     },
 };
@@ -50,6 +50,7 @@ use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 use crate::{
     panic_formatter,
     workflow_executor::WakeTracker,
+    workflow_interceptors::WorkflowInterceptorConstructor,
     workflow_registry::{WorkflowExecutionFactory, WorkflowExecutionInput},
 };
 
@@ -66,6 +67,7 @@ pub(crate) fn start_workflow(
     data_converter: DataConverter,
     detect_nondeterministic: bool,
     patch_activation_callback: Option<PatchActivationCallback>,
+    workflow_interceptor_constructors: Vec<WorkflowInterceptorConstructor>,
 ) -> Result<
     (
         impl Future<Output = WorkflowResult<Payload>> + use<>,
@@ -89,6 +91,7 @@ pub(crate) fn start_workflow(
         data_converter: data_converter.clone(),
         host: host.clone(),
         patch_activation_callback,
+        workflow_interceptor_constructors,
     })
     .context("Failed to create workflow execution")?;
 
@@ -108,6 +111,7 @@ pub(crate) fn start_workflow(
             incoming_activations,
             wake_tracking,
             active_routines: Vec::new(),
+            in_flight_activation: None,
         },
         tx,
     ))
@@ -156,6 +160,19 @@ pub(crate) struct WorkflowFuture {
     wake_tracking: Option<WakeTracker>,
     /// Signal and update routines that are still live across activations.
     active_routines: Vec<RoutineId>,
+    /// Activation retained while an interceptor is waiting for a wake that Core cannot provide.
+    in_flight_activation: Option<InFlightActivation>,
+}
+
+struct InFlightActivation {
+    run_id: String,
+    commands: Vec<WorkflowCommand>,
+}
+
+enum RoutineDriveOutcome {
+    Complete,
+    AwaitWake,
+    Failed,
 }
 
 #[derive(Debug)]
@@ -167,6 +184,38 @@ enum ActivationJobContext {
 }
 
 impl WorkflowFuture {
+    fn tracked_waker(&self, parent: &Waker) -> Option<Waker> {
+        self.wake_tracking
+            .as_ref()
+            .map(|tracker| tracker.new_per_poll_waker(parent))
+    }
+
+    fn fail_on_non_sdk_wake(&self, run_id: &str) -> bool {
+        if !self
+            .wake_tracking
+            .as_ref()
+            .is_some_and(WakeTracker::take_non_sdk_wake)
+        {
+            return false;
+        }
+        self.fail_nondeterministic_future(
+            run_id,
+            "a waker was invoked by a non-SDK source. This usually means workflow code is using \
+             nondeterministic operations like tokio async functions or channels, other async \
+             libraries, or std::thread. Use SDK-provided alternatives (ctx.timer(), \
+             ctx.state_mut() + ctx.wait_condition(), etc.) instead.",
+        );
+        true
+    }
+
+    fn fail_nondeterministic_future(&self, run_id: &str, message: &str) {
+        self.fail_wft(
+            run_id.to_owned(),
+            anyhow!("[TMPRL1100] Nondeterministic future detected: {message}"),
+            Some(WorkflowTaskFailedCause::NonDeterministicError),
+        );
+    }
+
     fn fail_wft(&self, run_id: String, fail: Error, cause: Option<WorkflowTaskFailedCause>) {
         self.fail_wft_with_failure(run_id, fail.into(), cause);
     }
@@ -396,10 +445,7 @@ impl WorkflowFuture {
     ) -> Result<RoutinePollResult, Error> {
         let span = self.span.clone();
         let _guard = span.enter();
-        let tracked_waker = self
-            .wake_tracking
-            .as_ref()
-            .map(|tracker| tracker.new_per_poll_waker(cx.waker()));
+        let tracked_waker = self.tracked_waker(cx.waker());
         let waker = tracked_waker.as_ref().unwrap_or(cx.waker());
         match panic::catch_unwind(AssertUnwindSafe(|| {
             self.execution.poll_routine(routine_id, waker)
@@ -409,6 +455,179 @@ impl WorkflowFuture {
             Err(e) => bail!("Workflow function panicked: {}", panic_formatter(e)),
         }
     }
+
+    fn drive_routines(
+        &mut self,
+        cx: &Context<'_>,
+        run_id: &str,
+        activation_cmds: &mut Vec<WorkflowCommand>,
+    ) -> RoutineDriveOutcome {
+        loop {
+            let mut pass_made_progress = false;
+            let mut interceptor_pending = false;
+            let mut should_stop_polling = false;
+            let mut still_active = Vec::with_capacity(self.active_routines.len());
+            for routine_id in std::mem::take(&mut self.active_routines) {
+                let poll_result = match self.poll_guest_routine(routine_id, cx) {
+                    Ok(result) => result,
+                    Err(e) => {
+                        self.fail_wft(run_id.to_owned(), e, None);
+                        return RoutineDriveOutcome::Failed;
+                    }
+                };
+                if self.fail_on_non_sdk_wake(run_id) {
+                    return RoutineDriveOutcome::Failed;
+                }
+                pass_made_progress |= poll_result.made_progress;
+                interceptor_pending |= matches!(
+                    poll_result.pending_state,
+                    Some(RoutinePendingState::Interceptor)
+                );
+                match poll_result.completion {
+                    None => still_active.push(routine_id),
+                    Some(result) => match result {
+                        RoutineCompletion::Signal(Ok(())) => {}
+                        RoutineCompletion::Signal(Err(failure)) => {
+                            self.fail_wft(run_id.to_owned(), anyhow!(failure.message), None);
+                            return RoutineDriveOutcome::Failed;
+                        }
+                        RoutineCompletion::Update(UpdateRoutineCompletion::Completed {
+                            protocol_instance_id,
+                            result,
+                        }) => activation_cmds.push(
+                            update_response(
+                                protocol_instance_id,
+                                update_response::Response::Completed(result),
+                            )
+                            .into(),
+                        ),
+                        RoutineCompletion::Update(UpdateRoutineCompletion::Rejected {
+                            protocol_instance_id,
+                            failure,
+                        }) => activation_cmds.push(
+                            update_response(
+                                protocol_instance_id,
+                                update_response::Response::Rejected(*failure),
+                            )
+                            .into(),
+                        ),
+                        RoutineCompletion::Main(_) => {
+                            self.fail_wft(
+                                run_id.to_owned(),
+                                anyhow!("non-main routine returned a main completion"),
+                                None,
+                            );
+                            return RoutineDriveOutcome::Failed;
+                        }
+                    },
+                }
+            }
+            self.active_routines = still_active;
+
+            let main_poll_result = match self
+                .poll_guest_routine(temporalio_workflow::runtime::types::MAIN_ROUTINE_ID, cx)
+            {
+                Ok(result) => result,
+                Err(e) => {
+                    self.fail_wft(run_id.to_owned(), e, None);
+                    return RoutineDriveOutcome::Failed;
+                }
+            };
+            if self.fail_on_non_sdk_wake(run_id) {
+                return RoutineDriveOutcome::Failed;
+            }
+            pass_made_progress |= main_poll_result.made_progress;
+            interceptor_pending |= matches!(
+                main_poll_result.pending_state,
+                Some(RoutinePendingState::Interceptor)
+            );
+
+            match main_poll_result.completion {
+                None => {
+                    self.fail_wft(
+                        run_id.to_owned(),
+                        anyhow!("main routine returned no completion"),
+                        None,
+                    );
+                    return RoutineDriveOutcome::Failed;
+                }
+                Some(result) => match result {
+                    RoutineCompletion::Main(MainRoutineCompletion::Blocked) => {}
+                    RoutineCompletion::Main(MainRoutineCompletion::TaskFailed(task_failure)) => {
+                        self.fail_wft_with_failure(
+                            run_id.to_owned(),
+                            *task_failure.failure,
+                            workflow_task_failed_cause_from_wit(task_failure.force_cause),
+                        );
+                        return RoutineDriveOutcome::Failed;
+                    }
+                    RoutineCompletion::Main(MainRoutineCompletion::Terminal(outcome)) => {
+                        let outcome = *outcome;
+                        match outcome {
+                            TerminalOutcome::Completed(result) => {
+                                self.host.push_command_variant(
+                                    workflow_command::Variant::CompleteWorkflowExecution(
+                                        CompleteWorkflowExecution {
+                                            result: Some(result),
+                                        },
+                                    ),
+                                );
+                            }
+                            TerminalOutcome::Failed(failure) => {
+                                self.host.push_command_variant(
+                                    workflow_command::Variant::FailWorkflowExecution(
+                                        FailWorkflowExecution {
+                                            failure: Some(*failure),
+                                        },
+                                    ),
+                                );
+                            }
+                            TerminalOutcome::Cancelled => {
+                                self.host.push_command_variant(
+                                    workflow_command::Variant::CancelWorkflowExecution(
+                                        CancelWorkflowExecution {},
+                                    ),
+                                );
+                            }
+                            TerminalOutcome::ContinueAsNew(req) => {
+                                self.host.push_command_variant(
+                                    workflow_command::Variant::ContinueAsNewWorkflowExecution(*req),
+                                );
+                            }
+                        }
+                        should_stop_polling = true;
+                    }
+                    other => {
+                        self.fail_wft(
+                            run_id.to_owned(),
+                            anyhow!("main routine returned unexpected completion {other:?}"),
+                            None,
+                        );
+                        return RoutineDriveOutcome::Failed;
+                    }
+                },
+            }
+
+            if should_stop_polling {
+                return RoutineDriveOutcome::Complete;
+            }
+            if !pass_made_progress {
+                if !interceptor_pending {
+                    return RoutineDriveOutcome::Complete;
+                }
+                if self.wake_tracking.is_some() {
+                    self.fail_nondeterministic_future(
+                        run_id,
+                        "a workflow interceptor returned Poll::Pending without polling its \
+                         handler or an SDK operation that will produce another workflow \
+                         activation.",
+                    );
+                    return RoutineDriveOutcome::Failed;
+                }
+                return RoutineDriveOutcome::AwaitWake;
+            }
+        }
+    }
 }
 
 impl Future for WorkflowFuture {
@@ -416,232 +635,96 @@ impl Future for WorkflowFuture {
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         'activations: loop {
-            let activation = match self.incoming_activations.poll_recv(cx) {
-                Poll::Ready(a) => match a {
-                    Some(act) => act,
-                    None => {
-                        return Poll::Ready(Err(anyhow!(
-                            "Workflow future's activation channel was lost!"
-                        )
-                        .into()));
-                    }
-                },
-                Poll::Pending => return Poll::Pending,
-            };
-
-            let is_only_eviction = activation.is_only_eviction();
-            let run_id = activation.run_id.clone();
-
-            let mut activation_cmds = vec![];
-
-            if is_only_eviction {
-                self.outgoing_completions
-                    .send(WorkflowActivationCompletion::from_cmds(run_id, vec![]))
-                    .expect("Completion channel intact");
-                return Err(WorkflowTermination::Evicted).into();
-            }
-
-            if self
-                .wake_tracking
-                .as_mut()
-                .is_some_and(|t| t.take_non_sdk_wake())
-            {
-                self.fail_wft(
-                    run_id,
-                    anyhow!(
-                        "[TMPRL1100] Nondeterministic future detected: a waker was invoked by a \
-                         non-SDK source. This usually means workflow code is using nondeterministic \
-                         operations like tokio async functions or channels, other async libraries, \
-                         or std::thread. Use SDK-provided alternatives \
-                         (ctx.timer(), ctx.state_mut() + ctx.wait_condition(), etc.) instead."
-                    ),
-                    Some(WorkflowTaskFailedCause::NonDeterministicError),
-                );
-                continue 'activations;
-            }
-
-            let (guest_activation, job_contexts, should_poll_routines) =
-                match self.translate_activation(activation) {
-                    Ok(translated) => translated,
-                    Err(e) => {
-                        self.fail_wft(run_id, e, None);
-                        continue 'activations;
-                    }
+            let mut in_flight = if let Some(in_flight) = self.in_flight_activation.take() {
+                if self.fail_on_non_sdk_wake(&in_flight.run_id) {
+                    continue 'activations;
+                }
+                in_flight
+            } else {
+                let activation = match self.incoming_activations.poll_recv(cx) {
+                    Poll::Ready(a) => match a {
+                        Some(act) => act,
+                        None => {
+                            return Poll::Ready(Err(anyhow!(
+                                "Workflow future's activation channel was lost!"
+                            )
+                            .into()));
+                        }
+                    },
+                    Poll::Pending => return Poll::Pending,
                 };
 
-            let activation_result = match panic::catch_unwind(AssertUnwindSafe(|| {
-                self.execution.activate(guest_activation)
-            })) {
-                Ok(Ok(result)) => result,
-                Ok(Err(err)) => {
-                    self.fail_wft(run_id.clone(), anyhow!(err.message), None);
+                let run_id = activation.run_id.clone();
+                if activation.is_only_eviction() {
+                    self.outgoing_completions
+                        .send(WorkflowActivationCompletion::from_cmds(run_id, vec![]))
+                        .expect("Completion channel intact");
+                    return Err(WorkflowTermination::Evicted).into();
+                }
+                if self.fail_on_non_sdk_wake(&run_id) {
                     continue 'activations;
                 }
-                Err(e) => {
-                    self.fail_wft(
-                        run_id.clone(),
-                        anyhow!("Workflow function panicked: {}", panic_formatter(e)),
-                        None,
-                    );
-                    continue 'activations;
-                }
-            };
 
-            if let Err(e) = self.process_activation_results(
-                job_contexts,
-                activation_result,
-                &mut activation_cmds,
-            ) {
-                self.fail_wft(run_id.clone(), e, None);
-                continue 'activations;
-            }
-
-            if should_poll_routines {
-                loop {
-                    let mut pass_made_progress = false;
-                    let mut should_stop_polling = false;
-                    let mut still_active = Vec::with_capacity(self.active_routines.len());
-                    for routine_id in std::mem::take(&mut self.active_routines) {
-                        let poll_result = match self.poll_guest_routine(routine_id, cx) {
-                            Ok(result) => result,
-                            Err(e) => {
-                                self.fail_wft(run_id.clone(), e, None);
-                                continue 'activations;
-                            }
-                        };
-                        pass_made_progress |= poll_result.made_progress;
-                        match poll_result.completion {
-                            None => still_active.push(routine_id),
-                            Some(result) => match result {
-                                RoutineCompletion::Signal(Ok(())) => {}
-                                RoutineCompletion::Signal(Err(failure)) => {
-                                    self.fail_wft(run_id.clone(), anyhow!(failure.message), None);
-                                    continue 'activations;
-                                }
-                                RoutineCompletion::Update(UpdateRoutineCompletion::Completed {
-                                    protocol_instance_id,
-                                    result,
-                                }) => activation_cmds.push(
-                                    update_response(
-                                        protocol_instance_id,
-                                        update_response::Response::Completed(result),
-                                    )
-                                    .into(),
-                                ),
-                                RoutineCompletion::Update(UpdateRoutineCompletion::Rejected {
-                                    protocol_instance_id,
-                                    failure,
-                                }) => activation_cmds.push(
-                                    update_response(
-                                        protocol_instance_id,
-                                        update_response::Response::Rejected(*failure),
-                                    )
-                                    .into(),
-                                ),
-                                RoutineCompletion::Main(_) => {
-                                    self.fail_wft(
-                                        run_id.clone(),
-                                        anyhow!("non-main routine returned a main completion"),
-                                        None,
-                                    );
-                                    continue 'activations;
-                                }
-                            },
-                        }
-                    }
-                    self.active_routines = still_active;
-
-                    let main_poll_result = match self.poll_guest_routine(
-                        temporalio_workflow::runtime::types::MAIN_ROUTINE_ID,
-                        cx,
-                    ) {
-                        Ok(result) => result,
+                let (guest_activation, job_contexts, should_poll_routines) =
+                    match self.translate_activation(activation) {
+                        Ok(translated) => translated,
                         Err(e) => {
-                            self.fail_wft(run_id.clone(), e, None);
+                            self.fail_wft(run_id, e, None);
                             continue 'activations;
                         }
                     };
-                    pass_made_progress |= main_poll_result.made_progress;
 
-                    match main_poll_result.completion {
-                        None => {
-                            self.fail_wft(
-                                run_id.clone(),
-                                anyhow!("main routine returned no completion"),
-                                None,
-                            );
-                            continue 'activations;
-                        }
-                        Some(result) => match result {
-                            RoutineCompletion::Main(MainRoutineCompletion::Blocked) => {}
-                            RoutineCompletion::Main(MainRoutineCompletion::TaskFailed(
-                                task_failure,
-                            )) => {
-                                self.fail_wft_with_failure(
-                                    run_id.clone(),
-                                    *task_failure.failure,
-                                    workflow_task_failed_cause_from_wit(task_failure.force_cause),
-                                );
-                                continue 'activations;
-                            }
-                            RoutineCompletion::Main(MainRoutineCompletion::Terminal(outcome)) => {
-                                {
-                                    let host: &NativeWorkflowHost = &self.host;
-                                    let outcome = *outcome;
-                                    match outcome {
-                                        TerminalOutcome::Completed(result) => {
-                                            host.push_command_variant(workflow_command::Variant::CompleteWorkflowExecution(
-                                                CompleteWorkflowExecution {
-                                                    result: Some(result),
-                                                },
-                                            ));
-                                        }
-                                        TerminalOutcome::Failed(failure) => {
-                                            host.push_command_variant(
-                                                workflow_command::Variant::FailWorkflowExecution(
-                                                    FailWorkflowExecution {
-                                                        failure: Some(*failure),
-                                                    },
-                                                ),
-                                            );
-                                        }
-                                        TerminalOutcome::Cancelled => {
-                                            host.push_command_variant(
-                                                workflow_command::Variant::CancelWorkflowExecution(
-                                                    CancelWorkflowExecution {},
-                                                ),
-                                            );
-                                        }
-                                        TerminalOutcome::ContinueAsNew(req) => {
-                                            host.push_command_variant(workflow_command::Variant::ContinueAsNewWorkflowExecution(
-                                                *req,
-                                            ));
-                                        }
-                                    }
-                                };
-                                should_stop_polling = true;
-                            }
-                            other => {
-                                self.fail_wft(
-                                    run_id.clone(),
-                                    anyhow!(
-                                        "main routine returned unexpected completion {other:?}"
-                                    ),
-                                    None,
-                                );
-                                continue 'activations;
-                            }
-                        },
+                let tracked_waker = self.tracked_waker(cx.waker());
+                let waker = tracked_waker.as_ref().unwrap_or(cx.waker());
+                let activation_result = match panic::catch_unwind(AssertUnwindSafe(|| {
+                    self.execution.activate(guest_activation, waker)
+                })) {
+                    Ok(Ok(result)) => result,
+                    Ok(Err(err)) => {
+                        self.fail_wft(run_id.clone(), anyhow!(err.message), None);
+                        continue 'activations;
                     }
-
-                    if should_stop_polling || !pass_made_progress {
-                        break;
+                    Err(e) => {
+                        self.fail_wft(
+                            run_id.clone(),
+                            anyhow!("Workflow function panicked: {}", panic_formatter(e)),
+                            None,
+                        );
+                        continue 'activations;
                     }
+                };
+                if self.fail_on_non_sdk_wake(&run_id) {
+                    continue 'activations;
                 }
-            }
 
-            activation_cmds.extend(self.host.take_commands());
-            self.send_completion(run_id, activation_cmds);
+                let mut commands = Vec::new();
+                if let Err(e) =
+                    self.process_activation_results(job_contexts, activation_result, &mut commands)
+                {
+                    self.fail_wft(run_id.clone(), e, None);
+                    continue 'activations;
+                }
+
+                if !should_poll_routines {
+                    commands.extend(self.host.take_commands());
+                    self.send_completion(run_id, commands);
+                    continue 'activations;
+                }
+
+                InFlightActivation { run_id, commands }
+            };
+
+            match self.drive_routines(cx, &in_flight.run_id, &mut in_flight.commands) {
+                RoutineDriveOutcome::Complete => {
+                    in_flight.commands.extend(self.host.take_commands());
+                    self.send_completion(in_flight.run_id, in_flight.commands);
+                }
+                RoutineDriveOutcome::AwaitWake => {
+                    self.in_flight_activation = Some(in_flight);
+                    return Poll::Pending;
+                }
+                RoutineDriveOutcome::Failed => continue 'activations,
+            }
         }
     }
 }

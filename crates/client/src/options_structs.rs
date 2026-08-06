@@ -1,4 +1,7 @@
-use crate::{HttpConnectProxyOptions, RetryOptions, VERSION, callback_based};
+use crate::{
+    ClientInterceptor, ClientPlugin, ErasedClientPlugin, HttpConnectProxyOptions, RetryOptions,
+    RpcOptions, VERSION, callback_based,
+};
 use http::Uri;
 use std::{collections::HashMap, sync::Arc, time::Duration};
 use temporalio_common::{
@@ -51,6 +54,11 @@ pub struct ConnectionOptions {
     /// An API key to use for auth. If set, TLS will be enabled by default, but without any mTLS
     /// specific settings.
     pub api_key: Option<String>,
+    /// When set, limits the time allowed to establish the initial TCP/TLS connection to the
+    /// server. If the connection cannot be established within this duration, `connect` will
+    /// return an error. When `None` (the default), no explicit timeout is applied and the
+    /// connection attempt may block indefinitely (subject to OS-level TCP timeouts).
+    pub connect_timeout: Option<Duration>,
     /// Retry configuration for the server client. Default is [RetryOptions::default]
     #[builder(default)]
     pub retry_options: RetryOptions,
@@ -135,16 +143,78 @@ impl ConnectionOptions {
 }
 
 /// Options for [crate::Client::new].
-#[derive(Clone, Debug, bon::Builder)]
+#[derive(Clone, derive_more::Debug, bon::Builder)]
 #[non_exhaustive]
 #[builder(start_fn = new, on(String, into), state_mod(vis = "pub"))]
 pub struct ClientOptions {
     /// The namespace this client will be bound to.
     #[builder(start_fn)]
     pub namespace: String,
+
+    #[builder(field)]
+    #[debug(skip)]
+    plugins: Vec<ErasedClientPlugin>,
+
+    #[builder(field)]
+    #[debug(skip)]
+    client_plugins_applied: bool,
+
     /// The data converter used for serializing/deserializing payloads.
     #[builder(default)]
     pub data_converter: DataConverter,
+    /// Interceptors for high-level client operations, ordered outermost to innermost.
+    #[builder(default)]
+    #[debug(skip)]
+    pub client_interceptors: Vec<Arc<dyn ClientInterceptor>>,
+}
+
+impl<S: client_options_builder::State> ClientOptionsBuilder<S> {
+    /// Register a type-erased client plugin.
+    ///
+    /// **Experimental:** This API may change or be removed.
+    pub fn plugin<P: Into<ErasedClientPlugin>>(mut self, plugin: P) -> Self {
+        self.plugins.push(plugin.into());
+        self
+    }
+
+    /// Register type-erased client plugins in iteration order.
+    ///
+    /// **Experimental:** This API may change or be removed.
+    pub fn plugins<I, P>(mut self, plugins: I) -> Self
+    where
+        I: IntoIterator<Item = P>,
+        P: Into<ErasedClientPlugin>,
+    {
+        self.plugins.extend(plugins.into_iter().map(Into::into));
+        self
+    }
+
+    /// Register a client-only plugin.
+    ///
+    /// **Experimental:** This API may change or be removed.
+    pub fn client_plugin<P: ClientPlugin>(mut self, plugin: P) -> Self {
+        self.plugins.push(ErasedClientPlugin::new(plugin));
+        self
+    }
+}
+
+impl ClientOptions {
+    /// Return the registered plugins.
+    ///
+    /// This is intended for SDK integrations that propagate worker plugin registrations.
+    ///
+    /// **Experimental:** This API may change or be removed.
+    pub fn plugins(&self) -> &[ErasedClientPlugin] {
+        &self.plugins
+    }
+
+    pub(crate) fn client_plugins_applied(&self) -> bool {
+        self.client_plugins_applied
+    }
+
+    pub(crate) fn mark_client_plugins_applied(&mut self) {
+        self.client_plugins_applied = true;
+    }
 }
 
 /// Selects the transport-level compression used for gRPC calls. See
@@ -160,7 +230,8 @@ pub enum GrpcCompression {
 }
 
 /// Configuration options for TLS
-#[derive(Clone, Default)]
+#[derive(Clone, bon::Builder)]
+#[non_exhaustive]
 pub struct TlsOptions {
     /// Bytes representing the root CA certificate used by the server. If not set, and the server's
     /// cert is issued by someone the operating system trusts, verification will still work (ex:
@@ -190,6 +261,12 @@ pub struct TlsOptions {
     pub server_cert_verifier: Option<Arc<dyn ServerCertVerifier>>,
 }
 
+impl Default for TlsOptions {
+    fn default() -> Self {
+        Self::builder().build()
+    }
+}
+
 impl std::fmt::Debug for TlsOptions {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("TlsOptions")
@@ -211,7 +288,8 @@ impl std::fmt::Debug for TlsOptions {
 }
 
 /// If using mTLS, both the client cert and private key must be specified, this contains them.
-#[derive(Clone)]
+#[derive(Clone, bon::Builder)]
+#[non_exhaustive]
 pub struct ClientTlsOptions {
     /// The certificate for this client, encoded as PEM
     pub client_cert: Vec<u8>,
@@ -220,57 +298,56 @@ pub struct ClientTlsOptions {
 }
 
 /// Client keep alive configuration.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, bon::Builder)]
+#[non_exhaustive]
 pub struct ClientKeepAliveOptions {
     /// Interval to send HTTP2 keep alive pings.
+    #[builder(default = Duration::from_secs(30))]
     pub interval: Duration,
     /// Timeout that the keep alive must be responded to within or the connection will be closed.
+    #[builder(default = Duration::from_secs(15))]
     pub timeout: Duration,
 }
 
 impl Default for ClientKeepAliveOptions {
     fn default() -> Self {
-        Self {
-            interval: Duration::from_secs(30),
-            timeout: Duration::from_secs(15),
-        }
+        Self::builder().build()
     }
 }
 
 /// Options for DNS-based load balancing.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, bon::Builder)]
 #[non_exhaustive]
 pub struct DnsLoadBalancingOptions {
     /// How often to re-resolve DNS. Defaults to 30 seconds.
+    #[builder(default = Duration::from_secs(30))]
     pub resolution_interval: Duration,
 }
 
 impl Default for DnsLoadBalancingOptions {
     fn default() -> Self {
-        Self {
-            resolution_interval: Duration::from_secs(30),
-        }
+        Self::builder().build()
     }
 }
 
 /// Payload size limit options for a connection.
 /// NOTE: Experimental
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, bon::Builder)]
+#[non_exhaustive]
 pub struct PayloadLimitsOptions {
     /// Warning threshold (bytes) for the size of an outbound payload-bearing field; over-threshold
     /// fields are logged but still sent to server. Defaults to 512 KiB. Set to `0` to disable.
+    #[builder(default = 512 * 1024)]
     pub payloads_warn_size: u64,
     /// Warning threshold (bytes) for outbound memo sizes; over-threshold memos are logged but still
     /// sent to server. Defaults to 2 KiB. Set to `0` to disable.
+    #[builder(default = 2 * 1024)]
     pub memo_warn_size: u64,
 }
 
 impl Default for PayloadLimitsOptions {
     fn default() -> Self {
-        Self {
-            payloads_warn_size: 512 * 1024,
-            memo_warn_size: 2 * 1024,
-        }
+        Self::builder().build()
     }
 }
 
@@ -353,6 +430,10 @@ pub struct WorkflowStartOptions {
 
     /// Multi-line static details for the workflow, shown in the Temporal UI.
     pub static_details: Option<String>,
+
+    /// Controls for the RPC used to start the workflow.
+    #[builder(default)]
+    pub rpc_options: RpcOptions,
 }
 
 /// A signal to send atomically when starting a workflow.
@@ -373,17 +454,23 @@ pub struct WorkflowStartSignal {
 pub use temporalio_common::Priority;
 
 /// Options for fetching workflow results
-#[derive(Debug, Clone, Copy, bon::Builder)]
+#[derive(Debug, Clone, bon::Builder)]
 #[non_exhaustive]
 pub struct WorkflowGetResultOptions {
     /// If true (the default), follows to the next workflow run in the execution chain while
     /// retrieving results.
     #[builder(default = true)]
     pub follow_runs: bool,
+    /// Controls for each history RPC used to retrieve the result.
+    #[builder(default)]
+    pub rpc_options: RpcOptions,
 }
 impl Default for WorkflowGetResultOptions {
     fn default() -> Self {
-        Self { follow_runs: true }
+        Self {
+            follow_runs: true,
+            rpc_options: RpcOptions::default(),
+        }
     }
 }
 
@@ -395,6 +482,9 @@ pub struct WorkflowExecuteUpdateOptions {
     pub update_id: Option<String>,
     /// Headers to include.
     pub header: Option<Header>,
+    /// Controls for the start-update and poll-update RPCs.
+    #[builder(default)]
+    pub rpc_options: RpcOptions,
 }
 
 /// Options for sending a signal to a workflow.
@@ -405,6 +495,9 @@ pub struct WorkflowSignalOptions {
     pub request_id: Option<String>,
     /// Headers to include with the signal.
     pub header: Option<Header>,
+    /// Controls for the signal RPC.
+    #[builder(default)]
+    pub rpc_options: RpcOptions,
 }
 
 /// Options for querying a workflow.
@@ -416,6 +509,9 @@ pub struct WorkflowQueryOptions {
     pub reject_condition: Option<QueryRejectCondition>,
     /// Headers to include with the query.
     pub header: Option<Header>,
+    /// Controls for the query RPC.
+    #[builder(default)]
+    pub rpc_options: RpcOptions,
 }
 
 /// Options for cancelling a workflow.
@@ -428,6 +524,9 @@ pub struct WorkflowCancelOptions {
     pub reason: String,
     /// Request ID for idempotency. If not provided, a UUID will be generated.
     pub request_id: Option<String>,
+    /// Controls for the cancellation RPC.
+    #[builder(default)]
+    pub rpc_options: RpcOptions,
 }
 
 /// Options for terminating a workflow.
@@ -440,12 +539,19 @@ pub struct WorkflowTerminateOptions {
     pub reason: String,
     /// Additional details to include with the termination.
     pub details: Option<Payloads>,
+    /// Controls for the termination RPC.
+    #[builder(default)]
+    pub rpc_options: RpcOptions,
 }
 
 /// Options for describing a workflow.
 #[derive(Debug, Clone, Default, bon::Builder)]
 #[non_exhaustive]
-pub struct WorkflowDescribeOptions {}
+pub struct WorkflowDescribeOptions {
+    /// Controls for the describe RPC.
+    #[builder(default)]
+    pub rpc_options: RpcOptions,
+}
 
 /// Default workflow execution retention for a Namespace is 3 days
 const DEFAULT_WORKFLOW_EXECUTION_RETENTION_PERIOD: Duration = Duration::from_secs(60 * 60 * 24 * 3);
@@ -453,6 +559,7 @@ const DEFAULT_WORKFLOW_EXECUTION_RETENTION_PERIOD: Duration = Duration::from_sec
 /// Helper struct for `register_namespace`.
 #[derive(Clone, Debug, bon::Builder)]
 #[builder(on(String, into))]
+#[non_exhaustive]
 pub struct RegisterNamespaceOptions {
     /// Name (required)
     pub namespace: String,
@@ -529,6 +636,9 @@ pub struct WorkflowFetchHistoryOptions {
     /// Specifies which kind of events will be retrieved. Defaults to all events.
     #[builder(default = HistoryEventFilterType::AllEvent)]
     pub event_filter_type: HistoryEventFilterType,
+    /// Controls for each history page RPC.
+    #[builder(default)]
+    pub rpc_options: RpcOptions,
 }
 
 /// Which lifecycle stage to wait for when starting an update.
@@ -555,6 +665,9 @@ pub struct WorkflowStartUpdateOptions {
     /// The lifecycle stage to wait for before returning the handle.
     #[builder(default)]
     pub wait_for_stage: WorkflowUpdateWaitStage,
+    /// Controls for the start-update RPC.
+    #[builder(default)]
+    pub rpc_options: RpcOptions,
 }
 
 /// Options for listing workflows.
@@ -564,12 +677,19 @@ pub struct WorkflowListOptions {
     /// Maximum number of workflows to return.
     /// If not specified, returns all matching workflows.
     pub limit: Option<usize>,
+    /// Controls for each list page RPC.
+    #[builder(default)]
+    pub rpc_options: RpcOptions,
 }
 
 /// Options for counting workflows.
 #[derive(Debug, Clone, Default, bon::Builder)]
 #[non_exhaustive]
-pub struct WorkflowCountOptions {}
+pub struct WorkflowCountOptions {
+    /// Controls for the count RPC.
+    #[builder(default)]
+    pub rpc_options: RpcOptions,
+}
 
 /// Options for starting a standalone activity.
 #[derive(Clone, Debug, bon::Builder)]

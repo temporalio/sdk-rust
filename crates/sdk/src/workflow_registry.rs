@@ -18,8 +18,9 @@ use temporalio_workflow::{
         guest::WorkflowInstance,
         host::WorkflowHost,
         instance::{GuestWorkflowInstance, instantiate_workflow},
-        types::WorkflowDefinitionDescriptor,
+        types::{WorkflowDefinitionDescriptor, WorkflowInit},
     },
+    workflow_interceptors::WorkflowInterceptorConstructor,
 };
 
 /// Host-owned execution inputs used to instantiate a single workflow run.
@@ -31,6 +32,7 @@ pub(crate) struct WorkflowExecutionInput {
     pub data_converter: DataConverter,
     pub host: Rc<dyn WorkflowHost>,
     pub patch_activation_callback: Option<PatchActivationCallback>,
+    pub workflow_interceptor_constructors: Vec<WorkflowInterceptorConstructor>,
 }
 
 /// Creates workflow execution instances from activation input payloads and context.
@@ -73,6 +75,13 @@ pub struct WorkflowDefinitions {
 }
 
 impl WorkflowDefinitions {
+    pub(crate) fn extend(&mut self, other: &Self) -> Result<(), WorkflowRegistrationError> {
+        for workflow in other.workflows.values() {
+            self.insert_workflow(workflow.definition.clone(), workflow.factory.clone())?;
+        }
+        Ok(())
+    }
+
     /// Creates a new empty `WorkflowDefinitions`.
     pub fn new() -> Self {
         Self::default()
@@ -183,17 +192,22 @@ fn workflow_input_parts(
         data_converter,
         host,
         patch_activation_callback,
+        workflow_interceptor_constructors,
     } = input;
     let payloads = init_workflow_job.arguments.clone();
     let payload_converter = data_converter.payload_converter().clone();
-    let base_ctx = BaseWorkflowContext::from_raw(
+    let init = WorkflowInit {
         namespace,
         task_queue,
         run_id,
-        init_workflow_job,
+        initialize_workflow: init_workflow_job,
+    };
+    let base_ctx = BaseWorkflowContext::from_raw(
+        init,
         data_converter,
         host,
         patch_activation_callback,
+        workflow_interceptor_constructors,
     );
     (payloads, payload_converter, base_ctx)
 }

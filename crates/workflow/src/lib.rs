@@ -14,14 +14,17 @@ pub mod __private {
     pub use futures_util;
 }
 
+mod cancellation;
 #[doc(hidden)]
 pub mod component;
 mod memo;
 #[doc(hidden)]
 pub mod runtime;
 mod workflow_context;
+pub mod workflow_interceptors;
 pub mod workflows;
 
+pub use cancellation::{WorkflowCancellationError, WorkflowCancellationToken};
 pub use memo::{MemoValue, MemoValues};
 #[doc(hidden)]
 pub use runtime::model::{CancellableID, UnblockEvent};
@@ -35,18 +38,19 @@ pub use temporalio_common_wasm::{
         TimeoutType, WorkflowSignalError,
     },
 };
-#[doc(hidden)]
-pub use workflow_context::PatchActivationCaller;
 pub use workflow_context::{
-    ActivityCancellationType, ActivityOptions, BaseWorkflowContext, CancellableFuture,
-    ChildWorkflowCancellationType, ChildWorkflowOptions, ContinueAsNewOptions,
-    ContinueAsNewVersioningBehavior, ExternalWorkflowHandle, LocalActivityOptions,
-    NamespacedWorkflowInfo, NexusOperationCancellationType, NexusOperationOptions,
-    ParentClosePolicy, PatchActivationCallback, PatchActivationInput, Signal, SignalData,
-    StartChildWorkflowExecutionFailedCause, StartedChildWorkflow, SyncWorkflowContext,
-    TimerOptions, VersioningIntent, WorkflowContext, WorkflowContextView, WorkflowIdReusePolicy,
-    WorkflowRandomValue,
+    ActivityCancellationType, ActivityOptions, BaseWorkflowContext,
+    CancellableFuture, CancellableFutureWithReason, ChildWorkflowCancellationType,
+    ChildWorkflowOptions, ContinueAsNewOptions, ContinueAsNewVersioningBehavior,
+    ExternalWorkflowHandle, LocalActivityOptions, NamespacedWorkflowInfo,
+    NexusOperationCancellationType, NexusOperationOptions, ParentClosePolicy, Signal, SignalData,
+    SignalWorkflowOptions, StartChildWorkflowExecutionFailedCause, StartChildWorkflowOutput,
+    StartedChildWorkflow, StartedNexusOperation, SyncWorkflowContext, TimerOptions,
+    VersioningIntent, WaitConditionOptions, WorkflowContext, WorkflowContextView,
+    WorkflowIdReusePolicy, WorkflowRandomValue,
 };
+#[doc(hidden)]
+pub use workflow_context::{PatchActivationCallback, PatchActivationCaller};
 pub use workflows::{join, join_all, select};
 
 #[macro_export]
@@ -77,10 +81,32 @@ macro_rules! __temporalio_export_workflow_component {
 
 #[macro_export]
 /// Export one or more workflow implementations as a component-model workflow module.
+///
+/// Component-side workflow interceptor constructors can be supplied with
+/// `interceptor_constructors = [constructor]`. Each constructor receives a read-only workflow
+/// context and is invoked for every workflow instance.
 macro_rules! export_workflow_module {
     ([$($workflow:ty),+ $(,)?]) => {
+        ::temporalio_workflow::export_workflow_module!(
+            [$($workflow),+],
+            interceptor_constructors = [],
+        );
+    };
+    ([$($workflow:ty),+ $(,)?], interceptor_constructors = [$($constructor:expr),* $(,)?] $(,)?) => {
         const _: () = {
             struct __TemporalWorkflowModule;
+
+            fn __temporal_workflow_interceptor_constructors() -> ::std::vec::Vec<
+                ::temporalio_workflow::workflow_interceptors::WorkflowInterceptorConstructor,
+            > {
+                ::std::vec![
+                    $(
+                        ::temporalio_workflow::workflow_interceptors::WorkflowInterceptorConstructor::new(
+                            $constructor,
+                        )
+                    ),*
+                ]
+            }
 
             impl ::temporalio_workflow::component::StaticWorkflowComponent for __TemporalWorkflowModule {
                 fn list_workflows(
@@ -99,7 +125,11 @@ macro_rules! export_workflow_module {
                     match workflow_type {
                         $(
                             name if name == <$workflow as ::temporalio_workflow::runtime::entry::WorkflowImplementation>::name() => {
-                                ::temporalio_workflow::component::instantiate_component_workflow::<$workflow>(init, host)
+                                ::temporalio_workflow::component::instantiate_component_workflow_with_interceptor_constructors::<$workflow>(
+                                    init,
+                                    host,
+                                    __temporal_workflow_interceptor_constructors(),
+                                )
                             }
                         )*
                         _ => Err(::std::boxed::Box::new(

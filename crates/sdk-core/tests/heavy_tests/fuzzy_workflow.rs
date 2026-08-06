@@ -41,7 +41,7 @@ struct FuzzyWf {
 impl FuzzyWf {
     #[run(name = "fuzzy_wf")]
     async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<()> {
-        ctx.wait_condition(|s| s.done).await;
+        ctx.wait_condition(|s| s.done).await?;
         Ok(())
     }
 
@@ -63,10 +63,9 @@ impl FuzzyWf {
                     .execute_local_activity(
                         StdActivities::echo,
                         "hi!".to_string(),
-                        LocalActivityOptions {
-                            start_to_close_timeout: Some(Duration::from_secs(5)),
-                            ..Default::default()
-                        },
+                        LocalActivityOptions::builder()
+                            .start_to_close_timeout(Duration::from_secs(5))
+                            .build(),
                     )
                     .await;
             }

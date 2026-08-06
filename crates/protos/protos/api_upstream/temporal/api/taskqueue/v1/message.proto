@@ -143,6 +143,12 @@ message TaskQueueStats {
     //   workflow goes to a normal queue, and the rest workflow tasks go to the Sticky queue associated with a specific
     //   worker instance.
     float tasks_dispatch_rate = 4;
+
+    // Whether rate limiting blocked any dispatches within the recent observation window (approximately
+    // 30 seconds). When true, adding more workers will not increase throughput — the bottleneck is the
+    // rate limit, not worker count. This field is useful for auto-scaling systems to avoid unnecessary
+    // scale-up.
+    bool rate_limiting_active = 5;
 }
 
 // Deprecated. Use `InternalTaskQueueStatus`. This is kept until `DescribeTaskQueue` supports legacy behavior.
@@ -306,6 +312,17 @@ message TimestampedCompatibleBuildIdRedirectRule {
 message PollerGroupInfo {
   string id = 1;
   float weight = 2;
+}
+
+// A versioned snapshot of the poller groups the client should use for future polls to a task
+// queue. The version is monotonically increasing so that a client can ignore a snapshot that is
+// older than the one it has already applied.
+message PollerGroupsInfo {
+  // Monotonically increasing version of this snapshot. A client should ignore any snapshot whose
+  // version is not greater than the one it last applied.
+  int64 version = 1;
+  // The weighted list of poller groups the client should use for future polls to this task queue.
+  repeated PollerGroupInfo poller_groups = 2;
 }
 
 // Attached to task responses to give hints to the SDK about how it may adjust its number of

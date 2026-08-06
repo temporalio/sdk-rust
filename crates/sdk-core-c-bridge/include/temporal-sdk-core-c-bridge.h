@@ -839,6 +839,11 @@ typedef struct TemporalCoreWorkerOptions {
    * NOTE: Experimental
    */
   bool disable_payload_error_limit;
+  /**
+   * Maximum number of activity slots that may be reserved for eager execution when completing
+   * a workflow task. Zero disables eager activity execution.
+   */
+  uint32_t max_eager_activity_reservations_per_workflow_task;
 } TemporalCoreWorkerOptions;
 
 /**

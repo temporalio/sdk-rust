@@ -104,10 +104,7 @@ async fn child_workflow_happy_path() {
         .await
         .unwrap();
     worker.run_until_done().await.unwrap();
-    handle
-        .fetch_history_and_replay(worker.inner_mut())
-        .await
-        .unwrap();
+    handle.fetch_history_and_replay(&mut worker).await.unwrap();
 }
 
 #[workflow]
@@ -341,7 +338,7 @@ impl CancelledChildGetsReasonChild {
     #[run(name = "child_wf")]
     async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<String> {
         let r = ctx.cancelled().await;
-        Ok(r)
+        Ok(r.unwrap_or_default())
     }
 }
 
@@ -391,11 +388,12 @@ impl SignalChildWorkflowWf {
         let serial = ctx.state(|wf| wf.serial);
         if serial {
             start_res
-                .signal(UnusedChildWf::signal, "Hi!".to_string())
+                .signal(UnusedChildWf::signal, "Hi!".to_string(), Default::default())
                 .await?;
             start_res.result().await?;
         } else {
-            let sigfut = start_res.signal(UnusedChildWf::signal, "Hi!".to_string());
+            let sigfut =
+                start_res.signal(UnusedChildWf::signal, "Hi!".to_string(), Default::default());
             let resfut = start_res.result();
             let (sigres, res) = join!(sigfut, resfut);
             sigres?;
@@ -1237,10 +1235,7 @@ async fn cancel_child_wf_before_started_event_real_server() {
     );
 
     // Replay the history to verify determinism
-    handle
-        .fetch_history_and_replay(worker.inner_mut())
-        .await
-        .unwrap();
+    handle.fetch_history_and_replay(&mut worker).await.unwrap();
 }
 
 #[workflow]
@@ -1396,7 +1391,11 @@ impl ChildSignalSerializationFailParent {
             .await?;
 
         let signal_result = started
-            .signal(UnserializableSignalChild::bad_signal, AlwaysFailsSerialize)
+            .signal(
+                UnserializableSignalChild::bad_signal,
+                AlwaysFailsSerialize,
+                Default::default(),
+            )
             .await;
         assert_matches!(signal_result, Err(WorkflowSignalError::Serialization(_)));
 
@@ -1544,7 +1543,7 @@ impl CancelExternalTarget {
     #[run]
     async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<String> {
         let r = ctx.cancelled().await;
-        Ok(r)
+        Ok(r.unwrap_or_default())
     }
 }
 

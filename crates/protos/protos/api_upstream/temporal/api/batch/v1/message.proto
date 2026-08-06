@@ -28,6 +28,8 @@ message BatchOperationInfo {
   google.protobuf.Timestamp start_time = 3;
   // Batch operation close time
   google.protobuf.Timestamp close_time = 4;
+  // Operation type
+  temporal.api.enums.v1.BatchOperationType operation_type = 5;
 }
 
 // BatchOperationTermination sends terminate requests to batch workflows.
@@ -38,6 +40,16 @@ message BatchOperationTermination {
   temporal.api.common.v1.Payloads details = 1;
   // The identity of the worker/client
   string identity = 2;
+}
+
+// BatchOperationTerminateActivities sends terminate requests to a batch of activities.
+// Keep the parameter in sync with temporal.api.workflowservice.v1.TerminateActivityExecutionRequest.
+message BatchOperationTerminateActivities {
+  // The identity of the worker/client
+  string identity = 1;
+  // Reason for requesting the termination, recorded and available via the PollActivityExecution API.
+  // Not propagated to a worker if an activity attempt is currently running.
+  string reason = 2;
 }
 
 // BatchOperationSignal sends signals to batch workflows.
@@ -62,11 +74,26 @@ message BatchOperationCancellation {
   string identity = 1;
 }
 
+// BatchOperationCancelActivities sends cancel requests to a batch of activities.
+// Keep the parameter in sync with temporal.api.workflowservice.v1.RequestCancelActivityExecutionRequest.
+message BatchOperationCancelActivities {
+  // The identity of the worker/client
+  string identity = 1;
+  // Reason for requesting the cancellation, recorded and available via the PollActivityExecution API.
+  // Not propagated to a worker if an activity attempt is currently running.
+  string reason = 2;
+}
+
 // BatchOperationDeletion sends deletion requests to batch workflows.
 // Keep the parameter in sync with temporal.api.workflowservice.v1.DeleteWorkflowExecutionRequest.
 message BatchOperationDeletion {
   // The identity of the worker/client
   string identity = 1;
+}
+
+// BatchOperationDeleteActivities sends deletion requests to a batch of activities.
+// Keep the parameter in sync with temporal.api.workflowservice.v1.DeleteActivityExecutionRequest.
+message BatchOperationDeleteActivities {
 }
 
 // BatchOperationReset sends reset requests to batch workflows.

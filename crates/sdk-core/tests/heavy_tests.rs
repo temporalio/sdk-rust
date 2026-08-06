@@ -83,7 +83,7 @@ async fn activity_load() {
 
     let mut starter = CoreWfStarter::new("activity_load");
     starter.sdk_config.max_cached_workflows = CONCURRENCY;
-    starter.sdk_config.activity_task_poller_behavior = PollerBehavior::SimpleMaximum(10);
+    starter.sdk_config.activity_task_poller_behavior = Some(PollerBehavior::SimpleMaximum(10));
     starter.sdk_config.tuner =
         Arc::new(TunerHolder::fixed_size(CONCURRENCY, CONCURRENCY, 100, 100));
     starter.sdk_config.register_activities(StdActivities);
@@ -162,8 +162,10 @@ async fn chunky_activities_resource_based() {
     const WORKFLOWS: usize = 100;
 
     let mut starter = CoreWfStarter::new("chunky_activities_resource_based");
-    starter.sdk_config.workflow_task_poller_behavior = PollerBehavior::SimpleMaximum(10_usize);
-    starter.sdk_config.activity_task_poller_behavior = PollerBehavior::SimpleMaximum(10_usize);
+    starter.sdk_config.workflow_task_poller_behavior =
+        Some(PollerBehavior::SimpleMaximum(10_usize));
+    starter.sdk_config.activity_task_poller_behavior =
+        Some(PollerBehavior::SimpleMaximum(10_usize));
     let mut tuner = ResourceBasedTuner::new(0.7, 0.7);
     tuner
         .with_workflow_slots_options(ResourceSlotOptions::new(
@@ -245,7 +247,7 @@ async fn workflow_load() {
     let rt = CoreRuntime::new_assume_tokio(get_integ_runtime_options(telemopts)).unwrap();
     let mut starter = CoreWfStarter::new_with_runtime("workflow_load", rt);
     starter.sdk_config.max_cached_workflows = 200;
-    starter.sdk_config.activity_task_poller_behavior = PollerBehavior::SimpleMaximum(10);
+    starter.sdk_config.activity_task_poller_behavior = Some(PollerBehavior::SimpleMaximum(10));
     starter.sdk_config.tuner = Arc::new(TunerHolder::fixed_size(5, 100, 100, 100));
     starter.sdk_config.register_activities(StdActivities);
     let task_queue = starter.get_task_queue().to_owned();
@@ -456,16 +458,16 @@ async fn poller_autoscaling_basic_loadtest() {
     let mut starter = CoreWfStarter::new("poller_load");
     starter.sdk_config.max_cached_workflows = 5000;
     starter.sdk_config.tuner = Arc::new(TunerHolder::fixed_size(1000, 1000, 100, 1));
-    starter.sdk_config.workflow_task_poller_behavior = PollerBehavior::Autoscaling {
+    starter.sdk_config.workflow_task_poller_behavior = Some(PollerBehavior::Autoscaling {
         minimum: 1,
         maximum: 200,
         initial: 5,
-    };
-    starter.sdk_config.activity_task_poller_behavior = PollerBehavior::Autoscaling {
+    });
+    starter.sdk_config.activity_task_poller_behavior = Some(PollerBehavior::Autoscaling {
         minimum: 1,
         maximum: 200,
         initial: 5,
-    };
+    });
 
     starter.sdk_config.register_activities(JitteryActivities);
     let mut worker = starter.worker().await;

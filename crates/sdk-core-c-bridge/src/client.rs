@@ -824,6 +824,14 @@ async fn call_workflow_service(
                 poll_nexus_operation_execution
             )
         }
+        "PollWorkflowExecutionTimeSkipping" => {
+            rpc_call_on_trait!(
+                client,
+                call,
+                WorkflowService,
+                poll_workflow_execution_time_skipping
+            )
+        }
         "PollNexusTaskQueue" => {
             rpc_call_on_trait!(client, call, WorkflowService, poll_nexus_task_queue)
         }
@@ -1463,10 +1471,12 @@ impl TryFrom<&ConnectionOptions> for temporalio_client::ConnectionOptions {
                     ClientGrpcCompression::Gzip => temporalio_client::GrpcCompression::Gzip,
                     ClientGrpcCompression::None => temporalio_client::GrpcCompression::None,
                 })
-                .payload_limits(temporalio_client::PayloadLimitsOptions {
-                    payloads_warn_size: opts.payloads_warn_size,
-                    memo_warn_size: opts.memo_warn_size,
-                })
+                .payload_limits(
+                    temporalio_client::PayloadLimitsOptions::builder()
+                        .payloads_warn_size(opts.payloads_warn_size)
+                        .memo_warn_size(opts.memo_warn_size)
+                        .build(),
+                )
                 .build(),
         )
     }
@@ -1476,75 +1486,73 @@ impl TryFrom<&ClientTlsOptions> for temporalio_client::TlsOptions {
     type Error = anyhow::Error;
 
     fn try_from(opts: &ClientTlsOptions) -> anyhow::Result<Self> {
-        Ok(temporalio_client::TlsOptions {
-            server_root_ca_cert: opts.server_root_ca_cert.to_option_vec(),
-            domain: opts.domain.to_option_string(),
-            client_tls_options: match (
-                opts.client_cert.to_option_vec(),
-                opts.client_private_key.to_option_vec(),
-            ) {
-                (None, None) => None,
-                (Some(client_cert), Some(client_private_key)) => {
-                    Some(temporalio_client::ClientTlsOptions {
-                        client_cert,
-                        client_private_key,
-                    })
-                }
-                _ => {
-                    return Err(anyhow::anyhow!(
-                        "Must have both client cert and private key or neither"
-                    ));
-                }
-            },
-            server_cert_verifier: None,
-        })
+        let client_tls_options = match (
+            opts.client_cert.to_option_vec(),
+            opts.client_private_key.to_option_vec(),
+        ) {
+            (None, None) => None,
+            (Some(client_cert), Some(client_private_key)) => Some(
+                temporalio_client::ClientTlsOptions::builder()
+                    .client_cert(client_cert)
+                    .client_private_key(client_private_key)
+                    .build(),
+            ),
+            _ => {
+                return Err(anyhow::anyhow!(
+                    "Must have both client cert and private key or neither"
+                ));
+            }
+        };
+        Ok(temporalio_client::TlsOptions::builder()
+            .maybe_server_root_ca_cert(opts.server_root_ca_cert.to_option_vec())
+            .maybe_domain(opts.domain.to_option_string())
+            .maybe_client_tls_options(client_tls_options)
+            .build())
     }
 }
 
 impl From<&ClientRetryOptions> for temporalio_client::RetryOptions {
     fn from(opts: &ClientRetryOptions) -> Self {
-        temporalio_client::RetryOptions {
-            initial_interval: Duration::from_millis(opts.initial_interval_millis),
-            randomization_factor: opts.randomization_factor,
-            multiplier: opts.multiplier,
-            max_interval: Duration::from_millis(opts.max_interval_millis),
-            max_elapsed_time: if opts.max_elapsed_time_millis == 0 {
-                None
-            } else {
-                Some(Duration::from_millis(opts.max_elapsed_time_millis))
-            },
-            max_retries: opts.max_retries,
-        }
+        temporalio_client::RetryOptions::builder()
+            .initial_interval(Duration::from_millis(opts.initial_interval_millis))
+            .randomization_factor(opts.randomization_factor)
+            .multiplier(opts.multiplier)
+            .max_interval(Duration::from_millis(opts.max_interval_millis))
+            .max_elapsed_time(
+                (opts.max_elapsed_time_millis != 0)
+                    .then(|| Duration::from_millis(opts.max_elapsed_time_millis)),
+            )
+            .max_retries(opts.max_retries)
+            .build()
     }
 }
 
 impl From<&ClientKeepAliveOptions> for temporalio_client::ClientKeepAliveOptions {
     fn from(opts: &ClientKeepAliveOptions) -> Self {
-        temporalio_client::ClientKeepAliveOptions {
-            interval: Duration::from_millis(opts.interval_millis),
-            timeout: Duration::from_millis(opts.timeout_millis),
-        }
+        temporalio_client::ClientKeepAliveOptions::builder()
+            .interval(Duration::from_millis(opts.interval_millis))
+            .timeout(Duration::from_millis(opts.timeout_millis))
+            .build()
     }
 }
 
 impl From<&ClientDnsLoadBalancingOptions> for temporalio_client::DnsLoadBalancingOptions {
     fn from(opts: &ClientDnsLoadBalancingOptions) -> Self {
-        let mut out = temporalio_client::DnsLoadBalancingOptions::default();
-        out.resolution_interval = Duration::from_millis(opts.resolution_interval_millis);
-        out
+        temporalio_client::DnsLoadBalancingOptions::builder()
+            .resolution_interval(Duration::from_millis(opts.resolution_interval_millis))
+            .build()
     }
 }
 
 impl From<&ClientHttpConnectProxyOptions> for temporalio_client::proxy::HttpConnectProxyOptions {
     fn from(opts: &ClientHttpConnectProxyOptions) -> Self {
-        temporalio_client::proxy::HttpConnectProxyOptions {
-            target_addr: opts.target_host.to_string(),
-            basic_auth: if opts.username.size != 0 && opts.password.size != 0 {
+        temporalio_client::proxy::HttpConnectProxyOptions::new(opts.target_host.to_string())
+            .maybe_basic_auth(if opts.username.size != 0 && opts.password.size != 0 {
                 Some((opts.username.to_string(), opts.password.to_string()))
             } else {
                 None
-            },
-        }
+            })
+            .build()
     }
 }
 

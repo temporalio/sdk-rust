@@ -10,7 +10,7 @@ use crate::{
         self, PollerBehavior,
         client::{
             MockWorkerClient,
-            mocks::{DEFAULT_TEST_CAPABILITIES, DEFAULT_WORKERS_REGISTRY, mock_worker_client},
+            mocks::{DEFAULT_TEST_CAPABILITIES, mock_worker_client},
         },
     },
 };
@@ -24,6 +24,7 @@ use std::{
     },
     time::Duration,
 };
+use temporalio_client::worker::ClientWorkerSet;
 use temporalio_common::{
     protos::{
         coresdk::{
@@ -343,10 +344,10 @@ async fn worker_shutdown_api(#[case] use_cache: bool, #[case] api_success: bool)
     // This will no longer be needed if
     // https://github.com/asomers/mockall/issues/283 is implemented.
     let mut mock = MockWorkerClient::new();
+    let workers = Arc::new(ClientWorkerSet::new());
     mock.expect_capabilities()
         .returning(|| Some(*DEFAULT_TEST_CAPABILITIES));
-    mock.expect_workers()
-        .returning(|| DEFAULT_WORKERS_REGISTRY.clone());
+    mock.expect_workers().returning(move || workers.clone());
     mock.expect_is_mock().returning(|| true);
     mock.expect_sdk_name_and_version()
         .returning(|| ("test-core".to_string(), "0.0.0".to_string()));
@@ -413,6 +414,7 @@ fn create_test_activity_task() -> PollActivityTaskQueueResponse {
     }
 }
 
+#[allow(deprecated)] // poller_group_infos is deprecated but still an explicit field
 fn create_test_nexus_task(
     header: Option<HashMap<String, String>>,
     capabilities: Option<nexus::v1::request::Capabilities>,
@@ -439,6 +441,7 @@ fn create_test_nexus_task(
         poller_scaling_decision: None,
         poller_group_id: Default::default(),
         poller_group_infos: vec![],
+        poller_groups_info: None,
     }
 }
 
@@ -1237,12 +1240,13 @@ async fn graceful_shutdown_sends_shutdown_worker_rpc_during_initiate() {
     let poll_releaser_for_rpc = poll_releaser.clone();
 
     let mut mock_client = MockWorkerClient::new();
+    let workers = Arc::new(ClientWorkerSet::new());
     mock_client
         .expect_capabilities()
         .returning(|| Some(*DEFAULT_TEST_CAPABILITIES));
     mock_client
         .expect_workers()
-        .returning(|| DEFAULT_WORKERS_REGISTRY.clone());
+        .returning(move || workers.clone());
     mock_client.expect_is_mock().returning(|| true);
     mock_client
         .expect_sdk_name_and_version()
@@ -1264,7 +1268,7 @@ async fn graceful_shutdown_sends_shutdown_worker_rpc_during_initiate() {
             hb.worker_identity = "test-identity".to_string();
             hb.heartbeat_time = Some(std::time::SystemTime::now().into());
         });
-    // Return the worker_poll_complete_on_shutdown capability so validate() enables graceful mode
+    // Return the worker_poll_complete_on_shutdown capability so graceful mode is enabled.
     mock_client.expect_describe_namespace().returning(move || {
         Ok(DescribeNamespaceResponse {
             namespace_info: Some(NamespaceInfo {
@@ -1325,4 +1329,62 @@ async fn graceful_shutdown_sends_shutdown_worker_rpc_during_initiate() {
     );
 
     worker.finalize_shutdown().await;
+}
+
+#[tokio::test]
+async fn validate_enables_auto_enroll_capability() {
+    let mut mock = mock_worker_client();
+    mock.expect_describe_namespace().returning(|| {
+        Ok(DescribeNamespaceResponse {
+            namespace_info: Some(NamespaceInfo {
+                capabilities: Some(Capabilities {
+                    poller_autoscaling_auto_enroll: true,
+                    ..Capabilities::default()
+                }),
+                ..NamespaceInfo::default()
+            }),
+            ..DescribeNamespaceResponse::default()
+        })
+    });
+    let t = canned_histories::single_timer("1");
+    let mut mh = MockPollCfg::from_resp_batches("fakeid", t, [1], mock);
+    mh.enforce_correct_number_of_polls = false;
+    let worker = mock_worker(build_mock_pollers(mh));
+
+    worker.validate().await.unwrap();
+    let caps = worker.get_namespace_capabilities();
+    assert!(caps.poller_autoscaling_auto_enroll());
+    // The two capabilities are independent: advertising auto-enroll alone does not imply the
+    // `poller_autoscaling` capability (the server advertises each on its own).
+    assert!(!caps.poller_autoscaling());
+
+    worker.drain_pollers_and_shutdown().await;
+}
+
+#[tokio::test]
+async fn validate_without_auto_enroll_leaves_capabilities_off() {
+    let mut mock = mock_worker_client();
+    mock.expect_describe_namespace().returning(|| {
+        Ok(DescribeNamespaceResponse {
+            namespace_info: Some(NamespaceInfo {
+                capabilities: Some(Capabilities {
+                    poller_autoscaling_auto_enroll: false,
+                    ..Capabilities::default()
+                }),
+                ..NamespaceInfo::default()
+            }),
+            ..DescribeNamespaceResponse::default()
+        })
+    });
+    let t = canned_histories::single_timer("1");
+    let mut mh = MockPollCfg::from_resp_batches("fakeid", t, [1], mock);
+    mh.enforce_correct_number_of_polls = false;
+    let worker = mock_worker(build_mock_pollers(mh));
+
+    worker.validate().await.unwrap();
+    let caps = worker.get_namespace_capabilities();
+    assert!(!caps.poller_autoscaling_auto_enroll());
+    assert!(!caps.poller_autoscaling());
+
+    worker.drain_pollers_and_shutdown().await;
 }

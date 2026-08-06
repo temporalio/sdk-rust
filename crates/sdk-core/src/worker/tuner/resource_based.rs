@@ -529,10 +529,11 @@ impl RealSysInfoInner {
         if let Some(cgroup_limits) = lock.cgroup_limits() {
             self.total_mem
                 .store(cgroup_limits.total_memory, Ordering::Release);
-            self.cur_mem_usage.store(
-                cgroup_limits.total_memory - cgroup_limits.free_memory,
-                Ordering::Release,
-            );
+            // Gate on anonymous memory (`rss`) rather than `memory.current`
+            // (`total - free`), which includes reclaimable page cache and can
+            // permanently starve slot admission.
+            self.cur_mem_usage
+                .store(cgroup_limits.rss, Ordering::Release);
 
             let cpu = self.cgroup_cpu_info.calc_cpu_percent().unwrap_or_else(|| {
                 // There won't be a cgroup cpu usage if there is no limit applied to the cgroup
@@ -1191,9 +1192,9 @@ mod tests {
             "RealSysInfo total_mem should equal min(cgroup limit, host total)"
         );
 
-        let cur_used = current_mem
-            .total_memory
-            .saturating_sub(current_mem.free_memory);
+        // Usage is gated on anonymous memory, not `memory.current`, so page
+        // cache doesn't count against the limit.
+        let cur_used = current_mem.rss;
         let half_total = current_mem.total_memory / 2;
         let expected_percentage = if cur_used > half_total {
             cur_used as f64 / current_mem.total_memory as f64
@@ -1212,8 +1213,9 @@ mod tests {
 
         assert!(
             diff < 0.2,
-            "RealSysInfo used_mem_percentage should be ~= {}%",
-            expected_percentage * 100.0
+            "RealSysInfo used_mem_percentage should be ~= {}% but was {}",
+            expected_percentage * 100.0,
+            percentage * 100.0
         );
     }
 

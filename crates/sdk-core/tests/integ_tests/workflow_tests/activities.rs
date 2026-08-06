@@ -1,8 +1,8 @@
 use crate::{
     common::{
         ActivationAssertionsInterceptor, CoreWfStarter, INTEG_CLIENT_IDENTITY,
-        activity_functions::StdActivities, build_fake_sdk, eventually, init_core_and_create_wf,
-        mock_sdk, mock_sdk_cfg,
+        activity_functions::StdActivities, build_fake_sdk_intercepted, eventually,
+        init_core_and_create_wf, mock_sdk, mock_sdk_cfg,
     },
     shared_tests,
 };
@@ -316,21 +316,20 @@ async fn activity_interceptor_wraps_activity_execution() {
         .sdk_config
         .register_workflow::<OneActivityWorkflow>()
         .unwrap();
-    let mut worker = starter.worker().await;
-
     let records = Arc::new(ActivityInterceptorRecords::default());
-    worker
-        .inner_mut()
-        .add_activity_inbound_interceptor(RecordingActivityInboundInterceptor {
+    starter
+        .sdk_config
+        .activity_inbound_interceptor(RecordingActivityInboundInterceptor {
             interceptor: "outer",
             records: records.clone(),
         });
-    worker
-        .inner_mut()
-        .add_activity_inbound_interceptor(RecordingActivityInboundInterceptor {
+    starter
+        .sdk_config
+        .activity_inbound_interceptor(RecordingActivityInboundInterceptor {
             interceptor: "inner",
             records: records.clone(),
         });
+    let mut worker = starter.worker().await;
 
     let input = "hello from input!".to_string();
     let task_queue = starter.get_task_queue().to_owned();
@@ -402,15 +401,14 @@ async fn activity_interceptor_wraps_local_activity_execution() {
         .sdk_config
         .register_workflow::<OneLocalActivityWorkflow>()
         .unwrap();
-    let mut worker = starter.worker().await;
-
     let records = Arc::new(ActivityInterceptorRecords::default());
-    worker
-        .inner_mut()
-        .add_activity_inbound_interceptor(RecordingActivityInboundInterceptor {
+    starter
+        .sdk_config
+        .activity_inbound_interceptor(RecordingActivityInboundInterceptor {
             interceptor: "local",
             records: records.clone(),
         });
+    let mut worker = starter.worker().await;
 
     let input = "hello from local input!".to_string();
     let task_queue = starter.get_task_queue().to_owned();
@@ -476,11 +474,10 @@ async fn activity_inbound_interceptor_can_mutate_activity_input() {
         .sdk_config
         .register_workflow::<OneActivityWorkflow>()
         .unwrap();
+    starter
+        .sdk_config
+        .activity_inbound_interceptor(MutatingActivityInboundInterceptor);
     let mut worker = starter.worker().await;
-
-    worker
-        .inner_mut()
-        .add_activity_inbound_interceptor(MutatingActivityInboundInterceptor);
 
     let input = "hello from input!".to_string();
     let task_queue = starter.get_task_queue().to_owned();
@@ -541,15 +538,14 @@ async fn activity_interceptor_observes_activity_error() {
         .sdk_config
         .register_workflow::<ActivityFailureWorkflow>()
         .unwrap();
-    let mut worker = starter.worker().await;
-
     let records = Arc::new(ActivityInterceptorRecords::default());
-    worker
-        .inner_mut()
-        .add_activity_inbound_interceptor(RecordingActivityInboundInterceptor {
+    starter
+        .sdk_config
+        .activity_inbound_interceptor(RecordingActivityInboundInterceptor {
             interceptor: "failure",
             records: records.clone(),
         });
+    let mut worker = starter.worker().await;
 
     let input = "bad input".to_string();
     let task_queue = starter.get_task_queue().to_owned();
@@ -638,15 +634,14 @@ async fn activity_interceptor_observes_activity_panic() {
         .sdk_config
         .register_workflow::<ActivityPanicWorkflow>()
         .unwrap();
-    let mut worker = starter.worker().await;
-
     let records = Arc::new(ActivityInterceptorRecords::default());
-    worker
-        .inner_mut()
-        .add_activity_inbound_interceptor(RecordingActivityInboundInterceptor {
+    starter
+        .sdk_config
+        .activity_inbound_interceptor(RecordingActivityInboundInterceptor {
             interceptor: "panic",
             records: records.clone(),
         });
+    let mut worker = starter.worker().await;
 
     let input = "panic input".to_string();
     let task_queue = starter.get_task_queue().to_owned();
@@ -1537,7 +1532,10 @@ async fn async_activity_completion_workflow() {
         .get_client()
         .await
         .get_async_activity_handle(ActivityIdentifier::TaskToken(task.task_token.into()))
-        .complete(Some(RawValue::new(vec![response_payload.clone()])))
+        .complete(
+            Some(RawValue::new(vec![response_payload.clone()])),
+            Default::default(),
+        )
         .await
         .unwrap();
 
@@ -1990,16 +1988,16 @@ async fn activity_can_be_cancelled_by_local_timeout() {
 async fn long_activity_timeout_repro() {
     let wf_name = "long_activity_timeout_repro";
     let mut starter = CoreWfStarter::new(wf_name);
-    starter.sdk_config.workflow_task_poller_behavior = PollerBehavior::Autoscaling {
+    starter.sdk_config.workflow_task_poller_behavior = Some(PollerBehavior::Autoscaling {
         minimum: 1,
         maximum: 10,
         initial: 5,
-    };
-    starter.sdk_config.activity_task_poller_behavior = PollerBehavior::Autoscaling {
+    });
+    starter.sdk_config.activity_task_poller_behavior = Some(PollerBehavior::Autoscaling {
         minimum: 1,
         maximum: 10,
         initial: 5,
-    };
+    });
     starter
         .set_core_cfg_mutator(|m| m.local_timeout_buffer_for_activities = Duration::from_secs(0));
     starter.sdk_config.register_activities(StdActivities);
@@ -2031,7 +2029,7 @@ async fn long_activity_timeout_repro() {
                 ctx.timer(Duration::from_secs(60 * 3)).await;
                 iter += 1;
                 if iter > 5000 {
-                    ctx.continue_as_new(&(), Default::default())?;
+                    ctx.continue_as_new((), Default::default())?;
                 }
             }
         }
@@ -2216,11 +2214,6 @@ async fn immediate_activity_cancelation() {
     t.add_by_type(EventType::WorkflowExecutionStarted);
     t.add_full_wf_task();
     t.add_workflow_execution_completed();
-    let mut worker = build_fake_sdk(MockPollCfg::from_resps(t, [ResponseType::AllHistory]));
-    worker
-        .register_workflow::<ImmediateActivityCancelationWorkflow>()
-        .unwrap();
-
     let mut aai = ActivationAssertionsInterceptor::default();
     aai.then(|a| {
         assert_matches!(
@@ -2230,6 +2223,7 @@ async fn immediate_activity_cancelation() {
             }]
         )
     });
+
     aai.then(|a| {
         assert_matches!(
             a.jobs.as_slice(),
@@ -2246,13 +2240,21 @@ async fn immediate_activity_cancelation() {
         )
     });
 
-    worker.set_worker_interceptor(aai);
+    let mut worker =
+        build_fake_sdk_intercepted(MockPollCfg::from_resps(t, [ResponseType::AllHistory]), aai);
+    worker
+        .register_workflow::<ImmediateActivityCancelationWorkflow>()
+        .unwrap();
+
     worker.run().await.unwrap();
 }
 
 /// Verifies that activity cancellation is delivered via the nexus worker command channel
-/// even when the activity does not heartbeat.
+/// even when the activity does not heartbeat, with and without eager dispatch.
+#[rstest::rstest]
+#[case::no_eager(true)]
+#[case::eager(false)]
 #[tokio::test]
-async fn activity_cancel_delivered_without_heartbeat() {
-    shared_tests::activity_cancel_delivered_without_heartbeat().await
+async fn activity_cancel_delivered_without_heartbeat(#[case] disable_eager: bool) {
+    shared_tests::activity_cancel_delivered_without_heartbeat(disable_eager).await
 }

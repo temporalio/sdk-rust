@@ -125,7 +125,7 @@ async fn cache_miss_ok() {
     starter.sdk_config.task_types = WorkerTaskTypes::workflow_only();
     starter.sdk_config.tuner = Arc::new(TunerHolder::fixed_size(2, 1, 1, 1));
     starter.sdk_config.max_cached_workflows = 0_usize;
-    starter.sdk_config.workflow_task_poller_behavior = PollerBehavior::SimpleMaximum(1_usize);
+    starter.sdk_config.workflow_task_poller_behavior = Some(PollerBehavior::SimpleMaximum(1_usize));
     let mut worker = starter.worker().await;
 
     let barr = Arc::new(Barrier::new(2));

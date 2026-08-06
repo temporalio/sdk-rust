@@ -108,10 +108,9 @@ pub const LEGACY_QUERY_ID: &str = "legacy_query";
 /// What percentage of a WFT timeout we are willing to wait before sending a WFT heartbeat when
 /// necessary.
 const WFT_HEARTBEAT_TIMEOUT_FRACTION: f32 = 0.8;
-const MAX_EAGER_ACTIVITY_RESERVATIONS_PER_WORKFLOW_TASK: usize = 3;
 
 type Result<T, E = WFMachinesError> = result::Result<T, E>;
-type BoxedActivationStream = BoxStream<'static, Result<ActivationOrAuto, PollError>>;
+type BoxedActivationStream = BoxStream<'static, Result<WorkflowStreamAction, PollError>>;
 type InternalFlagsRef = Rc<RefCell<InternalFlags>>;
 
 /// Centralizes all state related to workflows and workflow tasks
@@ -130,6 +129,8 @@ pub(crate) struct Workflows {
     sticky_attrs: Option<StickyExecutionAttributes>,
     /// If set, can be used to reserve activity task slots for eager-return of new activity tasks.
     activity_tasks_handle: Option<ActivitiesFromWFTsHandle>,
+    /// Maximum number of activity slots to reserve for eager execution per workflow task.
+    max_eager_activity_reservations_per_workflow_task: usize,
     /// Ensures we stay at or below this worker's maximum concurrent workflow task limit
     wft_semaphore: MeteredPermitDealer<WorkflowSlotKind>,
     local_act_mgr: Option<Arc<LocalActivityManager>>,
@@ -177,6 +178,9 @@ impl Workflows {
         let (fetch_tx, fetch_rx) = unbounded_channel();
         let shutdown_tok = basics.shutdown_token.clone();
         let task_queue = basics.worker_config.task_queue.clone();
+        let max_eager_activity_reservations_per_workflow_task = basics
+            .worker_config
+            .max_eager_activity_reservations_per_workflow_task;
         let default_versioning_behavior = basics.default_versioning_behavior;
         let extracted_wft_stream = WFTExtractor::build(
             client.clone(),
@@ -237,9 +241,9 @@ impl Workflows {
                                         .send(fetchreq)
                                         .expect("Fetch channel must not be dropped");
                                 }
-                                for act in o.activations {
+                                for action in o.actions {
                                     activation_tx
-                                        .send(Ok(act))
+                                        .send(Ok(action))
                                         .expect("Activation processor channel not dropped");
                                 }
                             }
@@ -264,6 +268,7 @@ impl Workflows {
             client,
             sticky_attrs,
             activity_tasks_handle,
+            max_eager_activity_reservations_per_workflow_task,
             wft_semaphore,
             local_act_mgr,
             ever_polled: AtomicBool::new(false),
@@ -274,7 +279,7 @@ impl Workflows {
     pub(super) async fn next_workflow_activation(&self) -> Result<WorkflowActivation, PollError> {
         self.ever_polled.store(true, atomic::Ordering::Release);
         loop {
-            let al = {
+            let action = {
                 let mut lock = self.activation_stream.lock().await;
                 let (stream, beginner) = lock.deref_mut();
                 if let Some(beginner) = beginner.take() {
@@ -282,49 +287,64 @@ impl Workflows {
                 }
                 stream.next().await.unwrap_or(Err(PollError::ShutDown))?
             };
-            match al {
-                ActivationOrAuto::LangActivation(mut act)
-                | ActivationOrAuto::ReadyForQueries(mut act) => {
-                    prepare_to_ship_activation(&mut act);
-                    debug!(activation=%act, "Sending activation to lang");
-                    break Ok(act);
-                }
-                ActivationOrAuto::Autocomplete { run_id } => {
-                    if let Err(e) = self
-                        .activation_completed(
-                            WorkflowActivationCompletion {
-                                run_id,
-                                status: Some(
-                                    workflow_completion::Success::from_variants(vec![]).into(),
-                                ),
-                            },
-                            true,
-                            // We need to say a type, but the type is irrelevant, so imagine some
-                            // boxed function we'll never call.
-                            Option::<Box<dyn Fn(PostActivateHookData) + Send>>::None,
-                        )
-                        .await
-                    {
-                        error!(error=?e, "Error while auto-completing workflow task");
+            match action {
+                WorkflowStreamAction::Activation(al) => match al {
+                    ActivationOrAuto::LangActivation(mut act)
+                    | ActivationOrAuto::ReadyForQueries(mut act) => {
+                        prepare_to_ship_activation(&mut act);
+                        debug!(activation=%act, "Sending activation to lang");
+                        break Ok(act);
                     }
-                }
-                ActivationOrAuto::AutoFail {
+                    ActivationOrAuto::Autocomplete { run_id } => {
+                        if let Err(e) = self
+                            .activation_completed(
+                                WorkflowActivationCompletion {
+                                    run_id,
+                                    status: Some(
+                                        workflow_completion::Success::from_variants(vec![]).into(),
+                                    ),
+                                },
+                                true,
+                                // We need to say a type, but the type is irrelevant, so imagine some
+                                // boxed function we'll never call.
+                                Option::<Box<dyn Fn(PostActivateHookData) + Send>>::None,
+                            )
+                            .await
+                        {
+                            error!(error=?e, "Error while auto-completing workflow task");
+                        }
+                    }
+                    ActivationOrAuto::AutoFail {
+                        run_id,
+                        machines_err,
+                    } => {
+                        if let Err(e) = self
+                            .activation_completed(
+                                WorkflowActivationCompletion {
+                                    run_id,
+                                    status: Some(machines_err.as_failure().into()),
+                                },
+                                true,
+                                Option::<Box<dyn Fn(PostActivateHookData) + Send>>::None,
+                            )
+                            .await
+                        {
+                            error!(error=?e, "Error while auto-failing workflow task");
+                        }
+                    }
+                },
+                WorkflowStreamAction::FailUnstoredWft {
                     run_id,
-                    machines_err,
+                    task_token,
+                    cause,
+                    failure,
                 } => {
-                    if let Err(e) = self
-                        .activation_completed(
-                            WorkflowActivationCompletion {
-                                run_id,
-                                status: Some(machines_err.as_failure().into()),
-                            },
-                            true,
-                            Option::<Box<dyn Fn(PostActivateHookData) + Send>>::None,
-                        )
-                        .await
-                    {
-                        error!(error=?e, "Error while auto-failing workflow task");
-                    }
+                    self.handle_activation_failed(
+                        &run_id,
+                        Instant::now(),
+                        FailedActivationWFTReport::Report(task_token, cause, failure),
+                    )
+                    .await;
                 }
             }
         }
@@ -826,7 +846,7 @@ impl Workflows {
                         .map(|q| q.name == self.task_queue)
                         .unwrap_or_default();
                     if same_task_queue
-                        && reserved.len() < MAX_EAGER_ACTIVITY_RESERVATIONS_PER_WORKFLOW_TASK
+                        && reserved.len() < self.max_eager_activity_reservations_per_workflow_task
                     {
                         if let Some(p) = self
                             .activity_tasks_handle
@@ -900,8 +920,22 @@ struct NextPageReq {
 
 #[derive(Debug)]
 struct WFStreamOutput {
-    activations: VecDeque<ActivationOrAuto>,
+    actions: VecDeque<WorkflowStreamAction>,
     fetch_histories: VecDeque<HistoryFetchReq>,
+}
+
+#[derive(Debug, derive_more::Display)]
+enum WorkflowStreamAction {
+    Activation(ActivationOrAuto),
+    /// Fail a WFT that could not be associated with a run and therefore cannot use the normal
+    /// activation completion path.
+    #[display("FailUnstoredWft(run_id={run_id})")]
+    FailUnstoredWft {
+        run_id: String,
+        task_token: TaskToken,
+        cause: WorkflowTaskFailedCause,
+        failure: Failure,
+    },
 }
 
 #[derive(Debug, derive_more::Display)]
@@ -1761,8 +1795,10 @@ fn make_payloads_too_large_failure(violation: &PayloadLimitViolation) -> Failure
 mod tests {
     use super::*;
     use itertools::Itertools;
-    use temporalio_common::payload_limits::{LimitClass, LimitSeverity};
-    use temporalio_common::protos::coresdk::workflow_activation::SignalWorkflow;
+    use temporalio_common::{
+        payload_limits::{LimitClass, LimitSeverity},
+        protos::coresdk::workflow_activation::SignalWorkflow,
+    };
 
     #[test]
     fn payloads_too_large_wft_failure_is_retryable() {

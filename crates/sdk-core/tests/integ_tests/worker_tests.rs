@@ -9,7 +9,6 @@ use crate::{
 use assert_matches::assert_matches;
 use futures_util::{FutureExt, StreamExt};
 use std::{
-    cell::Cell,
     sync::{
         Arc, Mutex,
         atomic::{
@@ -132,7 +131,7 @@ async fn worker_handles_unknown_workflow_types_gracefully() {
     struct GracefulAsserter {
         notify: Arc<Notify>,
         run_id: String,
-        unregistered_failure_seen: Cell<bool>,
+        unregistered_failure_seen: AtomicBool,
     }
     #[async_trait::async_trait(?Send)]
     impl WorkerInterceptor for GracefulAsserter {
@@ -150,7 +149,8 @@ async fn worker_handles_unknown_workflow_types_gracefully() {
                     run_id,
                 } if message == "Workflow type unregistered not found" && *run_id == self.run_id
             ) {
-                self.unregistered_failure_seen.set(true);
+                self.unregistered_failure_seen
+                    .store(true, Ordering::Relaxed);
             }
             // If we've seen the failure, and the completion is a success for the same run, we're done
             if matches!(
@@ -158,7 +158,7 @@ async fn worker_handles_unknown_workflow_types_gracefully() {
                 WorkflowActivationCompletion {
                     status: Some(Status::Successful(..)),
                     run_id,
-                } if self.unregistered_failure_seen.get() && *run_id == self.run_id
+                } if self.unregistered_failure_seen.load(Ordering::Relaxed) && *run_id == self.run_id
             ) {
                 // Shutdown the worker
                 self.notify.notify_one();
@@ -167,13 +167,13 @@ async fn worker_handles_unknown_workflow_types_gracefully() {
         fn on_shutdown(&self, _: &temporalio_sdk::Worker) {}
     }
 
-    let inner = worker.inner_mut();
     let notify = Arc::new(Notify::new());
-    inner.set_worker_interceptor(GracefulAsserter {
+    worker.set_worker_interceptor(GracefulAsserter {
         notify: notify.clone(),
         run_id,
-        unregistered_failure_seen: Cell::new(false),
+        unregistered_failure_seen: AtomicBool::new(false),
     });
+    let inner = worker.inner_mut();
     tokio::join!(async { inner.run().await.unwrap() }, async move {
         notify.notified().await;
         let worker = starter.get_worker().await.clone();
@@ -199,7 +199,7 @@ async fn resource_based_few_pollers_guarantees_non_sticky_poll() {
     let mut starter = CoreWfStarter::new(wf_name);
     starter.sdk_config.task_types = WorkerTaskTypes::workflow_only();
     // 3 pollers so the minimum slots of 2 can both be handed out to a sticky poller
-    starter.sdk_config.workflow_task_poller_behavior = PollerBehavior::SimpleMaximum(3_usize);
+    starter.sdk_config.workflow_task_poller_behavior = Some(PollerBehavior::SimpleMaximum(3_usize));
     // Set the limits to zero so it's essentially unwilling to hand out slots
     let mut tuner = ResourceBasedTuner::new(0.0, 0.0);
     tuner.with_workflow_slots_options(ResourceSlotOptions::new(2, 10, Duration::from_millis(0)));
@@ -541,10 +541,10 @@ async fn warn_band_payload_is_logged_and_completes() {
 
     let mut conn_opts = get_integ_server_options();
     conn_opts.metrics_meter = runtime.telemetry().get_temporal_metric_meter();
-    conn_opts.payload_limits = PayloadLimitsOptions {
-        payloads_warn_size: 1,
-        memo_warn_size: 1,
-    };
+    conn_opts.payload_limits = PayloadLimitsOptions::builder()
+        .payloads_warn_size(1)
+        .memo_warn_size(1)
+        .build();
     let connection = Connection::connect(conn_opts).await.unwrap();
     let client = Client::new(connection, ClientOptions::new(integ_namespace()).build()).unwrap();
 
@@ -894,13 +894,13 @@ async fn history_length_with_fail_and_timeout(
     #[values(true, false)] use_cache: bool,
     #[values(1, 2, 3)] history_responses_case: u8,
 ) {
-    if !use_cache && history_responses_case == 3 {
-        eprintln!(
-            "Skipping history_length_with_fail_and_timeout::use_cache_2_false::history_responses_case_3_3 due to flaky hang"
-        );
-        return;
-    }
     let wfid = "fake_wf_id";
+    // This variant combines a zero-sized cache with a malformed paginated response. Delay that
+    // response until the first WFT's automatic eviction has removed the run, forcing Core to
+    // handle the failed fetch without a cached run. Core must still fail the WFT task token;
+    // otherwise the mock server withholds later responses and the worker hangs.
+    let force_failed_fetch_after_eviction = !use_cache && history_responses_case == 3;
+    let allow_failed_fetch = CancellationToken::new();
     let mut t = TestHistoryBuilder::default();
     t.add_by_type(EventType::WorkflowExecutionStarted);
     t.add_full_wf_task();
@@ -929,7 +929,14 @@ async fn history_length_with_fail_and_timeout(
             needs_fetch.next_page_token = vec![1];
             // Truncate the history a bit in order to force incomplete WFT
             needs_fetch.history.as_mut().unwrap().events.truncate(6);
-            let needs_fetch_resp = ResponseType::Raw(needs_fetch);
+            let needs_fetch_resp = if force_failed_fetch_after_eviction {
+                ResponseType::UntilResolvedRaw(
+                    allow_failed_fetch.clone().cancelled_owned().boxed(),
+                    needs_fetch,
+                )
+            } else {
+                ResponseType::Raw(needs_fetch)
+            };
             let mut empty_fetch_resp: GetWorkflowExecutionHistoryResponse =
                 t.get_history_info(1).unwrap().into();
             empty_fetch_resp.history.as_mut().unwrap().events = vec![];
@@ -975,7 +982,39 @@ async fn history_length_with_fail_and_timeout(
     }
 
     worker.register_workflow::<HistoryLengthWf>().unwrap();
-    worker.run_until_done().await.unwrap();
+    if force_failed_fetch_after_eviction {
+        struct FirstCompletionNotifier(CancellationToken);
+
+        #[async_trait::async_trait(?Send)]
+        impl WorkerInterceptor for FirstCompletionNotifier {
+            async fn on_workflow_activation_completion(
+                &self,
+                _completion: &WorkflowActivationCompletion,
+            ) {
+                self.0.cancel();
+            }
+        }
+
+        let core = worker.core_worker();
+        let first_completion = CancellationToken::new();
+        let wait_for_eviction = async {
+            first_completion.cancelled().await;
+            while core.cached_workflows().await != 0 {
+                tokio::task::yield_now().await;
+            }
+            allow_failed_fetch.cancel();
+        };
+        let run_worker = worker
+            .run_until_done_intercepted(Some(FirstCompletionNotifier(first_completion.clone())));
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(run_worker, wait_for_eviction).0.unwrap();
+        })
+        .await
+        .expect("worker should fail the workflow task after the history fetch fails");
+    } else {
+        worker.run_until_done().await.unwrap();
+    }
 }
 
 #[allow(deprecated)]
@@ -1177,10 +1216,9 @@ async fn test_custom_slot_supplier_simple() {
                 .execute_local_activity(
                     StdActivities::no_op,
                     (),
-                    LocalActivityOptions {
-                        start_to_close_timeout: Some(Duration::from_secs(10)),
-                        ..Default::default()
-                    },
+                    LocalActivityOptions::builder()
+                        .start_to_close_timeout(Duration::from_secs(10))
+                        .build(),
                 )
                 .await;
             Ok(())

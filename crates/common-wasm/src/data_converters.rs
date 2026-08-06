@@ -56,7 +56,7 @@ impl DataConverter {
             converter: &self.payload_converter,
         };
         let payload = self.payload_converter.to_payload(&context, val)?;
-        let encoded = self.codec.encode(data, vec![payload]).await;
+        let encoded = self.codec.encode(data, vec![payload]).await?;
         encoded
             .into_iter()
             .next()
@@ -73,7 +73,7 @@ impl DataConverter {
             data,
             converter: &self.payload_converter,
         };
-        let decoded = self.codec.decode(data, vec![payload]).await;
+        let decoded = self.codec.decode(data, vec![payload]).await?;
         let payload = decoded
             .into_iter()
             .next()
@@ -92,7 +92,7 @@ impl DataConverter {
             converter: &self.payload_converter,
         };
         let payloads = self.payload_converter.to_payloads(&context, val)?;
-        Ok(self.codec.encode(data, payloads).await)
+        self.codec.encode(data, payloads).await
     }
 
     /// Deserialize a value from multiple payloads (e.g. for multi-arg support), applying the codec.
@@ -105,7 +105,7 @@ impl DataConverter {
             data,
             converter: &self.payload_converter,
         };
-        let decoded = self.codec.decode(data, payloads).await;
+        let decoded = self.codec.decode(data, payloads).await?;
         self.payload_converter.from_payloads(&context, decoded)
     }
 
@@ -234,19 +234,22 @@ impl std::error::Error for PayloadConversionError {
 }
 
 /// Encodes and decodes payloads, enabling encryption or compression.
+///
+/// Operational codec failures should be returned as
+/// [`PayloadConversionError::EncodingError`].
 pub trait PayloadCodec {
     /// Encode payloads before they are sent to the server.
     fn encode(
         &self,
         context: &SerializationContextData,
         payloads: Vec<Payload>,
-    ) -> BoxFuture<'static, Vec<Payload>>;
+    ) -> BoxFuture<'static, Result<Vec<Payload>, PayloadConversionError>>;
     /// Decode payloads after they are received from the server.
     fn decode(
         &self,
         context: &SerializationContextData,
         payloads: Vec<Payload>,
-    ) -> BoxFuture<'static, Vec<Payload>>;
+    ) -> BoxFuture<'static, Result<Vec<Payload>, PayloadConversionError>>;
 }
 
 impl<T: PayloadCodec> PayloadCodec for Arc<T> {
@@ -254,14 +257,14 @@ impl<T: PayloadCodec> PayloadCodec for Arc<T> {
         &self,
         context: &SerializationContextData,
         payloads: Vec<Payload>,
-    ) -> BoxFuture<'static, Vec<Payload>> {
+    ) -> BoxFuture<'static, Result<Vec<Payload>, PayloadConversionError>> {
         (**self).encode(context, payloads)
     }
     fn decode(
         &self,
         context: &SerializationContextData,
         payloads: Vec<Payload>,
-    ) -> BoxFuture<'static, Vec<Payload>> {
+    ) -> BoxFuture<'static, Result<Vec<Payload>, PayloadConversionError>> {
         (**self).decode(context, payloads)
     }
 }
@@ -741,15 +744,15 @@ impl PayloadCodec for DefaultPayloadCodec {
         &self,
         _: &SerializationContextData,
         payloads: Vec<Payload>,
-    ) -> BoxFuture<'static, Vec<Payload>> {
-        async move { payloads }.boxed()
+    ) -> BoxFuture<'static, Result<Vec<Payload>, PayloadConversionError>> {
+        async move { Ok(payloads) }.boxed()
     }
     fn decode(
         &self,
         _: &SerializationContextData,
         payloads: Vec<Payload>,
-    ) -> BoxFuture<'static, Vec<Payload>> {
-        async move { payloads }.boxed()
+    ) -> BoxFuture<'static, Result<Vec<Payload>, PayloadConversionError>> {
+        async move { Ok(payloads) }.boxed()
     }
 }
 

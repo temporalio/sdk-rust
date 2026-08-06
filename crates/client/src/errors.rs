@@ -1,6 +1,6 @@
 //! Contains errors that can be returned by clients.
 
-use crate::{WorkflowExecutionStatus, workflow_handle::WorkflowResultDetails};
+use crate::{PluginApplyError, WorkflowExecutionStatus, workflow_handle::WorkflowResultDetails};
 use http::uri::InvalidUri;
 use temporalio_common::{
     data_converters::{DecodablePayloads, PayloadConversionError},
@@ -18,6 +18,9 @@ use tonic::Code;
 #[derive(thiserror::Error, Debug)]
 #[non_exhaustive]
 pub enum ClientConnectError {
+    /// A plugin failed while configuring connection options.
+    #[error(transparent)]
+    Plugin(#[from] PluginApplyError),
     /// Invalid URI. Configuration error, fatal.
     #[error("Invalid URI: {0:?}")]
     InvalidUri(#[from] InvalidUri),
@@ -43,6 +46,14 @@ pub enum ClientConnectError {
     /// Invalid client configuration.
     #[error("Invalid client configuration: {0}")]
     InvalidConfig(String),
+}
+
+impl From<ClientNewError> for ClientConnectError {
+    fn from(value: ClientNewError) -> Self {
+        match value {
+            ClientNewError::Plugin(err) => Self::Plugin(err),
+        }
+    }
 }
 
 /// Errors thrown when a gRPC metadata header is invalid.
@@ -249,6 +260,9 @@ impl WorkflowGetResultError {
 #[derive(thiserror::Error, Debug)]
 #[non_exhaustive]
 pub enum ClientError {
+    /// Error decoding payloads returned by the server.
+    #[error("Payload conversion error: {0}")]
+    PayloadConversion(#[from] PayloadConversionError),
     /// An uncategorized rpc error from the server.
     #[error("Server error: {0}")]
     Rpc(#[from] tonic::Status),
@@ -312,11 +326,13 @@ impl AsyncActivityError {
 }
 
 /// Errors that can occur when constructing a [`crate::Client`].
-///
-/// Currently has no variants, but may be extended in the future.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
-pub enum ClientNewError {}
+pub enum ClientNewError {
+    /// A plugin failed while configuring client options.
+    #[error(transparent)]
+    Plugin(#[from] PluginApplyError),
+}
 
 /// Errors returned by methods on [crate::ActivityHandle] that don't need more specific error types.
 #[derive(Debug, thiserror::Error)]

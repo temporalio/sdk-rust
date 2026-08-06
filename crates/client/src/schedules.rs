@@ -1,4 +1,10 @@
-use crate::{Client, NamespacedClient, grpc::WorkflowService};
+use crate::{
+    BackfillScheduleInput, Client, CreateScheduleInput, CreateScheduleOutput, DeleteScheduleInput,
+    DescribeScheduleInput, DescribeScheduleOutput, ListSchedulesPageInput, ListSchedulesPageOutput,
+    NamespacedClient, Next, PauseScheduleInput, RpcOptions, SendScheduleUpdateInput,
+    TriggerScheduleInput, UnpauseScheduleInput, UpdateScheduleInput, grpc::WorkflowService,
+    interceptors,
+};
 use futures_util::{FutureExt, future::BoxFuture, stream};
 use std::{
     collections::VecDeque,
@@ -122,6 +128,9 @@ pub struct CreateScheduleOptions {
     /// A note to attach to the schedule state (e.g., reason for pausing).
     #[builder(default)]
     pub note: String,
+    /// Controls for the create RPC.
+    #[builder(default)]
+    pub rpc_options: RpcOptions,
 }
 
 /// The action a schedule should perform on each trigger.
@@ -355,6 +364,54 @@ pub struct ListSchedulesOptions {
     /// Query filter string.
     #[builder(default)]
     pub query: String,
+    /// Controls for each list page RPC.
+    #[builder(default)]
+    pub rpc_options: RpcOptions,
+}
+
+/// Options for deleting a schedule.
+#[derive(Debug, Clone, Default, bon::Builder)]
+#[non_exhaustive]
+pub struct DeleteScheduleOptions {
+    /// Controls for the delete RPC.
+    #[builder(default)]
+    pub rpc_options: RpcOptions,
+}
+
+/// Options for pausing a schedule.
+#[derive(Debug, Clone, Default, bon::Builder)]
+#[non_exhaustive]
+pub struct PauseScheduleOptions {
+    /// Controls for the pause RPC.
+    #[builder(default)]
+    pub rpc_options: RpcOptions,
+}
+
+/// Options for unpausing a schedule.
+#[derive(Debug, Clone, Default, bon::Builder)]
+#[non_exhaustive]
+pub struct UnpauseScheduleOptions {
+    /// Controls for the unpause RPC.
+    #[builder(default)]
+    pub rpc_options: RpcOptions,
+}
+
+/// Options for triggering a schedule.
+#[derive(Debug, Clone, Default, bon::Builder)]
+#[non_exhaustive]
+pub struct TriggerScheduleOptions {
+    /// Controls for the trigger RPC.
+    #[builder(default)]
+    pub rpc_options: RpcOptions,
+}
+
+/// Options for backfilling a schedule.
+#[derive(Debug, Clone, Default, bon::Builder)]
+#[non_exhaustive]
+pub struct BackfillScheduleOptions {
+    /// Controls for the backfill RPC.
+    #[builder(default)]
+    pub rpc_options: RpcOptions,
 }
 
 /// A stream of schedule summaries from a list operation.
@@ -997,25 +1054,41 @@ where
     }
 
     /// Describe this schedule, returning its full definition, info, and conflict token.
-    pub async fn describe(&self) -> Result<ScheduleDescription, ScheduleError> {
-        let mut resp = WorkflowService::describe_schedule(
-            &mut self.client.clone(),
-            DescribeScheduleRequest {
-                namespace: self.namespace.clone(),
+    pub async fn describe(
+        &self,
+        rpc_options: RpcOptions,
+    ) -> Result<ScheduleDescription, ScheduleError> {
+        let output = interceptors::call_describe_schedule(
+            self.client.client_interceptors(),
+            DescribeScheduleInput {
                 schedule_id: self.schedule_id.clone(),
-            }
-            .into_request(),
+                rpc_options,
+            },
+            Next::new({
+                let handle = self.clone();
+                move |input: DescribeScheduleInput| -> BoxFuture<
+                    '_,
+                    Result<DescribeScheduleOutput, ScheduleError>,
+                > {
+                    Box::pin(async move {
+                        let response = handle
+                            .describe_raw(input.schedule_id, input.rpc_options)
+                            .await?;
+                        Ok(DescribeScheduleOutput::new(response))
+                    })
+                }
+            }),
         )
-        .await?
-        .into_inner();
+        .await?;
 
+        let mut resp = output.response;
         if let Some(memo) = resp.memo.as_mut() {
             decode_payloads(
                 memo,
                 self.client.data_converter().codec(),
                 &SerializationContextData::Workflow,
             )
-            .await;
+            .await?;
         }
 
         ScheduleDescription::new(
@@ -1035,9 +1108,12 @@ where
     /// #     handle: &temporalio_client::schedules::ScheduleHandle<temporalio_client::Client>,
     /// # ) -> Result<(), temporalio_client::schedules::ScheduleError> {
     /// handle
-    ///     .update(|u| {
-    ///         u.set_note("updated").set_paused(true);
-    ///     })
+    ///     .update(
+    ///         |u| {
+    ///             u.set_note("updated").set_paused(true);
+    ///         },
+    ///         Default::default(),
+    ///     )
     ///     .await?;
     /// # Ok(())
     /// # }
@@ -1046,12 +1122,43 @@ where
     // returns FailedPrecondition with "mismatched conflict token".
     pub async fn update(
         &self,
-        updater: impl FnOnce(&mut ScheduleUpdate),
+        updater: impl FnOnce(&mut ScheduleUpdate) + Send + 'static,
+        rpc_options: RpcOptions,
     ) -> Result<(), ScheduleError> {
-        let desc = self.describe().await?;
-        let mut update = desc.into_update();
-        updater(&mut update);
-        self.send_update(update).await
+        interceptors::call_update_schedule(
+            self.client.client_interceptors(),
+            UpdateScheduleInput {
+                schedule_id: self.schedule_id.clone(),
+                rpc_options,
+            },
+            Next::new({
+                let handle = self.clone();
+                move |input: UpdateScheduleInput| -> BoxFuture<'_, Result<(), ScheduleError>> {
+                    Box::pin(async move {
+                        let mut response = handle
+                            .describe_raw(input.schedule_id.clone(), input.rpc_options.clone())
+                            .await?;
+                        decode_payloads(
+                            &mut response,
+                            handle.client.data_converter().codec(),
+                            &SerializationContextData::Workflow,
+                        )
+                        .await?;
+                        let description = ScheduleDescription::new(
+                            response,
+                            handle.client.data_converter().clone(),
+                            &input.schedule_id,
+                        )?;
+                        let mut update = description.into_update();
+                        updater(&mut update);
+                        handle
+                            .send_update_raw(input.schedule_id, update, input.rpc_options)
+                            .await
+                    })
+                }
+            }),
+        )
+        .await
     }
 
     /// Send a pre-built [`ScheduleUpdate`] to the server.
@@ -1059,142 +1166,281 @@ where
     /// Prefer [`update()`](Self::update) for most use cases. Use this when you
     /// need to inspect the [`ScheduleDescription`] before deciding what to
     /// change.
-    pub async fn send_update(&self, mut update: ScheduleUpdate) -> Result<(), ScheduleError> {
+    pub async fn send_update(
+        &self,
+        update: ScheduleUpdate,
+        rpc_options: RpcOptions,
+    ) -> Result<(), ScheduleError> {
+        interceptors::call_send_schedule_update(
+            self.client.client_interceptors(),
+            SendScheduleUpdateInput {
+                schedule_id: self.schedule_id.clone(),
+                update,
+                rpc_options,
+            },
+            Next::new({
+                let handle = self.clone();
+                move |input: SendScheduleUpdateInput| -> BoxFuture<'_, Result<(), ScheduleError>> {
+                    Box::pin(async move {
+                        handle
+                            .send_update_raw(input.schedule_id, input.update, input.rpc_options)
+                            .await
+                    })
+                }
+            }),
+        )
+        .await
+    }
+
+    async fn describe_raw(
+        &self,
+        schedule_id: String,
+        rpc_options: RpcOptions,
+    ) -> Result<DescribeScheduleResponse, ScheduleError> {
+        let mut request = DescribeScheduleRequest {
+            namespace: self.namespace.clone(),
+            schedule_id,
+        }
+        .into_request();
+        rpc_options.apply_to(&mut request);
+        Ok(
+            WorkflowService::describe_schedule(&mut self.client.clone(), request)
+                .await?
+                .into_inner(),
+        )
+    }
+
+    async fn send_update_raw(
+        &self,
+        schedule_id: String,
+        mut update: ScheduleUpdate,
+        rpc_options: RpcOptions,
+    ) -> Result<(), ScheduleError> {
         if let Some(action) = update.pending_action.take() {
             update.schedule.action = Some(action.into_proto(self.client.data_converter()).await?);
         }
-        WorkflowService::update_schedule(
-            &mut self.client.clone(),
-            UpdateScheduleRequest {
-                namespace: self.namespace.clone(),
-                schedule_id: self.schedule_id.clone(),
-                schedule: Some(update.schedule),
-                identity: self.client.identity(),
-                request_id: Uuid::new_v4().to_string(),
-                ..Default::default()
-            }
-            .into_request(),
-        )
-        .await?;
+        let mut request = UpdateScheduleRequest {
+            namespace: self.namespace.clone(),
+            schedule_id,
+            schedule: Some(update.schedule),
+            identity: self.client.identity(),
+            request_id: Uuid::new_v4().to_string(),
+            ..Default::default()
+        }
+        .into_request();
+        rpc_options.apply_to(&mut request);
+        WorkflowService::update_schedule(&mut self.client.clone(), request).await?;
         Ok(())
     }
 
     /// Delete this schedule.
-    pub async fn delete(&self) -> Result<(), ScheduleError> {
-        WorkflowService::delete_schedule(
-            &mut self.client.clone(),
-            DeleteScheduleRequest {
-                namespace: self.namespace.clone(),
+    pub async fn delete(&self, options: DeleteScheduleOptions) -> Result<(), ScheduleError> {
+        let rpc_options = options.rpc_options;
+        interceptors::call_delete_schedule(
+            self.client.client_interceptors(),
+            DeleteScheduleInput {
                 schedule_id: self.schedule_id.clone(),
-                identity: self.client.identity(),
-            }
-            .into_request(),
+                rpc_options,
+            },
+            Next::new({
+                let mut client = self.client.clone();
+                let namespace = self.namespace.clone();
+                move |input: DeleteScheduleInput| -> BoxFuture<'_, Result<(), ScheduleError>> {
+                    Box::pin(async move {
+                        let mut request = DeleteScheduleRequest {
+                            namespace,
+                            schedule_id: input.schedule_id,
+                            identity: client.identity(),
+                        }
+                        .into_request();
+                        input.rpc_options.apply_to(&mut request);
+                        WorkflowService::delete_schedule(&mut client, request).await?;
+                        Ok(())
+                    })
+                }
+            }),
         )
-        .await?;
-        Ok(())
+        .await
     }
 
     /// Pause the schedule with an optional note.
     ///
     /// If `note` is `None`, a default note is used.
-    pub async fn pause(&self, note: Option<impl Into<String>>) -> Result<(), ScheduleError> {
+    pub async fn pause(
+        &self,
+        note: Option<impl Into<String>>,
+        options: PauseScheduleOptions,
+    ) -> Result<(), ScheduleError> {
         let note = note.map_or_else(|| "Paused via Rust SDK".to_string(), |s| s.into());
-        WorkflowService::patch_schedule(
-            &mut self.client.clone(),
-            PatchScheduleRequest {
-                namespace: self.namespace.clone(),
+        let rpc_options = options.rpc_options;
+        interceptors::call_pause_schedule(
+            self.client.client_interceptors(),
+            PauseScheduleInput {
                 schedule_id: self.schedule_id.clone(),
-                patch: Some(schedule_proto::SchedulePatch {
-                    pause: note,
-                    ..Default::default()
-                }),
-                identity: self.client.identity(),
-                request_id: Uuid::new_v4().to_string(),
-            }
-            .into_request(),
+                note,
+                rpc_options,
+            },
+            Next::new({
+                let mut client = self.client.clone();
+                let namespace = self.namespace.clone();
+                move |input: PauseScheduleInput| -> BoxFuture<'_, Result<(), ScheduleError>> {
+                    Box::pin(async move {
+                        let mut request = PatchScheduleRequest {
+                            namespace,
+                            schedule_id: input.schedule_id,
+                            patch: Some(schedule_proto::SchedulePatch {
+                                pause: input.note,
+                                ..Default::default()
+                            }),
+                            identity: client.identity(),
+                            request_id: Uuid::new_v4().to_string(),
+                        }
+                        .into_request();
+                        input.rpc_options.apply_to(&mut request);
+                        WorkflowService::patch_schedule(&mut client, request).await?;
+                        Ok(())
+                    })
+                }
+            }),
         )
-        .await?;
-        Ok(())
+        .await
     }
 
     /// Unpause the schedule with an optional note.
     ///
     /// If `note` is `None`, a default note is used.
-    pub async fn unpause(&self, note: Option<impl Into<String>>) -> Result<(), ScheduleError> {
+    pub async fn unpause(
+        &self,
+        note: Option<impl Into<String>>,
+        options: UnpauseScheduleOptions,
+    ) -> Result<(), ScheduleError> {
         let note = note.map_or_else(|| "Unpaused via Rust SDK".to_string(), |s| s.into());
-        WorkflowService::patch_schedule(
-            &mut self.client.clone(),
-            PatchScheduleRequest {
-                namespace: self.namespace.clone(),
+        let rpc_options = options.rpc_options;
+        interceptors::call_unpause_schedule(
+            self.client.client_interceptors(),
+            UnpauseScheduleInput {
                 schedule_id: self.schedule_id.clone(),
-                patch: Some(schedule_proto::SchedulePatch {
-                    unpause: note,
-                    ..Default::default()
-                }),
-                identity: self.client.identity(),
-                request_id: Uuid::new_v4().to_string(),
-            }
-            .into_request(),
+                note,
+                rpc_options,
+            },
+            Next::new({
+                let mut client = self.client.clone();
+                let namespace = self.namespace.clone();
+                move |input: UnpauseScheduleInput| -> BoxFuture<'_, Result<(), ScheduleError>> {
+                    Box::pin(async move {
+                        let mut request = PatchScheduleRequest {
+                            namespace,
+                            schedule_id: input.schedule_id,
+                            patch: Some(schedule_proto::SchedulePatch {
+                                unpause: input.note,
+                                ..Default::default()
+                            }),
+                            identity: client.identity(),
+                            request_id: Uuid::new_v4().to_string(),
+                        }
+                        .into_request();
+                        input.rpc_options.apply_to(&mut request);
+                        WorkflowService::patch_schedule(&mut client, request).await?;
+                        Ok(())
+                    })
+                }
+            }),
         )
-        .await?;
-        Ok(())
+        .await
     }
 
     /// Trigger the schedule to run immediately with the given overlap policy.
     pub async fn trigger(
         &self,
         overlap_policy: ScheduleOverlapPolicy,
+        options: TriggerScheduleOptions,
     ) -> Result<(), ScheduleError> {
-        WorkflowService::patch_schedule(
-            &mut self.client.clone(),
-            PatchScheduleRequest {
-                namespace: self.namespace.clone(),
+        let rpc_options = options.rpc_options;
+        interceptors::call_trigger_schedule(
+            self.client.client_interceptors(),
+            TriggerScheduleInput {
                 schedule_id: self.schedule_id.clone(),
-                patch: Some(schedule_proto::SchedulePatch {
-                    trigger_immediately: Some(schedule_proto::TriggerImmediatelyRequest {
-                        overlap_policy: overlap_policy.to_proto(),
-                        scheduled_time: None,
-                    }),
-                    ..Default::default()
-                }),
-                identity: self.client.identity(),
-                request_id: Uuid::new_v4().to_string(),
-            }
-            .into_request(),
+                overlap_policy,
+                rpc_options,
+            },
+            Next::new({
+                let mut client = self.client.clone();
+                let namespace = self.namespace.clone();
+                move |input: TriggerScheduleInput| -> BoxFuture<'_, Result<(), ScheduleError>> {
+                    Box::pin(async move {
+                        let mut request = PatchScheduleRequest {
+                            namespace,
+                            schedule_id: input.schedule_id,
+                            patch: Some(schedule_proto::SchedulePatch {
+                                trigger_immediately: Some(
+                                    schedule_proto::TriggerImmediatelyRequest {
+                                        overlap_policy: input.overlap_policy.to_proto(),
+                                        scheduled_time: None,
+                                    },
+                                ),
+                                ..Default::default()
+                            }),
+                            identity: client.identity(),
+                            request_id: Uuid::new_v4().to_string(),
+                        }
+                        .into_request();
+                        input.rpc_options.apply_to(&mut request);
+                        WorkflowService::patch_schedule(&mut client, request).await?;
+                        Ok(())
+                    })
+                }
+            }),
         )
-        .await?;
-        Ok(())
+        .await
     }
 
     /// Request backfill of missed runs.
     pub async fn backfill(
         &self,
         backfills: impl IntoIterator<Item = ScheduleBackfill>,
+        options: BackfillScheduleOptions,
     ) -> Result<(), ScheduleError> {
-        let backfill_requests: Vec<schedule_proto::BackfillRequest> = backfills
-            .into_iter()
-            .map(|b| schedule_proto::BackfillRequest {
-                start_time: Some(b.start_time.into()),
-                end_time: Some(b.end_time.into()),
-                overlap_policy: b.overlap_policy.to_proto(),
-            })
-            .collect();
-        WorkflowService::patch_schedule(
-            &mut self.client.clone(),
-            PatchScheduleRequest {
-                namespace: self.namespace.clone(),
+        let rpc_options = options.rpc_options;
+        interceptors::call_backfill_schedule(
+            self.client.client_interceptors(),
+            BackfillScheduleInput {
                 schedule_id: self.schedule_id.clone(),
-                patch: Some(schedule_proto::SchedulePatch {
-                    backfill_request: backfill_requests,
-                    ..Default::default()
-                }),
-                identity: self.client.identity(),
-                request_id: Uuid::new_v4().to_string(),
-            }
-            .into_request(),
+                backfills: backfills.into_iter().collect(),
+                rpc_options,
+            },
+            Next::new({
+                let mut client = self.client.clone();
+                let namespace = self.namespace.clone();
+                move |input: BackfillScheduleInput| -> BoxFuture<'_, Result<(), ScheduleError>> {
+                    Box::pin(async move {
+                        let backfill_requests = input
+                            .backfills
+                            .into_iter()
+                            .map(|backfill| schedule_proto::BackfillRequest {
+                                start_time: Some(backfill.start_time.into()),
+                                end_time: Some(backfill.end_time.into()),
+                                overlap_policy: backfill.overlap_policy.to_proto(),
+                            })
+                            .collect();
+                        let mut request = PatchScheduleRequest {
+                            namespace,
+                            schedule_id: input.schedule_id,
+                            patch: Some(schedule_proto::SchedulePatch {
+                                backfill_request: backfill_requests,
+                                ..Default::default()
+                            }),
+                            identity: client.identity(),
+                            request_id: Uuid::new_v4().to_string(),
+                        }
+                        .into_request();
+                        input.rpc_options.apply_to(&mut request);
+                        WorkflowService::patch_schedule(&mut client, request).await?;
+                        Ok(())
+                    })
+                }
+            }),
         )
-        .await?;
-        Ok(())
+        .await
     }
 }
 
@@ -1208,53 +1454,72 @@ impl Client {
     ) -> Result<ScheduleHandle<Self>, ScheduleError> {
         let schedule_id = schedule_id.into();
         let namespace = self.namespace();
-
-        let initial_patch = if opts.trigger_immediately {
-            Some(schedule_proto::SchedulePatch {
-                trigger_immediately: Some(schedule_proto::TriggerImmediatelyRequest {
-                    // Always use AllowAll for the initial trigger so the
-                    // schedule fires immediately regardless of overlap state.
-                    overlap_policy: ScheduleOverlapPolicy::AllowAll.to_proto(),
-                    scheduled_time: None,
-                }),
-                ..Default::default()
-            })
-        } else {
-            None
-        };
-        // Only send explicit policies when the user set a non-default overlap
-        // policy, so the server uses its own defaults otherwise.
-        let policies = (opts.overlap_policy != ScheduleOverlapPolicy::Unspecified).then(|| {
-            schedule_proto::SchedulePolicies {
-                overlap_policy: opts.overlap_policy.to_proto(),
-                ..Default::default()
-            }
-        });
-        let schedule = schedule_proto::Schedule {
-            spec: Some(opts.spec.into_proto()),
-            action: Some(opts.action.into_proto(self.data_converter()).await?),
-            policies,
-            state: Some(schedule_proto::ScheduleState {
-                paused: opts.paused,
-                notes: opts.note,
-                ..Default::default()
+        let output = interceptors::call_create_schedule(
+            self.client_interceptors(),
+            CreateScheduleInput {
+                schedule_id,
+                options: opts,
+            },
+            Next::new({
+                let mut client = self.clone();
+                move |input: CreateScheduleInput| -> BoxFuture<
+                    '_,
+                    Result<CreateScheduleOutput, ScheduleError>,
+                > {
+                    Box::pin(async move {
+                        let options = input.options;
+                        let initial_patch = options.trigger_immediately.then(|| {
+                            schedule_proto::SchedulePatch {
+                                trigger_immediately: Some(
+                                    schedule_proto::TriggerImmediatelyRequest {
+                                        overlap_policy: ScheduleOverlapPolicy::AllowAll.to_proto(),
+                                        scheduled_time: None,
+                                    },
+                                ),
+                                ..Default::default()
+                            }
+                        });
+                        let policies = (options.overlap_policy
+                            != ScheduleOverlapPolicy::Unspecified)
+                            .then(|| schedule_proto::SchedulePolicies {
+                                overlap_policy: options.overlap_policy.to_proto(),
+                                ..Default::default()
+                            });
+                        let schedule = schedule_proto::Schedule {
+                            spec: Some(options.spec.into_proto()),
+                            action: Some(
+                                options.action.into_proto(client.data_converter()).await?,
+                            ),
+                            policies,
+                            state: Some(schedule_proto::ScheduleState {
+                                paused: options.paused,
+                                notes: options.note,
+                                ..Default::default()
+                            }),
+                        };
+                        let mut request = CreateScheduleRequest {
+                            namespace: client.namespace(),
+                            schedule_id: input.schedule_id.clone(),
+                            schedule: Some(schedule),
+                            initial_patch,
+                            identity: client.identity(),
+                            request_id: Uuid::new_v4().to_string(),
+                            ..Default::default()
+                        }
+                        .into_request();
+                        options.rpc_options.apply_to(&mut request);
+                        WorkflowService::create_schedule(&mut client, request).await?;
+                        Ok(CreateScheduleOutput::new(input.schedule_id))
+                    })
+                }
             }),
-        };
-        WorkflowService::create_schedule(
-            &mut self.clone(),
-            CreateScheduleRequest {
-                namespace: namespace.clone(),
-                schedule_id: schedule_id.clone(),
-                schedule: Some(schedule),
-                initial_patch,
-                identity: self.identity(),
-                request_id: Uuid::new_v4().to_string(),
-                ..Default::default()
-            }
-            .into_request(),
         )
         .await?;
-        Ok(ScheduleHandle::new(self.clone(), namespace, schedule_id))
+        Ok(ScheduleHandle::new(
+            self.clone(),
+            namespace,
+            output.schedule_id,
+        ))
     }
 
     /// Get a handle to an existing schedule by ID.
@@ -1265,79 +1530,121 @@ impl Client {
     /// List schedules matching the query, returning a stream that lazily
     /// paginates through results.
     pub fn list_schedules(&self, opts: ListSchedulesOptions) -> ListSchedulesStream {
-        let client = self.clone();
-        let namespace = self.namespace();
-        let query = opts.query;
-        let page_size = opts.maximum_page_size;
-
-        let stream = stream::unfold(
-            (Vec::new(), VecDeque::new(), false),
-            move |(next_page_token, mut buffer, exhausted)| {
-                let mut client = client.clone();
-                let namespace = namespace.clone();
-                let query = query.clone();
-
-                async move {
-                    if let Some(item) = buffer.pop_front() {
-                        return Some((Ok(item), (next_page_token, buffer, exhausted)));
-                    } else if exhausted {
-                        return None;
-                    }
-
-                    let response = WorkflowService::list_schedules(
-                        &mut client,
-                        ListSchedulesRequest {
-                            namespace,
-                            maximum_page_size: page_size,
-                            next_page_token: next_page_token.clone(),
-                            query,
-                        }
-                        .into_request(),
-                    )
-                    .await;
-
-                    match response {
-                        Ok(resp) => {
-                            let mut resp = resp.into_inner();
-                            let new_exhausted = resp.next_page_token.is_empty();
-                            let new_token = resp.next_page_token;
-
-                            let data_converter = client.data_converter().clone();
-                            for schedule in &mut resp.schedules {
-                                if let Some(memo) = schedule.memo.as_mut() {
-                                    decode_payloads(
-                                        memo,
-                                        data_converter.codec(),
-                                        &SerializationContextData::Workflow,
-                                    )
-                                    .await;
-                                }
-                            }
-                            buffer = resp
-                                .schedules
-                                .into_iter()
-                                .map(|raw| ScheduleSummary::new(raw, data_converter.clone()))
-                                .collect();
-
-                            buffer
-                                .pop_front()
-                                .map(|item| (Ok(item), (new_token, buffer, new_exhausted)))
-                        }
-                        Err(e) => Some((Err(e.into()), (next_page_token, buffer, true))),
-                    }
-                }
-            },
-        );
-
-        ListSchedulesStream::new(Box::pin(stream))
+        list_schedules_stream(self.clone(), opts)
     }
+}
+
+fn list_schedules_stream<CT>(client: CT, opts: ListSchedulesOptions) -> ListSchedulesStream
+where
+    CT: WorkflowService + NamespacedClient + Clone + Send + Sync + 'static,
+{
+    let namespace = client.namespace();
+    let query = opts.query;
+    let page_size = opts.maximum_page_size;
+    let rpc_options = opts.rpc_options;
+
+    let stream = stream::unfold(
+        (Vec::new(), VecDeque::new(), false),
+        move |(next_page_token, mut buffer, exhausted)| {
+            let client = client.clone();
+            let namespace = namespace.clone();
+            let query = query.clone();
+            let rpc_options = rpc_options.clone();
+
+            async move {
+                if let Some(item) = buffer.pop_front() {
+                    return Some((Ok(item), (next_page_token, buffer, exhausted)));
+                } else if exhausted {
+                    return None;
+                }
+
+                let response = interceptors::call_list_schedules_page(
+                    client.client_interceptors(),
+                    ListSchedulesPageInput {
+                        maximum_page_size: page_size,
+                        query,
+                        next_page_token: next_page_token.clone(),
+                        rpc_options,
+                    },
+                    Next::new({
+                        let mut rpc_client = client.clone();
+                        move |input: ListSchedulesPageInput| -> BoxFuture<
+                                '_,
+                                Result<ListSchedulesPageOutput, ScheduleError>,
+                            > {
+                                Box::pin(async move {
+                                    let mut request = ListSchedulesRequest {
+                                        namespace,
+                                        maximum_page_size: input.maximum_page_size,
+                                        next_page_token: input.next_page_token,
+                                        query: input.query,
+                                    }
+                                    .into_request();
+                                    input.rpc_options.apply_to(&mut request);
+                                    let response =
+                                        WorkflowService::list_schedules(&mut rpc_client, request)
+                                            .await?
+                                            .into_inner();
+                                    Ok(ListSchedulesPageOutput::new(
+                                        response.schedules,
+                                        response.next_page_token,
+                                    ))
+                                })
+                            }
+                    }),
+                )
+                .await;
+
+                match response {
+                    Ok(mut output) => {
+                        let new_exhausted = output.next_page_token.is_empty();
+                        let new_token = output.next_page_token;
+
+                        let data_converter = client.data_converter().clone();
+                        for schedule in &mut output.schedules {
+                            if let Some(memo) = schedule.memo.as_mut()
+                                && let Err(err) = decode_payloads(
+                                    memo,
+                                    data_converter.codec(),
+                                    &SerializationContextData::Workflow,
+                                )
+                                .await
+                            {
+                                return Some((
+                                    Err(ScheduleError::from(err)),
+                                    (new_token, buffer, true),
+                                ));
+                            }
+                        }
+                        buffer = output
+                            .schedules
+                            .into_iter()
+                            .map(|raw| ScheduleSummary::new(raw, data_converter.clone()))
+                            .collect();
+
+                        buffer
+                            .pop_front()
+                            .map(|item| (Ok(item), (new_token, buffer, new_exhausted)))
+                    }
+                    Err(e) => Some((Err(e), (next_page_token, buffer, true))),
+                }
+            }
+        },
+    );
+
+    ListSchedulesStream::new(Box::pin(stream))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{NamespacedClient, grpc::WorkflowService, test_helpers::XorCodec};
-    use futures_util::FutureExt;
+    use crate::{
+        ClientInterceptor, DescribeScheduleInput, DescribeScheduleOutput, NamespacedClient, Next,
+        SendScheduleUpdateInput, UpdateScheduleInput,
+        grpc::WorkflowService,
+        test_helpers::{FailingCodec, XorCodec},
+    };
+    use futures_util::{FutureExt, StreamExt};
     use std::{
         collections::HashMap,
         sync::{
@@ -1363,8 +1670,8 @@ mod tests {
             taskqueue::v1::TaskQueue,
             workflow::v1::NewWorkflowExecutionInfo,
             workflowservice::v1::{
-                DeleteScheduleResponse, DescribeScheduleResponse, PatchScheduleResponse,
-                UpdateScheduleResponse,
+                DeleteScheduleResponse, DescribeScheduleResponse, ListSchedulesResponse,
+                PatchScheduleResponse, UpdateScheduleResponse,
             },
         },
     };
@@ -1384,14 +1691,17 @@ mod tests {
         update: AtomicUsize,
         delete: AtomicUsize,
         patch: AtomicUsize,
+        list: AtomicUsize,
     }
 
     #[derive(Clone)]
     struct MockScheduleClient {
         captured: Arc<CapturedRequests>,
         describe_response: DescribeScheduleResponse,
+        list_response: ListSchedulesResponse,
         data_converter: DataConverter,
         should_error: bool,
+        interceptors: Vec<Arc<dyn ClientInterceptor>>,
     }
 
     impl Default for MockScheduleClient {
@@ -1399,8 +1709,10 @@ mod tests {
             Self {
                 captured: Arc::new(CapturedRequests::default()),
                 describe_response: describe_response_with_start_workflow(None),
+                list_response: ListSchedulesResponse::default(),
                 data_converter: DataConverter::default(),
                 should_error: false,
+                interceptors: Vec::new(),
             }
         }
     }
@@ -1414,6 +1726,53 @@ mod tests {
         }
         fn data_converter(&self) -> &DataConverter {
             &self.data_converter
+        }
+        fn client_interceptors(&self) -> &[Arc<dyn ClientInterceptor>] {
+            &self.interceptors
+        }
+    }
+
+    #[derive(Default)]
+    struct ScheduleHookCounts {
+        describe: AtomicUsize,
+        update: AtomicUsize,
+        send_update: AtomicUsize,
+    }
+
+    struct RecordingScheduleInterceptor {
+        counts: Arc<ScheduleHookCounts>,
+    }
+
+    impl ClientInterceptor for RecordingScheduleInterceptor {
+        fn describe_schedule<'a>(
+            &'a self,
+            input: DescribeScheduleInput,
+            next: Next<
+                'a,
+                DescribeScheduleInput,
+                BoxFuture<'a, Result<DescribeScheduleOutput, ScheduleError>>,
+            >,
+        ) -> BoxFuture<'a, Result<DescribeScheduleOutput, ScheduleError>> {
+            self.counts.describe.fetch_add(1, Ordering::SeqCst);
+            next.run(input)
+        }
+
+        fn update_schedule<'a>(
+            &'a self,
+            input: UpdateScheduleInput,
+            next: Next<'a, UpdateScheduleInput, BoxFuture<'a, Result<(), ScheduleError>>>,
+        ) -> BoxFuture<'a, Result<(), ScheduleError>> {
+            self.counts.update.fetch_add(1, Ordering::SeqCst);
+            next.run(input)
+        }
+
+        fn send_schedule_update<'a>(
+            &'a self,
+            input: SendScheduleUpdateInput,
+            next: Next<'a, SendScheduleUpdateInput, BoxFuture<'a, Result<(), ScheduleError>>>,
+        ) -> BoxFuture<'a, Result<(), ScheduleError>> {
+            self.counts.send_update.fetch_add(1, Ordering::SeqCst);
+            next.run(input)
         }
     }
 
@@ -1493,6 +1852,18 @@ mod tests {
                 }
             }
             .boxed()
+        }
+
+        fn list_schedules(
+            &mut self,
+            _request: Request<ListSchedulesRequest>,
+        ) -> futures_util::future::BoxFuture<
+            '_,
+            Result<Response<ListSchedulesResponse>, tonic::Status>,
+        > {
+            self.captured.list.fetch_add(1, Ordering::SeqCst);
+            let response = self.list_response.clone();
+            async move { Ok(Response::new(response)) }.boxed()
         }
     }
 
@@ -1580,7 +1951,7 @@ mod tests {
         };
 
         let handle = make_schedule_handle(client.clone());
-        let desc = handle.describe().await.unwrap();
+        let desc = handle.describe(RpcOptions::default()).await.unwrap();
 
         assert_eq!(client.captured.describe.load(Ordering::SeqCst), 1);
         assert!(desc.raw().schedule.is_some());
@@ -1611,7 +1982,10 @@ mod tests {
             ..Default::default()
         };
 
-        let description = make_schedule_handle(client).describe().await.unwrap();
+        let description = make_schedule_handle(client)
+            .describe(RpcOptions::default())
+            .await
+            .unwrap();
 
         assert_eq!(
             description.memo().get::<String>("memo-key").unwrap(),
@@ -1647,17 +2021,76 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn list_schedules_yields_codec_error_then_ends() {
+        let client = MockScheduleClient {
+            list_response: ListSchedulesResponse {
+                schedules: vec![ScheduleListEntry {
+                    memo: Some(Memo {
+                        fields: HashMap::from([("memo-key".to_owned(), Payload::default())]),
+                    }),
+                    ..Default::default()
+                }],
+                next_page_token: b"next-page".to_vec(),
+            },
+            data_converter: DataConverter::new(
+                PayloadConverter::default(),
+                DefaultFailureConverter,
+                FailingCodec,
+            ),
+            ..Default::default()
+        };
+        let mut stream = list_schedules_stream(client.clone(), ListSchedulesOptions::default());
+
+        let err = stream.next().await.unwrap().unwrap_err();
+
+        assert!(matches!(err, ScheduleError::PayloadConversion(_)));
+        assert!(stream.next().await.is_none());
+        assert_eq!(client.captured.list.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
     async fn schedule_update_describes_then_sends() {
         let client = MockScheduleClient::default();
         let handle = make_schedule_handle(client.clone());
 
         handle
-            .update(|u| {
-                u.set_note("hi");
-            })
+            .update(
+                |u| {
+                    u.set_note("hi");
+                },
+                RpcOptions::default(),
+            )
             .await
             .unwrap();
 
+        assert_eq!(client.captured.describe.load(Ordering::SeqCst), 1);
+        assert_eq!(client.captured.update.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn schedule_update_does_not_nest_describe_or_send_update_hooks() {
+        let counts = Arc::new(ScheduleHookCounts::default());
+        let client = MockScheduleClient {
+            interceptors: vec![Arc::new(RecordingScheduleInterceptor {
+                counts: counts.clone(),
+            })],
+            ..Default::default()
+        };
+        let handle = make_schedule_handle(client.clone());
+
+        handle
+            .update(
+                |update| {
+                    update.set_note("updated");
+                },
+                RpcOptions::default(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(counts.update.load(Ordering::SeqCst), 1);
+        assert_eq!(counts.describe.load(Ordering::SeqCst), 0);
+        assert_eq!(counts.send_update.load(Ordering::SeqCst), 0);
         assert_eq!(client.captured.describe.load(Ordering::SeqCst), 1);
         assert_eq!(client.captured.update.load(Ordering::SeqCst), 1);
     }
@@ -1667,8 +2100,8 @@ mod tests {
         let client = MockScheduleClient::default();
         let handle = make_schedule_handle(client.clone());
 
-        handle.update(|_| {}).await.unwrap();
-        handle.update(|_| {}).await.unwrap();
+        handle.update(|_| {}, RpcOptions::default()).await.unwrap();
+        handle.update(|_| {}, RpcOptions::default()).await.unwrap();
 
         assert_eq!(client.captured.update.load(Ordering::SeqCst), 2);
     }
@@ -1678,7 +2111,10 @@ mod tests {
         let client = MockScheduleClient::default();
         let handle = make_schedule_handle(client.clone());
 
-        handle.delete().await.unwrap();
+        handle
+            .delete(DeleteScheduleOptions::default())
+            .await
+            .unwrap();
 
         assert_eq!(client.captured.delete.load(Ordering::SeqCst), 1);
     }
@@ -1688,7 +2124,10 @@ mod tests {
         let client = MockScheduleClient::default();
         let handle = make_schedule_handle(client.clone());
 
-        handle.pause(Some("taking a break")).await.unwrap();
+        handle
+            .pause(Some("taking a break"), PauseScheduleOptions::default())
+            .await
+            .unwrap();
 
         assert_eq!(client.captured.patch.load(Ordering::SeqCst), 1);
     }
@@ -1698,7 +2137,10 @@ mod tests {
         let client = MockScheduleClient::default();
         let handle = make_schedule_handle(client.clone());
 
-        handle.pause(None::<&str>).await.unwrap();
+        handle
+            .pause(None::<&str>, PauseScheduleOptions::default())
+            .await
+            .unwrap();
 
         assert_eq!(client.captured.patch.load(Ordering::SeqCst), 1);
     }
@@ -1708,7 +2150,10 @@ mod tests {
         let client = MockScheduleClient::default();
         let handle = make_schedule_handle(client.clone());
 
-        handle.unpause(Some("resuming work")).await.unwrap();
+        handle
+            .unpause(Some("resuming work"), UnpauseScheduleOptions::default())
+            .await
+            .unwrap();
 
         assert_eq!(client.captured.patch.load(Ordering::SeqCst), 1);
     }
@@ -1719,7 +2164,10 @@ mod tests {
         let handle = make_schedule_handle(client.clone());
 
         handle
-            .trigger(ScheduleOverlapPolicy::Unspecified)
+            .trigger(
+                ScheduleOverlapPolicy::Unspecified,
+                TriggerScheduleOptions::default(),
+            )
             .await
             .unwrap();
 
@@ -1733,14 +2181,17 @@ mod tests {
 
         let now = SystemTime::now();
         handle
-            .backfill(vec![
-                ScheduleBackfill::new(now, now)
-                    .overlap_policy(ScheduleOverlapPolicy::Skip)
-                    .build(),
-                ScheduleBackfill::new(now, now)
-                    .overlap_policy(ScheduleOverlapPolicy::BufferOne)
-                    .build(),
-            ])
+            .backfill(
+                vec![
+                    ScheduleBackfill::new(now, now)
+                        .overlap_policy(ScheduleOverlapPolicy::Skip)
+                        .build(),
+                    ScheduleBackfill::new(now, now)
+                        .overlap_policy(ScheduleOverlapPolicy::BufferOne)
+                        .build(),
+                ],
+                BackfillScheduleOptions::default(),
+            )
             .await
             .unwrap();
 
@@ -1755,7 +2206,7 @@ mod tests {
         };
         let handle = make_schedule_handle(client);
 
-        let err = handle.describe().await.unwrap_err();
+        let err = handle.describe(RpcOptions::default()).await.unwrap_err();
         assert!(
             matches!(err, ScheduleError::Rpc(_)),
             "expected Rpc variant, got: {err:?}"
@@ -1771,7 +2222,10 @@ mod tests {
         };
         let handle = make_schedule_handle(client);
 
-        let err = handle.update(|_| {}).await.unwrap_err();
+        let err = handle
+            .update(|_| {}, RpcOptions::default())
+            .await
+            .unwrap_err();
         assert!(matches!(err, ScheduleError::Rpc(_)));
     }
 
@@ -1783,7 +2237,10 @@ mod tests {
         };
         let handle = make_schedule_handle(client);
 
-        let err = handle.delete().await.unwrap_err();
+        let err = handle
+            .delete(DeleteScheduleOptions::default())
+            .await
+            .unwrap_err();
         assert!(matches!(err, ScheduleError::Rpc(_)));
     }
 
@@ -1795,10 +2252,30 @@ mod tests {
         };
         let handle = make_schedule_handle(client);
 
-        assert!(handle.pause(Some("")).await.is_err());
-        assert!(handle.unpause(Some("")).await.is_err());
-        assert!(handle.trigger(Default::default()).await.is_err());
-        assert!(handle.backfill(vec![]).await.is_err());
+        assert!(
+            handle
+                .pause(Some(""), PauseScheduleOptions::default())
+                .await
+                .is_err()
+        );
+        assert!(
+            handle
+                .unpause(Some(""), UnpauseScheduleOptions::default())
+                .await
+                .is_err()
+        );
+        assert!(
+            handle
+                .trigger(Default::default(), TriggerScheduleOptions::default())
+                .await
+                .is_err()
+        );
+        assert!(
+            handle
+                .backfill(vec![], BackfillScheduleOptions::default())
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]
@@ -1806,10 +2283,22 @@ mod tests {
         let client = MockScheduleClient::default();
         let handle = make_schedule_handle(client.clone());
 
-        handle.pause(Some("p")).await.unwrap();
-        handle.unpause(Some("u")).await.unwrap();
-        handle.trigger(Default::default()).await.unwrap();
-        handle.backfill(vec![]).await.unwrap();
+        handle
+            .pause(Some("p"), PauseScheduleOptions::default())
+            .await
+            .unwrap();
+        handle
+            .unpause(Some("u"), UnpauseScheduleOptions::default())
+            .await
+            .unwrap();
+        handle
+            .trigger(Default::default(), TriggerScheduleOptions::default())
+            .await
+            .unwrap();
+        handle
+            .backfill(vec![], BackfillScheduleOptions::default())
+            .await
+            .unwrap();
 
         assert_eq!(client.captured.patch.load(Ordering::SeqCst), 4);
     }
@@ -1864,7 +2353,7 @@ mod tests {
         };
 
         let handle = make_schedule_handle(client);
-        let desc = handle.describe().await.unwrap();
+        let desc = handle.describe(RpcOptions::default()).await.unwrap();
 
         assert!(desc.paused());
         assert_eq!(desc.note(), Some("maintenance window"));
@@ -1891,7 +2380,7 @@ mod tests {
         let client = MockScheduleClient::default();
 
         let handle = make_schedule_handle(client);
-        let desc = handle.describe().await.unwrap();
+        let desc = handle.describe(RpcOptions::default()).await.unwrap();
 
         assert!(!desc.paused());
         assert_eq!(desc.note(), None);
@@ -1920,7 +2409,7 @@ mod tests {
         };
 
         let handle = make_schedule_handle(client);
-        let desc = handle.describe().await.unwrap();
+        let desc = handle.describe(RpcOptions::default()).await.unwrap();
         assert_eq!(desc.note(), None);
     }
 
@@ -2081,7 +2570,7 @@ mod tests {
         };
         let handle = make_schedule_handle(client);
 
-        let err = handle.describe().await.unwrap_err();
+        let err = handle.describe(RpcOptions::default()).await.unwrap_err();
         assert_eq!(
             err.to_string(),
             format!("Malformed schedule description for schedule ID 'test-schedule-id': {reason}")

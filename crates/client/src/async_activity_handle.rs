@@ -1,8 +1,13 @@
 //! Handle for completing activities asynchronously via a client.
 
-use crate::{NamespacedClient, errors::AsyncActivityError, grpc::WorkflowService};
+use crate::{
+    CompleteAsyncActivityInput, FailAsyncActivityInput, HeartbeatAsyncActivityInput,
+    NamespacedClient, Next, ReportAsyncActivityCancellationInput, RpcOptions, TemporalClientValue,
+    errors::AsyncActivityError, grpc::WorkflowService, interceptors,
+};
+use futures_util::future::BoxFuture;
 use temporalio_common::{
-    data_converters::{SerializationContextData, TemporalSerializable},
+    data_converters::{SerializationContext, SerializationContextData, TemporalSerializable},
     error::{ApplicationFailure, OutgoingActivityError, OutgoingError},
     payload_visitor::encode_payloads,
     protos::{
@@ -21,18 +26,40 @@ use temporalio_common::{
 };
 use tonic::IntoRequest;
 
+async fn encode_optional_value(
+    value: Option<Box<dyn TemporalClientValue>>,
+    data_converter: &temporalio_common::data_converters::DataConverter,
+) -> Result<Option<Payloads>, AsyncActivityError> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let unencoded_payloads = {
+        let payload_converter = data_converter.payload_converter();
+        let context = SerializationContext {
+            data: &SerializationContextData::Activity,
+            converter: payload_converter,
+        };
+        value.serialize_payloads(&context)?
+    };
+    drop(value);
+    let payloads = data_converter
+        .codec()
+        .encode(&SerializationContextData::Activity, unencoded_payloads)
+        .await?;
+    Ok(Some(Payloads { payloads }))
+}
+
 /// Identifies an async activity for completion outside a worker.
 #[derive(Debug, Clone)]
-#[non_exhaustive]
 pub enum ActivityIdentifier {
     /// Identify activity by its task token
     TaskToken(TaskToken),
     /// Identify workflow activity by workflow and activity IDs.
-    ByIdWorkflow {
+    ById {
         /// ID of the workflow that scheduled this activity.
         workflow_id: String,
-        /// Run ID of the workflow (if not provided, targets the latest run).
-        run_id: Option<String>,
+        /// Run ID of the workflow (optional - if not provided, targets the latest run).
+        run_id: String,
         /// ID of the activity to complete.
         activity_id: String,
     },
@@ -51,51 +78,17 @@ impl ActivityIdentifier {
         Self::TaskToken(token)
     }
 
-    /// Create an identifier of a workflow activity from workflow and activity IDs. Set run_id to
-    /// None to target the latest workflow execution.
-    pub fn by_id_workflow(
+    /// Create an identifier from workflow and activity IDs. Use an empty run id to target the
+    /// latest workflow execution.
+    pub fn by_id(
         workflow_id: impl Into<String>,
-        run_id: Option<String>,
+        run_id: impl Into<String>,
         activity_id: impl Into<String>,
     ) -> Self {
-        Self::ByIdWorkflow {
+        Self::ById {
             workflow_id: workflow_id.into(),
-            run_id,
+            run_id: run_id.into(),
             activity_id: activity_id.into(),
-        }
-    }
-
-    /// Create an identifier of a standalone activity from activity IDs. Set run_id to None to
-    /// target the latest workflow execution.
-    pub fn by_id_standalone(activity_id: impl Into<String>, run_id: Option<String>) -> Self {
-        Self::ByIdStandalone {
-            activity_id: activity_id.into(),
-            run_id,
-        }
-    }
-
-    /// Internal use only. Returns workflow ID, run ID and activity ID as separate strings.
-    fn id_tuple(&self) -> (String, String, String) {
-        debug_assert!(!matches!(self, ActivityIdentifier::TaskToken(..)));
-        match self {
-            ActivityIdentifier::ByIdWorkflow {
-                workflow_id,
-                run_id,
-                activity_id,
-            } => (
-                workflow_id.clone(),
-                run_id.clone().unwrap_or_default(),
-                activity_id.clone(),
-            ),
-            ActivityIdentifier::ByIdStandalone {
-                activity_id,
-                run_id,
-            } => (
-                "".into(),
-                run_id.clone().unwrap_or_default(),
-                activity_id.clone(),
-            ),
-            _ => unreachable!("Unknown activity identifier variant"),
         }
     }
 }
@@ -125,54 +118,74 @@ impl<CT> AsyncActivityHandle<CT> {
 
 impl<CT: WorkflowService + NamespacedClient + Clone> AsyncActivityHandle<CT> {
     /// Complete the activity with a successful result.
-    pub async fn complete<T>(&self, result: Option<T>) -> Result<(), AsyncActivityError>
+    pub async fn complete<T>(
+        &self,
+        result: Option<T>,
+        rpc_options: RpcOptions,
+    ) -> Result<(), AsyncActivityError>
     where
-        T: TemporalSerializable + 'static,
+        T: TemporalSerializable + Send + 'static,
     {
-        let result = match result {
-            Some(result) => Some(Payloads {
-                payloads: vec![
-                    self.client
-                        .data_converter()
-                        .to_payload(&SerializationContextData::Activity, &result)
-                        .await?,
-                ],
+        interceptors::call_complete_async_activity(
+            self.client.client_interceptors(),
+            CompleteAsyncActivityInput::new(self.identifier.clone(), result, rpc_options),
+            Next::new({
+                let mut client = self.client.clone();
+                move |input: CompleteAsyncActivityInput| -> BoxFuture<
+                    '_,
+                    Result<(), AsyncActivityError>,
+                > {
+                    Box::pin(async move {
+                        let (identifier, result, rpc_options) = input.into_parts();
+                        let result = encode_optional_value(result, client.data_converter()).await?;
+                        match identifier {
+                            ActivityIdentifier::TaskToken(token) => {
+                                let mut request = RespondActivityTaskCompletedRequest {
+                                    task_token: token.0,
+                                    result,
+                                    identity: client.identity(),
+                                    namespace: client.namespace(),
+                                    ..Default::default()
+                                }
+                                .into_request();
+                                rpc_options.apply_to(&mut request);
+                                WorkflowService::respond_activity_task_completed(
+                                    &mut client,
+                                    request,
+                                )
+                                .await
+                                .map_err(AsyncActivityError::from_status)?;
+                            }
+                            ActivityIdentifier::ById {
+                                workflow_id,
+                                run_id,
+                                activity_id,
+                            } => {
+                                let mut request = RespondActivityTaskCompletedByIdRequest {
+                                    namespace: client.namespace(),
+                                    workflow_id,
+                                    run_id,
+                                    activity_id,
+                                    result,
+                                    identity: client.identity(),
+                                    resource_id: Default::default(),
+                                }
+                                .into_request();
+                                rpc_options.apply_to(&mut request);
+                                WorkflowService::respond_activity_task_completed_by_id(
+                                    &mut client,
+                                    request,
+                                )
+                                .await
+                                .map_err(AsyncActivityError::from_status)?;
+                            }
+                        }
+                        Ok(())
+                    })
+                }
             }),
-            None => None,
-        };
-        if let ActivityIdentifier::TaskToken(token) = &self.identifier {
-            WorkflowService::respond_activity_task_completed(
-                &mut self.client.clone(),
-                RespondActivityTaskCompletedRequest {
-                    task_token: token.0.clone(),
-                    result,
-                    identity: self.client.identity(),
-                    namespace: self.client.namespace(),
-                    ..Default::default()
-                }
-                .into_request(),
-            )
-            .await
-            .map_err(AsyncActivityError::from_status)?;
-        } else {
-            let (workflow_id, run_id, activity_id) = self.identifier.id_tuple();
-            WorkflowService::respond_activity_task_completed_by_id(
-                &mut self.client.clone(),
-                RespondActivityTaskCompletedByIdRequest {
-                    namespace: self.client.namespace(),
-                    workflow_id,
-                    run_id,
-                    activity_id,
-                    result,
-                    identity: self.client.identity(),
-                    resource_id: Default::default(),
-                }
-                .into_request(),
-            )
-            .await
-            .map_err(AsyncActivityError::from_status)?;
-        }
-        Ok(())
+        )
+        .await
     }
 
     /// Fail the activity with a failure.
@@ -180,117 +193,169 @@ impl<CT: WorkflowService + NamespacedClient + Clone> AsyncActivityHandle<CT> {
         &self,
         failure: E,
         last_heartbeat_details: Option<T>,
+        rpc_options: RpcOptions,
     ) -> Result<(), AsyncActivityError>
     where
         E: Into<ApplicationFailure>,
-        T: TemporalSerializable + 'static,
+        T: TemporalSerializable + Send + 'static,
     {
-        let data_converter = self.client.data_converter();
-        let mut failure = data_converter.to_failure(
-            &SerializationContextData::Activity,
-            OutgoingError::Activity(OutgoingActivityError::Application(Box::new(failure.into()))),
-        );
-        encode_payloads(
-            &mut failure,
-            data_converter.codec(),
-            &SerializationContextData::Activity,
-        )
-        .await;
-        let last_heartbeat_details = match last_heartbeat_details {
-            Some(details) => Some(Payloads {
-                payloads: self
-                    .client
-                    .data_converter()
-                    .to_payloads(&SerializationContextData::Activity, &details)
-                    .await?,
+        interceptors::call_fail_async_activity(
+            self.client.client_interceptors(),
+            FailAsyncActivityInput::new(
+                self.identifier.clone(),
+                failure.into(),
+                last_heartbeat_details,
+                rpc_options,
+            ),
+            Next::new({
+                let mut client = self.client.clone();
+                move |input: FailAsyncActivityInput| -> BoxFuture<
+                    '_,
+                    Result<(), AsyncActivityError>,
+                > {
+                    Box::pin(async move {
+                        let (identifier, application_failure, details, rpc_options) =
+                            input.into_parts();
+                        let data_converter = client.data_converter().clone();
+                        let mut failure = data_converter.to_failure(
+                            &SerializationContextData::Activity,
+                            OutgoingError::Activity(OutgoingActivityError::Application(Box::new(
+                                application_failure,
+                            ))),
+                        );
+                        encode_payloads(
+                            &mut failure,
+                            data_converter.codec(),
+                            &SerializationContextData::Activity,
+                        )
+                        .await?;
+                        let last_heartbeat_details =
+                            encode_optional_value(details, &data_converter).await?;
+                        match identifier {
+                            ActivityIdentifier::TaskToken(token) => {
+                                let mut request = RespondActivityTaskFailedRequest {
+                                    task_token: token.0,
+                                    failure: Some(failure),
+                                    identity: client.identity(),
+                                    namespace: client.namespace(),
+                                    last_heartbeat_details,
+                                    ..Default::default()
+                                }
+                                .into_request();
+                                rpc_options.apply_to(&mut request);
+                                WorkflowService::respond_activity_task_failed(
+                                    &mut client,
+                                    request,
+                                )
+                                .await
+                                .map_err(AsyncActivityError::from_status)?;
+                            }
+                            ActivityIdentifier::ById {
+                                workflow_id,
+                                run_id,
+                                activity_id,
+                            } => {
+                                let mut request = RespondActivityTaskFailedByIdRequest {
+                                    namespace: client.namespace(),
+                                    workflow_id,
+                                    run_id,
+                                    activity_id,
+                                    failure: Some(failure),
+                                    identity: client.identity(),
+                                    last_heartbeat_details,
+                                    resource_id: Default::default(),
+                                }
+                                .into_request();
+                                rpc_options.apply_to(&mut request);
+                                WorkflowService::respond_activity_task_failed_by_id(
+                                    &mut client,
+                                    request,
+                                )
+                                .await
+                                .map_err(AsyncActivityError::from_status)?;
+                            }
+                        }
+                        Ok(())
+                    })
+                }
             }),
-            None => None,
-        };
-        if let ActivityIdentifier::TaskToken(token) = &self.identifier {
-            WorkflowService::respond_activity_task_failed(
-                &mut self.client.clone(),
-                RespondActivityTaskFailedRequest {
-                    task_token: token.0.clone(),
-                    failure: Some(failure),
-                    identity: self.client.identity(),
-                    namespace: self.client.namespace(),
-                    last_heartbeat_details,
-                    ..Default::default()
-                }
-                .into_request(),
-            )
-            .await
-            .map_err(AsyncActivityError::from_status)?;
-        } else {
-            let (workflow_id, run_id, activity_id) = self.identifier.id_tuple();
-            WorkflowService::respond_activity_task_failed_by_id(
-                &mut self.client.clone(),
-                RespondActivityTaskFailedByIdRequest {
-                    namespace: self.client.namespace(),
-                    workflow_id: workflow_id.clone(),
-                    run_id: run_id.clone(),
-                    activity_id: activity_id.clone(),
-                    failure: Some(failure),
-                    identity: self.client.identity(),
-                    last_heartbeat_details,
-                    resource_id: Default::default(),
-                }
-                .into_request(),
-            )
-            .await
-            .map_err(AsyncActivityError::from_status)?;
-        }
-        Ok(())
+        )
+        .await
     }
 
     /// Reports the activity as canceled.
-    pub async fn report_cancelation<T>(&self, details: Option<T>) -> Result<(), AsyncActivityError>
+    pub async fn report_cancelation<T>(
+        &self,
+        details: Option<T>,
+        rpc_options: RpcOptions,
+    ) -> Result<(), AsyncActivityError>
     where
-        T: TemporalSerializable + 'static,
+        T: TemporalSerializable + Send + 'static,
     {
-        let details = match details {
-            Some(details) => Some(Payloads {
-                payloads: self
-                    .client
-                    .data_converter()
-                    .to_payloads(&SerializationContextData::Activity, &details)
-                    .await?,
+        interceptors::call_report_async_activity_cancellation(
+            self.client.client_interceptors(),
+            ReportAsyncActivityCancellationInput::new(
+                self.identifier.clone(),
+                details,
+                rpc_options,
+            ),
+            Next::new({
+                let mut client = self.client.clone();
+                move |input: ReportAsyncActivityCancellationInput| -> BoxFuture<
+                    '_,
+                    Result<(), AsyncActivityError>,
+                > {
+                    Box::pin(async move {
+                        let (identifier, details, rpc_options) = input.into_parts();
+                        let details = encode_optional_value(details, client.data_converter()).await?;
+                        match identifier {
+                            ActivityIdentifier::TaskToken(token) => {
+                                let mut request = RespondActivityTaskCanceledRequest {
+                                    task_token: token.0,
+                                    details,
+                                    identity: client.identity(),
+                                    namespace: client.namespace(),
+                                    ..Default::default()
+                                }
+                                .into_request();
+                                rpc_options.apply_to(&mut request);
+                                WorkflowService::respond_activity_task_canceled(
+                                    &mut client,
+                                    request,
+                                )
+                                .await
+                                .map_err(AsyncActivityError::from_status)?;
+                            }
+                            ActivityIdentifier::ById {
+                                workflow_id,
+                                run_id,
+                                activity_id,
+                            } => {
+                                let mut request = RespondActivityTaskCanceledByIdRequest {
+                                    namespace: client.namespace(),
+                                    workflow_id,
+                                    run_id,
+                                    activity_id,
+                                    details,
+                                    identity: client.identity(),
+                                    ..Default::default()
+                                }
+                                .into_request();
+                                rpc_options.apply_to(&mut request);
+                                WorkflowService::respond_activity_task_canceled_by_id(
+                                    &mut client,
+                                    request,
+                                )
+                                .await
+                                .map_err(AsyncActivityError::from_status)?;
+                            }
+                        }
+                        Ok(())
+                    })
+                }
             }),
-            None => None,
-        };
-        if let ActivityIdentifier::TaskToken(token) = &self.identifier {
-            WorkflowService::respond_activity_task_canceled(
-                &mut self.client.clone(),
-                RespondActivityTaskCanceledRequest {
-                    task_token: token.0.clone(),
-                    details,
-                    identity: self.client.identity(),
-                    namespace: self.client.namespace(),
-                    ..Default::default()
-                }
-                .into_request(),
-            )
-            .await
-            .map_err(AsyncActivityError::from_status)?;
-        } else {
-            let (workflow_id, run_id, activity_id) = self.identifier.id_tuple();
-            WorkflowService::respond_activity_task_canceled_by_id(
-                &mut self.client.clone(),
-                RespondActivityTaskCanceledByIdRequest {
-                    namespace: self.client.namespace(),
-                    workflow_id: workflow_id.clone(),
-                    run_id: run_id.clone(),
-                    activity_id: activity_id.clone(),
-                    details,
-                    identity: self.client.identity(),
-                    ..Default::default()
-                }
-                .into_request(),
-            )
-            .await
-            .map_err(AsyncActivityError::from_status)?;
-        }
-        Ok(())
+        )
+        .await
     }
 
     /// Record a heartbeat for the activity.
@@ -300,56 +365,75 @@ impl<CT: WorkflowService + NamespacedClient + Clone> AsyncActivityHandle<CT> {
     pub async fn heartbeat<T>(
         &self,
         details: Option<T>,
+        rpc_options: RpcOptions,
     ) -> Result<ActivityHeartbeatResponse, AsyncActivityError>
     where
-        T: TemporalSerializable + 'static,
+        T: TemporalSerializable + Send + 'static,
     {
-        let details = match details {
-            Some(details) => Some(Payloads {
-                payloads: self
-                    .client
-                    .data_converter()
-                    .to_payloads(&SerializationContextData::Activity, &details)
-                    .await?,
+        interceptors::call_heartbeat_async_activity(
+            self.client.client_interceptors(),
+            HeartbeatAsyncActivityInput::new(self.identifier.clone(), details, rpc_options),
+            Next::new({
+                let mut client = self.client.clone();
+                move |input: HeartbeatAsyncActivityInput| -> BoxFuture<
+                    '_,
+                    Result<ActivityHeartbeatResponse, AsyncActivityError>,
+                > {
+                    Box::pin(async move {
+                        let (identifier, details, rpc_options) = input.into_parts();
+                        let details = encode_optional_value(details, client.data_converter()).await?;
+                        match identifier {
+                            ActivityIdentifier::TaskToken(token) => {
+                                let mut request = RecordActivityTaskHeartbeatRequest {
+                                    task_token: token.0,
+                                    details,
+                                    identity: client.identity(),
+                                    namespace: client.namespace(),
+                                    resource_id: Default::default(),
+                                }
+                                .into_request();
+                                rpc_options.apply_to(&mut request);
+                                let response = WorkflowService::record_activity_task_heartbeat(
+                                    &mut client,
+                                    request,
+                                )
+                                .await
+                                .map_err(AsyncActivityError::from_status)?
+                                .into_inner();
+                                Ok(ActivityHeartbeatResponse::from(response))
+                            }
+                            ActivityIdentifier::ById {
+                                workflow_id,
+                                run_id,
+                                activity_id,
+                            } => {
+                                let mut request = RecordActivityTaskHeartbeatByIdRequest {
+                                    namespace: client.namespace(),
+                                    workflow_id,
+                                    run_id,
+                                    activity_id,
+                                    details,
+                                    identity: client.identity(),
+                                    resource_id: Default::default(),
+                                }
+                                .into_request();
+                                rpc_options.apply_to(&mut request);
+                                let response =
+                                    WorkflowService::record_activity_task_heartbeat_by_id(
+                                        &mut client,
+                                        request,
+                                    )
+                                    .await
+                                    .map_err(AsyncActivityError::from_status)?
+                                    .into_inner();
+                                Ok(ActivityHeartbeatResponse::from(response))
+                            }
+                        }
+                    })
+                }
             }),
-            None => None,
-        };
-        if let ActivityIdentifier::TaskToken(token) = &self.identifier {
-            let resp = WorkflowService::record_activity_task_heartbeat(
-                &mut self.client.clone(),
-                RecordActivityTaskHeartbeatRequest {
-                    task_token: token.0.clone(),
-                    details,
-                    identity: self.client.identity(),
-                    namespace: self.client.namespace(),
-                    resource_id: Default::default(),
-                }
-                .into_request(),
-            )
-            .await
-            .map_err(AsyncActivityError::from_status)?
-            .into_inner();
-            Ok(ActivityHeartbeatResponse::from(resp))
-        } else {
-            let (workflow_id, run_id, activity_id) = self.identifier.id_tuple();
-            let resp = WorkflowService::record_activity_task_heartbeat_by_id(
-                &mut self.client.clone(),
-                RecordActivityTaskHeartbeatByIdRequest {
-                    namespace: self.client.namespace(),
-                    workflow_id: workflow_id.clone(),
-                    run_id: run_id.clone(),
-                    activity_id: activity_id.clone(),
-                    details,
-                    identity: self.client.identity(),
-                    resource_id: Default::default(),
-                }
-                .into_request(),
-            )
-            .await
-            .map_err(AsyncActivityError::from_status)?
-            .into_inner();
-            Ok(ActivityHeartbeatResponse::from(resp))
-        }
+        )
+        .await
     }
 }
 

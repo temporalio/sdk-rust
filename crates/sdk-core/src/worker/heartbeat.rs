@@ -15,7 +15,9 @@ use std::{
     },
     time::Duration,
 };
-use temporalio_client::worker::{SharedNamespaceWorkerTrait, WorkerCallbacks};
+use temporalio_client::worker::{
+    NamespaceDescriptionSource, SharedNamespaceWorkerTrait, WorkerCallbacks,
+};
 use temporalio_common::{
     protos::{
         TaskToken,
@@ -55,6 +57,7 @@ impl SharedNamespaceWorker {
         namespace: String,
         heartbeat_interval: Duration,
         telemetry: Option<WorkerTelemetry>,
+        namespace_description: Arc<NamespaceDescriptionSource>,
     ) -> Result<Self, anyhow::Error> {
         let reset_notify = Arc::new(Notify::new());
         let cancel = CancellationToken::new();
@@ -68,12 +71,16 @@ impl SharedNamespaceWorker {
             let cancel = cancel.clone();
             let worker_control_task_queue_enabled = worker_control_task_queue_enabled.clone();
             async move {
-                let worker_commands_supported = match client.describe_namespace().await {
+                let worker_commands_supported = match namespace_description
+                    .resolve(|| client.describe_namespace())
+                    .await
+                {
                     Ok(namespace_resp) => {
                         let caps = namespace_resp
                             .namespace_info
-                            .and_then(|info| info.capabilities);
-                        if caps.as_ref().map(|c| c.worker_heartbeats) != Some(true) {
+                            .as_ref()
+                            .and_then(|info| info.capabilities.as_ref());
+                        if caps.map(|c| c.worker_heartbeats) != Some(true) {
                             debug!(
                                 "Worker heartbeating configured for runtime, but server version does not support it."
                             );
@@ -444,6 +451,61 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn heartbeat_reports_auto_enroll_before_worker_validation() {
+        let mut mock = mock_worker_client();
+        let (reported_tx, reported_rx) = tokio::sync::oneshot::channel();
+        let reported_tx = Mutex::new(Some(reported_tx));
+        mock.expect_record_worker_heartbeat()
+            .returning(move |_, heartbeats| {
+                if let Some(tx) = reported_tx.lock().unwrap().take() {
+                    let is_autoscaling = heartbeats[0]
+                        .activity_poller_info
+                        .as_ref()
+                        .unwrap()
+                        .is_autoscaling;
+                    let _ = tx.send(is_autoscaling);
+                }
+                Ok(RecordWorkerHeartbeatResponse {})
+            });
+        mock.expect_describe_namespace().times(1).returning(|| {
+            Ok(DescribeNamespaceResponse {
+                namespace_info: Some(NamespaceInfo {
+                    capabilities: Some(Capabilities {
+                        worker_heartbeats: true,
+                        poller_autoscaling_auto_enroll: true,
+                        ..Capabilities::default()
+                    }),
+                    ..NamespaceInfo::default()
+                }),
+                ..DescribeNamespaceResponse::default()
+            })
+        });
+
+        let mut config = test_worker_cfg().build().unwrap();
+        config.task_types = WorkerTaskTypes::activity_only();
+        let worker = worker::Worker::new(
+            config,
+            None,
+            Arc::new(mock),
+            None,
+            Some(Duration::from_secs(60)),
+        )
+        .unwrap();
+
+        let reported_autoscaling = tokio::time::timeout(Duration::from_secs(5), reported_rx)
+            .await
+            .expect("worker heartbeat was not recorded in time")
+            .expect("heartbeat sender was dropped");
+        worker.validate().await.unwrap();
+        worker.drain_activity_poller_and_shutdown().await;
+
+        assert!(
+            reported_autoscaling,
+            "heartbeat emitted before validation must reflect namespace auto-enrollment"
+        );
+    }
+
+    #[tokio::test]
     async fn worker_commands_not_polled_when_capability_disabled() {
         let mut mock = mock_worker_client();
         let namespace = format!("{}-{}", crate::test_help::NAMESPACE, Uuid::new_v4());
@@ -483,6 +545,7 @@ mod tests {
             namespace,
             Duration::from_millis(100),
             None,
+            Arc::new(temporalio_client::worker::NamespaceDescriptionSource::unresolved()),
         )
         .unwrap();
 

@@ -1015,8 +1015,10 @@ impl WorkflowMethodsDefinition {
             ::temporalio_workflow::__private::futures_util::FutureExt::boxed_local(async move {
                 let result = #run_call;
                 match result {
-                    Ok(value) => ::temporalio_workflow::workflows::serialize_result(value, &ctx.payload_converter())
-                        .map_err(::temporalio_workflow::WorkflowTermination::from),
+                    Ok(value) => Ok(
+                        ::std::boxed::Box::new(value)
+                            as ::std::boxed::Box<dyn ::temporalio_workflow::workflow_interceptors::WorkflowOutputValue>
+                    ),
                     Err(e) => Err(e),
                 }
             })
@@ -1152,11 +1154,11 @@ impl WorkflowMethodsDefinition {
 
                 if u.is_async {
                     quote! {
-                        #handler_name => <Self as ::temporalio_workflow::workflows::ExecutableAsyncUpdate<#module_ident::#struct_ident>>::dispatch(ctx.clone(), input, converter),
+                        #handler_name => <Self as ::temporalio_workflow::workflows::ExecutableAsyncUpdate<#module_ident::#struct_ident>>::dispatch(ctx.clone(), input),
                     }
                 } else {
                     quote! {
-                        #handler_name => <Self as ::temporalio_workflow::workflows::ExecutableSyncUpdate<#module_ident::#struct_ident>>::dispatch(ctx, input, converter),
+                        #handler_name => <Self as ::temporalio_workflow::workflows::ExecutableSyncUpdate<#module_ident::#struct_ident>>::dispatch(ctx, input),
                     }
                 }
             })
@@ -1233,8 +1235,7 @@ impl WorkflowMethodsDefinition {
                     _ctx: ::temporalio_workflow::WorkflowContext<Self>,
                     name: &str,
                     _input: ::std::boxed::Box<dyn ::std::any::Any>,
-                    _converter: &::temporalio_workflow::common::data_converters::PayloadConverter,
-                ) -> ::temporalio_workflow::__private::futures_util::future::LocalBoxFuture<'static, Result<::temporalio_workflow::common::protos::temporal::api::common::v1::Payload, ::temporalio_workflow::workflows::WorkflowError>> {
+                ) -> ::temporalio_workflow::__private::futures_util::future::LocalBoxFuture<'static, Result<::std::boxed::Box<dyn ::temporalio_workflow::workflow_interceptors::WorkflowOutputValue>, ::temporalio_workflow::workflows::WorkflowError>> {
                     unreachable!("typed update dispatch called for unknown update handler '{name}'")
                 }
 
@@ -1253,8 +1254,7 @@ impl WorkflowMethodsDefinition {
                     ctx: ::temporalio_workflow::WorkflowContext<Self>,
                     name: &str,
                     input: ::std::boxed::Box<dyn ::std::any::Any>,
-                    converter: &::temporalio_workflow::common::data_converters::PayloadConverter,
-                ) -> ::temporalio_workflow::__private::futures_util::future::LocalBoxFuture<'static, Result<::temporalio_workflow::common::protos::temporal::api::common::v1::Payload, ::temporalio_workflow::workflows::WorkflowError>> {
+                ) -> ::temporalio_workflow::__private::futures_util::future::LocalBoxFuture<'static, Result<::std::boxed::Box<dyn ::temporalio_workflow::workflow_interceptors::WorkflowOutputValue>, ::temporalio_workflow::workflows::WorkflowError>> {
                     match name {
                         #(#dispatch_update_arms)*
                         _ => unreachable!("typed update dispatch called for unknown update handler '{name}'"),
@@ -1324,7 +1324,7 @@ impl WorkflowMethodsDefinition {
                 let handler_name = &info.handler_name;
 
                 quote! {
-                    #handler_name => <Self as ::temporalio_workflow::workflows::ExecutableQuery<#module_ident::#struct_ident>>::dispatch(self, &ctx, input, converter),
+                    #handler_name => <Self as ::temporalio_workflow::workflows::ExecutableQuery<#module_ident::#struct_ident>>::dispatch(self, &ctx, input),
                 }
             })
             .collect();
@@ -1353,8 +1353,7 @@ impl WorkflowMethodsDefinition {
                     _ctx: ::temporalio_workflow::WorkflowContextView,
                     name: &str,
                     _input: ::std::boxed::Box<dyn ::std::any::Any>,
-                    _converter: &::temporalio_workflow::common::data_converters::PayloadConverter,
-                ) -> Result<::temporalio_workflow::common::protos::temporal::api::common::v1::Payload, ::temporalio_workflow::workflows::WorkflowError> {
+                ) -> Result<::std::boxed::Box<dyn ::temporalio_workflow::workflow_interceptors::WorkflowOutputValue>, ::temporalio_workflow::workflows::WorkflowError> {
                     unreachable!("typed query dispatch called for unknown query handler '{name}'")
                 }
             }
@@ -1365,8 +1364,7 @@ impl WorkflowMethodsDefinition {
                     ctx: ::temporalio_workflow::WorkflowContextView,
                     name: &str,
                     input: ::std::boxed::Box<dyn ::std::any::Any>,
-                    converter: &::temporalio_workflow::common::data_converters::PayloadConverter,
-                ) -> Result<::temporalio_workflow::common::protos::temporal::api::common::v1::Payload, ::temporalio_workflow::workflows::WorkflowError> {
+                ) -> Result<::std::boxed::Box<dyn ::temporalio_workflow::workflow_interceptors::WorkflowOutputValue>, ::temporalio_workflow::workflows::WorkflowError> {
                     match name {
                         #(#dispatch_query_arms)*
                         _ => unreachable!("typed query dispatch called for unknown query handler '{name}'"),
@@ -1407,7 +1405,7 @@ impl WorkflowMethodsDefinition {
                 fn run(
                     mut ctx: ::temporalio_workflow::WorkflowContext<Self>,
                     input: ::std::option::Option<<Self::Run as ::temporalio_workflow::common::WorkflowDefinition>::Input>,
-                ) -> ::temporalio_workflow::__private::futures_util::future::LocalBoxFuture<'static, Result<::temporalio_workflow::common::protos::temporal::api::common::v1::Payload, ::temporalio_workflow::WorkflowTermination>> {
+                ) -> ::temporalio_workflow::__private::futures_util::future::LocalBoxFuture<'static, Result<::std::boxed::Box<dyn ::temporalio_workflow::workflow_interceptors::WorkflowOutputValue>, ::temporalio_workflow::WorkflowTermination>> {
                     #run_impl_body
                 }
 

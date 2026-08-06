@@ -38,7 +38,10 @@ pub(crate) fn make_wft_poller(
 > + Sized
 + 'static {
     let wft_metrics = metrics.with_new_attrs([workflow_poller()]);
-    let poller_behavior = wft_poller_behavior(config, false);
+    let effective_behavior = crate::worker::resolve_effective_behavior(
+        config.workflow_task_poller_behavior,
+        &capabilities,
+    );
     let wft_poller_shared = if sticky_queue_name.is_some() {
         Some(Arc::new(WFTPollerShared::new(
             wft_slots.available_permits(),
@@ -50,7 +53,7 @@ pub(crate) fn make_wft_poller(
         client.clone(),
         config.task_queue.clone(),
         None,
-        poller_behavior,
+        wft_poller_behavior(effective_behavior, config, false),
         wft_slots.clone(),
         shutdown_token.child_token(),
         Some(move |np| {
@@ -68,7 +71,7 @@ pub(crate) fn make_wft_poller(
             client.clone(),
             config.task_queue.clone(),
             Some(sqn.clone()),
-            wft_poller_behavior(config, true),
+            wft_poller_behavior(effective_behavior, config, true),
             wft_slots.clone().into_sticky(),
             shutdown_token.child_token(),
             Some(move |np| {

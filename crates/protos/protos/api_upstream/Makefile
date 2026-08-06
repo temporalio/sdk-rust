@@ -157,7 +157,7 @@ system-nexus-wit-install:
 
 nex-gen-install:
 	printf $(COLOR) "Install nex-gen if missing..."
-	command -v $(NEX_GEN) >/dev/null || cargo install nex-gen
+	command -v $(NEX_GEN) >/dev/null || cargo install nex-gen --version ^0.1
 
 ##### Clean #####
 clean:

@@ -10,7 +10,10 @@ use crate::{
 };
 use futures_util::{Stream, StreamExt, stream, stream::PollNext};
 use std::{collections::VecDeque, fmt::Debug, future, sync::Arc};
-use temporalio_common::protos::coresdk::workflow_activation::remove_from_cache::EvictionReason;
+use temporalio_common::protos::{
+    coresdk::workflow_activation::remove_from_cache::EvictionReason,
+    temporal::api::{enums::v1::WorkflowTaskFailedCause, failure::v1::Failure as ApiFailure},
+};
 use tokio_util::sync::CancellationToken;
 use tracing::{Level, Span};
 
@@ -103,6 +106,7 @@ impl WFStream {
                 let _span_g = span.enter();
 
                 let mut activations = vec![];
+                let mut actions = vec![];
                 let maybe_act = match action {
                     WFStreamInput::NewWft(pwft) => {
                         debug!(run_id=%pwft.work.execution.run_id, "New WFT");
@@ -156,14 +160,29 @@ impl WFStream {
                         run_id,
                         err,
                         auto_reply_fail_tt,
-                    } => state
-                        .request_eviction(RequestEvictMsg {
-                            run_id,
-                            message: format!("Fetching history failed: {err:?}"),
-                            reason: EvictionReason::PaginationOrHistoryFetch,
-                            auto_reply_fail_tt,
-                        })
-                        .into_run_update_resp(),
+                    } => {
+                        let message = format!("Fetching history failed: {err:?}");
+                        if !state.runs.has_run(&run_id)
+                            && let Some(task_token) = auto_reply_fail_tt.clone()
+                        {
+                            actions.push(WorkflowStreamAction::FailUnstoredWft {
+                                run_id,
+                                task_token,
+                                cause: WorkflowTaskFailedCause::WorkflowWorkerUnhandledFailure,
+                                failure: ApiFailure::application_failure(message, true).into(),
+                            });
+                            None
+                        } else {
+                            state
+                                .request_eviction(RequestEvictMsg {
+                                    run_id,
+                                    message,
+                                    reason: EvictionReason::PaginationOrHistoryFetch,
+                                    auto_reply_fail_tt,
+                                })
+                                .into_run_update_resp()
+                        }
+                    }
                     WFStreamInput::PollerDead => {
                         debug!("WFT poller died, beginning shutdown");
                         state.shutdown_token.cancel();
@@ -176,6 +195,11 @@ impl WFStream {
 
                 activations.extend(maybe_act);
                 activations.extend(state.reconcile_buffered());
+                actions.extend(
+                    activations
+                        .into_iter()
+                        .map(WorkflowStreamAction::Activation),
+                );
 
                 if state.shutdown_done() {
                     info!("Workflow shutdown is done");
@@ -183,7 +207,7 @@ impl WFStream {
                 }
 
                 Ok(WFStreamOutput {
-                    activations: activations.into(),
+                    actions: actions.into(),
                     fetch_histories: std::mem::take(&mut state.runs_needing_fetching),
                 })
             })
@@ -257,6 +281,7 @@ impl WFStream {
     }
 
     fn process_completion(&mut self, complete: NewOrFetchedComplete) -> Vec<ActivationOrAuto> {
+        let has_zero_sized_cache = self.runs.cache_capacity() == 0;
         let rh = if let Some(rh) = self.runs.get_mut(complete.run_id()) {
             rh
         } else {
@@ -316,8 +341,9 @@ impl WFStream {
         }
         .into_iter()
         .collect();
-        // Always queue evictions after completion when we have a zero-size cache
-        if self.runs.cache_capacity() == 0 {
+        // Keeping the run until its LAs resolve lets their incremental activations share the
+        // current WFT. The final completion will queue the zero-cache eviction as usual.
+        if has_zero_sized_cache && !rh.waiting_on_local_activities() {
             acts.extend(self.request_eviction_of_lru_run().into_run_update_resp())
         }
         acts

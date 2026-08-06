@@ -470,11 +470,11 @@ async fn idle_activity_worker_reports_zero_slots_used() {
     let rt = CoreRuntime::new_assume_tokio(get_integ_runtime_options(telemopts)).unwrap();
     let mut starter =
         CoreWfStarter::new_with_runtime("idle_activity_worker_reports_zero_slots_used", rt);
-    starter.sdk_config.activity_task_poller_behavior = PollerBehavior::Autoscaling {
+    starter.sdk_config.activity_task_poller_behavior = Some(PollerBehavior::Autoscaling {
         minimum: 1,
         maximum: 1,
         initial: 1,
-    };
+    });
     let activity_slots = Arc::new(ReservationTrackingActivitySlotSupplier::new(3));
     let mut tuner = TunerBuilder::default();
     tuner.activity_slot_supplier(activity_slots.clone());
@@ -1052,26 +1052,28 @@ async fn activity_metrics() {
             let local_act_fail = ctx.execute_local_activity(
                 PassFailActivities::pass_fail_act,
                 "fail".to_string(),
-                LocalActivityOptions {
-                    retry_policy: RetryPolicy {
-                        maximum_attempts: 1,
-                        ..Default::default()
-                    }
-                    .into(),
-                    ..Default::default()
-                },
+                LocalActivityOptions::builder()
+                    .retry_policy(
+                        RetryPolicy {
+                            maximum_attempts: 1,
+                            ..Default::default()
+                        }
+                        .into(),
+                    )
+                    .build(),
             );
             let local_act_cancel = ctx.execute_local_activity(
                 PassFailActivities::pass_fail_act,
                 "cancel".to_string(),
-                LocalActivityOptions {
-                    retry_policy: RetryPolicy {
-                        maximum_attempts: 1,
-                        ..Default::default()
-                    }
-                    .into(),
-                    ..Default::default()
-                },
+                LocalActivityOptions::builder()
+                    .retry_policy(
+                        RetryPolicy {
+                            maximum_attempts: 1,
+                            ..Default::default()
+                        }
+                        .into(),
+                    )
+                    .build(),
             );
             let _ = join!(local_act_pass, local_act_fail);
             // TODO: Currently takes a WFT b/c of https://github.com/temporalio/sdk-core/issues/856
@@ -1175,12 +1177,11 @@ async fn nexus_metrics() {
     impl NexusMetricsWf {
         #[run]
         async fn run(ctx: &mut WorkflowContext<Self>, endpoint: String) -> WorkflowResult<()> {
-            let partial_op = NexusOperationOptions {
-                endpoint: endpoint.clone(),
-                service: "mysvc".to_string(),
-                operation: "myop".to_string(),
-                ..Default::default()
-            };
+            let partial_op = NexusOperationOptions::builder()
+                .endpoint(endpoint.clone())
+                .service("mysvc")
+                .operation("myop")
+                .build();
             join!(
                 async {
                     ctx.start_nexus_operation(partial_op.clone())
@@ -1190,29 +1191,20 @@ async fn nexus_metrics() {
                         .await
                 },
                 async {
-                    let _ = ctx
-                        .start_nexus_operation(NexusOperationOptions {
-                            input: Some("fail".into()),
-                            ..partial_op.clone()
-                        })
-                        .await;
+                    let mut options = partial_op.clone();
+                    options.input = Some("fail".into());
+                    let _ = ctx.start_nexus_operation(options).await;
                 },
                 async {
-                    let _ = ctx
-                        .start_nexus_operation(NexusOperationOptions {
-                            input: Some("handler-fail".into()),
-                            ..partial_op.clone()
-                        })
-                        .await;
+                    let mut options = partial_op.clone();
+                    options.input = Some("handler-fail".into());
+                    let _ = ctx.start_nexus_operation(options).await;
                 },
                 async {
-                    let _ = ctx
-                        .start_nexus_operation(NexusOperationOptions {
-                            input: Some("timeout".into()),
-                            schedule_to_close_timeout: Some(Duration::from_secs(2)),
-                            ..partial_op.clone()
-                        })
-                        .await;
+                    let mut options = partial_op.clone();
+                    options.input = Some("timeout".into());
+                    options.schedule_to_close_timeout = Some(Duration::from_secs(2));
+                    let _ = ctx.start_nexus_operation(options).await;
                 }
             );
             Ok(())

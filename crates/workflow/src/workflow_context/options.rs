@@ -1,6 +1,6 @@
 use std::{collections::HashMap, time::Duration};
 
-use crate::{MemoValues, runtime::types::ContinueAsNewRequest};
+use crate::{MemoValues, WorkflowCancellationToken, runtime::types::ContinueAsNewRequest};
 use temporalio_common_wasm::{
     ActivityCloseTimeouts, Priority, RetryPolicy,
     data_converters::{
@@ -311,6 +311,8 @@ pub struct ActivityOptions {
     /// Determines what the SDK does when the Activity is cancelled.
     #[builder(default, into)]
     pub cancellation_type: ActivityCancellationType,
+    /// Cancellation token for this activity. `None` inherits workflow cancellation.
+    pub cancellation_token: Option<WorkflowCancellationToken>,
     /// Activity retry policy
     #[builder(into)]
     pub retry_policy: Option<RetryPolicy>,
@@ -355,6 +357,7 @@ impl ActivityOptions {
         seq: u32,
         activity_type: String,
         args: Vec<Payload>,
+        headers: HashMap<String, Payload>,
     ) -> WorkflowCommand {
         let close_timeouts = self.close_timeouts.into_values();
         command_with_metadata(
@@ -364,6 +367,7 @@ impl ActivityOptions {
                 activity_id: self.activity_id.unwrap_or_else(|| seq.to_string()),
                 task_queue: self.task_queue.unwrap_or_default(),
                 arguments: args,
+                headers,
                 schedule_to_close_timeout: close_timeouts
                     .schedule_to_close
                     .and_then(|duration| duration.try_into().ok()),
@@ -390,7 +394,8 @@ impl ActivityOptions {
 }
 
 /// Options for scheduling a local activity
-#[derive(Default, Debug, Clone)]
+#[derive(Debug, Clone, bon::Builder)]
+#[non_exhaustive]
 pub struct LocalActivityOptions {
     /// Identifier to use for tracking the activity in Workflow history.
     /// The `activityId` can be accessed by the activity function.
@@ -399,6 +404,7 @@ pub struct LocalActivityOptions {
     /// If `None` use the context's sequence number
     pub activity_id: Option<String>,
     /// Retry policy
+    #[builder(default)]
     pub retry_policy: RetryPolicy,
     /// Override attempt number rather than using 1.
     /// Ideally we would not expose this in a released Rust SDK, but it's needed for test.
@@ -409,7 +415,10 @@ pub struct LocalActivityOptions {
     /// Retry backoffs over this amount will use a timer rather than a local retry
     pub timer_backoff_threshold: Option<Duration>,
     /// How the activity will cancel
+    #[builder(default)]
     pub cancel_type: ActivityCancellationType,
+    /// Cancellation token for this local activity. `None` inherits workflow cancellation.
+    pub cancellation_token: Option<WorkflowCancellationToken>,
     /// Indicates how long the caller is willing to wait for local activity completion. Limits how
     /// long retries will be attempted. When not specified defaults to the workflow execution
     /// timeout (which may be unset).
@@ -429,12 +438,19 @@ pub struct LocalActivityOptions {
     pub summary: Option<String>,
 }
 
+impl Default for LocalActivityOptions {
+    fn default() -> Self {
+        Self::builder().build()
+    }
+}
+
 impl LocalActivityOptions {
     pub(crate) fn into_command(
         mut self,
         seq: u32,
         activity_type: String,
         args: Vec<Payload>,
+        headers: HashMap<String, Payload>,
     ) -> WorkflowCommand {
         // Tests and some workflow code rely on the historical SDK behavior where omitted local
         // activity timeouts are normalized before the command is emitted.
@@ -446,6 +462,7 @@ impl LocalActivityOptions {
                 activity_type,
                 activity_id: self.activity_id.unwrap_or_else(|| seq.to_string()),
                 arguments: args,
+                headers,
                 retry_policy: Some(self.retry_policy.into()),
                 attempt: self.attempt.unwrap_or(1),
                 original_schedule_time: self.original_schedule_time,
@@ -483,6 +500,8 @@ pub struct ChildWorkflowOptions {
     /// Cancellation strategy for the child workflow
     #[builder(default)]
     pub cancel_type: ChildWorkflowCancellationType,
+    /// Cancellation token for this child workflow. `None` inherits workflow cancellation.
+    pub cancellation_token: Option<WorkflowCancellationToken>,
     /// How to respond to parent workflow ending
     #[builder(default)]
     pub parent_close_policy: ParentClosePolicy,
@@ -520,6 +539,7 @@ impl ChildWorkflowOptions {
         seq: u32,
         workflow_type: String,
         args: Vec<Payload>,
+        headers: HashMap<String, Payload>,
         workflow_id: String,
     ) -> WorkflowCommand {
         command_with_metadata(
@@ -529,6 +549,7 @@ impl ChildWorkflowOptions {
                 workflow_id,
                 task_queue: self.task_queue.unwrap_or_default(),
                 input: args,
+                headers,
                 cancellation_type: ProtoChildWorkflowCancellationType::from(self.cancel_type)
                     .into(),
                 parent_close_policy: ProtoParentClosePolicy::from(self.parent_close_policy).into(),
@@ -620,12 +641,22 @@ impl SignalData {
 }
 
 /// Options for timer
-#[derive(Default, Debug, Clone)]
+#[derive(Debug, Clone, bon::Builder)]
+#[non_exhaustive]
 pub struct TimerOptions {
     /// Duration for the timer
+    #[builder(start_fn)]
     pub duration: Duration,
+    /// Cancellation token for this timer. `None` inherits workflow cancellation.
+    pub cancellation_token: Option<WorkflowCancellationToken>,
     /// Summary of the timer
     pub summary: Option<String>,
+}
+
+impl Default for TimerOptions {
+    fn default() -> Self {
+        Self::builder(Duration::default()).build()
+    }
 }
 
 impl From<Duration> for TimerOptions {
@@ -654,8 +685,26 @@ impl TimerOptions {
     }
 }
 
+/// Options for waiting on a workflow condition.
+#[derive(Default, Debug, Clone, bon::Builder)]
+#[non_exhaustive]
+pub struct WaitConditionOptions {
+    /// Cancellation token for this wait. `None` inherits workflow cancellation.
+    pub cancellation_token: Option<WorkflowCancellationToken>,
+}
+
+/// Options for signaling a workflow from another workflow.
+#[derive(Default, Debug, Clone, bon::Builder)]
+#[non_exhaustive]
+pub struct SignalWorkflowOptions {
+    /// Cancellation token for this signal. `None` inherits workflow cancellation.
+    pub cancellation_token: Option<WorkflowCancellationToken>,
+}
+
 /// Options for Nexus Operations
-#[derive(Default, Debug, Clone)]
+#[derive(Debug, Clone, bon::Builder)]
+#[builder(on(String, into))]
+#[non_exhaustive]
 pub struct NexusOperationOptions {
     /// Endpoint name, must exist in the endpoint registry or this command will fail.
     pub endpoint: String,
@@ -678,9 +727,12 @@ pub struct NexusOperationOptions {
     /// tracing information. Note these headers are not the same as Temporal headers on internal
     /// activities and child workflows, these are transmitted to Nexus operations that may be
     /// external and are not traditional payloads.
+    #[builder(default)]
     pub nexus_header: HashMap<String, String>,
     /// Cancellation type for the operation
     pub cancellation_type: Option<NexusOperationCancellationType>,
+    /// Cancellation token for this operation. `None` inherits workflow cancellation.
+    pub cancellation_token: Option<WorkflowCancellationToken>,
     /// Schedule-to-start timeout for this operation.
     /// Indicates how long the caller is willing to wait for the operation to be started (or completed if synchronous)
     /// by the handler. If the operation is not started within this timeout, it will fail with
@@ -793,6 +845,7 @@ pub struct ContinueAsNewOptions {
     /// search attributes.
     pub search_attributes: Option<SearchAttributes>,
     /// If set, the new workflow will have this retry policy. If `None`, reuses the current policy.
+    #[builder(into)]
     pub retry_policy: Option<RetryPolicy>,
     /// Whether the new workflow should run on a worker with a compatible build id.
     pub versioning_intent: Option<VersioningIntent>,
@@ -809,6 +862,7 @@ impl ContinueAsNewOptions {
         self,
         workflow_type: String,
         arguments: Vec<Payload>,
+        headers: HashMap<String, Payload>,
         payload_converter: &PayloadConverter,
     ) -> Result<ContinueAsNewRequest, PayloadConversionError> {
         let memo = self
@@ -830,7 +884,7 @@ impl ContinueAsNewOptions {
                 .backoff_start_interval
                 .and_then(|duration| duration.try_into().ok()),
             memo,
-            headers: self.headers.unwrap_or_default(),
+            headers,
             search_attributes: self.search_attributes.map(|t| t.into_proto()),
             retry_policy: self.retry_policy.map(Into::into),
             versioning_intent: ProtoVersioningIntent::from(
@@ -903,6 +957,7 @@ mod tests {
             1,
             "child".to_string(),
             vec![],
+            HashMap::new(),
             "child-id".to_string(),
         );
         let Some(workflow_command::Variant::StartChildWorkflowExecution(command)) = command.variant
@@ -939,6 +994,7 @@ mod tests {
         .into_request(
             "test-workflow".to_string(),
             vec![],
+            HashMap::new(),
             &PayloadConverter::default(),
         )
         .unwrap();
@@ -988,7 +1044,7 @@ mod tests {
         })
         .cancellation_type(ActivityCancellationType::Abandon)
         .build()
-        .into_command(7, "test".to_string(), vec![]);
+        .into_command(7, "test".to_string(), vec![], HashMap::new());
         let Some(workflow_command::Variant::ScheduleActivity(req)) = req.variant else {
             panic!("expected ScheduleActivity command");
         };
@@ -1011,7 +1067,13 @@ mod tests {
             run_timeout: Some(Duration::from_secs(10)),
             ..Default::default()
         };
-        let command = opts.into_command(1, "TestWorkflow".to_string(), vec![], "test-wf".into());
+        let command = opts.into_command(
+            1,
+            "TestWorkflow".to_string(),
+            vec![],
+            HashMap::new(),
+            "test-wf".into(),
+        );
         let Some(workflow_command::Variant::StartChildWorkflowExecution(req)) = command.variant
         else {
             panic!("expected StartChildWorkflowExecution command");
@@ -1041,7 +1103,13 @@ mod tests {
             execution_timeout: Some(Duration::from_secs(60)),
             ..Default::default()
         };
-        let command = opts.into_command(1, "TestWorkflow".to_string(), vec![], "test-wf".into());
+        let command = opts.into_command(
+            1,
+            "TestWorkflow".to_string(),
+            vec![],
+            HashMap::new(),
+            "test-wf".into(),
+        );
         let Some(workflow_command::Variant::StartChildWorkflowExecution(req)) = command.variant
         else {
             panic!("expected StartChildWorkflowExecution command");

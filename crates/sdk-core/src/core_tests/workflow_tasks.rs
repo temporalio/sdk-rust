@@ -1517,17 +1517,8 @@ async fn la_resolution_after_wft_not_found_during_eviction() {
             .is_err()
     );
 
-    core.complete_workflow_activation(WorkflowActivationCompletion::from_cmds(
+    core.complete_workflow_activation(WorkflowActivationCompletion::empty(
         replay_activation.run_id,
-        vec![
-            schedule_local_activity_cmd(
-                1,
-                "1",
-                ActivityCancellationType::WaitCancellationCompleted,
-                Duration::from_secs(30),
-            ),
-            start_timer_cmd(1, Duration::from_millis(10)),
-        ],
     ))
     .await
     .unwrap();
@@ -2805,7 +2796,7 @@ async fn poller_wont_run_ahead_of_task_slots() {
             let mut cfg = test_worker_cfg().build().unwrap();
             cfg.max_cached_workflows = 10_usize;
             cfg.max_outstanding_workflow_tasks = Some(10_usize);
-            cfg.workflow_task_poller_behavior = PollerBehavior::SimpleMaximum(10_usize);
+            cfg.workflow_task_poller_behavior = Some(PollerBehavior::SimpleMaximum(10_usize));
             cfg.task_types = WorkerTaskTypes::workflow_only();
             cfg
         },
@@ -3012,7 +3003,7 @@ async fn slot_provider_cant_hand_out_more_permits_than_cache_size() {
                     .workflow_slot_supplier(Arc::new(EndlessSupplier {}))
                     .build(),
             ));
-            cfg.workflow_task_poller_behavior = PollerBehavior::SimpleMaximum(10_usize);
+            cfg.workflow_task_poller_behavior = Some(PollerBehavior::SimpleMaximum(10_usize));
             cfg.task_types = WorkerTaskTypes::workflow_only();
             cfg
         },
@@ -3160,7 +3151,7 @@ async fn both_normal_and_sticky_pollers_poll_concurrently() {
             let mut cfg = test_worker_cfg().build().unwrap();
             cfg.max_cached_workflows = 500_usize; // We need cache, but don't want to deal with evictions
             cfg.max_outstanding_workflow_tasks = Some(2_usize);
-            cfg.workflow_task_poller_behavior = PollerBehavior::SimpleMaximum(2_usize);
+            cfg.workflow_task_poller_behavior = Some(PollerBehavior::SimpleMaximum(2_usize));
             cfg.nonsticky_to_sticky_poll_ratio = 0.2;
             cfg.task_types = WorkerTaskTypes::workflow_only();
             cfg

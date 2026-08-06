@@ -112,8 +112,15 @@ variant routine-completion {
   update(update-routine-completion),
 }
 
+variant routine-pending-state {
+  handler,
+  interceptor,
+  interceptor-with-activation,
+}
+
 record routine-poll-result {
   completion: option<routine-completion>,
   made-progress: bool,
+  pending-state: option<routine-pending-state>,
 }
 }

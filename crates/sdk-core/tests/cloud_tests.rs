@@ -48,9 +48,12 @@ async fn shutdown_during_active_timer_activity_workflows() {
     shared_tests::shutdown_during_active_timer_activity_workflows().await
 }
 
+#[rstest::rstest]
+#[case::no_eager(true)]
+#[case::eager(false)]
 #[tokio::test]
-async fn activity_cancel_delivered_without_heartbeat() {
-    shared_tests::activity_cancel_delivered_without_heartbeat().await
+async fn activity_cancel_delivered_without_heartbeat(#[case] disable_eager: bool) {
+    shared_tests::activity_cancel_delivered_without_heartbeat(disable_eager).await
 }
 
 #[tokio::test]

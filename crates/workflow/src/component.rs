@@ -9,10 +9,12 @@ use crate::{
         host::WorkflowHost,
         instance::instantiate_workflow,
         types::{
-            ActivationJobResult, MainRoutineCompletion, RoutineCompletion, TerminalOutcome,
-            UpdateRoutineCompletion, WorkflowDefinitionDescriptor, WorkflowFailure, WorkflowInit,
+            ActivationJobResult, MainRoutineCompletion, RoutineCompletion, RoutinePendingState,
+            TerminalOutcome, UpdateRoutineCompletion, WorkflowDefinitionDescriptor,
+            WorkflowFailure, WorkflowInit,
         },
     },
+    workflow_interceptors::WorkflowInterceptorConstructor,
 };
 use futures_util::task::noop_waker;
 use prost::Message;
@@ -90,7 +92,7 @@ impl wit_guest::GuestWorkflowInstance for ExportedWorkflowInstance {
     ) -> Result<wit_guest::ActivationResult, wit_guest::Failure> {
         self.0
             .borrow_mut()
-            .activate(decode_proto(activation))
+            .activate(decode_proto(activation), &noop_waker())
             .map(|result| wit_types::ActivationResult {
                 job_results: result
                     .job_results
@@ -196,6 +198,13 @@ impl wit_guest::GuestWorkflowInstance for ExportedWorkflowInstance {
                     }
                 }),
                 made_progress: result.made_progress,
+                pending_state: result.pending_state.map(|state| match state {
+                    RoutinePendingState::Handler => wit_types::RoutinePendingState::Handler,
+                    RoutinePendingState::Interceptor => wit_types::RoutinePendingState::Interceptor,
+                    RoutinePendingState::InterceptorWithActivation => {
+                        wit_types::RoutinePendingState::InterceptorWithActivation
+                    }
+                }),
             })
             .map_err(|e| e.encode_to_vec())
     }
@@ -208,19 +217,28 @@ pub fn instantiate_component_workflow<W: WorkflowImplementation>(
 where
     <W::Run as temporalio_common_wasm::WorkflowDefinition>::Input: Send,
 {
+    instantiate_component_workflow_with_interceptor_constructors::<W>(init, host, Vec::new())
+}
+
+pub fn instantiate_component_workflow_with_interceptor_constructors<W: WorkflowImplementation>(
+    init: WorkflowInit,
+    host: Rc<dyn WorkflowHost>,
+    interceptor_constructors: Vec<WorkflowInterceptorConstructor>,
+) -> Result<Box<dyn RuntimeWorkflowInstance>, WorkflowFailure>
+where
+    <W::Run as temporalio_common_wasm::WorkflowDefinition>::Input: Send,
+{
     let args = init.initialize_workflow.arguments.clone();
     let data_converter = DataConverter::default();
     let payload_converter = data_converter.payload_converter().clone();
     let patch_activation_callback: PatchActivationCallback =
         Arc::new(|input| wit_host::patch_activation(&input.patch_id));
     let base_ctx = BaseWorkflowContext::from_raw(
-        init.namespace,
-        init.task_queue,
-        init.run_id,
-        init.initialize_workflow,
+        init,
         data_converter,
         host,
         Some(patch_activation_callback),
+        interceptor_constructors,
     );
     instantiate_workflow::<W>(args, payload_converter, base_ctx).map_err(|err| {
         Box::new(Failure {

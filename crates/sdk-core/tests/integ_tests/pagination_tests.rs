@@ -26,7 +26,7 @@ struct WeirdPaginationWf {
 impl WeirdPaginationWf {
     #[run(name = DEFAULT_WORKFLOW_TYPE)]
     async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<()> {
-        ctx.wait_condition(|s| s.signal_count >= 2).await;
+        ctx.wait_condition(|s| s.signal_count >= 2).await?;
         Ok(())
     }
 
@@ -146,7 +146,7 @@ struct ExtremePaginationWf {
 impl ExtremePaginationWf {
     #[run(name = DEFAULT_WORKFLOW_TYPE)]
     async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<()> {
-        ctx.wait_condition(|s| s.signal_count >= 6).await;
+        ctx.wait_condition(|s| s.signal_count >= 6).await?;
         Ok(())
     }
 

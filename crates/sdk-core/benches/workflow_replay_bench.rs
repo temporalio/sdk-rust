@@ -164,7 +164,8 @@ impl BigSignalsWf {
     #[run(name = DEFAULT_WORKFLOW_TYPE)]
     async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<()> {
         let target_count = ctx.state(|s| s.num_tasks * 5);
-        ctx.wait_condition(|s| s.signal_count >= target_count).await;
+        ctx.wait_condition(|s| s.signal_count >= target_count)
+            .await?;
         Ok(().into())
     }
 

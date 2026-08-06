@@ -16,6 +16,7 @@ import "temporal/api/enums/v1/command_type.proto";
 import "temporal/api/common/v1/message.proto";
 import "temporal/api/failure/v1/message.proto";
 import "temporal/api/taskqueue/v1/message.proto";
+import "temporal/api/workflow/v1/message.proto";
 import "temporal/api/sdk/v1/user_metadata.proto";
 import "temporal/api/sdk/v1/event_group_marker.proto";
 
@@ -221,6 +222,9 @@ message StartChildWorkflowExecutionCommandAttributes {
     // Priority metadata. If this message is not present, or any fields are not
     // present, they inherit the values from the workflow.
     temporal.api.common.v1.Priority priority = 18;
+    // Versioning override for the child workflow. If present, this explicit override takes
+    // precedence over versioning behavior inherited from the parent workflow.
+    temporal.api.workflow.v1.VersioningOverride versioning_override = 19;
 }
 
 message ProtocolMessageCommandAttributes {

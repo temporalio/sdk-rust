@@ -219,10 +219,10 @@ pub extern "C" fn temporal_core_client_env_config_load(
         let opts = unsafe { &*options };
         let env_vars_map = parse_env_vars(&opts.env_vars)?;
 
-        let load_options = LoadClientConfigOptions {
-            config_source: parse_config_source(&opts.path, &opts.data)?,
-            config_file_strict: opts.config_file_strict,
-        };
+        let load_options = LoadClientConfigOptions::builder()
+            .maybe_config_source(parse_config_source(&opts.path, &opts.data)?)
+            .config_file_strict(opts.config_file_strict)
+            .build();
 
         let core_config = envconfig::load_client_config(load_options, env_vars_map.as_ref())
             .map_err(|e| e.to_string())?;
@@ -278,13 +278,13 @@ pub extern "C" fn temporal_core_client_env_config_profile_load(
         let config_source = parse_config_source(&opts.path, &opts.data)?;
         let env_vars_map = parse_env_vars(&opts.env_vars)?;
 
-        let load_options = LoadClientConfigProfileOptions {
-            config_source,
-            config_file_profile: profile_name,
-            config_file_strict: opts.config_file_strict,
-            disable_file: opts.disable_file,
-            disable_env: opts.disable_env,
-        };
+        let load_options = LoadClientConfigProfileOptions::builder()
+            .maybe_config_source(config_source)
+            .maybe_config_file_profile(profile_name)
+            .config_file_strict(opts.config_file_strict)
+            .disable_file(opts.disable_file)
+            .disable_env(opts.disable_env)
+            .build();
 
         let profile = envconfig::load_client_config_profile(load_options, env_vars_map.as_ref())
             .map_err(|e| e.to_string())?;
