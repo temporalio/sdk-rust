@@ -348,6 +348,27 @@ let worker_options = WorkerOptions::new("task-queue")
     .build();
 ```
 
+## Workflow Replay
+
+`WorkflowReplayer` checks whether workflow code remains compatible with recorded workflow
+histories. Histories can come from directly from a workflow handle or from JSON:
+
+```rust
+use temporalio_client::WorkflowHistory;
+use temporalio_sdk::workflow_replayer::{WorkflowReplayer, WorkflowReplayerOptions};
+
+let replayer = WorkflowReplayer::new(
+    WorkflowReplayerOptions::new()
+        .register_workflow::<MyWorkflow>()?
+        .build(),
+)?;
+let saved_history = std::fs::read("workflow-history.json")?;
+let history = WorkflowHistory::from_json(&saved_history)?;
+
+replayer.replay_workflow(history).await?;
+```
+
+
 ## Using the Client
 
 The `temporalio_client` crate provides a client for interacting with the Temporal service. You can

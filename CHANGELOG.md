@@ -56,6 +56,8 @@ relevant information.
 ### Changed
 * Cancellation errors propagated after workflow cancellation now complete the workflow as cancelled
   instead of failed.
+* `WorkflowReplayer` for workflow history replay, including JSON history helpers
+  and worker-plugin configuration.
 
 ### Breaking Changes :boom:
 * `CancellableFuture` and `CancellableFutureWithReason` now use the inherited `Future::Output`

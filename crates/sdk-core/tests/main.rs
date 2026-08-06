@@ -30,6 +30,7 @@ mod integ_tests {
     mod worker_tests;
     mod worker_versioning_tests;
     mod workflow_client_tests;
+    mod workflow_replayer_tests;
     mod workflow_tests;
 
     use crate::common::{

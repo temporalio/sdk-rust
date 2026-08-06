@@ -8,6 +8,7 @@ use crate::{
     activities::ActivityDefinitions,
     interceptors::{ActivityInboundInterceptor, WorkerInterceptor},
     workflow_interceptors::WorkflowInterceptorConstructor,
+    workflow_replayer::WorkflowReplayerOptions,
 };
 use std::{any::Any, sync::Arc};
 use temporalio_client::{
@@ -30,6 +31,17 @@ pub trait WorkerPlugin: Send + Sync + 'static {
     /// Worker plugin registrations are captured before this method is called. Altering plugins in
     /// this method does not change which plugins are applied.
     fn configure_worker_options(&self, _options: &mut WorkerOptions) -> Result<(), PluginError> {
+        Ok(())
+    }
+
+    /// Configure workflow replayer options.
+    ///
+    /// Replay plugin registrations are captured before this method is called. Altering plugins in
+    /// this method does not change which plugins are applied.
+    fn configure_workflow_replayer_options(
+        &self,
+        _options: &mut WorkflowReplayerOptions,
+    ) -> Result<(), PluginError> {
         Ok(())
     }
 }
@@ -99,6 +111,13 @@ impl WorkerPlugin for ClientAndWorkerPlugin {
 
     fn configure_worker_options(&self, options: &mut WorkerOptions) -> Result<(), PluginError> {
         self.worker.configure_worker_options(options)
+    }
+
+    fn configure_workflow_replayer_options(
+        &self,
+        options: &mut WorkflowReplayerOptions,
+    ) -> Result<(), PluginError> {
+        self.worker.configure_workflow_replayer_options(options)
     }
 }
 
@@ -282,6 +301,40 @@ impl WorkerPlugin for SimplePlugin {
         );
         Ok(())
     }
+
+    fn configure_workflow_replayer_options(
+        &self,
+        options: &mut WorkflowReplayerOptions,
+    ) -> Result<(), PluginError> {
+        apply_replacing(&mut options.data_converter, self.data_converter.as_ref());
+        if let Some(workflows) = &self.workflows {
+            match workflows {
+                SimplePluginOption::Value(value) => options.workflows.extend(value),
+                SimplePluginOption::Function(function) => {
+                    let workflows = function(Some(options.workflows.clone()));
+                    options.workflows.extend(&workflows)
+                }
+            }
+            .map_err(PluginError::new)?;
+        }
+        apply_appending(
+            &mut options.worker_interceptors,
+            self.worker_interceptors.as_ref(),
+            |existing, value| existing.extend(value.iter().cloned()),
+        );
+        apply_appending(
+            &mut options.workflow_interceptor_constructors,
+            self.workflow_interceptors.as_ref(),
+            |existing, value| existing.extend(value.iter().cloned()),
+        );
+        #[cfg(feature = "wasm-workflows")]
+        apply_appending(
+            &mut options.wasm_workflow_components,
+            self.wasm_workflow_components.as_ref(),
+            |existing, value| existing.extend(value.iter().cloned()),
+        );
+        Ok(())
+    }
 }
 
 struct SharedClientPlugin<P>(Arc<P>);
@@ -318,6 +371,13 @@ where
 
     fn configure_worker_options(&self, options: &mut WorkerOptions) -> Result<(), PluginError> {
         self.0.configure_worker_options(options)
+    }
+
+    fn configure_workflow_replayer_options(
+        &self,
+        options: &mut WorkflowReplayerOptions,
+    ) -> Result<(), PluginError> {
+        self.0.configure_workflow_replayer_options(options)
     }
 }
 
@@ -368,6 +428,26 @@ pub(crate) fn apply_worker_plugins(
             .configure_worker_options(options)
             .map_err(|source| {
                 PluginApplyError::new(registration.name(), PluginTarget::Worker, source)
+            })?;
+    }
+    options.worker_plugins = plugins;
+    Ok(())
+}
+
+pub(crate) fn apply_workflow_replayer_plugins(
+    options: &mut WorkflowReplayerOptions,
+) -> Result<(), PluginApplyError> {
+    let plugins = std::mem::take(&mut options.worker_plugins);
+
+    for warning in worker_plugin_warnings(&plugins) {
+        warn!(plugin = warning.plugin_name, "{}", warning.message);
+    }
+
+    for registration in &plugins {
+        registration
+            .configure_workflow_replayer_options(options)
+            .map_err(|source| {
+                PluginApplyError::new(registration.name(), PluginTarget::WorkflowReplayer, source)
             })?;
     }
     options.worker_plugins = plugins;
@@ -429,6 +509,14 @@ mod tests {
             self.order.lock().unwrap().push(self.value);
             Ok(())
         }
+
+        fn configure_workflow_replayer_options(
+            &self,
+            _options: &mut WorkflowReplayerOptions,
+        ) -> Result<(), PluginError> {
+            self.order.lock().unwrap().push(self.value);
+            Ok(())
+        }
     }
 
     #[test]
@@ -449,6 +537,28 @@ mod tests {
         apply_worker_plugins(&client_options, &mut worker_options).unwrap();
 
         assert_eq!(*order.lock().unwrap(), ["propagated", "local"]);
+    }
+
+    #[test]
+    fn replay_plugins_configure_in_registration_order() {
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let mut options = WorkflowReplayerOptions::new()
+            .worker_plugin(RecordingWorkerPlugin {
+                name: "first",
+                value: "first",
+                order: order.clone(),
+            })
+            .worker_plugin(RecordingWorkerPlugin {
+                name: "second",
+                value: "second",
+                order: order.clone(),
+            })
+            .build();
+
+        apply_workflow_replayer_plugins(&mut options).unwrap();
+
+        assert_eq!(*order.lock().unwrap(), ["first", "second"]);
+        assert_eq!(options.worker_plugins.len(), 2);
     }
 
     #[test]

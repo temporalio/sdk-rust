@@ -74,6 +74,8 @@ mod workflow_executor;
 mod workflow_future;
 pub mod workflow_interceptors;
 mod workflow_registry;
+/// Workflow history replay APIs.
+pub mod workflow_replayer;
 #[cfg(feature = "wasm-workflows")]
 mod workflow_wasm;
 pub mod workflows;
