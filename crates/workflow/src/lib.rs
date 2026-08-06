@@ -29,7 +29,7 @@ pub use runtime::model::{TimerResult, WorkflowResult, WorkflowTermination};
 #[doc(hidden)]
 pub use runtime::{SdkWakeGuard, is_sdk_wake};
 pub use temporalio_common_wasm::{
-    ActivityCloseTimeoutOptions, Memo, RetryPolicy,
+    ActivityCloseTimeouts, Memo, RetryPolicy,
     error::{
         ActivityExecutionError, ChildWorkflowExecutionError, ChildWorkflowStartError, RetryState,
         TimeoutType, WorkflowSignalError,

@@ -31,7 +31,7 @@ use temporalio_common::{
 use temporalio_macros::{activities, workflow, workflow_methods};
 
 use temporalio_common::{
-    ActivityCloseTimeoutOptions,
+    ActivityCloseTimeouts,
     protos::{
         coresdk::workflow_commands::ActivityCancellationType,
         temporal::api::enums::v1::WorkflowIdReusePolicy,
@@ -60,7 +60,7 @@ impl ActivityLoadWf {
             .execute_activity(
                 StdActivities::echo,
                 input_str.clone(),
-                ActivityOptions::with_close_timeouts(ActivityCloseTimeoutOptions::Both {
+                ActivityOptions::with_close_timeouts(ActivityCloseTimeouts::Both {
                     start_to_close: Duration::from_secs(8),
                     schedule_to_close: Duration::from_secs(8),
                 })

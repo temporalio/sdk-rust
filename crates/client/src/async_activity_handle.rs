@@ -55,25 +55,22 @@ impl ActivityIdentifier {
     /// None to target the latest workflow execution.
     pub fn by_id_workflow(
         workflow_id: impl Into<String>,
-        run_id: Option<impl Into<String>>,
+        run_id: Option<String>,
         activity_id: impl Into<String>,
     ) -> Self {
         Self::ByIdWorkflow {
             workflow_id: workflow_id.into(),
-            run_id: run_id.map(Into::into),
+            run_id,
             activity_id: activity_id.into(),
         }
     }
 
     /// Create an identifier of a standalone activity from activity IDs. Set run_id to None to
     /// target the latest workflow execution.
-    pub fn by_id_standalone(
-        activity_id: impl Into<String>,
-        run_id: Option<impl Into<String>>,
-    ) -> Self {
+    pub fn by_id_standalone(activity_id: impl Into<String>, run_id: Option<String>) -> Self {
         Self::ByIdStandalone {
             activity_id: activity_id.into(),
-            run_id: run_id.map(Into::into),
+            run_id,
         }
     }
 

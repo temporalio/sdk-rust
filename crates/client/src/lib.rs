@@ -28,7 +28,6 @@ mod retry;
 pub mod schedules;
 #[cfg(test)]
 mod test_helpers;
-pub(crate) mod utils;
 pub mod worker;
 mod workflow_handle;
 mod workflow_status;
@@ -71,7 +70,6 @@ use crate::{
     },
     metrics::{ChannelOrGrpcOverride, GrpcMetricSvc, MetricsContext},
     request_extensions::RequestExt,
-    utils::try_into_or_box_err,
     worker::ClientWorkerSet,
 };
 use errors::*;
@@ -80,6 +78,7 @@ use http::Uri;
 use parking_lot::RwLock;
 use std::{
     collections::{HashMap, VecDeque},
+    error::Error,
     fmt::Debug,
     pin::Pin,
     str::FromStr,
@@ -862,21 +861,6 @@ impl Client {
         WorkflowClientTrait::start_activity(self, activity, input, options).await
     }
 
-    /// Start a standalone activity and wait for its result.
-    ///
-    /// Equivalent to `start_activity(...).await?.result()`.
-    pub async fn execute_activity<A>(
-        &self,
-        activity: A,
-        input: A::Input,
-        options: ActivityStartOptions,
-    ) -> Result<A::Output, ExecuteActivityError>
-    where
-        A: ActivityDefinition,
-    {
-        WorkflowClientTrait::execute_activity(self, activity, input, options).await
-    }
-
     /// Get a handle to an existing standalone activity execution. If `run_id` is not specified,
     /// the handle always targets the latest execution with matching ID.
     ///
@@ -1024,17 +1008,6 @@ pub(crate) trait WorkflowClientTrait: NamespacedClient {
         input: A::Input,
         options: ActivityStartOptions,
     ) -> impl Future<Output = Result<ActivityHandle<Self, A>, StartActivityError>>
-    where
-        Self: Sized,
-        A: ActivityDefinition;
-
-    /// Start a standalone activity and wait for its result.
-    fn execute_activity<A>(
-        &self,
-        activity: A,
-        input: A::Input,
-        options: ActivityStartOptions,
-    ) -> impl Future<Output = Result<A::Output, ExecuteActivityError>>
     where
         Self: Sized,
         A: ActivityDefinition;
@@ -1691,23 +1664,6 @@ where
         ))
     }
 
-    async fn execute_activity<A>(
-        &self,
-        activity: A,
-        input: A::Input,
-        options: ActivityStartOptions,
-    ) -> Result<A::Output, ExecuteActivityError>
-    where
-        Self: Sized,
-        A: ActivityDefinition,
-    {
-        Ok(self
-            .start_activity(activity, input, options)
-            .await?
-            .result()
-            .await?)
-    }
-
     fn get_activity_handle<A>(
         &self,
         _activity: A,
@@ -1807,6 +1763,17 @@ macro_rules! dbg_panic {
   };
 }
 pub(crate) use dbg_panic;
+
+fn try_into_or_box_err<A, B, E, MapErr>(val: Option<A>, map_err: MapErr) -> Result<Option<B>, E>
+where
+    A: TryInto<B>,
+    <A as TryInto<B>>::Error: Error + Send + Sync + 'static,
+    MapErr: FnOnce(Box<dyn Error + Send + Sync + 'static>) -> E,
+{
+    val.map(TryInto::try_into)
+        .transpose()
+        .map_err(|e| map_err(Box::from(e)))
+}
 
 #[cfg(test)]
 mod tests {

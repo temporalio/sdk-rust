@@ -55,7 +55,7 @@ pub(crate) use dbg_panic;
 /// Activity options. Specifying at least one of them is required, but specifying both is also
 /// allowed. Note that this type does not cover all available timeout options for an Activity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ActivityCloseTimeoutOptions {
+pub enum ActivityCloseTimeouts {
     /// Total time the Activity is allowed to run, including retries.
     ScheduleToClose(Duration),
     /// Maximum time of a single Activity execution attempt. Note that the Temporal Server doesn't
@@ -74,14 +74,14 @@ pub enum ActivityCloseTimeoutOptions {
     },
 }
 
-impl ActivityCloseTimeoutOptions {
+impl ActivityCloseTimeouts {
     /// For internal use. Converts options to [`ActivityCloseTimeoutValues`].
     #[doc(hidden)]
     pub fn into_values(self) -> ActivityCloseTimeoutValues {
         let (schedule_to_close, start_to_close) = match self {
-            ActivityCloseTimeoutOptions::ScheduleToClose(t) => (Some(t), None),
-            ActivityCloseTimeoutOptions::StartToClose(t) => (None, Some(t)),
-            ActivityCloseTimeoutOptions::Both {
+            ActivityCloseTimeouts::ScheduleToClose(t) => (Some(t), None),
+            ActivityCloseTimeouts::StartToClose(t) => (None, Some(t)),
+            ActivityCloseTimeouts::Both {
                 schedule_to_close,
                 start_to_close,
             } => (Some(schedule_to_close), Some(start_to_close)),
@@ -94,7 +94,7 @@ impl ActivityCloseTimeoutOptions {
     }
 }
 
-/// For internal use. Obtained from [`ActivityCloseTimeoutOptions`].
+/// For internal use. Obtained from [`ActivityCloseTimeouts`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive] // disallow direct construction
 #[doc(hidden)]

@@ -7,9 +7,10 @@ use crate::{
 use std::marker::PhantomData;
 use temporalio_common::{
     ActivityDefinition,
-    data_converters::{NoopDecodeHint, SerializationContextData},
+    data_converters::{DecodablePayloads, NoopDecodeHint, SerializationContextData},
     protos::temporal::api::{
         activity::v1::{ActivityExecutionOutcome, activity_execution_outcome},
+        failure::v1::failure::FailureInfo,
         workflowservice::v1::{
             DescribeActivityExecutionRequest, PollActivityExecutionRequest,
             RequestCancelActivityExecutionRequest, TerminateActivityExecutionRequest,
@@ -96,18 +97,32 @@ where
             };
 
             let dc = client.data_converter();
-            let ctx = &SerializationContextData::Activity;
+            let ctx = SerializationContextData::Activity;
 
             return match outcome {
                 activity_execution_outcome::Value::Result(payloads) => {
-                    Ok(dc.from_payloads(ctx, payloads.payloads).await?)
+                    Ok(dc.from_payloads(&ctx, payloads.payloads).await?)
                 }
                 activity_execution_outcome::Value::Failure(failure) => {
-                    Err(ActivityResultError::ActivityFailed(dc.to_error(
-                        ctx,
-                        failure,
-                        NoopDecodeHint,
-                    )?))
+                    Err(match failure.failure_info {
+                        Some(FailureInfo::CanceledFailureInfo(info)) => {
+                            let payloads = info.details.unwrap_or_default().payloads;
+                            let details = DecodablePayloads::new(
+                                payloads,
+                                dc.payload_converter().clone(),
+                                ctx,
+                            );
+                            ActivityResultError::Cancelled { details }
+                        }
+                        Some(FailureInfo::TerminatedFailureInfo(_)) => {
+                            ActivityResultError::Terminated
+                        }
+                        _ => ActivityResultError::ActivityFailed(dc.to_error(
+                            &ctx,
+                            failure,
+                            NoopDecodeHint,
+                        )?),
+                    })
                 }
             };
         }

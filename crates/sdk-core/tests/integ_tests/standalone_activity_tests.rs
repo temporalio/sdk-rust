@@ -1,5 +1,4 @@
 use crate::common::{get_integ_client, init_integ_telem, integ_namespace, rand_6_chars};
-use anyhow::anyhow;
 use futures_util::{FutureExt, StreamExt, pin_mut, stream};
 use std::{
     collections::HashSet,
@@ -10,8 +9,8 @@ use std::{
 };
 use temporalio_client::{
     ActivityCancelOptions, ActivityDescribeOptions, ActivityExecutionInfoLike,
-    ActivityExecutionStatus, ActivityStartOptions, ActivityTerminateOptions, Client,
-    NamespacedClient, errors::ActivityResultError,
+    ActivityExecutionStatus, ActivityStartOptions, ActivityStartOptionsBuilder,
+    ActivityTerminateOptions, Client, NamespacedClient, errors::ActivityResultError,
 };
 use temporalio_common::{ActivityError, error::IncomingError};
 use temporalio_macros::activities;
@@ -30,14 +29,11 @@ impl Activities {
     }
 
     #[activity]
-    async fn fail_when_canceled(
-        self: Arc<Self>,
-        ctx: ActivityContext,
-    ) -> Result<(), ActivityError> {
+    async fn wait_for_cancel(self: Arc<Self>, ctx: ActivityContext) -> Result<(), ActivityError> {
         let mut ticker = tokio::time::interval(Duration::from_millis(100));
         loop {
             tokio::select! { biased;
-                _ = ctx.cancelled() => return Err(anyhow!("canceled").into()),
+                _ = ctx.cancelled() => return Err(ActivityError::Cancelled {details: None}),
                 _ = ticker.tick() => { let _ = ctx.record_heartbeat(()).await; },
             }
         }
@@ -89,17 +85,18 @@ async fn run_test(test: impl AsyncFnOnce(Client, String)) {
     }
 }
 
-macro_rules! test_options {
-    ($task_queue:expr) => {
-        ActivityStartOptions::new($task_queue, Uuid::new_v4())
-            .schedule_to_close_timeout(Duration::from_secs(60))
-    };
+fn test_options(task_queue: String) -> ActivityStartOptionsBuilder {
+    ActivityStartOptions::with_schedule_to_close_timeout(
+        task_queue,
+        Uuid::new_v4(),
+        Duration::from_secs(60),
+    )
 }
 
 #[tokio::test]
 async fn get_result() {
     run_test(async |client, tq| {
-        let options = test_options!(tq).build();
+        let options = test_options(tq).build();
         let arg = "Hello";
 
         let handle = client
@@ -150,23 +147,9 @@ async fn get_result() {
 }
 
 #[tokio::test]
-async fn execute() {
-    run_test(async |client, tq| {
-        let arg = "Hello";
-        let result = client
-            .execute_activity(Activities::echo, arg.into(), test_options!(tq).build())
-            .await
-            .unwrap();
-
-        assert_eq!(result, arg);
-    })
-    .await;
-}
-
-#[tokio::test]
 async fn describe() {
     run_test(async |client, tq| {
-        let options = test_options!(tq).build();
+        let options = test_options(tq).build();
         let arg = "Hello";
 
         let handle = client
@@ -198,11 +181,7 @@ async fn cancel() {
     run_test(async |client, tq| {
         let reason = "test cancel";
         let handle = client
-            .start_activity(
-                Activities::fail_when_canceled,
-                (),
-                test_options!(tq).build(),
-            )
+            .start_activity(Activities::wait_for_cancel, (), test_options(tq).build())
             .await
             .unwrap();
         handle
@@ -214,9 +193,7 @@ async fn cancel() {
 
         assert_matches!(
             handle.result().await,
-            Err(ActivityResultError::ActivityFailed(
-                IncomingError::Cancelled(_)
-            ))
+            Err(ActivityResultError::Cancelled { .. })
         );
         let desc = handle.describe(Default::default()).await.unwrap();
         assert_eq!(desc.status(), ActivityExecutionStatus::Canceled);
@@ -230,11 +207,7 @@ async fn terminate() {
     run_test(async |client, tq| {
         let reason = "test terminate";
         let handle = client
-            .start_activity(
-                Activities::fail_when_canceled,
-                (),
-                test_options!(tq).build(),
-            )
+            .start_activity(Activities::wait_for_cancel, (), test_options(tq).build())
             .await
             .unwrap();
         handle
@@ -244,12 +217,7 @@ async fn terminate() {
             .await
             .unwrap();
 
-        assert_matches!(
-            handle.result().await,
-            Err(ActivityResultError::ActivityFailed(
-                IncomingError::Terminated(_)
-            ))
-        );
+        assert_matches!(handle.result().await, Err(ActivityResultError::Terminated));
         let desc = handle.describe(Default::default()).await.unwrap();
         assert_eq!(desc.status(), ActivityExecutionStatus::Terminated);
     })
@@ -267,7 +235,7 @@ async fn list_and_count() {
                     .start_activity(
                         Activities::echo,
                         "Hello".into(),
-                        test_options!(tq.clone()).build(),
+                        test_options(tq.clone()).build(),
                     )
                     .await
                     .unwrap()

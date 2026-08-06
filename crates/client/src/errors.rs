@@ -3,8 +3,8 @@
 use crate::{WorkflowExecutionStatus, workflow_handle::WorkflowResultDetails};
 use http::uri::InvalidUri;
 use temporalio_common::{
-    data_converters::PayloadConversionError,
-    error::IncomingError,
+    data_converters::{DecodablePayloads, PayloadConversionError},
+    error::{IncomingError, TimeoutType},
     protos::{
         temporal::api::{
             errordetails::v1::ActivityExecutionAlreadyStartedFailure, failure::v1::Failure,
@@ -403,6 +403,21 @@ pub enum ActivityResultError {
     #[error("Activity failed: {0}")]
     ActivityFailed(#[source] IncomingError),
 
+    /// The activity was canceled.
+    #[error("Activity canceled")]
+    Cancelled {
+        /// Details provided at cancellation time.
+        details: DecodablePayloads,
+    },
+
+    /// The workflow was terminated.
+    #[error("Activity terminated")]
+    Terminated,
+
+    /// The activity timed out.
+    #[error("Activity timed out: {0:?}")]
+    TimedOut(TimeoutType),
+
     /// The activity was not found.
     #[error("Activity not found")]
     NotFound(#[source] tonic::Status),
@@ -426,63 +441,6 @@ impl From<tonic::Status> for ActivityResultError {
             Self::NotFound(status)
         } else {
             Self::Rpc(status)
-        }
-    }
-}
-
-/// Errors that can occur when executing a standalone activity.
-#[allow(clippy::large_enum_variant)]
-#[derive(Debug, thiserror::Error)]
-#[non_exhaustive]
-pub enum ExecuteActivityError {
-    /// Activity did not complete successfully.
-    #[error("Activity failed: {0}")]
-    ActivityFailed(#[source] IncomingError),
-
-    /// There's a conflicting activity execution with the same ID according to chosen ID reuse
-    /// policy and ID conflict policy.
-    #[error("Activity already started with run_id={run_id}")]
-    AlreadyStarted {
-        /// Run ID of the existing execution with the same activity ID.
-        run_id: String,
-        /// Raw error from the server.
-        #[source]
-        source: tonic::Status,
-    },
-
-    /// Error serializing input or output.
-    #[error("Payload conversion error: {0}")]
-    PayloadConversion(#[from] PayloadConversionError),
-
-    /// An uncategorized RPC error from the server.
-    #[error("Server error: {0}")]
-    Rpc(#[source] tonic::Status),
-
-    /// Other errors.
-    #[error(transparent)]
-    Other(#[from] Box<dyn std::error::Error + Send + Sync>),
-}
-
-impl From<StartActivityError> for ExecuteActivityError {
-    fn from(value: StartActivityError) -> Self {
-        match value {
-            StartActivityError::AlreadyStarted { run_id, source } => {
-                Self::AlreadyStarted { run_id, source }
-            }
-            StartActivityError::PayloadConversion(e) => Self::PayloadConversion(e),
-            StartActivityError::Rpc(e) => Self::Rpc(e),
-            StartActivityError::Other(e) => Self::Other(e),
-        }
-    }
-}
-
-impl From<ActivityResultError> for ExecuteActivityError {
-    fn from(value: ActivityResultError) -> Self {
-        match value {
-            ActivityResultError::ActivityFailed(e) => Self::ActivityFailed(e),
-            ActivityResultError::PayloadConversion(e) => Self::PayloadConversion(e),
-            ActivityResultError::NotFound(e) | ActivityResultError::Rpc(e) => Self::Rpc(e),
-            ActivityResultError::Other(e) => Self::Other(e),
         }
     }
 }

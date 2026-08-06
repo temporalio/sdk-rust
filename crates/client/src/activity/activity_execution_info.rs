@@ -120,10 +120,8 @@ impl ActivityExecutionInfo {
 
 /// Contains the current state of the activity execution.
 /// Obtained from [`ActivityHandle::describe`](crate::ActivityHandle::describe).
-///
-/// To support deserialization of transmitted payloads, the object internally stores a reference
-/// to the client used to make the request. For this reason, this type is parametrized with client
-/// type. The client reference can be dropped by calling [`simple`](Self::untyped).
+/// Methods that deserialize payloads (e.g. [`heartbeat_details`](Self::heartbeat_details)) use
+/// [`DataConverter`] of the client associated with the activity handle.
 pub struct ActivityExecutionDescription<ActivityT = UntypedActivity>
 where
     ActivityT: ActivityDefinition,

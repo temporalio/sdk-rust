@@ -9,6 +9,7 @@ pub use activity_execution_info::{
 pub use activity_handle::ActivityHandle;
 use futures_util::{Stream, StreamExt};
 use std::{
+    collections::VecDeque,
     pin::Pin,
     task::{Context, Poll},
 };
@@ -26,7 +27,7 @@ use temporalio_common::{
 /// Internally paginates through results from the server.
 pub struct ListActivitiesStream {
     inner: Pin<Box<dyn Stream<Item = Result<Vec<ActivityExecutionListInfo>, ClientError>> + Send>>,
-    buffer: <Vec<ActivityExecutionListInfo> as IntoIterator>::IntoIter,
+    buffer: VecDeque<ActivityExecutionListInfo>,
 }
 
 impl ListActivitiesStream {
@@ -35,7 +36,7 @@ impl ListActivitiesStream {
     ) -> Self {
         Self {
             inner: Box::pin(stream),
-            buffer: vec![].into_iter(),
+            buffer: VecDeque::new(),
         }
     }
 }
@@ -45,12 +46,13 @@ impl Stream for ListActivitiesStream {
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         loop {
-            if let Some(info) = self.buffer.next() {
+            if let Some(info) = self.buffer.pop_front() {
                 return Poll::Ready(Some(Ok(info.into())));
             }
             match self.inner.poll_next_unpin(cx) {
                 Poll::Ready(Some(Ok(items))) => {
-                    self.buffer = items.into_iter();
+                    // Using into() rather than extend() to avoid moving items in memory
+                    self.buffer = items.into();
                 }
                 Poll::Ready(Some(Err(e))) => {
                     return Poll::Ready(Some(Err(e)));

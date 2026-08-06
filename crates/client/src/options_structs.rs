@@ -2,7 +2,7 @@ use crate::{HttpConnectProxyOptions, RetryOptions, VERSION, callback_based};
 use http::Uri;
 use std::{collections::HashMap, sync::Arc, time::Duration};
 use temporalio_common::{
-    ActivityCloseTimeoutOptions, RetryPolicy,
+    ActivityCloseTimeouts, RetryPolicy,
     data_converters::DataConverter,
     protos::temporal::api::{
         common::{
@@ -581,10 +581,11 @@ pub struct ActivityStartOptions {
     /// Activity ID of the started activity. It's recommended to use a meaningful business ID.
     #[builder(start_fn)]
     pub id: String,
-    /// Combined schedule-to-close and start-to-close timeout options. At least one of them is
-    /// required.
-    #[builder(setters(name = combined_close_timeouts, vis = ""))]
-    pub close_timeouts: ActivityCloseTimeoutOptions,
+    /// Timeouts for activity completion.
+    ///
+    /// See [`ActivityCloseTimeouts`] for the meaning of each timeout variant.
+    #[builder(start_fn)]
+    pub close_timeouts: ActivityCloseTimeouts,
     /// If set, specifies maximum time the activity can wait in the task queue before being picked
     /// up by a worker. This timeout is non-retryable.
     pub schedule_to_start_timeout: Option<Duration>,
@@ -616,56 +617,31 @@ pub struct ActivityStartOptions {
     pub start_delay: Option<Duration>,
 }
 
-impl<S: activity_start_options_builder::State> ActivityStartOptionsBuilder<S>
-where
-    S::CloseTimeouts: activity_start_options_builder::IsUnset,
-{
-    /// _**Required if**_ [`start_to_close_timeout`](Self::start_to_close_timeout) is not set.
-    ///
-    /// If set, specifies total time the activity is allowed to run, including retries.
-    ///
-    /// Calling this method prevents calling
-    /// [`schedule_to_close_timeout`](Self::schedule_to_close_timeout). To set both timeouts, use
-    /// [`close_timeouts`](Self::close_timeouts).
-    pub fn schedule_to_close_timeout(
-        self,
-        value: Duration,
-    ) -> ActivityStartOptionsBuilder<activity_start_options_builder::SetCloseTimeouts<S>> {
-        self.combined_close_timeouts(ActivityCloseTimeoutOptions::ScheduleToClose(value))
+impl ActivityStartOptions {
+    /// Returns a builder with `close_timeouts` set to [`ActivityCloseTimeouts::StartToClose`].
+    pub fn with_start_to_close_timeout(
+        task_queue: impl Into<String>,
+        activity_id: impl Into<String>,
+        start_to_close_timeout: Duration,
+    ) -> ActivityStartOptionsBuilder {
+        Self::new(
+            task_queue,
+            activity_id,
+            ActivityCloseTimeouts::StartToClose(start_to_close_timeout),
+        )
     }
 
-    /// _**Required if**_ [`schedule_to_close_timeout`](Self::schedule_to_close_timeout) is not set.
-    ///
-    /// If set, specifies maximum time of a single Activity execution attempt.
-    ///
-    /// Note that the Temporal Server doesn't  detect Worker process failures directly. It relies on
-    /// this timeout to detect that an Activity that didn't complete on time. So this timeout should
-    /// be as short as the longest possible execution of the Activity body. Potentially long running
-    /// Activities must specify [`heartbeat_timeout`](Self::heartbeat_timeout) and heartbeat from
-    /// the activity periodically for timely failure detection.
-    ///
-    /// Calling this method prevents calling
-    /// [`schedule_to_close_timeout`](Self::schedule_to_close_timeout). To set both timeouts, use
-    /// [`close_timeouts`](Self::close_timeouts).
-    pub fn start_to_close_timeout(
-        self,
-        value: Duration,
-    ) -> ActivityStartOptionsBuilder<activity_start_options_builder::SetCloseTimeouts<S>> {
-        self.combined_close_timeouts(ActivityCloseTimeoutOptions::StartToClose(value))
-    }
-
-    /// Sets both [`schedule_to_close_timeout`](Self::schedule_to_close_timeout) and
-    /// [`start_to_close_timeout`](Self::start_to_close_timeout). See the respective methods for
-    /// meaning of the options.
-    pub fn close_timeouts(
-        self,
-        schedule_to_close: Duration,
-        start_to_close: Duration,
-    ) -> ActivityStartOptionsBuilder<activity_start_options_builder::SetCloseTimeouts<S>> {
-        self.combined_close_timeouts(ActivityCloseTimeoutOptions::Both {
-            schedule_to_close,
-            start_to_close,
-        })
+    /// Returns a builder with `close_timeouts` set to [`ActivityCloseTimeouts::ScheduleToClose`].
+    pub fn with_schedule_to_close_timeout(
+        task_queue: impl Into<String>,
+        activity_id: impl Into<String>,
+        schedule_to_close_timeout: Duration,
+    ) -> ActivityStartOptionsBuilder {
+        Self::new(
+            task_queue,
+            activity_id,
+            ActivityCloseTimeouts::ScheduleToClose(schedule_to_close_timeout),
+        )
     }
 }
 
