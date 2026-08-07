@@ -1635,23 +1635,34 @@ impl Worker {
             .heartbeat_manager
             .as_ref()
             .map(|hm| hm.heartbeat_callback.clone()());
+        let capabilities = self.capabilities.clone();
         let handle = tokio::spawn(async move {
             match client
                 .shutdown_worker(sticky_name, task_queue, task_queue_types, heartbeat)
                 .await
             {
                 Err(err)
-                    if !matches!(
+                    if matches!(
                         err.code(),
                         tonic::Code::Unimplemented | tonic::Code::Unavailable
                     ) =>
                 {
+                    capabilities
+                        .graceful_poll_shutdown
+                        .store(false, Ordering::Relaxed);
+                    debug!(
+                        "shutdown_worker rpc unavailable during worker shutdown; \
+                         disabling graceful poll shutdown and interrupting polls locally: {:?}",
+                        err
+                    );
+                }
+                Err(err) => {
                     warn!(
                         "shutdown_worker rpc errored during worker shutdown: {:?}",
                         err
                     );
                 }
-                _ => {}
+                Ok(_) => {}
             }
         });
         *guard = Some(handle);

@@ -407,7 +407,17 @@ where
                     let capabilities = capabilities.clone();
                     let poll_task = tokio::spawn(async move {
                         let r = if capabilities.graceful_poll_shutdown() {
-                            pf(timeout_override).await
+                            let shutdown_for_graceful_fallback = shutdown.clone();
+                            let local_interrupt_after_graceful_disabled = async move {
+                                shutdown_for_graceful_fallback.cancelled().await;
+                                while capabilities.graceful_poll_shutdown() {
+                                    tokio::time::sleep(Duration::from_millis(10)).await;
+                                }
+                            };
+                            tokio::select! {
+                                r = pf(timeout_override) => r,
+                                _ = local_interrupt_after_graceful_disabled => return,
+                            }
                         } else {
                             let poll_interruptor = shutdown.cancelled().then(|_| async move {
                                 if let Some(w) = poll_shutdown_interrupt_wait {
