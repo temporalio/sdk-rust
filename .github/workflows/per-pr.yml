@@ -219,7 +219,7 @@ jobs:
             --volume "$HOME:$HOME" \
             --volume "$GITHUB_WORKSPACE:$GITHUB_WORKSPACE" \
             --workdir "$GITHUB_WORKSPACE" \
-            ubuntu:24.04 \
+            rust:1.94-bookworm \
             "$HOME/.cargo/bin/cargo" integ-test worker_heartbeat_multiple_workers
 
   examples:
