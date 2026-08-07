@@ -90,7 +90,7 @@ where
 
             // If resp.outcome.value is None, poll again
             let Some(ActivityExecutionOutcome {
-                value: Some(outcome),
+                value: Some(outcome), ..
             }) = resp.outcome
             else {
                 continue;

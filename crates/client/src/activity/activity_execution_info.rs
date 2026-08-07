@@ -514,6 +514,8 @@ pub enum ActivityExecutionStatus {
     Terminated,
     /// The activity timed out.
     TimedOut,
+    /// The activity is paused.
+    Paused,
     /// This variant indicates the server used a value not known by this version of the SDK.
     Unknown,
 }
@@ -528,6 +530,7 @@ impl From<ProtoActivityExecutionStatus> for ActivityExecutionStatus {
             ProtoActivityExecutionStatus::Canceled => Self::Canceled,
             ProtoActivityExecutionStatus::Terminated => Self::Terminated,
             ProtoActivityExecutionStatus::TimedOut => Self::TimedOut,
+            ProtoActivityExecutionStatus::Paused => Self::Paused,
         }
     }
 }

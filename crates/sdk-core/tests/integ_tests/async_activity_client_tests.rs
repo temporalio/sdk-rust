@@ -176,7 +176,7 @@ async fn async_activity_completions(
                 eprintln!("DEBUG: Using ById identifier");
                 ActivityIdentifier::by_id_workflow(
                     info.workflow_id.unwrap(),
-                    Some(info.workflow_run_id.unwrap()),
+                    info.workflow_run_id.unwrap(),
                     info.activity_id,
                 )
             }
