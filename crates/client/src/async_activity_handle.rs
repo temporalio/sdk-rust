@@ -94,10 +94,7 @@ impl ActivityIdentifier {
 
     /// Create an identifier from standalone activity ID. Use an empty run id to target the
     /// latest activity execution.
-    pub fn by_id_standalone(
-        activity_id: impl Into<String>,
-        run_id: impl Into<String>,
-    ) -> Self {
+    pub fn by_id_standalone(activity_id: impl Into<String>, run_id: impl Into<String>) -> Self {
         Self::ByIdStandalone {
             activity_id: activity_id.into(),
             run_id: run_id.into(),
@@ -108,8 +105,15 @@ impl ActivityIdentifier {
     fn id_tuple(self) -> (String, String, String) {
         match self {
             Self::TaskToken(_) => unreachable!(),
-            Self::ByIdWorkflow { workflow_id, run_id, activity_id } => (workflow_id, run_id, activity_id),
-            Self::ByIdStandalone { activity_id, run_id } => (String::new(), run_id, activity_id),
+            Self::ByIdWorkflow {
+                workflow_id,
+                run_id,
+                activity_id,
+            } => (workflow_id, run_id, activity_id),
+            Self::ByIdStandalone {
+                activity_id,
+                run_id,
+            } => (String::new(), run_id, activity_id),
         }
     }
 }

@@ -5,7 +5,8 @@ pub use options::{
     ActivityCancellationType, ActivityOptions, ChildWorkflowCancellationType, ChildWorkflowOptions,
     ContinueAsNewOptions, ContinueAsNewVersioningBehavior, LocalActivityOptions,
     NexusOperationCancellationType, NexusOperationOptions, ParentClosePolicy, Signal, SignalData,
-    SignalWorkflowOptions, TimerOptions, VersioningIntent, WaitConditionOptions, WorkflowIdReusePolicy,
+    SignalWorkflowOptions, TimerOptions, VersioningIntent, WaitConditionOptions,
+    WorkflowIdReusePolicy,
 };
 pub use temporalio_common_wasm::protos::coresdk::child_workflow::StartChildWorkflowExecutionFailedCause;
 pub use view::{NamespacedWorkflowInfo, WorkflowContextView};
