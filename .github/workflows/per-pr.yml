@@ -207,20 +207,31 @@ jobs:
         with:
           compose-file: ./etc/docker/docker-compose-ci.yaml
       - run: cargo integ-test docker_
+        env:
+          TMPDIR: ${{ runner.temp }}
       - name: Verify worker environment detection inside Docker
         run: |
+          integ_test_binary="$(
+            find "$GITHUB_WORKSPACE/target/debug/deps" -maxdepth 1 -type f \
+              -name 'integ_tests-*' -perm -111 \
+              -printf '%T@ %p\n' | sort -nr | head -n 1 | cut -d' ' -f2-
+          )"
+          integ_runner_binary="$(
+            find "$GITHUB_WORKSPACE/target/debug/deps" -maxdepth 1 -type f \
+              -name 'integ_runner-*' -perm -111 \
+              -printf '%T@ %p\n' | sort -nr | head -n 1 | cut -d' ' -f2-
+          )"
+          test -x "$integ_test_binary"
+          test -x "$integ_runner_binary"
           docker run --rm \
-            --user "$(id -u):$(id -g)" \
-            --env HOME="$HOME" \
-            --env CARGO_HOME="$HOME/.cargo" \
-            --env RUSTUP_HOME="$HOME/.rustup" \
-            --env PROTOC \
+            --env TMPDIR="$RUNNER_TEMP" \
             --env TEMPORAL_TEST_EXPECT_DOCKER=true \
-            --volume "$HOME:$HOME" \
+            --volume "$RUNNER_TEMP:$RUNNER_TEMP" \
             --volume "$GITHUB_WORKSPACE:$GITHUB_WORKSPACE" \
             --workdir "$GITHUB_WORKSPACE" \
-            rust:1.94-bookworm \
-            "$HOME/.cargo/bin/cargo" integ-test worker_heartbeat_multiple_workers
+            ubuntu:24.04 \
+            "$integ_runner_binary" --test-executable "$integ_test_binary" \
+              worker_heartbeat_multiple_workers
 
   examples:
     name: "Build and run examples"
