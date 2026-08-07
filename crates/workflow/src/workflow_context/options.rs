@@ -479,7 +479,6 @@ impl LocalActivityOptions {
                 start_to_close_timeout: self
                     .start_to_close_timeout
                     .and_then(|duration| duration.try_into().ok()),
-                ..Default::default()
             }),
             self.summary,
             None,
