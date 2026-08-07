@@ -33,8 +33,7 @@ use temporalio_common::{
         },
         temporal::api::{
             common::v1::WorkflowExecution,
-            enums::v1::{EventType, ResetReapplyType, WorkflowTaskFailedCause},
-            history::v1::history_event::Attributes::WorkflowTaskFailedEventAttributes,
+            enums::v1::{EventType, ResetReapplyType},
             workflowservice::v1::{ResetStickyTaskQueueRequest, ResetWorkflowExecutionRequest},
         },
     },
