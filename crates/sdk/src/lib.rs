@@ -965,7 +965,10 @@ impl Worker {
                     },
                 )
                 .await
-                .map_err(|source| WorkerRunError::WorkflowFutures(Box::new(source)))
+                .map_err(|source| WorkerRunError::Fatal {
+                    message: "workflow futures encountered an error".to_owned(),
+                    source: Box::new(source),
+                })
         };
         let wf_completion_processor = async {
             UnboundedReceiverStream::new(completions_rx)
@@ -978,7 +981,10 @@ impl Worker {
                     common.worker.complete_workflow_activation(completion).await
                 })
                 .await
-                .map_err(WorkerRunError::WorkflowCompletions)
+                .map_err(|source| WorkerRunError::Fatal {
+                    message: "workflow completions processor encountered an error".to_owned(),
+                    source: Box::new(source),
+                })
         };
         tokio::try_join!(
             // Workflow-related tasks run inside LocalSet (allows !Send futures)
@@ -993,7 +999,10 @@ impl Worker {
                                     Err(PollError::ShutDown) => {
                                         break;
                                     }
-                                    o => o.map_err(WorkerRunError::WorkflowPoll)?,
+                                    o => o.map_err(|source| WorkerRunError::Fatal {
+                                        message: "workflow polling failed".to_owned(),
+                                        source: Box::new(source),
+                                    })?,
                                 };
                             if let Err(err) = decode_payloads(
                                 &mut activation,
@@ -1020,9 +1029,10 @@ impl Worker {
                             }
                             for i in &common.worker_interceptors {
                                 i.on_workflow_activation(&activation).await.map_err(|source| {
-                                    WorkerRunError::WorkflowActivationInterceptor(
-                                        source.into_boxed_dyn_error(),
-                                    )
+                                    WorkerRunError::Fatal {
+                                        message: "workflow activation interceptor failed".to_owned(),
+                                        source: source.into_boxed_dyn_error(),
+                                    }
                                 })?;
                             }
                             if let Some(wf_fut) = wf_half
@@ -1035,9 +1045,10 @@ impl Worker {
                                 )
                                 .await
                                 .map_err(|source| {
-                                    WorkerRunError::WorkflowActivation(
-                                        source.into_boxed_dyn_error(),
-                                    )
+                                    WorkerRunError::Fatal {
+                                        message: "workflow activation processing failed".to_owned(),
+                                        source: source.into_boxed_dyn_error(),
+                                    }
                                 })?
                                 && wf_future_tx.send(wf_fut).is_err()
                             {
@@ -1075,7 +1086,10 @@ impl Worker {
                         if matches!(activity, Err(PollError::ShutDown)) {
                             break;
                         }
-                        let mut activity = activity.map_err(WorkerRunError::ActivityPoll)?;
+                        let mut activity = activity.map_err(|source| WorkerRunError::Fatal {
+                            message: "activity polling failed".to_owned(),
+                            source: Box::new(source),
+                        })?;
                         if let Err(err) = decode_payloads(
                             &mut activity,
                             common.data_converter.codec(),
@@ -1099,8 +1113,9 @@ impl Worker {
                                 .worker
                                 .complete_activity_task(completion)
                                 .await
-                                .map_err(|source| {
-                                    WorkerRunError::ActivityCompletion(Box::new(source))
+                                .map_err(|source| WorkerRunError::Fatal {
+                                    message: "activity completion failed".to_owned(),
+                                    source: Box::new(source),
                                 })?;
                             continue;
                         }
@@ -1136,14 +1151,16 @@ impl Worker {
                                     .worker
                                     .complete_activity_task(completion)
                                     .await
-                                    .map_err(|source| {
-                                        WorkerRunError::ActivityCompletion(Box::new(source))
+                                    .map_err(|source| WorkerRunError::Fatal {
+                                        message: "activity completion failed".to_owned(),
+                                        source: Box::new(source),
                                     })?;
                             }
                             Err(ActivityTaskHandlerError::Fatal(source)) => {
-                                return Err(WorkerRunError::ActivityTask(
-                                    source.into_boxed_dyn_error(),
-                                ));
+                                return Err(WorkerRunError::Fatal {
+                                    message: "activity task handling failed".to_owned(),
+                                    source: source.into_boxed_dyn_error(),
+                                });
                             }
                         };
                     }
