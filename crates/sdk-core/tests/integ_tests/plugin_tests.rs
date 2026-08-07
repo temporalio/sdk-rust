@@ -1,6 +1,5 @@
 use crate::common::{
-    CoreWfStarter, get_integ_runtime_options, get_integ_server_options, get_integ_telem_options,
-    integ_namespace,
+    CoreWfStarter, get_integ_server_options, get_integ_telem_options, integ_namespace,
 };
 use futures_util::future::BoxFuture;
 use std::{
@@ -30,14 +29,24 @@ use temporalio_common::{
 };
 use temporalio_macros::{activities, workflow, workflow_methods};
 use temporalio_sdk::{
-    ActivityOptions, ClientAndWorkerPlugin, SimplePlugin, Worker, WorkerOptions, WorkerPlugin,
-    WorkflowContext, WorkflowDefinitions, WorkflowResult,
+    ActivityOptions, ClientAndWorkerPlugin, Runtime, SimplePlugin, Worker, WorkerOptions,
+    WorkerPlugin, WorkflowContext, WorkflowDefinitions, WorkflowResult,
     activities::{ActivityContext, ActivityDefinitions, ActivityError},
     interceptors::WorkerInterceptor,
+    runtime::RuntimeOptions,
 };
-use temporalio_sdk_core::CoreRuntime;
 use url::Url;
 use uuid::Uuid;
+
+fn new_sdk_runtime() -> Runtime {
+    Runtime::new_assume_tokio(
+        RuntimeOptions::builder()
+            .telemetry_options(get_integ_telem_options())
+            .build()
+            .unwrap(),
+    )
+    .unwrap()
+}
 
 #[derive(Clone)]
 struct IntegrationPlugin {
@@ -83,9 +92,7 @@ impl WorkerPlugin for IntegrationPlugin {
 
 #[tokio::test]
 async fn plugins_configure_client_and_worker() {
-    let runtime =
-        CoreRuntime::new_assume_tokio(get_integ_runtime_options(get_integ_telem_options()))
-            .unwrap();
+    let runtime = new_sdk_runtime();
     let connection_calls = Arc::new(AtomicU8::new(0));
     let client_calls = Arc::new(AtomicU8::new(0));
     let worker_calls = Arc::new(AtomicU8::new(0));
@@ -303,8 +310,7 @@ async fn plugin_errors_surface() {
     .await
     .unwrap();
     let worker_result = Worker::new(
-        &CoreRuntime::new_assume_tokio(get_integ_runtime_options(get_integ_telem_options()))
-            .unwrap(),
+        &new_sdk_runtime(),
         client,
         WorkerOptions::new(format!("failing-plugin-{}", Uuid::new_v4()))
             .worker_plugin(FailingWorkerPlugin)
@@ -373,9 +379,7 @@ impl WorkerPlugin for WorkerOnlyMetadataPlugin {
 
 #[tokio::test]
 async fn worker_metadata_includes_client_and_worker_plugin_names() {
-    let runtime =
-        CoreRuntime::new_assume_tokio(get_integ_runtime_options(get_integ_telem_options()))
-            .unwrap();
+    let runtime = new_sdk_runtime();
     let client = Client::connect(
         get_integ_server_options(),
         ClientOptions::new(integ_namespace())
