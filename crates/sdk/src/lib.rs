@@ -82,7 +82,8 @@ pub use crate::{
     error::{
         ActivityExecutionError, ApplicationFailure, ChildWorkflowExecutionError,
         ChildWorkflowStartError, OutgoingActivityError, OutgoingError, OutgoingWorkflowError,
-        RetryState, TimeoutType, WorkerCreateError, WorkflowRegistrationError, WorkflowSignalError,
+        RetryState, TimeoutType, WorkerCreateError, WorkerRunError, WorkflowRegistrationError,
+        WorkflowSignalError,
     },
     plugins::{
         ClientAndWorkerPlugin, SimplePlugin, SimplePluginBuilder, SimplePluginOption, WorkerPlugin,
@@ -112,12 +113,12 @@ use crate::{
         activity_error_to_core_result,
     },
     interceptors::{ActivityInboundInterceptor, WorkerInterceptor},
-    workflow_executor::{TaskHandle, WorkflowExecutor},
+    workflow_executor::{TaskDroppedError, TaskHandle, WorkflowExecutor},
     workflow_future::start_workflow,
     workflow_interceptors::WorkflowInterceptorConstructor,
 };
-use anyhow::{Context, anyhow, bail};
-use futures_util::{FutureExt, StreamExt, TryFutureExt, TryStreamExt};
+use anyhow::{anyhow, bail};
+use futures_util::{FutureExt, StreamExt, TryStreamExt};
 use std::{
     any::{Any, TypeId},
     cell::RefCell,
@@ -635,6 +636,14 @@ struct WorkflowFutureHandle<F: Future> {
     run_id: String,
 }
 
+#[derive(Debug, thiserror::Error)]
+enum WorkflowFutureError {
+    #[error("workflow task was dropped")]
+    TaskDropped(#[from] TaskDroppedError),
+    #[error("workflow execution failed")]
+    WorkflowFailed(#[source] WorkflowTermination),
+}
+
 #[derive(Debug, Default)]
 struct ActivityHalf {
     /// Maps activity type to the function for executing activities of that type
@@ -908,10 +917,14 @@ impl Worker {
 
     /// Runs the worker. Eventually resolves after the worker has been explicitly shut down,
     /// or may return early with an error in the event of some unresolvable problem.
-    pub async fn run(&mut self) -> Result<(), anyhow::Error> {
+    pub async fn run(&mut self) -> Result<(), WorkerRunError> {
         // Perform the namespace check-in so poller behavior (e.g. autoscaling auto-enroll) is
         // resolved before any polling begins.
-        self.common.worker.validate().await?;
+        self.common
+            .worker
+            .validate()
+            .await
+            .map_err(WorkerRunError::Validation)?;
         let shutdown_token = CancellationToken::new();
         let (common, wf_half, act_half) = self.split_apart();
         let (wf_future_tx, wf_future_rx) =
@@ -927,7 +940,7 @@ impl Worker {
 
         let wf_future_joiner = async {
             UnboundedReceiverStream::new(wf_future_rx)
-                .map(Result::<_, anyhow::Error>::Ok)
+                .map(Result::<_, WorkflowFutureError>::Ok)
                 .try_for_each_concurrent(
                     None,
                     |WorkflowFutureHandle {
@@ -936,13 +949,13 @@ impl Worker {
                      }| {
                         let wf_half = &*wf_half;
                         async move {
-                            let result = join_handle.await.map_err(anyhow::Error::new)?;
+                            let result = join_handle.await?;
                             // Eviction is normal workflow lifecycle - workflows loop waiting for
                             // eviction after completion to manage cache cleanup
                             if let Err(e) = result
                                 && !matches!(e, WorkflowTermination::Evicted)
                             {
-                                return Err(anyhow::Error::new(e));
+                                return Err(WorkflowFutureError::WorkflowFailed(e));
                             }
                             debug!(run_id=%run_id, "Removing workflow from cache");
                             wf_half.workflows.borrow_mut().remove(&run_id);
@@ -952,7 +965,7 @@ impl Worker {
                     },
                 )
                 .await
-                .context("Workflow futures encountered an error")
+                .map_err(|source| WorkerRunError::WorkflowFutures(Box::new(source)))
         };
         let wf_completion_processor = async {
             UnboundedReceiverStream::new(completions_rx)
@@ -964,9 +977,8 @@ impl Worker {
                     }
                     common.worker.complete_workflow_activation(completion).await
                 })
-                .map_err(anyhow::Error::from)
                 .await
-                .context("Workflow completions processor encountered an error")
+                .map_err(WorkerRunError::WorkflowCompletions)
         };
         tokio::try_join!(
             // Workflow-related tasks run inside LocalSet (allows !Send futures)
@@ -981,7 +993,7 @@ impl Worker {
                                     Err(PollError::ShutDown) => {
                                         break;
                                     }
-                                    o => o?,
+                                    o => o.map_err(WorkerRunError::WorkflowPoll)?,
                                 };
                             if let Err(err) = decode_payloads(
                                 &mut activation,
@@ -1007,7 +1019,11 @@ impl Worker {
                                 continue;
                             }
                             for i in &common.worker_interceptors {
-                                i.on_workflow_activation(&activation).await?;
+                                i.on_workflow_activation(&activation).await.map_err(|source| {
+                                    WorkerRunError::WorkflowActivationInterceptor(
+                                        source.into_boxed_dyn_error(),
+                                    )
+                                })?;
                             }
                             if let Some(wf_fut) = wf_half
                                 .workflow_activation_handler(
@@ -1017,7 +1033,12 @@ impl Worker {
                                     &completions_tx,
                                     &executor,
                                 )
-                                .await?
+                                .await
+                                .map_err(|source| {
+                                    WorkerRunError::WorkflowActivation(
+                                        source.into_boxed_dyn_error(),
+                                    )
+                                })?
                                 && wf_future_tx.send(wf_fut).is_err()
                             {
                                 panic!(
@@ -1031,7 +1052,7 @@ impl Worker {
                         // terminate.
                         drop(wf_future_tx);
                         drop(completions_tx);
-                        Result::<_, anyhow::Error>::Ok(())
+                        Result::<_, WorkerRunError>::Ok(())
                     },
                     wf_future_joiner,
                     async {
@@ -1040,7 +1061,7 @@ impl Worker {
                             _ = shutdown_token.cancelled() => {}
                         }
                         executor.shutdown().await;
-                        Result::<_, anyhow::Error>::Ok(())
+                        Result::<_, WorkerRunError>::Ok(())
                     },
                 )
                 }).await
@@ -1054,7 +1075,7 @@ impl Worker {
                         if matches!(activity, Err(PollError::ShutDown)) {
                             break;
                         }
-                        let mut activity = activity?;
+                        let mut activity = activity.map_err(WorkerRunError::ActivityPoll)?;
                         if let Err(err) = decode_payloads(
                             &mut activity,
                             common.data_converter.codec(),
@@ -1074,7 +1095,13 @@ impl Worker {
                             };
                             encode_activity_completion(&mut completion, &common.data_converter)
                                 .await;
-                            common.worker.complete_activity_task(completion).await?;
+                            common
+                                .worker
+                                .complete_activity_task(completion)
+                                .await
+                                .map_err(|source| {
+                                    WorkerRunError::ActivityCompletion(Box::new(source))
+                                })?;
                             continue;
                         }
                         match act_half.activity_task_handler(
@@ -1105,13 +1132,23 @@ impl Worker {
                                 };
                                 encode_activity_completion(&mut completion, &common.data_converter)
                                     .await;
-                                common.worker.complete_activity_task(completion).await?;
+                                common
+                                    .worker
+                                    .complete_activity_task(completion)
+                                    .await
+                                    .map_err(|source| {
+                                        WorkerRunError::ActivityCompletion(Box::new(source))
+                                    })?;
                             }
-                            Err(ActivityTaskHandlerError::Fatal(err)) => return Err(err),
+                            Err(ActivityTaskHandlerError::Fatal(source)) => {
+                                return Err(WorkerRunError::ActivityTask(
+                                    source.into_boxed_dyn_error(),
+                                ));
+                            }
                         };
                     }
                 };
-                Result::<_, anyhow::Error>::Ok(())
+                Result::<_, WorkerRunError>::Ok(())
             },
             wf_completion_processor,
         )?;

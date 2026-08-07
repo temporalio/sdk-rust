@@ -28,6 +28,7 @@ to docs, or any other relevant information.
 * `DnsLoadBalancingOptions::builder()` for configuring DNS re-resolution intervals.
 
 ### Breaking Changes :boom:
+* `Worker::run` now returns `WorkerRunError` instead of `anyhow::Error`.
 * `CancellableFuture` and `CancellableFutureWithReason` now use the inherited `Future::Output`
   associated type instead of a generic output parameter.
 * `TimerOptions` is now tagged with `#[non_exhaustive]`. Use
