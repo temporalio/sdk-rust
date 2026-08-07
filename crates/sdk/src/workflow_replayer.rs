@@ -1,5 +1,5 @@
 use crate::{
-    Worker, WorkerOptions,
+    Worker, WorkerOptions, WorkerRunError,
     interceptors::WorkerInterceptor,
     plugins::WorkerPlugin,
     runtime::WorkflowErrorType,
@@ -284,7 +284,13 @@ pub enum WorkflowReplayError {
     Initialization(#[source] anyhow::Error),
     /// The replay worker stopped before producing trustworthy results.
     #[error("workflow replay worker failed: {0}")]
-    Worker(#[source] anyhow::Error),
+    Worker(#[source] WorkerRunError),
+    /// Replay completed without producing the expected outcomes.
+    #[error("workflow replay failed internally: {message}")]
+    Internal {
+        /// Failure details.
+        message: String,
+    },
     /// A single-history replay failed.
     #[error(transparent)]
     Replay(#[from] WorkflowReplayFailure),
@@ -316,8 +322,8 @@ impl WorkflowReplayer {
         history: WorkflowHistory,
     ) -> Result<(), WorkflowReplayError> {
         let mut results = self.replay_workflows([history]).await?;
-        let result = results.pop().ok_or_else(|| {
-            WorkflowReplayError::Worker(anyhow!("replay produced no result for its history"))
+        let result = results.pop().ok_or_else(|| WorkflowReplayError::Internal {
+            message: "replay produced no result for its history".to_owned(),
         })?;
         match result.replay_failure {
             Some(failure) => Err(failure.into()),
@@ -413,11 +419,13 @@ impl WorkflowReplayer {
 
         let outcomes = std::mem::take(&mut *recorded_outcomes.lock());
         if outcomes.len() != valid_indexes.len() {
-            return Err(WorkflowReplayError::Worker(anyhow!(
-                "replay produced {} outcomes for {} valid histories",
-                outcomes.len(),
-                valid_indexes.len()
-            )));
+            return Err(WorkflowReplayError::Internal {
+                message: format!(
+                    "replay produced {} outcomes for {} valid histories",
+                    outcomes.len(),
+                    valid_indexes.len()
+                ),
+            });
         }
         for (index, replay_failure) in valid_indexes.into_iter().zip(outcomes) {
             results[index].replay_failure = replay_failure;
