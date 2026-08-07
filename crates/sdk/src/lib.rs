@@ -67,6 +67,8 @@ extern crate self as temporalio_sdk;
 pub mod activities;
 pub mod error;
 pub mod interceptors;
+/// Experimental APIs for configuring clients and workers with reusable plugins.
+pub mod plugins;
 /// Runtime configuration and low-level Core worker building blocks.
 ///
 /// These types are grouped here to keep Core-specific configuration separate from the SDK's
@@ -93,10 +95,16 @@ mod workflow_registry;
 mod workflow_wasm;
 pub mod workflows;
 
-pub use crate::error::{
-    ActivityExecutionError, ApplicationFailure, ChildWorkflowExecutionError,
-    ChildWorkflowStartError, OutgoingActivityError, OutgoingError, OutgoingWorkflowError,
-    RetryState, TimeoutType, WorkflowRegistrationError, WorkflowSignalError,
+pub use crate::{
+    error::{
+        ActivityExecutionError, ApplicationFailure, ChildWorkflowExecutionError,
+        ChildWorkflowStartError, OutgoingActivityError, OutgoingError, OutgoingWorkflowError,
+        RetryState, TimeoutType, WorkerCreateError, WorkflowRegistrationError, WorkflowSignalError,
+    },
+    plugins::{
+        ClientAndWorkerPlugin, SimplePlugin, SimplePluginBuilder, SimplePluginOption, WorkerPlugin,
+        WorkflowDefinitions,
+    },
 };
 pub use temporalio_client::Namespace;
 pub use temporalio_sdk_core::CoreRuntime as Runtime;
@@ -106,8 +114,9 @@ pub use temporalio_workflow::{
     ChildWorkflowOptions, ContinueAsNewOptions, ContinueAsNewVersioningBehavior,
     ExternalWorkflowHandle, LocalActivityOptions, MemoValue, NexusOperationCancellationType,
     NexusOperationOptions, ParentClosePolicy, PatchActivationCallback, Signal, SignalData,
-    StartChildWorkflowExecutionFailedCause, StartChildWorkflowOutput, StartedChildWorkflow,
-    StartedNexusOperation, SyncWorkflowContext, TimerOptions, TimerResult, VersioningIntent,
+    SignalWorkflowOptions, StartChildWorkflowExecutionFailedCause, StartChildWorkflowOutput,
+    StartedChildWorkflow, StartedNexusOperation, SyncWorkflowContext, TimerOptions, TimerResult,
+    VersioningIntent, WaitConditionOptions, WorkflowCancellationError, WorkflowCancellationToken,
     WorkflowContext, WorkflowContextView, WorkflowIdReusePolicy, WorkflowRandomValue,
     WorkflowResult, WorkflowTermination,
 };
@@ -123,7 +132,6 @@ use crate::{
     workflow_executor::{TaskHandle, WorkflowExecutor},
     workflow_future::start_workflow,
     workflow_interceptors::WorkflowInterceptorConstructor,
-    workflow_registry::WorkflowDefinitions,
 };
 use anyhow::{Context, anyhow, bail};
 use futures_util::{FutureExt, StreamExt, TryFutureExt, TryStreamExt};
@@ -152,6 +160,7 @@ use temporalio_common::{
         },
         temporal::api::{
             common::v1::Payload, enums::v1::WorkflowTaskFailedCause, failure::v1::Failure,
+            worker::v1::PluginInfo,
         },
     },
     worker::{WorkerDeploymentOptions, WorkerTaskTypes, build_id_from_current_exe},
@@ -189,7 +198,19 @@ pub struct WorkerOptions {
     workflows: WorkflowDefinitions,
 
     #[builder(field)]
+    worker_interceptors: Vec<Arc<dyn WorkerInterceptor>>,
+
+    #[builder(field)]
+    activity_inbound_interceptors: Vec<Arc<dyn ActivityInboundInterceptor>>,
+
+    #[builder(field)]
     workflow_interceptor_constructors: Vec<WorkflowInterceptorConstructor>,
+
+    #[builder(field)]
+    worker_plugins: Vec<Arc<dyn WorkerPlugin>>,
+
+    #[builder(field)]
+    client_plugin_names: HashSet<String>,
 
     #[cfg(feature = "wasm-workflows")]
     #[builder(field)]
@@ -309,6 +330,37 @@ pub struct WorkerOptions {
 }
 
 impl<S: worker_options_builder::State> WorkerOptionsBuilder<S> {
+    /// Register a worker plugin.
+    ///
+    /// **Experimental:** This API may change or be removed.
+    pub fn worker_plugin<P: WorkerPlugin>(mut self, plugin: P) -> Self {
+        self.worker_plugins.push(Arc::new(plugin));
+        self
+    }
+
+    /// Append a worker interceptor. Interceptors run in registration order.
+    pub fn worker_interceptor<I: WorkerInterceptor + 'static>(mut self, interceptor: I) -> Self {
+        self.worker_interceptors.push(Arc::new(interceptor));
+        self
+    }
+
+    /// Append an activity inbound interceptor. Interceptors run outermost-first in registration
+    /// order.
+    pub fn activity_inbound_interceptor<I: ActivityInboundInterceptor>(
+        mut self,
+        interceptor: I,
+    ) -> Self {
+        self.activity_inbound_interceptors
+            .push(Arc::new(interceptor));
+        self
+    }
+
+    /// Append a workflow interceptor constructor.
+    pub fn workflow_interceptor(mut self, constructor: WorkflowInterceptorConstructor) -> Self {
+        self.workflow_interceptor_constructors.push(constructor);
+        self
+    }
+
     /// Registers all activities on an activity implementer.
     pub fn register_activities<AI: ActivityImplementer>(mut self, instance: AI) -> Self {
         self.activities.register_activities::<AI>(instance);
@@ -398,6 +450,35 @@ fn def_build_id() -> WorkerDeploymentOptions {
 }
 
 impl WorkerOptions {
+    /// Append a worker interceptor. Interceptors run in registration order.
+    pub fn worker_interceptor<I: WorkerInterceptor + 'static>(
+        &mut self,
+        interceptor: I,
+    ) -> &mut Self {
+        self.worker_interceptors.push(Arc::new(interceptor));
+        self
+    }
+
+    /// Append an activity inbound interceptor. Interceptors run outermost-first in registration
+    /// order.
+    pub fn activity_inbound_interceptor<I: ActivityInboundInterceptor>(
+        &mut self,
+        interceptor: I,
+    ) -> &mut Self {
+        self.activity_inbound_interceptors
+            .push(Arc::new(interceptor));
+        self
+    }
+
+    /// Append a workflow interceptor constructor.
+    pub fn workflow_interceptor(
+        &mut self,
+        constructor: WorkflowInterceptorConstructor,
+    ) -> &mut Self {
+        self.workflow_interceptor_constructors.push(constructor);
+        self
+    }
+
     /// Registers all activities on an activity implementer.
     pub fn register_activities<AI: ActivityImplementer>(&mut self, instance: AI) -> &mut Self {
         self.activities.register_activities::<AI>(instance);
@@ -507,6 +588,19 @@ impl WorkerOptions {
             ))
             .workflow_failure_errors(self.workflow_failure_errors.clone())
             .workflow_types_to_failure_errors(self.workflow_types_to_failure_errors.clone())
+            .plugins(
+                self.client_plugin_names
+                    .iter()
+                    .map(|name| PluginInfo {
+                        name: name.clone(),
+                        version: String::new(),
+                    })
+                    .chain(self.worker_plugins.iter().map(|registration| PluginInfo {
+                        name: registration.name().to_owned(),
+                        version: String::new(),
+                    }))
+                    .collect(),
+            )
             .disable_payload_error_limit(self.disable_payload_error_limit)
             .build()
     }
@@ -515,30 +609,39 @@ impl WorkerOptions {
 /// A worker that can poll for and respond to workflow tasks by using
 /// [temporalio_macros::workflow], and activity tasks by using activities defined with
 /// [temporalio_macros::activities].
+#[derive(Debug)]
 pub struct Worker {
     common: CommonWorker,
     workflow_half: WorkflowHalf,
     activity_half: ActivityHalf,
 }
 
+#[derive(derive_more::Debug)]
 struct CommonWorker {
+    #[debug(skip)]
     worker: Arc<CoreWorker>,
     task_queue: String,
-    worker_interceptor: Option<Box<dyn WorkerInterceptor>>,
+    #[debug(skip)]
+    worker_interceptors: Vec<Arc<dyn WorkerInterceptor>>,
+    #[debug(skip)]
     activity_inbound_interceptors: Vec<Arc<dyn ActivityInboundInterceptor>>,
+    #[debug(skip)]
     workflow_interceptor_constructors: Vec<WorkflowInterceptorConstructor>,
     client_options: ClientOptions,
     data_converter: DataConverter,
 }
 
+#[derive(derive_more::Debug)]
 struct WorkflowHalf {
     /// Maps run id to cached workflow state
     workflows: RefCell<HashMap<String, WorkflowData>>,
     workflow_definitions: WorkflowDefinitions,
     workflow_removed_from_map: Notify,
     detect_nondeterministic_futures: bool,
+    #[debug(skip)]
     patch_activation_callback: Option<PatchActivationCallback>,
 }
+#[derive(Debug)]
 struct WorkflowData {
     /// Channel used to send the workflow activations
     activation_chan: UnboundedSender<WorkflowActivation>,
@@ -549,7 +652,7 @@ struct WorkflowFutureHandle<F: Future> {
     run_id: String,
 }
 
-#[derive(Default)]
+#[derive(Debug, Default)]
 struct ActivityHalf {
     /// Maps activity type to the function for executing activities of that type
     activities: ActivityDefinitions,
@@ -642,13 +745,15 @@ impl Worker {
     pub fn new(
         runtime: &Runtime,
         client: Client,
-        options: WorkerOptions,
-    ) -> Result<Self, Box<dyn std::error::Error>> {
+        mut options: WorkerOptions,
+    ) -> Result<Self, WorkerCreateError> {
+        plugins::apply_worker_plugins(client.options(), &mut options)?;
         let wc = options
             .to_core_options(client.namespace(), client.identity())
-            .map_err(|s| anyhow::anyhow!("{s}"))?;
-        let core = init_worker(runtime, wc, client.connection().clone())?;
-        Self::new_from_core_options(Arc::new(core), client.options().clone(), options)
+            .map_err(|error| WorkerCreateError::Initialization(anyhow!(error)))?;
+        let core = init_worker(runtime, wc, client.connection().clone())
+            .map_err(WorkerCreateError::Initialization)?;
+        Self::new_from_core_options_prepared(Arc::new(core), client.options().clone(), options)
     }
 
     // TODO [rust-sdk-branch]: Eliminate this constructor in favor of passing in fake connection
@@ -663,6 +768,8 @@ impl Worker {
             Default::default(),
             Default::default(),
             Default::default(),
+            Default::default(),
+            Default::default(),
         )
     }
 
@@ -672,9 +779,21 @@ impl Worker {
         worker: Arc<CoreWorker>,
         client_options: ClientOptions,
         mut options: WorkerOptions,
-    ) -> Result<Self, Box<dyn std::error::Error>> {
+    ) -> Result<Self, WorkerCreateError> {
+        plugins::apply_worker_plugins(&client_options, &mut options)?;
+        Self::new_from_core_options_prepared(worker, client_options, options)
+    }
+
+    fn new_from_core_options_prepared(
+        worker: Arc<CoreWorker>,
+        client_options: ClientOptions,
+        mut options: WorkerOptions,
+    ) -> Result<Self, WorkerCreateError> {
         let acts = std::mem::take(&mut options.activities);
         let wfs = std::mem::take(&mut options.workflows);
+        let worker_interceptors = std::mem::take(&mut options.worker_interceptors);
+        let activity_inbound_interceptors =
+            std::mem::take(&mut options.activity_inbound_interceptors);
         let workflow_interceptor_constructors =
             std::mem::take(&mut options.workflow_interceptor_constructors);
         #[cfg(feature = "wasm-workflows")]
@@ -684,6 +803,8 @@ impl Worker {
             client_options,
             acts,
             wfs,
+            worker_interceptors,
+            activity_inbound_interceptors,
             workflow_interceptor_constructors,
         );
         me.set_detect_nondeterministic_futures(options.detect_nondeterministic_futures);
@@ -694,7 +815,8 @@ impl Worker {
             .register_wasm_workflows(
                 wasm_components,
                 !me.common.workflow_interceptor_constructors.is_empty(),
-            )?;
+            )
+            .map_err(|error| WorkerCreateError::Initialization(anyhow!(error)))?;
         Ok(me)
     }
 
@@ -703,6 +825,8 @@ impl Worker {
         client_options: ClientOptions,
         activities: ActivityDefinitions,
         workflows: WorkflowDefinitions,
+        worker_interceptors: Vec<Arc<dyn WorkerInterceptor>>,
+        activity_inbound_interceptors: Vec<Arc<dyn ActivityInboundInterceptor>>,
         workflow_interceptor_constructors: Vec<WorkflowInterceptorConstructor>,
     ) -> Self {
         let data_converter = client_options.data_converter.clone();
@@ -710,8 +834,8 @@ impl Worker {
             common: CommonWorker {
                 task_queue: worker.get_config().task_queue.clone(),
                 worker,
-                worker_interceptor: None,
-                activity_inbound_interceptors: Vec::new(),
+                worker_interceptors,
+                activity_inbound_interceptors,
                 workflow_interceptor_constructors,
                 client_options,
                 data_converter,
@@ -852,7 +976,7 @@ impl Worker {
                 .map(Ok)
                 .try_for_each_concurrent(None, |mut completion| async {
                     encode_workflow_completion(&mut completion, &common.data_converter).await;
-                    if let Some(ref i) = common.worker_interceptor {
+                    for i in &common.worker_interceptors {
                         i.on_workflow_activation_completion(&completion).await;
                     }
                     common.worker.complete_workflow_activation(completion).await
@@ -899,7 +1023,7 @@ impl Worker {
                                     .expect("Completion channel intact");
                                 continue;
                             }
-                            if let Some(ref i) = common.worker_interceptor {
+                            for i in &common.worker_interceptors {
                                 i.on_workflow_activation(&activation).await?;
                             }
                             if let Some(wf_fut) = wf_half
@@ -1009,38 +1133,11 @@ impl Worker {
             wf_completion_processor,
         )?;
 
-        if let Some(i) = self.common.worker_interceptor.as_ref() {
+        for i in &self.common.worker_interceptors {
             i.on_shutdown(self);
         }
         self.common.worker.shutdown().await;
         Ok(())
-    }
-
-    /// Set a [WorkerInterceptor]
-    pub fn set_worker_interceptor(&mut self, interceptor: impl WorkerInterceptor + 'static) {
-        self.common.worker_interceptor = Some(Box::new(interceptor));
-    }
-
-    /// Append an [ActivityInboundInterceptor] to the chain. Interceptors run in the order they
-    /// are added, outer-most first.
-    pub fn add_activity_inbound_interceptor(
-        &mut self,
-        interceptor: impl ActivityInboundInterceptor,
-    ) {
-        self.common
-            .activity_inbound_interceptors
-            .push(Arc::new(interceptor));
-    }
-
-    /// Set the ordered constructors used to create workflow interceptors for each workflow instance.
-    ///
-    /// This replaces any previously configured constructors. Existing workflow instances retain
-    /// their current interceptors; the new constructors apply when later instances are created.
-    pub fn register_workflow_interceptors(
-        &mut self,
-        constructors: Vec<WorkflowInterceptorConstructor>,
-    ) {
-        self.common.workflow_interceptor_constructors = constructors;
     }
 
     /// Turns this rust worker into a new worker with all the same workflows and activities
@@ -1587,11 +1684,47 @@ mod tests {
         }
     }
 
+    #[workflow]
+    #[derive(Default)]
+    struct OtherWorkflow;
+
+    #[workflow_methods]
+    impl OtherWorkflow {
+        #[run]
+        async fn run(_ctx: &mut WorkflowContext<Self>) -> WorkflowResult<()> {
+            Ok(())
+        }
+    }
+
     #[test]
     fn test_workflow_registration() {
         let _ = WorkerOptions::new("task_q")
             .register_workflow::<MyWorkflow>()
             .unwrap();
+    }
+
+    #[test]
+    fn simple_plugin_workflow_function_merges_definitions() {
+        let plugin = SimplePlugin::builder("simple")
+            .workflows(|existing: Option<WorkflowDefinitions>| {
+                assert!(existing.is_some());
+                let mut workflows = WorkflowDefinitions::new();
+                workflows.register_workflow::<OtherWorkflow>().unwrap();
+                workflows
+            })
+            .build();
+        let client_options = ClientOptions::new("namespace").build();
+        let mut worker_options = WorkerOptions::new("task_q")
+            .register_workflow::<MyWorkflow>()
+            .unwrap()
+            .worker_plugin(plugin)
+            .build();
+
+        crate::plugins::apply_worker_plugins(&client_options, &mut worker_options).unwrap();
+
+        let workflows = format!("{:?}", worker_options.workflows());
+        assert!(workflows.contains("MyWorkflow"));
+        assert!(workflows.contains("OtherWorkflow"));
     }
 
     #[test]

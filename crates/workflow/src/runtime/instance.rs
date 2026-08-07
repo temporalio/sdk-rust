@@ -767,6 +767,10 @@ where
                 panic!("workflow instances must not explicitly return eviction")
             }
             Err(WorkflowTermination::Failed(err)) => {
+                if self.base_ctx.cancellation_token().is_cancelled() && err.as_cancelled().is_some()
+                {
+                    return crate::runtime::types::TerminalOutcome::Cancelled;
+                }
                 let failure = self.base_ctx.data_converter().to_failure(
                     &SerializationContextData::Workflow,
                     temporalio_common_wasm::error::OutgoingError::Workflow(err),

@@ -1,5 +1,6 @@
 use crate::{
-    ClientInterceptor, HttpConnectProxyOptions, RetryOptions, RpcOptions, VERSION, callback_based,
+    ClientInterceptor, ClientPlugin, ErasedClientPlugin, HttpConnectProxyOptions, RetryOptions,
+    RpcOptions, VERSION, callback_based,
 };
 use http::Uri;
 use std::{collections::HashMap, sync::Arc, time::Duration};
@@ -147,6 +148,15 @@ pub struct ClientOptions {
     /// The namespace this client will be bound to.
     #[builder(start_fn)]
     pub namespace: String,
+
+    #[builder(field)]
+    #[debug(skip)]
+    plugins: Vec<ErasedClientPlugin>,
+
+    #[builder(field)]
+    #[debug(skip)]
+    client_plugins_applied: bool,
+
     /// The data converter used for serializing/deserializing payloads.
     #[builder(default)]
     pub data_converter: DataConverter,
@@ -154,6 +164,55 @@ pub struct ClientOptions {
     #[builder(default)]
     #[debug(skip)]
     pub client_interceptors: Vec<Arc<dyn ClientInterceptor>>,
+}
+
+impl<S: client_options_builder::State> ClientOptionsBuilder<S> {
+    /// Register a type-erased client plugin.
+    ///
+    /// **Experimental:** This API may change or be removed.
+    pub fn plugin<P: Into<ErasedClientPlugin>>(mut self, plugin: P) -> Self {
+        self.plugins.push(plugin.into());
+        self
+    }
+
+    /// Register type-erased client plugins in iteration order.
+    ///
+    /// **Experimental:** This API may change or be removed.
+    pub fn plugins<I, P>(mut self, plugins: I) -> Self
+    where
+        I: IntoIterator<Item = P>,
+        P: Into<ErasedClientPlugin>,
+    {
+        self.plugins.extend(plugins.into_iter().map(Into::into));
+        self
+    }
+
+    /// Register a client-only plugin.
+    ///
+    /// **Experimental:** This API may change or be removed.
+    pub fn client_plugin<P: ClientPlugin>(mut self, plugin: P) -> Self {
+        self.plugins.push(ErasedClientPlugin::new(plugin));
+        self
+    }
+}
+
+impl ClientOptions {
+    /// Return the registered plugins.
+    ///
+    /// This is intended for SDK integrations that propagate worker plugin registrations.
+    ///
+    /// **Experimental:** This API may change or be removed.
+    pub fn plugins(&self) -> &[ErasedClientPlugin] {
+        &self.plugins
+    }
+
+    pub(crate) fn client_plugins_applied(&self) -> bool {
+        self.client_plugins_applied
+    }
+
+    pub(crate) fn mark_client_plugins_applied(&mut self) {
+        self.client_plugins_applied = true;
+    }
 }
 
 /// Selects the transport-level compression used for gRPC calls. See

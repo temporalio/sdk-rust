@@ -59,12 +59,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let client = Client::new(connection, client_opts)?;
 
     let worker_options = WorkerOptions::new("activity-interceptor")
+        .activity_inbound_interceptor(LoggingActivityInterceptor)
         .register_workflow::<ActivityInterceptorWorkflow>()?
         .register_activities(GreetingActivities)
         .build();
 
     let mut worker = Worker::new(&runtime, client, worker_options)?;
-    worker.add_activity_inbound_interceptor(LoggingActivityInterceptor);
     println!("Worker started on task queue: activity-interceptor");
     worker.run().await?;
 

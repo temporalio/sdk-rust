@@ -77,6 +77,17 @@ to docs, or any other relevant information.
   `LocalActivityOptions::builder()` to construct local activity options.
 * `NexusOperationOptions` is now tagged with `#[non_exhaustive]`. Use
   `NexusOperationOptions::builder()` to construct Nexus operation options.
+* `WorkflowContext::wait_condition` now returns `Result<(), WorkflowCancellationError>` instead of
+  `()` so that workflow cancellation can be propagated to the caller.
+
+### Added
+* `WorkflowCancellationToken` for deterministic cancellation of workflow operations.
+* `WorkflowContext::wait_condition_with_options` and `WaitConditionOptions` for waiting with a
+  custom cancellation token.
+
+### Changed
+* Cancellation errors propagated after workflow cancellation now complete the workflow as cancelled
+  instead of failed.
 
 ## [0.6.0] - 2026-08-04
 
@@ -93,6 +104,9 @@ to docs, or any other relevant information.
   runtime and worker configuration types under `temporalio_sdk::runtime`, so workers no
   longer need a direct `temporalio-sdk-core` dependency. `Url` is also re-exported from
   `temporalio_client`.
+* Experimental plugin APIs for packaging reusable client and worker configuration, including data
+  converters, interceptors, activities, workflows, and automatic propagation from clients to
+  workers.
 * Workers can configure the maximum number of activity slots reserved for eager execution per
   workflow task with `WorkerOptions::max_eager_activity_reservations_per_workflow_task`.
 * `WorkflowInterceptor` for observing, transforming, or short-circuiting inbound workflow calls

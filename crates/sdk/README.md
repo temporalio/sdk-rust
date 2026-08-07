@@ -147,7 +147,8 @@ impl MyWorkflow {
     #[run]
     async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<Vec<u32>> {
         // Wait until we have at least 3 values
-        ctx.wait_condition(|s| s.values.len() >= 3).await;
+        ctx.wait_condition(|s| s.values.len() >= 3)
+            .await?;
         Ok(ctx.state(|s| s.values.clone()))
     }
 
@@ -307,21 +308,29 @@ ctx.execute_local_activity(
 
 ## Cancellation
 
-Workflows and activities support cancellation. Activity cancellation may be delivered independently
-from heartbeating, though long-running activities may still wish to heartbeat with
-`ctx.record_heartbeat(...)` to report progress.
+Workflow operations inherit the workflow's root cancellation token by default. This includes
+timers, activities, local activities, child workflows, signals, Nexus operations, and wait
+conditions. Long-running activities should heartbeat with `ctx.record_heartbeat(...)` to ensure they
+receive cancellation notifications and report progress.
 
 ```rust
-use temporalio_sdk::workflows::select;
+// Condition waits inherit workflow cancellation.
+ctx.wait_condition(|state| state.ready).await?;
 
-// In a workflow: wait for cancellation
-let reason = ctx.cancelled().await;
+// A child token cancels a related group of operations together.
+let group = ctx.cancellation_token().child_token();
+let timer = ctx.timer(TimerOptions {
+    duration: Duration::from_secs(60),
+    cancellation_token: Some(group.clone()),
+    ..Default::default()
+});
+group.cancel_with_reason("no longer needed");
 
-// Race a timer against cancellation
-select! {
-    _ = ctx.timer(Duration::from_secs(60)) => { /* timer fired */ }
-    reason = ctx.cancelled() => { /* workflow cancelled */ }
-}
+// A newly-created token is detached, which is useful for cleanup after workflow cancellation.
+let cleanup_token = WorkflowCancellationToken::new();
+let mut cleanup_options = ActivityOptions::start_to_close_timeout(Duration::from_secs(10));
+cleanup_options.cancellation_token = Some(cleanup_token);
+ctx.execute_activity(MyActivities::cleanup, (), cleanup_options).await?;
 ```
 
 ## Worker Configuration

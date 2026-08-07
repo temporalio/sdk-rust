@@ -14,6 +14,7 @@ pub mod __private {
     pub use futures_util;
 }
 
+mod cancellation;
 #[doc(hidden)]
 pub mod component;
 #[doc(hidden)]
@@ -22,6 +23,7 @@ mod workflow_context;
 pub mod workflow_interceptors;
 pub mod workflows;
 
+pub use cancellation::{WorkflowCancellationError, WorkflowCancellationToken};
 #[doc(hidden)]
 pub use runtime::model::{CancellableID, UnblockEvent};
 pub use runtime::model::{TimerResult, WorkflowResult, WorkflowTermination};
@@ -40,9 +42,10 @@ pub use workflow_context::{
     ChildWorkflowOptions, ContinueAsNewOptions, ContinueAsNewVersioningBehavior,
     ExternalWorkflowHandle, LocalActivityOptions, NamespacedWorkflowInfo,
     NexusOperationCancellationType, NexusOperationOptions, ParentClosePolicy, Signal, SignalData,
-    StartChildWorkflowExecutionFailedCause, StartChildWorkflowOutput, StartedChildWorkflow,
-    StartedNexusOperation, SyncWorkflowContext, TimerOptions, VersioningIntent, WorkflowContext,
-    WorkflowContextView, WorkflowIdReusePolicy, WorkflowRandomValue,
+    SignalWorkflowOptions, StartChildWorkflowExecutionFailedCause, StartChildWorkflowOutput,
+    StartedChildWorkflow, StartedNexusOperation, SyncWorkflowContext, TimerOptions,
+    VersioningIntent, WaitConditionOptions, WorkflowContext, WorkflowContextView,
+    WorkflowIdReusePolicy, WorkflowRandomValue,
 };
 #[doc(hidden)]
 pub use workflow_context::{PatchActivationCallback, PatchActivationCaller};

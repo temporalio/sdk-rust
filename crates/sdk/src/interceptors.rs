@@ -50,8 +50,9 @@ mod activity_execution_value {
 /// Implementors can intercept certain actions that happen within the Worker.
 ///
 /// Advanced usage only.
+/// **Experimental:** This API may change or be removed.
 #[async_trait::async_trait(?Send)]
-pub trait WorkerInterceptor {
+pub trait WorkerInterceptor: Send + Sync {
     /// Called every time a workflow activation completes (just before sending the completion to
     /// core).
     async fn on_workflow_activation_completion(&self, _completion: &WorkflowActivationCompletion) {}

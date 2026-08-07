@@ -164,6 +164,7 @@ pub(crate) async fn create_balanced_channel(
 }
 
 /// Handle that aborts the DNS re-resolution task when dropped.
+#[derive(Debug)]
 pub(crate) struct DnsReresolutionHandle {
     abort_handle: tokio::task::AbortHandle,
 }

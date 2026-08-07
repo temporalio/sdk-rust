@@ -1,7 +1,8 @@
 use crate::{
     common::{
-        ActivationAssertionsInterceptor, build_fake_sdk, history_from_proto_binary,
-        init_core_replay_preloaded, replay_sdk_worker, replay_sdk_worker_stream,
+        ActivationAssertionsInterceptor, build_fake_sdk_intercepted, history_from_proto_binary,
+        init_core_replay_preloaded, replay_sdk_worker, replay_sdk_worker_intercepted,
+        replay_sdk_worker_stream_intercepted,
     },
     integ_tests::workflow_tests::patches::ChangesWf,
 };
@@ -62,7 +63,12 @@ impl TimersWf {
 fn fire_happy_hist(num_timers: u32) -> Worker {
     let mut t = canned_histories::long_sequential_timers(num_timers as usize);
     t.set_wf_input(num_timers.as_json_payload().unwrap());
-    let mut worker = build_fake_sdk(MockPollCfg::from_resps(t, [ResponseType::AllHistory]));
+    let mut aai = ActivationAssertionsInterceptor::default();
+    for _ in 1..=num_timers + 1 {
+        aai.then(|activation| assert!(activation.is_replaying));
+    }
+    let mut worker =
+        build_fake_sdk_intercepted(MockPollCfg::from_resps(t, [ResponseType::AllHistory]), aai);
     worker.register_workflow::<TimersWf>().unwrap();
     worker
 }
@@ -71,17 +77,10 @@ fn fire_happy_hist(num_timers: u32) -> Worker {
 #[case::one_timer(fire_happy_hist(1), 1)]
 #[case::five_timers(fire_happy_hist(5), 5)]
 #[tokio::test]
-async fn replay_flag_is_correct(#[case] mut worker: Worker, #[case] num_timers: usize) {
+async fn replay_flag_is_correct(#[case] mut worker: Worker, #[case] _num_timers: usize) {
     // Verify replay flag is correct by constructing a workflow manager that already has a complete
     // history fed into it. It should always be replaying, because history is complete.
 
-    let mut aai = ActivationAssertionsInterceptor::default();
-
-    for _ in 1..=num_timers + 1 {
-        aai.then(|a| assert!(a.is_replaying));
-    }
-
-    worker.set_worker_interceptor(aai);
     worker.run().await.unwrap();
 }
 
@@ -89,13 +88,10 @@ async fn replay_flag_is_correct(#[case] mut worker: Worker, #[case] num_timers: 
 async fn replay_flag_is_correct_partial_history() {
     let mut t = canned_histories::long_sequential_timers(2);
     t.set_wf_input(1u32.as_json_payload().unwrap());
-    let mut worker = build_fake_sdk(MockPollCfg::from_resps(t, [1]));
-    worker.register_workflow::<TimersWf>().unwrap();
-
     let mut aai = ActivationAssertionsInterceptor::default();
     aai.then(|a| assert!(!a.is_replaying));
-
-    worker.set_worker_interceptor(aai);
+    let mut worker = build_fake_sdk_intercepted(MockPollCfg::from_resps(t, [1]), aai);
+    worker.register_workflow::<TimersWf>().unwrap();
     worker.run().await.unwrap();
 }
 
@@ -246,11 +242,10 @@ async fn replay_ok_ending_with_timed_out() {
 async fn replay_shutdown_worker() {
     let mut t = canned_histories::single_timer("1");
     t.set_wf_input(1u32.as_json_payload().unwrap());
-    let mut worker = replay_sdk_worker([test_hist_to_replay(t)]);
-    worker.register_workflow::<TimersWf>().unwrap();
     let shutdown_ctr_i = UniqueShutdownWorker::default();
     let shutdown_ctr = shutdown_ctr_i.runs.clone();
-    worker.set_worker_interceptor(shutdown_ctr_i);
+    let mut worker = replay_sdk_worker_intercepted([test_hist_to_replay(t)], shutdown_ctr_i);
+    worker.register_workflow::<TimersWf>().unwrap();
     worker.run().await.unwrap();
     assert_eq!(shutdown_ctr.lock().len(), 1);
 }
@@ -310,17 +305,19 @@ async fn multiple_histories_replay(#[values(false, true)] use_feeder: bool) {
     seq_timer_hist.set_wf_type("seqtimer");
     seq_timer_hist.set_wf_input(num_timers.as_json_payload().unwrap());
     let (feeder, stream) = HistoryFeeder::new(1);
-    let mut worker = if use_feeder {
-        replay_sdk_worker_stream(stream)
-    } else {
-        replay_sdk_worker([
-            test_hist_to_replay(one_timer_hist.clone()),
-            test_hist_to_replay(seq_timer_hist.clone()),
-        ])
-    };
     let runs_ctr_i = UniqueRunsCounter::default();
     let runs_ctr = runs_ctr_i.runs.clone();
-    worker.set_worker_interceptor(runs_ctr_i);
+    let mut worker = if use_feeder {
+        replay_sdk_worker_stream_intercepted(stream, runs_ctr_i)
+    } else {
+        replay_sdk_worker_intercepted(
+            [
+                test_hist_to_replay(one_timer_hist.clone()),
+                test_hist_to_replay(seq_timer_hist.clone()),
+            ],
+            runs_ctr_i,
+        )
+    };
     worker.register_workflow::<OneTimerWf>().unwrap();
     worker.register_workflow::<SeqTimerWf>().unwrap();
 

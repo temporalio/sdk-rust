@@ -19,6 +19,8 @@ pub mod grpc;
 pub mod interceptors;
 mod metrics;
 mod options_structs;
+/// Experimental APIs for configuring clients with reusable plugins.
+pub mod plugins;
 /// Visible only for tests
 #[doc(hidden)]
 pub mod proxy;
@@ -60,6 +62,9 @@ pub use interceptors::{
 };
 pub use metrics::{LONG_REQUEST_LATENCY_HISTOGRAM_NAME, REQUEST_LATENCY_HISTOGRAM_NAME};
 pub use options_structs::*;
+pub use plugins::{
+    ClientPlugin, ErasedClientPlugin, PluginApplyError, PluginError, PluginTarget, WorkerPluginData,
+};
 pub use replaceable::SharedReplaceableClient;
 pub use retry::RetryOptions;
 pub use rpc_options::{RpcMetadata, RpcMetadataError, RpcOptions};
@@ -176,13 +181,14 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 ///
 /// Cloning a connection is cheap (single Arc increment). The underlying connection is shared
 /// between clones.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct Connection {
     inner: Arc<ConnectionInner>,
 }
 
-#[derive(Clone)]
+#[derive(Clone, derive_more::Debug)]
 struct ConnectionInner {
+    #[debug(skip)]
     service: TemporalServiceClient,
     retry_options: RetryOptions,
     identity: String,
@@ -757,18 +763,30 @@ impl TemporalServiceClient {
 
 /// Contains an instance of a namespace-bound client for interacting with the Temporal server.
 /// Cheap to clone.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct Client {
     connection: Connection,
     options: Arc<ClientOptions>,
 }
 
 impl Client {
+    /// Connect to a Temporal service and create a namespace-bound client, applying registered
+    /// plugins to connection and client options in registration order.
+    pub async fn connect(
+        mut connection_options: ConnectionOptions,
+        client_options: ClientOptions,
+    ) -> Result<Self, ClientConnectError> {
+        plugins::apply_connection_plugins(&client_options, &mut connection_options)?;
+        let connection = Connection::connect(connection_options).await?;
+        Ok(Self::new(connection, client_options)?)
+    }
+
     /// Create a new client from a connection and options.
     ///
-    /// Currently infallible, but returns a `Result` for future extensibility
-    /// (e.g., interceptor or plugin validation).
-    pub fn new(connection: Connection, options: ClientOptions) -> Result<Self, ClientNewError> {
+    /// Registered client plugins are applied here. Connection plugin hooks only run when using
+    /// [`Client::connect`].
+    pub fn new(connection: Connection, mut options: ClientOptions) -> Result<Self, ClientNewError> {
+        plugins::apply_client_plugins(&mut options)?;
         Ok(Client {
             connection,
             options: Arc::new(options),
