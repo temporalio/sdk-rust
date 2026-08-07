@@ -79,6 +79,10 @@ to docs, or any other relevant information.
 * Cancellation errors propagated after workflow cancellation now complete the workflow as cancelled
   instead of failed.
 
+### Fixed
+* Panics from update validators now reject the update instead of repeatedly failing workflow
+  tasks.
+
 ## [0.6.0] - 2026-08-04
 
 ### Added
