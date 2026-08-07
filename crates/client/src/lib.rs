@@ -314,7 +314,6 @@ impl Connection {
                 TlsConfigResult::Standard(ep) => ep,
             };
 
-
             let channel = if let Some(keep_alive) = options.keep_alive.as_ref() {
                 channel
                     .keep_alive_while_idle(true)
@@ -2487,7 +2486,6 @@ mod tests {
                 assert!(tls_opts.server_cert_verifier.is_none());
             }
 
-
             #[tokio::test]
             async fn add_tls_resolver_with_ip_host_uses_ip_as_domain() {
                 // When no explicit domain is set, the host from the URI is used for SNI.
@@ -2510,8 +2508,6 @@ mod tests {
                     ),
                 }
             }
-
-
         }
     }
 
