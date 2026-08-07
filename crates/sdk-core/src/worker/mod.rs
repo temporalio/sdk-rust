@@ -2424,6 +2424,7 @@ impl WorkerHeartbeatManager {
             worker_heartbeat
         });
         let heartbeat_success_callback: HeartbeatSuccessCallback = Arc::new(move || {
+            // Take the env info because we only care about sending it one time
             environment_info.lock().take();
         });
 

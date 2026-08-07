@@ -43,6 +43,9 @@ pub(crate) fn detect(runtimes: Vec<Runtime>) -> EnvironmentInfo {
 fn detect_hosting_environments() -> Vec<HostingEnvironment> {
     let mut environments = Vec::new();
 
+    // Note it is intentional that some environments may be detected simultaneously.
+    // EX: AzureFunctions inside AzureAppService or Docker inside Kubernetes.
+
     if is_docker() {
         environments.push(hosting_environment(HostingEnvironmentType::Docker, None));
     }
