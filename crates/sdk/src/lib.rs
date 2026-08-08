@@ -636,14 +636,6 @@ struct WorkflowFutureHandle<F: Future> {
     run_id: String,
 }
 
-#[derive(Debug, thiserror::Error)]
-enum WorkflowFutureError {
-    #[error("workflow task was dropped")]
-    TaskDropped(#[from] TaskDroppedError),
-    #[error("workflow execution failed")]
-    WorkflowFailed(#[source] WorkflowTermination),
-}
-
 #[derive(Debug, Default)]
 struct ActivityHalf {
     /// Maps activity type to the function for executing activities of that type
@@ -940,7 +932,7 @@ impl Worker {
 
         let wf_future_joiner = async {
             UnboundedReceiverStream::new(wf_future_rx)
-                .map(Result::<_, WorkflowFutureError>::Ok)
+                .map(Result::<_, WorkerRunError>::Ok)
                 .try_for_each_concurrent(
                     None,
                     |WorkflowFutureHandle {
@@ -949,13 +941,19 @@ impl Worker {
                      }| {
                         let wf_half = &*wf_half;
                         async move {
-                            let result = join_handle.await?;
+                            let result = join_handle.await.map_err(|e| WorkerRunError::Fatal {
+                                message: "workflow task dropped".into(),
+                                source: e.into(),
+                            })?;
                             // Eviction is normal workflow lifecycle - workflows loop waiting for
                             // eviction after completion to manage cache cleanup
                             if let Err(e) = result
                                 && !matches!(e, WorkflowTermination::Evicted)
                             {
-                                return Err(WorkflowFutureError::WorkflowFailed(e));
+                                return Err(WorkerRunError::Fatal {
+                                    message: "workflow execution failed".into(),
+                                    source: e.into(),
+                                });
                             }
                             debug!(run_id=%run_id, "Removing workflow from cache");
                             wf_half.workflows.borrow_mut().remove(&run_id);
