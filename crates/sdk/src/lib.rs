@@ -316,6 +316,44 @@ pub struct WorkerOptions {
 }
 
 impl<S: worker_options_builder::State> WorkerOptionsBuilder<S> {
+    pub(crate) fn with_workflows(mut self, workflows: WorkflowDefinitions) -> Self {
+        self.workflows = workflows;
+        self
+    }
+
+    pub(crate) fn with_worker_interceptors(
+        mut self,
+        worker_interceptors: Vec<Arc<dyn WorkerInterceptor>>,
+    ) -> Self {
+        self.worker_interceptors = worker_interceptors;
+        self
+    }
+
+    pub(crate) fn with_workflow_interceptor_constructors(
+        mut self,
+        workflow_interceptor_constructors: Vec<WorkflowInterceptorConstructor>,
+    ) -> Self {
+        self.workflow_interceptor_constructors = workflow_interceptor_constructors;
+        self
+    }
+
+    pub(crate) fn with_worker_plugins(
+        mut self,
+        worker_plugins: Vec<Arc<dyn WorkerPlugin>>,
+    ) -> Self {
+        self.worker_plugins = worker_plugins;
+        self
+    }
+
+    #[cfg(feature = "wasm-workflows")]
+    pub(crate) fn with_wasm_workflow_components(
+        mut self,
+        wasm_workflow_components: Vec<WasmWorkflowComponent>,
+    ) -> Self {
+        self.wasm_workflow_components = wasm_workflow_components;
+        self
+    }
+
     /// Register a worker plugin.
     ///
     /// **Experimental:** This API may change or be removed.

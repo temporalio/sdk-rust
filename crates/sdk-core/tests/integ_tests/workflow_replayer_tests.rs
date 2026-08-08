@@ -1,4 +1,4 @@
-use crate::common::{CoreWfStarter, TestWorker};
+use crate::common::{CoreWfStarter, TestWorker, eventually};
 use std::{
     sync::{
         Arc,
@@ -171,15 +171,23 @@ async fn workflow_replayer_replays_incomplete_workflow() {
         .unwrap();
 
     let fetch_open_history = async {
-        while !handle
-            .query(
-                SayHelloWorkflow::waiting,
-                (),
-                WorkflowQueryOptions::default(),
-            )
-            .await
-            .unwrap()
-        {}
+        eventually(
+            || async {
+                handle
+                    .query(
+                        SayHelloWorkflow::waiting,
+                        (),
+                        WorkflowQueryOptions::default(),
+                    )
+                    .await
+                    .unwrap()
+                    .then_some(())
+                    .ok_or("workflow is not waiting")
+            },
+            Duration::from_secs(10),
+        )
+        .await
+        .unwrap();
         let history = handle.fetch_history(Default::default()).await.unwrap();
         handle
             .terminate(WorkflowTerminateOptions::default())
@@ -281,20 +289,25 @@ async fn workflow_replayer_replays_history_with_workflow_task_failure() {
         .unwrap();
 
     let fetch_failed_history = async {
-        loop {
-            let history = handle.fetch_history(Default::default()).await.unwrap();
-            if history
-                .events()
-                .iter()
-                .any(|event| event.event_type() == EventType::WorkflowTaskFailed)
-            {
-                handle
-                    .terminate(WorkflowTerminateOptions::default())
-                    .await
-                    .unwrap();
-                break history;
-            }
-        }
+        let history = eventually(
+            || async {
+                let history = handle.fetch_history(Default::default()).await.unwrap();
+                history
+                    .events()
+                    .iter()
+                    .any(|event| event.event_type() == EventType::WorkflowTaskFailed)
+                    .then_some(history)
+                    .ok_or("workflow task failure not yet recorded")
+            },
+            Duration::from_secs(10),
+        )
+        .await
+        .unwrap();
+        handle
+            .terminate(WorkflowTerminateOptions::default())
+            .await
+            .unwrap();
+        history
     };
     let (history, worker_result) = tokio::join!(fetch_failed_history, worker.run_until_done());
     worker_result.unwrap();

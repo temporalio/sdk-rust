@@ -372,25 +372,7 @@ impl WorkflowReplayer {
         let observer = ReplayOutcomeInterceptor {
             outcomes: recorded_outcomes.clone(),
         };
-        let mut worker_options = WorkerOptions::new(self.options.task_queue.clone()).build();
-        worker_options.workflows = self.options.workflows.clone();
-        worker_options.worker_interceptors = self.options.worker_interceptors.clone();
-        worker_options
-            .worker_interceptors
-            .insert(0, Arc::new(observer));
-        worker_options.workflow_interceptor_constructors =
-            self.options.workflow_interceptor_constructors.clone();
-        worker_options.worker_plugins = self.options.worker_plugins.clone();
-        worker_options.workflow_failure_errors = self.options.workflow_failure_errors.clone();
-        worker_options.workflow_types_to_failure_errors =
-            self.options.workflow_types_to_failure_errors.clone();
-        worker_options.detect_nondeterministic_futures =
-            self.options.detect_nondeterministic_futures;
-        worker_options.patch_activation_callback = self.options.patch_activation_callback.clone();
-        #[cfg(feature = "wasm-workflows")]
-        {
-            worker_options.wasm_workflow_components = self.options.wasm_workflow_components.clone();
-        }
+        let worker_options = self.replay_worker_options(observer);
 
         let core_options = worker_options
             .to_core_options(self.options.namespace.clone(), String::new())
@@ -431,6 +413,27 @@ impl WorkflowReplayer {
             results[index].replay_failure = replay_failure;
         }
         Ok(results)
+    }
+
+    fn replay_worker_options(&self, observer: ReplayOutcomeInterceptor) -> WorkerOptions {
+        let worker_interceptors = std::iter::once(Arc::new(observer) as Arc<dyn WorkerInterceptor>)
+            .chain(self.options.worker_interceptors.iter().cloned())
+            .collect();
+        let worker_options = WorkerOptions::new(self.options.task_queue.clone())
+            .with_workflows(self.options.workflows.clone())
+            .with_worker_interceptors(worker_interceptors)
+            .with_workflow_interceptor_constructors(
+                self.options.workflow_interceptor_constructors.clone(),
+            )
+            .with_worker_plugins(self.options.worker_plugins.clone())
+            .workflow_failure_errors(self.options.workflow_failure_errors.clone())
+            .workflow_types_to_failure_errors(self.options.workflow_types_to_failure_errors.clone())
+            .detect_nondeterministic_futures(self.options.detect_nondeterministic_futures)
+            .maybe_patch_activation_callback(self.options.patch_activation_callback.clone());
+        #[cfg(feature = "wasm-workflows")]
+        let worker_options = worker_options
+            .with_wasm_workflow_components(self.options.wasm_workflow_components.clone());
+        worker_options.build()
     }
 }
 

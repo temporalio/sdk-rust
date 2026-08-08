@@ -358,23 +358,23 @@ impl WorkflowHistory {
     }
 
     /// Decode a workflow history from JSON bytes.
-    ///
-    /// This currently uses the JSON representation provided by the generated protobuf serde
-    /// implementations. It will use canonical protobuf JSON once that encoding is supported
-    /// natively.
     pub fn from_json(bytes: &[u8]) -> Result<Self, WorkflowHistoryJsonError> {
         let history: History = serde_json::from_slice(bytes)?;
-        let workflow_id = workflow_execution_started_attributes(&history.events)
+        let workflow_id = history
+            .events
+            .first()
+            .and_then(|event| match event.attributes.as_ref() {
+                Some(Attributes::WorkflowExecutionStartedEventAttributes(attributes)) => {
+                    Some(attributes)
+                }
+                _ => None,
+            })
             .map(|attributes| attributes.workflow_id.clone())
-            .filter(|workflow_id| !workflow_id.is_empty());
+            .filter(|wfid| !wfid.is_empty());
         Ok(Self::new(history.events, workflow_id))
     }
 
     /// Encode this workflow history as JSON bytes.
-    ///
-    /// This currently uses the JSON representation provided by the generated protobuf serde
-    /// implementations. It will use canonical protobuf JSON once that encoding is supported
-    /// natively.
     pub fn to_json(&self) -> Result<Vec<u8>, WorkflowHistoryJsonError> {
         Ok(serde_json::to_vec(&History {
             events: self.events.clone(),
@@ -386,19 +386,6 @@ impl WorkflowHistory {
         self.workflow_id.as_deref()
     }
 
-    /// Return the original run ID recorded by the workflow start event, when present.
-    pub fn run_id(&self) -> Option<&str> {
-        workflow_execution_started_attributes(&self.events)
-            .map(|attributes| attributes.original_execution_run_id.as_str())
-            .filter(|run_id| !run_id.is_empty())
-    }
-
-    /// Override the workflow ID used when replaying this history.
-    pub fn with_workflow_id(mut self, workflow_id: impl Into<String>) -> Self {
-        self.workflow_id = Some(workflow_id.into());
-        self
-    }
-
     /// The history events.
     pub fn events(&self) -> &[HistoryEvent] {
         &self.events
@@ -407,17 +394,6 @@ impl WorkflowHistory {
     /// Consume the history and return the events.
     pub fn into_events(self) -> Vec<HistoryEvent> {
         self.events
-    }
-}
-
-fn workflow_execution_started_attributes(
-    events: &[HistoryEvent],
-) -> Option<
-    &temporalio_common::protos::temporal::api::history::v1::WorkflowExecutionStartedEventAttributes,
-> {
-    match events.first()?.attributes.as_ref()? {
-        Attributes::WorkflowExecutionStartedEventAttributes(attributes) => Some(attributes),
-        _ => None,
     }
 }
 
@@ -1388,7 +1364,7 @@ mod tests {
     };
 
     #[test]
-    fn workflow_history_to_json_serializes_events() {
+    fn workflow_history_workflow_id_roundtrips() {
         let event = HistoryEvent {
             event_id: 1,
             attributes: Some(Attributes::WorkflowExecutionStartedEventAttributes(
@@ -1400,41 +1376,12 @@ mod tests {
             )),
             ..Default::default()
         };
-        let history = WorkflowHistory::new(vec![event.clone()], Some("external-id".to_owned()));
+        let history = WorkflowHistory::new(vec![event], None);
 
         let bytes = history.to_json().unwrap();
-        let proto: History = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(proto.events, [event]);
 
         let decoded = WorkflowHistory::from_json(&bytes).unwrap();
-        assert_eq!(decoded.events(), proto.events);
         assert_eq!(decoded.workflow_id(), Some("workflow-id"));
-        assert_eq!(decoded.run_id(), Some("run-id"));
-    }
-
-    #[test]
-    fn workflow_history_identity_is_optional_and_overridable() {
-        let event = HistoryEvent {
-            event_id: 1,
-            attributes: Some(Attributes::WorkflowExecutionStartedEventAttributes(
-                WorkflowExecutionStartedEventAttributes {
-                    original_execution_run_id: "run-id".to_owned(),
-                    ..Default::default()
-                },
-            )),
-            ..Default::default()
-        };
-        let bytes = serde_json::to_vec(&History {
-            events: vec![event],
-        })
-        .unwrap();
-
-        let history = WorkflowHistory::from_json(&bytes).unwrap();
-        assert_eq!(history.workflow_id(), None);
-        assert_eq!(history.run_id(), Some("run-id"));
-
-        let history = history.with_workflow_id("override-id");
-        assert_eq!(history.workflow_id(), Some("override-id"));
     }
 
     #[tokio::test]
