@@ -113,7 +113,7 @@ use crate::{
         activity_error_to_core_result,
     },
     interceptors::{ActivityInboundInterceptor, WorkerInterceptor},
-    workflow_executor::{TaskDroppedError, TaskHandle, WorkflowExecutor},
+    workflow_executor::{TaskHandle, WorkflowExecutor},
     workflow_future::start_workflow,
     workflow_interceptors::WorkflowInterceptorConstructor,
 };
