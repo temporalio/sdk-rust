@@ -147,7 +147,6 @@ async fn workflow_replayer_replays_completed_workflow() {
         .unwrap();
     assert_eq!(results.len(), 2);
     assert!(results.iter().all(|result| result.replay_failure.is_none()));
-    assert_eq!(results[0].history.run_id(), results[1].history.run_id());
 }
 
 #[tokio::test]

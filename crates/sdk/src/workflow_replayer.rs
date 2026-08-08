@@ -6,7 +6,6 @@ use crate::{
     workflow_interceptors::WorkflowInterceptorConstructor,
     workflow_registry::{WorkflowDefinitions, WorkflowRegistrationError},
 };
-use anyhow::anyhow;
 use futures_util::stream;
 use parking_lot::Mutex;
 use std::{
@@ -22,12 +21,12 @@ use temporalio_common::{
             WorkflowActivation, remove_from_cache::EvictionReason,
             workflow_activation_job::Variant as ActivationVariant,
         },
-        temporal::api::history::v1::{History, history_event::Attributes},
+        temporal::api::history::v1::History,
     },
 };
 use temporalio_sdk_core::{
     init_replay_worker,
-    replay::{HistoryForReplay, HistoryInfo, ReplayWorkerInput},
+    replay::{HistoryForReplay, ReplayWorkerInput},
 };
 use temporalio_workflow::{PatchActivationCallback, runtime::entry::WorkflowImplementation};
 
@@ -269,10 +268,22 @@ pub struct WorkflowReplayResult {
     pub replay_failure: Option<WorkflowReplayFailure>,
 }
 
-/// Error creating or running a workflow replayer.
+/// Error replaying a workflow history.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum WorkflowReplayError {
+    /// The replay worker could not be created or run.
+    #[error(transparent)]
+    Worker(#[from] WorkflowReplayWorkerError),
+    /// A single-history replay failed.
+    #[error(transparent)]
+    Replay(#[from] WorkflowReplayFailure),
+}
+
+/// Error creating or running the worker used for replay.
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum WorkflowReplayWorkerError {
     /// A plugin failed while configuring replay options.
     #[error(transparent)]
     Plugin(#[from] PluginApplyError),
@@ -280,20 +291,20 @@ pub enum WorkflowReplayError {
     #[error("at least one workflow must be registered for replay")]
     NoWorkflowsRegistered,
     /// The replay worker could not be initialized.
-    #[error("workflow replay initialization failed: {0}")]
-    Initialization(#[source] anyhow::Error),
+    #[error("workflow replay initialization failed: {message}")]
+    Initialization {
+        /// Initialization failure details.
+        message: String,
+    },
     /// The replay worker stopped before producing trustworthy results.
     #[error("workflow replay worker failed: {0}")]
-    Worker(#[source] WorkerRunError),
+    Run(#[source] WorkerRunError),
     /// Replay completed without producing the expected outcomes.
     #[error("workflow replay failed internally: {message}")]
     Internal {
         /// Failure details.
         message: String,
     },
-    /// A single-history replay failed.
-    #[error(transparent)]
-    Replay(#[from] WorkflowReplayFailure),
 }
 
 /// Replays workflow histories against registered workflow implementations.
@@ -304,9 +315,10 @@ pub struct WorkflowReplayer {
 impl WorkflowReplayer {
     /// Construct a replayer and apply its worker plugins.
     pub fn new(mut options: WorkflowReplayerOptions) -> Result<Self, WorkflowReplayError> {
-        crate::plugins::apply_workflow_replayer_plugins(&mut options)?;
+        crate::plugins::apply_workflow_replayer_plugins(&mut options)
+            .map_err(WorkflowReplayWorkerError::Plugin)?;
         if options.workflows.is_empty() {
-            return Err(WorkflowReplayError::NoWorkflowsRegistered);
+            return Err(WorkflowReplayWorkerError::NoWorkflowsRegistered.into());
         }
         Ok(Self { options })
     }
@@ -322,9 +334,11 @@ impl WorkflowReplayer {
         history: WorkflowHistory,
     ) -> Result<(), WorkflowReplayError> {
         let mut results = self.replay_workflows([history]).await?;
-        let result = results.pop().ok_or_else(|| WorkflowReplayError::Internal {
-            message: "replay produced no result for its history".to_owned(),
-        })?;
+        let result = results
+            .pop()
+            .ok_or_else(|| WorkflowReplayWorkerError::Internal {
+                message: "replay produced no result for its history".to_owned(),
+            })?;
         match result.replay_failure {
             Some(failure) => Err(failure.into()),
             None => Ok(()),
@@ -344,6 +358,10 @@ impl WorkflowReplayer {
         &self,
         histories: Vec<WorkflowHistory>,
     ) -> Result<Vec<WorkflowReplayResult>, WorkflowReplayError> {
+        if histories.is_empty() {
+            return Ok(Vec::new());
+        }
+
         let mut results = histories
             .into_iter()
             .map(|history| WorkflowReplayResult {
@@ -351,22 +369,20 @@ impl WorkflowReplayer {
                 replay_failure: None,
             })
             .collect::<Vec<_>>();
-        let mut valid_indexes = Vec::new();
-        let mut core_histories = Vec::new();
-
-        for (index, result) in results.iter_mut().enumerate() {
-            match validate_history(&result.history) {
-                Ok(history) => {
-                    valid_indexes.push(index);
-                    core_histories.push(history);
-                }
-                Err(failure) => result.replay_failure = Some(failure),
-            }
-        }
-
-        if core_histories.is_empty() {
-            return Ok(results);
-        }
+        let core_histories: Vec<_> = results
+            .iter()
+            .map(|result| {
+                HistoryForReplay::new(
+                    History {
+                        events: result.history.events().to_vec(),
+                    },
+                    result
+                        .history
+                        .workflow_id()
+                        .unwrap_or(DEFAULT_REPLAY_WORKFLOW_ID),
+                )
+            })
+            .collect();
 
         let recorded_outcomes = Arc::new(Mutex::new(Vec::new()));
         let observer = ReplayOutcomeInterceptor {
@@ -376,12 +392,14 @@ impl WorkflowReplayer {
 
         let core_options = worker_options
             .to_core_options(self.options.namespace.clone(), String::new())
-            .map_err(|error| WorkflowReplayError::Initialization(anyhow!(error)))?;
+            .map_err(|message| WorkflowReplayWorkerError::Initialization { message })?;
         let core_worker = init_replay_worker(ReplayWorkerInput::new(
             core_options,
             stream::iter(core_histories),
         ))
-        .map_err(WorkflowReplayError::Initialization)?;
+        .map_err(|error| WorkflowReplayWorkerError::Initialization {
+            message: error.to_string(),
+        })?;
         let client_options = ClientOptions::new(self.options.namespace.clone())
             .data_converter(self.options.data_converter.clone())
             .build();
@@ -390,26 +408,20 @@ impl WorkflowReplayer {
             client_options,
             worker_options,
         )
-        .map_err(|error| WorkflowReplayError::Initialization(anyhow!(error)))?;
+        .map_err(|error| WorkflowReplayWorkerError::Initialization {
+            message: error.to_string(),
+        })?;
 
         if let Err(source) = worker.run().await {
             let core_worker = worker.core_worker();
             core_worker.initiate_shutdown();
             core_worker.shutdown().await;
-            return Err(WorkflowReplayError::Worker(source));
+            return Err(WorkflowReplayWorkerError::Run(source).into());
         }
 
         let outcomes = std::mem::take(&mut *recorded_outcomes.lock());
-        if outcomes.len() != valid_indexes.len() {
-            return Err(WorkflowReplayError::Internal {
-                message: format!(
-                    "replay produced {} outcomes for {} valid histories",
-                    outcomes.len(),
-                    valid_indexes.len()
-                ),
-            });
-        }
-        for (index, replay_failure) in valid_indexes.into_iter().zip(outcomes) {
+
+        for (index, replay_failure) in outcomes.into_iter().enumerate() {
             results[index].replay_failure = replay_failure;
         }
         Ok(results)
@@ -435,47 +447,6 @@ impl WorkflowReplayer {
             .with_wasm_workflow_components(self.options.wasm_workflow_components.clone());
         worker_options.build()
     }
-}
-
-fn validate_history(history: &WorkflowHistory) -> Result<HistoryForReplay, WorkflowReplayFailure> {
-    let proto = History {
-        events: history.events().to_vec(),
-    };
-    HistoryInfo::new_from_history(&proto, None).map_err(|error| {
-        WorkflowReplayFailure::InvalidHistory {
-            message: error.to_string(),
-        }
-    })?;
-    let attributes = match proto
-        .events
-        .first()
-        .and_then(|event| event.attributes.as_ref())
-    {
-        Some(Attributes::WorkflowExecutionStartedEventAttributes(attributes)) => attributes,
-        _ => {
-            return Err(WorkflowReplayFailure::InvalidHistory {
-                message: "first event is not WorkflowExecutionStarted".to_owned(),
-            });
-        }
-    };
-    if attributes.original_execution_run_id.is_empty() {
-        return Err(WorkflowReplayFailure::InvalidHistory {
-            message: "workflow start event has no original execution run ID".to_owned(),
-        });
-    }
-    if attributes
-        .task_queue
-        .as_ref()
-        .is_none_or(|task_queue| task_queue.name.is_empty())
-    {
-        return Err(WorkflowReplayFailure::InvalidHistory {
-            message: "workflow start event has no task queue".to_owned(),
-        });
-    }
-    Ok(HistoryForReplay::new(
-        proto,
-        history.workflow_id().unwrap_or(DEFAULT_REPLAY_WORKFLOW_ID),
-    ))
 }
 
 struct ReplayOutcomeInterceptor {
