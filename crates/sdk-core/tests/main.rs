@@ -19,6 +19,7 @@ mod integ_tests {
     mod heartbeat_tests;
     mod metrics_tests;
     mod pagination_tests;
+    mod plugin_tests;
     mod poll_loop_tests;
     mod polling_tests;
     mod queries_tests;

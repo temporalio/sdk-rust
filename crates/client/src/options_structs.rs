@@ -1,5 +1,6 @@
 use crate::{
-    ClientInterceptor, HttpConnectProxyOptions, RetryOptions, RpcOptions, VERSION, callback_based,
+    ClientInterceptor, ClientPlugin, ErasedClientPlugin, HttpConnectProxyOptions, RetryOptions,
+    RpcOptions, VERSION, callback_based,
 };
 use http::Uri;
 use std::{collections::HashMap, sync::Arc, time::Duration};
@@ -21,6 +22,8 @@ use temporalio_common::{
     search_attributes::SearchAttributes,
     telemetry::metrics::TemporalMeter,
 };
+#[cfg(feature = "dynamic-tls")]
+use tokio_rustls::rustls::client::ResolvesClientCert;
 use tokio_rustls::rustls::client::danger::ServerCertVerifier;
 use url::Url;
 
@@ -147,6 +150,15 @@ pub struct ClientOptions {
     /// The namespace this client will be bound to.
     #[builder(start_fn)]
     pub namespace: String,
+
+    #[builder(field)]
+    #[debug(skip)]
+    plugins: Vec<ErasedClientPlugin>,
+
+    #[builder(field)]
+    #[debug(skip)]
+    client_plugins_applied: bool,
+
     /// The data converter used for serializing/deserializing payloads.
     #[builder(default)]
     pub data_converter: DataConverter,
@@ -154,6 +166,55 @@ pub struct ClientOptions {
     #[builder(default)]
     #[debug(skip)]
     pub client_interceptors: Vec<Arc<dyn ClientInterceptor>>,
+}
+
+impl<S: client_options_builder::State> ClientOptionsBuilder<S> {
+    /// Register a type-erased client plugin.
+    ///
+    /// **Experimental:** This API may change or be removed.
+    pub fn plugin<P: Into<ErasedClientPlugin>>(mut self, plugin: P) -> Self {
+        self.plugins.push(plugin.into());
+        self
+    }
+
+    /// Register type-erased client plugins in iteration order.
+    ///
+    /// **Experimental:** This API may change or be removed.
+    pub fn plugins<I, P>(mut self, plugins: I) -> Self
+    where
+        I: IntoIterator<Item = P>,
+        P: Into<ErasedClientPlugin>,
+    {
+        self.plugins.extend(plugins.into_iter().map(Into::into));
+        self
+    }
+
+    /// Register a client-only plugin.
+    ///
+    /// **Experimental:** This API may change or be removed.
+    pub fn client_plugin<P: ClientPlugin>(mut self, plugin: P) -> Self {
+        self.plugins.push(ErasedClientPlugin::new(plugin));
+        self
+    }
+}
+
+impl ClientOptions {
+    /// Return the registered plugins.
+    ///
+    /// This is intended for SDK integrations that propagate worker plugin registrations.
+    ///
+    /// **Experimental:** This API may change or be removed.
+    pub fn plugins(&self) -> &[ErasedClientPlugin] {
+        &self.plugins
+    }
+
+    pub(crate) fn client_plugins_applied(&self) -> bool {
+        self.client_plugins_applied
+    }
+
+    pub(crate) fn mark_client_plugins_applied(&mut self) {
+        self.client_plugins_applied = true;
+    }
 }
 
 /// Selects the transport-level compression used for gRPC calls. See
@@ -169,7 +230,8 @@ pub enum GrpcCompression {
 }
 
 /// Configuration options for TLS
-#[derive(Clone, Default)]
+#[derive(Clone, bon::Builder)]
+#[non_exhaustive]
 pub struct TlsOptions {
     /// Bytes representing the root CA certificate used by the server. If not set, and the server's
     /// cert is issued by someone the operating system trusts, verification will still work (ex:
@@ -179,6 +241,9 @@ pub struct TlsOptions {
     /// the domain name will be extracted from the URL used to connect.
     pub domain: Option<String>,
     /// TLS info for the client. If specified, core will attempt to use mTLS.
+    ///
+    /// Mutually exclusive with [`client_cert_resolver`](TlsOptions::client_cert_resolver).
+    /// Setting both is an error.
     pub client_tls_options: Option<ClientTlsOptions>,
     /// Optional custom server certificate verifier. When set, this replaces the default
     /// certificate verification and `server_root_ca_cert` is ignored.
@@ -197,30 +262,48 @@ pub struct TlsOptions {
     /// Note that `domain` is still respected for the `:authority` header / origin override
     /// even when a custom verifier is set.
     pub server_cert_verifier: Option<Arc<dyn ServerCertVerifier>>,
+    /// Optional dynamic client certificate resolver for transparent mTLS certificate rotation.
+    ///
+    /// Mutually exclusive with [`client_tls_options`](TlsOptions::client_tls_options).
+    /// Setting both is an error.
+    #[cfg(feature = "dynamic-tls")]
+    pub client_cert_resolver: Option<Arc<dyn ResolvesClientCert>>,
+}
+
+impl Default for TlsOptions {
+    fn default() -> Self {
+        Self::builder().build()
+    }
 }
 
 impl std::fmt::Debug for TlsOptions {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("TlsOptions")
-            .field(
-                "server_root_ca_cert",
-                &self
-                    .server_root_ca_cert
-                    .as_ref()
-                    .map(|c| format!("{} bytes", c.len())),
-            )
-            .field("domain", &self.domain)
-            .field("client_tls_options", &self.client_tls_options)
-            .field(
-                "server_cert_verifier",
-                &self.server_cert_verifier.as_ref().map(|_| "<custom>"),
-            )
-            .finish()
+        let mut s = f.debug_struct("TlsOptions");
+        s.field(
+            "server_root_ca_cert",
+            &self
+                .server_root_ca_cert
+                .as_ref()
+                .map(|c| format!("{} bytes", c.len())),
+        );
+        s.field("domain", &self.domain);
+        s.field("client_tls_options", &self.client_tls_options);
+        s.field(
+            "server_cert_verifier",
+            &self.server_cert_verifier.as_ref().map(|_| "<custom>"),
+        );
+        #[cfg(feature = "dynamic-tls")]
+        s.field(
+            "client_cert_resolver",
+            &self.client_cert_resolver.as_ref().map(|_| "<custom>"),
+        );
+        s.finish()
     }
 }
 
 /// If using mTLS, both the client cert and private key must be specified, this contains them.
-#[derive(Clone)]
+#[derive(Clone, bon::Builder)]
+#[non_exhaustive]
 pub struct ClientTlsOptions {
     /// The certificate for this client, encoded as PEM
     pub client_cert: Vec<u8>,
@@ -229,57 +312,56 @@ pub struct ClientTlsOptions {
 }
 
 /// Client keep alive configuration.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, bon::Builder)]
+#[non_exhaustive]
 pub struct ClientKeepAliveOptions {
     /// Interval to send HTTP2 keep alive pings.
+    #[builder(default = Duration::from_secs(30))]
     pub interval: Duration,
     /// Timeout that the keep alive must be responded to within or the connection will be closed.
+    #[builder(default = Duration::from_secs(15))]
     pub timeout: Duration,
 }
 
 impl Default for ClientKeepAliveOptions {
     fn default() -> Self {
-        Self {
-            interval: Duration::from_secs(30),
-            timeout: Duration::from_secs(15),
-        }
+        Self::builder().build()
     }
 }
 
 /// Options for DNS-based load balancing.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, bon::Builder)]
 #[non_exhaustive]
 pub struct DnsLoadBalancingOptions {
     /// How often to re-resolve DNS. Defaults to 30 seconds.
+    #[builder(default = Duration::from_secs(30))]
     pub resolution_interval: Duration,
 }
 
 impl Default for DnsLoadBalancingOptions {
     fn default() -> Self {
-        Self {
-            resolution_interval: Duration::from_secs(30),
-        }
+        Self::builder().build()
     }
 }
 
 /// Payload size limit options for a connection.
 /// NOTE: Experimental
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, bon::Builder)]
+#[non_exhaustive]
 pub struct PayloadLimitsOptions {
     /// Warning threshold (bytes) for the size of an outbound payload-bearing field; over-threshold
     /// fields are logged but still sent to server. Defaults to 512 KiB. Set to `0` to disable.
+    #[builder(default = 512 * 1024)]
     pub payloads_warn_size: u64,
     /// Warning threshold (bytes) for outbound memo sizes; over-threshold memos are logged but still
     /// sent to server. Defaults to 2 KiB. Set to `0` to disable.
+    #[builder(default = 2 * 1024)]
     pub memo_warn_size: u64,
 }
 
 impl Default for PayloadLimitsOptions {
     fn default() -> Self {
-        Self {
-            payloads_warn_size: 512 * 1024,
-            memo_warn_size: 2 * 1024,
-        }
+        Self::builder().build()
     }
 }
 
@@ -491,6 +573,7 @@ const DEFAULT_WORKFLOW_EXECUTION_RETENTION_PERIOD: Duration = Duration::from_sec
 /// Helper struct for `register_namespace`.
 #[derive(Clone, Debug, bon::Builder)]
 #[builder(on(String, into))]
+#[non_exhaustive]
 pub struct RegisterNamespaceOptions {
     /// Name (required)
     pub namespace: String,

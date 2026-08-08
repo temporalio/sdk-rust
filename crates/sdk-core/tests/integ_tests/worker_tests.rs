@@ -9,7 +9,6 @@ use crate::{
 use assert_matches::assert_matches;
 use futures_util::{FutureExt, StreamExt};
 use std::{
-    cell::Cell,
     sync::{
         Arc, Mutex,
         atomic::{
@@ -132,7 +131,7 @@ async fn worker_handles_unknown_workflow_types_gracefully() {
     struct GracefulAsserter {
         notify: Arc<Notify>,
         run_id: String,
-        unregistered_failure_seen: Cell<bool>,
+        unregistered_failure_seen: AtomicBool,
     }
     #[async_trait::async_trait(?Send)]
     impl WorkerInterceptor for GracefulAsserter {
@@ -151,7 +150,8 @@ async fn worker_handles_unknown_workflow_types_gracefully() {
                     ..
                 } if message == "Workflow type unregistered not found" && *run_id == self.run_id
             ) {
-                self.unregistered_failure_seen.set(true);
+                self.unregistered_failure_seen
+                    .store(true, Ordering::Relaxed);
             }
             // If we've seen the failure, and the completion is a success for the same run, we're done
             if matches!(
@@ -160,7 +160,7 @@ async fn worker_handles_unknown_workflow_types_gracefully() {
                     status: Some(Status::Successful(..)),
                     run_id,
                     ..
-                } if self.unregistered_failure_seen.get() && *run_id == self.run_id
+                } if self.unregistered_failure_seen.load(Ordering::Relaxed) && *run_id == self.run_id
             ) {
                 // Shutdown the worker
                 self.notify.notify_one();
@@ -169,13 +169,13 @@ async fn worker_handles_unknown_workflow_types_gracefully() {
         fn on_shutdown(&self, _: &temporalio_sdk::Worker) {}
     }
 
-    let inner = worker.inner_mut();
     let notify = Arc::new(Notify::new());
-    inner.set_worker_interceptor(GracefulAsserter {
+    worker.set_worker_interceptor(GracefulAsserter {
         notify: notify.clone(),
         run_id,
-        unregistered_failure_seen: Cell::new(false),
+        unregistered_failure_seen: AtomicBool::new(false),
     });
+    let inner = worker.inner_mut();
     tokio::join!(async { inner.run().await.unwrap() }, async move {
         notify.notified().await;
         let worker = starter.get_worker().await.clone();
@@ -543,10 +543,10 @@ async fn warn_band_payload_is_logged_and_completes() {
 
     let mut conn_opts = get_integ_server_options();
     conn_opts.metrics_meter = runtime.telemetry().get_temporal_metric_meter();
-    conn_opts.payload_limits = PayloadLimitsOptions {
-        payloads_warn_size: 1,
-        memo_warn_size: 1,
-    };
+    conn_opts.payload_limits = PayloadLimitsOptions::builder()
+        .payloads_warn_size(1)
+        .memo_warn_size(1)
+        .build();
     let connection = Connection::connect(conn_opts).await.unwrap();
     let client = Client::new(connection, ClientOptions::new(integ_namespace()).build()).unwrap();
 
@@ -1218,10 +1218,9 @@ async fn test_custom_slot_supplier_simple() {
                 .execute_local_activity(
                     StdActivities::no_op,
                     (),
-                    LocalActivityOptions {
-                        start_to_close_timeout: Some(Duration::from_secs(10)),
-                        ..Default::default()
-                    },
+                    LocalActivityOptions::builder()
+                        .start_to_close_timeout(Duration::from_secs(10))
+                        .build(),
                 )
                 .await;
             Ok(())

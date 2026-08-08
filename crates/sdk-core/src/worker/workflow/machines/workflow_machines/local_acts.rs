@@ -4,7 +4,7 @@ use crate::{
     worker::{ExecutingLAId, LocalActRequest, NewLocalAct},
 };
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashSet, VecDeque},
     time::SystemTime,
 };
 use temporalio_common::protos::temporal::api::common::v1::WorkflowExecution;
@@ -17,9 +17,9 @@ pub(super) struct LocalActivityData {
     cancel_requests: Vec<ExecutingLAId>,
     /// Seq #s of local activities which we have sent to be executed but have not yet resolved
     executing: HashSet<u32>,
-    /// Maps local activity sequence numbers to their resolutions as found when looking ahead at
-    /// next WFT
-    preresolutions: HashMap<u32, ResolveDat>,
+    /// Local activity resolutions in the order their markers were found while looking ahead at the
+    /// next WFT.
+    preresolutions: VecDeque<(u32, ResolveDat)>,
     /// Set true if the workflow is terminating
     am_terminating: bool,
 }
@@ -78,11 +78,22 @@ impl LocalActivityData {
     }
 
     pub(super) fn insert_peeked_marker(&mut self, dat: CompleteLocalActivityData) {
-        self.preresolutions.insert(dat.marker_dat.seq, dat.into());
+        self.preresolutions
+            .push_back((dat.marker_dat.seq, dat.into()));
     }
 
     pub(super) fn take_preresolution(&mut self, seq: u32) -> Option<ResolveDat> {
-        self.preresolutions.remove(&seq)
+        let idx = self.preresolutions.iter().position(|(s, _)| *s == seq)?;
+        let (_, dat) = self
+            .preresolutions
+            .remove(idx)
+            .expect("This index was just found to contain seq");
+        Some(dat)
+    }
+
+    pub(super) fn peek_preresolution_seq(&self) -> Option<u32> {
+        let (seq, _) = self.preresolutions.front()?;
+        Some(*seq)
     }
 
     pub(super) fn remove_from_queue(&mut self, seq: u32) -> Option<ValidScheduleLA> {

@@ -1,5 +1,6 @@
 use crate::common::{
     ActivationAssertionsInterceptor, CoreWfStarter, WorkflowHandleExt, build_fake_sdk,
+    build_fake_sdk_intercepted,
 };
 use std::{
     collections::{HashSet, VecDeque, hash_map::RandomState},
@@ -237,7 +238,7 @@ impl PatchActivationRolloutWf {
         let patched = ctx.patched(ROLLOUT_PATCH_ID);
         ctx.timer(Duration::from_millis(1)).await;
         ctx.state(|wf| wf.ready.notify_one());
-        ctx.wait_condition(|wf| wf.released).await;
+        ctx.wait_condition(|wf| wf.released).await?;
         Ok(if patched { "new" } else { "old" }.to_string())
     }
 
@@ -258,7 +259,7 @@ impl PatchActivationOldRolloutWf {
     #[run(name = "patch_activation_rollout")]
     async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<String> {
         ctx.timer(Duration::from_millis(1)).await;
-        ctx.wait_condition(|wf| wf.released).await;
+        ctx.wait_condition(|wf| wf.released).await?;
         Ok("old".to_string())
     }
 
@@ -507,7 +508,7 @@ impl DeprecatedPatchRemovalWf {
             assert!(ctx.deprecate_patch("getting-deprecated"));
         }
         ctx.state(|wf| wf.notify.notify_one());
-        ctx.wait_condition(|s| s.signal_received).await;
+        ctx.wait_condition(|s| s.signal_received).await?;
 
         ctx.timer(Duration::from_millis(1)).await;
 
@@ -805,8 +806,7 @@ async fn v1_and_v4_changes(
         });
     }
 
-    let mut worker = build_fake_sdk(mock_cfg);
-    worker.set_worker_interceptor(aai);
+    let mut worker = build_fake_sdk_intercepted(mock_cfg, aai);
     worker
         .register_workflow_with_factory(move || PatchWf {
             version: wf_version,
@@ -914,8 +914,7 @@ async fn v2_and_v3_changes(
         });
     }
 
-    let mut worker = build_fake_sdk(mock_cfg);
-    worker.set_worker_interceptor(aai);
+    let mut worker = build_fake_sdk_intercepted(mock_cfg, aai);
     worker
         .register_workflow_with_factory(move || PatchWf {
             version: wf_version,
@@ -1197,8 +1196,5 @@ async fn patch_marker_size_overflow_replay_is_deterministic() {
 
     // Replay the workflow from the fetched history. This must succeed: the SDK must produce the
     // same sequence of upsert SA commands during replay as it did during the original execution.
-    handle
-        .fetch_history_and_replay(worker.inner_mut())
-        .await
-        .unwrap();
+    handle.fetch_history_and_replay(&mut worker).await.unwrap();
 }

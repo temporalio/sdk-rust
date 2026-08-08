@@ -96,7 +96,19 @@ async fn build_endpoint(
             patched
         }
     });
-    let channel = add_tls_to_channel(tls_for_ip.as_ref().or(tls_options), channel).await?;
+    let tls_result = add_tls_to_channel(tls_for_ip.as_ref().or(tls_options), channel).await?;
+
+    let channel = match tls_result {
+        crate::TlsConfigResult::Standard(ep) => ep,
+        #[cfg(feature = "dynamic-tls")]
+        crate::TlsConfigResult::CustomConnector { .. } => {
+            return Err(ClientConnectError::InvalidConfig(
+                "client_cert_resolver is not yet supported with dns_load_balancing. \
+                 Disable dns_load_balancing or use static client_tls_options instead."
+                    .to_owned(),
+            ));
+        }
+    };
 
     let channel = if let Some(keep_alive) = keep_alive {
         channel
@@ -164,6 +176,7 @@ pub(crate) async fn create_balanced_channel(
 }
 
 /// Handle that aborts the DNS re-resolution task when dropped.
+#[derive(Debug)]
 pub(crate) struct DnsReresolutionHandle {
     abort_handle: tokio::task::AbortHandle,
 }
@@ -327,10 +340,11 @@ mod tests {
     #[test]
     fn zero_resolution_interval_is_error() {
         let opts = ConnectionOptions::new(Url::parse("http://temporal.example.com:7233").unwrap())
-            .dns_load_balancing(Some(DnsLoadBalancingOptions {
-                resolution_interval: Duration::ZERO,
-                ..Default::default()
-            }))
+            .dns_load_balancing(Some(
+                DnsLoadBalancingOptions::builder()
+                    .resolution_interval(Duration::ZERO)
+                    .build(),
+            ))
             .build();
         assert!(validate_and_get_dns_lb(&opts).is_err());
     }
@@ -338,10 +352,11 @@ mod tests {
     #[test]
     fn sub_minimum_resolution_interval_is_error() {
         let opts = ConnectionOptions::new(Url::parse("http://temporal.example.com:7233").unwrap())
-            .dns_load_balancing(Some(DnsLoadBalancingOptions {
-                resolution_interval: Duration::from_millis(500),
-                ..Default::default()
-            }))
+            .dns_load_balancing(Some(
+                DnsLoadBalancingOptions::builder()
+                    .resolution_interval(Duration::from_millis(500))
+                    .build(),
+            ))
             .build();
         assert!(validate_and_get_dns_lb(&opts).is_err());
     }

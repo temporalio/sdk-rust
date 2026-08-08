@@ -14,7 +14,8 @@ document as your quick reference when submitting pull requests.
 - It is EXTREMELY IMPORTANT that any added comments should explain why something needs to be done,
   rather than what it is. Comments that simply state a fact easily understood from type signatures
   or other context should NEVER be added. Always prefer to avoid a comment unless it truly is 
-  clarifying something nonobvious.
+  clarifying something nonobvious. This does _NOT_ mean you should _remove_ any existing comments
+  unless they are no longer accurate.
 - Always make every attempt to avoid explicit sleeps in test code. Instead rely on synchronization
   techniques like channels, Notify, etc.
 - Rust compilation can take some time. Do not interrupt builds or tests unless they are taking more
@@ -26,6 +27,8 @@ document as your quick reference when submitting pull requests.
   `cargo +nightly fmt`, because some settings require the nightly formatter.
 - Do not extract functions for relatively simple helpers that are only used in one location.
 - Use custom error types leveraging `thiserror` for any public facing error types
+- Don't add pro-forma unit tests that simply check values are passed through some very obviously
+  correct machinery, or that defaults equal the same hardcoded values in the test, etc.
 
 
 ## Repo Specific Utilities
@@ -59,6 +62,7 @@ Documentation can be generated with `cargo doc`.
 - Keep commit messages short and in the imperative mood.
 - Provide a clear PR description outlining what changed and why.
 - Reviewers expect new features or fixes to include corresponding tests when applicable.
+- Always add an entry to CHANGELOG.md for each relevant change in a PR.
 
 ## Review Checklist
 

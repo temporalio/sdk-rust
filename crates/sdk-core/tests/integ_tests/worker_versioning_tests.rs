@@ -42,11 +42,10 @@ async fn sets_deployment_info_on_task_responses(#[values(true, false)] use_defau
         deployment_name: deploy_name.clone(),
         build_id: "1.0".to_string(),
     };
-    starter.sdk_config.deployment_options = WorkerDeploymentOptions {
-        version: version.clone(),
-        use_worker_versioning: true,
-        default_versioning_behavior: Some(VersioningBehavior::AutoUpgrade),
-    };
+    starter.sdk_config.deployment_options = WorkerDeploymentOptions::new(version.clone())
+        .use_worker_versioning(true)
+        .default_versioning_behavior(VersioningBehavior::AutoUpgrade)
+        .build();
     starter.sdk_config.task_types = WorkerTaskTypes::workflow_only();
     let core = starter.get_worker().await;
     let client = starter.get_client().await;
@@ -174,14 +173,13 @@ async fn activity_has_deployment_stamp() {
     let wf_name = "activity_has_deployment_stamp";
     let mut starter = CoreWfStarter::new(wf_name);
     let deploy_name = format!("deployment-{}", starter.get_task_queue());
-    starter.sdk_config.deployment_options = WorkerDeploymentOptions {
-        version: WorkerDeploymentVersion {
-            deployment_name: deploy_name.clone(),
-            build_id: "1.0".to_string(),
-        },
-        use_worker_versioning: true,
-        default_versioning_behavior: Some(VersioningBehavior::AutoUpgrade),
-    };
+    starter.sdk_config.deployment_options = WorkerDeploymentOptions::new(WorkerDeploymentVersion {
+        deployment_name: deploy_name.clone(),
+        build_id: "1.0".to_string(),
+    })
+    .use_worker_versioning(true)
+    .default_versioning_behavior(VersioningBehavior::AutoUpgrade)
+    .build();
     starter.sdk_config.register_activities(StdActivities);
     let mut worker = starter.worker().await;
     let client = starter.get_client().await;
@@ -270,14 +268,11 @@ async fn versioning_off_with_custom_build_id() {
     let wf_type = "versioning_off_with_custom_build_id";
     let mut starter = CoreWfStarter::new(wf_type);
     let build_id = "my-custom-build-id-1.0";
-    starter.sdk_config.deployment_options = WorkerDeploymentOptions {
-        version: WorkerDeploymentVersion {
-            deployment_name: format!("deployment-{}", starter.get_task_queue()),
-            build_id: build_id.to_string(),
-        },
-        use_worker_versioning: false,
-        default_versioning_behavior: None,
-    };
+    starter.sdk_config.deployment_options = WorkerDeploymentOptions::new(WorkerDeploymentVersion {
+        deployment_name: format!("deployment-{}", starter.get_task_queue()),
+        build_id: build_id.to_string(),
+    })
+    .build();
     starter.sdk_config.task_types = WorkerTaskTypes::workflow_only();
     let core = starter.get_worker().await;
     starter.start_wf().await;
@@ -334,7 +329,7 @@ impl ContinueAsNewAutoUpgradeV1 {
             return Ok("v1.0".to_string());
         }
         ctx.wait_condition(|state| state.should_continue_as_new)
-            .await;
+            .await?;
         assert!(ctx.target_worker_deployment_version_changed());
         let mut options = ContinueAsNewOptions::default();
         options.initial_versioning_behavior = Some(ContinueAsNewVersioningBehavior::AutoUpgrade);
@@ -462,7 +457,7 @@ impl ContinueAsNewUseRampingVersionV1 {
             return Ok("v1.0".to_string());
         }
         ctx.wait_condition(|state| state.should_continue_as_new)
-            .await;
+            .await?;
         let mut options = ContinueAsNewOptions::default();
         options.initial_versioning_behavior =
             Some(ContinueAsNewVersioningBehavior::UseRampingVersion);
@@ -578,11 +573,10 @@ async fn continue_as_new_use_ramping_version_uses_ramping_deployment_version() {
 }
 
 fn versioned_worker_options(version: WorkerDeploymentVersion) -> WorkerDeploymentOptions {
-    WorkerDeploymentOptions {
-        version,
-        use_worker_versioning: true,
-        default_versioning_behavior: Some(VersioningBehavior::Pinned),
-    }
+    WorkerDeploymentOptions::new(version)
+        .use_worker_versioning(true)
+        .default_versioning_behavior(VersioningBehavior::Pinned)
+        .build()
 }
 
 async fn try_describe_worker_deployment(

@@ -75,16 +75,16 @@ jobs:
           test_executable=$(cargo build --tests --message-format json | jq -r 'select(.profile?.test == true and .target?.name == "temporalio_sdk_core" and .executable) | .executable')
           cp $test_executable ./core-tests
       - name: Upload cgroup test executable
-        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         if: runner.os == 'Linux' && runner.arch == 'X64'
         with:
           name: cgroup-tests-linux-x86_64
           path: ./core-tests
-      - uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: coverage-report
           path: tarpaulin-report.html
-      - uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: state-machine-coverage
           path: machine_coverage/
@@ -203,10 +203,35 @@ jobs:
         with:
           mise-install-args: protoc
       - name: Start container for otel-collector and prometheus
-        uses: hoverkraft-tech/compose-action@4894d2492015c1774ee5a13a95b1072093087ec3 # v2.5.0
+        uses: hoverkraft-tech/compose-action@d2bee4f07e8ca410d6b196d00f90c12e7d48c33a # v2.6.0
         with:
           compose-file: ./etc/docker/docker-compose-ci.yaml
       - run: cargo integ-test docker_
+        env:
+          TMPDIR: ${{ runner.temp }}
+      - name: Verify worker environment detection inside Docker
+        run: |
+          integ_test_binary="$(
+            find "$GITHUB_WORKSPACE/target/debug/deps" -maxdepth 1 -type f \
+              -name 'integ_tests-*' -perm -111 \
+              -printf '%T@ %p\n' | sort -nr | head -n 1 | cut -d' ' -f2-
+          )"
+          integ_runner_binary="$(
+            find "$GITHUB_WORKSPACE/target/debug/deps" -maxdepth 1 -type f \
+              -name 'integ_runner-*' -perm -111 \
+              -printf '%T@ %p\n' | sort -nr | head -n 1 | cut -d' ' -f2-
+          )"
+          test -x "$integ_test_binary"
+          test -x "$integ_runner_binary"
+          docker run --rm \
+            --env TMPDIR="$RUNNER_TEMP" \
+            --env TEMPORAL_TEST_EXPECT_DOCKER=true \
+            --volume "$RUNNER_TEMP:$RUNNER_TEMP" \
+            --volume "$GITHUB_WORKSPACE:$GITHUB_WORKSPACE" \
+            --workdir "$GITHUB_WORKSPACE" \
+            ubuntu:24.04 \
+            "$integ_runner_binary" --test-executable "$integ_test_binary" \
+              worker_heartbeat_multiple_workers
 
   examples:
     name: "Build and run examples"

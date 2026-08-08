@@ -66,10 +66,12 @@ fn build_tls_options(tls: ClientConfigTLS) -> Result<TlsOptions, ConfigError> {
                 resolve_datasource(cert).map_err(|e| ConfigError::LoadError(e.into()))?;
             let key_bytes =
                 resolve_datasource(key).map_err(|e| ConfigError::LoadError(e.into()))?;
-            Some(ClientTlsOptions {
-                client_cert: cert_bytes,
-                client_private_key: key_bytes,
-            })
+            Some(
+                ClientTlsOptions::builder()
+                    .client_cert(cert_bytes)
+                    .client_private_key(key_bytes)
+                    .build(),
+            )
         }
         (Some(_), None) | (None, Some(_)) => {
             return Err(ConfigError::InvalidConfig(
@@ -85,12 +87,11 @@ fn build_tls_options(tls: ClientConfigTLS) -> Result<TlsOptions, ConfigError> {
         .transpose()
         .map_err(|e| ConfigError::LoadError(e.into()))?;
 
-    Ok(TlsOptions {
-        server_root_ca_cert,
-        domain: tls.server_name,
-        client_tls_options,
-        server_cert_verifier: None,
-    })
+    Ok(TlsOptions::builder()
+        .maybe_server_root_ca_cert(server_root_ca_cert)
+        .maybe_domain(tls.server_name)
+        .maybe_client_tls_options(client_tls_options)
+        .build())
 }
 
 /// Determine whether TLS should be enabled based on the profile's TLS config and API key.
@@ -204,10 +205,9 @@ mod tests {
     #[test]
     fn empty_profile_defaults() {
         let env = HashMap::new();
-        let opts = LoadClientConfigProfileOptions {
-            disable_file: true,
-            ..Default::default()
-        };
+        let opts = LoadClientConfigProfileOptions::builder()
+            .disable_file(true)
+            .build();
         let (conn, client) = load_from_config_with_env(opts, Some(&env)).unwrap();
 
         assert_eq!(conn.target.as_str(), "http://localhost:7233/");
@@ -221,10 +221,9 @@ mod tests {
     fn namespace_override() {
         let mut env = HashMap::new();
         env.insert("TEMPORAL_NAMESPACE".to_string(), "my-namespace".to_string());
-        let opts = LoadClientConfigProfileOptions {
-            disable_file: true,
-            ..Default::default()
-        };
+        let opts = LoadClientConfigProfileOptions::builder()
+            .disable_file(true)
+            .build();
         let (_, client) = load_from_config_with_env(opts, Some(&env)).unwrap();
         assert_eq!(client.namespace, "my-namespace");
     }
@@ -382,11 +381,10 @@ namespace = "custom-ns"
         );
 
         // Default profile
-        let opts = LoadClientConfigProfileOptions {
-            config_source: Some(DataSource::Path(config_path.to_str().unwrap().to_string())),
-            disable_env: true,
-            ..Default::default()
-        };
+        let opts = LoadClientConfigProfileOptions::builder()
+            .config_source(DataSource::Path(config_path.to_str().unwrap().to_string()))
+            .disable_env(true)
+            .build();
         let (conn, client) = ClientOptions::load_from_config(opts).unwrap();
         assert_eq!(conn.target.as_str(), "https://toml-server:7233/");
         assert_eq!(client.namespace, "toml-ns");
@@ -398,12 +396,11 @@ namespace = "custom-ns"
         );
 
         // Custom profile
-        let opts = LoadClientConfigProfileOptions {
-            config_source: Some(DataSource::Path(config_path.to_str().unwrap().to_string())),
-            config_file_profile: Some("custom".to_string()),
-            disable_env: true,
-            ..Default::default()
-        };
+        let opts = LoadClientConfigProfileOptions::builder()
+            .config_source(DataSource::Path(config_path.to_str().unwrap().to_string()))
+            .config_file_profile("custom".to_string())
+            .disable_env(true)
+            .build();
         let (conn, client) = ClientOptions::load_from_config(opts).unwrap();
         assert_eq!(conn.target.as_str(), "http://custom-server:9090/");
         assert_eq!(client.namespace, "custom-ns");

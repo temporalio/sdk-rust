@@ -75,6 +75,7 @@ otel = ["temporalio-sdk-core/otel"]
 examples = ["serde/derive", "dep:serde_json", "envconfig"]
 wasm-examples = []
 wasm-workflows = ["dep:wasmtime"]
+dynamic-tls = ["temporalio-client/dynamic-tls"]
 
 [dependencies.serde_json]
 version = "1"

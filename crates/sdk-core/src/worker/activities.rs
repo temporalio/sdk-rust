@@ -46,6 +46,7 @@ use temporalio_common::{
             activity_task::{ActivityCancelReason, ActivityCancellationDetails, ActivityTask},
         },
         temporal::api::{
+            common::v1::{Payload, Payloads},
             failure::v1::{
                 ApplicationFailureInfo, CanceledFailureInfo, Failure, failure::FailureInfo,
             },
@@ -117,6 +118,8 @@ struct RemoteInFlightActInfo {
     local_timeouts_task: Option<JoinHandle<()>>,
     /// Used to reset the local heartbeat timeout every time we record a heartbeat
     timeout_resetter: Option<Arc<Notify>>,
+    /// The most recent heartbeat received from lang, independently of whether it has been sent.
+    last_heartbeat_details: Option<Vec<Payload>>,
     /// The permit from the max concurrent semaphore
     _permit: UsedMeteredSemPermit<ActivitySlotKind>,
 }
@@ -140,6 +143,7 @@ impl RemoteInFlightActInfo {
             known_not_found: false,
             local_timeouts_task: None,
             timeout_resetter: None,
+            last_heartbeat_details: None,
             _permit: permit,
         }
     }
@@ -347,14 +351,21 @@ impl WorkerActivityTasks {
             if let Some(jh) = act_info.local_timeouts_task {
                 jh.abort()
             };
+            // Cancellation responses cannot carry heartbeat details, so normal cancellations must
+            // flush them separately. Worker-shutdown cancellations are reported as failures below.
             let should_flush = !known_not_found
+                && matches!(&status, aer::Status::Cancelled(_))
                 && !matches!(
-                    &status,
-                    aer::Status::Completed(_) | aer::Status::WillCompleteAsync(_)
+                    act_info.issued_cancel_to_lang,
+                    Some(ActivityCancelReason::WorkerShutdown)
                 );
             self.heartbeat_manager
                 .evict(task_token.clone(), should_flush)
                 .await;
+
+            let last_heartbeat_details = act_info
+                .last_heartbeat_details
+                .map(|payloads| Payloads { payloads });
 
             // No need to report activities which we already know the server doesn't care about
             if !known_not_found {
@@ -384,6 +395,7 @@ impl WorkerActivityTasks {
                                         .fail_activity_task(
                                             task_token.clone(),
                                             Some(make_payloads_too_large_failure(violation)),
+                                            last_heartbeat_details.clone(),
                                         )
                                         .await
                                         .err()
@@ -398,7 +410,7 @@ impl WorkerActivityTasks {
                             act_metrics.act_execution_failed();
                         }
                         client
-                            .fail_activity_task(task_token.clone(), failure)
+                            .fail_activity_task(task_token.clone(), failure, last_heartbeat_details)
                             .await
                             .err()
                     }
@@ -414,6 +426,7 @@ impl WorkerActivityTasks {
                                 .fail_activity_task(
                                     task_token.clone(),
                                     Some(worker_shutdown_failure()),
+                                    last_heartbeat_details,
                                 )
                                 .await
                                 .err()
@@ -445,6 +458,7 @@ impl WorkerActivityTasks {
                                             .fail_activity_task(
                                                 task_token.clone(),
                                                 Some(make_payloads_too_large_failure(violation)),
+                                                last_heartbeat_details,
                                             )
                                             .await
                                             .err()
@@ -484,10 +498,11 @@ impl WorkerActivityTasks {
     ) -> Result<(), ActivityHeartbeatError> {
         // TODO: Propagate these back as cancels. Silent fails is too nonobvious
         let (heartbeat_timeout, timeout_resetter) = {
-            let outstanding_activity_tasks = self.outstanding_activity_tasks.lock();
+            let mut outstanding_activity_tasks = self.outstanding_activity_tasks.lock();
             let at_info = outstanding_activity_tasks
-                .get(&TaskToken(details.task_token.clone()))
+                .get_mut(&TaskToken(details.task_token.clone()))
                 .ok_or(ActivityHeartbeatError::UnknownActivity)?;
+            at_info.last_heartbeat_details = Some(details.details.clone());
             (at_info.heartbeat_timeout, at_info.timeout_resetter.clone())
         };
         let heartbeat_timeout: Duration = heartbeat_timeout

@@ -15,7 +15,7 @@ use std::{
 use temporalio_client::{
     Client, NamespacedClient, UntypedSignal, UntypedUpdate, UntypedWorkflow,
     WorkflowExecuteUpdateOptions, WorkflowExecutionInfo, WorkflowSignalOptions,
-    WorkflowStartOptions, grpc::WorkflowService,
+    WorkflowStartOptions, errors::WorkflowUpdateError, grpc::WorkflowService,
 };
 use temporalio_common::{
     data_converters::RawValue,
@@ -672,7 +672,7 @@ async fn update_with_local_acts() {
     impl UpdateWithLocalActsWf {
         #[run]
         async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<()> {
-            ctx.wait_condition(|s| s.done).await;
+            ctx.wait_condition(|s| s.done).await?;
             Ok(())
         }
 
@@ -731,10 +731,7 @@ async fn update_with_local_acts() {
         worker.run_until_done().await.unwrap();
     };
     join!(update, run);
-    handle
-        .fetch_history_and_replay(worker.inner_mut())
-        .await
-        .unwrap();
+    handle.fetch_history_and_replay(&mut worker).await.unwrap();
 }
 
 #[tokio::test]
@@ -797,10 +794,7 @@ async fn update_rejection_sdk() {
         worker.run_until_done().await.unwrap();
     };
     join!(update, run);
-    handle
-        .fetch_history_and_replay(worker.inner_mut())
-        .await
-        .unwrap();
+    handle.fetch_history_and_replay(&mut worker).await.unwrap();
 }
 
 #[tokio::test]
@@ -854,10 +848,7 @@ async fn update_fail_sdk() {
         worker.run_until_done().await.unwrap();
     };
     join!(update, run);
-    handle
-        .fetch_history_and_replay(worker.inner_mut())
-        .await
-        .unwrap();
+    handle.fetch_history_and_replay(&mut worker).await.unwrap();
 }
 
 #[tokio::test]
@@ -878,7 +869,7 @@ async fn unknown_update_rejected_sdk() {
     impl UnknownUpdateRejectedSdkWf {
         #[run]
         async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<()> {
-            ctx.wait_condition(|s| s.done).await;
+            ctx.wait_condition(|s| s.done).await?;
             Ok(())
         }
 
@@ -951,7 +942,7 @@ async fn update_timer_sequence() {
     impl UpdateTimerSequenceWf {
         #[run]
         async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<()> {
-            ctx.wait_condition(|s| s.done).await;
+            ctx.wait_condition(|s| s.done).await?;
             Ok(())
         }
 
@@ -991,10 +982,7 @@ async fn update_timer_sequence() {
         worker.run_until_done().await.unwrap();
     };
     join!(update, run);
-    handle
-        .fetch_history_and_replay(worker.inner_mut())
-        .await
-        .unwrap();
+    handle.fetch_history_and_replay(&mut worker).await.unwrap();
 }
 
 #[tokio::test]
@@ -1006,14 +994,21 @@ async fn task_failure_during_validation() {
     let mut worker = starter.worker().await;
     #[workflow]
     #[derive(Default)]
-    struct TaskFailureDuringValidationWf;
+    struct TaskFailureDuringValidationWf {
+        done: bool,
+    }
 
     #[workflow_methods]
     impl TaskFailureDuringValidationWf {
         #[run]
         async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<()> {
-            ctx.timer(Duration::from_secs(1)).await;
+            ctx.wait_condition(|state| state.done).await?;
             Ok(())
+        }
+
+        #[signal]
+        fn done(&mut self, _ctx: &mut SyncWorkflowContext<Self>, _: ()) {
+            self.done = true;
         }
 
         #[update_validator(do_update)]
@@ -1022,11 +1017,7 @@ async fn task_failure_during_validation() {
             _ctx: &WorkflowContextView,
             _: &(),
         ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-            static FAILCT: AtomicUsize = AtomicUsize::new(0);
-            if FAILCT.fetch_add(1, Ordering::Relaxed) < 2 {
-                panic!("ahhhhhh");
-            }
-            Ok(())
+            panic!("intentional validator panic")
         }
 
         #[update]
@@ -1050,7 +1041,7 @@ async fn task_failure_during_validation() {
         )
         .await
         .unwrap();
-    let update = async {
+    let update_result = async {
         let res = handle
             .execute_update(
                 TaskFailureDuringValidationWf::do_update,
@@ -1058,16 +1049,102 @@ async fn task_failure_during_validation() {
                 WorkflowExecuteUpdateOptions::default(),
             )
             .await;
+
+        handle
+            .signal(
+                TaskFailureDuringValidationWf::done,
+                (),
+                WorkflowSignalOptions::default(),
+            )
+            .await
+            .unwrap();
+        res
+    };
+    let run = async {
+        worker.run_until_done().await.unwrap();
+    };
+    let (update_result, _) = join!(update_result, run);
+    assert_matches!(
+        update_result,
+        Err(WorkflowUpdateError::Failed(failure))
+            if failure.message.contains("intentional validator panic")
+    );
+}
+
+#[tokio::test]
+async fn task_failure_during_update_handler() {
+    let wf_name = "task_failure_during_update_handler";
+    let mut starter = CoreWfStarter::new(wf_name);
+    starter.sdk_config.task_types = WorkerTaskTypes::workflow_only();
+    starter.workflow_options.task_timeout = Some(Duration::from_secs(1));
+    let mut worker = starter.worker().await;
+    #[workflow]
+    #[derive(Default)]
+    struct TaskFailureDuringUpdateHandlerWf {
+        done: bool,
+    }
+
+    #[workflow_methods]
+    impl TaskFailureDuringUpdateHandlerWf {
+        #[run]
+        async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<()> {
+            ctx.wait_condition(|state| state.done).await?;
+            Ok(())
+        }
+
+        #[signal]
+        fn done(&mut self, _ctx: &mut SyncWorkflowContext<Self>, _: ()) {
+            self.done = true;
+        }
+
+        #[update]
+        async fn do_update(
+            _ctx: &mut WorkflowContext<Self>,
+            _: (),
+        ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+            static FAILCT: AtomicUsize = AtomicUsize::new(0);
+            if FAILCT.fetch_add(1, Ordering::Relaxed) == 0 {
+                panic!("intentional update handler panic");
+            }
+            Ok("done".to_string())
+        }
+    }
+
+    worker
+        .register_workflow::<TaskFailureDuringUpdateHandlerWf>()
+        .unwrap();
+    let task_queue = starter.get_task_queue().to_owned();
+    let handle = worker
+        .submit_workflow(
+            TaskFailureDuringUpdateHandlerWf::run,
+            (),
+            WorkflowStartOptions::new(task_queue, starter.get_wf_id().to_owned()).build(),
+        )
+        .await
+        .unwrap();
+    let update = async {
+        let res = handle
+            .execute_update(
+                TaskFailureDuringUpdateHandlerWf::do_update,
+                (),
+                WorkflowExecuteUpdateOptions::default(),
+            )
+            .await;
         assert!(res.unwrap() == "done");
+        handle
+            .signal(
+                TaskFailureDuringUpdateHandlerWf::done,
+                (),
+                WorkflowSignalOptions::default(),
+            )
+            .await
+            .unwrap();
     };
     let run = async {
         worker.run_until_done().await.unwrap();
     };
     join!(update, run);
-    handle
-        .fetch_history_and_replay(worker.inner_mut())
-        .await
-        .unwrap();
+    handle.fetch_history_and_replay(&mut worker).await.unwrap();
     // Verify we did not spam task failures. There should only be one.
     let history = starter.get_history().await;
     assert_eq!(
@@ -1138,10 +1215,7 @@ async fn task_failure_after_update() {
         worker.run_until_done().await.unwrap();
     };
     join!(update, run);
-    handle
-        .fetch_history_and_replay(worker.inner_mut())
-        .await
-        .unwrap();
+    handle.fetch_history_and_replay(&mut worker).await.unwrap();
 }
 
 static BARR: LazyLock<Barrier> = LazyLock::new(|| Barrier::new(2));
@@ -1179,7 +1253,7 @@ async fn worker_restarted_in_middle_of_update() {
     impl WorkerRestartedInMiddleOfUpdateWf {
         #[run]
         async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<()> {
-            ctx.wait_condition(|s| s.done).await;
+            ctx.wait_condition(|s| s.done).await?;
             Ok(())
         }
 
@@ -1267,10 +1341,7 @@ async fn worker_restarted_in_middle_of_update() {
         worker.run_until_done().await.unwrap();
     };
     join!(update, run, stopper);
-    handle
-        .fetch_history_and_replay(worker.inner_mut())
-        .await
-        .unwrap();
+    handle.fetch_history_and_replay(&mut worker).await.unwrap();
 }
 
 #[tokio::test]
@@ -1293,7 +1364,9 @@ async fn update_after_empty_wft() {
         #[run]
         async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<()> {
             let sig_handle = async {
-                ctx.wait_condition(|s| s.signal_received).await;
+                ctx.wait_condition(|s| s.signal_received)
+                    .await
+                    .expect("workflow was not cancelled");
                 ACT_STARTED.store(true, Ordering::Release);
                 let _ = ctx
                     .execute_activity(
@@ -1364,10 +1437,7 @@ async fn update_after_empty_wft() {
         worker.run_until_done().await.unwrap();
     };
     join!(update, runner);
-    handle
-        .fetch_history_and_replay(worker.inner_mut())
-        .await
-        .unwrap();
+    handle.fetch_history_and_replay(&mut worker).await.unwrap();
 }
 
 #[tokio::test]
@@ -1389,7 +1459,7 @@ async fn update_lost_on_activity_mismatch() {
         async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<()> {
             ctx.state_mut(|s| s.can_run = 1);
             for _ in 1..=3 {
-                ctx.wait_condition(|s| s.can_run > 0).await;
+                ctx.wait_condition(|s| s.can_run > 0).await?;
                 let _ = ctx
                     .execute_activity(
                         StdActivities::echo,
@@ -1442,8 +1512,5 @@ async fn update_lost_on_activity_mismatch() {
         worker.run_until_done().await.unwrap();
     };
     join!(update, runner);
-    handle
-        .fetch_history_and_replay(worker.inner_mut())
-        .await
-        .unwrap();
+    handle.fetch_history_and_replay(&mut worker).await.unwrap();
 }

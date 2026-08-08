@@ -1197,14 +1197,15 @@ impl TryFrom<&WorkerOptions> for temporalio_sdk_core::WorkerConfig {
                             }
                         };
                         temporalio_sdk_core::WorkerVersioningStrategy::WorkerDeploymentBased(
-                            temporalio_common::worker::WorkerDeploymentOptions {
-                                version: temporalio_common::worker::WorkerDeploymentVersion {
+                            temporalio_common::worker::WorkerDeploymentOptions::new(
+                                temporalio_common::worker::WorkerDeploymentVersion {
                                     deployment_name: dopts.version.deployment_name.to_string(),
                                     build_id: dopts.version.build_id.to_string(),
                                 },
-                                use_worker_versioning: dopts.use_worker_versioning,
-                                default_versioning_behavior: dvb,
-                            },
+                            )
+                            .use_worker_versioning(dopts.use_worker_versioning)
+                            .maybe_default_versioning_behavior(dvb)
+                            .build(),
                         )
                     }
                     WorkerVersioningStrategy::LegacyBuildIdBased(l) => {

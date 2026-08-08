@@ -451,6 +451,20 @@ pub enum OutgoingWorkflowError {
     WorkflowSignal(#[from] Box<WorkflowSignalError>),
 }
 
+impl OutgoingWorkflowError {
+    /// If this workflow error was caused by cancellation, returns the associated
+    /// [`CancelledError`].
+    pub fn as_cancelled(&self) -> Option<&CancelledError> {
+        match self {
+            Self::Application(err) => err.as_cancelled(),
+            Self::ActivityExecution(err) => err.as_cancelled(),
+            Self::ChildWorkflowExecution(err) => err.as_cancelled(),
+            Self::ChildWorkflowStart(err) => err.as_cancelled(),
+            Self::WorkflowSignal(err) => err.as_cancelled(),
+        }
+    }
+}
+
 impl From<anyhow::Error> for OutgoingWorkflowError {
     fn from(value: anyhow::Error) -> Self {
         Self::Application(Box::new(ApplicationFailure::new(value)))
@@ -1055,6 +1069,16 @@ impl ChildWorkflowStartError {
             | ChildWorkflowStartError::Serialization(_) => None,
         }
     }
+
+    /// If this [`ChildWorkflowStartError`] was caused by cancellation, returns the associated
+    /// [`CancelledError`].
+    pub fn as_cancelled(&self) -> Option<&CancelledError> {
+        match self {
+            ChildWorkflowStartError::Cancelled(err) => Some(err),
+            ChildWorkflowStartError::StartFailed { .. }
+            | ChildWorkflowStartError::Serialization(_) => None,
+        }
+    }
 }
 
 /// Error returned when a child workflow execution fails.
@@ -1146,6 +1170,12 @@ impl WorkflowSignalError {
             WorkflowSignalError::Failed(err) => Some(err.error()),
             WorkflowSignalError::Serialization(_) => None,
         }
+    }
+
+    /// If this [`WorkflowSignalError`] was caused by cancellation, returns the associated
+    /// [`CancelledError`].
+    pub fn as_cancelled(&self) -> Option<&CancelledError> {
+        self.reason()?.as_cancelled()
     }
 }
 
