@@ -69,24 +69,7 @@ pub mod error;
 pub mod interceptors;
 /// Experimental APIs for configuring clients and workers with reusable plugins.
 pub mod plugins;
-/// Runtime configuration and low-level Core worker building blocks.
-///
-/// These types are grouped here to keep Core-specific configuration separate from the SDK's
-/// primary workflow and activity APIs. Create a [`crate::Runtime`] before connecting a client,
-/// then pass it to [`crate::Worker::new`].
-pub mod runtime {
-    pub use temporalio_sdk_core::{
-        ActivitySlotKind, FixedSizeSlotSupplier, LocalActivitySlotKind, NexusSlotKind,
-        PollerBehavior, ResourceBasedSlotsOptions, ResourceBasedSlotsOptionsBuilder,
-        ResourceBasedTuner, ResourceBasedTunerConfig, ResourceController, ResourceSlotOptions,
-        RuntimeOptions, RuntimeOptionsBuilder, SlotInfo, SlotInfoTrait, SlotKind, SlotKindType,
-        SlotMarkUsedContext, SlotReleaseContext, SlotReservationContext, SlotSupplier,
-        SlotSupplierOptions, SlotSupplierPermit, TokioRuntimeBuilder, TunerBuilder, TunerHolder,
-        TunerHolderOptions, TunerHolderOptionsBuilder, Worker as CoreWorker, WorkerConfig,
-        WorkerConfigBuilder, WorkerTuner, WorkerVersioningStrategy, WorkflowErrorType,
-        WorkflowSlotKind, init_replay_worker, replay,
-    };
-}
+pub mod runtime;
 mod workflow_executor;
 mod workflow_future;
 pub mod workflow_interceptors;
@@ -106,8 +89,8 @@ pub use crate::{
         WorkflowDefinitions,
     },
 };
+pub use runtime::Runtime;
 pub use temporalio_client::Namespace;
-pub use temporalio_sdk_core::CoreRuntime as Runtime;
 pub use temporalio_workflow::{
     ActivityCancellationType, ActivityCloseTimeouts, ActivityOptions, BaseWorkflowContext,
     CancellableFuture, CancellableFutureWithReason, ChildWorkflowCancellationType,

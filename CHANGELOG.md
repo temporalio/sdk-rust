@@ -26,6 +26,10 @@ to docs, or any other relevant information.
   and `list` read them back.
 * `MemoValue` and `MemoValues` are now exported from `temporalio_common` as well as
   `temporalio_workflow`, so the same types can be used from clients and workflows.
+* Worker heartbeats now report the SDK runtime, hosting environments, operating system, and
+  architecture once per worker, retrying until the first successful delivery. Runtime options can
+  disable this reporting, and language SDK bridges can supply their own runtime details. The Rust
+  SDK exposes separate runtime options that omit bridge-only runtime overrides.
 * `RpcOptions::builder()` for constructing per-call RPC options.
 * `DnsLoadBalancingOptions::builder()` for configuring DNS re-resolution intervals.
 
@@ -89,7 +93,62 @@ to docs, or any other relevant information.
 * Cancellation errors propagated after workflow cancellation now complete the workflow as cancelled
   instead of failed.
 
+### Fixed
+* Panics from update validators now reject the update instead of repeatedly failing workflow
+  tasks.
+
 ## [0.6.0] - 2026-08-04
+## [0.5.0]
+
+### Added
+* Workers are now automatically enrolled into poller autoscaling when the namespace advertises the
+  `poller_autoscaling_auto_enroll` capability. This only applies to poller types left at their
+  default (the worker set neither a fixed poller count nor a poller behavior); explicitly
+  configured pollers are left unchanged.
+* Support for dynamic client certificate resolution via `TlsOptions::client_cert_resolver`, which
+  accepts an `Arc<dyn ResolvesClientCert>` for per-handshake mTLS certificate selection. This enables
+  transparent certificate rotation without process restarts — useful for short-lived certificates
+  managed by Vault, cert-manager, or HSM-backed signers. `ResolvesClientCert`, `CertifiedKey`, and
+  `SignatureScheme` are re-exported from the crate root for convenience.
+* `client()` and `workflow_handle()` helpers to `ActivityContext` for easily obtaining a Temporal client
+* Exposed `backoff_start_interval` when continuing as new, which will delay the first task of the
+  continued workflow by the configured interval.
+* The `tls-ring` / `tls-aws-lc` features now also select the TLS crypto backend for the OTLP metric
+  exporter (in addition to the gRPC service client). Previously the OTLP exporter hardcoded the `ring`
+  backend regardless of the selected feature, which prevented producing a `ring`-free, `aws-lc-rs`-only
+  (FIPS-capable) build. Building with `--no-default-features --features tls-aws-lc,otel` now yields a
+  dependency tree free of `ring`.
+
+### Fixed
+* `GetSystemInfo` connection initialization now only falls back to empty server capabilities when
+  `UNIMPLEMENTED` indicates the RPC method is missing. Other `UNIMPLEMENTED` responses are
+  reported as connection errors.
+* Connection initialization now retries once with gRPC compression disabled if the eager
+  `GetSystemInfo` call fails because the server cannot decompress gzip.
+* Awaiting a Nexus operation's result (`StartedNexusOperation::result()`) no longer trips
+  nondeterminism detection ("a waker was invoked by a non-SDK source", TMPRL1100) on replay. The
+  result future is a `Shared`, whose internal waker machinery must be polled inside an `SdkWakeGuard`
+  (as `join_all` already is); it now is. Previously, a workflow that awaited a Nexus operation result
+  and then kept running (e.g. parked on a `wait_condition`) would fail its workflow task whenever it
+  was replayed — breaking queries and durable recovery for that execution.
+
+### Security
+* Replaced the unmaintained `backoff` dependency with `backon` for exponential retry and poll
+  backoff, clearing [RUSTSEC-2025-0012](https://rustsec.org/advisories/RUSTSEC-2025-0012) from
+  downstream security audits. Retry timing is preserved: exponential growth,
+  `randomization_factor` jitter, and the total retry-time budget behave as before.
+
+### Breaking Changes
+* The `ActivityContext` constructor now requires `ClientOptions`.
+* `WorkerConfig::{workflow,activity,nexus}_task_poller_behavior` and the corresponding Rust SDK
+  `WorkerOptions` fields are now `Option<PollerBehavior>`. `None` means the poller was not explicitly
+  configured and is eligible for automatic enrollment into poller autoscaling.
+### Breaking Changes
+
+- Rust SDK `ApplicationFailure` and `WorkflowError` APIs now use boxed `std::error::Error` values instead of
+  `anyhow::Error`.
+
+## [Unreleased]
 
 ### Added
 * `UntypedActivity` for invoking activities by a runtime activity type name with raw input and
@@ -217,6 +276,9 @@ to docs, or any other relevant information.
 ### Fixed
 * Try-cancel child workflows no longer cause nondeterminism when they complete or fail after their
   cancellation was requested.
+* Activity failures now include the latest heartbeat details atomically instead of force-flushing a
+  throttled heartbeat first. Temporal Server 1.16.0 or newer is required to guarantee those details
+  are preserved on failure; workers warn when the server does not advertise support.
 * `RuntimeOptions::default()` now uses the same 60-second worker heartbeat interval as the
   builder default.
 * Local activity resolutions are now delivered to workflows as each activity completes instead of

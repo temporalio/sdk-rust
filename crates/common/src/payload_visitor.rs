@@ -432,6 +432,7 @@ mod tests {
                     ..Default::default()
                 },
             )),
+            ..Default::default()
         };
 
         encode_payloads(
@@ -613,6 +614,7 @@ mod tests {
                     ..Default::default()
                 },
             )),
+            ..Default::default()
         };
 
         encode_payloads(

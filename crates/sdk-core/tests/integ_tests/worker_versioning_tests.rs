@@ -68,6 +68,7 @@ async fn sets_deployment_info_on_task_responses(#[values(true, false)] use_defau
         core.complete_workflow_activation(WorkflowActivationCompletion {
             run_id: res.run_id.clone(),
             status: Some(success_complete.into()),
+            ..Default::default()
         })
         .await
         .unwrap();
@@ -285,6 +286,7 @@ async fn versioning_off_with_custom_build_id() {
             ])
             .into(),
         ),
+        ..Default::default()
     })
     .await
     .unwrap();

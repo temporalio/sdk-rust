@@ -366,7 +366,11 @@ impl WFStream {
 
         let mut res = None;
 
-        let maybe_t = self.complete_wft(run_id, report.wft_report_status);
+        let maybe_t = self.complete_wft(
+            run_id,
+            report.wft_report_status,
+            &report.task_storage_metrics,
+        );
         // Augment the WFT from complete with the permit if both exist
         let wft_from_complete = wft_from_complete.and_then(|wft| {
             maybe_t.map(|t| PermittedWFT {
@@ -493,6 +497,7 @@ impl WFStream {
         &mut self,
         run_id: &str,
         wft_report_status: WFTReportStatus,
+        task_storage_metrics: &TaskStorageMetrics,
     ) -> Option<OutstandingTask> {
         // If the WFT completion wasn't sent to the server, but we did see the final event, we still
         // want to clear the workflow task. This can really only happen in replay testing, where we
@@ -519,7 +524,7 @@ impl WFStream {
                 return None;
             }
 
-            rh.mark_wft_complete(wft_report_status)
+            rh.mark_wft_complete(wft_report_status, task_storage_metrics)
         } else {
             None
         }

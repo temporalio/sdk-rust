@@ -114,6 +114,7 @@ mockall::mock! {
             &self,
             task_token: TaskToken,
             failure: Option<Failure>,
+            last_heartbeat_details: Option<Payloads>,
         ) -> impl Future<Output = Result<RespondActivityTaskFailedResponse>> + Send + 'b
             where 'a: 'b, Self: 'b;
 

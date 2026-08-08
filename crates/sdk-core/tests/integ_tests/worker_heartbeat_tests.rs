@@ -23,7 +23,13 @@ use temporalio_common::{
         temporal::api::{
             common::v1::RetryPolicy,
             enums::v1::WorkerStatus,
-            worker::v1::{PluginInfo, StorageDriverInfo, WorkerHeartbeat},
+            worker::v1::{
+                PluginInfo, StorageDriverInfo, WorkerHeartbeat,
+                environment_info::{
+                    Architecture, hosting_environment::HostingEnvironmentType, platform::Variant,
+                    runtime::RuntimeType,
+                },
+            },
             workflowservice::v1::{DescribeWorkerRequest, ListWorkersRequest},
         },
     },
@@ -94,6 +100,50 @@ async fn list_worker_heartbeats(client: &Client, query: impl Into<String>) -> Ve
         .into_iter()
         .filter_map(|info| info.worker_heartbeat)
         .collect()
+}
+
+fn assert_worker_environment(heartbeat: &WorkerHeartbeat) {
+    let environment = heartbeat
+        .environment
+        .as_ref()
+        .expect("environment info is present");
+    assert_eq!(environment.runtimes.len(), 1);
+    assert_eq!(environment.runtimes[0].r#type, RuntimeType::Native as i32);
+    assert!(environment.runtimes[0].version.is_empty());
+
+    let actual_architecture = match environment
+        .platform
+        .as_ref()
+        .expect("platform info is present")
+        .variant
+        .as_ref()
+        .expect("platform variant is present")
+    {
+        #[cfg(target_os = "linux")]
+        Variant::Linux(platform) => platform.architecture,
+        #[cfg(target_os = "macos")]
+        Variant::Macos(platform) => platform.architecture,
+        #[cfg(target_os = "windows")]
+        Variant::Windows(platform) => platform.architecture,
+        platform => panic!("unexpected platform variant: {platform:?}"),
+    };
+    let expected_architecture = if cfg!(target_arch = "x86_64") {
+        Architecture::Amd64
+    } else if cfg!(target_arch = "aarch64") {
+        Architecture::Arm64
+    } else {
+        Architecture::Unspecified
+    };
+    assert_eq!(actual_architecture, expected_architecture as i32);
+
+    if env::var("TEMPORAL_TEST_EXPECT_DOCKER").is_ok() {
+        assert!(
+            environment
+                .hosting_environments
+                .iter()
+                .any(|hosting| { hosting.r#type == HostingEnvironmentType::Docker as i32 })
+        );
+    }
 }
 
 // Tests that rely on Prometheus running in a docker container need to start
@@ -754,7 +804,13 @@ async fn worker_heartbeat_sticky_cache_miss() {
 #[tokio::test]
 async fn worker_heartbeat_multiple_workers() {
     let wf_name = "worker_heartbeat_multi_workers";
-    let mut starter = new_no_metrics_starter(wf_name);
+    let runtime_options = RuntimeOptions::builder()
+        .telemetry_options(TelemetryOptions::builder().build())
+        .heartbeat_interval(Some(Duration::from_secs(5)))
+        .build()
+        .unwrap();
+    let runtime = CoreRuntime::new_assume_tokio(runtime_options).unwrap();
+    let mut starter = CoreWfStarter::new_with_runtime(wf_name, runtime);
     starter.sdk_config.max_cached_workflows = 5_usize;
     starter.sdk_config.tuner = Arc::new(TunerHolder::fixed_size(5, 10, 10, 10));
     starter.sdk_config.register_activities(StdActivities);
@@ -784,6 +840,39 @@ async fn worker_heartbeat_multiple_workers() {
 
     let worker_a_key = worker_a.worker_instance_key().to_string();
     let worker_b_key = worker_b.worker_instance_key().to_string();
+    let initial_heartbeats = eventually(
+        || {
+            let client = client.clone();
+            let worker_a_key = worker_a_key.clone();
+            let worker_b_key = worker_b_key.clone();
+            async move {
+                let heartbeats = list_worker_heartbeats(&client, String::new()).await;
+                let heartbeats: Vec<_> = heartbeats
+                    .into_iter()
+                    .filter(|heartbeat| {
+                        heartbeat.worker_instance_key == worker_a_key
+                            || heartbeat.worker_instance_key == worker_b_key
+                    })
+                    .collect();
+                if heartbeats.len() == 2
+                    && heartbeats
+                        .iter()
+                        .all(|heartbeat| heartbeat.environment.is_some())
+                {
+                    Ok(heartbeats)
+                } else {
+                    Err("initial worker environments have not been recorded")
+                }
+            }
+        },
+        Duration::from_secs(7),
+    )
+    .await
+    .unwrap();
+    for heartbeat in &initial_heartbeats {
+        assert_worker_environment(heartbeat);
+    }
+
     let _ = starter
         .start_with_worker(MultiWorkersWf::name(), &mut worker_a)
         .await;
@@ -803,6 +892,14 @@ async fn worker_heartbeat_multiple_workers() {
         .collect();
     assert!(keys.contains(&worker_a_key));
     assert!(keys.contains(&worker_b_key));
+    assert!(
+        all.iter()
+            .filter(|heartbeat| {
+                heartbeat.worker_instance_key == worker_a_key
+                    || heartbeat.worker_instance_key == worker_b_key
+            })
+            .all(|heartbeat| heartbeat.environment.is_none())
+    );
 
     // Verify both heartbeats contain the same shared worker_grouping_key
     let worker_grouping_keys: HashSet<_> = all
@@ -1097,6 +1194,7 @@ async fn worker_heartbeat_skip_client_worker_set_check() {
     let runtimeopts = RuntimeOptions::builder()
         .telemetry_options(get_integ_telem_options())
         .heartbeat_interval(Some(Duration::from_secs(1)))
+        .disable_environment_info(true)
         .build()
         .unwrap();
     let rt = CoreRuntime::new_assume_tokio(runtimeopts).unwrap();
@@ -1162,4 +1260,13 @@ async fn worker_heartbeat_skip_client_worker_set_check() {
         }
     });
     assert!(heartbeat.is_some());
+    assert!(
+        heartbeat
+            .unwrap()
+            .worker_heartbeat
+            .as_ref()
+            .unwrap()
+            .environment
+            .is_none()
+    );
 }

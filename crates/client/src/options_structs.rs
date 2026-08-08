@@ -22,6 +22,8 @@ use temporalio_common::{
     search_attributes::SearchAttributes,
     telemetry::metrics::TemporalMeter,
 };
+#[cfg(feature = "dynamic-tls")]
+use tokio_rustls::rustls::client::ResolvesClientCert;
 use tokio_rustls::rustls::client::danger::ServerCertVerifier;
 use url::Url;
 
@@ -239,6 +241,9 @@ pub struct TlsOptions {
     /// the domain name will be extracted from the URL used to connect.
     pub domain: Option<String>,
     /// TLS info for the client. If specified, core will attempt to use mTLS.
+    ///
+    /// Mutually exclusive with [`client_cert_resolver`](TlsOptions::client_cert_resolver).
+    /// Setting both is an error.
     pub client_tls_options: Option<ClientTlsOptions>,
     /// Optional custom server certificate verifier. When set, this replaces the default
     /// certificate verification and `server_root_ca_cert` is ignored.
@@ -257,6 +262,12 @@ pub struct TlsOptions {
     /// Note that `domain` is still respected for the `:authority` header / origin override
     /// even when a custom verifier is set.
     pub server_cert_verifier: Option<Arc<dyn ServerCertVerifier>>,
+    /// Optional dynamic client certificate resolver for transparent mTLS certificate rotation.
+    ///
+    /// Mutually exclusive with [`client_tls_options`](TlsOptions::client_tls_options).
+    /// Setting both is an error.
+    #[cfg(feature = "dynamic-tls")]
+    pub client_cert_resolver: Option<Arc<dyn ResolvesClientCert>>,
 }
 
 impl Default for TlsOptions {
@@ -267,21 +278,26 @@ impl Default for TlsOptions {
 
 impl std::fmt::Debug for TlsOptions {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("TlsOptions")
-            .field(
-                "server_root_ca_cert",
-                &self
-                    .server_root_ca_cert
-                    .as_ref()
-                    .map(|c| format!("{} bytes", c.len())),
-            )
-            .field("domain", &self.domain)
-            .field("client_tls_options", &self.client_tls_options)
-            .field(
-                "server_cert_verifier",
-                &self.server_cert_verifier.as_ref().map(|_| "<custom>"),
-            )
-            .finish()
+        let mut s = f.debug_struct("TlsOptions");
+        s.field(
+            "server_root_ca_cert",
+            &self
+                .server_root_ca_cert
+                .as_ref()
+                .map(|c| format!("{} bytes", c.len())),
+        );
+        s.field("domain", &self.domain);
+        s.field("client_tls_options", &self.client_tls_options);
+        s.field(
+            "server_cert_verifier",
+            &self.server_cert_verifier.as_ref().map(|_| "<custom>"),
+        );
+        #[cfg(feature = "dynamic-tls")]
+        s.field(
+            "client_cert_resolver",
+            &self.client_cert_resolver.as_ref().map(|_| "<custom>"),
+        );
+        s.finish()
     }
 }
 
