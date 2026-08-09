@@ -121,7 +121,10 @@ use std::{
     fmt::Debug,
     pin::Pin,
     str::FromStr,
-    sync::{Arc, OnceLock},
+    sync::{
+        Arc, OnceLock,
+        atomic::AtomicBool,
+    },
     task::{Context, Poll},
     time::{Duration, SystemTime},
 };
@@ -220,6 +223,9 @@ struct ConnectionInner {
     /// Configured payload/memo size warning thresholds (bytes); `0` disables that warning.
     payloads_warn_size: usize,
     memo_warn_size: usize,
+    /// Set to `true` after the first successful RPC on this connection, used to gate
+    /// `PermissionDenied` retries (only retry if we've proven creds were valid).
+    established: Arc<AtomicBool>,
 }
 
 /// Resolve a user-configured warning threshold (bytes) into the internal representation. `0`
@@ -439,6 +445,7 @@ impl Connection {
                     "memo_warn_size",
                     options.payload_limits.memo_warn_size,
                 ),
+                established: Arc::new(AtomicBool::new(false)),
             }),
         })
     }

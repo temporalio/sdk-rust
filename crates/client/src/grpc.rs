@@ -153,22 +153,28 @@ impl RawGrpcCaller for Connection {
             self.inner.memo_warn_size,
         )?;
 
-        let info = self
-            .inner
-            .retry_options
-            .get_call_info(call_name, Some(&req));
+        let info = self.inner.retry_options.get_call_info(
+            call_name,
+            Some(&req),
+            Arc::clone(&self.inner.established),
+        );
         req.extensions_mut().insert(info.call_type);
         if info.call_type.is_long() {
             req.set_default_timeout(LONG_POLL_TIMEOUT);
         }
 
+        let established = Arc::clone(&self.inner.established);
         let fact = || {
             let req_clone = req_cloner(&req);
             callfn(req_clone)
         };
 
         let res = make_future_retry(info, fact);
-        res.map_err(|(e, _attempt)| e).map_ok(|x| x.0).await
+        let result = res.map_err(|(e, _attempt)| e).map_ok(|x| x.0).await;
+        if result.is_ok() {
+            established.store(true, std::sync::atomic::Ordering::Release);
+        }
+        result
     }
 }
 

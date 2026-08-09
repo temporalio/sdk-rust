@@ -9,6 +9,10 @@ use std::{
     error::Error,
     fmt::Debug,
     future::Future,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, Instant},
 };
 use tonic::Code;
@@ -50,6 +54,12 @@ pub struct RetryOptions {
     /// maximum number of retry attempts.
     #[builder(default = 10)]
     pub max_retries: usize,
+    /// When true, `PermissionDenied` errors will be retried if the client has previously
+    /// completed at least one successful RPC (indicating credentials were valid). This handles
+    /// transient auth failures on established connections (e.g. token rotation races) without
+    /// retrying genuinely unauthorized initial connections.
+    #[builder(default)]
+    pub retry_permission_denied_when_established: bool,
 }
 
 impl Default for RetryOptions {
@@ -67,6 +77,7 @@ impl RetryOptions {
             max_interval: Duration::from_secs(10),
             max_elapsed_time: None,
             max_retries: 0,
+            retry_permission_denied_when_established: false,
         }
     }
 
@@ -78,6 +89,7 @@ impl RetryOptions {
             max_interval: Duration::from_secs(10),
             max_elapsed_time: None,
             max_retries: 0,
+            retry_permission_denied_when_established: false,
         }
     }
 
@@ -90,6 +102,7 @@ impl RetryOptions {
             max_interval: Duration::from_secs(0),
             max_elapsed_time: None,
             max_retries: 1,
+            retry_permission_denied_when_established: false,
         }
     }
 
@@ -97,6 +110,7 @@ impl RetryOptions {
         &self,
         call_name: &'static str,
         request: Option<&tonic::Request<R>>,
+        established: Arc<AtomicBool>,
     ) -> CallInfo {
         let mut call_type = CallType::Normal;
         let mut retry_short_circuit = None;
@@ -124,6 +138,7 @@ impl RetryOptions {
             call_name,
             retry_cfg,
             retry_short_circuit,
+            established,
         }
     }
 
@@ -206,6 +221,8 @@ pub(crate) struct TonicErrorHandler {
     call_type: CallType,
     call_name: &'static str,
     retry_short_circuit: Option<NoRetryOnMatching>,
+    retry_permission_denied_when_established: bool,
+    established: Arc<AtomicBool>,
 }
 
 impl TonicErrorHandler {
@@ -213,12 +230,16 @@ impl TonicErrorHandler {
         Self {
             call_type: call_info.call_type,
             call_name: call_info.call_name,
+            retry_permission_denied_when_established: call_info
+                .retry_cfg
+                .retry_permission_denied_when_established,
             max_retries: call_info.retry_cfg.max_retries,
             max_interval: call_info.retry_cfg.max_interval,
             backoff: call_info.retry_cfg.jittered_backoff(),
             throttle_backoff: throttle_cfg.jittered_backoff(),
             retry_started_at: Instant::now(),
             retry_short_circuit: call_info.retry_short_circuit,
+            established: call_info.established,
         }
     }
 
@@ -250,6 +271,7 @@ pub(crate) struct CallInfo {
     call_name: &'static str,
     retry_cfg: RetryOptions,
     retry_short_circuit: Option<NoRetryOnMatching>,
+    established: Arc<AtomicBool>,
 }
 
 #[doc(hidden)]
@@ -321,9 +343,14 @@ impl ErrorHandler<tonic::Status> for TonicErrorHandler {
         let transport_cancel_retry_allowed =
             e.code() == Code::Cancelled && is_transport_cancelled(&e);
 
+        let permission_denied_retry_allowed = e.code() == Code::PermissionDenied
+            && self.retry_permission_denied_when_established
+            && self.established.load(Ordering::Acquire);
+
         if RETRYABLE_ERROR_CODES.contains(&e.code())
             || long_poll_allowed
             || transport_cancel_retry_allowed
+            || permission_denied_retry_allowed
         {
             if current_attempt == 1 {
                 debug!(error=?e, "gRPC call {} failed on first attempt", self.call_name);
@@ -388,7 +415,18 @@ mod tests {
         max_interval: Duration::from_millis(2),
         max_elapsed_time: None,
         max_retries: 10,
+        retry_permission_denied_when_established: false,
     };
+
+    fn test_call_info(call_type: CallType, call_name: &'static str) -> CallInfo {
+        CallInfo {
+            call_type,
+            call_name,
+            retry_cfg: TEST_RETRY_CONFIG,
+            retry_short_circuit: None,
+            established: Arc::new(AtomicBool::new(false)),
+        }
+    }
 
     const POLL_WORKFLOW_METH_NAME: &str = "poll_workflow_task_queue";
     const POLL_ACTIVITY_METH_NAME: &str = "poll_activity_task_queue";
@@ -407,12 +445,7 @@ mod tests {
         ] {
             for call_name in [POLL_WORKFLOW_METH_NAME, POLL_ACTIVITY_METH_NAME] {
                 let mut err_handler = TonicErrorHandler::new(
-                    CallInfo {
-                        call_type: CallType::TaskLongPoll,
-                        call_name,
-                        retry_cfg: TEST_RETRY_CONFIG,
-                        retry_short_circuit: None,
-                    },
+                    test_call_info(CallType::TaskLongPoll, call_name),
                     TEST_RETRY_CONFIG,
                 );
                 let result = err_handler.handle(1, Status::new(code, "Ahh"));
@@ -430,12 +463,7 @@ mod tests {
         for code in RETRYABLE_ERROR_CODES {
             for call_name in [POLL_WORKFLOW_METH_NAME, POLL_ACTIVITY_METH_NAME] {
                 let mut err_handler = TonicErrorHandler::new(
-                    CallInfo {
-                        call_type: CallType::TaskLongPoll,
-                        call_name,
-                        retry_cfg: TEST_RETRY_CONFIG,
-                        retry_short_circuit: None,
-                    },
+                    test_call_info(CallType::TaskLongPoll, call_name),
                     TEST_RETRY_CONFIG,
                 );
                 let result = err_handler.handle(1, Status::new(code, "Ahh"));
@@ -451,12 +479,7 @@ mod tests {
     #[tokio::test]
     async fn retry_resource_exhausted() {
         let mut err_handler = TonicErrorHandler::new(
-            CallInfo {
-                call_type: CallType::TaskLongPoll,
-                call_name: POLL_WORKFLOW_METH_NAME,
-                retry_cfg: TEST_RETRY_CONFIG,
-                retry_short_circuit: None,
-            },
+            test_call_info(CallType::TaskLongPoll, POLL_WORKFLOW_METH_NAME),
             RetryOptions {
                 initial_interval: Duration::from_millis(2),
                 randomization_factor: 0.0,
@@ -464,6 +487,7 @@ mod tests {
                 max_interval: Duration::from_millis(10),
                 max_elapsed_time: None,
                 max_retries: 10,
+                retry_permission_denied_when_established: false,
             },
         );
         let result = err_handler.handle(1, Status::new(Code::ResourceExhausted, "leave me alone"));
@@ -488,6 +512,7 @@ mod tests {
                 retry_short_circuit: Some(NoRetryOnMatching {
                     predicate: |s: &Status| s.code() == Code::ResourceExhausted,
                 }),
+                established: Arc::new(AtomicBool::new(false)),
             },
             TEST_RETRY_CONFIG,
         );
@@ -503,12 +528,7 @@ mod tests {
     #[tokio::test]
     async fn message_too_large_not_retried() {
         let mut err_handler = TonicErrorHandler::new(
-            CallInfo {
-                call_type: CallType::TaskLongPoll,
-                call_name: POLL_WORKFLOW_METH_NAME,
-                retry_cfg: TEST_RETRY_CONFIG,
-                retry_short_circuit: None,
-            },
+            test_call_info(CallType::TaskLongPoll, POLL_WORKFLOW_METH_NAME),
             TEST_RETRY_CONFIG,
         );
         let result = err_handler.handle(
@@ -564,7 +584,7 @@ mod tests {
         req.extensions_mut().insert(IsWorkerTaskLongPoll);
         for i in 1..=50 {
             let mut err_handler = TonicErrorHandler::new(
-                TEST_RETRY_CONFIG.get_call_info::<R>(call_name, Some(&req)),
+                TEST_RETRY_CONFIG.get_call_info::<R>(call_name, Some(&req), Arc::new(AtomicBool::new(false))),
                 RetryOptions::throttle_retry_policy(),
             );
             let result = err_handler.handle(i, Status::new(Code::Unknown, "Ahh"));
@@ -596,7 +616,7 @@ mod tests {
         // For some reason we will get cancelled in these situations occasionally (always?) too
         for code in [Code::Cancelled, Code::DeadlineExceeded] {
             let mut err_handler = TonicErrorHandler::new(
-                TEST_RETRY_CONFIG.get_call_info::<R>(call_name, Some(&req)),
+                TEST_RETRY_CONFIG.get_call_info::<R>(call_name, Some(&req), Arc::new(AtomicBool::new(false))),
                 RetryOptions::throttle_retry_policy(),
             );
             for i in 1..=5 {
@@ -611,12 +631,7 @@ mod tests {
         // A plain Code::Cancelled (no transport error in source chain) on a Normal call
         // must NOT be retried — this is spec-correct behavior for application-level cancels.
         let mut err_handler = TonicErrorHandler::new(
-            CallInfo {
-                call_type: CallType::Normal,
-                call_name: "respond_activity_task_completed",
-                retry_cfg: TEST_RETRY_CONFIG,
-                retry_short_circuit: None,
-            },
+            test_call_info(CallType::Normal, "respond_activity_task_completed"),
             TEST_RETRY_CONFIG,
         );
         let result = err_handler.handle(1, Status::new(Code::Cancelled, "caller cancelled"));
@@ -644,12 +659,7 @@ mod tests {
         // Cancelled status (created via from_error, which sets Code::Unknown but preserves
         // the transport source chain) IS retried multiple times on the standard budget.
         let mut err_handler = TonicErrorHandler::new(
-            CallInfo {
-                call_type: CallType::Normal,
-                call_name: "respond_activity_task_completed",
-                retry_cfg: TEST_RETRY_CONFIG,
-                retry_short_circuit: None,
-            },
+            test_call_info(CallType::Normal, "respond_activity_task_completed"),
             TEST_RETRY_CONFIG,
         );
 
@@ -668,5 +678,57 @@ mod tests {
                 "Transport error should be retried on attempt {i}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn permission_denied_not_retried_by_default() {
+        let mut err_handler = TonicErrorHandler::new(
+            test_call_info(CallType::Normal, "describe_namespace"),
+            TEST_RETRY_CONFIG,
+        );
+        let result = err_handler.handle(1, Status::new(Code::PermissionDenied, "forbidden"));
+        assert_matches!(result, RetryPolicy::ForwardError(_));
+    }
+
+    #[tokio::test]
+    async fn permission_denied_not_retried_when_not_established() {
+        let established = Arc::new(AtomicBool::new(false));
+        let retry_cfg = RetryOptions {
+            retry_permission_denied_when_established: true,
+            ..TEST_RETRY_CONFIG
+        };
+        let mut err_handler = TonicErrorHandler::new(
+            CallInfo {
+                call_type: CallType::Normal,
+                call_name: "describe_namespace",
+                retry_cfg,
+                retry_short_circuit: None,
+                established,
+            },
+            TEST_RETRY_CONFIG,
+        );
+        let result = err_handler.handle(1, Status::new(Code::PermissionDenied, "forbidden"));
+        assert_matches!(result, RetryPolicy::ForwardError(_));
+    }
+
+    #[tokio::test]
+    async fn permission_denied_retried_when_established_and_opted_in() {
+        let established = Arc::new(AtomicBool::new(true));
+        let retry_cfg = RetryOptions {
+            retry_permission_denied_when_established: true,
+            ..TEST_RETRY_CONFIG
+        };
+        let mut err_handler = TonicErrorHandler::new(
+            CallInfo {
+                call_type: CallType::Normal,
+                call_name: "describe_namespace",
+                retry_cfg,
+                retry_short_circuit: None,
+                established,
+            },
+            TEST_RETRY_CONFIG,
+        );
+        let result = err_handler.handle(1, Status::new(Code::PermissionDenied, "forbidden"));
+        assert_matches!(result, RetryPolicy::WaitRetry(_));
     }
 }
