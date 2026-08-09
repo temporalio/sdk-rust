@@ -1,4 +1,5 @@
 use crate::common::{CoreWfStarter, TestWorker, eventually};
+use futures_util::future::LocalBoxFuture;
 use std::{
     sync::{
         Arc,
@@ -13,9 +14,10 @@ use temporalio_client::{
 use temporalio_common::protos::temporal::api::enums::v1::EventType;
 use temporalio_macros::{activities, workflow, workflow_methods};
 use temporalio_sdk::{
-    ActivityOptions, SimplePlugin, WorkerPlugin, WorkflowContext, WorkflowContextView,
-    WorkflowDefinitions, WorkflowResult,
+    ActivityOptions, SimplePlugin, WorkerPlugin, WorkerRunError, WorkflowContext,
+    WorkflowContextView, WorkflowDefinitions, WorkflowResult,
     activities::{ActivityContext, ActivityError},
+    interceptors::{Next, RunWorkerInput, WithWorkflowReplayWorkerInput, WorkerInterceptor},
     workflow_replayer::{
         WorkflowReplayError, WorkflowReplayFailure, WorkflowReplayer, WorkflowReplayerOptions,
     },
@@ -373,6 +375,36 @@ struct ReplayConfigPlugin {
     configure_calls: Arc<AtomicUsize>,
 }
 
+struct ReplayLifecycleInterceptor {
+    run_calls: Arc<AtomicUsize>,
+    replay_calls: Arc<AtomicUsize>,
+}
+
+#[async_trait::async_trait(?Send)]
+impl WorkerInterceptor for ReplayLifecycleInterceptor {
+    fn run_worker<'a>(
+        &'a self,
+        input: RunWorkerInput<'a>,
+        next: Next<'a, RunWorkerInput<'a>, LocalBoxFuture<'a, Result<(), WorkerRunError>>>,
+    ) -> LocalBoxFuture<'a, Result<(), WorkerRunError>> {
+        self.run_calls.fetch_add(1, Ordering::Relaxed);
+        next.run(input)
+    }
+
+    fn with_workflow_replay_worker<'a>(
+        &'a self,
+        input: WithWorkflowReplayWorkerInput<'a>,
+        next: Next<
+            'a,
+            WithWorkflowReplayWorkerInput<'a>,
+            LocalBoxFuture<'a, Result<(), WorkerRunError>>,
+        >,
+    ) -> LocalBoxFuture<'a, Result<(), WorkerRunError>> {
+        self.replay_calls.fetch_add(1, Ordering::Relaxed);
+        next.run(input)
+    }
+}
+
 impl WorkerPlugin for ReplayConfigPlugin {
     fn name(&self) -> &str {
         "replay-config"
@@ -427,6 +459,26 @@ async fn workflow_replayer_applies_plugins() {
     );
     replayer.replay_workflow(history.clone()).await.unwrap();
     assert_eq!(configure_calls.load(Ordering::Relaxed), 1);
+
+    let run_calls = Arc::new(AtomicUsize::new(0));
+    let replay_calls = Arc::new(AtomicUsize::new(0));
+    let replayer = WorkflowReplayer::new(
+        WorkflowReplayerOptions::new()
+            .register_workflow::<SayHelloWorkflow>()
+            .unwrap()
+            .worker_interceptor(ReplayLifecycleInterceptor {
+                run_calls: run_calls.clone(),
+                replay_calls: replay_calls.clone(),
+            })
+            .build(),
+    )
+    .unwrap();
+    replayer
+        .replay_workflows([history.clone(), history.clone()])
+        .await
+        .unwrap();
+    assert_eq!(run_calls.load(Ordering::Relaxed), 0);
+    assert_eq!(replay_calls.load(Ordering::Relaxed), 1);
 
     let mut workflows = WorkflowDefinitions::new();
     workflows.register_workflow::<SayHelloWorkflow>().unwrap();

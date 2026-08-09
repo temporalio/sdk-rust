@@ -58,6 +58,8 @@ relevant information.
   instead of failed.
 * `WorkflowReplayer` for workflow history replay, including JSON history helpers
   and worker-plugin configuration.
+* Experimental worker lifecycle interception through `WorkerInterceptor::run_worker` and
+  `WorkerInterceptor::with_workflow_replay_worker`.
 
 ### Breaking Changes :boom:
 * `CancellableFuture` and `CancellableFutureWithReason` now use the inherited `Future::Output`

@@ -1,11 +1,11 @@
 //! User-definable interceptors are defined in this module
 
 use crate::{
-    Worker,
+    Worker, WorkerRunError,
     activities::{ActivityContext, ActivityError, ActivityInfo},
 };
 use anyhow::bail;
-use futures_util::future::BoxFuture;
+use futures_util::future::{BoxFuture, LocalBoxFuture};
 use std::{
     any::Any,
     collections::HashMap,
@@ -53,6 +53,28 @@ mod activity_execution_value {
 /// **Experimental:** This API may change or be removed.
 #[async_trait::async_trait(?Send)]
 pub trait WorkerInterceptor: Send + Sync {
+    /// Intercept the running of a worker.
+    fn run_worker<'a>(
+        &'a self,
+        input: RunWorkerInput<'a>,
+        next: Next<'a, RunWorkerInput<'a>, LocalBoxFuture<'a, Result<(), WorkerRunError>>>,
+    ) -> LocalBoxFuture<'a, Result<(), WorkerRunError>> {
+        next.run(input)
+    }
+
+    /// Intercept the running of a worker created for workflow replay.
+    fn with_workflow_replay_worker<'a>(
+        &'a self,
+        input: WithWorkflowReplayWorkerInput<'a>,
+        next: Next<
+            'a,
+            WithWorkflowReplayWorkerInput<'a>,
+            LocalBoxFuture<'a, Result<(), WorkerRunError>>,
+        >,
+    ) -> LocalBoxFuture<'a, Result<(), WorkerRunError>> {
+        next.run(input)
+    }
+
     /// Called every time a workflow activation completes (just before sending the completion to
     /// core).
     async fn on_workflow_activation_completion(&self, _completion: &WorkflowActivationCompletion) {}
@@ -73,6 +95,65 @@ pub trait WorkerInterceptor: Send + Sync {
 /// Interceptor implementations call [`Next::run`] to invoke the next step of the chain.
 pub struct Next<'a, I, O> {
     inner: Box<dyn FnOnce(I) -> O + Send + 'a>,
+}
+
+/// Input to [`WorkerInterceptor::run_worker`].
+#[derive(Debug)]
+#[non_exhaustive]
+pub struct RunWorkerInput<'a> {
+    /// The worker being run.
+    pub worker: &'a mut Worker,
+}
+
+impl<'a> RunWorkerInput<'a> {
+    pub(crate) fn new(worker: &'a mut Worker) -> Self {
+        Self { worker }
+    }
+}
+
+/// Input to [`WorkerInterceptor::with_workflow_replay_worker`].
+#[derive(Debug)]
+#[non_exhaustive]
+pub struct WithWorkflowReplayWorkerInput<'a> {
+    /// The worker created for this replay operation.
+    pub worker: &'a mut Worker,
+}
+
+impl<'a> WithWorkflowReplayWorkerInput<'a> {
+    pub(crate) fn new(worker: &'a mut Worker) -> Self {
+        Self { worker }
+    }
+}
+
+pub(crate) fn call_run_worker<'a>(
+    interceptors: &'a [Arc<dyn WorkerInterceptor>],
+    input: RunWorkerInput<'a>,
+    terminal: Next<'a, RunWorkerInput<'a>, LocalBoxFuture<'a, Result<(), WorkerRunError>>>,
+) -> LocalBoxFuture<'a, Result<(), WorkerRunError>> {
+    if let Some((interceptor, remaining)) = interceptors.split_first() {
+        let next = Next::new(move |input| call_run_worker(remaining, input, terminal));
+        interceptor.run_worker(input, next)
+    } else {
+        terminal.run(input)
+    }
+}
+
+pub(crate) fn call_with_workflow_replay_worker<'a>(
+    interceptors: &'a [Arc<dyn WorkerInterceptor>],
+    input: WithWorkflowReplayWorkerInput<'a>,
+    terminal: Next<
+        'a,
+        WithWorkflowReplayWorkerInput<'a>,
+        LocalBoxFuture<'a, Result<(), WorkerRunError>>,
+    >,
+) -> LocalBoxFuture<'a, Result<(), WorkerRunError>> {
+    if let Some((interceptor, remaining)) = interceptors.split_first() {
+        let next =
+            Next::new(move |input| call_with_workflow_replay_worker(remaining, input, terminal));
+        interceptor.with_workflow_replay_worker(input, next)
+    } else {
+        terminal.run(input)
+    }
 }
 
 impl<'a, I, O> Next<'a, I, O> {
@@ -180,6 +261,7 @@ pub trait ActivityInboundInterceptor: Send + Sync + 'static {
 }
 
 /// Supports the composition of interceptors
+// TODO: remove this, we already support vec based registration on the worker directly
 pub struct InterceptorWithNext {
     inner: Box<dyn WorkerInterceptor>,
     next: Option<Box<InterceptorWithNext>>,
@@ -200,6 +282,44 @@ impl InterceptorWithNext {
 
 #[async_trait::async_trait(?Send)]
 impl WorkerInterceptor for InterceptorWithNext {
+    fn run_worker<'a>(
+        &'a self,
+        input: RunWorkerInput<'a>,
+        next: Next<'a, RunWorkerInput<'a>, LocalBoxFuture<'a, Result<(), WorkerRunError>>>,
+    ) -> LocalBoxFuture<'a, Result<(), WorkerRunError>> {
+        self.inner.run_worker(
+            input,
+            Next::new(move |input| {
+                if let Some(interceptor) = &self.next {
+                    interceptor.run_worker(input, next)
+                } else {
+                    next.run(input)
+                }
+            }),
+        )
+    }
+
+    fn with_workflow_replay_worker<'a>(
+        &'a self,
+        input: WithWorkflowReplayWorkerInput<'a>,
+        next: Next<
+            'a,
+            WithWorkflowReplayWorkerInput<'a>,
+            LocalBoxFuture<'a, Result<(), WorkerRunError>>,
+        >,
+    ) -> LocalBoxFuture<'a, Result<(), WorkerRunError>> {
+        self.inner.with_workflow_replay_worker(
+            input,
+            Next::new(move |input| {
+                if let Some(interceptor) = &self.next {
+                    interceptor.with_workflow_replay_worker(input, next)
+                } else {
+                    next.run(input)
+                }
+            }),
+        )
+    }
+
     async fn on_workflow_activation_completion(&self, c: &WorkflowActivationCompletion) {
         self.inner.on_workflow_activation_completion(c).await;
         if let Some(next) = &self.next {

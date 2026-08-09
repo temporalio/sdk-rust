@@ -114,13 +114,13 @@ use crate::{
         ActivityContext, ActivityDefinitions, ActivityImplementer, ExecutableActivity,
         activity_error_to_core_result,
     },
-    interceptors::{ActivityInboundInterceptor, WorkerInterceptor},
+    interceptors::{ActivityInboundInterceptor, Next, RunWorkerInput, WorkerInterceptor},
     workflow_executor::{TaskHandle, WorkflowExecutor},
     workflow_future::start_workflow,
     workflow_interceptors::WorkflowInterceptorConstructor,
 };
 use anyhow::{anyhow, bail};
-use futures_util::{FutureExt, StreamExt, TryStreamExt};
+use futures_util::{FutureExt, StreamExt, TryStreamExt, future::LocalBoxFuture};
 use std::{
     any::{Any, TypeId},
     cell::RefCell,
@@ -950,6 +950,20 @@ impl Worker {
     /// Runs the worker. Eventually resolves after the worker has been explicitly shut down,
     /// or may return early with an error in the event of some unresolvable problem.
     pub async fn run(&mut self) -> Result<(), WorkerRunError> {
+        let interceptors = self.common.worker_interceptors.clone();
+        interceptors::call_run_worker(
+            &interceptors,
+            RunWorkerInput::new(self),
+            Next::new(
+                |input: RunWorkerInput<'_>| -> LocalBoxFuture<'_, Result<(), _>> {
+                    Box::pin(async move { input.worker.run_inner().await })
+                },
+            ),
+        )
+        .await
+    }
+
+    pub(crate) async fn run_inner(&mut self) -> Result<(), WorkerRunError> {
         // Perform the namespace check-in so poller behavior (e.g. autoscaling auto-enroll) is
         // resolved before any polling begins.
         self.common
@@ -1209,6 +1223,10 @@ impl Worker {
         }
         self.common.worker.shutdown().await;
         Ok(())
+    }
+
+    pub(crate) fn worker_interceptors(&self) -> Vec<Arc<dyn WorkerInterceptor>> {
+        self.common.worker_interceptors.clone()
     }
 
     /// Turns this rust worker into a new worker with all the same workflows and activities

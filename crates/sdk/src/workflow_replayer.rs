@@ -1,12 +1,12 @@
 use crate::{
     Worker, WorkerOptions, WorkerRunError,
-    interceptors::WorkerInterceptor,
+    interceptors::{self, Next, WithWorkflowReplayWorkerInput, WorkerInterceptor},
     plugins::WorkerPlugin,
     runtime::WorkflowErrorType,
     workflow_interceptors::WorkflowInterceptorConstructor,
     workflow_registry::{WorkflowDefinitions, WorkflowRegistrationError},
 };
-use futures_util::stream;
+use futures_util::{future::LocalBoxFuture, stream};
 use parking_lot::Mutex;
 use std::{
     collections::{HashMap, HashSet},
@@ -412,7 +412,18 @@ impl WorkflowReplayer {
             message: error.to_string(),
         })?;
 
-        if let Err(source) = worker.run().await {
+        let worker_interceptors = worker.worker_interceptors();
+        if let Err(source) = interceptors::call_with_workflow_replay_worker(
+            &worker_interceptors,
+            WithWorkflowReplayWorkerInput::new(&mut worker),
+            Next::new(
+                |input: WithWorkflowReplayWorkerInput<'_>| -> LocalBoxFuture<'_, Result<(), _>> {
+                    Box::pin(async move { input.worker.run_inner().await })
+                },
+            ),
+        )
+        .await
+        {
             let core_worker = worker.core_worker();
             core_worker.initiate_shutdown();
             core_worker.shutdown().await;
