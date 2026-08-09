@@ -977,6 +977,9 @@ impl TimeoutBag {
     /// Must be called once the associated local activity has been started / dispatched to lang.
     fn mark_started(&mut self) {
         if let Some((start_to_close, mut dat)) = self.start_to_close_dur_and_dat.as_ref().cloned() {
+            if let Some(old_handle) = self.start_to_close_handle.take() {
+                old_handle.abort();
+            }
             let started_t = Instant::now();
             let cchan = self.cancel_chan.clone();
             self.start_to_close_handle = Some(tokio::spawn(async move {
@@ -1467,6 +1470,67 @@ mod tests {
         sleep(timeout + Duration::from_millis(10)).await;
         assert!(lam.next_pending().await.unwrap().is_timeout(true));
         assert_eq!(lam.num_outstanding(), 0);
+    }
+
+    #[tokio::test]
+    async fn retry_does_not_fire_stale_start_to_close_timer() {
+        let lam = LocalActivityManager::test(1);
+        let start_to_close = Duration::from_millis(200);
+        lam.enqueue([NewLocalAct {
+            schedule_cmd: ValidScheduleLA {
+                seq: 1,
+                activity_id: 1.to_string(),
+                attempt: 1,
+                retry_policy: ValidatedRetryPolicy::from_proto_with_defaults(RetryPolicy {
+                    initial_interval: Some(prost_dur!(from_millis(1))),
+                    backoff_coefficient: 1.0,
+                    maximum_attempts: 3,
+                    ..Default::default()
+                }),
+                local_retry_threshold: Duration::from_secs(500),
+                close_timeouts: LACloseTimeouts::StartOnly(start_to_close),
+                ..Default::default()
+            },
+            workflow_type: "".to_string(),
+            workflow_exec_info: WorkflowExecution {
+                workflow_id: "".to_string(),
+                run_id: "run_id".to_string(),
+            },
+            schedule_time: SystemTime::now(),
+        }
+        .into()]);
+
+        // Dispatch attempt 1 — starts the start_to_close timer (T=0).
+        let next = lam.next_pending().await.unwrap().unwrap();
+        let tt = TaskToken(next.task_token);
+
+        // Burn some of the first timer's budget so the stale timer fires
+        // before the second attempt's timer would.
+        sleep(Duration::from_millis(100)).await;
+
+        // Fail so it retries locally.
+        lam.complete(
+            &tt,
+            LocalActivityExecutionResult::Failed(Default::default()),
+        );
+
+        // Dispatch attempt 2 — mark_started() should abort the old timer and
+        // spawn a fresh one (T≈100ms, first timer has ~100ms left, new timer
+        // has the full 200ms).
+        let next2 = lam.next_pending().await.unwrap().unwrap();
+        let _tt2 = TaskToken(next2.task_token);
+
+        // Wait long enough for the first timer to have fired if not aborted
+        // (~100ms remaining), but short enough that the second timer has NOT
+        // fired yet (needs ~200ms from now).
+        sleep(Duration::from_millis(130)).await;
+
+        // If the old handle was not aborted, a spurious StartToClose timeout
+        // would be queued and next_pending would return it here. With the fix,
+        // nothing should be available because attempt 2's timer hasn't fired.
+        let maybe = tokio::time::timeout(Duration::from_millis(20), lam.next_pending()).await;
+        assert!(maybe.is_err(), "no spurious timeout from stale timer");
+        assert_eq!(lam.num_outstanding(), 1, "attempt 2 still in-flight");
     }
 
     #[tokio::test]
