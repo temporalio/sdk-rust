@@ -36,7 +36,7 @@ async fn eager_wf_start() {
     let res = eager_start(
         wf_name,
         task_queue,
-        &starter.get_client().await,
+        &starter.get_core_client().await,
         starter.workflow_options.clone(),
     )
     .await;

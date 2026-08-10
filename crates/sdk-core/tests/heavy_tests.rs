@@ -316,7 +316,7 @@ async fn evict_while_la_running_no_interference() {
     let task_queue = starter.get_task_queue().to_owned();
     let mut worker = starter.worker().await;
 
-    let client = starter.get_client().await;
+    let client = starter.get_core_client().await;
     let subfs = FuturesUnordered::new();
     for i in 1..100 {
         let wf_id = format!("{wf_name}-{i}");
@@ -396,7 +396,7 @@ async fn can_paginate_long_history() {
         .await
         .unwrap();
     let run_id = handle.run_id().unwrap().to_owned();
-    let client = starter.get_client().await;
+    let client = starter.get_core_client().await;
     tokio::spawn(async move {
         let handle = WorkflowExecutionInfo {
             namespace: client.namespace(),
@@ -484,7 +484,7 @@ async fn poller_autoscaling_basic_loadtest() {
         .unwrap();
     let mut worker = starter.worker().await;
     let shutdown_handle = worker.inner_mut().shutdown_handle();
-    let client = starter.get_client().await;
+    let client = starter.get_core_client().await;
 
     let task_queue = starter.get_task_queue().to_owned();
     let mut workflow_handles = vec![];

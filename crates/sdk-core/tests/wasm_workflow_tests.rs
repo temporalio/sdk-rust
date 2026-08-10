@@ -272,7 +272,7 @@ async fn run_string_workflow(
     starter.sdk_config.register_wasm_workflow(component);
 
     let mut worker = starter.worker().await;
-    let client = starter.get_client().await;
+    let client = starter.get_core_client().await;
     let payload_converter = PayloadConverter::default();
     let input = RawValue::from_value(&"workflow", &payload_converter);
     let workflow_id = starter.get_wf_id().to_owned();
@@ -310,7 +310,7 @@ async fn run_patch_activation_workflow(
     starter.sdk_config.register_wasm_workflow(component);
 
     let mut worker = starter.worker().await;
-    let client = starter.get_client().await;
+    let client = starter.get_core_client().await;
     let payload_converter = PayloadConverter::default();
     let input = RawValue::from_value(&WASM_PATCH_ID, &payload_converter);
     let workflow_id = starter.get_wf_id().to_owned();

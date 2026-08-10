@@ -47,8 +47,8 @@ async fn sets_deployment_info_on_task_responses(#[values(true, false)] use_defau
         .default_versioning_behavior(VersioningBehavior::AutoUpgrade)
         .build();
     starter.set_core_task_types(WorkerTaskTypes::workflow_only());
-    let core = starter.get_worker().await;
-    let client = starter.get_client().await;
+    let core = starter.get_core_worker().await;
+    let client = starter.get_core_client().await;
 
     // A bit annoying. We have to start up polling here so that the deployment will exist before
     // we can describe it and then set the current version.
@@ -186,7 +186,7 @@ async fn activity_has_deployment_stamp() {
         .register_workflow::<ActivityHasDeploymentStampWf>()
         .unwrap();
     let mut worker = starter.worker().await;
-    let client = starter.get_client().await;
+    let client = starter.get_core_client().await;
     let submitter = worker.get_submitter_handle();
     let shutdown_handle = worker.inner_mut().shutdown_handle();
 
@@ -274,7 +274,7 @@ async fn versioning_off_with_custom_build_id() {
     })
     .build();
     starter.set_core_task_types(WorkerTaskTypes::workflow_only());
-    let core = starter.get_worker().await;
+    let core = starter.get_core_worker().await;
     starter.start_wf().await;
 
     let res = core.poll_workflow_activation().await.unwrap();
@@ -382,7 +382,7 @@ async fn continue_as_new_auto_upgrade_uses_current_deployment_version() {
     let mut worker1 = starter.worker().await;
     let mut worker2 = starter2.worker().await;
 
-    let client = starter.get_client().await;
+    let client = starter.get_core_client().await;
     let task_queue = starter.get_task_queue().to_owned();
     let workflow_id = starter.get_wf_id();
     let shutdown1 = worker1.inner_mut().shutdown_handle();
@@ -509,7 +509,7 @@ async fn continue_as_new_use_ramping_version_uses_ramping_deployment_version() {
     let mut worker1 = starter.worker().await;
     let mut worker2 = starter2.worker().await;
 
-    let client = starter.get_client().await;
+    let client = starter.get_core_client().await;
     let task_queue = starter.get_task_queue().to_owned();
     let workflow_id = starter.get_wf_id();
     let shutdown1 = worker1.inner_mut().shutdown_handle();

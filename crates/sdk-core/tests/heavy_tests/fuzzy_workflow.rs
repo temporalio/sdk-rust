@@ -84,7 +84,7 @@ async fn fuzzy_workflow() {
     starter.sdk_config.register_workflow::<FuzzyWf>().unwrap();
     let mut worker = starter.worker().await;
 
-    let client = starter.get_client().await;
+    let client = starter.get_core_client().await;
     let task_queue = starter.get_task_queue().to_owned();
 
     for i in 0..num_workflows {

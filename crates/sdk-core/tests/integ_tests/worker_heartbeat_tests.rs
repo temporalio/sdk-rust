@@ -277,7 +277,7 @@ async fn docker_worker_heartbeat_basic(#[values("otel", "prom", "no_metrics")] b
         // Give enough time to ensure heartbeat interval has been hit
         tokio::time::sleep(Duration::from_millis(1500)).await;
         acts_started.notified().await;
-        let client = starter.get_client().await;
+        let client = starter.get_core_client().await;
         let mut raw_client = client.clone();
         let workers_list = WorkflowService::list_workers(
             &mut raw_client,
@@ -449,7 +449,7 @@ async fn docker_worker_heartbeat_tuner() {
         .await;
     worker.run_until_done().await.unwrap();
 
-    let client = starter.get_client().await;
+    let client = starter.get_core_client().await;
     let mut raw_client = client.clone();
     let workers_list = WorkflowService::list_workers(
         &mut raw_client,
@@ -730,7 +730,7 @@ async fn worker_heartbeat_sticky_cache_miss() {
     let worker_core = worker.core_worker();
     let submitter = worker.get_submitter_handle();
     let wf_opts = starter.workflow_options.clone();
-    let client = starter.get_client().await;
+    let client = starter.get_core_client().await;
     let client_for_orchestrator = client.clone();
 
     let wf1_id = format!("{wf_name}_wf1");
@@ -827,7 +827,7 @@ async fn worker_heartbeat_multiple_workers() {
         .register_workflow::<MultiWorkersWf>()
         .unwrap();
 
-    let client = starter.get_client().await;
+    let client = starter.get_core_client().await;
     let starting_hb_len = list_worker_heartbeats(&client, String::new()).await.len();
 
     #[workflow]
@@ -1064,7 +1064,7 @@ async fn worker_heartbeat_failure_metrics() {
     let query = format!("WorkerInstanceKey=\"{worker_key}\"");
     let test_fut = async {
         ACT_FAIL.notified().await;
-        let client = starter.get_client().await;
+        let client = starter.get_core_client().await;
         eventually(
             || async {
                 let heartbeats = list_worker_heartbeats(&client, query.clone()).await;
@@ -1118,7 +1118,7 @@ async fn worker_heartbeat_failure_metrics() {
     };
     tokio::join!(test_fut, runner);
 
-    let client = starter.get_client().await;
+    let client = starter.get_core_client().await;
     let mut heartbeats = list_worker_heartbeats(&client, query).await;
     assert_eq!(heartbeats.len(), 1);
     let heartbeat = heartbeats.pop().unwrap();
@@ -1174,7 +1174,7 @@ async fn worker_heartbeat_no_runtime_heartbeat() {
         .await;
 
     worker.run_until_done().await.unwrap();
-    let client = starter.get_client().await;
+    let client = starter.get_core_client().await;
     let mut raw_client = client.clone();
     let workers_list = WorkflowService::list_workers(
         &mut raw_client,
@@ -1248,7 +1248,7 @@ async fn worker_heartbeat_skip_client_worker_set_check() {
         .await;
 
     worker.run_until_done().await.unwrap();
-    let client = starter.get_client().await;
+    let client = starter.get_core_client().await;
     let mut raw_client = client.clone();
     let workers_list = WorkflowService::list_workers(
         &mut raw_client,

@@ -73,7 +73,7 @@ async fn reset_workflow() {
         .unwrap();
     let run_id = handle.info().run_id.clone().unwrap();
 
-    let mut client = starter.get_client().await;
+    let mut client = starter.get_core_client().await;
     let resetter_fut = async {
         notify.notified().await;
         // Do the reset
@@ -225,7 +225,7 @@ async fn reset_randomseed() {
         .unwrap();
     let run_id = handle.info().run_id.clone().unwrap();
 
-    let mut client = starter.get_client().await;
+    let mut client = starter.get_core_client().await;
     let client_fur = async {
         notify.notified().await;
         handle

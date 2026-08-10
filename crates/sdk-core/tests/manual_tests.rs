@@ -151,7 +151,7 @@ async fn poller_load_spiky() {
         .unwrap();
     let mut worker = starter.worker().await;
     let submitter = worker.get_submitter_handle();
-    let client = starter.get_client().await;
+    let client = starter.get_core_client().await;
     let tq = starter.get_task_queue().to_owned();
 
     info!("Prom bound to {:?}", addr);
@@ -288,7 +288,7 @@ async fn poller_load_sustained() {
         .register_workflow::<PollerLoadSustainedWf>()
         .unwrap();
     let mut worker = starter.worker().await;
-    let client = starter.get_client().await;
+    let client = starter.get_core_client().await;
     let tq = starter.get_task_queue().to_owned();
 
     info!("Prom bound to {:?}", addr);
@@ -372,7 +372,7 @@ async fn poller_load_spike_then_sustained() {
         .unwrap();
     let mut worker = starter.worker().await;
     let submitter = worker.get_submitter_handle();
-    let client = starter.get_client().await;
+    let client = starter.get_core_client().await;
     let tq = starter.get_task_queue().to_owned();
 
     info!("Prom bound to {:?}", addr);

@@ -96,7 +96,7 @@ pub(crate) const INTEG_CLIENT_VERSION: &str = "0.1.0";
 /// upon. Returns the instance.
 pub(crate) async fn init_core_and_create_wf(test_name: &str) -> CoreWfStarter {
     let mut starter = CoreWfStarter::new(test_name);
-    let _ = starter.get_worker().await;
+    let _ = starter.get_core_worker().await;
     starter.start_wf().await;
     starter
 }
@@ -327,6 +327,12 @@ struct InitializedWorker {
     client: Client,
 }
 
+#[derive(Clone, Copy)]
+enum WorkerInitializationMode {
+    Sdk,
+    CoreOnly,
+}
+
 #[derive(Clone, Default)]
 struct TestWorkerInterceptorRouter {
     interceptor: Arc<RwLock<Option<Arc<dyn WorkerInterceptor>>>>,
@@ -396,7 +402,7 @@ impl CoreWfStarter {
 
         if check_mlsv && !version_req.is_empty() {
             let clustinfo = s
-                .get_client()
+                .get_core_client()
                 .await
                 .get_cluster_info(GetClusterInfoRequest::default().into_request())
                 .await;
@@ -460,12 +466,13 @@ impl CoreWfStarter {
     }
 
     pub(crate) async fn worker(&mut self) -> TestWorker {
-        let worker = self.get_worker().await;
+        let initialized = self.get_or_init(WorkerInitializationMode::Sdk).await;
+        let worker = initialized.worker.clone();
         worker
             .validate()
             .await
             .expect("Worker validation should succeed");
-        let client = self.get_client().await;
+        let client = initialized.client.clone();
         let interceptor_router = TestWorkerInterceptorRouter::default();
         let mut sdk_config = self.sdk_config.clone();
         sdk_config.worker_interceptor(interceptor_router.clone());
@@ -486,15 +493,27 @@ impl CoreWfStarter {
     }
 
     pub(crate) async fn shutdown(&mut self) {
-        self.get_worker().await.shutdown().await;
+        self.get_or_init(WorkerInitializationMode::Sdk)
+            .await
+            .worker
+            .shutdown()
+            .await;
     }
 
-    pub(crate) async fn get_worker(&mut self) -> Arc<CoreWorker> {
-        self.get_or_init().await.worker.clone()
+    /// Returns a Core worker for tests that drive Core directly rather than through the SDK.
+    pub(crate) async fn get_core_worker(&mut self) -> Arc<CoreWorker> {
+        self.get_or_init(WorkerInitializationMode::CoreOnly)
+            .await
+            .worker
+            .clone()
     }
 
-    pub(crate) async fn get_client(&mut self) -> Client {
-        self.get_or_init().await.client.clone()
+    /// Returns the client associated with a Core worker used directly by a test.
+    pub(crate) async fn get_core_client(&mut self) -> Client {
+        self.get_or_init(WorkerInitializationMode::CoreOnly)
+            .await
+            .client
+            .clone()
     }
 
     /// Start the workflow defined by the builder and return run id
@@ -523,7 +542,7 @@ impl CoreWfStarter {
     pub(crate) async fn start_wf_with_id(&self, workflow_id: String) -> String {
         let iw = self.initted_worker.get().expect(
             "Worker must be initted before starting a workflow.\
-                             Tests must call `get_worker` first.",
+                             Tests must initialize a worker first.",
         );
         let mut options = self.workflow_options.clone();
         options.workflow_id = workflow_id;
@@ -581,7 +600,7 @@ impl CoreWfStarter {
             .await
     }
 
-    async fn get_or_init(&mut self) -> &InitializedWorker {
+    async fn get_or_init(&mut self, mode: WorkerInitializationMode) -> &InitializedWorker {
         self.initted_worker
             .get_or_init(|| async {
                 let rt = if let Some(ref rto) = self.runtime_override {
@@ -604,12 +623,9 @@ impl CoreWfStarter {
                     (connection, client)
                 };
                 let mut sdk_config = self.sdk_config.clone();
-                let has_registrations =
-                    !sdk_config.workflows().is_empty() || !sdk_config.activities().is_empty();
-                if !has_registrations {
-                    // Core-only tests need a worker without language definitions, but converting
-                    // WorkerOptions rejects that public API configuration. The placeholder exists
-                    // only in this conversion clone and is never visible to an SDK worker.
+                if matches!(mode, WorkerInitializationMode::CoreOnly) {
+                    // Core tests intentionally have no SDK definitions, but SDK conversion needs
+                    // one.
                     sdk_config
                         .register_workflow::<workflows::LaProblemWorkflow>()
                         .expect("placeholder workflow registers");
@@ -619,7 +635,7 @@ impl CoreWfStarter {
                     .expect("sdk config converts to core config");
                 if let Some(task_types) = self.core_task_types {
                     core_config.task_types = task_types;
-                } else if !has_registrations {
+                } else if matches!(mode, WorkerInitializationMode::CoreOnly) {
                     core_config.task_types = WorkerTaskTypes::all();
                 }
                 if let Some(ref ccm) = self.core_config_mutator {

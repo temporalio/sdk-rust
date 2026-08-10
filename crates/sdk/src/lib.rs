@@ -1667,46 +1667,50 @@ mod tests {
         assert!(workflows.contains("OtherWorkflow"));
     }
 
+    #[rstest::rstest]
+    #[case::workflow_only(true, false, Ok(WorkerTaskTypes::workflow_only()))]
+    #[case::activity_only(false, true, Ok(WorkerTaskTypes::activity_only()))]
+    #[case::workflow_and_activity(
+        true,
+        true,
+        Ok(WorkerTaskTypes {
+            enable_workflows: true,
+            enable_local_activities: true,
+            enable_remote_activities: true,
+            enable_nexus: false,
+        })
+    )]
+    #[case::empty(
+        false,
+        false,
+        Err("At least one workflow or activity must be registered")
+    )]
     #[test]
-    fn task_types_are_derived_from_registrations() {
-        let workflow_config = WorkerOptions::new("task_q")
-            .register_workflow::<MyWorkflow>()
-            .unwrap()
-            .build()
-            .to_core_options("ns".into(), String::new())
-            .unwrap();
-        assert_eq!(workflow_config.task_types, WorkerTaskTypes::workflow_only());
+    fn task_types_are_derived_from_registrations(
+        #[case] register_workflow: bool,
+        #[case] register_activities: bool,
+        #[case] expected: Result<WorkerTaskTypes, &str>,
+    ) {
+        let options = if register_workflow {
+            WorkerOptions::new("task_q")
+                .register_workflow::<MyWorkflow>()
+                .unwrap()
+        } else {
+            WorkerOptions::new("task_q")
+        };
+        let options = if register_activities {
+            options.register_activities(MyActivities {})
+        } else {
+            options
+        };
 
-        let activity_config = WorkerOptions::new("task_q")
-            .register_activities(MyActivities {})
+        let actual = options
             .build()
             .to_core_options("ns".into(), String::new())
-            .unwrap();
-        assert_eq!(activity_config.task_types, WorkerTaskTypes::activity_only());
-
-        let combined_config = WorkerOptions::new("task_q")
-            .register_workflow::<MyWorkflow>()
-            .unwrap()
-            .register_activities(MyActivities {})
-            .build()
-            .to_core_options("ns".into(), String::new())
-            .unwrap();
+            .map(|config| config.task_types);
         assert_eq!(
-            combined_config.task_types,
-            WorkerTaskTypes {
-                enable_workflows: true,
-                enable_local_activities: true,
-                enable_remote_activities: true,
-                enable_nexus: false,
-            }
-        );
-
-        let empty_result = WorkerOptions::new("task_q")
-            .build()
-            .to_core_options("ns".into(), String::new());
-        assert_eq!(
-            empty_result.err().as_deref(),
-            Some("At least one workflow or activity must be registered")
+            actual.as_ref().map_err(String::as_str),
+            expected.as_ref().map_err(|err| *err)
         );
     }
 

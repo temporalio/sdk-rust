@@ -165,7 +165,7 @@ async fn sends_signal_with_create_wf() {
         .unwrap();
     let mut worker = starter.worker().await;
 
-    let client = starter.get_client().await;
+    let client = starter.get_core_client().await;
     let mut header: HashMap<String, Payload> = HashMap::new();
     header.insert("tupac".into(), "shakur".into());
     let task_queue = worker.inner_mut().task_queue().to_string();

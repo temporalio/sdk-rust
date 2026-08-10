@@ -177,7 +177,7 @@ async fn abandoned_child_bug_repro() {
         )
         .await
         .unwrap();
-    let client = starter.get_client().await;
+    let client = starter.get_core_client().await;
     let canceller = async {
         barr.wait().await;
         let parent_handle = client.get_workflow_handle::<UntypedWorkflow>("parent-abandoner");
@@ -266,7 +266,7 @@ async fn abandoned_child_resolves_post_cancel() {
         )
         .await
         .unwrap();
-    let client = starter.get_client().await;
+    let client = starter.get_core_client().await;
     let canceller = async {
         barr.wait().await;
         handle

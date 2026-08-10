@@ -47,7 +47,7 @@ async fn cancel_during_timer() {
         .register_workflow::<CancelledWf>()
         .unwrap();
     let mut worker = starter.worker().await;
-    let client = starter.get_client().await;
+    let client = starter.get_core_client().await;
     let task_queue = starter.get_task_queue().to_owned();
     let wf_id = task_queue.clone();
     let wf_handle = worker

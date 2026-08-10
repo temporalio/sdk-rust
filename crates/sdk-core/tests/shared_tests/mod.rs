@@ -373,7 +373,7 @@ pub(crate) async fn shutdown_during_active_timer_activity_workflows() {
         "Worker shutdown took {shutdown_elapsed:?}, expected < 5s"
     );
 
-    let client = starter.get_client().await;
+    let client = starter.get_core_client().await;
     for wf_id in &wf_ids {
         client
             .get_workflow_handle::<UntypedWorkflow>(wf_id)

@@ -75,7 +75,7 @@ async fn sends_upsert() {
         .unwrap();
     worker.run_until_done().await.unwrap();
 
-    let client = starter.get_client().await;
+    let client = starter.get_core_client().await;
     let search_attrs = client
         .get_workflow_handle::<UntypedWorkflow>(wf_id.to_string())
         .describe(WorkflowDescribeOptions::default())

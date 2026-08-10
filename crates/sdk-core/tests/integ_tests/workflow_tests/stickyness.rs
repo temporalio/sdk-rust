@@ -144,7 +144,7 @@ async fn cache_miss_ok() {
         )
         .await
         .unwrap();
-    let core = starter.get_worker().await;
+    let core = starter.get_core_worker().await;
     let run_id = handle.info().run_id.clone().unwrap();
     let (r1, _) = tokio::join!(worker.run_until_done(), async move {
         barr.wait().await;

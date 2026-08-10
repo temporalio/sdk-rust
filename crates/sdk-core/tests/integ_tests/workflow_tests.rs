@@ -121,7 +121,7 @@ async fn parallel_workflows_same_queue() {
 #[tokio::test]
 async fn shutdown_aborts_actively_blocked_poll() {
     let mut starter = CoreWfStarter::new("shutdown_aborts_actively_blocked_poll");
-    let core = starter.get_worker().await;
+    let core = starter.get_core_worker().await;
     // Begin the poll, and request shutdown from another thread after a small period of time.
     let tcore = core.clone();
     let handle = tokio::spawn(async move {
@@ -159,7 +159,7 @@ async fn fail_wf_task(#[values(true, false)] replay: bool) {
         Arc::new(init_core_replay_preloaded("fail_wf_task", [hist, hist2]))
     } else {
         let mut starter = init_core_and_create_wf("fail_wf_task").await;
-        starter.get_worker().await
+        starter.get_core_worker().await
     };
     // Start with a timer
     let task = core.poll_workflow_activation().await.unwrap();
@@ -202,7 +202,7 @@ async fn fail_wf_task(#[values(true, false)] replay: bool) {
 async fn fail_workflow_execution() {
     let core = init_core_and_create_wf("fail_workflow_execution")
         .await
-        .get_worker()
+        .get_core_worker()
         .await;
     let task = core.poll_workflow_activation().await.unwrap();
     core.complete_timer(&task.run_id, 0, Duration::from_secs(1))
@@ -224,8 +224,8 @@ async fn fail_workflow_execution() {
 #[tokio::test]
 async fn signal_workflow() {
     let mut starter = init_core_and_create_wf("signal_workflow").await;
-    let core = starter.get_worker().await;
-    let client = starter.get_client().await;
+    let core = starter.get_core_worker().await;
+    let client = starter.get_core_client().await;
     let workflow_id = starter.get_task_queue().to_string();
 
     let signal_id_1 = "signal1";
@@ -307,7 +307,7 @@ async fn signal_workflow() {
 async fn signal_workflow_signal_not_handled_on_workflow_completion() {
     let mut starter =
         init_core_and_create_wf("signal_workflow_signal_not_handled_on_workflow_completion").await;
-    let core = starter.get_worker().await;
+    let core = starter.get_core_worker().await;
     let workflow_id = starter.get_task_queue().to_string();
     let signal_id_1 = "signal1";
     for i in 1..=2 {
@@ -340,7 +340,7 @@ async fn signal_workflow_signal_not_handled_on_workflow_completion() {
             let run_id = res.run_id.clone();
 
             // Send the signal to the server
-            let sig_client = starter.get_client().await;
+            let sig_client = starter.get_core_client().await;
             WorkflowExecutionInfo {
                 namespace: sig_client.namespace(),
                 workflow_id: workflow_id.clone(),
@@ -393,8 +393,8 @@ async fn wft_timeout_doesnt_create_unsolvable_autocomplete() {
     wf_starter.sdk_config.workflow_task_poller_behavior =
         Some(PollerBehavior::SimpleMaximum(1_usize));
     wf_starter.workflow_options.task_timeout = Some(Duration::from_secs(1));
-    let core = wf_starter.get_worker().await;
-    let client = wf_starter.get_client().await;
+    let core = wf_starter.get_core_worker().await;
+    let client = wf_starter.get_core_client().await;
     let task_q = wf_starter.get_task_queue();
     let wf_id = &wf_starter.get_wf_id().to_owned();
 
@@ -573,9 +573,9 @@ async fn deployment_version_correct_in_wf_info(#[values(true, false)] use_only_b
         .build()
     };
     starter.set_core_task_types(WorkerTaskTypes::workflow_only());
-    let core = starter.get_worker().await;
+    let core = starter.get_core_worker().await;
     starter.start_wf().await;
-    let client = starter.get_client().await;
+    let client = starter.get_core_client().await;
     let workflow_id = starter.get_task_queue().to_string();
 
     let res = core.poll_workflow_activation().await.unwrap();
@@ -689,7 +689,7 @@ async fn deployment_version_correct_in_wf_info(#[values(true, false)] use_only_b
         .build()
     };
 
-    let core = starter.get_worker().await;
+    let core = starter.get_core_worker().await;
 
     let query_fut = async {
         query_handle
@@ -833,7 +833,7 @@ async fn nondeterminism_errors_fail_workflow_when_configured_to(
         }
     }
 
-    let client = starter.get_client().await;
+    let client = starter.get_core_client().await;
     let core_worker = worker.core_worker();
     starter.start_with_worker(wf_name, &mut worker).await;
 
@@ -1030,7 +1030,7 @@ async fn history_out_of_order_on_restart() {
     join!(w1, w2);
     // The workflow should fail with the nondeterminism error
     let handle = starter
-        .get_client()
+        .get_core_client()
         .await
         .get_workflow_handle::<UntypedWorkflow>(wf_name);
     let res = handle.get_result(Default::default()).await;

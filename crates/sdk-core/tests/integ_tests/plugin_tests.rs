@@ -1,6 +1,4 @@
-use crate::common::{
-    CoreWfStarter, get_integ_server_options, get_integ_telem_options, integ_namespace,
-};
+use crate::common::{get_integ_server_options, get_integ_telem_options, integ_namespace};
 use futures_util::future::BoxFuture;
 use std::{
     sync::{
@@ -25,7 +23,6 @@ use temporalio_common::{
     protos::{
         coresdk::workflow_activation::WorkflowActivation, temporal::api::common::v1::Payload,
     },
-    worker::WorkerTaskTypes,
 };
 use temporalio_macros::{activities, workflow, workflow_methods};
 use temporalio_sdk::{
@@ -113,7 +110,10 @@ async fn plugins_configure_client_and_worker() {
         .unwrap();
     assert_eq!(client.connection().identity(), "integration-plugin-client");
     assert_eq!(client.namespace(), integ_namespace());
-    let worker_options = WorkerOptions::new(format!("plugins-{}", Uuid::new_v4())).build();
+    let worker_options = WorkerOptions::new(format!("plugins-{}", Uuid::new_v4()))
+        .register_workflow::<SimplePluginWorkflow>()
+        .unwrap()
+        .build();
     let worker = Worker::new(&runtime, client, worker_options).unwrap();
 
     assert_eq!(connection_calls.load(Relaxed), 1);
@@ -245,22 +245,17 @@ async fn simple_plugin_configures_working_client_and_worker() {
     let client = Client::connect(get_integ_server_options(), client_options)
         .await
         .unwrap();
-    let mut starter = CoreWfStarter::new_with_overrides(
-        "simple_plugin_configures_working_client_and_worker",
-        None,
-        Some(client),
-    );
-    starter.set_core_task_types(WorkerTaskTypes {
-        enable_workflows: true,
-        enable_local_activities: true,
-        enable_remote_activities: true,
-        enable_nexus: false,
-    });
-    let task_queue = starter.get_task_queue().to_owned();
-    let mut worker = starter.worker().await;
+    let runtime = new_sdk_runtime();
+    let task_queue = format!("simple-plugin-{}", Uuid::new_v4());
+    let mut worker = Worker::new(
+        &runtime,
+        client.clone(),
+        WorkerOptions::new(task_queue.clone()).build(),
+    )
+    .unwrap();
     let workflow_id = format!("simple-plugin-{}", Uuid::new_v4());
-    let handle = worker
-        .submit_workflow(
+    let handle = client
+        .start_workflow(
             SimplePluginWorkflow::run,
             "Temporal".to_owned(),
             WorkflowStartOptions::new(task_queue, workflow_id).build(),
@@ -268,8 +263,17 @@ async fn simple_plugin_configures_working_client_and_worker() {
         .await
         .unwrap();
 
-    worker.run_until_done().await.unwrap();
-    let workflow_result = handle.get_result(Default::default()).await.unwrap();
+    let shutdown = worker.shutdown_handle();
+    let (workflow_result, worker_result) = tokio::join!(
+        async {
+            let result = handle.get_result(Default::default()).await;
+            shutdown();
+            result
+        },
+        worker.run(),
+    );
+    worker_result.unwrap();
+    let workflow_result = workflow_result.unwrap();
     assert_eq!(workflow_result, "Hello, Temporal!");
     assert_eq!(client_interceptor_calls.load(Ordering::Relaxed), 1);
     assert!(worker_interceptor_calls.load(Ordering::Relaxed) > 0);
@@ -392,6 +396,8 @@ async fn worker_metadata_includes_client_and_worker_plugin_names() {
         &runtime,
         client,
         WorkerOptions::new(format!("plugin-metadata-{}", Uuid::new_v4()))
+            .register_workflow::<SimplePluginWorkflow>()
+            .unwrap()
             .worker_plugin(WorkerOnlyMetadataPlugin)
             .build(),
     )

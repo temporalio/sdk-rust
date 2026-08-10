@@ -62,7 +62,7 @@ impl ActivityDoesntHeartbeatHitsTimeoutThenCompletesWf {
 #[tokio::test]
 async fn activity_heartbeat() {
     let mut starter = init_core_and_create_wf("activity_heartbeat").await;
-    let core = starter.get_worker().await;
+    let core = starter.get_core_worker().await;
     let task_q = starter.get_task_queue();
     let activity_id = "act-1";
     let task = core.poll_workflow_activation().await.unwrap();
@@ -134,7 +134,7 @@ async fn activity_heartbeat() {
 #[tokio::test]
 async fn many_act_fails_with_heartbeats() {
     let mut starter = init_core_and_create_wf("many_act_fails_with_heartbeats").await;
-    let core = starter.get_worker().await;
+    let core = starter.get_core_worker().await;
     let activity_id = "act-1";
     let task = core.poll_workflow_activation().await.unwrap();
     // Complete workflow task and schedule activity

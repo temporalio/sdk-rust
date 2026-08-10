@@ -590,7 +590,7 @@ async fn test_typed_signal_query_update() {
         .await
         .unwrap();
     let handle = starter
-        .get_client()
+        .get_core_client()
         .await
         .get_workflow_handle::<InteractionWorkflow>(wfid);
 
@@ -740,8 +740,8 @@ async fn client_interceptors_respect_registration_order() {
         .sdk_config
         .register_workflow::<ImmediatelyCompletingWf>()
         .unwrap();
-    let client = starter.get_client().await;
     let mut worker = starter.worker().await;
+    let client = starter.get_core_client().await;
     let task_queue = starter.get_task_queue().to_owned();
     let events = Arc::new(Mutex::new(Vec::new()));
 

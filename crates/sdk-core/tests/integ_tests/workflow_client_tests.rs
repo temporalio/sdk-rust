@@ -65,7 +65,7 @@ impl ClientInterceptor for StartWorkflowInterceptor {
 async fn client_interceptor_start_workflow() {
     let test_name = "client_interceptor_start_workflow";
     let mut starter = CoreWfStarter::new(test_name);
-    let mut client = starter.get_client().await;
+    let mut client = starter.get_core_client().await;
     let calls = Arc::new(AtomicUsize::new(0));
     client
         .options_mut()
@@ -102,8 +102,8 @@ async fn list_workflows(#[case] limit: Option<usize>) {
         .sdk_config
         .register_workflow::<EmptyWorkflow>()
         .unwrap();
-    let client = starter.get_client().await;
     let mut worker = starter.worker().await;
+    let client = starter.get_core_client().await;
 
     let suffix = rand_6_chars();
     let num_workflows = 5;
@@ -214,7 +214,7 @@ async fn list_workflows(#[case] limit: Option<usize>) {
 async fn already_started_error_contains_run_id() {
     let test_name = "already_started_error_contains_run_id";
     let mut starter = CoreWfStarter::new(test_name);
-    let client = starter.get_client().await;
+    let client = starter.get_core_client().await;
     let task_queue = starter.get_task_queue().to_owned();
     let wf_id = format!("{test_name}_{}", rand_6_chars());
 

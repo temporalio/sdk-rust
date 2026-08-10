@@ -69,8 +69,8 @@ enum CompleteWorkflow {
 #[tokio::test]
 async fn update_workflow(#[values(FailUpdate::Yes, FailUpdate::No)] will_fail: FailUpdate) {
     let mut starter = init_core_and_create_wf("update_workflow").await;
-    let core = starter.get_worker().await;
-    let client = starter.get_client().await;
+    let core = starter.get_core_worker().await;
+    let client = starter.get_core_client().await;
     let workflow_id = starter.get_task_queue();
     let update_id = "some_update";
     send_and_handle_update(
@@ -104,8 +104,8 @@ async fn update_workflow(#[values(FailUpdate::Yes, FailUpdate::No)] will_fail: F
 #[tokio::test]
 async fn reapplied_updates_due_to_reset() {
     let mut starter = init_core_and_create_wf("update_workflow").await;
-    let core = starter.get_worker().await;
-    let client = starter.get_client().await;
+    let core = starter.get_core_worker().await;
+    let client = starter.get_core_client().await;
     let workflow_id = starter.get_task_queue();
     let pre_reset_run_id = send_and_handle_update(
         workflow_id,
@@ -300,8 +300,8 @@ async fn handle_update(
 #[tokio::test]
 async fn update_rejection() {
     let mut starter = init_core_and_create_wf("update_workflow").await;
-    let core = starter.get_worker().await;
-    let client = starter.get_client().await;
+    let core = starter.get_core_worker().await;
+    let client = starter.get_core_client().await;
     let workflow_id = starter.get_task_queue().to_string();
 
     let update_id = "some_update";
@@ -379,8 +379,8 @@ async fn update_rejection() {
 #[tokio::test]
 async fn update_insta_complete(#[values(true, false)] accept_first: bool) {
     let mut starter = init_core_and_create_wf("update_workflow").await;
-    let core = starter.get_worker().await;
-    let client = starter.get_client().await;
+    let core = starter.get_core_worker().await;
+    let client = starter.get_core_client().await;
     let workflow_id = starter.get_task_queue().to_string();
 
     let update_id = "some_update";
@@ -472,8 +472,8 @@ async fn update_insta_complete(#[values(true, false)] accept_first: bool) {
 #[tokio::test]
 async fn update_complete_after_accept_without_new_task() {
     let mut starter = init_core_and_create_wf("update_workflow").await;
-    let core = starter.get_worker().await;
-    let client = starter.get_client().await;
+    let core = starter.get_core_worker().await;
+    let client = starter.get_core_client().await;
     let workflow_id = starter.get_task_queue().to_string();
 
     let update_id = "some_update";
@@ -572,8 +572,8 @@ async fn update_complete_after_accept_without_new_task() {
 #[tokio::test]
 async fn update_speculative_wft() {
     let mut starter = init_core_and_create_wf("update_workflow").await;
-    let core = starter.get_worker().await;
-    let client = starter.get_client().await;
+    let core = starter.get_core_worker().await;
+    let client = starter.get_core_client().await;
     let workflow_id = starter.get_task_queue().to_string();
 
     let update_id = "some_update";
@@ -866,7 +866,7 @@ async fn unknown_update_rejected_sdk() {
         .register_workflow::<UnknownUpdateRejectedSdkWf>()
         .unwrap();
     let mut worker = starter.worker().await;
-    let client = starter.get_client().await;
+    let client = starter.get_core_client().await;
 
     #[workflow]
     #[derive(Default)]
@@ -1083,9 +1083,7 @@ async fn task_failure_during_validation() {
 async fn task_failure_during_update_handler() {
     let wf_name = "task_failure_during_update_handler";
     let mut starter = CoreWfStarter::new(wf_name);
-    starter.sdk_config.task_types = WorkerTaskTypes::workflow_only();
     starter.workflow_options.task_timeout = Some(Duration::from_secs(1));
-    let mut worker = starter.worker().await;
     #[workflow]
     #[derive(Default)]
     struct TaskFailureDuringUpdateHandlerWf {
@@ -1118,9 +1116,11 @@ async fn task_failure_during_update_handler() {
         }
     }
 
-    worker
+    starter
+        .sdk_config
         .register_workflow::<TaskFailureDuringUpdateHandlerWf>()
         .unwrap();
+    let mut worker = starter.worker().await;
     let task_queue = starter.get_task_queue().to_owned();
     let handle = worker
         .submit_workflow(
@@ -1253,7 +1253,7 @@ async fn worker_restarted_in_middle_of_update() {
         .register_workflow::<WorkerRestartedInMiddleOfUpdateWf>()
         .unwrap();
     let mut worker = starter.worker().await;
-    let client = starter.get_client().await;
+    let client = starter.get_core_client().await;
 
     #[workflow]
     #[derive(Default)]
@@ -1318,7 +1318,7 @@ async fn worker_restarted_in_middle_of_update() {
             .await
             .unwrap();
     };
-    let core_worker = starter.get_worker().await;
+    let core_worker = starter.get_core_worker().await;
     let mut second_starter = starter.clone_no_worker();
     let stopper = async {
         // Wait for the activity to start
@@ -1344,7 +1344,7 @@ async fn worker_restarted_in_middle_of_update() {
         // This run attempt will get shut down
         worker.inner_mut().run().await.unwrap();
         // Start up a new worker
-        let new_worker = second_starter.get_worker().await;
+        let new_worker = second_starter.get_core_worker().await;
         // Replace with new core and run again
         worker.inner_mut().with_new_core_worker(new_worker);
         worker.run_until_done().await.unwrap();

@@ -1,8 +1,7 @@
 use crate::{
     common::{
         ActivationAssertionsInterceptor, CoreWfStarter, INTEG_CLIENT_IDENTITY,
-        activity_functions::StdActivities, build_fake_sdk_intercepted, eventually,
-        init_core_and_create_wf, mock_sdk, mock_sdk_cfg,
+        activity_functions::StdActivities, init_core_and_create_wf,
     },
     shared_tests,
 };
@@ -828,7 +827,7 @@ async fn unregistered_activity_type_fails_activity_task_not_worker() {
 #[tokio::test]
 async fn activity_workflow() {
     let mut starter = init_core_and_create_wf("activity_workflow").await;
-    let core = starter.get_worker().await;
+    let core = starter.get_core_worker().await;
     let task_q = starter.get_task_queue();
     let activity_id = "act-1";
     let task = core.poll_workflow_activation().await.unwrap();
@@ -893,7 +892,7 @@ async fn activity_workflow() {
 #[tokio::test]
 async fn activity_non_retryable_failure() {
     let mut starter = init_core_and_create_wf("activity_non_retryable_failure").await;
-    let core = starter.get_worker().await;
+    let core = starter.get_core_worker().await;
     let task_q = starter.get_task_queue();
     let activity_id = "act-1";
     let task = core.poll_workflow_activation().await.unwrap();
@@ -960,7 +959,7 @@ async fn activity_non_retryable_failure() {
 #[tokio::test]
 async fn activity_non_retryable_failure_with_error() {
     let mut starter = init_core_and_create_wf("activity_non_retryable_failure").await;
-    let core = starter.get_worker().await;
+    let core = starter.get_core_worker().await;
     let task_q = starter.get_task_queue();
     let activity_id = "act-1";
     let task = core.poll_workflow_activation().await.unwrap();
@@ -1106,7 +1105,7 @@ async fn workflow_observes_non_retryable_activity() {
 #[tokio::test]
 async fn activity_retry() {
     let mut starter = init_core_and_create_wf("activity_retry").await;
-    let core = starter.get_worker().await;
+    let core = starter.get_core_worker().await;
     let task_q = starter.get_task_queue();
     let activity_id = "act-1";
     let task = core.poll_workflow_activation().await.unwrap();
@@ -1172,7 +1171,7 @@ async fn activity_retry() {
 #[tokio::test]
 async fn activity_cancellation_try_cancel() {
     let mut starter = init_core_and_create_wf("activity_cancellation_try_cancel").await;
-    let core = starter.get_worker().await;
+    let core = starter.get_core_worker().await;
     let task_q = starter.get_task_queue();
     let activity_id = "act-1";
     let task = core.poll_workflow_activation().await.unwrap();
@@ -1229,7 +1228,7 @@ async fn activity_cancellation_try_cancel() {
 async fn activity_cancellation_plus_complete_doesnt_double_resolve() {
     let mut starter =
         init_core_and_create_wf("activity_cancellation_plus_complete_doesnt_double_resolve").await;
-    let core = starter.get_worker().await;
+    let core = starter.get_core_worker().await;
     let task_q = starter.get_task_queue();
     let activity_id = "act-1";
     let task = core.poll_workflow_activation().await.unwrap();
@@ -1321,7 +1320,7 @@ async fn activity_cancellation_plus_complete_doesnt_double_resolve() {
 #[tokio::test]
 async fn started_activity_timeout() {
     let mut starter = init_core_and_create_wf("started_activity_timeout").await;
-    let core = starter.get_worker().await;
+    let core = starter.get_core_worker().await;
     let task_q = starter.get_task_queue();
     let activity_id = "act-1";
     let task = core.poll_workflow_activation().await.unwrap();
@@ -1373,7 +1372,7 @@ async fn started_activity_timeout() {
 async fn activity_cancellation_wait_cancellation_completed() {
     let mut starter =
         init_core_and_create_wf("activity_cancellation_wait_cancellation_completed").await;
-    let core = starter.get_worker().await;
+    let core = starter.get_core_worker().await;
     let task_q = starter.get_task_queue();
     let activity_id = "act-1";
     let task = core.poll_workflow_activation().await.unwrap();
@@ -1435,7 +1434,7 @@ async fn activity_cancellation_wait_cancellation_completed() {
 #[tokio::test]
 async fn activity_cancellation_abandon() {
     let mut starter = init_core_and_create_wf("activity_cancellation_abandon").await;
-    let core = starter.get_worker().await;
+    let core = starter.get_core_worker().await;
     let task_q = starter.get_task_queue();
     let activity_id = "act-1";
     let task = core.poll_workflow_activation().await.unwrap();
@@ -1493,7 +1492,7 @@ async fn activity_cancellation_abandon() {
 #[tokio::test]
 async fn async_activity_completion_workflow() {
     let mut starter = init_core_and_create_wf("async_activity_workflow").await;
-    let core = starter.get_worker().await;
+    let core = starter.get_core_worker().await;
     let task_q = starter.get_task_queue();
     let activity_id = "act-1";
     let task = core.poll_workflow_activation().await.unwrap();
@@ -1527,7 +1526,7 @@ async fn async_activity_completion_workflow() {
     .await
     .unwrap();
     starter
-        .get_client()
+        .get_core_client()
         .await
         .get_async_activity_handle(ActivityIdentifier::TaskToken(task.task_token.into()))
         .complete(
@@ -1560,7 +1559,7 @@ async fn async_activity_completion_workflow() {
 #[tokio::test]
 async fn activity_cancelled_after_heartbeat_times_out() {
     let mut starter = init_core_and_create_wf("activity_cancelled_after_heartbeat_times_out").await;
-    let core = starter.get_worker().await;
+    let core = starter.get_core_worker().await;
     let task_q = starter.get_task_queue().to_string();
     let activity_id = "act-1";
     let task = core.poll_workflow_activation().await.unwrap();
@@ -1612,7 +1611,7 @@ async fn activity_cancelled_after_heartbeat_times_out() {
     drain_pollers_and_shutdown(&core).await;
     // Cleanup just in case
     starter
-        .get_client()
+        .get_core_client()
         .await
         .get_workflow_handle::<UntypedWorkflow>(task_q)
         .terminate(WorkflowTerminateOptions::default())
@@ -1624,7 +1623,7 @@ async fn activity_cancelled_after_heartbeat_times_out() {
 async fn activity_failure_includes_latest_heartbeat_on_retry() {
     let mut starter =
         init_core_and_create_wf("activity_failure_includes_latest_heartbeat_on_retry").await;
-    let core = starter.get_worker().await;
+    let core = starter.get_core_worker().await;
     let task_q = starter.get_task_queue().to_string();
     let task = core.poll_workflow_activation().await.unwrap();
     core.complete_workflow_activation(WorkflowActivationCompletion::from_cmd(
@@ -1832,7 +1831,7 @@ async fn graceful_shutdown() {
         .register_workflow::<GracefulShutdownWorkflow>()
         .unwrap();
     let mut worker = starter.worker().await;
-    let client = starter.get_client().await;
+    let client = starter.get_core_client().await;
 
     #[workflow]
     #[derive(Default)]

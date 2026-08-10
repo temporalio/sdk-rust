@@ -942,7 +942,7 @@ async fn repro_nondeterminism_with_timer_bug() {
         .await
         .unwrap();
     worker.run_until_done().await.unwrap();
-    let client = starter.get_client().await;
+    let client = starter.get_core_client().await;
     let handle = WorkflowExecutionInfo {
         namespace: client.namespace(),
         workflow_id: wf_name.into(),
@@ -1109,7 +1109,7 @@ async fn la_resolve_same_time_as_other_cancel() {
         .await
         .unwrap();
     worker.run_until_done().await.unwrap();
-    let client = starter.get_client().await;
+    let client = starter.get_core_client().await;
     let handle = WorkflowExecutionInfo {
         namespace: client.namespace(),
         workflow_id: wf_name.into(),

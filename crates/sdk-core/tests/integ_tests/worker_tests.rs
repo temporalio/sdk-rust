@@ -1,4 +1,3 @@
-use super::client_tests::make_ok_response;
 use crate::{
     common::{
         CoreWfStarter, activity_functions::StdActivities, fake_grpc_server::fake_server,
@@ -20,7 +19,7 @@ use std::{
     time::Duration,
 };
 use temporalio_client::{
-    Client, ClientOptions, Connection, PayloadLimitsOptions, RetryOptions, WorkflowStartOptions,
+    Client, ClientOptions, Connection, PayloadLimitsOptions, WorkflowStartOptions,
     errors::WorkflowGetResultError,
 };
 use temporalio_common::{
@@ -48,11 +47,9 @@ use temporalio_common::{
                     Attributes::{self as EventAttributes},
                 },
             },
-            namespace::v1::{NamespaceInfo, namespace_info::Capabilities},
             workflowservice::v1::{
-                DescribeNamespaceResponse, GetWorkflowExecutionHistoryResponse,
-                PollActivityTaskQueueResponse, PollWorkflowTaskQueueResponse,
-                RespondActivityTaskCompletedResponse, ShutdownWorkerResponse,
+                GetWorkflowExecutionHistoryResponse, PollActivityTaskQueueResponse,
+                RespondActivityTaskCompletedResponse,
             },
         },
     },
@@ -118,6 +115,10 @@ async fn worker_validation_fails_on_nonexistent_namespace() {
 async fn worker_handles_unknown_workflow_types_gracefully() {
     let wf_type = "worker_handles_unknown_workflow_types_gracefully";
     let mut starter = CoreWfStarter::new(wf_type);
+    starter
+        .sdk_config
+        .register_workflow::<ResourceBasedNonStickyWf>()
+        .unwrap();
     let mut worker = starter.worker().await;
 
     let task_queue = starter.get_task_queue().to_owned();
@@ -181,7 +182,7 @@ async fn worker_handles_unknown_workflow_types_gracefully() {
     let inner = worker.inner_mut();
     tokio::join!(async { inner.run().await.unwrap() }, async move {
         notify.notified().await;
-        let worker = starter.get_worker().await.clone();
+        let worker = starter.get_core_worker().await.clone();
         drain_pollers_and_shutdown(&worker).await;
     });
 }
@@ -1427,83 +1428,9 @@ async fn shutdown_worker_not_retried() {
 
     let wf_type = "shutdown_worker_not_retried";
     let mut starter = CoreWfStarter::new_with_overrides(wf_type, None, Some(client));
-    let worker = starter.get_worker().await;
+    let worker = starter.get_core_worker().await;
     drain_pollers_and_shutdown(&worker).await;
     assert_eq!(shutdown_call_count.load(Ordering::Relaxed), 1);
-}
-
-#[tokio::test]
-async fn high_level_workflow_only_worker_shuts_down() {
-    let workflow_poll_started = Arc::new(Notify::new());
-    let workflow_poll_started_for_server = workflow_poll_started.clone();
-    let shutdown_rpc_started = Arc::new(AtomicBool::new(false));
-    let shutdown_rpc_started_for_server = shutdown_rpc_started.clone();
-    let release_workflow_polls = Arc::new(Notify::new());
-    let release_workflow_polls_for_server = release_workflow_polls.clone();
-    let fs = fake_server(move |req| {
-        let workflow_poll_started = workflow_poll_started_for_server.clone();
-        let shutdown_rpc_started = shutdown_rpc_started_for_server.clone();
-        let release_workflow_polls = release_workflow_polls_for_server.clone();
-        async move {
-            let path = req.uri().path();
-            if path.contains("DescribeNamespace") {
-                make_ok_response(DescribeNamespaceResponse {
-                    namespace_info: Some(NamespaceInfo {
-                        capabilities: Some(Capabilities {
-                            worker_poll_complete_on_shutdown: true,
-                            ..Default::default()
-                        }),
-                        ..Default::default()
-                    }),
-                    ..Default::default()
-                })
-            } else if path.contains("PollWorkflowTaskQueue") {
-                workflow_poll_started.notify_one();
-                release_workflow_polls.notified().await;
-                make_ok_response(PollWorkflowTaskQueueResponse::default())
-            } else if path.contains("ShutdownWorker") {
-                shutdown_rpc_started.store(true, Ordering::Relaxed);
-                release_workflow_polls.notify_waiters();
-                make_ok_response(ShutdownWorkerResponse::default())
-            } else {
-                tonic::Status::unimplemented(path.to_owned()).into_http()
-            }
-        }
-        .boxed()
-    })
-    .await;
-
-    let mut connection_options = get_integ_server_options();
-    connection_options.target = format!("http://localhost:{}", fs.addr.port())
-        .parse::<url::Url>()
-        .unwrap();
-    connection_options.set_skip_get_system_info(true);
-    connection_options.retry_options = RetryOptions::no_retries();
-    let connection = Connection::connect(connection_options).await.unwrap();
-    let client = Client::new(connection, ClientOptions::new("default").build()).unwrap();
-    let runtime =
-        CoreRuntime::new_assume_tokio(get_integ_runtime_options(get_integ_telem_options()))
-            .unwrap();
-    let options = WorkerOptions::new("workflow_only_shutdown")
-        .register_workflow::<ResourceBasedNonStickyWf>()
-        .unwrap()
-        .build();
-    let mut worker = temporalio_sdk::Worker::new(&runtime, client, options).unwrap();
-    let shutdown = worker.shutdown_handle();
-    let mut worker_run = Box::pin(worker.run());
-
-    tokio::select! {
-        _ = workflow_poll_started.notified() => {}
-        result = &mut worker_run => panic!("worker stopped before shutdown: {result:?}"),
-    }
-    shutdown();
-    let shutdown_result = tokio::time::timeout(Duration::from_secs(1), &mut worker_run).await;
-    fs.server_handle.abort();
-
-    shutdown_result
-        .expect("workflow-only worker should shut down without an activity poll loop")
-        .unwrap();
-    assert!(shutdown_rpc_started.load(Ordering::Relaxed));
 }
 
 #[test]

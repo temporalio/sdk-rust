@@ -589,7 +589,7 @@ async fn query_of_closed_workflow_doesnt_tick_terminal_metric(
         CoreWfStarter::new_with_runtime("query_of_closed_workflow_doesnt_tick_terminal_metric", rt);
     // Disable cache to ensure replay happens completely
     starter.sdk_config.max_cached_workflows = 0_usize;
-    let worker = starter.get_worker().await;
+    let worker = starter.get_core_worker().await;
     let run_id = starter.start_wf().await;
     let task = worker.poll_workflow_activation().await.unwrap();
     // Fail wf task
@@ -643,7 +643,7 @@ async fn query_of_closed_workflow_doesnt_tick_terminal_metric(
         .unwrap();
 
     // Query the now-closed workflow
-    let client = starter.get_client().await;
+    let client = starter.get_core_client().await;
     let queryer = async {
         WorkflowExecutionInfo {
             namespace: client.namespace(),
@@ -757,7 +757,7 @@ async fn latency_metrics(
     ));
     let rt = CoreRuntime::new_assume_tokio(get_integ_runtime_options(telemopts)).unwrap();
     let mut starter = CoreWfStarter::new_with_runtime("latency_metrics", rt);
-    let worker = starter.get_worker().await;
+    let worker = starter.get_core_worker().await;
     starter.start_wf().await;
     // Immediately finish workflow
     let task = worker.poll_workflow_activation().await.unwrap();
@@ -938,7 +938,7 @@ async fn docker_metrics_with_prometheus(
     let rt = CoreRuntime::new_assume_tokio(get_integ_runtime_options(telemopts)).unwrap();
     let test_name = "docker_metrics_with_prometheus";
     let mut starter = CoreWfStarter::new_with_runtime(test_name, rt);
-    let worker = starter.get_worker().await;
+    let worker = starter.get_core_worker().await;
     starter.start_wf().await;
 
     // Immediately finish the workflow
@@ -951,7 +951,7 @@ async fn docker_metrics_with_prometheus(
         .await
         .unwrap();
 
-    let client = starter.get_client().await;
+    let client = starter.get_core_client().await;
     WorkflowService::list_namespaces(
         &mut client.clone(),
         ListNamespacesRequest::default().into_request(),
@@ -1176,7 +1176,7 @@ async fn nexus_metrics() {
         .register_workflow::<NexusMetricsWf>()
         .unwrap();
     let mut worker = starter.worker().await;
-    let core_worker = starter.get_worker().await;
+    let core_worker = starter.get_core_worker().await;
     let endpoint = mk_nexus_endpoint(&mut starter).await;
 
     #[workflow]

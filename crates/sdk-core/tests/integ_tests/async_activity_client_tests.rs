@@ -155,7 +155,7 @@ async fn async_activity_completions(
         .register_workflow::<AsyncCompletionWorkflow>()
         .unwrap();
     let mut worker = starter.worker().await;
-    let client = starter.get_client().await;
+    let client = starter.get_core_client().await;
 
     let completion_task = tokio::spawn(async move {
         let info = info_rx.recv().await.expect("should receive activity info");

@@ -118,7 +118,7 @@ async fn nexus_basic(
         .register_workflow::<NexusBasicWf>()
         .unwrap();
     let mut worker = starter.worker().await;
-    let core_worker = starter.get_worker().await;
+    let core_worker = starter.get_core_worker().await;
 
     let endpoint = mk_nexus_endpoint(&mut starter).await;
 
@@ -131,7 +131,7 @@ async fn nexus_basic(
         .await
         .unwrap();
 
-    let client = starter.get_client().await;
+    let client = starter.get_core_client().await;
     let nexus_task_handle = async {
         let nt = core_worker.poll_nexus_task().await.unwrap().unwrap_task();
         match outcome {
@@ -338,7 +338,7 @@ async fn nexus_async(
         .register_workflow::<AsyncCompleter>()
         .unwrap();
     let mut worker = starter.worker().await;
-    let core_worker = starter.get_worker().await;
+    let core_worker = starter.get_core_worker().await;
 
     let endpoint = mk_nexus_endpoint(&mut starter).await;
     let schedule_to_close_timeout = if outcome == Outcome::CancelAfterRecordedBeforeStarted {
@@ -362,7 +362,7 @@ async fn nexus_async(
         .await
         .unwrap();
 
-    let client = starter.get_client().await;
+    let client = starter.get_core_client().await;
     let nexus_task_handle = async {
         let mut nt = core_worker.poll_nexus_task().await.unwrap().unwrap_task();
         // Verify request header key for timeout exists and is lowercase
@@ -644,7 +644,7 @@ async fn workflow_cancellation_propagates_to_started_nexus_operation() {
         enable_remote_activities: false,
         enable_nexus: true,
     });
-    let core_worker = starter.get_worker().await;
+    let core_worker = starter.get_core_worker().await;
     let endpoint = mk_nexus_endpoint(&mut starter).await;
     let started = Arc::new(Semaphore::new(0));
 
@@ -787,7 +787,7 @@ async fn nexus_must_complete_task_to_shutdown(#[values(true, false)] use_grace_p
         .register_workflow::<NexusMustCompleteTaskWf>()
         .unwrap();
     let mut worker = starter.worker().await;
-    let core_worker = starter.get_worker().await;
+    let core_worker = starter.get_core_worker().await;
 
     let endpoint = mk_nexus_endpoint(&mut starter).await;
 
@@ -968,7 +968,7 @@ async fn nexus_cancellation_types(
     // This test uses a tokio watch channel directly from workflow code to
     // coordinate with the test harness, which triggers nondeterminism detection.
     starter.sdk_config.detect_nondeterministic_futures = false;
-    let core_worker = starter.get_worker().await;
+    let core_worker = starter.get_core_worker().await;
 
     let endpoint = mk_nexus_endpoint(&mut starter).await;
     let schedule_to_close_timeout = Some(Duration::from_secs(5));
@@ -1009,7 +1009,7 @@ async fn nexus_cancellation_types(
     let mut worker = starter.worker().await;
     let submitter = worker.get_submitter_handle();
     let wf_handle = starter.start_with_worker(wf_name, &mut worker).await;
-    let client = starter.get_client().await;
+    let client = starter.get_core_client().await;
     let (handler_wf_id_tx, mut handler_wf_id_rx) = tokio::sync::oneshot::channel();
     let completer_id = &format!("completer-{}", rand_6_chars());
     let nexus_task_handle = async {

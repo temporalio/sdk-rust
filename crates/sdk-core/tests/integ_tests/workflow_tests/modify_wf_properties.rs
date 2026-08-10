@@ -63,7 +63,7 @@ async fn sends_modify_wf_props() {
         .unwrap();
     worker.run_until_done().await.unwrap();
 
-    let client = starter.get_client().await;
+    let client = starter.get_core_client().await;
     let description = WorkflowExecutionInfo {
         namespace: client.namespace(),
         workflow_id: wf_id.to_string(),

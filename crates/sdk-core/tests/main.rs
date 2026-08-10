@@ -84,7 +84,7 @@ mod integ_tests {
     }
 
     pub(crate) async fn mk_nexus_endpoint(starter: &mut CoreWfStarter) -> String {
-        let client = starter.get_client().await;
+        let client = starter.get_core_client().await;
         let endpoint = format!("mycoolendpoint-{}", rand_6_chars());
         client
             .connection()

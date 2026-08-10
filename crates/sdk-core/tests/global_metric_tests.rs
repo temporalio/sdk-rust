@@ -78,7 +78,7 @@ async fn otel_errors_logged_as_errors() {
 
     let rt = CoreRuntime::new_assume_tokio(get_integ_runtime_options(telemopts)).unwrap();
     let mut starter = CoreWfStarter::new_with_runtime("otel_errors_logged_as_errors", rt);
-    let _worker = starter.get_worker().await;
+    let _worker = starter.get_core_worker().await;
 
     tracing::debug!("@@@@@@@@@@@@@@@@@@@@@@@@@@@@@ should be in global log");
 
