@@ -57,8 +57,7 @@ use temporalio_sdk::{
     Worker, WorkerOptions, WorkflowRegistrationError,
     activities::ActivityImplementer,
     interceptors::{
-        FailOnNondeterminismInterceptor, InterceptorWithNext, ReturnWorkflowExitValueInterceptor,
-        WorkerInterceptor,
+        FailOnNondeterminismInterceptor, ReturnWorkflowExitValueInterceptor, WorkerInterceptor,
     },
     workflows::WorkflowImplementation,
 };
@@ -319,24 +318,24 @@ struct InitializedWorker {
 
 #[derive(Clone, Default)]
 struct TestWorkerInterceptorRouter {
-    interceptor: Arc<RwLock<Option<Arc<dyn WorkerInterceptor>>>>,
+    interceptors: Arc<RwLock<Vec<Arc<dyn WorkerInterceptor>>>>,
 }
 
 impl TestWorkerInterceptorRouter {
-    fn set(&self, interceptor: impl WorkerInterceptor + 'static) {
-        *self.interceptor.write() = Some(Arc::new(interceptor));
+    fn set(&self, interceptors: Vec<Arc<dyn WorkerInterceptor>>) {
+        *self.interceptors.write() = interceptors;
     }
 
     fn clear(&self) {
-        *self.interceptor.write() = None;
+        self.interceptors.write().clear();
     }
 }
 
 #[async_trait::async_trait(?Send)]
 impl WorkerInterceptor for TestWorkerInterceptorRouter {
     async fn on_workflow_activation_completion(&self, completion: &WorkflowActivationCompletion) {
-        let interceptor = self.interceptor.read().clone();
-        if let Some(interceptor) = interceptor {
+        let interceptors = self.interceptors.read().clone();
+        for interceptor in interceptors {
             interceptor
                 .on_workflow_activation_completion(completion)
                 .await;
@@ -344,15 +343,15 @@ impl WorkerInterceptor for TestWorkerInterceptorRouter {
     }
 
     fn on_shutdown(&self, sdk_worker: &Worker) {
-        let interceptor = self.interceptor.read().clone();
-        if let Some(interceptor) = interceptor {
+        let interceptors = self.interceptors.read().clone();
+        for interceptor in interceptors {
             interceptor.on_shutdown(sdk_worker);
         }
     }
 
     async fn on_workflow_activation(&self, activation: &WorkflowActivation) -> anyhow::Result<()> {
-        let interceptor = self.interceptor.read().clone();
-        if let Some(interceptor) = interceptor {
+        let interceptors = self.interceptors.read().clone();
+        for interceptor in interceptors {
             interceptor.on_workflow_activation(activation).await?;
         }
         Ok(())
@@ -645,7 +644,7 @@ impl TestWorker {
         self.interceptor_router
             .as_ref()
             .expect("intercepted test workers must be created with an interceptor router")
-            .set(interceptor);
+            .set(vec![Arc::new(interceptor)]);
     }
 
     pub(crate) fn worker_instance_key(&self) -> Uuid {
@@ -788,7 +787,7 @@ impl TestWorker {
             self.interceptor_router
                 .as_ref()
                 .expect("intercepted test workers must be created with an interceptor router")
-                .set(interceptor);
+                .set(vec![Arc::new(interceptor)]);
         } else if let Some(interceptor_router) = &self.interceptor_router {
             interceptor_router.clear();
         }
@@ -1021,13 +1020,14 @@ where
         worker.inner.with_new_core_worker(Arc::new(replay_worker));
         let retval_icept = ReturnWorkflowExitValueInterceptor::default();
         let retval_handle = retval_icept.result_handle();
-        let mut top_icept = InterceptorWithNext::new(Box::new(FailOnNondeterminismInterceptor {}));
-        top_icept.set_next(Box::new(retval_icept));
         worker
             .interceptor_router
             .as_ref()
             .expect("replay test workers must be created with an interceptor router")
-            .set(top_icept);
+            .set(vec![
+                Arc::new(FailOnNondeterminismInterceptor {}),
+                Arc::new(retval_icept),
+            ]);
         worker.inner.run().await?;
         Ok(retval_handle.get().cloned())
     }
