@@ -46,6 +46,7 @@ relevant information.
   are preserved on failure; workers warn when the server does not advertise support.
 
 ### Fixed
+* Ephemeral server processes no longer leak on failed start.
 * Local activity resolutions are now delivered to workflows as each activity completes instead of
   waiting for every local activity in the workflow task. This allows sequences of short local
   activities to make progress while a long-running local activity executes in parallel, while
