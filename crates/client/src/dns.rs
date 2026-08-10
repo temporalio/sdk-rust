@@ -96,7 +96,19 @@ async fn build_endpoint(
             patched
         }
     });
-    let channel = add_tls_to_channel(tls_for_ip.as_ref().or(tls_options), channel).await?;
+    let tls_result = add_tls_to_channel(tls_for_ip.as_ref().or(tls_options), channel).await?;
+
+    let channel = match tls_result {
+        crate::TlsConfigResult::Standard(ep) => ep,
+        #[cfg(feature = "dynamic-tls")]
+        crate::TlsConfigResult::CustomConnector { .. } => {
+            return Err(ClientConnectError::InvalidConfig(
+                "client_cert_resolver is not yet supported with dns_load_balancing. \
+                 Disable dns_load_balancing or use static client_tls_options instead."
+                    .to_owned(),
+            ));
+        }
+    };
 
     let channel = if let Some(keep_alive) = keep_alive {
         channel
@@ -164,6 +176,7 @@ pub(crate) async fn create_balanced_channel(
 }
 
 /// Handle that aborts the DNS re-resolution task when dropped.
+#[derive(Debug)]
 pub(crate) struct DnsReresolutionHandle {
     abort_handle: tokio::task::AbortHandle,
 }

@@ -9,7 +9,6 @@ use crate::{
 use assert_matches::assert_matches;
 use futures_util::{FutureExt, StreamExt};
 use std::{
-    cell::Cell,
     sync::{
         Arc, Mutex,
         atomic::{
@@ -132,7 +131,7 @@ async fn worker_handles_unknown_workflow_types_gracefully() {
     struct GracefulAsserter {
         notify: Arc<Notify>,
         run_id: String,
-        unregistered_failure_seen: Cell<bool>,
+        unregistered_failure_seen: AtomicBool,
     }
     #[async_trait::async_trait(?Send)]
     impl WorkerInterceptor for GracefulAsserter {
@@ -148,9 +147,11 @@ async fn worker_handles_unknown_workflow_types_gracefully() {
                         ..
                     })),
                     run_id,
+                    ..
                 } if message == "Workflow type unregistered not found" && *run_id == self.run_id
             ) {
-                self.unregistered_failure_seen.set(true);
+                self.unregistered_failure_seen
+                    .store(true, Ordering::Relaxed);
             }
             // If we've seen the failure, and the completion is a success for the same run, we're done
             if matches!(
@@ -158,7 +159,8 @@ async fn worker_handles_unknown_workflow_types_gracefully() {
                 WorkflowActivationCompletion {
                     status: Some(Status::Successful(..)),
                     run_id,
-                } if self.unregistered_failure_seen.get() && *run_id == self.run_id
+                    ..
+                } if self.unregistered_failure_seen.load(Ordering::Relaxed) && *run_id == self.run_id
             ) {
                 // Shutdown the worker
                 self.notify.notify_one();
@@ -167,13 +169,13 @@ async fn worker_handles_unknown_workflow_types_gracefully() {
         fn on_shutdown(&self, _: &temporalio_sdk::Worker) {}
     }
 
-    let inner = worker.inner_mut();
     let notify = Arc::new(Notify::new());
-    inner.set_worker_interceptor(GracefulAsserter {
+    worker.set_worker_interceptor(GracefulAsserter {
         notify: notify.clone(),
         run_id,
-        unregistered_failure_seen: Cell::new(false),
+        unregistered_failure_seen: AtomicBool::new(false),
     });
+    let inner = worker.inner_mut();
     tokio::join!(async { inner.run().await.unwrap() }, async move {
         notify.notified().await;
         let worker = starter.get_worker().await.clone();

@@ -34,6 +34,10 @@ struct Cli {
     #[arg(short, long, allow_hyphen_values(true))]
     cargo_test_args: Vec<String>,
 
+    /// Existing test harness executable to run without invoking Cargo.
+    #[arg(long, conflicts_with_all = ["cargo_test_args", "just_build"])]
+    test_executable: Option<PathBuf>,
+
     #[arg(long)]
     /// If set, only run the build, not any tests
     just_build: bool,
@@ -58,6 +62,7 @@ async fn main() -> Result<(), anyhow::Error> {
         test_name,
         server_kind,
         cargo_test_args,
+        test_executable,
         just_build,
         harness_args,
     } = Cli::parse();
@@ -81,14 +86,16 @@ async fn main() -> Result<(), anyhow::Error> {
     .map(ToString::to_string)
     .chain(cargo_test_args)
     .collect::<Vec<_>>();
-    let mut build_cmd = Command::new(&cargo);
-    strip_cargo_env_vars(&mut build_cmd);
-    let status = build_cmd
-        .args([test_args_preamble.as_slice(), &["--no-run".to_string()]].concat())
-        .status()
-        .await?;
-    if !status.success() {
-        bail!("Building integration tests failed!");
+    if test_executable.is_none() {
+        let mut build_cmd = Command::new(&cargo);
+        strip_cargo_env_vars(&mut build_cmd);
+        let status = build_cmd
+            .args([test_args_preamble.as_slice(), &["--no-run".to_string()]].concat())
+            .status()
+            .await?;
+        if !status.success() {
+            bail!("Building integration tests failed!");
+        }
     }
     if just_build {
         return Ok(());
@@ -130,8 +137,21 @@ async fn main() -> Result<(), anyhow::Error> {
         }
     };
 
-    let mut cmd = Command::new(&cargo);
-    strip_cargo_env_vars(&mut cmd);
+    let mut cmd = if let Some(test_executable) = test_executable {
+        let mut cmd = Command::new(test_executable);
+        cmd.args(harness_args);
+        cmd
+    } else {
+        let mut cmd = Command::new(&cargo);
+        strip_cargo_env_vars(&mut cmd);
+        cmd.args(
+            test_args_preamble
+                .into_iter()
+                .chain(["--".to_string()])
+                .chain(harness_args),
+        );
+        cmd
+    };
     if let Some(srv) = server.as_ref() {
         println!("Running on {}", srv.target);
         cmd.env(
@@ -139,17 +159,7 @@ async fn main() -> Result<(), anyhow::Error> {
             format!("http://{}", &srv.target),
         );
     }
-    let status = cmd
-        .envs(envs)
-        .current_dir(project_root())
-        .args(
-            test_args_preamble
-                .into_iter()
-                .chain(["--".to_string()])
-                .chain(harness_args),
-        )
-        .status()
-        .await?;
+    let status = cmd.envs(envs).current_dir(project_root()).status().await?;
 
     if let Some(mut srv) = server {
         srv.shutdown().await?;

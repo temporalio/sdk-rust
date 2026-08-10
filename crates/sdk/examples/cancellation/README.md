@@ -1,8 +1,11 @@
 # Cancellation
 
-This sample demonstrates workflow and activity cancellation with cleanup.
+This sample demonstrates automatic workflow cancellation propagation and detached cleanup.
 
-The workflow starts a long-running activity that heartbeats, then races it against the workflow's cancellation signal. When the workflow is cancelled, the activity is cancelled and a cleanup activity runs before the workflow completes.
+The workflow starts a long-running activity that inherits the workflow cancellation token. When the
+workflow is cancelled, the SDK automatically cancels the activity. The workflow then handles that
+cancellation and runs cleanup with a detached token so cleanup can finish before the workflow
+completes.
 
 ### Running this sample
 

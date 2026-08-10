@@ -11,7 +11,7 @@ use futures_util::{
     Future, StreamExt, future, stream,
     stream::{Stream, TryStreamExt},
 };
-use parking_lot::Mutex;
+use parking_lot::{Mutex, RwLock};
 use prost::Message;
 use rand::RngExt;
 use std::{
@@ -29,8 +29,8 @@ use std::{
     time::{Duration, Instant},
 };
 use temporalio_client::{
-    Client, ClientTlsOptions, Connection, ConnectionOptions, GrpcCompression, NamespacedClient,
-    TlsOptions, UntypedWorkflow, UntypedWorkflowHandle, WorkflowExecutionInfo,
+    Client, ClientOptions, ClientTlsOptions, Connection, ConnectionOptions, GrpcCompression,
+    NamespacedClient, TlsOptions, UntypedWorkflow, UntypedWorkflowHandle, WorkflowExecutionInfo,
     WorkflowGetResultOptions, WorkflowHandle, WorkflowStartOptions,
     errors::{WorkflowGetResultError, WorkflowStartError},
     grpc::WorkflowService,
@@ -72,7 +72,7 @@ use temporalio_sdk_core::{
 };
 use tokio::{sync::OnceCell, task::AbortHandle};
 use tonic::IntoRequest;
-use tracing::{debug, warn};
+use tracing::warn;
 use url::Url;
 use uuid::Uuid;
 /// The env var used to specify where the integ tests should point
@@ -159,15 +159,55 @@ where
 {
     replay_sdk_worker_stream(stream::iter(histories))
 }
+pub(crate) fn replay_sdk_worker_intercepted<I>(
+    histories: I,
+    interceptor: impl WorkerInterceptor + 'static,
+) -> Worker
+where
+    I: IntoIterator<Item = HistoryForReplay> + 'static,
+    <I as IntoIterator>::IntoIter: Send,
+{
+    let core = init_core_replay_stream("replay_worker_test", stream::iter(histories));
+    let client_options = ClientOptions::new(core.get_config().namespace.clone())
+        .data_converter(DataConverter::default())
+        .build();
+    let worker_options = WorkerOptions::new(core.get_config().task_queue.clone())
+        .worker_interceptor(interceptor)
+        .build();
+    Worker::new_from_core_options(Arc::new(core), client_options, worker_options)
+        .expect("replay worker options are valid")
+}
+
 pub(crate) fn replay_sdk_worker_stream<I>(histories: I) -> Worker
 where
     I: Stream<Item = HistoryForReplay> + Send + 'static,
 {
     let core = init_core_replay_stream("replay_worker_test", histories);
-    // TODO [rust-sdk-branch]: Needs DC passed in
-    let mut worker = Worker::new_from_core(Arc::new(core), DataConverter::default());
-    worker.set_worker_interceptor(FailOnNondeterminismInterceptor {});
-    worker
+    let client_options = ClientOptions::new(core.get_config().namespace.clone())
+        .data_converter(DataConverter::default())
+        .build();
+    let worker_options = WorkerOptions::new(core.get_config().task_queue.clone())
+        .worker_interceptor(FailOnNondeterminismInterceptor {})
+        .build();
+    Worker::new_from_core_options(Arc::new(core), client_options, worker_options)
+        .expect("replay worker options are valid")
+}
+pub(crate) fn replay_sdk_worker_stream_intercepted<I>(
+    histories: I,
+    interceptor: impl WorkerInterceptor + 'static,
+) -> Worker
+where
+    I: Stream<Item = HistoryForReplay> + Send + 'static,
+{
+    let core = init_core_replay_stream("replay_worker_test", histories);
+    let client_options = ClientOptions::new(core.get_config().namespace.clone())
+        .data_converter(DataConverter::default())
+        .build();
+    let worker_options = WorkerOptions::new(core.get_config().task_queue.clone())
+        .worker_interceptor(interceptor)
+        .build();
+    Worker::new_from_core_options(Arc::new(core), client_options, worker_options)
+        .expect("replay worker options are valid")
 }
 
 /// Load history from a file containing the protobuf serialization of it.
@@ -277,6 +317,48 @@ struct InitializedWorker {
     client: Client,
 }
 
+#[derive(Clone, Default)]
+struct TestWorkerInterceptorRouter {
+    interceptor: Arc<RwLock<Option<Arc<dyn WorkerInterceptor>>>>,
+}
+
+impl TestWorkerInterceptorRouter {
+    fn set(&self, interceptor: impl WorkerInterceptor + 'static) {
+        *self.interceptor.write() = Some(Arc::new(interceptor));
+    }
+
+    fn clear(&self) {
+        *self.interceptor.write() = None;
+    }
+}
+
+#[async_trait::async_trait(?Send)]
+impl WorkerInterceptor for TestWorkerInterceptorRouter {
+    async fn on_workflow_activation_completion(&self, completion: &WorkflowActivationCompletion) {
+        let interceptor = self.interceptor.read().clone();
+        if let Some(interceptor) = interceptor {
+            interceptor
+                .on_workflow_activation_completion(completion)
+                .await;
+        }
+    }
+
+    fn on_shutdown(&self, sdk_worker: &Worker) {
+        let interceptor = self.interceptor.read().clone();
+        if let Some(interceptor) = interceptor {
+            interceptor.on_shutdown(sdk_worker);
+        }
+    }
+
+    async fn on_workflow_activation(&self, activation: &WorkflowActivation) -> anyhow::Result<()> {
+        let interceptor = self.interceptor.read().clone();
+        if let Some(interceptor) = interceptor {
+            interceptor.on_workflow_activation(activation).await?;
+        }
+        Ok(())
+    }
+}
+
 impl CoreWfStarter {
     pub(crate) fn new(test_name: &str) -> Self {
         init_integ_telem();
@@ -372,13 +454,12 @@ impl CoreWfStarter {
             .await
             .expect("Worker validation should succeed");
         let client = self.get_client().await;
-        let sdk = Worker::new_from_core_options(
-            worker,
-            client.options().clone(),
-            self.sdk_config.clone(),
-        )
-        .expect("SDK worker should initialize from core worker and options");
-        let mut w = TestWorker::new(sdk);
+        let interceptor_router = TestWorkerInterceptorRouter::default();
+        let mut sdk_config = self.sdk_config.clone();
+        sdk_config.worker_interceptor(interceptor_router.clone());
+        let sdk = Worker::new_from_core_options(worker, client.options().clone(), sdk_config)
+            .expect("SDK worker should initialize from core worker and options");
+        let mut w = TestWorker::new_with_interceptor_router(sdk, interceptor_router);
         w.client = Some(client);
 
         w
@@ -527,6 +608,7 @@ impl CoreWfStarter {
 /// Provides conveniences for running integ tests with the SDK (against real server or mocks)
 pub(crate) struct TestWorker {
     inner: Worker,
+    interceptor_router: Option<TestWorkerInterceptorRouter>,
     client: Option<Client>,
     pub started_workflows: Arc<Mutex<Vec<WorkflowExecutionInfo>>>,
     /// If set true (default), and a client is available, we will fetch workflow results to
@@ -538,14 +620,32 @@ impl TestWorker {
     pub(crate) fn new(sdk: Worker) -> Self {
         Self {
             inner: sdk,
+            interceptor_router: None,
             client: None,
             started_workflows: Arc::new(Mutex::new(vec![])),
             fetch_results: true,
         }
     }
 
+    fn new_with_interceptor_router(
+        sdk: Worker,
+        interceptor_router: TestWorkerInterceptorRouter,
+    ) -> Self {
+        Self {
+            interceptor_router: Some(interceptor_router),
+            ..Self::new(sdk)
+        }
+    }
+
     pub(crate) fn inner_mut(&mut self) -> &mut Worker {
         &mut self.inner
+    }
+
+    pub(crate) fn set_worker_interceptor(&self, interceptor: impl WorkerInterceptor + 'static) {
+        self.interceptor_router
+            .as_ref()
+            .expect("intercepted test workers must be created with an interceptor router")
+            .set(interceptor);
     }
 
     pub(crate) fn worker_instance_key(&self) -> Uuid {
@@ -662,7 +762,7 @@ impl TestWorker {
 
     /// Runs until all expected workflows have completed and then shuts down the worker
     pub(crate) async fn run_until_done(&mut self) -> Result<(), anyhow::Error> {
-        self.run_until_done_intercepted(Option::<TestWorkerCompletionIceptor>::None)
+        self.run_until_done_intercepted(Option::<FailOnNondeterminismInterceptor>::None)
             .await
     }
 
@@ -671,7 +771,7 @@ impl TestWorker {
         &mut self,
         next_interceptor: Option<impl WorkerInterceptor + 'static>,
     ) -> Result<(), anyhow::Error> {
-        let mut iceptor = TestWorkerCompletionIceptor::new(
+        let mut completion_waiter = TestWorkerCompletionIceptor::new(
             TestWorkerShutdownCond::NoAutoShutdown,
             Arc::new(self.inner.shutdown_handle()),
         );
@@ -679,14 +779,20 @@ impl TestWorker {
         if self.fetch_results
             && let Some(c) = self.client.clone()
         {
-            iceptor.condition = TestWorkerShutdownCond::GetResults(
+            completion_waiter.condition = TestWorkerShutdownCond::GetResults(
                 std::mem::take(&mut self.started_workflows.lock()),
                 c,
             );
         }
-        iceptor.next = next_interceptor.map(|i| Box::new(i) as Box<dyn WorkerInterceptor>);
-        let get_results_waiter = iceptor.wait_all_wfs();
-        self.inner.set_worker_interceptor(iceptor);
+        if let Some(interceptor) = next_interceptor {
+            self.interceptor_router
+                .as_ref()
+                .expect("intercepted test workers must be created with an interceptor router")
+                .set(interceptor);
+        } else if let Some(interceptor_router) = &self.interceptor_router {
+            interceptor_router.clear();
+        }
+        let get_results_waiter = completion_waiter.wait_all_wfs();
         tokio::try_join!(self.inner.run(), get_results_waiter)?;
         Ok(())
     }
@@ -740,15 +846,16 @@ pub(crate) enum TestWorkerShutdownCond {
 /// Implements calling the shutdown handle when the expected number of test workflows has completed
 pub(crate) struct TestWorkerCompletionIceptor {
     condition: TestWorkerShutdownCond,
-    shutdown_handle: Arc<dyn Fn()>,
-    next: Option<Box<dyn WorkerInterceptor>>,
+    shutdown_handle: Arc<dyn Fn() + Send + Sync>,
 }
 impl TestWorkerCompletionIceptor {
-    pub(crate) fn new(condition: TestWorkerShutdownCond, shutdown_handle: Arc<dyn Fn()>) -> Self {
+    pub(crate) fn new(
+        condition: TestWorkerShutdownCond,
+        shutdown_handle: Arc<dyn Fn() + Send + Sync>,
+    ) -> Self {
         Self {
             condition,
             shutdown_handle,
-            next: None,
         }
     }
 
@@ -781,30 +888,6 @@ impl TestWorkerCompletionIceptor {
         }
     }
 }
-#[async_trait::async_trait(?Send)]
-impl WorkerInterceptor for TestWorkerCompletionIceptor {
-    async fn on_workflow_activation_completion(&self, completion: &WorkflowActivationCompletion) {
-        if completion.has_execution_ending() {
-            debug!("Workflow {} says it's finishing", &completion.run_id);
-        }
-        if let Some(n) = self.next.as_ref() {
-            n.on_workflow_activation_completion(completion).await;
-        }
-    }
-
-    fn on_shutdown(&self, sdk_worker: &Worker) {
-        if let Some(n) = self.next.as_ref() {
-            n.on_shutdown(sdk_worker);
-        }
-    }
-    async fn on_workflow_activation(&self, a: &WorkflowActivation) -> Result<(), anyhow::Error> {
-        if let Some(n) = self.next.as_ref() {
-            n.on_workflow_activation(a).await?;
-        }
-        Ok(())
-    }
-}
-
 /// Returns the connection options used to connect to the server used for integration tests.
 pub(crate) fn get_integ_server_options() -> ConnectionOptions {
     let temporal_server_address = env::var(INTEG_SERVER_TARGET_ENV_VAR)
@@ -915,7 +998,7 @@ pub(crate) fn get_integ_runtime_options(telemopts: TelemetryOptions) -> RuntimeO
 pub(crate) trait WorkflowHandleExt {
     async fn fetch_history_and_replay(
         &self,
-        worker: &mut Worker,
+        worker: &mut TestWorker,
     ) -> Result<Option<Payload>, anyhow::Error>;
 }
 
@@ -926,19 +1009,23 @@ where
 {
     async fn fetch_history_and_replay(
         &self,
-        worker: &mut Worker,
+        worker: &mut TestWorker,
     ) -> Result<Option<Payload>, anyhow::Error> {
         let wf_id = self.info().workflow_id.clone();
         let events = self.fetch_history(Default::default()).await?.into_events();
         let with_id = HistoryForReplay::new(events, wf_id);
-        let replay_worker = init_core_replay_preloaded(worker.task_queue(), [with_id]);
-        worker.with_new_core_worker(Arc::new(replay_worker));
+        let replay_worker = init_core_replay_preloaded(worker.inner.task_queue(), [with_id]);
+        worker.inner.with_new_core_worker(Arc::new(replay_worker));
         let retval_icept = ReturnWorkflowExitValueInterceptor::default();
         let retval_handle = retval_icept.result_handle();
         let mut top_icept = InterceptorWithNext::new(Box::new(FailOnNondeterminismInterceptor {}));
         top_icept.set_next(Box::new(retval_icept));
-        worker.set_worker_interceptor(top_icept);
-        worker.run().await?;
+        worker
+            .interceptor_router
+            .as_ref()
+            .expect("replay test workers must be created with an interceptor router")
+            .set(top_icept);
+        worker.inner.run().await?;
         Ok(retval_handle.get().cloned())
     }
 }
@@ -1013,10 +1100,34 @@ pub(crate) fn build_fake_sdk(mock_cfg: MockPollCfg) -> temporalio_sdk::Worker {
         c.ignore_evicts_on_shutdown = false;
     });
     let core = mock_worker(mock);
-    let mut worker =
-        temporalio_sdk::Worker::new_from_core(Arc::new(core), DataConverter::default());
-    worker.set_worker_interceptor(FailOnNondeterminismInterceptor {});
-    worker
+    let client_options = ClientOptions::new(core.get_config().namespace.clone())
+        .data_converter(DataConverter::default())
+        .build();
+    let worker_options = WorkerOptions::new(core.get_config().task_queue.clone())
+        .worker_interceptor(FailOnNondeterminismInterceptor {})
+        .build();
+    Worker::new_from_core_options(Arc::new(core), client_options, worker_options)
+        .expect("mock worker options are valid")
+}
+
+pub(crate) fn build_fake_sdk_intercepted(
+    mock_cfg: MockPollCfg,
+    interceptor: impl WorkerInterceptor + 'static,
+) -> temporalio_sdk::Worker {
+    let mut mock = build_mock_pollers(mock_cfg);
+    mock.worker_cfg(|c| {
+        c.max_cached_workflows = 1;
+        c.ignore_evicts_on_shutdown = false;
+    });
+    let core = mock_worker(mock);
+    let client_options = ClientOptions::new(core.get_config().namespace.clone())
+        .data_converter(DataConverter::default())
+        .build();
+    let worker_options = WorkerOptions::new(core.get_config().task_queue.clone())
+        .worker_interceptor(interceptor)
+        .build();
+    Worker::new_from_core_options(Arc::new(core), client_options, worker_options)
+        .expect("mock worker options are valid")
 }
 
 pub(crate) fn mock_sdk(poll_cfg: MockPollCfg) -> TestWorker {
@@ -1031,16 +1142,22 @@ pub(crate) fn mock_sdk_cfg(
     let mut mock = build_mock_pollers(poll_cfg);
     mock.worker_cfg(mutator);
     let core = mock_worker(mock);
-    TestWorker::new(temporalio_sdk::Worker::new_from_core(
-        Arc::new(core),
-        DataConverter::default(),
-    ))
+    let interceptor_router = TestWorkerInterceptorRouter::default();
+    let client_options = ClientOptions::new(core.get_config().namespace.clone())
+        .data_converter(DataConverter::default())
+        .build();
+    let worker_options = WorkerOptions::new(core.get_config().task_queue.clone())
+        .worker_interceptor(interceptor_router.clone())
+        .build();
+    let sdk = Worker::new_from_core_options(Arc::new(core), client_options, worker_options)
+        .expect("mock worker options are valid");
+    TestWorker::new_with_interceptor_router(sdk, interceptor_router)
 }
 
 #[derive(Default)]
 pub(crate) struct ActivationAssertionsInterceptor {
     #[allow(clippy::type_complexity)]
-    assertions: Mutex<VecDeque<Box<dyn FnOnce(&WorkflowActivation)>>>,
+    assertions: Mutex<VecDeque<Box<dyn FnOnce(&WorkflowActivation) + Send>>>,
     used: AtomicBool,
 }
 
@@ -1050,7 +1167,10 @@ impl ActivationAssertionsInterceptor {
         self
     }
 
-    pub(crate) fn then(&mut self, assert: impl FnOnce(&WorkflowActivation) + 'static) -> &mut Self {
+    pub(crate) fn then(
+        &mut self,
+        assert: impl FnOnce(&WorkflowActivation) + Send + 'static,
+    ) -> &mut Self {
         self.assertions.lock().push_back(Box::new(assert));
         self
     }

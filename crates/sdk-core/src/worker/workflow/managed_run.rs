@@ -12,8 +12,8 @@ use crate::{
             FailedActivationWFTReport, HeartbeatTimeoutMsg, HistoryUpdate,
             LocalActivityRequestSink, LocalResolution, NextPageReq, OutstandingActivation,
             OutstandingTask, PermittedWFT, RequestEvictMsg, RunBasics,
-            ServerCommandsWithWorkflowInfo, WFCommand, WFCommandVariant, WFMachinesError,
-            WFT_HEARTBEAT_TIMEOUT_FRACTION, WFTReportStatus, WorkflowTaskInfo,
+            ServerCommandsWithWorkflowInfo, TaskStorageMetrics, WFCommand, WFCommandVariant,
+            WFMachinesError, WFT_HEARTBEAT_TIMEOUT_FRACTION, WFTReportStatus, WorkflowTaskInfo,
             history_update::HistoryPaginator,
             machines::{MachinesWFTResponseContent, WorkflowMachines},
         },
@@ -31,6 +31,7 @@ use std::{
 use temporalio_common::protos::{
     TaskToken,
     coresdk::{
+        common::ExternalStorageMetrics,
         workflow_activation::{
             WorkflowActivation, create_evict_activation, query_to_job,
             remove_from_cache::EvictionReason, workflow_activation_job,
@@ -297,6 +298,7 @@ impl ManagedRun {
     pub(super) fn mark_wft_complete(
         &mut self,
         report_status: WFTReportStatus,
+        task_storage_metrics: &TaskStorageMetrics,
     ) -> Option<OutstandingTask> {
         debug!("Marking WFT completed");
         let retme = self.wft.take();
@@ -304,7 +306,17 @@ impl ManagedRun {
         if let Some(ot) = &retme
             && let Some(ct) = report_status.completion_time()
         {
-            self.metrics.wf_task_latency(ct.sub(ot.start_time));
+            let task_duration = ct.sub(ot.start_time);
+            self.metrics.wf_task_latency(task_duration);
+            log_workflow_task_duration(
+                &self.wfm.machines.run_id,
+                &self.wfm.machines.workflow_type,
+                self.wfm.machines.last_processed_event + 1,
+                ot.info.attempt,
+                self.wfm.machines.history_size_bytes(),
+                task_duration,
+                task_storage_metrics,
+            );
         }
 
         if let WFTReportStatus::Reported {
@@ -1573,12 +1585,229 @@ impl From<WFMachinesError> for RunUpdateErr {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+fn log_workflow_task_duration(
+    run_id: &str,
+    workflow_type: &str,
+    event_id: i64,
+    attempt: u32,
+    history_size_bytes: u64,
+    duration: Duration,
+    storage: &TaskStorageMetrics,
+) {
+    let threshold = wft_duration_warn_threshold();
+    if duration <= threshold {
+        return;
+    }
+    let dl = storage.download.as_ref();
+    let ul = storage.upload.as_ref();
+    let duration_millis = |d: Duration| d.as_millis() as u64;
+    let storage_millis = |m: Option<&ExternalStorageMetrics>| -> u64 {
+        m.and_then(|m| m.total_duration)
+            .and_then(|d| Duration::try_from(d).ok())
+            .map(duration_millis)
+            .unwrap_or_default()
+    };
+    warn!(
+        workflow_type = %workflow_type,
+        event_id = event_id,
+        attempt = attempt,
+        workflow_task_duration = duration_millis(duration),
+        workflow_history_size = history_size_bytes,
+        payload_download_count = dl.map(|m| m.payload_count).unwrap_or_default(),
+        payload_download_size = dl.map(|m| m.total_size_bytes).unwrap_or_default(),
+        payload_download_duration = storage_millis(dl),
+        payload_download_drivers = ?dl.map(|m| sorted(&m.driver_names)).unwrap_or_default(),
+        payload_upload_count = ul.map(|m| m.payload_count).unwrap_or_default(),
+        payload_upload_size = ul.map(|m| m.total_size_bytes).unwrap_or_default(),
+        payload_upload_duration = storage_millis(ul),
+        payload_upload_drivers = ?ul.map(|m| sorted(&m.driver_names)).unwrap_or_default(),
+        "[TMPRL1104] {run_id}:{event_id}:{attempt} Workflow task duration exceeded {} seconds.",
+        threshold.as_secs()
+    );
+}
+
+fn wft_duration_warn_threshold() -> Duration {
+    static THRESHOLD: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
+    *THRESHOLD.get_or_init(|| {
+        parse_wft_duration_warn_threshold(
+            std::env::var("TEMPORAL_WORKFLOW_TASK_DURATION_WARN_SECONDS").ok(),
+        )
+    })
+}
+
+// Separated from the env read so the parse + default fallback can be unit-tested without mutating
+// the process environment.
+fn parse_wft_duration_warn_threshold(value: Option<String>) -> Duration {
+    value
+        .and_then(|s| s.parse::<u64>().ok())
+        .map(Duration::from_secs)
+        .unwrap_or(Duration::from_secs(5))
+}
+
+fn sorted(names: &[String]) -> Vec<String> {
+    let mut v = names.to_vec();
+    v.sort();
+    v
+}
+
 #[cfg(test)]
 mod tests {
+    use super::{
+        TaskStorageMetrics, log_workflow_task_duration, parse_wft_duration_warn_threshold,
+    };
     use crate::worker::workflow::{WFCommand, WFCommandVariant};
-    use std::mem::{Discriminant, discriminant};
+    use std::{
+        fmt::Write,
+        mem::{Discriminant, discriminant},
+        sync::{Arc, Mutex},
+        time::Duration,
+    };
+    use temporalio_common::protos::coresdk::common::ExternalStorageMetrics;
+    use tracing::{Event, Level, Metadata, Subscriber, field::Field, field::Visit, span};
 
     use command_utils::*;
+
+    #[derive(Default)]
+    struct CapturedEvent {
+        level: Option<Level>,
+        fields: String,
+    }
+    #[derive(Default, Clone)]
+    struct CapturingSub {
+        events: Arc<Mutex<Vec<CapturedEvent>>>,
+    }
+    struct FieldVisitor(String);
+    impl Visit for FieldVisitor {
+        fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+            let _ = write!(self.0, "{}={:?};", field.name(), value);
+        }
+        fn record_u64(&mut self, field: &Field, value: u64) {
+            let _ = write!(self.0, "{}={};", field.name(), value);
+        }
+        fn record_i64(&mut self, field: &Field, value: i64) {
+            let _ = write!(self.0, "{}={};", field.name(), value);
+        }
+        fn record_str(&mut self, field: &Field, value: &str) {
+            let _ = write!(self.0, "{}={};", field.name(), value);
+        }
+    }
+    impl Subscriber for CapturingSub {
+        fn enabled(&self, _: &Metadata<'_>) -> bool {
+            true
+        }
+        fn new_span(&self, _: &span::Attributes<'_>) -> span::Id {
+            span::Id::from_u64(1)
+        }
+        fn record(&self, _: &span::Id, _: &span::Record<'_>) {}
+        fn record_follows_from(&self, _: &span::Id, _: &span::Id) {}
+        fn event(&self, event: &Event<'_>) {
+            let mut v = FieldVisitor(String::new());
+            event.record(&mut v);
+            self.events.lock().unwrap().push(CapturedEvent {
+                level: Some(*event.metadata().level()),
+                fields: v.0,
+            });
+        }
+        fn enter(&self, _: &span::Id) {}
+        fn exit(&self, _: &span::Id) {}
+    }
+
+    fn capture(duration: Duration, storage: &TaskStorageMetrics) -> Option<CapturedEvent> {
+        let sub = CapturingSub::default();
+        tracing::subscriber::with_default(sub.clone(), || {
+            log_workflow_task_duration("run-1", "MyWorkflow", 12, 3, 4096, duration, storage);
+        });
+        sub.events.lock().unwrap().drain(..).next()
+    }
+
+    #[test]
+    fn tmprl1104_warns_only_over_threshold() {
+        let none = TaskStorageMetrics::default();
+        assert!(capture(Duration::from_secs(2), &none).is_none());
+        let warn_ev = capture(Duration::from_secs(7), &none).expect("warn emitted");
+        assert_eq!(warn_ev.level, Some(Level::WARN));
+        assert!(
+            warn_ev.fields.contains("[TMPRL1104]"),
+            "fields: {}",
+            warn_ev.fields
+        );
+    }
+
+    #[test]
+    fn tmprl1104_threshold_parsing() {
+        assert_eq!(
+            parse_wft_duration_warn_threshold(None),
+            Duration::from_secs(5)
+        );
+        assert_eq!(
+            parse_wft_duration_warn_threshold(Some("10".to_string())),
+            Duration::from_secs(10)
+        );
+        assert_eq!(
+            parse_wft_duration_warn_threshold(Some("0".to_string())),
+            Duration::from_secs(0)
+        );
+        // Unparseable / empty / negative values fall back to the default (parsed as u64, so a
+        // negative can never yield a threshold).
+        assert_eq!(
+            parse_wft_duration_warn_threshold(Some("nope".to_string())),
+            Duration::from_secs(5)
+        );
+        assert_eq!(
+            parse_wft_duration_warn_threshold(Some(String::new())),
+            Duration::from_secs(5)
+        );
+        assert_eq!(
+            parse_wft_duration_warn_threshold(Some("-5".to_string())),
+            Duration::from_secs(5)
+        );
+    }
+
+    #[test]
+    fn tmprl1104_fields_present() {
+        let storage = TaskStorageMetrics {
+            download: Some(ExternalStorageMetrics {
+                payload_count: 2,
+                total_size_bytes: 1024,
+                total_duration: Some(prost_types::Duration {
+                    seconds: 0,
+                    nanos: 5_000_000,
+                }),
+                driver_names: vec!["s3".to_string()],
+            }),
+            upload: None,
+        };
+        let ev = capture(Duration::from_secs(6), &storage).expect("warn emitted");
+        assert!(ev.fields.contains("attempt=3"), "fields: {}", ev.fields);
+        assert!(
+            ev.fields.contains("[TMPRL1104] run-1:12:3"),
+            "fields: {}",
+            ev.fields
+        );
+        // The message names the (default) threshold it exceeded.
+        assert!(
+            ev.fields.contains("exceeded 5 seconds"),
+            "fields: {}",
+            ev.fields
+        );
+        assert!(
+            ev.fields.contains("workflow_history_size=4096"),
+            "fields: {}",
+            ev.fields
+        );
+        assert!(
+            ev.fields.contains("payload_download_count=2"),
+            "fields: {}",
+            ev.fields
+        );
+        // No upload occurred; that group must still be present as zero.
+        assert!(
+            ev.fields.contains("payload_upload_count=0"),
+            "fields: {}",
+            ev.fields
+        );
+    }
 
     #[rstest::rstest]
     #[case::empty(

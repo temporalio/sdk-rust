@@ -1,8 +1,8 @@
 use crate::common::{
     ActivationAssertionsInterceptor, CoreWfStarter, WorkflowHandleExt,
-    activity_functions::StdActivities, build_fake_sdk, history_from_proto_binary,
-    init_core_replay_preloaded, mock_sdk, mock_sdk_cfg, replay_sdk_worker,
-    workflows::LaProblemWorkflow,
+    activity_functions::StdActivities, build_fake_sdk, build_fake_sdk_intercepted,
+    history_from_proto_binary, init_core_replay_preloaded, mock_sdk, mock_sdk_cfg,
+    replay_sdk_worker, workflows::LaProblemWorkflow,
 };
 use anyhow::anyhow;
 use crossbeam_queue::SegQueue;
@@ -114,10 +114,7 @@ async fn one_local_activity() {
         .await
         .unwrap();
     worker.run_until_done().await.unwrap();
-    handle
-        .fetch_history_and_replay(worker.inner_mut())
-        .await
-        .unwrap();
+    handle.fetch_history_and_replay(&mut worker).await.unwrap();
 }
 
 #[workflow]
@@ -343,10 +340,7 @@ async fn local_act_retry_timer_backoff() {
         .await
         .unwrap();
     worker.run_until_done().await.unwrap();
-    handle
-        .fetch_history_and_replay(worker.inner_mut())
-        .await
-        .unwrap();
+    handle.fetch_history_and_replay(&mut worker).await.unwrap();
 }
 
 #[rstest::rstest]
@@ -936,10 +930,7 @@ async fn repro_nondeterminism_with_timer_bug() {
         first_execution_run_id: None,
     }
     .bind_untyped(client.clone());
-    handle
-        .fetch_history_and_replay(worker.inner_mut())
-        .await
-        .unwrap();
+    handle.fetch_history_and_replay(&mut worker).await.unwrap();
 }
 
 #[rstest::rstest]
@@ -1093,10 +1084,7 @@ async fn la_resolve_same_time_as_other_cancel() {
         first_execution_run_id: None,
     }
     .bind_untyped(client.clone());
-    handle
-        .fetch_history_and_replay(worker.inner_mut())
-        .await
-        .unwrap();
+    handle.fetch_history_and_replay(&mut worker).await.unwrap();
 }
 
 #[rstest::rstest]
@@ -1185,10 +1173,7 @@ async fn long_local_activity_with_update(
     };
     tokio::select!(_ = update => {}, _ = runner => {});
     let res = handle.get_result(Default::default()).await.unwrap();
-    let replay_res = handle
-        .fetch_history_and_replay(worker.inner_mut())
-        .await
-        .unwrap();
+    let replay_res = handle.fetch_history_and_replay(&mut worker).await.unwrap();
     assert_eq!(res, usize::from_json_payload(&replay_res.unwrap()).unwrap());
 
     // Load histories from pre-fix version and ensure compat
@@ -1201,10 +1186,11 @@ async fn long_local_activity_with_update(
             "fake".to_owned(),
         )],
     );
-    let inner_worker = worker.inner_mut();
-    inner_worker.with_new_core_worker(Arc::new(replay_worker));
-    inner_worker.set_worker_interceptor(FailOnNondeterminismInterceptor {});
-    inner_worker.run().await.unwrap();
+    worker
+        .inner_mut()
+        .with_new_core_worker(Arc::new(replay_worker));
+    worker.set_worker_interceptor(FailOnNondeterminismInterceptor {});
+    worker.inner_mut().run().await.unwrap();
 }
 
 #[tokio::test]
@@ -1228,7 +1214,7 @@ async fn local_activity_with_heartbeat_only_causes_one_wakeup() {
             // Interestingly LA munst come first because if the condition is polled first, we won't
             // see that resolved is true.
             // TODO [rust-sdk-branch] - See if we can fix this and know that we should re-poll.
-            temporalio_sdk::workflows::join!(
+            let (_, wait_result) = temporalio_sdk::workflows::join!(
                 async {
                     ctx.execute_local_activity(
                         StdActivities::delay,
@@ -1244,6 +1230,7 @@ async fn local_activity_with_heartbeat_only_causes_one_wakeup() {
                     ctx.state(|s| s.la_resolved)
                 })
             );
+            wait_result?;
             Ok(wakeup_counter as usize)
         }
     }
@@ -1265,10 +1252,7 @@ async fn local_activity_with_heartbeat_only_causes_one_wakeup() {
     worker.run_until_done().await.unwrap();
     let r = handle.get_result(Default::default()).await.unwrap();
     assert_eq!(r, 2);
-    handle
-        .fetch_history_and_replay(worker.inner_mut())
-        .await
-        .unwrap();
+    handle.fetch_history_and_replay(&mut worker).await.unwrap();
 }
 
 #[workflow]
@@ -1303,10 +1287,7 @@ async fn local_activity_with_summary() {
 
     let handle = starter.start_with_worker(wf_name, &mut worker).await;
     worker.run_until_done().await.unwrap();
-    handle
-        .fetch_history_and_replay(worker.inner_mut())
-        .await
-        .unwrap();
+    handle.fetch_history_and_replay(&mut worker).await.unwrap();
 
     let la_events = starter
         .get_history()
@@ -3031,10 +3012,7 @@ async fn local_activity_resolutions_are_delivered_incrementally() {
         completed_while_long_was_running,
         "the short LA sequence did not complete while the long LA was still running"
     );
-    handle
-        .fetch_history_and_replay(worker.inner_mut())
-        .await
-        .unwrap();
+    handle.fetch_history_and_replay(&mut worker).await.unwrap();
 }
 
 #[workflow]
@@ -3108,8 +3086,7 @@ async fn old_batched_local_activity_history_replays() {
         });
     });
 
-    let mut worker = build_fake_sdk(mock_cfg);
-    worker.set_worker_interceptor(activation_assertions);
+    let mut worker = build_fake_sdk_intercepted(mock_cfg, activation_assertions);
     worker
         .register_workflow::<OldBatchedLocalActivityHistoryWf>()
         .unwrap();
@@ -3248,8 +3225,7 @@ async fn mixed_la_completion_times(#[values(true, false)] replay: bool) {
         }
     });
 
-    let mut worker = build_fake_sdk(mock_cfg);
-    worker.set_worker_interceptor(activation_assertions);
+    let mut worker = build_fake_sdk_intercepted(mock_cfg, activation_assertions);
     worker
         .register_workflow::<MixedCompletionTimesWf>()
         .unwrap();
@@ -3339,8 +3315,7 @@ async fn two_las_with_heartbeat(
         }
     });
 
-    let mut worker = build_fake_sdk(mock_cfg);
-    worker.set_worker_interceptor(activation_assertions);
+    let mut worker = build_fake_sdk_intercepted(mock_cfg, activation_assertions);
     worker.register_workflow::<TwoLaWfParallel>().unwrap();
     worker.register_activities(HeartbeatGatedActivity {
         release: release_activities,
@@ -3453,8 +3428,7 @@ async fn two_sequential_las(
         });
     });
 
-    let mut worker = build_fake_sdk(mock_cfg);
-    worker.set_worker_interceptor(aai);
+    let mut worker = build_fake_sdk_intercepted(mock_cfg, aai);
     if parallel {
         worker.register_workflow::<TwoLaWfParallel>().unwrap();
     } else {
@@ -3549,8 +3523,7 @@ async fn las_separated_by_timer(#[case] replay: bool) {
         }
     });
 
-    let mut worker = build_fake_sdk(mock_cfg);
-    worker.set_worker_interceptor(aai);
+    let mut worker = build_fake_sdk_intercepted(mock_cfg, aai);
     worker.register_workflow::<LaTimerLaWf>().unwrap();
     worker.register_activities(ResolvedActivity);
     worker.run().await.unwrap();
@@ -4047,6 +4020,9 @@ async fn replay_out_of_order_local_activity_markers_is_deterministic() {
     let test_name = "replay_out_of_order_local_activity_markers_is_deterministic";
     let mut starter = CoreWfStarter::new(test_name);
     starter.workflow_options.task_timeout = Some(Duration::from_secs(1));
+    starter
+        .sdk_config
+        .worker_interceptor(FailOnNondeterminismInterceptor {});
 
     let release_first = Arc::new(Notify::new());
     starter
@@ -4097,8 +4073,8 @@ async fn replay_out_of_order_local_activity_markers_is_deterministic() {
 
     let replay_core =
         init_core_replay_preloaded(&task_queue, [HistoryForReplay::new(events, workflow_id)]);
-    let inner = worker.inner_mut();
-    inner.with_new_core_worker(Arc::new(replay_core));
-    inner.set_worker_interceptor(FailOnNondeterminismInterceptor {});
-    inner.run().await.unwrap();
+    worker
+        .inner_mut()
+        .with_new_core_worker(Arc::new(replay_core));
+    worker.inner_mut().run().await.unwrap();
 }

@@ -145,10 +145,7 @@ async fn task_fail_causes_replay_unset_too_soon() {
         .unwrap();
 
     worker.run_until_done().await.unwrap();
-    handle
-        .fetch_history_and_replay(worker.inner_mut())
-        .await
-        .unwrap();
+    handle.fetch_history_and_replay(&mut worker).await.unwrap();
 }
 
 #[workflow]
@@ -184,7 +181,7 @@ async fn random_workflow_replays() {
     worker.run_until_done().await.unwrap();
     let result = handle.get_result(Default::default()).await.unwrap();
     let replay_result = handle
-        .fetch_history_and_replay(worker.inner_mut())
+        .fetch_history_and_replay(&mut worker)
         .await
         .unwrap()
         .expect("replayed workflow should return a result");

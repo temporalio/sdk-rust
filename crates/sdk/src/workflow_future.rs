@@ -243,6 +243,7 @@ impl WorkflowFuture {
                         versioning_behavior: VersioningBehavior::Unspecified.into(),
                     },
                 )),
+                ..Default::default()
             })
             .expect("Completion channel intact");
     }

@@ -40,7 +40,7 @@ impl CancelReceiver {
     #[run]
     async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<String> {
         let r = ctx.cancelled().await;
-        Ok(r)
+        Ok(r.unwrap_or_default())
     }
 }
 

@@ -443,6 +443,10 @@ pub struct ActivityDefinitions {
 }
 
 impl ActivityDefinitions {
+    pub(crate) fn extend(&mut self, other: &Self) {
+        self.activities.extend(other.activities.clone());
+    }
+
     /// Registers all activities on an activity implementer.
     pub fn register_activities<AI: ActivityImplementer>(&mut self, instance: AI) -> &mut Self {
         let arcd = Arc::new(instance);

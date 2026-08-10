@@ -44,12 +44,13 @@ use temporalio_common::{
 use temporalio_macros::{workflow, workflow_methods};
 use temporalio_sdk::{
     CancellableFuture, NexusOperationCancellationType, NexusOperationOptions, SyncWorkflowContext,
-    WorkflowContext, WorkflowContextView, WorkflowResult, WorkflowTermination,
+    WaitConditionOptions, WorkflowCancellationToken, WorkflowContext, WorkflowContextView,
+    WorkflowResult, WorkflowTermination,
 };
 use temporalio_sdk_core::PollError;
 use tokio::{
     join,
-    sync::{mpsc, watch},
+    sync::{Semaphore, mpsc, watch},
 };
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy, serde::Serialize, serde::Deserialize)]
@@ -225,7 +226,7 @@ async fn nexus_basic(
         _ => unreachable!(),
     }
     wf_handle
-        .fetch_history_and_replay(worker.inner_mut())
+        .fetch_history_and_replay(&mut worker)
         .await
         .unwrap();
 }
@@ -520,7 +521,7 @@ async fn nexus_async(
         }
     }
     wf_handle
-        .fetch_history_and_replay(worker.inner_mut())
+        .fetch_history_and_replay(&mut worker)
         .await
         .unwrap();
 }
@@ -588,10 +589,139 @@ async fn nexus_cancel_before_start() {
 
     worker.run_until_done().await.unwrap();
 
-    handle
-        .fetch_history_and_replay(worker.inner_mut())
+    handle.fetch_history_and_replay(&mut worker).await.unwrap();
+}
+
+#[workflow]
+struct NexusRootCancellationWf {
+    endpoint: String,
+    started: Arc<Semaphore>,
+}
+
+#[workflow_methods(factory_only)]
+impl NexusRootCancellationWf {
+    #[run]
+    async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<()> {
+        let started = ctx
+            .start_nexus_operation(
+                NexusOperationOptions::builder()
+                    .endpoint(ctx.state(|wf| wf.endpoint.clone()))
+                    .service("svc")
+                    .operation("op")
+                    .cancellation_type(NexusOperationCancellationType::WaitCancellationRequested)
+                    .build(),
+            )
+            .await
+            .expect("Nexus operation should start");
+        ctx.state(|wf| wf.started.add_permits(1));
+
+        let result = started.result().await;
+        assert_matches!(
+            result.status,
+            Some(nexus_operation_result::Status::Cancelled(_))
+        );
+        Err(WorkflowTermination::Cancelled)
+    }
+}
+
+#[tokio::test]
+async fn workflow_cancellation_propagates_to_started_nexus_operation() {
+    let wf_name = "workflow_cancellation_propagates_to_started_nexus_operation";
+    let mut starter = CoreWfStarter::new(wf_name);
+    starter.sdk_config.task_types = WorkerTaskTypes {
+        enable_workflows: true,
+        enable_local_activities: false,
+        enable_remote_activities: false,
+        enable_nexus: true,
+    };
+    let mut worker = starter.worker().await;
+    let core_worker = starter.get_worker().await;
+    let endpoint = mk_nexus_endpoint(&mut starter).await;
+    let started = Arc::new(Semaphore::new(0));
+
+    worker
+        .register_workflow_with_factory({
+            let endpoint = endpoint.clone();
+            let started = started.clone();
+            move || NexusRootCancellationWf {
+                endpoint: endpoint.clone(),
+                started: started.clone(),
+            }
+        })
+        .unwrap();
+    let wf_handle = worker
+        .submit_workflow(
+            NexusRootCancellationWf::run,
+            (),
+            starter.workflow_options.clone(),
+        )
         .await
         .unwrap();
+
+    let nexus_task_handler = async {
+        let start_task = core_worker.poll_nexus_task().await.unwrap().unwrap_task();
+        assert_matches!(
+            start_task.request.as_ref().unwrap().variant,
+            Some(request::Variant::StartOperation(_))
+        );
+        core_worker
+            .complete_nexus_task(NexusTaskCompletion {
+                task_token: start_task.task_token,
+                status: Some(nexus_task_completion::Status::Completed(
+                    nexus::v1::Response {
+                        variant: Some(nexus::v1::response::Variant::StartOperation(
+                            StartOperationResponse {
+                                variant: Some(start_operation_response::Variant::AsyncSuccess(
+                                    #[allow(deprecated)]
+                                    start_operation_response::Async {
+                                        operation_id: "op-1".to_string(),
+                                        links: vec![],
+                                        operation_token: "op-1".to_string(),
+                                    },
+                                )),
+                            },
+                        )),
+                    },
+                )),
+            })
+            .await
+            .unwrap();
+
+        let cancel_task = core_worker.poll_nexus_task().await.unwrap().unwrap_task();
+        assert_matches!(
+            cancel_task.request.as_ref().unwrap().variant,
+            Some(request::Variant::CancelOperation(_))
+        );
+        core_worker
+            .complete_nexus_task(NexusTaskCompletion {
+                task_token: cancel_task.task_token,
+                status: Some(nexus_task_completion::Status::Completed(
+                    nexus::v1::Response {
+                        variant: Some(nexus::v1::response::Variant::CancelOperation(
+                            CancelOperationResponse {},
+                        )),
+                    },
+                )),
+            })
+            .await
+            .unwrap();
+
+        assert_matches!(
+            core_worker.poll_nexus_task().await,
+            Err(PollError::ShutDown)
+        );
+    };
+    let canceller = async {
+        let _started = started.acquire().await.unwrap();
+        wf_handle
+            .cancel(WorkflowCancelOptions::builder().reason("propagate").build())
+            .await
+            .unwrap();
+    };
+
+    join!(nexus_task_handler, canceller, async {
+        worker.run_until_done().await.unwrap();
+    });
 }
 
 #[workflow]
@@ -707,10 +837,7 @@ async fn nexus_must_complete_task_to_shutdown(#[values(true, false)] use_grace_p
     // The first thing to finish needs to have been the nexus task completion
     assert_eq!(complete_order_rx.recv().await.unwrap(), "t");
 
-    handle
-        .fetch_history_and_replay(worker.inner_mut())
-        .await
-        .unwrap();
+    handle.fetch_history_and_replay(&mut worker).await.unwrap();
 }
 
 #[workflow]
@@ -769,11 +896,17 @@ impl AsyncCompleterWf {
         ctx.cancelled().await;
         ctx.state(|wf| wf.cancellation_tx.send(true).unwrap());
 
+        // These waits coordinate cancellation completion, so they must outlive workflow cancellation.
         if ctx.state(|wf| wf.cancellation_type)
             == NexusOperationCancellationType::WaitCancellationCompleted
         {
-            ctx.wait_condition(|wf| wf.cancellation_wait_happened.load(Ordering::Relaxed))
-                .await;
+            ctx.wait_condition_with_options(
+                |wf| wf.cancellation_wait_happened.load(Ordering::Relaxed),
+                WaitConditionOptions::builder()
+                    .cancellation_token(WorkflowCancellationToken::new())
+                    .build(),
+            )
+            .await?;
         } else if ctx.state(|wf| wf.cancellation_type)
             == NexusOperationCancellationType::WaitCancellationRequested
         {
@@ -782,7 +915,13 @@ impl AsyncCompleterWf {
             // NexusOperationCancelRequestCompleted (written after cancel handler responds)
             // rather than NexusOperationCanceled (written after handler workflow completes as
             // cancelled).
-            ctx.wait_condition(|wf| wf.proceed_signal_received).await;
+            ctx.wait_condition_with_options(
+                |wf| wf.proceed_signal_received,
+                WaitConditionOptions::builder()
+                    .cancellation_token(WorkflowCancellationToken::new())
+                    .build(),
+            )
+            .await?;
         }
 
         ctx.state(|wf| wf.handler_exited_tx.send(true).unwrap());
@@ -1081,7 +1220,7 @@ async fn nexus_cancellation_types(
     }
 
     wf_handle
-        .fetch_history_and_replay(worker.inner_mut())
+        .fetch_history_and_replay(&mut worker)
         .await
         .unwrap();
 }

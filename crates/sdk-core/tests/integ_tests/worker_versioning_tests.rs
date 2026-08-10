@@ -68,6 +68,7 @@ async fn sets_deployment_info_on_task_responses(#[values(true, false)] use_defau
         core.complete_workflow_activation(WorkflowActivationCompletion {
             run_id: res.run_id.clone(),
             status: Some(success_complete.into()),
+            ..Default::default()
         })
         .await
         .unwrap();
@@ -285,6 +286,7 @@ async fn versioning_off_with_custom_build_id() {
             ])
             .into(),
         ),
+        ..Default::default()
     })
     .await
     .unwrap();
@@ -327,7 +329,7 @@ impl ContinueAsNewAutoUpgradeV1 {
             return Ok("v1.0".to_string());
         }
         ctx.wait_condition(|state| state.should_continue_as_new)
-            .await;
+            .await?;
         assert!(ctx.target_worker_deployment_version_changed());
         let mut options = ContinueAsNewOptions::default();
         options.initial_versioning_behavior = Some(ContinueAsNewVersioningBehavior::AutoUpgrade);
@@ -455,7 +457,7 @@ impl ContinueAsNewUseRampingVersionV1 {
             return Ok("v1.0".to_string());
         }
         ctx.wait_condition(|state| state.should_continue_as_new)
-            .await;
+            .await?;
         let mut options = ContinueAsNewOptions::default();
         options.initial_versioning_behavior =
             Some(ContinueAsNewVersioningBehavior::UseRampingVersion);
