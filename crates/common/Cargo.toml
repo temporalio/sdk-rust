@@ -13,12 +13,7 @@ categories = ["development-tools"]
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [features]
-otel = [
-  "dep:opentelemetry",
-  "dep:opentelemetry_sdk",
-  "dep:opentelemetry-otlp",
-  "dep:reqwest",
-]
+otel = ["dep:opentelemetry", "dep:opentelemetry_sdk", "dep:opentelemetry-otlp", "dep:reqwest"]
 tls-ring = [
   "opentelemetry-otlp?/tls-ring",
   "reqwest?/rustls-no-provider",
