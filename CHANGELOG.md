@@ -89,7 +89,6 @@ to docs, or any other relevant information.
 ### Fixed
 * Panics from update validators now reject the update instead of repeatedly failing workflow
   tasks.
-* Update result RPC timeouts now report `DeadlineExceeded` instead of `Cancelled`.
 
 ## [0.6.0] - 2026-08-04
 ## [0.5.0]

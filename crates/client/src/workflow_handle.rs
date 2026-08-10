@@ -837,7 +837,7 @@ where
         handle.get_result(rpc_options).await
     }
 
-    /// Start an update and return a handle after the workflow accepts it.
+    /// Start an update and return a handle without waiting for completion.
     /// Use `execute_update()` if you want to wait for the result immediately.
     pub async fn start_update<U>(
         &self,
@@ -1189,7 +1189,7 @@ pub struct WorkflowUpdateHandle<CT, T> {
     update_id: String,
     workflow_id: String,
     run_id: Option<String>,
-    /// Outcome returned if the update completed before the start call returned.
+    /// If the update was started with `Completed` wait stage, the outcome is already available.
     known_outcome: Option<update::v1::Outcome>,
     _output: PhantomData<T>,
 }
