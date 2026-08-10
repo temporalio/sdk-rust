@@ -82,8 +82,8 @@ pub use crate::{
     error::{
         ActivityExecutionError, ApplicationFailure, ChildWorkflowExecutionError,
         ChildWorkflowStartError, OutgoingActivityError, OutgoingError, OutgoingWorkflowError,
-        RetryState, TimeoutType, WorkerCreateError, WorkerRunError, WorkflowRegistrationError,
-        WorkflowSignalError,
+        RetryState, TimeoutType, WorkerCreateError, WorkerRunError, WorkerValidationError,
+        WorkflowRegistrationError, WorkflowSignalError,
     },
     plugins::{
         ClientAndWorkerPlugin, SimplePlugin, SimplePluginBuilder, SimplePluginOption, WorkerPlugin,
@@ -963,10 +963,6 @@ impl Worker {
                     },
                 )
                 .await
-                .map_err(|source| WorkerRunError::Fatal {
-                    message: "workflow futures encountered an error".to_owned(),
-                    source: Box::new(source),
-                })
         };
         let wf_completion_processor = async {
             UnboundedReceiverStream::new(completions_rx)

@@ -2,7 +2,7 @@
 
 pub use crate::workflow_registry::WorkflowRegistrationError;
 use temporalio_client::PluginApplyError;
-use temporalio_sdk_core::WorkerValidationError;
+pub use temporalio_sdk_core::WorkerValidationError;
 
 /// Errors that can occur while creating a worker.
 ///
@@ -26,7 +26,7 @@ pub enum WorkerRunError {
     #[error("worker validation failed: {0}")]
     Validation(#[source] WorkerValidationError),
     /// An unrecoverable error occurred while running the worker.
-    #[error("{message}: {source}")]
+    #[error("{message}")]
     Fatal {
         /// Worker operation that could not continue.
         message: String,
