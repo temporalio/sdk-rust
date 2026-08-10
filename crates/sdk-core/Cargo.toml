@@ -47,6 +47,7 @@ debug-plugin = ["dep:reqwest", "dep:hyper"]
 # crates should not enable this feature.
 test-utilities = ["dep:assert_matches", "dep:bimap"]
 antithesis_assertions = ["dep:antithesis_sdk"]
+dynamic-tls = ["temporalio-client/dynamic-tls"]
 
 [dependencies]
 anyhow = "1.0"

@@ -15,7 +15,7 @@ use std::{
 use temporalio_client::{
     Client, NamespacedClient, UntypedSignal, UntypedUpdate, UntypedWorkflow,
     WorkflowExecuteUpdateOptions, WorkflowExecutionInfo, WorkflowSignalOptions,
-    WorkflowStartOptions, grpc::WorkflowService,
+    WorkflowStartOptions, errors::WorkflowUpdateError, grpc::WorkflowService,
 };
 use temporalio_common::{
     data_converters::RawValue,
@@ -994,14 +994,21 @@ async fn task_failure_during_validation() {
     let mut worker = starter.worker().await;
     #[workflow]
     #[derive(Default)]
-    struct TaskFailureDuringValidationWf;
+    struct TaskFailureDuringValidationWf {
+        done: bool,
+    }
 
     #[workflow_methods]
     impl TaskFailureDuringValidationWf {
         #[run]
         async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<()> {
-            ctx.timer(Duration::from_secs(1)).await;
+            ctx.wait_condition(|state| state.done).await?;
             Ok(())
+        }
+
+        #[signal]
+        fn done(&mut self, _ctx: &mut SyncWorkflowContext<Self>, _: ()) {
+            self.done = true;
         }
 
         #[update_validator(do_update)]
@@ -1010,11 +1017,7 @@ async fn task_failure_during_validation() {
             _ctx: &WorkflowContextView,
             _: &(),
         ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-            static FAILCT: AtomicUsize = AtomicUsize::new(0);
-            if FAILCT.fetch_add(1, Ordering::Relaxed) < 2 {
-                panic!("ahhhhhh");
-            }
-            Ok(())
+            panic!("intentional validator panic")
         }
 
         #[update]
@@ -1038,7 +1041,7 @@ async fn task_failure_during_validation() {
         )
         .await
         .unwrap();
-    let update = async {
+    let update_result = async {
         let res = handle
             .execute_update(
                 TaskFailureDuringValidationWf::do_update,
@@ -1046,7 +1049,96 @@ async fn task_failure_during_validation() {
                 WorkflowExecuteUpdateOptions::default(),
             )
             .await;
+
+        handle
+            .signal(
+                TaskFailureDuringValidationWf::done,
+                (),
+                WorkflowSignalOptions::default(),
+            )
+            .await
+            .unwrap();
+        res
+    };
+    let run = async {
+        worker.run_until_done().await.unwrap();
+    };
+    let (update_result, _) = join!(update_result, run);
+    assert_matches!(
+        update_result,
+        Err(WorkflowUpdateError::Failed(failure))
+            if failure.message.contains("intentional validator panic")
+    );
+}
+
+#[tokio::test]
+async fn task_failure_during_update_handler() {
+    let wf_name = "task_failure_during_update_handler";
+    let mut starter = CoreWfStarter::new(wf_name);
+    starter.sdk_config.task_types = WorkerTaskTypes::workflow_only();
+    starter.workflow_options.task_timeout = Some(Duration::from_secs(1));
+    let mut worker = starter.worker().await;
+    #[workflow]
+    #[derive(Default)]
+    struct TaskFailureDuringUpdateHandlerWf {
+        done: bool,
+    }
+
+    #[workflow_methods]
+    impl TaskFailureDuringUpdateHandlerWf {
+        #[run]
+        async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<()> {
+            ctx.wait_condition(|state| state.done).await?;
+            Ok(())
+        }
+
+        #[signal]
+        fn done(&mut self, _ctx: &mut SyncWorkflowContext<Self>, _: ()) {
+            self.done = true;
+        }
+
+        #[update]
+        async fn do_update(
+            _ctx: &mut WorkflowContext<Self>,
+            _: (),
+        ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+            static FAILCT: AtomicUsize = AtomicUsize::new(0);
+            if FAILCT.fetch_add(1, Ordering::Relaxed) == 0 {
+                panic!("intentional update handler panic");
+            }
+            Ok("done".to_string())
+        }
+    }
+
+    worker
+        .register_workflow::<TaskFailureDuringUpdateHandlerWf>()
+        .unwrap();
+    let task_queue = starter.get_task_queue().to_owned();
+    let handle = worker
+        .submit_workflow(
+            TaskFailureDuringUpdateHandlerWf::run,
+            (),
+            WorkflowStartOptions::new(task_queue, starter.get_wf_id().to_owned()).build(),
+        )
+        .await
+        .unwrap();
+    let update = async {
+        let res = handle
+            .execute_update(
+                TaskFailureDuringUpdateHandlerWf::do_update,
+                (),
+                WorkflowExecuteUpdateOptions::default(),
+            )
+            .await;
         assert!(res.unwrap() == "done");
+        handle
+            .signal(
+                TaskFailureDuringUpdateHandlerWf::done,
+                (),
+                WorkflowSignalOptions::default(),
+            )
+            .await
+            .unwrap();
     };
     let run = async {
         worker.run_until_done().await.unwrap();

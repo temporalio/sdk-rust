@@ -202,6 +202,7 @@ impl ActivityHeartbeatManager {
                                                 .fail_activity_task(
                                                     tt.clone(),
                                                     Some(make_payloads_too_large_failure(violation)),
+                                                    None,
                                                 )
                                                 .await
                                             {

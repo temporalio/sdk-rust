@@ -108,6 +108,7 @@ pub mod coresdk {
                 Self {
                     run_id: run_id.into(),
                     status: Some(workflow_activation_completion::Status::Successful(success)),
+                    ..Default::default()
                 }
             }
 
@@ -120,6 +121,7 @@ pub mod coresdk {
                 Self {
                     run_id: run_id.into(),
                     status: Some(workflow_activation_completion::Status::Successful(success)),
+                    ..Default::default()
                 }
             }
 
@@ -129,6 +131,7 @@ pub mod coresdk {
                 Self {
                     run_id: run_id.into(),
                     status: Some(workflow_activation_completion::Status::Successful(success)),
+                    ..Default::default()
                 }
             }
 
@@ -146,6 +149,7 @@ pub mod coresdk {
                                 as i32,
                         },
                     )),
+                    ..Default::default()
                 }
             }
 
@@ -269,6 +273,7 @@ pub mod coresdk {
                 WorkflowActivationCompletion {
                     run_id,
                     status: Some(workflow_activation_completion::Status::Successful(success)),
+                    ..Default::default()
                 }
             }
         }
