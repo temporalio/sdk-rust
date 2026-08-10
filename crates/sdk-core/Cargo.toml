@@ -21,7 +21,6 @@ tls-ring = [
   "temporalio-client/tls-ring",
   "temporalio-common/tls-ring",
   "opentelemetry-otlp?/tls-ring",
-  "opentelemetry-otlp?/reqwest-client",
   "reqwest?/rustls-no-provider",
   "tonic/tls-native-roots",
 ]

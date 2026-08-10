@@ -82,6 +82,7 @@ to docs, or any other relevant information.
 ### Changed
 * Cancellation errors propagated after workflow cancellation now complete the workflow as cancelled
   instead of failed.
+* The default `tls-ring` build no longer pulls in `aws-lc-rs`. `tls-aws-lc` builds are unchanged.
 
 ### Fixed
 * Panics from update validators now reject the update instead of repeatedly failing workflow
