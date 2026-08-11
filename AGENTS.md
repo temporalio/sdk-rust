@@ -77,6 +77,11 @@ Documentation can be generated with `cargo doc`.
   bridge, without its users noticing, belongs in neither file. This applies to the crates Core
   shares as well: `temporalio-client`, `temporalio-common`, `temporalio-common-wasm`,
   `temporalio-macros`, and `temporalio-protos`.
+- Write each entry from the perspective of the file's audience, and word a change that goes in
+  both files separately for each rather than copying it verbatim. The root changelog should not
+  describe Core internals or bridge-only APIs, and the sdk-core changelog should not name Rust
+  identifiers its readers cannot call. The comment at the top of either file lists the available
+  headings.
 
 ## Review Checklist
 

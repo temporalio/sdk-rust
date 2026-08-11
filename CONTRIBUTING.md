@@ -69,8 +69,9 @@ Good pull requests are focused and easy to review:
   different interaction with the server. Because the Rust SDK runs on Core too, a
   user-observable change in Core behavior normally belongs in both files; an internal Rust
   API change that a language SDK absorbs inside its own bridge is invisible to its users
-  and belongs in neither. The comment at the top of either file lists the available
-  headings.
+  and belongs in neither. Write each entry from the perspective of the file's audience,
+  wording a change that goes in both files separately for each. The comment at the top of
+  either file lists the available headings.
 * Describe what changed, why it changed, and what validation you ran.
 
 Run the relevant local checks when practical. CI must pass before a pull request can
