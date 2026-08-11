@@ -26,6 +26,7 @@ use temporalio_common::{
         coresdk::{
             ActivityTaskCompletion, AsJsonPayloadExt, FromJsonPayloadExt,
             activity_result::ActivityExecutionResult,
+            activity_task::activity_task as act_task,
             common::extract_local_activity_marker_data,
             workflow_activation::{
                 WorkflowActivation, WorkflowActivationJob, workflow_activation_job,
@@ -3061,22 +3062,43 @@ async fn zero_cache_doesnt_evict_before_wft_is_answered() {
     .await
     .unwrap();
 
-    let first_la = core.poll_activity_task().await.unwrap();
-    let second_la = core.poll_activity_task().await.unwrap();
+    // Which activity each task belongs to is matched on activity id, since the order the two are
+    // handed out in is not something this test should depend on.
+    let queued_las = [
+        core.poll_activity_task().await.unwrap(),
+        core.poll_activity_task().await.unwrap(),
+    ];
+    let token_for = |activity_id: &str| {
+        queued_las
+            .iter()
+            .find(|t| {
+                matches!(&t.variant, Some(act_task::Variant::Start(start))
+                    if start.activity_id == activity_id)
+            })
+            .unwrap_or_else(|| panic!("no local activity task for id {activity_id}"))
+            .task_token
+            .clone()
+    };
 
     core.complete_activity_task(ActivityTaskCompletion {
-        task_token: first_la.task_token,
+        task_token: token_for("1"),
         result: Some(ActivityExecutionResult::ok(vec![1].into())),
     })
     .await
     .unwrap();
     let resolve_first = core.poll_workflow_activation().await.unwrap();
+    assert_matches!(
+        resolve_first.jobs.as_slice(),
+        [WorkflowActivationJob {
+            variant: Some(workflow_activation_job::Variant::ResolveActivity(resolution)),
+        }] => assert_eq!(resolution.seq, 1)
+    );
 
     // Finishing the second activity while the first resolution is outstanding with lang is what
     // queues it rather than delivering it, leaving no outstanding activities but an undelivered
     // job once the completion below lands.
     core.complete_activity_task(ActivityTaskCompletion {
-        task_token: second_la.task_token,
+        task_token: token_for("2"),
         result: Some(ActivityExecutionResult::ok(vec![2].into())),
     })
     .await
@@ -3088,6 +3110,12 @@ async fn zero_cache_doesnt_evict_before_wft_is_answered() {
     // Scheduling from the queued resolution keeps the task open with the first two markers still
     // buffered, which is the point at which the run must survive to report them.
     let resolve_second = core.poll_workflow_activation().await.unwrap();
+    assert_matches!(
+        resolve_second.jobs.as_slice(),
+        [WorkflowActivationJob {
+            variant: Some(workflow_activation_job::Variant::ResolveActivity(resolution)),
+        }] => assert_eq!(resolution.seq, 2)
+    );
     core.complete_workflow_activation(WorkflowActivationCompletion::from_cmd(
         resolve_second.run_id,
         la_cmd(3, "3"),
@@ -3103,6 +3131,12 @@ async fn zero_cache_doesnt_evict_before_wft_is_answered() {
     .await
     .unwrap();
     let resolve_third = core.poll_workflow_activation().await.unwrap();
+    assert_matches!(
+        resolve_third.jobs.as_slice(),
+        [WorkflowActivationJob {
+            variant: Some(workflow_activation_job::Variant::ResolveActivity(resolution)),
+        }] => assert_eq!(resolution.seq, 3)
+    );
     core.complete_execution(&resolve_third.run_id).await;
 
     core.shutdown().await;
