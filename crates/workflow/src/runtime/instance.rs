@@ -28,10 +28,12 @@ use futures_util::{
     future::{Fuse, LocalBoxFuture},
 };
 use std::{
-    any::Any,
+    any::{Any, TypeId},
     cell::RefCell,
     collections::HashMap,
+    fmt::{Display, Formatter},
     future::{Future, ready},
+    panic::AssertUnwindSafe,
     pin::Pin,
     rc::Rc,
     sync::Arc,
@@ -603,12 +605,19 @@ where
                 let view = workflow_ctx.view();
                 workflow_ctx.state(|wf| wf.validate_update(view, &name, input))
             });
-            let validation = call_validate_update(
-                &self.interceptors,
-                validation_ctx,
-                validation_input,
-                validation_next,
-            );
+            let validation = std::panic::catch_unwind(AssertUnwindSafe(|| {
+                call_validate_update(
+                    &self.interceptors,
+                    validation_ctx,
+                    validation_input,
+                    validation_next,
+                )
+            }))
+            .unwrap_or_else(|panic| {
+                Err(WorkflowError::Execution(
+                    anyhow::anyhow!("Update validator panicked: {}", panic_formatter(panic)).into(),
+                ))
+            });
             match validation {
                 Ok(()) => {}
                 Err(e) => {
@@ -1086,6 +1095,43 @@ where
     <W::Run as WorkflowDefinition>::Input: Send,
 {
     GuestWorkflowInstance::<W>::instantiate(payloads, converter, base_ctx)
+}
+
+/// Attempts to turn caught panics into something printable
+fn panic_formatter(panic: Box<dyn Any>) -> Box<dyn Display> {
+    _panic_formatter::<&str>(panic)
+}
+fn _panic_formatter<T: 'static + PrintablePanicType>(panic: Box<dyn Any>) -> Box<dyn Display> {
+    match panic.downcast::<T>() {
+        Ok(d) => d,
+        Err(orig) => {
+            if TypeId::of::<<T as PrintablePanicType>::NextType>()
+                == TypeId::of::<EndPrintingAttempts>()
+            {
+                return Box::new("Couldn't turn panic into a string");
+            }
+            _panic_formatter::<T::NextType>(orig)
+        }
+    }
+}
+trait PrintablePanicType: Display {
+    type NextType: PrintablePanicType;
+}
+
+impl PrintablePanicType for &str {
+    type NextType = String;
+}
+impl PrintablePanicType for String {
+    type NextType = EndPrintingAttempts;
+}
+struct EndPrintingAttempts {}
+impl Display for EndPrintingAttempts {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Will never be printed")
+    }
+}
+impl PrintablePanicType for EndPrintingAttempts {
+    type NextType = EndPrintingAttempts;
 }
 
 #[cfg(test)]

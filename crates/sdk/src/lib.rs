@@ -69,24 +69,7 @@ pub mod error;
 pub mod interceptors;
 /// Experimental APIs for configuring clients and workers with reusable plugins.
 pub mod plugins;
-/// Runtime configuration and low-level Core worker building blocks.
-///
-/// These types are grouped here to keep Core-specific configuration separate from the SDK's
-/// primary workflow and activity APIs. Create a [`crate::Runtime`] before connecting a client,
-/// then pass it to [`crate::Worker::new`].
-pub mod runtime {
-    pub use temporalio_sdk_core::{
-        ActivitySlotKind, FixedSizeSlotSupplier, LocalActivitySlotKind, NexusSlotKind,
-        PollerBehavior, ResourceBasedSlotsOptions, ResourceBasedSlotsOptionsBuilder,
-        ResourceBasedTuner, ResourceBasedTunerConfig, ResourceController, ResourceSlotOptions,
-        RuntimeOptions, RuntimeOptionsBuilder, SlotInfo, SlotInfoTrait, SlotKind, SlotKindType,
-        SlotMarkUsedContext, SlotReleaseContext, SlotReservationContext, SlotSupplier,
-        SlotSupplierOptions, SlotSupplierPermit, TokioRuntimeBuilder, TunerBuilder, TunerHolder,
-        TunerHolderOptions, TunerHolderOptionsBuilder, Worker as CoreWorker, WorkerConfig,
-        WorkerConfigBuilder, WorkerTuner, WorkerVersioningStrategy, WorkflowErrorType,
-        WorkflowSlotKind, init_replay_worker, replay,
-    };
-}
+pub mod runtime;
 mod workflow_executor;
 mod workflow_future;
 pub mod workflow_interceptors;
@@ -99,15 +82,16 @@ pub use crate::{
     error::{
         ActivityExecutionError, ApplicationFailure, ChildWorkflowExecutionError,
         ChildWorkflowStartError, OutgoingActivityError, OutgoingError, OutgoingWorkflowError,
-        RetryState, TimeoutType, WorkerCreateError, WorkflowRegistrationError, WorkflowSignalError,
+        RetryState, TimeoutType, WorkerCreateError, WorkerRunError, WorkerValidationError,
+        WorkflowRegistrationError, WorkflowSignalError,
     },
     plugins::{
         ClientAndWorkerPlugin, SimplePlugin, SimplePluginBuilder, SimplePluginOption, WorkerPlugin,
         WorkflowDefinitions,
     },
 };
+pub use runtime::Runtime;
 pub use temporalio_client::Namespace;
-pub use temporalio_sdk_core::CoreRuntime as Runtime;
 pub use temporalio_workflow::{
     ActivityCancellationType, ActivityCloseTimeouts, ActivityOptions, BaseWorkflowContext,
     CancellableFuture, CancellableFutureWithReason, ChildWorkflowCancellationType,
@@ -133,8 +117,8 @@ use crate::{
     workflow_future::start_workflow,
     workflow_interceptors::WorkflowInterceptorConstructor,
 };
-use anyhow::{Context, anyhow, bail};
-use futures_util::{FutureExt, StreamExt, TryFutureExt, TryStreamExt};
+use anyhow::{anyhow, bail};
+use futures_util::{FutureExt, StreamExt, TryStreamExt};
 use std::{
     any::{Any, TypeId},
     cell::RefCell,
@@ -925,10 +909,14 @@ impl Worker {
 
     /// Runs the worker. Eventually resolves after the worker has been explicitly shut down,
     /// or may return early with an error in the event of some unresolvable problem.
-    pub async fn run(&mut self) -> Result<(), anyhow::Error> {
+    pub async fn run(&mut self) -> Result<(), WorkerRunError> {
         // Perform the namespace check-in so poller behavior (e.g. autoscaling auto-enroll) is
         // resolved before any polling begins.
-        self.common.worker.validate().await?;
+        self.common
+            .worker
+            .validate()
+            .await
+            .map_err(WorkerRunError::Validation)?;
         let shutdown_token = CancellationToken::new();
         let (common, wf_half, act_half) = self.split_apart();
         let (wf_future_tx, wf_future_rx) =
@@ -944,7 +932,7 @@ impl Worker {
 
         let wf_future_joiner = async {
             UnboundedReceiverStream::new(wf_future_rx)
-                .map(Result::<_, anyhow::Error>::Ok)
+                .map(Result::<_, WorkerRunError>::Ok)
                 .try_for_each_concurrent(
                     None,
                     |WorkflowFutureHandle {
@@ -953,13 +941,19 @@ impl Worker {
                      }| {
                         let wf_half = &*wf_half;
                         async move {
-                            let result = join_handle.await.map_err(anyhow::Error::new)?;
+                            let result = join_handle.await.map_err(|e| WorkerRunError::Fatal {
+                                message: "workflow task dropped".into(),
+                                source: e.into(),
+                            })?;
                             // Eviction is normal workflow lifecycle - workflows loop waiting for
                             // eviction after completion to manage cache cleanup
                             if let Err(e) = result
                                 && !matches!(e, WorkflowTermination::Evicted)
                             {
-                                return Err(anyhow::Error::new(e));
+                                return Err(WorkerRunError::Fatal {
+                                    message: "workflow execution failed".into(),
+                                    source: e.into(),
+                                });
                             }
                             debug!(run_id=%run_id, "Removing workflow from cache");
                             wf_half.workflows.borrow_mut().remove(&run_id);
@@ -969,7 +963,6 @@ impl Worker {
                     },
                 )
                 .await
-                .context("Workflow futures encountered an error")
         };
         let wf_completion_processor = async {
             UnboundedReceiverStream::new(completions_rx)
@@ -981,9 +974,11 @@ impl Worker {
                     }
                     common.worker.complete_workflow_activation(completion).await
                 })
-                .map_err(anyhow::Error::from)
                 .await
-                .context("Workflow completions processor encountered an error")
+                .map_err(|source| WorkerRunError::Fatal {
+                    message: "workflow completions processor encountered an error".to_owned(),
+                    source: Box::new(source),
+                })
         };
         tokio::try_join!(
             // Workflow-related tasks run inside LocalSet (allows !Send futures)
@@ -998,7 +993,10 @@ impl Worker {
                                     Err(PollError::ShutDown) => {
                                         break;
                                     }
-                                    o => o?,
+                                    o => o.map_err(|source| WorkerRunError::Fatal {
+                                        message: "workflow polling failed".to_owned(),
+                                        source: Box::new(source),
+                                    })?,
                                 };
                             if let Err(err) = decode_payloads(
                                 &mut activation,
@@ -1024,7 +1022,12 @@ impl Worker {
                                 continue;
                             }
                             for i in &common.worker_interceptors {
-                                i.on_workflow_activation(&activation).await?;
+                                i.on_workflow_activation(&activation).await.map_err(|source| {
+                                    WorkerRunError::Fatal {
+                                        message: "workflow activation interceptor failed".to_owned(),
+                                        source: source.into_boxed_dyn_error(),
+                                    }
+                                })?;
                             }
                             if let Some(wf_fut) = wf_half
                                 .workflow_activation_handler(
@@ -1034,7 +1037,13 @@ impl Worker {
                                     &completions_tx,
                                     &executor,
                                 )
-                                .await?
+                                .await
+                                .map_err(|source| {
+                                    WorkerRunError::Fatal {
+                                        message: "workflow activation processing failed".to_owned(),
+                                        source: source.into_boxed_dyn_error(),
+                                    }
+                                })?
                                 && wf_future_tx.send(wf_fut).is_err()
                             {
                                 panic!(
@@ -1048,7 +1057,7 @@ impl Worker {
                         // terminate.
                         drop(wf_future_tx);
                         drop(completions_tx);
-                        Result::<_, anyhow::Error>::Ok(())
+                        Result::<_, WorkerRunError>::Ok(())
                     },
                     wf_future_joiner,
                     async {
@@ -1057,7 +1066,7 @@ impl Worker {
                             _ = shutdown_token.cancelled() => {}
                         }
                         executor.shutdown().await;
-                        Result::<_, anyhow::Error>::Ok(())
+                        Result::<_, WorkerRunError>::Ok(())
                     },
                 )
                 }).await
@@ -1071,7 +1080,10 @@ impl Worker {
                         if matches!(activity, Err(PollError::ShutDown)) {
                             break;
                         }
-                        let mut activity = activity?;
+                        let mut activity = activity.map_err(|source| WorkerRunError::Fatal {
+                            message: "activity polling failed".to_owned(),
+                            source: Box::new(source),
+                        })?;
                         if let Err(err) = decode_payloads(
                             &mut activity,
                             common.data_converter.codec(),
@@ -1091,7 +1103,14 @@ impl Worker {
                             };
                             encode_activity_completion(&mut completion, &common.data_converter)
                                 .await;
-                            common.worker.complete_activity_task(completion).await?;
+                            common
+                                .worker
+                                .complete_activity_task(completion)
+                                .await
+                                .map_err(|source| WorkerRunError::Fatal {
+                                    message: "activity completion failed".to_owned(),
+                                    source: Box::new(source),
+                                })?;
                             continue;
                         }
                         match act_half.activity_task_handler(
@@ -1122,13 +1141,25 @@ impl Worker {
                                 };
                                 encode_activity_completion(&mut completion, &common.data_converter)
                                     .await;
-                                common.worker.complete_activity_task(completion).await?;
+                                common
+                                    .worker
+                                    .complete_activity_task(completion)
+                                    .await
+                                    .map_err(|source| WorkerRunError::Fatal {
+                                        message: "activity completion failed".to_owned(),
+                                        source: Box::new(source),
+                                    })?;
                             }
-                            Err(ActivityTaskHandlerError::Fatal(err)) => return Err(err),
+                            Err(ActivityTaskHandlerError::Fatal(source)) => {
+                                return Err(WorkerRunError::Fatal {
+                                    message: "activity task handling failed".to_owned(),
+                                    source: source.into_boxed_dyn_error(),
+                                });
+                            }
                         };
                     }
                 };
-                Result::<_, anyhow::Error>::Ok(())
+                Result::<_, WorkerRunError>::Ok(())
             },
             wf_completion_processor,
         )?;

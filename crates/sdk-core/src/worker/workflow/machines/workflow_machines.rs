@@ -397,6 +397,10 @@ impl WorkflowMachines {
         self.current_started_event_id
     }
 
+    pub(crate) fn history_size_bytes(&self) -> u64 {
+        self.history_size_bytes
+    }
+
     pub(crate) fn prepare_for_wft_response(&mut self) -> MachinesWFTResponseContent<'_> {
         MachinesWFTResponseContent {
             replaying: self.replaying,

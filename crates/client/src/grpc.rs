@@ -430,6 +430,11 @@ impl<C> PayloadLimitsClient<C> {
     pub fn set_error_limits(&self, limits: Option<PayloadErrorLimits>) {
         *self.error_limits.write() = limits;
     }
+
+    /// Return the error limits currently injected into requests.
+    pub fn error_limits(&self) -> Option<PayloadErrorLimits> {
+        *self.error_limits.read()
+    }
 }
 
 impl<C: RawClientProducer> RawClientProducer for PayloadLimitsClient<C> {

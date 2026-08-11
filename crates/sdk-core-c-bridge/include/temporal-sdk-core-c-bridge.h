@@ -5,6 +5,11 @@
 #include <stdint.h>
 #include <stdlib.h>
 
+/* Forward declarations for structs referenced in callback typedefs */
+struct TemporalCoreCustomMetricMeter;
+struct TemporalCoreCustomSlotSupplierCallbacks;
+
+
 typedef enum TemporalCoreClientGrpcCompression {
   TemporalCoreClientGrpcCompression_Gzip = 0,
   TemporalCoreClientGrpcCompression_None = 1,
@@ -52,6 +57,20 @@ typedef enum TemporalCoreOpenTelemetryProtocol {
   TemporalCoreOpenTelemetryProtocol_Grpc = 1,
   TemporalCoreOpenTelemetryProtocol_Http,
 } TemporalCoreOpenTelemetryProtocol;
+
+typedef enum TemporalCoreRuntimeType {
+  TemporalCoreRuntimeType_Unspecified = 0,
+  TemporalCoreRuntimeType_Jvm = 1,
+  TemporalCoreRuntimeType_Cpython = 2,
+  TemporalCoreRuntimeType_Node = 3,
+  TemporalCoreRuntimeType_Bun = 4,
+  TemporalCoreRuntimeType_Cruby = 5,
+  TemporalCoreRuntimeType_Go = 6,
+  TemporalCoreRuntimeType_DotnetFramework = 7,
+  TemporalCoreRuntimeType_DotnetCore = 8,
+  TemporalCoreRuntimeType_Native = 9,
+  TemporalCoreRuntimeType_Roadrunner = 10,
+} TemporalCoreRuntimeType;
 
 typedef enum TemporalCoreSlotKindType {
   TemporalCoreSlotKindType_WorkflowSlotKindType,
@@ -495,9 +514,37 @@ typedef struct TemporalCoreTelemetryOptions {
   const struct TemporalCoreMetricsOptions *metrics;
 } TemporalCoreTelemetryOptions;
 
+typedef struct TemporalCoreRuntimeInfo {
+  /**
+   * The SDK runtime hosting Core.
+   */
+  enum TemporalCoreRuntimeType runtime_type;
+  /**
+   * The runtime version, or empty if it cannot be determined.
+   */
+  struct TemporalCoreByteArrayRef version;
+} TemporalCoreRuntimeInfo;
+
+typedef struct TemporalCoreRuntimeInfoArray {
+  /**
+   * Runtime entries read during runtime construction; ownership remains with the caller.
+   */
+  const struct TemporalCoreRuntimeInfo *data;
+  size_t size;
+} TemporalCoreRuntimeInfoArray;
+
 typedef struct TemporalCoreRuntimeOptions {
   const struct TemporalCoreTelemetryOptions *telemetry;
   uint64_t worker_heartbeat_interval_millis;
+  /**
+   * SDK runtimes included in worker environment heartbeats. An empty array reports no runtime;
+   * the bridge does not inherit Core's native-runtime default.
+   */
+  struct TemporalCoreRuntimeInfoArray runtime_info;
+  /**
+   * If true, worker heartbeats omit all runtime, hosting, and platform information.
+   */
+  bool disable_environment_info;
 } TemporalCoreRuntimeOptions;
 
 typedef struct TemporalCoreTestServerOptions {

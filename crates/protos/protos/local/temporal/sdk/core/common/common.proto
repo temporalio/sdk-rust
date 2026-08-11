@@ -35,3 +35,16 @@ message WorkerDeploymentVersion {
     string deployment_name = 1;
     string build_id = 2;
 }
+
+// Metrics for a set of external payload storage operations (all uploads and downloads)
+// performed while processing a task, so core can emit unified logging and metrics.
+message ExternalStorageMetrics {
+    // Number of payloads stored or retrieved externally.
+    uint64 payload_count = 1;
+    // Total size in bytes of the externally stored or retrieved payloads.
+    uint64 total_size_bytes = 2;
+    // Wall-clock time spent on the external storage operations.
+    google.protobuf.Duration total_duration = 3;
+    // Names of the drivers that participated in the operations.
+    repeated string driver_names = 4;
+}

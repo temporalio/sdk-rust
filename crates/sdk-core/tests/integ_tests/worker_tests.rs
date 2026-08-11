@@ -147,6 +147,7 @@ async fn worker_handles_unknown_workflow_types_gracefully() {
                         ..
                     })),
                     run_id,
+                    ..
                 } if message == "Workflow type unregistered not found" && *run_id == self.run_id
             ) {
                 self.unregistered_failure_seen
@@ -158,6 +159,7 @@ async fn worker_handles_unknown_workflow_types_gracefully() {
                 WorkflowActivationCompletion {
                     status: Some(Status::Successful(..)),
                     run_id,
+                    ..
                 } if self.unregistered_failure_seen.load(Ordering::Relaxed) && *run_id == self.run_id
             ) {
                 // Shutdown the worker

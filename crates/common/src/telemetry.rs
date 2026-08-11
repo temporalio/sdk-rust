@@ -504,3 +504,20 @@ pub fn telemetry_init_fallback() -> Result<(), anyhow::Error> {
     )?;
     Ok(())
 }
+
+/// Ensure a process-wide default rustls `CryptoProvider` is installed.
+///
+/// Under the `tls-ring` build (and not `tls-aws-lc`), the reqwest clients used for ephemeral
+/// server downloads and the OTLP HTTP metric exporter carry no compiled-in crypto provider, so
+/// they resolve one from the process default at connection time. Installing ring here lets those
+/// clients negotiate TLS without pulling aws-lc-rs into the build. Idempotent, and tolerates a
+/// provider having already been installed by another component.
+pub fn ensure_default_crypto_provider() {
+    #[cfg(all(feature = "tls-ring", not(feature = "tls-aws-lc")))]
+    {
+        static INIT: std::sync::Once = std::sync::Once::new();
+        INIT.call_once(|| {
+            let _ = rustls::crypto::ring::default_provider().install_default();
+        });
+    }
+}
