@@ -87,6 +87,8 @@ to docs, or any other relevant information.
 ### Fixed
 * Panics from update validators now reject the update instead of repeatedly failing workflow
   tasks.
+* Workers with `max_cached_workflows` set to 0 no longer stall when a local activity resolves while
+  the resolution for an earlier one is still being delivered.
 
 ## [0.6.0] - 2026-08-04
 ## [0.5.0]
