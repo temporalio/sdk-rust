@@ -5,6 +5,11 @@
 #include <stdint.h>
 #include <stdlib.h>
 
+/* Forward declarations for structs referenced in callback typedefs */
+struct TemporalCoreCustomMetricMeter;
+struct TemporalCoreCustomSlotSupplierCallbacks;
+
+
 typedef enum TemporalCoreClientGrpcCompression {
   TemporalCoreClientGrpcCompression_Gzip = 0,
   TemporalCoreClientGrpcCompression_None = 1,

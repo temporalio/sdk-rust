@@ -809,7 +809,10 @@ impl TestWorker {
             interceptor_router.clear();
         }
         let get_results_waiter = completion_waiter.wait_all_wfs();
-        tokio::try_join!(self.inner.run(), get_results_waiter)?;
+        tokio::try_join!(
+            async { self.inner.run().await.map_err(anyhow::Error::from) },
+            get_results_waiter
+        )?;
         Ok(())
     }
 
