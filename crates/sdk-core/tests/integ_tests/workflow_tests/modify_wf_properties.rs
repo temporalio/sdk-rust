@@ -1,16 +1,13 @@
-use crate::common::{CoreWfStarter, build_fake_sdk};
+use crate::common::CoreWfStarter;
 use temporalio_client::{
     NamespacedClient, WorkflowDescribeOptions, WorkflowExecutionInfo, WorkflowStartOptions,
 };
-use temporalio_common::{
-    protos::{
-        coresdk::FromJsonPayloadExt,
-        temporal::api::{
-            command::v1::{Command, command},
-            enums::v1::EventType,
-        },
+use temporalio_common::protos::{
+    coresdk::FromJsonPayloadExt,
+    temporal::api::{
+        command::v1::{Command, command},
+        enums::v1::EventType,
     },
-    worker::WorkerTaskTypes,
 };
 use temporalio_macros::{workflow, workflow_methods};
 use temporalio_sdk::{MemoValue, WorkflowContext, WorkflowResult};
@@ -50,10 +47,11 @@ async fn sends_modify_wf_props() {
     let wf_name = "can_upsert_memo";
     let wf_id = Uuid::new_v4();
     let mut starter = CoreWfStarter::new(wf_name);
-    starter.sdk_config.task_types = WorkerTaskTypes::workflow_only();
+    starter
+        .sdk_config
+        .register_workflow::<MemoUpserter>()
+        .unwrap();
     let mut worker = starter.worker().await;
-
-    worker.register_workflow::<MemoUpserter>().unwrap();
     let task_queue = starter.get_task_queue().to_owned();
     let run_id = worker
         .submit_wf(
@@ -65,7 +63,7 @@ async fn sends_modify_wf_props() {
         .unwrap();
     worker.run_until_done().await.unwrap();
 
-    let client = starter.get_client().await;
+    let client = starter.get_core_client().await;
     let description = WorkflowExecutionInfo {
         namespace: client.namespace(),
         workflow_id: wf_id.to_string(),
@@ -134,7 +132,8 @@ async fn workflow_modify_props() {
         });
     });
 
-    let mut worker = build_fake_sdk(mock_cfg);
-    worker.register_workflow::<ModifyPropsWf>().unwrap();
+    let mut worker = crate::common::build_fake_sdk_with_options(mock_cfg, |options| {
+        options.register_workflow::<ModifyPropsWf>().unwrap();
+    });
     worker.run().await.unwrap();
 }

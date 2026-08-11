@@ -32,7 +32,7 @@ use temporalio_common::{
             enums::v1::{HistoryEventFilterType, UpdateWorkflowExecutionLifecycleStage},
             history::{
                 self,
-                v1::{HistoryEvent, history_event::Attributes},
+                v1::{History, HistoryEvent, history_event::Attributes},
             },
             query::v1::WorkflowQuery,
             sdk::v1::UserMetadata,
@@ -336,6 +336,7 @@ impl WorkflowExecutionDescription {
 #[derive(Debug, Clone)]
 pub struct WorkflowHistory {
     events: Vec<HistoryEvent>,
+    workflow_id: Option<String>,
 }
 impl From<WorkflowHistory> for history::v1::History {
     fn from(h: WorkflowHistory) -> Self {
@@ -343,9 +344,46 @@ impl From<WorkflowHistory> for history::v1::History {
     }
 }
 
+/// Error converting a workflow history to or from JSON.
+#[derive(Debug, thiserror::Error)]
+#[error("failed to convert workflow history JSON: {0}")]
+pub struct WorkflowHistoryJsonError(#[from] serde_json::Error);
+
 impl WorkflowHistory {
-    fn new(events: Vec<HistoryEvent>) -> Self {
-        Self { events }
+    fn new(events: Vec<HistoryEvent>, workflow_id: Option<String>) -> Self {
+        Self {
+            events,
+            workflow_id,
+        }
+    }
+
+    /// Decode a workflow history from JSON bytes.
+    pub fn from_json(bytes: &[u8]) -> Result<Self, WorkflowHistoryJsonError> {
+        let history: History = serde_json::from_slice(bytes)?;
+        let workflow_id = history
+            .events
+            .first()
+            .and_then(|event| match event.attributes.as_ref() {
+                Some(Attributes::WorkflowExecutionStartedEventAttributes(attributes)) => {
+                    Some(attributes)
+                }
+                _ => None,
+            })
+            .map(|attributes| attributes.workflow_id.clone())
+            .filter(|wfid| !wfid.is_empty());
+        Ok(Self::new(history.events, workflow_id))
+    }
+
+    /// Encode this workflow history as JSON bytes.
+    pub fn to_json(&self) -> Result<Vec<u8>, WorkflowHistoryJsonError> {
+        Ok(serde_json::to_vec(&History {
+            events: self.events.clone(),
+        })?)
+    }
+
+    /// Return the workflow ID when it is known.
+    pub fn workflow_id(&self) -> Option<&str> {
+        self.workflow_id.as_deref()
     }
 
     /// The history events.
@@ -1177,7 +1215,10 @@ where
             next_page_token = output.next_page_token;
         }
 
-        Ok(WorkflowHistory::new(all_events))
+        Ok(WorkflowHistory::new(
+            all_events,
+            Some(self.info.workflow_id.clone()),
+        ))
     }
 }
 
@@ -1305,10 +1346,32 @@ mod tests {
         protos::temporal::api::{
             common::v1::{Memo, SearchAttributes},
             enums::v1::WorkflowExecutionStatus as ProtoWorkflowExecutionStatus,
+            history::v1::WorkflowExecutionStartedEventAttributes,
             sdk::v1::UserMetadata,
             workflow::v1::WorkflowExecutionConfig,
         },
     };
+
+    #[test]
+    fn workflow_history_workflow_id_roundtrips() {
+        let event = HistoryEvent {
+            event_id: 1,
+            attributes: Some(Attributes::WorkflowExecutionStartedEventAttributes(
+                WorkflowExecutionStartedEventAttributes {
+                    workflow_id: "workflow-id".to_owned(),
+                    original_execution_run_id: "run-id".to_owned(),
+                    ..Default::default()
+                },
+            )),
+            ..Default::default()
+        };
+        let history = WorkflowHistory::new(vec![event], None);
+
+        let bytes = history.to_json().unwrap();
+
+        let decoded = WorkflowHistory::from_json(&bytes).unwrap();
+        assert_eq!(decoded.workflow_id(), Some("workflow-id"));
+    }
 
     #[tokio::test]
     async fn workflow_result_details_support_typed_decoding() {

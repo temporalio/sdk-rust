@@ -56,8 +56,15 @@ relevant information.
 ### Changed
 * Cancellation errors propagated after workflow cancellation now complete the workflow as cancelled
   instead of failed.
+* `WorkflowReplayer` for workflow history replay, including JSON history helpers
+  and worker-plugin configuration.
+* Experimental worker lifecycle interception through `WorkerInterceptor::run_worker` and
+  `WorkerInterceptor::with_workflow_replay_worker`.
 
 ### Breaking Changes :boom:
+* Removed `InterceptorWithNext`. Register worker interceptors as an ordered vector instead.
+* `Worker::run` now returns `WorkerRunError` instead of `anyhow::Error`.
+  Non-validation failures are reported as `WorkerRunError::Fatal` with a message and source.
 * `CancellableFuture` and `CancellableFutureWithReason` now use the inherited `Future::Output`
   associated type instead of a generic output parameter.
 * `TimerOptions` is now tagged with `#[non_exhaustive]`. Use
@@ -98,6 +105,10 @@ relevant information.
 * `WorkflowUpdateWaitStage` and `WorkflowStartUpdateOptions::wait_for_stage` have been removed.
   `start_update` now always waits for the update to be accepted; use `execute_update` to wait for
   completion.
+* Workflow and activity implementations must now be registered through `WorkerOptions` before
+  constructing a `Worker`; the corresponding registration methods on `Worker` have been removed.
+* `Worker::run` now returns `WorkerRunError` instead of `anyhow::Error`.
+  Non-validation failures are reported as `WorkerRunError::Fatal` with a message and source.
 
 ### Fixed
 * Local activity resolutions are now delivered to workflows as each activity completes instead of
@@ -110,6 +121,9 @@ relevant information.
   tasks.
 * Workers with `max_cached_workflows` set to 0 no longer stall when a local activity resolves while
   the resolution for an earlier one is still being delivered.
+* Rust SDK workers now derive enabled task types from registered workflows and activities. The
+  task types can no longer be configured separately, preventing mismatched poll loops from hanging
+  worker shutdown.
 
 ## [0.6.0] - 2026-08-04
 

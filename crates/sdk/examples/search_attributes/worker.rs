@@ -3,7 +3,6 @@ mod workflows;
 use temporalio_client::{
     Client, ClientOptions, Connection, envconfig::LoadClientConfigProfileOptions,
 };
-use temporalio_common::worker::WorkerTaskTypes;
 use temporalio_sdk::{Runtime, Worker, WorkerOptions};
 use workflows::SearchAttributesWorkflow;
 
@@ -17,7 +16,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let worker_options = WorkerOptions::new("search-attributes")
         .register_workflow::<SearchAttributesWorkflow>()?
-        .task_types(WorkerTaskTypes::workflow_only())
         .build();
 
     let mut worker = Worker::new(&runtime, client, worker_options)?;

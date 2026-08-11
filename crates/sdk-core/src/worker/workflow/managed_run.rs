@@ -1664,7 +1664,11 @@ mod tests {
         time::Duration,
     };
     use temporalio_common::protos::coresdk::common::ExternalStorageMetrics;
-    use tracing::{Event, Level, Metadata, Subscriber, field::Field, field::Visit, span};
+    use tracing::{
+        Event, Level, Metadata, Subscriber,
+        field::{Field, Visit},
+        span,
+    };
 
     use command_utils::*;
 
