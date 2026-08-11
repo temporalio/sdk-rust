@@ -65,6 +65,9 @@ extern crate tracing;
 extern crate self as temporalio_sdk;
 
 pub mod activities;
+/// Helpers for running Temporal workers in AWS Lambda.
+#[cfg(any(feature = "aws-lambda", feature = "aws-lambda-otel"))]
+pub mod aws_lambda;
 pub mod error;
 pub mod interceptors;
 /// Experimental APIs for configuring clients and workers with reusable plugins.
@@ -641,6 +644,8 @@ struct ActivityHalf {
     /// Maps activity type to the function for executing activities of that type
     activities: ActivityDefinitions,
     task_tokens_to_cancels: HashMap<TaskToken, CancellationToken>,
+    #[cfg(feature = "aws-lambda")]
+    active_tasks: Vec<tokio::task::AbortHandle>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -1168,7 +1173,39 @@ impl Worker {
             i.on_shutdown(self);
         }
         self.common.worker.shutdown().await;
+        for i in &self.common.worker_interceptors {
+            i.on_shutdown_complete(self);
+        }
         Ok(())
+    }
+
+    /// Runs the worker until `shutdown_signal` resolves, then initiates graceful shutdown and
+    /// continues driving the worker until shutdown completes.
+    ///
+    /// If the worker stops on its own before the signal resolves, its result is returned without
+    /// initiating another shutdown. The shutdown signal is a soft deadline: this method does not
+    /// impose a maximum duration on graceful shutdown.
+    pub async fn run_until(
+        &mut self,
+        shutdown_signal: impl Future<Output = ()>,
+    ) -> Result<(), anyhow::Error> {
+        let shutdown = self.shutdown_handle();
+        let run = self.run();
+        tokio::pin!(run);
+        tokio::pin!(shutdown_signal);
+
+        tokio::select! {
+            result = &mut run => result,
+            () = &mut shutdown_signal => {
+                shutdown();
+                run.await
+            }
+        }
+    }
+
+    #[cfg(feature = "aws-lambda")]
+    fn abort_active_activities(&mut self) {
+        self.activity_half.abort_active_tasks();
     }
 
     /// Turns this rust worker into a new worker with all the same workflows and activities
@@ -1334,6 +1371,13 @@ impl WorkflowHalf {
 }
 
 impl ActivityHalf {
+    #[cfg(feature = "aws-lambda")]
+    fn abort_active_tasks(&mut self) {
+        for task in self.active_tasks.drain(..) {
+            task.abort();
+        }
+    }
+
     /// Spawns off a task to handle the provided activity task
     fn activity_task_handler(
         &mut self,
@@ -1378,7 +1422,7 @@ impl ActivityHalf {
                 );
                 let codec_data_converter = data_converter.clone();
 
-                tokio::spawn(async move {
+                let task = tokio::spawn(async move {
                     let act_fut = async move {
                         if let Some(info) = &ctx.info().workflow_execution {
                             Span::current()
@@ -1415,6 +1459,13 @@ impl ActivityHalf {
                     worker.complete_activity_task(completion).await?;
                     Ok::<_, anyhow::Error>(())
                 });
+                #[cfg(feature = "aws-lambda")]
+                {
+                    self.active_tasks.retain(|task| !task.is_finished());
+                    self.active_tasks.push(task.abort_handle());
+                }
+                #[cfg(not(feature = "aws-lambda"))]
+                drop(task);
             }
             Some(activity_task::Variant::Cancel(_)) => {
                 if let Some(ct) = self
@@ -1572,6 +1623,18 @@ mod tests {
     fn test_activity_registration() {
         let act_instance = MyActivities {};
         let _ = WorkerOptions::new("task_q").register_activities(act_instance);
+    }
+
+    #[cfg(feature = "aws-lambda")]
+    #[tokio::test]
+    async fn abort_active_activity_tasks_cancels_spawned_work() {
+        let task = tokio::spawn(std::future::pending::<()>());
+        let mut activity_half = ActivityHalf::default();
+        activity_half.active_tasks.push(task.abort_handle());
+
+        activity_half.abort_active_tasks();
+
+        assert!(task.await.unwrap_err().is_cancelled());
     }
 
     #[tokio::test]

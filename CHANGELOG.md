@@ -20,6 +20,18 @@ to docs, or any other relevant information.
 ## Unreleased
 
 ### Added
+* `temporalio_sdk::aws_lambda::otel::OpenTelemetryPlugin` configures OTLP metrics and Rust tracing
+  spans with ADOT Lambda defaults and force-flushes both after worker shutdown while retaining the
+  providers for warm invocations. It is behind the independent `aws-lambda-otel` feature and does
+  not enable the Lambda runtime dependency; generic `otel` does not enable AWS-specific exporter
+  support. Core OTel meters and tracers now expose non-destructive force-flush support, and worker
+  interceptors have an `on_shutdown_complete` lifecycle callback.
+* The Rust SDK now has opt-in AWS Lambda Worker support behind the `aws-lambda` feature. It loads
+  Lambda-local Temporal configuration, applies conservative Worker defaults, runs a fresh
+  versioned Worker per invocation, stops before the invocation deadline, bounds graceful shutdown,
+  and provides ordered per-invocation shutdown hooks for telemetry flushing.
+* `Worker::run_until` initiates graceful shutdown when an arbitrary future resolves and continues
+  driving the Worker until shutdown completes.
 * Worker heartbeats now report the SDK runtime, hosting environments, operating system, and
   architecture once per worker, retrying until the first successful delivery. Runtime options can
   disable this reporting, and language SDK bridges can supply their own runtime details. The Rust

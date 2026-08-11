@@ -59,6 +59,11 @@ pub trait WorkerInterceptor: Send + Sync {
     /// Called after the worker has initiated shutdown and the workflow/activity polling loops
     /// have exited, but just before waiting for the inner core worker shutdown
     fn on_shutdown(&self, _sdk_worker: &Worker) {}
+    /// Called after the inner Core worker has finished shutting down.
+    ///
+    /// This is the last worker lifecycle callback and is suitable for flushing telemetry that
+    /// includes shutdown work.
+    fn on_shutdown_complete(&self, _sdk_worker: &Worker) {}
     /// Called every time a workflow is about to be activated
     async fn on_workflow_activation(
         &self,
@@ -211,6 +216,13 @@ impl WorkerInterceptor for InterceptorWithNext {
         self.inner.on_shutdown(w);
         if let Some(next) = &self.next {
             next.on_shutdown(w);
+        }
+    }
+
+    fn on_shutdown_complete(&self, w: &Worker) {
+        self.inner.on_shutdown_complete(w);
+        if let Some(next) = &self.next {
+            next.on_shutdown_complete(w);
         }
     }
 

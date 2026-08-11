@@ -13,7 +13,14 @@ categories = ["development-tools"]
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [features]
-otel = ["dep:opentelemetry", "dep:opentelemetry_sdk", "dep:opentelemetry-otlp", "dep:reqwest"]
+otel = [
+  "dep:opentelemetry",
+  "dep:opentelemetry_sdk",
+  "dep:opentelemetry-otlp",
+  "dep:reqwest",
+  "dep:tracing-opentelemetry",
+]
+otel-aws = ["otel", "dep:opentelemetry-aws"]
 tls-ring = [
   "opentelemetry-otlp?/tls-ring",
   "reqwest?/rustls-no-provider",
@@ -57,15 +64,20 @@ hyper-util = { version = "0.1", features = [
   "http2",
   "tokio",
 ], optional = true }
-opentelemetry = { workspace = true, features = ["metrics"], optional = true }
+opentelemetry = { workspace = true, features = ["metrics", "trace"], optional = true }
+opentelemetry-aws = { version = "0.20", default-features = false, features = [
+  "trace",
+], optional = true }
 opentelemetry_sdk = { version = "0.32", default-features = false, features = [
   "rt-tokio",
   "metrics",
+  "trace",
   "spec_unstable_metrics_views",
 ], optional = true }
 opentelemetry-otlp = { version = "0.32", default-features = false, features = [
   "tokio",
   "metrics",
+  "trace",
   "http-proto",
   "grpc-tonic",
   "reqwest-blocking-client",
@@ -92,6 +104,7 @@ tonic = { workspace = true, default-features = false, features = [
 ] }
 prost = { workspace = true }
 tracing = "0.1"
+tracing-opentelemetry = { version = "0.33", default-features = false, optional = true }
 # TODO [rust-sdk-branch]: Is it reasonable to make this optional?
 tracing-subscriber = { version = "0.3", default-features = false, features = [
   "parking_lot",

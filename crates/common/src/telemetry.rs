@@ -37,7 +37,9 @@ use crate::telemetry::log_export::CoreLogConsumerLayer;
 #[cfg(feature = "core-telemetry-bridge")]
 pub use log_export::{CoreLogBuffer, CoreLogBufferedConsumer, CoreLogStreamConsumer};
 #[cfg(feature = "otel")]
-pub use otel::build_otlp_metric_exporter;
+pub use otel::{
+    CoreOtelMeter, CoreOtelTracer, build_otlp_metric_exporter, build_otlp_trace_exporter,
+};
 #[cfg(feature = "prometheus")]
 pub use prometheus_server::start_prometheus_metric_exporter;
 
@@ -153,6 +155,26 @@ pub struct OtelCollectorOptions {
     /// Protocol to use for communication with the collector
     #[builder(default = OtlpProtocol::Grpc)]
     pub protocol: OtlpProtocol,
+}
+
+/// Options for exporting tracing spans to an OpenTelemetry Collector.
+#[derive(Debug, Clone, bon::Builder)]
+#[non_exhaustive]
+pub struct OtelTraceOptions {
+    /// The URL of the OTel collector to export spans to.
+    pub url: Url,
+    /// Optional set of HTTP headers to send to the collector, for example for authentication.
+    #[builder(default = HashMap::new())]
+    pub headers: HashMap<String, String>,
+    /// A map of attributes to include in the OTel resource.
+    #[builder(default)]
+    pub global_tags: HashMap<String, String>,
+    /// Protocol to use for communication with the collector.
+    #[builder(default = OtlpProtocol::Grpc)]
+    pub protocol: OtlpProtocol,
+    /// Use AWS X-Ray-compatible trace IDs. Requires the `otel-aws` feature.
+    #[builder(default)]
+    pub use_aws_xray_id_generator: bool,
 }
 
 /// Options for exporting metrics to Prometheus

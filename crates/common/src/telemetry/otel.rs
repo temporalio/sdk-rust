@@ -1,6 +1,6 @@
 use super::{
-    HistogramBucketOverrides, MetricTemporality, OtelCollectorOptions, OtlpProtocol,
-    TELEM_SERVICE_NAME,
+    HistogramBucketOverrides, MetricTemporality, OtelCollectorOptions, OtelTraceOptions,
+    OtlpProtocol, TELEM_SERVICE_NAME,
     metrics::{
         ACTIVITY_EXEC_LATENCY_HISTOGRAM_NAME, ACTIVITY_SCHED_TO_START_LATENCY_HISTOGRAM_NAME,
         CoreMeter, Counter, DEFAULT_MS_BUCKETS, DEFAULT_S_BUCKETS, Gauge, GaugeF64, Histogram,
@@ -15,7 +15,10 @@ use crate::dbg_panic;
 use opentelemetry::{
     self, Key, KeyValue,
     metrics::{Meter, MeterProvider as MeterProviderT},
+    trace::TracerProvider as _,
 };
+#[cfg(feature = "otel-aws")]
+use opentelemetry_aws::trace::id_generator::XrayIdGenerator;
 #[cfg(any(feature = "tls-ring", feature = "tls-aws-lc"))]
 use opentelemetry_otlp::tonic_types::transport::ClientTlsConfig;
 use opentelemetry_otlp::{WithExportConfig, WithHttpConfig, WithTonicConfig};
@@ -27,10 +30,12 @@ use opentelemetry_sdk::{
         Aggregation, Instrument, InstrumentKind, MeterProviderBuilder, PeriodicReader,
         SdkMeterProvider, Temporality, data::ResourceMetrics, exporter::PushMetricExporter,
     },
+    trace::SdkTracerProvider,
 };
 use std::{collections::HashMap, sync::Arc, time::Duration};
 use tonic::metadata::MetadataMap;
 use tracing::{Dispatch, instrument::WithSubscriber};
+use tracing_subscriber::layer::SubscriberExt;
 
 const OTLP_METRIC_EXPORT_WARN_TARGET: &str = "temporalio_common::telemetry::otel::metric_export";
 
@@ -166,7 +171,50 @@ pub fn build_otlp_metric_exporter(
     Ok::<_, anyhow::Error>(CoreOtelMeter {
         meter: mp.meter(TELEM_SERVICE_NAME),
         use_seconds_for_durations: opts.use_seconds_for_durations,
-        _mp: mp,
+        provider: mp,
+    })
+}
+
+/// Create an OTel tracing subscriber that exports spans over OTLP.
+pub fn build_otlp_trace_exporter(opts: OtelTraceOptions) -> Result<CoreOtelTracer, anyhow::Error> {
+    let exporter = match opts.protocol {
+        OtlpProtocol::Grpc => {
+            let exporter = opentelemetry_otlp::SpanExporter::builder()
+                .with_tonic()
+                .with_endpoint(opts.url.to_string());
+            #[cfg(any(feature = "tls-ring", feature = "tls-aws-lc"))]
+            let exporter = if opts.url.scheme() == "https" || opts.url.scheme() == "grpcs" {
+                exporter.with_tls_config(ClientTlsConfig::new().with_native_roots())
+            } else {
+                exporter
+            };
+            exporter
+                .with_metadata(MetadataMap::from_headers((&opts.headers).try_into()?))
+                .build()?
+        }
+        OtlpProtocol::Http => opentelemetry_otlp::SpanExporter::builder()
+            .with_http()
+            .with_endpoint(opts.url.to_string())
+            .with_headers(opts.headers)
+            .build()?,
+    };
+    let mut provider = SdkTracerProvider::builder()
+        .with_batch_exporter(exporter)
+        .with_resource(default_resource(&opts.global_tags));
+    if opts.use_aws_xray_id_generator {
+        #[cfg(feature = "otel-aws")]
+        {
+            provider = provider.with_id_generator(XrayIdGenerator::default());
+        }
+        #[cfg(not(feature = "otel-aws"))]
+        anyhow::bail!("AWS X-Ray trace IDs require the otel-aws feature");
+    }
+    let provider = provider.build();
+    let subscriber = tracing_subscriber::registry()
+        .with(tracing_opentelemetry::layer().with_tracer(provider.tracer(TELEM_SERVICE_NAME)));
+    Ok(CoreOtelTracer {
+        provider,
+        subscriber: Arc::new(subscriber),
     })
 }
 
@@ -215,13 +263,46 @@ impl<E: PushMetricExporter> PushMetricExporter for TracingMetricExporter<E> {
     }
 }
 
+/// An OpenTelemetry-backed implementation of Core metrics.
 #[derive(Debug)]
 pub struct CoreOtelMeter {
+    /// The underlying OTel meter used to construct metric instruments.
     pub meter: Meter,
     use_seconds_for_durations: bool,
     // we have to hold on to the provider otherwise otel automatically shuts it down on drop
     // for whatever crazy reason
-    _mp: SdkMeterProvider,
+    provider: SdkMeterProvider,
+}
+
+impl CoreOtelMeter {
+    /// Export all currently pending metric data without shutting down the provider.
+    pub fn force_flush(&self) -> OTelSdkResult {
+        self.provider.force_flush()
+    }
+}
+
+/// Owns an OTel tracer provider and the corresponding `tracing` subscriber.
+pub struct CoreOtelTracer {
+    provider: SdkTracerProvider,
+    subscriber: Arc<dyn tracing::Subscriber + Send + Sync>,
+}
+
+impl std::fmt::Debug for CoreOtelTracer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CoreOtelTracer").finish_non_exhaustive()
+    }
+}
+
+impl CoreOtelTracer {
+    /// Return the subscriber that exports `tracing` spans through this provider.
+    pub fn trace_subscriber(&self) -> Arc<dyn tracing::Subscriber + Send + Sync> {
+        self.subscriber.clone()
+    }
+
+    /// Export all currently pending spans without shutting down the provider.
+    pub fn force_flush(&self) -> OTelSdkResult {
+        self.provider.force_flush()
+    }
 }
 
 impl CoreMeter for CoreOtelMeter {
@@ -522,13 +603,18 @@ pub(crate) mod tests {
                 .build();
             MeterProviderBuilder::default().with_reader(reader).build()
         });
-        let meter = provider.meter("temporalio_common_test");
+        let meter = CoreOtelMeter {
+            meter: provider.meter("temporalio_common_test"),
+            use_seconds_for_durations: false,
+            provider,
+        };
         meter
+            .meter
             .u64_counter("temporalio_common_test_counter")
             .build()
             .add(1, &[]);
 
-        assert!(provider.force_flush().is_err());
+        assert!(meter.force_flush().is_err());
         assert!(saw_wrapper_warn.load(Ordering::SeqCst));
     }
 }

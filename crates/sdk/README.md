@@ -105,6 +105,65 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
+### Running a Worker in AWS Lambda
+
+Enable the opt-in `aws-lambda` feature to run a versioned Worker for the bounded lifetime of each
+Lambda invocation:
+
+```toml
+temporalio-sdk = { version = "0.6", features = ["aws-lambda"] }
+```
+
+```rust
+use temporalio_sdk::aws_lambda::{WorkerDeploymentVersion, run_worker};
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    run_worker(
+        WorkerDeploymentVersion {
+            deployment_name: "greetings".to_owned(),
+            build_id: "v1".to_owned(),
+        },
+        |options| {
+            options.worker_options.task_queue = "greetings".to_owned();
+            options
+                .worker_options
+                .register_activities(MyActivities { counter: Default::default() });
+            options
+                .worker_options
+                .register_workflow::<GreetingWorkflow>()?;
+
+            // Register provider force-flushes here; errors are logged and later hooks still run.
+            options.on_shutdown(|_invocation| async { Ok(()) });
+            Ok(())
+        },
+    )
+    .await?;
+    Ok(())
+}
+```
+
+The helper loads client settings from `TEMPORAL_CONFIG_FILE`, then
+`$LAMBDA_TASK_ROOT/temporal.toml`, then `./temporal.toml`; environment variables override file
+values. `TEMPORAL_TASK_QUEUE` supplies the initial task queue. It creates a fresh client and Worker
+per invocation, assigns the default identity `<request ID>@<function ARN>`, and always enables
+Worker Deployment Versioning with the supplied version.
+
+Lambda defaults use fixed task slots of 10 Workflow, 2 Activity, 2 Local Activity, and 5 Nexus;
+poller maxima of 2/1/1; a Workflow cache of 30; disabled eager Activities; and five seconds for
+graceful shutdown. Polling stops seven seconds before the invocation deadline. If the Worker has not
+stopped after five seconds, in-flight Rust Activity tasks are aborted so shutdown hooks retain the
+final two-second cleanup window. All defaults may be changed in the configure callback except the
+supplied deployment version and enabling Worker Versioning.
+
+Build the Lambda executable for `aarch64-unknown-linux-gnu` or `x86_64-unknown-linux-gnu` to match
+the function architecture, package it as an executable named `bootstrap` at the root of the ZIP,
+and use an Amazon Linux custom runtime such as `provided.al2023`. Put `temporal.toml`, certificates,
+and any collector configuration at the same deployment root. Publish immutable Lambda versions and
+use the same build ID for the corresponding Temporal Worker Deployment Version. Configure a Lambda
+timeout that leaves useful polling time after cold start, connection setup, and the seven-second
+shutdown window.
+
 ## Crate Features
 
 The SDK enables a few convenience integrations by default. Users who want a smaller dependency
@@ -116,10 +175,38 @@ temporalio-sdk = { version = "0.3", default-features = false, features = ["envco
 
 - `envconfig` - enabled by default. Adds `ClientOptions::load_from_config` and related helpers for
   loading connection settings from environment variables and `temporal.toml` files.
+- `aws-lambda` - optional. Adds the AWS Lambda Worker lifecycle helper and enables `envconfig`.
+- `aws-lambda-otel` - optional. Adds the AWS Lambda OpenTelemetry plugin and enables `otel` without
+  enabling the Lambda runtime dependency. This can be used independently of `aws-lambda`.
 - `prometheus` - enabled by default. Adds the Prometheus metrics exporter in
   `temporalio_common::telemetry` for serving SDK metrics from a HTTP endpoint.
-- `otel` - optional. Adds the OpenTelemetry metrics exporter in `temporalio_common::telemetry` for
-  sending SDK metrics to an OpenTelemetry collector.
+- `otel` - optional. Adds generic OpenTelemetry metric and trace exporters.
+
+### AWS Lambda OpenTelemetry
+
+With the `aws-lambda-otel` feature enabled, `OpenTelemetryPlugin` configures metrics and Rust
+`tracing` spans for the local OTLP endpoint exposed by the AWS Distro for OpenTelemetry (ADOT)
+Lambda layer. The feature is independent of `aws-lambda`; add both features when using the plugin
+with the Lambda Worker helper. The plugin uses `OTEL_SERVICE_NAME`, `AWS_LAMBDA_FUNCTION_NAME`, and
+`OTEL_EXPORTER_OTLP_ENDPOINT` when present, and flushes pending data after each worker shutdown
+without shutting down providers needed by warm invocations.
+
+```rust
+use temporalio_client::ClientOptions;
+use temporalio_sdk::{Runtime, aws_lambda::otel::OpenTelemetryPlugin, runtime::RuntimeOptions};
+
+let plugin = OpenTelemetryPlugin::new(Default::default())?;
+let runtime = Runtime::new_assume_tokio(
+    RuntimeOptions::builder()
+        .telemetry_options(plugin.telemetry_options())
+        .build()
+        .unwrap(),
+)?;
+let client_options = ClientOptions::new("default").plugin(plugin).build();
+```
+
+The current Rust SDK does not propagate OpenTelemetry trace context through Temporal headers, so
+these spans are local worker traces rather than a cross-service distributed trace.
 
 ## Workflows in detail
 
