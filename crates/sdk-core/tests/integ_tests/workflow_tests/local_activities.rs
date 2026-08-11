@@ -3015,6 +3015,113 @@ async fn local_activity_resolutions_are_delivered_incrementally() {
     handle.fetch_history_and_replay(&mut worker).await.unwrap();
 }
 
+/// With a zero-sized cache, a run keeps its workflow task until every local activity resolution has
+/// been delivered and the task answered. Resolutions queued while an earlier one is outstanding with
+/// lang may schedule further activities, and the markers for all of them belong on the completion
+/// that finally answers the task.
+#[tokio::test]
+async fn zero_cache_doesnt_evict_before_wft_is_answered() {
+    let wfid = "fake_wf_id";
+    let mut t = TestHistoryBuilder::default();
+    t.add_by_type(EventType::WorkflowExecutionStarted);
+    t.add_workflow_task_scheduled_and_started();
+
+    let reported_commands = Arc::new(SegQueue::new());
+    let recorder = reported_commands.clone();
+    let mut mock_cfg =
+        MockPollCfg::from_resp_batches(wfid, t, [ResponseType::AllHistory], mock_worker_client());
+    mock_cfg.enforce_correct_number_of_polls = false;
+    mock_cfg.completion_mock_fn = Some(Box::new(move |c| {
+        recorder.push(
+            c.commands
+                .iter()
+                .map(|cmd| cmd.command_type())
+                .collect::<Vec<_>>(),
+        );
+        Ok(Default::default())
+    }));
+    let mut mock = build_mock_pollers(mock_cfg);
+    mock.worker_cfg(|wc| wc.max_cached_workflows = 0);
+    let core = mock_worker(mock);
+
+    let la_cmd = |seq: u32, id: &str| {
+        schedule_local_activity_cmd(
+            seq,
+            id,
+            ProtoActivityCancellationType::TryCancel,
+            Duration::from_secs(60),
+        )
+    };
+
+    let task = core.poll_workflow_activation().await.unwrap();
+    core.complete_workflow_activation(WorkflowActivationCompletion::from_cmds(
+        task.run_id,
+        vec![la_cmd(1, "1"), la_cmd(2, "2")],
+    ))
+    .await
+    .unwrap();
+
+    let first_la = core.poll_activity_task().await.unwrap();
+    let second_la = core.poll_activity_task().await.unwrap();
+
+    core.complete_activity_task(ActivityTaskCompletion {
+        task_token: first_la.task_token,
+        result: Some(ActivityExecutionResult::ok(vec![1].into())),
+    })
+    .await
+    .unwrap();
+    let resolve_first = core.poll_workflow_activation().await.unwrap();
+
+    // Finishing the second activity while the first resolution is outstanding with lang is what
+    // queues it rather than delivering it, leaving no outstanding activities but an undelivered
+    // job once the completion below lands.
+    core.complete_activity_task(ActivityTaskCompletion {
+        task_token: second_la.task_token,
+        result: Some(ActivityExecutionResult::ok(vec![2].into())),
+    })
+    .await
+    .unwrap();
+    core.complete_workflow_activation(WorkflowActivationCompletion::empty(resolve_first.run_id))
+        .await
+        .unwrap();
+
+    // Scheduling from the queued resolution keeps the task open with the first two markers still
+    // buffered, which is the point at which the run must survive to report them.
+    let resolve_second = core.poll_workflow_activation().await.unwrap();
+    core.complete_workflow_activation(WorkflowActivationCompletion::from_cmd(
+        resolve_second.run_id,
+        la_cmd(3, "3"),
+    ))
+    .await
+    .unwrap();
+
+    let third_la = core.poll_activity_task().await.unwrap();
+    core.complete_activity_task(ActivityTaskCompletion {
+        task_token: third_la.task_token,
+        result: Some(ActivityExecutionResult::ok(vec![3].into())),
+    })
+    .await
+    .unwrap();
+    let resolve_third = core.poll_workflow_activation().await.unwrap();
+    core.complete_execution(&resolve_third.run_id).await;
+
+    core.shutdown().await;
+
+    let mut all_reported = vec![];
+    while let Some(cmds) = reported_commands.pop() {
+        all_reported.push(cmds);
+    }
+    let markers_reported: usize = all_reported
+        .iter()
+        .flatten()
+        .filter(|c| **c == CommandType::RecordMarker)
+        .count();
+    assert_eq!(
+        markers_reported, 3,
+        "all three local activity markers should reach the server, got {all_reported:?}"
+    );
+}
+
 #[workflow]
 #[derive(Default)]
 struct OldBatchedLocalActivityHistoryWf;
