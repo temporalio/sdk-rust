@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import unittest
 
-from scripts import changelog_release_notes as notes
+import scripts.changelog_release_notes as notes
 
 
 class ChangelogReleaseNotesTests(unittest.TestCase):
