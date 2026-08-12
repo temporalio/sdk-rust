@@ -221,7 +221,7 @@ impl ClientWorkerSetImpl {
             let worker_instance_key = worker.worker_instance_key();
             let namespace = worker.namespace().to_string();
 
-            let shared_worker = match self.shared_worker.entry(namespace.clone()) {
+            let shared_worker = match self.shared_worker.entry(namespace) {
                 Occupied(o) => o.into_mut(),
                 Vacant(v) => {
                     let shared_worker = worker.new_shared_namespace_worker()?;
@@ -500,8 +500,9 @@ impl std::fmt::Debug for ClientWorkerSet {
     }
 }
 
-/// Contains a worker heartbeat callback, wrapped for mocking.
-pub type HeartbeatCallback = Arc<dyn Fn() -> WorkerHeartbeat + Send + Sync>;
+/// Contains a worker heartbeat callback, wrapped for mocking. Returns `None` until the worker has
+/// started running.
+pub type HeartbeatCallback = Arc<dyn Fn() -> Option<WorkerHeartbeat> + Send + Sync>;
 
 /// Callback invoked after a worker heartbeat has been accepted by the server.
 pub type HeartbeatSuccessCallback = Arc<dyn Fn() + Send + Sync>;
@@ -1008,7 +1009,7 @@ mod tests {
         if heartbeat_enabled {
             mock_provider
                 .expect_heartbeat_callback()
-                .returning(|| Some(Arc::new(WorkerHeartbeat::default)));
+                .returning(|| Some(Arc::new(|| Some(WorkerHeartbeat::default()))));
             mock_provider
                 .expect_heartbeat_success_callback()
                 .returning(|| None);

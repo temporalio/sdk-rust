@@ -1144,6 +1144,15 @@ impl Worker {
         })
     }
 
+    fn mark_started(&self) {
+        if self.shutdown_token.is_cancelled() {
+            return;
+        }
+        if let Some(heartbeat_manager) = self.client_worker_registrator.heartbeat_manager.as_ref() {
+            heartbeat_manager.mark_started();
+        }
+    }
+
     /// Initiates async shutdown procedure, eventually ceases all polling of the server and shuts
     /// down this worker. [Worker::poll_workflow_activation] and [Worker::poll_activity_task] should
     /// be called until both return a `ShutDown` error to ensure that all outstanding work is
@@ -1269,6 +1278,7 @@ impl Worker {
     /// Local activities are returned first before polling the server if there are any.
     #[instrument(skip(self))]
     pub async fn poll_activity_task(&self) -> Result<ActivityTask, PollError> {
+        self.mark_started();
         loop {
             match self.activity_poll().await.transpose() {
                 Some(r) => break r,
@@ -1440,6 +1450,7 @@ impl Worker {
     /// Do not call poll concurrently. It handles polling the server concurrently internally.
     #[instrument(skip(self), fields(run_id, workflow_id, task_queue=%self.config.task_queue))]
     pub async fn poll_workflow_activation(&self) -> Result<WorkflowActivation, PollError> {
+        self.mark_started();
         match self.task_subsystems.workflows.as_ref() {
             Some(workflows) => {
                 let r = workflows.next_workflow_activation().await;
@@ -1498,6 +1509,7 @@ impl Worker {
     /// Do not call poll concurrently. It handles polling the server concurrently internally.
     #[instrument(skip(self))]
     pub async fn poll_nexus_task(&self) -> Result<NexusTask, PollError> {
+        self.mark_started();
         match self.task_subsystems.nexus_mgr.as_ref() {
             Some(mgr) => mgr.next_nexus_task().await,
             None => Err(PollError::ShutDown),
@@ -1658,7 +1670,7 @@ impl Worker {
             .client_worker_registrator
             .heartbeat_manager
             .as_ref()
-            .map(|hm| (hm.heartbeat_callback)());
+            .and_then(|hm| (hm.heartbeat_callback)());
         let handle = tokio::spawn(async move {
             match client
                 .shutdown_worker(sticky_name, task_queue, task_queue_types, heartbeat)
@@ -2272,6 +2284,7 @@ struct WorkerHeartbeatManager {
     /// Heartbeat callback
     heartbeat_callback: HeartbeatCallback,
     heartbeat_success_callback: HeartbeatSuccessCallback,
+    start_time: Arc<OnceLock<prost_types::Timestamp>>,
 }
 
 impl WorkerHeartbeatManager {
@@ -2284,10 +2297,12 @@ impl WorkerHeartbeatManager {
         capabilities: Arc<NamespaceCapabilities>,
         environment_info: Option<Arc<EnvironmentInfo>>,
     ) -> Self {
-        let start_time = Some(SystemTime::now().into());
+        let start_time = Arc::new(OnceLock::new());
+        let heartbeat_start_time = start_time.clone();
         let environment_info = Arc::new(Mutex::new(environment_info));
         let heartbeat_environment_info = environment_info.clone();
         let worker_heartbeat_callback: HeartbeatCallback = Arc::new(move || {
+            let start_time = heartbeat_start_time.get().copied()?;
             let deployment_version = config.computed_deployment_version().map(|dv| {
                 deployment::v1::WorkerDeploymentVersion {
                     deployment_name: dv.deployment_name,
@@ -2318,7 +2333,7 @@ impl WorkerHeartbeatManager {
                 deployment_version,
 
                 status: (*heartbeat_manager_metrics.status.read()) as i32,
-                start_time,
+                start_time: Some(start_time),
                 plugins,
                 drivers,
                 environment: heartbeat_environment_info.lock().as_deref().cloned(),
@@ -2431,7 +2446,7 @@ impl WorkerHeartbeatManager {
                     in_mem.local_activity_execution_failed.clone(),
                 );
             }
-            worker_heartbeat
+            Some(worker_heartbeat)
         });
         let heartbeat_success_callback: HeartbeatSuccessCallback = Arc::new(move || {
             // Take the env info because we only care about sending it one time
@@ -2443,7 +2458,12 @@ impl WorkerHeartbeatManager {
             telemetry: telemetry_instance,
             heartbeat_callback: worker_heartbeat_callback,
             heartbeat_success_callback,
+            start_time,
         }
+    }
+
+    fn mark_started(&self) {
+        let _ = self.start_time.set(SystemTime::now().into());
     }
 }
 
