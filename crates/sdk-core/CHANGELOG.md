@@ -34,6 +34,8 @@ relevant information.
 ## Unreleased
 
 ### Added
+* Core console logs can now be emitted as newline-delimited JSON when an SDK selects the JSON log
+  format. Configured log filters continue to apply to JSON output.
 * Worker heartbeats now report the SDK runtime, hosting environments, operating system, and
   architecture once per worker, retrying until the first successful delivery. Runtime options can
   disable the reporting.
@@ -53,4 +55,3 @@ relevant information.
   preserving the resolution ordering recorded in existing histories during replay.
 * Try-cancel child workflows no longer cause nondeterminism when they complete or fail after their
   cancellation was requested.
-

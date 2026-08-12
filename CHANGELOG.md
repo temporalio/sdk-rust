@@ -34,6 +34,8 @@ relevant information.
 ## Unreleased
 
 ### Added
+* `LoggerFormat` for selecting compact, pretty, or JSON Core console log output. Configured log
+  filters continue to apply to JSON output.
 * `RpcOptions::builder()` for constructing per-call RPC options.
 * `DnsLoadBalancingOptions::builder()` for configuring DNS re-resolution intervals.
 * Experimental plugin APIs for packaging reusable client and worker configuration, including data
@@ -65,6 +67,8 @@ relevant information.
 * Removed `InterceptorWithNext`. Register worker interceptors as an ordered vector instead.
 * `Worker::run` now returns `WorkerRunError` instead of `anyhow::Error`.
   Non-validation failures are reported as `WorkerRunError::Fatal` with a message and source.
+* `Logger::Console` now requires a `format: LoggerFormat` field. Use `LoggerFormat::Compact` to
+  preserve the previous default output.
 * `CancellableFuture` and `CancellableFutureWithReason` now use the inherited `Future::Output`
   associated type instead of a generic output parameter.
 * `TimerOptions` is now tagged with `#[non_exhaustive]`. Use

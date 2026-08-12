@@ -28,7 +28,7 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tracing::{Level, Subscriber};
-use tracing_subscriber::{EnvFilter, Layer, layer::SubscriberExt};
+use tracing_subscriber::{EnvFilter, Layer, fmt::MakeWriter, layer::SubscriberExt};
 use url::Url;
 
 #[cfg(feature = "core-telemetry-bridge")]
@@ -201,9 +201,11 @@ pub enum Logger {
     Console {
         /// An [EnvFilter](https://docs.rs/tracing-subscriber/latest/tracing_subscriber/struct.EnvFilter.html) filter string.
         filter: String,
+        /// The format used to render logs.
+        format: LoggerFormat,
     },
     #[cfg(feature = "core-telemetry-bridge")]
-    /// Forward logs to Lang - collectable with `fetch_global_buffered_logs`.
+    /// Forward logs to Lang - collectable with `fetch_buffered_logs`.
     Forward {
         /// An [EnvFilter](https://docs.rs/tracing-subscriber/latest/tracing_subscriber/struct.EnvFilter.html) filter string.
         filter: String,
@@ -217,6 +219,19 @@ pub enum Logger {
         /// Trait invoked on each log.
         consumer: Arc<dyn CoreLogConsumer>,
     },
+}
+
+/// Controls how console logs are rendered.
+#[derive(Debug, Default, Clone, Copy)]
+pub enum LoggerFormat {
+    /// Render logs compactly on a single line.
+    #[default]
+    Compact,
+    /// Render logs in a human-readable format across multiple lines. This format is also selected
+    /// when `TEMPORAL_CORE_PRETTY_LOGS` is set, regardless of the configured format.
+    Pretty,
+    /// Render each log as a JSON object on a single line.
+    Json,
 }
 
 /// Types of aggregation temporality for metric export.
@@ -392,12 +407,28 @@ impl CoreTelemetry for TelemetryInstance {
 ///
 /// See [TelemetryOptions] docs for more on configuration.
 pub fn telemetry_init(opts: TelemetryOptions) -> Result<TelemetryInstance, anyhow::Error> {
+    telemetry_init_with_console_writer(
+        opts,
+        std::io::stdout,
+        env::var("TEMPORAL_CORE_PRETTY_LOGS").is_ok(),
+    )
+}
+
+fn telemetry_init_with_console_writer<W>(
+    opts: TelemetryOptions,
+    console_writer: W,
+    pretty_logs_env_set: bool,
+) -> Result<TelemetryInstance, anyhow::Error>
+where
+    W: for<'writer> MakeWriter<'writer> + Send + Sync + 'static,
+{
     #[cfg(feature = "core-telemetry-bridge")]
     let mut logs_out = None;
 
     // Tracing subscriber layers =========
     let mut console_pretty_layer = None;
     let mut console_compact_layer = None;
+    let mut console_json_layer = None;
     #[cfg(feature = "core-telemetry-bridge")]
     let mut forward_layer = None;
     // ===================================
@@ -407,30 +438,49 @@ pub fn telemetry_init(opts: TelemetryOptions) -> Result<TelemetryInstance, anyho
     } else {
         opts.logging.map(|logger| {
             match logger {
-                Logger::Console { filter } => {
+                Logger::Console { filter, format } => {
                     // This is silly dupe but can't be avoided without boxing.
-                    if env::var("TEMPORAL_CORE_PRETTY_LOGS").is_ok() {
-                        console_pretty_layer = Some(
-                            tracing_subscriber::fmt::layer()
-                                .with_target(false)
-                                .event_format(
-                                    tracing_subscriber::fmt::format()
-                                        .pretty()
-                                        .with_source_location(false),
-                                )
-                                .with_filter(EnvFilter::new(filter)),
-                        )
+                    let format = if pretty_logs_env_set {
+                        LoggerFormat::Pretty
                     } else {
-                        console_compact_layer = Some(
-                            tracing_subscriber::fmt::layer()
-                                .with_target(false)
-                                .event_format(
-                                    tracing_subscriber::fmt::format()
-                                        .compact()
-                                        .with_source_location(false),
-                                )
-                                .with_filter(EnvFilter::new(filter)),
-                        )
+                        format
+                    };
+                    match format {
+                        LoggerFormat::Pretty => {
+                            console_pretty_layer = Some(
+                                tracing_subscriber::fmt::layer()
+                                    .with_writer(console_writer)
+                                    .with_target(false)
+                                    .event_format(
+                                        tracing_subscriber::fmt::format()
+                                            .pretty()
+                                            .with_source_location(false),
+                                    )
+                                    .with_filter(EnvFilter::new(filter)),
+                            )
+                        }
+                        LoggerFormat::Compact => {
+                            console_compact_layer = Some(
+                                tracing_subscriber::fmt::layer()
+                                    .with_writer(console_writer)
+                                    .with_target(false)
+                                    .event_format(
+                                        tracing_subscriber::fmt::format()
+                                            .compact()
+                                            .with_source_location(false),
+                                    )
+                                    .with_filter(EnvFilter::new(filter)),
+                            )
+                        }
+                        LoggerFormat::Json => {
+                            console_json_layer = Some(
+                                tracing_subscriber::fmt::layer()
+                                    .with_writer(console_writer)
+                                    .with_target(false)
+                                    .json()
+                                    .with_filter(EnvFilter::new(filter)),
+                            )
+                        }
                     }
                 }
                 #[cfg(feature = "core-telemetry-bridge")]
@@ -449,7 +499,8 @@ pub fn telemetry_init(opts: TelemetryOptions) -> Result<TelemetryInstance, anyho
             };
             let reg = tracing_subscriber::registry()
                 .with(console_pretty_layer)
-                .with(console_compact_layer);
+                .with(console_compact_layer)
+                .with(console_json_layer);
             #[cfg(feature = "core-telemetry-bridge")]
             let reg = reg.with(forward_layer);
 
@@ -499,6 +550,7 @@ pub fn telemetry_init_fallback() -> Result<(), anyhow::Error> {
         TelemetryOptions::builder()
             .logging(Logger::Console {
                 filter: construct_filter_string(Level::DEBUG, Level::WARN),
+                format: LoggerFormat::Compact,
             })
             .build(),
     )?;
@@ -519,5 +571,91 @@ pub fn ensure_default_crypto_provider() {
         INIT.call_once(|| {
             let _ = rustls::crypto::ring::default_provider().install_default();
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{
+        io::Write,
+        sync::{Arc, Mutex},
+    };
+
+    #[derive(Clone)]
+    struct CapturingWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl<'writer> MakeWriter<'writer> for CapturingWriter {
+        type Writer = CapturingWriter;
+
+        fn make_writer(&'writer self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    impl Write for CapturingWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn json_console_logs_respect_filter() {
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let instance = telemetry_init_with_console_writer(
+            TelemetryOptions::builder()
+                .logging(Logger::Console {
+                    filter: "off,json_log_test=info".to_string(),
+                    format: LoggerFormat::Json,
+                })
+                .build(),
+            CapturingWriter(output.clone()),
+            false,
+        )
+        .unwrap();
+        let subscriber = instance.trace_subscriber().unwrap();
+
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::info!(target: "json_log_test", answer = 42, "included");
+            tracing::debug!(target: "json_log_test", "filtered by level");
+            tracing::info!(target: "other_target", "filtered by target");
+        });
+
+        let output = String::from_utf8(output.lock().unwrap().clone()).unwrap();
+        let logs = output
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(logs.len(), 1);
+        assert_eq!(logs[0]["fields"]["message"], "included");
+        assert_eq!(logs[0]["fields"]["answer"], 42);
+    }
+
+    #[test]
+    fn pretty_logs_env_overrides_configured_format() {
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let instance = telemetry_init_with_console_writer(
+            TelemetryOptions::builder()
+                .logging(Logger::Console {
+                    filter: "info".to_string(),
+                    format: LoggerFormat::Json,
+                })
+                .build(),
+            CapturingWriter(output.clone()),
+            true,
+        )
+        .unwrap();
+        let subscriber = instance.trace_subscriber().unwrap();
+
+        tracing::subscriber::with_default(subscriber, || tracing::info!("pretty log"));
+
+        let output = String::from_utf8(output.lock().unwrap().clone()).unwrap();
+        assert!(output.contains("pretty log"));
+        assert!(serde_json::from_str::<serde_json::Value>(&output).is_err());
     }
 }
