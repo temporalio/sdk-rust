@@ -2420,6 +2420,12 @@ message ResetActivityExecutionRequest {
 
     // Used to de-dupe reset requests.
     string request_id = 10;
+
+    // Reset persisted heartbeat details.
+    // Reset always resets the attempt counter. Passing this flag causes reset to additionally
+    // discard any persisted heartbeat details.
+    bool reset_heartbeat = 11;
+
 }
 
 // Deprecated. Use `ResetActivityExecutionRequest`.
