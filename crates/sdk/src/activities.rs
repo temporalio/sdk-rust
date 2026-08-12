@@ -91,7 +91,7 @@ use tokio_util::sync::CancellationToken;
 /// Used within activities to get info, heartbeat management etc.
 #[derive(Clone)]
 pub struct ActivityContext {
-    backend: Arc<dyn ActivityContextBackend>,
+    backend: ActivityContextBackend,
     data_converter: DataConverter,
     cancellation_token: CancellationToken,
     heartbeat_details: ActivityHeartbeatDetails,
@@ -99,46 +99,50 @@ pub struct ActivityContext {
     info: ActivityInfo,
 }
 
-trait ActivityContextBackend: Send + Sync {
-    fn record_heartbeat(&self, heartbeat: ActivityHeartbeat);
-    fn client(&self) -> Option<Client>;
+#[derive(Clone)]
+enum ActivityContextBackend {
+    Worker {
+        worker: Arc<CoreWorker>,
+        client_options: ClientOptions,
+    },
+    #[cfg(feature = "testing")]
+    Test {
+        client: Option<Client>,
+        heartbeat_callback: Option<Arc<dyn Fn(Vec<Payload>) + Send + Sync>>,
+    },
 }
 
-struct WorkerActivityContextBackend {
-    worker: Arc<CoreWorker>,
-    client_options: ClientOptions,
-}
-
-impl ActivityContextBackend for WorkerActivityContextBackend {
+impl ActivityContextBackend {
     fn record_heartbeat(&self, heartbeat: ActivityHeartbeat) {
-        self.worker.record_activity_heartbeat(heartbeat);
-    }
-
-    fn client(&self) -> Option<Client> {
-        let connection = self.worker.get_client_connection()?;
-        Some(
-            Client::new(connection, self.client_options.clone())
-                .expect("client construction from a worker connection should be infallible"),
-        )
-    }
-}
-
-#[cfg(feature = "testing")]
-struct TestActivityContextBackend {
-    client: Option<Client>,
-    heartbeat_callback: Option<Arc<dyn Fn(Vec<Payload>) + Send + Sync>>,
-}
-
-#[cfg(feature = "testing")]
-impl ActivityContextBackend for TestActivityContextBackend {
-    fn record_heartbeat(&self, heartbeat: ActivityHeartbeat) {
-        if let Some(callback) = &self.heartbeat_callback {
-            callback(heartbeat.details);
+        match self {
+            Self::Worker { worker, .. } => worker.record_activity_heartbeat(heartbeat),
+            #[cfg(feature = "testing")]
+            Self::Test {
+                heartbeat_callback, ..
+            } => {
+                if let Some(callback) = heartbeat_callback {
+                    callback(heartbeat.details);
+                }
+            }
         }
     }
 
     fn client(&self) -> Option<Client> {
-        self.client.clone()
+        match self {
+            Self::Worker {
+                worker,
+                client_options,
+            } => {
+                let connection = worker.get_client_connection()?;
+                Some(
+                    Client::new(connection, client_options.clone()).expect(
+                        "client construction from a worker connection should be infallible",
+                    ),
+                )
+            }
+            #[cfg(feature = "testing")]
+            Self::Test { client, .. } => client.clone(),
+        }
     }
 }
 
@@ -158,10 +162,10 @@ impl ActivityContext {
             data_converter.payload_converter().clone(),
         );
         Self {
-            backend: Arc::new(TestActivityContextBackend {
+            backend: ActivityContextBackend::Test {
                 client,
                 heartbeat_callback,
-            }),
+            },
             data_converter,
             cancellation_token,
             heartbeat_details,
@@ -217,10 +221,10 @@ impl ActivityContext {
 
         (
             ActivityContext {
-                backend: Arc::new(WorkerActivityContextBackend {
+                backend: ActivityContextBackend::Worker {
                     worker,
                     client_options,
-                }),
+                },
                 data_converter,
                 cancellation_token,
                 heartbeat_details,
@@ -501,7 +505,7 @@ fn call_execute_activity<'a>(
 ///
 /// This trait supports registration and direct execution infrastructure. Applications normally
 /// use the generated implementation rather than implementing it manually.
-pub trait ActivityImplementer: Send + Sync + 'static {
+pub trait ActivityImplementer {
     /// Register every activity method implemented by this type.
     fn register_all(self: Arc<Self>, defs: &mut ActivityDefinitions);
 }
@@ -512,7 +516,7 @@ pub trait ActivityImplementer: Send + Sync + 'static {
 /// manually.
 pub trait ExecutableActivity: ActivityDefinition + Sized {
     /// Type containing the activity implementation.
-    type Implementer: ActivityImplementer;
+    type Implementer: ActivityImplementer + Send + Sync + 'static;
     /// Whether this activity requires an implementation instance.
     const REQUIRES_INSTANCE: bool;
     /// Return this activity's definition marker.

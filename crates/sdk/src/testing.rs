@@ -61,13 +61,13 @@
 //! ```
 
 use crate::activities::{
-    ActivityContext, ActivityError, ActivityImplementer, ActivityInfo, ExecutableActivity,
+    ActivityContext, ActivityDefinitions, ActivityError, ActivityImplementer, ActivityInfo,
+    ExecutableActivity,
 };
 use futures_util::{FutureExt, future::BoxFuture};
 use std::{
-    any::{Any, TypeId, type_name},
+    any::{Any, type_name},
     collections::HashMap,
-    net::{IpAddr, Ipv4Addr},
     path::PathBuf,
     sync::Arc,
     time::{Duration, SystemTime},
@@ -86,7 +86,7 @@ use tokio_util::sync::CancellationToken;
 use url::Url;
 
 pub use temporalio_sdk_core::ephemeral_server::{
-    DevServerLogFormat, DevServerLogLevel, EphemeralExe, EphemeralExeVersion, EphemeralServerError,
+    EphemeralExe, EphemeralExeVersion, EphemeralServerError,
 };
 use temporalio_sdk_core::ephemeral_server::{
     EphemeralServer, TemporalDevServerConfig, default_cached_download,
@@ -98,9 +98,7 @@ type HeartbeatDetailsFactory = Arc<
         + Send
         + Sync,
 >;
-type ActivityImplementers = HashMap<TypeId, Arc<dyn Any + Send + Sync>>;
-
-struct Defaulted<T>(T);
+type ActivityImplementers = HashMap<String, Arc<dyn Any + Send + Sync>>;
 
 fn default_workflow_execution() -> WorkflowExecution {
     let mut execution = WorkflowExecution::default();
@@ -108,71 +106,78 @@ fn default_workflow_execution() -> WorkflowExecution {
     execution
 }
 
-/// Configure [`ActivityInfo`] with defaults suitable for an activity test.
-#[bon::builder(
-    builder_type(name = ActivityInfoBuilder, vis = "pub"),
-    start_fn(name = activity_info, vis = "pub"),
-    finish_fn(name = build, vis = "pub"),
+/// Options for constructing [`ActivityInfo`] with defaults suitable for an activity test.
+#[derive(bon::Builder)]
+#[builder(
+    finish_fn(name = build_internal, vis = ""),
     state_mod(vis = "pub"),
     on(String, into)
 )]
-fn build_activity_info(
-    #[builder(default = b"test".to_vec())] task_token: Vec<u8>,
-    #[builder(default = "test".to_owned())] workflow_type: String,
-    #[builder(default = "default".to_owned())] workflow_namespace: String,
-    #[builder(
-        with = |value: Option<WorkflowExecution>| Defaulted(value),
-        default = Defaulted(Some(default_workflow_execution()))
-    )]
-    workflow_execution: Defaulted<Option<WorkflowExecution>>,
-    #[builder(default = "test".to_owned())] activity_id: String,
-    #[builder(default = "unknown".to_owned())] activity_type: String,
-    #[builder(default = "test".to_owned())] task_queue: String,
+pub struct ActivityInfoOptions {
+    #[builder(default = b"test".to_vec())]
+    task_token: Vec<u8>,
+    #[builder(default = "test".to_owned())]
+    workflow_type: String,
+    #[builder(default = "default".to_owned())]
+    workflow_namespace: String,
+    #[builder(required, default = Some(default_workflow_execution()))]
+    workflow_execution: Option<WorkflowExecution>,
+    #[builder(default = "test".to_owned())]
+    activity_id: String,
+    #[builder(default = "unknown".to_owned())]
+    activity_type: String,
+    #[builder(default = "test".to_owned())]
+    task_queue: String,
     heartbeat_timeout: Option<Duration>,
+    #[builder(required, default = Some(SystemTime::UNIX_EPOCH))]
+    scheduled_time: Option<SystemTime>,
+    #[builder(required, default = Some(SystemTime::UNIX_EPOCH))]
+    started_time: Option<SystemTime>,
     #[builder(
-        with = |value: Option<SystemTime>| Defaulted(value),
-        default = Defaulted(Some(SystemTime::UNIX_EPOCH))
+        required,
+        default = SystemTime::UNIX_EPOCH.checked_add(Duration::from_secs(1))
     )]
-    scheduled_time: Defaulted<Option<SystemTime>>,
-    #[builder(
-        with = |value: Option<SystemTime>| Defaulted(value),
-        default = Defaulted(Some(SystemTime::UNIX_EPOCH))
-    )]
-    started_time: Defaulted<Option<SystemTime>>,
-    #[builder(
-        with = |value: Option<SystemTime>| Defaulted(value),
-        default = Defaulted(SystemTime::UNIX_EPOCH.checked_add(Duration::from_secs(1)))
-    )]
-    deadline: Defaulted<Option<SystemTime>>,
-    #[builder(default = 1)] attempt: u32,
-    #[builder(
-        with = |value: Option<SystemTime>| Defaulted(value),
-        default = Defaulted(Some(SystemTime::UNIX_EPOCH))
-    )]
-    current_attempt_scheduled_time: Defaulted<Option<SystemTime>>,
+    deadline: Option<SystemTime>,
+    #[builder(default = 1)]
+    attempt: u32,
+    #[builder(required, default = Some(SystemTime::UNIX_EPOCH))]
+    current_attempt_scheduled_time: Option<SystemTime>,
     retry_policy: Option<RetryPolicy>,
-    #[builder(default)] is_local: bool,
-    #[builder(default)] priority: Priority,
+    #[builder(default)]
+    is_local: bool,
+    #[builder(default)]
+    priority: Priority,
     run_id: Option<String>,
-) -> ActivityInfo {
-    ActivityInfo {
-        task_token,
-        workflow_type,
-        workflow_namespace,
-        workflow_execution: workflow_execution.0,
-        activity_id,
-        activity_type,
-        task_queue,
-        heartbeat_timeout,
-        scheduled_time: scheduled_time.0,
-        started_time: started_time.0,
-        deadline: deadline.0,
-        attempt,
-        current_attempt_scheduled_time: current_attempt_scheduled_time.0,
-        retry_policy,
-        is_local,
-        priority,
-        run_id,
+}
+
+impl<S: activity_info_options_builder::State> ActivityInfoOptionsBuilder<S> {
+    /// Build activity information from these test options.
+    pub fn build(self) -> ActivityInfo {
+        self.build_internal().into()
+    }
+}
+
+impl From<ActivityInfoOptions> for ActivityInfo {
+    fn from(options: ActivityInfoOptions) -> Self {
+        Self {
+            task_token: options.task_token,
+            workflow_type: options.workflow_type,
+            workflow_namespace: options.workflow_namespace,
+            workflow_execution: options.workflow_execution,
+            activity_id: options.activity_id,
+            activity_type: options.activity_type,
+            task_queue: options.task_queue,
+            heartbeat_timeout: options.heartbeat_timeout,
+            scheduled_time: options.scheduled_time,
+            started_time: options.started_time,
+            deadline: options.deadline,
+            attempt: options.attempt,
+            current_attempt_scheduled_time: options.current_attempt_scheduled_time,
+            retry_policy: options.retry_policy,
+            is_local: options.is_local,
+            priority: options.priority,
+            run_id: options.run_id,
+        }
     }
 }
 
@@ -186,7 +191,7 @@ pub struct ActivityEnvironment {
     heartbeat_details_factory: Option<HeartbeatDetailsFactory>,
     #[builder(field)]
     implementers: ActivityImplementers,
-    #[builder(default = activity_info().build())]
+    #[builder(default = ActivityInfoOptions::builder().build())]
     info: ActivityInfo,
     #[builder(default)]
     headers: HashMap<String, Payload>,
@@ -201,10 +206,15 @@ impl<S: activity_environment_builder::State> ActivityEnvironmentBuilder<S> {
     /// Register all activities implemented by an instance.
     pub fn register_activities<AI>(mut self, instance: AI) -> Self
     where
-        AI: ActivityImplementer,
+        AI: ActivityImplementer + Send + Sync + 'static,
     {
-        self.implementers
-            .insert(TypeId::of::<AI>(), Arc::new(instance));
+        let instance = Arc::new(instance);
+        let mut definitions = ActivityDefinitions::default();
+        AI::register_all(instance.clone(), &mut definitions);
+        let instance: Arc<dyn Any + Send + Sync> = instance;
+        for activity_type in definitions.names() {
+            self.implementers.insert(activity_type, instance.clone());
+        }
         self
     }
 
@@ -251,13 +261,14 @@ impl ActivityEnvironment {
         A: ExecutableActivity,
     {
         let receiver = if A::REQUIRES_INSTANCE {
+            let activity_type = activity.name();
             let implementer = self
                 .implementers
-                .get(&TypeId::of::<A::Implementer>())
+                .get(activity_type)
                 .cloned()
                 .and_then(|instance| Arc::downcast::<A::Implementer>(instance).ok())
                 .ok_or_else(|| ActivityEnvironmentError::MissingImplementer {
-                    activity_type: activity.name().to_owned(),
+                    activity_type: activity_type.to_owned(),
                     implementer_type: type_name::<A::Implementer>(),
                 })?;
             Some(implementer)
@@ -319,6 +330,55 @@ pub enum ActivityEnvironmentError {
     Activity(ActivityError),
 }
 
+/// Temporal CLI output format for a local workflow environment.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum DevServerLogFormat {
+    /// Human-readable text output.
+    #[default]
+    Text,
+    /// JSON output.
+    Json,
+}
+
+impl DevServerLogFormat {
+    fn as_cli_value(self) -> &'static str {
+        match self {
+            Self::Text => "text",
+            Self::Json => "json",
+        }
+    }
+}
+
+/// Temporal CLI logging level for a local workflow environment.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum DevServerLogLevel {
+    /// Debug and higher-severity messages.
+    Debug,
+    /// Informational and higher-severity messages.
+    Info,
+    /// Warning and higher-severity messages.
+    #[default]
+    Warn,
+    /// Error messages only.
+    Error,
+    /// Disable logging.
+    Never,
+}
+
+impl DevServerLogLevel {
+    fn as_cli_value(self) -> &'static str {
+        match self {
+            Self::Debug => "debug",
+            Self::Info => "info",
+            Self::Warn => "warn",
+            Self::Error => "error",
+            Self::Never => "never",
+        }
+    }
+}
+
 /// Configuration for a local Temporal CLI dev server and its client.
 #[derive(Debug, Clone, bon::Builder)]
 #[builder(state_mod(vis = "pub"))]
@@ -330,9 +390,6 @@ pub struct LocalWorkflowEnvironmentOptions {
     /// Existing or downloadable Temporal CLI executable.
     #[builder(default = default_cached_download())]
     pub server_executable: EphemeralExe,
-    /// Address on which the dev server listens.
-    #[builder(default = IpAddr::V4(Ipv4Addr::LOCALHOST))]
-    pub bind_ip: IpAddr,
     /// Fixed frontend port, or an OS-selected port when absent.
     pub port: Option<u16>,
     /// Whether to start the Temporal UI.
@@ -416,13 +473,14 @@ impl WorkflowEnvironment<LocalServer> {
         let server_config = TemporalDevServerConfig::builder()
             .exe(options.server_executable)
             .namespace(options.client_options.namespace.clone())
-            .ip(options.bind_ip.to_string())
             .maybe_port(options.port)
             .ui(options.ui)
             .maybe_ui_port(options.ui_port)
             .maybe_db_filename(database_filename)
-            .log_format(options.log_format)
-            .log_level(options.log_level)
+            .log((
+                options.log_format.as_cli_value().to_owned(),
+                options.log_level.as_cli_value().to_owned(),
+            ))
             .extra_args(options.extra_args)
             .build();
         let mut server = server_config
@@ -575,14 +633,24 @@ mod tests {
 
     #[test]
     fn activity_info_has_test_defaults_and_supports_overrides() {
-        let info = activity_info().attempt(3).activity_type("custom").build();
+        let default_info = ActivityInfoOptions::builder().build();
+        let info = ActivityInfoOptions::builder()
+            .attempt(3)
+            .activity_type("custom")
+            .workflow_execution(None)
+            .build();
 
         assert_eq!(info.attempt, 3);
         assert_eq!(info.activity_type, "custom");
         assert_eq!(info.activity_id, "test");
         assert_eq!(info.workflow_namespace, "default");
+        assert!(info.workflow_execution.is_none());
         assert_eq!(
-            info.workflow_execution.as_ref().unwrap().workflow_id(),
+            default_info
+                .workflow_execution
+                .as_ref()
+                .unwrap()
+                .workflow_id(),
             "test"
         );
     }
@@ -604,6 +672,10 @@ mod tests {
             })
             .build();
 
+        assert!(
+            env.implementers
+                .contains_key(TestActivities::prefixed.name())
+        );
         assert!(!requires_instance(TestActivities::echo));
         assert!(requires_instance(TestActivities::prefixed));
         assert_eq!(

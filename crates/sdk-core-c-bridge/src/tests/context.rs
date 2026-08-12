@@ -31,8 +31,7 @@ use std::{
 };
 use temporalio_client::ConnectionOptions;
 use temporalio_sdk_core::ephemeral_server::{
-    DevServerLogFormat, DevServerLogLevel, EphemeralExe, EphemeralExeVersion,
-    TemporalDevServerConfig,
+    EphemeralExe, EphemeralExeVersion, TemporalDevServerConfig,
 };
 
 #[derive(Debug)]
@@ -223,19 +222,6 @@ impl Context {
             }
         }
 
-        let log_format = match config.log_format {
-            DevServerLogFormat::Text => "text",
-            DevServerLogFormat::Json => "json",
-            _ => "text",
-        };
-        let log_level = match config.log_level {
-            DevServerLogLevel::Debug => "debug",
-            DevServerLogLevel::Info => "info",
-            DevServerLogLevel::Warn => "warn",
-            DevServerLogLevel::Error => "error",
-            DevServerLogLevel::Never => "never",
-            _ => "warn",
-        };
         let dev_server_options = Box::new(DevServerOptions {
             test_server: &*test_server_options,
             namespace: config.namespace.as_str().into(),
@@ -243,8 +229,8 @@ impl Context {
             database_filename: config.db_filename.as_deref().into(),
             ui: config.ui,
             ui_port: config.ui_port.unwrap_or(0),
-            log_format: log_format.into(),
-            log_level: log_level.into(),
+            log_format: config.log.0.as_str().into(),
+            log_level: config.log.1.as_str().into(),
         });
 
         let dev_server_options_ptr = &*dev_server_options as *const _;

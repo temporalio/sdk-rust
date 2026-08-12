@@ -91,6 +91,8 @@ relevant information.
 * Removed `InterceptorWithNext`. Register worker interceptors as an ordered vector instead.
 * Ephemeral server APIs now return `EphemeralServerError` instead of `anyhow::Error`, and dev-server
   log format and level use the non-exhaustive `DevServerLogFormat` and `DevServerLogLevel` enums.
+* Ephemeral server APIs now return the operation-oriented `EphemeralServerError` instead of
+  `anyhow::Error`.
 * Activity macro support now exposes instance requirements through `ExecutableActivity`; the
   redundant `HasOnlyStaticMethods` marker trait has been removed.
 * `Worker::run` now returns `WorkerRunError` instead of `anyhow::Error`.
