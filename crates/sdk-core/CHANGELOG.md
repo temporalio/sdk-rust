@@ -46,6 +46,8 @@ relevant information.
   are preserved on failure; workers warn when the server does not advertise support.
 
 ### Fixed
+* Workers no longer send worker heartbeats or appear in centralized heartbeat reports before they
+  begin polling.
 * Ephemeral server processes no longer leak on failed start.
 * Local activity resolutions are now delivered to workflows as each activity completes instead of
   waiting for every local activity in the workflow task. This allows sequences of short local
@@ -53,4 +55,3 @@ relevant information.
   preserving the resolution ordering recorded in existing histories during replay.
 * Try-cancel child workflows no longer cause nondeterminism when they complete or fail after their
   cancellation was requested.
-
