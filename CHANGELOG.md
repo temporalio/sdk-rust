@@ -67,8 +67,8 @@ relevant information.
 * Removed `InterceptorWithNext`. Register worker interceptors as an ordered vector instead.
 * `Worker::run` now returns `WorkerRunError` instead of `anyhow::Error`.
   Non-validation failures are reported as `WorkerRunError::Fatal` with a message and source.
-* `Logger::Console` now requires a `format: LoggerFormat` field. Use `LoggerFormat::Compact` to
-  preserve the previous default output.
+* `Logger::Console` now requires a `format: Option<LoggerFormat>` field. Use `None` to preserve the
+  previous behavior, including support for `TEMPORAL_CORE_PRETTY_LOGS`.
 * `CancellableFuture` and `CancellableFutureWithReason` now use the inherited `Future::Output`
   associated type instead of a generic output parameter.
 * `TimerOptions` is now tagged with `#[non_exhaustive]`. Use

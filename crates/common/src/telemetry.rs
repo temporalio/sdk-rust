@@ -201,8 +201,9 @@ pub enum Logger {
     Console {
         /// An [EnvFilter](https://docs.rs/tracing-subscriber/latest/tracing_subscriber/struct.EnvFilter.html) filter string.
         filter: String,
-        /// The format used to render logs.
-        format: LoggerFormat,
+        /// The format used to render logs. When unset, `TEMPORAL_CORE_PRETTY_LOGS` selects pretty
+        /// output if present; otherwise logs use the compact format.
+        format: Option<LoggerFormat>,
     },
     #[cfg(feature = "core-telemetry-bridge")]
     /// Forward logs to Lang - collectable with `fetch_buffered_logs`.
@@ -223,12 +224,12 @@ pub enum Logger {
 
 /// Controls how console logs are rendered.
 #[derive(Debug, Default, Clone, Copy)]
+#[non_exhaustive]
 pub enum LoggerFormat {
     /// Render logs compactly on a single line.
     #[default]
     Compact,
-    /// Render logs in a human-readable format across multiple lines. This format is also selected
-    /// when `TEMPORAL_CORE_PRETTY_LOGS` is set, regardless of the configured format.
+    /// Render logs in a human-readable format across multiple lines.
     Pretty,
     /// Render each log as a JSON object on a single line.
     Json,
@@ -440,11 +441,11 @@ where
             match logger {
                 Logger::Console { filter, format } => {
                     // This is silly dupe but can't be avoided without boxing.
-                    let format = if pretty_logs_env_set {
+                    let format = format.unwrap_or(if pretty_logs_env_set {
                         LoggerFormat::Pretty
                     } else {
-                        format
-                    };
+                        LoggerFormat::Compact
+                    });
                     match format {
                         LoggerFormat::Pretty => {
                             console_pretty_layer = Some(
@@ -550,7 +551,7 @@ pub fn telemetry_init_fallback() -> Result<(), anyhow::Error> {
         TelemetryOptions::builder()
             .logging(Logger::Console {
                 filter: construct_filter_string(Level::DEBUG, Level::WARN),
-                format: LoggerFormat::Compact,
+                format: None,
             })
             .build(),
     )?;
@@ -611,7 +612,7 @@ mod tests {
             TelemetryOptions::builder()
                 .logging(Logger::Console {
                     filter: "off,json_log_test=info".to_string(),
-                    format: LoggerFormat::Json,
+                    format: Some(LoggerFormat::Json),
                 })
                 .build(),
             CapturingWriter(output.clone()),
@@ -637,13 +638,38 @@ mod tests {
     }
 
     #[test]
-    fn pretty_logs_env_overrides_configured_format() {
+    fn explicit_format_overrides_pretty_logs_env() {
         let output = Arc::new(Mutex::new(Vec::new()));
         let instance = telemetry_init_with_console_writer(
             TelemetryOptions::builder()
                 .logging(Logger::Console {
                     filter: "info".to_string(),
-                    format: LoggerFormat::Json,
+                    format: Some(LoggerFormat::Json),
+                })
+                .build(),
+            CapturingWriter(output.clone()),
+            true,
+        )
+        .unwrap();
+        let subscriber = instance.trace_subscriber().unwrap();
+
+        tracing::subscriber::with_default(subscriber, || tracing::info!("json log"));
+
+        let output = String::from_utf8(output.lock().unwrap().clone()).unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&output).unwrap()["fields"]["message"],
+            "json log"
+        );
+    }
+
+    #[test]
+    fn pretty_logs_env_selects_pretty_when_format_unset() {
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let instance = telemetry_init_with_console_writer(
+            TelemetryOptions::builder()
+                .logging(Logger::Console {
+                    filter: "info".to_string(),
+                    format: None,
                 })
                 .build(),
             CapturingWriter(output.clone()),

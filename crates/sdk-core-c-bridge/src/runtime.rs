@@ -20,10 +20,9 @@ use temporalio_common::{
         Runtime as CoreEnvironmentRuntime, runtime::RuntimeType as CoreRuntimeType,
     },
     telemetry::{
-        CoreLog, CoreLogConsumer, HistogramBucketOverrides, Logger, LoggerFormat,
-        MetricTemporality, OtelCollectorOptions, PrometheusExporterOptions,
-        TelemetryOptions as CoreTelemetryOptions, build_otlp_metric_exporter, metrics::CoreMeter,
-        start_prometheus_metric_exporter,
+        CoreLog, CoreLogConsumer, HistogramBucketOverrides, Logger, MetricTemporality,
+        OtelCollectorOptions, PrometheusExporterOptions, TelemetryOptions as CoreTelemetryOptions,
+        build_otlp_metric_exporter, metrics::CoreMeter, start_prometheus_metric_exporter,
     },
 };
 use temporalio_sdk_core::{
@@ -321,7 +320,7 @@ impl Runtime {
                 } else {
                     Logger::Console {
                         filter: v.filter.to_string(),
-                        format: LoggerFormat::Compact,
+                        format: None,
                     }
                 }
             });

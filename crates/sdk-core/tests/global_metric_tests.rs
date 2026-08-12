@@ -7,7 +7,7 @@ use common::CoreWfStarter;
 use parking_lot::Mutex;
 use std::{sync::Arc, time::Duration};
 use temporalio_common::telemetry::{
-    Logger, LoggerFormat, OtelCollectorOptions, TelemetryOptions, build_otlp_metric_exporter,
+    Logger, OtelCollectorOptions, TelemetryOptions, build_otlp_metric_exporter,
     construct_filter_string, metrics::CoreMeter, telemetry_init_global,
 };
 use temporalio_sdk_core::CoreRuntime;
@@ -73,7 +73,7 @@ async fn otel_errors_logged_as_errors() {
         // Importantly, _not_ using subscriber override, is using console.
         .logging(Logger::Console {
             filter: construct_filter_string(Level::INFO, Level::WARN),
-            format: LoggerFormat::Compact,
+            format: None,
         })
         .build();
 

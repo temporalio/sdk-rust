@@ -48,7 +48,7 @@ use temporalio_common::{
         },
     },
     telemetry::{
-        Logger, LoggerFormat, OtelCollectorOptions, PrometheusExporterOptions, TelemetryOptions,
+        Logger, OtelCollectorOptions, PrometheusExporterOptions, TelemetryOptions,
         build_otlp_metric_exporter, metrics::CoreMeter, start_prometheus_metric_exporter,
     },
     worker::{WorkerDeploymentOptions, WorkerDeploymentVersion, WorkerTaskTypes},
@@ -978,7 +978,7 @@ pub(crate) fn get_integ_telem_options() -> TelemetryOptions {
             .metrics(Arc::new(build_otlp_metric_exporter(opts).unwrap()) as Arc<dyn CoreMeter>)
             .logging(Logger::Console {
                 filter: filter_string,
-                format: LoggerFormat::Compact,
+                format: None,
             })
             .build()
     } else if let Some(addr) = env::var(PROM_ENABLE_ENV_VAR)
@@ -995,14 +995,14 @@ pub(crate) fn get_integ_telem_options() -> TelemetryOptions {
             .metrics(prom_info.meter as Arc<dyn CoreMeter>)
             .logging(Logger::Console {
                 filter: filter_string,
-                format: LoggerFormat::Compact,
+                format: None,
             })
             .build()
     } else {
         TelemetryOptions::builder()
             .logging(Logger::Console {
                 filter: filter_string,
-                format: LoggerFormat::Compact,
+                format: None,
             })
             .build()
     }
