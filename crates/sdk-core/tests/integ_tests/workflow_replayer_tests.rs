@@ -96,9 +96,12 @@ impl SayHelloWorkflow {
 
 async fn replay_test_worker(test_name: &str) -> (CoreWfStarter, TestWorker) {
     let mut starter = CoreWfStarter::new(test_name);
-    starter.sdk_config.register_activities(SayHelloActivities);
-    let mut worker = starter.worker().await;
-    worker.register_workflow::<SayHelloWorkflow>().unwrap();
+    starter
+        .sdk_config
+        .register_activities(SayHelloActivities)
+        .register_workflow::<SayHelloWorkflow>()
+        .unwrap();
+    let worker = starter.worker().await;
     (starter, worker)
 }
 
