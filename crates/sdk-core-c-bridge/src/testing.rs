@@ -203,6 +203,19 @@ impl TryFrom<&DevServerOptions> for ephemeral_server::TemporalDevServerConfig {
 
     fn try_from(options: &DevServerOptions) -> anyhow::Result<Self> {
         let test_server_options = unsafe { &*options.test_server };
+        let log_format = match options.log_format.to_string().as_str() {
+            "" | "pretty" | "text" => ephemeral_server::DevServerLogFormat::Text,
+            "json" => ephemeral_server::DevServerLogFormat::Json,
+            value => anyhow::bail!("Invalid dev server log format: {value}"),
+        };
+        let log_level = match options.log_level.to_string().as_str() {
+            "debug" => ephemeral_server::DevServerLogLevel::Debug,
+            "info" => ephemeral_server::DevServerLogLevel::Info,
+            "" | "warn" => ephemeral_server::DevServerLogLevel::Warn,
+            "error" | "fatal" => ephemeral_server::DevServerLogLevel::Error,
+            "never" => ephemeral_server::DevServerLogLevel::Never,
+            value => anyhow::bail!("Invalid dev server log level: {value}"),
+        };
         Ok(ephemeral_server::TemporalDevServerConfig::builder()
             .exe(test_server_options.exe())
             .namespace(options.namespace.to_string())
@@ -215,10 +228,8 @@ impl TryFrom<&DevServerOptions> for ephemeral_server::TemporalDevServerConfig {
             } else {
                 None
             })
-            .log((
-                options.log_format.to_string(),
-                options.log_level.to_string(),
-            ))
+            .log_format(log_format)
+            .log_level(log_level)
             .extra_args(test_server_options.extra_args())
             .build())
     }

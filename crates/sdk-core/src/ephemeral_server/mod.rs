@@ -1,7 +1,6 @@
 //! This module implements support for downloading and running ephemeral test
 //! servers useful for testing.
 
-use anyhow::anyhow;
 use flate2::read::GzDecoder;
 use futures_util::StreamExt;
 use serde::Deserialize;
@@ -9,8 +8,9 @@ use std::{
     fs::OpenOptions,
     io,
     path::{Path, PathBuf},
+    time::SystemTimeError,
 };
-use temporalio_client::{Connection, ConnectionOptions};
+use temporalio_client::{Connection, ConnectionOptions, errors::ClientConnectError};
 use tokio::{
     task::spawn_blocking,
     time::{Duration, sleep},
@@ -22,6 +22,108 @@ use zip::read::read_zipfile_from_stream;
 #[cfg(target_family = "unix")]
 use std::os::unix::fs::OpenOptionsExt;
 use std::process::Stdio;
+
+/// Errors encountered while downloading, starting, or stopping an ephemeral server.
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum EphemeralServerError {
+    /// Filesystem, socket, or child-process I/O failed.
+    #[error(transparent)]
+    Io(#[from] io::Error),
+    /// A configured executable path does not exist.
+    #[error("ephemeral server executable does not exist: {}", path.display())]
+    ExecutableNotFound {
+        /// Missing executable path.
+        path: PathBuf,
+    },
+    /// The current CPU architecture is unsupported by the download service.
+    #[error("unsupported architecture: {architecture}")]
+    UnsupportedArchitecture {
+        /// Unsupported architecture name.
+        architecture: String,
+    },
+    /// A URL could not be parsed.
+    #[error(transparent)]
+    Url(#[from] url::ParseError),
+    /// An HTTP request or response failed.
+    #[error(transparent)]
+    Http(#[from] reqwest::Error),
+    /// Download metadata or archive contents were invalid.
+    #[error("invalid ephemeral server download: {message}")]
+    InvalidDownload {
+        /// Description of the invalid content.
+        message: String,
+    },
+    /// A ZIP archive could not be read.
+    #[error(transparent)]
+    Archive(#[from] zip::result::ZipError),
+    /// A blocking extraction task failed.
+    #[error(transparent)]
+    Join(#[from] tokio::task::JoinError),
+    /// File age could not be calculated.
+    #[error(transparent)]
+    SystemTime(#[from] SystemTimeError),
+    /// The server process did not become available before its startup deadline.
+    #[error("ephemeral server at {target} did not start within {timeout:?}")]
+    StartupTimeout {
+        /// Server target that could not be reached.
+        target: String,
+        /// Amount of time spent waiting.
+        timeout: Duration,
+        /// Last connection error, when one was observed.
+        #[source]
+        last_error: Option<ClientConnectError>,
+    },
+}
+
+/// Temporal CLI output format.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum DevServerLogFormat {
+    /// Human-readable text output.
+    #[default]
+    Text,
+    /// JSON output.
+    Json,
+}
+
+impl DevServerLogFormat {
+    fn as_cli_value(self) -> &'static str {
+        match self {
+            Self::Text => "text",
+            Self::Json => "json",
+        }
+    }
+}
+
+/// Temporal CLI logging level.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum DevServerLogLevel {
+    /// Debug and higher-severity messages.
+    Debug,
+    /// Informational and higher-severity messages.
+    Info,
+    /// Warning and higher-severity messages.
+    #[default]
+    Warn,
+    /// Error messages only.
+    Error,
+    /// Disable logging.
+    Never,
+}
+
+impl DevServerLogLevel {
+    fn as_cli_value(self) -> &'static str {
+        match self {
+            Self::Debug => "debug",
+            Self::Info => "info",
+            Self::Warn => "warn",
+            Self::Error => "error",
+            Self::Never => "never",
+        }
+    }
+}
 
 /// Configuration for Temporal CLI dev server.
 #[derive(Debug, Clone, bon::Builder)]
@@ -44,9 +146,12 @@ pub struct TemporalDevServerConfig {
     /// Whether to enable the UI. If ui_port is set, assumes true.
     #[builder(default)]
     pub ui: bool,
-    /// Log format and level
-    #[builder(default = ("pretty".to_owned(), "warn".to_owned()))]
-    pub log: (String, String),
+    /// Log output format.
+    #[builder(default)]
+    pub log_format: DevServerLogFormat,
+    /// Log level.
+    #[builder(default)]
+    pub log_level: DevServerLogLevel,
     /// Additional arguments to Temporal dev server.
     #[builder(default)]
     pub extra_args: Vec<String>,
@@ -54,7 +159,7 @@ pub struct TemporalDevServerConfig {
 
 impl TemporalDevServerConfig {
     /// Start a Temporal CLI dev server.
-    pub async fn start_server(&self) -> anyhow::Result<EphemeralServer> {
+    pub async fn start_server(&self) -> Result<EphemeralServer, EphemeralServerError> {
         self.start_server_with_output(Stdio::inherit(), Stdio::inherit())
             .await
     }
@@ -64,7 +169,7 @@ impl TemporalDevServerConfig {
         &self,
         output: Stdio,
         err_output: Stdio,
-    ) -> anyhow::Result<EphemeralServer> {
+    ) -> Result<EphemeralServer, EphemeralServerError> {
         // Get exe path
         let exe_path = self
             .exe
@@ -88,9 +193,9 @@ impl TemporalDevServerConfig {
             "--ip".to_owned(),
             self.ip.clone(),
             "--log-format".to_owned(),
-            self.log.0.clone(),
+            self.log_format.as_cli_value().to_owned(),
             "--log-level".to_owned(),
-            self.log.1.clone(),
+            self.log_level.as_cli_value().to_owned(),
             "--dynamic-config-value".to_owned(),
             "frontend.enableServerVersionCheck=false".to_owned(),
             "--dynamic-config-value".to_owned(),
@@ -118,6 +223,7 @@ impl TemporalDevServerConfig {
         // Start
         EphemeralServer::start(EphemeralServerConfig {
             exe_path,
+            target_host: self.ip.clone(),
             port,
             args,
             has_test_service: false,
@@ -142,7 +248,7 @@ pub struct TestServerConfig {
 
 impl TestServerConfig {
     /// Start a test server.
-    pub async fn start_server(&self) -> anyhow::Result<EphemeralServer> {
+    pub async fn start_server(&self) -> Result<EphemeralServer, EphemeralServerError> {
         self.start_server_with_output(Stdio::inherit(), Stdio::inherit())
             .await
     }
@@ -152,7 +258,7 @@ impl TestServerConfig {
         &self,
         output: Stdio,
         err_output: Stdio,
-    ) -> anyhow::Result<EphemeralServer> {
+    ) -> Result<EphemeralServer, EphemeralServerError> {
         // Get exe path
         let exe_path = self
             .exe
@@ -172,6 +278,7 @@ impl TestServerConfig {
         // Start
         EphemeralServer::start(EphemeralServerConfig {
             exe_path,
+            target_host: "127.0.0.1".to_owned(),
             port,
             args,
             has_test_service: true,
@@ -184,6 +291,7 @@ impl TestServerConfig {
 
 struct EphemeralServerConfig {
     exe_path: PathBuf,
+    target_host: String,
     port: u16,
     args: Vec<String>,
     has_test_service: bool,
@@ -202,7 +310,7 @@ pub struct EphemeralServer {
 }
 
 impl EphemeralServer {
-    async fn start(config: EphemeralServerConfig) -> anyhow::Result<EphemeralServer> {
+    async fn start(config: EphemeralServerConfig) -> Result<EphemeralServer, EphemeralServerError> {
         // Start process. kill_on_drop ensures the process cannot outlive this
         // handle if start fails before an EphemeralServer (whose shutdown is
         // the normal kill path) is returned to the caller.
@@ -215,11 +323,17 @@ impl EphemeralServer {
             .spawn()?;
         let target = format!("127.0.0.1:{}", config.port);
         let target_url = format!("http://{target}");
+        let target = if config.target_host.contains(':') {
+            format!("[{}]:{}", config.target_host, config.port)
+        } else {
+            format!("{}:{}", config.target_host, config.port)
+        };
+        let target_url = format!("http://{target}");
 
         let connection_options = ConnectionOptions::new(Url::parse(&target_url)?)
             .identity("online_checker".to_owned())
             .client_name("online-checker".to_owned())
-            .client_version("0.1.0".to_owned())
+            .client_version(env!("CARGO_PKG_VERSION").to_owned())
             .build();
 
         // Try to connect every 100ms for 5s
@@ -243,16 +357,18 @@ impl EphemeralServer {
         // which does not wait for the kill to complete) so it cannot linger
         // holding inherited stdout/stderr pipes.
         let _ = child.kill().await;
-        Err(anyhow!(
-            "Failed connecting to test server after 5 seconds, last error: {last_error:?}"
-        ))
+        Err(EphemeralServerError::StartupTimeout {
+            target,
+            timeout: Duration::from_secs(5),
+            last_error,
+        })
     }
 
     /// Shutdown the server (i.e. kill the child process). This does not attempt
     /// a kill if the child process appears completed, but such a check is not
     /// atomic so a kill could still fail as completed if completed just before
     /// kill.
-    pub async fn shutdown(&mut self) -> anyhow::Result<()> {
+    pub async fn shutdown(&mut self) -> Result<(), EphemeralServerError> {
         // Only kill if there is a PID
         if self.child.id().is_some() {
             Ok(self.child.kill().await?)
@@ -289,7 +405,7 @@ pub fn default_cached_download() -> EphemeralExe {
     EphemeralExe::CachedDownload {
         version: EphemeralExeVersion::SDKDefault {
             sdk_name: "sdk-rust".to_string(),
-            sdk_version: "0.1.0".to_string(),
+            sdk_version: env!("CARGO_PKG_VERSION").to_string(),
         },
         dest_dir: None,
         // 15 days
@@ -324,12 +440,12 @@ impl EphemeralExe {
         artifact_name: &str,
         downloaded_name_prefix: &str,
         preferred_format: Option<&str>,
-    ) -> anyhow::Result<PathBuf> {
+    ) -> Result<PathBuf, EphemeralServerError> {
         match self {
             EphemeralExe::ExistingPath(exe_path) => {
                 let path = PathBuf::from(exe_path);
                 if !path.exists() {
-                    return Err(anyhow!("Exe path does not exist"));
+                    return Err(EphemeralServerError::ExecutableNotFound { path });
                 }
                 Ok(path)
             }
@@ -370,7 +486,11 @@ impl EphemeralExe {
                 let arch = match std::env::consts::ARCH {
                     "x86_64" => "amd64",
                     "arm" | "aarch64" => "arm64",
-                    other => return Err(anyhow!("Unsupported arch: {other}")),
+                    other => {
+                        return Err(EphemeralServerError::UnsupportedArchitecture {
+                            architecture: other.to_owned(),
+                        });
+                    }
                 };
                 let mut get_info_params = vec![("arch", arch), ("platform", platform)];
                 if let Some(format) = preferred_format {
@@ -478,7 +598,7 @@ async fn lazy_download_exe(
     file_to_extract: &Path,
     dest: &Path,
     already_tried_cleaning_old: bool,
-) -> anyhow::Result<bool> {
+) -> Result<bool, EphemeralServerError> {
     // If it already exists, do not extract
     if dest.exists() {
         return Ok(true);
@@ -488,7 +608,12 @@ async fn lazy_download_exe(
     // kind of global lock, we'll just create the file eagerly w/ a temp
     // filename and delete it on failure or move it on success. If the temp file
     // already exists, we'll wait a bit and re-run this.
-    let temp_dest_str = format!("{}{}", dest.to_str().unwrap(), ".downloading");
+    let Some(dest_str) = dest.to_str() else {
+        return Err(EphemeralServerError::InvalidDownload {
+            message: format!("download path is not UTF-8: {}", dest.display()),
+        });
+    };
+    let temp_dest_str = format!("{dest_str}.downloading");
     let temp_dest = Path::new(&temp_dest_str);
     // Try to open file, using a file mode on unix families
     #[cfg(target_family = "unix")]
@@ -521,13 +646,13 @@ async fn lazy_download_exe(
                     // abandoned. Reclaim it once; if it goes stale again, fail
                     // loudly rather than looping forever.
                     if already_tried_cleaning_old {
-                        return Err(anyhow!(
-                            "Temp download file at {} made no progress for over {} \
-                            seconds. Make sure another download isn't stuck and \
-                            delete the temp file.",
-                            temp_dest.display(),
-                            DOWNLOAD_STALE_SECS,
-                        ));
+                        return Err(EphemeralServerError::InvalidDownload {
+                            message: format!(
+                                "temporary file at {} made no progress for over {} seconds",
+                                temp_dest.display(),
+                                DOWNLOAD_STALE_SECS,
+                            ),
+                        });
                     }
                     std::fs::remove_file(temp_dest)?;
                     return Box::pin(lazy_download_exe(client, uri, file_to_extract, dest, true))
@@ -569,7 +694,7 @@ async fn download_and_extract(
     uri: &str,
     file_to_extract: &Path,
     dest: &mut std::fs::File,
-) -> anyhow::Result<()> {
+) -> Result<(), EphemeralServerError> {
     // Start download. We are using streaming here to extract the file from the
     // tarball or zip instead of loading into memory for Cursor/Seek.
     let resp = client.get(uri).send().await?.error_for_status()?;
@@ -586,12 +711,14 @@ async fn download_and_extract(
     } else if uri.ends_with(".zip") {
         false
     } else {
-        return Err(anyhow!("URI not .tar.gz or .zip"));
+        return Err(EphemeralServerError::InvalidDownload {
+            message: format!("archive URL has unsupported format: {uri}"),
+        });
     };
     let file_to_extract = file_to_extract.to_path_buf();
     let mut dest = dest.try_clone()?;
 
-    spawn_blocking(move || {
+    spawn_blocking(move || -> Result<(), EphemeralServerError> {
         if tarball {
             for entry in tar::Archive::new(GzDecoder::new(reader)).entries()? {
                 let mut entry = entry?;
@@ -600,7 +727,9 @@ async fn download_and_extract(
                     return Ok(());
                 }
             }
-            Err(anyhow!("Unable to find file in tarball"))
+            Err(EphemeralServerError::InvalidDownload {
+                message: "requested executable was not found in tar archive".to_owned(),
+            })
         } else {
             loop {
                 // This is the way to stream a zip file without creating an archive
@@ -612,7 +741,9 @@ async fn download_and_extract(
                         return Ok(());
                     }
                 } else {
-                    return Err(anyhow!("Unable to find file in zip"));
+                    return Err(EphemeralServerError::InvalidDownload {
+                        message: "requested executable was not found in ZIP archive".to_owned(),
+                    });
                 }
             }
         }
@@ -622,7 +753,10 @@ async fn download_and_extract(
 
 /// Remove the file if it's older than the TTL. Returns true if the current file can be re-used,
 /// returns false if it was removed or should otherwise be re-downloaded.
-fn remove_file_past_ttl(ttl: &Option<Duration>, dest: &PathBuf) -> Result<bool, anyhow::Error> {
+fn remove_file_past_ttl(
+    ttl: &Option<Duration>,
+    dest: &PathBuf,
+) -> Result<bool, EphemeralServerError> {
     match ttl {
         None => return Ok(true),
         Some(ttl) => {
