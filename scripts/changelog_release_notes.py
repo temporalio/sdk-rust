@@ -58,7 +58,9 @@ def _updated_entries(
         for entry in header_entries
     ]
     previous = [
-        entry for category_entries in previous_entries.values() for entry in category_entries
+        entry
+        for category_entries in previous_entries.values()
+        for entry in category_entries
     ]
     exact_matches: dict[tuple[str, ...], list[_Entry]] = {}
     for entry in previous:
@@ -98,7 +100,9 @@ def _updated_entries(
     for current_index, (header, entry) in enumerate(current):
         previous_entry = matches.get(current_index)
         updated.setdefault(header, []).append(
-            _Entry(entry, previous_entry.introduced_header if previous_entry else header)
+            _Entry(
+                entry, previous_entry.introduced_header if previous_entry else header
+            )
         )
     return updated
 
