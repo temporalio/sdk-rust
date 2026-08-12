@@ -192,152 +192,6 @@ fn changelog_notes(from: &str, to: &str) -> Result<Vec<String>, String> {
     Ok(output)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn preserves_original_heading_after_move_and_edit() {
-        let previous = Entries::from([(
-            "Added".into(),
-            vec![Entry {
-                lines: vec!["* Initial feature.".into()],
-                introduced_header: Some("Added".into()),
-            }],
-        )]);
-        let updated = update_entries(
-            &previous,
-            BTreeMap::from([("Changed".into(), vec![vec!["* Updated feature.".into()]])]),
-        );
-        assert_eq!(
-            updated["Changed"][0].introduced_header.as_deref(),
-            Some("Added")
-        );
-    }
-
-    #[test]
-    fn formats_commit_links() {
-        assert_eq!(
-            link_prs("Change (#12)"),
-            "Change ([#12](https://github.com/temporalio/sdk-rust/pull/12))"
-        );
-        assert_eq!(clean_subject(":boom: Change"), "Change");
-    }
-
-    #[test]
-    fn keeps_final_wording_for_introduced_entry() {
-        let previous = Entries::from([(
-            "Added".into(),
-            vec![Entry {
-                lines: vec!["* Initial wording.".into()],
-                introduced_header: Some("Added".into()),
-            }],
-        )]);
-        let updated = update_entries(
-            &previous,
-            BTreeMap::from([("Added".into(), vec![vec!["* Final wording.".into()]])]),
-        );
-        assert_eq!(updated["Added"][0].lines, ["* Final wording."]);
-        assert_eq!(
-            updated["Added"][0].introduced_header.as_deref(),
-            Some("Added")
-        );
-    }
-
-    #[test]
-    fn excludes_modified_old_entry_and_keeps_new_entry() {
-        let previous = Entries::from([(
-            "Added".into(),
-            vec![Entry {
-                lines: vec!["* Existing feature.".into()],
-                introduced_header: None,
-            }],
-        )]);
-        let updated = update_entries(
-            &previous,
-            BTreeMap::from([(
-                "Added".into(),
-                vec![
-                    vec!["* Corrected existing feature.".into()],
-                    vec!["* New feature.".into()],
-                ],
-            )]),
-        );
-        assert_eq!(
-            updated["Added"]
-                .iter()
-                .map(|entry| entry.introduced_header.as_deref())
-                .collect::<Vec<_>>(),
-            [None, Some("Added")]
-        );
-    }
-
-    #[test]
-    fn includes_unrelated_replacement() {
-        let previous = Entries::from([(
-            "Added".into(),
-            vec![Entry {
-                lines: vec!["* Old feature.".into()],
-                introduced_header: None,
-            }],
-        )]);
-        let updated = update_entries(
-            &previous,
-            BTreeMap::from([(
-                "Added".into(),
-                vec![vec!["* New capability for another API.".into()]],
-            )]),
-        );
-        assert_eq!(
-            updated["Added"][0].introduced_header.as_deref(),
-            Some("Added")
-        );
-    }
-
-    #[test]
-    fn excludes_multiline_old_entry_modification() {
-        let previous = Entries::from([(
-            "Fixed".into(),
-            vec![Entry {
-                lines: vec!["* Existing fix.".into(), "  Old detail.".into()],
-                introduced_header: None,
-            }],
-        )]);
-        let updated = update_entries(
-            &previous,
-            BTreeMap::from([(
-                "Fixed".into(),
-                vec![vec!["* Existing fix.".into(), "  New detail.".into()]],
-            )]),
-        );
-        assert_eq!(updated["Fixed"][0].introduced_header, None);
-    }
-
-    #[test]
-    fn keeps_introduced_entry_when_heading_changes() {
-        let previous = Entries::from([(
-            "Added".into(),
-            vec![Entry {
-                lines: vec!["* New feature.".into()],
-                introduced_header: Some("Added".into()),
-            }],
-        )]);
-        let updated = update_entries(
-            &previous,
-            BTreeMap::from([(
-                "Released additions".into(),
-                vec![vec!["* New feature.".into()]],
-            )]),
-        );
-        assert_eq!(
-            updated["Released additions"][0]
-                .introduced_header
-                .as_deref(),
-            Some("Added")
-        );
-    }
-}
-
 fn clean_subject(subject: &str) -> String {
     let subject = subject.chars().filter(char::is_ascii).collect::<String>();
     let subject = subject.split_whitespace().collect::<Vec<_>>().join(" ");
@@ -413,4 +267,133 @@ fn main() -> Result<(), String> {
         .ok_or("expected --to <sha>")?;
     println!("{}", release_notes(&from, &to)?.join("\n"));
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entry(lines: &[&str], header: Option<&str>) -> Entry {
+        Entry {
+            lines: lines.iter().map(|line| (*line).into()).collect(),
+            introduced_header: header.map(Into::into),
+        }
+    }
+
+    #[test]
+    fn preserves_original_heading_after_move_and_edit() {
+        let previous = Entries::from([(
+            "Added".into(),
+            vec![entry(&["* Initial feature."], Some("Added"))],
+        )]);
+        let updated = update_entries(
+            &previous,
+            BTreeMap::from([("Changed".into(), vec![vec!["* Updated feature.".into()]])]),
+        );
+        assert_eq!(
+            updated["Changed"][0].introduced_header.as_deref(),
+            Some("Added")
+        );
+    }
+
+    #[test]
+    fn formats_commit_links() {
+        assert_eq!(
+            link_prs("Change (#12)"),
+            "Change ([#12](https://github.com/temporalio/sdk-rust/pull/12))"
+        );
+        assert_eq!(clean_subject(":boom: Change"), "Change");
+    }
+
+    #[test]
+    fn keeps_final_wording_for_introduced_entry() {
+        let previous = Entries::from([(
+            "Added".into(),
+            vec![entry(&["* Initial wording."], Some("Added"))],
+        )]);
+        let updated = update_entries(
+            &previous,
+            BTreeMap::from([("Added".into(), vec![vec!["* Final wording.".into()]])]),
+        );
+        assert_eq!(
+            updated["Added"][0],
+            entry(&["* Final wording."], Some("Added"))
+        );
+    }
+
+    #[test]
+    fn excludes_modified_old_entry_and_keeps_new_entry() {
+        let previous =
+            Entries::from([("Added".into(), vec![entry(&["* Existing feature."], None)])]);
+        let updated = update_entries(
+            &previous,
+            BTreeMap::from([(
+                "Added".into(),
+                vec![
+                    vec!["* Corrected existing feature.".into()],
+                    vec!["* New feature.".into()],
+                ],
+            )]),
+        );
+        assert_eq!(
+            updated["Added"]
+                .iter()
+                .map(|entry| entry.introduced_header.as_deref())
+                .collect::<Vec<_>>(),
+            [None, Some("Added")]
+        );
+    }
+
+    #[test]
+    fn includes_unrelated_replacement() {
+        let previous = Entries::from([("Added".into(), vec![entry(&["* Old feature."], None)])]);
+        let updated = update_entries(
+            &previous,
+            BTreeMap::from([(
+                "Added".into(),
+                vec![vec!["* New capability for another API.".into()]],
+            )]),
+        );
+        assert_eq!(
+            updated["Added"][0].introduced_header.as_deref(),
+            Some("Added")
+        );
+    }
+
+    #[test]
+    fn excludes_multiline_old_entry_modification() {
+        let previous = Entries::from([(
+            "Fixed".into(),
+            vec![entry(&["* Existing fix.", "  Old detail."], None)],
+        )]);
+        let updated = update_entries(
+            &previous,
+            BTreeMap::from([(
+                "Fixed".into(),
+                vec![vec!["* Existing fix.".into(), "  New detail.".into()]],
+            )]),
+        );
+        assert_eq!(updated["Fixed"][0].introduced_header, None);
+    }
+
+    #[test]
+    fn keeps_introduced_entry_when_heading_changes() {
+        let previous = Entries::from([(
+            "Added".into(),
+            vec![entry(&["* New feature."], Some("Added"))],
+        )]);
+        let updated = update_entries(
+            &previous,
+            BTreeMap::from([(
+                "Released additions".into(),
+                vec![vec!["* New feature.".into()]],
+            )]),
+        );
+        assert_eq!(
+            updated["Released additions"][0]
+                .introduced_header
+                .as_deref(),
+            Some("Added")
+        );
+    }
 }
