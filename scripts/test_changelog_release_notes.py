@@ -72,6 +72,20 @@ class ChangelogReleaseNotesTests(unittest.TestCase):
         )
         self.assertEqual(updated["Released additions"][0].introduced_header, "Added")
 
+    def test_release_notes_include_linked_commits(self) -> None:
+        module = _module()
+        module._git = lambda args: "full\x00short\x00:boom: Add feature (#12)"
+        module.changelog_entries = lambda _old, _new: []
+        self.assertEqual(
+            module.release_notes("old", "new"),
+            [
+                "#### Commits",
+                "",
+                "- [`short`](https://github.com/temporalio/sdk-rust/commit/full) "
+                "Add feature ([#12](https://github.com/temporalio/sdk-rust/pull/12))",
+            ],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

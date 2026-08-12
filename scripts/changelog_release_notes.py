@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import dataclasses
 import difflib
+import re
 import subprocess
 from collections.abc import Sequence
 
@@ -140,12 +141,53 @@ def changelog_entries(previous_commit: str, current_commit: str) -> list[str]:
     return output[:-1] if output else []
 
 
+def _clean_commit_subject(subject: str) -> str:
+    subject = subject.encode("ascii", "ignore").decode("ascii")
+    subject = re.sub(r"\s+", " ", subject).strip()
+    subject = re.sub(r"^:[a-z0-9_+-]+:\s*", "", subject)
+    return subject.replace(" : ", ": ")
+
+
+def _link_prs(subject: str) -> str:
+    return re.sub(
+        r"\(#([0-9]+)\)",
+        r"([#\1](https://github.com/temporalio/sdk-rust/pull/\1))",
+        subject,
+    )
+
+
+def release_notes(previous_commit: str, current_commit: str) -> list[str]:
+    log_output = _git(
+        [
+            "log",
+            "--format=%H%x00%h%x00%s",
+            "--reverse",
+            f"{previous_commit}..{current_commit}",
+        ]
+    )
+    if not log_output:
+        return []
+
+    lines: list[str] = []
+    entries = changelog_entries(previous_commit, current_commit)
+    if entries:
+        lines.extend(["#### Changelog", "", *entries, ""])
+    lines.extend(["#### Commits", ""])
+    for line in log_output.splitlines():
+        full_hash, short_hash, subject = line.split("\0", 2)
+        lines.append(
+            f"- [`{short_hash}`](https://github.com/temporalio/sdk-rust/commit/"
+            f"{full_hash}) {_link_prs(_clean_commit_subject(subject))}"
+        )
+    return lines
+
+
 def main(argv: Sequence[str] | None = None) -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--from", dest="previous_commit", required=True)
     parser.add_argument("--to", dest="current_commit", required=True)
     args = parser.parse_args(argv)
-    print("\n".join(changelog_entries(args.previous_commit, args.current_commit)))
+    print("\n".join(release_notes(args.previous_commit, args.current_commit)))
 
 
 if __name__ == "__main__":
