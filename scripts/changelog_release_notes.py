@@ -52,15 +52,15 @@ def _updated_entries(
     previous_entries: dict[str, list[_Entry]],
     current_entries: dict[str, list[list[str]]],
 ) -> dict[str, list[_Entry]]:
-    current = [
-        (header, entry)
+    current: list[tuple[str, list[str]]] = [
+        (header, lines)
         for header, header_entries in current_entries.items()
-        for entry in header_entries
+        for lines in header_entries
     ]
-    previous = [
-        entry
+    previous: list[_Entry] = [
+        previous_entry
         for category_entries in previous_entries.values()
-        for entry in category_entries
+        for previous_entry in category_entries
     ]
     exact_matches: dict[tuple[str, ...], list[_Entry]] = {}
     for entry in previous:
@@ -68,8 +68,8 @@ def _updated_entries(
 
     matches: dict[int, _Entry] = {}
     matched_previous: set[int] = set()
-    for current_index, (_, entry) in enumerate(current):
-        exact = exact_matches.get(tuple(entry))
+    for current_index, (_, current_lines) in enumerate(current):
+        exact = exact_matches.get(tuple(current_lines))
         if exact:
             previous_entry = exact.pop(0)
             matches[current_index] = previous_entry
@@ -97,11 +97,12 @@ def _updated_entries(
             matched_previous.add(id(previous_entry))
 
     updated: dict[str, list[_Entry]] = {}
-    for current_index, (header, entry) in enumerate(current):
-        previous_entry = matches.get(current_index)
+    for current_index, (header, current_lines) in enumerate(current):
+        previous_entry: _Entry | None = matches.get(current_index)
         updated.setdefault(header, []).append(
             _Entry(
-                entry, previous_entry.introduced_header if previous_entry else header
+                current_lines,
+                previous_entry.introduced_header if previous_entry else header,
             )
         )
     return updated

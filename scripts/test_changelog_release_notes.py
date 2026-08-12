@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import unittest
+from unittest.mock import patch
 
 import changelog_release_notes as notes
 
@@ -56,10 +57,15 @@ class ChangelogReleaseNotesTests(unittest.TestCase):
         self.assertEqual(updated["Released additions"][0].introduced_header, "Added")
 
     def test_release_notes_include_linked_commits(self) -> None:
-        notes._git = lambda args: "full\x00short\x00:boom: Add feature (#12)"
-        notes.changelog_entries = lambda _old, _new: []
+        with (
+            patch.object(
+                notes, "_git", return_value="full\x00short\x00:boom: Add feature (#12)"
+            ),
+            patch.object(notes, "changelog_entries", return_value=[]),
+        ):
+            release_notes = notes.release_notes("old", "new")
         self.assertEqual(
-            notes.release_notes("old", "new"),
+            release_notes,
             [
                 "#### Commits",
                 "",
