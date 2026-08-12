@@ -133,7 +133,7 @@ fn update_entries(previous: &Entries, current: BTreeMap<String, Vec<Vec<String>>
             Some(index) => previous_flat[index].introduced_header.clone(),
             None => Some(header.clone()),
         };
-        updated.entry(header).or_insert_with(Vec::new).push(Entry {
+        updated.entry(header).or_default().push(Entry {
             lines,
             introduced_header,
         });
