@@ -366,8 +366,8 @@ impl ActivitiesDefinition {
             })
             .collect();
 
-        // Run methods and `ExecutableActivity`/`ActivityImplementer`/`HasOnlyStaticMethods`
-        // impls only make sense for real activities; definitions skip them entirely.
+        // Run methods and `ExecutableActivity`/`ActivityImplementer` impls only make sense for
+        // real activities; definitions skip them entirely.
         let run_impls: Vec<_> = if is_definitions {
             Vec::new()
         } else {
@@ -396,14 +396,6 @@ impl ActivitiesDefinition {
             self.generate_activity_implementer_impl(impl_type, &module_ident)
         };
 
-        let has_only_static = if !is_definitions && self.activities.iter().all(|a| a.is_static) {
-            quote! {
-                impl ::temporalio_sdk::activities::HasOnlyStaticMethods for #impl_type {}
-            }
-        } else {
-            quote! {}
-        };
-
         // Generate impl block with consts
         let const_impl = quote! {
             impl #impl_type {
@@ -427,8 +419,6 @@ impl ActivitiesDefinition {
             #(#activity_impls)*
 
             #implementer_impl
-
-            #has_only_static
         };
 
         output.into()
@@ -608,6 +598,7 @@ impl ActivitiesDefinition {
 
         let prefixed_method = format_ident!("__{}", activity.method.sig.ident);
         let has_input = !activity.input_types.is_empty();
+        let is_instance = !activity.is_static;
 
         let receiver_pattern = if activity.is_static {
             quote! { _receiver }
@@ -666,6 +657,7 @@ impl ActivitiesDefinition {
 
             impl ::temporalio_sdk::activities::ExecutableActivity for #module_ident::#struct_ident {
                 type Implementer = #impl_type;
+                const REQUIRES_INSTANCE: bool = #is_instance;
 
                 fn definition() -> Self {
                     #module_ident::#struct_ident

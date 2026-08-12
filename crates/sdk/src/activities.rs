@@ -425,24 +425,33 @@ fn call_execute_activity<'a>(
     }
 }
 
-#[doc(hidden)]
-pub trait ActivityImplementer {
+/// Implemented by `#[activities]` for types that provide activity methods.
+///
+/// This trait supports registration and direct execution infrastructure. Applications normally
+/// use the generated implementation rather than implementing it manually.
+pub trait ActivityImplementer: Send + Sync + 'static {
+    /// Register every activity method implemented by this type.
     fn register_all(self: Arc<Self>, defs: &mut ActivityDefinitions);
 }
 
-#[doc(hidden)]
+/// Direct execution support generated for each activity marker by `#[activities]`.
+///
+/// Applications normally use the generated implementation rather than implementing this trait
+/// manually.
 pub trait ExecutableActivity: ActivityDefinition + Sized {
-    type Implementer: ActivityImplementer + Send + Sync + 'static;
+    /// Type containing the activity implementation.
+    type Implementer: ActivityImplementer;
+    /// Whether this activity requires an implementation instance.
+    const REQUIRES_INSTANCE: bool;
+    /// Return this activity's definition marker.
     fn definition() -> Self;
+    /// Execute the activity with already-typed input.
     fn execute(
         receiver: Option<Arc<Self::Implementer>>,
         ctx: ActivityContext,
         input: Self::Input,
     ) -> BoxFuture<'static, Result<Self::Output, ActivityError>>;
 }
-
-#[doc(hidden)]
-pub trait HasOnlyStaticMethods {}
 
 /// Contains activity registrations in a form ready for execution by workers.
 #[derive(Default, Clone)]
