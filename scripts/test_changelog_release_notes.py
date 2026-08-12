@@ -56,6 +56,22 @@ class ChangelogReleaseNotesTests(unittest.TestCase):
         )
         self.assertEqual(updated["Added"][0].introduced_header, "Added")
 
+    def test_excludes_multiline_old_entry_modification(self) -> None:
+        module = _module()
+        updated = module._updated_entries(
+            {"Fixed": [module._Entry(["* Existing fix.", "  Old detail."])]},
+            {"Fixed": [["* Existing fix.", "  New detail."]]},
+        )
+        self.assertIsNone(updated["Fixed"][0].introduced_header)
+
+    def test_keeps_introduced_entry_when_heading_changes(self) -> None:
+        module = _module()
+        updated = module._updated_entries(
+            {"Added": [module._Entry(["* New feature."], "Added")]},
+            {"Released additions": [["* New feature."]]},
+        )
+        self.assertEqual(updated["Released additions"][0].introduced_header, "Added")
+
 
 if __name__ == "__main__":
     unittest.main()
