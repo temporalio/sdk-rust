@@ -226,6 +226,76 @@ impl MultiArgActivityWorkflow {
     }
 }
 
+static FAIL_ACTIVITY_INPUT_SERIALIZATION_ONCE: AtomicBool = AtomicBool::new(true);
+
+#[derive(serde::Deserialize)]
+struct FailOnceActivityInput;
+
+impl serde::Serialize for FailOnceActivityInput {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        if FAIL_ACTIVITY_INPUT_SERIALIZATION_ONCE.swap(false, Ordering::SeqCst) {
+            return Err(serde::ser::Error::custom(
+                "intentional activity input serialization failure",
+            ));
+        }
+        serializer.serialize_unit_struct("FailOnceActivityInput")
+    }
+}
+
+struct PayloadConversionActivities;
+
+#[activities]
+impl PayloadConversionActivities {
+    #[activity]
+    async fn fail_once_input(
+        _ctx: ActivityContext,
+        _input: FailOnceActivityInput,
+    ) -> Result<(), ActivityError> {
+        Ok(())
+    }
+}
+
+#[workflow]
+#[derive(Default)]
+struct PropagatedActivityInputConversionFailureWorkflow;
+
+#[workflow_methods]
+impl PropagatedActivityInputConversionFailureWorkflow {
+    #[run]
+    async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<()> {
+        ctx.execute_activity(
+            PayloadConversionActivities::fail_once_input,
+            FailOnceActivityInput,
+            ActivityOptions::start_to_close_timeout(Duration::from_secs(5)),
+        )
+        .await?;
+        Ok(())
+    }
+}
+
+#[workflow]
+#[derive(Default)]
+struct CaughtActivityInputConversionFailureWorkflow;
+
+#[workflow_methods]
+impl CaughtActivityInputConversionFailureWorkflow {
+    #[run]
+    async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<()> {
+        let result = ctx
+            .execute_activity(
+                PayloadConversionActivities::fail_once_input,
+                FailOnceActivityInput,
+                ActivityOptions::start_to_close_timeout(Duration::from_secs(5)),
+            )
+            .await;
+        match result {
+            Err(ActivityExecutionError::Serialization(_error)) => (),
+            other => panic!("expected a serialization error, got {other:?}"),
+        }
+        Ok(())
+    }
+}
+
 #[tokio::test]
 async fn multi_arg_activity() {
     let wf_name = MultiArgActivityWorkflow::name();
@@ -250,6 +320,66 @@ async fn multi_arg_activity() {
     worker.run_until_done().await.unwrap();
     let r = handle.get_result(Default::default()).await.unwrap();
     assert_eq!(r, "hello world");
+}
+
+#[tokio::test]
+async fn propagated_activity_input_conversion_failure_fails_workflow_task() {
+    FAIL_ACTIVITY_INPUT_SERIALIZATION_ONCE.store(true, Ordering::SeqCst);
+    let wf_name = PropagatedActivityInputConversionFailureWorkflow::name();
+    let mut starter = CoreWfStarter::new(wf_name);
+    starter
+        .sdk_config
+        .register_activities(PayloadConversionActivities);
+    starter
+        .sdk_config
+        .register_workflow::<PropagatedActivityInputConversionFailureWorkflow>()
+        .unwrap();
+    let mut worker = starter.worker().await;
+
+    let task_queue = starter.get_task_queue().to_owned();
+    let handle = worker
+        .submit_workflow(
+            PropagatedActivityInputConversionFailureWorkflow::run,
+            (),
+            WorkflowStartOptions::new(task_queue, wf_name.to_owned()).build(),
+        )
+        .await
+        .unwrap();
+    worker.run_until_done().await.unwrap();
+    handle.get_result(Default::default()).await.unwrap();
+
+    let history = handle.fetch_history(Default::default()).await.unwrap();
+    assert_eq!(
+        history
+            .events()
+            .iter()
+            .filter(|event| event.event_type() == EventType::WorkflowTaskFailed)
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn activity_input_conversion_failure_can_be_caught() {
+    let wf_name = CaughtActivityInputConversionFailureWorkflow::name();
+    let mut starter = CoreWfStarter::new(wf_name);
+    starter
+        .sdk_config
+        .register_workflow::<CaughtActivityInputConversionFailureWorkflow>()
+        .unwrap();
+    let mut worker = starter.worker().await;
+
+    let task_queue = starter.get_task_queue().to_owned();
+    let handle = worker
+        .submit_workflow(
+            CaughtActivityInputConversionFailureWorkflow::run,
+            (),
+            WorkflowStartOptions::new(task_queue, wf_name.to_owned()).build(),
+        )
+        .await
+        .unwrap();
+    worker.run_until_done().await.unwrap();
+    handle.get_result(Default::default()).await.unwrap();
 }
 
 #[tokio::test]

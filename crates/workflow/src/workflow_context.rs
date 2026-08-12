@@ -4197,7 +4197,10 @@ mod tests {
     }
 
     #[test]
-    fn continue_as_new_reports_serialization_errors() {
+    #[should_panic(
+        expected = "Workflow payload conversion failed: Encoding error: serialization failure"
+    )]
+    fn continue_as_new_panics_on_input_serialization_errors() {
         #[derive(Debug)]
         struct FailingInput;
 
@@ -4259,38 +4262,24 @@ mod tests {
         );
         let ctx = WorkflowContext::from_base(base, Rc::new(RefCell::new(FailingWorkflow)));
 
-        let err = ctx
-            .continue_as_new(FailingInput, ContinueAsNewOptions::default())
-            .expect_err("serialization errors should be surfaced");
-
-        let WorkflowTermination::Failed(err) = err else {
-            panic!("expected failed termination, got {err:?}");
-        };
-        assert_eq!(err.to_string(), "Encoding error: serialization failure");
+        let _ = ctx.continue_as_new(FailingInput, ContinueAsNewOptions::default());
     }
 
     #[test]
-    fn continue_as_new_reports_memo_serialization_errors() {
+    #[should_panic(
+        expected = "Workflow payload conversion failed: Encoding error: memo serialization failure"
+    )]
+    fn continue_as_new_panics_on_memo_serialization_errors() {
         let ctx = test_context();
         let mut memo = MemoValues::new();
         memo.insert("invalid", FailingMemoValue);
 
-        let err = ctx
-            .continue_as_new(
-                7,
-                ContinueAsNewOptions {
-                    memo: Some(memo),
-                    ..Default::default()
-                },
-            )
-            .expect_err("memo serialization errors should be surfaced");
-
-        let WorkflowTermination::Failed(err) = err else {
-            panic!("expected failed termination, got {err:?}");
-        };
-        assert_eq!(
-            err.to_string(),
-            "Encoding error: memo serialization failure"
+        let _ = ctx.continue_as_new(
+            7,
+            ContinueAsNewOptions {
+                memo: Some(memo),
+                ..Default::default()
+            },
         );
     }
 

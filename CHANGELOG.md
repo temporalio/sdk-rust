@@ -111,6 +111,8 @@ relevant information.
   Non-validation failures are reported as `WorkerRunError::Fatal` with a message and source.
 
 ### Fixed
+* Unhandled workflow payload conversion errors now fail the Workflow Task so it can retry instead
+  of failing the Workflow Execution. Workflows may still explicitly handle these errors.
 * Local activity resolutions are now delivered to workflows as each activity completes instead of
   waiting for every local activity in the workflow task. This allows sequences of short local
   activities to make progress while a long-running local activity executes in parallel, while

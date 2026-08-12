@@ -9,9 +9,10 @@ use crate::{
 };
 use temporalio_common_wasm::{
     WorkflowDefinition,
+    data_converters::PayloadConversionError,
     error::{
         ActivityExecutionError, ApplicationFailure, ChildWorkflowExecutionError,
-        WorkflowSignalError,
+        ChildWorkflowStartError, WorkflowSignalError,
     },
     protos::{
         coresdk::{
@@ -212,6 +213,11 @@ impl CancellableID {
 pub type WorkflowResult<T> = Result<T, WorkflowTermination>;
 
 /// Represents ways a workflow can terminate without producing a normal result.
+///
+/// Payload conversion errors returned by workflow operations may be handled at the operation
+/// boundary. Propagating one directly into `WorkflowTermination`, such as with `?` will fail
+/// the current Workflow Task so it can be retried. Wrapping the conversion error in another
+/// error type instead produces the normal failure behavior for that wrapper.
 #[derive(Debug, thiserror::Error)]
 pub enum WorkflowTermination {
     #[error("Workflow cancelled")]
@@ -253,9 +259,13 @@ impl From<ApplicationFailure> for WorkflowTermination {
     }
 }
 
-impl From<temporalio_common_wasm::data_converters::PayloadConversionError> for WorkflowTermination {
-    fn from(value: temporalio_common_wasm::data_converters::PayloadConversionError) -> Self {
-        Self::Failed(value.into())
+fn fail_workflow_task_on_payload_conversion(error: PayloadConversionError) -> ! {
+    panic!("Workflow payload conversion failed: {error}")
+}
+
+impl From<PayloadConversionError> for WorkflowTermination {
+    fn from(value: PayloadConversionError) -> Self {
+        fail_workflow_task_on_payload_conversion(value)
     }
 }
 
@@ -274,24 +284,73 @@ impl From<crate::runtime::entry::WorkflowError> for WorkflowTermination {
 
 impl From<ActivityExecutionError> for WorkflowTermination {
     fn from(value: ActivityExecutionError) -> Self {
-        Self::Failed(value.into())
+        match value {
+            ActivityExecutionError::Serialization(err) => {
+                fail_workflow_task_on_payload_conversion(err)
+            }
+            other => Self::Failed(other.into()),
+        }
     }
 }
 
 impl From<ChildWorkflowExecutionError> for WorkflowTermination {
     fn from(value: ChildWorkflowExecutionError) -> Self {
-        Self::Failed(value.into())
+        match value {
+            ChildWorkflowExecutionError::Serialization(err) => {
+                fail_workflow_task_on_payload_conversion(err)
+            }
+            other => Self::Failed(other.into()),
+        }
     }
 }
 
 impl From<WorkflowSignalError> for WorkflowTermination {
     fn from(value: WorkflowSignalError) -> Self {
-        Self::Failed(value.into())
+        match value {
+            WorkflowSignalError::Serialization(err) => {
+                fail_workflow_task_on_payload_conversion(err)
+            }
+            other => Self::Failed(other.into()),
+        }
     }
 }
 
-impl From<temporalio_common_wasm::error::ChildWorkflowStartError> for WorkflowTermination {
-    fn from(value: temporalio_common_wasm::error::ChildWorkflowStartError) -> Self {
-        Self::Failed(value.into())
+impl From<ChildWorkflowStartError> for WorkflowTermination {
+    fn from(value: ChildWorkflowStartError) -> Self {
+        match value {
+            ChildWorkflowStartError::Serialization(err) => {
+                fail_workflow_task_on_payload_conversion(err)
+            }
+            other => Self::Failed(other.into()),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::runtime::entry::WorkflowError;
+    use rstest::rstest;
+
+    fn conversion_error() -> PayloadConversionError {
+        PayloadConversionError::EncodingError(std::io::Error::other("test conversion error").into())
+    }
+
+    #[rstest]
+    #[case::payload(conversion_error())]
+    #[case::workflow(WorkflowError::PayloadConversion(conversion_error()))]
+    #[case::activity(ActivityExecutionError::Serialization(conversion_error()))]
+    #[case::child_start(ChildWorkflowStartError::Serialization(conversion_error()))]
+    #[case::child_execution(ChildWorkflowExecutionError::Serialization(conversion_error()))]
+    #[case::signal(WorkflowSignalError::Serialization(conversion_error()))]
+    #[should_panic(
+        expected = "Workflow payload conversion failed: Encoding error: test conversion error"
+    )]
+    fn conversion_error_panics_when_converted_to_workflow_termination<
+        T: Into<WorkflowTermination>,
+    >(
+        #[case] error: T,
+    ) {
+        let _: WorkflowTermination = error.into();
     }
 }
