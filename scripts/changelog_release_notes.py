@@ -71,9 +71,9 @@ def _updated_entries(
     for current_index, (_, current_lines) in enumerate(current):
         exact = exact_matches.get(tuple(current_lines))
         if exact:
-            previous_entry = exact.pop(0)
-            matches[current_index] = previous_entry
-            matched_previous.add(id(previous_entry))
+            matched_entry = exact.pop(0)
+            matches[current_index] = matched_entry
+            matched_previous.add(id(matched_entry))
 
     candidates: list[tuple[float, int, _Entry]] = []
     for current_index, (_, current_entry) in enumerate(current):
@@ -98,11 +98,11 @@ def _updated_entries(
 
     updated: dict[str, list[_Entry]] = {}
     for current_index, (header, current_lines) in enumerate(current):
-        previous_entry: _Entry | None = matches.get(current_index)
+        prior_entry: _Entry | None = matches.get(current_index)
         updated.setdefault(header, []).append(
             _Entry(
                 current_lines,
-                previous_entry.introduced_header if previous_entry else header,
+                prior_entry.introduced_header if prior_entry else header,
             )
         )
     return updated
