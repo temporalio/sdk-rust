@@ -7,9 +7,7 @@ use temporalio_client::{
     Connection, ConnectionOptions, WorkflowStartOptions,
     grpc::{TestService, WorkflowService},
 };
-use temporalio_common::{
-    protos::temporal::api::workflowservice::v1::DescribeNamespaceRequest, worker::WorkerTaskTypes,
-};
+use temporalio_common::protos::temporal::api::workflowservice::v1::DescribeNamespaceRequest;
 use temporalio_macros::{workflow, workflow_methods};
 use temporalio_sdk::{
     Runtime, Worker, WorkerOptions, WorkflowContext, WorkflowResult,
