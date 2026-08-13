@@ -41,7 +41,6 @@ async fn test_workflow_environment_local() {
         .unwrap();
     let runtime = Runtime::new_assume_tokio(Default::default()).unwrap();
     let worker_options = WorkerOptions::new(format!("test-env-{}", rand_6_chars()))
-        .task_types(WorkerTaskTypes::workflow_only())
         .register_workflow::<TestEnvironmentWorkflow>()
         .unwrap()
         .build();
