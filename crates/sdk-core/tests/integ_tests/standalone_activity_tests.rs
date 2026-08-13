@@ -1,4 +1,4 @@
-use crate::common::{get_integ_client, init_integ_telem, integ_namespace, rand_6_chars};
+use crate::common::CoreWfStarter;
 use futures_util::{FutureExt, StreamExt, pin_mut, stream};
 use std::{
     collections::HashSet,
@@ -12,9 +12,9 @@ use temporalio_client::{
     ActivityExecutionStatus, ActivityStartOptions, ActivityStartOptionsBuilder,
     ActivityTerminateOptions, Client, NamespacedClient, errors::ActivityResultError,
 };
-use temporalio_common::{ActivityError, error::IncomingError};
+use temporalio_common::ActivityError;
 use temporalio_macros::activities;
-use temporalio_sdk::{Worker, WorkerOptions, activities::ActivityContext};
+use temporalio_sdk::activities::ActivityContext;
 use uuid::Uuid;
 
 const TASK_QUEUE_PREFIX: &str = "standalone_activity_tests";
@@ -41,25 +41,15 @@ impl Activities {
 }
 
 async fn run_test(test: impl AsyncFnOnce(Client, String)) {
-    let rt = init_integ_telem().unwrap();
-    let client = get_integ_client(
-        integ_namespace(),
-        rt.telemetry().get_temporal_metric_meter(),
-    )
-    .await;
-    let task_queue = format!("{TASK_QUEUE_PREFIX}_{}", rand_6_chars());
-    let mut worker = Worker::new(
-        rt,
-        client.clone(),
-        WorkerOptions::new(task_queue.clone()).build(),
-    )
-    .unwrap();
-    let shutdown_handle = worker.shutdown_handle();
-    worker.register_activities(Activities);
+    let mut starter = CoreWfStarter::new(TASK_QUEUE_PREFIX);
+    starter.sdk_config.register_activities(Activities);
+    let mut worker = starter.worker().await;
+    let client = starter.get_core_client().await;
+    let shutdown_handle = worker.inner_mut().shutdown_handle();
 
-    let worker_fut = worker.run();
+    let worker_fut = worker.inner_mut().run();
     let test_fut = async {
-        let result = AssertUnwindSafe(test(client, task_queue))
+        let result = AssertUnwindSafe(test(client, starter.sdk_config.task_queue.clone()))
             .catch_unwind()
             .await;
         shutdown_handle();
@@ -159,11 +149,7 @@ async fn describe() {
         let result = handle.result().await.unwrap();
 
         let desc = handle
-            .describe(ActivityDescribeOptions {
-                include_input: true,
-                include_outcome: true,
-                ..Default::default()
-            })
+            .describe(ActivityDescribeOptions::builder().include_input().include_outcome().build())
             .await
             .unwrap();
 
@@ -185,9 +171,7 @@ async fn cancel() {
             .await
             .unwrap();
         handle
-            .cancel(ActivityCancelOptions {
-                reason: reason.into(),
-            })
+            .cancel(ActivityCancelOptions::builder().reason(reason).build())
             .await
             .unwrap();
 
@@ -211,9 +195,7 @@ async fn terminate() {
             .await
             .unwrap();
         handle
-            .terminate(ActivityTerminateOptions {
-                reason: reason.into(),
-            })
+            .terminate(ActivityTerminateOptions::builder().reason(reason).build())
             .await
             .unwrap();
 

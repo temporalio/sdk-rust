@@ -730,7 +730,7 @@ pub struct ActivityStartOptions {
     /// Headers to include with the start request.
     pub header: Option<Header>,
     /// Single-line static summary for the activity, shown in the Temporal UI.
-    pub static_summary: Option<String>,
+    pub summary: Option<String>,
     /// Multi-line static details for the activity, shown in the Temporal UI.
     pub static_details: Option<String>,
     /// Time to wait before dispatching the first activity task.
@@ -830,31 +830,39 @@ pub struct ActivityCountOptions {}
 ///
 /// Note that these fields contain payloads that can be arbitrarily large. It's recommended not to
 /// include them unless they're needed.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, bon::Builder)]
 #[non_exhaustive]
 pub struct ActivityDescribeOptions {
-    /// If `true` and the activity received input, the input will be included.
+    /// If set and the activity received input, the input will be included.
+    #[builder(default, with = || true, setters(option_fn(vis = "")))]
     pub include_input: bool,
-    /// If `true` and the activity is closed, the activity outcome will be included.
+    /// If set and the activity is closed, the activity outcome will be included.
+    #[builder(default, with = || true, setters(option_fn(vis = "")))]
     pub include_outcome: bool,
-    /// If `true` and the activity sent heartbeat details, the heartbeat details will be included.
+    /// If set and the activity sent heartbeat details, the heartbeat details will be included.
+    #[builder(default, with = || true, setters(option_fn(vis = "")))]
     pub include_heartbeat_details: bool,
-    /// If `true` and the activity has a failed attempt, the last failure will be included.
+    /// If set and the activity has a failed attempt, the last failure will be included.
+    #[builder(default, with = || true, setters(option_fn(vis = "")))]
     pub include_last_failure: bool,
 }
 
 /// Options for [`ActivityHandle::cancel`](crate::ActivityHandle::cancel).
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, bon::Builder)]
+#[builder(on(String, into))]
 #[non_exhaustive]
 pub struct ActivityCancelOptions {
     /// Reason for cancellation. Can be empty.
+    #[builder(default)]
     pub reason: String,
 }
 
 /// Options for [`ActivityHandle::terminate`](crate::ActivityHandle::terminate).
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, bon::Builder)]
+#[builder(on(String, into))]
 #[non_exhaustive]
 pub struct ActivityTerminateOptions {
     /// Reason for termination. Can be empty.
+    #[builder(default)]
     pub reason: String,
 }

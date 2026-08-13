@@ -2061,7 +2061,7 @@ where
         let sc = &SerializationContextData::Activity;
 
         let user_metadata = {
-            let summary = match &options.static_summary {
+            let summary = match &options.summary {
                 Some(summary) => Some(dc.to_payload(sc, summary).await?),
                 None => None,
             };
