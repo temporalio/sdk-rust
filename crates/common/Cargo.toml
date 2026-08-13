@@ -98,6 +98,7 @@ tracing-subscriber = { version = "0.3", default-features = false, features = [
   "env-filter",
   "registry",
   "ansi",
+  "json",
 ] }
 tracing-core = "0.1"
 url = "2.5"

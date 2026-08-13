@@ -61,8 +61,17 @@ Good pull requests are focused and easy to review:
 * Keep each pull request scoped to one logical change.
 * Include tests for behavior changes.
 * Update public API documentation or doc comments when public behavior changes.
-* Add a high-level changelog entry for user-facing changes according to the
-  repository's local changelog convention.
+* Add a high-level changelog entry for user-facing changes, under the `## Unreleased`
+  heading. The two changelogs are split by audience: the repository-root `CHANGELOG.md`
+  serves users of the Rust SDK, and `crates/sdk-core/CHANGELOG.md` serves users of the
+  other Temporal SDKs, whose workers and clients run on Core. The test is whether a user
+  of that SDK can observe the change — behavior, an option they set, a log or metric, a
+  different interaction with the server. Because the Rust SDK runs on Core too, a
+  user-observable change in Core behavior normally belongs in both files; an internal Rust
+  API change that a language SDK absorbs inside its own bridge is invisible to its users
+  and belongs in neither. Write each entry from the perspective of the file's audience,
+  wording a change that goes in both files separately for each. The comment at the top of
+  either file lists the available headings.
 * Describe what changed, why it changed, and what validation you ran.
 
 Run the relevant local checks when practical. CI must pass before a pull request can

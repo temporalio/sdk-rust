@@ -14,7 +14,6 @@ use temporalio_common::protos::temporal::api::{
     common::v1::WorkflowExecution, workflowservice::v1::ResetWorkflowExecutionRequest,
 };
 
-use temporalio_common::worker::WorkerTaskTypes;
 use temporalio_macros::{workflow, workflow_methods};
 use temporalio_sdk::{LocalActivityOptions, SyncWorkflowContext, WorkflowContext, WorkflowResult};
 use tokio::sync::Notify;
@@ -50,18 +49,18 @@ impl ResetMeWf {
 async fn reset_workflow() {
     let wf_name = "reset_me_wf";
     let mut starter = CoreWfStarter::new(wf_name);
-    starter.sdk_config.task_types = WorkerTaskTypes::workflow_only();
-    let mut worker = starter.worker().await;
-    worker.fetch_results = false;
 
     let notify = Arc::new(Notify::new());
     let notify_clone = notify.clone();
-    worker
+    starter
+        .sdk_config
         .register_workflow_with_factory(move || ResetMeWf {
             notify: notify_clone.clone(),
             post_reset_received: false,
         })
         .unwrap();
+    let mut worker = starter.worker().await;
+    worker.fetch_results = false;
 
     let task_queue = starter.get_task_queue().to_owned();
     let handle = worker
@@ -74,7 +73,7 @@ async fn reset_workflow() {
         .unwrap();
     let run_id = handle.info().run_id.clone().unwrap();
 
-    let mut client = starter.get_client().await;
+    let mut client = starter.get_core_client().await;
     let resetter_fut = async {
         notify.notified().await;
         // Do the reset
@@ -191,14 +190,7 @@ impl ResetRandomseedWf {
 async fn reset_randomseed() {
     let wf_name = "reset_randomseed";
     let mut starter = CoreWfStarter::new(wf_name);
-    starter.sdk_config.task_types = WorkerTaskTypes {
-        enable_workflows: true,
-        enable_local_activities: true,
-        enable_remote_activities: false,
-        enable_nexus: true,
-    };
-    let mut worker = starter.worker().await;
-    worker.fetch_results = false;
+    starter.sdk_config.register_activities(StdActivities);
 
     let did_fail = Arc::new(AtomicBool::new(false));
     let initial_random = Arc::new(OnceLock::new());
@@ -208,7 +200,8 @@ async fn reset_randomseed() {
     let notify_clone = notify.clone();
     let reset_started_for_wf = reset_started.clone();
     let saw_updated_random_for_wf = saw_updated_random.clone();
-    worker
+    starter
+        .sdk_config
         .register_workflow_with_factory(move || ResetRandomseedWf {
             did_fail: did_fail.clone(),
             initial_random: initial_random.clone(),
@@ -219,8 +212,8 @@ async fn reset_randomseed() {
             post_reset_received: false,
         })
         .unwrap();
-    worker.register_activities(StdActivities);
-
+    let mut worker = starter.worker().await;
+    worker.fetch_results = false;
     let task_queue = starter.get_task_queue().to_owned();
     let handle = worker
         .submit_workflow(
@@ -232,7 +225,7 @@ async fn reset_randomseed() {
         .unwrap();
     let run_id = handle.info().run_id.clone().unwrap();
 
-    let mut client = starter.get_client().await;
+    let mut client = starter.get_core_client().await;
     let client_fur = async {
         notify.notified().await;
         handle

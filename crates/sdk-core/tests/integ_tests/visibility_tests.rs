@@ -21,8 +21,8 @@ use tonic::IntoRequest;
 async fn client_list_open_closed_workflow_executions() {
     let wf_name = "client_list_open_closed_workflow_executions".to_owned();
     let mut starter = CoreWfStarter::new(&wf_name);
-    let core = starter.get_worker().await;
-    let mut client = starter.get_client().await;
+    let core = starter.get_core_worker().await;
+    let mut client = starter.get_core_client().await;
 
     let earliest = std::time::SystemTime::now();
     let latest = earliest + Duration::from_secs(60);

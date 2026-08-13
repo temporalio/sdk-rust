@@ -1,15 +1,12 @@
-use crate::common::{ActivationAssertionsInterceptor, CoreWfStarter, build_fake_sdk_intercepted};
+use crate::common::{ActivationAssertionsInterceptor, CoreWfStarter};
 use std::{sync::Arc, time::Duration};
 use temporalio_client::{
     UntypedWorkflow, WorkflowCancelOptions, WorkflowDescribeOptions, WorkflowStartOptions,
     errors::WorkflowGetResultError,
 };
-use temporalio_common::{
-    protos::{
-        coresdk::workflow_activation::{WorkflowActivationJob, workflow_activation_job},
-        temporal::api::enums::v1::{CommandType, WorkflowExecutionStatus},
-    },
-    worker::WorkerTaskTypes,
+use temporalio_common::protos::{
+    coresdk::workflow_activation::{WorkflowActivationJob, workflow_activation_job},
+    temporal::api::enums::v1::{CommandType, WorkflowExecutionStatus},
 };
 use temporalio_macros::{activities, workflow, workflow_methods};
 use temporalio_sdk::{
@@ -45,10 +42,12 @@ impl CancelledWf {
 async fn cancel_during_timer() {
     let wf_name = "cancel_during_timer";
     let mut starter = CoreWfStarter::new(wf_name);
-    starter.sdk_config.task_types = WorkerTaskTypes::workflow_only();
+    starter
+        .sdk_config
+        .register_workflow::<CancelledWf>()
+        .unwrap();
     let mut worker = starter.worker().await;
-    let client = starter.get_client().await;
-    worker.register_workflow::<CancelledWf>().unwrap();
+    let client = starter.get_core_client().await;
     let task_queue = starter.get_task_queue().to_owned();
     let wf_id = task_queue.clone();
     let wf_handle = worker
@@ -112,11 +111,11 @@ impl ShieldedCancellationWf {
 async fn detached_token_shields_work_after_workflow_cancellation() {
     let wf_name = "detached_token_shields_work_after_workflow_cancellation";
     let mut starter = CoreWfStarter::new(wf_name);
-    starter.sdk_config.task_types = WorkerTaskTypes::workflow_only();
-    let mut worker = starter.worker().await;
-    worker
+    starter
+        .sdk_config
         .register_workflow::<ShieldedCancellationWf>()
         .unwrap();
+    let mut worker = starter.worker().await;
     let task_queue = starter.get_task_queue().to_owned();
     let wf_handle = worker
         .submit_workflow(
@@ -270,11 +269,12 @@ async fn workflow_cancellation_propagates_to_operations() {
         .register_activities(CancellationPropagationActivities {
             started: started.clone(),
         });
-    let mut worker = starter.worker().await;
-    worker
+    starter
+        .sdk_config
         .register_workflow::<CancellationPropagationParent>()
         .unwrap();
-    worker
+    starter
+        .sdk_config
         .register_workflow_with_factory({
             let started = started.clone();
             move || CancellationPropagationChild {
@@ -282,6 +282,7 @@ async fn workflow_cancellation_propagates_to_operations() {
             }
         })
         .unwrap();
+    let mut worker = starter.worker().await;
 
     let task_queue = starter.get_task_queue().to_owned();
     let wf_handle = worker
@@ -365,7 +366,9 @@ async fn wf_completing_with_cancelled() {
             });
     });
 
-    let mut worker = build_fake_sdk_intercepted(mock_cfg, aai);
-    worker.register_workflow::<WfWithTimer>().unwrap();
+    let mut worker =
+        crate::common::build_fake_sdk_intercepted_with_options(mock_cfg, aai, |options| {
+            options.register_workflow::<WfWithTimer>().unwrap();
+        });
     worker.run().await.unwrap();
 }

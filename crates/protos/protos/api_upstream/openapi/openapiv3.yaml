@@ -15529,6 +15529,12 @@ components:
         requestId:
           type: string
           description: Used to de-dupe reset requests.
+        resetHeartbeat:
+          type: boolean
+          description: |-
+            Reset persisted heartbeat details.
+             Reset always resets the attempt counter. Passing this flag causes reset to additionally
+             discard any persisted heartbeat details.
     ResetActivityExecutionResponse:
       type: object
       properties: {}

@@ -657,19 +657,6 @@ pub struct WorkflowFetchHistoryOptions {
     pub rpc_options: RpcOptions,
 }
 
-/// Which lifecycle stage to wait for when starting an update.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub enum WorkflowUpdateWaitStage {
-    /// This stage is reached when the server receives the update to process.
-    /// This is currently an invalid value on start.
-    Admitted,
-    /// Wait until the update is accepted by the workflow (validator passed).
-    #[default]
-    Accepted,
-    /// Wait until the update has completed.
-    Completed,
-}
-
 /// Options for starting an update without waiting for completion.
 #[derive(Debug, Clone, Default, bon::Builder)]
 #[non_exhaustive]
@@ -678,9 +665,6 @@ pub struct WorkflowStartUpdateOptions {
     pub update_id: Option<String>,
     /// Headers to include with the update.
     pub header: Option<Header>,
-    /// The lifecycle stage to wait for before returning the handle.
-    #[builder(default)]
-    pub wait_for_stage: WorkflowUpdateWaitStage,
     /// Controls for the start-update RPC.
     #[builder(default)]
     pub rpc_options: RpcOptions,

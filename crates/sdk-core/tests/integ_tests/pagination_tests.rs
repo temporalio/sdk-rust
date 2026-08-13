@@ -1,4 +1,3 @@
-use crate::common::*;
 use std::sync::{
     Arc,
     atomic::{AtomicUsize, Ordering},
@@ -118,19 +117,23 @@ async fn weird_pagination_doesnt_drop_wft_events() {
         .times(1);
 
     let mh = MockPollCfg::from_resp_batches(wf_id, t, [ResponseType::Raw(wft_resp)], mock_client);
-    let mut worker = mock_sdk_cfg(mh, |cfg| {
-        cfg.max_cached_workflows = 2;
-        cfg.ignore_evicts_on_shutdown = false;
-    });
-
     let sig_ctr = Arc::new(AtomicUsize::new(0));
     let sig_ctr_clone = sig_ctr.clone();
-    worker
-        .register_workflow_with_factory(move || WeirdPaginationWf {
-            sig_ctr: sig_ctr_clone.clone(),
-            signal_count: 0,
-        })
-        .unwrap();
+    let mut worker = crate::common::mock_sdk_cfg_with_options(
+        mh,
+        |cfg| {
+            cfg.max_cached_workflows = 2;
+            cfg.ignore_evicts_on_shutdown = false;
+        },
+        |options| {
+            options
+                .register_workflow_with_factory(move || WeirdPaginationWf {
+                    sig_ctr: sig_ctr_clone.clone(),
+                    signal_count: 0,
+                })
+                .unwrap();
+        },
+    );
 
     worker.run_until_done().await.unwrap();
     assert_eq!(sig_ctr.load(Ordering::Acquire), 2);
@@ -263,19 +266,23 @@ async fn extreme_pagination_doesnt_drop_wft_events_worker() {
     wft_resp.started_event_id = 15;
 
     let mh = MockPollCfg::from_resp_batches(wf_id, t, [ResponseType::Raw(wft_resp)], mock_client);
-    let mut worker = mock_sdk_cfg(mh, |cfg| {
-        cfg.max_cached_workflows = 2;
-        cfg.ignore_evicts_on_shutdown = false;
-    });
-
     let sig_ctr = Arc::new(AtomicUsize::new(0));
     let sig_ctr_clone = sig_ctr.clone();
-    worker
-        .register_workflow_with_factory(move || ExtremePaginationWf {
-            sig_ctr: sig_ctr_clone.clone(),
-            signal_count: 0,
-        })
-        .unwrap();
+    let mut worker = crate::common::mock_sdk_cfg_with_options(
+        mh,
+        |cfg| {
+            cfg.max_cached_workflows = 2;
+            cfg.ignore_evicts_on_shutdown = false;
+        },
+        |options| {
+            options
+                .register_workflow_with_factory(move || ExtremePaginationWf {
+                    sig_ctr: sig_ctr_clone.clone(),
+                    signal_count: 0,
+                })
+                .unwrap();
+        },
+    );
 
     worker.run_until_done().await.unwrap();
     assert_eq!(sig_ctr.load(Ordering::Acquire), 6);
