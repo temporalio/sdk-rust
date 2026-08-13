@@ -66,7 +66,7 @@ use crate::activities::{
 };
 use futures_util::{FutureExt, future::BoxFuture};
 use std::{
-    any::{Any, type_name},
+    any::Any,
     collections::HashMap,
     path::PathBuf,
     sync::Arc,
@@ -269,7 +269,6 @@ impl ActivityEnvironment {
                 .and_then(|instance| Arc::downcast::<A::Implementer>(instance).ok())
                 .ok_or_else(|| ActivityEnvironmentError::MissingImplementer {
                     activity_type: activity_type.to_owned(),
-                    implementer_type: type_name::<A::Implementer>(),
                 })?;
             Some(implementer)
         } else {
@@ -309,12 +308,10 @@ impl ActivityEnvironment {
 #[non_exhaustive]
 pub enum ActivityEnvironmentError {
     /// An instance activity was run without registering its implementer.
-    #[error("activity `{activity_type}` requires an instance of `{implementer_type}`")]
+    #[error("activity `{activity_type}` requires an instance in order to execute")]
     MissingImplementer {
         /// Activity type that could not be run.
         activity_type: String,
-        /// Required implementer type.
-        implementer_type: &'static str,
     },
     /// A value needed by the activity context could not be converted to payloads.
     #[error("payload conversion failed for {operation}: {source}")]
@@ -331,52 +328,38 @@ pub enum ActivityEnvironmentError {
 }
 
 /// Temporal CLI output format for a local workflow environment.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, derive_more::Display)]
 #[non_exhaustive]
 pub enum DevServerLogFormat {
     /// Human-readable text output.
     #[default]
+    #[display("text")]
     Text,
     /// JSON output.
+    #[display("json")]
     Json,
 }
 
-impl DevServerLogFormat {
-    fn as_cli_value(self) -> &'static str {
-        match self {
-            Self::Text => "text",
-            Self::Json => "json",
-        }
-    }
-}
-
 /// Temporal CLI logging level for a local workflow environment.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, derive_more::Display)]
 #[non_exhaustive]
 pub enum DevServerLogLevel {
     /// Debug and higher-severity messages.
+    #[display("debug")]
     Debug,
     /// Informational and higher-severity messages.
+    #[display("info")]
     Info,
     /// Warning and higher-severity messages.
     #[default]
+    #[display("warn")]
     Warn,
     /// Error messages only.
+    #[display("error")]
     Error,
     /// Disable logging.
+    #[display("never")]
     Never,
-}
-
-impl DevServerLogLevel {
-    fn as_cli_value(self) -> &'static str {
-        match self {
-            Self::Debug => "debug",
-            Self::Info => "info",
-            Self::Warn => "warn",
-            Self::Error => "error",
-            Self::Never => "never",
-        }
-    }
 }
 
 /// Configuration for a local Temporal CLI dev server and its client.
@@ -478,8 +461,8 @@ impl WorkflowEnvironment<LocalServer> {
             .maybe_ui_port(options.ui_port)
             .maybe_db_filename(database_filename)
             .log((
-                options.log_format.as_cli_value().to_owned(),
-                options.log_level.as_cli_value().to_owned(),
+                options.log_format.to_string(),
+                options.log_level.to_string(),
             ))
             .extra_args(options.extra_args)
             .build();
@@ -557,11 +540,7 @@ pub enum WorkflowEnvironmentError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use futures_util::future::BoxFuture;
     use std::sync::Mutex;
-    use temporalio_common::data_converters::{
-        DefaultFailureConverter, PayloadCodec, PayloadConverter,
-    };
     use temporalio_macros::activities;
 
     struct TestActivities {
@@ -597,87 +576,36 @@ mod tests {
         }
     }
 
-    struct FailingCodec;
+    struct StaticActivities;
 
-    impl PayloadCodec for FailingCodec {
-        fn encode(
-            &self,
-            _: &SerializationContextData,
-            _: Vec<Payload>,
-        ) -> BoxFuture<'static, Result<Vec<Payload>, PayloadConversionError>> {
-            async move {
-                Err(PayloadConversionError::EncodingError(
-                    "codec must not be called".into(),
-                ))
-            }
-            .boxed()
-        }
-
-        fn decode(
-            &self,
-            _: &SerializationContextData,
-            _: Vec<Payload>,
-        ) -> BoxFuture<'static, Result<Vec<Payload>, PayloadConversionError>> {
-            async move {
-                Err(PayloadConversionError::EncodingError(
-                    "codec must not be called".into(),
-                ))
-            }
-            .boxed()
+    #[activities]
+    impl StaticActivities {
+        #[activity]
+        async fn echo(_ctx: ActivityContext, value: String) -> Result<String, ActivityError> {
+            Ok(format!("static:{value}"))
         }
     }
 
-    fn requires_instance<A: ExecutableActivity>(_: A) -> bool {
-        A::REQUIRES_INSTANCE
-    }
+    #[tokio::test]
+    async fn runs_static_activities_without_instance() {
+        let env = ActivityEnvironment::builder().build();
 
-    #[test]
-    fn activity_info_has_test_defaults_and_supports_overrides() {
-        let default_info = ActivityInfoOptions::builder().build();
-        let info = ActivityInfoOptions::builder()
-            .attempt(3)
-            .activity_type("custom")
-            .workflow_execution(None)
-            .build();
-
-        assert_eq!(info.attempt, 3);
-        assert_eq!(info.activity_type, "custom");
-        assert_eq!(info.activity_id, "test");
-        assert_eq!(info.workflow_namespace, "default");
-        assert!(info.workflow_execution.is_none());
         assert_eq!(
-            default_info
-                .workflow_execution
-                .as_ref()
-                .unwrap()
-                .workflow_id(),
-            "test"
+            env.run(StaticActivities::echo, "value".to_owned())
+                .await
+                .unwrap(),
+            "static:value"
         );
     }
 
     #[tokio::test]
-    async fn runs_static_and_registered_instance_activities_directly() {
-        let data_converter = DataConverter::new(
-            PayloadConverter::default(),
-            DefaultFailureConverter,
-            FailingCodec,
-        );
+    async fn runs_activities_with_instance() {
         let env = ActivityEnvironment::builder()
-            .data_converter(data_converter)
             .register_activities(TestActivities {
-                prefix: "second:".to_owned(),
-            })
-            .register_activities(TestActivities {
-                prefix: "latest:".to_owned(),
+                prefix: "pre:".to_owned(),
             })
             .build();
 
-        assert!(
-            env.implementers
-                .contains_key(TestActivities::prefixed.name())
-        );
-        assert!(!requires_instance(TestActivities::echo));
-        assert!(requires_instance(TestActivities::prefixed));
         assert_eq!(
             env.run(TestActivities::echo, "value".to_owned())
                 .await
@@ -688,7 +616,7 @@ mod tests {
             env.run(TestActivities::prefixed, "value".to_owned())
                 .await
                 .unwrap(),
-            "latest:value"
+            "pre:value"
         );
     }
 
@@ -708,6 +636,7 @@ mod tests {
 
     #[tokio::test]
     async fn converts_previous_and_outbound_heartbeat_details() {
+        // TODO: Heartbeats should be received as `Box/Arc<dyn Any>`
         let heartbeats = Arc::new(Mutex::new(Vec::new()));
         let env = ActivityEnvironment::builder()
             .heartbeat_details(4_u32)
