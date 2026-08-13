@@ -73,6 +73,7 @@ async fn otel_errors_logged_as_errors() {
         // Importantly, _not_ using subscriber override, is using console.
         .logging(Logger::Console {
             filter: construct_filter_string(Level::INFO, Level::WARN),
+            format: None,
         })
         .build();
 

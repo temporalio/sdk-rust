@@ -846,32 +846,77 @@ async fn worker_heartbeat_multiple_workers() {
     let mut worker_a = starter.worker().await;
 
     let mut starter_b = starter.clone_no_worker();
+    starter_b.workflow_options.workflow_id = format!("{wf_name}_b");
     let mut worker_b = starter_b.worker().await;
 
     let worker_a_key = worker_a.worker_instance_key().to_string();
     let worker_b_key = worker_b.worker_instance_key().to_string();
-    let initial_heartbeats = eventually(
+    let _ = starter
+        .start_with_worker(MultiWorkersWf::name(), &mut worker_a)
+        .await;
+    let _ = starter_b
+        .start_with_worker(MultiWorkersWf::name(), &mut worker_b)
+        .await;
+
+    let initial_heartbeats_fut = async {
+        eventually(
+            || {
+                let client = client.clone();
+                let worker_a_key = worker_a_key.clone();
+                let worker_b_key = worker_b_key.clone();
+                async move {
+                    let heartbeats = list_worker_heartbeats(&client, String::new()).await;
+                    let heartbeats: Vec<_> = heartbeats
+                        .into_iter()
+                        .filter(|heartbeat| {
+                            heartbeat.worker_instance_key == worker_a_key
+                                || heartbeat.worker_instance_key == worker_b_key
+                        })
+                        .collect();
+                    if heartbeats.len() == 2
+                        && heartbeats
+                            .iter()
+                            .all(|heartbeat| heartbeat.environment.is_some())
+                    {
+                        Ok(heartbeats)
+                    } else {
+                        Err("initial worker environments have not been recorded")
+                    }
+                }
+            },
+            Duration::from_secs(7),
+        )
+        .await
+        .unwrap()
+    };
+    let worker_a_run = worker_a.run_until_done();
+    let worker_b_run = worker_b.run_until_done();
+    let (initial_heartbeats, worker_a_result, worker_b_result) =
+        tokio::join!(initial_heartbeats_fut, worker_a_run, worker_b_run);
+    worker_a_result.unwrap();
+    worker_b_result.unwrap();
+
+    for heartbeat in &initial_heartbeats {
+        assert_worker_environment(heartbeat);
+    }
+
+    let all = eventually(
         || {
             let client = client.clone();
             let worker_a_key = worker_a_key.clone();
             let worker_b_key = worker_b_key.clone();
             async move {
                 let heartbeats = list_worker_heartbeats(&client, String::new()).await;
-                let heartbeats: Vec<_> = heartbeats
-                    .into_iter()
-                    .filter(|heartbeat| {
-                        heartbeat.worker_instance_key == worker_a_key
-                            || heartbeat.worker_instance_key == worker_b_key
+                let is_final = |worker_key: &str| {
+                    heartbeats.iter().any(|heartbeat| {
+                        heartbeat.worker_instance_key == worker_key
+                            && heartbeat.status == WorkerStatus::ShuttingDown as i32
                     })
-                    .collect();
-                if heartbeats.len() == 2
-                    && heartbeats
-                        .iter()
-                        .all(|heartbeat| heartbeat.environment.is_some())
-                {
+                };
+                if is_final(&worker_a_key) && is_final(&worker_b_key) {
                     Ok(heartbeats)
                 } else {
-                    Err("initial worker environments have not been recorded")
+                    Err("final worker heartbeats have not been recorded")
                 }
             }
         },
@@ -879,37 +924,6 @@ async fn worker_heartbeat_multiple_workers() {
     )
     .await
     .unwrap();
-    for heartbeat in &initial_heartbeats {
-        assert_worker_environment(heartbeat);
-    }
-
-    let _ = starter
-        .start_with_worker(MultiWorkersWf::name(), &mut worker_a)
-        .await;
-    worker_a.run_until_done().await.unwrap();
-
-    let _ = starter_b
-        .start_with_worker(MultiWorkersWf::name(), &mut worker_b)
-        .await;
-    worker_b.run_until_done().await.unwrap();
-
-    sleep(Duration::from_secs(2)).await;
-
-    let all = list_worker_heartbeats(&client, String::new()).await;
-    let keys: HashSet<_> = all
-        .iter()
-        .map(|hb| hb.worker_instance_key.clone())
-        .collect();
-    assert!(keys.contains(&worker_a_key));
-    assert!(keys.contains(&worker_b_key));
-    assert!(
-        all.iter()
-            .filter(|heartbeat| {
-                heartbeat.worker_instance_key == worker_a_key
-                    || heartbeat.worker_instance_key == worker_b_key
-            })
-            .all(|heartbeat| heartbeat.environment.is_none())
-    );
 
     // Verify both heartbeats contain the same shared worker_grouping_key
     let worker_grouping_keys: HashSet<_> = all
