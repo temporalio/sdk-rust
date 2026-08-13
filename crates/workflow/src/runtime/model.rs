@@ -214,8 +214,7 @@ pub type WorkflowResult<T> = Result<T, WorkflowTermination>;
 
 /// Represents ways a workflow can terminate without producing a normal result.
 ///
-/// Payload conversion errors returned by workflow operations may be handled at the operation
-/// boundary. Propagating one directly into `WorkflowTermination`, such as with `?`, will fail
+/// Payload conversion errors returned by workflow operations propagated directly into `WorkflowTermination`, such as with `?`, will fail
 /// the current Workflow Task so it can be retried.
 ///
 /// Wrap an error in an [`ApplicationFailure`] to explicitly fail the Workflow Execution.
