@@ -62,6 +62,8 @@ relevant information.
   `WorkerInterceptor::with_workflow_replay_worker`.
 
 ### Breaking Changes :boom:
+* `anyhow::Error` no longer converts directly into `WorkflowTermination`. Wrap an error in
+  `ApplicationFailure` to explicitly fail the Workflow Execution.
 * Removed `InterceptorWithNext`. Register worker interceptors as an ordered vector instead.
 * `Worker::run` now returns `WorkerRunError` instead of `anyhow::Error`.
   Non-validation failures are reported as `WorkerRunError::Fatal` with a message and source.

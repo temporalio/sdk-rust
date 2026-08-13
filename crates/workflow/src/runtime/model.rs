@@ -215,9 +215,10 @@ pub type WorkflowResult<T> = Result<T, WorkflowTermination>;
 /// Represents ways a workflow can terminate without producing a normal result.
 ///
 /// Payload conversion errors returned by workflow operations may be handled at the operation
-/// boundary. Propagating one directly into `WorkflowTermination`, such as with `?` will fail
-/// the current Workflow Task so it can be retried. Wrapping the conversion error in another
-/// error type instead produces the normal failure behavior for that wrapper.
+/// boundary. Propagating one directly into `WorkflowTermination`, such as with `?`, will fail
+/// the current Workflow Task so it can be retried.
+///
+/// Wrap an error in an [`ApplicationFailure`] to explicitly fail the Workflow Execution.
 #[derive(Debug, thiserror::Error)]
 pub enum WorkflowTermination {
     #[error("Workflow cancelled")]
@@ -241,12 +242,6 @@ impl WorkflowTermination {
     }
 }
 
-impl From<anyhow::Error> for WorkflowTermination {
-    fn from(err: anyhow::Error) -> Self {
-        Self::Failed(err.into())
-    }
-}
-
 impl From<WorkflowCancellationError> for WorkflowTermination {
     fn from(_value: WorkflowCancellationError) -> Self {
         Self::Cancelled
@@ -266,19 +261,6 @@ fn fail_workflow_task_on_payload_conversion(error: PayloadConversionError) -> ! 
 impl From<PayloadConversionError> for WorkflowTermination {
     fn from(value: PayloadConversionError) -> Self {
         fail_workflow_task_on_payload_conversion(value)
-    }
-}
-
-impl From<crate::runtime::entry::WorkflowError> for WorkflowTermination {
-    fn from(value: crate::runtime::entry::WorkflowError) -> Self {
-        match value {
-            crate::runtime::entry::WorkflowError::PayloadConversion(err) => Self::from(err),
-            crate::runtime::entry::WorkflowError::Execution(err) => Self::Failed(
-                temporalio_common_wasm::error::OutgoingWorkflowError::Application(Box::new(
-                    ApplicationFailure::new(err),
-                )),
-            ),
-        }
     }
 }
 
@@ -329,7 +311,6 @@ impl From<ChildWorkflowStartError> for WorkflowTermination {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::runtime::entry::WorkflowError;
     use rstest::rstest;
 
     fn conversion_error() -> PayloadConversionError {
@@ -338,7 +319,6 @@ mod tests {
 
     #[rstest]
     #[case::payload(conversion_error())]
-    #[case::workflow(WorkflowError::PayloadConversion(conversion_error()))]
     #[case::activity(ActivityExecutionError::Serialization(conversion_error()))]
     #[case::child_start(ChildWorkflowStartError::Serialization(conversion_error()))]
     #[case::child_execution(ChildWorkflowExecutionError::Serialization(conversion_error()))]

@@ -5,7 +5,7 @@ use temporalio_common::protos::{
     temporal::api::enums::v1::{CommandType, EventType},
 };
 use temporalio_macros::{workflow, workflow_methods};
-use temporalio_sdk::{WorkflowContext, WorkflowResult};
+use temporalio_sdk::{ApplicationFailure, WorkflowContext, WorkflowResult};
 use temporalio_sdk_core::{
     replay::{DEFAULT_WORKFLOW_TYPE, TestHistoryBuilder},
     test_help::MockPollCfg,
@@ -104,7 +104,7 @@ impl CancelSenderCanned {
         let handle = ctx.external_workflow("fake_wid", Some("fake_rid".into()));
         let res = handle.cancel(None).await;
         if res.is_err() {
-            Err(anyhow::anyhow!("Cancel fail!").into())
+            Err(ApplicationFailure::new("Cancel fail!").into())
         } else {
             Ok(())
         }

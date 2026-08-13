@@ -2,7 +2,6 @@ use crate::{
     common::{CoreWfStarter, WorkflowHandleExt, rand_6_chars},
     integ_tests::mk_nexus_endpoint,
 };
-use anyhow::anyhow;
 use assert_matches::assert_matches;
 use std::{
     sync::{
@@ -43,9 +42,9 @@ use temporalio_common::{
 };
 use temporalio_macros::{workflow, workflow_methods};
 use temporalio_sdk::{
-    CancellableFuture, NexusOperationCancellationType, NexusOperationOptions, SyncWorkflowContext,
-    WaitConditionOptions, WorkflowCancellationToken, WorkflowContext, WorkflowContextView,
-    WorkflowResult, WorkflowTermination,
+    ApplicationFailure, CancellableFuture, NexusOperationCancellationType, NexusOperationOptions,
+    SyncWorkflowContext, WaitConditionOptions, WorkflowCancellationToken, WorkflowContext,
+    WorkflowContextView, WorkflowResult, WorkflowTermination,
 };
 use temporalio_sdk_core::PollError;
 use tokio::{
@@ -304,7 +303,7 @@ impl AsyncCompleter {
                 ctx.cancelled().await;
                 Err(WorkflowTermination::Cancelled)
             }
-            _ => Err(anyhow!("broken").into()),
+            _ => Err(ApplicationFailure::new("broken").into()),
         }
     }
 }
