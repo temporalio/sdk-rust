@@ -34,6 +34,8 @@ relevant information.
 ## Unreleased
 
 ### Added
+* Support for running Standalone Activities in Rust SDK Worker.
+* Client methods for starting and managing execution of Standalone Activities. 
 * `LoggerFormat` for selecting compact, pretty, or JSON Core console log output. Configured log
   filters continue to apply to JSON output.
 * `RpcOptions::builder()` for constructing per-call RPC options.
@@ -64,6 +66,12 @@ relevant information.
   `WorkerInterceptor::with_workflow_replay_worker`.
 
 ### Breaking Changes :boom:
+* Changes to `ActivityInfo`: instead of `workflow_namespace`, `workflow_execution` and `run_id`,
+  there is now `namespace`, `workflow_id`, `workflow_run_id` and `activity_run_id`. 
+  Also, `workflow_type` is now `Option<String>`.
+* `ActivityIdentifier::ById` was split into 2 variants, `ByIdWorkflow` and `ByIdStandalone`.
+  `ActivityIdentifier::by_id` method was renamed to `by_id_workflow`, and `by_id_standalone`
+  was added.
 * `anyhow::Error` no longer converts directly into `WorkflowTermination`. Wrap an error in
   `ApplicationFailure` to explicitly fail the Workflow Execution.
 * `OutgoingWorkflowError` now has a dedicated `PayloadConversion` variant. Converting activity,
