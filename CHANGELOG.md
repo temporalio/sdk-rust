@@ -64,6 +64,10 @@ relevant information.
 ### Breaking Changes :boom:
 * `anyhow::Error` no longer converts directly into `WorkflowTermination`. Wrap an error in
   `ApplicationFailure` to explicitly fail the Workflow Execution.
+* `OutgoingWorkflowError` now has a dedicated `PayloadConversion` variant. Converting activity,
+  child-workflow, and signal errors lifts their payload-conversion variants into it.
+  `OutgoingError`, `OutgoingActivityError`, and `OutgoingWorkflowError` are now non-exhaustive;
+  downstream matches must include a wildcard arm.
 * Removed `InterceptorWithNext`. Register worker interceptors as an ordered vector instead.
 * `Worker::run` now returns `WorkerRunError` instead of `anyhow::Error`.
   Non-validation failures are reported as `WorkerRunError::Fatal` with a message and source.

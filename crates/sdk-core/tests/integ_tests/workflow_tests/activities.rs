@@ -42,6 +42,7 @@ use temporalio_common::{
             common::v1::{ActivityType, Payload, RetryPolicy},
             enums::v1::{CommandType, EventType, RetryState as ProtoRetryState},
             failure::v1::{ActivityFailureInfo, Failure, failure::FailureInfo},
+            history::v1::history_event::Attributes::WorkflowTaskFailedEventAttributes,
             sdk::v1::UserMetadata,
         },
     },
@@ -349,13 +350,25 @@ async fn propagated_activity_input_conversion_failure_fails_workflow_task() {
     handle.get_result(Default::default()).await.unwrap();
 
     let history = handle.fetch_history(Default::default()).await.unwrap();
-    assert_eq!(
-        history
-            .events()
-            .iter()
-            .filter(|event| event.event_type() == EventType::WorkflowTaskFailed)
-            .count(),
-        1
+    let workflow_task_failures: Vec<_> = history
+        .events()
+        .iter()
+        .filter(|event| event.event_type() == EventType::WorkflowTaskFailed)
+        .collect();
+    assert_eq!(workflow_task_failures.len(), 1);
+    let Some(WorkflowTaskFailedEventAttributes(attributes)) =
+        workflow_task_failures[0].attributes.as_ref()
+    else {
+        panic!("expected workflow task failed attributes");
+    };
+    let failure = attributes
+        .failure
+        .as_ref()
+        .expect("workflow task failure should include a failure");
+    assert!(
+        failure
+            .message
+            .contains("intentional activity input serialization failure")
     );
 }
 
