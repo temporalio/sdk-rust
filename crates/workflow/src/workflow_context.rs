@@ -3215,6 +3215,7 @@ mod tests {
     use temporalio_common_wasm::{
         RetryPolicy,
         data_converters::{TemporalDeserializable, TemporalSerializable},
+        error::OutgoingWorkflowError,
         protos::{
             coresdk::{
                 AsJsonPayloadExt, FromJsonPayloadExt,
@@ -4197,7 +4198,7 @@ mod tests {
     }
 
     #[test]
-    fn continue_as_new_reports_serialization_errors() {
+    fn continue_as_new_preserves_input_serialization_errors() {
         #[derive(Debug)]
         struct FailingInput;
 
@@ -4259,23 +4260,24 @@ mod tests {
         );
         let ctx = WorkflowContext::from_base(base, Rc::new(RefCell::new(FailingWorkflow)));
 
-        let err = ctx
+        let termination = ctx
             .continue_as_new(FailingInput, ContinueAsNewOptions::default())
-            .expect_err("serialization errors should be surfaced");
-
-        let WorkflowTermination::Failed(err) = err else {
-            panic!("expected failed termination, got {err:?}");
+            .expect_err("input serialization should fail");
+        let WorkflowTermination::Failed(OutgoingWorkflowError::PayloadConversion(err)) =
+            termination
+        else {
+            panic!("expected a payload conversion failure");
         };
         assert_eq!(err.to_string(), "Encoding error: serialization failure");
     }
 
     #[test]
-    fn continue_as_new_reports_memo_serialization_errors() {
+    fn continue_as_new_preserves_memo_serialization_errors() {
         let ctx = test_context();
         let mut memo = MemoValues::new();
         memo.insert("invalid", FailingMemoValue);
 
-        let err = ctx
+        let termination = ctx
             .continue_as_new(
                 7,
                 ContinueAsNewOptions {
@@ -4283,10 +4285,11 @@ mod tests {
                     ..Default::default()
                 },
             )
-            .expect_err("memo serialization errors should be surfaced");
-
-        let WorkflowTermination::Failed(err) = err else {
-            panic!("expected failed termination, got {err:?}");
+            .expect_err("memo serialization should fail");
+        let WorkflowTermination::Failed(OutgoingWorkflowError::PayloadConversion(err)) =
+            termination
+        else {
+            panic!("expected a payload conversion failure");
         };
         assert_eq!(
             err.to_string(),

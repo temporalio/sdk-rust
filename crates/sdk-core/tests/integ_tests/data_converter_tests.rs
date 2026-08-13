@@ -30,8 +30,8 @@ use temporalio_common::{
 };
 use temporalio_macros::{activities, workflow, workflow_methods};
 use temporalio_sdk::{
-    ActivityOptions, CancellableFuture, MemoValue, SyncWorkflowContext, WorkflowContext,
-    WorkflowContextView, WorkflowResult,
+    ActivityOptions, ApplicationFailure, CancellableFuture, MemoValue, SyncWorkflowContext,
+    WorkflowContext, WorkflowContextView, WorkflowResult,
     activities::{ActivityContext, ActivityError},
 };
 
@@ -296,7 +296,7 @@ struct WorkflowFailureFallbackWorkflow;
 impl WorkflowFailureFallbackWorkflow {
     #[run]
     async fn run(_ctx: &mut WorkflowContext<Self>) -> WorkflowResult<()> {
-        Err(anyhow::anyhow!(WORKFLOW_FAILURE_MESSAGE).into())
+        Err(ApplicationFailure::new(WORKFLOW_FAILURE_MESSAGE).into())
     }
 }
 

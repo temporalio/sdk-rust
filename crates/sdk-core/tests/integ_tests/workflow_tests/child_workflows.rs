@@ -1,5 +1,4 @@
 use crate::common::{CoreWfStarter, WorkflowHandleExt};
-use anyhow::anyhow;
 use assert_matches::assert_matches;
 use std::{sync::Arc, time::Duration};
 use temporalio_client::{WorkflowCancelOptions, WorkflowStartOptions};
@@ -33,9 +32,9 @@ use temporalio_common::{
 };
 use temporalio_macros::{workflow, workflow_methods};
 use temporalio_sdk::{
-    CancellableFuture, ChildWorkflowCancellationType, ChildWorkflowExecutionError,
-    ChildWorkflowOptions, ChildWorkflowStartError, ParentClosePolicy, SyncWorkflowContext,
-    WorkflowContext, WorkflowResult, WorkflowSignalError, WorkflowTermination,
+    ApplicationFailure, CancellableFuture, ChildWorkflowCancellationType,
+    ChildWorkflowExecutionError, ChildWorkflowOptions, ChildWorkflowStartError, ParentClosePolicy,
+    SyncWorkflowContext, WorkflowContext, WorkflowResult, WorkflowSignalError, WorkflowTermination,
 };
 use temporalio_sdk_core::{
     replay::{DEFAULT_WORKFLOW_TYPE, TestHistoryBuilder, canned_histories},
@@ -918,7 +917,9 @@ impl ParentWf {
         if let Expectation::StartFailure = expectation {
             match start_res {
                 Err(ChildWorkflowStartError::StartFailed { .. }) => return Ok(()),
-                _ => return Err(anyhow!("Expected start failure").into()),
+                _ => {
+                    return Err(ApplicationFailure::new("Expected start failure").into());
+                }
             }
         }
         let started = start_res?;
@@ -932,7 +933,7 @@ impl ParentWf {
                 assert_eq!(failure.workflow_type(), Some("child"));
                 Ok(())
             }
-            _ => Err(anyhow!("Unexpected child WF status").into()),
+            _ => Err(ApplicationFailure::new("Unexpected child WF status").into()),
         }
     }
 }
@@ -1034,7 +1035,7 @@ impl CancelBeforeSendWf {
         start.cancel();
         match start.await {
             Err(ChildWorkflowStartError::Cancelled(_)) => Ok(()),
-            _ => Err(anyhow!("Unexpected start status").into()),
+            _ => Err(ApplicationFailure::new("Unexpected start status").into()),
         }
     }
 }

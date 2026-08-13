@@ -18,7 +18,8 @@ use temporalio_sdk_core::replay::{DEFAULT_WORKFLOW_TYPE, TestHistoryBuilder};
 
 use temporalio_macros::{workflow, workflow_methods};
 use temporalio_sdk::{
-    CancellableFuture, ChildWorkflowOptions, SyncWorkflowContext, WorkflowContext, WorkflowResult,
+    ApplicationFailure, CancellableFuture, ChildWorkflowOptions, SyncWorkflowContext,
+    WorkflowContext, WorkflowResult,
 };
 use temporalio_sdk_core::test_help::MockPollCfg;
 use uuid::Uuid;
@@ -278,7 +279,7 @@ impl SignalSenderCanned {
             )
             .await;
         if res.is_err() {
-            Err(anyhow::anyhow!("Signal fail!").into())
+            Err(ApplicationFailure::new("Signal fail!").into())
         } else {
             Ok(())
         }

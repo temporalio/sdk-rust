@@ -64,6 +64,12 @@ relevant information.
   `WorkerInterceptor::with_workflow_replay_worker`.
 
 ### Breaking Changes :boom:
+* `anyhow::Error` no longer converts directly into `WorkflowTermination`. Wrap an error in
+  `ApplicationFailure` to explicitly fail the Workflow Execution.
+* `OutgoingWorkflowError` now has a dedicated `PayloadConversion` variant. Converting activity,
+  child-workflow, and signal errors lifts their payload-conversion variants into it.
+  `OutgoingError`, `OutgoingActivityError`, and `OutgoingWorkflowError` are now non-exhaustive;
+  downstream matches must include a wildcard arm.
 * Removed `InterceptorWithNext`. Register worker interceptors as an ordered vector instead.
 * `Worker::run` now returns `WorkerRunError` instead of `anyhow::Error`.
   Non-validation failures are reported as `WorkerRunError::Fatal` with a message and source.
@@ -115,6 +121,8 @@ relevant information.
   Non-validation failures are reported as `WorkerRunError::Fatal` with a message and source.
 
 ### Fixed
+* Unhandled workflow payload conversion errors now fail the Workflow Task so it can retry instead
+  of failing the Workflow Execution. Workflows may still explicitly handle these errors.
 * Workers no longer send worker heartbeats or appear in centralized heartbeat reports before
   `Worker::run` begins.
 * Local activity resolutions are now delivered to workflows as each activity completes instead of

@@ -59,7 +59,6 @@ use temporalio_common::{
 use temporalio_macros::{activities, workflow, workflow_methods};
 use temporalio_sdk::{
     ActivityOptions, LocalActivityOptions, WorkerOptions, WorkflowContext, WorkflowResult,
-    WorkflowTermination,
     activities::{ActivityContext, ActivityError},
     interceptors::WorkerInterceptor,
 };
@@ -433,8 +432,7 @@ async fn oversize_activity_result_fails_retryably_then_completes() {
                     })
                     .build(),
             )
-            .await
-            .map_err(|e| WorkflowTermination::from(anyhow::Error::from(e)))?;
+            .await?;
             Ok(())
         }
     }
@@ -518,8 +516,7 @@ async fn oversize_activity_heartbeat_fails_retryably_then_completes() {
                     })
                     .build(),
             )
-            .await
-            .map_err(|e| WorkflowTermination::from(anyhow::Error::from(e)))?;
+            .await?;
             Ok(())
         }
     }
@@ -657,8 +654,7 @@ async fn disabled_error_limit_lets_server_hard_fail() {
                     })
                     .build(),
             )
-            .await
-            .map_err(|e| WorkflowTermination::from(anyhow::Error::from(e)))?;
+            .await?;
             Ok(())
         }
     }

@@ -190,6 +190,9 @@ impl FailureConverter for DefaultFailureConverter {
             OutgoingError::Workflow(OutgoingWorkflowError::Application(app)) => {
                 app.encode_failure(payload_converter, context)
             }
+            OutgoingError::Workflow(OutgoingWorkflowError::PayloadConversion(err)) => {
+                Ok(encode_generic_application_failure(&err))
+            }
             OutgoingError::Workflow(OutgoingWorkflowError::ActivityExecution(activity)) => {
                 activity.encode_failure(payload_converter, context)
             }
