@@ -45,6 +45,7 @@ impl DrivenWorkflow {
         workflow_id: String,
         randomness_seed: u64,
         start_time: Timestamp,
+        originating_event_id: i64,
         attribs: WorkflowExecutionStartedEventAttributes,
     ) {
         debug!(run_id = %attribs.original_execution_run_id, "Driven WF start");
@@ -55,7 +56,14 @@ impl DrivenWorkflow {
             retry_policy: attribs.retry_policy.clone(),
         };
         self.send_job(
-            start_workflow_from_attribs(attribs, workflow_id, randomness_seed, start_time).into(),
+            start_workflow_from_attribs(
+                attribs,
+                workflow_id,
+                randomness_seed,
+                start_time,
+                originating_event_id,
+            )
+            .into(),
         );
         self.started_attrs = Some(started_info);
     }
@@ -89,12 +97,8 @@ impl DrivenWorkflow {
     /// from a buffer that the language side sinks into when it calls [crate::Core::complete_task]
     pub(super) fn fetch_workflow_iteration_output(&mut self) -> Vec<WFCommand> {
         let in_cmds = self.incoming_commands.try_recv();
-        let in_cmds = in_cmds.unwrap_or_else(|_| {
-            vec![WFCommand {
-                variant: WFCommandVariant::NoCommandsFromLang,
-                metadata: None,
-            }]
-        });
+        let in_cmds =
+            in_cmds.unwrap_or_else(|_| vec![WFCommand::new(WFCommandVariant::NoCommandsFromLang)]);
         debug!(in_cmds = %in_cmds.display(), "wf bridge iteration fetch");
         in_cmds
     }

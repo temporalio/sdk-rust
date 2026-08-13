@@ -89,7 +89,7 @@ pub mod coresdk {
             fn from(v: workflow_command::Variant) -> Self {
                 Self {
                     variant: Some(v),
-                    user_metadata: None,
+                    ..Default::default()
                 }
             }
         }
@@ -1307,13 +1307,16 @@ pub mod coresdk {
                 }
             }
 
-            impl From<WorkflowExecutionSignaledEventAttributes> for SignalWorkflow {
-                fn from(a: WorkflowExecutionSignaledEventAttributes) -> Self {
+            impl From<(WorkflowExecutionSignaledEventAttributes, i64)> for SignalWorkflow {
+                fn from(
+                    (a, originating_event_id): (WorkflowExecutionSignaledEventAttributes, i64),
+                ) -> Self {
                     Self {
                         signal_name: a.signal_name,
                         input: Vec::from_payloads(a.input),
                         identity: a.identity,
                         headers: a.header.map(Into::into).unwrap_or_default(),
+                        originating_event_id,
                     }
                 }
             }
@@ -1330,6 +1333,7 @@ pub mod coresdk {
                 workflow_id: String,
                 randomness_seed: u64,
                 start_time: Timestamp,
+                originating_event_id: i64,
             ) -> InitializeWorkflow {
                 InitializeWorkflow {
                     workflow_type: attrs.workflow_type.map(|wt| wt.name).unwrap_or_default(),
@@ -1363,6 +1367,8 @@ pub mod coresdk {
                     start_time: Some(start_time),
                     root_workflow: attrs.root_workflow_execution,
                     priority: attrs.priority,
+                    originating_event_id,
+                    original_execution_run_id: attrs.original_execution_run_id,
                 }
             }
         }

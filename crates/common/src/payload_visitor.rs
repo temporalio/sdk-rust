@@ -427,7 +427,7 @@ mod tests {
                             },
                             ..Default::default()
                         })),
-                        user_metadata: None,
+                        ..Default::default()
                     }],
                     ..Default::default()
                 },
@@ -566,7 +566,7 @@ mod tests {
                                     }),
                                 },
                             )),
-                            user_metadata: None,
+                            ..Default::default()
                         },
                         // ContinueAsNewWorkflowExecution command
                         WorkflowCommand {
@@ -586,7 +586,7 @@ mod tests {
                                     ..Default::default()
                                 },
                             )),
-                            user_metadata: None,
+                            ..Default::default()
                         },
                         // StartChildWorkflowExecution command
                         WorkflowCommand {
@@ -608,7 +608,7 @@ mod tests {
                                     ..Default::default()
                                 },
                             )),
-                            user_metadata: None,
+                            ..Default::default()
                         },
                     ],
                     ..Default::default()

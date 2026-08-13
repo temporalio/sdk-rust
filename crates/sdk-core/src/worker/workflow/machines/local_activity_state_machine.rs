@@ -731,6 +731,7 @@ impl WFMachinesAdapter for LocalActivityMachine {
                     };
                     let command = ProtoCommand {
                         user_metadata: self.shared_state.attrs.user_metadata.clone(),
+                        event_group_markers: self.shared_state.attrs.event_group_markers.clone(),
                         ..command::Attributes::RecordMarkerCommandAttributes(marker_data).into()
                     };
                     responses.push(MachineResponse::IssueNewCommand(command));

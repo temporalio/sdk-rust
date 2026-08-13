@@ -38,7 +38,7 @@ use temporalio_common::protos::{
         failure::v1::Failure,
         history::v1::{History, HistoryEvent, MarkerRecordedEventAttributes, history_event},
         query::v1::WorkflowQuery,
-        sdk::v1::UserMetadata,
+        sdk::v1::{EventGroupMarker, UserMetadata},
         workflowservice::v1::PollWorkflowTaskQueueResponse,
     },
     utilities::TryIntoOrNone,
@@ -323,6 +323,7 @@ pub(crate) struct ValidScheduleLA {
     pub(crate) local_retry_threshold: Duration,
     pub(crate) cancellation_type: ActivityCancellationType,
     pub(crate) user_metadata: Option<UserMetadata>,
+    pub(crate) event_group_markers: Vec<EventGroupMarker>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -355,6 +356,7 @@ impl ValidScheduleLA {
     pub(crate) fn from_schedule_la(
         v: ScheduleLocalActivity,
         user_metadata: Option<UserMetadata>,
+        event_group_markers: Vec<EventGroupMarker>,
     ) -> Result<Self, anyhow::Error> {
         let original_schedule_time = v
             .original_schedule_time
@@ -431,6 +433,7 @@ impl ValidScheduleLA {
             local_retry_threshold,
             cancellation_type,
             user_metadata,
+            event_group_markers,
         })
     }
 }

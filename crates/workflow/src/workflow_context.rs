@@ -2525,6 +2525,7 @@ impl Future for LATimerBackoffFut {
                     .expect("duration converts ok"),
                 cancellation_token: Some(self.cancellation_token.clone()),
                 summary: None,
+                event_group_markers: vec![],
             });
             self.timer_fut = Some(Box::pin(timer_f));
             self.next_attempt = b.attempt;
@@ -3449,6 +3450,7 @@ mod tests {
             duration: Duration::from_secs(1),
             cancellation_token: Some(token.clone()),
             summary: None,
+            event_group_markers: vec![],
         });
 
         let mut activity_options = ActivityOptions::start_to_close_timeout(Duration::from_secs(1));

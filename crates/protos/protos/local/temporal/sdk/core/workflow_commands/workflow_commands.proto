@@ -15,6 +15,7 @@ import "temporal/api/common/v1/message.proto";
 import "temporal/api/enums/v1/workflow.proto";
 import "temporal/api/failure/v1/message.proto";
 import "temporal/api/sdk/v1/user_metadata.proto";
+import "temporal/api/sdk/v1/event_group_marker.proto";
 import "temporal/sdk/core/child_workflow/child_workflow.proto";
 import "temporal/sdk/core/nexus/nexus.proto";
 import "temporal/sdk/core/common/common.proto";
@@ -24,6 +25,11 @@ message WorkflowCommand {
     // Lang layers are expected to expose the setting of the internals of this metadata on a
     // per-command basis where applicable.
     temporal.api.sdk.v1.UserMetadata user_metadata = 100;
+
+    // Event group markers attached to the command. These are forwarded onto
+    // the corresponding server-side Command, and consequently surfaced on the
+    // resulting HistoryEvent. See `temporal/api/sdk/v1/event_group_marker.proto`.
+    repeated temporal.api.sdk.v1.EventGroupMarker event_group_markers = 101;
 
     oneof variant {
         StartTimer start_timer = 1;

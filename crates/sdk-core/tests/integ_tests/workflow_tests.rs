@@ -6,6 +6,7 @@ mod client_interactions;
 mod continue_as_new;
 mod determinism;
 mod eager;
+mod event_groups;
 mod interceptors;
 mod local_activities;
 mod modify_wf_properties;

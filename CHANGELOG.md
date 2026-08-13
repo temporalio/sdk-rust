@@ -58,6 +58,7 @@ relevant information.
   `TEMPORAL_WORKFLOW_TASK_DURATION_WARN_SECONDS` to change the threshold.
 * `SignalWorkflowOptions::summary` attaches a single-line summary to a signal sent to another
   workflow, which the UI and CLI display alongside the resulting history event.
+* Core now supports attaching `EventGroupMarker`s to various workflow commands.
 
 ### Changed
 * Cancellation errors propagated after workflow cancellation now complete the workflow as cancelled
