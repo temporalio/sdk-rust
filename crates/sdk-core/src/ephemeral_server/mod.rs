@@ -203,20 +203,18 @@ pub struct EphemeralServer {
 
 impl EphemeralServer {
     async fn start(config: EphemeralServerConfig) -> anyhow::Result<EphemeralServer> {
-        // Start process
-        let child = tokio::process::Command::new(config.exe_path)
+        // Start process. kill_on_drop ensures the process cannot outlive this
+        // handle if start fails before an EphemeralServer (whose shutdown is
+        // the normal kill path) is returned to the caller.
+        let mut child = tokio::process::Command::new(config.exe_path)
             .args(config.args)
             .stdin(Stdio::null())
             .stdout(config.output)
             .stderr(config.err_output)
+            .kill_on_drop(true)
             .spawn()?;
         let target = format!("127.0.0.1:{}", config.port);
         let target_url = format!("http://{target}");
-        let success = Ok(EphemeralServer {
-            target,
-            has_test_service: config.has_test_service,
-            child,
-        });
 
         let connection_options = ConnectionOptions::new(Url::parse(&target_url)?)
             .identity("online_checker".to_owned())
@@ -234,9 +232,17 @@ impl EphemeralServer {
             if let Err(err) = connect_res {
                 last_error = Some(err);
             } else {
-                return success;
+                return Ok(EphemeralServer {
+                    target,
+                    has_test_service: config.has_test_service,
+                    child,
+                });
             }
         }
+        // Kill the process explicitly (rather than relying on kill_on_drop,
+        // which does not wait for the kill to complete) so it cannot linger
+        // holding inherited stdout/stderr pipes.
+        let _ = child.kill().await;
         Err(anyhow!(
             "Failed connecting to test server after 5 seconds, last error: {last_error:?}"
         ))
@@ -381,6 +387,8 @@ impl EphemeralExe {
                     }
                     EphemeralExeVersion::Fixed(version) => version,
                 };
+                // The download client resolves its rustls provider from the process default.
+                temporalio_common::telemetry::ensure_default_crypto_provider();
                 let client = reqwest::Client::new();
                 let resp = client
                     .get(format!(
@@ -635,13 +643,62 @@ fn remove_file_past_ttl(ttl: &Option<Duration>, dest: &PathBuf) -> Result<bool, 
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    use super::{EphemeralServer, EphemeralServerConfig};
     use super::{get_free_port, remove_file_past_ttl};
+    #[cfg(unix)]
+    use std::process::Stdio;
     use std::{
         env::temp_dir,
         fs::File,
         net::{TcpListener, TcpStream},
         time::{Duration, SystemTime},
     };
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[ignore = "takes ~5s: must exhaust EphemeralServer::start's connect-retry window"]
+    async fn failed_start_kills_server_process() {
+        let pid_file = temp_dir().join(format!("core-test-pid-{}", rand::random::<u64>()));
+
+        // Stand in for a server that starts but never begins listening: it
+        // records its own PID and sleeps. `exec` keeps the PID stable.
+        let config = EphemeralServerConfig {
+            exe_path: "/bin/sh".into(),
+            port: get_free_port("127.0.0.1").unwrap(),
+            args: vec![
+                "-c".to_owned(),
+                format!("echo $$ > '{}'; exec sleep 60", pid_file.display()),
+            ],
+            has_test_service: false,
+            output: Stdio::null(),
+            err_output: Stdio::null(),
+        };
+
+        let result = EphemeralServer::start(config).await;
+        assert!(
+            result.is_err(),
+            "start against a non-listening exe must fail"
+        );
+
+        let pid: u32 = std::fs::read_to_string(&pid_file)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        std::fs::remove_file(&pid_file).ok();
+
+        // Signal 0 probes for existence without delivering a signal
+        let alive = std::process::Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .status()
+            .unwrap()
+            .success();
+        assert!(
+            !alive,
+            "ephemeral server process {pid} leaked after failed start"
+        );
+    }
 
     #[test]
     fn get_free_port_can_bind_immediately() {

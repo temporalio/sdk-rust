@@ -24,7 +24,6 @@ pub(crate) async fn priority_values_sent_to_server() {
         fairness_key: Some("fair-wf".to_string()),
         fairness_weight: Some(4.2),
     };
-    let mut worker = starter.worker().await;
     let child_type = "child-wf";
 
     struct PriorityActivities;
@@ -107,13 +106,16 @@ pub(crate) async fn priority_values_sent_to_server() {
         }
     }
 
-    worker.register_activities(PriorityActivities);
-    worker
+    starter
+        .sdk_config
+        .register_activities(PriorityActivities)
         .register_workflow_with_factory::<ParentWf, _>(move || ParentWf {
             child_type: child_type.to_owned(),
         })
+        .unwrap()
+        .register_workflow::<ChildWf>()
         .unwrap();
-    worker.register_workflow::<ChildWf>().unwrap();
+    let mut worker = starter.worker().await;
 
     worker
         .submit_workflow(ParentWf::run, (), starter.workflow_options.clone())
@@ -121,7 +123,7 @@ pub(crate) async fn priority_values_sent_to_server() {
         .unwrap();
     worker.run_until_done().await.unwrap();
 
-    let client = starter.get_client().await;
+    let client = starter.get_core_client().await;
     let handle = client.get_workflow_handle::<UntypedWorkflow>(starter.get_task_queue());
     handle
         .get_result(WorkflowGetResultOptions::default())

@@ -497,6 +497,10 @@ async fn idle_activity_worker_reports_zero_slots_used() {
     starter.sdk_config.register_activities(BlockingActivity {
         finish: finish_activity.clone(),
     });
+    starter
+        .sdk_config
+        .register_workflow::<OneActivity>()
+        .unwrap();
     let mut worker = starter.worker().await;
 
     #[workflow]
@@ -519,7 +523,6 @@ async fn idle_activity_worker_reports_zero_slots_used() {
         }
     }
 
-    worker.register_workflow::<OneActivity>().unwrap();
     let task_queue = starter.get_task_queue().to_owned();
     let handle = worker
         .submit_workflow(
@@ -586,7 +589,7 @@ async fn query_of_closed_workflow_doesnt_tick_terminal_metric(
         CoreWfStarter::new_with_runtime("query_of_closed_workflow_doesnt_tick_terminal_metric", rt);
     // Disable cache to ensure replay happens completely
     starter.sdk_config.max_cached_workflows = 0_usize;
-    let worker = starter.get_worker().await;
+    let worker = starter.get_core_worker().await;
     let run_id = starter.start_wf().await;
     let task = worker.poll_workflow_activation().await.unwrap();
     // Fail wf task
@@ -640,7 +643,7 @@ async fn query_of_closed_workflow_doesnt_tick_terminal_metric(
         .unwrap();
 
     // Query the now-closed workflow
-    let client = starter.get_client().await;
+    let client = starter.get_core_client().await;
     let queryer = async {
         WorkflowExecutionInfo {
             namespace: client.namespace(),
@@ -754,7 +757,7 @@ async fn latency_metrics(
     ));
     let rt = CoreRuntime::new_assume_tokio(get_integ_runtime_options(telemopts)).unwrap();
     let mut starter = CoreWfStarter::new_with_runtime("latency_metrics", rt);
-    let worker = starter.get_worker().await;
+    let worker = starter.get_core_worker().await;
     starter.start_wf().await;
     // Immediately finish workflow
     let task = worker.poll_workflow_activation().await.unwrap();
@@ -935,7 +938,7 @@ async fn docker_metrics_with_prometheus(
     let rt = CoreRuntime::new_assume_tokio(get_integ_runtime_options(telemopts)).unwrap();
     let test_name = "docker_metrics_with_prometheus";
     let mut starter = CoreWfStarter::new_with_runtime(test_name, rt);
-    let worker = starter.get_worker().await;
+    let worker = starter.get_core_worker().await;
     starter.start_wf().await;
 
     // Immediately finish the workflow
@@ -948,7 +951,7 @@ async fn docker_metrics_with_prometheus(
         .await
         .unwrap();
 
-    let client = starter.get_client().await;
+    let client = starter.get_core_client().await;
     WorkflowService::list_namespaces(
         &mut client.clone(),
         ListNamespacesRequest::default().into_request(),
@@ -1018,6 +1021,10 @@ async fn activity_metrics() {
     }
 
     starter.sdk_config.register_activities(PassFailActivities);
+    starter
+        .sdk_config
+        .register_workflow::<ActivityMetricsWf>()
+        .unwrap();
     let mut worker = starter.worker().await;
 
     #[workflow]
@@ -1083,7 +1090,6 @@ async fn activity_metrics() {
         }
     }
 
-    worker.register_workflow::<ActivityMetricsWf>().unwrap();
     let task_queue = starter.get_task_queue().to_owned();
     let workflow_id = wf_name.to_owned();
     worker
@@ -1156,17 +1162,21 @@ async fn nexus_metrics() {
     let rt = CoreRuntime::new_assume_tokio(get_integ_runtime_options(telemopts)).unwrap();
     let wf_name = "nexus_metrics";
     let mut starter = CoreWfStarter::new_with_runtime(wf_name, rt);
-    starter.sdk_config.task_types = WorkerTaskTypes {
+    starter.set_core_task_types(WorkerTaskTypes {
         enable_workflows: true,
         enable_local_activities: false,
         enable_remote_activities: false,
         enable_nexus: true,
-    };
+    });
     // Nexus operation handling involves internal async coordination that can
     // trigger false positives in nondeterminism detection.
     starter.sdk_config.detect_nondeterministic_futures = false;
+    starter
+        .sdk_config
+        .register_workflow::<NexusMetricsWf>()
+        .unwrap();
     let mut worker = starter.worker().await;
-    let core_worker = starter.get_worker().await;
+    let core_worker = starter.get_core_worker().await;
     let endpoint = mk_nexus_endpoint(&mut starter).await;
 
     #[workflow]
@@ -1211,7 +1221,6 @@ async fn nexus_metrics() {
         }
     }
 
-    worker.register_workflow::<NexusMetricsWf>().unwrap();
     let task_queue = starter.get_task_queue().to_owned();
     let workflow_id = wf_name.to_owned();
     worker
@@ -1349,7 +1358,10 @@ async fn evict_on_complete_does_not_count_as_forced_eviction() {
     let rt = CoreRuntime::new_assume_tokio(get_integ_runtime_options(telemopts)).unwrap();
     let wf_name = "evict_on_complete_does_not_count_as_forced_eviction";
     let mut starter = CoreWfStarter::new_with_runtime(wf_name, rt);
-    starter.sdk_config.task_types = WorkerTaskTypes::workflow_only();
+    starter
+        .sdk_config
+        .register_workflow::<EvictOnCompleteWf>()
+        .unwrap();
     let mut worker = starter.worker().await;
 
     #[workflow]
@@ -1364,7 +1376,6 @@ async fn evict_on_complete_does_not_count_as_forced_eviction() {
         }
     }
 
-    worker.register_workflow::<EvictOnCompleteWf>().unwrap();
     let task_queue = starter.get_task_queue().to_owned();
     let workflow_id = wf_name.to_owned();
     worker
@@ -1441,13 +1452,16 @@ async fn metrics_available_from_custom_slot_supplier() {
     let rt = CoreRuntime::new_assume_tokio(get_integ_runtime_options(telemopts)).unwrap();
     let mut starter =
         CoreWfStarter::new_with_runtime("metrics_available_from_custom_slot_supplier", rt);
-    starter.sdk_config.task_types = WorkerTaskTypes::workflow_only();
     let mut tb = TunerBuilder::default();
     tb.workflow_slot_supplier(Arc::new(MetricRecordingSlotSupplier::<WorkflowSlotKind> {
         inner: FixedSizeSlotSupplier::new(5),
         metrics: OnceLock::new(),
     }));
     starter.sdk_config.tuner = Arc::new(tb.build());
+    starter
+        .sdk_config
+        .register_workflow::<CustomSlotSupplierWf>()
+        .unwrap();
     let mut worker = starter.worker().await;
 
     #[workflow]
@@ -1462,7 +1476,6 @@ async fn metrics_available_from_custom_slot_supplier() {
         }
     }
 
-    worker.register_workflow::<CustomSlotSupplierWf>().unwrap();
     let task_queue = starter.get_task_queue().to_owned();
     worker
         .submit_workflow(
@@ -1619,7 +1632,10 @@ async fn sticky_queue_label_strategy(
     let mut starter = CoreWfStarter::new_with_runtime(&wf_name, rt);
     // Enable sticky queues by setting a reasonable cache size
     starter.sdk_config.max_cached_workflows = 10_usize;
-    starter.sdk_config.task_types = WorkerTaskTypes::workflow_only();
+    starter
+        .sdk_config
+        .register_workflow::<StickyQueueLabelStrategyWf>()
+        .unwrap();
     let mut worker = starter.worker().await;
 
     #[workflow]
@@ -1635,9 +1651,6 @@ async fn sticky_queue_label_strategy(
         }
     }
 
-    worker
-        .register_workflow::<StickyQueueLabelStrategyWf>()
-        .unwrap();
     let task_queue = starter.get_task_queue().to_owned();
     worker
         .submit_workflow(
@@ -1705,10 +1718,13 @@ async fn resource_based_tuner_metrics() {
     let rt = CoreRuntime::new_assume_tokio(get_integ_runtime_options(telemopts)).unwrap();
     let wf_name = "resource_based_tuner_metrics";
     let mut starter = CoreWfStarter::new_with_runtime(wf_name, rt);
-    starter.sdk_config.task_types = WorkerTaskTypes::workflow_only();
     // Create a resource-based tuner with reasonable thresholds
     let tuner = ResourceBasedTuner::new(0.8, 0.8);
     starter.sdk_config.tuner = Arc::new(tuner);
+    starter
+        .sdk_config
+        .register_workflow::<ResourceBasedTunerMetricsWf>()
+        .unwrap();
 
     let mut worker = starter.worker().await;
 
@@ -1725,9 +1741,6 @@ async fn resource_based_tuner_metrics() {
         }
     }
 
-    worker
-        .register_workflow::<ResourceBasedTunerMetricsWf>()
-        .unwrap();
     let task_queue = starter.get_task_queue().to_owned();
     let workflow_id = wf_name.to_owned();
     worker

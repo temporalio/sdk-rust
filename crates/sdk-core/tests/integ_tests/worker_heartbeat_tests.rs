@@ -238,8 +238,6 @@ async fn docker_worker_heartbeat_basic(#[values("otel", "prom", "no_metrics")] b
         acts_started: acts_started.clone(),
         acts_done: acts_done.clone(),
     });
-    let mut worker = starter.worker().await;
-    let worker_instance_key = worker.worker_instance_key();
 
     #[workflow]
     #[derive(Default)]
@@ -261,7 +259,12 @@ async fn docker_worker_heartbeat_basic(#[values("otel", "prom", "no_metrics")] b
         }
     }
 
-    worker.register_workflow::<HeartbeatBasicWf>().unwrap();
+    starter
+        .sdk_config
+        .register_workflow::<HeartbeatBasicWf>()
+        .unwrap();
+    let mut worker = starter.worker().await;
+    let worker_instance_key = worker.worker_instance_key();
 
     starter
         .start_with_worker(HeartbeatBasicWf::name(), &mut worker)
@@ -274,7 +277,7 @@ async fn docker_worker_heartbeat_basic(#[values("otel", "prom", "no_metrics")] b
         // Give enough time to ensure heartbeat interval has been hit
         tokio::time::sleep(Duration::from_millis(1500)).await;
         acts_started.notified().await;
-        let client = starter.get_client().await;
+        let client = starter.get_core_client().await;
         let mut raw_client = client.clone();
         let workers_list = WorkflowService::list_workers(
             &mut raw_client,
@@ -413,8 +416,6 @@ async fn docker_worker_heartbeat_tuner() {
     });
     starter.sdk_config.tuner = Arc::new(tuner);
     starter.sdk_config.register_activities(StdActivities);
-    let mut worker = starter.worker().await;
-    let worker_instance_key = worker.worker_instance_key();
 
     #[workflow]
     #[derive(Default)]
@@ -436,14 +437,19 @@ async fn docker_worker_heartbeat_tuner() {
         }
     }
 
-    worker.register_workflow::<HeartbeatTunerWf>().unwrap();
+    starter
+        .sdk_config
+        .register_workflow::<HeartbeatTunerWf>()
+        .unwrap();
+    let mut worker = starter.worker().await;
+    let worker_instance_key = worker.worker_instance_key();
 
     starter
         .start_with_worker(HeartbeatTunerWf::name(), &mut worker)
         .await;
     worker.run_until_done().await.unwrap();
 
-    let client = starter.get_client().await;
+    let client = starter.get_core_client().await;
     let mut raw_client = client.clone();
     let workers_list = WorkflowService::list_workers(
         &mut raw_client,
@@ -693,15 +699,6 @@ async fn worker_heartbeat_sticky_cache_miss() {
         .sdk_config
         .register_activities(StickyCacheActivities);
 
-    let mut worker = starter.worker().await;
-    worker.fetch_results = false;
-    let worker_key = worker.worker_instance_key().to_string();
-    let worker_core = worker.core_worker();
-    let submitter = worker.get_submitter_handle();
-    let wf_opts = starter.workflow_options.clone();
-    let client = starter.get_client().await;
-    let client_for_orchestrator = client.clone();
-
     #[workflow]
     #[derive(Default)]
     struct StickyCacheMissWf;
@@ -723,7 +720,18 @@ async fn worker_heartbeat_sticky_cache_miss() {
         }
     }
 
-    worker.register_workflow::<StickyCacheMissWf>().unwrap();
+    starter
+        .sdk_config
+        .register_workflow::<StickyCacheMissWf>()
+        .unwrap();
+    let mut worker = starter.worker().await;
+    worker.fetch_results = false;
+    let worker_key = worker.worker_instance_key().to_string();
+    let worker_core = worker.core_worker();
+    let submitter = worker.get_submitter_handle();
+    let wf_opts = starter.workflow_options.clone();
+    let client = starter.get_core_client().await;
+    let client_for_orchestrator = client.clone();
 
     let wf1_id = format!("{wf_name}_wf1");
     let wf2_id = format!("{wf_name}_wf2");
@@ -814,8 +822,12 @@ async fn worker_heartbeat_multiple_workers() {
     starter.sdk_config.max_cached_workflows = 5_usize;
     starter.sdk_config.tuner = Arc::new(TunerHolder::fixed_size(5, 10, 10, 10));
     starter.sdk_config.register_activities(StdActivities);
+    starter
+        .sdk_config
+        .register_workflow::<MultiWorkersWf>()
+        .unwrap();
 
-    let client = starter.get_client().await;
+    let client = starter.get_core_client().await;
     let starting_hb_len = list_worker_heartbeats(&client, String::new()).await.len();
 
     #[workflow]
@@ -832,11 +844,9 @@ async fn worker_heartbeat_multiple_workers() {
     }
 
     let mut worker_a = starter.worker().await;
-    worker_a.register_workflow::<MultiWorkersWf>().unwrap();
 
     let mut starter_b = starter.clone_no_worker();
     let mut worker_b = starter_b.worker().await;
-    worker_b.register_workflow::<MultiWorkersWf>().unwrap();
 
     let worker_a_key = worker_a.worker_instance_key().to_string();
     let worker_b_key = worker_b.worker_instance_key().to_string();
@@ -986,9 +996,6 @@ async fn worker_heartbeat_failure_metrics() {
 
     starter.sdk_config.register_activities(FailingActivities);
 
-    let mut worker = starter.worker().await;
-    let worker_instance_key = worker.worker_instance_key();
-
     #[workflow]
     #[derive(Default)]
     struct FailureMetricsWf {
@@ -1030,7 +1037,12 @@ async fn worker_heartbeat_failure_metrics() {
         }
     }
 
-    worker.register_workflow::<FailureMetricsWf>().unwrap();
+    starter
+        .sdk_config
+        .register_workflow::<FailureMetricsWf>()
+        .unwrap();
+    let mut worker = starter.worker().await;
+    let worker_instance_key = worker.worker_instance_key();
 
     let worker_key = worker_instance_key.to_string();
     let task_queue = starter.get_task_queue().to_owned();
@@ -1052,7 +1064,7 @@ async fn worker_heartbeat_failure_metrics() {
     let query = format!("WorkerInstanceKey=\"{worker_key}\"");
     let test_fut = async {
         ACT_FAIL.notified().await;
-        let client = starter.get_client().await;
+        let client = starter.get_core_client().await;
         eventually(
             || async {
                 let heartbeats = list_worker_heartbeats(&client, query.clone()).await;
@@ -1106,7 +1118,7 @@ async fn worker_heartbeat_failure_metrics() {
     };
     tokio::join!(test_fut, runner);
 
-    let client = starter.get_client().await;
+    let client = starter.get_core_client().await;
     let mut heartbeats = list_worker_heartbeats(&client, query).await;
     assert_eq!(heartbeats.len(), 1);
     let heartbeat = heartbeats.pop().unwrap();
@@ -1129,8 +1141,6 @@ async fn worker_heartbeat_no_runtime_heartbeat() {
     let rt = CoreRuntime::new_assume_tokio(runtimeopts).unwrap();
     let mut starter = CoreWfStarter::new_with_runtime(wf_name, rt);
     starter.sdk_config.register_activities(StdActivities);
-    let mut worker = starter.worker().await;
-    let worker_instance_key = worker.worker_instance_key();
 
     #[workflow]
     #[derive(Default)]
@@ -1152,14 +1162,19 @@ async fn worker_heartbeat_no_runtime_heartbeat() {
         }
     }
 
-    worker.register_workflow::<NoRuntimeHeartbeatWf>().unwrap();
+    starter
+        .sdk_config
+        .register_workflow::<NoRuntimeHeartbeatWf>()
+        .unwrap();
+    let mut worker = starter.worker().await;
+    let worker_instance_key = worker.worker_instance_key();
 
     starter
         .start_with_worker(NoRuntimeHeartbeatWf::name(), &mut worker)
         .await;
 
     worker.run_until_done().await.unwrap();
-    let client = starter.get_client().await;
+    let client = starter.get_core_client().await;
     let mut raw_client = client.clone();
     let workers_list = WorkflowService::list_workers(
         &mut raw_client,
@@ -1201,6 +1216,10 @@ async fn worker_heartbeat_skip_client_worker_set_check() {
     let mut starter = CoreWfStarter::new_with_runtime(wf_name, rt);
     starter.set_core_cfg_mutator(|m| m.skip_client_worker_set_check = true);
     starter.sdk_config.register_activities(StdActivities);
+    starter
+        .sdk_config
+        .register_workflow::<SkipClientWorkerSetCheckWf>()
+        .unwrap();
     let mut worker = starter.worker().await;
     let worker_instance_key = worker.worker_instance_key();
 
@@ -1224,16 +1243,12 @@ async fn worker_heartbeat_skip_client_worker_set_check() {
         }
     }
 
-    worker
-        .register_workflow::<SkipClientWorkerSetCheckWf>()
-        .unwrap();
-
     starter
         .start_with_worker(SkipClientWorkerSetCheckWf::name(), &mut worker)
         .await;
 
     worker.run_until_done().await.unwrap();
-    let client = starter.get_client().await;
+    let client = starter.get_core_client().await;
     let mut raw_client = client.clone();
     let workers_list = WorkflowService::list_workers(
         &mut raw_client,

@@ -45,7 +45,7 @@ use tracing::info;
 async fn can_use_retry_client() {
     // Not terribly interesting by itself but can be useful for manually inspecting metrics etc
     let mut core = CoreWfStarter::new("retry_client");
-    let retry_client = core.get_client().await;
+    let retry_client = core.get_core_client().await;
     for _ in 0..10 {
         WorkflowService::list_namespaces(
             &mut retry_client.clone(),
@@ -706,7 +706,7 @@ async fn update_get_result_retries_on_empty_outcome() {
     fs.shutdown().await;
 }
 
-fn make_ok_response<T>(message: T) -> Response<Body>
+pub(super) fn make_ok_response<T>(message: T) -> Response<Body>
 where
     T: Message,
 {

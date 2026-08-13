@@ -92,9 +92,6 @@ async fn async_activity_completions(
         .sdk_config
         .register_activities(AsyncActivities { info_tx });
 
-    let mut worker = starter.worker().await;
-    let client = starter.get_client().await;
-
     #[workflow]
     #[derive(Default)]
     struct AsyncCompletionWorkflow;
@@ -153,9 +150,12 @@ async fn async_activity_completions(
         }
     }
 
-    worker
+    starter
+        .sdk_config
         .register_workflow::<AsyncCompletionWorkflow>()
         .unwrap();
+    let mut worker = starter.worker().await;
+    let client = starter.get_core_client().await;
 
     let completion_task = tokio::spawn(async move {
         let info = info_rx.recv().await.expect("should receive activity info");

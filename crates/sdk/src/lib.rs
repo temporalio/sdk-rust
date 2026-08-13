@@ -11,9 +11,7 @@
 //! ```no_run
 //! use std::str::FromStr;
 //! use temporalio_client::{Client, ClientOptions, Connection, ConnectionOptions, Url};
-//! use temporalio_common::worker::{
-//!     WorkerDeploymentOptions, WorkerDeploymentVersion, WorkerTaskTypes,
-//! };
+//! use temporalio_common::worker::{WorkerDeploymentOptions, WorkerDeploymentVersion};
 //! use temporalio_macros::activities;
 //! use temporalio_sdk::{
 //!     Runtime, Worker, WorkerOptions,
@@ -42,7 +40,6 @@
 //!     let client = Client::new(connection, ClientOptions::new("my_namespace").build())?;
 //!
 //!     let worker_options = WorkerOptions::new("task_queue")
-//!         .task_types(WorkerTaskTypes::activity_only())
 //!         .deployment_options(
 //!             WorkerDeploymentOptions::new(WorkerDeploymentVersion {
 //!                 deployment_name: "my_deployment".to_owned(),
@@ -74,6 +71,8 @@ mod workflow_executor;
 mod workflow_future;
 pub mod workflow_interceptors;
 mod workflow_registry;
+/// Workflow history replay APIs.
+pub mod workflow_replayer;
 #[cfg(feature = "wasm-workflows")]
 mod workflow_wasm;
 pub mod workflows;
@@ -82,7 +81,8 @@ pub use crate::{
     error::{
         ActivityExecutionError, ApplicationFailure, ChildWorkflowExecutionError,
         ChildWorkflowStartError, OutgoingActivityError, OutgoingError, OutgoingWorkflowError,
-        RetryState, TimeoutType, WorkerCreateError, WorkflowRegistrationError, WorkflowSignalError,
+        RetryState, TimeoutType, WorkerCreateError, WorkerRunError, WorkerValidationError,
+        WorkflowRegistrationError, WorkflowSignalError,
     },
     plugins::{
         ClientAndWorkerPlugin, SimplePlugin, SimplePluginBuilder, SimplePluginOption, WorkerPlugin,
@@ -111,13 +111,13 @@ use crate::{
         ActivityContext, ActivityDefinitions, ActivityImplementer, ExecutableActivity,
         activity_error_to_core_result,
     },
-    interceptors::{ActivityInboundInterceptor, WorkerInterceptor},
+    interceptors::{ActivityInboundInterceptor, Next, RunWorkerInput, WorkerInterceptor},
     workflow_executor::{TaskHandle, WorkflowExecutor},
     workflow_future::start_workflow,
     workflow_interceptors::WorkflowInterceptorConstructor,
 };
-use anyhow::{Context, anyhow, bail};
-use futures_util::{FutureExt, StreamExt, TryFutureExt, TryStreamExt};
+use anyhow::{anyhow, bail};
+use futures_util::{FutureExt, StreamExt, TryStreamExt, future::LocalBoxFuture};
 use std::{
     any::{Any, TypeId},
     cell::RefCell,
@@ -165,6 +165,9 @@ use crate::runtime::{
 };
 
 /// Contains options for configuring a worker.
+///
+/// The worker polls task types according to its registered workflows and activities. At least one
+/// workflow or activity must be registered.
 #[derive(bon::Builder, Clone)]
 #[builder(start_fn = new, on(String, into), state_mod(vis = "pub"))]
 #[non_exhaustive]
@@ -244,13 +247,6 @@ pub struct WorkerOptions {
     /// If left unset, the worker uses `SimpleMaximum(5)` and becomes eligible for automatic
     /// enrollment into poller autoscaling when the namespace advertises support for it.
     pub nexus_task_poller_behavior: Option<PollerBehavior>,
-    // TODO [rust-sdk-branch]: Will go away once workflow registration can only happen in here.
-    //   Then it can be auto-determined.
-    /// Specifies which task types this worker will poll for.
-    ///
-    /// Note: At least one task type must be specified or the worker will fail validation.
-    #[builder(default = WorkerTaskTypes::all())]
-    pub task_types: WorkerTaskTypes,
     /// How long a workflow task is allowed to sit on the sticky queue before it is timed out
     /// and moved to the non-sticky queue where it may be picked up by any worker.
     #[builder(default = Duration::from_secs(10))]
@@ -313,6 +309,44 @@ pub struct WorkerOptions {
 }
 
 impl<S: worker_options_builder::State> WorkerOptionsBuilder<S> {
+    pub(crate) fn with_workflows(mut self, workflows: WorkflowDefinitions) -> Self {
+        self.workflows = workflows;
+        self
+    }
+
+    pub(crate) fn with_worker_interceptors(
+        mut self,
+        worker_interceptors: Vec<Arc<dyn WorkerInterceptor>>,
+    ) -> Self {
+        self.worker_interceptors = worker_interceptors;
+        self
+    }
+
+    pub(crate) fn with_workflow_interceptor_constructors(
+        mut self,
+        workflow_interceptor_constructors: Vec<WorkflowInterceptorConstructor>,
+    ) -> Self {
+        self.workflow_interceptor_constructors = workflow_interceptor_constructors;
+        self
+    }
+
+    pub(crate) fn with_worker_plugins(
+        mut self,
+        worker_plugins: Vec<Arc<dyn WorkerPlugin>>,
+    ) -> Self {
+        self.worker_plugins = worker_plugins;
+        self
+    }
+
+    #[cfg(feature = "wasm-workflows")]
+    pub(crate) fn with_wasm_workflow_components(
+        mut self,
+        wasm_workflow_components: Vec<WasmWorkflowComponent>,
+    ) -> Self {
+        self.wasm_workflow_components = wasm_workflow_components;
+        self
+    }
+
     /// Register a worker plugin.
     ///
     /// **Experimental:** This API may change or be removed.
@@ -539,6 +573,15 @@ impl WorkerOptions {
         namespace: String,
         connection_identity: String,
     ) -> Result<WorkerConfig, String> {
+        let workflows_registered = !self.workflows.is_empty();
+        #[cfg(feature = "wasm-workflows")]
+        let workflows_registered =
+            workflows_registered || !self.wasm_workflow_components.is_empty();
+        let activities_registered = !self.activities.is_empty();
+        if !workflows_registered && !activities_registered {
+            return Err("At least one workflow or activity must be registered".to_owned());
+        }
+
         WorkerConfig::builder()
             .namespace(namespace)
             .task_queue(self.task_queue.clone())
@@ -556,7 +599,12 @@ impl WorkerOptions {
             .maybe_workflow_task_poller_behavior(self.workflow_task_poller_behavior)
             .maybe_activity_task_poller_behavior(self.activity_task_poller_behavior)
             .maybe_nexus_task_poller_behavior(self.nexus_task_poller_behavior)
-            .task_types(self.task_types)
+            .task_types(WorkerTaskTypes {
+                enable_workflows: workflows_registered,
+                enable_local_activities: workflows_registered && activities_registered,
+                enable_remote_activities: activities_registered,
+                enable_nexus: false,
+            })
             .sticky_queue_schedule_to_start_timeout(self.sticky_queue_schedule_to_start_timeout)
             .max_heartbeat_throttle_interval(self.max_heartbeat_throttle_interval)
             .default_heartbeat_throttle_interval(self.default_heartbeat_throttle_interval)
@@ -856,62 +904,30 @@ impl Worker {
         move || w.initiate_shutdown()
     }
 
-    /// Registers all activities on an activity implementer.
-    pub fn register_activities<AI: ActivityImplementer>(&mut self, instance: AI) -> &mut Self {
-        self.activity_half
-            .activities
-            .register_activities::<AI>(instance);
-        self
-    }
-    /// Registers a specific activitiy.
-    pub fn register_activity<AD>(&mut self, instance: Arc<AD::Implementer>) -> &mut Self
-    where
-        AD: ActivityDefinition + ExecutableActivity,
-        AD::Input: Send + Sync,
-        AD::Output: Send + Sync,
-    {
-        self.activity_half
-            .activities
-            .register_activity::<AD>(instance);
-        self
-    }
-
-    /// Registers all workflows on a workflow implementer.
-    pub fn register_workflow<W>(&mut self) -> Result<&mut Self, WorkflowRegistrationError>
-    where
-        W: WorkflowImplementation,
-        <W::Run as WorkflowDefinition>::Input: Send,
-    {
-        self.workflow_half
-            .workflow_definitions
-            .register_workflow::<W>()?;
-        Ok(self)
-    }
-
-    /// Register a workflow with a custom factory for instance creation.
-    ///
-    /// See [WorkerOptionsBuilder::register_workflow_with_factory] for more.
-    pub fn register_workflow_with_factory<W, F>(
-        &mut self,
-        factory: F,
-    ) -> Result<&mut Self, WorkflowRegistrationError>
-    where
-        W: WorkflowImplementation,
-        <W::Run as WorkflowDefinition>::Input: Send,
-        F: Fn() -> W + Send + Sync + 'static,
-    {
-        self.workflow_half
-            .workflow_definitions
-            .register_workflow_run_with_factory::<W, F>(factory)?;
-        Ok(self)
-    }
-
     /// Runs the worker. Eventually resolves after the worker has been explicitly shut down,
     /// or may return early with an error in the event of some unresolvable problem.
-    pub async fn run(&mut self) -> Result<(), anyhow::Error> {
+    pub async fn run(&mut self) -> Result<(), WorkerRunError> {
+        let interceptors = self.common.worker_interceptors.clone();
+        interceptors::call_run_worker(
+            &interceptors,
+            RunWorkerInput::new(self),
+            Next::new(
+                |input: RunWorkerInput<'_>| -> LocalBoxFuture<'_, Result<(), _>> {
+                    Box::pin(async move { input.worker.run_inner().await })
+                },
+            ),
+        )
+        .await
+    }
+
+    pub(crate) async fn run_inner(&mut self) -> Result<(), WorkerRunError> {
         // Perform the namespace check-in so poller behavior (e.g. autoscaling auto-enroll) is
         // resolved before any polling begins.
-        self.common.worker.validate().await?;
+        self.common
+            .worker
+            .validate()
+            .await
+            .map_err(WorkerRunError::Validation)?;
         let shutdown_token = CancellationToken::new();
         let (common, wf_half, act_half) = self.split_apart();
         let (wf_future_tx, wf_future_rx) =
@@ -927,7 +943,7 @@ impl Worker {
 
         let wf_future_joiner = async {
             UnboundedReceiverStream::new(wf_future_rx)
-                .map(Result::<_, anyhow::Error>::Ok)
+                .map(Result::<_, WorkerRunError>::Ok)
                 .try_for_each_concurrent(
                     None,
                     |WorkflowFutureHandle {
@@ -936,13 +952,19 @@ impl Worker {
                      }| {
                         let wf_half = &*wf_half;
                         async move {
-                            let result = join_handle.await.map_err(anyhow::Error::new)?;
+                            let result = join_handle.await.map_err(|e| WorkerRunError::Fatal {
+                                message: "workflow task dropped".into(),
+                                source: e.into(),
+                            })?;
                             // Eviction is normal workflow lifecycle - workflows loop waiting for
                             // eviction after completion to manage cache cleanup
                             if let Err(e) = result
                                 && !matches!(e, WorkflowTermination::Evicted)
                             {
-                                return Err(anyhow::Error::new(e));
+                                return Err(WorkerRunError::Fatal {
+                                    message: "workflow execution failed".into(),
+                                    source: e.into(),
+                                });
                             }
                             debug!(run_id=%run_id, "Removing workflow from cache");
                             wf_half.workflows.borrow_mut().remove(&run_id);
@@ -952,7 +974,6 @@ impl Worker {
                     },
                 )
                 .await
-                .context("Workflow futures encountered an error")
         };
         let wf_completion_processor = async {
             UnboundedReceiverStream::new(completions_rx)
@@ -964,9 +985,11 @@ impl Worker {
                     }
                     common.worker.complete_workflow_activation(completion).await
                 })
-                .map_err(anyhow::Error::from)
                 .await
-                .context("Workflow completions processor encountered an error")
+                .map_err(|source| WorkerRunError::Fatal {
+                    message: "workflow completions processor encountered an error".to_owned(),
+                    source: Box::new(source),
+                })
         };
         tokio::try_join!(
             // Workflow-related tasks run inside LocalSet (allows !Send futures)
@@ -981,7 +1004,10 @@ impl Worker {
                                     Err(PollError::ShutDown) => {
                                         break;
                                     }
-                                    o => o?,
+                                    o => o.map_err(|source| WorkerRunError::Fatal {
+                                        message: "workflow polling failed".to_owned(),
+                                        source: Box::new(source),
+                                    })?,
                                 };
                             if let Err(err) = decode_payloads(
                                 &mut activation,
@@ -1007,7 +1033,12 @@ impl Worker {
                                 continue;
                             }
                             for i in &common.worker_interceptors {
-                                i.on_workflow_activation(&activation).await?;
+                                i.on_workflow_activation(&activation).await.map_err(|source| {
+                                    WorkerRunError::Fatal {
+                                        message: "workflow activation interceptor failed".to_owned(),
+                                        source: source.into_boxed_dyn_error(),
+                                    }
+                                })?;
                             }
                             if let Some(wf_fut) = wf_half
                                 .workflow_activation_handler(
@@ -1017,7 +1048,13 @@ impl Worker {
                                     &completions_tx,
                                     &executor,
                                 )
-                                .await?
+                                .await
+                                .map_err(|source| {
+                                    WorkerRunError::Fatal {
+                                        message: "workflow activation processing failed".to_owned(),
+                                        source: source.into_boxed_dyn_error(),
+                                    }
+                                })?
                                 && wf_future_tx.send(wf_fut).is_err()
                             {
                                 panic!(
@@ -1031,7 +1068,7 @@ impl Worker {
                         // terminate.
                         drop(wf_future_tx);
                         drop(completions_tx);
-                        Result::<_, anyhow::Error>::Ok(())
+                        Result::<_, WorkerRunError>::Ok(())
                     },
                     wf_future_joiner,
                     async {
@@ -1040,7 +1077,7 @@ impl Worker {
                             _ = shutdown_token.cancelled() => {}
                         }
                         executor.shutdown().await;
-                        Result::<_, anyhow::Error>::Ok(())
+                        Result::<_, WorkerRunError>::Ok(())
                     },
                 )
                 }).await
@@ -1054,7 +1091,10 @@ impl Worker {
                         if matches!(activity, Err(PollError::ShutDown)) {
                             break;
                         }
-                        let mut activity = activity?;
+                        let mut activity = activity.map_err(|source| WorkerRunError::Fatal {
+                            message: "activity polling failed".to_owned(),
+                            source: Box::new(source),
+                        })?;
                         if let Err(err) = decode_payloads(
                             &mut activity,
                             common.data_converter.codec(),
@@ -1074,7 +1114,14 @@ impl Worker {
                             };
                             encode_activity_completion(&mut completion, &common.data_converter)
                                 .await;
-                            common.worker.complete_activity_task(completion).await?;
+                            common
+                                .worker
+                                .complete_activity_task(completion)
+                                .await
+                                .map_err(|source| WorkerRunError::Fatal {
+                                    message: "activity completion failed".to_owned(),
+                                    source: Box::new(source),
+                                })?;
                             continue;
                         }
                         match act_half.activity_task_handler(
@@ -1105,13 +1152,25 @@ impl Worker {
                                 };
                                 encode_activity_completion(&mut completion, &common.data_converter)
                                     .await;
-                                common.worker.complete_activity_task(completion).await?;
+                                common
+                                    .worker
+                                    .complete_activity_task(completion)
+                                    .await
+                                    .map_err(|source| WorkerRunError::Fatal {
+                                        message: "activity completion failed".to_owned(),
+                                        source: Box::new(source),
+                                    })?;
                             }
-                            Err(ActivityTaskHandlerError::Fatal(err)) => return Err(err),
+                            Err(ActivityTaskHandlerError::Fatal(source)) => {
+                                return Err(WorkerRunError::Fatal {
+                                    message: "activity task handling failed".to_owned(),
+                                    source: source.into_boxed_dyn_error(),
+                                });
+                            }
                         };
                     }
                 };
-                Result::<_, anyhow::Error>::Ok(())
+                Result::<_, WorkerRunError>::Ok(())
             },
             wf_completion_processor,
         )?;
@@ -1121,6 +1180,10 @@ impl Worker {
         }
         self.common.worker.shutdown().await;
         Ok(())
+    }
+
+    pub(crate) fn worker_interceptors(&self) -> Vec<Arc<dyn WorkerInterceptor>> {
+        self.common.worker_interceptors.clone()
     }
 
     /// Turns this rust worker into a new worker with all the same workflows and activities
@@ -1710,6 +1773,53 @@ mod tests {
         assert!(workflows.contains("OtherWorkflow"));
     }
 
+    #[rstest::rstest]
+    #[case::workflow_only(true, false, Ok(WorkerTaskTypes::workflow_only()))]
+    #[case::activity_only(false, true, Ok(WorkerTaskTypes::activity_only()))]
+    #[case::workflow_and_activity(
+        true,
+        true,
+        Ok(WorkerTaskTypes {
+            enable_workflows: true,
+            enable_local_activities: true,
+            enable_remote_activities: true,
+            enable_nexus: false,
+        })
+    )]
+    #[case::empty(
+        false,
+        false,
+        Err("At least one workflow or activity must be registered")
+    )]
+    #[test]
+    fn task_types_are_derived_from_registrations(
+        #[case] register_workflow: bool,
+        #[case] register_activities: bool,
+        #[case] expected: Result<WorkerTaskTypes, &str>,
+    ) {
+        let options = if register_workflow {
+            WorkerOptions::new("task_q")
+                .register_workflow::<MyWorkflow>()
+                .unwrap()
+        } else {
+            WorkerOptions::new("task_q")
+        };
+        let options = if register_activities {
+            options.register_activities(MyActivities {})
+        } else {
+            options
+        };
+
+        let actual = options
+            .build()
+            .to_core_options("ns".into(), String::new())
+            .map(|config| config.task_types);
+        assert_eq!(
+            actual.as_ref().map_err(String::as_str),
+            expected.as_ref().map_err(|err| *err)
+        );
+    }
+
     #[test]
     fn workflow_interceptor_registration_replaces_previous_constructors() {
         let mut options = WorkerOptions::new("task_q").build();
@@ -1789,7 +1899,7 @@ mod tests {
         #[case] expected: Option<String>,
     ) {
         let opts = WorkerOptions::new("task_q")
-            .task_types(WorkerTaskTypes::activity_only())
+            .register_activities(MyActivities {})
             .maybe_client_identity_override(worker_override.map(|s| s.to_owned()))
             .build();
         let config = opts
@@ -1808,7 +1918,7 @@ mod tests {
         #[case] expected: bool,
     ) {
         let config = WorkerOptions::new("task_q")
-            .task_types(WorkerTaskTypes::activity_only())
+            .register_activities(MyActivities {})
             .maybe_disable_payload_error_limit(override_value)
             .build()
             .to_core_options("ns".into(), String::new())
@@ -1819,7 +1929,7 @@ mod tests {
     #[test]
     fn max_eager_activity_reservations_per_workflow_task_propagates() {
         let config = WorkerOptions::new("task_q")
-            .task_types(WorkerTaskTypes::activity_only())
+            .register_activities(MyActivities {})
             .max_eager_activity_reservations_per_workflow_task(7)
             .build()
             .to_core_options("ns".into(), String::new())

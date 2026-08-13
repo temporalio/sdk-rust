@@ -53,11 +53,13 @@ tracing = "0.1"
 url = "2.5"
 uuid = { version = "1.18", default-features = false, features = ["v4"] }
 rand = "0.10"
+serde_json = { workspace = true }
 
 [dependencies.temporalio-common]
 path = "../common"
 version = "0.6"
 default-features = false
+features = ["serde_serialize"]
 
 [dev-dependencies]
 assert_matches = "1"

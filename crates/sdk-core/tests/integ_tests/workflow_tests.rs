@@ -24,7 +24,7 @@ use crate::{
     common::{
         CoreWfStarter, activity_functions::StdActivities, get_integ_runtime_options,
         history_from_proto_binary, init_core_and_create_wf, init_core_replay_preloaded,
-        mock_sdk_cfg, prom_metrics,
+        prom_metrics,
     },
     integ_tests::metrics_tests,
 };
@@ -97,10 +97,11 @@ impl ParallelWorkflowsWf {
 async fn parallel_workflows_same_queue() {
     let wf_name = "parallel_workflows_same_queue";
     let mut starter = CoreWfStarter::new(wf_name);
-    starter.sdk_config.task_types = WorkerTaskTypes::workflow_only();
+    starter
+        .sdk_config
+        .register_workflow::<ParallelWorkflowsWf>()
+        .unwrap();
     let mut core = starter.worker().await;
-
-    core.register_workflow::<ParallelWorkflowsWf>().unwrap();
     let task_queue = starter.get_task_queue().to_owned();
     for i in 0..25 {
         core.submit_workflow(
@@ -120,7 +121,7 @@ async fn parallel_workflows_same_queue() {
 #[tokio::test]
 async fn shutdown_aborts_actively_blocked_poll() {
     let mut starter = CoreWfStarter::new("shutdown_aborts_actively_blocked_poll");
-    let core = starter.get_worker().await;
+    let core = starter.get_core_worker().await;
     // Begin the poll, and request shutdown from another thread after a small period of time.
     let tcore = core.clone();
     let handle = tokio::spawn(async move {
@@ -158,7 +159,7 @@ async fn fail_wf_task(#[values(true, false)] replay: bool) {
         Arc::new(init_core_replay_preloaded("fail_wf_task", [hist, hist2]))
     } else {
         let mut starter = init_core_and_create_wf("fail_wf_task").await;
-        starter.get_worker().await
+        starter.get_core_worker().await
     };
     // Start with a timer
     let task = core.poll_workflow_activation().await.unwrap();
@@ -201,7 +202,7 @@ async fn fail_wf_task(#[values(true, false)] replay: bool) {
 async fn fail_workflow_execution() {
     let core = init_core_and_create_wf("fail_workflow_execution")
         .await
-        .get_worker()
+        .get_core_worker()
         .await;
     let task = core.poll_workflow_activation().await.unwrap();
     core.complete_timer(&task.run_id, 0, Duration::from_secs(1))
@@ -223,8 +224,8 @@ async fn fail_workflow_execution() {
 #[tokio::test]
 async fn signal_workflow() {
     let mut starter = init_core_and_create_wf("signal_workflow").await;
-    let core = starter.get_worker().await;
-    let client = starter.get_client().await;
+    let core = starter.get_core_worker().await;
+    let client = starter.get_core_client().await;
     let workflow_id = starter.get_task_queue().to_string();
 
     let signal_id_1 = "signal1";
@@ -306,7 +307,7 @@ async fn signal_workflow() {
 async fn signal_workflow_signal_not_handled_on_workflow_completion() {
     let mut starter =
         init_core_and_create_wf("signal_workflow_signal_not_handled_on_workflow_completion").await;
-    let core = starter.get_worker().await;
+    let core = starter.get_core_worker().await;
     let workflow_id = starter.get_task_queue().to_string();
     let signal_id_1 = "signal1";
     for i in 1..=2 {
@@ -339,7 +340,7 @@ async fn signal_workflow_signal_not_handled_on_workflow_completion() {
             let run_id = res.run_id.clone();
 
             // Send the signal to the server
-            let sig_client = starter.get_client().await;
+            let sig_client = starter.get_core_client().await;
             WorkflowExecutionInfo {
                 namespace: sig_client.namespace(),
                 workflow_id: workflow_id.clone(),
@@ -392,8 +393,8 @@ async fn wft_timeout_doesnt_create_unsolvable_autocomplete() {
     wf_starter.sdk_config.workflow_task_poller_behavior =
         Some(PollerBehavior::SimpleMaximum(1_usize));
     wf_starter.workflow_options.task_timeout = Some(Duration::from_secs(1));
-    let core = wf_starter.get_worker().await;
-    let client = wf_starter.get_client().await;
+    let core = wf_starter.get_core_worker().await;
+    let client = wf_starter.get_core_client().await;
     let task_q = wf_starter.get_task_queue();
     let wf_id = &wf_starter.get_wf_id().to_owned();
 
@@ -520,11 +521,12 @@ async fn slow_completes_with_small_cache() {
     let mut starter = CoreWfStarter::new(wf_name);
     starter.sdk_config.tuner = Arc::new(TunerHolder::fixed_size(5, 10, 1, 1));
     starter.sdk_config.max_cached_workflows = 5_usize;
+    starter.sdk_config.register_activities(StdActivities);
+    starter
+        .sdk_config
+        .register_workflow::<SlowCompletesWf>()
+        .unwrap();
     let mut worker = starter.worker().await;
-
-    worker.register_activities(StdActivities);
-
-    worker.register_workflow::<SlowCompletesWf>().unwrap();
     let task_queue = starter.get_task_queue().to_owned();
     for i in 0..20 {
         worker
@@ -570,10 +572,10 @@ async fn deployment_version_correct_in_wf_info(#[values(true, false)] use_only_b
         })
         .build()
     };
-    starter.sdk_config.task_types = WorkerTaskTypes::workflow_only();
-    let core = starter.get_worker().await;
+    starter.set_core_task_types(WorkerTaskTypes::workflow_only());
+    let core = starter.get_core_worker().await;
     starter.start_wf().await;
-    let client = starter.get_client().await;
+    let client = starter.get_core_client().await;
     let workflow_id = starter.get_task_queue().to_string();
 
     let res = core.poll_workflow_activation().await.unwrap();
@@ -687,7 +689,7 @@ async fn deployment_version_correct_in_wf_info(#[values(true, false)] use_only_b
         .build()
     };
 
-    let core = starter.get_worker().await;
+    let core = starter.get_core_worker().await;
 
     let query_fut = async {
         query_handle
@@ -802,7 +804,6 @@ async fn nondeterminism_errors_fail_workflow_when_configured_to(
     let rt = CoreRuntime::new_assume_tokio(get_integ_runtime_options(telemopts)).unwrap();
     let wf_name = NONDETERMINISM_WF_NAME;
     let mut starter = CoreWfStarter::new_with_runtime(wf_name, rt);
-    starter.sdk_config.task_types = WorkerTaskTypes::workflow_only();
     let typeset = HashSet::from([WorkflowErrorType::Nondeterminism]);
     if whole_worker {
         starter.sdk_config.workflow_failure_errors = typeset;
@@ -810,6 +811,11 @@ async fn nondeterminism_errors_fail_workflow_when_configured_to(
         starter.sdk_config.workflow_types_to_failure_errors =
             HashMap::from([(wf_name.to_owned(), typeset)]);
     }
+    let restarted_starter = starter.clone_no_worker();
+    starter
+        .sdk_config
+        .register_workflow::<NondeterminismTimerWf>()
+        .unwrap();
     let wf_id = starter.get_task_queue().to_owned();
     let mut worker = starter.worker().await;
     worker.fetch_results = false;
@@ -827,8 +833,7 @@ async fn nondeterminism_errors_fail_workflow_when_configured_to(
         }
     }
 
-    worker.register_workflow::<NondeterminismTimerWf>().unwrap();
-    let client = starter.get_client().await;
+    let client = starter.get_core_client().await;
     let core_worker = worker.core_worker();
     starter.start_with_worker(wf_name, &mut worker).await;
 
@@ -853,8 +858,12 @@ async fn nondeterminism_errors_fail_workflow_when_configured_to(
     join!(stopper, runner);
 
     // Restart the worker with a new, incompatible wf definition which will cause nondeterminism
-    let mut starter = starter.clone_no_worker();
+    let mut starter = restarted_starter;
     starter.sdk_config.register_activities(StdActivities);
+    starter
+        .sdk_config
+        .register_workflow::<NondeterminismActivityWf>()
+        .unwrap();
     let mut worker = starter.worker().await;
 
     #[workflow]
@@ -875,9 +884,6 @@ async fn nondeterminism_errors_fail_workflow_when_configured_to(
         }
     }
 
-    worker
-        .register_workflow::<NondeterminismActivityWf>()
-        .unwrap();
     // We need to generate a task so that we'll encounter the error (first avoid WFT timeout)
     WorkflowService::reset_sticky_task_queue(
         &mut client.clone(),
@@ -921,9 +927,8 @@ async fn history_out_of_order_on_restart() {
     let wf_name = HISTORY_OUT_OF_ORDER_WF_NAME;
     let mut starter = CoreWfStarter::new(wf_name);
     starter.sdk_config.workflow_failure_errors = HashSet::from([WorkflowErrorType::Nondeterminism]);
-    let mut worker = starter.worker().await;
+    starter.sdk_config.register_activities(StdActivities);
     let mut starter2 = starter.clone_no_worker();
-    let mut worker2 = starter2.worker().await;
 
     let hit_sleep = Arc::new(Notify::new());
     let hit_sleep_clone1 = hit_sleep.clone();
@@ -987,14 +992,18 @@ async fn history_out_of_order_on_restart() {
         }
     }
 
-    worker.register_activities(StdActivities);
-    worker2.register_activities(StdActivities);
-    worker
+    starter
+        .sdk_config
         .register_workflow_with_factory(move || HistoryOutOfOrderWf1 {
             hit_sleep: hit_sleep_clone1.clone(),
         })
         .unwrap();
-    worker2.register_workflow::<HistoryOutOfOrderWf2>().unwrap();
+    starter2
+        .sdk_config
+        .register_workflow::<HistoryOutOfOrderWf2>()
+        .unwrap();
+    let mut worker = starter.worker().await;
+    let mut worker2 = starter2.worker().await;
     let task_queue = starter.get_task_queue().to_owned();
     worker
         .submit_workflow(
@@ -1021,7 +1030,7 @@ async fn history_out_of_order_on_restart() {
     join!(w1, w2);
     // The workflow should fail with the nondeterminism error
     let handle = starter
-        .get_client()
+        .get_core_client()
         .await
         .get_workflow_handle::<UntypedWorkflow>(wf_name);
     let res = handle.get_result(Default::default()).await;
@@ -1071,8 +1080,13 @@ async fn pass_timer_summary_to_metadata() {
         }
     }
 
-    let mut worker = mock_sdk_cfg(mock_cfg, |_| {});
-    worker.register_workflow::<PassTimerSummaryWf>().unwrap();
+    let mut worker = crate::common::mock_sdk_cfg_with_options(
+        mock_cfg,
+        |_| {},
+        |options| {
+            options.register_workflow::<PassTimerSummaryWf>().unwrap();
+        },
+    );
     worker
         .submit_wf(
             DEFAULT_WORKFLOW_TYPE.to_owned(),
