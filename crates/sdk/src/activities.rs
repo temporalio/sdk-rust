@@ -62,6 +62,8 @@ use futures_util::{
     future::{BoxFuture, ready},
 };
 use prost_types::{Duration, Timestamp};
+#[cfg(feature = "testing")]
+use std::any::Any;
 use std::{
     collections::HashMap,
     fmt::Debug,
@@ -88,11 +90,13 @@ use temporalio_common::{
 use temporalio_sdk_core::Worker as CoreWorker;
 use tokio_util::sync::CancellationToken;
 
+#[cfg(feature = "testing")]
+pub(crate) type ActivityHeartbeatCallback = Arc<dyn Fn(Box<dyn Any>) + Send + Sync>;
+
 /// Used within activities to get info, heartbeat management etc.
 #[derive(Clone)]
 pub struct ActivityContext {
     backend: ActivityContextBackend,
-    data_converter: DataConverter,
     cancellation_token: CancellationToken,
     heartbeat_details: ActivityHeartbeatDetails,
     header_fields: HashMap<String, Payload>,
@@ -108,40 +112,62 @@ enum ActivityContextBackend {
     #[cfg(feature = "testing")]
     Test {
         client: Option<Client>,
-        heartbeat_callback: Option<Arc<dyn Fn(Vec<Payload>) + Send + Sync>>,
+        heartbeat_callback: Option<ActivityHeartbeatCallback>,
     },
 }
 
 impl ActivityContextBackend {
-    fn record_heartbeat(&self, heartbeat: ActivityHeartbeat) {
-        match self {
-            Self::Worker { worker, .. } => worker.record_activity_heartbeat(heartbeat),
-            #[cfg(feature = "testing")]
-            Self::Test {
-                heartbeat_callback, ..
-            } => {
-                if let Some(callback) = heartbeat_callback {
-                    callback(heartbeat.details);
-                }
-            }
-        }
-    }
-
-    fn client(&self) -> Option<Client> {
+    async fn record_heartbeat<T>(
+        &self,
+        task_token: &[u8],
+        details: T,
+    ) -> Result<(), PayloadConversionError>
+    where
+        T: TemporalSerializable + 'static,
+    {
         match self {
             Self::Worker {
                 worker,
                 client_options,
             } => {
-                let connection = worker.get_client_connection()?;
-                Some(
-                    Client::new(connection, client_options.clone()).expect(
-                        "client construction from a worker connection should be infallible",
-                    ),
-                )
+                let details = client_options
+                    .data_converter
+                    .to_payloads(&SerializationContextData::Activity, &details)
+                    .await?;
+                worker.record_activity_heartbeat(ActivityHeartbeat {
+                    task_token: task_token.to_vec(),
+                    details,
+                });
             }
             #[cfg(feature = "testing")]
-            Self::Test { client, .. } => client.clone(),
+            Self::Test {
+                heartbeat_callback, ..
+            } => {
+                if let Some(callback) = heartbeat_callback {
+                    callback(Box::new(details));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn client(&self) -> Client {
+        match self {
+            Self::Worker {
+                worker,
+                client_options,
+            } => {
+                let connection = worker.get_client_connection().expect(
+                    "activity context client is unavailable because the worker was not created from a Temporal client",
+                );
+                Client::new(connection, client_options.clone())
+                    .expect("client construction from a worker connection should be infallible")
+            }
+            #[cfg(feature = "testing")]
+            Self::Test { client, .. } => client
+                .as_ref()
+                .expect("ActivityEnvironment was created without a Client. Pass one during construction to have one availalbe at runtime")
+                .clone(),
         }
     }
 }
@@ -151,22 +177,18 @@ impl ActivityContext {
     pub(crate) fn new_for_test(
         info: ActivityInfo,
         header_fields: HashMap<String, Payload>,
-        data_converter: DataConverter,
+        payload_converter: PayloadConverter,
         cancellation_token: CancellationToken,
         heartbeat_details: Vec<Payload>,
         client: Option<Client>,
-        heartbeat_callback: Option<Arc<dyn Fn(Vec<Payload>) + Send + Sync>>,
+        heartbeat_callback: Option<ActivityHeartbeatCallback>,
     ) -> Self {
-        let heartbeat_details = ActivityHeartbeatDetails::new(
-            heartbeat_details,
-            data_converter.payload_converter().clone(),
-        );
+        let heartbeat_details = ActivityHeartbeatDetails::new(heartbeat_details, payload_converter);
         Self {
             backend: ActivityContextBackend::Test {
                 client,
                 heartbeat_callback,
             },
-            data_converter,
             cancellation_token,
             heartbeat_details,
             header_fields,
@@ -217,7 +239,6 @@ impl ActivityContext {
             .map(|we| (we.workflow_id, we.run_id))
             .unzip();
         let activity_run_id = (workflow_id.is_none() && !run_id.is_empty()).then_some(run_id);
-        let data_converter = client_options.data_converter.clone();
 
         (
             ActivityContext {
@@ -225,7 +246,6 @@ impl ActivityContext {
                     worker,
                     client_options,
                 },
-                data_converter,
                 cancellation_token,
                 heartbeat_details,
                 header_fields,
@@ -278,14 +298,9 @@ impl ActivityContext {
         T: TemporalSerializable + 'static,
     {
         if !self.info.is_local {
-            let details = self
-                .data_converter
-                .to_payloads(&SerializationContextData::Activity, &details)
+            self.backend
+                .record_heartbeat(&self.info.task_token, details)
                 .await?;
-            self.backend.record_heartbeat(ActivityHeartbeat {
-                task_token: self.info.task_token.clone(),
-                details,
-            })
         }
         Ok(())
     }
@@ -297,10 +312,7 @@ impl ActivityContext {
 
     /// Return a client targeting the same Temporal service and namespace as this activity's worker.
     pub fn client(&self) -> Client {
-        self.backend.client().expect(
-            "activity context client is unavailable because the worker was not created from a \
-             Temporal client",
-        )
+        self.backend.client()
     }
 
     /// Return a workflow handle for the workflow execution that started this activity, if any.

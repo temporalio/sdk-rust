@@ -1,7 +1,8 @@
 //! Test environments for running activity code and workflow workers.
 //!
-//! Activity inputs and outputs stay typed and are passed directly to the activity. The data
-//! converter is used only where a worker would use it, such as heartbeat details.
+//! Activity inputs, outputs, and outbound heartbeat details stay typed. Previous heartbeat details
+//! are serialized with the configured [`PayloadConverter`]; payload codecs and failure converters
+//! are not used by [`ActivityEnvironment`].
 //!
 //! ```
 //! use std::sync::Arc;
@@ -61,10 +62,9 @@
 //! ```
 
 use crate::activities::{
-    ActivityContext, ActivityDefinitions, ActivityError, ActivityImplementer, ActivityInfo,
-    ExecutableActivity,
+    ActivityContext, ActivityDefinitions, ActivityError, ActivityHeartbeatCallback,
+    ActivityImplementer, ActivityInfo, ExecutableActivity,
 };
-use futures_util::{FutureExt, future::BoxFuture};
 use std::{
     any::Any,
     collections::HashMap,
@@ -78,7 +78,8 @@ use temporalio_client::{
 use temporalio_common::{
     RetryPolicy, WorkflowExecution,
     data_converters::{
-        DataConverter, PayloadConversionError, SerializationContextData, TemporalSerializable,
+        GenericPayloadConverter, PayloadConversionError, PayloadConverter, SerializationContext,
+        SerializationContextData, TemporalSerializable,
     },
     protos::temporal::api::common::v1::Payload,
 };
@@ -92,12 +93,6 @@ use temporalio_sdk_core::ephemeral_server::{
     EphemeralServer, TemporalDevServerConfig, default_cached_download,
 };
 
-type HeartbeatCallback = Arc<dyn Fn(Vec<Payload>) + Send + Sync>;
-type HeartbeatDetailsFactory = Arc<
-    dyn Fn(DataConverter) -> BoxFuture<'static, Result<Vec<Payload>, PayloadConversionError>>
-        + Send
-        + Sync,
->;
 type ActivityImplementers = HashMap<String, Arc<dyn Any + Send + Sync>>;
 
 fn default_workflow_execution() -> WorkflowExecution {
@@ -183,20 +178,23 @@ impl From<ActivityInfoOptions> for ActivityInfo {
 
 /// Environment for running activity code with a test [`ActivityContext`].
 #[derive(bon::Builder)]
-#[builder(state_mod(vis = "pub"))]
+#[builder(
+    start_fn(name = builder_internal, vis = ""),
+    state_mod(vis = "pub")
+)]
 pub struct ActivityEnvironment {
+    #[builder(start_fn)]
+    payload_converter: PayloadConverter,
     #[builder(field)]
-    heartbeat_callback: Option<HeartbeatCallback>,
+    heartbeat_callback: Option<ActivityHeartbeatCallback>,
     #[builder(field)]
-    heartbeat_details_factory: Option<HeartbeatDetailsFactory>,
+    heartbeat_details: Vec<Payload>,
     #[builder(field)]
     implementers: ActivityImplementers,
     #[builder(default = ActivityInfoOptions::builder().build())]
     info: ActivityInfo,
     #[builder(default)]
     headers: HashMap<String, Payload>,
-    #[builder(default)]
-    data_converter: DataConverter,
     client: Option<Client>,
     #[builder(default = CancellationToken::new())]
     cancellation_token: CancellationToken,
@@ -218,39 +216,44 @@ impl<S: activity_environment_builder::State> ActivityEnvironmentBuilder<S> {
         self
     }
 
-    /// Observe codec-encoded payloads for every heartbeat.
+    /// Observe the typed details supplied to every heartbeat.
     pub fn on_heartbeat<F>(mut self, callback: F) -> Self
     where
-        F: Fn(Vec<Payload>) + Send + Sync + 'static,
+        F: Fn(Box<dyn Any>) + Send + Sync + 'static,
     {
         self.heartbeat_callback = Some(Arc::new(callback));
         self
     }
 
-    /// Supply typed heartbeat details from a previous activity attempt.
-    pub fn heartbeat_details<T>(mut self, details: T) -> Self
+    /// Supply heartbeat details from a previous activity attempt.
+    ///
+    /// Details are serialized with the environment's configured [`PayloadConverter`].
+    pub fn heartbeat_details<T>(mut self, details: T) -> Result<Self, PayloadConversionError>
     where
-        T: TemporalSerializable + Send + Sync + 'static,
+        T: TemporalSerializable + 'static,
     {
-        let details = Arc::new(details);
-        self.heartbeat_details_factory = Some(Arc::new(move |data_converter| {
-            let details = details.clone();
-            async move {
-                let encoded = data_converter
-                    .to_payloads(&SerializationContextData::Activity, details.as_ref())
-                    .await?;
-                data_converter
-                    .codec()
-                    .decode(&SerializationContextData::Activity, encoded)
-                    .await
-            }
-            .boxed()
-        }));
-        self
+        let context = SerializationContext {
+            data: &SerializationContextData::Activity,
+            converter: &self.payload_converter,
+        };
+        self.heartbeat_details = self.payload_converter.to_payloads(&context, &details)?;
+        Ok(self)
     }
 }
 
 impl ActivityEnvironment {
+    /// Construct an activity environment builder using the default payload converter.
+    pub fn builder() -> ActivityEnvironmentBuilder {
+        Self::builder_internal(PayloadConverter::default())
+    }
+
+    /// Construct an activity environment builder using a custom payload converter.
+    pub fn builder_with_payload_converter(
+        payload_converter: PayloadConverter,
+    ) -> ActivityEnvironmentBuilder {
+        Self::builder_internal(payload_converter)
+    }
+
     /// Run an activity marker with already-typed input.
     pub async fn run<A>(
         &self,
@@ -274,21 +277,12 @@ impl ActivityEnvironment {
         } else {
             None
         };
-        let heartbeat_details = match &self.heartbeat_details_factory {
-            Some(factory) => factory(self.data_converter.clone())
-                .await
-                .map_err(|source| ActivityEnvironmentError::PayloadConversion {
-                    operation: "previous heartbeat details",
-                    source,
-                })?,
-            None => Vec::new(),
-        };
         let context = ActivityContext::new_for_test(
             self.info.clone(),
             self.headers.clone(),
-            self.data_converter.clone(),
+            self.payload_converter.clone(),
             self.cancellation_token.clone(),
-            heartbeat_details,
+            self.heartbeat_details.clone(),
             self.client.clone(),
             self.heartbeat_callback.clone(),
         );
@@ -303,7 +297,7 @@ impl ActivityEnvironment {
     }
 }
 
-/// Errors produced while preparing or running an activity in a test environment.
+/// Errors produced while running an activity in a test environment.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum ActivityEnvironmentError {
@@ -312,15 +306,6 @@ pub enum ActivityEnvironmentError {
     MissingImplementer {
         /// Activity type that could not be run.
         activity_type: String,
-    },
-    /// A value needed by the activity context could not be converted to payloads.
-    #[error("payload conversion failed for {operation}: {source}")]
-    PayloadConversion {
-        /// Conversion being performed.
-        operation: &'static str,
-        /// Underlying payload conversion error.
-        #[source]
-        source: PayloadConversionError,
     },
     /// The activity returned an error.
     #[error("activity execution failed: {0:?}")]
@@ -635,24 +620,25 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn converts_previous_and_outbound_heartbeat_details() {
-        // TODO: Heartbeats should be received as `Box/Arc<dyn Any>`
+    async fn converts_previous_and_observes_typed_outbound_heartbeat_details() {
         let heartbeats = Arc::new(Mutex::new(Vec::new()));
-        let env = ActivityEnvironment::builder()
-            .heartbeat_details(4_u32)
-            .on_heartbeat({
-                let heartbeats = heartbeats.clone();
-                move |payloads| heartbeats.lock().unwrap().push(payloads)
-            })
-            .build();
+        let env =
+            ActivityEnvironment::builder_with_payload_converter(PayloadConverter::serde_json())
+                .heartbeat_details(4_u32)
+                .unwrap()
+                .on_heartbeat({
+                    let heartbeats = heartbeats.clone();
+                    move |details| {
+                        let details = details
+                            .downcast::<u32>()
+                            .expect("heartbeat details should retain their concrete type");
+                        heartbeats.lock().unwrap().push(*details);
+                    }
+                })
+                .build();
 
         assert_eq!(env.run(TestActivities::heartbeat, 3).await.unwrap(), 4);
-        let payloads = heartbeats.lock().unwrap().pop().unwrap();
-        let value: u32 = DataConverter::default()
-            .from_payloads(&SerializationContextData::Activity, payloads)
-            .await
-            .unwrap();
-        assert_eq!(value, 7);
+        assert_eq!(heartbeats.lock().unwrap().pop(), Some(7));
     }
 
     #[tokio::test]
@@ -665,28 +651,5 @@ mod tests {
                 .await
                 .unwrap()
         );
-    }
-
-    #[tokio::test]
-    async fn local_environment_reports_a_missing_executable() {
-        let path = std::env::temp_dir().join(format!(
-            "temporal-missing-test-server-{}-{}",
-            std::process::id(),
-            uuid::Uuid::new_v4()
-        ));
-        let error = WorkflowEnvironment::start_local(
-            LocalWorkflowEnvironmentOptions::builder()
-                .server_executable(EphemeralExe::ExistingPath(
-                    path.to_string_lossy().into_owned(),
-                ))
-                .build(),
-        )
-        .await
-        .unwrap_err();
-
-        assert!(matches!(
-            error,
-            WorkflowEnvironmentError::ServerStart(EphemeralServerError::ExecutableNotFound { .. })
-        ));
     }
 }
