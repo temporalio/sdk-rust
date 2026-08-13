@@ -5,8 +5,8 @@ pub use options::{
     ActivityCancellationType, ActivityCloseTimeouts, ActivityOptions,
     ChildWorkflowCancellationType, ChildWorkflowOptions, ContinueAsNewOptions,
     ContinueAsNewVersioningBehavior, LocalActivityOptions, NexusOperationCancellationType,
-    NexusOperationOptions, ParentClosePolicy, Signal, SignalData, SignalWorkflowOptions,
-    TimerOptions, VersioningIntent, WaitConditionOptions, WorkflowIdReusePolicy,
+    NexusOperationOptions, ParentClosePolicy, SignalWorkflowOptions, TimerOptions,
+    VersioningIntent, WaitConditionOptions, WorkflowIdReusePolicy,
 };
 pub use temporalio_common_wasm::protos::coresdk::child_workflow::StartChildWorkflowExecutionFailedCause;
 pub use view::{NamespacedWorkflowInfo, WorkflowContextView};
@@ -86,9 +86,8 @@ use temporalio_common_wasm::{
                 CancelChildWorkflowExecution, CancelSignalWorkflow, CancelTimer,
                 ModifyWorkflowProperties, RequestCancelActivity,
                 RequestCancelExternalWorkflowExecution, RequestCancelLocalActivity,
-                RequestCancelNexusOperation, SetPatchMarker, SignalExternalWorkflowExecution,
-                UpsertWorkflowSearchAttributes, signal_external_workflow_execution,
-                workflow_command,
+                RequestCancelNexusOperation, SetPatchMarker, UpsertWorkflowSearchAttributes,
+                signal_external_workflow_execution, workflow_command,
             },
         },
         temporal::api::{
@@ -1129,19 +1128,21 @@ impl BaseWorkflowContext {
         target: SignalWorkflowTarget,
         signal: S,
         input: S::Input,
-        cancellation_token: Option<WorkflowCancellationToken>,
+        options: SignalWorkflowOptions,
     ) -> CancellableWorkflowOutboundFuture<SignalWorkflowResult> {
         let input = SignalWorkflowInput::new(
             S::name(&signal).to_string(),
             target,
             Box::new(input),
-            cancellation_token,
+            options,
         );
         let base_ctx = self.clone();
         let next = WorkflowNext::new(move |input: SignalWorkflowInput| {
-            let (signal_name, target, input, headers, cancellation_token) = input.into_parts();
-            let cancellation_token =
-                cancellation_token.unwrap_or_else(|| base_ctx.cancellation_token());
+            let (signal_name, target, input, headers, mut options) = input.into_parts();
+            let cancellation_token = options
+                .cancellation_token
+                .take()
+                .unwrap_or_else(|| base_ctx.cancellation_token());
             let input = match input.downcast::<S::Input>() {
                 Ok(input) => *input,
                 Err(_) => {
@@ -1185,8 +1186,6 @@ impl BaseWorkflowContext {
                     },
                 ),
             };
-            let mut signal = Signal::new(signal_name, payloads);
-            signal.data.headers = headers;
             let seq = base_ctx
                 .inner
                 .seq_nums
@@ -1200,19 +1199,11 @@ impl BaseWorkflowContext {
                 .inner
                 .runtime
                 .register_unblocker(PendingCommandId::SignalExternal(seq), unblocker);
-            let signal = signal.into_invocation();
-            base_ctx.inner.runtime.host.push_command(
-                workflow_command::Variant::SignalExternalWorkflowExecution(
-                    SignalExternalWorkflowExecution {
-                        seq,
-                        signal_name: signal.signal_name,
-                        args: signal.input,
-                        target: Some(target),
-                        headers: signal.headers,
-                    },
-                )
-                .into(),
-            );
+            base_ctx
+                .inner
+                .runtime
+                .host
+                .push_command(options.into_command(seq, signal_name, payloads, headers, target));
             cancellable_outbound(SignalChildFut::Running {
                 inner: cmd,
                 data_converter: base_ctx.data_converter().clone(),
@@ -3099,7 +3090,7 @@ where
             },
             signal,
             input,
-            options.cancellation_token,
+            options,
         )
     }
 }
@@ -3146,7 +3137,7 @@ impl ExternalWorkflowHandle {
             },
             signal,
             input,
-            options.cancellation_token,
+            options,
         )
     }
 

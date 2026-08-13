@@ -54,6 +54,8 @@ relevant information.
   `RuntimeOptions::disable_environment_info` to turn the reporting off.
 * Workers now log a `[TMPRL1104]` warning when a workflow task takes longer than 5 seconds. Set
   `TEMPORAL_WORKFLOW_TASK_DURATION_WARN_SECONDS` to change the threshold.
+* `SignalWorkflowOptions::summary` attaches a single-line summary to a signal sent to another
+  workflow, which the UI and CLI display alongside the resulting history event.
 
 ### Changed
 * Cancellation errors propagated after workflow cancellation now complete the workflow as cancelled
