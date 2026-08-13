@@ -115,6 +115,8 @@ relevant information.
   Non-validation failures are reported as `WorkerRunError::Fatal` with a message and source.
 
 ### Fixed
+* Workers no longer send worker heartbeats or appear in centralized heartbeat reports before
+  `Worker::run` begins.
 * Local activity resolutions are now delivered to workflows as each activity completes instead of
   waiting for every local activity in the workflow task. This allows sequences of short local
   activities to make progress while a long-running local activity executes in parallel, while
