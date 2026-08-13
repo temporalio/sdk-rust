@@ -149,7 +149,12 @@ async fn describe() {
         let result = handle.result().await.unwrap();
 
         let desc = handle
-            .describe(ActivityDescribeOptions::builder().include_input().include_outcome().build())
+            .describe(
+                ActivityDescribeOptions::builder()
+                    .include_input()
+                    .include_outcome()
+                    .build(),
+            )
             .await
             .unwrap();
 
