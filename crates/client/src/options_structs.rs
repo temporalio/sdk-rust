@@ -710,6 +710,7 @@ pub struct WorkflowCountOptions {
 /// Options for starting a standalone activity.
 #[derive(Clone, Debug, bon::Builder)]
 #[builder(start_fn = new, on(String, into))]
+#[non_exhaustive]
 pub struct ActivityStartOptions {
     /// Task queue to run this activity on.
     #[builder(start_fn)]
@@ -846,6 +847,7 @@ pub struct ActivityCountOptions {}
 /// Note that these fields contain payloads that can be arbitrarily large. It's recommended not to
 /// include them unless they're needed.
 #[derive(Debug, Clone, Default)]
+#[non_exhaustive]
 pub struct ActivityDescribeOptions {
     /// If `true` and the activity received input, the input will be included.
     pub include_input: bool,
@@ -859,6 +861,7 @@ pub struct ActivityDescribeOptions {
 
 /// Options for [`ActivityHandle::cancel`](crate::ActivityHandle::cancel).
 #[derive(Debug, Clone, Default)]
+#[non_exhaustive]
 pub struct ActivityCancelOptions {
     /// Reason for cancellation. Can be empty.
     pub reason: String,
@@ -866,6 +869,7 @@ pub struct ActivityCancelOptions {
 
 /// Options for [`ActivityHandle::terminate`](crate::ActivityHandle::terminate).
 #[derive(Debug, Clone, Default)]
+#[non_exhaustive]
 pub struct ActivityTerminateOptions {
     /// Reason for termination. Can be empty.
     pub reason: String,

@@ -359,7 +359,6 @@ impl ActivityOptions {
         args: Vec<Payload>,
         headers: HashMap<String, Payload>,
     ) -> WorkflowCommand {
-        let close_timeouts = self.close_timeouts.into_values();
         command_with_metadata(
             workflow_command::Variant::ScheduleActivity(ScheduleActivity {
                 seq,
@@ -368,14 +367,16 @@ impl ActivityOptions {
                 task_queue: self.task_queue.unwrap_or_default(),
                 arguments: args,
                 headers,
-                schedule_to_close_timeout: close_timeouts
-                    .schedule_to_close
+                schedule_to_close_timeout: self
+                    .close_timeouts
+                    .schedule_to_close()
                     .and_then(|duration| duration.try_into().ok()),
                 schedule_to_start_timeout: self
                     .schedule_to_start_timeout
                     .and_then(|duration| duration.try_into().ok()),
-                start_to_close_timeout: close_timeouts
-                    .start_to_close
+                start_to_close_timeout: self
+                    .close_timeouts
+                    .start_to_close()
                     .and_then(|duration| duration.try_into().ok()),
                 heartbeat_timeout: self
                     .heartbeat_timeout

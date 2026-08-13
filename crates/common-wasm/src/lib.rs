@@ -75,30 +75,23 @@ pub enum ActivityCloseTimeouts {
 }
 
 impl ActivityCloseTimeouts {
-    /// For internal use. Converts options to [`ActivityCloseTimeoutValues`].
-    #[doc(hidden)]
-    pub fn into_values(self) -> ActivityCloseTimeoutValues {
-        let (schedule_to_close, start_to_close) = match self {
-            ActivityCloseTimeouts::ScheduleToClose(t) => (Some(t), None),
-            ActivityCloseTimeouts::StartToClose(t) => (None, Some(t)),
-            ActivityCloseTimeouts::Both {
-                schedule_to_close,
-                start_to_close,
-            } => (Some(schedule_to_close), Some(start_to_close)),
-        };
-
-        ActivityCloseTimeoutValues {
-            schedule_to_close,
-            start_to_close,
+    /// Returns value of [`Self::ScheduleToClose`]  or [`Self::Both::schedule_to_close`].
+    pub fn schedule_to_close(&self) -> Option<Duration> {
+        match self {
+            ActivityCloseTimeouts::ScheduleToClose(schedule_to_close)
+            | ActivityCloseTimeouts::Both {
+                schedule_to_close, ..
+            } => Some(*schedule_to_close),
+            _ => None,
         }
     }
-}
 
-/// For internal use. Obtained from [`ActivityCloseTimeouts`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[non_exhaustive] // disallow direct construction
-#[doc(hidden)]
-pub struct ActivityCloseTimeoutValues {
-    pub schedule_to_close: Option<Duration>,
-    pub start_to_close: Option<Duration>,
+    /// Returns value of [`Self::StartToClose`]  or [`Self::Both::start_to_close`].
+    pub fn start_to_close(&self) -> Option<Duration> {
+        match self {
+            ActivityCloseTimeouts::StartToClose(start_to_close)
+            | ActivityCloseTimeouts::Both { start_to_close, .. } => Some(*start_to_close),
+            _ => None,
+        }
+    }
 }

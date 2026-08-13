@@ -101,19 +101,19 @@ impl ActivityIdentifier {
         }
     }
 
-    /// Returns tuple of (workflow_id, run_id, activity_id). Panics if identifier is a token.
-    fn id_tuple(self) -> (String, String, String) {
+    /// Returns tuple of (workflow_id, run_id, activity_id).
+    fn into_parts(self) -> Option<(String, String, String)> {
         match self {
-            Self::TaskToken(_) => unreachable!(),
+            Self::TaskToken(_) => None,
             Self::ByIdWorkflow {
                 workflow_id,
                 run_id,
                 activity_id,
-            } => (workflow_id, run_id, activity_id),
+            } => Some((workflow_id, run_id, activity_id)),
             Self::ByIdStandalone {
                 activity_id,
                 run_id,
-            } => (String::new(), run_id, activity_id),
+            } => Some((String::new(), run_id, activity_id)),
         }
     }
 }
@@ -180,7 +180,7 @@ impl<CT: WorkflowService + NamespacedClient + Clone> AsyncActivityHandle<CT> {
                             .await
                             .map_err(AsyncActivityError::from_status)?;
                         } else {
-                            let (workflow_id, run_id, activity_id) = identifier.id_tuple();
+                            let (workflow_id, run_id, activity_id) = identifier.into_parts().unwrap();
                             let mut request = RespondActivityTaskCompletedByIdRequest {
                                 namespace: client.namespace(),
                                 workflow_id,
@@ -268,7 +268,7 @@ impl<CT: WorkflowService + NamespacedClient + Clone> AsyncActivityHandle<CT> {
                             .await
                             .map_err(AsyncActivityError::from_status)?;
                         } else {
-                            let (workflow_id, run_id, activity_id) = identifier.id_tuple();
+                            let (workflow_id, run_id, activity_id) = identifier.into_parts().unwrap();
                             let mut request = RespondActivityTaskFailedByIdRequest {
                                 namespace: client.namespace(),
                                 workflow_id,
@@ -338,7 +338,7 @@ impl<CT: WorkflowService + NamespacedClient + Clone> AsyncActivityHandle<CT> {
                             .await
                             .map_err(AsyncActivityError::from_status)?;
                         } else {
-                            let (workflow_id, run_id, activity_id) = identifier.id_tuple();
+                            let (workflow_id, run_id, activity_id) = identifier.into_parts().unwrap();
                             let mut request = RespondActivityTaskCanceledByIdRequest {
                                 namespace: client.namespace(),
                                 workflow_id,
@@ -408,7 +408,7 @@ impl<CT: WorkflowService + NamespacedClient + Clone> AsyncActivityHandle<CT> {
                             .into_inner();
                             Ok(ActivityHeartbeatResponse::from(response))
                         } else {
-                            let (workflow_id, run_id, activity_id) = identifier.id_tuple();
+                            let (workflow_id, run_id, activity_id) = identifier.into_parts().unwrap();
                             let mut request = RecordActivityTaskHeartbeatByIdRequest {
                                 namespace: client.namespace(),
                                 workflow_id,

@@ -2060,7 +2060,6 @@ where
         let dc = client.data_converter();
         let sc = &SerializationContextData::Activity;
 
-        let close_timeouts = options.close_timeouts.into_values();
         let user_metadata = {
             let summary = match &options.static_summary {
                 Some(summary) => Some(dc.to_payload(sc, summary).await?),
@@ -2089,7 +2088,7 @@ where
                         normal_name: "".to_string(),
                     }),
                     schedule_to_close_timeout: try_into_or_box_err(
-                        close_timeouts.schedule_to_close,
+                        options.close_timeouts.schedule_to_close(),
                         StartActivityError::Other,
                     )?,
                     schedule_to_start_timeout: try_into_or_box_err(
@@ -2097,7 +2096,7 @@ where
                         StartActivityError::Other,
                     )?,
                     start_to_close_timeout: try_into_or_box_err(
-                        close_timeouts.start_to_close,
+                        options.close_timeouts.start_to_close(),
                         StartActivityError::Other,
                     )?,
                     heartbeat_timeout: try_into_or_box_err(

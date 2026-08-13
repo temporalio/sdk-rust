@@ -230,22 +230,19 @@ impl ActivityContext {
 
     /// Return a workflow handle for the workflow execution that started this activity, if any.
     pub fn workflow_handle<W: HasWorkflowDefinition>(&self) -> Option<WorkflowHandle<Client, W>> {
-        self.info().workflow_id.clone().map(|workflow_id| {
-            debug_assert!(
-                self.info().workflow_run_id.is_some(),
-                "workflow_run_id should be set when workflow_id is set"
-            );
-            let run_id = self.info.workflow_run_id.clone();
-            WorkflowHandle::new(
-                self.client(),
-                WorkflowExecutionInfo {
-                    namespace: self.client_options.namespace.clone(),
-                    workflow_id,
-                    run_id: run_id.clone(),
-                    first_execution_run_id: run_id,
-                },
-            )
-        })
+        let workflow_id = self.info.workflow_id.clone()?;
+        let run_id = self.info.workflow_run_id.clone();
+        let first_execution_run_id = run_id.clone();
+
+        Some(WorkflowHandle::new(
+            self.client(),
+            WorkflowExecutionInfo {
+                namespace: self.client_options.namespace.clone(),
+                workflow_id,
+                run_id,
+                first_execution_run_id,
+            },
+        ))
     }
 
     /// Get headers attached to this activity

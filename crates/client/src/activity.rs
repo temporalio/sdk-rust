@@ -51,7 +51,6 @@ impl Stream for ListActivitiesStream {
             }
             match self.inner.poll_next_unpin(cx) {
                 Poll::Ready(Some(Ok(items))) => {
-                    // Using into() rather than extend() to avoid moving items in memory
                     self.buffer = items.into();
                 }
                 Poll::Ready(Some(Err(e))) => {
