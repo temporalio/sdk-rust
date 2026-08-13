@@ -9,7 +9,7 @@ use std::{
 };
 use temporalio_client::WorkflowStartOptions;
 use temporalio_common::{
-    UntypedWorkflow,
+    UntypedActivity, UntypedWorkflow,
     data_converters::RawValue,
     protos::{
         coresdk::{AsJsonPayloadExt, FromJsonPayloadExt},
@@ -342,8 +342,12 @@ impl ActivityIdOrTypeChangeWf {
                 )
                 .await?;
             } else {
-                ctx.execute_local_activity(StdActivities::no_op, (), Default::default())
-                    .await?;
+                ctx.execute_local_activity(
+                    UntypedActivity::new("not the activity type"),
+                    RawValue::empty(),
+                    Default::default(),
+                )
+                .await?;
             }
         } else if id_change {
             ctx.execute_activity(
@@ -356,8 +360,8 @@ impl ActivityIdOrTypeChangeWf {
             .await?;
         } else {
             ctx.execute_activity(
-                StdActivities::no_op,
-                (),
+                UntypedActivity::new("not the activity type"),
+                RawValue::empty(),
                 ActivityOptions::start_to_close_timeout(Duration::from_secs(5)),
             )
             .await?;
