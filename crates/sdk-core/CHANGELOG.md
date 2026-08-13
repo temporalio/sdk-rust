@@ -34,6 +34,7 @@ relevant information.
 ## Unreleased
 
 ### Added
+* Core-based SDKs using the C bridge can now select compact, pretty, or JSON console log output.
 * Core console logs can now be emitted as newline-delimited JSON when an SDK selects the JSON log
   format. Configured log filters continue to apply to JSON output.
 * Worker heartbeats now report the SDK runtime, hosting environments, operating system, and

@@ -40,6 +40,13 @@ typedef enum TemporalCoreMetricKind {
   TemporalCoreMetricKind_UpDownCounterInteger,
 } TemporalCoreMetricKind;
 
+typedef enum TemporalCoreConsoleLogFormat {
+  TemporalCoreConsoleLogFormat_Unspecified = 0,
+  TemporalCoreConsoleLogFormat_Compact = 1,
+  TemporalCoreConsoleLogFormat_Pretty = 2,
+  TemporalCoreConsoleLogFormat_Json = 3,
+} TemporalCoreConsoleLogFormat;
+
 typedef enum TemporalCoreForwardedLogLevel {
   TemporalCoreForwardedLogLevel_Trace = 0,
   TemporalCoreForwardedLogLevel_Debug,
@@ -392,6 +399,7 @@ typedef void (*TemporalCoreForwardedLogCallback)(enum TemporalCoreForwardedLogLe
 
 typedef struct TemporalCoreLoggingOptions {
   struct TemporalCoreByteArrayRef filter;
+  enum TemporalCoreConsoleLogFormat format;
   /**
    * This callback is expected to work for the life of the runtime.
    */

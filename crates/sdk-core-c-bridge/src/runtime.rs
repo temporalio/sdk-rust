@@ -20,9 +20,10 @@ use temporalio_common::{
         Runtime as CoreEnvironmentRuntime, runtime::RuntimeType as CoreRuntimeType,
     },
     telemetry::{
-        CoreLog, CoreLogConsumer, HistogramBucketOverrides, Logger, MetricTemporality,
-        OtelCollectorOptions, PrometheusExporterOptions, TelemetryOptions as CoreTelemetryOptions,
-        build_otlp_metric_exporter, metrics::CoreMeter, start_prometheus_metric_exporter,
+        CoreLog, CoreLogConsumer, HistogramBucketOverrides, Logger, LoggerFormat,
+        MetricTemporality, OtelCollectorOptions, PrometheusExporterOptions,
+        TelemetryOptions as CoreTelemetryOptions, build_otlp_metric_exporter, metrics::CoreMeter,
+        start_prometheus_metric_exporter,
     },
 };
 use temporalio_sdk_core::{
@@ -138,8 +139,18 @@ pub struct TelemetryOptions {
 #[repr(C)]
 pub struct LoggingOptions {
     pub filter: ByteArrayRef,
+    pub format: ConsoleLogFormat,
     /// This callback is expected to work for the life of the runtime.
     pub forward_to: ForwardedLogCallback,
+}
+
+#[derive(Clone, Copy)]
+#[repr(C)]
+pub enum ConsoleLogFormat {
+    Unspecified = 0,
+    Compact = 1,
+    Pretty = 2,
+    Json = 3,
 }
 
 // This has to be Option here because of https://github.com/mozilla/cbindgen/issues/326
@@ -320,7 +331,12 @@ impl Runtime {
                 } else {
                     Logger::Console {
                         filter: v.filter.to_string(),
-                        format: None,
+                        format: match v.format {
+                            ConsoleLogFormat::Unspecified => None,
+                            ConsoleLogFormat::Compact => Some(LoggerFormat::Compact),
+                            ConsoleLogFormat::Pretty => Some(LoggerFormat::Pretty),
+                            ConsoleLogFormat::Json => Some(LoggerFormat::Json),
+                        },
                     }
                 }
             });
