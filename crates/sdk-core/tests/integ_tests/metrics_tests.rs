@@ -1235,15 +1235,8 @@ async fn nexus_metrics() {
         .unwrap();
 
     let nexus_polling = async {
-        // The number of tasks the server delivers here isn't fixed, so drain until the worker
-        // shuts down rather than counting them. Stopping early would leave the operation we
-        // deliberately never respond to outstanding, which blocks shutdown forever.
-        loop {
-            let nt = match core_worker.poll_nexus_task().await {
-                Ok(nt) => nt,
-                Err(PollError::ShutDown) => break,
-                Err(e) => panic!("Unexpected nexus poll error: {e:?}"),
-            };
+        for _ in 0..5 {
+            let nt = core_worker.poll_nexus_task().await.unwrap();
             let task_token = nt.task_token().to_vec();
             let status = if matches!(nt.variant, Some(nexus_task::Variant::CancelTask(_))) {
                 nexus_task_completion::Status::AckCancel(true)
@@ -1316,6 +1309,11 @@ async fn nexus_metrics() {
                 .await
                 .unwrap();
         }
+        // Gotta get shutdown poll
+        assert_matches!(
+            core_worker.poll_nexus_task().await,
+            Err(PollError::ShutDown)
+        );
     };
 
     join!(nexus_polling, async {
