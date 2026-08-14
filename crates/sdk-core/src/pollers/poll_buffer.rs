@@ -25,11 +25,17 @@ use std::{
 use temporalio_client::{
     ERROR_RETURNED_DUE_TO_SHORT_CIRCUIT, jittered, request_extensions::NoRetryOnMatching,
 };
-use temporalio_common::protos::temporal::api::{
-    taskqueue::v1::PollerScalingDecision,
-    workflowservice::v1::{
-        PollActivityTaskQueueResponse, PollNexusTaskQueueResponse, PollWorkflowTaskQueueResponse,
+use temporalio_common::protos::{
+    temporal::api::{
+        enums::v1::ResourceExhaustedCause,
+        errordetails::v1::ResourceExhaustedFailure,
+        taskqueue::v1::PollerScalingDecision,
+        workflowservice::v1::{
+            PollActivityTaskQueueResponse, PollNexusTaskQueueResponse,
+            PollWorkflowTaskQueueResponse,
+        },
     },
+    utilities::decode_status_detail,
 };
 use tokio::{
     sync::{
@@ -550,6 +556,7 @@ where
             ingested_last_period: Default::default(),
             scale_up_allowed: AtomicBool::new(true),
             last_successful_poll_time,
+            warned_worker_deployment_limits: AtomicBool::new(false),
             exponential_backoff: parking_lot::Mutex::new(TASK_POLL_BACKOFF.build()),
             resource_exhausted_backoff: parking_lot::Mutex::new(THROTTLE_POLL_BACKOFF.build()),
         });
@@ -616,6 +623,7 @@ struct PollScalerReportHandle {
     ingested_last_period: AtomicUsize,
     scale_up_allowed: AtomicBool,
     last_successful_poll_time: Arc<AtomicCell<Option<SystemTime>>>,
+    warned_worker_deployment_limits: AtomicBool,
 
     // Exponential backoff for normal errors and resource exhausted errors
     exponential_backoff: parking_lot::Mutex<backon::ExponentialBackoff>,
@@ -634,6 +642,9 @@ impl PollScalerReportHandle {
             Ok(res) => {
                 self.last_successful_poll_time
                     .store(Some(SystemTime::now()));
+                // A later deployment-limit failure is a new incident after polling recovers.
+                self.warned_worker_deployment_limits
+                    .store(false, Ordering::Relaxed);
 
                 // Reset backoff on successful poll
                 *self.exponential_backoff.lock() = TASK_POLL_BACKOFF.build();
@@ -673,6 +684,13 @@ impl PollScalerReportHandle {
             }
             Err(e) => {
                 if matches!(self.behavior, PollerBehavior::Autoscaling { .. }) {
+                    if self.should_warn_worker_deployment_limits(e) {
+                        warn!(
+                            error = ?e,
+                            "Worker deployment limits were reached while polling for tasks; the worker will continue retrying"
+                        );
+                    }
+
                     // Follow the same backoff logic as the retry client
                     let mut backoff_duration = self
                         .exponential_backoff
@@ -710,6 +728,19 @@ impl PollScalerReportHandle {
             }
         }
         (true, None)
+    }
+
+    fn should_warn_worker_deployment_limits(&self, error: &tonic::Status) -> bool {
+        error.code() == Code::ResourceExhausted
+            && decode_status_detail::<ResourceExhaustedFailure>(error.details()).is_some_and(
+                |details| {
+                    ResourceExhaustedCause::try_from(details.cause)
+                        == Ok(ResourceExhaustedCause::WorkerDeploymentLimits)
+                },
+            )
+            && !self
+                .warned_worker_deployment_limits
+                .swap(true, Ordering::Relaxed)
     }
 
     #[inline]
@@ -862,9 +893,13 @@ mod tests {
         worker::client::mocks::mock_manual_worker_client,
     };
     use futures_util::FutureExt;
+    use prost::Message;
     use rstest::rstest;
     use std::time::Duration;
-    use temporalio_common::protos::temporal::api::namespace::v1::namespace_info::Capabilities;
+    use temporalio_common::protos::{
+        google::rpc::Status as RpcStatus,
+        temporal::api::namespace::v1::namespace_info::Capabilities,
+    };
     use tokio::{select, sync::Notify};
 
     #[tokio::test]
@@ -1282,6 +1317,7 @@ mod tests {
             ingested_last_period: Default::default(),
             scale_up_allowed: AtomicBool::new(true),
             last_successful_poll_time: Arc::new(AtomicCell::new(None)),
+            warned_worker_deployment_limits: AtomicBool::new(false),
             exponential_backoff: parking_lot::Mutex::new(TASK_POLL_BACKOFF.build()),
             resource_exhausted_backoff: parking_lot::Mutex::new(THROTTLE_POLL_BACKOFF.build()),
         });
@@ -1294,5 +1330,75 @@ mod tests {
 
         assert_eq!(handle.target.load(Ordering::Relaxed), expected_target);
         assert!(!handle.ever_saw_scaling_decision.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn worker_deployment_limit_warning_is_deduplicated_until_polling_recovers() {
+        let handle = PollScalerReportHandle {
+            max: 10,
+            min: 1,
+            target: AtomicUsize::new(5),
+            ever_saw_scaling_decision: AtomicBool::new(false),
+            capabilities: Arc::new(NamespaceCapabilities::default()),
+            behavior: PollerBehavior::Autoscaling {
+                minimum: 1,
+                maximum: 10,
+                initial: 5,
+            },
+            ingested_this_period: Default::default(),
+            ingested_last_period: Default::default(),
+            scale_up_allowed: AtomicBool::new(true),
+            last_successful_poll_time: Arc::new(AtomicCell::new(None)),
+            warned_worker_deployment_limits: AtomicBool::new(false),
+            exponential_backoff: parking_lot::Mutex::new(TASK_POLL_BACKOFF.build()),
+            resource_exhausted_backoff: parking_lot::Mutex::new(THROTTLE_POLL_BACKOFF.build()),
+        };
+        let failed_poll: Result<PollWorkflowTaskQueueResponse, tonic::Status> =
+            Err(resource_exhausted_status(
+                ResourceExhaustedCause::WorkerDeploymentLimits,
+                "reached maximum deployments in namespace (100)",
+            ));
+        let deployment_limit = failed_poll.as_ref().unwrap_err();
+
+        handle.poll_result(&failed_poll);
+        assert!(
+            handle
+                .warned_worker_deployment_limits
+                .load(Ordering::Relaxed)
+        );
+        assert!(!handle.should_warn_worker_deployment_limits(deployment_limit));
+        assert!(
+            !handle.should_warn_worker_deployment_limits(&resource_exhausted_status(
+                ResourceExhaustedCause::ConcurrentLimit,
+                "too many concurrent pollers",
+            ))
+        );
+
+        let successful_poll: Result<PollWorkflowTaskQueueResponse, tonic::Status> =
+            Ok(PollWorkflowTaskQueueResponse::default());
+        handle.poll_result(&successful_poll);
+        assert!(handle.should_warn_worker_deployment_limits(deployment_limit));
+    }
+
+    fn resource_exhausted_status(cause: ResourceExhaustedCause, message: &str) -> tonic::Status {
+        let detail = ResourceExhaustedFailure {
+            cause: cause.into(),
+            scope: Default::default(),
+        };
+        let status = RpcStatus {
+            code: Code::ResourceExhausted as i32,
+            message: message.to_string(),
+            details: vec![prost_types::Any {
+                type_url:
+                    "type.googleapis.com/temporal.api.errordetails.v1.ResourceExhaustedFailure"
+                        .to_string(),
+                value: detail.encode_to_vec(),
+            }],
+        };
+        tonic::Status::with_details(
+            Code::ResourceExhausted,
+            message,
+            status.encode_to_vec().into(),
+        )
     }
 }
