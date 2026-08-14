@@ -1,7 +1,8 @@
 use crate::{
     common::{
-        ActivationAssertionsInterceptor, CoreWfStarter, INTEG_CLIENT_IDENTITY,
-        activity_functions::StdActivities, init_core_and_create_wf,
+        ActivationAssertionsInterceptor, CLI_VERSION_OVERRIDE_ENV_VAR, CoreWfStarter,
+        INTEG_CLIENT_IDENTITY, activity_functions::StdActivities, init_core_and_create_wf,
+        init_integ_telem,
     },
     shared_tests,
 };
@@ -9,6 +10,7 @@ use anyhow::anyhow;
 use assert_matches::assert_matches;
 use futures_util::FutureExt;
 use std::{
+    env,
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
@@ -66,6 +68,7 @@ use temporalio_sdk_core::{
     },
 };
 use tokio::{join, sync::Semaphore, time::sleep};
+use tracing::warn;
 
 #[workflow]
 #[derive(Default)]
@@ -2407,5 +2410,25 @@ async fn immediate_activity_cancelation() {
 #[case::eager(false)]
 #[tokio::test]
 async fn activity_cancel_delivered_without_heartbeat(#[case] disable_eager: bool) {
+    // Cancellation of activities through Worker Commands was added in Server v1.32.0-158.0,
+    // but the case for eager activities was initially broken. It got fixed in
+    // temporalio/temporal#10634, which was released in Server v1.32.0-159.0.
+    //
+    // At this time, there is no release of the Temporal CLI that bundles Server
+    // v1.32.0-159.0. We're pinned on CLI "v1.7.4-standalone-nexus-operations" which
+    // bundles Server v1.32.0-158.0, and therefore has the broken support for eager
+    // activity cancellation. That results in the eager activity cancelation test
+    // failing in CI and local tests against the CLI Dev Server.
+    //
+    // FIXME: Remove once we're pinned on a CLI that bundles Server >v1.32.0-159.0.
+    const CLI_WITHOUT_EAGER_CANCEL_FIX: &str = "v1.7.4-standalone-nexus-operations";
+    if !disable_eager
+        && env::var(CLI_VERSION_OVERRIDE_ENV_VAR).is_ok_and(|v| v == CLI_WITHOUT_EAGER_CANCEL_FIX)
+    {
+        // The skip message would go unlogged as no telemetry has been initialized yet.
+        init_integ_telem();
+        warn!("Skipping test: eager activity cancel requires server >= v1.32.0-159.0");
+        return;
+    }
     shared_tests::activity_cancel_delivered_without_heartbeat(disable_eager).await
 }

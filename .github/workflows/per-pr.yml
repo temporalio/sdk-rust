@@ -223,11 +223,23 @@ jobs:
           )"
           test -x "$integ_test_binary"
           test -x "$integ_runner_binary"
+          # The CLI is cached under a version-derived name, so the container only finds the one
+          # the previous step downloaded if it asks for the same version. Cargo's `[env]` does not
+          # reach a directly invoked binary, hence passing the pin, if any, explicitly.
+          cli_version_override="$(
+            sed -n 's/^CLI_VERSION_OVERRIDE = "\(.*\)"$/\1/p' .cargo/config.toml
+          )"
+          cli_version_env=()
+          if [ -n "$cli_version_override" ]; then
+            cli_version_env=(--env "CLI_VERSION_OVERRIDE=$cli_version_override")
+          fi
           docker run --rm \
             --env TMPDIR="$RUNNER_TEMP" \
             --env TEMPORAL_TEST_EXPECT_DOCKER=true \
+            "${cli_version_env[@]}" \
             --volume "$RUNNER_TEMP:$RUNNER_TEMP" \
             --volume "$GITHUB_WORKSPACE:$GITHUB_WORKSPACE" \
+            --volume /etc/ssl/certs/ca-certificates.crt:/etc/ssl/certs/ca-certificates.crt:ro \
             --workdir "$GITHUB_WORKSPACE" \
             ubuntu:24.04 \
             "$integ_runner_binary" --test-executable "$integ_test_binary" \
