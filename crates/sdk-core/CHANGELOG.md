@@ -57,3 +57,8 @@ relevant information.
   preserving the resolution ordering recorded in existing histories during replay.
 * Try-cancel child workflows no longer cause nondeterminism when they complete or fail after their
   cancellation was requested.
+* Nexus tasks are now timed out locally even when the server sends a `request-timeout` header that
+  falls outside the Nexus duration grammar, such as a negative value for a task whose deadline has
+  already elapsed, a sub-millisecond unit, or a multi-unit value like `1m30s`. Previously such a
+  header was ignored entirely, so the handler was never told the task had timed out, and a task
+  left unanswered could block worker shutdown indefinitely.
