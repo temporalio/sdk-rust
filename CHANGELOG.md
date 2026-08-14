@@ -33,6 +33,8 @@ relevant information.
 
 ## Unreleased
 
+## [0.7.0] - 2020-08-14
+
 ### Added
 * `LoggerFormat` for selecting compact, pretty, or JSON Core console log output. Configured log
   filters continue to apply to JSON output.
