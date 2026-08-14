@@ -57,7 +57,9 @@ pub enum EphemeralServerError {
         source: Box<dyn Error + Send + Sync>,
     },
     /// The server process did not become available before its startup deadline.
-    #[error("ephemeral server at {target} did not start within {timeout:?}")]
+    #[error(
+        "ephemeral server at {target} did not start within {timeout:?}. Make sure another download isn't stuck and delete the temp file."
+    )]
     StartupTimeout {
         /// Server target that could not be reached.
         target: String,
