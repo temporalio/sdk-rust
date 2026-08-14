@@ -15,12 +15,12 @@ use temporalio_common_wasm::{
             },
             common::VersioningIntent as ProtoVersioningIntent,
             nexus::NexusOperationCancellationType as ProtoNexusOperationCancellationType,
-            workflow_activation::SignalWorkflow,
             workflow_commands::{
                 ActivityCancellationType as ProtoActivityCancellationType,
                 ContinueAsNewWorkflowExecution, ScheduleActivity, ScheduleLocalActivity,
-                ScheduleNexusOperation, StartChildWorkflowExecution, StartTimer, WorkflowCommand,
-                workflow_command,
+                ScheduleNexusOperation, SignalExternalWorkflowExecution,
+                StartChildWorkflowExecution, StartTimer, WorkflowCommand,
+                signal_external_workflow_execution, workflow_command,
             },
         },
         temporal::api::{
@@ -580,66 +580,6 @@ impl ChildWorkflowOptions {
     }
 }
 
-/// Information needed to send a specific signal
-#[derive(Debug)]
-pub struct Signal {
-    /// The signal name
-    pub signal_name: String,
-    /// The data the signal carries
-    pub data: SignalData,
-}
-
-impl Signal {
-    /// Create a new signal
-    pub fn new(
-        name: impl Into<String>,
-        input: impl IntoIterator<Item = impl Into<Payload>>,
-    ) -> Self {
-        Self {
-            signal_name: name.into(),
-            data: SignalData::new(input),
-        }
-    }
-
-    pub(crate) fn into_invocation(self) -> SignalWorkflow {
-        SignalWorkflow {
-            signal_name: self.signal_name,
-            input: self.data.input,
-            identity: String::new(),
-            headers: self.data.headers,
-        }
-    }
-}
-
-/// Data contained within a signal
-#[derive(Default, Debug)]
-pub struct SignalData {
-    /// The arguments the signal will receive
-    pub input: Vec<Payload>,
-    /// Metadata attached to the signal
-    pub headers: HashMap<String, Payload>,
-}
-
-impl SignalData {
-    /// Create data for a signal
-    pub fn new(input: impl IntoIterator<Item = impl Into<Payload>>) -> Self {
-        Self {
-            input: input.into_iter().map(Into::into).collect(),
-            headers: HashMap::new(),
-        }
-    }
-
-    /// Set a header k/v pair attached to the signal
-    pub fn with_header(
-        &mut self,
-        key: impl Into<String>,
-        payload: impl Into<Payload>,
-    ) -> &mut Self {
-        self.headers.insert(key.into(), payload.into());
-        self
-    }
-}
-
 /// Options for timer
 #[derive(Debug, Clone, bon::Builder)]
 #[non_exhaustive]
@@ -699,6 +639,33 @@ pub struct WaitConditionOptions {
 pub struct SignalWorkflowOptions {
     /// Cancellation token for this signal. `None` inherits workflow cancellation.
     pub cancellation_token: Option<WorkflowCancellationToken>,
+    /// Single-line summary for this signal that will appear in UI/CLI.
+    pub summary: Option<String>,
+}
+
+impl SignalWorkflowOptions {
+    pub(crate) fn into_command(
+        self,
+        seq: u32,
+        signal_name: String,
+        args: Vec<Payload>,
+        headers: HashMap<String, Payload>,
+        target: signal_external_workflow_execution::Target,
+    ) -> WorkflowCommand {
+        command_with_metadata(
+            workflow_command::Variant::SignalExternalWorkflowExecution(
+                SignalExternalWorkflowExecution {
+                    seq,
+                    signal_name,
+                    args,
+                    target: Some(target),
+                    headers,
+                },
+            ),
+            self.summary,
+            None,
+        )
+    }
 }
 
 /// Options for Nexus Operations

@@ -84,8 +84,8 @@
 use crate::{
     ActivityOptions, BaseWorkflowContext, CancellableFuture, CancellableFutureWithReason,
     ChildWorkflowOptions, ContinueAsNewOptions, ExternalWorkflowHandle, LocalActivityOptions,
-    NexusOperationOptions, StartChildWorkflowOutput, StartedChildWorkflow, StartedNexusOperation,
-    TimerOptions, WorkflowCancellationToken, WorkflowContextView,
+    NexusOperationOptions, SignalWorkflowOptions, StartChildWorkflowOutput, StartedChildWorkflow,
+    StartedNexusOperation, TimerOptions, WorkflowCancellationToken, WorkflowContextView,
     cancellation::WorkflowCancellationRegistration,
     runtime::{
         entry::WorkflowError,
@@ -1223,7 +1223,7 @@ pub struct SignalWorkflowInput {
     signal_name: String,
     target: SignalWorkflowTarget,
     decoded: DecodedInput,
-    cancellation_token: Option<WorkflowCancellationToken>,
+    options: SignalWorkflowOptions,
 }
 
 impl SignalWorkflowInput {
@@ -1231,13 +1231,13 @@ impl SignalWorkflowInput {
         signal_name: String,
         target: SignalWorkflowTarget,
         input: Box<dyn Any>,
-        cancellation_token: Option<WorkflowCancellationToken>,
+        options: SignalWorkflowOptions,
     ) -> Self {
         Self {
             signal_name,
             target,
             decoded: DecodedInput::new(Some(input), HashMap::new()),
-            cancellation_token,
+            options,
         }
     }
 
@@ -1249,7 +1249,7 @@ impl SignalWorkflowInput {
         SignalWorkflowTarget,
         Box<dyn Any>,
         HashMap<String, Payload>,
-        Option<WorkflowCancellationToken>,
+        SignalWorkflowOptions,
     ) {
         let (input, headers) = self.decoded.into_parts();
         (
@@ -1257,7 +1257,7 @@ impl SignalWorkflowInput {
             self.target,
             input.expect("signal input must exist"),
             headers,
-            self.cancellation_token,
+            self.options,
         )
     }
 
@@ -1281,14 +1281,14 @@ impl SignalWorkflowInput {
         &mut self.target
     }
 
-    /// Cancellation token for this signal. `None` inherits workflow cancellation.
-    pub fn cancellation_token(&self) -> Option<&WorkflowCancellationToken> {
-        self.cancellation_token.as_ref()
+    /// Signal options.
+    pub fn options(&self) -> &SignalWorkflowOptions {
+        &self.options
     }
 
-    /// Mutably access the signal cancellation token.
-    pub fn cancellation_token_mut(&mut self) -> &mut Option<WorkflowCancellationToken> {
-        &mut self.cancellation_token
+    /// Mutably access signal options.
+    pub fn options_mut(&mut self) -> &mut SignalWorkflowOptions {
+        &mut self.options
     }
 }
 

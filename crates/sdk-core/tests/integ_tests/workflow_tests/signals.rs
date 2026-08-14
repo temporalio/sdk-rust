@@ -12,14 +12,15 @@ use temporalio_common::protos::{
         command::v1::{Command, command},
         common::v1::Payload,
         enums::v1::{CommandType, EventType},
+        sdk::v1::UserMetadata,
     },
 };
 use temporalio_sdk_core::replay::{DEFAULT_WORKFLOW_TYPE, TestHistoryBuilder};
 
 use temporalio_macros::{workflow, workflow_methods};
 use temporalio_sdk::{
-    ApplicationFailure, CancellableFuture, ChildWorkflowOptions, SyncWorkflowContext,
-    WorkflowContext, WorkflowResult,
+    ApplicationFailure, CancellableFuture, ChildWorkflowOptions, SignalWorkflowOptions,
+    SyncWorkflowContext, WorkflowContext, WorkflowResult,
 };
 use temporalio_sdk_core::test_help::MockPollCfg;
 use uuid::Uuid;
@@ -275,7 +276,9 @@ impl SignalSenderCanned {
             .signal(
                 SignalReceiver::handle_signal,
                 "hi!".into(),
-                Default::default(),
+                SignalWorkflowOptions::builder()
+                    .summary("signal summary".to_string())
+                    .build(),
             )
             .await;
         if res.is_err() {
@@ -307,10 +310,14 @@ async fn sends_signal(#[case] fails: bool) {
     mock_cfg.completion_asserts_from_expectations(|mut asserts| {
             asserts.then(move |wft| {
                 assert_matches!(wft.commands.as_slice(),
-                    [Command { attributes: Some(
+                    [cmd @ Command { attributes: Some(
                         command::Attributes::SignalExternalWorkflowExecutionCommandAttributes(attrs)),..}] => {
                         assert_eq!(attrs.signal_name, SIGNAME);
                         assert_eq!(attrs.input.as_ref().unwrap().payloads[0], "hi!".to_string().as_json_payload().unwrap());
+                        assert_eq!(cmd.user_metadata, Some(UserMetadata {
+                            summary: Some("signal summary".as_json_payload().unwrap()),
+                            details: None,
+                        }));
                     }
                 );
             }).then(move |wft| {
