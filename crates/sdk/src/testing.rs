@@ -108,7 +108,7 @@ fn default_workflow_execution() -> WorkflowExecution {
     state_mod(vis = "pub"),
     on(String, into)
 )]
-pub struct ActivityInfoOptions {
+pub struct TestActivityInfoOptions {
     #[builder(default = b"test".to_vec())]
     task_token: Vec<u8>,
     #[builder(default = "test".to_owned())]
@@ -145,15 +145,15 @@ pub struct ActivityInfoOptions {
     run_id: Option<String>,
 }
 
-impl<S: activity_info_options_builder::State> ActivityInfoOptionsBuilder<S> {
+impl<S: test_activity_info_options_builder::State> TestActivityInfoOptionsBuilder<S> {
     /// Build activity information from these test options.
     pub fn build(self) -> ActivityInfo {
         self.build_internal().into()
     }
 }
 
-impl From<ActivityInfoOptions> for ActivityInfo {
-    fn from(options: ActivityInfoOptions) -> Self {
+impl From<TestActivityInfoOptions> for ActivityInfo {
+    fn from(options: TestActivityInfoOptions) -> Self {
         Self {
             task_token: options.task_token,
             workflow_type: options.workflow_type,
@@ -195,7 +195,7 @@ pub struct ActivityEnvironment {
         setters(option_fn(vis = ""))
     )]
     payload_converter: PayloadConverter,
-    #[builder(default = ActivityInfoOptions::builder().build())]
+    #[builder(default = TestActivityInfoOptions::builder().build())]
     info: ActivityInfo,
     #[builder(default)]
     headers: HashMap<String, Payload>,
