@@ -151,8 +151,8 @@ async fn describe() {
         let desc = handle
             .describe(
                 ActivityDescribeOptions::builder()
-                    .include_input()
-                    .include_outcome()
+                    .include_input(true)
+                    .include_outcome(true)
                     .build(),
             )
             .await

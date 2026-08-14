@@ -834,16 +834,16 @@ pub struct ActivityCountOptions {}
 #[non_exhaustive]
 pub struct ActivityDescribeOptions {
     /// If set and the activity received input, the input will be included.
-    #[builder(default, with = || true, setters(option_fn(vis = "")))]
+    #[builder(default)]
     pub include_input: bool,
     /// If set and the activity is closed, the activity outcome will be included.
-    #[builder(default, with = || true, setters(option_fn(vis = "")))]
+    #[builder(default)]
     pub include_outcome: bool,
     /// If set and the activity sent heartbeat details, the heartbeat details will be included.
-    #[builder(default, with = || true, setters(option_fn(vis = "")))]
+    #[builder(default)]
     pub include_heartbeat_details: bool,
     /// If set and the activity has a failed attempt, the last failure will be included.
-    #[builder(default, with = || true, setters(option_fn(vis = "")))]
+    #[builder(default)]
     pub include_last_failure: bool,
 }
 

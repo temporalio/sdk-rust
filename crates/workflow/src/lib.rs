@@ -39,15 +39,15 @@ pub use temporalio_common_wasm::{
     },
 };
 pub use workflow_context::{
-    ActivityCancellationType, ActivityOptions, BaseWorkflowContext,
-    CancellableFuture, CancellableFutureWithReason, ChildWorkflowCancellationType,
-    ChildWorkflowOptions, ContinueAsNewOptions, ContinueAsNewVersioningBehavior,
-    ExternalWorkflowHandle, LocalActivityOptions, NamespacedWorkflowInfo,
-    NexusOperationCancellationType, NexusOperationOptions, ParentClosePolicy,
-    SignalWorkflowOptions, StartChildWorkflowExecutionFailedCause, StartChildWorkflowOutput,
-    StartedChildWorkflow, StartedNexusOperation, SyncWorkflowContext, TimerOptions,
-    VersioningIntent, WaitConditionOptions, WorkflowContext, WorkflowContextView,
-    WorkflowIdReusePolicy, WorkflowRandomValue,
+    ActivityCancellationType, ActivityOptions, BaseWorkflowContext, CancellableFuture,
+    CancellableFutureWithReason, ChildWorkflowCancellationType, ChildWorkflowOptions,
+    ContinueAsNewOptions, ContinueAsNewVersioningBehavior, ExternalWorkflowHandle,
+    LocalActivityOptions, NamespacedWorkflowInfo, NexusOperationCancellationType,
+    NexusOperationOptions, ParentClosePolicy, SignalWorkflowOptions,
+    StartChildWorkflowExecutionFailedCause, StartChildWorkflowOutput, StartedChildWorkflow,
+    StartedNexusOperation, SyncWorkflowContext, TimerOptions, VersioningIntent,
+    WaitConditionOptions, WorkflowContext, WorkflowContextView, WorkflowIdReusePolicy,
+    WorkflowRandomValue,
 };
 #[doc(hidden)]
 pub use workflow_context::{PatchActivationCallback, PatchActivationCaller};
