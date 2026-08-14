@@ -6,10 +6,11 @@ use crate::{
     workflow_context::{
         ChildWfCommon, NexusUnblockData, PendingChildWorkflow, StartedNexusOperation,
     },
+    workflow_interceptors::WorkflowOutputValue,
 };
 use temporalio_common_wasm::{
     WorkflowDefinition,
-    data_converters::PayloadConversionError,
+    data_converters::{PayloadConversionError, TemporalSerializable},
     error::{
         ActivityExecutionError, ApplicationFailure, ChildWorkflowExecutionError,
         ChildWorkflowStartError, WorkflowSignalError,
@@ -218,10 +219,14 @@ pub type WorkflowResult<T> = Result<T, WorkflowTermination>;
 /// the current Workflow Task so it can be retried.
 ///
 /// Wrap an error in an [`ApplicationFailure`] to explicitly fail the Workflow Execution.
-#[derive(Debug, thiserror::Error)]
+#[derive(derive_more::Debug, thiserror::Error)]
 pub enum WorkflowTermination {
     #[error("Workflow cancelled")]
-    Cancelled,
+    Cancelled {
+        /// Optional cancellation details.
+        #[debug(skip)]
+        details: Option<Box<dyn WorkflowOutputValue + Send + Sync>>,
+    },
     #[error("Workflow evicted from cache")]
     Evicted,
     #[error("Continue as new")]
@@ -231,6 +236,22 @@ pub enum WorkflowTermination {
 }
 
 impl WorkflowTermination {
+    /// Construct a cancelled workflow termination without details.
+    pub fn cancelled() -> Self {
+        Self::Cancelled { details: None }
+    }
+
+    /// Construct a cancelled workflow termination with details that will be converted using the
+    /// active payload converter.
+    pub fn cancelled_with_details<T>(details: T) -> Self
+    where
+        T: TemporalSerializable + Send + Sync + 'static,
+    {
+        Self::Cancelled {
+            details: Some(Box::new(details)),
+        }
+    }
+
     pub fn continue_as_new(can: ContinueAsNewRequest) -> Self {
         Self::ContinueAsNew(Box::new(can))
     }
@@ -243,7 +264,7 @@ impl WorkflowTermination {
 
 impl From<WorkflowCancellationError> for WorkflowTermination {
     fn from(_value: WorkflowCancellationError) -> Self {
-        Self::Cancelled
+        Self::cancelled()
     }
 }
 

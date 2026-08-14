@@ -19,7 +19,7 @@ use crate::{
         HandleSignalInput, HandleSignalResult, HandleUpdateInput, HandleUpdateResult,
         InitializeWorkflowInput, InitializeWorkflowOutput, SyncWorkflowInterceptorContext,
         ValidateUpdateInput, ValidateUpdateResult, WorkflowInterceptor, WorkflowInterceptorContext,
-        WorkflowInterceptorFuture, WorkflowNext, serialize_workflow_output,
+        WorkflowInterceptorFuture, WorkflowNext, WorkflowOutputValue, serialize_workflow_output,
         wrong_workflow_input_type,
     },
 };
@@ -767,7 +767,26 @@ where
         match result {
             Ok(result) => Ok(TerminalOutcome::Completed(result)),
             Err(WorkflowTermination::ContinueAsNew(req)) => Ok(TerminalOutcome::ContinueAsNew(req)),
-            Err(WorkflowTermination::Cancelled) => Ok(TerminalOutcome::Cancelled),
+            Err(WorkflowTermination::Cancelled { details }) => {
+                let details = details
+                    .map(|details| {
+                        (&*details as &dyn WorkflowOutputValue)
+                            .serialize_payloads(&SerializationContext {
+                                data: &SerializationContextData::Workflow,
+                                converter: self.ctx.payload_converter(),
+                            })
+                            .map(|payloads| Payloads { payloads })
+                    })
+                    .transpose()
+                    .map_err(|err| TaskFailure {
+                        failure: Box::new(Failure {
+                            message: format!("Workflow payload conversion failed: {err}"),
+                            ..Default::default()
+                        }),
+                        force_cause: None,
+                    })?;
+                Ok(TerminalOutcome::Cancelled(details))
+            }
             Err(WorkflowTermination::Evicted) => {
                 panic!("workflow instances must not explicitly return eviction")
             }
@@ -781,9 +800,13 @@ where
                 })
             }
             Err(WorkflowTermination::Failed(err)) => {
-                if self.base_ctx.cancellation_token().is_cancelled() && err.as_cancelled().is_some()
+                if self.base_ctx.cancellation_token().is_cancelled()
+                    && let Some(cancelled) = err.as_cancelled()
                 {
-                    return Ok(TerminalOutcome::Cancelled);
+                    let details = cancelled.raw_details().map(|payloads| Payloads {
+                        payloads: payloads.to_vec(),
+                    });
+                    return Ok(TerminalOutcome::Cancelled(details));
                 }
                 let failure = self.base_ctx.data_converter().to_failure(
                     &SerializationContextData::Workflow,

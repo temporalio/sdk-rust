@@ -36,6 +36,8 @@ relevant information.
 ### Added
 * Support for running Standalone Activities in Rust SDK Worker.
 * Client methods for starting and managing execution of Standalone Activities. 
+* `WorkflowTermination::cancelled_with_details` for recording structured details when a Workflow
+  Execution completes as cancelled.
 * `LoggerFormat` for selecting compact, pretty, or JSON Core console log output. Configured log
   filters continue to apply to JSON output.
 * `RpcOptions::builder()` for constructing per-call RPC options.
@@ -69,6 +71,8 @@ relevant information.
   `WorkerInterceptor::with_workflow_replay_worker`.
 
 ### Breaking Changes :boom:
+* `WorkflowTermination::Cancelled` now has an optional `details` field. Use
+  `WorkflowTermination::cancelled()` to construct a cancellation without details.
 * Changes to `ActivityInfo`: instead of `workflow_namespace`, `workflow_execution` and `run_id`,
   there is now `namespace`, `workflow_id`, `workflow_run_id` and `activity_run_id`. 
   Also, `workflow_type` is now `Option<String>`.

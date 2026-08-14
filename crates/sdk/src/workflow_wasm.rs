@@ -341,7 +341,9 @@ impl WorkflowInstance for WasmWorkflowInstance {
                                 wit_types::TerminalOutcome::Failed(failure) => {
                                     TerminalOutcome::Failed(convert_failure(failure))
                                 }
-                                wit_types::TerminalOutcome::Cancelled => TerminalOutcome::Cancelled,
+                                wit_types::TerminalOutcome::Cancelled(details) => {
+                                    TerminalOutcome::Cancelled(details.map(decode_proto))
+                                }
                                 wit_types::TerminalOutcome::ContinueAsNew(req) => {
                                     TerminalOutcome::ContinueAsNew(Box::new(decode_proto(req)))
                                 }
