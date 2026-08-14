@@ -71,7 +71,7 @@ use temporalio_common::{
             enums::v1::EventType,
             history::v1::{HistoryEvent, history_event},
             protocol::v1::{Message as ProtocolMessage, message::SequencingId},
-            sdk::v1::{UserMetadata, WorkflowTaskCompletedMetadata},
+            sdk::v1::{EventGroupMarker, UserMetadata, WorkflowTaskCompletedMetadata},
         },
     },
     worker::WorkerDeploymentVersion,
@@ -1008,6 +1008,7 @@ impl WorkflowMachines {
                         self.workflow_id.clone(),
                         str_to_randomness_seed(&attrs.original_execution_run_id),
                         event_dat.event.event_time.unwrap_or_default(),
+                        event_id,
                         attrs,
                     );
                 } else {
@@ -1027,8 +1028,9 @@ impl WorkflowMachines {
                     attrs,
                 )) = event_dat.event.attributes
                 {
-                    self.drive_me
-                        .send_job(workflow_activation::SignalWorkflow::from(attrs).into());
+                    self.drive_me.send_job(
+                        workflow_activation::SignalWorkflow::from((attrs, event_id)).into(),
+                    );
                 } else {
                     // err
                 }
@@ -1196,7 +1198,10 @@ impl WorkflowMachines {
                         };
                         self.add_cmd_to_wf_task(
                             new_external_cancel(0, we, attrs.child_workflow_only, attrs.reason),
+                            // FIXME: Wire metadata and group markers from lang's cancellation command,
+                            // through the state machine, into the command we issue here.
                             None,
+                            vec![],
                             CommandIdKind::CoreInternal,
                         );
                     }
@@ -1206,7 +1211,10 @@ impl WorkflowMachines {
                         // workflows by users (but rather, just for them to search with).
                         self.add_cmd_to_wf_task(
                             upsert_search_attrs_internal(attrs),
+                            // FIXME: Wire metadata and group markers from lang's patch command,
+                            // through the state machine, into the command we issue here.
                             None,
+                            vec![],
                             CommandIdKind::NeverResolves,
                         );
                     }
@@ -1313,6 +1321,7 @@ impl WorkflowMachines {
                     self.add_cmd_to_wf_task(
                         new_timer(attrs),
                         cmd.metadata,
+                        cmd.event_group_markers,
                         CommandID::Timer(seq).into(),
                     );
                 }
@@ -1326,6 +1335,7 @@ impl WorkflowMachines {
                             self.replaying,
                         ),
                         cmd.metadata,
+                        cmd.event_group_markers,
                         CommandIdKind::NeverResolves,
                     );
                 }
@@ -1345,15 +1355,20 @@ impl WorkflowMachines {
                             use_compat,
                         ),
                         cmd.metadata,
+                        cmd.event_group_markers,
                         CommandID::Activity(seq).into(),
                     );
                 }
                 WFCommandVariant::AddLocalActivity(attrs) => {
                     let seq = attrs.seq;
-                    let attrs: ValidScheduleLA =
-                        ValidScheduleLA::from_schedule_la(attrs, cmd.metadata).map_err(|e| {
-                            fatal!("Invalid schedule local activity request (seq {seq}): {e}")
-                        })?;
+                    let attrs: ValidScheduleLA = ValidScheduleLA::from_schedule_la(
+                        attrs,
+                        cmd.metadata,
+                        cmd.event_group_markers,
+                    )
+                    .map_err(|e| {
+                        fatal!("Invalid schedule local activity request (seq {seq}): {e}")
+                    })?;
                     let (la, mach_resp) = new_local_activity(
                         attrs,
                         self.replaying,
@@ -1382,10 +1397,18 @@ impl WorkflowMachines {
                     );
                 }
                 WFCommandVariant::CompleteWorkflow(attrs) => {
-                    self.add_terminal_command(complete_workflow(attrs), cmd.metadata);
+                    self.add_terminal_command(
+                        complete_workflow(attrs),
+                        cmd.metadata,
+                        cmd.event_group_markers,
+                    );
                 }
                 WFCommandVariant::FailWorkflow(attrs) => {
-                    self.add_terminal_command(fail_workflow(attrs), cmd.metadata);
+                    self.add_terminal_command(
+                        fail_workflow(attrs),
+                        cmd.metadata,
+                        cmd.event_group_markers,
+                    );
                 }
                 WFCommandVariant::ContinueAsNew(attrs) => {
                     let attrs = self.augment_continue_as_new_with_current_values(attrs);
@@ -1393,10 +1416,18 @@ impl WorkflowMachines {
                         attrs.versioning_intent(),
                         &attrs.task_queue,
                     );
-                    self.add_terminal_command(continue_as_new(attrs, use_compat), cmd.metadata);
+                    self.add_terminal_command(
+                        continue_as_new(attrs, use_compat),
+                        cmd.metadata,
+                        cmd.event_group_markers,
+                    );
                 }
                 WFCommandVariant::CancelWorkflow(attrs) => {
-                    self.add_terminal_command(cancel_workflow(attrs), cmd.metadata);
+                    self.add_terminal_command(
+                        cancel_workflow(attrs),
+                        cmd.metadata,
+                        cmd.event_group_markers,
+                    );
                 }
                 WFCommandVariant::SetPatchMarker(attrs) => {
                     // Do not create commands for change IDs that we have already created commands
@@ -1418,6 +1449,7 @@ impl WorkflowMachines {
                         let mkey = self.add_cmd_to_wf_task(
                             patch_machine,
                             cmd.metadata,
+                            cmd.event_group_markers,
                             CommandIdKind::NeverResolves,
                         );
                         self.process_machine_responses(mkey, other_cmds)?;
@@ -1447,6 +1479,7 @@ impl WorkflowMachines {
                             use_compat,
                         ),
                         cmd.metadata,
+                        cmd.event_group_markers,
                         CommandID::ChildWorkflowStart(seq).into(),
                     );
                 }
@@ -1474,6 +1507,7 @@ impl WorkflowMachines {
                             ),
                         ),
                         cmd.metadata,
+                        cmd.event_group_markers,
                         CommandID::CancelExternal(attrs.seq).into(),
                     );
                 }
@@ -1482,6 +1516,7 @@ impl WorkflowMachines {
                     self.add_cmd_to_wf_task(
                         new_external_signal(attrs, &self.worker_config.namespace)?,
                         cmd.metadata,
+                        cmd.event_group_markers,
                         CommandID::SignalExternal(seq).into(),
                     );
                 }
@@ -1501,6 +1536,7 @@ impl WorkflowMachines {
                     self.add_cmd_to_wf_task(
                         modify_workflow_properties(attrs),
                         cmd.metadata,
+                        cmd.event_group_markers,
                         CommandIdKind::NeverResolves,
                     );
                 }
@@ -1523,6 +1559,7 @@ impl WorkflowMachines {
                     self.add_cmd_to_wf_task(
                         NexusOperationMachine::new_scheduled(attrs),
                         cmd.metadata,
+                        cmd.event_group_markers,
                         CommandID::NexusOperation(seq).into(),
                     );
                 }
@@ -1568,8 +1605,9 @@ impl WorkflowMachines {
         &mut self,
         machine: NewMachineWithCommand,
         metadata: Option<UserMetadata>,
+        markers: Vec<EventGroupMarker>,
     ) {
-        let cwfm = self.add_new_command_machine(machine, metadata);
+        let cwfm = self.add_new_command_machine(machine, metadata, markers);
         self.workflow_end_time = Some(SystemTime::now());
         self.current_wf_task_commands.push_back(cwfm);
         // Wipe out any pending / executing local activity data since we're about to terminate
@@ -1582,9 +1620,10 @@ impl WorkflowMachines {
         &mut self,
         machine: NewMachineWithCommand,
         metadata: Option<UserMetadata>,
+        markers: Vec<EventGroupMarker>,
         id: CommandIdKind,
     ) -> MachineKey {
-        let mach = self.add_new_command_machine(machine, metadata);
+        let mach = self.add_new_command_machine(machine, metadata, markers);
         let key = mach.machine;
         if let CommandIdKind::LangIssued(id) = id {
             self.id_to_machine.insert(id, key);
@@ -1600,13 +1639,14 @@ impl WorkflowMachines {
         &mut self,
         machine: NewMachineWithCommand,
         metadata: Option<UserMetadata>,
+        markers: Vec<EventGroupMarker>,
     ) -> CommandAndMachine {
         let k = self.all_machines.insert(machine.machine);
         let cmd = ProtoCommand {
             command_type: machine.command.as_type() as i32,
             attributes: Some(machine.command),
             user_metadata: metadata,
-            event_group_markers: vec![],
+            event_group_markers: markers,
         };
         CommandAndMachine {
             command: cmd,

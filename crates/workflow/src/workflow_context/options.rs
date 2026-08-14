@@ -29,7 +29,7 @@ use temporalio_common_wasm::{
                 ContinueAsNewVersioningBehavior as ProtoContinueAsNewVersioningBehavior,
                 WorkflowIdReusePolicy as ProtoWorkflowIdReusePolicy,
             },
-            sdk::v1::UserMetadata,
+            sdk::v1::{EventGroupMarker, UserMetadata},
         },
     },
     search_attributes::SearchAttributes,
@@ -323,6 +323,13 @@ pub struct ActivityOptions {
     /// If true, disable eager execution for this activity
     #[builder(default)]
     pub do_not_eagerly_execute: bool,
+    /// Event group markers to attach to the resulting `ScheduleActivityTask` command.
+    ///
+    /// **Unstable:** Event Groups are not yet implemented in the Rust SDK; this field exists
+    /// only for internal test purposes. This API *will* change.
+    #[doc(hidden)]
+    #[builder(default)]
+    pub event_group_markers: Vec<EventGroupMarker>,
 }
 
 impl ActivityOptions {
@@ -390,6 +397,7 @@ impl ActivityOptions {
             }),
             self.summary,
             None,
+            self.event_group_markers,
         )
     }
 }
@@ -437,6 +445,13 @@ pub struct LocalActivityOptions {
     pub start_to_close_timeout: Option<Duration>,
     /// Single-line summary for this activity that will appear in UI/CLI.
     pub summary: Option<String>,
+    /// Event group markers to attach to the resulting `RecordMarker` command.
+    ///
+    /// **Unstable:** Event Groups are not yet implemented in the Rust SDK; this field exists
+    /// only for internal test purposes. This API *will* change.
+    #[doc(hidden)]
+    #[builder(default)]
+    pub event_group_markers: Vec<EventGroupMarker>,
 }
 
 impl Default for LocalActivityOptions {
@@ -483,6 +498,7 @@ impl LocalActivityOptions {
             }),
             self.summary,
             None,
+            self.event_group_markers,
         )
     }
 }
@@ -524,6 +540,13 @@ pub struct ChildWorkflowOptions {
     pub search_attributes: Option<SearchAttributes>,
     /// Priority for the workflow
     pub priority: Option<Priority>,
+    /// Event group markers to attach to the resulting `StartChildWorkflowExecution` command.
+    ///
+    /// **Unstable:** Event Groups are not yet implemented in the Rust SDK; this field exists
+    /// only for internal test purposes. This API *will* change.
+    #[doc(hidden)]
+    #[builder(default)]
+    pub event_group_markers: Vec<EventGroupMarker>,
 }
 
 impl ChildWorkflowOptions {
@@ -576,6 +599,7 @@ impl ChildWorkflowOptions {
             }),
             self.static_summary,
             self.static_details,
+            self.event_group_markers,
         )
     }
 }
@@ -591,6 +615,13 @@ pub struct TimerOptions {
     pub cancellation_token: Option<WorkflowCancellationToken>,
     /// Summary of the timer
     pub summary: Option<String>,
+    /// Event group markers to attach to the resulting `StartTimer` command.
+    ///
+    /// **Unstable:** Event Groups are not yet implemented in the Rust SDK; this field exists
+    /// only for internal test purposes. This API *will* change.
+    #[doc(hidden)]
+    #[builder(default)]
+    pub event_group_markers: Vec<EventGroupMarker>,
 }
 
 impl Default for TimerOptions {
@@ -621,6 +652,7 @@ impl TimerOptions {
             }),
             self.summary,
             None,
+            self.event_group_markers,
         )
     }
 }
@@ -641,6 +673,13 @@ pub struct SignalWorkflowOptions {
     pub cancellation_token: Option<WorkflowCancellationToken>,
     /// Single-line summary for this signal that will appear in UI/CLI.
     pub summary: Option<String>,
+    /// Event group markers to attach to the resulting `SignalExternalWorkflowExecution` command.
+    ///
+    /// **Unstable:** Event Groups are not yet implemented in the Rust SDK; this field exists
+    /// only for internal test purposes. This API *will* change.
+    #[doc(hidden)]
+    #[builder(default)]
+    pub event_group_markers: Vec<EventGroupMarker>,
 }
 
 impl SignalWorkflowOptions {
@@ -664,6 +703,7 @@ impl SignalWorkflowOptions {
             ),
             self.summary,
             None,
+            self.event_group_markers,
         )
     }
 }
@@ -870,10 +910,12 @@ fn command_with_metadata(
     variant: workflow_command::Variant,
     summary: Option<String>,
     details: Option<String>,
+    markers: Vec<EventGroupMarker>,
 ) -> WorkflowCommand {
     WorkflowCommand {
         variant: Some(variant),
         user_metadata: string_user_metadata(summary, details),
+        event_group_markers: markers,
     }
 }
 

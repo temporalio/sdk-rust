@@ -1,6 +1,7 @@
 [env]
 # This temporarily overrides the version of the CLI used for integration tests, locally and in CI
-# CLI_VERSION_OVERRIDE = "v1.6.3-serverless"
+# TEMP: Event Groups requires server >v1.32.0-158.0, for which there's no published CLI release yet.
+CLI_VERSION_OVERRIDE = "v1.7.4-standalone-nexus-operations"
 
 [alias]
 # Not sure why --all-features doesn't work

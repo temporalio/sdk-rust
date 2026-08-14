@@ -566,29 +566,52 @@ fn payloads_too_large_nexus_failure(violation: &PayloadLimitViolation) -> NexusT
     })
 }
 
+/// Parses the value of the nexus `request-timeout` header, which the Nexus spec defines as a
+/// positive decimal followed by `ms`, `s`, or `m`.
+///
+/// Temporal server formats this header with Go's `time.Duration::String`, which is a superset of
+/// that grammar: it also emits sub-millisecond units, hours, multi-unit values such as `1m30s`,
+/// and negative values when the task's deadline has already elapsed by the time the task is
+/// dispatched (see <https://github.com/temporalio/temporal/issues/11569>). All of those are accepted
+/// here, and anything that resolves to a non-positive duration means the deadline is already past,
+/// hence a zero timeout.
 fn parse_request_timeout(timeout: &str) -> Result<Duration, anyhow::Error> {
-    let timeout = timeout.trim();
-    let (value, unit) = timeout.split_at(
-        timeout
-            .find(|c: char| !c.is_ascii_digit() && c != '.')
-            .unwrap_or(timeout.len()),
-    );
-
-    match unit {
-        "m" => value
-            .parse::<f64>()
-            .map(|v| Duration::from_secs_f64(60.0 * v))
-            .map_err(Into::into),
-        "s" => value
-            .parse::<f64>()
-            .map(Duration::from_secs_f64)
-            .map_err(Into::into),
-        "ms" => value
-            .parse::<f64>()
-            .map_err(anyhow::Error::from)
-            .and_then(|v| Duration::try_from_secs_f64(v / 1000.0).map_err(Into::into)),
-        _ => Err(anyhow!("Invalid timeout format")),
+    let trimmed = timeout.trim();
+    let (negative, mut rest) = match trimmed.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, trimmed.strip_prefix('+').unwrap_or(trimmed)),
+    };
+    if rest.is_empty() {
+        return Err(anyhow!("Invalid timeout format"));
     }
+
+    let mut total = Duration::ZERO;
+    while !rest.is_empty() {
+        let unit_start = rest
+            .find(|c: char| !c.is_ascii_digit() && c != '.')
+            .ok_or_else(|| anyhow!("Invalid timeout format"))?;
+        let (value, after_value) = rest.split_at(unit_start);
+        let unit_end = after_value
+            .find(|c: char| c.is_ascii_digit())
+            .unwrap_or(after_value.len());
+        let (unit, remainder) = after_value.split_at(unit_end);
+
+        let value = value.parse::<f64>()?;
+        let seconds = match unit {
+            "ns" => value / 1e9,
+            // Go emits the micro sign, but tolerate the Greek letter and the ASCII form too.
+            "us" | "µs" | "μs" => value / 1e6,
+            "ms" => value / 1e3,
+            "s" => value,
+            "m" => value * 60.0,
+            "h" => value * 3600.0,
+            _ => return Err(anyhow!("Invalid timeout format")),
+        };
+        total += Duration::try_from_secs_f64(seconds)?;
+        rest = remainder;
+    }
+
+    Ok(if negative { Duration::ZERO } else { total })
 }
 
 #[cfg(test)]
@@ -614,6 +637,48 @@ mod tests {
             parse_request_timeout("9.155416ms").unwrap(),
             Duration::from_secs_f64(9.155416 / 1000.0)
         );
+    }
+
+    #[test]
+    fn parse_request_timeout_go_duration_forms() {
+        // Units outside the Nexus grammar which Go's `time.Duration::String` may still emit
+        assert_eq!(
+            parse_request_timeout("88.458µs").unwrap(),
+            Duration::from_secs_f64(88.458 / 1e6)
+        );
+        assert_eq!(
+            parse_request_timeout("125ns").unwrap(),
+            Duration::from_nanos(125)
+        );
+        assert_eq!(
+            parse_request_timeout("2h").unwrap(),
+            Duration::from_secs(7200)
+        );
+        // Multi-unit values
+        assert_eq!(
+            parse_request_timeout("1m30.5s").unwrap(),
+            Duration::from_secs_f64(90.5)
+        );
+        assert_eq!(
+            parse_request_timeout("1h0m0s").unwrap(),
+            Duration::from_secs(3600)
+        );
+        // An already-elapsed deadline means the task must be timed out right away
+        assert_eq!(parse_request_timeout("-88.458µs").unwrap(), Duration::ZERO);
+        assert_eq!(parse_request_timeout("-1m30s").unwrap(), Duration::ZERO);
+        assert_eq!(parse_request_timeout("0s").unwrap(), Duration::ZERO);
+        // Leading and surrounding whitespace, and an explicit positive sign
+        assert_eq!(
+            parse_request_timeout("  +10s  ").unwrap(),
+            Duration::from_secs(10)
+        );
+
+        for invalid in ["", "-", "10", "10x", "abc", "s", "1s2"] {
+            assert!(
+                parse_request_timeout(invalid).is_err(),
+                "'{invalid}' should not parse"
+            );
+        }
     }
 
     #[test]
