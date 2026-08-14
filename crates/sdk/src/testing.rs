@@ -183,14 +183,18 @@ impl From<ActivityInfoOptions> for ActivityInfo {
     state_mod(vis = "pub")
 )]
 pub struct ActivityEnvironment {
-    #[builder(start_fn)]
-    payload_converter: PayloadConverter,
     #[builder(field)]
     heartbeat_callback: Option<ActivityHeartbeatCallback>,
     #[builder(field)]
     heartbeat_details: Vec<Payload>,
     #[builder(field)]
     implementers: ActivityImplementers,
+    #[builder(
+        default,
+        getter(name = payload_converter_ref, vis = ""),
+        setters(option_fn(vis = ""))
+    )]
+    payload_converter: PayloadConverter,
     #[builder(default = ActivityInfoOptions::builder().build())]
     info: ActivityInfo,
     #[builder(default)]
@@ -224,37 +228,45 @@ impl<S: activity_environment_builder::State> ActivityEnvironmentBuilder<S> {
         self.heartbeat_callback = Some(Arc::new(callback));
         self
     }
+}
 
-    /// Supply heartbeat details from a previous activity attempt.
+impl<S> ActivityEnvironmentBuilder<S>
+where
+    S: activity_environment_builder::State,
+    S::PayloadConverter: activity_environment_builder::IsSet,
+{
+    /// Supply heartbeat details from the previous activity attempt.
     ///
-    /// Details are serialized with the environment's configured [`PayloadConverter`].
+    /// Accessible via [`ActivityContext::heartbeat_details`].
     pub fn heartbeat_details<T>(mut self, details: T) -> Result<Self, PayloadConversionError>
     where
         T: TemporalSerializable + 'static,
     {
+        let payload_converter = self
+            .payload_converter_ref()
+            .expect("payload converter must be set in builder state");
         let context = SerializationContext {
             data: &SerializationContextData::Activity,
-            converter: &self.payload_converter,
+            converter: payload_converter,
         };
-        self.heartbeat_details = self.payload_converter.to_payloads(&context, &details)?;
+        self.heartbeat_details = payload_converter.to_payloads(&context, &details)?;
         Ok(self)
     }
 }
 
 impl ActivityEnvironment {
-    /// Construct an activity environment builder using the default payload converter.
+    /// Construct an activity environment builder.
     pub fn builder() -> ActivityEnvironmentBuilder {
-        Self::builder_internal(PayloadConverter::default())
+        Self::builder_internal()
     }
 
-    /// Construct an activity environment builder using a custom payload converter.
-    pub fn builder_with_payload_converter(
-        payload_converter: PayloadConverter,
-    ) -> ActivityEnvironmentBuilder {
-        Self::builder_internal(payload_converter)
+    /// Construct an activity environment builder using the default payload converter.
+    pub fn builder_with_default()
+    -> ActivityEnvironmentBuilder<activity_environment_builder::SetPayloadConverter> {
+        Self::builder_internal().payload_converter(PayloadConverter::default())
     }
 
-    /// Run an activity marker with already-typed input.
+    /// Run an activity.
     pub async fn run<A>(
         &self,
         activity: A,
@@ -391,7 +403,7 @@ pub struct ExternalServer {
     _private: (),
 }
 
-/// State for a workflow environment that owns a local dev server.
+/// State for a workflow environment that starts a local dev server.
 #[derive(Debug)]
 #[non_exhaustive]
 pub struct LocalServer {
@@ -622,20 +634,19 @@ mod tests {
     #[tokio::test]
     async fn converts_previous_and_observes_typed_outbound_heartbeat_details() {
         let heartbeats = Arc::new(Mutex::new(Vec::new()));
-        let env =
-            ActivityEnvironment::builder_with_payload_converter(PayloadConverter::serde_json())
-                .heartbeat_details(4_u32)
-                .unwrap()
-                .on_heartbeat({
-                    let heartbeats = heartbeats.clone();
-                    move |details| {
-                        let details = details
-                            .downcast::<u32>()
-                            .expect("heartbeat details should retain their concrete type");
-                        heartbeats.lock().unwrap().push(*details);
-                    }
-                })
-                .build();
+        let env = ActivityEnvironment::builder_with_default()
+            .heartbeat_details(4_u32)
+            .unwrap()
+            .on_heartbeat({
+                let heartbeats = heartbeats.clone();
+                move |details| {
+                    let details = details
+                        .downcast::<u32>()
+                        .expect("heartbeat details should retain their concrete type");
+                    heartbeats.lock().unwrap().push(*details);
+                }
+            })
+            .build();
 
         assert_eq!(env.run(TestActivities::heartbeat, 3).await.unwrap(), 4);
         assert_eq!(heartbeats.lock().unwrap().pop(), Some(7));
