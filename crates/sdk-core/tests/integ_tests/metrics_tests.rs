@@ -960,12 +960,18 @@ async fn docker_metrics_with_prometheus(
     .await
     .unwrap();
 
+    let task_queue = starter.get_task_queue().to_string();
     eventually(
         || async {
             // Query Prometheus API for metrics
             temporalio_common::telemetry::ensure_default_crypto_provider();
             let client = reqwest::Client::new();
-            let query = format!("temporal_sdk_{}num_pollers", test_uid.clone());
+            // The task queue must be matched in the query rather than asserted on afterwards: this
+            // runtime's meter is also used by the shared-namespace worker, whose pollers report
+            // against the worker-commands control queue, and the order series come back in is not
+            // ours to choose.
+            let query =
+                format!("temporal_sdk_{test_uid}num_pollers{{task_queue=\"{task_queue}\"}}");
             let response = client
                 .get(PROMETHEUS_QUERY_API)
                 .query(&[("query", query.clone())])
@@ -981,12 +987,6 @@ async fn docker_metrics_with_prometheus(
                 }
                 assert_eq!(data[0]["metric"]["exported_job"], "temporal-core-sdk");
                 assert_eq!(data[0]["metric"]["job"], "otel-collector");
-                assert!(
-                    data[0]["metric"]["task_queue"]
-                        .as_str()
-                        .unwrap()
-                        .starts_with(test_name)
-                );
             } else {
                 bail!("Invalid Prometheus response: {response:?}");
             }
