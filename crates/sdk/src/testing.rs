@@ -235,7 +235,7 @@ where
     S: activity_environment_builder::State,
     S::PayloadConverter: activity_environment_builder::IsSet,
 {
-    /// Supply heartbeat details from the previous activity attempt.
+    /// Supply heartbeat details from an activity attempt.
     ///
     /// Accessible via [`ActivityContext::heartbeat_details`].
     pub fn heartbeat_details<T>(mut self, details: T) -> Result<Self, PayloadConversionError>
