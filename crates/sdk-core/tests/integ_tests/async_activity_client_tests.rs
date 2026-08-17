@@ -44,8 +44,8 @@ async fn async_activity_completions(
     #[derive(Clone)]
     struct SharedActivityInfo {
         task_token: Vec<u8>,
-        workflow_id: String,
-        run_id: String,
+        workflow_id: Option<String>,
+        workflow_run_id: Option<String>,
         activity_id: String,
     }
 
@@ -76,11 +76,10 @@ async fn async_activity_completions(
             }
 
             let activity_info = ctx.info();
-            let wf_exec = activity_info.workflow_execution.as_ref().unwrap();
             let info = SharedActivityInfo {
                 task_token: activity_info.task_token.clone(),
-                workflow_id: wf_exec.workflow_id().to_owned(),
-                run_id: wf_exec.run_id().to_owned(),
+                workflow_id: activity_info.workflow_id.clone(),
+                workflow_run_id: activity_info.workflow_run_id.clone(),
                 activity_id: activity_info.activity_id.clone(),
             };
             let _ = self.info_tx.send(info).await;
@@ -161,10 +160,10 @@ async fn async_activity_completions(
         let info = info_rx.recv().await.expect("should receive activity info");
 
         eprintln!(
-            "DEBUG: Received activity info - task_token_len={}, workflow_id={}, run_id={}, activity_id={}",
+            "DEBUG: Received activity info - task_token_len={}, workflow_id={:?}, run_id={:?}, activity_id={}",
             info.task_token.len(),
             info.workflow_id,
-            info.run_id,
+            info.workflow_run_id,
             info.activity_id
         );
 
@@ -175,7 +174,11 @@ async fn async_activity_completions(
             }
             IdentifierType::ById => {
                 eprintln!("DEBUG: Using ById identifier");
-                ActivityIdentifier::by_id(info.workflow_id, info.run_id, info.activity_id)
+                ActivityIdentifier::by_id_workflow(
+                    info.workflow_id.unwrap(),
+                    info.workflow_run_id.unwrap(),
+                    info.activity_id,
+                )
             }
         };
 

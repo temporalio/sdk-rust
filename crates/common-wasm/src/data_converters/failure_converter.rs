@@ -59,6 +59,18 @@ pub trait FailureDecodeHint {
     fn adapt(self, normalized: IncomingError) -> Self::Output;
 }
 
+/// No-op decode hint; returns the error unchanged.
+#[derive(Debug, Clone, Copy)]
+pub struct NoopDecodeHint;
+
+impl FailureDecodeHint for NoopDecodeHint {
+    type Output = IncomingError;
+
+    fn adapt(self, normalized: IncomingError) -> Self::Output {
+        normalized
+    }
+}
+
 /// Decode hint for activity execution results.
 #[derive(Debug, Clone, Copy)]
 pub struct ActivityExecutionDecodeHint {
@@ -177,6 +189,9 @@ impl FailureConverter for DefaultFailureConverter {
             }
             OutgoingError::Workflow(OutgoingWorkflowError::Application(app)) => {
                 app.encode_failure(payload_converter, context)
+            }
+            OutgoingError::Workflow(OutgoingWorkflowError::PayloadConversion(err)) => {
+                Ok(encode_generic_application_failure(&err))
             }
             OutgoingError::Workflow(OutgoingWorkflowError::ActivityExecution(activity)) => {
                 activity.encode_failure(payload_converter, context)

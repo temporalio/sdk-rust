@@ -92,6 +92,7 @@ use tonic::IntoRequest;
 use url::Url;
 
 pub(crate) async fn get_text(endpoint: String) -> String {
+    temporalio_common::telemetry::ensure_default_crypto_provider();
     reqwest::get(endpoint).await.unwrap().text().await.unwrap()
 }
 
@@ -959,11 +960,18 @@ async fn docker_metrics_with_prometheus(
     .await
     .unwrap();
 
+    let task_queue = starter.get_task_queue().to_string();
     eventually(
         || async {
             // Query Prometheus API for metrics
+            temporalio_common::telemetry::ensure_default_crypto_provider();
             let client = reqwest::Client::new();
-            let query = format!("temporal_sdk_{}num_pollers", test_uid.clone());
+            // The task queue must be matched in the query rather than asserted on afterwards: this
+            // runtime's meter is also used by the shared-namespace worker, whose pollers report
+            // against the worker-commands control queue, and the order series come back in is not
+            // ours to choose.
+            let query =
+                format!("temporal_sdk_{test_uid}num_pollers{{task_queue=\"{task_queue}\"}}");
             let response = client
                 .get(PROMETHEUS_QUERY_API)
                 .query(&[("query", query.clone())])
@@ -979,12 +987,6 @@ async fn docker_metrics_with_prometheus(
                 }
                 assert_eq!(data[0]["metric"]["exported_job"], "temporal-core-sdk");
                 assert_eq!(data[0]["metric"]["job"], "otel-collector");
-                assert!(
-                    data[0]["metric"]["task_queue"]
-                        .as_str()
-                        .unwrap()
-                        .starts_with(test_name)
-                );
             } else {
                 bail!("Invalid Prometheus response: {response:?}");
             }
@@ -1526,6 +1528,7 @@ async fn test_prometheus_endpoint_integration() {
     up_down_counter.adds(-2);
 
     let url = format!("http://{addr}/metrics");
+    temporalio_common::telemetry::ensure_default_crypto_provider();
     let response = tokio::time::timeout(Duration::from_secs(10), reqwest::get(&url))
         .await
         .expect("Request timed out")
@@ -1576,6 +1579,7 @@ async fn test_prometheus_metric_format_consistency() {
     activity_histogram.record(Duration::from_millis(150), &attrs);
 
     let url = format!("http://{addr}/metrics");
+    temporalio_common::telemetry::ensure_default_crypto_provider();
     let response = tokio::time::timeout(Duration::from_secs(10), reqwest::get(&url))
         .await
         .expect("Request timed out")

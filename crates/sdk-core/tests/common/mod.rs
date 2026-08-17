@@ -1263,6 +1263,8 @@ pub(crate) fn integ_dev_server_config(
             "--dynamic-config-value".to_owned(),
             "frontend.workerCommandsEnabled=true".to_owned(),
             "--dynamic-config-value".to_owned(),
+            "system.enableCancelActivityWorkerCommand=true".to_owned(),
+            "--dynamic-config-value".to_owned(),
             "matching.rps=12000".to_owned(),
             "--search-attribute".to_string(),
             format!("{SEARCH_ATTR_TXT}=Text"),

@@ -1,7 +1,8 @@
 use crate::{
     common::{
-        ActivationAssertionsInterceptor, CoreWfStarter, INTEG_CLIENT_IDENTITY,
-        activity_functions::StdActivities, init_core_and_create_wf,
+        ActivationAssertionsInterceptor, CLI_VERSION_OVERRIDE_ENV_VAR, CoreWfStarter,
+        INTEG_CLIENT_IDENTITY, activity_functions::StdActivities, init_core_and_create_wf,
+        init_integ_telem,
     },
     shared_tests,
 };
@@ -9,6 +10,7 @@ use anyhow::anyhow;
 use assert_matches::assert_matches;
 use futures_util::FutureExt;
 use std::{
+    env,
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
@@ -42,6 +44,7 @@ use temporalio_common::{
             common::v1::{ActivityType, Payload, RetryPolicy},
             enums::v1::{CommandType, EventType, RetryState as ProtoRetryState},
             failure::v1::{ActivityFailureInfo, Failure, failure::FailureInfo},
+            history::v1::history_event::Attributes::WorkflowTaskFailedEventAttributes,
             sdk::v1::UserMetadata,
         },
     },
@@ -65,6 +68,7 @@ use temporalio_sdk_core::{
     },
 };
 use tokio::{join, sync::Semaphore, time::sleep};
+use tracing::warn;
 
 #[workflow]
 #[derive(Default)]
@@ -131,7 +135,7 @@ struct ActivityInterceptorRecord {
     interceptor: &'static str,
     phase: ActivityInterceptorPhase,
     activity_type: String,
-    workflow_type: String,
+    workflow_type: Option<String>,
     is_local: bool,
     input: Option<String>,
     output: Option<String>,
@@ -226,6 +230,76 @@ impl MultiArgActivityWorkflow {
     }
 }
 
+static FAIL_ACTIVITY_INPUT_SERIALIZATION_ONCE: AtomicBool = AtomicBool::new(true);
+
+#[derive(serde::Deserialize)]
+struct FailOnceActivityInput;
+
+impl serde::Serialize for FailOnceActivityInput {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        if FAIL_ACTIVITY_INPUT_SERIALIZATION_ONCE.swap(false, Ordering::SeqCst) {
+            return Err(serde::ser::Error::custom(
+                "intentional activity input serialization failure",
+            ));
+        }
+        serializer.serialize_unit_struct("FailOnceActivityInput")
+    }
+}
+
+struct PayloadConversionActivities;
+
+#[activities]
+impl PayloadConversionActivities {
+    #[activity]
+    async fn fail_once_input(
+        _ctx: ActivityContext,
+        _input: FailOnceActivityInput,
+    ) -> Result<(), ActivityError> {
+        Ok(())
+    }
+}
+
+#[workflow]
+#[derive(Default)]
+struct PropagatedActivityInputConversionFailureWorkflow;
+
+#[workflow_methods]
+impl PropagatedActivityInputConversionFailureWorkflow {
+    #[run]
+    async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<()> {
+        ctx.execute_activity(
+            PayloadConversionActivities::fail_once_input,
+            FailOnceActivityInput,
+            ActivityOptions::start_to_close_timeout(Duration::from_secs(5)),
+        )
+        .await?;
+        Ok(())
+    }
+}
+
+#[workflow]
+#[derive(Default)]
+struct CaughtActivityInputConversionFailureWorkflow;
+
+#[workflow_methods]
+impl CaughtActivityInputConversionFailureWorkflow {
+    #[run]
+    async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<()> {
+        let result = ctx
+            .execute_activity(
+                PayloadConversionActivities::fail_once_input,
+                FailOnceActivityInput,
+                ActivityOptions::start_to_close_timeout(Duration::from_secs(5)),
+            )
+            .await;
+        match result {
+            Err(ActivityExecutionError::Serialization(_error)) => (),
+            other => panic!("expected a serialization error, got {other:?}"),
+        }
+        Ok(())
+    }
+}
+
 #[tokio::test]
 async fn multi_arg_activity() {
     let wf_name = MultiArgActivityWorkflow::name();
@@ -250,6 +324,78 @@ async fn multi_arg_activity() {
     worker.run_until_done().await.unwrap();
     let r = handle.get_result(Default::default()).await.unwrap();
     assert_eq!(r, "hello world");
+}
+
+#[tokio::test]
+async fn propagated_activity_input_conversion_failure_fails_workflow_task() {
+    FAIL_ACTIVITY_INPUT_SERIALIZATION_ONCE.store(true, Ordering::SeqCst);
+    let wf_name = PropagatedActivityInputConversionFailureWorkflow::name();
+    let mut starter = CoreWfStarter::new(wf_name);
+    starter
+        .sdk_config
+        .register_activities(PayloadConversionActivities);
+    starter
+        .sdk_config
+        .register_workflow::<PropagatedActivityInputConversionFailureWorkflow>()
+        .unwrap();
+    let mut worker = starter.worker().await;
+
+    let task_queue = starter.get_task_queue().to_owned();
+    let handle = worker
+        .submit_workflow(
+            PropagatedActivityInputConversionFailureWorkflow::run,
+            (),
+            WorkflowStartOptions::new(task_queue, wf_name.to_owned()).build(),
+        )
+        .await
+        .unwrap();
+    worker.run_until_done().await.unwrap();
+    handle.get_result(Default::default()).await.unwrap();
+
+    let history = handle.fetch_history(Default::default()).await.unwrap();
+    let workflow_task_failures: Vec<_> = history
+        .events()
+        .iter()
+        .filter(|event| event.event_type() == EventType::WorkflowTaskFailed)
+        .collect();
+    assert_eq!(workflow_task_failures.len(), 1);
+    let Some(WorkflowTaskFailedEventAttributes(attributes)) =
+        workflow_task_failures[0].attributes.as_ref()
+    else {
+        panic!("expected workflow task failed attributes");
+    };
+    let failure = attributes
+        .failure
+        .as_ref()
+        .expect("workflow task failure should include a failure");
+    assert!(
+        failure
+            .message
+            .contains("intentional activity input serialization failure")
+    );
+}
+
+#[tokio::test]
+async fn activity_input_conversion_failure_can_be_caught() {
+    let wf_name = CaughtActivityInputConversionFailureWorkflow::name();
+    let mut starter = CoreWfStarter::new(wf_name);
+    starter
+        .sdk_config
+        .register_workflow::<CaughtActivityInputConversionFailureWorkflow>()
+        .unwrap();
+    let mut worker = starter.worker().await;
+
+    let task_queue = starter.get_task_queue().to_owned();
+    let handle = worker
+        .submit_workflow(
+            CaughtActivityInputConversionFailureWorkflow::run,
+            (),
+            WorkflowStartOptions::new(task_queue, wf_name.to_owned()).build(),
+        )
+        .await
+        .unwrap();
+    worker.run_until_done().await.unwrap();
+    handle.get_result(Default::default()).await.unwrap();
 }
 
 #[tokio::test]
@@ -349,7 +495,7 @@ async fn activity_interceptor_wraps_activity_execution() {
                 interceptor: "outer",
                 phase: ActivityInterceptorPhase::Before,
                 activity_type: "StdActivities::echo".to_owned(),
-                workflow_type: wf_name.to_owned(),
+                workflow_type: Some(wf_name.to_owned()),
                 is_local: false,
                 input: Some(input.clone()),
                 output: None,
@@ -359,7 +505,7 @@ async fn activity_interceptor_wraps_activity_execution() {
                 interceptor: "inner",
                 phase: ActivityInterceptorPhase::Before,
                 activity_type: "StdActivities::echo".to_owned(),
-                workflow_type: wf_name.to_owned(),
+                workflow_type: Some(wf_name.to_owned()),
                 is_local: false,
                 input: Some(input.clone()),
                 output: None,
@@ -369,7 +515,7 @@ async fn activity_interceptor_wraps_activity_execution() {
                 interceptor: "inner",
                 phase: ActivityInterceptorPhase::After,
                 activity_type: "StdActivities::echo".to_owned(),
-                workflow_type: wf_name.to_owned(),
+                workflow_type: Some(wf_name.to_owned()),
                 is_local: false,
                 input: None,
                 output: Some(input.clone()),
@@ -379,7 +525,7 @@ async fn activity_interceptor_wraps_activity_execution() {
                 interceptor: "outer",
                 phase: ActivityInterceptorPhase::After,
                 activity_type: "StdActivities::echo".to_owned(),
-                workflow_type: wf_name.to_owned(),
+                workflow_type: Some(wf_name.to_owned()),
                 is_local: false,
                 input: None,
                 output: Some(input.clone()),
@@ -428,7 +574,7 @@ async fn activity_interceptor_wraps_local_activity_execution() {
                 interceptor: "local",
                 phase: ActivityInterceptorPhase::Before,
                 activity_type: "StdActivities::echo".to_owned(),
-                workflow_type: wf_name.to_owned(),
+                workflow_type: Some(wf_name.to_owned()),
                 is_local: true,
                 input: Some(input.clone()),
                 output: None,
@@ -438,7 +584,7 @@ async fn activity_interceptor_wraps_local_activity_execution() {
                 interceptor: "local",
                 phase: ActivityInterceptorPhase::After,
                 activity_type: "StdActivities::echo".to_owned(),
-                workflow_type: wf_name.to_owned(),
+                workflow_type: Some(wf_name.to_owned()),
                 is_local: true,
                 input: None,
                 output: Some(input.clone()),
@@ -564,7 +710,7 @@ async fn activity_interceptor_observes_activity_error() {
                 interceptor: "failure",
                 phase: ActivityInterceptorPhase::Before,
                 activity_type: "FailingActivities::fail".to_owned(),
-                workflow_type: wf_name.to_owned(),
+                workflow_type: Some(wf_name.to_owned()),
                 is_local: false,
                 input: Some(input),
                 output: None,
@@ -574,7 +720,7 @@ async fn activity_interceptor_observes_activity_error() {
                 interceptor: "failure",
                 phase: ActivityInterceptorPhase::After,
                 activity_type: "FailingActivities::fail".to_owned(),
-                workflow_type: wf_name.to_owned(),
+                workflow_type: Some(wf_name.to_owned()),
                 is_local: false,
                 input: None,
                 output: None,
@@ -660,7 +806,7 @@ async fn activity_interceptor_observes_activity_panic() {
                 interceptor: "panic",
                 phase: ActivityInterceptorPhase::Before,
                 activity_type: "PanickingActivities::panic_activity".to_owned(),
-                workflow_type: wf_name.to_owned(),
+                workflow_type: Some(wf_name.to_owned()),
                 is_local: false,
                 input: Some(input),
                 output: None,
@@ -670,7 +816,7 @@ async fn activity_interceptor_observes_activity_panic() {
                 interceptor: "panic",
                 phase: ActivityInterceptorPhase::After,
                 activity_type: "PanickingActivities::panic_activity".to_owned(),
-                workflow_type: wf_name.to_owned(),
+                workflow_type: Some(wf_name.to_owned()),
                 is_local: false,
                 input: None,
                 output: None,
@@ -2264,5 +2410,25 @@ async fn immediate_activity_cancelation() {
 #[case::eager(false)]
 #[tokio::test]
 async fn activity_cancel_delivered_without_heartbeat(#[case] disable_eager: bool) {
+    // Cancellation of activities through Worker Commands was added in Server v1.32.0-158.0,
+    // but the case for eager activities was initially broken. It got fixed in
+    // temporalio/temporal#10634, which was released in Server v1.32.0-159.0.
+    //
+    // At this time, there is no release of the Temporal CLI that bundles Server
+    // v1.32.0-159.0. We're pinned on CLI "v1.7.4-standalone-nexus-operations" which
+    // bundles Server v1.32.0-158.0, and therefore has the broken support for eager
+    // activity cancellation. That results in the eager activity cancelation test
+    // failing in CI and local tests against the CLI Dev Server.
+    //
+    // FIXME: Remove once we're pinned on a CLI that bundles Server >v1.32.0-159.0.
+    const CLI_WITHOUT_EAGER_CANCEL_FIX: &str = "v1.7.4-standalone-nexus-operations";
+    if !disable_eager
+        && env::var(CLI_VERSION_OVERRIDE_ENV_VAR).is_ok_and(|v| v == CLI_WITHOUT_EAGER_CANCEL_FIX)
+    {
+        // The skip message would go unlogged as no telemetry has been initialized yet.
+        init_integ_telem();
+        warn!("Skipping test: eager activity cancel requires server >= v1.32.0-159.0");
+        return;
+    }
     shared_tests::activity_cancel_delivered_without_heartbeat(disable_eager).await
 }

@@ -408,6 +408,7 @@ impl From<PayloadConversionError> for ApplicationFailure {
 
 /// A typed outbound error surface used before encoding to a Temporal failure proto.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum OutgoingError {
     /// An error produced while completing an activity.
     #[error(transparent)]
@@ -419,6 +420,7 @@ pub enum OutgoingError {
 
 /// A typed outbound activity error.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum OutgoingActivityError {
     /// An activity application failure.
     #[error(transparent)]
@@ -433,10 +435,14 @@ pub enum OutgoingActivityError {
 
 /// A typed outbound workflow failure.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum OutgoingWorkflowError {
     /// A workflow application failure.
     #[error(transparent)]
     Application(#[from] Box<ApplicationFailure>),
+    /// A workflow payload conversion failure.
+    #[error(transparent)]
+    PayloadConversion(#[from] PayloadConversionError),
     /// A workflow failure sourced from an activity execution.
     #[error(transparent)]
     ActivityExecution(#[from] Box<ActivityExecutionError>),
@@ -457,6 +463,7 @@ impl OutgoingWorkflowError {
     pub fn as_cancelled(&self) -> Option<&CancelledError> {
         match self {
             Self::Application(err) => err.as_cancelled(),
+            Self::PayloadConversion(_) => None,
             Self::ActivityExecution(err) => err.as_cancelled(),
             Self::ChildWorkflowExecution(err) => err.as_cancelled(),
             Self::ChildWorkflowStart(err) => err.as_cancelled(),
@@ -471,12 +478,6 @@ impl From<anyhow::Error> for OutgoingWorkflowError {
     }
 }
 
-impl From<PayloadConversionError> for OutgoingWorkflowError {
-    fn from(value: PayloadConversionError) -> Self {
-        Self::Application(Box::new(value.into()))
-    }
-}
-
 impl From<ApplicationFailure> for OutgoingWorkflowError {
     fn from(value: ApplicationFailure) -> Self {
         Self::Application(Box::new(value))
@@ -485,25 +486,37 @@ impl From<ApplicationFailure> for OutgoingWorkflowError {
 
 impl From<ActivityExecutionError> for OutgoingWorkflowError {
     fn from(value: ActivityExecutionError) -> Self {
-        Self::ActivityExecution(Box::new(value))
+        match value {
+            ActivityExecutionError::Serialization(err) => Self::PayloadConversion(err),
+            other => Self::ActivityExecution(Box::new(other)),
+        }
     }
 }
 
 impl From<ChildWorkflowExecutionError> for OutgoingWorkflowError {
     fn from(value: ChildWorkflowExecutionError) -> Self {
-        Self::ChildWorkflowExecution(Box::new(value))
+        match value {
+            ChildWorkflowExecutionError::Serialization(err) => Self::PayloadConversion(err),
+            other => Self::ChildWorkflowExecution(Box::new(other)),
+        }
     }
 }
 
 impl From<ChildWorkflowStartError> for OutgoingWorkflowError {
     fn from(value: ChildWorkflowStartError) -> Self {
-        Self::ChildWorkflowStart(Box::new(value))
+        match value {
+            ChildWorkflowStartError::Serialization(err) => Self::PayloadConversion(err),
+            other => Self::ChildWorkflowStart(Box::new(other)),
+        }
     }
 }
 
 impl From<WorkflowSignalError> for OutgoingWorkflowError {
     fn from(value: WorkflowSignalError) -> Self {
-        Self::WorkflowSignal(Box::new(value))
+        match value {
+            WorkflowSignalError::Serialization(err) => Self::PayloadConversion(err),
+            other => Self::WorkflowSignal(Box::new(other)),
+        }
     }
 }
 
@@ -1416,13 +1429,13 @@ mod tests {
     }
 
     #[test]
-    fn payload_conversion_errors_default_to_application_outgoing_errors() {
+    fn payload_conversion_errors_use_dedicated_outgoing_variant() {
         let outgoing: OutgoingWorkflowError =
             PayloadConversionError::EncodingError(anyhow::anyhow!("encode boom").into()).into();
 
-        let OutgoingWorkflowError::Application(app) = outgoing else {
-            panic!("payload conversion errors should default to application failures");
+        let OutgoingWorkflowError::PayloadConversion(err) = outgoing else {
+            panic!("expected a payload conversion failure");
         };
-        assert_eq!(app.to_string(), "Encoding error: encode boom");
+        assert_eq!(err.to_string(), "Encoding error: encode boom");
     }
 }

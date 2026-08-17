@@ -14,8 +14,8 @@ use temporalio_client::{
 use temporalio_common::protos::temporal::api::enums::v1::EventType;
 use temporalio_macros::{activities, workflow, workflow_methods};
 use temporalio_sdk::{
-    ActivityOptions, SimplePlugin, WorkerPlugin, WorkerRunError, WorkflowContext,
-    WorkflowContextView, WorkflowDefinitions, WorkflowResult,
+    ActivityOptions, ApplicationFailure, SimplePlugin, WorkerPlugin, WorkerRunError,
+    WorkflowContext, WorkflowContextView, WorkflowDefinitions, WorkflowResult,
     activities::{ActivityContext, ActivityError},
     interceptors::{Next, RunWorkerInput, WithWorkflowReplayWorkerInput, WorkerInterceptor},
     workflow_replayer::{
@@ -76,7 +76,7 @@ impl SayHelloWorkflow {
             ctx.wait_condition(|_| false).await?;
         }
         if input.should_error {
-            return Err(anyhow::anyhow!("Intentional workflow failure").into());
+            return Err(ApplicationFailure::new("Intentional workflow failure").into());
         }
         if input.should_fail_task {
             panic!("Intentional workflow task failure");

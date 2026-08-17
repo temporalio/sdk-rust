@@ -2,7 +2,7 @@ use std::{collections::HashMap, time::Duration};
 
 use crate::{MemoValues, WorkflowCancellationToken, runtime::types::ContinueAsNewRequest};
 use temporalio_common_wasm::{
-    Priority, RetryPolicy,
+    ActivityCloseTimeouts, Priority, RetryPolicy,
     data_converters::{
         GenericPayloadConverter, PayloadConversionError, PayloadConverter, SerializationContext,
         SerializationContextData,
@@ -15,12 +15,12 @@ use temporalio_common_wasm::{
             },
             common::VersioningIntent as ProtoVersioningIntent,
             nexus::NexusOperationCancellationType as ProtoNexusOperationCancellationType,
-            workflow_activation::SignalWorkflow,
             workflow_commands::{
                 ActivityCancellationType as ProtoActivityCancellationType,
                 ContinueAsNewWorkflowExecution, ScheduleActivity, ScheduleLocalActivity,
-                ScheduleNexusOperation, StartChildWorkflowExecution, StartTimer, WorkflowCommand,
-                workflow_command,
+                ScheduleNexusOperation, SignalExternalWorkflowExecution,
+                StartChildWorkflowExecution, StartTimer, WorkflowCommand,
+                signal_external_workflow_execution, workflow_command,
             },
         },
         temporal::api::{
@@ -29,7 +29,7 @@ use temporalio_common_wasm::{
                 ContinueAsNewVersioningBehavior as ProtoContinueAsNewVersioningBehavior,
                 WorkflowIdReusePolicy as ProtoWorkflowIdReusePolicy,
             },
-            sdk::v1::UserMetadata,
+            sdk::v1::{EventGroupMarker, UserMetadata},
         },
     },
     search_attributes::SearchAttributes,
@@ -323,15 +323,22 @@ pub struct ActivityOptions {
     /// If true, disable eager execution for this activity
     #[builder(default)]
     pub do_not_eagerly_execute: bool,
+    /// Event group markers to attach to the resulting `ScheduleActivityTask` command.
+    ///
+    /// **Unstable:** Event Groups are not yet implemented in the Rust SDK; this field exists
+    /// only for internal test purposes. This API *will* change.
+    #[doc(hidden)]
+    #[builder(default)]
+    pub event_group_markers: Vec<EventGroupMarker>,
 }
 
 impl ActivityOptions {
-    /// Returns a builder with `close_timeout` set to [`ActivityCloseTimeouts::StartToClose`].
+    /// Returns a builder with `close_timeouts` set to [`ActivityCloseTimeouts::StartToClose`].
     pub fn with_start_to_close_timeout(duration: Duration) -> ActivityOptionsBuilder {
         Self::with_close_timeouts(ActivityCloseTimeouts::StartToClose(duration))
     }
 
-    /// Returns a builder with `close_timeout` set to [`ActivityCloseTimeouts::ScheduleToClose`].
+    /// Returns a builder with `close_timeouts` set to [`ActivityCloseTimeouts::ScheduleToClose`].
     pub fn with_schedule_to_close_timeout(duration: Duration) -> ActivityOptionsBuilder {
         Self::with_close_timeouts(ActivityCloseTimeouts::ScheduleToClose(duration))
     }
@@ -351,43 +358,6 @@ impl ActivityOptions {
     }
 }
 
-/// The timeouts applied to an activity's completion.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ActivityCloseTimeouts {
-    /// Total time that a workflow is willing to wait for Activity to complete.
-    /// `ActivityCloseTimeouts::ScheduleToClose` limits the total time of an Activity's execution
-    /// including retries (use `ActivityCloseTimeouts::StartToClose` to limit the time of a single
-    /// attempt).
-    ScheduleToClose(Duration),
-    /// Maximum time of a single Activity execution attempt. Note that the Temporal Server doesn't
-    /// detect Worker process failures directly. It relies on this timeout to detect that an
-    /// Activity that didn't complete on time. So this timeout should be as short as the longest
-    /// possible execution of the Activity body. Potentially long running Activities must specify
-    /// `ActivityOptions::heartbeat_timeout` and heartbeat from the activity periodically for timely
-    /// failure detection.
-    StartToClose(Duration),
-    /// Applies both execution-attempt and overall-completion bounds.
-    Both {
-        /// Maximum time of a single Activity execution attempt.
-        start_to_close: Duration,
-        /// Total time that a workflow is willing to wait for Activity to complete.
-        schedule_to_close: Duration,
-    },
-}
-
-impl ActivityCloseTimeouts {
-    fn into_durations(self) -> (Option<Duration>, Option<Duration>) {
-        match self {
-            Self::ScheduleToClose(schedule_to_close) => (None, Some(schedule_to_close)),
-            Self::StartToClose(start_to_close) => (Some(start_to_close), None),
-            Self::Both {
-                start_to_close,
-                schedule_to_close,
-            } => (Some(start_to_close), Some(schedule_to_close)),
-        }
-    }
-}
-
 impl ActivityOptions {
     pub(crate) fn into_command(
         self,
@@ -396,8 +366,6 @@ impl ActivityOptions {
         args: Vec<Payload>,
         headers: HashMap<String, Payload>,
     ) -> WorkflowCommand {
-        let (start_to_close_timeout, schedule_to_close_timeout) =
-            self.close_timeouts.into_durations();
         command_with_metadata(
             workflow_command::Variant::ScheduleActivity(ScheduleActivity {
                 seq,
@@ -406,12 +374,16 @@ impl ActivityOptions {
                 task_queue: self.task_queue.unwrap_or_default(),
                 arguments: args,
                 headers,
-                schedule_to_close_timeout: schedule_to_close_timeout
+                schedule_to_close_timeout: self
+                    .close_timeouts
+                    .schedule_to_close()
                     .and_then(|duration| duration.try_into().ok()),
                 schedule_to_start_timeout: self
                     .schedule_to_start_timeout
                     .and_then(|duration| duration.try_into().ok()),
-                start_to_close_timeout: start_to_close_timeout
+                start_to_close_timeout: self
+                    .close_timeouts
+                    .start_to_close()
                     .and_then(|duration| duration.try_into().ok()),
                 heartbeat_timeout: self
                     .heartbeat_timeout
@@ -425,6 +397,7 @@ impl ActivityOptions {
             }),
             self.summary,
             None,
+            self.event_group_markers,
         )
     }
 }
@@ -472,6 +445,13 @@ pub struct LocalActivityOptions {
     pub start_to_close_timeout: Option<Duration>,
     /// Single-line summary for this activity that will appear in UI/CLI.
     pub summary: Option<String>,
+    /// Event group markers to attach to the resulting `RecordMarker` command.
+    ///
+    /// **Unstable:** Event Groups are not yet implemented in the Rust SDK; this field exists
+    /// only for internal test purposes. This API *will* change.
+    #[doc(hidden)]
+    #[builder(default)]
+    pub event_group_markers: Vec<EventGroupMarker>,
 }
 
 impl Default for LocalActivityOptions {
@@ -518,6 +498,7 @@ impl LocalActivityOptions {
             }),
             self.summary,
             None,
+            self.event_group_markers,
         )
     }
 }
@@ -559,6 +540,13 @@ pub struct ChildWorkflowOptions {
     pub search_attributes: Option<SearchAttributes>,
     /// Priority for the workflow
     pub priority: Option<Priority>,
+    /// Event group markers to attach to the resulting `StartChildWorkflowExecution` command.
+    ///
+    /// **Unstable:** Event Groups are not yet implemented in the Rust SDK; this field exists
+    /// only for internal test purposes. This API *will* change.
+    #[doc(hidden)]
+    #[builder(default)]
+    pub event_group_markers: Vec<EventGroupMarker>,
 }
 
 impl ChildWorkflowOptions {
@@ -611,67 +599,8 @@ impl ChildWorkflowOptions {
             }),
             self.static_summary,
             self.static_details,
+            self.event_group_markers,
         )
-    }
-}
-
-/// Information needed to send a specific signal
-#[derive(Debug)]
-pub struct Signal {
-    /// The signal name
-    pub signal_name: String,
-    /// The data the signal carries
-    pub data: SignalData,
-}
-
-impl Signal {
-    /// Create a new signal
-    pub fn new(
-        name: impl Into<String>,
-        input: impl IntoIterator<Item = impl Into<Payload>>,
-    ) -> Self {
-        Self {
-            signal_name: name.into(),
-            data: SignalData::new(input),
-        }
-    }
-
-    pub(crate) fn into_invocation(self) -> SignalWorkflow {
-        SignalWorkflow {
-            signal_name: self.signal_name,
-            input: self.data.input,
-            identity: String::new(),
-            headers: self.data.headers,
-        }
-    }
-}
-
-/// Data contained within a signal
-#[derive(Default, Debug)]
-pub struct SignalData {
-    /// The arguments the signal will receive
-    pub input: Vec<Payload>,
-    /// Metadata attached to the signal
-    pub headers: HashMap<String, Payload>,
-}
-
-impl SignalData {
-    /// Create data for a signal
-    pub fn new(input: impl IntoIterator<Item = impl Into<Payload>>) -> Self {
-        Self {
-            input: input.into_iter().map(Into::into).collect(),
-            headers: HashMap::new(),
-        }
-    }
-
-    /// Set a header k/v pair attached to the signal
-    pub fn with_header(
-        &mut self,
-        key: impl Into<String>,
-        payload: impl Into<Payload>,
-    ) -> &mut Self {
-        self.headers.insert(key.into(), payload.into());
-        self
     }
 }
 
@@ -686,6 +615,13 @@ pub struct TimerOptions {
     pub cancellation_token: Option<WorkflowCancellationToken>,
     /// Summary of the timer
     pub summary: Option<String>,
+    /// Event group markers to attach to the resulting `StartTimer` command.
+    ///
+    /// **Unstable:** Event Groups are not yet implemented in the Rust SDK; this field exists
+    /// only for internal test purposes. This API *will* change.
+    #[doc(hidden)]
+    #[builder(default)]
+    pub event_group_markers: Vec<EventGroupMarker>,
 }
 
 impl Default for TimerOptions {
@@ -716,6 +652,7 @@ impl TimerOptions {
             }),
             self.summary,
             None,
+            self.event_group_markers,
         )
     }
 }
@@ -734,6 +671,41 @@ pub struct WaitConditionOptions {
 pub struct SignalWorkflowOptions {
     /// Cancellation token for this signal. `None` inherits workflow cancellation.
     pub cancellation_token: Option<WorkflowCancellationToken>,
+    /// Single-line summary for this signal that will appear in UI/CLI.
+    pub summary: Option<String>,
+    /// Event group markers to attach to the resulting `SignalExternalWorkflowExecution` command.
+    ///
+    /// **Unstable:** Event Groups are not yet implemented in the Rust SDK; this field exists
+    /// only for internal test purposes. This API *will* change.
+    #[doc(hidden)]
+    #[builder(default)]
+    pub event_group_markers: Vec<EventGroupMarker>,
+}
+
+impl SignalWorkflowOptions {
+    pub(crate) fn into_command(
+        self,
+        seq: u32,
+        signal_name: String,
+        args: Vec<Payload>,
+        headers: HashMap<String, Payload>,
+        target: signal_external_workflow_execution::Target,
+    ) -> WorkflowCommand {
+        command_with_metadata(
+            workflow_command::Variant::SignalExternalWorkflowExecution(
+                SignalExternalWorkflowExecution {
+                    seq,
+                    signal_name,
+                    args,
+                    target: Some(target),
+                    headers,
+                },
+            ),
+            self.summary,
+            None,
+            self.event_group_markers,
+        )
+    }
 }
 
 /// Options for Nexus Operations
@@ -950,10 +922,12 @@ fn command_with_metadata(
     variant: workflow_command::Variant,
     summary: Option<String>,
     details: Option<String>,
+    markers: Vec<EventGroupMarker>,
 ) -> WorkflowCommand {
     WorkflowCommand {
         variant: Some(variant),
         user_metadata: string_user_metadata(summary, details),
+        event_group_markers: markers,
     }
 }
 

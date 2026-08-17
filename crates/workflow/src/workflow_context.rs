@@ -2,11 +2,11 @@ mod options;
 mod view;
 
 pub use options::{
-    ActivityCancellationType, ActivityCloseTimeouts, ActivityOptions,
-    ChildWorkflowCancellationType, ChildWorkflowOptions, ContinueAsNewOptions,
-    ContinueAsNewVersioningBehavior, LocalActivityOptions, NexusOperationCancellationType,
-    NexusOperationOptions, ParentClosePolicy, Signal, SignalData, SignalWorkflowOptions,
-    TimerOptions, VersioningIntent, WaitConditionOptions, WorkflowIdReusePolicy,
+    ActivityCancellationType, ActivityOptions, ChildWorkflowCancellationType, ChildWorkflowOptions,
+    ContinueAsNewOptions, ContinueAsNewVersioningBehavior, LocalActivityOptions,
+    NexusOperationCancellationType, NexusOperationOptions, ParentClosePolicy,
+    SignalWorkflowOptions, TimerOptions, VersioningIntent, WaitConditionOptions,
+    WorkflowIdReusePolicy,
 };
 pub use temporalio_common_wasm::protos::coresdk::child_workflow::StartChildWorkflowExecutionFailedCause;
 pub use view::{NamespacedWorkflowInfo, WorkflowContextView};
@@ -86,9 +86,8 @@ use temporalio_common_wasm::{
                 CancelChildWorkflowExecution, CancelSignalWorkflow, CancelTimer,
                 ModifyWorkflowProperties, RequestCancelActivity,
                 RequestCancelExternalWorkflowExecution, RequestCancelLocalActivity,
-                RequestCancelNexusOperation, SetPatchMarker, SignalExternalWorkflowExecution,
-                UpsertWorkflowSearchAttributes, signal_external_workflow_execution,
-                workflow_command,
+                RequestCancelNexusOperation, SetPatchMarker, UpsertWorkflowSearchAttributes,
+                signal_external_workflow_execution, workflow_command,
             },
         },
         temporal::api::{
@@ -1129,19 +1128,21 @@ impl BaseWorkflowContext {
         target: SignalWorkflowTarget,
         signal: S,
         input: S::Input,
-        cancellation_token: Option<WorkflowCancellationToken>,
+        options: SignalWorkflowOptions,
     ) -> CancellableWorkflowOutboundFuture<SignalWorkflowResult> {
         let input = SignalWorkflowInput::new(
             S::name(&signal).to_string(),
             target,
             Box::new(input),
-            cancellation_token,
+            options,
         );
         let base_ctx = self.clone();
         let next = WorkflowNext::new(move |input: SignalWorkflowInput| {
-            let (signal_name, target, input, headers, cancellation_token) = input.into_parts();
-            let cancellation_token =
-                cancellation_token.unwrap_or_else(|| base_ctx.cancellation_token());
+            let (signal_name, target, input, headers, mut options) = input.into_parts();
+            let cancellation_token = options
+                .cancellation_token
+                .take()
+                .unwrap_or_else(|| base_ctx.cancellation_token());
             let input = match input.downcast::<S::Input>() {
                 Ok(input) => *input,
                 Err(_) => {
@@ -1185,8 +1186,6 @@ impl BaseWorkflowContext {
                     },
                 ),
             };
-            let mut signal = Signal::new(signal_name, payloads);
-            signal.data.headers = headers;
             let seq = base_ctx
                 .inner
                 .seq_nums
@@ -1200,19 +1199,11 @@ impl BaseWorkflowContext {
                 .inner
                 .runtime
                 .register_unblocker(PendingCommandId::SignalExternal(seq), unblocker);
-            let signal = signal.into_invocation();
-            base_ctx.inner.runtime.host.push_command(
-                workflow_command::Variant::SignalExternalWorkflowExecution(
-                    SignalExternalWorkflowExecution {
-                        seq,
-                        signal_name: signal.signal_name,
-                        args: signal.input,
-                        target: Some(target),
-                        headers: signal.headers,
-                    },
-                )
-                .into(),
-            );
+            base_ctx
+                .inner
+                .runtime
+                .host
+                .push_command(options.into_command(seq, signal_name, payloads, headers, target));
             cancellable_outbound(SignalChildFut::Running {
                 inner: cmd,
                 data_converter: base_ctx.data_converter().clone(),
@@ -2539,6 +2530,7 @@ impl Future for LATimerBackoffFut {
                     .expect("duration converts ok"),
                 cancellation_token: Some(self.cancellation_token.clone()),
                 summary: None,
+                event_group_markers: vec![],
             });
             self.timer_fut = Some(Box::pin(timer_f));
             self.next_attempt = b.attempt;
@@ -3104,7 +3096,7 @@ where
             },
             signal,
             input,
-            options.cancellation_token,
+            options,
         )
     }
 }
@@ -3151,7 +3143,7 @@ impl ExternalWorkflowHandle {
             },
             signal,
             input,
-            options.cancellation_token,
+            options,
         )
     }
 
@@ -3220,6 +3212,7 @@ mod tests {
     use temporalio_common_wasm::{
         RetryPolicy,
         data_converters::{TemporalDeserializable, TemporalSerializable},
+        error::OutgoingWorkflowError,
         protos::{
             coresdk::{
                 AsJsonPayloadExt, FromJsonPayloadExt,
@@ -3462,6 +3455,7 @@ mod tests {
             duration: Duration::from_secs(1),
             cancellation_token: Some(token.clone()),
             summary: None,
+            event_group_markers: vec![],
         });
 
         let mut activity_options = ActivityOptions::start_to_close_timeout(Duration::from_secs(1));
@@ -4202,7 +4196,7 @@ mod tests {
     }
 
     #[test]
-    fn continue_as_new_reports_serialization_errors() {
+    fn continue_as_new_preserves_input_serialization_errors() {
         #[derive(Debug)]
         struct FailingInput;
 
@@ -4264,23 +4258,24 @@ mod tests {
         );
         let ctx = WorkflowContext::from_base(base, Rc::new(RefCell::new(FailingWorkflow)));
 
-        let err = ctx
+        let termination = ctx
             .continue_as_new(FailingInput, ContinueAsNewOptions::default())
-            .expect_err("serialization errors should be surfaced");
-
-        let WorkflowTermination::Failed(err) = err else {
-            panic!("expected failed termination, got {err:?}");
+            .expect_err("input serialization should fail");
+        let WorkflowTermination::Failed(OutgoingWorkflowError::PayloadConversion(err)) =
+            termination
+        else {
+            panic!("expected a payload conversion failure");
         };
         assert_eq!(err.to_string(), "Encoding error: serialization failure");
     }
 
     #[test]
-    fn continue_as_new_reports_memo_serialization_errors() {
+    fn continue_as_new_preserves_memo_serialization_errors() {
         let ctx = test_context();
         let mut memo = MemoValues::new();
         memo.insert("invalid", FailingMemoValue);
 
-        let err = ctx
+        let termination = ctx
             .continue_as_new(
                 7,
                 ContinueAsNewOptions {
@@ -4288,10 +4283,11 @@ mod tests {
                     ..Default::default()
                 },
             )
-            .expect_err("memo serialization errors should be surfaced");
-
-        let WorkflowTermination::Failed(err) = err else {
-            panic!("expected failed termination, got {err:?}");
+            .expect_err("memo serialization should fail");
+        let WorkflowTermination::Failed(OutgoingWorkflowError::PayloadConversion(err)) =
+            termination
+        else {
+            panic!("expected a payload conversion failure");
         };
         assert_eq!(
             err.to_string(),

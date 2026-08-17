@@ -96,12 +96,12 @@ pub use temporalio_workflow::{
     CancellableFuture, CancellableFutureWithReason, ChildWorkflowCancellationType,
     ChildWorkflowOptions, ContinueAsNewOptions, ContinueAsNewVersioningBehavior,
     ExternalWorkflowHandle, LocalActivityOptions, MemoValue, NexusOperationCancellationType,
-    NexusOperationOptions, ParentClosePolicy, PatchActivationCallback, Signal, SignalData,
-    SignalWorkflowOptions, StartChildWorkflowExecutionFailedCause, StartChildWorkflowOutput,
-    StartedChildWorkflow, StartedNexusOperation, SyncWorkflowContext, TimerOptions, TimerResult,
-    VersioningIntent, WaitConditionOptions, WorkflowCancellationError, WorkflowCancellationToken,
-    WorkflowContext, WorkflowContextView, WorkflowIdReusePolicy, WorkflowRandomValue,
-    WorkflowResult, WorkflowTermination,
+    NexusOperationOptions, ParentClosePolicy, PatchActivationCallback, SignalWorkflowOptions,
+    StartChildWorkflowExecutionFailedCause, StartChildWorkflowOutput, StartedChildWorkflow,
+    StartedNexusOperation, SyncWorkflowContext, TimerOptions, TimerResult, VersioningIntent,
+    WaitConditionOptions, WorkflowCancellationError, WorkflowCancellationToken, WorkflowContext,
+    WorkflowContextView, WorkflowIdReusePolicy, WorkflowRandomValue, WorkflowResult,
+    WorkflowTermination,
 };
 #[cfg(feature = "wasm-workflows")]
 pub use workflow_wasm::WasmWorkflowComponent;
@@ -1395,10 +1395,12 @@ impl ActivityHalf {
 
                 tokio::spawn(async move {
                     let act_fut = async move {
-                        if let Some(info) = &ctx.info().workflow_execution {
-                            Span::current()
-                                .record("temporalWorkflowID", info.workflow_id())
-                                .record("temporalRunID", info.run_id());
+                        let span = Span::current();
+                        if let Some(workflow_id) = &ctx.info().workflow_id {
+                            span.record("temporalWorkflowID", workflow_id);
+                        }
+                        if let Some(workflow_run_id) = &ctx.info().workflow_run_id {
+                            span.record("temporalRunID", workflow_run_id);
                         }
                         (act_fn)(args, data_converter, ctx, activity_inbound_interceptors).await
                     }

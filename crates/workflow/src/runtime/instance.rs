@@ -10,8 +10,8 @@ use crate::{
         types::{
             ActivationJobResult, ActivationResult, MAIN_ROUTINE_ID, MainRoutineCompletion,
             QueryResponse, RoutineCompletion, RoutineId, RoutineKind, RoutinePendingState,
-            RoutinePollResult, StartedRoutine, UpdateRoutineCompletion, UpdateRoutineKind,
-            WorkflowActivation, WorkflowFailure,
+            RoutinePollResult, StartedRoutine, TaskFailure, TerminalOutcome,
+            UpdateRoutineCompletion, UpdateRoutineKind, WorkflowActivation, WorkflowFailure,
         },
     },
     workflow_interceptors::{
@@ -759,32 +759,37 @@ where
     fn terminal_outcome_from_result(
         &self,
         result: ExecuteWorkflowResult,
-    ) -> crate::runtime::types::TerminalOutcome {
+    ) -> Result<TerminalOutcome, TaskFailure> {
         let result = result.and_then(|result| {
             serialize_workflow_output(result.as_ref(), self.ctx.payload_converter())
                 .map_err(WorkflowTermination::from)
         });
         match result {
-            Ok(result) => crate::runtime::types::TerminalOutcome::Completed(result),
-            Err(WorkflowTermination::ContinueAsNew(req)) => {
-                crate::runtime::types::TerminalOutcome::ContinueAsNew(req)
-            }
-            Err(WorkflowTermination::Cancelled) => {
-                crate::runtime::types::TerminalOutcome::Cancelled
-            }
+            Ok(result) => Ok(TerminalOutcome::Completed(result)),
+            Err(WorkflowTermination::ContinueAsNew(req)) => Ok(TerminalOutcome::ContinueAsNew(req)),
+            Err(WorkflowTermination::Cancelled) => Ok(TerminalOutcome::Cancelled),
             Err(WorkflowTermination::Evicted) => {
                 panic!("workflow instances must not explicitly return eviction")
+            }
+            Err(WorkflowTermination::Failed(OutgoingWorkflowError::PayloadConversion(err))) => {
+                Err(TaskFailure {
+                    failure: Box::new(Failure {
+                        message: format!("Workflow payload conversion failed: {err}"),
+                        ..Default::default()
+                    }),
+                    force_cause: None,
+                })
             }
             Err(WorkflowTermination::Failed(err)) => {
                 if self.base_ctx.cancellation_token().is_cancelled() && err.as_cancelled().is_some()
                 {
-                    return crate::runtime::types::TerminalOutcome::Cancelled;
+                    return Ok(TerminalOutcome::Cancelled);
                 }
                 let failure = self.base_ctx.data_converter().to_failure(
                     &SerializationContextData::Workflow,
                     temporalio_common_wasm::error::OutgoingError::Workflow(err),
                 );
-                crate::runtime::types::TerminalOutcome::Failed(Box::new(failure))
+                Ok(TerminalOutcome::Failed(Box::new(failure)))
             }
         }
     }
@@ -854,13 +859,17 @@ where
                 RoutinePollState::Ready {
                     result,
                     made_progress,
-                } => RoutinePollResult {
-                    completion: Some(RoutineCompletion::Main(MainRoutineCompletion::Terminal(
-                        Box::new(self.terminal_outcome_from_result(result)),
-                    ))),
-                    made_progress,
-                    pending_state: None,
-                },
+                } => {
+                    let completion = match self.terminal_outcome_from_result(result) {
+                        Ok(outcome) => MainRoutineCompletion::Terminal(Box::new(outcome)),
+                        Err(failure) => MainRoutineCompletion::TaskFailed(failure),
+                    };
+                    RoutinePollResult {
+                        completion: Some(RoutineCompletion::Main(completion)),
+                        made_progress,
+                        pending_state: None,
+                    }
+                }
                 RoutinePollState::ForcedFailure {
                     failure,
                     made_progress,

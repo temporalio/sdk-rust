@@ -5,10 +5,9 @@ pub(crate) mod common;
 #[path = "heavy_tests/fuzzy_workflow.rs"]
 mod fuzzy_workflow;
 
-use crate::common::get_integ_runtime_options;
 use common::{
-    CoreWfStarter, activity_functions::StdActivities, init_integ_telem, prom_metrics, rand_6_chars,
-    workflows::LaProblemWorkflow,
+    CoreWfStarter, activity_functions::StdActivities, get_integ_runtime_options, init_integ_telem,
+    prom_metrics, rand_6_chars, workflows::LaProblemWorkflow,
 };
 use futures_util::{
     StreamExt,
@@ -31,12 +30,15 @@ use temporalio_common::{
 };
 use temporalio_macros::{activities, workflow, workflow_methods};
 
-use temporalio_common::protos::{
-    coresdk::workflow_commands::ActivityCancellationType,
-    temporal::api::enums::v1::WorkflowIdReusePolicy,
+use temporalio_common::{
+    ActivityCloseTimeouts,
+    protos::{
+        coresdk::workflow_commands::ActivityCancellationType,
+        temporal::api::enums::v1::WorkflowIdReusePolicy,
+    },
 };
 use temporalio_sdk::{
-    ActivityCloseTimeouts, ActivityOptions, SyncWorkflowContext, WorkflowContext, WorkflowResult,
+    ActivityOptions, SyncWorkflowContext, WorkflowContext, WorkflowResult,
     activities::{ActivityContext, ActivityError},
     workflows,
 };

@@ -40,6 +40,8 @@ relevant information.
   and `list` read them back.
 * `MemoValue` and `MemoValues` are now exported from `temporalio_common` as well as
   `temporalio_workflow`, so the same types can be used from clients and workflows.
+* Support for running Standalone Activities in Rust SDK Worker.
+* Client methods for starting and managing execution of Standalone Activities. 
 * `LoggerFormat` for selecting compact, pretty, or JSON Core console log output. Configured log
   filters continue to apply to JSON output.
 * `RpcOptions::builder()` for constructing per-call RPC options.
@@ -60,6 +62,9 @@ relevant information.
   `RuntimeOptions::disable_environment_info` to turn the reporting off.
 * Workers now log a `[TMPRL1104]` warning when a workflow task takes longer than 5 seconds. Set
   `TEMPORAL_WORKFLOW_TASK_DURATION_WARN_SECONDS` to change the threshold.
+* `SignalWorkflowOptions::summary` attaches a single-line summary to a signal sent to another
+  workflow, which the UI and CLI display alongside the resulting history event.
+* Core now supports attaching `EventGroupMarker`s to various workflow commands.
 
 ### Changed
 * Cancellation errors propagated after workflow cancellation now complete the workflow as cancelled
@@ -70,6 +75,18 @@ relevant information.
   `WorkerInterceptor::with_workflow_replay_worker`.
 
 ### Breaking Changes :boom:
+* Changes to `ActivityInfo`: instead of `workflow_namespace`, `workflow_execution` and `run_id`,
+  there is now `namespace`, `workflow_id`, `workflow_run_id` and `activity_run_id`. 
+  Also, `workflow_type` is now `Option<String>`.
+* `ActivityIdentifier::ById` was split into 2 variants, `ByIdWorkflow` and `ByIdStandalone`.
+  `ActivityIdentifier::by_id` method was renamed to `by_id_workflow`, and `by_id_standalone`
+  was added.
+* `anyhow::Error` no longer converts directly into `WorkflowTermination`. Wrap an error in
+  `ApplicationFailure` to explicitly fail the Workflow Execution.
+* `OutgoingWorkflowError` now has a dedicated `PayloadConversion` variant. Converting activity,
+  child-workflow, and signal errors lifts their payload-conversion variants into it.
+  `OutgoingError`, `OutgoingActivityError`, and `OutgoingWorkflowError` are now non-exhaustive;
+  downstream matches must include a wildcard arm.
 * Removed `InterceptorWithNext`. Register worker interceptors as an ordered vector instead.
 * `Worker::run` now returns `WorkerRunError` instead of `anyhow::Error`.
   Non-validation failures are reported as `WorkerRunError::Fatal` with a message and source.
@@ -125,6 +142,10 @@ relevant information.
   Non-validation failures are reported as `WorkerRunError::Fatal` with a message and source.
 
 ### Fixed
+* Unhandled workflow payload conversion errors now fail the Workflow Task so it can retry instead
+  of failing the Workflow Execution. Workflows may still explicitly handle these errors.
+* Workers no longer send worker heartbeats or appear in centralized heartbeat reports before
+  `Worker::run` begins.
 * Local activity resolutions are now delivered to workflows as each activity completes instead of
   waiting for every local activity in the workflow task. This allows sequences of short local
   activities to make progress while a long-running local activity executes in parallel, while
