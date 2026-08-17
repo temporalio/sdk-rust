@@ -1,7 +1,8 @@
 use crate::{
     common::{
-        ActivationAssertionsInterceptor, CoreWfStarter, INTEG_CLIENT_IDENTITY,
-        activity_functions::StdActivities, init_core_and_create_wf,
+        ActivationAssertionsInterceptor, CLI_VERSION_OVERRIDE_ENV_VAR, CoreWfStarter,
+        INTEG_CLIENT_IDENTITY, activity_functions::StdActivities, init_core_and_create_wf,
+        init_integ_telem,
     },
     shared_tests,
 };
@@ -9,6 +10,7 @@ use anyhow::anyhow;
 use assert_matches::assert_matches;
 use futures_util::FutureExt;
 use std::{
+    env,
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
@@ -66,6 +68,7 @@ use temporalio_sdk_core::{
     },
 };
 use tokio::{join, sync::Semaphore, time::sleep};
+use tracing::warn;
 
 #[workflow]
 #[derive(Default)]
@@ -132,7 +135,7 @@ struct ActivityInterceptorRecord {
     interceptor: &'static str,
     phase: ActivityInterceptorPhase,
     activity_type: String,
-    workflow_type: String,
+    workflow_type: Option<String>,
     is_local: bool,
     input: Option<String>,
     output: Option<String>,
@@ -492,7 +495,7 @@ async fn activity_interceptor_wraps_activity_execution() {
                 interceptor: "outer",
                 phase: ActivityInterceptorPhase::Before,
                 activity_type: "StdActivities::echo".to_owned(),
-                workflow_type: wf_name.to_owned(),
+                workflow_type: Some(wf_name.to_owned()),
                 is_local: false,
                 input: Some(input.clone()),
                 output: None,
@@ -502,7 +505,7 @@ async fn activity_interceptor_wraps_activity_execution() {
                 interceptor: "inner",
                 phase: ActivityInterceptorPhase::Before,
                 activity_type: "StdActivities::echo".to_owned(),
-                workflow_type: wf_name.to_owned(),
+                workflow_type: Some(wf_name.to_owned()),
                 is_local: false,
                 input: Some(input.clone()),
                 output: None,
@@ -512,7 +515,7 @@ async fn activity_interceptor_wraps_activity_execution() {
                 interceptor: "inner",
                 phase: ActivityInterceptorPhase::After,
                 activity_type: "StdActivities::echo".to_owned(),
-                workflow_type: wf_name.to_owned(),
+                workflow_type: Some(wf_name.to_owned()),
                 is_local: false,
                 input: None,
                 output: Some(input.clone()),
@@ -522,7 +525,7 @@ async fn activity_interceptor_wraps_activity_execution() {
                 interceptor: "outer",
                 phase: ActivityInterceptorPhase::After,
                 activity_type: "StdActivities::echo".to_owned(),
-                workflow_type: wf_name.to_owned(),
+                workflow_type: Some(wf_name.to_owned()),
                 is_local: false,
                 input: None,
                 output: Some(input.clone()),
@@ -571,7 +574,7 @@ async fn activity_interceptor_wraps_local_activity_execution() {
                 interceptor: "local",
                 phase: ActivityInterceptorPhase::Before,
                 activity_type: "StdActivities::echo".to_owned(),
-                workflow_type: wf_name.to_owned(),
+                workflow_type: Some(wf_name.to_owned()),
                 is_local: true,
                 input: Some(input.clone()),
                 output: None,
@@ -581,7 +584,7 @@ async fn activity_interceptor_wraps_local_activity_execution() {
                 interceptor: "local",
                 phase: ActivityInterceptorPhase::After,
                 activity_type: "StdActivities::echo".to_owned(),
-                workflow_type: wf_name.to_owned(),
+                workflow_type: Some(wf_name.to_owned()),
                 is_local: true,
                 input: None,
                 output: Some(input.clone()),
@@ -707,7 +710,7 @@ async fn activity_interceptor_observes_activity_error() {
                 interceptor: "failure",
                 phase: ActivityInterceptorPhase::Before,
                 activity_type: "FailingActivities::fail".to_owned(),
-                workflow_type: wf_name.to_owned(),
+                workflow_type: Some(wf_name.to_owned()),
                 is_local: false,
                 input: Some(input),
                 output: None,
@@ -717,7 +720,7 @@ async fn activity_interceptor_observes_activity_error() {
                 interceptor: "failure",
                 phase: ActivityInterceptorPhase::After,
                 activity_type: "FailingActivities::fail".to_owned(),
-                workflow_type: wf_name.to_owned(),
+                workflow_type: Some(wf_name.to_owned()),
                 is_local: false,
                 input: None,
                 output: None,
@@ -803,7 +806,7 @@ async fn activity_interceptor_observes_activity_panic() {
                 interceptor: "panic",
                 phase: ActivityInterceptorPhase::Before,
                 activity_type: "PanickingActivities::panic_activity".to_owned(),
-                workflow_type: wf_name.to_owned(),
+                workflow_type: Some(wf_name.to_owned()),
                 is_local: false,
                 input: Some(input),
                 output: None,
@@ -813,7 +816,7 @@ async fn activity_interceptor_observes_activity_panic() {
                 interceptor: "panic",
                 phase: ActivityInterceptorPhase::After,
                 activity_type: "PanickingActivities::panic_activity".to_owned(),
-                workflow_type: wf_name.to_owned(),
+                workflow_type: Some(wf_name.to_owned()),
                 is_local: false,
                 input: None,
                 output: None,
@@ -2407,5 +2410,25 @@ async fn immediate_activity_cancelation() {
 #[case::eager(false)]
 #[tokio::test]
 async fn activity_cancel_delivered_without_heartbeat(#[case] disable_eager: bool) {
+    // Cancellation of activities through Worker Commands was added in Server v1.32.0-158.0,
+    // but the case for eager activities was initially broken. It got fixed in
+    // temporalio/temporal#10634, which was released in Server v1.32.0-159.0.
+    //
+    // At this time, there is no release of the Temporal CLI that bundles Server
+    // v1.32.0-159.0. We're pinned on CLI "v1.7.4-standalone-nexus-operations" which
+    // bundles Server v1.32.0-158.0, and therefore has the broken support for eager
+    // activity cancellation. That results in the eager activity cancelation test
+    // failing in CI and local tests against the CLI Dev Server.
+    //
+    // FIXME: Remove once we're pinned on a CLI that bundles Server >v1.32.0-159.0.
+    const CLI_WITHOUT_EAGER_CANCEL_FIX: &str = "v1.7.4-standalone-nexus-operations";
+    if !disable_eager
+        && env::var(CLI_VERSION_OVERRIDE_ENV_VAR).is_ok_and(|v| v == CLI_WITHOUT_EAGER_CANCEL_FIX)
+    {
+        // The skip message would go unlogged as no telemetry has been initialized yet.
+        init_integ_telem();
+        warn!("Skipping test: eager activity cancel requires server >= v1.32.0-159.0");
+        return;
+    }
     shared_tests::activity_cancel_delivered_without_heartbeat(disable_eager).await
 }

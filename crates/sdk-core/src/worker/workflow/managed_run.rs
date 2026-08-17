@@ -661,12 +661,11 @@ impl ManagedRun {
                 warn!(failure=?failure, "Failing workflow due to nondeterminism error");
                 return self
                     .successful_completion(
-                        vec![WFCommand {
-                            variant: WFCommandVariant::FailWorkflow(FailWorkflowExecution {
+                        vec![WFCommand::new(WFCommandVariant::FailWorkflow(
+                            FailWorkflowExecution {
                                 failure: failure.failure,
-                            }),
-                            metadata: None,
-                        }],
+                            },
+                        ))],
                         vec![],
                         VersioningBehavior::Unspecified, // Doesn't matter since we're failing wf
                         resp_chan,
@@ -1905,39 +1904,27 @@ mod tests {
         use super::*;
 
         pub(crate) fn complete() -> WFCommand {
-            WFCommand {
-                variant: WFCommandVariant::CompleteWorkflow(CompleteWorkflowExecution {
-                    result: None,
-                }),
-                metadata: None,
-            }
+            WFCommand::new(WFCommandVariant::CompleteWorkflow(
+                CompleteWorkflowExecution { result: None },
+            ))
         }
 
         pub(crate) fn cancel() -> WFCommand {
-            WFCommand {
-                variant: WFCommandVariant::CancelWorkflow(CancelWorkflowExecution {}),
-                metadata: None,
-            }
+            WFCommand::new(WFCommandVariant::CancelWorkflow(CancelWorkflowExecution {}))
         }
 
         pub(crate) fn query_response() -> WFCommand {
-            WFCommand {
-                variant: WFCommandVariant::QueryResponse(QueryResult {
-                    query_id: "".into(),
-                    variant: None,
-                }),
-                metadata: None,
-            }
+            WFCommand::new(WFCommandVariant::QueryResponse(QueryResult {
+                query_id: "".into(),
+                variant: None,
+            }))
         }
 
         pub(crate) fn update_response() -> WFCommand {
-            WFCommand {
-                variant: WFCommandVariant::UpdateResponse(UpdateResponse {
-                    protocol_instance_id: "".into(),
-                    response: None,
-                }),
-                metadata: None,
-            }
+            WFCommand::new(WFCommandVariant::UpdateResponse(UpdateResponse {
+                protocol_instance_id: "".into(),
+                response: None,
+            }))
         }
 
         pub(crate) fn command_types(commands: &[WFCommand]) -> Vec<Discriminant<WFCommand>> {

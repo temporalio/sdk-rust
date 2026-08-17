@@ -34,7 +34,7 @@ jobs:
       api_go_commit_sha: ${{ steps.pin_commits.outputs.api_go_commit_sha }}
     steps:
       - name: Checkout api
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           ref: ${{ github.event.inputs.branch }}
           fetch-depth: 0
@@ -42,7 +42,7 @@ jobs:
           path: api
 
       - name: Checkout api-go
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           repository: temporalio/api-go
           ref: ${{ github.event.inputs.branch }}
@@ -114,7 +114,7 @@ jobs:
           owner: ${{ github.repository_owner }}
 
       - name: Checkout
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           ref: ${{ needs.prepare-inputs.outputs.api_commit_sha }}
           token: ${{ steps.generate_token.outputs.token }}

@@ -5,7 +5,7 @@ use crate::{
 use http::Uri;
 use std::{collections::HashMap, sync::Arc, time::Duration};
 use temporalio_common::{
-    RetryPolicy,
+    ActivityCloseTimeouts, RetryPolicy,
     data_converters::DataConverter,
     protos::temporal::api::{
         common::{
@@ -13,7 +13,9 @@ use temporalio_common::{
             v1::{Header, Payloads},
         },
         enums::v1::{
-            ArchivalState, HistoryEventFilterType, QueryRejectCondition, WorkflowIdConflictPolicy,
+            ActivityIdConflictPolicy as ProtoActivityIdConflictPolicy,
+            ActivityIdReusePolicy as ProtoActivityIdReusePolicy, ArchivalState,
+            HistoryEventFilterType, QueryRejectCondition, WorkflowIdConflictPolicy,
             WorkflowIdReusePolicy,
         },
         replication::v1::ClusterReplicationConfig,
@@ -687,4 +689,180 @@ pub struct WorkflowCountOptions {
     /// Controls for the count RPC.
     #[builder(default)]
     pub rpc_options: RpcOptions,
+}
+
+/// Options for starting a standalone activity.
+#[derive(Clone, Debug, bon::Builder)]
+#[builder(start_fn = new, on(String, into))]
+#[non_exhaustive]
+pub struct ActivityStartOptions {
+    /// Task queue to run this activity on.
+    #[builder(start_fn)]
+    pub task_queue: String,
+    /// Activity ID of the started activity. It's recommended to use a meaningful business ID.
+    #[builder(start_fn)]
+    pub id: String,
+    /// Timeouts for activity completion.
+    ///
+    /// See [`ActivityCloseTimeouts`] for the meaning of each timeout variant.
+    #[builder(start_fn)]
+    pub close_timeouts: ActivityCloseTimeouts,
+    /// If set, specifies maximum time the activity can wait in the task queue before being picked
+    /// up by a worker. This timeout is non-retryable.
+    pub schedule_to_start_timeout: Option<Duration>,
+    /// If set, specifies maximum time between successful heartbeats.
+    pub heartbeat_timeout: Option<Duration>,
+    /// Controls how Activity is retried. If not set, the server will assign default retry policy.
+    #[builder(into)]
+    pub retry_policy: Option<RetryPolicy>,
+    /// Priority to use when starting this activity.
+    #[builder(default)]
+    pub priority: Priority,
+    /// Specifies behavior if there's a *closed* activity with the same ID.
+    #[builder(default)]
+    pub id_reuse_policy: ActivityIdReusePolicy,
+    /// Specifies behavior if there's a *running* activity with the same ID. Note that there can
+    /// only be one running activity for each Activity ID.
+    #[builder(default)]
+    pub id_conflict_policy: ActivityIdConflictPolicy,
+    /// Search attributes for the activity.
+    pub search_attributes: Option<SearchAttributes>,
+    /// Headers to include with the start request.
+    pub header: Option<Header>,
+    /// Single-line static summary for the activity, shown in the Temporal UI.
+    pub summary: Option<String>,
+    /// Multi-line static details for the activity, shown in the Temporal UI.
+    pub static_details: Option<String>,
+    /// Time to wait before dispatching the first activity task.
+    /// This delay is not applied to retry attempts.
+    pub start_delay: Option<Duration>,
+}
+
+impl ActivityStartOptions {
+    /// Returns a builder with `close_timeouts` set to [`ActivityCloseTimeouts::StartToClose`].
+    pub fn with_start_to_close_timeout(
+        task_queue: impl Into<String>,
+        activity_id: impl Into<String>,
+        start_to_close_timeout: Duration,
+    ) -> ActivityStartOptionsBuilder {
+        Self::new(
+            task_queue,
+            activity_id,
+            ActivityCloseTimeouts::StartToClose(start_to_close_timeout),
+        )
+    }
+
+    /// Returns a builder with `close_timeouts` set to [`ActivityCloseTimeouts::ScheduleToClose`].
+    pub fn with_schedule_to_close_timeout(
+        task_queue: impl Into<String>,
+        activity_id: impl Into<String>,
+        schedule_to_close_timeout: Duration,
+    ) -> ActivityStartOptionsBuilder {
+        Self::new(
+            task_queue,
+            activity_id,
+            ActivityCloseTimeouts::ScheduleToClose(schedule_to_close_timeout),
+        )
+    }
+}
+
+/// Specifies behavior when starting a standalone activity if there's a *closed* activity with
+/// the same ID. See [`ActivityStartOptions::id_reuse_policy`].
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum ActivityIdReusePolicy {
+    #[default]
+    /// Always allow starting an activity using the same activity ID. This is the default.
+    AllowDuplicate,
+    /// Allow starting an activity using the same ID only when the last execution did not complete
+    /// successfully.
+    AllowDuplicateFailedOnly,
+    /// Do not permit re-use of the ID for this activity.
+    RejectDuplicate,
+}
+
+impl From<ActivityIdReusePolicy> for ProtoActivityIdReusePolicy {
+    fn from(value: ActivityIdReusePolicy) -> Self {
+        match value {
+            ActivityIdReusePolicy::AllowDuplicate => Self::AllowDuplicate,
+            ActivityIdReusePolicy::AllowDuplicateFailedOnly => Self::AllowDuplicateFailedOnly,
+            ActivityIdReusePolicy::RejectDuplicate => Self::RejectDuplicate,
+        }
+    }
+}
+
+/// Specifies behavior when starting a standalone activity if there's a *running* activity with
+/// the same ID. See [`ActivityStartOptions::id_conflict_policy`].
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum ActivityIdConflictPolicy {
+    #[default]
+    /// Don't start a new activity; instead return
+    /// [`StartActivityError::AlreadyStarted`](crate::errors::StartActivityError::AlreadyStarted).
+    Fail,
+    /// Don't start a new activity; instead return a handle for the running activity.
+    UseExisting,
+}
+
+impl From<ActivityIdConflictPolicy> for ProtoActivityIdConflictPolicy {
+    fn from(value: ActivityIdConflictPolicy) -> Self {
+        match value {
+            ActivityIdConflictPolicy::Fail => Self::Fail,
+            ActivityIdConflictPolicy::UseExisting => Self::UseExisting,
+        }
+    }
+}
+
+/// Options for listing activities.
+#[derive(Debug, Clone, Default, bon::Builder)]
+#[non_exhaustive]
+pub struct ActivityListOptions {}
+
+/// Options for counting activities.
+#[derive(Debug, Clone, Default, bon::Builder)]
+#[non_exhaustive]
+pub struct ActivityCountOptions {}
+
+/// Controls which optional fields will be requested in
+/// [`ActivityHandle::describe`](crate::ActivityHandle::describe) operation. The fields will be
+/// present in returned [`ActivityExecutionDescription`](crate::ActivityExecutionDescription),
+/// subject to data availability and server support.
+///
+/// Note that these fields contain payloads that can be arbitrarily large. It's recommended not to
+/// include them unless they're needed.
+#[derive(Debug, Clone, Default, bon::Builder)]
+#[non_exhaustive]
+pub struct ActivityDescribeOptions {
+    /// If set and the activity received input, the input will be included.
+    #[builder(default)]
+    pub include_input: bool,
+    /// If set and the activity is closed, the activity outcome will be included.
+    #[builder(default)]
+    pub include_outcome: bool,
+    /// If set and the activity sent heartbeat details, the heartbeat details will be included.
+    #[builder(default)]
+    pub include_heartbeat_details: bool,
+    /// If set and the activity has a failed attempt, the last failure will be included.
+    #[builder(default)]
+    pub include_last_failure: bool,
+}
+
+/// Options for [`ActivityHandle::cancel`](crate::ActivityHandle::cancel).
+#[derive(Debug, Clone, Default, bon::Builder)]
+#[builder(on(String, into))]
+#[non_exhaustive]
+pub struct ActivityCancelOptions {
+    /// Reason for cancellation. Can be empty.
+    #[builder(default)]
+    pub reason: String,
+}
+
+/// Options for [`ActivityHandle::terminate`](crate::ActivityHandle::terminate).
+#[derive(Debug, Clone, Default, bon::Builder)]
+#[builder(on(String, into))]
+#[non_exhaustive]
+pub struct ActivityTerminateOptions {
+    /// Reason for termination. Can be empty.
+    #[builder(default)]
+    pub reason: String,
 }

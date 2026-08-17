@@ -3,8 +3,14 @@
 use crate::{PluginApplyError, WorkflowExecutionStatus, workflow_handle::WorkflowResultDetails};
 use http::uri::InvalidUri;
 use temporalio_common::{
-    data_converters::PayloadConversionError, error::IncomingError,
-    protos::temporal::api::failure::v1::Failure,
+    data_converters::{DecodablePayloads, PayloadConversionError},
+    error::{IncomingError, TimeoutType},
+    protos::{
+        temporal::api::{
+            errordetails::v1::ActivityExecutionAlreadyStartedFailure, failure::v1::Failure,
+        },
+        utilities::decode_status_detail,
+    },
 };
 use tonic::Code;
 
@@ -326,4 +332,131 @@ pub enum ClientNewError {
     /// A plugin failed while configuring client options.
     #[error(transparent)]
     Plugin(#[from] PluginApplyError),
+}
+
+/// Errors returned by methods on [crate::ActivityHandle] that don't need more specific error types.
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum ActivityInteractionError {
+    /// The activity was not found.
+    #[error("Activity not found")]
+    NotFound(#[source] tonic::Status),
+
+    /// Error deserializing output.
+    #[error("Payload conversion error: {0}")]
+    PayloadConversion(#[from] PayloadConversionError),
+
+    /// An uncategorized RPC error from the server.
+    #[error("Server error: {0}")]
+    Rpc(#[source] tonic::Status),
+
+    /// Other errors.
+    #[error(transparent)]
+    Other(#[from] Box<dyn std::error::Error + Send + Sync>),
+}
+
+impl From<tonic::Status> for ActivityInteractionError {
+    fn from(status: tonic::Status) -> Self {
+        if status.code() == Code::NotFound {
+            Self::NotFound(status)
+        } else {
+            Self::Rpc(status)
+        }
+    }
+}
+
+/// Errors that can occur when starting a standalone activity.
+#[allow(clippy::large_enum_variant)]
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum StartActivityError {
+    /// There's a conflicting activity execution with the same ID according to chosen ID reuse
+    /// policy and ID conflict policy.
+    #[error("Activity already started with run_id={run_id}")]
+    AlreadyStarted {
+        /// Run ID of the existing execution with the same activity ID.
+        run_id: String,
+        /// Raw error from the server.
+        #[source]
+        source: tonic::Status,
+    },
+
+    /// Error serializing input.
+    #[error("Payload conversion error: {0}")]
+    PayloadConversion(#[from] PayloadConversionError),
+
+    /// An uncategorized RPC error from the server.
+    #[error("Server error: {0}")]
+    Rpc(#[source] tonic::Status),
+
+    /// Other errors.
+    #[error(transparent)]
+    Other(#[from] Box<dyn std::error::Error + Send + Sync>),
+}
+
+impl From<tonic::Status> for StartActivityError {
+    fn from(status: tonic::Status) -> Self {
+        if status.code() == tonic::Code::AlreadyExists
+            && let Some(details) =
+                decode_status_detail::<ActivityExecutionAlreadyStartedFailure>(status.details())
+        {
+            StartActivityError::AlreadyStarted {
+                run_id: details.run_id,
+                source: status,
+            }
+        } else {
+            StartActivityError::Rpc(status)
+        }
+    }
+}
+
+/// Errors returned by [`crate::ActivityHandle::result`].
+#[allow(clippy::large_enum_variant)]
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum ActivityResultError {
+    /// Activity execution did not complete successfully.
+    #[error("Activity failed: {0}")]
+    ActivityFailed(#[source] IncomingError),
+
+    /// The activity was canceled.
+    #[error("Activity canceled")]
+    Cancelled {
+        /// Details provided at cancellation time.
+        details: DecodablePayloads,
+    },
+
+    /// The workflow was terminated.
+    #[error("Activity terminated")]
+    Terminated,
+
+    /// The activity timed out.
+    #[error("Activity timed out: {0:?}")]
+    TimedOut(TimeoutType),
+
+    /// The activity was not found.
+    #[error("Activity not found")]
+    NotFound(#[source] tonic::Status),
+
+    /// Error deserializing output.
+    #[error("Payload conversion error: {0}")]
+    PayloadConversion(#[from] PayloadConversionError),
+
+    /// An uncategorized RPC error from the server.
+    #[error("Server error: {0}")]
+    Rpc(#[source] tonic::Status),
+
+    /// Other errors.
+    #[error(transparent)]
+    Other(#[from] Box<dyn std::error::Error + Send + Sync>),
+}
+
+impl From<tonic::Status> for ActivityResultError {
+    fn from(status: tonic::Status) -> Self {
+        if status.code() == Code::NotFound {
+            Self::NotFound(status)
+        } else {
+            Self::Rpc(status)
+        }
+    }
 }
