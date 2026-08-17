@@ -898,9 +898,21 @@ impl ContinueAsNewOptions {
         headers: HashMap<String, Payload>,
         payload_converter: &PayloadConverter,
     ) -> Result<ContinueAsNewRequest, PayloadConversionError> {
+        let context = SerializationContext {
+            data: &SerializationContextData::Workflow,
+            converter: payload_converter,
+        };
         let memo = self
             .memo
-            .map(|memo| memo.encode(payload_converter))
+            .map(|memo| {
+                memo.iter()
+                    .map(|(key, value)| {
+                        payload_converter
+                            .to_payload(&context, value)
+                            .map(|payload| (key.to_owned(), payload))
+                    })
+                    .collect::<Result<HashMap<_, _>, _>>()
+            })
             .transpose()?
             .unwrap_or_default();
         Ok(ContinueAsNewWorkflowExecution {

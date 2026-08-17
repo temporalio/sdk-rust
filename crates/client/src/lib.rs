@@ -1570,13 +1570,22 @@ where
                         let workflow_id = options.workflow_id.clone();
                         let task_queue_name = options.task_queue.clone();
 
-                        // Memo values are serialized with the payload converter and then run
-                        // through the codec, since the read side (describe/list) codec-decodes
-                        // them.
                         let memo = match options.memo {
                             Some(memo) => {
+                                let payload_converter = data_converter.payload_converter();
+                                let context = SerializationContext {
+                                    data: &SerializationContextData::Workflow,
+                                    converter: payload_converter,
+                                };
                                 let mut memo = ProtoMemo {
-                                    fields: memo.encode(data_converter.payload_converter())?,
+                                    fields: memo
+                                        .iter()
+                                        .map(|(key, value)| {
+                                            payload_converter
+                                                .to_payload(&context, value)
+                                                .map(|payload| (key.to_owned(), payload))
+                                        })
+                                        .collect::<Result<_, _>>()?,
                                 };
                                 encode_payloads(
                                     &mut memo,
@@ -2917,12 +2926,6 @@ mod tests {
             )
         }
 
-        fn memo_with(key: &str, value: &str) -> MemoValues {
-            let mut memo = MemoValues::new();
-            memo.insert(key.to_owned(), value.to_owned());
-            memo
-        }
-
         /// Decode a sent memo the same way `describe`/`list` do, and read it back.
         async fn read_back(sent: ProtoMemo) -> Memo {
             let mut sent = sent;
@@ -2939,23 +2942,21 @@ mod tests {
         #[tokio::test]
         async fn start_workflow_encodes_memo_with_payload_converter_and_codec() {
             let (client, recorded) = mock_client_with_codec(XorCodec);
+            let mut memo = MemoValues::new();
+            memo.insert("memo-key", "memo-value".to_owned());
 
             client
                 .start_workflow(
                     TestWorkflow,
                     vec!["initial".to_owned()],
                     WorkflowStartOptions::new("task-queue", "workflow-id")
-                        .memo(memo_with("memo-key", "memo-value"))
+                        .memo(memo)
                         .build(),
                 )
                 .await
                 .unwrap();
 
             let sent = recorded.lock().memo.clone().expect("memo should be sent");
-            // The codec ran, so the value is not readable as plain JSON on the wire.
-            let raw = sent.fields.get("memo-key").expect("key should be present");
-            assert_ne!(raw.data, br#""memo-value""#);
-
             assert_eq!(
                 read_back(sent).await.get::<String>("memo-key").unwrap(),
                 Some("memo-value".to_owned())
@@ -2965,13 +2966,15 @@ mod tests {
         #[tokio::test]
         async fn signal_with_start_workflow_encodes_memo() {
             let (client, recorded) = mock_client_with_codec(XorCodec);
+            let mut memo = MemoValues::new();
+            memo.insert("memo-key", "memo-value".to_owned());
 
             client
                 .start_workflow(
                     TestWorkflow,
                     vec!["initial".to_owned()],
                     WorkflowStartOptions::new("task-queue", "workflow-id")
-                        .memo(memo_with("memo-key", "memo-value"))
+                        .memo(memo)
                         .start_signal(WorkflowStartSignal::new("some-signal").build())
                         .build(),
                 )

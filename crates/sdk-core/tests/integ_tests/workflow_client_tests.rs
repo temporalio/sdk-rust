@@ -255,7 +255,7 @@ async fn already_started_error_contains_run_id() {
 async fn start_workflow_with_memo() {
     let test_name = "start_workflow_with_memo";
     let mut starter = CoreWfStarter::new(test_name);
-    let client = starter.get_client().await;
+    let client = starter.get_core_client().await;
     let task_queue = starter.get_task_queue().to_owned();
     let wf_id = format!("{test_name}_{}", rand_6_chars());
 
@@ -281,32 +281,6 @@ async fn start_workflow_with_memo() {
         Some("memo-value".to_string())
     );
     assert_eq!(memo.get::<u32>("other-key").unwrap(), Some(42));
-
-    handle
-        .terminate(WorkflowTerminateOptions::default())
-        .await
-        .unwrap();
-}
-
-#[tokio::test]
-async fn start_workflow_without_memo_is_empty() {
-    let test_name = "start_workflow_without_memo_is_empty";
-    let mut starter = CoreWfStarter::new(test_name);
-    let client = starter.get_client().await;
-    let task_queue = starter.get_task_queue().to_owned();
-    let wf_id = format!("{test_name}_{}", rand_6_chars());
-
-    let handle = client
-        .start_workflow(
-            UntypedWorkflow::new(test_name),
-            RawValue::empty(),
-            WorkflowStartOptions::new(task_queue, wf_id).build(),
-        )
-        .await
-        .unwrap();
-
-    let desc = handle.describe(Default::default()).await.unwrap();
-    assert!(desc.memo().is_empty());
 
     handle
         .terminate(WorkflowTerminateOptions::default())

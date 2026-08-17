@@ -1736,17 +1736,22 @@ impl<W> SyncWorkflowContext<W> {
     where
         K: Into<String>,
     {
+        let payload_converter = self.payload_converter();
+        let context = SerializationContext {
+            data: &SerializationContextData::Workflow,
+            converter: payload_converter,
+        };
         let mut fields = HashMap::new();
         let mut local_updates = Vec::new();
         for (key, value) in updates {
             let key = key.into();
             let (command_payload, local_payload) = match value {
                 Some(value) => {
-                    let payload = value.to_payload(self.payload_converter())?;
+                    let payload = payload_converter.to_payload(&context, &value)?;
                     (payload.clone(), Some(payload))
                 }
                 None => (
-                    MemoValue::new(()).to_payload(self.payload_converter())?,
+                    payload_converter.to_payload(&context, &MemoValue::new(()))?,
                     None,
                 ),
             };
@@ -4363,7 +4368,15 @@ mod tests {
         };
         let fields = &command.upserted_memo.as_ref().unwrap().fields;
         let payload_converter = PayloadConverter::default();
-        let removal_payload = MemoValue::new(()).to_payload(&payload_converter).unwrap();
+        let removal_payload = payload_converter
+            .to_payload(
+                &SerializationContext {
+                    data: &SerializationContextData::Workflow,
+                    converter: &payload_converter,
+                },
+                &MemoValue::new(()),
+            )
+            .unwrap();
         assert_eq!(fields.get("old"), Some(&removal_payload));
         assert_eq!(
             u32::from_json_payload(fields.get("new").unwrap()).unwrap(),

@@ -5,10 +5,7 @@ use crate::{
     },
     protos::temporal::api::common::v1::{Memo as ProtoMemo, Payload},
 };
-use std::{
-    collections::{BTreeMap, HashMap},
-    sync::Arc,
-};
+use std::{collections::BTreeMap, sync::Arc};
 
 /// A collection of memo payloads that can be deserialized into typed values.
 #[derive(Clone, Debug)]
@@ -93,7 +90,7 @@ impl Memo {
 trait SerializableMemoValue: Send + Sync {
     fn to_payload(
         &self,
-        payload_converter: &PayloadConverter,
+        context: &SerializationContext<'_>,
     ) -> Result<Payload, PayloadConversionError>;
 }
 
@@ -103,15 +100,9 @@ where
 {
     fn to_payload(
         &self,
-        payload_converter: &PayloadConverter,
+        context: &SerializationContext<'_>,
     ) -> Result<Payload, PayloadConversionError> {
-        payload_converter.to_payload(
-            &SerializationContext {
-                data: &SerializationContextData::Workflow,
-                converter: payload_converter,
-            },
-            self,
-        )
+        context.converter.to_payload(context, self)
     }
 }
 
@@ -130,14 +121,14 @@ impl MemoValue {
             value: Arc::new(value),
         }
     }
+}
 
-    /// Serialize this value using `payload_converter`.
-    #[doc(hidden)]
-    pub fn to_payload(
+impl TemporalSerializable for MemoValue {
+    fn to_payload(
         &self,
-        payload_converter: &PayloadConverter,
+        context: &SerializationContext<'_>,
     ) -> Result<Payload, PayloadConversionError> {
-        self.value.to_payload(payload_converter)
+        self.value.to_payload(context)
     }
 }
 
@@ -163,26 +154,21 @@ impl MemoValues {
         self
     }
 
-    /// Serialize every value using `payload_converter`.
-    #[doc(hidden)]
-    pub fn encode(
-        &self,
-        payload_converter: &PayloadConverter,
-    ) -> Result<HashMap<String, Payload>, PayloadConversionError> {
-        self.values
-            .iter()
-            .map(|(key, value)| {
-                value
-                    .to_payload(payload_converter)
-                    .map(|payload| (key.clone(), payload))
-            })
-            .collect()
+    /// Returns the value for `key`, if present.
+    pub fn get(&self, key: &str) -> Option<&MemoValue> {
+        self.values.get(key)
+    }
+
+    /// Iterates over the memo entries in key order.
+    pub fn iter(&self) -> impl Iterator<Item = (&str, &MemoValue)> {
+        self.values.iter().map(|(key, value)| (key.as_str(), value))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
 
     #[test]
     fn memo_decodes_serialized_values() {
@@ -234,11 +220,23 @@ mod tests {
             .insert("count", 7_u32)
             .insert("label", "hello".to_string());
 
+        let context = SerializationContext {
+            data: &SerializationContextData::Workflow,
+            converter: &payload_converter,
+        };
+        let fields = values
+            .iter()
+            .map(|(key, value)| {
+                (
+                    key.to_owned(),
+                    payload_converter.to_payload(&context, value).unwrap(),
+                )
+            })
+            .collect();
+
         let memo = Memo::from_raw(
-            Some(ProtoMemo {
-                fields: values.encode(&payload_converter).unwrap(),
-            }),
-            payload_converter,
+            Some(ProtoMemo { fields }),
+            payload_converter.clone(),
             SerializationContextData::Workflow,
         );
 
