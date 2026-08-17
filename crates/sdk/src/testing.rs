@@ -76,7 +76,7 @@ use temporalio_client::{
     Client, ClientOptions, ConnectionOptions, Priority, errors::ClientConnectError,
 };
 use temporalio_common::{
-    RetryPolicy, WorkflowExecution,
+    RetryPolicy,
     data_converters::{
         GenericPayloadConverter, PayloadConversionError, PayloadConverter, SerializationContext,
         SerializationContextData, TemporalSerializable,
@@ -95,12 +95,6 @@ use temporalio_sdk_core::ephemeral_server::{
 
 type ActivityImplementers = HashMap<String, Arc<dyn Any + Send + Sync>>;
 
-fn default_workflow_execution() -> WorkflowExecution {
-    let mut execution = WorkflowExecution::default();
-    execution.set_workflow_id("test").set_run_id("test-run");
-    execution
-}
-
 /// Options for constructing [`ActivityInfo`] with defaults suitable for an activity test.
 #[derive(bon::Builder)]
 #[builder(
@@ -111,12 +105,14 @@ fn default_workflow_execution() -> WorkflowExecution {
 pub struct TestActivityInfoOptions {
     #[builder(default = b"test".to_vec())]
     task_token: Vec<u8>,
-    #[builder(default = "test".to_owned())]
-    workflow_type: String,
+    #[builder(required, default = Some("test".to_owned()))]
+    workflow_type: Option<String>,
     #[builder(default = "default".to_owned())]
-    workflow_namespace: String,
-    #[builder(required, default = Some(default_workflow_execution()))]
-    workflow_execution: Option<WorkflowExecution>,
+    namespace: String,
+    #[builder(required, default = Some("test".to_owned()))]
+    workflow_id: Option<String>,
+    #[builder(required, default = Some("test-run".to_owned()))]
+    workflow_run_id: Option<String>,
     #[builder(default = "test".to_owned())]
     activity_id: String,
     #[builder(default = "unknown".to_owned())]
@@ -142,7 +138,7 @@ pub struct TestActivityInfoOptions {
     is_local: bool,
     #[builder(default)]
     priority: Priority,
-    run_id: Option<String>,
+    activity_run_id: Option<String>,
 }
 
 impl<S: test_activity_info_options_builder::State> TestActivityInfoOptionsBuilder<S> {
@@ -157,8 +153,9 @@ impl From<TestActivityInfoOptions> for ActivityInfo {
         Self {
             task_token: options.task_token,
             workflow_type: options.workflow_type,
-            workflow_namespace: options.workflow_namespace,
-            workflow_execution: options.workflow_execution,
+            namespace: options.namespace,
+            workflow_id: options.workflow_id,
+            workflow_run_id: options.workflow_run_id,
             activity_id: options.activity_id,
             activity_type: options.activity_type,
             task_queue: options.task_queue,
@@ -171,7 +168,7 @@ impl From<TestActivityInfoOptions> for ActivityInfo {
             retry_policy: options.retry_policy,
             is_local: options.is_local,
             priority: options.priority,
-            run_id: options.run_id,
+            activity_run_id: options.activity_run_id,
         }
     }
 }
