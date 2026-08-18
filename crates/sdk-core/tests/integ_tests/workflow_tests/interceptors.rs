@@ -1,4 +1,4 @@
-use crate::common::{CoreWfStarter, activity_functions::StdActivities};
+use crate::common::{CoreWfStarter, WorkflowHandleExt, activity_functions::StdActivities};
 use std::{
     future::Future,
     pin::Pin,
@@ -308,6 +308,325 @@ async fn workflow_interceptors_mutate_inputs_and_replace_outputs() {
         worker.run_until_done().await.unwrap();
     };
     join!(driver, run);
+}
+
+#[workflow]
+#[derive(Default)]
+struct AllHandlersFinishedWorkflow {
+    handler_started: bool,
+}
+
+#[workflow_methods]
+impl AllHandlersFinishedWorkflow {
+    #[run]
+    async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<bool> {
+        ctx.wait_condition(|state| state.handler_started).await?;
+        let handlers_finished = ctx.all_handlers_finished();
+        let ctx_clone = ctx.clone();
+        ctx.wait_condition(move |_| ctx_clone.all_handlers_finished())
+            .await?;
+        Ok(handlers_finished)
+    }
+
+    #[signal]
+    fn sync_signal(&mut self, ctx: &mut SyncWorkflowContext<Self>) {
+        assert!(!ctx.all_handlers_finished());
+        self.handler_started = true;
+    }
+
+    #[signal]
+    async fn async_signal(ctx: &mut WorkflowContext<Self>) {
+        ctx.state_mut(|state| state.handler_started = true);
+    }
+
+    #[signal]
+    fn wake(&mut self, _ctx: &mut SyncWorkflowContext<Self>) {}
+
+    #[update_validator(async_update)]
+    fn validate_async_update(
+        &self,
+        _ctx: &WorkflowContextView,
+        reject: &bool,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        if *reject {
+            Err("rejected by validator".into())
+        } else {
+            Ok(())
+        }
+    }
+
+    #[update]
+    async fn async_update(ctx: &mut WorkflowContext<Self>, _reject: bool) {
+        ctx.state_mut(|state| state.handler_started = true);
+    }
+}
+
+struct PostHandlerTimerInterceptor;
+
+impl WorkflowInterceptor for PostHandlerTimerInterceptor {
+    fn handle_signal<'a>(
+        &'a self,
+        ctx: WorkflowInterceptorContext,
+        input: HandleSignalInput,
+        next: WorkflowNext<
+            'a,
+            HandleSignalInput,
+            WorkflowInterceptorFuture<'a, HandleSignalResult>,
+        >,
+    ) -> WorkflowInterceptorFuture<'a, HandleSignalResult> {
+        if input.name() == "wake" {
+            return next.run(input);
+        }
+        WorkflowInterceptorFuture::new(async move {
+            let result = next.run(input).await;
+            ctx.timer(Duration::from_millis(1)).await;
+            result
+        })
+    }
+
+    fn handle_update<'a>(
+        &'a self,
+        ctx: WorkflowInterceptorContext,
+        input: HandleUpdateInput,
+        next: WorkflowNext<
+            'a,
+            HandleUpdateInput,
+            WorkflowInterceptorFuture<'a, HandleUpdateResult>,
+        >,
+    ) -> WorkflowInterceptorFuture<'a, HandleUpdateResult> {
+        WorkflowInterceptorFuture::new(async move {
+            let result = next.run(input).await;
+            ctx.timer(Duration::from_millis(1)).await;
+            result
+        })
+    }
+}
+
+#[derive(Clone, Copy)]
+enum HandlerKind {
+    SyncSignal,
+    AsyncSignal,
+    Update,
+}
+
+#[rstest::rstest]
+#[tokio::test]
+async fn all_handlers_finished_waits_for_handler_chain(
+    #[values(
+        HandlerKind::SyncSignal,
+        HandlerKind::AsyncSignal,
+        HandlerKind::Update
+    )]
+    handler_kind: HandlerKind,
+    #[values(false, true)] with_interceptor: bool,
+) {
+    let mut starter = CoreWfStarter::new("all_handlers_finished_waits_for_handler_chain");
+    starter
+        .sdk_config
+        .register_workflow::<AllHandlersFinishedWorkflow>()
+        .unwrap();
+    if with_interceptor {
+        starter.sdk_config.register_workflow_interceptors(vec![
+            WorkflowInterceptorConstructor::new(|_| PostHandlerTimerInterceptor),
+        ]);
+    }
+    let mut worker = starter.worker().await;
+
+    let handle = worker
+        .submit_workflow(
+            AllHandlersFinishedWorkflow::run,
+            (),
+            WorkflowStartOptions::new(
+                starter.get_task_queue().to_owned(),
+                starter.get_wf_id().to_owned(),
+            )
+            .build(),
+        )
+        .await
+        .unwrap();
+
+    let driver = async {
+        match handler_kind {
+            HandlerKind::SyncSignal => {
+                handle
+                    .signal(
+                        AllHandlersFinishedWorkflow::sync_signal,
+                        (),
+                        WorkflowSignalOptions::default(),
+                    )
+                    .await
+                    .unwrap();
+            }
+            HandlerKind::AsyncSignal => {
+                handle
+                    .signal(
+                        AllHandlersFinishedWorkflow::async_signal,
+                        (),
+                        WorkflowSignalOptions::default(),
+                    )
+                    .await
+                    .unwrap();
+            }
+            HandlerKind::Update => {
+                handle
+                    .execute_update(
+                        AllHandlersFinishedWorkflow::async_update,
+                        false,
+                        WorkflowExecuteUpdateOptions::default(),
+                    )
+                    .await
+                    .unwrap();
+            }
+        }
+        assert_eq!(
+            // If interceptor wasn't registered, no timer was scheduled after the handlers so they should
+            // be finished after the first `wait_condition`.
+            !with_interceptor,
+            handle.get_result(Default::default()).await.unwrap()
+        );
+    };
+    let (_, worker_result) = join!(driver, worker.run_until_done());
+    worker_result.unwrap();
+    handle.fetch_history_and_replay(&mut worker).await.unwrap();
+}
+
+#[tokio::test]
+async fn rejected_update_does_not_leave_a_handler_in_progress() {
+    let mut starter = CoreWfStarter::new("rejected_update_does_not_leave_a_handler_in_progress");
+    starter
+        .sdk_config
+        .register_workflow::<AllHandlersFinishedWorkflow>()
+        .unwrap()
+        .register_workflow_interceptors(vec![WorkflowInterceptorConstructor::new(|_| {
+            PostHandlerTimerInterceptor
+        })]);
+    let mut worker = starter.worker().await;
+
+    let handle = worker
+        .submit_workflow(
+            AllHandlersFinishedWorkflow::run,
+            (),
+            WorkflowStartOptions::new(
+                starter.get_task_queue().to_owned(),
+                starter.get_wf_id().to_owned(),
+            )
+            .build(),
+        )
+        .await
+        .unwrap();
+
+    let driver = async {
+        assert!(
+            handle
+                .execute_update(
+                    AllHandlersFinishedWorkflow::async_update,
+                    true,
+                    WorkflowExecuteUpdateOptions::default(),
+                )
+                .await
+                .is_err()
+        );
+        handle
+            .signal(
+                AllHandlersFinishedWorkflow::sync_signal,
+                (),
+                WorkflowSignalOptions::default(),
+            )
+            .await
+            .unwrap();
+        assert!(!handle.get_result(Default::default()).await.unwrap());
+    };
+    let (_, worker_result) = join!(driver, worker.run_until_done());
+    worker_result.unwrap();
+}
+
+struct NonTemporalPostHandlerInterceptor {
+    waiting: Arc<Notify>,
+    release: Arc<Notify>,
+}
+
+impl WorkflowInterceptor for NonTemporalPostHandlerInterceptor {
+    fn handle_signal<'a>(
+        &'a self,
+        _ctx: WorkflowInterceptorContext,
+        input: HandleSignalInput,
+        next: WorkflowNext<
+            'a,
+            HandleSignalInput,
+            WorkflowInterceptorFuture<'a, HandleSignalResult>,
+        >,
+    ) -> WorkflowInterceptorFuture<'a, HandleSignalResult> {
+        if input.name() != "async_signal" {
+            return next.run(input);
+        }
+        let waiting = self.waiting.clone();
+        let release = self.release.clone();
+        WorkflowInterceptorFuture::new(async move {
+            let result = next.run(input).await;
+            waiting.notify_one();
+            release.notified().await;
+            result
+        })
+    }
+}
+
+#[tokio::test]
+async fn all_handlers_finished_tracks_nondeterministic_futures() {
+    let mut starter =
+        CoreWfStarter::new("all_handlers_finished_tracks_non_temporal_interceptor_futures");
+    starter.sdk_config.detect_nondeterministic_futures = false;
+    let waiting = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let waiting_ref = waiting.clone();
+    let release_ref = release.clone();
+    starter
+        .sdk_config
+        .register_workflow::<AllHandlersFinishedWorkflow>()
+        .unwrap()
+        .register_workflow_interceptors(vec![WorkflowInterceptorConstructor::new(move |_| {
+            NonTemporalPostHandlerInterceptor {
+                waiting: waiting_ref.clone(),
+                release: release_ref.clone(),
+            }
+        })]);
+    let mut worker = starter.worker().await;
+
+    let handle = worker
+        .submit_workflow(
+            AllHandlersFinishedWorkflow::run,
+            (),
+            WorkflowStartOptions::new(
+                starter.get_task_queue().to_owned(),
+                starter.get_wf_id().to_owned(),
+            )
+            .build(),
+        )
+        .await
+        .unwrap();
+
+    let driver = async {
+        handle
+            .signal(
+                AllHandlersFinishedWorkflow::async_signal,
+                (),
+                WorkflowSignalOptions::default(),
+            )
+            .await
+            .unwrap();
+        waiting.notified().await;
+        release.notify_one();
+        handle
+            .signal(
+                AllHandlersFinishedWorkflow::wake,
+                (),
+                WorkflowSignalOptions::default(),
+            )
+            .await
+            .unwrap();
+        assert!(!handle.get_result(Default::default()).await.unwrap());
+    };
+    let (_, worker_result) = join!(driver, worker.run_until_done());
+    worker_result.unwrap();
 }
 
 #[workflow]

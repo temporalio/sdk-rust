@@ -14,6 +14,7 @@ use crate::{
             UpdateRoutineCompletion, UpdateRoutineKind, WorkflowActivation, WorkflowFailure,
         },
     },
+    workflow_context::HandlerExecutionGuard,
     workflow_interceptors::{
         ExecuteWorkflowInput, ExecuteWorkflowResult, HandleQueryInput, HandleQueryResult,
         HandleSignalInput, HandleSignalResult, HandleUpdateInput, HandleUpdateResult,
@@ -81,6 +82,7 @@ enum GuestRoutine {
 struct InterceptedFuture<T> {
     inner: Fuse<LocalBoxFuture<'static, T>>,
     status: InterceptedFutureStatus,
+    _handler_execution: Option<HandlerExecutionGuard>,
 }
 
 impl<T> InterceptedFuture<T> {
@@ -88,6 +90,19 @@ impl<T> InterceptedFuture<T> {
         Self {
             inner: inner.fuse(),
             status,
+            _handler_execution: None,
+        }
+    }
+
+    fn with_handler_execution(
+        inner: LocalBoxFuture<'static, T>,
+        status: InterceptedFutureStatus,
+        handler_execution: HandlerExecutionGuard,
+    ) -> Self {
+        Self {
+            inner: inner.fuse(),
+            status,
+            _handler_execution: Some(handler_execution),
         }
     }
 
@@ -292,6 +307,7 @@ fn intercepted_signal_future<W>(
     base_ctx: BaseWorkflowContext,
     interceptors: Rc<[Arc<dyn WorkflowInterceptor>]>,
     input: HandleSignalInput,
+    handler_execution: HandlerExecutionGuard,
 ) -> InterceptedFuture<HandleSignalResult>
 where
     W: WorkflowImplementation,
@@ -310,7 +326,7 @@ where
         call_handle_signal(&interceptors, interceptor_ctx, input, next).await
     }
     .boxed_local();
-    InterceptedFuture::new(future, status)
+    InterceptedFuture::with_handler_execution(future, status, handler_execution)
 }
 
 fn intercepted_update_future<W>(
@@ -318,6 +334,7 @@ fn intercepted_update_future<W>(
     base_ctx: BaseWorkflowContext,
     interceptors: Rc<[Arc<dyn WorkflowInterceptor>]>,
     input: HandleUpdateInput,
+    handler_execution: HandlerExecutionGuard,
 ) -> InterceptedFuture<HandleUpdateResult>
 where
     W: WorkflowImplementation,
@@ -336,7 +353,7 @@ where
         call_handle_update(&interceptors, interceptor_ctx, input, next).await
     }
     .boxed_local();
-    InterceptedFuture::new(future, status)
+    InterceptedFuture::with_handler_execution(future, status, handler_execution)
 }
 
 impl<W: WorkflowImplementation> GuestWorkflowInstance<W>
@@ -532,11 +549,13 @@ where
         let future = match W::decode_signal_input(&name, payloads, converter) {
             Ok(Some(input)) => {
                 let input = HandleSignalInput::new(name.clone(), input, signal.headers);
+                let handler_execution = self.base_ctx.track_handler();
                 let mut future = intercepted_signal_future::<W>(
                     self.ctx.clone(),
                     self.base_ctx.clone(),
                     self.interceptors.clone(),
                     input,
+                    handler_execution,
                 );
                 if let ConstructionPoll::Ready(result) =
                     Self::poll_for_construction(&self.base_ctx, &mut future)?
@@ -580,6 +599,7 @@ where
             None => return Ok(self.rejection_for_missing_update_handler(name)),
         };
 
+        let mut handler_execution = None;
         if run_validator && has_validator {
             let payloads = Payloads {
                 payloads: input.clone(),
@@ -598,6 +618,7 @@ where
             };
             let validation_input =
                 ValidateUpdateInput::new(id.clone(), name.clone(), decoded_input, headers.clone());
+            let guard = self.base_ctx.track_handler();
             let validation_ctx = SyncWorkflowInterceptorContext::new(self.base_ctx.clone());
             let workflow_ctx = self.ctx.clone();
             let validation_next = WorkflowNext::new(move |input: ValidateUpdateInput| {
@@ -626,6 +647,7 @@ where
                     )));
                 }
             }
+            handler_execution = Some(guard);
         }
 
         let payloads = Payloads { payloads: input };
@@ -633,11 +655,14 @@ where
         let future = match W::decode_update_input(&name, payloads, converter) {
             Ok(Some(input)) => {
                 let input = HandleUpdateInput::new(id.clone(), name.clone(), input, headers);
+                let handler_execution =
+                    handler_execution.unwrap_or_else(|| self.base_ctx.track_handler());
                 let mut future = intercepted_update_future::<W>(
                     self.ctx.clone(),
                     self.base_ctx.clone(),
                     self.interceptors.clone(),
                     input,
+                    handler_execution,
                 );
                 if let ConstructionPoll::Ready(result) =
                     Self::poll_for_construction(&self.base_ctx, &mut future)?

@@ -485,8 +485,28 @@ struct WorkflowContextInner {
     data_converter: DataConverter,
     patch_activation_callback: Option<PatchActivationCallback>,
     state_mutated: Cell<bool>,
+    active_handlers: Cell<usize>,
+    condition_wakers: RefCell<Vec<Waker>>,
     current_waker: RefCell<Option<Waker>>,
     workflow_interceptors: Rc<[Arc<dyn WorkflowInterceptor>]>,
+}
+
+pub(crate) struct HandlerExecutionGuard {
+    base: BaseWorkflowContext,
+}
+
+impl Drop for HandlerExecutionGuard {
+    fn drop(&mut self) {
+        let active_handlers = self.base.inner.active_handlers.get();
+        debug_assert!(active_handlers > 0, "handler execution count underflow");
+        self.base
+            .inner
+            .active_handlers
+            .set(active_handlers.saturating_sub(1));
+        if active_handlers <= 1 {
+            self.base.wake_condition_waiters();
+        }
+    }
 }
 
 /// Identical to [`CancellableID`], but only containing command type and seq number, omitting any reason.
@@ -545,10 +565,6 @@ pub struct WorkflowContext<W> {
     sync: SyncWorkflowContext<W>,
     /// The workflow instance
     workflow_state: Rc<RefCell<W>>,
-    /// Wakers registered by `wait_condition` futures. Drained and woken on
-    /// every `state_mut` call so that waker-based combinators (e.g.
-    /// `FuturesOrdered`) re-poll the condition after state changes.
-    condition_wakers: Rc<RefCell<Vec<Waker>>>,
 }
 
 impl<W> Clone for WorkflowContext<W> {
@@ -556,7 +572,6 @@ impl<W> Clone for WorkflowContext<W> {
         Self {
             sync: self.sync.clone(),
             workflow_state: self.workflow_state.clone(),
-            condition_wakers: self.condition_wakers.clone(),
         }
     }
 }
@@ -623,6 +638,8 @@ impl BaseWorkflowContext {
                 data_converter,
                 patch_activation_callback,
                 state_mutated: Cell::new(false),
+                active_handlers: Cell::new(0),
+                condition_wakers: Default::default(),
                 current_waker: RefCell::new(None),
                 workflow_interceptors,
             }),
@@ -642,6 +659,24 @@ impl BaseWorkflowContext {
     /// Mark that workflow state has been mutated.
     pub(crate) fn set_state_mutated(&self) {
         self.inner.state_mutated.set(true);
+    }
+
+    pub(crate) fn all_handlers_finished(&self) -> bool {
+        self.inner.active_handlers.get() == 0
+    }
+
+    pub(crate) fn track_handler(&self) -> HandlerExecutionGuard {
+        self.inner
+            .active_handlers
+            .set(self.inner.active_handlers.get() + 1);
+        HandlerExecutionGuard { base: self.clone() }
+    }
+
+    fn wake_condition_waiters(&self) {
+        let _guard = SdkWakeGuard::new();
+        for waker in self.inner.condition_wakers.borrow_mut().drain(..) {
+            waker.wake();
+        }
     }
 
     pub(crate) fn take_runtime_progress(&self) -> bool {
@@ -1424,6 +1459,13 @@ impl<W> SyncWorkflowContext<W> {
         self.base.inner.shared.borrow().is_replaying_history_events
     }
 
+    /// Returns whether all currently dispatched signal and update handlers have finished.
+    ///
+    /// This includes the current handler invocation, if any, and all inbound interceptor work.
+    pub fn all_handlers_finished(&self) -> bool {
+        self.base.all_handlers_finished()
+    }
+
     /// Returns true if the server suggests this workflow should continue-as-new
     pub fn continue_as_new_suggested(&self) -> bool {
         self.base
@@ -1805,7 +1847,6 @@ impl<W> WorkflowContext<W> {
                 _phantom: PhantomData,
             },
             workflow_state,
-            condition_wakers: Rc::new(RefCell::new(Vec::new())),
         }
     }
 
@@ -1818,7 +1859,6 @@ impl<W> WorkflowContext<W> {
                 _phantom: PhantomData,
             },
             workflow_state: self.workflow_state.clone(),
-            condition_wakers: self.condition_wakers.clone(),
         }
     }
 
@@ -1906,6 +1946,28 @@ impl<W> WorkflowContext<W> {
     /// Returns true if the current work is replaying history events
     pub fn is_replaying_history_events(&self) -> bool {
         self.sync.is_replaying_history_events()
+    }
+
+    /// Returns whether all currently dispatched signal and update handlers have finished.
+    ///
+    /// Consider waiting on this condition before completing or continuing as new so in-progress
+    /// handlers are not interrupted. Use a cloned context in [`Self::wait_condition`]:
+    ///
+    /// ```rust
+    /// # use temporalio_workflow::{WorkflowContext, WorkflowResult};
+    /// # struct MyWorkflow;
+    /// # async fn wait_for_handlers(ctx: &mut WorkflowContext<MyWorkflow>) -> WorkflowResult<()> {
+    /// let wait_condition_ctx = ctx.clone();
+    /// ctx.wait_condition(move |_| wait_condition_ctx.all_handlers_finished())
+    ///     .await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// The check includes inbound interceptor work and the current handler invocation, if any.
+    /// It does not prevent future signal or update handlers from starting.
+    pub fn all_handlers_finished(&self) -> bool {
+        self.sync.all_handlers_finished()
     }
 
     /// Returns true if the server suggests this workflow should continue-as-new
@@ -2119,10 +2181,7 @@ impl<W> WorkflowContext<W> {
     /// `FuturesOrdered`) re-poll them on the next pass.
     pub fn state_mut<R>(&self, f: impl FnOnce(&mut W) -> R) -> R {
         let result = f(&mut *self.workflow_state.borrow_mut());
-        let _guard = SdkWakeGuard::new();
-        for waker in self.condition_wakers.borrow_mut().drain(..) {
-            waker.wake();
-        }
+        self.sync.base.wake_condition_waiters();
         self.sync.base.set_state_mutated();
         result
     }
@@ -2173,7 +2232,12 @@ impl<W> WorkflowContext<W> {
             } else if cancelled.as_mut().poll(cx).is_ready() {
                 Poll::Ready(Err(WorkflowCancellationError::new(token.reason())))
             } else {
-                self.condition_wakers.borrow_mut().push(cx.waker().clone());
+                self.sync
+                    .base
+                    .inner
+                    .condition_wakers
+                    .borrow_mut()
+                    .push(cx.waker().clone());
                 Poll::Pending
             }
         })

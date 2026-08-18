@@ -33,6 +33,11 @@ relevant information.
 
 ## Unreleased
 
+### Added
+* `WorkflowContext::all_handlers_finished` and `SyncWorkflowContext::all_handlers_finished` let
+  Rust workflows wait for active signal and update handler chains before completing or continuing
+  as new.
+
 ## [0.7.0] - 2026-08-17
 
 ### Added
