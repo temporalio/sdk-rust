@@ -33,6 +33,8 @@ relevant information.
 
 ## Unreleased
 
+## [0.7.0] - 2026-08-17
+
 ### Added
 * `WorkflowStartOptions::memo` attaches a non-indexed memo when starting a workflow, using the
   same `MemoValues` type already used by continue-as-new and `WorkflowContext::upsert_memo`.
@@ -44,6 +46,13 @@ relevant information.
 * Client methods for starting and managing execution of Standalone Activities. 
 * `LoggerFormat` for selecting compact, pretty, or JSON Core console log output. Configured log
   filters continue to apply to JSON output.
+* The Rust SDK now has an optional `testing` feature with a typed activity test environment and
+  local or external workflow test environments. Local workflow environments manage a Temporal CLI
+  dev server and expose shutdown through their local-server type state.
+* Worker heartbeats now report the SDK runtime, hosting environments, operating system, and
+  architecture once per worker, retrying until the first successful delivery. Runtime options can
+  disable this reporting, and language SDK bridges can supply their own runtime details. The Rust
+  SDK exposes separate runtime options that omit bridge-only runtime overrides.
 * `RpcOptions::builder()` for constructing per-call RPC options.
 * `DnsLoadBalancingOptions::builder()` for configuring DNS re-resolution intervals.
 * Experimental plugin APIs for packaging reusable client and worker configuration, including data
@@ -88,6 +97,12 @@ relevant information.
   `OutgoingError`, `OutgoingActivityError`, and `OutgoingWorkflowError` are now non-exhaustive;
   downstream matches must include a wildcard arm.
 * Removed `InterceptorWithNext`. Register worker interceptors as an ordered vector instead.
+* Ephemeral server APIs now return `EphemeralServerError` instead of `anyhow::Error`, and dev-server
+  log format and level use the non-exhaustive `DevServerLogFormat` and `DevServerLogLevel` enums.
+* Ephemeral server APIs now return the operation-oriented `EphemeralServerError` instead of
+  `anyhow::Error`.
+* Activity macro support now exposes instance requirements through `ExecutableActivity`; the
+  redundant `HasOnlyStaticMethods` marker trait has been removed.
 * `Worker::run` now returns `WorkerRunError` instead of `anyhow::Error`.
   Non-validation failures are reported as `WorkerRunError::Fatal` with a message and source.
 * `Logger::Console` now requires a `format: Option<LoggerFormat>` field. Use `None` to preserve the
