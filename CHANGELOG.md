@@ -132,8 +132,9 @@ relevant information.
   Non-validation failures are reported as `WorkerRunError::Fatal` with a message and source.
 
 ### Fixed
-* Rust SDK workers now warn when task polling reports that Worker Deployment limits have been
-  reached. Repeated warnings from the same poller are suppressed until polling succeeds.
+* Rust SDK workers now warn when autoscaling task polling encounters errors continuously for one
+  minute. Repeated warnings use exponential backoff up to 15-minute intervals and stop after
+  polling recovers.
 * Unhandled workflow payload conversion errors now fail the Workflow Task so it can retry instead
   of failing the Workflow Execution. Workflows may still explicitly handle these errors.
 * Workers no longer send worker heartbeats or appear in centralized heartbeat reports before
