@@ -6,7 +6,10 @@ use http::Uri;
 use std::{collections::HashMap, sync::Arc, time::Duration};
 use temporalio_common::{
     ActivityCloseTimeouts, MemoValues, RetryPolicy,
-    data_converters::DataConverter,
+    data_converters::{
+        DataConverter, GenericPayloadConverter, PayloadConverter, SerializationContext,
+        SerializationContextData,
+    },
     protos::temporal::api::{
         common::{
             self,
@@ -19,6 +22,7 @@ use temporalio_common::{
             WorkflowIdReusePolicy,
         },
         replication::v1::ClusterReplicationConfig,
+        sdk::v1::UserMetadata,
         workflowservice::v1::RegisterNamespaceRequest,
     },
     search_attributes::SearchAttributes,
@@ -421,10 +425,6 @@ pub struct WorkflowStartOptions {
     #[builder(into)]
     pub retry_policy: Option<RetryPolicy>,
 
-    /// If set, send a signal to the workflow atomically with start.
-    /// The workflow will receive this signal before its first task.
-    pub start_signal: Option<WorkflowStartSignal>,
-
     /// Links to associate with the workflow. Ex: References to a nexus operation.
     #[builder(default)]
     pub links: Vec<common::v1::Link>,
@@ -455,19 +455,28 @@ pub struct WorkflowStartOptions {
     pub rpc_options: RpcOptions,
 }
 
-/// A signal to send atomically when starting a workflow.
-/// Use with `WorkflowStartOptions::start_signal` to achieve signal-with-start behavior.
-#[derive(Debug, Clone, bon::Builder)]
-#[builder(start_fn = new, on(String, into))]
-#[non_exhaustive]
-pub struct WorkflowStartSignal {
-    /// Name of the signal to send.
-    #[builder(start_fn)]
-    pub signal_name: String,
-    /// Payload for the signal.
-    pub input: Option<Payloads>,
-    /// Headers for the signal.
-    pub header: Option<Header>,
+impl WorkflowStartOptions {
+    pub(crate) fn user_metadata(&self) -> Option<UserMetadata> {
+        (self.static_summary.is_some() || self.static_details.is_some()).then(|| {
+            let payload_converter = PayloadConverter::default();
+            let context = SerializationContext {
+                data: &SerializationContextData::Workflow,
+                converter: &payload_converter,
+            };
+            UserMetadata {
+                summary: self.static_summary.as_ref().map(|summary| {
+                    payload_converter
+                        .to_payload(&context, summary)
+                        .expect("String-to-JSON payload serialization is infallible")
+                }),
+                details: self.static_details.as_ref().map(|details| {
+                    payload_converter
+                        .to_payload(&context, details)
+                        .expect("String-to-JSON payload serialization is infallible")
+                }),
+            }
+        })
+    }
 }
 
 pub use temporalio_common::Priority;

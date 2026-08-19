@@ -47,6 +47,13 @@ relevant information.
   client. Only affects memo values that are themselves non-`Send`/non-`Sync`, such as those
   holding an `Rc` or `RefCell`.
 
+* `Client::signal_with_start_workflow` starts a workflow and sends a typed signal atomically.
+
+### Breaking Changes :boom:
+
+* Signal-with-start is now invoked with `Client::signal_with_start_workflow`; remove uses of
+  `WorkflowStartOptions::start_signal` and `WorkflowStartSignal`.
+
 ## [0.7.0] - 2026-08-17
 
 ### Added

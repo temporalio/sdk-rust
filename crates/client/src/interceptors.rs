@@ -187,6 +187,106 @@ impl StartWorkflowInput {
 
 impl_with_args!(StartWorkflowInput);
 
+/// Input to [`ClientInterceptor::signal_with_start_workflow`].
+#[non_exhaustive]
+#[derive(derive_more::Debug)]
+pub struct SignalWithStartWorkflowInput {
+    /// The workflow type sent to the server.
+    pub workflow_type: String,
+    /// The signal name sent to the workflow.
+    pub signal_name: String,
+    /// Options for the workflow start.
+    pub options: WorkflowStartOptions,
+    /// Controls for the signal-with-start RPC.
+    pub rpc_options: crate::RpcOptions,
+    // These remain type-erased until after interception so interceptors can replace either value
+    // before the client's payload converter and codec run.
+    #[debug(skip)]
+    workflow_args: Box<dyn TemporalClientValue>,
+    #[debug(skip)]
+    signal_args: Box<dyn TemporalClientValue>,
+}
+
+impl SignalWithStartWorkflowInput {
+    pub(crate) fn new<W, S>(
+        workflow_type: String,
+        workflow_args: W,
+        signal_name: String,
+        signal_args: S,
+        mut options: WorkflowStartOptions,
+    ) -> Self
+    where
+        W: TemporalSerializable + Send + 'static,
+        S: TemporalSerializable + Send + 'static,
+    {
+        let rpc_options = std::mem::take(&mut options.rpc_options);
+        Self {
+            workflow_type,
+            signal_name,
+            options,
+            rpc_options,
+            workflow_args: Box::new(workflow_args),
+            signal_args: Box::new(signal_args),
+        }
+    }
+
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        String,
+        Box<dyn TemporalClientValue>,
+        String,
+        Box<dyn TemporalClientValue>,
+        WorkflowStartOptions,
+        crate::RpcOptions,
+    ) {
+        (
+            self.workflow_type,
+            self.workflow_args,
+            self.signal_name,
+            self.signal_args,
+            self.options,
+            self.rpc_options,
+        )
+    }
+
+    /// Attempt to access the workflow arguments as a concrete type.
+    pub fn workflow_args_ref<T: Any>(&self) -> Option<&T> {
+        self.workflow_args.as_any().downcast_ref()
+    }
+
+    /// Attempt to access the signal arguments as a concrete type.
+    pub fn signal_args_ref<T: Any>(&self) -> Option<&T> {
+        self.signal_args.as_any().downcast_ref()
+    }
+
+    /// Attempt to mutably access the workflow arguments as a concrete type.
+    pub fn workflow_args_mut<T: Any>(&mut self) -> Option<&mut T> {
+        self.workflow_args.as_any_mut().downcast_mut()
+    }
+
+    /// Attempt to mutably access the signal arguments as a concrete type.
+    pub fn signal_args_mut<T: Any>(&mut self) -> Option<&mut T> {
+        self.signal_args.as_any_mut().downcast_mut()
+    }
+
+    /// Replace the workflow arguments before serialization.
+    pub fn replace_workflow_args<T>(&mut self, args: T)
+    where
+        T: TemporalSerializable + Send + 'static,
+    {
+        self.workflow_args = Box::new(args);
+    }
+
+    /// Replace the signal arguments before serialization.
+    pub fn replace_signal_args<T>(&mut self, args: T)
+    where
+        T: TemporalSerializable + Send + 'static,
+    {
+        self.signal_args = Box::new(args);
+    }
+}
+
 /// Result of a successful intercepted workflow start.
 #[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1062,6 +1162,19 @@ pub trait ClientInterceptor: Send + Sync + 'static {
         next.run(input)
     }
 
+    /// Intercept a `signal_with_start_workflow` operation.
+    fn signal_with_start_workflow<'a>(
+        &'a self,
+        input: SignalWithStartWorkflowInput,
+        next: Next<
+            'a,
+            SignalWithStartWorkflowInput,
+            BoxFuture<'a, Result<StartWorkflowOutput, WorkflowStartError>>,
+        >,
+    ) -> BoxFuture<'a, Result<StartWorkflowOutput, WorkflowStartError>> {
+        next.run(input)
+    }
+
     /// Intercept a `list_workflows_page` operation.
     fn list_workflows_page<'a>(
         &'a self,
@@ -1348,6 +1461,13 @@ interceptor_chain!(
     call_start_workflow,
     start_workflow,
     StartWorkflowInput,
+    BoxFuture<'a, Result<StartWorkflowOutput, WorkflowStartError>>
+);
+
+interceptor_chain!(
+    call_signal_with_start_workflow,
+    signal_with_start_workflow,
+    SignalWithStartWorkflowInput,
     BoxFuture<'a, Result<StartWorkflowOutput, WorkflowStartError>>
 );
 
