@@ -33,8 +33,6 @@ relevant information.
 
 ## Unreleased
 
-## [0.7.0] - 2026-08-17
-
 ### Added
 * `WorkflowStartOptions::memo` attaches a non-indexed memo when starting a workflow, using the
   same `MemoValues` type already used by continue-as-new and `WorkflowContext::upsert_memo`.
@@ -42,6 +40,16 @@ relevant information.
   and `list` read them back.
 * `MemoValue` and `MemoValues` are now exported from `temporalio_common` as well as
   `temporalio_workflow`, so the same types can be used from clients and workflows.
+
+### Breaking Changes :boom:
+* Values stored in a `MemoValue` must now be `Send + Sync`. It previously held its value in an
+  `Rc` and now uses an `Arc`, so that memos can be built outside a workflow and handed to the
+  client. Only affects memo values that are themselves non-`Send`/non-`Sync`, such as those
+  holding an `Rc` or `RefCell`.
+
+## [0.7.0] - 2026-08-17
+
+### Added
 * Support for running Standalone Activities in Rust SDK Worker.
 * Client methods for starting and managing execution of Standalone Activities. 
 * `WorkflowTermination::cancelled_with_details` for recording structured details when a Workflow
@@ -113,10 +121,6 @@ relevant information.
   previous behavior, including support for `TEMPORAL_CORE_PRETTY_LOGS`.
 * `CancellableFuture` and `CancellableFutureWithReason` now use the inherited `Future::Output`
   associated type instead of a generic output parameter.
-* Values stored in a `MemoValue` must now be `Send + Sync`. It previously held its value in an
-  `Rc` and now uses an `Arc`, so that memos can be built outside a workflow and handed to the
-  client. Only affects memo values that are themselves non-`Send`/non-`Sync`, such as those
-  holding an `Rc` or `RefCell`.
 * `TimerOptions` is now tagged with `#[non_exhaustive]`. Use
   `TimerOptions::builder(duration)` to construct timer options. Passing a `Duration` directly to
   `WorkflowContext::timer` remains supported.
