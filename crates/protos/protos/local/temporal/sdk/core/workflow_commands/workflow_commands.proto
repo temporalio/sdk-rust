@@ -231,7 +231,9 @@ message ContinueAsNewWorkflowExecution {
 
 // Indicate a workflow has completed as cancelled. Generally sent as a response to an activation
 // containing a cancellation job.
-message CancelWorkflowExecution {}
+message CancelWorkflowExecution {
+    temporal.api.common.v1.Payloads details = 1;
+}
 
 // A request to set/check if a certain patch is present or not
 message SetPatchMarker {

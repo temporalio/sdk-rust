@@ -37,12 +37,26 @@ relevant information.
 * `WorkflowContext::all_handlers_finished` and `SyncWorkflowContext::all_handlers_finished` let
   Rust workflows wait for active signal and update handler chains before completing or continuing
   as new.
+* `WorkflowStartOptions::memo` attaches a non-indexed memo when starting a workflow, using the
+  same `MemoValues` type already used by continue-as-new and `WorkflowContext::upsert_memo`.
+  Values are serialized with the client's payload converter and codec, matching how `describe`
+  and `list` read them back.
+* `MemoValue` and `MemoValues` are now exported from `temporalio_common` as well as
+  `temporalio_workflow`, so the same types can be used from clients and workflows.
+
+### Breaking Changes :boom:
+* Values stored in a `MemoValue` must now be `Send + Sync`. It previously held its value in an
+  `Rc` and now uses an `Arc`, so that memos can be built outside a workflow and handed to the
+  client. Only affects memo values that are themselves non-`Send`/non-`Sync`, such as those
+  holding an `Rc` or `RefCell`.
 
 ## [0.7.0] - 2026-08-17
 
 ### Added
 * Support for running Standalone Activities in Rust SDK Worker.
 * Client methods for starting and managing execution of Standalone Activities. 
+* `WorkflowTermination::cancelled_with_details` for recording structured details when a Workflow
+  Execution completes as cancelled.
 * `LoggerFormat` for selecting compact, pretty, or JSON Core console log output. Configured log
   filters continue to apply to JSON output.
 * The Rust SDK now has an optional `testing` feature with a typed activity test environment and
@@ -83,6 +97,8 @@ relevant information.
   `WorkerInterceptor::with_workflow_replay_worker`.
 
 ### Breaking Changes :boom:
+* `WorkflowTermination::Cancelled` now has an optional `details` field. Use
+  `WorkflowTermination::cancelled()` to construct a cancellation without details.
 * Changes to `ActivityInfo`: instead of `workflow_namespace`, `workflow_execution` and `run_id`,
   there is now `namespace`, `workflow_id`, `workflow_run_id` and `activity_run_id`. 
   Also, `workflow_type` is now `Option<String>`.
@@ -152,6 +168,9 @@ relevant information.
   Non-validation failures are reported as `WorkerRunError::Fatal` with a message and source.
 
 ### Fixed
+* Rust SDK workers now warn when autoscaling task polling encounters errors continuously for one
+  minute. Repeated warnings use exponential backoff up to 15-minute intervals and stop after
+  polling recovers.
 * Unhandled workflow payload conversion errors now fail the Workflow Task so it can retry instead
   of failing the Workflow Execution. Workflows may still explicitly handle these errors.
 * Workers no longer send worker heartbeats or appear in centralized heartbeat reports before

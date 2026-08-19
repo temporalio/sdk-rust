@@ -5,7 +5,7 @@ use crate::{
 use http::Uri;
 use std::{collections::HashMap, sync::Arc, time::Duration};
 use temporalio_common::{
-    ActivityCloseTimeouts, RetryPolicy,
+    ActivityCloseTimeouts, MemoValues, RetryPolicy,
     data_converters::DataConverter,
     protos::temporal::api::{
         common::{
@@ -440,6 +440,9 @@ pub struct WorkflowStartOptions {
 
     /// Headers to include with the start request.
     pub header: Option<Header>,
+
+    /// Non-indexed values attached to the workflow, serialized with the client's data converter.
+    pub memo: Option<MemoValues>,
 
     /// Single-line static summary for the workflow, shown in the Temporal UI.
     pub static_summary: Option<String>,

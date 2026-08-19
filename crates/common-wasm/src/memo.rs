@@ -1,10 +1,11 @@
 use crate::{
     data_converters::{
         GenericPayloadConverter, PayloadConversionError, PayloadConverter, SerializationContext,
-        SerializationContextData, TemporalDeserializable,
+        SerializationContextData, TemporalDeserializable, TemporalSerializable,
     },
     protos::temporal::api::common::v1::{Memo as ProtoMemo, Payload},
 };
+use std::{collections::BTreeMap, sync::Arc};
 
 /// A collection of memo payloads that can be deserialized into typed values.
 #[derive(Clone, Debug)]
@@ -86,6 +87,84 @@ impl Memo {
     }
 }
 
+trait SerializableMemoValue: Send + Sync {
+    fn to_payload(
+        &self,
+        context: &SerializationContext<'_>,
+    ) -> Result<Payload, PayloadConversionError>;
+}
+
+impl<T> SerializableMemoValue for T
+where
+    T: TemporalSerializable + Send + Sync + 'static,
+{
+    fn to_payload(
+        &self,
+        context: &SerializationContext<'_>,
+    ) -> Result<Payload, PayloadConversionError> {
+        context.converter.to_payload(context, self)
+    }
+}
+
+/// A typed value used in a workflow memo update.
+#[derive(Clone, derive_more::Debug)]
+#[non_exhaustive]
+pub struct MemoValue {
+    #[debug(skip)]
+    value: Arc<dyn SerializableMemoValue>,
+}
+
+impl MemoValue {
+    /// Create a memo value that will be serialized with the workflow's data converter.
+    pub fn new<T: TemporalSerializable + Send + Sync + 'static>(value: T) -> Self {
+        Self {
+            value: Arc::new(value),
+        }
+    }
+}
+
+impl TemporalSerializable for MemoValue {
+    fn to_payload(
+        &self,
+        context: &SerializationContext<'_>,
+    ) -> Result<Payload, PayloadConversionError> {
+        self.value.to_payload(context)
+    }
+}
+
+/// A complete set of memo values for a new workflow execution.
+#[derive(Clone, Debug, Default)]
+#[non_exhaustive]
+pub struct MemoValues {
+    values: BTreeMap<String, MemoValue>,
+}
+
+impl MemoValues {
+    /// Create an empty set of memo values.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Add or replace a memo value.
+    pub fn insert<T>(&mut self, key: impl Into<String>, value: T) -> &mut Self
+    where
+        T: TemporalSerializable + Send + Sync + 'static,
+    {
+        self.values.insert(key.into(), MemoValue::new(value));
+        self
+    }
+
+    /// Returns the value for `key`, if present.
+    pub fn get(&self, key: &str) -> Option<&MemoValue> {
+        self.values.get(key)
+    }
+
+    /// Iterates over the memo entries in key order.
+    pub fn iter(&self) -> impl Iterator<Item = (&str, &MemoValue)> {
+        self.values.iter().map(|(key, value)| (key.as_str(), value))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -131,5 +210,40 @@ mod tests {
         );
 
         assert!(memo.get::<String>("count").is_err());
+    }
+
+    #[test]
+    fn memo_values_serialize_heterogeneous_values() {
+        let payload_converter = PayloadConverter::default();
+        let mut values = MemoValues::new();
+        values
+            .insert("count", 7_u32)
+            .insert("label", "hello".to_string());
+
+        let context = SerializationContext {
+            data: &SerializationContextData::Workflow,
+            converter: &payload_converter,
+        };
+        let fields = values
+            .iter()
+            .map(|(key, value)| {
+                (
+                    key.to_owned(),
+                    payload_converter.to_payload(&context, value).unwrap(),
+                )
+            })
+            .collect();
+
+        let memo = Memo::from_raw(
+            Some(ProtoMemo { fields }),
+            payload_converter.clone(),
+            SerializationContextData::Workflow,
+        );
+
+        assert_eq!(memo.get::<u32>("count").unwrap(), Some(7));
+        assert_eq!(
+            memo.get::<String>("label").unwrap(),
+            Some("hello".to_string())
+        );
     }
 }

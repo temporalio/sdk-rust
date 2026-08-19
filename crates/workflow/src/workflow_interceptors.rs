@@ -132,6 +132,11 @@ mod workflow_output_value {
             &self,
             context: &SerializationContext<'_>,
         ) -> Result<Payload, PayloadConversionError>;
+
+        fn to_workflow_payloads(
+            &self,
+            context: &SerializationContext<'_>,
+        ) -> Result<Vec<Payload>, PayloadConversionError>;
     }
 
     impl<T> Sealed for T
@@ -143,6 +148,13 @@ mod workflow_output_value {
             context: &SerializationContext<'_>,
         ) -> Result<Payload, PayloadConversionError> {
             context.converter.to_payload(context, self)
+        }
+
+        fn to_workflow_payloads(
+            &self,
+            context: &SerializationContext<'_>,
+        ) -> Result<Vec<Payload>, PayloadConversionError> {
+            context.converter.to_payloads(context, self)
         }
     }
 }
@@ -173,6 +185,13 @@ impl dyn WorkflowOutputValue {
         context: &SerializationContext<'_>,
     ) -> Result<Payload, PayloadConversionError> {
         self.to_workflow_payload(context)
+    }
+
+    pub(crate) fn serialize_payloads(
+        &self,
+        context: &SerializationContext<'_>,
+    ) -> Result<Vec<Payload>, PayloadConversionError> {
+        self.to_workflow_payloads(context)
     }
 }
 

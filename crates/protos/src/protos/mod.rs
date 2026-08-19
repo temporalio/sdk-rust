@@ -2021,9 +2021,9 @@ pub mod temporal {
                     }
 
                     impl From<workflow_commands::CancelWorkflowExecution> for command::Attributes {
-                        fn from(_c: workflow_commands::CancelWorkflowExecution) -> Self {
+                        fn from(c: workflow_commands::CancelWorkflowExecution) -> Self {
                             Self::CancelWorkflowExecutionCommandAttributes(
-                                CancelWorkflowExecutionCommandAttributes { details: None },
+                                CancelWorkflowExecutionCommandAttributes { details: c.details },
                             )
                         }
                     }
