@@ -7,13 +7,14 @@ use std::{collections::HashMap, sync::Arc, time::Duration};
 use temporalio_common::{
     ActivityCloseTimeouts, MemoValues, RetryPolicy,
     data_converters::{
-        DataConverter, GenericPayloadConverter, PayloadConverter, SerializationContext,
-        SerializationContextData,
+        DataConverter, GenericPayloadConverter, PayloadConversionError, PayloadConverter,
+        SerializationContext, SerializationContextData,
     },
+    payload_visitor::encode_payloads,
     protos::temporal::api::{
         common::{
             self,
-            v1::{Header, Payloads},
+            v1::{Header, Memo as ProtoMemo, Payloads},
         },
         enums::v1::{
             ActivityIdConflictPolicy as ProtoActivityIdConflictPolicy,
@@ -456,6 +457,38 @@ pub struct WorkflowStartOptions {
 }
 
 impl WorkflowStartOptions {
+    pub(crate) async fn encoded_memo(
+        &self,
+        data_converter: &DataConverter,
+    ) -> Result<Option<ProtoMemo>, PayloadConversionError> {
+        let Some(memo) = &self.memo else {
+            return Ok(None);
+        };
+
+        let payload_converter = data_converter.payload_converter();
+        let context = SerializationContext {
+            data: &SerializationContextData::Workflow,
+            converter: payload_converter,
+        };
+        let mut memo = ProtoMemo {
+            fields: memo
+                .iter()
+                .map(|(key, value)| {
+                    payload_converter
+                        .to_payload(&context, value)
+                        .map(|payload| (key.to_owned(), payload))
+                })
+                .collect::<Result<_, _>>()?,
+        };
+        encode_payloads(
+            &mut memo,
+            data_converter.codec(),
+            &SerializationContextData::Workflow,
+        )
+        .await?;
+        Ok(Some(memo))
+    }
+
     pub(crate) fn user_metadata(&self) -> Option<UserMetadata> {
         (self.static_summary.is_some() || self.static_details.is_some()).then(|| {
             let payload_converter = PayloadConverter::default();

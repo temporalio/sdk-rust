@@ -130,18 +130,15 @@ use std::{
 };
 use temporalio_common::{
     ActivityDefinition, HasWorkflowDefinition, SignalDefinition, UntypedActivity,
-    data_converters::{
-        DataConverter, GenericPayloadConverter, PayloadConverter, SerializationContext,
-        SerializationContextData,
-    },
-    payload_visitor::{decode_payloads, encode_payloads},
+    data_converters::{DataConverter, SerializationContext, SerializationContextData},
+    payload_visitor::decode_payloads,
     protos::{
         coresdk::IntoPayloadsExt,
         grpc::health::v1::health_client::HealthClient,
         proto_ts_to_system_time,
         temporal::api::{
             cloud::cloudservice::v1::cloud_service_client::CloudServiceClient,
-            common::v1::{ActivityType, Memo as ProtoMemo, Payloads, WorkflowType},
+            common::v1::{ActivityType, Payloads, WorkflowType},
             enums::v1::{
                 ActivityIdConflictPolicy as ProtoActivityIdConflictPolicy,
                 ActivityIdReusePolicy as ProtoActivityIdReusePolicy, TaskQueueKind,
@@ -1746,35 +1743,9 @@ where
                         let workflow_id = options.workflow_id.clone();
                         let task_queue_name = options.task_queue.clone();
 
-                        let memo = match options.memo {
-                            Some(memo) => {
-                                let payload_converter = data_converter.payload_converter();
-                                let context = SerializationContext {
-                                    data: &SerializationContextData::Workflow,
-                                    converter: payload_converter,
-                                };
-                                let mut memo = ProtoMemo {
-                                    fields: memo
-                                        .iter()
-                                        .map(|(key, value)| {
-                                            payload_converter
-                                                .to_payload(&context, value)
-                                                .map(|payload| (key.to_owned(), payload))
-                                        })
-                                        .collect::<Result<_, _>>()?,
-                                };
-                                encode_payloads(
-                                    &mut memo,
-                                    data_converter.codec(),
-                                    &SerializationContextData::Workflow,
-                                )
-                                .await?;
-                                Some(memo)
-                            }
-                            None => None,
-                        };
-
                         let user_metadata = options.user_metadata();
+
+                        let memo = options.encoded_memo(&data_converter).await?;
 
                         let run_id = {
                             let mut request = StartWorkflowExecutionRequest {
@@ -1925,6 +1896,8 @@ where
 
                         let user_metadata = options.user_metadata();
 
+                        let memo = options.encoded_memo(&data_converter).await?;
+
                         let mut request = SignalWithStartWorkflowExecutionRequest {
                             namespace: client.namespace(),
                             workflow_id: workflow_id.clone(),
@@ -1959,6 +1932,7 @@ where
                                 .map(|attributes| attributes.into_proto()),
                             cron_schedule: options.cron_schedule.unwrap_or_default(),
                             retry_policy: options.retry_policy.map(Into::into),
+                            memo,
                             header: options.header,
                             user_metadata,
                             ..Default::default()
@@ -2992,40 +2966,34 @@ mod tests {
         use parking_lot::Mutex;
         use std::sync::atomic::{AtomicUsize, Ordering};
         use temporalio_common::{
-            HasWorkflowDefinition, MemoValues, SignalDefinition, WorkflowDefinition,
+            MemoValues, SignalDefinition,
             data_converters::{
                 DefaultFailureConverter, PayloadCodec, PayloadConversionError, PayloadConverter,
                 SerializationContext, SerializationContextData, TemporalDeserializable,
                 TemporalSerializable,
             },
-            protos::temporal::api::common::v1::Payload,
+            protos::temporal::api::common::v1::{Memo as ProtoMemo, Payload},
         };
+        use temporalio_macros::{workflow, workflow_methods};
+        use temporalio_workflow::{SyncWorkflowContext, WorkflowContext, WorkflowResult};
         use tonic::{Request, Response};
 
+        #[workflow]
+        #[derive(Default)]
         struct TestWorkflow;
 
-        impl WorkflowDefinition for TestWorkflow {
-            type Input = Vec<String>;
-            type Output = ();
-
-            fn name(&self) -> &str {
-                "test-workflow"
+        #[workflow_methods]
+        impl TestWorkflow {
+            #[run]
+            async fn run(
+                _ctx: &mut WorkflowContext<Self>,
+                _input: Vec<String>,
+            ) -> WorkflowResult<()> {
+                Ok(())
             }
-        }
 
-        impl HasWorkflowDefinition for TestWorkflow {
-            type Run = Self;
-        }
-
-        struct TestSignal;
-
-        impl SignalDefinition for TestSignal {
-            type Workflow = TestWorkflow;
-            type Input = Vec<String>;
-
-            fn name(&self) -> &str {
-                "test-signal"
-            }
+            #[signal]
+            fn test_signal(&mut self, _ctx: &mut SyncWorkflowContext<Self>, _input: Vec<String>) {}
         }
 
         #[derive(Default)]
@@ -3357,7 +3325,7 @@ mod tests {
         struct FailingSignal;
 
         impl SignalDefinition for FailingSignal {
-            type Workflow = TestWorkflow;
+            type Workflow = test_workflow::Run;
             type Input = FailingSignalInput;
 
             fn name(&self) -> &str {
@@ -3440,7 +3408,7 @@ mod tests {
 
             client
                 .start_workflow(
-                    TestWorkflow,
+                    TestWorkflow::run,
                     vec!["initial".to_owned()],
                     WorkflowStartOptions::new("task-queue", "workflow-id")
                         .memo(memo)
@@ -3463,12 +3431,13 @@ mod tests {
             memo.insert("memo-key", "memo-value".to_owned());
 
             client
-                .start_workflow(
-                    TestWorkflow,
+                .signal_with_start_workflow(
+                    TestWorkflow::run,
                     vec!["initial".to_owned()],
+                    TestWorkflow::test_signal,
+                    vec!["signal".to_owned()],
                     WorkflowStartOptions::new("task-queue", "workflow-id")
                         .memo(memo)
-                        .start_signal(WorkflowStartSignal::new("some-signal").build())
                         .build(),
                 )
                 .await
@@ -3487,7 +3456,7 @@ mod tests {
 
             client
                 .start_workflow(
-                    TestWorkflow,
+                    TestWorkflow::run,
                     vec!["initial".to_owned()],
                     WorkflowStartOptions::new("task-queue", "workflow-id").build(),
                 )
@@ -3519,7 +3488,7 @@ mod tests {
 
             let err = client
                 .start_workflow(
-                    TestWorkflow,
+                    TestWorkflow::run,
                     vec!["initial".to_owned()],
                     WorkflowStartOptions::new("task-queue", "workflow-id")
                         .memo(memo)
@@ -3561,7 +3530,7 @@ mod tests {
 
             let handle = client
                 .start_workflow(
-                    TestWorkflow,
+                    TestWorkflow::run,
                     vec!["initial".to_owned()],
                     WorkflowStartOptions::new("task-queue", "workflow-id").build(),
                 )
@@ -3597,7 +3566,7 @@ mod tests {
             );
             let handle = client
                 .start_workflow(
-                    TestWorkflow,
+                    TestWorkflow::run,
                     vec!["initial".to_owned()],
                     WorkflowStartOptions::new("task-queue", "ignored-workflow-id").build(),
                 )
@@ -3634,7 +3603,7 @@ mod tests {
 
             client
                 .start_workflow(
-                    TestWorkflow,
+                    TestWorkflow::run,
                     vec!["initial".to_owned()],
                     WorkflowStartOptions::new("task-queue", "workflow-id").build(),
                 )
@@ -3657,7 +3626,7 @@ mod tests {
 
             client
                 .start_workflow(
-                    TestWorkflow,
+                    TestWorkflow::run,
                     vec!["initial".to_owned()],
                     WorkflowStartOptions::new("task-queue", "workflow-id").build(),
                 )
@@ -3683,7 +3652,7 @@ mod tests {
             options.rpc_options = rpc_options.clone();
 
             client
-                .start_workflow(TestWorkflow, vec!["initial".to_owned()], options)
+                .start_workflow(TestWorkflow::run, vec!["initial".to_owned()], options)
                 .await
                 .unwrap();
 
@@ -3699,9 +3668,9 @@ mod tests {
             options.rpc_options = rpc_options;
             let handle = client
                 .signal_with_start_workflow(
-                    TestWorkflow,
+                    TestWorkflow::run,
                     vec!["initial".to_owned()],
-                    TestSignal,
+                    TestWorkflow::test_signal,
                     vec!["signal".to_owned()],
                     options,
                 )
@@ -3714,7 +3683,7 @@ mod tests {
             assert_eq!(recorded.binary_metadata.as_deref(), Some(&[0, 255][..]));
             assert_eq!(recorded.grpc_timeout.as_deref(), Some("250000u"));
             assert_eq!(recorded.retry_options, Some(RetryOptions::no_retries()));
-            assert_eq!(recorded.signal_name, "test-signal");
+            assert_eq!(recorded.signal_name, "test_signal");
             assert_eq!(recorded.signal_payloads.len(), 1);
             assert_eq!(handle.run_id(), Some("signal-server-run-id"));
         }
@@ -3728,9 +3697,9 @@ mod tests {
 
             client
                 .signal_with_start_workflow(
-                    TestWorkflow,
+                    TestWorkflow::run,
                     vec!["workflow".to_owned()],
-                    TestSignal,
+                    TestWorkflow::test_signal,
                     vec!["signal".to_owned()],
                     WorkflowStartOptions::new("task-queue", "workflow-id").build(),
                 )
@@ -3770,7 +3739,7 @@ mod tests {
 
             let result = client
                 .signal_with_start_workflow(
-                    TestWorkflow,
+                    TestWorkflow::run,
                     vec!["workflow".to_owned()],
                     FailingSignal,
                     FailingSignalInput,
