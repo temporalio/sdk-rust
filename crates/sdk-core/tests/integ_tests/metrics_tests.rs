@@ -580,7 +580,7 @@ async fn query_of_closed_workflow_doesnt_tick_terminal_metric(
             failure: Some(Failure::application_failure("I'm ded".to_string(), false)),
         }.into(),
         ContinueAsNewWorkflowExecution::default().into(),
-        CancelWorkflowExecution { }.into()
+        CancelWorkflowExecution::default().into()
     )]
     completion: workflow_command::Variant,
 ) {

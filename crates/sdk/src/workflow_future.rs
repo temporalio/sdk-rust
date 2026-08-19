@@ -584,10 +584,10 @@ impl WorkflowFuture {
                                     ),
                                 );
                             }
-                            TerminalOutcome::Cancelled => {
+                            TerminalOutcome::Cancelled(details) => {
                                 self.host.push_command_variant(
                                     workflow_command::Variant::CancelWorkflowExecution(
-                                        CancelWorkflowExecution {},
+                                        CancelWorkflowExecution { details },
                                     ),
                                 );
                             }

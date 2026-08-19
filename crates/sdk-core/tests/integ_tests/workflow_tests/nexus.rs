@@ -301,7 +301,7 @@ impl AsyncCompleter {
             Outcome::Succeed => Ok("completed async".to_string()),
             Outcome::Cancel | Outcome::CancelAfterRecordedBeforeStarted => {
                 ctx.cancelled().await;
-                Err(WorkflowTermination::Cancelled)
+                Err(WorkflowTermination::cancelled())
             }
             _ => Err(ApplicationFailure::new("broken").into()),
         }
@@ -629,7 +629,7 @@ impl NexusRootCancellationWf {
             result.status,
             Some(nexus_operation_result::Status::Cancelled(_))
         );
-        Err(WorkflowTermination::Cancelled)
+        Err(WorkflowTermination::cancelled())
     }
 }
 
@@ -936,7 +936,7 @@ impl AsyncCompleterWf {
         }
 
         ctx.state(|wf| wf.handler_exited_tx.send(true).unwrap());
-        Err(WorkflowTermination::Cancelled)
+        Err(WorkflowTermination::cancelled())
     }
 
     #[signal(name = "proceed-to-exit")]

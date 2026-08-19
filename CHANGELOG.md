@@ -44,6 +44,8 @@ relevant information.
   `temporalio_workflow`, so the same types can be used from clients and workflows.
 * Support for running Standalone Activities in Rust SDK Worker.
 * Client methods for starting and managing execution of Standalone Activities. 
+* `WorkflowTermination::cancelled_with_details` for recording structured details when a Workflow
+  Execution completes as cancelled.
 * `LoggerFormat` for selecting compact, pretty, or JSON Core console log output. Configured log
   filters continue to apply to JSON output.
 * The Rust SDK now has an optional `testing` feature with a typed activity test environment and
@@ -84,6 +86,8 @@ relevant information.
   `WorkerInterceptor::with_workflow_replay_worker`.
 
 ### Breaking Changes :boom:
+* `WorkflowTermination::Cancelled` now has an optional `details` field. Use
+  `WorkflowTermination::cancelled()` to construct a cancellation without details.
 * Changes to `ActivityInfo`: instead of `workflow_namespace`, `workflow_execution` and `run_id`,
   there is now `namespace`, `workflow_id`, `workflow_run_id` and `activity_run_id`. 
   Also, `workflow_type` is now `Option<String>`.
