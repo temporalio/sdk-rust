@@ -4,7 +4,9 @@ use super::{
     EventInfo, MachineError, NewMachineWithCommand, OnEventWrapper, StateMachine, TransitionResult,
     WFMachinesAdapter, fsm, workflow_machines::MachineResponse,
 };
-use crate::worker::workflow::{WFMachinesError, fatal, machines::HistEventData, nondeterminism};
+use crate::worker::workflow::{
+    CommandAnnotations, WFMachinesError, fatal, machines::HistEventData, nondeterminism,
+};
 use std::convert::TryFrom;
 use temporalio_common::protos::{
     coresdk::{
@@ -58,11 +60,15 @@ pub(super) enum TimerMachineCommand {
 pub(super) struct SharedState {
     attrs: StartTimer,
     cancelled_before_sent: bool,
+    annotations: CommandAnnotations,
 }
 
 /// Creates a new, scheduled, timer as a [CancellableCommand]
-pub(super) fn new_timer(attribs: StartTimer) -> NewMachineWithCommand {
-    let (timer, add_cmd) = TimerMachine::new_scheduled(attribs);
+pub(super) fn new_timer(
+    attribs: StartTimer,
+    annotations: CommandAnnotations,
+) -> NewMachineWithCommand {
+    let (timer, add_cmd) = TimerMachine::new_scheduled(attribs, annotations);
     NewMachineWithCommand {
         command: add_cmd,
         machine: timer.into(),
@@ -71,29 +77,39 @@ pub(super) fn new_timer(attribs: StartTimer) -> NewMachineWithCommand {
 
 impl TimerMachine {
     /// Create a new timer and immediately schedule it
-    fn new_scheduled(attribs: StartTimer) -> (Self, command::Attributes) {
-        let mut s = Self::new(attribs);
+    fn new_scheduled(
+        attribs: StartTimer,
+        annotations: CommandAnnotations,
+    ) -> (Self, command::Attributes) {
+        let mut s = Self::new(attribs, annotations);
         OnEventWrapper::on_event_mut(&mut s, TimerMachineEvents::Schedule)
             .expect("Scheduling timers doesn't fail");
         let cmd = s.shared_state().attrs.into();
         (s, cmd)
     }
 
-    fn new(attribs: StartTimer) -> Self {
+    fn new(attribs: StartTimer, annotations: CommandAnnotations) -> Self {
         Self::from_parts(
             Created {}.into(),
             SharedState {
                 attrs: attribs,
                 cancelled_before_sent: false,
+                annotations,
             },
         )
     }
 
-    pub(super) fn cancel(&mut self) -> Result<Vec<MachineResponse>, MachineError<WFMachinesError>> {
+    pub(super) fn cancel(
+        &mut self,
+        annotations: CommandAnnotations,
+    ) -> Result<Vec<MachineResponse>, MachineError<WFMachinesError>> {
+        self.shared_state.annotations.override_with(annotations);
         Ok(
             match OnEventWrapper::on_event_mut(self, TimerMachineEvents::Cancel)?.pop() {
                 Some(TimerMachineCommand::IssueCancelCmd(cmd)) => {
-                    vec![MachineResponse::IssueNewCommand(cmd.into())]
+                    vec![MachineResponse::IssueNewCommand(
+                        self.shared_state.annotations.clone().into_command(cmd),
+                    )]
                 }
                 None => vec![],
                 x => panic!("Invalid cancel event response {x:?}"),
@@ -257,7 +273,9 @@ impl WFMachinesAdapter for TimerMachine {
                 .into(),
             ],
             TimerMachineCommand::IssueCancelCmd(c) => {
-                vec![MachineResponse::IssueNewCommand(c.into())]
+                vec![MachineResponse::IssueNewCommand(
+                    self.shared_state.annotations.clone().into_command(c),
+                )]
             }
         })
     }
@@ -272,7 +290,7 @@ mod test {
     fn cancels_ignored_terminal() {
         for state in [TimerMachineState::Canceled(Canceled {}), Fired {}.into()] {
             let mut s = TimerMachine::from_parts(state.clone(), Default::default());
-            let cmds = s.cancel().unwrap();
+            let cmds = s.cancel(Default::default()).unwrap();
             assert_eq!(cmds.len(), 0);
             assert_eq!(discriminant(&state), discriminant(s.state()));
         }

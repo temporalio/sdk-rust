@@ -1,6 +1,6 @@
 use super::{MachineError, StateMachine, TransitionResult, fsm};
 use crate::worker::workflow::{
-    WFMachinesError,
+    CommandAnnotations, WFMachinesError,
     machines::{
         EventInfo, HistEventData, NewMachineWithCommand, OnEventWrapper, WFMachinesAdapter,
         workflow_machines::MachineResponse,
@@ -129,10 +129,14 @@ pub(super) struct SharedState {
     cancel_sent: bool,
     cancel_type: NexusOperationCancellationType,
     operation_token: Option<String>,
+    annotations: CommandAnnotations,
 }
 
 impl NexusOperationMachine {
-    pub(super) fn new_scheduled(attribs: ScheduleNexusOperation) -> NewMachineWithCommand {
+    pub(super) fn new_scheduled(
+        attribs: ScheduleNexusOperation,
+        annotations: CommandAnnotations,
+    ) -> NewMachineWithCommand {
         let s = Self::from_parts(
             ScheduleCommandCreated.into(),
             SharedState {
@@ -145,6 +149,7 @@ impl NexusOperationMachine {
                 cancel_sent: false,
                 cancel_type: attribs.cancellation_type(),
                 operation_token: None,
+                annotations,
             },
         );
         NewMachineWithCommand {
@@ -153,7 +158,11 @@ impl NexusOperationMachine {
         }
     }
 
-    pub(super) fn cancel(&mut self) -> Result<Vec<MachineResponse>, MachineError<WFMachinesError>> {
+    pub(super) fn cancel(
+        &mut self,
+        annotations: CommandAnnotations,
+    ) -> Result<Vec<MachineResponse>, MachineError<WFMachinesError>> {
+        self.shared_state.annotations.override_with(annotations);
         let event = NexusOperationMachineEvents::Cancel;
         let cmds = OnEventWrapper::on_event_mut(self, event)?;
         let mach_resps = cmds
@@ -641,12 +650,13 @@ impl WFMachinesAdapter for NexusOperationMachine {
                 let mut resps = vec![];
                 if self.shared_state.cancel_type != NexusOperationCancellationType::Abandon {
                     resps.push(MachineResponse::IssueNewCommand(
-                        command::Attributes::RequestCancelNexusOperationCommandAttributes(
-                            RequestCancelNexusOperationCommandAttributes {
-                                scheduled_event_id: self.shared_state.scheduled_event_id,
-                            },
-                        )
-                        .into(),
+                        self.shared_state.annotations.clone().into_command(
+                            command::Attributes::RequestCancelNexusOperationCommandAttributes(
+                                RequestCancelNexusOperationCommandAttributes {
+                                    scheduled_event_id: self.shared_state.scheduled_event_id,
+                                },
+                            ),
+                        ),
                     ))
                 }
                 // Immediately resolve abandon/trycancel modes

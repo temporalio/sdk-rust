@@ -41,6 +41,7 @@ relevant information.
   disable the reporting.
 * Workers now log a `[TMPRL1104]` warning when a workflow task takes longer than 5 seconds. Set
   `TEMPORAL_WORKFLOW_TASK_DURATION_WARN_SECONDS` to change the threshold.
+* Core now supports attaching `EventGroupMarker`s to most workflow commands.
 
 ### Breaking Changes :boom:
 * Activity failures now include the latest heartbeat details atomically instead of force-flushing a

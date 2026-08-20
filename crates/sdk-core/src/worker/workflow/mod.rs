@@ -75,7 +75,9 @@ use temporalio_common::{
             },
         },
         temporal::api::{
-            command::v1::{Command as ProtoCommand, Command, command::Attributes},
+            command::v1::{
+                Command as ProtoCommand, Command, CommandAttributesExt, command::Attributes,
+            },
             common::v1::{
                 Memo, MeteringMetadata, RetryPolicy, SearchAttributes, WorkflowExecution,
             },
@@ -1413,16 +1415,47 @@ struct EmptyWorkflowCommandErr;
 #[display("{}", variant)]
 struct WFCommand {
     variant: WFCommandVariant,
-    metadata: Option<UserMetadata>,
-    event_group_markers: Vec<EventGroupMarker>,
+    annotations: CommandAnnotations,
 }
 
 impl WFCommand {
     fn new(variant: WFCommandVariant) -> Self {
         Self {
             variant,
-            metadata: None,
-            event_group_markers: vec![],
+            annotations: CommandAnnotations::default(),
+        }
+    }
+}
+
+/// The lang-supplied decorations that ride along on a [WFCommand] and end up on the [ProtoCommand]
+/// we send to the server. They are kept together because a command machine must remember them in
+/// order to repeat them on any further command it issues, most notably a cancellation.
+#[derive(Debug, Default, Clone, PartialEq)]
+struct CommandAnnotations {
+    metadata: Option<UserMetadata>,
+    event_group_markers: Vec<EventGroupMarker>,
+}
+
+impl CommandAnnotations {
+    /// Apply annotations lang attached to a cancellation command on top of the ones the command
+    /// being cancelled carried. Anything lang set explicitly wins; anything it left out is
+    /// inherited, which is what makes a cancellation land in the same event group as the command
+    /// it cancels even when it is issued from somewhere no group is active.
+    fn override_with(&mut self, other: Self) {
+        if other.metadata.is_some() {
+            self.metadata = other.metadata;
+        }
+        if !other.event_group_markers.is_empty() {
+            self.event_group_markers = other.event_group_markers;
+        }
+    }
+
+    fn into_command(self, attributes: Attributes) -> ProtoCommand {
+        ProtoCommand {
+            command_type: attributes.as_type() as i32,
+            attributes: Some(attributes),
+            user_metadata: self.metadata,
+            event_group_markers: self.event_group_markers,
         }
     }
 }
@@ -1518,8 +1551,10 @@ impl TryFrom<WorkflowCommand> for WFCommand {
         };
         Ok(Self {
             variant,
-            metadata: c.user_metadata,
-            event_group_markers: c.event_group_markers,
+            annotations: CommandAnnotations {
+                metadata: c.user_metadata,
+                event_group_markers: c.event_group_markers,
+            },
         })
     }
 }

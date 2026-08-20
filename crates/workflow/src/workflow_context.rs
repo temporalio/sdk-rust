@@ -2525,7 +2525,7 @@ impl Future for LATimerBackoffFut {
                     .expect("duration converts ok"),
                 cancellation_token: Some(self.cancellation_token.clone()),
                 summary: None,
-                event_group_markers: vec![],
+                event_group_markers: self.la_opts.event_group_markers.clone(),
             });
             self.timer_fut = Some(Box::pin(timer_f));
             self.next_attempt = b.attempt;

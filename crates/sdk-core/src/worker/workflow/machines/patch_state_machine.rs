@@ -25,7 +25,7 @@ use crate::{
     internal_flags::CoreInternalFlags,
     protosext::HistoryEventExt,
     worker::workflow::{
-        InternalFlagsRef, fatal,
+        CommandAnnotations, InternalFlagsRef, fatal,
         machines::{
             HistEventData, upsert_search_attributes_state_machine::MAX_SEARCH_ATTR_PAYLOAD_SIZE,
         },
@@ -87,6 +87,8 @@ pub(super) enum PatchCommand {}
 /// are guaranteed to return the same value.
 /// `replaying_when_invoked`: If the workflow is replaying when this invocation occurs, this needs
 /// to be set to true.
+/// `annotations`: Lang's annotations on the patch command. They will be attached to both the
+/// RecordMarker command and the search attribute upsert we synthesize alongside the marker.
 pub(super) fn has_change<'a>(
     patch_id: String,
     replaying_when_invoked: bool,
@@ -94,6 +96,7 @@ pub(super) fn has_change<'a>(
     seen_in_peekahead: bool,
     existing_patch_ids: impl Iterator<Item = &'a str>,
     internal_flags: InternalFlagsRef,
+    annotations: CommandAnnotations,
 ) -> Result<(NewMachineWithCommand, Vec<MachineResponse>), WFMachinesError> {
     let shared_state = SharedState { patch_id };
     let initial_state = if replaying_when_invoked {
@@ -150,12 +153,13 @@ pub(super) fn has_change<'a>(
                 m.insert(VERSION_SEARCH_ATTR_KEY.to_string(), serialized);
                 m
             };
-            vec![MachineResponse::NewCoreOriginatedCommand(
-                UpsertWorkflowSearchAttributesCommandAttributes {
+            vec![MachineResponse::NewCoreOriginatedCommand {
+                attrs: UpsertWorkflowSearchAttributesCommandAttributes {
                     search_attributes: Some(SearchAttributes { indexed_fields }),
                 }
                 .into(),
-            )]
+                annotations,
+            }]
         }
     };
 
