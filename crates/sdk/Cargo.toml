@@ -1,6 +1,6 @@
 [package]
 name = "temporalio-sdk"
-version = "0.6.0"
+version = "0.7.0"
 edition = "2024"
 authors = ["Spencer Judge <spencer@temporal.io>"]
 license-file = { workspace = true }
@@ -39,29 +39,30 @@ tokio-stream = { version = "0.1", default-features = false }
 tracing = "0.1"
 uuid = { version = "1.18", default-features = false, features = ["v4"] }
 wasmtime = { version = "44", optional = true, features = ["component-model"] }
+url = { version = "2.5", optional = true }
 
 [dependencies.temporalio-sdk-core]
 path = "../sdk-core"
-version = "0.6"
+version = "0.7"
 default-features = false
 
 [dependencies.temporalio-workflow]
 path = "../workflow"
-version = "0.6"
+version = "0.7"
 
 [dependencies.temporalio-common]
 path = "../common"
-version = "0.6"
+version = "0.7"
 default-features = false
 
 [dependencies.temporalio-client]
 path = "../client"
-version = "0.6"
+version = "0.7"
 default-features = false
 
 [dependencies.temporalio-macros]
 path = "../macros"
-version = "0.6"
+version = "0.7"
 
 [dev-dependencies]
 futures = "0.3"
@@ -76,6 +77,7 @@ examples = ["serde/derive", "dep:serde_json", "envconfig"]
 wasm-examples = []
 wasm-workflows = ["dep:wasmtime"]
 dynamic-tls = ["temporalio-client/dynamic-tls"]
+testing = ["temporalio-sdk-core/ephemeral-server", "dep:url"]
 
 [dependencies.serde_json]
 version = "1"

@@ -146,7 +146,7 @@ impl AbandonedChildBugReproChild {
     #[run(name = "child_wf")]
     async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<()> {
         ctx.cancelled().await;
-        Err(WorkflowTermination::Cancelled)
+        Err(WorkflowTermination::cancelled())
     }
 }
 
@@ -567,7 +567,7 @@ impl GrandchildCancelled {
     #[run(name = "grandchild_wf")]
     async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<()> {
         ctx.cancelled().await;
-        Err(WorkflowTermination::Cancelled)
+        Err(WorkflowTermination::cancelled())
     }
 }
 
@@ -1100,7 +1100,7 @@ async fn cancel_child_before_started_event() {
                 reason: "parent cancelled".to_string(),
             }
             .into(),
-            CancelWorkflowExecution {}.into(),
+            CancelWorkflowExecution::default().into(),
         ],
     ))
     .await
@@ -1110,7 +1110,7 @@ async fn cancel_child_before_started_event() {
     let act = core.poll_workflow_activation().await.unwrap();
     core.complete_workflow_activation(WorkflowActivationCompletion::from_cmd(
         act.run_id,
-        CancelWorkflowExecution {}.into(),
+        CancelWorkflowExecution::default().into(),
     ))
     .await
     .unwrap();
@@ -1149,7 +1149,7 @@ impl CancelChildBeforeStartedCannedWf {
         };
         assert!(cancelled.raw_details().is_none());
         assert!(cancelled.cause().is_none());
-        Err(WorkflowTermination::Cancelled)
+        Err(WorkflowTermination::cancelled())
     }
 }
 
@@ -1189,7 +1189,7 @@ impl CancelChildBeforeStartedParent {
         // Wait for parent cancellation
         ctx.cancelled().await;
         started.cancel();
-        Err(WorkflowTermination::Cancelled)
+        Err(WorkflowTermination::cancelled())
     }
 }
 
@@ -1344,7 +1344,7 @@ impl UnserializableSignalChild {
     #[run]
     async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<()> {
         ctx.cancelled().await;
-        Err(WorkflowTermination::Cancelled)
+        Err(WorkflowTermination::cancelled())
     }
 
     #[signal]

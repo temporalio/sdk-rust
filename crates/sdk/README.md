@@ -105,6 +105,36 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
+### Testing
+
+Enable the `testing` feature to run activities directly or start an isolated Temporal CLI dev
+server for workflow tests:
+
+```toml
+temporalio-sdk = { version = "0.6", features = ["testing"] }
+```
+
+Activity test inputs and outputs are ordinary Rust values. Register an activity implementer when
+testing an instance activity:
+
+```rust
+let env = ActivityEnvironment::builder()
+    .register_activities(MyActivities { counter: Default::default() })
+    .build();
+
+assert_eq!(env.run(MyActivities::greet, "Rust".to_owned()).await?, "Hello, Rust!");
+```
+
+Workflow tests can use a local server with the normal client and worker APIs. Local environments
+own their server and expose a consuming shutdown method:
+
+```rust
+let env = WorkflowEnvironment::start_local(LocalWorkflowEnvironmentOptions::default()).await?;
+let client = env.client().clone();
+// Construct workflow starters and workers with `client`.
+env.shutdown().await?;
+```
+
 ## Crate Features
 
 The SDK enables a few convenience integrations by default. Users who want a smaller dependency
@@ -120,6 +150,8 @@ temporalio-sdk = { version = "0.3", default-features = false, features = ["envco
   `temporalio_common::telemetry` for serving SDK metrics from a HTTP endpoint.
 - `otel` - optional. Adds the OpenTelemetry metrics exporter in `temporalio_common::telemetry` for
   sending SDK metrics to an OpenTelemetry collector.
+- `testing` - optional. Adds activity and workflow test environments, including local Temporal CLI
+  dev-server lifecycle management.
 
 ## Workflows in detail
 

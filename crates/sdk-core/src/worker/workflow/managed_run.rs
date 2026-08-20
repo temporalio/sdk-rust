@@ -1910,7 +1910,9 @@ mod tests {
         }
 
         pub(crate) fn cancel() -> WFCommand {
-            WFCommand::new(WFCommandVariant::CancelWorkflow(CancelWorkflowExecution {}))
+            WFCommand::new(WFCommandVariant::CancelWorkflow(
+                CancelWorkflowExecution::default(),
+            ))
         }
 
         pub(crate) fn query_response() -> WFCommand {

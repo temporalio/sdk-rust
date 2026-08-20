@@ -1,9 +1,13 @@
 use crate::common::{ActivationAssertionsInterceptor, CoreWfStarter};
-use std::collections::HashMap;
-use temporalio_client::{WorkflowStartOptions, WorkflowStartSignal};
+use futures::future::BoxFuture;
+use std::{collections::HashMap, sync::Arc};
+use temporalio_client::{
+    ClientInterceptor, Next, SignalWithStartWorkflowInput, StartWorkflowOutput,
+    WorkflowStartOptions, errors::WorkflowStartError,
+};
 use temporalio_common::protos::{
     coresdk::{
-        AsJsonPayloadExt, IntoPayloadsExt,
+        AsJsonPayloadExt,
         workflow_activation::{
             ResolveSignalExternalWorkflow, WorkflowActivationJob, workflow_activation_job,
         },
@@ -21,6 +25,10 @@ use temporalio_macros::{workflow, workflow_methods};
 use temporalio_sdk::{
     ApplicationFailure, CancellableFuture, ChildWorkflowOptions, SignalWorkflowOptions,
     SyncWorkflowContext, WorkflowContext, WorkflowResult,
+    workflow_interceptors::{
+        HandleSignalInput, HandleSignalResult, WorkflowInterceptor, WorkflowInterceptorConstructor,
+        WorkflowInterceptorContext, WorkflowInterceptorFuture, WorkflowNext,
+    },
 };
 use temporalio_sdk_core::test_help::MockPollCfg;
 use uuid::Uuid;
@@ -114,14 +122,49 @@ impl SignalWithCreateWfReceiver {
     }
 
     #[signal(name = "signame")]
-    fn handle_signal(&mut self, ctx: &mut SyncWorkflowContext<Self>, input: String) {
+    fn handle_signal(&mut self, _ctx: &mut SyncWorkflowContext<Self>, input: String) {
         assert_eq!(input, "tada");
-        let headers = ctx.headers();
+        self.received = true;
+    }
+}
+
+struct SignalWithStartHeaderClientInterceptor;
+
+impl ClientInterceptor for SignalWithStartHeaderClientInterceptor {
+    fn signal_with_start_workflow<'a>(
+        &'a self,
+        mut input: SignalWithStartWorkflowInput,
+        next: Next<
+            'a,
+            SignalWithStartWorkflowInput,
+            BoxFuture<'a, Result<StartWorkflowOutput, WorkflowStartError>>,
+        >,
+    ) -> BoxFuture<'a, Result<StartWorkflowOutput, WorkflowStartError>> {
+        input.options.header =
+            Some(HashMap::from([("tupac".to_string(), Payload::from("shakur"))]).into());
+        next.run(input)
+    }
+}
+
+struct SignalHeaderWorkflowInterceptor;
+
+impl WorkflowInterceptor for SignalHeaderWorkflowInterceptor {
+    fn handle_signal<'a>(
+        &'a self,
+        _ctx: WorkflowInterceptorContext,
+        input: HandleSignalInput,
+        next: WorkflowNext<
+            'a,
+            HandleSignalInput,
+            WorkflowInterceptorFuture<'a, HandleSignalResult>,
+        >,
+    ) -> WorkflowInterceptorFuture<'a, HandleSignalResult> {
+        assert_eq!(input.name(), SIGNAME);
         assert_eq!(
-            *headers.get("tupac").expect("tupac header exists"),
+            *input.headers().get("tupac").expect("tupac header exists"),
             b"shakur".into()
         );
-        self.received = true;
+        next.run(input)
     }
 }
 
@@ -164,22 +207,27 @@ async fn sends_signal_with_create_wf() {
     starter
         .sdk_config
         .register_workflow::<SignalWithCreateWfReceiver>()
-        .unwrap();
+        .unwrap()
+        .register_workflow_interceptors(vec![WorkflowInterceptorConstructor::new(|_| {
+            SignalHeaderWorkflowInterceptor
+        })]);
     let mut worker = starter.worker().await;
 
-    let client = starter.get_core_client().await;
-    let mut header: HashMap<String, Payload> = HashMap::new();
-    header.insert("tupac".into(), "shakur".into());
+    let mut client = starter.get_core_client().await;
+    client
+        .options_mut()
+        .client_interceptors
+        .push(Arc::new(SignalWithStartHeaderClientInterceptor));
     let task_queue = worker.inner_mut().task_queue().to_string();
-    let start_signal = WorkflowStartSignal::new(SIGNAME)
-        .maybe_input(vec!["tada".to_string().as_json_payload().unwrap()].into_payloads())
-        .maybe_header(Some(header.into()))
-        .build();
-    let options = WorkflowStartOptions::new(task_queue, "sends_signal_with_create_wf")
-        .start_signal(start_signal)
-        .build();
+    let options = WorkflowStartOptions::new(task_queue, "sends_signal_with_create_wf").build();
     let handle = client
-        .start_workflow(SignalWithCreateWfReceiver::run, (), options)
+        .signal_with_start_workflow(
+            SignalWithCreateWfReceiver::run,
+            (),
+            SignalWithCreateWfReceiver::handle_signal,
+            "tada".to_string(),
+            options,
+        )
         .await
         .expect("request succeeds.qed");
 

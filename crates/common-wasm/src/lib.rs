@@ -26,7 +26,7 @@ pub mod worker;
 mod workflow_definition;
 
 pub use activity_definition::{ActivityDefinition, ActivityError, UntypedActivity};
-pub use memo::Memo;
+pub use memo::{Memo, MemoValue, MemoValues};
 pub use priority::Priority;
 pub use retry_policy::RetryPolicy;
 pub use search_attributes::{

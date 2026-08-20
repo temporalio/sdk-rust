@@ -60,8 +60,8 @@ interface workflow-service {
     task-timeout: option<duration>,
     /// @nexus.omit
     identity: placeholder,
-    /// @nexus.doc "Request ID used to deduplicate workflow start requests."
-    request-id: option<string>,
+    /// @nexus.omit
+    request-id: placeholder,
     /// @nexus.doc "Behavior when a closed workflow with the same ID exists. Default is allow-duplicate."
     /// @nexus.proto-field "workflow_id_reuse_policy"
     /// @nexus.default "allow-duplicate"
@@ -104,7 +104,8 @@ interface workflow-service {
     started: option<bool>,
     /// @nexus.omit
     signal-link: placeholder,
-    first-execution-run-id: string,
+    /// @nexus.omit
+    first-execution-run-id: placeholder,
   }
 
   /// @nexus.doc
@@ -119,6 +120,7 @@ interface workflow-service {
   ///   dotnet-type="Temporalio.Workflows.ExternalWorkflowHandle"
   ///   dotnet="Temporalio.Workflows.Workflow.GetExternalWorkflowHandle(request.Id, result.RunId)"
   /// @nexus.operation name="SignalWithStartWorkflowExecution"
+  /// @nexus.serialization-context python="signal_with_start_workflow_serialization_context"
   /// @nexus.experimental
   signal-with-start-workflow: func(
     request: signal-with-start-workflow-request,

@@ -67,6 +67,8 @@ pub mod interceptors;
 /// Experimental APIs for configuring clients and workers with reusable plugins.
 pub mod plugins;
 pub mod runtime;
+#[cfg(feature = "testing")]
+pub mod testing;
 mod workflow_executor;
 mod workflow_future;
 pub mod workflow_interceptors;

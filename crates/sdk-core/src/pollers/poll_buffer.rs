@@ -59,6 +59,11 @@ const THROTTLE_POLL_BACKOFF: ExponentialBuilder = ExponentialBuilder::new()
     .with_factor(2.0)
     .with_max_delay(Duration::from_secs(10))
     .without_max_times();
+const PERSISTENT_POLL_ERROR_WARN_BACKOFF: ExponentialBuilder = ExponentialBuilder::new()
+    .with_min_delay(Duration::from_secs(60))
+    .with_factor(2.0)
+    .with_max_delay(Duration::from_secs(15 * 60))
+    .without_max_times();
 
 type PollReceiver<T, SK> =
     Mutex<UnboundedReceiver<pollers::Result<(T, OwnedMeteredSemPermit<SK>)>>>;
@@ -550,6 +555,7 @@ where
             ingested_last_period: Default::default(),
             scale_up_allowed: AtomicBool::new(true),
             last_successful_poll_time,
+            persistent_error_warning_state: Default::default(),
             exponential_backoff: parking_lot::Mutex::new(TASK_POLL_BACKOFF.build()),
             resource_exhausted_backoff: parking_lot::Mutex::new(THROTTLE_POLL_BACKOFF.build()),
         });
@@ -616,6 +622,7 @@ struct PollScalerReportHandle {
     ingested_last_period: AtomicUsize,
     scale_up_allowed: AtomicBool,
     last_successful_poll_time: Arc<AtomicCell<Option<SystemTime>>>,
+    persistent_error_warning_state: parking_lot::Mutex<PersistentPollErrorWarningState>,
 
     // Exponential backoff for normal errors and resource exhausted errors
     exponential_backoff: parking_lot::Mutex<backon::ExponentialBackoff>,
@@ -634,10 +641,10 @@ impl PollScalerReportHandle {
             Ok(res) => {
                 self.last_successful_poll_time
                     .store(Some(SystemTime::now()));
-
                 // Reset backoff on successful poll
                 *self.exponential_backoff.lock() = TASK_POLL_BACKOFF.build();
                 *self.resource_exhausted_backoff.lock() = THROTTLE_POLL_BACKOFF.build();
+                self.persistent_error_warning_state.lock().reset();
 
                 if let PollerBehavior::SimpleMaximum(_) = self.behavior {
                     // We don't do auto-scaling with the simple max
@@ -673,6 +680,18 @@ impl PollScalerReportHandle {
             }
             Err(e) => {
                 if matches!(self.behavior, PollerBehavior::Autoscaling { .. }) {
+                    if let Some(error_duration) = self
+                        .persistent_error_warning_state
+                        .lock()
+                        .record_error(Instant::now())
+                    {
+                        warn!(
+                            error = ?e,
+                            ?error_duration,
+                            "Task polling has encountered errors continuously; the worker will continue retrying"
+                        );
+                    }
+
                     // Follow the same backoff logic as the retry client
                     let mut backoff_duration = self
                         .exponential_backoff
@@ -851,6 +870,44 @@ where
 
     async fn shutdown_box(self: Box<Self>) {
         self.inner.shutdown().await;
+    }
+}
+
+#[derive(Debug)]
+struct PersistentPollErrorWarningState {
+    started_at: Option<Instant>,
+    next_warning_at: Option<Instant>,
+    warning_backoff: backon::ExponentialBackoff,
+}
+
+impl Default for PersistentPollErrorWarningState {
+    fn default() -> Self {
+        Self {
+            started_at: None,
+            next_warning_at: None,
+            warning_backoff: PERSISTENT_POLL_ERROR_WARN_BACKOFF.build(),
+        }
+    }
+}
+
+impl PersistentPollErrorWarningState {
+    fn record_error(&mut self, now: Instant) -> Option<Duration> {
+        let Some(started_at) = self.started_at else {
+            self.started_at = Some(now);
+            self.next_warning_at = self.warning_backoff.next().map(|delay| now + delay);
+            return None;
+        };
+        let next_warning_at = self.next_warning_at?;
+        if now < next_warning_at {
+            return None;
+        }
+
+        self.next_warning_at = self.warning_backoff.next().map(|delay| now + delay);
+        Some(now.saturating_duration_since(started_at))
+    }
+
+    fn reset(&mut self) {
+        *self = Self::default();
     }
 }
 
@@ -1282,6 +1339,7 @@ mod tests {
             ingested_last_period: Default::default(),
             scale_up_allowed: AtomicBool::new(true),
             last_successful_poll_time: Arc::new(AtomicCell::new(None)),
+            persistent_error_warning_state: Default::default(),
             exponential_backoff: parking_lot::Mutex::new(TASK_POLL_BACKOFF.build()),
             resource_exhausted_backoff: parking_lot::Mutex::new(THROTTLE_POLL_BACKOFF.build()),
         });
@@ -1294,5 +1352,25 @@ mod tests {
 
         assert_eq!(handle.target.load(Ordering::Relaxed), expected_target);
         assert!(!handle.ever_saw_scaling_decision.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn persistent_poll_error_warning_uses_exponential_backoff_and_resets() {
+        let mut state = PersistentPollErrorWarningState::default();
+        let started_at = Instant::now();
+        let minute = Duration::from_secs(60);
+
+        assert_eq!(state.record_error(started_at), None);
+        assert_eq!(
+            state.record_error(started_at + minute - Duration::from_secs(1)),
+            None
+        );
+        for warning_minute in [1, 3, 7, 15, 30, 45] {
+            let elapsed = minute * warning_minute;
+            assert_eq!(state.record_error(started_at + elapsed), Some(elapsed));
+        }
+
+        state.reset();
+        assert_eq!(state.record_error(started_at + minute * 45), None);
     }
 }
