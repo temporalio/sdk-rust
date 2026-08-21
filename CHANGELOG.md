@@ -327,6 +327,8 @@ relevant information.
   metric reader reports an export error.
 * Worker heartbeat now samples host CPU/memory at the heartbeat interval (only when enabled) rather
   than every 100ms.
+* Workflow replay now reports nondeterminism when a scheduled Nexus operation's service or operation
+  differs from the command that produced it.
 * `WorkflowContext::force_task_fail` calls will be respected over a completion if both happen in the same poll
 * Workers no longer advertise a worker control task queue unless the namespace supports worker
   heartbeats and commands and the built-in Nexus command worker is running.
