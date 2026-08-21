@@ -1443,13 +1443,13 @@ impl CommandAnnotations {
     /// it cancels even when it is issued from somewhere no group is active.
     fn override_with(&mut self, other: Self) {
         if let Some(other_metadata) = other.metadata {
-             let metadata = self.metadata.get_or_insert_with(UserMetadata::default);
-             if let Some(summary) = other_metadata.summary {
-                 metadata.summary = Some(summary);
-             }
-             if let Some(details) = other_metadata.details {
-                 metadata.details = Some(details);
-             }
+            let metadata = self.metadata.get_or_insert_with(UserMetadata::default);
+            if let Some(summary) = other_metadata.summary {
+                metadata.summary = Some(summary);
+            }
+            if let Some(details) = other_metadata.details {
+                metadata.details = Some(details);
+            }
         }
         if !other.event_group_markers.is_empty() {
             self.event_group_markers = other.event_group_markers;
