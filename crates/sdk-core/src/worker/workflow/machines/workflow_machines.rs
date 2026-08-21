@@ -25,8 +25,8 @@ use crate::{
         ExecutingLAId, LocalActRequest, LocalActivityExecutionResult, LocalActivityResolution,
         workflow::{
             CommandAnnotations, CommandID, DrivenWorkflow, HistoryUpdate, InternalFlagsRef,
-            LocalResolution, OutgoingJob, RunBasics, WFCommand, WFCommandVariant, WFMachinesError,
-            WorkflowStartedInfo, fatal,
+            LocalResolution, OutgoingJob, ProtoCommandExt, RunBasics, WFCommand, WFCommandVariant,
+            WFMachinesError, WorkflowStartedInfo, fatal,
             history_update::NextWFT,
             machines::{
                 HistEventData, activity_state_machine::ActivityMachine,
@@ -1010,7 +1010,6 @@ impl WorkflowMachines {
                         self.workflow_id.clone(),
                         str_to_randomness_seed(&attrs.original_execution_run_id),
                         event_dat.event.event_time.unwrap_or_default(),
-                        event_id,
                         attrs,
                     );
                 } else {
@@ -1627,7 +1626,7 @@ impl WorkflowMachines {
     ) -> CommandAndMachine {
         let k = self.all_machines.insert(machine.machine);
         CommandAndMachine {
-            command: annotations.into_command(machine.command),
+            command: ProtoCommand::new(machine.command, annotations),
             machine: k,
         }
     }

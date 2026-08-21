@@ -8,7 +8,8 @@ use crate::{
     abstractions::dbg_panic,
     internal_flags::CoreInternalFlags,
     worker::workflow::{
-        CommandAnnotations, InternalFlagsRef, fatal, machines::HistEventData, nondeterminism,
+        CommandAnnotations, InternalFlagsRef, ProtoCommandExt, fatal, machines::HistEventData,
+        nondeterminism,
     },
 };
 use std::convert::{TryFrom, TryInto};
@@ -799,12 +800,13 @@ fn create_request_cancel_activity_task_command<S>(
 where
     S: Into<ActivityMachineState>,
 {
-    let cmd = dat.annotations.clone().into_command(
+    let cmd = Command::new(
         command::Attributes::RequestCancelActivityTaskCommandAttributes(
             RequestCancelActivityTaskCommandAttributes {
                 scheduled_event_id: dat.scheduled_event_id,
             },
         ),
+        dat.annotations.clone(),
     );
     ActivityMachineTransition::ok(
         vec![ActivityMachineCommand::RequestCancellation(cmd)],

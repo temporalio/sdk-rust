@@ -1,14 +1,3 @@
-//! Event group markers and user metadata attached to a lang command must survive the
-//! indirections Core puts between that command and the `Command` it eventually sends to the
-//! server. Two of those indirections mean the annotations cannot simply be copied across as they
-//! are for a directly translated command: a cancellation is produced by the machine of the
-//! command being cancelled, and a patch synthesizes a search attribute upsert of Core's own
-//! making.
-//!
-//! These tests drive a bare worker with hand-built activation completions because lang, not the
-//! Rust SDK, is what annotates commands; the Rust SDK has no Event Groups API to express a
-//! cancellation carrying markers of its own.
-
 use crate::{
     replay::{TestHistoryBuilder, canned_histories, default_act_sched},
     test_help::{MockPollCfg, build_mock_pollers, mock_worker, start_timer_cmd},
@@ -18,16 +7,23 @@ use temporalio_common::protos::{
     coresdk::{
         AsJsonPayloadExt,
         child_workflow::ChildWorkflowCancellationType,
+        nexus::NexusOperationCancellationType,
         workflow_commands::{
             ActivityCancellationType, CancelChildWorkflowExecution, CancelTimer,
-            CompleteWorkflowExecution, RequestCancelActivity, ScheduleActivity, SetPatchMarker,
-            StartChildWorkflowExecution, WorkflowCommand, workflow_command,
+            CompleteWorkflowExecution, RequestCancelActivity, RequestCancelNexusOperation,
+            ScheduleActivity, ScheduleNexusOperation, SetPatchMarker, StartChildWorkflowExecution,
+            WorkflowCommand, workflow_command,
         },
         workflow_completion::{WorkflowActivationCompletion, workflow_activation_completion},
     },
     temporal::api::{
         command::v1::Command,
+        common::v1::Payload,
         enums::v1::{CommandType, EventType},
+        history::v1::{
+            NexusOperationCancelRequestedEventAttributes, NexusOperationCanceledEventAttributes,
+            NexusOperationScheduledEventAttributes, history_event,
+        },
         sdk::v1::{
             EventGroupMarker, UserMetadata,
             event_group_marker::{Label, Variant},
@@ -238,6 +234,106 @@ async fn cancel_child_workflow_command_is_annotated(
         child_workflow_seq: child_seq,
         reason: "because".to_string(),
     };
+    let cancel = if lang_annotates_cancel {
+        annotate(cancel, "cancel-group")
+    } else {
+        plain(cancel)
+    };
+    let act = core.poll_workflow_activation().await.unwrap();
+    core.complete_workflow_activation(complete(act.run_id, vec![cancel]))
+        .await
+        .unwrap();
+
+    let act = core.poll_workflow_activation().await.unwrap();
+    core.complete_workflow_activation(complete(
+        act.run_id,
+        vec![plain(CompleteWorkflowExecution::default())],
+    ))
+    .await
+    .unwrap();
+}
+
+#[rstest::rstest]
+#[tokio::test]
+async fn cancel_nexus_operation_command_is_annotated(
+    #[values(false, true)] lang_annotates_cancel: bool,
+) {
+    let nexus_seq = 1;
+    let mut t = TestHistoryBuilder::default();
+    t.add_by_type(EventType::WorkflowExecutionStarted);
+    t.add_full_wf_task();
+    let scheduled_event_id = t.add(NexusOperationScheduledEventAttributes {
+        endpoint: "endpoint".to_string(),
+        service: "service".to_string(),
+        operation: "operation".to_string(),
+        ..Default::default()
+    });
+    t.add_we_signaled(
+        "signal",
+        vec![Payload {
+            metadata: Default::default(),
+            data: b"hello ".to_vec(),
+            external_payloads: Default::default(),
+        }],
+    );
+    t.add_full_wf_task();
+    t.add(
+        history_event::Attributes::NexusOperationCancelRequestedEventAttributes(
+            NexusOperationCancelRequestedEventAttributes {
+                scheduled_event_id,
+                ..Default::default()
+            },
+        ),
+    );
+    t.add(
+        history_event::Attributes::NexusOperationCanceledEventAttributes(
+            NexusOperationCanceledEventAttributes {
+                scheduled_event_id,
+                ..Default::default()
+            },
+        ),
+    );
+    t.add_full_wf_task();
+    t.add_workflow_execution_completed();
+
+    let mut mock_cfg = MockPollCfg::from_hist_builder(t);
+    let expected_group = if lang_annotates_cancel {
+        "cancel-group"
+    } else {
+        "nexus-group"
+    };
+    mock_cfg.completion_asserts_from_expectations(|mut asserts| {
+        asserts.then(|_| {}).then(move |wft| {
+            assert_eq!(
+                wft.commands[0].command_type(),
+                CommandType::RequestCancelNexusOperation
+            );
+            assert_annotated(&wft.commands[0], expected_group);
+        });
+    });
+    let mut mock = build_mock_pollers(mock_cfg);
+    mock.worker_cfg(|wc| wc.max_cached_workflows = 1);
+    let core = mock_worker(mock);
+
+    let act = core.poll_workflow_activation().await.unwrap();
+    core.complete_workflow_activation(complete(
+        act.run_id,
+        vec![annotate(
+            ScheduleNexusOperation {
+                seq: nexus_seq,
+                endpoint: "endpoint".to_string(),
+                service: "service".to_string(),
+                operation: "operation".to_string(),
+                cancellation_type: NexusOperationCancellationType::WaitCancellationCompleted as i32,
+                ..Default::default()
+            },
+            "nexus-group",
+        )],
+    ))
+    .await
+    .unwrap();
+
+    let cancel = RequestCancelNexusOperation { seq: nexus_seq };
     let cancel = if lang_annotates_cancel {
         annotate(cancel, "cancel-group")
     } else {

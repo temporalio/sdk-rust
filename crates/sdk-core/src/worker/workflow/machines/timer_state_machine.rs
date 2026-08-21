@@ -5,7 +5,8 @@ use super::{
     WFMachinesAdapter, fsm, workflow_machines::MachineResponse,
 };
 use crate::worker::workflow::{
-    CommandAnnotations, WFMachinesError, fatal, machines::HistEventData, nondeterminism,
+    CommandAnnotations, ProtoCommandExt, WFMachinesError, fatal, machines::HistEventData,
+    nondeterminism,
 };
 use std::convert::TryFrom;
 use temporalio_common::protos::{
@@ -15,7 +16,7 @@ use temporalio_common::protos::{
         workflow_commands::{CancelTimer, StartTimer},
     },
     temporal::api::{
-        command::v1::command,
+        command::v1::{Command, command},
         enums::v1::{CommandType, EventType},
         history::v1::{TimerFiredEventAttributes, history_event},
     },
@@ -107,9 +108,10 @@ impl TimerMachine {
         Ok(
             match OnEventWrapper::on_event_mut(self, TimerMachineEvents::Cancel)?.pop() {
                 Some(TimerMachineCommand::IssueCancelCmd(cmd)) => {
-                    vec![MachineResponse::IssueNewCommand(
-                        self.shared_state.annotations.clone().into_command(cmd),
-                    )]
+                    vec![MachineResponse::IssueNewCommand(Command::new(
+                        cmd,
+                        self.shared_state.annotations.clone(),
+                    ))]
                 }
                 None => vec![],
                 x => panic!("Invalid cancel event response {x:?}"),
@@ -273,9 +275,10 @@ impl WFMachinesAdapter for TimerMachine {
                 .into(),
             ],
             TimerMachineCommand::IssueCancelCmd(c) => {
-                vec![MachineResponse::IssueNewCommand(
-                    self.shared_state.annotations.clone().into_command(c),
-                )]
+                vec![MachineResponse::IssueNewCommand(Command::new(
+                    c,
+                    self.shared_state.annotations.clone(),
+                ))]
             }
         })
     }

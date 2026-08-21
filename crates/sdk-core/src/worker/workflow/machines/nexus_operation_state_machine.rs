@@ -1,6 +1,6 @@
 use super::{MachineError, StateMachine, TransitionResult, fsm};
 use crate::worker::workflow::{
-    CommandAnnotations, WFMachinesError,
+    CommandAnnotations, ProtoCommandExt, WFMachinesError,
     machines::{
         EventInfo, HistEventData, NewMachineWithCommand, OnEventWrapper, WFMachinesAdapter,
         workflow_machines::MachineResponse,
@@ -17,7 +17,7 @@ use temporalio_common::protos::{
         workflow_commands::ScheduleNexusOperation,
     },
     temporal::api::{
-        command::v1::{RequestCancelNexusOperationCommandAttributes, command},
+        command::v1::{Command, RequestCancelNexusOperationCommandAttributes, command},
         common::v1::Payload,
         enums::v1::{CommandType, EventType},
         failure::v1::{self as failure, Failure, failure::FailureInfo},
@@ -649,15 +649,14 @@ impl WFMachinesAdapter for NexusOperationMachine {
             NexusOperationCommand::IssueCancel => {
                 let mut resps = vec![];
                 if self.shared_state.cancel_type != NexusOperationCancellationType::Abandon {
-                    resps.push(MachineResponse::IssueNewCommand(
-                        self.shared_state.annotations.clone().into_command(
-                            command::Attributes::RequestCancelNexusOperationCommandAttributes(
-                                RequestCancelNexusOperationCommandAttributes {
-                                    scheduled_event_id: self.shared_state.scheduled_event_id,
-                                },
-                            ),
+                    resps.push(MachineResponse::IssueNewCommand(Command::new(
+                        command::Attributes::RequestCancelNexusOperationCommandAttributes(
+                            RequestCancelNexusOperationCommandAttributes {
+                                scheduled_event_id: self.shared_state.scheduled_event_id,
+                            },
                         ),
-                    ))
+                        self.shared_state.annotations.clone(),
+                    )))
                 }
                 // Immediately resolve abandon/trycancel modes
                 if matches!(

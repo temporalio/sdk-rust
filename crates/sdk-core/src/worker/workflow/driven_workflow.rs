@@ -45,7 +45,6 @@ impl DrivenWorkflow {
         workflow_id: String,
         randomness_seed: u64,
         start_time: Timestamp,
-        originating_event_id: i64,
         attribs: WorkflowExecutionStartedEventAttributes,
     ) {
         debug!(run_id = %attribs.original_execution_run_id, "Driven WF start");
@@ -56,14 +55,7 @@ impl DrivenWorkflow {
             retry_policy: attribs.retry_policy.clone(),
         };
         self.send_job(
-            start_workflow_from_attribs(
-                attribs,
-                workflow_id,
-                randomness_seed,
-                start_time,
-                originating_event_id,
-            )
-            .into(),
+            start_workflow_from_attribs(attribs, workflow_id, randomness_seed, start_time).into(),
         );
         self.started_attrs = Some(started_info);
     }

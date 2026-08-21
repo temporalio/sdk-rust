@@ -1449,13 +1449,19 @@ impl CommandAnnotations {
             self.event_group_markers = other.event_group_markers;
         }
     }
+}
 
-    fn into_command(self, attributes: Attributes) -> ProtoCommand {
-        ProtoCommand {
+trait ProtoCommandExt {
+    fn new(attributes: Attributes, annotations: CommandAnnotations) -> Self;
+}
+
+impl ProtoCommandExt for ProtoCommand {
+    fn new(attributes: Attributes, annotations: CommandAnnotations) -> Self {
+        Self {
             command_type: attributes.as_type() as i32,
             attributes: Some(attributes),
-            user_metadata: self.metadata,
-            event_group_markers: self.event_group_markers,
+            user_metadata: annotations.metadata,
+            event_group_markers: annotations.event_group_markers,
         }
     }
 }

@@ -783,6 +783,38 @@ async fn simple_timer_fail_wf_execution(hist_batches: &'static [usize]) {
     .await;
 }
 
+#[tokio::test]
+async fn signal_activation_has_originating_event_id() {
+    let mut t = TestHistoryBuilder::default();
+    t.add_by_type(EventType::WorkflowExecutionStarted);
+    t.add_full_wf_task();
+    t.add_we_signaled("signal", vec![]);
+    let signal_event_id = t.current_event_id();
+    t.add_full_wf_task();
+    t.add_workflow_execution_completed();
+
+    let mock = MockPollCfg::from_resps(t, [ResponseType::AllHistory]);
+    let mut mock = build_mock_pollers(mock);
+    mock.worker_cfg(|wc| wc.max_cached_workflows = 1);
+    let core = mock_worker(mock);
+
+    let task = core.poll_workflow_activation().await.unwrap();
+    core.complete_workflow_activation(WorkflowActivationCompletion::empty(task.run_id))
+        .await
+        .unwrap();
+
+    let task = core.poll_workflow_activation().await.unwrap();
+    assert_matches!(
+        task.jobs.as_slice(),
+        [WorkflowActivationJob {
+            variant: Some(workflow_activation_job::Variant::SignalWorkflow(signal)),
+        }] => {
+            assert_eq!(signal.originating_event_id, signal_event_id);
+        }
+    );
+    core.complete_execution(&task.run_id).await;
+}
+
 #[rstest(hist_batches, case::incremental(&[1, 2]), case::replay(&[2]))]
 #[tokio::test]
 async fn two_signals(hist_batches: &'static [usize]) {

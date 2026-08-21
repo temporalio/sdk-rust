@@ -1333,7 +1333,6 @@ pub mod coresdk {
                 workflow_id: String,
                 randomness_seed: u64,
                 start_time: Timestamp,
-                originating_event_id: i64,
             ) -> InitializeWorkflow {
                 InitializeWorkflow {
                     workflow_type: attrs.workflow_type.map(|wt| wt.name).unwrap_or_default(),
@@ -1367,7 +1366,6 @@ pub mod coresdk {
                     start_time: Some(start_time),
                     root_workflow: attrs.root_workflow_execution,
                     priority: attrs.priority,
-                    originating_event_id,
                     original_execution_run_id: attrs.original_execution_run_id,
                 }
             }
