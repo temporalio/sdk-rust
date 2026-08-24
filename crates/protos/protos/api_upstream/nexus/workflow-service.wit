@@ -13,6 +13,7 @@ world system {
 interface workflow-service {
   use nexus:temporal-types/model@1.0.0.{
     duration,
+    header,
     memo,
     payloads,
     placeholder,
@@ -89,8 +90,9 @@ interface workflow-service {
     namespace: string,
     /// @nexus.omit
     control: placeholder,
-    /// @nexus.omit
-    header: placeholder,
+    /// @nexus.api-omit
+    /// @nexus.proto-field "header"
+    headers: option<header>,
     /// @nexus.omit
     links: placeholder,
     /// @nexus.omit
