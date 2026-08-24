@@ -1018,7 +1018,7 @@ async fn activity_metrics() {
         async fn pass_fail_act(ctx: ActivityContext, i: String) -> Result<String, ActivityError> {
             match i.as_str() {
                 "pass" => Ok("pass".to_string()),
-                "cancel" => {
+                "cancel" | "timeout" => {
                     ctx.cancelled().await;
                     Err(ActivityError::cancelled())
                 }
@@ -1089,7 +1089,23 @@ async fn activity_metrics() {
                     )
                     .build(),
             );
-            let _ = join!(local_act_pass, local_act_fail);
+            // Outlives its start-to-close timeout, so core resolves it as timed out rather than
+            // as the cancel the activity reports once core stops it.
+            let local_act_timeout = ctx.execute_local_activity(
+                PassFailActivities::pass_fail_act,
+                "timeout".to_string(),
+                LocalActivityOptions::builder()
+                    .start_to_close_timeout(Duration::from_millis(100))
+                    .retry_policy(
+                        RetryPolicy {
+                            maximum_attempts: 1,
+                            ..Default::default()
+                        }
+                        .into(),
+                    )
+                    .build(),
+            );
+            let _ = join!(local_act_pass, local_act_fail, local_act_timeout);
             // TODO: Currently takes a WFT b/c of https://github.com/temporalio/sdk-core/issues/856
             local_act_cancel.cancel();
             let _ = local_act_cancel.await;
@@ -1136,11 +1152,18 @@ async fn activity_metrics() {
     assert!(body.contains(&format!(
         "temporal_local_activity_total{{activity_type=\"pass_fail_act\",namespace=\"{NAMESPACE}\",\
              service_name=\"temporal-core-sdk\",task_queue=\"{task_queue}\",\
-             workflow_type=\"{wf_type}\"}} 3"
+             workflow_type=\"{wf_type}\"}} 4"
     )));
     assert!(body.contains(&format!(
         "temporal_local_activity_execution_failed{{activity_type=\"pass_fail_act\",\
              failure_reason=\"ActivityError\",\
+             namespace=\"{NAMESPACE}\",service_name=\"temporal-core-sdk\",\
+             task_queue=\"{task_queue}\",\
+             workflow_type=\"{wf_type}\"}} 1"
+    )));
+    assert!(body.contains(&format!(
+        "temporal_local_activity_execution_failed{{activity_type=\"pass_fail_act\",\
+             failure_reason=\"timeout\",\
              namespace=\"{NAMESPACE}\",service_name=\"temporal-core-sdk\",\
              task_queue=\"{task_queue}\",\
              workflow_type=\"{wf_type}\"}} 1"
@@ -1155,7 +1178,7 @@ async fn activity_metrics() {
         "temporal_local_activity_execution_latency_count{{activity_type=\"pass_fail_act\",\
              namespace=\"{NAMESPACE}\",service_name=\"temporal-core-sdk\",\
              task_queue=\"{task_queue}\",\
-             workflow_type=\"{wf_type}\"}} 3"
+             workflow_type=\"{wf_type}\"}} 4"
     )));
     assert!(body.contains(&format!(
         "temporal_local_activity_succeed_endtoend_latency_count{{activity_type=\"pass_fail_act\",\
