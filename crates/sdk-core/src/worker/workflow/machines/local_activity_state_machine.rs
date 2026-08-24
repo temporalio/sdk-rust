@@ -134,6 +134,7 @@ impl From<CompleteLocalActivityData> for ResolveDat {
                     } else {
                         LocalActivityExecutionResult::Failed(ActFail {
                             failure: Some(fail),
+                            ..Default::default()
                         })
                     }
                 }
@@ -616,7 +617,7 @@ impl WFMachinesAdapter for LocalActivityMachine {
                         maybe_failure = fail.failure;
                     }
                     LocalActivityExecutionResult::Cancelled(Cancellation { failure })
-                    | LocalActivityExecutionResult::TimedOut(ActFail { failure }) => {
+                    | LocalActivityExecutionResult::TimedOut(ActFail { failure, .. }) => {
                         will_not_run_again = true;
                         maybe_failure = failure;
                     }

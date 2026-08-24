@@ -10,7 +10,10 @@ use std::{
     time::Duration,
 };
 use temporalio_common::{
-    protos::temporal::api::{enums::v1::WorkflowTaskFailedCause, failure::v1::Failure},
+    protos::{
+        coresdk::activity_result::ActivityTaskFailedCause,
+        temporal::api::{enums::v1::WorkflowTaskFailedCause, failure::v1::Failure},
+    },
     telemetry::metrics::{core::*, *},
 };
 
@@ -755,22 +758,26 @@ pub(crate) fn eager(is_eager: bool) -> MetricKeyValue {
 pub(crate) enum FailureReason {
     Nondeterminism,
     Workflow,
+    Activity,
     Timeout,
     NexusOperation(String),
     NexusHandlerError(String),
     GrpcMessageTooLarge,
     PayloadsTooLarge,
+    ExternalStorageError,
 }
 impl Display for FailureReason {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let str = match self {
             FailureReason::Nondeterminism => "NonDeterminismError".to_owned(),
             FailureReason::Workflow => "WorkflowError".to_owned(),
+            FailureReason::Activity => "ActivityError".to_owned(),
             FailureReason::Timeout => "timeout".to_owned(),
             FailureReason::NexusOperation(op) => format!("operation_{op}"),
             FailureReason::NexusHandlerError(op) => format!("handler_error_{op}"),
             FailureReason::GrpcMessageTooLarge => "GrpcMessageTooLarge".to_owned(),
             FailureReason::PayloadsTooLarge => "PayloadsTooLarge".to_owned(),
+            FailureReason::ExternalStorageError => "ExternalStorageError".to_owned(),
         };
         write!(f, "{str}")
     }
@@ -780,6 +787,16 @@ impl From<WorkflowTaskFailedCause> for FailureReason {
         match v {
             WorkflowTaskFailedCause::NonDeterministicError => FailureReason::Nondeterminism,
             _ => FailureReason::Workflow,
+        }
+    }
+}
+impl From<ActivityTaskFailedCause> for FailureReason {
+    fn from(v: ActivityTaskFailedCause) -> Self {
+        match v {
+            ActivityTaskFailedCause::PayloadsTooLarge => FailureReason::PayloadsTooLarge,
+            ActivityTaskFailedCause::ExternalStorageFailure => FailureReason::ExternalStorageError,
+            ActivityTaskFailedCause::Unspecified
+            | ActivityTaskFailedCause::ActivityWorkerUnhandledFailure => FailureReason::Activity,
         }
     }
 }

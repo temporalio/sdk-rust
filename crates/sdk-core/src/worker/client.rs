@@ -20,7 +20,10 @@ use temporalio_client::{
 };
 use temporalio_common::protos::{
     TaskToken,
-    coresdk::{workflow_commands::QueryResult, workflow_completion},
+    coresdk::{
+        activity_result::ActivityTaskFailedCause, workflow_commands::QueryResult,
+        workflow_completion,
+    },
     temporal::api::{
         command::v1::Command,
         common::v1::{
@@ -211,6 +214,7 @@ pub trait WorkerClient: Sync + Send {
     async fn fail_activity_task(
         &self,
         task_token: TaskToken,
+        cause: ActivityTaskFailedCause,
         failure: Option<Failure>,
         last_heartbeat_details: Option<Payloads>,
     ) -> Result<RespondActivityTaskFailedResponse>;
@@ -282,6 +286,10 @@ pub trait WorkerClient: Sync + Send {
     fn set_heartbeat_client_fields(&self, heartbeat: &mut WorkerHeartbeat);
     /// Set the worker's payload/memo error limits
     fn set_payload_error_limits(&self, _limits: Option<PayloadErrorLimits>) {}
+    /// Get the worker's payload/memo error limits
+    fn payload_error_limits(&self) -> Option<PayloadErrorLimits> {
+        None
+    }
 }
 
 /// Configuration options shared by workflow, activity, and Nexus polling calls
@@ -613,34 +621,13 @@ impl WorkerClient for WorkerClientBag {
     async fn fail_activity_task(
         &self,
         task_token: TaskToken,
-        mut failure: Option<Failure>,
-        mut last_heartbeat_details: Option<Payloads>,
+        // Unused until `RespondActivityTaskFailedRequest` gains a cause field
+        //  (https://github.com/temporalio/api/pull/816). Taken as a parameter regardless so the
+        //  cause is decided next to the failure it describes, as `fail_workflow_task` does.
+        _cause: ActivityTaskFailedCause,
+        failure: Option<Failure>,
+        last_heartbeat_details: Option<Payloads>,
     ) -> Result<RespondActivityTaskFailedResponse> {
-        let payload_error_limits = self.client.error_limits();
-        if let (Some(details), Some(limits)) =
-            (last_heartbeat_details.as_ref(), payload_error_limits)
-        {
-            let heartbeat_request = RecordActivityTaskHeartbeatRequest {
-                details: Some(details.clone()),
-                ..Default::default()
-            };
-            let payload_limits = temporalio_common::payload_limits::PayloadLimits {
-                blob_error: limits.blob,
-                memo_error: limits.memo,
-                ..Default::default()
-            };
-            if let Some(violation) =
-                temporalio_common::payload_limits::validate_known_payload_limits(
-                    &heartbeat_request,
-                    &payload_limits,
-                )
-            {
-                failure = Some(crate::worker::activities::make_payloads_too_large_failure(
-                    &violation,
-                ));
-                last_heartbeat_details = None;
-            }
-        }
         Ok(self
             .client
             .clone()
@@ -938,6 +925,10 @@ impl WorkerClient for WorkerClientBag {
     fn set_payload_error_limits(&self, limits: Option<PayloadErrorLimits>) {
         self.client.set_error_limits(limits);
     }
+
+    fn payload_error_limits(&self) -> Option<PayloadErrorLimits> {
+        self.client.error_limits()
+    }
 }
 
 impl NamespacedClient for WorkerClientBag {
@@ -1069,6 +1060,7 @@ mod tests {
         client
             .fail_activity_task(
                 TaskToken(vec![1]),
+                ActivityTaskFailedCause::ActivityWorkerUnhandledFailure,
                 None,
                 Some(last_heartbeat_details.clone()),
             )

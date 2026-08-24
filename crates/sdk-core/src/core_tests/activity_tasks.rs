@@ -37,8 +37,8 @@ use temporalio_common::{
         coresdk::{
             ActivityTaskCompletion,
             activity_result::{
-                ActivityExecutionResult, ActivityResolution, Success, activity_execution_result,
-                activity_resolution,
+                ActivityExecutionResult, ActivityResolution, ActivityTaskFailedCause, Success,
+                activity_execution_result, activity_resolution,
             },
             activity_task::{ActivityCancelReason, ActivityTask, Cancel, activity_task},
             workflow_activation::{
@@ -679,7 +679,7 @@ async fn complete_act_with_fail_includes_latest_heartbeat() {
             })
         });
     mock_client.expect_fail_activity_task().times(1).returning(
-        move |_, _, last_heartbeat_details| {
+        move |_, _, _, last_heartbeat_details| {
             assert_eq!(last_heartbeat_details.unwrap().payloads[0].data, [last_hb]);
             Ok(RespondActivityTaskFailedResponse::default())
         },
@@ -843,7 +843,7 @@ async fn activity_failure_distinguishes_no_heartbeat_from_empty_heartbeat() {
                 Ok(RecordActivityTaskHeartbeatResponse::default())
             });
         mock_client.expect_fail_activity_task().times(1).returning(
-            move |_, _, last_heartbeat_details| {
+            move |_, _, _, last_heartbeat_details| {
                 if explicit_empty_heartbeat {
                     assert_eq!(last_heartbeat_details.unwrap().payloads, []);
                 } else {
@@ -958,7 +958,8 @@ async fn oversized_activity_result_failure_includes_latest_heartbeat() {
         .times(1)
         .returning(|_, _| Err(payload_too_large_status()));
     mock_client.expect_fail_activity_task().times(1).returning(
-        |_, failure, last_heartbeat_details| {
+        |_, cause, failure, last_heartbeat_details| {
+            assert_eq!(cause, ActivityTaskFailedCause::PayloadsTooLarge);
             assert_payloads_too_large_retryable(&failure);
             assert_eq!(last_heartbeat_details.unwrap().payloads[0].data, [2]);
             Ok(RespondActivityTaskFailedResponse::default())
@@ -1005,7 +1006,8 @@ async fn oversized_cancel_details_fails_activity() {
         .times(1)
         .returning(|_, _| Err(payload_too_large_status()));
     mock_client.expect_fail_activity_task().times(1).returning(
-        |_, failure, last_heartbeat_details| {
+        |_, cause, failure, last_heartbeat_details| {
+            assert_eq!(cause, ActivityTaskFailedCause::PayloadsTooLarge);
             assert_payloads_too_large_retryable(&failure);
             assert_eq!(last_heartbeat_details.unwrap().payloads[0].data, [2]);
             Ok(RespondActivityTaskFailedResponse::default())
@@ -1051,7 +1053,8 @@ async fn oversized_heartbeat_fails_activity() {
         .times(1)
         .returning(|_, _| Err(payload_too_large_status()));
     mock_client.expect_fail_activity_task().times(1).returning(
-        |_, failure, last_heartbeat_details| {
+        |_, cause, failure, last_heartbeat_details| {
+            assert_eq!(cause, ActivityTaskFailedCause::PayloadsTooLarge);
             assert_payloads_too_large_retryable(&failure);
             assert!(last_heartbeat_details.is_none());
             Ok(RespondActivityTaskFailedResponse::default())
@@ -1456,7 +1459,7 @@ async fn graceful_shutdown(#[values(true, false)] at_max_outstanding: bool) {
             Ok(RecordActivityTaskHeartbeatResponse::default())
         });
     mock_client.expect_fail_activity_task().times(3).returning(
-        |task_token, _, last_heartbeat_details| {
+        |task_token, _, _, last_heartbeat_details| {
             if task_token.0 == [1] {
                 assert_eq!(last_heartbeat_details.unwrap().payloads[0].data, [2]);
             } else {

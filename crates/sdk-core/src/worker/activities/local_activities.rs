@@ -2,7 +2,9 @@ use crate::{
     MetricsContext, TaskToken,
     abstractions::{MeteredPermitDealer, OwnedMeteredSemPermit, UsedMeteredSemPermit, dbg_panic},
     protosext::ValidScheduleLA,
-    telemetry::metrics::{activity_type, should_record_failure_metric, workflow_type},
+    telemetry::metrics::{
+        FailureReason, activity_type, failure_reason, should_record_failure_metric, workflow_type,
+    },
     worker::{LocalActivitySlotKind, workflow::HeartbeatTimeoutMsg},
 };
 use futures_util::{
@@ -80,6 +82,7 @@ impl LocalActivityExecutionResult {
                 )),
                 ..Default::default()
             }),
+            ..Default::default()
         })
     }
 
@@ -612,14 +615,18 @@ impl LocalActivityManager {
             let outcome = match &status {
                 LocalActivityExecutionResult::Failed(fail) => {
                     if should_record_failure_metric(&fail.failure) {
-                        la_metrics.la_execution_failed()
+                        la_metrics
+                            .with_new_attrs([failure_reason(fail.cause().into())])
+                            .la_execution_failed()
                     }
                     Outcome::FailurePath {
                         backoff: calc_backoff!(fail),
                     }
                 }
                 LocalActivityExecutionResult::TimedOut(fail) => {
-                    la_metrics.la_execution_failed();
+                    la_metrics
+                        .with_new_attrs([failure_reason(FailureReason::Timeout)])
+                        .la_execution_failed();
                     is_timeout = true;
                     // Start to close timeouts are retryable, other timeout types aren't.
                     if matches!(status.get_timeout_type(), Some(TimeoutType::StartToClose)) {
@@ -1284,6 +1291,7 @@ mod tests {
                     )),
                     ..Default::default()
                 }),
+                ..Default::default()
             }),
         );
         assert_matches!(res, LACompleteAction::Report { .. });

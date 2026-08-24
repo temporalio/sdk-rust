@@ -324,6 +324,7 @@ impl WFMachinesAdapter for ActivityMachine {
                         result: Some(ActivityResolution {
                             status: Some(activity_resolution::Status::Failed(ar::Failure {
                                 failure: Some(failure),
+                                ..Default::default()
                             })),
                         }),
                         is_local: false,

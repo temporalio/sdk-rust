@@ -16,6 +16,7 @@ use temporalio_client::payload_limit_violation_from;
 use temporalio_common::protos::{
     coresdk::{
         ActivityHeartbeat, IntoPayloadsExt,
+        activity_result::ActivityTaskFailedCause,
         activity_task::{ActivityCancelReason, ActivityCancellationDetails, ActivityTask},
     },
     temporal::api::{
@@ -201,6 +202,7 @@ impl ActivityHeartbeatManager {
                                             if let Err(fe) = sg
                                                 .fail_activity_task(
                                                     tt.clone(),
+                                                    ActivityTaskFailedCause::PayloadsTooLarge,
                                                     Some(make_payloads_too_large_failure(violation)),
                                                     None,
                                                 )

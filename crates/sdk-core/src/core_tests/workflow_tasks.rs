@@ -317,7 +317,7 @@ async fn scheduled_activity_timeout(hist_batches: &'static [usize]) {
                                     seq,
                                     result: Some(ActivityResolution {
                                         status: Some(activity_resolution::Status::Failed(ar::Failure {
-                                            failure: Some(failure)
+                                            failure: Some(failure), ..
                                         })),
                                     }), ..
                                 }
@@ -370,7 +370,7 @@ async fn started_activity_timeout(hist_batches: &'static [usize]) {
                                     seq,
                                     result: Some(ActivityResolution {
                                         status: Some(activity_resolution::Status::Failed(ar::Failure {
-                                            failure: Some(failure)
+                                            failure: Some(failure), ..
                                         })),
                                     }), ..
                                 }

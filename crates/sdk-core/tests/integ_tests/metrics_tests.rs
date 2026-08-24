@@ -19,16 +19,19 @@ use std::{
     time::Duration,
 };
 use temporalio_client::{
-    Connection, MESSAGE_TOO_LARGE_KEY, NamespacedClient, REQUEST_LATENCY_HISTOGRAM_NAME,
-    UntypedQuery, UntypedWorkflow, WorkflowExecutionInfo, WorkflowQueryOptions,
-    WorkflowStartOptions, grpc::WorkflowService,
+    Connection, MESSAGE_TOO_LARGE_KEY, NamespacedClient, PayloadErrorLimits,
+    REQUEST_LATENCY_HISTOGRAM_NAME, UntypedQuery, UntypedWorkflow, WorkflowExecutionInfo,
+    WorkflowQueryOptions, WorkflowStartOptions, grpc::WorkflowService,
 };
 use temporalio_common::{
     data_converters::RawValue,
     protos::{
         coresdk::{
-            ActivityTaskCompletion,
-            activity_result::ActivityExecutionResult,
+            ActivityHeartbeat, ActivityTaskCompletion,
+            activity_result::{
+                self as activity_result, ActivityExecutionResult, ActivityTaskFailedCause,
+                activity_execution_result,
+            },
             nexus::{NexusTaskCompletion, nexus_task, nexus_task_completion},
             workflow_activation::{WorkflowActivationJob, workflow_activation_job},
             workflow_commands::{
@@ -41,10 +44,10 @@ use temporalio_common::{
         temporal::api::{
             common::v1::RetryPolicy,
             enums::v1::{
-                NexusHandlerErrorRetryBehavior, WorkflowIdConflictPolicy, WorkflowIdReusePolicy,
-                WorkflowTaskFailedCause,
+                ApplicationErrorCategory, NexusHandlerErrorRetryBehavior, WorkflowIdConflictPolicy,
+                WorkflowIdReusePolicy, WorkflowTaskFailedCause,
             },
-            failure::v1::Failure,
+            failure::v1::{ApplicationFailureInfo, Failure, failure},
             nexus::{
                 self,
                 v1::{
@@ -52,7 +55,9 @@ use temporalio_common::{
                     request::Variant, start_operation_response,
                 },
             },
-            workflowservice::v1::{DescribeNamespaceRequest, ListNamespacesRequest},
+            workflowservice::v1::{
+                DescribeNamespaceRequest, ListNamespacesRequest, PollActivityTaskQueueResponse,
+            },
         },
     },
     telemetry::{
@@ -80,8 +85,8 @@ use temporalio_sdk_core::{
     WorkflowSlotKind, init_worker, prost_dur,
     replay::TestHistoryBuilder,
     test_help::{
-        MockPollCfg, ResponseType, TemporalMeter, WorkerExt, WorkerTestHelpers, build_mock_pollers,
-        mock_worker, mock_worker_client,
+        MockPollCfg, MocksHolder, ResponseType, TemporalMeter, WorkerExt, WorkerTestHelpers,
+        build_mock_pollers, mock_worker, mock_worker_client, mock_worker_client_with_error_limits,
     },
 };
 use tokio::{
@@ -1108,6 +1113,7 @@ async fn activity_metrics() {
     let wf_type = ActivityMetricsWf::name();
     assert!(body.contains(&format!(
         "temporal_activity_execution_failed{{activity_type=\"pass_fail_act\",\
+             failure_reason=\"ActivityError\",\
              namespace=\"{NAMESPACE}\",service_name=\"temporal-core-sdk\",\
              task_queue=\"{task_queue}\",workflow_type=\"{wf_type}\"}} 1"
     )));
@@ -1134,6 +1140,7 @@ async fn activity_metrics() {
     )));
     assert!(body.contains(&format!(
         "temporal_local_activity_execution_failed{{activity_type=\"pass_fail_act\",\
+             failure_reason=\"ActivityError\",\
              namespace=\"{NAMESPACE}\",service_name=\"temporal-core-sdk\",\
              task_queue=\"{task_queue}\",\
              workflow_type=\"{wf_type}\"}} 1"
@@ -2093,5 +2100,167 @@ async fn grpc_message_too_large_wf_task_execution_failed_metric_includes_workflo
     assert!(
         metric_line.contains("workflow_type=\"default_wf_type\""),
         "Expected workflow_type label on metric, got: {metric_line}"
+    );
+}
+
+/// A cause reported by lang must survive to the metric as its own `failure_reason`, rather than
+/// being flattened into the catch-all activity reason.
+#[tokio::test]
+async fn lang_reported_activity_failure_cause_reaches_metric() {
+    let (telemopts, addr, _aborter) = prom_metrics(None);
+    let rt = CoreRuntime::new_assume_tokio(get_integ_runtime_options(telemopts)).unwrap();
+    let meter = rt.telemetry().get_temporal_metric_meter().unwrap();
+
+    let mut mock_client = mock_worker_client();
+    mock_client
+        .expect_fail_activity_task()
+        .times(1)
+        .returning(|_, cause, _, _| {
+            assert_eq!(cause, ActivityTaskFailedCause::ExternalStorageFailure);
+            Ok(Default::default())
+        });
+
+    let mut mock = MocksHolder::from_client_with_activities(
+        mock_client,
+        [PollActivityTaskQueueResponse {
+            task_token: vec![1],
+            activity_id: "act1".to_string(),
+            activity_type: Some("act_type".into()),
+            ..Default::default()
+        }
+        .into()],
+    );
+    mock.set_temporal_meter(meter);
+    let core = mock_worker(mock);
+
+    let act = core.poll_activity_task().await.unwrap();
+    core.complete_activity_task(ActivityTaskCompletion {
+        task_token: act.task_token,
+        result: Some(ActivityExecutionResult {
+            status: Some(activity_execution_result::Status::Failed(
+                activity_result::Failure {
+                    failure: Some(Failure {
+                        message: "storage exploded".to_string(),
+                        ..Default::default()
+                    }),
+                    cause: ActivityTaskFailedCause::ExternalStorageFailure as i32,
+                },
+            )),
+        }),
+    })
+    .await
+    .unwrap();
+    core.drain_activity_poller_and_shutdown().await;
+
+    let metric_line = eventually(
+        || {
+            let endpoint = format!("http://{addr}/metrics");
+            async move {
+                let body = get_text(endpoint).await;
+                body.lines()
+                    .find(|l| l.starts_with("temporal_activity_execution_failed{"))
+                    .map(ToString::to_string)
+                    .ok_or_else(|| anyhow!("activity_execution_failed metric not found"))
+            }
+        },
+        Duration::from_secs(5),
+    )
+    .await
+    .unwrap();
+
+    assert!(
+        metric_line.contains("failure_reason=\"ExternalStorageError\""),
+        "Expected ExternalStorageError failure reason on metric, got: {metric_line}"
+    );
+}
+
+/// Oversized heartbeat details replace whatever lang reported, so the metric must be recorded with
+/// the payload-limit reason even when the lang failure was benign (benign failures are otherwise
+/// not counted at all).
+#[tokio::test]
+async fn benign_failure_with_oversized_heartbeat_details_counts_as_payloads_too_large() {
+    let (telemopts, addr, _aborter) = prom_metrics(None);
+    let rt = CoreRuntime::new_assume_tokio(get_integ_runtime_options(telemopts)).unwrap();
+    let meter = rt.telemetry().get_temporal_metric_meter().unwrap();
+
+    let mut mock_client =
+        mock_worker_client_with_error_limits(Some(PayloadErrorLimits { blob: 10, memo: 10 }));
+    mock_client
+        .expect_record_activity_heartbeat()
+        .returning(|_, _| Ok(Default::default()));
+    mock_client.expect_fail_activity_task().times(1).returning(
+        |_, cause, failure, last_heartbeat_details| {
+            assert_eq!(cause, ActivityTaskFailedCause::PayloadsTooLarge);
+            assert!(
+                last_heartbeat_details.is_none(),
+                "oversized details must be dropped"
+            );
+            assert!(failure.is_some(), "failure present");
+            Ok(Default::default())
+        },
+    );
+
+    let mut mock = MocksHolder::from_client_with_activities(
+        mock_client,
+        [PollActivityTaskQueueResponse {
+            task_token: vec![1],
+            activity_id: "act1".to_string(),
+            activity_type: Some("act_type".into()),
+            heartbeat_timeout: Some(prost_dur!(from_secs(10))),
+            ..Default::default()
+        }
+        .into()],
+    );
+    mock.set_temporal_meter(meter);
+    let core = mock_worker(mock);
+
+    let act = core.poll_activity_task().await.unwrap();
+    core.record_activity_heartbeat(ActivityHeartbeat {
+        task_token: act.task_token.clone(),
+        details: vec![vec![0_u8; 1024].into()],
+    });
+    core.complete_activity_task(ActivityTaskCompletion {
+        task_token: act.task_token,
+        result: Some(ActivityExecutionResult {
+            status: Some(activity_execution_result::Status::Failed(
+                activity_result::Failure {
+                    failure: Some(Failure {
+                        message: "benign".to_string(),
+                        failure_info: Some(failure::FailureInfo::ApplicationFailureInfo(
+                            ApplicationFailureInfo {
+                                category: ApplicationErrorCategory::Benign as i32,
+                                ..Default::default()
+                            },
+                        )),
+                        ..Default::default()
+                    }),
+                    cause: ActivityTaskFailedCause::ActivityWorkerUnhandledFailure as i32,
+                },
+            )),
+        }),
+    })
+    .await
+    .unwrap();
+    core.drain_activity_poller_and_shutdown().await;
+
+    let metric_line = eventually(
+        || {
+            let endpoint = format!("http://{addr}/metrics");
+            async move {
+                let body = get_text(endpoint).await;
+                body.lines()
+                    .find(|l| l.starts_with("temporal_activity_execution_failed{"))
+                    .map(ToString::to_string)
+                    .ok_or_else(|| anyhow!("activity_execution_failed metric not found"))
+            }
+        },
+        Duration::from_secs(5),
+    )
+    .await
+    .unwrap();
+
+    assert!(
+        metric_line.contains("failure_reason=\"PayloadsTooLarge\""),
+        "Expected PayloadsTooLarge failure reason on metric, got: {metric_line}"
     );
 }

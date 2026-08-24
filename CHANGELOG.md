@@ -43,6 +43,9 @@ relevant information.
   and `list` read them back.
 * `MemoValue` and `MemoValues` are now exported from `temporalio_common` as well as
   `temporalio_workflow`, so the same types can be used from clients and workflows.
+* The `temporal_activity_execution_failed` and `temporal_local_activity_execution_failed` worker
+  metrics now carry a `failure_reason` attribute. Each is now split into one time series per
+  reason, which may affect existing dashboards.
 
 ### Breaking Changes :boom:
 * Values stored in a `MemoValue` must now be `Send + Sync`. It previously held its value in an
@@ -56,6 +59,13 @@ relevant information.
 
 * Signal-with-start is now invoked with `Client::signal_with_start_workflow`; remove uses of
   `WorkflowStartOptions::start_signal` and `WorkflowStartSignal`.
+
+### Fixed
+* An activity failure caused by oversized final heartbeat details is now counted in the
+  `temporal_activity_execution_failed` metric as `failure_reason="PayloadsTooLarge"`. Previously it
+  was counted under the reason for the failure the activity itself reported, and was not counted at
+  all when that failure was benign, even though the worker reported a payload-limit failure to the
+  server.
 
 ## [0.7.0] - 2026-08-17
 

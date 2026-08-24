@@ -6,7 +6,10 @@ pub use crate::{
     internal_flags::CoreInternalFlags,
     worker::{
         LEGACY_QUERY_ID,
-        client::{LegacyQueryResult, mocks::mock_worker_client},
+        client::{
+            LegacyQueryResult,
+            mocks::{mock_worker_client, mock_worker_client_with_error_limits},
+        },
     },
 };
 
