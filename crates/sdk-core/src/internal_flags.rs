@@ -33,6 +33,10 @@ pub enum CoreInternalFlags {
     /// if in the sequence delivered by lang they came after a terminal command.
     /// See <https://github.com/temporalio/features/issues/481>.
     MoveTerminalCommands = 3,
+    /// Selects the second-generation workflow-task history chunker for this run. This flag is
+    /// valid only on the run's first successful workflow-task completion, because changing
+    /// chunkers after workflow code has already executed would reinterpret earlier activations.
+    WftChunkingV2 = 4,
     /// We received a value higher than this code can understand.
     TooHigh = u32::MAX,
 }
@@ -55,12 +59,17 @@ impl InternalFlags {
         server_capabilities: &get_system_info_response::Capabilities,
         sdk_name: String,
         sdk_version: String,
+        record_wft_chunking_v2: bool,
     ) -> Self {
+        let mut core_since_last_complete = HashSet::new();
+        if server_capabilities.sdk_metadata && record_wft_chunking_v2 {
+            core_since_last_complete.insert(CoreInternalFlags::WftChunkingV2);
+        }
         Self {
             can_write_sdk_metadata: server_capabilities.sdk_metadata,
             core: Default::default(),
             lang: Default::default(),
-            core_since_last_complete: Default::default(),
+            core_since_last_complete,
             lang_since_last_complete: Default::default(),
             last_sdk_name: "".to_string(),
             last_sdk_version: "".to_string(),
@@ -70,6 +79,11 @@ impl InternalFlags {
     }
 
     pub(crate) fn add_from_complete(&mut self, e: &WorkflowTaskCompletedEventAttributes) {
+        // The first durable successful completion decides the run's chunker. Keep offering a
+        // staged flag across failed/ambiguous completion RPCs, but never move it to a later WFT if
+        // another worker wins the first completion without it.
+        self.core_since_last_complete
+            .remove(&CoreInternalFlags::WftChunkingV2);
         if let Some(metadata) = e.sdk_metadata.as_ref() {
             self.core.extend(
                 metadata
@@ -108,12 +122,12 @@ impl InternalFlags {
         }
     }
 
-    /// Writes all known core flags to the set which should be recorded in the current WFT if not
-    /// already known. Must only be called if not replaying.
+    /// Stages the cumulative, default-enabled flags. The first-WFT-only chunker flag is staged
+    /// separately at construction because it must never move to a later completion.
     pub(crate) fn write_all_known(&mut self) {
         if self.can_write_sdk_metadata {
             self.core_since_last_complete
-                .extend(CoreInternalFlags::all_except_too_high());
+                .extend(CoreInternalFlags::all_cumulative_default_enabled());
         }
     }
 
@@ -136,7 +150,14 @@ impl InternalFlags {
             .filter(|f| !self.lang.contains(f))
             .copied()
             .collect();
-        self.core.extend(self.core_since_last_complete.iter());
+        // Unlike ordinary capability flags, merely attempting to write the chunker flag cannot
+        // select it: the completion may fail or lose a race. It becomes observed only when read
+        // back through `add_from_complete`.
+        self.core.extend(
+            self.core_since_last_complete
+                .iter()
+                .filter(|flag| **flag != CoreInternalFlags::WftChunkingV2),
+        );
         self.lang.extend(self.lang_since_last_complete.iter());
         let sdk_name = if self.last_sdk_name != self.sdk_name {
             self.sdk_name.clone()
@@ -170,15 +191,26 @@ impl InternalFlags {
 }
 
 impl CoreInternalFlags {
-    fn from_u32(v: u32) -> Self {
+    pub(crate) fn from_u32(v: u32) -> Self {
         match v {
             1 => Self::IdAndTypeDeterminismChecks,
             2 => Self::UpsertSearchAttributeOnPatch,
             3 => Self::MoveTerminalCommands,
+            4 => Self::WftChunkingV2,
             _ => Self::TooHigh,
         }
     }
 
+    pub(crate) fn all_cumulative_default_enabled() -> impl Iterator<Item = CoreInternalFlags> {
+        [
+            Self::IdAndTypeDeterminismChecks,
+            Self::UpsertSearchAttributeOnPatch,
+            Self::MoveTerminalCommands,
+        ]
+        .into_iter()
+    }
+
+    #[cfg(test)]
     pub(crate) fn all_except_too_high() -> impl Iterator<Item = CoreInternalFlags> {
         enum_iterator::all::<CoreInternalFlags>()
             .filter(|f| !matches!(f, CoreInternalFlags::TooHigh))
@@ -192,7 +224,12 @@ mod tests {
 
     impl Default for InternalFlags {
         fn default() -> Self {
-            Self::new(&Capabilities::default(), "".to_string(), "".to_string())
+            Self::new(
+                &Capabilities::default(),
+                "".to_string(),
+                "".to_string(),
+                false,
+            )
         }
     }
 
@@ -202,6 +239,7 @@ mod tests {
             &Capabilities::default(),
             "name".to_string(),
             "ver".to_string(),
+            false,
         );
         f.add_from_complete(&WorkflowTaskCompletedEventAttributes {
             sdk_metadata: Some(WorkflowTaskCompletedMetadata {
@@ -223,6 +261,7 @@ mod tests {
             &Capabilities::default(),
             "name".to_string(),
             "ver".to_string(),
+            false,
         );
         f.add_lang_used([1]);
 
@@ -244,6 +283,31 @@ mod tests {
     }
 
     #[test]
+    fn chunking_v2_stays_staged_until_first_completion_is_observed() {
+        let mut flags = InternalFlags::new(
+            &Capabilities {
+                sdk_metadata: true,
+                ..Default::default()
+            },
+            "name".to_string(),
+            "ver".to_string(),
+            true,
+        );
+
+        assert_eq!(
+            flags.gather_for_wft_complete().core_used_flags,
+            vec![CoreInternalFlags::WftChunkingV2 as u32]
+        );
+        assert_eq!(
+            flags.gather_for_wft_complete().core_used_flags,
+            vec![CoreInternalFlags::WftChunkingV2 as u32]
+        );
+
+        flags.add_from_complete(&WorkflowTaskCompletedEventAttributes::default());
+        assert!(flags.gather_for_wft_complete().core_used_flags.is_empty());
+    }
+
+    #[test]
     fn only_writes_new_flags_and_sdk_info() {
         let mut f = InternalFlags::new(
             &Capabilities {
@@ -252,6 +316,7 @@ mod tests {
             },
             "name".to_string(),
             "ver".to_string(),
+            false,
         );
         f.add_lang_used([1]);
         f.try_use(CoreInternalFlags::IdAndTypeDeterminismChecks, true);

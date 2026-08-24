@@ -264,6 +264,7 @@ impl WorkflowMachines {
             basics.capabilities,
             basics.sdk_name.to_owned(),
             basics.sdk_version.to_owned(),
+            basics.record_wft_chunking_v2,
         );
         // Peek ahead to determine used flags in the first WFT.
         if let Some(attrs) = basics.history.peek_next_wft_completed(0) {
@@ -752,20 +753,13 @@ impl WorkflowMachines {
             ProtocolMessage(IncomingProtocolMessage),
         }
         let mut delayed_actions = vec![];
-        // Scan through to the next WFT, searching for any patch / la markers, so that we can
-        // pre-resolve them. This lookahead is necessary because we need these things to be already
-        // resolved in the same activations they would have been resolved in during initial
-        // execution. For example: If a workflow asks to run an LA and then waits on it, we will
-        // write the completion marker at the end of that WFT (as a command). So, upon replay,
-        // we need to lookahead and see that that LA is in fact resolved, so that we don't decide
-        // to execute it anew when lang says it wants to run it.
-        //
-        // Alternatively, lookahead can seemingly be avoided if we were to consider the commands
-        // that follow a WFT to be _part of_ that wft rather than the next one. That change might
-        // make sense to do, and maybe simplifies things slightly, but is a substantial alteration.
+        // Pre-resolve the contiguous command batch following the just-consumed completion so its
+        // effects appear in the same replay activation as they did during initial execution. V2
+        // can retain later events only to prove the chunk boundary, and those must not leak into
+        // the current activation.
         for e in self
             .last_history_from_server
-            .peek_next_wft_sequence(last_handled_wft_started_id)
+            .peek_next_wft_commands(last_handled_wft_started_id)
         {
             if let Some((patch_id, _)) = e.get_patch_marker_details() {
                 self.encountered_patch_markers.insert(

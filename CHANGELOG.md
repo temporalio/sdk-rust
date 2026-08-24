@@ -57,6 +57,13 @@ relevant information.
 * Signal-with-start is now invoked with `Client::signal_with_start_workflow`; remove uses of
   `WorkflowStartOptions::start_signal` and `WorkflowStartSignal`.
 
+### Fixed
+
+* Added opt-in Workflow Task chunking v2 to prevent replay boundary divergence around Updates,
+  heartbeat tasks, and paginated history. Deploy reader support before enabling
+  `TEMPORAL_USE_WFT_CHUNKING_V2`; runs whose first successful Workflow Task is already complete
+  remain on v1 and can adopt v2 via Continue-As-New.
+
 ## [0.7.0] - 2026-08-17
 
 ### Added

@@ -42,6 +42,8 @@ pub(crate) use wft_poller::WFTPollerShared;
 
 #[allow(unreachable_pub)] // re-exported in test_help::integ_helpers
 pub use workflow::LEGACY_QUERY_ID;
+#[cfg(test)]
+pub(crate) use workflow::parse_wft_chunking_v2_opt_in;
 
 use crate::{
     ActivityHeartbeat,

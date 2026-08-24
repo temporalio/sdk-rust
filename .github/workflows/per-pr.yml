@@ -44,6 +44,7 @@ jobs:
           - os: windows-latest
             timeoutMinutes: 30
           - os: ubuntu-latest
+            useWftChunkingV2: "true"
           - os: ubuntu-arm
             runsOn: ubuntu-24.04-arm64-2-core
             timeoutMinutes: 30
@@ -68,6 +69,8 @@ jobs:
           script: |
             core.exportVariable('RUSTFLAGS', '-Csymbol-mangling-version=v0');
       - run: cargo test -- --include-ignored --nocapture
+        env:
+          TEMPORAL_USE_WFT_CHUNKING_V2: ${{ matrix.useWftChunkingV2 || 'false' }}
       - name: Find test executable for cgroup tests
         id: find-cgroup-test
         if: runner.os == 'Linux' && runner.arch == 'X64'
@@ -131,6 +134,7 @@ jobs:
         include:
           - os: windows-latest
           - os: ubuntu-latest
+            useWftChunkingV2: "true"
           - os: ubuntu-arm
             runsOn: ubuntu-24.04-arm64-2-core
           - os: macos-arm
@@ -154,6 +158,8 @@ jobs:
           script: |
             core.exportVariable('RUSTFLAGS', '-Csymbol-mangling-version=v0');
       - run: cargo integ-test
+        env:
+          TEMPORAL_USE_WFT_CHUNKING_V2: ${{ matrix.useWftChunkingV2 || 'false' }}
 
   wasm-workflow-tests:
     name: WASM workflow tests

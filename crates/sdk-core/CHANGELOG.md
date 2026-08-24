@@ -51,6 +51,11 @@ relevant information.
   are preserved on failure; workers warn when the server does not advertise support.
 
 ### Fixed
+* Added opt-in Workflow Task chunking v2 to prevent replay boundary divergence around Updates and
+  heartbeat tasks. The writer is disabled by default, is enabled with
+  `TEMPORAL_USE_WFT_CHUNKING_V2`, requires server SDK metadata support, and must be enabled only
+  after every active, standby, and rollback worker has the v2 reader. Runs whose first successful
+  Workflow Task is already complete remain on v1.
 * Workers now warn when autoscaling task polling encounters errors continuously for one minute.
   Repeated warnings use exponential backoff up to 15-minute intervals and stop after polling
   recovers.

@@ -17,6 +17,7 @@ pub(super) struct RunCache {
     worker_config: Arc<WorkerConfig>,
     sdk_name_and_version: (String, String),
     server_capabilities: get_system_info_response::Capabilities,
+    may_record_wft_chunking_v2: bool,
     /// Run id -> Data
     runs: LruCache<String, ManagedRun>,
     local_activity_request_sink: Option<Rc<dyn LocalActivityRequestSink>>,
@@ -29,6 +30,7 @@ impl RunCache {
         worker_config: Arc<WorkerConfig>,
         sdk_name_and_version: (String, String),
         server_capabilities: get_system_info_response::Capabilities,
+        may_record_wft_chunking_v2: bool,
         local_activity_request_sink: Option<impl LocalActivityRequestSink>,
         metrics: MetricsContext,
     ) -> Self {
@@ -43,6 +45,7 @@ impl RunCache {
             worker_config,
             sdk_name_and_version,
             server_capabilities,
+            may_record_wft_chunking_v2,
             runs: LruCache::new(
                 NonZeroUsize::new(lru_size).expect("LRU size is guaranteed positive"),
             ),
@@ -67,6 +70,8 @@ impl RunCache {
         let metrics = self
             .metrics
             .with_new_attrs([workflow_type(pwft.work.workflow_type.clone())]);
+        let record_wft_chunking_v2 =
+            self.may_record_wft_chunking_v2 && pwft.paginator.should_record_first_wft_flags();
         let (mrh, rur) = ManagedRun::new(
             RunBasics {
                 worker_config: self.worker_config.clone(),
@@ -78,6 +83,7 @@ impl RunCache {
                 capabilities: &self.server_capabilities,
                 sdk_name: &self.sdk_name_and_version.0,
                 sdk_version: &self.sdk_name_and_version.1,
+                record_wft_chunking_v2,
             },
             pwft,
             self.local_activity_request_sink.clone(),

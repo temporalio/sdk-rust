@@ -5,14 +5,14 @@ use crate::{
         WorkflowSlotKind,
         client::WorkerClient,
         workflow::{
-            CacheMissFetchReq, HistoryUpdate, NextPageReq, PermittedWFT,
-            history_update::HistoryPaginator,
+            AutoReplyTask, CacheMissFetchReq, HistoryUpdate, NextPageReq, PermittedWFT,
+            history_update::{HistoryPaginator, WFTChunkingVersionRegistry},
         },
     },
 };
 use futures_util::{FutureExt, Stream, StreamExt, stream, stream::PollNext};
 use std::{future, sync::Arc};
-use temporalio_common::protos::{TaskToken, coresdk::WorkflowSlotInfo};
+use temporalio_common::protos::coresdk::WorkflowSlotInfo;
 use tracing::Span;
 
 /// Transforms incoming validated WFTs and history fetching requests into [PermittedWFT]s ready
@@ -35,7 +35,7 @@ pub(super) enum WFTExtractorOutput {
     FailedFetch {
         run_id: String,
         err: tonic::Status,
-        auto_reply_fail_tt: Option<TaskToken>,
+        auto_reply_fail_task: Option<AutoReplyTask>,
     },
     PollerDead,
 }
@@ -62,17 +62,25 @@ impl WFTExtractor {
         max_fetch_concurrency: usize,
         wft_stream: impl Stream<Item = WFTStreamIn> + Send + 'static,
         fetch_stream: impl Stream<Item = HistoryFetchReq> + Send + 'static,
+        chunking_versions: WFTChunkingVersionRegistry,
     ) -> impl Stream<Item = Result<WFTExtractorOutput, tonic::Status>> + Send + 'static {
         let fetch_client = client.clone();
         let wft_stream = wft_stream
             .map(move |stream_in| {
                 let client = client.clone();
+                let chunking_versions = chunking_versions.clone();
                 async move {
                     match stream_in {
                         Ok((wft, permit)) => {
                             let run_id = wft.workflow_execution.run_id.clone();
-                            let tt = wft.task_token.clone();
-                            Ok(match HistoryPaginator::from_poll(wft, client).await {
+                            let auto_reply_fail_task = if wft.legacy_query.is_some() {
+                                AutoReplyTask::LegacyQuery(wft.task_token.clone())
+                            } else {
+                                AutoReplyTask::Workflow(wft.task_token.clone())
+                            };
+                            let page =
+                                HistoryPaginator::from_poll(wft, client, chunking_versions).await;
+                            Ok(match page {
                                 Ok((pag, prep)) => WFTExtractorOutput::NewWFT(PermittedWFT {
                                     permit: permit.into_used(WorkflowSlotInfo {
                                         workflow_type: prep.workflow_type.clone(),
@@ -84,7 +92,7 @@ impl WFTExtractor {
                                 Err(err) => WFTExtractorOutput::FailedFetch {
                                     run_id,
                                     err,
-                                    auto_reply_fail_tt: Some(tt),
+                                    auto_reply_fail_task: Some(auto_reply_fail_task),
                                 },
                             })
                         }
@@ -111,13 +119,22 @@ impl WFTExtractor {
                         // failure. We'll just proceed with shutdown.
                         HistoryFetchReq::Full(req, rc) => {
                             let run_id = req.original_wft.work.execution.run_id.clone();
-                            let task_token = req.original_wft.work.task_token.clone();
+                            let auto_reply_fail_task = if req
+                                .original_wft
+                                .work
+                                .legacy_query
+                                .is_some()
+                            {
+                                AutoReplyTask::LegacyQuery(req.original_wft.work.task_token.clone())
+                            } else {
+                                AutoReplyTask::Workflow(req.original_wft.work.task_token.clone())
+                            };
                             match HistoryPaginator::from_fetchreq(req, client).await {
                                 Ok(r) => WFTExtractorOutput::FetchResult(r, rc),
                                 Err(err) => WFTExtractorOutput::FailedFetch {
                                     run_id,
                                     err,
-                                    auto_reply_fail_tt: Some(task_token),
+                                    auto_reply_fail_task: Some(auto_reply_fail_task),
                                 },
                             }
                         }
@@ -132,7 +149,7 @@ impl WFTExtractor {
                                 Err(err) => WFTExtractorOutput::FailedFetch {
                                     run_id: req.paginator.run_id,
                                     err,
-                                    auto_reply_fail_tt: None,
+                                    auto_reply_fail_task: None,
                                 },
                             }
                         }

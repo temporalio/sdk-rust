@@ -2,6 +2,7 @@ use crate::{
     MetricsContext,
     abstractions::dbg_panic,
     worker::workflow::{
+        history_update::is_incompatible_history_status,
         managed_run::RunUpdateAct,
         run_cache::RunCache,
         wft_extraction::{HistfetchRC, HistoryFetchReq, WFTExtractorOutput},
@@ -63,6 +64,7 @@ impl WFStream {
     /// manager), which is a quite substantial change.
     pub(super) fn build(
         basics: WorkflowBasics,
+        may_record_wft_chunking_v2: bool,
         wft_stream: impl Stream<Item = Result<WFTExtractorOutput, tonic::Status>> + Send + 'static,
         local_rx: impl Stream<Item = LocalInput> + Send + 'static,
         local_activity_request_sink: Option<impl LocalActivityRequestSink>,
@@ -77,12 +79,18 @@ impl WFStream {
             // Priority always goes to the local stream
             |_: &mut ()| PollNext::Left,
         );
-        Self::build_internal(all_inputs, basics, local_activity_request_sink)
+        Self::build_internal(
+            all_inputs,
+            basics,
+            may_record_wft_chunking_v2,
+            local_activity_request_sink,
+        )
     }
 
     fn build_internal(
         all_inputs: impl Stream<Item = WFStreamInput>,
         basics: WorkflowBasics,
+        may_record_wft_chunking_v2: bool,
         local_activity_request_sink: Option<impl LocalActivityRequestSink>,
     ) -> impl Stream<Item = Result<WFStreamOutput, PollError>> {
         let mut state = WFStream {
@@ -91,6 +99,7 @@ impl WFStream {
                 basics.worker_config.clone(),
                 (basics.sdk_name.clone(), basics.sdk_version.clone()),
                 basics.server_capabilities,
+                may_record_wft_chunking_v2,
                 local_activity_request_sink,
                 basics.metrics.clone(),
             ),
@@ -159,26 +168,44 @@ impl WFStream {
                     WFStreamInput::FailedFetch {
                         run_id,
                         err,
-                        auto_reply_fail_tt,
+                        auto_reply_fail_task,
                     } => {
+                        let incompatible = is_incompatible_history_status(&err);
+                        let cause = if incompatible {
+                            WorkflowTaskFailedCause::NonDeterministicError
+                        } else {
+                            WorkflowTaskFailedCause::WorkflowWorkerUnhandledFailure
+                        };
+                        let reason = if incompatible {
+                            EvictionReason::Nondeterminism
+                        } else {
+                            EvictionReason::PaginationOrHistoryFetch
+                        };
                         let message = format!("Fetching history failed: {err:?}");
-                        if !state.runs.has_run(&run_id)
-                            && let Some(task_token) = auto_reply_fail_tt.clone()
-                        {
+                        let has_run = state.runs.has_run(&run_id);
+                        let reply_now = incompatible || !has_run;
+                        if reply_now && let Some(task) = auto_reply_fail_task.clone() {
                             actions.push(WorkflowStreamAction::FailUnstoredWft {
-                                run_id,
-                                task_token,
-                                cause: WorkflowTaskFailedCause::WorkflowWorkerUnhandledFailure,
-                                failure: ApiFailure::application_failure(message, true).into(),
+                                run_id: run_id.clone(),
+                                task,
+                                cause,
+                                failure: ApiFailure::application_failure(message.clone(), true)
+                                    .into(),
                             });
+                        }
+                        if !has_run {
                             None
                         } else {
                             state
                                 .request_eviction(RequestEvictMsg {
                                     run_id,
                                     message,
-                                    reason: EvictionReason::PaginationOrHistoryFetch,
-                                    auto_reply_fail_tt,
+                                    reason,
+                                    auto_reply_fail_tt: if reply_now {
+                                        None
+                                    } else {
+                                        auto_reply_fail_task.map(AutoReplyTask::into_task_token)
+                                    },
                                 })
                                 .into_run_update_resp()
                         }
@@ -243,6 +270,15 @@ impl WFStream {
         &mut self,
         pwft: PermittedWFT,
     ) -> Result<RunUpdateAct, HistoryFetchReq> {
+        if pwft.paginator.requires_full_history_for_chunking_version() {
+            if !self.runs.has_run(&pwft.work.execution.run_id) {
+                self.metrics.sticky_cache_miss();
+            }
+            return Err(HistoryFetchReq::Full(
+                Box::new(CacheMissFetchReq { original_wft: pwft }),
+                self.history_fetch_refcounter.clone(),
+            ));
+        }
         // If the run already exists, possibly buffer the work and return early if we can't handle
         // it yet.
         let pwft = if let Some(rh) = self.runs.get_mut(&pwft.work.execution.run_id) {
@@ -633,7 +669,7 @@ enum WFStreamInput {
     FailedFetch {
         run_id: String,
         err: tonic::Status,
-        auto_reply_fail_tt: Option<TaskToken>,
+        auto_reply_fail_task: Option<AutoReplyTask>,
     },
 }
 impl From<LocalInput> for WFStreamInput {
@@ -701,7 +737,7 @@ enum ExternalPollerInputs {
     FailedFetch {
         run_id: String,
         err: tonic::Status,
-        auto_reply_fail_tt: Option<TaskToken>,
+        auto_reply_fail_task: Option<AutoReplyTask>,
     },
 }
 impl From<ExternalPollerInputs> for WFStreamInput {
@@ -714,11 +750,11 @@ impl From<ExternalPollerInputs> for WFStreamInput {
             ExternalPollerInputs::FailedFetch {
                 run_id,
                 err,
-                auto_reply_fail_tt,
+                auto_reply_fail_task,
             } => WFStreamInput::FailedFetch {
                 run_id,
                 err,
-                auto_reply_fail_tt,
+                auto_reply_fail_task,
             },
             ExternalPollerInputs::NextPage {
                 paginator,
@@ -751,11 +787,11 @@ impl From<Result<WFTExtractorOutput, tonic::Status>> for ExternalPollerInputs {
             Ok(WFTExtractorOutput::FailedFetch {
                 run_id,
                 err,
-                auto_reply_fail_tt,
+                auto_reply_fail_task,
             }) => ExternalPollerInputs::FailedFetch {
                 run_id,
                 err,
-                auto_reply_fail_tt,
+                auto_reply_fail_task,
             },
             Ok(WFTExtractorOutput::PollerDead) => ExternalPollerInputs::PollerDead,
             Err(e) => ExternalPollerInputs::PollerError(e),
