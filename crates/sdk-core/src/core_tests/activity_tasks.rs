@@ -10,8 +10,8 @@ use crate::{
     worker::{
         PollerBehavior, WorkerVersioningStrategy,
         client::{
-            WorkerClient, WorkerClientBag,
-            mocks::{mock_manual_worker_client, mock_worker_client},
+            MockWorkerClient, WorkerClient, WorkerClientBag,
+            mocks::{DEFAULT_TEST_CAPABILITIES, mock_manual_worker_client, mock_worker_client},
         },
     },
 };
@@ -30,6 +30,7 @@ use std::{
 use temporalio_client::{
     Connection, ConnectionOptions, PayloadErrorLimits, SharedReplaceableClient,
     callback_based::{CallbackBasedGrpcService, GrpcSuccessResponse},
+    worker::ClientWorkerSet,
 };
 use temporalio_common::{
     payload_limits::{LimitClass, LimitSeverity, PayloadLimitViolation},
@@ -37,8 +38,8 @@ use temporalio_common::{
         coresdk::{
             ActivityTaskCompletion,
             activity_result::{
-                ActivityExecutionResult, ActivityResolution, ActivityTaskFailedCause, Success,
-                activity_execution_result, activity_resolution,
+                self as activity_result, ActivityExecutionResult, ActivityResolution,
+                ActivityTaskFailedCause, Success, activity_execution_result, activity_resolution,
             },
             activity_task::{ActivityCancelReason, ActivityTask, Cancel, activity_task},
             workflow_activation::{
@@ -52,8 +53,8 @@ use temporalio_common::{
         },
         temporal::api::{
             command::v1::{ScheduleActivityTaskCommandAttributes, command::Attributes},
-            enums::v1::EventType,
-            failure::v1::failure::FailureInfo,
+            enums::v1::{ApplicationErrorCategory, EventType},
+            failure::v1::{ApplicationFailureInfo, Failure, failure::FailureInfo},
             workflowservice::v1::{
                 GetSystemInfoResponse, PollActivityTaskQueueResponse,
                 RecordActivityTaskHeartbeatRequest, RecordActivityTaskHeartbeatResponse,
@@ -1036,6 +1037,102 @@ async fn oversized_cancel_details_fails_activity() {
         result: Some(ActivityExecutionResult::cancel_from_details(Some(
             vec![1_u8; 1024].into(),
         ))),
+    })
+    .await
+    .unwrap();
+    core.drain_activity_poller_and_shutdown().await;
+}
+
+/// Oversized *final* heartbeat details replace whatever lang reported, so the cause and failure sent
+/// to the server describe the payload-limit violation rather than the activity's own error, and the
+/// oversized details are dropped so the server does not reject the whole request.
+#[tokio::test]
+async fn oversized_final_heartbeat_details_replace_reported_failure() {
+    // Manually created because we need non-default payload error limits, and mockall matches
+    // expectations in creation order, so they cannot be overridden after `mock_worker_client`.
+    // This will no longer be needed if https://github.com/asomers/mockall/issues/283 is implemented.
+    let mut mock_client = MockWorkerClient::new();
+    let workers = Arc::new(ClientWorkerSet::new());
+    mock_client
+        .expect_payload_error_limits()
+        .returning(|| Some(PayloadErrorLimits { blob: 10, memo: 10 }));
+    mock_client
+        .expect_capabilities()
+        .returning(|| Some(*DEFAULT_TEST_CAPABILITIES));
+    mock_client
+        .expect_workers()
+        .returning(move || workers.clone());
+    mock_client.expect_is_mock().returning(|| true);
+    mock_client
+        .expect_shutdown_worker()
+        .returning(|_, _, _, _| Ok(ShutdownWorkerResponse {}));
+    mock_client
+        .expect_sdk_name_and_version()
+        .returning(|| ("test-core".to_string(), "0.0.0".to_string()));
+    mock_client
+        .expect_identity()
+        .returning(|| "test-identity".to_string());
+    mock_client
+        .expect_worker_grouping_key()
+        .returning(Uuid::new_v4);
+    mock_client
+        .expect_worker_instance_key()
+        .returning(Uuid::new_v4);
+    mock_client
+        .expect_set_heartbeat_client_fields()
+        .returning(|_| {});
+    mock_client
+        .expect_record_activity_heartbeat()
+        .returning(|_, _| Ok(RecordActivityTaskHeartbeatResponse::default()));
+    mock_client.expect_fail_activity_task().times(1).returning(
+        |_, cause, failure, last_heartbeat_details| {
+            assert_eq!(cause, ActivityTaskFailedCause::PayloadsTooLarge);
+            assert_payloads_too_large_retryable(&failure);
+            assert!(
+                last_heartbeat_details.is_none(),
+                "oversized details must be dropped"
+            );
+            Ok(RespondActivityTaskFailedResponse::default())
+        },
+    );
+
+    let core = mock_worker(MocksHolder::from_client_with_activities(
+        mock_client,
+        [PollActivityTaskQueueResponse {
+            task_token: vec![1],
+            activity_id: "act1".to_string(),
+            heartbeat_timeout: Some(prost_dur!(from_secs(10))),
+            ..Default::default()
+        }
+        .into()],
+    ));
+
+    let act = core.poll_activity_task().await.unwrap();
+    core.record_activity_heartbeat(ActivityHeartbeat {
+        task_token: act.task_token.clone(),
+        details: vec![vec![0_u8; 1024].into()],
+    });
+    // A benign failure is normally not reported as an execution failure at all; what reaches the
+    // server here is a payload-limit failure instead, which is not benign.
+    core.complete_activity_task(ActivityTaskCompletion {
+        task_token: act.task_token,
+        result: Some(ActivityExecutionResult {
+            status: Some(activity_execution_result::Status::Failed(
+                activity_result::Failure {
+                    failure: Some(Failure {
+                        message: "benign".to_string(),
+                        failure_info: Some(FailureInfo::ApplicationFailureInfo(
+                            ApplicationFailureInfo {
+                                category: ApplicationErrorCategory::Benign as i32,
+                                ..Default::default()
+                            },
+                        )),
+                        ..Default::default()
+                    }),
+                    cause: ActivityTaskFailedCause::ActivityWorkerUnhandledFailure as i32,
+                },
+            )),
+        }),
     })
     .await
     .unwrap();

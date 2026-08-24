@@ -19,15 +19,16 @@ use std::{
     time::Duration,
 };
 use temporalio_client::{
-    Connection, MESSAGE_TOO_LARGE_KEY, NamespacedClient, PayloadErrorLimits,
-    REQUEST_LATENCY_HISTOGRAM_NAME, UntypedQuery, UntypedWorkflow, WorkflowExecutionInfo,
-    WorkflowQueryOptions, WorkflowStartOptions, grpc::WorkflowService,
+    Connection, MESSAGE_TOO_LARGE_KEY, NamespacedClient, REQUEST_LATENCY_HISTOGRAM_NAME,
+    UntypedQuery, UntypedWorkflow, WorkflowExecutionInfo, WorkflowQueryOptions,
+    WorkflowStartOptions, grpc::WorkflowService,
 };
 use temporalio_common::{
     data_converters::RawValue,
+    payload_limits::{LimitClass, LimitSeverity, PayloadLimitViolation},
     protos::{
         coresdk::{
-            ActivityHeartbeat, ActivityTaskCompletion,
+            ActivityTaskCompletion,
             activity_result::{
                 self as activity_result, ActivityExecutionResult, ActivityTaskFailedCause,
                 activity_execution_result,
@@ -44,10 +45,10 @@ use temporalio_common::{
         temporal::api::{
             common::v1::RetryPolicy,
             enums::v1::{
-                ApplicationErrorCategory, NexusHandlerErrorRetryBehavior, WorkflowIdConflictPolicy,
-                WorkflowIdReusePolicy, WorkflowTaskFailedCause,
+                NexusHandlerErrorRetryBehavior, WorkflowIdConflictPolicy, WorkflowIdReusePolicy,
+                WorkflowTaskFailedCause,
             },
-            failure::v1::{ApplicationFailureInfo, Failure, failure},
+            failure::v1::Failure,
             nexus::{
                 self,
                 v1::{
@@ -86,7 +87,7 @@ use temporalio_sdk_core::{
     replay::TestHistoryBuilder,
     test_help::{
         MockPollCfg, MocksHolder, ResponseType, TemporalMeter, WorkerExt, WorkerTestHelpers,
-        build_mock_pollers, mock_worker, mock_worker_client, mock_worker_client_with_error_limits,
+        build_mock_pollers, mock_worker, mock_worker_client,
     },
 };
 use tokio::{
@@ -2197,31 +2198,37 @@ async fn lang_reported_activity_failure_cause_reaches_metric() {
     );
 }
 
-/// Oversized heartbeat details replace whatever lang reported, so the metric must be recorded with
-/// the payload-limit reason even when the lang failure was benign (benign failures are otherwise
-/// not counted at all).
+/// A payload-limit violation detected while reporting an activity result is core's own doing, so it
+/// must reach the metric as its own reason rather than the generic activity one.
 #[tokio::test]
-async fn benign_failure_with_oversized_heartbeat_details_counts_as_payloads_too_large() {
+async fn payloads_too_large_activity_failure_reaches_metric() {
     let (telemopts, addr, _aborter) = prom_metrics(None);
     let rt = CoreRuntime::new_assume_tokio(get_integ_runtime_options(telemopts)).unwrap();
     let meter = rt.telemetry().get_temporal_metric_meter().unwrap();
 
-    let mut mock_client =
-        mock_worker_client_with_error_limits(Some(PayloadErrorLimits { blob: 10, memo: 10 }));
+    let mut mock_client = mock_worker_client();
     mock_client
-        .expect_record_activity_heartbeat()
-        .returning(|_, _| Ok(Default::default()));
-    mock_client.expect_fail_activity_task().times(1).returning(
-        |_, cause, failure, last_heartbeat_details| {
+        .expect_complete_activity_task()
+        .times(1)
+        .returning(|_, _| {
+            let violation = PayloadLimitViolation {
+                path: "result".to_string(),
+                class: LimitClass::Blob,
+                severity: LimitSeverity::Error,
+                size: 1024,
+                limit: 10,
+            };
+            let mut status = tonic::Status::invalid_argument("Payload size limit exceeded");
+            status.set_source(Arc::new(violation));
+            Err(status)
+        });
+    mock_client
+        .expect_fail_activity_task()
+        .times(1)
+        .returning(|_, cause, _, _| {
             assert_eq!(cause, ActivityTaskFailedCause::PayloadsTooLarge);
-            assert!(
-                last_heartbeat_details.is_none(),
-                "oversized details must be dropped"
-            );
-            assert!(failure.is_some(), "failure present");
             Ok(Default::default())
-        },
-    );
+        });
 
     let mut mock = MocksHolder::from_client_with_activities(
         mock_client,
@@ -2229,7 +2236,6 @@ async fn benign_failure_with_oversized_heartbeat_details_counts_as_payloads_too_
             task_token: vec![1],
             activity_id: "act1".to_string(),
             activity_type: Some("act_type".into()),
-            heartbeat_timeout: Some(prost_dur!(from_secs(10))),
             ..Default::default()
         }
         .into()],
@@ -2238,29 +2244,9 @@ async fn benign_failure_with_oversized_heartbeat_details_counts_as_payloads_too_
     let core = mock_worker(mock);
 
     let act = core.poll_activity_task().await.unwrap();
-    core.record_activity_heartbeat(ActivityHeartbeat {
-        task_token: act.task_token.clone(),
-        details: vec![vec![0_u8; 1024].into()],
-    });
     core.complete_activity_task(ActivityTaskCompletion {
         task_token: act.task_token,
-        result: Some(ActivityExecutionResult {
-            status: Some(activity_execution_result::Status::Failed(
-                activity_result::Failure {
-                    failure: Some(Failure {
-                        message: "benign".to_string(),
-                        failure_info: Some(failure::FailureInfo::ApplicationFailureInfo(
-                            ApplicationFailureInfo {
-                                category: ApplicationErrorCategory::Benign as i32,
-                                ..Default::default()
-                            },
-                        )),
-                        ..Default::default()
-                    }),
-                    cause: ActivityTaskFailedCause::ActivityWorkerUnhandledFailure as i32,
-                },
-            )),
-        }),
+        result: Some(ActivityExecutionResult::ok(vec![0_u8; 1024].into())),
     })
     .await
     .unwrap();
