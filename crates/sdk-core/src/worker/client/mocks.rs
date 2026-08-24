@@ -26,6 +26,8 @@ pub fn mock_worker_client() -> MockWorkerClient {
 }
 
 #[cfg(any(feature = "test-utilities", test))]
+/// As [mock_worker_client], reporting the given payload/memo error limits. Mockall matches
+/// expectations in creation order, so limits must be set here rather than overridden afterward.
 pub fn mock_worker_client_with_error_limits(
     error_limits: Option<PayloadErrorLimits>,
 ) -> MockWorkerClient {
