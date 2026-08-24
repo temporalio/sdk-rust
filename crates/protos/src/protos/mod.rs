@@ -746,7 +746,7 @@ pub mod coresdk {
                     Self {
                         status: Some(aer::Status::Failed(Failure {
                             failure: Some(fail),
-                            ..Default::default()
+                            cause: ActivityTaskFailedCause::ActivityWorkerUnhandledFailure as i32,
                         })),
                     }
                 }
@@ -833,7 +833,8 @@ pub mod coresdk {
                             Ok(p) => Some(aer::Status::Completed(Success { result: Some(p) })),
                             Err(f) => Some(aer::Status::Failed(Failure {
                                 failure: Some(f),
-                                ..Default::default()
+                                cause: ActivityTaskFailedCause::ActivityWorkerUnhandledFailure
+                                    as i32,
                             })),
                         },
                     }

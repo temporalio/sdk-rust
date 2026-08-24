@@ -442,7 +442,14 @@ impl WorkerActivityTasks {
                                 Some(make_payloads_too_large_failure(violation)),
                             )
                         } else {
-                            let cause = fail.cause();
+                            // An SDK reporting no cause recognized nothing more specific, which is
+                            // normalized to unhandled failure so all SDKs do not have to specify it.
+                            let cause = match fail.cause() {
+                                ActivityTaskFailedCause::Unspecified => {
+                                    ActivityTaskFailedCause::ActivityWorkerUnhandledFailure
+                                }
+                                c => c,
+                            };
                             if should_record_failure_metric(&fail.failure) {
                                 act_metrics
                                     .with_new_attrs([failure_reason(cause.into())])
