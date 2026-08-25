@@ -50,6 +50,8 @@ relevant information.
   reason, which may affect existing dashboards.
 
 ### Breaking Changes :boom:
+* `IncomingError` is now non-exhaustive. Add a wildcard branch to downstream matches over decoded
+  failures.
 * Values stored in a `MemoValue` must now be `Send + Sync`. It previously held its value in an
   `Rc` and now uses an `Arc`, so that memos can be built outside a workflow and handed to the
   client. Only affects memo values that are themselves non-`Send`/non-`Sync`, such as those

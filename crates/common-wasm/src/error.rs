@@ -522,6 +522,7 @@ impl From<WorkflowSignalError> for OutgoingWorkflowError {
 
 /// A normalized incoming Temporal failure decoded from a protobuf [`Failure`].
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum IncomingError {
     /// A decoded application failure.
     Application(ApplicationFailure),
