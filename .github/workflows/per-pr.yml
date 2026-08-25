@@ -171,7 +171,7 @@ jobs:
       - run: cargo integ-test -t wasm_workflow_tests -- --test-threads 1
 
   cloud-tests:
-    if: github.event.pull_request.head.repo.full_name == '' || github.event.pull_request.head.repo.full_name == 'temporalio/sdk-rust'
+    if: (github.event.pull_request.head.repo.full_name == '' || github.event.pull_request.head.repo.full_name == 'temporalio/sdk-rust') && github.actor != 'dependabot[bot]'
     name: Cloud tests
     env:
       TEMPORAL_CLOUD_ADDRESS: https://${{ vars.TEMPORAL_CLIENT_NAMESPACE }}.tmprl.cloud:7233
