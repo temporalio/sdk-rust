@@ -50,6 +50,8 @@ relevant information.
   reason, which may affect existing dashboards.
 
 ### Breaking Changes :boom:
+* Removed the unused `ActExitValue` type. Use `ActivityError::WillCompleteAsync` to mark an
+  activity for asynchronous completion.
 * `IncomingError` is now non-exhaustive. Add a wildcard branch to downstream matches over decoded
   failures.
 * Rust SDK environment configuration values (`DataSource`, `ClientConfig`, and related profile,

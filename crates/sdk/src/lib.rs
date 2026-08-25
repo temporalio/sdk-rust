@@ -137,7 +137,7 @@ use temporalio_common::{
     protos::{
         TaskToken,
         coresdk::{
-            ActivityTaskCompletion, AsJsonPayloadExt,
+            ActivityTaskCompletion,
             activity_result::ActivityExecutionResult,
             activity_task::{ActivityTask, activity_task},
             workflow_activation::{WorkflowActivation, workflow_activation_job::Variant},
@@ -1448,21 +1448,6 @@ impl ActivityHalf {
             }
         }
         Ok(())
-    }
-}
-
-/// Activity functions may return these values when exiting
-#[derive(Debug)]
-pub enum ActExitValue<T> {
-    /// Completion requires an asynchronous callback
-    WillCompleteAsync,
-    /// Finish with a result
-    Normal(T),
-}
-
-impl<T: AsJsonPayloadExt> From<T> for ActExitValue<T> {
-    fn from(t: T) -> Self {
-        Self::Normal(t)
     }
 }
 
