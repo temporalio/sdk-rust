@@ -54,6 +54,8 @@ relevant information.
   are preserved on failure; workers warn when the server does not advertise support.
 
 ### Fixed
+* The Prometheus exporter now appends `_total` to counter metric names when an SDK enables the
+  counter suffix option.
 * An activity failure caused by oversized final heartbeat details is now counted in the
   `temporal_activity_execution_failed` metric as `failure_reason="PayloadsTooLarge"`. Previously it
   was counted under the reason for the failure the activity itself reported, and was not counted at

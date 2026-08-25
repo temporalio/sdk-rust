@@ -61,6 +61,8 @@ relevant information.
   `WorkflowStartOptions::start_signal` and `WorkflowStartSignal`.
 
 ### Fixed
+* The Prometheus exporter now respects `PrometheusExporterOptions::counters_total_suffix`,
+  appending `_total` to counter metric names when enabled.
 * An activity failure caused by oversized final heartbeat details is now counted in the
   `temporal_activity_execution_failed` metric as `failure_reason="PayloadsTooLarge"`. Previously it
   was counted under the reason for the failure the activity itself reported, and was not counted at
