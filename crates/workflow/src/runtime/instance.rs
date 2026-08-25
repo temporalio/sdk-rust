@@ -541,6 +541,7 @@ where
         &mut self,
         signal: SignalWorkflow,
     ) -> Result<ActivationJobResult, WorkflowFailure> {
+        let originating_event_id = signal.originating_event_id;
         let name = signal.signal_name;
         let payloads = Payloads {
             payloads: signal.input,
@@ -551,8 +552,12 @@ where
                 let input = HandleSignalInput::new(name.clone(), input, signal.headers);
                 let handler_execution = self.base_ctx.track_handler();
                 let mut future = intercepted_signal_future::<W>(
-                    self.ctx.clone(),
-                    self.base_ctx.clone(),
+                    self.ctx
+                        .clone()
+                        .with_implicit_inbound_event(originating_event_id),
+                    self.base_ctx
+                        .clone()
+                        .with_implicit_inbound_event(originating_event_id),
                     self.interceptors.clone(),
                     input,
                     handler_execution,
@@ -658,8 +663,10 @@ where
                 let handler_execution =
                     handler_execution.unwrap_or_else(|| self.base_ctx.track_handler());
                 let mut future = intercepted_update_future::<W>(
-                    self.ctx.clone(),
-                    self.base_ctx.clone(),
+                    self.ctx.clone().with_implicit_inbound_update(id.clone()),
+                    self.base_ctx
+                        .clone()
+                        .with_implicit_inbound_update(id.clone()),
                     self.interceptors.clone(),
                     input,
                     handler_execution,

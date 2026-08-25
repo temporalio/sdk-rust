@@ -1,6 +1,8 @@
 use std::{collections::HashMap, time::Duration};
 
-use crate::{MemoValues, WorkflowCancellationToken, runtime::types::ContinueAsNewRequest};
+use crate::{
+    EventGroup, MemoValues, WorkflowCancellationToken, runtime::types::ContinueAsNewRequest,
+};
 use temporalio_common_wasm::{
     ActivityCloseTimeouts, Priority, RetryPolicy,
     data_converters::{
@@ -323,13 +325,14 @@ pub struct ActivityOptions {
     /// If true, disable eager execution for this activity
     #[builder(default)]
     pub do_not_eagerly_execute: bool,
-    /// Event group markers to attach to the resulting `ScheduleActivityTask` command.
+    /// Event Groups to attach to the resulting schedule-activity command, in addition to any
+    /// groups from the enclosing Event Group scope.
     ///
-    /// **Unstable:** Event Groups are not yet implemented in the Rust SDK; this field exists
-    /// only for internal test purposes. This API *will* change.
-    #[doc(hidden)]
+    /// # Experimental
+    ///
+    /// Event Groups is an experimental API and may change without notice.
     #[builder(default)]
-    pub event_group_markers: Vec<EventGroupMarker>,
+    pub event_groups: Vec<EventGroup>,
 }
 
 impl ActivityOptions {
@@ -397,7 +400,7 @@ impl ActivityOptions {
             }),
             self.summary,
             None,
-            self.event_group_markers,
+            EventGroup::to_markers(self.event_groups),
         )
     }
 }
@@ -445,13 +448,14 @@ pub struct LocalActivityOptions {
     pub start_to_close_timeout: Option<Duration>,
     /// Single-line summary for this activity that will appear in UI/CLI.
     pub summary: Option<String>,
-    /// Event group markers to attach to the resulting `RecordMarker` command.
+    /// Event Groups to attach to the resulting local-activity command, in addition to any groups
+    /// from the enclosing Event Group scope.
     ///
-    /// **Unstable:** Event Groups are not yet implemented in the Rust SDK; this field exists
-    /// only for internal test purposes. This API *will* change.
-    #[doc(hidden)]
+    /// # Experimental
+    ///
+    /// Event Groups is an experimental API and may change without notice.
     #[builder(default)]
-    pub event_group_markers: Vec<EventGroupMarker>,
+    pub event_groups: Vec<EventGroup>,
 }
 
 impl Default for LocalActivityOptions {
@@ -498,7 +502,7 @@ impl LocalActivityOptions {
             }),
             self.summary,
             None,
-            self.event_group_markers,
+            EventGroup::to_markers(self.event_groups),
         )
     }
 }
@@ -540,13 +544,14 @@ pub struct ChildWorkflowOptions {
     pub search_attributes: Option<SearchAttributes>,
     /// Priority for the workflow
     pub priority: Option<Priority>,
-    /// Event group markers to attach to the resulting `StartChildWorkflowExecution` command.
+    /// Event Groups to attach to the resulting start-child-workflow command, in addition to any
+    /// groups from the enclosing Event Group scope.
     ///
-    /// **Unstable:** Event Groups are not yet implemented in the Rust SDK; this field exists
-    /// only for internal test purposes. This API *will* change.
-    #[doc(hidden)]
+    /// # Experimental
+    ///
+    /// Event Groups is an experimental API and may change without notice.
     #[builder(default)]
-    pub event_group_markers: Vec<EventGroupMarker>,
+    pub event_groups: Vec<EventGroup>,
 }
 
 impl ChildWorkflowOptions {
@@ -599,7 +604,7 @@ impl ChildWorkflowOptions {
             }),
             self.static_summary,
             self.static_details,
-            self.event_group_markers,
+            EventGroup::to_markers(self.event_groups),
         )
     }
 }
@@ -615,13 +620,14 @@ pub struct TimerOptions {
     pub cancellation_token: Option<WorkflowCancellationToken>,
     /// Summary of the timer
     pub summary: Option<String>,
-    /// Event group markers to attach to the resulting `StartTimer` command.
+    /// Event Groups to attach to the resulting start-timer command, in addition to any groups from
+    /// the enclosing Event Group scope.
     ///
-    /// **Unstable:** Event Groups are not yet implemented in the Rust SDK; this field exists
-    /// only for internal test purposes. This API *will* change.
-    #[doc(hidden)]
+    /// # Experimental
+    ///
+    /// Event Groups is an experimental API and may change without notice.
     #[builder(default)]
-    pub event_group_markers: Vec<EventGroupMarker>,
+    pub event_groups: Vec<EventGroup>,
 }
 
 impl Default for TimerOptions {
@@ -652,7 +658,7 @@ impl TimerOptions {
             }),
             self.summary,
             None,
-            self.event_group_markers,
+            EventGroup::to_markers(self.event_groups),
         )
     }
 }
@@ -673,13 +679,14 @@ pub struct SignalWorkflowOptions {
     pub cancellation_token: Option<WorkflowCancellationToken>,
     /// Single-line summary for this signal that will appear in UI/CLI.
     pub summary: Option<String>,
-    /// Event group markers to attach to the resulting `SignalExternalWorkflowExecution` command.
+    /// Event Groups to attach to the resulting signal-external-workflow command, in addition to any
+    /// groups from the enclosing Event Group scope.
     ///
-    /// **Unstable:** Event Groups are not yet implemented in the Rust SDK; this field exists
-    /// only for internal test purposes. This API *will* change.
-    #[doc(hidden)]
+    /// # Experimental
+    ///
+    /// Event Groups is an experimental API and may change without notice.
     #[builder(default)]
-    pub event_group_markers: Vec<EventGroupMarker>,
+    pub event_groups: Vec<EventGroup>,
 }
 
 impl SignalWorkflowOptions {
@@ -703,7 +710,7 @@ impl SignalWorkflowOptions {
             ),
             self.summary,
             None,
-            self.event_group_markers,
+            EventGroup::to_markers(self.event_groups),
         )
     }
 }
@@ -753,33 +760,45 @@ pub struct NexusOperationOptions {
     /// Only applies to asynchronous operations. Synchronous operations ignore this timeout.
     /// If not set or zero, no start-to-close timeout is enforced.
     pub start_to_close_timeout: Option<Duration>,
+    /// Event Groups to attach to the resulting schedule-nexus-operation command, in addition to
+    /// any groups from the enclosing Event Group scope.
+    ///
+    /// # Experimental
+    ///
+    /// Event Groups is an experimental API and may change without notice.
+    #[builder(default)]
+    pub event_groups: Vec<EventGroup>,
 }
 
 impl NexusOperationOptions {
     pub(crate) fn into_command(self, seq: u32) -> WorkflowCommand {
-        workflow_command::Variant::ScheduleNexusOperation(ScheduleNexusOperation {
-            seq,
-            endpoint: self.endpoint,
-            service: self.service,
-            operation: self.operation,
-            input: self.input,
-            schedule_to_close_timeout: self
-                .schedule_to_close_timeout
-                .and_then(|duration| duration.try_into().ok()),
-            schedule_to_start_timeout: self
-                .schedule_to_start_timeout
-                .and_then(|duration| duration.try_into().ok()),
-            start_to_close_timeout: self
-                .start_to_close_timeout
-                .and_then(|duration| duration.try_into().ok()),
-            nexus_header: self.nexus_header,
-            cancellation_type: ProtoNexusOperationCancellationType::from(
-                self.cancellation_type
-                    .unwrap_or(NexusOperationCancellationType::WaitCancellationCompleted),
-            )
-            .into(),
-        })
-        .into()
+        command_with_metadata(
+            workflow_command::Variant::ScheduleNexusOperation(ScheduleNexusOperation {
+                seq,
+                endpoint: self.endpoint,
+                service: self.service,
+                operation: self.operation,
+                input: self.input,
+                schedule_to_close_timeout: self
+                    .schedule_to_close_timeout
+                    .and_then(|duration| duration.try_into().ok()),
+                schedule_to_start_timeout: self
+                    .schedule_to_start_timeout
+                    .and_then(|duration| duration.try_into().ok()),
+                start_to_close_timeout: self
+                    .start_to_close_timeout
+                    .and_then(|duration| duration.try_into().ok()),
+                nexus_header: self.nexus_header,
+                cancellation_type: ProtoNexusOperationCancellationType::from(
+                    self.cancellation_type
+                        .unwrap_or(NexusOperationCancellationType::WaitCancellationCompleted),
+                )
+                .into(),
+            }),
+            None,
+            None,
+            EventGroup::to_markers(self.event_groups),
+        )
     }
 }
 

@@ -17,6 +17,7 @@ pub mod __private {
 mod cancellation;
 #[doc(hidden)]
 pub mod component;
+mod event_groups;
 #[doc(hidden)]
 pub mod runtime;
 mod workflow_context;
@@ -24,6 +25,7 @@ pub mod workflow_interceptors;
 pub mod workflows;
 
 pub use cancellation::{WorkflowCancellationError, WorkflowCancellationToken};
+pub use event_groups::EventGroup;
 #[doc(hidden)]
 pub use runtime::model::{CancellableID, UnblockEvent};
 pub use runtime::model::{TimerResult, WorkflowResult, WorkflowTermination};

@@ -147,6 +147,7 @@ version = "0.7"
 
 [dev-dependencies]
 assert_matches = "1.5"
+sha1 = { version = "0.10", default-features = false }
 bimap = "0.6.3"
 bytes = "1.10"
 clap = { version = "4.5", features = ["derive"] }

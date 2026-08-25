@@ -34,9 +34,10 @@ relevant information.
 ## Unreleased
 
 ### Added
-* `WorkflowContext::all_handlers_finished` and `SyncWorkflowContext::all_handlers_finished` let
-  Rust workflows wait for active signal and update handler chains before completing or continuing
-  as new.
+* Experimental Event Groups APIs: `EventGroup`, `WorkflowContext::create_event_group`,
+  `with_event_group` / `with_event_groups`, and `event_groups` on timer, activity, local
+  activity, child workflow, signal-external, and Nexus operation options. Signal and update
+  handlers automatically attach an implicit inbound group. This API may change without notice.
 * `WorkflowStartOptions::memo` attaches a non-indexed memo when starting a workflow, using the
   same `MemoValues` type already used by continue-as-new and `WorkflowContext::upsert_memo`.
   Values are serialized with the client's payload converter and codec, matching how `describe`
