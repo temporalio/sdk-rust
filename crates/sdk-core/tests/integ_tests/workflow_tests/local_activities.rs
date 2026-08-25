@@ -1,7 +1,7 @@
 use crate::common::{
-    ActivationAssertionsInterceptor, CoreWfStarter, WorkflowHandleExt,
-    activity_functions::StdActivities, history_from_proto_binary, init_core_replay_preloaded,
-    workflows::LaProblemWorkflow,
+    ActivationAssertionsInterceptor, CoreWfStarter, FailOnNondeterminismInterceptor,
+    WorkflowHandleExt, activity_functions::StdActivities, history_from_proto_binary,
+    init_core_replay_preloaded, workflows::LaProblemWorkflow,
 };
 use anyhow::anyhow;
 use crossbeam_queue::SegQueue;
@@ -56,7 +56,7 @@ use temporalio_sdk::{
     CancellableFuture, LocalActivityOptions, TimeoutType, Worker, WorkflowContext,
     WorkflowContextView, WorkflowResult,
     activities::{ActivityContext, ActivityError},
-    interceptors::{FailOnNondeterminismInterceptor, WorkerInterceptor},
+    interceptors::WorkerInterceptor,
 };
 use temporalio_sdk_core::{
     PollError, TunerHolder, prost_dur,

@@ -41,7 +41,7 @@ use temporalio_common::{
     data_converters::{DataConverter, RawValue},
     protos::{
         coresdk::{
-            workflow_activation::WorkflowActivation,
+            workflow_activation::{WorkflowActivation, remove_from_cache::EvictionReason},
             workflow_completion::WorkflowActivationCompletion,
         },
         temporal::api::{
@@ -56,9 +56,7 @@ use temporalio_common::{
 };
 use temporalio_sdk::{
     Worker, WorkerOptions,
-    interceptors::{
-        FailOnNondeterminismInterceptor, ReturnWorkflowExitValueInterceptor, WorkerInterceptor,
-    },
+    interceptors::{ReturnWorkflowExitValueInterceptor, WorkerInterceptor},
 };
 #[cfg(any(feature = "test-utilities", test))]
 pub(crate) use temporalio_sdk_core::test_help::NAMESPACE;
@@ -103,6 +101,25 @@ static ENV_CONFIG_CLIENT_CONFIG: LazyLock<(ConnectionOptions, String)> = LazyLoc
     connection_options.identity = INTEG_CLIENT_IDENTITY.to_string();
     (connection_options, client_options.namespace)
 });
+
+/// Causes test workers to fail immediately when Core evicts a workflow for nondeterminism.
+pub(crate) struct FailOnNondeterminismInterceptor {}
+
+#[async_trait::async_trait(?Send)]
+impl WorkerInterceptor for FailOnNondeterminismInterceptor {
+    async fn on_workflow_activation(
+        &self,
+        activation: &WorkflowActivation,
+    ) -> Result<(), anyhow::Error> {
+        if matches!(
+            activation.eviction_reason(),
+            Some(EvictionReason::Nondeterminism)
+        ) {
+            bail!("Workflow is being evicted because of nondeterminism! {activation}");
+        }
+        Ok(())
+    }
+}
 
 /// Create a worker instance which will use the provided test name to base the task queue and wf id
 /// upon. Returns the instance.
