@@ -38,7 +38,7 @@ tokio-util = { version = "0.7" }
 tokio-stream = { version = "0.1", default-features = false }
 tracing = "0.1"
 uuid = { version = "1.18", default-features = false, features = ["v4"] }
-wasmtime = { version = "44", optional = true, features = ["component-model"] }
+wasmtime = { version = "47", optional = true, features = ["component-model"] }
 url = { version = "2.5", optional = true }
 
 [dependencies.temporalio-sdk-core]
