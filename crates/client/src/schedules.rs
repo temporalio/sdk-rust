@@ -214,6 +214,7 @@ impl ScheduleAction {
 /// set here will use their proto defaults on the server.
 #[derive(Debug, Clone, Default, PartialEq, bon::Builder)]
 #[builder(on(String, into))]
+#[non_exhaustive]
 pub struct ScheduleSpec {
     /// Interval-based triggers (e.g., every 1 hour).
     #[builder(default)]
@@ -766,6 +767,7 @@ impl ScheduleDescription {
 
 /// Controls what happens when a scheduled workflow would overlap with a running one.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ScheduleOverlapPolicy {
     /// Use the server default (currently Skip).
     #[default]

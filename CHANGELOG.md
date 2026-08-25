@@ -56,6 +56,9 @@ relevant information.
   TLS, codec, and profile-loading-option types) are now client-owned and non-exhaustive. Use the
   new `bon` builders to construct client configuration structs, and add a wildcard branch when
   matching `DataSource`.
+* `ScheduleSpec` and `ScheduleOverlapPolicy` are now non-exhaustive. Use
+  `ScheduleSpec::builder()` to construct schedule specifications and add a wildcard branch when
+  matching overlap policies.
 * Values stored in a `MemoValue` must now be `Send + Sync`. It previously held its value in an
   `Rc` and now uses an `Arc`, so that memos can be built outside a workflow and handed to the
   client. Only affects memo values that are themselves non-`Send`/non-`Sync`, such as those
