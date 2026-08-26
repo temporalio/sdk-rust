@@ -32,7 +32,7 @@ use std::{
     future,
     sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::{Duration, Instant, SystemTime},
 };
@@ -176,8 +176,15 @@ pub(crate) struct WorkerActivityTasks {
     max_heartbeat_throttle_interval: Duration,
     default_heartbeat_throttle_interval: Duration,
 
-    /// Wakes every time an activity is removed from the outstanding map
+    /// Wakes every time a completion finishes releasing an activity's resources
     complete_notify: Arc<Notify>,
+    /// Completions which have already taken their task out of `outstanding_activity_tasks` but
+    /// are still flushing the result to server. Such a completion still owns the activity's slot
+    /// permit, so shutdown must not treat the empty map as "all activities finished" while this
+    /// is nonzero — otherwise the heartbeat manager can be torn down out from under an in-flight
+    /// eviction (stranding it forever) and worker shutdown can proceed while the result was
+    /// never reported.
+    completions_in_flight: Arc<AtomicUsize>,
     /// Token to notify when poll returned a shutdown error
     poll_returned_shutdown_token: CancellationToken,
     /// Used to inject external cancellations (e.g. from nexus worker commands)
@@ -220,6 +227,7 @@ impl WorkerActivityTasks {
         let external_cancels_tx = cancels_tx.clone();
         let heartbeat_manager = ActivityHeartbeatManager::new(client, cancels_tx.clone());
         let complete_notify = Arc::new(Notify::new());
+        let completions_in_flight = Arc::new(AtomicUsize::new(0));
         let source_stream = stream::select_with_strategy(
             UnboundedReceiverStream::new(cancels_rx).map(ActivityTaskSource::from),
             starts_stream.map(|a| ActivityTaskSource::from(Box::new(a))),
@@ -231,6 +239,7 @@ impl WorkerActivityTasks {
             outstanding_tasks: outstanding_activity_tasks.clone(),
             start_tasks_stream_complete,
             complete_notify: complete_notify.clone(),
+            completions_in_flight: completions_in_flight.clone(),
             grace_period: graceful_shutdown,
             cancels_tx,
             local_timeout_buffer,
@@ -246,6 +255,7 @@ impl WorkerActivityTasks {
             activity_task_stream: Mutex::new(activity_task_stream.boxed()),
             eager_activities_semaphore,
             complete_notify,
+            completions_in_flight,
             metrics,
             max_heartbeat_throttle_interval,
             default_heartbeat_throttle_interval,
@@ -334,6 +344,14 @@ impl WorkerActivityTasks {
         status: aer::Status,
         client: &dyn WorkerClient,
     ) {
+        // Registered before taking the task out of the outstanding map so shutdown can never
+        // observe the map empty without also seeing this completion in flight. Declared first so
+        // it drops after `act_info` — and thus after the slot permit — even if this future is
+        // cancelled or panics mid-completion.
+        let _completion_guard = InFlightCompletionGuard::new(
+            self.completions_in_flight.clone(),
+            self.complete_notify.clone(),
+        );
         let act_info = {
             let mut outstanding_activity_tasks = self.outstanding_activity_tasks.lock();
             outstanding_activity_tasks.remove(&task_token)
@@ -487,8 +505,6 @@ impl WorkerActivityTasks {
                 &task_token
             );
         }
-
-        self.complete_notify.notify_waiters();
     }
 
     /// Attempt to record an activity heartbeat
@@ -562,11 +578,38 @@ impl WorkerActivityTasks {
     }
 }
 
+/// Holds a completion's spot in [WorkerActivityTasks::completions_in_flight] from before its task
+/// leaves the outstanding map until every resource it owns (notably the slot permit) is released.
+/// A guard rather than a manual decrement so cancellation or a panic mid-completion can't leave
+/// shutdown waiting forever.
+struct InFlightCompletionGuard {
+    completions_in_flight: Arc<AtomicUsize>,
+    complete_notify: Arc<Notify>,
+}
+
+impl InFlightCompletionGuard {
+    fn new(completions_in_flight: Arc<AtomicUsize>, complete_notify: Arc<Notify>) -> Self {
+        completions_in_flight.fetch_add(1, Ordering::SeqCst);
+        Self {
+            completions_in_flight,
+            complete_notify,
+        }
+    }
+}
+
+impl Drop for InFlightCompletionGuard {
+    fn drop(&mut self) {
+        self.completions_in_flight.fetch_sub(1, Ordering::SeqCst);
+        self.complete_notify.notify_waiters();
+    }
+}
+
 struct ActivityTaskStream<SrcStrm> {
     source_stream: SrcStrm,
     outstanding_tasks: OutstandingActMap,
     start_tasks_stream_complete: CancellationToken,
     complete_notify: Arc<Notify>,
+    completions_in_flight: Arc<AtomicUsize>,
     grace_period: Option<Duration>,
     cancels_tx: UnboundedSender<PendingActivityCancel>,
     /// The extra time we'll wait for local timeouts before firing them, to avoid racing with server
@@ -745,11 +788,23 @@ where
                 join!(
                     async {
                         self.start_tasks_stream_complete.cancelled().await;
-                        while {
-                            let outstanding_tasks = outstanding_tasks_clone.lock();
-                            !outstanding_tasks.is_empty()
-                        } {
-                            self.complete_notify.notified().await
+                        let mut notified = std::pin::pin!(self.complete_notify.notified());
+                        loop {
+                            // Arm the waiter before checking, since `notify_waiters` only reaches
+                            // already-registered waiters — a completion finishing between the
+                            // check and the await must not be missed, or shutdown would hang.
+                            notified.as_mut().enable();
+                            let no_outstanding = outstanding_tasks_clone.lock().is_empty();
+                            // An empty map alone isn't "all activities finished": completions
+                            // flushing to server have already left the map but still hold their
+                            // slot permit, and still need the heartbeat manager alive.
+                            if no_outstanding
+                                && self.completions_in_flight.load(Ordering::SeqCst) == 0
+                            {
+                                break;
+                            }
+                            notified.as_mut().await;
+                            notified.set(self.complete_notify.notified());
                         }
                         // If we were waiting for the grace period but everything already finished,
                         // we don't need to keep waiting.
@@ -920,15 +975,25 @@ mod tests {
     use super::*;
     use crate::{
         abstractions::tests::fixed_size_permit_dealer,
+        advance_fut,
         pollers::{ActivityTaskOptions, LongPollBuffer},
         prost_dur,
         worker::{
             NamespaceCapabilities, PollerBehavior,
-            client::{MockWorkerClient, mocks::mock_worker_client},
+            client::{
+                MockWorkerClient,
+                mocks::{mock_manual_worker_client, mock_worker_client},
+            },
         },
     };
     use crossbeam_utils::atomic::AtomicCell;
-    use temporalio_common::protos::coresdk::activity_result::ActivityExecutionResult;
+    use futures_util::FutureExt;
+    use temporalio_common::protos::{
+        coresdk::activity_result::ActivityExecutionResult,
+        temporal::api::workflowservice::v1::{
+            RecordActivityTaskHeartbeatResponse, RespondActivityTaskFailedResponse,
+        },
+    };
 
     fn build_local_timeout_test_atm(
         mock_client: Arc<MockWorkerClient>,
@@ -1270,5 +1335,122 @@ mod tests {
         atm.initiate_shutdown();
         assert_matches!(atm.poll().await.unwrap_err(), PollError::ShutDown);
         atm.shutdown().await;
+    }
+
+    // Regression test for a shutdown race: a completion takes its task out of the outstanding
+    // map before flushing the result to server, while still owning the activity's slot permit.
+    // If the last heartbeat's RPC is still in flight, the completion parks inside heartbeat
+    // eviction with the map already empty. Shutdown used to treat the empty map as fully
+    // drained and tear down the heartbeat manager, which dropped the pending eviction ack —
+    // stranding the completion forever, with the failure never reported and the slot permit
+    // never released.
+    #[tokio::test]
+    async fn shutdown_waits_for_completions_still_flushing_their_result() {
+        let hb_rpc_entered = Arc::new(Notify::new());
+        let hb_rpc_release = Arc::new(Notify::new());
+        let fail_reported = Arc::new(AtomicBool::new(false));
+
+        let mut mock_client = mock_manual_worker_client();
+        mock_client
+            .expect_poll_activity_task()
+            .times(1)
+            .returning(move |_, _| {
+                async {
+                    Ok(PollActivityTaskQueueResponse {
+                        task_token: vec![1],
+                        activity_id: "act1".to_string(),
+                        heartbeat_timeout: Some(prost_dur!(from_secs(100))),
+                        ..Default::default()
+                    })
+                }
+                .boxed()
+            });
+        mock_client
+            .expect_poll_activity_task()
+            .returning(|_, _| future::pending().boxed());
+        let hb_rpc_entered_clone = hb_rpc_entered.clone();
+        let hb_rpc_release_clone = hb_rpc_release.clone();
+        mock_client
+            .expect_record_activity_heartbeat()
+            .times(1)
+            .returning(move |_, _| {
+                let entered = hb_rpc_entered_clone.clone();
+                let release = hb_rpc_release_clone.clone();
+                async move {
+                    entered.notify_one();
+                    release.notified().await;
+                    Ok(RecordActivityTaskHeartbeatResponse::default())
+                }
+                .boxed()
+            });
+        let fail_reported_clone = fail_reported.clone();
+        mock_client
+            .expect_fail_activity_task()
+            .times(1)
+            .returning(move |_, _, _| {
+                fail_reported_clone.store(true, Ordering::SeqCst);
+                async { Ok(RespondActivityTaskFailedResponse::default()) }.boxed()
+            });
+        let mock_client = Arc::new(mock_client);
+
+        let sem = fixed_size_permit_dealer(1);
+        let ap = LongPollBuffer::new_activity_task(
+            mock_client.clone(),
+            "tq".to_string(),
+            PollerBehavior::SimpleMaximum(1),
+            sem.clone(),
+            CancellationToken::new(),
+            None::<fn(usize)>,
+            ActivityTaskOptions {
+                max_worker_acts_per_second: None,
+                max_tps: None,
+            },
+            Arc::new(AtomicCell::new(None)),
+            Arc::new(NamespaceCapabilities::default()),
+        );
+        let atm = WorkerActivityTasks::new(
+            sem,
+            Box::new(ap),
+            mock_client.clone(),
+            MetricsContext::no_op(),
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+            None,
+            Duration::from_secs(1),
+        );
+
+        let task = atm.poll().await.unwrap();
+        atm.record_heartbeat(ActivityHeartbeat {
+            task_token: task.task_token.clone(),
+            details: vec![],
+        })
+        .unwrap();
+        // Only complete once the heartbeat RPC is in flight, so the completion's eviction is
+        // parked waiting on it — the window in which shutdown used to slip through.
+        hb_rpc_entered.notified().await;
+
+        join!(
+            atm.complete(
+                TaskToken(task.task_token.clone()),
+                ActivityExecutionResult::fail("retry me".into())
+                    .status
+                    .unwrap(),
+                mock_client.as_ref(),
+            ),
+            async {
+                atm.initiate_shutdown();
+                let shutdown_fut = async {
+                    assert_matches!(atm.poll().await.unwrap_err(), PollError::ShutDown);
+                    atm.shutdown().await;
+                };
+                advance_fut!(shutdown_fut);
+                hb_rpc_release.notify_one();
+                shutdown_fut.await;
+                assert!(
+                    fail_reported.load(Ordering::SeqCst),
+                    "shutdown completed before the activity's failure was reported to server"
+                );
+            }
+        );
     }
 }

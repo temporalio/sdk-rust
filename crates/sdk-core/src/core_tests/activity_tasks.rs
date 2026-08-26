@@ -1,5 +1,6 @@
 use crate::{
-    ActivityHeartbeat, CompleteActivityError, Worker, advance_fut, job_assert, prost_dur,
+    ActivityHeartbeat, CompleteActivityError, PollError, Worker, advance_fut, job_assert,
+    prost_dur,
     replay::{TestHistoryBuilder, canned_histories},
     test_help::{
         FakeWfResponses, MockPollCfg, MockWorkerInputs, MocksHolder, QueueResponse, WorkerExt,
@@ -65,7 +66,11 @@ use temporalio_common::{
     },
     worker::WorkerTaskTypes,
 };
-use tokio::{join, sync::oneshot, time::sleep};
+use tokio::{
+    join,
+    sync::{Notify, oneshot},
+    time::sleep,
+};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
@@ -659,6 +664,91 @@ async fn can_heartbeat_acts_during_shutdown() {
     .await
     .unwrap();
     core.drain_activity_poller_and_shutdown().await;
+}
+
+// Worker-level regression test for the shutdown/completion race: an activity is completed while
+// its last heartbeat RPC is still in flight, so the completion has left the outstanding map but
+// is parked in heartbeat eviction, still owning its slot permit. Shutdown must wait for the
+// completion to finish reporting instead of tearing down the heartbeat manager under it (which
+// stranded the completion forever) and then tripping the slot-permit release deadline.
+#[tokio::test]
+async fn worker_shutdown_awaits_activity_completion_flushing_result() {
+    let hb_rpc_entered = Arc::new(Notify::new());
+    let hb_rpc_release = Arc::new(Notify::new());
+    let fail_reported = Arc::new(AtomicBool::new(false));
+
+    let mut mock_client = mock_manual_worker_client();
+    let hb_rpc_entered_clone = hb_rpc_entered.clone();
+    let hb_rpc_release_clone = hb_rpc_release.clone();
+    mock_client
+        .expect_record_activity_heartbeat()
+        .times(1)
+        .returning(move |_, _| {
+            let entered = hb_rpc_entered_clone.clone();
+            let release = hb_rpc_release_clone.clone();
+            async move {
+                entered.notify_one();
+                release.notified().await;
+                Ok(RecordActivityTaskHeartbeatResponse::default())
+            }
+            .boxed()
+        });
+    let fail_reported_clone = fail_reported.clone();
+    mock_client
+        .expect_fail_activity_task()
+        .times(1)
+        .returning(move |_, _, _| {
+            fail_reported_clone.store(true, Ordering::SeqCst);
+            async { Ok(RespondActivityTaskFailedResponse::default()) }.boxed()
+        });
+
+    let core = mock_worker(MocksHolder::from_client_with_activities(
+        mock_client,
+        [PollActivityTaskQueueResponse {
+            task_token: vec![1],
+            activity_id: "act1".to_string(),
+            heartbeat_timeout: Some(prost_dur!(from_secs(100))),
+            ..Default::default()
+        }
+        .into()],
+    ));
+
+    let act = core.poll_activity_task().await.unwrap();
+    core.record_activity_heartbeat(ActivityHeartbeat {
+        task_token: act.task_token.clone(),
+        details: vec![],
+    });
+    // Only complete once the heartbeat RPC is in flight, so the completion's eviction is parked
+    // waiting on it — the window in which shutdown used to slip through.
+    hb_rpc_entered.notified().await;
+
+    join!(
+        async {
+            core.complete_activity_task(ActivityTaskCompletion {
+                task_token: act.task_token.clone(),
+                result: Some(ActivityExecutionResult::fail("retry me".into())),
+            })
+            .await
+            .unwrap();
+        },
+        async {
+            core.initiate_shutdown();
+            let shutdown_fut = async {
+                assert_matches!(
+                    core.poll_activity_task().await.unwrap_err(),
+                    PollError::ShutDown
+                );
+                core.shutdown().await;
+            };
+            advance_fut!(shutdown_fut);
+            hb_rpc_release.notify_one();
+            shutdown_fut.await;
+            assert!(
+                fail_reported.load(Ordering::SeqCst),
+                "worker shutdown completed before the activity's failure was reported to server"
+            );
+        }
+    );
 }
 
 /// Rapid heartbeats are not force-flushed before failure. The failure request carries the latest

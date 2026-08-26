@@ -57,6 +57,14 @@ relevant information.
 * Signal-with-start is now invoked with `Client::signal_with_start_workflow`; remove uses of
   `WorkflowStartOptions::start_signal` and `WorkflowStartSignal`.
 
+### Fixed
+* `Worker` shutdown no longer loses an activity result it was still reporting to the server. If
+  shutdown raced such a completion — most likely while the activity's final heartbeat RPC was
+  still in flight — the worker could strand the completion forever: debug builds panicked with
+  `Waiting for all slot permits to release took too long!`, and release builds logged that error
+  and dropped the result, leaving the server to time the activity out before retrying it.
+  Shutdown now drains in-flight completions first.
+
 ## [0.7.0] - 2026-08-17
 
 ### Added
