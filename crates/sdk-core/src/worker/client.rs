@@ -57,10 +57,16 @@ use uuid::Uuid;
 
 type Result<T, E = tonic::Status> = std::result::Result<T, E>;
 
-/// Maximum encoded size of a single completion page, kept below the ~4 MiB gRPC frame limit (with
-/// headroom for framing not counted while packing commands). This per-page cap is distinct from
-/// the server's namespace-wide limit on the recombined completion size.
-const MAX_WFT_COMPLETION_PAGE_SIZE: usize = 4 * 1024 * 1024 - 256 * 1024;
+/// Maximum encoded size of a single completion page, kept below the ~4 MiB gRPC frame limit. This
+/// per-page cap is distinct from the server's namespace-wide limit on the recombined completion
+/// size.
+///
+/// Pages are packed by summing command body sizes only; the 512 KiB of headroom below 4 MiB absorbs
+/// everything that sum omits: the per-request overhead (task token, identity, namespace) and the
+/// per-command wire framing (a field tag plus a length varint, up to 6 bytes each). At the server's
+/// default per-workflow history-count limit (~51,200 events), worst-case framing is ~300 KiB, so
+/// this headroom covers even a page of many tiny commands and lets us skip per-command accounting.
+const MAX_WFT_COMPLETION_PAGE_SIZE: usize = 4 * 1024 * 1024 - 512 * 1024;
 // Conservative heuristic, not a tuned value: caps the client-side burst (concurrent request bodies
 // and streams); the cost is only extra serial rounds for completions over this many pages.
 const MAX_CONCURRENT_WFT_COMPLETION_PAGES: usize = 3;
@@ -109,18 +115,16 @@ fn paginate_wft_completion(
         intermediate_page: true,
         ..Default::default()
     };
-    let base_len = intermediate_template.encoded_len();
-    // A command is a repeated message entry: a field tag plus a length-delimited body. Six bytes
-    // bounds the tag (1) and the length varint (up to 5) so a packed page stays under the limit.
-    let command_framing = 6;
 
-    // Only commands can be split across pages, so pagination cannot help when there are none, or
-    // when a single command is itself larger than a page.
+    // Pages are packed purely by command body size; MAX_WFT_COMPLETION_PAGE_SIZE reserves headroom
+    // for the per-request and per-command overhead this ignores. Only commands can be split across
+    // pages, so pagination cannot help when there are none, or when a single command alone exceeds
+    // a page.
     if request.commands.is_empty()
         || request
             .commands
             .iter()
-            .any(|c| base_len + c.encoded_len() + command_framing > max_page_bytes)
+            .any(|c| c.encoded_len() > max_page_bytes)
     {
         return WftCompletionPages::Single(request);
     }
@@ -128,15 +132,15 @@ fn paginate_wft_completion(
     let commands = std::mem::take(&mut request.commands);
     let mut intermediate = Vec::new();
     let mut current = Vec::new();
-    let mut current_len = base_len;
+    let mut current_len = 0;
     for command in commands {
-        let command_len = command.encoded_len() + command_framing;
+        let command_len = command.encoded_len();
         if !current.is_empty() && current_len + command_len > max_page_bytes {
             let mut page = intermediate_template.clone();
             page.commands = std::mem::take(&mut current);
             page.page_number = intermediate.len() as i32;
             intermediate.push(page);
-            current_len = base_len;
+            current_len = 0;
         }
         current_len += command_len;
         current.push(command);
