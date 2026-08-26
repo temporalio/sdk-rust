@@ -704,6 +704,9 @@ impl WorkerClient for WorkerClientBag {
                     .buffer_unordered(MAX_CONCURRENT_WFT_COMPLETION_PAGES)
                     .try_collect::<Vec<_>>()
                     .await?;
+                // The final page must be sent only after every intermediate page has been
+                // buffered: it triggers the server-side merge, which requires pages 0..N-1 to all
+                // be present and otherwise returns a buffer-lost error.
                 self.client
                     .clone()
                     .respond_workflow_task_completed(wft_completion_page_request(
