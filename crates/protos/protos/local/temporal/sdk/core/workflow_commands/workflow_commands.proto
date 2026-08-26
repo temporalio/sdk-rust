@@ -148,6 +148,10 @@ message ScheduleLocalActivity {
     // confirmed. Lang should default this to `WAIT_CANCELLATION_COMPLETED`, even though proto
     // will default to `TRY_CANCEL` automatically.
     ActivityCancellationType cancellation_type = 13;
+    // If set, the local activity arguments will be included in the resulting marker under the
+    // `input` key. This is disabled by default to avoid increasing history size unless the lang
+    // SDK explicitly chooses to expose it.
+    bool include_arguments_into_marker = 14;
 }
 
 enum ActivityCancellationType {

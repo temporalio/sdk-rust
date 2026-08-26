@@ -34,6 +34,8 @@ relevant information.
 ## Unreleased
 
 ### Added
+* Language SDKs can opt in to recording local activity arguments in the local activity marker's
+  `input` detail.
 * Core console logs can now be emitted as newline-delimited JSON when an SDK selects the JSON log
   format. Configured log filters continue to apply to JSON output.
 * Workflow completion-as-cancelled commands can now carry details for recording on the terminal

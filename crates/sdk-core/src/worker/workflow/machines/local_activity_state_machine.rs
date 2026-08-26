@@ -32,6 +32,7 @@ use temporalio_common::protos::{
     },
     temporal::api::{
         command::v1::{Command as ProtoCommand, RecordMarkerCommandAttributes, command},
+        common::v1::Payloads,
         enums::v1::{CommandType, EventType, RetryState},
         failure::v1::{Failure, failure::FailureInfo},
     },
@@ -713,20 +714,29 @@ impl WFMachinesAdapter for LocalActivityMachine {
                 }
 
                 if record_marker {
+                    let mut details = build_local_activity_marker_details(
+                        LocalActivityMarkerData {
+                            seq: self.shared_state.attrs.seq,
+                            attempt,
+                            activity_id: self.shared_state.attrs.activity_id.clone(),
+                            activity_type: self.shared_state.attrs.activity_type.clone(),
+                            complete_time: complete_time.map(Into::into),
+                            backoff,
+                            original_schedule_time: original_schedule_time.map(Into::into),
+                        },
+                        maybe_ok_result,
+                    );
+                    if self.shared_state.attrs.include_arguments_into_marker {
+                        details.insert(
+                            "input".to_string(),
+                            Payloads {
+                                payloads: self.shared_state.attrs.arguments.clone(),
+                            },
+                        );
+                    }
                     let marker_data = RecordMarkerCommandAttributes {
                         marker_name: LOCAL_ACTIVITY_MARKER_NAME.to_string(),
-                        details: build_local_activity_marker_details(
-                            LocalActivityMarkerData {
-                                seq: self.shared_state.attrs.seq,
-                                attempt,
-                                activity_id: self.shared_state.attrs.activity_id.clone(),
-                                activity_type: self.shared_state.attrs.activity_type.clone(),
-                                complete_time: complete_time.map(Into::into),
-                                backoff,
-                                original_schedule_time: original_schedule_time.map(Into::into),
-                            },
-                            maybe_ok_result,
-                        ),
+                        details,
                         header: None,
                         failure: maybe_failure,
                     };

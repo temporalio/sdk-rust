@@ -40,7 +40,7 @@ use temporalio_common::{
         },
         temporal::api::{
             command::v1::{RecordMarkerCommandAttributes, command},
-            common::v1::RetryPolicy,
+            common::v1::{Payload, RetryPolicy},
             enums::v1::{
                 CommandType, EventType, TimeoutType as ProtoTimeoutType, WorkflowTaskFailedCause,
             },
@@ -2979,6 +2979,76 @@ async fn one_la_success(#[case] replay: bool, #[case] completes_ok: bool) {
     }
 
     worker.run().await.unwrap();
+}
+
+#[rstest]
+#[case::excluded(false)]
+#[case::included(true)]
+#[tokio::test]
+async fn local_activity_marker_optionally_includes_arguments(#[case] include_arguments: bool) {
+    let mut history = TestHistoryBuilder::default();
+    history.add_by_type(EventType::WorkflowExecutionStarted);
+    history.add_workflow_task_scheduled_and_started();
+
+    let arguments: Vec<Payload> = vec![b"first".into(), b"second".into()];
+    let expected_arguments = arguments.clone();
+    let mut mock_cfg = MockPollCfg::from_hist_builder(history);
+    mock_cfg.make_poll_stream_interminable = true;
+    mock_cfg.completion_asserts_from_expectations(|mut asserts| {
+        asserts.then(move |wft| {
+            assert_eq!(wft.commands.len(), 2);
+            let marker = assert_matches!(
+                wft.commands[0].attributes.as_ref(),
+                Some(command::Attributes::RecordMarkerCommandAttributes(marker)) => marker
+            );
+            let marker_input = marker.details.get("input");
+            if include_arguments {
+                assert_eq!(marker_input.unwrap().payloads, expected_arguments);
+            } else {
+                assert!(marker_input.is_none());
+            }
+            assert_eq!(
+                wft.commands[1].command_type(),
+                CommandType::CompleteWorkflowExecution
+            );
+        });
+    });
+    let core = mock_worker(build_mock_pollers(mock_cfg));
+
+    let activation = core.poll_workflow_activation().await.unwrap();
+    core.complete_workflow_activation(WorkflowActivationCompletion::from_cmd(
+        activation.run_id,
+        ScheduleLocalActivity {
+            seq: 1,
+            activity_id: "1".to_string(),
+            activity_type: "test_act".to_string(),
+            arguments,
+            start_to_close_timeout: Some(prost_dur!(from_secs(30))),
+            include_arguments_into_marker: include_arguments,
+            ..Default::default()
+        }
+        .into(),
+    ))
+    .await
+    .unwrap();
+
+    let activity_task = core.poll_activity_task().await.unwrap();
+    core.complete_activity_task(ActivityTaskCompletion {
+        task_token: activity_task.task_token,
+        result: Some(ActivityExecutionResult::ok(b"result".into())),
+    })
+    .await
+    .unwrap();
+
+    let resolution = core.poll_workflow_activation().await.unwrap();
+    assert_matches!(
+        resolution.jobs.as_slice(),
+        [WorkflowActivationJob {
+            variant: Some(workflow_activation_job::Variant::ResolveActivity(_)),
+        }]
+    );
+    core.complete_execution(&resolution.run_id).await;
+    core.drain_pollers_and_shutdown().await;
 }
 
 #[workflow]
