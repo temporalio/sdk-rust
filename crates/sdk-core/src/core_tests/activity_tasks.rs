@@ -19,6 +19,7 @@ use crate::{
 use futures_util::FutureExt;
 use itertools::Itertools;
 use prost::Message;
+use rstest::rstest;
 use std::{
     collections::{HashMap, HashSet, VecDeque, hash_map::Entry},
     future,
@@ -666,40 +667,66 @@ async fn can_heartbeat_acts_during_shutdown() {
     core.drain_activity_poller_and_shutdown().await;
 }
 
+#[derive(PartialEq)]
+enum HungRpc {
+    Heartbeat,
+    Fail,
+}
+
 // Worker-level regression test for the shutdown/completion race: an activity is completed while
-// its last heartbeat RPC is still in flight, so the completion has left the outstanding map but
-// is parked in heartbeat eviction, still owning its slot permit. Shutdown must wait for the
-// completion to finish reporting instead of tearing down the heartbeat manager under it (which
-// stranded the completion forever) and then tripping the slot-permit release deadline.
+// one of its server calls is still in flight, so the completion has left the outstanding map but
+// still owns its slot permit. Shutdown must wait for the completion to finish reporting rather
+// than tear down the heartbeat manager under it (which stranded the completion forever) and then
+// trip the slot-permit release deadline. The hung-heartbeat case reproduces the original race
+// (eviction defers its ack until the in-flight heartbeat returns); the hung-failure case pins the
+// same invariant when the completion is parked on the result RPC itself.
+#[rstest]
+#[case::heartbeat_rpc_hangs(HungRpc::Heartbeat)]
+#[case::fail_rpc_hangs(HungRpc::Fail)]
 #[tokio::test]
-async fn worker_shutdown_awaits_activity_completion_flushing_result() {
-    let hb_rpc_entered = Arc::new(Notify::new());
-    let hb_rpc_release = Arc::new(Notify::new());
+async fn worker_shutdown_awaits_activity_completion_flushing_result(#[case] hung: HungRpc) {
+    let rpc_entered = Arc::new(Notify::new());
+    let rpc_release = Arc::new(Notify::new());
     let fail_reported = Arc::new(AtomicBool::new(false));
 
     let mut mock_client = mock_manual_worker_client();
-    let hb_rpc_entered_clone = hb_rpc_entered.clone();
-    let hb_rpc_release_clone = hb_rpc_release.clone();
-    mock_client
-        .expect_record_activity_heartbeat()
-        .times(1)
-        .returning(move |_, _| {
-            let entered = hb_rpc_entered_clone.clone();
-            let release = hb_rpc_release_clone.clone();
-            async move {
-                entered.notify_one();
-                release.notified().await;
-                Ok(RecordActivityTaskHeartbeatResponse::default())
-            }
-            .boxed()
-        });
+    if hung == HungRpc::Heartbeat {
+        let entered = rpc_entered.clone();
+        let release = rpc_release.clone();
+        mock_client
+            .expect_record_activity_heartbeat()
+            .times(1)
+            .returning(move |_, _| {
+                let entered = entered.clone();
+                let release = release.clone();
+                async move {
+                    entered.notify_one();
+                    release.notified().await;
+                    Ok(RecordActivityTaskHeartbeatResponse::default())
+                }
+                .boxed()
+            });
+    }
+    let entered = rpc_entered.clone();
+    let release = rpc_release.clone();
     let fail_reported_clone = fail_reported.clone();
+    let hold_fail_rpc = hung == HungRpc::Fail;
     mock_client
         .expect_fail_activity_task()
         .times(1)
         .returning(move |_, _, _| {
-            fail_reported_clone.store(true, Ordering::SeqCst);
-            async { Ok(RespondActivityTaskFailedResponse::default()) }.boxed()
+            let entered = entered.clone();
+            let release = release.clone();
+            let fail_reported = fail_reported_clone.clone();
+            async move {
+                if hold_fail_rpc {
+                    entered.notify_one();
+                    release.notified().await;
+                }
+                fail_reported.store(true, Ordering::SeqCst);
+                Ok(RespondActivityTaskFailedResponse::default())
+            }
+            .boxed()
         });
 
     let core = mock_worker(MocksHolder::from_client_with_activities(
@@ -714,13 +741,12 @@ async fn worker_shutdown_awaits_activity_completion_flushing_result() {
     ));
 
     let act = core.poll_activity_task().await.unwrap();
-    core.record_activity_heartbeat(ActivityHeartbeat {
-        task_token: act.task_token.clone(),
-        details: vec![],
-    });
-    // Only complete once the heartbeat RPC is in flight, so the completion's eviction is parked
-    // waiting on it — the window in which shutdown used to slip through.
-    hb_rpc_entered.notified().await;
+    if hung == HungRpc::Heartbeat {
+        core.record_activity_heartbeat(ActivityHeartbeat {
+            task_token: act.task_token.clone(),
+            details: vec![],
+        });
+    }
 
     join!(
         async {
@@ -732,6 +758,10 @@ async fn worker_shutdown_awaits_activity_completion_flushing_result() {
             .unwrap();
         },
         async {
+            // Only begin shutdown once the hung RPC is in flight — for the heartbeat case that
+            // parks the completion's eviction behind it, the window in which shutdown used to
+            // slip through.
+            rpc_entered.notified().await;
             core.initiate_shutdown();
             let shutdown_fut = async {
                 assert_matches!(
@@ -741,7 +771,7 @@ async fn worker_shutdown_awaits_activity_completion_flushing_result() {
                 core.shutdown().await;
             };
             advance_fut!(shutdown_fut);
-            hb_rpc_release.notify_one();
+            rpc_release.notify_one();
             shutdown_fut.await;
             assert!(
                 fail_reported.load(Ordering::SeqCst),
