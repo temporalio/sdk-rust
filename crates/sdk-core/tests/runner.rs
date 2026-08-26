@@ -1,10 +1,12 @@
+mod cloud_namespace;
+
 // All non-main.rs tests ignore dead common code so that the linter doesn't complain about about it.
 #[allow(dead_code)]
 mod common;
 
 use crate::common::integ_dev_server_config;
 use anyhow::{anyhow, bail};
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use common::{INTEG_SERVER_TARGET_ENV_VAR, TEST_ENV_CONFIG_SERVER_ENV_VAR};
 use std::{
     env,
@@ -22,6 +24,9 @@ const INTEG_TEST_SERVER_USED_ENV_VAR: &str = "INTEG_TEST_SERVER_ON";
 #[derive(clap::Parser)]
 #[command(author, version, about, long_about = None)]
 struct Cli {
+    #[command(subcommand)]
+    command: Option<RunnerCommand>,
+
     /// Test harness to run. Anything defined as a `[[test]]` in core's `Cargo.toml` is valid.
     #[arg(short, long, default_value = "integ_tests")]
     test_name: String,
@@ -46,6 +51,23 @@ struct Cli {
     harness_args: Vec<String>,
 }
 
+#[derive(Subcommand)]
+enum RunnerCommand {
+    /// Manage an isolated Temporal Cloud namespace for integration tests
+    CloudNamespace {
+        #[command(subcommand)]
+        command: CloudNamespaceCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum CloudNamespaceCommand {
+    /// Create a namespace and write its full name to GITHUB_OUTPUT
+    Create,
+    /// Delete a namespace and wait for deletion to finish
+    Delete { namespace: String },
+}
+
 #[derive(Copy, Clone, PartialEq, Eq, clap::ValueEnum)]
 enum ServerKind {
     /// Use Temporal-cli
@@ -62,6 +84,7 @@ enum ServerKind {
 #[tokio::main]
 async fn main() -> Result<(), anyhow::Error> {
     let Cli {
+        command,
         test_name,
         server_kind,
         cargo_test_args,
@@ -69,6 +92,14 @@ async fn main() -> Result<(), anyhow::Error> {
         just_build,
         harness_args,
     } = Cli::parse();
+    if let Some(RunnerCommand::CloudNamespace { command }) = command {
+        return match command {
+            CloudNamespaceCommand::Create => cloud_namespace::create_namespace().await,
+            CloudNamespaceCommand::Delete { namespace } => {
+                cloud_namespace::delete_namespace(namespace).await
+            }
+        };
+    }
     let cargo = env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
     // Try building first, so that we error early on build failures & don't start server
     // Unclear why --all-features doesn't work here

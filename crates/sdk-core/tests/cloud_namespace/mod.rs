@@ -1,5 +1,4 @@
 use anyhow::{Context, bail};
-use clap::{Parser, Subcommand};
 use std::{collections::HashMap, env, fs::OpenOptions, io::Write, time::Duration};
 use temporalio_client::{Connection, ConnectionOptions, TlsOptions, grpc::CloudService};
 use temporalio_common::protos::temporal::api::cloud::{
@@ -21,30 +20,7 @@ const OPERATION_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 const DEFAULT_POLL_DELAY: Duration = Duration::from_secs(10);
 const MIN_POLL_DELAY: Duration = Duration::from_secs(1);
 
-#[derive(Parser)]
-#[command(about = "Manage an isolated Temporal Cloud namespace for integration tests")]
-struct Cli {
-    #[command(subcommand)]
-    command: Command,
-}
-
-#[derive(Subcommand)]
-enum Command {
-    /// Create a namespace and write its full name to GITHUB_OUTPUT
-    Create,
-    /// Delete a namespace and wait for deletion to finish
-    Delete { namespace: String },
-}
-
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
-    match Cli::parse().command {
-        Command::Create => create_namespace().await,
-        Command::Delete { namespace } => delete_namespace(namespace).await,
-    }
-}
-
-async fn create_namespace() -> anyhow::Result<()> {
+pub(crate) async fn create_namespace() -> anyhow::Result<()> {
     let namespace_name = format!(
         "sdk-rust-ci-{}-{}",
         required_env("GITHUB_RUN_ID")?,
@@ -93,7 +69,7 @@ async fn create_namespace() -> anyhow::Result<()> {
     .await
 }
 
-async fn delete_namespace(namespace: String) -> anyhow::Result<()> {
+pub(crate) async fn delete_namespace(namespace: String) -> anyhow::Result<()> {
     let connection = cloud_connection().await?;
     let mut client = connection.cloud_service();
     let existing = client

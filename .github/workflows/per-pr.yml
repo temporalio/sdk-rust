@@ -210,7 +210,7 @@ jobs:
         id: create-cloud-namespace
         env:
           TEMPORAL_CLIENT_CLOUD_API_KEY: ${{ secrets.TEMPORAL_CLIENT_CLOUD_API_KEY }}
-        run: cargo cloud-namespace create
+        run: cargo integ-test cloud-namespace create
       - name: Run existing integration test against Cloud
         timeout-minutes: 20
         env:
@@ -226,7 +226,7 @@ jobs:
         continue-on-error: true
         env:
           TEMPORAL_CLIENT_CLOUD_API_KEY: ${{ secrets.TEMPORAL_CLIENT_CLOUD_API_KEY }}
-        run: cargo cloud-namespace delete "${{ steps.create-cloud-namespace.outputs.namespace }}"
+        run: cargo integ-test cloud-namespace delete "${{ steps.create-cloud-namespace.outputs.namespace }}"
       - name: Report Cloud namespace cleanup failure
         if: ${{ always() && steps.delete-cloud-namespace.outcome == 'failure' }}
         run: echo "::warning title=Cloud namespace cleanup failed::Failed to delete Cloud namespace ${{ steps.create-cloud-namespace.outputs.namespace }}"

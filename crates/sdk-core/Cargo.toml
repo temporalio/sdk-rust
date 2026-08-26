@@ -237,13 +237,6 @@ test = false
 required-features = ["test-utilities"]
 
 [[test]]
-name = "cloud_namespace"
-path = "tests/cloud_namespace.rs"
-harness = false
-test = false
-required-features = ["test-utilities"]
-
-[[test]]
 name = "fsm_procmacro"
 path = "tests/fsm_procmacro.rs"
 required-features = ["temporalio-common/serde_serialize"]
