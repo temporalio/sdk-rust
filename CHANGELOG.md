@@ -53,6 +53,10 @@ relevant information.
 * Removed the unused `ActExitValue` type. Use `ActivityError::WillCompleteAsync` to mark an
   activity for asynchronous completion.
 * Removed the test-only `FailOnNondeterminismInterceptor` from the public Rust SDK API.
+* `ActivityExecutionDecodeHint`, child-workflow and signal decode hints,
+  `SerializationContextData`, and `PayloadConverter` are now non-exhaustive. Use
+  `ActivityExecutionDecodeHint::new` or `Default` to create decode hints, and add a wildcard
+  branch when matching `SerializationContextData` or `PayloadConverter`.
 * `IncomingError` is now non-exhaustive. Add a wildcard branch to downstream matches over decoded
   failures.
 * Rust SDK environment configuration values (`DataSource`, `ClientConfig`, and related profile,

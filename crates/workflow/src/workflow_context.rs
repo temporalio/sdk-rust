@@ -2685,7 +2685,7 @@ where
                                     message: "Activity completed without a status".to_string(),
                                     ..Default::default()
                                 },
-                                ActivityExecutionDecodeHint { cancelled: false },
+                                ActivityExecutionDecodeHint::new(false),
                             )
                             .expect("synthetic activity failure should decode")
                     })?;
@@ -2705,12 +2705,12 @@ where
                         activity_resolution::Status::Failed(f) => Err(data_converter.to_error(
                             &SerializationContextData::Workflow,
                             f.failure.unwrap_or_default(),
-                            ActivityExecutionDecodeHint { cancelled: false },
+                            ActivityExecutionDecodeHint::new(false),
                         )?),
                         activity_resolution::Status::Cancelled(c) => Err(data_converter.to_error(
                             &SerializationContextData::Workflow,
                             c.failure.unwrap_or_default(),
-                            ActivityExecutionDecodeHint { cancelled: true },
+                            ActivityExecutionDecodeHint::new(true),
                         )?),
                         activity_resolution::Status::Backoff(_) => {
                             panic!("DoBackoff should be handled by LATimerBackoffFut")
@@ -2857,7 +2857,7 @@ where
                                         .to_string(),
                                     ..Default::default()
                                 },
-                                ChildWorkflowExecutionDecodeHint,
+                                ChildWorkflowExecutionDecodeHint::default(),
                             )
                             .expect("synthetic child workflow failure should decode")
                     })?;
@@ -2876,13 +2876,13 @@ where
                         child_workflow_result::Status::Failed(f) => Err(data_converter.to_error(
                             &SerializationContextData::Workflow,
                             f.failure.unwrap_or_default(),
-                            ChildWorkflowExecutionDecodeHint,
+                            ChildWorkflowExecutionDecodeHint::default(),
                         )?),
                         child_workflow_result::Status::Cancelled(c) => Err(data_converter
                             .to_error(
                                 &SerializationContextData::Workflow,
                                 c.failure.unwrap_or_default(),
-                                ChildWorkflowExecutionDecodeHint,
+                                ChildWorkflowExecutionDecodeHint::default(),
                             )?),
                     }
                 }),
@@ -3004,7 +3004,7 @@ where
                         Err(base_ctx.data_converter().to_error(
                             &SerializationContextData::Workflow,
                             c.failure.unwrap_or_default(),
-                            ChildWorkflowStartDecodeHint,
+                            ChildWorkflowStartDecodeHint::default(),
                         )?)
                     }
                 }),
@@ -3081,7 +3081,7 @@ where
                 Poll::Ready(Err(failure)) => Poll::Ready(Err(data_converter.to_error(
                     &SerializationContextData::Workflow,
                     failure,
-                    WorkflowSignalDecodeHint,
+                    WorkflowSignalDecodeHint::default(),
                 )?)),
             },
             SignalChildFut::Terminated => panic!("polled after termination"),

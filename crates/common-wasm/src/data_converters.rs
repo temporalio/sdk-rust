@@ -150,6 +150,7 @@ impl DataConverter {
 
 /// Data about the serialization context, indicating where the serialization is occurring.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum SerializationContextData {
     /// Serialization is occurring in a workflow context.
     Workflow,
@@ -172,6 +173,7 @@ pub struct SerializationContext<'a> {
 }
 /// Converts values to and from [`Payload`]s using different encoding strategies.
 #[derive(Clone)]
+#[non_exhaustive]
 pub enum PayloadConverter {
     /// Uses a serde-based converter for encoding/decoding.
     Serde(Arc<dyn ErasedSerdePayloadConverter>),
