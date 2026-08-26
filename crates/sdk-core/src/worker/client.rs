@@ -5,6 +5,7 @@ use crate::{
     protosext::legacy_query_failure,
     worker::{WorkerVersioningStrategy, worker_control_task_queue},
 };
+use backon::{BackoffBuilder, ExponentialBuilder};
 use futures_util::{StreamExt, TryStreamExt, stream};
 use parking_lot::Mutex;
 use prost::Message;
@@ -63,8 +64,14 @@ const MAX_WFT_COMPLETION_PAGE_SIZE: usize = 4 * 1024 * 1024 - 256 * 1024;
 // Conservative heuristic, not a tuned value: caps the client-side burst (concurrent request bodies
 // and streams); the cost is only extra serial rounds for completions over this many pages.
 const MAX_CONCURRENT_WFT_COMPLETION_PAGES: usize = 3;
-const WFT_COMPLETION_PAGE_RESEND_INITIAL_BACKOFF: Duration = Duration::from_millis(100);
-const WFT_COMPLETION_PAGE_RESEND_MAX_BACKOFF: Duration = Duration::from_secs(5);
+// Backoff between resends of lost pages. Values are a conservative heuristic, not tuned;
+// `without_max_times` leaves the number of resends to the loop (bounded by a stale token or
+// shutdown), not the backoff.
+const WFT_COMPLETION_PAGE_RESEND_BACKOFF: ExponentialBuilder = ExponentialBuilder::new()
+    .with_min_delay(Duration::from_millis(100))
+    .with_factor(2.0)
+    .with_max_delay(Duration::from_secs(5))
+    .without_max_times();
 /// Marker set on the error returned when a completion is failed proactively for exceeding the
 /// namespace's recombined completion-size limit, so the workflow layer reports it as
 /// `REQUEST_TOO_LARGE`.
@@ -687,7 +694,7 @@ impl WorkerClient for WorkerClientBag {
         // has to live here because the client's retry layer would resend only the single failed
         // page, which cannot rebuild the buffer the server dropped; it is told to pass buffer loss
         // straight through (see `wft_completion_page_request`).
-        let mut backoff = WFT_COMPLETION_PAGE_RESEND_INITIAL_BACKOFF;
+        let mut backoff = WFT_COMPLETION_PAGE_RESEND_BACKOFF.build();
         loop {
             let send_all = async {
                 // Cancel in-flight pages on the first error rather than awaiting them: any failure
@@ -717,11 +724,11 @@ impl WorkerClient for WorkerClientBag {
             match send_all.await {
                 Ok(response) => return Ok(response.into_inner()),
                 Err(e) if is_workflow_task_completion_buffer_lost(&e) => {
+                    let delay = backoff.next().expect("resend backoff is unbounded");
                     tokio::select! {
                         _ = shutdown_token.cancelled() => return Err(e),
-                        _ = sleep(backoff) => {}
+                        _ = sleep(delay) => {}
                     }
-                    backoff = (backoff * 2).min(WFT_COMPLETION_PAGE_RESEND_MAX_BACKOFF);
                 }
                 Err(e) => return Err(e),
             }
