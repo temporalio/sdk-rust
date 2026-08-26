@@ -437,24 +437,20 @@ mod tests {
         .unwrap();
         shared_worker.register_callback(
             Uuid::new_v4(),
-            WorkerCallbacks {
-                heartbeat: Arc::new(|| None),
-                heartbeat_success: None,
-                cancel_activity: None,
-            },
+            WorkerCallbacks::new(Arc::new(|| None), None, None),
         );
         shared_worker.register_callback(
             started_worker_key,
-            WorkerCallbacks {
-                heartbeat: Arc::new(move || {
+            WorkerCallbacks::new(
+                Arc::new(move || {
                     Some(WorkerHeartbeat {
                         worker_instance_key: started_worker_key.to_string(),
                         ..Default::default()
                     })
                 }),
-                heartbeat_success: None,
-                cancel_activity: None,
-            },
+                None,
+                None,
+            ),
         );
 
         tokio::time::timeout(Duration::from_secs(5), recorded_rx)
@@ -659,16 +655,16 @@ mod tests {
         let callback_tx = Mutex::new(Some(callback_tx));
         shared_worker.register_callback(
             Uuid::new_v4(),
-            WorkerCallbacks {
-                heartbeat: Arc::new(move || {
+            WorkerCallbacks::new(
+                Arc::new(move || {
                     if let Some(tx) = callback_tx.lock().unwrap().take() {
                         let _ = tx.send(());
                     }
                     None
                 }),
-                heartbeat_success: None,
-                cancel_activity: None,
-            },
+                None,
+                None,
+            ),
         );
         tokio::time::timeout(Duration::from_secs(5), callback_rx)
             .await

@@ -230,11 +230,11 @@ impl ClientWorkerSetImpl {
             };
             shared_worker.register_callback(
                 worker_instance_key,
-                WorkerCallbacks {
-                    heartbeat: heartbeat_callback,
-                    heartbeat_success: worker.heartbeat_success_callback(),
-                    cancel_activity: worker.cancel_activity_callback(),
-                },
+                WorkerCallbacks::new(
+                    heartbeat_callback,
+                    worker.heartbeat_success_callback(),
+                    worker.cancel_activity_callback(),
+                ),
             );
         }
 
@@ -511,6 +511,7 @@ pub type HeartbeatSuccessCallback = Arc<dyn Fn() + Send + Sync>;
 pub type CancelActivityCallback = Arc<dyn Fn(TaskToken) -> bool + Send + Sync>;
 
 /// Bundles all per-worker callbacks registered with the SharedNamespaceWorker.
+#[non_exhaustive]
 pub struct WorkerCallbacks {
     /// Callback to collect heartbeat data from the worker.
     pub heartbeat: HeartbeatCallback,
@@ -518,6 +519,21 @@ pub struct WorkerCallbacks {
     pub heartbeat_success: Option<HeartbeatSuccessCallback>,
     /// Callback to cancel an activity by task token.
     pub cancel_activity: Option<CancelActivityCallback>,
+}
+
+impl WorkerCallbacks {
+    /// Creates a callback bundle for a worker.
+    pub fn new(
+        heartbeat: HeartbeatCallback,
+        heartbeat_success: Option<HeartbeatSuccessCallback>,
+        cancel_activity: Option<CancelActivityCallback>,
+    ) -> Self {
+        Self {
+            heartbeat,
+            heartbeat_success,
+            cancel_activity,
+        }
+    }
 }
 
 /// Represents a complete worker that can handle both slot management

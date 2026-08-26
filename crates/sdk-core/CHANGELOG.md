@@ -51,6 +51,8 @@ relevant information.
   reason, which may affect existing dashboards.
 
 ### Breaking Changes :boom:
+* Core worker integrations constructing heartbeat and activity-cancellation callback bundles must
+  use the provided constructor, as callback bundles may gain fields in future releases.
 * Activity failures now include the latest heartbeat details atomically instead of force-flushing a
   throttled heartbeat first. Temporal Server 1.16.0 or newer is required to guarantee those details
   are preserved on failure; workers warn when the server does not advertise support.

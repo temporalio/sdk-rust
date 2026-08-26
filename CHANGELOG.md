@@ -50,6 +50,7 @@ relevant information.
   reason, which may affect existing dashboards.
 
 ### Breaking Changes :boom:
+* `WorkerCallbacks` is now non-exhaustive. Construct it with `WorkerCallbacks::new`.
 * `WorkflowExecutionInfo` is now non-exhaustive. Construct it with
   `WorkflowExecutionInfo::builder().namespace(...).workflow_id(...).build()`.
 * `ActivityCloseTimeouts` is now non-exhaustive. Add a wildcard branch to downstream matches.
