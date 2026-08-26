@@ -82,7 +82,7 @@ enum WftCompletionPages {
     },
 }
 
-/// Split a completion that exceeds `max_page_bytes` into pages that each stay under it, by
+/// Split a completion that may exceed `max_page_bytes` into pages that each stay under it, by
 /// distributing its commands across intermediate pages in order.
 ///
 /// Falls back to [WftCompletionPages::Single] when the request already fits, has no commands to
