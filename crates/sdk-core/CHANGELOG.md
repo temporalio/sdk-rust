@@ -63,10 +63,6 @@ relevant information.
 * Removed the unused `ActExitValue` type. Use `ActivityError::WillCompleteAsync` to mark an
   activity for asynchronous completion.
 * Removed the test-only `FailOnNondeterminismInterceptor` from the public API.
-* Environment configuration values (`DataSource`, `ClientConfig`, and related profile, TLS, codec,
-  and profile-loading-option types) are now client-owned and non-exhaustive. Use the new `bon`
-  builders to construct configuration structs, and add a wildcard branch when matching
-  `DataSource`.
 * `TaskToken` no longer exposes its underlying bytes directly. Use `TaskToken::into_inner()` to
   consume a token into its bytes.
 * Activity failures now include the latest heartbeat details atomically instead of force-flushing a

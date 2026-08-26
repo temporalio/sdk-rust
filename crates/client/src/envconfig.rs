@@ -6,239 +6,15 @@
 use std::{collections::HashMap, fs};
 use url::Url;
 
-pub use temporalio_common::envconfig::ConfigError;
-use temporalio_common::envconfig::{
-    self, ClientConfig as CoreClientConfig, ClientConfigCodec as CoreClientConfigCodec,
-    ClientConfigProfile as CoreClientConfigProfile, ClientConfigTLS as CoreClientConfigTLS,
-    DataSource as CoreDataSource,
-    LoadClientConfigProfileOptions as CoreLoadClientConfigProfileOptions,
+pub use temporalio_common::envconfig::{
+    ClientConfigProfile, ConfigError, DataSource, LoadClientConfigProfileOptions,
 };
+use temporalio_common::envconfig::{ClientConfigTLS, load_client_config_profile};
 
 use crate::{ClientOptions, ClientTlsOptions, ConnectionOptions, TlsOptions};
 
 const DEFAULT_ADDRESS: &str = "http://localhost:7233";
 const DEFAULT_NAMESPACE: &str = "default";
-
-/// A source for configuration or TLS certificate/key data.
-#[derive(Debug, Clone, PartialEq)]
-#[non_exhaustive]
-pub enum DataSource {
-    /// A filesystem path to the data.
-    Path(String),
-    /// The raw data bytes.
-    Data(Vec<u8>),
-}
-
-impl From<DataSource> for CoreDataSource {
-    fn from(value: DataSource) -> Self {
-        match value {
-            DataSource::Path(path) => Self::Path(path),
-            DataSource::Data(data) => Self::Data(data),
-        }
-    }
-}
-
-impl From<CoreDataSource> for DataSource {
-    fn from(value: CoreDataSource) -> Self {
-        match value {
-            CoreDataSource::Path(path) => Self::Path(path),
-            CoreDataSource::Data(data) => Self::Data(data),
-        }
-    }
-}
-
-/// A client configuration file.
-#[derive(Debug, Clone, PartialEq, Default, bon::Builder)]
-#[builder(on(String, into))]
-#[non_exhaustive]
-pub struct ClientConfig {
-    /// Profiles, keyed by profile name.
-    #[builder(default)]
-    pub profiles: HashMap<String, ClientConfigProfile>,
-}
-
-impl From<ClientConfig> for CoreClientConfig {
-    fn from(value: ClientConfig) -> Self {
-        Self {
-            profiles: value
-                .profiles
-                .into_iter()
-                .map(|(name, profile)| (name, profile.into()))
-                .collect(),
-        }
-    }
-}
-
-impl From<CoreClientConfig> for ClientConfig {
-    fn from(value: CoreClientConfig) -> Self {
-        Self {
-            profiles: value
-                .profiles
-                .into_iter()
-                .map(|(name, profile)| (name, profile.into()))
-                .collect(),
-        }
-    }
-}
-
-/// A client configuration profile.
-#[derive(Debug, Clone, PartialEq, Default, bon::Builder)]
-#[builder(on(String, into))]
-#[non_exhaustive]
-pub struct ClientConfigProfile {
-    /// Client address.
-    pub address: Option<String>,
-    /// Client namespace.
-    pub namespace: Option<String>,
-    /// Client API key.
-    pub api_key: Option<String>,
-    /// Optional client TLS configuration.
-    pub tls: Option<ClientConfigTLS>,
-    /// Optional client codec configuration.
-    pub codec: Option<ClientConfigCodec>,
-    /// Client gRPC metadata headers.
-    #[builder(default)]
-    pub grpc_meta: HashMap<String, String>,
-}
-
-impl From<ClientConfigProfile> for CoreClientConfigProfile {
-    fn from(value: ClientConfigProfile) -> Self {
-        Self {
-            address: value.address,
-            namespace: value.namespace,
-            api_key: value.api_key,
-            tls: value.tls.map(Into::into),
-            codec: value.codec.map(Into::into),
-            grpc_meta: value.grpc_meta,
-        }
-    }
-}
-
-impl From<CoreClientConfigProfile> for ClientConfigProfile {
-    fn from(value: CoreClientConfigProfile) -> Self {
-        Self {
-            address: value.address,
-            namespace: value.namespace,
-            api_key: value.api_key,
-            tls: value.tls.map(Into::into),
-            codec: value.codec.map(Into::into),
-            grpc_meta: value.grpc_meta,
-        }
-    }
-}
-
-/// TLS configuration for a client profile.
-#[derive(Debug, Clone, PartialEq, Default, bon::Builder)]
-#[builder(on(String, into))]
-#[non_exhaustive]
-pub struct ClientConfigTLS {
-    /// Whether TLS is explicitly disabled or enabled.
-    pub disabled: Option<bool>,
-    /// Client certificate source.
-    pub client_cert: Option<DataSource>,
-    /// Client key source.
-    pub client_key: Option<DataSource>,
-    /// Server CA certificate source.
-    pub server_ca_cert: Option<DataSource>,
-    /// SNI override.
-    pub server_name: Option<String>,
-    /// Whether host verification should be skipped.
-    #[builder(default)]
-    pub disable_host_verification: bool,
-}
-
-impl From<ClientConfigTLS> for CoreClientConfigTLS {
-    fn from(value: ClientConfigTLS) -> Self {
-        Self {
-            disabled: value.disabled,
-            client_cert: value.client_cert.map(Into::into),
-            client_key: value.client_key.map(Into::into),
-            server_ca_cert: value.server_ca_cert.map(Into::into),
-            server_name: value.server_name,
-            disable_host_verification: value.disable_host_verification,
-        }
-    }
-}
-
-impl From<CoreClientConfigTLS> for ClientConfigTLS {
-    fn from(value: CoreClientConfigTLS) -> Self {
-        Self {
-            disabled: value.disabled,
-            client_cert: value.client_cert.map(Into::into),
-            client_key: value.client_key.map(Into::into),
-            server_ca_cert: value.server_ca_cert.map(Into::into),
-            server_name: value.server_name,
-            disable_host_verification: value.disable_host_verification,
-        }
-    }
-}
-
-/// Remote codec configuration for a client profile.
-#[derive(Debug, Clone, PartialEq, Default, bon::Builder)]
-#[builder(on(String, into))]
-#[non_exhaustive]
-pub struct ClientConfigCodec {
-    /// Remote endpoint for the codec.
-    pub endpoint: Option<String>,
-    /// Authorization header for the codec.
-    pub auth: Option<String>,
-}
-
-impl From<ClientConfigCodec> for CoreClientConfigCodec {
-    fn from(value: ClientConfigCodec) -> Self {
-        Self {
-            endpoint: value.endpoint,
-            auth: value.auth,
-        }
-    }
-}
-
-impl From<CoreClientConfigCodec> for ClientConfigCodec {
-    fn from(value: CoreClientConfigCodec) -> Self {
-        Self {
-            endpoint: value.endpoint,
-            auth: value.auth,
-        }
-    }
-}
-
-/// Options for loading a client configuration profile.
-#[derive(Debug, PartialEq, bon::Builder)]
-#[non_exhaustive]
-pub struct LoadClientConfigProfileOptions {
-    /// Where to load configuration from. If unset, the loader checks environment variables and
-    /// the default configuration path.
-    pub config_source: Option<DataSource>,
-    /// Specific profile to use.
-    pub config_file_profile: Option<String>,
-    /// Whether to reject unrecognized configuration file keys.
-    #[builder(default)]
-    pub config_file_strict: bool,
-    /// Whether to skip configuration-file loading.
-    #[builder(default)]
-    pub disable_file: bool,
-    /// Whether to skip environment-variable loading.
-    #[builder(default)]
-    pub disable_env: bool,
-}
-
-impl Default for LoadClientConfigProfileOptions {
-    fn default() -> Self {
-        Self::builder().build()
-    }
-}
-
-impl From<LoadClientConfigProfileOptions> for CoreLoadClientConfigProfileOptions {
-    fn from(value: LoadClientConfigProfileOptions) -> Self {
-        Self::builder()
-            .maybe_config_source(value.config_source.map(Into::into))
-            .maybe_config_file_profile(value.config_file_profile)
-            .config_file_strict(value.config_file_strict)
-            .disable_file(value.disable_file)
-            .disable_env(value.disable_env)
-            .build()
-    }
-}
 
 impl ClientOptions {
     /// Load client and connection options from environment variables and/or a TOML config file.
@@ -254,8 +30,7 @@ fn load_from_config_with_env(
     options: LoadClientConfigProfileOptions,
     env_vars: Option<&HashMap<String, String>>,
 ) -> Result<(ConnectionOptions, ClientOptions), ConfigError> {
-    let profile: ClientConfigProfile =
-        envconfig::load_client_config_profile(options.into(), env_vars)?.into();
+    let profile = load_client_config_profile(options, env_vars)?;
     let namespace = profile
         .namespace
         .clone()
@@ -373,6 +148,10 @@ fn resolve_datasource(data_source: DataSource) -> Result<Vec<u8>, std::io::Error
     match data_source {
         DataSource::Path(path) => fs::read(path),
         DataSource::Data(data) => Ok(data),
+        _ => Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "unsupported envconfig data source",
+        )),
     }
 }
 
@@ -382,6 +161,7 @@ mod tests {
     use rstest::{fixture, rstest};
     use std::path::PathBuf;
     use tempfile::TempDir;
+    use temporalio_common::envconfig::{ClientConfigTLS, DataSource};
 
     /// Write a TOML config file into a temp directory and return (dir, path).
     /// The `TempDir` handle keeps the directory alive; it is cleaned up on drop.
@@ -575,33 +355,6 @@ mod tests {
             )
             .build();
         assert!(ConnectionOptions::try_from(profile).is_err());
-    }
-
-    #[test]
-    fn config_wrappers_convert_to_and_from_common() {
-        let config = ClientConfig::builder()
-            .profiles(HashMap::from([(
-                "default".to_string(),
-                ClientConfigProfile::builder()
-                    .address("localhost:7233")
-                    .tls(
-                        ClientConfigTLS::builder()
-                            .client_cert(DataSource::Data(b"cert".to_vec()))
-                            .client_key(DataSource::Data(b"key".to_vec()))
-                            .build(),
-                    )
-                    .codec(
-                        ClientConfigCodec::builder()
-                            .endpoint("http://localhost:8080")
-                            .auth("Bearer token")
-                            .build(),
-                    )
-                    .build(),
-            )]))
-            .build();
-
-        let common: CoreClientConfig = config.clone().into();
-        assert_eq!(ClientConfig::from(common), config);
     }
 
     #[rstest]
