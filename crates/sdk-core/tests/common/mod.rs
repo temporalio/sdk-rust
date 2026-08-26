@@ -93,8 +93,9 @@ pub(crate) const INTEG_CLIENT_IDENTITY: &str = "integ_tester";
 pub(crate) const INTEG_CLIENT_NAME: &str = "temporal-core";
 pub(crate) const INTEG_CLIENT_VERSION: &str = "0.1.0";
 
-// Envconfig can read TOML and TLS files. Load one immutable snapshot so concurrently-created
-// clients and workers cannot observe different configuration during a test run.
+// Envconfig can read TOML profiles and TLS credentials from files. Load one immutable snapshot so
+// concurrently-created clients and workers cannot observe different configuration during a test
+// run.
 static ENV_CONFIG_CLIENT_CONFIG: LazyLock<(ConnectionOptions, String)> = LazyLock::new(|| {
     let (mut connection_options, client_options) =
         ClientOptions::load_from_config(LoadClientConfigProfileOptions::default())
