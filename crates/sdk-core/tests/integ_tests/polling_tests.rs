@@ -205,16 +205,15 @@ async fn switching_worker_client_changes_poll() {
         worker.complete_execution(&act1.run_id).await;
         worker.handle_eviction().await;
         info!("Waiting on first workflow complete");
-        WorkflowExecutionInfo {
-            namespace: client1.namespace(),
-            workflow_id: "my-workflow-1".into(),
-            run_id: Some(wf1_run_id.clone()),
-            first_execution_run_id: None,
-        }
-        .bind_untyped(client1.clone())
-        .get_result(Default::default())
-        .await
-        .unwrap();
+        WorkflowExecutionInfo::builder()
+            .namespace(client1.namespace())
+            .workflow_id("my-workflow-1")
+            .maybe_run_id(Some(wf1_run_id.clone()))
+            .build()
+            .bind_untyped(client1.clone())
+            .get_result(Default::default())
+            .await
+            .unwrap();
 
         // Swap client, poll for next task, confirm it's second wf, and respond w/ empty
         info!("Replacing client and polling again");
@@ -224,16 +223,15 @@ async fn switching_worker_client_changes_poll() {
         worker.complete_execution(&act2.run_id).await;
         worker.handle_eviction().await;
         info!("Waiting on second workflow complete");
-        WorkflowExecutionInfo {
-            namespace: client2.namespace(),
-            workflow_id: "my-workflow-2".into(),
-            run_id: Some(wf2_run_id),
-            first_execution_run_id: None,
-        }
-        .bind_untyped(client2.clone())
-        .get_result(Default::default())
-        .await
-        .unwrap();
+        WorkflowExecutionInfo::builder()
+            .namespace(client2.namespace())
+            .workflow_id("my-workflow-2")
+            .maybe_run_id(Some(wf2_run_id))
+            .build()
+            .bind_untyped(client2.clone())
+            .get_result(Default::default())
+            .await
+            .unwrap();
 
         // Shutdown workers and servers
         drain_pollers_and_shutdown(&worker).await;

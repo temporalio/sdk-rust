@@ -784,12 +784,13 @@ impl TestWorker {
         }
         let wfid = options.workflow_id.clone();
         let handle = c.start_workflow(workflow, input, options).await?;
-        self.started_workflows.lock().push(WorkflowExecutionInfo {
-            namespace: c.namespace(),
-            workflow_id: wfid,
-            run_id: handle.info().run_id.clone(),
-            first_execution_run_id: None,
-        });
+        self.started_workflows.lock().push(
+            WorkflowExecutionInfo::builder()
+                .namespace(c.namespace())
+                .workflow_id(wfid)
+                .maybe_run_id(handle.info().run_id.clone())
+                .build(),
+        );
         Ok(handle)
     }
 
@@ -798,16 +799,18 @@ impl TestWorker {
         wf_id: impl Into<String>,
         run_id: Option<String>,
     ) {
-        self.started_workflows.lock().push(WorkflowExecutionInfo {
-            namespace: self
-                .client
-                .as_ref()
-                .map(|c| c.namespace())
-                .unwrap_or(NAMESPACE.to_owned()),
-            workflow_id: wf_id.into(),
-            run_id,
-            first_execution_run_id: None,
-        });
+        self.started_workflows.lock().push(
+            WorkflowExecutionInfo::builder()
+                .namespace(
+                    self.client
+                        .as_ref()
+                        .map(|c| c.namespace())
+                        .unwrap_or(NAMESPACE.to_owned()),
+                )
+                .workflow_id(wf_id.into())
+                .maybe_run_id(run_id)
+                .build(),
+        );
     }
 
     /// Runs until all expected workflows have completed and then shuts down the worker
@@ -882,12 +885,13 @@ impl TestWorkerSubmitterHandle {
             )
             .await?;
         let run_id = handle.run_id().unwrap().to_string();
-        self.started_workflows.lock().push(WorkflowExecutionInfo {
-            namespace: self.client.namespace(),
-            workflow_id: wfid,
-            run_id: Some(run_id.clone()),
-            first_execution_run_id: None,
-        });
+        self.started_workflows.lock().push(
+            WorkflowExecutionInfo::builder()
+                .namespace(self.client.namespace())
+                .workflow_id(wfid)
+                .maybe_run_id(Some(run_id.clone()))
+                .build(),
+        );
         Ok(run_id)
     }
 }

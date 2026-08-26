@@ -64,16 +64,15 @@ async fn sends_modify_wf_props() {
     worker.run_until_done().await.unwrap();
 
     let client = starter.get_core_client().await;
-    let description = WorkflowExecutionInfo {
-        namespace: client.namespace(),
-        workflow_id: wf_id.to_string(),
-        run_id: Some(run_id),
-        first_execution_run_id: None,
-    }
-    .bind_untyped(client.clone())
-    .describe(WorkflowDescribeOptions::default())
-    .await
-    .unwrap();
+    let description = WorkflowExecutionInfo::builder()
+        .namespace(client.namespace())
+        .workflow_id(wf_id.to_string())
+        .maybe_run_id(Some(run_id))
+        .build()
+        .bind_untyped(client.clone())
+        .describe(WorkflowDescribeOptions::default())
+        .await
+        .unwrap();
     assert_eq!(
         description.memo().get::<String>(FIELD_A).unwrap(),
         Some("enchi".to_string())

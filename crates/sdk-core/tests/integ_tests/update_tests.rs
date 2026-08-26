@@ -160,17 +160,16 @@ async fn reapplied_updates_due_to_reset() {
     assert_eq!(post_reset_run_id, reset_response.run_id);
 
     // Make sure replay works
-    let events = WorkflowExecutionInfo {
-        namespace: client.namespace(),
-        workflow_id: workflow_id.to_string(),
-        run_id: Some(post_reset_run_id.clone()),
-        first_execution_run_id: None,
-    }
-    .bind_untyped(client.clone())
-    .fetch_history(Default::default())
-    .await
-    .unwrap()
-    .into_events();
+    let events = WorkflowExecutionInfo::builder()
+        .namespace(client.namespace())
+        .workflow_id(workflow_id.to_string())
+        .maybe_run_id(Some(post_reset_run_id.clone()))
+        .build()
+        .bind_untyped(client.clone())
+        .fetch_history(Default::default())
+        .await
+        .unwrap()
+        .into_events();
     let with_id = HistoryForReplay::new(events, workflow_id.to_string());
 
     let replay_worker = init_core_replay_preloaded(workflow_id, [with_id]);
@@ -205,13 +204,12 @@ async fn send_and_handle_update(
         .await
         .unwrap();
 
-    let handle = WorkflowExecutionInfo {
-        namespace: client.namespace(),
-        workflow_id: workflow_id.to_string(),
-        run_id: Some(act.run_id.clone()),
-        first_execution_run_id: None,
-    }
-    .bind_untyped(client.clone());
+    let handle = WorkflowExecutionInfo::builder()
+        .namespace(client.namespace())
+        .workflow_id(workflow_id.to_string())
+        .maybe_run_id(Some(act.run_id.clone()))
+        .build()
+        .bind_untyped(client.clone());
 
     // Send the update to the server
     let update_task = async {
@@ -314,13 +312,12 @@ async fn update_rejection() {
     .await
     .unwrap();
 
-    let handle = WorkflowExecutionInfo {
-        namespace: client.namespace(),
-        workflow_id: workflow_id.clone(),
-        run_id: Some(res.run_id.clone()),
-        first_execution_run_id: None,
-    }
-    .bind_untyped(client.clone());
+    let handle = WorkflowExecutionInfo::builder()
+        .namespace(client.namespace())
+        .workflow_id(workflow_id.clone())
+        .maybe_run_id(Some(res.run_id.clone()))
+        .build()
+        .bind_untyped(client.clone());
 
     // Send the update to the server
     let update_task = async {
@@ -393,13 +390,12 @@ async fn update_insta_complete(#[values(true, false)] accept_first: bool) {
     .await
     .unwrap();
 
-    let handle = WorkflowExecutionInfo {
-        namespace: client.namespace(),
-        workflow_id,
-        run_id: Some(res.run_id.clone()),
-        first_execution_run_id: None,
-    }
-    .bind_untyped(client.clone());
+    let handle = WorkflowExecutionInfo::builder()
+        .namespace(client.namespace())
+        .workflow_id(workflow_id)
+        .maybe_run_id(Some(res.run_id.clone()))
+        .build()
+        .bind_untyped(client.clone());
 
     // Send the update to the server
     let (update_task, stop_wait_update) = future::abortable(async {
@@ -486,13 +482,12 @@ async fn update_complete_after_accept_without_new_task() {
     .await
     .unwrap();
 
-    let handle = WorkflowExecutionInfo {
-        namespace: client.namespace(),
-        workflow_id,
-        run_id: Some(res.run_id.clone()),
-        first_execution_run_id: None,
-    }
-    .bind_untyped(client.clone());
+    let handle = WorkflowExecutionInfo::builder()
+        .namespace(client.namespace())
+        .workflow_id(workflow_id)
+        .maybe_run_id(Some(res.run_id.clone()))
+        .build()
+        .bind_untyped(client.clone());
 
     // Send the update to the server
     let update_task = async {

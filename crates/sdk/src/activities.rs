@@ -324,12 +324,12 @@ impl ActivityContext {
 
         Some(WorkflowHandle::new(
             client.clone(),
-            WorkflowExecutionInfo {
-                namespace: client.options().namespace.clone(),
-                workflow_id,
-                run_id,
-                first_execution_run_id,
-            },
+            WorkflowExecutionInfo::builder()
+                .namespace(client.options().namespace.clone())
+                .workflow_id(workflow_id)
+                .maybe_run_id(run_id)
+                .maybe_first_execution_run_id(first_execution_run_id)
+                .build(),
         ))
     }
 

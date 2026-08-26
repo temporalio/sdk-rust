@@ -438,6 +438,7 @@ impl<CT: WorkflowService + NamespacedClient + Clone> AsyncActivityHandle<CT> {
 
 /// Response from a heartbeat call.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct ActivityHeartbeatResponse {
     /// True if the activity has been asked to cancel itself.
     pub cancel_requested: bool,
