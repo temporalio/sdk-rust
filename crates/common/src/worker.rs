@@ -135,10 +135,12 @@ pub struct WorkerDeploymentOptions {
 impl WorkerDeploymentOptions {
     /// Create deployment options from just a build ID, without opting into worker versioning.
     pub fn from_build_id(build_id: String) -> Self {
-        Self::new(WorkerDeploymentVersion {
-            deployment_name: "".to_owned(),
-            build_id,
-        })
+        Self::new(
+            WorkerDeploymentVersion::builder()
+                .deployment_name("")
+                .build_id(build_id)
+                .build(),
+        )
         .build()
     }
 }

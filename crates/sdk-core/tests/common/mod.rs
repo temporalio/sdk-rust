@@ -158,10 +158,12 @@ pub(crate) fn integ_worker_config(tq: &str) -> WorkerConfig {
 pub(crate) fn integ_sdk_config(tq: &str) -> WorkerOptions {
     WorkerOptions::new(tq)
         .deployment_options(
-            WorkerDeploymentOptions::new(WorkerDeploymentVersion {
-                deployment_name: "".to_owned(),
-                build_id: "test_build_id".to_owned(),
-            })
+            WorkerDeploymentOptions::new(
+                WorkerDeploymentVersion::builder()
+                    .deployment_name("".to_owned())
+                    .build_id("test_build_id".to_owned())
+                    .build(),
+            )
             .build(),
         )
         .build()

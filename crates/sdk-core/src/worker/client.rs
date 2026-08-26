@@ -1080,10 +1080,12 @@ mod tests {
             (
                 "deployment",
                 WorkerVersioningStrategy::WorkerDeploymentBased(
-                    WorkerDeploymentOptions::new(WorkerDeploymentVersion {
-                        deployment_name: "deployment".to_string(),
-                        build_id: "deployment-build".to_string(),
-                    })
+                    WorkerDeploymentOptions::new(
+                        WorkerDeploymentVersion::builder()
+                            .deployment_name("deployment".to_string())
+                            .build_id("deployment-build".to_string())
+                            .build(),
+                    )
                     .use_worker_versioning(true)
                     .build(),
                 ),

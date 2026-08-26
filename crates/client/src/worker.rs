@@ -704,10 +704,12 @@ mod tests {
             .expect_task_queue()
             .return_const(task_queue.clone());
         failing_worker.expect_deployment_options().return_const(
-            WorkerDeploymentOptions::new(temporalio_common::worker::WorkerDeploymentVersion {
-                deployment_name: "test-deployment".to_string(),
-                build_id: "build-fail".to_string(),
-            })
+            WorkerDeploymentOptions::new(
+                temporalio_common::worker::WorkerDeploymentVersion::builder()
+                    .deployment_name("test-deployment".to_string())
+                    .build_id("build-fail".to_string())
+                    .build(),
+            )
             .use_worker_versioning(true)
             .build(),
         );
@@ -738,13 +740,14 @@ mod tests {
         succeeding_worker
             .expect_task_queue()
             .return_const(task_queue.clone());
-        let success_deployment_options =
-            WorkerDeploymentOptions::new(temporalio_common::worker::WorkerDeploymentVersion {
-                deployment_name: "test-deployment".to_string(),
-                build_id: "build-success".to_string(),
-            })
-            .use_worker_versioning(true)
-            .build();
+        let success_deployment_options = WorkerDeploymentOptions::new(
+            temporalio_common::worker::WorkerDeploymentVersion::builder()
+                .deployment_name("test-deployment".to_string())
+                .build_id("build-success".to_string())
+                .build(),
+        )
+        .use_worker_versioning(true)
+        .build();
         succeeding_worker
             .expect_deployment_options()
             .return_const(success_deployment_options.clone());
@@ -801,10 +804,12 @@ mod tests {
             .expect_task_queue()
             .return_const(task_queue.clone());
         failing_worker.expect_deployment_options().return_const(
-            WorkerDeploymentOptions::new(temporalio_common::worker::WorkerDeploymentVersion {
-                deployment_name: "test-deployment".to_string(),
-                build_id: "build-fail".to_string(),
-            })
+            WorkerDeploymentOptions::new(
+                temporalio_common::worker::WorkerDeploymentVersion::builder()
+                    .deployment_name("test-deployment".to_string())
+                    .build_id("build-fail".to_string())
+                    .build(),
+            )
             .use_worker_versioning(true)
             .build(),
         );
@@ -1012,10 +1017,10 @@ mod tests {
             .returning(move || {
                 build_id_for_closure.as_ref().map(|build_id| {
                     WorkerDeploymentOptions::new(
-                        temporalio_common::worker::WorkerDeploymentVersion {
-                            deployment_name: deployment_name.clone(),
-                            build_id: build_id.clone(),
-                        },
+                        temporalio_common::worker::WorkerDeploymentVersion::builder()
+                            .deployment_name(deployment_name.clone())
+                            .build_id(build_id.clone())
+                            .build(),
                     )
                     .use_worker_versioning(true)
                     .build()

@@ -2293,10 +2293,12 @@ mod tests {
             }
         }
 
-        let deployment_opts = WorkerDeploymentOptions::new(WorkerDeploymentVersion {
-            deployment_name: "test-deployment".to_string(),
-            build_id: "test-build-123".to_string(),
-        })
+        let deployment_opts = WorkerDeploymentOptions::new(
+            WorkerDeploymentVersion::builder()
+                .deployment_name("test-deployment".to_string())
+                .build_id("test-build-123".to_string())
+                .build(),
+        )
         .use_worker_versioning(use_worker_versioning)
         .build();
 

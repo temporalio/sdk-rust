@@ -19,11 +19,11 @@ pub(crate) async fn priority_values_sent_to_server() {
     } else {
         return;
     };
-    starter.workflow_options.priority = Priority {
-        priority_key: Some(1),
-        fairness_key: Some("fair-wf".to_string()),
-        fairness_weight: Some(4.2),
-    };
+    starter.workflow_options.priority = Priority::builder()
+        .priority_key(1)
+        .fairness_key("fair-wf")
+        .fairness_weight(4.2)
+        .build();
     let child_type = "child-wf";
 
     struct PriorityActivities;
@@ -33,11 +33,11 @@ pub(crate) async fn priority_values_sent_to_server() {
         async fn echo(ctx: ActivityContext, echo_me: String) -> Result<String, ActivityError> {
             assert_eq!(
                 ctx.info().priority,
-                Priority {
-                    priority_key: Some(5),
-                    fairness_key: Some("fair-act".to_string()),
-                    fairness_weight: Some(1.1)
-                }
+                Priority::builder()
+                    .priority_key(5)
+                    .fairness_key("fair-act")
+                    .fairness_weight(1.1)
+                    .build()
             );
             Ok(echo_me)
         }
@@ -60,11 +60,13 @@ pub(crate) async fn priority_values_sent_to_server() {
                     RawValue::new(vec![]),
                     ChildWorkflowOptions::builder()
                         .workflow_id(format!("{}-child", ctx.task_queue()))
-                        .priority(Priority {
-                            priority_key: Some(4),
-                            fairness_key: Some("fair-child".to_string()),
-                            fairness_weight: Some(1.23),
-                        })
+                        .priority(
+                            Priority::builder()
+                                .priority_key(4)
+                                .fairness_key("fair-child")
+                                .fairness_weight(1.23)
+                                .build(),
+                        )
                         .build(),
                 )
                 .await?;
@@ -72,11 +74,13 @@ pub(crate) async fn priority_values_sent_to_server() {
                 PriorityActivities::echo,
                 "hello".to_string(),
                 ActivityOptions::with_start_to_close_timeout(Duration::from_secs(5))
-                    .priority(Priority {
-                        priority_key: Some(5),
-                        fairness_key: Some("fair-act".to_string()),
-                        fairness_weight: Some(1.1),
-                    })
+                    .priority(
+                        Priority::builder()
+                            .priority_key(5)
+                            .fairness_key("fair-act")
+                            .fairness_weight(1.1)
+                            .build(),
+                    )
                     .do_not_eagerly_execute(true)
                     .build(),
             );
@@ -96,11 +100,11 @@ pub(crate) async fn priority_values_sent_to_server() {
         async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<()> {
             assert_eq!(
                 ctx.info().priority(),
-                Priority {
-                    priority_key: Some(4),
-                    fairness_key: Some("fair-child".to_string()),
-                    fairness_weight: Some(1.23)
-                }
+                Priority::builder()
+                    .priority_key(4)
+                    .fairness_key("fair-child")
+                    .fairness_weight(1.23)
+                    .build()
             );
             Ok(())
         }

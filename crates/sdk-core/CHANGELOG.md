@@ -51,6 +51,8 @@ relevant information.
   reason, which may affect existing dashboards.
 
 ### Breaking Changes :boom:
+* Worker deployment-version configuration now uses a non-exhaustive input type. Use the provided
+  builder to construct deployment versions.
 * Core worker integrations constructing heartbeat and activity-cancellation callback bundles must
   use the provided constructor, as callback bundles may gain fields in future releases.
 * Activity failures now include the latest heartbeat details atomically instead of force-flushing a

@@ -50,6 +50,8 @@ relevant information.
   reason, which may affect existing dashboards.
 
 ### Breaking Changes :boom:
+* `Priority` is now non-exhaustive. Use a builder to construct.
+* `WorkerDeploymentVersion` is now non-exhaustive. Use a builder to construct.
 * `WorkerCallbacks` is now non-exhaustive. Construct it with `WorkerCallbacks::new`.
 * `WorkflowExecutionInfo` is now non-exhaustive. Construct it with
   `WorkflowExecutionInfo::builder().namespace(...).workflow_id(...).build()`.

@@ -41,10 +41,12 @@
 //!
 //!     let worker_options = WorkerOptions::new("task_queue")
 //!         .deployment_options(
-//!             WorkerDeploymentOptions::new(WorkerDeploymentVersion {
-//!                 deployment_name: "my_deployment".to_owned(),
-//!                 build_id: "my_build_id".to_owned(),
-//!             })
+//!             WorkerDeploymentOptions::new(
+//!                 WorkerDeploymentVersion::builder()
+//!                     .deployment_name("my_deployment")
+//!                     .build_id("my_build_id")
+//!                     .build(),
+//!             )
 //!             .build(),
 //!         )
 //!         .register_activities(MyActivities)

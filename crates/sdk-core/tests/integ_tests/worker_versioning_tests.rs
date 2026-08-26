@@ -38,10 +38,10 @@ async fn sets_deployment_info_on_task_responses(#[values(true, false)] use_defau
     let wf_type = "sets_deployment_info_on_task_responses";
     let mut starter = CoreWfStarter::new(wf_type);
     let deploy_name = format!("deployment-{}", starter.get_task_queue());
-    let version = WorkerDeploymentVersion {
-        deployment_name: deploy_name.clone(),
-        build_id: "1.0".to_string(),
-    };
+    let version = WorkerDeploymentVersion::builder()
+        .deployment_name(deploy_name.clone())
+        .build_id("1.0".to_string())
+        .build();
     starter.sdk_config.deployment_options = WorkerDeploymentOptions::new(version.clone())
         .use_worker_versioning(true)
         .default_versioning_behavior(VersioningBehavior::AutoUpgrade)
@@ -173,10 +173,12 @@ async fn activity_has_deployment_stamp() {
     let wf_name = "activity_has_deployment_stamp";
     let mut starter = CoreWfStarter::new(wf_name);
     let deploy_name = format!("deployment-{}", starter.get_task_queue());
-    starter.sdk_config.deployment_options = WorkerDeploymentOptions::new(WorkerDeploymentVersion {
-        deployment_name: deploy_name.clone(),
-        build_id: "1.0".to_string(),
-    })
+    starter.sdk_config.deployment_options = WorkerDeploymentOptions::new(
+        WorkerDeploymentVersion::builder()
+            .deployment_name(deploy_name.clone())
+            .build_id("1.0".to_string())
+            .build(),
+    )
     .use_worker_versioning(true)
     .default_versioning_behavior(VersioningBehavior::AutoUpgrade)
     .build();
@@ -268,10 +270,12 @@ async fn versioning_off_with_custom_build_id() {
     let wf_type = "versioning_off_with_custom_build_id";
     let mut starter = CoreWfStarter::new(wf_type);
     let build_id = "my-custom-build-id-1.0";
-    starter.sdk_config.deployment_options = WorkerDeploymentOptions::new(WorkerDeploymentVersion {
-        deployment_name: format!("deployment-{}", starter.get_task_queue()),
-        build_id: build_id.to_string(),
-    })
+    starter.sdk_config.deployment_options = WorkerDeploymentOptions::new(
+        WorkerDeploymentVersion::builder()
+            .deployment_name(format!("deployment-{}", starter.get_task_queue()))
+            .build_id(build_id.to_string())
+            .build(),
+    )
     .build();
     starter.set_core_task_types(WorkerTaskTypes::workflow_only());
     let core = starter.get_core_worker().await;
@@ -360,14 +364,14 @@ async fn continue_as_new_auto_upgrade_uses_current_deployment_version() {
     let wf_type = "continue_as_new_auto_upgrade_uses_current_deployment_version";
     let mut starter = CoreWfStarter::new(wf_type);
     let deploy_name = format!("deployment-{}", starter.get_task_queue());
-    let v1 = WorkerDeploymentVersion {
-        deployment_name: deploy_name.clone(),
-        build_id: "1.0".to_string(),
-    };
-    let v2 = WorkerDeploymentVersion {
-        deployment_name: deploy_name.clone(),
-        build_id: "2.0".to_string(),
-    };
+    let v1 = WorkerDeploymentVersion::builder()
+        .deployment_name(deploy_name.clone())
+        .build_id("1.0".to_string())
+        .build();
+    let v2 = WorkerDeploymentVersion::builder()
+        .deployment_name(deploy_name.clone())
+        .build_id("2.0".to_string())
+        .build();
     starter.sdk_config.deployment_options = versioned_worker_options(v1.clone());
     let mut starter2 = starter.clone_no_worker();
     starter2.sdk_config.deployment_options = versioned_worker_options(v2.clone());
@@ -487,14 +491,14 @@ async fn continue_as_new_use_ramping_version_uses_ramping_deployment_version() {
     let wf_type = "continue_as_new_use_ramping_version_uses_ramping_deployment_version";
     let mut starter = CoreWfStarter::new(wf_type);
     let deploy_name = format!("deployment-{}", starter.get_task_queue());
-    let v1 = WorkerDeploymentVersion {
-        deployment_name: deploy_name.clone(),
-        build_id: "1.0".to_string(),
-    };
-    let v2 = WorkerDeploymentVersion {
-        deployment_name: deploy_name.clone(),
-        build_id: "2.0".to_string(),
-    };
+    let v1 = WorkerDeploymentVersion::builder()
+        .deployment_name(deploy_name.clone())
+        .build_id("1.0".to_string())
+        .build();
+    let v2 = WorkerDeploymentVersion::builder()
+        .deployment_name(deploy_name.clone())
+        .build_id("2.0".to_string())
+        .build();
     starter.sdk_config.deployment_options = versioned_worker_options(v1.clone());
     let mut starter2 = starter.clone_no_worker();
     starter2.sdk_config.deployment_options = versioned_worker_options(v2.clone());

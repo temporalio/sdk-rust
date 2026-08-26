@@ -592,10 +592,10 @@ impl WorkflowMachines {
                 (*$me.observed_internal_flags)
                     .borrow_mut()
                     .add_from_complete($wtc);
-                let mut combined_ver = WorkerDeploymentVersion {
-                    deployment_name: "".to_string(),
-                    build_id: "".to_string(),
-                };
+                let mut combined_ver = WorkerDeploymentVersion::builder()
+                    .deployment_name("")
+                    .build_id("")
+                    .build();
                 #[allow(deprecated)]
                 if let Some(bid) = $wtc.worker_version.as_ref().map(|wv| &wv.build_id) {
                     combined_ver.build_id = bid.to_string();
