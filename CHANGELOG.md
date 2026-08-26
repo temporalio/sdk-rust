@@ -67,6 +67,7 @@ relevant information.
   `WorkflowStartOptions::start_signal` and `WorkflowStartSignal`.
 
 ### Fixed
+* Workflow start requests now include the client's identity.
 * An activity failure caused by oversized final heartbeat details is now counted in the
   `temporal_activity_execution_failed` metric as `failure_reason="PayloadsTooLarge"`. Previously it
   was counted under the reason for the failure the activity itself reported, and was not counted at

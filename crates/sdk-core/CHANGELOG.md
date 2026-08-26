@@ -54,6 +54,9 @@ relevant information.
   are preserved on failure; workers warn when the server does not advertise support.
 
 ### Fixed
+* Update-with-start `ExecuteMultiOperation` calls now use Core's long-poll timeout instead of the
+  normal RPC timeout, avoiding premature failures while waiting for an update to reach its
+  requested stage.
 * An activity failure caused by oversized final heartbeat details is now counted in the
   `temporal_activity_execution_failed` metric as `failure_reason="PayloadsTooLarge"`. Previously it
   was counted under the reason for the failure the activity itself reported, and was not counted at

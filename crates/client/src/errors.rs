@@ -259,10 +259,11 @@ impl WorkflowUpdateWithStartError {
             .into_iter()
             .enumerate()
             .find(|(_, op_status)| {
-                !op_status
-                    .details
-                    .iter()
-                    .any(|detail| detail.type_url.ends_with(MULTI_OPERATION_ABORTED_NAME))
+                op_status.code != Code::Ok as i32
+                    && !op_status
+                        .details
+                        .iter()
+                        .any(|detail| detail.type_url.ends_with(MULTI_OPERATION_ABORTED_NAME))
             });
         match culprit {
             Some((0, op_status)) => Self::Start(WorkflowStartError::from_status(
@@ -667,6 +668,32 @@ mod tests {
         let detail = decode_status_detail::<NotFoundFailure>(inner.details())
             .expect("operation details must be preserved");
         assert_eq!(detail.current_cluster, "here");
+    }
+
+    #[test]
+    fn update_with_start_error_skips_successful_start() {
+        let status = multi_op_status(
+            Code::NotFound,
+            vec![
+                OperationStatus {
+                    code: Code::Ok as i32,
+                    message: String::new(),
+                    details: vec![],
+                },
+                OperationStatus {
+                    code: Code::NotFound as i32,
+                    message: "update failed".to_owned(),
+                    details: vec![],
+                },
+            ],
+        );
+
+        let err = WorkflowUpdateWithStartError::from_status(status);
+        assert_matches!(
+            err,
+            WorkflowUpdateWithStartError::Update(WorkflowUpdateError::NotFound(status))
+                if status.message() == "update failed"
+        );
     }
 
     #[test]
