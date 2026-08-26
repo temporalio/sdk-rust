@@ -1137,9 +1137,9 @@ async fn sends_appropriate_sticky_task_queue_responses() {
     let t = canned_histories::single_timer("1");
     let mut mock = mock_worker_client();
     mock.expect_complete_workflow_task()
-        .withf(|comp| comp.sticky_attributes.is_some())
+        .withf(|comp, _| comp.sticky_attributes.is_some())
         .times(1)
-        .returning(|_| Ok(Default::default()));
+        .returning(|_, _| Ok(Default::default()));
     mock.expect_complete_workflow_task().times(0);
     let mut mock = single_hist_mock_sg(wfid, t, [1], mock, false);
     mock.worker_cfg(|wc| wc.max_cached_workflows = 10);
@@ -1222,7 +1222,7 @@ async fn buffered_work_drained_on_shutdown() {
     );
     let mut mock = mock_worker_client();
     mock.expect_complete_workflow_task()
-        .returning(|_| Ok(RespondWorkflowTaskCompletedResponse::default()));
+        .returning(|_, _| Ok(RespondWorkflowTaskCompletedResponse::default()));
     let mut mock = MocksHolder::from_wft_stream(mock, stream::iter(tasks));
     // Cache on to avoid being super repetitive
     mock.worker_cfg(|wc| wc.max_cached_workflows = 10);
@@ -1396,10 +1396,10 @@ async fn lang_slower_than_wft_timeouts() {
     let mut mock = mock_worker_client();
     mock.expect_complete_workflow_task()
         .times(1)
-        .returning(|_| Err(tonic::Status::not_found("Workflow task not found.")));
+        .returning(|_, _| Err(tonic::Status::not_found("Workflow task not found.")));
     mock.expect_complete_workflow_task()
         .times(1)
-        .returning(|_| Ok(Default::default()));
+        .returning(|_, _| Ok(Default::default()));
     let mut mock = single_hist_mock_sg(wfid, t, [1, 1], mock, true);
     let tasksmap = mock.outstanding_task_map.clone().unwrap();
     mock.worker_cfg(|wc| {
@@ -1815,10 +1815,10 @@ async fn tasks_from_completion_are_delivered() {
     };
     mock.expect_complete_workflow_task()
         .times(1)
-        .returning(move |_| Ok(complete_resp.clone()));
+        .returning(move |_, _| Ok(complete_resp.clone()));
     mock.expect_complete_workflow_task()
         .times(1)
-        .returning(|_| Ok(Default::default()));
+        .returning(|_, _| Ok(Default::default()));
     let mut mock = single_hist_mock_sg(wfid, t, [1], mock, true);
     mock.worker_cfg(|wc| wc.max_cached_workflows = 2);
     let core = mock_worker(mock);
@@ -1861,10 +1861,10 @@ async fn pagination_works_with_tasks_from_completion() {
     };
     mock.expect_complete_workflow_task()
         .times(1)
-        .returning(move |_| Ok(complete_resp.clone()));
+        .returning(move |_, _| Ok(complete_resp.clone()));
     mock.expect_complete_workflow_task()
         .times(1)
-        .returning(|_| Ok(Default::default()));
+        .returning(|_, _| Ok(Default::default()));
 
     let get_exec_resp: GetWorkflowExecutionHistoryResponse =
         t.get_full_history_info().unwrap().into();
@@ -1910,7 +1910,7 @@ async fn poll_faster_than_complete_wont_overflow_cache() {
     mock_client
         .expect_complete_workflow_task()
         .times(3)
-        .returning(|_| Ok(Default::default()));
+        .returning(|_, _| Ok(Default::default()));
     let mut mock_cfg = MockPollCfg::new(tasks, true, 0);
     mock_cfg.mock_client = mock_client;
     let mut mock = build_mock_pollers(mock_cfg);
@@ -2167,7 +2167,7 @@ async fn no_race_acquiring_permits() {
         .returning(move |_, _| async move { Ok(Default::default()) }.boxed());
     mock_client
         .expect_complete_workflow_task()
-        .returning(|_| async move { Ok(Default::default()) }.boxed());
+        .returning(|_, _| async move { Ok(Default::default()) }.boxed());
 
     let worker = Worker::new_test(
         {
@@ -2253,7 +2253,7 @@ async fn continue_as_new_preserves_some_values() {
     };
     mock_client
         .expect_complete_workflow_task()
-        .returning(move |mut c| {
+        .returning(move |mut c, _| {
             let cmd = c.commands.pop().unwrap().attributes.unwrap();
             if let Attributes::ContinueAsNewWorkflowExecutionCommandAttributes(a) = cmd {
                 assert_eq!(a.workflow_type.unwrap().name, "meow");
@@ -2821,7 +2821,7 @@ async fn poller_wont_run_ahead_of_task_slots() {
         .returning(move |_, _| Ok(bunch_of_first_tasks.next().unwrap()));
     mock_client
         .expect_complete_workflow_task()
-        .returning(|_| Ok(Default::default()));
+        .returning(|_, _| Ok(Default::default()));
 
     let worker = Worker::new_test(
         {
@@ -2931,7 +2931,7 @@ async fn use_compatible_version_flag(
     #[allow(deprecated)]
     mock_client
         .expect_complete_workflow_task()
-        .returning(move |mut c| {
+        .returning(move |mut c, _| {
             let can_cmd = c.commands.pop().unwrap().attributes.unwrap();
             match can_cmd {
                 Attributes::ContinueAsNewWorkflowExecutionCommandAttributes(a) => {
@@ -3007,7 +3007,7 @@ async fn slot_provider_cant_hand_out_more_permits_than_cache_size() {
         .returning(move |_, _| Ok(bunch_of_first_tasks.next().unwrap()));
     mock_client
         .expect_complete_workflow_task()
-        .returning(|_| Ok(Default::default()));
+        .returning(|_, _| Ok(Default::default()));
 
     struct EndlessSupplier {}
     #[async_trait::async_trait]
@@ -3169,7 +3169,7 @@ async fn both_normal_and_sticky_pollers_poll_concurrently() {
     let cc = Arc::clone(&counters);
     mock_client
         .expect_complete_workflow_task()
-        .returning(move |completion| {
+        .returning(move |completion, _| {
             if completion.task_token.0.ends_with(b"normal") {
                 cc.normal_slots_active_count.fetch_sub(1, Ordering::Relaxed);
             } else {

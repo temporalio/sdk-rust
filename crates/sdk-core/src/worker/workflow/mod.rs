@@ -421,7 +421,6 @@ impl Workflows {
                     wft_completion_size_limit: self
                         .namespace_capabilities
                         .workflow_task_completion_size_limit(),
-                    shutdown_token: self.shutdown_token.clone(),
                 };
                 let sticky_attrs = self.sticky_attrs.clone();
                 // Do not return new WFT if we would not cache, because returned new WFTs are
@@ -433,7 +432,11 @@ impl Workflows {
 
                 let mut reset_last_started_to = None;
                 self.handle_wft_reporting_errs(run_id, || async {
-                    match self.client.complete_workflow_task(completion).await {
+                    match self
+                        .client
+                        .complete_workflow_task(completion, self.shutdown_token.clone())
+                        .await
+                    {
                         Ok(response) => {
                             if let Some(record) = maybe_record_terminal_metric.take() {
                                 record(&run_metrics);

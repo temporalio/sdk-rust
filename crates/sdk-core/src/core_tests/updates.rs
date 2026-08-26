@@ -110,7 +110,7 @@ async fn initial_request_sent_back(#[values(false, true)] reject: bool) {
     mock_client
         .expect_complete_workflow_task()
         .times(1)
-        .returning(move |mut resp| {
+        .returning(move |mut resp, _| {
             let msg = resp.messages.pop().unwrap();
             let orig_req = if reject {
                 let acceptance = msg.body.unwrap().to_msg::<Rejection>().unwrap();
@@ -338,7 +338,7 @@ async fn update_activation_has_update_id() {
     mock_client
         .expect_complete_workflow_task()
         .times(1)
-        .returning(|_| Ok(RespondWorkflowTaskCompletedResponse::default()));
+        .returning(|_, _| Ok(RespondWorkflowTaskCompletedResponse::default()));
     let mh = MockPollCfg::from_resp_batches(wfid, t, [poll_resp], mock_client);
     let core = mock_worker(build_mock_pollers(mh));
 

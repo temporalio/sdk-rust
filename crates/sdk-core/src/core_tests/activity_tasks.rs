@@ -1282,7 +1282,7 @@ async fn no_eager_activities_requested_when_worker_options_disable_it(
     let mut mock = mock_worker_client();
     mock.expect_complete_workflow_task()
         .times(1)
-        .returning(move |req| {
+        .returning(move |req, _| {
             // Store the number of eager activities requested to be checked below
             let count = req
                 .commands
@@ -1369,7 +1369,7 @@ async fn activity_tasks_from_completion_are_delivered() {
     let mut mock = mock_worker_client();
     mock.expect_complete_workflow_task()
         .times(1)
-        .returning(move |req| {
+        .returning(move |req, _| {
             // Store the number of eager activities requested to be checked below
             let count = req
                 .commands

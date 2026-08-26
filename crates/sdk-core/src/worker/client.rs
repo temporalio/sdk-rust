@@ -317,6 +317,7 @@ pub trait WorkerClient: Sync + Send {
     async fn complete_workflow_task(
         &self,
         request: WorkflowTaskCompletion,
+        shutdown_token: CancellationToken,
     ) -> Result<RespondWorkflowTaskCompletedResponse>;
     /// Complete an activity task
     async fn complete_activity_task(
@@ -597,10 +598,10 @@ impl WorkerClient for WorkerClientBag {
     async fn complete_workflow_task(
         &self,
         request: WorkflowTaskCompletion,
+        shutdown_token: CancellationToken,
     ) -> Result<RespondWorkflowTaskCompletedResponse> {
         let pagination_enabled = request.pagination_enabled;
         let wft_completion_size_limit = request.wft_completion_size_limit;
-        let shutdown_token = request.shutdown_token.clone();
         #[allow(deprecated)] // want to list all fields explicitly
         let request = RespondWorkflowTaskCompletedRequest {
             task_token: request.task_token.into(),
@@ -689,11 +690,12 @@ impl WorkerClient for WorkerClientBag {
 
         // Buffer loss is transient, so resend the whole set from page 0 with exponential backoff.
         // The server bounds the loop: once the task times out it starts a new attempt, and the next
-        // resend fails the token check with a non-buffer-lost error. Shutdown ends the loop sooner,
-        // so a stream of buffer losses cannot hold shutdown open until the task times out. Recovery
-        // has to live here because the client's retry layer would resend only the single failed
-        // page, which cannot rebuild the buffer the server dropped; it is told to pass buffer loss
-        // straight through (see `wft_completion_page_request`).
+        // resend fails the token check with a non-buffer-lost error. Worker shutdown ends the loop
+        // sooner, so a stream of buffer losses can't hold shutdown's drain open until the task times
+        // out (a completion that is not resending still drains normally). Recovery has to live here
+        // because the client's retry layer would resend only the single failed page, which cannot
+        // rebuild the buffer the server dropped; it is told to pass buffer loss straight through
+        // (see `wft_completion_page_request`).
         let mut backoff = WFT_COMPLETION_PAGE_RESEND_BACKOFF.build();
         loop {
             let send_all = async {
@@ -1187,8 +1189,6 @@ pub struct WorkflowTaskCompletion {
     /// advertises one. A paginated completion larger than this is rejected server-side with
     /// `REQUEST_TOO_LARGE`, so the worker fails it proactively instead of sending doomed pages.
     pub wft_completion_size_limit: Option<usize>,
-    /// Signaled when the worker is shutting down.
-    pub shutdown_token: CancellationToken,
 }
 
 #[derive(Clone, Default)]
@@ -1626,9 +1626,11 @@ mod tests {
                 versioning_behavior: VersioningBehavior::Unspecified,
                 pagination_enabled: true,
                 wft_completion_size_limit: None,
-                shutdown_token: CancellationToken::new(),
             };
-            client.complete_workflow_task(completion).await.unwrap();
+            client
+                .complete_workflow_task(completion, CancellationToken::new())
+                .await
+                .unwrap();
 
             let sent = captured.lock().unwrap();
             assert!(
@@ -1725,14 +1727,13 @@ mod tests {
                 versioning_behavior: VersioningBehavior::Unspecified,
                 pagination_enabled: true,
                 wft_completion_size_limit: None,
-                shutdown_token: CancellationToken::new(),
             };
 
             // Without cancellation this would hang on the never-completing page; the timeout guards
             // against that regression instead of relying on a sleep.
             let outcome = tokio::time::timeout(
                 Duration::from_secs(10),
-                client.complete_workflow_task(completion),
+                client.complete_workflow_task(completion, CancellationToken::new()),
             )
             .await
             .expect("completion resolved without waiting on the hung page");
@@ -1802,10 +1803,9 @@ mod tests {
                 versioning_behavior: VersioningBehavior::Unspecified,
                 pagination_enabled: true,
                 wft_completion_size_limit: Some(1024 * 1024),
-                shutdown_token: CancellationToken::new(),
             };
             let err = client
-                .complete_workflow_task(completion)
+                .complete_workflow_task(completion, CancellationToken::new())
                 .await
                 .expect_err("completion over the namespace limit must fail");
             assert!(err.metadata().contains_key(REQUEST_TOO_LARGE_KEY));
@@ -1889,10 +1889,9 @@ mod tests {
                 versioning_behavior: VersioningBehavior::Unspecified,
                 pagination_enabled: true,
                 wft_completion_size_limit: None,
-                shutdown_token: CancellationToken::new(),
             };
             client
-                .complete_workflow_task(completion)
+                .complete_workflow_task(completion, CancellationToken::new())
                 .await
                 .expect("completion eventually succeeds after the buffer is re-established");
             assert_eq!(
@@ -1979,12 +1978,11 @@ mod tests {
                 versioning_behavior: VersioningBehavior::Unspecified,
                 pagination_enabled: true,
                 wft_completion_size_limit: None,
-                shutdown_token,
             };
 
             let err = tokio::time::timeout(
                 Duration::from_secs(10),
-                client.complete_workflow_task(completion),
+                client.complete_workflow_task(completion, shutdown_token),
             )
             .await
             .expect("shutdown ends the resend loop instead of waiting for the server timeout")
@@ -1995,6 +1993,84 @@ mod tests {
                 1,
                 "the first attempt still sends; shutdown prevents any resend"
             );
+        }
+
+        #[tokio::test]
+        async fn cancelled_shutdown_does_not_interrupt_successful_completion() {
+            // The shutdown token is only consulted while resending after buffer loss. A completion
+            // that never hits buffer loss must still succeed even when the worker is shutting down,
+            // so graceful drain can finish outstanding completions rather than abandon them.
+            let final_pages = Arc::new(Mutex::new(0usize));
+            let final_pages_cb = final_pages.clone();
+            let service_override = CallbackBasedGrpcService {
+                callback: Arc::new(move |request| {
+                    let final_pages = final_pages_cb.clone();
+                    Box::pin(async move {
+                        let proto = match request.rpc.as_str() {
+                            "GetSystemInfo" => GetSystemInfoResponse {
+                                capabilities: Some(Capabilities::default()),
+                                ..Default::default()
+                            }
+                            .encode_to_vec(),
+                            "RespondWorkflowTaskCompleted" => {
+                                let page =
+                                    RespondWorkflowTaskCompletedRequest::decode(request.proto)
+                                        .expect("completion request is valid");
+                                if !page.intermediate_page {
+                                    *final_pages.lock().unwrap() += 1;
+                                }
+                                RespondWorkflowTaskCompletedResponse::default().encode_to_vec()
+                            }
+                            rpc => panic!("unexpected RPC: {rpc}"),
+                        };
+                        Ok(GrpcSuccessResponse {
+                            headers: Default::default(),
+                            proto,
+                        })
+                    })
+                }),
+            };
+            let connection = Connection::connect(
+                ConnectionOptions::new(url::Url::parse("http://localhost:7233").unwrap())
+                    .service_override(service_override)
+                    .dns_load_balancing(None)
+                    .build(),
+            )
+            .await
+            .unwrap();
+            let client = WorkerClientBag::new(
+                SharedReplaceableClient::new(connection),
+                "namespace".to_string(),
+                WorkerVersioningStrategy::LegacyBuildIdBased {
+                    build_id: "test-build".to_string(),
+                },
+                Uuid::new_v4(),
+            );
+
+            let shutdown_token = CancellationToken::new();
+            shutdown_token.cancel();
+            let commands: Vec<_> = (0..8).map(|_| command_with_payload(512 * 1024)).collect();
+            let completion = WorkflowTaskCompletion {
+                task_token: TaskToken(b"shared-token".to_vec()),
+                commands,
+                messages: vec![],
+                sticky_attributes: None,
+                query_responses: vec![],
+                return_new_workflow_task: false,
+                force_create_new_workflow_task: false,
+                sdk_metadata: Default::default(),
+                metering_metadata: Default::default(),
+                versioning_behavior: VersioningBehavior::Unspecified,
+                pagination_enabled: true,
+                wft_completion_size_limit: None,
+            };
+
+            client
+                .complete_workflow_task(completion, shutdown_token)
+                .await
+                .expect("a completion without buffer loss succeeds despite shutdown");
+            // The paginated path ran to its final page rather than being cut short.
+            assert_eq!(*final_pages.lock().unwrap(), 1);
         }
     }
 }
