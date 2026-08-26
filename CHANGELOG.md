@@ -50,6 +50,8 @@ relevant information.
   reason, which may affect existing dashboards.
 
 ### Breaking Changes :boom:
+* `ActivityCloseTimeouts` is now non-exhaustive. Add a wildcard branch to downstream matches.
+* Renamed `ActivityCloseTimeouts::Both` to `ActivityCloseTimeouts::ScheduleAndStartToClose`.
 * Removed the unused `ActExitValue` type. Use `ActivityError::WillCompleteAsync` to mark an
   activity for asynchronous completion.
 * Removed the test-only `FailOnNondeterminismInterceptor` from the public Rust SDK API.

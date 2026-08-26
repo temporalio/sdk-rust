@@ -1059,13 +1059,14 @@ mod tests {
 
     #[test]
     fn activity_options_both_close_timeouts_map_to_command() {
-        let req = ActivityOptions::with_close_timeouts(ActivityCloseTimeouts::Both {
-            start_to_close: Duration::from_secs(3),
-            schedule_to_close: Duration::from_secs(8),
-        })
-        .cancellation_type(ActivityCancellationType::Abandon)
-        .build()
-        .into_command(7, "test".to_string(), vec![], HashMap::new());
+        let req =
+            ActivityOptions::with_close_timeouts(ActivityCloseTimeouts::ScheduleAndStartToClose {
+                start_to_close: Duration::from_secs(3),
+                schedule_to_close: Duration::from_secs(8),
+            })
+            .cancellation_type(ActivityCancellationType::Abandon)
+            .build()
+            .into_command(7, "test".to_string(), vec![], HashMap::new());
         let Some(workflow_command::Variant::ScheduleActivity(req)) = req.variant else {
             panic!("expected ScheduleActivity command");
         };

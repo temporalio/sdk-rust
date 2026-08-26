@@ -59,10 +59,12 @@ impl ActivityLoadWf {
             .execute_activity(
                 StdActivities::echo,
                 input_str.clone(),
-                ActivityOptions::with_close_timeouts(ActivityCloseTimeouts::Both {
-                    start_to_close: Duration::from_secs(8),
-                    schedule_to_close: Duration::from_secs(8),
-                })
+                ActivityOptions::with_close_timeouts(
+                    ActivityCloseTimeouts::ScheduleAndStartToClose {
+                        start_to_close: Duration::from_secs(8),
+                        schedule_to_close: Duration::from_secs(8),
+                    },
+                )
                 .activity_id("act-1".to_string())
                 .task_queue(tq)
                 .schedule_to_start_timeout(Duration::from_secs(8))
