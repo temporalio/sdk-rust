@@ -752,7 +752,7 @@ pub fn build_mock_pollers(mut cfg: MockPollCfg) -> MocksHolder {
                     let rid = t.workflow_execution.as_ref().unwrap().run_id.clone();
                     if !outstanding.has_run(&rid) {
                         let t = tasks.pop_front().unwrap();
-                        outstanding.put_token(rid, TaskToken(t.task_token.clone()));
+                        outstanding.put_token(rid, t.task_token.clone().into());
                         resp = Some(t);
                         break;
                     }

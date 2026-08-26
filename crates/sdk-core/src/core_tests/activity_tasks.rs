@@ -19,6 +19,7 @@ use futures_util::FutureExt;
 use itertools::Itertools;
 use prost::Message;
 use std::{
+    borrow::Borrow,
     collections::{HashMap, HashSet, VecDeque, hash_map::Entry},
     future,
     sync::{
@@ -1557,7 +1558,7 @@ async fn graceful_shutdown(#[values(true, false)] at_max_outstanding: bool) {
         });
     mock_client.expect_fail_activity_task().times(3).returning(
         |task_token, _, _, last_heartbeat_details| {
-            if task_token.0 == [1] {
+            if task_token.borrow() == [1] {
                 assert_eq!(last_heartbeat_details.unwrap().payloads[0].data, [2]);
             } else {
                 assert!(last_heartbeat_details.is_none());

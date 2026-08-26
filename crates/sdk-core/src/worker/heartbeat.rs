@@ -303,7 +303,7 @@ async fn handle_worker_command_task(
     for command in &exec_req.commands {
         let result_type = match &command.r#type {
             Some(WorkerCommandType::CancelActivity(cancel_cmd)) => {
-                let tt = TaskToken(cancel_cmd.task_token.clone());
+                let tt: TaskToken = cancel_cmd.task_token.clone().into();
                 let cancel_callbacks: Vec<_> = callbacks_map
                     .read()
                     .values()

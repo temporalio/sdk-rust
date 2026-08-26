@@ -3170,7 +3170,7 @@ async fn both_normal_and_sticky_pollers_poll_concurrently() {
     mock_client
         .expect_complete_workflow_task()
         .returning(move |completion| {
-            if completion.task_token.0.ends_with(b"normal") {
+            if completion.task_token.into_inner().ends_with(b"normal") {
                 cc.normal_slots_active_count.fetch_sub(1, Ordering::Relaxed);
             } else {
                 cc.sticky_slots_active_count.fetch_sub(1, Ordering::Relaxed);

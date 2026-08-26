@@ -121,7 +121,7 @@ impl TryFrom<PollWorkflowTaskQueueResponse> for ValidPollWFTQResponse {
                 let messages = messages.into_iter().map(TryInto::try_into).try_collect()?;
 
                 Ok(Self {
-                    task_token: TaskToken(task_token),
+                    task_token: task_token.into(),
                     task_queue: tq.name,
                     workflow_execution,
                     workflow_type: workflow_type.name,

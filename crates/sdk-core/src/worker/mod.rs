@@ -1392,7 +1392,7 @@ impl Worker {
     /// options.
     pub fn record_activity_heartbeat(&self, details: ActivityHeartbeat) {
         if let Some(at_mgr) = self.task_subsystems.at_task_mgr.as_ref() {
-            let tt = TaskToken(details.task_token.clone());
+            let tt: TaskToken = details.task_token.clone().into();
             if let Err(e) = at_mgr.record_heartbeat(details) {
                 warn!(task_token = %tt, details = ?e, "Activity heartbeat failed.");
             }
@@ -1408,7 +1408,7 @@ impl Worker {
         &self,
         completion: ActivityTaskCompletion,
     ) -> Result<(), CompleteActivityError> {
-        let task_token = TaskToken(completion.task_token);
+        let task_token: TaskToken = completion.task_token.into();
         let status = if let Some(s) = completion.result.and_then(|r| r.status) {
             s
         } else {
@@ -1533,7 +1533,7 @@ impl Worker {
                 reason: "Nexus completion had empty status field".to_owned(),
             });
         };
-        let tt = TaskToken(completion.task_token);
+        let tt: TaskToken = completion.task_token.into();
         tracing::Span::current().record("task_token", tt.to_string());
         tracing::Span::current().record("status", status.to_string());
 

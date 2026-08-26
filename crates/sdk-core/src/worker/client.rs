@@ -531,7 +531,7 @@ impl WorkerClient for WorkerClientBag {
             .respond_activity_task_completed(
                 #[allow(deprecated)] // want to list all fields explicitly
                 RespondActivityTaskCompletedRequest {
-                    task_token: task_token.0,
+                    task_token: task_token.into_inner(),
                     result,
                     identity: self.identity(),
                     namespace: self.namespace.clone(),
@@ -559,7 +559,7 @@ impl WorkerClient for WorkerClientBag {
                 RespondNexusTaskCompletedRequest {
                     namespace: self.namespace.clone(),
                     identity: self.identity(),
-                    task_token: task_token.0,
+                    task_token: task_token.into_inner(),
                     response: Some(response),
                     poller_group_id: Default::default(),
                 }
@@ -579,7 +579,7 @@ impl WorkerClient for WorkerClientBag {
             .clone()
             .record_activity_task_heartbeat(
                 RecordActivityTaskHeartbeatRequest {
-                    task_token: task_token.0,
+                    task_token: task_token.into_inner(),
                     details,
                     identity: self.identity(),
                     namespace: self.namespace.clone(),
@@ -602,7 +602,7 @@ impl WorkerClient for WorkerClientBag {
             .respond_activity_task_canceled(
                 #[allow(deprecated)] // want to list all fields explicitly
                 RespondActivityTaskCanceledRequest {
-                    task_token: task_token.0,
+                    task_token: task_token.into_inner(),
                     details,
                     identity: self.identity(),
                     namespace: self.namespace.clone(),
@@ -634,7 +634,7 @@ impl WorkerClient for WorkerClientBag {
             .respond_activity_task_failed(
                 #[allow(deprecated)] // want to list all fields explicitly
                 RespondActivityTaskFailedRequest {
-                    task_token: task_token.0,
+                    task_token: task_token.into_inner(),
                     failure,
                     identity: self.identity(),
                     namespace: self.namespace.clone(),
@@ -659,7 +659,7 @@ impl WorkerClient for WorkerClientBag {
     ) -> Result<RespondWorkflowTaskFailedResponse> {
         #[allow(deprecated)] // want to list all fields explicitly
         let request = RespondWorkflowTaskFailedRequest {
-            task_token: task_token.0,
+            task_token: task_token.into_inner(),
             cause: cause as i32,
             failure,
             identity: self.identity(),
@@ -698,7 +698,7 @@ impl WorkerClient for WorkerClientBag {
                 RespondNexusTaskFailedRequest {
                     namespace: self.namespace.clone(),
                     identity: self.identity(),
-                    task_token: task_token.0,
+                    task_token: task_token.into_inner(),
                     failure,
                     error,
                     poller_group_id: Default::default(),
@@ -1059,7 +1059,7 @@ mod tests {
 
         client
             .fail_activity_task(
-                TaskToken(vec![1]),
+                vec![1].into(),
                 ActivityTaskFailedCause::ActivityWorkerUnhandledFailure,
                 None,
                 Some(last_heartbeat_details.clone()),

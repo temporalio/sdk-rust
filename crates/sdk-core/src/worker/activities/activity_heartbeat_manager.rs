@@ -254,7 +254,7 @@ impl ActivityHeartbeatManager {
     ) -> Result<(), ActivityHeartbeatError> {
         self.heartbeat_tx
             .send(HeartbeatAction::SendHeartbeat(ValidActivityHeartbeat {
-                task_token: TaskToken(hb.task_token),
+                task_token: hb.task_token.into(),
                 details: hb.details,
                 throttle_interval,
                 timeout_resetter,

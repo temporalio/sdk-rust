@@ -568,8 +568,9 @@ impl WorkerActivityTasks {
         // TODO: Propagate these back as cancels. Silent fails is too nonobvious
         let (heartbeat_timeout, timeout_resetter) = {
             let mut outstanding_activity_tasks = self.outstanding_activity_tasks.lock();
+            let task_token: TaskToken = details.task_token.clone().into();
             let at_info = outstanding_activity_tasks
-                .get_mut(&TaskToken(details.task_token.clone()))
+                .get_mut(&task_token)
                 .ok_or(ActivityHeartbeatError::UnknownActivity)?;
             at_info.last_heartbeat_details = Some(details.details.clone());
             (at_info.heartbeat_timeout, at_info.timeout_resetter.clone())
@@ -680,7 +681,7 @@ where
                                         details.known_not_found = true;
                                     }
                                     Some(Ok(ActivityTask::cancel_from_ids(
-                                        next_pc.task_token.0,
+                                        next_pc.task_token.into_inner(),
                                         next_pc.reason,
                                         next_pc.details,
                                     )))
@@ -1146,13 +1147,13 @@ mod tests {
         shutdown_token.cancel();
         // Need to complete the tasks so shutdown will resolve
         atm.complete(
-            TaskToken(t1.task_token),
+            t1.task_token.into(),
             ActivityExecutionResult::ok(vec![1].into()).status.unwrap(),
             mock_client.as_ref(),
         )
         .await;
         atm.complete(
-            TaskToken(t2.task_token),
+            t2.task_token.into(),
             ActivityExecutionResult::ok(vec![1].into()).status.unwrap(),
             mock_client.as_ref(),
         )
@@ -1215,7 +1216,7 @@ mod tests {
             // Make sure it didn't take wayyy too long. Our long timeouts specified above are huge
             assert!(start.elapsed() < Duration::from_secs(5));
             atm.complete(
-                TaskToken(t.task_token),
+                t.task_token.into(),
                 ActivityExecutionResult::fail("unimportant".into())
                     .status
                     .unwrap(),
@@ -1280,7 +1281,7 @@ mod tests {
         join!(heartbeater, poller);
 
         atm.complete(
-            TaskToken(t.task_token),
+            t.task_token.into(),
             ActivityExecutionResult::fail("unimportant".into())
                 .status
                 .unwrap(),
@@ -1348,7 +1349,7 @@ mod tests {
         assert!(activity_task.is_timeout());
 
         atm.complete(
-            TaskToken(t.task_token),
+            t.task_token.into(),
             ActivityExecutionResult::fail("unimportant".into())
                 .status
                 .unwrap(),
