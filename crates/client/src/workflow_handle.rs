@@ -63,10 +63,7 @@ fn decode_user_metadata(
     user_metadata: Option<UserMetadata>,
 ) -> Result<DecodedUserMetadata, PayloadConversionError> {
     let payload_converter = PayloadConverter::default();
-    let context = SerializationContext {
-        data: context,
-        converter: &payload_converter,
-    };
+    let context = SerializationContext::new(context, &payload_converter);
     let (summary, details) = user_metadata
         .map(|metadata| (metadata.summary, metadata.details))
         .unwrap_or_default();
@@ -715,10 +712,7 @@ where
                         let data_converter = client.data_converter().clone();
                         let unencoded_payloads = {
                             let payload_converter = data_converter.payload_converter();
-                            let context = SerializationContext {
-                                data: &SerializationContextData::Workflow,
-                                converter: payload_converter,
-                            };
+                            let context = SerializationContext::new(&SerializationContextData::Workflow, payload_converter);
                             args.serialize_payloads(&context)
                         };
                         drop(args);
@@ -786,10 +780,7 @@ where
                         let data_converter = client.data_converter().clone();
                         let unencoded_payloads = {
                             let payload_converter = data_converter.payload_converter();
-                            let context = SerializationContext {
-                                data: &SerializationContextData::Workflow,
-                                converter: payload_converter,
-                            };
+                            let context = SerializationContext::new(&SerializationContextData::Workflow, payload_converter);
                             args.serialize_payloads(&context)
                         };
                         drop(args);
@@ -888,90 +879,90 @@ where
         U: UpdateDefinition<Workflow = W::Run>,
         U::Input: Send,
     {
-        let output = interceptors::call_start_workflow_update(
-            self.client.client_interceptors(),
-            StartWorkflowUpdateInput::new(
-                self.info().workflow_id.clone(),
-                self.info().run_id.clone().unwrap_or_default(),
-                update.name().to_string(),
-                input,
-                options,
-            ),
-            Next::new({
-                let mut client = self.client.clone();
-                move |input: StartWorkflowUpdateInput| -> BoxFuture<
-                    '_,
-                    Result<StartWorkflowUpdateOutput, WorkflowUpdateError>,
-                > {
-                    Box::pin(async move {
-                        let (workflow_id, run_id, update_name, args, options) = input.into_parts();
-                        let data_converter = client.data_converter().clone();
-                        let unencoded_payloads = {
-                            let payload_converter = data_converter.payload_converter();
-                            let context = SerializationContext {
-                                data: &SerializationContextData::Workflow,
-                                converter: payload_converter,
+        let output =
+            interceptors::call_start_workflow_update(
+                self.client.client_interceptors(),
+                StartWorkflowUpdateInput::new(
+                    self.info().workflow_id.clone(),
+                    self.info().run_id.clone().unwrap_or_default(),
+                    update.name().to_string(),
+                    input,
+                    options,
+                ),
+                Next::new({
+                    let mut client = self.client.clone();
+                    move |input: StartWorkflowUpdateInput| -> BoxFuture<
+                        '_,
+                        Result<StartWorkflowUpdateOutput, WorkflowUpdateError>,
+                    > {
+                        Box::pin(async move {
+                            let (workflow_id, run_id, update_name, args, options) =
+                                input.into_parts();
+                            let data_converter = client.data_converter().clone();
+                            let unencoded_payloads = {
+                                let payload_converter = data_converter.payload_converter();
+                                let context = SerializationContext::new(
+                                    &SerializationContextData::Workflow,
+                                    payload_converter,
+                                );
+                                args.serialize_payloads(&context)
                             };
-                            args.serialize_payloads(&context)
-                        };
-                        drop(args);
-                        let payloads = data_converter
-                            .codec()
-                            .encode(&SerializationContextData::Workflow, unencoded_payloads?)
-                            .await?;
-                        let update_id = options
-                            .update_id
-                            .unwrap_or_else(|| Uuid::new_v4().to_string());
-                        let mut request = UpdateWorkflowExecutionRequest {
-                            namespace: client.namespace(),
-                            workflow_execution: Some(ProtoWorkflowExecution {
-                                workflow_id: workflow_id.clone(),
-                                run_id,
-                            }),
-                            wait_policy: Some(WaitPolicy {
-                                lifecycle_stage:
-                                    UpdateWorkflowExecutionLifecycleStage::Accepted.into(),
-                            }),
-                            request: Some(update::v1::Request {
-                                meta: Some(update::v1::Meta {
-                                    update_id: update_id.clone(),
-                                    identity: client.identity(),
+                            drop(args);
+                            let payloads = data_converter
+                                .codec()
+                                .encode(&SerializationContextData::Workflow, unencoded_payloads?)
+                                .await?;
+                            let update_id = options
+                                .update_id
+                                .unwrap_or_else(|| Uuid::new_v4().to_string());
+                            let mut request = UpdateWorkflowExecutionRequest {
+                                namespace: client.namespace(),
+                                workflow_execution: Some(ProtoWorkflowExecution {
+                                    workflow_id: workflow_id.clone(),
+                                    run_id,
                                 }),
-                                input: Some(update::v1::Input {
-                                    header: options.header,
-                                    name: update_name,
-                                    args: Some(Payloads { payloads }),
+                                wait_policy: Some(WaitPolicy {
+                                    lifecycle_stage:
+                                        UpdateWorkflowExecutionLifecycleStage::Accepted.into(),
+                                }),
+                                request: Some(update::v1::Request {
+                                    meta: Some(update::v1::Meta {
+                                        update_id: update_id.clone(),
+                                        identity: client.identity(),
+                                    }),
+                                    input: Some(update::v1::Input {
+                                        header: options.header,
+                                        name: update_name,
+                                        args: Some(Payloads { payloads }),
+                                    }),
+                                    ..Default::default()
                                 }),
                                 ..Default::default()
-                            }),
-                            ..Default::default()
-                        }
-                        .into_request();
-                        options.rpc_options.apply_to(&mut request);
-                        let response = WorkflowService::update_workflow_execution(
-                            &mut client,
-                            request,
-                        )
-                        .await
-                        .map_err(WorkflowUpdateError::from_status)?
-                        .into_inner();
-                        let run_id = response
-                            .update_ref
-                            .as_ref()
-                            .and_then(|reference| reference.workflow_execution.as_ref())
-                            .map(|execution| execution.run_id.clone())
-                            .filter(|run_id| !run_id.is_empty());
-                        Ok(StartWorkflowUpdateOutput::new(
-                            update_id,
-                            workflow_id,
-                            run_id,
-                            response.outcome,
-                        ))
-                    })
-                }
-            }),
-        )
-        .await?;
+                            }
+                            .into_request();
+                            options.rpc_options.apply_to(&mut request);
+                            let response =
+                                WorkflowService::update_workflow_execution(&mut client, request)
+                                    .await
+                                    .map_err(WorkflowUpdateError::from_status)?
+                                    .into_inner();
+                            let run_id = response
+                                .update_ref
+                                .as_ref()
+                                .and_then(|reference| reference.workflow_execution.as_ref())
+                                .map(|execution| execution.run_id.clone())
+                                .filter(|run_id| !run_id.is_empty());
+                            Ok(StartWorkflowUpdateOutput::new(
+                                update_id,
+                                workflow_id,
+                                run_id,
+                                response.outcome,
+                            ))
+                        })
+                    }
+                }),
+            )
+            .await?;
 
         Ok(WorkflowUpdateHandle {
             client: self.client.clone(),

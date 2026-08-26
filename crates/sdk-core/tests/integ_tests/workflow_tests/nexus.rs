@@ -348,10 +348,7 @@ async fn nexus_async(
 
     let submitter = worker.get_submitter_handle();
     let converter = PayloadConverter::default();
-    let ser_ctx = SerializationContext {
-        data: &SerializationContextData::Workflow,
-        converter: &converter,
-    };
+    let ser_ctx = SerializationContext::new(&SerializationContextData::Workflow, &converter);
     let wf_handle = worker
         .submit_workflow(
             NexusAsyncWf::run,

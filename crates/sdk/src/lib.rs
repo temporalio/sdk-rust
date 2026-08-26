@@ -1413,10 +1413,8 @@ impl ActivityHalf {
                             // Codec application happens at the SDK/Core boundary, so activity
                             // implementations work with the payload converter directly.
                             let pc = codec_data_converter.payload_converter();
-                            let ctx = SerializationContext {
-                                data: &SerializationContextData::Activity,
-                                converter: pc,
-                            };
+                            let ctx =
+                                SerializationContext::new(&SerializationContextData::Activity, pc);
                             match output.serialize_payload(&ctx) {
                                 Ok(payload) => ActivityExecutionResult::ok(payload),
                                 Err(err) => {

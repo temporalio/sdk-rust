@@ -35,10 +35,8 @@ async fn encode_optional_value(
     };
     let unencoded_payloads = {
         let payload_converter = data_converter.payload_converter();
-        let context = SerializationContext {
-            data: &SerializationContextData::Activity,
-            converter: payload_converter,
-        };
+        let context =
+            SerializationContext::new(&SerializationContextData::Activity, payload_converter);
         value.serialize_payloads(&context)?
     };
     drop(value);

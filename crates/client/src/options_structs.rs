@@ -466,10 +466,8 @@ impl WorkflowStartOptions {
         };
 
         let payload_converter = data_converter.payload_converter();
-        let context = SerializationContext {
-            data: &SerializationContextData::Workflow,
-            converter: payload_converter,
-        };
+        let context =
+            SerializationContext::new(&SerializationContextData::Workflow, payload_converter);
         let mut memo = ProtoMemo {
             fields: memo
                 .iter()
@@ -492,10 +490,8 @@ impl WorkflowStartOptions {
     pub(crate) fn user_metadata(&self) -> Option<UserMetadata> {
         (self.static_summary.is_some() || self.static_details.is_some()).then(|| {
             let payload_converter = PayloadConverter::default();
-            let context = SerializationContext {
-                data: &SerializationContextData::Workflow,
-                converter: &payload_converter,
-            };
+            let context =
+                SerializationContext::new(&SerializationContextData::Workflow, &payload_converter);
             UserMetadata {
                 summary: self.static_summary.as_ref().map(|summary| {
                     payload_converter

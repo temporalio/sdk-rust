@@ -1727,10 +1727,7 @@ where
                         let data_converter = client.data_converter().clone();
                         let unencoded_payloads = {
                             let payload_converter = data_converter.payload_converter();
-                            let context = SerializationContext {
-                                data: &SerializationContextData::Workflow,
-                                converter: payload_converter,
-                            };
+                            let context = SerializationContext::new(&SerializationContextData::Workflow, payload_converter);
                             args.serialize_payloads(&context)
                         };
                         drop(args);
@@ -1875,10 +1872,7 @@ where
                         ) = input.into_parts();
                         let data_converter = client.data_converter().clone();
                         let payload_converter = data_converter.payload_converter();
-                        let context = SerializationContext {
-                            data: &SerializationContextData::Workflow,
-                            converter: payload_converter,
-                        };
+                        let context = SerializationContext::new(&SerializationContextData::Workflow, payload_converter);
                         let workflow_payloads = workflow_args.serialize_payloads(&context);
                         let signal_payloads = signal_args.serialize_payloads(&context);
                         drop(workflow_args);

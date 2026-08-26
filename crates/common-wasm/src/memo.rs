@@ -42,10 +42,7 @@ impl Memo {
         };
         self.payload_converter
             .from_payload(
-                &SerializationContext {
-                    data: &self.context,
-                    converter: &self.payload_converter,
-                },
+                &SerializationContext::new(&self.context, &self.payload_converter),
                 payload.clone(),
             )
             .map(Some)
@@ -173,10 +170,8 @@ mod tests {
     #[test]
     fn memo_decodes_serialized_values() {
         let payload_converter = PayloadConverter::default();
-        let context = SerializationContext {
-            data: &SerializationContextData::Workflow,
-            converter: &payload_converter,
-        };
+        let context =
+            SerializationContext::new(&SerializationContextData::Workflow, &payload_converter);
         let payload = payload_converter.to_payload(&context, &7_u32).unwrap();
         let raw = ProtoMemo {
             fields: HashMap::from([("count".to_owned(), payload.clone())]),
@@ -196,10 +191,8 @@ mod tests {
     #[test]
     fn memo_reports_deserialization_errors() {
         let payload_converter = PayloadConverter::default();
-        let context = SerializationContext {
-            data: &SerializationContextData::Workflow,
-            converter: &payload_converter,
-        };
+        let context =
+            SerializationContext::new(&SerializationContextData::Workflow, &payload_converter);
         let payload = payload_converter.to_payload(&context, &7_u32).unwrap();
         let memo = Memo::from_raw(
             Some(ProtoMemo {
@@ -220,10 +213,8 @@ mod tests {
             .insert("count", 7_u32)
             .insert("label", "hello".to_string());
 
-        let context = SerializationContext {
-            data: &SerializationContextData::Workflow,
-            converter: &payload_converter,
-        };
+        let context =
+            SerializationContext::new(&SerializationContextData::Workflow, &payload_converter);
         let fields = values
             .iter()
             .map(|(key, value)| {

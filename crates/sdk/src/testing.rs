@@ -242,10 +242,8 @@ where
         let payload_converter = self
             .payload_converter_ref()
             .expect("payload converter must be set in builder state");
-        let context = SerializationContext {
-            data: &SerializationContextData::Activity,
-            converter: payload_converter,
-        };
+        let context =
+            SerializationContext::new(&SerializationContextData::Activity, payload_converter);
         self.heartbeat_details = payload_converter.to_payloads(&context, &details)?;
         Ok(self)
     }

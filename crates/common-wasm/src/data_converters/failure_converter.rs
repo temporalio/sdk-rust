@@ -696,10 +696,7 @@ mod tests {
         let converter = PayloadConverter::default();
         let details: String = converter
             .from_payloads(
-                &SerializationContext {
-                    data: &SerializationContextData::Workflow,
-                    converter: &converter,
-                },
+                &SerializationContext::new(&SerializationContextData::Workflow, &converter),
                 payloads,
             )
             .unwrap();
@@ -729,10 +726,7 @@ mod tests {
         let converter = PayloadConverter::default();
         let payloads = converter
             .to_payloads(
-                &SerializationContext {
-                    data: &SerializationContextData::Workflow,
-                    converter: &converter,
-                },
+                &SerializationContext::new(&SerializationContextData::Workflow, &converter),
                 &"detail",
             )
             .unwrap();
