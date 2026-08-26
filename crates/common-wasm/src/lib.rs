@@ -76,7 +76,8 @@ pub enum ActivityCloseTimeouts {
 }
 
 impl ActivityCloseTimeouts {
-    /// Returns value of [`Self::ScheduleToClose`]  or [`Self::Both::schedule_to_close`].
+    /// Returns value of [`Self::ScheduleToClose`] or
+    /// [`Self::ScheduleAndStartToClose::schedule_to_close`].
     pub fn schedule_to_close(&self) -> Option<Duration> {
         match self {
             ActivityCloseTimeouts::ScheduleToClose(schedule_to_close)
@@ -87,7 +88,8 @@ impl ActivityCloseTimeouts {
         }
     }
 
-    /// Returns value of [`Self::StartToClose`]  or [`Self::Both::start_to_close`].
+    /// Returns value of [`Self::StartToClose`] or
+    /// [`Self::ScheduleAndStartToClose::start_to_close`].
     pub fn start_to_close(&self) -> Option<Duration> {
         match self {
             ActivityCloseTimeouts::StartToClose(start_to_close)
