@@ -50,30 +50,22 @@ relevant information.
   reason, which may affect existing dashboards.
 
 ### Breaking Changes :boom:
-* `Priority` is now non-exhaustive. Use a builder to construct.
-* `WorkerDeploymentVersion` is now non-exhaustive. Use a builder to construct.
-* `WorkerCallbacks` is now non-exhaustive. Construct it with `WorkerCallbacks::new`.
-* `WorkflowExecutionInfo` is now non-exhaustive. Construct it with
-  `WorkflowExecutionInfo::builder().namespace(...).workflow_id(...).build()`.
-* `ActivityCloseTimeouts` is now non-exhaustive. Add a wildcard branch to downstream matches.
+* The following types are now non-exhaustive: `Priority`, `WorkerDeploymentVersion`,
+  `WorkerCallbacks`, `WorkflowExecutionInfo`, `ActivityCloseTimeouts`,
+  `ActivityExecutionDecodeHint`, child-workflow and signal decode hints,
+  `SerializationContext`, `SerializationContextData`, `PayloadConverter`, `IncomingError`,
+  `ScheduleSpec`, and `ScheduleOverlapPolicy`. Construct structs using their respective builders
+  or constructors (`WorkerCallbacks::new`, `ActivityExecutionDecodeHint::new`, or
+  `SerializationContext::new`); use `Default` for `PayloadConverter`; and add wildcard branches
+  when matching enums.
 * Renamed `ActivityCloseTimeouts::Both` to `ActivityCloseTimeouts::ScheduleAndStartToClose`.
 * Removed the unused `ActExitValue` type. Use `ActivityError::WillCompleteAsync` to mark an
   activity for asynchronous completion.
 * Removed the test-only `FailOnNondeterminismInterceptor` from the public Rust SDK API.
-* `ActivityExecutionDecodeHint`, child-workflow and signal decode hints, `SerializationContext`,
-  `SerializationContextData`, and `PayloadConverter` are now non-exhaustive. Use
-  `ActivityExecutionDecodeHint::new`, `SerializationContext::new`, or `Default` to construct
-  these types, and add a wildcard branch when matching `SerializationContextData` or
-  `PayloadConverter`.
-* `IncomingError` is now non-exhaustive. Add a wildcard branch to downstream matches over decoded
-  failures.
 * Rust SDK environment configuration values (`DataSource`, `ClientConfig`, and related profile,
   TLS, codec, and profile-loading-option types) are now client-owned and non-exhaustive. Use the
   new `bon` builders to construct client configuration structs, and add a wildcard branch when
   matching `DataSource`.
-* `ScheduleSpec` and `ScheduleOverlapPolicy` are now non-exhaustive. Use
-  `ScheduleSpec::builder()` to construct schedule specifications and add a wildcard branch when
-  matching overlap policies.
 * Values stored in a `MemoValue` must now be `Send + Sync`. It previously held its value in an
   `Rc` and now uses an `Arc`, so that memos can be built outside a workflow and handed to the
   client. Only affects memo values that are themselves non-`Send`/non-`Sync`, such as those
