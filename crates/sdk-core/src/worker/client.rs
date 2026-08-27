@@ -1620,7 +1620,7 @@ mod tests {
             // Roughly 4 MiB of commands forces splitting under the ~3 MiB page target.
             let commands: Vec<_> = (0..8).map(|_| command_with_payload(512 * 1024)).collect();
             let completion = WorkflowTaskCompletion {
-                task_token: TaskToken(b"shared-token".to_vec()),
+                task_token: b"shared-token".to_vec().into(),
                 commands,
                 messages: vec![],
                 sticky_attributes: None,
@@ -1721,7 +1721,7 @@ mod tests {
             // Enough commands to yield at least two intermediate pages (one fails, one hangs).
             let commands: Vec<_> = (0..8).map(|_| command_with_payload(512 * 1024)).collect();
             let completion = WorkflowTaskCompletion {
-                task_token: TaskToken(b"shared-token".to_vec()),
+                task_token: b"shared-token".to_vec().into(),
                 commands,
                 messages: vec![],
                 sticky_attributes: None,
@@ -1797,7 +1797,7 @@ mod tests {
             // at 1 MiB, so the server would reject it, and the worker must fail it without sending.
             let commands: Vec<_> = (0..8).map(|_| command_with_payload(512 * 1024)).collect();
             let completion = WorkflowTaskCompletion {
-                task_token: TaskToken(b"shared-token".to_vec()),
+                task_token: b"shared-token".to_vec().into(),
                 commands,
                 messages: vec![],
                 sticky_attributes: None,
@@ -1883,7 +1883,7 @@ mod tests {
 
             let commands: Vec<_> = (0..8).map(|_| command_with_payload(512 * 1024)).collect();
             let completion = WorkflowTaskCompletion {
-                task_token: TaskToken(b"shared-token".to_vec()),
+                task_token: b"shared-token".to_vec().into(),
                 commands,
                 messages: vec![],
                 sticky_attributes: None,
@@ -1972,7 +1972,7 @@ mod tests {
             shutdown_token.cancel();
             let commands: Vec<_> = (0..8).map(|_| command_with_payload(512 * 1024)).collect();
             let completion = WorkflowTaskCompletion {
-                task_token: TaskToken(b"shared-token".to_vec()),
+                task_token: b"shared-token".to_vec().into(),
                 commands,
                 messages: vec![],
                 sticky_attributes: None,
@@ -2057,7 +2057,7 @@ mod tests {
             shutdown_token.cancel();
             let commands: Vec<_> = (0..8).map(|_| command_with_payload(512 * 1024)).collect();
             let completion = WorkflowTaskCompletion {
-                task_token: TaskToken(b"shared-token".to_vec()),
+                task_token: b"shared-token".to_vec().into(),
                 commands,
                 messages: vec![],
                 sticky_attributes: None,
