@@ -671,6 +671,7 @@ async fn can_heartbeat_acts_during_shutdown() {
 enum HungRpc {
     Heartbeat,
     Fail,
+    Complete,
 }
 
 // Worker-level regression test for the shutdown/completion race: an activity is completed while
@@ -678,16 +679,18 @@ enum HungRpc {
 // still owns its slot permit. Shutdown must wait for the completion to finish reporting rather
 // than tear down the heartbeat manager under it (which stranded the completion forever) and then
 // trip the slot-permit release deadline. The hung-heartbeat case reproduces the original race
-// (eviction defers its ack until the in-flight heartbeat returns); the hung-failure case pins the
-// same invariant when the completion is parked on the result RPC itself.
+// (eviction defers its ack until the in-flight heartbeat returns); the hung-failure and
+// hung-success cases pin the same invariant when the completion is parked on the result RPC
+// itself.
 #[rstest]
 #[case::heartbeat_rpc_hangs(HungRpc::Heartbeat)]
 #[case::fail_rpc_hangs(HungRpc::Fail)]
+#[case::complete_rpc_hangs(HungRpc::Complete)]
 #[tokio::test]
 async fn worker_shutdown_awaits_activity_completion_flushing_result(#[case] hung: HungRpc) {
     let rpc_entered = Arc::new(Notify::new());
     let rpc_release = Arc::new(Notify::new());
-    let fail_reported = Arc::new(AtomicBool::new(false));
+    let result_reported = Arc::new(AtomicBool::new(false));
 
     let mut mock_client = mock_manual_worker_client();
     if hung == HungRpc::Heartbeat {
@@ -709,25 +712,43 @@ async fn worker_shutdown_awaits_activity_completion_flushing_result(#[case] hung
     }
     let entered = rpc_entered.clone();
     let release = rpc_release.clone();
-    let fail_reported_clone = fail_reported.clone();
-    let hold_fail_rpc = hung == HungRpc::Fail;
-    mock_client
-        .expect_fail_activity_task()
-        .times(1)
-        .returning(move |_, _, _| {
-            let entered = entered.clone();
-            let release = release.clone();
-            let fail_reported = fail_reported_clone.clone();
-            async move {
-                if hold_fail_rpc {
+    let result_reported_clone = result_reported.clone();
+    if hung == HungRpc::Complete {
+        mock_client
+            .expect_complete_activity_task()
+            .times(1)
+            .returning(move |_, _| {
+                let entered = entered.clone();
+                let release = release.clone();
+                let result_reported = result_reported_clone.clone();
+                async move {
                     entered.notify_one();
                     release.notified().await;
+                    result_reported.store(true, Ordering::SeqCst);
+                    Ok(RespondActivityTaskCompletedResponse::default())
                 }
-                fail_reported.store(true, Ordering::SeqCst);
-                Ok(RespondActivityTaskFailedResponse::default())
-            }
-            .boxed()
-        });
+                .boxed()
+            });
+    } else {
+        let hold_fail_rpc = hung == HungRpc::Fail;
+        mock_client
+            .expect_fail_activity_task()
+            .times(1)
+            .returning(move |_, _, _| {
+                let entered = entered.clone();
+                let release = release.clone();
+                let result_reported = result_reported_clone.clone();
+                async move {
+                    if hold_fail_rpc {
+                        entered.notify_one();
+                        release.notified().await;
+                    }
+                    result_reported.store(true, Ordering::SeqCst);
+                    Ok(RespondActivityTaskFailedResponse::default())
+                }
+                .boxed()
+            });
+    }
 
     let core = mock_worker(MocksHolder::from_client_with_activities(
         mock_client,
@@ -748,11 +769,16 @@ async fn worker_shutdown_awaits_activity_completion_flushing_result(#[case] hung
         });
     }
 
+    let result = if hung == HungRpc::Complete {
+        ActivityExecutionResult::ok(vec![1].into())
+    } else {
+        ActivityExecutionResult::fail("retry me".into())
+    };
     join!(
         async {
             core.complete_activity_task(ActivityTaskCompletion {
                 task_token: act.task_token.clone(),
-                result: Some(ActivityExecutionResult::fail("retry me".into())),
+                result: Some(result),
             })
             .await
             .unwrap();
@@ -774,8 +800,8 @@ async fn worker_shutdown_awaits_activity_completion_flushing_result(#[case] hung
             rpc_release.notify_one();
             shutdown_fut.await;
             assert!(
-                fail_reported.load(Ordering::SeqCst),
-                "worker shutdown completed before the activity's failure was reported to server"
+                result_reported.load(Ordering::SeqCst),
+                "worker shutdown completed before the activity's result was reported to server"
             );
         }
     );
