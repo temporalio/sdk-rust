@@ -528,6 +528,25 @@ impl NamespaceCapabilities {
         self.capabilities()
             .is_some_and(|capabilities| capabilities.worker_commands)
     }
+
+    /// Returns true if the namespace accepts paginated `RespondWorkflowTaskCompleted` requests, so
+    /// large completions may be split across multiple page requests sharing one task token.
+    pub fn workflow_task_completion_pagination(&self) -> bool {
+        self.capabilities()
+            .is_some_and(|capabilities| capabilities.workflow_task_completion_pagination)
+    }
+
+    /// The namespace's limit on the recombined size of a paginated workflow task completion, if one
+    /// is configured. `None` when unset (the server advertises `0` for no explicit limit).
+    pub fn workflow_task_completion_size_limit(&self) -> Option<usize> {
+        self.description
+            .get()
+            .and_then(|description| description.namespace_info.as_ref())
+            .and_then(|namespace_info| namespace_info.limits.as_ref())
+            .map(|limits| limits.workflow_task_completion_size_limit_error)
+            .filter(|limit| *limit > 0)
+            .map(|limit| limit as usize)
+    }
 }
 
 /// Resolve the effective poller behavior. When no behavior was configured (`None`), pollers are
@@ -977,7 +996,7 @@ impl Worker {
                                 shutdown_token.child_token(),
                                 Some(move |np| np_metrics.record_num_pollers(np)),
                                 nexus_last_suc_poll_time,
-                                capabilities,
+                                capabilities.clone(),
                                 shared_namespace_worker,
                             )) as BoxedNexusPoller)
                         } else {
@@ -1077,6 +1096,7 @@ impl Worker {
                             shutdown_token: shutdown_token.child_token(),
                             metrics,
                             server_capabilities: client.capabilities().unwrap_or_default(),
+                            namespace_capabilities: capabilities.clone(),
                             sdk_name: sdk_name_and_ver.0,
                             sdk_version: sdk_name_and_ver.1,
                             default_versioning_behavior: config

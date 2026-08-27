@@ -87,6 +87,7 @@ mockall::mock! {
         fn complete_workflow_task<'a, 'b>(
             &self,
             request: WorkflowTaskCompletion,
+            shutdown_token: CancellationToken,
         ) -> impl Future<Output = Result<RespondWorkflowTaskCompletedResponse>> + Send + 'b
             where 'a: 'b, Self: 'b;
 

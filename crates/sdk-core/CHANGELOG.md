@@ -49,6 +49,7 @@ relevant information.
 * The `temporal_activity_execution_failed` and `temporal_local_activity_execution_failed` worker
   metrics now carry a `failure_reason` attribute. Each is now split into one time series per
   reason, which may affect existing dashboards.
+* Workflow task completions larger than the gRPC request size limit are now paginated automatically when the namespace supports it. Paginated workflow task completions require Temporal Server 1.32.0 or later.
 
 ### Breaking Changes :boom:
 * The following types are now non-exhaustive: `Priority`, `WorkerDeploymentVersion`,

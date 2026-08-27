@@ -765,6 +765,7 @@ pub(crate) enum FailureReason {
     GrpcMessageTooLarge,
     PayloadsTooLarge,
     ExternalStorageError,
+    RequestTooLarge,
 }
 impl Display for FailureReason {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -778,6 +779,7 @@ impl Display for FailureReason {
             FailureReason::GrpcMessageTooLarge => "GrpcMessageTooLarge".to_owned(),
             FailureReason::PayloadsTooLarge => "PayloadsTooLarge".to_owned(),
             FailureReason::ExternalStorageError => "ExternalStorageError".to_owned(),
+            FailureReason::RequestTooLarge => "RequestTooLarge".to_owned(),
         };
         write!(f, "{str}")
     }

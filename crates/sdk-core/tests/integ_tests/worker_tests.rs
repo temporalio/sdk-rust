@@ -313,6 +313,59 @@ async fn grpc_message_too_large_test() {
     shared_tests::grpc_message_too_large().await
 }
 
+#[workflow]
+#[derive(Default)]
+struct PaginatedCompletionWf;
+
+#[workflow_methods]
+impl PaginatedCompletionWf {
+    #[run]
+    async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<()> {
+        // Schedule many activities in a single workflow task so the completion (~5 MiB across the
+        // commands) exceeds the per-page limit and must be paginated. Each input is well under the
+        // per-blob size limit, so it's the aggregate completion size that drives pagination.
+        let input = "a".repeat(400 * 1024);
+        let mut futs = vec![];
+        for _ in 0..13 {
+            futs.push(ctx.execute_activity(
+                StdActivities::echo,
+                input.clone(),
+                ActivityOptions::start_to_close_timeout(Duration::from_secs(30)),
+            ));
+        }
+        temporalio_sdk::workflows::join_all(futs).await;
+        Ok(())
+    }
+}
+
+/// A workflow task completion too large for a single gRPC request is split into pages that the
+/// server buffers and reassembles; the workflow then completes normally. Local-lane only: it needs
+/// the dev server's `history.enableWorkflowTaskCompletionPagination` and a raised
+/// `system.transactionSizeLimit`.
+#[tokio::test]
+async fn workflow_task_completion_pagination_test() {
+    let wf_name = "wft_completion_pagination";
+    let mut starter = CoreWfStarter::new_cloud_or_local(wf_name, "")
+        .await
+        .unwrap();
+    starter
+        .sdk_config
+        .register_workflow::<PaginatedCompletionWf>()
+        .unwrap();
+    starter.sdk_config.register_activities(StdActivities);
+    let mut worker = starter.worker().await;
+    let handle = worker
+        .submit_workflow(
+            PaginatedCompletionWf::run,
+            (),
+            starter.workflow_options.clone(),
+        )
+        .await
+        .unwrap();
+    worker.run_until_done().await.unwrap();
+    handle.get_result(Default::default()).await.unwrap();
+}
+
 // Serializes to between the default blob error limit (2 MiB) and the gRPC transport limit (4 MiB).
 const OVERSIZE_PAYLOAD_BYTES: usize = 3 * 1024 * 1024;
 

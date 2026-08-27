@@ -808,7 +808,7 @@ pub fn build_mock_pollers(mut cfg: MockPollCfg) -> MocksHolder {
     } else if cfg.completion_mock_fn.is_some() {
         expect_completes.times(1..);
     }
-    expect_completes.returning(move |comp| {
+    expect_completes.returning(move |comp, _| {
         let r = if let Some(ass) = cfg.completion_mock_fn.as_mut() {
             // tee hee
             ass(&comp)
