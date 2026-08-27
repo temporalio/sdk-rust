@@ -11,15 +11,13 @@ interface on-complete-request {
     placeholder,
   };
 
-
   /// @nexus.type-parameter
   type source-context-t = placeholder;
 
   /// @nexus.type-parameter
   type output-t = placeholder;
 
-
-  /// Protobuf oneof `temporal.api.notificationservice.v1.OnCompleteRequest.result`.
+  /// @nexus.proto "temporal.api.notificationservice.v1.OnCompleteRequest.result"
   variant on-complete-request-result {
     success(output-t),
     failure(failure),
@@ -30,6 +28,7 @@ interface on-complete-request {
     %result: on-complete-request-result,
     source-context: source-context-t,
   }
+
   /// @nexus.proto "temporal.api.notificationservice.v1.OnCompleteResponse"
   record on-complete-response {
   }

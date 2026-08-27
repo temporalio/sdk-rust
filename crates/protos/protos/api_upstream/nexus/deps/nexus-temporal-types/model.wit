@@ -18,6 +18,18 @@ interface model {
   /// @nexus.type dotnet="IReadOnlyCollection<object?>" dotnet-to="ProtoExtensions.ToPayloads"
   type payloads = list<payload>;
 
+  /// Temporal failure represented by the target SDK's native exception/error type.
+  /// The SDK failure converter owns the recursive cause and failure-info structure.
+  /// @nexus.proto "temporal.api.failure.v1.Failure" typescript-import="@temporalio/proto"
+  /// @nexus.type
+  ///   python="BaseException"
+  ///   typescript="Error"
+  ///   go="error"
+  ///   dotnet="System.Exception"
+  ///   dotnet-from="ProtoExtensions.FromFailureProto"
+  ///   dotnet-to="ProtoExtensions.ToFailureProto"
+  type failure = placeholder;
+
   /// Callable result annotation for workflow functions.
   /// @nexus.type
   ///   python="collections.abc.Awaitable[WorkflowResult]"
@@ -147,12 +159,7 @@ interface model {
   ///   typescript="common.WorkflowIdReusePolicy"
   ///   dotnet="Temporalio.Api.Enums.V1.WorkflowIdReusePolicy"
   ///   typescript-import="@temporalio/common"
-  enum workflow-id-reuse-policy {
-    allow-duplicate,
-    allow-duplicate-failed-only,
-    reject-duplicate,
-    terminate-if-running,
-  }
+  type workflow-id-reuse-policy = placeholder;
 
   /// @nexus.proto "temporal.api.enums.v1.WorkflowIdConflictPolicy" typescript-import="@temporalio/proto"
   /// @nexus.type
@@ -160,11 +167,7 @@ interface model {
   ///   typescript="common.WorkflowIdConflictPolicy"
   ///   dotnet="Temporalio.Api.Enums.V1.WorkflowIdConflictPolicy"
   ///   typescript-import="@temporalio/common"
-  enum workflow-id-conflict-policy {
-    fail,
-    use-existing,
-    terminate-existing,
-  }
+  type workflow-id-conflict-policy = placeholder;
 
   /// @nexus.proto "temporal.api.sdk.v1.UserMetadata" typescript-import="@temporalio/proto"
   /// @nexus.flatten-in-api
