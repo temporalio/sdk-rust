@@ -10817,6 +10817,8 @@ components:
           $ref: '#/components/schemas/Callback_Nexus'
         internal:
           $ref: '#/components/schemas/Callback_Internal'
+        worker:
+          $ref: '#/components/schemas/Callback_Worker'
         links:
           type: array
           items:
@@ -10869,6 +10871,12 @@ components:
         blockedReason:
           type: string
           description: If the state is BLOCKED, blocked reason provides additional information.
+        failure:
+          allOf:
+            - $ref: '#/components/schemas/Failure'
+          description: |-
+            The failure if the callback was not able to complete successfully. e.g. timed out, received an
+             unretriable error, etc.
       description: Common callback information. Specific CallbackInfo messages should embed this and may include additional fields.
     Callback_Internal:
       type: object
@@ -10893,6 +10901,42 @@ components:
           additionalProperties:
             type: string
           description: Header to attach to callback request.
+    Callback_Worker:
+      type: object
+      properties:
+        taskQueueName:
+          type: string
+          description: |-
+            Nexus task queue the Temporal worker is listening on.
+
+             NOTE: This is not a temporal.api.taskqueue.v1.TaskQueue to avoid a circular dependency.
+        service:
+          type: string
+          description: Target Nexus service, e.g. "HTTPAdapter".
+        operation:
+          type: string
+          description: Target operation, e.g. "DeliverAsWebhook".
+        sourceContext:
+          allOf:
+            - $ref: '#/components/schemas/Payload'
+          description: |-
+            Arbitrary user-supplied data from the source operation's callsite. (As applicable, not all operations
+             support attaching context data.)
+
+             There is a relatively small maximum size the source context can be, e.g. 32KiB.
+      description: |-
+        Worker callbacks are requests to invoke a specific shape of Nexus operation on a Temporal worker.
+         The specified Nexus operation must have the following:
+         - Input:  temporal.api.notificationservice.v1.OnCompleteRequest
+         - Output: temporal.api.notificationservice.v1.OnCompleteResponse
+
+         The targeted Nexus service must be registered within the same namespace as the source operation
+         the callback is attached to. (While Nexus allows for cross-namespace operations, worker callbacks
+         are purely "caller-side".)
+
+         Worker callbacks are only supported for certain types of operations, e.g. standalone Nexus operations.
+         Attempting to attach a Worker callback for an unsupported operation will result in an INVALID_ARGUMENT
+         error from the server.
     CanceledFailureInfo:
       type: object
       properties:
@@ -11877,6 +11921,13 @@ components:
           type: string
           description: Token for follow-on long-poll requests. Absent only if the operation is complete.
           format: bytes
+        completionCallbacks:
+          type: array
+          items:
+            $ref: '#/components/schemas/CallbackInfo'
+          description: |-
+            Completion callbacks to be invoked once the Nexus operation reaches a terminal state.
+             They will remain in the CALLBACK_STATE_STANDBY state until the Nexus operation is finished.
     DescribeScheduleResponse:
       type: object
       properties:
@@ -13061,6 +13112,8 @@ components:
           $ref: '#/components/schemas/Link_NexusOperation'
         workflow:
           $ref: '#/components/schemas/Link_Workflow'
+        nexusOperationCallback:
+          $ref: '#/components/schemas/Link_NexusOperationCallback'
       description: |-
         Link can be associated with history events. It might contain information about an external entity
          related to the history event. For example, workflow A makes a Nexus call that starts workflow B:
@@ -13095,6 +13148,19 @@ components:
         runId:
           type: string
       description: A link to a standalone Nexus operation.
+    Link_NexusOperationCallback:
+      type: object
+      properties:
+        operationId:
+          type: string
+        runId:
+          type: string
+        requestId:
+          type: string
+      description: |-
+        A link to a worker callback attached to a Nexus operation within the same namespace. e.g. the completion handler attached
+         to a standalone Nexus operation, not the source Nexus operation itself. A standalone Nexus operation can have multiple
+         callbacks attached to them, and will be differentiated by the server-generated request_id used when the callback was invoked.
     Link_Workflow:
       type: object
       properties:
@@ -17301,6 +17367,13 @@ components:
             Defines how to resolve an operation id conflict with a *running* operation.
              The default policy is NEXUS_OPERATION_ID_CONFLICT_POLICY_FAIL.
           format: enum
+        onConflictOptions:
+          allOf:
+            - $ref: '#/components/schemas/OnConflictOptions'
+          description: |-
+            Defines actions to be done to the existing running standalone Nexus when the conflict policy
+             NEXUS_OPERATION_ID_CONFLICT_POLICY_USE_EXISTING is used. If not set or set to a empty object
+             (all options with default value), it won't do modify running operation.
         searchAttributes:
           allOf:
             - $ref: '#/components/schemas/SearchAttributes'
@@ -17320,6 +17393,11 @@ components:
           allOf:
             - $ref: '#/components/schemas/UserMetadata'
           description: Metadata for use by user interfaces to display the fixed as-of-start summary and details of the operation.
+        completionCallbacks:
+          type: array
+          items:
+            $ref: '#/components/schemas/Callback'
+          description: Completion callbacks to be invoked once the Nexus operation reaches a terminal state.
     StartNexusOperationExecutionResponse:
       type: object
       properties:
@@ -18159,6 +18237,12 @@ components:
         identity:
           type: string
           description: The identity of the client who initiated this request.
+        resetAttempts:
+          type: boolean
+          description: Providing this flag will also reset the number of attempts.
+        resetHeartbeat:
+          type: boolean
+          description: Providing this flag will also reset the heartbeat details.
         reason:
           type: string
           description: Reason to unpause the activity.

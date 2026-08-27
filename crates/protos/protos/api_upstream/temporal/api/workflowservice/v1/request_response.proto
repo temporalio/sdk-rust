@@ -45,6 +45,7 @@ import "temporal/api/batch/v1/message.proto";
 import "temporal/api/sdk/v1/task_complete_metadata.proto";
 import "temporal/api/sdk/v1/user_metadata.proto";
 import "temporal/api/nexus/v1/message.proto";
+import "temporal/api/nexusoperation/v1/message.proto";
 import "temporal/api/worker/v1/message.proto";
 
 import "google/protobuf/duration.proto";
@@ -2327,8 +2328,11 @@ message UnpauseActivityExecutionRequest {
     // The identity of the client who initiated this request.
     string identity = 5;
 
-    reserved 6, 7;
-    reserved "reset_attempts", "reset_heartbeat";
+    // Providing this flag will also reset the number of attempts.
+    bool reset_attempts = 6;
+
+    // Providing this flag will also reset the heartbeat details.
+    bool reset_heartbeat = 7;
 
     // Reason to unpause the activity.
     string reason = 8;
@@ -3399,6 +3403,10 @@ message StartNexusOperationExecutionRequest {
     // Defines how to resolve an operation id conflict with a *running* operation.
     // The default policy is NEXUS_OPERATION_ID_CONFLICT_POLICY_FAIL.
     temporal.api.enums.v1.NexusOperationIdConflictPolicy id_conflict_policy = 13;
+    // Defines actions to be done to the existing running standalone Nexus when the conflict policy
+    // NEXUS_OPERATION_ID_CONFLICT_POLICY_USE_EXISTING is used. If not set or set to a empty object
+    // (all options with default value), it won't do modify running operation.
+    temporal.api.nexusoperation.v1.OnConflictOptions on_conflict_options = 17;
 
     // Search attributes for indexing.
     temporal.api.common.v1.SearchAttributes search_attributes = 14;
@@ -3411,6 +3419,9 @@ message StartNexusOperationExecutionRequest {
     map<string, string> nexus_header = 15;
     // Metadata for use by user interfaces to display the fixed as-of-start summary and details of the operation.
     temporal.api.sdk.v1.UserMetadata user_metadata = 16;
+
+    // Completion callbacks to be invoked once the Nexus operation reaches a terminal state.
+    repeated temporal.api.common.v1.Callback completion_callbacks = 18;
 }
 
 message StartNexusOperationExecutionResponse {
@@ -3459,6 +3470,10 @@ message DescribeNexusOperationExecutionResponse {
 
     // Token for follow-on long-poll requests. Absent only if the operation is complete.
     bytes long_poll_token = 6;
+
+    // Completion callbacks to be invoked once the Nexus operation reaches a terminal state.
+    // They will remain in the CALLBACK_STATE_STANDBY state until the Nexus operation is finished.
+    repeated temporal.api.nexusoperation.v1.CallbackInfo completion_callbacks = 7;
 }
 
 message PollNexusOperationExecutionRequest {

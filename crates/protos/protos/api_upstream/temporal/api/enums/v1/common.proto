@@ -47,7 +47,7 @@ enum CallbackState {
     CALLBACK_STATE_FAILED = 4;
     // Callback has succeeded.
     CALLBACK_STATE_SUCCEEDED = 5;
-    // Callback is blocked (eg: by circuit breaker).
+    // Callback is blocked, e.g. by circuit breaker.
     CALLBACK_STATE_BLOCKED = 6;
 }
 

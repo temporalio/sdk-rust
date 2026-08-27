@@ -10815,6 +10815,10 @@
       "type": "object",
       "description": "Trigger for when the activity is closed."
     },
+    "CallbackInfoOperationCompleted": {
+      "type": "object",
+      "description": "Trigger for when the Nexus operation is completed, covering both success cases as\nwell as any type of failure."
+    },
     "CallbackInfoUpdateWorkflowExecutionCompleted": {
       "type": "object",
       "properties": {
@@ -10931,20 +10935,6 @@
         }
       },
       "description": "Target an external server by URL.\nAt a later point, this will support providing credentials, in the meantime, an http.RoundTripper can be injected\ninto the server to modify the request."
-    },
-    "EndpointTargetWorker": {
-      "type": "object",
-      "properties": {
-        "namespace": {
-          "type": "string",
-          "description": "Namespace to route requests to."
-        },
-        "taskQueue": {
-          "type": "string",
-          "description": "Nexus task queue to route requests to."
-        }
-      },
-      "description": "Target a worker polling on a Nexus task queue in a specific namespace."
     },
     "EnvironmentInfoArchitecture": {
       "type": "string",
@@ -11116,6 +11106,21 @@
         }
       },
       "description": "A link to a standalone Nexus operation."
+    },
+    "LinkNexusOperationCallback": {
+      "type": "object",
+      "properties": {
+        "operationId": {
+          "type": "string"
+        },
+        "runId": {
+          "type": "string"
+        },
+        "requestId": {
+          "type": "string"
+        }
+      },
+      "description": "A link to a worker callback attached to a Nexus operation within the same namespace. e.g. the completion handler attached\nto a standalone Nexus operation, not the source Nexus operation itself. A standalone Nexus operation can have multiple\ncallbacks attached to them, and will be differentiated by the server-generated request_id used when the callback was invoked."
     },
     "LinkWorkflow": {
       "type": "object",
@@ -12717,6 +12722,10 @@
           "$ref": "#/definitions/v1NexusOperationIdConflictPolicy",
           "description": "Defines how to resolve an operation id conflict with a *running* operation.\nThe default policy is NEXUS_OPERATION_ID_CONFLICT_POLICY_FAIL."
         },
+        "onConflictOptions": {
+          "$ref": "#/definitions/apiNexusoperationV1OnConflictOptions",
+          "description": "Defines actions to be done to the existing running standalone Nexus when the conflict policy\nNEXUS_OPERATION_ID_CONFLICT_POLICY_USE_EXISTING is used. If not set or set to a empty object\n(all options with default value), it won't do modify running operation."
+        },
         "searchAttributes": {
           "$ref": "#/definitions/v1SearchAttributes",
           "description": "Search attributes for indexing."
@@ -12731,6 +12740,14 @@
         "userMetadata": {
           "$ref": "#/definitions/v1UserMetadata",
           "description": "Metadata for use by user interfaces to display the fixed as-of-start summary and details of the operation."
+        },
+        "completionCallbacks": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "$ref": "#/definitions/v1Callback"
+          },
+          "description": "Completion callbacks to be invoked once the Nexus operation reaches a terminal state."
         }
       }
     },
@@ -13014,6 +13031,14 @@
         "identity": {
           "type": "string",
           "description": "The identity of the client who initiated this request."
+        },
+        "resetAttempts": {
+          "type": "boolean",
+          "description": "Providing this flag will also reset the number of attempts."
+        },
+        "resetHeartbeat": {
+          "type": "boolean",
+          "description": "Providing this flag will also reset the heartbeat details."
         },
         "reason": {
           "type": "string",
@@ -13489,6 +13514,15 @@
         "blockedReason": {
           "type": "string",
           "description": "If the state is BLOCKED, blocked reason provides additional information."
+        },
+        "success": {
+          "type": "object",
+          "properties": {},
+          "title": "The callback completed successfully. (Which may include delivering a \"failed\" result successfully.)"
+        },
+        "failure": {
+          "$ref": "#/definitions/v1Failure",
+          "description": "The failure if the callback was not able to complete successfully. e.g. timed out, received an\nunretriable error, etc."
         }
       },
       "description": "Common callback information. Specific CallbackInfo messages should embed this and may include additional fields."
@@ -13510,6 +13544,46 @@
         }
       },
       "description": "When starting an execution with a conflict policy that uses an existing execution and there is already an existing\nrunning execution, OnConflictOptions defines actions to be taken on the existing running execution."
+    },
+    "apiNexusoperationV1CallbackInfo": {
+      "type": "object",
+      "properties": {
+        "trigger": {
+          "$ref": "#/definitions/apiNexusoperationV1CallbackInfoTrigger",
+          "description": "Trigger for this callback."
+        },
+        "info": {
+          "$ref": "#/definitions/apiCallbackV1CallbackInfo",
+          "description": "Common callback info."
+        }
+      },
+      "description": "CallbackInfo contains the state of a callback attached to a standalone Nexus operation."
+    },
+    "apiNexusoperationV1CallbackInfoTrigger": {
+      "type": "object",
+      "properties": {
+        "operationCompleted": {
+          "$ref": "#/definitions/CallbackInfoOperationCompleted"
+        }
+      }
+    },
+    "apiNexusoperationV1OnConflictOptions": {
+      "type": "object",
+      "properties": {
+        "attachRequestId": {
+          "type": "boolean",
+          "description": "Attaches the request ID to the running operation."
+        },
+        "attachCompletionCallbacks": {
+          "type": "boolean",
+          "description": "Attaches the completion callbacks to the running operation."
+        },
+        "attachLinks": {
+          "type": "boolean",
+          "description": "Attaches any new links to the running operation."
+        }
+      },
+      "description": "When StartNexusOperationExecutionRequest uses the conflict policy NEXUS_OPERATION_ID_CONFLICT_POLICY_USE_EXISTING\nand there is already an existing, running standalone Nexus operation, OnConflictOptions defines actions to be\ntaken."
     },
     "apiWorkflowV1CallbackInfo": {
       "type": "object",
@@ -14672,6 +14746,9 @@
         "internal": {
           "$ref": "#/definitions/CallbackInternal"
         },
+        "worker": {
+          "$ref": "#/definitions/v1CallbackWorker"
+        },
         "links": {
           "type": "array",
           "items": {
@@ -14695,7 +14772,31 @@
         "CALLBACK_STATE_BLOCKED"
       ],
       "default": "CALLBACK_STATE_UNSPECIFIED",
-      "description": "State of a callback.\n\n - CALLBACK_STATE_UNSPECIFIED: Default value, unspecified state.\n - CALLBACK_STATE_STANDBY: Callback is standing by, waiting to be triggered.\n - CALLBACK_STATE_SCHEDULED: Callback is in the queue waiting to be executed or is currently executing.\n - CALLBACK_STATE_BACKING_OFF: Callback has failed with a retryable error and is backing off before the next attempt.\n - CALLBACK_STATE_FAILED: Callback has failed.\n - CALLBACK_STATE_SUCCEEDED: Callback has succeeded.\n - CALLBACK_STATE_BLOCKED: Callback is blocked (eg: by circuit breaker)."
+      "description": "State of a callback.\n\n - CALLBACK_STATE_UNSPECIFIED: Default value, unspecified state.\n - CALLBACK_STATE_STANDBY: Callback is standing by, waiting to be triggered.\n - CALLBACK_STATE_SCHEDULED: Callback is in the queue waiting to be executed or is currently executing.\n - CALLBACK_STATE_BACKING_OFF: Callback has failed with a retryable error and is backing off before the next attempt.\n - CALLBACK_STATE_FAILED: Callback has failed.\n - CALLBACK_STATE_SUCCEEDED: Callback has succeeded.\n - CALLBACK_STATE_BLOCKED: Callback is blocked, e.g. by circuit breaker."
+    },
+    "v1CallbackWorker": {
+      "type": "object",
+      "properties": {
+        "taskQueueName": {
+          "type": "string",
+          "description": "Nexus task queue the Temporal worker is listening on.\n\nNOTE: This is not a temporal.api.taskqueue.v1.TaskQueue to avoid a circular dependency."
+        },
+        "service": {
+          "type": "string",
+          "description": "Target Nexus service, e.g. \"HTTPAdapter\"."
+        },
+        "operation": {
+          "type": "string",
+          "description": "Target operation, e.g. \"DeliverAsWebhook\"."
+        },
+        "sourceContext": {
+          "$ref": "#/definitions/v1Payload",
+          "description": "There is a relatively small maximum size the source context can be, e.g. 32KiB.",
+          "title": "Arbitrary user-supplied data from the source operation's callsite. (As applicable, not all operations\nsupport attaching context data.)"
+        }
+      },
+      "description": "The targeted Nexus service must be registered within the same namespace as the source operation\nthe callback is attached to. (While Nexus allows for cross-namespace operations, worker callbacks\nare purely \"caller-side\".)\n\nWorker callbacks are only supported for certain types of operations, e.g. standalone Nexus operations.\nAttempting to attach a Worker callback for an unsupported operation will result in an INVALID_ARGUMENT\nerror from the server.",
+      "title": "Worker callbacks are requests to invoke a specific shape of Nexus operation on a Temporal worker.\nThe specified Nexus operation must have the following:\n- Input:  temporal.api.notificationservice.v1.OnCompleteRequest\n- Output: temporal.api.notificationservice.v1.OnCompleteResponse"
     },
     "v1CancelExternalWorkflowExecutionFailedCause": {
       "type": "string",
@@ -15620,6 +15721,14 @@
           "type": "string",
           "format": "byte",
           "description": "Token for follow-on long-poll requests. Absent only if the operation is complete."
+        },
+        "completionCallbacks": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "$ref": "#/definitions/apiNexusoperationV1CallbackInfo"
+          },
+          "description": "Completion callbacks to be invoked once the Nexus operation reaches a terminal state.\nThey will remain in the CALLBACK_STATE_STANDBY state until the Nexus operation is finished."
         }
       }
     },
@@ -15857,13 +15966,27 @@
       "type": "object",
       "properties": {
         "worker": {
-          "$ref": "#/definitions/EndpointTargetWorker"
+          "$ref": "#/definitions/v1EndpointTargetWorker"
         },
         "external": {
           "$ref": "#/definitions/EndpointTargetExternal"
         }
       },
       "description": "Target to route requests to."
+    },
+    "v1EndpointTargetWorker": {
+      "type": "object",
+      "properties": {
+        "namespace": {
+          "type": "string",
+          "description": "Namespace to route requests to."
+        },
+        "taskQueue": {
+          "type": "string",
+          "description": "Nexus task queue to route requests to."
+        }
+      },
+      "description": "Target a worker polling on a Nexus task queue in a specific namespace."
     },
     "v1EnvironmentInfo": {
       "type": "object",
@@ -16742,6 +16865,9 @@
         },
         "workflow": {
           "$ref": "#/definitions/LinkWorkflow"
+        },
+        "nexusOperationCallback": {
+          "$ref": "#/definitions/LinkNexusOperationCallback"
         }
       },
       "description": "Link can be associated with history events. It might contain information about an external entity\nrelated to the history event. For example, workflow A makes a Nexus call that starts workflow B:\nin this case, a history event in workflow A could contain a Link to the workflow started event in\nworkflow B, and vice-versa."

@@ -1,0 +1,42 @@
+syntax = "proto3";
+
+package temporal.api.nexusoperation.v1;
+
+option go_package = "go.temporal.io/api/nexusoperation/v1;nexusoperation";
+option java_package = "io.temporal.api.nexusoperation.v1";
+option java_multiple_files = true;
+option java_outer_classname = "MessageProto";
+option ruby_package = "Temporalio::Api::NexusOperation::V1";
+option csharp_namespace = "Temporalio.Api.NexusOperation.V1";
+
+import "temporal/api/callback/v1/message.proto";
+
+// CallbackInfo contains the state of a callback attached to a standalone Nexus operation.
+message CallbackInfo {
+    // Trigger for when the Nexus operation is completed, covering both success cases as
+    // well as any type of failure.
+    message OperationCompleted {}
+
+    message Trigger {
+        oneof variant {
+            OperationCompleted operation_completed = 1;
+        }
+    }
+
+    // Trigger for this callback.
+    Trigger trigger = 1;
+    // Common callback info.
+    temporal.api.callback.v1.CallbackInfo info = 2;
+}
+
+// When StartNexusOperationExecutionRequest uses the conflict policy NEXUS_OPERATION_ID_CONFLICT_POLICY_USE_EXISTING
+// and there is already an existing, running standalone Nexus operation, OnConflictOptions defines actions to be
+// taken.
+message OnConflictOptions {
+    // Attaches the request ID to the running operation.
+    bool attach_request_id = 1;
+    // Attaches the completion callbacks to the running operation.
+    bool attach_completion_callbacks = 2;
+    // Attaches any new links to the running operation.
+    bool attach_links = 3;
+}

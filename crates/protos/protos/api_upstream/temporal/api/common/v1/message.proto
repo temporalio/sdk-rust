@@ -201,10 +201,41 @@ message Callback {
         bytes data = 1;
     }
 
+    // Worker callbacks are requests to invoke a specific shape of Nexus operation on a Temporal worker.
+    // The specified Nexus operation must have the following:
+    // - Input:  temporal.api.notificationservice.v1.OnCompleteRequest
+    // - Output: temporal.api.notificationservice.v1.OnCompleteResponse
+    //
+    // The targeted Nexus service must be registered within the same namespace as the source operation
+    // the callback is attached to. (While Nexus allows for cross-namespace operations, worker callbacks
+    // are purely "caller-side".)
+    //
+    // Worker callbacks are only supported for certain types of operations, e.g. standalone Nexus operations.
+    // Attempting to attach a Worker callback for an unsupported operation will result in an INVALID_ARGUMENT
+    // error from the server.
+    message Worker {
+        // Nexus task queue the Temporal worker is listening on.
+        //
+        // NOTE: This is not a temporal.api.taskqueue.v1.TaskQueue to avoid a circular dependency.
+        string task_queue_name = 1;
+
+        // Target Nexus service, e.g. "HTTPAdapter".
+        string service = 2;
+        // Target operation, e.g. "DeliverAsWebhook".
+        string operation = 3;
+
+        // Arbitrary user-supplied data from the source operation's callsite. (As applicable, not all operations
+        // support attaching context data.)
+        //
+        // There is a relatively small maximum size the source context can be, e.g. 32KiB.
+        temporal.api.common.v1.Payload source_context = 4;
+    }
+
     reserved 1; // For a generic callback mechanism to be added later.
     oneof variant {
         Nexus nexus = 2;
         Internal internal = 3;
+        Worker worker = 4;
     }
 
     // Links associated with the callback. It can be used to link to underlying resources of the
@@ -273,12 +304,22 @@ message Link {
         string reason = 4;
     }
 
+    // A link to a worker callback attached to a Nexus operation within the same namespace. e.g. the completion handler attached
+    // to a standalone Nexus operation, not the source Nexus operation itself. A standalone Nexus operation can have multiple
+    // callbacks attached to them, and will be differentiated by the server-generated request_id used when the callback was invoked.
+    message NexusOperationCallback {
+        string operation_id = 1;
+        string run_id = 2;
+        string request_id  = 3;
+    }
+
     oneof variant {
         WorkflowEvent workflow_event = 1;
         BatchJob batch_job = 2;
         Activity activity = 3;
         NexusOperation nexus_operation = 4;
         Workflow workflow = 5;
+        NexusOperationCallback nexus_operation_callback = 6;
     }
 }
 
