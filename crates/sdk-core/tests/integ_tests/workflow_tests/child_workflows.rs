@@ -34,8 +34,7 @@ use temporalio_macros::{workflow, workflow_methods};
 use temporalio_sdk::{
     ApplicationFailure, CancellableFuture, ChildWorkflowCancellationType,
     ChildWorkflowExecutionError, ChildWorkflowOptions, ChildWorkflowStartError, ParentClosePolicy,
-    SyncWorkflowContext, TimerOptions, WorkflowCancellationToken, WorkflowContext, WorkflowResult,
-    WorkflowSignalError, WorkflowTermination,
+    SyncWorkflowContext, WorkflowContext, WorkflowResult, WorkflowSignalError, WorkflowTermination,
 };
 use temporalio_sdk_core::{
     replay::{DEFAULT_WORKFLOW_TYPE, TestHistoryBuilder, canned_histories},
@@ -199,14 +198,13 @@ async fn abandoned_child_bug_repro() {
 
 #[workflow]
 struct AbandonedChildResolvesPostCancelParent {
-    barr: Arc<Barrier>,
+    ready: Arc<Notify>,
 }
 
 #[workflow_methods(factory_only)]
 impl AbandonedChildResolvesPostCancelParent {
     #[run(name = "parent_wf")]
     async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<()> {
-        let post_cancel_token = WorkflowCancellationToken::new();
         let started = ctx
             .start_child_workflow(
                 AbandonedChildResolvesPostCancelChild::run,
@@ -215,21 +213,14 @@ impl AbandonedChildResolvesPostCancelParent {
                     .workflow_id("abandoned-child-resolve-post-cancel".to_owned())
                     .parent_close_policy(ParentClosePolicy::Abandon)
                     .cancel_type(ChildWorkflowCancellationType::Abandon)
-                    .cancellation_token(post_cancel_token.clone())
                     .build(),
             )
             .await
             .expect("Child should start OK");
-        let barr = ctx.state(|wf| wf.barr.clone());
-        barr.wait().await;
+        ctx.state(|wf| wf.ready.notify_one());
         ctx.cancelled().await;
         started.cancel("Die reason".to_string());
-        ctx.timer(
-            TimerOptions::builder(Duration::from_secs(1))
-                .cancellation_token(post_cancel_token)
-                .build(),
-        )
-        .await;
+        ctx.timer(Duration::from_secs(1)).await;
         let _ = started.result().await;
         Ok(())
     }
@@ -250,12 +241,12 @@ impl AbandonedChildResolvesPostCancelChild {
 #[tokio::test]
 async fn abandoned_child_resolves_post_cancel() {
     let mut starter = CoreWfStarter::new("child-workflow-resolves-post-cancel");
-    let barr = Arc::new(Barrier::new(2));
-    let barr_clone = barr.clone();
+    let ready = Arc::new(Notify::new());
+    let ready_clone = ready.clone();
     starter
         .sdk_config
         .register_workflow_with_factory(move || AbandonedChildResolvesPostCancelParent {
-            barr: barr_clone.clone(),
+            ready: ready_clone.clone(),
         })
         .unwrap();
     starter
@@ -275,7 +266,7 @@ async fn abandoned_child_resolves_post_cancel() {
         .unwrap();
     let client = starter.get_core_client().await;
     let canceller = async {
-        barr.wait().await;
+        ready.notified().await;
         handle
             .cancel(WorkflowCancelOptions::builder().reason("die").build())
             .await
