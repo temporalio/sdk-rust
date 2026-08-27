@@ -34,6 +34,8 @@ relevant information.
 ## Unreleased
 
 ### Added
+* `LocalActivityOptions::include_arguments_into_marker` allows Rust workflows to opt in to
+  recording local activity arguments in Workflow history.
 * `WorkflowContext::all_handlers_finished` and `SyncWorkflowContext::all_handlers_finished` let
   Rust workflows wait for active signal and update handler chains before completing or continuing
   as new.
@@ -43,8 +45,33 @@ relevant information.
   and `list` read them back.
 * `MemoValue` and `MemoValues` are now exported from `temporalio_common` as well as
   `temporalio_workflow`, so the same types can be used from clients and workflows.
+* The `temporal_activity_execution_failed` and `temporal_local_activity_execution_failed` worker
+  metrics now carry a `failure_reason` attribute. Each is now split into one time series per
+  reason, which may affect existing dashboards.
+* Workflow task completions larger than the gRPC request size limit are now paginated automatically when the namespace supports it. Paginated workflow task completions require Temporal Server 1.32.0 or later.
+* Update-with-Start support: `Client::start_update_with_start_workflow` and
+  `Client::execute_update_with_start_workflow` start a workflow and send it an update in one atomic
+  operation. `WorkflowUpdateWithStartOptions` requires an ID conflict policy (use `UseExisting` to
+  attach an update to an already-running workflow), provides distinct start and update headers,
+  and controls the atomic RPC. The operation can be intercepted via
+  `ClientInterceptor::update_with_start_workflow`.
 
 ### Breaking Changes :boom:
+* The following types are now non-exhaustive: `Priority`, `WorkerDeploymentVersion`,
+  `WorkerCallbacks`, `WorkflowExecutionInfo`, `ActivityCloseTimeouts`,
+  `ActivityExecutionDecodeHint`, child-workflow and signal decode hints,
+  `SerializationContext`, `SerializationContextData`, `PayloadConverter`, `IncomingError`,
+  `ScheduleSpec`, and `ScheduleOverlapPolicy`. Construct structs using their respective builders
+  or constructors (`WorkerCallbacks::new`, `ActivityExecutionDecodeHint::new`, or
+  `SerializationContext::new`); use `Default` for `PayloadConverter`; and add wildcard branches
+  when matching enums.
+* Renamed `ActivityCloseTimeouts::Both` to `ActivityCloseTimeouts::ScheduleAndStartToClose`.
+* Removed the unused `ActExitValue` type. Use `ActivityError::WillCompleteAsync` to mark an
+  activity for asynchronous completion.
+* Removed the test-only `FailOnNondeterminismInterceptor` from the public Rust SDK API.
+* Environment configuration values (`DataSource`, `ClientConfig`, and related profile, TLS, and
+  codec types) are now non-exhaustive. Use their `bon` builders to construct configuration structs,
+  and add a wildcard branch when matching `DataSource`.
 * Values stored in a `MemoValue` must now be `Send + Sync`. It previously held its value in an
   `Rc` and now uses an `Arc`, so that memos can be built outside a workflow and handed to the
   client. Only affects memo values that are themselves non-`Send`/non-`Sync`, such as those
@@ -64,6 +91,19 @@ relevant information.
   `Waiting for all slot permits to release took too long!`, and release builds logged that error
   and dropped the result, leaving the server to time the activity out before retrying it.
   Shutdown now drains in-flight completions first.
+* The Prometheus exporter now respects `PrometheusExporterOptions::counters_total_suffix`,
+  appending `_total` to counter metric names when enabled.
+* Workflow start requests now include the client's identity.
+* An activity failure caused by oversized final heartbeat details is now counted in the
+  `temporal_activity_execution_failed` metric as `failure_reason="PayloadsTooLarge"`. Previously it
+  was counted under the reason for the failure the activity itself reported, and was not counted at
+  all when that failure was benign, even though the worker reported a payload-limit failure to the
+  server.
+* Workers configured with a small `max_cached_workflows` no longer briefly stop accepting new
+  workflows. Sticky workflow-task pollers could consume every workflow-cache permit and starve the
+  non-sticky poller, so the worker would stop picking up new workflows until a poll timed out (up to
+  ~60s). The poll balancer now reserves a non-sticky slot against the cache size rather than the
+  slot-supplier size.
 
 ## [0.7.0] - 2026-08-17
 
@@ -101,7 +141,6 @@ relevant information.
   `TEMPORAL_WORKFLOW_TASK_DURATION_WARN_SECONDS` to change the threshold.
 * `SignalWorkflowOptions::summary` attaches a single-line summary to a signal sent to another
   workflow, which the UI and CLI display alongside the resulting history event.
-* Core now supports attaching `EventGroupMarker`s to various workflow commands.
 
 ### Changed
 * Cancellation errors propagated after workflow cancellation now complete the workflow as cancelled

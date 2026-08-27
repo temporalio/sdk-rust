@@ -59,10 +59,12 @@ impl ActivityLoadWf {
             .execute_activity(
                 StdActivities::echo,
                 input_str.clone(),
-                ActivityOptions::with_close_timeouts(ActivityCloseTimeouts::Both {
-                    start_to_close: Duration::from_secs(8),
-                    schedule_to_close: Duration::from_secs(8),
-                })
+                ActivityOptions::with_close_timeouts(
+                    ActivityCloseTimeouts::ScheduleAndStartToClose {
+                        start_to_close: Duration::from_secs(8),
+                        schedule_to_close: Duration::from_secs(8),
+                    },
+                )
                 .activity_id("act-1".to_string())
                 .task_queue(tq)
                 .schedule_to_start_timeout(Duration::from_secs(8))
@@ -336,20 +338,19 @@ async fn evict_while_la_running_no_interference() {
         subfs.push(async move {
             tokio::time::sleep(Duration::from_secs(1)).await;
             cw.request_workflow_eviction(&run_id);
-            WorkflowExecutionInfo {
-                namespace: client.namespace(),
-                workflow_id: wf_id,
-                run_id: Some(run_id),
-                first_execution_run_id: None,
-            }
-            .bind_untyped(client)
-            .signal(
-                UntypedSignal::new("whaatever"),
-                RawValue::empty(),
-                WorkflowSignalOptions::default(),
-            )
-            .await
-            .unwrap();
+            WorkflowExecutionInfo::builder()
+                .namespace(client.namespace())
+                .workflow_id(wf_id)
+                .maybe_run_id(Some(run_id))
+                .build()
+                .bind_untyped(client)
+                .signal(
+                    UntypedSignal::new("whaatever"),
+                    RawValue::empty(),
+                    WorkflowSignalOptions::default(),
+                )
+                .await
+                .unwrap();
         });
     }
     let runf = async {
@@ -400,13 +401,12 @@ async fn can_paginate_long_history() {
     let run_id = handle.run_id().unwrap().to_owned();
     let client = starter.get_core_client().await;
     tokio::spawn(async move {
-        let handle = WorkflowExecutionInfo {
-            namespace: client.namespace(),
-            workflow_id: wf_name.into(),
-            run_id: Some(run_id),
-            first_execution_run_id: None,
-        }
-        .bind_untyped(client);
+        let handle = WorkflowExecutionInfo::builder()
+            .namespace(client.namespace())
+            .workflow_id(wf_name)
+            .maybe_run_id(Some(run_id))
+            .build()
+            .bind_untyped(client);
         loop {
             for _ in 0..10 {
                 handle

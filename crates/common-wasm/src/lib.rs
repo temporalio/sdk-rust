@@ -55,6 +55,7 @@ pub(crate) use dbg_panic;
 /// Activity options. Specifying at least one of them is required, but specifying both is also
 /// allowed. Note that this type does not cover all available timeout options for an Activity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ActivityCloseTimeouts {
     /// Total time the Activity is allowed to run, including retries.
     ScheduleToClose(Duration),
@@ -66,7 +67,7 @@ pub enum ActivityCloseTimeouts {
     /// failure detection.
     StartToClose(Duration),
     /// Applies both execution-attempt and overall-completion bounds.
-    Both {
+    ScheduleAndStartToClose {
         /// Total time the Activity is allowed to run, including retries.
         schedule_to_close: Duration,
         /// Maximum time of a single Activity execution attempt.
@@ -75,22 +76,26 @@ pub enum ActivityCloseTimeouts {
 }
 
 impl ActivityCloseTimeouts {
-    /// Returns value of [`Self::ScheduleToClose`]  or [`Self::Both::schedule_to_close`].
+    /// Returns value of [`Self::ScheduleToClose`] or
+    /// [`Self::ScheduleAndStartToClose::schedule_to_close`].
     pub fn schedule_to_close(&self) -> Option<Duration> {
         match self {
             ActivityCloseTimeouts::ScheduleToClose(schedule_to_close)
-            | ActivityCloseTimeouts::Both {
+            | ActivityCloseTimeouts::ScheduleAndStartToClose {
                 schedule_to_close, ..
             } => Some(*schedule_to_close),
             _ => None,
         }
     }
 
-    /// Returns value of [`Self::StartToClose`]  or [`Self::Both::start_to_close`].
+    /// Returns value of [`Self::StartToClose`] or
+    /// [`Self::ScheduleAndStartToClose::start_to_close`].
     pub fn start_to_close(&self) -> Option<Duration> {
         match self {
             ActivityCloseTimeouts::StartToClose(start_to_close)
-            | ActivityCloseTimeouts::Both { start_to_close, .. } => Some(*start_to_close),
+            | ActivityCloseTimeouts::ScheduleAndStartToClose { start_to_close, .. } => {
+                Some(*start_to_close)
+            }
             _ => None,
         }
     }

@@ -1076,7 +1076,7 @@ async fn activity_non_retryable_failure() {
                 variant: Some(workflow_activation_job::Variant::ResolveActivity(
                     ResolveActivity {seq, result: Some(ActivityResolution{
                     status: Some(act_res::Status::Failed(activity_result::Failure{
-                        failure: Some(f),
+                        failure: Some(f), ..
                     }))}),..}
                 )),
             },
@@ -1143,7 +1143,7 @@ async fn activity_non_retryable_failure_with_error() {
                 variant: Some(workflow_activation_job::Variant::ResolveActivity(
                     ResolveActivity {seq, result: Some(ActivityResolution{
                     status: Some(act_res::Status::Failed(activity_result::Failure{
-                        failure: Some(f),
+                        failure: Some(f), ..
                     }))}),..}
                 )),
             },
@@ -1499,7 +1499,7 @@ async fn started_activity_timeout() {
                         result: Some(ActivityResolution{
                             status: Some(
                                 act_res::Status::Failed(
-                                    activity_result::Failure{failure: Some(_)}
+                                    activity_result::Failure{failure: Some(_), ..}
                                 )
                             ),
                             ..

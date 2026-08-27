@@ -4,7 +4,6 @@ use crate::{
     Worker, WorkerRunError,
     activities::{ActivityContext, ActivityError, ActivityInfo},
 };
-use anyhow::bail;
 use futures_util::future::{BoxFuture, LocalBoxFuture};
 use std::{
     any::Any,
@@ -17,7 +16,7 @@ use temporalio_common::{
     },
     protos::{
         coresdk::{
-            workflow_activation::{WorkflowActivation, remove_from_cache::EvictionReason},
+            workflow_activation::WorkflowActivation,
             workflow_completion::WorkflowActivationCompletion,
         },
         temporal::api::common::v1::Payload,
@@ -257,25 +256,6 @@ pub trait ActivityInboundInterceptor: Send + Sync + 'static {
         next: Next<'a, ExecuteActivityInput, ExecuteActivityOutput<'a>>,
     ) -> ExecuteActivityOutput<'a> {
         next.run(input)
-    }
-}
-
-/// An interceptor which causes the worker's run function to exit early if nondeterminism errors are
-/// encountered
-pub struct FailOnNondeterminismInterceptor {}
-#[async_trait::async_trait(?Send)]
-impl WorkerInterceptor for FailOnNondeterminismInterceptor {
-    async fn on_workflow_activation(
-        &self,
-        activation: &WorkflowActivation,
-    ) -> Result<(), anyhow::Error> {
-        if matches!(
-            activation.eviction_reason(),
-            Some(EvictionReason::Nondeterminism)
-        ) {
-            bail!("Workflow is being evicted because of nondeterminism! {activation}");
-        }
-        Ok(())
     }
 }
 

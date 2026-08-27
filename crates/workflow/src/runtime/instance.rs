@@ -367,10 +367,7 @@ where
     ) -> Result<Box<dyn WorkflowInstance>, PayloadConversionError> {
         let view = base_ctx.view();
         let interceptors = base_ctx.workflow_interceptors();
-        let ser_ctx = SerializationContext {
-            data: &SerializationContextData::Workflow,
-            converter: &converter,
-        };
+        let ser_ctx = SerializationContext::new(&SerializationContextData::Workflow, &converter);
         let input = converter.from_payloads(&ser_ctx, payloads)?;
         let (init_input, run_input) = if W::INIT_TAKES_INPUT {
             (Some(input), None)
@@ -453,10 +450,7 @@ where
         }
 
         let converter = PayloadConverter::default();
-        let ctx = SerializationContext {
-            data: &SerializationContextData::Workflow,
-            converter: &converter,
-        };
+        let ctx = SerializationContext::new(&SerializationContextData::Workflow, &converter);
         QueryResponse {
             result: converter
                 .to_payload(
@@ -796,10 +790,10 @@ where
                 let details = details
                     .map(|details| {
                         (&*details as &dyn WorkflowOutputValue)
-                            .serialize_payloads(&SerializationContext {
-                                data: &SerializationContextData::Workflow,
-                                converter: self.ctx.payload_converter(),
-                            })
+                            .serialize_payloads(&SerializationContext::new(
+                                &SerializationContextData::Workflow,
+                                self.ctx.payload_converter(),
+                            ))
                             .map(|payloads| Payloads { payloads })
                     })
                     .transpose()

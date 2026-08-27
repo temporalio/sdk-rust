@@ -199,10 +199,7 @@ pub(crate) fn serialize_workflow_output(
     output: &dyn WorkflowOutputValue,
     converter: &PayloadConverter,
 ) -> Result<Payload, PayloadConversionError> {
-    let ctx = SerializationContext {
-        data: &SerializationContextData::Workflow,
-        converter,
-    };
+    let ctx = SerializationContext::new(&SerializationContextData::Workflow, converter);
     output.serialize_payload(&ctx)
 }
 

@@ -121,7 +121,7 @@ impl FailurePayloadActivities {
             "codec-heartbeat-details".to_string(),
         )))
         .await?;
-        tokio::time::sleep(Duration::from_secs(2)).await;
+        ctx.cancelled().await;
         Ok(())
     }
 }

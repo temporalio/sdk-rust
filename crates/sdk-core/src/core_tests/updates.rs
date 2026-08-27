@@ -110,7 +110,7 @@ async fn initial_request_sent_back(#[values(false, true)] reject: bool) {
     mock_client
         .expect_complete_workflow_task()
         .times(1)
-        .returning(move |mut resp| {
+        .returning(move |mut resp, _| {
             let msg = resp.messages.pop().unwrap();
             let orig_req = if reject {
                 let acceptance = msg.body.unwrap().to_msg::<Rejection>().unwrap();
@@ -324,70 +324,42 @@ async fn replay_with_signal_and_update_same_task() {
 }
 
 #[tokio::test]
-async fn originating_ids_on_inbound_activation_jobs() {
-    // Each inbound-job kind that auto-creates an event group marker on the lang side
-    // is supposed to carry the identifier it needs to construct that marker:
-    //   - `InitializeWorkflow.originating_event_id` = `WorkflowExecutionStarted` event id (1)
-    //   - `SignalWorkflow.originating_event_id`    = `WorkflowExecutionSignaled` event id
-    //   - `DoUpdate.id`                            = the workflow-unique update id (always set)
+async fn update_activation_has_update_id() {
+    let wfid = "fakeid";
     let mut t = TestHistoryBuilder::default();
-    t.add_by_type(EventType::WorkflowExecutionStarted); // 1
-    t.add_full_wf_task(); //                              2,3,4
-    t.add_we_signaled("go", vec![]); //                   5
-    let signal_event_id = t.current_event_id();
-    t.add_full_wf_task(); //                              6,7,8
-    let accept_id = t.add_update_accepted("upd1", "update"); // 9
-    t.add_update_completed(accept_id); //                 10
-    t.add_workflow_execution_completed(); //              11
+    t.add_by_type(EventType::WorkflowExecutionStarted);
+    t.add_workflow_task_scheduled_and_started();
 
-    let mock = MockPollCfg::from_resps(t, [ResponseType::AllHistory]);
-    let mut mock = build_mock_pollers(mock);
-    mock.worker_cfg(|wc| wc.max_cached_workflows = 1);
-    let core = mock_worker(mock);
+    let update_id = "upd-1";
+    let mut poll_resp = hist_to_poll_resp(&t, wfid, ResponseType::AllHistory);
+    poll_resp.add_update_request(update_id, 1);
 
-    let task = core.poll_workflow_activation().await.unwrap();
-    assert_matches!(
-        task.jobs.as_slice(),
-        [WorkflowActivationJob {
-            variant: Some(workflow_activation_job::Variant::InitializeWorkflow(init)),
-        }] => {
-            assert_eq!(init.originating_event_id, 1);
-        }
-    );
-    core.complete_workflow_activation(WorkflowActivationCompletion::empty(task.run_id))
-        .await
-        .unwrap();
+    let mut mock_client = mock_worker_client();
+    mock_client
+        .expect_complete_workflow_task()
+        .times(1)
+        .returning(|_, _| Ok(RespondWorkflowTaskCompletedResponse::default()));
+    let mh = MockPollCfg::from_resp_batches(wfid, t, [poll_resp], mock_client);
+    let core = mock_worker(build_mock_pollers(mh));
 
     let task = core.poll_workflow_activation().await.unwrap();
-    assert_matches!(
-        task.jobs.as_slice(),
-        [
-            WorkflowActivationJob {
-                variant: Some(workflow_activation_job::Variant::SignalWorkflow(sig)),
-            },
-            WorkflowActivationJob {
-                variant: Some(workflow_activation_job::Variant::DoUpdate(upd)),
-            }
-        ] => {
-            assert_eq!(sig.originating_event_id, signal_event_id);
-            assert_eq!(upd.id, "upd1");
-        }
-    );
-    core.complete_workflow_activation(WorkflowActivationCompletion::from_cmds(
+    let update = task
+        .jobs
+        .iter()
+        .find_map(|job| match job.variant.as_ref() {
+            Some(workflow_activation_job::Variant::DoUpdate(update)) => Some(update),
+            _ => None,
+        })
+        .expect("activation should contain an update");
+    assert_eq!(update.id, update_id);
+
+    core.complete_workflow_activation(WorkflowActivationCompletion::from_cmd(
         task.run_id,
-        vec![
-            UpdateResponse {
-                protocol_instance_id: "upd1".to_string(),
-                response: Some(Response::Accepted(())),
-            }
-            .into(),
-            UpdateResponse {
-                protocol_instance_id: "upd1".to_string(),
-                response: Some(Response::Completed(Payload::default())),
-            }
-            .into(),
-            CompleteWorkflowExecution { result: None }.into(),
-        ],
+        UpdateResponse {
+            protocol_instance_id: update_id.to_string(),
+            response: Some(Response::Accepted(())),
+        }
+        .into(),
     ))
     .await
     .unwrap();

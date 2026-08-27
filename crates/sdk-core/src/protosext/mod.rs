@@ -121,7 +121,7 @@ impl TryFrom<PollWorkflowTaskQueueResponse> for ValidPollWFTQResponse {
                 let messages = messages.into_iter().map(TryInto::try_into).try_collect()?;
 
                 Ok(Self {
-                    task_token: TaskToken(task_token),
+                    task_token: task_token.into(),
                     task_queue: tq.name,
                     workflow_execution,
                     workflow_type: workflow_type.name,
@@ -322,6 +322,7 @@ pub(crate) struct ValidScheduleLA {
     pub(crate) retry_policy: ValidatedRetryPolicy,
     pub(crate) local_retry_threshold: Duration,
     pub(crate) cancellation_type: ActivityCancellationType,
+    pub(crate) include_arguments_into_marker: bool,
     pub(crate) user_metadata: Option<UserMetadata>,
     pub(crate) event_group_markers: Vec<EventGroupMarker>,
 }
@@ -432,6 +433,7 @@ impl ValidScheduleLA {
             retry_policy,
             local_retry_threshold,
             cancellation_type,
+            include_arguments_into_marker: v.include_arguments_into_marker,
             user_metadata,
             event_group_markers,
         })

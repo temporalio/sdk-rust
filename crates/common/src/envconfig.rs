@@ -101,6 +101,7 @@ impl From<toml::ser::Error> for ConfigError {
 
 /// A source for configuration or a TLS certificate/key, from a path or raw data.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub enum DataSource {
     /// A filesystem path to the data.
     Path(String),
@@ -109,14 +110,18 @@ pub enum DataSource {
 }
 
 /// ClientConfig represents a client config file.
-#[derive(Debug, Clone, PartialEq, Default)]
+#[derive(Debug, Clone, PartialEq, Default, bon::Builder)]
+#[non_exhaustive]
 pub struct ClientConfig {
     /// Profiles, keyed by profile name
+    #[builder(default)]
     pub profiles: HashMap<String, ClientConfigProfile>,
 }
 
 /// ClientConfigProfile is profile-level configuration for a client.
-#[derive(Debug, Clone, PartialEq, Default)]
+#[derive(Debug, Clone, PartialEq, Default, bon::Builder)]
+#[builder(on(String, into))]
+#[non_exhaustive]
 pub struct ClientConfigProfile {
     /// Client address
     pub address: Option<String>,
@@ -137,11 +142,14 @@ pub struct ClientConfigProfile {
     /// Client gRPC metadata (aka headers). When loading from TOML and env var, or writing to TOML, the keys are
     /// lowercased and underscores are replaced with hyphens. This is used for deduplicating/overriding too, so manually
     /// set values that are not normalized may not get overridden when applying environment variables.
+    #[builder(default)]
     pub grpc_meta: HashMap<String, String>,
 }
 
 /// ClientConfigTLS is TLS configuration for a client.
-#[derive(Debug, Clone, PartialEq, Default)]
+#[derive(Debug, Clone, PartialEq, Default, bon::Builder)]
+#[builder(on(String, into))]
+#[non_exhaustive]
 pub struct ClientConfigTLS {
     /// If Some(true), TLS is explicitly disabled. If Some(false), TLS is explicitly enabled.
     /// If None, TLS behavior depends on other factors (API key presence, etc.)
@@ -160,11 +168,14 @@ pub struct ClientConfigTLS {
     pub server_name: Option<String>,
 
     /// True if host verification should be skipped
+    #[builder(default)]
     pub disable_host_verification: bool,
 }
 
 /// Codec configuration for a client
-#[derive(Debug, Clone, PartialEq, Default)]
+#[derive(Debug, Clone, PartialEq, Default, bon::Builder)]
+#[builder(on(String, into))]
+#[non_exhaustive]
 pub struct ClientConfigCodec {
     /// Remote endpoint for the codec
     pub endpoint: Option<String>,

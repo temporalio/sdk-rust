@@ -242,10 +242,8 @@ where
         let payload_converter = self
             .payload_converter_ref()
             .expect("payload converter must be set in builder state");
-        let context = SerializationContext {
-            data: &SerializationContextData::Activity,
-            converter: payload_converter,
-        };
+        let context =
+            SerializationContext::new(&SerializationContextData::Activity, payload_converter);
         self.heartbeat_details = payload_converter.to_payloads(&context, &details)?;
         Ok(self)
     }
@@ -535,6 +533,7 @@ pub enum WorkflowEnvironmentError {
 mod tests {
     use super::*;
     use std::sync::Mutex;
+    use temporalio_common::data_converters::{MultiArgs2, MultiArgs3};
     use temporalio_macros::activities;
 
     struct TestActivities {
@@ -550,7 +549,7 @@ mod tests {
 
         #[activity]
         async fn prefixed(
-            self: Arc<Self>,
+            self: std::sync::Arc<Self>,
             _ctx: ActivityContext,
             value: String,
         ) -> Result<String, ActivityError> {
@@ -577,6 +576,71 @@ mod tests {
         #[activity]
         async fn echo(_ctx: ActivityContext, value: String) -> Result<String, ActivityError> {
             Ok(format!("static:{value}"))
+        }
+    }
+
+    struct ActivityMacroShapes;
+
+    #[activities]
+    impl ActivityMacroShapes {
+        #[activity]
+        fn sync(_ctx: ActivityContext, value: bool) -> Result<String, ActivityError> {
+            Ok(value.to_string())
+        }
+
+        #[activity]
+        async fn no_input(_ctx: ActivityContext) -> Result<String, ActivityError> {
+            Ok("no input".to_owned())
+        }
+
+        #[activity]
+        async fn async_no_return(_ctx: ActivityContext, _value: String) {}
+
+        #[activity]
+        fn sync_no_return(_ctx: ActivityContext) {}
+    }
+
+    struct MultiArgActivities;
+
+    #[activities]
+    impl MultiArgActivities {
+        #[activity]
+        async fn two_args(
+            _ctx: ActivityContext,
+            first: String,
+            second: i32,
+        ) -> Result<String, ActivityError> {
+            Ok(format!("{first}:{second}"))
+        }
+
+        #[activity]
+        async fn three_args(
+            _ctx: ActivityContext,
+            first: String,
+            second: i32,
+            third: bool,
+        ) -> Result<String, ActivityError> {
+            Ok(format!("{first}:{second}:{third}"))
+        }
+
+        #[activity]
+        async fn instance_two_args(
+            self: Arc<Self>,
+            _ctx: ActivityContext,
+            first: String,
+            second: i32,
+        ) -> Result<String, ActivityError> {
+            let _ = self;
+            Ok(format!("{first}:{second}"))
+        }
+
+        #[activity]
+        fn sync_two_args(
+            _ctx: ActivityContext,
+            first: String,
+            second: i32,
+        ) -> Result<String, ActivityError> {
+            Ok(format!("{first}:{second}"))
         }
     }
 
@@ -611,6 +675,70 @@ mod tests {
                 .await
                 .unwrap(),
             "pre:value"
+        );
+    }
+
+    #[tokio::test]
+    async fn runs_sync_and_unit_output_activities() {
+        let env = ActivityEnvironment::builder().build();
+
+        assert_eq!(
+            env.run(ActivityMacroShapes::sync, true).await.unwrap(),
+            "true"
+        );
+        assert_eq!(
+            env.run(ActivityMacroShapes::no_input, ()).await.unwrap(),
+            "no input"
+        );
+        env.run(ActivityMacroShapes::async_no_return, "value".to_owned())
+            .await
+            .unwrap();
+        env.run(ActivityMacroShapes::sync_no_return, ())
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn runs_multi_argument_activities() {
+        let env = ActivityEnvironment::builder()
+            .register_activities(MultiArgActivities)
+            .build();
+
+        assert_eq!(
+            env.run(
+                MultiArgActivities::two_args,
+                MultiArgs2("one".to_owned(), 2),
+            )
+            .await
+            .unwrap(),
+            "one:2"
+        );
+        assert_eq!(
+            env.run(
+                MultiArgActivities::three_args,
+                MultiArgs3("one".to_owned(), 2, true),
+            )
+            .await
+            .unwrap(),
+            "one:2:true"
+        );
+        assert_eq!(
+            env.run(
+                MultiArgActivities::instance_two_args,
+                MultiArgs2("one".to_owned(), 2),
+            )
+            .await
+            .unwrap(),
+            "one:2"
+        );
+        assert_eq!(
+            env.run(
+                MultiArgActivities::sync_two_args,
+                MultiArgs2("one".to_owned(), 2),
+            )
+            .await
+            .unwrap(),
+            "one:2"
         );
     }
 

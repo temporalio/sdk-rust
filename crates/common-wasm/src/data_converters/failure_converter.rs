@@ -73,9 +73,17 @@ impl FailureDecodeHint for NoopDecodeHint {
 
 /// Decode hint for activity execution results.
 #[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
 pub struct ActivityExecutionDecodeHint {
     /// Whether the workflow-side resolution was cancelled rather than failed.
     pub cancelled: bool,
+}
+
+impl ActivityExecutionDecodeHint {
+    /// Creates a decode hint for an activity resolution.
+    pub fn new(cancelled: bool) -> Self {
+        Self { cancelled }
+    }
 }
 
 impl FailureDecodeHint for ActivityExecutionDecodeHint {
@@ -114,7 +122,8 @@ impl FailureDecodeHint for ActivityExecutionDecodeHint {
 }
 
 /// Decode hint for child-workflow start results.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Default)]
+#[non_exhaustive]
 pub struct ChildWorkflowStartDecodeHint;
 
 impl FailureDecodeHint for ChildWorkflowStartDecodeHint {
@@ -140,7 +149,8 @@ impl FailureDecodeHint for ChildWorkflowStartDecodeHint {
 }
 
 /// Decode hint for child-workflow execution results.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Default)]
+#[non_exhaustive]
 pub struct ChildWorkflowExecutionDecodeHint;
 
 impl FailureDecodeHint for ChildWorkflowExecutionDecodeHint {
@@ -161,7 +171,8 @@ impl FailureDecodeHint for ChildWorkflowExecutionDecodeHint {
 }
 
 /// Decode hint for workflow signal failures.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Default)]
+#[non_exhaustive]
 pub struct WorkflowSignalDecodeHint;
 
 impl FailureDecodeHint for WorkflowSignalDecodeHint {
@@ -685,10 +696,7 @@ mod tests {
         let converter = PayloadConverter::default();
         let details: String = converter
             .from_payloads(
-                &SerializationContext {
-                    data: &SerializationContextData::Workflow,
-                    converter: &converter,
-                },
+                &SerializationContext::new(&SerializationContextData::Workflow, &converter),
                 payloads,
             )
             .unwrap();
@@ -718,10 +726,7 @@ mod tests {
         let converter = PayloadConverter::default();
         let payloads = converter
             .to_payloads(
-                &SerializationContext {
-                    data: &SerializationContextData::Workflow,
-                    converter: &converter,
-                },
+                &SerializationContext::new(&SerializationContextData::Workflow, &converter),
                 &"detail",
             )
             .unwrap();

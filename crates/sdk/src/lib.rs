@@ -41,10 +41,12 @@
 //!
 //!     let worker_options = WorkerOptions::new("task_queue")
 //!         .deployment_options(
-//!             WorkerDeploymentOptions::new(WorkerDeploymentVersion {
-//!                 deployment_name: "my_deployment".to_owned(),
-//!                 build_id: "my_build_id".to_owned(),
-//!             })
+//!             WorkerDeploymentOptions::new(
+//!                 WorkerDeploymentVersion::builder()
+//!                     .deployment_name("my_deployment")
+//!                     .build_id("my_build_id")
+//!                     .build(),
+//!             )
 //!             .build(),
 //!         )
 //!         .register_activities(MyActivities)
@@ -137,7 +139,7 @@ use temporalio_common::{
     protos::{
         TaskToken,
         coresdk::{
-            ActivityTaskCompletion, AsJsonPayloadExt,
+            ActivityTaskCompletion,
             activity_result::ActivityExecutionResult,
             activity_task::{ActivityTask, activity_task},
             workflow_activation::{WorkflowActivation, workflow_activation_job::Variant},
@@ -1413,10 +1415,8 @@ impl ActivityHalf {
                             // Codec application happens at the SDK/Core boundary, so activity
                             // implementations work with the payload converter directly.
                             let pc = codec_data_converter.payload_converter();
-                            let ctx = SerializationContext {
-                                data: &SerializationContextData::Activity,
-                                converter: pc,
-                            };
+                            let ctx =
+                                SerializationContext::new(&SerializationContextData::Activity, pc);
                             match output.serialize_payload(&ctx) {
                                 Ok(payload) => ActivityExecutionResult::ok(payload),
                                 Err(err) => {
@@ -1448,21 +1448,6 @@ impl ActivityHalf {
             }
         }
         Ok(())
-    }
-}
-
-/// Activity functions may return these values when exiting
-#[derive(Debug)]
-pub enum ActExitValue<T> {
-    /// Completion requires an asynchronous callback
-    WillCompleteAsync,
-    /// Finish with a result
-    Normal(T),
-}
-
-impl<T: AsJsonPayloadExt> From<T> for ActExitValue<T> {
-    fn from(t: T) -> Self {
-        Self::Normal(t)
     }
 }
 

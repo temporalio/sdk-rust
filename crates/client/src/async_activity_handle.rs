@@ -35,10 +35,8 @@ async fn encode_optional_value(
     };
     let unencoded_payloads = {
         let payload_converter = data_converter.payload_converter();
-        let context = SerializationContext {
-            data: &SerializationContextData::Activity,
-            converter: payload_converter,
-        };
+        let context =
+            SerializationContext::new(&SerializationContextData::Activity, payload_converter);
         value.serialize_payloads(&context)?
     };
     drop(value);
@@ -165,7 +163,7 @@ impl<CT: WorkflowService + NamespacedClient + Clone> AsyncActivityHandle<CT> {
                         let result = encode_optional_value(result, client.data_converter()).await?;
                         if let ActivityIdentifier::TaskToken(token) = identifier {
                             let mut request = RespondActivityTaskCompletedRequest {
-                                task_token: token.0,
+                                task_token: token.into_inner(),
                                 result,
                                 identity: client.identity(),
                                 namespace: client.namespace(),
@@ -252,7 +250,7 @@ impl<CT: WorkflowService + NamespacedClient + Clone> AsyncActivityHandle<CT> {
                             encode_optional_value(details, &data_converter).await?;
                         if let ActivityIdentifier::TaskToken(token) = identifier {
                             let mut request = RespondActivityTaskFailedRequest {
-                                task_token: token.0,
+                                task_token: token.into_inner(),
                                 failure: Some(failure),
                                 identity: client.identity(),
                                 namespace: client.namespace(),
@@ -323,7 +321,7 @@ impl<CT: WorkflowService + NamespacedClient + Clone> AsyncActivityHandle<CT> {
                         let details = encode_optional_value(details, client.data_converter()).await?;
                         if let ActivityIdentifier::TaskToken(token) = identifier {
                             let mut request = RespondActivityTaskCanceledRequest {
-                                task_token: token.0,
+                                task_token: token.into_inner(),
                                 details,
                                 identity: client.identity(),
                                 namespace: client.namespace(),
@@ -391,7 +389,7 @@ impl<CT: WorkflowService + NamespacedClient + Clone> AsyncActivityHandle<CT> {
                         let details = encode_optional_value(details, client.data_converter()).await?;
                         if let ActivityIdentifier::TaskToken(token) = identifier {
                             let mut request = RecordActivityTaskHeartbeatRequest {
-                                task_token: token.0,
+                                task_token: token.into_inner(),
                                 details,
                                 identity: client.identity(),
                                 namespace: client.namespace(),
@@ -440,6 +438,7 @@ impl<CT: WorkflowService + NamespacedClient + Clone> AsyncActivityHandle<CT> {
 
 /// Response from a heartbeat call.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct ActivityHeartbeatResponse {
     /// True if the activity has been asked to cancel itself.
     pub cancel_requested: bool,

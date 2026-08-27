@@ -123,13 +123,7 @@ where
         payload_converter: &PayloadConverter,
         context: &SerializationContextData,
     ) -> Result<Vec<Payload>, PayloadConversionError> {
-        payload_converter.to_payloads(
-            &SerializationContext {
-                data: context,
-                converter: payload_converter,
-            },
-            self,
-        )
+        payload_converter.to_payloads(&SerializationContext::new(context, payload_converter), self)
     }
 }
 
@@ -522,6 +516,7 @@ impl From<WorkflowSignalError> for OutgoingWorkflowError {
 
 /// A normalized incoming Temporal failure decoded from a protobuf [`Failure`].
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum IncomingError {
     /// A decoded application failure.
     Application(ApplicationFailure),
@@ -1386,10 +1381,7 @@ mod tests {
         let converter = PayloadConverter::default();
         let details: String = converter
             .from_payloads(
-                &SerializationContext {
-                    data: &SerializationContextData::None,
-                    converter: &converter,
-                },
+                &SerializationContext::new(&SerializationContextData::None, &converter),
                 payloads,
             )
             .unwrap();

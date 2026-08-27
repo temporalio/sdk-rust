@@ -24,9 +24,9 @@ use crate::{
     worker::{
         ExecutingLAId, LocalActRequest, LocalActivityExecutionResult, LocalActivityResolution,
         workflow::{
-            CommandID, DrivenWorkflow, HistoryUpdate, InternalFlagsRef, LocalResolution,
-            OutgoingJob, RunBasics, WFCommand, WFCommandVariant, WFMachinesError,
-            WorkflowStartedInfo, fatal,
+            CommandAnnotations, CommandID, DrivenWorkflow, HistoryUpdate, InternalFlagsRef,
+            LocalResolution, OutgoingJob, ProtoCommandExt, RunBasics, WFCommand, WFCommandVariant,
+            WFMachinesError, WorkflowStartedInfo, fatal,
             history_update::NextWFT,
             machines::{
                 HistEventData, activity_state_machine::ActivityMachine,
@@ -64,14 +64,12 @@ use temporalio_common::{
             workflow_commands::ContinueAsNewWorkflowExecution,
         },
         temporal::api::{
-            command::v1::{
-                Command as ProtoCommand, CommandAttributesExt, command::Attributes as ProtoCmdAttrs,
-            },
+            command::v1::{Command as ProtoCommand, command::Attributes as ProtoCmdAttrs},
             common::v1::SearchAttributes,
             enums::v1::EventType,
             history::v1::{HistoryEvent, history_event},
             protocol::v1::{Message as ProtocolMessage, message::SequencingId},
-            sdk::v1::{EventGroupMarker, UserMetadata, WorkflowTaskCompletedMetadata},
+            sdk::v1::WorkflowTaskCompletedMetadata,
         },
     },
     worker::WorkerDeploymentVersion,
@@ -201,9 +199,13 @@ pub(super) enum MachineResponse {
     IssueNewMessage(ProtocolMessage),
     /// The machine requests the creation of another *different* machine. This acts as if lang
     /// had replied to the activation with a command, but we use a special set of IDs to avoid
-    /// collisions.
-    #[display("NewCoreOriginatedCommand({_0:?})")]
-    NewCoreOriginatedCommand(ProtoCmdAttrs),
+    /// collisions. The requesting machine supplies the annotations, since it is the only thing
+    /// that knows which lang command this one is being issued on behalf of.
+    #[display("NewCoreOriginatedCommand({attrs:?})")]
+    NewCoreOriginatedCommand {
+        attrs: ProtoCmdAttrs,
+        annotations: CommandAnnotations,
+    },
     #[display("TriggerWFTaskStarted")]
     TriggerWFTaskStarted {
         task_started_event_id: i64,
@@ -590,10 +592,10 @@ impl WorkflowMachines {
                 (*$me.observed_internal_flags)
                     .borrow_mut()
                     .add_from_complete($wtc);
-                let mut combined_ver = WorkerDeploymentVersion {
-                    deployment_name: "".to_string(),
-                    build_id: "".to_string(),
-                };
+                let mut combined_ver = WorkerDeploymentVersion::builder()
+                    .deployment_name("")
+                    .build_id("")
+                    .build();
                 #[allow(deprecated)]
                 if let Some(bid) = $wtc.worker_version.as_ref().map(|wv| &wv.build_id) {
                     combined_ver.build_id = bid.to_string();
@@ -1008,7 +1010,6 @@ impl WorkflowMachines {
                         self.workflow_id.clone(),
                         str_to_randomness_seed(&attrs.original_execution_run_id),
                         event_dat.event.event_time.unwrap_or_default(),
-                        event_id,
                         attrs,
                     );
                 } else {
@@ -1186,7 +1187,7 @@ impl WorkflowMachines {
                         self.message_outbox.push_back(pm);
                     }
                 }
-                MachineResponse::NewCoreOriginatedCommand(attrs) => match attrs {
+                MachineResponse::NewCoreOriginatedCommand { attrs, annotations } => match attrs {
                     ProtoCmdAttrs::RequestCancelExternalWorkflowExecutionCommandAttributes(
                         attrs,
                     ) => {
@@ -1198,10 +1199,7 @@ impl WorkflowMachines {
                         };
                         self.add_cmd_to_wf_task(
                             new_external_cancel(0, we, attrs.child_workflow_only, attrs.reason),
-                            // FIXME: Wire metadata and group markers from lang's cancellation command,
-                            // through the state machine, into the command we issue here.
-                            None,
-                            vec![],
+                            annotations,
                             CommandIdKind::CoreInternal,
                         );
                     }
@@ -1211,10 +1209,7 @@ impl WorkflowMachines {
                         // workflows by users (but rather, just for them to search with).
                         self.add_cmd_to_wf_task(
                             upsert_search_attrs_internal(attrs),
-                            // FIXME: Wire metadata and group markers from lang's patch command,
-                            // through the state machine, into the command we issue here.
-                            None,
-                            vec![],
+                            annotations,
                             CommandIdKind::NeverResolves,
                         );
                     }
@@ -1315,13 +1310,16 @@ impl WorkflowMachines {
     /// server.
     fn handle_driven_results(&mut self, results: Vec<WFCommand>) -> Result<()> {
         for cmd in results {
-            match cmd.variant {
+            let WFCommand {
+                variant,
+                annotations,
+            } = cmd;
+            match variant {
                 WFCommandVariant::AddTimer(attrs) => {
                     let seq = attrs.seq;
                     self.add_cmd_to_wf_task(
-                        new_timer(attrs),
-                        cmd.metadata,
-                        cmd.event_group_markers,
+                        new_timer(attrs, annotations.clone()),
+                        annotations,
                         CommandID::Timer(seq).into(),
                     );
                 }
@@ -1334,13 +1332,18 @@ impl WorkflowMachines {
                             self.observed_internal_flags.clone(),
                             self.replaying,
                         ),
-                        cmd.metadata,
-                        cmd.event_group_markers,
+                        annotations,
                         CommandIdKind::NeverResolves,
                     );
                 }
                 WFCommandVariant::CancelTimer(attrs) => {
-                    cancel_machine!(self, CommandID::Timer(attrs.seq), TimerMachine, cancel);
+                    cancel_machine!(
+                        self,
+                        CommandID::Timer(attrs.seq),
+                        TimerMachine,
+                        cancel,
+                        annotations
+                    );
                 }
                 WFCommandVariant::AddActivity(attrs) => {
                     let seq = attrs.seq;
@@ -1353,9 +1356,9 @@ impl WorkflowMachines {
                             attrs,
                             self.observed_internal_flags.clone(),
                             use_compat,
+                            annotations.clone(),
                         ),
-                        cmd.metadata,
-                        cmd.event_group_markers,
+                        annotations,
                         CommandID::Activity(seq).into(),
                     );
                 }
@@ -1363,8 +1366,8 @@ impl WorkflowMachines {
                     let seq = attrs.seq;
                     let attrs: ValidScheduleLA = ValidScheduleLA::from_schedule_la(
                         attrs,
-                        cmd.metadata,
-                        cmd.event_group_markers,
+                        annotations.metadata,
+                        annotations.event_group_markers,
                     )
                     .map_err(|e| {
                         fatal!("Invalid schedule local activity request (seq {seq}): {e}")
@@ -1385,7 +1388,8 @@ impl WorkflowMachines {
                         self,
                         CommandID::Activity(attrs.seq),
                         ActivityMachine,
-                        cancel
+                        cancel,
+                        annotations
                     );
                 }
                 WFCommandVariant::RequestCancelLocalActivity(attrs) => {
@@ -1397,18 +1401,10 @@ impl WorkflowMachines {
                     );
                 }
                 WFCommandVariant::CompleteWorkflow(attrs) => {
-                    self.add_terminal_command(
-                        complete_workflow(attrs),
-                        cmd.metadata,
-                        cmd.event_group_markers,
-                    );
+                    self.add_terminal_command(complete_workflow(attrs), annotations);
                 }
                 WFCommandVariant::FailWorkflow(attrs) => {
-                    self.add_terminal_command(
-                        fail_workflow(attrs),
-                        cmd.metadata,
-                        cmd.event_group_markers,
-                    );
+                    self.add_terminal_command(fail_workflow(attrs), annotations);
                 }
                 WFCommandVariant::ContinueAsNew(attrs) => {
                     let attrs = self.augment_continue_as_new_with_current_values(attrs);
@@ -1416,18 +1412,10 @@ impl WorkflowMachines {
                         attrs.versioning_intent(),
                         &attrs.task_queue,
                     );
-                    self.add_terminal_command(
-                        continue_as_new(attrs, use_compat),
-                        cmd.metadata,
-                        cmd.event_group_markers,
-                    );
+                    self.add_terminal_command(continue_as_new(attrs, use_compat), annotations);
                 }
                 WFCommandVariant::CancelWorkflow(attrs) => {
-                    self.add_terminal_command(
-                        cancel_workflow(attrs),
-                        cmd.metadata,
-                        cmd.event_group_markers,
-                    );
+                    self.add_terminal_command(cancel_workflow(attrs), annotations);
                 }
                 WFCommandVariant::SetPatchMarker(attrs) => {
                     // Do not create commands for change IDs that we have already created commands
@@ -1445,11 +1433,11 @@ impl WorkflowMachines {
                                 .iter()
                                 .filter_map(|(k, ci)| ci.created_command.then_some(k.as_str())),
                             self.observed_internal_flags.clone(),
+                            annotations.clone(),
                         )?;
                         let mkey = self.add_cmd_to_wf_task(
                             patch_machine,
-                            cmd.metadata,
-                            cmd.event_group_markers,
+                            annotations,
                             CommandIdKind::NeverResolves,
                         );
                         self.process_machine_responses(mkey, other_cmds)?;
@@ -1477,9 +1465,9 @@ impl WorkflowMachines {
                             attrs,
                             self.observed_internal_flags.clone(),
                             use_compat,
+                            annotations.clone(),
                         ),
-                        cmd.metadata,
-                        cmd.event_group_markers,
+                        annotations,
                         CommandID::ChildWorkflowStart(seq).into(),
                     );
                 }
@@ -1489,7 +1477,8 @@ impl WorkflowMachines {
                         CommandID::ChildWorkflowStart(attrs.child_workflow_seq),
                         ChildWorkflowMachine,
                         cancel,
-                        attrs.reason
+                        attrs.reason,
+                        annotations
                     );
                 }
                 WFCommandVariant::RequestCancelExternalWorkflow(attrs) => {
@@ -1506,8 +1495,7 @@ impl WorkflowMachines {
                                 self.run_id, attrs.reason
                             ),
                         ),
-                        cmd.metadata,
-                        cmd.event_group_markers,
+                        annotations,
                         CommandID::CancelExternal(attrs.seq).into(),
                     );
                 }
@@ -1515,8 +1503,7 @@ impl WorkflowMachines {
                     let seq = attrs.seq;
                     self.add_cmd_to_wf_task(
                         new_external_signal(attrs, &self.worker_config.namespace)?,
-                        cmd.metadata,
-                        cmd.event_group_markers,
+                        annotations,
                         CommandID::SignalExternal(seq).into(),
                     );
                 }
@@ -1535,8 +1522,7 @@ impl WorkflowMachines {
                 WFCommandVariant::ModifyWorkflowProperties(attrs) => {
                     self.add_cmd_to_wf_task(
                         modify_workflow_properties(attrs),
-                        cmd.metadata,
-                        cmd.event_group_markers,
+                        annotations,
                         CommandIdKind::NeverResolves,
                     );
                 }
@@ -1557,9 +1543,8 @@ impl WorkflowMachines {
                 WFCommandVariant::ScheduleNexusOperation(attrs) => {
                     let seq = attrs.seq;
                     self.add_cmd_to_wf_task(
-                        NexusOperationMachine::new_scheduled(attrs),
-                        cmd.metadata,
-                        cmd.event_group_markers,
+                        NexusOperationMachine::new_scheduled(attrs, annotations.clone()),
+                        annotations,
                         CommandID::NexusOperation(seq).into(),
                     );
                 }
@@ -1568,7 +1553,8 @@ impl WorkflowMachines {
                         self,
                         CommandID::NexusOperation(attrs.seq),
                         NexusOperationMachine,
-                        cancel
+                        cancel,
+                        annotations
                     );
                 }
                 WFCommandVariant::NoCommandsFromLang => (),
@@ -1604,10 +1590,9 @@ impl WorkflowMachines {
     fn add_terminal_command(
         &mut self,
         machine: NewMachineWithCommand,
-        metadata: Option<UserMetadata>,
-        markers: Vec<EventGroupMarker>,
+        annotations: CommandAnnotations,
     ) {
-        let cwfm = self.add_new_command_machine(machine, metadata, markers);
+        let cwfm = self.add_new_command_machine(machine, annotations);
         self.workflow_end_time = Some(SystemTime::now());
         self.current_wf_task_commands.push_back(cwfm);
         // Wipe out any pending / executing local activity data since we're about to terminate
@@ -1619,11 +1604,10 @@ impl WorkflowMachines {
     fn add_cmd_to_wf_task(
         &mut self,
         machine: NewMachineWithCommand,
-        metadata: Option<UserMetadata>,
-        markers: Vec<EventGroupMarker>,
+        annotations: CommandAnnotations,
         id: CommandIdKind,
     ) -> MachineKey {
-        let mach = self.add_new_command_machine(machine, metadata, markers);
+        let mach = self.add_new_command_machine(machine, annotations);
         let key = mach.machine;
         if let CommandIdKind::LangIssued(id) = id {
             self.id_to_machine.insert(id, key);
@@ -1638,18 +1622,11 @@ impl WorkflowMachines {
     fn add_new_command_machine(
         &mut self,
         machine: NewMachineWithCommand,
-        metadata: Option<UserMetadata>,
-        markers: Vec<EventGroupMarker>,
+        annotations: CommandAnnotations,
     ) -> CommandAndMachine {
         let k = self.all_machines.insert(machine.machine);
-        let cmd = ProtoCommand {
-            command_type: machine.command.as_type() as i32,
-            attributes: Some(machine.command),
-            user_metadata: metadata,
-            event_group_markers: markers,
-        };
         CommandAndMachine {
-            command: cmd,
+            command: ProtoCommand::new(machine.command, annotations),
             machine: k,
         }
     }

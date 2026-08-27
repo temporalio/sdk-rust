@@ -29,9 +29,10 @@ use crate::{
     },
     worker::{
         ActivitySlotKind, CompleteWfError, LocalActRequest, LocalActivityExecutionResult,
-        LocalActivityResolution, PollError, PostActivateHookData, WorkflowSlotKind,
+        LocalActivityResolution, NamespaceCapabilities, PollError, PostActivateHookData,
+        WorkflowSlotKind,
         activities::{ActivitiesFromWFTsHandle, LocalActivityManager},
-        client::{LegacyQueryResult, WorkerClient, WorkflowTaskCompletion},
+        client::{LegacyQueryResult, REQUEST_TOO_LARGE_KEY, WorkerClient, WorkflowTaskCompletion},
         workflow::{
             history_update::HistoryPaginator,
             machines::MachineError,
@@ -75,7 +76,9 @@ use temporalio_common::{
             },
         },
         temporal::api::{
-            command::v1::{Command as ProtoCommand, Command, command::Attributes},
+            command::v1::{
+                Command as ProtoCommand, Command, CommandAttributesExt, command::Attributes,
+            },
             common::v1::{
                 Memo, MeteringMetadata, RetryPolicy, SearchAttributes, WorkflowExecution,
             },
@@ -137,6 +140,8 @@ pub(crate) struct Workflows {
     local_act_mgr: Option<Arc<LocalActivityManager>>,
     ever_polled: AtomicBool,
     default_versioning_behavior: Option<VersioningBehavior>,
+    namespace_capabilities: Arc<NamespaceCapabilities>,
+    shutdown_token: CancellationToken,
 }
 
 pub(crate) struct WorkflowBasics {
@@ -144,6 +149,7 @@ pub(crate) struct WorkflowBasics {
     pub(crate) shutdown_token: CancellationToken,
     pub(crate) metrics: MetricsContext,
     pub(crate) server_capabilities: get_system_info_response::Capabilities,
+    pub(crate) namespace_capabilities: Arc<NamespaceCapabilities>,
     pub(crate) sdk_name: String,
     pub(crate) sdk_version: String,
     pub(crate) default_versioning_behavior: Option<VersioningBehavior>,
@@ -183,6 +189,8 @@ impl Workflows {
             .worker_config
             .max_eager_activity_reservations_per_workflow_task;
         let default_versioning_behavior = basics.default_versioning_behavior;
+        let namespace_capabilities = basics.namespace_capabilities.clone();
+        let shutdown_token = basics.shutdown_token.clone();
         let extracted_wft_stream = WFTExtractor::build(
             client.clone(),
             basics.worker_config.fetching_concurrency,
@@ -274,6 +282,8 @@ impl Workflows {
             local_act_mgr,
             ever_polled: AtomicBool::new(false),
             default_versioning_behavior,
+            namespace_capabilities,
+            shutdown_token,
         }
     }
 
@@ -405,6 +415,12 @@ impl Workflows {
                         nonfirst_local_activity_execution_attempts,
                     },
                     versioning_behavior,
+                    pagination_enabled: self
+                        .namespace_capabilities
+                        .workflow_task_completion_pagination(),
+                    wft_completion_size_limit: self
+                        .namespace_capabilities
+                        .workflow_task_completion_size_limit(),
                 };
                 let sticky_attrs = self.sticky_attrs.clone();
                 // Do not return new WFT if we would not cache, because returned new WFTs are
@@ -416,7 +432,11 @@ impl Workflows {
 
                 let mut reset_last_started_to = None;
                 self.handle_wft_reporting_errs(run_id, || async {
-                    match self.client.complete_workflow_task(completion).await {
+                    match self
+                        .client
+                        .complete_workflow_task(completion, self.shutdown_token.clone())
+                        .await
+                    {
                         Ok(response) => {
                             if let Some(record) = maybe_record_terminal_metric.take() {
                                 record(&run_metrics);
@@ -435,7 +455,17 @@ impl Workflows {
                         Err(e) => {
                             let cause_reason_failure = if e
                                 .metadata()
-                                .contains_key(MESSAGE_TOO_LARGE_KEY)
+                                .contains_key(REQUEST_TOO_LARGE_KEY)
+                                && attempt < 2
+                            {
+                                // Completion exceeds the namespace's recombined size limit, so the
+                                // worker failed it proactively rather than sending doomed pages.
+                                Some((
+                                    WorkflowTaskFailedCause::RequestTooLarge,
+                                    FailureReason::RequestTooLarge,
+                                    make_request_too_large_failure(),
+                                ))
+                            } else if e.metadata().contains_key(MESSAGE_TOO_LARGE_KEY)
                                 && attempt < 2
                             {
                                 // gRPC message too large from server; skip on nonfirst attempts to
@@ -1413,16 +1443,59 @@ struct EmptyWorkflowCommandErr;
 #[display("{}", variant)]
 struct WFCommand {
     variant: WFCommandVariant,
-    metadata: Option<UserMetadata>,
-    event_group_markers: Vec<EventGroupMarker>,
+    annotations: CommandAnnotations,
 }
 
 impl WFCommand {
     fn new(variant: WFCommandVariant) -> Self {
         Self {
             variant,
-            metadata: None,
-            event_group_markers: vec![],
+            annotations: CommandAnnotations::default(),
+        }
+    }
+}
+
+/// The lang-supplied decorations that ride along on a [WFCommand] and end up on the [ProtoCommand]
+/// we send to the server. They are kept together because a command machine must remember them in
+/// order to repeat them on any further command it issues, most notably a cancellation.
+#[derive(Debug, Default, Clone, PartialEq)]
+struct CommandAnnotations {
+    metadata: Option<UserMetadata>,
+    event_group_markers: Vec<EventGroupMarker>,
+}
+
+impl CommandAnnotations {
+    /// Apply annotations lang attached to a cancellation command on top of the ones the command
+    /// being cancelled carried. Anything lang set explicitly wins; anything it left out is
+    /// inherited, which is what makes a cancellation land in the same event group as the command
+    /// it cancels even when it is issued from somewhere no group is active.
+    fn override_with(&mut self, other: Self) {
+        if let Some(other_metadata) = other.metadata {
+            let metadata = self.metadata.get_or_insert_with(UserMetadata::default);
+            if let Some(summary) = other_metadata.summary {
+                metadata.summary = Some(summary);
+            }
+            if let Some(details) = other_metadata.details {
+                metadata.details = Some(details);
+            }
+        }
+        if !other.event_group_markers.is_empty() {
+            self.event_group_markers = other.event_group_markers;
+        }
+    }
+}
+
+trait ProtoCommandExt {
+    fn new(attributes: Attributes, annotations: CommandAnnotations) -> Self;
+}
+
+impl ProtoCommandExt for ProtoCommand {
+    fn new(attributes: Attributes, annotations: CommandAnnotations) -> Self {
+        Self {
+            command_type: attributes.as_type() as i32,
+            attributes: Some(attributes),
+            user_metadata: annotations.metadata,
+            event_group_markers: annotations.event_group_markers,
         }
     }
 }
@@ -1518,8 +1591,10 @@ impl TryFrom<WorkflowCommand> for WFCommand {
         };
         Ok(Self {
             variant,
-            metadata: c.user_metadata,
-            event_group_markers: c.event_group_markers,
+            annotations: CommandAnnotations {
+                metadata: c.user_metadata,
+                event_group_markers: c.event_group_markers,
+            },
         })
     }
 }
@@ -1803,6 +1878,25 @@ fn make_grpc_message_too_large_failure() -> Failure {
             },
         ),
         force_cause: WorkflowTaskFailedCause::GrpcMessageTooLarge as i32,
+    }
+}
+
+fn make_request_too_large_failure() -> Failure {
+    Failure {
+        failure: Some(
+            temporalio_common::protos::temporal::api::failure::v1::Failure {
+                message: "Workflow task completion exceeds the namespace size limit".to_string(),
+                failure_info: Some(FailureInfo::ApplicationFailureInfo(
+                    ApplicationFailureInfo {
+                        r#type: "RequestTooLarge".to_string(),
+                        non_retryable: true,
+                        ..Default::default()
+                    },
+                )),
+                ..Default::default()
+            },
+        ),
+        force_cause: WorkflowTaskFailedCause::RequestTooLarge as i32,
     }
 }
 

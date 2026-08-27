@@ -752,7 +752,7 @@ pub fn build_mock_pollers(mut cfg: MockPollCfg) -> MocksHolder {
                     let rid = t.workflow_execution.as_ref().unwrap().run_id.clone();
                     if !outstanding.has_run(&rid) {
                         let t = tasks.pop_front().unwrap();
-                        outstanding.put_token(rid, TaskToken(t.task_token.clone()));
+                        outstanding.put_token(rid, t.task_token.clone().into());
                         resp = Some(t);
                         break;
                     }
@@ -808,7 +808,7 @@ pub fn build_mock_pollers(mut cfg: MockPollCfg) -> MocksHolder {
     } else if cfg.completion_mock_fn.is_some() {
         expect_completes.times(1..);
     }
-    expect_completes.returning(move |comp| {
+    expect_completes.returning(move |comp, _| {
         let r = if let Some(ass) = cfg.completion_mock_fn.as_mut() {
             // tee hee
             ass(&comp)

@@ -767,26 +767,24 @@ async fn worker_heartbeat_sticky_cache_miss() {
         HISTORY_WF2_ACTIVITY_STARTED.notified().await;
 
         HISTORY_WF1_ACTIVITY_FINISH.notify_one();
-        let handle1 = WorkflowExecutionInfo {
-            namespace: client_for_orchestrator.namespace(),
-            workflow_id: wf1_id,
-            run_id: Some(wf1_run),
-            first_execution_run_id: None,
-        }
-        .bind_untyped(client_for_orchestrator.clone());
+        let handle1 = WorkflowExecutionInfo::builder()
+            .namespace(client_for_orchestrator.namespace())
+            .workflow_id(wf1_id)
+            .maybe_run_id(Some(wf1_run))
+            .build()
+            .bind_untyped(client_for_orchestrator.clone());
         handle1
             .get_result(Default::default())
             .await
             .expect("wf1 result");
 
         HISTORY_WF2_ACTIVITY_FINISH.notify_one();
-        let handle2 = WorkflowExecutionInfo {
-            namespace: client_for_orchestrator.namespace(),
-            workflow_id: wf2_id,
-            run_id: Some(wf2_run),
-            first_execution_run_id: None,
-        }
-        .bind_untyped(client_for_orchestrator.clone());
+        let handle2 = WorkflowExecutionInfo::builder()
+            .namespace(client_for_orchestrator.namespace())
+            .workflow_id(wf2_id)
+            .maybe_run_id(Some(wf2_run))
+            .build()
+            .bind_untyped(client_for_orchestrator.clone());
         handle2
             .get_result(Default::default())
             .await

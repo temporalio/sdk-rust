@@ -98,6 +98,17 @@ interface model {
   /// @nexus.type python="collections.abc.Mapping[str, typing.Any]" typescript="Record<string, unknown>" dotnet="IReadOnlyDictionary<string, object?>"
   type memo = placeholder;
 
+  /// @nexus.proto "temporal.api.common.v1.Header" typescript-import="@temporalio/proto"
+  /// @nexus.type
+  ///   python="collections.abc.Mapping[str, typing.Any]"
+  ///   typescript="common.Headers"
+  ///   go="map[string]any"
+  ///   dotnet="IReadOnlyDictionary<string, object?>"
+  ///   dotnet-from="ProtoExtensions.FromHeaderProto"
+  ///   dotnet-to="ProtoExtensions.ToHeaderProto"
+  ///   typescript-import="@temporalio/common"
+  type header = placeholder;
+
   /// @nexus.proto "temporal.api.common.v1.SearchAttributes" typescript-import="@temporalio/proto"
   /// @nexus.type
   ///   python="temporalio.common.TypedSearchAttributes"

@@ -1451,7 +1451,7 @@
     },
     "/api/v1/namespaces/{namespace}/current-deployment/{deployment.seriesName}": {
       "post": {
-        "summary": "Sets a deployment as the current deployment for its deployment series. Can optionally update\nthe metadata of the deployment as well.\nExperimental. This API might significantly change or be removed in a future release.\nDeprecated. Replaced by `SetWorkerDeploymentCurrentVersion`.",
+        "summary": "Sets a deployment as the current deployment for its deployment series. Can optionally update\nthe metadata of the deployment as well.\nDeprecated. Replaced by `SetWorkerDeploymentCurrentVersion`.",
         "operationId": "SetCurrentDeployment2",
         "responses": {
           "200": {
@@ -1497,7 +1497,7 @@
     },
     "/api/v1/namespaces/{namespace}/current-deployment/{seriesName}": {
       "get": {
-        "summary": "Returns the current deployment (and its info) for a given deployment series.\nExperimental. This API might significantly change or be removed in a future release.\nDeprecated. Replaced by `current_version` returned by `DescribeWorkerDeployment`.",
+        "summary": "Returns the current deployment (and its info) for a given deployment series.\nDeprecated. Replaced by `current_version` returned by `DescribeWorkerDeployment`.",
         "operationId": "GetCurrentDeployment2",
         "responses": {
           "200": {
@@ -1534,7 +1534,7 @@
     },
     "/api/v1/namespaces/{namespace}/deployments": {
       "get": {
-        "summary": "Lists worker deployments in the namespace. Optionally can filter based on deployment series\nname.\nExperimental. This API might significantly change or be removed in a future release.\nDeprecated. Replaced with `ListWorkerDeployments`.",
+        "summary": "Lists worker deployments in the namespace. Optionally can filter based on deployment series\nname.\nDeprecated. Replaced with `ListWorkerDeployments`.",
         "operationId": "ListDeployments2",
         "responses": {
           "200": {
@@ -1586,7 +1586,7 @@
     },
     "/api/v1/namespaces/{namespace}/deployments/{deployment.seriesName}/{deployment.buildId}": {
       "get": {
-        "summary": "Describes a worker deployment.\nExperimental. This API might significantly change or be removed in a future release.\nDeprecated. Replaced with `DescribeWorkerDeploymentVersion`.",
+        "summary": "Describes a worker deployment.\nDeprecated. Replaced with `DescribeWorkerDeploymentVersion`.",
         "operationId": "DescribeDeployment2",
         "responses": {
           "200": {
@@ -1631,7 +1631,7 @@
     },
     "/api/v1/namespaces/{namespace}/deployments/{deployment.seriesName}/{deployment.buildId}/reachability": {
       "get": {
-        "summary": "Returns the reachability level of a worker deployment to help users decide when it is time\nto decommission a deployment. Reachability level is calculated based on the deployment's\n`status` and existing workflows that depend on the given deployment for their execution.\nCalculating reachability is relatively expensive. Therefore, server might return a recently\ncached value. In such a case, the `last_update_time` will inform you about the actual\nreachability calculation time.\nExperimental. This API might significantly change or be removed in a future release.\nDeprecated. Replaced with `DrainageInfo` returned by `DescribeWorkerDeploymentVersion`.",
+        "summary": "Returns the reachability level of a worker deployment to help users decide when it is time\nto decommission a deployment. Reachability level is calculated based on the deployment's\n`status` and existing workflows that depend on the given deployment for their execution.\nCalculating reachability is relatively expensive. Therefore, server might return a recently\ncached value. In such a case, the `last_update_time` will inform you about the actual\nreachability calculation time.\nDeprecated. Replaced with `DrainageInfo` returned by `DescribeWorkerDeploymentVersion`.",
         "operationId": "GetDeploymentReachability2",
         "responses": {
           "200": {
@@ -2849,7 +2849,7 @@
     },
     "/api/v1/namespaces/{namespace}/worker-deployment-versions/{deploymentVersion.deploymentName}/{deploymentVersion.buildId}": {
       "get": {
-        "summary": "Describes a worker deployment version.\nExperimental. This API might significantly change or be removed in a future release.",
+        "summary": "Describes a worker deployment version.",
         "operationId": "DescribeWorkerDeploymentVersion2",
         "responses": {
           "200": {
@@ -2906,7 +2906,7 @@
         ]
       },
       "delete": {
-        "summary": "Used for manual deletion of Versions. User can delete a Version only when all the\nfollowing conditions are met:\n - It is not the Current or Ramping Version of its Deployment.\n - It has no active pollers (none of the task queues in the Version have pollers)\n - It is not draining (see WorkerDeploymentVersionInfo.drainage_info). This condition\n   can be skipped by passing `skip-drainage=true`.\nExperimental. This API might significantly change or be removed in a future release.",
+        "summary": "Used for manual deletion of Versions. User can delete a Version only when all the\nfollowing conditions are met:\n - It is not the Current or Ramping Version of its Deployment.\n - It has no active pollers (none of the task queues in the Version have pollers)\n - It is not draining (see WorkerDeploymentVersionInfo.drainage_info). This condition\n   can be skipped by passing `skip-drainage=true`.",
         "operationId": "DeleteWorkerDeploymentVersion2",
         "responses": {
           "200": {
@@ -3025,7 +3025,7 @@
     },
     "/api/v1/namespaces/{namespace}/worker-deployment-versions/{deploymentVersion.deploymentName}/{deploymentVersion.buildId}/update-metadata": {
       "post": {
-        "summary": "Updates the user-given metadata attached to a Worker Deployment Version.\nExperimental. This API might significantly change or be removed in a future release.",
+        "summary": "Updates the user-given metadata attached to a Worker Deployment Version.",
         "operationId": "UpdateWorkerDeploymentVersionMetadata2",
         "responses": {
           "200": {
@@ -3131,7 +3131,7 @@
     },
     "/api/v1/namespaces/{namespace}/worker-deployments": {
       "get": {
-        "summary": "Lists all Worker Deployments that are tracked in the Namespace.\nExperimental. This API might significantly change or be removed in a future release.",
+        "summary": "Lists all Worker Deployments that are tracked in the Namespace.",
         "operationId": "ListWorkerDeployments2",
         "responses": {
           "200": {
@@ -3176,7 +3176,7 @@
     },
     "/api/v1/namespaces/{namespace}/worker-deployments/{deploymentName}": {
       "get": {
-        "summary": "Describes a Worker Deployment.\nExperimental. This API might significantly change or be removed in a future release.",
+        "summary": "Describes a Worker Deployment.",
         "operationId": "DescribeWorkerDeployment2",
         "responses": {
           "200": {
@@ -3211,7 +3211,7 @@
         ]
       },
       "delete": {
-        "summary": "Deletes records of (an old) Deployment. A deployment can only be deleted if\nit has no Version in it.\nExperimental. This API might significantly change or be removed in a future release.",
+        "summary": "Deletes records of (an old) Deployment. A deployment can only be deleted if\nit has no Version in it.",
         "operationId": "DeleteWorkerDeployment2",
         "responses": {
           "200": {
@@ -3300,7 +3300,7 @@
     },
     "/api/v1/namespaces/{namespace}/worker-deployments/{deploymentName}/set-current-version": {
       "post": {
-        "summary": "Set/unset the Current Version of a Worker Deployment. Automatically unsets the Ramping\nVersion if it is the Version being set as Current.\nExperimental. This API might significantly change or be removed in a future release.",
+        "summary": "Set/unset the Current Version of a Worker Deployment. Automatically unsets the Ramping\nVersion if it is the Version being set as Current.",
         "operationId": "SetWorkerDeploymentCurrentVersion2",
         "responses": {
           "200": {
@@ -3390,7 +3390,7 @@
     },
     "/api/v1/namespaces/{namespace}/worker-deployments/{deploymentName}/set-ramping-version": {
       "post": {
-        "summary": "Set/unset the Ramping Version of a Worker Deployment and its ramp percentage. Can be used for\ngradual ramp to unversioned workers too.\nExperimental. This API might significantly change or be removed in a future release.",
+        "summary": "Set/unset the Ramping Version of a Worker Deployment and its ramp percentage. Can be used for\ngradual ramp to unversioned workers too.",
         "operationId": "SetWorkerDeploymentRampingVersion2",
         "responses": {
           "200": {
@@ -7104,7 +7104,7 @@
     },
     "/namespaces/{namespace}/current-deployment/{deployment.seriesName}": {
       "post": {
-        "summary": "Sets a deployment as the current deployment for its deployment series. Can optionally update\nthe metadata of the deployment as well.\nExperimental. This API might significantly change or be removed in a future release.\nDeprecated. Replaced by `SetWorkerDeploymentCurrentVersion`.",
+        "summary": "Sets a deployment as the current deployment for its deployment series. Can optionally update\nthe metadata of the deployment as well.\nDeprecated. Replaced by `SetWorkerDeploymentCurrentVersion`.",
         "operationId": "SetCurrentDeployment",
         "responses": {
           "200": {
@@ -7150,7 +7150,7 @@
     },
     "/namespaces/{namespace}/current-deployment/{seriesName}": {
       "get": {
-        "summary": "Returns the current deployment (and its info) for a given deployment series.\nExperimental. This API might significantly change or be removed in a future release.\nDeprecated. Replaced by `current_version` returned by `DescribeWorkerDeployment`.",
+        "summary": "Returns the current deployment (and its info) for a given deployment series.\nDeprecated. Replaced by `current_version` returned by `DescribeWorkerDeployment`.",
         "operationId": "GetCurrentDeployment",
         "responses": {
           "200": {
@@ -7187,7 +7187,7 @@
     },
     "/namespaces/{namespace}/deployments": {
       "get": {
-        "summary": "Lists worker deployments in the namespace. Optionally can filter based on deployment series\nname.\nExperimental. This API might significantly change or be removed in a future release.\nDeprecated. Replaced with `ListWorkerDeployments`.",
+        "summary": "Lists worker deployments in the namespace. Optionally can filter based on deployment series\nname.\nDeprecated. Replaced with `ListWorkerDeployments`.",
         "operationId": "ListDeployments",
         "responses": {
           "200": {
@@ -7239,7 +7239,7 @@
     },
     "/namespaces/{namespace}/deployments/{deployment.seriesName}/{deployment.buildId}": {
       "get": {
-        "summary": "Describes a worker deployment.\nExperimental. This API might significantly change or be removed in a future release.\nDeprecated. Replaced with `DescribeWorkerDeploymentVersion`.",
+        "summary": "Describes a worker deployment.\nDeprecated. Replaced with `DescribeWorkerDeploymentVersion`.",
         "operationId": "DescribeDeployment",
         "responses": {
           "200": {
@@ -7284,7 +7284,7 @@
     },
     "/namespaces/{namespace}/deployments/{deployment.seriesName}/{deployment.buildId}/reachability": {
       "get": {
-        "summary": "Returns the reachability level of a worker deployment to help users decide when it is time\nto decommission a deployment. Reachability level is calculated based on the deployment's\n`status` and existing workflows that depend on the given deployment for their execution.\nCalculating reachability is relatively expensive. Therefore, server might return a recently\ncached value. In such a case, the `last_update_time` will inform you about the actual\nreachability calculation time.\nExperimental. This API might significantly change or be removed in a future release.\nDeprecated. Replaced with `DrainageInfo` returned by `DescribeWorkerDeploymentVersion`.",
+        "summary": "Returns the reachability level of a worker deployment to help users decide when it is time\nto decommission a deployment. Reachability level is calculated based on the deployment's\n`status` and existing workflows that depend on the given deployment for their execution.\nCalculating reachability is relatively expensive. Therefore, server might return a recently\ncached value. In such a case, the `last_update_time` will inform you about the actual\nreachability calculation time.\nDeprecated. Replaced with `DrainageInfo` returned by `DescribeWorkerDeploymentVersion`.",
         "operationId": "GetDeploymentReachability",
         "responses": {
           "200": {
@@ -8432,7 +8432,7 @@
     },
     "/namespaces/{namespace}/worker-deployment-versions/{deploymentVersion.deploymentName}/{deploymentVersion.buildId}": {
       "get": {
-        "summary": "Describes a worker deployment version.\nExperimental. This API might significantly change or be removed in a future release.",
+        "summary": "Describes a worker deployment version.",
         "operationId": "DescribeWorkerDeploymentVersion",
         "responses": {
           "200": {
@@ -8489,7 +8489,7 @@
         ]
       },
       "delete": {
-        "summary": "Used for manual deletion of Versions. User can delete a Version only when all the\nfollowing conditions are met:\n - It is not the Current or Ramping Version of its Deployment.\n - It has no active pollers (none of the task queues in the Version have pollers)\n - It is not draining (see WorkerDeploymentVersionInfo.drainage_info). This condition\n   can be skipped by passing `skip-drainage=true`.\nExperimental. This API might significantly change or be removed in a future release.",
+        "summary": "Used for manual deletion of Versions. User can delete a Version only when all the\nfollowing conditions are met:\n - It is not the Current or Ramping Version of its Deployment.\n - It has no active pollers (none of the task queues in the Version have pollers)\n - It is not draining (see WorkerDeploymentVersionInfo.drainage_info). This condition\n   can be skipped by passing `skip-drainage=true`.",
         "operationId": "DeleteWorkerDeploymentVersion",
         "responses": {
           "200": {
@@ -8608,7 +8608,7 @@
     },
     "/namespaces/{namespace}/worker-deployment-versions/{deploymentVersion.deploymentName}/{deploymentVersion.buildId}/update-metadata": {
       "post": {
-        "summary": "Updates the user-given metadata attached to a Worker Deployment Version.\nExperimental. This API might significantly change or be removed in a future release.",
+        "summary": "Updates the user-given metadata attached to a Worker Deployment Version.",
         "operationId": "UpdateWorkerDeploymentVersionMetadata",
         "responses": {
           "200": {
@@ -8714,7 +8714,7 @@
     },
     "/namespaces/{namespace}/worker-deployments": {
       "get": {
-        "summary": "Lists all Worker Deployments that are tracked in the Namespace.\nExperimental. This API might significantly change or be removed in a future release.",
+        "summary": "Lists all Worker Deployments that are tracked in the Namespace.",
         "operationId": "ListWorkerDeployments",
         "responses": {
           "200": {
@@ -8759,7 +8759,7 @@
     },
     "/namespaces/{namespace}/worker-deployments/{deploymentName}": {
       "get": {
-        "summary": "Describes a Worker Deployment.\nExperimental. This API might significantly change or be removed in a future release.",
+        "summary": "Describes a Worker Deployment.",
         "operationId": "DescribeWorkerDeployment",
         "responses": {
           "200": {
@@ -8794,7 +8794,7 @@
         ]
       },
       "delete": {
-        "summary": "Deletes records of (an old) Deployment. A deployment can only be deleted if\nit has no Version in it.\nExperimental. This API might significantly change or be removed in a future release.",
+        "summary": "Deletes records of (an old) Deployment. A deployment can only be deleted if\nit has no Version in it.",
         "operationId": "DeleteWorkerDeployment",
         "responses": {
           "200": {
@@ -8883,7 +8883,7 @@
     },
     "/namespaces/{namespace}/worker-deployments/{deploymentName}/set-current-version": {
       "post": {
-        "summary": "Set/unset the Current Version of a Worker Deployment. Automatically unsets the Ramping\nVersion if it is the Version being set as Current.\nExperimental. This API might significantly change or be removed in a future release.",
+        "summary": "Set/unset the Current Version of a Worker Deployment. Automatically unsets the Ramping\nVersion if it is the Version being set as Current.",
         "operationId": "SetWorkerDeploymentCurrentVersion",
         "responses": {
           "200": {
@@ -8973,7 +8973,7 @@
     },
     "/namespaces/{namespace}/worker-deployments/{deploymentName}/set-ramping-version": {
       "post": {
-        "summary": "Set/unset the Ramping Version of a Worker Deployment and its ramp percentage. Can be used for\ngradual ramp to unversioned workers too.\nExperimental. This API might significantly change or be removed in a future release.",
+        "summary": "Set/unset the Ramping Version of a Worker Deployment and its ramp percentage. Can be used for\ngradual ramp to unversioned workers too.",
         "operationId": "SetWorkerDeploymentRampingVersion",
         "responses": {
           "200": {

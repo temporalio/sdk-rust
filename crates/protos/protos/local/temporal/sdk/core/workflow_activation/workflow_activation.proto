@@ -211,12 +211,10 @@ message InitializeWorkflow {
     temporal.api.common.v1.WorkflowExecution root_workflow = 24;
     // Priority of this workflow execution
     temporal.api.common.v1.Priority priority = 25;
-    // Event ID of the `WORKFLOW_EXECUTION_STARTED` history event that triggered this job.
-    int64 originating_event_id = 26;
     // The run id recorded on the `WORKFLOW_EXECUTION_STARTED` event. Unlike the execution's current
     // run id, this value is preserved across workflow resets. Mirrors the `original_execution_run_id`
     // field from `WorkflowExecutionStartedEventAttributes`.
-    string original_execution_run_id = 27;
+    string original_execution_run_id = 26;
 }
 
 // Notify a workflow that a timer has fired

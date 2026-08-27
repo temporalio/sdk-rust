@@ -186,10 +186,6 @@ name = "histfetch"
 path = "src/histfetch.rs"
 required-features = ["test-utilities"]
 
-[[bin]]
-name = "changelog-release-notes"
-path = "src/changelog_release_notes.rs"
-
 [[test]]
 name = "integ_tests"
 path = "tests/main.rs"

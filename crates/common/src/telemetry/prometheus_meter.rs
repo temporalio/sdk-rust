@@ -483,6 +483,7 @@ impl MetricAttributable<Box<dyn HistogramF64Base>> for PromHistogramF64 {
 #[derive(Debug)]
 pub struct CorePrometheusMeter {
     registry: Registry,
+    counters_total_suffix: bool,
     use_seconds_for_durations: bool,
     unit_suffix: bool,
     bucket_overrides: crate::telemetry::HistogramBucketOverrides,
@@ -491,12 +492,14 @@ pub struct CorePrometheusMeter {
 impl CorePrometheusMeter {
     pub(super) fn new(
         registry: Registry,
+        counters_total_suffix: bool,
         use_seconds_for_durations: bool,
         unit_suffix: bool,
         bucket_overrides: crate::telemetry::HistogramBucketOverrides,
     ) -> Self {
         Self {
             registry,
+            counters_total_suffix,
             use_seconds_for_durations,
             unit_suffix,
             bucket_overrides,
@@ -558,7 +561,10 @@ impl CoreMeter for CorePrometheusMeter {
     }
 
     fn counter(&self, params: MetricParameters) -> Counter {
-        let metric_name = params.name.to_string();
+        let mut metric_name = params.name.to_string();
+        if self.counters_total_suffix {
+            metric_name.push_str("_total");
+        }
         Counter::new(Arc::new(PromMetric::<IntCounterVec>::new(
             metric_name,
             params.description.to_string(),
@@ -676,12 +682,14 @@ mod tests {
         metrics::{MetricKeyValue, NewAttributes, WORKFLOW_E2E_LATENCY_HISTOGRAM_NAME},
     };
     use prometheus::{Encoder, TextEncoder};
+    use rstest::rstest;
 
     #[test]
     fn test_prometheus_meter_dynamic_labels() {
         let registry = Registry::new(HashMap::from([("global".to_string(), "value".to_string())]));
         let meter = CorePrometheusMeter::new(
             registry.clone(),
+            false,
             false,
             false,
             HistogramBucketOverrides::default(),
@@ -717,11 +725,40 @@ mod tests {
         );
     }
 
+    #[rstest]
+    #[case(false, "test_counter")]
+    #[case(true, "test_counter_total")]
+    fn counter_total_suffix_option_controls_counter_names(
+        #[case] counters_total_suffix: bool,
+        #[case] expected_name: &str,
+    ) {
+        let registry = Registry::new(HashMap::new());
+        let meter = CorePrometheusMeter::new(
+            registry.clone(),
+            counters_total_suffix,
+            false,
+            false,
+            HistogramBucketOverrides::default(),
+        );
+        let counter = meter.counter(MetricParameters {
+            name: "test_counter".into(),
+            description: "A test counter metric".into(),
+            unit: "".into(),
+        });
+
+        counter.adds(1);
+
+        let output = output_string(&registry);
+        let expected_sample = format!("{expected_name} 1");
+        assert!(output.lines().any(|line| line == expected_sample));
+    }
+
     #[test]
     fn test_extend_attributes() {
         let registry = Registry::new(HashMap::new());
         let meter = CorePrometheusMeter::new(
             registry.clone(),
+            false,
             false,
             false,
             HistogramBucketOverrides::default(),
@@ -763,6 +800,7 @@ mod tests {
             registry.clone(),
             false,
             false,
+            false,
             HistogramBucketOverrides::default(),
         );
 
@@ -787,6 +825,7 @@ mod tests {
         let registry_s = Registry::new(HashMap::new());
         let meter_s = CorePrometheusMeter::new(
             registry_s.clone(),
+            false,
             true,
             false,
             HistogramBucketOverrides::default(),
@@ -817,6 +856,7 @@ mod tests {
             registry.clone(),
             false,
             false,
+            false,
             HistogramBucketOverrides::default(),
         );
         let counter = meter.counter(MetricParameters {
@@ -839,6 +879,7 @@ mod tests {
         )]));
         let meter = CorePrometheusMeter::new(
             registry.clone(),
+            false,
             false,
             false,
             HistogramBucketOverrides::default(),
@@ -875,6 +916,7 @@ mod tests {
             registry.clone(),
             false,
             false,
+            false,
             HistogramBucketOverrides::default(),
         );
         let dashes = meter.counter(MetricParameters {
@@ -894,6 +936,7 @@ mod tests {
         let registry = Registry::new(HashMap::new());
         let meter = CorePrometheusMeter::new(
             registry.clone(),
+            false,
             false,
             false,
             HistogramBucketOverrides::default(),

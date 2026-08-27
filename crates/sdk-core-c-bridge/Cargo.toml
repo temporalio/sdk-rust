@@ -54,7 +54,7 @@ version = "0.7"
 features = ["core-based-sdk", "otel"]
 
 [dev-dependencies]
-base64 = "0.22"
+base64 = "0.23"
 futures-util = "0.3"
 thiserror = { workspace = true }
 

@@ -319,16 +319,16 @@ impl WorkerConfig {
 
     pub(crate) fn computed_deployment_version(&self) -> Option<WorkerDeploymentVersion> {
         let wdv = match self.versioning_strategy {
-            WorkerVersioningStrategy::None { ref build_id } => WorkerDeploymentVersion {
-                deployment_name: "".to_owned(),
-                build_id: build_id.clone(),
-            },
+            WorkerVersioningStrategy::None { ref build_id } => WorkerDeploymentVersion::builder()
+                .deployment_name("")
+                .build_id(build_id.clone())
+                .build(),
             WorkerVersioningStrategy::WorkerDeploymentBased(ref opts) => opts.version.clone(),
             WorkerVersioningStrategy::LegacyBuildIdBased { ref build_id } => {
-                WorkerDeploymentVersion {
-                    deployment_name: "".to_owned(),
-                    build_id: build_id.clone(),
-                }
+                WorkerDeploymentVersion::builder()
+                    .deployment_name("")
+                    .build_id(build_id.clone())
+                    .build()
             }
         };
         if wdv.is_empty() { None } else { Some(wdv) }
@@ -527,6 +527,25 @@ impl NamespaceCapabilities {
     pub fn worker_commands(&self) -> bool {
         self.capabilities()
             .is_some_and(|capabilities| capabilities.worker_commands)
+    }
+
+    /// Returns true if the namespace accepts paginated `RespondWorkflowTaskCompleted` requests, so
+    /// large completions may be split across multiple page requests sharing one task token.
+    pub fn workflow_task_completion_pagination(&self) -> bool {
+        self.capabilities()
+            .is_some_and(|capabilities| capabilities.workflow_task_completion_pagination)
+    }
+
+    /// The namespace's limit on the recombined size of a paginated workflow task completion, if one
+    /// is configured. `None` when unset (the server advertises `0` for no explicit limit).
+    pub fn workflow_task_completion_size_limit(&self) -> Option<usize> {
+        self.description
+            .get()
+            .and_then(|description| description.namespace_info.as_ref())
+            .and_then(|namespace_info| namespace_info.limits.as_ref())
+            .map(|limits| limits.workflow_task_completion_size_limit_error)
+            .filter(|limit| *limit > 0)
+            .map(|limit| limit as usize)
     }
 }
 
@@ -977,7 +996,7 @@ impl Worker {
                                 shutdown_token.child_token(),
                                 Some(move |np| np_metrics.record_num_pollers(np)),
                                 nexus_last_suc_poll_time,
-                                capabilities,
+                                capabilities.clone(),
                                 shared_namespace_worker,
                             )) as BoxedNexusPoller)
                         } else {
@@ -1077,6 +1096,7 @@ impl Worker {
                             shutdown_token: shutdown_token.child_token(),
                             metrics,
                             server_capabilities: client.capabilities().unwrap_or_default(),
+                            namespace_capabilities: capabilities.clone(),
                             sdk_name: sdk_name_and_ver.0,
                             sdk_version: sdk_name_and_ver.1,
                             default_versioning_behavior: config
@@ -1392,7 +1412,7 @@ impl Worker {
     /// options.
     pub fn record_activity_heartbeat(&self, details: ActivityHeartbeat) {
         if let Some(at_mgr) = self.task_subsystems.at_task_mgr.as_ref() {
-            let tt = TaskToken(details.task_token.clone());
+            let tt: TaskToken = details.task_token.clone().into();
             if let Err(e) = at_mgr.record_heartbeat(details) {
                 warn!(task_token = %tt, details = ?e, "Activity heartbeat failed.");
             }
@@ -1408,7 +1428,7 @@ impl Worker {
         &self,
         completion: ActivityTaskCompletion,
     ) -> Result<(), CompleteActivityError> {
-        let task_token = TaskToken(completion.task_token);
+        let task_token: TaskToken = completion.task_token.into();
         let status = if let Some(s) = completion.result.and_then(|r| r.status) {
             s
         } else {
@@ -1533,7 +1553,7 @@ impl Worker {
                 reason: "Nexus completion had empty status field".to_owned(),
             });
         };
-        let tt = TaskToken(completion.task_token);
+        let tt: TaskToken = completion.task_token.into();
         tracing::Span::current().record("task_token", tt.to_string());
         tracing::Span::current().record("status", status.to_string());
 
@@ -2779,10 +2799,12 @@ mod tests {
             .namespace("default")
             .task_queue("test-queue")
             .versioning_strategy(WorkerVersioningStrategy::WorkerDeploymentBased(
-                WorkerDeploymentOptions::new(WorkerDeploymentVersion {
-                    deployment_name: "deployment".to_string(),
-                    build_id: "1.0".to_string(),
-                })
+                WorkerDeploymentOptions::new(
+                    WorkerDeploymentVersion::builder()
+                        .deployment_name("deployment")
+                        .build_id("1.0")
+                        .build(),
+                )
                 .default_versioning_behavior(VersioningBehavior::AutoUpgrade.into())
                 .build(),
             ))

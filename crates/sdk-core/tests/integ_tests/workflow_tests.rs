@@ -241,13 +241,12 @@ async fn signal_workflow() {
     .unwrap();
 
     // Send the signals to the server
-    let handle = WorkflowExecutionInfo {
-        namespace: client.namespace(),
-        workflow_id: workflow_id.clone(),
-        run_id: Some(res.run_id.clone()),
-        first_execution_run_id: None,
-    }
-    .bind_untyped(client.clone());
+    let handle = WorkflowExecutionInfo::builder()
+        .namespace(client.namespace())
+        .workflow_id(workflow_id.clone())
+        .maybe_run_id(Some(res.run_id.clone()))
+        .build()
+        .bind_untyped(client.clone());
     handle
         .signal(
             UntypedSignal::new(signal_id_1),
@@ -342,20 +341,19 @@ async fn signal_workflow_signal_not_handled_on_workflow_completion() {
 
             // Send the signal to the server
             let sig_client = starter.get_core_client().await;
-            WorkflowExecutionInfo {
-                namespace: sig_client.namespace(),
-                workflow_id: workflow_id.clone(),
-                run_id: Some(res.run_id.clone()),
-                first_execution_run_id: None,
-            }
-            .bind_untyped(sig_client.clone())
-            .signal(
-                UntypedSignal::new(signal_id_1),
-                RawValue::empty(),
-                WorkflowSignalOptions::default(),
-            )
-            .await
-            .unwrap();
+            WorkflowExecutionInfo::builder()
+                .namespace(sig_client.namespace())
+                .workflow_id(workflow_id.clone())
+                .maybe_run_id(Some(res.run_id.clone()))
+                .build()
+                .bind_untyped(sig_client.clone())
+                .signal(
+                    UntypedSignal::new(signal_id_1),
+                    RawValue::empty(),
+                    WorkflowSignalOptions::default(),
+                )
+                .await
+                .unwrap();
 
             // Send completion - not having seen a poll response with a signal in it yet (unhandled
             // command error will be logged as a warning and an eviction will be issued)
@@ -424,13 +422,12 @@ async fn wft_timeout_doesnt_create_unsolvable_autocomplete() {
     // Before polling for a task again, we start and complete the activity and send the
     // corresponding signals.
     let ac_task = core.poll_activity_task().await.unwrap();
-    let handle = WorkflowExecutionInfo {
-        namespace: client.namespace(),
-        workflow_id: wf_id.to_string(),
-        run_id: Some(wf_task.run_id.clone()),
-        first_execution_run_id: None,
-    }
-    .bind_untyped(client.clone());
+    let handle = WorkflowExecutionInfo::builder()
+        .namespace(client.namespace())
+        .workflow_id(wf_id.to_string())
+        .maybe_run_id(Some(wf_task.run_id.clone()))
+        .build()
+        .bind_untyped(client.clone());
     // Send the signals to the server & resolve activity -- sometimes this happens too fast
     sleep(Duration::from_millis(200)).await;
     handle
@@ -561,16 +558,20 @@ async fn deployment_version_correct_in_wf_info(#[values(true, false)] use_only_b
     let wf_type = "deployment_version_correct_in_wf_info";
     let mut starter = CoreWfStarter::new(wf_type);
     starter.sdk_config.deployment_options = if use_only_build_id {
-        WorkerDeploymentOptions::new(WorkerDeploymentVersion {
-            deployment_name: "".to_string(),
-            build_id: "1.0".to_string(),
-        })
+        WorkerDeploymentOptions::new(
+            WorkerDeploymentVersion::builder()
+                .deployment_name("".to_string())
+                .build_id("1.0".to_string())
+                .build(),
+        )
         .build()
     } else {
-        WorkerDeploymentOptions::new(WorkerDeploymentVersion {
-            deployment_name: "deployment-1".to_string(),
-            build_id: "1.0".to_string(),
-        })
+        WorkerDeploymentOptions::new(
+            WorkerDeploymentVersion::builder()
+                .deployment_name("deployment-1".to_string())
+                .build_id("1.0".to_string())
+                .build(),
+        )
         .build()
     };
     starter.set_core_task_types(WorkerTaskTypes::workflow_only());
@@ -603,13 +604,12 @@ async fn deployment_version_correct_in_wf_info(#[values(true, false)] use_only_b
     .unwrap();
 
     // Ensure a query on first wft also sees the correct id
-    let query_handle = WorkflowExecutionInfo {
-        namespace: client.namespace(),
-        workflow_id: workflow_id.clone(),
-        run_id: Some(res.run_id.clone()),
-        first_execution_run_id: None,
-    }
-    .bind_untyped(client.clone());
+    let query_handle = WorkflowExecutionInfo::builder()
+        .namespace(client.namespace())
+        .workflow_id(workflow_id.clone())
+        .maybe_run_id(Some(res.run_id.clone()))
+        .build()
+        .bind_untyped(client.clone());
     let query_fut = async {
         query_handle
             .query(
@@ -677,16 +677,20 @@ async fn deployment_version_correct_in_wf_info(#[values(true, false)] use_only_b
 
     let mut starter = starter.clone_no_worker();
     starter.sdk_config.deployment_options = if use_only_build_id {
-        WorkerDeploymentOptions::new(WorkerDeploymentVersion {
-            deployment_name: "".to_string(),
-            build_id: "2.0".to_string(),
-        })
+        WorkerDeploymentOptions::new(
+            WorkerDeploymentVersion::builder()
+                .deployment_name("".to_string())
+                .build_id("2.0".to_string())
+                .build(),
+        )
         .build()
     } else {
-        WorkerDeploymentOptions::new(WorkerDeploymentVersion {
-            deployment_name: "deployment-1".to_string(),
-            build_id: "2.0".to_string(),
-        })
+        WorkerDeploymentOptions::new(
+            WorkerDeploymentVersion::builder()
+                .deployment_name("deployment-1".to_string())
+                .build_id("2.0".to_string())
+                .build(),
+        )
         .build()
     };
 

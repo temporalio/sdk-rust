@@ -6,10 +6,16 @@ use temporalio_common::{
     data_converters::{DecodablePayloads, PayloadConversionError},
     error::{IncomingError, TimeoutType},
     protos::{
+        google::rpc::Status as RpcStatus,
         temporal::api::{
-            errordetails::v1::ActivityExecutionAlreadyStartedFailure, failure::v1::Failure,
+            errordetails::v1::{
+                ActivityExecutionAlreadyStartedFailure, MultiOperationExecutionFailure,
+                WorkflowExecutionAlreadyStartedFailure,
+                multi_operation_execution_failure::OperationStatus,
+            },
+            failure::v1::Failure,
         },
-        utilities::decode_status_detail,
+        utilities::{decode_status_detail, encode_status_details},
     },
 };
 use tonic::Code;
@@ -109,6 +115,22 @@ pub enum WorkflowStartError {
     Rpc(#[from] tonic::Status),
 }
 
+impl WorkflowStartError {
+    pub(crate) fn from_status(status: tonic::Status) -> Self {
+        if status.code() == Code::AlreadyExists {
+            let run_id =
+                decode_status_detail::<WorkflowExecutionAlreadyStartedFailure>(status.details())
+                    .map(|failure| failure.run_id);
+            Self::AlreadyStarted {
+                run_id,
+                source: status,
+            }
+        } else {
+            Self::Rpc(status)
+        }
+    }
+}
+
 /// Errors returned by query operations on [crate::WorkflowHandle].
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
@@ -178,6 +200,79 @@ impl WorkflowUpdateError {
             Self::NotFound(status)
         } else {
             Self::Rpc(status)
+        }
+    }
+}
+
+/// Errors returned by update-with-start operations
+/// (see [crate::Client::start_update_with_start_workflow]).
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum WorkflowUpdateWithStartError {
+    /// The start operation failed.
+    #[error("Workflow start failed: {0}")]
+    Start(#[source] WorkflowStartError),
+
+    /// The update operation failed, or waiting for the update result failed.
+    #[error("Workflow update failed: {0}")]
+    Update(#[source] WorkflowUpdateError),
+
+    /// Error serializing the workflow input or update arguments.
+    #[error("Payload conversion error: {0}")]
+    PayloadConversion(#[from] PayloadConversionError),
+
+    /// An RPC error from the server that could not be attributed to either operation.
+    #[error("Server error: {0}")]
+    Rpc(tonic::Status),
+
+    /// Other errors.
+    #[error(transparent)]
+    Other(#[from] Box<dyn std::error::Error + Send + Sync>),
+}
+
+const MULTI_OPERATION_ABORTED_NAME: &str = "temporal.api.failure.v1.MultiOperationExecutionAborted";
+
+/// Reconstruct a standalone gRPC status from a multi-operation `OperationStatus`, re-encoding
+/// its details so the operation-specific failure information stays available to callers.
+fn operation_status_to_tonic(op_status: OperationStatus) -> tonic::Status {
+    let code = Code::from(op_status.code);
+    let details = encode_status_details(&RpcStatus {
+        code: op_status.code,
+        message: op_status.message.clone(),
+        details: op_status.details,
+    });
+    tonic::Status::with_details(code, op_status.message, details.into())
+}
+
+impl WorkflowUpdateWithStartError {
+    /// A multi-operation failure carries one status per operation; all operations except the
+    /// failed one are marked aborted. Attribute the error to the operation that actually failed
+    /// (index 0 is the start operation, index 1 the update).
+    pub(crate) fn from_status(status: tonic::Status) -> Self {
+        let Some(failure) =
+            decode_status_detail::<MultiOperationExecutionFailure>(status.details())
+        else {
+            return Self::Rpc(status);
+        };
+        let culprit = failure
+            .statuses
+            .into_iter()
+            .enumerate()
+            .find(|(_, op_status)| {
+                op_status.code != Code::Ok as i32
+                    && !op_status
+                        .details
+                        .iter()
+                        .any(|detail| detail.type_url.ends_with(MULTI_OPERATION_ABORTED_NAME))
+            });
+        match culprit {
+            Some((0, op_status)) => Self::Start(WorkflowStartError::from_status(
+                operation_status_to_tonic(op_status),
+            )),
+            Some((_, op_status)) => Self::Update(WorkflowUpdateError::from_status(
+                operation_status_to_tonic(op_status),
+            )),
+            None => Self::Rpc(status),
         }
     }
 }
@@ -458,5 +553,153 @@ impl From<tonic::Status> for ActivityResultError {
         } else {
             Self::Rpc(status)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use assert_matches::assert_matches;
+    use prost::Message;
+    use temporalio_common::protos::{
+        temporal::api::{
+            errordetails::v1::NotFoundFailure, failure::v1::MultiOperationExecutionAborted,
+        },
+        utilities::pack_any,
+    };
+
+    fn multi_op_status(code: Code, statuses: Vec<OperationStatus>) -> tonic::Status {
+        let failure = MultiOperationExecutionFailure { statuses };
+        let rpc_status = RpcStatus {
+            code: code as i32,
+            message: "multi-op failure".to_owned(),
+            details: vec![
+                pack_any(
+                    "type.googleapis.com/temporal.api.errordetails.v1.MultiOperationExecutionFailure"
+                        .to_owned(),
+                    &failure,
+                )
+                .unwrap(),
+            ],
+        };
+        tonic::Status::with_details(code, "multi-op failure", rpc_status.encode_to_vec().into())
+    }
+
+    fn aborted_status() -> OperationStatus {
+        OperationStatus {
+            code: Code::Aborted as i32,
+            message: "aborted".to_owned(),
+            details: vec![
+                pack_any(
+                    "type.googleapis.com/temporal.api.failure.v1.MultiOperationExecutionAborted"
+                        .to_owned(),
+                    &MultiOperationExecutionAborted {},
+                )
+                .unwrap(),
+            ],
+        }
+    }
+
+    #[test]
+    fn update_with_start_error_attributes_start_already_started() {
+        let status = multi_op_status(
+            Code::AlreadyExists,
+            vec![
+                OperationStatus {
+                    code: Code::AlreadyExists as i32,
+                    message: "already started".to_owned(),
+                    details: vec![
+                        pack_any(
+                            "type.googleapis.com/temporal.api.errordetails.v1.WorkflowExecutionAlreadyStartedFailure"
+                                .to_owned(),
+                            &WorkflowExecutionAlreadyStartedFailure {
+                                run_id: "existing-run".to_owned(),
+                                ..Default::default()
+                            },
+                        )
+                        .unwrap(),
+                    ],
+                },
+                aborted_status(),
+            ],
+        );
+
+        let err = WorkflowUpdateWithStartError::from_status(status);
+        assert_matches!(
+            err,
+            WorkflowUpdateWithStartError::Start(WorkflowStartError::AlreadyStarted {
+                run_id: Some(run_id),
+                ..
+            }) if run_id == "existing-run"
+        );
+    }
+
+    #[test]
+    fn update_with_start_error_attributes_update_failure() {
+        let status = multi_op_status(
+            Code::NotFound,
+            vec![
+                aborted_status(),
+                OperationStatus {
+                    code: Code::NotFound as i32,
+                    message: "no such workflow".to_owned(),
+                    details: vec![
+                        pack_any(
+                            "type.googleapis.com/temporal.api.errordetails.v1.NotFoundFailure"
+                                .to_owned(),
+                            &NotFoundFailure {
+                                current_cluster: "here".to_owned(),
+                                ..Default::default()
+                            },
+                        )
+                        .unwrap(),
+                    ],
+                },
+            ],
+        );
+
+        let err = WorkflowUpdateWithStartError::from_status(status);
+        let inner = assert_matches!(
+            err,
+            WorkflowUpdateWithStartError::Update(WorkflowUpdateError::NotFound(status)) => status
+        );
+        assert_eq!(inner.message(), "no such workflow");
+        // The operation's own failure details must survive reconstruction of the inner status.
+        let detail = decode_status_detail::<NotFoundFailure>(inner.details())
+            .expect("operation details must be preserved");
+        assert_eq!(detail.current_cluster, "here");
+    }
+
+    #[test]
+    fn update_with_start_error_skips_successful_start() {
+        let status = multi_op_status(
+            Code::NotFound,
+            vec![
+                OperationStatus {
+                    code: Code::Ok as i32,
+                    message: String::new(),
+                    details: vec![],
+                },
+                OperationStatus {
+                    code: Code::NotFound as i32,
+                    message: "update failed".to_owned(),
+                    details: vec![],
+                },
+            ],
+        );
+
+        let err = WorkflowUpdateWithStartError::from_status(status);
+        assert_matches!(
+            err,
+            WorkflowUpdateWithStartError::Update(WorkflowUpdateError::NotFound(status))
+                if status.message() == "update failed"
+        );
+    }
+
+    #[test]
+    fn update_with_start_error_without_details_is_rpc() {
+        let err =
+            WorkflowUpdateWithStartError::from_status(tonic::Status::new(Code::Internal, "boom"));
+        assert_matches!(err, WorkflowUpdateWithStartError::Rpc(status) if status.code() == Code::Internal);
     }
 }

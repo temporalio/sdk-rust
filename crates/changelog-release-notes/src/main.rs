@@ -141,8 +141,8 @@ fn update_entries(previous: &Entries, current: BTreeMap<String, Vec<Vec<String>>
     updated
 }
 
-fn changelog_notes(from: &str, to: &str) -> Result<Vec<String>, String> {
-    let mut entries: Entries = changelog_entries(&git(&["show", &format!("{from}:CHANGELOG.md")])?)
+fn changelog_notes(from: &str, to: &str, path: &str) -> Result<Vec<String>, String> {
+    let mut entries: Entries = changelog_entries(&git(&["show", &format!("{from}:{path}")])?)
         .into_iter()
         .map(|(header, entries)| {
             (
@@ -163,12 +163,12 @@ fn changelog_notes(from: &str, to: &str) -> Result<Vec<String>, String> {
         "--reverse",
         &format!("{from}..{to}"),
         "--",
-        "CHANGELOG.md",
+        path,
     ])?;
     for commit in commits.lines().filter(|commit| !commit.is_empty()) {
         entries = update_entries(
             &entries,
-            changelog_entries(&git(&["show", &format!("{commit}:CHANGELOG.md")])?),
+            changelog_entries(&git(&["show", &format!("{commit}:{path}")])?),
         );
     }
     let mut categorized: Entries = Entries::new();
@@ -225,7 +225,7 @@ fn link_prs(subject: &str) -> String {
     output
 }
 
-fn release_notes(from: &str, to: &str) -> Result<Vec<String>, String> {
+fn release_notes(from: &str, to: &str, changelog: &str) -> Result<Vec<String>, String> {
     let log = git(&[
         "log",
         "--format=%H%x00%h%x00%s",
@@ -235,7 +235,7 @@ fn release_notes(from: &str, to: &str) -> Result<Vec<String>, String> {
     if log.is_empty() {
         return Ok(Vec::new());
     }
-    let mut output = changelog_notes(from, to)?;
+    let mut output = changelog_notes(from, to, changelog)?;
     if !output.is_empty() {
         output.insert(0, String::new());
         output.insert(0, "#### Changelog".into());
@@ -253,6 +253,14 @@ fn release_notes(from: &str, to: &str) -> Result<Vec<String>, String> {
     Ok(output)
 }
 
+fn changelog_path(changelog: &str) -> Result<&'static str, String> {
+    match changelog {
+        "rust" => Ok("CHANGELOG.md"),
+        "core" => Ok("crates/sdk-core/CHANGELOG.md"),
+        _ => Err("expected --changelog <rust|core>".into()),
+    }
+}
+
 fn main() -> Result<(), String> {
     let mut args = env::args().skip(1);
     let from = args
@@ -265,7 +273,15 @@ fn main() -> Result<(), String> {
         .filter(|arg| arg == "--to")
         .and_then(|_| args.next())
         .ok_or("expected --to <sha>")?;
-    println!("{}", release_notes(&from, &to)?.join("\n"));
+    let changelog = match args.next().as_deref() {
+        None => "core".to_owned(),
+        Some("--changelog") => args.next().ok_or("expected --changelog <rust|core>")?,
+        Some(_) => return Err("expected --changelog <rust|core>".into()),
+    };
+    println!(
+        "{}",
+        release_notes(&from, &to, changelog_path(&changelog)?)?.join("\n")
+    );
     Ok(())
 }
 
@@ -303,6 +319,15 @@ mod tests {
             "Change ([#12](https://github.com/temporalio/sdk-rust/pull/12))"
         );
         assert_eq!(clean_subject(":boom: Change"), "Change");
+    }
+
+    #[test]
+    fn selects_the_requested_changelog() {
+        assert_eq!(changelog_path("rust").unwrap(), "CHANGELOG.md");
+        assert_eq!(
+            changelog_path("core").unwrap(),
+            "crates/sdk-core/CHANGELOG.md"
+        );
     }
 
     #[test]

@@ -324,12 +324,12 @@ impl ActivityContext {
 
         Some(WorkflowHandle::new(
             client.clone(),
-            WorkflowExecutionInfo {
-                namespace: client.options().namespace.clone(),
-                workflow_id,
-                run_id,
-                first_execution_run_id,
-            },
+            WorkflowExecutionInfo::builder()
+                .namespace(client.options().namespace.clone())
+                .workflow_id(workflow_id)
+                .maybe_run_id(run_id)
+                .maybe_first_execution_run_id(first_execution_run_id)
+                .build(),
         ))
     }
 
@@ -573,10 +573,7 @@ impl ActivityDefinitions {
                     // Codec application happens at the SDK/Core boundary, so activity
                     // implementations work with the payload converter directly.
                     let pc = dc.payload_converter();
-                    let ctx = SerializationContext {
-                        data: &SerializationContextData::Activity,
-                        converter: pc,
-                    };
+                    let ctx = SerializationContext::new(&SerializationContextData::Activity, pc);
                     let input: AD::Input = pc.from_payloads(&ctx, payloads)?;
                     let input = ExecuteActivityInput::new(c, Box::new(input));
                     let leaf = activity_inbound_base::<AD>(instance);
@@ -691,10 +688,7 @@ mod test {
         let payload_converter = PayloadConverter::default();
         let payload = payload_converter
             .to_payload(
-                &SerializationContext {
-                    data: &SerializationContextData::Activity,
-                    converter: &payload_converter,
-                },
+                &SerializationContext::new(&SerializationContextData::Activity, &payload_converter),
                 &"progress".to_owned(),
             )
             .unwrap();

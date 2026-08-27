@@ -129,9 +129,11 @@ where
             .boxed()
         });
 
-        client.expect_complete_workflow_task().returning(move |_a| {
-            async move { Ok(RespondWorkflowTaskCompletedResponse::default()) }.boxed()
-        });
+        client
+            .expect_complete_workflow_task()
+            .returning(move |_a, _b| {
+                async move { Ok(RespondWorkflowTaskCompletedResponse::default()) }.boxed()
+            });
         client
             .expect_fail_workflow_task()
             .returning(move |_, _, _| {

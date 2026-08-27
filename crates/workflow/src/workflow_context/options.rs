@@ -426,6 +426,12 @@ pub struct LocalActivityOptions {
     /// How the activity will cancel
     #[builder(default)]
     pub cancel_type: ActivityCancellationType,
+    /// Whether to record the local activity's serialized arguments in the local activity marker.
+    ///
+    /// Enabling this makes the arguments visible in Workflow history and increases its size.
+    /// Defaults to `false`.
+    #[builder(default)]
+    pub include_arguments_into_marker: bool,
     /// Cancellation token for this local activity. `None` inherits workflow cancellation.
     pub cancellation_token: Option<WorkflowCancellationToken>,
     /// Indicates how long the caller is willing to wait for local activity completion. Limits how
@@ -486,6 +492,7 @@ impl LocalActivityOptions {
                     .timer_backoff_threshold
                     .and_then(|duration| duration.try_into().ok()),
                 cancellation_type: ProtoActivityCancellationType::from(self.cancel_type).into(),
+                include_arguments_into_marker: self.include_arguments_into_marker,
                 schedule_to_close_timeout: self
                     .schedule_to_close_timeout
                     .and_then(|duration| duration.try_into().ok()),
@@ -870,10 +877,8 @@ impl ContinueAsNewOptions {
         headers: HashMap<String, Payload>,
         payload_converter: &PayloadConverter,
     ) -> Result<ContinueAsNewRequest, PayloadConversionError> {
-        let context = SerializationContext {
-            data: &SerializationContextData::Workflow,
-            converter: payload_converter,
-        };
+        let context =
+            SerializationContext::new(&SerializationContextData::Workflow, payload_converter);
         let memo = self
             .memo
             .map(|memo| {
@@ -936,10 +941,7 @@ fn string_user_metadata(summary: Option<String>, details: Option<String>) -> Opt
         return None;
     }
     let converter = PayloadConverter::default();
-    let context = SerializationContext {
-        data: &SerializationContextData::Workflow,
-        converter: &converter,
-    };
+    let context = SerializationContext::new(&SerializationContextData::Workflow, &converter);
     Some(UserMetadata {
         summary: summary.map(|value| {
             converter
@@ -1057,13 +1059,14 @@ mod tests {
 
     #[test]
     fn activity_options_both_close_timeouts_map_to_command() {
-        let req = ActivityOptions::with_close_timeouts(ActivityCloseTimeouts::Both {
-            start_to_close: Duration::from_secs(3),
-            schedule_to_close: Duration::from_secs(8),
-        })
-        .cancellation_type(ActivityCancellationType::Abandon)
-        .build()
-        .into_command(7, "test".to_string(), vec![], HashMap::new());
+        let req =
+            ActivityOptions::with_close_timeouts(ActivityCloseTimeouts::ScheduleAndStartToClose {
+                start_to_close: Duration::from_secs(3),
+                schedule_to_close: Duration::from_secs(8),
+            })
+            .cancellation_type(ActivityCancellationType::Abandon)
+            .build()
+            .into_command(7, "test".to_string(), vec![], HashMap::new());
         let Some(workflow_command::Variant::ScheduleActivity(req)) = req.variant else {
             panic!("expected ScheduleActivity command");
         };
@@ -1073,6 +1076,33 @@ mod tests {
             req.cancellation_type,
             ProtoActivityCancellationType::Abandon as i32
         );
+    }
+
+    #[test]
+    fn local_activity_arguments_marker_option_maps_to_command() {
+        let default_command = LocalActivityOptions::default().into_command(
+            1,
+            "test".to_string(),
+            vec![],
+            HashMap::new(),
+        );
+        let enabled_command = LocalActivityOptions::builder()
+            .include_arguments_into_marker(true)
+            .build()
+            .into_command(1, "test".to_string(), vec![], HashMap::new());
+
+        let Some(workflow_command::Variant::ScheduleLocalActivity(default_command)) =
+            default_command.variant
+        else {
+            panic!("expected ScheduleLocalActivity command");
+        };
+        let Some(workflow_command::Variant::ScheduleLocalActivity(enabled_command)) =
+            enabled_command.variant
+        else {
+            panic!("expected ScheduleLocalActivity command");
+        };
+        assert!(!default_command.include_arguments_into_marker);
+        assert!(enabled_command.include_arguments_into_marker);
     }
 
     #[test]

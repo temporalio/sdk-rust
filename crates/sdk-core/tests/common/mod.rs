@@ -23,7 +23,7 @@ use std::{
     path::PathBuf,
     str::FromStr,
     sync::{
-        Arc,
+        Arc, LazyLock,
         atomic::{AtomicBool, Ordering},
     },
     time::{Duration, Instant},
@@ -32,6 +32,7 @@ use temporalio_client::{
     Client, ClientOptions, ClientTlsOptions, Connection, ConnectionOptions, GrpcCompression,
     NamespacedClient, TlsOptions, UntypedWorkflow, UntypedWorkflowHandle, WorkflowExecutionInfo,
     WorkflowGetResultOptions, WorkflowHandle, WorkflowStartOptions,
+    envconfig::LoadClientConfigProfileOptions,
     errors::{WorkflowGetResultError, WorkflowStartError},
     grpc::WorkflowService,
 };
@@ -40,7 +41,7 @@ use temporalio_common::{
     data_converters::{DataConverter, RawValue},
     protos::{
         coresdk::{
-            workflow_activation::WorkflowActivation,
+            workflow_activation::{WorkflowActivation, remove_from_cache::EvictionReason},
             workflow_completion::WorkflowActivationCompletion,
         },
         temporal::api::{
@@ -55,9 +56,7 @@ use temporalio_common::{
 };
 use temporalio_sdk::{
     Worker, WorkerOptions,
-    interceptors::{
-        FailOnNondeterminismInterceptor, ReturnWorkflowExitValueInterceptor, WorkerInterceptor,
-    },
+    interceptors::{ReturnWorkflowExitValueInterceptor, WorkerInterceptor},
 };
 #[cfg(any(feature = "test-utilities", test))]
 pub(crate) use temporalio_sdk_core::test_help::NAMESPACE;
@@ -77,6 +76,7 @@ pub(crate) const INTEG_SERVER_TARGET_ENV_VAR: &str = "TEMPORAL_SERVICE_ADDRESS";
 pub(crate) const INTEG_NAMESPACE_ENV_VAR: &str = "TEMPORAL_NAMESPACE";
 pub(crate) const INTEG_USE_TLS_ENV_VAR: &str = "TEMPORAL_USE_TLS";
 pub(crate) const INTEG_API_KEY: &str = "TEMPORAL_API_KEY_PATH";
+pub(crate) const TEST_ENV_CONFIG_SERVER_ENV_VAR: &str = "TEMPORAL_TEST_ENV_CONFIG_SERVER";
 pub(crate) static SEARCH_ATTR_TXT: &str = "CustomTextField";
 pub(crate) static SEARCH_ATTR_INT: &str = "CustomIntField";
 /// If set, turn export traces and metrics to the OTel collector at the given URL
@@ -91,6 +91,36 @@ pub(crate) const INTEG_CLIENT_IDENTITY: &str = "integ_tester";
 pub(crate) const INTEG_CLIENT_NAME: &str = "temporal-core";
 pub(crate) const INTEG_CLIENT_VERSION: &str = "0.1.0";
 
+// Envconfig can read TOML profiles and TLS credentials from files. Load one immutable snapshot so
+// concurrently-created clients and workers cannot observe different configuration during a test
+// run.
+static ENV_CONFIG_CLIENT_CONFIG: LazyLock<(ConnectionOptions, String)> = LazyLock::new(|| {
+    let (mut connection_options, client_options) =
+        ClientOptions::load_from_config(LoadClientConfigProfileOptions::default())
+            .unwrap_or_else(|err| panic!("Failed to load integration test envconfig: {err}"));
+    connection_options.identity = INTEG_CLIENT_IDENTITY.to_string();
+    (connection_options, client_options.namespace)
+});
+
+/// Causes test workers to fail immediately when Core evicts a workflow for nondeterminism.
+pub(crate) struct FailOnNondeterminismInterceptor {}
+
+#[async_trait::async_trait(?Send)]
+impl WorkerInterceptor for FailOnNondeterminismInterceptor {
+    async fn on_workflow_activation(
+        &self,
+        activation: &WorkflowActivation,
+    ) -> Result<(), anyhow::Error> {
+        if matches!(
+            activation.eviction_reason(),
+            Some(EvictionReason::Nondeterminism)
+        ) {
+            bail!("Workflow is being evicted because of nondeterminism! {activation}");
+        }
+        Ok(())
+    }
+}
+
 /// Create a worker instance which will use the provided test name to base the task queue and wf id
 /// upon. Returns the instance.
 pub(crate) async fn init_core_and_create_wf(test_name: &str) -> CoreWfStarter {
@@ -101,7 +131,12 @@ pub(crate) async fn init_core_and_create_wf(test_name: &str) -> CoreWfStarter {
 }
 
 pub(crate) fn integ_namespace() -> String {
-    env::var(INTEG_NAMESPACE_ENV_VAR).unwrap_or(NAMESPACE.to_string())
+    if env::var_os(TEST_ENV_CONFIG_SERVER_ENV_VAR).is_some() {
+        let (_, namespace) = &*ENV_CONFIG_CLIENT_CONFIG;
+        namespace.clone()
+    } else {
+        env::var(INTEG_NAMESPACE_ENV_VAR).unwrap_or(NAMESPACE.to_string())
+    }
 }
 
 pub(crate) fn integ_worker_config(tq: &str) -> WorkerConfig {
@@ -123,10 +158,12 @@ pub(crate) fn integ_worker_config(tq: &str) -> WorkerConfig {
 pub(crate) fn integ_sdk_config(tq: &str) -> WorkerOptions {
     WorkerOptions::new(tq)
         .deployment_options(
-            WorkerDeploymentOptions::new(WorkerDeploymentVersion {
-                deployment_name: "".to_owned(),
-                build_id: "test_build_id".to_owned(),
-            })
+            WorkerDeploymentOptions::new(
+                WorkerDeploymentVersion::builder()
+                    .deployment_name("".to_owned())
+                    .build_id("test_build_id".to_owned())
+                    .build(),
+            )
             .build(),
         )
         .build()
@@ -749,12 +786,13 @@ impl TestWorker {
         }
         let wfid = options.workflow_id.clone();
         let handle = c.start_workflow(workflow, input, options).await?;
-        self.started_workflows.lock().push(WorkflowExecutionInfo {
-            namespace: c.namespace(),
-            workflow_id: wfid,
-            run_id: handle.info().run_id.clone(),
-            first_execution_run_id: None,
-        });
+        self.started_workflows.lock().push(
+            WorkflowExecutionInfo::builder()
+                .namespace(c.namespace())
+                .workflow_id(wfid)
+                .maybe_run_id(handle.info().run_id.clone())
+                .build(),
+        );
         Ok(handle)
     }
 
@@ -763,16 +801,18 @@ impl TestWorker {
         wf_id: impl Into<String>,
         run_id: Option<String>,
     ) {
-        self.started_workflows.lock().push(WorkflowExecutionInfo {
-            namespace: self
-                .client
-                .as_ref()
-                .map(|c| c.namespace())
-                .unwrap_or(NAMESPACE.to_owned()),
-            workflow_id: wf_id.into(),
-            run_id,
-            first_execution_run_id: None,
-        });
+        self.started_workflows.lock().push(
+            WorkflowExecutionInfo::builder()
+                .namespace(
+                    self.client
+                        .as_ref()
+                        .map(|c| c.namespace())
+                        .unwrap_or(NAMESPACE.to_owned()),
+                )
+                .workflow_id(wf_id.into())
+                .maybe_run_id(run_id)
+                .build(),
+        );
     }
 
     /// Runs until all expected workflows have completed and then shuts down the worker
@@ -847,12 +887,13 @@ impl TestWorkerSubmitterHandle {
             )
             .await?;
         let run_id = handle.run_id().unwrap().to_string();
-        self.started_workflows.lock().push(WorkflowExecutionInfo {
-            namespace: self.client.namespace(),
-            workflow_id: wfid,
-            run_id: Some(run_id.clone()),
-            first_execution_run_id: None,
-        });
+        self.started_workflows.lock().push(
+            WorkflowExecutionInfo::builder()
+                .namespace(self.client.namespace())
+                .workflow_id(wfid)
+                .maybe_run_id(Some(run_id.clone()))
+                .build(),
+        );
         Ok(run_id)
     }
 }
@@ -908,6 +949,11 @@ impl TestWorkerCompletionIceptor {
 }
 /// Returns the connection options used to connect to the server used for integration tests.
 pub(crate) fn get_integ_server_options() -> ConnectionOptions {
+    if env::var_os(TEST_ENV_CONFIG_SERVER_ENV_VAR).is_some() {
+        let (connection_options, _) = &*ENV_CONFIG_CLIENT_CONFIG;
+        return connection_options.clone();
+    }
+
     let temporal_server_address = env::var(INTEG_SERVER_TARGET_ENV_VAR)
         .unwrap_or_else(|_| "http://localhost:7233".to_owned());
     let url = Url::try_from(&*temporal_server_address).unwrap();
@@ -1264,6 +1310,10 @@ pub(crate) fn integ_dev_server_config(
             "frontend.workerCommandsEnabled=true".to_owned(),
             "--dynamic-config-value".to_owned(),
             "system.enableCancelActivityWorkerCommand=true".to_owned(),
+            "--dynamic-config-value".to_owned(),
+            "history.enableWorkflowTaskCompletionPagination=true".to_owned(),
+            "--dynamic-config-value".to_owned(),
+            "system.transactionSizeLimit=33554432".to_owned(),
             "--dynamic-config-value".to_owned(),
             "matching.rps=12000".to_owned(),
             "--search-attribute".to_string(),
