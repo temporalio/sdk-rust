@@ -2328,11 +2328,8 @@ message UnpauseActivityExecutionRequest {
     // The identity of the client who initiated this request.
     string identity = 5;
 
-    // Providing this flag will also reset the number of attempts.
-    bool reset_attempts = 6;
-
-    // Providing this flag will also reset the heartbeat details.
-    bool reset_heartbeat = 7;
+    reserved 6, 7;
+    reserved "reset_attempts", "reset_heartbeat";
 
     // Reason to unpause the activity.
     string reason = 8;
@@ -3422,6 +3419,9 @@ message StartNexusOperationExecutionRequest {
 
     // Completion callbacks to be invoked once the Nexus operation reaches a terminal state.
     repeated temporal.api.common.v1.Callback completion_callbacks = 18;
+    // Links to be associated with the Nexus operation. Callbacks may also have associated links;
+    // links already included with a callback should not be duplicated here.
+    repeated temporal.api.common.v1.Link links = 19;
 }
 
 message StartNexusOperationExecutionResponse {

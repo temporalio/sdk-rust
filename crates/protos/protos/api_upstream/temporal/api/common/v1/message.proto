@@ -68,8 +68,7 @@ message WorkflowExecution {
     string run_id = 2;
 }
 
-// Identifies a specific execution within a namespace. This is used for standalone activities
-// executions in batch jobs currently.
+// Identifies a specific execution within a namespace.
 message Execution {
     temporal.api.enums.v1.ExecutionType type = 1;
     string business_id = 2;
@@ -304,13 +303,17 @@ message Link {
         string reason = 4;
     }
 
-    // A link to a worker callback attached to a Nexus operation within the same namespace. e.g. the completion handler attached
-    // to a standalone Nexus operation, not the source Nexus operation itself. A standalone Nexus operation can have multiple
-    // callbacks attached to them, and will be differentiated by the server-generated request_id used when the callback was invoked.
-    message NexusOperationCallback {
-        string operation_id = 1;
-        string run_id = 2;
-        string request_id  = 3;
+    // A link to a worker callback attached to an execution. An execution (e.g. standalone Nexus operation) can have
+    // multiple callbacks attached, and will be differentiated by the request_id used when the callback is invoked.
+    message Callback {
+        string namespace = 1;
+        Execution execution = 2;
+        // In most cases, the Execution is sufficient to identify the callback's source. But for some types of execution,
+        // a separate "component ID" is required. e.g. for completion callbacks attached to a workflow update. The
+        // execution would be the workflow itself, with the component_id referring to the update of that workflow.
+        string component_id = 3;
+
+        string request_id  = 4;
     }
 
     oneof variant {
@@ -319,7 +322,7 @@ message Link {
         Activity activity = 3;
         NexusOperation nexus_operation = 4;
         Workflow workflow = 5;
-        NexusOperationCallback nexus_operation_callback = 6;
+        Callback callback = 6;
     }
 }
 

@@ -36,12 +36,16 @@ message CallbackInfo {
     // If the state is BLOCKED, blocked reason provides additional information.
     string blocked_reason = 8;
 
+    // Server-generated request ID used as an idempotency token when invoking callbacks.
+    // It has no relation to caller-side request_id sent in operations like StartNexusOperationExecutionRequest.
+    string request_id = 9;
+
     // Result of the callback's execution, only set when the callback reaches a terminal state.
     oneof result {
         // The callback completed successfully. (Which may include delivering a "failed" result successfully.)
-        google.protobuf.Empty success = 9;
+        google.protobuf.Empty success = 10;
         // The failure if the callback was not able to complete successfully. e.g. timed out, received an
         // unretriable error, etc.
-        temporal.api.failure.v1.Failure failure = 10;
+        temporal.api.failure.v1.Failure failure = 11;
     }
 }

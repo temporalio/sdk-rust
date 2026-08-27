@@ -113,4 +113,6 @@ enum ExecutionType {
     EXECUTION_TYPE_WORKFLOW = 1;
     // An activity execution archetype. This is reserved for standalone activities.
     EXECUTION_TYPE_ACTIVITY = 2;
+    // A Nexus operation execution archetype. This is reserved for standalone Nexus operations.
+    EXECUTION_TYPE_NEXUS_OPERATION = 3;
 }
