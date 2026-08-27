@@ -36,6 +36,8 @@ relevant information.
 ### Added
 * `LocalActivityOptions::include_arguments_into_marker` allows Rust workflows to opt in to
   recording local activity arguments in Workflow history.
+* `WorkflowHandle::get_update_handle` creates a typed handle for an existing Workflow Update from
+  its update ID, allowing callers to wait for the result independently of the original handle.
 * `WorkflowContext::all_handlers_finished` and `SyncWorkflowContext::all_handlers_finished` let
   Rust workflows wait for active signal and update handler chains before completing or continuing
   as new.

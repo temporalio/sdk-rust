@@ -989,6 +989,29 @@ where
         ))
     }
 
+    /// Get a handle to an existing update.
+    ///
+    /// The update definition determines the result type. The returned handle uses this workflow
+    /// handle's workflow and run IDs and does not validate the update ID until
+    /// [`get_result`](WorkflowUpdateHandle::get_result) is called.
+    pub fn get_update_handle<U>(
+        &self,
+        update: U,
+        update_id: impl Into<String>,
+    ) -> WorkflowUpdateHandle<CT, U::Output>
+    where
+        U: UpdateDefinition<Workflow = W::Run>,
+    {
+        let _ = update;
+        WorkflowUpdateHandle::new(
+            self.client.clone(),
+            update_id.into(),
+            self.info.workflow_id.clone(),
+            self.info.run_id.clone(),
+            None,
+        )
+    }
+
     /// Request cancellation of this workflow.
     pub async fn cancel(&self, opts: WorkflowCancelOptions) -> Result<(), WorkflowInteractionError>
     where
