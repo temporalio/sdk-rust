@@ -97,7 +97,7 @@ api-linter-install:
 
 buf-install:
 	printf $(COLOR) "Install/update buf..."
-	go install github.com/bufbuild/buf/cmd/buf@v1.27.0
+	go install github.com/bufbuild/buf/cmd/buf@v1.49.0
 
 ##### Sync external proto dependencies #####
 sync-nexus-annotations:
@@ -112,12 +112,12 @@ api-linter:
 $(STAMPDIR):
 	mkdir $@
 
-$(STAMPDIR)/buf-mod-prune: $(STAMPDIR) buf.yaml
+$(STAMPDIR)/buf-dep-prune: $(STAMPDIR) buf.yaml
 	printf $(COLOR) "Pruning buf module"
-	buf mod prune
+	buf dep prune
 	touch $@
 
-buf-lint: $(STAMPDIR)/buf-mod-prune
+buf-lint: $(STAMPDIR)/buf-dep-prune
 	printf $(COLOR) "Run buf linter..."
 	(cd $(PROTO_ROOT) && buf lint)
 

@@ -86,7 +86,7 @@ interface workflow-service {
     /// @nexus.proto-field "workflow_start_delay"
     start-delay: option<duration>,
     user-metadata: option<user-metadata>,
-    /// @nexus.source python="workflow_namespace" typescript="workflowNamespace" dotnet="TemporalWorkflowContext.WorkflowNamespace"
+    /// @nexus.source python="workflow_namespace()" typescript="workflowNamespace()" go="workflow.GetInfo(ctx).Namespace" dotnet="TemporalWorkflowContext.WorkflowNamespace()"
     namespace: string,
     /// @nexus.omit
     control: placeholder,
@@ -122,7 +122,7 @@ interface workflow-service {
   ///   dotnet-type="Temporalio.Workflows.ExternalWorkflowHandle"
   ///   dotnet="Temporalio.Workflows.Workflow.GetExternalWorkflowHandle(request.Id, result.RunId)"
   /// @nexus.operation name="SignalWithStartWorkflowExecution"
-  /// @nexus.serialization-context python="signal_with_start_workflow_serialization_context"
+  /// @nexus.serialization-context python="signal_with_start_workflow_serialization_context" dotnet="WorkflowServiceSerializationContexts.SignalWithStartWorkflow"
   /// @nexus.experimental
   signal-with-start-workflow: func(
     request: signal-with-start-workflow-request,
