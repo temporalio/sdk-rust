@@ -6,6 +6,9 @@
 //! Worker polls until the invocation enters its reserved shutdown window, drains gracefully, runs
 //! shutdown hooks, and then returns control to the Lambda runtime.
 
+#[cfg(feature = "otel")]
+pub mod otel;
+
 use std::{
     env,
     future::Future,
@@ -106,6 +109,10 @@ pub enum LambdaWorkerError {
     /// The Temporal SDK runtime could not be created.
     #[error("failed to create Temporal runtime: {0}")]
     Runtime(#[source] anyhow::Error),
+    /// OpenTelemetry providers or exporters could not be configured.
+    #[cfg(feature = "otel")]
+    #[error("failed to configure OpenTelemetry: {0}")]
+    OpenTelemetry(#[source] anyhow::Error),
     /// The Temporal client could not connect.
     #[error("failed to connect Temporal client: {0}")]
     ClientConnect(#[from] ClientConnectError),
@@ -144,6 +151,8 @@ pub struct LambdaWorkerBuilder {
     custom_tuner: Option<Arc<dyn WorkerTuner + Send + Sync>>,
     default_versioning_behavior: VersioningBehavior,
     shutdown_hooks: Vec<ShutdownHook>,
+    #[cfg(feature = "otel")]
+    open_telemetry: Option<otel::OpenTelemetryOptions>,
 }
 
 impl LambdaWorkerBuilder {
@@ -161,6 +170,17 @@ impl LambdaWorkerBuilder {
     /// Use an already-created Temporal SDK runtime.
     pub fn runtime(mut self, runtime: Arc<Runtime>) -> Self {
         self.runtime = Some(runtime);
+        self
+    }
+
+    /// Configure OTLP metrics and tracing using AWS Lambda-oriented defaults.
+    ///
+    /// This creates the SDK runtime, so it cannot be combined with [`Self::runtime`]. Pending
+    /// telemetry is force-flushed after every invocation without shutting down the providers,
+    /// allowing them to remain available for warm starts.
+    #[cfg(feature = "otel")]
+    pub fn open_telemetry(mut self, options: otel::OpenTelemetryOptions) -> Self {
+        self.open_telemetry = Some(options);
         self
     }
 
@@ -230,6 +250,26 @@ impl LambdaWorkerBuilder {
                 (None, None) => load_client_options()?,
                 _ => unreachable!("client_options sets both option types"),
             };
+        #[cfg(feature = "otel")]
+        let runtime = match (self.runtime, self.open_telemetry) {
+            (Some(_), Some(_)) => {
+                return Err(LambdaWorkerError::InvalidConfiguration(
+                    "runtime and OpenTelemetry options cannot both be supplied".to_owned(),
+                ));
+            }
+            (Some(runtime), None) => runtime,
+            (None, Some(options)) => {
+                let integration = otel::OpenTelemetryIntegration::new(options)
+                    .map_err(LambdaWorkerError::OpenTelemetry)?;
+                self.shutdown_hooks.push(integration.flush_hook());
+                integration.runtime()
+            }
+            (None, None) => Arc::new(
+                Runtime::new_assume_tokio(Default::default())
+                    .map_err(LambdaWorkerError::Runtime)?,
+            ),
+        };
+        #[cfg(not(feature = "otel"))]
         let runtime = match self.runtime {
             Some(runtime) => runtime,
             None => Arc::new(
@@ -286,6 +326,8 @@ impl LambdaWorker {
             custom_tuner: None,
             default_versioning_behavior: VersioningBehavior::Pinned,
             shutdown_hooks: Vec::new(),
+            #[cfg(feature = "otel")]
+            open_telemetry: None,
         }
     }
 
@@ -618,6 +660,29 @@ mod tests {
             options.deployment_options.default_versioning_behavior,
             Some(VersioningBehavior::AutoUpgrade)
         );
+    }
+
+    #[cfg(feature = "otel")]
+    #[tokio::test]
+    async fn rejects_open_telemetry_with_caller_owned_runtime() {
+        let runtime = Arc::new(Runtime::new_assume_tokio(Default::default()).unwrap());
+        let result = LambdaWorker::builder(version(), WorkerOptions::new("queue").build())
+            .client_options(
+                ConnectionOptions::new(
+                    temporalio_client::Url::parse("http://localhost:7233").unwrap(),
+                )
+                .build(),
+                ClientOptions::new("default").build(),
+            )
+            .runtime(runtime)
+            .open_telemetry(otel::OpenTelemetryOptions::default())
+            .build();
+
+        assert!(matches!(
+            result,
+            Err(LambdaWorkerError::InvalidConfiguration(message))
+                if message.contains("runtime and OpenTelemetry")
+        ));
     }
 
     #[test]

@@ -305,6 +305,12 @@ impl CoreMeter for CoreOtelMeter {
 }
 
 impl CoreOtelMeter {
+    /// Export all metrics currently buffered by this meter.
+    pub fn force_flush(&self) -> Result<(), anyhow::Error> {
+        self._mp.force_flush()?;
+        Ok(())
+    }
+
     fn create_histogram(&self, params: MetricParameters) -> opentelemetry::metrics::Histogram<u64> {
         self.meter
             .u64_histogram(params.name)

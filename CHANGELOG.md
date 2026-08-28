@@ -35,7 +35,9 @@ relevant information.
 
 ### Added
 * The experimental `temporalio-sdk-aws-lambda` crate runs a versioned Rust SDK Worker for each AWS
-  Lambda invocation with Lambda-oriented concurrency defaults and deadline-aware graceful shutdown.
+  Lambda invocation with Lambda-oriented concurrency defaults, deadline-aware graceful shutdown,
+  and optional OTLP metrics and tracing configured for the AWS Distro for OpenTelemetry Lambda
+  layers.
 * `LocalActivityOptions::include_arguments_into_marker` allows Rust workflows to opt in to
   recording local activity arguments in Workflow history.
 * `WorkflowHandle::get_update_handle` creates a typed handle for an existing Workflow Update from
