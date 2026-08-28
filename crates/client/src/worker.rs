@@ -221,7 +221,7 @@ impl ClientWorkerSetImpl {
             let worker_instance_key = worker.worker_instance_key();
             let namespace = worker.namespace().to_string();
 
-            let shared_worker = match self.shared_worker.entry(namespace.clone()) {
+            let shared_worker = match self.shared_worker.entry(namespace) {
                 Occupied(o) => o.into_mut(),
                 Vacant(v) => {
                     let shared_worker = worker.new_shared_namespace_worker()?;
@@ -230,11 +230,11 @@ impl ClientWorkerSetImpl {
             };
             shared_worker.register_callback(
                 worker_instance_key,
-                WorkerCallbacks {
-                    heartbeat: heartbeat_callback,
-                    heartbeat_success: worker.heartbeat_success_callback(),
-                    cancel_activity: worker.cancel_activity_callback(),
-                },
+                WorkerCallbacks::new(
+                    heartbeat_callback,
+                    worker.heartbeat_success_callback(),
+                    worker.cancel_activity_callback(),
+                ),
             );
         }
 
@@ -500,8 +500,9 @@ impl std::fmt::Debug for ClientWorkerSet {
     }
 }
 
-/// Contains a worker heartbeat callback, wrapped for mocking.
-pub type HeartbeatCallback = Arc<dyn Fn() -> WorkerHeartbeat + Send + Sync>;
+/// Contains a worker heartbeat callback, wrapped for mocking. Returns `None` until the worker has
+/// started running.
+pub type HeartbeatCallback = Arc<dyn Fn() -> Option<WorkerHeartbeat> + Send + Sync>;
 
 /// Callback invoked after a worker heartbeat has been accepted by the server.
 pub type HeartbeatSuccessCallback = Arc<dyn Fn() + Send + Sync>;
@@ -510,6 +511,7 @@ pub type HeartbeatSuccessCallback = Arc<dyn Fn() + Send + Sync>;
 pub type CancelActivityCallback = Arc<dyn Fn(TaskToken) -> bool + Send + Sync>;
 
 /// Bundles all per-worker callbacks registered with the SharedNamespaceWorker.
+#[non_exhaustive]
 pub struct WorkerCallbacks {
     /// Callback to collect heartbeat data from the worker.
     pub heartbeat: HeartbeatCallback,
@@ -517,6 +519,21 @@ pub struct WorkerCallbacks {
     pub heartbeat_success: Option<HeartbeatSuccessCallback>,
     /// Callback to cancel an activity by task token.
     pub cancel_activity: Option<CancelActivityCallback>,
+}
+
+impl WorkerCallbacks {
+    /// Creates a callback bundle for a worker.
+    pub fn new(
+        heartbeat: HeartbeatCallback,
+        heartbeat_success: Option<HeartbeatSuccessCallback>,
+        cancel_activity: Option<CancelActivityCallback>,
+    ) -> Self {
+        Self {
+            heartbeat,
+            heartbeat_success,
+            cancel_activity,
+        }
+    }
 }
 
 /// Represents a complete worker that can handle both slot management
@@ -687,10 +704,12 @@ mod tests {
             .expect_task_queue()
             .return_const(task_queue.clone());
         failing_worker.expect_deployment_options().return_const(
-            WorkerDeploymentOptions::new(temporalio_common::worker::WorkerDeploymentVersion {
-                deployment_name: "test-deployment".to_string(),
-                build_id: "build-fail".to_string(),
-            })
+            WorkerDeploymentOptions::new(
+                temporalio_common::worker::WorkerDeploymentVersion::builder()
+                    .deployment_name("test-deployment".to_string())
+                    .build_id("build-fail".to_string())
+                    .build(),
+            )
             .use_worker_versioning(true)
             .build(),
         );
@@ -721,13 +740,14 @@ mod tests {
         succeeding_worker
             .expect_task_queue()
             .return_const(task_queue.clone());
-        let success_deployment_options =
-            WorkerDeploymentOptions::new(temporalio_common::worker::WorkerDeploymentVersion {
-                deployment_name: "test-deployment".to_string(),
-                build_id: "build-success".to_string(),
-            })
-            .use_worker_versioning(true)
-            .build();
+        let success_deployment_options = WorkerDeploymentOptions::new(
+            temporalio_common::worker::WorkerDeploymentVersion::builder()
+                .deployment_name("test-deployment".to_string())
+                .build_id("build-success".to_string())
+                .build(),
+        )
+        .use_worker_versioning(true)
+        .build();
         succeeding_worker
             .expect_deployment_options()
             .return_const(success_deployment_options.clone());
@@ -784,10 +804,12 @@ mod tests {
             .expect_task_queue()
             .return_const(task_queue.clone());
         failing_worker.expect_deployment_options().return_const(
-            WorkerDeploymentOptions::new(temporalio_common::worker::WorkerDeploymentVersion {
-                deployment_name: "test-deployment".to_string(),
-                build_id: "build-fail".to_string(),
-            })
+            WorkerDeploymentOptions::new(
+                temporalio_common::worker::WorkerDeploymentVersion::builder()
+                    .deployment_name("test-deployment".to_string())
+                    .build_id("build-fail".to_string())
+                    .build(),
+            )
             .use_worker_versioning(true)
             .build(),
         );
@@ -995,10 +1017,10 @@ mod tests {
             .returning(move || {
                 build_id_for_closure.as_ref().map(|build_id| {
                     WorkerDeploymentOptions::new(
-                        temporalio_common::worker::WorkerDeploymentVersion {
-                            deployment_name: deployment_name.clone(),
-                            build_id: build_id.clone(),
-                        },
+                        temporalio_common::worker::WorkerDeploymentVersion::builder()
+                            .deployment_name(deployment_name.clone())
+                            .build_id(build_id.clone())
+                            .build(),
                     )
                     .use_worker_versioning(true)
                     .build()
@@ -1008,7 +1030,7 @@ mod tests {
         if heartbeat_enabled {
             mock_provider
                 .expect_heartbeat_callback()
-                .returning(|| Some(Arc::new(WorkerHeartbeat::default)));
+                .returning(|| Some(Arc::new(|| Some(WorkerHeartbeat::default()))));
             mock_provider
                 .expect_heartbeat_success_callback()
                 .returning(|| None);

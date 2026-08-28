@@ -1198,10 +1198,10 @@ impl TryFrom<&WorkerOptions> for temporalio_sdk_core::WorkerConfig {
                         };
                         temporalio_sdk_core::WorkerVersioningStrategy::WorkerDeploymentBased(
                             temporalio_common::worker::WorkerDeploymentOptions::new(
-                                temporalio_common::worker::WorkerDeploymentVersion {
-                                    deployment_name: dopts.version.deployment_name.to_string(),
-                                    build_id: dopts.version.build_id.to_string(),
-                                },
+                                temporalio_common::worker::WorkerDeploymentVersion::builder()
+                                    .deployment_name(dopts.version.deployment_name.to_string())
+                                    .build_id(dopts.version.build_id.to_string())
+                                    .build(),
                             )
                             .use_worker_versioning(dopts.use_worker_versioning)
                             .maybe_default_versioning_behavior(dvb)

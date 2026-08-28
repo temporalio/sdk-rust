@@ -59,11 +59,31 @@ pub trait FailureDecodeHint {
     fn adapt(self, normalized: IncomingError) -> Self::Output;
 }
 
+/// No-op decode hint; returns the error unchanged.
+#[derive(Debug, Clone, Copy)]
+pub struct NoopDecodeHint;
+
+impl FailureDecodeHint for NoopDecodeHint {
+    type Output = IncomingError;
+
+    fn adapt(self, normalized: IncomingError) -> Self::Output {
+        normalized
+    }
+}
+
 /// Decode hint for activity execution results.
 #[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
 pub struct ActivityExecutionDecodeHint {
     /// Whether the workflow-side resolution was cancelled rather than failed.
     pub cancelled: bool,
+}
+
+impl ActivityExecutionDecodeHint {
+    /// Creates a decode hint for an activity resolution.
+    pub fn new(cancelled: bool) -> Self {
+        Self { cancelled }
+    }
 }
 
 impl FailureDecodeHint for ActivityExecutionDecodeHint {
@@ -102,7 +122,8 @@ impl FailureDecodeHint for ActivityExecutionDecodeHint {
 }
 
 /// Decode hint for child-workflow start results.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Default)]
+#[non_exhaustive]
 pub struct ChildWorkflowStartDecodeHint;
 
 impl FailureDecodeHint for ChildWorkflowStartDecodeHint {
@@ -128,7 +149,8 @@ impl FailureDecodeHint for ChildWorkflowStartDecodeHint {
 }
 
 /// Decode hint for child-workflow execution results.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Default)]
+#[non_exhaustive]
 pub struct ChildWorkflowExecutionDecodeHint;
 
 impl FailureDecodeHint for ChildWorkflowExecutionDecodeHint {
@@ -149,7 +171,8 @@ impl FailureDecodeHint for ChildWorkflowExecutionDecodeHint {
 }
 
 /// Decode hint for workflow signal failures.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Default)]
+#[non_exhaustive]
 pub struct WorkflowSignalDecodeHint;
 
 impl FailureDecodeHint for WorkflowSignalDecodeHint {
@@ -177,6 +200,9 @@ impl FailureConverter for DefaultFailureConverter {
             }
             OutgoingError::Workflow(OutgoingWorkflowError::Application(app)) => {
                 app.encode_failure(payload_converter, context)
+            }
+            OutgoingError::Workflow(OutgoingWorkflowError::PayloadConversion(err)) => {
+                Ok(encode_generic_application_failure(&err))
             }
             OutgoingError::Workflow(OutgoingWorkflowError::ActivityExecution(activity)) => {
                 activity.encode_failure(payload_converter, context)
@@ -670,10 +696,7 @@ mod tests {
         let converter = PayloadConverter::default();
         let details: String = converter
             .from_payloads(
-                &SerializationContext {
-                    data: &SerializationContextData::Workflow,
-                    converter: &converter,
-                },
+                &SerializationContext::new(&SerializationContextData::Workflow, &converter),
                 payloads,
             )
             .unwrap();
@@ -703,10 +726,7 @@ mod tests {
         let converter = PayloadConverter::default();
         let payloads = converter
             .to_payloads(
-                &SerializationContext {
-                    data: &SerializationContextData::Workflow,
-                    converter: &converter,
-                },
+                &SerializationContext::new(&SerializationContextData::Workflow, &converter),
                 &"detail",
             )
             .unwrap();

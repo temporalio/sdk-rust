@@ -13,7 +13,7 @@ use temporalio_client::{
     WorkflowCountOptions, WorkflowListOptions, WorkflowStartOptions, WorkflowTerminateOptions,
     errors::WorkflowStartError,
 };
-use temporalio_common::{data_converters::RawValue, worker::WorkerTaskTypes};
+use temporalio_common::{MemoValues, data_converters::RawValue};
 use temporalio_macros::{workflow, workflow_methods};
 use temporalio_sdk::{WorkflowContext, WorkflowResult};
 
@@ -65,7 +65,7 @@ impl ClientInterceptor for StartWorkflowInterceptor {
 async fn client_interceptor_start_workflow() {
     let test_name = "client_interceptor_start_workflow";
     let mut starter = CoreWfStarter::new(test_name);
-    let mut client = starter.get_client().await;
+    let mut client = starter.get_core_client().await;
     let calls = Arc::new(AtomicUsize::new(0));
     client
         .options_mut()
@@ -98,10 +98,12 @@ async fn client_interceptor_start_workflow() {
 async fn list_workflows(#[case] limit: Option<usize>) {
     let test_name = "list_workflows_returns_started_workflows";
     let mut starter = CoreWfStarter::new(test_name);
-    starter.sdk_config.task_types = WorkerTaskTypes::workflow_only();
-    let client = starter.get_client().await;
+    starter
+        .sdk_config
+        .register_workflow::<EmptyWorkflow>()
+        .unwrap();
     let mut worker = starter.worker().await;
-    worker.register_workflow::<EmptyWorkflow>().unwrap();
+    let client = starter.get_core_client().await;
 
     let suffix = rand_6_chars();
     let num_workflows = 5;
@@ -212,7 +214,7 @@ async fn list_workflows(#[case] limit: Option<usize>) {
 async fn already_started_error_contains_run_id() {
     let test_name = "already_started_error_contains_run_id";
     let mut starter = CoreWfStarter::new(test_name);
-    let client = starter.get_client().await;
+    let client = starter.get_core_client().await;
     let task_queue = starter.get_task_queue().to_owned();
     let wf_id = format!("{test_name}_{}", rand_6_chars());
 
@@ -242,6 +244,43 @@ async fn already_started_error_contains_run_id() {
         }
         other => panic!("Expected AlreadyStarted, got: {other}"),
     }
+
+    handle
+        .terminate(WorkflowTerminateOptions::default())
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn start_workflow_with_memo() {
+    let test_name = "start_workflow_with_memo";
+    let mut starter = CoreWfStarter::new(test_name);
+    let client = starter.get_core_client().await;
+    let task_queue = starter.get_task_queue().to_owned();
+    let wf_id = format!("{test_name}_{}", rand_6_chars());
+
+    let mut memo = MemoValues::new();
+    memo.insert("memo-key", "memo-value".to_string())
+        .insert("other-key", 42_u32);
+
+    let handle = client
+        .start_workflow(
+            UntypedWorkflow::new(test_name),
+            RawValue::empty(),
+            WorkflowStartOptions::new(task_queue, wf_id)
+                .memo(memo)
+                .build(),
+        )
+        .await
+        .unwrap();
+
+    let desc = handle.describe(Default::default()).await.unwrap();
+    let memo = desc.memo();
+    assert_eq!(
+        memo.get::<String>("memo-key").unwrap(),
+        Some("memo-value".to_string())
+    );
+    assert_eq!(memo.get::<u32>("other-key").unwrap(), Some(42));
 
     handle
         .terminate(WorkflowTerminateOptions::default())

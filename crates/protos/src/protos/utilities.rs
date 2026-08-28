@@ -37,6 +37,12 @@ pub fn decode_status_detail<T: Message + Default>(details: &[u8]) -> Option<T> {
     T::decode(first_detail.value.as_slice()).ok()
 }
 
+/// Encode a `google.rpc.Status` into the serialized bytes format carried by
+/// `grpc-status-details-bin` (as expected by `tonic::Status::with_details`).
+pub fn encode_status_details(status: &super::google::rpc::Status) -> Vec<u8> {
+    status.encode_to_vec()
+}
+
 /// Given a header map, lowercase all the keys and return it as a new map.
 /// Any keys that are duplicated after lowercasing will clobber each other in undefined ordering.
 pub fn normalize_http_headers(headers: HashMap<String, String>) -> HashMap<String, String> {

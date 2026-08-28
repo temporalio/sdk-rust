@@ -9,12 +9,13 @@ pub(crate) use local_activities::{
 use crate::{
     TaskToken,
     abstractions::{
-        ClosableMeteredPermitDealer, MeteredPermitDealer, TrackedOwnedMeteredSemPermit,
-        UsedMeteredSemPermit,
+        ActiveCounter, ClosableMeteredPermitDealer, MeteredPermitDealer,
+        TrackedOwnedMeteredSemPermit, UsedMeteredSemPermit,
     },
     pollers::{BoxedActPoller, PermittedTqResp, TrackedPermittedTqResp, new_activity_task_poller},
     telemetry::metrics::{
-        MetricsContext, activity_type, eager, should_record_failure_metric, workflow_type,
+        FailureReason, MetricsContext, activity_type, eager, failure_reason,
+        should_record_failure_metric, workflow_type,
     },
     worker::{
         ActivitySlotKind, PollError,
@@ -36,13 +37,17 @@ use std::{
     },
     time::{Duration, Instant, SystemTime},
 };
-use temporalio_client::{payload_limit_violation_from, worker::CancelActivityCallback};
+use temporalio_client::{
+    PayloadErrorLimits, payload_limit_violation_from, worker::CancelActivityCallback,
+};
 use temporalio_common::{
-    payload_limits::PayloadLimitViolation,
+    payload_limits::{PayloadLimitViolation, PayloadLimits, validate_known_payload_limits},
     protos::{
         coresdk::{
             ActivityHeartbeat, ActivitySlotInfo,
-            activity_result::{self as ar, activity_execution_result as aer},
+            activity_result::{
+                self as ar, ActivityTaskFailedCause, activity_execution_result as aer,
+            },
             activity_task::{ActivityCancelReason, ActivityCancellationDetails, ActivityTask},
         },
         temporal::api::{
@@ -50,7 +55,9 @@ use temporalio_common::{
             failure::v1::{
                 ApplicationFailureInfo, CanceledFailureInfo, Failure, failure::FailureInfo,
             },
-            workflowservice::v1::PollActivityTaskQueueResponse,
+            workflowservice::v1::{
+                PollActivityTaskQueueResponse, RecordActivityTaskHeartbeatRequest,
+            },
         },
     },
 };
@@ -59,6 +66,7 @@ use tokio::{
     sync::{
         Mutex, Notify,
         mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel},
+        watch,
     },
     task::JoinHandle,
 };
@@ -176,8 +184,13 @@ pub(crate) struct WorkerActivityTasks {
     max_heartbeat_throttle_interval: Duration,
     default_heartbeat_throttle_interval: Duration,
 
-    /// Wakes every time an activity is removed from the outstanding map
-    complete_notify: Arc<Notify>,
+    /// Counts completions which have already taken their task out of
+    /// `outstanding_activity_tasks` but are still flushing the result to server. Such a
+    /// completion still owns the activity's slot permit, so shutdown must not treat the empty
+    /// map as "all activities finished" while this is nonzero — otherwise the heartbeat manager
+    /// can be torn down out from under an in-flight eviction (stranding it forever) and worker
+    /// shutdown can proceed while the result was never reported.
+    completions_in_flight: watch::Sender<usize>,
     /// Token to notify when poll returned a shutdown error
     poll_returned_shutdown_token: CancellationToken,
     /// Used to inject external cancellations (e.g. from nexus worker commands)
@@ -219,7 +232,7 @@ impl WorkerActivityTasks {
         let (cancels_tx, cancels_rx) = unbounded_channel();
         let external_cancels_tx = cancels_tx.clone();
         let heartbeat_manager = ActivityHeartbeatManager::new(client, cancels_tx.clone());
-        let complete_notify = Arc::new(Notify::new());
+        let (completions_in_flight, completions_in_flight_rx) = watch::channel(0);
         let source_stream = stream::select_with_strategy(
             UnboundedReceiverStream::new(cancels_rx).map(ActivityTaskSource::from),
             starts_stream.map(|a| ActivityTaskSource::from(Box::new(a))),
@@ -230,7 +243,7 @@ impl WorkerActivityTasks {
             source_stream,
             outstanding_tasks: outstanding_activity_tasks.clone(),
             start_tasks_stream_complete,
-            complete_notify: complete_notify.clone(),
+            completions_in_flight: completions_in_flight_rx,
             grace_period: graceful_shutdown,
             cancels_tx,
             local_timeout_buffer,
@@ -245,7 +258,7 @@ impl WorkerActivityTasks {
             heartbeat_manager,
             activity_task_stream: Mutex::new(activity_task_stream.boxed()),
             eager_activities_semaphore,
-            complete_notify,
+            completions_in_flight,
             metrics,
             max_heartbeat_throttle_interval,
             default_heartbeat_throttle_interval,
@@ -334,6 +347,12 @@ impl WorkerActivityTasks {
         status: aer::Status,
         client: &dyn WorkerClient,
     ) {
+        // Counted before taking the task out of the outstanding map so shutdown can never
+        // observe the map empty without also seeing this completion in flight. Declared first so
+        // it drops after `act_info` — and thus after the slot permit — even if this future is
+        // cancelled or panics mid-completion.
+        let _completion_guard =
+            ActiveCounter::<fn(usize)>::new(self.completions_in_flight.clone(), None);
         let act_info = {
             let mut outstanding_activity_tasks = self.outstanding_activity_tasks.lock();
             outstanding_activity_tasks.remove(&task_token)
@@ -363,13 +382,24 @@ impl WorkerActivityTasks {
                 .evict(task_token.clone(), should_flush)
                 .await;
 
-            let last_heartbeat_details = act_info
-                .last_heartbeat_details
-                .map(|payloads| Payloads { payloads });
-
             // No need to report activities which we already know the server doesn't care about
             if !known_not_found {
                 let _flushing_guard = self.completers_lock.read().await;
+
+                let mut last_heartbeat_details = act_info
+                    .last_heartbeat_details
+                    .map(|payloads| Payloads { payloads });
+                // Only failure reports carry these to the server, and oversized details would make
+                // the server reject such a request outright, so drop them and report the violation
+                // as the failure instead. Checked here rather than in the client so that the
+                // reported failure, the cause, and the metric can't disagree about what happened.
+                let heartbeat_details_violation = last_heartbeat_details.as_ref().and_then(|d| {
+                    heartbeat_details_limit_violation(d, client.payload_error_limits())
+                });
+                if heartbeat_details_violation.is_some() {
+                    last_heartbeat_details = None;
+                }
+
                 let maybe_net_err = match status {
                     aer::Status::WillCompleteAsync(_) => None,
                     aer::Status::Completed(ar::Success { result }) => {
@@ -390,10 +420,15 @@ impl WorkerActivityTasks {
                             }
                             Err(e) => {
                                 if let Some(violation) = payload_limit_violation_from(&e) {
-                                    act_metrics.act_execution_failed();
+                                    act_metrics
+                                        .with_new_attrs([failure_reason(
+                                            FailureReason::PayloadsTooLarge,
+                                        )])
+                                        .act_execution_failed();
                                     client
                                         .fail_activity_task(
                                             task_token.clone(),
+                                            ActivityTaskFailedCause::PayloadsTooLarge,
                                             Some(make_payloads_too_large_failure(violation)),
                                             last_heartbeat_details.clone(),
                                         )
@@ -405,12 +440,42 @@ impl WorkerActivityTasks {
                             }
                         }
                     }
-                    aer::Status::Failed(ar::Failure { failure }) => {
-                        if should_record_failure_metric(&failure) {
-                            act_metrics.act_execution_failed();
-                        }
+                    aer::Status::Failed(fail) => {
+                        let (cause, failure) = if let Some(violation) =
+                            heartbeat_details_violation.as_ref()
+                        {
+                            // What reaches the server is no longer whatever lang reported, so
+                            // the metric must be recorded even for an otherwise benign failure.
+                            act_metrics
+                                .with_new_attrs([failure_reason(FailureReason::PayloadsTooLarge)])
+                                .act_execution_failed();
+                            (
+                                ActivityTaskFailedCause::PayloadsTooLarge,
+                                Some(make_payloads_too_large_failure(violation)),
+                            )
+                        } else {
+                            // An SDK reporting no cause recognized nothing more specific, which is
+                            // normalized to unhandled failure so all SDKs do not have to specify it.
+                            let cause = match fail.cause() {
+                                ActivityTaskFailedCause::Unspecified => {
+                                    ActivityTaskFailedCause::ActivityWorkerUnhandledFailure
+                                }
+                                c => c,
+                            };
+                            if should_record_failure_metric(&fail.failure) {
+                                act_metrics
+                                    .with_new_attrs([failure_reason(cause.into())])
+                                    .act_execution_failed();
+                            }
+                            (cause, fail.failure)
+                        };
                         client
-                            .fail_activity_task(task_token.clone(), failure, last_heartbeat_details)
+                            .fail_activity_task(
+                                task_token.clone(),
+                                cause,
+                                failure,
+                                last_heartbeat_details,
+                            )
                             .await
                             .err()
                     }
@@ -422,10 +487,21 @@ impl WorkerActivityTasks {
                             // We report cancels for graceful shutdown as failures, so we
                             // don't wait for the whole timeout to elapse, which is what would
                             // happen anyway.
+                            let (cause, failure) = match heartbeat_details_violation.as_ref() {
+                                Some(violation) => (
+                                    ActivityTaskFailedCause::PayloadsTooLarge,
+                                    make_payloads_too_large_failure(violation),
+                                ),
+                                None => (
+                                    ActivityTaskFailedCause::ActivityWorkerUnhandledFailure,
+                                    worker_shutdown_failure(),
+                                ),
+                            };
                             client
                                 .fail_activity_task(
                                     task_token.clone(),
-                                    Some(worker_shutdown_failure()),
+                                    cause,
+                                    Some(failure),
                                     last_heartbeat_details,
                                 )
                                 .await
@@ -453,10 +529,15 @@ impl WorkerActivityTasks {
                                 Ok(_) => None,
                                 Err(e) => {
                                     if let Some(violation) = payload_limit_violation_from(&e) {
-                                        act_metrics.act_execution_failed();
+                                        act_metrics
+                                            .with_new_attrs([failure_reason(
+                                                FailureReason::PayloadsTooLarge,
+                                            )])
+                                            .act_execution_failed();
                                         client
                                             .fail_activity_task(
                                                 task_token.clone(),
+                                                ActivityTaskFailedCause::PayloadsTooLarge,
                                                 Some(make_payloads_too_large_failure(violation)),
                                                 last_heartbeat_details,
                                             )
@@ -487,8 +568,6 @@ impl WorkerActivityTasks {
                 &task_token
             );
         }
-
-        self.complete_notify.notify_waiters();
     }
 
     /// Attempt to record an activity heartbeat
@@ -499,8 +578,9 @@ impl WorkerActivityTasks {
         // TODO: Propagate these back as cancels. Silent fails is too nonobvious
         let (heartbeat_timeout, timeout_resetter) = {
             let mut outstanding_activity_tasks = self.outstanding_activity_tasks.lock();
+            let task_token: TaskToken = details.task_token.clone().into();
             let at_info = outstanding_activity_tasks
-                .get_mut(&TaskToken(details.task_token.clone()))
+                .get_mut(&task_token)
                 .ok_or(ActivityHeartbeatError::UnknownActivity)?;
             at_info.last_heartbeat_details = Some(details.details.clone());
             (at_info.heartbeat_timeout, at_info.timeout_resetter.clone())
@@ -566,7 +646,7 @@ struct ActivityTaskStream<SrcStrm> {
     source_stream: SrcStrm,
     outstanding_tasks: OutstandingActMap,
     start_tasks_stream_complete: CancellationToken,
-    complete_notify: Arc<Notify>,
+    completions_in_flight: watch::Receiver<usize>,
     grace_period: Option<Duration>,
     cancels_tx: UnboundedSender<PendingActivityCancel>,
     /// The extra time we'll wait for local timeouts before firing them, to avoid racing with server
@@ -611,7 +691,7 @@ where
                                         details.known_not_found = true;
                                     }
                                     Some(Ok(ActivityTask::cancel_from_ids(
-                                        next_pc.task_token.0,
+                                        next_pc.task_token.into_inner(),
                                         next_pc.reason,
                                         next_pc.details,
                                     )))
@@ -745,11 +825,23 @@ where
                 join!(
                     async {
                         self.start_tasks_stream_complete.cancelled().await;
-                        while {
-                            let outstanding_tasks = outstanding_tasks_clone.lock();
-                            !outstanding_tasks.is_empty()
-                        } {
-                            self.complete_notify.notified().await
+                        let mut completions_in_flight = self.completions_in_flight;
+                        loop {
+                            let no_outstanding = outstanding_tasks_clone.lock().is_empty();
+                            // An empty map alone isn't "all activities finished": completions
+                            // flushing to server have already left the map but still hold their
+                            // slot permit, and still need the heartbeat manager alive. Tasks only
+                            // ever leave the map inside a counted completion, so every relevant
+                            // transition ends in a counter change and waiting on the counter
+                            // alone can't miss one.
+                            if no_outstanding && *completions_in_flight.borrow_and_update() == 0 {
+                                break;
+                            }
+                            if completions_in_flight.changed().await.is_err() {
+                                // Sender closed: the manager (and any completion guards, which
+                                // hold sender clones) are gone, so nothing further can flush.
+                                break;
+                            }
                         }
                         // If we were waiting for the grace period but everything already finished,
                         // we don't need to keep waiting.
@@ -805,6 +897,26 @@ fn worker_shutdown_failure() -> Failure {
             },
         )),
     }
+}
+
+/// Validates final heartbeat details against the worker's payload error limits, since attaching
+/// oversized details to a failure request would make the server reject the request as a whole.
+fn heartbeat_details_limit_violation(
+    details: &Payloads,
+    limits: Option<PayloadErrorLimits>,
+) -> Option<PayloadLimitViolation> {
+    let limits = limits?;
+    validate_known_payload_limits(
+        &RecordActivityTaskHeartbeatRequest {
+            details: Some(details.clone()),
+            ..Default::default()
+        },
+        &PayloadLimits {
+            blob_error: limits.blob,
+            memo_error: limits.memo,
+            ..Default::default()
+        },
+    )
 }
 
 /// The failure is deliberately retryable: catching the violation client-side exists precisely to
@@ -1057,13 +1169,13 @@ mod tests {
         shutdown_token.cancel();
         // Need to complete the tasks so shutdown will resolve
         atm.complete(
-            TaskToken(t1.task_token),
+            t1.task_token.into(),
             ActivityExecutionResult::ok(vec![1].into()).status.unwrap(),
             mock_client.as_ref(),
         )
         .await;
         atm.complete(
-            TaskToken(t2.task_token),
+            t2.task_token.into(),
             ActivityExecutionResult::ok(vec![1].into()).status.unwrap(),
             mock_client.as_ref(),
         )
@@ -1126,7 +1238,7 @@ mod tests {
             // Make sure it didn't take wayyy too long. Our long timeouts specified above are huge
             assert!(start.elapsed() < Duration::from_secs(5));
             atm.complete(
-                TaskToken(t.task_token),
+                t.task_token.into(),
                 ActivityExecutionResult::fail("unimportant".into())
                     .status
                     .unwrap(),
@@ -1191,7 +1303,7 @@ mod tests {
         join!(heartbeater, poller);
 
         atm.complete(
-            TaskToken(t.task_token),
+            t.task_token.into(),
             ActivityExecutionResult::fail("unimportant".into())
                 .status
                 .unwrap(),
@@ -1259,7 +1371,7 @@ mod tests {
         assert!(activity_task.is_timeout());
 
         atm.complete(
-            TaskToken(t.task_token),
+            t.task_token.into(),
             ActivityExecutionResult::fail("unimportant".into())
                 .status
                 .unwrap(),

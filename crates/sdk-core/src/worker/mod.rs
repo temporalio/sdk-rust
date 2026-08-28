@@ -319,16 +319,16 @@ impl WorkerConfig {
 
     pub(crate) fn computed_deployment_version(&self) -> Option<WorkerDeploymentVersion> {
         let wdv = match self.versioning_strategy {
-            WorkerVersioningStrategy::None { ref build_id } => WorkerDeploymentVersion {
-                deployment_name: "".to_owned(),
-                build_id: build_id.clone(),
-            },
+            WorkerVersioningStrategy::None { ref build_id } => WorkerDeploymentVersion::builder()
+                .deployment_name("")
+                .build_id(build_id.clone())
+                .build(),
             WorkerVersioningStrategy::WorkerDeploymentBased(ref opts) => opts.version.clone(),
             WorkerVersioningStrategy::LegacyBuildIdBased { ref build_id } => {
-                WorkerDeploymentVersion {
-                    deployment_name: "".to_owned(),
-                    build_id: build_id.clone(),
-                }
+                WorkerDeploymentVersion::builder()
+                    .deployment_name("")
+                    .build_id(build_id.clone())
+                    .build()
             }
         };
         if wdv.is_empty() { None } else { Some(wdv) }
@@ -527,6 +527,25 @@ impl NamespaceCapabilities {
     pub fn worker_commands(&self) -> bool {
         self.capabilities()
             .is_some_and(|capabilities| capabilities.worker_commands)
+    }
+
+    /// Returns true if the namespace accepts paginated `RespondWorkflowTaskCompleted` requests, so
+    /// large completions may be split across multiple page requests sharing one task token.
+    pub fn workflow_task_completion_pagination(&self) -> bool {
+        self.capabilities()
+            .is_some_and(|capabilities| capabilities.workflow_task_completion_pagination)
+    }
+
+    /// The namespace's limit on the recombined size of a paginated workflow task completion, if one
+    /// is configured. `None` when unset (the server advertises `0` for no explicit limit).
+    pub fn workflow_task_completion_size_limit(&self) -> Option<usize> {
+        self.description
+            .get()
+            .and_then(|description| description.namespace_info.as_ref())
+            .and_then(|namespace_info| namespace_info.limits.as_ref())
+            .map(|limits| limits.workflow_task_completion_size_limit_error)
+            .filter(|limit| *limit > 0)
+            .map(|limit| limit as usize)
     }
 }
 
@@ -977,7 +996,7 @@ impl Worker {
                                 shutdown_token.child_token(),
                                 Some(move |np| np_metrics.record_num_pollers(np)),
                                 nexus_last_suc_poll_time,
-                                capabilities,
+                                capabilities.clone(),
                                 shared_namespace_worker,
                             )) as BoxedNexusPoller)
                         } else {
@@ -1077,6 +1096,7 @@ impl Worker {
                             shutdown_token: shutdown_token.child_token(),
                             metrics,
                             server_capabilities: client.capabilities().unwrap_or_default(),
+                            namespace_capabilities: capabilities.clone(),
                             sdk_name: sdk_name_and_ver.0,
                             sdk_version: sdk_name_and_ver.1,
                             default_versioning_behavior: config
@@ -1142,6 +1162,15 @@ impl Worker {
             capabilities: worker_capabilities,
             shutdown_rpc_handle: Mutex::new(None),
         })
+    }
+
+    fn mark_started(&self) {
+        if self.shutdown_token.is_cancelled() {
+            return;
+        }
+        if let Some(heartbeat_manager) = self.client_worker_registrator.heartbeat_manager.as_ref() {
+            heartbeat_manager.mark_started();
+        }
     }
 
     /// Initiates async shutdown procedure, eventually ceases all polling of the server and shuts
@@ -1269,6 +1298,7 @@ impl Worker {
     /// Local activities are returned first before polling the server if there are any.
     #[instrument(skip(self))]
     pub async fn poll_activity_task(&self) -> Result<ActivityTask, PollError> {
+        self.mark_started();
         loop {
             match self.activity_poll().await.transpose() {
                 Some(r) => break r,
@@ -1382,7 +1412,7 @@ impl Worker {
     /// options.
     pub fn record_activity_heartbeat(&self, details: ActivityHeartbeat) {
         if let Some(at_mgr) = self.task_subsystems.at_task_mgr.as_ref() {
-            let tt = TaskToken(details.task_token.clone());
+            let tt: TaskToken = details.task_token.clone().into();
             if let Err(e) = at_mgr.record_heartbeat(details) {
                 warn!(task_token = %tt, details = ?e, "Activity heartbeat failed.");
             }
@@ -1398,7 +1428,7 @@ impl Worker {
         &self,
         completion: ActivityTaskCompletion,
     ) -> Result<(), CompleteActivityError> {
-        let task_token = TaskToken(completion.task_token);
+        let task_token: TaskToken = completion.task_token.into();
         let status = if let Some(s) = completion.result.and_then(|r| r.status) {
             s
         } else {
@@ -1440,6 +1470,7 @@ impl Worker {
     /// Do not call poll concurrently. It handles polling the server concurrently internally.
     #[instrument(skip(self), fields(run_id, workflow_id, task_queue=%self.config.task_queue))]
     pub async fn poll_workflow_activation(&self) -> Result<WorkflowActivation, PollError> {
+        self.mark_started();
         match self.task_subsystems.workflows.as_ref() {
             Some(workflows) => {
                 let r = workflows.next_workflow_activation().await;
@@ -1498,6 +1529,7 @@ impl Worker {
     /// Do not call poll concurrently. It handles polling the server concurrently internally.
     #[instrument(skip(self))]
     pub async fn poll_nexus_task(&self) -> Result<NexusTask, PollError> {
+        self.mark_started();
         match self.task_subsystems.nexus_mgr.as_ref() {
             Some(mgr) => mgr.next_nexus_task().await,
             None => Err(PollError::ShutDown),
@@ -1521,7 +1553,7 @@ impl Worker {
                 reason: "Nexus completion had empty status field".to_owned(),
             });
         };
-        let tt = TaskToken(completion.task_token);
+        let tt: TaskToken = completion.task_token.into();
         tracing::Span::current().record("task_token", tt.to_string());
         tracing::Span::current().record("status", status.to_string());
 
@@ -1658,7 +1690,7 @@ impl Worker {
             .client_worker_registrator
             .heartbeat_manager
             .as_ref()
-            .map(|hm| (hm.heartbeat_callback)());
+            .and_then(|hm| (hm.heartbeat_callback)());
         let handle = tokio::spawn(async move {
             match client
                 .shutdown_worker(sticky_name, task_queue, task_queue_types, heartbeat)
@@ -2272,6 +2304,7 @@ struct WorkerHeartbeatManager {
     /// Heartbeat callback
     heartbeat_callback: HeartbeatCallback,
     heartbeat_success_callback: HeartbeatSuccessCallback,
+    start_time: Arc<OnceLock<prost_types::Timestamp>>,
 }
 
 impl WorkerHeartbeatManager {
@@ -2284,10 +2317,12 @@ impl WorkerHeartbeatManager {
         capabilities: Arc<NamespaceCapabilities>,
         environment_info: Option<Arc<EnvironmentInfo>>,
     ) -> Self {
-        let start_time = Some(SystemTime::now().into());
+        let start_time = Arc::new(OnceLock::new());
+        let heartbeat_start_time = start_time.clone();
         let environment_info = Arc::new(Mutex::new(environment_info));
         let heartbeat_environment_info = environment_info.clone();
         let worker_heartbeat_callback: HeartbeatCallback = Arc::new(move || {
+            let start_time = heartbeat_start_time.get().copied()?;
             let deployment_version = config.computed_deployment_version().map(|dv| {
                 deployment::v1::WorkerDeploymentVersion {
                     deployment_name: dv.deployment_name,
@@ -2318,7 +2353,7 @@ impl WorkerHeartbeatManager {
                 deployment_version,
 
                 status: (*heartbeat_manager_metrics.status.read()) as i32,
-                start_time,
+                start_time: Some(start_time),
                 plugins,
                 drivers,
                 environment: heartbeat_environment_info.lock().as_deref().cloned(),
@@ -2431,7 +2466,7 @@ impl WorkerHeartbeatManager {
                     in_mem.local_activity_execution_failed.clone(),
                 );
             }
-            worker_heartbeat
+            Some(worker_heartbeat)
         });
         let heartbeat_success_callback: HeartbeatSuccessCallback = Arc::new(move || {
             // Take the env info because we only care about sending it one time
@@ -2443,7 +2478,12 @@ impl WorkerHeartbeatManager {
             telemetry: telemetry_instance,
             heartbeat_callback: worker_heartbeat_callback,
             heartbeat_success_callback,
+            start_time,
         }
+    }
+
+    fn mark_started(&self) {
+        let _ = self.start_time.set(SystemTime::now().into());
     }
 }
 
@@ -2759,10 +2799,12 @@ mod tests {
             .namespace("default")
             .task_queue("test-queue")
             .versioning_strategy(WorkerVersioningStrategy::WorkerDeploymentBased(
-                WorkerDeploymentOptions::new(WorkerDeploymentVersion {
-                    deployment_name: "deployment".to_string(),
-                    build_id: "1.0".to_string(),
-                })
+                WorkerDeploymentOptions::new(
+                    WorkerDeploymentVersion::builder()
+                        .deployment_name("deployment")
+                        .build_id("1.0")
+                        .build(),
+                )
                 .default_versioning_behavior(VersioningBehavior::AutoUpgrade.into())
                 .build(),
             ))

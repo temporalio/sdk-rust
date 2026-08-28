@@ -30,15 +30,13 @@ impl LaProblemWorkflow {
                 .timer_backoff_threshold(Duration::from_secs(1))
                 .build(),
         )
-        .await
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+        .await?;
         ctx.execute_activity(
             StdActivities::delay,
             Duration::from_secs(15),
             ActivityOptions::start_to_close_timeout(Duration::from_secs(20)),
         )
-        .await
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+        .await?;
         Ok(())
     }
 }

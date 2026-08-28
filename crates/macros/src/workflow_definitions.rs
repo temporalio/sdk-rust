@@ -75,10 +75,10 @@ fn generate_decode_arm(
 ) -> TokenStream2 {
     quote! {
         #handler_name => {
-            let ctx = ::temporalio_workflow::common::data_converters::SerializationContext {
-                data: &::temporalio_workflow::common::data_converters::SerializationContextData::Workflow,
+            let ctx = ::temporalio_workflow::common::data_converters::SerializationContext::new(
+                &::temporalio_workflow::common::data_converters::SerializationContextData::Workflow,
                 converter,
-            };
+            );
             let input: #input_type = <::temporalio_workflow::common::data_converters::PayloadConverter as ::temporalio_workflow::common::data_converters::GenericPayloadConverter>::from_payloads(
                 converter,
                 &ctx,

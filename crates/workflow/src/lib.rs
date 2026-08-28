@@ -17,7 +17,6 @@ pub mod __private {
 mod cancellation;
 #[doc(hidden)]
 pub mod component;
-mod memo;
 #[doc(hidden)]
 pub mod runtime;
 mod workflow_context;
@@ -25,29 +24,28 @@ pub mod workflow_interceptors;
 pub mod workflows;
 
 pub use cancellation::{WorkflowCancellationError, WorkflowCancellationToken};
-pub use memo::{MemoValue, MemoValues};
 #[doc(hidden)]
 pub use runtime::model::{CancellableID, UnblockEvent};
 pub use runtime::model::{TimerResult, WorkflowResult, WorkflowTermination};
 #[doc(hidden)]
 pub use runtime::{SdkWakeGuard, is_sdk_wake};
 pub use temporalio_common_wasm::{
-    Memo, RetryPolicy,
+    ActivityCloseTimeouts, Memo, MemoValue, MemoValues, RetryPolicy,
     error::{
         ActivityExecutionError, ChildWorkflowExecutionError, ChildWorkflowStartError, RetryState,
         TimeoutType, WorkflowSignalError,
     },
 };
 pub use workflow_context::{
-    ActivityCancellationType, ActivityCloseTimeouts, ActivityOptions, BaseWorkflowContext,
-    CancellableFuture, CancellableFutureWithReason, ChildWorkflowCancellationType,
-    ChildWorkflowOptions, ContinueAsNewOptions, ContinueAsNewVersioningBehavior,
-    ExternalWorkflowHandle, LocalActivityOptions, NamespacedWorkflowInfo,
-    NexusOperationCancellationType, NexusOperationOptions, ParentClosePolicy, Signal, SignalData,
-    SignalWorkflowOptions, StartChildWorkflowExecutionFailedCause, StartChildWorkflowOutput,
-    StartedChildWorkflow, StartedNexusOperation, SyncWorkflowContext, TimerOptions,
-    VersioningIntent, WaitConditionOptions, WorkflowContext, WorkflowContextView,
-    WorkflowIdReusePolicy, WorkflowRandomValue,
+    ActivityCancellationType, ActivityOptions, BaseWorkflowContext, CancellableFuture,
+    CancellableFutureWithReason, ChildWorkflowCancellationType, ChildWorkflowOptions,
+    ContinueAsNewOptions, ContinueAsNewVersioningBehavior, ExternalWorkflowHandle,
+    LocalActivityOptions, NamespacedWorkflowInfo, NexusOperationCancellationType,
+    NexusOperationOptions, ParentClosePolicy, SignalWorkflowOptions,
+    StartChildWorkflowExecutionFailedCause, StartChildWorkflowOutput, StartedChildWorkflow,
+    StartedNexusOperation, SyncWorkflowContext, TimerOptions, VersioningIntent,
+    WaitConditionOptions, WorkflowContext, WorkflowContextView, WorkflowIdReusePolicy,
+    WorkflowRandomValue,
 };
 #[doc(hidden)]
 pub use workflow_context::{PatchActivationCallback, PatchActivationCaller};

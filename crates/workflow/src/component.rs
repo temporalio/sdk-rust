@@ -154,8 +154,10 @@ impl wit_guest::GuestWorkflowInstance for ExportedWorkflowInstance {
                                     TerminalOutcome::Failed(failure) => {
                                         wit_types::TerminalOutcome::Failed(failure.encode_to_vec())
                                     }
-                                    TerminalOutcome::Cancelled => {
-                                        wit_types::TerminalOutcome::Cancelled
+                                    TerminalOutcome::Cancelled(details) => {
+                                        wit_types::TerminalOutcome::Cancelled(
+                                            details.map(|details| details.encode_to_vec()),
+                                        )
                                     }
                                     TerminalOutcome::ContinueAsNew(req) => {
                                         wit_types::TerminalOutcome::ContinueAsNew(

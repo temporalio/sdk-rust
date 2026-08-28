@@ -28,6 +28,9 @@ pub enum PluginTarget {
     /// Worker options.
     #[display("worker options")]
     Worker,
+    /// Workflow replayer options.
+    #[display("workflow replayer options")]
+    WorkflowReplayer,
 }
 
 /// An error applying a named plugin to a configuration target.

@@ -5,10 +5,9 @@ pub(crate) mod common;
 #[path = "heavy_tests/fuzzy_workflow.rs"]
 mod fuzzy_workflow;
 
-use crate::common::get_integ_runtime_options;
 use common::{
-    CoreWfStarter, activity_functions::StdActivities, init_integ_telem, prom_metrics, rand_6_chars,
-    workflows::LaProblemWorkflow,
+    CoreWfStarter, activity_functions::StdActivities, get_integ_runtime_options, init_integ_telem,
+    prom_metrics, rand_6_chars, workflows::LaProblemWorkflow,
 };
 use futures_util::{
     StreamExt,
@@ -32,14 +31,14 @@ use temporalio_common::{
 use temporalio_macros::{activities, workflow, workflow_methods};
 
 use temporalio_common::{
+    ActivityCloseTimeouts,
     protos::{
         coresdk::workflow_commands::ActivityCancellationType,
         temporal::api::enums::v1::WorkflowIdReusePolicy,
     },
-    worker::WorkerTaskTypes,
 };
 use temporalio_sdk::{
-    ActivityCloseTimeouts, ActivityOptions, SyncWorkflowContext, WorkflowContext, WorkflowResult,
+    ActivityOptions, SyncWorkflowContext, WorkflowContext, WorkflowResult,
     activities::{ActivityContext, ActivityError},
     workflows,
 };
@@ -60,10 +59,12 @@ impl ActivityLoadWf {
             .execute_activity(
                 StdActivities::echo,
                 input_str.clone(),
-                ActivityOptions::with_close_timeouts(ActivityCloseTimeouts::Both {
-                    start_to_close: Duration::from_secs(8),
-                    schedule_to_close: Duration::from_secs(8),
-                })
+                ActivityOptions::with_close_timeouts(
+                    ActivityCloseTimeouts::ScheduleAndStartToClose {
+                        start_to_close: Duration::from_secs(8),
+                        schedule_to_close: Duration::from_secs(8),
+                    },
+                )
                 .activity_id("act-1".to_string())
                 .task_queue(tq)
                 .schedule_to_start_timeout(Duration::from_secs(8))
@@ -87,11 +88,14 @@ async fn activity_load() {
     starter.sdk_config.tuner =
         Arc::new(TunerHolder::fixed_size(CONCURRENCY, CONCURRENCY, 100, 100));
     starter.sdk_config.register_activities(StdActivities);
+    starter
+        .sdk_config
+        .register_workflow::<ActivityLoadWf>()
+        .unwrap();
     let task_queue = starter.get_task_queue().to_owned();
     let mut worker = starter.worker().await;
 
     let starting = Instant::now();
-    worker.register_workflow::<ActivityLoadWf>().unwrap();
     join_all((0..CONCURRENCY).map(|i| {
         let worker = &worker;
         let wf_id = format!("activity_load_{i}");
@@ -177,11 +181,14 @@ async fn chunky_activities_resource_based() {
     starter.sdk_config.tuner = Arc::new(tuner);
 
     starter.sdk_config.register_activities(ChunkyActivities);
+    starter
+        .sdk_config
+        .register_workflow::<ChunkyActivityWf>()
+        .unwrap();
     let task_queue = starter.get_task_queue().to_owned();
     let mut worker = starter.worker().await;
 
     let starting = Instant::now();
-    worker.register_workflow::<ChunkyActivityWf>().unwrap();
     join_all((0..WORKFLOWS).map(|i| {
         let worker = &worker;
         let wf_id = format!("chunk_activity_{i}");
@@ -251,8 +258,11 @@ async fn workflow_load() {
     starter.sdk_config.tuner = Arc::new(TunerHolder::fixed_size(5, 100, 100, 100));
     starter.sdk_config.register_activities(StdActivities);
     let task_queue = starter.get_task_queue().to_owned();
+    starter
+        .sdk_config
+        .register_workflow::<WorkflowLoadWf>()
+        .unwrap();
     let mut worker = starter.worker().await;
-    worker.register_workflow::<WorkflowLoadWf>().unwrap();
 
     let mut workflow_handles = vec![];
     for i in 0..num_workflows {
@@ -303,12 +313,14 @@ async fn evict_while_la_running_no_interference() {
     // starter.max_wft(20);
     starter.sdk_config.tuner = Arc::new(TunerHolder::fixed_size(100, 10, 20, 1));
     starter.sdk_config.register_activities(StdActivities);
+    starter
+        .sdk_config
+        .register_workflow::<LaProblemWorkflow>()
+        .unwrap();
     let task_queue = starter.get_task_queue().to_owned();
     let mut worker = starter.worker().await;
 
-    worker.register_workflow::<LaProblemWorkflow>().unwrap();
-
-    let client = starter.get_client().await;
+    let client = starter.get_core_client().await;
     let subfs = FuturesUnordered::new();
     for i in 1..100 {
         let wf_id = format!("{wf_name}-{i}");
@@ -326,20 +338,19 @@ async fn evict_while_la_running_no_interference() {
         subfs.push(async move {
             tokio::time::sleep(Duration::from_secs(1)).await;
             cw.request_workflow_eviction(&run_id);
-            WorkflowExecutionInfo {
-                namespace: client.namespace(),
-                workflow_id: wf_id,
-                run_id: Some(run_id),
-                first_execution_run_id: None,
-            }
-            .bind_untyped(client)
-            .signal(
-                UntypedSignal::new("whaatever"),
-                RawValue::empty(),
-                WorkflowSignalOptions::default(),
-            )
-            .await
-            .unwrap();
+            WorkflowExecutionInfo::builder()
+                .namespace(client.namespace())
+                .workflow_id(wf_id)
+                .maybe_run_id(Some(run_id))
+                .build()
+                .bind_untyped(client)
+                .signal(
+                    UntypedSignal::new("whaatever"),
+                    RawValue::empty(),
+                    WorkflowSignalOptions::default(),
+                )
+                .await
+                .unwrap();
         });
     }
     let runf = async {
@@ -371,13 +382,13 @@ impl ManyParallelTimersLonghistWf {
 async fn can_paginate_long_history() {
     let wf_name = "can_paginate_long_history";
     let mut starter = CoreWfStarter::new(wf_name);
-    starter.sdk_config.task_types = WorkerTaskTypes::workflow_only();
     starter.sdk_config.max_cached_workflows = 0;
-
-    let mut worker = starter.worker().await;
-    worker
+    starter
+        .sdk_config
         .register_workflow::<ManyParallelTimersLonghistWf>()
         .unwrap();
+
+    let mut worker = starter.worker().await;
     let task_queue = starter.get_task_queue().to_owned();
     let handle = worker
         .submit_workflow(
@@ -388,15 +399,14 @@ async fn can_paginate_long_history() {
         .await
         .unwrap();
     let run_id = handle.run_id().unwrap().to_owned();
-    let client = starter.get_client().await;
+    let client = starter.get_core_client().await;
     tokio::spawn(async move {
-        let handle = WorkflowExecutionInfo {
-            namespace: client.namespace(),
-            workflow_id: wf_name.into(),
-            run_id: Some(run_id),
-            first_execution_run_id: None,
-        }
-        .bind_untyped(client);
+        let handle = WorkflowExecutionInfo::builder()
+            .namespace(client.namespace())
+            .workflow_id(wf_name)
+            .maybe_run_id(Some(run_id))
+            .build()
+            .bind_untyped(client);
         loop {
             for _ in 0..10 {
                 handle
@@ -470,10 +480,13 @@ async fn poller_autoscaling_basic_loadtest() {
     });
 
     starter.sdk_config.register_activities(JitteryActivities);
+    starter
+        .sdk_config
+        .register_workflow::<PollerLoadWf>()
+        .unwrap();
     let mut worker = starter.worker().await;
     let shutdown_handle = worker.inner_mut().shutdown_handle();
-    worker.register_workflow::<PollerLoadWf>().unwrap();
-    let client = starter.get_client().await;
+    let client = starter.get_core_client().await;
 
     let task_queue = starter.get_task_queue().to_owned();
     let mut workflow_handles = vec![];

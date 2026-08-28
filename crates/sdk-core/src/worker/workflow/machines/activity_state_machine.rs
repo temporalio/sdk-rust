@@ -7,7 +7,10 @@ use super::{
 use crate::{
     abstractions::dbg_panic,
     internal_flags::CoreInternalFlags,
-    worker::workflow::{InternalFlagsRef, fatal, machines::HistEventData, nondeterminism},
+    worker::workflow::{
+        CommandAnnotations, InternalFlagsRef, ProtoCommandExt, fatal, machines::HistEventData,
+        nondeterminism,
+    },
 };
 use std::convert::{TryFrom, TryInto};
 use temporalio_common::protos::{
@@ -112,6 +115,7 @@ impl ActivityMachine {
         attrs: ScheduleActivity,
         internal_flags: InternalFlagsRef,
         use_compatible_version: bool,
+        annotations: CommandAnnotations,
     ) -> NewMachineWithCommand {
         let mut s = Self::from_parts(
             Created {}.into(),
@@ -123,6 +127,7 @@ impl ActivityMachine {
                 scheduled_event_id: 0,
                 started_event_id: 0,
                 cancelled_before_sent: false,
+                annotations,
             },
         );
         OnEventWrapper::on_event_mut(&mut s, ActivityMachineEvents::Schedule)
@@ -164,7 +169,11 @@ impl ActivityMachine {
         }
     }
 
-    pub(super) fn cancel(&mut self) -> Result<Vec<MachineResponse>, MachineError<WFMachinesError>> {
+    pub(super) fn cancel(
+        &mut self,
+        annotations: CommandAnnotations,
+    ) -> Result<Vec<MachineResponse>, MachineError<WFMachinesError>> {
+        self.shared_state.annotations.override_with(annotations);
         if matches!(
             self.state(),
             ActivityMachineState::Completed(_)
@@ -315,6 +324,7 @@ impl WFMachinesAdapter for ActivityMachine {
                         result: Some(ActivityResolution {
                             status: Some(activity_resolution::Status::Failed(ar::Failure {
                                 failure: Some(failure),
+                                ..Default::default()
                             })),
                         }),
                         is_local: false,
@@ -352,6 +362,7 @@ pub(super) struct SharedState {
     cancellation_type: ActivityCancellationType,
     cancelled_before_sent: bool,
     internal_flags: InternalFlagsRef,
+    annotations: CommandAnnotations,
 }
 
 #[derive(Default, Clone)]
@@ -790,18 +801,14 @@ fn create_request_cancel_activity_task_command<S>(
 where
     S: Into<ActivityMachineState>,
 {
-    let cmd = Command {
-        command_type: CommandType::RequestCancelActivityTask as i32,
-        attributes: Some(
-            command::Attributes::RequestCancelActivityTaskCommandAttributes(
-                RequestCancelActivityTaskCommandAttributes {
-                    scheduled_event_id: dat.scheduled_event_id,
-                },
-            ),
+    let cmd = Command::new(
+        command::Attributes::RequestCancelActivityTaskCommandAttributes(
+            RequestCancelActivityTaskCommandAttributes {
+                scheduled_event_id: dat.scheduled_event_id,
+            },
         ),
-        user_metadata: Default::default(),
-        event_group_markers: vec![],
-    };
+        dat.annotations.clone(),
+    );
     ActivityMachineTransition::ok(
         vec![ActivityMachineCommand::RequestCancellation(cmd)],
         next_state,
@@ -937,9 +944,10 @@ mod test {
                     cancellation_type: Default::default(),
                     cancelled_before_sent: false,
                     internal_flags: Rc::new(RefCell::new(InternalFlags::default())),
+                    annotations: Default::default(),
                 },
             );
-            let cmds = s.cancel().unwrap();
+            let cmds = s.cancel(Default::default()).unwrap();
             assert_eq!(cmds.len(), 0);
             assert_eq!(discriminant(&state), discriminant(s.state()));
         }
@@ -956,13 +964,14 @@ mod test {
             },
             Rc::new(RefCell::new(InternalFlags::default())),
             true,
+            Default::default(),
         );
         let mut s = if let Machines::ActivityMachine(am) = s.machine {
             am
         } else {
             panic!("Wrong machine type");
         };
-        let cmds = s.cancel().unwrap();
+        let cmds = s.cancel(Default::default()).unwrap();
         // We should always be notifying lang that the activity got cancelled, even if it's
         // abandoned and we aren't telling server
         assert_matches!(

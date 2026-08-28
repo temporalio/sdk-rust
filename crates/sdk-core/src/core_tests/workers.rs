@@ -146,7 +146,7 @@ async fn worker_shutdown_during_poll_doesnt_deadlock() {
     let mut mock_client = mock_worker_client();
     mock_client
         .expect_complete_workflow_task()
-        .returning(|_| Ok(RespondWorkflowTaskCompletedResponse::default()));
+        .returning(|_, _| Ok(RespondWorkflowTaskCompletedResponse::default()));
     let worker = mock_worker(MocksHolder::from_mock_worker(mock_client, mw));
     let pollfut = worker.poll_workflow_activation();
     let shutdownfut = async {
@@ -206,7 +206,7 @@ async fn complete_with_task_not_found_during_shutdown() {
     let mut mock = mock_worker_client();
     mock.expect_complete_workflow_task()
         .times(1)
-        .returning(|_| Err(tonic::Status::not_found("Workflow task not found.")));
+        .returning(|_, _| Err(tonic::Status::not_found("Workflow task not found.")));
     let mh = MockPollCfg::from_resp_batches("fakeid", t, [1], mock);
     let core = mock_worker(build_mock_pollers(mh));
 
@@ -277,7 +277,7 @@ async fn worker_does_not_panic_on_retry_exhaustion_of_nonfatal_net_err() {
     // Return a failure that counts as retryable, and hence we want to be swallowed
     mock.expect_complete_workflow_task()
         .times(1)
-        .returning(|_| Err(tonic::Status::internal("Some retryable error")));
+        .returning(|_, _| Err(tonic::Status::internal("Some retryable error")));
     let mut mh =
         MockPollCfg::from_resp_batches("fakeid", t, [1.into(), ResponseType::AllHistory], mock);
     mh.enforce_correct_number_of_polls = false;
@@ -1291,7 +1291,7 @@ async fn graceful_shutdown_sends_shutdown_worker_rpc_during_initiate() {
         });
     mock_client
         .expect_complete_workflow_task()
-        .returning(|_| Ok(RespondWorkflowTaskCompletedResponse::default()));
+        .returning(|_, _| Ok(RespondWorkflowTaskCompletedResponse::default()));
 
     // Polls block until shutdown_worker RPC releases them (simulating server holding polls
     // open until it receives the ShutdownWorker signal)

@@ -17,7 +17,7 @@ use context::Context;
 use prost::Message;
 use std::{
     collections::HashMap,
-    sync::{Arc, LazyLock, Mutex},
+    sync::{Arc, LazyLock, Mutex, PoisonError},
 };
 use temporalio_common::protos::temporal::api::{
     failure::v1::Failure,
@@ -30,8 +30,13 @@ use temporalio_common::protos::temporal::api::{
 mod context;
 mod utils;
 
+static EPHEMERAL_SERVER_TEST_MUTEX: Mutex<()> = Mutex::new(());
+
 #[test]
 fn test_get_system_info() {
+    let _server_guard = EPHEMERAL_SERVER_TEST_MUTEX
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
     Context::with(|context| {
         context.runtime_new().unwrap();
         context
@@ -82,6 +87,9 @@ fn rpc_call_exists(context: &Arc<Context>, service: RpcService, rpc: &str) -> bo
 
 #[test]
 fn test_missing_rpc_call_has_expected_error_message() {
+    let _server_guard = EPHEMERAL_SERVER_TEST_MUTEX
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
     Context::with(|context| {
         context.runtime_new().unwrap();
         context
@@ -146,6 +154,9 @@ fn all_rpc_calls_exist(context: &Arc<Context>, service: RpcService, proto: &str)
 
 #[test]
 fn test_all_rpc_calls_exist() {
+    let _server_guard = EPHEMERAL_SERVER_TEST_MUTEX
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
     Context::with(|context| {
         context.runtime_new().unwrap();
         context

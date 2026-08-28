@@ -62,7 +62,26 @@ Documentation can be generated with `cargo doc`.
 - Keep commit messages short and in the imperative mood.
 - Provide a clear PR description outlining what changed and why.
 - Reviewers expect new features or fixes to include corresponding tests when applicable.
-- Always add an entry to CHANGELOG.md for each relevant change in a PR.
+- Always add a changelog entry for each user-facing change in a PR, under the `## Unreleased`
+  heading and never under a released version heading. The two changelogs are split by audience:
+  the repository-root `CHANGELOG.md` serves users of the Rust SDK, and
+  `crates/sdk-core/CHANGELOG.md` serves users of the other Temporal SDKs, whose workers and
+  clients run on Core.
+- The test for either file is whether a user of that SDK can observe the change: different
+  behavior, an option they can set, a new log or metric, a different interaction with the server.
+  Ask what the user sees, not which crate or which files the PR touched.
+- The Rust SDK runs on Core too, so a user-observable change in Core behavior normally belongs in
+  both files, worded for each audience. What belongs only in the sdk-core changelog is what only
+  the other SDKs' users can see — a Core capability the Rust SDK does not surface, or a C-bridge
+  change. Conversely, an internal Rust API change that a language SDK absorbs inside its own
+  bridge, without its users noticing, belongs in neither file. This applies to the crates Core
+  shares as well: `temporalio-client`, `temporalio-common`, `temporalio-common-wasm`,
+  `temporalio-macros`, and `temporalio-protos`.
+- Write each entry from the perspective of the file's audience, and word a change that goes in
+  both files separately for each rather than copying it verbatim. The root changelog should not
+  describe Core internals or bridge-only APIs, and the sdk-core changelog should not name Rust
+  identifiers its readers cannot call. The comment at the top of either file lists the available
+  headings.
 
 ## Review Checklist
 

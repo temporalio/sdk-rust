@@ -1,14 +1,11 @@
-use crate::common::{CoreWfStarter, build_fake_sdk};
+use crate::common::CoreWfStarter;
 use temporalio_client::WorkflowStartOptions;
-use temporalio_common::{
-    protos::{
-        coresdk::common::NamespacedWorkflowExecution,
-        temporal::api::enums::v1::{CommandType, EventType},
-    },
-    worker::WorkerTaskTypes,
+use temporalio_common::protos::{
+    coresdk::common::NamespacedWorkflowExecution,
+    temporal::api::enums::v1::{CommandType, EventType},
 };
 use temporalio_macros::{workflow, workflow_methods};
-use temporalio_sdk::{WorkflowContext, WorkflowResult};
+use temporalio_sdk::{ApplicationFailure, WorkflowContext, WorkflowResult};
 use temporalio_sdk_core::{
     replay::{DEFAULT_WORKFLOW_TYPE, TestHistoryBuilder},
     test_help::MockPollCfg,
@@ -47,10 +44,15 @@ impl CancelReceiver {
 #[tokio::test]
 async fn sends_cancel_to_other_wf() {
     let mut starter = CoreWfStarter::new("sends_cancel_to_other_wf");
-    starter.sdk_config.task_types = WorkerTaskTypes::workflow_only();
+    starter
+        .sdk_config
+        .register_workflow::<CancelSender>()
+        .unwrap();
+    starter
+        .sdk_config
+        .register_workflow::<CancelReceiver>()
+        .unwrap();
     let mut worker = starter.worker().await;
-    worker.register_workflow::<CancelSender>().unwrap();
-    worker.register_workflow::<CancelReceiver>().unwrap();
 
     let task_queue = starter.get_task_queue().to_owned();
     let receiver_wfid = "sends-cancel-receiver";
@@ -102,7 +104,7 @@ impl CancelSenderCanned {
         let handle = ctx.external_workflow("fake_wid", Some("fake_rid".into()));
         let res = handle.cancel(None).await;
         if res.is_err() {
-            Err(anyhow::anyhow!("Cancel fail!").into())
+            Err(ApplicationFailure::new("Cancel fail!").into())
         } else {
             Ok(())
         }
@@ -157,7 +159,8 @@ async fn sends_cancel_canned(#[case] fails: bool) {
                 }
             });
     });
-    let mut worker = build_fake_sdk(mock_cfg);
-    worker.register_workflow::<CancelSenderCanned>().unwrap();
+    let mut worker = crate::common::build_fake_sdk_with_options(mock_cfg, |options| {
+        options.register_workflow::<CancelSenderCanned>().unwrap();
+    });
     worker.run().await.unwrap();
 }

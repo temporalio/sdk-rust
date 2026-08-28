@@ -2,7 +2,9 @@ use crate::{
     MetricsContext, TaskToken,
     abstractions::{MeteredPermitDealer, OwnedMeteredSemPermit, UsedMeteredSemPermit, dbg_panic},
     protosext::ValidScheduleLA,
-    telemetry::metrics::{activity_type, should_record_failure_metric, workflow_type},
+    telemetry::metrics::{
+        FailureReason, activity_type, failure_reason, should_record_failure_metric, workflow_type,
+    },
     worker::{LocalActivitySlotKind, workflow::HeartbeatTimeoutMsg},
 };
 use futures_util::{
@@ -80,6 +82,7 @@ impl LocalActivityExecutionResult {
                 )),
                 ..Default::default()
             }),
+            ..Default::default()
         })
     }
 
@@ -528,7 +531,7 @@ impl LocalActivityManager {
                 ])
                 .la_executed();
             return Some(NextPendingLAAction::Dispatch(ActivityTask {
-                task_token: tt.0,
+                task_token: tt.into_inner(),
                 variant: Some(activity_task::Variant::Start(Start {
                     workflow_namespace: self.namespace.clone(),
                     workflow_type: new_la.workflow_type,
@@ -612,14 +615,18 @@ impl LocalActivityManager {
             let outcome = match &status {
                 LocalActivityExecutionResult::Failed(fail) => {
                     if should_record_failure_metric(&fail.failure) {
-                        la_metrics.la_execution_failed()
+                        la_metrics
+                            .with_new_attrs([failure_reason(fail.cause().into())])
+                            .la_execution_failed()
                     }
                     Outcome::FailurePath {
                         backoff: calc_backoff!(fail),
                     }
                 }
                 LocalActivityExecutionResult::TimedOut(fail) => {
-                    la_metrics.la_execution_failed();
+                    la_metrics
+                        .with_new_attrs([failure_reason(FailureReason::Timeout)])
+                        .la_execution_failed();
                     is_timeout = true;
                     // Start to close timeouts are retryable, other timeout types aren't.
                     if matches!(status.get_timeout_type(), Some(TimeoutType::StartToClose)) {
@@ -658,7 +665,7 @@ impl LocalActivityManager {
             // We want to generate a cancel task if the reason for failure was a timeout.
             let task = if is_timeout {
                 Some(ActivityTask::cancel_from_ids(
-                    task_token.clone().0,
+                    task_token.clone().into_inner(),
                     ActivityCancelReason::TimedOut,
                     ActivityTask::primary_reason_to_cancellation_details(
                         ActivityCancelReason::TimedOut,
@@ -818,7 +825,7 @@ impl LocalActivityManager {
 
         self.cancels_req_tx
             .send(CancelOrTimeout::Cancel(ActivityTask::cancel_from_ids(
-                lai.task_token.0.clone(),
+                lai.task_token.clone().into_inner(),
                 ActivityCancelReason::Cancelled,
                 ActivityTask::primary_reason_to_cancellation_details(
                     ActivityCancelReason::Cancelled,
@@ -1055,7 +1062,7 @@ mod tests {
                 activity_task::Variant::Start(Start {activity_id, ..})
                     if activity_id == i.to_string()
             );
-            let next_tt = TaskToken(next.task_token);
+            let next_tt: TaskToken = next.task_token.into();
             let complete_branch = async {
                 lam.complete(
                     &next_tt,
@@ -1090,7 +1097,7 @@ mod tests {
         lam.workflows_have_shutdown();
 
         let task = lam.next_pending().await.unwrap().unwrap();
-        let task_token = TaskToken(task.task_token);
+        let task_token: TaskToken = task.task_token.into();
         lam.complete(
             &task_token,
             LocalActivityExecutionResult::Completed(Default::default()),
@@ -1114,7 +1121,7 @@ mod tests {
         .into()]);
 
         let next = lam.next_pending().await.unwrap().unwrap();
-        let tt = TaskToken(next.task_token);
+        let tt: TaskToken = next.task_token.into();
         tokio::select! {
             biased;
 
@@ -1235,7 +1242,7 @@ mod tests {
         .into()]);
 
         let next = lam.next_pending().await.unwrap().unwrap();
-        let tt = TaskToken(next.task_token);
+        let tt: TaskToken = next.task_token.into();
         let res = lam.complete(
             &tt,
             LocalActivityExecutionResult::Failed(Default::default()),
@@ -1270,7 +1277,7 @@ mod tests {
         .into()]);
 
         let next = lam.next_pending().await.unwrap().unwrap();
-        let tt = TaskToken(next.task_token);
+        let tt: TaskToken = next.task_token.into();
         let res = lam.complete(
             &tt,
             LocalActivityExecutionResult::Failed(ActFail {
@@ -1284,6 +1291,7 @@ mod tests {
                     )),
                     ..Default::default()
                 }),
+                ..Default::default()
             }),
         );
         assert_matches!(res, LACompleteAction::Report { .. });
@@ -1317,7 +1325,7 @@ mod tests {
         .into()]);
 
         let next = lam.next_pending().await.unwrap().unwrap();
-        let tt = TaskToken(next.task_token);
+        let tt: TaskToken = next.task_token.into();
         lam.complete(
             &tt,
             LocalActivityExecutionResult::Failed(Default::default()),
@@ -1364,7 +1372,7 @@ mod tests {
         .into()]);
 
         let next = lam.next_pending().await.unwrap().unwrap();
-        let tt = TaskToken(next.task_token);
+        let tt: TaskToken = next.task_token.into();
         lam.complete(
             &tt,
             LocalActivityExecutionResult::Failed(Default::default()),
@@ -1516,7 +1524,7 @@ mod tests {
         let spinfail = || async {
             for _ in 1..=10 {
                 let next = lam.next_pending().await.unwrap().unwrap();
-                let tt = TaskToken(next.task_token);
+                let tt: TaskToken = next.task_token.into();
                 lam.complete(
                     &tt,
                     LocalActivityExecutionResult::Failed(Default::default()),
