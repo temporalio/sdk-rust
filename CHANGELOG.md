@@ -138,6 +138,9 @@ relevant information.
 * `DefaultFailureConverter::new(true)` moves failure messages and stack traces into encoded
   attributes so payload codecs can encrypt them.
 * `LocalActivityOptions::include_arguments_in_marker` allows Rust workflows to opt in to
+* The experimental `temporalio-sdk-aws-lambda` crate runs a versioned Rust SDK Worker for each AWS
+  Lambda invocation with Lambda-oriented concurrency defaults and deadline-aware graceful shutdown.
+* `LocalActivityOptions::include_arguments_into_marker` allows Rust workflows to opt in to
   recording local activity arguments in Workflow history.
 * `WorkflowContext::random_stream`, `SyncWorkflowContext::random_stream`, and
   `WorkflowInterceptorContext::random_stream` provide deterministic, workflow-run-scoped
