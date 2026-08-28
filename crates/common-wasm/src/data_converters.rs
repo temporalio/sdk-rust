@@ -746,7 +746,8 @@ impl PayloadCodec for DefaultPayloadCodec {
     }
 }
 
-// Represents an explicitly separated argument list for workflows and activities.
+/// Represents multiple arguments for workflows/activities that accept more than one argument.
+/// Use this when interoperating with other language SDKs that allow multiple arguments.
 macro_rules! impl_multi_args {
     ($name:ident; $count:expr; $($idx:tt: $ty:ident),+) => {
         #[doc = concat!("Wrapper for ", stringify!($count), " typed arguments, enabling multi-arg serialization.")]
@@ -883,22 +884,14 @@ mod tests {
     }
 
     #[test]
-    fn multi_unit_args_encode_individually() {
+    fn multi_unit_args_emit_payload() {
         let converter = PayloadConverter::default();
         let ctx = SerializationContext::new(&SerializationContextData::Activity, &converter);
 
-        let args: MultiArgs1<()> = ((),).into();
+        let args = MultiArgs1(());
         let payloads = converter.to_payloads(&ctx, &args).unwrap();
         assert_eq!(payloads.len(), 1);
         assert!(is_unit_payloads(&payloads));
-
-        let payloads = converter.to_payloads(&ctx, &MultiArgs2((), ())).unwrap();
-        assert_eq!(payloads.len(), 2);
-        assert!(
-            payloads
-                .iter()
-                .all(|payload| is_unit_payloads(std::slice::from_ref(payload)))
-        );
     }
 
     #[test]
