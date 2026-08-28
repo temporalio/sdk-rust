@@ -34,6 +34,8 @@ relevant information.
 ## Unreleased
 
 ### Added
+* `MultiArgs1<T>` explicitly serializes one endpoint argument. Use `MultiArgs1(())` to send a
+  single `binary/null` payload; bare `()` continues to represent no arguments.
 * `LocalActivityOptions::include_arguments_into_marker` allows Rust workflows to opt in to
   recording local activity arguments in Workflow history.
 * `WorkflowContext::all_handlers_finished` and `SyncWorkflowContext::all_handlers_finished` let

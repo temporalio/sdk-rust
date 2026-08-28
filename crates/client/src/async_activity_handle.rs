@@ -160,7 +160,8 @@ impl<CT: WorkflowService + NamespacedClient + Clone> AsyncActivityHandle<CT> {
                 > {
                     Box::pin(async move {
                         let (identifier, result, rpc_options) = input.into_parts();
-                        let result = encode_optional_value(result, client.data_converter()).await?;
+                        let result =
+                            encode_optional_value(result, client.data_converter()).await?;
                         if let ActivityIdentifier::TaskToken(token) = identifier {
                             let mut request = RespondActivityTaskCompletedRequest {
                                 task_token: token.into_inner(),
@@ -318,7 +319,8 @@ impl<CT: WorkflowService + NamespacedClient + Clone> AsyncActivityHandle<CT> {
                 > {
                     Box::pin(async move {
                         let (identifier, details, rpc_options) = input.into_parts();
-                        let details = encode_optional_value(details, client.data_converter()).await?;
+                        let details =
+                            encode_optional_value(details, client.data_converter()).await?;
                         if let ActivityIdentifier::TaskToken(token) = identifier {
                             let mut request = RespondActivityTaskCanceledRequest {
                                 task_token: token.into_inner(),
@@ -386,7 +388,8 @@ impl<CT: WorkflowService + NamespacedClient + Clone> AsyncActivityHandle<CT> {
                 > {
                     Box::pin(async move {
                         let (identifier, details, rpc_options) = input.into_parts();
-                        let details = encode_optional_value(details, client.data_converter()).await?;
+                        let details =
+                            encode_optional_value(details, client.data_converter()).await?;
                         if let ActivityIdentifier::TaskToken(token) = identifier {
                             let mut request = RecordActivityTaskHeartbeatRequest {
                                 task_token: token.into_inner(),

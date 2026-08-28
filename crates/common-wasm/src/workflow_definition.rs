@@ -4,6 +4,11 @@ use crate::data_converters::{RawValue, TemporalDeserializable, TemporalSerializa
 ///
 /// Typically, you will want to use the `#[workflow]` and `#[workflow_methods]` macros to define
 /// workflows. However, this trait may be implemented manually if desired.
+///
+/// Foreign workflows can use argument-list wrappers to model SDKs that accept one or more explicit
+/// arguments. In particular, use
+/// [`MultiArgs1<()>`](crate::data_converters::MultiArgs1) to send a single unit argument because
+/// bare `()` represents no arguments.
 pub trait WorkflowDefinition {
     /// Type of the input argument to the workflow
     type Input: TemporalDeserializable + TemporalSerializable + 'static;
