@@ -488,15 +488,7 @@ impl GenericPayloadConverter for PayloadConverter {
     ) -> Result<Payload, PayloadConversionError> {
         // If a single payload is explicitly needed for `()`, then produce a null payload
         if std::any::TypeId::of::<T>() == std::any::TypeId::of::<()>() {
-            return Ok(Payload {
-                metadata: {
-                    let mut hm = HashMap::new();
-                    hm.insert("encoding".to_string(), b"binary/null".to_vec());
-                    hm
-                },
-                data: vec![],
-                external_payloads: vec![],
-            });
+            return Ok(binary_null_payload());
         }
         let mut payloads = self.to_payloads(context, val)?;
         if payloads.len() != 1 {
@@ -578,17 +570,31 @@ impl GenericPayloadConverter for PayloadConverter {
     }
 }
 
+fn binary_null_payload() -> Payload {
+    Payload {
+        metadata: {
+            let mut hm = HashMap::new();
+            hm.insert("encoding".to_string(), b"binary/null".to_vec());
+            hm
+        },
+        data: vec![],
+        external_payloads: vec![],
+    }
+}
+
+fn is_binary_null_payload(payload: &Payload) -> bool {
+    payload.data.is_empty()
+        && payload
+            .metadata
+            .get("encoding")
+            .map(|encoding| encoding == b"binary/null")
+            .unwrap_or(false)
+}
+
 fn is_unit_payloads(payloads: &[Payload]) -> bool {
     match payloads {
         [] => true,
-        [payload] => {
-            payload.data.is_empty()
-                && payload
-                    .metadata
-                    .get("encoding")
-                    .map(|encoding| encoding == b"binary/null")
-                    .unwrap_or(false)
-        }
+        [payload] => is_binary_null_payload(payload),
         _ => false,
     }
 }
@@ -629,6 +635,9 @@ impl ErasedSerdePayloadConverter for SerdeJsonPayloadConverter {
     ) -> Result<Payload, PayloadConversionError> {
         let as_json = serde_json::to_vec(value)
             .map_err(|e| PayloadConversionError::EncodingError(e.into()))?;
+        if as_json.as_slice() == b"null" {
+            return Ok(binary_null_payload());
+        }
         Ok(Payload {
             metadata: {
                 let mut hm = HashMap::new();
@@ -646,11 +655,14 @@ impl ErasedSerdePayloadConverter for SerdeJsonPayloadConverter {
         payload: Payload,
     ) -> Result<Box<dyn erased_serde::Deserializer<'static>>, PayloadConversionError> {
         let encoding = payload.metadata.get("encoding").map(|v| v.as_slice());
-        if encoding != Some(b"json/plain".as_slice()) {
+        let json_v = if encoding == Some(b"json/plain".as_slice()) {
+            serde_json::from_slice(&payload.data)
+                .map_err(|e| PayloadConversionError::EncodingError(Box::new(e)))?
+        } else if encoding == Some(b"binary/null".as_slice()) {
+            serde_json::Value::Null
+        } else {
             return Err(PayloadConversionError::WrongEncoding);
-        }
-        let json_v: serde_json::Value = serde_json::from_slice(&payload.data)
-            .map_err(|e| PayloadConversionError::EncodingError(Box::new(e)))?;
+        };
         Ok(Box::new(<dyn erased_serde::Deserializer>::erase(json_v)))
     }
 }
@@ -880,6 +892,52 @@ mod tests {
 
         let result: MultiArgs2<String, i32> = converter.from_payloads(&ctx, payloads).unwrap();
         assert_eq!(result, args);
+    }
+
+    #[test]
+    fn option_none_uses_binary_null_and_accepts_legacy_json_null() {
+        let converter = PayloadConverter::default();
+        let ctx = SerializationContext::new(&SerializationContextData::Workflow, &converter);
+
+        let payloads = converter
+            .to_payloads(&ctx, &Option::<String>::None)
+            .unwrap();
+        assert_eq!(payloads.len(), 1);
+        assert!(is_binary_null_payload(&payloads[0]));
+
+        let result: Option<String> = converter
+            .from_payload(&ctx, payloads.into_iter().next().unwrap())
+            .unwrap();
+        assert_eq!(result, None);
+
+        let legacy_json_null = Payload {
+            metadata: HashMap::from([("encoding".to_string(), b"json/plain".to_vec())]),
+            data: b"null".to_vec(),
+            external_payloads: vec![],
+        };
+        let result: Option<String> = converter.from_payload(&ctx, legacy_json_null).unwrap();
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn non_null_option_retains_json_encoding() {
+        let converter = PayloadConverter::default();
+        let ctx = SerializationContext::new(&SerializationContextData::Workflow, &converter);
+
+        let payload = converter
+            .to_payload(&ctx, &Some("value".to_string()))
+            .unwrap();
+        assert_eq!(payload.metadata.get("encoding").unwrap(), b"json/plain");
+        assert_eq!(payload.data, br#""value""#);
+    }
+
+    #[test]
+    fn empty_payloads_do_not_decode_as_option() {
+        let converter = PayloadConverter::default();
+        let ctx = SerializationContext::new(&SerializationContextData::Workflow, &converter);
+
+        let result: Result<Option<String>, _> = converter.from_payloads(&ctx, vec![]);
+        assert!(matches!(result, Err(PayloadConversionError::WrongEncoding)));
     }
 
     #[test]

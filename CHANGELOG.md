@@ -93,6 +93,8 @@ relevant information.
   `Waiting for all slot permits to release took too long!`, and release builds logged that error
   and dropped the result, leaving the server to time the activity out before retrying it.
   Shutdown now drains in-flight completions first.
+* The default payload converter now serializes Serde `null` values such as `Option::None` as
+  `binary/null` and accepts both `binary/null` and legacy `json/plain` null payloads.
 * The Prometheus exporter now respects `PrometheusExporterOptions::counters_total_suffix`,
   appending `_total` to counter metric names when enabled.
 * Workflow start requests now include the client's identity.

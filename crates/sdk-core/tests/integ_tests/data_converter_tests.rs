@@ -756,6 +756,60 @@ async fn multi_args_serializes_as_multiple_payloads() {
     assert_eq!(second_payload_data, 42);
 }
 
+#[workflow]
+#[derive(Default)]
+struct BinaryNullWorkflow;
+
+#[workflow_methods]
+impl BinaryNullWorkflow {
+    #[run]
+    async fn run(_ctx: &mut WorkflowContext<Self>, input: Option<String>) -> WorkflowResult<()> {
+        assert_eq!(input, None);
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn option_none_workflow_input_is_recorded_as_binary_null() {
+    let wf_name = BinaryNullWorkflow::name();
+    let mut starter = CoreWfStarter::new(wf_name);
+    starter
+        .sdk_config
+        .register_workflow::<BinaryNullWorkflow>()
+        .unwrap();
+    let mut worker = starter.worker().await;
+    let handle = worker
+        .submit_workflow(
+            BinaryNullWorkflow::run,
+            Option::<String>::None,
+            WorkflowStartOptions::new(starter.get_task_queue(), wf_name).build(),
+        )
+        .await
+        .unwrap();
+    worker.run_until_done().await.unwrap();
+
+    let events = handle
+        .fetch_history(Default::default())
+        .await
+        .unwrap()
+        .into_events();
+    let input = events
+        .iter()
+        .find_map(|event| match event.attributes.as_ref() {
+            Some(Attributes::WorkflowExecutionStartedEventAttributes(attributes)) => {
+                attributes.input.as_ref()
+            }
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(input.payloads.len(), 1);
+    assert_eq!(
+        input.payloads[0].metadata.get("encoding").unwrap(),
+        b"binary/null"
+    );
+    assert!(input.payloads[0].data.is_empty());
+}
+
 /// A codec that XORs payload data with a key and tracks encode/decode operations.
 struct XorCodec {
     key: u8,
