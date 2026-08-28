@@ -5,18 +5,25 @@ use crate::{
 use http::Uri;
 use std::{collections::HashMap, sync::Arc, time::Duration};
 use temporalio_common::{
-    RetryPolicy,
-    data_converters::DataConverter,
+    ActivityCloseTimeouts, MemoValues, RetryPolicy,
+    data_converters::{
+        DataConverter, GenericPayloadConverter, PayloadConversionError, PayloadConverter,
+        SerializationContext, SerializationContextData,
+    },
+    payload_visitor::encode_payloads,
     protos::temporal::api::{
         common::{
             self,
-            v1::{Header, Payloads},
+            v1::{Header, Memo as ProtoMemo, Payloads},
         },
         enums::v1::{
-            ArchivalState, HistoryEventFilterType, QueryRejectCondition, WorkflowIdConflictPolicy,
+            ActivityIdConflictPolicy as ProtoActivityIdConflictPolicy,
+            ActivityIdReusePolicy as ProtoActivityIdReusePolicy, ArchivalState,
+            HistoryEventFilterType, QueryRejectCondition, WorkflowIdConflictPolicy,
             WorkflowIdReusePolicy,
         },
         replication::v1::ClusterReplicationConfig,
+        sdk::v1::UserMetadata,
         workflowservice::v1::RegisterNamespaceRequest,
     },
     search_attributes::SearchAttributes,
@@ -419,10 +426,6 @@ pub struct WorkflowStartOptions {
     #[builder(into)]
     pub retry_policy: Option<RetryPolicy>,
 
-    /// If set, send a signal to the workflow atomically with start.
-    /// The workflow will receive this signal before its first task.
-    pub start_signal: Option<WorkflowStartSignal>,
-
     /// Links to associate with the workflow. Ex: References to a nexus operation.
     #[builder(default)]
     pub links: Vec<common::v1::Link>,
@@ -439,6 +442,9 @@ pub struct WorkflowStartOptions {
     /// Headers to include with the start request.
     pub header: Option<Header>,
 
+    /// Non-indexed values attached to the workflow, serialized with the client's data converter.
+    pub memo: Option<MemoValues>,
+
     /// Single-line static summary for the workflow, shown in the Temporal UI.
     pub static_summary: Option<String>,
 
@@ -450,19 +456,183 @@ pub struct WorkflowStartOptions {
     pub rpc_options: RpcOptions,
 }
 
-/// A signal to send atomically when starting a workflow.
-/// Use with `WorkflowStartOptions::start_signal` to achieve signal-with-start behavior.
+impl WorkflowStartOptions {
+    pub(crate) async fn encoded_memo(
+        &self,
+        data_converter: &DataConverter,
+    ) -> Result<Option<ProtoMemo>, PayloadConversionError> {
+        let Some(memo) = &self.memo else {
+            return Ok(None);
+        };
+
+        let payload_converter = data_converter.payload_converter();
+        let context =
+            SerializationContext::new(&SerializationContextData::Workflow, payload_converter);
+        let mut memo = ProtoMemo {
+            fields: memo
+                .iter()
+                .map(|(key, value)| {
+                    payload_converter
+                        .to_payload(&context, value)
+                        .map(|payload| (key.to_owned(), payload))
+                })
+                .collect::<Result<_, _>>()?,
+        };
+        encode_payloads(
+            &mut memo,
+            data_converter.codec(),
+            &SerializationContextData::Workflow,
+        )
+        .await?;
+        Ok(Some(memo))
+    }
+
+    pub(crate) fn user_metadata(&self) -> Option<UserMetadata> {
+        (self.static_summary.is_some() || self.static_details.is_some()).then(|| {
+            let payload_converter = PayloadConverter::default();
+            let context =
+                SerializationContext::new(&SerializationContextData::Workflow, &payload_converter);
+            UserMetadata {
+                summary: self.static_summary.as_ref().map(|summary| {
+                    payload_converter
+                        .to_payload(&context, summary)
+                        .expect("String-to-JSON payload serialization is infallible")
+                }),
+                details: self.static_details.as_ref().map(|details| {
+                    payload_converter
+                        .to_payload(&context, details)
+                        .expect("String-to-JSON payload serialization is infallible")
+                }),
+            }
+        })
+    }
+}
+
+/// Options for starting a workflow and sending it an update in one atomic operation.
+///
+/// See [crate::Client::start_update_with_start_workflow] and
+/// [crate::Client::execute_update_with_start_workflow].
 #[derive(Debug, Clone, bon::Builder)]
 #[builder(start_fn = new, on(String, into))]
 #[non_exhaustive]
-pub struct WorkflowStartSignal {
-    /// Name of the signal to send.
+pub struct WorkflowUpdateWithStartOptions {
+    /// The task queue to run the workflow on.
     #[builder(start_fn)]
-    pub signal_name: String,
-    /// Payload for the signal.
-    pub input: Option<Payloads>,
-    /// Headers for the signal.
-    pub header: Option<Header>,
+    pub task_queue: String,
+
+    /// The workflow ID.
+    #[builder(start_fn)]
+    pub workflow_id: String,
+
+    /// How to resolve a conflict with an already-running workflow. This is required so callers
+    /// explicitly choose whether an update may attach to an existing workflow.
+    #[builder(start_fn)]
+    pub id_conflict_policy: WorkflowIdConflictPolicy,
+
+    /// The policy for reusing the workflow ID after a workflow closes.
+    #[builder(default)]
+    pub id_reuse_policy: WorkflowIdReusePolicy,
+
+    /// The workflow execution timeout.
+    pub execution_timeout: Option<Duration>,
+
+    /// The workflow run timeout.
+    pub run_timeout: Option<Duration>,
+
+    /// The workflow task timeout.
+    pub task_timeout: Option<Duration>,
+
+    /// Search attributes for the workflow.
+    pub search_attributes: Option<SearchAttributes>,
+
+    /// The workflow retry policy.
+    #[builder(into)]
+    pub retry_policy: Option<RetryPolicy>,
+
+    /// Links to associate with the workflow.
+    #[builder(default)]
+    pub links: Vec<common::v1::Link>,
+
+    /// Callbacks invoked when the workflow completes.
+    #[builder(default)]
+    pub completion_callbacks: Vec<common::v1::Callback>,
+
+    /// Priority for the workflow. Defaults to all-inherited (empty).
+    #[builder(default)]
+    pub priority: Priority,
+
+    /// Headers to include with the start operation.
+    pub start_header: Option<Header>,
+
+    /// Headers to include with the update operation.
+    pub update_header: Option<Header>,
+
+    /// Non-indexed values attached to the workflow, serialized with the client's data converter.
+    pub memo: Option<MemoValues>,
+
+    /// Single-line static summary for the workflow, shown in the Temporal UI.
+    pub static_summary: Option<String>,
+
+    /// Multi-line static details for the workflow, shown in the Temporal UI.
+    pub static_details: Option<String>,
+
+    /// Update ID for idempotency. If not provided, a UUID will be generated.
+    pub update_id: Option<String>,
+
+    /// Controls for the multi-operation RPC and, when executing the update, subsequent polling.
+    #[builder(default)]
+    pub rpc_options: RpcOptions,
+}
+
+impl WorkflowUpdateWithStartOptions {
+    pub(crate) fn into_parts(self) -> (WorkflowStartOptions, Option<String>, Option<Header>) {
+        let Self {
+            task_queue,
+            workflow_id,
+            id_conflict_policy,
+            id_reuse_policy,
+            execution_timeout,
+            run_timeout,
+            task_timeout,
+            search_attributes,
+            retry_policy,
+            links,
+            completion_callbacks,
+            priority,
+            start_header,
+            update_header,
+            memo,
+            static_summary,
+            static_details,
+            update_id,
+            rpc_options: _,
+        } = self;
+        (
+            WorkflowStartOptions {
+                task_queue,
+                workflow_id,
+                id_reuse_policy,
+                id_conflict_policy,
+                execution_timeout,
+                run_timeout,
+                task_timeout,
+                cron_schedule: None,
+                search_attributes,
+                enable_eager_workflow_start: false,
+                retry_policy,
+                links,
+                completion_callbacks,
+                priority,
+                header: start_header,
+                memo,
+                static_summary,
+                static_details,
+                rpc_options: RpcOptions::default(),
+            },
+            update_id,
+            update_header,
+        )
+    }
 }
 
 pub use temporalio_common::Priority;
@@ -655,19 +825,6 @@ pub struct WorkflowFetchHistoryOptions {
     pub rpc_options: RpcOptions,
 }
 
-/// Which lifecycle stage to wait for when starting an update.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub enum WorkflowUpdateWaitStage {
-    /// This stage is reached when the server receives the update to process.
-    /// This is currently an invalid value on start.
-    Admitted,
-    /// Wait until the update is accepted by the workflow (validator passed).
-    #[default]
-    Accepted,
-    /// Wait until the update has completed.
-    Completed,
-}
-
 /// Options for starting an update without waiting for completion.
 #[derive(Debug, Clone, Default, bon::Builder)]
 #[non_exhaustive]
@@ -676,12 +833,20 @@ pub struct WorkflowStartUpdateOptions {
     pub update_id: Option<String>,
     /// Headers to include with the update.
     pub header: Option<Header>,
-    /// The lifecycle stage to wait for before returning the handle.
-    #[builder(default)]
-    pub wait_for_stage: WorkflowUpdateWaitStage,
     /// Controls for the start-update RPC.
     #[builder(default)]
     pub rpc_options: RpcOptions,
+}
+
+impl From<WorkflowExecuteUpdateOptions> for WorkflowStartUpdateOptions {
+    /// Execute-update is start-update followed by waiting for the update result.
+    fn from(options: WorkflowExecuteUpdateOptions) -> Self {
+        Self::builder()
+            .maybe_update_id(options.update_id)
+            .maybe_header(options.header)
+            .rpc_options(options.rpc_options)
+            .build()
+    }
 }
 
 /// Options for listing workflows.
@@ -703,4 +868,180 @@ pub struct WorkflowCountOptions {
     /// Controls for the count RPC.
     #[builder(default)]
     pub rpc_options: RpcOptions,
+}
+
+/// Options for starting a standalone activity.
+#[derive(Clone, Debug, bon::Builder)]
+#[builder(start_fn = new, on(String, into))]
+#[non_exhaustive]
+pub struct ActivityStartOptions {
+    /// Task queue to run this activity on.
+    #[builder(start_fn)]
+    pub task_queue: String,
+    /// Activity ID of the started activity. It's recommended to use a meaningful business ID.
+    #[builder(start_fn)]
+    pub id: String,
+    /// Timeouts for activity completion.
+    ///
+    /// See [`ActivityCloseTimeouts`] for the meaning of each timeout variant.
+    #[builder(start_fn)]
+    pub close_timeouts: ActivityCloseTimeouts,
+    /// If set, specifies maximum time the activity can wait in the task queue before being picked
+    /// up by a worker. This timeout is non-retryable.
+    pub schedule_to_start_timeout: Option<Duration>,
+    /// If set, specifies maximum time between successful heartbeats.
+    pub heartbeat_timeout: Option<Duration>,
+    /// Controls how Activity is retried. If not set, the server will assign default retry policy.
+    #[builder(into)]
+    pub retry_policy: Option<RetryPolicy>,
+    /// Priority to use when starting this activity.
+    #[builder(default)]
+    pub priority: Priority,
+    /// Specifies behavior if there's a *closed* activity with the same ID.
+    #[builder(default)]
+    pub id_reuse_policy: ActivityIdReusePolicy,
+    /// Specifies behavior if there's a *running* activity with the same ID. Note that there can
+    /// only be one running activity for each Activity ID.
+    #[builder(default)]
+    pub id_conflict_policy: ActivityIdConflictPolicy,
+    /// Search attributes for the activity.
+    pub search_attributes: Option<SearchAttributes>,
+    /// Headers to include with the start request.
+    pub header: Option<Header>,
+    /// Single-line static summary for the activity, shown in the Temporal UI.
+    pub summary: Option<String>,
+    /// Multi-line static details for the activity, shown in the Temporal UI.
+    pub static_details: Option<String>,
+    /// Time to wait before dispatching the first activity task.
+    /// This delay is not applied to retry attempts.
+    pub start_delay: Option<Duration>,
+}
+
+impl ActivityStartOptions {
+    /// Returns a builder with `close_timeouts` set to [`ActivityCloseTimeouts::StartToClose`].
+    pub fn with_start_to_close_timeout(
+        task_queue: impl Into<String>,
+        activity_id: impl Into<String>,
+        start_to_close_timeout: Duration,
+    ) -> ActivityStartOptionsBuilder {
+        Self::new(
+            task_queue,
+            activity_id,
+            ActivityCloseTimeouts::StartToClose(start_to_close_timeout),
+        )
+    }
+
+    /// Returns a builder with `close_timeouts` set to [`ActivityCloseTimeouts::ScheduleToClose`].
+    pub fn with_schedule_to_close_timeout(
+        task_queue: impl Into<String>,
+        activity_id: impl Into<String>,
+        schedule_to_close_timeout: Duration,
+    ) -> ActivityStartOptionsBuilder {
+        Self::new(
+            task_queue,
+            activity_id,
+            ActivityCloseTimeouts::ScheduleToClose(schedule_to_close_timeout),
+        )
+    }
+}
+
+/// Specifies behavior when starting a standalone activity if there's a *closed* activity with
+/// the same ID. See [`ActivityStartOptions::id_reuse_policy`].
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum ActivityIdReusePolicy {
+    #[default]
+    /// Always allow starting an activity using the same activity ID. This is the default.
+    AllowDuplicate,
+    /// Allow starting an activity using the same ID only when the last execution did not complete
+    /// successfully.
+    AllowDuplicateFailedOnly,
+    /// Do not permit re-use of the ID for this activity.
+    RejectDuplicate,
+}
+
+impl From<ActivityIdReusePolicy> for ProtoActivityIdReusePolicy {
+    fn from(value: ActivityIdReusePolicy) -> Self {
+        match value {
+            ActivityIdReusePolicy::AllowDuplicate => Self::AllowDuplicate,
+            ActivityIdReusePolicy::AllowDuplicateFailedOnly => Self::AllowDuplicateFailedOnly,
+            ActivityIdReusePolicy::RejectDuplicate => Self::RejectDuplicate,
+        }
+    }
+}
+
+/// Specifies behavior when starting a standalone activity if there's a *running* activity with
+/// the same ID. See [`ActivityStartOptions::id_conflict_policy`].
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum ActivityIdConflictPolicy {
+    #[default]
+    /// Don't start a new activity; instead return
+    /// [`StartActivityError::AlreadyStarted`](crate::errors::StartActivityError::AlreadyStarted).
+    Fail,
+    /// Don't start a new activity; instead return a handle for the running activity.
+    UseExisting,
+}
+
+impl From<ActivityIdConflictPolicy> for ProtoActivityIdConflictPolicy {
+    fn from(value: ActivityIdConflictPolicy) -> Self {
+        match value {
+            ActivityIdConflictPolicy::Fail => Self::Fail,
+            ActivityIdConflictPolicy::UseExisting => Self::UseExisting,
+        }
+    }
+}
+
+/// Options for listing activities.
+#[derive(Debug, Clone, Default, bon::Builder)]
+#[non_exhaustive]
+pub struct ActivityListOptions {}
+
+/// Options for counting activities.
+#[derive(Debug, Clone, Default, bon::Builder)]
+#[non_exhaustive]
+pub struct ActivityCountOptions {}
+
+/// Controls which optional fields will be requested in
+/// [`ActivityHandle::describe`](crate::ActivityHandle::describe) operation. The fields will be
+/// present in returned [`ActivityExecutionDescription`](crate::ActivityExecutionDescription),
+/// subject to data availability and server support.
+///
+/// Note that these fields contain payloads that can be arbitrarily large. It's recommended not to
+/// include them unless they're needed.
+#[derive(Debug, Clone, Default, bon::Builder)]
+#[non_exhaustive]
+pub struct ActivityDescribeOptions {
+    /// If set and the activity received input, the input will be included.
+    #[builder(default)]
+    pub include_input: bool,
+    /// If set and the activity is closed, the activity outcome will be included.
+    #[builder(default)]
+    pub include_outcome: bool,
+    /// If set and the activity sent heartbeat details, the heartbeat details will be included.
+    #[builder(default)]
+    pub include_heartbeat_details: bool,
+    /// If set and the activity has a failed attempt, the last failure will be included.
+    #[builder(default)]
+    pub include_last_failure: bool,
+}
+
+/// Options for [`ActivityHandle::cancel`](crate::ActivityHandle::cancel).
+#[derive(Debug, Clone, Default, bon::Builder)]
+#[builder(on(String, into))]
+#[non_exhaustive]
+pub struct ActivityCancelOptions {
+    /// Reason for cancellation. Can be empty.
+    #[builder(default)]
+    pub reason: String,
+}
+
+/// Options for [`ActivityHandle::terminate`](crate::ActivityHandle::terminate).
+#[derive(Debug, Clone, Default, bon::Builder)]
+#[builder(on(String, into))]
+#[non_exhaustive]
+pub struct ActivityTerminateOptions {
+    /// Reason for termination. Can be empty.
+    #[builder(default)]
+    pub reason: String,
 }

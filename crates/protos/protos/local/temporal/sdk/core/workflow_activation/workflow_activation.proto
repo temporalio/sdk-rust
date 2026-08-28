@@ -211,6 +211,10 @@ message InitializeWorkflow {
     temporal.api.common.v1.WorkflowExecution root_workflow = 24;
     // Priority of this workflow execution
     temporal.api.common.v1.Priority priority = 25;
+    // The run id recorded on the `WORKFLOW_EXECUTION_STARTED` event. Unlike the execution's current
+    // run id, this value is preserved across workflow resets. Mirrors the `original_execution_run_id`
+    // field from `WorkflowExecutionStartedEventAttributes`.
+    string original_execution_run_id = 26;
 }
 
 // Notify a workflow that a timer has fired
@@ -300,6 +304,8 @@ message SignalWorkflow {
     string identity = 3;
     // Headers attached to the signal
     map<string, temporal.api.common.v1.Payload> headers = 5;
+    // Event ID of the `WORKFLOW_EXECUTION_SIGNALED` history event that produced this job.
+    int64 originating_event_id = 6;
 }
 
 // Inform lang what the result of a call to `patched` or similar API should be -- this is always

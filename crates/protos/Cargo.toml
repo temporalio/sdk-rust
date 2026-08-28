@@ -1,6 +1,6 @@
 [package]
 name = "temporalio-protos"
-version = "0.6.0"
+version = "0.7.0"
 edition = "2024"
 authors = ["Temporal Technologies Inc. <sdk@temporal.io>"]
 license-file = { workspace = true }
@@ -19,7 +19,7 @@ grpc-clients = ["tonic/channel"]
 
 [dependencies]
 anyhow = "1.0"
-base64 = "0.22"
+base64 = "0.23"
 derive_more = { workspace = true }
 http = "1"
 prost = { workspace = true }

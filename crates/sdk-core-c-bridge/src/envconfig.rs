@@ -56,11 +56,17 @@ struct ClientEnvConfig {
     profiles: HashMap<String, ClientEnvConfigProfile>,
 }
 
-impl From<CoreClientConfig> for ClientEnvConfig {
-    fn from(c: CoreClientConfig) -> Self {
-        Self {
-            profiles: c.profiles.into_iter().map(|(k, v)| (k, v.into())).collect(),
-        }
+impl TryFrom<CoreClientConfig> for ClientEnvConfig {
+    type Error = String;
+
+    fn try_from(c: CoreClientConfig) -> Result<Self, Self::Error> {
+        Ok(Self {
+            profiles: c
+                .profiles
+                .into_iter()
+                .map(|(name, profile)| Ok((name, profile.try_into()?)))
+                .collect::<Result<_, String>>()?,
+        })
     }
 }
 
@@ -80,16 +86,18 @@ struct ClientEnvConfigProfile {
     grpc_meta: HashMap<String, String>,
 }
 
-impl From<CoreClientConfigProfile> for ClientEnvConfigProfile {
-    fn from(c: CoreClientConfigProfile) -> Self {
-        Self {
+impl TryFrom<CoreClientConfigProfile> for ClientEnvConfigProfile {
+    type Error = String;
+
+    fn try_from(c: CoreClientConfigProfile) -> Result<Self, Self::Error> {
+        Ok(Self {
             address: c.address,
             namespace: c.namespace,
             api_key: c.api_key,
-            tls: c.tls.map(Into::into),
+            tls: c.tls.map(TryInto::try_into).transpose()?,
             codec: c.codec.map(Into::into),
             grpc_meta: c.grpc_meta,
-        }
+        })
     }
 }
 
@@ -107,15 +115,17 @@ struct ClientEnvConfigTLS {
     client_key: Option<DataSource>,
 }
 
-impl From<CoreClientConfigTLS> for ClientEnvConfigTLS {
-    fn from(c: CoreClientConfigTLS) -> Self {
-        Self {
+impl TryFrom<CoreClientConfigTLS> for ClientEnvConfigTLS {
+    type Error = String;
+
+    fn try_from(c: CoreClientConfigTLS) -> Result<Self, Self::Error> {
+        Ok(Self {
             disabled: c.disabled,
             server_name: c.server_name,
-            server_ca_cert: c.server_ca_cert.map(Into::into),
-            client_cert: c.client_cert.map(Into::into),
-            client_key: c.client_key.map(Into::into),
-        }
+            server_ca_cert: c.server_ca_cert.map(TryInto::try_into).transpose()?,
+            client_cert: c.client_cert.map(TryInto::try_into).transpose()?,
+            client_key: c.client_key.map(TryInto::try_into).transpose()?,
+        })
     }
 }
 
@@ -144,9 +154,11 @@ struct DataSource {
     data: Option<Vec<u8>>,
 }
 
-impl From<CoreDataSource> for DataSource {
-    fn from(c: CoreDataSource) -> Self {
-        match c {
+impl TryFrom<CoreDataSource> for DataSource {
+    type Error = String;
+
+    fn try_from(c: CoreDataSource) -> Result<Self, Self::Error> {
+        Ok(match c {
             CoreDataSource::Path(p) => Self {
                 path: Some(p),
                 data: None,
@@ -155,7 +167,8 @@ impl From<CoreDataSource> for DataSource {
                 path: None,
                 data: Some(d),
             },
-        }
+            _ => return Err("Unsupported envconfig data source".to_string()),
+        })
     }
 }
 
@@ -227,7 +240,7 @@ pub extern "C" fn temporal_core_client_env_config_load(
         let core_config = envconfig::load_client_config(load_options, env_vars_map.as_ref())
             .map_err(|e| e.to_string())?;
 
-        Ok(core_config.into())
+        core_config.try_into()
     };
 
     match result() {
@@ -289,7 +302,7 @@ pub extern "C" fn temporal_core_client_env_config_profile_load(
         let profile = envconfig::load_client_config_profile(load_options, env_vars_map.as_ref())
             .map_err(|e| e.to_string())?;
 
-        Ok(profile.into())
+        profile.try_into()
     };
 
     match result() {

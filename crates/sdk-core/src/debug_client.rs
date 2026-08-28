@@ -30,6 +30,7 @@ impl DebugClient {
         client_name: &str,
         client_version: &str,
     ) -> Result<DebugClient, anyhow::Error> {
+        temporalio_common::telemetry::ensure_default_crypto_provider();
         let mut client = reqwest::ClientBuilder::new();
         client = client.default_headers({
             let mut hm = HeaderMap::new();

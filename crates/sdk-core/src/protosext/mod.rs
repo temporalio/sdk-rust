@@ -38,7 +38,7 @@ use temporalio_common::protos::{
         failure::v1::Failure,
         history::v1::{History, HistoryEvent, MarkerRecordedEventAttributes, history_event},
         query::v1::WorkflowQuery,
-        sdk::v1::UserMetadata,
+        sdk::v1::{EventGroupMarker, UserMetadata},
         workflowservice::v1::PollWorkflowTaskQueueResponse,
     },
     utilities::TryIntoOrNone,
@@ -121,7 +121,7 @@ impl TryFrom<PollWorkflowTaskQueueResponse> for ValidPollWFTQResponse {
                 let messages = messages.into_iter().map(TryInto::try_into).try_collect()?;
 
                 Ok(Self {
-                    task_token: TaskToken(task_token),
+                    task_token: task_token.into(),
                     task_queue: tq.name,
                     workflow_execution,
                     workflow_type: workflow_type.name,
@@ -322,7 +322,9 @@ pub(crate) struct ValidScheduleLA {
     pub(crate) retry_policy: ValidatedRetryPolicy,
     pub(crate) local_retry_threshold: Duration,
     pub(crate) cancellation_type: ActivityCancellationType,
+    pub(crate) include_arguments_into_marker: bool,
     pub(crate) user_metadata: Option<UserMetadata>,
+    pub(crate) event_group_markers: Vec<EventGroupMarker>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -355,6 +357,7 @@ impl ValidScheduleLA {
     pub(crate) fn from_schedule_la(
         v: ScheduleLocalActivity,
         user_metadata: Option<UserMetadata>,
+        event_group_markers: Vec<EventGroupMarker>,
     ) -> Result<Self, anyhow::Error> {
         let original_schedule_time = v
             .original_schedule_time
@@ -430,7 +433,9 @@ impl ValidScheduleLA {
             retry_policy,
             local_retry_threshold,
             cancellation_type,
+            include_arguments_into_marker: v.include_arguments_into_marker,
             user_metadata,
+            event_group_markers,
         })
     }
 }

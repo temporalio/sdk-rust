@@ -97,14 +97,20 @@ impl SharedNamespaceWorker {
                     namespace: &str,
                     callbacks_map: &Arc<RwLock<HashMap<Uuid, WorkerCallbacks>>>,
                 ) -> bool {
-                    let mut hb_to_send = Vec::new();
                     let hb_callbacks: Vec<_> = callbacks_map
                         .read()
                         .values()
-                        .map(|cb| (cb.heartbeat.clone(), cb.heartbeat_success.clone()))
+                        .filter_map(|cb| {
+                            (cb.heartbeat)()
+                                .map(|heartbeat| (heartbeat, cb.heartbeat_success.clone()))
+                        })
                         .collect();
-                    for (heartbeat_callback, _) in &hb_callbacks {
-                        let mut heartbeat = heartbeat_callback();
+                    if hb_callbacks.is_empty() {
+                        return false;
+                    }
+                    let mut hb_to_send = Vec::with_capacity(hb_callbacks.len());
+                    for (heartbeat, _) in &hb_callbacks {
+                        let mut heartbeat = heartbeat.clone();
                         // All of these heartbeat details rely on a client. To avoid circular
                         // dependencies, this must be populated from within SharedNamespaceWorker
                         // to get info from the current client
@@ -297,7 +303,7 @@ async fn handle_worker_command_task(
     for command in &exec_req.commands {
         let result_type = match &command.r#type {
             Some(WorkerCommandType::CancelActivity(cancel_cmd)) => {
-                let tt = TaskToken(cancel_cmd.task_token.clone());
+                let tt: TaskToken = cancel_cmd.task_token.clone().into();
                 let cancel_callbacks: Vec<_> = callbacks_map
                     .read()
                     .values()
@@ -367,6 +373,7 @@ mod tests {
         },
         time::Duration,
     };
+    use temporalio_client::worker::{SharedNamespaceWorkerTrait, WorkerCallbacks};
     use temporalio_common::{
         protos::temporal::api::{
             common::v1::Payload,
@@ -376,8 +383,8 @@ mod tests {
             },
             nexusservices::workerservice::v1::{ExecuteCommandsRequest, ExecuteCommandsResponse},
             worker::v1::{
-                CancelActivityCommand, EnvironmentInfo, WorkerCommand, worker_command,
-                worker_command_result,
+                CancelActivityCommand, EnvironmentInfo, WorkerCommand, WorkerHeartbeat,
+                worker_command, worker_command_result,
             },
             workflowservice::v1::{
                 DescribeNamespaceResponse, PollNexusTaskQueueResponse,
@@ -389,10 +396,77 @@ mod tests {
     use uuid::Uuid;
 
     #[tokio::test]
+    async fn heartbeat_only_includes_started_workers() {
+        let mut mock = mock_worker_client();
+        let started_worker_key = Uuid::new_v4();
+        let (recorded_tx, recorded_rx) = tokio::sync::oneshot::channel();
+        let recorded_tx = Mutex::new(Some(recorded_tx));
+        mock.expect_record_worker_heartbeat()
+            .times(1)
+            .returning(move |_, heartbeats| {
+                assert_eq!(heartbeats.len(), 1);
+                assert_eq!(
+                    heartbeats[0].worker_instance_key,
+                    started_worker_key.to_string()
+                );
+                if let Some(tx) = recorded_tx.lock().unwrap().take() {
+                    let _ = tx.send(());
+                }
+                Ok(RecordWorkerHeartbeatResponse {})
+            });
+        mock.expect_describe_namespace().returning(|| {
+            Ok(DescribeNamespaceResponse {
+                namespace_info: Some(NamespaceInfo {
+                    capabilities: Some(Capabilities {
+                        worker_heartbeats: true,
+                        ..Capabilities::default()
+                    }),
+                    ..NamespaceInfo::default()
+                }),
+                ..DescribeNamespaceResponse::default()
+            })
+        });
+        let client: Arc<dyn WorkerClient> = Arc::new(mock);
+        let shared_worker = super::SharedNamespaceWorker::new(
+            client,
+            "test-namespace".to_string(),
+            Duration::from_millis(100),
+            None,
+            Arc::new(temporalio_client::worker::NamespaceDescriptionSource::unresolved()),
+        )
+        .unwrap();
+        shared_worker.register_callback(
+            Uuid::new_v4(),
+            WorkerCallbacks::new(Arc::new(|| None), None, None),
+        );
+        shared_worker.register_callback(
+            started_worker_key,
+            WorkerCallbacks::new(
+                Arc::new(move || {
+                    Some(WorkerHeartbeat {
+                        worker_instance_key: started_worker_key.to_string(),
+                        ..Default::default()
+                    })
+                }),
+                None,
+                None,
+            ),
+        );
+
+        tokio::time::timeout(Duration::from_secs(5), recorded_rx)
+            .await
+            .expect("worker heartbeat was not recorded in time")
+            .expect("heartbeat sender was dropped");
+        shared_worker.cancel.cancel();
+    }
+
+    #[tokio::test]
     async fn worker_heartbeat_basic() {
         let mut mock = mock_worker_client();
         let heartbeat_count = Arc::new(AtomicUsize::new(0));
         let heartbeat_count_clone = heartbeat_count.clone();
+        let (third_heartbeat_tx, third_heartbeat_rx) = tokio::sync::oneshot::channel();
+        let third_heartbeat_tx = Mutex::new(Some(third_heartbeat_tx));
         mock.expect_poll_workflow_task()
             .returning(move |_namespace, _task_queue| Ok(Default::default()));
         mock.expect_poll_nexus_task()
@@ -402,6 +476,11 @@ mod tests {
                 assert_eq!(1, worker_heartbeat.len());
                 let heartbeat = worker_heartbeat[0].clone();
                 let heartbeat_index = heartbeat_count_clone.fetch_add(1, Ordering::Relaxed);
+                if heartbeat_index == 2
+                    && let Some(tx) = third_heartbeat_tx.lock().unwrap().take()
+                {
+                    let _ = tx.send(());
+                }
                 assert_eq!(heartbeat.environment.is_some(), heartbeat_index < 2);
                 let host_info = heartbeat.host_info.clone().unwrap();
                 assert_eq!("test-identity", heartbeat.worker_identity);
@@ -453,14 +532,27 @@ mod tests {
         )
         .unwrap();
 
-        tokio::time::sleep(Duration::from_millis(250)).await;
+        let heartbeat_callback = worker
+            .client_worker_registrator
+            .heartbeat_manager
+            .as_ref()
+            .unwrap()
+            .heartbeat_callback
+            .clone();
+        assert!(heartbeat_callback().is_none());
+        worker.mark_started();
+        assert!(heartbeat_callback().is_some());
+        tokio::time::timeout(Duration::from_secs(5), third_heartbeat_rx)
+            .await
+            .expect("worker heartbeat was not recorded in time")
+            .expect("heartbeat sender was dropped");
         worker.drain_activity_poller_and_shutdown().await;
 
         assert_eq!(3, heartbeat_count.load(Ordering::Relaxed));
     }
 
     #[tokio::test]
-    async fn heartbeat_reports_auto_enroll_before_worker_validation() {
+    async fn heartbeat_reports_auto_enroll_after_worker_starts() {
         let mut mock = mock_worker_client();
         let (reported_tx, reported_rx) = tokio::sync::oneshot::channel();
         let reported_tx = Mutex::new(Some(reported_tx));
@@ -502,16 +594,17 @@ mod tests {
         )
         .unwrap();
 
+        worker.validate().await.unwrap();
+        worker.mark_started();
         let reported_autoscaling = tokio::time::timeout(Duration::from_secs(5), reported_rx)
             .await
             .expect("worker heartbeat was not recorded in time")
             .expect("heartbeat sender was dropped");
-        worker.validate().await.unwrap();
         worker.drain_activity_poller_and_shutdown().await;
 
         assert!(
             reported_autoscaling,
-            "heartbeat emitted before validation must reflect namespace auto-enrollment"
+            "heartbeat emitted after startup must reflect namespace auto-enrollment"
         );
     }
 
@@ -527,16 +620,14 @@ mod tests {
             Ok(Default::default())
         });
 
-        let (heartbeat_tx, heartbeat_rx) = tokio::sync::oneshot::channel();
-        let heartbeat_tx = Mutex::new(Some(heartbeat_tx));
+        let heartbeat_count = Arc::new(AtomicUsize::new(0));
+        let heartbeat_count_clone = heartbeat_count.clone();
         mock.expect_record_worker_heartbeat()
             .returning(move |_, _| {
-                if let Some(tx) = heartbeat_tx.lock().unwrap().take() {
-                    let _ = tx.send(());
-                }
+                heartbeat_count_clone.fetch_add(1, Ordering::Relaxed);
                 Ok(RecordWorkerHeartbeatResponse {})
             });
-        mock.expect_describe_namespace().returning(move || {
+        mock.expect_describe_namespace().returning(|| {
             Ok(DescribeNamespaceResponse {
                 namespace_info: Some(NamespaceInfo {
                     capabilities: Some(Capabilities {
@@ -550,19 +641,37 @@ mod tests {
             })
         });
 
+        let client: Arc<dyn WorkerClient> = Arc::new(mock);
         let shared_worker = super::SharedNamespaceWorker::new(
-            Arc::new(mock),
-            namespace,
+            client.clone(),
+            namespace.clone(),
             Duration::from_millis(100),
             None,
             Arc::new(temporalio_client::worker::NamespaceDescriptionSource::unresolved()),
         )
         .unwrap();
 
-        tokio::time::timeout(Duration::from_secs(5), heartbeat_rx)
+        let (callback_tx, callback_rx) = tokio::sync::oneshot::channel();
+        let callback_tx = Mutex::new(Some(callback_tx));
+        shared_worker.register_callback(
+            Uuid::new_v4(),
+            WorkerCallbacks::new(
+                Arc::new(move || {
+                    if let Some(tx) = callback_tx.lock().unwrap().take() {
+                        let _ = tx.send(());
+                    }
+                    None
+                }),
+                None,
+                None,
+            ),
+        );
+        tokio::time::timeout(Duration::from_secs(5), callback_rx)
             .await
-            .expect("worker heartbeat was not recorded in time")
-            .expect("heartbeat sender was dropped");
+            .expect("heartbeat callback was not invoked in time")
+            .expect("heartbeat callback sender was dropped");
+        tokio::task::yield_now().await;
+        assert_eq!(heartbeat_count.load(Ordering::Relaxed), 0);
         assert!(
             !shared_worker
                 .worker_control_task_queue_enabled
@@ -686,6 +795,7 @@ mod tests {
         )
         .unwrap();
 
+        worker.mark_started();
         let response = tokio::time::timeout(Duration::from_secs(5), completion_rx)
             .await
             .expect("nexus task was not completed in time")

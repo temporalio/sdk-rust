@@ -24,12 +24,14 @@ mod integ_tests {
     mod polling_tests;
     mod queries_tests;
     mod schedule_tests;
+    mod standalone_activity_tests;
     mod update_tests;
     mod visibility_tests;
     mod worker_heartbeat_tests;
     mod worker_tests;
     mod worker_versioning_tests;
     mod workflow_client_tests;
+    mod workflow_replayer_tests;
     mod workflow_tests;
 
     use crate::common::{
@@ -84,7 +86,7 @@ mod integ_tests {
     }
 
     pub(crate) async fn mk_nexus_endpoint(starter: &mut CoreWfStarter) -> String {
-        let client = starter.get_client().await;
+        let client = starter.get_core_client().await;
         let endpoint = format!("mycoolendpoint-{}", rand_6_chars());
         client
             .connection()

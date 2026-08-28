@@ -2,7 +2,6 @@ use crate::{
     common::{CoreWfStarter, WorkflowHandleExt, rand_6_chars},
     integ_tests::mk_nexus_endpoint,
 };
-use anyhow::anyhow;
 use assert_matches::assert_matches;
 use std::{
     sync::{
@@ -43,9 +42,9 @@ use temporalio_common::{
 };
 use temporalio_macros::{workflow, workflow_methods};
 use temporalio_sdk::{
-    CancellableFuture, NexusOperationCancellationType, NexusOperationOptions, SyncWorkflowContext,
-    WaitConditionOptions, WorkflowCancellationToken, WorkflowContext, WorkflowContextView,
-    WorkflowResult, WorkflowTermination,
+    ApplicationFailure, CancellableFuture, NexusOperationCancellationType, NexusOperationOptions,
+    SyncWorkflowContext, WaitConditionOptions, WorkflowCancellationToken, WorkflowContext,
+    WorkflowContextView, WorkflowResult, WorkflowTermination,
 };
 use temporalio_sdk_core::PollError;
 use tokio::{
@@ -107,18 +106,21 @@ async fn nexus_basic(
 ) {
     let wf_name = "nexus_basic";
     let mut starter = CoreWfStarter::new(wf_name);
-    starter.sdk_config.task_types = WorkerTaskTypes {
+    starter.set_core_task_types(WorkerTaskTypes {
         enable_workflows: true,
         enable_local_activities: false,
         enable_remote_activities: false,
         enable_nexus: true,
-    };
+    });
+    starter
+        .sdk_config
+        .register_workflow::<NexusBasicWf>()
+        .unwrap();
     let mut worker = starter.worker().await;
-    let core_worker = starter.get_worker().await;
+    let core_worker = starter.get_core_worker().await;
 
     let endpoint = mk_nexus_endpoint(&mut starter).await;
 
-    worker.register_workflow::<NexusBasicWf>().unwrap();
     let wf_handle = worker
         .submit_workflow(
             NexusBasicWf::run,
@@ -128,7 +130,7 @@ async fn nexus_basic(
         .await
         .unwrap();
 
-    let client = starter.get_client().await;
+    let client = starter.get_core_client().await;
     let nexus_task_handle = async {
         let nt = core_worker.poll_nexus_task().await.unwrap().unwrap_task();
         match outcome {
@@ -299,9 +301,9 @@ impl AsyncCompleter {
             Outcome::Succeed => Ok("completed async".to_string()),
             Outcome::Cancel | Outcome::CancelAfterRecordedBeforeStarted => {
                 ctx.cancelled().await;
-                Err(WorkflowTermination::Cancelled)
+                Err(WorkflowTermination::cancelled())
             }
-            _ => Err(anyhow!("broken").into()),
+            _ => Err(ApplicationFailure::new("broken").into()),
         }
     }
 }
@@ -320,14 +322,22 @@ async fn nexus_async(
 ) {
     let wf_name = "nexus_async";
     let mut starter = CoreWfStarter::new(wf_name);
-    starter.sdk_config.task_types = WorkerTaskTypes {
+    starter.set_core_task_types(WorkerTaskTypes {
         enable_workflows: true,
         enable_local_activities: false,
         enable_remote_activities: false,
         enable_nexus: true,
-    };
+    });
+    starter
+        .sdk_config
+        .register_workflow::<NexusAsyncWf>()
+        .unwrap();
+    starter
+        .sdk_config
+        .register_workflow::<AsyncCompleter>()
+        .unwrap();
     let mut worker = starter.worker().await;
-    let core_worker = starter.get_worker().await;
+    let core_worker = starter.get_core_worker().await;
 
     let endpoint = mk_nexus_endpoint(&mut starter).await;
     let schedule_to_close_timeout = if outcome == Outcome::CancelAfterRecordedBeforeStarted {
@@ -336,14 +346,9 @@ async fn nexus_async(
         Some(Duration::from_secs(5))
     };
 
-    worker.register_workflow::<NexusAsyncWf>().unwrap();
-    worker.register_workflow::<AsyncCompleter>().unwrap();
     let submitter = worker.get_submitter_handle();
     let converter = PayloadConverter::default();
-    let ser_ctx = SerializationContext {
-        data: &SerializationContextData::Workflow,
-        converter: &converter,
-    };
+    let ser_ctx = SerializationContext::new(&SerializationContextData::Workflow, &converter);
     let wf_handle = worker
         .submit_workflow(
             NexusAsyncWf::run,
@@ -353,7 +358,7 @@ async fn nexus_async(
         .await
         .unwrap();
 
-    let client = starter.get_client().await;
+    let client = starter.get_core_client().await;
     let nexus_task_handle = async {
         let mut nt = core_worker.poll_nexus_task().await.unwrap().unwrap_task();
         // Verify request header key for timeout exists and is lowercase
@@ -565,19 +570,20 @@ impl NexusCancelBeforeStartWf {
 async fn nexus_cancel_before_start() {
     let wf_name = "nexus_cancel_before_start";
     let mut starter = CoreWfStarter::new(wf_name);
-    starter.sdk_config.task_types = WorkerTaskTypes {
+    starter.set_core_task_types(WorkerTaskTypes {
         enable_workflows: true,
         enable_local_activities: false,
         enable_remote_activities: false,
         enable_nexus: true,
-    };
+    });
+    starter
+        .sdk_config
+        .register_workflow::<NexusCancelBeforeStartWf>()
+        .unwrap();
     let mut worker = starter.worker().await;
 
     let endpoint = mk_nexus_endpoint(&mut starter).await;
 
-    worker
-        .register_workflow::<NexusCancelBeforeStartWf>()
-        .unwrap();
     let handle = worker
         .submit_workflow(
             NexusCancelBeforeStartWf::run,
@@ -620,7 +626,7 @@ impl NexusRootCancellationWf {
             result.status,
             Some(nexus_operation_result::Status::Cancelled(_))
         );
-        Err(WorkflowTermination::Cancelled)
+        Err(WorkflowTermination::cancelled())
     }
 }
 
@@ -628,18 +634,18 @@ impl NexusRootCancellationWf {
 async fn workflow_cancellation_propagates_to_started_nexus_operation() {
     let wf_name = "workflow_cancellation_propagates_to_started_nexus_operation";
     let mut starter = CoreWfStarter::new(wf_name);
-    starter.sdk_config.task_types = WorkerTaskTypes {
+    starter.set_core_task_types(WorkerTaskTypes {
         enable_workflows: true,
         enable_local_activities: false,
         enable_remote_activities: false,
         enable_nexus: true,
-    };
-    let mut worker = starter.worker().await;
-    let core_worker = starter.get_worker().await;
+    });
+    let core_worker = starter.get_core_worker().await;
     let endpoint = mk_nexus_endpoint(&mut starter).await;
     let started = Arc::new(Semaphore::new(0));
 
-    worker
+    starter
+        .sdk_config
         .register_workflow_with_factory({
             let endpoint = endpoint.clone();
             let started = started.clone();
@@ -649,6 +655,7 @@ async fn workflow_cancellation_propagates_to_started_nexus_operation() {
             }
         })
         .unwrap();
+    let mut worker = starter.worker().await;
     let wf_handle = worker
         .submit_workflow(
             NexusRootCancellationWf::run,
@@ -762,23 +769,24 @@ impl NexusMustCompleteTaskWf {
 async fn nexus_must_complete_task_to_shutdown(#[values(true, false)] use_grace_period: bool) {
     let wf_name = "nexus_must_complete_task_to_shutdown";
     let mut starter = CoreWfStarter::new(wf_name);
-    starter.sdk_config.task_types = WorkerTaskTypes {
+    starter.set_core_task_types(WorkerTaskTypes {
         enable_workflows: true,
         enable_local_activities: false,
         enable_remote_activities: false,
         enable_nexus: true,
-    };
+    });
     if use_grace_period {
         starter.sdk_config.graceful_shutdown_period = Some(Duration::from_millis(500));
     }
+    starter
+        .sdk_config
+        .register_workflow::<NexusMustCompleteTaskWf>()
+        .unwrap();
     let mut worker = starter.worker().await;
-    let core_worker = starter.get_worker().await;
+    let core_worker = starter.get_core_worker().await;
 
     let endpoint = mk_nexus_endpoint(&mut starter).await;
 
-    worker
-        .register_workflow::<NexusMustCompleteTaskWf>()
-        .unwrap();
     let handle = worker
         .submit_workflow(
             NexusMustCompleteTaskWf::run,
@@ -925,7 +933,7 @@ impl AsyncCompleterWf {
         }
 
         ctx.state(|wf| wf.handler_exited_tx.send(true).unwrap());
-        Err(WorkflowTermination::Cancelled)
+        Err(WorkflowTermination::cancelled())
     }
 
     #[signal(name = "proceed-to-exit")]
@@ -947,23 +955,23 @@ async fn nexus_cancellation_types(
 ) {
     let wf_name = "nexus_cancellation_types";
     let mut starter = CoreWfStarter::new(wf_name);
-    starter.sdk_config.task_types = WorkerTaskTypes {
+    starter.set_core_task_types(WorkerTaskTypes {
         enable_workflows: true,
         enable_local_activities: false,
         enable_remote_activities: false,
         enable_nexus: true,
-    };
+    });
     // This test uses a tokio watch channel directly from workflow code to
     // coordinate with the test harness, which triggers nondeterminism detection.
     starter.sdk_config.detect_nondeterministic_futures = false;
-    let mut worker = starter.worker().await;
-    let core_worker = starter.get_worker().await;
+    let core_worker = starter.get_core_worker().await;
 
     let endpoint = mk_nexus_endpoint(&mut starter).await;
     let schedule_to_close_timeout = Some(Duration::from_secs(5));
 
     let (caller_op_future_tx, caller_op_future_rx) = watch::channel(false);
-    worker
+    starter
+        .sdk_config
         .register_workflow_with_factory({
             let endpoint = endpoint.clone();
             let caller_op_future_tx = caller_op_future_tx.clone();
@@ -979,7 +987,8 @@ async fn nexus_cancellation_types(
     let cancellation_wait_happened = Arc::new(AtomicBool::new(false));
     let (cancellation_tx, mut cancellation_rx) = watch::channel(false);
     let (handler_exited_tx, mut handler_exited_rx) = watch::channel(false);
-    worker
+    starter
+        .sdk_config
         .register_workflow_with_factory({
             let cancellation_wait_happened = cancellation_wait_happened.clone();
             let cancellation_tx = cancellation_tx.clone();
@@ -993,9 +1002,10 @@ async fn nexus_cancellation_types(
             }
         })
         .unwrap();
+    let mut worker = starter.worker().await;
     let submitter = worker.get_submitter_handle();
     let wf_handle = starter.start_with_worker(wf_name, &mut worker).await;
-    let client = starter.get_client().await;
+    let client = starter.get_core_client().await;
     let (handler_wf_id_tx, mut handler_wf_id_rx) = tokio::sync::oneshot::channel();
     let completer_id = &format!("completer-{}", rand_6_chars());
     let nexus_task_handle = async {

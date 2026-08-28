@@ -2,11 +2,11 @@ mod options;
 mod view;
 
 pub use options::{
-    ActivityCancellationType, ActivityCloseTimeouts, ActivityOptions,
-    ChildWorkflowCancellationType, ChildWorkflowOptions, ContinueAsNewOptions,
-    ContinueAsNewVersioningBehavior, LocalActivityOptions, NexusOperationCancellationType,
-    NexusOperationOptions, ParentClosePolicy, Signal, SignalData, SignalWorkflowOptions,
-    TimerOptions, VersioningIntent, WaitConditionOptions, WorkflowIdReusePolicy,
+    ActivityCancellationType, ActivityOptions, ChildWorkflowCancellationType, ChildWorkflowOptions,
+    ContinueAsNewOptions, ContinueAsNewVersioningBehavior, LocalActivityOptions,
+    NexusOperationCancellationType, NexusOperationOptions, ParentClosePolicy,
+    SignalWorkflowOptions, TimerOptions, VersioningIntent, WaitConditionOptions,
+    WorkflowIdReusePolicy,
 };
 pub use temporalio_common_wasm::protos::coresdk::child_workflow::StartChildWorkflowExecutionFailedCause;
 pub use view::{NamespacedWorkflowInfo, WorkflowContextView};
@@ -86,9 +86,8 @@ use temporalio_common_wasm::{
                 CancelChildWorkflowExecution, CancelSignalWorkflow, CancelTimer,
                 ModifyWorkflowProperties, RequestCancelActivity,
                 RequestCancelExternalWorkflowExecution, RequestCancelLocalActivity,
-                RequestCancelNexusOperation, SetPatchMarker, SignalExternalWorkflowExecution,
-                UpsertWorkflowSearchAttributes, signal_external_workflow_execution,
-                workflow_command,
+                RequestCancelNexusOperation, SetPatchMarker, UpsertWorkflowSearchAttributes,
+                signal_external_workflow_execution, workflow_command,
             },
         },
         temporal::api::{
@@ -486,8 +485,28 @@ struct WorkflowContextInner {
     data_converter: DataConverter,
     patch_activation_callback: Option<PatchActivationCallback>,
     state_mutated: Cell<bool>,
+    active_handlers: Cell<usize>,
+    condition_wakers: RefCell<Vec<Waker>>,
     current_waker: RefCell<Option<Waker>>,
     workflow_interceptors: Rc<[Arc<dyn WorkflowInterceptor>]>,
+}
+
+pub(crate) struct HandlerExecutionGuard {
+    base: BaseWorkflowContext,
+}
+
+impl Drop for HandlerExecutionGuard {
+    fn drop(&mut self) {
+        let active_handlers = self.base.inner.active_handlers.get();
+        debug_assert!(active_handlers > 0, "handler execution count underflow");
+        self.base
+            .inner
+            .active_handlers
+            .set(active_handlers.saturating_sub(1));
+        if active_handlers <= 1 {
+            self.base.wake_condition_waiters();
+        }
+    }
 }
 
 /// Identical to [`CancellableID`], but only containing command type and seq number, omitting any reason.
@@ -546,10 +565,6 @@ pub struct WorkflowContext<W> {
     sync: SyncWorkflowContext<W>,
     /// The workflow instance
     workflow_state: Rc<RefCell<W>>,
-    /// Wakers registered by `wait_condition` futures. Drained and woken on
-    /// every `state_mut` call so that waker-based combinators (e.g.
-    /// `FuturesOrdered`) re-poll the condition after state changes.
-    condition_wakers: Rc<RefCell<Vec<Waker>>>,
 }
 
 impl<W> Clone for WorkflowContext<W> {
@@ -557,7 +572,6 @@ impl<W> Clone for WorkflowContext<W> {
         Self {
             sync: self.sync.clone(),
             workflow_state: self.workflow_state.clone(),
-            condition_wakers: self.condition_wakers.clone(),
         }
     }
 }
@@ -624,6 +638,8 @@ impl BaseWorkflowContext {
                 data_converter,
                 patch_activation_callback,
                 state_mutated: Cell::new(false),
+                active_handlers: Cell::new(0),
+                condition_wakers: Default::default(),
                 current_waker: RefCell::new(None),
                 workflow_interceptors,
             }),
@@ -643,6 +659,24 @@ impl BaseWorkflowContext {
     /// Mark that workflow state has been mutated.
     pub(crate) fn set_state_mutated(&self) {
         self.inner.state_mutated.set(true);
+    }
+
+    pub(crate) fn all_handlers_finished(&self) -> bool {
+        self.inner.active_handlers.get() == 0
+    }
+
+    pub(crate) fn track_handler(&self) -> HandlerExecutionGuard {
+        self.inner
+            .active_handlers
+            .set(self.inner.active_handlers.get() + 1);
+        HandlerExecutionGuard { base: self.clone() }
+    }
+
+    fn wake_condition_waiters(&self) {
+        let _guard = SdkWakeGuard::new();
+        for waker in self.inner.condition_wakers.borrow_mut().drain(..) {
+            waker.wake();
+        }
     }
 
     pub(crate) fn take_runtime_progress(&self) -> bool {
@@ -824,10 +858,8 @@ impl BaseWorkflowContext {
                 }
             };
             let payload_converter = base_ctx.inner.data_converter.payload_converter();
-            let ctx = SerializationContext {
-                data: &SerializationContextData::Workflow,
-                converter: payload_converter,
-            };
+            let ctx =
+                SerializationContext::new(&SerializationContextData::Workflow, payload_converter);
             match payload_converter.to_payloads(&ctx, &input) {
                 Ok(payloads) => {
                     let cancellation_token = opts
@@ -920,10 +952,8 @@ impl BaseWorkflowContext {
                 }
             };
             let payload_converter = base_ctx.inner.data_converter.payload_converter();
-            let ctx = SerializationContext {
-                data: &SerializationContextData::Workflow,
-                converter: payload_converter,
-            };
+            let ctx =
+                SerializationContext::new(&SerializationContextData::Workflow, payload_converter);
             match payload_converter.to_payloads(&ctx, &input) {
                 Ok(payloads) => {
                     let cancellation_token = opts
@@ -1004,10 +1034,8 @@ impl BaseWorkflowContext {
                 }
             };
             let payload_converter = base_ctx.inner.data_converter.payload_converter();
-            let ctx = SerializationContext {
-                data: &SerializationContextData::Workflow,
-                converter: payload_converter,
-            };
+            let ctx =
+                SerializationContext::new(&SerializationContextData::Workflow, payload_converter);
             let payloads = match payload_converter.to_payloads(&ctx, &input) {
                 Ok(payloads) => payloads,
                 Err(err) => {
@@ -1129,19 +1157,21 @@ impl BaseWorkflowContext {
         target: SignalWorkflowTarget,
         signal: S,
         input: S::Input,
-        cancellation_token: Option<WorkflowCancellationToken>,
+        options: SignalWorkflowOptions,
     ) -> CancellableWorkflowOutboundFuture<SignalWorkflowResult> {
         let input = SignalWorkflowInput::new(
             S::name(&signal).to_string(),
             target,
             Box::new(input),
-            cancellation_token,
+            options,
         );
         let base_ctx = self.clone();
         let next = WorkflowNext::new(move |input: SignalWorkflowInput| {
-            let (signal_name, target, input, headers, cancellation_token) = input.into_parts();
-            let cancellation_token =
-                cancellation_token.unwrap_or_else(|| base_ctx.cancellation_token());
+            let (signal_name, target, input, headers, mut options) = input.into_parts();
+            let cancellation_token = options
+                .cancellation_token
+                .take()
+                .unwrap_or_else(|| base_ctx.cancellation_token());
             let input = match input.downcast::<S::Input>() {
                 Ok(input) => *input,
                 Err(_) => {
@@ -1156,10 +1186,8 @@ impl BaseWorkflowContext {
                 }
             };
             let payload_converter = base_ctx.data_converter().payload_converter();
-            let ctx = SerializationContext {
-                data: &SerializationContextData::Workflow,
-                converter: payload_converter,
-            };
+            let ctx =
+                SerializationContext::new(&SerializationContextData::Workflow, payload_converter);
             let payloads = match payload_converter.to_payloads(&ctx, &input) {
                 Ok(payloads) => payloads,
                 Err(err) => {
@@ -1185,8 +1213,6 @@ impl BaseWorkflowContext {
                     },
                 ),
             };
-            let mut signal = Signal::new(signal_name, payloads);
-            signal.data.headers = headers;
             let seq = base_ctx
                 .inner
                 .seq_nums
@@ -1200,19 +1226,11 @@ impl BaseWorkflowContext {
                 .inner
                 .runtime
                 .register_unblocker(PendingCommandId::SignalExternal(seq), unblocker);
-            let signal = signal.into_invocation();
-            base_ctx.inner.runtime.host.push_command(
-                workflow_command::Variant::SignalExternalWorkflowExecution(
-                    SignalExternalWorkflowExecution {
-                        seq,
-                        signal_name: signal.signal_name,
-                        args: signal.input,
-                        target: Some(target),
-                        headers: signal.headers,
-                    },
-                )
-                .into(),
-            );
+            base_ctx
+                .inner
+                .runtime
+                .host
+                .push_command(options.into_command(seq, signal_name, payloads, headers, target));
             cancellable_outbound(SignalChildFut::Running {
                 inner: cmd,
                 data_converter: base_ctx.data_converter().clone(),
@@ -1433,6 +1451,13 @@ impl<W> SyncWorkflowContext<W> {
         self.base.inner.shared.borrow().is_replaying_history_events
     }
 
+    /// Returns whether all currently dispatched signal and update handlers have finished.
+    ///
+    /// This includes the current handler invocation, if any, and all inbound interceptor work.
+    pub fn all_handlers_finished(&self) -> bool {
+        self.base.all_handlers_finished()
+    }
+
     /// Returns true if the server suggests this workflow should continue-as-new
     pub fn continue_as_new_suggested(&self) -> bool {
         self.base
@@ -1510,10 +1535,7 @@ impl<W> SyncWorkflowContext<W> {
                 Err(_) => return Err(outbound_type_error("continue-as-new input").into()),
             };
             let pc = base_ctx.data_converter().payload_converter();
-            let ctx = SerializationContext {
-                data: &SerializationContextData::Workflow,
-                converter: pc,
-            };
+            let ctx = SerializationContext::new(&SerializationContextData::Workflow, pc);
             let arguments = pc
                 .to_payloads(&ctx, &*input)
                 .map_err(WorkflowTermination::from)?;
@@ -1736,17 +1758,20 @@ impl<W> SyncWorkflowContext<W> {
     where
         K: Into<String>,
     {
+        let payload_converter = self.payload_converter();
+        let context =
+            SerializationContext::new(&SerializationContextData::Workflow, payload_converter);
         let mut fields = HashMap::new();
         let mut local_updates = Vec::new();
         for (key, value) in updates {
             let key = key.into();
             let (command_payload, local_payload) = match value {
                 Some(value) => {
-                    let payload = value.to_payload(self.payload_converter())?;
+                    let payload = payload_converter.to_payload(&context, &value)?;
                     (payload.clone(), Some(payload))
                 }
                 None => (
-                    MemoValue::new(()).to_payload(self.payload_converter())?,
+                    payload_converter.to_payload(&context, &MemoValue::new(()))?,
                     None,
                 ),
             };
@@ -1814,7 +1839,6 @@ impl<W> WorkflowContext<W> {
                 _phantom: PhantomData,
             },
             workflow_state,
-            condition_wakers: Rc::new(RefCell::new(Vec::new())),
         }
     }
 
@@ -1827,7 +1851,6 @@ impl<W> WorkflowContext<W> {
                 _phantom: PhantomData,
             },
             workflow_state: self.workflow_state.clone(),
-            condition_wakers: self.condition_wakers.clone(),
         }
     }
 
@@ -1915,6 +1938,28 @@ impl<W> WorkflowContext<W> {
     /// Returns true if the current work is replaying history events
     pub fn is_replaying_history_events(&self) -> bool {
         self.sync.is_replaying_history_events()
+    }
+
+    /// Returns whether all currently dispatched signal and update handlers have finished.
+    ///
+    /// Consider waiting on this condition before completing or continuing as new so in-progress
+    /// handlers are not interrupted. Use a cloned context in [`Self::wait_condition`]:
+    ///
+    /// ```rust
+    /// # use temporalio_workflow::{WorkflowContext, WorkflowResult};
+    /// # struct MyWorkflow;
+    /// # async fn wait_for_handlers(ctx: &mut WorkflowContext<MyWorkflow>) -> WorkflowResult<()> {
+    /// let wait_condition_ctx = ctx.clone();
+    /// ctx.wait_condition(move |_| wait_condition_ctx.all_handlers_finished())
+    ///     .await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// The check includes inbound interceptor work and the current handler invocation, if any.
+    /// It does not prevent future signal or update handlers from starting.
+    pub fn all_handlers_finished(&self) -> bool {
+        self.sync.all_handlers_finished()
     }
 
     /// Returns true if the server suggests this workflow should continue-as-new
@@ -2128,10 +2173,7 @@ impl<W> WorkflowContext<W> {
     /// `FuturesOrdered`) re-poll them on the next pass.
     pub fn state_mut<R>(&self, f: impl FnOnce(&mut W) -> R) -> R {
         let result = f(&mut *self.workflow_state.borrow_mut());
-        let _guard = SdkWakeGuard::new();
-        for waker in self.condition_wakers.borrow_mut().drain(..) {
-            waker.wake();
-        }
+        self.sync.base.wake_condition_waiters();
         self.sync.base.set_state_mutated();
         result
     }
@@ -2182,7 +2224,12 @@ impl<W> WorkflowContext<W> {
             } else if cancelled.as_mut().poll(cx).is_ready() {
                 Poll::Ready(Err(WorkflowCancellationError::new(token.reason())))
             } else {
-                self.condition_wakers.borrow_mut().push(cx.waker().clone());
+                self.sync
+                    .base
+                    .inner
+                    .condition_wakers
+                    .borrow_mut()
+                    .push(cx.waker().clone());
                 Poll::Pending
             }
         })
@@ -2534,6 +2581,7 @@ impl Future for LATimerBackoffFut {
                     .expect("duration converts ok"),
                 cancellation_token: Some(self.cancellation_token.clone()),
                 summary: None,
+                event_group_markers: self.la_opts.event_group_markers.clone(),
             });
             self.timer_fut = Some(Box::pin(timer_f));
             self.next_attempt = b.attempt;
@@ -2624,7 +2672,7 @@ where
                                     message: "Activity completed without a status".to_string(),
                                     ..Default::default()
                                 },
-                                ActivityExecutionDecodeHint { cancelled: false },
+                                ActivityExecutionDecodeHint::new(false),
                             )
                             .expect("synthetic activity failure should decode")
                     })?;
@@ -2632,10 +2680,10 @@ where
                     match status {
                         activity_resolution::Status::Completed(success) => {
                             let payload = success.result.unwrap_or_default();
-                            let ctx = SerializationContext {
-                                data: &SerializationContextData::Workflow,
-                                converter: data_converter.payload_converter(),
-                            };
+                            let ctx = SerializationContext::new(
+                                &SerializationContextData::Workflow,
+                                data_converter.payload_converter(),
+                            );
                             data_converter
                                 .payload_converter()
                                 .from_payload::<Output>(&ctx, payload)
@@ -2644,12 +2692,12 @@ where
                         activity_resolution::Status::Failed(f) => Err(data_converter.to_error(
                             &SerializationContextData::Workflow,
                             f.failure.unwrap_or_default(),
-                            ActivityExecutionDecodeHint { cancelled: false },
+                            ActivityExecutionDecodeHint::new(false),
                         )?),
                         activity_resolution::Status::Cancelled(c) => Err(data_converter.to_error(
                             &SerializationContextData::Workflow,
                             c.failure.unwrap_or_default(),
-                            ActivityExecutionDecodeHint { cancelled: true },
+                            ActivityExecutionDecodeHint::new(true),
                         )?),
                         activity_resolution::Status::Backoff(_) => {
                             panic!("DoBackoff should be handled by LATimerBackoffFut")
@@ -2796,17 +2844,17 @@ where
                                         .to_string(),
                                     ..Default::default()
                                 },
-                                ChildWorkflowExecutionDecodeHint,
+                                ChildWorkflowExecutionDecodeHint::default(),
                             )
                             .expect("synthetic child workflow failure should decode")
                     })?;
                     match status {
                         child_workflow_result::Status::Completed(success) => {
                             let payloads = success.result.into_iter().collect();
-                            let ctx = SerializationContext {
-                                data: &SerializationContextData::Workflow,
-                                converter: data_converter.payload_converter(),
-                            };
+                            let ctx = SerializationContext::new(
+                                &SerializationContextData::Workflow,
+                                data_converter.payload_converter(),
+                            );
                             data_converter
                                 .payload_converter()
                                 .from_payloads::<Output>(&ctx, payloads)
@@ -2815,13 +2863,13 @@ where
                         child_workflow_result::Status::Failed(f) => Err(data_converter.to_error(
                             &SerializationContextData::Workflow,
                             f.failure.unwrap_or_default(),
-                            ChildWorkflowExecutionDecodeHint,
+                            ChildWorkflowExecutionDecodeHint::default(),
                         )?),
                         child_workflow_result::Status::Cancelled(c) => Err(data_converter
                             .to_error(
                                 &SerializationContextData::Workflow,
                                 c.failure.unwrap_or_default(),
-                                ChildWorkflowExecutionDecodeHint,
+                                ChildWorkflowExecutionDecodeHint::default(),
                             )?),
                     }
                 }),
@@ -2943,7 +2991,7 @@ where
                         Err(base_ctx.data_converter().to_error(
                             &SerializationContextData::Workflow,
                             c.failure.unwrap_or_default(),
-                            ChildWorkflowStartDecodeHint,
+                            ChildWorkflowStartDecodeHint::default(),
                         )?)
                     }
                 }),
@@ -3020,7 +3068,7 @@ where
                 Poll::Ready(Err(failure)) => Poll::Ready(Err(data_converter.to_error(
                     &SerializationContextData::Workflow,
                     failure,
-                    WorkflowSignalDecodeHint,
+                    WorkflowSignalDecodeHint::default(),
                 )?)),
             },
             SignalChildFut::Terminated => panic!("polled after termination"),
@@ -3099,7 +3147,7 @@ where
             },
             signal,
             input,
-            options.cancellation_token,
+            options,
         )
     }
 }
@@ -3146,7 +3194,7 @@ impl ExternalWorkflowHandle {
             },
             signal,
             input,
-            options.cancellation_token,
+            options,
         )
     }
 
@@ -3215,6 +3263,7 @@ mod tests {
     use temporalio_common_wasm::{
         RetryPolicy,
         data_converters::{TemporalDeserializable, TemporalSerializable},
+        error::OutgoingWorkflowError,
         protos::{
             coresdk::{
                 AsJsonPayloadExt, FromJsonPayloadExt,
@@ -3228,6 +3277,7 @@ mod tests {
             temporal::api::{
                 common::v1::{Payload, RetryPolicy as ProtoRetryPolicy},
                 enums::v1::ContinueAsNewVersioningBehavior as ProtoContinueAsNewVersioningBehavior,
+                sdk::v1::{EventGroupMarker, event_group_marker},
             },
         },
     };
@@ -3457,6 +3507,7 @@ mod tests {
             duration: Duration::from_secs(1),
             cancellation_token: Some(token.clone()),
             summary: None,
+            event_group_markers: vec![],
         });
 
         let mut activity_options = ActivityOptions::start_to_close_timeout(Duration::from_secs(1));
@@ -3671,8 +3722,17 @@ mod tests {
             Vec::new(),
         );
         let token = WorkflowCancellationToken::new();
+        let marker = EventGroupMarker {
+            variant: Some(event_group_marker::Variant::Label(
+                event_group_marker::Label {
+                    id: "la-group".to_string(),
+                    label: Some("la-group".as_json_payload().unwrap()),
+                },
+            )),
+        };
         let mut options = LocalActivityOptions {
             schedule_to_close_timeout: Some(Duration::from_secs(10)),
+            event_group_markers: vec![marker.clone()],
             ..Default::default()
         };
         options.cancellation_token = Some(token.clone());
@@ -3698,12 +3758,19 @@ mod tests {
         let commands = host.commands.borrow();
         assert!(commands.iter().any(|command| matches!(
             &command.variant,
-            Some(workflow_command::Variant::StartTimer(_))
-        )));
-        assert!(commands.iter().any(|command| matches!(
-            &command.variant,
             Some(workflow_command::Variant::CancelTimer(_))
         )));
+
+        let start_timer = commands
+            .iter()
+            .find(|command| {
+                matches!(
+                    &command.variant,
+                    Some(workflow_command::Variant::StartTimer(_))
+                )
+            })
+            .expect("backoff StartTimer is issued");
+        assert_eq!(start_timer.event_group_markers, [marker]);
     }
 
     #[test]
@@ -4197,7 +4264,7 @@ mod tests {
     }
 
     #[test]
-    fn continue_as_new_reports_serialization_errors() {
+    fn continue_as_new_preserves_input_serialization_errors() {
         #[derive(Debug)]
         struct FailingInput;
 
@@ -4259,23 +4326,24 @@ mod tests {
         );
         let ctx = WorkflowContext::from_base(base, Rc::new(RefCell::new(FailingWorkflow)));
 
-        let err = ctx
+        let termination = ctx
             .continue_as_new(FailingInput, ContinueAsNewOptions::default())
-            .expect_err("serialization errors should be surfaced");
-
-        let WorkflowTermination::Failed(err) = err else {
-            panic!("expected failed termination, got {err:?}");
+            .expect_err("input serialization should fail");
+        let WorkflowTermination::Failed(OutgoingWorkflowError::PayloadConversion(err)) =
+            termination
+        else {
+            panic!("expected a payload conversion failure");
         };
         assert_eq!(err.to_string(), "Encoding error: serialization failure");
     }
 
     #[test]
-    fn continue_as_new_reports_memo_serialization_errors() {
+    fn continue_as_new_preserves_memo_serialization_errors() {
         let ctx = test_context();
         let mut memo = MemoValues::new();
         memo.insert("invalid", FailingMemoValue);
 
-        let err = ctx
+        let termination = ctx
             .continue_as_new(
                 7,
                 ContinueAsNewOptions {
@@ -4283,10 +4351,11 @@ mod tests {
                     ..Default::default()
                 },
             )
-            .expect_err("memo serialization errors should be surfaced");
-
-        let WorkflowTermination::Failed(err) = err else {
-            panic!("expected failed termination, got {err:?}");
+            .expect_err("memo serialization should fail");
+        let WorkflowTermination::Failed(OutgoingWorkflowError::PayloadConversion(err)) =
+            termination
+        else {
+            panic!("expected a payload conversion failure");
         };
         assert_eq!(
             err.to_string(),
@@ -4363,7 +4432,12 @@ mod tests {
         };
         let fields = &command.upserted_memo.as_ref().unwrap().fields;
         let payload_converter = PayloadConverter::default();
-        let removal_payload = MemoValue::new(()).to_payload(&payload_converter).unwrap();
+        let removal_payload = payload_converter
+            .to_payload(
+                &SerializationContext::new(&SerializationContextData::Workflow, &payload_converter),
+                &MemoValue::new(()),
+            )
+            .unwrap();
         assert_eq!(fields.get("old"), Some(&removal_payload));
         assert_eq!(
             u32::from_json_payload(fields.get("new").unwrap()).unwrap(),

@@ -1,14 +1,11 @@
 use crate::common::{CoreWfStarter, NAMESPACE, get_integ_connection};
 use std::time::Duration;
 use temporalio_client::{Client, NamespacedClient, WorkflowStartOptions, grpc::WorkflowService};
-use temporalio_common::{
-    protos::temporal::api::{
-        common::v1::WorkflowType,
-        enums::v1::TaskQueueKind,
-        taskqueue::v1::TaskQueue,
-        workflowservice::v1::{StartWorkflowExecutionRequest, StartWorkflowExecutionResponse},
-    },
-    worker::WorkerTaskTypes,
+use temporalio_common::protos::temporal::api::{
+    common::v1::WorkflowType,
+    enums::v1::TaskQueueKind,
+    taskqueue::v1::TaskQueue,
+    workflowservice::v1::{StartWorkflowExecutionRequest, StartWorkflowExecutionResponse},
 };
 use temporalio_macros::{workflow, workflow_methods};
 use temporalio_sdk::{WorkflowContext, WorkflowResult};
@@ -30,17 +27,16 @@ impl EagerWf {
 async fn eager_wf_start() {
     let wf_name = "eager_wf_start";
     let mut starter = CoreWfStarter::new(wf_name);
-    starter.sdk_config.task_types = WorkerTaskTypes::workflow_only();
     starter.workflow_options.enable_eager_workflow_start = true;
     // hang the test if eager task dispatch failed
     starter.workflow_options.task_timeout = Some(Duration::from_secs(1500));
+    starter.sdk_config.register_workflow::<EagerWf>().unwrap();
     let mut worker = starter.worker().await;
-    worker.register_workflow::<EagerWf>().unwrap();
     let task_queue = starter.get_task_queue().to_string();
     let res = eager_start(
         wf_name,
         task_queue,
-        &starter.get_client().await,
+        &starter.get_core_client().await,
         starter.workflow_options.clone(),
     )
     .await;
@@ -55,12 +51,11 @@ async fn eager_wf_start() {
 async fn eager_wf_start_different_clients() {
     let wf_name = "eager_wf_start";
     let mut starter = CoreWfStarter::new(wf_name);
-    starter.sdk_config.task_types = WorkerTaskTypes::workflow_only();
     starter.workflow_options.enable_eager_workflow_start = true;
     // hang the test if wf task needs retry
     starter.workflow_options.task_timeout = Some(Duration::from_secs(1500));
+    starter.sdk_config.register_workflow::<EagerWf>().unwrap();
     let mut worker = starter.worker().await;
-    worker.register_workflow::<EagerWf>().unwrap();
 
     let connection = get_integ_connection(None).await;
     let client_opts = temporalio_client::ClientOptions::new(NAMESPACE).build();

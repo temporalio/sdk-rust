@@ -5,7 +5,8 @@ mod failure_converter;
 
 pub use failure_converter::{
     ActivityExecutionDecodeHint, ChildWorkflowExecutionDecodeHint, ChildWorkflowStartDecodeHint,
-    DefaultFailureConverter, FailureConverter, FailureDecodeHint, WorkflowSignalDecodeHint,
+    DefaultFailureConverter, FailureConverter, FailureDecodeHint, NoopDecodeHint,
+    WorkflowSignalDecodeHint,
 };
 
 use crate::protos::temporal::api::common::v1::Payload;
@@ -50,10 +51,7 @@ impl DataConverter {
         data: &SerializationContextData,
         val: &T,
     ) -> Result<Payload, PayloadConversionError> {
-        let context = SerializationContext {
-            data,
-            converter: &self.payload_converter,
-        };
+        let context = SerializationContext::new(data, &self.payload_converter);
         let payload = self.payload_converter.to_payload(&context, val)?;
         let encoded = self.codec.encode(data, vec![payload]).await?;
         encoded
@@ -68,10 +66,7 @@ impl DataConverter {
         data: &SerializationContextData,
         payload: Payload,
     ) -> Result<T, PayloadConversionError> {
-        let context = SerializationContext {
-            data,
-            converter: &self.payload_converter,
-        };
+        let context = SerializationContext::new(data, &self.payload_converter);
         let decoded = self.codec.decode(data, vec![payload]).await?;
         let payload = decoded
             .into_iter()
@@ -86,10 +81,7 @@ impl DataConverter {
         data: &SerializationContextData,
         val: &T,
     ) -> Result<Vec<Payload>, PayloadConversionError> {
-        let context = SerializationContext {
-            data,
-            converter: &self.payload_converter,
-        };
+        let context = SerializationContext::new(data, &self.payload_converter);
         let payloads = self.payload_converter.to_payloads(&context, val)?;
         self.codec.encode(data, payloads).await
     }
@@ -100,10 +92,7 @@ impl DataConverter {
         data: &SerializationContextData,
         payloads: Vec<Payload>,
     ) -> Result<T, PayloadConversionError> {
-        let context = SerializationContext {
-            data,
-            converter: &self.payload_converter,
-        };
+        let context = SerializationContext::new(data, &self.payload_converter);
         let decoded = self.codec.decode(data, payloads).await?;
         self.payload_converter.from_payloads(&context, decoded)
     }
@@ -149,6 +138,7 @@ impl DataConverter {
 
 /// Data about the serialization context, indicating where the serialization is occurring.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum SerializationContextData {
     /// Serialization is occurring in a workflow context.
     Workflow,
@@ -163,14 +153,24 @@ pub enum SerializationContextData {
 /// Context for serialization operations, including the kind of context and the
 /// payload converter for nested serialization.
 #[derive(Clone, Copy)]
+#[non_exhaustive]
 pub struct SerializationContext<'a> {
     /// The kind of serialization context (workflow, activity, etc.).
     pub data: &'a SerializationContextData,
     /// Allows nested types to serialize their contents using the same converter.
     pub converter: &'a PayloadConverter,
 }
+
+impl<'a> SerializationContext<'a> {
+    /// Creates a serialization context for the given execution context and payload converter.
+    pub fn new(data: &'a SerializationContextData, converter: &'a PayloadConverter) -> Self {
+        Self { data, converter }
+    }
+}
+
 /// Converts values to and from [`Payload`]s using different encoding strategies.
 #[derive(Clone)]
+#[non_exhaustive]
 pub enum PayloadConverter {
     /// Uses a serde-based converter for encoding/decoding.
     Serde(Arc<dyn ErasedSerdePayloadConverter>),
@@ -354,10 +354,7 @@ impl DecodablePayloads {
         &self,
     ) -> Result<T, PayloadConversionError> {
         self.payload_converter.from_payloads(
-            &SerializationContext {
-                data: &self.context,
-                converter: &self.payload_converter,
-            },
+            &SerializationContext::new(&self.context, &self.payload_converter),
             self.payloads.clone(),
         )
     }
@@ -401,10 +398,7 @@ impl RawValue {
         RawValue::new(vec![
             converter
                 .to_payload(
-                    &SerializationContext {
-                        data: &SerializationContextData::None,
-                        converter,
-                    },
+                    &SerializationContext::new(&SerializationContextData::None, converter),
                     value,
                 )
                 .unwrap(),
@@ -415,10 +409,7 @@ impl RawValue {
     pub fn to_value<T: TemporalDeserializable + 'static>(self, converter: &PayloadConverter) -> T {
         converter
             .from_payload(
-                &SerializationContext {
-                    data: &SerializationContextData::None,
-                    converter,
-                },
+                &SerializationContext::new(&SerializationContextData::None, converter),
                 self.payloads.into_iter().next().unwrap(),
             )
             .unwrap()
@@ -821,10 +812,7 @@ mod tests {
     #[test]
     fn test_empty_payloads_as_unit_type() {
         let converter = PayloadConverter::default();
-        let ctx = SerializationContext {
-            data: &SerializationContextData::Workflow,
-            converter: &converter,
-        };
+        let ctx = SerializationContext::new(&SerializationContextData::Workflow, &converter);
 
         let empty_payloads: Vec<Payload> = vec![];
         let result: Result<(), _> = converter.from_payloads(&ctx, empty_payloads);
@@ -835,10 +823,7 @@ mod tests {
     #[test]
     fn test_unit_type_roundtrip_serde() {
         let converter = PayloadConverter::serde_json();
-        let ctx = SerializationContext {
-            data: &SerializationContextData::Workflow,
-            converter: &converter,
-        };
+        let ctx = SerializationContext::new(&SerializationContextData::Workflow, &converter);
 
         let payloads = converter.to_payloads(&ctx, &()).unwrap();
         assert!(payloads.is_empty());
@@ -850,10 +835,7 @@ mod tests {
     #[test]
     fn test_unit_composite_roundtrip() {
         let converter = PayloadConverter::default();
-        let ctx = SerializationContext {
-            data: &SerializationContextData::Workflow,
-            converter: &converter,
-        };
+        let ctx = SerializationContext::new(&SerializationContextData::Workflow, &converter);
 
         let payloads = converter.to_payloads(&ctx, &()).unwrap();
         assert!(payloads.is_empty());
@@ -865,10 +847,7 @@ mod tests {
     #[test]
     fn test_unit_to_payload_roundtrip() {
         let converter = PayloadConverter::default();
-        let ctx = SerializationContext {
-            data: &SerializationContextData::Workflow,
-            converter: &converter,
-        };
+        let ctx = SerializationContext::new(&SerializationContextData::Workflow, &converter);
 
         let mut payloads = vec![converter.to_payload(&ctx, &()).unwrap()];
         assert!(is_unit_payloads(&payloads));
@@ -881,10 +860,7 @@ mod tests {
     #[test]
     fn test_unit_use_wrappers_returns_wrong_encoding() {
         let converter = PayloadConverter::UseWrappers;
-        let ctx = SerializationContext {
-            data: &SerializationContextData::Workflow,
-            converter: &converter,
-        };
+        let ctx = SerializationContext::new(&SerializationContextData::Workflow, &converter);
 
         let result = converter.to_payloads(&ctx, &());
         assert!(
@@ -896,10 +872,7 @@ mod tests {
     #[test]
     fn multi_args_round_trip() {
         let converter = PayloadConverter::default();
-        let ctx = SerializationContext {
-            data: &SerializationContextData::Workflow,
-            converter: &converter,
-        };
+        let ctx = SerializationContext::new(&SerializationContextData::Workflow, &converter);
 
         let args = MultiArgs2("hello".to_string(), 42i32);
         let payloads = converter.to_payloads(&ctx, &args).unwrap();
@@ -919,10 +892,7 @@ mod tests {
         let converter = PayloadConverter::default();
         let payloads = converter
             .to_payloads(
-                &SerializationContext {
-                    data: &SerializationContextData::Workflow,
-                    converter: &converter,
-                },
+                &SerializationContext::new(&SerializationContextData::Workflow, &converter),
                 value,
             )
             .unwrap();

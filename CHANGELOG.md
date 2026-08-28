@@ -2,10 +2,24 @@
 High-level release notes.
 Loosely based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+This file serves users of the Rust SDK. crates/sdk-core/CHANGELOG.md serves users of
+the other Temporal SDKs, whose workers and clients run on Core.
+
+Log a change here only if a Rust SDK user can observe it: different behavior, an option
+they can set, a new log or metric, a different interaction with the server. The question
+is what the user sees, not which crate or which files your PR touched.
+
+The Rust SDK runs on Core, so a user-observable change in Core behavior normally belongs
+here as well as in the sdk-core changelog, worded for each audience. An internal Rust API
+change that no SDK user can observe belongs in neither. The same applies to the crates
+Core shares: temporalio-client, temporalio-common, temporalio-common-wasm,
+temporalio-macros, and temporalio-protos.
+
 When your PR includes a user-facing change, add an entry below under the
-appropriate heading (create the heading if it does not yet exist). Within
-each heading content can be free-form. Feel free to include examples, links
-to docs, or any other relevant information.
+appropriate heading (create the heading if it does not yet exist) in the
+Unreleased section — never under a released version. Within each heading content
+can be free-form. Feel free to include examples, links to docs, or any other
+relevant information.
 
 ### Added            — new features
 ### Changed          — changes in existing functionality
@@ -20,14 +34,150 @@ to docs, or any other relevant information.
 ## Unreleased
 
 ### Added
+* `LocalActivityOptions::include_arguments_into_marker` allows Rust workflows to opt in to
+  recording local activity arguments in Workflow history.
+* `WorkflowHandle::get_update_handle` creates a typed handle for an existing Workflow Update from
+  its update ID, allowing callers to wait for the result independently of the original handle.
+* `WorkflowContext::all_handlers_finished` and `SyncWorkflowContext::all_handlers_finished` let
+  Rust workflows wait for active signal and update handler chains before completing or continuing
+  as new.
+* `WorkflowStartOptions::memo` attaches a non-indexed memo when starting a workflow, using the
+  same `MemoValues` type already used by continue-as-new and `WorkflowContext::upsert_memo`.
+  Values are serialized with the client's payload converter and codec, matching how `describe`
+  and `list` read them back.
+* `MemoValue` and `MemoValues` are now exported from `temporalio_common` as well as
+  `temporalio_workflow`, so the same types can be used from clients and workflows.
+* The `temporal_activity_execution_failed` and `temporal_local_activity_execution_failed` worker
+  metrics now carry a `failure_reason` attribute. Each is now split into one time series per
+  reason, which may affect existing dashboards.
+* Workflow task completions larger than the gRPC request size limit are now paginated automatically when the namespace supports it. Paginated workflow task completions require Temporal Server 1.32.0 or later.
+* Update-with-Start support: `Client::start_update_with_start_workflow` and
+  `Client::execute_update_with_start_workflow` start a workflow and send it an update in one atomic
+  operation. `WorkflowUpdateWithStartOptions` requires an ID conflict policy (use `UseExisting` to
+  attach an update to an already-running workflow), provides distinct start and update headers,
+  and controls the atomic RPC. The operation can be intercepted via
+  `ClientInterceptor::update_with_start_workflow`.
+
+### Breaking Changes :boom:
+* The following types are now non-exhaustive: `Priority`, `WorkerDeploymentVersion`,
+  `WorkerCallbacks`, `WorkflowExecutionInfo`, `ActivityCloseTimeouts`,
+  `ActivityExecutionDecodeHint`, child-workflow and signal decode hints,
+  `SerializationContext`, `SerializationContextData`, `PayloadConverter`, `IncomingError`,
+  `ScheduleSpec`, and `ScheduleOverlapPolicy`. Construct structs using their respective builders
+  or constructors (`WorkerCallbacks::new`, `ActivityExecutionDecodeHint::new`, or
+  `SerializationContext::new`); use `Default` for `PayloadConverter`; and add wildcard branches
+  when matching enums.
+* Renamed `ActivityCloseTimeouts::Both` to `ActivityCloseTimeouts::ScheduleAndStartToClose`.
+* Removed the unused `ActExitValue` type. Use `ActivityError::WillCompleteAsync` to mark an
+  activity for asynchronous completion.
+* Removed the test-only `FailOnNondeterminismInterceptor` from the public Rust SDK API.
+* Environment configuration values (`DataSource`, `ClientConfig`, and related profile, TLS, and
+  codec types) are now non-exhaustive. Use their `bon` builders to construct configuration structs,
+  and add a wildcard branch when matching `DataSource`.
+* Values stored in a `MemoValue` must now be `Send + Sync`. It previously held its value in an
+  `Rc` and now uses an `Arc`, so that memos can be built outside a workflow and handed to the
+  client. Only affects memo values that are themselves non-`Send`/non-`Sync`, such as those
+  holding an `Rc` or `RefCell`.
+
+* `Client::signal_with_start_workflow` starts a workflow and sends a typed signal atomically.
+
+### Breaking Changes :boom:
+
+* Signal-with-start is now invoked with `Client::signal_with_start_workflow`; remove uses of
+  `WorkflowStartOptions::start_signal` and `WorkflowStartSignal`.
+
+### Fixed
+* `Worker` shutdown no longer loses an activity result it was still reporting to the server. If
+  shutdown raced such a completion — most likely while the activity's final heartbeat RPC was
+  still in flight — the worker could strand the completion forever: debug builds panicked with
+  `Waiting for all slot permits to release took too long!`, and release builds logged that error
+  and dropped the result, leaving the server to time the activity out before retrying it.
+  Shutdown now drains in-flight completions first.
+* The Prometheus exporter now respects `PrometheusExporterOptions::counters_total_suffix`,
+  appending `_total` to counter metric names when enabled.
+* Workflow start requests now include the client's identity.
+* An activity failure caused by oversized final heartbeat details is now counted in the
+  `temporal_activity_execution_failed` metric as `failure_reason="PayloadsTooLarge"`. Previously it
+  was counted under the reason for the failure the activity itself reported, and was not counted at
+  all when that failure was benign, even though the worker reported a payload-limit failure to the
+  server.
+* Workers configured with a small `max_cached_workflows` no longer briefly stop accepting new
+  workflows. Sticky workflow-task pollers could consume every workflow-cache permit and starve the
+  non-sticky poller, so the worker would stop picking up new workflows until a poll timed out (up to
+  ~60s). The poll balancer now reserves a non-sticky slot against the cache size rather than the
+  slot-supplier size.
+
+## [0.7.0] - 2026-08-17
+
+### Added
+* Support for running Standalone Activities in Rust SDK Worker.
+* Client methods for starting and managing execution of Standalone Activities. 
+* `WorkflowTermination::cancelled_with_details` for recording structured details when a Workflow
+  Execution completes as cancelled.
+* `LoggerFormat` for selecting compact, pretty, or JSON Core console log output. Configured log
+  filters continue to apply to JSON output.
+* The Rust SDK now has an optional `testing` feature with a typed activity test environment and
+  local or external workflow test environments. Local workflow environments manage a Temporal CLI
+  dev server and expose shutdown through their local-server type state.
 * Worker heartbeats now report the SDK runtime, hosting environments, operating system, and
   architecture once per worker, retrying until the first successful delivery. Runtime options can
   disable this reporting, and language SDK bridges can supply their own runtime details. The Rust
   SDK exposes separate runtime options that omit bridge-only runtime overrides.
 * `RpcOptions::builder()` for constructing per-call RPC options.
 * `DnsLoadBalancingOptions::builder()` for configuring DNS re-resolution intervals.
+* Experimental plugin APIs for packaging reusable client and worker configuration, including data
+  converters, interceptors, activities, workflows, and automatic propagation from clients to
+  workers.
+* `WorkflowCancellationToken` for deterministic cancellation of workflow operations.
+* `WorkflowContext::wait_condition_with_options` and `WaitConditionOptions` for waiting with a
+  custom cancellation token.
+* Support for dynamic client certificate resolution via `TlsOptions::client_cert_resolver`, which
+  accepts an `Arc<dyn ResolvesClientCert>` for per-handshake mTLS certificate selection. This enables
+  transparent certificate rotation without process restarts — useful for short-lived certificates
+  managed by Vault, cert-manager, or HSM-backed signers. `ResolvesClientCert`, `CertifiedKey`, and
+  `SignatureScheme` are re-exported from the crate root for convenience.
+* Worker heartbeats now report the SDK runtime, hosting environments, operating system, and
+  architecture once per worker, retrying until the first successful delivery. Set
+  `RuntimeOptions::disable_environment_info` to turn the reporting off.
+* Workers now log a `[TMPRL1104]` warning when a workflow task takes longer than 5 seconds. Set
+  `TEMPORAL_WORKFLOW_TASK_DURATION_WARN_SECONDS` to change the threshold.
+* `SignalWorkflowOptions::summary` attaches a single-line summary to a signal sent to another
+  workflow, which the UI and CLI display alongside the resulting history event.
+
+### Changed
+* Cancellation errors propagated after workflow cancellation now complete the workflow as cancelled
+  instead of failed.
+* `WorkflowReplayer` for workflow history replay, including JSON history helpers
+  and worker-plugin configuration.
+* Experimental worker lifecycle interception through `WorkerInterceptor::run_worker` and
+  `WorkerInterceptor::with_workflow_replay_worker`.
 
 ### Breaking Changes :boom:
+* `WorkflowTermination::Cancelled` now has an optional `details` field. Use
+  `WorkflowTermination::cancelled()` to construct a cancellation without details.
+* Changes to `ActivityInfo`: instead of `workflow_namespace`, `workflow_execution` and `run_id`,
+  there is now `namespace`, `workflow_id`, `workflow_run_id` and `activity_run_id`. 
+  Also, `workflow_type` is now `Option<String>`.
+* `ActivityIdentifier::ById` was split into 2 variants, `ByIdWorkflow` and `ByIdStandalone`.
+  `ActivityIdentifier::by_id` method was renamed to `by_id_workflow`, and `by_id_standalone`
+  was added.
+* `anyhow::Error` no longer converts directly into `WorkflowTermination`. Wrap an error in
+  `ApplicationFailure` to explicitly fail the Workflow Execution.
+* `OutgoingWorkflowError` now has a dedicated `PayloadConversion` variant. Converting activity,
+  child-workflow, and signal errors lifts their payload-conversion variants into it.
+  `OutgoingError`, `OutgoingActivityError`, and `OutgoingWorkflowError` are now non-exhaustive;
+  downstream matches must include a wildcard arm.
+* Removed `InterceptorWithNext`. Register worker interceptors as an ordered vector instead.
+* Ephemeral server APIs now return `EphemeralServerError` instead of `anyhow::Error`, and dev-server
+  log format and level use the non-exhaustive `DevServerLogFormat` and `DevServerLogLevel` enums.
+* Ephemeral server APIs now return the operation-oriented `EphemeralServerError` instead of
+  `anyhow::Error`.
+* Activity macro support now exposes instance requirements through `ExecutableActivity`; the
+  redundant `HasOnlyStaticMethods` marker trait has been removed.
+* `Worker::run` now returns `WorkerRunError` instead of `anyhow::Error`.
+  Non-validation failures are reported as `WorkerRunError::Fatal` with a message and source.
+* `Logger::Console` now requires a `format: Option<LoggerFormat>` field. Use `None` to preserve the
+  previous behavior, including support for `TEMPORAL_CORE_PRETTY_LOGS`.
 * `CancellableFuture` and `CancellableFutureWithReason` now use the inherited `Future::Output`
   associated type instead of a generic output parameter.
 * `TimerOptions` is now tagged with `#[non_exhaustive]`. Use
@@ -59,86 +209,43 @@ to docs, or any other relevant information.
   `PrometheusExporterOptions::builder()` to construct Prometheus exporter options.
 * `WorkerDeploymentOptions` is now tagged with `#[non_exhaustive]`. Use
   `WorkerDeploymentOptions::new(version)` to construct worker deployment options.
-* `PollOptions` is now tagged with `#[non_exhaustive]`. Use `PollOptions::new(task_queue)` to
-  construct polling options.
-* `PollWorkflowOptions` is now tagged with `#[non_exhaustive]`. Use
-  `PollWorkflowOptions::builder()` to construct workflow polling options.
-* `PollActivityOptions` is now tagged with `#[non_exhaustive]`. Use
-  `PollActivityOptions::builder()` to construct activity polling options.
-* `PollNexusOptions` is now tagged with `#[non_exhaustive]`. Use
-  `PollNexusOptions::builder()` to construct Nexus polling options.
 * `LocalActivityOptions` is now tagged with `#[non_exhaustive]`. Use
   `LocalActivityOptions::builder()` to construct local activity options.
 * `NexusOperationOptions` is now tagged with `#[non_exhaustive]`. Use
   `NexusOperationOptions::builder()` to construct Nexus operation options.
 * `WorkflowContext::wait_condition` now returns `Result<(), WorkflowCancellationError>` instead of
   `()` so that workflow cancellation can be propagated to the caller.
-
-### Added
-* `WorkflowCancellationToken` for deterministic cancellation of workflow operations.
-* `WorkflowContext::wait_condition_with_options` and `WaitConditionOptions` for waiting with a
-  custom cancellation token.
-
-### Changed
-* Cancellation errors propagated after workflow cancellation now complete the workflow as cancelled
-  instead of failed.
+* `WorkflowUpdateWaitStage` and `WorkflowStartUpdateOptions::wait_for_stage` have been removed.
+  `start_update` now always waits for the update to be accepted; use `execute_update` to wait for
+  completion.
+* Workflow and activity implementations must now be registered through `WorkerOptions` before
+  constructing a `Worker`; the corresponding registration methods on `Worker` have been removed.
+* `Worker::run` now returns `WorkerRunError` instead of `anyhow::Error`.
+  Non-validation failures are reported as `WorkerRunError::Fatal` with a message and source.
 
 ### Fixed
+* Rust SDK workers now warn when autoscaling task polling encounters errors continuously for one
+  minute. Repeated warnings use exponential backoff up to 15-minute intervals and stop after
+  polling recovers.
+* Unhandled workflow payload conversion errors now fail the Workflow Task so it can retry instead
+  of failing the Workflow Execution. Workflows may still explicitly handle these errors.
+* Workers no longer send worker heartbeats or appear in centralized heartbeat reports before
+  `Worker::run` begins.
+* Local activity resolutions are now delivered to workflows as each activity completes instead of
+  waiting for every local activity in the workflow task. This allows sequences of short local
+  activities to make progress while a long-running local activity executes in parallel, while
+  preserving the resolution ordering recorded in existing histories during replay.
+* Try-cancel child workflows no longer cause nondeterminism when they complete or fail after their
+  cancellation was requested.
 * Panics from update validators now reject the update instead of repeatedly failing workflow
   tasks.
+* Workers with `max_cached_workflows` set to 0 no longer stall when a local activity resolves while
+  the resolution for an earlier one is still being delivered.
+* Rust SDK workers now derive enabled task types from registered workflows and activities. The
+  task types can no longer be configured separately, preventing mismatched poll loops from hanging
+  worker shutdown.
 
 ## [0.6.0] - 2026-08-04
-## [0.5.0]
-
-### Added
-* Workers are now automatically enrolled into poller autoscaling when the namespace advertises the
-  `poller_autoscaling_auto_enroll` capability. This only applies to poller types left at their
-  default (the worker set neither a fixed poller count nor a poller behavior); explicitly
-  configured pollers are left unchanged.
-* Support for dynamic client certificate resolution via `TlsOptions::client_cert_resolver`, which
-  accepts an `Arc<dyn ResolvesClientCert>` for per-handshake mTLS certificate selection. This enables
-  transparent certificate rotation without process restarts — useful for short-lived certificates
-  managed by Vault, cert-manager, or HSM-backed signers. `ResolvesClientCert`, `CertifiedKey`, and
-  `SignatureScheme` are re-exported from the crate root for convenience.
-* `client()` and `workflow_handle()` helpers to `ActivityContext` for easily obtaining a Temporal client
-* Exposed `backoff_start_interval` when continuing as new, which will delay the first task of the
-  continued workflow by the configured interval.
-* The `tls-ring` / `tls-aws-lc` features now also select the TLS crypto backend for the OTLP metric
-  exporter (in addition to the gRPC service client). Previously the OTLP exporter hardcoded the `ring`
-  backend regardless of the selected feature, which prevented producing a `ring`-free, `aws-lc-rs`-only
-  (FIPS-capable) build. Building with `--no-default-features --features tls-aws-lc,otel` now yields a
-  dependency tree free of `ring`.
-
-### Fixed
-* `GetSystemInfo` connection initialization now only falls back to empty server capabilities when
-  `UNIMPLEMENTED` indicates the RPC method is missing. Other `UNIMPLEMENTED` responses are
-  reported as connection errors.
-* Connection initialization now retries once with gRPC compression disabled if the eager
-  `GetSystemInfo` call fails because the server cannot decompress gzip.
-* Awaiting a Nexus operation's result (`StartedNexusOperation::result()`) no longer trips
-  nondeterminism detection ("a waker was invoked by a non-SDK source", TMPRL1100) on replay. The
-  result future is a `Shared`, whose internal waker machinery must be polled inside an `SdkWakeGuard`
-  (as `join_all` already is); it now is. Previously, a workflow that awaited a Nexus operation result
-  and then kept running (e.g. parked on a `wait_condition`) would fail its workflow task whenever it
-  was replayed — breaking queries and durable recovery for that execution.
-
-### Security
-* Replaced the unmaintained `backoff` dependency with `backon` for exponential retry and poll
-  backoff, clearing [RUSTSEC-2025-0012](https://rustsec.org/advisories/RUSTSEC-2025-0012) from
-  downstream security audits. Retry timing is preserved: exponential growth,
-  `randomization_factor` jitter, and the total retry-time budget behave as before.
-
-### Breaking Changes
-* The `ActivityContext` constructor now requires `ClientOptions`.
-* `WorkerConfig::{workflow,activity,nexus}_task_poller_behavior` and the corresponding Rust SDK
-  `WorkerOptions` fields are now `Option<PollerBehavior>`. `None` means the poller was not explicitly
-  configured and is eligible for automatic enrollment into poller autoscaling.
-### Breaking Changes
-
-- Rust SDK `ApplicationFailure` and `WorkflowError` APIs now use boxed `std::error::Error` values instead of
-  `anyhow::Error`.
-
-## [Unreleased]
 
 ### Added
 * `UntypedActivity` for invoking activities by a runtime activity type name with raw input and
@@ -153,9 +260,6 @@ to docs, or any other relevant information.
   runtime and worker configuration types under `temporalio_sdk::runtime`, so workers no
   longer need a direct `temporalio-sdk-core` dependency. `Url` is also re-exported from
   `temporalio_client`.
-* Experimental plugin APIs for packaging reusable client and worker configuration, including data
-  converters, interceptors, activities, workflows, and automatic propagation from clients to
-  workers.
 * Workers can configure the maximum number of activity slots reserved for eager execution per
   workflow task with `WorkerOptions::max_eager_activity_reservations_per_workflow_task`.
 * `WorkflowInterceptor` for observing, transforming, or short-circuiting inbound workflow calls
@@ -264,17 +368,8 @@ to docs, or any other relevant information.
   cancellation, and heartbeat, and `WorkflowUpdateHandle::get_result`.
 
 ### Fixed
-* Try-cancel child workflows no longer cause nondeterminism when they complete or fail after their
-  cancellation was requested.
-* Activity failures now include the latest heartbeat details atomically instead of force-flushing a
-  throttled heartbeat first. Temporal Server 1.16.0 or newer is required to guarantee those details
-  are preserved on failure; workers warn when the server does not advertise support.
 * `RuntimeOptions::default()` now uses the same 60-second worker heartbeat interval as the
   builder default.
-* Local activity resolutions are now delivered to workflows as each activity completes instead of
-  waiting for every local activity in the workflow task. This allows sequences of short local
-  activities to make progress while a long-running local activity executes in parallel, while
-  preserving the resolution ordering recorded in existing histories during replay.
 * Workflow tasks no longer livelock when a burst of ready async operations exhausts Tokio's
   cooperative scheduling budget.
 * OTLP metric export failures are now logged through Core telemetry when OpenTelemetry's periodic

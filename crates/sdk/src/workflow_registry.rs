@@ -126,10 +126,8 @@ impl WorkflowDefinitions {
 
         let factory = Arc::new(move |input| {
             let (payloads, payload_converter, base_ctx) = workflow_input_parts(input);
-            let ser_ctx = SerializationContext {
-                data: &SerializationContextData::Workflow,
-                converter: &payload_converter,
-            };
+            let ser_ctx =
+                SerializationContext::new(&SerializationContextData::Workflow, &payload_converter);
             let input: <W::Run as WorkflowDefinition>::Input =
                 payload_converter.from_payloads(&ser_ctx, payloads)?;
 

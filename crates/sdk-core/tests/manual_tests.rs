@@ -24,9 +24,7 @@ use temporalio_client::{
     NamespacedClient, UntypedSignal, UntypedWorkflow, WorkflowExecutionInfo,
     WorkflowGetResultOptions, WorkflowSignalOptions, WorkflowStartOptions,
 };
-use temporalio_common::{
-    data_converters::RawValue, telemetry::PrometheusExporterOptions, worker::WorkerTaskTypes,
-};
+use temporalio_common::{data_converters::RawValue, telemetry::PrometheusExporterOptions};
 use temporalio_macros::{activities, workflow, workflow_methods};
 use temporalio_sdk::{
     ActivityOptions, SyncWorkflowContext, WorkflowContext, WorkflowResult,
@@ -146,12 +144,14 @@ async fn poller_load_spiky() {
         maximum: 200,
         initial: 5,
     });
+    starter
+        .sdk_config
+        .register_activities(JitteryEchoActivities)
+        .register_workflow::<PollerLoadSpikyWf>()
+        .unwrap();
     let mut worker = starter.worker().await;
     let submitter = worker.get_submitter_handle();
-
-    worker.register_activities(JitteryEchoActivities);
-    worker.register_workflow::<PollerLoadSpikyWf>().unwrap();
-    let client = starter.get_client().await;
+    let client = starter.get_core_client().await;
     let tq = starter.get_task_queue().to_owned();
 
     info!("Prom bound to {:?}", addr);
@@ -171,13 +171,12 @@ async fn poller_load_spiky() {
             .await
             .unwrap();
         workflow_handles.push(
-            WorkflowExecutionInfo {
-                namespace: client.namespace(),
-                workflow_id: wfid,
-                run_id: Some(rid),
-                first_execution_run_id: None,
-            }
-            .bind_untyped(client.clone()),
+            WorkflowExecutionInfo::builder()
+                .namespace(client.namespace())
+                .workflow_id(wfid)
+                .maybe_run_id(Some(rid))
+                .build()
+                .bind_untyped(client.clone()),
         );
     }
     info!("Done starting workflows");
@@ -209,13 +208,12 @@ async fn poller_load_spiky() {
                 .await
                 .unwrap();
             workflow_handles.push(
-                WorkflowExecutionInfo {
-                    namespace: client.namespace(),
-                    workflow_id: wfid,
-                    run_id: Some(rid),
-                    first_execution_run_id: None,
-                }
-                .bind_untyped(client.clone()),
+                WorkflowExecutionInfo::builder()
+                    .namespace(client.namespace())
+                    .workflow_id(wfid)
+                    .maybe_run_id(Some(rid))
+                    .build()
+                    .bind_untyped(client.clone()),
             );
         }
         stream::iter(workflow_handles)
@@ -283,10 +281,12 @@ async fn poller_load_sustained() {
         maximum: 200,
         initial: 5,
     });
-    starter.sdk_config.task_types = WorkerTaskTypes::workflow_only();
+    starter
+        .sdk_config
+        .register_workflow::<PollerLoadSustainedWf>()
+        .unwrap();
     let mut worker = starter.worker().await;
-    worker.register_workflow::<PollerLoadSustainedWf>().unwrap();
-    let client = starter.get_client().await;
+    let client = starter.get_core_client().await;
     let tq = starter.get_task_queue().to_owned();
 
     info!("Prom bound to {:?}", addr);
@@ -306,13 +306,12 @@ async fn poller_load_sustained() {
             .await
             .unwrap();
         workflow_handles.push(
-            WorkflowExecutionInfo {
-                namespace: client.namespace(),
-                workflow_id: wfid,
-                run_id: Some(rid),
-                first_execution_run_id: None,
-            }
-            .bind_untyped(client.clone()),
+            WorkflowExecutionInfo::builder()
+                .namespace(client.namespace())
+                .workflow_id(wfid)
+                .maybe_run_id(Some(rid))
+                .build()
+                .bind_untyped(client.clone()),
         );
     }
     info!("Done starting workflows");
@@ -363,14 +362,14 @@ async fn poller_load_spike_then_sustained() {
         maximum: 200,
         initial: 5,
     });
-    let mut worker = starter.worker().await;
-    let submitter = worker.get_submitter_handle();
-
-    worker.register_activities(JitteryEchoActivities);
-    worker
+    starter
+        .sdk_config
+        .register_activities(JitteryEchoActivities)
         .register_workflow::<PollerLoadSpikeThenSustainedWf>()
         .unwrap();
-    let client = starter.get_client().await;
+    let mut worker = starter.worker().await;
+    let submitter = worker.get_submitter_handle();
+    let client = starter.get_core_client().await;
     let tq = starter.get_task_queue().to_owned();
 
     info!("Prom bound to {:?}", addr);
@@ -390,13 +389,12 @@ async fn poller_load_spike_then_sustained() {
             .await
             .unwrap();
         workflow_handles.push(
-            WorkflowExecutionInfo {
-                namespace: client.namespace(),
-                workflow_id: wfid,
-                run_id: Some(rid),
-                first_execution_run_id: None,
-            }
-            .bind_untyped(client.clone()),
+            WorkflowExecutionInfo::builder()
+                .namespace(client.namespace())
+                .workflow_id(wfid)
+                .maybe_run_id(Some(rid))
+                .build()
+                .bind_untyped(client.clone()),
         );
     }
     info!("Done starting workflows");
@@ -427,13 +425,12 @@ async fn poller_load_spike_then_sustained() {
                 .await
                 .unwrap();
             workflow_handles.push(
-                WorkflowExecutionInfo {
-                    namespace: client.namespace(),
-                    workflow_id: wfid,
-                    run_id: Some(rid),
-                    first_execution_run_id: None,
-                }
-                .bind_untyped(client.clone()),
+                WorkflowExecutionInfo::builder()
+                    .namespace(client.namespace())
+                    .workflow_id(wfid)
+                    .maybe_run_id(Some(rid))
+                    .build()
+                    .bind_untyped(client.clone()),
             );
             tokio::time::sleep(Duration::from_secs(1)).await;
         }

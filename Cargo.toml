@@ -9,6 +9,7 @@ members = [
     "crates/sdk",
     "crates/workflow",
     "crates/sdk-core-c-bridge",
+    "crates/changelog-release-notes",
 ]
 resolver = "2"
 

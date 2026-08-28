@@ -288,10 +288,7 @@ pub(crate) fn serialize_output<O: TemporalSerializable + 'static>(
     output: &O,
     converter: &PayloadConverter,
 ) -> Result<Payload, WorkflowError> {
-    let ctx = SerializationContext {
-        data: &SerializationContextData::Workflow,
-        converter,
-    };
+    let ctx = SerializationContext::new(&SerializationContextData::Workflow, converter);
     converter.to_payload(&ctx, output).map_err(Into::into)
 }
 

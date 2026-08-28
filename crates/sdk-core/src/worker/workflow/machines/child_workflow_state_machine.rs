@@ -5,7 +5,9 @@ use super::{
 use crate::{
     abstractions::dbg_panic,
     internal_flags::CoreInternalFlags,
-    worker::workflow::{InternalFlagsRef, fatal, machines::HistEventData, nondeterminism},
+    worker::workflow::{
+        CommandAnnotations, InternalFlagsRef, fatal, machines::HistEventData, nondeterminism,
+    },
 };
 use itertools::Itertools;
 use std::{
@@ -445,6 +447,7 @@ pub(super) struct SharedState {
     cancelled_before_sent: bool,
     cancel_type: ChildWorkflowCancellationType,
     internal_flags: InternalFlagsRef,
+    annotations: CommandAnnotations,
 }
 
 impl SharedState {
@@ -462,6 +465,7 @@ impl ChildWorkflowMachine {
         attribs: StartChildWorkflowExecution,
         internal_flags: InternalFlagsRef,
         use_compatible_version: bool,
+        annotations: CommandAnnotations,
     ) -> NewMachineWithCommand {
         let mut s = Self::from_parts(
             Created {}.into(),
@@ -476,6 +480,7 @@ impl ChildWorkflowMachine {
                 initiated_event_id: 0,
                 started_event_id: 0,
                 cancelled_before_sent: false,
+                annotations,
             },
         );
         OnEventWrapper::on_event_mut(&mut s, ChildWorkflowMachineEvents::Schedule)
@@ -516,7 +521,9 @@ impl ChildWorkflowMachine {
     pub(super) fn cancel(
         &mut self,
         reason: String,
+        annotations: CommandAnnotations,
     ) -> Result<Vec<MachineResponse>, MachineError<WFMachinesError>> {
+        self.shared_state.annotations.override_with(annotations);
         let event = ChildWorkflowMachineEvents::Cancel(reason);
         let vec = OnEventWrapper::on_event_mut(self, event)?;
         let res = vec
@@ -733,8 +740,8 @@ impl WFMachinesAdapter for ChildWorkflowMachine {
                 let mut resps = vec![];
                 if self.shared_state.cancel_type != ChildWorkflowCancellationType::Abandon {
                     #[allow(deprecated)]
-                    resps.push(MachineResponse::NewCoreOriginatedCommand(
-                        RequestCancelExternalWorkflowExecutionCommandAttributes {
+                    resps.push(MachineResponse::NewCoreOriginatedCommand {
+                        attrs: RequestCancelExternalWorkflowExecutionCommandAttributes {
                             namespace: self.shared_state.namespace.clone(),
                             workflow_id: self.shared_state.workflow_id.clone(),
                             run_id: self.shared_state.run_id.clone(),
@@ -743,7 +750,8 @@ impl WFMachinesAdapter for ChildWorkflowMachine {
                             ..Default::default()
                         }
                         .into(),
-                    ))
+                        annotations: self.shared_state.annotations.clone(),
+                    })
                 }
                 if self.shared_state.resolves_immediately_on_cancel() {
                     resps.push(self.resolve_cancelled_msg().into())
@@ -826,9 +834,12 @@ mod test {
                     cancelled_before_sent: false,
                     cancel_type: Default::default(),
                     internal_flags: Rc::new(RefCell::new(InternalFlags::default())),
+                    annotations: Default::default(),
                 },
             );
-            let cmds = s.cancel("cancel reason".to_string()).unwrap();
+            let cmds = s
+                .cancel("cancel reason".to_string(), Default::default())
+                .unwrap();
             assert_eq!(cmds.len(), 0);
             assert_eq!(discriminant(&state), discriminant(s.state()));
         }
@@ -851,6 +862,7 @@ mod test {
             cancelled_before_sent: false,
             cancel_type,
             internal_flags: Rc::new(RefCell::new(InternalFlags::default())),
+            annotations: Default::default(),
         };
         let state = Cancelled::default();
         let res = state.on_child_workflow_execution_completed(&mut shared, None);
@@ -925,10 +937,11 @@ mod test {
                 cancelled_before_sent: false,
                 cancel_type,
                 internal_flags: Rc::new(RefCell::new(InternalFlags::default())),
+                annotations: Default::default(),
             },
         );
         let cmds = s
-            .cancel("parent cancelled".to_string())
+            .cancel("parent cancelled".to_string(), Default::default())
             .expect("Cancel in StartEventRecorded should not fail");
         assert!(
             !cmds.is_empty(),

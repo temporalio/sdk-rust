@@ -7,7 +7,10 @@ use temporalio_common_wasm::protos::{
         workflow_activation::{InitializeWorkflow, WorkflowActivation as CoreWorkflowActivation},
         workflow_commands::ContinueAsNewWorkflowExecution,
     },
-    temporal::api::{common::v1::Payload, failure::v1::Failure},
+    temporal::api::{
+        common::v1::{Payload, Payloads},
+        failure::v1::Failure,
+    },
 };
 
 #[derive(Clone, Debug, PartialEq)]
@@ -89,7 +92,7 @@ pub struct TaskFailure {
 pub enum TerminalOutcome {
     Completed(Payload),
     Failed(WorkflowFailure),
-    Cancelled,
+    Cancelled(Option<Payloads>),
     ContinueAsNew(Box<ContinueAsNewRequest>),
 }
 

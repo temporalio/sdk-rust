@@ -64,6 +64,21 @@ You can build and test the project using cargo:
 Run integ tests with `cargo integ-test`. By default it will start an ephemeral server. You can also
 use an already-running server by passing `-s external`.
 
+To run target-compatible integration tests against a client configured with
+[envconfig](./crates/client/README.md), pass `-s envconfig` and select a test suitable for that
+target:
+
+```bash
+TEMPORAL_ADDRESS=namespace.account.tmprl.cloud:7233 \
+TEMPORAL_NAMESPACE=namespace.account \
+TEMPORAL_API_KEY=... \
+cargo integ-test -s envconfig -- \
+  integ_tests::workflow_tests::timers::timer_workflow_workflow_driver --exact
+```
+
+`TEMPORAL_CONFIG_FILE` and `TEMPORAL_PROFILE` can select a TOML profile instead. The harness does
+not start, configure, or clean up the target server or namespace in this mode.
+
 Run load tests with `cargo test --test heavy_tests`.
 
 NOTE: Integration tests should pass locally, if running on MacOS and you see integration tests consistently failing

@@ -1342,8 +1342,22 @@ proxier! {
         ExecuteMultiOperationRequest,
         ExecuteMultiOperationResponse,
         |r| {
-            let labels = namespaced_request!(r);
-            r.extensions_mut().insert(labels);
+            let mut labels = namespaced_request!(r);
+            if let Some(execute_multi_operation_request::operation::Operation::StartWorkflow(
+                start_req,
+            )) = r
+                .get_ref()
+                .operations
+                .first()
+                .and_then(|op| op.operation.as_ref())
+            {
+                labels.task_q(start_req.task_queue.clone());
+            }
+            let exts = r.extensions_mut();
+            exts.insert(labels);
+            // Update-with-start blocks until the update reaches the requested wait stage, so it
+            // must be retried/timed out like other user long-polls.
+            exts.insert(IsUserLongPoll);
         }
     );
     (
@@ -2293,10 +2307,12 @@ mod tests {
             }
         }
 
-        let deployment_opts = WorkerDeploymentOptions::new(WorkerDeploymentVersion {
-            deployment_name: "test-deployment".to_string(),
-            build_id: "test-build-123".to_string(),
-        })
+        let deployment_opts = WorkerDeploymentOptions::new(
+            WorkerDeploymentVersion::builder()
+                .deployment_name("test-deployment".to_string())
+                .build_id("test-build-123".to_string())
+                .build(),
+        )
         .use_worker_versioning(use_worker_versioning)
         .build();
 

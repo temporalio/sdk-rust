@@ -1,15 +1,12 @@
-use crate::common::{ActivationAssertionsInterceptor, CoreWfStarter, build_fake_sdk_intercepted};
+use crate::common::{ActivationAssertionsInterceptor, CoreWfStarter};
 use std::{sync::Arc, time::Duration};
 use temporalio_client::{
     UntypedWorkflow, WorkflowCancelOptions, WorkflowDescribeOptions, WorkflowStartOptions,
     errors::WorkflowGetResultError,
 };
-use temporalio_common::{
-    protos::{
-        coresdk::workflow_activation::{WorkflowActivationJob, workflow_activation_job},
-        temporal::api::enums::v1::{CommandType, WorkflowExecutionStatus},
-    },
-    worker::WorkerTaskTypes,
+use temporalio_common::protos::{
+    coresdk::workflow_activation::{WorkflowActivationJob, workflow_activation_job},
+    temporal::api::enums::v1::{CommandType, WorkflowExecutionStatus},
 };
 use temporalio_macros::{activities, workflow, workflow_methods};
 use temporalio_sdk::{
@@ -41,14 +38,77 @@ impl CancelledWf {
     }
 }
 
+#[derive(Debug, PartialEq, serde::Deserialize, serde::Serialize)]
+struct CancellationDetails {
+    reason: String,
+}
+
+#[workflow]
+#[derive(Default)]
+struct CancelledWithDetailsWf;
+
+#[workflow_methods]
+impl CancelledWithDetailsWf {
+    #[run]
+    async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<()> {
+        ctx.cancelled().await;
+        Err(WorkflowTermination::cancelled_with_details(
+            CancellationDetails {
+                reason: "contract expired".to_owned(),
+            },
+        ))
+    }
+}
+
+#[tokio::test]
+async fn workflow_cancellation_records_details() {
+    let wf_name = "workflow_cancellation_records_details";
+    let mut starter = CoreWfStarter::new(wf_name);
+    starter
+        .sdk_config
+        .register_workflow::<CancelledWithDetailsWf>()
+        .unwrap();
+    let mut worker = starter.worker().await;
+    let task_queue = starter.get_task_queue().to_owned();
+    let wf_handle = worker
+        .submit_workflow(
+            CancelledWithDetailsWf::run,
+            (),
+            WorkflowStartOptions::new(task_queue, wf_name).build(),
+        )
+        .await
+        .unwrap();
+
+    let (cancel_result, worker_result) = tokio::join!(
+        wf_handle.cancel(WorkflowCancelOptions::default()),
+        worker.run_until_done()
+    );
+    cancel_result.unwrap();
+    worker_result.unwrap();
+
+    let Err(WorkflowGetResultError::Cancelled { details }) =
+        wf_handle.get_result(Default::default()).await
+    else {
+        panic!("workflow should complete as cancelled");
+    };
+    assert_eq!(
+        details.deserialize::<CancellationDetails>().unwrap(),
+        CancellationDetails {
+            reason: "contract expired".to_owned(),
+        }
+    );
+}
+
 #[tokio::test]
 async fn cancel_during_timer() {
     let wf_name = "cancel_during_timer";
     let mut starter = CoreWfStarter::new(wf_name);
-    starter.sdk_config.task_types = WorkerTaskTypes::workflow_only();
+    starter
+        .sdk_config
+        .register_workflow::<CancelledWf>()
+        .unwrap();
     let mut worker = starter.worker().await;
-    let client = starter.get_client().await;
-    worker.register_workflow::<CancelledWf>().unwrap();
+    let client = starter.get_core_client().await;
     let task_queue = starter.get_task_queue().to_owned();
     let wf_id = task_queue.clone();
     let wf_handle = worker
@@ -112,11 +172,11 @@ impl ShieldedCancellationWf {
 async fn detached_token_shields_work_after_workflow_cancellation() {
     let wf_name = "detached_token_shields_work_after_workflow_cancellation";
     let mut starter = CoreWfStarter::new(wf_name);
-    starter.sdk_config.task_types = WorkerTaskTypes::workflow_only();
-    let mut worker = starter.worker().await;
-    worker
+    starter
+        .sdk_config
         .register_workflow::<ShieldedCancellationWf>()
         .unwrap();
+    let mut worker = starter.worker().await;
     let task_queue = starter.get_task_queue().to_owned();
     let wf_handle = worker
         .submit_workflow(
@@ -156,11 +216,86 @@ impl CancellationPropagationActivities {
         let mut heartbeat = tokio::time::interval(Duration::from_millis(100));
         loop {
             tokio::select! {
-                _ = ctx.cancelled() => return Err(ActivityError::cancelled()),
+                _ = ctx.cancelled() => return Err(ActivityError::cancelled_with_details(
+                    CancellationDetails {
+                        reason: "operation cancelled".to_owned(),
+                    },
+                )),
                 _ = heartbeat.tick() => ctx.record_heartbeat(()).await?,
             }
         }
     }
+}
+
+#[workflow]
+#[derive(Default)]
+struct FailedCancellationDetailsWf;
+
+#[workflow_methods]
+impl FailedCancellationDetailsWf {
+    #[run]
+    async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<()> {
+        let err = ctx
+            .execute_activity(
+                CancellationPropagationActivities::wait_for_cancellation,
+                (),
+                ActivityOptions::with_start_to_close_timeout(Duration::from_secs(30))
+                    .heartbeat_timeout(Duration::from_secs(1))
+                    .cancellation_type(ActivityCancellationType::WaitCancellationCompleted)
+                    .build(),
+            )
+            .await
+            .expect_err("activity should be cancelled");
+        Err(err.into())
+    }
+}
+
+#[tokio::test]
+async fn workflow_failed_cancellation_propagates_details() {
+    let wf_name = "workflow_failed_cancellation_propagates_details";
+    let mut starter = CoreWfStarter::new(wf_name);
+    let started = Arc::new(Semaphore::new(0));
+    starter
+        .sdk_config
+        .register_activities(CancellationPropagationActivities {
+            started: started.clone(),
+        });
+    starter
+        .sdk_config
+        .register_workflow::<FailedCancellationDetailsWf>()
+        .unwrap();
+    let mut worker = starter.worker().await;
+    let task_queue = starter.get_task_queue().to_owned();
+    let wf_handle = worker
+        .submit_workflow(
+            FailedCancellationDetailsWf::run,
+            (),
+            WorkflowStartOptions::new(task_queue, wf_name).build(),
+        )
+        .await
+        .unwrap();
+
+    let canceller = async {
+        let _started = started.acquire().await.unwrap();
+        wf_handle
+            .cancel(WorkflowCancelOptions::default())
+            .await
+            .unwrap();
+    };
+    let (_, worker_result) = tokio::join!(canceller, worker.run_until_done());
+    worker_result.unwrap();
+
+    let Err(WorkflowGetResultError::Cancelled { details }) =
+        wf_handle.get_result(Default::default()).await
+    else {
+        panic!("workflow should complete as cancelled");
+    };
+    assert_eq!(
+        details.deserialize::<CancellationDetails>().unwrap(),
+        CancellationDetails {
+            reason: "operation cancelled".to_owned(),
+        }
+    );
 }
 
 #[workflow]
@@ -174,7 +309,7 @@ impl CancellationPropagationChild {
     async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<()> {
         ctx.state(|wf| wf.started.add_permits(1));
         ctx.cancelled().await;
-        Err(WorkflowTermination::Cancelled)
+        Err(WorkflowTermination::cancelled())
     }
 
     #[signal]
@@ -270,11 +405,12 @@ async fn workflow_cancellation_propagates_to_operations() {
         .register_activities(CancellationPropagationActivities {
             started: started.clone(),
         });
-    let mut worker = starter.worker().await;
-    worker
+    starter
+        .sdk_config
         .register_workflow::<CancellationPropagationParent>()
         .unwrap();
-    worker
+    starter
+        .sdk_config
         .register_workflow_with_factory({
             let started = started.clone();
             move || CancellationPropagationChild {
@@ -282,6 +418,7 @@ async fn workflow_cancellation_propagates_to_operations() {
             }
         })
         .unwrap();
+    let mut worker = starter.worker().await;
 
     let task_queue = starter.get_task_queue().to_owned();
     let wf_handle = worker
@@ -303,9 +440,16 @@ async fn workflow_cancellation_propagates_to_operations() {
     let (_, worker_result) = tokio::join!(canceller, worker.run_until_done());
     worker_result.unwrap();
 
-    assert_matches!(
-        wf_handle.get_result(Default::default()).await,
-        Err(WorkflowGetResultError::Cancelled { .. })
+    let Err(WorkflowGetResultError::Cancelled { details }) =
+        wf_handle.get_result(Default::default()).await
+    else {
+        panic!("workflow should complete as cancelled");
+    };
+    assert_eq!(
+        details.deserialize::<CancellationDetails>().unwrap(),
+        CancellationDetails {
+            reason: "operation cancelled".to_owned(),
+        }
     );
 }
 
@@ -318,7 +462,7 @@ impl WfWithTimer {
     #[run(name = DEFAULT_WORKFLOW_TYPE)]
     async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<()> {
         ctx.timer(Duration::from_millis(500)).await;
-        Err(WorkflowTermination::Cancelled)
+        Err(WorkflowTermination::cancelled())
     }
 }
 
@@ -365,7 +509,9 @@ async fn wf_completing_with_cancelled() {
             });
     });
 
-    let mut worker = build_fake_sdk_intercepted(mock_cfg, aai);
-    worker.register_workflow::<WfWithTimer>().unwrap();
+    let mut worker =
+        crate::common::build_fake_sdk_intercepted_with_options(mock_cfg, aai, |options| {
+            options.register_workflow::<WfWithTimer>().unwrap();
+        });
     worker.run().await.unwrap();
 }

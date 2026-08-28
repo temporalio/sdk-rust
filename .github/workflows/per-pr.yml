@@ -171,13 +171,14 @@ jobs:
       - run: cargo integ-test -t wasm_workflow_tests -- --test-threads 1
 
   cloud-tests:
-    if: github.event.pull_request.head.repo.full_name == '' || github.event.pull_request.head.repo.full_name == 'temporalio/sdk-rust'
+    if: github.actor != 'dependabot[bot]' && (github.event.pull_request.head.repo.full_name == '' || github.event.pull_request.head.repo.full_name == 'temporalio/sdk-rust')
     name: Cloud tests
     env:
       TEMPORAL_CLOUD_ADDRESS: https://${{ vars.TEMPORAL_CLIENT_NAMESPACE }}.tmprl.cloud:7233
       TEMPORAL_NAMESPACE: ${{ vars.TEMPORAL_CLIENT_NAMESPACE }}
       TEMPORAL_CLIENT_CERT: ${{ secrets.TEMPORAL_CLIENT_CERT }}
       TEMPORAL_CLIENT_KEY: ${{ secrets.TEMPORAL_CLIENT_KEY }}
+      TEMPORAL_CLIENT_CLOUD_API_VERSION: v0.19.1
     timeout-minutes: ${{ github.ref == 'refs/heads/main' && 25 || 20 }}
     runs-on: ubuntu-latest
     steps:
@@ -186,6 +187,57 @@ jobs:
         with:
           mise-install-args: protoc
       - run: cargo test --features=test-utilities --test cloud_tests
+      - name: Generate Cloud test certificates
+        run: |
+          umask 077
+          cert_dir="$RUNNER_TEMP/cloud-test-certs"
+          mkdir "$cert_dir"
+          openssl req -x509 -newkey rsa:2048 -nodes -days 1 \
+            -keyout "$cert_dir/ca.key" -out "$cert_dir/ca.pem" \
+            -subj '/CN=Temporal Rust SDK Cloud CI CA'
+          openssl req -newkey rsa:2048 -nodes \
+            -keyout "$cert_dir/client.key" -out "$cert_dir/client.csr" \
+            -subj '/CN=Temporal Rust SDK Cloud CI'
+          openssl x509 -req -days 1 -in "$cert_dir/client.csr" \
+            -CA "$cert_dir/ca.pem" -CAkey "$cert_dir/ca.key" -CAcreateserial \
+            -out "$cert_dir/client.pem" -extfile <(printf 'extendedKeyUsage=clientAuth')
+          {
+            echo "TEMPORAL_CLOUD_CLIENT_CA_PATH=$cert_dir/ca.pem"
+            echo "TEMPORAL_TLS_CLIENT_CERT_PATH=$cert_dir/client.pem"
+            echo "TEMPORAL_TLS_CLIENT_KEY_PATH=$cert_dir/client.key"
+          } >> "$GITHUB_ENV"
+      - name: Create Cloud namespace
+        id: create-cloud-namespace
+        env:
+          TEMPORAL_CLIENT_CLOUD_API_KEY: ${{ secrets.TEMPORAL_CLIENT_CLOUD_API_KEY }}
+        run: cargo integ-test cloud-namespace create
+      - name: Run existing integration test against Cloud
+        timeout-minutes: 20
+        env:
+          TEMPORAL_ADDRESS: ${{ steps.create-cloud-namespace.outputs.namespace }}.tmprl.cloud:7233
+          TEMPORAL_NAMESPACE: ${{ steps.create-cloud-namespace.outputs.namespace }}
+        run: |
+          cargo integ-test -s envconfig -- \
+            integ_tests::workflow_tests::timers::timer_workflow_workflow_driver --exact \
+            2>&1 | tee cloud-integration.log
+      - name: Delete Cloud namespace
+        id: delete-cloud-namespace
+        if: ${{ always() && steps.create-cloud-namespace.outputs.namespace != '' }}
+        continue-on-error: true
+        env:
+          TEMPORAL_CLIENT_CLOUD_API_KEY: ${{ secrets.TEMPORAL_CLIENT_CLOUD_API_KEY }}
+        run: cargo integ-test cloud-namespace delete "${{ steps.create-cloud-namespace.outputs.namespace }}"
+      - name: Report Cloud namespace cleanup failure
+        if: ${{ always() && steps.delete-cloud-namespace.outcome == 'failure' }}
+        run: echo "::warning title=Cloud namespace cleanup failed::Failed to delete Cloud namespace ${{ steps.create-cloud-namespace.outputs.namespace }}"
+      - name: Upload Cloud test output
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: cloud-integration-tests-output
+          path: cloud-integration.log
+          if-no-files-found: ignore
+          retention-days: 14
 
   docker-integ-tests:
     name: Docker integ tests
@@ -223,11 +275,23 @@ jobs:
           )"
           test -x "$integ_test_binary"
           test -x "$integ_runner_binary"
+          # The CLI is cached under a version-derived name, so the container only finds the one
+          # the previous step downloaded if it asks for the same version. Cargo's `[env]` does not
+          # reach a directly invoked binary, hence passing the pin, if any, explicitly.
+          cli_version_override="$(
+            sed -n 's/^CLI_VERSION_OVERRIDE = "\(.*\)"$/\1/p' .cargo/config.toml
+          )"
+          cli_version_env=()
+          if [ -n "$cli_version_override" ]; then
+            cli_version_env=(--env "CLI_VERSION_OVERRIDE=$cli_version_override")
+          fi
           docker run --rm \
             --env TMPDIR="$RUNNER_TEMP" \
             --env TEMPORAL_TEST_EXPECT_DOCKER=true \
+            "${cli_version_env[@]}" \
             --volume "$RUNNER_TEMP:$RUNNER_TEMP" \
             --volume "$GITHUB_WORKSPACE:$GITHUB_WORKSPACE" \
+            --volume /etc/ssl/certs/ca-certificates.crt:/etc/ssl/certs/ca-certificates.crt:ro \
             --workdir "$GITHUB_WORKSPACE" \
             ubuntu:24.04 \
             "$integ_runner_binary" --test-executable "$integ_test_binary" \

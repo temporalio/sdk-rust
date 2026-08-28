@@ -10,16 +10,17 @@ use crate::{
         types::{
             ActivationJobResult, ActivationResult, MAIN_ROUTINE_ID, MainRoutineCompletion,
             QueryResponse, RoutineCompletion, RoutineId, RoutineKind, RoutinePendingState,
-            RoutinePollResult, StartedRoutine, UpdateRoutineCompletion, UpdateRoutineKind,
-            WorkflowActivation, WorkflowFailure,
+            RoutinePollResult, StartedRoutine, TaskFailure, TerminalOutcome,
+            UpdateRoutineCompletion, UpdateRoutineKind, WorkflowActivation, WorkflowFailure,
         },
     },
+    workflow_context::HandlerExecutionGuard,
     workflow_interceptors::{
         ExecuteWorkflowInput, ExecuteWorkflowResult, HandleQueryInput, HandleQueryResult,
         HandleSignalInput, HandleSignalResult, HandleUpdateInput, HandleUpdateResult,
         InitializeWorkflowInput, InitializeWorkflowOutput, SyncWorkflowInterceptorContext,
         ValidateUpdateInput, ValidateUpdateResult, WorkflowInterceptor, WorkflowInterceptorContext,
-        WorkflowInterceptorFuture, WorkflowNext, serialize_workflow_output,
+        WorkflowInterceptorFuture, WorkflowNext, WorkflowOutputValue, serialize_workflow_output,
         wrong_workflow_input_type,
     },
 };
@@ -81,6 +82,7 @@ enum GuestRoutine {
 struct InterceptedFuture<T> {
     inner: Fuse<LocalBoxFuture<'static, T>>,
     status: InterceptedFutureStatus,
+    _handler_execution: Option<HandlerExecutionGuard>,
 }
 
 impl<T> InterceptedFuture<T> {
@@ -88,6 +90,19 @@ impl<T> InterceptedFuture<T> {
         Self {
             inner: inner.fuse(),
             status,
+            _handler_execution: None,
+        }
+    }
+
+    fn with_handler_execution(
+        inner: LocalBoxFuture<'static, T>,
+        status: InterceptedFutureStatus,
+        handler_execution: HandlerExecutionGuard,
+    ) -> Self {
+        Self {
+            inner: inner.fuse(),
+            status,
+            _handler_execution: Some(handler_execution),
         }
     }
 
@@ -292,6 +307,7 @@ fn intercepted_signal_future<W>(
     base_ctx: BaseWorkflowContext,
     interceptors: Rc<[Arc<dyn WorkflowInterceptor>]>,
     input: HandleSignalInput,
+    handler_execution: HandlerExecutionGuard,
 ) -> InterceptedFuture<HandleSignalResult>
 where
     W: WorkflowImplementation,
@@ -310,7 +326,7 @@ where
         call_handle_signal(&interceptors, interceptor_ctx, input, next).await
     }
     .boxed_local();
-    InterceptedFuture::new(future, status)
+    InterceptedFuture::with_handler_execution(future, status, handler_execution)
 }
 
 fn intercepted_update_future<W>(
@@ -318,6 +334,7 @@ fn intercepted_update_future<W>(
     base_ctx: BaseWorkflowContext,
     interceptors: Rc<[Arc<dyn WorkflowInterceptor>]>,
     input: HandleUpdateInput,
+    handler_execution: HandlerExecutionGuard,
 ) -> InterceptedFuture<HandleUpdateResult>
 where
     W: WorkflowImplementation,
@@ -336,7 +353,7 @@ where
         call_handle_update(&interceptors, interceptor_ctx, input, next).await
     }
     .boxed_local();
-    InterceptedFuture::new(future, status)
+    InterceptedFuture::with_handler_execution(future, status, handler_execution)
 }
 
 impl<W: WorkflowImplementation> GuestWorkflowInstance<W>
@@ -350,10 +367,7 @@ where
     ) -> Result<Box<dyn WorkflowInstance>, PayloadConversionError> {
         let view = base_ctx.view();
         let interceptors = base_ctx.workflow_interceptors();
-        let ser_ctx = SerializationContext {
-            data: &SerializationContextData::Workflow,
-            converter: &converter,
-        };
+        let ser_ctx = SerializationContext::new(&SerializationContextData::Workflow, &converter);
         let input = converter.from_payloads(&ser_ctx, payloads)?;
         let (init_input, run_input) = if W::INIT_TAKES_INPUT {
             (Some(input), None)
@@ -436,10 +450,7 @@ where
         }
 
         let converter = PayloadConverter::default();
-        let ctx = SerializationContext {
-            data: &SerializationContextData::Workflow,
-            converter: &converter,
-        };
+        let ctx = SerializationContext::new(&SerializationContextData::Workflow, &converter);
         QueryResponse {
             result: converter
                 .to_payload(
@@ -532,11 +543,13 @@ where
         let future = match W::decode_signal_input(&name, payloads, converter) {
             Ok(Some(input)) => {
                 let input = HandleSignalInput::new(name.clone(), input, signal.headers);
+                let handler_execution = self.base_ctx.track_handler();
                 let mut future = intercepted_signal_future::<W>(
                     self.ctx.clone(),
                     self.base_ctx.clone(),
                     self.interceptors.clone(),
                     input,
+                    handler_execution,
                 );
                 if let ConstructionPoll::Ready(result) =
                     Self::poll_for_construction(&self.base_ctx, &mut future)?
@@ -580,6 +593,7 @@ where
             None => return Ok(self.rejection_for_missing_update_handler(name)),
         };
 
+        let mut handler_execution = None;
         if run_validator && has_validator {
             let payloads = Payloads {
                 payloads: input.clone(),
@@ -598,6 +612,7 @@ where
             };
             let validation_input =
                 ValidateUpdateInput::new(id.clone(), name.clone(), decoded_input, headers.clone());
+            let guard = self.base_ctx.track_handler();
             let validation_ctx = SyncWorkflowInterceptorContext::new(self.base_ctx.clone());
             let workflow_ctx = self.ctx.clone();
             let validation_next = WorkflowNext::new(move |input: ValidateUpdateInput| {
@@ -626,6 +641,7 @@ where
                     )));
                 }
             }
+            handler_execution = Some(guard);
         }
 
         let payloads = Payloads { payloads: input };
@@ -633,11 +649,14 @@ where
         let future = match W::decode_update_input(&name, payloads, converter) {
             Ok(Some(input)) => {
                 let input = HandleUpdateInput::new(id.clone(), name.clone(), input, headers);
+                let handler_execution =
+                    handler_execution.unwrap_or_else(|| self.base_ctx.track_handler());
                 let mut future = intercepted_update_future::<W>(
                     self.ctx.clone(),
                     self.base_ctx.clone(),
                     self.interceptors.clone(),
                     input,
+                    handler_execution,
                 );
                 if let ConstructionPoll::Ready(result) =
                     Self::poll_for_construction(&self.base_ctx, &mut future)?
@@ -759,32 +778,60 @@ where
     fn terminal_outcome_from_result(
         &self,
         result: ExecuteWorkflowResult,
-    ) -> crate::runtime::types::TerminalOutcome {
+    ) -> Result<TerminalOutcome, TaskFailure> {
         let result = result.and_then(|result| {
             serialize_workflow_output(result.as_ref(), self.ctx.payload_converter())
                 .map_err(WorkflowTermination::from)
         });
         match result {
-            Ok(result) => crate::runtime::types::TerminalOutcome::Completed(result),
-            Err(WorkflowTermination::ContinueAsNew(req)) => {
-                crate::runtime::types::TerminalOutcome::ContinueAsNew(req)
-            }
-            Err(WorkflowTermination::Cancelled) => {
-                crate::runtime::types::TerminalOutcome::Cancelled
+            Ok(result) => Ok(TerminalOutcome::Completed(result)),
+            Err(WorkflowTermination::ContinueAsNew(req)) => Ok(TerminalOutcome::ContinueAsNew(req)),
+            Err(WorkflowTermination::Cancelled { details }) => {
+                let details = details
+                    .map(|details| {
+                        (&*details as &dyn WorkflowOutputValue)
+                            .serialize_payloads(&SerializationContext::new(
+                                &SerializationContextData::Workflow,
+                                self.ctx.payload_converter(),
+                            ))
+                            .map(|payloads| Payloads { payloads })
+                    })
+                    .transpose()
+                    .map_err(|err| TaskFailure {
+                        failure: Box::new(Failure {
+                            message: format!("Workflow payload conversion failed: {err}"),
+                            ..Default::default()
+                        }),
+                        force_cause: None,
+                    })?;
+                Ok(TerminalOutcome::Cancelled(details))
             }
             Err(WorkflowTermination::Evicted) => {
                 panic!("workflow instances must not explicitly return eviction")
             }
+            Err(WorkflowTermination::Failed(OutgoingWorkflowError::PayloadConversion(err))) => {
+                Err(TaskFailure {
+                    failure: Box::new(Failure {
+                        message: format!("Workflow payload conversion failed: {err}"),
+                        ..Default::default()
+                    }),
+                    force_cause: None,
+                })
+            }
             Err(WorkflowTermination::Failed(err)) => {
-                if self.base_ctx.cancellation_token().is_cancelled() && err.as_cancelled().is_some()
+                if self.base_ctx.cancellation_token().is_cancelled()
+                    && let Some(cancelled) = err.as_cancelled()
                 {
-                    return crate::runtime::types::TerminalOutcome::Cancelled;
+                    let details = cancelled.raw_details().map(|payloads| Payloads {
+                        payloads: payloads.to_vec(),
+                    });
+                    return Ok(TerminalOutcome::Cancelled(details));
                 }
                 let failure = self.base_ctx.data_converter().to_failure(
                     &SerializationContextData::Workflow,
                     temporalio_common_wasm::error::OutgoingError::Workflow(err),
                 );
-                crate::runtime::types::TerminalOutcome::Failed(Box::new(failure))
+                Ok(TerminalOutcome::Failed(Box::new(failure)))
             }
         }
     }
@@ -854,13 +901,17 @@ where
                 RoutinePollState::Ready {
                     result,
                     made_progress,
-                } => RoutinePollResult {
-                    completion: Some(RoutineCompletion::Main(MainRoutineCompletion::Terminal(
-                        Box::new(self.terminal_outcome_from_result(result)),
-                    ))),
-                    made_progress,
-                    pending_state: None,
-                },
+                } => {
+                    let completion = match self.terminal_outcome_from_result(result) {
+                        Ok(outcome) => MainRoutineCompletion::Terminal(Box::new(outcome)),
+                        Err(failure) => MainRoutineCompletion::TaskFailed(failure),
+                    };
+                    RoutinePollResult {
+                        completion: Some(RoutineCompletion::Main(completion)),
+                        made_progress,
+                        pending_state: None,
+                    }
+                }
                 RoutinePollState::ForcedFailure {
                     failure,
                     made_progress,

@@ -320,6 +320,7 @@ impl Runtime {
                 } else {
                     Logger::Console {
                         filter: v.filter.to_string(),
+                        format: None,
                     }
                 }
             });

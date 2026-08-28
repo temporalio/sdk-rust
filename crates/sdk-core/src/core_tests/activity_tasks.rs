@@ -1,5 +1,6 @@
 use crate::{
-    ActivityHeartbeat, CompleteActivityError, Worker, advance_fut, job_assert, prost_dur,
+    ActivityHeartbeat, CompleteActivityError, PollError, Worker, advance_fut, job_assert,
+    prost_dur,
     replay::{TestHistoryBuilder, canned_histories},
     test_help::{
         FakeWfResponses, MockPollCfg, MockWorkerInputs, MocksHolder, QueueResponse, WorkerExt,
@@ -10,15 +11,17 @@ use crate::{
     worker::{
         PollerBehavior, WorkerVersioningStrategy,
         client::{
-            WorkerClient, WorkerClientBag,
-            mocks::{mock_manual_worker_client, mock_worker_client},
+            MockWorkerClient, WorkerClient, WorkerClientBag,
+            mocks::{DEFAULT_TEST_CAPABILITIES, mock_manual_worker_client, mock_worker_client},
         },
     },
 };
 use futures_util::FutureExt;
 use itertools::Itertools;
 use prost::Message;
+use rstest::rstest;
 use std::{
+    borrow::Borrow,
     collections::{HashMap, HashSet, VecDeque, hash_map::Entry},
     future,
     sync::{
@@ -30,6 +33,7 @@ use std::{
 use temporalio_client::{
     Connection, ConnectionOptions, PayloadErrorLimits, SharedReplaceableClient,
     callback_based::{CallbackBasedGrpcService, GrpcSuccessResponse},
+    worker::ClientWorkerSet,
 };
 use temporalio_common::{
     payload_limits::{LimitClass, LimitSeverity, PayloadLimitViolation},
@@ -37,8 +41,8 @@ use temporalio_common::{
         coresdk::{
             ActivityTaskCompletion,
             activity_result::{
-                ActivityExecutionResult, ActivityResolution, Success, activity_execution_result,
-                activity_resolution,
+                self as activity_result, ActivityExecutionResult, ActivityResolution,
+                ActivityTaskFailedCause, Success, activity_execution_result, activity_resolution,
             },
             activity_task::{ActivityCancelReason, ActivityTask, Cancel, activity_task},
             workflow_activation::{
@@ -52,8 +56,8 @@ use temporalio_common::{
         },
         temporal::api::{
             command::v1::{ScheduleActivityTaskCommandAttributes, command::Attributes},
-            enums::v1::EventType,
-            failure::v1::failure::FailureInfo,
+            enums::v1::{ApplicationErrorCategory, EventType},
+            failure::v1::{ApplicationFailureInfo, Failure, failure::FailureInfo},
             workflowservice::v1::{
                 GetSystemInfoResponse, PollActivityTaskQueueResponse,
                 RecordActivityTaskHeartbeatRequest, RecordActivityTaskHeartbeatResponse,
@@ -65,7 +69,11 @@ use temporalio_common::{
     },
     worker::WorkerTaskTypes,
 };
-use tokio::{join, sync::oneshot, time::sleep};
+use tokio::{
+    join,
+    sync::{Notify, oneshot},
+    time::sleep,
+};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
@@ -661,6 +669,146 @@ async fn can_heartbeat_acts_during_shutdown() {
     core.drain_activity_poller_and_shutdown().await;
 }
 
+#[derive(PartialEq)]
+enum HungRpc {
+    Heartbeat,
+    Fail,
+    Complete,
+}
+
+// Worker-level regression test for the shutdown/completion race: an activity is completed while
+// one of its server calls is still in flight, so the completion has left the outstanding map but
+// still owns its slot permit. Shutdown must wait for the completion to finish reporting rather
+// than tear down the heartbeat manager under it (which stranded the completion forever) and then
+// trip the slot-permit release deadline. The hung-heartbeat case reproduces the original race
+// (eviction defers its ack until the in-flight heartbeat returns); the hung-failure and
+// hung-success cases pin the same invariant when the completion is parked on the result RPC
+// itself.
+#[rstest]
+#[case::heartbeat_rpc_hangs(HungRpc::Heartbeat)]
+#[case::fail_rpc_hangs(HungRpc::Fail)]
+#[case::complete_rpc_hangs(HungRpc::Complete)]
+#[tokio::test]
+async fn worker_shutdown_awaits_activity_completion_flushing_result(#[case] hung: HungRpc) {
+    let rpc_entered = Arc::new(Notify::new());
+    let rpc_release = Arc::new(Notify::new());
+    let result_reported = Arc::new(AtomicBool::new(false));
+
+    let mut mock_client = mock_manual_worker_client();
+    if hung == HungRpc::Heartbeat {
+        let entered = rpc_entered.clone();
+        let release = rpc_release.clone();
+        mock_client
+            .expect_record_activity_heartbeat()
+            .times(1)
+            .returning(move |_, _| {
+                let entered = entered.clone();
+                let release = release.clone();
+                async move {
+                    entered.notify_one();
+                    release.notified().await;
+                    Ok(RecordActivityTaskHeartbeatResponse::default())
+                }
+                .boxed()
+            });
+    }
+    let entered = rpc_entered.clone();
+    let release = rpc_release.clone();
+    let result_reported_clone = result_reported.clone();
+    if hung == HungRpc::Complete {
+        mock_client
+            .expect_complete_activity_task()
+            .times(1)
+            .returning(move |_, _| {
+                let entered = entered.clone();
+                let release = release.clone();
+                let result_reported = result_reported_clone.clone();
+                async move {
+                    entered.notify_one();
+                    release.notified().await;
+                    result_reported.store(true, Ordering::SeqCst);
+                    Ok(RespondActivityTaskCompletedResponse::default())
+                }
+                .boxed()
+            });
+    } else {
+        let hold_fail_rpc = hung == HungRpc::Fail;
+        mock_client
+            .expect_fail_activity_task()
+            .times(1)
+            .returning(move |_, _, _, _| {
+                let entered = entered.clone();
+                let release = release.clone();
+                let result_reported = result_reported_clone.clone();
+                async move {
+                    if hold_fail_rpc {
+                        entered.notify_one();
+                        release.notified().await;
+                    }
+                    result_reported.store(true, Ordering::SeqCst);
+                    Ok(RespondActivityTaskFailedResponse::default())
+                }
+                .boxed()
+            });
+    }
+
+    let core = mock_worker(MocksHolder::from_client_with_activities(
+        mock_client,
+        [PollActivityTaskQueueResponse {
+            task_token: vec![1],
+            activity_id: "act1".to_string(),
+            heartbeat_timeout: Some(prost_dur!(from_secs(100))),
+            ..Default::default()
+        }
+        .into()],
+    ));
+
+    let act = core.poll_activity_task().await.unwrap();
+    if hung == HungRpc::Heartbeat {
+        core.record_activity_heartbeat(ActivityHeartbeat {
+            task_token: act.task_token.clone(),
+            details: vec![],
+        });
+    }
+
+    let result = if hung == HungRpc::Complete {
+        ActivityExecutionResult::ok(vec![1].into())
+    } else {
+        ActivityExecutionResult::fail("retry me".into())
+    };
+    join!(
+        async {
+            core.complete_activity_task(ActivityTaskCompletion {
+                task_token: act.task_token.clone(),
+                result: Some(result),
+            })
+            .await
+            .unwrap();
+        },
+        async {
+            // Only begin shutdown once the hung RPC is in flight — for the heartbeat case that
+            // parks the completion's eviction behind it, the window in which shutdown used to
+            // slip through.
+            rpc_entered.notified().await;
+            core.initiate_shutdown();
+            let shutdown_fut = async {
+                assert_matches!(
+                    core.poll_activity_task().await.unwrap_err(),
+                    PollError::ShutDown
+                );
+                core.shutdown().await;
+            };
+            advance_fut!(shutdown_fut);
+            rpc_release.notify_one();
+            shutdown_fut.await;
+            assert!(
+                result_reported.load(Ordering::SeqCst),
+                "worker shutdown completed before the activity's result was reported to server"
+            );
+        }
+    );
+}
+
 /// Rapid heartbeats are not force-flushed before failure. The failure request carries the latest
 /// details atomically instead.
 #[tokio::test]
@@ -679,7 +827,7 @@ async fn complete_act_with_fail_includes_latest_heartbeat() {
             })
         });
     mock_client.expect_fail_activity_task().times(1).returning(
-        move |_, _, last_heartbeat_details| {
+        move |_, _, _, last_heartbeat_details| {
             assert_eq!(last_heartbeat_details.unwrap().payloads[0].data, [last_hb]);
             Ok(RespondActivityTaskFailedResponse::default())
         },
@@ -843,7 +991,7 @@ async fn activity_failure_distinguishes_no_heartbeat_from_empty_heartbeat() {
                 Ok(RecordActivityTaskHeartbeatResponse::default())
             });
         mock_client.expect_fail_activity_task().times(1).returning(
-            move |_, _, last_heartbeat_details| {
+            move |_, _, _, last_heartbeat_details| {
                 if explicit_empty_heartbeat {
                     assert_eq!(last_heartbeat_details.unwrap().payloads, []);
                 } else {
@@ -958,7 +1106,8 @@ async fn oversized_activity_result_failure_includes_latest_heartbeat() {
         .times(1)
         .returning(|_, _| Err(payload_too_large_status()));
     mock_client.expect_fail_activity_task().times(1).returning(
-        |_, failure, last_heartbeat_details| {
+        |_, cause, failure, last_heartbeat_details| {
+            assert_eq!(cause, ActivityTaskFailedCause::PayloadsTooLarge);
             assert_payloads_too_large_retryable(&failure);
             assert_eq!(last_heartbeat_details.unwrap().payloads[0].data, [2]);
             Ok(RespondActivityTaskFailedResponse::default())
@@ -1005,7 +1154,8 @@ async fn oversized_cancel_details_fails_activity() {
         .times(1)
         .returning(|_, _| Err(payload_too_large_status()));
     mock_client.expect_fail_activity_task().times(1).returning(
-        |_, failure, last_heartbeat_details| {
+        |_, cause, failure, last_heartbeat_details| {
+            assert_eq!(cause, ActivityTaskFailedCause::PayloadsTooLarge);
             assert_payloads_too_large_retryable(&failure);
             assert_eq!(last_heartbeat_details.unwrap().payloads[0].data, [2]);
             Ok(RespondActivityTaskFailedResponse::default())
@@ -1040,6 +1190,102 @@ async fn oversized_cancel_details_fails_activity() {
     core.drain_activity_poller_and_shutdown().await;
 }
 
+/// Oversized *final* heartbeat details replace whatever lang reported, so the cause and failure sent
+/// to the server describe the payload-limit violation rather than the activity's own error, and the
+/// oversized details are dropped so the server does not reject the whole request.
+#[tokio::test]
+async fn oversized_final_heartbeat_details_replace_reported_failure() {
+    // Manually created because we need non-default payload error limits, and mockall matches
+    // expectations in creation order, so they cannot be overridden after `mock_worker_client`.
+    // This will no longer be needed if https://github.com/asomers/mockall/issues/283 is implemented.
+    let mut mock_client = MockWorkerClient::new();
+    let workers = Arc::new(ClientWorkerSet::new());
+    mock_client
+        .expect_payload_error_limits()
+        .returning(|| Some(PayloadErrorLimits { blob: 10, memo: 10 }));
+    mock_client
+        .expect_capabilities()
+        .returning(|| Some(*DEFAULT_TEST_CAPABILITIES));
+    mock_client
+        .expect_workers()
+        .returning(move || workers.clone());
+    mock_client.expect_is_mock().returning(|| true);
+    mock_client
+        .expect_shutdown_worker()
+        .returning(|_, _, _, _| Ok(ShutdownWorkerResponse {}));
+    mock_client
+        .expect_sdk_name_and_version()
+        .returning(|| ("test-core".to_string(), "0.0.0".to_string()));
+    mock_client
+        .expect_identity()
+        .returning(|| "test-identity".to_string());
+    mock_client
+        .expect_worker_grouping_key()
+        .returning(Uuid::new_v4);
+    mock_client
+        .expect_worker_instance_key()
+        .returning(Uuid::new_v4);
+    mock_client
+        .expect_set_heartbeat_client_fields()
+        .returning(|_| {});
+    mock_client
+        .expect_record_activity_heartbeat()
+        .returning(|_, _| Ok(RecordActivityTaskHeartbeatResponse::default()));
+    mock_client.expect_fail_activity_task().times(1).returning(
+        |_, cause, failure, last_heartbeat_details| {
+            assert_eq!(cause, ActivityTaskFailedCause::PayloadsTooLarge);
+            assert_payloads_too_large_retryable(&failure);
+            assert!(
+                last_heartbeat_details.is_none(),
+                "oversized details must be dropped"
+            );
+            Ok(RespondActivityTaskFailedResponse::default())
+        },
+    );
+
+    let core = mock_worker(MocksHolder::from_client_with_activities(
+        mock_client,
+        [PollActivityTaskQueueResponse {
+            task_token: vec![1],
+            activity_id: "act1".to_string(),
+            heartbeat_timeout: Some(prost_dur!(from_secs(10))),
+            ..Default::default()
+        }
+        .into()],
+    ));
+
+    let act = core.poll_activity_task().await.unwrap();
+    core.record_activity_heartbeat(ActivityHeartbeat {
+        task_token: act.task_token.clone(),
+        details: vec![vec![0_u8; 1024].into()],
+    });
+    // A benign failure is normally not reported as an execution failure at all; what reaches the
+    // server here is a payload-limit failure instead, which is not benign.
+    core.complete_activity_task(ActivityTaskCompletion {
+        task_token: act.task_token,
+        result: Some(ActivityExecutionResult {
+            status: Some(activity_execution_result::Status::Failed(
+                activity_result::Failure {
+                    failure: Some(Failure {
+                        message: "benign".to_string(),
+                        failure_info: Some(FailureInfo::ApplicationFailureInfo(
+                            ApplicationFailureInfo {
+                                category: ApplicationErrorCategory::Benign as i32,
+                                ..Default::default()
+                            },
+                        )),
+                        ..Default::default()
+                    }),
+                    cause: ActivityTaskFailedCause::ActivityWorkerUnhandledFailure as i32,
+                },
+            )),
+        }),
+    })
+    .await
+    .unwrap();
+    core.drain_activity_poller_and_shutdown().await;
+}
+
 /// An oversized heartbeat `details` payload must fail the activity task (retryably) and stop the
 /// running activity with a `Cancelled` cancel — replicating the server, which fails the activity
 /// task and returns `cancel_requested = true`.
@@ -1051,7 +1297,8 @@ async fn oversized_heartbeat_fails_activity() {
         .times(1)
         .returning(|_, _| Err(payload_too_large_status()));
     mock_client.expect_fail_activity_task().times(1).returning(
-        |_, failure, last_heartbeat_details| {
+        |_, cause, failure, last_heartbeat_details| {
+            assert_eq!(cause, ActivityTaskFailedCause::PayloadsTooLarge);
             assert_payloads_too_large_retryable(&failure);
             assert!(last_heartbeat_details.is_none());
             Ok(RespondActivityTaskFailedResponse::default())
@@ -1182,7 +1429,7 @@ async fn no_eager_activities_requested_when_worker_options_disable_it(
     let mut mock = mock_worker_client();
     mock.expect_complete_workflow_task()
         .times(1)
-        .returning(move |req| {
+        .returning(move |req, _| {
             // Store the number of eager activities requested to be checked below
             let count = req
                 .commands
@@ -1269,7 +1516,7 @@ async fn activity_tasks_from_completion_are_delivered() {
     let mut mock = mock_worker_client();
     mock.expect_complete_workflow_task()
         .times(1)
-        .returning(move |req| {
+        .returning(move |req, _| {
             // Store the number of eager activities requested to be checked below
             let count = req
                 .commands
@@ -1456,8 +1703,8 @@ async fn graceful_shutdown(#[values(true, false)] at_max_outstanding: bool) {
             Ok(RecordActivityTaskHeartbeatResponse::default())
         });
     mock_client.expect_fail_activity_task().times(3).returning(
-        |task_token, _, last_heartbeat_details| {
-            if task_token.0 == [1] {
+        |task_token, _, _, last_heartbeat_details| {
+            if task_token.borrow() == [1] {
                 assert_eq!(last_heartbeat_details.unwrap().payloads[0].data, [2]);
             } else {
                 assert!(last_heartbeat_details.is_none());

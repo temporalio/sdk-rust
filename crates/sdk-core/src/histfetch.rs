@@ -24,13 +24,12 @@ async fn main() -> Result<(), anyhow::Error> {
         .nth(1)
         .expect("must provide workflow id as only argument");
     let run_id = std::env::args().nth(2).filter(|s| !s.is_empty());
-    let handle = WorkflowExecutionInfo {
-        namespace: client.namespace(),
-        workflow_id: wf_id.clone(),
-        run_id,
-        first_execution_run_id: None,
-    }
-    .bind_untyped(client);
+    let handle = WorkflowExecutionInfo::builder()
+        .namespace(client.namespace())
+        .workflow_id(wf_id.clone())
+        .maybe_run_id(run_id)
+        .build()
+        .bind_untyped(client);
     let events = handle
         .fetch_history(WorkflowFetchHistoryOptions::default())
         .await?

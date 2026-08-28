@@ -248,10 +248,7 @@ fn encode_json_search_attr<T: serde::Serialize + 'static>(
     indexed_value_type: IndexedValueType,
 ) -> Result<Payload, SearchAttributeError> {
     let converter = PayloadConverter::serde_json();
-    let context = SerializationContext {
-        data: &SerializationContextData::None,
-        converter: &converter,
-    };
+    let context = SerializationContext::new(&SerializationContextData::None, &converter);
     let mut payload = converter.to_payload(&context, value)?;
     payload.metadata.insert(
         TYPE_METADATA_KEY.to_string(),
@@ -267,10 +264,7 @@ fn decode_json_search_attr<T: serde::de::DeserializeOwned + 'static>(
     payload: &Payload,
 ) -> Result<T, SearchAttributeError> {
     let converter = PayloadConverter::serde_json();
-    let context = SerializationContext {
-        data: &SerializationContextData::None,
-        converter: &converter,
-    };
+    let context = SerializationContext::new(&SerializationContextData::None, &converter);
     Ok(converter.from_payload(&context, payload.clone())?)
 }
 

@@ -28,7 +28,6 @@ use temporalio_common::{
             },
         },
     },
-    worker::WorkerTaskTypes,
 };
 use temporalio_sdk::{PatchActivationCallback, WasmWorkflowComponent};
 use tokio::process::Command;
@@ -152,7 +151,6 @@ async fn wasm_patch_activation_callback_panic_fails_workflow_task() {
         .expect("sample WASM component should be loadable");
     let mut starter =
         CoreWfStarter::new("wasm_patch_activation_callback_panic_fails_workflow_task");
-    starter.sdk_config.task_types = WorkerTaskTypes::workflow_only();
     starter.sdk_config.patch_activation_callback =
         Some(Arc::new(|_| panic!("wasm patch activation callback panic")));
     starter.sdk_config.register_wasm_workflow(component);
@@ -212,7 +210,6 @@ async fn wasm_task_failure_preserves_wit_failure_details() {
         .expect("sample WASM component should be loadable");
 
     let mut starter = CoreWfStarter::new("wasm_task_failure_preserves_wit_failure_details");
-    starter.sdk_config.task_types = WorkerTaskTypes::workflow_only();
     starter.sdk_config.register_wasm_workflow(component);
 
     let mut worker = starter.worker().await;
@@ -272,11 +269,10 @@ async fn run_string_workflow(
     expected_result: &'static str,
 ) {
     let mut starter = CoreWfStarter::new(test_name);
-    starter.sdk_config.task_types = WorkerTaskTypes::workflow_only();
     starter.sdk_config.register_wasm_workflow(component);
 
     let mut worker = starter.worker().await;
-    let client = starter.get_client().await;
+    let client = starter.get_core_client().await;
     let payload_converter = PayloadConverter::default();
     let input = RawValue::from_value(&"workflow", &payload_converter);
     let workflow_id = starter.get_wf_id().to_owned();
@@ -310,12 +306,11 @@ async fn run_patch_activation_workflow(
     let component = WasmWorkflowComponent::from_file(WASM_COMPONENT_ID, component_path)
         .expect("sample WASM component should be loadable");
     let mut starter = CoreWfStarter::new(test_name);
-    starter.sdk_config.task_types = WorkerTaskTypes::workflow_only();
     starter.sdk_config.patch_activation_callback = callback;
     starter.sdk_config.register_wasm_workflow(component);
 
     let mut worker = starter.worker().await;
-    let client = starter.get_client().await;
+    let client = starter.get_core_client().await;
     let payload_converter = PayloadConverter::default();
     let input = RawValue::from_value(&WASM_PATCH_ID, &payload_converter);
     let workflow_id = starter.get_wf_id().to_owned();
