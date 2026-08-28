@@ -55,12 +55,6 @@ pub struct DefaultFailureConverter {
     encode_common_attributes: bool,
 }
 
-/// A default failure converter that leaves common failure attributes unencoded.
-///
-/// This value preserves the original unit-struct construction syntax for downstream users.
-#[allow(non_upper_case_globals)]
-pub const DefaultFailureConverter: DefaultFailureConverter = DefaultFailureConverter::new(false);
-
 impl DefaultFailureConverter {
     /// Creates a failure converter, optionally moving failure messages and stack traces into
     /// encoded attributes.

@@ -724,7 +724,7 @@ impl Default for DataConverter {
     fn default() -> Self {
         Self::new(
             PayloadConverter::default(),
-            DefaultFailureConverter,
+            DefaultFailureConverter::default(),
             DefaultPayloadCodec,
         )
     }
