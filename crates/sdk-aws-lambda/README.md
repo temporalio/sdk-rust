@@ -36,3 +36,41 @@ The builder applies Lambda-oriented limits by default: 10 Workflow Task slots, 2
 workflow cache size of 30, and a five-second graceful shutdown period. Eager Activity execution is
 always disabled, and Worker Deployment Versioning is always enabled. Call `worker_tuner` to
 explicitly replace the fixed-size Lambda tuner with a custom tuner.
+
+## OpenTelemetry
+
+Enable the `otel` feature to configure Temporal metrics and tracing for the AWS Distro for
+OpenTelemetry Collector Lambda layer:
+
+```toml
+[dependencies]
+temporalio-sdk-aws-lambda = { version = "0.1", features = ["otel"] }
+```
+
+```rust,no_run
+use temporalio_sdk_aws_lambda::otel::OpenTelemetryOptions;
+
+# fn configure(
+#     version: temporalio_common::worker::WorkerDeploymentVersion,
+#     worker_options: temporalio_sdk::WorkerOptions,
+# ) -> Result<(), temporalio_sdk_aws_lambda::LambdaWorkerError> {
+let worker = temporalio_sdk_aws_lambda::LambdaWorker::builder(version, worker_options)
+    .open_telemetry(OpenTelemetryOptions::default())
+    .build()?;
+# Ok(())
+# }
+```
+
+The default OTLP gRPC endpoint is `OTEL_EXPORTER_OTLP_ENDPOINT`, then
+`http://localhost:4317`. The service name is taken from `OTEL_SERVICE_NAME`, then
+`AWS_LAMBDA_FUNCTION_NAME`, and otherwise defaults to `temporal-lambda-worker`. Traces use
+AWS X-Ray-compatible trace IDs. Metrics and spans are force-flushed within the invocation's
+shutdown window while their providers remain active for warm starts.
+
+Attach the ADOT Collector Lambda layer and point `OTEL_EXPORTER_OTLP_ENDPOINT` at its receiver.
+The Lambda integration configures Temporal telemetry; application code outside Temporal still
+requires separate instrumentation.
+
+`open_telemetry` creates a telemetry-enabled Temporal runtime and therefore cannot be combined with
+the builder's `runtime` method. Applications that provide their own runtime can use `shutdown_hook`
+to flush their application-owned telemetry providers.
