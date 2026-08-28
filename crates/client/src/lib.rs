@@ -3655,7 +3655,7 @@ mod tests {
             let recorded = Arc::new(Mutex::new(RecordedStart::default()));
             let data_converter = DataConverter::new(
                 PayloadConverter::default(),
-                DefaultFailureConverter,
+                DefaultFailureConverter::default(),
                 CountingCodec {
                     encode_calls: encode_calls.clone(),
                 },
@@ -3678,8 +3678,11 @@ mod tests {
             codec: impl PayloadCodec + Send + Sync + 'static,
         ) -> (MockStartWorkflowClient, Arc<Mutex<RecordedStart>>) {
             let recorded = Arc::new(Mutex::new(RecordedStart::default()));
-            let data_converter =
-                DataConverter::new(PayloadConverter::default(), DefaultFailureConverter, codec);
+            let data_converter = DataConverter::new(
+                PayloadConverter::default(),
+                DefaultFailureConverter::default(),
+                codec,
+            );
             (
                 MockStartWorkflowClient {
                     recorded: recorded.clone(),
@@ -3888,7 +3891,7 @@ mod tests {
             let recorded = Arc::new(Mutex::new(RecordedStart::default()));
             let data_converter = DataConverter::new(
                 PayloadConverter::UseWrappers,
-                DefaultFailureConverter,
+                DefaultFailureConverter::default(),
                 CountingCodec {
                     encode_calls: encode_calls.clone(),
                 },
@@ -4776,7 +4779,7 @@ mod tests {
         async fn list_workflows_exposes_typed_memo() {
             let data_converter = DataConverter::new(
                 PayloadConverter::default(),
-                DefaultFailureConverter,
+                DefaultFailureConverter::default(),
                 XorCodec,
             );
             let memo_payload = data_converter
@@ -4816,7 +4819,7 @@ mod tests {
                 total_workflows: 1,
                 data_converter: DataConverter::new(
                     PayloadConverter::default(),
-                    DefaultFailureConverter,
+                    DefaultFailureConverter::default(),
                     FailingCodec,
                 ),
                 memo_payload: Some(Payload::default()),

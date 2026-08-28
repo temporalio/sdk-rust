@@ -1423,7 +1423,7 @@ mod tests {
     async fn workflow_result_details_support_typed_decoding() {
         let converter = DataConverter::new(
             PayloadConverter::default(),
-            DefaultFailureConverter,
+            DefaultFailureConverter::default(),
             XorCodec,
         );
         let payloads = converter
@@ -1461,7 +1461,7 @@ mod tests {
     async fn workflow_description_memo_uses_saved_converter() {
         let converter = DataConverter::new(
             PayloadConverter::default(),
-            DefaultFailureConverter,
+            DefaultFailureConverter::default(),
             XorCodec,
         );
         let encoded = converter

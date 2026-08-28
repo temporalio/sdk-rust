@@ -797,7 +797,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_encode_failure_encodes_application_failure_details() {
-        let mut failure = DefaultFailureConverter.to_failure(
+        let mut failure = DefaultFailureConverter::default().to_failure(
             OutgoingError::Workflow(OutgoingWorkflowError::Application(Box::new(
                 ApplicationFailure::builder(anyhow::anyhow!("app boom"))
                     .details(crate::data_converters::RawValue::new(vec![make_payload(

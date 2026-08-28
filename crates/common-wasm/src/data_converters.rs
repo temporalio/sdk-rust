@@ -5,7 +5,7 @@ mod failure_converter;
 
 pub use failure_converter::{
     ActivityExecutionDecodeHint, ChildWorkflowExecutionDecodeHint, ChildWorkflowStartDecodeHint,
-    DefaultFailureConverter, FailureConverter, FailureDecodeHint, NoopDecodeHint,
+    CommonAttributes, DefaultFailureConverter, FailureConverter, FailureDecodeHint, NoopDecodeHint,
     WorkflowSignalDecodeHint,
 };
 

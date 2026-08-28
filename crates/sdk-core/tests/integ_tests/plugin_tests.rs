@@ -218,7 +218,7 @@ async fn simple_plugin_configures_working_client_and_worker() {
     let worker_interceptor_calls = Arc::new(AtomicUsize::new(0));
     let data_converter = DataConverter::new(
         PayloadConverter::default(),
-        DefaultFailureConverter,
+        DefaultFailureConverter::default(),
         CountingPayloadCodec {
             encode_calls: encode_calls.clone(),
             decode_calls: decode_calls.clone(),

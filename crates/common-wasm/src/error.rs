@@ -1271,7 +1271,7 @@ mod tests {
             ..Default::default()
         };
 
-        let decoded = DefaultFailureConverter
+        let decoded = DefaultFailureConverter::default()
             .to_error(
                 failure,
                 &PayloadConverter::default(),
@@ -1316,7 +1316,7 @@ mod tests {
                 ..Default::default()
             }],
         };
-        let failure = DefaultFailureConverter.to_failure(
+        let failure = DefaultFailureConverter::default().to_failure(
             OutgoingError::Workflow(OutgoingWorkflowError::Application(Box::new(
                 ApplicationFailure::builder(anyhow::anyhow!("oops"))
                     .type_name("MyType".to_owned())
@@ -1346,7 +1346,7 @@ mod tests {
             data: b"details".to_vec(),
             ..Default::default()
         };
-        let failure = DefaultFailureConverter.to_failure(
+        let failure = DefaultFailureConverter::default().to_failure(
             OutgoingError::Workflow(OutgoingWorkflowError::Application(Box::new(
                 ApplicationFailure::builder(anyhow::anyhow!("oops"))
                     .details(RawValue::new(vec![payload.clone()]))
@@ -1364,7 +1364,7 @@ mod tests {
 
     #[test]
     fn builder_accepts_serializable_details() {
-        let failure = DefaultFailureConverter.to_failure(
+        let failure = DefaultFailureConverter::default().to_failure(
             OutgoingError::Workflow(OutgoingWorkflowError::Application(Box::new(
                 ApplicationFailure::builder(anyhow::anyhow!("oops"))
                     .details("details".to_string())
@@ -1390,7 +1390,7 @@ mod tests {
 
     #[test]
     fn application_failure_encoding_surfaces_detail_encoding_errors() {
-        let failure = DefaultFailureConverter.to_failure(
+        let failure = DefaultFailureConverter::default().to_failure(
             OutgoingError::Workflow(OutgoingWorkflowError::Application(Box::new(
                 ApplicationFailure::builder(anyhow::anyhow!("oops"))
                     .details(AlwaysFailsSerialize)

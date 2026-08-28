@@ -1583,7 +1583,7 @@ mod tests {
         let codec = Arc::new(FailingEncodeCodec::default());
         let data_converter = DataConverter::new(
             PayloadConverter::default(),
-            DefaultFailureConverter,
+            DefaultFailureConverter::default(),
             codec.clone(),
         );
         let mut completion = WorkflowActivationCompletion::from_cmd(
@@ -1614,7 +1614,7 @@ mod tests {
         let codec = Arc::new(FailingEncodeCodec::default());
         let data_converter = DataConverter::new(
             PayloadConverter::default(),
-            DefaultFailureConverter,
+            DefaultFailureConverter::default(),
             codec.clone(),
         );
         let mut completion = ActivityTaskCompletion {

@@ -11,6 +11,7 @@ use temporalio_common::{
         TemporalDeserializable,
     },
     error::IncomingError,
+    payload_visitor::decode_payloads,
     protos::{
         proto_ts_to_system_time,
         temporal::api::{
@@ -187,18 +188,25 @@ impl<ActivityT> ActivityExecutionDescription<ActivityT>
 where
     ActivityT: ActivityDefinition,
 {
-    pub(crate) fn new(
+    pub(crate) async fn new(
         data_converter: DataConverter,
         serialization_context: SerializationContextData,
         response: DescribeActivityExecutionResponse,
     ) -> Result<Self, Box<dyn Error + Send + Sync + 'static>> {
-        let Some(raw_info) = response.info else {
+        let Some(mut raw_info) = response.info else {
             return Err("info missing in describe response".into());
         };
+        if let Some(failure) = raw_info.last_failure.as_mut() {
+            decode_payloads(failure, data_converter.codec(), &serialization_context).await?;
+        }
+        let mut raw_outcome = response.outcome.and_then(|o| o.value);
+        if let Some(ActivityExecutionOutcomeValue::Failure(failure)) = raw_outcome.as_mut() {
+            decode_payloads(failure, data_converter.codec(), &serialization_context).await?;
+        }
         Ok(Self {
             raw_info,
             raw_input: response.input,
-            raw_outcome: response.outcome.and_then(|o| o.value),
+            raw_outcome,
             data_converter,
             serialization_context,
             _phantom: PhantomData,

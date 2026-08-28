@@ -1682,7 +1682,7 @@ mod tests {
     fn data_converter_with_codec() -> DataConverter {
         DataConverter::new(
             PayloadConverter::default(),
-            DefaultFailureConverter,
+            DefaultFailureConverter::default(),
             XorCodec,
         )
     }
@@ -2036,7 +2036,7 @@ mod tests {
             },
             data_converter: DataConverter::new(
                 PayloadConverter::default(),
-                DefaultFailureConverter,
+                DefaultFailureConverter::default(),
                 FailingCodec,
             ),
             ..Default::default()

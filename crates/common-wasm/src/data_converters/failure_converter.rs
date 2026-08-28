@@ -9,7 +9,10 @@
 //!   [`FailureDecodeHint`] implementations adapt that normalized value into the caller-facing error
 //!   type they expect.
 
-use super::{PayloadConversionError, PayloadConverter, SerializationContextData};
+use super::{
+    GenericPayloadConverter, PayloadConversionError, PayloadConverter, SerializationContext,
+    SerializationContextData,
+};
 use crate::{
     error::{
         ActivityExecutionError, ActivityFailureError, ApplicationFailure, CancelledError,
@@ -48,7 +51,41 @@ pub trait FailureConverter {
 }
 
 /// Default failure converter.
-pub struct DefaultFailureConverter;
+pub struct DefaultFailureConverter {
+    encode_common_attributes: bool,
+}
+
+/// A default failure converter that leaves common failure attributes unencoded.
+///
+/// This value preserves the original unit-struct construction syntax for downstream users.
+#[allow(non_upper_case_globals)]
+pub const DefaultFailureConverter: DefaultFailureConverter = DefaultFailureConverter::new(false);
+
+impl DefaultFailureConverter {
+    /// Creates a failure converter, optionally moving failure messages and stack traces into
+    /// encoded attributes.
+    pub const fn new(encode_common_attributes: bool) -> Self {
+        Self {
+            encode_common_attributes,
+        }
+    }
+}
+
+impl Default for DefaultFailureConverter {
+    fn default() -> Self {
+        Self::new(false)
+    }
+}
+
+/// Failure attributes that can be moved into an encoded payload.
+#[derive(serde::Deserialize, serde::Serialize)]
+#[non_exhaustive]
+pub struct CommonAttributes {
+    /// Failure message.
+    pub message: String,
+    /// Failure stack trace.
+    pub stack_trace: String,
+}
 
 /// Adapts a normalized incoming failure into a caller-facing error surface.
 pub trait FailureDecodeHint {
@@ -217,12 +254,21 @@ impl FailureConverter for DefaultFailureConverter {
                 signal.encode_failure(payload_converter, context)
             }
         };
-        encoded.unwrap_or_else(|converter_error| {
+        let mut failure = encoded.unwrap_or_else(|converter_error| {
             Failure::application_failure(
                 failed_error_conversion_message(&original_error, &converter_error),
                 false,
             )
-        })
+        });
+        if self.encode_common_attributes
+            && encode_common_attributes(&mut failure, payload_converter, context).is_err()
+        {
+            failure = Failure::application_failure(
+                "Failed encoding failure attributes".to_owned(),
+                false,
+            );
+        }
+        failure
     }
 
     fn to_error(
@@ -476,11 +522,39 @@ fn encode_failed_error_conversion(
     }
 }
 
+fn encode_common_attributes(
+    failure: &mut Failure,
+    payload_converter: &PayloadConverter,
+    context: &SerializationContextData,
+) -> Result<(), PayloadConversionError> {
+    if let Some(cause) = failure.cause.as_deref_mut() {
+        encode_common_attributes(cause, payload_converter, context)?;
+    }
+    failure.encoded_attributes = Some(payload_converter.to_payload(
+        &SerializationContext::new(context, payload_converter),
+        &CommonAttributes {
+            message: std::mem::take(&mut failure.message),
+            stack_trace: std::mem::take(&mut failure.stack_trace),
+        },
+    )?);
+    failure.message = "Encoded failure".to_owned();
+    Ok(())
+}
+
 fn decode_failure(
-    failure: Failure,
+    mut failure: Failure,
     payload_converter: &PayloadConverter,
     context: &SerializationContextData,
 ) -> IncomingError {
+    if let Some(encoded_attributes) = failure.encoded_attributes.clone()
+        && let Ok(attributes) = payload_converter.from_payload::<CommonAttributes>(
+            &SerializationContext::new(context, payload_converter),
+            encoded_attributes,
+        )
+    {
+        failure.message = attributes.message;
+        failure.stack_trace = attributes.stack_trace;
+    }
     let cause = failure
         .cause
         .clone()
@@ -624,7 +698,7 @@ mod tests {
     }
 
     fn convert(err: OutgoingWorkflowError) -> Failure {
-        DefaultFailureConverter.to_failure(
+        DefaultFailureConverter::default().to_failure(
             OutgoingError::Workflow(err),
             &PayloadConverter::default(),
             &SerializationContextData::Workflow,
@@ -634,7 +708,7 @@ mod tests {
     fn data_converter() -> crate::data_converters::DataConverter {
         crate::data_converters::DataConverter::new(
             PayloadConverter::default(),
-            DefaultFailureConverter,
+            DefaultFailureConverter::default(),
             crate::data_converters::DefaultPayloadCodec,
         )
     }
@@ -705,7 +779,7 @@ mod tests {
 
     #[test]
     fn application_failures_surface_detail_encoding_errors_with_original_message() {
-        let failure = DefaultFailureConverter.to_failure(
+        let failure = DefaultFailureConverter::default().to_failure(
             OutgoingError::Workflow(OutgoingWorkflowError::Application(Box::new(
                 ApplicationFailure::builder(anyhow::anyhow!("app boom"))
                     .details(AlwaysFailsSerialize)
@@ -741,7 +815,7 @@ mod tests {
             ..Default::default()
         };
 
-        let decoded = DefaultFailureConverter
+        let decoded = DefaultFailureConverter::default()
             .to_error(failure, &converter, &SerializationContextData::Workflow)
             .unwrap();
 
@@ -885,7 +959,7 @@ mod tests {
         ));
         assert!(cause.cause.is_none());
 
-        let decoded = DefaultFailureConverter
+        let decoded = DefaultFailureConverter::default()
             .to_error(
                 converted.clone(),
                 &PayloadConverter::default(),
@@ -905,6 +979,79 @@ mod tests {
             Some("generic inner cause")
         );
         assert!(wrapper.cause().is_none());
+    }
+
+    #[test]
+    fn failure_converter_encodes_and_decodes_cause_chain() {
+        let payload_converter = PayloadConverter::default();
+        let converter = DefaultFailureConverter::new(true);
+        let context = SerializationContextData::Workflow;
+        let failure = Failure {
+            message: "outer message".to_owned(),
+            stack_trace: "outer stack trace".to_owned(),
+            cause: Some(Box::new(Failure {
+                message: "inner message".to_owned(),
+                stack_trace: "inner stack trace".to_owned(),
+                failure_info: Some(FailureInfo::ApplicationFailureInfo(
+                    ApplicationFailureInfo::default(),
+                )),
+                ..Default::default()
+            })),
+            failure_info: Some(FailureInfo::ActivityFailureInfo(
+                ActivityFailureInfo::default(),
+            )),
+            ..Default::default()
+        };
+        let activity_error = ActivityExecutionError::Failed(ActivityFailureError::new(
+            failure,
+            ActivityFailureInfo::default(),
+            None,
+        ));
+
+        let failure = converter.to_failure(
+            OutgoingError::Workflow(OutgoingWorkflowError::ActivityExecution(Box::new(
+                activity_error,
+            ))),
+            &payload_converter,
+            &context,
+        );
+
+        assert_eq!(failure.message, "Encoded failure");
+        assert_eq!(failure.cause.as_ref().unwrap().message, "Encoded failure");
+        assert!(failure.stack_trace.is_empty());
+        assert!(failure.cause.as_ref().unwrap().stack_trace.is_empty());
+        let payload_context = SerializationContext::new(&context, &payload_converter);
+        let outer_attributes: CommonAttributes = payload_converter
+            .from_payload(
+                &payload_context,
+                failure.encoded_attributes.clone().unwrap(),
+            )
+            .unwrap();
+        let inner_attributes: CommonAttributes = payload_converter
+            .from_payload(
+                &payload_context,
+                failure
+                    .cause
+                    .as_ref()
+                    .unwrap()
+                    .encoded_attributes
+                    .clone()
+                    .unwrap(),
+            )
+            .unwrap();
+        assert_eq!(outer_attributes.message, "outer message");
+        assert_eq!(inner_attributes.message, "inner message");
+        assert_eq!(outer_attributes.stack_trace, "outer stack trace");
+        assert_eq!(inner_attributes.stack_trace, "inner stack trace");
+
+        let decoded = DefaultFailureConverter::default()
+            .to_error(failure, &payload_converter, &context)
+            .unwrap();
+        assert_eq!(decoded.failure().message, "outer message");
+        assert_eq!(decoded.failure().stack_trace, "outer stack trace");
+        let cause = decoded.cause().unwrap().failure();
+        assert_eq!(cause.message, "inner message");
+        assert_eq!(cause.stack_trace, "inner stack trace");
     }
 
     #[test]
@@ -937,7 +1084,7 @@ mod tests {
             ..Default::default()
         };
 
-        let decoded = DefaultFailureConverter
+        let decoded = DefaultFailureConverter::default()
             .to_error(
                 failure.clone(),
                 &PayloadConverter::default(),
@@ -970,7 +1117,7 @@ mod tests {
             ..Default::default()
         };
 
-        let decoded = DefaultFailureConverter
+        let decoded = DefaultFailureConverter::default()
             .to_error(
                 failure.clone(),
                 &PayloadConverter::default(),
@@ -996,7 +1143,7 @@ mod tests {
             ..Default::default()
         };
 
-        let decoded = DefaultFailureConverter
+        let decoded = DefaultFailureConverter::default()
             .to_error(
                 failure.clone(),
                 &PayloadConverter::default(),
@@ -1014,7 +1161,7 @@ mod tests {
         assert_eq!(reencoded.message, failure.message);
         assert_eq!(reencoded.cause.as_deref(), failure.cause.as_deref());
 
-        let decoded_reencoded = DefaultFailureConverter
+        let decoded_reencoded = DefaultFailureConverter::default()
             .to_error(
                 reencoded,
                 &PayloadConverter::default(),
@@ -1044,7 +1191,7 @@ mod tests {
             ..Default::default()
         };
 
-        let decoded = DefaultFailureConverter
+        let decoded = DefaultFailureConverter::default()
             .to_error(
                 failure.clone(),
                 &PayloadConverter::default(),
@@ -1115,7 +1262,7 @@ mod tests {
             ..Default::default()
         };
 
-        let decoded = DefaultFailureConverter
+        let decoded = DefaultFailureConverter::default()
             .to_error(
                 failure.clone(),
                 &PayloadConverter::default(),
@@ -1152,7 +1299,7 @@ mod tests {
         };
         let data_converter = crate::data_converters::DataConverter::new(
             PayloadConverter::default(),
-            DefaultFailureConverter,
+            DefaultFailureConverter::default(),
             crate::data_converters::DefaultPayloadCodec,
         );
 
@@ -1254,7 +1401,7 @@ mod tests {
             ..Default::default()
         };
 
-        let decoded = DefaultFailureConverter
+        let decoded = DefaultFailureConverter::default()
             .to_error(
                 failure.clone(),
                 &PayloadConverter::default(),
@@ -1290,7 +1437,7 @@ mod tests {
             ..Default::default()
         };
 
-        let decoded = DefaultFailureConverter
+        let decoded = DefaultFailureConverter::default()
             .to_error(
                 failure.clone(),
                 &PayloadConverter::default(),
@@ -1463,7 +1610,7 @@ mod tests {
 
     #[test]
     fn outgoing_cancelled_activity_errors_encode_to_cancelled_failures() {
-        let failure = DefaultFailureConverter.to_failure(
+        let failure = DefaultFailureConverter::default().to_failure(
             OutgoingError::Activity(OutgoingActivityError::Cancelled { details: None }),
             &PayloadConverter::default(),
             &SerializationContextData::Activity,
@@ -1478,7 +1625,7 @@ mod tests {
 
     #[test]
     fn outgoing_cancelled_activity_errors_encode_serializable_details_with_payload_converter() {
-        let failure = DefaultFailureConverter.to_failure(
+        let failure = DefaultFailureConverter::default().to_failure(
             OutgoingError::Activity(OutgoingActivityError::Cancelled {
                 details: Some("detail".to_string().into()),
             }),
@@ -1486,7 +1633,7 @@ mod tests {
             &SerializationContextData::Activity,
         );
 
-        let err = DefaultFailureConverter
+        let err = DefaultFailureConverter::default()
             .to_error(
                 failure,
                 &PayloadConverter::default(),
