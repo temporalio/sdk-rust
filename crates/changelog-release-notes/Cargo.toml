@@ -5,6 +5,11 @@ edition = "2024"
 license-file = { workspace = true }
 publish = false
 rust-version = "1.88.0"
+default-run = "changelog-release-notes"
+
+[dependencies]
+chrono = { version = "=0.4.45", default-features = false, features = ["clock"] }
+semver = "=1.0.28"
 
 [lints]
 workspace = true

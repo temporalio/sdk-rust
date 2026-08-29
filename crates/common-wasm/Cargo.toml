@@ -45,7 +45,7 @@ tracing-core = "0.1"
 url = "2.5"
 [dependencies.temporalio-protos]
 path = "../protos"
-version = "0.7"
+version = "~0.7.0"
 
 [lints]
 workspace = true
