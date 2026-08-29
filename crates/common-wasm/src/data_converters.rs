@@ -683,6 +683,33 @@ pub trait ErasedSerdePayloadConverter: Send + Sync {
     ) -> Result<Box<dyn erased_serde::Deserializer<'static>>, PayloadConversionError>;
 }
 
+/// Wrapper for raw bytes that implements [`TemporalSerializable`]/[`TemporalDeserializable`]
+/// using `binary/plain` encoding.
+pub struct Binary(pub Vec<u8>);
+
+impl TemporalSerializable for Binary {
+    fn to_payload(&self, _: &SerializationContext<'_>) -> Result<Payload, PayloadConversionError> {
+        Ok(Payload {
+            metadata: HashMap::from([("encoding".to_string(), b"binary/plain".to_vec())]),
+            data: self.0.clone(),
+            external_payloads: vec![],
+        })
+    }
+}
+
+impl TemporalDeserializable for Binary {
+    fn from_payload(
+        _: &SerializationContext<'_>,
+        p: Payload,
+    ) -> Result<Self, PayloadConversionError> {
+        let encoding = p.metadata.get("encoding").map(|v| v.as_slice());
+        if encoding != Some(b"binary/plain".as_slice()) {
+            return Err(PayloadConversionError::WrongEncoding);
+        }
+        Ok(Binary(p.data))
+    }
+}
+
 // TODO [rust-sdk-branch]: All prost things should be behind a compile flag
 
 /// Wrapper for protobuf messages that implements [`TemporalSerializable`]/[`TemporalDeserializable`]
@@ -929,6 +956,21 @@ mod tests {
             .unwrap();
         assert_eq!(payload.metadata.get("encoding").unwrap(), b"json/plain");
         assert_eq!(payload.data, br#""value""#);
+    }
+
+    #[test]
+    fn binary_roundtrip() {
+        let converter = PayloadConverter::default();
+        let ctx = SerializationContext::new(&SerializationContextData::Workflow, &converter);
+
+        let payload = converter
+            .to_payload(&ctx, &Binary(vec![0, 1, 2, 255]))
+            .unwrap();
+        assert_eq!(payload.metadata.get("encoding").unwrap(), b"binary/plain");
+        assert_eq!(payload.data, vec![0, 1, 2, 255]);
+
+        let result: Binary = converter.from_payload(&ctx, payload).unwrap();
+        assert_eq!(result.0, vec![0, 1, 2, 255]);
     }
 
     #[test]

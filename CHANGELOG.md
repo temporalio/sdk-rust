@@ -34,6 +34,7 @@ relevant information.
 ## Unreleased
 
 ### Added
+* `Binary` to explicitly serialize a `Vec<u8>` as a `binary/plain` payload.
 * `LocalActivityOptions::include_arguments_into_marker` allows Rust workflows to opt in to
   recording local activity arguments in Workflow history.
 * `WorkflowHandle::get_update_handle` creates a typed handle for an existing Workflow Update from
