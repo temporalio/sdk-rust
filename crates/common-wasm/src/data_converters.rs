@@ -516,6 +516,15 @@ impl GenericPayloadConverter for PayloadConverter {
                 // no payloads for it.
                 if std::any::TypeId::of::<T>() == std::any::TypeId::of::<()>() {
                     Ok(Vec::new())
+                } else if let Some(bytes) = (val as &dyn std::any::Any).downcast_ref::<Vec<u8>>() {
+                    Ok(vec![binary_plain_payload(bytes.clone())])
+                } else if let Some(bytes) =
+                    (val as &dyn std::any::Any).downcast_ref::<Option<Vec<u8>>>()
+                {
+                    Ok(vec![match bytes {
+                        Some(bytes) => binary_plain_payload(bytes.clone()),
+                        None => binary_null_payload(),
+                    }])
                 } else {
                     Ok(vec![pc.to_payload(context.data, val.as_serde()?)?])
                 }
@@ -553,7 +562,24 @@ impl GenericPayloadConverter for PayloadConverter {
                 if payloads.len() != 1 {
                     return Err(PayloadConversionError::WrongEncoding);
                 }
-                T::from_serde(pc.as_ref(), context, payloads.into_iter().next().unwrap())
+                let payload = payloads.into_iter().next().unwrap();
+                if std::any::TypeId::of::<T>() == std::any::TypeId::of::<Vec<u8>>()
+                    && is_binary_plain_payload(&payload)
+                {
+                    let boxed: Box<dyn std::any::Any> = Box::new(payload.data);
+                    return Ok(*boxed.downcast::<T>().unwrap());
+                }
+                if std::any::TypeId::of::<T>() == std::any::TypeId::of::<Option<Vec<u8>>>() {
+                    if is_binary_plain_payload(&payload) {
+                        let boxed: Box<dyn std::any::Any> = Box::new(Some(payload.data));
+                        return Ok(*boxed.downcast::<T>().unwrap());
+                    }
+                    if is_binary_null_payload(&payload) {
+                        let boxed: Box<dyn std::any::Any> = Box::new(None::<Vec<u8>>);
+                        return Ok(*boxed.downcast::<T>().unwrap());
+                    }
+                }
+                T::from_serde(pc.as_ref(), context, payload)
             }
             PayloadConverter::UseWrappers => T::from_payloads(context, payloads),
             PayloadConverter::Composite(composite) => {
@@ -568,6 +594,21 @@ impl GenericPayloadConverter for PayloadConverter {
             }
         }
     }
+}
+
+fn binary_plain_payload(data: Vec<u8>) -> Payload {
+    Payload {
+        metadata: HashMap::from([("encoding".to_string(), b"binary/plain".to_vec())]),
+        data,
+        external_payloads: vec![],
+    }
+}
+
+fn is_binary_plain_payload(payload: &Payload) -> bool {
+    payload
+        .metadata
+        .get("encoding")
+        .is_some_and(|encoding| encoding == b"binary/plain")
 }
 
 fn binary_null_payload() -> Payload {
@@ -681,33 +722,6 @@ pub trait ErasedSerdePayloadConverter: Send + Sync {
         context: &SerializationContextData,
         payload: Payload,
     ) -> Result<Box<dyn erased_serde::Deserializer<'static>>, PayloadConversionError>;
-}
-
-/// Wrapper for raw bytes that implements [`TemporalSerializable`]/[`TemporalDeserializable`]
-/// using `binary/plain` encoding.
-pub struct Binary(pub Vec<u8>);
-
-impl TemporalSerializable for Binary {
-    fn to_payload(&self, _: &SerializationContext<'_>) -> Result<Payload, PayloadConversionError> {
-        Ok(Payload {
-            metadata: HashMap::from([("encoding".to_string(), b"binary/plain".to_vec())]),
-            data: self.0.clone(),
-            external_payloads: vec![],
-        })
-    }
-}
-
-impl TemporalDeserializable for Binary {
-    fn from_payload(
-        _: &SerializationContext<'_>,
-        p: Payload,
-    ) -> Result<Self, PayloadConversionError> {
-        let encoding = p.metadata.get("encoding").map(|v| v.as_slice());
-        if encoding != Some(b"binary/plain".as_slice()) {
-            return Err(PayloadConversionError::WrongEncoding);
-        }
-        Ok(Binary(p.data))
-    }
 }
 
 // TODO [rust-sdk-branch]: All prost things should be behind a compile flag
@@ -897,11 +911,17 @@ mod tests {
     }
 
     #[test]
-    fn test_unit_use_wrappers_returns_wrong_encoding() {
+    fn use_wrappers_returns_wrong_encoding_for_standard_types() {
         let converter = PayloadConverter::UseWrappers;
         let ctx = SerializationContext::new(&SerializationContextData::Workflow, &converter);
 
         let result = converter.to_payloads(&ctx, &());
+        assert!(
+            matches!(result, Err(PayloadConversionError::WrongEncoding)),
+            "{result:?}"
+        );
+
+        let result = converter.to_payloads(&ctx, &vec![1_u8, 2, 3]);
         assert!(
             matches!(result, Err(PayloadConversionError::WrongEncoding)),
             "{result:?}"
@@ -959,18 +979,58 @@ mod tests {
     }
 
     #[test]
-    fn binary_roundtrip() {
+    fn vec_u8_uses_binary_plain_and_accepts_legacy_json() {
         let converter = PayloadConverter::default();
         let ctx = SerializationContext::new(&SerializationContextData::Workflow, &converter);
 
-        let payload = converter
-            .to_payload(&ctx, &Binary(vec![0, 1, 2, 255]))
-            .unwrap();
+        let payload = converter.to_payload(&ctx, &vec![0_u8, 1, 2, 255]).unwrap();
         assert_eq!(payload.metadata.get("encoding").unwrap(), b"binary/plain");
         assert_eq!(payload.data, vec![0, 1, 2, 255]);
 
-        let result: Binary = converter.from_payload(&ctx, payload).unwrap();
-        assert_eq!(result.0, vec![0, 1, 2, 255]);
+        let result: Vec<u8> = converter.from_payload(&ctx, payload).unwrap();
+        assert_eq!(result, vec![0, 1, 2, 255]);
+
+        let legacy_json = Payload {
+            metadata: HashMap::from([("encoding".to_string(), b"json/plain".to_vec())]),
+            data: b"[3,2,1]".to_vec(),
+            external_payloads: vec![],
+        };
+        let result: Vec<u8> = converter.from_payload(&ctx, legacy_json).unwrap();
+        assert_eq!(result, vec![3, 2, 1]);
+    }
+
+    #[test]
+    fn option_vec_u8_uses_binary_encodings_and_accepts_legacy_json() {
+        let converter = PayloadConverter::default();
+        let ctx = SerializationContext::new(&SerializationContextData::Workflow, &converter);
+
+        let payload = converter.to_payload(&ctx, &Some(vec![1_u8, 2, 3])).unwrap();
+        assert_eq!(payload.metadata.get("encoding").unwrap(), b"binary/plain");
+        let result: Option<Vec<u8>> = converter.from_payload(&ctx, payload).unwrap();
+        assert_eq!(result, Some(vec![1, 2, 3]));
+
+        let payload = converter
+            .to_payload(&ctx, &Option::<Vec<u8>>::None)
+            .unwrap();
+        assert!(is_binary_null_payload(&payload));
+        let result: Option<Vec<u8>> = converter.from_payload(&ctx, payload).unwrap();
+        assert_eq!(result, None);
+
+        let legacy_json = Payload {
+            metadata: HashMap::from([("encoding".to_string(), b"json/plain".to_vec())]),
+            data: b"[3,2,1]".to_vec(),
+            external_payloads: vec![],
+        };
+        let result: Option<Vec<u8>> = converter.from_payload(&ctx, legacy_json).unwrap();
+        assert_eq!(result, Some(vec![3, 2, 1]));
+
+        let legacy_json_null = Payload {
+            metadata: HashMap::from([("encoding".to_string(), b"json/plain".to_vec())]),
+            data: b"null".to_vec(),
+            external_payloads: vec![],
+        };
+        let result: Option<Vec<u8>> = converter.from_payload(&ctx, legacy_json_null).unwrap();
+        assert_eq!(result, None);
     }
 
     #[test]

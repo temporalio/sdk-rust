@@ -34,7 +34,6 @@ relevant information.
 ## Unreleased
 
 ### Added
-* `Binary` to explicitly serialize a `Vec<u8>` as a `binary/plain` payload.
 * `LocalActivityOptions::include_arguments_into_marker` allows Rust workflows to opt in to
   recording local activity arguments in Workflow history.
 * `WorkflowHandle::get_update_handle` creates a typed handle for an existing Workflow Update from
@@ -109,6 +108,8 @@ relevant information.
   non-sticky poller, so the worker would stop picking up new workflows until a poll timed out (up to
   ~60s). The poll balancer now reserves a non-sticky slot against the cache size rather than the
   slot-supplier size.
+* The default payload converter now encodes `Vec<u8>` and `Option<Vec<u8>>` as `binary/plain` when
+  present.
 
 ## [0.7.0] - 2026-08-17
 
