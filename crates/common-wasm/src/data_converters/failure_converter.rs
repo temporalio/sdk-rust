@@ -597,7 +597,10 @@ fn decode_failure(
 mod tests {
     use super::*;
     use crate::{
-        data_converters::{GenericPayloadConverter, SerializationContext},
+        data_converters::{
+            ActivitySerializationContext, GenericPayloadConverter, SerializationContext,
+            WorkflowSerializationContext,
+        },
         error::ApplicationErrorCategory,
         protos::temporal::api::{
             common::v1::{Payload, Payloads},
@@ -695,7 +698,7 @@ mod tests {
         DefaultFailureConverter::default().to_failure(
             OutgoingError::Workflow(err),
             &PayloadConverter::default(),
-            &SerializationContextData::Workflow,
+            &SerializationContextData::Workflow(WorkflowSerializationContext::new()),
         )
     }
 
@@ -764,7 +767,10 @@ mod tests {
         let converter = PayloadConverter::default();
         let details: String = converter
             .from_payloads(
-                &SerializationContext::new(&SerializationContextData::Workflow, &converter),
+                &SerializationContext::new(
+                    &SerializationContextData::Workflow(WorkflowSerializationContext::new()),
+                    &converter,
+                ),
                 payloads,
             )
             .unwrap();
@@ -780,7 +786,7 @@ mod tests {
                     .build(),
             ))),
             &PayloadConverter::default(),
-            &SerializationContextData::Workflow,
+            &SerializationContextData::Workflow(WorkflowSerializationContext::new()),
         );
 
         assert_eq!(
@@ -794,7 +800,10 @@ mod tests {
         let converter = PayloadConverter::default();
         let payloads = converter
             .to_payloads(
-                &SerializationContext::new(&SerializationContextData::Workflow, &converter),
+                &SerializationContext::new(
+                    &SerializationContextData::Workflow(WorkflowSerializationContext::new()),
+                    &converter,
+                ),
                 &"detail",
             )
             .unwrap();
@@ -810,7 +819,11 @@ mod tests {
         };
 
         let decoded = DefaultFailureConverter::default()
-            .to_error(failure, &converter, &SerializationContextData::Workflow)
+            .to_error(
+                failure,
+                &converter,
+                &SerializationContextData::Workflow(WorkflowSerializationContext::new()),
+            )
             .unwrap();
 
         let IncomingError::Application(app) = decoded else {
@@ -957,7 +970,7 @@ mod tests {
             .to_error(
                 converted.clone(),
                 &PayloadConverter::default(),
-                &SerializationContextData::Workflow,
+                &SerializationContextData::Workflow(WorkflowSerializationContext::new()),
             )
             .unwrap();
 
@@ -979,7 +992,7 @@ mod tests {
     fn failure_converter_encodes_and_decodes_cause_chain() {
         let payload_converter = PayloadConverter::default();
         let converter = DefaultFailureConverter::new(true);
-        let context = SerializationContextData::Workflow;
+        let context = SerializationContextData::Workflow(WorkflowSerializationContext::new());
         let failure = Failure {
             message: "outer message".to_owned(),
             stack_trace: "outer stack trace".to_owned(),
@@ -1082,7 +1095,7 @@ mod tests {
             .to_error(
                 failure.clone(),
                 &PayloadConverter::default(),
-                &SerializationContextData::Workflow,
+                &SerializationContextData::Workflow(WorkflowSerializationContext::new()),
             )
             .unwrap();
 
@@ -1115,7 +1128,7 @@ mod tests {
             .to_error(
                 failure.clone(),
                 &PayloadConverter::default(),
-                &SerializationContextData::Workflow,
+                &SerializationContextData::Workflow(WorkflowSerializationContext::new()),
             )
             .unwrap();
 
@@ -1141,7 +1154,7 @@ mod tests {
             .to_error(
                 failure.clone(),
                 &PayloadConverter::default(),
-                &SerializationContextData::Workflow,
+                &SerializationContextData::Workflow(WorkflowSerializationContext::new()),
             )
             .unwrap();
 
@@ -1159,7 +1172,7 @@ mod tests {
             .to_error(
                 reencoded,
                 &PayloadConverter::default(),
-                &SerializationContextData::Workflow,
+                &SerializationContextData::Workflow(WorkflowSerializationContext::new()),
             )
             .unwrap();
         let IncomingError::Application(roundtripped) = decoded_reencoded else {
@@ -1189,7 +1202,7 @@ mod tests {
             .to_error(
                 failure.clone(),
                 &PayloadConverter::default(),
-                &SerializationContextData::Workflow,
+                &SerializationContextData::Workflow(WorkflowSerializationContext::new()),
             )
             .unwrap();
 
@@ -1260,7 +1273,7 @@ mod tests {
             .to_error(
                 failure.clone(),
                 &PayloadConverter::default(),
-                &SerializationContextData::Workflow,
+                &SerializationContextData::Workflow(WorkflowSerializationContext::new()),
             )
             .unwrap();
 
@@ -1299,7 +1312,7 @@ mod tests {
 
         let decoded = data_converter
             .to_error(
-                &SerializationContextData::Workflow,
+                &SerializationContextData::Workflow(WorkflowSerializationContext::new()),
                 failure.clone(),
                 ActivityExecutionDecodeHint { cancelled: false },
             )
@@ -1350,7 +1363,7 @@ mod tests {
     ) {
         let decoded = data_converter()
             .to_error(
-                &SerializationContextData::Workflow,
+                &SerializationContextData::Workflow(WorkflowSerializationContext::new()),
                 failure.clone(),
                 ActivityExecutionDecodeHint { cancelled: true },
             )
@@ -1399,7 +1412,7 @@ mod tests {
             .to_error(
                 failure.clone(),
                 &PayloadConverter::default(),
-                &SerializationContextData::Workflow,
+                &SerializationContextData::Workflow(WorkflowSerializationContext::new()),
             )
             .unwrap();
 
@@ -1435,7 +1448,7 @@ mod tests {
             .to_error(
                 failure.clone(),
                 &PayloadConverter::default(),
-                &SerializationContextData::Workflow,
+                &SerializationContextData::Workflow(WorkflowSerializationContext::new()),
             )
             .unwrap();
 
@@ -1472,7 +1485,7 @@ mod tests {
         };
         let decoded = data_converter()
             .to_error(
-                &SerializationContextData::Workflow,
+                &SerializationContextData::Workflow(WorkflowSerializationContext::new()),
                 failure.clone(),
                 ChildWorkflowExecutionDecodeHint,
             )
@@ -1521,7 +1534,7 @@ mod tests {
     ) {
         let decoded = data_converter()
             .to_error(
-                &SerializationContextData::Workflow,
+                &SerializationContextData::Workflow(WorkflowSerializationContext::new()),
                 failure.clone(),
                 ChildWorkflowExecutionDecodeHint,
             )
@@ -1553,7 +1566,7 @@ mod tests {
         };
         let decoded = data_converter()
             .to_error(
-                &SerializationContextData::Workflow,
+                &SerializationContextData::Workflow(WorkflowSerializationContext::new()),
                 failure.clone(),
                 ChildWorkflowStartDecodeHint,
             )
@@ -1581,7 +1594,7 @@ mod tests {
         };
         let decoded = data_converter()
             .to_error(
-                &SerializationContextData::Workflow,
+                &SerializationContextData::Workflow(WorkflowSerializationContext::new()),
                 failure.clone(),
                 WorkflowSignalDecodeHint,
             )
@@ -1607,7 +1620,7 @@ mod tests {
         let failure = DefaultFailureConverter::default().to_failure(
             OutgoingError::Activity(OutgoingActivityError::Cancelled { details: None }),
             &PayloadConverter::default(),
-            &SerializationContextData::Activity,
+            &SerializationContextData::Activity(ActivitySerializationContext::new()),
         );
 
         assert_eq!(failure.message, "Activity cancelled");
@@ -1624,14 +1637,14 @@ mod tests {
                 details: Some("detail".to_string().into()),
             }),
             &PayloadConverter::default(),
-            &SerializationContextData::Activity,
+            &SerializationContextData::Activity(ActivitySerializationContext::new()),
         );
 
         let err = DefaultFailureConverter::default()
             .to_error(
                 failure,
                 &PayloadConverter::default(),
-                &SerializationContextData::Activity,
+                &SerializationContextData::Activity(ActivitySerializationContext::new()),
             )
             .unwrap();
         let cancelled = err.as_cancelled().unwrap();

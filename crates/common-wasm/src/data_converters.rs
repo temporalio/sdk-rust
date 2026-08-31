@@ -140,16 +140,61 @@ impl DataConverter {
     }
 }
 
+/// Data available when serializing in a workflow context.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct WorkflowSerializationContext {}
+
+#[allow(clippy::new_without_default)]
+impl WorkflowSerializationContext {
+    /// Creates an empty workflow serialization context.
+    ///
+    /// **Experimental:** This constructor may change when workflow context data is added.
+    pub fn new() -> Self {
+        Self {}
+    }
+}
+
+/// Data available when serializing in an activity context.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ActivitySerializationContext {}
+
+#[allow(clippy::new_without_default)]
+impl ActivitySerializationContext {
+    /// Creates an empty activity serialization context.
+    ///
+    /// **Experimental:** This constructor may change when activity context data is added.
+    pub fn new() -> Self {
+        Self {}
+    }
+}
+
+/// Data available when serializing in a Nexus context.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct NexusSerializationContext {}
+
+#[allow(clippy::new_without_default)]
+impl NexusSerializationContext {
+    /// Creates an empty Nexus serialization context.
+    ///
+    /// **Experimental:** This constructor may change when Nexus context data is added.
+    pub fn new() -> Self {
+        Self {}
+    }
+}
+
 /// Data about the serialization context, indicating where the serialization is occurring.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum SerializationContextData {
     /// Serialization is occurring in a workflow context.
-    Workflow,
+    Workflow(WorkflowSerializationContext),
     /// Serialization is occurring in an activity context.
-    Activity,
+    Activity(ActivitySerializationContext),
     /// Serialization is occurring in a nexus context.
-    Nexus,
+    Nexus(NexusSerializationContext),
     /// No specific serialization context.
     None,
 }
@@ -838,7 +883,8 @@ mod tests {
     #[test]
     fn unit_payloads_roundtrip() {
         let converter = PayloadConverter::serde_json();
-        let ctx = SerializationContext::new(&SerializationContextData::Workflow, &converter);
+        let context_data = SerializationContextData::Workflow(WorkflowSerializationContext::new());
+        let ctx = SerializationContext::new(&context_data, &converter);
 
         let payloads = converter.to_payloads(&ctx, &()).unwrap();
         assert!(payloads.is_empty());
@@ -870,7 +916,8 @@ mod tests {
         T: TemporalSerializable + std::fmt::Debug + 'static,
     {
         let converter = PayloadConverter::default();
-        let ctx = SerializationContext::new(&SerializationContextData::Workflow, &converter);
+        let context_data = SerializationContextData::Workflow(WorkflowSerializationContext::new());
+        let ctx = SerializationContext::new(&context_data, &converter);
 
         let payload = converter.to_payload(&ctx, &value).unwrap();
 
@@ -904,7 +951,8 @@ mod tests {
         T: TemporalDeserializable + std::fmt::Debug + PartialEq + 'static,
     {
         let converter = PayloadConverter::default();
-        let ctx = SerializationContext::new(&SerializationContextData::Workflow, &converter);
+        let context_data = SerializationContextData::Workflow(WorkflowSerializationContext::new());
+        let ctx = SerializationContext::new(&context_data, &converter);
 
         let actual: T = converter
             .from_payload(
@@ -925,7 +973,8 @@ mod tests {
     #[test]
     fn use_wrappers_returns_wrong_encoding_for_standard_types() {
         let converter = PayloadConverter::UseWrappers;
-        let ctx = SerializationContext::new(&SerializationContextData::Workflow, &converter);
+        let context_data = SerializationContextData::Workflow(WorkflowSerializationContext::new());
+        let ctx = SerializationContext::new(&context_data, &converter);
 
         let result = converter.to_payload(&ctx, &());
         assert!(
@@ -955,7 +1004,8 @@ mod tests {
     #[test]
     fn multi_args_round_trip() {
         let converter = PayloadConverter::default();
-        let ctx = SerializationContext::new(&SerializationContextData::Workflow, &converter);
+        let context_data = SerializationContextData::Workflow(WorkflowSerializationContext::new());
+        let ctx = SerializationContext::new(&context_data, &converter);
 
         let args = MultiArgs2("hello".to_string(), 42i32);
         let payloads = converter.to_payloads(&ctx, &args).unwrap();
@@ -968,7 +1018,8 @@ mod tests {
     #[test]
     fn empty_payloads_do_not_decode_as_option() {
         let converter = PayloadConverter::default();
-        let ctx = SerializationContext::new(&SerializationContextData::Workflow, &converter);
+        let context_data = SerializationContextData::Workflow(WorkflowSerializationContext::new());
+        let ctx = SerializationContext::new(&context_data, &converter);
 
         let result: Result<Option<String>, _> = converter.from_payloads(&ctx, vec![]);
         assert!(matches!(result, Err(PayloadConversionError::WrongEncoding)));
@@ -996,12 +1047,18 @@ mod tests {
         let converter = PayloadConverter::default();
         let payloads = converter
             .to_payloads(
-                &SerializationContext::new(&SerializationContextData::Workflow, &converter),
+                &SerializationContext::new(
+                    &SerializationContextData::Workflow(WorkflowSerializationContext::new()),
+                    &converter,
+                ),
                 &value,
             )
             .unwrap();
-        let payloads =
-            DecodablePayloads::new(payloads, converter, SerializationContextData::Workflow);
+        let payloads = DecodablePayloads::new(
+            payloads,
+            converter,
+            SerializationContextData::Workflow(WorkflowSerializationContext::new()),
+        );
 
         let result: T = payloads.deserialize().unwrap();
         assert_eq!(result, value);

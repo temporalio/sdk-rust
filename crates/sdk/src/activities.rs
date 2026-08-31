@@ -76,9 +76,9 @@ pub use temporalio_common::ActivityError;
 use temporalio_common::{
     ActivityDefinition, HasWorkflowDefinition, RetryPolicy,
     data_converters::{
-        DataConverter, DecodablePayloads, GenericPayloadConverter, PayloadConversionError,
-        PayloadConverter, RawValue, SerializationContext, SerializationContextData,
-        TemporalDeserializable, TemporalSerializable,
+        ActivitySerializationContext, DataConverter, DecodablePayloads, GenericPayloadConverter,
+        PayloadConversionError, PayloadConverter, RawValue, SerializationContext,
+        SerializationContextData, TemporalDeserializable, TemporalSerializable,
     },
     error::ApplicationFailure,
     protos::{
@@ -132,7 +132,10 @@ impl ActivityContextBackend {
             } => {
                 let details = client_options
                     .data_converter
-                    .to_payloads(&SerializationContextData::Activity, &details)
+                    .to_payloads(
+                        &SerializationContextData::Activity(ActivitySerializationContext::new()),
+                        &details,
+                    )
                     .await?;
                 worker.record_activity_heartbeat(ActivityHeartbeat {
                     task_token: task_token.to_vec(),
@@ -356,7 +359,7 @@ impl ActivityHeartbeatDetails {
             payloads: DecodablePayloads::new(
                 payloads,
                 payload_converter,
-                SerializationContextData::Activity,
+                SerializationContextData::Activity(ActivitySerializationContext::new()),
             ),
         }
     }
@@ -573,7 +576,9 @@ impl ActivityDefinitions {
                     // Codec application happens at the SDK/Core boundary, so activity
                     // implementations work with the payload converter directly.
                     let pc = dc.payload_converter();
-                    let ctx = SerializationContext::new(&SerializationContextData::Activity, pc);
+                    let context_data =
+                        SerializationContextData::Activity(ActivitySerializationContext::new());
+                    let ctx = SerializationContext::new(&context_data, pc);
                     let input: AD::Input = pc.from_payloads(&ctx, payloads)?;
                     let input = ExecuteActivityInput::new(c, Box::new(input));
                     let leaf = activity_inbound_base::<AD>(instance);
@@ -658,11 +663,11 @@ pub(crate) fn activity_error_to_core_result(
 ) -> ActivityExecutionResult {
     match err {
         ActivityError::Application(app) => ActivityExecutionResult::fail(dc.to_failure(
-            &SerializationContextData::Activity,
+            &SerializationContextData::Activity(ActivitySerializationContext::new()),
             OutgoingError::Activity(OutgoingActivityError::Application(app)),
         )),
         ActivityError::Cancelled { details } => ActivityExecutionResult::cancel(dc.to_failure(
-            &SerializationContextData::Activity,
+            &SerializationContextData::Activity(ActivitySerializationContext::new()),
             OutgoingError::Activity(OutgoingActivityError::Cancelled { details }),
         )),
         ActivityError::WillCompleteAsync => ActivityExecutionResult::will_complete_async(),
@@ -688,7 +693,10 @@ mod test {
         let payload_converter = PayloadConverter::default();
         let payload = payload_converter
             .to_payload(
-                &SerializationContext::new(&SerializationContextData::Activity, &payload_converter),
+                &SerializationContext::new(
+                    &SerializationContextData::Activity(ActivitySerializationContext::new()),
+                    &payload_converter,
+                ),
                 &"progress".to_owned(),
             )
             .unwrap();

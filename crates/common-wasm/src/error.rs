@@ -364,7 +364,7 @@ impl ApplicationFailure {
                 FailurePayloads::from(DecodablePayloads::new(
                     details.payloads,
                     payload_converter.clone(),
-                    *context,
+                    context.clone(),
                 ))
             }),
             failure: Some(failure),
@@ -730,7 +730,7 @@ impl TimeoutError {
             cause: cause.map(Box::new),
             timeout_type: TimeoutType::from_raw(failure_info.timeout_type),
             last_heartbeat_details: failure_info.last_heartbeat_details.map(|details| {
-                DecodablePayloads::new(details.payloads, payload_converter.clone(), *context)
+                DecodablePayloads::new(details.payloads, payload_converter.clone(), context.clone())
             }),
         }
     }
@@ -781,7 +781,7 @@ impl CancelledError {
             failure,
             cause: cause.map(Box::new),
             details: failure_info.details.map(|details| {
-                DecodablePayloads::new(details.payloads, payload_converter.clone(), *context)
+                DecodablePayloads::new(details.payloads, payload_converter.clone(), context.clone())
             }),
         }
     }
@@ -1238,7 +1238,7 @@ mod tests {
     use crate::{
         data_converters::{
             DefaultFailureConverter, FailureConverter, GenericPayloadConverter, PayloadConverter,
-            SerializationContext, SerializationContextData,
+            SerializationContext, SerializationContextData, WorkflowSerializationContext,
         },
         protos::temporal::api::{
             common::v1::Payload,
@@ -1275,7 +1275,7 @@ mod tests {
             .to_error(
                 failure,
                 &PayloadConverter::default(),
-                &SerializationContextData::Workflow,
+                &SerializationContextData::Workflow(WorkflowSerializationContext::new()),
             )
             .unwrap();
         let IncomingError::Activity(activity) = decoded else {

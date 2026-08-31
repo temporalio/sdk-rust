@@ -27,6 +27,7 @@ use temporalio_common::{
     data_converters::{
         DataConverter, DecodablePayloads, GenericPayloadConverter, PayloadConversionError,
         PayloadConverter, RawValue, SerializationContext, SerializationContextData,
+        WorkflowSerializationContext,
     },
     error::IncomingError,
     payload_visitor::decode_payloads,
@@ -99,13 +100,16 @@ impl WorkflowResultDetails {
     ) -> Result<Self, PayloadConversionError> {
         let payloads = data_converter
             .codec()
-            .decode(&SerializationContextData::Workflow, payloads)
+            .decode(
+                &SerializationContextData::Workflow(WorkflowSerializationContext::new()),
+                payloads,
+            )
             .await?;
         Ok(Self {
             payloads: DecodablePayloads::new(
                 payloads,
                 data_converter.payload_converter().clone(),
-                SerializationContextData::Workflow,
+                SerializationContextData::Workflow(WorkflowSerializationContext::new()),
             ),
         })
     }
@@ -177,11 +181,13 @@ impl WorkflowExecutionDescription {
         decode_payloads(
             &mut raw_description,
             data_converter.codec(),
-            &SerializationContextData::Workflow,
+            &SerializationContextData::Workflow(WorkflowSerializationContext::new()),
         )
         .await?;
-        let decoded_metadata =
-            decode_user_metadata(&SerializationContextData::Workflow, raw_user_metadata)?;
+        let decoded_metadata = decode_user_metadata(
+            &SerializationContextData::Workflow(WorkflowSerializationContext::new()),
+            raw_user_metadata,
+        )?;
         let history_length_raw = raw_description
             .workflow_execution_info
             .as_ref()
@@ -261,7 +267,7 @@ impl WorkflowExecutionDescription {
         crate::Memo::from_raw(
             self.workflow_info().memo.clone(),
             self.data_converter.payload_converter().clone(),
-            SerializationContextData::Workflow,
+            SerializationContextData::Workflow(WorkflowSerializationContext::new()),
         )
     }
 
@@ -675,7 +681,7 @@ where
                         .and_then(|p| p.payloads.into_iter().next())
                         .unwrap_or_default();
                     let result: W::Output = dc
-                        .from_payload(&SerializationContextData::Workflow, payload)
+                        .from_payload(&SerializationContextData::Workflow(WorkflowSerializationContext::new()), payload)
                         .await?;
                     Ok(WorkflowExecutionResult::Succeeded(result))
                 }
@@ -685,13 +691,13 @@ where
                     decode_payloads(
                         &mut failure,
                         dc.codec(),
-                        &SerializationContextData::Workflow,
+                        &SerializationContextData::Workflow(WorkflowSerializationContext::new()),
                     )
                     .await?;
                     let error = dc.failure_converter().to_error(
                         failure,
                         dc.payload_converter(),
-                        &SerializationContextData::Workflow,
+                        &SerializationContextData::Workflow(WorkflowSerializationContext::new()),
                     )?;
                     Ok(WorkflowExecutionResult::Failed(error))
                 }
@@ -770,13 +776,17 @@ where
                         let data_converter = client.data_converter().clone();
                         let unencoded_payloads = {
                             let payload_converter = data_converter.payload_converter();
-                            let context = SerializationContext::new(&SerializationContextData::Workflow, payload_converter);
+                            let context_data = SerializationContextData::Workflow(
+                                WorkflowSerializationContext::new(),
+                            );
+                            let context =
+                                SerializationContext::new(&context_data, payload_converter);
                             args.serialize_payloads(&context)
                         };
                         drop(args);
                         let payloads = data_converter
                             .codec()
-                            .encode(&SerializationContextData::Workflow, unencoded_payloads?)
+                            .encode(&SerializationContextData::Workflow(WorkflowSerializationContext::new()), unencoded_payloads?)
                             .await?;
                         let mut request = SignalWorkflowExecutionRequest {
                             namespace: client.namespace(),
@@ -838,13 +848,17 @@ where
                         let data_converter = client.data_converter().clone();
                         let unencoded_payloads = {
                             let payload_converter = data_converter.payload_converter();
-                            let context = SerializationContext::new(&SerializationContextData::Workflow, payload_converter);
+                            let context_data = SerializationContextData::Workflow(
+                                WorkflowSerializationContext::new(),
+                            );
+                            let context =
+                                SerializationContext::new(&context_data, payload_converter);
                             args.serialize_payloads(&context)
                         };
                         drop(args);
                         let payloads = data_converter
                             .codec()
-                            .encode(&SerializationContextData::Workflow, unencoded_payloads?)
+                            .encode(&SerializationContextData::Workflow(WorkflowSerializationContext::new()), unencoded_payloads?)
                             .await?;
                         let mut request = QueryWorkflowRequest {
                             namespace: client.namespace(),
@@ -891,7 +905,10 @@ where
 
         self.client
             .data_converter()
-            .from_payloads(&SerializationContextData::Workflow, result_payloads)
+            .from_payloads(
+                &SerializationContextData::Workflow(WorkflowSerializationContext::new()),
+                result_payloads,
+            )
             .await
             .map_err(WorkflowQueryError::from)
     }
@@ -948,16 +965,22 @@ where
                             let data_converter = client.data_converter().clone();
                             let unencoded_payloads = {
                                 let payload_converter = data_converter.payload_converter();
-                                let context = SerializationContext::new(
-                                    &SerializationContextData::Workflow,
-                                    payload_converter,
+                                let context_data = SerializationContextData::Workflow(
+                                    WorkflowSerializationContext::new(),
                                 );
+                                let context =
+                                    SerializationContext::new(&context_data, payload_converter);
                                 args.serialize_payloads(&context)
                             };
                             drop(args);
                             let payloads = data_converter
                                 .codec()
-                                .encode(&SerializationContextData::Workflow, unencoded_payloads?)
+                                .encode(
+                                    &SerializationContextData::Workflow(
+                                        WorkflowSerializationContext::new(),
+                                    ),
+                                    unencoded_payloads?,
+                                )
                                 .await?;
                             let update_id = options
                                 .update_id
@@ -1418,7 +1441,10 @@ where
             Some(update::v1::outcome::Value::Success(success)) => self
                 .client
                 .data_converter()
-                .from_payloads(&SerializationContextData::Workflow, success.payloads)
+                .from_payloads(
+                    &SerializationContextData::Workflow(WorkflowSerializationContext::new()),
+                    success.payloads,
+                )
                 .await
                 .map_err(WorkflowUpdateError::from),
             Some(update::v1::outcome::Value::Failure(failure)) => {
@@ -1630,7 +1656,7 @@ mod tests {
         );
         let payloads = converter
             .to_payloads(
-                &SerializationContextData::Workflow,
+                &SerializationContextData::Workflow(WorkflowSerializationContext::new()),
                 &"workflow-result-details".to_owned(),
             )
             .await
@@ -1668,7 +1694,7 @@ mod tests {
         );
         let encoded = converter
             .to_payload(
-                &SerializationContextData::Workflow,
+                &SerializationContextData::Workflow(WorkflowSerializationContext::new()),
                 &"memo-value".to_owned(),
             )
             .await
@@ -1699,19 +1725,31 @@ mod tests {
     async fn workflow_description_accessors_expose_decoded_fields() {
         let converter = DataConverter::default();
         let memo_payload = converter
-            .to_payload(&SerializationContextData::Workflow, &"memo-value")
+            .to_payload(
+                &SerializationContextData::Workflow(WorkflowSerializationContext::new()),
+                &"memo-value",
+            )
             .await
             .unwrap();
         let search_attr_payload = converter
-            .to_payload(&SerializationContextData::Workflow, &"search-value")
+            .to_payload(
+                &SerializationContextData::Workflow(WorkflowSerializationContext::new()),
+                &"search-value",
+            )
             .await
             .unwrap();
         let summary_payload = converter
-            .to_payload(&SerializationContextData::Workflow, &"workflow summary")
+            .to_payload(
+                &SerializationContextData::Workflow(WorkflowSerializationContext::new()),
+                &"workflow summary",
+            )
             .await
             .unwrap();
         let details_payload = converter
-            .to_payload(&SerializationContextData::Workflow, &"workflow details")
+            .to_payload(
+                &SerializationContextData::Workflow(WorkflowSerializationContext::new()),
+                &"workflow details",
+            )
             .await
             .unwrap();
         let description = WorkflowExecutionDescription::new(

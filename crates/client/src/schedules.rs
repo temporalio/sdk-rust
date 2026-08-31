@@ -17,7 +17,7 @@ use temporalio_common::{
     HasWorkflowDefinition,
     data_converters::{
         DataConverter, PayloadConversionError, SerializationContextData, TemporalDeserializable,
-        TemporalSerializable,
+        TemporalSerializable, WorkflowSerializationContext,
     },
     payload_visitor::decode_payloads,
     protos::{
@@ -102,7 +102,11 @@ impl ScheduleWorkflowInput {
         dc: &DataConverter,
     ) -> Result<Vec<common_proto::Payload>, PayloadConversionError> {
         let ScheduleWorkflowInputRepr::Deferred(v) = self.repr;
-        v.to_payloads(dc, &SerializationContextData::Workflow).await
+        v.to_payloads(
+            dc,
+            &SerializationContextData::Workflow(WorkflowSerializationContext::new()),
+        )
+        .await
     }
 }
 
@@ -541,7 +545,10 @@ impl ScheduleDescriptionStartWorkflowAction {
         match &self.input {
             Some(input) => self
                 .data_converter
-                .from_payloads(&SerializationContextData::Workflow, input.payloads.clone())
+                .from_payloads(
+                    &SerializationContextData::Workflow(WorkflowSerializationContext::new()),
+                    input.payloads.clone(),
+                )
                 .await
                 .map(Some),
             None => Ok(None),
@@ -726,7 +733,7 @@ impl ScheduleDescription {
         crate::Memo::from_raw(
             self.raw.memo.clone(),
             self.data_converter.payload_converter().clone(),
-            SerializationContextData::Workflow,
+            SerializationContextData::Workflow(WorkflowSerializationContext::new()),
         )
     }
 
@@ -979,7 +986,7 @@ impl ScheduleSummary {
         crate::Memo::from_raw(
             self.raw.memo.clone(),
             self.data_converter.payload_converter().clone(),
-            SerializationContextData::Workflow,
+            SerializationContextData::Workflow(WorkflowSerializationContext::new()),
         )
     }
 
@@ -1088,7 +1095,7 @@ where
             decode_payloads(
                 memo,
                 self.client.data_converter().codec(),
-                &SerializationContextData::Workflow,
+                &SerializationContextData::Workflow(WorkflowSerializationContext::new()),
             )
             .await?;
         }
@@ -1143,7 +1150,7 @@ where
                         decode_payloads(
                             &mut response,
                             handle.client.data_converter().codec(),
-                            &SerializationContextData::Workflow,
+                            &SerializationContextData::Workflow(WorkflowSerializationContext::new()),
                         )
                         .await?;
                         let description = ScheduleDescription::new(
@@ -1608,7 +1615,9 @@ where
                                 && let Err(err) = decode_payloads(
                                     memo,
                                     data_converter.codec(),
-                                    &SerializationContextData::Workflow,
+                                    &SerializationContextData::Workflow(
+                                        WorkflowSerializationContext::new(),
+                                    ),
                                 )
                                 .await
                             {
@@ -1969,7 +1978,7 @@ mod tests {
         let data_converter = data_converter_with_codec();
         let memo_payload = data_converter
             .to_payload(
-                &SerializationContextData::Workflow,
+                &SerializationContextData::Workflow(WorkflowSerializationContext::new()),
                 &"memo-value".to_owned(),
             )
             .await
@@ -2000,7 +2009,7 @@ mod tests {
         let data_converter = DataConverter::default();
         let memo_payload = data_converter
             .to_payload(
-                &SerializationContextData::Workflow,
+                &SerializationContextData::Workflow(WorkflowSerializationContext::new()),
                 &"memo-value".to_owned(),
             )
             .await
@@ -2509,7 +2518,10 @@ mod tests {
         let data_converter = DataConverter::default();
         let expected = MultiArgs2("hello".to_string(), 42i32);
         let payloads = data_converter
-            .to_payloads(&SerializationContextData::Workflow, &expected)
+            .to_payloads(
+                &SerializationContextData::Workflow(WorkflowSerializationContext::new()),
+                &expected,
+            )
             .await
             .unwrap();
         let desc = ScheduleDescription::new(
@@ -2542,7 +2554,10 @@ mod tests {
         let data_converter = DataConverter::default();
         let expected: String = "not-an-int".to_string();
         let payloads = data_converter
-            .to_payloads(&SerializationContextData::Workflow, &expected)
+            .to_payloads(
+                &SerializationContextData::Workflow(WorkflowSerializationContext::new()),
+                &expected,
+            )
             .await
             .unwrap();
         let desc = schedule_description_from_response(describe_response_with_start_workflow(Some(

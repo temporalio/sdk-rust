@@ -17,7 +17,7 @@ use temporalio_client::{
 use temporalio_common::{
     data_converters::{
         GenericPayloadConverter, PayloadConverter, RawValue, SerializationContext,
-        SerializationContextData,
+        SerializationContextData, WorkflowSerializationContext,
     },
     protos::{
         coresdk::{
@@ -348,7 +348,8 @@ async fn nexus_async(
 
     let submitter = worker.get_submitter_handle();
     let converter = PayloadConverter::default();
-    let ser_ctx = SerializationContext::new(&SerializationContextData::Workflow, &converter);
+    let context_data = SerializationContextData::Workflow(WorkflowSerializationContext::new());
+    let ser_ctx = SerializationContext::new(&context_data, &converter);
     let wf_handle = worker
         .submit_workflow(
             NexusAsyncWf::run,

@@ -134,7 +134,10 @@ use std::{
 use temporalio_client::{Client, ClientOptions, NamespacedClient};
 use temporalio_common::{
     ActivityDefinition, WorkflowDefinition,
-    data_converters::{DataConverter, SerializationContext, SerializationContextData},
+    data_converters::{
+        ActivitySerializationContext, DataConverter, SerializationContext,
+        SerializationContextData, WorkflowSerializationContext,
+    },
     payload_visitor::{decode_payloads, encode_payloads},
     protos::{
         TaskToken,
@@ -740,7 +743,7 @@ async fn encode_workflow_completion(
     if let Err(err) = encode_payloads(
         completion,
         data_converter.codec(),
-        &SerializationContextData::Workflow,
+        &SerializationContextData::Workflow(WorkflowSerializationContext::new()),
     )
     .await
     {
@@ -763,7 +766,7 @@ async fn encode_activity_completion(
     if let Err(err) = encode_payloads(
         completion,
         data_converter.codec(),
-        &SerializationContextData::Activity,
+        &SerializationContextData::Activity(ActivitySerializationContext::new()),
     )
     .await
     {
@@ -1016,7 +1019,7 @@ impl Worker {
                             if let Err(err) = decode_payloads(
                                 &mut activation,
                                 common.data_converter.codec(),
-                                &SerializationContextData::Workflow,
+                                &SerializationContextData::Workflow(WorkflowSerializationContext::new()),
                             )
                             .await
                             {
@@ -1099,12 +1102,15 @@ impl Worker {
                             message: "activity polling failed".to_owned(),
                             source: Box::new(source),
                         })?;
-                        if let Err(err) = decode_payloads(
-                            &mut activity,
-                            common.data_converter.codec(),
-                            &SerializationContextData::Activity,
-                        )
-                        .await
+                        if let Err(err) =
+                            decode_payloads(
+                                &mut activity,
+                                common.data_converter.codec(),
+                                &SerializationContextData::Activity(
+                                    ActivitySerializationContext::new(),
+                                ),
+                            )
+                            .await
                         {
                             error!(error = %err, "Failed decoding activity task");
                             let mut completion = ActivityTaskCompletion {
@@ -1142,7 +1148,9 @@ impl Worker {
                                 task_token,
                             }) => {
                                 let failure = common.data_converter.to_failure(
-                                    &SerializationContextData::Activity,
+                                    &SerializationContextData::Activity(
+                                        ActivitySerializationContext::new(),
+                                    ),
                                     OutgoingError::Activity(OutgoingActivityError::Application(
                                         ApplicationFailure::builder(source)
                                             .type_name("NotFoundError".to_owned())
@@ -1415,8 +1423,10 @@ impl ActivityHalf {
                             // Codec application happens at the SDK/Core boundary, so activity
                             // implementations work with the payload converter directly.
                             let pc = codec_data_converter.payload_converter();
-                            let ctx =
-                                SerializationContext::new(&SerializationContextData::Activity, pc);
+                            let context_data = SerializationContextData::Activity(
+                                ActivitySerializationContext::new(),
+                            );
+                            let ctx = SerializationContext::new(&context_data, pc);
                             match output.serialize_payload(&ctx) {
                                 Ok(payload) => ActivityExecutionResult::ok(payload),
                                 Err(err) => {

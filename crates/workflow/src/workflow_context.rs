@@ -65,7 +65,7 @@ use temporalio_common_wasm::{
         ActivityExecutionDecodeHint, ChildWorkflowExecutionDecodeHint,
         ChildWorkflowStartDecodeHint, DataConverter, GenericPayloadConverter,
         PayloadConversionError, PayloadConverter, SerializationContext, SerializationContextData,
-        TemporalDeserializable, WorkflowSignalDecodeHint,
+        TemporalDeserializable, WorkflowSerializationContext, WorkflowSignalDecodeHint,
     },
     error::{
         ActivityExecutionError, ChildWorkflowExecutionError, ChildWorkflowStartError,
@@ -858,8 +858,9 @@ impl BaseWorkflowContext {
                 }
             };
             let payload_converter = base_ctx.inner.data_converter.payload_converter();
-            let ctx =
-                SerializationContext::new(&SerializationContextData::Workflow, payload_converter);
+            let context_data =
+                SerializationContextData::Workflow(WorkflowSerializationContext::new());
+            let ctx = SerializationContext::new(&context_data, payload_converter);
             match payload_converter.to_payloads(&ctx, &input) {
                 Ok(payloads) => {
                     let cancellation_token = opts
@@ -952,8 +953,9 @@ impl BaseWorkflowContext {
                 }
             };
             let payload_converter = base_ctx.inner.data_converter.payload_converter();
-            let ctx =
-                SerializationContext::new(&SerializationContextData::Workflow, payload_converter);
+            let context_data =
+                SerializationContextData::Workflow(WorkflowSerializationContext::new());
+            let ctx = SerializationContext::new(&context_data, payload_converter);
             match payload_converter.to_payloads(&ctx, &input) {
                 Ok(payloads) => {
                     let cancellation_token = opts
@@ -1034,8 +1036,9 @@ impl BaseWorkflowContext {
                 }
             };
             let payload_converter = base_ctx.inner.data_converter.payload_converter();
-            let ctx =
-                SerializationContext::new(&SerializationContextData::Workflow, payload_converter);
+            let context_data =
+                SerializationContextData::Workflow(WorkflowSerializationContext::new());
+            let ctx = SerializationContext::new(&context_data, payload_converter);
             let payloads = match payload_converter.to_payloads(&ctx, &input) {
                 Ok(payloads) => payloads,
                 Err(err) => {
@@ -1186,8 +1189,9 @@ impl BaseWorkflowContext {
                 }
             };
             let payload_converter = base_ctx.data_converter().payload_converter();
-            let ctx =
-                SerializationContext::new(&SerializationContextData::Workflow, payload_converter);
+            let context_data =
+                SerializationContextData::Workflow(WorkflowSerializationContext::new());
+            let ctx = SerializationContext::new(&context_data, payload_converter);
             let payloads = match payload_converter.to_payloads(&ctx, &input) {
                 Ok(payloads) => payloads,
                 Err(err) => {
@@ -1419,7 +1423,7 @@ impl<W> SyncWorkflowContext<W> {
         Memo::from_raw(
             Some(self.base.inner.shared.borrow().memo.clone()),
             self.payload_converter().clone(),
-            SerializationContextData::Workflow,
+            SerializationContextData::Workflow(WorkflowSerializationContext::new()),
         )
     }
 
@@ -1535,7 +1539,9 @@ impl<W> SyncWorkflowContext<W> {
                 Err(_) => return Err(outbound_type_error("continue-as-new input").into()),
             };
             let pc = base_ctx.data_converter().payload_converter();
-            let ctx = SerializationContext::new(&SerializationContextData::Workflow, pc);
+            let context_data =
+                SerializationContextData::Workflow(WorkflowSerializationContext::new());
+            let ctx = SerializationContext::new(&context_data, pc);
             let arguments = pc
                 .to_payloads(&ctx, &*input)
                 .map_err(WorkflowTermination::from)?;
@@ -1759,8 +1765,8 @@ impl<W> SyncWorkflowContext<W> {
         K: Into<String>,
     {
         let payload_converter = self.payload_converter();
-        let context =
-            SerializationContext::new(&SerializationContextData::Workflow, payload_converter);
+        let context_data = SerializationContextData::Workflow(WorkflowSerializationContext::new());
+        let context = SerializationContext::new(&context_data, payload_converter);
         let mut fields = HashMap::new();
         let mut local_updates = Vec::new();
         for (key, value) in updates {
@@ -2653,60 +2659,72 @@ where
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
-        let poll = match this {
-            ActivityFut::Errored { error, .. } => {
-                Poll::Ready(Err(*error.take().expect("polled after completion")))
-            }
-            ActivityFut::Running {
-                inner,
-                data_converter,
-                ..
-            } => match Pin::new(inner).poll(cx) {
-                Poll::Pending => Poll::Pending,
-                Poll::Ready(resolution) => Poll::Ready({
-                    let status = resolution.status.ok_or_else(|| {
-                        data_converter
-                            .to_error(
-                                &SerializationContextData::Workflow,
-                                Failure {
-                                    message: "Activity completed without a status".to_string(),
-                                    ..Default::default()
-                                },
-                                ActivityExecutionDecodeHint::new(false),
-                            )
-                            .expect("synthetic activity failure should decode")
-                    })?;
-
-                    match status {
-                        activity_resolution::Status::Completed(success) => {
-                            let payload = success.result.unwrap_or_default();
-                            let ctx = SerializationContext::new(
-                                &SerializationContextData::Workflow,
-                                data_converter.payload_converter(),
-                            );
+        let poll =
+            match this {
+                ActivityFut::Errored { error, .. } => {
+                    Poll::Ready(Err(*error.take().expect("polled after completion")))
+                }
+                ActivityFut::Running {
+                    inner,
+                    data_converter,
+                    ..
+                } => match Pin::new(inner).poll(cx) {
+                    Poll::Pending => Poll::Pending,
+                    Poll::Ready(resolution) => Poll::Ready({
+                        let status = resolution.status.ok_or_else(|| {
                             data_converter
-                                .payload_converter()
-                                .from_payload::<Output>(&ctx, payload)
-                                .map_err(ActivityExecutionError::Serialization)
+                                .to_error(
+                                    &SerializationContextData::Workflow(
+                                        WorkflowSerializationContext::new(),
+                                    ),
+                                    Failure {
+                                        message: "Activity completed without a status".to_string(),
+                                        ..Default::default()
+                                    },
+                                    ActivityExecutionDecodeHint::new(false),
+                                )
+                                .expect("synthetic activity failure should decode")
+                        })?;
+
+                        match status {
+                            activity_resolution::Status::Completed(success) => {
+                                let payload = success.result.unwrap_or_default();
+                                let context_data = SerializationContextData::Workflow(
+                                    WorkflowSerializationContext::new(),
+                                );
+                                let ctx = SerializationContext::new(
+                                    &context_data,
+                                    data_converter.payload_converter(),
+                                );
+                                data_converter
+                                    .payload_converter()
+                                    .from_payload::<Output>(&ctx, payload)
+                                    .map_err(ActivityExecutionError::Serialization)
+                            }
+                            activity_resolution::Status::Failed(f) => Err(data_converter
+                                .to_error(
+                                    &SerializationContextData::Workflow(
+                                        WorkflowSerializationContext::new(),
+                                    ),
+                                    f.failure.unwrap_or_default(),
+                                    ActivityExecutionDecodeHint::new(false),
+                                )?),
+                            activity_resolution::Status::Cancelled(c) => Err(data_converter
+                                .to_error(
+                                    &SerializationContextData::Workflow(
+                                        WorkflowSerializationContext::new(),
+                                    ),
+                                    c.failure.unwrap_or_default(),
+                                    ActivityExecutionDecodeHint::new(true),
+                                )?),
+                            activity_resolution::Status::Backoff(_) => {
+                                panic!("DoBackoff should be handled by LATimerBackoffFut")
+                            }
                         }
-                        activity_resolution::Status::Failed(f) => Err(data_converter.to_error(
-                            &SerializationContextData::Workflow,
-                            f.failure.unwrap_or_default(),
-                            ActivityExecutionDecodeHint::new(false),
-                        )?),
-                        activity_resolution::Status::Cancelled(c) => Err(data_converter.to_error(
-                            &SerializationContextData::Workflow,
-                            c.failure.unwrap_or_default(),
-                            ActivityExecutionDecodeHint::new(true),
-                        )?),
-                        activity_resolution::Status::Backoff(_) => {
-                            panic!("DoBackoff should be handled by LATimerBackoffFut")
-                        }
-                    }
-                }),
-            },
-            ActivityFut::Terminated => panic!("polled after termination"),
-        };
+                    }),
+                },
+                ActivityFut::Terminated => panic!("polled after termination"),
+            };
         if poll.is_ready() {
             *this = ActivityFut::Terminated;
         }
@@ -2838,7 +2856,9 @@ where
                     let status = result.status.ok_or_else(|| {
                         data_converter
                             .to_error(
-                                &SerializationContextData::Workflow,
+                                &SerializationContextData::Workflow(
+                                    WorkflowSerializationContext::new(),
+                                ),
                                 Failure {
                                     message: "Child workflow completed without a status"
                                         .to_string(),
@@ -2851,8 +2871,11 @@ where
                     match status {
                         child_workflow_result::Status::Completed(success) => {
                             let payloads = success.result.into_iter().collect();
+                            let context_data = SerializationContextData::Workflow(
+                                WorkflowSerializationContext::new(),
+                            );
                             let ctx = SerializationContext::new(
-                                &SerializationContextData::Workflow,
+                                &context_data,
                                 data_converter.payload_converter(),
                             );
                             data_converter
@@ -2860,14 +2883,20 @@ where
                                 .from_payloads::<Output>(&ctx, payloads)
                                 .map_err(ChildWorkflowExecutionError::Serialization)
                         }
-                        child_workflow_result::Status::Failed(f) => Err(data_converter.to_error(
-                            &SerializationContextData::Workflow,
-                            f.failure.unwrap_or_default(),
-                            ChildWorkflowExecutionDecodeHint::default(),
-                        )?),
+                        child_workflow_result::Status::Failed(f) => {
+                            Err(data_converter.to_error(
+                                &SerializationContextData::Workflow(
+                                    WorkflowSerializationContext::new(),
+                                ),
+                                f.failure.unwrap_or_default(),
+                                ChildWorkflowExecutionDecodeHint::default(),
+                            )?)
+                        }
                         child_workflow_result::Status::Cancelled(c) => Err(data_converter
                             .to_error(
-                                &SerializationContextData::Workflow,
+                                &SerializationContextData::Workflow(
+                                    WorkflowSerializationContext::new(),
+                                ),
                                 c.failure.unwrap_or_default(),
                                 ChildWorkflowExecutionDecodeHint::default(),
                             )?),
@@ -2949,55 +2978,58 @@ where
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
-        let poll = match this {
-            ChildWorkflowStartFut::Errored { error, .. } => {
-                Poll::Ready(Err(*error.take().expect("polled after completion")))
-            }
-            ChildWorkflowStartFut::Running(inner) => match Pin::new(inner).poll(cx) {
-                Poll::Pending => Poll::Pending,
-                Poll::Ready(pending) => Poll::Ready(match pending.status {
-                    ChildWorkflowStartStatus::Succeeded(s) => {
-                        let ChildWfCommon {
-                            workflow_id,
-                            child_seq,
-                            result_future,
-                            base_ctx,
-                        } = pending.common;
-                        Ok(StartChildWorkflowOutput {
-                            run_id: s.run_id,
-                            result_future,
-                            workflow_id,
-                            child_seq,
-                            base_ctx,
-                        })
-                    }
-                    ChildWorkflowStartStatus::Failed(f) => {
-                        let mut result_future = pending.common.result_future;
-                        result_future.unregister_cancellation();
-                        Err(ChildWorkflowStartError::StartFailed {
-                            workflow_id: f.workflow_id,
-                            workflow_type: f.workflow_type,
-                            cause: StartChildWorkflowExecutionFailedCause::try_from(f.cause)
-                                .unwrap_or(StartChildWorkflowExecutionFailedCause::Unspecified),
-                        })
-                    }
-                    ChildWorkflowStartStatus::Cancelled(c) => {
-                        let ChildWfCommon {
-                            mut result_future,
-                            base_ctx,
-                            ..
-                        } = pending.common;
-                        result_future.unregister_cancellation();
-                        Err(base_ctx.data_converter().to_error(
-                            &SerializationContextData::Workflow,
-                            c.failure.unwrap_or_default(),
-                            ChildWorkflowStartDecodeHint::default(),
-                        )?)
-                    }
-                }),
-            },
-            ChildWorkflowStartFut::Terminated => panic!("polled after termination"),
-        };
+        let poll =
+            match this {
+                ChildWorkflowStartFut::Errored { error, .. } => {
+                    Poll::Ready(Err(*error.take().expect("polled after completion")))
+                }
+                ChildWorkflowStartFut::Running(inner) => match Pin::new(inner).poll(cx) {
+                    Poll::Pending => Poll::Pending,
+                    Poll::Ready(pending) => Poll::Ready(match pending.status {
+                        ChildWorkflowStartStatus::Succeeded(s) => {
+                            let ChildWfCommon {
+                                workflow_id,
+                                child_seq,
+                                result_future,
+                                base_ctx,
+                            } = pending.common;
+                            Ok(StartChildWorkflowOutput {
+                                run_id: s.run_id,
+                                result_future,
+                                workflow_id,
+                                child_seq,
+                                base_ctx,
+                            })
+                        }
+                        ChildWorkflowStartStatus::Failed(f) => {
+                            let mut result_future = pending.common.result_future;
+                            result_future.unregister_cancellation();
+                            Err(ChildWorkflowStartError::StartFailed {
+                                workflow_id: f.workflow_id,
+                                workflow_type: f.workflow_type,
+                                cause: StartChildWorkflowExecutionFailedCause::try_from(f.cause)
+                                    .unwrap_or(StartChildWorkflowExecutionFailedCause::Unspecified),
+                            })
+                        }
+                        ChildWorkflowStartStatus::Cancelled(c) => {
+                            let ChildWfCommon {
+                                mut result_future,
+                                base_ctx,
+                                ..
+                            } = pending.common;
+                            result_future.unregister_cancellation();
+                            Err(base_ctx.data_converter().to_error(
+                                &SerializationContextData::Workflow(
+                                    WorkflowSerializationContext::new(),
+                                ),
+                                c.failure.unwrap_or_default(),
+                                ChildWorkflowStartDecodeHint::default(),
+                            )?)
+                        }
+                    }),
+                },
+                ChildWorkflowStartFut::Terminated => panic!("polled after termination"),
+            };
         if poll.is_ready() {
             *this = ChildWorkflowStartFut::Terminated;
         }
@@ -3066,7 +3098,7 @@ where
                 Poll::Pending => Poll::Pending,
                 Poll::Ready(Ok(_)) => Poll::Ready(Ok(())),
                 Poll::Ready(Err(failure)) => Poll::Ready(Err(data_converter.to_error(
-                    &SerializationContextData::Workflow,
+                    &SerializationContextData::Workflow(WorkflowSerializationContext::new()),
                     failure,
                     WorkflowSignalDecodeHint::default(),
                 )?)),
@@ -4434,7 +4466,10 @@ mod tests {
         let payload_converter = PayloadConverter::default();
         let removal_payload = payload_converter
             .to_payload(
-                &SerializationContext::new(&SerializationContextData::Workflow, &payload_converter),
+                &SerializationContext::new(
+                    &SerializationContextData::Workflow(WorkflowSerializationContext::new()),
+                    &payload_converter,
+                ),
                 &MemoValue::new(()),
             )
             .unwrap();

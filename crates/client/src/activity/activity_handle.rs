@@ -7,7 +7,9 @@ use crate::{
 use std::marker::PhantomData;
 use temporalio_common::{
     ActivityDefinition,
-    data_converters::{DecodablePayloads, NoopDecodeHint, SerializationContextData},
+    data_converters::{
+        ActivitySerializationContext, DecodablePayloads, NoopDecodeHint, SerializationContextData,
+    },
     payload_visitor::decode_payloads,
     protos::temporal::api::{
         activity::v1::{ActivityExecutionOutcome, activity_execution_outcome},
@@ -99,7 +101,7 @@ where
             };
 
             let dc = client.data_converter();
-            let ctx = SerializationContextData::Activity;
+            let ctx = SerializationContextData::Activity(ActivitySerializationContext::new());
 
             return match outcome {
                 activity_execution_outcome::Value::Result(payloads) => {
@@ -156,7 +158,7 @@ where
 
         Ok(ActivityExecutionDescription::new(
             client.data_converter().clone(),
-            SerializationContextData::Activity,
+            SerializationContextData::Activity(ActivitySerializationContext::new()),
             resp,
         )
         .await?)
@@ -293,7 +295,7 @@ mod tests {
             DefaultFailureConverter::new(true),
             XorCodec,
         );
-        let context = SerializationContextData::Activity;
+        let context = SerializationContextData::Activity(ActivitySerializationContext::new());
         let mut failure = data_converter.to_failure(
             &context,
             OutgoingError::Activity(OutgoingActivityError::Application(Box::new(

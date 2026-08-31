@@ -5,7 +5,7 @@ use temporalio_common_wasm::{
     ActivityCloseTimeouts, Priority, RetryPolicy,
     data_converters::{
         GenericPayloadConverter, PayloadConversionError, PayloadConverter, SerializationContext,
-        SerializationContextData,
+        SerializationContextData, WorkflowSerializationContext,
     },
     protos::{
         coresdk::{
@@ -877,8 +877,8 @@ impl ContinueAsNewOptions {
         headers: HashMap<String, Payload>,
         payload_converter: &PayloadConverter,
     ) -> Result<ContinueAsNewRequest, PayloadConversionError> {
-        let context =
-            SerializationContext::new(&SerializationContextData::Workflow, payload_converter);
+        let context_data = SerializationContextData::Workflow(WorkflowSerializationContext::new());
+        let context = SerializationContext::new(&context_data, payload_converter);
         let memo = self
             .memo
             .map(|memo| {
@@ -941,7 +941,8 @@ fn string_user_metadata(summary: Option<String>, details: Option<String>) -> Opt
         return None;
     }
     let converter = PayloadConverter::default();
-    let context = SerializationContext::new(&SerializationContextData::Workflow, &converter);
+    let context_data = SerializationContextData::Workflow(WorkflowSerializationContext::new());
+    let context = SerializationContext::new(&context_data, &converter);
     Some(UserMetadata {
         summary: summary.map(|value| {
             converter

@@ -14,7 +14,7 @@ use temporalio_common_wasm::{
     QueryDefinition, SignalDefinition, UpdateDefinition, WorkflowDefinition,
     data_converters::{
         GenericPayloadConverter, PayloadConversionError, PayloadConverter, SerializationContext,
-        SerializationContextData, TemporalSerializable,
+        SerializationContextData, TemporalSerializable, WorkflowSerializationContext,
     },
     protos::temporal::api::{
         common::v1::{Payload, Payloads},
@@ -288,7 +288,8 @@ pub(crate) fn serialize_output<O: TemporalSerializable + 'static>(
     output: &O,
     converter: &PayloadConverter,
 ) -> Result<Payload, WorkflowError> {
-    let ctx = SerializationContext::new(&SerializationContextData::Workflow, converter);
+    let context_data = SerializationContextData::Workflow(WorkflowSerializationContext::new());
+    let ctx = SerializationContext::new(&context_data, converter);
     converter.to_payload(&ctx, output).map_err(Into::into)
 }
 

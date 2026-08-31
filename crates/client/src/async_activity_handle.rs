@@ -7,7 +7,10 @@ use crate::{
 };
 use futures_util::future::BoxFuture;
 use temporalio_common::{
-    data_converters::{SerializationContext, SerializationContextData, TemporalSerializable},
+    data_converters::{
+        ActivitySerializationContext, SerializationContext, SerializationContextData,
+        TemporalSerializable,
+    },
     error::{ApplicationFailure, OutgoingActivityError, OutgoingError},
     payload_visitor::encode_payloads,
     protos::{
@@ -35,14 +38,17 @@ async fn encode_optional_value(
     };
     let unencoded_payloads = {
         let payload_converter = data_converter.payload_converter();
-        let context =
-            SerializationContext::new(&SerializationContextData::Activity, payload_converter);
+        let context_data = SerializationContextData::Activity(ActivitySerializationContext::new());
+        let context = SerializationContext::new(&context_data, payload_converter);
         value.serialize_payloads(&context)?
     };
     drop(value);
     let payloads = data_converter
         .codec()
-        .encode(&SerializationContextData::Activity, unencoded_payloads)
+        .encode(
+            &SerializationContextData::Activity(ActivitySerializationContext::new()),
+            unencoded_payloads,
+        )
         .await?;
     Ok(Some(Payloads { payloads }))
 }
@@ -235,7 +241,7 @@ impl<CT: WorkflowService + NamespacedClient + Clone> AsyncActivityHandle<CT> {
                             input.into_parts();
                         let data_converter = client.data_converter().clone();
                         let mut failure = data_converter.to_failure(
-                            &SerializationContextData::Activity,
+                            &SerializationContextData::Activity(ActivitySerializationContext::new()),
                             OutgoingError::Activity(OutgoingActivityError::Application(Box::new(
                                 application_failure,
                             ))),
@@ -243,7 +249,7 @@ impl<CT: WorkflowService + NamespacedClient + Clone> AsyncActivityHandle<CT> {
                         encode_payloads(
                             &mut failure,
                             data_converter.codec(),
-                            &SerializationContextData::Activity,
+                            &SerializationContextData::Activity(ActivitySerializationContext::new()),
                         )
                         .await?;
                         let last_heartbeat_details =

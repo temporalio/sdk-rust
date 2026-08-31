@@ -115,6 +115,7 @@ use temporalio_common_wasm::{
     data_converters::{
         GenericPayloadConverter, PayloadConversionError, PayloadConverter, SerializationContext,
         SerializationContextData, TemporalDeserializable, TemporalSerializable,
+        WorkflowSerializationContext,
     },
     error::{
         ActivityExecutionError, ChildWorkflowExecutionError, ChildWorkflowStartError,
@@ -199,7 +200,8 @@ pub(crate) fn serialize_workflow_output(
     output: &dyn WorkflowOutputValue,
     converter: &PayloadConverter,
 ) -> Result<Payload, PayloadConversionError> {
-    let ctx = SerializationContext::new(&SerializationContextData::Workflow, converter);
+    let context_data = SerializationContextData::Workflow(WorkflowSerializationContext::new());
+    let ctx = SerializationContext::new(&context_data, converter);
     output.serialize_payload(&ctx)
 }
 

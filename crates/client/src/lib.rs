@@ -135,7 +135,10 @@ use std::{
 };
 use temporalio_common::{
     ActivityDefinition, HasWorkflowDefinition, SignalDefinition, UntypedActivity, UpdateDefinition,
-    data_converters::{DataConverter, SerializationContext, SerializationContextData},
+    data_converters::{
+        ActivitySerializationContext, DataConverter, SerializationContext,
+        SerializationContextData, WorkflowSerializationContext,
+    },
     payload_visitor::decode_payloads,
     protos::{
         coresdk::IntoPayloadsExt,
@@ -1659,7 +1662,7 @@ impl WorkflowExecution {
         Memo::from_raw(
             self.raw.memo.clone(),
             self.data_converter.payload_converter().clone(),
-            SerializationContextData::Workflow,
+            SerializationContextData::Workflow(WorkflowSerializationContext::new()),
         )
     }
 
@@ -1876,14 +1879,18 @@ where
                         let data_converter = client.data_converter().clone();
                         let unencoded_payloads = {
                             let payload_converter = data_converter.payload_converter();
-                            let context = SerializationContext::new(&SerializationContextData::Workflow, payload_converter);
+                            let context_data = SerializationContextData::Workflow(
+                                WorkflowSerializationContext::new(),
+                            );
+                            let context =
+                                SerializationContext::new(&context_data, payload_converter);
                             args.serialize_payloads(&context)
                         };
                         drop(args);
 
                         let payloads = data_converter
                             .codec()
-                            .encode(&SerializationContextData::Workflow, unencoded_payloads?)
+                            .encode(&SerializationContextData::Workflow(WorkflowSerializationContext::new()), unencoded_payloads?)
                             .await?;
                         let workflow_id = options.workflow_id.clone();
                         let memo = options.encoded_memo(&data_converter).await?;
@@ -1967,18 +1974,21 @@ where
                         ) = input.into_parts();
                         let data_converter = client.data_converter().clone();
                         let payload_converter = data_converter.payload_converter();
-                        let context = SerializationContext::new(&SerializationContextData::Workflow, payload_converter);
+                        let context_data = SerializationContextData::Workflow(
+                            WorkflowSerializationContext::new(),
+                        );
+                        let context = SerializationContext::new(&context_data, payload_converter);
                         let workflow_payloads = workflow_args.serialize_payloads(&context);
                         let signal_payloads = signal_args.serialize_payloads(&context);
                         drop(workflow_args);
                         drop(signal_args);
                         let workflow_payloads = data_converter
                             .codec()
-                            .encode(&SerializationContextData::Workflow, workflow_payloads?)
+                            .encode(&SerializationContextData::Workflow(WorkflowSerializationContext::new()), workflow_payloads?)
                             .await?;
                         let signal_payloads = data_converter
                             .codec()
-                            .encode(&SerializationContextData::Workflow, signal_payloads?)
+                            .encode(&SerializationContextData::Workflow(WorkflowSerializationContext::new()), signal_payloads?)
                             .await?;
                         let workflow_id = options.workflow_id.clone();
                         let memo = options.encoded_memo(&data_converter).await?;
@@ -2097,10 +2107,11 @@ where
                         let data_converter = client.data_converter().clone();
                         let (unencoded_workflow_payloads, unencoded_update_payloads) = {
                             let payload_converter = data_converter.payload_converter();
-                            let context = SerializationContext::new(
-                                &SerializationContextData::Workflow,
-                                payload_converter,
+                            let context_data = SerializationContextData::Workflow(
+                                WorkflowSerializationContext::new(),
                             );
+                            let context =
+                                SerializationContext::new(&context_data, payload_converter);
                             (
                                 workflow_args.serialize_payloads(&context),
                                 update_args.serialize_payloads(&context),
@@ -2112,11 +2123,15 @@ where
                         // encode both payload sets concurrently.
                         let (workflow_payloads, update_payloads) = try_join(
                             data_converter.codec().encode(
-                                &SerializationContextData::Workflow,
+                                &SerializationContextData::Workflow(
+                                    WorkflowSerializationContext::new(),
+                                ),
                                 unencoded_workflow_payloads?,
                             ),
                             data_converter.codec().encode(
-                                &SerializationContextData::Workflow,
+                                &SerializationContextData::Workflow(
+                                    WorkflowSerializationContext::new(),
+                                ),
                                 unencoded_update_payloads?,
                             ),
                         )
@@ -2364,7 +2379,9 @@ where
                                     && let Err(err) = decode_payloads(
                                         memo,
                                         data_converter.codec(),
-                                        &SerializationContextData::Workflow,
+                                        &SerializationContextData::Workflow(
+                                            WorkflowSerializationContext::new(),
+                                        ),
                                     )
                                     .await
                                 {
@@ -2460,7 +2477,7 @@ where
     {
         let mut client = self.clone();
         let dc = client.data_converter();
-        let sc = &SerializationContextData::Activity;
+        let sc = &SerializationContextData::Activity(ActivitySerializationContext::new());
 
         let user_metadata = {
             let summary = match &options.summary {
@@ -3695,13 +3712,17 @@ mod tests {
         /// Decode a sent memo the same way `describe`/`list` do, and read it back.
         async fn read_back(sent: ProtoMemo) -> Memo {
             let mut sent = sent;
-            decode_payloads(&mut sent, &XorCodec, &SerializationContextData::Workflow)
-                .await
-                .unwrap();
+            decode_payloads(
+                &mut sent,
+                &XorCodec,
+                &SerializationContextData::Workflow(WorkflowSerializationContext::new()),
+            )
+            .await
+            .unwrap();
             Memo::from_raw(
                 Some(sent),
                 PayloadConverter::default(),
-                SerializationContextData::Workflow,
+                SerializationContextData::Workflow(WorkflowSerializationContext::new()),
             )
         }
 
@@ -3856,7 +3877,10 @@ mod tests {
             };
             let replacement: String = client
                 .data_converter()
-                .from_payloads(&SerializationContextData::Workflow, payloads)
+                .from_payloads(
+                    &SerializationContextData::Workflow(WorkflowSerializationContext::new()),
+                    payloads,
+                )
                 .await
                 .unwrap();
             assert_eq!(replacement, "replacement");
@@ -4019,7 +4043,7 @@ mod tests {
             assert_eq!(
                 data_converter
                     .from_payloads::<Vec<String>>(
-                        &SerializationContextData::Workflow,
+                        &SerializationContextData::Workflow(WorkflowSerializationContext::new()),
                         workflow_payloads,
                     )
                     .await
@@ -4029,7 +4053,7 @@ mod tests {
             assert_eq!(
                 data_converter
                     .from_payloads::<Vec<String>>(
-                        &SerializationContextData::Workflow,
+                        &SerializationContextData::Workflow(WorkflowSerializationContext::new()),
                         signal_payloads,
                     )
                     .await
@@ -4184,15 +4208,18 @@ mod tests {
         ) -> ExecuteMultiOperationResponse {
             let outcome = (stage == UpdateWorkflowExecutionLifecycleStage::Completed).then(|| {
                 let payload_converter = PayloadConverter::default();
-                let result_payloads = payload_converter
-                    .to_payloads(
-                        &SerializationContext::new(
-                            &SerializationContextData::Workflow,
-                            &payload_converter,
-                        ),
-                        &"update-result".to_owned(),
-                    )
-                    .unwrap();
+                let result_payloads =
+                    payload_converter
+                        .to_payloads(
+                            &SerializationContext::new(
+                                &SerializationContextData::Workflow(
+                                    WorkflowSerializationContext::new(),
+                                ),
+                                &payload_converter,
+                            ),
+                            &"update-result".to_owned(),
+                        )
+                        .unwrap();
                 Outcome {
                     value: Some(outcome::Value::Success(Payloads {
                         payloads: result_payloads,
@@ -4324,8 +4351,9 @@ mod tests {
                 .unwrap();
 
             let payload_converter = PayloadConverter::default();
-            let context =
-                SerializationContext::new(&SerializationContextData::Workflow, &payload_converter);
+            let context_data =
+                SerializationContextData::Workflow(WorkflowSerializationContext::new());
+            let context = SerializationContext::new(&context_data, &payload_converter);
             let workflow_payloads = payload_converter
                 .to_payloads(&context, &"workflow-input".to_owned())
                 .unwrap();
@@ -4534,7 +4562,7 @@ mod tests {
             let workflow_input: String = client
                 .data_converter()
                 .from_payloads(
-                    &SerializationContextData::Workflow,
+                    &SerializationContextData::Workflow(WorkflowSerializationContext::new()),
                     start_request.input.clone().unwrap().payloads,
                 )
                 .await
@@ -4547,7 +4575,7 @@ mod tests {
             let update_input: String = client
                 .data_converter()
                 .from_payloads(
-                    &SerializationContextData::Workflow,
+                    &SerializationContextData::Workflow(WorkflowSerializationContext::new()),
                     update_request
                         .request
                         .clone()
@@ -4784,7 +4812,7 @@ mod tests {
             );
             let memo_payload = data_converter
                 .to_payload(
-                    &SerializationContextData::Workflow,
+                    &SerializationContextData::Workflow(WorkflowSerializationContext::new()),
                     &"memo-value".to_owned(),
                 )
                 .await

@@ -44,7 +44,7 @@ use temporalio_common_wasm::{
     WorkflowDefinition,
     data_converters::{
         GenericPayloadConverter, PayloadConversionError, PayloadConverter, SerializationContext,
-        SerializationContextData,
+        SerializationContextData, WorkflowSerializationContext,
     },
     error::{ApplicationFailure, OutgoingError, OutgoingWorkflowError},
     protos::{
@@ -367,7 +367,8 @@ where
     ) -> Result<Box<dyn WorkflowInstance>, PayloadConversionError> {
         let view = base_ctx.view();
         let interceptors = base_ctx.workflow_interceptors();
-        let ser_ctx = SerializationContext::new(&SerializationContextData::Workflow, &converter);
+        let context_data = SerializationContextData::Workflow(WorkflowSerializationContext::new());
+        let ser_ctx = SerializationContext::new(&context_data, &converter);
         let input = converter.from_payloads(&ser_ctx, payloads)?;
         let (init_input, run_input) = if W::INIT_TAKES_INPUT {
             (Some(input), None)
@@ -450,7 +451,8 @@ where
         }
 
         let converter = PayloadConverter::default();
-        let ctx = SerializationContext::new(&SerializationContextData::Workflow, &converter);
+        let context_data = SerializationContextData::Workflow(WorkflowSerializationContext::new());
+        let ctx = SerializationContext::new(&context_data, &converter);
         QueryResponse {
             result: converter
                 .to_payload(
@@ -480,14 +482,14 @@ where
             }
         };
         self.base_ctx.data_converter().to_failure(
-            &SerializationContextData::Workflow,
+            &SerializationContextData::Workflow(WorkflowSerializationContext::new()),
             OutgoingError::Workflow(outgoing),
         )
     }
 
     fn message_to_failure(&self, message: String) -> Failure {
         self.base_ctx.data_converter().to_failure(
-            &SerializationContextData::Workflow,
+            &SerializationContextData::Workflow(WorkflowSerializationContext::new()),
             OutgoingError::Workflow(OutgoingWorkflowError::Application(Box::new(
                 ApplicationFailure::new(message),
             ))),
@@ -791,7 +793,9 @@ where
                     .map(|details| {
                         (&*details as &dyn WorkflowOutputValue)
                             .serialize_payloads(&SerializationContext::new(
-                                &SerializationContextData::Workflow,
+                                &SerializationContextData::Workflow(
+                                    WorkflowSerializationContext::new(),
+                                ),
                                 self.ctx.payload_converter(),
                             ))
                             .map(|payloads| Payloads { payloads })
@@ -828,7 +832,7 @@ where
                     return Ok(TerminalOutcome::Cancelled(details));
                 }
                 let failure = self.base_ctx.data_converter().to_failure(
-                    &SerializationContextData::Workflow,
+                    &SerializationContextData::Workflow(WorkflowSerializationContext::new()),
                     temporalio_common_wasm::error::OutgoingError::Workflow(err),
                 );
                 Ok(TerminalOutcome::Failed(Box::new(failure)))

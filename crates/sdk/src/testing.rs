@@ -78,8 +78,8 @@ use temporalio_client::{
 use temporalio_common::{
     RetryPolicy,
     data_converters::{
-        GenericPayloadConverter, PayloadConversionError, PayloadConverter, SerializationContext,
-        SerializationContextData, TemporalSerializable,
+        ActivitySerializationContext, GenericPayloadConverter, PayloadConversionError,
+        PayloadConverter, SerializationContext, SerializationContextData, TemporalSerializable,
     },
     protos::temporal::api::common::v1::Payload,
 };
@@ -242,8 +242,8 @@ where
         let payload_converter = self
             .payload_converter_ref()
             .expect("payload converter must be set in builder state");
-        let context =
-            SerializationContext::new(&SerializationContextData::Activity, payload_converter);
+        let context_data = SerializationContextData::Activity(ActivitySerializationContext::new());
+        let context = SerializationContext::new(&context_data, payload_converter);
         self.heartbeat_details = payload_converter.to_payloads(&context, &details)?;
         Ok(self)
     }

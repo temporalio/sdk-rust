@@ -76,6 +76,8 @@ relevant information.
   or constructors (`WorkerCallbacks::new`, `ActivityExecutionDecodeHint::new`, or
   `SerializationContext::new`); use `Default` for `PayloadConverter`; and add wildcard branches
   when matching enums.
+* `SerializationContextData::{Workflow, Activity, Nexus}` now contain corresponding context
+  structs. `SerializationContextData` is no longer `Copy`.
 * Renamed `ActivityCloseTimeouts::Both` to `ActivityCloseTimeouts::ScheduleAndStartToClose`.
 * Removed the unused `ActExitValue` type. Use `ActivityError::WillCompleteAsync` to mark an
   activity for asynchronous completion.

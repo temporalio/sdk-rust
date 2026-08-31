@@ -2,7 +2,7 @@ use std::time::{Duration, SystemTime};
 
 use temporalio_common_wasm::{
     Memo, Priority, RetryPolicy, WorkflowExecution,
-    data_converters::{PayloadConverter, SerializationContextData},
+    data_converters::{PayloadConverter, SerializationContextData, WorkflowSerializationContext},
     protos::coresdk::{
         common::NamespacedWorkflowExecution, workflow_activation::InitializeWorkflow,
     },
@@ -144,7 +144,7 @@ impl WorkflowContextView {
         Memo::from_raw(
             self.raw.memo.clone(),
             self.payload_converter.clone(),
-            SerializationContextData::Workflow,
+            SerializationContextData::Workflow(WorkflowSerializationContext::new()),
         )
     }
 

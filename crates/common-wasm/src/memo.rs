@@ -165,13 +165,14 @@ impl MemoValues {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::data_converters::WorkflowSerializationContext;
     use std::collections::HashMap;
 
     #[test]
     fn memo_decodes_serialized_values() {
         let payload_converter = PayloadConverter::default();
-        let context =
-            SerializationContext::new(&SerializationContextData::Workflow, &payload_converter);
+        let context_data = SerializationContextData::Workflow(WorkflowSerializationContext::new());
+        let context = SerializationContext::new(&context_data, &payload_converter);
         let payload = payload_converter.to_payload(&context, &7_u32).unwrap();
         let raw = ProtoMemo {
             fields: HashMap::from([("count".to_owned(), payload.clone())]),
@@ -179,7 +180,7 @@ mod tests {
         let memo = Memo::from_raw(
             Some(raw.clone()),
             payload_converter,
-            SerializationContextData::Workflow,
+            SerializationContextData::Workflow(WorkflowSerializationContext::new()),
         );
 
         assert_eq!(memo.get::<u32>("count").unwrap(), Some(7));
@@ -191,15 +192,15 @@ mod tests {
     #[test]
     fn memo_reports_deserialization_errors() {
         let payload_converter = PayloadConverter::default();
-        let context =
-            SerializationContext::new(&SerializationContextData::Workflow, &payload_converter);
+        let context_data = SerializationContextData::Workflow(WorkflowSerializationContext::new());
+        let context = SerializationContext::new(&context_data, &payload_converter);
         let payload = payload_converter.to_payload(&context, &7_u32).unwrap();
         let memo = Memo::from_raw(
             Some(ProtoMemo {
                 fields: HashMap::from([("count".to_owned(), payload)]),
             }),
             payload_converter,
-            SerializationContextData::Workflow,
+            SerializationContextData::Workflow(WorkflowSerializationContext::new()),
         );
 
         assert!(memo.get::<String>("count").is_err());
@@ -213,8 +214,8 @@ mod tests {
             .insert("count", 7_u32)
             .insert("label", "hello".to_string());
 
-        let context =
-            SerializationContext::new(&SerializationContextData::Workflow, &payload_converter);
+        let context_data = SerializationContextData::Workflow(WorkflowSerializationContext::new());
+        let context = SerializationContext::new(&context_data, &payload_converter);
         let fields = values
             .iter()
             .map(|(key, value)| {
@@ -228,7 +229,7 @@ mod tests {
         let memo = Memo::from_raw(
             Some(ProtoMemo { fields }),
             payload_converter.clone(),
-            SerializationContextData::Workflow,
+            SerializationContextData::Workflow(WorkflowSerializationContext::new()),
         );
 
         assert_eq!(memo.get::<u32>("count").unwrap(), Some(7));

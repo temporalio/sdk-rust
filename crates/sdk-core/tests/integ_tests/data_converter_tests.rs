@@ -934,10 +934,10 @@ impl PayloadCodec for FailOnceCodec {
             (self.failure_point, context),
             (
                 CodecFailurePoint::WorkflowEncode,
-                SerializationContextData::Workflow
+                SerializationContextData::Workflow(_)
             ) | (
                 CodecFailurePoint::ActivityEncode,
-                SerializationContextData::Activity
+                SerializationContextData::Activity(_)
             )
         );
         let marker = if matches!(self.failure_point, CodecFailurePoint::WorkflowEncode) {
@@ -977,10 +977,10 @@ impl PayloadCodec for FailOnceCodec {
             (self.failure_point, context),
             (
                 CodecFailurePoint::WorkflowDecode,
-                SerializationContextData::Workflow
+                SerializationContextData::Workflow(_)
             ) | (
                 CodecFailurePoint::ActivityDecode,
-                SerializationContextData::Activity
+                SerializationContextData::Activity(_)
             )
         );
         let matches_payload = payloads.iter().any(|payload| {
