@@ -198,7 +198,7 @@ async fn abandoned_child_bug_repro() {
 
 #[workflow]
 struct AbandonedChildResolvesPostCancelParent {
-    barr: Arc<Barrier>,
+    ready: Arc<Notify>,
 }
 
 #[workflow_methods(factory_only)]
@@ -217,8 +217,7 @@ impl AbandonedChildResolvesPostCancelParent {
             )
             .await
             .expect("Child should start OK");
-        let barr = ctx.state(|wf| wf.barr.clone());
-        barr.wait().await;
+        ctx.state(|wf| wf.ready.notify_one());
         ctx.cancelled().await;
         started.cancel("Die reason".to_string());
         ctx.timer(Duration::from_secs(1)).await;
@@ -242,12 +241,12 @@ impl AbandonedChildResolvesPostCancelChild {
 #[tokio::test]
 async fn abandoned_child_resolves_post_cancel() {
     let mut starter = CoreWfStarter::new("child-workflow-resolves-post-cancel");
-    let barr = Arc::new(Barrier::new(2));
-    let barr_clone = barr.clone();
+    let ready = Arc::new(Notify::new());
+    let ready_clone = ready.clone();
     starter
         .sdk_config
         .register_workflow_with_factory(move || AbandonedChildResolvesPostCancelParent {
-            barr: barr_clone.clone(),
+            ready: ready_clone.clone(),
         })
         .unwrap();
     starter
@@ -267,7 +266,7 @@ async fn abandoned_child_resolves_post_cancel() {
         .unwrap();
     let client = starter.get_core_client().await;
     let canceller = async {
-        barr.wait().await;
+        ready.notified().await;
         handle
             .cancel(WorkflowCancelOptions::builder().reason("die").build())
             .await
@@ -277,6 +276,7 @@ async fn abandoned_child_resolves_post_cancel() {
         worker.run_until_done().await.unwrap();
     };
     tokio::join!(canceller, runner);
+    handle.get_result(Default::default()).await.unwrap();
 
     // Verify no WFT failures on the child workflow. A failure here indicates
     // the child couldn't deserialize its input (e.g., sending a payload when none expected).
