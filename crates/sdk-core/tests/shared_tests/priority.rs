@@ -135,9 +135,9 @@ pub(crate) async fn priority_values_sent_to_server() {
         .unwrap();
     let events = handle
         .fetch_history(Default::default())
+        .into_events()
         .await
-        .unwrap()
-        .into_events();
+        .unwrap();
     let workflow_init_event = events
         .iter()
         .find_map(|e| {

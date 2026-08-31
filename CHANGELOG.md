@@ -59,6 +59,12 @@ relevant information.
   `ClientInterceptor::update_with_start_workflow`.
 
 ### Breaking Changes :boom:
+* `WorkflowHandle::fetch_history` now returns a lazy `WorkflowHistory` stream instead
+  of eagerly fetching every history page. Use `WorkflowHistory::into_events` if eager fetching
+  is desired.
+* `WorkflowHistory::to_json` is now async, `WorkflowHistoryError` reports fetch and JSON conversion failures; and the eager `events`,
+  `Clone`, and `From<WorkflowHistory> for History` APIs have been removed. Replay results expose
+  their eagerly fetched events through `ReplayHistory`.
 * The following types are now non-exhaustive: `Priority`, `WorkerDeploymentVersion`,
   `WorkerCallbacks`, `WorkflowExecutionInfo`, `ActivityCloseTimeouts`,
   `ActivityExecutionDecodeHint`, child-workflow and signal decode hints,

@@ -11,7 +11,7 @@ use temporalio_client::{
     PluginError, WorkflowHistory, WorkflowQueryOptions, WorkflowStartOptions,
     WorkflowTerminateOptions, errors::WorkflowGetResultError,
 };
-use temporalio_common::protos::temporal::api::enums::v1::EventType;
+use temporalio_common::protos::temporal::api::{enums::v1::EventType, history::v1::History};
 use temporalio_macros::{activities, workflow, workflow_methods};
 use temporalio_sdk::{
     ActivityOptions, ApplicationFailure, SimplePlugin, WorkerPlugin, WorkerRunError,
@@ -137,21 +137,29 @@ async fn workflow_replayer_replays_completed_workflow() {
         handle.get_result(Default::default()).await.unwrap(),
         "Hello, Temporal!"
     );
-    let history = handle.fetch_history(Default::default()).await.unwrap();
-    let history_from_json = WorkflowHistory::from_json(&history.to_json().unwrap()).unwrap();
-    assert_eq!(history_from_json.workflow_id(), history.workflow_id());
+    let history = handle.fetch_history(Default::default());
+    let workflow_id = history.workflow_id().map(str::to_owned);
+    let history_json = history.to_json().await.unwrap();
+    let history_from_json = WorkflowHistory::from_json(&history_json).unwrap();
+    assert_eq!(history_from_json.workflow_id(), workflow_id.as_deref());
 
     let replayer = replayer();
-    replayer
-        .replay_workflow(history_from_json.clone())
-        .await
-        .unwrap();
+    replayer.replay_workflow(history_from_json).await.unwrap();
     let results = replayer
-        .replay_workflows([history_from_json.clone(), history_from_json])
+        .replay_workflows([
+            WorkflowHistory::from_json(&history_json).unwrap(),
+            WorkflowHistory::from_json(&history_json).unwrap(),
+        ])
         .await
         .unwrap();
     assert_eq!(results.len(), 2);
     assert!(results.iter().all(|result| result.replay_failure.is_none()));
+    let cloned_result = results[0].clone();
+    assert_eq!(
+        cloned_result.history.workflow_id(),
+        Some(starter.get_wf_id())
+    );
+    assert!(!cloned_result.history.events().is_empty());
 }
 
 #[tokio::test]
@@ -192,7 +200,14 @@ async fn workflow_replayer_replays_incomplete_workflow() {
         )
         .await
         .unwrap();
-        let history = handle.fetch_history(Default::default()).await.unwrap();
+        let history: WorkflowHistory = History {
+            events: handle
+                .fetch_history(Default::default())
+                .into_events()
+                .await
+                .unwrap(),
+        }
+        .into();
         handle
             .terminate(WorkflowTerminateOptions::default())
             .await
@@ -230,7 +245,7 @@ async fn workflow_replayer_replays_failed_workflow() {
         handle.get_result(Default::default()).await,
         Err(WorkflowGetResultError::Failed(_))
     ));
-    let history = handle.fetch_history(Default::default()).await.unwrap();
+    let history = handle.fetch_history(Default::default());
 
     replayer().replay_workflow(history).await.unwrap();
 }
@@ -256,16 +271,30 @@ async fn workflow_replayer_reports_nondeterminism() {
         .unwrap();
 
     worker.run_until_done().await.unwrap();
-    let history = handle.fetch_history(Default::default()).await.unwrap();
+    let events = handle
+        .fetch_history(Default::default())
+        .into_events()
+        .await
+        .unwrap();
     let replayer = replayer();
 
     assert!(matches!(
-        replayer.replay_workflow(history.clone()).await,
+        replayer
+            .replay_workflow(
+                History {
+                    events: events.clone(),
+                }
+                .into()
+            )
+            .await,
         Err(WorkflowReplayError::Replay(
             WorkflowReplayFailure::Nondeterminism { .. }
         ))
     ));
-    let results = replayer.replay_workflows([history]).await.unwrap();
+    let results = replayer
+        .replay_workflows([History { events }.into()])
+        .await
+        .unwrap();
     assert!(matches!(
         results[0].replay_failure,
         Some(WorkflowReplayFailure::Nondeterminism { .. })
@@ -295,12 +324,15 @@ async fn workflow_replayer_replays_history_with_workflow_task_failure() {
     let fetch_failed_history = async {
         let history = eventually(
             || async {
-                let history = handle.fetch_history(Default::default()).await.unwrap();
-                history
-                    .events()
+                let events = handle
+                    .fetch_history(Default::default())
+                    .into_events()
+                    .await
+                    .unwrap();
+                events
                     .iter()
                     .any(|event| event.event_type() == EventType::WorkflowTaskFailed)
-                    .then_some(history)
+                    .then_some(History { events }.into())
                     .ok_or("workflow task failure not yet recorded")
             },
             Duration::from_secs(10),
@@ -353,14 +385,8 @@ async fn workflow_replayer_returns_ordered_results_for_multiple_histories() {
         .unwrap();
 
     worker.run_until_done().await.unwrap();
-    let successful_history = successful_handle
-        .fetch_history(Default::default())
-        .await
-        .unwrap();
-    let nondeterministic_history = nondeterministic_handle
-        .fetch_history(Default::default())
-        .await
-        .unwrap();
+    let successful_history = successful_handle.fetch_history(Default::default());
+    let nondeterministic_history = nondeterministic_handle.fetch_history(Default::default());
 
     let results = replayer()
         .replay_workflows([successful_history, nondeterministic_history])
@@ -441,7 +467,11 @@ async fn workflow_replayer_applies_plugins() {
         .await
         .unwrap();
     worker.run_until_done().await.unwrap();
-    let history = handle.fetch_history(Default::default()).await.unwrap();
+    let events = handle
+        .fetch_history(Default::default())
+        .into_events()
+        .await
+        .unwrap();
 
     let configure_calls = Arc::new(AtomicUsize::new(0));
     let replayer = WorkflowReplayer::new(
@@ -460,7 +490,15 @@ async fn workflow_replayer_applies_plugins() {
             .count(),
         1
     );
-    replayer.replay_workflow(history.clone()).await.unwrap();
+    replayer
+        .replay_workflow(
+            History {
+                events: events.clone(),
+            }
+            .into(),
+        )
+        .await
+        .unwrap();
     assert_eq!(configure_calls.load(Ordering::Relaxed), 1);
 
     let run_calls = Arc::new(AtomicUsize::new(0));
@@ -477,7 +515,16 @@ async fn workflow_replayer_applies_plugins() {
     )
     .unwrap();
     replayer
-        .replay_workflows([history.clone(), history.clone()])
+        .replay_workflows([
+            History {
+                events: events.clone(),
+            }
+            .into(),
+            History {
+                events: events.clone(),
+            }
+            .into(),
+        ])
         .await
         .unwrap();
     assert_eq!(run_calls.load(Ordering::Relaxed), 0);
@@ -495,5 +542,8 @@ async fn workflow_replayer_applies_plugins() {
             .build(),
     )
     .unwrap();
-    replayer.replay_workflow(history).await.unwrap();
+    replayer
+        .replay_workflow(History { events }.into())
+        .await
+        .unwrap();
 }

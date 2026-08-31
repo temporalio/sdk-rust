@@ -323,9 +323,9 @@ async fn small_workflow_slots_and_pollers(#[values(false, true)] use_autoscaling
         .await
         .get_workflow_handle::<UntypedWorkflow>(&wf2id)
         .fetch_history(Default::default())
+        .into_events()
         .await
-        .unwrap()
-        .into_events();
+        .unwrap();
     let any_task_timeouts = events
         .iter()
         .any(|e| e.event_type() == EventType::WorkflowTaskTimedOut);

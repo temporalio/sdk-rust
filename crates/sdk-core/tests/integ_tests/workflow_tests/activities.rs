@@ -352,9 +352,12 @@ async fn propagated_activity_input_conversion_failure_fails_workflow_task() {
     worker.run_until_done().await.unwrap();
     handle.get_result(Default::default()).await.unwrap();
 
-    let history = handle.fetch_history(Default::default()).await.unwrap();
+    let history = handle
+        .fetch_history(Default::default())
+        .into_events()
+        .await
+        .unwrap();
     let workflow_task_failures: Vec<_> = history
-        .events()
         .iter()
         .filter(|event| event.event_type() == EventType::WorkflowTaskFailed)
         .collect();

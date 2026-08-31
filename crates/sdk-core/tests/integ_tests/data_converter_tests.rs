@@ -441,9 +441,12 @@ async fn custom_failure_converter_fallback_applied_to_activity_panic_failures() 
     worker.run_until_done().await.unwrap();
     handle.get_result(Default::default()).await.unwrap();
 
-    let history = handle.fetch_history(Default::default()).await.unwrap();
-    let activity_failure = history
+    let history = handle
+        .fetch_history(Default::default())
         .into_events()
+        .await
+        .unwrap();
+    let activity_failure = history
         .into_iter()
         .find_map(|event| match event.attributes {
             Some(Attributes::ActivityTaskFailedEventAttributes(attrs)) => attrs.failure,
@@ -717,9 +720,9 @@ async fn multi_args_serializes_as_multiple_payloads() {
     let events = client
         .get_workflow_handle::<UntypedWorkflow>(wf_name)
         .fetch_history(Default::default())
+        .into_events()
         .await
-        .unwrap()
-        .into_events();
+        .unwrap();
 
     let workflow_started_event = events
         .iter()

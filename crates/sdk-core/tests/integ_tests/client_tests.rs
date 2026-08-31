@@ -463,6 +463,7 @@ async fn namespace_header_attached_to_relevant_calls() {
     let _ = client
         .get_workflow_handle::<UntypedWorkflow>("hi")
         .fetch_history(Default::default())
+        .into_events()
         .await;
     let val = header_rx.recv().await.unwrap();
     assert_eq!(namespace, val);

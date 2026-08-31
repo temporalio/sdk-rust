@@ -284,10 +284,10 @@ async fn abandoned_child_resolves_post_cancel() {
         client.get_workflow_handle::<UntypedWorkflow>("abandoned-child-resolve-post-cancel");
     let history = child_handle
         .fetch_history(Default::default())
+        .into_events()
         .await
         .unwrap();
     let wft_failures: Vec<_> = history
-        .events()
         .iter()
         .filter(|e| {
             matches!(
@@ -1235,9 +1235,12 @@ async fn cancel_child_wf_before_started_event_real_server() {
     // Verify no unexpected workflow task failures in history. The bug manifests as a WFT failure
     // with a nondeterminism error. UnhandledCommand failures are acceptable since the server
     // may reject a cancel command if it races with the child workflow start.
-    let history = handle.fetch_history(Default::default()).await.unwrap();
+    let history = handle
+        .fetch_history(Default::default())
+        .into_events()
+        .await
+        .unwrap();
     let unexpected_wft_failures: Vec<_> = history
-        .events()
         .iter()
         .filter(|e| {
             if let Some(history_event::Attributes::WorkflowTaskFailedEventAttributes(attrs)) =

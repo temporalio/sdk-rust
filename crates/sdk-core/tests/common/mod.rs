@@ -614,9 +614,9 @@ impl CoreWfStarter {
         let events = client
             .get_workflow_handle::<UntypedWorkflow>(self.get_wf_id())
             .fetch_history(Default::default())
+            .into_events()
             .await
-            .unwrap()
-            .into_events();
+            .unwrap();
         History { events }
     }
 
@@ -1079,7 +1079,7 @@ where
         worker: &mut TestWorker,
     ) -> Result<Option<Payload>, anyhow::Error> {
         let wf_id = self.info().workflow_id.clone();
-        let events = self.fetch_history(Default::default()).await?.into_events();
+        let events = self.fetch_history(Default::default()).into_events().await?;
         let with_id = HistoryForReplay::new(events, wf_id);
         let replay_worker = init_core_replay_preloaded(worker.inner.task_queue(), [with_id]);
         worker.inner.with_new_core_worker(Arc::new(replay_worker));
