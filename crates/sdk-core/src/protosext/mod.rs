@@ -322,7 +322,7 @@ pub(crate) struct ValidScheduleLA {
     pub(crate) retry_policy: ValidatedRetryPolicy,
     pub(crate) local_retry_threshold: Duration,
     pub(crate) cancellation_type: ActivityCancellationType,
-    pub(crate) include_arguments_into_marker: bool,
+    pub(crate) include_arguments_in_marker: bool,
     pub(crate) user_metadata: Option<UserMetadata>,
     pub(crate) event_group_markers: Vec<EventGroupMarker>,
 }
@@ -433,7 +433,7 @@ impl ValidScheduleLA {
             retry_policy,
             local_retry_threshold,
             cancellation_type,
-            include_arguments_into_marker: v.include_arguments_into_marker,
+            include_arguments_in_marker: v.include_arguments_in_marker,
             user_metadata,
             event_group_markers,
         })

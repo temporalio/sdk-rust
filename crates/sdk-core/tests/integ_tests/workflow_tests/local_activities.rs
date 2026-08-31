@@ -3022,7 +3022,7 @@ async fn local_activity_marker_optionally_includes_arguments(#[case] include_arg
             activity_type: "test_act".to_string(),
             arguments,
             start_to_close_timeout: Some(prost_dur!(from_secs(30))),
-            include_arguments_into_marker: include_arguments,
+            include_arguments_in_marker: include_arguments,
             ..Default::default()
         }
         .into(),

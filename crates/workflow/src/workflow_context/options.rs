@@ -431,7 +431,7 @@ pub struct LocalActivityOptions {
     /// Enabling this makes the arguments visible in Workflow history and increases its size.
     /// Defaults to `false`.
     #[builder(default)]
-    pub include_arguments_into_marker: bool,
+    pub include_arguments_in_marker: bool,
     /// Cancellation token for this local activity. `None` inherits workflow cancellation.
     pub cancellation_token: Option<WorkflowCancellationToken>,
     /// Indicates how long the caller is willing to wait for local activity completion. Limits how
@@ -492,7 +492,7 @@ impl LocalActivityOptions {
                     .timer_backoff_threshold
                     .and_then(|duration| duration.try_into().ok()),
                 cancellation_type: ProtoActivityCancellationType::from(self.cancel_type).into(),
-                include_arguments_into_marker: self.include_arguments_into_marker,
+                include_arguments_in_marker: self.include_arguments_in_marker,
                 schedule_to_close_timeout: self
                     .schedule_to_close_timeout
                     .and_then(|duration| duration.try_into().ok()),
@@ -1088,7 +1088,7 @@ mod tests {
             HashMap::new(),
         );
         let enabled_command = LocalActivityOptions::builder()
-            .include_arguments_into_marker(true)
+            .include_arguments_in_marker(true)
             .build()
             .into_command(1, "test".to_string(), vec![], HashMap::new());
 
@@ -1102,8 +1102,8 @@ mod tests {
         else {
             panic!("expected ScheduleLocalActivity command");
         };
-        assert!(!default_command.include_arguments_into_marker);
-        assert!(enabled_command.include_arguments_into_marker);
+        assert!(!default_command.include_arguments_in_marker);
+        assert!(enabled_command.include_arguments_in_marker);
     }
 
     #[test]

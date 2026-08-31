@@ -726,7 +726,7 @@ impl WFMachinesAdapter for LocalActivityMachine {
                         },
                         maybe_ok_result,
                     );
-                    if self.shared_state.attrs.include_arguments_into_marker {
+                    if self.shared_state.attrs.include_arguments_in_marker {
                         details.insert(
                             "input".to_string(),
                             Payloads {

@@ -36,7 +36,7 @@ relevant information.
 ### Added
 * `DefaultFailureConverter::new(true)` moves failure messages and stack traces into encoded
   attributes so payload codecs can encrypt them.
-* `LocalActivityOptions::include_arguments_into_marker` allows Rust workflows to opt in to
+* `LocalActivityOptions::include_arguments_in_marker` allows Rust workflows to opt in to
   recording local activity arguments in Workflow history.
 * `WorkflowHandle::get_update_handle` creates a typed handle for an existing Workflow Update from
   its update ID, allowing callers to wait for the result independently of the original handle.

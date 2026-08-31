@@ -151,7 +151,7 @@ message ScheduleLocalActivity {
     // If set, the local activity arguments will be included in the resulting marker under the
     // `input` key. This is disabled by default to avoid increasing history size unless the lang
     // SDK explicitly chooses to expose it.
-    bool include_arguments_into_marker = 14;
+    bool include_arguments_in_marker = 14;
 }
 
 enum ActivityCancellationType {
