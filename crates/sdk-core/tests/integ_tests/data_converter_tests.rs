@@ -793,9 +793,9 @@ async fn option_none_workflow_input_is_recorded_as_binary_null() {
 
     let events = handle
         .fetch_history(Default::default())
+        .into_events()
         .await
-        .unwrap()
-        .into_events();
+        .unwrap();
     let input = events
         .iter()
         .find_map(|event| match event.attributes.as_ref() {
