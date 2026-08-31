@@ -383,10 +383,10 @@ pub(crate) async fn shutdown_during_active_timer_activity_workflows() {
         let history = client
             .get_workflow_handle::<UntypedWorkflow>(wf_id)
             .fetch_history(WorkflowFetchHistoryOptions::default())
+            .into_events()
             .await
             .unwrap();
         let bad_events: Vec<_> = history
-            .events()
             .iter()
             .filter(|e| match &e.attributes {
                 Some(history_event::Attributes::WorkflowTaskFailedEventAttributes(f))

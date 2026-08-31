@@ -4384,9 +4384,9 @@ async fn replay_out_of_order_local_activity_markers_is_deterministic() {
     let workflow_id = handle.info().workflow_id.clone();
     let events = handle
         .fetch_history(Default::default())
+        .into_events()
         .await
-        .unwrap()
-        .into_events();
+        .unwrap();
     let marker_order = events
         .iter()
         .filter_map(|event| match event.attributes.as_ref() {

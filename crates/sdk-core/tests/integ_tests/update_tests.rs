@@ -90,9 +90,9 @@ async fn update_workflow(#[values(FailUpdate::Yes, FailUpdate::No)] will_fail: F
     let events = client
         .get_workflow_handle::<UntypedWorkflow>(workflow_id)
         .fetch_history(Default::default())
+        .into_events()
         .await
-        .unwrap()
-        .into_events();
+        .unwrap();
     let with_id = HistoryForReplay::new(events, workflow_id.to_string());
     let replay_worker = init_core_replay_preloaded(workflow_id, [with_id]);
     // Init workflow comes by itself
@@ -170,9 +170,9 @@ async fn reapplied_updates_due_to_reset() {
         .build()
         .bind_untyped(client.clone())
         .fetch_history(Default::default())
+        .into_events()
         .await
-        .unwrap()
-        .into_events();
+        .unwrap();
     let with_id = HistoryForReplay::new(events, workflow_id.to_string());
 
     let replay_worker = init_core_replay_preloaded(workflow_id, [with_id]);
@@ -363,9 +363,9 @@ async fn update_rejection() {
     let events = client
         .get_workflow_handle::<UntypedWorkflow>(&workflow_id)
         .fetch_history(Default::default())
+        .into_events()
         .await
-        .unwrap()
-        .into_events();
+        .unwrap();
     let has_update_event = events.iter().any(|e| {
         matches!(
             e.event_type(),

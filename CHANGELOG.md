@@ -62,6 +62,12 @@ relevant information.
 
 ### Breaking Changes :boom:
 * `DefaultFailureConverter` is no longer a unit struct. Use `DefaultFailureConverter::default()` instead.
+* `WorkflowHandle::fetch_history` now returns a lazy `WorkflowHistory` stream instead
+  of eagerly fetching every history page. Use `WorkflowHistory::into_events` if eager fetching
+  is desired.
+* `WorkflowHistory::to_json` is now async, `WorkflowHistoryError` reports fetch and JSON conversion failures; and the eager `events`,
+  `Clone`, and `From<WorkflowHistory> for History` APIs have been removed. Replay results expose
+  their eagerly fetched events through `ReplayHistory`.
 * The following types are now non-exhaustive: `Priority`, `WorkerDeploymentVersion`,
   `WorkerCallbacks`, `WorkflowExecutionInfo`, `ActivityCloseTimeouts`,
   `ActivityExecutionDecodeHint`, child-workflow and signal decode hints,
@@ -98,6 +104,8 @@ relevant information.
   Shutdown now drains in-flight completions first.
 * Standalone activity result and describe APIs now apply the configured payload codec when
   decoding failures, so encoded failure attributes and details are restored correctly.
+* The default payload converter now serializes Serde `null` values such as `Option::None` as
+  `binary/null` and accepts both `binary/null` and legacy `json/plain` null payloads.
 * The Prometheus exporter now respects `PrometheusExporterOptions::counters_total_suffix`,
   appending `_total` to counter metric names when enabled.
 * Workflow start requests now include the client's identity.
@@ -111,6 +119,8 @@ relevant information.
   non-sticky poller, so the worker would stop picking up new workflows until a poll timed out (up to
   ~60s). The poll balancer now reserves a non-sticky slot against the cache size rather than the
   slot-supplier size.
+* The default payload converter now encodes `Vec<u8>` and `Option<Vec<u8>>` as `binary/plain` when
+  present.
 
 ## [0.7.0] - 2026-08-17
 

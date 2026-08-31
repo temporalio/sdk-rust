@@ -441,9 +441,12 @@ async fn custom_failure_converter_fallback_applied_to_activity_panic_failures() 
     worker.run_until_done().await.unwrap();
     handle.get_result(Default::default()).await.unwrap();
 
-    let history = handle.fetch_history(Default::default()).await.unwrap();
-    let activity_failure = history
+    let history = handle
+        .fetch_history(Default::default())
         .into_events()
+        .await
+        .unwrap();
+    let activity_failure = history
         .into_iter()
         .find_map(|event| match event.attributes {
             Some(Attributes::ActivityTaskFailedEventAttributes(attrs)) => attrs.failure,
@@ -717,9 +720,9 @@ async fn multi_args_serializes_as_multiple_payloads() {
     let events = client
         .get_workflow_handle::<UntypedWorkflow>(wf_name)
         .fetch_history(Default::default())
+        .into_events()
         .await
-        .unwrap()
-        .into_events();
+        .unwrap();
 
     let workflow_started_event = events
         .iter()
@@ -754,6 +757,60 @@ async fn multi_args_serializes_as_multiple_payloads() {
     let second_payload_data: i32 =
         serde_json::from_slice(&input_payloads.payloads[1].data).unwrap();
     assert_eq!(second_payload_data, 42);
+}
+
+#[workflow]
+#[derive(Default)]
+struct BinaryNullWorkflow;
+
+#[workflow_methods]
+impl BinaryNullWorkflow {
+    #[run]
+    async fn run(_ctx: &mut WorkflowContext<Self>, input: Option<String>) -> WorkflowResult<()> {
+        assert_eq!(input, None);
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn option_none_workflow_input_is_recorded_as_binary_null() {
+    let wf_name = BinaryNullWorkflow::name();
+    let mut starter = CoreWfStarter::new(wf_name);
+    starter
+        .sdk_config
+        .register_workflow::<BinaryNullWorkflow>()
+        .unwrap();
+    let mut worker = starter.worker().await;
+    let handle = worker
+        .submit_workflow(
+            BinaryNullWorkflow::run,
+            Option::<String>::None,
+            WorkflowStartOptions::new(starter.get_task_queue(), wf_name).build(),
+        )
+        .await
+        .unwrap();
+    worker.run_until_done().await.unwrap();
+
+    let events = handle
+        .fetch_history(Default::default())
+        .await
+        .unwrap()
+        .into_events();
+    let input = events
+        .iter()
+        .find_map(|event| match event.attributes.as_ref() {
+            Some(Attributes::WorkflowExecutionStartedEventAttributes(attributes)) => {
+                attributes.input.as_ref()
+            }
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(input.payloads.len(), 1);
+    assert_eq!(
+        input.payloads[0].metadata.get("encoding").unwrap(),
+        b"binary/null"
+    );
+    assert!(input.payloads[0].data.is_empty());
 }
 
 /// A codec that XORs payload data with a key and tracks encode/decode operations.

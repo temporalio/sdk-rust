@@ -32,8 +32,8 @@ async fn main() -> Result<(), anyhow::Error> {
         .bind_untyped(client);
     let events = handle
         .fetch_history(WorkflowFetchHistoryOptions::default())
-        .await?
-        .into_events();
+        .into_events()
+        .await?;
     let hist = History { events };
     // Serialize history to file
     let byteified = hist.encode_to_vec();

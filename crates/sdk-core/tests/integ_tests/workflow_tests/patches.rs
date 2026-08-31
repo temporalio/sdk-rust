@@ -212,8 +212,12 @@ async fn patch_activation_callback_is_memoized_across_replay() {
         (false, false)
     );
     assert_eq!(callback_calls.load(Ordering::Relaxed), 1);
-    let history = handle.fetch_history(Default::default()).await.unwrap();
-    assert!(!history.events().iter().any(|event| matches!(
+    let history = handle
+        .fetch_history(Default::default())
+        .into_events()
+        .await
+        .unwrap();
+    assert!(!history.iter().any(|event| matches!(
         &event.attributes,
         Some(EventAttributes::MarkerRecordedEventAttributes(attrs))
             if attrs.marker_name == PATCH_MARKER_NAME
@@ -305,8 +309,12 @@ async fn declined_patch_can_roll_out_to_old_worker() {
     });
     run_result.unwrap();
     assert_eq!(callback_calls.load(Ordering::Relaxed), 1);
-    let history = handle.fetch_history(Default::default()).await.unwrap();
-    assert!(!history.events().iter().any(|event| matches!(
+    let history = handle
+        .fetch_history(Default::default())
+        .into_events()
+        .await
+        .unwrap();
+    assert!(!history.iter().any(|event| matches!(
         &event.attributes,
         Some(EventAttributes::MarkerRecordedEventAttributes(attrs))
             if attrs.marker_name == PATCH_MARKER_NAME
@@ -369,8 +377,12 @@ async fn activated_patch_replays_without_consulting_declining_callback() {
     });
     run_result.unwrap();
     assert_eq!(activated_calls.load(Ordering::Relaxed), 1);
-    let history = handle.fetch_history(Default::default()).await.unwrap();
-    assert!(history.events().iter().any(|event| matches!(
+    let history = handle
+        .fetch_history(Default::default())
+        .into_events()
+        .await
+        .unwrap();
+    assert!(history.iter().any(|event| matches!(
         &event.attributes,
         Some(EventAttributes::MarkerRecordedEventAttributes(attrs))
             if attrs.marker_name == PATCH_MARKER_NAME
@@ -1179,9 +1191,12 @@ async fn patch_marker_size_overflow_replay_is_deterministic() {
 
     // Confirm that the original execution did in fact hit the size limit: the last upsert SA
     // event in history must contain fewer than the total number of patches issued by the workflow.
-    let history = handle.fetch_history(Default::default()).await.unwrap();
+    let history = handle
+        .fetch_history(Default::default())
+        .into_events()
+        .await
+        .unwrap();
     let last_upsert_patches = history
-        .events()
         .iter()
         .rev()
         .find_map(|e| match &e.attributes {

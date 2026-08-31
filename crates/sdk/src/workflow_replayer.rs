@@ -12,7 +12,9 @@ use std::{
     collections::{HashMap, HashSet},
     sync::Arc,
 };
-use temporalio_client::{ClientOptions, PluginApplyError, WorkflowHistory};
+use temporalio_client::{
+    ClientOptions, PluginApplyError, WorkflowHistory, errors::WorkflowInteractionError,
+};
 use temporalio_common::{
     WorkflowDefinition,
     data_converters::DataConverter,
@@ -21,7 +23,7 @@ use temporalio_common::{
             WorkflowActivation, remove_from_cache::EvictionReason,
             workflow_activation_job::Variant as ActivationVariant,
         },
-        temporal::api::history::v1::History,
+        temporal::api::history::v1::{History, HistoryEvent},
     },
 };
 use temporalio_sdk_core::{
@@ -258,12 +260,39 @@ pub enum WorkflowReplayFailure {
     },
 }
 
+/// Eagerly fetched workflow history returned after replay.
+#[derive(Clone, Debug)]
+pub struct ReplayHistory {
+    events: Vec<HistoryEvent>,
+    /// Workflow ID when it is known.
+    workflow_id: Option<String>,
+}
+
+impl ReplayHistory {
+    fn new(events: Vec<HistoryEvent>, workflow_id: Option<String>) -> Self {
+        Self {
+            events,
+            workflow_id,
+        }
+    }
+
+    /// The history events.
+    pub fn events(&self) -> &[HistoryEvent] {
+        &self.events
+    }
+
+    /// The history events.
+    pub fn workflow_id(&self) -> Option<&str> {
+        self.workflow_id.as_deref()
+    }
+}
+
 /// Outcome of replaying one workflow history.
 #[derive(Clone, Debug)]
 #[non_exhaustive]
 pub struct WorkflowReplayResult {
     /// History supplied to the replayer.
-    pub history: WorkflowHistory,
+    pub history: ReplayHistory,
     /// Replay failure, or `None` when the workflow code is compatible with the history.
     pub replay_failure: Option<WorkflowReplayFailure>,
 }
@@ -272,6 +301,9 @@ pub struct WorkflowReplayResult {
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum WorkflowReplayError {
+    /// Fetching a streamed workflow history failed.
+    #[error(transparent)]
+    History(#[from] WorkflowInteractionError),
     /// The replay worker could not be created or run.
     #[error(transparent)]
     Worker(#[from] WorkflowReplayWorkerError),
@@ -362,27 +394,26 @@ impl WorkflowReplayer {
             return Ok(Vec::new());
         }
 
-        let mut results = histories
-            .into_iter()
-            .map(|history| WorkflowReplayResult {
-                history,
+        let mut results = Vec::with_capacity(histories.len());
+        let mut core_histories = Vec::with_capacity(histories.len());
+        for history in histories {
+            let workflow_id = history.workflow_id().map(str::to_owned);
+            let replay_workflow_id = workflow_id
+                .as_deref()
+                .unwrap_or(DEFAULT_REPLAY_WORKFLOW_ID)
+                .to_owned();
+            let events = history.into_events().await?;
+            core_histories.push(HistoryForReplay::new(
+                History {
+                    events: events.clone(),
+                },
+                replay_workflow_id,
+            ));
+            results.push(WorkflowReplayResult {
+                history: ReplayHistory::new(events, workflow_id),
                 replay_failure: None,
-            })
-            .collect::<Vec<_>>();
-        let core_histories: Vec<_> = results
-            .iter()
-            .map(|result| {
-                HistoryForReplay::new(
-                    History {
-                        events: result.history.events().to_vec(),
-                    },
-                    result
-                        .history
-                        .workflow_id()
-                        .unwrap_or(DEFAULT_REPLAY_WORKFLOW_ID),
-                )
-            })
-            .collect();
+            });
+        }
 
         let recorded_outcomes = Arc::new(Mutex::new(Vec::new()));
         let observer = ReplayOutcomeInterceptor {

@@ -102,7 +102,7 @@ pub use tonic;
 pub use workflow_handle::{
     UntypedQuery, UntypedSignal, UntypedUpdate, UntypedWorkflow, UntypedWorkflowHandle,
     WorkflowExecutionDescription, WorkflowExecutionInfo, WorkflowExecutionResult, WorkflowHandle,
-    WorkflowHistory, WorkflowHistoryJsonError, WorkflowResultDetails, WorkflowUpdateHandle,
+    WorkflowHistory, WorkflowHistoryError, WorkflowResultDetails, WorkflowUpdateHandle,
 };
 pub use workflow_status::WorkflowExecutionStatus;
 
