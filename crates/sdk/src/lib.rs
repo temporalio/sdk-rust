@@ -942,7 +942,7 @@ impl Worker {
             activity_inbound_interceptors,
             workflow_interceptor_constructors,
         );
-        me.set_detect_nondeterministic_futures(options.detect_nondeterministic_futures);
+        me.workflow_half.detect_nondeterministic_futures = options.detect_nondeterministic_futures;
         #[cfg(feature = "experimental")]
         {
             me.workflow_half.patch_activation_callback = options.patch_activation_callback;
@@ -995,13 +995,6 @@ impl Worker {
     /// Returns the task queue name this worker polls on
     pub fn task_queue(&self) -> &str {
         &self.common.task_queue
-    }
-
-    #[doc(hidden)]
-    /// Set whether nondeterministic future detection is enabled for workflows on this worker. Users
-    /// should use [WorkerOptions] to set this. TODO: Only needs to exist due to test setup.
-    pub fn set_detect_nondeterministic_futures(&mut self, enabled: bool) {
-        self.workflow_half.detect_nondeterministic_futures = enabled;
     }
 
     /// Return a handle that can be used to initiate shutdown. This is useful because [Worker::run]

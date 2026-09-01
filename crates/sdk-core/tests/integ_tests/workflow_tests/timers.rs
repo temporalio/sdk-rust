@@ -375,10 +375,10 @@ async fn wait_condition_waker_in_futures_unordered() {
     let t = canned_histories::single_timer_wf_completes("1");
     let mock_cfg = MockPollCfg::from_hist_builder(t);
     let mut worker = crate::common::build_fake_sdk_with_options(mock_cfg, |options| {
+        // FuturesUnordered uses internal wakers that forward wake calls outside the
+        // SdkWakeGuard scope.
+        options.detect_nondeterministic_futures = false;
         options.register_workflow::<WaitConditionWakerWf>().unwrap();
     });
-    // FuturesUnordered uses internal wakers that forward wake calls outside the
-    // SdkWakeGuard scope.
-    worker.set_detect_nondeterministic_futures(false);
     worker.run().await.unwrap();
 }
