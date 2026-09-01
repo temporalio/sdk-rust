@@ -32,8 +32,9 @@ use temporalio_common_wasm::{
     },
 };
 
+#[cfg_attr(not(feature = "experimental"), allow(dead_code))]
 #[derive(Debug)]
-pub enum UnblockEvent {
+pub(crate) enum UnblockEvent {
     Timer(u32, TimerResult),
     Activity(u32, Box<ActivityResolution>),
     WorkflowStart(u32, Box<ChildWorkflowStartStatus>),
@@ -145,8 +146,9 @@ impl Unblockable for CancelExternalWfResult {
     }
 }
 
+#[cfg_attr(not(feature = "experimental"), allow(dead_code))]
 #[derive(Debug, Clone)]
-pub enum CancellableID {
+pub(crate) enum CancellableID {
     Timer(u32),
     Activity(u32),
     LocalActivity(u32),

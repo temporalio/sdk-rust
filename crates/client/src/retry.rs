@@ -252,9 +252,8 @@ pub(crate) struct CallInfo {
     retry_short_circuit: Option<NoRetryOnMatching>,
 }
 
-#[doc(hidden)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
-pub enum CallType {
+pub(crate) enum CallType {
     Normal,
     // A long poll but won't always retry timeouts/cancels. EX: Get workflow history
     UserLongPoll,

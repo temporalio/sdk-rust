@@ -38,14 +38,14 @@ mod workflow_handle;
 mod workflow_status;
 
 pub use crate::{
-    proxy::HttpConnectProxyOptions,
-    request_extensions::PayloadErrorLimits,
-    retry::{CallType, RETRYABLE_ERROR_CODES},
+    proxy::HttpConnectProxyOptions, request_extensions::PayloadErrorLimits,
+    retry::RETRYABLE_ERROR_CODES,
 };
 pub use activity::*;
 pub use async_activity_handle::{
     ActivityHeartbeatResponse, ActivityIdentifier, AsyncActivityHandle,
 };
+pub(crate) use retry::CallType;
 #[doc(hidden)]
 pub use retry::jittered;
 

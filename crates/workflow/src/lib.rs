@@ -25,8 +25,6 @@ pub mod workflow_interceptors;
 pub mod workflows;
 
 pub use cancellation::{WorkflowCancellationError, WorkflowCancellationToken};
-#[doc(hidden)]
-pub use runtime::model::{CancellableID, UnblockEvent};
 pub use runtime::model::{TimerResult, WorkflowResult, WorkflowTermination};
 #[doc(hidden)]
 pub use runtime::{SdkWakeGuard, is_sdk_wake};
