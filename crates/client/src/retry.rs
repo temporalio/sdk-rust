@@ -14,8 +14,7 @@ use std::{
 use tonic::Code;
 
 /// List of gRPC error codes that client will retry.
-#[doc(hidden)]
-pub const RETRYABLE_ERROR_CODES: [Code; 7] = [
+const RETRYABLE_ERROR_CODES: [Code; 7] = [
     Code::DataLoss,
     Code::Internal,
     Code::Unknown,
@@ -372,12 +371,25 @@ fn is_transport_cancelled(status: &tonic::Status) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{
+        Client, ClientOptions, Connection, ConnectionOptions,
+        callback_based::{CallbackBasedGrpcService, GrpcSuccessResponse},
+    };
     use assert_matches::assert_matches;
-    use std::time::Instant;
+    use prost::Message;
+    use std::{
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
+        time::Instant,
+    };
     use temporalio_common::protos::temporal::api::workflowservice::v1::{
-        PollActivityTaskQueueRequest, PollNexusTaskQueueRequest, PollWorkflowTaskQueueRequest,
+        CountWorkflowExecutionsResponse, PollActivityTaskQueueRequest, PollNexusTaskQueueRequest,
+        PollWorkflowTaskQueueRequest,
     };
     use tonic::{IntoRequest, Status};
+    use url::Url;
 
     /// Predefined retry configs with low durations to make unit tests faster
     const TEST_RETRY_CONFIG: RetryOptions = RetryOptions {
@@ -392,6 +404,49 @@ mod tests {
     const POLL_WORKFLOW_METH_NAME: &str = "poll_workflow_task_queue";
     const POLL_ACTIVITY_METH_NAME: &str = "poll_activity_task_queue";
     const POLL_NEXUS_METH_NAME: &str = "poll_nexus_task_queue";
+
+    #[tokio::test]
+    async fn retryable_errors() {
+        // Resource exhausted has a separate retry policy and is covered below.
+        for code in RETRYABLE_ERROR_CODES
+            .iter()
+            .copied()
+            .filter(|code| code != &Code::ResourceExhausted)
+        {
+            let attempts = Arc::new(AtomicUsize::new(0));
+            let callback_attempts = attempts.clone();
+            let service_override = CallbackBasedGrpcService {
+                callback: Arc::new(move |request| {
+                    assert_eq!(request.rpc, "CountWorkflowExecutions");
+                    let callback_attempts = callback_attempts.clone();
+                    Box::pin(async move {
+                        if callback_attempts.fetch_add(1, Ordering::Relaxed) < 3 {
+                            Err(Status::new(code, "retryable"))
+                        } else {
+                            Ok(GrpcSuccessResponse {
+                                headers: Default::default(),
+                                proto: CountWorkflowExecutionsResponse::default().encode_to_vec(),
+                            })
+                        }
+                    })
+                }),
+            };
+            let connection_options =
+                ConnectionOptions::new(Url::parse("http://localhost:7233").unwrap())
+                    .retry_options(TEST_RETRY_CONFIG)
+                    .skip_get_system_info(true)
+                    .service_override(service_override)
+                    .dns_load_balancing(None)
+                    .build();
+            let connection = Connection::connect(connection_options).await.unwrap();
+            let client = Client::new(connection, ClientOptions::new("ns").build()).unwrap();
+
+            let result = client.count_workflows("whatever", Default::default()).await;
+
+            assert!(result.is_ok(), "{result:?}");
+            assert_eq!(attempts.load(Ordering::Relaxed), 4);
+        }
+    }
 
     #[tokio::test]
     async fn long_poll_non_retryable_errors() {

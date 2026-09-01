@@ -21,15 +21,15 @@ use std::{
     time::Duration,
 };
 use temporalio_client::{
-    Connection, GrpcCompression, RETRYABLE_ERROR_CODES, RetryOptions, UntypedWorkflow,
-    errors::ClientConnectError, grpc::WorkflowService,
+    Connection, GrpcCompression, RetryOptions, UntypedWorkflow, errors::ClientConnectError,
+    grpc::WorkflowService,
 };
 use temporalio_common::protos::temporal::api::{
     cloud::cloudservice::v1::GetNamespaceRequest,
     workflowservice::v1::{
         DescribeNamespaceRequest, GetSystemInfoResponse, GetWorkflowExecutionHistoryRequest,
-        ListNamespacesRequest, RespondActivityTaskCanceledResponse, SignalWorkflowExecutionRequest,
-        SignalWorkflowExecutionResponse, get_system_info_response,
+        ListNamespacesRequest, SignalWorkflowExecutionRequest, SignalWorkflowExecutionResponse,
+        get_system_info_response,
     },
 };
 use tokio::{net::TcpListener, sync::oneshot};
@@ -376,47 +376,6 @@ async fn non_retryable_errors() {
         fs.header_rx.recv_many(&mut all_calls, 9999).await;
         assert_eq!(all_calls.len(), 1);
 
-        fs.shutdown().await;
-    }
-}
-
-#[tokio::test]
-async fn retryable_errors() {
-    // Take out retry exhausted since it gets a special policy which would make this take ages
-    for code in RETRYABLE_ERROR_CODES
-        .iter()
-        .copied()
-        .filter(|p| p != &Code::ResourceExhausted)
-    {
-        let count = Arc::new(AtomicUsize::new(0));
-        let mut fs = fake_server(move |_| {
-            let prev = count.fetch_add(1, Ordering::Relaxed);
-            let r = if prev < 3 {
-                Status::new(code, "bla").into_http()
-            } else {
-                make_ok_response(RespondActivityTaskCanceledResponse::default())
-            };
-            async { r }.boxed()
-        })
-        .await;
-
-        let mut opts = get_integ_server_options();
-        opts.target = format!("http://localhost:{}", fs.addr.port())
-            .parse::<url::Url>()
-            .unwrap();
-        opts.set_skip_get_system_info(true);
-        let connection = Connection::connect(opts).await.unwrap();
-        let client_opts = temporalio_client::ClientOptions::new("ns").build();
-        let client = temporalio_client::Client::new(connection, client_opts).unwrap();
-
-        let result = client.count_workflows("whatever", Default::default()).await;
-
-        // Expecting successful response after retries
-        assert!(result.is_ok(), "{:?}", result);
-        let mut all_calls = vec![];
-        fs.header_rx.recv_many(&mut all_calls, 9999).await;
-        // Should be 4 attempts
-        assert_eq!(all_calls.len(), 4);
         fs.shutdown().await;
     }
 }
