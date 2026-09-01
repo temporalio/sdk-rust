@@ -34,6 +34,9 @@ relevant information.
 ## Unreleased
 
 ### Added
+* Workflow and workflow-interceptor contexts now expose `is_read_only`, allowing shared code to
+  detect query handlers, update validators, and patch activation callbacks where workflow state
+  must not be changed.
 * `DefaultFailureConverter::new(true)` moves failure messages and stack traces into encoded
   attributes so payload codecs can encrypt them.
 * `LocalActivityOptions::include_arguments_in_marker` allows Rust workflows to opt in to

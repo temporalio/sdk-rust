@@ -47,6 +47,7 @@ struct InboundInterceptorWorkflow {
 impl InboundInterceptorWorkflow {
     #[run]
     async fn run(ctx: &mut WorkflowContext<Self>, input: String) -> WorkflowResult<String> {
+        assert!(!ctx.is_read_only());
         assert_eq!(input, "run-mutated");
         ctx.wait_condition(|state| {
             state.signal_value.is_some() && state.update_value.is_some() && state.finish
@@ -56,22 +57,25 @@ impl InboundInterceptorWorkflow {
     }
 
     #[signal]
-    fn set_signal(&mut self, _ctx: &mut SyncWorkflowContext<Self>, input: String) {
+    fn set_signal(&mut self, ctx: &mut SyncWorkflowContext<Self>, input: String) {
+        assert!(!ctx.is_read_only());
         assert_eq!(input, "signal-mutated");
         self.signal_value = Some(input);
     }
 
     #[signal]
-    fn finish(&mut self, _ctx: &mut SyncWorkflowContext<Self>) {
+    fn finish(&mut self, ctx: &mut SyncWorkflowContext<Self>) {
+        assert!(!ctx.is_read_only());
         self.finish = true;
     }
 
     #[update_validator(set_update)]
     fn validate_set_update(
         &self,
-        _ctx: &WorkflowContextView,
+        ctx: &WorkflowContextView,
         input: &str,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        assert!(ctx.is_read_only());
         assert!(input.ends_with("-validated"));
         if input.starts_with("reject") {
             Err("update rejected by validator".into())
@@ -81,14 +85,16 @@ impl InboundInterceptorWorkflow {
     }
 
     #[update]
-    fn set_update(&mut self, _ctx: &mut SyncWorkflowContext<Self>, input: String) -> String {
+    fn set_update(&mut self, ctx: &mut SyncWorkflowContext<Self>, input: String) -> String {
+        assert!(!ctx.is_read_only());
         assert_eq!(input, "update-handled");
         self.update_value = Some(input);
         "update-original-output".to_string()
     }
 
     #[query]
-    fn get_status(&self, _ctx: &WorkflowContextView, input: String) -> String {
+    fn get_status(&self, ctx: &WorkflowContextView, input: String) -> String {
+        assert!(ctx.is_read_only());
         assert_eq!(input, "query-mutated");
         "query-original-output".to_string()
     }
@@ -111,6 +117,7 @@ impl WorkflowInterceptor for MutatingWorkflowInterceptor {
         >,
     ) -> WorkflowInterceptorFuture<'a, ExecuteWorkflowResult> {
         WorkflowInterceptorFuture::new(async move {
+            assert!(!ctx.is_read_only());
             assert!(!ctx.is_replaying_history_events());
             if let Some(input) = input.input_mut::<String>() {
                 *input = "run-mutated".to_string();
@@ -137,6 +144,7 @@ impl WorkflowInterceptor for MutatingWorkflowInterceptor {
     ) -> WorkflowInterceptorFuture<'a, HandleSignalResult> {
         let signal_post_handler_done = self.signal_post_handler_done.clone();
         WorkflowInterceptorFuture::new(async move {
+            assert!(!ctx.is_read_only());
             assert!(!ctx.is_replaying_history_events());
             let should_notify_after_signal = input.name() == "set_signal";
             if let Some(input) = input.input_mut::<String>() {
@@ -163,6 +171,7 @@ impl WorkflowInterceptor for MutatingWorkflowInterceptor {
     ) -> WorkflowInterceptorFuture<'a, HandleUpdateResult> {
         assert_eq!(input.id(), "accepted-update-id");
         WorkflowInterceptorFuture::new(async move {
+            assert!(!ctx.is_read_only());
             assert!(!ctx.is_replaying_history_events());
             if let Some(input) = input.input_mut::<String>() {
                 assert_eq!(input.as_str(), "update");
@@ -184,6 +193,7 @@ impl WorkflowInterceptor for MutatingWorkflowInterceptor {
         mut input: HandleQueryInput,
         next: WorkflowNext<'_, HandleQueryInput, HandleQueryResult>,
     ) -> HandleQueryResult {
+        assert!(ctx.is_read_only());
         assert!(!input.id().is_empty());
         *self.saw_query_history_replay.lock().unwrap() = Some(ctx.is_replaying_history_events());
         if let Some(input) = input.input_mut::<String>() {
@@ -200,10 +210,11 @@ impl WorkflowInterceptor for MutatingWorkflowInterceptor {
 
     fn validate_update(
         &self,
-        _ctx: SyncWorkflowInterceptorContext,
+        ctx: SyncWorkflowInterceptorContext,
         mut input: ValidateUpdateInput,
         next: WorkflowNext<'_, ValidateUpdateInput, ValidateUpdateResult>,
     ) -> ValidateUpdateResult {
+        assert!(ctx.is_read_only());
         let expected_id = match input.input_ref::<String>().map(String::as_str) {
             Some("reject") => "rejected-update-id",
             Some("update") => "accepted-update-id",
@@ -228,7 +239,8 @@ async fn workflow_interceptors_mutate_inputs_and_replace_outputs() {
         .sdk_config
         .register_workflow::<InboundInterceptorWorkflow>()
         .unwrap()
-        .register_workflow_interceptors(vec![WorkflowInterceptorConstructor::new(move |_| {
+        .register_workflow_interceptors(vec![WorkflowInterceptorConstructor::new(move |ctx| {
+            assert!(!ctx.is_read_only());
             MutatingWorkflowInterceptor {
                 signal_post_handler_done: signal_post_handler_done_ref.clone(),
                 saw_query_history_replay: saw_query_history_replay_ref.clone(),
@@ -336,6 +348,7 @@ impl AllHandlersFinishedWorkflow {
 
     #[signal]
     async fn async_signal(ctx: &mut WorkflowContext<Self>) {
+        assert!(!ctx.is_read_only());
         ctx.state_mut(|state| state.handler_started = true);
     }
 
@@ -345,9 +358,10 @@ impl AllHandlersFinishedWorkflow {
     #[update_validator(async_update)]
     fn validate_async_update(
         &self,
-        _ctx: &WorkflowContextView,
+        ctx: &WorkflowContextView,
         reject: &bool,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        assert!(ctx.is_read_only());
         if *reject {
             Err("rejected by validator".into())
         } else {
@@ -357,6 +371,7 @@ impl AllHandlersFinishedWorkflow {
 
     #[update]
     async fn async_update(ctx: &mut WorkflowContext<Self>, _reject: bool) {
+        assert!(!ctx.is_read_only());
         ctx.state_mut(|state| state.handler_started = true);
     }
 }

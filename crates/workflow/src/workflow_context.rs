@@ -241,6 +241,7 @@ impl PatchActivationCaller {
                 run_id,
                 init,
                 payload_converter,
+                true,
             ),
         }
     }
@@ -394,6 +395,19 @@ impl BaseWorkflowContext {
         self.inner.shared.borrow().is_replaying_history_events
     }
 
+    /// Reports whether the current workflow code is executing in a read-only context.
+    pub fn is_read_only(&self) -> bool {
+        self.inner.is_read_only.get()
+    }
+
+    pub(crate) fn enter_read_only(&self) -> ReadOnlyGuard {
+        let previous = self.inner.is_read_only.replace(true);
+        ReadOnlyGuard {
+            base: self.clone(),
+            previous,
+        }
+    }
+
     /// Returns the payload converter used by the worker running this workflow.
     pub fn payload_converter(&self) -> &PayloadConverter {
         self.inner.data_converter.payload_converter()
@@ -455,6 +469,7 @@ impl BaseWorkflowContext {
             self.inner.run_id.clone(),
             initial_information,
             self.inner.data_converter.payload_converter().clone(),
+            self.is_read_only(),
         )
     }
 }
@@ -563,6 +578,7 @@ struct WorkflowContextInner {
     patch_activation_callback: Option<PatchActivationCallback>,
     state_mutated: Cell<bool>,
     active_handlers: Cell<usize>,
+    is_read_only: Cell<bool>,
     condition_wakers: RefCell<Vec<Waker>>,
     current_waker: RefCell<Option<Waker>>,
     workflow_interceptors: Rc<[Arc<dyn WorkflowInterceptor>]>,
@@ -570,6 +586,17 @@ struct WorkflowContextInner {
 
 pub(crate) struct HandlerExecutionGuard {
     base: BaseWorkflowContext,
+}
+
+pub(crate) struct ReadOnlyGuard {
+    base: BaseWorkflowContext,
+    previous: bool,
+}
+
+impl Drop for ReadOnlyGuard {
+    fn drop(&mut self) {
+        self.base.inner.is_read_only.set(self.previous);
+    }
 }
 
 impl Drop for HandlerExecutionGuard {
@@ -675,6 +702,7 @@ impl BaseWorkflowContext {
             run_id,
             initialize_workflow,
             data_converter.payload_converter().clone(),
+            false,
         );
         let workflow_interceptors = workflow_interceptor_constructors
             .into_iter()
@@ -719,6 +747,7 @@ impl BaseWorkflowContext {
                 patch_activation_callback,
                 state_mutated: Cell::new(false),
                 active_handlers: Cell::new(0),
+                is_read_only: Cell::new(false),
                 condition_wakers: Default::default(),
                 current_waker: RefCell::new(None),
                 workflow_interceptors,
@@ -1499,6 +1528,14 @@ impl<W> SyncWorkflowContext<W> {
         self.base.inner.shared.borrow().is_replaying_history_events
     }
 
+    /// Reports whether the current workflow code is executing in a read-only context.
+    ///
+    /// This is true in query handlers and update validators, and false during normal workflow,
+    /// signal-handler, and update-handler execution.
+    pub fn is_read_only(&self) -> bool {
+        self.base.is_read_only()
+    }
+
     /// Returns whether all currently dispatched signal and update handlers have finished.
     ///
     /// This includes the current handler invocation, if any, and all inbound interceptor work.
@@ -1729,6 +1766,7 @@ impl<W> SyncWorkflowContext<W> {
         let res = if deprecated || replaying || notified {
             !replaying || notified
         } else if let Some(callback) = &self.base.inner.patch_activation_callback {
+            let _read_only = self.base.enter_read_only();
             callback(PatchActivationInput {
                 workflow_info: self.base.view(),
                 patch_id: patch_id.to_string(),
@@ -1988,6 +2026,13 @@ impl<W> WorkflowContext<W> {
     /// Returns true if the current work is replaying history events
     pub fn is_replaying_history_events(&self) -> bool {
         self.sync.is_replaying_history_events()
+    }
+
+    /// Reports whether the current workflow code is executing in a read-only context.
+    ///
+    /// See [`SyncWorkflowContext::is_read_only`].
+    pub fn is_read_only(&self) -> bool {
+        self.sync.is_read_only()
     }
 
     /// Returns whether all currently dispatched signal and update handlers have finished.
@@ -3821,6 +3866,7 @@ mod tests {
         let callback_calls = calls.clone();
         let callback_input = input.clone();
         let callback: PatchActivationCallback = Arc::new(move |value| {
+            assert!(value.workflow_info.is_read_only());
             callback_calls.fetch_add(1, AtomicOrdering::Relaxed);
             *callback_input.lock().unwrap() = Some(value);
             true
@@ -3828,6 +3874,7 @@ mod tests {
         let (_, ctx, commands) = patch_test_context(Some(callback));
 
         assert!(ctx.patched("my-patch"));
+        assert!(!ctx.is_read_only());
         assert!(ctx.patched("my-patch"));
         assert_eq!(calls.load(AtomicOrdering::Relaxed), 1);
         assert_eq!(commands.borrow().len(), 1);

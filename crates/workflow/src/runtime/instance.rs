@@ -615,6 +615,7 @@ where
             let validation_input =
                 ValidateUpdateInput::new(id.clone(), name.clone(), decoded_input, headers.clone());
             let guard = self.base_ctx.track_handler();
+            let _read_only = self.base_ctx.enter_read_only();
             let validation_ctx = SyncWorkflowInterceptorContext::new(self.base_ctx.clone());
             let workflow_ctx = self.ctx.clone();
             let validation_next = WorkflowNext::new(move |input: ValidateUpdateInput| {
@@ -721,6 +722,7 @@ where
             decoded_input,
             query.headers,
         );
+        let _read_only = self.base_ctx.enter_read_only();
         let interceptor_ctx = SyncWorkflowInterceptorContext::new(self.base_ctx.clone());
         let workflow_ctx = self.ctx.clone();
         let query_next = WorkflowNext::new(move |input: HandleQueryInput| {
