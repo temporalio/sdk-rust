@@ -1,5 +1,11 @@
 use crate::common::{CoreWfStarter, SEARCH_ATTR_TXT};
-use std::{sync::Arc, time::Duration};
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Duration,
+};
 use temporalio_client::WorkflowStartOptions;
 use temporalio_common::{
     protos::temporal::api::{
@@ -58,6 +64,62 @@ async fn continue_as_new_happy_path() {
         .await
         .unwrap();
     worker.run_until_done().await.unwrap();
+}
+
+#[workflow]
+struct ContinueAsNewRandomWf {
+    saw_independent_stream: Arc<AtomicBool>,
+}
+
+#[workflow_methods(factory_only)]
+impl ContinueAsNewRandomWf {
+    #[run]
+    async fn run(
+        ctx: &mut WorkflowContext<Self>,
+        (run, previous_value): (u8, Option<u64>),
+    ) -> WorkflowResult<()> {
+        let value = ctx.random_stream("continue-as-new-test").random::<u64>();
+        if run == 1 {
+            ctx.continue_as_new((2, Some(value)), ContinueAsNewOptions::default())?;
+        } else {
+            ctx.state(|wf| {
+                assert_ne!(
+                    value,
+                    previous_value.expect("first run should pass its stream value"),
+                    "continue-as-new should independently seed named streams"
+                );
+                wf.saw_independent_stream.store(true, Ordering::Relaxed);
+            });
+        }
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn continue_as_new_reseeds_named_random_streams() {
+    let wf_name = "continue_as_new_reseeds_named_random_streams";
+    let mut starter = CoreWfStarter::new(wf_name);
+    let saw_independent_stream = Arc::new(AtomicBool::new(false));
+    let saw_independent_stream_for_wf = saw_independent_stream.clone();
+    starter
+        .sdk_config
+        .register_workflow_with_factory(move || ContinueAsNewRandomWf {
+            saw_independent_stream: saw_independent_stream_for_wf.clone(),
+        })
+        .unwrap();
+    let mut worker = starter.worker().await;
+
+    let task_queue = starter.get_task_queue().to_owned();
+    worker
+        .submit_workflow(
+            ContinueAsNewRandomWf::run,
+            (1, None),
+            WorkflowStartOptions::new(task_queue, wf_name).build(),
+        )
+        .await
+        .unwrap();
+    worker.run_until_done().await.unwrap();
+    assert!(saw_independent_stream.load(Ordering::Relaxed));
 }
 
 #[tokio::test]

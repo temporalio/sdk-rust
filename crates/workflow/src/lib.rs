@@ -45,7 +45,7 @@ pub use workflow_context::{
     StartChildWorkflowExecutionFailedCause, StartChildWorkflowOutput, StartedChildWorkflow,
     StartedNexusOperation, SyncWorkflowContext, TimerOptions, VersioningIntent,
     WaitConditionOptions, WorkflowContext, WorkflowContextView, WorkflowIdReusePolicy,
-    WorkflowRandomValue,
+    WorkflowRandomStream, WorkflowRandomValue,
 };
 #[doc(hidden)]
 pub use workflow_context::{PatchActivationCallback, PatchActivationCaller};

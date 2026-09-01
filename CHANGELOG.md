@@ -37,6 +37,11 @@ relevant information.
 * `DefaultFailureConverter::new(true)` moves failure messages and stack traces into encoded
   attributes so payload codecs can encrypt them.
 * `LocalActivityOptions::include_arguments_in_marker` allows Rust workflows to opt in to
+* `WorkflowContext::random_stream`, `SyncWorkflowContext::random_stream`, and
+  `WorkflowInterceptorContext::random_stream` provide deterministic, workflow-run-scoped
+  pseudo-random streams isolated by a stable caller-supplied name. Repeated lookup continues a
+  named stream without consuming the workflow's default randomness or any other named stream.
+* `LocalActivityOptions::include_arguments_into_marker` allows Rust workflows to opt in to
   recording local activity arguments in Workflow history.
 * `WorkflowHandle::get_update_handle` creates a typed handle for an existing Workflow Update from
   its update ID, allowing callers to wait for the result independently of the original handle.

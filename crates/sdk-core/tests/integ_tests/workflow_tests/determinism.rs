@@ -152,7 +152,15 @@ struct RandomReplayWf;
 impl RandomReplayWf {
     #[run]
     async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<String> {
-        Ok(format!("{}:{}", ctx.random::<u64>(), ctx.uuid4()))
+        let orders = ctx.random_stream("example.com/orders");
+        let first_order = orders.random::<u64>();
+        let _ = ctx.random_stream("example.com/telemetry").random::<u64>();
+        let second_order = ctx.random_stream("example.com/orders").random::<u64>();
+        Ok(format!(
+            "{}:{}:{first_order}:{second_order}",
+            ctx.random::<u64>(),
+            ctx.uuid4()
+        ))
     }
 }
 

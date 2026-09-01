@@ -45,10 +45,12 @@ use futures_util::{
 };
 use rand::SeedableRng;
 use rand_pcg::Pcg64Mcg;
+use siphasher::sip::SipHasher13;
 use std::{
     cell::{Cell, RefCell},
     collections::{HashMap, HashSet},
     future::{self, Future},
+    hash::Hasher,
     marker::PhantomData,
     pin::Pin,
     rc::Rc,
@@ -138,6 +140,57 @@ macro_rules! impl_random_value {
 }
 
 impl_random_value!(u8, u16, u32, u64, u128, i8, i16, i32, i64, i128, f32, f64);
+
+/// A deterministic pseudo-random stream private to a stable caller-supplied name.
+///
+/// Obtain a stream with [`WorkflowContext::random_stream`],
+/// [`SyncWorkflowContext::random_stream`], or
+/// [`crate::workflow_interceptors::WorkflowInterceptorContext::random_stream`]. Looking up the
+/// same name again continues the same stream, while different names and the context's default
+/// [`WorkflowContext::random`] stream do not consume one another. Clones of this value refer to the
+/// same named stream.
+///
+/// Draws advance workflow state without recording individual values in history, so replaying code
+/// must draw from a given name in the same order. Adding or removing draws from one name does not
+/// change any other name.
+///
+/// Workflow reset replays the original sequence through the reset point. When Core supplies the
+/// reset run's new randomness seed, all named streams start new sequences for work after that
+/// point. Continue-as-new creates a new workflow run and independently seeds all streams.
+///
+/// Random streams are deliberately unavailable from [`WorkflowContextView`], which is used by
+/// read-only init, query, and update-validator handlers.
+#[derive(Clone)]
+pub struct WorkflowRandomStream {
+    base: BaseWorkflowContext,
+    name: String,
+}
+
+impl WorkflowRandomStream {
+    /// Generates the next deterministic pseudo-random value from this named stream.
+    ///
+    /// This generator is not cryptographically secure.
+    pub fn random<T>(&self) -> T
+    where
+        T: WorkflowRandomValue,
+    {
+        self.base.named_random(&self.name)
+    }
+
+    /// Returns the stable name associated with this stream.
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+}
+
+fn named_random_seed(randomness_seed: u64, name: &str) -> u64 {
+    // Fixed keys and explicit byte writes keep stream derivation stable across Rust versions.
+    let mut hasher =
+        SipHasher13::new_with_keys(randomness_seed, randomness_seed ^ 0x7465_6d70_6f72_616c);
+    hasher.write(b"temporal-rust-workflow-random-stream\0");
+    hasher.write(name.as_bytes());
+    hasher.finish()
+}
 
 /// Non-generic base context containing all workflow execution infrastructure.
 ///
@@ -235,6 +288,8 @@ impl BaseWorkflowContext {
             _ => None,
         }) {
             shared.random = Pcg64Mcg::seed_from_u64(seed);
+            shared.randomness_seed = seed;
+            shared.named_random.clear();
         }
     }
 
@@ -244,6 +299,26 @@ impl BaseWorkflowContext {
     {
         let random = &mut self.inner.shared.borrow_mut().random;
         <T as private::Sealed>::sample(random)
+    }
+
+    fn named_random<T>(&self, name: &str) -> T
+    where
+        T: WorkflowRandomValue,
+    {
+        let mut shared = self.inner.shared.borrow_mut();
+        let seed = shared.randomness_seed;
+        let random = shared
+            .named_random
+            .entry(name.to_owned())
+            .or_insert_with(|| Pcg64Mcg::seed_from_u64(named_random_seed(seed, name)));
+        <T as private::Sealed>::sample(random)
+    }
+
+    pub(crate) fn random_stream(&self, name: impl Into<String>) -> WorkflowRandomStream {
+        WorkflowRandomStream {
+            base: self.clone(),
+            name: name.into(),
+        }
     }
 
     fn uuid4(&self) -> String {
@@ -612,6 +687,8 @@ impl BaseWorkflowContext {
                 run_id,
                 shared: RefCell::new(WorkflowContextSharedData {
                     random: Pcg64Mcg::seed_from_u64(init_workflow_job.randomness_seed),
+                    randomness_seed: init_workflow_job.randomness_seed,
+                    named_random: HashMap::new(),
                     memo: init_workflow_job.memo.clone().unwrap_or_default(),
                     search_attributes: init_workflow_job
                         .search_attributes
@@ -1445,6 +1522,25 @@ impl<W> SyncWorkflowContext<W> {
         self.base.uuid4()
     }
 
+    /// Returns the deterministic pseudo-random stream associated with `name`.
+    ///
+    /// Repeated lookup of the same name continues the prior stream. Different names are isolated
+    /// from one another and from [`Self::random`]. Keep the name stable across workflow replays.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # use temporalio_workflow::{SyncWorkflowContext, WorkflowRandomStream};
+    /// # fn choose<W>(ctx: &SyncWorkflowContext<W>) {
+    /// let stream: WorkflowRandomStream = ctx.random_stream("example.com/orders/tiebreaker");
+    /// let choice = stream.random::<u64>();
+    /// # let _ = choice;
+    /// # }
+    /// ```
+    pub fn random_stream(&self, name: impl Into<String>) -> WorkflowRandomStream {
+        self.base.random_stream(name)
+    }
+
     /// Returns true if the current workflow task is happening under replay
     pub fn is_replaying(&self) -> bool {
         self.base.inner.shared.borrow().activation.is_replaying
@@ -1936,6 +2032,13 @@ impl<W> WorkflowContext<W> {
         self.sync.uuid4()
     }
 
+    /// Returns the deterministic pseudo-random stream associated with `name`.
+    ///
+    /// See [`SyncWorkflowContext::random_stream`].
+    pub fn random_stream(&self, name: impl Into<String>) -> WorkflowRandomStream {
+        self.sync.random_stream(name)
+    }
+
     /// Returns true if the current workflow task is happening under replay
     pub fn is_replaying(&self) -> bool {
         self.sync.is_replaying()
@@ -2296,6 +2399,8 @@ struct WorkflowContextSharedData {
     is_replaying_history_events: bool,
     search_attributes: ProtoSearchAttributes,
     random: Pcg64Mcg,
+    randomness_seed: u64,
+    named_random: HashMap<String, Pcg64Mcg>,
     /// Current details string, surfaced via the workflow metadata query.
     current_details: String,
 }
@@ -3914,6 +4019,93 @@ mod tests {
         ctx.sync.base.apply_activation_context(&activation, false);
 
         assert_eq!(ctx.random::<u64>(), expected);
+    }
+
+    #[test]
+    fn named_random_lookup_continues_the_same_stream() {
+        let ctx = test_context_with_seed(42);
+        let first_lookup = ctx.random_stream("orders");
+        let first = first_lookup.random::<u64>();
+        let second = ctx.random_stream("orders").random::<u64>();
+
+        let expected = test_context_with_seed(42).random_stream("orders");
+        assert_eq!(first, expected.random::<u64>());
+        assert_eq!(second, expected.random::<u64>());
+    }
+
+    #[test]
+    fn named_random_sequence_is_stable() {
+        let stream = test_context_with_seed(42).random_stream("example.com/orders");
+
+        // Changing seed derivation or the generator would break existing workflow replays.
+        assert_eq!(stream.random::<u64>(), 18_054_372_068_998_079_507);
+    }
+
+    #[test]
+    fn named_random_streams_are_isolated() {
+        let ctx = test_context_with_seed(42);
+        let alpha = ctx.random_stream("alpha");
+        let first_alpha = alpha.random::<u64>();
+        let _ = ctx.random_stream("beta").random::<u64>();
+        let second_alpha = alpha.random::<u64>();
+
+        let expected_ctx = test_context_with_seed(42);
+        let expected_alpha = expected_ctx.random_stream("alpha");
+        assert_eq!(first_alpha, expected_alpha.random::<u64>());
+        assert_eq!(second_alpha, expected_alpha.random::<u64>());
+        assert_ne!(
+            test_context_with_seed(42)
+                .random_stream("alpha")
+                .random::<u64>(),
+            test_context_with_seed(42)
+                .random_stream("beta")
+                .random::<u64>()
+        );
+    }
+
+    #[test]
+    fn named_random_does_not_advance_default_randomness() {
+        let ctx = test_context_with_seed(42);
+        let first = ctx.random::<u64>();
+        let _ = ctx.random_stream("plugin").random::<u64>();
+        let second = ctx.random::<u64>();
+
+        let expected = test_context_with_seed(42);
+        assert_eq!(first, expected.random::<u64>());
+        assert_eq!(second, expected.random::<u64>());
+    }
+
+    #[test]
+    fn interceptor_context_shares_named_random_stream_state() {
+        let ctx = test_context_with_seed(42);
+        let first = ctx.random_stream("plugin").random::<u64>();
+        let interceptor_ctx =
+            crate::workflow_interceptors::WorkflowInterceptorContext::new(ctx.sync.base.clone());
+        let second = interceptor_ctx.random_stream("plugin").random::<u64>();
+
+        let expected = test_context_with_seed(42).random_stream("plugin");
+        assert_eq!(first, expected.random::<u64>());
+        assert_eq!(second, expected.random::<u64>());
+    }
+
+    #[test]
+    fn named_random_streams_are_reseeded_by_activation() {
+        let ctx = test_context_with_seed(123);
+        let stream = ctx.random_stream("orders");
+        let _ = stream.random::<u64>();
+        let activation = CoreWorkflowActivation {
+            jobs: vec![WorkflowActivationJob {
+                variant: Some(ActivationVariant::UpdateRandomSeed(UpdateRandomSeed {
+                    randomness_seed: 456,
+                })),
+            }],
+            ..Default::default()
+        };
+
+        ctx.sync.base.apply_activation_context(&activation, false);
+
+        let expected = test_context_with_seed(456).random_stream("orders");
+        assert_eq!(stream.random::<u64>(), expected.random::<u64>());
     }
 
     struct MutatingRemainingOutboundInterceptor;

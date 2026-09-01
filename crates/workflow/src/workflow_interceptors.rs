@@ -86,6 +86,7 @@ use crate::{
     ChildWorkflowOptions, ContinueAsNewOptions, ExternalWorkflowHandle, LocalActivityOptions,
     NexusOperationOptions, SignalWorkflowOptions, StartChildWorkflowOutput, StartedChildWorkflow,
     StartedNexusOperation, TimerOptions, WorkflowCancellationToken, WorkflowContextView,
+    WorkflowRandomStream,
     cancellation::WorkflowCancellationRegistration,
     runtime::{
         entry::WorkflowError,
@@ -335,6 +336,16 @@ impl WorkflowInterceptorContext {
     /// Return the workflow's root cancellation token.
     pub fn cancellation_token(&self) -> WorkflowCancellationToken {
         self.base.cancellation_token()
+    }
+
+    /// Returns the deterministic pseudo-random stream associated with `name`.
+    ///
+    /// Named streams let interceptors consume replay-safe randomness without changing the
+    /// workflow's default random sequence or another interceptor's named sequence. Query and
+    /// update-validator interceptors receive [`SyncWorkflowInterceptorContext`], which does not
+    /// expose random streams because those handlers are read-only.
+    pub fn random_stream(&self, name: impl Into<String>) -> WorkflowRandomStream {
+        self.base.random_stream(name)
     }
 
     /// Request to create a timer through the workflow outbound interceptor chain.
