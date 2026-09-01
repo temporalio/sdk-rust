@@ -1544,9 +1544,9 @@ impl From<&ClientDnsLoadBalancingOptions> for temporalio_client::DnsLoadBalancin
     }
 }
 
-impl From<&ClientHttpConnectProxyOptions> for temporalio_client::proxy::HttpConnectProxyOptions {
+impl From<&ClientHttpConnectProxyOptions> for temporalio_client::HttpConnectProxyOptions {
     fn from(opts: &ClientHttpConnectProxyOptions) -> Self {
-        temporalio_client::proxy::HttpConnectProxyOptions::new(opts.target_host.to_string())
+        temporalio_client::HttpConnectProxyOptions::new(opts.target_host.to_string())
             .maybe_basic_auth(if opts.username.size != 0 && opts.password.size != 0 {
                 Some((opts.username.to_string(), opts.password.to_string()))
             } else {

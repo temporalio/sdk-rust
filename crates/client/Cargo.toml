@@ -71,6 +71,8 @@ features = ["serde_serialize"]
 
 [dev-dependencies]
 assert_matches = "1"
+hyper = { version = "1.7.0", features = ["http1", "server"] }
+hyper-util = { version = "0.1.16", features = ["http1", "server", "tokio"] }
 mockall = "0.14"
 prost = "0.14"
 prost-types = { workspace = true }
@@ -86,6 +88,8 @@ tokio = { version = "1.47", default-features = false, features = [
   "sync",
   "time",
 ] }
+tokio-stream = { version = "0.1", default-features = false, features = ["net"] }
+tonic = { workspace = true, default-features = false, features = ["router", "server"] }
 trybuild = { version = "1.0", features = ["diff"] }
 
 [lints]

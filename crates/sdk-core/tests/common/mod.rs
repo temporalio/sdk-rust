@@ -3,7 +3,6 @@
 
 pub(crate) mod activity_functions;
 pub(crate) mod fake_grpc_server;
-pub(crate) mod http_proxy;
 pub(crate) mod workflows;
 
 use anyhow::bail;

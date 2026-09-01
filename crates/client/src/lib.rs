@@ -24,9 +24,7 @@ mod options_structs;
 #[cfg(feature = "experimental")]
 /// Experimental APIs for configuring clients with reusable plugins.
 pub mod plugins;
-/// Visible only for tests
-#[doc(hidden)]
-pub mod proxy;
+mod proxy;
 mod replaceable;
 pub mod request_extensions;
 mod retry;

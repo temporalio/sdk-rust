@@ -108,9 +108,7 @@ impl Service<hyper::Uri> for OverrideAddrConnector {
     }
 }
 
-/// Visible only for tests
-#[doc(hidden)]
-pub enum ProxyStream {
+enum ProxyStream {
     Tcp(TcpStream),
     #[cfg(unix)]
     Unix(UnixStream),
@@ -234,11 +232,214 @@ fn ensure_connect_authority_port(uri: tonic::transport::Uri) -> tonic::transport
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{HttpConnectProxyOptions, ProxyStream};
+    use crate::{
+        Client, ClientOptions, Connection as TemporalConnection, ConnectionOptions, RetryOptions,
+        grpc::WorkflowService,
+    };
+    use base64::prelude::*;
+    use futures_util::{FutureExt, future::BoxFuture};
+    use http::{Request, Response};
+    use http_body_util::Empty;
+    use hyper::{
+        body::{Bytes, Incoming},
+        server::conn::http1,
+        service::service_fn,
+    };
+    use hyper_util::rt::TokioIo;
+    use std::{
+        convert::Infallible,
+        io,
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
+        task::{Context, Poll},
+    };
+    use temporalio_common::protos::temporal::api::workflowservice::v1::ListNamespacesRequest;
+    #[cfg(unix)]
+    use tokio::net::UnixListener;
     use tokio::{
         io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
-        net::TcpListener,
+        net::{TcpListener, TcpStream},
+        sync::oneshot,
     };
+    use tokio_stream::wrappers::TcpListenerStream;
+    use tonic::{IntoRequest, body::Body, server::NamedService, transport::Server};
+    use tower::Service;
+    use tracing::warn;
+    use url::Url;
+
+    #[derive(Clone)]
+    struct FakeWorkflowService<F>(F);
+
+    impl<F> Service<Request<Body>> for FakeWorkflowService<F>
+    where
+        F: FnMut(Request<Body>) -> BoxFuture<'static, Response<Body>>,
+    {
+        type Response = Response<Body>;
+        type Error = Infallible;
+        type Future = BoxFuture<'static, Result<Self::Response, Self::Error>>;
+
+        fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn call(&mut self, request: Request<Body>) -> Self::Future {
+            let response = (self.0)(request);
+            async move { Ok(response.await) }.boxed()
+        }
+    }
+
+    impl<F> NamedService for FakeWorkflowService<F> {
+        const NAME: &'static str = "temporal.api.workflowservice.v1.WorkflowService";
+    }
+
+    struct FakeServer {
+        addr: std::net::SocketAddr,
+        shutdown_tx: oneshot::Sender<()>,
+    }
+
+    async fn fake_server<F>(response_maker: F) -> FakeServer
+    where
+        F: FnMut(Request<Body>) -> BoxFuture<'static, Response<Body>>
+            + Clone
+            + Send
+            + Sync
+            + 'static,
+    {
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let listener = TcpListener::bind("[::]:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            Server::builder()
+                .add_service(FakeWorkflowService(response_maker))
+                .serve_with_incoming_shutdown(TcpListenerStream::new(listener), async move {
+                    let _ = shutdown_rx.await;
+                })
+                .await
+                .unwrap();
+        });
+        FakeServer { addr, shutdown_tx }
+    }
+
+    struct HttpProxy {
+        proxy_hits: Arc<AtomicUsize>,
+        shutdown_tx: oneshot::Sender<()>,
+    }
+
+    impl HttpProxy {
+        fn spawn_tcp(listener: TcpListener) -> Self {
+            Self::spawn(ProxyListener::Tcp(listener))
+        }
+
+        #[cfg(unix)]
+        fn spawn_unix(listener: UnixListener) -> Self {
+            Self::spawn(ProxyListener::Unix(listener))
+        }
+
+        fn spawn(listener: ProxyListener) -> Self {
+            let (shutdown_tx, mut shutdown_rx) = oneshot::channel();
+            let proxy_hits = Arc::new(AtomicUsize::new(0));
+            let proxy_hits_for_task = proxy_hits.clone();
+            tokio::spawn(async move {
+                loop {
+                    let proxy_hits = proxy_hits_for_task.clone();
+                    tokio::select! {
+                        _ = &mut shutdown_rx => break,
+                        stream = listener.accept() => {
+                            let stream = match stream {
+                                Ok(stream) => stream,
+                                Err(error) => {
+                                    warn!(%error, "Proxy accept failed");
+                                    continue;
+                                }
+                            };
+                            tokio::spawn(async move {
+                                if let Err(error) = http1::Builder::new()
+                                    .serve_connection(
+                                        TokioIo::new(stream),
+                                        service_fn(move |request| {
+                                            handle_connect(request, proxy_hits.clone())
+                                        }),
+                                    )
+                                    .with_upgrades()
+                                    .await
+                                {
+                                    warn!(%error, "Proxy connection failed");
+                                }
+                            });
+                        }
+                    }
+                }
+            });
+            Self {
+                proxy_hits,
+                shutdown_tx,
+            }
+        }
+
+        fn hit_count(&self) -> usize {
+            self.proxy_hits.load(Ordering::SeqCst)
+        }
+
+        fn shutdown(self) {
+            let _ = self.shutdown_tx.send(());
+        }
+    }
+
+    async fn handle_connect(
+        request: Request<Incoming>,
+        counter: Arc<AtomicUsize>,
+    ) -> Result<Response<Empty<Bytes>>, hyper::Error> {
+        if request.method() != hyper::Method::CONNECT {
+            return Ok(Response::builder()
+                .status(hyper::StatusCode::METHOD_NOT_ALLOWED)
+                .body(Empty::new())
+                .unwrap());
+        }
+
+        counter.fetch_add(1, Ordering::SeqCst);
+        tokio::spawn(async move {
+            if let Some(addr) = request
+                .uri()
+                .authority()
+                .map(|authority| authority.as_str())
+                && let Ok(mut server_stream) = TcpStream::connect(addr).await
+                && let Ok(upgraded) = hyper::upgrade::on(request).await
+            {
+                let mut upgraded = TokioIo::new(upgraded);
+                let _ = tokio::io::copy_bidirectional(&mut upgraded, &mut server_stream).await;
+            }
+        });
+
+        Ok(Response::builder()
+            .status(hyper::StatusCode::OK)
+            .body(Empty::new())
+            .unwrap())
+    }
+
+    enum ProxyListener {
+        Tcp(TcpListener),
+        #[cfg(unix)]
+        Unix(UnixListener),
+    }
+
+    impl ProxyListener {
+        async fn accept(&self) -> io::Result<ProxyStream> {
+            match self {
+                ProxyListener::Tcp(listener) => listener
+                    .accept()
+                    .await
+                    .map(|(stream, _)| ProxyStream::Tcp(stream)),
+                #[cfg(unix)]
+                ProxyListener::Unix(listener) => listener
+                    .accept()
+                    .await
+                    .map(|(stream, _)| ProxyStream::Unix(stream)),
+            }
+        }
+    }
 
     struct CapturedConnect {
         request_line: String,
@@ -310,5 +511,78 @@ mod tests {
             auth_header.trim(),
             format!("proxy-authorization: Basic {creds}")
         );
+    }
+
+    #[tokio::test]
+    async fn connection_uses_http_connect_proxy() {
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let call_count_for_server = call_count.clone();
+        let server = fake_server(move |_| {
+            call_count_for_server.fetch_add(1, Ordering::SeqCst);
+            async { Response::new(Body::empty()) }.boxed()
+        })
+        .await;
+
+        let tcp_proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let tcp_proxy_addr = tcp_proxy_listener.local_addr().unwrap();
+        let tcp_proxy = HttpProxy::spawn_tcp(tcp_proxy_listener);
+
+        let mut options = ConnectionOptions::new(
+            Url::parse(&format!("http://[::1]:{}", server.addr.port())).unwrap(),
+        )
+        .retry_options(RetryOptions::no_retries())
+        .skip_get_system_info(true)
+        .build();
+
+        let connection = TemporalConnection::connect(options.clone()).await.unwrap();
+        let client_options = ClientOptions::new("my-namespace").build();
+        let client = Client::new(connection, client_options).unwrap();
+        let _ = WorkflowService::list_namespaces(
+            &mut client.clone(),
+            ListNamespacesRequest::default().into_request(),
+        )
+        .await;
+        assert_eq!(call_count.load(Ordering::SeqCst), 1);
+        assert_eq!(tcp_proxy.hit_count(), 0);
+
+        options.http_connect_proxy =
+            Some(HttpConnectProxyOptions::new(tcp_proxy_addr.to_string()).build());
+        options.dns_load_balancing = None;
+        let connection = TemporalConnection::connect(options.clone()).await.unwrap();
+        let client_options = ClientOptions::new("my-namespace").build();
+        let proxied_client = Client::new(connection, client_options).unwrap();
+        let _ = WorkflowService::list_namespaces(
+            &mut proxied_client.clone(),
+            ListNamespacesRequest::default().into_request(),
+        )
+        .await;
+        assert_eq!(call_count.load(Ordering::SeqCst), 2);
+        assert_eq!(tcp_proxy.hit_count(), 1);
+
+        #[cfg(unix)]
+        {
+            let socket_dir = tempfile::tempdir().unwrap();
+            let socket_path = socket_dir.path().join("http-proxy.sock");
+            let unix_proxy = HttpProxy::spawn_unix(UnixListener::bind(&socket_path).unwrap());
+
+            options.http_connect_proxy = Some(
+                HttpConnectProxyOptions::new(format!("unix:{}", socket_path.display())).build(),
+            );
+            let connection = TemporalConnection::connect(options).await.unwrap();
+            let client_options = ClientOptions::new("my-namespace").build();
+            let proxied_client = Client::new(connection, client_options).unwrap();
+            let _ = WorkflowService::list_namespaces(
+                &mut proxied_client.clone(),
+                ListNamespacesRequest::default().into_request(),
+            )
+            .await;
+            assert_eq!(call_count.load(Ordering::SeqCst), 3);
+            assert_eq!(unix_proxy.hit_count(), 1);
+
+            unix_proxy.shutdown();
+        }
+
+        let _ = server.shutdown_tx.send(());
+        tcp_proxy.shutdown();
     }
 }
