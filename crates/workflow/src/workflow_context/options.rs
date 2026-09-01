@@ -286,10 +286,9 @@ pub struct ActivityOptions {
     pub do_not_eagerly_execute: bool,
     /// Event group markers to attach to the resulting `ScheduleActivityTask` command.
     ///
-    /// **Unstable:** Event Groups are not yet implemented in the Rust SDK; this field exists
-    /// only for internal test purposes. This API *will* change.
+    /// **Experimental:** Event Groups are not yet fully supported by the Rust SDK. This API may
+    /// change.
     #[cfg(feature = "experimental")]
-    #[doc(hidden)]
     #[builder(default)]
     pub event_group_markers: Vec<EventGroupMarker>,
 }
@@ -419,10 +418,9 @@ pub struct LocalActivityOptions {
     pub summary: Option<String>,
     /// Event group markers to attach to the resulting `RecordMarker` command.
     ///
-    /// **Unstable:** Event Groups are not yet implemented in the Rust SDK; this field exists
-    /// only for internal test purposes. This API *will* change.
+    /// **Experimental:** Event Groups are not yet fully supported by the Rust SDK. This API may
+    /// change.
     #[cfg(feature = "experimental")]
-    #[doc(hidden)]
     #[builder(default)]
     pub event_group_markers: Vec<EventGroupMarker>,
 }
@@ -520,10 +518,9 @@ pub struct ChildWorkflowOptions {
     pub priority: Option<Priority>,
     /// Event group markers to attach to the resulting `StartChildWorkflowExecution` command.
     ///
-    /// **Unstable:** Event Groups are not yet implemented in the Rust SDK; this field exists
-    /// only for internal test purposes. This API *will* change.
+    /// **Experimental:** Event Groups are not yet fully supported by the Rust SDK. This API may
+    /// change.
     #[cfg(feature = "experimental")]
-    #[doc(hidden)]
     #[builder(default)]
     pub event_group_markers: Vec<EventGroupMarker>,
 }
@@ -600,10 +597,9 @@ pub struct TimerOptions {
     pub summary: Option<String>,
     /// Event group markers to attach to the resulting `StartTimer` command.
     ///
-    /// **Unstable:** Event Groups are not yet implemented in the Rust SDK; this field exists
-    /// only for internal test purposes. This API *will* change.
+    /// **Experimental:** Event Groups are not yet fully supported by the Rust SDK. This API may
+    /// change.
     #[cfg(feature = "experimental")]
-    #[doc(hidden)]
     #[builder(default)]
     pub event_group_markers: Vec<EventGroupMarker>,
 }
@@ -663,10 +659,9 @@ pub struct SignalWorkflowOptions {
     pub summary: Option<String>,
     /// Event group markers to attach to the resulting `SignalExternalWorkflowExecution` command.
     ///
-    /// **Unstable:** Event Groups are not yet implemented in the Rust SDK; this field exists
-    /// only for internal test purposes. This API *will* change.
+    /// **Experimental:** Event Groups are not yet fully supported by the Rust SDK. This API may
+    /// change.
     #[cfg(feature = "experimental")]
-    #[doc(hidden)]
     #[builder(default)]
     pub event_group_markers: Vec<EventGroupMarker>,
 }
