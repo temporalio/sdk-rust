@@ -184,7 +184,8 @@ impl WorkflowRandomStream {
 }
 
 fn named_random_seed(randomness_seed: u64, name: &str) -> u64 {
-    // Fixed keys and explicit byte writes keep stream derivation stable across Rust versions.
+    // The fixed "temporal" key domain-separates this derivation, and together with explicit byte
+    // writes forms a replay compatibility contract independent of Rust's Hash implementations.
     let mut hasher =
         SipHasher13::new_with_keys(randomness_seed, randomness_seed ^ 0x7465_6d70_6f72_616c);
     hasher.write(b"temporal-rust-workflow-random-stream\0");

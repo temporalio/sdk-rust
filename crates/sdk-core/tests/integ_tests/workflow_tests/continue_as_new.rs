@@ -1,11 +1,5 @@
 use crate::common::{CoreWfStarter, SEARCH_ATTR_TXT};
-use std::{
-    sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-    },
-    time::Duration,
-};
+use std::{sync::Arc, time::Duration};
 use temporalio_client::WorkflowStartOptions;
 use temporalio_common::{
     protos::temporal::api::{
@@ -67,31 +61,24 @@ async fn continue_as_new_happy_path() {
 }
 
 #[workflow]
-struct ContinueAsNewRandomWf {
-    saw_independent_stream: Arc<AtomicBool>,
-}
+#[derive(Default)]
+struct ContinueAsNewRandomWf;
 
-#[workflow_methods(factory_only)]
+#[workflow_methods]
 impl ContinueAsNewRandomWf {
     #[run]
     async fn run(
         ctx: &mut WorkflowContext<Self>,
-        (run, previous_value): (u8, Option<u64>),
-    ) -> WorkflowResult<()> {
+        previous_value: Option<u64>,
+    ) -> WorkflowResult<(u64, u64)> {
         let value = ctx.random_stream("continue-as-new-test").random::<u64>();
-        if run == 1 {
-            ctx.continue_as_new((2, Some(value)), ContinueAsNewOptions::default())?;
-        } else {
-            ctx.state(|wf| {
-                assert_ne!(
-                    value,
-                    previous_value.expect("first run should pass its stream value"),
-                    "continue-as-new should independently seed named streams"
-                );
-                wf.saw_independent_stream.store(true, Ordering::Relaxed);
-            });
+        if ctx.info().continued_from_run_id().is_none() {
+            ctx.continue_as_new(Some(value), ContinueAsNewOptions::default())?;
         }
-        Ok(())
+        Ok((
+            previous_value.expect("first run should pass its stream value"),
+            value,
+        ))
     }
 }
 
@@ -99,27 +86,27 @@ impl ContinueAsNewRandomWf {
 async fn continue_as_new_reseeds_named_random_streams() {
     let wf_name = "continue_as_new_reseeds_named_random_streams";
     let mut starter = CoreWfStarter::new(wf_name);
-    let saw_independent_stream = Arc::new(AtomicBool::new(false));
-    let saw_independent_stream_for_wf = saw_independent_stream.clone();
     starter
         .sdk_config
-        .register_workflow_with_factory(move || ContinueAsNewRandomWf {
-            saw_independent_stream: saw_independent_stream_for_wf.clone(),
-        })
+        .register_workflow::<ContinueAsNewRandomWf>()
         .unwrap();
     let mut worker = starter.worker().await;
 
     let task_queue = starter.get_task_queue().to_owned();
-    worker
+    let handle = worker
         .submit_workflow(
             ContinueAsNewRandomWf::run,
-            (1, None),
+            None,
             WorkflowStartOptions::new(task_queue, wf_name).build(),
         )
         .await
         .unwrap();
     worker.run_until_done().await.unwrap();
-    assert!(saw_independent_stream.load(Ordering::Relaxed));
+    let (first_value, continued_value) = handle.get_result(Default::default()).await.unwrap();
+    assert_ne!(
+        first_value, continued_value,
+        "continue-as-new should independently seed named streams"
+    );
 }
 
 #[tokio::test]
