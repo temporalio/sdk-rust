@@ -32,7 +32,10 @@ use crate::{
         LocalActivityResolution, NamespaceCapabilities, PollError, PostActivateHookData,
         WorkflowSlotKind,
         activities::{ActivitiesFromWFTsHandle, LocalActivityManager},
-        client::{LegacyQueryResult, REQUEST_TOO_LARGE_KEY, WorkerClient, WorkflowTaskCompletion},
+        client::{
+            LegacyQueryResult, REQUEST_TOO_LARGE_KEY, WorkerClient, WorkflowTaskCompletion,
+            payload_limit_violation_from,
+        },
         workflow::{
             history_update::HistoryPaginator,
             machines::MachineError,
@@ -59,7 +62,7 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
-use temporalio_client::{MESSAGE_TOO_LARGE_KEY, payload_limit_violation_from};
+use temporalio_client::MESSAGE_TOO_LARGE_KEY;
 use temporalio_common::{
     payload_limits::PayloadLimitViolation,
     protos::{

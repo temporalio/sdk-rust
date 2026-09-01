@@ -2,7 +2,10 @@ use crate::{
     abstractions::UsedMeteredSemPermit,
     pollers::{BoxedNexusPoller, NexusPollItem, new_nexus_task_poller},
     telemetry::metrics::{self, FailureReason, MetricsContext},
-    worker::{CompleteNexusError, NexusSlotKind, PollError, client::WorkerClient},
+    worker::{
+        CompleteNexusError, NexusSlotKind, PollError,
+        client::{WorkerClient, payload_limit_violation_from},
+    },
 };
 use anyhow::anyhow;
 use futures_util::{
@@ -18,7 +21,6 @@ use std::{
     },
     time::{Duration, Instant, SystemTime},
 };
-use temporalio_client::payload_limit_violation_from;
 use temporalio_common::{
     payload_limits::PayloadLimitViolation,
     protos::{

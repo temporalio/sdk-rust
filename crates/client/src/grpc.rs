@@ -193,7 +193,7 @@ fn req_cloner<T: Clone>(cloneme: &Request<T>) -> Request<T> {
 
 /// `*_warn` are the connection's configured warn thresholds; per-call error limits ride a
 /// [`PayloadErrorLimits`] extension. On an error-level violation, returns a [`Status`] carrying
-/// the [`PayloadLimitViolation`] as its source (extract via [crate::payload_limit_violation_from]).
+/// the payload limit violation as its source.
 fn validate_request_payload_limits<Req: Any>(
     req: &Request<Req>,
     blob_warn: usize,
@@ -2055,8 +2055,11 @@ mod tests {
         req.extensions_mut()
             .insert(PayloadErrorLimits { blob: 10, memo: 10 });
         let err = validate_request_payload_limits(&req, 1, 1).unwrap_err();
-        let violation =
-            crate::payload_limit_violation_from(&err).expect("violation carried on status");
+        let violation = std::error::Error::source(&err)
+            .and_then(|source| {
+                source.downcast_ref::<temporalio_common::payload_limits::PayloadLimitViolation>()
+            })
+            .expect("violation carried on status");
         assert_eq!(violation.path, "input");
         assert_eq!(
             violation.class,

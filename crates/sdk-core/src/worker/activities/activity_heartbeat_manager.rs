@@ -3,7 +3,7 @@ use crate::{
     abstractions::take_cell::TakeCell,
     worker::{
         activities::{PendingActivityCancel, make_payloads_too_large_failure},
-        client::WorkerClient,
+        client::{WorkerClient, payload_limit_violation_from},
     },
 };
 use futures_util::StreamExt;
@@ -12,7 +12,6 @@ use std::{
     sync::Arc,
     time::{Duration, Instant},
 };
-use temporalio_client::payload_limit_violation_from;
 use temporalio_common::protos::{
     coresdk::{
         ActivityHeartbeat, IntoPayloadsExt,

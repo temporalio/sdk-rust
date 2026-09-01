@@ -57,6 +57,12 @@ use uuid::Uuid;
 
 type Result<T, E = tonic::Status> = std::result::Result<T, E>;
 
+pub(crate) fn payload_limit_violation_from(
+    status: &tonic::Status,
+) -> Option<&temporalio_common::payload_limits::PayloadLimitViolation> {
+    std::error::Error::source(status).and_then(|source| source.downcast_ref())
+}
+
 /// Maximum encoded size of a single completion page, kept below the ~4 MiB gRPC frame limit. This
 /// per-page cap is distinct from the server's namespace-wide limit on the recombined completion
 /// size.

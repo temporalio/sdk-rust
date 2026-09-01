@@ -189,14 +189,6 @@ static TEMPORAL_NAMESPACE_HEADER_KEY: &str = "temporal-namespace";
 /// Key used to communicate when a GRPC message is too large
 pub static MESSAGE_TOO_LARGE_KEY: &str = "message-too-large";
 #[doc(hidden)]
-/// Returns the violation, if `status` is the client proactively rejecting an outbound request for exceeding a
-/// payload/memo error size limit.
-pub fn payload_limit_violation_from(
-    status: &tonic::Status,
-) -> Option<&temporalio_common::payload_limits::PayloadLimitViolation> {
-    std::error::Error::source(status).and_then(|src| src.downcast_ref())
-}
-#[doc(hidden)]
 /// Key used to indicate a error was returned by the retryer because of the short-circuit predicate
 pub static ERROR_RETURNED_DUE_TO_SHORT_CIRCUIT: &str = "short-circuit";
 

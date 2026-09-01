@@ -19,7 +19,8 @@ use crate::{
     },
     worker::{
         ActivitySlotKind, PollError,
-        activities::activity_heartbeat_manager::ActivityHeartbeatError, client::WorkerClient,
+        activities::activity_heartbeat_manager::ActivityHeartbeatError,
+        client::{WorkerClient, payload_limit_violation_from},
     },
 };
 use activity_heartbeat_manager::ActivityHeartbeatManager;
@@ -37,9 +38,7 @@ use std::{
     },
     time::{Duration, Instant, SystemTime},
 };
-use temporalio_client::{
-    PayloadErrorLimits, payload_limit_violation_from, worker::CancelActivityCallback,
-};
+use temporalio_client::{PayloadErrorLimits, worker::CancelActivityCallback};
 use temporalio_common::{
     payload_limits::{PayloadLimitViolation, PayloadLimits, validate_known_payload_limits},
     protos::{
