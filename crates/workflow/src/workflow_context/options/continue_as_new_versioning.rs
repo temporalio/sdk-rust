@@ -1,7 +1,6 @@
 use temporalio_common_wasm::protos::temporal::api::enums::v1::ContinueAsNewVersioningBehavior as ProtoContinueAsNewVersioningBehavior;
 
 /// Versioning behavior to use for the first workflow task of a new continue-as-new run.
-#[cfg_attr(docsrs, doc(cfg(feature = "experimental")))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 #[non_exhaustive]
 pub enum ContinueAsNewVersioningBehavior {

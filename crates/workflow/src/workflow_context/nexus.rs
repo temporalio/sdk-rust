@@ -65,7 +65,6 @@ impl BaseWorkflowContext {
 
 impl<W> SyncWorkflowContext<W> {
     /// Start a Nexus operation.
-    #[cfg_attr(docsrs, doc(cfg(feature = "experimental")))]
     pub fn start_nexus_operation(
         &self,
         opts: NexusOperationOptions,
@@ -76,7 +75,6 @@ impl<W> SyncWorkflowContext<W> {
 
 impl<W> WorkflowContext<W> {
     /// Start a Nexus operation.
-    #[cfg_attr(docsrs, doc(cfg(feature = "experimental")))]
     pub fn start_nexus_operation(
         &self,
         opts: NexusOperationOptions,
@@ -96,7 +94,6 @@ impl WfCtxProtectedDat {
 #[derive(derive_more::Debug)]
 #[debug("StartedNexusOperation{{ operation_token: {operation_token:?} }}")]
 /// Handle to a started Nexus operation.
-#[cfg_attr(docsrs, doc(cfg(feature = "experimental")))]
 pub struct StartedNexusOperation {
     /// The operation token, if the operation started asynchronously
     pub operation_token: Option<String>,

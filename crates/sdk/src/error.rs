@@ -13,7 +13,6 @@ pub use temporalio_sdk_core::WorkerValidationError;
 pub enum WorkerCreateError {
     /// A plugin failed while configuring worker options.
     #[cfg(feature = "experimental")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "experimental")))]
     #[error(transparent)]
     Plugin(#[from] PluginApplyError),
     /// Worker initialization failed after plugin configuration completed.

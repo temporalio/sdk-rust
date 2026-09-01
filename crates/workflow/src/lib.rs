@@ -47,7 +47,6 @@ pub use workflow_context::{
     WorkflowIdReusePolicy, WorkflowRandomStream, WorkflowRandomValue,
 };
 #[cfg(feature = "experimental")]
-#[cfg_attr(docsrs, doc(cfg(feature = "experimental")))]
 pub use workflow_context::{
     ContinueAsNewVersioningBehavior, NexusOperationCancellationType, NexusOperationOptions,
     PatchActivationCallback, PatchActivationInput, StartedNexusOperation,

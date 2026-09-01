@@ -111,7 +111,6 @@ pub struct ConnectionOptions {
     /// disable an individual warning by setting its threshold to `0`.
     /// NOTE: Experimental
     #[cfg(feature = "experimental")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "experimental")))]
     #[cfg_attr(
         docsrs,
         builder(setters(
@@ -224,7 +223,6 @@ impl<S: client_options_builder::State> ClientOptionsBuilder<S> {
     /// Register a type-erased client plugin.
     ///
     /// **Experimental:** This API may change or be removed.
-    #[cfg_attr(docsrs, doc(cfg(feature = "experimental")))]
     pub fn plugin<P: Into<ErasedClientPlugin>>(mut self, plugin: P) -> Self {
         self.plugins.push(plugin.into());
         self
@@ -233,7 +231,6 @@ impl<S: client_options_builder::State> ClientOptionsBuilder<S> {
     /// Register type-erased client plugins in iteration order.
     ///
     /// **Experimental:** This API may change or be removed.
-    #[cfg_attr(docsrs, doc(cfg(feature = "experimental")))]
     pub fn plugins<I, P>(mut self, plugins: I) -> Self
     where
         I: IntoIterator<Item = P>,
@@ -246,7 +243,6 @@ impl<S: client_options_builder::State> ClientOptionsBuilder<S> {
     /// Register a client-only plugin.
     ///
     /// **Experimental:** This API may change or be removed.
-    #[cfg_attr(docsrs, doc(cfg(feature = "experimental")))]
     pub fn client_plugin<P: ClientPlugin>(mut self, plugin: P) -> Self {
         self.plugins.push(ErasedClientPlugin::new(plugin));
         self
@@ -260,7 +256,6 @@ impl ClientOptions {
     ///
     /// **Experimental:** This API may change or be removed.
     #[cfg(feature = "experimental")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "experimental")))]
     pub fn plugins(&self) -> &[ErasedClientPlugin] {
         &self.plugins
     }
@@ -406,7 +401,6 @@ impl Default for DnsLoadBalancingOptions {
 /// Payload size limit options for a connection.
 /// NOTE: Experimental
 #[cfg(feature = "experimental")]
-#[cfg_attr(docsrs, doc(cfg(feature = "experimental")))]
 #[derive(Clone, Debug, PartialEq, bon::Builder)]
 #[non_exhaustive]
 pub struct PayloadLimitsOptions {

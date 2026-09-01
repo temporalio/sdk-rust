@@ -68,7 +68,6 @@ pub mod activities;
 pub mod error;
 pub mod interceptors;
 #[cfg(feature = "experimental")]
-#[cfg_attr(docsrs, doc(cfg(feature = "experimental")))]
 /// Experimental APIs for configuring clients and workers with reusable plugins.
 pub mod plugins;
 pub mod runtime;
@@ -85,7 +84,6 @@ mod workflow_wasm;
 pub mod workflows;
 
 #[cfg(feature = "experimental")]
-#[cfg_attr(docsrs, doc(cfg(feature = "experimental")))]
 pub use crate::plugins::{
     ClientAndWorkerPlugin, SimplePlugin, SimplePluginBuilder, SimplePluginOption, WorkerPlugin,
 };
@@ -111,7 +109,6 @@ pub use temporalio_workflow::{
     WorkflowResult, WorkflowTermination,
 };
 #[cfg(feature = "experimental")]
-#[cfg_attr(docsrs, doc(cfg(feature = "experimental")))]
 pub use temporalio_workflow::{
     ContinueAsNewVersioningBehavior, NexusOperationCancellationType, NexusOperationOptions,
     PatchActivationCallback, PatchActivationInput, StartedNexusOperation,
@@ -318,7 +315,6 @@ pub struct WorkerOptions {
     /// limit. Defaults to false.
     /// NOTE: Experimental
     #[cfg(feature = "experimental")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "experimental")))]
     #[cfg_attr(
         docsrs,
         builder(setters(
@@ -336,7 +332,6 @@ pub struct WorkerOptions {
     /// workflow run. For registered WASM workflow components, the callback remains on the worker
     /// host and is invoked through the workflow component's synchronous host interface.
     #[cfg(feature = "experimental")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "experimental")))]
     #[cfg_attr(
         docsrs,
         builder(setters(
@@ -444,7 +439,6 @@ impl<S: worker_options_builder::State> WorkerOptionsBuilder<S> {
     ///
     /// **Experimental:** This API may change or be removed.
     #[cfg(feature = "experimental")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "experimental")))]
     pub fn worker_plugin<P: WorkerPlugin>(mut self, plugin: P) -> Self {
         self.worker_plugins.push(Arc::new(plugin));
         self
@@ -452,7 +446,6 @@ impl<S: worker_options_builder::State> WorkerOptionsBuilder<S> {
 
     /// Append a worker interceptor. Interceptors run in registration order.
     #[cfg(feature = "experimental")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "experimental")))]
     pub fn worker_interceptor<I: WorkerInterceptor + 'static>(mut self, interceptor: I) -> Self {
         self.worker_interceptors.push(Arc::new(interceptor));
         self
@@ -566,7 +559,6 @@ fn def_build_id() -> WorkerDeploymentOptions {
 impl WorkerOptions {
     /// Append a worker interceptor. Interceptors run in registration order.
     #[cfg(feature = "experimental")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "experimental")))]
     pub fn worker_interceptor<I: WorkerInterceptor + 'static>(
         &mut self,
         interceptor: I,

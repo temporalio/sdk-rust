@@ -70,7 +70,6 @@ mod worker_lifecycle {
     ///
     /// Advanced usage only.
     /// **Experimental:** This API may change or be removed.
-    #[cfg_attr(docsrs, doc(cfg(feature = "experimental")))]
     #[async_trait::async_trait(?Send)]
     pub trait WorkerInterceptor: Send + Sync {
         /// Intercept the running of a worker.
@@ -115,7 +114,6 @@ mod worker_lifecycle {
     }
 
     /// Input to [`WorkerInterceptor::run_worker`].
-    #[cfg_attr(docsrs, doc(cfg(feature = "experimental")))]
     #[derive(Debug)]
     #[non_exhaustive]
     pub struct RunWorkerInput<'a> {
@@ -130,7 +128,6 @@ mod worker_lifecycle {
     }
 
     /// Input to [`WorkerInterceptor::with_workflow_replay_worker`].
-    #[cfg_attr(docsrs, doc(cfg(feature = "experimental")))]
     #[derive(Debug)]
     #[non_exhaustive]
     pub struct WithWorkflowReplayWorkerInput<'a> {
@@ -182,7 +179,6 @@ pub(crate) use worker_lifecycle::{
     RunWorkerInput, WithWorkflowReplayWorkerInput, WorkerInterceptor,
 };
 #[cfg(feature = "experimental")]
-#[cfg_attr(docsrs, doc(cfg(feature = "experimental")))]
 pub use worker_lifecycle::{RunWorkerInput, WithWorkflowReplayWorkerInput, WorkerInterceptor};
 pub(crate) use worker_lifecycle::{call_run_worker, call_with_workflow_replay_worker};
 
@@ -281,7 +277,6 @@ pub trait ActivityInboundInterceptor: Send + Sync + 'static {
 
 /// An interceptor that allows you to fetch the exit value of the workflow if and when it is set
 #[cfg(feature = "experimental")]
-#[cfg_attr(docsrs, doc(cfg(feature = "experimental")))]
 #[derive(Default)]
 pub struct ReturnWorkflowExitValueInterceptor {
     result_value: Arc<OnceLock<Payload>>,

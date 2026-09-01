@@ -4,7 +4,6 @@ use temporalio_common_wasm::protos::temporal::api::failure::v1::Failure;
 
 impl WorkflowInterceptorContext {
     /// Start a Nexus operation through the workflow outbound interceptor chain.
-    #[cfg_attr(docsrs, doc(cfg(feature = "experimental")))]
     pub fn start_nexus_operation(
         &self,
         opts: NexusOperationOptions,
@@ -14,7 +13,6 @@ impl WorkflowInterceptorContext {
 }
 
 /// Input passed to [`WorkflowInterceptor::start_nexus_operation`].
-#[cfg_attr(docsrs, doc(cfg(feature = "experimental")))]
 #[non_exhaustive]
 pub struct StartNexusOperationInput {
     options: NexusOperationOptions,
@@ -41,7 +39,6 @@ impl StartNexusOperationInput {
 }
 
 /// Result of an intercepted Nexus operation start.
-#[cfg_attr(docsrs, doc(cfg(feature = "experimental")))]
 pub type StartNexusOperationResult = Result<StartedNexusOperation, Failure>;
 
 outbound_chain!(

@@ -92,7 +92,6 @@ impl<S: workflow_replayer_options_builder::State> WorkflowReplayerOptionsBuilder
     ///
     /// **Experimental:** This API may change or be removed.
     #[cfg(feature = "experimental")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "experimental")))]
     pub fn worker_plugin<P: WorkerPlugin>(mut self, plugin: P) -> Self {
         self.worker_plugins.push(Arc::new(plugin));
         self
@@ -100,7 +99,6 @@ impl<S: workflow_replayer_options_builder::State> WorkflowReplayerOptionsBuilder
 
     /// Append a worker interceptor used during replay.
     #[cfg(feature = "experimental")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "experimental")))]
     pub fn worker_interceptor<I: WorkerInterceptor + 'static>(mut self, interceptor: I) -> Self {
         self.worker_interceptors.push(Arc::new(interceptor));
         self
@@ -166,7 +164,6 @@ impl<S: workflow_replayer_options_builder::State> WorkflowReplayerOptionsBuilder
 impl WorkflowReplayerOptions {
     /// Append a worker interceptor used during replay.
     #[cfg(feature = "experimental")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "experimental")))]
     pub fn worker_interceptor<I: WorkerInterceptor + 'static>(
         &mut self,
         interceptor: I,
@@ -323,7 +320,6 @@ pub enum WorkflowReplayError {
 pub enum WorkflowReplayWorkerError {
     /// A plugin failed while configuring replay options.
     #[cfg(feature = "experimental")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "experimental")))]
     #[error(transparent)]
     Plugin(#[from] PluginApplyError),
     /// No workflow definitions were registered after plugin configuration.

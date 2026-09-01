@@ -28,7 +28,6 @@ use tonic::Code;
 pub enum ClientConnectError {
     /// A plugin failed while configuring connection options.
     #[cfg(feature = "experimental")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "experimental")))]
     #[error(transparent)]
     Plugin(#[from] PluginApplyError),
     /// Invalid URI. Configuration error, fatal.
@@ -431,7 +430,6 @@ impl AsyncActivityError {
 pub enum ClientNewError {
     /// A plugin failed while configuring client options.
     #[cfg(feature = "experimental")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "experimental")))]
     #[error(transparent)]
     Plugin(#[from] PluginApplyError),
 }

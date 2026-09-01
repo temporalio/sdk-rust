@@ -6,7 +6,6 @@ mod view;
 #[cfg(feature = "experimental")]
 pub(crate) use nexus::NexusUnblockData;
 #[cfg(feature = "experimental")]
-#[cfg_attr(docsrs, doc(cfg(feature = "experimental")))]
 pub use nexus::StartedNexusOperation;
 pub use options::{
     ActivityCancellationType, ActivityOptions, ChildWorkflowCancellationType, ChildWorkflowOptions,
@@ -14,7 +13,6 @@ pub use options::{
     TimerOptions, VersioningIntent, WaitConditionOptions, WorkflowIdReusePolicy,
 };
 #[cfg(feature = "experimental")]
-#[cfg_attr(docsrs, doc(cfg(feature = "experimental")))]
 pub use options::{
     ContinueAsNewVersioningBehavior, NexusOperationCancellationType, NexusOperationOptions,
 };
@@ -205,7 +203,6 @@ pub struct BaseWorkflowContext {
 }
 
 /// Input provided to a worker's patch activation callback.
-#[cfg_attr(docsrs, doc(cfg(feature = "experimental")))]
 #[derive(Clone, Debug)]
 #[non_exhaustive]
 pub struct PatchActivationInput {
@@ -216,7 +213,6 @@ pub struct PatchActivationInput {
 }
 
 /// Callback that decides whether a newly encountered patch should be activated.
-#[cfg_attr(docsrs, doc(cfg(feature = "experimental")))]
 pub type PatchActivationCallback =
     Arc<dyn Fn(PatchActivationInput) -> bool + Send + Sync + 'static>;
 
@@ -1524,7 +1520,6 @@ impl<W> SyncWorkflowContext<W> {
     ///
     /// This experimental signal is intended for workers using worker deployment versioning.
     #[cfg(feature = "experimental")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "experimental")))]
     pub fn target_worker_deployment_version_changed(&self) -> bool {
         self.base
             .inner
@@ -2026,7 +2021,6 @@ impl<W> WorkflowContext<W> {
     ///
     /// This experimental signal is intended for workers using worker deployment versioning.
     #[cfg(feature = "experimental")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "experimental")))]
     pub fn target_worker_deployment_version_changed(&self) -> bool {
         self.sync.target_worker_deployment_version_changed()
     }

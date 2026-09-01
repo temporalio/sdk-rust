@@ -10,7 +10,6 @@ use temporalio_common_wasm::protos::{
 };
 
 /// Controls when Nexus operation cancellation is reported to a workflow.
-#[cfg_attr(docsrs, doc(cfg(feature = "experimental")))]
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, Hash, Default, serde::Serialize, serde::Deserialize,
 )]
@@ -58,7 +57,6 @@ impl From<ProtoNexusOperationCancellationType> for NexusOperationCancellationTyp
 }
 
 /// Options for Nexus Operations
-#[cfg_attr(docsrs, doc(cfg(feature = "experimental")))]
 #[derive(Debug, Clone, bon::Builder)]
 #[builder(on(String, into))]
 #[non_exhaustive]

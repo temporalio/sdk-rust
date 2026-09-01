@@ -22,7 +22,6 @@ pub mod interceptors;
 mod metrics;
 mod options_structs;
 #[cfg(feature = "experimental")]
-#[cfg_attr(docsrs, doc(cfg(feature = "experimental")))]
 /// Experimental APIs for configuring clients with reusable plugins.
 pub mod plugins;
 /// Visible only for tests
@@ -69,7 +68,6 @@ pub use interceptors::{
 pub use metrics::{LONG_REQUEST_LATENCY_HISTOGRAM_NAME, REQUEST_LATENCY_HISTOGRAM_NAME};
 pub use options_structs::*;
 #[cfg(feature = "experimental")]
-#[cfg_attr(docsrs, doc(cfg(feature = "experimental")))]
 pub use plugins::{
     ClientPlugin, ErasedClientPlugin, PluginApplyError, PluginError, PluginTarget, WorkerPluginData,
 };

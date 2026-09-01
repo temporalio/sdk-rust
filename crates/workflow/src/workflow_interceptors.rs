@@ -125,7 +125,6 @@ use temporalio_common_wasm::{
 #[cfg(feature = "experimental")]
 pub(crate) use nexus::call_start_nexus_operation;
 #[cfg(feature = "experimental")]
-#[cfg_attr(docsrs, doc(cfg(feature = "experimental")))]
 pub use nexus::{StartNexusOperationInput, StartNexusOperationResult};
 
 mod workflow_output_value {
@@ -1582,7 +1581,6 @@ pub trait WorkflowInterceptor: 'static {
 
     /// Called when the workflow starts a Nexus operation.
     #[cfg(feature = "experimental")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "experimental")))]
     fn start_nexus_operation(
         &self,
         _ctx: WorkflowInterceptorContext,

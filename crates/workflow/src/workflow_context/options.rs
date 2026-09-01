@@ -38,10 +38,8 @@ mod continue_as_new_versioning;
 mod nexus;
 
 #[cfg(feature = "experimental")]
-#[cfg_attr(docsrs, doc(cfg(feature = "experimental")))]
 pub use continue_as_new_versioning::ContinueAsNewVersioningBehavior;
 #[cfg(feature = "experimental")]
-#[cfg_attr(docsrs, doc(cfg(feature = "experimental")))]
 pub use nexus::{NexusOperationCancellationType, NexusOperationOptions};
 
 /// Controls when activity cancellation is reported back to a workflow.
@@ -291,7 +289,6 @@ pub struct ActivityOptions {
     /// **Unstable:** Event Groups are not yet implemented in the Rust SDK; this field exists
     /// only for internal test purposes. This API *will* change.
     #[cfg(feature = "experimental")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "experimental")))]
     #[doc(hidden)]
     #[builder(default)]
     pub event_group_markers: Vec<EventGroupMarker>,
@@ -425,7 +422,6 @@ pub struct LocalActivityOptions {
     /// **Unstable:** Event Groups are not yet implemented in the Rust SDK; this field exists
     /// only for internal test purposes. This API *will* change.
     #[cfg(feature = "experimental")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "experimental")))]
     #[doc(hidden)]
     #[builder(default)]
     pub event_group_markers: Vec<EventGroupMarker>,
@@ -527,7 +523,6 @@ pub struct ChildWorkflowOptions {
     /// **Unstable:** Event Groups are not yet implemented in the Rust SDK; this field exists
     /// only for internal test purposes. This API *will* change.
     #[cfg(feature = "experimental")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "experimental")))]
     #[doc(hidden)]
     #[builder(default)]
     pub event_group_markers: Vec<EventGroupMarker>,
@@ -608,7 +603,6 @@ pub struct TimerOptions {
     /// **Unstable:** Event Groups are not yet implemented in the Rust SDK; this field exists
     /// only for internal test purposes. This API *will* change.
     #[cfg(feature = "experimental")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "experimental")))]
     #[doc(hidden)]
     #[builder(default)]
     pub event_group_markers: Vec<EventGroupMarker>,
@@ -672,7 +666,6 @@ pub struct SignalWorkflowOptions {
     /// **Unstable:** Event Groups are not yet implemented in the Rust SDK; this field exists
     /// only for internal test purposes. This API *will* change.
     #[cfg(feature = "experimental")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "experimental")))]
     #[doc(hidden)]
     #[builder(default)]
     pub event_group_markers: Vec<EventGroupMarker>,
@@ -740,7 +733,6 @@ pub struct ContinueAsNewOptions {
     /// versioning. `AutoUpgrade` routes the new run to the current deployment version;
     /// `UseRampingVersion` routes it to the ramping deployment version when one is configured.
     #[cfg(feature = "experimental")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "experimental")))]
     pub initial_versioning_behavior: Option<ContinueAsNewVersioningBehavior>,
 }
 

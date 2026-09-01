@@ -4,7 +4,6 @@ use crate::{ClientOptions, ConnectionOptions};
 use std::{any::Any, error::Error, sync::Arc};
 
 /// An error returned by a plugin configuration hook.
-#[cfg_attr(docsrs, doc(cfg(feature = "experimental")))]
 #[derive(Debug, thiserror::Error)]
 #[error(transparent)]
 pub struct PluginError(Box<dyn Error + Send + Sync>);
@@ -17,7 +16,6 @@ impl PluginError {
 }
 
 /// The configuration target being modified when a plugin failed.
-#[cfg_attr(docsrs, doc(cfg(feature = "experimental")))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq, derive_more::Display)]
 #[non_exhaustive]
 pub enum PluginTarget {
@@ -36,7 +34,6 @@ pub enum PluginTarget {
 }
 
 /// An error applying a named plugin to a configuration target.
-#[cfg_attr(docsrs, doc(cfg(feature = "experimental")))]
 #[derive(Debug, thiserror::Error)]
 #[error("plugin '{plugin_name}' failed to configure {target}: {source}")]
 #[non_exhaustive]
@@ -67,7 +64,6 @@ impl PluginApplyError {
 /// Configures connection and namespace-bound client options.
 ///
 /// **Experimental:** This API may change or be removed.
-#[cfg_attr(docsrs, doc(cfg(feature = "experimental")))]
 pub trait ClientPlugin: Send + Sync + 'static {
     /// Return the stable, unique name used to identify this plugin in diagnostics and worker
     /// heartbeats.
@@ -91,7 +87,6 @@ pub trait ClientPlugin: Send + Sync + 'static {
 ///
 /// Implementing this trait will not make a type recognized as plugin. Only SDK known
 /// `WorkerPluginExtension` implementers will be used as plugins.
-#[cfg_attr(docsrs, doc(cfg(feature = "experimental")))]
 pub trait WorkerPluginData: Any + Send + Sync + 'static {}
 
 /// A type-erased client plugin and worker-plugin propagation data.
@@ -99,7 +94,6 @@ pub trait WorkerPluginData: Any + Send + Sync + 'static {}
 /// The worker data is intentionally opaque to avoid taking a dependency on `temporalio-sdk`.
 ///
 /// **Experimental:** This API may change or be removed.
-#[cfg_attr(docsrs, doc(cfg(feature = "experimental")))]
 #[derive(Clone)]
 pub struct ErasedClientPlugin {
     client: Arc<dyn ClientPlugin>,
