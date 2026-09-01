@@ -184,10 +184,9 @@ impl WorkflowRandomStream {
 }
 
 fn named_random_seed(randomness_seed: u64, name: &str) -> u64 {
-    // 0x7465_6d70_6f72_616c is ASCII "temporal", used as a fixed second SipHash key for domain
-    // separation. It and the explicit byte writes are part of the replay compatibility contract.
-    let mut hasher =
-        SipHasher13::new_with_keys(randomness_seed, randomness_seed ^ 0x7465_6d70_6f72_616c);
+    // The fixed second key provides domain separation and is part of replay compatibility.
+    let second_key = randomness_seed ^ u64::from_be_bytes(*b"temporal");
+    let mut hasher = SipHasher13::new_with_keys(randomness_seed, second_key);
     hasher.write(b"temporal-rust-workflow-random-stream\0");
     hasher.write(name.as_bytes());
     hasher.finish()
