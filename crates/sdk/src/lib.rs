@@ -322,8 +322,8 @@ pub struct WorkerOptions {
     #[cfg_attr(
         docsrs,
         builder(setters(
-            some_fn(name = __disable_payload_error_limit, vis = "pub(crate)"),
-            option_fn(name = __maybe_disable_payload_error_limit, vis = "pub(crate)")
+            some_fn(name = disable_payload_error_limit_impl, vis = "pub(crate)"),
+            option_fn(name = maybe_disable_payload_error_limit_impl, vis = "pub(crate)")
         ))
     )]
     #[builder(default = false)]
@@ -340,13 +340,15 @@ pub struct WorkerOptions {
     #[cfg_attr(
         docsrs,
         builder(setters(
-            some_fn(name = __patch_activation_callback, vis = "pub(crate)"),
-            option_fn(name = __maybe_patch_activation_callback, vis = "pub(crate)")
+            some_fn(name = patch_activation_callback_impl, vis = "pub(crate)"),
+            option_fn(name = maybe_patch_activation_callback_impl, vis = "pub(crate)")
         ))
     )]
     pub patch_activation_callback: Option<PatchActivationCallback>,
 }
 
+// Bon does not propagate `doc(cfg)` to generated setters, so these docs-only methods forward to
+// renamed generated implementations.
 #[cfg(all(feature = "experimental", docsrs))]
 impl<S: worker_options_builder::State> WorkerOptionsBuilder<S> {
     /// Set whether payloads over the namespace error limit are sent to the server.
@@ -358,7 +360,7 @@ impl<S: worker_options_builder::State> WorkerOptionsBuilder<S> {
     where
         S::DisablePayloadErrorLimit: worker_options_builder::IsUnset,
     {
-        self.__disable_payload_error_limit(value)
+        self.disable_payload_error_limit_impl(value)
     }
 
     /// Set the payload error limit override from an optional value.
@@ -370,7 +372,7 @@ impl<S: worker_options_builder::State> WorkerOptionsBuilder<S> {
     where
         S::DisablePayloadErrorLimit: worker_options_builder::IsUnset,
     {
-        self.__maybe_disable_payload_error_limit(value)
+        self.maybe_disable_payload_error_limit_impl(value)
     }
 
     /// Set the callback used to decide whether a patch should activate.
@@ -382,7 +384,7 @@ impl<S: worker_options_builder::State> WorkerOptionsBuilder<S> {
     where
         S::PatchActivationCallback: worker_options_builder::IsUnset,
     {
-        self.__patch_activation_callback(value)
+        self.patch_activation_callback_impl(value)
     }
 
     /// Set the patch activation callback from an optional value.
@@ -394,7 +396,7 @@ impl<S: worker_options_builder::State> WorkerOptionsBuilder<S> {
     where
         S::PatchActivationCallback: worker_options_builder::IsUnset,
     {
-        self.__maybe_patch_activation_callback(value)
+        self.maybe_patch_activation_callback_impl(value)
     }
 }
 

@@ -440,11 +440,11 @@ impl Connection {
         #[cfg(feature = "experimental")]
         let payloads_warn_size = options.payload_limits.payloads_warn_size;
         #[cfg(not(feature = "experimental"))]
-        let payloads_warn_size = 512 * 1024;
+        let payloads_warn_size = options_structs::DEFAULT_PAYLOADS_WARN_SIZE;
         #[cfg(feature = "experimental")]
         let memo_warn_size = options.payload_limits.memo_warn_size;
         #[cfg(not(feature = "experimental"))]
-        let memo_warn_size = 2 * 1024;
+        let memo_warn_size = options_structs::DEFAULT_MEMO_WARN_SIZE;
         Ok(Self {
             inner: Arc::new(ConnectionInner {
                 service: svc_client,
@@ -1824,10 +1824,7 @@ fn build_start_workflow_request(
     options: WorkflowStartOptions,
 ) -> StartWorkflowExecutionRequest {
     let user_metadata = options.user_metadata();
-    #[cfg(feature = "experimental")]
     let request_eager_execution = options.enable_eager_workflow_start;
-    #[cfg(not(feature = "experimental"))]
-    let request_eager_execution = false;
     StartWorkflowExecutionRequest {
         namespace: client.namespace(),
         input,

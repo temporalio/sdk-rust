@@ -35,6 +35,9 @@ use tokio_rustls::rustls::client::ResolvesClientCert;
 use tokio_rustls::rustls::client::danger::ServerCertVerifier;
 use url::Url;
 
+pub(crate) const DEFAULT_PAYLOADS_WARN_SIZE: u64 = 512 * 1024;
+pub(crate) const DEFAULT_MEMO_WARN_SIZE: u64 = 2 * 1024;
+
 /// Options for [crate::Connection::connect].
 #[derive(bon::Builder, Clone, Debug)]
 #[non_exhaustive]
@@ -112,8 +115,8 @@ pub struct ConnectionOptions {
     #[cfg_attr(
         docsrs,
         builder(setters(
-            some_fn(name = __payload_limits, vis = "pub(crate)"),
-            option_fn(name = __maybe_payload_limits, vis = "pub(crate)")
+            some_fn(name = payload_limits_impl, vis = "pub(crate)"),
+            option_fn(name = maybe_payload_limits_impl, vis = "pub(crate)")
         ))
     )]
     #[builder(default)]
@@ -138,6 +141,8 @@ pub struct ConnectionOptions {
     pub(crate) client_version: String,
 }
 
+// Bon does not propagate `doc(cfg)` to generated setters, so these docs-only methods forward to
+// renamed generated implementations.
 #[cfg(all(feature = "experimental", docsrs))]
 impl<S: connection_options_builder::State> ConnectionOptionsBuilder<S> {
     /// Set the payload size limit options for this connection.
@@ -149,7 +154,7 @@ impl<S: connection_options_builder::State> ConnectionOptionsBuilder<S> {
     where
         S::PayloadLimits: connection_options_builder::IsUnset,
     {
-        self.__payload_limits(value)
+        self.payload_limits_impl(value)
     }
 
     /// Set the payload size limit options for this connection from an optional value.
@@ -161,7 +166,7 @@ impl<S: connection_options_builder::State> ConnectionOptionsBuilder<S> {
     where
         S::PayloadLimits: connection_options_builder::IsUnset,
     {
-        self.__maybe_payload_limits(value)
+        self.maybe_payload_limits_impl(value)
     }
 }
 
@@ -407,11 +412,11 @@ impl Default for DnsLoadBalancingOptions {
 pub struct PayloadLimitsOptions {
     /// Warning threshold (bytes) for the size of an outbound payload-bearing field; over-threshold
     /// fields are logged but still sent to server. Defaults to 512 KiB. Set to `0` to disable.
-    #[builder(default = 512 * 1024)]
+    #[builder(default = DEFAULT_PAYLOADS_WARN_SIZE)]
     pub payloads_warn_size: u64,
     /// Warning threshold (bytes) for outbound memo sizes; over-threshold memos are logged but still
     /// sent to server. Defaults to 2 KiB. Set to `0` to disable.
-    #[builder(default = 2 * 1024)]
+    #[builder(default = DEFAULT_MEMO_WARN_SIZE)]
     pub memo_warn_size: u64,
 }
 
@@ -467,17 +472,7 @@ pub struct WorkflowStartOptions {
     /// Additional search attributes for the workflow.
     pub search_attributes: Option<SearchAttributes>,
 
-    /// Optionally enable Eager Workflow Start, a latency optimization using local workers
-    /// NOTE: Experimental
-    #[cfg(feature = "experimental")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "experimental")))]
-    #[cfg_attr(
-        docsrs,
-        builder(setters(
-            some_fn(name = __enable_eager_workflow_start, vis = "pub(crate)"),
-            option_fn(name = __maybe_enable_eager_workflow_start, vis = "pub(crate)")
-        ))
-    )]
+    /// Optionally enable Eager Workflow Start, a latency optimization using local workers.
     #[builder(default)]
     pub enable_eager_workflow_start: bool,
 
@@ -513,33 +508,6 @@ pub struct WorkflowStartOptions {
     /// Controls for the RPC used to start the workflow.
     #[builder(default)]
     pub rpc_options: RpcOptions,
-}
-
-#[cfg(all(feature = "experimental", docsrs))]
-impl<S: workflow_start_options_builder::State> WorkflowStartOptionsBuilder<S> {
-    /// Enable eager workflow start.
-    #[doc(cfg(feature = "experimental"))]
-    pub fn enable_eager_workflow_start(
-        self,
-        value: bool,
-    ) -> WorkflowStartOptionsBuilder<workflow_start_options_builder::SetEnableEagerWorkflowStart<S>>
-    where
-        S::EnableEagerWorkflowStart: workflow_start_options_builder::IsUnset,
-    {
-        self.__enable_eager_workflow_start(value)
-    }
-
-    /// Set eager workflow start from an optional value.
-    #[doc(cfg(feature = "experimental"))]
-    pub fn maybe_enable_eager_workflow_start(
-        self,
-        value: Option<bool>,
-    ) -> WorkflowStartOptionsBuilder<workflow_start_options_builder::SetEnableEagerWorkflowStart<S>>
-    where
-        S::EnableEagerWorkflowStart: workflow_start_options_builder::IsUnset,
-    {
-        self.__maybe_enable_eager_workflow_start(value)
-    }
 }
 
 impl WorkflowStartOptions {
@@ -705,7 +673,6 @@ impl WorkflowUpdateWithStartOptions {
                 task_timeout,
                 cron_schedule: None,
                 search_attributes,
-                #[cfg(feature = "experimental")]
                 enable_eager_workflow_start: false,
                 retry_policy,
                 links,

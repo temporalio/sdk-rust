@@ -77,7 +77,6 @@ relevant information.
   * Nexus operation caller and workflow interceptor APIs, including `NexusOperationOptions`,
     `NexusOperationCancellationType`, `StartedNexusOperation`, the workflow-context start methods,
     and the `WorkflowInterceptor::start_nexus_operation` hook and input/result types.
-  * Eager Workflow Start via `WorkflowStartOptions::enable_eager_workflow_start`.
   * Worker deployment versioning APIs: `ContinueAsNewVersioningBehavior`,
     `ContinueAsNewOptions::initial_versioning_behavior`,
     `WorkflowContext::target_worker_deployment_version_changed`, and
@@ -85,7 +84,7 @@ relevant information.
   * Client, worker, and workflow replayer plugin APIs.
   * Client payload warning thresholds (`PayloadLimitsOptions` and
     `ConnectionOptions::payload_limits`) and `WorkerOptions::disable_payload_error_limit`.
-  * Patch activation callback types and the corresponding worker and workflow replayer options.
+  * Patch activation callback types and the corresponding worker option.
   * Worker lifecycle interception APIs (`WorkerInterceptor`, its input types and registration
     methods, and `ReturnWorkflowExitValueInterceptor`).
   * Event Group marker fields on activity, local activity, child workflow, timer, and external

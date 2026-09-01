@@ -31,8 +31,6 @@ use temporalio_sdk_core::{
     init_replay_worker,
     replay::{HistoryForReplay, ReplayWorkerInput},
 };
-#[cfg(feature = "experimental")]
-use temporalio_workflow::InternalPatchActivationCallback as PatchActivationCallback;
 use temporalio_workflow::runtime::entry::WorkflowImplementation;
 
 #[cfg(feature = "wasm-workflows")]
@@ -87,49 +85,6 @@ pub struct WorkflowReplayerOptions {
     /// Whether to detect nondeterministic future usage in workflow code.
     #[builder(default = true)]
     pub detect_nondeterministic_futures: bool,
-
-    /// Callback controlling first non-replay patch decisions.
-    #[cfg(feature = "experimental")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "experimental")))]
-    #[cfg_attr(
-        docsrs,
-        builder(setters(
-            some_fn(name = __patch_activation_callback, vis = "pub(crate)"),
-            option_fn(name = __maybe_patch_activation_callback, vis = "pub(crate)")
-        ))
-    )]
-    pub patch_activation_callback: Option<PatchActivationCallback>,
-}
-
-#[cfg(all(feature = "experimental", docsrs))]
-impl<S: workflow_replayer_options_builder::State> WorkflowReplayerOptionsBuilder<S> {
-    /// Set the callback used to decide whether a patch should activate during replay.
-    #[doc(cfg(feature = "experimental"))]
-    pub fn patch_activation_callback(
-        self,
-        value: PatchActivationCallback,
-    ) -> WorkflowReplayerOptionsBuilder<
-        workflow_replayer_options_builder::SetPatchActivationCallback<S>,
-    >
-    where
-        S::PatchActivationCallback: workflow_replayer_options_builder::IsUnset,
-    {
-        self.__patch_activation_callback(value)
-    }
-
-    /// Set the replay patch activation callback from an optional value.
-    #[doc(cfg(feature = "experimental"))]
-    pub fn maybe_patch_activation_callback(
-        self,
-        value: Option<PatchActivationCallback>,
-    ) -> WorkflowReplayerOptionsBuilder<
-        workflow_replayer_options_builder::SetPatchActivationCallback<S>,
-    >
-    where
-        S::PatchActivationCallback: workflow_replayer_options_builder::IsUnset,
-    {
-        self.__maybe_patch_activation_callback(value)
-    }
 }
 
 impl<S: workflow_replayer_options_builder::State> WorkflowReplayerOptionsBuilder<S> {
@@ -540,9 +495,6 @@ impl WorkflowReplayer {
         #[cfg(feature = "experimental")]
         let worker_options =
             worker_options.with_worker_plugins(self.options.worker_plugins.clone());
-        #[cfg(feature = "experimental")]
-        let worker_options = worker_options
-            .maybe_patch_activation_callback(self.options.patch_activation_callback.clone());
         #[cfg(feature = "wasm-workflows")]
         let worker_options = worker_options
             .with_wasm_workflow_components(self.options.wasm_workflow_components.clone());

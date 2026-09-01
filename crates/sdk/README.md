@@ -133,17 +133,16 @@ env.shutdown().await?;
 
 ## Crate Features
 
+The SDK enables a few convenience integrations by default. Users who want a smaller dependency
+graph can disable defaults and opt back into the integrations they use.
 
-| Feature | What it enables |
-| --- | --- |
-| `envconfig` | Support for loading connection settings from environment variables and `temporal.toml` files. |
-| `prometheus` | The Prometheus metrics exporter for `temporalio_common::telemetry`. |
-| `otel` | The OpenTelemetry metrics exporter for `temporalio_common::telemetry`. |
-| `experimental` | Rust SDK, client, and Workflow APIs that are still under development and may change or be removed. |
-| `testing` | The `testing` module, direct activity test support, and local Temporal CLI dev-server lifecycle management. |
-| `dynamic-tls` | Dynamic mTLS client-certificate resolution for transparent certificate rotation. |
-| `wasm-workflows` | Support WebAssembly workflow components through Wasmtime for workers and workflow replay. |
-
+- `envconfig`: Support for loading connection settings from environment variables and `temporal.toml` files. |
+- `prometheus`: The Prometheus metrics exporter for `temporalio_common::telemetry`. |
+- `otel`: The OpenTelemetry metrics exporter for `temporalio_common::telemetry`. |
+- `experimental`: Rust SDK, client, and Workflow APIs that are still under development and may change or be removed. |
+- `testing`: The `testing` module, direct activity test support, and local Temporal CLI dev-server lifecycle management. |
+- `dynamic-tls`: Dynamic mTLS client-certificate resolution for transparent certificate rotation. |
+- `wasm-workflows`: Support WebAssembly workflow components through Wasmtime for workers and workflow replay. |
 
 ## Workflows in detail
 
