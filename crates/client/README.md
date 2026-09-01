@@ -162,6 +162,15 @@ while let Some(result) = stream.next().await {
 }
 ```
 
+## Experimental APIs
+
+APIs that are still under development require the `experimental` Cargo feature and may change or
+be removed before stabilization:
+
+```toml
+temporalio-client = { version = "0.7", features = ["experimental"] }
+```
+
 ## Raw gRPC Access
 
 For operations not covered by the high-level API, access the underlying gRPC service clients

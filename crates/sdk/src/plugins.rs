@@ -22,6 +22,7 @@ use temporalio_common::data_converters::DataConverter;
 /// Use [`ClientAndWorkerPlugin`] for plugins that target both clients and workers.
 ///
 /// **Experimental:** This API may change or be removed.
+#[cfg_attr(docsrs, doc(cfg(feature = "experimental")))]
 pub trait WorkerPlugin: Send + Sync + 'static {
     /// Stable, unique name used to identify this plugin.
     fn name(&self) -> &str;
@@ -77,6 +78,7 @@ impl WorkerPluginData for PropagatedWorkerPlugin {}
 /// ```
 ///
 /// **Experimental:** This API may change or be removed.
+#[cfg_attr(docsrs, doc(cfg(feature = "experimental")))]
 #[derive(Clone)]
 pub struct ClientAndWorkerPlugin {
     client: ErasedClientPlugin,
@@ -127,6 +129,7 @@ impl WorkerPlugin for ClientAndWorkerPlugin {
 /// functions into this type.
 ///
 /// **Experimental:** This API may change or be removed.
+#[cfg_attr(docsrs, doc(cfg(feature = "experimental")))]
 #[derive(Clone)]
 pub enum SimplePluginOption<T> {
     /// A value that replaces a scalar field or appends to a collection field.
@@ -210,6 +213,7 @@ fn apply_appending<T: Clone>(
 /// configured client when a worker is created.
 ///
 /// **Experimental:** This API may change or be removed.
+#[cfg_attr(docsrs, doc(cfg(feature = "experimental")))]
 #[derive(Clone, bon::Builder)]
 #[builder(state_mod(vis = "pub"))]
 pub struct SimplePlugin {
@@ -454,7 +458,7 @@ pub(crate) fn apply_workflow_replayer_plugins(
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "experimental"))]
 mod tests {
     use super::*;
     use std::{

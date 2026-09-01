@@ -72,6 +72,24 @@ relevant information.
 * `WorkflowHistory::to_json` is now async, `WorkflowHistoryError` reports fetch and JSON conversion failures; and the eager `events`,
   `Clone`, and `From<WorkflowHistory> for History` APIs have been removed. Replay results expose
   their eagerly fetched events through `ReplayHistory`.
+* Rust SDK APIs previously marked experimental now require the `experimental` Cargo feature. This
+  includes:
+  * Nexus operation caller and workflow interceptor APIs, including `NexusOperationOptions`,
+    `NexusOperationCancellationType`, `StartedNexusOperation`, the workflow-context start methods,
+    and the `WorkflowInterceptor::start_nexus_operation` hook and input/result types.
+  * Eager Workflow Start via `WorkflowStartOptions::enable_eager_workflow_start`.
+  * Worker deployment versioning APIs: `ContinueAsNewVersioningBehavior`,
+    `ContinueAsNewOptions::initial_versioning_behavior`,
+    `WorkflowContext::target_worker_deployment_version_changed`, and
+    `SyncWorkflowContext::target_worker_deployment_version_changed`.
+  * Client, worker, and workflow replayer plugin APIs.
+  * Client payload warning thresholds (`PayloadLimitsOptions` and
+    `ConnectionOptions::payload_limits`) and `WorkerOptions::disable_payload_error_limit`.
+  * Patch activation callback types and the corresponding worker and workflow replayer options.
+  * Worker lifecycle interception APIs (`WorkerInterceptor`, its input types and registration
+    methods, and `ReturnWorkflowExitValueInterceptor`).
+  * Event Group marker fields on activity, local activity, child workflow, timer, and external
+    signal options.
 * The following types are now non-exhaustive: `Priority`, `WorkerDeploymentVersion`,
   `WorkerCallbacks`, `WorkflowExecutionInfo`, `ActivityCloseTimeouts`,
   `ActivityExecutionDecodeHint`, child-workflow and signal decode hints,

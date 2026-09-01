@@ -34,7 +34,7 @@ use temporalio_common::{
     },
 };
 use temporalio_workflow::{
-    PatchActivationCallback,
+    InternalPatchActivationCallback as PatchActivationCallback,
     runtime::{
         guest::WorkflowInstance,
         host::WorkflowHost,

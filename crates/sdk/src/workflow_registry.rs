@@ -12,7 +12,7 @@ use temporalio_common::{
     },
 };
 use temporalio_workflow::{
-    BaseWorkflowContext, PatchActivationCallback,
+    BaseWorkflowContext, InternalPatchActivationCallback as PatchActivationCallback,
     runtime::{
         entry::WorkflowImplementation,
         guest::WorkflowInstance,
@@ -75,6 +75,8 @@ pub struct WorkflowDefinitions {
 }
 
 impl WorkflowDefinitions {
+    // Only used by Plugins so feature flagged to avoid dead code.
+    #[cfg(feature = "experimental")]
     pub(crate) fn extend(&mut self, other: &Self) -> Result<(), WorkflowRegistrationError> {
         for workflow in other.workflows.values() {
             self.insert_workflow(workflow.definition.clone(), workflow.factory.clone())?;

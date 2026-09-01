@@ -108,11 +108,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 ### Testing
 
 Enable the `testing` feature to run activities directly or start an isolated Temporal CLI dev
-server for workflow tests:
-
-```toml
-temporalio-sdk = { version = "0.6", features = ["testing"] }
-```
+server for workflow tests.
 
 Activity test inputs and outputs are ordinary Rust values. Register an activity implementer when
 testing an instance activity:
@@ -137,21 +133,17 @@ env.shutdown().await?;
 
 ## Crate Features
 
-The SDK enables a few convenience integrations by default. Users who want a smaller dependency
-graph can disable defaults and opt back into the integrations they use:
 
-```toml
-temporalio-sdk = { version = "0.3", default-features = false, features = ["envconfig"] }
-```
+| Feature | What it enables |
+| --- | --- |
+| `envconfig` | Support for loading connection settings from environment variables and `temporal.toml` files. |
+| `prometheus` | The Prometheus metrics exporter for `temporalio_common::telemetry`. |
+| `otel` | The OpenTelemetry metrics exporter for `temporalio_common::telemetry`. |
+| `experimental` | Rust SDK, client, and Workflow APIs that are still under development and may change or be removed. |
+| `testing` | The `testing` module, direct activity test support, and local Temporal CLI dev-server lifecycle management. |
+| `dynamic-tls` | Dynamic mTLS client-certificate resolution for transparent certificate rotation. |
+| `wasm-workflows` | Support WebAssembly workflow components through Wasmtime for workers and workflow replay. |
 
-- `envconfig` - enabled by default. Adds `ClientOptions::load_from_config` and related helpers for
-  loading connection settings from environment variables and `temporal.toml` files.
-- `prometheus` - enabled by default. Adds the Prometheus metrics exporter in
-  `temporalio_common::telemetry` for serving SDK metrics from a HTTP endpoint.
-- `otel` - optional. Adds the OpenTelemetry metrics exporter in `temporalio_common::telemetry` for
-  sending SDK metrics to an OpenTelemetry collector.
-- `testing` - optional. Adds activity and workflow test environments, including local Temporal CLI
-  dev-server lifecycle management.
 
 ## Workflows in detail
 

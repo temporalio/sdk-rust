@@ -1,6 +1,7 @@
 //! Shared SDK error re-exports.
 
 pub use crate::workflow_registry::WorkflowRegistrationError;
+#[cfg(feature = "experimental")]
 use temporalio_client::PluginApplyError;
 pub use temporalio_sdk_core::WorkerValidationError;
 
@@ -11,6 +12,8 @@ pub use temporalio_sdk_core::WorkerValidationError;
 #[non_exhaustive]
 pub enum WorkerCreateError {
     /// A plugin failed while configuring worker options.
+    #[cfg(feature = "experimental")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "experimental")))]
     #[error(transparent)]
     Plugin(#[from] PluginApplyError),
     /// Worker initialization failed after plugin configuration completed.

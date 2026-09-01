@@ -1,3 +1,4 @@
+#![cfg_attr(docsrs, feature(doc_cfg))]
 #![warn(missing_docs)]
 
 //! Temporal workflow authoring APIs and runtime glue.
@@ -36,20 +37,25 @@ pub use temporalio_common_wasm::{
         TimeoutType, WorkflowSignalError,
     },
 };
-#[cfg(feature = "experimental")]
-pub use workflow_context::ContinueAsNewVersioningBehavior;
 pub use workflow_context::{
     ActivityCancellationType, ActivityOptions, BaseWorkflowContext, CancellableFuture,
     CancellableFutureWithReason, ChildWorkflowCancellationType, ChildWorkflowOptions,
     ContinueAsNewOptions, ExternalWorkflowHandle, LocalActivityOptions, NamespacedWorkflowInfo,
-    NexusOperationCancellationType, NexusOperationOptions, ParentClosePolicy,
-    SignalWorkflowOptions, StartChildWorkflowExecutionFailedCause, StartChildWorkflowOutput,
-    StartedChildWorkflow, StartedNexusOperation, SyncWorkflowContext, TimerOptions,
+    ParentClosePolicy, SignalWorkflowOptions, StartChildWorkflowExecutionFailedCause,
+    StartChildWorkflowOutput, StartedChildWorkflow, SyncWorkflowContext, TimerOptions,
     VersioningIntent, WaitConditionOptions, WorkflowContext, WorkflowContextView,
     WorkflowIdReusePolicy, WorkflowRandomStream, WorkflowRandomValue,
 };
+#[cfg(feature = "experimental")]
+#[cfg_attr(docsrs, doc(cfg(feature = "experimental")))]
+pub use workflow_context::{
+    ContinueAsNewVersioningBehavior, NexusOperationCancellationType, NexusOperationOptions,
+    PatchActivationCallback, PatchActivationInput, StartedNexusOperation,
+};
 #[doc(hidden)]
-pub use workflow_context::{PatchActivationCallback, PatchActivationCaller};
+pub use workflow_context::{
+    PatchActivationCallback as InternalPatchActivationCallback, PatchActivationCaller,
+};
 pub use workflows::{join, join_all, select};
 
 #[macro_export]

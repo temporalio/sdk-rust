@@ -2,7 +2,7 @@
 //!
 //! Everything in this module is internal SDK/component glue.
 use crate::{
-    BaseWorkflowContext, PatchActivationCallback,
+    BaseWorkflowContext, InternalPatchActivationCallback as PatchActivationCallback,
     runtime::{
         entry::WorkflowImplementation,
         guest::WorkflowInstance as RuntimeWorkflowInstance,

@@ -551,6 +551,7 @@ pub struct ActivityDefinitions {
 }
 
 impl ActivityDefinitions {
+    #[cfg(feature = "experimental")]
     pub(crate) fn extend(&mut self, other: &Self) {
         self.activities.extend(other.activities.clone());
     }

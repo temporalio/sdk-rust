@@ -5,11 +5,9 @@ use crate::{
     activities::{ActivityContext, ActivityError, ActivityInfo},
 };
 use futures_util::future::{BoxFuture, LocalBoxFuture};
-use std::{
-    any::Any,
-    collections::HashMap,
-    sync::{Arc, OnceLock},
-};
+#[cfg(feature = "experimental")]
+use std::sync::OnceLock;
+use std::{any::Any, collections::HashMap, sync::Arc};
 use temporalio_common::{
     data_converters::{
         GenericPayloadConverter, PayloadConversionError, SerializationContext, TemporalSerializable,
@@ -46,113 +44,11 @@ mod activity_execution_value {
     }
 }
 
-/// Implementors can intercept certain actions that happen within the Worker.
-///
-/// Advanced usage only.
-/// **Experimental:** This API may change or be removed.
-#[async_trait::async_trait(?Send)]
-pub trait WorkerInterceptor: Send + Sync {
-    /// Intercept the running of a worker.
-    fn run_worker<'a>(
-        &'a self,
-        input: RunWorkerInput<'a>,
-        next: Next<'a, RunWorkerInput<'a>, LocalBoxFuture<'a, Result<(), WorkerRunError>>>,
-    ) -> LocalBoxFuture<'a, Result<(), WorkerRunError>> {
-        next.run(input)
-    }
-
-    /// Intercept the running of a worker created for workflow replay.
-    fn with_workflow_replay_worker<'a>(
-        &'a self,
-        input: WithWorkflowReplayWorkerInput<'a>,
-        next: Next<
-            'a,
-            WithWorkflowReplayWorkerInput<'a>,
-            LocalBoxFuture<'a, Result<(), WorkerRunError>>,
-        >,
-    ) -> LocalBoxFuture<'a, Result<(), WorkerRunError>> {
-        next.run(input)
-    }
-
-    /// Called every time a workflow activation completes (just before sending the completion to
-    /// core).
-    async fn on_workflow_activation_completion(&self, _completion: &WorkflowActivationCompletion) {}
-    /// Called after the worker has initiated shutdown and the workflow/activity polling loops
-    /// have exited, but just before waiting for the inner core worker shutdown
-    fn on_shutdown(&self, _sdk_worker: &Worker) {}
-    /// Called every time a workflow is about to be activated
-    async fn on_workflow_activation(
-        &self,
-        _activation: &WorkflowActivation,
-    ) -> Result<(), anyhow::Error> {
-        Ok(())
-    }
-}
-
 /// Continuation for an interceptor operation.
 ///
 /// Interceptor implementations call [`Next::run`] to invoke the next step of the chain.
 pub struct Next<'a, I, O> {
     inner: Box<dyn FnOnce(I) -> O + Send + 'a>,
-}
-
-/// Input to [`WorkerInterceptor::run_worker`].
-#[derive(Debug)]
-#[non_exhaustive]
-pub struct RunWorkerInput<'a> {
-    /// The worker being run.
-    pub worker: &'a mut Worker,
-}
-
-impl<'a> RunWorkerInput<'a> {
-    pub(crate) fn new(worker: &'a mut Worker) -> Self {
-        Self { worker }
-    }
-}
-
-/// Input to [`WorkerInterceptor::with_workflow_replay_worker`].
-#[derive(Debug)]
-#[non_exhaustive]
-pub struct WithWorkflowReplayWorkerInput<'a> {
-    /// The worker created for this replay operation.
-    pub worker: &'a mut Worker,
-}
-
-impl<'a> WithWorkflowReplayWorkerInput<'a> {
-    pub(crate) fn new(worker: &'a mut Worker) -> Self {
-        Self { worker }
-    }
-}
-
-pub(crate) fn call_run_worker<'a>(
-    interceptors: &'a [Arc<dyn WorkerInterceptor>],
-    input: RunWorkerInput<'a>,
-    terminal: Next<'a, RunWorkerInput<'a>, LocalBoxFuture<'a, Result<(), WorkerRunError>>>,
-) -> LocalBoxFuture<'a, Result<(), WorkerRunError>> {
-    if let Some((interceptor, remaining)) = interceptors.split_first() {
-        let next = Next::new(move |input| call_run_worker(remaining, input, terminal));
-        interceptor.run_worker(input, next)
-    } else {
-        terminal.run(input)
-    }
-}
-
-pub(crate) fn call_with_workflow_replay_worker<'a>(
-    interceptors: &'a [Arc<dyn WorkerInterceptor>],
-    input: WithWorkflowReplayWorkerInput<'a>,
-    terminal: Next<
-        'a,
-        WithWorkflowReplayWorkerInput<'a>,
-        LocalBoxFuture<'a, Result<(), WorkerRunError>>,
-    >,
-) -> LocalBoxFuture<'a, Result<(), WorkerRunError>> {
-    if let Some((interceptor, remaining)) = interceptors.split_first() {
-        let next =
-            Next::new(move |input| call_with_workflow_replay_worker(remaining, input, terminal));
-        interceptor.with_workflow_replay_worker(input, next)
-    } else {
-        terminal.run(input)
-    }
 }
 
 impl<'a, I, O> Next<'a, I, O> {
@@ -165,6 +61,130 @@ impl<'a, I, O> Next<'a, I, O> {
         (self.inner)(input)
     }
 }
+
+#[cfg_attr(not(feature = "experimental"), allow(unreachable_pub))]
+mod worker_lifecycle {
+    use super::*;
+
+    /// Implementors can intercept certain actions that happen within the Worker.
+    ///
+    /// Advanced usage only.
+    /// **Experimental:** This API may change or be removed.
+    #[cfg_attr(docsrs, doc(cfg(feature = "experimental")))]
+    #[async_trait::async_trait(?Send)]
+    pub trait WorkerInterceptor: Send + Sync {
+        /// Intercept the running of a worker.
+        fn run_worker<'a>(
+            &'a self,
+            input: RunWorkerInput<'a>,
+            next: Next<'a, RunWorkerInput<'a>, LocalBoxFuture<'a, Result<(), WorkerRunError>>>,
+        ) -> LocalBoxFuture<'a, Result<(), WorkerRunError>> {
+            next.run(input)
+        }
+
+        /// Intercept the running of a worker created for workflow replay.
+        fn with_workflow_replay_worker<'a>(
+            &'a self,
+            input: WithWorkflowReplayWorkerInput<'a>,
+            next: Next<
+                'a,
+                WithWorkflowReplayWorkerInput<'a>,
+                LocalBoxFuture<'a, Result<(), WorkerRunError>>,
+            >,
+        ) -> LocalBoxFuture<'a, Result<(), WorkerRunError>> {
+            next.run(input)
+        }
+
+        /// Called every time a workflow activation completes (just before sending the completion to
+        /// core).
+        async fn on_workflow_activation_completion(
+            &self,
+            _completion: &WorkflowActivationCompletion,
+        ) {
+        }
+        /// Called after the worker has initiated shutdown and the workflow/activity polling loops
+        /// have exited, but just before waiting for the inner core worker shutdown
+        fn on_shutdown(&self, _sdk_worker: &Worker) {}
+        /// Called every time a workflow is about to be activated
+        async fn on_workflow_activation(
+            &self,
+            _activation: &WorkflowActivation,
+        ) -> Result<(), anyhow::Error> {
+            Ok(())
+        }
+    }
+
+    /// Input to [`WorkerInterceptor::run_worker`].
+    #[cfg_attr(docsrs, doc(cfg(feature = "experimental")))]
+    #[derive(Debug)]
+    #[non_exhaustive]
+    pub struct RunWorkerInput<'a> {
+        /// The worker being run.
+        pub worker: &'a mut Worker,
+    }
+
+    impl<'a> RunWorkerInput<'a> {
+        pub(crate) fn new(worker: &'a mut Worker) -> Self {
+            Self { worker }
+        }
+    }
+
+    /// Input to [`WorkerInterceptor::with_workflow_replay_worker`].
+    #[cfg_attr(docsrs, doc(cfg(feature = "experimental")))]
+    #[derive(Debug)]
+    #[non_exhaustive]
+    pub struct WithWorkflowReplayWorkerInput<'a> {
+        /// The worker created for this replay operation.
+        pub worker: &'a mut Worker,
+    }
+
+    impl<'a> WithWorkflowReplayWorkerInput<'a> {
+        pub(crate) fn new(worker: &'a mut Worker) -> Self {
+            Self { worker }
+        }
+    }
+
+    pub(crate) fn call_run_worker<'a>(
+        interceptors: &'a [Arc<dyn WorkerInterceptor>],
+        input: RunWorkerInput<'a>,
+        terminal: Next<'a, RunWorkerInput<'a>, LocalBoxFuture<'a, Result<(), WorkerRunError>>>,
+    ) -> LocalBoxFuture<'a, Result<(), WorkerRunError>> {
+        if let Some((interceptor, remaining)) = interceptors.split_first() {
+            let next = Next::new(move |input| call_run_worker(remaining, input, terminal));
+            interceptor.run_worker(input, next)
+        } else {
+            terminal.run(input)
+        }
+    }
+
+    pub(crate) fn call_with_workflow_replay_worker<'a>(
+        interceptors: &'a [Arc<dyn WorkerInterceptor>],
+        input: WithWorkflowReplayWorkerInput<'a>,
+        terminal: Next<
+            'a,
+            WithWorkflowReplayWorkerInput<'a>,
+            LocalBoxFuture<'a, Result<(), WorkerRunError>>,
+        >,
+    ) -> LocalBoxFuture<'a, Result<(), WorkerRunError>> {
+        if let Some((interceptor, remaining)) = interceptors.split_first() {
+            let next = Next::new(move |input| {
+                call_with_workflow_replay_worker(remaining, input, terminal)
+            });
+            interceptor.with_workflow_replay_worker(input, next)
+        } else {
+            terminal.run(input)
+        }
+    }
+}
+
+#[cfg(not(feature = "experimental"))]
+pub(crate) use worker_lifecycle::{
+    RunWorkerInput, WithWorkflowReplayWorkerInput, WorkerInterceptor,
+};
+#[cfg(feature = "experimental")]
+#[cfg_attr(docsrs, doc(cfg(feature = "experimental")))]
+pub use worker_lifecycle::{RunWorkerInput, WithWorkflowReplayWorkerInput, WorkerInterceptor};
+pub(crate) use worker_lifecycle::{call_run_worker, call_with_workflow_replay_worker};
 
 /// Activity execution data passed to [`ActivityInboundInterceptor::execute_activity`].
 #[non_exhaustive]
@@ -260,11 +280,14 @@ pub trait ActivityInboundInterceptor: Send + Sync + 'static {
 }
 
 /// An interceptor that allows you to fetch the exit value of the workflow if and when it is set
+#[cfg(feature = "experimental")]
+#[cfg_attr(docsrs, doc(cfg(feature = "experimental")))]
 #[derive(Default)]
 pub struct ReturnWorkflowExitValueInterceptor {
     result_value: Arc<OnceLock<Payload>>,
 }
 
+#[cfg(feature = "experimental")]
 impl ReturnWorkflowExitValueInterceptor {
     /// Can be used to fetch the workflow result if/when it is determined
     pub fn result_handle(&self) -> Arc<OnceLock<Payload>> {
@@ -273,6 +296,7 @@ impl ReturnWorkflowExitValueInterceptor {
 }
 
 #[async_trait::async_trait(?Send)]
+#[cfg(feature = "experimental")]
 impl WorkerInterceptor for ReturnWorkflowExitValueInterceptor {
     async fn on_workflow_activation_completion(&self, c: &WorkflowActivationCompletion) {
         if let Some(v) = c.complete_workflow_execution_value() {

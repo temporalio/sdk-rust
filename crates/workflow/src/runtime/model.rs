@@ -1,11 +1,14 @@
 //! Runtime protocol and execution model types shared by workflow code and native hosts.
 
+#[cfg(feature = "experimental")]
+mod nexus;
+#[cfg(feature = "experimental")]
+pub(crate) use nexus::NexusStartResult;
+
 use crate::{
     WorkflowCancellationError,
     runtime::types::ContinueAsNewRequest,
-    workflow_context::{
-        ChildWfCommon, NexusUnblockData, PendingChildWorkflow, StartedNexusOperation,
-    },
+    workflow_context::{ChildWfCommon, PendingChildWorkflow},
     workflow_interceptors::WorkflowOutputValue,
 };
 use temporalio_common_wasm::{
@@ -138,53 +141,6 @@ impl Unblockable for CancelExternalWfResult {
                 maybefail.map_or(Ok(CancelExternalOk), Err)
             }
             _ => panic!("Invalid unblock event for cancel external workflow result"),
-        }
-    }
-}
-
-pub(crate) type NexusStartResult = Result<StartedNexusOperation, Failure>;
-
-impl Unblockable for NexusStartResult {
-    type OtherDat = NexusUnblockData;
-
-    fn unblock(ue: UnblockEvent, od: Self::OtherDat) -> Self {
-        let NexusUnblockData {
-            result_future,
-            schedule_seq,
-            base_ctx,
-        } = od;
-        match ue {
-            UnblockEvent::NexusOperationStart(_, result) => match *result {
-                resolve_nexus_operation_start::Status::OperationToken(op_token) => {
-                    Ok(StartedNexusOperation {
-                        operation_token: Some(op_token),
-                        result_future,
-                        schedule_seq,
-                        base_ctx,
-                    })
-                }
-                resolve_nexus_operation_start::Status::StartedSync(_) => {
-                    Ok(StartedNexusOperation {
-                        operation_token: None,
-                        result_future,
-                        schedule_seq,
-                        base_ctx,
-                    })
-                }
-                resolve_nexus_operation_start::Status::Failed(f) => Err(f),
-            },
-            _ => panic!("Invalid unblock event for nexus operation"),
-        }
-    }
-}
-
-impl Unblockable for NexusOperationResult {
-    type OtherDat = ();
-
-    fn unblock(ue: UnblockEvent, _: Self::OtherDat) -> Self {
-        match ue {
-            UnblockEvent::NexusOperationComplete(_, result) => *result,
-            _ => panic!("Invalid unblock event for nexus operation complete"),
         }
     }
 }

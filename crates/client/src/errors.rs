@@ -1,6 +1,8 @@
 //! Contains errors that can be returned by clients.
 
-use crate::{PluginApplyError, WorkflowExecutionStatus, workflow_handle::WorkflowResultDetails};
+#[cfg(feature = "experimental")]
+use crate::PluginApplyError;
+use crate::{WorkflowExecutionStatus, workflow_handle::WorkflowResultDetails};
 use http::uri::InvalidUri;
 use temporalio_common::{
     data_converters::{DecodablePayloads, PayloadConversionError},
@@ -25,6 +27,8 @@ use tonic::Code;
 #[non_exhaustive]
 pub enum ClientConnectError {
     /// A plugin failed while configuring connection options.
+    #[cfg(feature = "experimental")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "experimental")))]
     #[error(transparent)]
     Plugin(#[from] PluginApplyError),
     /// Invalid URI. Configuration error, fatal.
@@ -57,6 +61,7 @@ pub enum ClientConnectError {
 impl From<ClientNewError> for ClientConnectError {
     fn from(value: ClientNewError) -> Self {
         match value {
+            #[cfg(feature = "experimental")]
             ClientNewError::Plugin(err) => Self::Plugin(err),
         }
     }
@@ -425,6 +430,8 @@ impl AsyncActivityError {
 #[non_exhaustive]
 pub enum ClientNewError {
     /// A plugin failed while configuring client options.
+    #[cfg(feature = "experimental")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "experimental")))]
     #[error(transparent)]
     Plugin(#[from] PluginApplyError),
 }

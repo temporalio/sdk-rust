@@ -1,7 +1,8 @@
 use crate::{
-    ClientInterceptor, ClientPlugin, ErasedClientPlugin, HttpConnectProxyOptions, RetryOptions,
-    RpcOptions, VERSION, callback_based,
+    ClientInterceptor, HttpConnectProxyOptions, RetryOptions, RpcOptions, VERSION, callback_based,
 };
+#[cfg(feature = "experimental")]
+use crate::{ClientPlugin, ErasedClientPlugin};
 use http::Uri;
 use std::{collections::HashMap, sync::Arc, time::Duration};
 use temporalio_common::{
@@ -106,6 +107,15 @@ pub struct ConnectionOptions {
     /// Payload size limit options for this connection. Defaults to the standard warning thresholds;
     /// disable an individual warning by setting its threshold to `0`.
     /// NOTE: Experimental
+    #[cfg(feature = "experimental")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "experimental")))]
+    #[cfg_attr(
+        docsrs,
+        builder(setters(
+            some_fn(name = __payload_limits, vis = "pub(crate)"),
+            option_fn(name = __maybe_payload_limits, vis = "pub(crate)")
+        ))
+    )]
     #[builder(default)]
     pub payload_limits: PayloadLimitsOptions,
 
@@ -126,6 +136,33 @@ pub struct ConnectionOptions {
     #[builder(default = VERSION.to_owned())]
     #[cfg_attr(feature = "core-based-sdk", builder(setters(vis = "pub")))]
     pub(crate) client_version: String,
+}
+
+#[cfg(all(feature = "experimental", docsrs))]
+impl<S: connection_options_builder::State> ConnectionOptionsBuilder<S> {
+    /// Set the payload size limit options for this connection.
+    #[doc(cfg(feature = "experimental"))]
+    pub fn payload_limits(
+        self,
+        value: PayloadLimitsOptions,
+    ) -> ConnectionOptionsBuilder<connection_options_builder::SetPayloadLimits<S>>
+    where
+        S::PayloadLimits: connection_options_builder::IsUnset,
+    {
+        self.__payload_limits(value)
+    }
+
+    /// Set the payload size limit options for this connection from an optional value.
+    #[doc(cfg(feature = "experimental"))]
+    pub fn maybe_payload_limits(
+        self,
+        value: Option<PayloadLimitsOptions>,
+    ) -> ConnectionOptionsBuilder<connection_options_builder::SetPayloadLimits<S>>
+    where
+        S::PayloadLimits: connection_options_builder::IsUnset,
+    {
+        self.__maybe_payload_limits(value)
+    }
 }
 
 // Setters/getters for fields that should only be touched by SDK implementers.
@@ -160,10 +197,12 @@ pub struct ClientOptions {
 
     #[builder(field)]
     #[debug(skip)]
+    #[cfg(feature = "experimental")]
     plugins: Vec<ErasedClientPlugin>,
 
     #[builder(field)]
     #[debug(skip)]
+    #[cfg(feature = "experimental")]
     client_plugins_applied: bool,
 
     /// The data converter used for serializing/deserializing payloads.
@@ -175,10 +214,12 @@ pub struct ClientOptions {
     pub client_interceptors: Vec<Arc<dyn ClientInterceptor>>,
 }
 
+#[cfg(feature = "experimental")]
 impl<S: client_options_builder::State> ClientOptionsBuilder<S> {
     /// Register a type-erased client plugin.
     ///
     /// **Experimental:** This API may change or be removed.
+    #[cfg_attr(docsrs, doc(cfg(feature = "experimental")))]
     pub fn plugin<P: Into<ErasedClientPlugin>>(mut self, plugin: P) -> Self {
         self.plugins.push(plugin.into());
         self
@@ -187,6 +228,7 @@ impl<S: client_options_builder::State> ClientOptionsBuilder<S> {
     /// Register type-erased client plugins in iteration order.
     ///
     /// **Experimental:** This API may change or be removed.
+    #[cfg_attr(docsrs, doc(cfg(feature = "experimental")))]
     pub fn plugins<I, P>(mut self, plugins: I) -> Self
     where
         I: IntoIterator<Item = P>,
@@ -199,6 +241,7 @@ impl<S: client_options_builder::State> ClientOptionsBuilder<S> {
     /// Register a client-only plugin.
     ///
     /// **Experimental:** This API may change or be removed.
+    #[cfg_attr(docsrs, doc(cfg(feature = "experimental")))]
     pub fn client_plugin<P: ClientPlugin>(mut self, plugin: P) -> Self {
         self.plugins.push(ErasedClientPlugin::new(plugin));
         self
@@ -211,14 +254,18 @@ impl ClientOptions {
     /// This is intended for SDK integrations that propagate worker plugin registrations.
     ///
     /// **Experimental:** This API may change or be removed.
+    #[cfg(feature = "experimental")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "experimental")))]
     pub fn plugins(&self) -> &[ErasedClientPlugin] {
         &self.plugins
     }
 
+    #[cfg(feature = "experimental")]
     pub(crate) fn client_plugins_applied(&self) -> bool {
         self.client_plugins_applied
     }
 
+    #[cfg(feature = "experimental")]
     pub(crate) fn mark_client_plugins_applied(&mut self) {
         self.client_plugins_applied = true;
     }
@@ -353,6 +400,8 @@ impl Default for DnsLoadBalancingOptions {
 
 /// Payload size limit options for a connection.
 /// NOTE: Experimental
+#[cfg(feature = "experimental")]
+#[cfg_attr(docsrs, doc(cfg(feature = "experimental")))]
 #[derive(Clone, Debug, PartialEq, bon::Builder)]
 #[non_exhaustive]
 pub struct PayloadLimitsOptions {
@@ -366,6 +415,7 @@ pub struct PayloadLimitsOptions {
     pub memo_warn_size: u64,
 }
 
+#[cfg(feature = "experimental")]
 impl Default for PayloadLimitsOptions {
     fn default() -> Self {
         Self::builder().build()
@@ -420,6 +470,14 @@ pub struct WorkflowStartOptions {
     /// Optionally enable Eager Workflow Start, a latency optimization using local workers
     /// NOTE: Experimental
     #[cfg(feature = "experimental")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "experimental")))]
+    #[cfg_attr(
+        docsrs,
+        builder(setters(
+            some_fn(name = __enable_eager_workflow_start, vis = "pub(crate)"),
+            option_fn(name = __maybe_enable_eager_workflow_start, vis = "pub(crate)")
+        ))
+    )]
     #[builder(default)]
     pub enable_eager_workflow_start: bool,
 
@@ -455,6 +513,33 @@ pub struct WorkflowStartOptions {
     /// Controls for the RPC used to start the workflow.
     #[builder(default)]
     pub rpc_options: RpcOptions,
+}
+
+#[cfg(all(feature = "experimental", docsrs))]
+impl<S: workflow_start_options_builder::State> WorkflowStartOptionsBuilder<S> {
+    /// Enable eager workflow start.
+    #[doc(cfg(feature = "experimental"))]
+    pub fn enable_eager_workflow_start(
+        self,
+        value: bool,
+    ) -> WorkflowStartOptionsBuilder<workflow_start_options_builder::SetEnableEagerWorkflowStart<S>>
+    where
+        S::EnableEagerWorkflowStart: workflow_start_options_builder::IsUnset,
+    {
+        self.__enable_eager_workflow_start(value)
+    }
+
+    /// Set eager workflow start from an optional value.
+    #[doc(cfg(feature = "experimental"))]
+    pub fn maybe_enable_eager_workflow_start(
+        self,
+        value: Option<bool>,
+    ) -> WorkflowStartOptionsBuilder<workflow_start_options_builder::SetEnableEagerWorkflowStart<S>>
+    where
+        S::EnableEagerWorkflowStart: workflow_start_options_builder::IsUnset,
+    {
+        self.__maybe_enable_eager_workflow_start(value)
+    }
 }
 
 impl WorkflowStartOptions {
