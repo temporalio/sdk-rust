@@ -1,4 +1,9 @@
-use std::time::{Duration, SystemTime};
+use super::{WorkflowRandomState, WorkflowRandomStream, WorkflowRandomStreamSource};
+use std::{
+    marker::PhantomData,
+    sync::{Arc, Mutex},
+    time::{Duration, SystemTime},
+};
 
 use temporalio_common_wasm::{
     Memo, Priority, RetryPolicy, WorkflowExecution,
@@ -20,7 +25,10 @@ pub struct WorkflowContextView {
     task_queue: String,
     run_id: String,
     payload_converter: PayloadConverter,
-    is_read_only: bool,
+    requires_replay_safety: bool,
+    // Workflow execution is single-threaded, but synchronization here preserves this public
+    // type's existing Send and Sync auto-trait implementations.
+    workflow_random: Option<Arc<Mutex<WorkflowRandomState>>>,
 }
 
 impl WorkflowContextView {
@@ -31,7 +39,8 @@ impl WorkflowContextView {
         run_id: String,
         raw: InitializeWorkflow,
         payload_converter: PayloadConverter,
-        is_read_only: bool,
+        requires_replay_safety: bool,
+        workflow_random: Option<Arc<Mutex<WorkflowRandomState>>>,
     ) -> Self {
         Self {
             raw,
@@ -39,7 +48,8 @@ impl WorkflowContextView {
             task_queue,
             run_id,
             payload_converter,
-            is_read_only,
+            requires_replay_safety,
+            workflow_random,
         }
     }
 
@@ -159,24 +169,25 @@ impl WorkflowContextView {
             .map(SearchAttributes::from_proto)
     }
 
-    /// Reports whether the current workflow code is executing in a read-only context.
-    ///
-    /// Query handlers, update validators, and patch activation callbacks are read-only. Workflow
-    /// initialization is not considered read-only even though it also receives a
-    /// `WorkflowContextView`.
-    ///
-    /// This is useful for helpers shared by read-only execution paths:
-    ///
-    /// ```
-    /// # use temporalio_workflow::WorkflowContextView;
-    /// fn inspect(ctx: &WorkflowContextView) {
-    ///     if ctx.is_read_only() {
-    ///         // Avoid changes that would affect workflow execution.
-    ///     }
-    /// }
-    /// ```
-    pub fn is_read_only(&self) -> bool {
-        self.is_read_only
+    #[allow(
+        dead_code,
+        reason = "used by SDK-provided interceptors built separately from this change"
+    )]
+    pub(crate) fn random_stream(&self, name: impl Into<String>) -> WorkflowRandomStream {
+        let source = if self.requires_replay_safety {
+            WorkflowRandomStreamSource::Workflow(
+                self.workflow_random
+                    .clone()
+                    .expect("replay-safe context views must have workflow randomness"),
+            )
+        } else {
+            super::system_random_stream_source()
+        };
+        WorkflowRandomStream {
+            source,
+            name: name.into(),
+            _not_send_or_sync: PhantomData,
+        }
     }
 
     /// Accesses the underlying workflow initialization protobuf.

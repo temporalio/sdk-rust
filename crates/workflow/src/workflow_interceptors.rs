@@ -329,11 +329,6 @@ impl WorkflowInterceptorContext {
         self.base.is_replaying_history_events()
     }
 
-    /// Reports whether the intercepted workflow operation is executing in a read-only context.
-    pub fn is_read_only(&self) -> bool {
-        self.base.is_read_only()
-    }
-
     /// Returns the payload converter used by the worker running this workflow.
     pub fn payload_converter(&self) -> &PayloadConverter {
         self.base.payload_converter()
@@ -477,11 +472,6 @@ impl SyncWorkflowInterceptorContext {
     /// Returns true if the current work is replaying history events.
     pub fn is_replaying_history_events(&self) -> bool {
         self.base.is_replaying_history_events()
-    }
-
-    /// Reports whether the intercepted workflow operation is executing in a read-only context.
-    pub fn is_read_only(&self) -> bool {
-        self.base.is_read_only()
     }
 
     /// Returns the payload converter used by the worker running this workflow.

@@ -58,7 +58,7 @@ use std::{
     pin::Pin,
     rc::Rc,
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, Ordering},
     },
     task::{Poll, Waker},
@@ -143,7 +143,7 @@ macro_rules! impl_random_value {
 
 impl_random_value!(u8, u16, u32, u64, u128, i8, i16, i32, i64, i128, f32, f64);
 
-/// A deterministic pseudo-random stream private to a stable caller-supplied name.
+/// A pseudo-random stream private to a stable caller-supplied name.
 ///
 /// Obtain a stream with [`WorkflowContext::random_stream`],
 /// [`SyncWorkflowContext::random_stream`], or
@@ -159,30 +159,58 @@ impl_random_value!(u8, u16, u32, u64, u128, i8, i16, i32, i64, i128, f32, f64);
 /// Workflow reset replays the original sequence through the reset point. When Core supplies the
 /// reset run's new randomness seed, all named streams start new sequences for work after that
 /// point. Continue-as-new creates a new workflow run and independently seeds all streams.
-///
-/// Random streams are deliberately unavailable from [`WorkflowContextView`], which is used by
-/// read-only init, query, and update-validator handlers.
 #[derive(Clone)]
 pub struct WorkflowRandomStream {
-    base: BaseWorkflowContext,
+    source: WorkflowRandomStreamSource,
     name: String,
+    _not_send_or_sync: PhantomData<Rc<()>>,
+}
+
+#[derive(Clone)]
+enum WorkflowRandomStreamSource {
+    Workflow(Arc<Mutex<WorkflowRandomState>>),
+    System(Arc<Mutex<Pcg64Mcg>>),
 }
 
 impl WorkflowRandomStream {
-    /// Generates the next deterministic pseudo-random value from this named stream.
+    /// Generates the next pseudo-random value from this named stream.
     ///
     /// This generator is not cryptographically secure.
     pub fn random<T>(&self) -> T
     where
         T: WorkflowRandomValue,
     {
-        self.base.named_random(&self.name)
+        match &self.source {
+            WorkflowRandomStreamSource::Workflow(random) => {
+                random.lock().unwrap().named_random(&self.name)
+            }
+            WorkflowRandomStreamSource::System(random) => {
+                <T as private::Sealed>::sample(&mut random.lock().unwrap())
+            }
+        }
     }
 
     /// Returns the stable name associated with this stream.
     pub fn name(&self) -> &str {
         &self.name
     }
+}
+
+fn system_random_stream_source() -> WorkflowRandomStreamSource {
+    #[cfg(not(target_arch = "wasm32"))]
+    let seed = rand::random();
+    #[cfg(target_arch = "wasm32")]
+    let seed = {
+        // wasm32-unknown-unknown has no system entropy source by default, so RandomState uses the
+        // standard library's allocation-address fallback and varies its keys between constructions.
+        // This stream is only used when replay safety is not required; the important property here
+        // is that generating incidental identifiers does not consume workflow randomness.
+        let mut hasher = std::hash::BuildHasher::build_hasher(&std::hash::RandomState::new());
+        std::hash::Hasher::write(&mut hasher, b"temporal-rust-system-random-stream");
+        std::hash::Hasher::finish(&hasher)
+    };
+
+    WorkflowRandomStreamSource::System(Arc::new(Mutex::new(Pcg64Mcg::seed_from_u64(seed))))
 }
 
 fn named_random_seed(randomness_seed: u64, name: &str) -> u64 {
@@ -192,6 +220,40 @@ fn named_random_seed(randomness_seed: u64, name: &str) -> u64 {
     hasher.write(b"temporal-rust-workflow-random-stream\0");
     hasher.write(name.as_bytes());
     hasher.finish()
+}
+
+#[derive(Clone, Debug)]
+pub(super) struct WorkflowRandomState {
+    random: Pcg64Mcg,
+    randomness_seed: u64,
+    named_random: HashMap<String, Pcg64Mcg>,
+}
+
+impl WorkflowRandomState {
+    fn new(randomness_seed: u64) -> Self {
+        Self {
+            random: Pcg64Mcg::seed_from_u64(randomness_seed),
+            randomness_seed,
+            named_random: HashMap::new(),
+        }
+    }
+
+    fn random<T: WorkflowRandomValue>(&mut self) -> T {
+        <T as private::Sealed>::sample(&mut self.random)
+    }
+
+    fn named_random<T: WorkflowRandomValue>(&mut self, name: &str) -> T {
+        let random = self.named_random.entry(name.to_owned()).or_insert_with(|| {
+            Pcg64Mcg::seed_from_u64(named_random_seed(self.randomness_seed, name))
+        });
+        <T as private::Sealed>::sample(random)
+    }
+
+    fn reseed(&mut self, randomness_seed: u64) {
+        self.random = Pcg64Mcg::seed_from_u64(randomness_seed);
+        self.randomness_seed = randomness_seed;
+        self.named_random.clear();
+    }
 }
 
 /// Non-generic base context containing all workflow execution infrastructure.
@@ -241,7 +303,8 @@ impl PatchActivationCaller {
                 run_id,
                 init,
                 payload_converter,
-                true,
+                false,
+                None,
             ),
         }
     }
@@ -283,16 +346,17 @@ impl BaseWorkflowContext {
         activation: &CoreWorkflowActivation,
         is_replaying_history_events: bool,
     ) {
-        let mut shared = self.inner.shared.borrow_mut();
-        shared.activation = activation.clone();
-        shared.is_replaying_history_events = is_replaying_history_events;
-        if let Some(seed) = activation.jobs.iter().find_map(|job| match &job.variant {
-            Some(ActivationVariant::UpdateRandomSeed(attrs)) => Some(attrs.randomness_seed),
-            _ => None,
-        }) {
-            shared.random = Pcg64Mcg::seed_from_u64(seed);
-            shared.randomness_seed = seed;
-            shared.named_random.clear();
+        let new_seed = {
+            let mut shared = self.inner.shared.borrow_mut();
+            shared.activation = activation.clone();
+            shared.is_replaying_history_events = is_replaying_history_events;
+            activation.jobs.iter().find_map(|job| match &job.variant {
+                Some(ActivationVariant::UpdateRandomSeed(attrs)) => Some(attrs.randomness_seed),
+                _ => None,
+            })
+        };
+        if let Some(seed) = new_seed {
+            self.inner.random.lock().unwrap().reseed(seed);
         }
     }
 
@@ -300,27 +364,14 @@ impl BaseWorkflowContext {
     where
         T: WorkflowRandomValue,
     {
-        let random = &mut self.inner.shared.borrow_mut().random;
-        <T as private::Sealed>::sample(random)
-    }
-
-    fn named_random<T>(&self, name: &str) -> T
-    where
-        T: WorkflowRandomValue,
-    {
-        let mut shared = self.inner.shared.borrow_mut();
-        let seed = shared.randomness_seed;
-        let random = shared
-            .named_random
-            .entry(name.to_owned())
-            .or_insert_with(|| Pcg64Mcg::seed_from_u64(named_random_seed(seed, name)));
-        <T as private::Sealed>::sample(random)
+        self.inner.random.lock().unwrap().random()
     }
 
     pub(crate) fn random_stream(&self, name: impl Into<String>) -> WorkflowRandomStream {
         WorkflowRandomStream {
-            base: self.clone(),
+            source: WorkflowRandomStreamSource::Workflow(self.inner.random.clone()),
             name: name.into(),
+            _not_send_or_sync: PhantomData,
         }
     }
 
@@ -395,13 +446,12 @@ impl BaseWorkflowContext {
         self.inner.shared.borrow().is_replaying_history_events
     }
 
-    /// Reports whether the current workflow code is executing in a read-only context.
-    pub fn is_read_only(&self) -> bool {
-        self.inner.is_read_only.get()
+    fn requires_replay_safety(&self) -> bool {
+        self.inner.requires_replay_safety.get()
     }
 
     pub(crate) fn enter_read_only(&self) -> ReadOnlyGuard {
-        let previous = self.inner.is_read_only.replace(true);
+        let previous = self.inner.requires_replay_safety.replace(false);
         ReadOnlyGuard {
             base: self.clone(),
             previous,
@@ -469,7 +519,8 @@ impl BaseWorkflowContext {
             self.inner.run_id.clone(),
             initial_information,
             self.inner.data_converter.payload_converter().clone(),
-            self.is_read_only(),
+            self.requires_replay_safety(),
+            Some(self.inner.random.clone()),
         )
     }
 }
@@ -573,12 +624,13 @@ struct WorkflowContextInner {
     cancellation_token: WorkflowCancellationToken,
     cancelled_operations: RefCell<HashSet<CancellableSeqNum>>,
     shared: RefCell<WorkflowContextSharedData>,
+    random: Arc<Mutex<WorkflowRandomState>>,
     seq_nums: RefCell<WfCtxProtectedDat>,
     data_converter: DataConverter,
     patch_activation_callback: Option<PatchActivationCallback>,
     state_mutated: Cell<bool>,
     active_handlers: Cell<usize>,
-    is_read_only: Cell<bool>,
+    requires_replay_safety: Cell<bool>,
     condition_wakers: RefCell<Vec<Waker>>,
     current_waker: RefCell<Option<Waker>>,
     workflow_interceptors: Rc<[Arc<dyn WorkflowInterceptor>]>,
@@ -595,7 +647,7 @@ pub(crate) struct ReadOnlyGuard {
 
 impl Drop for ReadOnlyGuard {
     fn drop(&mut self) {
-        self.base.inner.is_read_only.set(self.previous);
+        self.base.inner.requires_replay_safety.set(self.previous);
     }
 }
 
@@ -696,13 +748,17 @@ impl BaseWorkflowContext {
             run_id,
             initialize_workflow,
         } = init;
+        let random = Arc::new(Mutex::new(WorkflowRandomState::new(
+            initialize_workflow.randomness_seed,
+        )));
         let view = WorkflowContextView::new(
             namespace,
             task_queue,
             run_id,
             initialize_workflow,
             data_converter.payload_converter().clone(),
-            false,
+            true,
+            Some(random.clone()),
         );
         let workflow_interceptors = workflow_interceptor_constructors
             .into_iter()
@@ -716,9 +772,6 @@ impl BaseWorkflowContext {
                 task_queue,
                 run_id,
                 shared: RefCell::new(WorkflowContextSharedData {
-                    random: Pcg64Mcg::seed_from_u64(init_workflow_job.randomness_seed),
-                    randomness_seed: init_workflow_job.randomness_seed,
-                    named_random: HashMap::new(),
                     memo: init_workflow_job.memo.clone().unwrap_or_default(),
                     search_attributes: init_workflow_job
                         .search_attributes
@@ -730,6 +783,7 @@ impl BaseWorkflowContext {
                     current_details: Default::default(),
                     notified_patches: Default::default(),
                 }),
+                random,
                 initial_information: init_workflow_job,
                 runtime: WorkflowRuntimeState::new(host),
                 cancellation_token: WorkflowCancellationToken::new(),
@@ -747,7 +801,7 @@ impl BaseWorkflowContext {
                 patch_activation_callback,
                 state_mutated: Cell::new(false),
                 active_handlers: Cell::new(0),
-                is_read_only: Cell::new(false),
+                requires_replay_safety: Cell::new(true),
                 condition_wakers: Default::default(),
                 current_waker: RefCell::new(None),
                 workflow_interceptors,
@@ -1528,14 +1582,6 @@ impl<W> SyncWorkflowContext<W> {
         self.base.inner.shared.borrow().is_replaying_history_events
     }
 
-    /// Reports whether the current workflow code is executing in a read-only context.
-    ///
-    /// This is true in query handlers and update validators, and false during normal workflow,
-    /// signal-handler, and update-handler execution.
-    pub fn is_read_only(&self) -> bool {
-        self.base.is_read_only()
-    }
-
     /// Returns whether all currently dispatched signal and update handlers have finished.
     ///
     /// This includes the current handler invocation, if any, and all inbound interceptor work.
@@ -2028,13 +2074,6 @@ impl<W> WorkflowContext<W> {
         self.sync.is_replaying_history_events()
     }
 
-    /// Reports whether the current workflow code is executing in a read-only context.
-    ///
-    /// See [`SyncWorkflowContext::is_read_only`].
-    pub fn is_read_only(&self) -> bool {
-        self.sync.is_read_only()
-    }
-
     /// Returns whether all currently dispatched signal and update handlers have finished.
     ///
     /// Consider waiting on this condition before completing or continuing as new so in-progress
@@ -2373,9 +2412,6 @@ struct WorkflowContextSharedData {
     memo: ProtoMemo,
     is_replaying_history_events: bool,
     search_attributes: ProtoSearchAttributes,
-    random: Pcg64Mcg,
-    randomness_seed: u64,
-    named_random: HashMap<String, Pcg64Mcg>,
     /// Current details string, surfaced via the workflow metadata query.
     current_details: String,
 }
@@ -3866,7 +3902,10 @@ mod tests {
         let callback_calls = calls.clone();
         let callback_input = input.clone();
         let callback: PatchActivationCallback = Arc::new(move |value| {
-            assert!(value.workflow_info.is_read_only());
+            assert!(matches!(
+                value.workflow_info.random_stream("plugin").source,
+                WorkflowRandomStreamSource::System(_)
+            ));
             callback_calls.fetch_add(1, AtomicOrdering::Relaxed);
             *callback_input.lock().unwrap() = Some(value);
             true
@@ -3874,7 +3913,6 @@ mod tests {
         let (_, ctx, commands) = patch_test_context(Some(callback));
 
         assert!(ctx.patched("my-patch"));
-        assert!(!ctx.is_read_only());
         assert!(ctx.patched("my-patch"));
         assert_eq!(calls.load(AtomicOrdering::Relaxed), 1);
         assert_eq!(commands.borrow().len(), 1);
@@ -4037,6 +4075,50 @@ mod tests {
         let expected = test_context_with_seed(42).random_stream("plugin");
         assert_eq!(first, expected.random::<u64>());
         assert_eq!(second, expected.random::<u64>());
+    }
+
+    #[test]
+    fn replay_safe_context_view_shares_workflow_randomness() {
+        let ctx = test_context_with_seed(42);
+        let first = ctx.sync.base.view().random_stream("plugin").random::<u64>();
+        let second = ctx.random_stream("plugin").random::<u64>();
+
+        let expected = test_context_with_seed(42).random_stream("plugin");
+        assert_eq!(first, expected.random::<u64>());
+        assert_eq!(second, expected.random::<u64>());
+    }
+
+    #[test]
+    fn read_only_context_view_does_not_advance_workflow_randomness() {
+        let ctx = test_context_with_seed(42);
+        let expected = test_context_with_seed(42)
+            .random_stream("plugin")
+            .random::<u64>();
+
+        {
+            let _read_only = ctx.sync.base.enter_read_only();
+            let _ = ctx.sync.base.view().random_stream("plugin").random::<u64>();
+        }
+
+        assert_eq!(ctx.random_stream("plugin").random::<u64>(), expected);
+    }
+
+    #[test]
+    fn nested_read_only_scopes_restore_replay_safety() {
+        let ctx = test_context_with_seed(42);
+        assert!(ctx.sync.base.requires_replay_safety());
+
+        {
+            let _outer = ctx.sync.base.enter_read_only();
+            assert!(!ctx.sync.base.requires_replay_safety());
+            {
+                let _inner = ctx.sync.base.enter_read_only();
+                assert!(!ctx.sync.base.requires_replay_safety());
+            }
+            assert!(!ctx.sync.base.requires_replay_safety());
+        }
+
+        assert!(ctx.sync.base.requires_replay_safety());
     }
 
     #[test]

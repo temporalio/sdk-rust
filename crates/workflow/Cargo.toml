@@ -38,6 +38,9 @@ thiserror = "2"
 uuid = { version = "1.18", default-features = false }
 wit-bindgen = { version = "0.57.1", default-features = false, features = ["macros", "std", "realloc", "bitflags"] }
 
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+rand = { version = "0.10", default-features = false, features = ["thread_rng"] }
+
 [dependencies.temporalio-common-wasm]
 path = "../common-wasm"
 version = "~0.7.0"
