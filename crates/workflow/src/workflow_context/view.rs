@@ -131,6 +131,9 @@ impl WorkflowContextView {
     }
 
     /// Returns information about the root workflow in the execution chain.
+    ///
+    /// Its namespace is not retained and may differ from this workflow's namespace for
+    /// cross-namespace child workflows. Track it separately if needed.
     pub fn root(&self) -> Option<WorkflowExecution> {
         self.raw.root_workflow.clone().map(Into::into)
     }
