@@ -95,7 +95,10 @@ async fn wasm_patch_activation_callback_can_decline() {
     let callback_input = input.clone();
     let callback: PatchActivationCallback = Arc::new(move |value| {
         callback_calls.fetch_add(1, Ordering::Relaxed);
-        *callback_input.lock().unwrap() = Some(value);
+        *callback_input.lock().unwrap() = Some((
+            value.workflow_info.workflow_type().to_string(),
+            value.patch_id,
+        ));
         false
     });
 
@@ -108,11 +111,8 @@ async fn wasm_patch_activation_callback_can_decline() {
     assert_eq!(marker_count, 0);
     let input = input.lock().unwrap();
     let input = input.as_ref().unwrap();
-    assert_eq!(
-        input.workflow_info.workflow_type(),
-        WASM_PATCH_ACTIVATION_WORKFLOW_TYPE
-    );
-    assert_eq!(input.patch_id, WASM_PATCH_ID);
+    assert_eq!(input.0, WASM_PATCH_ACTIVATION_WORKFLOW_TYPE);
+    assert_eq!(input.1, WASM_PATCH_ID);
 }
 
 #[tokio::test]

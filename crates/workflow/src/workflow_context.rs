@@ -58,7 +58,7 @@ use std::{
     pin::Pin,
     rc::Rc,
     sync::{
-        Arc, Mutex,
+        Arc,
         atomic::{AtomicBool, Ordering},
     },
     task::{Poll, Waker},
@@ -163,13 +163,12 @@ impl_random_value!(u8, u16, u32, u64, u128, i8, i16, i32, i64, i128, f32, f64);
 pub struct WorkflowRandomStream {
     source: WorkflowRandomStreamSource,
     name: String,
-    _not_send_or_sync: PhantomData<Rc<()>>,
 }
 
 #[derive(Clone)]
 enum WorkflowRandomStreamSource {
-    Workflow(Arc<Mutex<WorkflowRandomState>>),
-    System(Arc<Mutex<Pcg64Mcg>>),
+    Workflow(Rc<RefCell<WorkflowRandomState>>),
+    System(Rc<RefCell<Pcg64Mcg>>),
 }
 
 impl WorkflowRandomStream {
@@ -182,10 +181,10 @@ impl WorkflowRandomStream {
     {
         match &self.source {
             WorkflowRandomStreamSource::Workflow(random) => {
-                random.lock().unwrap().named_random(&self.name)
+                random.borrow_mut().named_random(&self.name)
             }
             WorkflowRandomStreamSource::System(random) => {
-                <T as private::Sealed>::sample(&mut random.lock().unwrap())
+                <T as private::Sealed>::sample(&mut random.borrow_mut())
             }
         }
     }
@@ -210,7 +209,7 @@ fn system_random_stream_source() -> WorkflowRandomStreamSource {
         std::hash::Hasher::finish(&hasher)
     };
 
-    WorkflowRandomStreamSource::System(Arc::new(Mutex::new(Pcg64Mcg::seed_from_u64(seed))))
+    WorkflowRandomStreamSource::System(Rc::new(RefCell::new(Pcg64Mcg::seed_from_u64(seed))))
 }
 
 fn named_random_seed(randomness_seed: u64, name: &str) -> u64 {
@@ -356,7 +355,7 @@ impl BaseWorkflowContext {
             })
         };
         if let Some(seed) = new_seed {
-            self.inner.random.lock().unwrap().reseed(seed);
+            self.inner.random.borrow_mut().reseed(seed);
         }
     }
 
@@ -364,14 +363,13 @@ impl BaseWorkflowContext {
     where
         T: WorkflowRandomValue,
     {
-        self.inner.random.lock().unwrap().random()
+        self.inner.random.borrow_mut().random()
     }
 
     pub(crate) fn random_stream(&self, name: impl Into<String>) -> WorkflowRandomStream {
         WorkflowRandomStream {
             source: WorkflowRandomStreamSource::Workflow(self.inner.random.clone()),
             name: name.into(),
-            _not_send_or_sync: PhantomData,
         }
     }
 
@@ -624,7 +622,7 @@ struct WorkflowContextInner {
     cancellation_token: WorkflowCancellationToken,
     cancelled_operations: RefCell<HashSet<CancellableSeqNum>>,
     shared: RefCell<WorkflowContextSharedData>,
-    random: Arc<Mutex<WorkflowRandomState>>,
+    random: Rc<RefCell<WorkflowRandomState>>,
     seq_nums: RefCell<WfCtxProtectedDat>,
     data_converter: DataConverter,
     patch_activation_callback: Option<PatchActivationCallback>,
@@ -748,7 +746,7 @@ impl BaseWorkflowContext {
             run_id,
             initialize_workflow,
         } = init;
-        let random = Arc::new(Mutex::new(WorkflowRandomState::new(
+        let random = Rc::new(RefCell::new(WorkflowRandomState::new(
             initialize_workflow.randomness_seed,
         )));
         let view = WorkflowContextView::new(
@@ -3907,7 +3905,11 @@ mod tests {
                 WorkflowRandomStreamSource::System(_)
             ));
             callback_calls.fetch_add(1, AtomicOrdering::Relaxed);
-            *callback_input.lock().unwrap() = Some(value);
+            *callback_input.lock().unwrap() = Some((
+                value.workflow_info.workflow_id().to_string(),
+                value.workflow_info.run_id().to_string(),
+                value.patch_id,
+            ));
             true
         });
         let (_, ctx, commands) = patch_test_context(Some(callback));
@@ -3918,9 +3920,9 @@ mod tests {
         assert_eq!(commands.borrow().len(), 1);
         let input = input.lock().unwrap();
         let input = input.as_ref().unwrap();
-        assert_eq!(input.workflow_info.workflow_id(), "workflow-id");
-        assert_eq!(input.workflow_info.run_id(), "run-id");
-        assert_eq!(input.patch_id, "my-patch");
+        assert_eq!(input.0, "workflow-id");
+        assert_eq!(input.1, "run-id");
+        assert_eq!(input.2, "my-patch");
     }
 
     #[test]

@@ -1,7 +1,7 @@
 use super::{WorkflowRandomState, WorkflowRandomStream, WorkflowRandomStreamSource};
 use std::{
-    marker::PhantomData,
-    sync::{Arc, Mutex},
+    cell::RefCell,
+    rc::Rc,
     time::{Duration, SystemTime},
 };
 
@@ -26,9 +26,7 @@ pub struct WorkflowContextView {
     run_id: String,
     payload_converter: PayloadConverter,
     requires_replay_safety: bool,
-    // Workflow execution is single-threaded, but synchronization here preserves this public
-    // type's existing Send and Sync auto-trait implementations.
-    workflow_random: Option<Arc<Mutex<WorkflowRandomState>>>,
+    workflow_random: Option<Rc<RefCell<WorkflowRandomState>>>,
 }
 
 impl WorkflowContextView {
@@ -40,7 +38,7 @@ impl WorkflowContextView {
         raw: InitializeWorkflow,
         payload_converter: PayloadConverter,
         requires_replay_safety: bool,
-        workflow_random: Option<Arc<Mutex<WorkflowRandomState>>>,
+        workflow_random: Option<Rc<RefCell<WorkflowRandomState>>>,
     ) -> Self {
         Self {
             raw,
@@ -186,7 +184,6 @@ impl WorkflowContextView {
         WorkflowRandomStream {
             source,
             name: name.into(),
-            _not_send_or_sync: PhantomData,
         }
     }
 

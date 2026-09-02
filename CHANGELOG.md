@@ -33,6 +33,11 @@ relevant information.
 
 ## Unreleased
 
+### Breaking Changes
+* `WorkflowContextView` and the containing `PatchActivationInput` are no longer `Send` or `Sync`
+  because workflow context views now share single-threaded workflow randomness with replay-sensitive
+  SDK integrations.
+
 ### Added
 * `DefaultFailureConverter::new(true)` moves failure messages and stack traces into encoded
   attributes so payload codecs can encrypt them.
