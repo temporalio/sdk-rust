@@ -33,6 +33,10 @@ relevant information.
 
 ## Unreleased
 
+### Added
+* `CancelExternalWorkflowError` and `workflow_interceptors::CancelExternalWorkflowResult`
+  for use in interceptors.
+
 ## [0.8.0] - 2026-09-02
 
 ### Breaking Changes
@@ -43,8 +47,6 @@ relevant information.
   SDK integrations.
 
 ### Added
-* `CancelExternalWorkflowError` and `workflow_interceptors::CancelExternalWorkflowResult`
-  for use in interceptors.
 * `DefaultFailureConverter::new(true)` moves failure messages and stack traces into encoded
   attributes so payload codecs can encrypt them.
 * `LocalActivityOptions::include_arguments_in_marker` allows Rust workflows to opt in to
