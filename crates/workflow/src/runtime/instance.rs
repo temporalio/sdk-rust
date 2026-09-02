@@ -1147,18 +1147,6 @@ where
     }
 }
 
-/// Instantiates a workflow behind the runtime-facing [`WorkflowInstance`] interface.
-pub fn instantiate_workflow<W: WorkflowImplementation>(
-    payloads: Vec<Payload>,
-    converter: PayloadConverter,
-    base_ctx: BaseWorkflowContext,
-) -> Result<Box<dyn WorkflowInstance>, PayloadConversionError>
-where
-    <W::Run as WorkflowDefinition>::Input: Send,
-{
-    GuestWorkflowInstance::<W>::instantiate(payloads, converter, base_ctx)
-}
-
 /// Attempts to turn caught panics into something printable
 fn panic_formatter(panic: Box<dyn Any>) -> Box<dyn Display> {
     _panic_formatter::<&str>(panic)

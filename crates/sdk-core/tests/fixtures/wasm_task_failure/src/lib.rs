@@ -4,14 +4,14 @@ use temporalio_workflow::{
         sdk::{
             ActivationJobResult, ActivationResult, MAIN_ROUTINE_ID, MainRoutineCompletion,
             RoutineCompletion, RoutinePollResult, TaskFailure, WorkflowActivation,
-            WorkflowDefinitionDescriptor, WorkflowFailure, WorkflowHost, WorkflowInit,
-            WorkflowInstance,
+            WorkflowFailure, WorkflowHost, WorkflowInit, WorkflowInstance,
         },
     },
     common::protos::temporal::api::{
         enums::v1::WorkflowTaskFailedCause,
         failure::v1::{ApplicationFailureInfo, Failure, failure::FailureInfo},
     },
+    workflows::WorkflowDefinitionDescriptor,
 };
 
 struct WasmTaskFailureWorkflow;

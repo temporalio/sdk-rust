@@ -39,14 +39,14 @@ pub mod __private {
             entry::WorkflowImplementation,
             guest::WorkflowInstance,
             host::WorkflowHost,
-            instance::{GuestWorkflowInstance, instantiate_workflow},
+            instance::GuestWorkflowInstance,
             is_sdk_wake,
             types::{
                 ActivationJobResult, ActivationResult, MAIN_ROUTINE_ID, MainRoutineCompletion,
                 QueryResponse, RoutineCompletion, RoutineId, RoutineKind, RoutinePendingState,
                 RoutinePollResult, StartedRoutine, TaskFailure, TerminalOutcome,
-                UpdateDefinitionDescriptor, UpdateRoutineCompletion, UpdateRoutineKind,
-                WorkflowActivation, WorkflowDefinitionDescriptor, WorkflowFailure, WorkflowInit,
+                UpdateRoutineCompletion, UpdateRoutineKind, WorkflowActivation, WorkflowFailure,
+                WorkflowInit,
             },
         };
     }

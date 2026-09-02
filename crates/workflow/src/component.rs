@@ -7,7 +7,7 @@ use crate::{
         entry::WorkflowImplementation,
         guest::WorkflowInstance as RuntimeWorkflowInstance,
         host::WorkflowHost,
-        instance::instantiate_workflow,
+        instance::GuestWorkflowInstance,
         types::{
             ActivationJobResult, MainRoutineCompletion, RoutineCompletion, RoutinePendingState,
             TerminalOutcome, UpdateRoutineCompletion, WorkflowDefinitionDescriptor,
@@ -253,7 +253,7 @@ where
         Some(patch_activation_callback),
         interceptor_constructors,
     );
-    instantiate_workflow::<W>(args, payload_converter, base_ctx).map_err(|err| {
+    GuestWorkflowInstance::<W>::instantiate(args, payload_converter, base_ctx).map_err(|err| {
         Box::new(Failure {
             message: format!("Workflow input deserialization failed: {err}"),
             ..Default::default()

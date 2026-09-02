@@ -163,9 +163,7 @@ use temporalio_common::{
     worker::{WorkerDeploymentOptions, WorkerTaskTypes, build_id_from_current_exe},
 };
 use temporalio_sdk_core::{PollError, init_worker};
-use temporalio_workflow::{
-    __private::sdk::WorkflowImplementation, InternalPatchActivationCallback,
-};
+use temporalio_workflow::{InternalPatchActivationCallback, workflows::WorkflowImplementation};
 use tokio::sync::{
     Notify,
     mpsc::{UnboundedSender, unbounded_channel},

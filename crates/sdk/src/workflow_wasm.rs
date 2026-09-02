@@ -9,11 +9,11 @@ use temporalio_workflow::{
     __private::sdk::{
         ActivationJobResult, ActivationResult, MainRoutineCompletion, QueryResponse,
         RoutineCompletion, RoutineKind, RoutinePendingState, RoutinePollResult, StartedRoutine,
-        TaskFailure, TerminalOutcome, UpdateDefinitionDescriptor, UpdateRoutineCompletion,
-        UpdateRoutineKind, WorkflowActivation, WorkflowDefinitionDescriptor, WorkflowFailure,
-        WorkflowHost, WorkflowInstance,
+        TaskFailure, TerminalOutcome, UpdateRoutineCompletion, UpdateRoutineKind,
+        WorkflowActivation, WorkflowFailure, WorkflowHost, WorkflowInstance,
     },
     PatchActivationCaller,
+    workflows::{UpdateDefinitionDescriptor, WorkflowDefinitionDescriptor},
 };
 use wasmtime::{
     Config, Engine, Store,
