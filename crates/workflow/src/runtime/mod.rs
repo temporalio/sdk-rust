@@ -238,13 +238,13 @@ pub(crate) fn mark_intercepted_handler_ready() {
 }
 
 /// Guard that marks the current scope as an SDK-initiated wake source.
-pub struct SdkWakeGuard {
+pub(crate) struct SdkWakeGuard {
     _not_send_or_sync: PhantomData<Rc<()>>,
 }
 
 impl SdkWakeGuard {
     /// Enters an SDK wake scope until the returned guard is dropped.
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         SDK_WAKE_DEPTH.with(|c| c.set(c.get() + 1));
         Self {
             _not_send_or_sync: PhantomData,
@@ -279,5 +279,45 @@ impl<F: Future + Unpin> Future for SdkGuardedFuture<F> {
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let _guard = SdkWakeGuard::new();
         Pin::new(&mut self.0).poll(cx)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sdk_wake_guard_nesting() {
+        assert!(!is_sdk_wake());
+
+        {
+            let _guard1 = SdkWakeGuard::new();
+            assert!(is_sdk_wake());
+            {
+                let _guard2 = SdkWakeGuard::new();
+                assert!(is_sdk_wake());
+            }
+            assert!(is_sdk_wake());
+        }
+        assert!(!is_sdk_wake());
+    }
+
+    #[test]
+    fn sdk_wake_guard_panic_safety() {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = SdkWakeGuard::new();
+            panic!("test panic");
+        }));
+        assert!(result.is_err());
+        assert!(!is_sdk_wake());
+    }
+
+    #[test]
+    fn sdk_wake_guard_is_thread_local() {
+        let _guard = SdkWakeGuard::new();
+        assert!(is_sdk_wake());
+
+        let child_is_sdk_wake = std::thread::spawn(is_sdk_wake).join().unwrap();
+        assert!(!child_is_sdk_wake);
     }
 }
