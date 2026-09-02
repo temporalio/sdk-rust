@@ -34,6 +34,8 @@ relevant information.
 ## Unreleased
 
 ### Breaking Changes
+* `SdkWakeGuard` is no longer `Send` or `Sync`, preventing the thread-local guard from being moved
+  to or referenced from another thread.
 * `WorkflowContextView` and the containing `PatchActivationInput` are no longer `Send` or `Sync`
   because workflow context views now share single-threaded workflow randomness with replay-sensitive
   SDK integrations.

@@ -7,6 +7,7 @@ use crate::runtime::types::RoutinePendingState;
 use std::{
     cell::{Cell, RefCell},
     future::Future,
+    marker::PhantomData,
     pin::Pin,
     rc::Rc,
     task::{Context, Poll},
@@ -239,14 +240,16 @@ pub(crate) fn mark_intercepted_handler_ready() {
 /// Guard that marks the current scope as an SDK-initiated wake source.
 #[doc(hidden)]
 pub struct SdkWakeGuard {
-    _priv: (),
+    _not_send_or_sync: PhantomData<Rc<()>>,
 }
 
 impl SdkWakeGuard {
     #[doc(hidden)]
     pub fn new() -> Self {
         SDK_WAKE_DEPTH.with(|c| c.set(c.get() + 1));
-        Self { _priv: () }
+        Self {
+            _not_send_or_sync: PhantomData,
+        }
     }
 }
 
