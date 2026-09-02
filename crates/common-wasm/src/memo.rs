@@ -19,7 +19,6 @@ pub struct Memo {
 impl Memo {
     /// Construct a memo with the payload converter and serialization context associated with its
     /// source.
-    #[doc(hidden)]
     pub fn from_raw(
         raw: Option<ProtoMemo>,
         payload_converter: PayloadConverter,
