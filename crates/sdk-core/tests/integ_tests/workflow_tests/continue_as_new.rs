@@ -18,7 +18,7 @@ use temporalio_sdk_core::{
     replay::{DEFAULT_WORKFLOW_TYPE, canned_histories},
     test_help::MockPollCfg,
 };
-use temporalio_workflow::runtime::types::ContinueAsNewRequest;
+use temporalio_workflow::__private::sdk::ContinueAsNewRequest;
 
 const SA_TXT: SearchAttributeKey<String> = SearchAttributeKey::text(SEARCH_ATTR_TXT);
 

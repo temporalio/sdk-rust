@@ -12,14 +12,11 @@ use temporalio_common::{
     },
 };
 use temporalio_workflow::{
-    BaseWorkflowContext, InternalPatchActivationCallback as PatchActivationCallback,
-    runtime::{
-        entry::WorkflowImplementation,
-        guest::WorkflowInstance,
-        host::WorkflowHost,
-        instance::{GuestWorkflowInstance, instantiate_workflow},
-        types::{WorkflowDefinitionDescriptor, WorkflowInit},
+    __private::sdk::{
+        GuestWorkflowInstance, WorkflowDefinitionDescriptor, WorkflowHost, WorkflowImplementation,
+        WorkflowInit, WorkflowInstance, instantiate_workflow,
     },
+    BaseWorkflowContext, InternalPatchActivationCallback as PatchActivationCallback,
     workflow_interceptors::WorkflowInterceptorConstructor,
 };
 

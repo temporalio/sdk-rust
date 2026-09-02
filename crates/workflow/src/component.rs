@@ -24,6 +24,10 @@ use temporalio_common_wasm::{
     protos::{coresdk::workflow_commands::WorkflowCommand, temporal::api::failure::v1::Failure},
 };
 
+/// Generated component-model bindings named by the workflow export macro.
+///
+/// This module must remain public because the export macro expands in the workflow author's crate.
+#[doc(hidden)]
 pub mod bindings {
     wit_bindgen::generate!({
         path: "wit",
@@ -46,8 +50,11 @@ use self::bindings::{
     temporal::workflow_runtime::{types as wit_types, workflow_host as wit_host},
 };
 
+/// Connects the static workflow set emitted by `export_workflow_module!` to the component adapter.
 pub trait StaticWorkflowComponent {
+    /// Describes every workflow implementation exported by the component.
     fn list_workflows() -> Vec<WorkflowDefinitionDescriptor>;
+    /// Instantiates the workflow selected by the host from the component's static workflow set.
     fn instantiate_workflow(
         workflow_type: &str,
         init: WorkflowInit,
@@ -55,6 +62,7 @@ pub trait StaticWorkflowComponent {
     ) -> Result<Box<dyn RuntimeWorkflowInstance>, WorkflowFailure>;
 }
 
+/// Adapts a [`StaticWorkflowComponent`] to the guest interface generated from the workflow WIT.
 pub struct ExportedComponent<T>(PhantomData<T>);
 
 impl<T: StaticWorkflowComponent> wit_guest::Guest for ExportedComponent<T> {
@@ -83,6 +91,7 @@ impl<T: StaticWorkflowComponent> wit_guest::Guest for ExportedComponent<T> {
     }
 }
 
+/// Adapts one runtime workflow instance to the resource interface generated from the workflow WIT.
 pub struct ExportedWorkflowInstance(RefCell<Box<dyn RuntimeWorkflowInstance>>);
 
 impl wit_guest::GuestWorkflowInstance for ExportedWorkflowInstance {
@@ -212,6 +221,7 @@ impl wit_guest::GuestWorkflowInstance for ExportedWorkflowInstance {
     }
 }
 
+/// Instantiates a generated workflow implementation for a component without interceptors.
 pub fn instantiate_component_workflow<W: WorkflowImplementation>(
     init: WorkflowInit,
     host: Rc<dyn WorkflowHost>,
@@ -222,6 +232,7 @@ where
     instantiate_component_workflow_with_interceptor_constructors::<W>(init, host, Vec::new())
 }
 
+/// Instantiates a generated workflow implementation with component-local interceptor constructors.
 pub fn instantiate_component_workflow_with_interceptor_constructors<W: WorkflowImplementation>(
     init: WorkflowInit,
     host: Rc<dyn WorkflowHost>,

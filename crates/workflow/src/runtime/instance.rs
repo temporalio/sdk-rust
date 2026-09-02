@@ -59,6 +59,7 @@ use temporalio_common_wasm::{
     },
 };
 
+/// Owns the deterministic execution state for one native workflow instance.
 pub struct GuestWorkflowInstance<W: WorkflowImplementation> {
     base_ctx: BaseWorkflowContext,
     ctx: WorkflowContext<W>,
@@ -360,6 +361,8 @@ impl<W: WorkflowImplementation> GuestWorkflowInstance<W>
 where
     <W::Run as WorkflowDefinition>::Input: Send,
 {
+    /// Deserializes workflow input, runs initialization interceptors, and creates an executable
+    /// workflow instance.
     pub fn instantiate(
         payloads: Vec<Payload>,
         converter: PayloadConverter,
@@ -407,6 +410,7 @@ where
         )))
     }
 
+    /// Creates an executable instance around an already initialized workflow value.
     pub fn new_with_workflow(
         workflow: W,
         base_ctx: BaseWorkflowContext,
@@ -1143,6 +1147,7 @@ where
     }
 }
 
+/// Instantiates a workflow behind the runtime-facing [`WorkflowInstance`] interface.
 pub fn instantiate_workflow<W: WorkflowImplementation>(
     payloads: Vec<Payload>,
     converter: PayloadConverter,

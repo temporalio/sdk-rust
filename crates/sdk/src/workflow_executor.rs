@@ -10,7 +10,7 @@ use std::{
     },
     task::{Context, Poll, Wake, Waker},
 };
-use temporalio_workflow::runtime::is_sdk_wake;
+use temporalio_workflow::__private::sdk::is_sdk_wake;
 
 /// Persists across polls to accumulate non-SDK wake detection. Each poll creates a lightweight
 /// waker via [`WakeTracker::new_per_poll_waker`] that shares the detection flag but has the
@@ -255,7 +255,7 @@ impl WorkflowExecutor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use temporalio_workflow::runtime::SdkWakeGuard;
+    use temporalio_workflow::__private::sdk::SdkWakeGuard;
     use tokio::sync::oneshot;
 
     #[tokio::test]

@@ -1180,7 +1180,7 @@ impl WorkflowMethodsDefinition {
                 let handler_name = &info.handler_name;
                 let has_validator = u.validator.is_some();
                 quote! {
-                    ::temporalio_workflow::runtime::types::UpdateDefinitionDescriptor {
+                    ::temporalio_workflow::__private::macros::UpdateDefinitionDescriptor {
                         name: (#handler_name).to_string(),
                         has_validator: #has_validator,
                     }
@@ -1377,7 +1377,7 @@ impl WorkflowMethodsDefinition {
         };
 
         quote! {
-            impl ::temporalio_workflow::runtime::entry::WorkflowImplementation for #impl_type {
+            impl ::temporalio_workflow::__private::macros::WorkflowImplementation for #impl_type {
                 type Run = #module_ident::#run_struct_ident;
 
                 const HAS_INIT: bool = #has_init;
@@ -1387,8 +1387,8 @@ impl WorkflowMethodsDefinition {
                     <#impl_type>::name()
                 }
 
-                fn definition() -> ::temporalio_workflow::runtime::types::WorkflowDefinitionDescriptor {
-                    ::temporalio_workflow::runtime::types::WorkflowDefinitionDescriptor {
+                fn definition() -> ::temporalio_workflow::__private::macros::WorkflowDefinitionDescriptor {
+                    ::temporalio_workflow::__private::macros::WorkflowDefinitionDescriptor {
                         workflow_type: Self::name().to_string(),
                         has_init: #has_init,
                         init_takes_input: #init_has_input,

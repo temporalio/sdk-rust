@@ -164,7 +164,7 @@ use temporalio_common::{
 };
 use temporalio_sdk_core::{PollError, init_worker};
 use temporalio_workflow::{
-    InternalPatchActivationCallback, runtime::entry::WorkflowImplementation,
+    __private::sdk::WorkflowImplementation, InternalPatchActivationCallback,
 };
 use tokio::sync::{
     Notify,

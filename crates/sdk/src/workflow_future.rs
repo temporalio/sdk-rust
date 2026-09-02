@@ -34,17 +34,13 @@ use temporalio_common::{
     },
 };
 use temporalio_workflow::{
-    InternalPatchActivationCallback as PatchActivationCallback,
-    runtime::{
-        guest::WorkflowInstance,
-        host::WorkflowHost,
-        model::{WorkflowResult, WorkflowTermination},
-        types::{
-            ActivationJobResult, ActivationResult, MainRoutineCompletion, RoutineCompletion,
-            RoutineId, RoutineKind, RoutinePendingState, RoutinePollResult, TerminalOutcome,
-            UpdateRoutineCompletion, WorkflowActivation,
-        },
+    __private::sdk::{
+        ActivationJobResult, ActivationResult, MainRoutineCompletion, RoutineCompletion, RoutineId,
+        RoutineKind, RoutinePendingState, RoutinePollResult, TerminalOutcome,
+        UpdateRoutineCompletion, WorkflowActivation, WorkflowHost, WorkflowInstance,
     },
+    InternalPatchActivationCallback as PatchActivationCallback, WorkflowResult,
+    WorkflowTermination,
 };
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 
@@ -527,7 +523,7 @@ impl WorkflowFuture {
             self.active_routines = still_active;
 
             let main_poll_result = match self
-                .poll_guest_routine(temporalio_workflow::runtime::types::MAIN_ROUTINE_ID, cx)
+                .poll_guest_routine(temporalio_workflow::__private::sdk::MAIN_ROUTINE_ID, cx)
             {
                 Ok(result) => result,
                 Err(e) => {

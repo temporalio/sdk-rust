@@ -1,18 +1,20 @@
 use temporalio_workflow::{
+    __private::{
+        macros::{
+            ExportedComponent, StaticWorkflowComponent, WorkflowImplementation,
+            instantiate_component_workflow,
+        },
+        sdk::{
+            ActivationJobResult, ActivationResult, MAIN_ROUTINE_ID, MainRoutineCompletion,
+            RoutineCompletion, RoutinePollResult, TaskFailure, WorkflowActivation,
+            WorkflowDefinitionDescriptor, WorkflowFailure, WorkflowHost, WorkflowInit,
+            WorkflowInstance,
+        },
+    },
     WorkflowContext, WorkflowResult,
     common::protos::temporal::api::{
         enums::v1::WorkflowTaskFailedCause,
         failure::v1::{ApplicationFailureInfo, Failure, failure::FailureInfo},
-    },
-    component::{StaticWorkflowComponent, instantiate_component_workflow},
-    runtime::{
-        guest::WorkflowInstance,
-        host::WorkflowHost,
-        types::{
-            ActivationJobResult, ActivationResult, MAIN_ROUTINE_ID, MainRoutineCompletion,
-            RoutineCompletion, RoutinePollResult, TaskFailure, WorkflowDefinitionDescriptor,
-            WorkflowFailure, WorkflowInit,
-        },
     },
     workflow, workflow_methods,
 };
@@ -34,7 +36,7 @@ struct WasmTaskFailureWorkflow;
 impl WorkflowInstance for WasmTaskFailureWorkflow {
     fn activate(
         &mut self,
-        activation: temporalio_workflow::runtime::types::WorkflowActivation,
+        activation: WorkflowActivation,
         _waker: &std::task::Waker,
     ) -> Result<ActivationResult, WorkflowFailure> {
         Ok(ActivationResult {
@@ -86,7 +88,7 @@ struct WasmTestWorkflowModule;
 impl StaticWorkflowComponent for WasmTestWorkflowModule {
     fn list_workflows() -> Vec<WorkflowDefinitionDescriptor> {
         vec![
-            <HelloWorkflow as temporalio_workflow::runtime::entry::WorkflowImplementation>::definition(),
+            <HelloWorkflow as WorkflowImplementation>::definition(),
             WorkflowDefinitionDescriptor {
                 workflow_type: "WasmTaskFailureWorkflow".to_string(),
                 has_init: false,
@@ -104,9 +106,7 @@ impl StaticWorkflowComponent for WasmTestWorkflowModule {
         host: std::rc::Rc<dyn WorkflowHost>,
     ) -> Result<Box<dyn WorkflowInstance>, WorkflowFailure> {
         match workflow_type {
-            name if name
-                == <HelloWorkflow as temporalio_workflow::runtime::entry::WorkflowImplementation>::name() =>
-            {
+            name if name == <HelloWorkflow as WorkflowImplementation>::name() => {
                 instantiate_component_workflow::<HelloWorkflow>(init, host)
             }
             "WasmTaskFailureWorkflow" => Ok(Box::new(WasmTaskFailureWorkflow)),
@@ -118,7 +118,6 @@ impl StaticWorkflowComponent for WasmTestWorkflowModule {
     }
 }
 
-type WasmTestWorkflowComponentExport =
-    temporalio_workflow::component::ExportedComponent<WasmTestWorkflowModule>;
+type WasmTestWorkflowComponentExport = ExportedComponent<WasmTestWorkflowModule>;
 
 temporalio_workflow::__temporalio_export_workflow_component!(WasmTestWorkflowComponentExport);

@@ -6,17 +6,14 @@ use temporalio_common::protos::{
     coresdk::workflow_commands::WorkflowCommand, temporal::api::failure::v1::Failure,
 };
 use temporalio_workflow::{
-    PatchActivationCaller,
-    runtime::{
-        guest::WorkflowInstance,
-        host::WorkflowHost,
-        types::{
-            ActivationJobResult, ActivationResult, MainRoutineCompletion, QueryResponse,
-            RoutineCompletion, RoutinePendingState, RoutinePollResult, StartedRoutine, TaskFailure,
-            TerminalOutcome, UpdateRoutineCompletion, UpdateRoutineKind, WorkflowActivation,
-            WorkflowDefinitionDescriptor, WorkflowFailure,
-        },
+    __private::sdk::{
+        ActivationJobResult, ActivationResult, MainRoutineCompletion, QueryResponse,
+        RoutineCompletion, RoutineKind, RoutinePendingState, RoutinePollResult, StartedRoutine,
+        TaskFailure, TerminalOutcome, UpdateDefinitionDescriptor, UpdateRoutineCompletion,
+        UpdateRoutineKind, WorkflowActivation, WorkflowDefinitionDescriptor, WorkflowFailure,
+        WorkflowHost, WorkflowInstance,
     },
+    PatchActivationCaller,
 };
 use wasmtime::{
     Config, Engine, Store,
@@ -175,11 +172,9 @@ impl CompiledWasmWorkflowModule {
                         updates: def
                             .updates
                             .into_iter()
-                            .map(|u| {
-                                temporalio_workflow::runtime::types::UpdateDefinitionDescriptor {
-                                    name: u.name,
-                                    has_validator: u.has_validator,
-                                }
+                            .map(|u| UpdateDefinitionDescriptor {
+                                name: u.name,
+                                has_validator: u.has_validator,
                             })
                             .collect(),
                     })
@@ -278,20 +273,14 @@ impl WorkflowInstance for WasmWorkflowInstance {
                         ActivationJobResult::StartedRoutine(StartedRoutine {
                             routine_id: routine.routine_id,
                             kind: match routine.kind {
-                                wit_types::RoutineKind::Main => {
-                                    temporalio_workflow::runtime::types::RoutineKind::Main
-                                }
-                                wit_types::RoutineKind::Signal(name) => {
-                                    temporalio_workflow::runtime::types::RoutineKind::Signal(name)
-                                }
+                                wit_types::RoutineKind::Main => RoutineKind::Main,
+                                wit_types::RoutineKind::Signal(name) => RoutineKind::Signal(name),
                                 wit_types::RoutineKind::Update(update) => {
-                                    temporalio_workflow::runtime::types::RoutineKind::Update(
-                                        UpdateRoutineKind {
-                                            name: update.name,
-                                            update_id: update.update_id,
-                                            protocol_instance_id: update.protocol_instance_id,
-                                        },
-                                    )
+                                    RoutineKind::Update(UpdateRoutineKind {
+                                        name: update.name,
+                                        update_id: update.update_id,
+                                        protocol_instance_id: update.protocol_instance_id,
+                                    })
                                 }
                             },
                         })

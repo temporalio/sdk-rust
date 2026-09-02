@@ -13,12 +13,12 @@ use std::{
     task::{Context, Poll},
 };
 
-pub mod entry;
-pub mod guest;
-pub mod host;
-pub mod instance;
-pub mod model;
-pub mod types;
+pub(crate) mod entry;
+pub(crate) mod guest;
+pub(crate) mod host;
+pub(crate) mod instance;
+pub(crate) mod model;
+pub(crate) mod types;
 
 thread_local! {
     static SDK_WAKE_DEPTH: Cell<u32> = const { Cell::new(0) };
@@ -238,18 +238,23 @@ pub(crate) fn mark_intercepted_handler_ready() {
 }
 
 /// Guard that marks the current scope as an SDK-initiated wake source.
-#[doc(hidden)]
 pub struct SdkWakeGuard {
     _not_send_or_sync: PhantomData<Rc<()>>,
 }
 
 impl SdkWakeGuard {
-    #[doc(hidden)]
+    /// Enters an SDK wake scope until the returned guard is dropped.
     pub fn new() -> Self {
         SDK_WAKE_DEPTH.with(|c| c.set(c.get() + 1));
         Self {
             _not_send_or_sync: PhantomData,
         }
+    }
+}
+
+impl Default for SdkWakeGuard {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -259,7 +264,7 @@ impl Drop for SdkWakeGuard {
     }
 }
 
-#[doc(hidden)]
+/// Reports whether the current thread is inside an SDK-initiated wake scope.
 pub fn is_sdk_wake() -> bool {
     SDK_WAKE_DEPTH.with(|c| c.get() > 0)
 }

@@ -31,7 +31,7 @@ use temporalio_sdk_core::{
     init_replay_worker,
     replay::{HistoryForReplay, ReplayWorkerInput},
 };
-use temporalio_workflow::runtime::entry::WorkflowImplementation;
+use temporalio_workflow::__private::sdk::WorkflowImplementation;
 
 #[cfg(feature = "wasm-workflows")]
 use crate::WasmWorkflowComponent;

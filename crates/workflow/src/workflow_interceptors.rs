@@ -81,6 +81,8 @@
 //! # let _ = interceptor_constructor();
 //! ```
 
+#[doc(inline)]
+pub use crate::runtime::model::{CancelExternalOk, CancelExternalWfResult};
 use crate::{
     ActivityOptions, BaseWorkflowContext, CancellableFuture, CancellableFutureWithReason,
     ChildWorkflowOptions, ContinueAsNewOptions, ExternalWorkflowHandle, LocalActivityOptions,
@@ -89,7 +91,7 @@ use crate::{
     cancellation::WorkflowCancellationRegistration,
     runtime::{
         entry::WorkflowError,
-        model::{CancelExternalWfResult, TimerResult, WorkflowResult, WorkflowTermination},
+        model::{TimerResult, WorkflowResult, WorkflowTermination},
     },
 };
 use futures_util::{
