@@ -1,6 +1,6 @@
 [package]
 name = "temporalio-common-wasm"
-version = "0.7.0"
+version = "0.8.0"
 edition = "2024"
 authors = ["Temporal Technologies Inc. <sdk@temporal.io>"]
 license-file = { workspace = true }
@@ -45,7 +45,7 @@ tracing-core = "0.1"
 url = "2.5"
 [dependencies.temporalio-protos]
 path = "../protos"
-version = "~0.7.0"
+version = "~0.8.0"
 
 [lints]
 workspace = true

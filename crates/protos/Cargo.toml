@@ -1,6 +1,6 @@
 [package]
 name = "temporalio-protos"
-version = "0.7.0"
+version = "0.8.0"
 edition = "2024"
 authors = ["Temporal Technologies Inc. <sdk@temporal.io>"]
 license-file = { workspace = true }

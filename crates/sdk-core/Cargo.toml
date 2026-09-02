@@ -1,6 +1,6 @@
 [package]
 name = "temporalio-sdk-core"
-version = "0.7.0"
+version = "0.8.0"
 authors = ["Temporal Technologies Inc. <sdk@temporal.io>"]
 edition = "2024"
 license-file = { workspace = true }
@@ -131,19 +131,19 @@ zip = { version = "8.4", optional = true, default-features = false, features = [
 # 1st party local deps
 [dependencies.temporalio-common]
 path = "../common"
-version = "~0.7.0"
+version = "~0.8.0"
 default-features = false
 features = ["core-telemetry-bridge", "serde_serialize"]
 
 [dependencies.temporalio-client]
 path = "../client"
-version = "~0.7.0"
+version = "~0.8.0"
 default-features = false
 features = ["core-based-sdk"]
 
 [dependencies.temporalio-macros]
 path = "../macros"
-version = "~0.7.0"
+version = "~0.8.0"
 
 [dev-dependencies]
 assert_matches = "1.5"
@@ -169,8 +169,8 @@ temporalio-sdk = { path = "../sdk", features = [
   "testing",
   "wasm-workflows",
 ] }
-temporalio-common = { path = "../common", version = "~0.7.0", default-features = false }
-temporalio-workflow = { path = "../workflow", version = "~0.7.0", features = [
+temporalio-common = { path = "../common", version = "~0.8.0", default-features = false }
+temporalio-workflow = { path = "../workflow", version = "~0.8.0", features = [
   "experimental",
 ] }
 tokio = { version = "1.47", default-features = false, features = [

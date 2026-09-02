@@ -1,6 +1,6 @@
 [package]
 name = "temporalio-client"
-version = "0.7.0"
+version = "0.8.0"
 edition = "2024"
 authors = ["Temporal Technologies Inc. <sdk@temporal.io>"]
 license-file = { workspace = true }
@@ -65,7 +65,7 @@ serde_json = { workspace = true }
 
 [dependencies.temporalio-common]
 path = "../common"
-version = "~0.7.0"
+version = "~0.8.0"
 default-features = false
 features = ["serde_serialize"]
 
@@ -76,8 +76,8 @@ prost = "0.14"
 prost-types = { workspace = true }
 rstest = "0.26"
 tempfile = "3"
-temporalio-macros = { path = "../macros", version = "~0.7.0" }
-temporalio-workflow = { path = "../workflow", version = "~0.7.0" }
+temporalio-macros = { path = "../macros", version = "~0.8.0" }
+temporalio-workflow = { path = "../workflow", version = "~0.8.0" }
 tokio = { version = "1.47", default-features = false, features = [
   "io-util",
   "macros",

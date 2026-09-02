@@ -33,6 +33,8 @@ relevant information.
 
 ## Unreleased
 
+## [0.8.0] - 2026-09-02
+
 ### Breaking Changes
 * `SdkWakeGuard` is no longer `Send` or `Sync`, preventing the thread-local guard from being moved
   to or referenced from another thread.
