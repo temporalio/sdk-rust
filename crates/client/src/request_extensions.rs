@@ -7,7 +7,7 @@ use crate::RetryOptions;
 use std::time::Duration;
 
 /// A request extension that, when set, should make the retry behavior consider this call to be a
-/// [CallType::TaskLongPoll](crate::CallType::TaskLongPoll)
+/// worker task long poll.
 #[derive(Copy, Clone, Debug)]
 pub struct IsWorkerTaskLongPoll;
 
