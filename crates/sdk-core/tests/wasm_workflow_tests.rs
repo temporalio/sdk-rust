@@ -205,7 +205,7 @@ async fn wasm_patch_activation_callback_panic_fails_workflow_task() {
 
 #[tokio::test]
 async fn wasm_task_failure_preserves_wit_failure_details() {
-    let component_path = build_wasm_hello_component().await;
+    let component_path = build_wasm_task_failure_component().await;
     let component = WasmWorkflowComponent::from_file(WASM_COMPONENT_ID, component_path)
         .expect("sample WASM component should be loadable");
 
@@ -387,6 +387,11 @@ async fn build_wasm_patch_activation_component() -> PathBuf {
     let fixture_dir =
         repository_root().join("crates/sdk-core/tests/fixtures/wasm_patch_activation");
     build_wasm_component(fixture_dir, "temporal_wasm_patch_activation_workflow.wasm").await
+}
+
+async fn build_wasm_task_failure_component() -> PathBuf {
+    let fixture_dir = repository_root().join("crates/sdk-core/tests/fixtures/wasm_task_failure");
+    build_wasm_component(fixture_dir, "temporal_wasm_task_failure_workflow.wasm").await
 }
 
 fn repository_root() -> PathBuf {

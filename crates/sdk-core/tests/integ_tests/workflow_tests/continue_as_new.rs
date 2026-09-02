@@ -12,13 +12,14 @@ use temporalio_common::{
     search_attributes::{SearchAttributeKey, SearchAttributes},
 };
 use temporalio_macros::{workflow, workflow_methods};
-use temporalio_sdk::{ContinueAsNewOptions, WorkflowContext, WorkflowResult, WorkflowTermination};
+use temporalio_sdk::{
+    ContinueAsNewOptions, ContinueAsNewVersioningBehavior, WorkflowContext, WorkflowResult,
+};
 use temporalio_sdk_core::{
     TunerHolder,
     replay::{DEFAULT_WORKFLOW_TYPE, canned_histories},
     test_help::MockPollCfg,
 };
-use temporalio_workflow::__private::sdk::ContinueAsNewRequest;
 
 const SA_TXT: SearchAttributeKey<String> = SearchAttributeKey::text(SEARCH_ATTR_TXT);
 
@@ -145,11 +146,13 @@ impl WfWithTimer {
     #[run(name = DEFAULT_WORKFLOW_TYPE)]
     async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<()> {
         ctx.timer(Duration::from_millis(500)).await;
-        Err(WorkflowTermination::continue_as_new(ContinueAsNewRequest {
-            arguments: vec![[1].into()],
-            initial_versioning_behavior: ProtoContinueAsNewVersioningBehavior::AutoUpgrade.into(),
-            ..Default::default()
-        }))
+        ctx.continue_as_new(
+            (),
+            ContinueAsNewOptions::builder()
+                .initial_versioning_behavior(ContinueAsNewVersioningBehavior::AutoUpgrade)
+                .build(),
+        )?;
+        Ok(())
     }
 }
 

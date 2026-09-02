@@ -1,0 +1,16 @@
+[package]
+name = "temporal-wasm-task-failure-workflow"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+temporalio-workflow = { path = "../../../../workflow" }
+
+[lib]
+crate-type = ["cdylib"]
+
+[package.metadata.component]
+package = "temporal:task-failure-workflow"
+
+[workspace]

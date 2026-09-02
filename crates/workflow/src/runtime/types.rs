@@ -119,7 +119,7 @@ pub struct ActivationResult {
 }
 
 /// Command attributes used when a workflow continues as a new run.
-pub type ContinueAsNewRequest = ContinueAsNewWorkflowExecution;
+pub(crate) type ContinueAsNewRequest = ContinueAsNewWorkflowExecution;
 
 /// Workflow Task failure requested by the main workflow routine.
 #[derive(Clone, Debug, PartialEq)]
