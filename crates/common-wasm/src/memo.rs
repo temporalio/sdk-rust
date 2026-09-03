@@ -12,6 +12,7 @@ use std::{collections::BTreeMap, sync::Arc};
 #[non_exhaustive]
 pub struct Memo {
     raw: ProtoMemo,
+    ordered_keys: BTreeMap<String, ()>,
     payload_converter: PayloadConverter,
     context: SerializationContextData,
 }
@@ -24,8 +25,11 @@ impl Memo {
         payload_converter: PayloadConverter,
         context: SerializationContextData,
     ) -> Self {
+        let raw = raw.unwrap_or_default();
+        let ordered_keys = raw.fields.keys().cloned().map(|key| (key, ())).collect();
         Self {
-            raw: raw.unwrap_or_default(),
+            raw,
+            ordered_keys,
             payload_converter,
             context,
         }
@@ -62,9 +66,9 @@ impl Memo {
         self.raw.fields.is_empty()
     }
 
-    /// Iterates over memo keys.
+    /// Iterates over memo keys in lexicographic order.
     pub fn keys(&self) -> impl Iterator<Item = &str> {
-        self.raw.fields.keys().map(String::as_str)
+        self.ordered_keys.keys().map(String::as_str)
     }
 
     /// Returns the underlying payload without applying payload conversion.
@@ -203,6 +207,26 @@ mod tests {
         );
 
         assert!(memo.get::<String>("count").is_err());
+    }
+
+    #[test]
+    fn memo_keys_have_replay_stable_order() {
+        let memo = Memo::from_raw(
+            Some(ProtoMemo {
+                fields: HashMap::from([
+                    ("zebra".to_owned(), Payload::default()),
+                    ("alpha".to_owned(), Payload::default()),
+                    ("middle".to_owned(), Payload::default()),
+                ]),
+            }),
+            PayloadConverter::default(),
+            SerializationContextData::Workflow(WorkflowSerializationContext::new()),
+        );
+
+        assert_eq!(
+            memo.keys().collect::<Vec<_>>(),
+            vec!["alpha", "middle", "zebra"]
+        );
     }
 
     #[test]

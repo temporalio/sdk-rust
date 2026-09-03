@@ -45,6 +45,10 @@ relevant information.
 * `WorkflowSignalError::NotFound` and `CancelExternalWorkflowError::NotFound` let workflows
   distinguish a missing signal or cancellation target from other delivery failures.
 
+### Fixed
+* `Memo::keys` and `SearchAttributes::keys` now iterate in lexicographic order so workflow
+  decisions based on collection traversal remain deterministic during replay.
+
 ## [0.8.0] - 2026-09-02
 
 ### Breaking Changes
