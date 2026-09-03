@@ -100,6 +100,7 @@ impl ModifyPropsWf {
     }
 }
 
+#[temporalio_macros::cloud_test_exclusion(crate::CloudTestExclusionReason::DoesNotUseServer)]
 #[tokio::test]
 async fn workflow_modify_props() {
     let mut t = TestHistoryBuilder::default();

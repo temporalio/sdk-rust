@@ -175,6 +175,7 @@ impl CancelAlreadyFiredTimerWf {
     }
 }
 
+#[temporalio_macros::cloud_test_exclusion(crate::CloudTestExclusionReason::DoesNotUseServer)]
 #[tokio::test]
 async fn cancel_unpolled_timer_after_both_timers_fire_same_activation() {
     let mut t = canned_histories::parallel_timer("1", "2");
@@ -203,6 +204,7 @@ impl HappyTimerWf {
     }
 }
 
+#[temporalio_macros::cloud_test_exclusion(crate::CloudTestExclusionReason::DoesNotUseServer)]
 #[tokio::test]
 async fn test_fire_happy_path_inc() {
     let t = canned_histories::single_timer("1");
@@ -241,6 +243,7 @@ impl MismatchedTimerWf {
     }
 }
 
+#[temporalio_macros::cloud_test_exclusion(crate::CloudTestExclusionReason::DoesNotUseServer)]
 #[tokio::test]
 async fn mismatched_timer_ids_errors() {
     let t = canned_histories::single_timer("badid");
@@ -273,6 +276,7 @@ impl CancelTimerWf {
     }
 }
 
+#[temporalio_macros::cloud_test_exclusion(crate::CloudTestExclusionReason::DoesNotUseServer)]
 #[tokio::test]
 async fn incremental_cancellation() {
     let t = canned_histories::cancel_timer("2", "1");
@@ -315,6 +319,7 @@ impl CancelBeforeSentWf {
     }
 }
 
+#[temporalio_macros::cloud_test_exclusion(crate::CloudTestExclusionReason::DoesNotUseServer)]
 #[tokio::test]
 async fn cancel_before_sent_to_server() {
     let mut t = TestHistoryBuilder::default();
@@ -370,6 +375,7 @@ impl WaitConditionWakerWf {
     }
 }
 
+#[temporalio_macros::cloud_test_exclusion(crate::CloudTestExclusionReason::DoesNotUseServer)]
 #[tokio::test]
 async fn wait_condition_waker_in_futures_unordered() {
     let t = canned_histories::single_timer_wf_completes("1");

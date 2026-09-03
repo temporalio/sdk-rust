@@ -32,6 +32,7 @@ impl TestEnvironmentWorkflow {
     }
 }
 
+#[temporalio_macros::cloud_test_exclusion(crate::CloudTestExclusionReason::RequiresLocalServer)]
 #[tokio::test]
 async fn test_workflow_environment_local() {
     let env = WorkflowEnvironment::start_local(LocalWorkflowEnvironmentOptions::default())
@@ -63,6 +64,7 @@ async fn test_workflow_environment_local() {
     env.shutdown().await.unwrap();
 }
 
+#[temporalio_macros::cloud_test_exclusion(crate::CloudTestExclusionReason::RequiresLocalServer)]
 #[tokio::test]
 async fn temporal_cli_default() {
     let config = TemporalDevServerConfig::builder()
@@ -78,6 +80,7 @@ async fn temporal_cli_default() {
     assert!(sysinfo::System::new_all().process(pid).is_none());
 }
 
+#[temporalio_macros::cloud_test_exclusion(crate::CloudTestExclusionReason::RequiresLocalServer)]
 #[tokio::test]
 async fn temporal_cli_fixed() {
     let config = TemporalDevServerConfig::builder()
@@ -88,6 +91,7 @@ async fn temporal_cli_fixed() {
     server.shutdown().await.unwrap();
 }
 
+#[temporalio_macros::cloud_test_exclusion(crate::CloudTestExclusionReason::RequiresLocalServer)]
 #[tokio::test]
 async fn temporal_cli_shutdown_port_reuse() {
     // Start, test shutdown, do again immediately on same port to ensure we can
@@ -138,6 +142,7 @@ mod test_server {
     use super::*;
     use temporalio_sdk_core::ephemeral_server::TestServerConfig;
 
+    #[temporalio_macros::cloud_test_exclusion(crate::CloudTestExclusionReason::RequiresLocalServer)]
     #[tokio::test]
     async fn test_server_default() {
         let config = TestServerConfig::builder()
@@ -148,6 +153,7 @@ mod test_server {
         server.shutdown().await.unwrap();
     }
 
+    #[temporalio_macros::cloud_test_exclusion(crate::CloudTestExclusionReason::RequiresLocalServer)]
     #[tokio::test]
     async fn test_server_fixed() {
         let config = TestServerConfig::builder()
@@ -158,6 +164,7 @@ mod test_server {
         server.shutdown().await.unwrap();
     }
 
+    #[temporalio_macros::cloud_test_exclusion(crate::CloudTestExclusionReason::RequiresLocalServer)]
     #[tokio::test]
     async fn test_server_shutdown_port_reuse() {
         // Start, test shutdown, do again immediately on same port to ensure we can

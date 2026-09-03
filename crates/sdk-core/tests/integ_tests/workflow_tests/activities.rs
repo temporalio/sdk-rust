@@ -2194,6 +2194,7 @@ async fn long_activity_timeout_repro() {
     worker.run_until_done().await.unwrap();
 }
 
+#[temporalio_macros::cloud_test_exclusion(crate::CloudTestExclusionReason::DoesNotUseServer)]
 #[tokio::test]
 async fn pass_activity_summary_to_metadata() {
     let t = canned_histories::single_activity("1");
@@ -2264,6 +2265,7 @@ async fn pass_activity_summary_to_metadata() {
     worker.run_until_done().await.unwrap();
 }
 
+#[temporalio_macros::cloud_test_exclusion(crate::CloudTestExclusionReason::DoesNotUseServer)]
 #[rstest(hist_batches, case::incremental(&[1, 2, 3, 4]), case::replay(&[4]))]
 #[tokio::test]
 async fn abandoned_activities_ignore_start_and_complete(hist_batches: &'static [usize]) {
@@ -2367,6 +2369,7 @@ impl ImmediateActivityCancelationWorkflow {
     }
 }
 
+#[temporalio_macros::cloud_test_exclusion(crate::CloudTestExclusionReason::DoesNotUseServer)]
 #[tokio::test]
 async fn immediate_activity_cancelation() {
     let mut t = TestHistoryBuilder::default();

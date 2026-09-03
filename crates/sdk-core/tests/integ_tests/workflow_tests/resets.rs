@@ -1,4 +1,4 @@
-use crate::common::{CoreWfStarter, NAMESPACE, activity_functions::StdActivities};
+use crate::common::{CoreWfStarter, activity_functions::StdActivities};
 use std::{
     sync::{
         Arc, OnceLock,
@@ -7,7 +7,7 @@ use std::{
     time::Duration,
 };
 use temporalio_client::{
-    WorkflowSignalOptions, WorkflowStartOptions, errors::WorkflowGetResultError,
+    NamespacedClient, WorkflowSignalOptions, WorkflowStartOptions, errors::WorkflowGetResultError,
     grpc::WorkflowService,
 };
 use temporalio_common::protos::temporal::api::{
@@ -80,7 +80,7 @@ async fn reset_workflow() {
         client
             .reset_workflow_execution(
                 ResetWorkflowExecutionRequest {
-                    namespace: NAMESPACE.to_owned(),
+                    namespace: client.namespace(),
                     workflow_execution: Some(WorkflowExecution {
                         workflow_id: wf_name.to_owned(),
                         run_id,
@@ -259,7 +259,7 @@ async fn reset_randomseed() {
         client
             .reset_workflow_execution(
                 ResetWorkflowExecutionRequest {
-                    namespace: NAMESPACE.to_owned(),
+                    namespace: client.namespace(),
                     workflow_execution: Some(WorkflowExecution {
                         workflow_id: wf_name.to_owned(),
                         run_id: run_id.clone(),

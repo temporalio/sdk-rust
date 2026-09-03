@@ -40,6 +40,7 @@ use temporalio_sdk_core::{
     test_help::MockPollCfg,
 };
 
+#[temporalio_macros::cloud_test_exclusion(crate::CloudTestExclusionReason::DoesNotUseServer)]
 #[tokio::test]
 async fn pass_event_group_markers_on_schedule_activity() {
     let t = canned_histories::single_activity("1");
@@ -114,6 +115,7 @@ async fn pass_event_group_markers_on_schedule_activity() {
     worker.run_until_done().await.unwrap();
 }
 
+#[temporalio_macros::cloud_test_exclusion(crate::CloudTestExclusionReason::DoesNotUseServer)]
 #[tokio::test]
 async fn pass_event_group_markers_on_start_child_workflow() {
     let wf_id = "1";
@@ -194,6 +196,7 @@ async fn pass_event_group_markers_on_start_child_workflow() {
     worker.run_until_done().await.unwrap();
 }
 
+#[temporalio_macros::cloud_test_exclusion(crate::CloudTestExclusionReason::DoesNotUseServer)]
 #[tokio::test]
 async fn pass_event_group_markers_on_start_timer() {
     let t = canned_histories::single_timer("1");
@@ -269,6 +272,7 @@ async fn pass_event_group_markers_on_start_timer() {
 /// server, so instead of a command of their own they produce a `RecordMarker` command that
 /// Core synthesizes when the activity resolves. Markers attached to the `ScheduleLocalActivity`
 /// command have to survive that indirection and end up on the marker command.
+#[temporalio_macros::cloud_test_exclusion(crate::CloudTestExclusionReason::DoesNotUseServer)]
 #[tokio::test]
 async fn pass_event_group_markers_on_schedule_local_activity() {
     let t = canned_histories::single_local_activity("1");
