@@ -175,10 +175,6 @@ jobs:
     if: github.actor != 'dependabot[bot]' && (github.event.pull_request.head.repo.full_name == '' || github.event.pull_request.head.repo.full_name == 'temporalio/sdk-rust')
     name: Cloud tests
     env:
-      TEMPORAL_CLOUD_ADDRESS: https://${{ vars.TEMPORAL_CLIENT_NAMESPACE }}.tmprl.cloud:7233
-      TEMPORAL_NAMESPACE: ${{ vars.TEMPORAL_CLIENT_NAMESPACE }}
-      TEMPORAL_CLIENT_CERT: ${{ secrets.TEMPORAL_CLIENT_CERT }}
-      TEMPORAL_CLIENT_KEY: ${{ secrets.TEMPORAL_CLIENT_KEY }}
       TEMPORAL_CLIENT_CLOUD_API_VERSION: v0.19.1
     timeout-minutes: ${{ github.ref == 'refs/heads/main' && 25 || 20 }}
     runs-on: ubuntu-latest
@@ -187,7 +183,12 @@ jobs:
       - uses: ./.github/actions/setup
         with:
           mise-install-args: protoc
-      - run: cargo test --features=test-utilities,temporalio-sdk/experimental --test cloud_tests
+      - env:
+          TEMPORAL_CLOUD_ADDRESS: https://${{ vars.TEMPORAL_CLIENT_NAMESPACE }}.tmprl.cloud:7233
+          TEMPORAL_NAMESPACE: ${{ vars.TEMPORAL_CLIENT_NAMESPACE }}
+          TEMPORAL_CLIENT_CERT: ${{ secrets.TEMPORAL_CLIENT_CERT }}
+          TEMPORAL_CLIENT_KEY: ${{ secrets.TEMPORAL_CLIENT_KEY }}
+        run: cargo test --features=test-utilities,temporalio-sdk/experimental --test cloud_tests
       - name: Generate Cloud test certificates
         run: |
           umask 077
@@ -212,15 +213,14 @@ jobs:
         env:
           TEMPORAL_CLIENT_CLOUD_API_KEY: ${{ secrets.TEMPORAL_CLIENT_CLOUD_API_KEY }}
         run: cargo integ-test cloud-namespace create
-      - name: Run existing integration test against Cloud
+      - name: Run Cloud-eligible integration tests
         timeout-minutes: 20
         env:
           TEMPORAL_ADDRESS: ${{ steps.create-cloud-namespace.outputs.namespace }}.tmprl.cloud:7233
           TEMPORAL_NAMESPACE: ${{ steps.create-cloud-namespace.outputs.namespace }}
         run: |
-          cargo integ-test -s envconfig -- \
-            integ_tests::workflow_tests::timers::timer_workflow_workflow_driver --exact \
-            2>&1 | tee cloud-integration.log
+          set -o pipefail
+          cargo integ-test -s envconfig --cloud 2>&1 | tee cloud-integration.log
       - name: Delete Cloud namespace
         id: delete-cloud-namespace
         if: ${{ always() && steps.create-cloud-namespace.outputs.namespace != '' }}
