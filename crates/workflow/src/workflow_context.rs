@@ -50,8 +50,10 @@ use rand::SeedableRng;
 use rand_pcg::Pcg64Mcg;
 use siphasher::sip::SipHasher13;
 use std::{
+    any::{Any, TypeId},
     cell::{Cell, RefCell},
     collections::{HashMap, HashSet},
+    fmt,
     future::{self, Future},
     hash::Hasher,
     marker::PhantomData,
@@ -262,6 +264,106 @@ impl WorkflowRandomState {
 #[derive(Clone)]
 pub struct BaseWorkflowContext {
     inner: Rc<WorkflowContextInner>,
+}
+
+/// A typed key for values stored in the current workflow execution context.
+///
+/// Implement this trait on a dedicated marker type shared by the workflow and its interceptors.
+/// The marker type itself is the key, so different markers can store the same value type without
+/// colliding.
+///
+/// # Scope and propagation
+///
+/// A scope inherits the values active when it is created. A nested scope shadows only its selected
+/// key. Plain child futures polled inside a scope see that scope, while separately scoped
+/// concurrent futures retain their own snapshots. Independently scheduled signal and update
+/// handlers start without another routine's values; an inbound interceptor or the handler itself
+/// can establish a handler-local scope.
+///
+/// Values remain installed only while scoped workflow code is being polled. The SDK restores the
+/// prior snapshot on suspension, completion, cancellation by dropping the future, and panic. This
+/// prevents a value from leaking to another routine sharing the workflow's single-threaded
+/// executor, or to another workflow execution. Cache eviction drops all values; replay recreates
+/// them by executing the same deterministic scope calls.
+///
+/// Storage is in-memory and local to one workflow run. Cross-boundary propagation is explicit:
+/// outbound interceptors read values and write headers for activities, local activities, child
+/// workflows, signals, Nexus operations, or continue-as-new, and inbound interceptors decode those
+/// headers and establish a new scope.
+///
+/// ```
+/// use temporalio_workflow::WorkflowContextKey;
+///
+/// struct RequestId;
+///
+/// impl WorkflowContextKey for RequestId {
+///     type Value = String;
+/// }
+/// ```
+pub trait WorkflowContextKey: 'static {
+    /// Value stored under this key.
+    type Value: 'static;
+}
+
+type WorkflowContextValues = Rc<HashMap<TypeId, Rc<dyn Any>>>;
+
+#[derive(Clone, Default)]
+pub(super) struct WorkflowContextValueStore {
+    current: Rc<RefCell<WorkflowContextValues>>,
+}
+
+impl fmt::Debug for WorkflowContextValueStore {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("WorkflowContextValueStore")
+            .finish_non_exhaustive()
+    }
+}
+
+impl WorkflowContextValueStore {
+    pub(super) fn context_value<K: WorkflowContextKey>(&self) -> Option<Rc<K::Value>> {
+        self.current
+            .borrow()
+            .get(&TypeId::of::<K>())
+            .cloned()
+            .and_then(|value| value.downcast().ok())
+    }
+}
+
+/// A future that installs workflow context values while polling its inner future.
+///
+/// Create this with [`WorkflowContext::with_context_value`] or
+/// [`WorkflowInterceptorContext::with_context_value`](crate::workflow_interceptors::WorkflowInterceptorContext::with_context_value).
+/// Values survive suspension and are isolated from concurrently polled workflow futures.
+#[must_use = "futures do nothing unless polled"]
+pub struct WorkflowContextFuture<F> {
+    base: BaseWorkflowContext,
+    values: WorkflowContextValues,
+    inner: Pin<Box<F>>,
+}
+
+impl<F: Future> Future for WorkflowContextFuture<F> {
+    type Output = F::Output;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.get_mut();
+        let _guard = this.base.install_context_values(this.values.clone());
+        this.inner.as_mut().poll(cx)
+    }
+}
+
+struct WorkflowContextRestoreGuard {
+    base: BaseWorkflowContext,
+    previous: Option<WorkflowContextValues>,
+}
+
+impl Drop for WorkflowContextRestoreGuard {
+    fn drop(&mut self) {
+        self.base
+            .inner
+            .context_values
+            .current
+            .replace(self.previous.take().expect("context is restored once"));
+    }
 }
 
 /// Input provided to a worker's patch activation callback.
@@ -521,6 +623,7 @@ impl BaseWorkflowContext {
             self.requires_replay_safety(),
             Some(self.inner.random.clone()),
         )
+        .with_context_values(self.inner.context_values.clone())
     }
 }
 
@@ -632,6 +735,7 @@ struct WorkflowContextInner {
     requires_replay_safety: Cell<bool>,
     condition_wakers: RefCell<Vec<Waker>>,
     current_waker: RefCell<Option<Waker>>,
+    context_values: WorkflowContextValueStore,
     workflow_interceptors: Rc<[Arc<dyn WorkflowInterceptor>]>,
 }
 
@@ -750,6 +854,7 @@ impl BaseWorkflowContext {
         let random = Rc::new(RefCell::new(WorkflowRandomState::new(
             initialize_workflow.randomness_seed,
         )));
+        let context_values = WorkflowContextValueStore::default();
         let view = WorkflowContextView::new(
             namespace,
             task_queue,
@@ -758,7 +863,8 @@ impl BaseWorkflowContext {
             data_converter.payload_converter().clone(),
             true,
             Some(random.clone()),
-        );
+        )
+        .with_context_values(context_values.clone());
         let workflow_interceptors = workflow_interceptor_constructors
             .into_iter()
             .map(|constructor| constructor.construct(&view))
@@ -803,8 +909,49 @@ impl BaseWorkflowContext {
                 requires_replay_safety: Cell::new(true),
                 condition_wakers: Default::default(),
                 current_waker: RefCell::new(None),
+                context_values,
                 workflow_interceptors,
             }),
+        }
+    }
+
+    pub(crate) fn context_value<K: WorkflowContextKey>(&self) -> Option<Rc<K::Value>> {
+        self.inner.context_values.context_value::<K>()
+    }
+
+    fn context_values_with<K: WorkflowContextKey>(&self, value: K::Value) -> WorkflowContextValues {
+        let mut values = self.inner.context_values.current.borrow().as_ref().clone();
+        values.insert(TypeId::of::<K>(), Rc::new(value));
+        Rc::new(values)
+    }
+
+    pub(crate) fn with_context_value<K: WorkflowContextKey, F: Future>(
+        &self,
+        value: K::Value,
+        future: F,
+    ) -> WorkflowContextFuture<F> {
+        WorkflowContextFuture {
+            base: self.clone(),
+            values: self.context_values_with::<K>(value),
+            inner: Box::pin(future),
+        }
+    }
+
+    pub(crate) fn with_context_value_sync<K: WorkflowContextKey, R>(
+        &self,
+        value: K::Value,
+        f: impl FnOnce() -> R,
+    ) -> R {
+        let values = self.context_values_with::<K>(value);
+        let _guard = self.install_context_values(values);
+        f()
+    }
+
+    fn install_context_values(&self, values: WorkflowContextValues) -> WorkflowContextRestoreGuard {
+        let previous = self.inner.context_values.current.replace(values);
+        WorkflowContextRestoreGuard {
+            base: self.clone(),
+            previous: Some(previous),
         }
     }
 
@@ -1484,6 +1631,26 @@ impl BaseWorkflowContext {
 }
 
 impl<W> SyncWorkflowContext<W> {
+    /// Return the value associated with key type `K` in the current workflow context scope.
+    ///
+    /// The returned [`Rc`] makes lookup inexpensive without requiring stored values to implement
+    /// [`Clone`]. Values exist only in memory for this workflow run and are rebuilt during replay.
+    pub fn context_value<K: WorkflowContextKey>(&self) -> Option<Rc<K::Value>> {
+        self.base.context_value::<K>()
+    }
+
+    /// Run synchronous workflow code with `value` installed for key type `K`.
+    ///
+    /// Nested calls inherit other current values and shadow the same key. The previous context is
+    /// restored when `f` returns or unwinds.
+    pub fn with_context_value_sync<K: WorkflowContextKey, R>(
+        &self,
+        value: K::Value,
+        f: impl FnOnce() -> R,
+    ) -> R {
+        self.base.with_context_value_sync::<K, R>(value, f)
+    }
+
     /// Return the workflow's unique identifier
     pub fn workflow_id(&self) -> &str {
         &self.base.inner.initial_information.workflow_id
@@ -2005,6 +2172,37 @@ impl<W> WorkflowContext<W> {
     }
 
     // --- Delegated methods from SyncWorkflowContext ---
+
+    /// Return the value associated with key type `K` in the current workflow context scope.
+    pub fn context_value<K: WorkflowContextKey>(&self) -> Option<Rc<K::Value>> {
+        self.sync.context_value::<K>()
+    }
+
+    /// Poll `future` with `value` installed for key type `K`.
+    ///
+    /// The scope captures the context active when this method is called. Nested scopes inherit
+    /// other values and shadow the same key. Context is restored after every poll, including when
+    /// the future completes or panics, so concurrent workflow branches and handlers cannot observe
+    /// one another's scoped values.
+    ///
+    /// Context values are runtime-only. They are not recorded in history or automatically placed
+    /// in command headers; outbound interceptors can read them and propagate selected values.
+    pub fn with_context_value<K: WorkflowContextKey, F: Future>(
+        &self,
+        value: K::Value,
+        future: F,
+    ) -> WorkflowContextFuture<F> {
+        self.sync.base.with_context_value::<K, F>(value, future)
+    }
+
+    /// Run synchronous workflow code with `value` installed for key type `K`.
+    pub fn with_context_value_sync<K: WorkflowContextKey, R>(
+        &self,
+        value: K::Value,
+        f: impl FnOnce() -> R,
+    ) -> R {
+        self.sync.with_context_value_sync::<K, R>(value, f)
+    }
 
     /// Return the workflow's unique identifier
     pub fn workflow_id(&self) -> &str {
@@ -4921,5 +5119,125 @@ mod tests {
         assert_eq!(info.raw().identity, "raw-only-identity");
         assert_eq!(info.raw(), &expected);
         assert_eq!(info.into_raw(), expected);
+    }
+
+    #[test]
+    fn async_context_values_survive_suspension_and_isolate_concurrent_branches() {
+        struct Label;
+
+        impl WorkflowContextKey for Label {
+            type Value = &'static str;
+        }
+
+        let ctx = test_context();
+        let first_poll = Rc::new(Cell::new(true));
+        let second_poll = Rc::new(Cell::new(true));
+        let first_ctx = ctx.clone();
+        let first_poll_in_future = first_poll.clone();
+        let first = ctx.with_context_value::<Label, _>(
+            "first",
+            future::poll_fn(move |_| {
+                assert_eq!(
+                    first_ctx.context_value::<Label>().as_deref(),
+                    Some(&"first")
+                );
+                if first_poll_in_future.replace(false) {
+                    Poll::Pending
+                } else {
+                    Poll::Ready(())
+                }
+            }),
+        );
+        let second_ctx = ctx.clone();
+        let second_poll_in_future = second_poll.clone();
+        let second = ctx.with_context_value::<Label, _>(
+            "second",
+            future::poll_fn(move |_| {
+                assert_eq!(
+                    second_ctx.context_value::<Label>().as_deref(),
+                    Some(&"second")
+                );
+                if second_poll_in_future.replace(false) {
+                    Poll::Pending
+                } else {
+                    Poll::Ready(())
+                }
+            }),
+        );
+        let mut joined = Box::pin(futures_util::future::join(first, second));
+        let waker = futures_util::task::noop_waker();
+        let mut poll_ctx = Context::from_waker(&waker);
+
+        assert!(joined.as_mut().poll(&mut poll_ctx).is_pending());
+        assert!(ctx.context_value::<Label>().is_none());
+        assert!(joined.as_mut().poll(&mut poll_ctx).is_ready());
+        assert!(ctx.context_value::<Label>().is_none());
+
+        let mut dropped =
+            Box::pin(ctx.with_context_value::<Label, _>("dropped", future::pending::<()>()));
+        assert!(dropped.as_mut().poll(&mut poll_ctx).is_pending());
+        assert!(ctx.context_value::<Label>().is_none());
+        drop(dropped);
+        assert!(ctx.context_value::<Label>().is_none());
+    }
+
+    #[test]
+    fn context_scopes_inherit_shadow_and_restore_after_panic() {
+        struct Label;
+        struct OtherLabel;
+        struct Count;
+
+        impl WorkflowContextKey for Label {
+            type Value = &'static str;
+        }
+
+        impl WorkflowContextKey for OtherLabel {
+            type Value = &'static str;
+        }
+
+        impl WorkflowContextKey for Count {
+            type Value = u32;
+        }
+
+        let ctx = test_context();
+        ctx.with_context_value_sync::<Label, _>("outer", || {
+            assert_eq!(ctx.context_value::<Label>().as_deref(), Some(&"outer"));
+            assert!(ctx.context_value::<OtherLabel>().is_none());
+            ctx.with_context_value_sync::<Count, _>(7, || {
+                assert_eq!(ctx.context_value::<Label>().as_deref(), Some(&"outer"));
+                assert_eq!(ctx.context_value::<Count>().as_deref(), Some(&7));
+                ctx.with_context_value_sync::<Label, _>("inner", || {
+                    assert_eq!(ctx.context_value::<Label>().as_deref(), Some(&"inner"));
+                });
+                assert_eq!(ctx.context_value::<Label>().as_deref(), Some(&"outer"));
+            });
+            assert!(ctx.context_value::<Count>().is_none());
+
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                ctx.with_context_value_sync::<Label, _>("panic", || panic!("test panic"));
+            }));
+            assert!(result.is_err());
+            assert_eq!(ctx.context_value::<Label>().as_deref(), Some(&"outer"));
+        });
+        assert!(ctx.context_value::<Label>().is_none());
+
+        let panic_ctx = ctx.clone();
+        let mut panic_future = Box::pin(ctx.with_context_value::<Label, _>(
+            "async-panic",
+            async move {
+                assert_eq!(
+                    panic_ctx.context_value::<Label>().as_deref(),
+                    Some(&"async-panic")
+                );
+                panic!("async test panic");
+            },
+        ));
+        let waker = futures_util::task::noop_waker();
+        let mut poll_ctx = Context::from_waker(&waker);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            panic_future.as_mut().poll(&mut poll_ctx)
+        }));
+        assert!(result.is_err());
+        assert!(ctx.context_value::<Label>().is_none());
     }
 }

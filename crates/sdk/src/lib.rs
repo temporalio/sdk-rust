@@ -105,8 +105,8 @@ pub use temporalio_workflow::{
     MemoValue, ParentClosePolicy, SignalWorkflowOptions, StartChildWorkflowExecutionFailedCause,
     StartChildWorkflowOutput, StartedChildWorkflow, SyncWorkflowContext, TimerOptions, TimerResult,
     VersioningIntent, WaitConditionOptions, WorkflowCancellationError, WorkflowCancellationToken,
-    WorkflowContext, WorkflowContextView, WorkflowIdReusePolicy, WorkflowRandomValue,
-    WorkflowResult, WorkflowTermination,
+    WorkflowContext, WorkflowContextFuture, WorkflowContextKey, WorkflowContextView,
+    WorkflowIdReusePolicy, WorkflowRandomValue, WorkflowResult, WorkflowTermination,
 };
 #[cfg(feature = "experimental")]
 pub use temporalio_workflow::{

@@ -1,4 +1,7 @@
-use super::{WorkflowRandomState, WorkflowRandomStream, WorkflowRandomStreamSource};
+use super::{
+    WorkflowContextKey, WorkflowContextValueStore, WorkflowRandomState, WorkflowRandomStream,
+    WorkflowRandomStreamSource,
+};
 use std::{
     cell::RefCell,
     rc::Rc,
@@ -14,7 +17,7 @@ use temporalio_common_wasm::{
     search_attributes::SearchAttributes,
 };
 
-/// Read-only view of workflow context for use in init and query handlers.
+/// Read-only view of workflow context for use in init, query, and update-validator handlers.
 ///
 /// This provides access to workflow information but cannot issue commands.
 #[derive(Clone, Debug)]
@@ -27,6 +30,7 @@ pub struct WorkflowContextView {
     payload_converter: PayloadConverter,
     requires_replay_safety: bool,
     workflow_random: Option<Rc<RefCell<WorkflowRandomState>>>,
+    context_values: WorkflowContextValueStore,
 }
 
 impl WorkflowContextView {
@@ -48,7 +52,13 @@ impl WorkflowContextView {
             payload_converter,
             requires_replay_safety,
             workflow_random,
+            context_values: WorkflowContextValueStore::default(),
         }
+    }
+
+    pub(super) fn with_context_values(mut self, context_values: WorkflowContextValueStore) -> Self {
+        self.context_values = context_values;
+        self
     }
 
     pub(super) fn into_parts(self) -> (String, String, String, InitializeWorkflow) {
@@ -165,6 +175,14 @@ impl WorkflowContextView {
             .search_attributes
             .as_ref()
             .map(SearchAttributes::from_proto)
+    }
+
+    /// Return the value associated with key type `K` in the current workflow context scope.
+    ///
+    /// This allows queries and update validators to observe values established by synchronous
+    /// inbound interceptors without allowing the handler to modify the context scope.
+    pub fn context_value<K: WorkflowContextKey>(&self) -> Option<Rc<K::Value>> {
+        self.context_values.context_value::<K>()
     }
 
     #[allow(
