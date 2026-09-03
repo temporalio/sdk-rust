@@ -40,6 +40,8 @@ relevant information.
 * `ActivityError`, `PayloadConversionError`, `ActivityExecutionError`,
   `ChildWorkflowStartError`, `ChildWorkflowExecutionError`, and `WorkflowSignalError` are now
   non-exhaustive. Add wildcard branches when matching these enums.
+  for use in interceptors, with `WorkflowCancelFailureError` exposing the decoded cancellation
+  failure.
 * `WorkflowSignalError::NotFound` and `CancelExternalWorkflowError::NotFound` let workflows
   distinguish a missing signal or cancellation target from other delivery failures.
 

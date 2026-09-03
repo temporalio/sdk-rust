@@ -20,7 +20,7 @@ use crate::{
         ChildWorkflowFailureError, ChildWorkflowStartError, IncomingError,
         IncomingNexusHandlerError, IncomingNexusOperationExecutionError, OutgoingActivityError,
         OutgoingError, OutgoingWorkflowError, ResetWorkflowError, ServerError, TerminatedError,
-        TimeoutError, WorkflowSignalError, WorkflowSignalFailureError,
+        TimeoutError, WorkflowCancelFailureError, WorkflowSignalError, WorkflowSignalFailureError,
     },
     protos::temporal::api::{
         enums::v1::{
@@ -252,12 +252,14 @@ impl FailureDecodeHint for CancelExternalWorkflowDecodeHint {
     type Output = CancelExternalWorkflowError;
 
     fn adapt(self, normalized: IncomingError) -> Self::Output {
+        let failure = normalized.failure().clone();
+        let error = Box::new(WorkflowCancelFailureError::new(failure, normalized));
         if self.cause
             == CancelExternalWorkflowExecutionFailedCause::ExternalWorkflowExecutionNotFound
         {
-            CancelExternalWorkflowError::NotFound(Box::new(normalized))
+            CancelExternalWorkflowError::NotFound(error)
         } else {
-            CancelExternalWorkflowError::Failed(Box::new(normalized))
+            CancelExternalWorkflowError::Failed(error)
         }
     }
 }
@@ -1677,6 +1679,13 @@ mod tests {
     fn cancel_external_workflow_decode_hint_recognizes_not_found() {
         let failure = Failure {
             message: "workflow not found".to_owned(),
+            cause: Some(Box::new(Failure {
+                message: "timed out".to_owned(),
+                failure_info: Some(FailureInfo::TimeoutFailureInfo(
+                    TimeoutFailureInfo::default(),
+                )),
+                ..Default::default()
+            })),
             ..Default::default()
         };
         let decoded = data_converter()
@@ -1693,6 +1702,7 @@ mod tests {
             panic!("expected not-found external-workflow cancellation error");
         };
         assert_eq!(decoded_failure.failure(), &failure);
+        assert!(std::error::Error::source(&*decoded_failure).is_some());
     }
 
     #[test]
