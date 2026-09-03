@@ -194,14 +194,12 @@ pub struct RuntimeOptions {
     #[builder(default)]
     disable_environment_info: bool,
     /// Runtime information supplied by language SDK bridges.
-    #[doc(hidden)]
     #[builder(skip = vec![environment::native_runtime()])]
     runtimes: Vec<Runtime>,
 }
 
 impl RuntimeOptions {
     /// Supplies runtime information from a language SDK bridge.
-    #[doc(hidden)]
     pub fn with_runtimes(mut self, runtimes: Vec<Runtime>) -> Self {
         self.runtimes = runtimes;
         self
