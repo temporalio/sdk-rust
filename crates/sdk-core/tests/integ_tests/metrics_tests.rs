@@ -494,7 +494,7 @@ async fn idle_activity_worker_reports_zero_slots_used() {
     let activity_slots = Arc::new(ReservationTrackingActivitySlotSupplier::new(3));
     let mut tuner = TunerBuilder::default();
     tuner.activity_slot_supplier(activity_slots.clone());
-    starter.sdk_config.tuner = Arc::new(tuner.build());
+    starter.set_core_tuner(Arc::new(tuner.build()));
 
     let finish_activity = Arc::new(Barrier::new(2));
     struct BlockingActivity {
@@ -1498,7 +1498,7 @@ async fn metrics_available_from_custom_slot_supplier() {
         inner: FixedSizeSlotSupplier::new(5),
         metrics: OnceLock::new(),
     }));
-    starter.sdk_config.tuner = Arc::new(tb.build());
+    starter.set_core_tuner(Arc::new(tb.build()));
     starter
         .sdk_config
         .register_workflow::<CustomSlotSupplierWf>()
@@ -1763,7 +1763,7 @@ async fn resource_based_tuner_metrics() {
     let mut starter = CoreWfStarter::new_with_runtime(wf_name, rt);
     // Create a resource-based tuner with reasonable thresholds
     let tuner = ResourceBasedTuner::new(0.8, 0.8);
-    starter.sdk_config.tuner = Arc::new(tuner);
+    starter.set_core_tuner(Arc::new(tuner));
     starter
         .sdk_config
         .register_workflow::<ResourceBasedTunerMetricsWf>()

@@ -276,7 +276,7 @@ impl LocalActFanoutWf {
 async fn local_act_fanout() {
     let wf_name = "local_act_fanout";
     let mut starter = CoreWfStarter::new(wf_name);
-    starter.sdk_config.tuner = Arc::new(TunerHolder::fixed_size(5, 1, 1, 1));
+    starter.set_core_tuner(Arc::new(TunerHolder::fixed_size(5, 1, 1, 1)));
     starter.sdk_config.register_activities(StdActivities);
     starter
         .sdk_config

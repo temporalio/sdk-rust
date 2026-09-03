@@ -207,7 +207,7 @@ async fn resource_based_few_pollers_guarantees_non_sticky_poll() {
     // Set the limits to zero so it's essentially unwilling to hand out slots
     let mut tuner = ResourceBasedTuner::new(0.0, 0.0);
     tuner.with_workflow_slots_options(ResourceSlotOptions::new(2, 10, Duration::from_millis(0)));
-    starter.sdk_config.tuner = Arc::new(tuner);
+    starter.set_core_tuner(Arc::new(tuner));
     starter
         .sdk_config
         .register_workflow::<ResourceBasedNonStickyWf>()
@@ -1274,7 +1274,7 @@ async fn test_custom_slot_supplier_simple() {
     tb.workflow_slot_supplier(wf_supplier.clone());
     tb.activity_slot_supplier(activity_supplier.clone());
     tb.local_activity_slot_supplier(local_activity_supplier.clone());
-    starter.sdk_config.tuner = Arc::new(tb.build());
+    starter.set_core_tuner(Arc::new(tb.build()));
     starter
         .sdk_config
         .register_workflow::<SlotSupplierWorkflow>()

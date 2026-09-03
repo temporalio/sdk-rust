@@ -14,16 +14,8 @@ use temporalio_sdk_core::{
 
 use crate::error::RuntimeError;
 
-// These tuner types are intentionally part of the Rust SDK's public API. Changes to their Core
-// definitions must preserve the SDK's stability guarantees until the SDK owns this surface.
-pub use temporalio_sdk_core::{
-    ActivitySlotKind, FixedSizeSlotSupplier, LocalActivitySlotKind, NexusSlotKind,
-    ResourceBasedSlotsOptions, ResourceBasedSlotsOptionsBuilder, ResourceBasedTuner,
-    ResourceBasedTunerConfig, ResourceController, ResourceSlotOptions, SlotInfo, SlotInfoTrait,
-    SlotKind, SlotKindType, SlotMarkUsedContext, SlotReleaseContext, SlotReservationContext,
-    SlotSupplier, SlotSupplierOptions, SlotSupplierPermit, TunerBuilder, TunerHolder,
-    TunerHolderOptions, TunerHolderOptionsBuilder, WorkerTuner, WorkflowSlotKind,
-};
+/// Worker concurrency tuning.
+pub mod worker_tuner;
 
 // These remain public only for the raw-worker APIs that are being migrated separately.
 pub use temporalio_sdk_core::{Worker as CoreWorker, WorkerConfig};

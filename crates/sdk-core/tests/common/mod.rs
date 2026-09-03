@@ -60,8 +60,8 @@ use temporalio_sdk::{
 #[cfg(any(feature = "test-utilities", test))]
 pub(crate) use temporalio_sdk_core::test_help::NAMESPACE;
 use temporalio_sdk_core::{
-    CoreRuntime, RuntimeOptions, Worker as CoreWorker, WorkerConfig, WorkerVersioningStrategy,
-    init_replay_worker, init_worker,
+    CoreRuntime, RuntimeOptions, Worker as CoreWorker, WorkerConfig,
+    WorkerTuner as CoreWorkerTuner, WorkerVersioningStrategy, init_replay_worker, init_worker,
     replay::{HistoryForReplay, ReplayWorkerInput},
     test_help::{MockPollCfg, build_mock_pollers, mock_worker},
 };
@@ -355,6 +355,7 @@ pub(crate) struct CoreWfStarter {
     /// Run when initializing, allows for altering the config used to init the core worker
     #[allow(clippy::type_complexity)] // It's not tho
     core_config_mutator: Option<Arc<dyn Fn(&mut WorkerConfig)>>,
+    core_tuner_override: Option<Arc<dyn CoreWorkerTuner + Send + Sync>>,
     core_task_types: Option<WorkerTaskTypes>,
 }
 struct InitializedWorker {
@@ -480,6 +481,7 @@ impl CoreWfStarter {
             client_override,
             min_local_server_version: None,
             core_config_mutator: None,
+            core_tuner_override: None,
             core_task_types: None,
         }
     }
@@ -496,6 +498,7 @@ impl CoreWfStarter {
             min_local_server_version: self.min_local_server_version.clone(),
             initted_worker: Default::default(),
             core_config_mutator: self.core_config_mutator.clone(),
+            core_tuner_override: self.core_tuner_override.clone(),
             core_task_types: self.core_task_types,
         }
     }
@@ -522,6 +525,10 @@ impl CoreWfStarter {
 
     pub(crate) fn set_core_cfg_mutator(&mut self, mutator: impl Fn(&mut WorkerConfig) + 'static) {
         self.core_config_mutator = Some(Arc::new(mutator))
+    }
+
+    pub(crate) fn set_core_tuner(&mut self, tuner: Arc<dyn CoreWorkerTuner + Send + Sync>) {
+        self.core_tuner_override = Some(tuner);
     }
 
     pub(crate) fn set_core_task_types(&mut self, task_types: WorkerTaskTypes) {
@@ -676,6 +683,9 @@ impl CoreWfStarter {
                 }
                 if let Some(ref ccm) = self.core_config_mutator {
                     ccm(&mut core_config);
+                }
+                if let Some(tuner) = &self.core_tuner_override {
+                    core_config.tuner = Some(tuner.clone());
                 }
                 let worker =
                     init_worker(rt, core_config, connection).expect("Worker inits cleanly");

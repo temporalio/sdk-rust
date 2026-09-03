@@ -174,7 +174,7 @@ use tracing::{Instrument, Span, field};
 use uuid::Uuid;
 
 use crate::runtime::{
-    CoreWorker, PollerBehavior, TunerBuilder, WorkerConfig, WorkerTuner, WorkflowErrorType,
+    CoreWorker, PollerBehavior, WorkerConfig, WorkflowErrorType, worker_tuner::WorkerTuner,
 };
 
 /// Contains options for configuring a worker.
@@ -232,10 +232,10 @@ pub struct WorkerOptions {
     /// or failures.
     #[builder(default = 1000)]
     pub max_cached_workflows: usize,
-    /// Set a [crate::WorkerTuner] for this worker, which controls how many slots are available for
-    /// the different kinds of tasks.
-    #[builder(default = Arc::new(TunerBuilder::default().build()))]
-    pub tuner: Arc<dyn WorkerTuner + Send + Sync>,
+    /// Set a [`runtime::worker_tuner::WorkerTuner`] for this worker, which controls how many slots
+    /// are available for the different kinds of tasks.
+    #[builder(into, default)]
+    pub tuner: WorkerTuner,
     /// Controls how polling for Workflow tasks will happen on this worker's task queue. See also
     /// [WorkerConfig::nonsticky_to_sticky_poll_ratio]. If using SimpleMaximum, Must be at least 2
     /// when `max_cached_workflows` > 0, or is an error.
@@ -689,6 +689,8 @@ impl WorkerOptions {
         #[cfg(not(feature = "experimental"))]
         let plugin_info = HashSet::new();
 
+        let tuner = self.tuner.to_core()?;
+
         WorkerConfig::builder()
             .namespace(namespace)
             .task_queue(self.task_queue.clone())
@@ -702,7 +704,7 @@ impl WorkerOptions {
                 })
             }))
             .max_cached_workflows(self.max_cached_workflows)
-            .tuner(self.tuner.clone())
+            .tuner(tuner)
             .maybe_workflow_task_poller_behavior(
                 self.workflow_task_poller_behavior
                     .map(PollerBehavior::into_core),

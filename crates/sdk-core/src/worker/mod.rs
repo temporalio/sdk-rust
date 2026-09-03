@@ -1845,8 +1845,6 @@ pub enum WorkflowErrorType {
     Nondeterminism,
 }
 
-// The Rust SDK intentionally re-exports this trait and the slot-supplier family below, so Core
-// changes to these APIs must preserve the Rust SDK's stability guarantees.
 /// This trait allows users to customize the performance characteristics of workers dynamically.
 /// For more, see the docstrings of the traits in the return types of its functions.
 pub trait WorkerTuner {

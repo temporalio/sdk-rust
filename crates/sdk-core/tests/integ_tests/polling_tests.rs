@@ -289,7 +289,7 @@ async fn small_workflow_slots_and_pollers(#[values(false, true)] use_autoscaling
         starter.sdk_config.workflow_task_poller_behavior = Some(PollerBehavior::SimpleMaximum(2));
     }
     starter.sdk_config.activity_task_poller_behavior = Some(PollerBehavior::SimpleMaximum(1));
-    starter.sdk_config.tuner = Arc::new(TunerHolder::fixed_size(2, 1, 1, 1));
+    starter.set_core_tuner(Arc::new(TunerHolder::fixed_size(2, 1, 1, 1)));
     starter
         .sdk_config
         .register_activities(StdActivities)

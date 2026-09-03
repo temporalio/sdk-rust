@@ -46,6 +46,8 @@ relevant information.
   distinguish a missing signal or cancellation target from other delivery failures.
 
 ### Breaking Changes
+* `temporalio-sdk` now exposes SDK-owned worker tuner and slot supplier types instead of
+  re-exporting the corresponding `temporalio-sdk-core` traits.
 * `temporalio-sdk` now owns its runtime, polling, workflow-error, worker-validation, and local test
   server configuration types instead of re-exporting their `temporalio-sdk-core` equivalents.
   `TokioRuntimeBuilder` is non-exhaustive and provides a builder for construction. Unrelated Core

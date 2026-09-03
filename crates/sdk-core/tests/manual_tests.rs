@@ -134,7 +134,7 @@ async fn poller_load_spiky() {
     let rt = CoreRuntime::new_assume_tokio(get_integ_runtime_options(telemopts)).unwrap();
     let mut starter = CoreWfStarter::new_with_runtime("poller_load", rt);
     starter.sdk_config.max_cached_workflows = 5000;
-    starter.sdk_config.tuner = Arc::new(TunerHolder::fixed_size(1000, 1000, 100, 100));
+    starter.set_core_tuner(Arc::new(TunerHolder::fixed_size(1000, 1000, 100, 100)));
     starter.sdk_config.workflow_task_poller_behavior = Some(PollerBehavior::Autoscaling(
         AutoscalingOptions::builder()
             .minimum(1)
@@ -280,7 +280,7 @@ async fn poller_load_sustained() {
     let rt = CoreRuntime::new_assume_tokio(get_integ_runtime_options(telemopts)).unwrap();
     let mut starter = CoreWfStarter::new_with_runtime("poller_load", rt);
     starter.sdk_config.max_cached_workflows = 5000;
-    starter.sdk_config.tuner = Arc::new(TunerHolder::fixed_size(1000, 100, 100, 100));
+    starter.set_core_tuner(Arc::new(TunerHolder::fixed_size(1000, 100, 100, 100)));
     starter.sdk_config.workflow_task_poller_behavior = Some(PollerBehavior::Autoscaling(
         AutoscalingOptions::builder()
             .minimum(1)
@@ -358,7 +358,7 @@ async fn poller_load_spike_then_sustained() {
     let rt = CoreRuntime::new_assume_tokio(get_integ_runtime_options(telemopts)).unwrap();
     let mut starter = CoreWfStarter::new_with_runtime("poller_load", rt);
     starter.sdk_config.max_cached_workflows = 5000;
-    starter.sdk_config.tuner = Arc::new(TunerHolder::fixed_size(1000, 100, 100, 100));
+    starter.set_core_tuner(Arc::new(TunerHolder::fixed_size(1000, 100, 100, 100)));
     starter.sdk_config.workflow_task_poller_behavior = Some(PollerBehavior::Autoscaling(
         AutoscalingOptions::builder()
             .minimum(1)

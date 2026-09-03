@@ -121,7 +121,7 @@ impl CacheMissWf {
 async fn cache_miss_ok() {
     let wf_name = "cache_miss_ok";
     let mut starter = CoreWfStarter::new(wf_name);
-    starter.sdk_config.tuner = Arc::new(TunerHolder::fixed_size(2, 1, 1, 1));
+    starter.set_core_tuner(Arc::new(TunerHolder::fixed_size(2, 1, 1, 1)));
     starter.sdk_config.max_cached_workflows = 0_usize;
     starter.sdk_config.workflow_task_poller_behavior = Some(PollerBehavior::SimpleMaximum(1_usize));
 

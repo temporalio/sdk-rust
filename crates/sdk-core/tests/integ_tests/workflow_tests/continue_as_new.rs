@@ -115,7 +115,7 @@ async fn continue_as_new_multiple_concurrent() {
     let wf_name = "continue_as_new_multiple_concurrent";
     let mut starter = CoreWfStarter::new(wf_name);
     starter.sdk_config.max_cached_workflows = 5_usize;
-    starter.sdk_config.tuner = Arc::new(TunerHolder::fixed_size(5, 1, 1, 1));
+    starter.set_core_tuner(Arc::new(TunerHolder::fixed_size(5, 1, 1, 1)));
     starter
         .sdk_config
         .register_workflow::<ContinueAsNewWf>()
