@@ -88,7 +88,7 @@ use temporalio_sdk::{Runtime, Worker, WorkerOptions};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let runtime = Runtime::new_assume_tokio(Default::default())?;
+    let runtime = Runtime::from_current_tokio(Default::default())?;
     let (conn_options, client_options) = ClientOptions::load_from_config(
         LoadClientConfigProfileOptions::default()
     )?;

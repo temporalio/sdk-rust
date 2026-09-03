@@ -4,24 +4,111 @@
 //! primary workflow and activity APIs. Create a [`crate::Runtime`] before connecting a client,
 //! then pass it to [`crate::Worker::new`].
 
-use std::{
-    ops::{Deref, DerefMut},
-    time::Duration,
+use std::time::Duration;
+
+use temporalio_common::telemetry::TelemetryOptions;
+use temporalio_sdk_core::{
+    CoreRuntime, PollerBehavior as CorePollerBehavior, RuntimeOptions as CoreRuntimeOptions,
+    TokioRuntimeBuilder as CoreTokioRuntimeBuilder, WorkflowErrorType as CoreWorkflowErrorType,
 };
 
-use temporalio_common::telemetry::{TelemetryInstance, TelemetryOptions};
-use temporalio_sdk_core::{CoreRuntime, RuntimeOptions as CoreRuntimeOptions};
+use crate::error::RuntimeError;
 
+// These tuner types are intentionally part of the Rust SDK's public API. Changes to their Core
+// definitions must preserve the SDK's stability guarantees until the SDK owns this surface.
 pub use temporalio_sdk_core::{
-    ActivitySlotKind, FixedSizeSlotSupplier, LocalActivitySlotKind, NexusSlotKind, PollerBehavior,
+    ActivitySlotKind, FixedSizeSlotSupplier, LocalActivitySlotKind, NexusSlotKind,
     ResourceBasedSlotsOptions, ResourceBasedSlotsOptionsBuilder, ResourceBasedTuner,
     ResourceBasedTunerConfig, ResourceController, ResourceSlotOptions, SlotInfo, SlotInfoTrait,
     SlotKind, SlotKindType, SlotMarkUsedContext, SlotReleaseContext, SlotReservationContext,
-    SlotSupplier, SlotSupplierOptions, SlotSupplierPermit, TokioRuntimeBuilder, TunerBuilder,
-    TunerHolder, TunerHolderOptions, TunerHolderOptionsBuilder, Worker as CoreWorker, WorkerConfig,
-    WorkerConfigBuilder, WorkerTuner, WorkerVersioningStrategy, WorkflowErrorType,
-    WorkflowSlotKind, init_replay_worker, replay,
+    SlotSupplier, SlotSupplierOptions, SlotSupplierPermit, TunerBuilder, TunerHolder,
+    TunerHolderOptions, TunerHolderOptionsBuilder, WorkerTuner, WorkflowSlotKind,
 };
+
+// These remain public only for the raw-worker APIs that are being migrated separately.
+pub use temporalio_sdk_core::{Worker as CoreWorker, WorkerConfig};
+
+/// Wraps a Tokio runtime builder so the SDK can install its per-thread telemetry state.
+#[derive(bon::Builder)]
+#[builder(state_mod(vis = "pub"))]
+#[non_exhaustive]
+pub struct TokioRuntimeBuilder {
+    /// The Tokio runtime builder used to create the runtime.
+    pub inner: tokio::runtime::Builder,
+}
+
+impl Default for TokioRuntimeBuilder {
+    fn default() -> Self {
+        Self {
+            inner: tokio::runtime::Builder::new_multi_thread(),
+        }
+    }
+}
+
+impl TokioRuntimeBuilder {
+    fn into_core(self) -> CoreTokioRuntimeBuilder<Box<dyn Fn() + Send + Sync>> {
+        CoreTokioRuntimeBuilder {
+            inner: self.inner,
+            lang_on_thread_start: None,
+        }
+    }
+}
+
+/// Options for automatically scaling the number of concurrent task polls.
+#[derive(bon::Builder, Clone, Copy, Debug, PartialEq)]
+#[builder(state_mod(vis = "pub"))]
+#[non_exhaustive]
+pub struct AutoscalingOptions {
+    /// Minimum number of concurrent polls. Cannot be zero.
+    pub minimum: usize,
+    /// Maximum number of concurrent polls. Must be at least `minimum`.
+    pub maximum: usize,
+    /// Initial number of concurrent polls. Must be between `minimum` and `maximum`.
+    pub initial: usize,
+}
+
+/// Controls how many concurrent task polls a worker issues.
+#[derive(Clone, Copy, Debug, PartialEq)]
+#[non_exhaustive]
+pub enum PollerBehavior {
+    /// Poll whenever a slot is available, up to the supplied maximum.
+    SimpleMaximum(usize),
+    /// Adjust concurrent polls using feedback from the server.
+    Autoscaling(AutoscalingOptions),
+}
+
+impl PollerBehavior {
+    pub(crate) fn into_core(self) -> CorePollerBehavior {
+        match self {
+            PollerBehavior::SimpleMaximum(maximum) => CorePollerBehavior::SimpleMaximum(maximum),
+            PollerBehavior::Autoscaling(AutoscalingOptions {
+                minimum,
+                maximum,
+                initial,
+            }) => CorePollerBehavior::Autoscaling {
+                minimum,
+                maximum,
+                initial,
+            },
+        }
+    }
+}
+
+/// Workflow-processing errors that may be configured to fail the workflow execution.
+#[derive(Clone, Debug, Eq, PartialEq, Hash)]
+#[non_exhaustive]
+pub enum WorkflowErrorType {
+    /// A workflow produced commands that do not match its recorded history.
+    Nondeterminism,
+}
+
+impl WorkflowErrorType {
+    pub(crate) fn into_core(self) -> CoreWorkflowErrorType {
+        match self {
+            WorkflowErrorType::Nondeterminism => CoreWorkflowErrorType::Nondeterminism,
+        }
+    }
+}
 
 /// Configuration for the Rust SDK runtime. Construct with [`RuntimeOptions::builder`].
 #[derive(bon::Builder)]
@@ -66,12 +153,12 @@ impl<S: runtime_options_builder::State> RuntimeOptionsBuilder<S> {
     }
 }
 
-impl From<RuntimeOptions> for CoreRuntimeOptions {
-    fn from(options: RuntimeOptions) -> Self {
+impl RuntimeOptions {
+    fn into_core(self) -> CoreRuntimeOptions {
         CoreRuntimeOptions::builder()
-            .telemetry_options(options.telemetry_options)
-            .heartbeat_interval(options.heartbeat_interval)
-            .disable_environment_info(options.disable_environment_info)
+            .telemetry_options(self.telemetry_options)
+            .heartbeat_interval(self.heartbeat_interval)
+            .disable_environment_info(self.disable_environment_info)
             .build()
             .expect("SDK runtime options have already been validated")
     }
@@ -82,50 +169,62 @@ pub struct Runtime(CoreRuntime);
 
 impl Runtime {
     /// Creates a runtime with a newly constructed Tokio runtime.
-    pub fn new<F>(
+    ///
+    /// # Errors
+    /// Returns an error if telemetry or the Tokio runtime cannot be initialized.
+    pub fn new(
         options: RuntimeOptions,
-        tokio_builder: TokioRuntimeBuilder<F>,
-    ) -> Result<Self, anyhow::Error>
-    where
-        F: Fn() + Send + Sync + 'static,
-    {
-        CoreRuntime::new(options.into(), tokio_builder).map(Self)
+        tokio_builder: TokioRuntimeBuilder,
+    ) -> Result<Self, RuntimeError> {
+        CoreRuntime::new(options.into_core(), tokio_builder.into_core())
+            .map(Self)
+            .map_err(RuntimeError::from_core)
     }
 
     /// Creates a runtime using the currently active Tokio runtime.
     ///
-    /// # Panics
-    /// Panics if there is no currently active Tokio runtime.
-    pub fn new_assume_tokio(options: RuntimeOptions) -> Result<Self, anyhow::Error> {
-        CoreRuntime::new_assume_tokio(options.into()).map(Self)
+    /// # Errors
+    /// Returns [`RuntimeError::NoCurrentTokioRuntime`] if there is no currently active Tokio
+    /// runtime, or [`RuntimeError::Initialization`] if telemetry cannot be initialized.
+    pub fn from_current_tokio(options: RuntimeOptions) -> Result<Self, RuntimeError> {
+        tokio::runtime::Handle::try_current().map_err(|_| RuntimeError::NoCurrentTokioRuntime)?;
+        CoreRuntime::new_assume_tokio(options.into_core())
+            .map(Self)
+            .map_err(RuntimeError::from_core)
     }
 
-    /// Creates a runtime from an initialized telemetry instance using the currently active Tokio
-    /// runtime.
+    /// Creates a runtime using the currently active Tokio runtime.
     ///
-    /// # Panics
-    /// Panics if there is no currently active Tokio runtime.
-    pub fn new_assume_tokio_initialized_telem(
-        telemetry: TelemetryInstance,
-        heartbeat_interval: Option<Duration>,
-    ) -> Self {
-        Self(CoreRuntime::new_assume_tokio_initialized_telem(
-            telemetry,
-            heartbeat_interval,
-        ))
+    /// # Errors
+    /// Returns [`RuntimeError::NoCurrentTokioRuntime`] if there is no currently active Tokio
+    /// runtime, or [`RuntimeError::Initialization`] if telemetry cannot be initialized.
+    #[deprecated(note = "use `Runtime::from_current_tokio` instead")]
+    pub fn new_assume_tokio(options: RuntimeOptions) -> Result<Self, RuntimeError> {
+        Self::from_current_tokio(options)
     }
-}
 
-impl Deref for Runtime {
-    type Target = CoreRuntime;
-
-    fn deref(&self) -> &Self::Target {
+    pub(crate) fn core(&self) -> &CoreRuntime {
         &self.0
     }
 }
 
-impl DerefMut for Runtime {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.0
+#[cfg(test)]
+mod tests {
+    use super::{Runtime, TokioRuntimeBuilder};
+    use crate::error::RuntimeError;
+
+    #[test]
+    fn from_current_tokio_without_runtime_returns_error() {
+        assert!(matches!(
+            Runtime::from_current_tokio(Default::default()),
+            Err(RuntimeError::NoCurrentTokioRuntime)
+        ));
+    }
+
+    #[test]
+    fn tokio_runtime_builder_constructs_with_an_inner_builder() {
+        let _builder = TokioRuntimeBuilder::builder()
+            .inner(tokio::runtime::Builder::new_current_thread())
+            .build();
     }
 }

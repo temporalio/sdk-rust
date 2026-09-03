@@ -86,14 +86,89 @@ use temporalio_common::{
 use tokio_util::sync::CancellationToken;
 use url::Url;
 
-pub use temporalio_sdk_core::ephemeral_server::{
-    EphemeralExe, EphemeralExeVersion, EphemeralServerError,
-};
 use temporalio_sdk_core::ephemeral_server::{
-    EphemeralServer, TemporalDevServerConfig, default_cached_download,
+    EphemeralExe as CoreEphemeralExe, EphemeralExeVersion as CoreEphemeralExeVersion,
+    EphemeralServer, EphemeralServerError as CoreEphemeralServerError, TemporalDevServerConfig,
 };
 
 type ActivityImplementers = HashMap<String, Arc<dyn Any + Send + Sync>>;
+
+/// Where to find the Temporal server executable used by a local workflow environment.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub enum EphemeralExe {
+    /// Use an existing executable at this path.
+    ExistingPath(String),
+    /// Download and cache an executable when necessary.
+    CachedDownload {
+        /// Version to download.
+        version: EphemeralExeVersion,
+        /// Cache directory, or the operating system's temporary directory when absent.
+        dest_dir: Option<String>,
+        /// Maximum cache age, or no expiration when absent.
+        ttl: Option<Duration>,
+    },
+}
+
+impl EphemeralExe {
+    fn into_core(self) -> CoreEphemeralExe {
+        match self {
+            EphemeralExe::ExistingPath(path) => CoreEphemeralExe::ExistingPath(path),
+            EphemeralExe::CachedDownload {
+                version,
+                dest_dir,
+                ttl,
+            } => CoreEphemeralExe::CachedDownload {
+                version: version.into_core(),
+                dest_dir,
+                ttl,
+            },
+        }
+    }
+}
+
+impl Default for EphemeralExe {
+    fn default() -> Self {
+        EphemeralExe::CachedDownload {
+            version: EphemeralExeVersion::Default,
+            dest_dir: None,
+            ttl: Some(Duration::from_secs(60 * 60 * 24 * 15)),
+        }
+    }
+}
+
+/// Version of a downloadable Temporal server executable.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub enum EphemeralExeVersion {
+    /// Resolve the server version selected for this SDK release.
+    Default,
+    /// Download a specific server version.
+    Fixed(String),
+}
+
+impl EphemeralExeVersion {
+    fn into_core(self) -> CoreEphemeralExeVersion {
+        match self {
+            EphemeralExeVersion::Default => CoreEphemeralExeVersion::SDKDefault {
+                sdk_name: "sdk-rust".to_owned(),
+                sdk_version: env!("CARGO_PKG_VERSION").to_owned(),
+            },
+            EphemeralExeVersion::Fixed(version) => CoreEphemeralExeVersion::Fixed(version),
+        }
+    }
+}
+
+/// Errors encountered while downloading, starting, or stopping a local Temporal server.
+#[derive(Debug, thiserror::Error)]
+#[error(transparent)]
+pub struct EphemeralServerError(CoreEphemeralServerError);
+
+impl EphemeralServerError {
+    fn from_core(error: CoreEphemeralServerError) -> Self {
+        Self(error)
+    }
+}
 
 /// Options for constructing [`ActivityInfo`] with defaults suitable for an activity test.
 #[derive(bon::Builder)]
@@ -363,7 +438,7 @@ pub struct LocalWorkflowEnvironmentOptions {
     #[builder(default = ClientOptions::new("default").build())]
     pub client_options: ClientOptions,
     /// Existing or downloadable Temporal CLI executable.
-    #[builder(default = default_cached_download())]
+    #[builder(default)]
     pub server_executable: EphemeralExe,
     /// Fixed frontend port, or an OS-selected port when absent.
     pub port: Option<u16>,
@@ -446,7 +521,7 @@ impl WorkflowEnvironment<LocalServer> {
             })
             .transpose()?;
         let server_config = TemporalDevServerConfig::builder()
-            .exe(options.server_executable)
+            .exe(options.server_executable.into_core())
             .namespace(options.client_options.namespace.clone())
             .maybe_port(options.port)
             .ui(options.ui)
@@ -461,6 +536,7 @@ impl WorkflowEnvironment<LocalServer> {
         let mut server = server_config
             .start_server()
             .await
+            .map_err(EphemeralServerError::from_core)
             .map_err(WorkflowEnvironmentError::ServerStart)?;
         let target = Url::parse(&format!("http://{}", server.target))
             .map_err(WorkflowEnvironmentError::InvalidServerTarget)?;
@@ -476,7 +552,7 @@ impl WorkflowEnvironment<LocalServer> {
                     Ok(()) => Err(WorkflowEnvironmentError::ClientConnect(connect)),
                     Err(shutdown) => Err(WorkflowEnvironmentError::ClientConnectAndShutdown {
                         connect: Box::new(connect),
-                        shutdown: Box::new(shutdown),
+                        shutdown: Box::new(EphemeralServerError::from_core(shutdown)),
                     }),
                 };
             }
@@ -493,6 +569,7 @@ impl WorkflowEnvironment<LocalServer> {
             .server
             .shutdown()
             .await
+            .map_err(EphemeralServerError::from_core)
             .map_err(WorkflowEnvironmentError::ServerShutdown)
     }
 }

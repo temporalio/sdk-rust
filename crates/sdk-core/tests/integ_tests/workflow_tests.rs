@@ -68,9 +68,10 @@ use temporalio_macros::{workflow, workflow_methods};
 use temporalio_sdk::{
     ActivityOptions, LocalActivityOptions, TimerOptions, WorkflowContext, WorkflowResult,
     interceptors::WorkerInterceptor,
+    runtime::{PollerBehavior, WorkflowErrorType},
 };
 use temporalio_sdk_core::{
-    CoreRuntime, PollError, PollerBehavior, TunerHolder, WorkflowErrorType, prost_dur,
+    CoreRuntime, PollError, TunerHolder, prost_dur,
     replay::{DEFAULT_WORKFLOW_TYPE, HistoryForReplay, canned_histories},
     test_help::{
         MockPollCfg, WorkerTestHelpers, drain_pollers_and_shutdown, schedule_activity_cmd,

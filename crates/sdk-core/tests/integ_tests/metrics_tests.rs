@@ -78,12 +78,13 @@ use temporalio_sdk::{
     ActivityOptions, CancellableFuture, LocalActivityOptions, NexusOperationOptions,
     WorkflowContext, WorkflowResult,
     activities::{ActivityContext, ActivityError},
+    runtime::{AutoscalingOptions, PollerBehavior},
 };
 use temporalio_sdk_core::{
-    ActivitySlotKind, CoreRuntime, FixedSizeSlotSupplier, PollError, PollerBehavior, SlotKind,
-    SlotMarkUsedContext, SlotReleaseContext, SlotReservationContext, SlotSupplier,
-    SlotSupplierPermit, TokioRuntimeBuilder, TunerBuilder, WorkerConfig, WorkerVersioningStrategy,
-    WorkflowSlotKind, init_worker, prost_dur,
+    ActivitySlotKind, CoreRuntime, FixedSizeSlotSupplier, PollError,
+    PollerBehavior as CorePollerBehavior, SlotKind, SlotMarkUsedContext, SlotReleaseContext,
+    SlotReservationContext, SlotSupplier, SlotSupplierPermit, TokioRuntimeBuilder, TunerBuilder,
+    WorkerConfig, WorkerVersioningStrategy, WorkflowSlotKind, init_worker, prost_dur,
     replay::TestHistoryBuilder,
     test_help::{
         MockPollCfg, MocksHolder, ResponseType, TemporalMeter, WorkerExt, WorkerTestHelpers,
@@ -194,7 +195,7 @@ async fn one_slot_worker_reports_available_slot() {
         // Need to use two for WFTs because there are a minimum of 2 pollers b/c of sticky polling
         .max_outstanding_workflow_tasks(2_usize)
         .max_outstanding_nexus_tasks(1_usize)
-        .workflow_task_poller_behavior(PollerBehavior::SimpleMaximum(2_usize))
+        .workflow_task_poller_behavior(CorePollerBehavior::SimpleMaximum(2_usize))
         .task_types(WorkerTaskTypes::all())
         .build()
         .unwrap();
@@ -483,11 +484,13 @@ async fn idle_activity_worker_reports_zero_slots_used() {
     let rt = CoreRuntime::new_assume_tokio(get_integ_runtime_options(telemopts)).unwrap();
     let mut starter =
         CoreWfStarter::new_with_runtime("idle_activity_worker_reports_zero_slots_used", rt);
-    starter.sdk_config.activity_task_poller_behavior = Some(PollerBehavior::Autoscaling {
-        minimum: 1,
-        maximum: 1,
-        initial: 1,
-    });
+    starter.sdk_config.activity_task_poller_behavior = Some(PollerBehavior::Autoscaling(
+        AutoscalingOptions::builder()
+            .minimum(1)
+            .maximum(1)
+            .initial(1)
+            .build(),
+    ));
     let activity_slots = Arc::new(ReservationTrackingActivitySlotSupplier::new(3));
     let mut tuner = TunerBuilder::default();
     tuner.activity_slot_supplier(activity_slots.clone());

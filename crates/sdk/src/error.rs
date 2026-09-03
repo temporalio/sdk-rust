@@ -3,7 +3,50 @@
 pub use crate::workflow_registry::WorkflowRegistrationError;
 #[cfg(feature = "experimental")]
 use temporalio_client::PluginApplyError;
-pub use temporalio_sdk_core::WorkerValidationError;
+use temporalio_sdk_core::WorkerValidationError as CoreWorkerValidationError;
+
+/// Errors that can occur while creating an SDK runtime.
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum RuntimeError {
+    /// Runtime initialization failed.
+    #[error("runtime initialization failed: {0}")]
+    Initialization(#[source] Box<dyn std::error::Error + Send + Sync + 'static>),
+    /// No Tokio runtime is active on the current thread.
+    #[error("no Tokio runtime is active on the current thread")]
+    NoCurrentTokioRuntime,
+}
+
+impl RuntimeError {
+    pub(crate) fn from_core(error: anyhow::Error) -> Self {
+        Self::Initialization(error.into_boxed_dyn_error())
+    }
+}
+
+/// Errors encountered while validating a worker before polling begins.
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum WorkerValidationError {
+    /// The configured namespace could not be described.
+    #[error("namespace {namespace} was not found or otherwise could not be described: {source}")]
+    NamespaceDescribeError {
+        /// The underlying server error.
+        #[source]
+        source: temporalio_client::tonic::Status,
+        /// The namespace that could not be described.
+        namespace: String,
+    },
+}
+
+impl WorkerValidationError {
+    pub(crate) fn from_core(error: CoreWorkerValidationError) -> Self {
+        match error {
+            CoreWorkerValidationError::NamespaceDescribeError { source, namespace } => {
+                Self::NamespaceDescribeError { source, namespace }
+            }
+        }
+    }
+}
 
 /// Errors that can occur while creating a worker.
 ///

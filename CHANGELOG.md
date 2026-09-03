@@ -45,7 +45,19 @@ relevant information.
 * `WorkflowSignalError::NotFound` and `CancelExternalWorkflowError::NotFound` let workflows
   distinguish a missing signal or cancellation target from other delivery failures.
 
+### Breaking Changes
+* `temporalio-sdk` now owns its runtime, polling, workflow-error, worker-validation, and local test
+  server configuration types instead of re-exporting their `temporalio-sdk-core` equivalents.
+  `TokioRuntimeBuilder` is non-exhaustive and provides a builder for construction. Unrelated Core
+  worker configuration and replay helpers are no longer re-exported by the SDK.
+  `PollerBehavior::Autoscaling` now holds builder-created `AutoscalingOptions`.
+* `Runtime::from_current_tokio` replaces `Runtime::new_assume_tokio` as the preferred constructor.
+  The old name remains as a deprecated alias, but now returns `RuntimeError` instead of
+  `anyhow::Error`.
+
 ### Fixed
+* `Runtime::from_current_tokio` now returns `RuntimeError::NoCurrentTokioRuntime` when called
+  without an active Tokio runtime instead of panicking.
 * `Memo::keys` and `SearchAttributes::keys` now iterate in lexicographic order so workflow
   decisions based on collection traversal remain deterministic during replay.
 

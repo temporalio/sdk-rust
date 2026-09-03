@@ -9,8 +9,8 @@ use std::{
 use temporalio_client::WorkflowStartOptions;
 use temporalio_common::protos::temporal::api::enums::v1::EventType;
 use temporalio_macros::{workflow, workflow_methods};
-use temporalio_sdk::{WorkflowContext, WorkflowResult};
-use temporalio_sdk_core::{PollerBehavior, TunerHolder};
+use temporalio_sdk::{WorkflowContext, WorkflowResult, runtime::PollerBehavior};
+use temporalio_sdk_core::TunerHolder;
 use tokio::sync::Barrier;
 
 #[tokio::test]

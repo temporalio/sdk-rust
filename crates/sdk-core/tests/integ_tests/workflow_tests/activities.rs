@@ -58,9 +58,10 @@ use temporalio_sdk::{
         ActivityInboundInterceptor, ExecuteActivityInput, ExecuteActivityOutput,
         ExecuteActivityResult, Next,
     },
+    runtime::{AutoscalingOptions, PollerBehavior},
 };
 use temporalio_sdk_core::{
-    PollerBehavior, prost_dur,
+    prost_dur,
     replay::{DEFAULT_ACTIVITY_TYPE, DEFAULT_WORKFLOW_TYPE, TestHistoryBuilder, canned_histories},
     test_help::{
         MockPollCfg, ResponseType, WorkerTestHelpers, drain_pollers_and_shutdown,
@@ -2134,16 +2135,20 @@ async fn activity_can_be_cancelled_by_local_timeout() {
 async fn long_activity_timeout_repro() {
     let wf_name = "long_activity_timeout_repro";
     let mut starter = CoreWfStarter::new(wf_name);
-    starter.sdk_config.workflow_task_poller_behavior = Some(PollerBehavior::Autoscaling {
-        minimum: 1,
-        maximum: 10,
-        initial: 5,
-    });
-    starter.sdk_config.activity_task_poller_behavior = Some(PollerBehavior::Autoscaling {
-        minimum: 1,
-        maximum: 10,
-        initial: 5,
-    });
+    starter.sdk_config.workflow_task_poller_behavior = Some(PollerBehavior::Autoscaling(
+        AutoscalingOptions::builder()
+            .minimum(1)
+            .maximum(10)
+            .initial(5)
+            .build(),
+    ));
+    starter.sdk_config.activity_task_poller_behavior = Some(PollerBehavior::Autoscaling(
+        AutoscalingOptions::builder()
+            .minimum(1)
+            .maximum(10)
+            .initial(5)
+            .build(),
+    ));
     starter
         .set_core_cfg_mutator(|m| m.local_timeout_buffer_for_activities = Duration::from_secs(0));
     starter.sdk_config.register_activities(StdActivities);

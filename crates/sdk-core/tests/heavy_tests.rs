@@ -40,11 +40,10 @@ use temporalio_common::{
 use temporalio_sdk::{
     ActivityOptions, SyncWorkflowContext, WorkflowContext, WorkflowResult,
     activities::{ActivityContext, ActivityError},
+    runtime::{AutoscalingOptions, PollerBehavior},
     workflows,
 };
-use temporalio_sdk_core::{
-    CoreRuntime, PollerBehavior, ResourceBasedTuner, ResourceSlotOptions, TunerHolder,
-};
+use temporalio_sdk_core::{CoreRuntime, ResourceBasedTuner, ResourceSlotOptions, TunerHolder};
 
 #[workflow]
 #[derive(Clone, Default)]
@@ -468,16 +467,20 @@ async fn poller_autoscaling_basic_loadtest() {
     let mut starter = CoreWfStarter::new("poller_load");
     starter.sdk_config.max_cached_workflows = 5000;
     starter.sdk_config.tuner = Arc::new(TunerHolder::fixed_size(1000, 1000, 100, 1));
-    starter.sdk_config.workflow_task_poller_behavior = Some(PollerBehavior::Autoscaling {
-        minimum: 1,
-        maximum: 200,
-        initial: 5,
-    });
-    starter.sdk_config.activity_task_poller_behavior = Some(PollerBehavior::Autoscaling {
-        minimum: 1,
-        maximum: 200,
-        initial: 5,
-    });
+    starter.sdk_config.workflow_task_poller_behavior = Some(PollerBehavior::Autoscaling(
+        AutoscalingOptions::builder()
+            .minimum(1)
+            .maximum(200)
+            .initial(5)
+            .build(),
+    ));
+    starter.sdk_config.activity_task_poller_behavior = Some(PollerBehavior::Autoscaling(
+        AutoscalingOptions::builder()
+            .minimum(1)
+            .maximum(200)
+            .initial(5)
+            .build(),
+    ));
 
     starter.sdk_config.register_activities(JitteryActivities);
     starter

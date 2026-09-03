@@ -29,8 +29,9 @@ use temporalio_macros::{activities, workflow, workflow_methods};
 use temporalio_sdk::{
     ActivityOptions, SyncWorkflowContext, WorkflowContext, WorkflowResult,
     activities::{ActivityContext, ActivityError},
+    runtime::{AutoscalingOptions, PollerBehavior},
 };
-use temporalio_sdk_core::{CoreRuntime, PollerBehavior, TunerHolder};
+use temporalio_sdk_core::{CoreRuntime, TunerHolder};
 use tracing::info;
 
 struct JitteryEchoActivities;
@@ -134,16 +135,20 @@ async fn poller_load_spiky() {
     let mut starter = CoreWfStarter::new_with_runtime("poller_load", rt);
     starter.sdk_config.max_cached_workflows = 5000;
     starter.sdk_config.tuner = Arc::new(TunerHolder::fixed_size(1000, 1000, 100, 100));
-    starter.sdk_config.workflow_task_poller_behavior = Some(PollerBehavior::Autoscaling {
-        minimum: 1,
-        maximum: 200,
-        initial: 5,
-    });
-    starter.sdk_config.activity_task_poller_behavior = Some(PollerBehavior::Autoscaling {
-        minimum: 1,
-        maximum: 200,
-        initial: 5,
-    });
+    starter.sdk_config.workflow_task_poller_behavior = Some(PollerBehavior::Autoscaling(
+        AutoscalingOptions::builder()
+            .minimum(1)
+            .maximum(200)
+            .initial(5)
+            .build(),
+    ));
+    starter.sdk_config.activity_task_poller_behavior = Some(PollerBehavior::Autoscaling(
+        AutoscalingOptions::builder()
+            .minimum(1)
+            .maximum(200)
+            .initial(5)
+            .build(),
+    ));
     starter
         .sdk_config
         .register_activities(JitteryEchoActivities)
@@ -276,11 +281,13 @@ async fn poller_load_sustained() {
     let mut starter = CoreWfStarter::new_with_runtime("poller_load", rt);
     starter.sdk_config.max_cached_workflows = 5000;
     starter.sdk_config.tuner = Arc::new(TunerHolder::fixed_size(1000, 100, 100, 100));
-    starter.sdk_config.workflow_task_poller_behavior = Some(PollerBehavior::Autoscaling {
-        minimum: 1,
-        maximum: 200,
-        initial: 5,
-    });
+    starter.sdk_config.workflow_task_poller_behavior = Some(PollerBehavior::Autoscaling(
+        AutoscalingOptions::builder()
+            .minimum(1)
+            .maximum(200)
+            .initial(5)
+            .build(),
+    ));
     starter
         .sdk_config
         .register_workflow::<PollerLoadSustainedWf>()
@@ -352,16 +359,20 @@ async fn poller_load_spike_then_sustained() {
     let mut starter = CoreWfStarter::new_with_runtime("poller_load", rt);
     starter.sdk_config.max_cached_workflows = 5000;
     starter.sdk_config.tuner = Arc::new(TunerHolder::fixed_size(1000, 100, 100, 100));
-    starter.sdk_config.workflow_task_poller_behavior = Some(PollerBehavior::Autoscaling {
-        minimum: 1,
-        maximum: 200,
-        initial: 5,
-    });
-    starter.sdk_config.activity_task_poller_behavior = Some(PollerBehavior::Autoscaling {
-        minimum: 1,
-        maximum: 200,
-        initial: 5,
-    });
+    starter.sdk_config.workflow_task_poller_behavior = Some(PollerBehavior::Autoscaling(
+        AutoscalingOptions::builder()
+            .minimum(1)
+            .maximum(200)
+            .initial(5)
+            .build(),
+    ));
+    starter.sdk_config.activity_task_poller_behavior = Some(PollerBehavior::Autoscaling(
+        AutoscalingOptions::builder()
+            .minimum(1)
+            .maximum(200)
+            .initial(5)
+            .build(),
+    ));
     starter
         .sdk_config
         .register_activities(JitteryEchoActivities)

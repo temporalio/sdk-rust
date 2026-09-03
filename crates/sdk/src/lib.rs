@@ -36,7 +36,7 @@
 //! async fn main() -> Result<(), Box<dyn std::error::Error>> {
 //!     let connection_options =
 //!         ConnectionOptions::new(Url::from_str("http://localhost:7233")?).build();
-//!     let runtime = Runtime::new_assume_tokio(Default::default())?;
+//!     let runtime = Runtime::from_current_tokio(Default::default())?;
 //!     let connection = Connection::connect(connection_options).await?;
 //!     let client = Client::new(connection, ClientOptions::new("my_namespace").build())?;
 //!
@@ -91,8 +91,8 @@ pub use crate::{
     error::{
         ActivityExecutionError, ApplicationFailure, CancelExternalWorkflowError,
         ChildWorkflowExecutionError, ChildWorkflowStartError, OutgoingActivityError, OutgoingError,
-        OutgoingWorkflowError, RetryState, TimeoutType, WorkerCreateError, WorkerRunError,
-        WorkerValidationError, WorkflowRegistrationError, WorkflowSignalError,
+        OutgoingWorkflowError, RetryState, RuntimeError, TimeoutType, WorkerCreateError,
+        WorkerRunError, WorkerValidationError, WorkflowRegistrationError, WorkflowSignalError,
     },
     workflow_registry::WorkflowDefinitions,
 };
@@ -162,7 +162,7 @@ use temporalio_common::{
     },
     worker::{WorkerDeploymentOptions, WorkerTaskTypes, build_id_from_current_exe},
 };
-use temporalio_sdk_core::{PollError, init_worker};
+use temporalio_sdk_core::{PollError, WorkerVersioningStrategy, init_worker};
 use temporalio_workflow::{InternalPatchActivationCallback, workflows::WorkflowImplementation};
 use tokio::sync::{
     Notify,
@@ -174,8 +174,7 @@ use tracing::{Instrument, Span, field};
 use uuid::Uuid;
 
 use crate::runtime::{
-    CoreWorker, PollerBehavior, TunerBuilder, WorkerConfig, WorkerTuner, WorkerVersioningStrategy,
-    WorkflowErrorType,
+    CoreWorker, PollerBehavior, TunerBuilder, WorkerConfig, WorkerTuner, WorkflowErrorType,
 };
 
 /// Contains options for configuring a worker.
@@ -704,9 +703,18 @@ impl WorkerOptions {
             }))
             .max_cached_workflows(self.max_cached_workflows)
             .tuner(self.tuner.clone())
-            .maybe_workflow_task_poller_behavior(self.workflow_task_poller_behavior)
-            .maybe_activity_task_poller_behavior(self.activity_task_poller_behavior)
-            .maybe_nexus_task_poller_behavior(self.nexus_task_poller_behavior)
+            .maybe_workflow_task_poller_behavior(
+                self.workflow_task_poller_behavior
+                    .map(PollerBehavior::into_core),
+            )
+            .maybe_activity_task_poller_behavior(
+                self.activity_task_poller_behavior
+                    .map(PollerBehavior::into_core),
+            )
+            .maybe_nexus_task_poller_behavior(
+                self.nexus_task_poller_behavior
+                    .map(PollerBehavior::into_core),
+            )
             .task_types(WorkerTaskTypes {
                 enable_workflows: workflows_registered,
                 enable_local_activities: workflows_registered && activities_registered,
@@ -725,8 +733,28 @@ impl WorkerOptions {
             .versioning_strategy(WorkerVersioningStrategy::WorkerDeploymentBased(
                 self.deployment_options.clone(),
             ))
-            .workflow_failure_errors(self.workflow_failure_errors.clone())
-            .workflow_types_to_failure_errors(self.workflow_types_to_failure_errors.clone())
+            .workflow_failure_errors(
+                self.workflow_failure_errors
+                    .iter()
+                    .cloned()
+                    .map(WorkflowErrorType::into_core)
+                    .collect(),
+            )
+            .workflow_types_to_failure_errors(
+                self.workflow_types_to_failure_errors
+                    .iter()
+                    .map(|(workflow_type, error_types)| {
+                        (
+                            workflow_type.clone(),
+                            error_types
+                                .iter()
+                                .cloned()
+                                .map(WorkflowErrorType::into_core)
+                                .collect(),
+                        )
+                    })
+                    .collect(),
+            )
             .plugins(plugin_info)
             .disable_payload_error_limit(disable_payload_error_limit)
             .build()
@@ -881,7 +909,7 @@ impl Worker {
         let wc = options
             .to_core_options(client.namespace(), client.identity())
             .map_err(|error| WorkerCreateError::Initialization(anyhow!(error)))?;
-        let core = init_worker(runtime, wc, client.connection().clone())
+        let core = init_worker(runtime.core(), wc, client.connection().clone())
             .map_err(WorkerCreateError::Initialization)?;
         Self::new_from_core_options_prepared(Arc::new(core), client.options().clone(), options)
     }
@@ -1027,6 +1055,7 @@ impl Worker {
             .worker
             .validate()
             .await
+            .map_err(WorkerValidationError::from_core)
             .map_err(WorkerRunError::Validation)?;
         let shutdown_token = CancellationToken::new();
         let (common, wf_half, act_half) = self.split_apart();

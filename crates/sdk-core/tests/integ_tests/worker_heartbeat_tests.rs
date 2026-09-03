@@ -42,10 +42,10 @@ use temporalio_macros::{activities, workflow, workflow_methods};
 use temporalio_sdk::{
     ActivityOptions, SyncWorkflowContext, WorkflowContext, WorkflowResult,
     activities::{ActivityContext, ActivityError},
+    runtime::{AutoscalingOptions, PollerBehavior},
 };
 use temporalio_sdk_core::{
-    CoreRuntime, PollerBehavior, ResourceBasedTuner, ResourceSlotOptions, RuntimeOptions,
-    TunerHolder, prost_dur,
+    CoreRuntime, ResourceBasedTuner, ResourceSlotOptions, RuntimeOptions, TunerHolder, prost_dur,
 };
 use tokio::{sync::Notify, time::sleep};
 use tonic::IntoRequest;
@@ -407,16 +407,20 @@ async fn docker_worker_heartbeat_tuner() {
     tuner
         .with_workflow_slots_options(ResourceSlotOptions::new(2, 10, Duration::from_millis(0)))
         .with_activity_slots_options(ResourceSlotOptions::new(5, 10, Duration::from_millis(50)));
-    starter.sdk_config.workflow_task_poller_behavior = Some(PollerBehavior::Autoscaling {
-        minimum: 1,
-        maximum: 200,
-        initial: 5,
-    });
-    starter.sdk_config.nexus_task_poller_behavior = Some(PollerBehavior::Autoscaling {
-        minimum: 1,
-        maximum: 200,
-        initial: 5,
-    });
+    starter.sdk_config.workflow_task_poller_behavior = Some(PollerBehavior::Autoscaling(
+        AutoscalingOptions::builder()
+            .minimum(1)
+            .maximum(200)
+            .initial(5)
+            .build(),
+    ));
+    starter.sdk_config.nexus_task_poller_behavior = Some(PollerBehavior::Autoscaling(
+        AutoscalingOptions::builder()
+            .minimum(1)
+            .maximum(200)
+            .initial(5)
+            .build(),
+    ));
     starter.sdk_config.tuner = Arc::new(tuner);
     starter.sdk_config.register_activities(StdActivities);
 

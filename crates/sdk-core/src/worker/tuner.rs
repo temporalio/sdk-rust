@@ -1,6 +1,8 @@
 mod fixed_size;
 mod resource_based;
 
+// The Rust SDK intentionally re-exports this module's public tuner configuration types. Changes
+// here must preserve that stable user-facing API even while sdk-core itself remains pre-1.0.
 pub use fixed_size::FixedSizeSlotSupplier;
 pub(crate) use resource_based::{RealSysInfo, SystemResourceInfo};
 pub use resource_based::{

@@ -61,13 +61,13 @@ use temporalio_sdk::{
     ActivityOptions, LocalActivityOptions, WorkerOptions, WorkflowContext, WorkflowResult,
     activities::{ActivityContext, ActivityError},
     interceptors::WorkerInterceptor,
+    runtime::PollerBehavior,
 };
 use temporalio_sdk_core::{
-    ActivitySlotKind, CoreRuntime, LocalActivitySlotKind, PollError, PollerBehavior,
-    ResourceBasedTuner, ResourceSlotOptions, SlotInfo, SlotInfoTrait, SlotMarkUsedContext,
-    SlotReleaseContext, SlotReservationContext, SlotSupplier, SlotSupplierPermit, TunerBuilder,
-    WorkerConfig, WorkerValidationError, WorkerVersioningStrategy, WorkflowSlotKind, init_worker,
-    prost_dur,
+    ActivitySlotKind, CoreRuntime, LocalActivitySlotKind, PollError, ResourceBasedTuner,
+    ResourceSlotOptions, SlotInfo, SlotInfoTrait, SlotMarkUsedContext, SlotReleaseContext,
+    SlotReservationContext, SlotSupplier, SlotSupplierPermit, TunerBuilder, WorkerConfig,
+    WorkerValidationError, WorkerVersioningStrategy, WorkflowSlotKind, init_worker, prost_dur,
     replay::{DEFAULT_WORKFLOW_TYPE, TestHistoryBuilder, canned_histories},
     test_help::{
         FakeWfResponses, MockPollCfg, ResponseType, build_mock_pollers, drain_pollers_and_shutdown,

@@ -36,7 +36,7 @@ use url::Url;
 use uuid::Uuid;
 
 fn new_sdk_runtime() -> Runtime {
-    Runtime::new_assume_tokio(
+    Runtime::from_current_tokio(
         RuntimeOptions::builder()
             .telemetry_options(get_integ_telem_options())
             .build()
