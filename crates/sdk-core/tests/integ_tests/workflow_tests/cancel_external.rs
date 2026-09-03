@@ -5,7 +5,9 @@ use temporalio_common::protos::{
     temporal::api::enums::v1::{CommandType, EventType},
 };
 use temporalio_macros::{workflow, workflow_methods};
-use temporalio_sdk::{ApplicationFailure, WorkflowContext, WorkflowResult};
+use temporalio_sdk::{
+    ApplicationFailure, CancelExternalWorkflowError, WorkflowContext, WorkflowResult,
+};
 use temporalio_sdk_core::{
     replay::{DEFAULT_WORKFLOW_TYPE, TestHistoryBuilder},
     test_help::MockPollCfg,
@@ -103,10 +105,12 @@ impl CancelSenderCanned {
     async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<()> {
         let handle = ctx.external_workflow("fake_wid", Some("fake_rid".into()));
         let res = handle.cancel(None).await;
-        if res.is_err() {
-            Err(ApplicationFailure::new("Cancel fail!").into())
-        } else {
-            Ok(())
+        match res {
+            Err(CancelExternalWorkflowError::Failed(_)) => {
+                Err(ApplicationFailure::new("Cancel fail!").into())
+            }
+            Err(error) => panic!("unexpected external cancellation error: {error}"),
+            Ok(()) => Ok(()),
         }
     }
 }

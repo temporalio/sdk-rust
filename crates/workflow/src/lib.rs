@@ -35,7 +35,6 @@ pub mod __private {
 
     pub mod sdk {
         pub use crate::runtime::{
-            SdkWakeGuard,
             entry::WorkflowImplementation,
             guest::WorkflowInstance,
             host::WorkflowHost,
@@ -64,8 +63,8 @@ pub use runtime::model::{TimerResult, WorkflowResult, WorkflowTermination};
 pub use temporalio_common_wasm::{
     ActivityCloseTimeouts, Memo, MemoValue, MemoValues, RetryPolicy,
     error::{
-        ActivityExecutionError, ChildWorkflowExecutionError, ChildWorkflowStartError, RetryState,
-        TimeoutType, WorkflowSignalError,
+        ActivityExecutionError, CancelExternalWorkflowError, ChildWorkflowExecutionError,
+        ChildWorkflowStartError, RetryState, TimeoutType, WorkflowSignalError,
     },
 };
 pub use workflow_context::{

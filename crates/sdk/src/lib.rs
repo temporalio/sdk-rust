@@ -89,10 +89,10 @@ pub use crate::plugins::{
 };
 pub use crate::{
     error::{
-        ActivityExecutionError, ApplicationFailure, ChildWorkflowExecutionError,
-        ChildWorkflowStartError, OutgoingActivityError, OutgoingError, OutgoingWorkflowError,
-        RetryState, TimeoutType, WorkerCreateError, WorkerRunError, WorkerValidationError,
-        WorkflowRegistrationError, WorkflowSignalError,
+        ActivityExecutionError, ApplicationFailure, CancelExternalWorkflowError,
+        ChildWorkflowExecutionError, ChildWorkflowStartError, OutgoingActivityError, OutgoingError,
+        OutgoingWorkflowError, RetryState, TimeoutType, WorkerCreateError, WorkerRunError,
+        WorkerValidationError, WorkflowRegistrationError, WorkflowSignalError,
     },
     workflow_registry::WorkflowDefinitions,
 };

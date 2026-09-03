@@ -449,6 +449,9 @@ pub enum OutgoingWorkflowError {
     /// A workflow failure sourced from signaling a workflow.
     #[error(transparent)]
     WorkflowSignal(#[from] Box<WorkflowSignalError>),
+    /// A workflow failure sourced from requesting cancellation of an external workflow.
+    #[error(transparent)]
+    CancelExternalWorkflow(#[from] Box<CancelExternalWorkflowError>),
 }
 
 impl OutgoingWorkflowError {
@@ -462,6 +465,7 @@ impl OutgoingWorkflowError {
             Self::ChildWorkflowExecution(err) => err.as_cancelled(),
             Self::ChildWorkflowStart(err) => err.as_cancelled(),
             Self::WorkflowSignal(err) => err.as_cancelled(),
+            Self::CancelExternalWorkflow(err) => err.as_cancelled(),
         }
     }
 }
@@ -510,6 +514,15 @@ impl From<WorkflowSignalError> for OutgoingWorkflowError {
         match value {
             WorkflowSignalError::Serialization(err) => Self::PayloadConversion(err),
             other => Self::WorkflowSignal(Box::new(other)),
+        }
+    }
+}
+
+impl From<CancelExternalWorkflowError> for OutgoingWorkflowError {
+    fn from(value: CancelExternalWorkflowError) -> Self {
+        match value {
+            CancelExternalWorkflowError::Serialization(err) => Self::PayloadConversion(err),
+            other => Self::CancelExternalWorkflow(Box::new(other)),
         }
     }
 }
@@ -1153,6 +1166,48 @@ pub enum WorkflowSignalError {
     /// Failed to serialize the signal input payload.
     #[error("Signal payload conversion failed: {0}")]
     Serialization(#[from] PayloadConversionError),
+}
+
+/// Error returned when requesting cancellation of an external workflow fails.
+#[derive(Debug, thiserror::Error)]
+pub enum CancelExternalWorkflowError {
+    /// The cancellation request failed.
+    #[error("External workflow cancellation request failed: {}", .0.failure().message)]
+    Failed(#[source] Box<IncomingError>),
+    /// Failed to deserialize payloads attached to the cancellation failure.
+    #[error("External workflow cancellation failure conversion failed: {0}")]
+    Serialization(#[from] PayloadConversionError),
+}
+
+impl CancelExternalWorkflowError {
+    /// Returns the retained top-level cancellation failure proto, if one exists.
+    pub fn failure(&self) -> Option<&Failure> {
+        match self {
+            Self::Failed(err) => Some(err.failure()),
+            Self::Serialization(_) => None,
+        }
+    }
+
+    /// Returns the normalized cause of the cancellation failure, if any.
+    pub fn cause(&self) -> Option<&IncomingError> {
+        match self {
+            Self::Failed(err) => err.cause(),
+            Self::Serialization(_) => None,
+        }
+    }
+
+    /// Returns the normalized cancellation failure itself, if one exists.
+    pub fn reason(&self) -> Option<&IncomingError> {
+        match self {
+            Self::Failed(err) => Some(err),
+            Self::Serialization(_) => None,
+        }
+    }
+
+    /// If this error was caused by cancellation, returns the associated [`CancelledError`].
+    pub fn as_cancelled(&self) -> Option<&CancelledError> {
+        self.reason()?.as_cancelled()
+    }
 }
 
 impl WorkflowSignalError {

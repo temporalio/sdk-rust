@@ -15,8 +15,8 @@ use temporalio_common_wasm::{
     WorkflowDefinition,
     data_converters::{PayloadConversionError, TemporalSerializable},
     error::{
-        ActivityExecutionError, ApplicationFailure, ChildWorkflowExecutionError,
-        ChildWorkflowStartError, WorkflowSignalError,
+        ActivityExecutionError, ApplicationFailure, CancelExternalWorkflowError,
+        ChildWorkflowExecutionError, ChildWorkflowStartError, WorkflowSignalError,
     },
     protos::{
         coresdk::{
@@ -60,11 +60,11 @@ pub(crate) struct SignalExternalOk;
 /// Result of awaiting on sending a signal to an external workflow
 pub(crate) type SignalExternalWfResult = Result<SignalExternalOk, Failure>;
 
-/// Successful result of sending a cancel request to an external workflow
+/// Distinguishes external cancellation resolutions from other command results.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct CancelExternalOk;
-/// Result of awaiting on sending a cancel request to an external workflow
-pub type CancelExternalWfResult = Result<CancelExternalOk, Failure>;
+pub(crate) struct CancelExternalOk;
+/// Internal result delivered when an external cancellation command resolves.
+pub(crate) type CancelExternalWfResult = Result<CancelExternalOk, Failure>;
 
 pub(crate) trait Unblockable {
     type OtherDat;
@@ -261,6 +261,12 @@ impl From<WorkflowSignalError> for WorkflowTermination {
     }
 }
 
+impl From<CancelExternalWorkflowError> for WorkflowTermination {
+    fn from(value: CancelExternalWorkflowError) -> Self {
+        Self::Failed(value.into())
+    }
+}
+
 impl From<ChildWorkflowStartError> for WorkflowTermination {
     fn from(value: ChildWorkflowStartError) -> Self {
         Self::Failed(value.into())
@@ -283,6 +289,7 @@ mod tests {
     #[case::child_start(ChildWorkflowStartError::Serialization(conversion_error()))]
     #[case::child_execution(ChildWorkflowExecutionError::Serialization(conversion_error()))]
     #[case::signal(WorkflowSignalError::Serialization(conversion_error()))]
+    #[case::cancel_external(CancelExternalWorkflowError::Serialization(conversion_error()))]
     fn conversion_error_is_preserved_in_workflow_termination<T: Into<WorkflowTermination>>(
         #[case] error: T,
     ) {

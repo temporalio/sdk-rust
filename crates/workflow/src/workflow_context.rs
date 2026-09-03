@@ -33,15 +33,15 @@ use crate::{
         types::WorkflowInit,
     },
     workflow_interceptors::{
-        CancelExternalWorkflowInput, CancellableWorkflowOutboundFuture,
-        ChildWorkflowOutboundResult, ContinueAsNewInput, ScheduleActivityInput,
-        ScheduleLocalActivityInput, SignalWorkflowInput, SignalWorkflowResult,
-        SignalWorkflowTarget, StartChildWorkflowInput, StartChildWorkflowResult, StartTimerInput,
-        WorkflowCancellationHandle, WorkflowInterceptor, WorkflowInterceptorConstructor,
-        WorkflowInterceptorContext, WorkflowNext, WorkflowOutboundFuture, WorkflowOutboundValue,
-        call_cancel_external_workflow, call_continue_as_new, call_schedule_activity,
-        call_schedule_local_activity, call_signal_workflow, call_start_child_workflow,
-        call_start_timer,
+        CancelExternalWorkflowInput, CancelExternalWorkflowResult,
+        CancellableWorkflowOutboundFuture, ChildWorkflowOutboundResult, ContinueAsNewInput,
+        ScheduleActivityInput, ScheduleLocalActivityInput, SignalWorkflowInput,
+        SignalWorkflowResult, SignalWorkflowTarget, StartChildWorkflowInput,
+        StartChildWorkflowResult, StartTimerInput, WorkflowCancellationHandle, WorkflowInterceptor,
+        WorkflowInterceptorConstructor, WorkflowInterceptorContext, WorkflowNext,
+        WorkflowOutboundFuture, WorkflowOutboundValue, call_cancel_external_workflow,
+        call_continue_as_new, call_schedule_activity, call_schedule_local_activity,
+        call_signal_workflow, call_start_child_workflow, call_start_timer,
     },
 };
 use futures_channel::oneshot;
@@ -68,13 +68,13 @@ use temporalio_common_wasm::{
     ActivityDefinition, Memo, SignalDefinition, WorkflowDefinition,
     data_converters::{
         ActivityExecutionDecodeHint, ChildWorkflowExecutionDecodeHint,
-        ChildWorkflowStartDecodeHint, DataConverter, GenericPayloadConverter,
+        ChildWorkflowStartDecodeHint, DataConverter, GenericPayloadConverter, NoopDecodeHint,
         PayloadConversionError, PayloadConverter, SerializationContext, SerializationContextData,
         TemporalDeserializable, WorkflowSerializationContext, WorkflowSignalDecodeHint,
     },
     error::{
-        ActivityExecutionError, ChildWorkflowExecutionError, ChildWorkflowStartError,
-        WorkflowSignalError,
+        ActivityExecutionError, CancelExternalWorkflowError, ChildWorkflowExecutionError,
+        ChildWorkflowStartError, WorkflowSignalError,
     },
     protos::{
         coresdk::{
@@ -1428,7 +1428,7 @@ impl BaseWorkflowContext {
     fn cancel_external_workflow(
         &self,
         input: CancelExternalWorkflowInput,
-    ) -> WorkflowOutboundFuture<CancelExternalWfResult> {
+    ) -> WorkflowOutboundFuture<CancelExternalWorkflowResult> {
         let base_ctx = self.clone();
         let next = WorkflowNext::new(move |input: CancelExternalWorkflowInput| {
             let seq = base_ctx
@@ -1436,7 +1436,7 @@ impl BaseWorkflowContext {
                 .seq_nums
                 .borrow_mut()
                 .next_cancel_external_wf_seq();
-            let (cmd, unblocker) = WFCommandFut::new();
+            let (cmd, unblocker) = WFCommandFut::<CancelExternalWfResult, ()>::new();
             base_ctx
                 .inner
                 .runtime
@@ -1455,7 +1455,18 @@ impl BaseWorkflowContext {
                 )
                 .into(),
             );
-            WorkflowOutboundFuture::new(cmd)
+            let data_converter = base_ctx.data_converter().clone();
+            WorkflowOutboundFuture::new(async move {
+                match cmd.await {
+                    Ok(_) => Ok(()),
+                    Err(failure) => {
+                        let context =
+                            SerializationContextData::Workflow(WorkflowSerializationContext::new());
+                        let error = data_converter.to_error(&context, failure, NoopDecodeHint)?;
+                        Err(CancelExternalWorkflowError::Failed(Box::new(error)))
+                    }
+                }
+            })
         });
         let interceptors = self.inner.workflow_interceptors.clone();
         let future = call_cancel_external_workflow(
@@ -3349,7 +3360,7 @@ impl ExternalWorkflowHandle {
     pub fn cancel(
         &self,
         reason: Option<String>,
-    ) -> impl FusedFuture<Output = CancelExternalWfResult> {
+    ) -> impl FusedFuture<Output = CancelExternalWorkflowResult> {
         self.base_ctx
             .cancel_external_workflow(CancelExternalWorkflowInput {
                 workflow_id: self.workflow_id.clone(),
@@ -4181,9 +4192,9 @@ mod tests {
                 next: WorkflowNext<
                     'static,
                     CancelExternalWorkflowInput,
-                    WorkflowOutboundFuture<CancelExternalWfResult>,
+                    WorkflowOutboundFuture<CancelExternalWorkflowResult>,
                 >,
-            ) -> WorkflowOutboundFuture<CancelExternalWfResult> {
+            ) -> WorkflowOutboundFuture<CancelExternalWorkflowResult> {
                 input.workflow_id = "mutated-cancel-workflow".to_string();
                 input.run_id = Some("mutated-cancel-run".to_string());
                 input.reason = Some("mutated-reason".to_string());

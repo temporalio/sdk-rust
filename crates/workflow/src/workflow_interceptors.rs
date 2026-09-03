@@ -81,13 +81,12 @@
 //! # let _ = interceptor_constructor();
 //! ```
 
-#[doc(inline)]
-pub use crate::runtime::model::{CancelExternalOk, CancelExternalWfResult};
 use crate::{
-    ActivityOptions, BaseWorkflowContext, CancellableFuture, CancellableFutureWithReason,
-    ChildWorkflowOptions, ContinueAsNewOptions, ExternalWorkflowHandle, LocalActivityOptions,
-    SignalWorkflowOptions, StartChildWorkflowOutput, StartedChildWorkflow, TimerOptions,
-    WorkflowCancellationToken, WorkflowContextView, WorkflowRandomStream,
+    ActivityOptions, BaseWorkflowContext, CancelExternalWorkflowError, CancellableFuture,
+    CancellableFutureWithReason, ChildWorkflowOptions, ContinueAsNewOptions,
+    ExternalWorkflowHandle, LocalActivityOptions, SignalWorkflowOptions, StartChildWorkflowOutput,
+    StartedChildWorkflow, TimerOptions, WorkflowCancellationToken, WorkflowContextView,
+    WorkflowRandomStream,
     cancellation::WorkflowCancellationRegistration,
     runtime::{
         entry::WorkflowError,
@@ -1379,6 +1378,9 @@ pub type ChildWorkflowOutboundResult =
 /// Result of an intercepted signal call.
 pub type SignalWorkflowResult = Result<(), WorkflowSignalError>;
 
+/// Result of requesting cancellation of an external workflow.
+pub type CancelExternalWorkflowResult = Result<(), CancelExternalWorkflowError>;
+
 /// Result of an intercepted child workflow start.
 pub type StartChildWorkflowResult = Result<StartChildWorkflowOutput, ChildWorkflowStartError>;
 
@@ -1565,9 +1567,9 @@ pub trait WorkflowInterceptor: 'static {
         next: WorkflowNext<
             'static,
             CancelExternalWorkflowInput,
-            WorkflowOutboundFuture<CancelExternalWfResult>,
+            WorkflowOutboundFuture<CancelExternalWorkflowResult>,
         >,
-    ) -> WorkflowOutboundFuture<CancelExternalWfResult> {
+    ) -> WorkflowOutboundFuture<CancelExternalWorkflowResult> {
         next.run(input)
     }
 
@@ -1673,7 +1675,7 @@ outbound_chain!(
     cancel_external_workflow,
     WorkflowInterceptorContext,
     CancelExternalWorkflowInput,
-    WorkflowOutboundFuture<CancelExternalWfResult>
+    WorkflowOutboundFuture<CancelExternalWorkflowResult>
 );
 outbound_chain!(
     call_continue_as_new,

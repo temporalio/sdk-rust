@@ -15,12 +15,12 @@ use super::{
 };
 use crate::{
     error::{
-        ActivityExecutionError, ActivityFailureError, ApplicationFailure, CancelledError,
-        ChildWorkflowExecutionError, ChildWorkflowFailureError, ChildWorkflowStartError,
-        IncomingError, IncomingNexusHandlerError, IncomingNexusOperationExecutionError,
-        OutgoingActivityError, OutgoingError, OutgoingWorkflowError, ResetWorkflowError,
-        ServerError, TerminatedError, TimeoutError, WorkflowSignalError,
-        WorkflowSignalFailureError,
+        ActivityExecutionError, ActivityFailureError, ApplicationFailure,
+        CancelExternalWorkflowError, CancelledError, ChildWorkflowExecutionError,
+        ChildWorkflowFailureError, ChildWorkflowStartError, IncomingError,
+        IncomingNexusHandlerError, IncomingNexusOperationExecutionError, OutgoingActivityError,
+        OutgoingError, OutgoingWorkflowError, ResetWorkflowError, ServerError, TerminatedError,
+        TimeoutError, WorkflowSignalError, WorkflowSignalFailureError,
     },
     protos::temporal::api::{
         enums::v1::ApplicationErrorCategory as ProtoApplicationErrorCategory,
@@ -247,6 +247,9 @@ impl FailureConverter for DefaultFailureConverter {
             OutgoingError::Workflow(OutgoingWorkflowError::WorkflowSignal(signal)) => {
                 signal.encode_failure(payload_converter, context)
             }
+            OutgoingError::Workflow(OutgoingWorkflowError::CancelExternalWorkflow(cancel)) => {
+                cancel.encode_failure(payload_converter, context)
+            }
         };
         let mut failure = encoded.unwrap_or_else(|converter_error| {
             Failure::application_failure(
@@ -290,6 +293,7 @@ enum ClassifiedFailure<'a> {
     ChildWorkflowExecution(&'a ChildWorkflowExecutionError),
     ChildWorkflowStart(&'a ChildWorkflowStartError),
     WorkflowSignal(&'a WorkflowSignalError),
+    CancelExternalWorkflow(&'a CancelExternalWorkflowError),
     Generic(&'a (dyn std::error::Error + 'static)),
 }
 
@@ -315,6 +319,8 @@ impl<'a> ClassifiedFailure<'a> {
             Self::ChildWorkflowStart(child)
         } else if let Some(child_signal) = err.downcast_ref::<WorkflowSignalError>() {
             Self::WorkflowSignal(child_signal)
+        } else if let Some(cancel_external) = err.downcast_ref::<CancelExternalWorkflowError>() {
+            Self::CancelExternalWorkflow(cancel_external)
         } else {
             Self::Generic(err)
         }
@@ -361,6 +367,14 @@ impl<'a> ClassifiedFailure<'a> {
                 )
                 .unwrap_or_else(|converter_error| {
                     encode_failed_error_conversion(signal, converter_error)
+                }),
+            Self::CancelExternalWorkflow(cancel) => cancel
+                .encode_failure(
+                    &PayloadConverter::default(),
+                    &SerializationContextData::None,
+                )
+                .unwrap_or_else(|converter_error| {
+                    encode_failed_error_conversion(cancel, converter_error)
                 }),
             Self::Generic(err) => encode_generic_application_failure(err),
         }
@@ -464,6 +478,19 @@ impl EncodeFailure for WorkflowSignalError {
     ) -> Result<Failure, PayloadConversionError> {
         Ok(match self {
             Self::Failed(failure) => failure.failure().clone(),
+            Self::Serialization(err) => encode_generic_application_failure(err),
+        })
+    }
+}
+
+impl EncodeFailure for CancelExternalWorkflowError {
+    fn encode_failure(
+        &self,
+        _: &PayloadConverter,
+        _: &SerializationContextData,
+    ) -> Result<Failure, PayloadConversionError> {
+        Ok(match self {
+            Self::Failed(error) => error.failure().clone(),
             Self::Serialization(err) => encode_generic_application_failure(err),
         })
     }

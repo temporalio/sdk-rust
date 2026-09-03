@@ -40,6 +40,7 @@ pub enum WorkerRunError {
 
 pub use temporalio_common::error::{
     ActivityExecutionError, ApplicationErrorCategory, ApplicationFailure,
-    ChildWorkflowExecutionError, ChildWorkflowStartError, OutgoingActivityError, OutgoingError,
-    OutgoingWorkflowError, RetryState, TimeoutType, WorkflowSignalError,
+    CancelExternalWorkflowError, ChildWorkflowExecutionError, ChildWorkflowStartError,
+    OutgoingActivityError, OutgoingError, OutgoingWorkflowError, RetryState, TimeoutType,
+    WorkflowSignalError,
 };

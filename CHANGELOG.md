@@ -33,6 +33,10 @@ relevant information.
 
 ## Unreleased
 
+### Added
+* `CancelExternalWorkflowError` and `workflow_interceptors::CancelExternalWorkflowResult`
+  for use in interceptors.
+
 ## [0.8.0] - 2026-09-02
 
 ### Breaking Changes
