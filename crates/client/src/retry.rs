@@ -156,8 +156,8 @@ where
     )
 }
 
-#[doc(hidden)]
-pub fn jittered(base: Duration, randomization_factor: f64) -> Duration {
+// Duplicated from `temporalio_sdk_core::pollers::poll_buffer`, if updating this function update that as well.
+fn jittered(base: Duration, randomization_factor: f64) -> Duration {
     if randomization_factor <= 0.0 {
         return base;
     }

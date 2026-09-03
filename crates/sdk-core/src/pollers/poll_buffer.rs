@@ -23,7 +23,7 @@ use std::{
     time::{Duration, Instant, SystemTime},
 };
 use temporalio_client::{
-    ERROR_RETURNED_DUE_TO_SHORT_CIRCUIT, jittered, request_extensions::NoRetryOnMatching,
+    ERROR_RETURNED_DUE_TO_SHORT_CIRCUIT, request_extensions::NoRetryOnMatching,
 };
 use temporalio_common::protos::temporal::api::{
     taskqueue::v1::PollerScalingDecision,
@@ -64,6 +64,21 @@ const PERSISTENT_POLL_ERROR_WARN_BACKOFF: ExponentialBuilder = ExponentialBuilde
     .with_factor(2.0)
     .with_max_delay(Duration::from_secs(15 * 60))
     .without_max_times();
+
+// Duplicated from `temporalio_client::retry::jitter`, if updating this function update that as well.
+fn jittered(base: Duration, randomization_factor: f64) -> Duration {
+    if randomization_factor <= 0.0 {
+        return base;
+    }
+    // Reproduce the `backoff` crate's documented jitter for backward compatibility:
+    //   randomized interval = retry_interval * (random value in range [1 - randomization_factor, 1 + randomization_factor])
+    // Docs: https://github.com/ihrwein/backoff/blob/587e2da8fb2dcfc65ca544cb9249022c51f1406e/src/lib.rs#L4
+    // Algorithm (`get_random_value_from_interval`): https://github.com/ihrwein/backoff/blob/587e2da8fb2dcfc65ca544cb9249022c51f1406e/src/exponential.rs#L61
+    let base_secs = base.as_secs_f64();
+    let spread = randomization_factor * base_secs;
+    let offset = spread * (2.0 * rand::random::<f64>() - 1.0);
+    Duration::try_from_secs_f64((base_secs + offset).max(0.0)).unwrap_or(base)
+}
 
 type PollReceiver<T, SK> =
     Mutex<UnboundedReceiver<pollers::Result<(T, OwnedMeteredSemPermit<SK>)>>>;
