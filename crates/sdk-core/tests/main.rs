@@ -8,6 +8,15 @@ extern crate assert_matches;
 mod common;
 
 #[cfg(test)]
+pub(crate) enum CloudTestExclusionReason {
+    DoesNotUseServer,
+    RequiresLocalServer,
+    RequiresOssOnlyApis,
+    RequiresCloudProvisioning,
+    NeedsCloudAdaptation,
+}
+
+#[cfg(test)]
 mod shared_tests;
 
 #[cfg(test)]
