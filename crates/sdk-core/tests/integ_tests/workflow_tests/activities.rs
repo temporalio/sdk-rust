@@ -208,6 +208,7 @@ fn activity_execution_result_status(result: &ExecuteActivityResult) -> &'static 
         Err(ActivityError::Application(_)) => "failed",
         Err(ActivityError::Cancelled { .. }) => "cancelled",
         Err(ActivityError::WillCompleteAsync) => "will_complete_async",
+        Err(_) => "unknown",
     }
 }
 

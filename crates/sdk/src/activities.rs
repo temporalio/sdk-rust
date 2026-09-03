@@ -672,6 +672,12 @@ pub(crate) fn activity_error_to_core_result(
             OutgoingError::Activity(OutgoingActivityError::Cancelled { details }),
         )),
         ActivityError::WillCompleteAsync => ActivityExecutionResult::will_complete_async(),
+        other => ActivityExecutionResult::fail(dc.to_failure(
+            &SerializationContextData::Activity(ActivitySerializationContext::new()),
+            OutgoingError::Activity(OutgoingActivityError::Application(Box::new(
+                ApplicationFailure::new(anyhow::anyhow!("Unsupported activity error: {other:?}")),
+            ))),
+        )),
     }
 }
 

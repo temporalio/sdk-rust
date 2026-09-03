@@ -256,6 +256,7 @@ impl Default for PayloadConverter {
 
 /// Errors that can occur during payload conversion.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum PayloadConversionError {
     /// The payload's encoding does not match what the converter expects.
     WrongEncoding,

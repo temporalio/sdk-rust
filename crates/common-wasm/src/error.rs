@@ -990,6 +990,7 @@ incoming_failure_wrapper!(
 
 /// Error type for activity execution outcomes.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum ActivityExecutionError {
     /// The activity failed with the given failure details.
     #[error("Activity failed: {}", .0.failure().message)]
@@ -1051,6 +1052,7 @@ impl ActivityExecutionError {
 
 /// Error returned when starting a child workflow fails.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum ChildWorkflowStartError {
     /// The child workflow start was cancelled before the normal execution wrapper path existed.
     #[error("Child workflow start cancelled: {}", .0.failure().message)]
@@ -1104,6 +1106,7 @@ impl ChildWorkflowStartError {
 
 /// Error returned when a child workflow execution fails.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum ChildWorkflowExecutionError {
     /// The child workflow failed.
     #[error("Child workflow failed: {}", .0.failure().message)]
@@ -1159,6 +1162,7 @@ impl ChildWorkflowExecutionError {
 
 /// Error returned when signaling a workflow fails.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum WorkflowSignalError {
     /// The signal delivery failed.
     #[error("Child workflow signal failed: {}", .0.failure().message)]

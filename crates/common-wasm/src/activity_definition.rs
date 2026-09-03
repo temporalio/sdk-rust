@@ -44,6 +44,7 @@ impl ActivityDefinition for UntypedActivity {
 
 /// Returned as errors from activity functions.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum ActivityError {
     /// Return this error to attach application-failure metadata to an activity failure.
     Application(Box<ApplicationFailure>),

@@ -36,6 +36,10 @@ relevant information.
 ### Added
 * `CancelExternalWorkflowError` and `workflow_interceptors::CancelExternalWorkflowResult`
   for use in interceptors.
+### Breaking Changes
+* `ActivityError`, `PayloadConversionError`, `ActivityExecutionError`,
+  `ChildWorkflowStartError`, `ChildWorkflowExecutionError`, and `WorkflowSignalError` are now
+  non-exhaustive. Add wildcard branches when matching these enums.
 
 ## [0.8.0] - 2026-09-02
 
