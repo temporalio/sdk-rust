@@ -840,6 +840,7 @@ async fn activity_tasks_from_completion_reserve_slots() {
     let mut worker = crate::common::TestWorker::new(
         temporalio_sdk::Worker::new_from_core_options(core.clone(), client_options, worker_options)
             .unwrap(),
+        core.clone(),
     );
 
     // First poll for activities twice, occupying both slots
