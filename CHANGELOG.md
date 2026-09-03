@@ -49,6 +49,13 @@ relevant information.
 ### Breaking Changes
 * `ActivityEnvironmentBuilder` no longer accepts a `tokio_util::sync::CancellationToken`.
   Use `ActivityEnvironment::cancel` to cancel activities running in the test environment.
+* `ChildWorkflowStartError::StartFailed` now reports an SDK-owned, non-exhaustive
+  `StartChildWorkflowExecutionFailedCause` instead of a generated protobuf enum. Add a wildcard
+  branch when matching the cause.
+* Client options now use client-owned, non-exhaustive `WorkflowIdReusePolicy`,
+  `WorkflowIdConflictPolicy`, `QueryRejectCondition`, `ArchivalState`, and
+  `HistoryEventFilterType` enums instead of generated protobuf enums. Add wildcard branches when
+  matching these types.
 * `ActivityError`, `PayloadConversionError`, `ActivityExecutionError`,
   `ChildWorkflowStartError`, `ChildWorkflowExecutionError`, and `WorkflowSignalError` are now
   non-exhaustive. Add wildcard branches when matching these enums.

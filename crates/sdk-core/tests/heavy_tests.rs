@@ -23,19 +23,14 @@ use std::{
 };
 use temporalio_client::{
     NamespacedClient, UntypedSignal, UntypedWorkflow, WorkflowExecutionInfo,
-    WorkflowGetResultOptions, WorkflowSignalOptions, WorkflowStartOptions,
+    WorkflowGetResultOptions, WorkflowIdConflictPolicy, WorkflowIdReusePolicy,
+    WorkflowSignalOptions, WorkflowStartOptions,
 };
-use temporalio_common::{
-    data_converters::RawValue, protos::temporal::api::enums::v1::WorkflowIdConflictPolicy,
-};
+use temporalio_common::data_converters::RawValue;
 use temporalio_macros::{activities, workflow, workflow_methods};
 
 use temporalio_common::{
-    ActivityCloseTimeouts,
-    protos::{
-        coresdk::workflow_commands::ActivityCancellationType,
-        temporal::api::enums::v1::WorkflowIdReusePolicy,
-    },
+    ActivityCloseTimeouts, protos::coresdk::workflow_commands::ActivityCancellationType,
 };
 use temporalio_sdk::{
     ActivityOptions, SyncWorkflowContext, WorkflowContext, WorkflowResult,

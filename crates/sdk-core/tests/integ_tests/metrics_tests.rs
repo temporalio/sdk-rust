@@ -20,8 +20,8 @@ use std::{
 };
 use temporalio_client::{
     Connection, MESSAGE_TOO_LARGE_KEY, NamespacedClient, REQUEST_LATENCY_HISTOGRAM_NAME,
-    UntypedQuery, UntypedWorkflow, WorkflowExecutionInfo, WorkflowQueryOptions,
-    WorkflowStartOptions, grpc::WorkflowService,
+    UntypedQuery, UntypedWorkflow, WorkflowExecutionInfo, WorkflowIdConflictPolicy,
+    WorkflowIdReusePolicy, WorkflowQueryOptions, WorkflowStartOptions, grpc::WorkflowService,
 };
 use temporalio_common::{
     data_converters::RawValue,
@@ -44,10 +44,7 @@ use temporalio_common::{
         },
         temporal::api::{
             common::v1::RetryPolicy,
-            enums::v1::{
-                NexusHandlerErrorRetryBehavior, WorkflowIdConflictPolicy, WorkflowIdReusePolicy,
-                WorkflowTaskFailedCause,
-            },
+            enums::v1::{NexusHandlerErrorRetryBehavior, WorkflowTaskFailedCause},
             failure::v1::Failure,
             nexus::{
                 self,

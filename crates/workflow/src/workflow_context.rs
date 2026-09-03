@@ -16,7 +16,7 @@ pub use options::{
 pub use options::{
     ContinueAsNewVersioningBehavior, NexusOperationCancellationType, NexusOperationOptions,
 };
-pub use temporalio_common_wasm::protos::coresdk::child_workflow::StartChildWorkflowExecutionFailedCause;
+pub use temporalio_common_wasm::error::StartChildWorkflowExecutionFailedCause;
 pub use view::{NamespacedWorkflowInfo, WorkflowContextView};
 
 use crate::{
@@ -82,7 +82,11 @@ use temporalio_common_wasm::{
     protos::{
         coresdk::{
             activity_result::{ActivityResolution, Cancellation, activity_resolution},
-            child_workflow::{ChildWorkflowResult, child_workflow_result},
+            child_workflow::{
+                ChildWorkflowResult,
+                StartChildWorkflowExecutionFailedCause as ProtoStartChildCause,
+                child_workflow_result,
+            },
             common::NamespacedWorkflowExecution,
             workflow_activation::{
                 InitializeWorkflow, WorkflowActivation as CoreWorkflowActivation,
@@ -3306,12 +3310,12 @@ where
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
-        let poll =
-            match this {
-                ChildWorkflowStartFut::Errored { error, .. } => {
-                    Poll::Ready(Err(*error.take().expect("polled after completion")))
-                }
-                ChildWorkflowStartFut::Running(inner) => match Pin::new(inner).poll(cx) {
+        let poll = match this {
+            ChildWorkflowStartFut::Errored { error, .. } => {
+                Poll::Ready(Err(*error.take().expect("polled after completion")))
+            }
+            ChildWorkflowStartFut::Running(inner) => {
+                match Pin::new(inner).poll(cx) {
                     Poll::Pending => Poll::Pending,
                     Poll::Ready(pending) => Poll::Ready(match pending.status {
                         ChildWorkflowStartStatus::Succeeded(s) => {
@@ -3335,8 +3339,18 @@ where
                             Err(ChildWorkflowStartError::StartFailed {
                                 workflow_id: f.workflow_id,
                                 workflow_type: f.workflow_type,
-                                cause: StartChildWorkflowExecutionFailedCause::try_from(f.cause)
-                                    .unwrap_or(StartChildWorkflowExecutionFailedCause::Unspecified),
+                                cause: match f.cause {
+                                    cause if cause == ProtoStartChildCause::Unspecified as i32 => {
+                                        StartChildWorkflowExecutionFailedCause::Unspecified
+                                    }
+                                    cause
+                                        if cause
+                                            == ProtoStartChildCause::WorkflowAlreadyExists as i32 =>
+                                    {
+                                        StartChildWorkflowExecutionFailedCause::WorkflowAlreadyExists
+                                    }
+                                    _ => StartChildWorkflowExecutionFailedCause::Unknown,
+                                },
                             })
                         }
                         ChildWorkflowStartStatus::Cancelled(c) => {
@@ -3355,9 +3369,10 @@ where
                             )?)
                         }
                     }),
-                },
-                ChildWorkflowStartFut::Terminated => panic!("polled after termination"),
-            };
+                }
+            }
+            ChildWorkflowStartFut::Terminated => panic!("polled after termination"),
+        };
         if poll.is_ready() {
             *this = ChildWorkflowStartFut::Terminated;
         }

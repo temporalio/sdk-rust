@@ -14,8 +14,8 @@ use std::{
 };
 use temporalio_client::{
     Client, NamespacedClient, UntypedSignal, UntypedUpdate, UntypedWorkflow,
-    WorkflowExecuteUpdateOptions, WorkflowExecutionInfo, WorkflowSignalOptions,
-    WorkflowStartOptions, WorkflowUpdateWithStartOptions,
+    WorkflowExecuteUpdateOptions, WorkflowExecutionInfo, WorkflowIdConflictPolicy,
+    WorkflowSignalOptions, WorkflowStartOptions, WorkflowUpdateWithStartOptions,
     errors::{WorkflowStartError, WorkflowUpdateError, WorkflowUpdateWithStartError},
     grpc::WorkflowService,
 };
@@ -35,7 +35,7 @@ use temporalio_common::{
         },
         temporal::api::{
             common::v1::WorkflowExecution,
-            enums::v1::{EventType, ResetReapplyType, WorkflowIdConflictPolicy},
+            enums::v1::{EventType, ResetReapplyType},
             workflowservice::v1::{ResetStickyTaskQueueRequest, ResetWorkflowExecutionRequest},
         },
     },

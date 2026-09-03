@@ -1,12 +1,12 @@
 use crate::{
     CancelWorkflowInput, DescribeWorkflowInput, DescribeWorkflowOutput,
-    FetchWorkflowHistoryPageInput, FetchWorkflowHistoryPageOutput, NamespacedClient, Next,
-    PollWorkflowUpdateInput, PollWorkflowUpdateOutput, QueryWorkflowInput, QueryWorkflowOutput,
-    RpcOptions, SignalWorkflowInput, StartWorkflowUpdateInput, StartWorkflowUpdateOutput,
-    TerminateWorkflowInput, WorkflowCancelOptions, WorkflowDescribeOptions,
-    WorkflowExecuteUpdateOptions, WorkflowExecutionStatus, WorkflowFetchHistoryOptions,
-    WorkflowGetResultOptions, WorkflowQueryOptions, WorkflowSignalOptions,
-    WorkflowStartUpdateOptions, WorkflowTerminateOptions,
+    FetchWorkflowHistoryPageInput, FetchWorkflowHistoryPageOutput, HistoryEventFilterType,
+    NamespacedClient, Next, PollWorkflowUpdateInput, PollWorkflowUpdateOutput, QueryWorkflowInput,
+    QueryWorkflowOutput, RpcOptions, SignalWorkflowInput, StartWorkflowUpdateInput,
+    StartWorkflowUpdateOutput, TerminateWorkflowInput, WorkflowCancelOptions,
+    WorkflowDescribeOptions, WorkflowExecuteUpdateOptions, WorkflowExecutionStatus,
+    WorkflowFetchHistoryOptions, WorkflowGetResultOptions, WorkflowQueryOptions,
+    WorkflowSignalOptions, WorkflowStartUpdateOptions, WorkflowTerminateOptions,
     errors::{
         WorkflowGetResultError, WorkflowInteractionError, WorkflowQueryError, WorkflowUpdateError,
     },
@@ -36,7 +36,11 @@ use temporalio_common::{
         proto_ts_to_system_time,
         temporal::api::{
             common::v1::{Header, Payload, Payloads, WorkflowExecution as ProtoWorkflowExecution},
-            enums::v1::{HistoryEventFilterType, UpdateWorkflowExecutionLifecycleStage},
+            enums::v1::{
+                HistoryEventFilterType as ProtoHistoryEventFilterType,
+                QueryRejectCondition as ProtoQueryRejectCondition,
+                UpdateWorkflowExecutionLifecycleStage,
+            },
             history::{
                 self,
                 v1::{History, HistoryEvent, history_event::Attributes},
@@ -873,8 +877,8 @@ where
                             }),
                             query_reject_condition: options
                                 .reject_condition
-                                .map(|condition| condition as i32)
-                                .unwrap_or(1),
+                                .map(|condition| ProtoQueryRejectCondition::from(condition) as i32)
+                                .unwrap_or(ProtoQueryRejectCondition::None as i32),
                         }
                         .into_request();
                         options.rpc_options.apply_to(&mut request);
@@ -1272,10 +1276,11 @@ where
                                             next_page_token: input.next_page_token,
                                             skip_archival: input.options.skip_archival,
                                             wait_new_event: input.options.wait_new_event,
-                                            history_event_filter_type: input
-                                                .options
-                                                .event_filter_type
-                                                as i32,
+                                            history_event_filter_type:
+                                                ProtoHistoryEventFilterType::from(
+                                                    input.options.event_filter_type,
+                                                )
+                                                    as i32,
                                             ..Default::default()
                                         }
                                         .into_request();

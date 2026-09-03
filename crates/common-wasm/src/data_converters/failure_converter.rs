@@ -675,7 +675,7 @@ mod tests {
             ActivitySerializationContext, GenericPayloadConverter, SerializationContext,
             WorkflowSerializationContext,
         },
-        error::ApplicationErrorCategory,
+        error::{ApplicationErrorCategory, StartChildWorkflowExecutionFailedCause},
         protos::temporal::api::{
             common::v1::{Payload, Payloads},
             failure::v1::{
@@ -1141,7 +1141,7 @@ mod tests {
             ChildWorkflowStartError::StartFailed {
                 workflow_id: "wf-id".to_owned(),
                 workflow_type: "wf-type".to_owned(),
-                cause: crate::protos::coresdk::child_workflow::StartChildWorkflowExecutionFailedCause::WorkflowAlreadyExists,
+                cause: StartChildWorkflowExecutionFailedCause::WorkflowAlreadyExists,
             },
         )));
         assert!(matches!(

@@ -149,6 +149,8 @@ use temporalio_common::{
                 ActivityIdConflictPolicy as ProtoActivityIdConflictPolicy,
                 ActivityIdReusePolicy as ProtoActivityIdReusePolicy, TaskQueueKind,
                 UpdateWorkflowExecutionLifecycleStage,
+                WorkflowIdConflictPolicy as ProtoWorkflowIdConflictPolicy,
+                WorkflowIdReusePolicy as ProtoWorkflowIdReusePolicy,
             },
             operatorservice::v1::operator_service_client::OperatorServiceClient,
             sdk::v1::UserMetadata,
@@ -1824,8 +1826,9 @@ fn build_start_workflow_request(
         }),
         identity: client.identity(),
         request_id: Uuid::new_v4().to_string(),
-        workflow_id_reuse_policy: options.id_reuse_policy as i32,
-        workflow_id_conflict_policy: options.id_conflict_policy as i32,
+        workflow_id_reuse_policy: ProtoWorkflowIdReusePolicy::from(options.id_reuse_policy) as i32,
+        workflow_id_conflict_policy: ProtoWorkflowIdConflictPolicy::from(options.id_conflict_policy)
+            as i32,
         workflow_execution_timeout: options
             .execution_timeout
             .and_then(|duration| duration.try_into().ok()),
@@ -4169,7 +4172,10 @@ mod tests {
                 common::v1::{
                     Header, Payload, Payloads, WorkflowExecution as ProtoWorkflowExecution,
                 },
-                enums::v1::{UpdateWorkflowExecutionLifecycleStage, WorkflowIdConflictPolicy},
+                enums::v1::{
+                    UpdateWorkflowExecutionLifecycleStage,
+                    WorkflowIdConflictPolicy as ProtoWorkflowIdConflictPolicy,
+                },
                 update::v1::{
                     Input as UpdateInput, Meta as UpdateMeta, Outcome, Request as UpdateRequest,
                     UpdateRef, WaitPolicy, outcome,
@@ -4393,7 +4399,7 @@ mod tests {
                                     request_id,
                                     identity: "test-identity".to_owned(),
                                     workflow_id_conflict_policy:
-                                        WorkflowIdConflictPolicy::UseExisting as i32,
+                                        ProtoWorkflowIdConflictPolicy::UseExisting as i32,
                                     header: Some(start_header),
                                     priority: Some(Default::default()),
                                     ..Default::default()
