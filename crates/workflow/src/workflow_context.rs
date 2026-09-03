@@ -67,14 +67,15 @@ use std::{
 use temporalio_common_wasm::{
     ActivityDefinition, Memo, SignalDefinition, WorkflowDefinition,
     data_converters::{
-        ActivityExecutionDecodeHint, ChildWorkflowExecutionDecodeHint,
-        ChildWorkflowStartDecodeHint, DataConverter, GenericPayloadConverter, NoopDecodeHint,
-        PayloadConversionError, PayloadConverter, SerializationContext, SerializationContextData,
-        TemporalDeserializable, WorkflowSerializationContext, WorkflowSignalDecodeHint,
+        ActivityExecutionDecodeHint, CancelExternalWorkflowDecodeHint,
+        ChildWorkflowExecutionDecodeHint, ChildWorkflowStartDecodeHint, DataConverter,
+        GenericPayloadConverter, PayloadConversionError, PayloadConverter, SerializationContext,
+        SerializationContextData, TemporalDeserializable, WorkflowSerializationContext,
+        WorkflowSignalDecodeHint,
     },
     error::{
-        ActivityExecutionError, CancelExternalWorkflowError, ChildWorkflowExecutionError,
-        ChildWorkflowStartError, WorkflowSignalError,
+        ActivityExecutionError, ChildWorkflowExecutionError, ChildWorkflowStartError,
+        WorkflowSignalError,
     },
     protos::{
         coresdk::{
@@ -1459,11 +1460,14 @@ impl BaseWorkflowContext {
             WorkflowOutboundFuture::new(async move {
                 match cmd.await {
                     Ok(_) => Ok(()),
-                    Err(failure) => {
+                    Err(error) => {
                         let context =
                             SerializationContextData::Workflow(WorkflowSerializationContext::new());
-                        let error = data_converter.to_error(&context, failure, NoopDecodeHint)?;
-                        Err(CancelExternalWorkflowError::Failed(Box::new(error)))
+                        Err(data_converter.to_error(
+                            &context,
+                            error.failure,
+                            CancelExternalWorkflowDecodeHint::new(error.cause),
+                        )?)
                     }
                 }
             })
@@ -3223,10 +3227,10 @@ where
             } => match Pin::new(inner).poll(cx) {
                 Poll::Pending => Poll::Pending,
                 Poll::Ready(Ok(_)) => Poll::Ready(Ok(())),
-                Poll::Ready(Err(failure)) => Poll::Ready(Err(data_converter.to_error(
+                Poll::Ready(Err(error)) => Poll::Ready(Err(data_converter.to_error(
                     &SerializationContextData::Workflow(WorkflowSerializationContext::new()),
-                    failure,
-                    WorkflowSignalDecodeHint::default(),
+                    error.failure,
+                    WorkflowSignalDecodeHint::new(error.cause),
                 )?)),
             },
             SignalChildFut::Terminated => panic!("polled after termination"),

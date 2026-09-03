@@ -13,6 +13,7 @@ import "google/protobuf/empty.proto";
 import "temporal/api/failure/v1/message.proto";
 import "temporal/api/update/v1/message.proto";
 import "temporal/api/common/v1/message.proto";
+import "temporal/api/enums/v1/failed_cause.proto";
 import "temporal/api/enums/v1/workflow.proto";
 import "temporal/sdk/core/activity_result/activity_result.proto";
 import "temporal/sdk/core/child_workflow/child_workflow.proto";
@@ -321,15 +322,19 @@ message ResolveSignalExternalWorkflow {
     // If populated, this signal either failed to be sent or was cancelled depending on failure
     // type / info.
     temporal.api.failure.v1.Failure failure = 2;
+    // The server-reported cause when the signal failed. Unspecified when the signal succeeded or
+    // was cancelled before being sent.
+    temporal.api.enums.v1.SignalExternalWorkflowExecutionFailedCause cause = 3;
 }
 
 message ResolveRequestCancelExternalWorkflow {
     // Sequence number as provided by lang in the corresponding
     // RequestCancelExternalWorkflowExecution command
     uint32 seq = 1;
-    // If populated, this signal either failed to be sent or was cancelled depending on failure
-    // type / info.
+    // If populated, the cancellation request failed.
     temporal.api.failure.v1.Failure failure = 2;
+    // The server-reported cause when the cancellation request failed.
+    temporal.api.enums.v1.CancelExternalWorkflowExecutionFailedCause cause = 3;
 }
 
 // Lang is requested to invoke an update handler on the workflow. Lang should invoke the update

@@ -6,7 +6,10 @@ use crate::{
         InterceptedFuturePollGuard, InterceptedFuturePollKind, InterceptedFutureStatus,
         entry::{WorkflowError, WorkflowImplementation},
         guest::WorkflowInstance,
-        model::{TimerResult, UnblockEvent, WorkflowTermination},
+        model::{
+            CancelExternalWfFailure, SignalExternalWfFailure, TimerResult, UnblockEvent,
+            WorkflowTermination,
+        },
         types::{
             ActivationJobResult, ActivationResult, MAIN_ROUTINE_ID, MainRoutineCompletion,
             QueryResponse, RoutineCompletion, RoutineId, RoutineKind, RoutinePendingState,
@@ -759,10 +762,22 @@ where
                 UnblockEvent::WorkflowComplete(event.seq, Box::new(expect_resolution(event.result)))
             }
             ActivationVariant::ResolveSignalExternalWorkflow(event) => {
-                UnblockEvent::SignalExternal(event.seq, event.failure)
+                let cause = event.cause();
+                UnblockEvent::SignalExternal(
+                    event.seq,
+                    event
+                        .failure
+                        .map(|failure| SignalExternalWfFailure { failure, cause }),
+                )
             }
             ActivationVariant::ResolveRequestCancelExternalWorkflow(event) => {
-                UnblockEvent::CancelExternal(event.seq, event.failure)
+                let cause = event.cause();
+                UnblockEvent::CancelExternal(
+                    event.seq,
+                    event
+                        .failure
+                        .map(|failure| CancelExternalWfFailure { failure, cause }),
+                )
             }
             ActivationVariant::ResolveNexusOperationStart(event) => {
                 UnblockEvent::NexusOperationStart(

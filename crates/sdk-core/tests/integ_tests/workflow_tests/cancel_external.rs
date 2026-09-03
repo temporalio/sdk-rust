@@ -22,10 +22,15 @@ impl CancelSender {
     #[run]
     async fn run(
         ctx: &mut WorkflowContext<Self>,
-        (run_id, workflow_id): (String, String),
+        (run_id, workflow_id, expect_not_found): (String, String, bool),
     ) -> WorkflowResult<()> {
         let handle = ctx.external_workflow(workflow_id, Some(run_id));
-        handle.cancel(Some("cancel-reason".into())).await.unwrap();
+        let result = handle.cancel(Some("cancel-reason".into())).await;
+        if expect_not_found {
+            assert_matches!(result, Err(CancelExternalWorkflowError::NotFound(_)));
+        } else {
+            result.unwrap();
+        }
         Ok(())
     }
 }
@@ -70,7 +75,7 @@ async fn sends_cancel_to_other_wf() {
     let sender_handle = worker
         .submit_workflow(
             CancelSender::run,
-            (receiver_run_id.to_owned(), receiver_wfid.to_owned()),
+            (receiver_run_id.to_owned(), receiver_wfid.to_owned(), false),
             WorkflowStartOptions::new(task_queue, "sends-cancel-sender").build(),
         )
         .await
@@ -93,6 +98,32 @@ async fn sends_cancel_to_other_wf() {
         receiver_result.contains("cancel-reason"),
         "expected cancel reason in message, got: {receiver_result}"
     );
+}
+
+#[tokio::test]
+async fn cancel_missing_external_wf_returns_not_found() {
+    let wf_name = "cancel_missing_external_wf_returns_not_found";
+    let mut starter = CoreWfStarter::new(wf_name);
+    starter
+        .sdk_config
+        .register_workflow::<CancelSender>()
+        .unwrap();
+    let mut worker = starter.worker().await;
+
+    let task_queue = starter.get_task_queue().to_owned();
+    let handle = worker
+        .submit_workflow(
+            CancelSender::run,
+            (uuid::Uuid::new_v4().to_string(), wf_name.to_owned(), true),
+            WorkflowStartOptions::new(task_queue, wf_name).build(),
+        )
+        .await
+        .unwrap();
+    worker.run_until_done().await.unwrap();
+    handle
+        .get_result(Default::default())
+        .await
+        .expect("workflow should observe a not-found cancellation error");
 }
 
 #[workflow]
