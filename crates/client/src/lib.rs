@@ -43,8 +43,6 @@ pub use async_activity_handle::{
     ActivityHeartbeatResponse, ActivityIdentifier, AsyncActivityHandle,
 };
 pub(crate) use retry::CallType;
-#[doc(hidden)]
-pub use retry::jittered;
 
 pub use interceptors::{
     BackfillScheduleInput, CancelWorkflowInput, ClientInterceptor, CompleteAsyncActivityInput,
