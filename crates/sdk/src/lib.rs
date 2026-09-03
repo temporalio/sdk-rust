@@ -1309,17 +1309,6 @@ impl Worker {
         self.common.worker.worker_instance_key()
     }
 
-    #[cfg(feature = "experimental")]
-    #[doc(hidden)]
-    pub fn core_worker(&self) -> Arc<CoreWorker> {
-        self.common.worker.clone()
-    }
-
-    #[cfg(not(feature = "experimental"))]
-    pub(crate) fn core_worker(&self) -> Arc<CoreWorker> {
-        self.common.worker.clone()
-    }
-
     fn split_apart(&mut self) -> (&mut CommonWorker, &mut WorkflowHalf, &mut ActivityHalf) {
         (
             &mut self.common,

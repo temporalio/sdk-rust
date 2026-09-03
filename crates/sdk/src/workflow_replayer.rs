@@ -461,7 +461,7 @@ impl WorkflowReplayer {
         )
         .await
         {
-            let core_worker = worker.core_worker();
+            let core_worker = worker.common.worker.clone();
             core_worker.initiate_shutdown();
             core_worker.shutdown().await;
             return Err(WorkflowReplayWorkerError::Run(source).into());
