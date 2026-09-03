@@ -35,7 +35,8 @@ relevant information.
 
 ### Added
 * `CancelExternalWorkflowError` and `workflow_interceptors::CancelExternalWorkflowResult`
-  for use in interceptors.
+  for use in interceptors, with `WorkflowCancelFailureError` exposing the decoded cancellation
+  failure.
 * `WorkflowSignalError::NotFound` and `CancelExternalWorkflowError::NotFound` let workflows
   distinguish a missing signal or cancellation target from other delivery failures.
 
