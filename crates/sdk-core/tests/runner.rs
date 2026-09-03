@@ -47,6 +47,10 @@ struct Cli {
     /// If set, only run the build, not any tests
     just_build: bool,
 
+    /// Run only tests that are eligible for Temporal Cloud
+    #[arg(long)]
+    cloud: bool,
+
     /// The rest of the arguments will be passed through to the test harness
     harness_args: Vec<String>,
 }
@@ -90,6 +94,7 @@ async fn main() -> Result<(), anyhow::Error> {
         cargo_test_args,
         test_executable,
         just_build,
+        cloud,
         harness_args,
     } = Cli::parse();
     if let Some(RunnerCommand::CloudNamespace { command }) = command {
@@ -100,10 +105,16 @@ async fn main() -> Result<(), anyhow::Error> {
             }
         };
     }
+    if cloud && test_name != "integ_tests" {
+        bail!("Cloud filtering is only defined for the integ_tests target");
+    }
+    if cloud && test_executable.is_some() {
+        bail!("Cloud filtering requires Cargo to build the test target with cloud-test-mode");
+    }
     let cargo = env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
     // Try building first, so that we error early on build failures & don't start server
     // Unclear why --all-features doesn't work here
-    let test_args_preamble = [
+    let mut test_args_preamble = [
         "test",
         "--features",
         "temporalio-common/serde_serialize",
@@ -113,13 +124,15 @@ async fn main() -> Result<(), anyhow::Error> {
         "ephemeral-server",
         "--features",
         "temporalio-sdk-core/otel",
-        "--test",
-        &test_name,
     ]
     .into_iter()
     .map(ToString::to_string)
-    .chain(cargo_test_args)
     .collect::<Vec<_>>();
+    if cloud {
+        test_args_preamble.extend(["--features".to_owned(), "cloud-test-mode".to_owned()]);
+    }
+    test_args_preamble.extend(["--test".to_owned(), test_name.clone()]);
+    test_args_preamble.extend(cargo_test_args);
     if test_executable.is_none() {
         let mut build_cmd = Command::new(&cargo);
         strip_cargo_env_vars(&mut build_cmd);
@@ -134,7 +147,6 @@ async fn main() -> Result<(), anyhow::Error> {
     if just_build {
         return Ok(());
     }
-
     let (server, envs) = match server_kind {
         ServerKind::TemporalCLI => {
             let config =
