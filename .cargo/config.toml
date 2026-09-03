@@ -42,6 +42,8 @@ lint = [
     "--test",
     "integ_runner",
     "--test",
+    "local_first_bridge_tests",
+    "--test",
     "global_metric_tests",
     "--",
     "--D",
