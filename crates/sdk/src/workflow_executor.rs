@@ -255,7 +255,7 @@ impl WorkflowExecutor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use temporalio_workflow::__private::sdk::SdkWakeGuard;
+    use temporalio_workflow::WorkflowCancellationToken;
     use tokio::sync::oneshot;
 
     #[tokio::test]
@@ -344,34 +344,7 @@ mod tests {
     }
 
     #[test]
-    fn sdk_wake_guard_nesting() {
-        assert!(!is_sdk_wake());
-
-        let guard1 = SdkWakeGuard::new();
-        assert!(is_sdk_wake());
-
-        {
-            let _guard2 = SdkWakeGuard::new();
-            assert!(is_sdk_wake());
-        }
-        assert!(is_sdk_wake());
-
-        drop(guard1);
-        assert!(!is_sdk_wake());
-    }
-
-    #[test]
-    fn sdk_wake_guard_panic_safety() {
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _guard = SdkWakeGuard::new();
-            panic!("test panic");
-        }));
-        assert!(result.is_err());
-        assert!(!is_sdk_wake());
-    }
-
-    #[test]
-    fn wake_tracker_detects_non_sdk_wake() {
+    fn wake_tracker_distinguishes_sdk_wakes() {
         let tracker = WakeTracker::new();
         let noop = Waker::noop();
         let waker = tracker.new_per_poll_waker(noop);
@@ -379,23 +352,42 @@ mod tests {
         waker.wake_by_ref();
         assert!(tracker.take_non_sdk_wake());
 
-        let _guard = SdkWakeGuard::new();
-        waker.wake_by_ref();
+        // Create an SDK owned wake
+        let cancellation = WorkflowCancellationToken::new();
+        let mut cancelled = std::pin::pin!(cancellation.cancelled());
+        let mut cx = Context::from_waker(&waker);
+        assert!(cancelled.as_mut().poll(&mut cx).is_pending());
+
+        cancellation.cancel();
+
         assert!(!tracker.take_non_sdk_wake());
     }
 
+    struct CrossThreadWake(Waker);
+
+    impl Wake for CrossThreadWake {
+        fn wake(self: Arc<Self>) {
+            self.wake_by_ref();
+        }
+
+        fn wake_by_ref(self: &Arc<Self>) {
+            let waker = self.0.clone();
+            std::thread::spawn(move || waker.wake()).join().unwrap();
+        }
+    }
     #[test]
     fn wake_tracker_cross_thread_detection() {
         let tracker = WakeTracker::new();
         let noop = Waker::noop();
-        let waker = tracker.new_per_poll_waker(noop);
+        let tracked_waker = tracker.new_per_poll_waker(noop);
+        let cross_thread_waker = Waker::from(Arc::new(CrossThreadWake(tracked_waker)));
 
-        let _guard = SdkWakeGuard::new();
+        let cancellation = WorkflowCancellationToken::new();
+        let mut cancelled = std::pin::pin!(cancellation.cancelled());
+        let mut cx = Context::from_waker(&cross_thread_waker);
+        assert!(cancelled.as_mut().poll(&mut cx).is_pending());
 
-        let handle = std::thread::spawn(move || {
-            waker.wake_by_ref();
-        });
-        handle.join().unwrap();
+        cancellation.cancel();
 
         assert!(tracker.take_non_sdk_wake());
     }

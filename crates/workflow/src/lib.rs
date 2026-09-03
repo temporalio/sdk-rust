@@ -35,7 +35,6 @@ pub mod __private {
 
     pub mod sdk {
         pub use crate::runtime::{
-            SdkWakeGuard,
             entry::WorkflowImplementation,
             guest::WorkflowInstance,
             host::WorkflowHost,
