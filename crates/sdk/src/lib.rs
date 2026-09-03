@@ -162,7 +162,9 @@ use temporalio_common::{
     },
     worker::{WorkerDeploymentOptions, WorkerTaskTypes, build_id_from_current_exe},
 };
-use temporalio_sdk_core::{PollError, WorkerVersioningStrategy, init_worker};
+use temporalio_sdk_core::{
+    PollError, Worker as CoreWorker, WorkerConfig, WorkerVersioningStrategy, init_worker,
+};
 use temporalio_workflow::{InternalPatchActivationCallback, workflows::WorkflowImplementation};
 use tokio::sync::{
     Notify,
@@ -173,9 +175,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{Instrument, Span, field};
 use uuid::Uuid;
 
-use crate::runtime::{
-    CoreWorker, PollerBehavior, WorkerConfig, WorkflowErrorType, worker_tuner::WorkerTuner,
-};
+use crate::runtime::{PollerBehavior, WorkflowErrorType, worker_tuner::WorkerTuner};
 
 /// Contains options for configuring a worker.
 ///

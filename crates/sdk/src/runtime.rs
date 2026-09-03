@@ -17,7 +17,9 @@ use crate::error::RuntimeError;
 /// Worker concurrency tuning.
 pub mod worker_tuner;
 
-// These remain public only for the raw-worker APIs that are being migrated separately.
+// Keep these public only with the raw-worker APIs while they are migrated separately.
+// Worker::new_from_core, Worker::new_from_core_options, Worker::with_new_core_worker
+#[cfg(feature = "experimental")]
 pub use temporalio_sdk_core::{Worker as CoreWorker, WorkerConfig};
 
 /// Wraps a Tokio runtime builder so the SDK can install its per-thread telemetry state.
