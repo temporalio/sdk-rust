@@ -887,6 +887,7 @@ impl Worker {
     }
 
     // TODO [rust-sdk-branch]: Eliminate this constructor in favor of passing in fake connection
+    #[cfg(feature = "experimental")]
     #[doc(hidden)]
     pub fn new_from_core(worker: Arc<CoreWorker>, data_converter: DataConverter) -> Self {
         let client_options = ClientOptions::new(worker.get_config().namespace.clone())
@@ -904,6 +905,7 @@ impl Worker {
     }
 
     // TODO [rust-sdk-branch]: Eliminate this constructor in favor of passing in fake connection
+    #[cfg(feature = "experimental")]
     #[doc(hidden)]
     pub fn new_from_core_options(
         worker: Arc<CoreWorker>,
@@ -1307,8 +1309,14 @@ impl Worker {
         self.common.worker.worker_instance_key()
     }
 
+    #[cfg(feature = "experimental")]
     #[doc(hidden)]
     pub fn core_worker(&self) -> Arc<CoreWorker> {
+        self.common.worker.clone()
+    }
+
+    #[cfg(not(feature = "experimental"))]
+    pub(crate) fn core_worker(&self) -> Arc<CoreWorker> {
         self.common.worker.clone()
     }
 
