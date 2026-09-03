@@ -1,5 +1,5 @@
 use crate::{
-    ERROR_RETURNED_DUE_TO_SHORT_CIRCUIT, MESSAGE_TOO_LARGE_KEY,
+    ERROR_RETURNED_DUE_TO_SHORT_CIRCUIT_KEY, MESSAGE_TOO_LARGE_KEY,
     grpc::IsUserLongPoll,
     request_extensions::{IsWorkerTaskLongPoll, NoRetryOnMatching, RetryConfigForCall},
 };
@@ -283,7 +283,7 @@ impl ErrorHandler<tonic::Status> for TonicErrorHandler {
             && (sc.predicate)(&e)
         {
             e.metadata_mut().insert(
-                ERROR_RETURNED_DUE_TO_SHORT_CIRCUIT,
+                ERROR_RETURNED_DUE_TO_SHORT_CIRCUIT_KEY,
                 tonic::metadata::MetadataValue::from(0),
             );
             return RetryPolicy::ForwardError(e);
@@ -549,7 +549,7 @@ mod tests {
         let e = assert_matches!(result, RetryPolicy::ForwardError(e) => e);
         assert!(
             e.metadata()
-                .get(ERROR_RETURNED_DUE_TO_SHORT_CIRCUIT)
+                .get(ERROR_RETURNED_DUE_TO_SHORT_CIRCUIT_KEY)
                 .is_some()
         );
     }

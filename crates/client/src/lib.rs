@@ -188,7 +188,7 @@ static TEMPORAL_NAMESPACE_HEADER_KEY: &str = "temporal-namespace";
 pub static MESSAGE_TOO_LARGE_KEY: &str = "message-too-large";
 #[doc(hidden)]
 /// Key used to indicate a error was returned by the retryer because of the short-circuit predicate
-pub static ERROR_RETURNED_DUE_TO_SHORT_CIRCUIT: &str = "short-circuit";
+pub static ERROR_RETURNED_DUE_TO_SHORT_CIRCUIT_KEY: &str = "short-circuit";
 
 /// The server times out polls after 60 seconds. Set our timeout to be slightly beyond that.
 const LONG_POLL_TIMEOUT: Duration = Duration::from_secs(70);

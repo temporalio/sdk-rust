@@ -23,7 +23,7 @@ use std::{
     time::{Duration, Instant, SystemTime},
 };
 use temporalio_client::{
-    ERROR_RETURNED_DUE_TO_SHORT_CIRCUIT, request_extensions::NoRetryOnMatching,
+    ERROR_RETURNED_DUE_TO_SHORT_CIRCUIT_KEY, request_extensions::NoRetryOnMatching,
 };
 use temporalio_common::protos::temporal::api::{
     taskqueue::v1::PollerScalingDecision,
@@ -727,7 +727,7 @@ impl PollScalerReportHandle {
                     // so we're not reacting to errors, only propagating them.
                     let should_forward = !e
                         .metadata()
-                        .contains_key(ERROR_RETURNED_DUE_TO_SHORT_CIRCUIT);
+                        .contains_key(ERROR_RETURNED_DUE_TO_SHORT_CIRCUIT_KEY);
 
                     if self.can_scale_down() {
                         debug!("Got error from server while polling: {:?}", e);
@@ -997,7 +997,7 @@ mod tests {
                 async {
                     let mut st = tonic::Status::cancelled("whatever");
                     st.metadata_mut()
-                        .insert(ERROR_RETURNED_DUE_TO_SHORT_CIRCUIT, 1.into());
+                        .insert(ERROR_RETURNED_DUE_TO_SHORT_CIRCUIT_KEY, 1.into());
                     Err(st)
                 }
                 .boxed()
