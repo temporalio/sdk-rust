@@ -137,7 +137,10 @@ impl LongPollBuffer<PollWorkflowTaskQueueResponse, WorkflowSlotKind> {
         );
         if let Some(wftps) = options.wft_poller_shared.as_ref() {
             if is_sticky {
-                wftps.set_sticky_active(poll_scaler.active_rx.clone());
+                wftps.set_sticky_active(
+                    poll_scaler.active_rx.clone(),
+                    poll_scaler.report_handle.target.clone(),
+                );
             } else {
                 wftps.set_non_sticky_active(poll_scaler.active_rx.clone());
             };
@@ -547,7 +550,7 @@ where
         let report_handle = Arc::new(PollScalerReportHandle {
             max,
             min,
-            target: AtomicUsize::new(target),
+            target: Arc::new(AtomicUsize::new(target)),
             ever_saw_scaling_decision: AtomicBool::default(),
             capabilities,
             behavior,
@@ -613,7 +616,7 @@ where
 struct PollScalerReportHandle {
     max: usize,
     min: usize,
-    target: AtomicUsize,
+    target: Arc<AtomicUsize>,
     ever_saw_scaling_decision: AtomicBool,
     capabilities: Arc<NamespaceCapabilities>,
     behavior: PollerBehavior,
@@ -1324,7 +1327,7 @@ mod tests {
         let handle = Arc::new(PollScalerReportHandle {
             max: 10,
             min: minimum,
-            target: AtomicUsize::new(10),
+            target: Arc::new(AtomicUsize::new(10)),
             ever_saw_scaling_decision: AtomicBool::new(false),
             capabilities: Arc::new(NamespaceCapabilities::resolved(Capabilities {
                 poller_autoscaling: supports_autoscaling,

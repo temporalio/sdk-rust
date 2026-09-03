@@ -9,7 +9,10 @@ use crate::{
 use crossbeam_utils::atomic::AtomicCell;
 use futures_util::{Stream, stream};
 use std::{
-    sync::{Arc, OnceLock},
+    sync::{
+        Arc, OnceLock,
+        atomic::{AtomicUsize, Ordering},
+    },
     time::SystemTime,
 };
 use temporalio_common::protos::temporal::api::workflowservice::v1::PollWorkflowTaskQueueResponse;
@@ -98,6 +101,7 @@ pub(crate) fn make_wft_poller(
 pub(crate) struct WFTPollerShared {
     last_seen_sticky_backlog: (watch::Receiver<usize>, watch::Sender<usize>),
     sticky_active: OnceLock<watch::Receiver<usize>>,
+    sticky_target: OnceLock<Arc<AtomicUsize>>,
     non_sticky_active: OnceLock<watch::Receiver<usize>>,
     max_slots: Option<usize>,
 }
@@ -107,12 +111,14 @@ impl WFTPollerShared {
         Self {
             last_seen_sticky_backlog: (rx, tx),
             sticky_active: OnceLock::new(),
+            sticky_target: OnceLock::new(),
             non_sticky_active: OnceLock::new(),
             max_slots,
         }
     }
-    pub(crate) fn set_sticky_active(&self, rx: watch::Receiver<usize>) {
+    pub(crate) fn set_sticky_active(&self, rx: watch::Receiver<usize>, target: Arc<AtomicUsize>) {
         let _ = self.sticky_active.set(rx);
+        let _ = self.sticky_target.set(target);
     }
     pub(crate) fn set_non_sticky_active(&self, rx: watch::Receiver<usize>) {
         let _ = self.non_sticky_active.set(rx);
@@ -124,8 +130,9 @@ impl WFTPollerShared {
         // that we won't end up using every available permit with one kind of poller. In practice
         // this is only ever likely to be an issue with very small numbers of slots.
         if let Some(max_slots) = self.max_slots
-            && let Some((sticky_active, non_sticky_active)) =
-                self.sticky_active.get().zip(self.non_sticky_active.get())
+            && let Some(sticky_active) = self.sticky_active.get()
+            && let Some(sticky_target) = self.sticky_target.get()
+            && let Some(non_sticky_active) = self.non_sticky_active.get()
         {
             let mut sticky_active = sticky_active.clone();
             let mut non_sticky_active = non_sticky_active.clone();
@@ -135,6 +142,9 @@ impl WFTPollerShared {
                 let num_sticky_active = *sticky_active.borrow_and_update();
                 let num_non_sticky_active = *non_sticky_active.borrow_and_update();
                 let num_sticky_backlog = *sticky_backlog.borrow_and_update();
+                let sticky_needs_capacity = num_sticky_backlog > 1
+                    && num_sticky_backlog > num_sticky_active
+                    && num_sticky_active < sticky_target.load(Ordering::Relaxed);
 
                 let allow = || {
                     if !is_sticky {
@@ -149,7 +159,7 @@ impl WFTPollerShared {
                         }
 
                         // If there's a meaningful sticky backlog, prioritize sticky.
-                        if num_sticky_backlog > 1 && num_sticky_backlog > num_sticky_active {
+                        if sticky_needs_capacity {
                             return false;
                         }
                     } else {
@@ -164,7 +174,7 @@ impl WFTPollerShared {
                         }
 
                         // If there's a meaningful sticky backlog, prioritize sticky.
-                        if num_sticky_backlog > 1 && num_sticky_backlog > num_sticky_active {
+                        if sticky_needs_capacity {
                             return true;
                         }
                     }
@@ -279,6 +289,22 @@ mod tests {
         atomic::{AtomicUsize, Ordering},
     };
     use temporalio_common::protos::temporal::api::enums::v1::EventType;
+
+    #[tokio::test]
+    async fn sticky_priority_respects_poller_target() {
+        let shared = WFTPollerShared::new(Some(4));
+        let (_sticky_tx, sticky_rx) = watch::channel(2);
+        let (_non_sticky_tx, non_sticky_rx) = watch::channel(1);
+        let sticky_target = Arc::new(AtomicUsize::new(3));
+        shared.set_sticky_active(sticky_rx, sticky_target.clone());
+        shared.set_non_sticky_active(non_sticky_rx);
+        shared.record_sticky_backlog(10);
+
+        assert!(shared.wait_if_needed(false).now_or_never().is_none());
+
+        sticky_target.store(2, Ordering::Relaxed);
+        assert!(shared.wait_if_needed(false).now_or_never().is_some());
+    }
 
     #[tokio::test]
     async fn poll_timeouts_do_not_produce_responses() {

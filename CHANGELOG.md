@@ -36,6 +36,9 @@ relevant information.
 ### Added
 * `CancelExternalWorkflowError` and `workflow_interceptors::CancelExternalWorkflowResult`
   for use in interceptors.
+### Fixed
+* Sticky workflow backlog no longer prevents normal pollers from using capacity after sticky
+  pollers reach their autoscaling target.
 ### Breaking Changes
 * `ActivityError`, `PayloadConversionError`, `ActivityExecutionError`,
   `ChildWorkflowStartError`, `ChildWorkflowExecutionError`, and `WorkflowSignalError` are now

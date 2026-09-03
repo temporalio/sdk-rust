@@ -73,6 +73,8 @@ relevant information.
   are preserved on failure; workers warn when the server does not advertise support.
 
 ### Fixed
+* Sticky workflow backlog no longer prevents normal pollers from using capacity after sticky
+  pollers reach their autoscaling target.
 * Worker shutdown now drains activity completions that are still flushing their result to the
   server before finishing. Previously such a completion — typically one whose final heartbeat RPC
   was still in flight — could be permanently stranded by shutdown: the activity's result was
