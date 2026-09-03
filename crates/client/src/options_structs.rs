@@ -447,7 +447,6 @@ pub enum WorkflowIdReusePolicy {
 }
 
 impl From<WorkflowIdReusePolicy> for ProtoWorkflowIdReusePolicy {
-    #[allow(deprecated)]
     fn from(value: WorkflowIdReusePolicy) -> Self {
         match value {
             WorkflowIdReusePolicy::Unspecified => Self::Unspecified,
