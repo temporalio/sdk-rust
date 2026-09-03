@@ -6,7 +6,7 @@ authors = ["Temporal Technologies Inc. <sdk@temporal.io>"]
 license-file = { workspace = true }
 description = "Temporal Rust workflow authoring surface"
 homepage = "https://temporal.io/"
-repository = "https://github.com/temporalio/sdk-core"
+repository = "https://github.com/temporalio/sdk-rust"
 keywords = ["temporal", "workflow"]
 categories = ["development-tools"]
 
