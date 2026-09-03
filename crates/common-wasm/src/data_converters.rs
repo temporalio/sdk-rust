@@ -5,8 +5,9 @@ mod failure_converter;
 mod well_known;
 
 pub use failure_converter::{
-    ActivityExecutionDecodeHint, ChildWorkflowExecutionDecodeHint, ChildWorkflowStartDecodeHint,
-    CommonAttributes, DefaultFailureConverter, FailureConverter, FailureDecodeHint, NoopDecodeHint,
+    ActivityExecutionDecodeHint, CancelExternalWorkflowDecodeHint,
+    ChildWorkflowExecutionDecodeHint, ChildWorkflowStartDecodeHint, CommonAttributes,
+    DefaultFailureConverter, FailureConverter, FailureDecodeHint, NoopDecodeHint,
     WorkflowSignalDecodeHint,
 };
 use well_known::{BINARY_NULL_ENCODING_VAL, WellKnownType, binary_null_payload};

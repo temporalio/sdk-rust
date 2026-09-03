@@ -23,7 +23,10 @@ use crate::{
         TimeoutError, WorkflowSignalError, WorkflowSignalFailureError,
     },
     protos::temporal::api::{
-        enums::v1::ApplicationErrorCategory as ProtoApplicationErrorCategory,
+        enums::v1::{
+            ApplicationErrorCategory as ProtoApplicationErrorCategory,
+            CancelExternalWorkflowExecutionFailedCause, SignalExternalWorkflowExecutionFailedCause,
+        },
         failure::v1::{
             ActivityFailureInfo, ApplicationFailureInfo, CanceledFailureInfo,
             ChildWorkflowExecutionFailureInfo, Failure, failure::FailureInfo,
@@ -204,16 +207,58 @@ impl FailureDecodeHint for ChildWorkflowExecutionDecodeHint {
 /// Decode hint for workflow signal failures.
 #[derive(Debug, Clone, Copy, Default)]
 #[non_exhaustive]
-pub struct WorkflowSignalDecodeHint;
+pub struct WorkflowSignalDecodeHint {
+    cause: SignalExternalWorkflowExecutionFailedCause,
+}
+
+impl WorkflowSignalDecodeHint {
+    /// Creates a decode hint with the server-reported signal failure cause.
+    pub fn new(cause: SignalExternalWorkflowExecutionFailedCause) -> Self {
+        Self { cause }
+    }
+}
 
 impl FailureDecodeHint for WorkflowSignalDecodeHint {
     type Output = WorkflowSignalError;
 
     fn adapt(self, normalized: IncomingError) -> Self::Output {
         let failure = normalized.failure().clone();
-        WorkflowSignalError::Failed(Box::new(WorkflowSignalFailureError::new(
-            failure, normalized,
-        )))
+        let error = Box::new(WorkflowSignalFailureError::new(failure, normalized));
+        if self.cause
+            == SignalExternalWorkflowExecutionFailedCause::ExternalWorkflowExecutionNotFound
+        {
+            WorkflowSignalError::NotFound(error)
+        } else {
+            WorkflowSignalError::Failed(error)
+        }
+    }
+}
+
+/// Decode hint for external-workflow cancellation failures.
+#[derive(Debug, Clone, Copy, Default)]
+#[non_exhaustive]
+pub struct CancelExternalWorkflowDecodeHint {
+    cause: CancelExternalWorkflowExecutionFailedCause,
+}
+
+impl CancelExternalWorkflowDecodeHint {
+    /// Creates a decode hint with the server-reported cancellation failure cause.
+    pub fn new(cause: CancelExternalWorkflowExecutionFailedCause) -> Self {
+        Self { cause }
+    }
+}
+
+impl FailureDecodeHint for CancelExternalWorkflowDecodeHint {
+    type Output = CancelExternalWorkflowError;
+
+    fn adapt(self, normalized: IncomingError) -> Self::Output {
+        if self.cause
+            == CancelExternalWorkflowExecutionFailedCause::ExternalWorkflowExecutionNotFound
+        {
+            CancelExternalWorkflowError::NotFound(Box::new(normalized))
+        } else {
+            CancelExternalWorkflowError::Failed(Box::new(normalized))
+        }
     }
 }
 
@@ -477,7 +522,7 @@ impl EncodeFailure for WorkflowSignalError {
         _: &SerializationContextData,
     ) -> Result<Failure, PayloadConversionError> {
         Ok(match self {
-            Self::Failed(failure) => failure.failure().clone(),
+            Self::NotFound(failure) | Self::Failed(failure) => failure.failure().clone(),
             Self::Serialization(err) => encode_generic_application_failure(err),
         })
     }
@@ -490,7 +535,7 @@ impl EncodeFailure for CancelExternalWorkflowError {
         _: &SerializationContextData,
     ) -> Result<Failure, PayloadConversionError> {
         Ok(match self {
-            Self::Failed(error) => error.failure().clone(),
+            Self::NotFound(error) | Self::Failed(error) => error.failure().clone(),
             Self::Serialization(err) => encode_generic_application_failure(err),
         })
     }
@@ -1607,6 +1652,50 @@ mod tests {
     }
 
     #[test]
+    fn workflow_signal_decode_hint_recognizes_not_found() {
+        let failure = Failure {
+            message: "workflow not found".to_owned(),
+            ..Default::default()
+        };
+        let decoded = data_converter()
+            .to_error(
+                &SerializationContextData::Workflow(WorkflowSerializationContext::new()),
+                failure.clone(),
+                WorkflowSignalDecodeHint::new(
+                    SignalExternalWorkflowExecutionFailedCause::ExternalWorkflowExecutionNotFound,
+                ),
+            )
+            .unwrap();
+
+        let WorkflowSignalError::NotFound(decoded_failure) = decoded else {
+            panic!("expected not-found workflow signal error");
+        };
+        assert_eq!(decoded_failure.failure(), &failure);
+    }
+
+    #[test]
+    fn cancel_external_workflow_decode_hint_recognizes_not_found() {
+        let failure = Failure {
+            message: "workflow not found".to_owned(),
+            ..Default::default()
+        };
+        let decoded = data_converter()
+            .to_error(
+                &SerializationContextData::Workflow(WorkflowSerializationContext::new()),
+                failure.clone(),
+                CancelExternalWorkflowDecodeHint::new(
+                    CancelExternalWorkflowExecutionFailedCause::ExternalWorkflowExecutionNotFound,
+                ),
+            )
+            .unwrap();
+
+        let CancelExternalWorkflowError::NotFound(decoded_failure) = decoded else {
+            panic!("expected not-found external-workflow cancellation error");
+        };
+        assert_eq!(decoded_failure.failure(), &failure);
+    }
+
+    #[test]
     fn child_workflow_signal_decode_hint_preserves_failure_proto() {
         let failure = Failure {
             message: "child workflow signal failed".to_owned(),
@@ -1623,7 +1712,7 @@ mod tests {
             .to_error(
                 &SerializationContextData::Workflow(WorkflowSerializationContext::new()),
                 failure.clone(),
-                WorkflowSignalDecodeHint,
+                WorkflowSignalDecodeHint::default(),
             )
             .unwrap();
 

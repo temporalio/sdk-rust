@@ -180,6 +180,7 @@ impl WFMachinesAdapter for CancelExternalMachine {
                     ResolveRequestCancelExternalWorkflow {
                         seq: self.shared_state.seq,
                         failure: None,
+                        cause: CancelExternalWorkflowExecutionFailedCause::Unspecified as i32,
                     }
                     .into(),
                 ]
@@ -203,6 +204,7 @@ impl WFMachinesAdapter for CancelExternalMachine {
                             )),
                             ..Default::default()
                         }),
+                        cause: f as i32,
                     }
                     .into(),
                 ]

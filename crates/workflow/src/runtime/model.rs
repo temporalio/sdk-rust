@@ -28,7 +28,13 @@ use temporalio_common_wasm::{
                 resolve_nexus_operation_start,
             },
         },
-        temporal::api::failure::v1::Failure,
+        temporal::api::{
+            enums::v1::{
+                CancelExternalWorkflowExecutionFailedCause,
+                SignalExternalWorkflowExecutionFailedCause,
+            },
+            failure::v1::Failure,
+        },
     },
 };
 
@@ -39,8 +45,8 @@ pub(crate) enum UnblockEvent {
     Activity(u32, Box<ActivityResolution>),
     WorkflowStart(u32, Box<ChildWorkflowStartStatus>),
     WorkflowComplete(u32, Box<ChildWorkflowResult>),
-    SignalExternal(u32, Option<Failure>),
-    CancelExternal(u32, Option<Failure>),
+    SignalExternal(u32, Option<SignalExternalWfFailure>),
+    CancelExternal(u32, Option<CancelExternalWfFailure>),
     NexusOperationStart(u32, Box<resolve_nexus_operation_start::Status>),
     NexusOperationComplete(u32, Box<NexusOperationResult>),
 }
@@ -57,14 +63,24 @@ pub enum TimerResult {
 /// Successful result of sending a signal to an external workflow
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct SignalExternalOk;
+#[derive(Debug)]
+pub(crate) struct SignalExternalWfFailure {
+    pub(crate) failure: Failure,
+    pub(crate) cause: SignalExternalWorkflowExecutionFailedCause,
+}
 /// Result of awaiting on sending a signal to an external workflow
-pub(crate) type SignalExternalWfResult = Result<SignalExternalOk, Failure>;
+pub(crate) type SignalExternalWfResult = Result<SignalExternalOk, SignalExternalWfFailure>;
 
 /// Distinguishes external cancellation resolutions from other command results.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct CancelExternalOk;
+#[derive(Debug)]
+pub(crate) struct CancelExternalWfFailure {
+    pub(crate) failure: Failure,
+    pub(crate) cause: CancelExternalWorkflowExecutionFailedCause,
+}
 /// Internal result delivered when an external cancellation command resolves.
-pub(crate) type CancelExternalWfResult = Result<CancelExternalOk, Failure>;
+pub(crate) type CancelExternalWfResult = Result<CancelExternalOk, CancelExternalWfFailure>;
 
 pub(crate) trait Unblockable {
     type OtherDat;

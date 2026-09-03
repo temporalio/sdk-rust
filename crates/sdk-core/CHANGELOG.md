@@ -34,6 +34,8 @@ relevant information.
 ## Unreleased
 
 ### Added
+* External workflow signal and cancellation resolution activations now include the typed server
+  failure cause alongside the existing failure.
 * Language SDKs can opt in to recording local activity arguments in the local activity marker's
   `input` detail.
 * Core console logs can now be emitted as newline-delimited JSON when an SDK selects the JSON log
