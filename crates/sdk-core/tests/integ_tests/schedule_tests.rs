@@ -1,4 +1,4 @@
-use crate::common::{NAMESPACE, eventually, get_integ_client, rand_6_chars};
+use crate::common::{eventually, get_integ_client, integ_namespace, rand_6_chars};
 use futures::TryStreamExt;
 use std::time::{Duration, SystemTime};
 use temporalio_client::{
@@ -13,7 +13,7 @@ use temporalio_macros::{workflow, workflow_methods};
 use temporalio_sdk::{WorkflowContext, WorkflowResult};
 
 async fn test_client() -> temporalio_client::Client {
-    get_integ_client(NAMESPACE.to_string(), None).await
+    get_integ_client(integ_namespace(), None).await
 }
 
 #[workflow]

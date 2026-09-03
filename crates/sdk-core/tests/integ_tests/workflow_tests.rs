@@ -917,8 +917,9 @@ async fn nondeterminism_errors_fail_workflow_when_configured_to(
     worker.run_until_done().await.unwrap();
 
     let body = metrics_tests::get_text(format!("http://{addr}/metrics")).await;
+    let namespace = client.namespace();
     let match_this = format!(
-        "temporal_workflow_failed{{namespace=\"default\",\
+        "temporal_workflow_failed{{namespace=\"{namespace}\",\
          service_name=\"temporal-core-sdk\",\
          task_queue=\"{wf_id}\",workflow_type=\"{wf_name}\"}} 1"
     );
@@ -1042,6 +1043,10 @@ async fn history_out_of_order_on_restart() {
     assert_matches!(res, Err(WorkflowGetResultError::Failed(_)));
 }
 
+#[temporalio_macros::cloud_test_exclusion(
+    DoesNotUseServer,
+    "Uses MockPollCfg and a mocked SDK worker with synthetic history; no Temporal server is contacted."
+)]
 #[tokio::test]
 async fn pass_timer_summary_to_metadata() {
     let t = canned_histories::single_timer("1");

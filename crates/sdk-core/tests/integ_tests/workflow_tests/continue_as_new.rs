@@ -156,6 +156,10 @@ impl WfWithTimer {
     }
 }
 
+#[temporalio_macros::cloud_test_exclusion(
+    DoesNotUseServer,
+    "Uses MockPollCfg and a fake SDK worker with synthetic history; no Temporal server is contacted."
+)]
 #[tokio::test]
 async fn wf_completing_with_continue_as_new() {
     let t = canned_histories::timer_then_continue_as_new("1");
@@ -206,6 +210,10 @@ impl ContinueAsNewSuggestedWf {
     }
 }
 
+#[temporalio_macros::cloud_test_exclusion(
+    DoesNotUseServer,
+    "Uses MockPollCfg and a fake SDK worker with synthetic history; no Temporal server is contacted."
+)]
 #[tokio::test]
 async fn continue_as_new_suggested_flag_exposed() {
     let mut t = canned_histories::timer_then_continue_as_new("1");
@@ -247,6 +255,10 @@ impl ClearSearchAttrsOnContinueAsNewWf {
     }
 }
 
+#[temporalio_macros::cloud_test_exclusion(
+    RequiresCloudProvisioning,
+    "Uses a custom search attribute that isolated Cloud CI does not provision."
+)]
 #[tokio::test]
 async fn clear_search_attributes_on_continue_as_new() {
     let wf_name = "clear_search_attrs_on_continue_as_new";

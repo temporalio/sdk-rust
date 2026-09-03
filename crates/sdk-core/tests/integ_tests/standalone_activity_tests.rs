@@ -211,6 +211,10 @@ async fn terminate() {
     .await;
 }
 
+#[temporalio_macros::cloud_test_exclusion(
+    NeedsCloudAdaptation,
+    "Cloud list visibility can lag behind count visibility, but the test lists activities only once."
+)]
 #[tokio::test]
 async fn list_and_count() {
     run_test(async |client, tq| {

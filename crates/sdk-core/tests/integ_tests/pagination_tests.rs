@@ -36,6 +36,10 @@ impl WeirdPaginationWf {
     }
 }
 
+#[temporalio_macros::cloud_test_exclusion(
+    DoesNotUseServer,
+    "Uses synthetic history pages and mocked worker pollers; no Temporal server is contacted."
+)]
 #[tokio::test]
 async fn weird_pagination_doesnt_drop_wft_events() {
     let wf_id = "fakeid";
@@ -160,6 +164,10 @@ impl ExtremePaginationWf {
     }
 }
 
+#[temporalio_macros::cloud_test_exclusion(
+    DoesNotUseServer,
+    "Uses synthetic history pages and mocked worker pollers; no Temporal server is contacted."
+)]
 #[tokio::test]
 async fn extreme_pagination_doesnt_drop_wft_events_worker() {
     let wf_id = "fakeid";

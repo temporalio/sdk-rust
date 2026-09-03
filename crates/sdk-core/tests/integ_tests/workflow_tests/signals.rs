@@ -337,6 +337,10 @@ impl SignalSenderCanned {
     }
 }
 
+#[temporalio_macros::cloud_test_exclusion(
+    DoesNotUseServer,
+    "Uses MockPollCfg and a fake SDK worker with synthetic history; no Temporal server is contacted."
+)]
 #[rstest::rstest]
 #[case::succeeds(false)]
 #[case::fails(true)]
@@ -408,6 +412,10 @@ impl CancelsBeforeSending {
     }
 }
 
+#[temporalio_macros::cloud_test_exclusion(
+    DoesNotUseServer,
+    "Uses MockPollCfg and a fake intercepted SDK worker; no Temporal server is contacted."
+)]
 #[tokio::test]
 async fn cancels_before_sending() {
     let mut t = TestHistoryBuilder::default();

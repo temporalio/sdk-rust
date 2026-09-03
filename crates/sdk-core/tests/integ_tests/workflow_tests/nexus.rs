@@ -99,6 +99,10 @@ impl NexusBasicWf {
     }
 }
 
+#[temporalio_macros::cloud_test_exclusion(
+    RequiresCloudProvisioning,
+    "Creates a Nexus endpoint through the Operator Service, unavailable to isolated Cloud namespace credentials."
+)]
 #[rstest::rstest]
 #[tokio::test]
 async fn nexus_basic(
@@ -308,6 +312,10 @@ impl AsyncCompleter {
     }
 }
 
+#[temporalio_macros::cloud_test_exclusion(
+    RequiresCloudProvisioning,
+    "Creates a Nexus endpoint through the Operator Service, unavailable to isolated Cloud namespace credentials."
+)]
 #[rstest::rstest]
 #[tokio::test]
 async fn nexus_async(
@@ -567,6 +575,10 @@ impl NexusCancelBeforeStartWf {
     }
 }
 
+#[temporalio_macros::cloud_test_exclusion(
+    RequiresCloudProvisioning,
+    "Creates a Nexus endpoint through the Operator Service, unavailable to isolated Cloud namespace credentials."
+)]
 #[tokio::test]
 async fn nexus_cancel_before_start() {
     let wf_name = "nexus_cancel_before_start";
@@ -631,6 +643,10 @@ impl NexusRootCancellationWf {
     }
 }
 
+#[temporalio_macros::cloud_test_exclusion(
+    RequiresCloudProvisioning,
+    "Creates a Nexus endpoint through the Operator Service, unavailable to isolated Cloud namespace credentials."
+)]
 #[tokio::test]
 async fn workflow_cancellation_propagates_to_started_nexus_operation() {
     let wf_name = "workflow_cancellation_propagates_to_started_nexus_operation";
@@ -765,6 +781,10 @@ impl NexusMustCompleteTaskWf {
     }
 }
 
+#[temporalio_macros::cloud_test_exclusion(
+    RequiresCloudProvisioning,
+    "Creates a Nexus endpoint through the Operator Service, unavailable to isolated Cloud namespace credentials."
+)]
 #[rstest::rstest]
 #[tokio::test]
 async fn nexus_must_complete_task_to_shutdown(#[values(true, false)] use_grace_period: bool) {
@@ -943,6 +963,10 @@ impl AsyncCompleterWf {
     }
 }
 
+#[temporalio_macros::cloud_test_exclusion(
+    RequiresCloudProvisioning,
+    "Creates a Nexus endpoint through the Operator Service, unavailable to isolated Cloud namespace credentials."
+)]
 #[rstest::rstest]
 #[tokio::test]
 async fn nexus_cancellation_types(

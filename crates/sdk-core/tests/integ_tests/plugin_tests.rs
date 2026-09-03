@@ -87,6 +87,10 @@ impl WorkerPlugin for IntegrationPlugin {
     }
 }
 
+#[temporalio_macros::cloud_test_exclusion(
+    NeedsCloudAdaptation,
+    "Retargeting the client discards envconfig TLS options, so the HTTPS Cloud connection cannot be established."
+)]
 #[tokio::test]
 async fn plugins_configure_client_and_worker() {
     let runtime = new_sdk_runtime();

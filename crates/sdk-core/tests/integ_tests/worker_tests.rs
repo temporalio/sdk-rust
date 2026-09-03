@@ -2,7 +2,7 @@ use crate::{
     common::{
         CoreWfStarter, activity_functions::StdActivities, fake_grpc_server::fake_server,
         get_integ_runtime_options, get_integ_server_options, get_integ_telem_options,
-        integ_namespace,
+        integ_namespace, prom_metrics,
     },
     shared_tests::{self, is_oversize_grpc_event},
 };
@@ -232,7 +232,7 @@ async fn resource_based_few_pollers_guarantees_non_sticky_poll() {
 
 #[tokio::test]
 async fn oversize_grpc_message() {
-    use crate::common::{NAMESPACE, prom_metrics};
+    let namespace = integ_namespace();
     let wf_name = "oversize_grpc_message";
     // Enable Prometheus metrics for this test and capture the address
     let (telemopts, addr, _aborter) = prom_metrics(None);
@@ -292,7 +292,7 @@ async fn oversize_grpc_message() {
             if body.lines().any(|line| {
                 line.starts_with("temporal_workflow_task_execution_failed{")
                     && line.contains("failure_reason=\"GrpcMessageTooLarge\"")
-                    && line.contains(&format!("namespace=\"{NAMESPACE}\""))
+                    && line.contains(&format!("namespace=\"{namespace}\""))
                     && line.contains("service_name=\"temporal-core-sdk\"")
                     && line.contains(&format!("task_queue=\"{tq}\""))
                     && line.ends_with(" 1")
@@ -342,6 +342,10 @@ impl PaginatedCompletionWf {
 /// server buffers and reassembles; the workflow then completes normally. Local-lane only: it needs
 /// the dev server's `history.enableWorkflowTaskCompletionPagination` and a raised
 /// `system.transactionSizeLimit`.
+#[temporalio_macros::cloud_test_exclusion(
+    RequiresLocalServer,
+    "Requires dev-server workflow-task pagination and transaction-size dynamic configuration."
+)]
 #[tokio::test]
 async fn workflow_task_completion_pagination_test() {
     let wf_name = "wft_completion_pagination";
@@ -735,6 +739,10 @@ async fn disabled_error_limit_lets_server_hard_fail() {
     );
 }
 
+#[temporalio_macros::cloud_test_exclusion(
+    DoesNotUseServer,
+    "Uses synthetic workflow and activity tasks with mocked worker pollers."
+)]
 #[tokio::test]
 async fn activity_tasks_from_completion_reserve_slots() {
     let wf_id = "fake_wf_id";
@@ -915,6 +923,10 @@ async fn activity_tasks_from_completion_reserve_slots() {
     tokio::join!(run_fut, act_completer);
 }
 
+#[temporalio_macros::cloud_test_exclusion(
+    DoesNotUseServer,
+    "Uses MockPollCfg with synthetic workflow histories; no Temporal server is contacted."
+)]
 #[tokio::test]
 async fn max_wft_respected() {
     let total_wfs = 100;
@@ -961,6 +973,10 @@ async fn max_wft_respected() {
     worker.run_until_done().await.unwrap();
 }
 
+#[temporalio_macros::cloud_test_exclusion(
+    DoesNotUseServer,
+    "Uses synthetic workflow history with a mocked worker client; no Temporal server is contacted."
+)]
 #[rstest]
 #[tokio::test]
 async fn history_length_with_fail_and_timeout(
@@ -1096,6 +1112,10 @@ async fn history_length_with_fail_and_timeout(
 }
 
 #[allow(deprecated)]
+#[temporalio_macros::cloud_test_exclusion(
+    DoesNotUseServer,
+    "Uses synthetic workflow history with a mocked worker client; no Temporal server is contacted."
+)]
 #[tokio::test]
 async fn sets_build_id_from_wft_complete() {
     let wfid = "fake_wf_id";
@@ -1453,6 +1473,10 @@ async fn test_custom_slot_supplier_simple() {
     );
 }
 
+#[temporalio_macros::cloud_test_exclusion(
+    DoesNotUseServer,
+    "Uses a fake gRPC server to count shutdown attempts; no Temporal server is contacted."
+)]
 #[tokio::test]
 async fn shutdown_worker_not_retried() {
     let shutdown_call_count = Arc::new(AtomicU8::new(0));
@@ -1482,6 +1506,10 @@ async fn shutdown_worker_not_retried() {
     assert_eq!(shutdown_call_count.load(Ordering::Relaxed), 1);
 }
 
+#[temporalio_macros::cloud_test_exclusion(
+    DoesNotUseServer,
+    "Constructs worker options in process and performs no server interaction."
+)]
 #[test]
 fn test_default_build_id() {
     let o = WorkerOptions::new("task_queue").build();
@@ -1489,6 +1517,10 @@ fn test_default_build_id() {
     assert_ne!(o.deployment_options.version.build_id, "undetermined");
 }
 
+#[temporalio_macros::cloud_test_exclusion(
+    NeedsCloudAdaptation,
+    "Uses new_cloud_or_local, which treats envconfig as local and calls a cluster-info RPC unavailable to Cloud namespace credentials."
+)]
 #[tokio::test]
 async fn shutdown_during_active_timer_activity_workflows() {
     shared_tests::shutdown_during_active_timer_activity_workflows().await

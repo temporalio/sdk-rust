@@ -100,6 +100,10 @@ impl ModifyPropsWf {
     }
 }
 
+#[temporalio_macros::cloud_test_exclusion(
+    DoesNotUseServer,
+    "Uses MockPollCfg and a fake SDK worker with synthetic history; no Temporal server is contacted."
+)]
 #[tokio::test]
 async fn workflow_modify_props() {
     let mut t = TestHistoryBuilder::default();

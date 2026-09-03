@@ -48,6 +48,10 @@ impl SearchAttrUpdater {
     }
 }
 
+#[temporalio_macros::cloud_test_exclusion(
+    RequiresCloudProvisioning,
+    "Uses custom search attributes that isolated Cloud CI does not provision."
+)]
 #[tokio::test]
 async fn sends_upsert() {
     let wf_name = "sends_upsert_search_attrs";
@@ -122,6 +126,10 @@ impl UpsertTestWf {
     }
 }
 
+#[temporalio_macros::cloud_test_exclusion(
+    DoesNotUseServer,
+    "Uses MockPollCfg and a fake SDK worker with synthetic history; no Temporal server is contacted."
+)]
 #[tokio::test]
 async fn upsert_search_attrs_from_workflow() {
     let mut t = TestHistoryBuilder::default();

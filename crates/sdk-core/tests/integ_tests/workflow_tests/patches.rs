@@ -768,6 +768,10 @@ impl PatchWf {
     }
 }
 
+#[temporalio_macros::cloud_test_exclusion(
+    DoesNotUseServer,
+    "Uses MockPollCfg and a fake intercepted SDK worker; no Temporal server is contacted."
+)]
 #[rstest]
 #[case::v1_breaks_on_normal_marker(false, MarkerType::NotDeprecated, 1)]
 #[case::v1_accepts_dep_marker(false, MarkerType::Deprecated, 1)]
@@ -827,6 +831,10 @@ async fn v1_and_v4_changes(
 }
 
 // Note that the not-replaying and no-marker cases don't make sense and hence are absent
+#[temporalio_macros::cloud_test_exclusion(
+    DoesNotUseServer,
+    "Uses MockPollCfg and a fake intercepted SDK worker; no Temporal server is contacted."
+)]
 #[rstest]
 #[case::v2_marker_new_path(false, MarkerType::NotDeprecated, 2)]
 #[case::v2_dep_marker_new_path(false, MarkerType::Deprecated, 2)]
@@ -971,6 +979,10 @@ impl SameChangeMultipleSpotsWf {
     }
 }
 
+#[temporalio_macros::cloud_test_exclusion(
+    DoesNotUseServer,
+    "Uses MockPollCfg and a fake SDK worker with synthetic history; no Temporal server is contacted."
+)]
 #[rstest]
 #[case::has_change_replay(true, true)]
 #[case::no_change_replay(false, true)]
@@ -1084,6 +1096,10 @@ impl ManyPatchesWf {
     }
 }
 
+#[temporalio_macros::cloud_test_exclusion(
+    DoesNotUseServer,
+    "Uses MockPollCfg and a fake SDK worker with synthetic history; no Temporal server is contacted."
+)]
 #[rstest]
 #[case::happy_path(50)]
 // We start exceeding the 2k size limit at 180 patches with this format
