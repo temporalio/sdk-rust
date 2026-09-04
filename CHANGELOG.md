@@ -33,10 +33,11 @@ relevant information.
 
 ## Unreleased
 
+## [1.0.0] - 2026-09-04
+
 ### Changed
 * Published Rust SDK crates now declare their minimum supported Rust version: Rust 1.92 for
   `temporalio-sdk`, and Rust 1.88 for the other crates.
-## [1.0.0] - 2026-09-04
 
 ### Added
 * `CancelExternalWorkflowError` and `workflow_interceptors::CancelExternalWorkflowResult`
