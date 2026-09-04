@@ -43,6 +43,7 @@ jobs:
         run: |
           metadata="$(cargo metadata --format-version 1 --no-deps)"
           version="$(jq -er '[.packages[] | select(.name == "temporalio-sdk") | .version] | if length == 1 then .[0] else error("expected one temporalio-sdk package") end' <<<"$metadata")"
+          core_version="$(jq -er '[.packages[] | select(.name == "temporalio-sdk-core") | .version] | if length == 1 then .[0] else error("expected one temporalio-sdk-core package") end' <<<"$metadata")"
 
           if [[ "$GITHUB_REF_NAME" =~ ^releases/([0-9]+)\.([0-9]+)\.x$ ]]; then
             release_line="${BASH_REMATCH[1]}.${BASH_REMATCH[2]}"
@@ -55,6 +56,7 @@ jobs:
           {
             echo "version=$version"
             echo "tag=v$version"
+            echo "core_tag=core-v$core_version"
           } >>"$GITHUB_OUTPUT"
 
       - name: Generate release notes
@@ -64,7 +66,16 @@ jobs:
             --from "$previous_tag" \
             --to HEAD \
             --changelog rust \
-            >"$RUNNER_TEMP/release-notes.md"
+            >"$RUNNER_TEMP/sdk-release-notes.md"
+
+          if ! previous_core_tag="$(git describe --tags --match 'core-v[0-9]*' --abbrev=0 HEAD 2>/dev/null)"; then
+            previous_core_tag="$previous_tag"
+          fi
+          cargo run -p changelog-release-notes -- \
+            --from "$previous_core_tag" \
+            --to HEAD \
+            --changelog core \
+            >"$RUNNER_TEMP/core-release-notes.md"
 
       - name: Plan crate publication
         id: publish-plan
@@ -91,7 +102,7 @@ jobs:
           done
           cargo publish "${publish_args[@]}"
 
-      - name: Create draft GitHub release
+      - name: Create draft SDK GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ steps.release.outputs.tag }}
@@ -101,4 +112,16 @@ jobs:
             --target "$GITHUB_SHA" \
             --draft \
             --title "$RELEASE_TITLE" \
-            --notes-file "$RUNNER_TEMP/release-notes.md"
+            --notes-file "$RUNNER_TEMP/sdk-release-notes.md"
+
+      - name: Create draft Core GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.release.outputs.core_tag }}
+          RELEASE_TITLE: temporalio-sdk-core ${{ steps.release.outputs.core_tag }}
+        run: |
+          gh release create "$RELEASE_TAG" \
+            --target "$GITHUB_SHA" \
+            --draft \
+            --title "$RELEASE_TITLE" \
+            --notes-file "$RUNNER_TEMP/core-release-notes.md"

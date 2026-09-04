@@ -95,11 +95,16 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<(Version, Versio
 fn main() -> Result<(), String> {
     let (target_sdk, target_core_protos) = parse_args(env::args().skip(1))?;
     let root = workspace_root();
+    let release_date = Utc::now().date_naive();
 
     let changelog_path = root.join("CHANGELOG.md");
     let changelog = fs::read_to_string(&changelog_path)
         .map_err(|err| format!("failed to read {}: {err}", changelog_path.display()))?;
-    let changelog = turn_over_changelog(&changelog, &target_sdk, Utc::now().date_naive())?;
+    let changelog = turn_over_changelog(&changelog, &target_sdk, release_date)?;
+    let core_changelog_path = root.join("crates/sdk-core/CHANGELOG.md");
+    let core_changelog = fs::read_to_string(&core_changelog_path)
+        .map_err(|err| format!("failed to read {}: {err}", core_changelog_path.display()))?;
+    let core_changelog = turn_over_changelog(&core_changelog, &target_core_protos, release_date)?;
 
     let sdk_update = vec![
         "set-version".into(),
@@ -141,6 +146,8 @@ fn main() -> Result<(), String> {
     cargo_set_version(&root, &protos_update)?;
     fs::write(&changelog_path, changelog)
         .map_err(|err| format!("failed to write {}: {err}", changelog_path.display()))?;
+    fs::write(&core_changelog_path, core_changelog)
+        .map_err(|err| format!("failed to write {}: {err}", core_changelog_path.display()))?;
 
     println!("Prepared SDK {target_sdk} with Core and Protos {target_core_protos}");
     Ok(())
