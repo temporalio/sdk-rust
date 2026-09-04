@@ -1,12 +1,10 @@
 #![cfg_attr(docsrs, feature(doc_cfg))]
 #![warn(missing_docs)] // error if there are missing docs
 
-//! This crate defines a Public Preview Temporal Rust SDK.
+//! This crate defines the Temporal Rust SDK.
 //!
 //! The SDK is built on top of Core and provides a native Rust experience for writing Temporal
 //! Workflows and Activities.
-//!
-//! The SDK is in Public Preview and under active development. The API can and will continue to evolve.
 //!
 //! An example of running an activity worker:
 //! ```no_run

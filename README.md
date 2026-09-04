@@ -5,14 +5,14 @@
 [![crates.io](https://img.shields.io/crates/v/temporalio-sdk.svg)](https://crates.io/crates/temporalio-sdk)
 [![docs.rs](https://docs.rs/temporalio-sdk/badge.svg)](https://docs.rs/temporalio-sdk)
 
-Currently in Public Preview, see more in the [SDK README.md](crates/sdk/README.md)
+See the [SDK README](crates/sdk/README.md) for usage and examples.
 
 # Temporal Rust Client
 
 [![crates.io](https://img.shields.io/crates/v/temporalio-sdk.svg)](https://crates.io/crates/temporalio-client)
 [![docs.rs](https://docs.rs/temporalio-sdk/badge.svg)](https://docs.rs/temporalio-client)
 
-Currently in Public Preview, see more in the [client README.md](crates/client/README.md)
+See the [client README](crates/client/README.md) for usage and examples.
 
 # Temporal Core SDK
 
@@ -47,7 +47,7 @@ This repo is composed of multiple crates:
 - temporalio-sdk-core `./crates/core` - The Core implementation.
 - temporalio-sdk-core-c-bridge `./crates/core-c-bridge` - Provides C bindings for Core.
 - temporalio-macros `./crates/macros` - Implements procedural macros used by core and the SDK.
-- temporalio-sdk `./crates/sdk` - A Public Preview Rust SDK built on top of Core. Used for testing.
+- temporalio-sdk `./crates/sdk` - A Rust SDK built on top of Core.
 
 Visualized (dev dependencies are in blue):
 
