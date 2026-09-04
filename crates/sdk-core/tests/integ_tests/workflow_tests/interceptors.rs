@@ -20,7 +20,8 @@ use temporalio_common::protos::temporal::api::{
 use temporalio_macros::{workflow, workflow_methods};
 use temporalio_sdk::{
     ActivityOptions, ChildWorkflowOptions, LocalActivityOptions, NexusOperationOptions,
-    SyncWorkflowContext, TimerResult, WorkflowContext, WorkflowContextView, WorkflowResult,
+    SyncWorkflowContext, TimerResult, WorkflowContext, WorkflowContextKey, WorkflowContextView,
+    WorkflowResult,
     workflow_interceptors::{
         CancellableWorkflowOutboundFuture, ExecuteWorkflowInput, ExecuteWorkflowResult,
         HandleQueryInput, HandleQueryResult, HandleSignalInput, HandleSignalResult,
@@ -69,9 +70,13 @@ impl InboundInterceptorWorkflow {
     #[update_validator(set_update)]
     fn validate_set_update(
         &self,
-        _ctx: &WorkflowContextView,
+        ctx: &WorkflowContextView,
         input: &str,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        assert_eq!(
+            ctx.context_value::<CurrentContextLabel>().as_deref(),
+            Some(&"validator")
+        );
         assert!(input.ends_with("-validated"));
         if input.starts_with("reject") {
             Err("update rejected by validator".into())
@@ -88,7 +93,11 @@ impl InboundInterceptorWorkflow {
     }
 
     #[query]
-    fn get_status(&self, _ctx: &WorkflowContextView, input: String) -> String {
+    fn get_status(&self, ctx: &WorkflowContextView, input: String) -> String {
+        assert_eq!(
+            ctx.context_value::<CurrentContextLabel>().as_deref(),
+            Some(&"query")
+        );
         assert_eq!(input, "query-mutated");
         "query-original-output".to_string()
     }
@@ -190,7 +199,10 @@ impl WorkflowInterceptor for MutatingWorkflowInterceptor {
             *input = "query-mutated".to_string();
         }
 
-        let result = next.run(input)?;
+        assert!(ctx.context_value::<CurrentContextLabel>().is_none());
+        let result =
+            ctx.with_context_value::<CurrentContextLabel, _>("query", || next.run(input))?;
+        assert!(ctx.context_value::<CurrentContextLabel>().is_none());
         assert_eq!(
             result.downcast_ref::<String>().map(String::as_str),
             Some("query-original-output")
@@ -200,7 +212,7 @@ impl WorkflowInterceptor for MutatingWorkflowInterceptor {
 
     fn validate_update(
         &self,
-        _ctx: SyncWorkflowInterceptorContext,
+        ctx: SyncWorkflowInterceptorContext,
         mut input: ValidateUpdateInput,
         next: WorkflowNext<'_, ValidateUpdateInput, ValidateUpdateResult>,
     ) -> ValidateUpdateResult {
@@ -213,7 +225,11 @@ impl WorkflowInterceptor for MutatingWorkflowInterceptor {
         if let Some(input) = input.input_mut::<String>() {
             input.push_str("-validated");
         }
-        next.run(input)
+        assert!(ctx.context_value::<CurrentContextLabel>().is_none());
+        let result =
+            ctx.with_context_value::<CurrentContextLabel, _>("validator", || next.run(input));
+        assert!(ctx.context_value::<CurrentContextLabel>().is_none());
+        result
     }
 }
 
@@ -488,6 +504,146 @@ async fn all_handlers_finished_waits_for_handler_chain(
     let (_, worker_result) = join!(driver, worker.run_until_done());
     worker_result.unwrap();
     handle.fetch_history_and_replay(&mut worker).await.unwrap();
+}
+
+struct CurrentContextLabel;
+
+impl WorkflowContextKey for CurrentContextLabel {
+    type Value = &'static str;
+}
+
+#[workflow]
+#[derive(Default)]
+struct WorkflowContextPropagationWorkflow {
+    finish: bool,
+}
+
+#[workflow_methods]
+impl WorkflowContextPropagationWorkflow {
+    #[run]
+    async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<()> {
+        let run_ctx = ctx.clone();
+        ctx.with_context_value::<CurrentContextLabel, _>("run", async move {
+            let left_ctx = run_ctx.clone();
+            let left = run_ctx.with_context_value::<CurrentContextLabel, _>("left", async move {
+                left_ctx.timer(Duration::from_millis(1)).await;
+                assert_eq!(
+                    left_ctx.context_value::<CurrentContextLabel>().as_deref(),
+                    Some(&"left")
+                );
+            });
+            let right_ctx = run_ctx.clone();
+            let right = run_ctx.with_context_value::<CurrentContextLabel, _>("right", async move {
+                right_ctx.timer(Duration::from_millis(1)).await;
+                assert_eq!(
+                    right_ctx.context_value::<CurrentContextLabel>().as_deref(),
+                    Some(&"right")
+                );
+            });
+            temporalio_sdk::workflows::join!(left, right);
+
+            assert_eq!(
+                run_ctx.context_value::<CurrentContextLabel>().as_deref(),
+                Some(&"run")
+            );
+            run_ctx.timer(Duration::from_millis(1)).await;
+            run_ctx.wait_condition(|state| state.finish).await
+        })
+        .await?;
+        assert!(ctx.context_value::<CurrentContextLabel>().is_none());
+        Ok(())
+    }
+
+    #[signal]
+    async fn finish(ctx: &mut WorkflowContext<Self>) {
+        let signal_ctx = ctx.clone();
+        ctx.with_context_value::<CurrentContextLabel, _>("signal", async move {
+            signal_ctx.timer(Duration::from_millis(1)).await;
+            assert_eq!(
+                signal_ctx.context_value::<CurrentContextLabel>().as_deref(),
+                Some(&"signal")
+            );
+            signal_ctx.state_mut(|state| state.finish = true);
+        })
+        .await;
+        assert!(ctx.context_value::<CurrentContextLabel>().is_none());
+    }
+}
+
+struct ObserveWorkflowContextInterceptor {
+    observed: Arc<Mutex<Vec<&'static str>>>,
+}
+
+impl WorkflowInterceptor for ObserveWorkflowContextInterceptor {
+    fn start_timer(
+        &self,
+        ctx: WorkflowInterceptorContext,
+        input: StartTimerInput,
+        next: WorkflowNext<
+            'static,
+            StartTimerInput,
+            CancellableWorkflowOutboundFuture<TimerResult>,
+        >,
+    ) -> CancellableWorkflowOutboundFuture<TimerResult> {
+        self.observed.lock().unwrap().push(
+            *ctx.context_value::<CurrentContextLabel>()
+                .expect("timer must have workflow context"),
+        );
+        next.run(input)
+    }
+}
+
+#[tokio::test]
+async fn workflow_context_is_branch_and_handler_local_during_replay() {
+    let mut starter =
+        CoreWfStarter::new("workflow_context_is_branch_and_handler_local_during_replay");
+    let observed = Arc::new(Mutex::new(Vec::new()));
+    let interceptor_observed = observed.clone();
+    starter
+        .sdk_config
+        .register_workflow::<WorkflowContextPropagationWorkflow>()
+        .unwrap()
+        .register_workflow_interceptors(vec![WorkflowInterceptorConstructor::new(move |_| {
+            ObserveWorkflowContextInterceptor {
+                observed: interceptor_observed.clone(),
+            }
+        })]);
+    let mut worker = starter.worker().await;
+
+    let handle = worker
+        .submit_workflow(
+            WorkflowContextPropagationWorkflow::run,
+            (),
+            WorkflowStartOptions::new(
+                starter.get_task_queue().to_owned(),
+                starter.get_wf_id().to_owned(),
+            )
+            .build(),
+        )
+        .await
+        .unwrap();
+    let driver = async {
+        handle
+            .signal(
+                WorkflowContextPropagationWorkflow::finish,
+                (),
+                WorkflowSignalOptions::default(),
+            )
+            .await
+            .unwrap();
+        handle.get_result(Default::default()).await.unwrap();
+    };
+    let (_, worker_result) = join!(driver, worker.run_until_done());
+    worker_result.unwrap();
+    let mut live_observed = observed.lock().unwrap().clone();
+    live_observed.sort_unstable();
+    assert_eq!(live_observed, ["left", "right", "run", "signal"]);
+
+    observed.lock().unwrap().clear();
+    handle.fetch_history_and_replay(&mut worker).await.unwrap();
+    let mut replay_observed = observed.lock().unwrap().clone();
+    replay_observed.sort_unstable();
+    assert_eq!(replay_observed, ["left", "right", "run", "signal"]);
 }
 
 #[tokio::test]

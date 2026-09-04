@@ -85,8 +85,8 @@ use crate::{
     ActivityOptions, BaseWorkflowContext, CancelExternalWorkflowError, CancellableFuture,
     CancellableFutureWithReason, ChildWorkflowOptions, ContinueAsNewOptions,
     ExternalWorkflowHandle, LocalActivityOptions, SignalWorkflowOptions, StartChildWorkflowOutput,
-    StartedChildWorkflow, TimerOptions, WorkflowCancellationToken, WorkflowContextView,
-    WorkflowRandomStream,
+    StartedChildWorkflow, TimerOptions, WorkflowCancellationToken, WorkflowContextFuture,
+    WorkflowContextKey, WorkflowContextView, WorkflowRandomStream,
     cancellation::WorkflowCancellationRegistration,
     runtime::{
         entry::WorkflowError,
@@ -280,6 +280,33 @@ impl WorkflowInterceptorContext {
         Self { base }
     }
 
+    /// Return the value associated with key type `K` in the current workflow context scope.
+    pub fn context_value<K: WorkflowContextKey>(&self) -> Option<Rc<K::Value>> {
+        self.base.context_value::<K>()
+    }
+
+    /// Poll `future` with `value` installed for key type `K`.
+    ///
+    /// Inbound interceptors can use this to establish context around `next.run(input)`. Outbound
+    /// interceptors invoked by the workflow inside that scope observe the value with
+    /// [`Self::context_value`]. The previous context is restored after each poll.
+    pub fn with_context_value<K: WorkflowContextKey, F: Future>(
+        &self,
+        value: K::Value,
+        future: F,
+    ) -> WorkflowContextFuture<F> {
+        self.base.with_context_value::<K, F>(value, future)
+    }
+
+    /// Run synchronous interceptor code with `value` installed for key type `K`.
+    pub fn with_context_value_sync<K: WorkflowContextKey, R>(
+        &self,
+        value: K::Value,
+        f: impl FnOnce() -> R,
+    ) -> R {
+        self.base.with_context_value_sync::<K, R>(value, f)
+    }
+
     /// Return the workflow's unique identifier.
     pub fn workflow_id(&self) -> &str {
         self.base.workflow_id()
@@ -418,6 +445,22 @@ pub struct SyncWorkflowInterceptorContext {
 impl SyncWorkflowInterceptorContext {
     pub(crate) fn new(base: BaseWorkflowContext) -> Self {
         Self { base }
+    }
+
+    /// Return the value associated with key type `K` in the current workflow context scope.
+    pub fn context_value<K: WorkflowContextKey>(&self) -> Option<Rc<K::Value>> {
+        self.base.context_value::<K>()
+    }
+
+    /// Run synchronous interceptor code with `value` installed for key type `K`.
+    ///
+    /// This is intended for query and update-validator interceptor chains, which cannot await.
+    pub fn with_context_value<K: WorkflowContextKey, R>(
+        &self,
+        value: K::Value,
+        f: impl FnOnce() -> R,
+    ) -> R {
+        self.base.with_context_value_sync::<K, R>(value, f)
     }
 
     /// Return the workflow's unique identifier.

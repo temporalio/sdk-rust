@@ -118,6 +118,11 @@ path = "examples/activity_interceptor/starter.rs"
 required-features = ["examples"]
 
 [[example]]
+name = "workflow-context"
+path = "examples/workflow_context.rs"
+required-features = ["examples"]
+
+[[example]]
 name = "timer-examples-worker"
 path = "examples/timer_examples/worker.rs"
 required-features = ["examples"]

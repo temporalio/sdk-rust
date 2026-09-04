@@ -39,6 +39,12 @@ relevant information.
 ### Fixed
 * Sticky workflow backlog no longer prevents normal pollers from using capacity after sticky
   pollers reach their autoscaling target.
+* `WorkflowContextKey` and context-value scopes provide replay-safe, workflow-run-owned context
+  storage for application code and workflow interceptors. Values survive async suspension while
+  remaining isolated between concurrent branches and signal/update handlers. Read-only workflow
+  views can observe values established by synchronous inbound interceptors, and outbound
+  interceptors can use values to propagate metadata to activities, child workflows, signals,
+  Nexus operations, and continue-as-new runs.
 ### Breaking Changes
 * `ActivityError`, `PayloadConversionError`, `ActivityExecutionError`,
   `ChildWorkflowStartError`, `ChildWorkflowExecutionError`, and `WorkflowSignalError` are now

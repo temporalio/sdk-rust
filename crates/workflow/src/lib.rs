@@ -73,8 +73,9 @@ pub use workflow_context::{
     ContinueAsNewOptions, ExternalWorkflowHandle, LocalActivityOptions, NamespacedWorkflowInfo,
     ParentClosePolicy, SignalWorkflowOptions, StartChildWorkflowExecutionFailedCause,
     StartChildWorkflowOutput, StartedChildWorkflow, SyncWorkflowContext, TimerOptions,
-    VersioningIntent, WaitConditionOptions, WorkflowContext, WorkflowContextView,
-    WorkflowIdReusePolicy, WorkflowRandomStream, WorkflowRandomValue,
+    VersioningIntent, WaitConditionOptions, WorkflowContext, WorkflowContextFuture,
+    WorkflowContextKey, WorkflowContextView, WorkflowIdReusePolicy, WorkflowRandomStream,
+    WorkflowRandomValue,
 };
 #[cfg(feature = "experimental")]
 pub use workflow_context::{
