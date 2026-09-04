@@ -123,6 +123,10 @@ async fn out_of_order_completion_doesnt_hang() {
     jh.await.unwrap();
 }
 
+#[temporalio_macros::cloud_test_exclusion(
+    RequiresLocalServer,
+    "Starts two local Temporal CLI dev servers with custom dynamic configuration."
+)]
 #[tokio::test]
 async fn switching_worker_client_changes_poll() {
     // Start two servers
@@ -337,6 +341,10 @@ async fn small_workflow_slots_and_pollers(#[values(false, true)] use_autoscaling
     assert!(!any_task_timeouts);
 }
 
+#[temporalio_macros::cloud_test_exclusion(
+    RequiresLocalServer,
+    "Starts and terminates a dedicated local dev server to induce a polling failure."
+)]
 #[tokio::test]
 async fn replace_client_works_after_polling_failure() {
     let (log_consumer, mut log_rx) = CoreLogStreamConsumer::new(100);

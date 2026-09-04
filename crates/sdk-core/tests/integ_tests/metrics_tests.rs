@@ -2,7 +2,7 @@ use crate::{
     common::{
         ANY_PORT, CoreWfStarter, NAMESPACE, OTEL_URL_ENV_VAR, PROMETHEUS_QUERY_API, eventually,
         get_integ_client, get_integ_connection, get_integ_runtime_options,
-        get_integ_server_options, get_integ_telem_options, prom_metrics,
+        get_integ_server_options, get_integ_telem_options, integ_namespace, prom_metrics,
     },
     integ_tests::mk_nexus_endpoint,
 };
@@ -103,6 +103,10 @@ pub(crate) async fn get_text(endpoint: String) -> String {
     reqwest::get(endpoint).await.unwrap().text().await.unwrap()
 }
 
+#[temporalio_macros::cloud_test_exclusion(
+    RequiresCloudProvisioning,
+    "Uses the cluster-wide ListNamespaces RPC to produce request metrics."
+)]
 #[rstest::rstest]
 #[tokio::test]
 async fn prometheus_metrics_exported(
@@ -179,12 +183,13 @@ async fn prometheus_metrics_exported(
 
 #[tokio::test]
 async fn one_slot_worker_reports_available_slot() {
+    let namespace = integ_namespace();
     let (telemopts, addr, _aborter) = prom_metrics(None);
     let tq = "one_slot_worker_tq";
     let rt = CoreRuntime::new_assume_tokio(get_integ_runtime_options(telemopts)).unwrap();
 
     let worker_cfg = WorkerConfig::builder()
-        .namespace(NAMESPACE)
+        .namespace(namespace.clone())
         .task_queue(tq)
         .versioning_strategy(WorkerVersioningStrategy::None {
             build_id: "test_build_id".to_owned(),
@@ -278,22 +283,22 @@ async fn one_slot_worker_reports_available_slot() {
         tokio::time::sleep(Duration::from_millis(50)).await;
         let body = get_text(format!("http://{addr}/metrics")).await;
         assert!(body.contains(&format!(
-            "temporal_worker_task_slots_available{{namespace=\"{NAMESPACE}\",\
+            "temporal_worker_task_slots_available{{namespace=\"{namespace}\",\
              service_name=\"temporal-core-sdk\",task_queue=\"one_slot_worker_tq\",\
              worker_type=\"WorkflowWorker\"}} 2"
         )));
         assert!(body.contains(&format!(
-            "temporal_worker_task_slots_available{{namespace=\"{NAMESPACE}\",\
+            "temporal_worker_task_slots_available{{namespace=\"{namespace}\",\
              service_name=\"temporal-core-sdk\",task_queue=\"one_slot_worker_tq\",\
              worker_type=\"ActivityWorker\"}} 1"
         )));
         assert!(body.contains(&format!(
-            "temporal_worker_task_slots_available{{namespace=\"{NAMESPACE}\",\
+            "temporal_worker_task_slots_available{{namespace=\"{namespace}\",\
              service_name=\"temporal-core-sdk\",task_queue=\"one_slot_worker_tq\",\
              worker_type=\"LocalActivityWorker\"}} 1"
         )));
         assert!(body.contains(&format!(
-            "temporal_worker_task_slots_available{{namespace=\"{NAMESPACE}\",\
+            "temporal_worker_task_slots_available{{namespace=\"{namespace}\",\
              service_name=\"temporal-core-sdk\",task_queue=\"one_slot_worker_tq\",\
              worker_type=\"NexusWorker\"}} 1"
         )));
@@ -317,37 +322,37 @@ async fn one_slot_worker_reports_available_slot() {
         // At this point the workflow task is outstanding and the activities haven't started
         let body = get_text(format!("http://{addr}/metrics")).await;
         assert!(body.contains(&format!(
-            "temporal_worker_task_slots_available{{namespace=\"{NAMESPACE}\",\
+            "temporal_worker_task_slots_available{{namespace=\"{namespace}\",\
              service_name=\"temporal-core-sdk\",task_queue=\"one_slot_worker_tq\",\
              worker_type=\"WorkflowWorker\"}} 1"
         )));
         assert!(body.contains(&format!(
-            "temporal_worker_task_slots_available{{namespace=\"{NAMESPACE}\",\
+            "temporal_worker_task_slots_available{{namespace=\"{namespace}\",\
              service_name=\"temporal-core-sdk\",task_queue=\"one_slot_worker_tq\",\
              worker_type=\"ActivityWorker\"}} 1"
         )));
         assert!(body.contains(&format!(
-            "temporal_worker_task_slots_available{{namespace=\"{NAMESPACE}\",\
+            "temporal_worker_task_slots_available{{namespace=\"{namespace}\",\
              service_name=\"temporal-core-sdk\",task_queue=\"one_slot_worker_tq\",\
              worker_type=\"LocalActivityWorker\"}} 1"
         )));
         assert!(body.contains(&format!(
-            "temporal_worker_task_slots_used{{namespace=\"{NAMESPACE}\",\
+            "temporal_worker_task_slots_used{{namespace=\"{namespace}\",\
              service_name=\"temporal-core-sdk\",task_queue=\"one_slot_worker_tq\",\
              worker_type=\"WorkflowWorker\"}} 1"
         )));
         assert!(body.contains(&format!(
-            "temporal_worker_task_slots_used{{namespace=\"{NAMESPACE}\",\
+            "temporal_worker_task_slots_used{{namespace=\"{namespace}\",\
              service_name=\"temporal-core-sdk\",task_queue=\"one_slot_worker_tq\",\
              worker_type=\"ActivityWorker\"}} 0"
         )));
         assert!(body.contains(&format!(
-            "temporal_worker_task_slots_used{{namespace=\"{NAMESPACE}\",\
+            "temporal_worker_task_slots_used{{namespace=\"{namespace}\",\
              service_name=\"temporal-core-sdk\",task_queue=\"one_slot_worker_tq\",\
              worker_type=\"LocalActivityWorker\"}} 0"
         )));
         assert!(body.contains(&format!(
-            "temporal_worker_task_slots_used{{namespace=\"{NAMESPACE}\",\
+            "temporal_worker_task_slots_used{{namespace=\"{namespace}\",\
              service_name=\"temporal-core-sdk\",task_queue=\"one_slot_worker_tq\",\
              worker_type=\"NexusWorker\"}} 0"
         )));
@@ -360,17 +365,17 @@ async fn one_slot_worker_reports_available_slot() {
         tokio::time::sleep(Duration::from_millis(100)).await;
         let body = get_text(format!("http://{addr}/metrics")).await;
         assert!(body.contains(&format!(
-            "temporal_worker_task_slots_available{{namespace=\"{NAMESPACE}\",\
+            "temporal_worker_task_slots_available{{namespace=\"{namespace}\",\
              service_name=\"temporal-core-sdk\",task_queue=\"one_slot_worker_tq\",\
              worker_type=\"WorkflowWorker\"}} 2"
         )));
         assert!(body.contains(&format!(
-            "temporal_worker_task_slots_available{{namespace=\"{NAMESPACE}\",\
+            "temporal_worker_task_slots_available{{namespace=\"{namespace}\",\
              service_name=\"temporal-core-sdk\",task_queue=\"one_slot_worker_tq\",\
              worker_type=\"ActivityWorker\"}} 0"
         )));
         assert!(body.contains(&format!(
-            "temporal_worker_task_slots_used{{namespace=\"{NAMESPACE}\",\
+            "temporal_worker_task_slots_used{{namespace=\"{namespace}\",\
              service_name=\"temporal-core-sdk\",task_queue=\"one_slot_worker_tq\",\
              worker_type=\"ActivityWorker\"}} 1"
         )));
@@ -381,7 +386,7 @@ async fn one_slot_worker_reports_available_slot() {
         act_task_barr.wait().await;
         let body = get_text(format!("http://{addr}/metrics")).await;
         assert!(body.contains(&format!(
-            "temporal_worker_task_slots_available{{namespace=\"{NAMESPACE}\",\
+            "temporal_worker_task_slots_available{{namespace=\"{namespace}\",\
              service_name=\"temporal-core-sdk\",task_queue=\"one_slot_worker_tq\",\
              worker_type=\"ActivityWorker\"}} 1"
         )));
@@ -391,12 +396,12 @@ async fn one_slot_worker_reports_available_slot() {
         // Ensure that, once we have the LA task, slots are 0
         let body = get_text(format!("http://{addr}/metrics")).await;
         assert!(body.contains(&format!(
-            "temporal_worker_task_slots_available{{namespace=\"{NAMESPACE}\",\
+            "temporal_worker_task_slots_available{{namespace=\"{namespace}\",\
              service_name=\"temporal-core-sdk\",task_queue=\"one_slot_worker_tq\",\
              worker_type=\"LocalActivityWorker\"}} 0"
         )));
         assert!(body.contains(&format!(
-            "temporal_worker_task_slots_used{{namespace=\"{NAMESPACE}\",\
+            "temporal_worker_task_slots_used{{namespace=\"{namespace}\",\
              service_name=\"temporal-core-sdk\",task_queue=\"one_slot_worker_tq\",\
              worker_type=\"LocalActivityWorker\"}} 1"
         )));
@@ -405,7 +410,7 @@ async fn one_slot_worker_reports_available_slot() {
         act_task_barr.wait().await;
         let body = get_text(format!("http://{addr}/metrics")).await;
         assert!(body.contains(&format!(
-            "temporal_worker_task_slots_available{{namespace=\"{NAMESPACE}\",\
+            "temporal_worker_task_slots_available{{namespace=\"{namespace}\",\
              service_name=\"temporal-core-sdk\",task_queue=\"one_slot_worker_tq\",\
              worker_type=\"LocalActivityWorker\"}} 1"
         )));
@@ -721,6 +726,10 @@ async fn query_of_closed_workflow_doesnt_tick_terminal_metric(
     assert!(matching_line.ends_with('1'));
 }
 
+#[temporalio_macros::cloud_test_exclusion(
+    RequiresCloudProvisioning,
+    "Uses the cluster-wide ListNamespaces RPC to produce runtime metrics."
+)]
 #[test]
 fn runtime_new() {
     let mut rt = CoreRuntime::new(
@@ -854,6 +863,10 @@ async fn latency_metrics(
     );
 }
 
+#[temporalio_macros::cloud_test_exclusion(
+    NeedsCloudAdaptation,
+    "Cloud authorizes the malformed request before validation, so it does not return the expected InvalidArgument status."
+)]
 #[tokio::test]
 async fn request_fail_codes() {
     let (telemopts, addr, _aborter) = prom_metrics(None);
@@ -921,6 +934,10 @@ async fn request_fail_codes_otel() {
 
 // Tests that rely on Prometheus running in a docker container need to start
 // with `docker_` and set the `DOCKER_PROMETHEUS_RUNNING` env variable to run
+#[temporalio_macros::cloud_test_exclusion(
+    RequiresCloudProvisioning,
+    "Uses the cluster-wide ListNamespaces RPC in addition to Docker telemetry services."
+)]
 #[rstest::rstest]
 #[tokio::test]
 async fn docker_metrics_with_prometheus(
@@ -1014,6 +1031,7 @@ async fn docker_metrics_with_prometheus(
 
 #[tokio::test]
 async fn activity_metrics() {
+    let namespace = integ_namespace();
     let (telemopts, addr, _aborter) = prom_metrics(None);
     let rt = CoreRuntime::new_assume_tokio(get_integ_runtime_options(telemopts)).unwrap();
     let wf_name = "activity_metrics";
@@ -1139,64 +1157,68 @@ async fn activity_metrics() {
     assert!(body.contains(&format!(
         "temporal_activity_execution_failed{{activity_type=\"pass_fail_act\",\
              failure_reason=\"ActivityError\",\
-             namespace=\"{NAMESPACE}\",service_name=\"temporal-core-sdk\",\
+             namespace=\"{namespace}\",service_name=\"temporal-core-sdk\",\
              task_queue=\"{task_queue}\",workflow_type=\"{wf_type}\"}} 1"
     )));
     assert!(body.contains(&format!(
         "temporal_activity_schedule_to_start_latency_count{{\
-             namespace=\"{NAMESPACE}\",service_name=\"temporal-core-sdk\",\
+             namespace=\"{namespace}\",service_name=\"temporal-core-sdk\",\
              task_queue=\"{task_queue}\"}} 2"
     )));
     assert!(body.contains(&format!(
         "temporal_activity_execution_latency_count{{activity_type=\"pass_fail_act\",\
-             namespace=\"{NAMESPACE}\",service_name=\"temporal-core-sdk\",\
+             namespace=\"{namespace}\",service_name=\"temporal-core-sdk\",\
              task_queue=\"{task_queue}\",workflow_type=\"{wf_type}\"}} 2"
     )));
     assert!(body.contains(&format!(
         "temporal_activity_succeed_endtoend_latency_count{{activity_type=\"pass_fail_act\",\
-             namespace=\"{NAMESPACE}\",service_name=\"temporal-core-sdk\",\
+             namespace=\"{namespace}\",service_name=\"temporal-core-sdk\",\
              task_queue=\"{task_queue}\",workflow_type=\"{wf_type}\"}} 1"
     )));
 
     assert!(body.contains(&format!(
-        "temporal_local_activity_total{{activity_type=\"pass_fail_act\",namespace=\"{NAMESPACE}\",\
+        "temporal_local_activity_total{{activity_type=\"pass_fail_act\",namespace=\"{namespace}\",\
              service_name=\"temporal-core-sdk\",task_queue=\"{task_queue}\",\
              workflow_type=\"{wf_type}\"}} 4"
     )));
     assert!(body.contains(&format!(
         "temporal_local_activity_execution_failed{{activity_type=\"pass_fail_act\",\
              failure_reason=\"ActivityError\",\
-             namespace=\"{NAMESPACE}\",service_name=\"temporal-core-sdk\",\
+             namespace=\"{namespace}\",service_name=\"temporal-core-sdk\",\
              task_queue=\"{task_queue}\",\
              workflow_type=\"{wf_type}\"}} 1"
     )));
     assert!(body.contains(&format!(
         "temporal_local_activity_execution_failed{{activity_type=\"pass_fail_act\",\
              failure_reason=\"timeout\",\
-             namespace=\"{NAMESPACE}\",service_name=\"temporal-core-sdk\",\
+             namespace=\"{namespace}\",service_name=\"temporal-core-sdk\",\
              task_queue=\"{task_queue}\",\
              workflow_type=\"{wf_type}\"}} 1"
     )));
     assert!(body.contains(&format!(
         "temporal_local_activity_execution_cancelled{{activity_type=\"pass_fail_act\",\
-             namespace=\"{NAMESPACE}\",service_name=\"temporal-core-sdk\",\
+             namespace=\"{namespace}\",service_name=\"temporal-core-sdk\",\
              task_queue=\"{task_queue}\",\
              workflow_type=\"{wf_type}\"}} 1"
     )));
     assert!(body.contains(&format!(
         "temporal_local_activity_execution_latency_count{{activity_type=\"pass_fail_act\",\
-             namespace=\"{NAMESPACE}\",service_name=\"temporal-core-sdk\",\
+             namespace=\"{namespace}\",service_name=\"temporal-core-sdk\",\
              task_queue=\"{task_queue}\",\
              workflow_type=\"{wf_type}\"}} 4"
     )));
     assert!(body.contains(&format!(
         "temporal_local_activity_succeed_endtoend_latency_count{{activity_type=\"pass_fail_act\",\
-             namespace=\"{NAMESPACE}\",service_name=\"temporal-core-sdk\",\
+             namespace=\"{namespace}\",service_name=\"temporal-core-sdk\",\
              task_queue=\"{task_queue}\",\
              workflow_type=\"{wf_type}\"}} 1"
     )));
 }
 
+#[temporalio_macros::cloud_test_exclusion(
+    RequiresCloudProvisioning,
+    "Creates a Nexus endpoint through an admin API unavailable to the isolated Cloud credential."
+)]
 #[tokio::test]
 async fn nexus_metrics() {
     let (telemopts, addr, _aborter) = prom_metrics(None);
@@ -1664,6 +1686,7 @@ async fn sticky_queue_label_strategy(
     )]
     strategy: TaskQueueLabelStrategy,
 ) {
+    let namespace = integ_namespace();
     let (mut telemopts, addr, _aborter) = prom_metrics(Some(
         PrometheusExporterOptions::builder()
             .socket_addr(ANY_PORT.parse().unwrap())
@@ -1717,7 +1740,7 @@ async fn sticky_queue_label_strategy(
         .filter(|l| {
             l.contains("temporal_long_request")
                 && l.contains("operation=\"PollWorkflowTaskQueue\"")
-                && l.contains(&format!("namespace=\"{NAMESPACE}\""))
+                && l.contains(&format!("namespace=\"{namespace}\""))
         })
         .collect();
 
@@ -1821,6 +1844,10 @@ async fn resource_based_tuner_metrics() {
     );
 }
 
+#[temporalio_macros::cloud_test_exclusion(
+    DoesNotUseServer,
+    "Uses mocked workflow poll responses and queries only a local Prometheus endpoint."
+)]
 #[tokio::test]
 async fn terminal_metric_not_recorded_on_rejected_completion() {
     let prom_info = start_prometheus_metric_exporter(
@@ -1904,6 +1931,10 @@ async fn terminal_metric_not_recorded_on_rejected_completion() {
     }
 }
 
+#[temporalio_macros::cloud_test_exclusion(
+    DoesNotUseServer,
+    "Uses mocked workflow poll failures and queries only a local Prometheus endpoint."
+)]
 #[tokio::test]
 async fn wf_task_latency_recorded_on_dropped_wft() {
     let (telemopts, addr, _aborter) = prom_metrics(None);
@@ -1978,6 +2009,10 @@ async fn wf_task_latency_recorded_on_dropped_wft() {
     .unwrap();
 }
 
+#[temporalio_macros::cloud_test_exclusion(
+    DoesNotUseServer,
+    "Uses mocked workflow task failures and queries only a local Prometheus endpoint."
+)]
 #[tokio::test]
 async fn wf_task_execution_failed_metric_includes_workflow_type() {
     let (telemopts, addr, _aborter) = prom_metrics(None);
@@ -2052,6 +2087,10 @@ async fn wf_task_execution_failed_metric_includes_workflow_type() {
     );
 }
 
+#[temporalio_macros::cloud_test_exclusion(
+    DoesNotUseServer,
+    "Uses mocked oversized workflow-task responses and only local metrics collection."
+)]
 #[tokio::test]
 async fn grpc_message_too_large_wf_task_execution_failed_metric_includes_workflow_type() {
     let (telemopts, addr, _aborter) = prom_metrics(None);
@@ -2137,6 +2176,10 @@ async fn grpc_message_too_large_wf_task_execution_failed_metric_includes_workflo
 
 /// A cause reported by lang must survive to the metric as its own `failure_reason`, rather than
 /// being flattened into the catch-all activity reason.
+#[temporalio_macros::cloud_test_exclusion(
+    DoesNotUseServer,
+    "Uses a mocked activity client and synthetic task; only local metrics are collected."
+)]
 #[tokio::test]
 async fn lang_reported_activity_failure_cause_reaches_metric() {
     let (telemopts, addr, _aborter) = prom_metrics(None);
@@ -2208,6 +2251,10 @@ async fn lang_reported_activity_failure_cause_reaches_metric() {
 
 /// A payload-limit violation detected while reporting an activity result is core's own doing, so it
 /// must reach the metric as its own reason rather than the generic activity one.
+#[temporalio_macros::cloud_test_exclusion(
+    DoesNotUseServer,
+    "Uses a mocked activity client and synthetic task; only local metrics are collected."
+)]
 #[tokio::test]
 async fn payloads_too_large_activity_failure_reaches_metric() {
     let (telemopts, addr, _aborter) = prom_metrics(None);

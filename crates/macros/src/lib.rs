@@ -3,6 +3,7 @@ use proc_macro2::TokenStream as TokenStream2;
 use syn::{parse::Parser, parse_macro_input};
 
 mod activities_definitions;
+mod cloud_test_exclusion;
 mod fsm_impl;
 mod macro_utils;
 mod workflow_definitions;
@@ -33,6 +34,19 @@ pub fn activity(_attr: TokenStream, item: TokenStream) -> TokenStream {
 pub fn activity_definitions(_attr: TokenStream, item: TokenStream) -> TokenStream {
     let def = parse_macro_input!(item with activities_definitions::parse_definitions);
     def.codegen()
+}
+
+/// Marks an SDK integration-test function that should not run against Temporal Cloud.
+///
+/// The second argument records why the exclusion is needed:
+/// `#[cloud_test_exclusion(NeedsCloudAdaptation, "Requires custom setup.")]`.
+#[doc(hidden)]
+#[proc_macro_attribute]
+pub fn cloud_test_exclusion(attr: TokenStream, item: TokenStream) -> TokenStream {
+    match cloud_test_exclusion::expand(attr.into(), item.into()) {
+        Ok(output) => output.into(),
+        Err(error) => error.into_compile_error().into(),
+    }
 }
 
 /// Marks a struct as a workflow definition.

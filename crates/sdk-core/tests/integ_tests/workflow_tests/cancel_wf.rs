@@ -466,6 +466,10 @@ impl WfWithTimer {
     }
 }
 
+#[temporalio_macros::cloud_test_exclusion(
+    DoesNotUseServer,
+    "Uses MockPollCfg and a fake SDK worker with synthetic history; no Temporal server is contacted."
+)]
 #[tokio::test]
 async fn wf_completing_with_cancelled() {
     let t = canned_histories::timer_wf_cancel_req_cancelled("1");

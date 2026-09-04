@@ -1,4 +1,4 @@
-use crate::common::{CoreWfStarter, NAMESPACE, eventually, get_integ_client};
+use crate::common::{CoreWfStarter, NAMESPACE, eventually, get_integ_client, integ_namespace};
 use assert_matches::assert_matches;
 use std::{sync::Arc, time::Duration};
 use temporalio_client::{NamespacedClient, RegisterNamespaceOptions, grpc::WorkflowService};
@@ -17,6 +17,10 @@ use temporalio_sdk_core::test_help::{WorkerTestHelpers, drain_pollers_and_shutdo
 use tokio::time::sleep;
 use tonic::IntoRequest;
 
+#[temporalio_macros::cloud_test_exclusion(
+    NeedsCloudAdaptation,
+    "Cloud visibility indexing can exceed the test's fixed 500 ms retry window."
+)]
 #[tokio::test]
 async fn client_list_open_closed_workflow_executions() {
     let wf_name = "client_list_open_closed_workflow_executions".to_owned();
@@ -128,6 +132,10 @@ async fn client_list_open_closed_workflow_executions() {
     assert!(passed);
 }
 
+#[temporalio_macros::cloud_test_exclusion(
+    RequiresCloudProvisioning,
+    "Registers a namespace through an administrative RPC unavailable to isolated Cloud credentials."
+)]
 #[tokio::test]
 async fn client_create_namespace() {
     let client = Arc::new(get_integ_client(NAMESPACE.to_string(), None).await);
@@ -177,12 +185,13 @@ async fn client_create_namespace() {
 
 #[tokio::test]
 async fn client_describe_namespace() {
-    let client = Arc::new(get_integ_client(NAMESPACE.to_string(), None).await);
+    let client = Arc::new(get_integ_client(integ_namespace(), None).await);
+    let namespace = client.namespace();
 
     let namespace_result = WorkflowService::describe_namespace(
         &mut client.as_ref().clone(),
         DescribeNamespaceRequest {
-            namespace: NAMESPACE.to_owned(),
+            namespace: namespace.clone(),
             ..Default::default()
         }
         .into_request(),
@@ -190,5 +199,5 @@ async fn client_describe_namespace() {
     .await
     .unwrap()
     .into_inner();
-    assert_eq!(namespace_result.namespace_info.unwrap().name, NAMESPACE);
+    assert_eq!(namespace_result.namespace_info.unwrap().name, namespace);
 }

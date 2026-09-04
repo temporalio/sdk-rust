@@ -59,6 +59,10 @@ impl CompleteOnSecondPollWf {
 /// The error message from core when this happens is:
 /// "Workflow completion had a legacy query response along with other commands.
 /// This is not allowed and constitutes an error in the lang SDK."
+#[temporalio_macros::cloud_test_exclusion(
+    DoesNotUseServer,
+    "Uses MockPollCfg with synthetic query tasks; no Temporal server is contacted."
+)]
 #[tokio::test]
 async fn query_only_activation_should_not_advance_workflow() {
     let mut t = TestHistoryBuilder::default();
@@ -119,6 +123,10 @@ async fn query_only_activation_should_not_advance_workflow() {
 }
 
 /// Test that a query for a non-existent handler doesn't advance the workflow either.
+#[temporalio_macros::cloud_test_exclusion(
+    DoesNotUseServer,
+    "Uses MockPollCfg with synthetic query tasks; no Temporal server is contacted."
+)]
 #[tokio::test]
 async fn nonexistent_query_should_not_advance_workflow() {
     let mut t = TestHistoryBuilder::default();
@@ -211,6 +219,10 @@ impl CounterWf {
 /// Non-legacy queries (in the `queries` field) come bundled with new history.
 /// Core sends these queries in their own activation after the workflow has processed
 /// the history, so queries should observe state AFTER the workflow has advanced.
+#[temporalio_macros::cloud_test_exclusion(
+    DoesNotUseServer,
+    "Uses MockPollCfg with synthetic query tasks; no Temporal server is contacted."
+)]
 #[tokio::test]
 async fn non_legacy_query_should_see_state_after_workflow_advances() {
     let wfid = "non_legacy_query_state_test";
@@ -352,6 +364,10 @@ impl ContextViewWf {
 }
 
 /// Test that WorkflowContextView contains the correct workflow information.
+#[temporalio_macros::cloud_test_exclusion(
+    DoesNotUseServer,
+    "Uses MockPollCfg with synthetic query tasks; no Temporal server is contacted."
+)]
 #[tokio::test]
 async fn query_returns_workflow_context_view_info() {
     const WFID: &str = "context_view_test_wf";
@@ -440,6 +456,10 @@ impl CurrentDetailsWf {
 
 /// Verify that the query returns a proto-JSON-encoded `WorkflowMetadata`
 /// whose `current_details` field reflects the value set by `set_current_details`.
+#[temporalio_macros::cloud_test_exclusion(
+    DoesNotUseServer,
+    "Uses MockPollCfg with synthetic query tasks; no Temporal server is contacted."
+)]
 #[tokio::test]
 async fn workflow_metadata_query_returns_current_details() {
     let wfid = "workflow_metadata_query_test";
@@ -533,6 +553,10 @@ impl NoCurrentDetailsWf {
 
 /// Verify that the query returns `{}` when `set_current_details` was never
 /// called, matching proto3 JSON behavior where default (empty) fields are omitted.
+#[temporalio_macros::cloud_test_exclusion(
+    DoesNotUseServer,
+    "Uses MockPollCfg with synthetic query tasks; no Temporal server is contacted."
+)]
 #[tokio::test]
 async fn workflow_metadata_query_empty_details() {
     let wfid = "workflow_metadata_query_empty_test";

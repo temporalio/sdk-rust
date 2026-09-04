@@ -74,6 +74,10 @@ fn fire_happy_hist(num_timers: u32) -> Worker {
     )
 }
 
+#[temporalio_macros::cloud_test_exclusion(
+    DoesNotUseServer,
+    "Uses fake-worker fixtures over supplied histories; no Temporal server is contacted."
+)]
 #[rstest]
 #[case::one_timer(fire_happy_hist(1), 1)]
 #[case::five_timers(fire_happy_hist(5), 5)]
@@ -85,6 +89,10 @@ async fn replay_flag_is_correct(#[case] mut worker: Worker, #[case] _num_timers:
     worker.run().await.unwrap();
 }
 
+#[temporalio_macros::cloud_test_exclusion(
+    DoesNotUseServer,
+    "Replays supplied workflow history in process; no Temporal server is contacted."
+)]
 #[tokio::test(flavor = "multi_thread")]
 async fn replay_flag_is_correct_partial_history() {
     let mut t = canned_histories::long_sequential_timers(2);
@@ -101,6 +109,10 @@ async fn replay_flag_is_correct_partial_history() {
     worker.run().await.unwrap();
 }
 
+#[temporalio_macros::cloud_test_exclusion(
+    DoesNotUseServer,
+    "Replays supplied workflow history in process; no Temporal server is contacted."
+)]
 #[tokio::test]
 async fn timer_workflow_replay() {
     let core = init_core_replay_preloaded(
@@ -158,6 +170,10 @@ async fn timer_workflow_replay() {
     core.shutdown().await;
 }
 
+#[temporalio_macros::cloud_test_exclusion(
+    DoesNotUseServer,
+    "Replays supplied workflow history in process; no Temporal server is contacted."
+)]
 #[tokio::test]
 async fn workflow_nondeterministic_replay() {
     let core = init_core_replay_preloaded(
@@ -198,6 +214,10 @@ async fn workflow_nondeterministic_replay() {
     );
 }
 
+#[temporalio_macros::cloud_test_exclusion(
+    DoesNotUseServer,
+    "Replays supplied workflow history in process; no Temporal server is contacted."
+)]
 #[tokio::test]
 async fn replay_using_wf_function() {
     let num_timers = 10u32;
@@ -210,6 +230,10 @@ async fn replay_using_wf_function() {
     worker.run().await.unwrap();
 }
 
+#[temporalio_macros::cloud_test_exclusion(
+    DoesNotUseServer,
+    "Replays supplied workflow history in process; no Temporal server is contacted."
+)]
 #[tokio::test]
 async fn replay_ending_wft_complete_with_commands_but_no_scheduled_started() {
     let mut t = TestHistoryBuilder::default();
@@ -237,12 +261,20 @@ async fn replay_abrupt_ending(mut t: TestHistoryBuilder) {
         });
     worker.run().await.unwrap();
 }
+#[temporalio_macros::cloud_test_exclusion(
+    DoesNotUseServer,
+    "Replays supplied workflow history in process; no Temporal server is contacted."
+)]
 #[tokio::test]
 async fn replay_ok_ending_with_terminated() {
     let mut t1 = canned_histories::single_timer("1");
     t1.add_workflow_execution_terminated();
     replay_abrupt_ending(t1).await;
 }
+#[temporalio_macros::cloud_test_exclusion(
+    DoesNotUseServer,
+    "Replays supplied workflow history in process; no Temporal server is contacted."
+)]
 #[tokio::test]
 async fn replay_ok_ending_with_timed_out() {
     let mut t2 = canned_histories::single_timer("1");
@@ -250,6 +282,10 @@ async fn replay_ok_ending_with_timed_out() {
     replay_abrupt_ending(t2).await;
 }
 
+#[temporalio_macros::cloud_test_exclusion(
+    DoesNotUseServer,
+    "Replays supplied workflow history in process; no Temporal server is contacted."
+)]
 #[tokio::test]
 async fn replay_shutdown_worker() {
     let mut t = canned_histories::single_timer("1");
@@ -311,6 +347,10 @@ impl SeqTimerWf {
     }
 }
 
+#[temporalio_macros::cloud_test_exclusion(
+    DoesNotUseServer,
+    "Replays supplied workflow history in process; no Temporal server is contacted."
+)]
 #[rstest::rstest]
 #[tokio::test]
 async fn multiple_histories_replay(#[values(false, true)] use_feeder: bool) {
@@ -366,6 +406,10 @@ async fn multiple_histories_replay(#[values(false, true)] use_feeder: bool) {
     assert_eq!(runs_ctr.lock().len(), 2);
 }
 
+#[temporalio_macros::cloud_test_exclusion(
+    DoesNotUseServer,
+    "Replays supplied workflow history in process; no Temporal server is contacted."
+)]
 #[tokio::test]
 async fn multiple_histories_can_handle_dupe_run_ids() {
     let mut hist1 = canned_histories::single_timer("1");
@@ -385,6 +429,10 @@ async fn multiple_histories_can_handle_dupe_run_ids() {
 }
 
 // Verifies SDK can decode patch markers before changing them to use json encoding.
+#[temporalio_macros::cloud_test_exclusion(
+    DoesNotUseServer,
+    "Replays supplied workflow history in process; no Temporal server is contacted."
+)]
 #[tokio::test]
 async fn replay_old_patch_format() {
     let mut worker = crate::common::replay_sdk_worker_with_options(
@@ -401,6 +449,10 @@ async fn replay_old_patch_format() {
     worker.run().await.unwrap();
 }
 
+#[temporalio_macros::cloud_test_exclusion(
+    DoesNotUseServer,
+    "Replays supplied workflow history in process; no Temporal server is contacted."
+)]
 #[tokio::test]
 async fn replay_ends_with_empty_wft() {
     let core = init_core_replay_preloaded(
