@@ -37,6 +37,7 @@ envconfig = ["dep:toml", "dep:dirs"]
 serde_serialize = ["temporalio-common-wasm/serde_serialize", "temporalio-protos/serde_serialize"]
 core-telemetry-bridge = ["dep:ringbuf", "dep:futures-channel"]
 core-based-sdk = ["core-telemetry-bridge", "prometheus", "envconfig"]
+vendored-protox = ["temporalio-protos/vendored-protox"]
 
 [dependencies]
 anyhow = "1.0"

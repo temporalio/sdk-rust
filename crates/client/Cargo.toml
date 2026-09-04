@@ -24,6 +24,7 @@ telemetry = ["dep:opentelemetry"]
 core-based-sdk = []
 envconfig = ["temporalio-common/envconfig"]
 dynamic-tls = ["dep:rustls-native-certs"]
+vendored-protox = ["temporalio-common/vendored-protox"]
 
 [dependencies]
 anyhow = "1.0"

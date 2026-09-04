@@ -167,6 +167,11 @@ while let Some(result) = stream.next().await {
 APIs that are still under development require the `experimental` Cargo feature and may change or
 be removed before stabilization.
 
+## Building Without `protoc`
+
+Enable the `vendored-protox` Cargo feature to compile protobuf definitions with `protox`
+instead of a system `protoc` binary.
+
 ## Raw gRPC Access
 
 For operations not covered by the high-level API, access the underlying gRPC service clients

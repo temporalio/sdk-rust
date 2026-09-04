@@ -32,6 +32,11 @@ jobs:
       - run: cargo test-lint
       - run: cargo check
       - run: cargo check --features experimental
+      - name: Check vendored proto compilation
+        run: cargo check --features temporalio-client/vendored-protox
+        env:
+          PROTOC: /does/not/exist
+          CARGO_TARGET_DIR: /tmp/vendored-protox-target
       - run: git diff --exit-code
 
   test:

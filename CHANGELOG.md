@@ -38,6 +38,8 @@ relevant information.
   `temporalio-sdk`, and Rust 1.88 for the other crates.
 
 ### Added
+* `temporalio-client` now provides a `vendored-protox` feature for compiling protobuf definitions
+  with `protox`, allowing client and Rust SDK builds without an installed `protoc`.
 * `CancelExternalWorkflowError` and `workflow_interceptors::CancelExternalWorkflowResult`
   for use in interceptors.
 * `WorkflowContextKey` and context-value scopes provide replay-safe, workflow-run-owned context

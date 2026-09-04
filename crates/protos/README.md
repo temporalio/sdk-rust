@@ -9,3 +9,6 @@ Compiled protobuf definitions for Temporal APIs and SDK Core protocols.
 
 Most Rust SDK users should use [`temporalio-client`](https://crates.io/crates/temporalio-client) or
 [`temporalio-sdk`](https://crates.io/crates/temporalio-sdk) instead.
+
+Enable the `vendored-protox` feature to compile the protobuf definitions with the pure-Rust
+`protox` implementation instead of requiring an installed `protoc` binary.
