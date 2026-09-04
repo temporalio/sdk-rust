@@ -14,7 +14,7 @@ readme = "README.md"
 autoexamples = false
 
 [package.metadata.docs.rs]
-features = ["experimental"]
+features = ["experimental", "opentelemetry"]
 
 [dependencies]
 async-trait = "0.1"
@@ -25,6 +25,8 @@ futures-util = { version = "0.3", default-features = false, features = [
   "async-await-macro",
 ] }
 gethostname = "1.0.2"
+opentelemetry = { workspace = true, features = ["trace"], optional = true }
+opentelemetry_sdk = { version = "0.32", default-features = false, features = ["trace"], optional = true }
 parking_lot = { version = "0.12" }
 prost = { workspace = true }
 prost-types = { workspace = true }
@@ -70,6 +72,7 @@ version = "~1.0.0"
 
 [dev-dependencies]
 futures = "0.3"
+opentelemetry_sdk = { version = "0.32", features = ["testing"] }
 rstest = "0.26"
 
 [features]
@@ -78,6 +81,7 @@ envconfig = ["temporalio-sdk-core/envconfig"]
 experimental = ["temporalio-client/experimental", "temporalio-workflow/experimental"]
 prometheus = ["temporalio-sdk-core/prometheus"]
 otel = ["temporalio-sdk-core/otel"]
+opentelemetry = ["experimental", "dep:opentelemetry", "dep:opentelemetry_sdk"]
 examples = ["serde/derive", "dep:serde_json", "envconfig"]
 wasm-examples = []
 wasm-workflows = ["dep:wasmtime"]

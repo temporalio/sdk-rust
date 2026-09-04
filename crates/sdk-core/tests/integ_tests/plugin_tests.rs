@@ -1,8 +1,15 @@
 use crate::common::{get_integ_server_options, get_integ_telem_options, integ_namespace};
 use futures_util::future::BoxFuture;
+use opentelemetry::{
+    Context,
+    trace::{FutureExt as _, TraceContextExt, Tracer, TracerProvider as _},
+};
+use opentelemetry_sdk::trace::{
+    InMemorySpanExporter, SdkTracer, SdkTracerProvider, SimpleSpanProcessor,
+};
 use std::{
     sync::{
-        Arc,
+        Arc, OnceLock,
         atomic::{
             AtomicU8, AtomicUsize,
             Ordering::{self, Relaxed},
@@ -30,7 +37,9 @@ use temporalio_sdk::{
     WorkerPlugin, WorkflowContext, WorkflowDefinitions, WorkflowResult,
     activities::{ActivityContext, ActivityDefinitions, ActivityError},
     interceptors::WorkerInterceptor,
+    opentelemetry::{OpenTelemetryPlugin, WorkflowIdGenerator, WorkflowSpanProcessor},
     runtime::RuntimeOptions,
+    workflow_replayer::{WorkflowReplayer, WorkflowReplayerOptions},
 };
 use url::Url;
 use uuid::Uuid;
@@ -186,11 +195,44 @@ struct SimplePluginWorkflow;
 
 struct SimplePluginActivities;
 
+static WORKFLOW_OTEL_TRACER: OnceLock<SdkTracer> = OnceLock::new();
+
 #[activities]
 impl SimplePluginActivities {
     #[activity]
     async fn greet(_ctx: ActivityContext, name: String) -> Result<String, ActivityError> {
         Ok(format!("Hello, {name}!"))
+    }
+}
+
+#[workflow]
+#[derive(Default)]
+struct OpenTelemetryPluginWorkflow;
+
+#[workflow_methods]
+impl OpenTelemetryPluginWorkflow {
+    #[run]
+    async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<String> {
+        let tracer = WORKFLOW_OTEL_TRACER
+            .get()
+            .expect("The test must initialize the Workflow tracer.");
+        let parent = Context::current();
+        let span_context = parent.with_span(tracer.start_with_context("ApplicationSpan", &parent));
+        let activity_ctx = ctx.clone();
+        let result = async move {
+            activity_ctx
+                .execute_activity(
+                    SimplePluginActivities::greet,
+                    "Temporal".to_owned(),
+                    ActivityOptions::start_to_close_timeout(Duration::from_secs(5)),
+                )
+                .await
+                .map_err(Into::into)
+        }
+        .with_context(span_context.clone())
+        .await;
+        span_context.span().end();
+        result
     }
 }
 
@@ -277,6 +319,91 @@ async fn simple_plugin_configures_working_client_and_worker() {
     assert!(worker_interceptor_calls.load(Ordering::Relaxed) > 0);
     assert!(encode_calls.load(Ordering::Relaxed) > 0);
     assert!(decode_calls.load(Ordering::Relaxed) > 0);
+}
+
+#[tokio::test]
+async fn opentelemetry_plugin_parents_activity_to_application_workflow_span() {
+    let exporter = InMemorySpanExporter::default();
+    let provider = SdkTracerProvider::builder()
+        .with_id_generator(WorkflowIdGenerator::default())
+        .with_span_processor(WorkflowSpanProcessor::new(SimpleSpanProcessor::new(
+            exporter.clone(),
+        )))
+        .build();
+    let tracer = provider.tracer("integration-test");
+    WORKFLOW_OTEL_TRACER
+        .set(tracer.clone())
+        .expect("The test must initialize the Workflow tracer only once.");
+    let plugin = OpenTelemetryPlugin::new().with_tracer(tracer);
+    let client = Client::connect(
+        get_integ_server_options(),
+        ClientOptions::new(integ_namespace())
+            .plugin(plugin.clone())
+            .build(),
+    )
+    .await
+    .unwrap();
+    let runtime = new_sdk_runtime();
+    let task_queue = format!("opentelemetry-plugin-{}", Uuid::new_v4());
+    let worker_options = WorkerOptions::new(task_queue.clone())
+        .register_activities(SimplePluginActivities)
+        .register_workflow::<OpenTelemetryPluginWorkflow>()
+        .unwrap()
+        .build();
+    let mut worker = Worker::new(&runtime, client.clone(), worker_options).unwrap();
+    let handle = client
+        .start_workflow(
+            OpenTelemetryPluginWorkflow::run,
+            (),
+            WorkflowStartOptions::new(
+                task_queue,
+                format!("opentelemetry-plugin-{}", Uuid::new_v4()),
+            )
+            .build(),
+        )
+        .await
+        .unwrap();
+
+    let shutdown = worker.shutdown_handle();
+    let (workflow_result, worker_result) = tokio::join!(
+        async {
+            let result = handle.get_result(Default::default()).await;
+            shutdown();
+            result
+        },
+        worker.run(),
+    );
+    worker_result.unwrap();
+    assert_eq!(workflow_result.unwrap(), "Hello, Temporal!");
+
+    let live_spans = exporter.get_finished_spans().unwrap();
+    let application = live_spans
+        .iter()
+        .find(|span| span.name == "ApplicationSpan")
+        .unwrap();
+    let activity_start = live_spans
+        .iter()
+        .find(|span| span.name.starts_with("StartActivity:"))
+        .unwrap();
+    assert_eq!(
+        activity_start.parent_span_id,
+        application.span_context.span_id()
+    );
+
+    let history = handle.fetch_history(Default::default());
+    let replayer = WorkflowReplayer::new(
+        WorkflowReplayerOptions::new()
+            .worker_plugin(plugin)
+            .register_workflow::<OpenTelemetryPluginWorkflow>()
+            .unwrap()
+            .build(),
+    )
+    .unwrap();
+    replayer.replay_workflow(history).await.unwrap();
+    assert_eq!(
+        exporter.get_finished_spans().unwrap().len(),
+        live_spans.len()
+    );
 }
 
 #[tokio::test]
