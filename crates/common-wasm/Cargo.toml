@@ -2,6 +2,7 @@
 name = "temporalio-common-wasm"
 version = "0.8.0"
 edition = "2024"
+rust-version = "1.88.0"
 authors = ["Temporal Technologies Inc. <sdk@temporal.io>"]
 license-file = { workspace = true }
 description = "WASM-safe shared functionality for the Temporal Rust workflow surface"

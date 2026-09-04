@@ -91,17 +91,29 @@ jobs:
           path: machine_coverage/
 
   msrv:
-    name: "Verify MSRV"
-    timeout-minutes: ${{ github.ref == 'refs/heads/main' && 15 || 10 }}
+    name: "Verify MSRV (${{ matrix.group }})"
+    timeout-minutes: ${{ github.ref == 'refs/heads/main' && 20 || 15 }}
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - group: rust-1.88
+            crates: client common common-wasm macros protos sdk-core workflow
+          - group: rust-1.92
+            crates: sdk
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - uses: ./.github/actions/setup
         with:
           mise-install-args: protoc cargo:cargo-msrv
-          rust-cache-key: msrv
-      - run: cargo msrv verify
-        working-directory: ./crates/sdk-core
+          rust-cache-key: msrv-${{ matrix.group }}
+      - name: Verify crate MSRVs
+        run: |
+          read -ra crates <<< "${{ matrix.crates }}"
+          for crate in "${crates[@]}"; do
+            cargo msrv verify --all-features --path "crates/$crate"
+          done
 
   cgroup-tests:
     name: cgroup tests

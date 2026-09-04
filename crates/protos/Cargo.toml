@@ -2,6 +2,7 @@
 name = "temporalio-protos"
 version = "0.8.0"
 edition = "2024"
+rust-version = "1.88.0"
 authors = ["Temporal Technologies Inc. <sdk@temporal.io>"]
 license-file = { workspace = true }
 description = "Compiled protobuf definitions for the Temporal Rust SDK"
