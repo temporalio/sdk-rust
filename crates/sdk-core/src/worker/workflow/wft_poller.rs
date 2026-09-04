@@ -116,12 +116,16 @@ impl WFTPollerShared {
             max_slots,
         }
     }
-    pub(crate) fn set_sticky_active(&self, rx: watch::Receiver<usize>, target: Arc<AtomicUsize>) {
-        let _ = self.sticky_active.set(rx);
+    pub(crate) fn set_sticky_active(
+        &self,
+        active_rx: watch::Receiver<usize>,
+        target: Arc<AtomicUsize>,
+    ) {
+        let _ = self.sticky_active.set(active_rx);
         let _ = self.sticky_target.set(target);
     }
-    pub(crate) fn set_non_sticky_active(&self, rx: watch::Receiver<usize>) {
-        let _ = self.non_sticky_active.set(rx);
+    pub(crate) fn set_non_sticky_active(&self, active_rx: watch::Receiver<usize>) {
+        let _ = self.non_sticky_active.set(active_rx);
     }
     /// Makes either the sticky or non-sticky poller wait pre-permit-acquisition so that we can
     /// balance which kind of queue we poll appropriately.
@@ -142,7 +146,7 @@ impl WFTPollerShared {
                 let num_sticky_active = *sticky_active.borrow_and_update();
                 let num_non_sticky_active = *non_sticky_active.borrow_and_update();
                 let num_sticky_backlog = *sticky_backlog.borrow_and_update();
-                let sticky_needs_capacity = num_sticky_backlog > 1
+                let sticky_should_be_chosen = num_sticky_backlog > 1
                     && num_sticky_backlog > num_sticky_active
                     && num_sticky_active < sticky_target.load(Ordering::Relaxed);
 
@@ -159,7 +163,7 @@ impl WFTPollerShared {
                         }
 
                         // If there's a meaningful sticky backlog, prioritize sticky.
-                        if sticky_needs_capacity {
+                        if sticky_should_be_chosen {
                             return false;
                         }
                     } else {
@@ -174,7 +178,7 @@ impl WFTPollerShared {
                         }
 
                         // If there's a meaningful sticky backlog, prioritize sticky.
-                        if sticky_needs_capacity {
+                        if sticky_should_be_chosen {
                             return true;
                         }
                     }
