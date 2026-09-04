@@ -161,11 +161,14 @@ hyper-util = { version = "0.1", features = [
   "http2",
   "tokio",
 ] }
+opentelemetry = { workspace = true, features = ["trace"] }
+opentelemetry_sdk = { version = "0.32", features = ["testing", "trace"] }
 rstest = "0.26"
 semver = "1.0"
 # A registry version here creates a cycle when Cargo orders sdk-core before sdk for workspace publishing.
 temporalio-sdk = { path = "../sdk", features = [
   "experimental",
+  "opentelemetry",
   "testing",
   "wasm-workflows",
 ] }

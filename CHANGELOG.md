@@ -33,6 +33,10 @@ relevant information.
 
 ## Unreleased
 
+### Added
+* Adds an optional OpenTelemetry integration. It traces client, Workflow, and Activity operations.
+  It propagates W3C trace context across Temporal calls.
+
 ## [1.0.0] - 2026-09-04
 
 ### Changed
