@@ -1271,12 +1271,21 @@ async fn nexus_metrics() {
         .unwrap();
 
     let nexus_polling = async {
-        for _ in 0..5 {
-            let nt = core_worker.poll_nexus_task().await.unwrap();
+        let mut start_operations = 0;
+        loop {
+            let nt = match core_worker.poll_nexus_task().await {
+                Ok(nt) => nt,
+                Err(PollError::ShutDown) => {
+                    assert_eq!(start_operations, 4);
+                    break;
+                }
+                Err(err) => panic!("unexpected nexus poll error: {err:?}"),
+            };
             let task_token = nt.task_token().to_vec();
             let status = if matches!(nt.variant, Some(nexus_task::Variant::CancelTask(_))) {
                 nexus_task_completion::Status::AckCancel(true)
             } else {
+                start_operations += 1;
                 let nt = nt.unwrap_task();
                 match nt.request.unwrap().variant.unwrap() {
                     Variant::StartOperation(s) => match s.payload {
@@ -1345,11 +1354,6 @@ async fn nexus_metrics() {
                 .await
                 .unwrap();
         }
-        // Gotta get shutdown poll
-        assert_matches!(
-            core_worker.poll_nexus_task().await,
-            Err(PollError::ShutDown)
-        );
     };
 
     join!(nexus_polling, async {
