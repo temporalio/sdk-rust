@@ -41,6 +41,8 @@ relevant information.
 * `CancelExternalWorkflowError` and `workflow_interceptors::CancelExternalWorkflowResult`
   for use in interceptors.
 ### Breaking Changes
+* `ActivityEnvironmentBuilder` no longer accepts a `tokio_util::sync::CancellationToken`.
+  Use `ActivityEnvironment::cancel` to cancel activities running in the test environment.
 * `ActivityError`, `PayloadConversionError`, `ActivityExecutionError`,
   `ChildWorkflowStartError`, `ChildWorkflowExecutionError`, and `WorkflowSignalError` are now
   non-exhaustive. Add wildcard branches when matching these enums.

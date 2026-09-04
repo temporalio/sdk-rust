@@ -261,6 +261,8 @@ pub struct ActivityEnvironment {
     heartbeat_details: Vec<Payload>,
     #[builder(field)]
     implementers: ActivityImplementers,
+    #[builder(field = CancellationToken::new())]
+    cancellation_token: CancellationToken,
     #[builder(
         default,
         getter(name = payload_converter_ref, vis = ""),
@@ -272,8 +274,6 @@ pub struct ActivityEnvironment {
     #[builder(default)]
     headers: HashMap<String, Payload>,
     client: Option<Client>,
-    #[builder(default = CancellationToken::new())]
-    cancellation_token: CancellationToken,
 }
 
 impl<S: activity_environment_builder::State> ActivityEnvironmentBuilder<S> {
