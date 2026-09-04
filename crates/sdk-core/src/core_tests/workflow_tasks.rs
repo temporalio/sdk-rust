@@ -1130,6 +1130,45 @@ async fn complete_after_eviction() {
 }
 
 #[tokio::test]
+async fn failed_completion_after_eviction_releases_outstanding_replay_activation() {
+    let wfid = "fake_wf_id";
+    let t = canned_histories::single_timer("1");
+    let mut mock = mock_worker_client();
+    mock.expect_complete_workflow_task().times(0);
+    mock.expect_fail_workflow_task()
+        .returning(|_, _, _| Ok(Default::default()))
+        .times(1);
+    let mut mock = single_hist_mock_sg(wfid, t, [2], mock, true);
+    mock.make_wft_stream_interminable();
+    mock.worker_cfg(|wc| wc.max_cached_workflows = 10);
+    let core = mock_worker(mock);
+
+    let activation = core.poll_workflow_activation().await.unwrap();
+    core.request_workflow_eviction(&activation.run_id);
+    core.complete_workflow_activation(WorkflowActivationCompletion::fail(
+        activation.run_id,
+        Failure::application_failure("Language Workflow state was lost".to_string(), true),
+        None,
+    ))
+    .await
+    .unwrap();
+
+    // Failure marks the replay state as unusable, so pending replay jobs must not keep the requested eviction blocked.
+    let eviction = core.poll_workflow_activation().await.unwrap();
+    assert_matches!(
+        eviction.jobs.as_slice(),
+        [WorkflowActivationJob {
+            variant: Some(workflow_activation_job::Variant::RemoveFromCache(job)),
+        }] if job.reason == EvictionReason::LangFail as i32
+    );
+    core.complete_workflow_activation(WorkflowActivationCompletion::empty(eviction.run_id))
+        .await
+        .unwrap();
+
+    core.shutdown().await;
+}
+
+#[tokio::test]
 async fn sends_appropriate_sticky_task_queue_responses() {
     // This test verifies that when completions are sent with sticky queues enabled, that they
     // include the information that tells the server to enqueue the next task on a sticky queue.
