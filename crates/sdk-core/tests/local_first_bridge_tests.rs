@@ -306,6 +306,8 @@ fn start_bridge_server(upstream: &ReadyMessage) -> (DemoServer, ReadyMessage) {
         .arg(&state_directory)
         .arg("--sync-interval")
         .arg("3s")
+        .arg("--fail-sync-attempts")
+        .arg("2")
         .arg("--upstream-address")
         .arg(&upstream.upstream_address)
         .arg("--namespace")
