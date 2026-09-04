@@ -66,6 +66,8 @@ relevant information.
   attempt, including ones whose failure was not sent to the server, and tags size-related failures
   with their specific `failure_reason` (`GrpcMessageTooLarge`, `PayloadsTooLarge`,
   `RequestTooLarge`) on every path.
+* Adds an optional OpenTelemetry integration. It traces client, Workflow, and Activity operations.
+  It propagates W3C trace context across Temporal calls.
 
 ## [1.0.0] - 2026-09-04
 
