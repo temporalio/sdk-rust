@@ -1,6 +1,6 @@
 [package]
 name = "temporalio-common-wasm"
-version = "0.8.0"
+version = "1.0.0"
 edition = "2024"
 rust-version = "1.88.0"
 authors = ["Temporal Technologies Inc. <sdk@temporal.io>"]
@@ -46,7 +46,7 @@ tracing-core = "0.1"
 url = "2.5"
 [dependencies.temporalio-protos]
 path = "../protos"
-version = "~0.8.0"
+version = "~0.9.0"
 
 [lints]
 workspace = true

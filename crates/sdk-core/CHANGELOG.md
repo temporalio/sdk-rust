@@ -33,6 +33,10 @@ relevant information.
 
 ## Unreleased
 
+## [0.9.0] - 2026-09-04
+
+## [0.8.0] - 2026-09-02
+
 ### Added
 * External workflow signal and cancellation resolution activations now include the typed server
   failure cause alongside the existing failure.

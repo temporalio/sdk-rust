@@ -1,6 +1,6 @@
 [package]
 name = "temporalio-sdk"
-version = "0.8.0"
+version = "1.0.0"
 edition = "2024"
 rust-version = "1.92.0"
 authors = ["Spencer Judge <spencer@temporal.io>"]
@@ -47,26 +47,26 @@ url = { version = "2.5", optional = true }
 
 [dependencies.temporalio-sdk-core]
 path = "../sdk-core"
-version = "=0.8.0"
+version = "=0.9.0"
 default-features = false
 
 [dependencies.temporalio-workflow]
 path = "../workflow"
-version = "~0.8.0"
+version = "~1.0.0"
 
 [dependencies.temporalio-common]
 path = "../common"
-version = "~0.8.0"
+version = "~1.0.0"
 default-features = false
 
 [dependencies.temporalio-client]
 path = "../client"
-version = "~0.8.0"
+version = "~1.0.0"
 default-features = false
 
 [dependencies.temporalio-macros]
 path = "../macros"
-version = "~0.8.0"
+version = "~1.0.0"
 
 [dev-dependencies]
 futures = "0.3"

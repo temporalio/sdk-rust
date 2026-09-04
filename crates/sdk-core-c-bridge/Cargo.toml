@@ -41,17 +41,17 @@ xz2 = { version = "0.1", optional = true }
 
 [dependencies.temporalio-client]
 path = "../client"
-version = "~0.8.0"
+version = "~1.0.0"
 features = ["experimental"]
 
 [dependencies.temporalio-sdk-core]
 path = "../sdk-core"
-version = "=0.8.0"
+version = "=0.9.0"
 features = ["ephemeral-server", "otel"]
 
 [dependencies.temporalio-common]
 path = "../common"
-version = "~0.8.0"
+version = "~1.0.0"
 features = ["core-based-sdk", "otel"]
 
 [dev-dependencies]
