@@ -298,6 +298,11 @@ fn start_bridge_server(upstream: &ReadyMessage) -> (DemoServer, ReadyMessage) {
         .unwrap_or_else(|| panic!("{SERVER_BINARY_ENV} must point to local-first-demo-server"));
     let state_directory = env::temp_dir().join(format!("local-first-core-{}", Uuid::new_v4()));
     fs::create_dir(&state_directory).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&state_directory, fs::Permissions::from_mode(0o700)).unwrap();
+    }
     let mut command = Command::new(binary);
     command
         .arg("--mode")
