@@ -215,6 +215,8 @@ struct ConnectionInner {
     retry_options: RetryOptions,
     identity: String,
     headers: Arc<RwLock<ClientHeaders>>,
+    #[debug(skip)]
+    connection_options: Arc<RwLock<ConnectionOptions>>,
     client_name: String,
     client_version: String,
     /// Capabilities as read from the `get_system_info` RPC call made on client connection
@@ -438,6 +440,7 @@ impl Connection {
                 retry_options: options.retry_options.clone(),
                 identity: options.identity.clone(),
                 headers,
+                connection_options: Arc::new(RwLock::new(options.clone())),
                 client_name: options.client_name.clone(),
                 client_version: options.client_version.clone(),
                 capabilities,
@@ -454,7 +457,8 @@ impl Connection {
 
     /// Set API key, overwriting any previous one.
     pub fn set_api_key(&self, api_key: Option<String>) {
-        self.inner.headers.write().api_key = api_key;
+        self.inner.headers.write().api_key.clone_from(&api_key);
+        self.inner.connection_options.write().api_key = api_key;
     }
 
     /// Set HTTP request headers overwriting previous headers.
@@ -466,7 +470,9 @@ impl Connection {
     /// Will return an error if any of the provided keys or values are not valid gRPC metadata.
     /// If an error is returned, the previous headers will remain unchanged.
     pub fn set_headers(&self, headers: HashMap<String, String>) -> Result<(), InvalidHeaderError> {
-        self.inner.headers.write().user_headers = parse_ascii_headers(headers)?;
+        let parsed = parse_ascii_headers(headers.clone())?;
+        self.inner.headers.write().user_headers = parsed;
+        self.inner.connection_options.write().headers = Some(headers);
         Ok(())
     }
 
@@ -482,8 +488,20 @@ impl Connection {
         &self,
         binary_headers: HashMap<String, Vec<u8>>,
     ) -> Result<(), InvalidHeaderError> {
-        self.inner.headers.write().user_binary_headers = parse_binary_headers(binary_headers)?;
+        let parsed = parse_binary_headers(binary_headers.clone())?;
+        self.inner.headers.write().user_binary_headers = parsed;
+        self.inner.connection_options.write().binary_headers = Some(binary_headers);
         Ok(())
+    }
+
+    /// Return the effective connection options for Core-based SDK infrastructure.
+    ///
+    /// Runtime API-key and header replacements are reflected in the returned snapshot. Transport
+    /// details that cannot be represented by another process remain present so callers can reject
+    /// unsupported forwarding configurations rather than silently changing connection behavior.
+    #[cfg(feature = "core-based-sdk")]
+    pub fn connection_options(&self) -> ConnectionOptions {
+        self.inner.connection_options.read().clone()
     }
 
     /// Returns the value used for the `client-name` header by this connection.

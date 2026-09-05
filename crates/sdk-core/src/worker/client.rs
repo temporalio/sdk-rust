@@ -496,6 +496,7 @@ impl WorkerClient for WorkerClientBag {
             worker_instance_key: self.worker_instance_key.to_string(),
             worker_control_task_queue: self.worker_control_task_queue(),
             poller_group_id: Default::default(),
+            local_execution_options: None,
         }
         .into_request();
         request.extensions_mut().insert(IsWorkerTaskLongPoll);

@@ -66,6 +66,8 @@ message NamespaceInfo {
         bool standalone_activity_batch_operations = 16;
         // True if the namespace supports standalone activity operator commands.
         bool standalone_activity_operator_commands = 17;
+        // True if the namespace permits bridge-owned local workflow execution.
+        bool local_execution = 18;
     }
 
     // Namespace configured limits
@@ -81,6 +83,10 @@ message NamespaceInfo {
         // Requests exceeding this fail the workflow task with
         // WORKFLOW_TASK_FAILED_CAUSE_REQUEST_TOO_LARGE. 0 means no explicit limit.
         int64 workflow_task_completion_size_limit_error = 3;
+        // Minimum synchronization interval accepted for local execution acquisition.
+        google.protobuf.Duration minimum_local_execution_sync_interval = 4;
+        // Maximum synchronization interval accepted for local execution acquisition.
+        google.protobuf.Duration maximum_local_execution_sync_interval = 5;
     }
 
     // Whether scheduled workflows are supported on this namespace. This is only needed

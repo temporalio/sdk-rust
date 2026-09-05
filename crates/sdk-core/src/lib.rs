@@ -22,6 +22,7 @@ mod environment;
 #[cfg(feature = "ephemeral-server")]
 pub mod ephemeral_server;
 mod internal_flags;
+mod local_execution;
 mod pollers;
 mod protosext;
 pub mod replay;
@@ -38,6 +39,7 @@ pub mod test_help;
 pub use crate::worker::client::{
     PollActivityOptions, PollOptions, PollWorkflowOptions, WorkerClient, WorkflowTaskCompletion,
 };
+pub use local_execution::{LocalFirstOptions, LocalFirstOptionsBuilder};
 pub use pollers::{Client, ClientOptions, ClientTlsOptions, RetryOptions, TlsOptions};
 pub use temporalio_common::protos::TaskToken;
 pub use url::Url;

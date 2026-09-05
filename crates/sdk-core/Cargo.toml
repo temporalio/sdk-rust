@@ -110,6 +110,8 @@ tokio = { version = "1.47", default-features = false, features = [
   "parking_lot",
   "time",
   "fs",
+  "io-util",
+  "net",
   "process",
   "macros",
 ] }
@@ -165,6 +167,7 @@ hyper-util = { version = "0.1", features = [
 ] }
 rstest = "0.26"
 semver = "1.0"
+tempfile = "3.27"
 # A registry version here creates a cycle when Cargo orders sdk-core before sdk for workspace publishing.
 temporalio-sdk = { path = "../sdk", features = [
   "experimental",

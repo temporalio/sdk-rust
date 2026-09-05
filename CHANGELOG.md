@@ -85,6 +85,10 @@ relevant information.
   without an active Tokio runtime instead of panicking.
 * `Memo::keys` and `SearchAttributes::keys` now iterate in lexicographic order so workflow
   decisions based on collection traversal remain deterministic during replay.
+### Added
+* Experimental `WorkerOptions::local_first_options` support can start a durable Temporal CLI bridge
+  and route Worker polling through it when the server and namespace advertise local-execution
+  support. Unsupported servers continue using the configured upstream connection.
 
 ## [0.8.0] - 2026-09-02
 

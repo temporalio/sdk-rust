@@ -7,102 +7,21 @@
 use std::time::Duration;
 
 use temporalio_common::telemetry::TelemetryOptions;
-use temporalio_sdk_core::{
-    CoreRuntime, PollerBehavior as CorePollerBehavior, RuntimeOptions as CoreRuntimeOptions,
-    TokioRuntimeBuilder as CoreTokioRuntimeBuilder, WorkflowErrorType as CoreWorkflowErrorType,
-};
+use temporalio_sdk_core::{CoreRuntime, RuntimeOptions as CoreRuntimeOptions};
 
 use crate::error::RuntimeError;
 
-/// Worker concurrency tuning.
-pub mod worker_tuner;
-
-// Keep these public only with the raw-worker APIs while they are migrated separately.
-// Worker::new_from_core, Worker::new_from_core_options, Worker::with_new_core_worker
-#[cfg(feature = "experimental")]
-pub use temporalio_sdk_core::{Worker as CoreWorker, WorkerConfig};
-
-/// Wraps a Tokio runtime builder so the SDK can install its per-thread telemetry state.
-#[derive(bon::Builder)]
-#[builder(state_mod(vis = "pub"))]
-#[non_exhaustive]
-pub struct TokioRuntimeBuilder {
-    /// The Tokio runtime builder used to create the runtime.
-    pub inner: tokio::runtime::Builder,
-}
-
-impl Default for TokioRuntimeBuilder {
-    fn default() -> Self {
-        Self {
-            inner: tokio::runtime::Builder::new_multi_thread(),
-        }
-    }
-}
-
-impl TokioRuntimeBuilder {
-    fn into_core(self) -> CoreTokioRuntimeBuilder<Box<dyn Fn() + Send + Sync>> {
-        CoreTokioRuntimeBuilder {
-            inner: self.inner,
-            lang_on_thread_start: None,
-        }
-    }
-}
-
-/// Options for automatically scaling the number of concurrent task polls.
-#[derive(bon::Builder, Clone, Copy, Debug, PartialEq)]
-#[builder(state_mod(vis = "pub"))]
-#[non_exhaustive]
-pub struct AutoscalingOptions {
-    /// Minimum number of concurrent polls. Cannot be zero.
-    pub minimum: usize,
-    /// Maximum number of concurrent polls. Must be at least `minimum`.
-    pub maximum: usize,
-    /// Initial number of concurrent polls. Must be between `minimum` and `maximum`.
-    pub initial: usize,
-}
-
-/// Controls how many concurrent task polls a worker issues.
-#[derive(Clone, Copy, Debug, PartialEq)]
-#[non_exhaustive]
-pub enum PollerBehavior {
-    /// Poll whenever a slot is available, up to the supplied maximum.
-    SimpleMaximum(usize),
-    /// Adjust concurrent polls using feedback from the server.
-    Autoscaling(AutoscalingOptions),
-}
-
-impl PollerBehavior {
-    pub(crate) fn into_core(self) -> CorePollerBehavior {
-        match self {
-            PollerBehavior::SimpleMaximum(maximum) => CorePollerBehavior::SimpleMaximum(maximum),
-            PollerBehavior::Autoscaling(AutoscalingOptions {
-                minimum,
-                maximum,
-                initial,
-            }) => CorePollerBehavior::Autoscaling {
-                minimum,
-                maximum,
-                initial,
-            },
-        }
-    }
-}
-
-/// Workflow-processing errors that may be configured to fail the workflow execution.
-#[derive(Clone, Debug, Eq, PartialEq, Hash)]
-#[non_exhaustive]
-pub enum WorkflowErrorType {
-    /// A workflow produced commands that do not match its recorded history.
-    Nondeterminism,
-}
-
-impl WorkflowErrorType {
-    pub(crate) fn into_core(self) -> CoreWorkflowErrorType {
-        match self {
-            WorkflowErrorType::Nondeterminism => CoreWorkflowErrorType::Nondeterminism,
-        }
-    }
-}
+pub use temporalio_sdk_core::{
+    ActivitySlotKind, FixedSizeSlotSupplier, LocalActivitySlotKind, LocalFirstOptions,
+    LocalFirstOptionsBuilder, NexusSlotKind, PollerBehavior, ResourceBasedSlotsOptions,
+    ResourceBasedSlotsOptionsBuilder, ResourceBasedTuner, ResourceBasedTunerConfig,
+    ResourceController, ResourceSlotOptions, SlotInfo, SlotInfoTrait, SlotKind, SlotKindType,
+    SlotMarkUsedContext, SlotReleaseContext, SlotReservationContext, SlotSupplier,
+    SlotSupplierOptions, SlotSupplierPermit, TokioRuntimeBuilder, TunerBuilder, TunerHolder,
+    TunerHolderOptions, TunerHolderOptionsBuilder, Worker as CoreWorker, WorkerConfig,
+    WorkerConfigBuilder, WorkerTuner, WorkerVersioningStrategy, WorkflowErrorType,
+    WorkflowSlotKind, init_replay_worker, replay,
+};
 
 /// Configuration for the Rust SDK runtime. Construct with [`RuntimeOptions::builder`].
 #[derive(bon::Builder)]

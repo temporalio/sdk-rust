@@ -40,6 +40,9 @@ relevant information.
 ### Added
 * External workflow signal and cancellation resolution activations now include the typed server
   failure cause alongside the existing failure.
+* Core and the C bridge now accept experimental local-first options plus final workflow and Activity
+  registration manifests. When supported upstream, Core starts and securely bootstraps a durable
+  Temporal CLI bridge; otherwise it retains direct Worker polling without failing startup.
 * Language SDKs can opt in to recording local activity arguments in the local activity marker's
   `input` detail.
 * Core console logs can now be emitted as newline-delimited JSON when an SDK selects the JSON log

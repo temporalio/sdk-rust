@@ -46,6 +46,9 @@ pub use workflow::LEGACY_QUERY_ID;
 use crate::{
     ActivityHeartbeat,
     abstractions::{MeteredPermitDealer, PermitDealerContextData, dbg_panic},
+    local_execution::{
+        LocalBridgeProcess, LocalFirstOptions, start_local_bridge, supports_local_execution,
+    },
     pollers::{ActivityTaskOptions, BoxedActPoller, BoxedNexusPoller, LongPollBuffer},
     protosext::validate_activity_completion,
     telemetry::metrics::{
@@ -299,6 +302,20 @@ pub struct WorkerConfig {
     /// NOTE: Experimental
     #[builder(default = false)]
     pub disable_payload_error_limit: bool,
+
+    /// Enables experimental local-first execution for this Worker when the upstream server and
+    /// namespace advertise support. Unsupported servers retain normal direct Worker behavior.
+    pub local_first_options: Option<LocalFirstOptions>,
+
+    /// Workflow types in the final language-SDK registration set, supplied to bridge mode before
+    /// it can acquire work.
+    #[builder(default)]
+    pub registered_workflow_types: Vec<String>,
+
+    /// Activity types in the final language-SDK registration set, supplied to bridge mode before
+    /// it can acquire work.
+    #[builder(default)]
+    pub registered_activity_types: Vec<String>,
 }
 
 impl WorkerConfig {
@@ -395,6 +412,10 @@ impl<S: worker_config_builder::IsComplete> WorkerConfigBuilder<S> {
             }
         }
 
+        if let Some(options) = &config.local_first_options {
+            options.validate()?;
+        }
+
         if config.tuner.is_some()
             && (config.max_outstanding_workflow_tasks.is_some()
                 || config.max_outstanding_activities.is_some()
@@ -460,6 +481,9 @@ pub struct Worker {
     capabilities: Arc<NamespaceCapabilities>,
     /// Handle for the spawned ShutdownWorker RPC task, awaited during shutdown.
     shutdown_rpc_handle: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    local_bridge_activation: tokio::sync::Mutex<()>,
+    local_bridge_activation_complete: AtomicBool,
+    local_bridge_process: Mutex<Option<LocalBridgeProcess>>,
 }
 
 /// Namespace capabilities discovered via `describe_namespace`.
@@ -677,6 +701,7 @@ impl Worker {
                             memo: limits.memo_size_limit_error.max(0) as usize,
                         }));
                 }
+                self.activate_local_bridge(info).await?;
                 // Now that capabilities are known, eagerly build the pollers so effective poller
                 // behavior is resolved during the normal check-in path.
                 LazyLock::force(&self.task_subsystems);
@@ -687,6 +712,91 @@ impl Worker {
                 namespace: self.config.namespace.clone(),
             }),
         }
+    }
+
+    async fn activate_local_bridge(
+        &self,
+        namespace_description: &DescribeNamespaceResponse,
+    ) -> Result<(), WorkerValidationError> {
+        let Some(options) = self.config.local_first_options.as_ref() else {
+            return Ok(());
+        };
+        if self
+            .local_bridge_activation_complete
+            .load(Ordering::Acquire)
+        {
+            return Ok(());
+        }
+        let _activation_guard = self.local_bridge_activation.lock().await;
+        if self
+            .local_bridge_activation_complete
+            .load(Ordering::Acquire)
+        {
+            return Ok(());
+        }
+        let namespace_info = namespace_description
+            .namespace_info
+            .as_ref()
+            .ok_or_else(|| WorkerValidationError::LocalBridgeStart {
+                source: anyhow::anyhow!("namespace description contains no namespace info"),
+            })?;
+        let system_capabilities = self.client.capabilities();
+        if !supports_local_execution(
+            system_capabilities.as_ref(),
+            namespace_info,
+            options.sync_interval,
+        ) {
+            info!(
+                namespace = %self.config.namespace,
+                task_queue = %self.config.task_queue,
+                "Local-first execution is unavailable; using the upstream Worker connection"
+            );
+            self.local_bridge_activation_complete
+                .store(true, Ordering::Release);
+            return Ok(());
+        }
+        let connection =
+            self.client
+                .connection()
+                .ok_or_else(|| WorkerValidationError::LocalBridgeStart {
+                    source: anyhow::anyhow!(
+                        "worker client does not expose its upstream connection"
+                    ),
+                })?;
+        if self.config.registered_workflow_types.is_empty() {
+            info!(
+                namespace = %self.config.namespace,
+                task_queue = %self.config.task_queue,
+                "Local-first execution requires a registered workflow type; using the upstream Worker connection"
+            );
+            self.local_bridge_activation_complete
+                .store(true, Ordering::Release);
+            return Ok(());
+        }
+        let (process, local_connection) = start_local_bridge(
+            &connection,
+            &self.config.namespace,
+            &self.config.task_queue,
+            &self.config.registered_workflow_types,
+            &self.config.registered_activity_types,
+            options,
+            &self.shutdown_token,
+        )
+        .await
+        .map_err(|source| WorkerValidationError::LocalBridgeStart {
+            source: source.into(),
+        })?;
+        self.replace_client(local_connection)
+            .map_err(|source| WorkerValidationError::LocalBridgeStart { source })?;
+        *self.local_bridge_process.lock() = Some(process);
+        self.local_bridge_activation_complete
+            .store(true, Ordering::Release);
+        info!(
+            namespace = %self.config.namespace,
+            task_queue = %self.config.task_queue,
+            "Local-first execution bridge is ready"
+        );
+        Ok(())
     }
 
     /// Replace client.
@@ -1161,6 +1271,9 @@ impl Worker {
             status: worker_status,
             capabilities: worker_capabilities,
             shutdown_rpc_handle: Mutex::new(None),
+            local_bridge_activation: tokio::sync::Mutex::new(()),
+            local_bridge_activation_complete: AtomicBool::new(false),
+            local_bridge_process: Mutex::new(None),
         })
     }
 
@@ -1223,6 +1336,10 @@ impl Worker {
             _ = tokio::time::sleep(Duration::from_secs(5)) => {
                 dbg_panic!("Waiting for all slot permits to release took too long!");
             }
+        }
+        let bridge_process = self.local_bridge_process.lock().take();
+        if let Some(bridge_process) = bridge_process {
+            bridge_process.shutdown().await;
         }
     }
 
@@ -1771,6 +1888,14 @@ pub enum WorkerValidationError {
         source: tonic::Status,
         /// The associated namespace.
         namespace: String,
+    },
+    /// Local-first was supported and requested, but the bridge process could not be started or
+    /// connected without changing the configured upstream transport semantics.
+    #[error("Local-first bridge startup failed: {source}")]
+    LocalBridgeStart {
+        /// The underlying bridge process, bootstrap, or connection error.
+        #[source]
+        source: anyhow::Error,
     },
 }
 

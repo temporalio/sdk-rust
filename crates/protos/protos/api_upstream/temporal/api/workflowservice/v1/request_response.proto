@@ -306,6 +306,9 @@ message PollWorkflowTaskQueueRequest {
     // Worker deployment options that user has set in the worker.
     temporal.api.deployment.v1.WorkerDeploymentOptions deployment_options = 6;
 
+    // Set only by a bridge requesting ownership for local execution.
+    LocalExecutionPollOptions local_execution_options = 11;
+
     // Removed in 1.55.0; was temporal.api.worker.v1.WorkerHeartbeat worker_heartbeat
     reserved 7;
     reserved "worker_heartbeat";
@@ -383,6 +386,9 @@ message PollWorkflowTaskQueueResponse {
     //   3. If every group has some pending polls, assign the next poll to a group randomly
     //     according to the weights.
     temporal.api.taskqueue.v1.PollerGroupsInfo poller_groups_info = 19;
+    // Present only when this poll acquired the execution for a local bridge. The upstream
+    // Workflow Task remains scheduled and started_event_id is zero.
+    LocalExecutionTaskInfo local_execution_info = 20;
 }
 
 message RespondWorkflowTaskCompletedRequest {
@@ -1388,6 +1394,9 @@ message GetSystemInfoResponse {
         // server-scaled deployments. Dependent on server version and the
         // provider being enabled via server configuration.
         bool server_scaled_provider_cloud_run = 13;
+
+        // True if the server supports acquiring and synchronizing local executions.
+        bool local_execution = 14;
 
     }
 }
@@ -3673,4 +3682,29 @@ message PollWorkflowExecutionTimeSkippingResponse {
   string failed_reason = 2;
   // The execution's current fast-forward, if any.
   temporal.api.common.v1.TimeSkippingFastForwardInfo fast_forward_info = 3;
+}
+
+// Options supplied only by a local bridge when acquiring workflow tasks for local execution.
+message LocalExecutionPollOptions {
+    // Stable identity of the bridge's durable local server.
+    string local_server_id = 1;
+    // Version of the local execution protocol implemented by the bridge.
+    int32 protocol_version = 2;
+    // Maximum interval between synchronization attempts.
+    google.protobuf.Duration sync_interval = 3;
+    // Requested upstream ownership lease. Must be three times sync_interval.
+    google.protobuf.Duration requested_lease_duration = 4;
+}
+
+// Ownership granted to a bridge without starting the upstream Workflow Task.
+message LocalExecutionTaskInfo {
+    // Opaque secret required by ownership-sensitive local execution RPCs.
+    bytes ownership_token = 1;
+    // Monotonically increasing fencing epoch for this execution.
+    int64 fencing_epoch = 2;
+    // Expiration assigned using upstream server time.
+    google.protobuf.Timestamp lease_expiration_time = 3;
+    // Upstream event cursor at acquisition time.
+    int64 last_synchronized_event_id = 4;
+    int64 last_synchronized_event_version = 5;
 }

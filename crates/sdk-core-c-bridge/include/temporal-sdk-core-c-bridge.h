@@ -858,6 +858,14 @@ typedef struct TemporalCorePollerBehavior {
   const struct TemporalCorePollerBehaviorAutoscaling *autoscaling;
 } TemporalCorePollerBehavior;
 
+typedef struct TemporalCoreLocalFirstOptions {
+  uint64_t sync_interval_millis;
+  struct TemporalCoreByteArrayRef state_directory;
+  struct TemporalCoreByteArrayRef temporal_cli_path;
+  uint64_t max_unsynchronized_events;
+  uint64_t max_unsynchronized_bytes;
+} TemporalCoreLocalFirstOptions;
+
 typedef struct TemporalCoreWorkerOptions {
   struct TemporalCoreByteArrayRef namespace_;
   struct TemporalCoreByteArrayRef task_queue;
@@ -891,6 +899,19 @@ typedef struct TemporalCoreWorkerOptions {
    * a workflow task. Zero disables eager activity execution.
    */
   uint32_t max_eager_activity_reservations_per_workflow_task;
+  /**
+   * Optional experimental local-first bridge configuration. Null retains normal direct Worker
+   * behavior.
+   */
+  const struct TemporalCoreLocalFirstOptions *local_first_options;
+  /**
+   * Final workflow type registrations supplied before bridge acquisition starts.
+   */
+  struct TemporalCoreByteArrayRefArray registered_workflow_types;
+  /**
+   * Final Activity type registrations supplied before bridge acquisition starts.
+   */
+  struct TemporalCoreByteArrayRefArray registered_activity_types;
 } TemporalCoreWorkerOptions;
 
 /**

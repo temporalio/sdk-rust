@@ -8,6 +8,7 @@ use prost::Message;
 use std::{
     collections::{HashMap, HashSet},
     num::NonZero,
+    path::PathBuf,
     sync::Arc,
     time::Duration,
 };
@@ -61,6 +62,22 @@ pub struct WorkerOptions {
     /// Maximum number of activity slots that may be reserved for eager execution when completing
     /// a workflow task. Zero disables eager activity execution.
     pub max_eager_activity_reservations_per_workflow_task: u32,
+    /// Optional experimental local-first bridge configuration. Null retains normal direct Worker
+    /// behavior.
+    pub local_first_options: *const LocalFirstOptions,
+    /// Final workflow type registrations supplied before bridge acquisition starts.
+    pub registered_workflow_types: ByteArrayRefArray,
+    /// Final Activity type registrations supplied before bridge acquisition starts.
+    pub registered_activity_types: ByteArrayRefArray,
+}
+
+#[repr(C)]
+pub struct LocalFirstOptions {
+    pub sync_interval_millis: u64,
+    pub state_directory: ByteArrayRef,
+    pub temporal_cli_path: ByteArrayRef,
+    pub max_unsynchronized_events: u64,
+    pub max_unsynchronized_bytes: u64,
 }
 
 #[repr(C)]
@@ -1175,6 +1192,20 @@ impl TryFrom<&WorkerOptions> for temporalio_sdk_core::WorkerConfig {
 
     fn try_from(opt: &WorkerOptions) -> anyhow::Result<Self> {
         let converted_tuner: temporalio_sdk_core::TunerHolder = (&opt.tuner).try_into()?;
+        let local_first_options = if let Some(options) = unsafe { opt.local_first_options.as_ref() }
+        {
+            Some(
+                temporalio_sdk_core::LocalFirstOptions::builder()
+                    .sync_interval(Duration::from_millis(options.sync_interval_millis))
+                    .state_directory(PathBuf::from(options.state_directory.to_str()))
+                    .temporal_cli_path(PathBuf::from(options.temporal_cli_path.to_str()))
+                    .max_unsynchronized_events(usize::try_from(options.max_unsynchronized_events)?)
+                    .max_unsynchronized_bytes(usize::try_from(options.max_unsynchronized_bytes)?)
+                    .build(),
+            )
+        } else {
+            None
+        };
         WorkerConfig::builder()
             .namespace(opt.namespace.to_str())
             .task_queue(opt.task_queue.to_str())
@@ -1298,6 +1329,21 @@ impl TryFrom<&WorkerOptions> for temporalio_sdk_core::WorkerConfig {
                     .collect::<HashSet<_>>(),
             )
             .disable_payload_error_limit(opt.disable_payload_error_limit)
+            .maybe_local_first_options(local_first_options)
+            .registered_workflow_types(
+                opt.registered_workflow_types
+                    .to_str_vec()
+                    .into_iter()
+                    .map(str::to_owned)
+                    .collect(),
+            )
+            .registered_activity_types(
+                opt.registered_activity_types
+                    .to_str_vec()
+                    .into_iter()
+                    .map(str::to_owned)
+                    .collect(),
+            )
             .build()
             .map_err(|err| anyhow::anyhow!(err))
     }
@@ -1504,6 +1550,9 @@ mod tests {
             storage_drivers: crate::ByteArrayRefArray::empty(),
             disable_payload_error_limit: false,
             max_eager_activity_reservations_per_workflow_task: 3,
+            local_first_options: std::ptr::null(),
+            registered_workflow_types: crate::ByteArrayRefArray::empty(),
+            registered_activity_types: crate::ByteArrayRefArray::empty(),
         }
     }
 

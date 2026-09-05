@@ -173,7 +173,10 @@ use tokio_util::sync::CancellationToken;
 use tracing::{Instrument, Span, field};
 use uuid::Uuid;
 
-use crate::runtime::{PollerBehavior, WorkflowErrorType, worker_tuner::WorkerTuner};
+use crate::runtime::{
+    CoreWorker, LocalFirstOptions, PollerBehavior, TunerBuilder, WorkerConfig, WorkerTuner,
+    WorkerVersioningStrategy, WorkflowErrorType,
+};
 
 /// Contains options for configuring a worker.
 ///
@@ -319,6 +322,12 @@ pub struct WorkerOptions {
     )]
     #[builder(default = false)]
     pub disable_payload_error_limit: bool,
+    /// Run this Worker's traffic through a durable local Temporal bridge when the upstream server
+    /// and namespace advertise support.
+    ///
+    /// **Experimental:** This API may change or be removed.
+    #[cfg(feature = "experimental")]
+    pub local_first_options: Option<LocalFirstOptions>,
     /// Experimental callback that decides whether the first non-replay call to
     /// [`SyncWorkflowContext::patched`] for a patch ID should activate that patch.
     ///
@@ -672,6 +681,10 @@ impl WorkerOptions {
         #[cfg(not(feature = "experimental"))]
         let disable_payload_error_limit = false;
         #[cfg(feature = "experimental")]
+        let local_first_options = self.local_first_options.clone();
+        #[cfg(not(feature = "experimental"))]
+        let local_first_options = None;
+        #[cfg(feature = "experimental")]
         let plugin_info = self
             .client_plugin_names
             .iter()
@@ -686,6 +699,12 @@ impl WorkerOptions {
             .collect();
         #[cfg(not(feature = "experimental"))]
         let plugin_info = HashSet::new();
+        let mut registered_workflow_types = self
+            .workflows
+            .workflow_definitions()
+            .map(|definition| definition.workflow_type.clone())
+            .collect::<Vec<_>>();
+        registered_workflow_types.sort_unstable();
 
         let tuner = self.tuner.to_core()?;
 
@@ -757,6 +776,9 @@ impl WorkerOptions {
             )
             .plugins(plugin_info)
             .disable_payload_error_limit(disable_payload_error_limit)
+            .maybe_local_first_options(local_first_options)
+            .registered_workflow_types(registered_workflow_types)
+            .registered_activity_types(self.activities.names())
             .build()
     }
 }
