@@ -8,10 +8,11 @@ use std::{
     time::Duration,
 };
 use temporalio_client::{
-    Client, ClientOptions, Connection, ConnectionOptions, WorkflowExecutionInfo,
-    WorkflowGetResultOptions, grpc::WorkflowService,
+    Client, ClientOptions, Connection, ConnectionOptions, UntypedWorkflow, WorkflowExecutionInfo,
+    WorkflowGetResultOptions, WorkflowStartOptions, grpc::WorkflowService,
 };
 use temporalio_common::{
+    data_converters::RawValue,
     protos::{
         coresdk::{
             ActivityTaskCompletion,
@@ -297,6 +298,7 @@ async fn local_first_capability_fallback() {
         start_upstream_server_with_args(&["--enable-local-execution=false"]);
     let (upstream_connection, upstream_client) =
         connect(&ready.upstream_address, &ready.namespace).await;
+    let fallback_task_queue = format!("{}-fallback-{}", ready.task_queue, Uuid::new_v4());
     let state_directory = tempfile::tempdir().unwrap();
     let runtime = CoreRuntime::new_assume_tokio(
         RuntimeOptions::builder()
@@ -309,7 +311,7 @@ async fn local_first_capability_fallback() {
         &runtime,
         WorkerConfig::builder()
             .namespace(ready.namespace.clone())
-            .task_queue(ready.task_queue.clone())
+            .task_queue(fallback_task_queue.clone())
             .task_types(WorkerTaskTypes::all())
             .tuner(Arc::new(TunerHolder::fixed_size(1, 1, 1, 1)))
             .max_cached_workflows(10_usize)
@@ -332,11 +334,27 @@ async fn local_first_capability_fallback() {
     .unwrap();
     core.validate().await.unwrap();
 
-    let activation = tokio::time::timeout(Duration::from_secs(20), core.poll_workflow_activation())
-        .await
-        .expect("Core polled the unsupported server directly")
-        .unwrap();
-    assert_eq!(activation.run_id, ready.run_id);
+    let (fallback_handle, activation) = tokio::time::timeout(Duration::from_secs(40), async {
+        tokio::join!(
+            upstream_client.start_workflow(
+                UntypedWorkflow::new(&ready.workflow_type),
+                RawValue::empty(),
+                WorkflowStartOptions::new(
+                    fallback_task_queue,
+                    format!("local-first-fallback-{}", Uuid::new_v4()),
+                )
+                .task_timeout(Duration::from_secs(60))
+                .build(),
+            ),
+            core.poll_workflow_activation(),
+        )
+    })
+    .await
+    .expect("Core polled the unsupported server directly");
+    let fallback_handle = fallback_handle.unwrap();
+    let fallback_run_id = fallback_handle.run_id().unwrap().to_owned();
+    let activation = activation.unwrap();
+    assert_eq!(activation.run_id, fallback_run_id);
     let result = Payload {
         data: b"direct-fallback".to_vec(),
         ..Default::default()
@@ -351,13 +369,7 @@ async fn local_first_capability_fallback() {
     .await
     .unwrap();
 
-    let handle = WorkflowExecutionInfo::builder()
-        .namespace(ready.namespace.clone())
-        .workflow_id(ready.workflow_id.clone())
-        .maybe_run_id(Some(ready.run_id.clone()))
-        .build()
-        .bind_untyped(upstream_client);
-    let upstream_result = handle
+    let upstream_result = fallback_handle
         .get_result(WorkflowGetResultOptions::default())
         .await
         .unwrap();
@@ -738,6 +750,21 @@ async fn local_first_external_signal_hands_back_upstream() {
             .map(HistoryEvent::event_type)
             .collect::<Vec<_>>()
     );
+
+    let resolution = tokio::time::timeout(Duration::from_secs(20), core.poll_workflow_activation())
+        .await
+        .expect("Core received the upstream external-Signal resolution")
+        .unwrap();
+    assert!(resolution.jobs.iter().any(|job| matches!(
+        job.variant.as_ref(),
+        Some(workflow_activation_job::Variant::ResolveSignalExternalWorkflow(_))
+    )));
+    core.complete_workflow_activation(WorkflowActivationCompletion::from_cmd(
+        resolution.run_id,
+        CompleteWorkflowExecution { result: None }.into(),
+    ))
+    .await
+    .unwrap();
 
     drain_pollers_and_shutdown(&core).await;
     core.finalize_shutdown().await;

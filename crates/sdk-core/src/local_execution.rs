@@ -222,22 +222,7 @@ pub(crate) async fn start_local_bridge(
         .join(format!(".bootstrap-{}", Uuid::new_v4()));
     write_private_token(&token_path, token.as_bytes()).await?;
 
-    let mut child = Command::new(&options.temporal_cli_path)
-        .args([
-            "server",
-            "start-bridge",
-            "--state-dir",
-            options.state_directory.to_string_lossy().as_ref(),
-            "--bootstrap-token-file",
-            token_path.to_string_lossy().as_ref(),
-            "--bootstrap-port",
-            &bootstrap_port.to_string(),
-            "--log-level",
-            "warn",
-        ])
-        .stdin(Stdio::null())
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
+    let mut child = bridge_command(options, &token_path, bootstrap_port)
         .kill_on_drop(true)
         .spawn()
         .map_err(LocalBridgeError::Spawn)?;
@@ -276,6 +261,27 @@ pub(crate) async fn start_local_bridge(
     local_options.service_override = None;
     let local_connection = Connection::connect(local_options).await?;
     Ok((LocalBridgeProcess { child }, local_connection))
+}
+
+fn bridge_command(options: &LocalFirstOptions, token_path: &Path, bootstrap_port: u16) -> Command {
+    let mut command = Command::new(&options.temporal_cli_path);
+    command
+        .args([
+            "server",
+            "start-bridge",
+            "--state-dir",
+            options.state_directory.to_string_lossy().as_ref(),
+            "--bootstrap-token-file",
+            token_path.to_string_lossy().as_ref(),
+            "--bootstrap-port",
+            &bootstrap_port.to_string(),
+            "--log-level",
+            "warn",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit());
+    command
 }
 
 fn upstream_profile(
@@ -602,5 +608,35 @@ mod tests {
             &namespace,
             Duration::from_secs(10),
         ));
+    }
+
+    #[test]
+    fn bridge_process_arguments_contain_only_bootstrap_locations() {
+        let options = LocalFirstOptions::builder()
+            .sync_interval(Duration::from_secs(3))
+            .state_directory(PathBuf::from("state-directory"))
+            .temporal_cli_path(PathBuf::from("temporal"))
+            .build();
+        let command = bridge_command(&options, Path::new("bootstrap-token-file"), 12345);
+        let arguments = command
+            .as_std()
+            .get_args()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            arguments,
+            [
+                "server",
+                "start-bridge",
+                "--state-dir",
+                "state-directory",
+                "--bootstrap-token-file",
+                "bootstrap-token-file",
+                "--bootstrap-port",
+                "12345",
+                "--log-level",
+                "warn",
+            ]
+        );
     }
 }
