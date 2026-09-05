@@ -870,9 +870,12 @@ where
         self.calls_tx.send(MetricEvent::CreateAttributes {
             populate_into: ba.clone(),
             append_from: None,
-            attributes: opts.attributes,
+            attributes: opts.attributes.clone(),
         });
-        MetricAttributes::Buffer(ba)
+        MetricAttributes::Buffer {
+            attrs: ba,
+            kvs: Arc::new(opts.attributes),
+        }
     }
 
     fn extend_attributes(
@@ -880,14 +883,25 @@ where
         existing: MetricAttributes,
         attribs: NewAttributes,
     ) -> MetricAttributes {
-        if let MetricAttributes::Buffer(ol) = existing {
+        if let MetricAttributes::Buffer { attrs, kvs } = existing {
+            let mut merged = (*kvs).clone();
+            for kv in attribs.attributes.iter() {
+                if let Some(existing_kv) = merged.iter_mut().find(|k| k.key == kv.key) {
+                    *existing_kv = kv.clone();
+                } else {
+                    merged.push(kv.clone());
+                }
+            }
             let ba = BufferAttributes::hole();
             self.calls_tx.send(MetricEvent::CreateAttributes {
                 populate_into: ba.clone(),
-                append_from: Some(ol),
+                append_from: Some(attrs),
                 attributes: attribs.attributes,
             });
-            MetricAttributes::Buffer(ba)
+            MetricAttributes::Buffer {
+                attrs: ba,
+                kvs: Arc::new(merged),
+            }
         } else {
             dbg_panic!("Must use buffer attributes with a buffer metric implementation");
             existing
@@ -948,7 +962,7 @@ where
 {
     fn send(&self, value: MetricUpdateVal, attributes: &MetricAttributes) {
         let attributes = match attributes {
-            MetricAttributes::Buffer(l) => l.clone(),
+            MetricAttributes::Buffer { attrs, .. } => attrs.clone(),
             e => panic!(
                 "MetricsCallBuffer only works with MetricAttributes::Buffer, but used: {:?}",
                 e
@@ -1141,7 +1155,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::any::Any;
+    use std::{any::Any, sync::atomic::Ordering};
     use temporalio_common::telemetry::{
         TelemetryOptions,
         metrics::core::{BufferInstrumentRef, CustomMetricAttributes},
@@ -1264,6 +1278,41 @@ mod tests {
             }
             if DummyCustomAttrs::as_id(attributes) == 3 && instrument.get().0 == 12
                && d == &Duration::from_secs(1)
+        );
+    }
+
+    #[test]
+    fn test_buffered_heartbeat_metrics_resolve_labels() {
+        // Regression test: worker-heartbeat slot/poller gauges are written by the
+        // in-memory tap only when the label can be resolved from the attributes. The
+        // buffered meter retains its key-value pairs core-side so that lookup works
+        // without reading the lang-side (Python-held) dict.
+        let call_buffer = Arc::new(MetricsCallBuffer::<DummyInstrumentRef>::new(100));
+        let telem_instance = telemetry_init(
+            TelemetryOptions::builder()
+                .metrics(call_buffer.clone() as Arc<dyn CoreMeter>)
+                .build(),
+        )
+        .unwrap();
+        let mc = MetricsContext::top_level("foo".to_string(), "q".to_string(), &telem_instance);
+        let in_mem = mc.in_memory_meter().unwrap();
+
+        mc.available_task_slots(100);
+        mc.record_num_pollers(5);
+
+        let wf_ctx = mc.with_new_attrs([workflow_worker_type()]);
+        wf_ctx.available_task_slots(42);
+
+        let wf_poller = mc.with_new_attrs([workflow_poller()]);
+        wf_poller.record_num_pollers(7);
+
+        assert_eq!(
+            in_mem.worker_task_slots_available.as_map()["WorkflowWorker"].load(Ordering::Relaxed),
+            42
+        );
+        assert_eq!(
+            in_mem.num_pollers.as_map()["workflow_task"].load(Ordering::Relaxed),
+            7
         );
     }
 
