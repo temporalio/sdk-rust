@@ -35,7 +35,8 @@ use temporalio_common::{
     },
     telemetry::{
         OtelCollectorOptions, PrometheusExporterOptions, TelemetryOptions,
-        build_otlp_metric_exporter, start_prometheus_metric_exporter,
+        build_otlp_metric_exporter, metrics::core::BufferInstrumentRef,
+        start_prometheus_metric_exporter,
     },
 };
 use temporalio_macros::{activities, workflow, workflow_methods};
@@ -45,7 +46,7 @@ use temporalio_sdk::{
 };
 use temporalio_sdk_core::{
     CoreRuntime, PollerBehavior, ResourceBasedTuner, ResourceSlotOptions, RuntimeOptions,
-    TunerHolder, prost_dur,
+    TunerHolder, prost_dur, telemetry::MetricsCallBuffer,
 };
 use tokio::{sync::Notify, time::sleep};
 use tonic::IntoRequest;
@@ -58,6 +59,12 @@ fn within_two_minutes_ts(ts: Timestamp) -> bool {
     // ts should be at most 2 minutes before the current time
     now.duration_since(ts_time).unwrap() <= Duration::from_secs(2 * 60)
 }
+
+// A minimal buffered-instrument reference so the worker-heartbeat tests can attach a
+// `MetricsCallBuffer` meter without a language bridge.
+#[derive(Debug, Clone)]
+struct DummyBufferInstrument;
+impl BufferInstrumentRef for DummyBufferInstrument {}
 
 fn within_duration(dur: PbDuration, threshold: Duration) -> bool {
     let std_dur = Duration::new(dur.seconds as u64, dur.nanos as u32);
@@ -150,11 +157,13 @@ fn assert_worker_environment(heartbeat: &WorkerHeartbeat) {
 // with `docker_` and set the `DOCKER_PROMETHEUS_RUNNING` env variable to run
 #[rstest::rstest]
 #[tokio::test]
-async fn docker_worker_heartbeat_basic(#[values("otel", "prom", "no_metrics")] backing: &str) {
+async fn docker_worker_heartbeat_basic(
+    #[values("otel", "prom", "no_metrics", "buffered")] backing: &str,
+) {
     if env::var("DOCKER_PROMETHEUS_RUNNING").is_err() {
         return;
     }
-    let telemopts = if backing == "no_metrics" {
+    let telemopts = if backing == "no_metrics" || backing == "buffered" {
         TelemetryOptions::builder().build()
     } else {
         get_integ_telem_options()
@@ -181,6 +190,13 @@ async fn docker_worker_heartbeat_basic(#[values("otel", "prom", "no_metrics")] b
             let opts = opts_build.build();
             rt.telemetry_mut()
                 .attach_late_init_metrics(start_prometheus_metric_exporter(opts).unwrap().meter);
+        }
+        "buffered" => {
+            // The buffer is never drained here; a full buffer only drops metric events
+            // while the in-memory heartbeat tap (which we're asserting on) still records.
+            let buffer: Arc<dyn temporalio_common::telemetry::metrics::CoreMeter> =
+                Arc::new(MetricsCallBuffer::<DummyBufferInstrument>::new(100000));
+            rt.telemetry_mut().attach_late_init_metrics(buffer);
         }
         "no_metrics" => {}
         _ => unreachable!(),

@@ -88,6 +88,10 @@ relevant information.
 * Workers now warn when autoscaling task polling encounters errors continuously for one minute.
   Repeated warnings use exponential backoff up to 15-minute intervals and stop after polling
   recovers.
+* Worker heartbeats reported through a buffered metric meter (e.g. the Python SDK's `MetricBuffer`)
+  now include correct task-slot and poller counts. Previously the labelled slot/poller gauges could
+  not resolve their `worker_type`/`poller_type` labels from buffered attributes, so those fields
+  were always reported as `0`.
 * Workers no longer send worker heartbeats or appear in centralized heartbeat reports before they
   begin polling.
 * Ephemeral server processes no longer leak on failed start.
