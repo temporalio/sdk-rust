@@ -1664,4 +1664,42 @@ mod tests {
         let seq = next_check_peek(&mut update, 3);
         assert_eq!(seq.len(), 3);
     }
+
+    /// Demonstrates that durable history alone cannot produce a stable chunk boundary for an
+    /// empty WFT followed by a WFT carrying an Update. Both observations have the same prefix
+    /// through WFT2Started: when that is the current history tip, WFT1 and WFT2 are collapsed;
+    /// after WFT2Completed and UpdateAccepted become visible, the boundary moves back to WFT1.
+    /// The live Update request is a protocol message outside history, so an explicit decision on
+    /// WFT1Completed is required to make these two observations agree without observing the future.
+    #[test]
+    fn chunking_boundary_is_not_stable_under_future_history() {
+        let mut t = TestHistoryBuilder::default();
+        t.add_by_type(EventType::WorkflowExecutionStarted);
+        t.add_full_wf_task();
+        t.add_full_wf_task();
+        t.add_update_accepted("1", "upd");
+        let all_events = t.get_full_history_info().unwrap().into_events();
+
+        let mut at_current_tip = HistoryUpdate::new_from_events(all_events[..6].to_vec(), 0, 6);
+        let boundary_at_tip = at_current_tip
+            .take_next_wft_sequence(0)
+            .unwrap_events()
+            .last()
+            .unwrap()
+            .event_id;
+
+        let mut after_update_accepted =
+            HistoryUpdate::new_from_events(all_events[..8].to_vec(), 0, 6);
+        let boundary_after_update = after_update_accepted
+            .take_next_wft_sequence(0)
+            .unwrap_events()
+            .last()
+            .unwrap()
+            .event_id;
+
+        assert_eq!(
+            boundary_at_tip, boundary_after_update,
+            "a future event changed an already-observable chunk boundary"
+        );
+    }
 }
