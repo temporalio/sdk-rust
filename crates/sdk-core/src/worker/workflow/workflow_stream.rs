@@ -431,11 +431,14 @@ impl WFStream {
         {
             // Attempt to produce the next activation if needed
             res = rh.check_more_activations();
-            // If there's no more work and we reported workflow completion to server, evict.
-            if res.is_none()
-                && rh.workflow_is_finished()
-                && matches!(report.wft_report_status, WFTReportStatus::Reported { .. })
-            {
+            // If there's no more work and the workflow has ended, evict. Workflows can end either
+            // because lang produced a terminal command we successfully reported to server, or
+            // because replay observed a server-side terminal event like timeout or termination.
+            let should_evict_finished_workflow = rh.workflow_is_finished()
+                && matches!(report.wft_report_status, WFTReportStatus::Reported { .. });
+            let should_evict_terminal_history = rh.have_seen_terminal_event()
+                && matches!(report.wft_report_status, WFTReportStatus::NotReported);
+            if res.is_none() && (should_evict_finished_workflow || should_evict_terminal_history) {
                 res = rh
                     .request_eviction(RequestEvictMsg {
                         run_id: run_id.to_string(),
