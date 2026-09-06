@@ -77,6 +77,8 @@ relevant information.
   are preserved on failure; workers warn when the server does not advertise support.
 
 ### Fixed
+* Workflow poll balancing now lets non-sticky pollers use capacity after sticky pollers reach their
+  configured or autoscaled polling limit.
 * Worker shutdown now drains activity completions that are still flushing their result to the
   server before finishing. Previously such a completion — typically one whose final heartbeat RPC
   was still in flight — could be permanently stranded by shutdown: the activity's result was

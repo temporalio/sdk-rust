@@ -137,7 +137,10 @@ impl LongPollBuffer<PollWorkflowTaskQueueResponse, WorkflowSlotKind> {
         );
         if let Some(wftps) = options.wft_poller_shared.as_ref() {
             if is_sticky {
-                wftps.set_sticky_active(poll_scaler.active_rx.clone());
+                wftps.set_sticky_active(
+                    poll_scaler.active_rx.clone(),
+                    poll_scaler.report_handle.target.subscribe(),
+                );
             } else {
                 wftps.set_non_sticky_active(poll_scaler.active_rx.clone());
             };
@@ -544,10 +547,11 @@ where
                 initial,
             } => (minimum, maximum, initial),
         };
+        let target = watch::Sender::new(target);
         let report_handle = Arc::new(PollScalerReportHandle {
             max,
             min,
-            target: AtomicUsize::new(target),
+            target,
             ever_saw_scaling_decision: AtomicBool::default(),
             capabilities,
             behavior,
@@ -596,10 +600,7 @@ where
 
     async fn wait_until_allowed(&mut self) -> ActiveCounter<impl Fn(usize) + use<F>> {
         self.active_rx
-            .wait_for(|v| {
-                *v < self.report_handle.max
-                    && *v < self.report_handle.target.load(Ordering::Relaxed)
-            })
+            .wait_for(|v| *v < self.report_handle.max && *v < *self.report_handle.target.borrow())
             .await
             .expect("Poll allow does not panic");
         ActiveCounter::new(self.active_tx.clone(), self.num_pollers_handler.clone())
@@ -613,7 +614,7 @@ where
 struct PollScalerReportHandle {
     max: usize,
     min: usize,
-    target: AtomicUsize,
+    target: watch::Sender<usize>,
     ever_saw_scaling_decision: AtomicBool,
     capabilities: Arc<NamespaceCapabilities>,
     behavior: PollerBehavior,
@@ -733,11 +734,15 @@ impl PollScalerReportHandle {
 
     #[inline]
     fn change_target(&self, change: fn(usize, usize) -> usize, change_by: usize) {
-        self.target
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
-                Some(change(v, change_by).clamp(self.min, self.max))
-            })
-            .expect("Cannot fail because always returns Some");
+        self.target.send_if_modified(|target| {
+            let new_target = change(*target, change_by).clamp(self.min, self.max);
+            if *target == new_target {
+                return false;
+            }
+
+            *target = new_target;
+            true
+        });
     }
 
     /// We want to avoid scaling down on empty polls if the server has never made any scaling
@@ -1324,7 +1329,7 @@ mod tests {
         let handle = Arc::new(PollScalerReportHandle {
             max: 10,
             min: minimum,
-            target: AtomicUsize::new(10),
+            target: watch::channel(10).0,
             ever_saw_scaling_decision: AtomicBool::new(false),
             capabilities: Arc::new(NamespaceCapabilities::resolved(Capabilities {
                 poller_autoscaling: supports_autoscaling,
@@ -1350,7 +1355,7 @@ mod tests {
             handle.poll_result(&empty_resp);
         }
 
-        assert_eq!(handle.target.load(Ordering::Relaxed), expected_target);
+        assert_eq!(*handle.target.borrow(), expected_target);
         assert!(!handle.ever_saw_scaling_decision.load(Ordering::Relaxed));
     }
 
