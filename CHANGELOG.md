@@ -45,6 +45,7 @@ relevant information.
   views can observe values established by synchronous inbound interceptors, and outbound
   interceptors can use values to propagate metadata to activities, child workflows, signals,
   Nexus operations, and continue-as-new runs.
+  pollers reach their polling limit.
 ### Breaking Changes
 * `ActivityError`, `PayloadConversionError`, `ActivityExecutionError`,
   `ChildWorkflowStartError`, `ChildWorkflowExecutionError`, and `WorkflowSignalError` are now
