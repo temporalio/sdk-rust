@@ -923,7 +923,7 @@ mod tests {
     };
     use futures_util::FutureExt;
     use rstest::rstest;
-    use std::time::Duration;
+    use std::{future::pending, time::Duration};
     use temporalio_common::protos::temporal::api::namespace::v1::namespace_info::Capabilities;
     use tokio::{select, sync::Notify};
 
@@ -1221,6 +1221,88 @@ mod tests {
             .unwrap_or_else(|_| panic!("Failed to unwrap Arc"))
             .shutdown()
             .await;
+    }
+
+    #[rstest]
+    #[case::cancelled(Code::Cancelled)]
+    #[case::deadline_exceeded(Code::DeadlineExceeded)]
+    #[tokio::test(start_paused = true)]
+    async fn transient_error_retires_poller(#[case] error_code: Code) {
+        const INITIAL_POLLERS: usize = 4;
+        const POLLERS_AFTER_ERROR: usize = INITIAL_POLLERS - 1;
+        // Cross the maximum jittered delay to observe post-backoff concurrency.
+        const BACKOFF_SETTLE_TIME: Duration = Duration::from_secs(13);
+
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let call_count_clone = call_count.clone();
+        let (calls_tx, mut calls_rx) = watch::channel(0);
+        let fail_poll = Arc::new(Notify::new());
+        let fail_poll_clone = fail_poll.clone();
+
+        let mut mock_client = mock_manual_worker_client();
+        mock_client
+            .expect_poll_workflow_task()
+            .returning(move |_, _| {
+                let call_number = call_count_clone.fetch_add(1, Ordering::SeqCst) + 1;
+                calls_tx.send_replace(call_number);
+                let fail_poll = fail_poll_clone.clone();
+
+                async move {
+                    if call_number == INITIAL_POLLERS {
+                        fail_poll.notified().await;
+
+                        return Err(tonic::Status::new(error_code, "simulated poll error"));
+                    }
+
+                    pending().await
+                }
+                .boxed()
+            });
+
+        let (active_tx, mut active_rx) = watch::channel(0);
+        let pb = LongPollBuffer::new_workflow_task(
+            Arc::new(mock_client),
+            "normal".to_string(),
+            Some("sticky".to_string()),
+            PollerBehavior::Autoscaling {
+                minimum: 1,
+                maximum: INITIAL_POLLERS,
+                initial: INITIAL_POLLERS,
+            },
+            fixed_size_permit_dealer(INITIAL_POLLERS),
+            CancellationToken::new(),
+            Some(move |active| {
+                active_tx.send_replace(active);
+            }),
+            WorkflowTaskOptions {
+                wft_poller_shared: None,
+            },
+            Arc::new(AtomicCell::new(None)),
+            Arc::new(NamespaceCapabilities::resolved(Capabilities {
+                poller_autoscaling: true,
+                ..Default::default()
+            })),
+        );
+
+        let _ = pb.starter.send(());
+        calls_rx
+            .wait_for(|calls| *calls == INITIAL_POLLERS)
+            .await
+            .unwrap();
+        active_rx
+            .wait_for(|active| *active == INITIAL_POLLERS)
+            .await
+            .unwrap();
+
+        fail_poll.notify_one();
+        tokio::task::yield_now().await;
+        tokio::time::advance(BACKOFF_SETTLE_TIME).await;
+        tokio::task::yield_now().await;
+
+        assert_eq!(call_count.load(Ordering::SeqCst), INITIAL_POLLERS);
+        assert_eq!(*active_rx.borrow_and_update(), POLLERS_AFTER_ERROR);
+
+        pb.shutdown().await;
     }
 
     #[rstest]
