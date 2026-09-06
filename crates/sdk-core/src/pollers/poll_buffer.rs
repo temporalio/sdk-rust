@@ -1293,14 +1293,23 @@ mod tests {
             .wait_for(|active| *active == INITIAL_POLLERS)
             .await
             .unwrap();
+        println!(
+            "before error: calls={}, active={}",
+            call_count.load(Ordering::SeqCst),
+            *active_rx.borrow_and_update()
+        );
 
         fail_poll.notify_one();
         tokio::task::yield_now().await;
         tokio::time::advance(BACKOFF_SETTLE_TIME).await;
         tokio::task::yield_now().await;
 
-        assert_eq!(call_count.load(Ordering::SeqCst), INITIAL_POLLERS);
-        assert_eq!(*active_rx.borrow_and_update(), POLLERS_AFTER_ERROR);
+        let calls_after_backoff = call_count.load(Ordering::SeqCst);
+        let active_after_backoff = *active_rx.borrow_and_update();
+        println!("after backoff: calls={calls_after_backoff}, active={active_after_backoff}");
+
+        assert_eq!(calls_after_backoff, INITIAL_POLLERS);
+        assert_eq!(active_after_backoff, POLLERS_AFTER_ERROR);
 
         pb.shutdown().await;
     }
