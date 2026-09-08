@@ -44,6 +44,9 @@ relevant information.
 * The `workflow_task_execution_failed` metric is now recorded for every failed workflow task
   attempt, including attempts whose failure was not sent to the server, and its `failure_reason`
   tag distinguishes `GrpcMessageTooLarge`, `PayloadsTooLarge`, and `RequestTooLarge` on every path.
+* Core now preserves workflow-task boundaries required by Workflow Update sequencing during
+  history replay, preventing live or admitted Updates from being delivered before replay work they
+  are sequenced after.
 
 ## [0.9.0] - 2026-09-04
 

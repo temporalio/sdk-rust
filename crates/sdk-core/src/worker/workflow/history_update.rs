@@ -483,6 +483,7 @@ impl HistoryUpdate {
             all_events.as_slice(),
             previous_wft_started_id,
             has_last_wft,
+            &[],
         );
         if matches!(last_end, NextWFTSeqEndIndex::Incomplete(_)) {
             return if has_last_wft {
@@ -519,6 +520,7 @@ impl HistoryUpdate {
                 &all_events[next_end_ix..],
                 next_end_eid,
                 has_last_wft,
+                &[],
             )
             .add(next_end_ix);
             if matches!(next_end, NextWFTSeqEndIndex::Incomplete(_)) {
@@ -574,13 +576,21 @@ impl HistoryUpdate {
     ///
     /// If we are out of WFT sequences that can be yielded by this update, it will return an empty
     /// vec, indicating more pages will need to be fetched.
-    pub(crate) fn take_next_wft_sequence(&mut self, from_wft_started_id: i64) -> NextWFT {
+    pub(crate) fn take_next_wft_sequence(
+        &mut self,
+        from_wft_started_id: i64,
+        live_message_sequencing_event_ids: &[i64],
+    ) -> NextWFT {
         // First, drop any events from the queue which are earlier than the passed-in id.
         if let Some(ix_first_relevant) = self.starting_index_after_skipping(from_wft_started_id) {
             self.events.drain(0..ix_first_relevant);
         }
-        let next_wft_ix =
-            find_end_index_of_next_wft_seq(&self.events, from_wft_started_id, self.has_last_wft);
+        let next_wft_ix = find_end_index_of_next_wft_seq(
+            &self.events,
+            from_wft_started_id,
+            self.has_last_wft,
+            live_message_sequencing_event_ids,
+        );
         match next_wft_ix {
             NextWFTSeqEndIndex::Incomplete(siz) => {
                 if self.has_last_wft {
@@ -613,7 +623,11 @@ impl HistoryUpdate {
     /// [take_next_wft_sequence]. Will always return the first available WFT sequence if that has
     /// not been called first. May also return an empty iterator or incomplete sequence if we are at
     /// the end of history.
-    pub(crate) fn peek_next_wft_sequence(&self, from_wft_started_id: i64) -> &[HistoryEvent] {
+    pub(crate) fn peek_next_wft_sequence(
+        &self,
+        from_wft_started_id: i64,
+        live_message_sequencing_event_ids: &[i64],
+    ) -> &[HistoryEvent] {
         let ix_first_relevant = self
             .starting_index_after_skipping(from_wft_started_id)
             .unwrap_or_default();
@@ -621,17 +635,29 @@ impl HistoryUpdate {
         if relevant_events.is_empty() {
             return relevant_events;
         }
-        let ix_end =
-            find_end_index_of_next_wft_seq(relevant_events, from_wft_started_id, self.has_last_wft)
-                .index();
+        let ix_end = find_end_index_of_next_wft_seq(
+            relevant_events,
+            from_wft_started_id,
+            self.has_last_wft,
+            live_message_sequencing_event_ids,
+        )
+        .index();
         &relevant_events[0..=ix_end]
     }
 
     /// Returns true if this update has the next needed WFT sequence, false if events will need to
     /// be fetched in order to create a complete update with the entire next WFT sequence.
-    pub(crate) fn can_take_next_wft_sequence(&self, from_wft_started_id: i64) -> bool {
-        let next_wft_ix =
-            find_end_index_of_next_wft_seq(&self.events, from_wft_started_id, self.has_last_wft);
+    pub(crate) fn can_take_next_wft_sequence(
+        &self,
+        from_wft_started_id: i64,
+        live_message_sequencing_event_ids: &[i64],
+    ) -> bool {
+        let next_wft_ix = find_end_index_of_next_wft_seq(
+            &self.events,
+            from_wft_started_id,
+            self.has_last_wft,
+            live_message_sequencing_event_ids,
+        );
         if let NextWFTSeqEndIndex::Incomplete(_) = next_wft_ix
             && !self.has_last_wft
         {
@@ -691,6 +717,7 @@ fn find_end_index_of_next_wft_seq(
     events: &[HistoryEvent],
     from_event_id: i64,
     has_last_wft: bool,
+    live_message_sequencing_event_ids: &[i64],
 ) -> NextWFTSeqEndIndex {
     if events.is_empty() {
         return NextWFTSeqEndIndex::Incomplete(0);
@@ -698,7 +725,9 @@ fn find_end_index_of_next_wft_seq(
     let mut last_index = 0;
     let mut saw_command_or_started = false;
     let mut saw_command = false;
-    let mut wft_started_event_id_to_index = vec![];
+    let mut non_skipped_wft_started_event_id_to_index = vec![];
+    let mut next_live_message_index =
+        live_message_sequencing_event_ids.partition_point(|event_id| *event_id <= from_event_id);
     for (ix, e) in events.iter().enumerate() {
         last_index = ix;
 
@@ -706,6 +735,30 @@ fn find_end_index_of_next_wft_seq(
         // command on completion), where we may need to skip events we already handled.
         if e.event_id <= from_event_id {
             continue;
+        }
+
+        while let Some(sequencing_event_id) =
+            live_message_sequencing_event_ids.get(next_live_message_index)
+            && *sequencing_event_id <= e.event_id
+        {
+            next_live_message_index += 1;
+            if let Some(boundary_index) = nearest_non_skipped_wft_started_before(
+                &non_skipped_wft_started_event_id_to_index,
+                *sequencing_event_id,
+            ) {
+                return NextWFTSeqEndIndex::Complete(boundary_index);
+            }
+        }
+        if matches!(
+            e.attributes,
+            Some(Attributes::WorkflowExecutionUpdateAdmittedEventAttributes(
+                _
+            ))
+        ) && let Some(boundary_index) = nearest_non_skipped_wft_started_before(
+            &non_skipped_wft_started_event_id_to_index,
+            e.event_id,
+        ) {
+            return NextWFTSeqEndIndex::Complete(boundary_index);
         }
 
         if e.is_command_event() {
@@ -720,31 +773,32 @@ fn find_end_index_of_next_wft_seq(
         }
 
         if e.event_type() == EventType::WorkflowTaskStarted {
-            wft_started_event_id_to_index.push((e.event_id, ix));
-            if let Some(next_event) = events.get(ix + 1) {
-                let next_event_type = next_event.event_type();
-                // If the next event is WFT timeout or fail, or abrupt WF execution end, that
-                // doesn't conclude a WFT sequence.
-                if matches!(
-                    next_event_type,
+            if events.get(ix + 1).is_some_and(|event| {
+                matches!(
+                    event.event_type(),
                     EventType::WorkflowTaskFailed
                         | EventType::WorkflowTaskTimedOut
                         | EventType::WorkflowExecutionTimedOut
                         | EventType::WorkflowExecutionTerminated
                         | EventType::WorkflowExecutionCanceled
-                ) {
-                    // Since we're skipping this WFT, we don't want to include it in the vec used
-                    // for update accepted sequencing lookups.
-                    wft_started_event_id_to_index.pop();
-                    continue;
-                } else if next_event_type == EventType::WorkflowTaskCompleted {
+                )
+            }) {
+                continue;
+            }
+            non_skipped_wft_started_event_id_to_index.push((e.event_id, ix));
+            if let Some(next_event) = events.get(ix + 1) {
+                let next_event_type = next_event.event_type();
+                if next_event_type == EventType::WorkflowTaskCompleted {
                     if let Some(next_next_event) = events.get(ix + 2) {
                         if !saw_command
                             && next_next_event.event_type() == EventType::WorkflowTaskScheduled
                         {
                             // If we've never seen an interesting event and the next two events are
                             // a completion followed immediately again by scheduled, then this is a
-                            // WFT heartbeat and also doesn't conclude the sequence.
+                            // WFT heartbeat and also doesn't conclude the sequence. If a protocol
+                            // message or durable admitted update is sequenced after this WFT but
+                            // before the next non-skipped WFT starts, this WFT is its required
+                            // boundary and must not be folded.
                             continue;
                         } else {
                             // If we see an update accepted command after WFT completed, we want to
@@ -766,16 +820,10 @@ fn find_end_index_of_next_wft_seq(
                                 // update was sequenced. If we did, we'll fail to actually include
                                 // the update accepted event and therefore fail to generate the
                                 // request to run the update handler on replay.
-                                if let Some(ret_ix) = wft_started_event_id_to_index
-                                    .iter()
-                                    .rev()
-                                    .find_map(|(eid, ix)| {
-                                        if *eid < attr.accepted_request_sequencing_event_id {
-                                            return Some(*ix);
-                                        }
-                                        None
-                                    })
-                                {
+                                if let Some(ret_ix) = nearest_non_skipped_wft_started_before(
+                                    &non_skipped_wft_started_event_id_to_index,
+                                    attr.accepted_request_sequencing_event_id,
+                                ) {
                                     return NextWFTSeqEndIndex::Complete(ret_ix);
                                 }
                             }
@@ -801,6 +849,16 @@ fn find_end_index_of_next_wft_seq(
     NextWFTSeqEndIndex::Incomplete(last_index)
 }
 
+fn nearest_non_skipped_wft_started_before(
+    wft_started_event_id_to_index: &[(i64, usize)],
+    sequencing_event_id: i64,
+) -> Option<usize> {
+    wft_started_event_id_to_index
+        .partition_point(|(event_id, _)| *event_id < sequencing_event_id)
+        .checked_sub(1)
+        .map(|index| wft_started_event_id_to_index[index].1)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -811,7 +869,12 @@ mod tests {
     };
     use futures_util::TryStreamExt;
     use temporalio_common::protos::temporal::api::{
-        common::v1::WorkflowExecution, enums::v1::WorkflowTaskFailedCause,
+        common::v1::WorkflowExecution,
+        enums::v1::WorkflowTaskFailedCause,
+        history::v1::{
+            WorkflowExecutionUpdateAcceptedEventAttributes,
+            WorkflowExecutionUpdateAdmittedEventAttributes,
+        },
         workflowservice::v1::GetWorkflowExecutionHistoryResponse,
     };
 
@@ -845,8 +908,8 @@ mod tests {
     }
 
     fn next_check_peek(update: &mut HistoryUpdate, from_id: i64) -> Vec<HistoryEvent> {
-        let seq_peeked = update.peek_next_wft_sequence(from_id).to_vec();
-        let seq = update.take_next_wft_sequence(from_id).unwrap_events();
+        let seq_peeked = update.peek_next_wft_sequence(from_id, &[]).to_vec();
+        let seq = update.take_next_wft_sequence(from_id, &[]).unwrap_events();
         assert_eq!(seq, seq_peeked);
         seq
     }
@@ -858,7 +921,7 @@ mod tests {
         let seq_1 = next_check_peek(&mut update, 0);
         assert_eq!(seq_1.len(), 3);
         assert_eq!(seq_1.last().unwrap().event_id, 3);
-        let seq_2_peeked = update.peek_next_wft_sequence(0).to_vec();
+        let seq_2_peeked = update.peek_next_wft_sequence(0, &[]).to_vec();
         let seq_2 = next_check_peek(&mut update, 3);
         assert_eq!(seq_2, seq_2_peeked);
         assert_eq!(seq_2.len(), 5);
@@ -894,7 +957,7 @@ mod tests {
         let timer_hist = canned_histories::single_timer("t");
         let mut update = timer_hist.as_history_update();
         // We haven't processed the first 3 events, but we should still only get the second sequence
-        let seq_2 = update.take_next_wft_sequence(3).unwrap_events();
+        let seq_2 = update.take_next_wft_sequence(3, &[]).unwrap_events();
         assert_eq!(seq_2.len(), 5);
         assert_eq!(seq_2.last().unwrap().event_id, 8);
     }
@@ -904,7 +967,7 @@ mod tests {
         let mut timer_hist = canned_histories::single_timer("t");
         timer_hist.add_workflow_execution_terminated();
         let mut update = timer_hist.as_history_update();
-        let seq_2 = update.take_next_wft_sequence(3).unwrap_events();
+        let seq_2 = update.take_next_wft_sequence(3, &[]).unwrap_events();
         assert_eq!(seq_2.len(), 6);
         assert_eq!(seq_2.last().unwrap().event_id, 9);
     }
@@ -1011,19 +1074,19 @@ mod tests {
         );
         let mut update = paginator.extract_next_update().await.unwrap();
 
-        let seq = update.take_next_wft_sequence(0).unwrap_events();
+        let seq = update.take_next_wft_sequence(0, &[]).unwrap_events();
         assert_eq!(seq.len(), 3);
 
         let mut last_event_id = 3;
         let mut last_started_id = 3;
         for i in 1..wft_count {
             let seq = {
-                match update.take_next_wft_sequence(last_started_id) {
+                match update.take_next_wft_sequence(last_started_id, &[]) {
                     NextWFT::WFT(seq, _) => seq,
                     NextWFT::NeedFetch => {
                         update = paginator.extract_next_update().await.unwrap();
                         update
-                            .take_next_wft_sequence(last_started_id)
+                            .take_next_wft_sequence(last_started_id, &[])
                             .unwrap_events()
                     }
                     NextWFT::ReplayOver => {
@@ -1095,13 +1158,13 @@ mod tests {
         );
         assert_eq!(remaining[0].event_id, 12);
         assert_eq!(remaining.last().unwrap().event_id, truncate_at as i64);
-        let seq = update.take_next_wft_sequence(0).unwrap_events();
+        let seq = update.take_next_wft_sequence(0, &[]).unwrap_events();
         assert_eq!(seq.last().unwrap().event_id, 3);
-        let seq = update.take_next_wft_sequence(3).unwrap_events();
+        let seq = update.take_next_wft_sequence(3, &[]).unwrap_events();
         assert_eq!(seq.last().unwrap().event_id, 7);
-        let seq = update.take_next_wft_sequence(7).unwrap_events();
+        let seq = update.take_next_wft_sequence(7, &[]).unwrap_events();
         assert_eq!(seq.last().unwrap().event_id, 11);
-        let next = update.take_next_wft_sequence(11);
+        let next = update.take_next_wft_sequence(11, &[]);
         assert_matches!(next, NextWFT::NeedFetch);
     }
 
@@ -1115,7 +1178,7 @@ mod tests {
         let mut update = paginator.extract_next_update().await.unwrap();
         let mut last_id = 0;
         loop {
-            let seq = update.take_next_wft_sequence(last_id);
+            let seq = update.take_next_wft_sequence(last_id, &[]);
             match seq {
                 NextWFT::WFT(seq, _) => {
                     last_id = seq.last().unwrap().event_id;
@@ -1133,15 +1196,15 @@ mod tests {
     async fn task_just_before_heartbeat_chain_is_taken() {
         let t = three_wfts_then_heartbeats();
         let mut update = t.as_history_update();
-        let seq = update.take_next_wft_sequence(0).unwrap_events();
+        let seq = update.take_next_wft_sequence(0, &[]).unwrap_events();
         assert_eq!(seq.last().unwrap().event_id, 3);
-        let seq = update.take_next_wft_sequence(3).unwrap_events();
+        let seq = update.take_next_wft_sequence(3, &[]).unwrap_events();
         assert_eq!(seq.last().unwrap().event_id, 7);
-        let seq = update.take_next_wft_sequence(7).unwrap_events();
+        let seq = update.take_next_wft_sequence(7, &[]).unwrap_events();
         assert_eq!(seq.last().unwrap().event_id, 11);
-        let seq = update.take_next_wft_sequence(11).unwrap_events();
+        let seq = update.take_next_wft_sequence(11, &[]).unwrap_events();
         assert_eq!(seq.last().unwrap().event_id, 158);
-        let seq = update.take_next_wft_sequence(158).unwrap_events();
+        let seq = update.take_next_wft_sequence(158, &[]).unwrap_events();
         assert_eq!(seq.last().unwrap().event_id, 160);
         assert_eq!(
             seq.last().unwrap().event_type(),
@@ -1178,9 +1241,9 @@ mod tests {
         let mut update = paginator.extract_next_update().await.unwrap();
         // We expect if we try to take the first task sequence that the first event is the first
         // event in the sequence.
-        let seq = update.take_next_wft_sequence(0).unwrap_events();
+        let seq = update.take_next_wft_sequence(0, &[]).unwrap_events();
         assert_eq!(seq[0].event_id, 1);
-        let seq = update.take_next_wft_sequence(3).unwrap_events();
+        let seq = update.take_next_wft_sequence(3, &[]).unwrap_events();
         // Verify anything extra (which should only ever be WFT started) was re-appended to the
         // end of the event iteration after fetching the old history.
         assert_eq!(seq.last().unwrap().event_id, 8);
@@ -1273,11 +1336,11 @@ mod tests {
             Arc::new(mock_client),
         );
         let mut update = paginator.extract_next_update().await.unwrap();
-        let seq = update.take_next_wft_sequence(0).unwrap_events();
+        let seq = update.take_next_wft_sequence(0, &[]).unwrap_events();
         assert_eq!(seq.last().unwrap().event_id, 3);
-        let seq = update.take_next_wft_sequence(3).unwrap_events();
+        let seq = update.take_next_wft_sequence(3, &[]).unwrap_events();
         assert_eq!(seq.last().unwrap().event_id, 8);
-        assert_matches!(update.take_next_wft_sequence(8), NextWFT::ReplayOver);
+        assert_matches!(update.take_next_wft_sequence(8, &[]), NextWFT::ReplayOver);
     }
 
     // TODO: Test we dont re-feed pointless updates if fetching returns <= events we already
@@ -1321,11 +1384,11 @@ mod tests {
             Arc::new(mock_client),
         );
         let mut update = paginator.extract_next_update().await.unwrap();
-        let seq = update.take_next_wft_sequence(0).unwrap_events();
+        let seq = update.take_next_wft_sequence(0, &[]).unwrap_events();
         assert_eq!(seq.last().unwrap().event_id, 3);
-        let seq = update.take_next_wft_sequence(3).unwrap_events();
+        let seq = update.take_next_wft_sequence(3, &[]).unwrap_events();
         assert_eq!(seq.last().unwrap().event_id, 8);
-        assert_matches!(update.take_next_wft_sequence(8), NextWFT::ReplayOver);
+        assert_matches!(update.take_next_wft_sequence(8, &[]), NextWFT::ReplayOver);
     }
 
     #[tokio::test]
@@ -1426,11 +1489,11 @@ mod tests {
         );
 
         let mut update = paginator.extract_next_update().await.unwrap();
-        let seq = update.take_next_wft_sequence(0).unwrap_events();
+        let seq = update.take_next_wft_sequence(0, &[]).unwrap_events();
         assert_eq!(seq.first().unwrap().event_id, 1);
         assert_eq!(seq.last().unwrap().event_id, 3);
 
-        let seq = update.take_next_wft_sequence(3).unwrap_events();
+        let seq = update.take_next_wft_sequence(3, &[]).unwrap_events();
         assert_eq!(seq.first().unwrap().event_id, 4);
         assert_eq!(seq.last().unwrap().event_id, 15);
     }
@@ -1483,9 +1546,9 @@ mod tests {
             Arc::new(mock_client),
         );
         let mut update = paginator.extract_next_update().await.unwrap();
-        let seq = update.take_next_wft_sequence(0).unwrap_events();
+        let seq = update.take_next_wft_sequence(0, &[]).unwrap_events();
         assert_eq!(seq.last().unwrap().event_id, 3);
-        let seq = update.take_next_wft_sequence(3).unwrap_events();
+        let seq = update.take_next_wft_sequence(3, &[]).unwrap_events();
         // We're done since the last fetch revealed nothing
         assert_eq!(seq.last().unwrap().event_id, 7);
     }
@@ -1663,5 +1726,316 @@ mod tests {
         assert_eq!(seq.len(), 3);
         let seq = next_check_peek(&mut update, 3);
         assert_eq!(seq.len(), 3);
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum UpdateEvidence {
+        Live,
+        Admitted,
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum InterveningEvent {
+        None,
+        Signals(usize),
+        CancelRequested,
+        Command,
+    }
+
+    struct FoldableWftFixture {
+        history: TestHistoryBuilder,
+        from_wft: i64,
+        required_wft: i64,
+        required_completed: i64,
+    }
+
+    fn foldable_wft() -> FoldableWftFixture {
+        let mut history = TestHistoryBuilder::default();
+        history.add_by_type(EventType::WorkflowExecutionStarted);
+        history.add_workflow_task_scheduled_and_started();
+        let from_wft = history.current_event_id();
+        history.add_workflow_task_completed();
+        history.add_workflow_task_scheduled_and_started();
+        let required_wft = history.current_event_id();
+        history.add_workflow_task_completed();
+        let required_completed = history.current_event_id();
+        FoldableWftFixture {
+            history,
+            from_wft,
+            required_wft,
+            required_completed,
+        }
+    }
+
+    fn event_index(events: &[HistoryEvent], event_id: i64) -> usize {
+        events
+            .iter()
+            .position(|event| event.event_id == event_id)
+            .unwrap()
+    }
+
+    fn boundary_event_id(
+        events: &[HistoryEvent],
+        from: i64,
+        has_last_wft: bool,
+        ids: &[i64],
+    ) -> i64 {
+        let boundary = find_end_index_of_next_wft_seq(events, from, has_last_wft, ids);
+        events[boundary.index()].event_id
+    }
+
+    #[track_caller]
+    fn assert_next_wft_boundary(update: &mut HistoryUpdate, from: i64, ids: &[i64], expected: i64) {
+        assert!(update.can_take_next_wft_sequence(from, ids));
+        let peeked = update.peek_next_wft_sequence(from, ids).to_vec();
+        let taken = update.take_next_wft_sequence(from, ids).unwrap_events();
+        assert_eq!(taken, peeked);
+        assert_eq!(taken.last().unwrap().event_id, expected);
+    }
+
+    #[rstest::rstest]
+    #[case::live(UpdateEvidence::Live)]
+    #[case::admitted(UpdateEvidence::Admitted)]
+    fn update_evidence_preserves_successive_wft_boundaries(#[case] evidence: UpdateEvidence) {
+        let FoldableWftFixture {
+            mut history,
+            from_wft,
+            required_wft,
+            ..
+        } = foldable_wft();
+        history.add_workflow_task_scheduled();
+        history.add_we_signaled("before-first-update", vec![]);
+        let mut live_ids = vec![];
+        match evidence {
+            UpdateEvidence::Live => {
+                let sequencing_id = history.current_event_id();
+                live_ids.extend([sequencing_id, sequencing_id]);
+            }
+            UpdateEvidence::Admitted => {
+                history.add(WorkflowExecutionUpdateAdmittedEventAttributes::default());
+                history.add(WorkflowExecutionUpdateAdmittedEventAttributes::default());
+            }
+        }
+        history.add_workflow_task_started();
+        let second_empty_wft = history.current_event_id();
+        history.add_workflow_task_completed();
+
+        history.add_workflow_task_scheduled();
+        history.add_we_signaled("before-second-update", vec![]);
+        match evidence {
+            UpdateEvidence::Live => {
+                live_ids.push(history.current_event_id());
+            }
+            UpdateEvidence::Admitted => {
+                history.add(WorkflowExecutionUpdateAdmittedEventAttributes::default());
+            }
+        }
+        history.add_workflow_task_started();
+
+        let mut update = history.as_history_update();
+        assert_next_wft_boundary(&mut update, from_wft, &live_ids, required_wft);
+        assert_next_wft_boundary(&mut update, required_wft, &live_ids, second_empty_wft);
+    }
+
+    #[test]
+    fn sequencing_evidence_respects_page_cuts() {
+        let FoldableWftFixture {
+            mut history,
+            from_wft,
+            required_wft,
+            required_completed,
+        } = foldable_wft();
+        history.add_workflow_task_scheduled();
+        let following_scheduled = history.current_event_id();
+        let admitted_id = history.add(WorkflowExecutionUpdateAdmittedEventAttributes::default());
+        history.add_we_signaled("after-admitted", vec![]);
+        let after_admitted = history.current_event_id();
+        history.add_workflow_task_started();
+        let following_started = history.current_event_id();
+
+        let events = history.get_full_history_info().unwrap().events().to_vec();
+        let early_page_end = event_index(&events, following_scheduled);
+        let unconstrained =
+            find_end_index_of_next_wft_seq(&events[..=early_page_end], from_wft, false, &[]);
+        let future_constrained = find_end_index_of_next_wft_seq(
+            &events[..=early_page_end],
+            from_wft,
+            false,
+            &[following_started],
+        );
+        assert_eq!(future_constrained.index(), unconstrained.index());
+        assert_matches!(
+            future_constrained,
+            NextWFTSeqEndIndex::Incomplete(ix) if ix == early_page_end
+        );
+
+        for cut_event_id in [required_wft, required_completed, following_scheduled] {
+            let cut_index = event_index(&events, cut_event_id);
+            assert_matches!(
+                find_end_index_of_next_wft_seq(
+                    &events[..=cut_index],
+                    from_wft,
+                    false,
+                    &[],
+                ),
+                NextWFTSeqEndIndex::Incomplete(ix) if ix == cut_index
+            );
+        }
+        for (cut_event_id, has_last_wft) in [
+            (admitted_id, false),
+            (after_admitted, false),
+            (following_started, true),
+        ] {
+            let cut_index = event_index(&events, cut_event_id);
+            assert_eq!(
+                boundary_event_id(&events[..=cut_index], from_wft, has_last_wft, &[]),
+                required_wft
+            );
+        }
+    }
+
+    #[rstest::rstest]
+    #[case::at_required_started(0)]
+    #[case::at_required_completed(1)]
+    #[case::at_following_scheduled(2)]
+    #[case::at_admitted(3)]
+    #[tokio::test]
+    async fn admitted_then_accepted_paginates_across_boundary_splits(#[case] cut_index: usize) {
+        let update_id = "admitted-update";
+        let FoldableWftFixture {
+            history: mut t,
+            from_wft,
+            required_wft,
+            required_completed,
+        } = foldable_wft();
+
+        t.add_workflow_task_scheduled();
+        let following_scheduled = t.current_event_id();
+        let admitted_id = t.add(WorkflowExecutionUpdateAdmittedEventAttributes::default());
+        t.add_workflow_task_started();
+        t.add_workflow_task_completed();
+        t.add(WorkflowExecutionUpdateAcceptedEventAttributes {
+            protocol_instance_id: update_id.to_string(),
+            accepted_request_message_id: format!("{update_id}/request"),
+            accepted_request_sequencing_event_id: admitted_id,
+            accepted_request: None,
+        });
+
+        let chunk_size = [
+            required_wft,
+            required_completed,
+            following_scheduled,
+            admitted_id,
+        ][cut_index] as usize;
+        let mut paginator = paginator_setup(t, chunk_size);
+        let mut update = paginator.extract_next_update().await.unwrap();
+        let seq = loop {
+            match update.take_next_wft_sequence(from_wft, &[]) {
+                NextWFT::WFT(events, _) => break events,
+                NextWFT::NeedFetch => {
+                    update = paginator.extract_next_update().await.unwrap();
+                }
+                NextWFT::ReplayOver => panic!("history ended before required WFT boundary"),
+            }
+        };
+        assert_eq!(seq.last().unwrap().event_id, required_wft);
+    }
+
+    #[rstest::rstest]
+    #[case::failed(EventType::WorkflowTaskFailed)]
+    #[case::timed_out(EventType::WorkflowTaskTimedOut)]
+    fn admitted_update_boundary_skips_failed_wft_starts(#[case] skipped_event: EventType) {
+        let FoldableWftFixture {
+            mut history,
+            from_wft,
+            required_wft,
+            ..
+        } = foldable_wft();
+        history.add_workflow_task_scheduled_and_started();
+        match skipped_event {
+            EventType::WorkflowTaskFailed => history.add_workflow_task_failed_with_failure(
+                WorkflowTaskFailedCause::Unspecified,
+                Default::default(),
+            ),
+            EventType::WorkflowTaskTimedOut => history.add_workflow_task_timed_out(),
+            _ => unreachable!(),
+        }
+        history.add_workflow_task_scheduled();
+        history.add(WorkflowExecutionUpdateAdmittedEventAttributes::default());
+        history.add_workflow_task_started();
+
+        let mut update = history.as_history_update();
+        assert_next_wft_boundary(&mut update, from_wft, &[], required_wft);
+    }
+
+    #[rstest::rstest]
+    #[case::less_than_from(-1)]
+    #[case::equal_to_from(0)]
+    fn consumed_sequencing_evidence_does_not_create_a_new_boundary(#[case] evidence_offset: i64) {
+        let FoldableWftFixture {
+            mut history,
+            required_wft: from_wft,
+            ..
+        } = foldable_wft();
+        history.add_full_wf_task();
+        history.add_full_wf_task();
+        history.add_workflow_task_scheduled_and_started();
+
+        let events = history.get_full_history_info().unwrap().events().to_vec();
+        let unconstrained = find_end_index_of_next_wft_seq(&events, from_wft, true, &[]);
+        assert_eq!(
+            find_end_index_of_next_wft_seq(&events, from_wft, true, &[from_wft + evidence_offset])
+                .index(),
+            unconstrained.index()
+        );
+    }
+
+    #[rstest::rstest]
+    #[case::adjacent_live(UpdateEvidence::Live, InterveningEvent::None)]
+    #[case::live_after_one_signal(UpdateEvidence::Live, InterveningEvent::Signals(1))]
+    #[case::live_after_two_signals(UpdateEvidence::Live, InterveningEvent::Signals(2))]
+    #[case::live_after_cancel(UpdateEvidence::Live, InterveningEvent::CancelRequested)]
+    #[case::live_after_command(UpdateEvidence::Live, InterveningEvent::Command)]
+    #[case::adjacent_admitted(UpdateEvidence::Admitted, InterveningEvent::None)]
+    #[case::admitted_after_one_signal(UpdateEvidence::Admitted, InterveningEvent::Signals(1))]
+    #[case::admitted_after_two_signals(UpdateEvidence::Admitted, InterveningEvent::Signals(2))]
+    fn sequencing_evidence_selects_preceding_logical_wft(
+        #[case] evidence: UpdateEvidence,
+        #[case] intervening_event: InterveningEvent,
+    ) {
+        let FoldableWftFixture {
+            mut history,
+            from_wft,
+            required_wft,
+            ..
+        } = foldable_wft();
+        if matches!(intervening_event, InterveningEvent::Command) {
+            history.add_timer_started("command-producing-continuation".to_string());
+        }
+        history.add_workflow_task_scheduled();
+        match intervening_event {
+            InterveningEvent::Signals(count) => {
+                for index in 0..count {
+                    history.add_we_signaled(&format!("before-update-{index}"), vec![]);
+                }
+            }
+            InterveningEvent::CancelRequested => history.add_cancel_requested(),
+            InterveningEvent::None | InterveningEvent::Command => {}
+        }
+        let sequencing_event_id = history.current_event_id();
+        if matches!(evidence, UpdateEvidence::Admitted) {
+            history.add(WorkflowExecutionUpdateAdmittedEventAttributes::default());
+        }
+        history.add_workflow_task_started();
+
+        let events = history.get_full_history_info().unwrap().events().to_vec();
+        let live_evidence = matches!(evidence, UpdateEvidence::Live)
+            .then_some(sequencing_event_id)
+            .into_iter()
+            .collect::<Vec<_>>();
+        assert_eq!(
+            boundary_event_id(&events, from_wft, true, &live_evidence),
+            required_wft
+        );
     }
 }
