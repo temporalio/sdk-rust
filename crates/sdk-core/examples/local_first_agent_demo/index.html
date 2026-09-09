@@ -1,0 +1,93 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta
+      name="description"
+      content="Interactive Temporal local-first workflow execution demo"
+    />
+    <title>Temporal Local-first Agent</title>
+    <link rel="stylesheet" href="/app.css" />
+  </head>
+  <body>
+    <div class="app-shell">
+      <header class="topbar">
+        <div class="brand">
+          <span class="brand-mark" aria-hidden="true">T</span>
+          <div>
+            <strong>Temporal Local-first</strong>
+            <span>Agent workflow · timeout-fix</span>
+          </div>
+        </div>
+        <div class="system-status" aria-live="polite">
+          <span><i class="status-dot"></i>Upstream connected</span>
+          <span><i class="status-dot local"></i>Executing locally</span>
+          <span class="sync-summary" id="sync-summary">Loading histories…</span>
+        </div>
+      </header>
+
+      <main class="workspace">
+        <section class="agent-pane" aria-labelledby="agent-heading">
+          <div class="pane-heading">
+            <div>
+              <h1 id="agent-heading">Coding agent</h1>
+              <p id="agent-status">Connecting to the workflow…</p>
+            </div>
+            <code id="workflow-id">coding-agent-demo</code>
+          </div>
+
+          <div class="transcript" id="transcript" aria-live="polite">
+            <div class="empty-state">Preparing the local workflow…</div>
+          </div>
+
+          <form class="composer" id="prompt-form">
+            <label for="prompt">Next turn</label>
+            <div class="composer-row">
+              <textarea id="prompt" rows="2" readonly></textarea>
+              <button id="send-turn" type="submit" disabled>
+                <span>Send</span>
+                <span aria-hidden="true">↗</span>
+              </button>
+            </div>
+            <p id="composer-note">Waiting for local and upstream history…</p>
+          </form>
+        </section>
+
+        <aside class="history-pane" aria-labelledby="history-heading">
+          <div class="pane-heading history-heading">
+            <div>
+              <h2 id="history-heading">Temporal UI</h2>
+              <p id="sync-cursor">Opening the workflow in both servers…</p>
+            </div>
+          </div>
+
+          <div class="ui-columns">
+            <section aria-labelledby="local-history-heading">
+              <div class="ui-column-heading">
+                <span><i class="legend-dot local-only"></i></span>
+                <div>
+                  <h3 id="local-history-heading">Local server</h3>
+                  <p id="local-count">0 events</p>
+                </div>
+              </div>
+              <iframe id="local-ui" title="Local server Temporal UI"></iframe>
+            </section>
+
+            <section aria-labelledby="upstream-history-heading">
+              <div class="ui-column-heading">
+                <span><i class="legend-dot synced"></i></span>
+                <div>
+                  <h3 id="upstream-history-heading">Upstream server</h3>
+                  <p id="upstream-count">0 events</p>
+                </div>
+              </div>
+              <iframe id="upstream-ui" title="Upstream server Temporal UI"></iframe>
+            </section>
+          </div>
+        </aside>
+      </main>
+    </div>
+    <script src="/app.js" defer></script>
+  </body>
+</html>

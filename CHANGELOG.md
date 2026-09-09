@@ -89,6 +89,9 @@ relevant information.
 * Experimental `WorkerOptions::local_first_options` support can start a durable Temporal CLI bridge
   and route Worker polling through it when the server and namespace advertise local-execution
   support. Unsupported servers continue using the configured upstream connection.
+* A local-first coding-agent example demonstrates bursts of timed ordinary Activities, persisted
+  Activity summaries, explicitly triggered synchronization at user-input waits, and side-by-side
+  official Temporal UI history pages connected to the local and upstream frontends.
 
 ## [0.8.0] - 2026-09-02
 
