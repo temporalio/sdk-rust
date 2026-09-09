@@ -1370,6 +1370,13 @@ pub struct CancelExternalWorkflowInput {
     pub run_id: Option<String>,
     /// Cancellation reason.
     pub reason: Option<String>,
+    /// Event Groups to attach to the cancel-external-workflow command, in addition to any groups
+    /// from the enclosing Event Group scope.
+    ///
+    /// **EXPERIMENTAL:** Event Groups is an experimental API and may change without notice.
+    #[cfg(feature = "experimental")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "experimental")))]
+    pub event_groups: Vec<crate::EventGroup>,
 }
 
 /// Input passed to [`WorkflowInterceptor::continue_as_new`].
