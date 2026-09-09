@@ -36,6 +36,13 @@ pub enum WorkerValidationError {
         /// The namespace that could not be described.
         namespace: String,
     },
+    /// Local-first execution was available, but its bridge could not be started or connected.
+    #[error("local-first bridge startup failed: {source}")]
+    LocalBridgeStart {
+        /// The underlying bridge process, bootstrap, or connection error.
+        #[source]
+        source: anyhow::Error,
+    },
 }
 
 impl WorkerValidationError {
@@ -43,6 +50,9 @@ impl WorkerValidationError {
         match error {
             CoreWorkerValidationError::NamespaceDescribeError { source, namespace } => {
                 Self::NamespaceDescribeError { source, namespace }
+            }
+            CoreWorkerValidationError::LocalBridgeStart { source } => {
+                Self::LocalBridgeStart { source }
             }
         }
     }

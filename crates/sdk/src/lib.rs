@@ -173,10 +173,9 @@ use tokio_util::sync::CancellationToken;
 use tracing::{Instrument, Span, field};
 use uuid::Uuid;
 
-use crate::runtime::{
-    CoreWorker, LocalFirstOptions, PollerBehavior, TunerBuilder, WorkerConfig, WorkerTuner,
-    WorkerVersioningStrategy, WorkflowErrorType,
-};
+#[cfg(feature = "experimental")]
+use crate::runtime::LocalFirstOptions;
+use crate::runtime::{PollerBehavior, WorkflowErrorType, worker_tuner::WorkerTuner};
 
 /// Contains options for configuring a worker.
 ///
