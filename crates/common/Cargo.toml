@@ -1,7 +1,8 @@
 [package]
 name = "temporalio-common"
-version = "0.8.0"
+version = "1.0.0"
 edition = "2024"
+rust-version = "1.88.0"
 authors = ["Temporal Technologies Inc. <sdk@temporal.io>"]
 license-file = { workspace = true }
 description = "Common functionality for the Temporal SDK Core, Client, and Rust SDK"
@@ -36,6 +37,7 @@ envconfig = ["dep:toml", "dep:dirs"]
 serde_serialize = ["temporalio-common-wasm/serde_serialize", "temporalio-protos/serde_serialize"]
 core-telemetry-bridge = ["dep:ringbuf", "dep:futures-channel"]
 core-based-sdk = ["core-telemetry-bridge", "prometheus", "envconfig"]
+vendored-protox = ["temporalio-protos/vendored-protox"]
 
 [dependencies]
 anyhow = "1.0"
@@ -106,12 +108,12 @@ uuid = { version = "1.18", default-features = false, features = ["v4"] }
 
 [dependencies.temporalio-protos]
 path = "../protos"
-version = "~0.8.0"
+version = "~0.9.0"
 features = ["grpc-clients"]
 
 [dependencies.temporalio-common-wasm]
 path = "../common-wasm"
-version = "~0.8.0"
+version = "~1.0.0"
 
 [build-dependencies]
 prost = { workspace = true }

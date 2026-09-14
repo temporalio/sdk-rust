@@ -7,9 +7,6 @@ This crate provides a Rust client for interacting with the Temporal service. It 
 standalone to start and manage workflows, or together with the
 [`temporalio-sdk`](https://crates.io/crates/temporalio-sdk) crate to run workers.
 
-⚠️ **This crate is in Public Preview and under active development.** The API can and
-will continue to evolve.
-
 ## Quick Start
 
 ### Connecting and Starting Workflows with Environment Configuration
@@ -166,6 +163,11 @@ while let Some(result) = stream.next().await {
 
 APIs that are still under development require the `experimental` Cargo feature and may change or
 be removed before stabilization.
+
+## Building Without `protoc`
+
+Enable the `vendored-protox` Cargo feature to compile protobuf definitions with `protox`
+instead of a system `protoc` binary.
 
 ## Raw gRPC Access
 

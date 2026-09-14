@@ -8,7 +8,7 @@ use workflows::{BookingActivities, SagaWorkflow};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let runtime = Runtime::new_assume_tokio(Default::default())?;
+    let runtime = Runtime::from_current_tokio(Default::default())?;
     let (conn_opts, client_opts) =
         ClientOptions::load_from_config(LoadClientConfigProfileOptions::default())?;
     let connection = Connection::connect(conn_opts).await?;

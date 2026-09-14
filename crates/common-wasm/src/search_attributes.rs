@@ -17,7 +17,10 @@
 //! let unset = MY_KW.value_unset();
 //! ```
 
-use std::{collections::HashMap, marker::PhantomData};
+use std::{
+    collections::{BTreeMap, HashMap},
+    marker::PhantomData,
+};
 
 use tracing::warn;
 
@@ -565,7 +568,7 @@ impl SearchAttributeUpdate {
 /// [`SearchAttributeKey`].
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct SearchAttributes {
-    fields: HashMap<String, Payload>,
+    fields: BTreeMap<String, Payload>,
 }
 
 impl SearchAttributes {
@@ -573,7 +576,7 @@ impl SearchAttributes {
     ///
     /// Updates with `None` payloads remove any existing entry for that key.
     pub fn new(updates: impl IntoIterator<Item = SearchAttributeUpdate>) -> Self {
-        let mut fields = HashMap::new();
+        let mut fields = BTreeMap::new();
         for update in updates {
             match update.payload {
                 Some(payload) => {
@@ -647,7 +650,7 @@ impl SearchAttributes {
         self.fields.len()
     }
 
-    /// Returns an iterator over the attribute names in this collection.
+    /// Returns an iterator over the attribute names in lexicographic order.
     pub fn keys(&self) -> impl Iterator<Item = &str> {
         self.fields.keys().map(|s| s.as_str())
     }
@@ -662,7 +665,7 @@ impl SearchAttributes {
     /// Convert to the proto wire representation.
     pub fn to_proto(&self) -> ProtoSearchAttributes {
         ProtoSearchAttributes {
-            indexed_fields: self.fields.clone(),
+            indexed_fields: self.fields.clone().into_iter().collect(),
         }
     }
 
@@ -670,14 +673,14 @@ impl SearchAttributes {
     /// cloning.
     pub fn into_proto(self) -> ProtoSearchAttributes {
         ProtoSearchAttributes {
-            indexed_fields: self.fields,
+            indexed_fields: self.fields.into_iter().collect(),
         }
     }
 
     /// Construct from the proto wire representation by cloning the inner map.
     pub fn from_proto(attrs: &ProtoSearchAttributes) -> Self {
         Self {
-            fields: attrs.indexed_fields.clone(),
+            fields: attrs.indexed_fields.clone().into_iter().collect(),
         }
     }
 }
@@ -686,7 +689,7 @@ impl From<ProtoSearchAttributes> for SearchAttributes {
     /// Construct from an owned proto, moving the inner map without cloning.
     fn from(attrs: ProtoSearchAttributes) -> Self {
         Self {
-            fields: attrs.indexed_fields,
+            fields: attrs.indexed_fields.into_iter().collect(),
         }
     }
 }
@@ -1120,11 +1123,19 @@ mod tests {
     }
 
     #[test]
-    fn keys_returns_attribute_names() {
-        let attrs = SearchAttributes::new([BOOL_KEY.value_set(true), INT_KEY.value_set(42)]);
-        let mut keys: Vec<&str> = attrs.keys().collect();
-        keys.sort();
-        assert_eq!(keys, vec!["my_bool", "my_int"]);
+    fn search_attribute_keys_have_replay_stable_order() {
+        let attrs = SearchAttributes::from(ProtoSearchAttributes {
+            indexed_fields: HashMap::from([
+                ("zebra".to_owned(), Payload::default()),
+                ("alpha".to_owned(), Payload::default()),
+                ("middle".to_owned(), Payload::default()),
+            ]),
+        });
+
+        assert_eq!(
+            attrs.keys().collect::<Vec<_>>(),
+            vec!["alpha", "middle", "zebra"]
+        );
     }
 
     #[test]

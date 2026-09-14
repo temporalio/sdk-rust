@@ -36,7 +36,7 @@ use url::Url;
 use uuid::Uuid;
 
 fn new_sdk_runtime() -> Runtime {
-    Runtime::new_assume_tokio(
+    Runtime::from_current_tokio(
         RuntimeOptions::builder()
             .telemetry_options(get_integ_telem_options())
             .build()
@@ -87,6 +87,10 @@ impl WorkerPlugin for IntegrationPlugin {
     }
 }
 
+#[temporalio_macros::cloud_test_exclusion(
+    crate::CloudTestExclusionReason::NeedsCloudAdaptation,
+    "Retargeting the client discards envconfig TLS options, so the HTTPS Cloud connection cannot be established."
+)]
 #[tokio::test]
 async fn plugins_configure_client_and_worker() {
     let runtime = new_sdk_runtime();

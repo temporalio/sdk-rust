@@ -3,11 +3,8 @@
 [![crates.io](https://img.shields.io/crates/v/temporalio-sdk.svg)](https://crates.io/crates/temporalio-sdk)
 [![docs.rs](https://docs.rs/temporalio-sdk/badge.svg)](https://docs.rs/temporalio-sdk)
 
-This crate contains a Public Preview Rust SDK. The SDK is built on top of
-Core and provides a native Rust experience for writing Temporal workflows and activities.
-
-⚠️ **The SDK is in Public Preview and under active development.** The API can and
-will continue to evolve.
+This crate contains the Temporal Rust SDK. The SDK is built on top of Core and provides a native
+Rust experience for writing Temporal workflows and activities.
 
 ## Quick Start
 
@@ -88,7 +85,7 @@ use temporalio_sdk::{Runtime, Worker, WorkerOptions};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let runtime = Runtime::new_assume_tokio(Default::default())?;
+    let runtime = Runtime::from_current_tokio(Default::default())?;
     let (conn_options, client_options) = ClientOptions::load_from_config(
         LoadClientConfigProfileOptions::default()
     )?;

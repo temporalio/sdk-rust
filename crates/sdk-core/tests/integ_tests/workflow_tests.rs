@@ -68,9 +68,10 @@ use temporalio_macros::{workflow, workflow_methods};
 use temporalio_sdk::{
     ActivityOptions, LocalActivityOptions, TimerOptions, WorkflowContext, WorkflowResult,
     interceptors::WorkerInterceptor,
+    runtime::{PollerBehavior, WorkflowErrorType},
 };
 use temporalio_sdk_core::{
-    CoreRuntime, PollError, PollerBehavior, TunerHolder, WorkflowErrorType, prost_dur,
+    CoreRuntime, PollError, TunerHolder, prost_dur,
     replay::{DEFAULT_WORKFLOW_TYPE, HistoryForReplay, canned_histories},
     test_help::{
         MockPollCfg, WorkerTestHelpers, drain_pollers_and_shutdown, schedule_activity_cmd,
@@ -388,7 +389,7 @@ async fn wft_timeout_doesnt_create_unsolvable_autocomplete() {
     let mut wf_starter = CoreWfStarter::new("wft_timeout_doesnt_create_unsolvable_autocomplete");
     // Test needs eviction on and a short timeout
     wf_starter.sdk_config.max_cached_workflows = 0_usize;
-    wf_starter.sdk_config.tuner = Arc::new(TunerHolder::fixed_size(1, 1, 1, 1));
+    wf_starter.set_core_tuner(Arc::new(TunerHolder::fixed_size(1, 1, 1, 1)));
     wf_starter.sdk_config.workflow_task_poller_behavior =
         Some(PollerBehavior::SimpleMaximum(1_usize));
     wf_starter.workflow_options.task_timeout = Some(Duration::from_secs(1));
@@ -517,7 +518,7 @@ impl SlowCompletesWf {
 async fn slow_completes_with_small_cache() {
     let wf_name = "slow_completes_with_small_cache";
     let mut starter = CoreWfStarter::new(wf_name);
-    starter.sdk_config.tuner = Arc::new(TunerHolder::fixed_size(5, 10, 1, 1));
+    starter.set_core_tuner(Arc::new(TunerHolder::fixed_size(5, 10, 1, 1)));
     starter.sdk_config.max_cached_workflows = 5_usize;
     starter.sdk_config.register_activities(StdActivities);
     starter
@@ -917,8 +918,9 @@ async fn nondeterminism_errors_fail_workflow_when_configured_to(
     worker.run_until_done().await.unwrap();
 
     let body = metrics_tests::get_text(format!("http://{addr}/metrics")).await;
+    let namespace = client.namespace();
     let match_this = format!(
-        "temporal_workflow_failed{{namespace=\"default\",\
+        "temporal_workflow_failed{{namespace=\"{namespace}\",\
          service_name=\"temporal-core-sdk\",\
          task_queue=\"{wf_id}\",workflow_type=\"{wf_name}\"}} 1"
     );
@@ -1042,6 +1044,7 @@ async fn history_out_of_order_on_restart() {
     assert_matches!(res, Err(WorkflowGetResultError::Failed(_)));
 }
 
+#[temporalio_macros::cloud_test_exclusion(crate::CloudTestExclusionReason::DoesNotUseServer)]
 #[tokio::test]
 async fn pass_timer_summary_to_metadata() {
     let t = canned_histories::single_timer("1");

@@ -420,6 +420,7 @@ impl UnusedChildWf {
     }
 }
 
+#[temporalio_macros::cloud_test_exclusion(crate::CloudTestExclusionReason::DoesNotUseServer)]
 #[rstest::rstest]
 #[case::signal_then_result(true)]
 #[case::signal_and_result_concurrent(false)]
@@ -485,6 +486,7 @@ impl ParentCancelsChildWf {
     }
 }
 
+#[temporalio_macros::cloud_test_exclusion(crate::CloudTestExclusionReason::DoesNotUseServer)]
 #[tokio::test]
 async fn cancel_child_workflow() {
     let t = canned_histories::single_child_workflow_cancelled("child-id-1");
@@ -813,6 +815,7 @@ impl PassChildWorkflowSummaryToMetadata {
     }
 }
 
+#[temporalio_macros::cloud_test_exclusion(crate::CloudTestExclusionReason::DoesNotUseServer)]
 #[tokio::test]
 async fn pass_child_workflow_summary_to_metadata() {
     let wf_id = "1";
@@ -938,6 +941,7 @@ impl ParentWf {
     }
 }
 
+#[temporalio_macros::cloud_test_exclusion(crate::CloudTestExclusionReason::DoesNotUseServer)]
 #[rstest(
     mock_cfg,
     case::success(child_workflow_happy_hist()),
@@ -972,6 +976,7 @@ async fn single_child_workflow_until_completion(mut mock_cfg: MockPollCfg) {
     worker.run().await.unwrap();
 }
 
+#[temporalio_macros::cloud_test_exclusion(crate::CloudTestExclusionReason::DoesNotUseServer)]
 #[tokio::test]
 async fn single_child_workflow_start_fail() {
     let child_wf_id = "child-id-1";
@@ -1040,6 +1045,7 @@ impl CancelBeforeSendWf {
     }
 }
 
+#[temporalio_macros::cloud_test_exclusion(crate::CloudTestExclusionReason::DoesNotUseServer)]
 #[tokio::test]
 async fn single_child_workflow_cancel_before_sent() {
     let mut t = TestHistoryBuilder::default();
@@ -1153,6 +1159,7 @@ impl CancelChildBeforeStartedCannedWf {
     }
 }
 
+#[temporalio_macros::cloud_test_exclusion(crate::CloudTestExclusionReason::DoesNotUseServer)]
 #[tokio::test]
 async fn cancel_child_before_started_event_exposes_cancelled_error() {
     let t = canned_histories::cancel_child_workflow_before_started_event("child-id-1");
@@ -1491,6 +1498,7 @@ impl UnitChildParentWf {
 /// Parent that starts a typed child returning () and awaits its result.
 /// With a canned history whose completion is missing a result (simulating a
 /// non-Rust child workflow that might not have a result payload).
+#[temporalio_macros::cloud_test_exclusion(crate::CloudTestExclusionReason::DoesNotUseServer)]
 #[tokio::test]
 async fn child_workflow_unit_result_none_payload() {
     // single_child_workflow produces a completion with result: None

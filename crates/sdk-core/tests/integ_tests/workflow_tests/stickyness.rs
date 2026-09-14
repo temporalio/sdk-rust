@@ -9,8 +9,8 @@ use std::{
 use temporalio_client::WorkflowStartOptions;
 use temporalio_common::protos::temporal::api::enums::v1::EventType;
 use temporalio_macros::{workflow, workflow_methods};
-use temporalio_sdk::{WorkflowContext, WorkflowResult};
-use temporalio_sdk_core::{PollerBehavior, TunerHolder};
+use temporalio_sdk::{WorkflowContext, WorkflowResult, runtime::PollerBehavior};
+use temporalio_sdk_core::TunerHolder;
 use tokio::sync::Barrier;
 
 #[tokio::test]
@@ -121,7 +121,7 @@ impl CacheMissWf {
 async fn cache_miss_ok() {
     let wf_name = "cache_miss_ok";
     let mut starter = CoreWfStarter::new(wf_name);
-    starter.sdk_config.tuner = Arc::new(TunerHolder::fixed_size(2, 1, 1, 1));
+    starter.set_core_tuner(Arc::new(TunerHolder::fixed_size(2, 1, 1, 1)));
     starter.sdk_config.max_cached_workflows = 0_usize;
     starter.sdk_config.workflow_task_poller_behavior = Some(PollerBehavior::SimpleMaximum(1_usize));
 

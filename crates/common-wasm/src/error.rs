@@ -7,19 +7,28 @@ use crate::{
         RawValue, SerializationContext, SerializationContextData, TemporalDeserializable,
         TemporalSerializable,
     },
-    protos::{
-        coresdk::child_workflow::StartChildWorkflowExecutionFailedCause,
-        temporal::api::{
-            common::v1::{Payload, Payloads},
-            enums::v1::{
-                ApplicationErrorCategory as ProtoApplicationErrorCategory,
-                RetryState as ProtoRetryState, TimeoutType as ProtoTimeoutType,
-            },
-            failure::v1::Failure,
+    protos::temporal::api::{
+        common::v1::{Payload, Payloads},
+        enums::v1::{
+            ApplicationErrorCategory as ProtoApplicationErrorCategory,
+            RetryState as ProtoRetryState, TimeoutType as ProtoTimeoutType,
         },
+        failure::v1::Failure,
     },
 };
 use std::time::Duration;
+
+/// Why starting a child workflow failed.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[non_exhaustive]
+pub enum StartChildWorkflowExecutionFailedCause {
+    /// No cause was specified.
+    Unspecified,
+    /// A workflow with the requested ID already exists.
+    WorkflowAlreadyExists,
+    /// A cause introduced by a newer server or API version.
+    Unknown,
+}
 
 /// Describes why a retry did or did not occur.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]

@@ -1,4 +1,4 @@
-use crate::common::{CoreWfStarter, NAMESPACE, get_integ_connection};
+use crate::common::{CoreWfStarter, get_integ_connection};
 use std::time::Duration;
 use temporalio_client::{Client, NamespacedClient, WorkflowStartOptions, grpc::WorkflowService};
 use temporalio_common::protos::temporal::api::{
@@ -58,7 +58,8 @@ async fn eager_wf_start_different_clients() {
     let mut worker = starter.worker().await;
 
     let connection = get_integ_connection(None).await;
-    let client_opts = temporalio_client::ClientOptions::new(NAMESPACE).build();
+    let client_opts =
+        temporalio_client::ClientOptions::new(starter.get_core_client().await.namespace()).build();
     let client = Client::new(connection, client_opts).unwrap();
     let task_queue = starter.get_task_queue().to_string();
     let res = eager_start(

@@ -337,6 +337,7 @@ impl SignalSenderCanned {
     }
 }
 
+#[temporalio_macros::cloud_test_exclusion(crate::CloudTestExclusionReason::DoesNotUseServer)]
 #[rstest::rstest]
 #[case::succeeds(false)]
 #[case::fails(true)]
@@ -408,6 +409,7 @@ impl CancelsBeforeSending {
     }
 }
 
+#[temporalio_macros::cloud_test_exclusion(crate::CloudTestExclusionReason::DoesNotUseServer)]
 #[tokio::test]
 async fn cancels_before_sending() {
     let mut t = TestHistoryBuilder::default();

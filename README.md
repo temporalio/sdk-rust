@@ -5,14 +5,14 @@
 [![crates.io](https://img.shields.io/crates/v/temporalio-sdk.svg)](https://crates.io/crates/temporalio-sdk)
 [![docs.rs](https://docs.rs/temporalio-sdk/badge.svg)](https://docs.rs/temporalio-sdk)
 
-Currently in Public Preview, see more in the [SDK README.md](crates/sdk/README.md)
+See the [SDK README](crates/sdk/README.md) for usage and examples.
 
 # Temporal Rust Client
 
 [![crates.io](https://img.shields.io/crates/v/temporalio-sdk.svg)](https://crates.io/crates/temporalio-client)
 [![docs.rs](https://docs.rs/temporalio-sdk/badge.svg)](https://docs.rs/temporalio-client)
 
-Currently in Public Preview, see more in the [client README.md](crates/client/README.md)
+See the [client README](crates/client/README.md) for usage and examples.
 
 # Temporal Core SDK
 
@@ -47,7 +47,7 @@ This repo is composed of multiple crates:
 - temporalio-sdk-core `./crates/core` - The Core implementation.
 - temporalio-sdk-core-c-bridge `./crates/core-c-bridge` - Provides C bindings for Core.
 - temporalio-macros `./crates/macros` - Implements procedural macros used by core and the SDK.
-- temporalio-sdk `./crates/sdk` - A Public Preview Rust SDK built on top of Core. Used for testing.
+- temporalio-sdk `./crates/sdk` - A Rust SDK built on top of Core.
 
 Visualized (dev dependencies are in blue):
 
@@ -78,6 +78,34 @@ cargo integ-test -s envconfig -- \
 
 `TEMPORAL_CONFIG_FILE` and `TEMPORAL_PROFILE` can select a TOML profile instead. The harness does
 not start, configure, or clean up the target server or namespace in this mode.
+
+Pass `--cloud` to skip integration tests that do not exercise a server, require a local server or
+unavailable Cloud provisioning, or are not yet compatible with Temporal Cloud. Cloud filtering is
+independent of server selection. Run the eligible tests through envconfig, or list the excluded
+cases without connecting to a server:
+
+```bash
+cargo integ-test -s envconfig --cloud
+cargo integ-test -s external --cloud -- --ignored --list
+```
+
+Tests are Cloud-eligible by default. An incompatible test must select a
+`CloudTestExclusionReason` at the test function:
+
+```rust
+#[temporalio_macros::cloud_test_exclusion(
+    crate::CloudTestExclusionReason::DoesNotUseServer
+)]
+#[tokio::test]
+async fn example() {
+    // ...
+}
+```
+
+The supported categories are `DoesNotUseServer`, `RequiresLocalServer`, `RequiresOssOnlyApis`,
+`RequiresCloudProvisioning`, and `NeedsCloudAdaptation`. An optional second string should only be
+used when it adds information beyond the category. In Cloud mode exclusions become native ignored
+tests, so `--ignored --list` lists the skipped cases.
 
 Run load tests with `cargo test --features experimental --test heavy_tests`.
 

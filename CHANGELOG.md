@@ -33,20 +33,37 @@ relevant information.
 
 ## Unreleased
 
-### Added
-* `CancelExternalWorkflowError` and `workflow_interceptors::CancelExternalWorkflowResult`
-  for use in interceptors.
 ### Fixed
 * Sticky workflow backlog no longer prevents normal pollers from using capacity after sticky
-  pollers reach their autoscaling target.
+  pollers reach their polling limit.
+
+## [1.0.0] - 2026-09-04
+
+### Changed
+* Published Rust SDK crates now declare their minimum supported Rust version: Rust 1.92 for
+  `temporalio-sdk`, and Rust 1.88 for the other crates.
+
+### Added
+* `temporalio-client` now provides a `vendored-protox` feature for compiling protobuf definitions
+  with `protox`, allowing client and Rust SDK builds without an installed `protoc`.
+* `CancelExternalWorkflowError` and `workflow_interceptors::CancelExternalWorkflowResult`
+  for use in interceptors.
 * `WorkflowContextKey` and context-value scopes provide replay-safe, workflow-run-owned context
   storage for application code and workflow interceptors. Values survive async suspension while
   remaining isolated between concurrent branches and signal/update handlers. Read-only workflow
   views can observe values established by synchronous inbound interceptors, and outbound
   interceptors can use values to propagate metadata to activities, child workflows, signals,
   Nexus operations, and continue-as-new runs.
-  pollers reach their polling limit.
 ### Breaking Changes
+* `ActivityEnvironmentBuilder` no longer accepts a `tokio_util::sync::CancellationToken`.
+  Use `ActivityEnvironment::cancel` to cancel activities running in the test environment.
+* `ChildWorkflowStartError::StartFailed` now reports an SDK-owned, non-exhaustive
+  `StartChildWorkflowExecutionFailedCause` instead of a generated protobuf enum. Add a wildcard
+  branch when matching the cause.
+* Client options now use client-owned, non-exhaustive `WorkflowIdReusePolicy`,
+  `WorkflowIdConflictPolicy`, `QueryRejectCondition`, `ArchivalState`, and
+  `HistoryEventFilterType` enums instead of generated protobuf enums. Add wildcard branches when
+  matching these types.
 * `ActivityError`, `PayloadConversionError`, `ActivityExecutionError`,
   `ChildWorkflowStartError`, `ChildWorkflowExecutionError`, and `WorkflowSignalError` are now
   non-exhaustive. Add wildcard branches when matching these enums.
@@ -54,6 +71,24 @@ relevant information.
   failure.
 * `WorkflowSignalError::NotFound` and `CancelExternalWorkflowError::NotFound` let workflows
   distinguish a missing signal or cancellation target from other delivery failures.
+
+### Breaking Changes
+* `temporalio-sdk` now exposes SDK-owned worker tuner and slot supplier types instead of
+  re-exporting the corresponding `temporalio-sdk-core` traits.
+* `temporalio-sdk` now owns its runtime, polling, workflow-error, worker-validation, and local test
+  server configuration types instead of re-exporting their `temporalio-sdk-core` equivalents.
+  `TokioRuntimeBuilder` is non-exhaustive and provides a builder for construction. Unrelated Core
+  worker configuration and replay helpers are no longer re-exported by the SDK.
+  `PollerBehavior::Autoscaling` now holds builder-created `AutoscalingOptions`.
+* `Runtime::from_current_tokio` replaces `Runtime::new_assume_tokio` as the preferred constructor.
+  The old name remains as a deprecated alias, but now returns `RuntimeError` instead of
+  `anyhow::Error`.
+
+### Fixed
+* `Runtime::from_current_tokio` now returns `RuntimeError::NoCurrentTokioRuntime` when called
+  without an active Tokio runtime instead of panicking.
+* `Memo::keys` and `SearchAttributes::keys` now iterate in lexicographic order so workflow
+  decisions based on collection traversal remain deterministic during replay.
 
 ## [0.8.0] - 2026-09-02
 

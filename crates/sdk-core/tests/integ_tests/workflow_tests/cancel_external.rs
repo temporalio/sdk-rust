@@ -146,6 +146,7 @@ impl CancelSenderCanned {
     }
 }
 
+#[temporalio_macros::cloud_test_exclusion(crate::CloudTestExclusionReason::DoesNotUseServer)]
 #[rstest::rstest]
 #[case::succeeds(false)]
 #[case::fails(true)]

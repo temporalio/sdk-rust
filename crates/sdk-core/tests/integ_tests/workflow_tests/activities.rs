@@ -58,9 +58,10 @@ use temporalio_sdk::{
         ActivityInboundInterceptor, ExecuteActivityInput, ExecuteActivityOutput,
         ExecuteActivityResult, Next,
     },
+    runtime::{AutoscalingOptions, PollerBehavior},
 };
 use temporalio_sdk_core::{
-    PollerBehavior, prost_dur,
+    prost_dur,
     replay::{DEFAULT_ACTIVITY_TYPE, DEFAULT_WORKFLOW_TYPE, TestHistoryBuilder, canned_histories},
     test_help::{
         MockPollCfg, ResponseType, WorkerTestHelpers, drain_pollers_and_shutdown,
@@ -2134,16 +2135,20 @@ async fn activity_can_be_cancelled_by_local_timeout() {
 async fn long_activity_timeout_repro() {
     let wf_name = "long_activity_timeout_repro";
     let mut starter = CoreWfStarter::new(wf_name);
-    starter.sdk_config.workflow_task_poller_behavior = Some(PollerBehavior::Autoscaling {
-        minimum: 1,
-        maximum: 10,
-        initial: 5,
-    });
-    starter.sdk_config.activity_task_poller_behavior = Some(PollerBehavior::Autoscaling {
-        minimum: 1,
-        maximum: 10,
-        initial: 5,
-    });
+    starter.sdk_config.workflow_task_poller_behavior = Some(PollerBehavior::Autoscaling(
+        AutoscalingOptions::builder()
+            .minimum(1)
+            .maximum(10)
+            .initial(5)
+            .build(),
+    ));
+    starter.sdk_config.activity_task_poller_behavior = Some(PollerBehavior::Autoscaling(
+        AutoscalingOptions::builder()
+            .minimum(1)
+            .maximum(10)
+            .initial(5)
+            .build(),
+    ));
     starter
         .set_core_cfg_mutator(|m| m.local_timeout_buffer_for_activities = Duration::from_secs(0));
     starter.sdk_config.register_activities(StdActivities);
@@ -2189,6 +2194,7 @@ async fn long_activity_timeout_repro() {
     worker.run_until_done().await.unwrap();
 }
 
+#[temporalio_macros::cloud_test_exclusion(crate::CloudTestExclusionReason::DoesNotUseServer)]
 #[tokio::test]
 async fn pass_activity_summary_to_metadata() {
     let t = canned_histories::single_activity("1");
@@ -2259,6 +2265,7 @@ async fn pass_activity_summary_to_metadata() {
     worker.run_until_done().await.unwrap();
 }
 
+#[temporalio_macros::cloud_test_exclusion(crate::CloudTestExclusionReason::DoesNotUseServer)]
 #[rstest(hist_batches, case::incremental(&[1, 2, 3, 4]), case::replay(&[4]))]
 #[tokio::test]
 async fn abandoned_activities_ignore_start_and_complete(hist_batches: &'static [usize]) {
@@ -2362,6 +2369,7 @@ impl ImmediateActivityCancelationWorkflow {
     }
 }
 
+#[temporalio_macros::cloud_test_exclusion(crate::CloudTestExclusionReason::DoesNotUseServer)]
 #[tokio::test]
 async fn immediate_activity_cancelation() {
     let mut t = TestHistoryBuilder::default();

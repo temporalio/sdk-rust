@@ -115,7 +115,7 @@ async fn continue_as_new_multiple_concurrent() {
     let wf_name = "continue_as_new_multiple_concurrent";
     let mut starter = CoreWfStarter::new(wf_name);
     starter.sdk_config.max_cached_workflows = 5_usize;
-    starter.sdk_config.tuner = Arc::new(TunerHolder::fixed_size(5, 1, 1, 1));
+    starter.set_core_tuner(Arc::new(TunerHolder::fixed_size(5, 1, 1, 1)));
     starter
         .sdk_config
         .register_workflow::<ContinueAsNewWf>()
@@ -156,6 +156,7 @@ impl WfWithTimer {
     }
 }
 
+#[temporalio_macros::cloud_test_exclusion(crate::CloudTestExclusionReason::DoesNotUseServer)]
 #[tokio::test]
 async fn wf_completing_with_continue_as_new() {
     let t = canned_histories::timer_then_continue_as_new("1");
@@ -206,6 +207,7 @@ impl ContinueAsNewSuggestedWf {
     }
 }
 
+#[temporalio_macros::cloud_test_exclusion(crate::CloudTestExclusionReason::DoesNotUseServer)]
 #[tokio::test]
 async fn continue_as_new_suggested_flag_exposed() {
     let mut t = canned_histories::timer_then_continue_as_new("1");
@@ -247,6 +249,10 @@ impl ClearSearchAttrsOnContinueAsNewWf {
     }
 }
 
+#[temporalio_macros::cloud_test_exclusion(
+    crate::CloudTestExclusionReason::RequiresCloudProvisioning,
+    "Uses a custom search attribute that isolated Cloud CI does not provision."
+)]
 #[tokio::test]
 async fn clear_search_attributes_on_continue_as_new() {
     let wf_name = "clear_search_attrs_on_continue_as_new";

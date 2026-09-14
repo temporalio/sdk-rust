@@ -23,28 +23,22 @@ use std::{
 };
 use temporalio_client::{
     NamespacedClient, UntypedSignal, UntypedWorkflow, WorkflowExecutionInfo,
-    WorkflowGetResultOptions, WorkflowSignalOptions, WorkflowStartOptions,
+    WorkflowGetResultOptions, WorkflowIdConflictPolicy, WorkflowIdReusePolicy,
+    WorkflowSignalOptions, WorkflowStartOptions,
 };
-use temporalio_common::{
-    data_converters::RawValue, protos::temporal::api::enums::v1::WorkflowIdConflictPolicy,
-};
+use temporalio_common::data_converters::RawValue;
 use temporalio_macros::{activities, workflow, workflow_methods};
 
 use temporalio_common::{
-    ActivityCloseTimeouts,
-    protos::{
-        coresdk::workflow_commands::ActivityCancellationType,
-        temporal::api::enums::v1::WorkflowIdReusePolicy,
-    },
+    ActivityCloseTimeouts, protos::coresdk::workflow_commands::ActivityCancellationType,
 };
 use temporalio_sdk::{
     ActivityOptions, SyncWorkflowContext, WorkflowContext, WorkflowResult,
     activities::{ActivityContext, ActivityError},
+    runtime::{AutoscalingOptions, PollerBehavior},
     workflows,
 };
-use temporalio_sdk_core::{
-    CoreRuntime, PollerBehavior, ResourceBasedTuner, ResourceSlotOptions, TunerHolder,
-};
+use temporalio_sdk_core::{CoreRuntime, ResourceBasedTuner, ResourceSlotOptions, TunerHolder};
 
 #[workflow]
 #[derive(Clone, Default)]
@@ -85,8 +79,12 @@ async fn activity_load() {
     let mut starter = CoreWfStarter::new("activity_load");
     starter.sdk_config.max_cached_workflows = CONCURRENCY;
     starter.sdk_config.activity_task_poller_behavior = Some(PollerBehavior::SimpleMaximum(10));
-    starter.sdk_config.tuner =
-        Arc::new(TunerHolder::fixed_size(CONCURRENCY, CONCURRENCY, 100, 100));
+    starter.set_core_tuner(Arc::new(TunerHolder::fixed_size(
+        CONCURRENCY,
+        CONCURRENCY,
+        100,
+        100,
+    )));
     starter.sdk_config.register_activities(StdActivities);
     starter
         .sdk_config
@@ -178,7 +176,7 @@ async fn chunky_activities_resource_based() {
             Duration::from_millis(0),
         ))
         .with_activity_slots_options(ResourceSlotOptions::new(5, 1000, Duration::from_millis(50)));
-    starter.sdk_config.tuner = Arc::new(tuner);
+    starter.set_core_tuner(Arc::new(tuner));
 
     starter.sdk_config.register_activities(ChunkyActivities);
     starter
@@ -255,7 +253,7 @@ async fn workflow_load() {
     let mut starter = CoreWfStarter::new_with_runtime("workflow_load", rt);
     starter.sdk_config.max_cached_workflows = 200;
     starter.sdk_config.activity_task_poller_behavior = Some(PollerBehavior::SimpleMaximum(10));
-    starter.sdk_config.tuner = Arc::new(TunerHolder::fixed_size(5, 100, 100, 100));
+    starter.set_core_tuner(Arc::new(TunerHolder::fixed_size(5, 100, 100, 100)));
     starter.sdk_config.register_activities(StdActivities);
     let task_queue = starter.get_task_queue().to_owned();
     starter
@@ -311,7 +309,7 @@ async fn evict_while_la_running_no_interference() {
     // Though it doesn't make sense to set wft higher than cached workflows, leaving this commented
     // introduces more instability that can be useful in the test.
     // starter.max_wft(20);
-    starter.sdk_config.tuner = Arc::new(TunerHolder::fixed_size(100, 10, 20, 1));
+    starter.set_core_tuner(Arc::new(TunerHolder::fixed_size(100, 10, 20, 1)));
     starter.sdk_config.register_activities(StdActivities);
     starter
         .sdk_config
@@ -467,17 +465,21 @@ async fn poller_autoscaling_basic_loadtest() {
     let wf_name = "poller_load";
     let mut starter = CoreWfStarter::new("poller_load");
     starter.sdk_config.max_cached_workflows = 5000;
-    starter.sdk_config.tuner = Arc::new(TunerHolder::fixed_size(1000, 1000, 100, 1));
-    starter.sdk_config.workflow_task_poller_behavior = Some(PollerBehavior::Autoscaling {
-        minimum: 1,
-        maximum: 200,
-        initial: 5,
-    });
-    starter.sdk_config.activity_task_poller_behavior = Some(PollerBehavior::Autoscaling {
-        minimum: 1,
-        maximum: 200,
-        initial: 5,
-    });
+    starter.set_core_tuner(Arc::new(TunerHolder::fixed_size(1000, 1000, 100, 1)));
+    starter.sdk_config.workflow_task_poller_behavior = Some(PollerBehavior::Autoscaling(
+        AutoscalingOptions::builder()
+            .minimum(1)
+            .maximum(200)
+            .initial(5)
+            .build(),
+    ));
+    starter.sdk_config.activity_task_poller_behavior = Some(PollerBehavior::Autoscaling(
+        AutoscalingOptions::builder()
+            .minimum(1)
+            .maximum(200)
+            .initial(5)
+            .build(),
+    ));
 
     starter.sdk_config.register_activities(JitteryActivities);
     starter

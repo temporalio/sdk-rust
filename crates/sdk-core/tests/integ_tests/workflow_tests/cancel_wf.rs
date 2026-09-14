@@ -466,6 +466,7 @@ impl WfWithTimer {
     }
 }
 
+#[temporalio_macros::cloud_test_exclusion(crate::CloudTestExclusionReason::DoesNotUseServer)]
 #[tokio::test]
 async fn wf_completing_with_cancelled() {
     let t = canned_histories::timer_wf_cancel_req_cancelled("1");

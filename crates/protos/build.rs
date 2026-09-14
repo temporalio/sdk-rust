@@ -1,4 +1,7 @@
 use std::{env, path::PathBuf};
+
+#[cfg(feature = "vendored-protox")]
+use prost::Message;
 use tonic_prost_build::Config;
 
 static ALWAYS_SERDE: &str = "#[cfg_attr(not(feature = \"serde_serialize\"), \
@@ -50,6 +53,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let out = PathBuf::from(env::var("OUT_DIR").unwrap());
     let descriptor_file = out.join("descriptors.bin");
     println!("cargo:descriptor_path={}", descriptor_file.display());
+    let protos = &[
+        "./protos/local/temporal/sdk/core/core_interface.proto",
+        "./protos/api_upstream/temporal/api/sdk/v1/workflow_metadata.proto",
+        "./protos/api_upstream/temporal/api/workflowservice/v1/service.proto",
+        "./protos/api_upstream/temporal/api/nexusservices/workerservice/v1/request_response.proto",
+        "./protos/api_upstream/temporal/api/operatorservice/v1/service.proto",
+        "./protos/api_upstream/temporal/api/errordetails/v1/message.proto",
+        "./protos/api_cloud_upstream/temporal/api/cloud/cloudservice/v1/service.proto",
+        "./protos/testsrv_upstream/temporal/api/testservice/v1/service.proto",
+        "./protos/grpc/health/v1/health.proto",
+        "./protos/google/rpc/status.proto",
+    ];
+    let includes = &[
+        "./protos/api_upstream",
+        "./protos/api_cloud_upstream",
+        "./protos/local",
+        "./protos/testsrv_upstream",
+        "./protos/grpc",
+        "./protos",
+    ];
     let mut builder = tonic_prost_build::configure()
         // Workflow guests need message structs, while the native common crate enables this
         // feature to preserve the generated clients it re-exports today.
@@ -145,6 +168,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         builder = builder.type_attribute(*prefix, SERDE_ATTR);
     }
 
+    #[cfg(feature = "vendored-protox")]
+    {
+        let descriptors = protox::compile(protos, includes)?;
+        std::fs::write(&descriptor_file, descriptors.encode_to_vec())?;
+        builder = builder.skip_protoc_run();
+    }
+
     builder
         .file_descriptor_set_path(&descriptor_file)
         .compile_with_config(
@@ -153,26 +183,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 c.enable_type_names();
                 c
             },
-            &[
-                "./protos/local/temporal/sdk/core/core_interface.proto",
-                "./protos/api_upstream/temporal/api/sdk/v1/workflow_metadata.proto",
-                "./protos/api_upstream/temporal/api/workflowservice/v1/service.proto",
-                "./protos/api_upstream/temporal/api/nexusservices/workerservice/v1/request_response.proto",
-                "./protos/api_upstream/temporal/api/operatorservice/v1/service.proto",
-                "./protos/api_upstream/temporal/api/errordetails/v1/message.proto",
-                "./protos/api_cloud_upstream/temporal/api/cloud/cloudservice/v1/service.proto",
-                "./protos/testsrv_upstream/temporal/api/testservice/v1/service.proto",
-                "./protos/grpc/health/v1/health.proto",
-                "./protos/google/rpc/status.proto",
-            ],
-            &[
-                "./protos/api_upstream",
-                "./protos/api_cloud_upstream",
-                "./protos/local",
-                "./protos/testsrv_upstream",
-                "./protos/grpc",
-                "./protos",
-            ],
+            protos,
+            includes,
         )?;
 
     // TODO [rust-sdk-branch]: support normal JSON and proto JSON serialization

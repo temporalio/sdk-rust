@@ -18,7 +18,8 @@ mod retry_policy;
 mod workflow_execution;
 pub mod protos {
     //! Protobuf definitions re-exported from `temporalio-protos`.
-
+    //!
+    //! Because this module re-exports generated types, updating it might include breaking changes.
     pub use temporalio_protos::*;
 }
 pub mod search_attributes;

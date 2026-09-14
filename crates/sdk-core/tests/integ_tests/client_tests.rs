@@ -1,7 +1,7 @@
 use crate::common::{
     CoreWfStarter, NAMESPACE,
     fake_grpc_server::{FakeServer, GenericService, fake_server},
-    get_integ_server_options,
+    get_integ_server_options, integ_namespace,
 };
 use assert_matches::assert_matches;
 use futures_util::{FutureExt, stream};
@@ -38,6 +38,7 @@ use tonic::{
 };
 use tracing::info;
 
+#[temporalio_macros::cloud_test_exclusion(crate::CloudTestExclusionReason::RequiresOssOnlyApis)]
 #[tokio::test]
 async fn can_use_retry_client() {
     // Not terribly interesting by itself but can be useful for manually inspecting metrics etc
@@ -61,7 +62,7 @@ async fn can_use_retry_raw_client() {
     connection
         .describe_namespace(
             DescribeNamespaceRequest {
-                namespace: NAMESPACE.to_string(),
+                namespace: integ_namespace(),
                 ..Default::default()
             }
             .into_request(),
@@ -155,6 +156,7 @@ fn compression_test_options(
     opts
 }
 
+#[temporalio_macros::cloud_test_exclusion(crate::CloudTestExclusionReason::DoesNotUseServer)]
 #[tokio::test]
 async fn gzip_get_system_info_failure_reconnects_without_compression() {
     let (fs, records) =
@@ -184,6 +186,7 @@ async fn gzip_get_system_info_failure_reconnects_without_compression() {
     fs.shutdown().await;
 }
 
+#[temporalio_macros::cloud_test_exclusion(crate::CloudTestExclusionReason::DoesNotUseServer)]
 #[tokio::test]
 async fn compression_none_does_not_retry_compression_fallback() {
     let (fs, records) =
@@ -202,6 +205,7 @@ async fn compression_none_does_not_retry_compression_fallback() {
     fs.shutdown().await;
 }
 
+#[temporalio_macros::cloud_test_exclusion(crate::CloudTestExclusionReason::DoesNotUseServer)]
 #[tokio::test]
 async fn generic_gzip_unimplemented_does_not_reconnect_without_compression() {
     let (fs, records) =
@@ -228,6 +232,7 @@ async fn generic_gzip_unimplemented_does_not_reconnect_without_compression() {
     fs.shutdown().await;
 }
 
+#[temporalio_macros::cloud_test_exclusion(crate::CloudTestExclusionReason::DoesNotUseServer)]
 #[tokio::test]
 async fn unknown_method_unimplemented_does_not_trigger_compression_reconnect() {
     let (fs, records) = compression_test_server(CompressionTestBehavior::UnknownMethod).await;
@@ -283,6 +288,7 @@ async fn per_call_timeout_respected_one_call() {
     );
 }
 
+#[temporalio_macros::cloud_test_exclusion(crate::CloudTestExclusionReason::DoesNotUseServer)]
 #[tokio::test]
 async fn timeouts_respected_one_call_fake_server() {
     let mut fs = fake_server(|_| async { Response::new(Body::empty()) }.boxed()).await;
@@ -340,6 +346,7 @@ async fn timeouts_respected_one_call_fake_server() {
     fs.shutdown().await;
 }
 
+#[temporalio_macros::cloud_test_exclusion(crate::CloudTestExclusionReason::DoesNotUseServer)]
 #[tokio::test]
 async fn non_retryable_errors() {
     for code in [
@@ -380,6 +387,7 @@ async fn non_retryable_errors() {
     }
 }
 
+#[temporalio_macros::cloud_test_exclusion(crate::CloudTestExclusionReason::DoesNotUseServer)]
 #[tokio::test]
 async fn namespace_header_attached_to_relevant_calls() {
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
@@ -453,6 +461,10 @@ async fn grpc_compression() {
     crate::shared_tests::grpc_compression().await
 }
 
+#[temporalio_macros::cloud_test_exclusion(
+    crate::CloudTestExclusionReason::RequiresCloudProvisioning,
+    "Requires separate Cloud Operations API credentials and a preconfigured namespace."
+)]
 #[tokio::test]
 async fn cloud_ops_test() {
     let api_key = match env::var("TEMPORAL_CLIENT_CLOUD_API_KEY") {
@@ -491,6 +503,7 @@ async fn cloud_ops_test() {
     assert_eq!(res.into_inner().namespace.unwrap().namespace, namespace);
 }
 
+#[temporalio_macros::cloud_test_exclusion(crate::CloudTestExclusionReason::DoesNotUseServer)]
 #[tokio::test]
 async fn update_get_result_retries_on_empty_outcome() {
     use temporalio_common::protos::temporal::api::{

@@ -19,9 +19,12 @@ use temporalio_common::{
         },
         enums::v1::{
             ActivityIdConflictPolicy as ProtoActivityIdConflictPolicy,
-            ActivityIdReusePolicy as ProtoActivityIdReusePolicy, ArchivalState,
-            HistoryEventFilterType, QueryRejectCondition, WorkflowIdConflictPolicy,
-            WorkflowIdReusePolicy,
+            ActivityIdReusePolicy as ProtoActivityIdReusePolicy,
+            ArchivalState as ProtoArchivalState,
+            HistoryEventFilterType as ProtoHistoryEventFilterType,
+            QueryRejectCondition as ProtoQueryRejectCondition,
+            WorkflowIdConflictPolicy as ProtoWorkflowIdConflictPolicy,
+            WorkflowIdReusePolicy as ProtoWorkflowIdReusePolicy,
         },
         replication::v1::ClusterReplicationConfig,
         sdk::v1::UserMetadata,
@@ -428,6 +431,59 @@ impl std::fmt::Debug for ClientTlsOptions {
     }
 }
 
+/// Controls whether a closed workflow ID may be reused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[non_exhaustive]
+pub enum WorkflowIdReusePolicy {
+    /// Use the server's default policy.
+    #[default]
+    Unspecified,
+    /// Allow starting a workflow using the same workflow ID.
+    AllowDuplicate,
+    /// Allow reuse only when the previous execution did not complete successfully.
+    AllowDuplicateFailedOnly,
+    /// Reject reuse of the workflow ID.
+    RejectDuplicate,
+}
+
+impl From<WorkflowIdReusePolicy> for ProtoWorkflowIdReusePolicy {
+    fn from(value: WorkflowIdReusePolicy) -> Self {
+        match value {
+            WorkflowIdReusePolicy::Unspecified => Self::Unspecified,
+            WorkflowIdReusePolicy::AllowDuplicate => Self::AllowDuplicate,
+            WorkflowIdReusePolicy::AllowDuplicateFailedOnly => Self::AllowDuplicateFailedOnly,
+            WorkflowIdReusePolicy::RejectDuplicate => Self::RejectDuplicate,
+        }
+    }
+}
+
+/// Controls how starting a workflow resolves a conflict with a running workflow using the same
+/// workflow ID.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[non_exhaustive]
+pub enum WorkflowIdConflictPolicy {
+    /// Use the server's default policy.
+    #[default]
+    Unspecified,
+    /// Do not start a new workflow and return an already-started error.
+    Fail,
+    /// Do not start a new workflow and return a handle for the running workflow.
+    UseExisting,
+    /// Terminate the running workflow before starting a new one.
+    TerminateExisting,
+}
+
+impl From<WorkflowIdConflictPolicy> for ProtoWorkflowIdConflictPolicy {
+    fn from(value: WorkflowIdConflictPolicy) -> Self {
+        match value {
+            WorkflowIdConflictPolicy::Unspecified => Self::Unspecified,
+            WorkflowIdConflictPolicy::Fail => Self::Fail,
+            WorkflowIdConflictPolicy::UseExisting => Self::UseExisting,
+            WorkflowIdConflictPolicy::TerminateExisting => Self::TerminateExisting,
+        }
+    }
+}
+
 /// Options for starting a workflow execution.
 #[derive(Debug, Clone, bon::Builder)]
 #[builder(start_fn = new, on(String, into))]
@@ -733,6 +789,32 @@ pub struct WorkflowSignalOptions {
     pub rpc_options: RpcOptions,
 }
 
+/// Controls when a workflow query should be rejected based on workflow state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[non_exhaustive]
+pub enum QueryRejectCondition {
+    /// Use the server's default condition.
+    #[default]
+    Unspecified,
+    /// Do not reject the query based on workflow state.
+    None,
+    /// Reject the query if the workflow is not open.
+    NotOpen,
+    /// Reject the query if the workflow did not complete successfully.
+    NotCompletedCleanly,
+}
+
+impl From<QueryRejectCondition> for ProtoQueryRejectCondition {
+    fn from(value: QueryRejectCondition) -> Self {
+        match value {
+            QueryRejectCondition::Unspecified => Self::Unspecified,
+            QueryRejectCondition::None => Self::None,
+            QueryRejectCondition::NotOpen => Self::NotOpen,
+            QueryRejectCondition::NotCompletedCleanly => Self::NotCompletedCleanly,
+        }
+    }
+}
+
 /// Options for querying a workflow.
 #[derive(Debug, Clone, Default, bon::Builder)]
 #[non_exhaustive]
@@ -788,6 +870,29 @@ pub struct WorkflowDescribeOptions {
 
 /// Default workflow execution retention for a Namespace is 3 days
 const DEFAULT_WORKFLOW_EXECUTION_RETENTION_PERIOD: Duration = Duration::from_secs(60 * 60 * 24 * 3);
+
+/// Controls whether archival is enabled for a namespace.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[non_exhaustive]
+pub enum ArchivalState {
+    /// Use the server's default archival state.
+    #[default]
+    Unspecified,
+    /// Disable archival.
+    Disabled,
+    /// Enable archival.
+    Enabled,
+}
+
+impl From<ArchivalState> for ProtoArchivalState {
+    fn from(value: ArchivalState) -> Self {
+        match value {
+            ArchivalState::Unspecified => Self::Unspecified,
+            ArchivalState::Disabled => Self::Disabled,
+            ArchivalState::Enabled => Self::Enabled,
+        }
+    }
+}
 
 /// Helper struct for `register_namespace`.
 #[derive(Clone, Debug, bon::Builder)]
@@ -848,10 +953,34 @@ impl From<RegisterNamespaceOptions> for RegisterNamespaceRequest {
             data: val.data,
             security_token: val.security_token,
             is_global_namespace: val.is_global_namespace,
-            history_archival_state: val.history_archival_state as i32,
+            history_archival_state: ProtoArchivalState::from(val.history_archival_state) as i32,
             history_archival_uri: val.history_archival_uri,
-            visibility_archival_state: val.visibility_archival_state as i32,
+            visibility_archival_state: ProtoArchivalState::from(val.visibility_archival_state)
+                as i32,
             visibility_archival_uri: val.visibility_archival_uri,
+        }
+    }
+}
+
+/// Selects which workflow history events are returned when fetching history.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[non_exhaustive]
+pub enum HistoryEventFilterType {
+    /// Use the server's default filter.
+    #[default]
+    Unspecified,
+    /// Return all history events.
+    AllEvent,
+    /// Return only the workflow's close event.
+    CloseEvent,
+}
+
+impl From<HistoryEventFilterType> for ProtoHistoryEventFilterType {
+    fn from(value: HistoryEventFilterType) -> Self {
+        match value {
+            HistoryEventFilterType::Unspecified => Self::Unspecified,
+            HistoryEventFilterType::AllEvent => Self::AllEvent,
+            HistoryEventFilterType::CloseEvent => Self::CloseEvent,
         }
     }
 }
