@@ -1,8 +1,8 @@
 [env]
 # This temporarily overrides the version of the CLI used for integration tests, locally and in CI
-# TEMP: workflow task completion pagination requires server >=v1.32.0-162.0, for which there's no
-# published stable CLI release yet.
-CLI_VERSION_OVERRIDE = "v1.8.3-server-1.32.0-162.0"
+# TEMP: workflow task completion pagination requires server >=v1.32.0-162.0; this pre-release
+# CLI bundles server 1.32.0.
+CLI_VERSION_OVERRIDE = "v1.9.0-rc.1"
 
 [alias]
 # Not sure why --all-features doesn't work
