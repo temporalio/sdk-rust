@@ -34,6 +34,8 @@ relevant information.
 ## Unreleased
 
 ### Fixed
+* Task-poll targets no longer decrease after cancelled or timed-out polls. Affected pollers still
+  retain their slot during backoff, while resource-exhaustion errors still reduce the target.
 * Workflow poll balancing now lets non-sticky pollers use capacity after sticky pollers reach their
   configured or autoscaled polling limit.
 

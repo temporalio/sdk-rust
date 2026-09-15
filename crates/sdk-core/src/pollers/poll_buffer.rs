@@ -715,15 +715,10 @@ impl PollScalerReportHandle {
                         .metadata()
                         .contains_key(ERROR_RETURNED_DUE_TO_SHORT_CIRCUIT);
 
-                    if self.can_scale_down() {
+                    if self.can_scale_down() && e.code() == Code::ResourceExhausted {
                         debug!("Got error from server while polling: {:?}", e);
-                        if e.code() == Code::ResourceExhausted {
-                            // Scale down significantly for resource exhaustion
-                            self.change_target(usize::saturating_div, 2);
-                        } else {
-                            // Other codes that would normally have made us back off briefly can reclaim this poller
-                            self.change_target(usize::saturating_sub, 1);
-                        }
+                        // Scale down significantly for resource exhaustion
+                        self.change_target(usize::saturating_div, 2);
                     }
                     return (should_forward, backoff_duration);
                 }
@@ -925,7 +920,7 @@ mod tests {
     };
     use futures_util::FutureExt;
     use rstest::rstest;
-    use std::time::Duration;
+    use std::{future::pending, time::Duration};
     use temporalio_common::protos::temporal::api::namespace::v1::namespace_info::Capabilities;
     use tokio::{select, sync::Notify};
 
@@ -1140,10 +1135,13 @@ mod tests {
 
     #[rstest]
     #[case::resource_exhausted(Code::ResourceExhausted)]
-    #[case::internal(Code::Internal)]
+    #[case::cancelled(Code::Cancelled)]
     #[tokio::test]
     async fn autoscaler_applies_backoff_on_errors(#[case] error_code: Code) {
         use temporalio_common::protos::temporal::api::taskqueue::v1::PollerScalingDecision;
+
+        const INITIAL_POLLERS: usize = 10;
+        const MAX_POLLS_DURING_BACKOFF: usize = INITIAL_POLLERS + 1;
 
         let call_count = Arc::new(AtomicUsize::new(0));
         let call_count_clone = call_count.clone();
@@ -1186,13 +1184,13 @@ mod tests {
             PollerBehavior::Autoscaling {
                 minimum: 5,
                 maximum: 100,
-                initial: 10,
+                initial: INITIAL_POLLERS,
             },
-            fixed_size_permit_dealer(10),
+            fixed_size_permit_dealer(INITIAL_POLLERS),
             CancellationToken::new(),
             None::<fn(usize)>,
             WorkflowTaskOptions {
-                wft_poller_shared: Some(Arc::new(WFTPollerShared::new(Some(10)))),
+                wft_poller_shared: Some(Arc::new(WFTPollerShared::new(Some(INITIAL_POLLERS)))),
             },
             Arc::new(AtomicCell::new(None)),
             Arc::new(NamespaceCapabilities::default()),
@@ -1211,11 +1209,10 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(100)).await;
         let hot_loop_calls = call_count.load(Ordering::SeqCst);
 
-        // Without backoff, this was producing ~6300 polls in ~100ms on my machine.
-        // With exponential backoff, I'm getting exactly 10 (initial poller count).
+        // One replacement may follow the successful setup poll, but errors must not create a hot loop.
         assert!(
-            hot_loop_calls == 10,
-            "Expected proper backoff with == 10 polls in 100ms, but got {} polls.",
+            hot_loop_calls <= MAX_POLLS_DURING_BACKOFF,
+            "Expected at most {MAX_POLLS_DURING_BACKOFF} polls during backoff, got {}.",
             hot_loop_calls
         );
 
@@ -1223,6 +1220,85 @@ mod tests {
             .unwrap_or_else(|_| panic!("Failed to unwrap Arc"))
             .shutdown()
             .await;
+    }
+
+    #[rstest]
+    #[case::cancelled(Code::Cancelled)]
+    #[case::deadline_exceeded(Code::DeadlineExceeded)]
+    #[tokio::test(start_paused = true)]
+    async fn transient_error_keeps_target(#[case] error_code: Code) {
+        const INITIAL_POLLERS: usize = 4;
+        const REPLACEMENT_CALLS: usize = INITIAL_POLLERS + 1;
+        const BACKOFF_SETTLE_TIME: Duration = Duration::from_millis(250);
+
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let call_count_clone = call_count.clone();
+        let fail_poll = Arc::new(Notify::new());
+        let fail_poll_clone = fail_poll.clone();
+
+        let mut mock_client = mock_manual_worker_client();
+        mock_client
+            .expect_poll_workflow_task()
+            .returning(move |_, _| {
+                let call_number = call_count_clone.fetch_add(1, Ordering::SeqCst) + 1;
+                let fail_poll = fail_poll_clone.clone();
+
+                async move {
+                    if call_number == INITIAL_POLLERS {
+                        fail_poll.notified().await;
+
+                        return Err(tonic::Status::new(error_code, "simulated poll error"));
+                    }
+
+                    pending().await
+                }
+                .boxed()
+            });
+
+        let (active_tx, mut active_rx) = watch::channel(0);
+        let pb = LongPollBuffer::new_workflow_task(
+            Arc::new(mock_client),
+            "normal".to_string(),
+            Some("sticky".to_string()),
+            PollerBehavior::Autoscaling {
+                minimum: 1,
+                maximum: INITIAL_POLLERS,
+                initial: INITIAL_POLLERS,
+            },
+            fixed_size_permit_dealer(INITIAL_POLLERS),
+            CancellationToken::new(),
+            Some(move |active| {
+                active_tx.send_replace(active);
+            }),
+            WorkflowTaskOptions {
+                wft_poller_shared: None,
+            },
+            Arc::new(AtomicCell::new(None)),
+            Arc::new(NamespaceCapabilities::resolved(Capabilities {
+                poller_autoscaling: true,
+                ..Default::default()
+            })),
+        );
+
+        let _ = pb.starter.send(());
+        active_rx
+            .wait_for(|active| *active == INITIAL_POLLERS)
+            .await
+            .unwrap();
+
+        fail_poll.notify_one();
+        tokio::task::yield_now().await;
+
+        assert_eq!(call_count.load(Ordering::SeqCst), INITIAL_POLLERS);
+        assert_eq!(*active_rx.borrow_and_update(), INITIAL_POLLERS);
+
+        tokio::time::advance(BACKOFF_SETTLE_TIME).await;
+        tokio::task::yield_now().await;
+
+        assert_eq!(call_count.load(Ordering::SeqCst), REPLACEMENT_CALLS);
+        assert_eq!(*active_rx.borrow_and_update(), INITIAL_POLLERS);
+
+        pb.shutdown().await;
     }
 
     #[rstest]

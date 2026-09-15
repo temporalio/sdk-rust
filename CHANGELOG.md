@@ -34,6 +34,8 @@ relevant information.
 ## Unreleased
 
 ### Fixed
+* Autoscaled task pollers now preserve polling concurrency after transient cancellations and
+  timeouts while still applying retry backoff.
 * Sticky workflow backlog no longer prevents normal pollers from using capacity after sticky
   pollers reach their polling limit.
 
