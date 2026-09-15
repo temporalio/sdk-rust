@@ -848,10 +848,7 @@ impl WorkerClient for WorkerClientBag {
     async fn fail_activity_task(
         &self,
         task_token: TaskToken,
-        // Unused until `RespondActivityTaskFailedRequest` gains a cause field
-        //  (https://github.com/temporalio/api/pull/816). Taken as a parameter regardless so the
-        //  cause is decided next to the failure it describes, as `fail_workflow_task` does.
-        _cause: ActivityTaskFailedCause,
+        cause: ActivityTaskFailedCause,
         failure: Option<Failure>,
         last_heartbeat_details: Option<Payloads>,
     ) -> Result<RespondActivityTaskFailedResponse> {
@@ -871,6 +868,7 @@ impl WorkerClient for WorkerClientBag {
                     deployment: None,
                     deployment_options: self.deployment_options(),
                     resource_id: Default::default(),
+                    cause: cause as i32,
                 }
                 .into_request(),
             )

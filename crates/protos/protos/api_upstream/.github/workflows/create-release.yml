@@ -20,6 +20,22 @@ on:
         description: An ID used by external tools to identify workflow runs(can be left empty when running manually)
         default: "none"
         type: string
+      api_ref:
+        description: "api commit or ref to release; defaults to `branch`"
+        default: ""
+        type: string
+      api_go_ref:
+        description: "api-go commit or ref to release; defaults to `branch`"
+        default: ""
+        type: string
+      auto_publish:
+        description: "Publish the release instead of leaving a draft. A draft creates no tag, so automated callers need this."
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
 jobs:
   dispatch:
     runs-on: ubuntu-latest
@@ -33,10 +49,15 @@ jobs:
       api_commit_sha: ${{ steps.pin_commits.outputs.api_commit_sha }}
       api_go_commit_sha: ${{ steps.pin_commits.outputs.api_go_commit_sha }}
     steps:
+      # api_ref/api_go_ref let a caller release specific commits rather than
+      # the head of a branch. They must name a corresponding pair: the "Pin
+      # commits sha" step below asserts that the api-go commit's proto/api
+      # submodule points at the api commit. Left empty, both fall back to
+      # `branch`.
       - name: Checkout api
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
-          ref: ${{ github.event.inputs.branch }}
+          ref: ${{ inputs.api_ref || inputs.branch }}
           fetch-depth: 0
           fetch-tags: true
           path: api
@@ -45,7 +66,7 @@ jobs:
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           repository: temporalio/api-go
-          ref: ${{ github.event.inputs.branch }}
+          ref: ${{ inputs.api_go_ref || inputs.branch }}
           submodules: true
           path: api-go
 
@@ -141,3 +162,33 @@ jobs:
       api_commit_sha: ${{ needs.prepare-inputs.outputs.api_commit_sha }}
       base_tag: ${{ github.event.inputs.base_tag }}
     secrets: inherit
+
+  # Publishing this repo's release fires `release: published`, which
+  # trigger-api-go-publish-release.yml turns into api-go's publish-release.yml
+  # -- the step that actually creates the api-go tag.
+  publish-release:
+    name: "Publish release"
+    needs:
+      - create-release
+      - release-api-go
+    if: |
+      !cancelled() &&
+      (inputs.auto_publish == true || inputs.auto_publish == 'true') &&
+      needs.create-release.result == 'success' &&
+      needs.release-api-go.result == 'success'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Generate token
+        id: generate_token
+        uses: actions/create-github-app-token@d72941d797fd3113feb6b93fd0dec494b13a2547 # v1.12.0
+        with:
+          app-id: ${{ secrets.TEMPORAL_CICD_APP_ID }}
+          private-key: ${{ secrets.TEMPORAL_CICD_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ steps.generate_token.outputs.token }}
+          TAG: ${{ github.event.inputs.tag }}
+        run: gh release edit "$TAG" --draft=false -R "$GITHUB_REPOSITORY" --latest

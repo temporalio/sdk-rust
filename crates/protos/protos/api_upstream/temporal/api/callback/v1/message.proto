@@ -34,4 +34,8 @@ message CallbackInfo {
     google.protobuf.Timestamp next_attempt_schedule_time = 7;
     // If the state is BLOCKED, blocked reason provides additional information.
     string blocked_reason = 8;
+
+    // Server-generated request ID used as an idempotency token when invoking callbacks.
+    // It has no relation to caller-side request_id sent in operations like StartNexusOperationExecutionRequest.
+    string request_id = 9;
 }

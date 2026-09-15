@@ -826,6 +826,8 @@ const NOT_VALIDATED_FIELDS: &[&str] = &[
     "temporal.api.sdk.v1.UserMetadata.summary",
     "temporal.api.nexus.v1.EndpointSpec.description",
     "temporal.api.cloud.nexus.v1.EndpointSpec.description",
+    // Callback source context has dedicated dynamic-config limits that clients cannot fetch.
+    "temporal.api.common.v1.Callback.NexusHandler.source_context",
     // Dedicated, non-fetchable limits (not blob/memo, not in DescribeNamespace): Event group marker
     // label: custom 400-byte server-side limit.
     "temporal.api.sdk.v1.EventGroupMarker.Label.label",
