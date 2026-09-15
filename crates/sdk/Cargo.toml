@@ -234,6 +234,36 @@ path = "examples/schedules/starter.rs"
 required-features = ["examples"]
 
 [[example]]
+name = "standalone-activities-worker"
+path = "examples/standalone_activities/worker.rs"
+required-features = ["examples"]
+
+[[example]]
+name = "standalone-activities-execute"
+path = "examples/standalone_activities/execute_activity.rs"
+required-features = ["examples"]
+
+[[example]]
+name = "standalone-activities-start"
+path = "examples/standalone_activities/start_activity.rs"
+required-features = ["examples"]
+
+[[example]]
+name = "standalone-activities-get-handle"
+path = "examples/standalone_activities/get_activity_handle.rs"
+required-features = ["examples"]
+
+[[example]]
+name = "standalone-activities-list"
+path = "examples/standalone_activities/list_activities.rs"
+required-features = ["examples"]
+
+[[example]]
+name = "standalone-activities-count"
+path = "examples/standalone_activities/count_activities.rs"
+required-features = ["examples"]
+
+[[example]]
 name = "wasm-workflows"
 path = "examples/wasm_workflows/src/lib.rs"
 crate-type = ["cdylib"]
