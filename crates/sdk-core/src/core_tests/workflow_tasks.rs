@@ -3344,3 +3344,117 @@ async fn payloads_too_large_doesnt_spam_task_fails() {
     core.complete_execution(&act.run_id).await;
     core.drain_pollers_and_shutdown().await;
 }
+
+/// A history fetch failure for a run that was never cached is reported through a path that has no
+/// activation to complete. Later attempts of that same task must still not be re-reported.
+#[tokio::test]
+async fn unstored_wft_fetch_failure_doesnt_spam_task_fails() {
+    let mut t = TestHistoryBuilder::default();
+    t.add_by_type(EventType::WorkflowExecutionStarted);
+    t.add_workflow_task_scheduled_and_started();
+    t.add_workflow_task_completed();
+    let mut need_fetch_resp =
+        hist_to_poll_resp(&t, "wfid".to_owned(), ResponseType::AllHistory).resp;
+    need_fetch_resp.next_page_token = vec![1];
+
+    let mut mock_client = mock_worker_client();
+    mock_client
+        .expect_get_workflow_execution_history()
+        .returning(|_, _, _| Err(tonic::Status::not_found("Ahh broken")))
+        .times(2);
+    // Identical responses are handed out with incrementing attempt numbers by the mock
+    let mut mh = MockPollCfg::from_resp_batches(
+        "wfid",
+        t,
+        [
+            ResponseType::Raw(need_fetch_resp.clone()),
+            ResponseType::Raw(need_fetch_resp),
+        ],
+        mock_client,
+    );
+    // Counted explicitly because a violated mock expectation inside the worker does not reliably
+    // fail the test.
+    let fails = Arc::new(AtomicUsize::new(0));
+    let fails_clone = fails.clone();
+    mh.num_expected_fails = 1;
+    mh.expect_fail_wft_matcher = Box::new(move |_, cause, _| {
+        fails_clone.fetch_add(1, Ordering::Relaxed);
+        *cause == WorkflowTaskFailedCause::WorkflowWorkerUnhandledFailure
+    });
+    let core = mock_worker(build_mock_pollers(mh));
+
+    // Both fetch failures are processed before the exhausted poller shuts the worker down
+    assert_matches!(
+        core.poll_workflow_activation().await.unwrap_err(),
+        PollError::ShutDown
+    );
+    core.shutdown().await;
+    assert_eq!(fails.load(Ordering::Relaxed), 1);
+}
+
+/// A history fetch failure for a cached run evicts it and reports the failure once the eviction
+/// completes. Later attempts of that same task must still not be re-reported.
+#[tokio::test]
+async fn cached_run_fetch_failure_doesnt_spam_task_fails() {
+    let mut t = TestHistoryBuilder::default();
+    t.add_by_type(EventType::WorkflowExecutionStarted);
+    t.add_workflow_task_scheduled_and_started();
+    t.add_workflow_task_completed();
+    let mut need_fetch_resp =
+        hist_to_poll_resp(&t, "wfid".to_owned(), ResponseType::AllHistory).resp;
+    need_fetch_resp.next_page_token = vec![1];
+
+    let mut mock_client = mock_worker_client();
+    mock_client
+        .expect_get_workflow_execution_history()
+        .returning(|_, _, _| Err(tonic::Status::not_found("Ahh broken")))
+        .times(2);
+    let mut mh = MockPollCfg::from_resp_batches(
+        "wfid",
+        t,
+        [
+            ResponseType::ToTaskNum(1),
+            ResponseType::Raw(need_fetch_resp.clone()),
+            ResponseType::ToTaskNum(1),
+            ResponseType::Raw(need_fetch_resp),
+        ],
+        mock_client,
+    );
+    // Counted explicitly because a violated mock expectation inside the worker does not reliably
+    // fail the test.
+    let fails = Arc::new(AtomicUsize::new(0));
+    let fails_clone = fails.clone();
+    mh.num_expected_fails = 1;
+    mh.expect_fail_wft_matcher = Box::new(move |_, cause, _| {
+        fails_clone.fetch_add(1, Ordering::Relaxed);
+        *cause == WorkflowTaskFailedCause::WorkflowWorkerUnhandledFailure
+    });
+    let mut mock = build_mock_pollers(mh);
+    // Otherwise the poller runs dry and starts shutdown before the second eviction completes
+    mock.make_wft_stream_interminable();
+    mock.worker_cfg(|wc| wc.max_cached_workflows = 10);
+    let core = mock_worker(mock);
+
+    for _ in 0..2 {
+        let act = core.poll_workflow_activation().await.unwrap();
+        assert_matches!(
+            act.jobs[0].variant,
+            Some(workflow_activation_job::Variant::InitializeWorkflow(_))
+        );
+        core.complete_workflow_activation(WorkflowActivationCompletion::empty(act.run_id))
+            .await
+            .unwrap();
+        let evict_act = core.poll_workflow_activation().await.unwrap();
+        assert_matches!(
+            evict_act.jobs.as_slice(),
+            [WorkflowActivationJob {
+                variant: Some(workflow_activation_job::Variant::RemoveFromCache(r)),
+            }] => r.message.contains("Fetching history failed")
+        );
+        core.complete_workflow_activation(WorkflowActivationCompletion::empty(evict_act.run_id))
+            .await
+            .unwrap();
+    }
+    core.shutdown().await;
+    assert_eq!(fails.load(Ordering::Relaxed), 1);
+}

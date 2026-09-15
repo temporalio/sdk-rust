@@ -788,6 +788,9 @@ impl From<WorkflowTaskFailedCause> for FailureReason {
     fn from(v: WorkflowTaskFailedCause) -> Self {
         match v {
             WorkflowTaskFailedCause::NonDeterministicError => FailureReason::Nondeterminism,
+            WorkflowTaskFailedCause::GrpcMessageTooLarge => FailureReason::GrpcMessageTooLarge,
+            WorkflowTaskFailedCause::PayloadsTooLarge => FailureReason::PayloadsTooLarge,
+            WorkflowTaskFailedCause::RequestTooLarge => FailureReason::RequestTooLarge,
             _ => FailureReason::Workflow,
         }
     }

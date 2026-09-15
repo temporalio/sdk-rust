@@ -1,6 +1,7 @@
 use crate::{
     MetricsContext,
     abstractions::dbg_panic,
+    telemetry::metrics::workflow_type,
     worker::workflow::{
         managed_run::RunUpdateAct,
         run_cache::RunCache,
@@ -159,17 +160,24 @@ impl WFStream {
                     WFStreamInput::FailedFetch {
                         run_id,
                         err,
-                        auto_reply_fail_tt,
+                        auto_reply_fail,
                     } => {
                         let message = format!("Fetching history failed: {err:?}");
                         if !state.runs.has_run(&run_id)
-                            && let Some(task_token) = auto_reply_fail_tt.clone()
+                            && let Some(info) = auto_reply_fail.clone()
                         {
                             actions.push(WorkflowStreamAction::FailUnstoredWft {
                                 run_id,
-                                task_token,
-                                cause: WorkflowTaskFailedCause::WorkflowWorkerUnhandledFailure,
-                                failure: ApiFailure::application_failure(message, true).into(),
+                                report: Box::new(FailedActivationWFTReport {
+                                    task_token: info.task_token,
+                                    attempt: info.attempt,
+                                    cause: WorkflowTaskFailedCause::WorkflowWorkerUnhandledFailure,
+                                    failure: ApiFailure::application_failure(message, true).into(),
+                                    metrics: state
+                                        .metrics
+                                        .with_new_attrs([workflow_type(info.workflow_type)]),
+                                    legacy_query: false,
+                                }),
                             });
                             None
                         } else {
@@ -178,7 +186,7 @@ impl WFStream {
                                     run_id,
                                     message,
                                     reason: EvictionReason::PaginationOrHistoryFetch,
-                                    auto_reply_fail_tt,
+                                    auto_reply_fail,
                                 })
                                 .into_run_update_resp()
                         }
@@ -441,7 +449,7 @@ impl WFStream {
                         run_id: run_id.to_string(),
                         message: "Workflow completed".to_string(),
                         reason: EvictionReason::WorkflowExecutionEnding,
-                        auto_reply_fail_tt: None,
+                        auto_reply_fail: None,
                     })
                     .into_run_update_resp()
             }
@@ -489,7 +497,7 @@ impl WFStream {
                 run_id,
                 message: "Workflow cache full".to_string(),
                 reason: EvictionReason::CacheFull,
-                auto_reply_fail_tt: None,
+                auto_reply_fail: None,
             })
         } else {
             // This branch shouldn't really be possible
@@ -578,7 +586,7 @@ impl WFStream {
                     run_id,
                     message: "Workflow cache full".to_string(),
                     reason: EvictionReason::CacheFull,
-                    auto_reply_fail_tt: None,
+                    auto_reply_fail: None,
                 })
                 .into_run_update_resp(),
             );
@@ -633,7 +641,7 @@ enum WFStreamInput {
     FailedFetch {
         run_id: String,
         err: tonic::Status,
-        auto_reply_fail_tt: Option<TaskToken>,
+        auto_reply_fail: Option<UnstoredWftFailInfo>,
     },
 }
 impl From<LocalInput> for WFStreamInput {
@@ -701,7 +709,7 @@ enum ExternalPollerInputs {
     FailedFetch {
         run_id: String,
         err: tonic::Status,
-        auto_reply_fail_tt: Option<TaskToken>,
+        auto_reply_fail: Option<UnstoredWftFailInfo>,
     },
 }
 impl From<ExternalPollerInputs> for WFStreamInput {
@@ -714,11 +722,11 @@ impl From<ExternalPollerInputs> for WFStreamInput {
             ExternalPollerInputs::FailedFetch {
                 run_id,
                 err,
-                auto_reply_fail_tt,
+                auto_reply_fail,
             } => WFStreamInput::FailedFetch {
                 run_id,
                 err,
-                auto_reply_fail_tt,
+                auto_reply_fail,
             },
             ExternalPollerInputs::NextPage {
                 paginator,
@@ -751,11 +759,11 @@ impl From<Result<WFTExtractorOutput, tonic::Status>> for ExternalPollerInputs {
             Ok(WFTExtractorOutput::FailedFetch {
                 run_id,
                 err,
-                auto_reply_fail_tt,
+                auto_reply_fail,
             }) => ExternalPollerInputs::FailedFetch {
                 run_id,
                 err,
-                auto_reply_fail_tt,
+                auto_reply_fail,
             },
             Ok(WFTExtractorOutput::PollerDead) => ExternalPollerInputs::PollerDead,
             Err(e) => ExternalPollerInputs::PollerError(e),

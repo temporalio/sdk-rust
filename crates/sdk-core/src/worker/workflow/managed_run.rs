@@ -3,7 +3,6 @@ use crate::{
     abstractions::dbg_panic,
     internal_flags::CoreInternalFlags,
     protosext::{WorkflowActivationExt, protocol_messages::IncomingProtocolMessage},
-    telemetry::metrics,
     worker::{
         LEGACY_QUERY_ID, LocalActRequest, WorkflowErrorType,
         workflow::{
@@ -439,16 +438,19 @@ impl ManagedRun {
                     self.run_id()
                 );
             }
-            let outcome = if let Some((tt, reason)) = self.trying_to_evict.as_mut().and_then(|te| {
-                te.auto_reply_fail_tt
-                    .take()
-                    .map(|tt| (tt, te.message.clone()))
-            }) {
-                ActivationCompleteOutcome::ReportWFTFail(FailedActivationWFTReport::Report(
-                    tt,
-                    WorkflowTaskFailedCause::WorkflowWorkerUnhandledFailure,
-                    Failure::application_failure(reason, true).into(),
-                ))
+            let outcome = if let Some((info, reason)) = self
+                .trying_to_evict
+                .as_mut()
+                .and_then(|te| te.auto_reply_fail.take().map(|i| (i, te.message.clone())))
+            {
+                ActivationCompleteOutcome::ReportWFTFail(Box::new(FailedActivationWFTReport {
+                    task_token: info.task_token,
+                    attempt: info.attempt,
+                    cause: WorkflowTaskFailedCause::WorkflowWorkerUnhandledFailure,
+                    failure: Failure::application_failure(reason, true).into(),
+                    metrics: self.metrics.clone(),
+                    legacy_query: false,
+                }))
             } else {
                 ActivationCompleteOutcome::DoNothing
             };
@@ -603,8 +605,8 @@ impl ManagedRun {
         is_auto_fail: bool,
         resp_chan: Option<oneshot::Sender<ActivationCompleteResult>>,
     ) -> RunUpdateAct {
-        let tt = if let Some(tt) = self.wft.as_ref().map(|t| t.info.task_token.clone()) {
-            tt
+        let (tt, attempt) = if let Some(t) = self.wft.as_ref() {
+            (t.info.task_token.clone(), t.info.attempt)
         } else {
             dbg_panic!(
                 "No workflow task for run id {} found when trying to fail activation",
@@ -623,71 +625,66 @@ impl ManagedRun {
                 EvictionReason::Unspecified | EvictionReason::PaginationOrHistoryFetch
             );
 
-        let (should_report, rur) = if is_no_report_query_fail {
-            (false, None)
+        let rur = if is_no_report_query_fail {
+            None
         } else {
             // Blow up any cached data associated with the workflow
-            let evict_req_outcome = self.request_eviction(RequestEvictMsg {
+            self.request_eviction(RequestEvictMsg {
                 run_id: self.run_id().to_string(),
                 message,
                 reason,
-                auto_reply_fail_tt: None,
-            });
-            let should_report = match &evict_req_outcome {
-                EvictionRequestResult::EvictionRequested(Some(attempt), _)
-                | EvictionRequestResult::EvictionAlreadyRequested(Some(attempt)) => *attempt <= 1,
-                _ => false,
-            };
-            let rur = evict_req_outcome.into_run_update_resp();
-            (should_report, rur)
+                auto_reply_fail: None,
+            })
+            .into_run_update_resp()
         };
 
-        let outcome = if self.pending_work_is_legacy_query() {
-            if is_no_report_query_fail {
-                ActivationCompleteOutcome::WFTFailedDontReport
-            } else {
-                ActivationCompleteOutcome::ReportWFTFail(
-                    FailedActivationWFTReport::ReportLegacyQueryFailure(tt, failure),
-                )
-            }
-        } else if should_report {
-            // Check if we should fail the workflow instead of the WFT because of user's preferences
-            if matches!(cause, WorkflowTaskFailedCause::NonDeterministicError)
-                && self.config.should_fail_workflow(
-                    &self.wfm.machines.workflow_type,
-                    &WorkflowErrorType::Nondeterminism,
-                )
-            {
-                warn!(failure=?failure, "Failing workflow due to nondeterminism error");
-                return self
-                    .successful_completion(
-                        vec![WFCommand::new(WFCommandVariant::FailWorkflow(
-                            FailWorkflowExecution {
-                                failure: failure.failure,
-                            },
-                        ))],
-                        vec![],
-                        VersioningBehavior::Unspecified, // Doesn't matter since we're failing wf
-                        resp_chan,
-                        true,
-                    )
-                    .unwrap_or_else(|e| {
-                        dbg_panic!("Got next page request when auto-failing workflow: {e:?}");
-                        None
-                    });
-            } else {
-                ActivationCompleteOutcome::ReportWFTFail(FailedActivationWFTReport::Report(
-                    tt, cause, failure,
-                ))
-            }
-        } else {
-            ActivationCompleteOutcome::WFTFailedDontReport
-        };
+        let legacy_query = self.pending_work_is_legacy_query();
+        if legacy_query && is_no_report_query_fail {
+            self.reply_to_complete(ActivationCompleteOutcome::WFTFailedDontReport, resp_chan);
+            return rur;
+        }
 
-        self.metrics
-            .with_new_attrs([metrics::failure_reason(cause.into())])
-            .wf_task_failed();
-        self.reply_to_complete(outcome, resp_chan);
+        // Check if we should fail the workflow instead of the WFT because of user's preferences.
+        // Only done on the first attempt: if that attempt's completion didn't reach the server,
+        // later attempts fall through to the normal task failure path, which won't re-report.
+        if !legacy_query
+            && attempt <= 1
+            && matches!(cause, WorkflowTaskFailedCause::NonDeterministicError)
+            && self.config.should_fail_workflow(
+                &self.wfm.machines.workflow_type,
+                &WorkflowErrorType::Nondeterminism,
+            )
+        {
+            warn!(failure=?failure, "Failing workflow due to nondeterminism error");
+            return self
+                .successful_completion(
+                    vec![WFCommand::new(WFCommandVariant::FailWorkflow(
+                        FailWorkflowExecution {
+                            failure: failure.failure,
+                        },
+                    ))],
+                    vec![],
+                    VersioningBehavior::Unspecified, // Doesn't matter since we're failing wf
+                    resp_chan,
+                    true,
+                )
+                .unwrap_or_else(|e| {
+                    dbg_panic!("Got next page request when auto-failing workflow: {e:?}");
+                    None
+                });
+        }
+
+        self.reply_to_complete(
+            ActivationCompleteOutcome::ReportWFTFail(Box::new(FailedActivationWFTReport {
+                task_token: tt,
+                attempt,
+                cause,
+                failure,
+                metrics: self.metrics.clone(),
+                legacy_query,
+            })),
+            resp_chan,
+        );
         rur
     }
 
@@ -952,8 +949,6 @@ impl ManagedRun {
     }
 
     pub(super) fn request_eviction(&mut self, info: RequestEvictMsg) -> EvictionRequestResult {
-        let attempts = self.wft.as_ref().map(|wt| wt.info.attempt);
-
         // If we were waiting on a page fetch and we're getting evicted because fetching failed,
         // then make sure we allow the completion to proceed, otherwise we're stuck waiting forever.
         if self.completion_waiting_on_page_fetch.is_some()
@@ -968,7 +963,7 @@ impl ManagedRun {
                 true,
                 c.resp_chan,
             );
-            return EvictionRequestResult::EvictionRequested(attempts, run_upd);
+            return EvictionRequestResult::EvictionRequested(run_upd);
         }
 
         if !self.activation_is_eviction() && self.trying_to_evict.is_none() {
@@ -995,11 +990,11 @@ impl ManagedRun {
             }
 
             self.trying_to_evict = Some(info);
-            EvictionRequestResult::EvictionRequested(attempts, self.check_more_activations())
+            EvictionRequestResult::EvictionRequested(self.check_more_activations())
         } else {
             // Always store the most recent eviction reason
             self.trying_to_evict = Some(info);
-            EvictionRequestResult::EvictionAlreadyRequested(attempts)
+            EvictionRequestResult::EvictionAlreadyRequested
         }
     }
 
@@ -1270,7 +1265,7 @@ impl ManagedRun {
                 run_id: self.run_id().to_string(),
                 message: warnstr,
                 reason: EvictionReason::Fatal,
-                auto_reply_fail_tt: None,
+                auto_reply_fail: None,
             });
         }
     }

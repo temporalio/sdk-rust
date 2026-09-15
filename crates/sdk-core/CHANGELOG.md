@@ -36,9 +36,12 @@ relevant information.
 ### Fixed
 * Workflow poll balancing now lets non-sticky pollers use capacity after sticky pollers reach their
   configured or autoscaled polling limit.
-* Workflow task failures with cause `PayloadsTooLarge` are now only sent to the server on the first
-  task attempt, as is already done for `RequestTooLarge` and `GrpcMessageTooLarge`. Later attempts
-  are left to time out rather than repeatedly failing the task.
+* Every path that fails a workflow task now only reports the failure to server
+  on the task's first attempt, and later attempts are left to time out. Previously `PayloadsTooLarge`
+  failures and history fetch failures were re-reported on every attempt.
+* The `workflow_task_execution_failed` metric is now recorded for every failed workflow task
+  attempt, including attempts whose failure was not sent to the server, and its `failure_reason`
+  tag distinguishes `GrpcMessageTooLarge`, `PayloadsTooLarge`, and `RequestTooLarge` on every path.
 
 ## [0.9.0] - 2026-09-04
 
