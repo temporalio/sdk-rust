@@ -456,11 +456,12 @@ impl Workflows {
                             );
                         }
                         Err(e) => {
-                            let cause_reason_failure = if e
-                                .metadata()
-                                .contains_key(REQUEST_TOO_LARGE_KEY)
-                                && attempt < 2
-                            {
+                            // Size failures are deterministic: retrying the task regenerates the
+                            // same oversized completion, so only report the first attempt and let
+                            // later ones time out rather than spamming the server with failures.
+                            let cause_reason_failure = if attempt >= 2 {
+                                None
+                            } else if e.metadata().contains_key(REQUEST_TOO_LARGE_KEY) {
                                 // Completion exceeds the namespace's recombined size limit, so the
                                 // worker failed it proactively rather than sending doomed pages.
                                 Some((
@@ -468,11 +469,7 @@ impl Workflows {
                                     FailureReason::RequestTooLarge,
                                     make_request_too_large_failure(),
                                 ))
-                            } else if e.metadata().contains_key(MESSAGE_TOO_LARGE_KEY)
-                                && attempt < 2
-                            {
-                                // gRPC message too large from server; skip on nonfirst attempts to
-                                // avoid spamming.
+                            } else if e.metadata().contains_key(MESSAGE_TOO_LARGE_KEY) {
                                 Some((
                                     WorkflowTaskFailedCause::GrpcMessageTooLarge,
                                     FailureReason::GrpcMessageTooLarge,

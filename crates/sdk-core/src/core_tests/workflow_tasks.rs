@@ -31,6 +31,7 @@ use std::{
 };
 use temporalio_client::MESSAGE_TOO_LARGE_KEY;
 use temporalio_common::{
+    payload_limits::{LimitClass, LimitSeverity, PayloadLimitViolation},
     protos::{
         coresdk::{
             ActivityTaskCompletion,
@@ -3285,4 +3286,61 @@ async fn grpc_message_too_large_doesnt_spam_task_fails() {
     core.complete_execution(&act.run_id).await;
     core.drain_pollers_and_shutdown().await;
     // Mock only expects 1 task failure, and would fail here if we spammed
+}
+
+#[tokio::test]
+async fn payloads_too_large_doesnt_spam_task_fails() {
+    let mut t = TestHistoryBuilder::default();
+    t.add_by_type(EventType::WorkflowExecutionStarted);
+    t.add_workflow_task_scheduled_and_started();
+
+    let mut mh = MockPollCfg::from_resp_batches(
+        "fake_wf_id",
+        t,
+        [
+            ResponseType::AllHistory,
+            ResponseType::AllHistory,
+            ResponseType::AllHistory,
+            ResponseType::AllHistory,
+            ResponseType::AllHistory,
+            ResponseType::AllHistory,
+        ],
+        mock_worker_client(),
+    );
+    mh.num_expected_fails = 1;
+    let mut times = 1;
+    mh.completion_mock_fn = Some(Box::new(move |_| {
+        if times <= 5 {
+            let violation = PayloadLimitViolation {
+                path: "commands[0].input".to_string(),
+                class: LimitClass::Blob,
+                severity: LimitSeverity::Error,
+                size: 1024,
+                limit: 10,
+            };
+            let mut err = tonic::Status::new(tonic::Code::InvalidArgument, violation.to_string());
+            err.set_source(Arc::new(violation));
+            times += 1;
+            Err(err)
+        } else {
+            Ok(Default::default())
+        }
+    }));
+    mh.expect_fail_wft_matcher =
+        Box::new(|_, cause, _| *cause == WorkflowTaskFailedCause::PayloadsTooLarge);
+
+    let mut mock = build_mock_pollers(mh);
+    mock.worker_cfg(|wc| wc.max_cached_workflows = 1);
+    let core = mock_worker(mock);
+
+    for _ in 1..=5 {
+        let act = core.poll_workflow_activation().await.unwrap();
+        core.complete_workflow_activation(WorkflowActivationCompletion::empty(&act.run_id))
+            .await
+            .unwrap();
+        core.handle_eviction().await;
+    }
+    let act = core.poll_workflow_activation().await.unwrap();
+    core.complete_execution(&act.run_id).await;
+    core.drain_pollers_and_shutdown().await;
 }

@@ -36,6 +36,9 @@ relevant information.
 ### Fixed
 * Sticky workflow backlog no longer prevents normal pollers from using capacity after sticky
   pollers reach their polling limit.
+* A workflow task completion rejected for exceeding the worker's payload size error limit is now
+  reported as a task failure only on the first attempt, matching the existing behavior for
+  oversized gRPC requests, instead of on every retry.
 
 ## [1.0.0] - 2026-09-04
 
