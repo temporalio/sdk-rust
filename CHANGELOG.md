@@ -36,6 +36,9 @@ relevant information.
 ### Fixed
 * Sticky workflow backlog no longer prevents normal pollers from using capacity after sticky
   pollers reach their polling limit.
+* Workflow task failures are now reported to the server only on a task's first attempt, no
+  matter why the task failed. Previously a completion rejected for exceeding the worker's payload
+  size error limit, or a failure to fetch workflow history, was re-reported on every retry.
 * The `temporal_workflow_task_execution_failed` metric now counts every failed workflow task
   attempt, including ones whose failure was not sent to the server, and tags size-related failures
   with their specific `failure_reason` (`GrpcMessageTooLarge`, `PayloadsTooLarge`,

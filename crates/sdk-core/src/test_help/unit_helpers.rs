@@ -1,11 +1,132 @@
 //! Unit test helpers - only available in unit tests (cfg(test))
 
 use futures_util::{StreamExt, stream::FuturesUnordered};
-use std::{collections::HashSet, future::Future};
-use temporalio_common::protos::coresdk::{
-    workflow_activation::workflow_activation_job,
-    workflow_completion::{WorkflowActivationCompletion, workflow_activation_completion},
+use std::{
+    collections::{HashMap, HashSet},
+    future::Future,
+    sync::{Arc, Mutex},
 };
+use temporalio_common::{
+    protos::coresdk::{
+        workflow_activation::workflow_activation_job,
+        workflow_completion::{WorkflowActivationCompletion, workflow_activation_completion},
+    },
+    telemetry::{
+        TaskQueueLabelStrategy,
+        metrics::{
+            CoreMeter, Counter, CounterBase, Gauge, GaugeF64, Histogram, HistogramDuration,
+            HistogramF64, MetricAttributable, MetricAttributes, MetricParameters, NewAttributes,
+            NoOpCoreMeter, TemporalMeter, UpDownCounter,
+        },
+    },
+};
+
+/// A meter that records counter increments in memory so unit tests can assert on them. All other
+/// instrument kinds are discarded.
+#[derive(Debug, Default)]
+pub struct CounterRecordingMeter {
+    adds: Arc<Mutex<Vec<CounterAdd>>>,
+}
+#[derive(Debug)]
+struct CounterAdd {
+    name: String,
+    labels: HashMap<String, String>,
+    value: u64,
+}
+impl CounterRecordingMeter {
+    pub fn into_temporal_meter(self: Arc<Self>) -> TemporalMeter {
+        TemporalMeter::new(
+            self,
+            NewAttributes::default(),
+            TaskQueueLabelStrategy::UseNormal,
+        )
+    }
+
+    /// Sum of all increments to the named counter whose labels include every provided pair
+    pub fn counter_total(&self, name: &str, labels: &[(&str, &str)]) -> u64 {
+        self.adds
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|a| {
+                a.name == name
+                    && labels
+                        .iter()
+                        .all(|(k, v)| a.labels.get(*k).map(String::as_str) == Some(*v))
+            })
+            .map(|a| a.value)
+            .sum()
+    }
+}
+struct RecordingCounter {
+    name: String,
+    adds: Arc<Mutex<Vec<CounterAdd>>>,
+}
+impl MetricAttributable<Box<dyn CounterBase>> for RecordingCounter {
+    fn with_attributes(
+        &self,
+        attributes: &MetricAttributes,
+    ) -> Result<Box<dyn CounterBase>, Box<dyn std::error::Error>> {
+        let MetricAttributes::NoOp(labels) = attributes else {
+            panic!("CounterRecordingMeter only works with NoOp attributes");
+        };
+        Ok(Box::new(BoundRecordingCounter {
+            name: self.name.clone(),
+            labels: (**labels).clone(),
+            adds: self.adds.clone(),
+        }))
+    }
+}
+struct BoundRecordingCounter {
+    name: String,
+    labels: HashMap<String, String>,
+    adds: Arc<Mutex<Vec<CounterAdd>>>,
+}
+impl CounterBase for BoundRecordingCounter {
+    fn adds(&self, value: u64) {
+        self.adds.lock().unwrap().push(CounterAdd {
+            name: self.name.clone(),
+            labels: self.labels.clone(),
+            value,
+        });
+    }
+}
+impl CoreMeter for CounterRecordingMeter {
+    fn new_attributes(&self, attribs: NewAttributes) -> MetricAttributes {
+        NoOpCoreMeter.new_attributes(attribs)
+    }
+    fn extend_attributes(
+        &self,
+        existing: MetricAttributes,
+        attribs: NewAttributes,
+    ) -> MetricAttributes {
+        NoOpCoreMeter.extend_attributes(existing, attribs)
+    }
+    fn counter(&self, params: MetricParameters) -> Counter {
+        Counter::new(Arc::new(RecordingCounter {
+            name: params.name.to_string(),
+            adds: self.adds.clone(),
+        }))
+    }
+    fn histogram(&self, params: MetricParameters) -> Histogram {
+        NoOpCoreMeter.histogram(params)
+    }
+    fn histogram_f64(&self, params: MetricParameters) -> HistogramF64 {
+        NoOpCoreMeter.histogram_f64(params)
+    }
+    fn histogram_duration(&self, params: MetricParameters) -> HistogramDuration {
+        NoOpCoreMeter.histogram_duration(params)
+    }
+    fn gauge(&self, params: MetricParameters) -> Gauge {
+        NoOpCoreMeter.gauge(params)
+    }
+    fn gauge_f64(&self, params: MetricParameters) -> GaugeF64 {
+        NoOpCoreMeter.gauge_f64(params)
+    }
+    fn up_down_counter(&self, params: MetricParameters) -> UpDownCounter {
+        NoOpCoreMeter.up_down_counter(params)
+    }
+}
 
 /// Given a desired number of concurrent executions and a provided function that produces a future,
 /// run that many instances of the future concurrently.

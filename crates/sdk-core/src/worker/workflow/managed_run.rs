@@ -12,7 +12,8 @@ use crate::{
             LocalActivityRequestSink, LocalResolution, NextPageReq, OutstandingActivation,
             OutstandingTask, PermittedWFT, RequestEvictMsg, RunBasics,
             ServerCommandsWithWorkflowInfo, TaskStorageMetrics, WFCommand, WFCommandVariant,
-            WFMachinesError, WFT_HEARTBEAT_TIMEOUT_FRACTION, WFTReportStatus, WorkflowTaskInfo,
+            WFMachinesError, WFT_HEARTBEAT_TIMEOUT_FRACTION, WFTReportStatus, WftFailureKind,
+            WorkflowTaskInfo,
             history_update::HistoryPaginator,
             machines::{MachinesWFTResponseContent, WorkflowMachines},
         },
@@ -443,14 +444,14 @@ impl ManagedRun {
                 .as_mut()
                 .and_then(|te| te.auto_reply_fail.take().map(|i| (i, te.message.clone())))
             {
-                ActivationCompleteOutcome::ReportWFTFail(Box::new(FailedActivationWFTReport {
-                    task_token: info.task_token,
-                    attempt: info.attempt,
-                    cause: WorkflowTaskFailedCause::WorkflowWorkerUnhandledFailure,
-                    failure: Failure::application_failure(reason, true).into(),
-                    metrics: self.metrics.clone(),
-                    legacy_query: false,
-                }))
+                ActivationCompleteOutcome::ReportWFTFail(Box::new(FailedActivationWFTReport::new(
+                    info.task_token,
+                    info.attempt,
+                    WorkflowTaskFailedCause::WorkflowWorkerUnhandledFailure,
+                    Failure::application_failure(reason, true).into(),
+                    WftFailureKind::Task,
+                    &self.metrics,
+                )))
             } else {
                 ActivationCompleteOutcome::DoNothing
             };
@@ -638,16 +639,18 @@ impl ManagedRun {
             .into_run_update_resp()
         };
 
-        let legacy_query = self.pending_work_is_legacy_query();
-        if legacy_query && is_no_report_query_fail {
-            self.reply_to_complete(ActivationCompleteOutcome::WFTFailedDontReport, resp_chan);
-            return rur;
-        }
+        let kind = if !self.pending_work_is_legacy_query() {
+            WftFailureKind::Task
+        } else if is_no_report_query_fail {
+            WftFailureKind::RetryableLegacyQuery
+        } else {
+            WftFailureKind::LegacyQuery
+        };
 
         // Check if we should fail the workflow instead of the WFT because of user's preferences.
         // Only done on the first attempt: if that attempt's completion didn't reach the server,
         // later attempts fall through to the normal task failure path, which won't re-report.
-        if !legacy_query
+        if kind == WftFailureKind::Task
             && attempt <= 1
             && matches!(cause, WorkflowTaskFailedCause::NonDeterministicError)
             && self.config.should_fail_workflow(
@@ -675,14 +678,14 @@ impl ManagedRun {
         }
 
         self.reply_to_complete(
-            ActivationCompleteOutcome::ReportWFTFail(Box::new(FailedActivationWFTReport {
-                task_token: tt,
+            ActivationCompleteOutcome::ReportWFTFail(Box::new(FailedActivationWFTReport::new(
+                tt,
                 attempt,
                 cause,
                 failure,
-                metrics: self.metrics.clone(),
-                legacy_query,
-            })),
+                kind,
+                &self.metrics,
+            ))),
             resp_chan,
         );
         rur

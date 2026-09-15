@@ -471,14 +471,14 @@ impl Workflows {
                                 self.handle_activation_failed(
                                     run_id,
                                     completion_time,
-                                    FailedActivationWFTReport {
+                                    FailedActivationWFTReport::new(
                                         task_token,
                                         attempt,
                                         cause,
                                         failure,
-                                        metrics: run_metrics.clone(),
-                                        legacy_query: false,
-                                    },
+                                        WftFailureKind::Task,
+                                        &run_metrics,
+                                    ),
                                 )
                                 .await;
                             }
@@ -510,10 +510,9 @@ impl Workflows {
     }
 
     /// The single point through which every workflow task failure passes on its way to the
-    /// server. The task-failed metric counts every attempt, but the failure itself is only sent for
-    /// the first attempt of a task. Later attempts almost always fail the same way, so reporting
-    /// them would just spam the server with failures it already knows about. Instead they are left
-    /// to time out.
+    /// server. A task failure is only sent for the first attempt of a task. Later attempts almost
+    /// always fail the same way, so reporting them would just spam the server with failures it
+    /// already knows about. Instead they are left to time out.
     async fn handle_activation_failed(
         &self,
         run_id: &str,
@@ -525,28 +524,33 @@ impl Workflows {
             attempt,
             cause,
             failure,
-            metrics,
-            legacy_query,
+            kind,
         } = report;
-        metrics
-            .with_new_attrs([metrics::failure_reason(cause.into())])
-            .wf_task_failed();
-        if legacy_query {
-            warn!(run_id=%run_id, failure=?failure, "Failing legacy query request");
-            self.respond_legacy_query(task_token, LegacyQueryResult::Failed(failure))
+        match kind {
+            WftFailureKind::LegacyQuery => {
+                warn!(run_id=%run_id, failure=?failure, "Failing legacy query request");
+                self.respond_legacy_query(task_token, LegacyQueryResult::Failed(failure))
+                    .await;
+            }
+            WftFailureKind::RetryableLegacyQuery => {
+                debug!(run_id=%run_id, failure=?failure,
+                       "Dropping legacy query with retryable failure");
+                return WFTReportStatus::DropWft { completion_time };
+            }
+            WftFailureKind::Task if attempt > 1 => {
+                debug!(run_id=%run_id, attempt, failure=?failure,
+                       "Not reporting workflow task failure on non-first attempt");
+                return WFTReportStatus::DropWft { completion_time };
+            }
+            WftFailureKind::Task => {
+                warn!(run_id=%run_id, failure=?failure, "Failing workflow task");
+                self.handle_wft_reporting_errs(run_id, || async {
+                    self.client
+                        .fail_workflow_task(task_token, cause, failure.failure)
+                        .await
+                })
                 .await;
-        } else if attempt > 1 {
-            debug!(run_id=%run_id, attempt, failure=?failure,
-                   "Not reporting workflow task failure on non-first attempt");
-            return WFTReportStatus::DropWft { completion_time };
-        } else {
-            warn!(run_id=%run_id, failure=?failure, "Failing workflow task");
-            self.handle_wft_reporting_errs(run_id, || async {
-                self.client
-                    .fail_workflow_task(task_token, cause, failure.failure)
-                    .await
-            })
-            .await;
+            }
         }
         WFTReportStatus::Reported {
             reset_last_started_to: None,
@@ -575,9 +579,6 @@ impl Workflows {
             ActivationCompleteOutcome::ReportWFTFail(report) => {
                 self.handle_activation_failed(run_id, completion_time, *report)
                     .await
-            }
-            ActivationCompleteOutcome::WFTFailedDontReport => {
-                WFTReportStatus::DropWft { completion_time }
             }
             ActivationCompleteOutcome::DoNothing => WFTReportStatus::NotReported,
         }
@@ -1089,28 +1090,49 @@ struct WorkflowTaskInfo {
 }
 
 /// Everything needed to tell the server a workflow task failed. Every path that fails a WFT
-/// produces one of these, so that [Workflows::handle_activation_failed] is the single place that
-/// decides whether the failure is actually sent.
+/// must produce one of these via [FailedActivationWFTReport::new] and feed it to
+/// [Workflows::handle_activation_failed].
+#[derive(Debug)]
 struct FailedActivationWFTReport {
     task_token: TaskToken,
     attempt: u32,
     cause: WorkflowTaskFailedCause,
     failure: Failure,
-    metrics: MetricsContext,
-    /// Legacy queries are answered through the query response API rather than by failing the
-    /// task, and the caller is blocked until an answer arrives, so they are always reported.
-    legacy_query: bool,
+    kind: WftFailureKind,
 }
-impl Debug for FailedActivationWFTReport {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("FailedActivationWFTReport")
-            .field("task_token", &self.task_token)
-            .field("attempt", &self.attempt)
-            .field("cause", &self.cause)
-            .field("failure", &self.failure)
-            .field("legacy_query", &self.legacy_query)
-            .finish()
+impl FailedActivationWFTReport {
+    /// Records the task-failed metric as part of constructing the report.
+    fn new(
+        task_token: TaskToken,
+        attempt: u32,
+        cause: WorkflowTaskFailedCause,
+        failure: Failure,
+        kind: WftFailureKind,
+        metrics: &MetricsContext,
+    ) -> Self {
+        metrics
+            .with_new_attrs([metrics::failure_reason(cause.into())])
+            .wf_task_failed();
+        Self {
+            task_token,
+            attempt,
+            cause,
+            failure,
+            kind,
+        }
     }
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+enum WftFailureKind {
+    /// A normal workflow task, failed via the task failure API.
+    Task,
+    /// A legacy query, answered through the query response API rather than by failing the task.
+    /// The caller is blocked until an answer arrives, so these are always reported.
+    LegacyQuery,
+    /// A legacy query whose failure is transient and may succeed if retried. Failing the query
+    /// would surface that transient error to the caller, so the task is dropped unanswered.
+    RetryableLegacyQuery,
 }
 
 /// Identifies a WFT whose failure must be reported outside the normal activation completion path,
@@ -1277,10 +1299,6 @@ enum ActivationCompleteOutcome {
     ReportWFTFail(Box<FailedActivationWFTReport>),
     /// There's nothing to do right now. EX: The workflow needs to keep replaying.
     DoNothing,
-    /// The workflow task failed, but we shouldn't report it. Only used for legacy queries whose
-    /// failure is retryable, since failing the query would surface a transient error to the
-    /// caller.
-    WFTFailedDontReport,
 }
 /// Did we report, or not, completion of a WFT to server?
 #[derive(Debug, Copy, Clone)]
@@ -1293,7 +1311,7 @@ enum WFTReportStatus {
     /// work to be done. EX: Running LAs.
     NotReported,
     /// We didn't report, but we want to clear the outstanding workflow task anyway. See
-    /// [ActivationCompleteOutcome::WFTFailedDontReport].
+    /// [Workflows::handle_activation_failed] for when this happens.
     DropWft { completion_time: Instant },
 }
 impl WFTReportStatus {

@@ -168,16 +168,16 @@ impl WFStream {
                         {
                             actions.push(WorkflowStreamAction::FailUnstoredWft {
                                 run_id,
-                                report: Box::new(FailedActivationWFTReport {
-                                    task_token: info.task_token,
-                                    attempt: info.attempt,
-                                    cause: WorkflowTaskFailedCause::WorkflowWorkerUnhandledFailure,
-                                    failure: ApiFailure::application_failure(message, true).into(),
-                                    metrics: state
+                                report: Box::new(FailedActivationWFTReport::new(
+                                    info.task_token,
+                                    info.attempt,
+                                    WorkflowTaskFailedCause::WorkflowWorkerUnhandledFailure,
+                                    ApiFailure::application_failure(message, true).into(),
+                                    WftFailureKind::Task,
+                                    &state
                                         .metrics
                                         .with_new_attrs([workflow_type(info.workflow_type)]),
-                                    legacy_query: false,
-                                }),
+                                )),
                             });
                             None
                         } else {

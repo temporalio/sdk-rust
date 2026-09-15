@@ -4,7 +4,8 @@ use crate::{
     job_assert,
     replay::{TestHistoryBuilder, canned_histories, default_act_sched, default_wes_attribs},
     test_help::{
-        FakeWfResponses, MockPollCfg, MocksHolder, ResponseType, WorkerExt, WorkerTestHelpers,
+        CounterRecordingMeter, FakeWfResponses, MockPollCfg, MocksHolder, ResponseType, WorkerExt,
+        WorkerTestHelpers,
         WorkflowCachingPolicy::{self, AfterEveryReply, NonSticky},
         build_fake_worker, build_mock_pollers, build_multihist_mock_sg, fanout_tasks,
         gen_assert_and_fail, gen_assert_and_reply, hist_to_poll_resp, mock_worker, poll_and_reply,
@@ -3272,6 +3273,8 @@ async fn grpc_message_too_large_doesnt_spam_task_fails() {
 
     let mut mock = build_mock_pollers(mh);
     mock.worker_cfg(|wc| wc.max_cached_workflows = 1);
+    let meter = Arc::new(CounterRecordingMeter::default());
+    mock.set_temporal_meter(meter.clone().into_temporal_meter());
     let core = mock_worker(mock);
 
     // Since the mock makes us fail 5 times, we should succeed on the sixth
@@ -3286,6 +3289,14 @@ async fn grpc_message_too_large_doesnt_spam_task_fails() {
     core.complete_execution(&act.run_id).await;
     core.drain_pollers_and_shutdown().await;
     // Mock only expects 1 task failure, and would fail here if we spammed
+    // Every attempt counts as a failure though, even the unreported ones
+    assert_eq!(
+        meter.counter_total(
+            "workflow_task_execution_failed",
+            &[("failure_reason", "GrpcMessageTooLarge")]
+        ),
+        5
+    );
 }
 
 #[tokio::test]
@@ -3326,11 +3337,17 @@ async fn payloads_too_large_doesnt_spam_task_fails() {
             Ok(Default::default())
         }
     }));
-    mh.expect_fail_wft_matcher =
-        Box::new(|_, cause, _| *cause == WorkflowTaskFailedCause::PayloadsTooLarge);
+    let fails = Arc::new(AtomicUsize::new(0));
+    let fails_clone = fails.clone();
+    mh.expect_fail_wft_matcher = Box::new(move |_, cause, _| {
+        fails_clone.fetch_add(1, Ordering::Relaxed);
+        *cause == WorkflowTaskFailedCause::PayloadsTooLarge
+    });
 
     let mut mock = build_mock_pollers(mh);
     mock.worker_cfg(|wc| wc.max_cached_workflows = 1);
+    let meter = Arc::new(CounterRecordingMeter::default());
+    mock.set_temporal_meter(meter.clone().into_temporal_meter());
     let core = mock_worker(mock);
 
     for _ in 1..=5 {
@@ -3343,6 +3360,14 @@ async fn payloads_too_large_doesnt_spam_task_fails() {
     let act = core.poll_workflow_activation().await.unwrap();
     core.complete_execution(&act.run_id).await;
     core.drain_pollers_and_shutdown().await;
+    assert_eq!(fails.load(Ordering::Relaxed), 1);
+    assert_eq!(
+        meter.counter_total(
+            "workflow_task_execution_failed",
+            &[("failure_reason", "PayloadsTooLarge")]
+        ),
+        5
+    );
 }
 
 /// A history fetch failure for a run that was never cached is reported through a path that has no
@@ -3381,7 +3406,10 @@ async fn unstored_wft_fetch_failure_doesnt_spam_task_fails() {
         fails_clone.fetch_add(1, Ordering::Relaxed);
         *cause == WorkflowTaskFailedCause::WorkflowWorkerUnhandledFailure
     });
-    let core = mock_worker(build_mock_pollers(mh));
+    let mut mock = build_mock_pollers(mh);
+    let meter = Arc::new(CounterRecordingMeter::default());
+    mock.set_temporal_meter(meter.clone().into_temporal_meter());
+    let core = mock_worker(mock);
 
     // Both fetch failures are processed before the exhausted poller shuts the worker down
     assert_matches!(
@@ -3390,6 +3418,13 @@ async fn unstored_wft_fetch_failure_doesnt_spam_task_fails() {
     );
     core.shutdown().await;
     assert_eq!(fails.load(Ordering::Relaxed), 1);
+    assert_eq!(
+        meter.counter_total(
+            "workflow_task_execution_failed",
+            &[("failure_reason", "WorkflowError")]
+        ),
+        2
+    );
 }
 
 /// A history fetch failure for a cached run evicts it and reports the failure once the eviction
@@ -3433,6 +3468,8 @@ async fn cached_run_fetch_failure_doesnt_spam_task_fails() {
     // Otherwise the poller runs dry and starts shutdown before the second eviction completes
     mock.make_wft_stream_interminable();
     mock.worker_cfg(|wc| wc.max_cached_workflows = 10);
+    let meter = Arc::new(CounterRecordingMeter::default());
+    mock.set_temporal_meter(meter.clone().into_temporal_meter());
     let core = mock_worker(mock);
 
     for _ in 0..2 {
@@ -3457,4 +3494,11 @@ async fn cached_run_fetch_failure_doesnt_spam_task_fails() {
     }
     core.shutdown().await;
     assert_eq!(fails.load(Ordering::Relaxed), 1);
+    assert_eq!(
+        meter.counter_total(
+            "workflow_task_execution_failed",
+            &[("failure_reason", "WorkflowError")]
+        ),
+        2
+    );
 }
