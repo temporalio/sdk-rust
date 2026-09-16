@@ -758,6 +758,7 @@ const BLOB_FIELDS: &[&str] = &[
     "temporal.api.workflowservice.v1.RespondActivityTaskCanceledRequest.details",
     "temporal.api.workflowservice.v1.RespondActivityTaskCompletedByIdRequest.result",
     "temporal.api.workflowservice.v1.RespondActivityTaskCompletedRequest.result",
+    "temporal.api.common.v1.Callback.NexusHandler.source_context",
     "temporal.api.workflowservice.v1.SignalWithStartWorkflowExecutionRequest.input",
     "temporal.api.workflowservice.v1.SignalWithStartWorkflowExecutionRequest.signal_input",
     "temporal.api.workflowservice.v1.SignalWorkflowExecutionRequest.input",
@@ -829,9 +830,6 @@ const NOT_VALIDATED_FIELDS: &[&str] = &[
     // Dedicated, non-fetchable limits (not blob/memo, not in DescribeNamespace): Event group marker
     // label: custom 400-byte server-side limit.
     "temporal.api.sdk.v1.EventGroupMarker.Label.label",
-    // NexusHandler callback source context: dedicated per-callback and aggregate server limits
-    // are not exposed through NamespaceInfo.
-    "temporal.api.common.v1.Callback.NexusHandler.source_context",
     // Update input args: frontend records a metric only — enforced on delivery via Message.body.
     "temporal.api.update.v1.Input.args",
     // Query/nexus failures and the nexus sync response payload: not size-checked on these paths.
