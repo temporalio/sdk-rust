@@ -749,6 +749,7 @@ const BLOB_FIELDS: &[&str] = &[
     "temporal.api.command.v1.SignalExternalWorkflowExecutionCommandAttributes.input",
     "temporal.api.command.v1.StartChildWorkflowExecutionCommandAttributes.input",
     "temporal.api.command.v1.UpsertWorkflowSearchAttributesCommandAttributes.search_attributes", // indexed_fields data-sum
+    "temporal.api.common.v1.Callback.NexusHandler.source_context",
     "temporal.api.protocol.v1.Message.body", // whole Any body; see EXTRA_WHOLE_MESSAGE_LEAVES
     "temporal.api.query.v1.WorkflowQuery.query_args",
     "temporal.api.workflow.v1.NewWorkflowExecutionInfo.input",
@@ -758,7 +759,6 @@ const BLOB_FIELDS: &[&str] = &[
     "temporal.api.workflowservice.v1.RespondActivityTaskCanceledRequest.details",
     "temporal.api.workflowservice.v1.RespondActivityTaskCompletedByIdRequest.result",
     "temporal.api.workflowservice.v1.RespondActivityTaskCompletedRequest.result",
-    "temporal.api.common.v1.Callback.NexusHandler.source_context",
     "temporal.api.workflowservice.v1.SignalWithStartWorkflowExecutionRequest.input",
     "temporal.api.workflowservice.v1.SignalWithStartWorkflowExecutionRequest.signal_input",
     "temporal.api.workflowservice.v1.SignalWorkflowExecutionRequest.input",
