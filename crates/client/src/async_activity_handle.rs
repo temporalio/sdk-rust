@@ -282,6 +282,7 @@ impl<CT: WorkflowService + NamespacedClient + Clone> AsyncActivityHandle<CT> {
                                 identity: client.identity(),
                                 last_heartbeat_details,
                                 resource_id: Default::default(),
+                                ..Default::default()
                             }
                             .into_request();
                             rpc_options.apply_to(&mut request);
