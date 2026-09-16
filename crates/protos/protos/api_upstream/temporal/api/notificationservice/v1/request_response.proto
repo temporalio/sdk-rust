@@ -1,0 +1,37 @@
+syntax = "proto3";
+
+package temporal.api.notificationservice.v1;
+
+option go_package = "go.temporal.io/api/notificationservice/v1;notificationservice";
+option java_package = "io.temporal.api.notificationservice.v1";
+option java_multiple_files = true;
+option java_outer_classname = "RequestResponseProto";
+option ruby_package = "Temporalio::Api::NotificationService::V1";
+option csharp_namespace = "Temporalio.Api.NotificationService.V1";
+
+import "temporal/api/common/v1/message.proto";
+import "temporal/api/failure/v1/message.proto";
+
+// OnCompleteRequest is the request type to the NotificationService's OnComplete operation,
+// allowing for defining completion handlers for arbitrary operations.
+//
+// Information about the source operation will be available in the form of a commonpb.Link,
+// which will be available separately from this OnCompleteRequest. e.g. a link to the source
+// standalone Nexus operation would be found in the nexuspb.StartOperationRequest parameter
+// sent to the worker callback. (In addition to this OnCompleteRequest.)
+message OnCompleteRequest {
+
+    // The result of the source operation.
+    oneof result {
+        // The operation was successful, and resulted in the given payload.
+        temporal.api.common.v1.Payload success = 1;
+        // The operation failed. Includes timeout, cancellation, and application errors.
+        temporal.api.failure.v1.Failure failure = 2;
+    }
+
+    // User-supplied data which was added to the source invocation. (As applicable.)
+    temporal.api.common.v1.Payload source_context = 3;
+}
+
+// OnCompleteResponse is the return type of the OnComplete operation.
+message OnCompleteResponse {}

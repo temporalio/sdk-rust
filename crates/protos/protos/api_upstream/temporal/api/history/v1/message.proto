@@ -517,6 +517,8 @@ message ActivityTaskFailedEventAttributes {
     // Version info of the worker who processed this workflow task.
     // Deprecated. This field should be cleaned up when versioning-2 API is removed. [cleanup-experimental-wv]
     temporal.api.common.v1.WorkerVersionStamp worker_version = 6 [deprecated = true];
+    // Why did the task fail? When unset, the failure is treated as an unspecified activity failure.
+    temporal.api.enums.v1.ActivityTaskFailedCause cause = 7;
 }
 
 message ActivityTaskTimedOutEventAttributes {

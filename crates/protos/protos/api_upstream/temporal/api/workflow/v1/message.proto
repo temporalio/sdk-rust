@@ -496,6 +496,10 @@ message CallbackInfo {
 
     // If the state is BLOCKED, blocked reason provides additional information.
     string blocked_reason = 9;
+
+    // Server-generated request ID used as an idempotency token when invoking callbacks.
+    // It has no relation to caller-side request_id sent in operations like StartWorkflowExecutionRequest.
+    string request_id = 10;
 }
 
 // PendingNexusOperationInfo contains the state of a pending Nexus operation.
