@@ -2,6 +2,7 @@ use super::*;
 use futures_util::{Future, FutureExt};
 use std::sync::Arc;
 use temporalio_client::worker::ClientWorkerSet;
+use temporalio_common::protos::temporal::api::enums::v1::ActivityTaskFailedCause;
 
 pub(crate) static DEFAULT_TEST_CAPABILITIES: &Capabilities = &Capabilities {
     signal_and_query_header: true,

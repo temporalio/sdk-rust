@@ -725,7 +725,7 @@ pub mod coresdk {
                 coresdk::activity_result::activity_resolution::Status,
                 temporal::api::{
                     common::v1::Payload,
-                    enums::v1::TimeoutType,
+                    enums::v1::{ActivityTaskFailedCause, TimeoutType},
                     failure::v1::{CanceledFailureInfo, Failure as APIFailure, failure},
                 },
             };
