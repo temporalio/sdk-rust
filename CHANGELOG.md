@@ -34,6 +34,10 @@ relevant information.
 ## Unreleased
 
 ### Fixed
+* `temporalio-common`'s build script now generates its payload-visitor implementations in a
+  stable order. The generated code was emitted in `HashSet`/`HashMap` iteration order, so its
+  content changed on every build and a compilation cache such as sccache missed
+  `temporalio-common` and every crate downstream of it on every build.
 * Autoscaled task pollers now preserve polling concurrency after transient cancellations and
   timeouts while still applying retry backoff.
 * Sticky workflow backlog no longer prevents normal pollers from using capacity after sticky
