@@ -512,6 +512,9 @@ pub struct ChildWorkflowOptions {
     pub task_timeout: Option<Duration>,
     /// Optionally set a cron schedule for the workflow
     pub cron_schedule: Option<String>,
+    /// Optionally set a retry policy for the child workflow. If unset, the child workflow is not
+    /// retried by the server.
+    pub retry_policy: Option<RetryPolicy>,
     /// Additional search attributes to set on the child workflow.
     pub search_attributes: Option<SearchAttributes>,
     /// Priority for the workflow
@@ -573,6 +576,7 @@ impl ChildWorkflowOptions {
                     .task_timeout
                     .and_then(|duration| duration.try_into().ok()),
                 cron_schedule: self.cron_schedule.unwrap_or_default(),
+                retry_policy: self.retry_policy.map(Into::into),
                 search_attributes: self.search_attributes.map(|t| t.into_proto()),
                 priority: self.priority.map(Into::into),
                 ..Default::default()
