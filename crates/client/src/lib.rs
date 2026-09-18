@@ -4870,3 +4870,6 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod updates_wait_for_acceptance_tests;

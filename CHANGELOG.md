@@ -40,6 +40,8 @@ relevant information.
   `temporalio-common` and every crate downstream of it on every build.
 * Autoscaled task pollers now preserve polling concurrency after transient cancellations and
   timeouts while still applying retry backoff.
+* Workflow `start_update` now waits for acceptance before returning a handle, retrying successful
+  responses below Accepted with the same encoded request and update ID.
 * Sticky workflow backlog no longer prevents normal pollers from using capacity after sticky
   pollers reach their polling limit.
 * Workflow task failures are now reported to the server only on a task's first attempt, no

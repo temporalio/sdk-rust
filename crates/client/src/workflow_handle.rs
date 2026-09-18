@@ -935,7 +935,8 @@ where
         handle.get_result(rpc_options).await
     }
 
-    /// Start an update and return a handle without waiting for completion.
+    /// Start an update and wait for acceptance before returning a handle.
+    /// This does not wait for completion.
     /// Use `execute_update()` if you want to wait for the result immediately.
     pub async fn start_update<U>(
         &self,
@@ -989,7 +990,7 @@ where
                             let update_id = options
                                 .update_id
                                 .unwrap_or_else(|| Uuid::new_v4().to_string());
-                            let mut request = build_update_workflow_request(
+                            let request = build_update_workflow_request(
                                 client.namespace(),
                                 client.identity(),
                                 workflow_id.clone(),
@@ -998,14 +999,25 @@ where
                                 update_name,
                                 options.header,
                                 payloads,
-                            )
-                            .into_request();
-                            options.rpc_options.apply_to(&mut request);
-                            let response =
-                                WorkflowService::update_workflow_execution(&mut client, request)
-                                    .await
-                                    .map_err(WorkflowUpdateError::from_status)?
-                                    .into_inner();
+                            );
+                            let response = loop {
+                                let mut rpc_request = request.clone().into_request();
+                                options.rpc_options.apply_to(&mut rpc_request);
+                                let response = WorkflowService::update_workflow_execution(
+                                    &mut client,
+                                    rpc_request,
+                                )
+                                .await
+                                .map_err(WorkflowUpdateError::from_status)?
+                                .into_inner();
+                                // The server can end its acceptance long-poll successfully before
+                                // acceptance. Reuse the encoded request and update ID until accepted.
+                                if response.stage
+                                    >= UpdateWorkflowExecutionLifecycleStage::Accepted as i32
+                                {
+                                    break response;
+                                }
+                            };
                             let run_id = response
                                 .update_ref
                                 .as_ref()

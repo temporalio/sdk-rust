@@ -508,6 +508,7 @@ async fn cloud_ops_test() {
 async fn update_get_result_retries_on_empty_outcome() {
     use temporalio_common::protos::temporal::api::{
         common::v1::{Payloads, WorkflowExecution as ProtoWorkflowExecution},
+        enums::v1::UpdateWorkflowExecutionLifecycleStage,
         update::v1::{self, Outcome, UpdateRef},
         workflowservice::v1::{
             PollWorkflowExecutionUpdateResponse, UpdateWorkflowExecutionResponse,
@@ -532,6 +533,7 @@ async fn update_get_result_retries_on_empty_outcome() {
                         update_id: "update-id".into(),
                     }),
                     outcome: None,
+                    stage: UpdateWorkflowExecutionLifecycleStage::Accepted as i32,
                     ..Default::default()
                 })
             } else if path.contains("PollWorkflowExecutionUpdate") {
