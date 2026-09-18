@@ -37,8 +37,24 @@ For the reasoning behind the Core SDK, see blog post:
 
 # Development
 
-You will need the `protoc` [protobuf compiler](https://grpc.io/docs/protoc-installation)
-installed to build Core.
+Install [mise](https://mise.jdx.dev) for automatic tool management, then run:
+
+    mise install
+
+This installs `protoc`, `cargo-component`, `cargo-msrv`, and other
+development tools.
+
+For formatting with nightly rustfmt settings, you'll also need:
+
+    rustup toolchain install nightly
+
+### Git hooks (optional)
+
+This repo includes a `lefthook.yml` with pre-commit (format check) and
+pre-push (lint + check) hooks. To opt in:
+
+    brew install lefthook   # or: mise use lefthook
+    lefthook install
 
 This repo is composed of multiple crates:
 

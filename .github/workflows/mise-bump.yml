@@ -1,0 +1,53 @@
+name: Bump mise tool versions
+
+on:
+  schedule:
+    - cron: '0 9 * * 1' # Weekly Monday 9am UTC
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  bump:
+    name: Check for mise tool updates
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - name: Run mise install
+        uses: jdx/mise-action@e6a8b3978addb5a52f2b4cd9d91eafa7f0ab959d # v4.2.0
+        with:
+          version: 2026.7.1
+
+      - name: Check for outdated tools
+        id: outdated
+        run: |
+          # mise outdated returns non-zero if updates available
+          if mise outdated 2>/dev/null | grep -q .; then
+            echo "has_updates=true" >> "$GITHUB_OUTPUT"
+            echo "### Outdated mise tools" >> "$GITHUB_STEP_SUMMARY"
+            mise outdated >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "has_updates=false" >> "$GITHUB_OUTPUT"
+            echo "All mise tools are up to date." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Bump versions
+        if: steps.outdated.outputs.has_updates == 'true'
+        run: mise up --bump
+
+      - name: Create Pull Request
+        if: steps.outdated.outputs.has_updates == 'true'
+        uses: peter-evans/create-pull-request@271a8d0340265f705b14b31e2c788f8e3a2383a3 # v7
+        with:
+          branch: chore/mise-bump
+          title: "chore(deps): bump mise tool versions"
+          body: |
+            Automated mise tool version bump.
+
+            This PR was created by the weekly `mise-bump.yml` workflow.
+            Versions are only bumped after they have been available for at
+            least 2 weeks (matching our minimum age policy).
+          commit-message: "chore(deps): bump mise tool versions"
+          labels: dependencies
