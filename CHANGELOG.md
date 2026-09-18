@@ -49,6 +49,8 @@ relevant information.
   attempt, including ones whose failure was not sent to the server, and tags size-related failures
   with their specific `failure_reason` (`GrpcMessageTooLarge`, `PayloadsTooLarge`,
   `RequestTooLarge`) on every path.
+* Workflow Updates no longer run before replay work they are sequenced after when a commandless
+  workflow task is folded during history replay, avoiding cold-start nondeterminism.
 
 ## [1.0.0] - 2026-09-04
 
