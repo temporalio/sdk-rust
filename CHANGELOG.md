@@ -49,6 +49,23 @@ relevant information.
   attempt, including ones whose failure was not sent to the server, and tags size-related failures
   with their specific `failure_reason` (`GrpcMessageTooLarge`, `PayloadsTooLarge`,
   `RequestTooLarge`) on every path.
+### Added
+* Experimental Event Groups support (requires the `experimental` feature). Event Groups
+  are workflow-level metadata that group related history events for UI and observability.
+  `EventGroup::new` takes a required ID (used verbatim; do not put secrets in it);
+  `EventGroup::with_label` sets an optional label that is stored as a codec-encoded
+  payload. Attach groups with `with_event_group` / `with_event_groups` or the
+  `event_groups` field on command options. Signal and update handlers receive implicit
+  inbound groups. This API may change without notice.
+* `original_execution_run_id()` on workflow context, the run ID recorded on the
+  `WorkflowExecutionStarted` event. Unlike `run_id()`, this value is preserved across
+  workflow resets.
+* `WaitConditionOptions::timeout` starts a workflow timer and completes the wait with
+  `Ok(false)` when the timer fires before the condition becomes true.
+
+### Breaking Changes
+* `WorkflowContext::wait_condition_with_options` now returns `Result<bool, WorkflowCancellationError>`:
+  `Ok(true)` when the condition becomes true, `Ok(false)` when `WaitConditionOptions::timeout` fires.
 
 ## [1.0.0] - 2026-09-04
 

@@ -2,14 +2,16 @@
 //!
 //! All items here are SDK/runtime glue.
 
+use prost::Message;
 use temporalio_common_wasm::protos::{
     coresdk::{
         workflow_activation::{InitializeWorkflow, WorkflowActivation as CoreWorkflowActivation},
-        workflow_commands::ContinueAsNewWorkflowExecution,
+        workflow_commands::{ContinueAsNewWorkflowExecution, WorkflowCommand, workflow_command},
     },
     temporal::api::{
         common::v1::{Payload, Payloads},
         failure::v1::Failure,
+        sdk::v1::EventGroupMarker,
     },
 };
 
@@ -118,8 +120,66 @@ pub struct ActivationResult {
     pub job_results: Vec<ActivationJobResult>,
 }
 
-/// Command attributes used when a workflow continues as a new run.
-pub(crate) type ContinueAsNewRequest = ContinueAsNewWorkflowExecution;
+/// Continue-as-new command attributes plus any Event Group markers on the wrapping command.
+#[doc(hidden)]
+#[derive(Clone, Debug, PartialEq, Default)]
+pub struct ContinueAsNewRequest {
+    /// Continue-as-new attributes sent to Core.
+    pub attributes: ContinueAsNewWorkflowExecution,
+    /// Event Group markers attached to the continue-as-new command.
+    pub event_group_markers: Vec<EventGroupMarker>,
+}
+
+impl std::ops::Deref for ContinueAsNewRequest {
+    type Target = ContinueAsNewWorkflowExecution;
+
+    fn deref(&self) -> &Self::Target {
+        &self.attributes
+    }
+}
+
+impl ContinueAsNewRequest {
+    #[doc(hidden)]
+    pub fn into_command(self) -> WorkflowCommand {
+        WorkflowCommand {
+            variant: Some(workflow_command::Variant::ContinueAsNewWorkflowExecution(
+                self.attributes,
+            )),
+            event_group_markers: self.event_group_markers,
+            user_metadata: None,
+        }
+    }
+
+    #[doc(hidden)]
+    pub fn encode_to_vec(&self) -> Vec<u8> {
+        WorkflowCommand {
+            variant: Some(workflow_command::Variant::ContinueAsNewWorkflowExecution(
+                self.attributes.clone(),
+            )),
+            event_group_markers: self.event_group_markers.clone(),
+            user_metadata: None,
+        }
+        .encode_to_vec()
+    }
+
+    #[doc(hidden)]
+    pub fn decode(bytes: &[u8]) -> Self {
+        if let Ok(command) = WorkflowCommand::decode(bytes)
+            && let Some(workflow_command::Variant::ContinueAsNewWorkflowExecution(attributes)) =
+                command.variant
+        {
+            return Self {
+                attributes,
+                event_group_markers: command.event_group_markers,
+            };
+        }
+        Self {
+            attributes: ContinueAsNewWorkflowExecution::decode(bytes)
+                .unwrap_or_else(|err| panic!("failed to decode continue-as-new request: {err}")),
+            event_group_markers: Vec::new(),
+        }
+    }
+}
 
 /// Workflow Task failure requested by the main workflow routine.
 #[derive(Clone, Debug, PartialEq)]
