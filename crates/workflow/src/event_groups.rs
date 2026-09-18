@@ -160,13 +160,20 @@ impl ActiveEventGroups {
         }
     }
 
-    fn to_markers(&self) -> Vec<EventGroupMarker> {
-        let mut groups = Vec::new();
+    fn markers(&self) -> Vec<EventGroupMarker> {
+        let mut markers =
+            Vec::with_capacity(usize::from(self.implicit.is_some()) + self.explicit.len());
+        self.for_each_marker(|marker| markers.push(marker));
+        markers
+    }
+
+    fn for_each_marker(&self, mut f: impl FnMut(EventGroupMarker)) {
         if let Some(implicit) = &self.implicit {
-            groups.push(implicit.clone());
+            f(implicit.to_marker());
         }
-        groups.extend(self.explicit.iter().cloned());
-        EventGroup::to_markers(groups)
+        for group in &self.explicit {
+            f(group.to_marker());
+        }
     }
 }
 
@@ -175,24 +182,29 @@ pub(crate) fn merge_event_group_markers(
     ambient: &ActiveEventGroups,
     direct: Vec<EventGroupMarker>,
 ) -> Vec<EventGroupMarker> {
-    let mut by_key = HashMap::new();
-    let mut order = Vec::new();
-    for marker in ambient
-        .to_markers()
-        .into_iter()
-        .chain(direct)
-        .filter(|marker| marker.variant.is_some())
-    {
-        if let Some(key) = marker_key(&marker)
-            && by_key.insert(key.clone(), marker).is_none()
-        {
-            order.push(key);
-        }
+    if direct.is_empty() {
+        return ambient.markers();
     }
-    order
-        .into_iter()
-        .filter_map(|key| by_key.remove(&key))
-        .collect()
+    let mut result = Vec::with_capacity(
+        usize::from(ambient.implicit.is_some()) + ambient.explicit.len() + direct.len(),
+    );
+    let mut index_by_key = HashMap::new();
+    let mut push = |marker: EventGroupMarker| {
+        let Some(key) = marker_key(&marker) else {
+            return;
+        };
+        if let Some(&index) = index_by_key.get(&key) {
+            result[index] = marker;
+        } else {
+            index_by_key.insert(key, result.len());
+            result.push(marker);
+        }
+    };
+    ambient.for_each_marker(&mut push);
+    for marker in direct {
+        push(marker);
+    }
+    result
 }
 
 fn label_payload(label: &str) -> Payload {

@@ -57,6 +57,9 @@ relevant information.
   payload. Attach groups with `with_event_group` / `with_event_groups` or the
   `event_groups` field on command options. Signal and update handlers receive implicit
   inbound groups. This API may change without notice.
+* `original_execution_run_id()` on workflow context, the run ID recorded on the
+  `WorkflowExecutionStarted` event. Unlike `run_id()`, this value is preserved across
+  workflow resets.
 * `WaitConditionOptions::timeout` starts a workflow timer and completes the wait with
   `Ok(false)` when the timer fires before the condition becomes true.
 

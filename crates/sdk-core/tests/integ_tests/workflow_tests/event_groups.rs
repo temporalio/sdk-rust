@@ -634,6 +634,118 @@ async fn event_groups_labels_scopes_and_aggregation() {
 
 #[workflow]
 #[derive(Default)]
+struct AggregationWf;
+
+#[workflow_methods]
+impl AggregationWf {
+    #[run(name = "event_groups_aggregation")]
+    async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<()> {
+        let a1 = EventGroup::new("aaa");
+        let a2 = EventGroup::new("aaa");
+        let b1 = EventGroup::new("b-id").with_label("bbb1");
+        let b2 = EventGroup::new("b-id").with_label("bbb2");
+        let opts = || ActivityOptions::with_start_to_close_timeout(Duration::from_secs(5));
+
+        ctx.execute_activity(
+            StdActivities::echo,
+            "direct-duplicates".to_string(),
+            opts()
+                .event_groups(vec![
+                    a2.clone(),
+                    b1.clone(),
+                    a1.clone(),
+                    b1.clone(),
+                    a2.clone(),
+                    a1.clone(),
+                ])
+                .build(),
+        )
+        .await?;
+        ctx.with_event_group(a1.clone())
+            .with_event_group(a2.clone())
+            .with_event_group(b1.clone())
+            .execute_activity(
+                StdActivities::echo,
+                "nested-scopes".to_string(),
+                opts().build(),
+            )
+            .await?;
+        let scoped = ctx
+            .with_event_group(a1.clone())
+            .with_event_group(b1.clone());
+        scoped
+            .execute_activity(
+                StdActivities::echo,
+                "scope-and-direct-b".to_string(),
+                opts().event_groups(vec![b1.clone()]).build(),
+            )
+            .await?;
+        scoped
+            .execute_activity(
+                StdActivities::echo,
+                "scope-and-direct-a-b".to_string(),
+                opts().event_groups(vec![b1.clone(), a1.clone()]).build(),
+            )
+            .await?;
+        ctx.execute_activity(
+            StdActivities::echo,
+            "same-instance-twice".to_string(),
+            opts().event_groups(vec![a1.clone(), a1.clone()]).build(),
+        )
+        .await?;
+        ctx.execute_activity(
+            StdActivities::echo,
+            "same-id-direct".to_string(),
+            opts().event_groups(vec![b1.clone(), b2.clone()]).build(),
+        )
+        .await?;
+        ctx.with_event_group(b1)
+            .execute_activity(
+                StdActivities::echo,
+                "same-id-scope-and-direct".to_string(),
+                opts().event_groups(vec![b2]).build(),
+            )
+            .await?;
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn event_groups_aggregation() {
+    let wf_name = "event_groups_aggregation";
+    let mut starter = CoreWfStarter::new(wf_name);
+    starter
+        .sdk_config
+        .register_activities(StdActivities)
+        .register_workflow::<AggregationWf>()
+        .unwrap();
+    let mut worker = starter.worker().await;
+    starter.start_with_worker(wf_name, &mut worker).await;
+    worker.run_until_done().await.unwrap();
+
+    let history = starter.get_history().await;
+    let scheduled = activities_by_input(&history);
+    let aaa_and_b = set(["aaa", "b-id"]);
+
+    // EG-AGGREGATION-00
+    assert_eq!(label_ids(scheduled["direct-duplicates"]), aaa_and_b);
+    // EG-AGGREGATION-01
+    assert_eq!(label_ids(scheduled["nested-scopes"]), aaa_and_b);
+    // EG-AGGREGATION-02
+    assert_eq!(label_ids(scheduled["scope-and-direct-b"]), aaa_and_b);
+    assert_eq!(label_ids(scheduled["scope-and-direct-a-b"]), aaa_and_b);
+    // EG-AGGREGATION-03
+    assert_eq!(label_ids(scheduled["same-instance-twice"]), set(["aaa"]));
+    // EG-AGGREGATION-04: compare IDs only; which label is emitted is unspecified
+    assert_eq!(label_ids(scheduled["same-id-direct"]), set(["b-id"]));
+    assert_eq!(
+        label_ids(scheduled["same-id-scope-and-direct"]),
+        set(["b-id"])
+    );
+}
+
+#[workflow]
+#[derive(Default)]
 struct LabelPayloadWf;
 
 #[workflow_methods]
@@ -1334,6 +1446,96 @@ async fn event_groups_cancel_external_upsert_and_patch_commands() {
 
 #[workflow]
 #[derive(Default)]
+struct TimerCommandsWf;
+
+#[workflow_methods]
+impl TimerCommandsWf {
+    #[run(name = "event_groups_timer_commands")]
+    async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<()> {
+        let scope = EventGroup::new("scope");
+        let direct = EventGroup::new("direct");
+        let scoped = ctx.with_event_group(scope);
+
+        // EG-COMMANDS-00
+        scoped
+            .timer(
+                TimerOptions::builder(Duration::from_millis(1))
+                    .event_groups(vec![direct.clone()])
+                    .build(),
+            )
+            .await;
+
+        // EG-COMMANDS-01
+        let _ = scoped
+            .wait_condition_with_options(
+                |_| false,
+                WaitConditionOptions::builder()
+                    .timeout(Duration::from_millis(1))
+                    .event_groups(vec![direct.clone()])
+                    .build(),
+            )
+            .await?;
+
+        // EG-COMMANDS-00-CANCEL: 1ms timer is the timeout (ambient only); 60s is cancelled.
+        let timer_token = WorkflowCancellationToken::new();
+        let mut long_opts = TimerOptions::builder(Duration::from_secs(60))
+            .event_groups(vec![direct])
+            .build();
+        long_opts.cancellation_token = Some(timer_token.clone());
+        let long_timer = scoped.timer(long_opts);
+        scoped.timer(Duration::from_millis(1)).await;
+        timer_token.cancel();
+        let _ = long_timer.await;
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn event_groups_timer_commands() {
+    let wf_name = "event_groups_timer_commands";
+    let mut starter = CoreWfStarter::new(wf_name);
+    starter
+        .sdk_config
+        .register_workflow::<TimerCommandsWf>()
+        .unwrap();
+    let mut worker = starter.worker().await;
+    starter.start_with_worker(wf_name, &mut worker).await;
+    worker.run_until_done().await.unwrap();
+
+    let history = starter.get_history().await;
+    let both = set(["direct", "scope"]);
+    let scope_only = set(["scope"]);
+    let timers: Vec<_> = history
+        .events
+        .iter()
+        .filter(|e| e.event_type() == EventType::TimerStarted)
+        .collect();
+    assert_eq!(timers.len(), 4);
+    // EG-COMMANDS-00 and EG-COMMANDS-01 run sequentially, so they are the first two timers.
+    assert_eq!(label_ids(timers[0]), both);
+    assert_eq!(label_ids(timers[1]), both);
+    // EG-COMMANDS-00-CANCEL: remaining timers are the 1ms timeout (scope only) and the 60s cancel.
+    let rest = &timers[2..];
+    let timeout_timer = rest
+        .iter()
+        .find(|e| timer_duration_millis(e) == Some(1) && label_ids(e) == scope_only)
+        .expect("1ms timeout timer");
+    let cancelled_timer = rest
+        .iter()
+        .find(|e| timer_duration_millis(e) == Some(60_000))
+        .expect("60s cancelled timer");
+    assert_eq!(label_ids(timeout_timer), scope_only);
+    assert_eq!(label_ids(cancelled_timer), both);
+    let timer_canceled = history
+        .events
+        .iter()
+        .find(|e| e.event_type() == EventType::TimerCanceled)
+        .expect("timer canceled");
+    assert_eq!(label_ids(timer_canceled), both);
+}
+
+#[workflow]
+#[derive(Default)]
 struct WaitTimeoutWf;
 
 #[workflow_methods]
@@ -1374,6 +1576,7 @@ async fn event_groups_wait_condition_timeout_timer() {
         .iter()
         .find(|e| e.event_type() == EventType::TimerStarted)
         .expect("wait-condition timeout timer");
+    // EG-COMMANDS-01
     assert_eq!(label_ids(timer), set(["scope-id", "direct-id"]));
 }
 

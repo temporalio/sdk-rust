@@ -512,6 +512,22 @@ impl BaseWorkflowContext {
         &self.inner.run_id
     }
 
+    /// Return the run ID recorded on the `WorkflowExecutionStarted` event.
+    ///
+    /// Unlike [`Self::run_id`], this value is preserved across workflow resets.
+    pub fn original_execution_run_id(&self) -> &str {
+        if self
+            .inner
+            .initial_information
+            .original_execution_run_id
+            .is_empty()
+        {
+            &self.inner.run_id
+        } else {
+            &self.inner.initial_information.original_execution_run_id
+        }
+    }
+
     /// Return the namespace the workflow is executing in.
     pub fn namespace(&self) -> &str {
         &self.inner.namespace
@@ -1142,6 +1158,9 @@ impl BaseWorkflowContext {
                 );
             }
             CancellableID::SignalExternalWorkflow(seq) => {
+                // `CancelSignalWorkflow` is Core-only: it applies only if the signal command has
+                // not yet been sent. It is never transcribed to history, so Event Groups and user
+                // metadata would not be observable.
                 self.inner.runtime.host.push_command(
                     workflow_command::Variant::CancelSignalWorkflow(CancelSignalWorkflow { seq })
                         .into(),
@@ -1789,6 +1808,13 @@ impl<W> SyncWorkflowContext<W> {
         &self.base.inner.run_id
     }
 
+    /// Return the run ID recorded on the `WorkflowExecutionStarted` event.
+    ///
+    /// Unlike [`Self::run_id`], this value is preserved across workflow resets.
+    pub fn original_execution_run_id(&self) -> &str {
+        self.base.original_execution_run_id()
+    }
+
     /// Return the namespace the workflow is executing in
     pub fn namespace(&self) -> &str {
         &self.base.inner.namespace
@@ -1985,7 +2011,8 @@ impl<W> SyncWorkflowContext<W> {
             let extra_markers = EventGroup::to_markers(opts.event_groups.clone());
             let attributes = opts.into_request(workflow_type, arguments, headers, pc)?;
             #[cfg(feature = "experimental")]
-            let event_group_markers = merge_event_group_markers(&base_ctx.event_groups, extra_markers);
+            let event_group_markers =
+                merge_event_group_markers(&base_ctx.event_groups, extra_markers);
             #[cfg(not(feature = "experimental"))]
             let event_group_markers = Vec::new();
             Err(WorkflowTermination::continue_as_new(
@@ -2481,6 +2508,13 @@ impl<W> WorkflowContext<W> {
     /// Return the run id of this workflow execution
     pub fn run_id(&self) -> &str {
         self.sync.run_id()
+    }
+
+    /// Return the run ID recorded on the `WorkflowExecutionStarted` event.
+    ///
+    /// Unlike [`Self::run_id`], this value is preserved across workflow resets.
+    pub fn original_execution_run_id(&self) -> &str {
+        self.sync.original_execution_run_id()
     }
 
     /// Return the namespace the workflow is executing in
