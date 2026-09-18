@@ -41,8 +41,8 @@ use temporalio_common::{
         coresdk::{
             ActivityTaskCompletion,
             activity_result::{
-                self as activity_result, ActivityExecutionResult, ActivityResolution,
-                ActivityTaskFailedCause, Success, activity_execution_result, activity_resolution,
+                self as activity_result, ActivityExecutionResult, ActivityResolution, Success,
+                activity_execution_result, activity_resolution,
             },
             activity_task::{ActivityCancelReason, ActivityTask, Cancel, activity_task},
             workflow_activation::{
@@ -56,7 +56,7 @@ use temporalio_common::{
         },
         temporal::api::{
             command::v1::{ScheduleActivityTaskCommandAttributes, command::Attributes},
-            enums::v1::{ApplicationErrorCategory, EventType},
+            enums::v1::{ActivityTaskFailedCause, ApplicationErrorCategory, EventType},
             failure::v1::{ApplicationFailureInfo, Failure, failure::FailureInfo},
             workflowservice::v1::{
                 GetSystemInfoResponse, PollActivityTaskQueueResponse,

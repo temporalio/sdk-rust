@@ -10,9 +10,9 @@ use std::{
     time::Duration,
 };
 use temporalio_common::{
-    protos::{
-        coresdk::activity_result::ActivityTaskFailedCause,
-        temporal::api::{enums::v1::WorkflowTaskFailedCause, failure::v1::Failure},
+    protos::temporal::api::{
+        enums::v1::{ActivityTaskFailedCause, WorkflowTaskFailedCause},
+        failure::v1::Failure,
     },
     telemetry::metrics::{core::*, *},
 };
