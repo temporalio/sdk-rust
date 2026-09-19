@@ -1565,9 +1565,10 @@ impl Worker {
 
     /// Request that a workflow be evicted by its run id. This will generate a workflow activation
     /// with the eviction job inside it to be eventually returned by
-    /// [Worker::poll_workflow_activation]. If the workflow had any existing outstanding
-    /// activations, such activations are invalidated and subsequent completions of them will do
-    /// nothing and log a warning.
+    /// [Worker::poll_workflow_activation]. If the workflow has an outstanding activation, the
+    /// language must still complete it before the eviction can be delivered. During replay,
+    /// already-buffered jobs may be delivered first; a failed completion instead makes the
+    /// workflow unusable and allows eviction immediately.
     pub fn request_workflow_eviction(&self, run_id: &str) {
         self.request_wf_eviction(
             run_id,
