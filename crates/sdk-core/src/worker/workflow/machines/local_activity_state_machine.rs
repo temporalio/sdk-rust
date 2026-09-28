@@ -176,6 +176,7 @@ pub(super) fn new_local_activity(
             replaying_when_invoked,
             wf_time_when_started: wf_time,
             internal_flags,
+            activation_group: 0,
         },
     );
 
@@ -254,7 +255,9 @@ impl LocalActivityMachine {
         attempt: u32,
         backoff: Option<prost_types::Duration>,
         original_schedule_time: Option<SystemTime>,
+        activation_group: u64,
     ) -> Result<Vec<MachineResponse>, WFMachinesError> {
+        self.shared_state.activation_group = activation_group;
         self._try_resolve(
             ResolveDat {
                 result,
@@ -304,7 +307,11 @@ impl LocalActivityMachine {
             .collect())
     }
 
-    pub(super) fn cancel(&mut self) -> Result<Vec<MachineResponse>, MachineError<WFMachinesError>> {
+    pub(super) fn cancel(
+        &mut self,
+        activation_group: u64,
+    ) -> Result<Vec<MachineResponse>, MachineError<WFMachinesError>> {
+        self.shared_state.activation_group = activation_group;
         let event = match self.shared_state.attrs.cancellation_type {
             ct @ ActivityCancellationType::TryCancel | ct @ ActivityCancellationType::Abandon => {
                 LocalActivityMachineEvents::NoWaitCancel(ct)
@@ -335,6 +342,7 @@ pub(super) struct SharedState {
     replaying_when_invoked: bool,
     wf_time_when_started: Option<SystemTime>,
     internal_flags: InternalFlagsRef,
+    activation_group: u64,
 }
 
 impl SharedState {
@@ -723,6 +731,7 @@ impl WFMachinesAdapter for LocalActivityMachine {
                             complete_time: complete_time.map(Into::into),
                             backoff,
                             original_schedule_time: original_schedule_time.map(Into::into),
+                            activation_group: Some(self.shared_state.activation_group),
                         },
                         maybe_ok_result,
                     );

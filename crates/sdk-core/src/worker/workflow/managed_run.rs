@@ -1931,4 +1931,337 @@ mod tests {
             commands.iter().map(discriminant).collect()
         }
     }
+
+    mod local_activity_replay_tests {
+        use super::super::WorkflowManager;
+        use crate::{
+            replay::{DEFAULT_WORKFLOW_TYPE, TestHistoryBuilder},
+            telemetry::metrics::MetricsContext,
+            test_help::{schedule_local_activity_cmd, test_worker_cfg},
+            worker::{
+                LocalActivityExecutionResult, LocalActivityResolution,
+                workflow::{LocalResolution, RunBasics, WFCommand, WFCommandVariant},
+            },
+        };
+        use itertools::Itertools;
+        use rstest::rstest;
+        use std::{collections::BTreeMap, time::Duration};
+        use temporalio_common::protos::{
+            coresdk::{
+                AsJsonPayloadExt,
+                activity_result::{ActivityResolution, Success, activity_resolution},
+                workflow_activation::{
+                    ResolveActivity, WorkflowActivation, workflow_activation_job::Variant,
+                },
+                workflow_commands::{
+                    ActivityCancellationType, RequestCancelLocalActivity, workflow_command,
+                },
+            },
+            temporal::api::{
+                command::v1::command, common::v1::Payload, enums::v1::EventType,
+                history::v1::MarkerRecordedEventAttributes,
+            },
+        };
+
+        #[derive(Clone, Copy, Debug)]
+        enum Activity {
+            Work(u32),
+            Expired,
+            Finish,
+        }
+
+        impl Activity {
+            fn result(self) -> Payload {
+                match self {
+                    Self::Work(index) => index.to_string().as_json_payload().unwrap(),
+                    Self::Expired => false.as_json_payload().unwrap(),
+                    Self::Finish => "finished".as_json_payload().unwrap(),
+                }
+            }
+        }
+
+        #[derive(Clone, Default)]
+        struct FanoutWorkflow {
+            outstanding: BTreeMap<u32, Activity>,
+            next_seq: u32,
+            pending_work: usize,
+            completed_work: usize,
+            waiting_on_expired: bool,
+            finished: bool,
+        }
+
+        impl FanoutWorkflow {
+            fn schedule(&mut self, activity: Activity) -> WFCommand {
+                self.next_seq += 1;
+                self.outstanding.insert(self.next_seq, activity);
+                let id = match activity {
+                    Activity::Work(index) => format!("work-{index}"),
+                    Activity::Expired => "expired".to_owned(),
+                    Activity::Finish => "finish".to_owned(),
+                };
+                let workflow_command::Variant::ScheduleLocalActivity(command) =
+                    schedule_local_activity_cmd(
+                        self.next_seq,
+                        &id,
+                        ActivityCancellationType::TryCancel,
+                        Duration::from_secs(10),
+                    )
+                else {
+                    unreachable!()
+                };
+                WFCommand::new(WFCommandVariant::AddLocalActivity(command))
+            }
+
+            fn activate(&mut self, activation: WorkflowActivation) -> Vec<WFCommand> {
+                let mut commands = vec![];
+                for job in activation.jobs {
+                    match job.variant.unwrap() {
+                        Variant::InitializeWorkflow(_) => {
+                            self.pending_work = 3;
+                            commands
+                                .extend((1..=3).map(|index| self.schedule(Activity::Work(index))));
+                        }
+                        Variant::ResolveActivity(resolution) => {
+                            let activity = self.outstanding.remove(&resolution.seq).unwrap();
+                            assert_eq!(
+                                resolution.result.unwrap().status,
+                                Some(activity_resolution::Status::Completed(Success {
+                                    result: Some(activity.result()),
+                                })),
+                                "wrong result for {activity:?} at sequence {}",
+                                resolution.seq,
+                            );
+                            match activity {
+                                Activity::Work(_) => self.completed_work += 1,
+                                Activity::Expired => self.waiting_on_expired = false,
+                                Activity::Finish => {
+                                    self.finished = true;
+                                    commands.push(WFCommand::new(
+                                        WFCommandVariant::CompleteWorkflow(Default::default()),
+                                    ));
+                                }
+                            }
+                        }
+                        unexpected => panic!("unexpected job: {unexpected:?}"),
+                    }
+                }
+                // The number of work results delivered together determines whether another
+                // activity is scheduled before the remaining work completes.
+                if !self.waiting_on_expired && self.completed_work > 0 {
+                    self.pending_work -= self.completed_work;
+                    self.completed_work = 0;
+                    if self.pending_work == 0 {
+                        commands.push(self.schedule(Activity::Finish));
+                    } else {
+                        self.waiting_on_expired = true;
+                        commands.push(self.schedule(Activity::Expired));
+                    }
+                }
+                commands
+            }
+
+            fn resolutions(&self, batch: &[u32]) -> WorkflowActivation {
+                WorkflowActivation {
+                    jobs: batch
+                        .iter()
+                        .map(|seq| {
+                            Variant::ResolveActivity(ResolveActivity {
+                                seq: *seq,
+                                is_local: true,
+                                result: Some(ActivityResolution {
+                                    status: Some(activity_resolution::Status::Completed(Success {
+                                        result: Some(self.outstanding[seq].result()),
+                                    })),
+                                }),
+                            })
+                            .into()
+                        })
+                        .collect(),
+                    ..Default::default()
+                }
+            }
+        }
+
+        fn manager(history: &TestHistoryBuilder) -> WorkflowManager {
+            WorkflowManager::new(RunBasics {
+                worker_config: test_worker_cfg().build().unwrap().into(),
+                workflow_id: "fanout".to_owned(),
+                workflow_type: DEFAULT_WORKFLOW_TYPE.to_owned(),
+                run_id: history.get_orig_run_id().to_owned(),
+                history: history.get_full_history_info().unwrap().into(),
+                metrics: MetricsContext::no_op(),
+                capabilities: &Default::default(),
+                sdk_name: "test",
+                sdk_version: "test",
+            })
+        }
+
+        #[rstest]
+        #[case([1, 2, 3])]
+        #[case([1, 3, 2])]
+        #[case([2, 1, 3])]
+        #[case([2, 3, 1])]
+        #[case([3, 1, 2])]
+        #[case([3, 2, 1])]
+        fn local_activity_fanout_replay(
+            #[case] work_order: [u32; 3],
+            #[values(false, true)] legacy: bool,
+        ) {
+            let mut start = TestHistoryBuilder::default();
+            start.add_by_type(EventType::WorkflowExecutionStarted);
+            start.add_workflow_task_scheduled_and_started();
+            let mut initial = FanoutWorkflow::default();
+            initial.activate(manager(&start).get_next_activation().unwrap());
+            let mut paths = vec![(initial, vec![], 0)];
+            let mut plans = vec![];
+            // Enumerate every legal completion order and activation partition, including expired
+            // completing before, between, or after the remaining work activities.
+            while let Some((workflow, batches, work_done)) = paths.pop() {
+                if workflow.finished {
+                    plans.push(batches);
+                    continue;
+                }
+                for size in 1..=workflow.outstanding.len() {
+                    for batch in workflow.outstanding.keys().copied().permutations(size) {
+                        let work = batch
+                            .iter()
+                            .copied()
+                            .filter(|seq| *seq <= 3)
+                            .collect::<Vec<_>>();
+                        if work != work_order[work_done..work_done + work.len()] {
+                            continue;
+                        }
+                        let mut next = workflow.clone();
+                        next.activate(workflow.resolutions(&batch));
+                        let mut batches = batches.clone();
+                        batches.push(batch);
+                        paths.push((next, batches, work_done + work.len()));
+                    }
+                }
+            }
+
+            for plan in plans {
+                // Before incremental delivery, all three initial activities resolved together. Such
+                // histories must remain replayable even though they have no activation group field.
+                if legacy && plan[0].len() != 3 {
+                    continue;
+                }
+                let mut live = manager(&start);
+                let mut workflow = FanoutWorkflow::default();
+                let commands = workflow.activate(live.get_next_activation().unwrap());
+                live.push_commands_and_iterate(commands).unwrap();
+                for batch in &plan {
+                    live.drain_queued_local_activities();
+                    for seq in batch {
+                        live.notify_of_local_result(LocalResolution::LocalActivity(
+                            LocalActivityResolution {
+                                seq: *seq,
+                                result: LocalActivityExecutionResult::Completed(Success {
+                                    result: Some(workflow.outstanding[seq].result()),
+                                }),
+                                runtime: Duration::ZERO,
+                                attempt: 1,
+                                backoff: None,
+                                original_schedule_time: None,
+                            },
+                        ))
+                        .unwrap();
+                    }
+                    let commands = workflow.activate(live.get_next_activation().unwrap());
+                    live.push_commands_and_iterate(commands).unwrap();
+                }
+                assert!(workflow.finished);
+
+                let mut history = start.clone();
+                history.add_workflow_task_completed();
+                for command in live.machines.get_commands() {
+                    match command.attributes.unwrap() {
+                        command::Attributes::RecordMarkerCommandAttributes(mut marker) => {
+                            if legacy {
+                                let data =
+                                    &mut marker.details.get_mut("data").unwrap().payloads[0].data;
+                                let mut json: serde_json::Value =
+                                    serde_json::from_slice(data).unwrap();
+                                json.as_object_mut().unwrap().remove("activation_group");
+                                *data = serde_json::to_vec(&json).unwrap();
+                            }
+                            history.add(MarkerRecordedEventAttributes {
+                                marker_name: marker.marker_name,
+                                details: marker.details,
+                                failure: marker.failure,
+                                workflow_task_completed_event_id: 4,
+                                ..Default::default()
+                            });
+                        }
+                        command::Attributes::CompleteWorkflowExecutionCommandAttributes(_) => {
+                            history.add_workflow_execution_completed();
+                        }
+                        unexpected => panic!("unexpected command: {unexpected:?}"),
+                    }
+                }
+
+                let mut replay = manager(&history);
+                let mut workflow = FanoutWorkflow::default();
+                for _ in 0..=plan.len() {
+                    let activation = replay.get_next_activation().unwrap();
+                    assert!(!activation.jobs.is_empty(), "replay stalled for {plan:?}");
+                    let commands = workflow.activate(activation);
+                    replay.push_commands_and_iterate(commands).unwrap();
+                    if workflow.finished {
+                        break;
+                    }
+                }
+                assert!(workflow.finished, "replay failed to finish for {plan:?}");
+            }
+        }
+
+        #[test]
+        fn cancel_does_not_pull_resolution_from_later_activation_group() {
+            let mut history = TestHistoryBuilder::default();
+            history.add_by_type(EventType::WorkflowExecutionStarted);
+            history.add_full_wf_task();
+            for seq in 1..=3 {
+                history.add_local_activity_marker(
+                    seq,
+                    &format!("work-{seq}"),
+                    Some(Activity::Work(seq).result()),
+                    None,
+                    |data| data.activation_group = Some(u64::from(seq)),
+                );
+            }
+            history.add_workflow_execution_completed();
+            let mut replay = manager(&history);
+            replay.get_next_activation().unwrap();
+            let mut workflow = FanoutWorkflow::default();
+            let commands = (1..=3)
+                .map(|seq| {
+                    let mut command = workflow.schedule(Activity::Work(seq));
+                    if let WFCommandVariant::AddLocalActivity(activity) = &mut command.variant {
+                        activity.cancellation_type =
+                            ActivityCancellationType::WaitCancellationCompleted as i32;
+                    }
+                    command
+                })
+                .collect();
+            replay.push_commands_and_iterate(commands).unwrap();
+            for seq in 1..=3 {
+                let activation = replay.get_next_activation().unwrap();
+                assert_eq!(activation.jobs.len(), 1);
+                assert_matches!(activation.jobs[0].variant.as_ref(),
+                Some(Variant::ResolveActivity(result)) => assert_eq!(result.seq, seq));
+                let commands = match seq {
+                    1 => vec![WFCommand::new(
+                        WFCommandVariant::RequestCancelLocalActivity(RequestCancelLocalActivity {
+                            seq: 3,
+                        }),
+                    )],
+                    3 => vec![WFCommand::new(WFCommandVariant::CompleteWorkflow(
+                        Default::default(),
+                    ))],
+                    _ => vec![],
+                };
+                replay.push_commands_and_iterate(commands).unwrap();
+            }
+        }
+    }
 }

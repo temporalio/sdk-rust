@@ -9,6 +9,13 @@ use std::{
 };
 use temporalio_common::protos::temporal::api::common::v1::WorkflowExecution;
 
+struct Preresolution {
+    seq: u32,
+    /// Older markers have no group, so replay must keep their existing batching behavior.
+    activation_group: Option<u64>,
+    resolution: ResolveDat,
+}
+
 #[derive(Default)]
 pub(super) struct LocalActivityData {
     /// Queued local activity requests which need to be executed
@@ -19,7 +26,12 @@ pub(super) struct LocalActivityData {
     executing: HashSet<u32>,
     /// Local activity resolutions in the order their markers were found while looking ahead at the
     /// next WFT.
-    preresolutions: VecDeque<(u32, ResolveDat)>,
+    preresolutions: VecDeque<Preresolution>,
+    /// Results delivered in one activation need the same group on their markers, even when the
+    /// activities completed at different times.
+    activation_group: u64,
+    /// Hold later groups until lang has responded to the activation for this group.
+    replay_activation_group: Option<u64>,
     /// Set true if the workflow is terminating
     am_terminating: bool,
 }
@@ -78,22 +90,54 @@ impl LocalActivityData {
     }
 
     pub(super) fn insert_peeked_marker(&mut self, dat: CompleteLocalActivityData) {
-        self.preresolutions
-            .push_back((dat.marker_dat.seq, dat.into()));
+        if let Some(group) = dat.marker_dat.activation_group {
+            // Once replay reaches live execution, newly recorded markers need group IDs beyond
+            // those in history so separate activations cannot appear to belong to one group.
+            self.activation_group = self.activation_group.max(group + 1);
+        }
+        self.preresolutions.push_back(Preresolution {
+            seq: dat.marker_dat.seq,
+            activation_group: dat.marker_dat.activation_group,
+            resolution: dat.into(),
+        });
     }
 
     pub(super) fn take_preresolution(&mut self, seq: u32) -> Option<ResolveDat> {
-        let idx = self.preresolutions.iter().position(|(s, _)| *s == seq)?;
-        let (_, dat) = self
+        let idx = self
+            .preresolutions
+            .iter()
+            .position(|item| item.seq == seq)?;
+        let item = self
             .preresolutions
             .remove(idx)
             .expect("This index was just found to contain seq");
-        Some(dat)
+        self.replay_activation_group = item.activation_group;
+        Some(item.resolution)
     }
 
     pub(super) fn peek_preresolution_seq(&self) -> Option<u32> {
-        let (seq, _) = self.preresolutions.front()?;
-        Some(*seq)
+        let item = self.preresolutions.front()?;
+        if let (Some(current), Some(next)) = (self.replay_activation_group, item.activation_group)
+            && current != next
+        {
+            return None;
+        }
+        Some(item.seq)
+    }
+
+    pub(super) fn has_grouped_preresolution(&self, seq: u32) -> bool {
+        self.preresolutions
+            .iter()
+            .any(|item| item.seq == seq && item.activation_group.is_some())
+    }
+
+    pub(super) fn activation_dispatched(&mut self) {
+        self.activation_group += 1;
+        self.replay_activation_group = None;
+    }
+
+    pub(super) fn current_activation_group(&self) -> u64 {
+        self.activation_group
     }
 
     pub(super) fn remove_from_queue(&mut self, seq: u32) -> Option<ValidScheduleLA> {

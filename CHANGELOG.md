@@ -40,6 +40,9 @@ relevant information.
   `temporalio-common` and every crate downstream of it on every build.
 * Autoscaled task pollers now preserve polling concurrency after transient cancellations and
   timeouts while still applying retry backoff.
+* Newly recorded local activity results preserve their activation grouping during replay, preventing
+  workflows that wait for the first completion from receiving a result on the wrong activity handle.
+  Histories recorded without grouping information retain the previous replay behavior.
 * Sticky workflow backlog no longer prevents normal pollers from using capacity after sticky
   pollers reach their polling limit.
 * Workflow task failures are now reported to the server only on a task's first attempt, no
