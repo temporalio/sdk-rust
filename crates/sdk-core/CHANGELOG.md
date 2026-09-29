@@ -37,8 +37,9 @@ relevant information.
 * Task-poll targets no longer decrease after cancelled or timed-out polls. Affected pollers still
   retain their slot during backoff, while resource-exhaustion errors still reduce the target.
 * Replay now preserves which local activity results were delivered together for newly recorded
-  histories. This prevents conditional activity scheduling (such as Python's `FIRST_COMPLETED`)
-  from assigning recorded results to different handles. Older markers keep their existing behavior.
+  histories. This prevents local activity scheduling which was conditional on local activity
+  resolution order from assigning recorded results to different handles. Older markers keep their
+  existing behavior.
 * Workflow poll balancing now lets non-sticky pollers use capacity after sticky pollers reach their
   configured or autoscaled polling limit.
 * Every path that fails a workflow task now only reports the failure to server
