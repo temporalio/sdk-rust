@@ -1937,7 +1937,7 @@ mod tests {
         use crate::{
             replay::{DEFAULT_WORKFLOW_TYPE, TestHistoryBuilder},
             telemetry::metrics::MetricsContext,
-            test_help::{schedule_local_activity_cmd, test_worker_cfg},
+            test_help::{schedule_activity_cmd, schedule_local_activity_cmd, test_worker_cfg},
             worker::{
                 LocalActivityExecutionResult, LocalActivityResolution,
                 workflow::{LocalResolution, RunBasics, WFCommand, WFCommandVariant},
@@ -1954,7 +1954,8 @@ mod tests {
                     ResolveActivity, WorkflowActivation, workflow_activation_job::Variant,
                 },
                 workflow_commands::{
-                    ActivityCancellationType, RequestCancelLocalActivity, workflow_command,
+                    ActivityCancellationType, RequestCancelActivity, RequestCancelLocalActivity,
+                    workflow_command,
                 },
             },
             temporal::api::{
@@ -2262,6 +2263,145 @@ mod tests {
                 };
                 replay.push_commands_and_iterate(commands).unwrap();
             }
+        }
+
+        #[rstest]
+        // Cancelling the never-sent regular activity resolves it immediately, in an activation
+        // holding no LA results. LA 2 resolves afterwards, in its own activation, and replay must
+        // not fold it into the cancellation's activation.
+        #[case::activation_without_la_results(false, vec![vec![1], vec![], vec![2]])]
+        // A TryCancel LA cancel resolves immediately, so live delivers LA 2's cancellation before
+        // the regular activity's, matching command order. Replay must too.
+        #[case::la_try_cancel_order(true, vec![vec![1], vec![]])]
+        fn replay_matches_live_activations(
+            #[case] cancel_la: bool,
+            #[case] resolve_before_activation: Vec<Vec<u32>>,
+        ) {
+            let job_names = |activation: WorkflowActivation| -> Vec<String> {
+                activation
+                    .jobs
+                    .into_iter()
+                    .map(|job| match job.variant.unwrap() {
+                        Variant::InitializeWorkflow(_) => "init".to_owned(),
+                        Variant::ResolveActivity(r) if r.is_local => format!("la-{}", r.seq),
+                        Variant::ResolveActivity(r) => format!("act-{}", r.seq),
+                        unexpected => panic!("unexpected job: {unexpected:?}"),
+                    })
+                    .collect()
+            };
+            let respond = |jobs: &[String]| -> Vec<WFCommand> {
+                match jobs {
+                    [init] if init == "init" => {
+                        let mut commands = (1..=2)
+                            .map(|seq| {
+                                let workflow_command::Variant::ScheduleLocalActivity(command) =
+                                    schedule_local_activity_cmd(
+                                        seq,
+                                        &format!("la-{seq}"),
+                                        ActivityCancellationType::TryCancel,
+                                        Duration::from_secs(10),
+                                    )
+                                else {
+                                    unreachable!()
+                                };
+                                WFCommand::new(WFCommandVariant::AddLocalActivity(command))
+                            })
+                            .collect::<Vec<_>>();
+                        let workflow_command::Variant::ScheduleActivity(regular) =
+                            schedule_activity_cmd(
+                                3,
+                                "q",
+                                "act-3",
+                                ActivityCancellationType::TryCancel,
+                                Duration::from_secs(10),
+                                Duration::from_secs(10),
+                            )
+                        else {
+                            unreachable!()
+                        };
+                        commands.push(WFCommand::new(WFCommandVariant::AddActivity(regular)));
+                        commands
+                    }
+                    [la] if la == "la-1" => {
+                        let mut commands = vec![];
+                        if cancel_la {
+                            commands.push(WFCommand::new(
+                                WFCommandVariant::RequestCancelLocalActivity(
+                                    RequestCancelLocalActivity { seq: 2 },
+                                ),
+                            ));
+                        }
+                        commands.push(WFCommand::new(WFCommandVariant::RequestCancelActivity(
+                            RequestCancelActivity { seq: 3 },
+                        )));
+                        commands
+                    }
+                    jobs if jobs.iter().any(|j| j == "la-2") => vec![WFCommand::new(
+                        WFCommandVariant::CompleteWorkflow(Default::default()),
+                    )],
+                    _ => vec![],
+                }
+            };
+
+            let mut start = TestHistoryBuilder::default();
+            start.add_by_type(EventType::WorkflowExecutionStarted);
+            start.add_workflow_task_scheduled_and_started();
+
+            let mut live = manager(&start);
+            let mut live_activations = vec![];
+            for resolve in std::iter::once(vec![]).chain(resolve_before_activation) {
+                live.drain_queued_local_activities();
+                for seq in resolve {
+                    live.notify_of_local_result(LocalResolution::LocalActivity(
+                        LocalActivityResolution {
+                            seq,
+                            result: LocalActivityExecutionResult::Completed(Success {
+                                result: Some(seq.as_json_payload().unwrap()),
+                            }),
+                            runtime: Duration::ZERO,
+                            attempt: 1,
+                            backoff: None,
+                            original_schedule_time: None,
+                        },
+                    ))
+                    .unwrap();
+                }
+                let jobs = job_names(live.get_next_activation().unwrap());
+                live.push_commands_and_iterate(respond(&jobs)).unwrap();
+                live_activations.push(jobs);
+            }
+
+            let mut history = start.clone();
+            history.add_workflow_task_completed();
+            for command in live.machines.get_commands() {
+                match command.attributes.unwrap() {
+                    command::Attributes::RecordMarkerCommandAttributes(marker) => {
+                        history.add(MarkerRecordedEventAttributes {
+                            marker_name: marker.marker_name,
+                            details: marker.details,
+                            failure: marker.failure,
+                            workflow_task_completed_event_id: 4,
+                            ..Default::default()
+                        });
+                    }
+                    command::Attributes::CompleteWorkflowExecutionCommandAttributes(_) => {
+                        history.add_workflow_execution_completed();
+                    }
+                    unexpected => panic!("unexpected command: {unexpected:?}"),
+                }
+            }
+
+            let mut replay = manager(&history);
+            let mut replay_activations = vec![];
+            for _ in 0..live_activations.len() {
+                let jobs = job_names(replay.get_next_activation().unwrap());
+                if jobs.is_empty() {
+                    break;
+                }
+                replay.push_commands_and_iterate(respond(&jobs)).unwrap();
+                replay_activations.push(jobs);
+            }
+            assert_eq!(replay_activations, live_activations);
         }
     }
 }
