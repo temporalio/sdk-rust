@@ -972,6 +972,18 @@ async fn max_wft_respected() {
     worker.run_until_done().await.unwrap();
 }
 
+#[workflow]
+#[derive(Default)]
+struct PauseBeforeStartWorkflow;
+
+#[workflow_methods]
+impl PauseBeforeStartWorkflow {
+    #[run(name = DEFAULT_WORKFLOW_TYPE)]
+    async fn run(_ctx: &mut WorkflowContext<Self>) -> WorkflowResult<()> {
+        Ok(())
+    }
+}
+
 #[temporalio_macros::cloud_test_exclusion(crate::CloudTestExclusionReason::DoesNotUseServer)]
 #[tokio::test]
 async fn workflow_task_failed_before_start_on_pause_replays() {
@@ -990,18 +1002,6 @@ async fn workflow_task_failed_before_start_on_pause_replays() {
     history.last_event().unwrap().worker_may_ignore = true;
     history.add_workflow_task_scheduled_and_started();
 
-    #[workflow]
-    #[derive(Default)]
-    struct PausedBeforeTaskStartedWorkflow;
-
-    #[workflow_methods]
-    impl PausedBeforeTaskStartedWorkflow {
-        #[run(name = DEFAULT_WORKFLOW_TYPE)]
-        async fn run(_ctx: &mut WorkflowContext<Self>) -> WorkflowResult<()> {
-            Ok(())
-        }
-    }
-
     let mut mock = MockPollCfg::from_hist_builder(history);
     mock.completion_asserts_from_expectations(|mut asserts| {
         asserts.then(|completion| {
@@ -1017,7 +1017,7 @@ async fn workflow_task_failed_before_start_on_pause_replays() {
         |_| {},
         |options| {
             options
-                .register_workflow::<PausedBeforeTaskStartedWorkflow>()
+                .register_workflow::<PauseBeforeStartWorkflow>()
                 .unwrap();
         },
     );
@@ -1026,18 +1026,6 @@ async fn workflow_task_failed_before_start_on_pause_replays() {
 
 #[tokio::test]
 async fn pause_before_workflow_task_starts_resumes_after_unpause() {
-    #[workflow]
-    #[derive(Default)]
-    struct PauseBeforeStartWorkflow;
-
-    #[workflow_methods]
-    impl PauseBeforeStartWorkflow {
-        #[run]
-        async fn run(_ctx: &mut WorkflowContext<Self>) -> WorkflowResult<()> {
-            Ok(())
-        }
-    }
-
     let mut starter = CoreWfStarter::new("pause_before_workflow_task_starts_resumes_after_unpause");
     starter
         .sdk_config
