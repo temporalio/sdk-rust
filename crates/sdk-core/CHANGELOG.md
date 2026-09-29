@@ -52,6 +52,8 @@ relevant information.
   now waits until the current workflow task is reported. Previously it replaced that workflow task
   ("Trying to send a new WFT for a run which already has one!"), which then timed out on the server
   and could leave the workflow stuck on a nondeterminism error.
+* Workers now replay workflows paused before a scheduled task starts, allowing those workflows to
+  make progress after unpause.
 
 ## [0.10.0] - 2026-10-06
 

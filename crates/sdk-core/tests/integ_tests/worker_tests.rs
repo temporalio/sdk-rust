@@ -1,8 +1,8 @@
 use crate::{
     common::{
         CoreWfStarter, activity_functions::StdActivities, fake_grpc_server::fake_server,
-        get_integ_runtime_options, get_integ_server_options, get_integ_telem_options,
-        integ_namespace, prom_metrics,
+        get_integ_client, get_integ_runtime_options, get_integ_server_options,
+        get_integ_telem_options, integ_namespace, prom_metrics,
     },
     shared_tests::{self, is_oversize_grpc_event},
 };
@@ -36,20 +36,23 @@ use temporalio_common::{
             command::v1::command::Attributes,
             common::v1::{RetryPolicy, WorkerVersionStamp},
             enums::v1::{
-                EventType,
+                CommandType, EventType,
                 WorkflowTaskFailedCause::{self},
             },
             failure::v1::Failure as InnerFailure,
             history::v1::{
                 ActivityTaskScheduledEventAttributes, HistoryEvent,
+                WorkflowExecutionPausedEventAttributes, WorkflowExecutionUnpausedEventAttributes,
+                WorkflowTaskFailedEventAttributes,
                 history_event::{
                     self,
                     Attributes::{self as EventAttributes},
                 },
             },
             workflowservice::v1::{
-                GetWorkflowExecutionHistoryResponse, PollActivityTaskQueueResponse,
-                RespondActivityTaskCompletedResponse,
+                GetWorkflowExecutionHistoryResponse, PauseWorkflowExecutionRequest,
+                PollActivityTaskQueueResponse, RespondActivityTaskCompletedResponse,
+                UnpauseWorkflowExecutionRequest,
             },
         },
     },
@@ -76,6 +79,7 @@ use temporalio_sdk_core::{
 };
 use tokio::sync::{Barrier, Notify, Semaphore};
 use tokio_util::sync::CancellationToken;
+use tonic::IntoRequest;
 use tracing::Level;
 use uuid::Uuid;
 
@@ -966,6 +970,174 @@ async fn max_wft_respected() {
         },
     );
     worker.run_until_done().await.unwrap();
+}
+
+#[temporalio_macros::cloud_test_exclusion(crate::CloudTestExclusionReason::DoesNotUseServer)]
+#[tokio::test]
+async fn workflow_task_failed_before_start_on_pause_replays() {
+    let mut history = TestHistoryBuilder::default();
+    history.add_by_type(EventType::WorkflowExecutionStarted);
+    history.add_workflow_task_scheduled();
+    let scheduled_event_id = history.current_event_id();
+    history.add(WorkflowTaskFailedEventAttributes {
+        scheduled_event_id,
+        cause: WorkflowTaskFailedCause::WorkflowPauseRequestedBeforeTaskStarted as i32,
+        ..Default::default()
+    });
+    history.add(WorkflowExecutionPausedEventAttributes::default());
+    history.last_event().unwrap().worker_may_ignore = true;
+    history.add(WorkflowExecutionUnpausedEventAttributes::default());
+    history.last_event().unwrap().worker_may_ignore = true;
+    history.add_workflow_task_scheduled_and_started();
+
+    #[workflow]
+    #[derive(Default)]
+    struct PausedBeforeTaskStartedWorkflow;
+
+    #[workflow_methods]
+    impl PausedBeforeTaskStartedWorkflow {
+        #[run(name = DEFAULT_WORKFLOW_TYPE)]
+        async fn run(_ctx: &mut WorkflowContext<Self>) -> WorkflowResult<()> {
+            Ok(())
+        }
+    }
+
+    let mut mock = MockPollCfg::from_hist_builder(history);
+    mock.completion_asserts_from_expectations(|mut asserts| {
+        asserts.then(|completion| {
+            assert_eq!(completion.commands.len(), 1);
+            assert_eq!(
+                completion.commands[0].command_type(),
+                CommandType::CompleteWorkflowExecution
+            );
+        });
+    });
+    let mut worker = crate::common::mock_sdk_cfg_with_options(
+        mock,
+        |_| {},
+        |options| {
+            options
+                .register_workflow::<PausedBeforeTaskStartedWorkflow>()
+                .unwrap();
+        },
+    );
+    worker.run_until_done().await.unwrap();
+}
+
+#[tokio::test]
+async fn pause_before_workflow_task_starts_resumes_after_unpause() {
+    #[workflow]
+    #[derive(Default)]
+    struct PauseBeforeStartWorkflow;
+
+    #[workflow_methods]
+    impl PauseBeforeStartWorkflow {
+        #[run]
+        async fn run(_ctx: &mut WorkflowContext<Self>) -> WorkflowResult<()> {
+            Ok(())
+        }
+    }
+
+    let mut starter = CoreWfStarter::new("pause_before_workflow_task_starts_resumes_after_unpause");
+    starter
+        .sdk_config
+        .register_workflow::<PauseBeforeStartWorkflow>()
+        .unwrap();
+    let client = get_integ_client(integ_namespace(), None).await;
+    let handle = client
+        .start_workflow(
+            PauseBeforeStartWorkflow::run,
+            (),
+            starter.workflow_options.clone(),
+        )
+        .await
+        .unwrap();
+    let workflow_id = starter.get_wf_id().to_owned();
+    let run_id = handle.run_id().unwrap().to_owned();
+
+    client
+        .connection()
+        .workflow_service()
+        .pause_workflow_execution(
+            PauseWorkflowExecutionRequest {
+                namespace: integ_namespace(),
+                workflow_id: workflow_id.clone(),
+                run_id: run_id.clone(),
+                identity: "sdk-rust-integration-test".to_owned(),
+                reason: "test pause before first task starts".to_owned(),
+                request_id: Uuid::new_v4().to_string(),
+            }
+            .into_request(),
+        )
+        .await
+        .unwrap();
+
+    let paused_history = handle
+        .fetch_history(Default::default())
+        .into_events()
+        .await
+        .unwrap();
+    assert_eq!(
+        paused_history[1].event_type(),
+        EventType::WorkflowTaskScheduled
+    );
+    assert_eq!(
+        paused_history[2].event_type(),
+        EventType::WorkflowTaskFailed
+    );
+    assert_matches!(
+        paused_history[2].attributes.as_ref(),
+        Some(EventAttributes::WorkflowTaskFailedEventAttributes(attributes))
+            if attributes.cause() == WorkflowTaskFailedCause::WorkflowPauseRequestedBeforeTaskStarted
+                && attributes.scheduled_event_id == paused_history[1].event_id
+                && attributes.started_event_id == 0
+                && attributes.failure.is_none()
+    );
+    assert_eq!(
+        paused_history[3].event_type(),
+        EventType::WorkflowExecutionPaused
+    );
+    assert!(paused_history[3].worker_may_ignore);
+
+    client
+        .connection()
+        .workflow_service()
+        .unpause_workflow_execution(
+            UnpauseWorkflowExecutionRequest {
+                namespace: integ_namespace(),
+                workflow_id: workflow_id.clone(),
+                run_id: run_id.clone(),
+                identity: "sdk-rust-integration-test".to_owned(),
+                reason: "resume workflow".to_owned(),
+                request_id: Uuid::new_v4().to_string(),
+            }
+            .into_request(),
+        )
+        .await
+        .unwrap();
+
+    let resumed_history = handle
+        .fetch_history(Default::default())
+        .into_events()
+        .await
+        .unwrap();
+    assert_eq!(
+        resumed_history[4].event_type(),
+        EventType::WorkflowExecutionUnpaused
+    );
+    assert!(resumed_history[4].worker_may_ignore);
+    assert_eq!(
+        resumed_history[5].event_type(),
+        EventType::WorkflowTaskScheduled
+    );
+
+    let mut worker = starter.worker().await;
+    worker.expect_workflow_completion(workflow_id, Some(run_id));
+    tokio::time::timeout(Duration::from_secs(60), worker.run_until_done())
+        .await
+        .expect("workflow did not resume after unpause")
+        .unwrap();
+    handle.get_result(Default::default()).await.unwrap();
 }
 
 #[temporalio_macros::cloud_test_exclusion(crate::CloudTestExclusionReason::DoesNotUseServer)]
