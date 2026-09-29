@@ -1219,11 +1219,12 @@ impl ManagedRun {
         } else {
             ActivationCompleteOutcome::DoNothing
         };
+        let replaying = machines_wft_response.replaying;
+        if matches!(outcome, ActivationCompleteOutcome::ReportWFTSuccess(_)) {
+            self.wfm.wft_completion_reported();
+        }
         FulfillableActivationComplete {
-            result: ActivationCompleteResult {
-                outcome,
-                replaying: machines_wft_response.replaying,
-            },
+            result: ActivationCompleteResult { outcome, replaying },
             resp_chan,
         }
     }
@@ -1423,6 +1424,14 @@ struct WorkflowManager {
     /// Is always `Some` in normal operation. Optional to allow for unit testing with the test
     /// workflow driver, which does not need to complete activations the normal way.
     command_sink: Option<Sender<Vec<WFCommand>>>,
+    awaiting_activation_completion: bool,
+    awaiting_next_wft: bool,
+    /// Replay can only apply a peeked resolution after lang responds to the activation before it,
+    /// or after applying the events of the WFT it was recorded in. Resolutions arriving while lang
+    /// is busy, or between WFTs, wait until then too. Otherwise their jobs would precede those
+    /// produced by lang's response or the WFT's events, unlike during replay, and resolutions
+    /// arriving between WFTs would be recorded with an index from the previous WFT.
+    deferred_local_resolutions: Vec<LocalResolution>,
 }
 
 impl WorkflowManager {
@@ -1434,6 +1443,9 @@ impl WorkflowManager {
         Self {
             machines: state_machines,
             command_sink: Some(cmd_sink),
+            awaiting_activation_completion: false,
+            awaiting_next_wft: false,
+            deferred_local_resolutions: vec![],
         }
     }
 
@@ -1448,6 +1460,8 @@ impl WorkflowManager {
         messages: Vec<IncomingProtocolMessage>,
     ) -> Result<WorkflowActivation> {
         self.machines.new_work_from_server(update, messages)?;
+        self.awaiting_next_wft = false;
+        self.apply_deferred_local_resolutions()?;
         self.get_next_activation()
     }
 
@@ -1459,11 +1473,13 @@ impl WorkflowManager {
 
     /// Let this workflow know that something we've been waiting locally on has resolved, like a
     /// local activity or side effect
-    ///
-    /// Returns true if the resolution did anything. EX: If the activity is already canceled and
-    /// used the TryCancel or Abandon modes, the resolution is uninteresting.
-    fn notify_of_local_result(&mut self, resolved: LocalResolution) -> Result<bool> {
-        self.machines.local_resolution(resolved)
+    fn notify_of_local_result(&mut self, resolved: LocalResolution) -> Result<()> {
+        if self.awaiting_activation_completion || self.awaiting_next_wft {
+            self.deferred_local_resolutions.push(resolved);
+        } else {
+            self.machines.local_resolution(resolved)?;
+        }
+        Ok(())
     }
 
     /// Fetch the next workflow activation for this workflow if one is required. Doing so will apply
@@ -1473,13 +1489,13 @@ impl WorkflowManager {
     /// to the server.
     fn get_next_activation(&mut self) -> Result<WorkflowActivation> {
         // First check if there are already some pending jobs, which can be a result of replay.
-        let activation = self.machines.get_wf_activation();
-        if !activation.jobs.is_empty() {
-            return Ok(activation);
+        let mut activation = self.machines.get_wf_activation();
+        if activation.jobs.is_empty() {
+            self.machines.apply_next_wft_from_history()?;
+            activation = self.machines.get_wf_activation();
         }
-
-        self.machines.apply_next_wft_from_history()?;
-        Ok(self.machines.get_wf_activation())
+        self.awaiting_activation_completion = !activation.jobs.is_empty();
+        Ok(activation)
     }
 
     /// Returns true if machines are ready to apply the next WFT sequence, false if events will need
@@ -1528,6 +1544,22 @@ impl WorkflowManager {
             })?;
         }
         self.machines.iterate_machines()?;
+        self.awaiting_activation_completion = false;
+        self.apply_deferred_local_resolutions()
+    }
+
+    /// Must be called once the current WFT's completion has been reported to server.
+    fn wft_completion_reported(&mut self) {
+        self.awaiting_next_wft = true;
+    }
+
+    fn apply_deferred_local_resolutions(&mut self) -> Result<()> {
+        if self.awaiting_activation_completion || self.awaiting_next_wft {
+            return Ok(());
+        }
+        for resolution in mem::take(&mut self.deferred_local_resolutions) {
+            self.machines.local_resolution(resolution)?;
+        }
         Ok(())
     }
 }
@@ -2060,27 +2092,6 @@ mod tests {
                 }
                 commands
             }
-
-            fn resolutions(&self, batch: &[u32]) -> WorkflowActivation {
-                WorkflowActivation {
-                    jobs: batch
-                        .iter()
-                        .map(|seq| {
-                            Variant::ResolveActivity(ResolveActivity {
-                                seq: *seq,
-                                is_local: true,
-                                result: Some(ActivityResolution {
-                                    status: Some(activity_resolution::Status::Completed(Success {
-                                        result: Some(self.outstanding[seq].result()),
-                                    })),
-                                }),
-                            })
-                            .into()
-                        })
-                        .collect(),
-                    ..Default::default()
-                }
-            }
         }
 
         fn manager(history: &TestHistoryBuilder) -> WorkflowManager {
@@ -2133,7 +2144,28 @@ mod tests {
                             continue;
                         }
                         let mut next = workflow.clone();
-                        next.activate(workflow.resolutions(&batch));
+                        next.activate(WorkflowActivation {
+                            jobs: batch
+                                .iter()
+                                .map(|seq| {
+                                    Variant::ResolveActivity(ResolveActivity {
+                                        seq: *seq,
+                                        is_local: true,
+                                        result: Some(ActivityResolution {
+                                            status: Some(activity_resolution::Status::Completed(
+                                                Success {
+                                                    result: Some(
+                                                        workflow.outstanding[seq].result(),
+                                                    ),
+                                                },
+                                            )),
+                                        }),
+                                    })
+                                    .into()
+                                })
+                                .collect(),
+                            ..Default::default()
+                        });
                         let mut batches = batches.clone();
                         batches.push(batch);
                         paths.push((next, batches, work_done + work.len()));
@@ -2143,7 +2175,7 @@ mod tests {
 
             for plan in plans {
                 // Before incremental delivery, all three initial activities resolved together. Such
-                // histories must remain replayable even though they have no activation group field.
+                // histories must remain replayable even though they have no activation index field.
                 if legacy && plan[0].len() != 3 {
                     continue;
                 }
@@ -2183,7 +2215,7 @@ mod tests {
                                     &mut marker.details.get_mut("data").unwrap().payloads[0].data;
                                 let mut json: serde_json::Value =
                                     serde_json::from_slice(data).unwrap();
-                                json.as_object_mut().unwrap().remove("activation_group");
+                                json.as_object_mut().unwrap().remove("activation_index");
                                 *data = serde_json::to_vec(&json).unwrap();
                             }
                             history.add(MarkerRecordedEventAttributes {
@@ -2217,7 +2249,7 @@ mod tests {
         }
 
         #[test]
-        fn cancel_does_not_pull_resolution_from_later_activation_group() {
+        fn cancel_does_not_pull_resolution_from_later_activation() {
             let mut history = TestHistoryBuilder::default();
             history.add_by_type(EventType::WorkflowExecutionStarted);
             history.add_full_wf_task();
@@ -2227,7 +2259,7 @@ mod tests {
                     &format!("work-{seq}"),
                     Some(Activity::Work(seq).result()),
                     None,
-                    |data| data.activation_group = Some(u64::from(seq)),
+                    |data| data.activation_index = Some(u64::from(seq)),
                 );
             }
             history.add_workflow_execution_completed();
@@ -2265,17 +2297,87 @@ mod tests {
             }
         }
 
+        #[derive(Clone, Copy)]
+        enum OnFirstResult {
+            Nothing,
+            CancelActivity,
+            CancelLaThenActivity,
+        }
+
+        #[derive(Clone, Copy)]
+        enum Step {
+            Resolve(u32),
+            Activate,
+            /// Activates, resolving the LA while lang is still working on the activation.
+            ActivateResolving(u32),
+            /// Reports the WFT complete while LAs are still running.
+            CompleteWft,
+            /// Applies the WFT server issues after a heartbeat completion.
+            NextWft {
+                signal: bool,
+            },
+        }
+
+        /// The workflow schedules LAs 1 and 2 plus regular activity 3, reacts to LA 1's result as
+        /// directed, and completes once LA 2's result arrives.
         #[rstest]
         // Cancelling the never-sent regular activity resolves it immediately, in an activation
         // holding no LA results. LA 2 resolves afterwards, in its own activation, and replay must
         // not fold it into the cancellation's activation.
-        #[case::activation_without_la_results(false, vec![vec![1], vec![], vec![2]])]
+        #[case::activation_without_la_results(
+            OnFirstResult::CancelActivity,
+            vec![Step::Resolve(1), Step::Activate, Step::Activate, Step::Resolve(2), Step::Activate]
+        )]
         // A TryCancel LA cancel resolves immediately, so live delivers LA 2's cancellation before
         // the regular activity's, matching command order. Replay must too.
-        #[case::la_try_cancel_order(true, vec![vec![1], vec![]])]
+        #[case::la_try_cancel_order(
+            OnFirstResult::CancelLaThenActivity,
+            vec![Step::Resolve(1), Step::Activate, Step::Activate]
+        )]
+        // LA 2 resolving while lang handles LA 1 must not jump ahead of the jobs produced by
+        // lang's response, since replay can only apply its marker after that response.
+        #[case::la_resolves_while_activation_outstanding(
+            OnFirstResult::CancelActivity,
+            vec![Step::Resolve(1), Step::ActivateResolving(2), Step::Activate]
+        )]
+        // A signal in the heartbeat WFT is delivered on its own before LA 2 resolves, so replay
+        // must not merge LA 2 into it.
+        #[case::heartbeat_signal_before_la(
+            OnFirstResult::Nothing,
+            vec![
+                Step::Resolve(1),
+                Step::Activate,
+                Step::CompleteWft,
+                Step::NextWft { signal: true },
+                Step::Resolve(2),
+                Step::Activate,
+            ]
+        )]
+        // LA 2 resolving between the heartbeat completion and the next WFT belongs to that WFT's
+        // first activation, after the WFT's own jobs, since that's where replay finds its marker.
+        #[case::la_resolves_before_heartbeat_wft_with_signal(
+            OnFirstResult::Nothing,
+            vec![
+                Step::Resolve(1),
+                Step::Activate,
+                Step::CompleteWft,
+                Step::Resolve(2),
+                Step::NextWft { signal: true },
+            ]
+        )]
+        #[case::la_resolves_before_heartbeat_wft(
+            OnFirstResult::Nothing,
+            vec![
+                Step::Resolve(1),
+                Step::Activate,
+                Step::CompleteWft,
+                Step::Resolve(2),
+                Step::NextWft { signal: false },
+            ]
+        )]
         fn replay_matches_live_activations(
-            #[case] cancel_la: bool,
-            #[case] resolve_before_activation: Vec<Vec<u32>>,
+            #[case] on_first_result: OnFirstResult,
+            #[case] steps: Vec<Step>,
         ) {
             let job_names = |activation: WorkflowActivation| -> Vec<String> {
                 activation
@@ -2283,6 +2385,7 @@ mod tests {
                     .into_iter()
                     .map(|job| match job.variant.unwrap() {
                         Variant::InitializeWorkflow(_) => "init".to_owned(),
+                        Variant::SignalWorkflow(_) => "signal".to_owned(),
                         Variant::ResolveActivity(r) if r.is_local => format!("la-{}", r.seq),
                         Variant::ResolveActivity(r) => format!("act-{}", r.seq),
                         unexpected => panic!("unexpected job: {unexpected:?}"),
@@ -2290,6 +2393,11 @@ mod tests {
                     .collect()
             };
             let respond = |jobs: &[String]| -> Vec<WFCommand> {
+                let cancel_activity = || {
+                    WFCommand::new(WFCommandVariant::RequestCancelActivity(
+                        RequestCancelActivity { seq: 3 },
+                    ))
+                };
                 match jobs {
                     [init] if init == "init" => {
                         let mut commands = (1..=2)
@@ -2322,74 +2430,113 @@ mod tests {
                         commands.push(WFCommand::new(WFCommandVariant::AddActivity(regular)));
                         commands
                     }
-                    [la] if la == "la-1" => {
-                        let mut commands = vec![];
-                        if cancel_la {
-                            commands.push(WFCommand::new(
-                                WFCommandVariant::RequestCancelLocalActivity(
-                                    RequestCancelLocalActivity { seq: 2 },
-                                ),
-                            ));
-                        }
-                        commands.push(WFCommand::new(WFCommandVariant::RequestCancelActivity(
-                            RequestCancelActivity { seq: 3 },
-                        )));
-                        commands
-                    }
+                    [la] if la == "la-1" => match on_first_result {
+                        OnFirstResult::Nothing => vec![],
+                        OnFirstResult::CancelActivity => vec![cancel_activity()],
+                        OnFirstResult::CancelLaThenActivity => vec![
+                            WFCommand::new(WFCommandVariant::RequestCancelLocalActivity(
+                                RequestCancelLocalActivity { seq: 2 },
+                            )),
+                            cancel_activity(),
+                        ],
+                    },
                     jobs if jobs.iter().any(|j| j == "la-2") => vec![WFCommand::new(
                         WFCommandVariant::CompleteWorkflow(Default::default()),
                     )],
                     _ => vec![],
                 }
             };
-
-            let mut start = TestHistoryBuilder::default();
-            start.add_by_type(EventType::WorkflowExecutionStarted);
-            start.add_workflow_task_scheduled_and_started();
-
-            let mut live = manager(&start);
-            let mut live_activations = vec![];
-            for resolve in std::iter::once(vec![]).chain(resolve_before_activation) {
+            let resolve = |live: &mut WorkflowManager, seq: u32| {
                 live.drain_queued_local_activities();
-                for seq in resolve {
-                    live.notify_of_local_result(LocalResolution::LocalActivity(
-                        LocalActivityResolution {
-                            seq,
-                            result: LocalActivityExecutionResult::Completed(Success {
-                                result: Some(seq.as_json_payload().unwrap()),
-                            }),
-                            runtime: Duration::ZERO,
-                            attempt: 1,
-                            backoff: None,
-                            original_schedule_time: None,
-                        },
-                    ))
-                    .unwrap();
+                live.notify_of_local_result(LocalResolution::LocalActivity(
+                    LocalActivityResolution {
+                        seq,
+                        result: LocalActivityExecutionResult::Completed(Success {
+                            result: Some(seq.as_json_payload().unwrap()),
+                        }),
+                        runtime: Duration::ZERO,
+                        attempt: 1,
+                        backoff: None,
+                        original_schedule_time: None,
+                    },
+                ))
+                .unwrap();
+            };
+            let record_wft_completion =
+                |history: &mut TestHistoryBuilder, live: &WorkflowManager| {
+                    history.add_workflow_task_completed();
+                    let wft_completed_id = history.current_event_id();
+                    for command in live.machines.get_commands() {
+                        match command.attributes.unwrap() {
+                            command::Attributes::RecordMarkerCommandAttributes(marker) => {
+                                history.add(MarkerRecordedEventAttributes {
+                                    marker_name: marker.marker_name,
+                                    details: marker.details,
+                                    failure: marker.failure,
+                                    workflow_task_completed_event_id: wft_completed_id,
+                                    ..Default::default()
+                                });
+                            }
+                            command::Attributes::ScheduleActivityTaskCommandAttributes(attrs) => {
+                                history.add_activity_task_scheduled(attrs.activity_id);
+                            }
+                            command::Attributes::CompleteWorkflowExecutionCommandAttributes(_) => {
+                                history.add_workflow_execution_completed();
+                            }
+                            unexpected => panic!("unexpected command: {unexpected:?}"),
+                        }
+                    }
+                };
+
+            let mut history = TestHistoryBuilder::default();
+            history.add_by_type(EventType::WorkflowExecutionStarted);
+            history.add_workflow_task_scheduled_and_started();
+            let mut live = manager(&history);
+            let mut live_activations = vec![];
+            let jobs = job_names(live.get_next_activation().unwrap());
+            live.push_commands_and_iterate(respond(&jobs)).unwrap();
+            live_activations.push(jobs);
+            let mut wft_number = 1;
+            for step in steps {
+                let activation = match step {
+                    Step::Resolve(seq) => {
+                        resolve(&mut live, seq);
+                        continue;
+                    }
+                    Step::Activate | Step::ActivateResolving(_) => {
+                        live.get_next_activation().unwrap()
+                    }
+                    Step::CompleteWft => {
+                        record_wft_completion(&mut history, &live);
+                        live.wft_completion_reported();
+                        continue;
+                    }
+                    Step::NextWft { signal } => {
+                        if signal {
+                            history.add_we_signaled("signal", vec![]);
+                        }
+                        history.add_workflow_task_scheduled_and_started();
+                        wft_number += 1;
+                        let activation = live
+                            .new_work_from_server(
+                                history.get_one_wft(wft_number).unwrap().into(),
+                                vec![],
+                            )
+                            .unwrap();
+                        if activation.jobs.is_empty() {
+                            continue;
+                        }
+                        activation
+                    }
+                };
+                let jobs = job_names(activation);
+                if let Step::ActivateResolving(seq) = step {
+                    resolve(&mut live, seq);
                 }
-                let jobs = job_names(live.get_next_activation().unwrap());
                 live.push_commands_and_iterate(respond(&jobs)).unwrap();
                 live_activations.push(jobs);
             }
-
-            let mut history = start.clone();
-            history.add_workflow_task_completed();
-            for command in live.machines.get_commands() {
-                match command.attributes.unwrap() {
-                    command::Attributes::RecordMarkerCommandAttributes(marker) => {
-                        history.add(MarkerRecordedEventAttributes {
-                            marker_name: marker.marker_name,
-                            details: marker.details,
-                            failure: marker.failure,
-                            workflow_task_completed_event_id: 4,
-                            ..Default::default()
-                        });
-                    }
-                    command::Attributes::CompleteWorkflowExecutionCommandAttributes(_) => {
-                        history.add_workflow_execution_completed();
-                    }
-                    unexpected => panic!("unexpected command: {unexpected:?}"),
-                }
-            }
+            record_wft_completion(&mut history, &live);
 
             let mut replay = manager(&history);
             let mut replay_activations = vec![];

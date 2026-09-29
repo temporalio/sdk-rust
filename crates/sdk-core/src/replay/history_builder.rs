@@ -320,7 +320,7 @@ impl TestHistoryBuilder {
             complete_time: None,
             backoff: None,
             original_schedule_time: None,
-            activation_group: None,
+            activation_index: None,
         };
         detail_mutator(&mut lamd);
         let attrs = MarkerRecordedEventAttributes {
