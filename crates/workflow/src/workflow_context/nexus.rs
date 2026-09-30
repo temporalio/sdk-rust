@@ -26,11 +26,7 @@ impl BaseWorkflowContext {
                 .inner
                 .runtime
                 .register_unblocker(PendingCommandId::NexusOpComplete(seq), unblocker);
-            base_ctx
-                .inner
-                .runtime
-                .host
-                .push_command(opts.into_command(seq));
+            base_ctx.push_user_command(opts.into_command(seq));
             let result_future = CancellableWorkflowOutboundFuture::new(
                 result_future,
                 base_ctx.cancellation_handle(CancellableID::NexusOp(seq)),

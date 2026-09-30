@@ -41,11 +41,11 @@ pub mod __private {
             instance::GuestWorkflowInstance,
             is_sdk_wake,
             types::{
-                ActivationJobResult, ActivationResult, MAIN_ROUTINE_ID, MainRoutineCompletion,
-                QueryResponse, RoutineCompletion, RoutineId, RoutineKind, RoutinePendingState,
-                RoutinePollResult, StartedRoutine, TaskFailure, TerminalOutcome,
-                UpdateRoutineCompletion, UpdateRoutineKind, WorkflowActivation, WorkflowFailure,
-                WorkflowInit,
+                ActivationJobResult, ActivationResult, ContinueAsNewRequest, MAIN_ROUTINE_ID,
+                MainRoutineCompletion, QueryResponse, RoutineCompletion, RoutineId, RoutineKind,
+                RoutinePendingState, RoutinePollResult, StartedRoutine, TaskFailure,
+                TerminalOutcome, UpdateRoutineCompletion, UpdateRoutineKind, WorkflowActivation,
+                WorkflowFailure, WorkflowInit,
             },
         };
     }
@@ -53,12 +53,16 @@ pub mod __private {
 
 mod cancellation;
 mod component;
+#[cfg(feature = "experimental")]
+mod event_groups;
 mod runtime;
 mod workflow_context;
 pub mod workflow_interceptors;
 pub mod workflows;
 
 pub use cancellation::{WorkflowCancellationError, WorkflowCancellationToken};
+#[cfg(feature = "experimental")]
+pub use event_groups::EventGroup;
 pub use runtime::model::{TimerResult, WorkflowResult, WorkflowTermination};
 pub use temporalio_common_wasm::{
     ActivityCloseTimeouts, Memo, MemoValue, MemoValues, RetryPolicy,
@@ -79,8 +83,10 @@ pub use workflow_context::{
 };
 #[cfg(feature = "experimental")]
 pub use workflow_context::{
-    ContinueAsNewVersioningBehavior, NexusOperationCancellationType, NexusOperationOptions,
-    PatchActivationCallback, PatchActivationInput, StartedNexusOperation,
+    CancelChildWorkflowOptions, CancelExternalWorkflowOptions, ContinueAsNewVersioningBehavior,
+    NexusOperationCancellationType, NexusOperationOptions, PatchActivationCallback,
+    PatchActivationInput, PatchOptions, StartedNexusOperation, UpsertMemoOptions,
+    UpsertSearchAttributesOptions,
 };
 #[doc(hidden)]
 pub use workflow_context::{

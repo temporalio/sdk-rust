@@ -244,6 +244,16 @@ impl PayloadConverter {
     pub fn serde_json() -> Self {
         Self::Serde(Arc::new(SerdeJsonPayloadConverter))
     }
+
+    /// Build an ordered composite converter.
+    ///
+    /// TODO: Hidden until we're ready to freeze the Composite Payload Converter API.
+    #[doc(hidden)]
+    pub fn composite(converters: impl IntoIterator<Item = Self>) -> Self {
+        Self::Composite(Arc::new(CompositePayloadConverter {
+            converters: converters.into_iter().collect(),
+        }))
+    }
     // TODO [rust-sdk-branch]: Proto binary, other standard built-ins
 }
 

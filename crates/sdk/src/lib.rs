@@ -108,8 +108,10 @@ pub use temporalio_workflow::{
 };
 #[cfg(feature = "experimental")]
 pub use temporalio_workflow::{
-    ContinueAsNewVersioningBehavior, NexusOperationCancellationType, NexusOperationOptions,
-    PatchActivationCallback, PatchActivationInput, StartedNexusOperation,
+    CancelChildWorkflowOptions, CancelExternalWorkflowOptions, ContinueAsNewVersioningBehavior,
+    EventGroup, NexusOperationCancellationType, NexusOperationOptions, PatchActivationCallback,
+    PatchActivationInput, PatchOptions, StartedNexusOperation, UpsertMemoOptions,
+    UpsertSearchAttributesOptions,
 };
 #[cfg(feature = "wasm-workflows")]
 pub use workflow_wasm::WasmWorkflowComponent;

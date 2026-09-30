@@ -100,6 +100,17 @@ impl WorkflowContextView {
         &self.raw.first_execution_run_id
     }
 
+    /// Returns the run ID recorded on the `WorkflowExecutionStarted` event.
+    ///
+    /// Unlike [`Self::run_id`], this value is preserved across workflow resets.
+    pub fn original_execution_run_id(&self) -> &str {
+        if self.raw.original_execution_run_id.is_empty() {
+            &self.run_id
+        } else {
+            &self.raw.original_execution_run_id
+        }
+    }
+
     /// Returns the run ID of the previous execution when this is a continuation.
     pub fn continued_from_run_id(&self) -> Option<&str> {
         (!self.raw.continued_from_execution_run_id.is_empty())

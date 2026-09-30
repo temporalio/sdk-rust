@@ -588,9 +588,7 @@ impl WorkflowFuture {
                                 );
                             }
                             TerminalOutcome::ContinueAsNew(req) => {
-                                self.host.push_command_variant(
-                                    workflow_command::Variant::ContinueAsNewWorkflowExecution(*req),
-                                );
+                                self.host.push_command(req.into_command());
                             }
                         }
                         should_stop_polling = true;
