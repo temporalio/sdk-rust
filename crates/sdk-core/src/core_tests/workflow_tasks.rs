@@ -7,10 +7,10 @@ use crate::{
         CounterRecordingMeter, FakeWfResponses, MockPollCfg, MocksHolder, ResponseType, WorkerExt,
         WorkerTestHelpers,
         WorkflowCachingPolicy::{self, AfterEveryReply, NonSticky},
-        build_fake_worker, build_mock_pollers, build_multihist_mock_sg, fanout_tasks,
-        gen_assert_and_fail, gen_assert_and_reply, hist_to_poll_resp, mock_worker, poll_and_reply,
-        poll_and_reply_clears_outstanding_evicts, schedule_local_activity_cmd, single_hist_mock_sg,
-        start_timer_cmd, test_worker_cfg,
+        build_fake_worker, build_mock_pollers, build_multihist_mock_sg, drain_pollers_and_shutdown,
+        fanout_tasks, gen_assert_and_fail, gen_assert_and_reply, hist_to_poll_resp, mock_worker,
+        poll_and_reply, poll_and_reply_clears_outstanding_evicts, schedule_local_activity_cmd,
+        single_hist_mock_sg, start_timer_cmd, test_worker_cfg,
     },
     worker::{
         PollerBehavior, SlotMarkUsedContext, SlotReleaseContext, SlotReservationContext,
@@ -39,6 +39,7 @@ use temporalio_common::{
             activity_result::{
                 self as ar, ActivityExecutionResult, ActivityResolution, activity_resolution,
             },
+            activity_task::{ActivityCancelReason, Cancel, activity_task},
             common::VersioningIntent,
             workflow_activation::{
                 FireTimer, InitializeWorkflow, ResolveActivity, UpdateRandomSeed,
@@ -47,7 +48,8 @@ use temporalio_common::{
             workflow_commands::{
                 ActivityCancellationType, CancelTimer, CompleteWorkflowExecution,
                 ContinueAsNewWorkflowExecution, FailWorkflowExecution, RequestCancelActivity,
-                ScheduleActivity, SetPatchMarker, StartChildWorkflowExecution, UpdateResponse,
+                RequestCancelLocalActivity, ScheduleActivity, ScheduleLocalActivity,
+                SetPatchMarker, StartChildWorkflowExecution, UpdateResponse,
                 update_response::Response, workflow_command,
             },
             workflow_completion::WorkflowActivationCompletion,
@@ -1511,10 +1513,17 @@ async fn la_resolution_after_wft_not_found_during_eviction() {
         .unwrap()
         .unwrap();
 
-    let eviction = time::timeout(Duration::from_secs(5), core.poll_workflow_activation())
-        .await
-        .unwrap()
-        .unwrap();
+    // The workflow poll drives the heartbeat autocompletion whose WFT-not-found response evicts
+    // the run, and the eviction is withheld until the in-flight LA's cancel has been handed to
+    // lang, so both must be polled concurrently
+    let (cancel, eviction) = join!(
+        time::timeout(Duration::from_secs(5), core.poll_activity_task()),
+        time::timeout(Duration::from_secs(5), core.poll_workflow_activation())
+    );
+    let cancel = cancel.unwrap().unwrap();
+    assert_eq!(cancel.task_token, act_task.task_token);
+    assert_matches!(cancel.variant, Some(activity_task::Variant::Cancel(_)));
+    let eviction = eviction.unwrap().unwrap();
     assert_matches!(
         eviction.jobs.as_slice(),
         [WorkflowActivationJob {
@@ -1557,6 +1566,552 @@ async fn la_resolution_after_wft_not_found_during_eviction() {
     .await
     .unwrap();
     core.shutdown().await;
+}
+
+#[tokio::test]
+async fn la_cancel_delivered_before_eviction_activation() {
+    let mut t = TestHistoryBuilder::default();
+    // Long enough that the LA heartbeat (a fraction of the WFT timeout) cannot fire mid-test
+    t.add_wfe_started_with_wft_timeout(Duration::from_secs(60));
+    t.add_workflow_task_scheduled_and_started();
+    let mut mock_cfg = MockPollCfg::from_resp_batches("fake_wf_id", t, [1], mock_worker_client());
+    // Keep PollerDead from starting shutdown
+    mock_cfg.make_poll_stream_interminable = true;
+    let mut mock = build_mock_pollers(mock_cfg);
+    mock.worker_cfg(|wc| wc.max_cached_workflows = 1);
+    let core = mock_worker(mock);
+
+    let activation = core.poll_workflow_activation().await.unwrap();
+    let run_id = activation.run_id.clone();
+    core.complete_workflow_activation(WorkflowActivationCompletion::from_cmd(
+        run_id.clone(),
+        schedule_local_activity_cmd(
+            1,
+            "1",
+            ActivityCancellationType::WaitCancellationCompleted,
+            Duration::from_secs(60),
+        ),
+    ))
+    .await
+    .unwrap();
+    let la_start = core.poll_activity_task().await.unwrap();
+    assert_matches!(la_start.variant, Some(activity_task::Variant::Start(_)));
+
+    core.request_workflow_eviction(&run_id);
+    // GetStateInfo rides the stream's FIFO local channel, so once it answers the eviction
+    // request has been processed
+    assert_eq!(core.cached_workflows().await, 1);
+
+    // The eviction must not reach lang until the LA's cancel has been polled
+    let wf_poll = core.poll_workflow_activation();
+    advance_fut!(wf_poll);
+
+    let cancel = core.poll_activity_task().await.unwrap();
+    assert_eq!(cancel.task_token, la_start.task_token);
+    assert_matches!(
+        cancel.variant,
+        Some(activity_task::Variant::Cancel(Cancel { reason, .. }))
+            if reason == ActivityCancelReason::Cancelled as i32
+    );
+
+    let eviction = wf_poll.await.unwrap();
+    assert_matches!(
+        eviction.jobs.as_slice(),
+        [WorkflowActivationJob {
+            variant: Some(workflow_activation_job::Variant::RemoveFromCache(rfc)),
+        }] if rfc.reason == EvictionReason::LangRequested as i32
+    );
+    core.complete_workflow_activation(WorkflowActivationCompletion::empty(eviction.run_id))
+        .await
+        .unwrap();
+    // Lang reporting the cancel after the run is gone is untracked and must be accepted silently
+    core.complete_activity_task(ActivityTaskCompletion {
+        task_token: cancel.task_token,
+        result: Some(ActivityExecutionResult::cancel_from_details(None)),
+    })
+    .await
+    .unwrap();
+    assert_eq!(core.cached_workflows().await, 0);
+    assert_eq!(core.outstanding_workflow_tasks().await, 0);
+    drain_pollers_and_shutdown(&core).await;
+}
+
+#[tokio::test]
+async fn abandoned_la_cancel_delivered_before_workflow_completion_eviction() {
+    let mut t = TestHistoryBuilder::default();
+    t.add_wfe_started_with_wft_timeout(Duration::from_secs(60));
+    t.add_workflow_task_scheduled_and_started();
+    let mut mock_cfg = MockPollCfg::from_resp_batches("fake_wf_id", t, [1], mock_worker_client());
+    mock_cfg.make_poll_stream_interminable = true;
+    let mut mock = build_mock_pollers(mock_cfg);
+    mock.worker_cfg(|wc| wc.max_cached_workflows = 1);
+    let core = mock_worker(mock);
+
+    let activation = core.poll_workflow_activation().await.unwrap();
+    let run_id = activation.run_id.clone();
+    core.complete_workflow_activation(WorkflowActivationCompletion::from_cmds(
+        run_id.clone(),
+        vec![
+            schedule_local_activity_cmd(
+                1,
+                "1",
+                ActivityCancellationType::Abandon,
+                Duration::from_secs(60),
+            ),
+            schedule_local_activity_cmd(
+                2,
+                "2",
+                ActivityCancellationType::WaitCancellationCompleted,
+                Duration::from_secs(60),
+            ),
+        ],
+    ))
+    .await
+    .unwrap();
+    let mut starts = HashMap::new();
+    for _ in 0..2 {
+        let task = core.poll_activity_task().await.unwrap();
+        let Some(activity_task::Variant::Start(start)) = &task.variant else {
+            panic!("Expected LA start, got {task:?}");
+        };
+        starts.insert(start.activity_id.clone(), task.task_token);
+    }
+    let la1_token = starts.remove("1").unwrap();
+    let la2_token = starts.remove("2").unwrap();
+
+    core.complete_activity_task(ActivityTaskCompletion {
+        task_token: la2_token,
+        result: Some(ActivityExecutionResult::ok(vec![1].into())),
+    })
+    .await
+    .unwrap();
+    let activation = core.poll_workflow_activation().await.unwrap();
+    assert_matches!(
+        activation.jobs.as_slice(),
+        [WorkflowActivationJob {
+            variant: Some(workflow_activation_job::Variant::ResolveActivity(
+                ResolveActivity { seq: 2, .. }
+            )),
+        }]
+    );
+    // Abandon resolves the LA at once while lang keeps running it, as sdk-python's
+    // test_workflow_cancel_activity does before completing the workflow
+    core.complete_workflow_activation(WorkflowActivationCompletion::from_cmd(
+        run_id.clone(),
+        RequestCancelLocalActivity { seq: 1 }.into(),
+    ))
+    .await
+    .unwrap();
+    let activation = core.poll_workflow_activation().await.unwrap();
+    assert_matches!(
+        activation.jobs.as_slice(),
+        [WorkflowActivationJob {
+            variant: Some(workflow_activation_job::Variant::ResolveActivity(
+                ResolveActivity {
+                    seq: 1,
+                    result: Some(ActivityResolution {
+                        status: Some(activity_resolution::Status::Cancelled(_)),
+                    }),
+                    ..
+                }
+            )),
+        }]
+    );
+    core.complete_workflow_activation(WorkflowActivationCompletion::from_cmd(
+        run_id.clone(),
+        CompleteWorkflowExecution { result: None }.into(),
+    ))
+    .await
+    .unwrap();
+    assert_eq!(core.cached_workflows().await, 1);
+
+    // The workflow-completion eviction must wait for the abandoned LA's cancel to be polled
+    let wf_poll = core.poll_workflow_activation();
+    advance_fut!(wf_poll);
+
+    let cancel = core.poll_activity_task().await.unwrap();
+    assert_eq!(cancel.task_token, la1_token);
+    assert_matches!(
+        cancel.variant,
+        Some(activity_task::Variant::Cancel(Cancel { reason, .. }))
+            if reason == ActivityCancelReason::Cancelled as i32
+    );
+
+    let eviction = wf_poll.await.unwrap();
+    assert_matches!(
+        eviction.jobs.as_slice(),
+        [WorkflowActivationJob {
+            variant: Some(workflow_activation_job::Variant::RemoveFromCache(rfc)),
+        }] if rfc.reason == EvictionReason::WorkflowExecutionEnding as i32
+    );
+    core.complete_workflow_activation(WorkflowActivationCompletion::empty(eviction.run_id))
+        .await
+        .unwrap();
+    core.complete_activity_task(ActivityTaskCompletion {
+        task_token: cancel.task_token,
+        result: Some(ActivityExecutionResult::cancel_from_details(None)),
+    })
+    .await
+    .unwrap();
+    assert_eq!(core.cached_workflows().await, 0);
+    drain_pollers_and_shutdown(&core).await;
+}
+
+#[tokio::test]
+async fn la_results_during_withheld_eviction_do_not_surface() {
+    let mut t = TestHistoryBuilder::default();
+    t.add_wfe_started_with_wft_timeout(Duration::from_secs(60));
+    t.add_workflow_task_scheduled_and_started();
+    let mut mock_cfg = MockPollCfg::from_resp_batches("fake_wf_id", t, [1], mock_worker_client());
+    mock_cfg.make_poll_stream_interminable = true;
+    let mut mock = build_mock_pollers(mock_cfg);
+    mock.worker_cfg(|wc| wc.max_cached_workflows = 1);
+    let core = mock_worker(mock);
+
+    let activation = core.poll_workflow_activation().await.unwrap();
+    let run_id = activation.run_id.clone();
+    core.complete_workflow_activation(WorkflowActivationCompletion::from_cmds(
+        run_id.clone(),
+        vec![
+            schedule_local_activity_cmd(
+                1,
+                "1",
+                ActivityCancellationType::WaitCancellationCompleted,
+                Duration::from_secs(60),
+            ),
+            schedule_local_activity_cmd(
+                2,
+                "2",
+                ActivityCancellationType::WaitCancellationCompleted,
+                Duration::from_secs(60),
+            ),
+        ],
+    ))
+    .await
+    .unwrap();
+    let mut start_tokens = HashSet::new();
+    for _ in 0..2 {
+        let task = core.poll_activity_task().await.unwrap();
+        assert_matches!(task.variant, Some(activity_task::Variant::Start(_)));
+        start_tokens.insert(task.task_token);
+    }
+
+    core.request_workflow_eviction(&run_id);
+    assert_eq!(core.cached_workflows().await, 1);
+
+    // Lang reacts to the first cancel while the other LA's cancel is still queued, so the
+    // eviction is still withheld when the cancelled result arrives
+    let first_cancel = core.poll_activity_task().await.unwrap();
+    assert!(start_tokens.remove(&first_cancel.task_token));
+    assert_matches!(
+        first_cancel.variant,
+        Some(activity_task::Variant::Cancel(_))
+    );
+    core.complete_activity_task(ActivityTaskCompletion {
+        task_token: first_cancel.task_token,
+        result: Some(ActivityExecutionResult::cancel_from_details(None)),
+    })
+    .await
+    .unwrap();
+    // GetStateInfo rides the stream's FIFO local channel, so once it answers the resolution has
+    // been processed
+    assert_eq!(core.cached_workflows().await, 1);
+    // A cancellation the eviction itself caused must not reach workflow code as an activation
+    let wf_poll = core.poll_workflow_activation();
+    advance_fut!(wf_poll);
+
+    let second_cancel = core.poll_activity_task().await.unwrap();
+    assert!(start_tokens.remove(&second_cancel.task_token));
+    assert_matches!(
+        second_cancel.variant,
+        Some(activity_task::Variant::Cancel(_))
+    );
+
+    let eviction = wf_poll.await.unwrap();
+    assert_matches!(
+        eviction.jobs.as_slice(),
+        [WorkflowActivationJob {
+            variant: Some(workflow_activation_job::Variant::RemoveFromCache(rfc)),
+        }] if rfc.reason == EvictionReason::LangRequested as i32
+    );
+    core.complete_workflow_activation(WorkflowActivationCompletion::empty(eviction.run_id))
+        .await
+        .unwrap();
+    core.complete_activity_task(ActivityTaskCompletion {
+        task_token: second_cancel.task_token,
+        result: Some(ActivityExecutionResult::cancel_from_details(None)),
+    })
+    .await
+    .unwrap();
+    assert_eq!(core.cached_workflows().await, 0);
+    drain_pollers_and_shutdown(&core).await;
+}
+
+#[tokio::test]
+async fn la_result_before_its_cancel_is_polled_releases_withheld_eviction() {
+    let mut t = TestHistoryBuilder::default();
+    t.add_wfe_started_with_wft_timeout(Duration::from_secs(60));
+    t.add_workflow_task_scheduled_and_started();
+    let mut mock_cfg = MockPollCfg::from_resp_batches("fake_wf_id", t, [1], mock_worker_client());
+    mock_cfg.make_poll_stream_interminable = true;
+    let mut mock = build_mock_pollers(mock_cfg);
+    mock.worker_cfg(|wc| wc.max_cached_workflows = 1);
+    let core = mock_worker(mock);
+
+    let activation = core.poll_workflow_activation().await.unwrap();
+    let run_id = activation.run_id.clone();
+    core.complete_workflow_activation(WorkflowActivationCompletion::from_cmd(
+        run_id.clone(),
+        schedule_local_activity_cmd(
+            1,
+            "1",
+            ActivityCancellationType::WaitCancellationCompleted,
+            Duration::from_secs(60),
+        ),
+    ))
+    .await
+    .unwrap();
+    let la_start = core.poll_activity_task().await.unwrap();
+    assert_matches!(la_start.variant, Some(activity_task::Variant::Start(_)));
+
+    core.request_workflow_eviction(&run_id);
+    assert_eq!(core.cached_workflows().await, 1);
+
+    // Lang finishes the LA before its activity poll reaches the cancel. The evicting run cannot
+    // use the result, and with the attempt gone there is nothing left to deliver a cancel to, so
+    // the eviction goes out instead of a resolution.
+    core.complete_activity_task(ActivityTaskCompletion {
+        task_token: la_start.task_token,
+        result: Some(ActivityExecutionResult::ok(vec![1].into())),
+    })
+    .await
+    .unwrap();
+    let eviction = core.poll_workflow_activation().await.unwrap();
+    assert_matches!(
+        eviction.jobs.as_slice(),
+        [WorkflowActivationJob {
+            variant: Some(workflow_activation_job::Variant::RemoveFromCache(rfc)),
+        }] if rfc.reason == EvictionReason::LangRequested as i32
+    );
+    core.complete_workflow_activation(WorkflowActivationCompletion::empty(eviction.run_id))
+        .await
+        .unwrap();
+    assert_eq!(core.cached_workflows().await, 0);
+    // The cancel left in the queue is for an attempt that is no longer tracked and is discarded
+    // when the poller drains it
+    drain_pollers_and_shutdown(&core).await;
+}
+
+#[tokio::test]
+async fn queued_la_cancelled_by_eviction_does_not_surface() {
+    let mut t = TestHistoryBuilder::default();
+    t.add_wfe_started_with_wft_timeout(Duration::from_secs(60));
+    t.add_workflow_task_scheduled_and_started();
+    let mut mock_cfg = MockPollCfg::from_resp_batches("fake_wf_id", t, [1], mock_worker_client());
+    mock_cfg.make_poll_stream_interminable = true;
+    let mut mock = build_mock_pollers(mock_cfg);
+    mock.worker_cfg(|wc| {
+        wc.max_cached_workflows = 1;
+        // A single slot keeps the second LA waiting for dispatch behind the first
+        wc.max_outstanding_local_activities = Some(1);
+    });
+    let core = mock_worker(mock);
+
+    let activation = core.poll_workflow_activation().await.unwrap();
+    let run_id = activation.run_id.clone();
+    core.complete_workflow_activation(WorkflowActivationCompletion::from_cmds(
+        run_id.clone(),
+        vec![
+            schedule_local_activity_cmd(
+                1,
+                "1",
+                ActivityCancellationType::WaitCancellationCompleted,
+                Duration::from_secs(60),
+            ),
+            schedule_local_activity_cmd(
+                2,
+                "2",
+                ActivityCancellationType::WaitCancellationCompleted,
+                Duration::from_secs(60),
+            ),
+        ],
+    ))
+    .await
+    .unwrap();
+    let la_start = core.poll_activity_task().await.unwrap();
+    assert_matches!(la_start.variant, Some(activity_task::Variant::Start(_)));
+
+    core.request_workflow_eviction(&run_id);
+    assert_eq!(core.cached_workflows().await, 1);
+    // Cancelling resolved the never-dispatched LA on the spot. That cancellation must not become
+    // an activation while the dispatched LA's cancel is still waiting to be polled.
+    let wf_poll = core.poll_workflow_activation();
+    advance_fut!(wf_poll);
+
+    let cancel = core.poll_activity_task().await.unwrap();
+    assert_eq!(cancel.task_token, la_start.task_token);
+    assert_matches!(cancel.variant, Some(activity_task::Variant::Cancel(_)));
+
+    let eviction = wf_poll.await.unwrap();
+    assert_matches!(
+        eviction.jobs.as_slice(),
+        [WorkflowActivationJob {
+            variant: Some(workflow_activation_job::Variant::RemoveFromCache(rfc)),
+        }] if rfc.reason == EvictionReason::LangRequested as i32
+    );
+    core.complete_workflow_activation(WorkflowActivationCompletion::empty(eviction.run_id))
+        .await
+        .unwrap();
+    core.complete_activity_task(ActivityTaskCompletion {
+        task_token: cancel.task_token,
+        result: Some(ActivityExecutionResult::cancel_from_details(None)),
+    })
+    .await
+    .unwrap();
+    assert_eq!(core.cached_workflows().await, 0);
+    drain_pollers_and_shutdown(&core).await;
+}
+
+#[tokio::test]
+async fn backing_off_la_cancelled_by_eviction_does_not_surface() {
+    let mut t = TestHistoryBuilder::default();
+    t.add_wfe_started_with_wft_timeout(Duration::from_secs(60));
+    t.add_workflow_task_scheduled_and_started();
+    let mut mock_cfg = MockPollCfg::from_resp_batches("fake_wf_id", t, [1], mock_worker_client());
+    mock_cfg.make_poll_stream_interminable = true;
+    let mut mock = build_mock_pollers(mock_cfg);
+    mock.worker_cfg(|wc| wc.max_cached_workflows = 1);
+    let core = mock_worker(mock);
+
+    let activation = core.poll_workflow_activation().await.unwrap();
+    let run_id = activation.run_id.clone();
+    core.complete_workflow_activation(WorkflowActivationCompletion::from_cmd(
+        run_id.clone(),
+        ScheduleLocalActivity {
+            seq: 1,
+            activity_id: "1".to_string(),
+            activity_type: "test_act".to_string(),
+            start_to_close_timeout: Some(Duration::from_secs(60).try_into().unwrap()),
+            // Below the default local retry threshold, so the retry waits inside the worker
+            retry_policy: Some(RetryPolicy {
+                initial_interval: Some(Duration::from_secs(30).try_into().unwrap()),
+                backoff_coefficient: 1.0,
+                maximum_attempts: 5,
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+        .into(),
+    ))
+    .await
+    .unwrap();
+    let la_start = core.poll_activity_task().await.unwrap();
+    assert_matches!(la_start.variant, Some(activity_task::Variant::Start(_)));
+    core.complete_activity_task(ActivityTaskCompletion {
+        task_token: la_start.task_token,
+        result: Some(ActivityExecutionResult::fail("retry me".into())),
+    })
+    .await
+    .unwrap();
+
+    core.request_workflow_eviction(&run_id);
+    assert_eq!(core.cached_workflows().await, 1);
+    // Cancelling the backing-off attempt resolved it on the spot and nothing is left in flight, so
+    // the eviction goes out at once; the cancellation must not precede it
+    let eviction = core.poll_workflow_activation().await.unwrap();
+    assert_matches!(
+        eviction.jobs.as_slice(),
+        [WorkflowActivationJob {
+            variant: Some(workflow_activation_job::Variant::RemoveFromCache(rfc)),
+        }] if rfc.reason == EvictionReason::LangRequested as i32
+    );
+    core.complete_workflow_activation(WorkflowActivationCompletion::empty(eviction.run_id))
+        .await
+        .unwrap();
+    assert_eq!(core.cached_workflows().await, 0);
+    drain_pollers_and_shutdown(&core).await;
+}
+
+#[tokio::test]
+async fn queued_la_cancelled_by_workflow_completion_does_not_surface() {
+    let mut t = TestHistoryBuilder::default();
+    t.add_wfe_started_with_wft_timeout(Duration::from_secs(60));
+    t.add_workflow_task_scheduled_and_started();
+    let mut mock_cfg = MockPollCfg::from_resp_batches("fake_wf_id", t, [1], mock_worker_client());
+    mock_cfg.make_poll_stream_interminable = true;
+    mock_cfg.completion_mock_fn = Some(Box::new(|c| {
+        // Only the completed LA gets a marker; the cancelled one must not be recorded
+        assert_matches!(
+            c.commands.as_slice(),
+            [marker, complete]
+                if marker.command_type() == CommandType::RecordMarker
+                    && complete.command_type() == CommandType::CompleteWorkflowExecution
+        );
+        Ok(Default::default())
+    }));
+    let mut mock = build_mock_pollers(mock_cfg);
+    mock.worker_cfg(|wc| {
+        wc.max_cached_workflows = 1;
+        wc.max_outstanding_local_activities = Some(1);
+    });
+    let core = mock_worker(mock);
+
+    let activation = core.poll_workflow_activation().await.unwrap();
+    let run_id = activation.run_id.clone();
+    core.complete_workflow_activation(WorkflowActivationCompletion::from_cmds(
+        run_id.clone(),
+        vec![
+            schedule_local_activity_cmd(
+                1,
+                "1",
+                ActivityCancellationType::WaitCancellationCompleted,
+                Duration::from_secs(60),
+            ),
+            schedule_local_activity_cmd(
+                2,
+                "2",
+                ActivityCancellationType::WaitCancellationCompleted,
+                Duration::from_secs(60),
+            ),
+        ],
+    ))
+    .await
+    .unwrap();
+    let la_start = core.poll_activity_task().await.unwrap();
+    assert_matches!(la_start.variant, Some(activity_task::Variant::Start(_)));
+    core.complete_activity_task(ActivityTaskCompletion {
+        task_token: la_start.task_token,
+        result: Some(ActivityExecutionResult::ok(vec![1].into())),
+    })
+    .await
+    .unwrap();
+    let activation = core.poll_workflow_activation().await.unwrap();
+    assert_matches!(
+        activation.jobs.as_slice(),
+        [WorkflowActivationJob {
+            variant: Some(workflow_activation_job::Variant::ResolveActivity(_)),
+        }]
+    );
+    // Completing with the other LA still waiting for a slot cancels it; the workflow is done, so
+    // that cancellation has nothing to be delivered to
+    core.complete_workflow_activation(WorkflowActivationCompletion::from_cmd(
+        run_id.clone(),
+        CompleteWorkflowExecution { result: None }.into(),
+    ))
+    .await
+    .unwrap();
+    let eviction = core.poll_workflow_activation().await.unwrap();
+    assert_matches!(
+        eviction.jobs.as_slice(),
+        [WorkflowActivationJob {
+            variant: Some(workflow_activation_job::Variant::RemoveFromCache(rfc)),
+        }] if rfc.reason == EvictionReason::WorkflowExecutionEnding as i32
+    );
+    core.complete_workflow_activation(WorkflowActivationCompletion::empty(eviction.run_id))
+        .await
+        .unwrap();
+    assert_eq!(core.cached_workflows().await, 0);
+    drain_pollers_and_shutdown(&core).await;
 }
 
 #[tokio::test]
