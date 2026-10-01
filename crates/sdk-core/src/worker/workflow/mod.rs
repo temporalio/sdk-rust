@@ -1291,9 +1291,8 @@ pub(crate) struct HeartbeatTimeoutMsg {
 #[derive(Debug)]
 pub(crate) enum LocalActivityNotification {
     HeartbeatTimeout(HeartbeatTimeoutMsg),
-    /// Every queued cancel for the run's in-flight local activities has been handed to lang, so an
-    /// eviction withheld for them can now be produced
-    CancelsDelivered {
+    /// A queued local activity cancel was handed to lang. Recheck whether the run can evict.
+    CancelProcessed {
         run_id: String,
         span: Span,
     },
