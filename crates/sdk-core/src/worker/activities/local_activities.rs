@@ -58,8 +58,6 @@ pub(crate) enum NextPendingLAAction {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CancelDelivery {
     NotRequested,
-    /// A cancel task for this attempt is in the cancel channel but lang has not polled it yet. The
-    /// run's eviction is withheld while any of its attempts is in this state.
     Queued,
     Delivered,
 }
@@ -71,6 +69,12 @@ struct LocalInFlightActInfo {
     attempt: u32,
     cancel: CancelDelivery,
     _permit: UsedMeteredSemPermit<LocalActivitySlotKind>,
+}
+
+impl LocalInFlightActInfo {
+    fn has_undelivered_cancel(&self, run_id: &str) -> bool {
+        self.la_info.workflow_exec_info.run_id == run_id && self.cancel == CancelDelivery::Queued
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -436,10 +440,11 @@ impl LocalActivityManager {
                     let mut dlock = self.dat.lock();
                     // Evictions are withheld until every queued cancel for the run has been
                     // polled, so a queued one here means a cancel is about to be lost
-                    if dlock.outstanding_activity_tasks.values().any(|info| {
-                        info.la_info.workflow_exec_info.run_id == run_id
-                            && info.cancel == CancelDelivery::Queued
-                    }) {
+                    if dlock
+                        .outstanding_activity_tasks
+                        .values()
+                        .any(|info| info.has_undelivered_cancel(&run_id))
+                    {
                         dbg_panic!(
                             "Run {run_id} invalidated while a local activity cancel for it was \
                              still queued"
@@ -484,35 +489,27 @@ impl LocalActivityManager {
         loop {
             let (new_or_retry, permit) = match self.rcvs.lock().await.next().await? {
                 NewOrCancel::Cancel(c) => match c {
-                    CancelOrTimeout::Cancel(c) => {
-                        let last_queued_for_run = {
-                            let mut dlock = self.dat.lock();
-                            let Some(info) = dlock
-                                .outstanding_activity_tasks
-                                .get_mut(c.task_token.as_slice())
-                            else {
-                                // Don't dispatch cancels for things we've already stopped tracking
-                                continue;
-                            };
-                            info.cancel = CancelDelivery::Delivered;
-                            let run_id = info.la_info.workflow_exec_info.run_id.clone();
-                            let more_queued = dlock.outstanding_activity_tasks.values().any(|i| {
-                                i.la_info.workflow_exec_info.run_id == run_id
-                                    && i.cancel == CancelDelivery::Queued
+                    CancelOrTimeout::Cancel(task) => {
+                        let run_id = self
+                            .dat
+                            .lock()
+                            .outstanding_activity_tasks
+                            .get_mut(task.task_token.as_slice())
+                            .map(|info| {
+                                info.cancel = CancelDelivery::Delivered;
+                                info.la_info.workflow_exec_info.run_id.clone()
                             });
-                            (!more_queued).then_some(run_id)
-                        };
-                        if let Some(run_id) = last_queued_for_run {
-                            // The run may be withholding its eviction until now. Nobody listens
-                            // once workflows have shut down, so a send error is fine.
+                        if let Some(run_id) = run_id {
                             let _ = self.workflow_notify_tx.send(
-                                LocalActivityNotification::CancelsDelivered {
+                                LocalActivityNotification::CancelProcessed {
                                     run_id,
                                     span: Span::current(),
                                 },
                             );
+                            return Some(NextPendingLAAction::Dispatch(task));
                         }
-                        return Some(NextPendingLAAction::Dispatch(c));
+                        // Don't dispatch cancels for things we've already stopped tracking
+                        continue;
                     }
                     CancelOrTimeout::Timeout { run_id, resolution } => {
                         let tt = self
@@ -893,16 +890,13 @@ impl LocalActivityManager {
             .sum()
     }
 
-    /// True while a cancel for one of the run's dispatched local activities is in the cancel
-    /// channel but has not yet been returned from an activity poll
+    /// True while an in-flight attempt still needs its queued cancel handed to lang.
     pub(crate) fn has_undelivered_cancels(&self, run_id: &str) -> bool {
         self.dat
             .lock()
             .outstanding_activity_tasks
             .values()
-            .any(|i| {
-                i.la_info.workflow_exec_info.run_id == run_id && i.cancel == CancelDelivery::Queued
-            })
+            .any(|info| info.has_undelivered_cancel(run_id))
     }
 
     fn set_shutdown_complete_if_ready(&self, dlock: &mut MutexGuard<LAMData>) -> bool {
@@ -1386,7 +1380,7 @@ mod tests {
         assert!(!lam.has_undelivered_cancels("run_id"));
         assert_matches!(
             notify_rx.try_recv(),
-            Ok(LocalActivityNotification::CancelsDelivered { run_id, .. }) if run_id == "run_id"
+            Ok(LocalActivityNotification::CancelProcessed { run_id, .. }) if run_id == "run_id"
         );
         // Three cancel requests must have produced exactly one cancel task
         assert!(lam.next_pending().now_or_never().is_none());
