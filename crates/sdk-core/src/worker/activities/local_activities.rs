@@ -68,6 +68,7 @@ struct LocalInFlightActInfo {
     dispatch_time: Instant,
     attempt: u32,
     cancel: CancelDelivery,
+    stop_retries: bool,
     _permit: UsedMeteredSemPermit<LocalActivitySlotKind>,
 }
 
@@ -395,7 +396,7 @@ impl LocalActivityManager {
                     if let Entry::Occupied(mut o) = la_info.entry(id) {
                         let seq = o.key().seq_num;
                         let (remove, res) =
-                            self.cancel_one_la(seq, o.get_mut(), outstanding_activity_tasks);
+                            self.cancel_one_la(seq, o.get_mut(), outstanding_activity_tasks, false);
                         immediate_resolutions.extend(res);
                         if remove {
                             o.remove();
@@ -427,7 +428,7 @@ impl LocalActivityManager {
                         // Resolutions for attempts that were backing off or never dispatched are
                         // dropped here, see the variant's docs
                         let (remove, _) =
-                            self.cancel_one_la(id.seq_num, lai, outstanding_activity_tasks);
+                            self.cancel_one_la(id.seq_num, lai, outstanding_activity_tasks, true);
                         !remove
                     });
                     if la_info.len() != before {
@@ -600,6 +601,7 @@ impl LocalActivityManager {
                     dispatch_time: Instant::now(),
                     attempt,
                     cancel: CancelDelivery::NotRequested,
+                    stop_retries: false,
                     _permit: permit.into_used(LocalActivitySlotInfo {
                         activity_type: sa.activity_type.clone(),
                     }),
@@ -692,12 +694,8 @@ impl LocalActivityManager {
                 };
             }
 
-            // Once a cancel has been requested for an attempt its failure is final, as it is for
-            // server-side activities (RETRY_STATE_CANCEL_REQUESTED). A retried attempt would be
-            // dispatched with no cancel ever following it, and because WillBeRetried never
-            // reaches the workflow, a run withholding its eviction for this cancel would never be
-            // re-evaluated.
-            let cancel_requested = info.cancel != CancelDelivery::NotRequested;
+            // A run being evicted cannot receive WillBeRetried, so retrying here would dispatch
+            // another attempt with no cancel and leave the eviction waiting indefinitely.
             let mut is_timeout = false;
             let runtime = info.dispatch_time.elapsed();
             la_metrics.la_exec_latency(runtime);
@@ -708,7 +706,7 @@ impl LocalActivityManager {
                             .with_new_attrs([failure_reason(fail.cause().into())])
                             .la_execution_failed()
                     }
-                    if cancel_requested {
+                    if info.stop_retries {
                         Outcome::JustReport
                     } else {
                         Outcome::FailurePath {
@@ -723,7 +721,7 @@ impl LocalActivityManager {
                     is_timeout = true;
                     // Start to close timeouts are retryable, other timeout types aren't.
                     if matches!(status.get_timeout_type(), Some(TimeoutType::StartToClose))
-                        && !cancel_requested
+                        && !info.stop_retries
                     {
                         Outcome::FailurePath {
                             backoff: calc_backoff!(fail),
@@ -915,6 +913,7 @@ impl LocalActivityManager {
         seq: u32,
         lai: &mut LocalActivityInfo,
         outstanding: &mut HashMap<TaskToken, LocalInFlightActInfo>,
+        stop_retries: bool,
     ) -> (bool, Option<LocalActivityResolution>) {
         let cancelled_now = || LocalActivityResolution {
             seq,
@@ -931,6 +930,7 @@ impl LocalActivityManager {
             return (true, Some(cancelled_now()));
         }
         if let Some(in_flight) = outstanding.get_mut(&lai.task_token) {
+            in_flight.stop_retries |= stop_retries;
             // Lang reports the result of an attempt it holds, and one cancel task per attempt is
             // enough: CancelAllInRun is re-sunk on every pass while a run is evicting, and the
             // eviction waits on queued cancels, so re-queueing would hold it back indefinitely
@@ -1444,7 +1444,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cancelled_attempt_is_not_retried_locally() {
+    async fn evicted_attempt_is_not_retried_locally() {
         let lam = LocalActivityManager::test(1);
         lam.enqueue([NewLocalAct {
             schedule_cmd: ValidScheduleLA {
@@ -1468,10 +1468,7 @@ mod tests {
         }
         .into()]);
         let start = lam.next_pending().await.unwrap().unwrap();
-        lam.enqueue([LocalActRequest::Cancel(ExecutingLAId {
-            run_id: "run_id".to_string(),
-            seq_num: 1,
-        })]);
+        lam.enqueue([LocalActRequest::CancelAllInRun("run_id".to_string())]);
         let cancel = lam.next_pending().await.unwrap().unwrap();
         assert_matches!(cancel.variant, Some(activity_task::Variant::Cancel(_)));
 

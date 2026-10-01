@@ -47,7 +47,7 @@ relevant information.
   activity poller before the run's eviction activation is issued, so a local activity can no
   longer be left running without ever receiving its cancellation. Evictions no longer
   deliver duplicate cancellation tasks for the same attempt, a local activity attempt that fails
-  after its cancellation was requested is no longer retried locally,
+  after cancellation due to run eviction is no longer retried locally,
   and a local activity cancelled before the activity poller picked it up now resolves as cancelled
   immediately instead of starting. Workflow code is no longer activated with cancellations or
   results of local activities that only came about because their run was being evicted or had
