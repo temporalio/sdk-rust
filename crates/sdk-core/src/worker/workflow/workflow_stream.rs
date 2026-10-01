@@ -140,6 +140,10 @@ impl WFStream {
                             LocalInputs::HeartbeatTimeout(hbt) => {
                                 state.process_heartbeat_timeout(hbt)
                             }
+                            LocalInputs::LocalActivityCancelsDelivered(run_id) => state
+                                .runs
+                                .get_mut(&run_id)
+                                .and_then(|rh| rh.check_more_activations()),
                             LocalInputs::RequestEviction(evict) => {
                                 state.request_eviction(evict).into_run_update_resp()
                             }
@@ -657,11 +661,17 @@ pub(super) struct LocalInput {
     pub(super) input: LocalInputs,
     pub(super) span: Span,
 }
-impl From<HeartbeatTimeoutMsg> for LocalInput {
-    fn from(hb: HeartbeatTimeoutMsg) -> Self {
-        Self {
-            input: LocalInputs::HeartbeatTimeout(hb.run_id),
-            span: hb.span,
+impl From<LocalActivityNotification> for LocalInput {
+    fn from(notification: LocalActivityNotification) -> Self {
+        match notification {
+            LocalActivityNotification::HeartbeatTimeout(hb) => Self {
+                input: LocalInputs::HeartbeatTimeout(hb.run_id),
+                span: hb.span,
+            },
+            LocalActivityNotification::CancelsDelivered { run_id, span } => Self {
+                input: LocalInputs::LocalActivityCancelsDelivered(run_id),
+                span,
+            },
         }
     }
 }
@@ -678,6 +688,9 @@ pub(super) enum LocalInputs {
     PostActivation(Box<PostActivationMsg>),
     RequestEviction(RequestEvictMsg),
     HeartbeatTimeout(String),
+    /// The run's queued local activity cancels have all been handed to lang
+    #[from(ignore)]
+    LocalActivityCancelsDelivered(String),
     GetStateInfo(GetStateInfoMsg),
     BumpStream,
 }
@@ -689,7 +702,8 @@ impl LocalInputs {
             LocalInputs::LocalResolution(lr) => &lr.run_id,
             LocalInputs::PostActivation(pa) => &pa.run_id,
             LocalInputs::RequestEviction(re) => &re.run_id,
-            LocalInputs::HeartbeatTimeout(hb) => hb,
+            LocalInputs::HeartbeatTimeout(run_id)
+            | LocalInputs::LocalActivityCancelsDelivered(run_id) => run_id,
             LocalInputs::GetStateInfo(_) | LocalInputs::BumpStream => return None,
         })
     }
