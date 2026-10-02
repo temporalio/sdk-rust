@@ -1010,6 +1010,7 @@ impl Worker {
                     #[cfg(any(feature = "test-utilities", test))]
                     TaskPollers::Mocked {
                         wft_stream,
+                        drain_wft_stream,
                         act_poller,
                         nexus_poller,
                     } => {
@@ -1036,6 +1037,15 @@ impl Worker {
                             MockPermittedPollBuffer::new(Arc::new(nexus_slots.clone()), np)
                         });
                         let wfs = wft_stream.map(|stream| {
+                            // Mock streams model legacy poll interruption unless a test
+                            // explicitly controls the delivery of tasks during shutdown.
+                            let stream = if drain_wft_stream {
+                                stream.left_stream()
+                            } else {
+                                stream
+                                    .take_until(shutdown_token.clone().cancelled_owned())
+                                    .right_stream()
+                            };
                             let wft_semaphore = wft_slots.clone();
                             let wfs = stream.then(move |s| {
                                 let wft_semaphore = wft_semaphore.clone();
@@ -1632,6 +1642,8 @@ impl Worker {
                 .workers()
                 .unregister_slot_provider(self.worker_instance_key);
         }
+
+        self.client_worker_registrator.slot_provider.shutdown();
 
         // Push a BumpStream message to the workflow activation queue. This ensures that
         // any pending workflow activation polls will resolve, even if there are no other inputs.
@@ -2496,6 +2508,7 @@ pub(crate) enum TaskPollers {
     Real,
     #[cfg(any(feature = "test-utilities", test))]
     Mocked {
+        drain_wft_stream: bool,
         wft_stream: Option<BoxStream<'static, Result<ValidPollWFTQResponse, tonic::Status>>>,
         act_poller: Option<BoxedPoller<PollActivityTaskQueueResponse>>,
         nexus_poller: Option<BoxedPoller<PollNexusTaskQueueResponse>>,

@@ -11,8 +11,9 @@ use crate::{
     },
 };
 use futures_util::{FutureExt, Stream, StreamExt, stream, stream::PollNext};
-use std::{future, sync::Arc};
+use std::sync::Arc;
 use temporalio_common::protos::coresdk::WorkflowSlotInfo;
+use tokio_util::task::TaskTracker;
 use tracing::Span;
 
 /// Transforms incoming validated WFTs and history fetching requests into [PermittedWFT]s ready
@@ -64,10 +65,14 @@ impl WFTExtractor {
         fetch_stream: impl Stream<Item = HistoryFetchReq> + Send + 'static,
     ) -> impl Stream<Item = Result<WFTExtractorOutput, tonic::Status>> + Send + 'static {
         let fetch_client = client.clone();
+        let in_flight = TaskTracker::new();
+        let in_flight_polls = in_flight.clone();
         let wft_stream = wft_stream
             .map(move |stream_in| {
                 let client = client.clone();
+                let pending = in_flight_polls.token();
                 async move {
+                    let _pending = pending;
                     match stream_in {
                         Ok((wft, permit)) => {
                             let run_id = wft.workflow_execution.run_id.clone();
@@ -99,9 +104,13 @@ impl WFTExtractor {
                 .left_future()
                 .left_future()
             })
-            .chain(stream::iter([future::ready(Ok(
-                WFTExtractorOutput::PollerDead,
-            ))
+            .chain(stream::iter([async move {
+                // buffer_unordered may reach EOF while earlier tasks fetch history.
+                // Emit PollerDead only after those tasks have been yielded downstream.
+                in_flight.close();
+                in_flight.wait().await;
+                Ok(WFTExtractorOutput::PollerDead)
+            }
             .right_future()
             .left_future()]));
 
