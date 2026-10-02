@@ -8,6 +8,8 @@ rust-version = "1.88.0"
 default-run = "changelog-release-notes"
 
 [dependencies]
+clap = { version = "4.5", features = ["derive"] }
+thiserror = { workspace = true }
 chrono = { version = "=0.4.45", default-features = false, features = ["clock"] }
 reqwest = { version = "0.13", default-features = false, features = ["blocking", "rustls"] }
 semver = "=1.0.28"
@@ -16,3 +18,6 @@ serde_json = { workspace = true }
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+tempfile = "3"
