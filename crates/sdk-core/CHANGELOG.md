@@ -34,6 +34,8 @@ relevant information.
 ## Unreleased
 
 ### Fixed
+
+* Graceful worker shutdown drains both workflow poll queues, pending history fetches, and reserved eager starts before ending workflow processing, when coordinated poll shutdown is supported by the server.
 * Task-poll targets no longer decrease after cancelled or timed-out polls. Affected pollers still
   retain their slot during backoff, while resource-exhaustion errors still reduce the target.
 * Replay now preserves which local activity results were delivered together for newly recorded

@@ -34,6 +34,8 @@ relevant information.
 ## Unreleased
 
 ### Fixed
+
+* Workers finish workflow tasks already in transit during graceful shutdown when the server supports coordinated poll shutdown.
 * `temporalio-common`'s build script now generates its payload-visitor implementations in a
   stable order. The generated code was emitted in `HashSet`/`HashMap` iteration order, so its
   content changed on every build and a compilation cache such as sccache missed
