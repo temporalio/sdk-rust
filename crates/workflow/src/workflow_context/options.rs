@@ -2,6 +2,8 @@ use std::{collections::HashMap, time::Duration};
 
 use crate::{MemoValues, WorkflowCancellationToken, runtime::types::ContinueAsNewRequest};
 #[cfg(feature = "experimental")]
+use temporalio_common_wasm::VersioningOverride;
+#[cfg(feature = "experimental")]
 use temporalio_common_wasm::protos::temporal::api::enums::v1::ContinueAsNewVersioningBehavior as ProtoContinueAsNewVersioningBehavior;
 use temporalio_common_wasm::{
     ActivityCloseTimeouts, Priority, RetryPolicy,
@@ -519,6 +521,12 @@ pub struct ChildWorkflowOptions {
     pub search_attributes: Option<SearchAttributes>,
     /// Priority for the workflow
     pub priority: Option<Priority>,
+    /// Override the child's worker deployment routing independently of its parent.
+    ///
+    /// When unset, the server's normal child workflow versioning rules apply.
+    /// **Experimental:** Requires Temporal Server 1.32.0 or later.
+    #[cfg(feature = "experimental")]
+    pub versioning_override: Option<VersioningOverride>,
     /// Event group markers to attach to the resulting `StartChildWorkflowExecution` command.
     ///
     /// **Experimental:** Event Groups are not yet fully supported by the Rust SDK. This API may
@@ -579,6 +587,8 @@ impl ChildWorkflowOptions {
                 retry_policy: self.retry_policy.map(Into::into),
                 search_attributes: self.search_attributes.map(|t| t.into_proto()),
                 priority: self.priority.map(Into::into),
+                #[cfg(feature = "experimental")]
+                versioning_override: self.versioning_override.map(Into::into),
                 ..Default::default()
             }),
             self.static_summary,
@@ -830,6 +840,74 @@ fn string_user_metadata(summary: Option<String>, details: Option<String>) -> Opt
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "experimental")]
+    use temporalio_common_wasm::{
+        WorkerDeploymentVersion, protos::temporal::api::workflow::v1::versioning_override,
+    };
+
+    #[cfg(feature = "experimental")]
+    #[test]
+    fn child_versioning_overrides_map_to_command() {
+        let version = WorkerDeploymentVersion::builder()
+            .deployment_name("deployment")
+            .build_id("build")
+            .build();
+        for override_value in [
+            None,
+            Some(VersioningOverride::Pinned(version.clone())),
+            Some(VersioningOverride::AutoUpgrade),
+            Some(VersioningOverride::OneTime(version)),
+        ] {
+            let options = ChildWorkflowOptions::builder()
+                .maybe_versioning_override(override_value.clone())
+                .build();
+            let command = options.into_command(
+                1,
+                "child-workflow".to_string(),
+                Vec::new(),
+                HashMap::new(),
+                "child-id".to_string(),
+            );
+            let Some(workflow_command::Variant::StartChildWorkflowExecution(child)) =
+                command.variant
+            else {
+                panic!("expected child start command");
+            };
+            match (
+                override_value,
+                child.versioning_override.and_then(|value| value.r#override),
+            ) {
+                (None, None) => {}
+                (
+                    Some(VersioningOverride::Pinned(version)),
+                    Some(versioning_override::Override::Pinned(pinned)),
+                ) => {
+                    assert_eq!(
+                        pinned.behavior,
+                        versioning_override::PinnedOverrideBehavior::Pinned as i32
+                    );
+                    let actual = pinned.version.expect("pinned version");
+                    assert_eq!(actual.deployment_name, version.deployment_name);
+                    assert_eq!(actual.build_id, version.build_id);
+                }
+                (
+                    Some(VersioningOverride::AutoUpgrade),
+                    Some(versioning_override::Override::AutoUpgrade(true)),
+                ) => {}
+                (
+                    Some(VersioningOverride::OneTime(version)),
+                    Some(versioning_override::Override::OneTime(one_time)),
+                ) => {
+                    let actual = one_time
+                        .target_deployment_version
+                        .expect("one-time version");
+                    assert_eq!(actual.deployment_name, version.deployment_name);
+                    assert_eq!(actual.build_id, version.build_id);
+                }
+                values => panic!("unexpected override mapping: {values:?}"),
+            }
+        }
+    }
 
     #[test]
     fn activity_cancellation_default_preserves_sdk_behavior() {

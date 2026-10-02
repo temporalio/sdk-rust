@@ -1121,6 +1121,14 @@ void temporal_core_worker_poll_nexus_task(struct TemporalCoreWorker *worker,
                                           void *user_data,
                                           TemporalCoreWorkerPollCallback callback);
 
+/**
+ * Accepts a protobuf-encoded `coresdk.workflow_completion.WorkflowActivationCompletion`.
+ *
+ * Child workflow versioning overrides are carried in
+ * `coresdk.workflow_commands.StartChildWorkflowExecution.versioning_override`, so language SDKs
+ * can configure child routing without a separate C ABI option. Requires Temporal Server 1.32.0
+ * or later.
+ */
 void temporal_core_worker_complete_workflow_activation(struct TemporalCoreWorker *worker,
                                                        struct TemporalCoreByteArrayRef completion,
                                                        void *user_data,

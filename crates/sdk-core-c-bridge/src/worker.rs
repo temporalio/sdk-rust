@@ -781,6 +781,12 @@ pub extern "C" fn temporal_core_worker_poll_nexus_task(
     });
 }
 
+/// Accepts a protobuf-encoded `coresdk.workflow_completion.WorkflowActivationCompletion`.
+///
+/// Child workflow versioning overrides are carried in
+/// `coresdk.workflow_commands.StartChildWorkflowExecution.versioning_override`, so language SDKs
+/// can configure child routing without a separate C ABI option. Requires Temporal Server 1.32.0
+/// or later.
 #[unsafe(no_mangle)]
 pub extern "C" fn temporal_core_worker_complete_workflow_activation(
     worker: *mut Worker,

@@ -3349,6 +3349,18 @@ where
                                     {
                                         StartChildWorkflowExecutionFailedCause::WorkflowAlreadyExists
                                     }
+                                    cause
+                                        if cause == ProtoStartChildCause::NamespaceNotFound as i32 =>
+                                    {
+                                        StartChildWorkflowExecutionFailedCause::NamespaceNotFound
+                                    }
+                                    cause
+                                        if cause
+                                            == ProtoStartChildCause::InvalidVersioningOverride
+                                                as i32 =>
+                                    {
+                                        StartChildWorkflowExecutionFailedCause::InvalidVersioningOverride
+                                    }
                                     _ => StartChildWorkflowExecutionFailedCause::Unknown,
                                 },
                             })
@@ -3607,7 +3619,10 @@ mod tests {
             coresdk::{
                 AsJsonPayloadExt, FromJsonPayloadExt,
                 common::VersioningIntent as ProtoVersioningIntent,
-                workflow_activation::{UpdateRandomSeed, WorkflowActivationJob},
+                workflow_activation::{
+                    ResolveChildWorkflowExecutionStartFailure, UpdateRandomSeed,
+                    WorkflowActivationJob,
+                },
                 workflow_commands::WorkflowCommand,
             },
             temporal::api::{
@@ -3741,6 +3756,56 @@ mod tests {
 
         let ctx = WorkflowContext::from_base(base.clone(), Rc::new(RefCell::new(TestWorkflow)));
         (base, ctx, commands)
+    }
+
+    #[test]
+    fn child_start_failure_preserves_server_cause() {
+        for (raw_cause, expected_cause) in [
+            (
+                ProtoStartChildCause::WorkflowAlreadyExists as i32,
+                StartChildWorkflowExecutionFailedCause::WorkflowAlreadyExists,
+            ),
+            (
+                ProtoStartChildCause::NamespaceNotFound as i32,
+                StartChildWorkflowExecutionFailedCause::NamespaceNotFound,
+            ),
+            (
+                ProtoStartChildCause::InvalidVersioningOverride as i32,
+                StartChildWorkflowExecutionFailedCause::InvalidVersioningOverride,
+            ),
+            (999, StartChildWorkflowExecutionFailedCause::Unknown),
+        ] {
+            let (base, _, _) = patch_test_context(None);
+            let child = base.start_child_workflow(
+                TestWorkflow::run,
+                1,
+                ChildWorkflowOptions::workflow_id("child-id".to_string()),
+            );
+            base.unblock(UnblockEvent::WorkflowStart(
+                1,
+                Box::new(ChildWorkflowStartStatus::Failed(
+                    ResolveChildWorkflowExecutionStartFailure {
+                        workflow_id: "child-id".to_string(),
+                        workflow_type: TestWorkflow.name().to_string(),
+                        cause: raw_cause,
+                    },
+                )),
+            ))
+            .unwrap();
+            let Err(error) = child.now_or_never().expect("child start should resolve") else {
+                panic!("child start should fail");
+            };
+            assert!(matches!(
+                error,
+                ChildWorkflowStartError::StartFailed {
+                    workflow_id,
+                    workflow_type,
+                    cause,
+                } if workflow_id == "child-id"
+                    && workflow_type == TestWorkflow.name()
+                    && cause == expected_cause
+            ));
+        }
     }
 
     struct ShortCircuitFirstTimer {

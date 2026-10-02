@@ -15,6 +15,7 @@ pub mod error;
 mod memo;
 mod priority;
 mod retry_policy;
+mod versioning_override;
 mod workflow_execution;
 pub mod protos {
     //! Protobuf definitions re-exported from `temporalio-protos`.
@@ -34,6 +35,7 @@ pub use search_attributes::{
     SearchAttributeError, SearchAttributeKey, SearchAttributeUpdate, SearchAttributeValue,
     SearchAttributes, Timestamp,
 };
+pub use versioning_override::VersioningOverride;
 pub use worker::WorkerDeploymentVersion;
 pub use workflow_definition::{
     HasWorkflowDefinition, QueryDefinition, SignalDefinition, UntypedWorkflow, UpdateDefinition,

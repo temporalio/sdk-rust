@@ -61,7 +61,7 @@ pub mod workflows;
 pub use cancellation::{WorkflowCancellationError, WorkflowCancellationToken};
 pub use runtime::model::{TimerResult, WorkflowResult, WorkflowTermination};
 pub use temporalio_common_wasm::{
-    ActivityCloseTimeouts, Memo, MemoValue, MemoValues, RetryPolicy,
+    ActivityCloseTimeouts, Memo, MemoValue, MemoValues, RetryPolicy, VersioningOverride,
     error::{
         ActivityExecutionError, CancelExternalWorkflowError, ChildWorkflowExecutionError,
         ChildWorkflowStartError, RetryState, TimeoutType, WorkflowSignalError,

@@ -26,6 +26,10 @@ pub enum StartChildWorkflowExecutionFailedCause {
     Unspecified,
     /// A workflow with the requested ID already exists.
     WorkflowAlreadyExists,
+    /// The child workflow's namespace does not exist.
+    NamespaceNotFound,
+    /// The server rejected the child workflow's versioning override.
+    InvalidVersioningOverride,
     /// A cause introduced by a newer server or API version.
     Unknown,
 }

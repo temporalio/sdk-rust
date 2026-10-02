@@ -680,6 +680,20 @@ impl WFMachinesAdapter for ChildWorkflowMachine {
                 ]
             }
             ChildWorkflowCommand::StartFail(cause) => {
+                let cause = match cause {
+                    StartChildWorkflowExecutionFailedCause::Unspecified => {
+                        wfr::StartChildWorkflowExecutionFailedCause::Unspecified
+                    }
+                    StartChildWorkflowExecutionFailedCause::WorkflowAlreadyExists => {
+                        wfr::StartChildWorkflowExecutionFailedCause::WorkflowAlreadyExists
+                    }
+                    StartChildWorkflowExecutionFailedCause::NamespaceNotFound => {
+                        wfr::StartChildWorkflowExecutionFailedCause::NamespaceNotFound
+                    }
+                    StartChildWorkflowExecutionFailedCause::InvalidVersioningOverride => {
+                        wfr::StartChildWorkflowExecutionFailedCause::InvalidVersioningOverride
+                    }
+                };
                 vec![
                     ResolveChildWorkflowExecutionStart {
                         seq: self.shared_state.lang_sequence_number,
@@ -805,10 +819,183 @@ fn convert_payloads(
 
 #[cfg(test)]
 mod test {
-    use super::*;
+    use super::{super::TemporalStateMachine, *};
     use crate::internal_flags::InternalFlags;
     use rstest::rstest;
     use std::{cell::RefCell, mem::discriminant, rc::Rc};
+    use temporalio_common::protos::{
+        coresdk::workflow_activation::workflow_activation_job,
+        temporal::api::{
+            command::v1::command,
+            deployment::v1::WorkerDeploymentVersion,
+            history::v1::{HistoryEvent, StartChildWorkflowExecutionInitiatedEventAttributes},
+            workflow::v1::{VersioningOverride, versioning_override},
+        },
+    };
+
+    #[rstest]
+    #[case::pinned(Some(versioning_override::Override::Pinned(
+        versioning_override::PinnedOverride {
+            behavior: versioning_override::PinnedOverrideBehavior::Pinned as i32,
+            version: Some(WorkerDeploymentVersion {
+                deployment_name: "child-deployment".into(),
+                build_id: "child-build".into(),
+            }),
+        }
+    )))]
+    #[case::auto_upgrade(Some(versioning_override::Override::AutoUpgrade(true)))]
+    #[case::one_time(Some(versioning_override::Override::OneTime(
+        versioning_override::OneTimeOverride {
+            target_deployment_version: Some(WorkerDeploymentVersion {
+                deployment_name: "child-deployment".into(),
+                build_id: "child-build".into(),
+            }),
+        }
+    )))]
+    #[case::unset(None)]
+    fn child_versioning_override_command(
+        #[case] override_variant: Option<versioning_override::Override>,
+        #[values(false, true)] inherit_build_id: bool,
+    ) {
+        let versioning_override = override_variant.map(|r#override| VersioningOverride {
+            r#override: Some(r#override),
+            ..Default::default()
+        });
+        let NewMachineWithCommand {
+            command,
+            mut machine,
+        } = ChildWorkflowMachine::new_scheduled(
+            StartChildWorkflowExecution {
+                seq: 7,
+                namespace: "namespace".into(),
+                workflow_id: "child-id".into(),
+                workflow_type: "child-type".into(),
+                task_queue: "child-queue".into(),
+                versioning_override: versioning_override.clone(),
+                ..Default::default()
+            },
+            Rc::new(RefCell::new(InternalFlags::default())),
+            inherit_build_id,
+            Default::default(),
+        );
+        let command::Attributes::StartChildWorkflowExecutionCommandAttributes(attrs) = command
+        else {
+            panic!("Expected child start command");
+        };
+        assert_eq!(attrs.versioning_override, versioning_override);
+        #[allow(deprecated)]
+        {
+            assert_eq!(attrs.inherit_build_id, inherit_build_id);
+        }
+        assert_eq!(attrs.task_queue.unwrap().name, "child-queue");
+        assert_eq!(attrs.workflow_id, "child-id");
+        assert!(
+            machine
+                .handle_command(CommandType::StartChildWorkflowExecution)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(machine
+            .handle_event(HistEventData {
+                event: HistoryEvent {
+                    event_id: 10,
+                    event_type: EventType::StartChildWorkflowExecutionInitiated as i32,
+                    attributes: Some(history_event::Attributes::StartChildWorkflowExecutionInitiatedEventAttributes(
+                        StartChildWorkflowExecutionInitiatedEventAttributes {
+                            workflow_id: attrs.workflow_id,
+                            workflow_type: attrs.workflow_type,
+                            versioning_override: attrs.versioning_override,
+                            ..Default::default()
+                        }
+                    )),
+                    ..Default::default()
+                },
+                replaying: true,
+                current_task_is_last_in_history: true,
+            })
+            .unwrap()
+            .is_empty());
+    }
+
+    #[rstest]
+    #[case::already_exists(
+        StartChildWorkflowExecutionFailedCause::WorkflowAlreadyExists,
+        wfr::StartChildWorkflowExecutionFailedCause::WorkflowAlreadyExists
+    )]
+    #[case::namespace_not_found(
+        StartChildWorkflowExecutionFailedCause::NamespaceNotFound,
+        wfr::StartChildWorkflowExecutionFailedCause::NamespaceNotFound
+    )]
+    #[case::invalid_versioning_override(
+        StartChildWorkflowExecutionFailedCause::InvalidVersioningOverride,
+        wfr::StartChildWorkflowExecutionFailedCause::InvalidVersioningOverride
+    )]
+    #[case::unspecified(
+        StartChildWorkflowExecutionFailedCause::Unspecified,
+        wfr::StartChildWorkflowExecutionFailedCause::Unspecified
+    )]
+    fn child_start_failure_activation(
+        #[case] api_cause: StartChildWorkflowExecutionFailedCause,
+        #[case] lang_cause: wfr::StartChildWorkflowExecutionFailedCause,
+        #[values(false, true)] replaying: bool,
+    ) {
+        let mut machine = ChildWorkflowMachine::from_parts(
+            StartEventRecorded {}.into(),
+            SharedState {
+                initiated_event_id: 10,
+                started_event_id: 0,
+                lang_sequence_number: 7,
+                namespace: "namespace".into(),
+                workflow_id: "child-id".into(),
+                run_id: String::new(),
+                workflow_type: "child-type".into(),
+                cancelled_before_sent: false,
+                cancel_type: ChildWorkflowCancellationType::WaitCancellationCompleted,
+                internal_flags: Rc::new(RefCell::new(InternalFlags::default())),
+                annotations: Default::default(),
+            },
+        );
+        let responses = machine
+            .handle_event(HistEventData {
+                event: HistoryEvent {
+                    event_id: 11,
+                    event_type: EventType::StartChildWorkflowExecutionFailed as i32,
+                    attributes: Some(
+                        history_event::Attributes::StartChildWorkflowExecutionFailedEventAttributes(
+                            StartChildWorkflowExecutionFailedEventAttributes {
+                                initiated_event_id: 10,
+                                cause: api_cause as i32,
+                                ..Default::default()
+                            },
+                        ),
+                    ),
+                    ..Default::default()
+                },
+                replaying,
+                current_task_is_last_in_history: true,
+            })
+            .unwrap();
+        assert!(matches!(
+            machine.state(),
+            ChildWorkflowMachineState::StartFailed(_)
+        ));
+        let [MachineResponse::PushWFJob(job)] = responses.as_slice() else {
+            panic!("Expected a single language activation job");
+        };
+        let workflow_activation_job::Variant::ResolveChildWorkflowExecutionStart(start) =
+            &job.variant
+        else {
+            panic!("Expected child start resolution");
+        };
+        assert_eq!(start.seq, 7);
+        let Some(resolve_child_workflow_execution_start::Status::Failed(failure)) = &start.status
+        else {
+            panic!("Expected failed child start resolution");
+        };
+        assert_eq!(failure.workflow_id, "child-id");
+        assert_eq!(failure.workflow_type, "child-type");
+        assert_eq!(failure.cause(), lang_cause);
+    }
 
     #[test]
     fn cancels_ignored_terminal() {

@@ -69,7 +69,7 @@ pub use plugins::{
 pub use replaceable::SharedReplaceableClient;
 pub use retry::RetryOptions;
 pub use rpc_options::{RpcMetadata, RpcMetadataError, RpcOptions};
-pub use temporalio_common::{Memo, RetryPolicy};
+pub use temporalio_common::{Memo, RetryPolicy, VersioningOverride};
 pub use url::Url;
 /// Potentially dangerous TLS related functionality.
 pub mod danger {
@@ -1847,6 +1847,7 @@ fn build_start_workflow_request(
         links: options.links,
         completion_callbacks: options.completion_callbacks,
         priority: Some(options.priority.into()),
+        versioning_override: options.versioning_override.map(Into::into),
         memo,
         header: options.header,
         user_metadata,
@@ -3279,14 +3280,15 @@ mod tests {
         use parking_lot::Mutex;
         use std::sync::atomic::{AtomicUsize, Ordering};
         use temporalio_common::{
-            MemoValues, SignalDefinition,
+            MemoValues, SignalDefinition, WorkerDeploymentVersion,
             data_converters::{
                 DefaultFailureConverter, PayloadCodec, PayloadConversionError, PayloadConverter,
                 SerializationContext, SerializationContextData, TemporalDeserializable,
                 TemporalSerializable,
             },
-            protos::temporal::api::common::v1::{
-                Link, Memo as ProtoMemo, Payload, Priority as ProtoPriority,
+            protos::temporal::api::{
+                common::v1::{Link, Memo as ProtoMemo, Payload, Priority as ProtoPriority},
+                workflow::v1::VersioningOverride as ProtoVersioningOverride,
             },
         };
         use temporalio_macros::{workflow, workflow_methods};
@@ -3322,6 +3324,7 @@ mod tests {
             identity: String,
             links: Vec<Link>,
             priority: Option<ProtoPriority>,
+            versioning_override: Option<ProtoVersioningOverride>,
             ascii_metadata: Option<String>,
             binary_metadata: Option<Vec<u8>>,
             grpc_timeout: Option<String>,
@@ -3410,6 +3413,7 @@ mod tests {
                 recorded.identity = request.identity;
                 recorded.links = request.links;
                 recorded.priority = request.priority;
+                recorded.versioning_override = request.versioning_override;
                 recorded.ascii_metadata = ascii_metadata;
                 recorded.binary_metadata = binary_metadata;
                 recorded.grpc_timeout = grpc_timeout;
@@ -3457,6 +3461,7 @@ mod tests {
                 recorded.identity = request.identity;
                 recorded.links = request.links;
                 recorded.priority = request.priority;
+                recorded.versioning_override = request.versioning_override;
                 recorded.ascii_metadata = ascii_metadata;
                 recorded.binary_metadata = binary_metadata;
                 recorded.grpc_timeout = grpc_timeout;
@@ -3729,6 +3734,49 @@ mod tests {
                 PayloadConverter::default(),
                 SerializationContextData::Workflow(WorkflowSerializationContext::new()),
             )
+        }
+
+        #[rstest::rstest]
+        #[case::unset(None)]
+        #[case::pinned(Some(VersioningOverride::Pinned(
+            WorkerDeploymentVersion::builder().deployment_name("deployment").build_id("build").build()
+        )))]
+        #[case::auto_upgrade(Some(VersioningOverride::AutoUpgrade))]
+        #[case::one_time(Some(VersioningOverride::OneTime(
+            WorkerDeploymentVersion::builder().deployment_name("deployment").build_id("build").build()
+        )))]
+        #[tokio::test]
+        async fn start_workflow_sends_versioning_override(
+            #[case] versioning_override: Option<VersioningOverride>,
+            #[values(false, true)] signal_with_start: bool,
+        ) {
+            let (client, recorded) = mock_client_with_codec(XorCodec);
+            let options = WorkflowStartOptions::new("task-queue", "workflow-id")
+                .maybe_versioning_override(versioning_override.clone())
+                .build();
+            if signal_with_start {
+                client
+                    .signal_with_start_workflow(
+                        TestWorkflow::run,
+                        vec!["initial".to_owned()],
+                        TestWorkflow::test_signal,
+                        vec!["signal".to_owned()],
+                        options,
+                    )
+                    .await
+                    .unwrap();
+            } else {
+                client
+                    .start_workflow(TestWorkflow::run, vec!["initial".to_owned()], options)
+                    .await
+                    .unwrap();
+            }
+            let recorded = recorded.lock();
+            assert_eq!(recorded.calls, 1);
+            assert_eq!(
+                recorded.versioning_override,
+                versioning_override.map(Into::into)
+            );
         }
 
         #[tokio::test]
@@ -4166,7 +4214,7 @@ mod tests {
         use parking_lot::Mutex;
         use std::collections::VecDeque;
         use temporalio_common::{
-            UpdateDefinition, WorkflowDefinition,
+            UpdateDefinition, WorkerDeploymentVersion, WorkflowDefinition,
             data_converters::{GenericPayloadConverter, PayloadConverter},
             protos::temporal::api::{
                 common::v1::{
@@ -4328,8 +4376,19 @@ mod tests {
                 .build()
         }
 
+        #[rstest::rstest]
+        #[case::unset(None)]
+        #[case::pinned(Some(VersioningOverride::Pinned(
+            WorkerDeploymentVersion::builder().deployment_name("deployment").build_id("build").build()
+        )))]
+        #[case::auto_upgrade(Some(VersioningOverride::AutoUpgrade))]
+        #[case::one_time(Some(VersioningOverride::OneTime(
+            WorkerDeploymentVersion::builder().deployment_name("deployment").build_id("build").build()
+        )))]
         #[tokio::test]
-        async fn update_with_start_builds_multi_operation_request() {
+        async fn update_with_start_builds_multi_operation_request(
+            #[case] versioning_override: Option<VersioningOverride>,
+        ) {
             let client = MockMultiOperationClient::new(Vec::new(), []);
             let recorded = client.recorded.clone();
 
@@ -4353,6 +4412,7 @@ mod tests {
                     .update_id("my-update-id".to_owned())
                     .start_header(start_header.clone())
                     .update_header(update_header.clone())
+                    .maybe_versioning_override(versioning_override.clone())
                     .build(),
                 )
                 .await
@@ -4402,6 +4462,7 @@ mod tests {
                                         ProtoWorkflowIdConflictPolicy::UseExisting as i32,
                                     header: Some(start_header),
                                     priority: Some(Default::default()),
+                                    versioning_override: versioning_override.map(Into::into),
                                     ..Default::default()
                                 },
                             )),

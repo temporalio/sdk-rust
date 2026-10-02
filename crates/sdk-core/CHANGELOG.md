@@ -33,6 +33,12 @@ relevant information.
 
 ## Unreleased
 
+### Added
+* Child workflow commands, including those submitted through the C bridge, support pinned,
+  auto-upgrade, and one-time worker deployment versioning overrides on Temporal Server 1.32.0
+  or later. Child-start resolutions distinguish invalid versioning overrides and missing
+  namespaces from other start failures.
+
 ### Fixed
 * Task-poll targets no longer decrease after cancelled or timed-out polls. Affected pollers still
   retain their slot during backoff, while resource-exhaustion errors still reduce the target.

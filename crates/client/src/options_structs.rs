@@ -6,7 +6,7 @@ use crate::{ClientPlugin, ErasedClientPlugin};
 use http::Uri;
 use std::{collections::HashMap, sync::Arc, time::Duration};
 use temporalio_common::{
-    ActivityCloseTimeouts, MemoValues, RetryPolicy,
+    ActivityCloseTimeouts, MemoValues, RetryPolicy, VersioningOverride,
     data_converters::{
         DataConverter, GenericPayloadConverter, PayloadConversionError, PayloadConverter,
         SerializationContext, SerializationContextData, WorkflowSerializationContext,
@@ -543,6 +543,12 @@ pub struct WorkflowStartOptions {
     #[builder(default)]
     pub priority: Priority,
 
+    /// Override the workflow's worker deployment routing. When unset, normal task queue
+    /// routing applies.
+    ///
+    /// **Experimental:** See [`VersioningOverride`] for the available routing behaviors.
+    pub versioning_override: Option<VersioningOverride>,
+
     /// Headers to include with the start request.
     pub header: Option<Header>,
 
@@ -666,6 +672,12 @@ pub struct WorkflowUpdateWithStartOptions {
     #[builder(default)]
     pub priority: Priority,
 
+    /// Override worker deployment routing when this operation starts a new workflow.
+    /// Does not change the routing of an already-running workflow.
+    ///
+    /// **Experimental:** See [`VersioningOverride`] for the available routing behaviors.
+    pub versioning_override: Option<VersioningOverride>,
+
     /// Headers to include with the start operation.
     pub start_header: Option<Header>,
 
@@ -704,6 +716,7 @@ impl WorkflowUpdateWithStartOptions {
             links,
             completion_callbacks,
             priority,
+            versioning_override,
             start_header,
             update_header,
             memo,
@@ -728,6 +741,7 @@ impl WorkflowUpdateWithStartOptions {
                 links,
                 completion_callbacks,
                 priority,
+                versioning_override,
                 header: start_header,
                 memo,
                 static_summary,
