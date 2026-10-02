@@ -399,7 +399,9 @@ impl ManagedRun {
                 Ok(Some(ActivationOrAuto::Autocomplete {
                     run_id: self.run_id().to_string(),
                 }))
-            } else if let Some(wte) = self.trying_to_evict.clone() {
+            } else if let Some(wte) = self.trying_to_evict.clone()
+                && !self.la_cancels_undelivered()
+            {
                 let act =
                     create_evict_activation(self.run_id().to_string(), wte.message, wte.reason);
                 Ok(Some(ActivationOrAuto::LangActivation(act)))
@@ -407,6 +409,16 @@ impl ManagedRun {
                 Ok(None)
             }
         }
+    }
+
+    /// Completing an eviction makes the LA manager forget this run's local activities, so a cancel
+    /// still queued for one of them at that point would be dropped as untracked once polled. The
+    /// eviction is withheld while this is true, and the LA manager wakes the run when a queued
+    /// cancel is handed to lang.
+    fn la_cancels_undelivered(&self) -> bool {
+        self.local_activity_request_sink
+            .as_ref()
+            .is_some_and(|sink| sink.has_undelivered_cancels(self.run_id()))
     }
 
     /// Called whenever lang successfully completes a workflow activation. Commands produced by the
@@ -873,6 +885,17 @@ impl ManagedRun {
         &mut self,
         res: LocalResolution,
     ) -> Result<Option<ActivationOrAuto>, RunUpdateErr> {
+        // When the eviction is the only work left, its activation would already be outstanding
+        // were it not withheld for undelivered local activity cancels, and a result arriving then
+        // would be thrown away with the run. Applying it instead would let the cancellation the
+        // eviction itself caused reach workflow code as an activation ahead of the eviction, and
+        // the completion lang sends in reaction would be recorded in history.
+        if self.trying_to_evict.is_some() && self.activation.is_none() && !self.more_pending_work()
+        {
+            debug!(resolution=?res, "Discarding local resolution for run about to be evicted");
+            // The resolved attempt leaving the LA manager may be what lets the eviction go out
+            return self._check_more_activations();
+        }
         debug!(resolution=?res, "Applying local resolution");
         self.wfm.notify_of_local_result(res)?;
         if self.activation.is_none() {
@@ -976,7 +999,7 @@ impl ManagedRun {
                     run_id=%info.run_id,
                     reason=?info.reason,
                     outstanding_local_activities=outstanding_las,
-                    "Eviction requested while local activities are still in flight; local activities when using max_cached_workflows=0 are likely to be dropped or retried"
+                    "Eviction requested while local activities are still in flight; local activities when using max_cached_workflows=0 are cancelled and will be re-executed on replay"
                 );
             }
             debug!(run_id=%info.run_id, reason=%info.message, "Eviction requested");
@@ -1056,7 +1079,10 @@ impl ManagedRun {
                         if let Some(reason) = self.trying_to_evict.as_ref() {
                             // If we had nothing to do, but we're trying to evict, just do that now
                             // as long as there's no other outstanding work.
-                            if self.activation.is_none() && !self.more_pending_work() {
+                            if self.activation.is_none()
+                                && !self.more_pending_work()
+                                && !self.la_cancels_undelivered()
+                            {
                                 let mut evict_act = create_evict_activation(
                                     self.run_id().to_string(),
                                     reason.message.clone(),

@@ -448,6 +448,80 @@ async fn cancel_immediate(#[case] cancel_type: ActivityCancellationType) {
         .unwrap();
 }
 
+#[tokio::test]
+async fn ordinary_failure_after_local_activity_cancel_retries() {
+    let wf_name = "ordinary_failure_after_local_activity_cancel_retries";
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let mut starter = CoreWfStarter::new(wf_name);
+
+    struct FailAfterCancel {
+        attempts: Arc<AtomicUsize>,
+    }
+    #[activities]
+    impl FailAfterCancel {
+        #[activity]
+        async fn run(self: Arc<Self>, ctx: ActivityContext, _: ()) -> Result<(), ActivityError> {
+            let attempt = self.attempts.fetch_add(1, Ordering::SeqCst) + 1;
+            if attempt == 1 {
+                ctx.cancelled().await;
+            }
+            Err(anyhow!("ordinary failure on attempt {attempt}").into())
+        }
+    }
+
+    #[workflow]
+    #[derive(Default)]
+    struct CancelThenFail;
+
+    #[workflow_methods]
+    impl CancelThenFail {
+        #[run]
+        async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<()> {
+            let la = ctx.execute_local_activity(
+                FailAfterCancel::run,
+                (),
+                LocalActivityOptions::builder()
+                    .cancel_type(ActivityCancellationType::WaitCancellationCompleted)
+                    .retry_policy(
+                        RetryPolicy {
+                            initial_interval: Some(prost_dur!(from_millis(10))),
+                            backoff_coefficient: 1.,
+                            maximum_interval: Some(prost_dur!(from_millis(10))),
+                            maximum_attempts: 2,
+                            ..Default::default()
+                        }
+                        .into(),
+                    )
+                    .build(),
+            );
+            ctx.timer(Duration::from_secs(1)).await;
+            la.cancel();
+            let _ = la.await;
+            Ok(())
+        }
+    }
+
+    starter.sdk_config.register_activities(FailAfterCancel {
+        attempts: attempts.clone(),
+    });
+    starter
+        .sdk_config
+        .register_workflow::<CancelThenFail>()
+        .unwrap();
+    let mut worker = starter.worker().await;
+    let task_queue = starter.get_task_queue().to_owned();
+    worker
+        .submit_workflow(
+            CancelThenFail::run,
+            (),
+            WorkflowStartOptions::new(task_queue, wf_name.to_owned()).build(),
+        )
+        .await
+        .unwrap();
+    worker.run_until_done().await.unwrap();
+    assert_eq!(attempts.load(Ordering::SeqCst), 2);
+}
+
 struct LACancellerInterceptor {
     token: CancellationToken,
     cancel_on_workflow_completed: bool,

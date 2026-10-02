@@ -40,6 +40,19 @@ relevant information.
   namespaces from other start failures.
 
 ### Fixed
+* Local activities still running when their workflow run is evicted (cache full, workflow
+  completion, worker shutdown, task failures) now have their cancellation delivered to the
+  activity poller before the run's eviction activation is issued, so a local activity can no
+  longer be left running without ever receiving its cancellation. Evictions no longer
+  deliver duplicate cancellation tasks for the same attempt, a local activity attempt that fails
+  after cancellation due to run eviction is no longer retried locally,
+  and a local activity cancelled before the activity poller picked it up now resolves as cancelled
+  immediately instead of starting. Workflow code is no longer activated with cancellations or
+  results of local activities that only came about because their run was being evicted or had
+  completed (previously a local activity backing off between retries at that point surfaced a
+  cancellation the workflow never requested). A worker with local activities enabled must keep
+  polling activity tasks until the poll reports shutdown: evictions of runs with in-flight local
+  activities wait for that poll.
 * Task-poll targets no longer decrease after cancelled or timed-out polls. Affected pollers still
   retain their slot during backoff, while resource-exhaustion errors still reduce the target.
 * Replay now preserves which local activity results were delivered together for newly recorded
