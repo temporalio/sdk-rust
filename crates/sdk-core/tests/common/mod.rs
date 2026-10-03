@@ -1322,6 +1322,8 @@ pub(crate) fn integ_dev_server_config(
             "--dynamic-config-value".to_owned(),
             "frontend.workerCommandsEnabled=true".to_owned(),
             "--dynamic-config-value".to_owned(),
+            "frontend.WorkflowPauseEnabled=true".to_owned(),
+            "--dynamic-config-value".to_owned(),
             "system.enableCancelActivityWorkerCommand=true".to_owned(),
             "--dynamic-config-value".to_owned(),
             "history.enableWorkflowTaskCompletionPagination=true".to_owned(),

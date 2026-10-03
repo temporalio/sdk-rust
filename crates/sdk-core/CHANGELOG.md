@@ -40,6 +40,8 @@ relevant information.
   namespaces from other start failures.
 
 ### Fixed
+* Workers now replay workflows paused before a scheduled task starts, allowing those workflows to
+  make progress after unpause.
 * Task-poll targets no longer decrease after cancelled or timed-out polls. Affected pollers still
   retain their slot during backoff, while resource-exhaustion errors still reduce the target.
 * Replay now preserves which local activity results were delivered together for newly recorded

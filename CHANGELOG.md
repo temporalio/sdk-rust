@@ -46,6 +46,8 @@ relevant information.
   are now distinguished by `StartChildWorkflowExecutionFailedCause::NamespaceNotFound`.
 
 ### Fixed
+* Workflows paused before a scheduled workflow task starts now resume after unpause instead of
+  failing during history replay.
 * `temporalio-common`'s build script now generates its payload-visitor implementations in a
   stable order. The generated code was emitted in `HashSet`/`HashMap` iteration order, so its
   content changed on every build and a compilation cache such as sccache missed

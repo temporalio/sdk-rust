@@ -21,8 +21,10 @@ use crate::{
 use futures_util::{FutureExt, stream};
 use mockall::TimesRange;
 use rstest::{fixture, rstest};
+use siphasher::sip::SipHasher13;
 use std::{
     collections::{HashMap, HashSet, VecDeque},
+    hash::{Hash, Hasher},
     sync::{
         Arc,
         atomic::{AtomicU64, AtomicUsize, Ordering},
@@ -627,6 +629,9 @@ async fn workflow_update_random_seed_on_workflow_reset() {
     let new_run_id = "86E39A5F-AE31-4626-BDFE-398EE072D156";
     let timer_1_id = 1;
     let randomness_seed_from_start = AtomicU64::new(0);
+    let mut hasher = SipHasher13::new();
+    new_run_id.hash(&mut hasher);
+    let expected_reset_seed = hasher.finish();
 
     let t = canned_histories::workflow_fails_with_reset_after_timer(
         timer_1_id.to_string().as_str(),
@@ -668,6 +673,7 @@ async fn workflow_update_random_seed_on_workflow_reset() {
                         ] => {
                             assert_ne!(randomness_seed_from_start.load(Ordering::SeqCst),
                                       *randomness_seed);
+                            assert_eq!(*randomness_seed, expected_reset_seed);
                         }
                     );
                 },
