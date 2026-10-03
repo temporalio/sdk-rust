@@ -40,6 +40,10 @@ relevant information.
   namespaces from other start failures.
 
 ### Fixed
+* Core-backed workers no longer discard newer polled workflow tasks when an older task arrives
+  in a completion response, including during workflow eviction.
+* Core-backed workers preserve pending queries across buffered task replacement and
+  workflow eviction, including while history is fetched for a pending task.
 * Task-poll targets no longer decrease after cancelled or timed-out polls. Affected pollers still
   retain their slot during backoff, while resource-exhaustion errors still reduce the target.
 * Replay now preserves which local activity results were delivered together for newly recorded

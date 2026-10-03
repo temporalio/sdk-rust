@@ -696,11 +696,11 @@ impl ManagedRun {
     /// It will delete the currently tracked workflow activation (if there is one) and `pred`
     /// evaluates to true. In the event the activation was an eviction, the bool part of the return
     /// tuple is true. The [BufferedTasks] part will contain any buffered tasks that may still exist
-    /// and need to be instantiated into a new instance of the run, if a `wft_from_complete` was
-    /// provided, it will supersede any real WFTs in the buffer as by definition those are now
-    /// out-of-date.
+    /// and need to be instantiated into a new instance of the run. A completion-returned task
+    /// retains its own slot alongside any polled task until both can be processed.
     pub(super) fn finish_activation(
         &mut self,
+        wft_from_completion: Option<PermittedWFT>,
         pred: impl FnOnce(&OutstandingActivation) -> bool,
     ) -> (bool, BufferedTasks) {
         let evict = if self.activation().map(pred).unwrap_or_default() {
@@ -710,6 +710,9 @@ impl ManagedRun {
         } else {
             false
         };
+        if let Some(task) = wft_from_completion {
+            self.task_buffer.buffer_from_completion(task);
+        }
         if evict && let Some(sink) = self.local_activity_request_sink.as_deref() {
             let immediate_resolutions = sink.sink_reqs(vec![LocalActRequest::InvalidateRun(
                 self.wfm.machines.run_id.clone(),
@@ -928,22 +931,29 @@ impl ManagedRun {
         self.wft.is_some() || buffered || self.more_pending_work() || act_work || evict_work
     }
 
-    /// Stores some work if there is any outstanding WFT or activation for the run. If there was
-    /// not, returns the work back out inside the option.
-    pub(super) fn buffer_wft_if_outstanding_work(
+    /// Transfers buffered work without changing task sources. Returns it if the run can admit it.
+    pub(super) fn buffer_tasks_if_outstanding_work(
         &mut self,
-        work: PermittedWFT,
-    ) -> Option<PermittedWFT> {
+        work: BufferedTasks,
+    ) -> Option<BufferedTasks> {
         let about_to_issue_evict = self.trying_to_evict.is_some();
         let has_activation = self.activation().is_some();
-        if has_activation || about_to_issue_evict || self.more_pending_work() {
+        if has_activation
+            || about_to_issue_evict
+            || self.more_pending_work()
+            || self.task_buffer.has_tasks()
+        {
             debug!(run_id = %self.run_id(),
                    "Got new WFT for a run with outstanding work, buffering it act: {:?} wft: {:?} about to evict: {:?}", &self.activation(), &self.wft, about_to_issue_evict);
-            self.task_buffer.buffer(work);
+            self.task_buffer.append(work);
             None
         } else {
             Some(work)
         }
+    }
+
+    pub(super) fn append_buffered_tasks(&mut self, tasks: BufferedTasks) {
+        self.task_buffer.append(tasks);
     }
 
     /// Returns true if there is a buffered workflow task for this run.

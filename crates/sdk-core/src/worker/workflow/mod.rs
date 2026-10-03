@@ -1329,58 +1329,94 @@ impl WFTReportStatus {
 }
 #[derive(Debug, Default)]
 struct BufferedTasks {
-    /// There should only be one buffered actual WFT at a time, since any new one will immediately
-    /// supersede any old one.
+    /// A later polled task supersedes the previous polled task.
     wft: Option<PermittedWFT>,
-    /// For query only tasks, multiple may be received concurrently and it's OK to buffer more
-    /// than one - however they must all be handled before applying the next "real" wft (after the
-    /// current one has been processed).
+    /// Completion and poll RPCs can arrive out of order, including across history branches.
+    /// Keep the returned task separate until it is processed or rejected by the server.
+    completion_returned: Option<PermittedWFT>,
+    /// Query-only tasks have independent response tokens and must precede real history work.
     query_only_tasks: VecDeque<PermittedWFT>,
-    /// These are query-only tasks for the *buffered* wft, if any. They will all be discarded if
-    /// a buffered wft is replaced before being handled.
-    query_only_tasks_for_buffered: VecDeque<PermittedWFT>,
+}
+
+#[derive(Debug)]
+enum BufferedTaskSource {
+    Query,
+    Completion,
+    Poll,
 }
 
 impl BufferedTasks {
-    /// Buffers a new task. If it is a query-only task, multiple such tasks may be buffered which
-    /// all will be handled at the end of the current WFT. If a new WFT which would advance history
-    /// is provided, it will be buffered - but if another such task comes in while there is already
-    /// one buffered, the old one will be overriden, and all queries will be invalidated.
     fn buffer(&mut self, task: PermittedWFT) {
         if task.work.is_query_only() {
-            if self.wft.is_none() {
-                self.query_only_tasks.push_back(task);
-            } else {
-                self.query_only_tasks_for_buffered.push_back(task);
-            }
+            self.query_only_tasks.push_back(task);
         } else {
-            if self.wft.is_some() {
-                self.query_only_tasks_for_buffered.clear();
+            self.wft = Some(task);
+        }
+    }
+
+    fn buffer_from_completion(&mut self, task: PermittedWFT) {
+        if task.work.is_query_only() {
+            self.query_only_tasks.push_back(task);
+        } else {
+            assert!(
+                self.completion_returned.is_none(),
+                "Completion task already buffered"
+            );
+            self.completion_returned = Some(task);
+        }
+    }
+
+    fn append(&mut self, mut tasks: Self) {
+        self.query_only_tasks.append(&mut tasks.query_only_tasks);
+        if let Some(task) = tasks.wft {
+            self.wft = Some(task);
+        }
+        if let Some(task) = tasks.completion_returned {
+            self.buffer_from_completion(task);
+        }
+    }
+
+    /// Restore the selected admission after a history fetch if the cache is now full.
+    /// Tasks received during the fetch must not overtake its Query or replace its completion task.
+    fn restore_selected(&mut self, task: PermittedWFT, source: BufferedTaskSource) {
+        match source {
+            BufferedTaskSource::Query => self.query_only_tasks.push_front(task),
+            BufferedTaskSource::Completion => self.buffer_from_completion(task),
+            BufferedTaskSource::Poll => {
+                if self.wft.is_none() {
+                    self.wft = Some(task);
+                }
             }
-            let _ = self.wft.insert(task);
         }
     }
 
     fn has_tasks(&self) -> bool {
-        self.wft.is_some() || !self.query_only_tasks.is_empty()
+        self.wft.is_some()
+            || self.completion_returned.is_some()
+            || !self.query_only_tasks.is_empty()
     }
 
-    /// Remove and return the next WFT from the buffer that should be applied. Queries are returned
-    /// first for the current workflow task, if there are any. If not, the next WFT that would
-    /// advance history is returned.
+    fn run_id(&self) -> Option<&str> {
+        self.query_only_tasks
+            .front()
+            .or(self.completion_returned.as_ref())
+            .or(self.wft.as_ref())
+            .map(|task| task.work.execution.run_id.as_str())
+    }
+
+    fn pop_next(&mut self) -> Option<(BufferedTaskSource, PermittedWFT)> {
+        if let Some(task) = self.query_only_tasks.pop_front() {
+            Some((BufferedTaskSource::Query, task))
+        } else if let Some(task) = self.completion_returned.take() {
+            Some((BufferedTaskSource::Completion, task))
+        } else {
+            self.wft.take().map(|task| (BufferedTaskSource::Poll, task))
+        }
+    }
+
+    /// Queries use the current state before completion-returned or polled tasks advance history.
     fn get_next_wft(&mut self) -> Option<PermittedWFT> {
-        if let Some(q) = self.query_only_tasks.pop_front() {
-            return Some(q);
-        }
-        if self.wft.is_some() {
-            if let Some(q) = self.query_only_tasks_for_buffered.pop_front() {
-                return Some(q);
-            }
-            if let Some(t) = self.wft.take() {
-                return Some(t);
-            }
-        }
-        None
+        self.pop_next().map(|(_, task)| task)
     }
 }
 
