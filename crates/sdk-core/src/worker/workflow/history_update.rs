@@ -483,6 +483,7 @@ impl HistoryUpdate {
             all_events.as_slice(),
             previous_wft_started_id,
             has_last_wft,
+            previous_wft_started_id,
         );
         if matches!(last_end, NextWFTSeqEndIndex::Incomplete(_)) {
             return if has_last_wft {
@@ -519,6 +520,7 @@ impl HistoryUpdate {
                 &all_events[next_end_ix..],
                 next_end_eid,
                 has_last_wft,
+                previous_wft_started_id,
             )
             .add(next_end_ix);
             if matches!(next_end, NextWFTSeqEndIndex::Incomplete(_)) {
@@ -579,8 +581,12 @@ impl HistoryUpdate {
         if let Some(ix_first_relevant) = self.starting_index_after_skipping(from_wft_started_id) {
             self.events.drain(0..ix_first_relevant);
         }
-        let next_wft_ix =
-            find_end_index_of_next_wft_seq(&self.events, from_wft_started_id, self.has_last_wft);
+        let next_wft_ix = find_end_index_of_next_wft_seq(
+            &self.events,
+            from_wft_started_id,
+            self.has_last_wft,
+            self.previous_wft_started_id,
+        );
         match next_wft_ix {
             NextWFTSeqEndIndex::Incomplete(siz) => {
                 if self.has_last_wft {
@@ -621,17 +627,25 @@ impl HistoryUpdate {
         if relevant_events.is_empty() {
             return relevant_events;
         }
-        let ix_end =
-            find_end_index_of_next_wft_seq(relevant_events, from_wft_started_id, self.has_last_wft)
-                .index();
+        let ix_end = find_end_index_of_next_wft_seq(
+            relevant_events,
+            from_wft_started_id,
+            self.has_last_wft,
+            self.previous_wft_started_id,
+        )
+        .index();
         &relevant_events[0..=ix_end]
     }
 
     /// Returns true if this update has the next needed WFT sequence, false if events will need to
     /// be fetched in order to create a complete update with the entire next WFT sequence.
     pub(crate) fn can_take_next_wft_sequence(&self, from_wft_started_id: i64) -> bool {
-        let next_wft_ix =
-            find_end_index_of_next_wft_seq(&self.events, from_wft_started_id, self.has_last_wft);
+        let next_wft_ix = find_end_index_of_next_wft_seq(
+            &self.events,
+            from_wft_started_id,
+            self.has_last_wft,
+            self.previous_wft_started_id,
+        );
         if let NextWFTSeqEndIndex::Incomplete(_) = next_wft_ix
             && !self.has_last_wft
         {
@@ -691,6 +705,7 @@ fn find_end_index_of_next_wft_seq(
     events: &[HistoryEvent],
     from_event_id: i64,
     has_last_wft: bool,
+    replay_boundary_id: i64,
 ) -> NextWFTSeqEndIndex {
     if events.is_empty() {
         return NextWFTSeqEndIndex::Incomplete(0);
@@ -741,6 +756,12 @@ fn find_end_index_of_next_wft_seq(
                     if let Some(next_next_event) = events.get(ix + 2) {
                         if !saw_command
                             && next_next_event.event_type() == EventType::WorkflowTaskScheduled
+                            // An activation carries one `is_replaying` flag, so merging here
+                            // makes it wrong for half the work it covers. Lang turns that flag
+                            // into commands: patch markers, recorded logic flags, replay-only
+                            // fixups. Later replays chunk the two tasks apart and cannot
+                            // reproduce them.
+                            && e.event_id != replay_boundary_id
                         {
                             // If we've never seen an interesting event and the next two events are
                             // a completion followed immediately again by scheduled, then this is a
@@ -1641,6 +1662,58 @@ mod tests {
         assert_eq!(seq.len(), 6);
         let seq = next_check_peek(&mut update, 6);
         assert_eq!(seq.len(), 7);
+    }
+
+    #[test]
+    fn empty_first_wft_not_merged_into_following_new_wft() {
+        // Models the live task in temporalio/sdk-dotnet#917: the workflow parked on its first
+        // WFT having issued no commands, then an update arrived. The update is a protocol
+        // message, so there is no new history event between the two tasks - only
+        // WFTCompleted -> WFTScheduled, which looks exactly like a WFT heartbeat.
+        //
+        // The two tasks must not be merged. Merging puts the already-executed first WFT and the
+        // brand new one in a single activation, which is then flagged `is_replaying: false`,
+        // and `patched()` writes a marker that replay can never reproduce.
+        let mut t = TestHistoryBuilder::default();
+        t.add_by_type(EventType::WorkflowExecutionStarted);
+        t.add_full_wf_task();
+        t.add_workflow_task_scheduled_and_started();
+
+        let mut update = t.as_history_update();
+        assert_eq!(update.previous_wft_started_id, 3);
+        assert_eq!(update.wft_started_id, 6);
+
+        let seq = next_check_peek(&mut update, 0);
+        assert_eq!(seq.len(), 3);
+        assert_eq!(seq.last().unwrap().event_id, 3);
+        let seq = next_check_peek(&mut update, 3);
+        assert_eq!(seq.len(), 3);
+        assert_eq!(seq.last().unwrap().event_id, 6);
+    }
+
+    #[test]
+    fn empty_wft_before_replay_boundary_still_merges() {
+        // The heartbeat merge must still apply to empty WFTs that sit wholly within the
+        // replayed portion of history - otherwise replaying a WFT-heartbeat chain would
+        // produce activations with no jobs.
+        let mut t = TestHistoryBuilder::default();
+        t.add_by_type(EventType::WorkflowExecutionStarted);
+        t.add_full_wf_task();
+        t.add_full_wf_task();
+        t.add_full_wf_task();
+        let timer_id = t.add_timer_started("1".to_string());
+        t.add_timer_fired(timer_id, "1".to_string());
+        t.add_workflow_task_scheduled_and_started();
+
+        let mut update = t.as_history_update();
+        assert_eq!(update.previous_wft_started_id, 9);
+
+        // Events 1-9: the two interior empty WFTs collapse into the initial sequence, which
+        // runs up to the last already-executed WFT started (9).
+        let seq = next_check_peek(&mut update, 0);
+        assert_eq!(seq.last().unwrap().event_id, 9);
+        let seq = next_check_peek(&mut update, 9);
+        assert_eq!(seq.last().unwrap().event_id, 14);
     }
 
     #[test]

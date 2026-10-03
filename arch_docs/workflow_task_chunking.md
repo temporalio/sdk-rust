@@ -36,11 +36,20 @@ Core does not consider such empty WFT sequences as worthy of waking lang (on rep
 task, they always will), since nothing meaningful has happened. Thus, they are grouped together
 as part of a "logical" WFT with the last WFT that had any real work in it.
 
+Grouping never spans the replay boundary, though. The WFT identified by the incoming task's
+`previous_started_event_id` always ends its logical WFT, even when it was empty. Grouping it with
+what follows would produce one activation covering both already-executed history and brand new
+work, which lang is then told is not replaying - so a `patched()` call sited in the replayed
+portion records a marker that no later replay can re-issue, wedging the run permanently. Case 2
+above makes this easy to hit: a workflow that blocks on its first WFT without issuing commands,
+and is then woken by an update while uncached.
+
 ## Possible issues as of this writing (5/25)
 
 The "new WFT force-issued by server" case would, currently, not cause a wakeup on replay for the
 reasons discussed above. In some obscure edge cases (inspecting workflow clock) this could cause
-NDE.
+NDE. Ending the logical WFT at the replay boundary does not address this: the sequence after the
+boundary simply has no jobs, and core completes that activation itself rather than waking lang.
 
 ### Possible solutions
 

@@ -7,7 +7,9 @@ use std::{
     },
     time::Duration,
 };
-use temporalio_client::{WorkflowSignalOptions, WorkflowStartOptions};
+use temporalio_client::{
+    WorkflowExecuteUpdateOptions, WorkflowSignalOptions, WorkflowStartOptions,
+};
 use temporalio_common::{
     data_converters::RawValue,
     protos::{
@@ -575,6 +577,87 @@ async fn deprecated_patch_removal() {
         worker.run_until_done().await.unwrap();
     };
     join!(sig_fut, run_fut);
+}
+
+/// Repro for #1613: a patch introduced while a run is parked on its first workflow task.
+#[workflow]
+struct PatchAddedWhileParkedWf {
+    patch_deployed: Arc<AtomicBool>,
+    parked: Arc<Notify>,
+    proceed: bool,
+}
+
+#[workflow_methods(factory_only)]
+impl PatchAddedWhileParkedWf {
+    #[run(name = "patch_added_while_parked_on_first_task")]
+    async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<()> {
+        if ctx.state(|wf| wf.patch_deployed.load(Ordering::Acquire)) {
+            ctx.patched(MY_PATCH_ID);
+        }
+        ctx.state(|wf| wf.parked.notify_one());
+        ctx.wait_condition(|s| s.proceed).await?;
+        Ok(())
+    }
+
+    #[update]
+    async fn nudge(
+        ctx: &mut WorkflowContext<Self>,
+        _: (),
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        ctx.state_mut(|s| s.proceed = true);
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn patch_added_while_parked_on_first_task() {
+    let wf_name = "patch_added_while_parked_on_first_task";
+    let mut starter = CoreWfStarter::new(wf_name);
+    // The run must replay from the start, as it would on a worker that has never seen it.
+    starter.sdk_config.max_cached_workflows = 0_usize;
+    // Flipped once the run is parked, standing in for deploying the patched code.
+    let patch_deployed = Arc::new(AtomicBool::new(false));
+    let parked = Arc::new(Notify::new());
+    let patch_deployed_wf = patch_deployed.clone();
+    let parked_wf = parked.clone();
+    starter
+        .sdk_config
+        .register_workflow_with_factory(move || PatchAddedWhileParkedWf {
+            patch_deployed: patch_deployed_wf.clone(),
+            parked: parked_wf.clone(),
+            proceed: false,
+        })
+        .unwrap();
+    let mut worker = starter.worker().await;
+    let task_queue = starter.get_task_queue().to_owned();
+    let handle = worker
+        .submit_workflow(
+            PatchAddedWhileParkedWf::run,
+            (),
+            WorkflowStartOptions::new(task_queue, starter.get_wf_id().to_owned()).build(),
+        )
+        .await
+        .unwrap();
+
+    let client_fut = async {
+        parked.notified().await;
+        patch_deployed.store(true, Ordering::Release);
+        handle
+            .execute_update(
+                PatchAddedWhileParkedWf::nudge,
+                (),
+                WorkflowExecuteUpdateOptions::default(),
+            )
+            .await
+            .unwrap();
+    };
+    let run_fut = async {
+        worker.run_until_done().await.unwrap();
+    };
+    join!(client_fut, run_fut);
+
+    // The update succeeds either way; a wrongly recorded marker only surfaces on replay.
+    handle.fetch_history_and_replay(&mut worker).await.unwrap();
 }
 
 #[derive(Eq, PartialEq, Copy, Clone, Debug)]

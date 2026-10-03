@@ -54,6 +54,9 @@ relevant information.
 * The `workflow_task_execution_failed` metric is now recorded for every failed workflow task
   attempt, including attempts whose failure was not sent to the server, and its `failure_reason`
   tag distinguishes `GrpcMessageTooLarge`, `PayloadsTooLarge`, and `RequestTooLarge` on every path.
+* Workflow tasks are no longer grouped across the replay boundary. Prior to this change, grouping
+  could activate already-replayed history while reporting to the SDK that replay was not
+  occurring, causing non-determinism on later replays.
 
 ## [0.9.0] - 2026-09-04
 

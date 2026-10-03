@@ -64,6 +64,10 @@ relevant information.
   attempt, including ones whose failure was not sent to the server, and tags size-related failures
   with their specific `failure_reason` (`GrpcMessageTooLarge`, `PayloadsTooLarge`,
   `RequestTooLarge`) on every path.
+* Fixed a non-determinism error affecting a workflow that completes a workflow task without
+  issuing any commands and then receives an update while uncached. Such a run replayed from the
+  start with replay reported as already finished, so commands it recorded during that activation
+  could not be reproduced on later replays.
 
 ## [1.0.0] - 2026-09-04
 
