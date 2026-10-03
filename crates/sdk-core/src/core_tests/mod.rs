@@ -1,5 +1,6 @@
 mod activity_tasks;
 mod event_groups;
+mod history_fetch_failure;
 mod queries;
 mod replay_flag;
 mod updates;

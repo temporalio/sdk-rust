@@ -40,6 +40,8 @@ relevant information.
   namespaces from other start failures.
 
 ### Fixed
+* Core reports failures from legacy query history fetches through the query response API and holds
+  the workflow task slot until the failure report completes.
 * Task-poll targets no longer decrease after cancelled or timed-out polls. Affected pollers still
   retain their slot during backoff, while resource-exhaustion errors still reduce the target.
 * Replay now preserves which local activity results were delivered together for newly recorded

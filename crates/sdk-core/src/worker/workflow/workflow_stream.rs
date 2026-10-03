@@ -160,12 +160,13 @@ impl WFStream {
                     WFStreamInput::FailedFetch {
                         run_id,
                         err,
-                        auto_reply_fail,
+                        failed_task,
                     } => {
                         let message = format!("Fetching history failed: {err:?}");
                         if !state.runs.has_run(&run_id)
-                            && let Some(info) = auto_reply_fail.clone()
+                            && let Some(task) = failed_task
                         {
+                            let UnstoredTask { info, kind, permit } = *task;
                             actions.push(WorkflowStreamAction::FailUnstoredWft {
                                 run_id,
                                 report: Box::new(FailedActivationWFTReport::new(
@@ -173,14 +174,17 @@ impl WFStream {
                                     info.attempt,
                                     WorkflowTaskFailedCause::WorkflowWorkerUnhandledFailure,
                                     ApiFailure::application_failure(message, true).into(),
-                                    WftFailureKind::Task,
+                                    kind,
                                     &state
                                         .metrics
                                         .with_new_attrs([workflow_type(info.workflow_type)]),
                                 )),
+                                permit,
                             });
                             None
                         } else {
+                            let auto_reply_fail =
+                                failed_task.as_ref().map(|task| task.info.clone());
                             state
                                 .request_eviction(RequestEvictMsg {
                                     run_id,
@@ -641,7 +645,7 @@ enum WFStreamInput {
     FailedFetch {
         run_id: String,
         err: tonic::Status,
-        auto_reply_fail: Option<UnstoredWftFailInfo>,
+        failed_task: Option<Box<UnstoredTask>>,
     },
 }
 impl From<LocalInput> for WFStreamInput {
@@ -709,7 +713,7 @@ enum ExternalPollerInputs {
     FailedFetch {
         run_id: String,
         err: tonic::Status,
-        auto_reply_fail: Option<UnstoredWftFailInfo>,
+        failed_task: Option<Box<UnstoredTask>>,
     },
 }
 impl From<ExternalPollerInputs> for WFStreamInput {
@@ -722,11 +726,11 @@ impl From<ExternalPollerInputs> for WFStreamInput {
             ExternalPollerInputs::FailedFetch {
                 run_id,
                 err,
-                auto_reply_fail,
+                failed_task,
             } => WFStreamInput::FailedFetch {
                 run_id,
                 err,
-                auto_reply_fail,
+                failed_task,
             },
             ExternalPollerInputs::NextPage {
                 paginator,
@@ -759,11 +763,11 @@ impl From<Result<WFTExtractorOutput, tonic::Status>> for ExternalPollerInputs {
             Ok(WFTExtractorOutput::FailedFetch {
                 run_id,
                 err,
-                auto_reply_fail,
+                failed_task,
             }) => ExternalPollerInputs::FailedFetch {
                 run_id,
                 err,
-                auto_reply_fail,
+                failed_task,
             },
             Ok(WFTExtractorOutput::PollerDead) => ExternalPollerInputs::PollerDead,
             Err(e) => ExternalPollerInputs::PollerError(e),

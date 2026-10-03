@@ -346,7 +346,11 @@ impl Workflows {
                         }
                     }
                 },
-                WorkflowStreamAction::FailUnstoredWft { run_id, report } => {
+                WorkflowStreamAction::FailUnstoredWft {
+                    run_id,
+                    report,
+                    permit: _permit,
+                } => {
                     self.handle_activation_failed(&run_id, Instant::now(), *report)
                         .await;
                 }
@@ -969,6 +973,7 @@ enum WorkflowStreamAction {
     FailUnstoredWft {
         run_id: String,
         report: Box<FailedActivationWFTReport>,
+        permit: UsedMeteredSemPermit<WorkflowSlotKind>,
     },
 }
 
@@ -1142,6 +1147,31 @@ struct UnstoredWftFailInfo {
     task_token: TaskToken,
     attempt: u32,
     workflow_type: String,
+}
+
+#[derive(Debug)]
+struct UnstoredTask {
+    info: UnstoredWftFailInfo,
+    kind: WftFailureKind,
+    permit: UsedMeteredSemPermit<WorkflowSlotKind>,
+}
+
+impl From<PermittedWFT> for UnstoredTask {
+    fn from(task: PermittedWFT) -> Self {
+        Self {
+            info: UnstoredWftFailInfo {
+                task_token: task.work.task_token,
+                attempt: task.work.attempt,
+                workflow_type: task.work.workflow_type,
+            },
+            kind: if task.work.legacy_query.is_some() {
+                WftFailureKind::LegacyQuery
+            } else {
+                WftFailureKind::Task
+            },
+            permit: task.permit,
+        }
+    }
 }
 
 struct ServerCommandsWithWorkflowInfo {

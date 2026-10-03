@@ -169,7 +169,7 @@ impl HistoryPaginator {
     pub(super) async fn from_fetchreq(
         mut req: Box<CacheMissFetchReq>,
         client: Arc<dyn WorkerClient>,
-    ) -> Result<PermittedWFT, tonic::Status> {
+    ) -> Result<PermittedWFT, Box<(tonic::Status, PermittedWFT)>> {
         let mut paginator = Self {
             wf_id: req.original_wft.work.execution.workflow_id.clone(),
             run_id: req.original_wft.work.execution.run_id.clone(),
@@ -182,9 +182,12 @@ impl HistoryPaginator {
             client,
             event_queue: Default::default(),
             next_page_token: NextPageToken::FetchFromStart,
-            final_events: req.original_wft.work.update.events,
+            final_events: std::mem::take(&mut req.original_wft.work.update.events),
         };
-        let first_update = paginator.extract_next_update().await?;
+        let first_update = match paginator.extract_next_update().await {
+            Ok(update) => update,
+            Err(error) => return Err(Box::new((error, req.original_wft))),
+        };
         req.original_wft.work.update = first_update;
         req.original_wft.paginator = paginator;
         Ok(req.original_wft)
