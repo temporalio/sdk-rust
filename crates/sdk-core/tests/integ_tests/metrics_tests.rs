@@ -30,8 +30,7 @@ use temporalio_common::{
         coresdk::{
             ActivityTaskCompletion,
             activity_result::{
-                self as activity_result, ActivityExecutionResult, ActivityTaskFailedCause,
-                activity_execution_result,
+                self as activity_result, ActivityExecutionResult, activity_execution_result,
             },
             nexus::{NexusTaskCompletion, nexus_task, nexus_task_completion},
             workflow_activation::{WorkflowActivationJob, workflow_activation_job},
@@ -44,7 +43,9 @@ use temporalio_common::{
         },
         temporal::api::{
             common::v1::RetryPolicy,
-            enums::v1::{NexusHandlerErrorRetryBehavior, WorkflowTaskFailedCause},
+            enums::v1::{
+                ActivityTaskFailedCause, NexusHandlerErrorRetryBehavior, WorkflowTaskFailedCause,
+            },
             failure::v1::Failure,
             nexus::{
                 self,

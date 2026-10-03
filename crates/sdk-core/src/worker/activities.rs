@@ -44,13 +44,12 @@ use temporalio_common::{
     protos::{
         coresdk::{
             ActivityHeartbeat, ActivitySlotInfo,
-            activity_result::{
-                self as ar, ActivityTaskFailedCause, activity_execution_result as aer,
-            },
+            activity_result::{self as ar, activity_execution_result as aer},
             activity_task::{ActivityCancelReason, ActivityCancellationDetails, ActivityTask},
         },
         temporal::api::{
             common::v1::{Payload, Payloads},
+            enums::v1::ActivityTaskFailedCause,
             failure::v1::{
                 ApplicationFailureInfo, CanceledFailureInfo, Failure, failure::FailureInfo,
             },
