@@ -238,6 +238,11 @@ fn label_value_from_attributes(attributes: &MetricAttributes, key: &str) -> Opti
             .find(|kv| kv.key.as_str() == key)
             .map(|kv| kv.value.to_string()),
         MetricAttributes::NoOp(labels) => labels.get(key).cloned(),
+        #[cfg(feature = "core-telemetry-bridge")]
+        MetricAttributes::Buffer { kvs, .. } => kvs
+            .iter()
+            .find(|kv| kv.key == key)
+            .map(|kv| kv.value.to_string()),
         _ => None,
     }
 }
@@ -377,8 +382,17 @@ pub enum MetricAttributes {
         labels: Arc<OrderedPromLabelSet>,
     },
     /// Buffered attributes used by core-based SDKs for deferred metric initialization.
+    ///
+    /// The `kvs` are retained because the opaque lang-side handle cannot be read without
+    /// taking a GIL, which the buffered design exists to avoid. Core-side label lookups
+    /// (e.g. worker-heartbeat slot/poller gauges) read from `kvs` instead.
     #[cfg(feature = "core-telemetry-bridge")]
-    Buffer(core::BufferAttributes),
+    Buffer {
+        /// The lang-side handle used to defer initialization.
+        attrs: core::BufferAttributes,
+        /// The key-value pairs captured at attribute-creation time.
+        kvs: Arc<Vec<MetricKeyValue>>,
+    },
     /// Dynamic attributes backed by a lang-side custom implementation.
     #[cfg(feature = "core-telemetry-bridge")]
     Dynamic(Arc<dyn core::CustomMetricAttributes>),
@@ -1190,6 +1204,34 @@ mod tests {
         assert_eq!(
             label_value_from_attributes(&attrs, "poller_type").as_deref(),
             Some("workflow_task")
+        );
+    }
+
+    #[cfg(feature = "core-telemetry-bridge")]
+    #[test]
+    fn in_memory_attributes_provide_label_values_from_buffer() {
+        let attrs = MetricAttributes::Buffer {
+            attrs: core::BufferAttributes::hole(),
+            kvs: Arc::new(vec![
+                MetricKeyValue::new("worker_type", "WorkflowWorker"),
+                MetricKeyValue::new("namespace", "default"),
+            ]),
+        };
+
+        let value = Arc::new(AtomicU64::new(0));
+        let mut metrics = HashMap::new();
+        metrics.insert("WorkflowWorker".to_string(), value.clone());
+        let heartbeat_metric = HeartbeatMetricType::WithLabel {
+            label_key: "worker_type".to_string(),
+            metrics,
+        };
+
+        heartbeat_metric.record_gauge(3, &attrs);
+
+        assert_eq!(value.load(Ordering::Relaxed), 3);
+        assert_eq!(
+            label_value_from_attributes(&attrs, "worker_type").as_deref(),
+            Some("WorkflowWorker")
         );
     }
 }
