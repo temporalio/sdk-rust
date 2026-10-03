@@ -1,0 +1,11 @@
+pre-commit:
+  commands:
+    fmt-check:
+      run: cargo +nightly fmt --all -- --check
+
+pre-push:
+  commands:
+    lint:
+      run: cargo lint
+    check:
+      run: cargo check
