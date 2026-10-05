@@ -147,10 +147,6 @@ graph can disable defaults and opt back into the integrations they use.
 Enable the `opentelemetry` feature. Configure an OpenTelemetry tracer provider. Add the plugin to
 the Temporal client. Workers that use the client automatically get the worker interceptors.
 
-```toml
-temporalio-sdk = { version = "1.0", features = ["opentelemetry"] }
-```
-
 ```rust,no_run
 use temporalio_client::ClientOptions;
 use temporalio_sdk::opentelemetry::OpenTelemetryPlugin;
