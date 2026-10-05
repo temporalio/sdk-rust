@@ -29,8 +29,9 @@ Commands:
   conventions should pass their previous tag explicitly.
 
 Changelog and fragment paths are relative to `--repo`. Fragments are `.md` files
-directly inside `added`, `changed`, `deprecated`, `breaking-changes`, `fixed`, or
-`security` folders. The folder supplies the category. Write a concise entry,
+directly inside `added`, `stabilized`, `changed`, `deprecated`, `breaking-changes`,
+`fixed`, or `security` folders. Use `stabilized` for features that are no longer
+experimental. The folder supplies the category. Write a concise entry,
 ideally one or two sentences, without a leading list marker (`-`). Write each entry
 entirely on one line: assembly turns each nonempty line into a separate list item.
 A fragment may contain multiple entries; their order is preserved and blank lines

@@ -82,7 +82,9 @@ fn snapshot(
     for file in files.lines().filter(|f| !f.ends_with("/README.md")) {
         let category = fragment_category(Path::new(file), directory)?;
         let body = git(repo, &["show", &format!("{revision}:{file}")])?;
-        let heading = if category == 3 && entries.contains_key(":boom: Breaking Changes") {
+        let heading = if CATEGORIES[category].0 == "breaking-changes"
+            && entries.contains_key(":boom: Breaking Changes")
+        {
             ":boom: Breaking Changes"
         } else {
             CATEGORIES[category].1

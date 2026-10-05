@@ -64,6 +64,11 @@ fn prepends_grouped_list_items_without_changing_history() {
     repo.write("changelog/fixed/amber-otter.md", body);
     repo.write("changelog/added/silly-badger.md", "A feature.\n");
     repo.write(
+        "changelog/stabilized/steady-starfish.md",
+        "A feature is now stable.\nAnother feature is no longer experimental.\n",
+    );
+    check_fragments(&repo.root, Path::new("changelog"), None, "HEAD", false).unwrap();
+    repo.write(
         "changelog/breaking-changes/dancing-cupcake.md",
         "A breaking change.\n",
     );
@@ -83,10 +88,13 @@ fn prepends_grouped_list_items_without_changing_history() {
     assert!(changelog.contains("### Added\n\n- A feature.\n\n"));
     assert!(changelog.contains(entry));
     assert!(changelog.contains("- Last fix.\n\n"));
-    assert_eq!(changelog.matches("\n- ").count(), 5);
+    assert!(changelog.contains("### Stabilized\n\n- A feature is now stable.\n- Another feature is no longer experimental.\n\n"));
+    assert!(changelog.find("### Added").unwrap() < changelog.find("### Stabilized").unwrap());
+    assert!(changelog.find("### Stabilized").unwrap() < changelog.find("### :boom:").unwrap());
+    assert_eq!(changelog.matches("\n- ").count(), 7);
     assert!(changelog.ends_with(history));
     assert!(changelog.find(entry).unwrap() < changelog.find("- Last fix.").unwrap());
-    assert_eq!(count, 4);
+    assert_eq!(count, 5);
     assert!(!changelog.contains("Unreleased"));
     assert!(
         collect_fragments(&repo.root, Path::new("changelog"))
@@ -204,6 +212,11 @@ fn range_notes_survive_fragment_migration_and_assembly() {
     );
     repo.commit();
     let directory = Path::new("crates/sdk-core/changelog");
+    repo.write(
+        "crates/sdk-core/changelog/stabilized/steady-starfish.md",
+        "A feature is no longer experimental.\n",
+    );
+    repo.commit();
     prepare_release(&repo.root, Path::new(path), directory, &options()).unwrap();
     let end = repo.commit();
     let notes = changelog_release_notes::range::release_notes(&repo.root, &base, &end, path)
@@ -211,6 +224,13 @@ fn range_notes_survive_fragment_migration_and_assembly() {
         .join("\n");
     assert_eq!(notes.matches("- New feature.").count(), 1);
     assert_eq!(notes.matches("- Another feature.").count(), 1);
+    assert!(notes.contains("#### Stabilized"));
+    assert_eq!(
+        notes
+            .matches("- A feature is no longer experimental.")
+            .count(),
+        1
+    );
     assert!(!notes.contains("- Old feature."));
 }
 

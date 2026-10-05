@@ -10,8 +10,9 @@ use thiserror::Error;
 
 pub mod range;
 
-pub const CATEGORIES: [(&str, &str); 6] = [
+pub const CATEGORIES: [(&str, &str); 7] = [
     ("added", "Added"),
+    ("stabilized", "Stabilized"),
     ("changed", "Changed"),
     ("deprecated", "Deprecated"),
     ("breaking-changes", "Breaking Changes"),
@@ -308,13 +309,13 @@ pub fn assemble_release(
         .find(|(_, _, title)| *title == "Changelog")
         .ok_or_else(|| ChangelogError("missing # Changelog heading".into()))?;
     let mut sections = Vec::new();
-    for (index, (_, heading)) in CATEGORIES.iter().enumerate() {
+    for (index, (folder, heading)) in CATEGORIES.iter().enumerate() {
         let mut entries: Vec<_> = fragments.iter().filter(|f| f.category == index).collect();
         entries.sort_by(|a, b| a.path.cmp(&b.path));
         if entries.is_empty() {
             continue;
         }
-        let heading = if index == 3 {
+        let heading = if *folder == "breaking-changes" {
             breaking_heading.unwrap_or(heading)
         } else {
             heading
