@@ -1,10 +1,9 @@
 //! Print SDK Core changelog and commit notes for a Git revision range.
 
+use anyhow::{Context, Result, anyhow};
 use std::{collections::BTreeMap, path::Path};
 
-use crate::{
-    CATEGORIES, ChangelogError, category_sections, fragment_category, fragment_entries, git,
-};
+use crate::{CATEGORIES, category_sections, fragment_category, fragment_entries, git};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Entry {
@@ -66,7 +65,7 @@ fn snapshot(
     revision: &str,
     path: &str,
     directory: &Path,
-) -> Result<BTreeMap<String, Vec<Vec<String>>>, ChangelogError> {
+) -> Result<BTreeMap<String, Vec<Vec<String>>>> {
     let mut entries = changelog_entries(&git(repo, &["show", &format!("{revision}:{path}")])?);
     let files = git(
         repo,
@@ -76,16 +75,16 @@ fn snapshot(
             "--name-only",
             revision,
             "--",
-            directory.to_str().ok_or("invalid fragment directory")?,
+            directory.to_str().context("invalid fragment directory")?,
         ],
     )?;
     for file in files.lines().filter(|f| !f.ends_with("/README.md")) {
         let category = fragment_category(Path::new(file), directory)?;
         let body = git(repo, &["show", &format!("{revision}:{file}")])?;
         let heading = if CATEGORIES[category].0 == "breaking-changes"
-            && entries.contains_key(":boom: Breaking Changes")
+            && entries.contains_key("Breaking Changes")
         {
-            ":boom: Breaking Changes"
+            "Breaking Changes"
         } else {
             CATEGORIES[category].1
         };
@@ -176,12 +175,7 @@ fn update_entries(previous: &Entries, current: BTreeMap<String, Vec<Vec<String>>
     updated
 }
 
-fn changelog_notes(
-    repo: &Path,
-    from: &str,
-    to: &str,
-    path: &str,
-) -> Result<Vec<String>, ChangelogError> {
+fn changelog_notes(repo: &Path, from: &str, to: &str, path: &str) -> Result<Vec<String>> {
     let directory = Path::new(path)
         .parent()
         .unwrap_or(Path::new(""))
@@ -210,7 +204,7 @@ fn changelog_notes(
             &format!("{from}..{to}"),
             "--",
             path,
-            directory.to_str().ok_or("invalid fragment directory")?,
+            directory.to_str().context("invalid fragment directory")?,
         ],
     )?;
     for commit in commits.lines().filter(|commit| !commit.is_empty()) {
@@ -270,12 +264,7 @@ fn link_prs(subject: &str) -> String {
     output
 }
 
-pub fn release_notes(
-    repo: &Path,
-    from: &str,
-    to: &str,
-    changelog: &str,
-) -> Result<Vec<String>, ChangelogError> {
+pub fn release_notes(repo: &Path, from: &str, to: &str, changelog: &str) -> Result<Vec<String>> {
     let log = git(
         repo,
         &[
@@ -306,11 +295,11 @@ pub fn release_notes(
     Ok(output)
 }
 
-pub fn changelog_path(changelog: &str) -> Result<&'static str, ChangelogError> {
+pub fn changelog_path(changelog: &str) -> Result<&'static str> {
     match changelog {
         "rust" => Ok("CHANGELOG.md"),
         "core" => Ok("crates/sdk-core/CHANGELOG.md"),
-        _ => Err("expected --changelog <rust|core>".into()),
+        _ => Err(anyhow!("expected --changelog <rust|core>")),
     }
 }
 

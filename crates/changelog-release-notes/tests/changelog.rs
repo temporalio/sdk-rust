@@ -44,8 +44,6 @@ fn options() -> ReleaseOptions<'static> {
     ReleaseOptions {
         version: "1.1.0",
         date: NaiveDate::from_ymd_opt(2026, 10, 2).unwrap(),
-        allow_empty: false,
-        breaking_heading: Some(":boom: Breaking Changes"),
     }
 }
 
@@ -133,15 +131,12 @@ fn rejects_invalid_layouts_and_empty_fragments() {
     }
     let repo = Repo::new();
     assert!(collect_fragments(&repo.root, Path::new("../elsewhere")).is_err());
-    assert!(assemble_release("# Changelog\n", &[], &options()).is_err());
-    let mut opts = options();
-    opts.allow_empty = true;
-    assert!(assemble_release("# Changelog\n", &[], &opts).is_ok());
+    assert!(assemble_release("# Changelog\n", &[], &options()).is_ok());
     assert!(
         assemble_release(
             "# Changelog\n\n## [Unreleased]\n\nOld pending note.\n",
             &[],
-            &opts
+            &options()
         )
         .is_err()
     );
@@ -349,4 +344,35 @@ fn invalid_fragments_do_not_change_changelog_or_consume_notes() {
     );
     assert!(repo.root.join("changelog/fixed/valid-otter.md").exists());
     assert!(repo.root.join("changelog/fixed/empty-otter.md").exists());
+}
+
+#[test]
+fn cli_prepares_and_extracts_an_empty_release() {
+    let repo = Repo::new();
+    let history = "## [1.0.0] - 2026-01-01\n\n### Fixed\n\n- Old fix.\n";
+    repo.write("CHANGELOG.md", &format!("# Changelog\n\n{history}"));
+    let output = Command::new(env!("CARGO_BIN_EXE_changelog-tool"))
+        .args(["prepare", "--repo"])
+        .arg(&repo.root)
+        .args(["--version", "1.1.0", "--date", "2026-10-05"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("consumed 0 changelog fragments"));
+    let text = fs::read_to_string(repo.root.join("CHANGELOG.md")).unwrap();
+    assert!(text.contains("## [1.1.0] - 2026-10-05\n\n"));
+    assert!(text.ends_with(history));
+    let output = Command::new(env!("CARGO_BIN_EXE_changelog-tool"))
+        .args(["notes", "--repo"])
+        .arg(&repo.root)
+        .args(["--version", "1.1.0"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert!(output.stdout.is_empty());
+    assert!(release_section(&text, "2.0.0").is_err());
 }

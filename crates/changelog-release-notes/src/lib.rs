@@ -1,12 +1,12 @@
 //! Shared changelog preparation for Temporal SDK release adapters.
 
+use anyhow::{Context, Result, anyhow, bail};
 use chrono::NaiveDate;
 use std::{
     fs,
     path::{Component, Path},
     process::Command,
 };
-use thiserror::Error;
 
 pub mod range;
 
@@ -15,34 +15,14 @@ pub const CATEGORIES: [(&str, &str); 7] = [
     ("stabilized", "Stabilized"),
     ("changed", "Changed"),
     ("deprecated", "Deprecated"),
-    ("breaking-changes", "Breaking Changes"),
+    ("breaking-changes", ":boom: Breaking Changes"),
     ("fixed", "Fixed"),
     ("security", "Security"),
 ];
 
-#[derive(Debug, Error)]
-#[error("{0}")]
-pub struct ChangelogError(pub String);
-
-impl From<String> for ChangelogError {
-    fn from(value: String) -> Self {
-        Self(value)
-    }
-}
-
-impl From<&str> for ChangelogError {
-    fn from(value: &str) -> Self {
-        Self(value.into())
-    }
-}
-
-type Result<T> = std::result::Result<T, ChangelogError>;
-
 pub struct ReleaseOptions<'a> {
     pub version: &'a str,
     pub date: NaiveDate,
-    pub allow_empty: bool,
-    pub breaking_heading: Option<&'a str>,
 }
 
 #[derive(Debug)]
@@ -57,17 +37,18 @@ pub fn git(repo: &Path, args: &[&str]) -> Result<String> {
         .args(args)
         .current_dir(repo)
         .output()
-        .map_err(|e| ChangelogError(format!("failed to run git: {e}")))?;
+        .context("failed to run git")?;
     if !output.status.success() {
-        return Err(ChangelogError(
-            String::from_utf8_lossy(&output.stderr).trim().into(),
-        ));
+        bail!(
+            "git failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim(),
+        );
     }
-    String::from_utf8(output.stdout).map_err(|e| ChangelogError(e.to_string()))
+    String::from_utf8(output.stdout).context("git output is not UTF-8")
 }
 
 fn read(path: &Path) -> Result<String> {
-    fs::read_to_string(path).map_err(|e| ChangelogError(format!("{}: {e}", path.display())))
+    fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))
 }
 
 fn relative(path: &Path) -> Result<()> {
@@ -76,10 +57,7 @@ fn relative(path: &Path) -> Result<()> {
             .components()
             .any(|c| !matches!(c, Component::Normal(_)))
     {
-        return Err(ChangelogError(format!(
-            "expected a repository-relative path: {}",
-            path.display()
-        )));
+        bail!("expected a repository-relative path: {}", path.display());
     }
     Ok(())
 }
@@ -87,24 +65,21 @@ fn relative(path: &Path) -> Result<()> {
 pub fn fragment_category(path: &Path, directory: &Path) -> Result<usize> {
     relative(directory)?;
     let suffix = path.strip_prefix(directory).map_err(|_| {
-        ChangelogError(format!(
+        anyhow!(
             "fragment outside {}: {}",
             directory.display(),
             path.display()
-        ))
+        )
     })?;
     let parts: Vec<_> = suffix.components().collect();
     if parts.len() != 2 || path.extension().is_none_or(|s| s != "md") {
-        return Err(ChangelogError(format!(
-            "fragment must be <category>/<name>.md: {}",
-            path.display()
-        )));
+        bail!("fragment must be <category>/<name>.md: {}", path.display());
     }
     let folder = parts[0].as_os_str().to_str().unwrap_or("");
     CATEGORIES
         .iter()
         .position(|(name, _)| *name == folder)
-        .ok_or_else(|| ChangelogError(format!("unknown fragment category: {}", path.display())))
+        .ok_or_else(|| anyhow!("unknown fragment category: {}", path.display()))
 }
 
 pub fn collect_fragments(repo: &Path, directory: &Path) -> Result<Vec<Fragment>> {
@@ -113,21 +88,13 @@ pub fn collect_fragments(repo: &Path, directory: &Path) -> Result<Vec<Fragment>>
     if !root.exists() {
         return Ok(Vec::new());
     }
-    if !fs::symlink_metadata(&root)
-        .map_err(|e| ChangelogError(e.to_string()))?
-        .is_dir()
-    {
-        return Err(ChangelogError(format!(
-            "expected a fragment directory: {}",
-            root.display()
-        )));
+    if !fs::symlink_metadata(&root)?.is_dir() {
+        bail!("expected a fragment directory: {}", root.display());
     }
     let mut fragments = Vec::new();
-    for entry in fs::read_dir(&root).map_err(|e| ChangelogError(e.to_string()))? {
-        let entry = entry.map_err(|e| ChangelogError(e.to_string()))?;
-        let kind = entry
-            .file_type()
-            .map_err(|e| ChangelogError(e.to_string()))?;
+    for entry in fs::read_dir(&root)? {
+        let entry = entry?;
+        let kind = entry.file_type()?;
         if entry.file_name() == "README.md" && kind.is_file() {
             continue;
         }
@@ -135,37 +102,22 @@ pub fn collect_fragments(repo: &Path, directory: &Path) -> Result<Vec<Fragment>>
             .iter()
             .position(|(folder, _)| entry.file_name() == *folder);
         if !kind.is_dir() || category.is_none() {
-            return Err(ChangelogError(format!(
-                "unexpected changelog path: {}",
-                entry.path().display()
-            )));
+            bail!("unexpected changelog path: {}", entry.path().display());
         }
-        for file in fs::read_dir(entry.path()).map_err(|e| ChangelogError(e.to_string()))? {
-            let file = file.map_err(|e| ChangelogError(e.to_string()))?;
+        for file in fs::read_dir(entry.path())? {
+            let file = file?;
             let path = file.path();
-            if !file
-                .file_type()
-                .map_err(|e| ChangelogError(e.to_string()))?
-                .is_file()
-                || path.extension().is_none_or(|s| s != "md")
-            {
-                return Err(ChangelogError(format!(
-                    "expected a Markdown fragment: {}",
-                    path.display()
-                )));
+            if !file.file_type()?.is_file() || path.extension().is_none_or(|s| s != "md") {
+                bail!("expected a Markdown fragment: {}", path.display());
             }
             let body = read(&path)?;
             if body.trim().is_empty() {
-                return Err(ChangelogError(format!(
-                    "empty fragment: {}",
-                    path.display()
-                )));
+                bail!("empty fragment: {}", path.display());
             }
             let path = path
-                .strip_prefix(repo)
-                .map_err(|e| ChangelogError(e.to_string()))?
+                .strip_prefix(repo)?
                 .to_str()
-                .ok_or_else(|| ChangelogError("fragment path is not UTF-8".into()))?
+                .ok_or_else(|| anyhow!("fragment path is not UTF-8"))?
                 .replace('\\', "/");
             fragments.push(Fragment {
                 path,
@@ -228,18 +180,14 @@ fn section<'a>(text: &'a str, version: &str) -> Result<(usize, usize, usize, &'a
             ));
         }
     }
-    Err(ChangelogError(format!(
-        "could not find changelog section for {version:?}"
-    )))
+    Err(anyhow!("could not find changelog section for {version:?}"))
 }
 
 pub fn release_section(text: &str, version: &str) -> Result<String> {
     let (_, start, end, _) = section(text, version)?;
     let body = text[start..end].trim_matches(['\r', '\n']);
     if body.trim().is_empty() {
-        return Err(ChangelogError(format!(
-            "changelog section for {version:?} is empty"
-        )));
+        return Ok(String::new());
     }
     Ok(format!("{body}\n"))
 }
@@ -249,7 +197,9 @@ pub(crate) fn category_sections(text: &str) -> Vec<(String, String)> {
         .into_iter()
         .filter(|(_, _, heading)| {
             let heading = heading.strip_prefix(":boom: ").unwrap_or(heading);
-            CATEGORIES.iter().any(|(_, category)| *category == heading)
+            CATEGORIES.iter().any(|(_, category)| {
+                category.strip_prefix(":boom: ").unwrap_or(category) == heading
+            })
         })
         .collect();
     let mut result = Vec::new();
@@ -282,44 +232,27 @@ pub fn assemble_release(
     fragments: &[Fragment],
     options: &ReleaseOptions<'_>,
 ) -> Result<String> {
-    let ReleaseOptions {
-        version,
-        date,
-        allow_empty,
-        breaking_heading,
-    } = *options;
+    let ReleaseOptions { version, date } = *options;
     if version.is_empty() || version.contains(['\n', '\r', '[', ']']) {
-        return Err(ChangelogError("invalid release version".into()));
+        bail!("invalid release version");
     }
     if section(text, version).is_ok() {
-        return Err(ChangelogError(format!(
-            "changelog already contains [{version}]"
-        )));
+        bail!("changelog already contains [{version}]");
     }
     if section(text, "Unreleased").is_ok() {
-        return Err(ChangelogError(
-            "migrate Unreleased notes to category folders before preparing a release".into(),
-        ));
-    }
-    if fragments.is_empty() && !allow_empty {
-        return Err(ChangelogError("release has no changelog notes".into()));
+        bail!("migrate Unreleased notes to category folders before preparing a release",);
     }
     let (_, insert, _) = headings(text, "# ")
         .into_iter()
         .find(|(_, _, title)| *title == "Changelog")
-        .ok_or_else(|| ChangelogError("missing # Changelog heading".into()))?;
+        .ok_or_else(|| anyhow!("missing # Changelog heading"))?;
     let mut sections = Vec::new();
-    for (index, (folder, heading)) in CATEGORIES.iter().enumerate() {
+    for (index, (_, heading)) in CATEGORIES.iter().enumerate() {
         let mut entries: Vec<_> = fragments.iter().filter(|f| f.category == index).collect();
         entries.sort_by(|a, b| a.path.cmp(&b.path));
         if entries.is_empty() {
             continue;
         }
-        let heading = if *folder == "breaking-changes" {
-            breaking_heading.unwrap_or(heading)
-        } else {
-            heading
-        };
         let entries: String = entries
             .into_iter()
             .map(|fragment| {
@@ -348,13 +281,13 @@ pub fn prepare_release(
     let fragments = collect_fragments(repo, directory)?;
     let text = assemble_release(&read(&repo.join(changelog))?, &fragments, options)?;
     fs::write(repo.join(changelog), text)
-        .map_err(|e| ChangelogError(format!("failed to write {}: {e}", changelog.display())))?;
+        .with_context(|| format!("failed to write {}", changelog.display()))?;
     for fragment in &fragments {
-        fs::remove_file(repo.join(&fragment.path)).map_err(|e| {
-            ChangelogError(format!(
-                "failed to consume {} after writing changelog: {e}",
+        fs::remove_file(repo.join(&fragment.path)).with_context(|| {
+            format!(
+                "failed to consume {} after writing changelog",
                 fragment.path
-            ))
+            )
         })?;
     }
     Ok(fragments.len())
@@ -381,7 +314,7 @@ pub fn check_fragments(
                 "--",
                 directory
                     .to_str()
-                    .ok_or_else(|| ChangelogError("invalid directory".into()))?,
+                    .ok_or_else(|| anyhow!("invalid directory"))?,
             ],
         )?;
         let fields: Vec<_> = changed.split('\0').filter(|s| !s.is_empty()).collect();
@@ -392,20 +325,15 @@ pub fn check_fragments(
             }
             fragment_category(Path::new(pair[1]), directory)?;
             if !fragments.iter().any(|f| f.path == pair[1]) {
-                return Err(ChangelogError(format!(
-                    "fragment missing from checkout: {}",
-                    pair[1]
-                )));
+                bail!("fragment missing from checkout: {}", pair[1]);
             }
             added |= pair[0] == "A";
         }
         if require_new && !added {
-            return Err(ChangelogError(
-                "add a new changelog fragment or apply the skip-changelog label".into(),
-            ));
+            bail!("add a new changelog fragment or apply the skip-changelog label",);
         }
     } else if require_new {
-        return Err(ChangelogError("--require-new needs --base".into()));
+        bail!("--require-new needs --base");
     }
     Ok(())
 }
@@ -423,24 +351,21 @@ fn numeric_version(value: &str) -> Option<Vec<u64>> {
 }
 
 pub fn previous_release_tag(repo: &Path, version: &str) -> Result<String> {
-    let current = numeric_version(version)
-        .ok_or_else(|| ChangelogError(format!("invalid version: {version}")))?;
+    let current = numeric_version(version).ok_or_else(|| anyhow!("invalid version: {version}"))?;
     git(repo, &["tag"])?
         .lines()
         .filter_map(|tag| numeric_version(tag).map(|v| (v, tag.to_owned())))
         .filter(|(v, _)| *v < current)
         .max_by(|a, b| a.0.cmp(&b.0))
         .map(|(_, tag)| tag)
-        .ok_or_else(|| ChangelogError(format!("no previous release tag before {version}")))
+        .ok_or_else(|| anyhow!("no previous release tag before {version}"))
 }
 
 fn gitlink(repo: &Path, revision: &str, path: &str) -> Result<String> {
     let output = git(repo, &["ls-tree", revision, "--", path])?;
     let fields: Vec<_> = output.split_whitespace().collect();
     if fields.len() < 3 || fields[0] != "160000" {
-        return Err(ChangelogError(format!(
-            "no submodule {path:?} at {revision:?}"
-        )));
+        bail!("no submodule {path:?} at {revision:?}");
     }
     Ok(fields[2].into())
 }
@@ -459,7 +384,7 @@ pub fn core_notes(
     };
     let path = submodule
         .to_str()
-        .ok_or_else(|| ChangelogError("invalid submodule path".into()))?;
+        .ok_or_else(|| anyhow!("invalid submodule path"))?;
     let old = gitlink(repo, &previous, path)?;
     let new = gitlink(repo, to, path)?;
     if old == new {
@@ -467,9 +392,7 @@ pub fn core_notes(
     }
     let submodule = repo.join(submodule);
     if !submodule.join(".git").exists() {
-        return Err(ChangelogError(
-            "submodule is not initialized; checkout with submodules".into(),
-        ));
+        bail!("submodule is not initialized; checkout with submodules",);
     }
     let notes = match range::release_notes(&submodule, &old, &new, "crates/sdk-core/CHANGELOG.md") {
         Ok(notes) => notes,

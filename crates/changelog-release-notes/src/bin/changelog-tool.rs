@@ -1,5 +1,6 @@
 //! Shared changelog operations for SDK release scripts.
 
+use anyhow::{Context, Result};
 use changelog_release_notes::{
     ReleaseOptions, check_fragments, core_notes, prepare_release, release_section,
 };
@@ -39,10 +40,6 @@ enum Command {
         version: String,
         #[arg(long, value_name = "YYYY-MM-DD")]
         date: NaiveDate,
-        #[arg(long)]
-        allow_empty: bool,
-        #[arg(long)]
-        breaking_heading: Option<String>,
     },
     #[command(about = "Extract the changelog notes for a released version")]
     Notes {
@@ -64,24 +61,24 @@ enum Command {
     },
 }
 
-fn main() -> Result<(), String> {
+fn main() -> Result<()> {
     let cli = Cli::parse();
-    let repo = cli.repo.canonicalize().map_err(|e| e.to_string())?;
+    let repo = cli
+        .repo
+        .canonicalize()
+        .with_context(|| format!("invalid repository: {}", cli.repo.display()))?;
     match cli.command {
         Command::Check {
             fragments,
             base,
             head,
             require_new,
-        } => check_fragments(&repo, &fragments, base.as_deref(), &head, require_new)
-            .map_err(|e| e.to_string())?,
+        } => check_fragments(&repo, &fragments, base.as_deref(), &head, require_new)?,
         Command::Prepare {
             fragments,
             changelog,
             version,
             date,
-            allow_empty,
-            breaking_heading,
         } => {
             let count = prepare_release(
                 &repo,
@@ -90,16 +87,13 @@ fn main() -> Result<(), String> {
                 &ReleaseOptions {
                     version: &version,
                     date,
-                    allow_empty,
-                    breaking_heading: breaking_heading.as_deref(),
                 },
-            )
-            .map_err(|e| e.to_string())?;
+            )?;
             println!("Prepared release {version}; consumed {count} changelog fragments");
         }
         Command::Notes { changelog, version } => {
-            let text = fs::read_to_string(repo.join(changelog)).map_err(|e| e.to_string())?;
-            let notes = release_section(&text, &version).map_err(|e| e.to_string())?;
+            let text = fs::read_to_string(repo.join(changelog))?;
+            let notes = release_section(&text, &version)?;
             print!("{notes}");
         }
         Command::CoreNotes {
@@ -108,8 +102,7 @@ fn main() -> Result<(), String> {
             from,
             to,
         } => {
-            let notes = core_notes(&repo, &submodule, &version, from.as_deref(), &to)
-                .map_err(|e| e.to_string())?;
+            let notes = core_notes(&repo, &submodule, &version, from.as_deref(), &to)?;
             if !notes.is_empty() {
                 println!("{notes}");
             }

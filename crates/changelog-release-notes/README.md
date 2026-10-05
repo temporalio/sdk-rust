@@ -15,13 +15,14 @@ Commands:
   than only edits or deletions. The checkout must match `--head`. The calling
   workflow handles override labels and checks out the PR's synthetic merge result.
 * `prepare --version <version> --date YYYY-MM-DD [--changelog CHANGELOG.md]
-  [--fragments changelog] [--breaking-heading 'Breaking Changes'] [--allow-empty]`
+  [--fragments changelog]`
   validates all pending notes, writes the dated release into the changelog, and
-  removes the consumed fragments. Empty releases are rejected unless explicitly
-  allowed; duplicate versions are always rejected. Validation failures leave the
+  removes the consumed fragments. Empty releases are allowed; duplicate versions
+  are always rejected. Validation failures leave the
   changelog and fragments intact.
 * `notes --version <version> [--changelog CHANGELOG.md]` prints that dated release's
-  body as Markdown, excluding the version heading.
+  body as Markdown, excluding the version heading. Empty release sections produce
+  no output; missing release sections are errors.
 * `core-notes --version <version> --submodule <path> [--from <tag> --to HEAD]`
   resolves Core revisions from the parent repository's Git links and produces
   the existing Core changelog/commit notes. Without `--from`, it selects the
@@ -43,7 +44,8 @@ misplaced files, nested folders, and symlinks are rejected.
 
 Assembly inserts a dated release immediately after `# Changelog`, groups notes in
 the folder order above, and sorts filenames within categories. Existing releases
-are unchanged. Migrate pending Unreleased notes into fragments and remove that
+are unchanged. Breaking changes use the heading `### :boom: Breaking Changes`.
+Migrate pending Unreleased notes into fragments and remove that
 section before adopting `prepare`; there is no new Unreleased section.
 
 SDK adapters update their version files and refresh their lockfile first, then
