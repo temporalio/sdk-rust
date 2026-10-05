@@ -67,6 +67,7 @@ Documentation can be generated with `cargo doc`.
   the repository-root `CHANGELOG.md` serves users of the Rust SDK, and
   `crates/sdk-core/CHANGELOG.md` serves users of the other Temporal SDKs, whose workers and
   clients run on Core.
+- Keep changelog entries concise, ideally one or two sentences describing what users can observe.
 - The test for either file is whether a user of that SDK can observe the change: different
   behavior, an option they can set, a new log or metric, a different interaction with the server.
   Ask what the user sees, not which crate or which files the PR touched.

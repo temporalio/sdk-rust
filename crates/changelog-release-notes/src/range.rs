@@ -2,7 +2,9 @@
 
 use std::{collections::BTreeMap, path::Path};
 
-use crate::{CATEGORIES, ChangelogError, category_sections, fragment_category, git};
+use crate::{
+    CATEGORIES, ChangelogError, category_sections, fragment_category, fragment_entry, git,
+};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Entry {
@@ -88,7 +90,7 @@ fn snapshot(
         entries
             .entry(heading.into())
             .or_default()
-            .extend(markdown_entries(&body));
+            .extend(markdown_entries(&fragment_entry(&body)));
     }
     Ok(entries)
 }

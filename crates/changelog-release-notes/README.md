@@ -30,7 +30,10 @@ Commands:
 
 Changelog and fragment paths are relative to `--repo`. Fragments are `.md` files
 directly inside `added`, `changed`, `deprecated`, `breaking-changes`, `fixed`, or
-`security` folders. The folder supplies the category; the body is copied as-is.
+`security` folders. The folder supplies the category. Write a concise entry,
+ideally one or two sentences, without a leading list marker (`-`). Assembly adds
+the list marker and indents continuation lines to keep paragraphs and examples
+inside the item.
 Use fun, whimsical lowercase kebab-case filenames such as `dancing-marshmallow.md`.
 The root fragment-directory README is ignored. Empty files, unexpected folders,
 misplaced files, nested folders, and symlinks are rejected.

@@ -269,6 +269,22 @@ pub(crate) fn category_sections(text: &str) -> Vec<(String, String)> {
     result
 }
 
+pub(crate) fn fragment_entry(body: &str) -> String {
+    body.split_inclusive('\n')
+        .enumerate()
+        .map(|(index, line)| {
+            let prefix = if index == 0 {
+                "- "
+            } else if matches!(line, "\n" | "\r\n") {
+                ""
+            } else {
+                "  "
+            };
+            format!("{prefix}{line}")
+        })
+        .collect()
+}
+
 pub fn assemble_release(
     text: &str,
     fragments: &[Fragment],
@@ -315,7 +331,7 @@ pub fn assemble_release(
         let entries: String = entries
             .into_iter()
             .map(|fragment| {
-                let body = &fragment.body;
+                let body = fragment_entry(&fragment.body);
                 let newline = if body.ends_with('\n') { "" } else { "\n" };
                 format!("{body}{newline}\n")
             })

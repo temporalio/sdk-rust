@@ -50,7 +50,7 @@ fn options() -> ReleaseOptions<'static> {
 }
 
 #[test]
-fn prepends_grouped_notes_without_changing_bodies_or_history() {
+fn prepends_grouped_list_items_without_changing_history() {
     let repo = Repo::new();
     let history = "## [1.0.0] - 2026-01-01\n\n### Added\n\nOld note.\n";
     repo.write(
@@ -58,13 +58,14 @@ fn prepends_grouped_notes_without_changing_bodies_or_history() {
         &format!("<!-- Intro -->\n# Changelog\n\n{history}"),
     );
     repo.write("changelog/README.md", "Instructions");
-    repo.write("changelog/fixed/zany-zebra.md", "- Last fix.\n");
-    let body = "    indented example\n\n```markdown\n## [1.1.0]\n### Added\n```\n\n## Example\n\nA paragraph with two spaces.  \n";
+    repo.write("changelog/fixed/zany-zebra.md", "Last fix.");
+    let body = "A fix.\n\n    indented example\n\n```markdown\n## [1.1.0]\n### Added\n```\n\n## Example\n\nA paragraph with two spaces.  \n";
+    let entry = "- A fix.\n\n      indented example\n\n  ```markdown\n  ## [1.1.0]\n  ### Added\n  ```\n\n  ## Example\n\n  A paragraph with two spaces.  \n";
     repo.write("changelog/fixed/amber-otter.md", body);
-    repo.write("changelog/added/silly-badger.md", "- A feature.\n");
+    repo.write("changelog/added/silly-badger.md", "A feature.\n");
     repo.write(
         "changelog/breaking-changes/dancing-cupcake.md",
-        "- A breaking change.\n",
+        "A breaking change.\n",
     );
     let count = prepare_release(
         &repo.root,
@@ -79,9 +80,11 @@ fn prepends_grouped_notes_without_changing_bodies_or_history() {
             .starts_with("<!-- Intro -->\n# Changelog\n\n## [1.1.0] - 2026-10-02\n\n### Added")
     );
     assert!(changelog.contains("### :boom: Breaking Changes\n\n- A breaking change."));
-    assert!(changelog.contains(body));
+    assert!(changelog.contains("### Added\n\n- A feature.\n\n"));
+    assert!(changelog.contains(entry));
+    assert!(changelog.contains("- Last fix.\n\n"));
     assert!(changelog.ends_with(history));
-    assert!(changelog.find(body).unwrap() < changelog.find("- Last fix.").unwrap());
+    assert!(changelog.find(entry).unwrap() < changelog.find("- Last fix.").unwrap());
     assert_eq!(count, 4);
     assert!(!changelog.contains("Unreleased"));
     assert!(
@@ -89,7 +92,11 @@ fn prepends_grouped_notes_without_changing_bodies_or_history() {
             .unwrap()
             .is_empty()
     );
-    assert!(release_section(&changelog, "1.1.0").unwrap().contains(body));
+    assert!(
+        release_section(&changelog, "1.1.0")
+            .unwrap()
+            .contains(entry.trim_end_matches('\n'))
+    );
     let fragments = collect_fragments(&repo.root, Path::new("changelog")).unwrap();
     assert!(
         assemble_release(&changelog, &fragments, &options())
@@ -134,9 +141,9 @@ fn rejects_invalid_layouts_and_empty_fragments() {
 #[test]
 fn requires_a_new_fragment_not_only_modifications_or_deletions() {
     let repo = Repo::new();
-    repo.write("changelog/fixed/old-otter.md", "- Original fix.\n");
+    repo.write("changelog/fixed/old-otter.md", "Original fix.\n");
     let base = repo.commit();
-    repo.write("changelog/fixed/old-otter.md", "- Updated fix.\n");
+    repo.write("changelog/fixed/old-otter.md", "Updated fix.\n");
     repo.commit();
     assert!(
         check_fragments(
@@ -148,7 +155,7 @@ fn requires_a_new_fragment_not_only_modifications_or_deletions() {
         )
         .is_err()
     );
-    repo.write("changelog/added/new-narwhal.md", "- New feature.\n");
+    repo.write("changelog/added/new-narwhal.md", "New feature.\n");
     repo.commit();
     check_fragments(
         &repo.root,
@@ -192,7 +199,7 @@ fn range_notes_survive_fragment_migration_and_assembly() {
     );
     repo.write(
         "crates/sdk-core/changelog/added/dancing-otter.md",
-        "- New feature.\n",
+        "New feature.\n",
     );
     repo.commit();
     let directory = Path::new("crates/sdk-core/changelog");
@@ -267,7 +274,7 @@ fn resolves_core_range_from_parent_tags_and_gitlinks() {
 fn cli_prepares_an_explicit_parent_repository() {
     let repo = Repo::new();
     repo.write("CHANGELOG.md", "# Changelog\n");
-    repo.write("changelog/fixed/silly-sloth.md", "- A fix.\n");
+    repo.write("changelog/fixed/silly-sloth.md", "A fix.\n");
     let output = Command::new(env!("CARGO_BIN_EXE_changelog-tool"))
         .args(["prepare", "--repo"])
         .arg(&repo.root)
@@ -284,7 +291,7 @@ fn cli_prepares_an_explicit_parent_repository() {
     assert!(changelog.contains("## [1.1.0] - 2026-10-02"));
     assert!(changelog.contains("- A fix."));
     assert!(!repo.root.join("changelog/fixed/silly-sloth.md").exists());
-    repo.write("changelog/fixed/late-llama.md", "- Late note.\n");
+    repo.write("changelog/fixed/late-llama.md", "Late note.\n");
     let retry = Command::new(env!("CARGO_BIN_EXE_changelog-tool"))
         .args(["prepare", "--repo"])
         .arg(&repo.root)
@@ -303,7 +310,7 @@ fn cli_prepares_an_explicit_parent_repository() {
 fn invalid_fragments_do_not_change_changelog_or_consume_notes() {
     let repo = Repo::new();
     repo.write("CHANGELOG.md", "# Changelog\n");
-    repo.write("changelog/fixed/valid-otter.md", "- A valid note.\n");
+    repo.write("changelog/fixed/valid-otter.md", "A valid note.\n");
     repo.write("changelog/fixed/empty-otter.md", " \n");
     assert!(
         prepare_release(
