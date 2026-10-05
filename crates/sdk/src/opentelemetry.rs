@@ -30,15 +30,15 @@
 //! [`crate::opentelemetry::WorkflowIdGenerator`] in the tracer provider for Workflow spans. If
 //! application code creates Workflow spans, also wrap each span processor in
 //! [`crate::opentelemetry::WorkflowSpanProcessor`]. These types give the same span IDs during
-//! execution and replay. They do not export application spans that finish during replay. The Rust
+//! execution and replay. They do not process application spans that start during replay. The Rust
 //! interceptor API does not support inbound Nexus handler interception.
 
 use ::opentelemetry::{
     Context, KeyValue, global,
     propagation::{Extractor, Injector, TextMapCompositePropagator, TextMapPropagator},
     trace::{
-        FutureExt as _, SpanBuilder, SpanContext, SpanId, SpanKind, Status, TraceContextExt,
-        TraceFlags, TraceId, Tracer,
+        FutureExt as _, Span as _, SpanBuilder, SpanContext, SpanId, SpanKind, Status,
+        TraceContextExt, TraceFlags, TraceId, Tracer,
     },
 };
 use opentelemetry_sdk::{
@@ -46,9 +46,10 @@ use opentelemetry_sdk::{
     resource::Resource,
     trace::{IdGenerator, RandomIdGenerator, SpanData, SpanProcessor},
 };
+use parking_lot::Mutex;
 use std::{
     cell::RefCell,
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fmt::Debug,
     future::Future,
     pin::Pin,
@@ -104,7 +105,7 @@ impl WorkflowContextKey for CurrentOpenTelemetryContext {
     type Value = Context;
 }
 
-/// The Temporal header that OpenTelemetry integrations use in other Temporal SDKs.
+/// The Temporal header that contains OpenTelemetry context.
 pub const TRACE_HEADER_KEY: &str = "_tracer-data";
 /// The OpenTelemetry instrumentation scope that the default tracer uses.
 pub const INSTRUMENTATION_SCOPE: &str = "temporalio-sdk";
@@ -192,19 +193,23 @@ impl IdGenerator for WorkflowIdGenerator {
     }
 }
 
-/// A span processor that does not export application Workflow spans that finish during replay.
+/// A span processor that does not process application Workflow spans that start during replay.
 ///
 /// Wrap each processor in the tracer provider for [`OpenTelemetryPlugin`] when application
 /// Workflow code creates spans. The application flushes and stops the provider and exporters.
 #[derive(Debug)]
 pub struct WorkflowSpanProcessor<P> {
     inner: P,
+    forwarded_spans: Mutex<HashSet<(TraceId, SpanId)>>,
 }
 
 impl<P> WorkflowSpanProcessor<P> {
     /// Prevents the export of replay spans from a span processor.
     pub fn new(inner: P) -> Self {
-        Self { inner }
+        Self {
+            inner,
+            forwarded_spans: Mutex::new(HashSet::new()),
+        }
     }
 
     /// Returns the wrapped processor.
@@ -215,13 +220,20 @@ impl<P> WorkflowSpanProcessor<P> {
 
 impl<P: SpanProcessor> SpanProcessor for WorkflowSpanProcessor<P> {
     fn on_start(&self, span: &mut opentelemetry_sdk::trace::Span, cx: &Context) {
-        self.inner.on_start(span, cx);
-    }
-
-    fn on_end(&self, span: SpanData) {
         let replaying = WORKFLOW_TELEMETRY_STATE
             .with(|state| state.borrow().as_ref().is_some_and(|state| state.replaying));
         if !replaying {
+            let span_context = span.span_context();
+            self.forwarded_spans
+                .lock()
+                .insert((span_context.trace_id(), span_context.span_id()));
+            self.inner.on_start(span, cx);
+        }
+    }
+
+    fn on_end(&self, span: SpanData) {
+        let span_key = (span.span_context.trace_id(), span.span_context.span_id());
+        if self.forwarded_spans.lock().remove(&span_key) {
             self.inner.on_end(span);
         }
     }
@@ -316,6 +328,8 @@ pub struct OpenTelemetryPlugin {
 
 impl OpenTelemetryPlugin {
     /// Creates a plugin that uses the global tracer and W3C propagators.
+    ///
+    /// The global tracer provider must use [`WorkflowIdGenerator`] for replay-safe Workflow spans.
     pub fn new() -> Self {
         Self {
             config: Arc::new(Config {
@@ -332,6 +346,8 @@ impl OpenTelemetryPlugin {
     }
 
     /// Sets the tracer that the plugin uses.
+    ///
+    /// The tracer provider must use [`WorkflowIdGenerator`] for replay-safe Workflow spans.
     pub fn with_tracer<T>(mut self, tracer: T) -> Self
     where
         T: Tracer + Send + Sync + 'static,
@@ -1188,9 +1204,7 @@ mod tests {
     use ::opentelemetry::{
         Context,
         baggage::BaggageExt,
-        trace::{
-            Span as _, SpanContext, SpanId, TraceFlags, TraceId, TraceState, TracerProvider as _,
-        },
+        trace::{SpanContext, SpanId, TraceFlags, TraceId, TraceState, TracerProvider as _},
     };
     use opentelemetry_sdk::trace::{InMemorySpanExporter, SdkTracerProvider, SimpleSpanProcessor};
 
@@ -1310,11 +1324,17 @@ mod tests {
             .build();
         let tracer = provider.tracer("test");
 
+        let mut replayed_span = {
+            let _guard = WorkflowTelemetryStateGuard::enter(None, true);
+            tracer.start("replayed")
+        };
+        replayed_span.end();
+
+        let mut live_span = tracer.start("live");
         {
             let _guard = WorkflowTelemetryStateGuard::enter(None, true);
-            tracer.start("replayed").end();
+            live_span.end();
         }
-        tracer.start("live").end();
 
         let spans = exporter.get_finished_spans().unwrap();
         assert_eq!(spans.len(), 1);
