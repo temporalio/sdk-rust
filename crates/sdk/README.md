@@ -148,13 +148,21 @@ Enable the `opentelemetry` feature. Configure an OpenTelemetry tracer provider. 
 the Temporal client. Workers that use the client automatically get the worker interceptors.
 
 ```rust,no_run
+use opentelemetry::trace::TracerProvider as _;
+use opentelemetry_sdk::trace::SdkTracerProvider;
 use temporalio_client::ClientOptions;
-use temporalio_sdk::opentelemetry::OpenTelemetryPlugin;
+use temporalio_sdk::opentelemetry::{OpenTelemetryPlugin, WorkflowIdGenerator};
+
+let tracer_provider = SdkTracerProvider::builder()
+    .with_id_generator(WorkflowIdGenerator::default())
+    .build();
+let plugin = OpenTelemetryPlugin::new().with_tracer(tracer_provider.tracer("temporalio-sdk"));
 
 let client_options = ClientOptions::new("default")
-    .plugin(OpenTelemetryPlugin::new())
+    .plugin(plugin)
     .build();
 # let _ = client_options;
+# tracer_provider.shutdown().unwrap();
 ```
 
 By default, the plugin uses the OpenTelemetry global tracer. It propagates W3C Trace Context and W3C
@@ -165,7 +173,7 @@ provider and exporters. The application also flushes and shuts down these compon
 
 Use `WorkflowIdGenerator` in the tracer provider for Workflow spans. If application Workflow code
 creates spans, also wrap each span processor in `WorkflowSpanProcessor`. These types keep span IDs
-the same during execution and replay. They do not export application spans that finish during
+the same during execution and replay. They do not export application spans that start during
 replay.
 
 The integration traces client calls, Workflow execution, Workflow message handlers, and Activity
