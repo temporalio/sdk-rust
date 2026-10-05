@@ -59,8 +59,8 @@ fn prepends_grouped_list_items_without_changing_history() {
     );
     repo.write("changelog/README.md", "Instructions");
     repo.write("changelog/fixed/zany-zebra.md", "Last fix.");
-    let body = "A fix.\n\n    indented example\n\n```markdown\n## [1.1.0]\n### Added\n```\n\n## Example\n\nA paragraph with two spaces.  \n";
-    let entry = "- A fix.\n\n      indented example\n\n  ```markdown\n  ## [1.1.0]\n  ### Added\n  ```\n\n  ## Example\n\n  A paragraph with two spaces.  \n";
+    let body = "\r\nA fix with a [documentation link](https://example.com).\r\n \t\r\nAnother fix. This entry has two sentences.\r\n";
+    let entry = "- A fix with a [documentation link](https://example.com).\n- Another fix. This entry has two sentences.\n";
     repo.write("changelog/fixed/amber-otter.md", body);
     repo.write("changelog/added/silly-badger.md", "A feature.\n");
     repo.write(
@@ -83,6 +83,7 @@ fn prepends_grouped_list_items_without_changing_history() {
     assert!(changelog.contains("### Added\n\n- A feature.\n\n"));
     assert!(changelog.contains(entry));
     assert!(changelog.contains("- Last fix.\n\n"));
+    assert_eq!(changelog.matches("\n- ").count(), 5);
     assert!(changelog.ends_with(history));
     assert!(changelog.find(entry).unwrap() < changelog.find("- Last fix.").unwrap());
     assert_eq!(count, 4);
@@ -199,7 +200,7 @@ fn range_notes_survive_fragment_migration_and_assembly() {
     );
     repo.write(
         "crates/sdk-core/changelog/added/dancing-otter.md",
-        "New feature.\n",
+        "New feature.\nAnother feature.\n",
     );
     repo.commit();
     let directory = Path::new("crates/sdk-core/changelog");
@@ -209,6 +210,7 @@ fn range_notes_survive_fragment_migration_and_assembly() {
         .unwrap()
         .join("\n");
     assert_eq!(notes.matches("- New feature.").count(), 1);
+    assert_eq!(notes.matches("- Another feature.").count(), 1);
     assert!(!notes.contains("- Old feature."));
 }
 

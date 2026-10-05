@@ -3,7 +3,7 @@
 use std::{collections::BTreeMap, path::Path};
 
 use crate::{
-    CATEGORIES, ChangelogError, category_sections, fragment_category, fragment_entry, git,
+    CATEGORIES, ChangelogError, category_sections, fragment_category, fragment_entries, git,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -90,7 +90,7 @@ fn snapshot(
         entries
             .entry(heading.into())
             .or_default()
-            .extend(markdown_entries(&fragment_entry(&body)));
+            .extend(markdown_entries(&fragment_entries(&body)));
     }
     Ok(entries)
 }
