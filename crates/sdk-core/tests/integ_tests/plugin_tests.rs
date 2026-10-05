@@ -9,7 +9,7 @@ use opentelemetry_sdk::trace::{
 };
 use std::{
     sync::{
-        Arc, OnceLock,
+        Arc,
         atomic::{
             AtomicU8, AtomicUsize,
             Ordering::{self, Relaxed},
@@ -199,8 +199,6 @@ struct SimplePluginWorkflow;
 
 struct SimplePluginActivities;
 
-static WORKFLOW_OTEL_TRACER: OnceLock<SdkTracer> = OnceLock::new();
-
 #[activities]
 impl SimplePluginActivities {
     #[activity]
@@ -210,16 +208,15 @@ impl SimplePluginActivities {
 }
 
 #[workflow]
-#[derive(Default)]
-struct OpenTelemetryPluginWorkflow;
+struct OpenTelemetryPluginWorkflow {
+    tracer: SdkTracer,
+}
 
-#[workflow_methods]
+#[workflow_methods(factory_only)]
 impl OpenTelemetryPluginWorkflow {
     #[run]
     async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<String> {
-        let tracer = WORKFLOW_OTEL_TRACER
-            .get()
-            .expect("The test must initialize the Workflow tracer.");
+        let tracer = ctx.state(|workflow| workflow.tracer.clone());
         let parent = Context::current();
         let span_context = parent.with_span(tracer.start_with_context("ApplicationSpan", &parent));
         let activity_ctx = ctx.clone();
@@ -335,10 +332,7 @@ async fn opentelemetry_plugin_parents_activity_to_application_workflow_span() {
         )))
         .build();
     let tracer = provider.tracer("integration-test");
-    WORKFLOW_OTEL_TRACER
-        .set(tracer.clone())
-        .expect("The test must initialize the Workflow tracer only once.");
-    let plugin = OpenTelemetryPlugin::new().with_tracer(tracer);
+    let plugin = OpenTelemetryPlugin::new().with_tracer(tracer.clone());
     let client = Client::connect(
         get_integ_server_options(),
         ClientOptions::new(integ_namespace())
@@ -351,7 +345,12 @@ async fn opentelemetry_plugin_parents_activity_to_application_workflow_span() {
     let task_queue = format!("opentelemetry-plugin-{}", Uuid::new_v4());
     let worker_options = WorkerOptions::new(task_queue.clone())
         .register_activities(SimplePluginActivities)
-        .register_workflow::<OpenTelemetryPluginWorkflow>()
+        .register_workflow_with_factory({
+            let tracer = tracer.clone();
+            move || OpenTelemetryPluginWorkflow {
+                tracer: tracer.clone(),
+            }
+        })
         .unwrap()
         .build();
     let mut worker = Worker::new(&runtime, client.clone(), worker_options).unwrap();
@@ -398,7 +397,9 @@ async fn opentelemetry_plugin_parents_activity_to_application_workflow_span() {
     let replayer = WorkflowReplayer::new(
         WorkflowReplayerOptions::new()
             .worker_plugin(plugin)
-            .register_workflow::<OpenTelemetryPluginWorkflow>()
+            .register_workflow_with_factory(move || OpenTelemetryPluginWorkflow {
+                tracer: tracer.clone(),
+            })
             .unwrap()
             .build(),
     )
