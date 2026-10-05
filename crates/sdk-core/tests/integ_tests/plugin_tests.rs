@@ -33,8 +33,9 @@ use temporalio_common::{
 };
 use temporalio_macros::{activities, workflow, workflow_methods};
 use temporalio_sdk::{
-    ActivityOptions, ClientAndWorkerPlugin, Runtime, SimplePlugin, Worker, WorkerOptions,
-    WorkerPlugin, WorkflowContext, WorkflowDefinitions, WorkflowResult,
+    ActivityOptions, ChildWorkflowOptions, ClientAndWorkerPlugin, LocalActivityOptions, Runtime,
+    SimplePlugin, SyncWorkflowContext, Worker, WorkerOptions, WorkerPlugin, WorkflowContext,
+    WorkflowDefinitions, WorkflowResult,
     activities::{ActivityContext, ActivityDefinitions, ActivityError},
     interceptors::WorkerInterceptor,
     opentelemetry::{OpenTelemetryPlugin, WorkflowIdGenerator, WorkflowSpanProcessor},
@@ -212,6 +213,26 @@ struct OpenTelemetryPluginWorkflow {
     tracer: SdkTracer,
 }
 
+#[workflow]
+#[derive(Default)]
+struct OpenTelemetryChildWorkflow {
+    unblocked: bool,
+}
+
+#[workflow_methods]
+impl OpenTelemetryChildWorkflow {
+    #[run]
+    async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<()> {
+        ctx.wait_condition(|workflow| workflow.unblocked).await?;
+        Ok(())
+    }
+
+    #[signal]
+    fn unblock(&mut self, _ctx: &mut SyncWorkflowContext<Self>, _: ()) {
+        self.unblocked = true;
+    }
+}
+
 #[workflow_methods(factory_only)]
 impl OpenTelemetryPluginWorkflow {
     #[run]
@@ -220,15 +241,33 @@ impl OpenTelemetryPluginWorkflow {
         let parent = Context::current();
         let span_context = parent.with_span(tracer.start_with_context("ApplicationSpan", &parent));
         let activity_ctx = ctx.clone();
-        let result = async move {
-            activity_ctx
+        let result: WorkflowResult<String> = async move {
+            let result = activity_ctx
                 .execute_activity(
                     SimplePluginActivities::greet,
                     "Temporal".to_owned(),
                     ActivityOptions::start_to_close_timeout(Duration::from_secs(5)),
                 )
-                .await
-                .map_err(Into::into)
+                .await?;
+            activity_ctx
+                .execute_local_activity(
+                    SimplePluginActivities::greet,
+                    "Temporal".to_owned(),
+                    LocalActivityOptions::default(),
+                )
+                .await?;
+            let child = activity_ctx
+                .start_child_workflow(
+                    OpenTelemetryChildWorkflow::run,
+                    (),
+                    ChildWorkflowOptions::default(),
+                )
+                .await?;
+            child
+                .signal(OpenTelemetryChildWorkflow::unblock, (), Default::default())
+                .await?;
+            child.result().await?;
+            Ok(result)
         }
         .with_context(span_context.clone())
         .await;
@@ -323,7 +362,7 @@ async fn simple_plugin_configures_working_client_and_worker() {
 }
 
 #[tokio::test]
-async fn opentelemetry_plugin_parents_activity_to_application_workflow_span() {
+async fn opentelemetry_plugin_connects_supported_spans_and_replays() {
     let exporter = InMemorySpanExporter::default();
     let provider = SdkTracerProvider::builder()
         .with_id_generator(WorkflowIdGenerator::default())
@@ -345,6 +384,8 @@ async fn opentelemetry_plugin_parents_activity_to_application_workflow_span() {
     let task_queue = format!("opentelemetry-plugin-{}", Uuid::new_v4());
     let worker_options = WorkerOptions::new(task_queue.clone())
         .register_activities(SimplePluginActivities)
+        .register_workflow::<OpenTelemetryChildWorkflow>()
+        .unwrap()
         .register_workflow_with_factory({
             let tracer = tracer.clone();
             move || OpenTelemetryPluginWorkflow {
@@ -384,19 +425,59 @@ async fn opentelemetry_plugin_parents_activity_to_application_workflow_span() {
         .iter()
         .find(|span| span.name == "ApplicationSpan")
         .unwrap();
-    let activity_start = live_spans
+    let application_activity_starts = live_spans
         .iter()
-        .find(|span| span.name.starts_with("StartActivity:"))
+        .filter(|span| {
+            span.name.starts_with("StartActivity:")
+                && span.parent_span_id == application.span_context.span_id()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(application_activity_starts.len(), 2);
+    for activity_start in application_activity_starts {
+        assert!(live_spans.iter().any(|span| {
+            span.name.starts_with("RunActivity:")
+                && span.parent_span_id == activity_start.span_context.span_id()
+        }));
+    }
+
+    let child_start = live_spans
+        .iter()
+        .find(|span| span.name.starts_with("StartChildWorkflow:"))
         .unwrap();
     assert_eq!(
-        activity_start.parent_span_id,
+        child_start.parent_span_id,
         application.span_context.span_id()
     );
+    let child_run = live_spans
+        .iter()
+        .find(|span| {
+            span.name.starts_with("RunWorkflow:")
+                && span.parent_span_id == child_start.span_context.span_id()
+        })
+        .unwrap();
+    let child_signal = live_spans
+        .iter()
+        .find(|span| span.name.starts_with("SignalWorkflow:"))
+        .unwrap();
+    assert_eq!(
+        child_signal.parent_span_id,
+        application.span_context.span_id()
+    );
+    assert!(live_spans.iter().any(|span| {
+        span.name.starts_with("HandleSignal:")
+            && span.parent_span_id == child_signal.span_context.span_id()
+            && span.span_context.trace_id() == child_run.span_context.trace_id()
+    }));
+    for span in &live_spans {
+        assert!(span.span_context.is_valid());
+    }
 
     let history = handle.fetch_history(Default::default());
     let replayer = WorkflowReplayer::new(
         WorkflowReplayerOptions::new()
             .worker_plugin(plugin)
+            .register_workflow::<OpenTelemetryChildWorkflow>()
+            .unwrap()
             .register_workflow_with_factory(move || OpenTelemetryPluginWorkflow {
                 tracer: tracer.clone(),
             })
