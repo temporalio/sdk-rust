@@ -62,11 +62,11 @@ jobs:
       - name: Generate release notes
         run: |
           previous_tag="$(git describe --tags --match 'v[0-9]*' --abbrev=0 HEAD)"
-          cargo run -p changelog-release-notes -- \
+          cargo run -p changelog-release-notes --bin changelog-tool -- release-notes \
+            --version '${{ steps.release.outputs.version }}' \
             --from "$previous_tag" \
             --to HEAD \
-            --changelog rust \
-            >"$RUNNER_TEMP/sdk-release-notes.md"
+            --output "$RUNNER_TEMP/sdk-release-notes.md"
 
           if ! previous_core_tag="$(git describe --tags --match 'core-v[0-9]*' --abbrev=0 HEAD 2>/dev/null)"; then
             previous_core_tag="$previous_tag"

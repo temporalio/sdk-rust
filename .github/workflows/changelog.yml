@@ -9,6 +9,42 @@ permissions:
   pull-requests: read
 
 jobs:
+  changelog-paths:
+    name: Select changelog checks
+    runs-on: ubuntu-latest
+    outputs:
+      core: ${{ steps.paths.outputs.core }}
+      fragments: ${{ steps.paths.outputs.fragments }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - id: paths
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          set -euo pipefail
+          if git diff --quiet "$BASE_SHA" HEAD -- crates/sdk-core/CHANGELOG.md; then
+            echo 'core=false' >> "$GITHUB_OUTPUT"
+          else
+            echo 'core=true' >> "$GITHUB_OUTPUT"
+          fi
+          if git diff --quiet "$BASE_SHA" HEAD -- changelog; then
+            echo 'fragments=false' >> "$GITHUB_OUTPUT"
+          else
+            echo 'fragments=true' >> "$GITHUB_OUTPUT"
+          fi
+
   changelog-check:
     name: Changelog checkpoint
+    needs: changelog-paths
+    if: needs.changelog-paths.outputs.core != 'true' || needs.changelog-paths.outputs.fragments == 'true'
+    uses: temporalio/.github/.github/workflows/changelog-fragments.yml@b87e4183c4b74b7f6d4a2a7f3e77150da55cf733
+    with:
+      sdk-rust-path: '.'
+
+  core-changelog-check:
+    name: Core changelog
+    needs: changelog-paths
+    if: needs.changelog-paths.outputs.core == 'true'
     uses: temporalio/.github/.github/workflows/changelog.yml@d8129c755fbd1d3f18c5a7a5420d5754acc63e3f
