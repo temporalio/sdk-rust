@@ -136,7 +136,7 @@ graph can disable defaults and opt back into the integrations they use.
 - `envconfig`: Support for loading connection settings from environment variables and `temporal.toml` files. |
 - `prometheus`: The Prometheus metrics exporter for `temporalio_common::telemetry`. |
 - `otel`: The OpenTelemetry metrics exporter for `temporalio_common::telemetry`. |
-- `opentelemetry`: OpenTelemetry tracing and cross-SDK W3C trace-context propagation. |
+- `opentelemetry`: Experimental OpenTelemetry tracing and cross-SDK W3C trace-context propagation. Requires the `experimental` feature. |
 - `experimental`: Rust SDK, client, and Workflow APIs that are still under development and may change or be removed. |
 - `testing`: The `testing` module, direct activity test support, and local Temporal CLI dev-server lifecycle management. |
 - `dynamic-tls`: Dynamic mTLS client-certificate resolution for transparent certificate rotation. |
@@ -144,8 +144,9 @@ graph can disable defaults and opt back into the integrations they use.
 
 ### OpenTelemetry tracing
 
-Enable the `opentelemetry` feature. Configure an OpenTelemetry tracer provider. Add the plugin to
-the Temporal client. Workers that use the client automatically get the worker interceptors.
+Enable both the `experimental` and `opentelemetry` features. Configure an OpenTelemetry tracer
+provider. Add the plugin to the Temporal client. Workers that use the client automatically get the
+worker interceptors.
 
 ```rust,no_run
 use opentelemetry::trace::TracerProvider as _;

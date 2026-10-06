@@ -66,9 +66,9 @@ relevant information.
   attempt, including ones whose failure was not sent to the server, and tags size-related failures
   with their specific `failure_reason` (`GrpcMessageTooLarge`, `PayloadsTooLarge`,
   `RequestTooLarge`) on every path.
-* Adds OpenTelemetry integration tracing client, Workflow, and Activity operations and propagating
-  trace context across Temporal invocations. Use `OpenTelemetryPlugin::builder()` to configure a
-  `SimplePlugin`.
+* Adds experimental OpenTelemetry integration tracing client, Workflow, and Activity operations
+  and propagating trace context across Temporal invocations. Use `OpenTelemetryPlugin::builder()`
+  with the `experimental` and `opentelemetry` features to configure a `SimplePlugin`.
 
 ## [1.0.0] - 2026-09-04
 

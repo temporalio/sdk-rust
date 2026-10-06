@@ -2,6 +2,9 @@
 
 //! OpenTelemetry tracing and context propagation for the Temporal Rust SDK.
 //!
+//! **Experimental:** This API may change or be removed. Enable both the `experimental` and
+//! `opentelemetry` features to use it.
+//!
 //! [`crate::opentelemetry::OpenTelemetryPlugin`] installs interceptors for clients, Workflows, and
 //! Activities. The application configures and shuts down its OpenTelemetry provider and exporters.
 //! The plugin puts trace context in the cross-SDK `_tracer-data` Temporal header. By default, the
