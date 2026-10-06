@@ -155,6 +155,15 @@ pub struct WorkflowIdGenerator {
     fallback: RandomIdGenerator,
 }
 
+fn valid_id<T: Eq>(mut generate: impl FnMut() -> T, invalid: T) -> T {
+    loop {
+        let id = generate();
+        if id != invalid {
+            return id;
+        }
+    }
+}
+
 impl IdGenerator for WorkflowIdGenerator {
     fn new_trace_id(&self) -> TraceId {
         WORKFLOW_TELEMETRY_STATE.with(|state| {
@@ -163,12 +172,7 @@ impl IdGenerator for WorkflowIdGenerator {
                 .as_ref()
                 .and_then(|state| state.random.clone())
             {
-                loop {
-                    let id = TraceId::from(random.random::<u128>());
-                    if id != TraceId::INVALID {
-                        return id;
-                    }
-                }
+                return valid_id(|| TraceId::from(random.random::<u128>()), TraceId::INVALID);
             }
             self.fallback.new_trace_id()
         })
@@ -181,12 +185,7 @@ impl IdGenerator for WorkflowIdGenerator {
                 .as_ref()
                 .and_then(|state| state.random.clone())
             {
-                loop {
-                    let id = SpanId::from(random.random::<u64>());
-                    if id != SpanId::INVALID {
-                        return id;
-                    }
-                }
+                return valid_id(|| SpanId::from(random.random::<u64>()), SpanId::INVALID);
             }
             self.fallback.new_span_id()
         })
@@ -523,23 +522,13 @@ fn start_span(
 }
 
 fn replay_span_context(parent: &Context, random: &WorkflowRandomStream) -> Context {
-    let span_id = loop {
-        let id = SpanId::from(random.random::<u64>());
-        if id != SpanId::INVALID {
-            break id;
-        }
-    };
+    let span_id = valid_id(|| SpanId::from(random.random::<u64>()), SpanId::INVALID);
     let parent_span = parent.span();
     let parent_span_context = parent_span.span_context();
     let trace_id = if parent_span_context.is_valid() {
         parent_span_context.trace_id()
     } else {
-        loop {
-            let id = TraceId::from(random.random::<u128>());
-            if id != TraceId::INVALID {
-                break id;
-            }
-        }
+        valid_id(|| TraceId::from(random.random::<u128>()), TraceId::INVALID)
     };
     let trace_flags = if parent_span_context.is_valid() {
         parent_span_context.trace_flags()

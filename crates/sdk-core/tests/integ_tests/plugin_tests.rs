@@ -19,8 +19,8 @@ use std::{
 };
 use temporalio_client::{
     Client, ClientInterceptor, ClientOptions, ClientPlugin, ConnectionOptions, NamespacedClient,
-    Next, PluginError, StartWorkflowInput, StartWorkflowOutput, WorkflowStartOptions,
-    errors::WorkflowStartError,
+    Next, PluginError, StartWorkflowInput, StartWorkflowOutput, WorkflowHistory,
+    WorkflowStartOptions, errors::WorkflowStartError,
 };
 use temporalio_common::{
     data_converters::{
@@ -211,6 +211,18 @@ impl SimplePluginActivities {
 #[workflow]
 struct OpenTelemetryPluginWorkflow {
     tracer: SdkTracer,
+}
+
+#[workflow]
+#[derive(Default)]
+struct OpenTelemetryReplayWorkflow;
+
+#[workflow_methods]
+impl OpenTelemetryReplayWorkflow {
+    #[run]
+    async fn run(_ctx: &mut WorkflowContext<Self>) -> WorkflowResult<()> {
+        Ok(())
+    }
 }
 
 #[workflow]
@@ -490,6 +502,110 @@ async fn opentelemetry_plugin_connects_supported_spans_and_replays() {
         exporter.get_finished_spans().unwrap().len(),
         live_spans.len()
     );
+}
+
+async fn run_opentelemetry_replay_workflow(client: Client) -> WorkflowHistory {
+    let runtime = new_sdk_runtime();
+    let task_queue = format!("opentelemetry-replay-{}", Uuid::new_v4());
+    let mut worker = Worker::new(
+        &runtime,
+        client.clone(),
+        WorkerOptions::new(task_queue.clone())
+            .register_workflow::<OpenTelemetryReplayWorkflow>()
+            .unwrap()
+            .build(),
+    )
+    .unwrap();
+    let handle = client
+        .start_workflow(
+            OpenTelemetryReplayWorkflow::run,
+            (),
+            WorkflowStartOptions::new(
+                task_queue,
+                format!("opentelemetry-replay-{}", Uuid::new_v4()),
+            )
+            .build(),
+        )
+        .await
+        .unwrap();
+
+    let shutdown = worker.shutdown_handle();
+    let (workflow_result, worker_result) = tokio::join!(
+        async {
+            let result = handle.get_result(Default::default()).await;
+            shutdown();
+            result
+        },
+        worker.run(),
+    );
+    worker_result.unwrap();
+    workflow_result.unwrap();
+    handle.fetch_history(Default::default())
+}
+
+#[tokio::test]
+async fn opentelemetry_plugin_replay_compatibility() {
+    let provider = SdkTracerProvider::builder()
+        .with_id_generator(WorkflowIdGenerator::default())
+        .build();
+    let plugin = OpenTelemetryPlugin::new().with_tracer(provider.tracer("replay-test"));
+    let instrumented_client = Client::connect(
+        get_integ_server_options(),
+        ClientOptions::new(integ_namespace())
+            .plugin(plugin.clone())
+            .build(),
+    )
+    .await
+    .unwrap();
+    let instrumented_history = run_opentelemetry_replay_workflow(instrumented_client)
+        .await
+        .to_json()
+        .await
+        .unwrap();
+    WorkflowReplayer::new(
+        WorkflowReplayerOptions::new()
+            .register_workflow::<OpenTelemetryReplayWorkflow>()
+            .unwrap()
+            .build(),
+    )
+    .unwrap()
+    .replay_workflow(WorkflowHistory::from_json(&instrumented_history).unwrap())
+    .await
+    .unwrap();
+
+    let uninstrumented_client = Client::connect(
+        get_integ_server_options(),
+        ClientOptions::new(integ_namespace()).build(),
+    )
+    .await
+    .unwrap();
+    let uninstrumented_history = run_opentelemetry_replay_workflow(uninstrumented_client)
+        .await
+        .to_json()
+        .await
+        .unwrap();
+
+    let replayer = WorkflowReplayer::new(
+        WorkflowReplayerOptions::new()
+            .worker_plugin(plugin)
+            .register_workflow::<OpenTelemetryReplayWorkflow>()
+            .unwrap()
+            .build(),
+    )
+    .unwrap();
+    replayer
+        .replay_workflow(WorkflowHistory::from_json(&uninstrumented_history).unwrap())
+        .await
+        .unwrap();
+    replayer
+        .replay_workflow(
+            WorkflowHistory::from_json(include_bytes!(
+                "../histories/opentelemetry_replay_history.json"
+            ))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
 }
 
 #[tokio::test]

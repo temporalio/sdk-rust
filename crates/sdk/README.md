@@ -167,7 +167,8 @@ let client_options = ClientOptions::new("default")
 
 By default, the plugin uses the OpenTelemetry global tracer. It propagates W3C Trace Context and W3C
 Baggage in the cross-SDK `_tracer-data` Temporal header. The application controls the tracer
-provider and exporters. The application also flushes and shuts down these components. Use
+provider and exporters. The application is also responsible for flushing and shutting down these
+components. Use
 `OpenTelemetryPlugin::with_tracer` and
 `OpenTelemetryPlugin::with_propagator` to configure only this plugin.
 
