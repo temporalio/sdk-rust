@@ -95,7 +95,7 @@ can use the `skip-changelog` label.
 Install the pinned `cargo-edit` with `mise install cargo:cargo-edit`, then run:
 
 ```bash
-cargo prepare-release 1.1.0 0.10.0
+cargo prepare-release 1.2.0 0.11.0
 ```
 
 The adapter validates both changelogs before changing versions. It updates SDK
@@ -111,7 +111,7 @@ repository commits with the shared `release-notes` command. To generate the same
 notes manually:
 
 ```bash
-cargo release-notes --version 1.1.0 --from v1.0.0 --output release-notes.md
+cargo release-notes --version 1.2.0 --from v1.1.0 --output release-notes.md
 ```
 
 Fragments merged after preparation remain pending for the next release. Core

@@ -1,1 +1,0 @@
-Newly recorded local activity results preserve their activation grouping during replay, preventing workflows that wait for the first completion from receiving a result on the wrong activity handle. Histories recorded without grouping information retain the previous replay behavior.
