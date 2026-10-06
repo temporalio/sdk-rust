@@ -104,7 +104,7 @@ impl OpenTelemetryIntegration {
             .telemetry_options(telemetry_options)
             .build()
             .map_err(anyhow::Error::msg)?;
-        let runtime = Arc::new(Runtime::new_assume_tokio(runtime_options)?);
+        let runtime = Arc::new(Runtime::from_current_tokio(runtime_options)?);
         let flush_hook: ShutdownHook = Arc::new(move |_| {
             let meter = meter.clone();
             let tracer_provider = tracer_provider.clone();
