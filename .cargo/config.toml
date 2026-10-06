@@ -5,88 +5,62 @@
 CLI_VERSION_OVERRIDE = "v1.8.3-server-1.32.0-162.0"
 
 [alias]
+# Aliases are strings rather than arrays because Cargo concatenates arrays from nested config
+# files, which duplicates the arguments when a checkout lives inside another (ex: worktrees).
 # Not sure why --all-features doesn't work
-integ-test = [
-    "test",
-    "--features",
-    "temporalio-common/serde_serialize",
-    "--features",
-    "test-utilities",
-    "--features",
-    "ephemeral-server",
-    "--features",
-    "temporalio-sdk/experimental",
-    "--features",
-    "temporalio-sdk-core/otel",
-    "--package",
-    "temporalio-sdk-core",
-    "--test",
-    "integ_runner",
-    "--",
-]
-lint = [
-    "clippy",
-    "--workspace",
-    "--examples",
-    "--all-features",
-    "--test",
-    "integ_tests",
-    "--test",
-    "heavy_tests",
-    "--test",
-    "manual_tests",
-    "--test",
-    "wasm_workflow_tests",
-    "--test",
-    "cloud_tests",
-    "--test",
-    "integ_runner",
-    "--test",
-    "global_metric_tests",
-    "--",
-    "--D",
-    "warnings",
-]
-lint-fix = [
-    "clippy",
-    "--workspace",
-    "--examples",
-    "--all-features",
-    "--test",
-    "integ_tests",
-    "--test",
-    "heavy_tests",
-    "--test",
-    "manual_tests",
-    "--test",
-    "wasm_workflow_tests",
-    "--test",
-    "cloud_tests",
-    "--test",
-    "integ_runner",
-    "--test",
-    "global_metric_tests",
-    "--fix",
-    "--allow-dirty",
-]
-test-lint = [
-    "clippy",
-    "--all",
-    "--all-features",
-    "--examples",
-    "--workspace",
-    "--tests",
-    "--",
-    "--D",
-    "warnings",
-]
-test-lint-fix = [
-    "clippy",
-    "--all",
-    "--all-features",
-    "--examples",
-    "--workspace",
-    "--tests",
-    "--fix",
-    "--allow-dirty",
-]
+integ-test = """\
+    test \
+    --features temporalio-common/serde_serialize \
+    --features test-utilities \
+    --features ephemeral-server \
+    --features temporalio-sdk/experimental \
+    --features temporalio-sdk-core/otel \
+    --package temporalio-sdk-core \
+    --test integ_runner \
+    --"""
+lint = """\
+    clippy \
+    --workspace \
+    --examples \
+    --all-features \
+    --test integ_tests \
+    --test heavy_tests \
+    --test manual_tests \
+    --test wasm_workflow_tests \
+    --test cloud_tests \
+    --test integ_runner \
+    --test global_metric_tests \
+    -- \
+    --D warnings"""
+lint-fix = """\
+    clippy \
+    --workspace \
+    --examples \
+    --all-features \
+    --test integ_tests \
+    --test heavy_tests \
+    --test manual_tests \
+    --test wasm_workflow_tests \
+    --test cloud_tests \
+    --test integ_runner \
+    --test global_metric_tests \
+    --fix \
+    --allow-dirty"""
+test-lint = """\
+    clippy \
+    --all \
+    --all-features \
+    --examples \
+    --workspace \
+    --tests \
+    -- \
+    --D warnings"""
+test-lint-fix = """\
+    clippy \
+    --all \
+    --all-features \
+    --examples \
+    --workspace \
+    --tests \
+    --fix \
+    --allow-dirty"""
