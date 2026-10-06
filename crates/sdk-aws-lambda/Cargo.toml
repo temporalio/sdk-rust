@@ -18,10 +18,10 @@ otel = [
   "dep:opentelemetry",
   "dep:opentelemetry-otlp",
   "dep:opentelemetry_sdk",
-  "dep:tracing-opentelemetry",
-  "dep:tracing-subscriber",
   "temporalio-common/otel",
   "temporalio-sdk/otel",
+  "temporalio-sdk/experimental",
+  "temporalio-sdk/opentelemetry",
 ]
 
 [dependencies]
@@ -41,10 +41,6 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 tokio = { version = "1.47", default-features = false, features = ["sync", "time"] }
 tracing = "0.1"
-tracing-opentelemetry = { version = "0.33", optional = true }
-tracing-subscriber = { version = "0.3", default-features = false, features = [
-  "registry",
-], optional = true }
 
 [dependencies.temporalio-client]
 path = "../client"
@@ -64,14 +60,22 @@ default-features = false
 features = ["envconfig"]
 
 [dev-dependencies]
+futures = "0.3"
+temporalio-macros = { path = "../macros", version = "~1.1.0" }
+temporalio-workflow = { path = "../workflow", version = "~1.1.0" }
 tempfile = "3"
 tokio = { version = "1.47", default-features = false, features = [
   "macros",
   "rt",
+  "rt-multi-thread",
   "sync",
   "test-util",
   "time",
 ] }
+
+[[example]]
+name = "lambda_worker"
+required-features = ["otel"]
 
 [lints]
 workspace = true
