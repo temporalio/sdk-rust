@@ -2109,4 +2109,13 @@ mod tests {
         };
         prepare_to_ship_activation(&mut act);
     }
+    #[test]
+    fn chunking_v2_opt_in_requires_explicit_truthy_value() {
+        for value in [Some("true"), Some("TRUE"), Some("1")] {
+            assert!(parse_wft_chunking_v2_opt_in(value));
+        }
+        for value in [None, Some(""), Some("false"), Some("0"), Some("yes")] {
+            assert!(!parse_wft_chunking_v2_opt_in(value));
+        }
+    }
 }

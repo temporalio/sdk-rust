@@ -312,4 +312,28 @@ mod tests {
         assert!(gathered.sdk_name.is_empty());
         assert_matches!(gathered.sdk_version.as_str(), "ver");
     }
+    #[test]
+    fn chunking_v2_stays_staged_until_first_completion_is_observed() {
+        let mut flags = InternalFlags::new(
+            &Capabilities {
+                sdk_metadata: true,
+                ..Default::default()
+            },
+            "name".to_string(),
+            "ver".to_string(),
+            true,
+        );
+
+        assert_eq!(
+            flags.gather_for_wft_complete().core_used_flags,
+            vec![CoreInternalFlags::WftChunkingV2 as u32]
+        );
+        assert_eq!(
+            flags.gather_for_wft_complete().core_used_flags,
+            vec![CoreInternalFlags::WftChunkingV2 as u32]
+        );
+
+        flags.add_from_complete(&WorkflowTaskCompletedEventAttributes::default());
+        assert!(flags.gather_for_wft_complete().core_used_flags.is_empty());
+    }
 }
