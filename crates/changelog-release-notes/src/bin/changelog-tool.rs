@@ -3,7 +3,7 @@
 use anyhow::{Context, Result};
 use changelog_release_notes::{
     ReleaseOptions, check_fragments, core_notes, prepare_release, published_release_notes,
-    release_section, update_core,
+    published_repository_release_notes, release_section, update_core,
 };
 use chrono::NaiveDate;
 use clap::{Parser, Subcommand};
@@ -31,15 +31,15 @@ enum Command {
         #[arg(long, default_value = "changelog")]
         fragments: PathBuf,
     },
-    #[command(about = "Generate complete release notes from the SDK changelog and Core commits")]
+    #[command(about = "Generate complete release notes from the SDK changelog and Git commits")]
     ReleaseNotes {
         #[arg(long)]
-        submodule: PathBuf,
+        submodule: Option<PathBuf>,
         #[arg(long)]
         version: String,
         #[arg(long, default_value = "CHANGELOG.md")]
         changelog: PathBuf,
-        #[arg(long)]
+        #[arg(long, required_unless_present = "submodule")]
         from: Option<String>,
         #[arg(long, default_value = "HEAD")]
         to: String,
@@ -118,14 +118,24 @@ fn main() -> Result<()> {
             to,
             output,
         } => {
-            let notes = published_release_notes(
-                &repo,
-                &changelog,
-                &submodule,
-                &version,
-                from.as_deref(),
-                &to,
-            )?;
+            let notes = match submodule {
+                Some(submodule) => published_release_notes(
+                    &repo,
+                    &changelog,
+                    &submodule,
+                    &version,
+                    from.as_deref(),
+                    &to,
+                )?,
+                None => published_repository_release_notes(
+                    &repo,
+                    &changelog,
+                    &version,
+                    from.as_deref()
+                        .context("--from is required without --submodule")?,
+                    &to,
+                )?,
+            };
             match output {
                 Some(path) => fs::write(repo.join(path), notes)?,
                 None => print!("{notes}"),

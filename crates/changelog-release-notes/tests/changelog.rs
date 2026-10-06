@@ -6,7 +6,8 @@ use std::{
 
 use changelog_release_notes::{
     ReleaseOptions, assemble_release, check_fragments, collect_fragments, core_notes, git,
-    prepare_release, previous_release_tag, published_release_notes, release_section, update_core,
+    prepare_release, previous_release_tag, published_release_notes,
+    published_repository_release_notes, release_section, update_core,
 };
 use chrono::NaiveDate;
 #[cfg(unix)]
@@ -40,6 +41,57 @@ impl Repo {
             .trim()
             .into()
     }
+}
+
+#[test]
+fn repository_notes_use_completed_release_and_keep_late_fragments_pending() {
+    let repo = Repo::new();
+    repo.write(
+        "CHANGELOG.md",
+        "# Changelog\n\n## [1.0.0] - 2026-01-01\n\nOld.\n",
+    );
+    repo.commit();
+    git(&repo.root, &["tag", "v1.0.0"]).unwrap();
+    repo.write(
+        "changelog/stabilized/waltzing-walrus.md",
+        "Stable feature.\nSecond entry.\n",
+    );
+    prepare_release(
+        &repo.root,
+        Path::new("CHANGELOG.md"),
+        Path::new("changelog"),
+        &options(),
+    )
+    .unwrap();
+    repo.commit();
+    repo.write("changelog/fixed/dancing-duck.md", "A later fix.\n");
+    repo.commit();
+    let notes = published_repository_release_notes(
+        &repo.root,
+        Path::new("CHANGELOG.md"),
+        "1.1.0",
+        "v1.0.0",
+        "HEAD",
+    )
+    .unwrap();
+    assert!(notes.starts_with(
+        "## Notable Changes\n\n### Stabilized\n\n- Stable feature.\n- Second entry.\n"
+    ));
+    assert!(notes.contains("### Commits\n\n- [`"));
+    assert!(!notes.contains("A later fix."));
+    assert!(!notes.contains("Old."));
+    assert!(!notes.contains("SDK Core Commits"));
+    assert!(repo.root.join("changelog/fixed/dancing-duck.md").exists());
+    assert!(
+        published_repository_release_notes(
+            &repo.root,
+            Path::new("CHANGELOG.md"),
+            "9.9.9",
+            "v1.0.0",
+            "HEAD",
+        )
+        .is_err()
+    );
 }
 
 fn core_parent(core: &Repo, revision: &str) -> Repo {

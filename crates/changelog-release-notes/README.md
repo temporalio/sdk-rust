@@ -41,12 +41,15 @@ Commands:
 * `notes --version <version> [--changelog CHANGELOG.md]` prints that dated release's
   body as Markdown, excluding the version heading. Empty release sections produce
   no output; missing release sections are errors.
-* `release-notes --version <version> --submodule <path> [--changelog CHANGELOG.md]
+* `release-notes --version <version> [--submodule <path>] [--changelog CHANGELOG.md]
   [--from <parent-ref> --to HEAD] [--output <file>]` generates complete publishing
-  notes. It reads the dated language changelog under `## Notable Changes`, then
-  appends Core commit links under `### SDK Core Commits` when the range is nonempty.
+  notes. It reads the dated SDK changelog under `## Notable Changes`. With
+  `--submodule`, it appends Core commit links under `### SDK Core Commits` when
+  the range is nonempty. Without a submodule, `--from` is required and the
+  repository's own commit links appear under `### Commits`; Rust's publishing
+  workflow uses this form with its previous `v<version>` tag.
   It never collects Core changelog entries at release time. Core revisions come
-  from the parent repository's Git links; the default baseline is the greatest
+  from the parent repository's Git links; the default Core baseline is the greatest
   numeric release tag below the version, accepting an optional `v` prefix
   (for example, `1.9.0` or `v1.9.0`). Other tag conventions can pass `--from`.
   Output goes to stdout unless a file is supplied. Relative output paths resolve
@@ -95,5 +98,7 @@ tool from the SDK's pinned submodule and use the checked-out commit as the basel
 The existing `changelog-release-notes --from <sha> --to <sha>
 [--changelog rust|core]` interface remains available. Its history traversal includes
 fragments beside the selected master changelog, allowing ranges across migration
-and assembly without duplicating notes. Rust's own contributor convention and
-`prepare-release` binary retain their current Unreleased workflow until migrated.
+and assembly without duplicating notes. Rust SDK contributions use root `changelog/`
+fragments. Its `prepare-release` adapter updates crate versions, then invokes shared
+preparation for the root changelog. Core's changelog retains its Unreleased workflow.
+See the repository [contributing guide](../../CONTRIBUTING.md#preparing-a-release).

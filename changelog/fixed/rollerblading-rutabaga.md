@@ -1,0 +1,1 @@
+`temporalio-common`'s build script now generates its payload-visitor implementations in a stable order. This prevents compilation caches such as sccache from missing `temporalio-common` and downstream crates on every build because of nondeterministic generated code.

@@ -15,18 +15,8 @@ change that no SDK user can observe belongs in neither. The same applies to the 
 Core shares: temporalio-client, temporalio-common, temporalio-common-wasm,
 temporalio-macros, and temporalio-protos.
 
-When your PR includes a user-facing change, add an entry below under the
-appropriate heading (create the heading if it does not yet exist) in the
-Unreleased section — never under a released version. Within each heading content
-can be free-form. Feel free to include examples, links to docs, or any other
-relevant information.
-
-### Added            — new features
-### Changed          — changes in existing functionality
-### Deprecated       — soon-to-be-removed features
-### Breaking Changes — removed or backwards-incompatible features
-### Fixed            — notable bug fixes
-### Security         — notable security fixes
+Pending Rust SDK changes belong in changelog/; see changelog/README.md.
+This file contains completed Rust SDK releases only.
 -->
 
 # Changelog
