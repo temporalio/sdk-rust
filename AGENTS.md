@@ -33,12 +33,6 @@ document as your quick reference when submitting pull requests.
 
 ## Repo Specific Utilities
 
-- Language SDKs should update their Core pin with `changelog-tool update-core`,
-  which also imports Core changelog entries as language fragments. Keep this
-  behavior in the shared `changelog-release-notes` crate. SDK adapters own version
-  and lockfile updates, then invoke `prepare`; publishing invokes `release-notes`
-  for the completed changelog and Core commit list. See the crate README.
-
 - `.cargo/config.toml` defines useful cargo aliases:
   - `cargo lint` – run clippy on workspace crates and integration tests
   - `cargo test-lint` – run clippy on unit tests
