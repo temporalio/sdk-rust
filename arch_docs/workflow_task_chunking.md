@@ -11,6 +11,12 @@ an activity waiter updating workflow state, while a truly empty task can be a
 heartbeat for an outstanding local activity. Folding those tasks indiscriminately
 can change which state an Update observes during replay.
 
+This design builds on [PR #1597](https://github.com/temporalio/sdk-rust/pull/1597)
+by [hikaru-212](https://github.com/hikaru-212), whose contribution uses Update
+sequencing to preserve Workflow Task boundaries and adds regression coverage for
+that behavior. This rework extends that approach with complete command-batch
+scanning and run-level version selection.
+
 ## Boundary rules
 
 The original chunker remains available as v1 for existing runs. The opt-in v2
