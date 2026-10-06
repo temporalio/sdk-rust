@@ -400,7 +400,7 @@ impl ManagedRun {
                     run_id: self.run_id().to_string(),
                 }))
             } else if let Some(wte) = self.trying_to_evict.clone()
-                && !self.la_cancels_undelivered()
+                && !self.has_undelivered_la_cancels()
             {
                 let act =
                     create_evict_activation(self.run_id().to_string(), wte.message, wte.reason);
@@ -411,11 +411,14 @@ impl ManagedRun {
         }
     }
 
-    /// Completing an eviction makes the LA manager forget this run's local activities, so a cancel
-    /// still queued for one of them at that point would be dropped as untracked once polled. The
-    /// eviction is withheld while this is true, and the LA manager wakes the run when a queued
-    /// cancel is handed to lang.
-    fn la_cancels_undelivered(&self) -> bool {
+    /// Returns true while a cancellation for one of this run's in-flight local activities is
+    /// queued but has not yet been returned from an activity poll.
+    ///
+    /// Completing an eviction makes the LA manager forget this run's local activities, so a
+    /// cancellation still queued at that point would later be dropped as untracked. The eviction
+    /// is therefore withheld while this returns true, and the LA manager wakes the run when a
+    /// queued cancellation is handed to lang.
+    fn has_undelivered_la_cancels(&self) -> bool {
         self.local_activity_request_sink
             .as_ref()
             .is_some_and(|sink| sink.has_undelivered_cancels(self.run_id()))
@@ -1081,7 +1084,7 @@ impl ManagedRun {
                             // as long as there's no other outstanding work.
                             if self.activation.is_none()
                                 && !self.more_pending_work()
-                                && !self.la_cancels_undelivered()
+                                && !self.has_undelivered_la_cancels()
                             {
                                 let mut evict_act = create_evict_activation(
                                     self.run_id().to_string(),
