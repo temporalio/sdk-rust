@@ -91,6 +91,7 @@ pub fn update_core(
                     "Core entry in {heading} contains block Markdown; rewrite it as concise prose before importing: {first}"
                 );
             }
+            body.push_str("Core: ");
             body.push_str(first);
             for line in continuation {
                 body.push(' ');

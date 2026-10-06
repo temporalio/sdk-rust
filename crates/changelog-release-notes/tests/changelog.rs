@@ -79,9 +79,9 @@ fn core_update_through_preparation_and_publishing() {
     );
     let old = core.commit();
     let parent = core_parent(&core, &old);
-    core.write(path, "# Changelog\n\n## Unreleased\n\n### Fixed\n- Existing fix.\n* A new fix with\n  a [link](https://example.com).\n\n### Breaking Changes\n- A breaking change.\n");
+    core.write(path, "# Changelog\n\n## Unreleased\n\n### Fixed\n- Existing fix.\n* A new fix with\n  a [link](https://example.com).\n* Another new fix.\n\n### Breaking Changes\n- A breaking change.\n");
     core.commit();
-    core.write(path, "# Changelog\n\n## Unreleased\n\n## [1.0.0] - 2026-10-02\n\n### Fixed\n- Existing fix.\n* A new fix with\n  a [link](https://example.com).\n\n### Breaking Changes\n- A breaking change.\n");
+    core.write(path, "# Changelog\n\n## Unreleased\n\n## [1.0.0] - 2026-10-02\n\n### Fixed\n- Existing fix.\n* A new fix with\n  a [link](https://example.com).\n* Another new fix.\n\n### Breaking Changes\n- A breaking change.\n");
     let new = core.commit();
     assert_eq!(
         update_core(
@@ -101,10 +101,10 @@ fn core_update_through_preparation_and_publishing() {
         new
     );
     let fragments = collect_fragments(&parent.root, Path::new("changelog")).unwrap();
-    assert_eq!(fragments[0].body, "A breaking change.\n");
+    assert_eq!(fragments[0].body, "Core: A breaking change.\n");
     assert_eq!(
         fragments[1].body,
-        "A new fix with a [link](https://example.com).\n"
+        "Core: A new fix with a [link](https://example.com).\nCore: Another new fix.\n"
     );
     assert_eq!(
         Path::new(&fragments[0].path).file_name(),
@@ -140,8 +140,9 @@ fn core_update_through_preparation_and_publishing() {
         "HEAD",
     )
     .unwrap();
-    assert_eq!(notes.matches("- A new fix").count(), 1);
-    assert!(notes.contains("### :boom: Breaking Changes\n\n- A breaking change."));
+    assert_eq!(notes.matches("- Core: A new fix").count(), 1);
+    assert_eq!(notes.matches("- Core: Another new fix.").count(), 1);
+    assert!(notes.contains("### :boom: Breaking Changes\n\n- Core: A breaking change."));
     assert!(notes.contains("- A language fix."));
     assert!(notes.contains("### SDK Core Commits\n\n- [`"));
     assert!(!notes.contains("#### Commits"));
@@ -211,8 +212,8 @@ fn consecutive_updates_only_import_each_new_range() {
         .iter()
         .map(|fragment| fragment.body.as_str())
         .collect::<String>();
-    assert_eq!(bodies.matches("First fix.").count(), 1);
-    assert_eq!(bodies.matches("Second fix.").count(), 1);
+    assert_eq!(bodies.matches("Core: First fix.").count(), 1);
+    assert_eq!(bodies.matches("Core: Second fix.").count(), 1);
 }
 
 #[test]
@@ -240,7 +241,7 @@ fn explicit_baseline_backfills_an_already_updated_pin() {
     );
     assert_eq!(
         collect_fragments(&parent.root, Path::new("changelog")).unwrap()[0].body,
-        "A feature is stable.\n"
+        "Core: A feature is stable.\n"
     );
 }
 

@@ -20,7 +20,8 @@ Commands:
   Core must be initialized and clean. Unchanged pins create no fragments.
   Filenames are generated from petname's large word lists, with collision retries;
   affected categories share a stem. Each complete Core entry becomes one line,
-  without its source list marker. Inline Markdown is preserved; unsupported block
+  without its source list marker and prefixed with `Core: ` to distinguish it
+  from language SDK changes. Inline Markdown is preserved; unsupported block
   Markdown and unknown categories cause an error before the checkout changes.
   Review and commit the pin and generated fragments together. The command does
   not stage, commit, update language lockfiles, or resolve bridge compatibility.
