@@ -16,7 +16,7 @@ use crate::{
         PollerBehavior, SlotMarkUsedContext, SlotReleaseContext, SlotReservationContext,
         SlotSupplier, SlotSupplierPermit, TunerBuilder, WorkflowSlotKind,
         client::mocks::{mock_manual_worker_client, mock_worker_client},
-        workflow::parse_wft_chunking_v2_opt_in,
+        parse_wft_chunking_v2_opt_in,
     },
 };
 use futures_util::{FutureExt, stream};
@@ -2483,6 +2483,20 @@ async fn ensure_fetching_fail_during_complete_sends_task_failure() {
         .await
         .unwrap();
 
+    let wf_task = core.poll_workflow_activation().await.unwrap();
+    assert_matches!(
+        wf_task.jobs.as_slice(),
+        [WorkflowActivationJob {
+            variant: Some(workflow_activation_job::Variant::SignalWorkflow(_)),
+        }]
+    );
+    core.complete_workflow_activation(WorkflowActivationCompletion::from_cmd(
+        wf_task.run_id,
+        start_timer_cmd(1, Duration::from_secs(1)),
+    ))
+    .await
+    .unwrap();
+
     // Expect to see eviction b/c of history fetching error here.
     let wf_task = core.poll_workflow_activation().await.unwrap();
     assert_matches!(
@@ -3546,6 +3560,19 @@ async fn unknown_first_completion_flag_fails_polled_task() {
     });
     let worker = mock_worker(build_mock_pollers(mh));
 
+    for _ in 0..2 {
+        let activation = worker.poll_workflow_activation().await.unwrap();
+        assert_matches!(
+            activation.jobs.as_slice(),
+            [WorkflowActivationJob {
+                variant: Some(workflow_activation_job::Variant::RemoveFromCache(eviction)),
+            }] if eviction.message.contains("Unknown Core flag 1000000")
+        );
+        worker
+            .complete_workflow_activation(WorkflowActivationCompletion::empty(activation.run_id))
+            .await
+            .unwrap();
+    }
     assert_matches!(
         worker.poll_workflow_activation().await,
         Err(PollError::ShutDown)

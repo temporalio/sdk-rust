@@ -56,7 +56,7 @@ use temporalio_sdk::{
     CancellableFuture, LocalActivityOptions, TimeoutType, Worker, WorkflowContext,
     WorkflowContextView, WorkflowResult,
     activities::{ActivityContext, ActivityError},
-    interceptors::WorkerInterceptor,
+    interceptors::{ReturnWorkflowExitValueInterceptor, WorkerInterceptor},
 };
 use temporalio_sdk_core::{
     PollError, TunerHolder, prost_dur,
@@ -65,9 +65,9 @@ use temporalio_sdk_core::{
         canned_histories, default_wes_attribs,
     },
     test_help::{
-        LEGACY_QUERY_ID, MockPollCfg, ResponseType, WorkerExt, WorkerTestHelpers,
-        build_mock_pollers, hist_to_poll_resp, mock_worker, mock_worker_client, query_ok,
-        schedule_local_activity_cmd, single_hist_mock_sg, start_timer_cmd,
+        CoreInternalFlags, LEGACY_QUERY_ID, MockPollCfg, ResponseType, WorkerExt,
+        WorkerTestHelpers, build_mock_pollers, hist_to_poll_resp, mock_worker, mock_worker_client,
+        query_ok, schedule_local_activity_cmd, single_hist_mock_sg, start_timer_cmd,
     },
 };
 use tokio::{
@@ -1166,7 +1166,7 @@ async fn long_local_activity_with_update(
             Ok(ctx.state(|wf| wf.update_counter))
         }
 
-        #[update]
+        #[update(name = "update")]
         async fn do_update(ctx: &mut WorkflowContext<Self>, _: ()) {
             let update_inner_timer = ctx.state(|s| s.update_inner_timer);
             if update_inner_timer != 0 {
@@ -1187,7 +1187,9 @@ async fn long_local_activity_with_update(
         .submit_workflow(
             LongLocalActivityWithUpdateWf::run,
             update_inner_timer,
-            WorkflowStartOptions::new(task_queue, wf_name.to_owned()).build(),
+            WorkflowStartOptions::new(task_queue, wf_name.to_owned())
+                .task_timeout(Duration::from_secs(1))
+                .build(),
         )
         .await
         .unwrap();
@@ -1209,24 +1211,94 @@ async fn long_local_activity_with_update(
     };
     tokio::select!(_ = update => {}, _ = runner => {});
     let res = handle.get_result(Default::default()).await.unwrap();
+    assert!(
+        res > 1,
+        "an Update must finish while the local activity is running"
+    );
+    let history = handle
+        .fetch_history(Default::default())
+        .into_events()
+        .await
+        .unwrap();
+    let first_flags = history
+        .iter()
+        .find_map(|event| match &event.attributes {
+            Some(history_event::Attributes::WorkflowTaskCompletedEventAttributes(attrs)) => {
+                Some(attrs.sdk_metadata.as_ref())
+            }
+            _ => None,
+        })
+        .expect("workflow must have a successful task completion");
+    let writer_enabled = std::env::var("TEMPORAL_USE_WFT_CHUNKING_V2")
+        .ok()
+        .is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("true"));
+    assert_eq!(
+        first_flags.is_some_and(|metadata| {
+            metadata
+                .core_used_flags
+                .contains(&(CoreInternalFlags::WftChunkingV2 as u32))
+        }),
+        writer_enabled,
+        "the first durable completion must preserve the writer's chunking choice"
+    );
     let replay_res = handle.fetch_history_and_replay(&mut worker).await.unwrap();
     assert_eq!(res, usize::from_json_payload(&replay_res.unwrap()).unwrap());
 
-    // Load histories from pre-fix version and ensure compat
+    // These fixtures predate typed workflow registration and use the test name as their type.
+    let mut old_history = history_from_proto_binary(&format!("{wf_name}_history.bin"))
+        .await
+        .unwrap();
+    let Some(history_event::Attributes::WorkflowExecutionStartedEventAttributes(attrs)) =
+        old_history.events.first_mut().unwrap().attributes.as_mut()
+    else {
+        panic!("fixture must begin with WorkflowExecutionStarted");
+    };
+    attrs.workflow_type.as_mut().unwrap().name = "LongLocalActivityWithUpdateWf".to_owned();
+    // The original workflow closure captured this case's timer instead of taking an input.
+    assert!(
+        attrs
+            .input
+            .as_ref()
+            .is_none_or(|input| input.payloads.is_empty())
+    );
+    attrs.input.get_or_insert_default().payloads =
+        vec![update_inner_timer.as_json_payload().unwrap()];
     let replay_worker = init_core_replay_preloaded(
         starter.get_task_queue(),
-        [HistoryForReplay::new(
-            history_from_proto_binary(&format!("{wf_name}_history.bin"))
-                .await
-                .unwrap(),
-            "fake".to_owned(),
-        )],
+        [HistoryForReplay::new(old_history, "fake".to_owned())],
     );
     worker
         .inner_mut()
         .with_new_core_worker(Arc::new(replay_worker));
-    worker.set_worker_interceptor(FailOnNondeterminismInterceptor {});
+    struct CheckLegacyReplay(ReturnWorkflowExitValueInterceptor);
+
+    #[async_trait::async_trait(?Send)]
+    impl WorkerInterceptor for CheckLegacyReplay {
+        async fn on_workflow_activation(
+            &self,
+            activation: &WorkflowActivation,
+        ) -> Result<(), anyhow::Error> {
+            FailOnNondeterminismInterceptor {}
+                .on_workflow_activation(activation)
+                .await
+        }
+
+        async fn on_workflow_activation_completion(
+            &self,
+            completion: &WorkflowActivationCompletion,
+        ) {
+            self.0.on_workflow_activation_completion(completion).await;
+        }
+    }
+
+    let result_interceptor = ReturnWorkflowExitValueInterceptor::default();
+    let old_result = result_interceptor.result_handle();
+    worker.set_worker_interceptor(CheckLegacyReplay(result_interceptor));
     worker.inner_mut().run().await.unwrap();
+    assert!(
+        usize::from_json_payload(old_result.get().expect("legacy replay must complete")).unwrap()
+            > 1
+    );
 }
 
 #[tokio::test]

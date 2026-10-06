@@ -88,6 +88,8 @@ pub(crate) struct WorkflowMachines {
     last_history_from_server: HistoryUpdate,
     /// Protocol messages that have yet to be processed for the current WFT.
     protocol_msgs: Vec<IncomingProtocolMessage>,
+    chunking_version: super::super::chunking::RunVersion,
+    live_update_positions: Vec<i64>,
     /// EventId of the last handled WorkflowTaskStarted event
     current_started_event_id: i64,
     /// The event id of the next workflow task started event that the machines need to process.
@@ -272,6 +274,8 @@ impl WorkflowMachines {
         Self {
             last_history_from_server: basics.history,
             protocol_msgs: vec![],
+            chunking_version: Default::default(),
+            live_update_positions: vec![],
             workflow_id: basics.workflow_id,
             workflow_type: basics.workflow_type,
             run_id: basics.run_id,
@@ -329,13 +333,42 @@ impl WorkflowMachines {
         if !self.protocol_msgs.is_empty() {
             dbg_panic!("There are unprocessed protocol messages while receiving new work");
         }
+        self.live_update_positions = protocol_messages
+            .iter()
+            .filter_map(|message| match message.sequencing_id {
+                Some(SequencingId::EventId(id)) => Some(id),
+                _ => None,
+            })
+            .collect();
+        self.live_update_positions.sort_unstable();
+        self.live_update_positions.dedup();
+        self.last_history_from_server = HistoryUpdate::dummy();
         self.protocol_msgs = protocol_messages;
         self.new_history_from_server(update)?;
         Ok(())
     }
 
     pub(crate) fn new_history_from_server(&mut self, update: HistoryUpdate) -> Result<()> {
-        self.last_history_from_server = update;
+        self.chunking_version
+            .observe(update.get_events())
+            .map_err(|error| nondeterminism!("{error}"))?;
+        if self.chunking_version.selected().is_none()
+            && update.first_event_id() == Some(1)
+            && super::super::chunking_v2_enabled()
+        {
+            self.observed_internal_flags
+                .borrow_mut()
+                .try_use(CoreInternalFlags::WftChunkingV2, true);
+        }
+        self.last_history_from_server.append(update);
+        self.last_history_from_server.chunking_v2 =
+            self.chunking_version.selected().unwrap_or_else(|| {
+                super::super::chunking_v2_enabled()
+                    && self.observed_internal_flags.borrow().can_write_metadata()
+            });
+        self.last_history_from_server
+            .update_positions
+            .clone_from(&self.live_update_positions);
         self.replaying = self.last_history_from_server.previous_wft_started_id > 0;
         self.apply_next_wft_from_history()?;
         Ok(())
@@ -778,10 +811,13 @@ impl WorkflowMachines {
         // Alternatively, lookahead can seemingly be avoided if we were to consider the commands
         // that follow a WFT to be _part of_ that wft rather than the next one. That change might
         // make sense to do, and maybe simplifies things slightly, but is a substantial alteration.
-        for e in self
-            .last_history_from_server
-            .peek_next_wft_sequence(last_handled_wft_started_id)
-        {
+        let lookahead = if self.last_history_from_server.chunking_v2 {
+            self.last_history_from_server.peek_commands()
+        } else {
+            self.last_history_from_server
+                .peek_next_wft_sequence(self.last_processed_event)
+        };
+        for e in lookahead {
             if let Some((patch_id, _)) = e.get_patch_marker_details() {
                 self.encountered_patch_markers.insert(
                     patch_id.clone(),
@@ -1856,4 +1892,118 @@ enum CommandIdKind {
     CoreInternal,
     /// A command which is fire-and-forget (ex: Upsert search attribs)
     NeverResolves,
+}
+
+#[cfg(test)]
+mod chunking_tests {
+    use super::*;
+    use crate::{replay::TestHistoryBuilder, test_help::test_worker_cfg};
+    use temporalio_common::protos::temporal::api::workflowservice::v1::get_system_info_response::Capabilities;
+
+    #[rstest::rstest]
+    #[case::legacy(false)]
+    #[case::v2(true)]
+    fn first_completion_controls_sticky_and_reloaded_runs(
+        #[case] recorded_v2: bool,
+        #[values(false, true)] metadata_supported: bool,
+    ) {
+        let capabilities = Capabilities {
+            sdk_metadata: metadata_supported,
+            ..Default::default()
+        };
+        let new_run = || {
+            let (workflow, _) = DrivenWorkflow::new();
+            WorkflowMachines::new(
+                RunBasics {
+                    worker_config: test_worker_cfg().build().unwrap().into(),
+                    workflow_id: "chunking".into(),
+                    workflow_type: "chunking".into(),
+                    run_id: "same-run".into(),
+                    history: HistoryUpdate::dummy(),
+                    metrics: MetricsContext::no_op(),
+                    capabilities: &capabilities,
+                    sdk_name: "test",
+                    sdk_version: "test",
+                },
+                workflow,
+            )
+        };
+        let mut machines = new_run();
+        let mut history = TestHistoryBuilder::default();
+        history.add_by_type(EventType::WorkflowExecutionStarted);
+        history.add_workflow_task_scheduled_and_started();
+        machines
+            .new_work_from_server(history.get_full_history_info().unwrap().into(), vec![])
+            .unwrap();
+        let staged = machines
+            .observed_internal_flags
+            .borrow_mut()
+            .gather_for_wft_complete();
+        assert_eq!(
+            staged
+                .core_used_flags
+                .contains(&(CoreInternalFlags::WftChunkingV2 as u32)),
+            metadata_supported && super::super::super::chunking_v2_enabled()
+        );
+        machines.get_wf_activation();
+
+        history.add_workflow_task_completed();
+        history.set_flags_first_wft(
+            if recorded_v2 {
+                &[CoreInternalFlags::WftChunkingV2]
+            } else {
+                &[]
+            },
+            &[],
+        );
+        history.add_workflow_task_scheduled_and_started();
+        let events = history.get_full_history_info().unwrap().into_events();
+        let sticky = HistoryUpdate::from_events(
+            events.into_iter().filter(|event| event.event_id > 3),
+            3,
+            6,
+            true,
+        )
+        .0;
+        machines.new_work_from_server(sticky, vec![]).unwrap();
+        assert_eq!(machines.chunking_version.selected(), Some(recorded_v2));
+        assert_eq!(machines.last_history_from_server.chunking_v2, recorded_v2);
+        assert!(
+            !machines
+                .observed_internal_flags
+                .borrow_mut()
+                .gather_for_wft_complete()
+                .core_used_flags
+                .contains(&(CoreInternalFlags::WftChunkingV2 as u32))
+        );
+
+        history.add_workflow_task_completed();
+        history.set_flags_last_wft(
+            if recorded_v2 {
+                &[]
+            } else {
+                &[CoreInternalFlags::WftChunkingV2]
+            },
+            &[],
+        );
+        history.add_workflow_task_scheduled_and_started();
+        let events = history.get_full_history_info().unwrap().into_events();
+        let sticky = HistoryUpdate::from_events(
+            events.into_iter().filter(|event| event.event_id > 6),
+            6,
+            9,
+            true,
+        )
+        .0;
+        machines.new_work_from_server(sticky, vec![]).unwrap();
+        assert_eq!(machines.chunking_version.selected(), Some(recorded_v2));
+        assert_eq!(machines.last_history_from_server.chunking_v2, recorded_v2);
+
+        let mut reloaded = new_run();
+        reloaded
+            .new_work_from_server(history.get_full_history_info().unwrap().into(), vec![])
+            .unwrap();
+        assert_eq!(reloaded.chunking_version.selected(), Some(recorded_v2));
+        assert_eq!(reloaded.last_history_from_server.chunking_v2, recorded_v2);
+    }
 }

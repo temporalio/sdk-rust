@@ -46,6 +46,9 @@ relevant information.
   are now distinguished by `StartChildWorkflowExecutionFailedCause::NamespaceNotFound`.
 
 ### Fixed
+* Opting in with `TEMPORAL_USE_WFT_CHUNKING_V2=true` preserves workflow activation boundaries
+  around Updates and commandless tasks during replay, including paginated histories. The setting
+  applies to new runs on servers with SDK metadata support; existing runs retain their recorded behavior.
 * `temporalio-common`'s build script now generates its payload-visitor implementations in a
   stable order. The generated code was emitted in `HashSet`/`HashMap` iteration order, so its
   content changed on every build and a compilation cache such as sccache missed
