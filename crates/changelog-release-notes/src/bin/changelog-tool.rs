@@ -2,7 +2,8 @@
 
 use anyhow::{Context, Result};
 use changelog_release_notes::{
-    ReleaseOptions, check_fragments, core_notes, prepare_release, release_section,
+    ReleaseOptions, check_fragments, core_notes, prepare_release, published_release_notes,
+    release_section, update_core,
 };
 use chrono::NaiveDate;
 use clap::{Parser, Subcommand};
@@ -19,6 +20,32 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    #[command(about = "Update Core and import its changelog entries as SDK fragments")]
+    UpdateCore {
+        #[arg(long)]
+        submodule: PathBuf,
+        #[arg(long)]
+        revision: Option<String>,
+        #[arg(long)]
+        from: Option<String>,
+        #[arg(long, default_value = "changelog")]
+        fragments: PathBuf,
+    },
+    #[command(about = "Generate complete release notes from the SDK changelog and Core commits")]
+    ReleaseNotes {
+        #[arg(long)]
+        submodule: PathBuf,
+        #[arg(long)]
+        version: String,
+        #[arg(long, default_value = "CHANGELOG.md")]
+        changelog: PathBuf,
+        #[arg(long)]
+        from: Option<String>,
+        #[arg(long, default_value = "HEAD")]
+        to: String,
+        #[arg(long)]
+        output: Option<PathBuf>,
+    },
     #[command(about = "Validate fragments and optionally require a new PR fragment")]
     Check {
         #[arg(long, default_value = "changelog")]
@@ -68,6 +95,42 @@ fn main() -> Result<()> {
         .canonicalize()
         .with_context(|| format!("invalid repository: {}", cli.repo.display()))?;
     match cli.command {
+        Command::UpdateCore {
+            submodule,
+            revision,
+            from,
+            fragments,
+        } => {
+            let count = update_core(
+                &repo,
+                &submodule,
+                &fragments,
+                revision.as_deref(),
+                from.as_deref(),
+            )?;
+            println!("Updated Core; created {count} changelog fragments");
+        }
+        Command::ReleaseNotes {
+            submodule,
+            version,
+            changelog,
+            from,
+            to,
+            output,
+        } => {
+            let notes = published_release_notes(
+                &repo,
+                &changelog,
+                &submodule,
+                &version,
+                from.as_deref(),
+                &to,
+            )?;
+            match output {
+                Some(path) => fs::write(repo.join(path), notes)?,
+                None => print!("{notes}"),
+            }
+        }
         Command::Check {
             fragments,
             base,

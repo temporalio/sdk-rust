@@ -175,7 +175,12 @@ fn update_entries(previous: &Entries, current: BTreeMap<String, Vec<Vec<String>>
     updated
 }
 
-fn changelog_notes(repo: &Path, from: &str, to: &str, path: &str) -> Result<Vec<String>> {
+pub fn categorized_entries(
+    repo: &Path,
+    from: &str,
+    to: &str,
+    path: &str,
+) -> Result<BTreeMap<String, Vec<Vec<String>>>> {
     let directory = Path::new(path)
         .parent()
         .unwrap_or(Path::new(""))
@@ -218,12 +223,25 @@ fn changelog_notes(repo: &Path, from: &str, to: &str, path: &str) -> Result<Vec<
             }
         }
     }
+    Ok(categorized
+        .into_iter()
+        .map(|(header, entries)| {
+            (
+                header,
+                entries.into_iter().map(|entry| entry.lines).collect(),
+            )
+        })
+        .collect())
+}
+
+fn changelog_notes(repo: &Path, from: &str, to: &str, path: &str) -> Result<Vec<String>> {
     let mut output = Vec::new();
+    let categorized = categorized_entries(repo, from, to, path)?;
     for (header, entries) in categorized {
         if !entries.is_empty() {
             output.extend([format!("#### {header}"), String::new()]);
             for entry in entries {
-                output.extend(entry.lines);
+                output.extend(entry);
             }
             output.push(String::new());
         }
@@ -265,6 +283,21 @@ fn link_prs(subject: &str) -> String {
 }
 
 pub fn release_notes(repo: &Path, from: &str, to: &str, changelog: &str) -> Result<Vec<String>> {
+    let commits = commit_notes(repo, from, to)?;
+    if commits.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut output = changelog_notes(repo, from, to, changelog)?;
+    if !output.is_empty() {
+        output.insert(0, String::new());
+        output.insert(0, "#### Changelog".into());
+    }
+    output.extend(["#### Commits".into(), String::new()]);
+    output.extend(commits);
+    Ok(output)
+}
+
+pub fn commit_notes(repo: &Path, from: &str, to: &str) -> Result<Vec<String>> {
     let log = git(
         repo,
         &[
@@ -277,12 +310,7 @@ pub fn release_notes(repo: &Path, from: &str, to: &str, changelog: &str) -> Resu
     if log.is_empty() {
         return Ok(Vec::new());
     }
-    let mut output = changelog_notes(repo, from, to, changelog)?;
-    if !output.is_empty() {
-        output.insert(0, String::new());
-        output.insert(0, "#### Changelog".into());
-    }
-    output.extend(["#### Commits".into(), String::new()]);
+    let mut output = Vec::new();
     for line in log.lines() {
         let parts: Vec<_> = line.split('\0').collect();
         if let [full, short, subject] = parts.as_slice() {

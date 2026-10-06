@@ -9,6 +9,8 @@ use std::{
 };
 
 pub mod range;
+mod update;
+pub use update::update_core;
 
 pub const CATEGORIES: [(&str, &str); 7] = [
     ("added", "Added"),
@@ -51,7 +53,7 @@ fn read(path: &Path) -> Result<String> {
     fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))
 }
 
-fn relative(path: &Path) -> Result<()> {
+pub(crate) fn relative(path: &Path) -> Result<()> {
     if path.as_os_str().is_empty()
         || path
             .components()
@@ -195,11 +197,12 @@ pub fn release_section(text: &str, version: &str) -> Result<String> {
 pub(crate) fn category_sections(text: &str) -> Vec<(String, String)> {
     let headers: Vec<_> = headings(text, "### ")
         .into_iter()
-        .filter(|(_, _, heading)| {
-            let heading = heading.strip_prefix(":boom: ").unwrap_or(heading);
-            CATEGORIES.iter().any(|(_, category)| {
-                category.strip_prefix(":boom: ").unwrap_or(category) == heading
-            })
+        .map(|(start, end, heading)| {
+            (
+                start,
+                end,
+                heading.strip_suffix(" :boom:").unwrap_or(heading),
+            )
         })
         .collect();
     let mut result = Vec::new();
@@ -377,6 +380,20 @@ pub fn core_notes(
     from: Option<&str>,
     to: &str,
 ) -> Result<String> {
+    let (submodule, old, new) = core_range(repo, submodule, version, from, to)?;
+    if old == new {
+        return Ok(String::new());
+    }
+    Ok(range::release_notes(&submodule, &old, &new, "crates/sdk-core/CHANGELOG.md")?.join("\n"))
+}
+
+fn core_range(
+    repo: &Path,
+    submodule: &Path,
+    version: &str,
+    from: Option<&str>,
+    to: &str,
+) -> Result<(std::path::PathBuf, String, String)> {
     relative(submodule)?;
     let previous = match from {
         Some(from) => from.to_owned(),
@@ -387,19 +404,41 @@ pub fn core_notes(
         .ok_or_else(|| anyhow!("invalid submodule path"))?;
     let old = gitlink(repo, &previous, path)?;
     let new = gitlink(repo, to, path)?;
-    if old == new {
-        return Ok(String::new());
-    }
     let submodule = repo.join(submodule);
     if !submodule.join(".git").exists() {
         bail!("submodule is not initialized; checkout with submodules",);
     }
-    let notes = match range::release_notes(&submodule, &old, &new, "crates/sdk-core/CHANGELOG.md") {
-        Ok(notes) => notes,
-        Err(_) => {
-            git(&submodule, &["fetch", "--quiet", "origin", "main"])?;
-            range::release_notes(&submodule, &old, &new, "crates/sdk-core/CHANGELOG.md")?
+    for revision in [&old, &new] {
+        if git(
+            &submodule,
+            &["cat-file", "-e", &format!("{revision}^{{commit}}")],
+        )
+        .is_err()
+        {
+            git(&submodule, &["fetch", "--quiet", "origin", revision])?;
         }
-    };
-    Ok(notes.join("\n"))
+    }
+    Ok((submodule, old, new))
+}
+
+pub fn published_release_notes(
+    repo: &Path,
+    changelog: &Path,
+    submodule: &Path,
+    version: &str,
+    from: Option<&str>,
+    to: &str,
+) -> Result<String> {
+    relative(changelog)?;
+    let section = release_section(&read(&repo.join(changelog))?, version)?;
+    let (core, old, new) = core_range(repo, submodule, version, from, to)?;
+    let commits = range::commit_notes(&core, &old, &new)?;
+    let mut notes = format!("## Notable Changes\n\n{section}");
+    if !commits.is_empty() {
+        if !notes.ends_with("\n\n") {
+            notes.push('\n');
+        }
+        notes.push_str(&format!("### SDK Core Commits\n\n{}\n", commits.join("\n")));
+    }
+    Ok(notes)
 }

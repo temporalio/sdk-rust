@@ -10,6 +10,8 @@ default-run = "changelog-release-notes"
 [dependencies]
 clap = { version = "4.5", features = ["derive"] }
 anyhow = "1.0"
+petname = { version = "=3.2.0", default-features = false, features = ["default-rng", "default-words"] }
+rand = "0.10"
 chrono = { version = "=0.4.45", default-features = false, features = ["clock"] }
 reqwest = { version = "0.13", default-features = false, features = ["blocking", "rustls"] }
 semver = "=1.0.28"

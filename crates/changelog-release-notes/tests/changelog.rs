@@ -6,9 +6,11 @@ use std::{
 
 use changelog_release_notes::{
     ReleaseOptions, assemble_release, check_fragments, collect_fragments, core_notes, git,
-    prepare_release, previous_release_tag, release_section,
+    prepare_release, previous_release_tag, published_release_notes, release_section, update_core,
 };
 use chrono::NaiveDate;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use tempfile::TempDir;
 
 struct Repo {
@@ -38,6 +40,439 @@ impl Repo {
             .trim()
             .into()
     }
+}
+
+fn core_parent(core: &Repo, revision: &str) -> Repo {
+    git(&core.root, &["branch", "-M", "main"]).unwrap();
+    let parent = Repo::new();
+    parent.write("CHANGELOG.md", "# Changelog\n");
+    git(
+        &parent.root,
+        &[
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "add",
+            "-q",
+            core.root.to_str().unwrap(),
+            "core",
+        ],
+    )
+    .unwrap();
+    git(
+        &parent.root.join("core"),
+        &["checkout", "-q", "--detach", revision],
+    )
+    .unwrap();
+    parent.commit();
+    git(&parent.root, &["tag", "1.0.0"]).unwrap();
+    parent
+}
+
+#[test]
+fn core_update_through_preparation_and_publishing() {
+    let core = Repo::new();
+    let path = "crates/sdk-core/CHANGELOG.md";
+    core.write(
+        path,
+        "# Changelog\n\n## Unreleased\n\n### Fixed\n- Existing fix.\n",
+    );
+    let old = core.commit();
+    let parent = core_parent(&core, &old);
+    core.write(path, "# Changelog\n\n## Unreleased\n\n### Fixed\n- Existing fix.\n* A new fix with\n  a [link](https://example.com).\n\n### Breaking Changes\n- A breaking change.\n");
+    core.commit();
+    core.write(path, "# Changelog\n\n## Unreleased\n\n## [1.0.0] - 2026-10-02\n\n### Fixed\n- Existing fix.\n* A new fix with\n  a [link](https://example.com).\n\n### Breaking Changes\n- A breaking change.\n");
+    let new = core.commit();
+    assert_eq!(
+        update_core(
+            &parent.root,
+            Path::new("core"),
+            Path::new("changelog"),
+            None,
+            None
+        )
+        .unwrap(),
+        2
+    );
+    assert_eq!(
+        git(&parent.root.join("core"), &["rev-parse", "HEAD"])
+            .unwrap()
+            .trim(),
+        new
+    );
+    let fragments = collect_fragments(&parent.root, Path::new("changelog")).unwrap();
+    assert_eq!(fragments[0].body, "A breaking change.\n");
+    assert_eq!(
+        fragments[1].body,
+        "A new fix with a [link](https://example.com).\n"
+    );
+    assert_eq!(
+        Path::new(&fragments[0].path).file_name(),
+        Path::new(&fragments[1].path).file_name()
+    );
+    assert_eq!(
+        update_core(
+            &parent.root,
+            Path::new("core"),
+            Path::new("changelog"),
+            None,
+            None
+        )
+        .unwrap(),
+        0
+    );
+    parent.write("changelog/fixed/language-llama.md", "A language fix.\n");
+    prepare_release(
+        &parent.root,
+        Path::new("CHANGELOG.md"),
+        Path::new("changelog"),
+        &options(),
+    )
+    .unwrap();
+    parent.commit();
+    parent.write("changelog/fixed/late-llama.md", "A late fix.\n");
+    let notes = published_release_notes(
+        &parent.root,
+        Path::new("CHANGELOG.md"),
+        Path::new("core"),
+        "1.1.0",
+        None,
+        "HEAD",
+    )
+    .unwrap();
+    assert_eq!(notes.matches("- A new fix").count(), 1);
+    assert!(notes.contains("### :boom: Breaking Changes\n\n- A breaking change."));
+    assert!(notes.contains("- A language fix."));
+    assert!(notes.contains("### SDK Core Commits\n\n- [`"));
+    assert!(!notes.contains("#### Commits"));
+    assert!(!notes.contains("Existing fix."));
+    assert!(!notes.contains("A late fix."));
+    assert!(parent.root.join("changelog/fixed/late-llama.md").exists());
+    let output = Command::new(env!("CARGO_BIN_EXE_changelog-tool"))
+        .args(["release-notes", "--repo"])
+        .arg(&parent.root)
+        .args([
+            "--submodule",
+            "core",
+            "--version",
+            "1.1.0",
+            "--output",
+            "notes.md",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(parent.root.join("notes.md")).unwrap(),
+        notes
+    );
+}
+
+#[test]
+fn consecutive_updates_only_import_each_new_range() {
+    let core = Repo::new();
+    let path = "crates/sdk-core/CHANGELOG.md";
+    core.write(path, "# Changelog\n\n## Unreleased\n");
+    let old = core.commit();
+    let parent = core_parent(&core, &old);
+    for entry in ["First fix.", "Second fix."] {
+        let text = fs::read_to_string(core.root.join(path)).unwrap();
+        core.write(
+            path,
+            &format!(
+                "{text}{}- {entry}\n",
+                if entry == "First fix." {
+                    "\n### Fixed\n"
+                } else {
+                    ""
+                }
+            ),
+        );
+        core.commit();
+        assert_eq!(
+            update_core(
+                &parent.root,
+                Path::new("core"),
+                Path::new("changelog"),
+                None,
+                None
+            )
+            .unwrap(),
+            1
+        );
+    }
+    let fragments = collect_fragments(&parent.root, Path::new("changelog")).unwrap();
+    assert_eq!(fragments.len(), 2);
+    let bodies = fragments
+        .iter()
+        .map(|fragment| fragment.body.as_str())
+        .collect::<String>();
+    assert_eq!(bodies.matches("First fix.").count(), 1);
+    assert_eq!(bodies.matches("Second fix.").count(), 1);
+}
+
+#[test]
+fn explicit_baseline_backfills_an_already_updated_pin() {
+    let core = Repo::new();
+    let path = "crates/sdk-core/CHANGELOG.md";
+    core.write(path, "# Changelog\n\n## Unreleased\n");
+    let old = core.commit();
+    core.write(
+        path,
+        "# Changelog\n\n## Unreleased\n\n### Stabilized\n- A feature is stable.\n",
+    );
+    let new = core.commit();
+    let parent = core_parent(&core, &new);
+    assert_eq!(
+        update_core(
+            &parent.root,
+            Path::new("core"),
+            Path::new("changelog"),
+            Some(&new),
+            Some(&old)
+        )
+        .unwrap(),
+        1
+    );
+    assert_eq!(
+        collect_fragments(&parent.root, Path::new("changelog")).unwrap()[0].body,
+        "A feature is stable.\n"
+    );
+}
+
+#[test]
+fn invalid_core_imports_leave_checkout_and_fragments_unchanged() {
+    for addition in [
+        "### Fixed\n- A fix.\n  ```rust\n  example();\n  ```\n",
+        "### Surprising\n- A fix.\n",
+    ] {
+        let core = Repo::new();
+        let path = "crates/sdk-core/CHANGELOG.md";
+        core.write(path, "# Changelog\n\n## Unreleased\n");
+        let old = core.commit();
+        let parent = core_parent(&core, &old);
+        parent.write(
+            "changelog/fixed/existing-otter.md",
+            "Existing language fix.\n",
+        );
+        core.write(path, &format!("# Changelog\n\n## Unreleased\n\n{addition}"));
+        core.commit();
+        assert!(
+            update_core(
+                &parent.root,
+                Path::new("core"),
+                Path::new("changelog"),
+                None,
+                None
+            )
+            .is_err()
+        );
+        assert_eq!(
+            git(&parent.root.join("core"), &["rev-parse", "HEAD"])
+                .unwrap()
+                .trim(),
+            old
+        );
+        assert_eq!(
+            collect_fragments(&parent.root, Path::new("changelog"))
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+}
+
+#[test]
+fn dirty_or_backward_core_updates_are_rejected() {
+    let core = Repo::new();
+    let path = "crates/sdk-core/CHANGELOG.md";
+    core.write(path, "# Changelog\n\n## Unreleased\n");
+    let old = core.commit();
+    core.write("internal.txt", "Internal change");
+    let new = core.commit();
+    let parent = core_parent(&core, &new);
+    assert!(
+        update_core(
+            &parent.root,
+            Path::new("core"),
+            Path::new("changelog"),
+            Some(&old),
+            None
+        )
+        .is_err()
+    );
+    fs::write(parent.root.join("core/untracked.txt"), "Local work").unwrap();
+    assert!(
+        update_core(
+            &parent.root,
+            Path::new("core"),
+            Path::new("changelog"),
+            None,
+            None
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("local changes")
+    );
+    assert_eq!(
+        git(&parent.root.join("core"), &["rev-parse", "HEAD"])
+            .unwrap()
+            .trim(),
+        new
+    );
+}
+
+#[test]
+fn empty_release_omits_unchanged_core_and_supports_explicit_tags() {
+    let core = Repo::new();
+    core.write(
+        "crates/sdk-core/CHANGELOG.md",
+        "# Changelog\n\n## Unreleased\n",
+    );
+    let old = core.commit();
+    let parent = core_parent(&core, &old);
+    prepare_release(
+        &parent.root,
+        Path::new("CHANGELOG.md"),
+        Path::new("changelog"),
+        &options(),
+    )
+    .unwrap();
+    parent.commit();
+    assert_eq!(
+        published_release_notes(
+            &parent.root,
+            Path::new("CHANGELOG.md"),
+            Path::new("core"),
+            "1.1.0",
+            None,
+            "HEAD"
+        )
+        .unwrap(),
+        "## Notable Changes\n\n"
+    );
+    git(&parent.root, &["tag", "-d", "1.0.0"]).unwrap();
+    assert!(
+        published_release_notes(
+            &parent.root,
+            Path::new("CHANGELOG.md"),
+            Path::new("core"),
+            "1.1.0",
+            None,
+            "HEAD"
+        )
+        .is_err()
+    );
+    assert_eq!(
+        published_release_notes(
+            &parent.root,
+            Path::new("CHANGELOG.md"),
+            Path::new("core"),
+            "1.1.0",
+            Some("HEAD~"),
+            "HEAD"
+        )
+        .unwrap(),
+        "## Notable Changes\n\n"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn checkout_failure_removes_imports_and_reports_rollback_failure() {
+    let core = Repo::new();
+    let path = "crates/sdk-core/CHANGELOG.md";
+    core.write(path, "# Changelog\n\n## Unreleased\n");
+    let old = core.commit();
+    let parent = core_parent(&core, &old);
+    core.write(
+        path,
+        "# Changelog\n\n## Unreleased\n\n### Fixed\n- New Core fix.\n",
+    );
+    core.commit();
+    parent.write(
+        "changelog/fixed/existing-otter.md",
+        "Existing language fix.\n",
+    );
+    let checkout = parent.root.join("core");
+    let hook = git(
+        &checkout,
+        &["rev-parse", "--git-path", "hooks/post-checkout"],
+    )
+    .unwrap();
+    let hook = checkout.join(hook.trim());
+    fs::write(&hook, "#!/bin/sh\nexit 1\n").unwrap();
+    fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).unwrap();
+    let error = update_core(
+        &parent.root,
+        Path::new("core"),
+        Path::new("changelog"),
+        None,
+        None,
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("rollback failed"));
+    assert_eq!(git(&checkout, &["rev-parse", "HEAD"]).unwrap().trim(), old);
+    let fragments = collect_fragments(&parent.root, Path::new("changelog")).unwrap();
+    assert_eq!(fragments.len(), 1);
+    assert_eq!(fragments[0].body, "Existing language fix.\n");
+}
+
+#[test]
+fn divergent_updates_are_rejected_without_importing_entries() {
+    let core = Repo::new();
+    let path = "crates/sdk-core/CHANGELOG.md";
+    core.write(path, "# Changelog\n\n## Unreleased\n");
+    let base = core.commit();
+    core.write("branch.txt", "Current branch");
+    let old = core.commit();
+    let parent = core_parent(&core, &old);
+    git(&core.root, &["checkout", "-q", "-B", "other", &base]).unwrap();
+    core.write(
+        path,
+        "# Changelog\n\n## Unreleased\n\n### Fixed\n- A divergent fix.\n",
+    );
+    let other = core.commit();
+    git(
+        &parent.root.join("core"),
+        &["fetch", "-q", "origin", "other"],
+    )
+    .unwrap();
+    assert!(
+        update_core(
+            &parent.root,
+            Path::new("core"),
+            Path::new("changelog"),
+            Some(&other),
+            None
+        )
+        .is_err()
+    );
+    assert_eq!(
+        git(&parent.root.join("core"), &["rev-parse", "HEAD"])
+            .unwrap()
+            .trim(),
+        old
+    );
+    assert!(
+        collect_fragments(&parent.root, Path::new("changelog"))
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        update_core(
+            &parent.root,
+            Path::new("core"),
+            Path::new("changelog"),
+            Some(&other),
+            Some(&base)
+        )
+        .is_err()
+    );
 }
 
 fn options() -> ReleaseOptions<'static> {
