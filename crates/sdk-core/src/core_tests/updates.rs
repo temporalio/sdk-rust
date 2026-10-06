@@ -4,7 +4,7 @@ use crate::{
     replay::{DEFAULT_ACTIVITY_TYPE, TestHistoryBuilder},
     test_help::{
         MockPollCfg, PollWFTRespExt, ResponseType, build_mock_pollers, hist_to_poll_resp,
-        mock_worker,
+        mock_worker, query_ok,
     },
     worker::{Worker, client::mocks::mock_worker_client},
 };
@@ -26,6 +26,7 @@ use temporalio_common::protos::{
             WorkflowExecutionUpdateAcceptedEventAttributes,
             WorkflowExecutionUpdateAdmittedEventAttributes,
         },
+        query::v1::WorkflowQuery,
         update::v1::{Acceptance, Input, Meta, Rejection, Request},
         workflowservice::v1::RespondWorkflowTaskCompletedResponse,
     },
@@ -61,10 +62,20 @@ fn chunking_worker(
     history: TestHistoryBuilder,
     updates: &[(&str, i64)],
     failures: usize,
+    query: Option<&str>,
 ) -> Worker {
     let mut response = hist_to_poll_resp(&history, "chunking", ResponseType::AllHistory);
     for (id, position) in updates {
         response.add_update_request(id, *position);
+    }
+    if let Some(id) = query {
+        response.queries.insert(
+            id.to_string(),
+            WorkflowQuery {
+                query_type: "ready".to_string(),
+                ..Default::default()
+            },
+        );
     }
     let mut polls = MockPollCfg::from_resp_batches(
         "chunking",
@@ -73,8 +84,16 @@ fn chunking_worker(
         mock_worker_client(),
     );
     polls.num_expected_fails = failures;
+    if query.is_some() {
+        polls.num_expected_completions = Some(1.into());
+        polls.completion_mock_fn = Some(Box::new(|completion| {
+            assert!(completion.commands.is_empty());
+            assert_eq!(completion.query_responses.len(), 1);
+            Ok(Default::default())
+        }));
+    }
     let mut mock = build_mock_pollers(polls);
-    mock.worker_cfg(|wc| wc.max_cached_workflows = 1);
+    mock.worker_cfg(|wc| wc.max_cached_workflows = usize::from(query.is_none()));
     mock_worker(mock)
 }
 
@@ -92,6 +111,9 @@ async fn expect_activation(core: &Worker, expected: &[&str]) -> WorkflowActivati
             workflow_activation_job::Variant::FireTimer(timer) => format!("timer:{}", timer.seq),
             workflow_activation_job::Variant::ResolveActivity(activity) => {
                 format!("activity:{}", activity.seq)
+            }
+            workflow_activation_job::Variant::QueryWorkflow(query) => {
+                format!("query:{}", query.query_id)
             }
             workflow_activation_job::Variant::RemoveFromCache(_) => "eviction".to_string(),
             other => panic!("unexpected activation job: {other:?}"),
@@ -114,9 +136,10 @@ async fn complete_empty(core: &Worker, run_id: String) {
 }
 
 #[derive(Clone, Copy, Debug)]
-enum UpdateEvidence {
-    Live,
-    Admitted,
+enum FollowupTask {
+    LiveUpdate,
+    AdmittedUpdate,
+    Query,
 }
 
 #[tokio::test]
@@ -453,23 +476,24 @@ async fn repeated_admitted_update_replays_once_before_accepted() {
         accepted_request_sequencing_event_id: latest_admitted_event_id,
         accepted_request: None,
     });
-    let core = chunking_worker(t, &[], 0);
+    let core = chunking_worker(t, &[], 0, None);
     complete_activation(&core, &["initialize"]).await;
     expect_activation(&core, &["update:reapplied-update"]).await;
 }
 
 #[rstest::rstest]
-#[case::adjacent_live(0, 1, UpdateEvidence::Live)]
-#[case::live_after_one_signal(1, 1, UpdateEvidence::Live)]
-#[case::two_live_same_boundary(0, 2, UpdateEvidence::Live)]
-#[case::adjacent_admitted(0, 1, UpdateEvidence::Admitted)]
-#[case::admitted_after_one_signal(1, 1, UpdateEvidence::Admitted)]
-#[case::two_admitted_same_boundary(0, 2, UpdateEvidence::Admitted)]
+#[case::adjacent_live(0, 1, FollowupTask::LiveUpdate)]
+#[case::live_after_one_signal(1, 1, FollowupTask::LiveUpdate)]
+#[case::two_live_same_boundary(0, 2, FollowupTask::LiveUpdate)]
+#[case::adjacent_admitted(0, 1, FollowupTask::AdmittedUpdate)]
+#[case::admitted_after_one_signal(1, 1, FollowupTask::AdmittedUpdate)]
+#[case::two_admitted_same_boundary(0, 2, FollowupTask::AdmittedUpdate)]
+#[case::query_after_empty_wft(0, 0, FollowupTask::Query)]
 #[tokio::test]
-async fn update_after_commandless_activity_resolution_wft_is_separate(
+async fn commandless_activity_resolution_replays_before_followup_task(
     #[case] intervening_signal_count: usize,
     #[case] update_count: usize,
-    #[case] evidence: UpdateEvidence,
+    #[case] followup: FollowupTask,
 ) {
     let update_ids = (0..update_count)
         .map(|index| format!("upd-{index}"))
@@ -501,14 +525,14 @@ async fn update_after_commandless_activity_resolution_wft_is_separate(
         t.add_we_signaled(&format!("before-update-{index}"), vec![]);
     }
     let position = t.current_event_id();
-    if matches!(evidence, UpdateEvidence::Admitted) {
+    if matches!(followup, FollowupTask::AdmittedUpdate) {
         for id in &update_ids {
             add_reapplied_update_admitted(&mut t, id);
         }
     }
     t.add_workflow_task_started();
     let final_history_length = t.current_event_id() as u32;
-    let updates = if matches!(evidence, UpdateEvidence::Live) {
+    let updates = if matches!(followup, FollowupTask::LiveUpdate) {
         update_ids
             .iter()
             .map(|id| (id.as_str(), position))
@@ -516,7 +540,8 @@ async fn update_after_commandless_activity_resolution_wft_is_separate(
     } else {
         vec![]
     };
-    let core = chunking_worker(t, &updates, 0);
+    let query = matches!(followup, FollowupTask::Query).then_some("ready");
+    let core = chunking_worker(t, &updates, 0, query);
 
     let task = expect_activation(&core, &["initialize"]).await;
     core.complete_workflow_activation(WorkflowActivationCompletion::from_cmd(
@@ -547,6 +572,22 @@ async fn update_after_commandless_activity_resolution_wft_is_separate(
     assert!(task.is_replaying);
     assert_eq!(task.history_length, activity_resolution_history_length);
 
+    if let Some(query_id) = query {
+        // #1606 has no Update sequencing evidence: a buffered query creates the empty task
+        // which used to make the preceding activity resolution run again as non-replay.
+        let task = expect_activation(&core, &["query:ready"]).await;
+        assert!(task.is_replaying);
+        assert_eq!(task.history_length, final_history_length);
+        core.complete_workflow_activation(WorkflowActivationCompletion::from_cmd(
+            task.run_id,
+            query_ok(query_id, "true"),
+        ))
+        .await
+        .unwrap();
+        core.shutdown().await;
+        return;
+    }
+
     let expected = (0..intervening_signal_count)
         .map(|index| format!("signal:before-update-{index}"))
         .chain(update_ids.iter().map(|id| format!("update:{id}")))
@@ -569,7 +610,7 @@ async fn failed_historical_activation_withholds_live_update_until_retry_complete
     t.add_workflow_task_scheduled();
     let position = t.current_event_id();
     t.add_workflow_task_started();
-    let core = chunking_worker(t, &[(update_id, position)], 1);
+    let core = chunking_worker(t, &[(update_id, position)], 1, None);
 
     complete_activation(&core, &["initialize"]).await;
     let task = expect_activation(&core, &["signal:historical-boundary"]).await;
@@ -613,7 +654,7 @@ async fn live_updates_at_distinct_positions_wait_for_each_boundary() {
             t.add_workflow_task_completed();
         }
     }
-    let core = chunking_worker(t, &updates, 0);
+    let core = chunking_worker(t, &updates, 0, None);
     complete_activation(&core, &["initialize"]).await;
     for ((signal, update), (signal_boundary, update_boundary)) in [
         ("first-boundary", "first-live-update"),
@@ -654,7 +695,7 @@ async fn historical_accepted_then_later_live_update_preserve_boundaries() {
     let position = t.current_event_id();
     t.add_workflow_task_started();
     let history_length = t.current_event_id() as u32;
-    let core = chunking_worker(t, &[(live_update_id, position)], 0);
+    let core = chunking_worker(t, &[(live_update_id, position)], 0, None);
 
     complete_activation(&core, &["initialize"]).await;
     let task = expect_activation(&core, &["update:historical-accepted"]).await;
@@ -682,7 +723,7 @@ async fn historical_admitted_and_later_live_update_preserve_protocol_order() {
     t.add_we_signaled("between-sources", vec![]);
     let position = t.current_event_id();
     t.add_workflow_task_started();
-    let core = chunking_worker(t, &[("later-live", position)], 0);
+    let core = chunking_worker(t, &[("later-live", position)], 0, None);
     complete_activation(&core, &["initialize"]).await;
     expect_activation(
         &core,
