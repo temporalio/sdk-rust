@@ -1,1 +1,0 @@
-The `temporal_workflow_task_execution_failed` metric now counts every failed workflow task attempt, including ones whose failure was not sent to the server, and tags size-related failures with their specific `failure_reason` (`GrpcMessageTooLarge`, `PayloadsTooLarge`, `RequestTooLarge`) on every path.

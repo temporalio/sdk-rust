@@ -1,1 +1,0 @@
-`WorkflowStartOptions::versioning_override` and `WorkflowUpdateWithStartOptions::versioning_override` support pinned, auto-upgrade, and one-time deployment routing for client-started workflows, including signal-with-start and update-with-start. Pinned and auto-upgrade overrides require Temporal Server 1.28.0 or later; one-time routing requires Temporal Server 1.32.0 or later.

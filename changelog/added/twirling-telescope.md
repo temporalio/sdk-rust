@@ -1,1 +1,0 @@
-Added experimental OpenTelemetry integration tracing client, Workflow, and Activity operations and propagating trace context across Temporal invocations. Use `OpenTelemetryPlugin::builder()` with the `experimental` and `opentelemetry` features to configure a `SimplePlugin`.

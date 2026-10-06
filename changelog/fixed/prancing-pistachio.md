@@ -1,1 +1,0 @@
-Workflow task failures are now reported to the server only on a task's first attempt, no matter why the task failed. Previously a completion rejected for exceeding the worker's payload size error limit, or a failure to fetch workflow history, was re-reported on every retry.
