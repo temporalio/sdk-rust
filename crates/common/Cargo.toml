@@ -109,7 +109,8 @@ uuid = { version = "1.18", default-features = false, features = ["v4"] }
 [dependencies.temporalio-protos]
 path = "../protos"
 version = "~0.10.0"
-features = ["grpc-clients"]
+# External storage reads and writes proto JSON, whose impls live behind serde_serialize.
+features = ["grpc-clients", "serde_serialize"]
 
 [dependencies.temporalio-common-wasm]
 path = "../common-wasm"
