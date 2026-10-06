@@ -44,7 +44,7 @@ use temporalio_common::{
             enums::v1::{
                 CommandType, EventType, TimeoutType as ProtoTimeoutType, WorkflowTaskFailedCause,
             },
-            failure::v1::Failure,
+            failure::v1::{Failure, failure::FailureInfo},
             history::v1::history_event::{self, Attributes::MarkerRecordedEventAttributes},
             query::v1::WorkflowQuery,
         },
@@ -449,8 +449,8 @@ async fn cancel_immediate(#[case] cancel_type: ActivityCancellationType) {
 }
 
 #[tokio::test]
-async fn ordinary_failure_after_local_activity_cancel_retries() {
-    let wf_name = "ordinary_failure_after_local_activity_cancel_retries";
+async fn ordinary_failure_after_local_activity_cancel_does_not_retry() {
+    let wf_name = "ordinary_failure_after_local_activity_cancel_does_not_retry";
     let attempts = Arc::new(AtomicUsize::new(0));
     let mut starter = CoreWfStarter::new(wf_name);
 
@@ -496,7 +496,14 @@ async fn ordinary_failure_after_local_activity_cancel_retries() {
             );
             ctx.timer(Duration::from_secs(1)).await;
             la.cancel();
-            let _ = la.await;
+            let Err(ActivityExecutionError::Failed(failure)) = la.await else {
+                panic!("Expected ordinary failure after cancellation");
+            };
+            assert_eq!(failure.failure().message, "ordinary failure on attempt 1");
+            assert_matches!(
+                &failure.failure().failure_info,
+                Some(FailureInfo::ApplicationFailureInfo(_))
+            );
             Ok(())
         }
     }
@@ -519,7 +526,7 @@ async fn ordinary_failure_after_local_activity_cancel_retries() {
         .await
         .unwrap();
     worker.run_until_done().await.unwrap();
-    assert_eq!(attempts.load(Ordering::SeqCst), 2);
+    assert_eq!(attempts.load(Ordering::SeqCst), 1);
 }
 
 struct LACancellerInterceptor {
@@ -652,17 +659,31 @@ async fn cancel_after_act_starts(
             // resolving the LA with cancel on replay
             ctx.timer(Duration::from_secs(1)).await;
             let err = la.await.unwrap_err();
-            let ActivityExecutionError::Cancelled(cancel_err) = err else {
-                panic!("expected cancellation failure, got {err:?}");
+            match err {
+                ActivityExecutionError::Cancelled(cancel_err) => {
+                    let expected_details = if bo_dur == Duration::from_secs(1)
+                        && cancel_type == ActivityCancellationType::WaitCancellationCompleted
+                    {
+                        Some("cancel-after-start".to_string())
+                    } else {
+                        None
+                    };
+                    assert_eq!(cancel_err.details::<String>().unwrap(), expected_details);
+                }
+                ActivityExecutionError::Failed(failure)
+                    if bo_dur != Duration::from_secs(1)
+                        && cancel_type == ActivityCancellationType::WaitCancellationCompleted =>
+                {
+                    // Cancellation can land during an attempt rather than its backoff. That
+                    // attempt's ordinary failure is terminal, not converted to cancellation.
+                    assert_eq!(failure.failure().message, "Oh no I failed!");
+                    assert_matches!(
+                        &failure.failure().failure_info,
+                        Some(FailureInfo::ApplicationFailureInfo(_))
+                    );
+                }
+                other => panic!("Unexpected activity result after cancellation: {other:?}"),
             };
-            let expected_details = if bo_dur == Duration::from_secs(1)
-                && cancel_type == ActivityCancellationType::WaitCancellationCompleted
-            {
-                Some("cancel-after-start".to_string())
-            } else {
-                None
-            };
-            assert_eq!(cancel_err.details::<String>().unwrap(), expected_details);
             Ok(())
         }
     }
