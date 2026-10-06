@@ -1,4 +1,5 @@
 use crate::{
+    internal_flags::CoreInternalFlags,
     prost_dur,
     replay::{DEFAULT_ACTIVITY_TYPE, TestHistoryBuilder},
     test_help::{
@@ -10,7 +11,7 @@ use crate::{
 
 use temporalio_common::protos::{
     coresdk::{
-        workflow_activation::{WorkflowActivationJob, workflow_activation_job},
+        workflow_activation::{WorkflowActivation, WorkflowActivationJob, workflow_activation_job},
         workflow_commands::{
             CompleteWorkflowExecution, ScheduleActivity, StartTimer, UpdateResponse,
             update_response::Response,
@@ -48,15 +49,62 @@ fn add_reapplied_update_admitted(t: &mut TestHistoryBuilder, update_id: &str) ->
     })
 }
 
-async fn poll_and_complete_empty_initialization(core: &Worker) {
-    let task = core.poll_workflow_activation().await.unwrap();
-    assert_matches!(
-        task.jobs.as_slice(),
-        [WorkflowActivationJob {
-            variant: Some(workflow_activation_job::Variant::InitializeWorkflow(_)),
-        }]
+fn chunking_history() -> TestHistoryBuilder {
+    let mut history = TestHistoryBuilder::default();
+    history.add_by_type(EventType::WorkflowExecutionStarted);
+    history.add_full_wf_task();
+    history.set_flags_first_wft(&[CoreInternalFlags::WftChunkingV2], &[]);
+    history
+}
+
+fn chunking_worker(
+    history: TestHistoryBuilder,
+    updates: &[(&str, i64)],
+    failures: usize,
+) -> Worker {
+    let mut response = hist_to_poll_resp(&history, "chunking", ResponseType::AllHistory);
+    for (id, position) in updates {
+        response.add_update_request(id, *position);
+    }
+    let mut polls = MockPollCfg::from_resp_batches(
+        "chunking",
+        history,
+        vec![response.resp; failures + 1],
+        mock_worker_client(),
     );
-    complete_empty(core, task.run_id).await;
+    polls.num_expected_fails = failures;
+    let mut mock = build_mock_pollers(polls);
+    mock.worker_cfg(|wc| wc.max_cached_workflows = 1);
+    mock_worker(mock)
+}
+
+async fn expect_activation(core: &Worker, expected: &[&str]) -> WorkflowActivation {
+    let task = core.poll_workflow_activation().await.unwrap();
+    let jobs = task
+        .jobs
+        .iter()
+        .map(|job| match job.variant.as_ref().unwrap() {
+            workflow_activation_job::Variant::InitializeWorkflow(_) => "initialize".to_string(),
+            workflow_activation_job::Variant::SignalWorkflow(signal) => {
+                format!("signal:{}", signal.signal_name)
+            }
+            workflow_activation_job::Variant::DoUpdate(update) => format!("update:{}", update.id),
+            workflow_activation_job::Variant::FireTimer(timer) => format!("timer:{}", timer.seq),
+            workflow_activation_job::Variant::ResolveActivity(activity) => {
+                format!("activity:{}", activity.seq)
+            }
+            workflow_activation_job::Variant::RemoveFromCache(_) => "eviction".to_string(),
+            other => panic!("unexpected activation job: {other:?}"),
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(jobs, expected);
+    task
+}
+
+async fn complete_activation(core: &Worker, jobs: &[&str]) -> WorkflowActivation {
+    let task = expect_activation(core, jobs).await;
+    complete_empty(core, task.run_id.clone()).await;
+    task
 }
 
 async fn complete_empty(core: &Worker, run_id: String) {
@@ -394,9 +442,7 @@ async fn replay_with_signal_and_update_same_task() {
 #[tokio::test]
 async fn repeated_admitted_update_replays_once_before_accepted() {
     let update_id = "reapplied-update";
-    let mut t = TestHistoryBuilder::default();
-    t.add_by_type(EventType::WorkflowExecutionStarted);
-    t.add_full_wf_task();
+    let mut t = chunking_history();
     t.add_full_wf_task();
     add_reapplied_update_admitted(&mut t, update_id);
     let latest_admitted_event_id = add_reapplied_update_admitted(&mut t, update_id);
@@ -407,21 +453,9 @@ async fn repeated_admitted_update_replays_once_before_accepted() {
         accepted_request_sequencing_event_id: latest_admitted_event_id,
         accepted_request: None,
     });
-
-    let mock = MockPollCfg::from_resps(t, [ResponseType::AllHistory]);
-    let mut mock = build_mock_pollers(mock);
-    mock.worker_cfg(|wc| wc.max_cached_workflows = 1);
-    let core = mock_worker(mock);
-
-    poll_and_complete_empty_initialization(&core).await;
-
-    let task = core.poll_workflow_activation().await.unwrap();
-    assert_matches!(
-        task.jobs.as_slice(),
-        [WorkflowActivationJob {
-            variant: Some(workflow_activation_job::Variant::DoUpdate(update)),
-        }] if update.id == update_id
-    );
+    let core = chunking_worker(t, &[], 0);
+    complete_activation(&core, &["initialize"]).await;
+    expect_activation(&core, &["update:reapplied-update"]).await;
 }
 
 #[rstest::rstest]
@@ -437,16 +471,11 @@ async fn update_after_commandless_activity_resolution_wft_is_separate(
     #[case] update_count: usize,
     #[case] evidence: UpdateEvidence,
 ) {
-    let wfid = format!("commandless-{intervening_signal_count}-{update_count}-{evidence:?}");
     let update_ids = (0..update_count)
         .map(|index| format!("upd-{index}"))
         .collect::<Vec<_>>();
-    let mut t = TestHistoryBuilder::default();
-
-    t.add_by_type(EventType::WorkflowExecutionStarted);
-    t.add_full_wf_task();
+    let mut t = chunking_history();
     let timer_started_event_id = t.add_timer_started("1".to_string());
-
     t.add_we_signaled("process", vec![]);
     t.add_full_wf_task();
     let activity_scheduled_event_id = t.add_activity_task_scheduled("act1");
@@ -455,7 +484,6 @@ async fn update_after_commandless_activity_resolution_wft_is_separate(
     // activity completion has no command events and is eligible for empty-WFT folding.
     t.add_timer_fired(timer_started_event_id, "1".to_string());
     t.add_full_wf_task();
-
     let activity_started_event_id = t.add_activity_task_started(activity_scheduled_event_id);
     t.add_activity_task_completed(
         activity_scheduled_event_id,
@@ -465,44 +493,32 @@ async fn update_after_commandless_activity_resolution_wft_is_separate(
 
     // This WFT represents the language resuming its activity waiter and making an in-memory-only
     // state change. Its completion therefore adds no command event to history.
-    t.add_workflow_task_scheduled();
-    t.add_workflow_task_started();
+    t.add_workflow_task_scheduled_and_started();
     let activity_resolution_history_length = t.current_event_id() as u32;
     t.add_workflow_task_completed();
-
     t.add_workflow_task_scheduled();
-    for signal_index in 0..intervening_signal_count {
-        let signal_name = format!("before-update-{signal_index}");
-        t.add_we_signaled(&signal_name, vec![]);
+    for index in 0..intervening_signal_count {
+        t.add_we_signaled(&format!("before-update-{index}"), vec![]);
     }
-    let update_sequencing_event_id = t.current_event_id();
+    let position = t.current_event_id();
     if matches!(evidence, UpdateEvidence::Admitted) {
-        for update_id in &update_ids {
-            add_reapplied_update_admitted(&mut t, update_id);
+        for id in &update_ids {
+            add_reapplied_update_admitted(&mut t, id);
         }
     }
     t.add_workflow_task_started();
     let final_history_length = t.current_event_id() as u32;
+    let updates = if matches!(evidence, UpdateEvidence::Live) {
+        update_ids
+            .iter()
+            .map(|id| (id.as_str(), position))
+            .collect()
+    } else {
+        vec![]
+    };
+    let core = chunking_worker(t, &updates, 0);
 
-    let mut poll_resp = hist_to_poll_resp(&t, &wfid, ResponseType::AllHistory);
-    if matches!(evidence, UpdateEvidence::Live) {
-        for update_id in &update_ids {
-            poll_resp.add_update_request(update_id, update_sequencing_event_id);
-        }
-    }
-
-    let mh = MockPollCfg::from_resp_batches(&wfid, t, [poll_resp], mock_worker_client());
-    let mut mock = build_mock_pollers(mh);
-    mock.worker_cfg(|wc| wc.max_cached_workflows = 1);
-    let core = mock_worker(mock);
-
-    let task = core.poll_workflow_activation().await.unwrap();
-    assert_matches!(
-        task.jobs.as_slice(),
-        [WorkflowActivationJob {
-            variant: Some(workflow_activation_job::Variant::InitializeWorkflow(_)),
-        }]
-    );
+    let task = expect_activation(&core, &["initialize"]).await;
     core.complete_workflow_activation(WorkflowActivationCompletion::from_cmd(
         task.run_id,
         StartTimer {
@@ -513,14 +529,7 @@ async fn update_after_commandless_activity_resolution_wft_is_separate(
     ))
     .await
     .unwrap();
-
-    let task = core.poll_workflow_activation().await.unwrap();
-    assert_matches!(
-        task.jobs.as_slice(),
-        [WorkflowActivationJob {
-            variant: Some(workflow_activation_job::Variant::SignalWorkflow(_)),
-        }]
-    );
+    let task = expect_activation(&core, &["signal:process"]).await;
     core.complete_workflow_activation(WorkflowActivationCompletion::from_cmd(
         task.run_id,
         ScheduleActivity {
@@ -533,93 +542,38 @@ async fn update_after_commandless_activity_resolution_wft_is_separate(
     ))
     .await
     .unwrap();
-
-    let task = core.poll_workflow_activation().await.unwrap();
-    assert_matches!(
-        task.jobs.as_slice(),
-        [WorkflowActivationJob {
-            variant: Some(workflow_activation_job::Variant::FireTimer(_)),
-        }]
-    );
-    complete_empty(&core, task.run_id).await;
-
-    let task = core.poll_workflow_activation().await.unwrap();
+    complete_activation(&core, &["timer:1"]).await;
+    let task = complete_activation(&core, &["activity:1"]).await;
     assert!(task.is_replaying);
     assert_eq!(task.history_length, activity_resolution_history_length);
-    assert_matches!(
-        task.jobs.as_slice(),
-        [WorkflowActivationJob {
-            variant: Some(workflow_activation_job::Variant::ResolveActivity(activity)),
-        }] if activity.seq == 1
-    );
-    complete_empty(&core, task.run_id).await;
 
-    let task = core.poll_workflow_activation().await.unwrap();
+    let expected = (0..intervening_signal_count)
+        .map(|index| format!("signal:before-update-{index}"))
+        .chain(update_ids.iter().map(|id| format!("update:{id}")))
+        .collect::<Vec<_>>();
+    let task = expect_activation(
+        &core,
+        &expected.iter().map(String::as_str).collect::<Vec<_>>(),
+    )
+    .await;
     assert!(!task.is_replaying);
     assert_eq!(task.history_length, final_history_length);
-    let observed_jobs = task
-        .jobs
-        .iter()
-        .map(|job| match job.variant.as_ref() {
-            Some(workflow_activation_job::Variant::SignalWorkflow(signal)) => {
-                format!("signal:{}", signal.signal_name)
-            }
-            Some(workflow_activation_job::Variant::DoUpdate(update)) => {
-                format!("update:{}", update.id)
-            }
-            other => panic!("unexpected job after commandless boundary: {other:?}"),
-        })
-        .collect::<Vec<_>>();
-    let expected_jobs = (0..intervening_signal_count)
-        .map(|index| format!("signal:before-update-{index}"))
-        .chain(
-            update_ids
-                .iter()
-                .map(|update_id| format!("update:{update_id}")),
-        )
-        .collect::<Vec<_>>();
-    assert_eq!(observed_jobs, expected_jobs);
 }
 
 #[tokio::test]
 async fn failed_historical_activation_withholds_live_update_until_retry_completes() {
-    let wfid = "failed-historical-activation-retry";
     let update_id = "live-after-retry";
-    let mut t = TestHistoryBuilder::default();
-
-    t.add_by_type(EventType::WorkflowExecutionStarted);
-    t.add_full_wf_task();
+    let mut t = chunking_history();
     t.add_we_signaled("historical-boundary", vec![]);
     t.add_full_wf_task();
     t.add_workflow_task_scheduled();
-    let update_sequencing_event_id = t.current_event_id();
+    let position = t.current_event_id();
     t.add_workflow_task_started();
+    let core = chunking_worker(t, &[(update_id, position)], 1);
 
-    let mut poll_resp = hist_to_poll_resp(&t, wfid, ResponseType::AllHistory);
-    poll_resp.add_update_request(update_id, update_sequencing_event_id);
-    let poll_resp = poll_resp.resp;
-
-    let mut mh = MockPollCfg::from_resp_batches(
-        wfid,
-        t,
-        [poll_resp.clone(), poll_resp],
-        mock_worker_client(),
-    );
-    mh.num_expected_fails = 1;
-    let mut mock = build_mock_pollers(mh);
-    mock.worker_cfg(|wc| wc.max_cached_workflows = 1);
-    let core = mock_worker(mock);
-
-    poll_and_complete_empty_initialization(&core).await;
-
-    let task = core.poll_workflow_activation().await.unwrap();
+    complete_activation(&core, &["initialize"]).await;
+    let task = expect_activation(&core, &["signal:historical-boundary"]).await;
     assert!(task.is_replaying);
-    assert_matches!(
-        task.jobs.as_slice(),
-        [WorkflowActivationJob {
-            variant: Some(workflow_activation_job::Variant::SignalWorkflow(signal)),
-        }] if signal.signal_name == "historical-boundary"
-    );
     core.complete_workflow_activation(WorkflowActivationCompletion::fail(
         task.run_id,
         Failure {
@@ -630,161 +584,80 @@ async fn failed_historical_activation_withholds_live_update_until_retry_complete
     ))
     .await
     .unwrap();
-
-    let task = core.poll_workflow_activation().await.unwrap();
+    let task = complete_activation(&core, &["eviction"]).await;
     assert!(task.is_only_eviction());
-    complete_empty(&core, task.run_id).await;
-
-    poll_and_complete_empty_initialization(&core).await;
-
-    let task = core.poll_workflow_activation().await.unwrap();
+    complete_activation(&core, &["initialize"]).await;
+    let task = complete_activation(&core, &["signal:historical-boundary"]).await;
     assert!(task.is_replaying);
-    assert_matches!(
-        task.jobs.as_slice(),
-        [WorkflowActivationJob {
-            variant: Some(workflow_activation_job::Variant::SignalWorkflow(signal)),
-        }] if signal.signal_name == "historical-boundary"
-    );
-    complete_empty(&core, task.run_id).await;
-
-    let task = core.poll_workflow_activation().await.unwrap();
+    let task = expect_activation(&core, &["update:live-after-retry"]).await;
     assert!(!task.is_replaying);
-    assert_matches!(
-        task.jobs.as_slice(),
-        [WorkflowActivationJob {
-            variant: Some(workflow_activation_job::Variant::DoUpdate(update)),
-        }] if update.id == update_id
-    );
 }
 
 #[tokio::test]
 async fn live_updates_at_distinct_positions_wait_for_each_boundary() {
-    let wfid = "live-updates-at-distinct-positions";
-    let first_update_id = "first-live-update";
-    let second_update_id = "second-live-update";
-    let mut t = TestHistoryBuilder::default();
-
-    t.add_by_type(EventType::WorkflowExecutionStarted);
-    t.add_full_wf_task();
-
-    t.add_we_signaled("first-boundary", vec![]);
-    t.add_workflow_task_scheduled_and_started();
-    let first_boundary_history_length = t.current_event_id() as u32;
-    t.add_workflow_task_completed();
-
-    t.add_workflow_task_scheduled();
-    let first_update_sequencing_event_id = t.current_event_id();
-    t.add_workflow_task_started();
-    let first_update_history_length = t.current_event_id() as u32;
-    t.add_workflow_task_completed();
-
-    t.add_we_signaled("second-boundary", vec![]);
-    t.add_workflow_task_scheduled_and_started();
-    let second_boundary_history_length = t.current_event_id() as u32;
-    t.add_workflow_task_completed();
-
-    t.add_workflow_task_scheduled();
-    let second_update_sequencing_event_id = t.current_event_id();
-    t.add_workflow_task_started();
-    let second_update_history_length = t.current_event_id() as u32;
-
-    let mut poll_resp = hist_to_poll_resp(&t, wfid, ResponseType::AllHistory);
-    poll_resp.add_update_request(first_update_id, first_update_sequencing_event_id);
-    poll_resp.add_update_request(second_update_id, second_update_sequencing_event_id);
-
-    let mh = MockPollCfg::from_resp_batches(wfid, t, [poll_resp], mock_worker_client());
-    let mut mock = build_mock_pollers(mh);
-    mock.worker_cfg(|wc| wc.max_cached_workflows = 1);
-    let core = mock_worker(mock);
-
-    poll_and_complete_empty_initialization(&core).await;
-
-    let task = core.poll_workflow_activation().await.unwrap();
-    assert_eq!(task.history_length, first_boundary_history_length);
-    assert_matches!(
-        task.jobs.as_slice(),
-        [WorkflowActivationJob {
-            variant: Some(workflow_activation_job::Variant::SignalWorkflow(signal)),
-        }] if signal.signal_name == "first-boundary"
-    );
-    complete_empty(&core, task.run_id).await;
-
-    let task = core.poll_workflow_activation().await.unwrap();
-    assert_eq!(task.history_length, first_update_history_length);
-    assert_matches!(
-        task.jobs.as_slice(),
-        [WorkflowActivationJob {
-            variant: Some(workflow_activation_job::Variant::DoUpdate(update)),
-        }] if update.id == first_update_id
-    );
-    core.complete_workflow_activation(WorkflowActivationCompletion::from_cmd(
-        task.run_id,
-        UpdateResponse {
-            protocol_instance_id: first_update_id.to_string(),
-            response: Some(Response::Rejected(Default::default())),
+    let mut t = chunking_history();
+    let mut updates = vec![];
+    let mut boundaries = vec![];
+    for (signal, update) in [
+        ("first-boundary", "first-live-update"),
+        ("second-boundary", "second-live-update"),
+    ] {
+        t.add_we_signaled(signal, vec![]);
+        t.add_full_wf_task();
+        let signal_boundary = t.current_event_id() as u32 - 1;
+        t.add_workflow_task_scheduled();
+        updates.push((update, t.current_event_id()));
+        t.add_workflow_task_started();
+        boundaries.push((signal_boundary, t.current_event_id() as u32));
+        if updates.len() == 1 {
+            t.add_workflow_task_completed();
         }
-        .into(),
-    ))
-    .await
-    .unwrap();
-
-    let task = core.poll_workflow_activation().await.unwrap();
-    assert_eq!(task.history_length, second_boundary_history_length);
-    assert_matches!(
-        task.jobs.as_slice(),
-        [WorkflowActivationJob {
-            variant: Some(workflow_activation_job::Variant::SignalWorkflow(signal)),
-        }] if signal.signal_name == "second-boundary"
-    );
-    complete_empty(&core, task.run_id).await;
-
-    let task = core.poll_workflow_activation().await.unwrap();
-    assert_eq!(task.history_length, second_update_history_length);
-    assert_matches!(
-        task.jobs.as_slice(),
-        [WorkflowActivationJob {
-            variant: Some(workflow_activation_job::Variant::DoUpdate(update)),
-        }] if update.id == second_update_id
-    );
+    }
+    let core = chunking_worker(t, &updates, 0);
+    complete_activation(&core, &["initialize"]).await;
+    for ((signal, update), (signal_boundary, update_boundary)) in [
+        ("first-boundary", "first-live-update"),
+        ("second-boundary", "second-live-update"),
+    ]
+    .into_iter()
+    .zip(boundaries)
+    {
+        let task = complete_activation(&core, &[&format!("signal:{signal}")]).await;
+        assert_eq!(task.history_length, signal_boundary);
+        let task = expect_activation(&core, &[&format!("update:{update}")]).await;
+        assert_eq!(task.history_length, update_boundary);
+        if update == "first-live-update" {
+            core.complete_workflow_activation(WorkflowActivationCompletion::from_cmd(
+                task.run_id,
+                UpdateResponse {
+                    protocol_instance_id: update.to_string(),
+                    response: Some(Response::Rejected(Default::default())),
+                }
+                .into(),
+            ))
+            .await
+            .unwrap();
+        }
+    }
 }
 
 #[tokio::test]
 async fn historical_accepted_then_later_live_update_preserve_boundaries() {
-    let wfid = "historical-accepted-then-live";
     let historical_update_id = "historical-accepted";
     let live_update_id = "later-live";
-    let mut t = TestHistoryBuilder::default();
-
-    t.add_by_type(EventType::WorkflowExecutionStarted);
-    t.add_full_wf_task();
+    let mut t = chunking_history();
     t.add_full_wf_task();
     t.add_update_accepted(historical_update_id, "update");
-
     t.add_we_signaled("after-historical-update", vec![]);
     t.add_full_wf_task();
-
     t.add_workflow_task_scheduled();
-    let live_update_sequencing_event_id = t.current_event_id();
+    let position = t.current_event_id();
     t.add_workflow_task_started();
-    let live_update_history_length = t.current_event_id() as u32;
+    let history_length = t.current_event_id() as u32;
+    let core = chunking_worker(t, &[(live_update_id, position)], 0);
 
-    let mut poll_resp = hist_to_poll_resp(&t, wfid, ResponseType::AllHistory);
-    poll_resp.add_update_request(live_update_id, live_update_sequencing_event_id);
-
-    let mh = MockPollCfg::from_resp_batches(wfid, t, [poll_resp], mock_worker_client());
-    let mut mock = build_mock_pollers(mh);
-    mock.worker_cfg(|wc| wc.max_cached_workflows = 1);
-    let core = mock_worker(mock);
-
-    poll_and_complete_empty_initialization(&core).await;
-
-    let task = core.poll_workflow_activation().await.unwrap();
-    assert_matches!(
-        task.jobs.as_slice(),
-        [WorkflowActivationJob {
-            variant: Some(workflow_activation_job::Variant::DoUpdate(update)),
-        }] if update.id == historical_update_id
-    );
+    complete_activation(&core, &["initialize"]).await;
+    let task = expect_activation(&core, &["update:historical-accepted"]).await;
     core.complete_workflow_activation(WorkflowActivationCompletion::from_cmd(
         task.run_id,
         UpdateResponse {
@@ -795,69 +668,31 @@ async fn historical_accepted_then_later_live_update_preserve_boundaries() {
     ))
     .await
     .unwrap();
-
-    let task = core.poll_workflow_activation().await.unwrap();
-    assert_matches!(
-        task.jobs.as_slice(),
-        [WorkflowActivationJob {
-            variant: Some(workflow_activation_job::Variant::SignalWorkflow(signal)),
-        }] if signal.signal_name == "after-historical-update"
-    );
-    complete_empty(&core, task.run_id).await;
-
-    let task = core.poll_workflow_activation().await.unwrap();
-    assert_eq!(task.history_length, live_update_history_length);
-    assert_matches!(
-        task.jobs.as_slice(),
-        [WorkflowActivationJob {
-            variant: Some(workflow_activation_job::Variant::DoUpdate(update)),
-        }] if update.id == live_update_id
-    );
+    complete_activation(&core, &["signal:after-historical-update"]).await;
+    let task = expect_activation(&core, &["update:later-live"]).await;
+    assert_eq!(task.history_length, history_length);
 }
 
 #[tokio::test]
 async fn historical_admitted_and_later_live_update_preserve_protocol_order() {
-    let wfid = "historical-admitted-and-live";
-    let admitted_update_id = "historical-admitted";
-    let live_update_id = "later-live";
-    let mut t = TestHistoryBuilder::default();
-
-    t.add_by_type(EventType::WorkflowExecutionStarted);
-    t.add_full_wf_task();
+    let mut t = chunking_history();
     t.add_full_wf_task();
     t.add_workflow_task_scheduled();
-    add_reapplied_update_admitted(&mut t, admitted_update_id);
+    add_reapplied_update_admitted(&mut t, "historical-admitted");
     t.add_we_signaled("between-sources", vec![]);
-    let live_update_sequencing_event_id = t.current_event_id();
+    let position = t.current_event_id();
     t.add_workflow_task_started();
-
-    let mut poll_resp = hist_to_poll_resp(&t, wfid, ResponseType::AllHistory);
-    poll_resp.add_update_request(live_update_id, live_update_sequencing_event_id);
-
-    let mh = MockPollCfg::from_resp_batches(wfid, t, [poll_resp], mock_worker_client());
-    let mut mock = build_mock_pollers(mh);
-    mock.worker_cfg(|wc| wc.max_cached_workflows = 1);
-    let core = mock_worker(mock);
-
-    poll_and_complete_empty_initialization(&core).await;
-
-    let task = core.poll_workflow_activation().await.unwrap();
-    assert_matches!(
-        task.jobs.as_slice(),
-        [
-            WorkflowActivationJob {
-                variant: Some(workflow_activation_job::Variant::DoUpdate(admitted)),
-            },
-            WorkflowActivationJob {
-                variant: Some(workflow_activation_job::Variant::SignalWorkflow(signal)),
-            },
-            WorkflowActivationJob {
-                variant: Some(workflow_activation_job::Variant::DoUpdate(live)),
-            },
-        ] if admitted.id == admitted_update_id
-            && signal.signal_name == "between-sources"
-            && live.id == live_update_id
-    );
+    let core = chunking_worker(t, &[("later-live", position)], 0);
+    complete_activation(&core, &["initialize"]).await;
+    expect_activation(
+        &core,
+        &[
+            "update:historical-admitted",
+            "signal:between-sources",
+            "update:later-live",
+        ],
+    )
+    .await;
 }
 
 #[tokio::test]
