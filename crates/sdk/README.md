@@ -156,7 +156,9 @@ use temporalio_sdk::opentelemetry::{OpenTelemetryPlugin, WorkflowIdGenerator};
 let tracer_provider = SdkTracerProvider::builder()
     .with_id_generator(WorkflowIdGenerator::default())
     .build();
-let plugin = OpenTelemetryPlugin::new().with_tracer(tracer_provider.tracer("temporalio-sdk"));
+let plugin = OpenTelemetryPlugin::builder()
+    .tracer(tracer_provider.tracer("temporalio-sdk"))
+    .build();
 
 let client_options = ClientOptions::new("default")
     .plugin(plugin)
@@ -168,9 +170,8 @@ let client_options = ClientOptions::new("default")
 By default, the plugin uses the OpenTelemetry global tracer. It propagates W3C Trace Context and W3C
 Baggage in the cross-SDK `_tracer-data` Temporal header. The application controls the tracer
 provider and exporters. The application is also responsible for flushing and shutting down these
-components. Use
-`OpenTelemetryPlugin::with_tracer` and
-`OpenTelemetryPlugin::with_propagator` to configure only this plugin.
+components. Use `OpenTelemetryPlugin::builder()` to set a tracer or propagator for this plugin.
+The builder returns a `SimplePlugin` when you call `build()`.
 
 Use `WorkflowIdGenerator` in the tracer provider for Workflow spans. If application Workflow code
 creates spans, also wrap each span processor in `WorkflowSpanProcessor`. These types keep span IDs

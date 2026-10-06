@@ -12,7 +12,7 @@
 //! use temporalio_sdk::opentelemetry::OpenTelemetryPlugin;
 //!
 //! let client_options = ClientOptions::new("default")
-//!     .plugin(OpenTelemetryPlugin::new())
+//!     .plugin(OpenTelemetryPlugin::builder().build())
 //!     .build();
 //! # let _ = client_options;
 //! ```
@@ -59,11 +59,11 @@ use std::{
     time::Duration,
 };
 use temporalio_client::{
-    CancelWorkflowInput, ClientInterceptor, ClientOptions, ClientPlugin, DescribeWorkflowInput,
-    DescribeWorkflowOutput, ErasedClientPlugin, Next as ClientNext, PluginError,
-    QueryWorkflowInput, QueryWorkflowOutput, SignalWithStartWorkflowInput, SignalWorkflowInput,
-    StartWorkflowInput, StartWorkflowOutput, StartWorkflowUpdateInput, StartWorkflowUpdateOutput,
-    TerminateWorkflowInput, UpdateWithStartWorkflowInput, UpdateWithStartWorkflowOutput,
+    CancelWorkflowInput, ClientInterceptor, DescribeWorkflowInput, DescribeWorkflowOutput,
+    Next as ClientNext, QueryWorkflowInput, QueryWorkflowOutput, SignalWithStartWorkflowInput,
+    SignalWorkflowInput, StartWorkflowInput, StartWorkflowOutput, StartWorkflowUpdateInput,
+    StartWorkflowUpdateOutput, TerminateWorkflowInput, UpdateWithStartWorkflowInput,
+    UpdateWithStartWorkflowOutput,
     errors::{
         WorkflowInteractionError, WorkflowQueryError, WorkflowStartError, WorkflowUpdateError,
         WorkflowUpdateWithStartError,
@@ -77,7 +77,7 @@ use temporalio_common::{
     protos::temporal::api::common::v1::{Header, Payload},
 };
 use temporalio_sdk::{
-    ClientAndWorkerPlugin, WorkerOptions, WorkerPlugin, WorkflowContextKey,
+    SimplePlugin, WorkflowContextKey,
     activities::ActivityError,
     interceptors::{
         ActivityInboundInterceptor, ExecuteActivityInput, ExecuteActivityOutput,
@@ -95,7 +95,6 @@ use temporalio_sdk::{
         WorkflowInterceptor, WorkflowInterceptorConstructor, WorkflowInterceptorContext,
         WorkflowInterceptorFuture, WorkflowNext, WorkflowOutboundFuture,
     },
-    workflow_replayer::WorkflowReplayerOptions,
 };
 use temporalio_workflow::WorkflowRandomStream;
 
@@ -316,22 +315,33 @@ impl Config {
     }
 }
 
-/// A Temporal client and worker plugin for OpenTelemetry tracing.
+/// Creates an OpenTelemetry tracing plugin for Temporal clients and workers.
 ///
-/// By default, the plugin uses the OpenTelemetry global tracer. It propagates W3C Trace Context and
-/// W3C Baggage. The application starts, flushes, and stops the provider and exporters.
-#[derive(Clone)]
-pub struct OpenTelemetryPlugin {
-    config: Arc<Config>,
-}
+/// Use [`Self::builder`] to configure the plugin. The application is responsible for starting,
+/// flushing, and stopping the provider and exporters.
+pub struct OpenTelemetryPlugin;
 
 impl OpenTelemetryPlugin {
-    /// Creates a plugin that uses the global tracer and W3C propagators.
+    /// Creates a builder that uses the global tracer and W3C propagators.
     ///
     /// The global tracer provider must use [`WorkflowIdGenerator`] for replay-safe Workflow spans.
-    pub fn new() -> Self {
+    pub fn builder() -> OpenTelemetryPluginBuilder {
+        OpenTelemetryPluginBuilder::default()
+    }
+}
+
+/// Configures an OpenTelemetry tracing plugin.
+///
+/// Call [`Self::build`] to create a [`SimplePlugin`] for clients, workers, and Workflow replay.
+#[derive(Clone)]
+pub struct OpenTelemetryPluginBuilder {
+    config: Config,
+}
+
+impl Default for OpenTelemetryPluginBuilder {
+    fn default() -> Self {
         Self {
-            config: Arc::new(Config {
+            config: Config {
                 tracer: TracerSource::Global,
                 propagator: PropagatorSource::Configured(Arc::new(
                     TextMapCompositePropagator::new(vec![
@@ -340,103 +350,64 @@ impl OpenTelemetryPlugin {
                     ]),
                 )),
                 header_key: TRACE_HEADER_KEY.into(),
-            }),
+            },
         }
     }
+}
 
+impl OpenTelemetryPluginBuilder {
     /// Sets the tracer that the plugin uses.
     ///
     /// The tracer provider must use [`WorkflowIdGenerator`] for replay-safe Workflow spans.
-    pub fn with_tracer<T>(mut self, tracer: T) -> Self
+    pub fn tracer<T>(mut self, tracer: T) -> Self
     where
         T: Tracer + Send + Sync + 'static,
         T::Span: Send + Sync + 'static,
     {
-        Arc::make_mut(&mut self.config).tracer =
-            TracerSource::Configured(Arc::new(move |builder, parent| {
-                parent.with_span(builder.start_with_context(&tracer, parent))
-            }));
+        self.config.tracer = TracerSource::Configured(Arc::new(move |builder, parent| {
+            parent.with_span(builder.start_with_context(&tracer, parent))
+        }));
         self
     }
 
     /// Sets the text-map propagator that the plugin uses.
-    pub fn with_propagator(
+    pub fn propagator(
         mut self,
         propagator: impl TextMapPropagator + Send + Sync + 'static,
     ) -> Self {
-        Arc::make_mut(&mut self.config).propagator =
-            PropagatorSource::Configured(Arc::new(propagator));
+        self.config.propagator = PropagatorSource::Configured(Arc::new(propagator));
         self
     }
 
     /// Uses the global text-map propagator for each operation.
-    pub fn with_global_propagator(mut self) -> Self {
-        Arc::make_mut(&mut self.config).propagator = PropagatorSource::Global;
+    pub fn global_propagator(mut self) -> Self {
+        self.config.propagator = PropagatorSource::Global;
         self
     }
 
     /// Sets the Temporal payload header that contains trace context.
     ///
     /// Keep the default `_tracer-data` value to propagate context to other Temporal SDKs.
-    pub fn with_header_key(mut self, header_key: impl Into<Arc<str>>) -> Self {
-        Arc::make_mut(&mut self.config).header_key = header_key.into();
+    pub fn header_key(mut self, header_key: impl Into<Arc<str>>) -> Self {
+        self.config.header_key = header_key.into();
         self
     }
 
-    fn workflow_interceptor_constructor(&self) -> WorkflowInterceptorConstructor {
-        let config = self.config.clone();
-        WorkflowInterceptorConstructor::new(move |_| {
-            OpenTelemetryWorkflowInterceptor::new(config.clone())
-        })
-    }
-}
-
-impl Default for OpenTelemetryPlugin {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl From<OpenTelemetryPlugin> for ErasedClientPlugin {
-    fn from(plugin: OpenTelemetryPlugin) -> Self {
-        ClientAndWorkerPlugin::new(plugin).into()
-    }
-}
-
-impl ClientPlugin for OpenTelemetryPlugin {
-    fn name(&self) -> &str {
-        "opentelemetry"
-    }
-
-    fn configure_client_options(&self, options: &mut ClientOptions) -> Result<(), PluginError> {
-        options
-            .client_interceptors
-            .push(Arc::new(OpenTelemetryClientInterceptor {
-                config: self.config.clone(),
-            }));
-        Ok(())
-    }
-}
-
-impl WorkerPlugin for OpenTelemetryPlugin {
-    fn name(&self) -> &str {
-        "opentelemetry"
-    }
-
-    fn configure_worker_options(&self, options: &mut WorkerOptions) -> Result<(), PluginError> {
-        options.activity_inbound_interceptor(OpenTelemetryActivityInboundInterceptor {
-            config: self.config.clone(),
-        });
-        options.workflow_interceptor(self.workflow_interceptor_constructor());
-        Ok(())
-    }
-
-    fn configure_workflow_replayer_options(
-        &self,
-        options: &mut WorkflowReplayerOptions,
-    ) -> Result<(), PluginError> {
-        options.workflow_interceptor(self.workflow_interceptor_constructor());
-        Ok(())
+    /// Creates a plugin that shares this configuration across all its interceptors.
+    pub fn build(self) -> SimplePlugin {
+        let config = Arc::new(self.config);
+        SimplePlugin::builder("opentelemetry")
+            .client_interceptors(vec![Arc::new(OpenTelemetryClientInterceptor {
+                config: config.clone(),
+            }) as Arc<dyn ClientInterceptor>])
+            .activity_inbound_interceptors(vec![Arc::new(OpenTelemetryActivityInboundInterceptor {
+                config: config.clone(),
+            })
+                as Arc<dyn ActivityInboundInterceptor>])
+            .workflow_interceptors(vec![WorkflowInterceptorConstructor::new(move |_| {
+                OpenTelemetryWorkflowInterceptor::new(config.clone())
+            })])
+            .build()
     }
 }
 
@@ -1196,6 +1167,7 @@ mod tests {
         trace::{SpanContext, SpanId, TraceFlags, TraceId, TraceState, TracerProvider as _},
     };
     use opentelemetry_sdk::trace::{InMemorySpanExporter, SdkTracerProvider, SimpleSpanProcessor};
+    use temporalio_client::{ClientOptions, ClientPlugin};
 
     fn test_context(span_id: u64) -> Context {
         Context::new().with_remote_span_context(SpanContext::new(
@@ -1224,7 +1196,7 @@ mod tests {
 
     #[test]
     fn default_propagator_uses_cross_sdk_header_and_baggage() {
-        let plugin = OpenTelemetryPlugin::new();
+        let builder = OpenTelemetryPlugin::builder();
         let remote = SpanContext::new(
             TraceId::from_hex("4bf92f3577b34da6a3ce929d0e0e4736").unwrap(),
             SpanId::from_hex("00f067aa0ba902b7").unwrap(),
@@ -1237,8 +1209,8 @@ mod tests {
             .with_baggage([KeyValue::new("tenant", "acme")]);
         let mut fields = HashMap::new();
 
-        inject_into_fields(&plugin.config, &context, &mut fields);
-        let extracted = extract_from_fields(&plugin.config, &fields);
+        inject_into_fields(&builder.config, &context, &mut fields);
+        let extracted = extract_from_fields(&builder.config, &fields);
 
         assert!(fields.contains_key(TRACE_HEADER_KEY));
         assert_eq!(extracted.span().span_context(), &remote);
@@ -1254,9 +1226,9 @@ mod tests {
         let provider = SdkTracerProvider::builder()
             .with_simple_exporter(exporter.clone())
             .build();
-        let plugin = OpenTelemetryPlugin::new().with_tracer(provider.tracer("test"));
+        let builder = OpenTelemetryPlugin::builder().tracer(provider.tracer("test"));
         let context = start_span(
-            &plugin.config,
+            &builder.config,
             &Context::new(),
             "StartWorkflow:Example".to_owned(),
             SpanKind::Client,
@@ -1278,8 +1250,8 @@ mod tests {
 
     #[test]
     fn outbound_context_prefers_active_then_workflow_scoped_context() {
-        let plugin = OpenTelemetryPlugin::new();
-        let interceptor = OpenTelemetryWorkflowInterceptor::new(plugin.config);
+        let builder = OpenTelemetryPlugin::builder();
+        let interceptor = OpenTelemetryWorkflowInterceptor::new(Arc::new(builder.config));
         *interceptor.workflow_context.borrow_mut() = Some(test_context(1));
         let scoped = Rc::new(test_context(2));
 
@@ -1332,7 +1304,7 @@ mod tests {
 
     #[test]
     fn plugin_appends_each_supported_interceptor() {
-        let plugin = OpenTelemetryPlugin::new();
+        let plugin = OpenTelemetryPlugin::builder().build();
         let mut client_options = ClientOptions::new("namespace").build();
         ClientPlugin::configure_client_options(&plugin, &mut client_options).unwrap();
         assert_eq!(client_options.client_interceptors.len(), 1);

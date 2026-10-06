@@ -383,7 +383,9 @@ async fn opentelemetry_plugin_connects_supported_spans_and_replays() {
         )))
         .build();
     let tracer = provider.tracer("integration-test");
-    let plugin = OpenTelemetryPlugin::new().with_tracer(tracer.clone());
+    let plugin = OpenTelemetryPlugin::builder()
+        .tracer(tracer.clone())
+        .build();
     let client = Client::connect(
         get_integ_server_options(),
         ClientOptions::new(integ_namespace())
@@ -548,7 +550,9 @@ async fn opentelemetry_plugin_replay_compatibility() {
     let provider = SdkTracerProvider::builder()
         .with_id_generator(WorkflowIdGenerator::default())
         .build();
-    let plugin = OpenTelemetryPlugin::new().with_tracer(provider.tracer("replay-test"));
+    let plugin = OpenTelemetryPlugin::builder()
+        .tracer(provider.tracer("replay-test"))
+        .build();
     let instrumented_client = Client::connect(
         get_integ_server_options(),
         ClientOptions::new(integ_namespace())
