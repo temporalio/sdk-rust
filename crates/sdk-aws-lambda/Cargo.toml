@@ -2,6 +2,7 @@
 name = "temporalio-sdk-aws-lambda"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.92.0"
 authors = ["Temporal Technologies Inc. <sdk@temporal.io>"]
 license-file = { workspace = true }
 description = "AWS Lambda integration for the Temporal Rust SDK"
@@ -47,18 +48,18 @@ tracing-subscriber = { version = "0.3", default-features = false, features = [
 
 [dependencies.temporalio-client]
 path = "../client"
-version = "0.7"
+version = "~1.1.0"
 default-features = false
 features = ["envconfig", "tls-ring"]
 
 [dependencies.temporalio-common]
 path = "../common"
-version = "0.7"
+version = "~1.1.0"
 default-features = false
 
 [dependencies.temporalio-sdk]
 path = "../sdk"
-version = "0.7"
+version = "~1.1.0"
 default-features = false
 features = ["envconfig"]
 

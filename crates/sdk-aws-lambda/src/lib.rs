@@ -28,8 +28,11 @@ use temporalio_common::worker::{
     VersioningBehavior, WorkerDeploymentOptions, WorkerDeploymentVersion,
 };
 use temporalio_sdk::{
-    Runtime, Worker, WorkerCreateError, WorkerOptions, WorkerRunError,
-    runtime::{PollerBehavior, TunerHolder, WorkerTuner},
+    Runtime, RuntimeError, Worker, WorkerCreateError, WorkerOptions, WorkerRunError,
+    runtime::{
+        PollerBehavior,
+        worker_tuner::{FixedSizeSlotSupplier, TunerHolder, WorkerTuner},
+    },
 };
 use tokio::time::{Instant, sleep, sleep_until, timeout};
 
@@ -56,15 +59,10 @@ pub struct LambdaWorkerDefaults {
     pub activity_slots: usize,
     /// Maximum concurrent Local Activities.
     pub local_activity_slots: usize,
-    /// Maximum concurrent Nexus Tasks. Rust SDK Nexus registration is not yet exposed, but the
-    /// slot supplier is configured for forward compatibility.
-    pub nexus_slots: usize,
     /// Maximum concurrent Workflow Task polls.
     pub workflow_task_pollers: usize,
     /// Maximum concurrent Activity Task polls.
     pub activity_task_pollers: usize,
-    /// Maximum concurrent Nexus Task polls.
-    pub nexus_task_pollers: usize,
     /// Maximum number of cached Workflows.
     pub max_cached_workflows: usize,
     /// Time allowed for graceful Worker shutdown.
@@ -79,10 +77,8 @@ impl Default for LambdaWorkerDefaults {
             workflow_slots: 10,
             activity_slots: 2,
             local_activity_slots: 2,
-            nexus_slots: 5,
             workflow_task_pollers: 2,
             activity_task_pollers: 1,
-            nexus_task_pollers: 1,
             max_cached_workflows: 30,
             graceful_shutdown_period: Duration::from_secs(5),
             shutdown_hook_buffer: Duration::from_secs(2),
@@ -108,7 +104,7 @@ pub enum LambdaWorkerError {
     ClientConfiguration(#[from] ConfigError),
     /// The Temporal SDK runtime could not be created.
     #[error("failed to create Temporal runtime: {0}")]
-    Runtime(#[source] anyhow::Error),
+    Runtime(#[from] RuntimeError),
     /// OpenTelemetry providers or exporters could not be configured.
     #[cfg(feature = "otel")]
     #[error("failed to configure OpenTelemetry: {0}")]
@@ -148,7 +144,7 @@ pub struct LambdaWorkerBuilder {
     client_options: Option<ClientOptions>,
     runtime: Option<Arc<Runtime>>,
     defaults: LambdaWorkerDefaults,
-    custom_tuner: Option<Arc<dyn WorkerTuner + Send + Sync>>,
+    custom_tuner: Option<WorkerTuner>,
     default_versioning_behavior: VersioningBehavior,
     shutdown_hooks: Vec<ShutdownHook>,
     #[cfg(feature = "otel")]
@@ -191,8 +187,8 @@ impl LambdaWorkerBuilder {
     }
 
     /// Explicitly use a custom Worker tuner instead of the Lambda fixed-size tuner.
-    pub fn worker_tuner(mut self, tuner: Arc<dyn WorkerTuner + Send + Sync>) -> Self {
-        self.custom_tuner = Some(tuner);
+    pub fn worker_tuner(mut self, tuner: impl Into<WorkerTuner>) -> Self {
+        self.custom_tuner = Some(tuner.into());
         self
     }
 
@@ -265,7 +261,7 @@ impl LambdaWorkerBuilder {
                 integration.runtime()
             }
             (None, None) => Arc::new(
-                Runtime::new_assume_tokio(Default::default())
+                Runtime::from_current_tokio(Default::default())
                     .map_err(LambdaWorkerError::Runtime)?,
             ),
         };
@@ -273,7 +269,7 @@ impl LambdaWorkerBuilder {
         let runtime = match self.runtime {
             Some(runtime) => runtime,
             None => Arc::new(
-                Runtime::new_assume_tokio(Default::default())
+                Runtime::from_current_tokio(Default::default())
                     .map_err(LambdaWorkerError::Runtime)?,
             ),
         };
@@ -440,16 +436,20 @@ fn apply_worker_configuration(
     options: &mut WorkerOptions,
     version: &WorkerDeploymentVersion,
     defaults: &LambdaWorkerDefaults,
-    custom_tuner: Option<Arc<dyn WorkerTuner + Send + Sync>>,
+    custom_tuner: Option<WorkerTuner>,
     default_versioning_behavior: VersioningBehavior,
 ) {
     options.tuner = custom_tuner.unwrap_or_else(|| {
-        Arc::new(TunerHolder::fixed_size(
-            defaults.workflow_slots,
-            defaults.activity_slots,
-            defaults.local_activity_slots,
-            defaults.nexus_slots,
-        ))
+        TunerHolder::builder()
+            .workflow_task_slot_supplier(FixedSizeSlotSupplier::new(defaults.workflow_slots))
+            .activity_task_slot_supplier(FixedSizeSlotSupplier::new(defaults.activity_slots))
+            .local_activity_task_slot_supplier(FixedSizeSlotSupplier::new(
+                defaults.local_activity_slots,
+            ))
+            // The tuner requires every supplier even though Rust workers do not poll Nexus tasks.
+            .nexus_task_slot_supplier(FixedSizeSlotSupplier::new(1))
+            .build()
+            .into()
     });
     options.workflow_task_poller_behavior = Some(PollerBehavior::SimpleMaximum(
         defaults.workflow_task_pollers,
@@ -457,8 +457,6 @@ fn apply_worker_configuration(
     options.activity_task_poller_behavior = Some(PollerBehavior::SimpleMaximum(
         defaults.activity_task_pollers,
     ));
-    options.nexus_task_poller_behavior =
-        Some(PollerBehavior::SimpleMaximum(defaults.nexus_task_pollers));
     options.max_cached_workflows = defaults.max_cached_workflows;
     options.graceful_shutdown_period = Some(defaults.graceful_shutdown_period);
     options.max_eager_activity_reservations_per_workflow_task = 0;
@@ -480,7 +478,6 @@ fn validate_defaults(defaults: &LambdaWorkerDefaults) -> Result<(), LambdaWorker
     if defaults.workflow_slots == 0
         || defaults.activity_slots == 0
         || defaults.local_activity_slots == 0
-        || defaults.nexus_slots == 0
     {
         return Err(LambdaWorkerError::InvalidConfiguration(
             "all fixed-size tuner slot counts must be greater than zero".to_owned(),
@@ -491,9 +488,9 @@ fn validate_defaults(defaults: &LambdaWorkerDefaults) -> Result<(), LambdaWorker
             "workflow_task_pollers must be at least 2 when sticky caching is enabled".to_owned(),
         ));
     }
-    if defaults.activity_task_pollers == 0 || defaults.nexus_task_pollers == 0 {
+    if defaults.activity_task_pollers == 0 {
         return Err(LambdaWorkerError::InvalidConfiguration(
-            "activity_task_pollers and nexus_task_pollers must be greater than zero".to_owned(),
+            "activity_task_pollers must be greater than zero".to_owned(),
         ));
     }
     Ok(())
@@ -595,6 +592,7 @@ mod tests {
             atomic::{AtomicBool, Ordering},
         },
     };
+    use temporalio_sdk::runtime::worker_tuner::SlotSupplier;
     use tokio::sync::{Notify, oneshot};
 
     fn version() -> WorkerDeploymentVersion {
@@ -625,10 +623,6 @@ mod tests {
             options.activity_task_poller_behavior,
             Some(PollerBehavior::SimpleMaximum(1))
         );
-        assert_eq!(
-            options.nexus_task_poller_behavior,
-            Some(PollerBehavior::SimpleMaximum(1))
-        );
         assert_eq!(options.max_eager_activity_reservations_per_workflow_task, 0);
         assert_eq!(
             options.graceful_shutdown_period,
@@ -644,8 +638,13 @@ mod tests {
 
     #[test]
     fn custom_tuner_is_preserved_explicitly() {
-        let custom: Arc<dyn WorkerTuner + Send + Sync> =
-            Arc::new(TunerHolder::fixed_size(3, 4, 5, 6));
+        let custom: WorkerTuner = TunerHolder::builder()
+            .workflow_task_slot_supplier(FixedSizeSlotSupplier::new(3))
+            .activity_task_slot_supplier(FixedSizeSlotSupplier::new(4))
+            .local_activity_task_slot_supplier(FixedSizeSlotSupplier::new(5))
+            .nexus_task_slot_supplier(FixedSizeSlotSupplier::new(1))
+            .build()
+            .into();
         let mut options = WorkerOptions::new("queue").build();
         apply_worker_configuration(
             &mut options,
@@ -655,7 +654,18 @@ mod tests {
             VersioningBehavior::AutoUpgrade,
         );
 
-        assert!(Arc::ptr_eq(&options.tuner, &custom));
+        let WorkerTuner::TunerHolder(tuner) = options.tuner else {
+            panic!("custom tuner was replaced");
+        };
+        assert!(
+            matches!(tuner.workflow_task_slot_supplier, SlotSupplier::FixedSize(supplier) if supplier.num_slots == 3)
+        );
+        assert!(
+            matches!(tuner.activity_task_slot_supplier, SlotSupplier::FixedSize(supplier) if supplier.num_slots == 4)
+        );
+        assert!(
+            matches!(tuner.local_activity_task_slot_supplier, SlotSupplier::FixedSize(supplier) if supplier.num_slots == 5)
+        );
         assert_eq!(
             options.deployment_options.default_versioning_behavior,
             Some(VersioningBehavior::AutoUpgrade)
@@ -665,7 +675,7 @@ mod tests {
     #[cfg(feature = "otel")]
     #[tokio::test]
     async fn rejects_open_telemetry_with_caller_owned_runtime() {
-        let runtime = Arc::new(Runtime::new_assume_tokio(Default::default()).unwrap());
+        let runtime = Arc::new(Runtime::from_current_tokio(Default::default()).unwrap());
         let result = LambdaWorker::builder(version(), WorkerOptions::new("queue").build())
             .client_options(
                 ConnectionOptions::new(
@@ -839,7 +849,7 @@ mod tests {
                 .build(),
                 client_options: ClientOptions::new("default").build(),
                 worker_options: WorkerOptions::new("queue").build(),
-                runtime: Arc::new(Runtime::new_assume_tokio(Default::default()).unwrap()),
+                runtime: Arc::new(Runtime::from_current_tokio(Default::default()).unwrap()),
                 shutdown_buffer: Duration::from_secs(7),
                 shutdown_hooks: vec![
                     Arc::new(move |_| {

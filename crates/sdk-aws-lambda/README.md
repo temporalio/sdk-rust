@@ -32,10 +32,12 @@ The file lookup order is `TEMPORAL_CONFIG_FILE`, `$LAMBDA_TASK_ROOT/temporal.tom
 queue.
 
 The builder applies Lambda-oriented limits by default: 10 Workflow Task slots, 2 Activity slots,
-2 Local Activity slots, 2 Workflow Task pollers, 1 Activity Task poller, 1 Nexus Task poller, a
+2 Local Activity slots, 2 Workflow Task pollers, 1 Activity Task poller, a
 workflow cache size of 30, and a five-second graceful shutdown period. Eager Activity execution is
 always disabled, and Worker Deployment Versioning is always enabled. Call `worker_tuner` to
 explicitly replace the fixed-size Lambda tuner with a custom tuner.
+
+Nexus service hosting is outside this integration's scope.
 
 ## OpenTelemetry
 
