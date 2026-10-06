@@ -33,6 +33,8 @@ relevant information.
 
 ## Unreleased
 
+## [1.1.0] - 2026-10-06
+
 ### Added
 * `WorkflowStartOptions::versioning_override` and
   `WorkflowUpdateWithStartOptions::versioning_override` support pinned, auto-upgrade, and

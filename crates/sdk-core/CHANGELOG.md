@@ -33,6 +33,8 @@ relevant information.
 
 ## Unreleased
 
+## [0.10.0] - 2026-10-06
+
 ### Added
 * Child workflow commands, including those submitted through the C bridge, support pinned,
   auto-upgrade, and one-time worker deployment versioning overrides on Temporal Server 1.32.0
