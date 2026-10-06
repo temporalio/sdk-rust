@@ -36,8 +36,11 @@ relevant information.
 ### Added
 * The experimental `temporalio-sdk-aws-lambda` crate runs a versioned Rust SDK Worker for each AWS
   Lambda invocation with Lambda-oriented concurrency defaults, deadline-aware graceful shutdown,
-  and optional OTLP metrics and tracing configured for the AWS Distro for OpenTelemetry Lambda
-  layers.
+  and optional replay-safe OpenTelemetry plugin tracing and OTLP metrics for ADOT Lambda layers.
+  Worker drain and telemetry have separate budgets; providers remain active across warm invocations.
+* OpenTelemetry metric exporters accept an explicit per-request timeout through
+  `OtelCollectorOptions::export_timeout`; `CoreOtelMeter::force_flush` exports pending metrics
+  without shutting down the provider.
 
 ## [1.1.0] - 2026-10-06
 

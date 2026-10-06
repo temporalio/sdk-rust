@@ -138,6 +138,9 @@ pub struct OtelCollectorOptions {
     /// Optionally specify how frequently metrics should be exported. Defaults to 1 second.
     #[builder(default = Duration::from_secs(1))]
     pub metric_periodicity: Duration,
+    /// Optional timeout for each OTLP export request. If unset, the exporter uses its standard
+    /// environment-variable and default timeout configuration.
+    pub export_timeout: Option<Duration>,
     /// Specifies the aggregation temporality for metric export. Defaults to cumulative.
     #[builder(default = MetricTemporality::Cumulative)]
     pub metric_temporality: MetricTemporality,
