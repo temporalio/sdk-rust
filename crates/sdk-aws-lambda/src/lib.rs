@@ -11,6 +11,7 @@ pub mod otel;
 
 use std::{
     env,
+    error::Error as StdError,
     future::Future,
     path::{Path, PathBuf},
     pin::Pin,
@@ -25,13 +26,12 @@ use lambda_runtime::{LambdaEvent, service_fn};
 use temporalio_client::{
     Client, ClientOptions, ConnectionOptions,
     envconfig::{ConfigError, DataSource, LoadClientConfigProfileOptions},
-    errors::ClientConnectError,
 };
 use temporalio_common::worker::{
     VersioningBehavior, WorkerDeploymentOptions, WorkerDeploymentVersion,
 };
 use temporalio_sdk::{
-    Runtime, RuntimeError, Worker, WorkerCreateError, WorkerOptions, WorkerRunError,
+    Runtime, Worker, WorkerOptions,
     runtime::{
         PollerBehavior,
         worker_tuner::{FixedSizeSlotSupplier, TunerHolder, WorkerTuner},
@@ -97,60 +97,60 @@ impl Default for LambdaWorkerOptions {
     }
 }
 
-/// Errors produced while configuring or running a Lambda Worker.
+/// An error configuring a Lambda Worker. The underlying cause is available through
+/// [`std::error::Error::source`].
 #[derive(Debug, thiserror::Error)]
-#[non_exhaustive]
-pub enum LambdaWorkerError {
-    /// The Worker Deployment Version is incomplete.
-    #[error("worker deployment name and build ID must both be non-empty")]
-    InvalidDeploymentVersion,
-    /// No task queue was configured.
-    #[error("task queue is required: set WorkerOptions.task_queue or {ENV_TASK_QUEUE}")]
-    MissingTaskQueue,
-    /// A Lambda Worker limit is invalid.
-    #[error("invalid Lambda Worker configuration: {0}")]
-    InvalidConfiguration(String),
-    /// Client environment or file configuration could not be loaded.
-    #[error("failed to load Temporal client configuration: {0}")]
-    ClientConfiguration(#[from] ConfigError),
-    /// The Temporal SDK runtime could not be created.
-    #[error("failed to create Temporal runtime: {0}")]
-    Runtime(#[from] RuntimeError),
-    /// OpenTelemetry providers or exporters could not be configured.
-    #[cfg(feature = "otel")]
-    #[error("failed to configure OpenTelemetry: {0}")]
-    OpenTelemetry(#[source] anyhow::Error),
-    /// The Temporal client could not connect.
-    #[error("failed to connect Temporal client: {0}")]
-    ClientConnect(#[from] ClientConnectError),
-    /// The Temporal client did not connect before the Worker shutdown window began.
-    #[error("Temporal client did not connect within the {0:?} work budget")]
-    ClientConnectTimedOut(Duration),
-    /// The Temporal Worker could not be created.
-    #[error("failed to create Temporal Worker: {0}")]
-    WorkerCreate(#[from] WorkerCreateError),
-    /// The Temporal Worker stopped with an error.
-    #[error("Temporal Worker failed: {0}")]
-    WorkerRun(#[from] WorkerRunError),
-    /// Too little invocation time remains to start a Worker.
-    #[error(
-        "insufficient Lambda invocation time: {remaining:?} remaining with a {shutdown_buffer:?} shutdown buffer"
-    )]
-    InsufficientTime {
-        /// Time remaining in the invocation.
-        remaining: Duration,
-        /// Time reserved for shutdown.
-        shutdown_buffer: Duration,
-    },
-    /// The Worker did not finish before its graceful shutdown allowance elapsed.
-    #[error("Temporal Worker did not stop within {0:?}")]
-    ShutdownTimedOut(Duration),
-    /// A previous invocation was cancelled or its Worker did not finish safely.
-    #[error("this Lambda Worker cannot be reused after an interrupted or failed Worker run")]
-    InterruptedInvocation,
-    /// The same handler was called concurrently.
-    #[error("a Lambda invocation is already running on this handler")]
-    ConcurrentInvocation,
+#[error("{0}")]
+pub struct LambdaWorkerBuildError(#[source] Box<dyn StdError>);
+
+impl LambdaWorkerBuildError {
+    fn new(source: impl Into<Box<dyn StdError>>) -> Self {
+        Self(source.into())
+    }
+
+    fn invalid(message: impl Into<String>) -> Self {
+        Self::new(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            message.into(),
+        ))
+    }
+}
+
+/// An error handling a Lambda invocation. The underlying cause is available through
+/// [`std::error::Error::source`].
+#[derive(Debug, thiserror::Error)]
+#[error("{source}")]
+pub struct LambdaInvocationError {
+    #[source]
+    source: Box<dyn StdError + Send + Sync>,
+    requires_restart: bool,
+}
+
+impl LambdaInvocationError {
+    fn new(source: impl Into<Box<dyn StdError + Send + Sync>>, requires_restart: bool) -> Self {
+        Self {
+            source: source.into(),
+            requires_restart,
+        }
+    }
+
+    fn interrupted() -> Self {
+        Self::new(
+            anyhow::anyhow!(
+                "this Lambda Worker cannot be reused after an interrupted or failed Worker run"
+            ),
+            true,
+        )
+    }
+
+    /// Whether this failure requires recycling the Lambda execution environment.
+    ///
+    /// When true, do not reuse this handler or construct another in the same process, since
+    /// background Worker resources or Activity work may still be running. When false, this
+    /// failure alone does not prevent a subsequent invocation.
+    pub fn requires_restart(&self) -> bool {
+        self.requires_restart
+    }
 }
 
 /// Builder for [`LambdaWorker`].
@@ -238,18 +238,22 @@ impl LambdaWorkerBuilder {
     /// When no client options were supplied, configuration is loaded from `temporal.toml` and
     /// environment variables. This method must run inside a Tokio runtime unless [`Self::runtime`]
     /// was used.
-    pub fn build(mut self) -> Result<LambdaWorker, LambdaWorkerError> {
+    pub fn build(mut self) -> Result<LambdaWorker, LambdaWorkerBuildError> {
         validate_version(&self.version)?;
         validate_lambda_options(&self.lambda_options)?;
         if self.default_versioning_behavior == VersioningBehavior::Unspecified {
-            return Err(LambdaWorkerError::InvalidConfiguration(
-                "default versioning behavior cannot be Unspecified".to_owned(),
+            return Err(LambdaWorkerBuildError::invalid(
+                "default versioning behavior cannot be Unspecified",
             ));
         }
 
         self.worker_options.task_queue =
             resolve_task_queue(&self.worker_options.task_queue, |name| env::var(name).ok())
-                .ok_or(LambdaWorkerError::MissingTaskQueue)?;
+                .ok_or_else(|| {
+                    LambdaWorkerBuildError::invalid(format!(
+                        "task queue is required: set WorkerOptions.task_queue or {ENV_TASK_QUEUE}"
+                    ))
+                })?;
 
         apply_worker_configuration(
             &mut self.worker_options,
@@ -263,14 +267,14 @@ impl LambdaWorkerBuilder {
         let (connection_options, mut client_options) =
             match (self.connection_options, self.client_options) {
                 (Some(connection), Some(client)) => (connection, client),
-                (None, None) => load_client_options()?,
+                (None, None) => load_client_options().map_err(LambdaWorkerBuildError::new)?,
                 _ => unreachable!("client_options sets both option types"),
             };
         #[cfg(feature = "otel")]
         if let Some(options) = self.open_telemetry {
             if self.runtime.is_some() {
-                return Err(LambdaWorkerError::InvalidConfiguration(
-                    "runtime and OpenTelemetry options cannot both be supplied".to_owned(),
+                return Err(LambdaWorkerBuildError::invalid(
+                    "runtime and OpenTelemetry options cannot both be supplied",
                 ));
             }
             otel::configure(
@@ -280,13 +284,13 @@ impl LambdaWorkerBuilder {
                 &mut self.shutdown_hooks,
                 &mut self.runtime,
             )
-            .map_err(LambdaWorkerError::OpenTelemetry)?;
+            .map_err(LambdaWorkerBuildError::new)?;
         }
         let runtime = match self.runtime {
             Some(runtime) => runtime,
             None => Arc::new(
                 Runtime::from_current_tokio(Default::default())
-                    .map_err(LambdaWorkerError::Runtime)?,
+                    .map_err(LambdaWorkerBuildError::new)?,
             ),
         };
         let drain_budget = self
@@ -390,24 +394,26 @@ impl LambdaWorker {
     /// window and an invocation-specific identity. Calls must be sequential. Cancelling this
     /// future or exceeding the Worker drain budget makes this handler unusable for later calls,
     /// since background Activity work may still be running. Recycle the Lambda environment in
-    /// that case rather than constructing another handler in the same process.
-    pub async fn handle<T>(&self, event: LambdaEvent<T>) -> Result<(), LambdaWorkerError> {
+    /// that case rather than constructing another handler in the same process. For returned
+    /// errors, use [`LambdaInvocationError::requires_restart`] to determine whether to recycle.
+    pub async fn handle<T>(&self, event: LambdaEvent<T>) -> Result<(), LambdaInvocationError> {
+        if !self.inner.healthy.load(Ordering::Acquire) {
+            return Err(LambdaInvocationError::interrupted());
+        }
         let now = Instant::now();
         let deadline = event.context.deadline();
         let initial_remaining = deadline
             .duration_since(SystemTime::now())
             .unwrap_or(Duration::ZERO);
-        let work_time = initial_remaining
-            .checked_sub(self.inner.shutdown_buffer)
-            .ok_or(LambdaWorkerError::InsufficientTime {
-                remaining: initial_remaining,
-                shutdown_buffer: self.inner.shutdown_buffer,
-            })?;
+        let work_time = initial_remaining.saturating_sub(self.inner.shutdown_buffer);
         if work_time <= MINIMUM_WORK_TIME {
-            return Err(LambdaWorkerError::InsufficientTime {
-                remaining: initial_remaining,
-                shutdown_buffer: self.inner.shutdown_buffer,
-            });
+            return Err(LambdaInvocationError::new(
+                anyhow::anyhow!(
+                    "insufficient Lambda invocation time: {initial_remaining:?} remaining with a {:?} shutdown buffer",
+                    self.inner.shutdown_buffer,
+                ),
+                false,
+            ));
         }
         if work_time < LOW_WORK_TIME_WARNING {
             tracing::warn!(
@@ -416,13 +422,14 @@ impl LambdaWorker {
                 "Lambda invocation has little time available for Temporal Worker polling"
             );
         }
-        let _permit = self
-            .inner
-            .invocation_gate
-            .try_acquire()
-            .map_err(|_| LambdaWorkerError::ConcurrentInvocation)?;
+        let _permit = self.inner.invocation_gate.try_acquire().map_err(|_| {
+            LambdaInvocationError::new(
+                anyhow::anyhow!("a Lambda invocation is already running on this handler"),
+                false,
+            )
+        })?;
         if !self.inner.healthy.load(Ordering::Acquire) {
-            return Err(LambdaWorkerError::InterruptedInvocation);
+            return Err(LambdaInvocationError::interrupted());
         }
         let mut guard = InvocationGuard {
             healthy: &self.inner.healthy,
@@ -440,10 +447,10 @@ impl LambdaWorker {
             (invocation_deadline - RESPONSE_BUFFER).min(Instant::now() + self.inner.hook_budget),
         )
         .await;
-        guard.completed = !matches!(
-            result,
-            Err(LambdaWorkerError::ShutdownTimedOut(_) | LambdaWorkerError::WorkerRun(_))
-        );
+        guard.completed = result
+            .as_ref()
+            .err()
+            .is_none_or(|error| !error.requires_restart());
         result
     }
 
@@ -454,18 +461,17 @@ impl LambdaWorker {
             lambda_runtime::run(service_fn(move |event: LambdaEvent<serde_json::Value>| {
                 let worker = handler.clone();
                 async move {
-                    worker.handle(event).await.map_err(|error| {
-                        Box::new(std::io::Error::other(error.to_string())) as lambda_runtime::Error
-                    })
+                    worker
+                        .handle(event)
+                        .await
+                        .map_err(lambda_runtime::Error::from)
                 }
             }));
         // An interrupted Worker can retain background Activities. Ending the runtime loop lets
         // the process exit instead of letting AWS reuse an unsafe execution environment.
         tokio::select! {
             result = runtime => result,
-            () = self.inner.interrupted.notified() => Err(Box::new(std::io::Error::other(
-                LambdaWorkerError::InterruptedInvocation.to_string(),
-            ))),
+            () = self.inner.interrupted.notified() => Err(LambdaInvocationError::interrupted().into()),
         }
     }
 
@@ -474,7 +480,7 @@ impl LambdaWorker {
         context: lambda_runtime::Context,
         shutdown_at: Instant,
         drain_deadline: Instant,
-    ) -> Result<(), LambdaWorkerError> {
+    ) -> Result<(), LambdaInvocationError> {
         let mut connection_options = self.inner.connection_options.clone();
         if connection_options.identity.is_empty()
             && self.inner.worker_options.client_identity_override.is_none()
@@ -488,12 +494,21 @@ impl LambdaWorker {
             Client::connect(connection_options, self.inner.client_options.clone()),
         )
         .await
-        .map_err(|_| LambdaWorkerError::ClientConnectTimedOut(connect_budget))??;
+        .map_err(|error| {
+            LambdaInvocationError::new(
+                anyhow::Error::new(error).context(format!(
+                    "Temporal client did not connect within the {connect_budget:?} work budget"
+                )),
+                false,
+            )
+        })?
+        .map_err(|error| LambdaInvocationError::new(error, false))?;
         let mut worker = Worker::new(
             &self.inner.runtime,
             client,
             self.inner.worker_options.clone(),
-        )?;
+        )
+        .map_err(|error| LambdaInvocationError::new(error, false))?;
         let mut shutdown = ShutdownGuard(Some(worker.shutdown_handle()));
         let worker_result = {
             let run = worker.run();
@@ -504,7 +519,15 @@ impl LambdaWorker {
                     shutdown.0.take().expect("shutdown has not been initiated")();
                     timeout_at(drain_deadline, &mut run)
                         .await
-                        .map_err(|_| LambdaWorkerError::ShutdownTimedOut(self.inner.drain_budget))?
+                        .map_err(|error| {
+                            LambdaInvocationError::new(
+                                anyhow::Error::new(error).context(format!(
+                                    "Temporal Worker did not drain and finalize within {:?}",
+                                    self.inner.drain_budget,
+                                )),
+                                true,
+                            )
+                        })?
                 }
             }
         };
@@ -519,11 +542,22 @@ impl LambdaWorker {
         }
         // Core retains the heartbeat registration after polling stops; finalize before hooks or
         // a warm invocation, without letting cleanup consume the hooks' reserved time.
-        timeout_at(drain_deadline, worker.finalize_shutdown())
-            .await
-            .map_err(|_| LambdaWorkerError::ShutdownTimedOut(self.inner.drain_budget))?
-            .map_err(LambdaWorkerError::WorkerRun)?;
-        worker_result.map_err(LambdaWorkerError::WorkerRun)
+        match timeout_at(drain_deadline, worker.finalize_shutdown()).await {
+            Ok(result) => result.map_err(|error| LambdaInvocationError::new(error, true))?,
+            Err(error) => {
+                let source = worker_result
+                    .err()
+                    .map_or_else(|| anyhow::Error::new(error), anyhow::Error::new);
+                return Err(LambdaInvocationError::new(
+                    source.context(format!(
+                        "Temporal Worker did not drain and finalize within {:?}",
+                        self.inner.drain_budget,
+                    )),
+                    true,
+                ));
+            }
+        }
+        worker_result.map_err(|error| LambdaInvocationError::new(error, true))
     }
 
     async fn run_shutdown_hooks(&self, deadline: Instant) {
@@ -583,36 +617,38 @@ fn apply_worker_configuration(
         .build();
 }
 
-fn validate_version(version: &WorkerDeploymentVersion) -> Result<(), LambdaWorkerError> {
+fn validate_version(version: &WorkerDeploymentVersion) -> Result<(), LambdaWorkerBuildError> {
     if version.deployment_name.trim().is_empty() || version.build_id.trim().is_empty() {
-        Err(LambdaWorkerError::InvalidDeploymentVersion)
+        Err(LambdaWorkerBuildError::invalid(
+            "worker deployment name and build ID must both be non-empty",
+        ))
     } else {
         Ok(())
     }
 }
 
-fn validate_lambda_options(options: &LambdaWorkerOptions) -> Result<(), LambdaWorkerError> {
+fn validate_lambda_options(options: &LambdaWorkerOptions) -> Result<(), LambdaWorkerBuildError> {
     if options.workflow_slots == 0
         || options.activity_slots == 0
         || options.local_activity_slots == 0
     {
-        return Err(LambdaWorkerError::InvalidConfiguration(
-            "all fixed-size tuner slot counts must be greater than zero".to_owned(),
+        return Err(LambdaWorkerBuildError::invalid(
+            "all fixed-size tuner slot counts must be greater than zero",
         ));
     }
     if options.workflow_task_pollers < 2 {
-        return Err(LambdaWorkerError::InvalidConfiguration(
-            "workflow_task_pollers must be at least 2 when sticky caching is enabled".to_owned(),
+        return Err(LambdaWorkerBuildError::invalid(
+            "workflow_task_pollers must be at least 2 when sticky caching is enabled",
         ));
     }
     if options.activity_task_pollers == 0 {
-        return Err(LambdaWorkerError::InvalidConfiguration(
-            "activity_task_pollers must be greater than zero".to_owned(),
+        return Err(LambdaWorkerBuildError::invalid(
+            "activity_task_pollers must be greater than zero",
         ));
     }
     if options.worker_shutdown_buffer.is_zero() || options.shutdown_hook_buffer.is_zero() {
-        return Err(LambdaWorkerError::InvalidConfiguration(
-            "worker_shutdown_buffer and shutdown_hook_buffer must be greater than zero".to_owned(),
+        return Err(LambdaWorkerBuildError::invalid(
+            "worker_shutdown_buffer and shutdown_hook_buffer must be greater than zero",
         ));
     }
     Ok(())
@@ -677,7 +713,8 @@ mod tests {
         ffi::OsString,
         sync::{Mutex, atomic::AtomicBool},
     };
-    use temporalio_sdk::runtime::worker_tuner::SlotSupplier;
+    use temporalio_client::errors::ClientConnectError;
+    use temporalio_sdk::{RuntimeError, runtime::worker_tuner::SlotSupplier};
     use tokio::sync::Notify;
 
     fn version() -> WorkerDeploymentVersion {
@@ -773,11 +810,13 @@ mod tests {
             .open_telemetry(otel::OpenTelemetryOptions::default())
             .build();
 
-        assert!(matches!(
-            result,
-            Err(LambdaWorkerError::InvalidConfiguration(message))
-                if message.contains("runtime and OpenTelemetry")
-        ));
+        assert!(
+            result
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("runtime and OpenTelemetry")
+        );
     }
 
     #[test]
@@ -786,19 +825,82 @@ mod tests {
             .deployment_name("")
             .build_id("build")
             .build();
-        assert!(matches!(
-            validate_version(&invalid_version),
-            Err(LambdaWorkerError::InvalidDeploymentVersion)
-        ));
+        assert!(
+            validate_version(&invalid_version)
+                .unwrap_err()
+                .to_string()
+                .contains("deployment name and build ID")
+        );
 
         let lambda_options = LambdaWorkerOptions {
             workflow_task_pollers: 1,
             ..Default::default()
         };
+        assert!(
+            validate_lambda_options(&lambda_options)
+                .unwrap_err()
+                .to_string()
+                .contains("workflow_task_pollers must be at least 2")
+        );
+    }
+
+    #[test]
+    fn build_error_preserves_runtime_cause() {
+        let error = LambdaWorker::builder(version(), WorkerOptions::new("queue").build())
+            .client_options(
+                ConnectionOptions::new(
+                    temporalio_client::Url::parse("http://localhost:7233").unwrap(),
+                )
+                .build(),
+                ClientOptions::new("default").build(),
+            )
+            .build()
+            .err()
+            .unwrap();
         assert!(matches!(
-            validate_lambda_options(&lambda_options),
-            Err(LambdaWorkerError::InvalidConfiguration(_))
+            error.source().unwrap().downcast_ref::<RuntimeError>(),
+            Some(RuntimeError::NoCurrentTokioRuntime)
         ));
+    }
+
+    #[tokio::test]
+    async fn startup_failure_preserves_cause_and_allows_reuse() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        drop(listener);
+        let worker = LambdaWorker::builder(version(), WorkerOptions::new("queue").build())
+            .client_options(
+                ConnectionOptions::new(
+                    temporalio_client::Url::parse(&format!("http://{address}")).unwrap(),
+                )
+                .build(),
+                ClientOptions::new("default").build(),
+            )
+            .build()
+            .unwrap();
+        for _ in 0..2 {
+            let mut context = lambda_runtime::Context::default();
+            context.deadline = (SystemTime::now() + Duration::from_secs(12))
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as u64;
+            let error = worker
+                .handle(LambdaEvent::new((), context))
+                .await
+                .unwrap_err();
+            assert!(!error.requires_restart());
+            assert!(error.source().unwrap().is::<ClientConnectError>());
+        }
+        let error = worker
+            .handle(LambdaEvent::new((), lambda_runtime::Context::default()))
+            .await
+            .unwrap_err();
+        assert!(!error.requires_restart());
+        assert!(
+            error
+                .to_string()
+                .contains("insufficient Lambda invocation time")
+        );
     }
 
     #[test]
@@ -891,15 +993,20 @@ mod tests {
             result = &mut invocation => panic!("invocation ended before cancellation: {result:?}"),
             () = started.notified() => {}
         }
-        assert!(matches!(
-            worker.handle(LambdaEvent::new((), context.clone())).await,
-            Err(LambdaWorkerError::ConcurrentInvocation)
-        ));
+        let error = worker
+            .handle(LambdaEvent::new((), context.clone()))
+            .await
+            .unwrap_err();
+        assert!(!error.requires_restart());
+        assert!(error.to_string().contains("invocation is already running"));
         drop(invocation);
-        assert!(matches!(
-            worker.handle(LambdaEvent::new((), context)).await,
-            Err(LambdaWorkerError::InterruptedInvocation)
-        ));
+        context.deadline = 0;
+        let error = worker
+            .handle(LambdaEvent::new((), context))
+            .await
+            .unwrap_err();
+        assert!(error.requires_restart());
+        assert!(error.to_string().contains("cannot be reused"));
     }
 
     #[tokio::test]

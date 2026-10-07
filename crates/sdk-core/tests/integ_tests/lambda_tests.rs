@@ -26,16 +26,14 @@ use temporalio_client::{Client, ClientOptions, WorkflowStartOptions, worker::Cli
 use temporalio_common::worker::WorkerDeploymentVersion;
 use temporalio_macros::{activities, workflow, workflow_methods};
 use temporalio_sdk::{
-    ActivityOptions, VersioningOverride, Worker, WorkerOptions, WorkflowContext,
+    ActivityOptions, VersioningOverride, Worker, WorkerOptions, WorkerRunError, WorkflowContext,
     WorkflowContextView, WorkflowResult,
     activities::{ActivityContext, ActivityError},
     interceptors::WorkerInterceptor,
     opentelemetry::{OpenTelemetryPlugin, WorkflowIdGenerator, WorkflowSpanProcessor},
     workflow_replayer::{WorkflowReplayer, WorkflowReplayerOptions},
 };
-use temporalio_sdk_aws_lambda::{
-    LambdaWorker, LambdaWorkerError, LambdaWorkerOptions, otel::OpenTelemetryOptions,
-};
+use temporalio_sdk_aws_lambda::{LambdaWorker, LambdaWorkerOptions, otel::OpenTelemetryOptions};
 use tokio::{net::TcpListener, sync::oneshot};
 use tokio_stream::wrappers::TcpListenerStream;
 use tonic::{Request, Response, Status, transport::Server};
@@ -195,16 +193,30 @@ async fn lambda_validation_failure_cannot_block_cleanup_or_allow_reuse() {
         worker.handle(event("invalid-namespace")),
     )
     .await
-    .expect("cleanup must not exceed the invocation deadline");
-    assert!(matches!(
-        result,
-        Err(LambdaWorkerError::ShutdownTimedOut(_) | LambdaWorkerError::WorkerRun(_))
-    ));
+    .expect("cleanup must not exceed the invocation deadline")
+    .unwrap_err();
+    assert!(result.requires_restart());
+    let mut cause = std::error::Error::source(&result);
+    let mut validation_failure = false;
+    while let Some(error) = cause {
+        validation_failure |= matches!(
+            error.downcast_ref::<WorkerRunError>(),
+            Some(WorkerRunError::Validation(_))
+        );
+        cause = error.source();
+    }
+    assert!(
+        validation_failure,
+        "cleanup must preserve the original Worker failure"
+    );
     assert!(hook_called.load(Ordering::Relaxed));
-    assert!(matches!(
-        worker.handle(event("after-failure")).await,
-        Err(LambdaWorkerError::InterruptedInvocation)
-    ));
+    assert!(
+        worker
+            .handle(event("after-failure"))
+            .await
+            .unwrap_err()
+            .requires_restart()
+    );
 }
 
 #[tokio::test]
