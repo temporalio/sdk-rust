@@ -22,17 +22,20 @@ use std::{
     },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
-use temporalio_client::{Client, ClientOptions, WorkflowStartOptions};
+use temporalio_client::{Client, ClientOptions, WorkflowStartOptions, worker::ClientWorkerSet};
 use temporalio_common::worker::WorkerDeploymentVersion;
 use temporalio_macros::{activities, workflow, workflow_methods};
 use temporalio_sdk::{
-    ActivityOptions, VersioningOverride, WorkerOptions, WorkflowContext, WorkflowContextView,
-    WorkflowResult,
+    ActivityOptions, VersioningOverride, Worker, WorkerOptions, WorkflowContext,
+    WorkflowContextView, WorkflowResult,
     activities::{ActivityContext, ActivityError},
+    interceptors::WorkerInterceptor,
     opentelemetry::{OpenTelemetryPlugin, WorkflowIdGenerator, WorkflowSpanProcessor},
     workflow_replayer::{WorkflowReplayer, WorkflowReplayerOptions},
 };
-use temporalio_sdk_aws_lambda::{LambdaWorker, LambdaWorkerDefaults, otel::OpenTelemetryOptions};
+use temporalio_sdk_aws_lambda::{
+    LambdaWorker, LambdaWorkerDefaults, LambdaWorkerError, otel::OpenTelemetryOptions,
+};
 use tokio::{net::TcpListener, sync::oneshot};
 use tokio_stream::wrappers::TcpListenerStream;
 use tonic::{Request, Response, Status, transport::Server};
@@ -87,12 +90,18 @@ impl MetricsService for Collector {
 #[derive(Default)]
 struct LambdaActivities {
     cancellation_complete: Arc<AtomicBool>,
+    invocation_registry: Arc<Mutex<Option<Arc<ClientWorkerSet>>>>,
 }
 
 #[activities]
 impl LambdaActivities {
     #[activity]
-    async fn greet(_ctx: ActivityContext, name: String) -> Result<String, ActivityError> {
+    async fn greet(
+        self: Arc<Self>,
+        ctx: ActivityContext,
+        name: String,
+    ) -> Result<String, ActivityError> {
+        *self.invocation_registry.lock().unwrap() = Some(ctx.client().connection().workers());
         Ok(format!("Hello, {name}!"))
     }
 
@@ -105,6 +114,14 @@ impl LambdaActivities {
         ctx.cancelled().await;
         self.cancellation_complete.store(true, Ordering::Relaxed);
         Ok(())
+    }
+}
+
+struct ShutdownObserver(Arc<Mutex<Option<Uuid>>>);
+
+impl WorkerInterceptor for ShutdownObserver {
+    fn on_shutdown(&self, worker: &Worker) {
+        *self.0.lock().unwrap() = Some(worker.worker_instance_key());
     }
 }
 
@@ -144,7 +161,54 @@ fn event(request_id: &str) -> LambdaEvent<()> {
 }
 
 #[tokio::test]
-async fn lambda_warm_invocations_flush_propagate_and_replay() {
+async fn lambda_validation_failure_cannot_block_cleanup_or_allow_reuse() {
+    let queue = format!("lambda-validation-{}", Uuid::new_v4());
+    let version = WorkerDeploymentVersion::builder()
+        .deployment_name(queue.clone())
+        .build_id("test")
+        .build();
+    let hook_called = Arc::new(AtomicBool::new(false));
+    let observed = hook_called.clone();
+    let mut defaults = LambdaWorkerDefaults::default();
+    defaults.graceful_shutdown_period = Duration::from_millis(100);
+    let worker = LambdaWorker::builder(
+        version,
+        WorkerOptions::new(queue)
+            .register_workflow::<LambdaWorkflow>()
+            .unwrap()
+            .register_activities(LambdaActivities::default())
+            .build(),
+    )
+    .client_options(
+        get_integ_server_options(),
+        ClientOptions::new(format!("missing-{}", Uuid::new_v4())).build(),
+    )
+    .lambda_defaults(defaults)
+    .shutdown_hook(move |_| {
+        observed.store(true, Ordering::Relaxed);
+        async { Ok(()) }
+    })
+    .build()
+    .unwrap();
+    let result = tokio::time::timeout(
+        Duration::from_secs(6),
+        worker.handle(event("invalid-namespace")),
+    )
+    .await
+    .expect("cleanup must not exceed the invocation deadline");
+    assert!(matches!(
+        result,
+        Err(LambdaWorkerError::ShutdownTimedOut(_) | LambdaWorkerError::WorkerRun(_))
+    ));
+    assert!(hook_called.load(Ordering::Relaxed));
+    assert!(matches!(
+        worker.handle(event("after-failure")).await,
+        Err(LambdaWorkerError::InterruptedInvocation)
+    ));
+}
+
+#[tokio::test]
+async fn lambda_warm_invocations_finalize_flush_propagate_and_replay() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let endpoint = Url::parse(&format!("http://{}", listener.local_addr().unwrap())).unwrap();
     let collector = Collector::default();
@@ -182,6 +246,10 @@ async fn lambda_warm_invocations_flush_propagate_and_replay() {
         .build();
     let hooks = Arc::new(AtomicUsize::new(0));
     let hook_calls = hooks.clone();
+    let invocation_registry = Arc::new(Mutex::new(None::<Arc<ClientWorkerSet>>));
+    let hook_registry = invocation_registry.clone();
+    let shutdown_key = Arc::new(Mutex::new(None::<Uuid>));
+    let hook_key = shutdown_key.clone();
     let mut telemetry = OpenTelemetryOptions::default();
     telemetry.endpoint = Some(endpoint);
     telemetry.metric_export_interval = Duration::from_secs(3600);
@@ -193,7 +261,11 @@ async fn lambda_warm_invocations_flush_propagate_and_replay() {
         WorkerOptions::new(queue.clone())
             .register_workflow::<LambdaWorkflow>()
             .unwrap()
-            .register_activities(LambdaActivities::default())
+            .register_activities(LambdaActivities {
+                invocation_registry,
+                ..Default::default()
+            })
+            .worker_interceptor(ShutdownObserver(shutdown_key))
             .build(),
     )
     .client_options(
@@ -203,6 +275,15 @@ async fn lambda_warm_invocations_flush_propagate_and_replay() {
     .lambda_defaults(defaults)
     .open_telemetry(telemetry)
     .shutdown_hook(move |_| {
+        if let Some(registry) = hook_registry.lock().unwrap().take() {
+            let key = hook_key.lock().unwrap().unwrap();
+            // Retain the invocation's registry so dropping the client cannot mask a missing
+            // finalizer. This fails if the worker still exists in all_workers, even after drain.
+            assert!(
+                registry.unregister_slot_provider(key).is_err(),
+                "worker registration remains when shutdown hooks start",
+            );
+        }
         hook_calls.fetch_add(1, Ordering::Relaxed);
         async { Ok(()) }
     })
@@ -332,6 +413,7 @@ async fn lambda_drains_cancelled_activities_before_hooks() {
             .unwrap()
             .register_activities(LambdaActivities {
                 cancellation_complete: cancellation_complete.clone(),
+                ..Default::default()
             })
             .build(),
     )

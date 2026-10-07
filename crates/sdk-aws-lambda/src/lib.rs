@@ -382,6 +382,9 @@ impl LambdaWorker {
 
     /// Handle one Lambda invocation.
     ///
+    /// Typically, use [`Self::run`] to let the AWS Lambda runtime drive invocations and exit the
+    /// runtime loop if this handler can no longer be reused safely.
+    ///
     /// The event payload is ignored; the invocation exists to give the Worker a bounded polling
     /// window and an invocation-specific identity. Calls must be sequential. Cancelling this
     /// future or exceeding the Worker drain budget makes this handler unusable for later calls,
@@ -390,7 +393,9 @@ impl LambdaWorker {
     pub async fn handle<T>(&self, event: LambdaEvent<T>) -> Result<(), LambdaWorkerError> {
         let now = Instant::now();
         let deadline = event.context.deadline();
-        let initial_remaining = remaining_until(deadline);
+        let initial_remaining = deadline
+            .duration_since(SystemTime::now())
+            .unwrap_or(Duration::ZERO);
         let work_time = initial_remaining
             .checked_sub(self.inner.shutdown_buffer)
             .ok_or(LambdaWorkerError::InsufficientTime {
@@ -488,15 +493,35 @@ impl LambdaWorker {
             client,
             self.inner.worker_options.clone(),
         )?;
-        let initiate_shutdown = worker.shutdown_handle();
-        let worker_result = run_until_shutdown(
-            worker.run(),
-            sleep_until(shutdown_at),
-            initiate_shutdown,
-            drain_deadline,
-            self.inner.drain_budget,
-        )
-        .await?;
+        let mut shutdown = ShutdownGuard(Some(worker.shutdown_handle()));
+        let worker_result = {
+            let run = worker.run();
+            tokio::pin!(run);
+            tokio::select! {
+                result = &mut run => result,
+                () = sleep_until(shutdown_at) => {
+                    shutdown.0.take().expect("shutdown has not been initiated")();
+                    timeout_at(drain_deadline, &mut run)
+                        .await
+                        .map_err(|_| LambdaWorkerError::ShutdownTimedOut(self.inner.drain_budget))?
+                }
+            }
+        };
+        if let Some(initiate_shutdown) = shutdown.0.take() {
+            initiate_shutdown();
+        }
+        if let Err(error) = &worker_result {
+            tracing::error!(
+                ?error,
+                "Temporal Worker failed; attempting shutdown finalization"
+            );
+        }
+        // Core retains the heartbeat registration after polling stops; finalize before hooks or
+        // a warm invocation, without letting cleanup consume the hooks' reserved time.
+        timeout_at(drain_deadline, worker.finalize_shutdown())
+            .await
+            .map_err(|_| LambdaWorkerError::ShutdownTimedOut(self.inner.drain_budget))?
+            .map_err(LambdaWorkerError::WorkerRun)?;
         worker_result.map_err(LambdaWorkerError::WorkerRun)
     }
 
@@ -644,53 +669,15 @@ fn invocation_identity(context: &lambda_runtime::Context) -> String {
     format!("{request_id}@{function_arn}")
 }
 
-fn remaining_until(deadline: SystemTime) -> Duration {
-    deadline
-        .duration_since(SystemTime::now())
-        .unwrap_or(Duration::ZERO)
-}
-
-async fn run_until_shutdown<R, D, S, E>(
-    run: R,
-    shutdown_delay: D,
-    initiate_shutdown: S,
-    shutdown_deadline: Instant,
-    graceful_shutdown_period: Duration,
-) -> Result<Result<(), E>, LambdaWorkerError>
-where
-    R: Future<Output = Result<(), E>>,
-    D: Future<Output = ()>,
-    S: FnOnce(),
-{
-    let mut shutdown = ShutdownGuard(Some(initiate_shutdown));
-    tokio::pin!(run);
-    tokio::pin!(shutdown_delay);
-    tokio::select! {
-        result = &mut run => Ok(result),
-        () = &mut shutdown_delay => {
-            shutdown.0.take().expect("shutdown has not been initiated")();
-            tokio::select! {
-                result = &mut run => Ok(result),
-                () = sleep_until(shutdown_deadline) => {
-                    Err(LambdaWorkerError::ShutdownTimedOut(graceful_shutdown_period))
-                }
-            }
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::{
         ffi::OsString,
-        sync::{
-            Mutex,
-            atomic::{AtomicBool, Ordering},
-        },
+        sync::{Mutex, atomic::AtomicBool},
     };
     use temporalio_sdk::runtime::worker_tuner::SlotSupplier;
-    use tokio::sync::{Notify, oneshot};
+    use tokio::sync::Notify;
 
     fn version() -> WorkerDeploymentVersion {
         WorkerDeploymentVersion::builder()
@@ -873,104 +860,6 @@ mod tests {
 
         let context = lambda_runtime::Context::default();
         assert_eq!(invocation_identity(&context), "unknown@unknown");
-    }
-
-    #[tokio::test]
-    async fn lifecycle_initiates_shutdown_and_waits_for_run() {
-        let (trigger_tx, trigger_rx) = oneshot::channel();
-        let stopped = Arc::new(Notify::new());
-        let stopped_for_run = stopped.clone();
-        let shutdown_called = Arc::new(AtomicBool::new(false));
-        let shutdown_called_for_closure = shutdown_called.clone();
-
-        let run = async move {
-            stopped_for_run.notified().await;
-            Result::<(), ()>::Ok(())
-        };
-        let result = run_until_shutdown(
-            run,
-            async move {
-                trigger_rx.await.unwrap();
-            },
-            move || {
-                shutdown_called_for_closure.store(true, Ordering::SeqCst);
-                stopped.notify_one();
-            },
-            Instant::now() + Duration::from_secs(5),
-            Duration::from_secs(5),
-        );
-        trigger_tx.send(()).unwrap();
-
-        assert_eq!(result.await.unwrap(), Ok(()));
-        assert!(shutdown_called.load(Ordering::SeqCst));
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn lifecycle_times_out_when_run_does_not_stop() {
-        let (trigger_tx, trigger_rx) = oneshot::channel();
-        let shutdown_called = Arc::new(AtomicBool::new(false));
-        let shutdown_called_for_closure = shutdown_called.clone();
-        let never = Arc::new(Notify::new());
-        let run = async move {
-            never.notified().await;
-            Result::<(), ()>::Ok(())
-        };
-
-        let result = run_until_shutdown(
-            run,
-            async move {
-                trigger_rx.await.unwrap();
-            },
-            move || shutdown_called_for_closure.store(true, Ordering::SeqCst),
-            Instant::now() + Duration::from_secs(5),
-            Duration::from_secs(5),
-        );
-        trigger_tx.send(()).unwrap();
-
-        assert!(matches!(
-            result.await,
-            Err(LambdaWorkerError::ShutdownTimedOut(duration))
-                if duration == Duration::from_secs(5)
-        ));
-        assert!(shutdown_called.load(Ordering::SeqCst));
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn late_shutdown_does_not_extend_the_drain_deadline() {
-        let start = Instant::now();
-        let result = run_until_shutdown(
-            std::future::pending::<Result<(), ()>>(),
-            async { tokio::time::advance(Duration::from_secs(3)).await },
-            || {},
-            start + Duration::from_secs(5),
-            Duration::from_secs(5),
-        )
-        .await;
-        assert!(matches!(
-            result,
-            Err(LambdaWorkerError::ShutdownTimedOut(_))
-        ));
-        assert_eq!(Instant::now() - start, Duration::from_secs(5));
-    }
-
-    #[tokio::test]
-    async fn cancelling_run_initiates_shutdown() {
-        let shutdown_called = Arc::new(AtomicBool::new(false));
-        let called = shutdown_called.clone();
-        let mut run = Box::pin(run_until_shutdown(
-            std::future::pending::<Result<(), ()>>(),
-            std::future::pending(),
-            move || called.store(true, Ordering::SeqCst),
-            Instant::now() + Duration::from_secs(5),
-            Duration::from_secs(5),
-        ));
-        tokio::select! {
-            biased;
-            _ = &mut run => panic!("the worker must still be running"),
-            () = std::future::ready(()) => {}
-        }
-        drop(run);
-        assert!(shutdown_called.load(Ordering::SeqCst));
     }
 
     #[tokio::test]
