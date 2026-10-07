@@ -177,7 +177,7 @@ pub fn build_otlp_metric_exporter(
     Ok::<_, anyhow::Error>(CoreOtelMeter {
         meter: mp.meter(TELEM_SERVICE_NAME),
         use_seconds_for_durations: opts.use_seconds_for_durations,
-        _mp: mp,
+        meter_provider: mp,
     })
 }
 
@@ -232,7 +232,7 @@ pub struct CoreOtelMeter {
     use_seconds_for_durations: bool,
     // we have to hold on to the provider otherwise otel automatically shuts it down on drop
     // for whatever crazy reason
-    _mp: SdkMeterProvider,
+    meter_provider: SdkMeterProvider,
 }
 
 impl CoreMeter for CoreOtelMeter {
@@ -321,7 +321,7 @@ impl CoreOtelMeter {
     /// This may block while the collector responds. Async callers should run it on a blocking
     /// thread; cancelling that caller does not cancel the underlying export.
     pub fn force_flush(&self) -> Result<(), anyhow::Error> {
-        self._mp.force_flush()?;
+        self.meter_provider.force_flush()?;
         Ok(())
     }
 
