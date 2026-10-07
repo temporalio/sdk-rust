@@ -10,7 +10,7 @@ use temporalio_common::worker::WorkerDeploymentVersion;
 use temporalio_sdk::WorkerOptions;
 use temporalio_sdk_aws_lambda::LambdaWorker;
 
-# async fn example() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+# async fn example() -> Result<(), Box<dyn std::error::Error>> {
 let version = WorkerDeploymentVersion::builder()
     .deployment_name("payments")
     .build_id("2026-08-28")
@@ -49,9 +49,12 @@ per invocation to leave at least one second for polling and connection setup.
 Worker drain and finalization complete before telemetry flush and application hooks. Hook errors
 are logged; a hook that exceeds the shared hook budget is cancelled. A Worker that fails or cannot
 drain and finalize makes the handler unusable for warm invocations, and `run` exits the runtime loop
-so the process can terminate. If calling `handle` directly, recycle the process after
-`ShutdownTimedOut`, `WorkerRun`, or cancelling the handler future. Calls to the same handler must be
-sequential.
+so the process can terminate. If calling `handle` directly, recycle the process when
+`LambdaInvocationError::requires_restart()` is true, or after cancelling the handler future.
+Calls to the same handler must be sequential.
+
+`build` returns an opaque `LambdaWorkerBuildError`; `handle` returns an opaque
+`LambdaInvocationError`. Both preserve the underlying cause through `std::error::Error::source`.
 
 ## OpenTelemetry
 
@@ -64,7 +67,7 @@ use temporalio_sdk_aws_lambda::otel::OpenTelemetryOptions;
 # fn configure(
 #     version: temporalio_common::worker::WorkerDeploymentVersion,
 #     worker_options: temporalio_sdk::WorkerOptions,
-# ) -> Result<(), temporalio_sdk_aws_lambda::LambdaWorkerError> {
+# ) -> Result<(), temporalio_sdk_aws_lambda::LambdaWorkerBuildError> {
 let worker = temporalio_sdk_aws_lambda::LambdaWorker::builder(version, worker_options)
     .open_telemetry(OpenTelemetryOptions::default())
     .build()?;
