@@ -102,49 +102,7 @@ to flush their application-owned telemetry providers.
 
 ## Deployable example and local testing
 
-`examples/lambda_worker.rs` registers `GreetingWorkflow` and a greeting Activity. Build its container
-from the repository root (Docker BuildKit is required):
-
-```sh
-docker build -t temporal-rust-lambda -f crates/sdk-aws-lambda/examples/Dockerfile .
-```
-
-For AWS, supply `TEMPORAL_ADDRESS`, `TEMPORAL_NAMESPACE`, `TEMPORAL_TASK_QUEUE`,
-`TEMPORAL_DEPLOYMENT_NAME`, and `TEMPORAL_BUILD_ID`, plus authentication/TLS settings as needed.
-Configure a Lambda timeout of at least 15 seconds, deploy a matching-architecture image, and
-attach/configure the ADOT Collector extension. Mark the Worker Deployment Version current before
-starting new Workflows, or use a pinned versioning override on the starting client.
-
-For local testing, start `temporal server start-dev --ip 0.0.0.0` and an OTLP collector. The example
-collector configuration (`examples/otel-collector.yaml`) exports to its debug log. Download the
-matching Linux binary from the official
-[Runtime Interface Emulator releases](https://github.com/aws/aws-lambda-runtime-interface-emulator/releases)
-and make it executable. With Docker Desktop, mount it and run:
-
-```sh
-docker run --rm -p 9000:8080 \
-  -v /absolute/path/aws-lambda-rie:/usr/local/bin/aws-lambda-rie:ro \
-  -e AWS_LAMBDA_FUNCTION_TIMEOUT=15 \
-  -e TEMPORAL_ADDRESS=host.docker.internal:7233 \
-  -e TEMPORAL_NAMESPACE=default -e TEMPORAL_TASK_QUEUE=lambda-greetings \
-  -e TEMPORAL_DEPLOYMENT_NAME=lambda-greetings -e TEMPORAL_BUILD_ID=local \
-  -e OTEL_EXPORTER_OTLP_ENDPOINT=http://host.docker.internal:4317 \
-  --entrypoint /usr/local/bin/aws-lambda-rie temporal-rust-lambda /var/runtime/bootstrap
-```
-
-Invoke it once to register the version, then set that version current and start a Workflow:
-
-```sh
-curl --fail -X POST http://localhost:9000/2015-03-31/functions/function/invocations -d '{}'
-temporal worker deployment set-current-version --deployment-name lambda-greetings --build-id local --yes
-temporal workflow start --type GreetingWorkflow --task-queue lambda-greetings --input '"Temporal"'
-curl --fail -X POST http://localhost:9000/2015-03-31/functions/function/invocations -d '{}'
-```
-
-The second invocation should complete the Workflow with `"Hello, Temporal!"`; the collector should
-receive connected Workflow/Activity spans and Temporal metrics. Repeating the last two commands
-tests warm reuse. RIE tests the runtime protocol locally, not AWS freezing or the ADOT extension's
-deployment and permissions.
-
-If Docker Desktop resolves `host.docker.internal` to an unreachable IPv6 address, substitute the
-host's IPv4 address for the local Temporal and collector endpoints.
+The [AWS Lambda example](../sdk/examples/aws_lambda/) lives with the other Rust SDK examples. It
+contains a Lambda Worker, a separate Workflow starter, and an AWS deployment walkthrough covering
+Temporal-triggered invocation, the ADOT collector layer, CloudWatch metrics, and X-Ray traces.
+It also includes a local Runtime Interface Emulator path for development without AWS.

@@ -1,3 +1,4 @@
+# Local testing must not need AWS credentials or send sample telemetry to AWS.
 receivers:
   otlp:
     protocols:
