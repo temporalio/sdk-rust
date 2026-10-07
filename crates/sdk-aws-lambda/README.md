@@ -43,8 +43,8 @@ The default shutdown reserve is 8.1 seconds: five for graceful Activity completi
 Activity cancellation and Worker finalization, two for telemetry and application hooks, and
 100 milliseconds for returning the runtime response.
 Polling ends when that reserve begins. Worker drain cannot consume the hook reserve. Configure
-`LambdaWorkerDefaults` to adjust these budgets, and allow more than 9.1 seconds per invocation
-to leave at least one second for polling and connection setup.
+`LambdaWorkerOptions` through `lambda_options` to adjust these budgets. Allow more than 9.1 seconds
+per invocation to leave at least one second for polling and connection setup.
 
 Worker drain and finalization complete before telemetry flush and application hooks. Hook errors
 are logged; a hook that exceeds the shared hook budget is cancelled. A Worker that fails or cannot

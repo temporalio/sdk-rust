@@ -57,9 +57,10 @@ type ShutdownHook = Arc<dyn Fn(Duration) -> HookFuture + Send + Sync>;
 ///
 /// These settings are distinct from [`WorkerOptions`] so callers can explicitly choose Lambda
 /// defaults or replace them without the integration guessing whether an SDK default was intentional.
+/// Pass customized limits and shutdown timings to [`LambdaWorkerBuilder::lambda_options`].
 #[derive(Clone, Debug)]
 #[non_exhaustive]
-pub struct LambdaWorkerDefaults {
+pub struct LambdaWorkerOptions {
     /// Maximum concurrent Workflow Tasks.
     pub workflow_slots: usize,
     /// Maximum concurrent Activities.
@@ -80,7 +81,7 @@ pub struct LambdaWorkerDefaults {
     pub shutdown_hook_buffer: Duration,
 }
 
-impl Default for LambdaWorkerDefaults {
+impl Default for LambdaWorkerOptions {
     fn default() -> Self {
         Self {
             workflow_slots: 10,
@@ -159,7 +160,7 @@ pub struct LambdaWorkerBuilder {
     connection_options: Option<ConnectionOptions>,
     client_options: Option<ClientOptions>,
     runtime: Option<Arc<Runtime>>,
-    defaults: LambdaWorkerDefaults,
+    lambda_options: LambdaWorkerOptions,
     custom_tuner: Option<WorkerTuner>,
     default_versioning_behavior: VersioningBehavior,
     shutdown_hooks: Vec<ShutdownHook>,
@@ -197,9 +198,9 @@ impl LambdaWorkerBuilder {
         self
     }
 
-    /// Replace the Lambda-oriented limits and shutdown timings.
-    pub fn lambda_defaults(mut self, defaults: LambdaWorkerDefaults) -> Self {
-        self.defaults = defaults;
+    /// Set the Lambda-oriented limits and shutdown timings.
+    pub fn lambda_options(mut self, options: LambdaWorkerOptions) -> Self {
+        self.lambda_options = options;
         self
     }
 
@@ -221,7 +222,7 @@ impl LambdaWorkerBuilder {
     ///
     /// Hooks run in registration order. Each receives the shared hook budget remaining when it starts.
     /// Hook failures are logged and do not prevent later hooks from running. The automatic
-    /// telemetry flush runs first. All hooks share [`LambdaWorkerDefaults::shutdown_hook_buffer`].
+    /// telemetry flush runs first. All hooks share [`LambdaWorkerOptions::shutdown_hook_buffer`].
     pub fn shutdown_hook<F, Fut>(mut self, hook: F) -> Self
     where
         F: Fn(Duration) -> Fut + Send + Sync + 'static,
@@ -239,7 +240,7 @@ impl LambdaWorkerBuilder {
     /// was used.
     pub fn build(mut self) -> Result<LambdaWorker, LambdaWorkerError> {
         validate_version(&self.version)?;
-        validate_defaults(&self.defaults)?;
+        validate_lambda_options(&self.lambda_options)?;
         if self.default_versioning_behavior == VersioningBehavior::Unspecified {
             return Err(LambdaWorkerError::InvalidConfiguration(
                 "default versioning behavior cannot be Unspecified".to_owned(),
@@ -253,7 +254,7 @@ impl LambdaWorkerBuilder {
         apply_worker_configuration(
             &mut self.worker_options,
             &self.version,
-            &self.defaults,
+            &self.lambda_options,
             self.custom_tuner,
             self.default_versioning_behavior,
         );
@@ -289,11 +290,11 @@ impl LambdaWorkerBuilder {
             ),
         };
         let drain_budget = self
-            .defaults
+            .lambda_options
             .graceful_shutdown_period
-            .saturating_add(self.defaults.worker_shutdown_buffer);
+            .saturating_add(self.lambda_options.worker_shutdown_buffer);
         let shutdown_buffer = drain_budget
-            .saturating_add(self.defaults.shutdown_hook_buffer)
+            .saturating_add(self.lambda_options.shutdown_hook_buffer)
             .saturating_add(RESPONSE_BUFFER);
 
         Ok(LambdaWorker {
@@ -304,7 +305,7 @@ impl LambdaWorkerBuilder {
                 runtime,
                 shutdown_buffer,
                 drain_budget,
-                hook_budget: self.defaults.shutdown_hook_buffer,
+                hook_budget: self.lambda_options.shutdown_hook_buffer,
                 shutdown_hooks: self.shutdown_hooks,
                 invocation_gate: Semaphore::new(1),
                 healthy: AtomicBool::new(true),
@@ -371,7 +372,7 @@ impl LambdaWorker {
             connection_options: None,
             client_options: None,
             runtime: None,
-            defaults: LambdaWorkerDefaults::default(),
+            lambda_options: LambdaWorkerOptions::default(),
             custom_tuner: None,
             default_versioning_behavior: VersioningBehavior::Pinned,
             shutdown_hooks: Vec::new(),
@@ -551,16 +552,16 @@ impl LambdaWorker {
 fn apply_worker_configuration(
     options: &mut WorkerOptions,
     version: &WorkerDeploymentVersion,
-    defaults: &LambdaWorkerDefaults,
+    lambda_options: &LambdaWorkerOptions,
     custom_tuner: Option<WorkerTuner>,
     default_versioning_behavior: VersioningBehavior,
 ) {
     options.tuner = custom_tuner.unwrap_or_else(|| {
         TunerHolder::builder()
-            .workflow_task_slot_supplier(FixedSizeSlotSupplier::new(defaults.workflow_slots))
-            .activity_task_slot_supplier(FixedSizeSlotSupplier::new(defaults.activity_slots))
+            .workflow_task_slot_supplier(FixedSizeSlotSupplier::new(lambda_options.workflow_slots))
+            .activity_task_slot_supplier(FixedSizeSlotSupplier::new(lambda_options.activity_slots))
             .local_activity_task_slot_supplier(FixedSizeSlotSupplier::new(
-                defaults.local_activity_slots,
+                lambda_options.local_activity_slots,
             ))
             // The tuner requires every supplier even though Rust workers do not poll Nexus tasks.
             .nexus_task_slot_supplier(FixedSizeSlotSupplier::new(1))
@@ -568,13 +569,13 @@ fn apply_worker_configuration(
             .into()
     });
     options.workflow_task_poller_behavior = Some(PollerBehavior::SimpleMaximum(
-        defaults.workflow_task_pollers,
+        lambda_options.workflow_task_pollers,
     ));
     options.activity_task_poller_behavior = Some(PollerBehavior::SimpleMaximum(
-        defaults.activity_task_pollers,
+        lambda_options.activity_task_pollers,
     ));
-    options.max_cached_workflows = defaults.max_cached_workflows;
-    options.graceful_shutdown_period = Some(defaults.graceful_shutdown_period);
+    options.max_cached_workflows = lambda_options.max_cached_workflows;
+    options.graceful_shutdown_period = Some(lambda_options.graceful_shutdown_period);
     options.max_eager_activity_reservations_per_workflow_task = 0;
     options.deployment_options = WorkerDeploymentOptions::new(version.clone())
         .use_worker_versioning(true)
@@ -590,26 +591,26 @@ fn validate_version(version: &WorkerDeploymentVersion) -> Result<(), LambdaWorke
     }
 }
 
-fn validate_defaults(defaults: &LambdaWorkerDefaults) -> Result<(), LambdaWorkerError> {
-    if defaults.workflow_slots == 0
-        || defaults.activity_slots == 0
-        || defaults.local_activity_slots == 0
+fn validate_lambda_options(options: &LambdaWorkerOptions) -> Result<(), LambdaWorkerError> {
+    if options.workflow_slots == 0
+        || options.activity_slots == 0
+        || options.local_activity_slots == 0
     {
         return Err(LambdaWorkerError::InvalidConfiguration(
             "all fixed-size tuner slot counts must be greater than zero".to_owned(),
         ));
     }
-    if defaults.workflow_task_pollers < 2 {
+    if options.workflow_task_pollers < 2 {
         return Err(LambdaWorkerError::InvalidConfiguration(
             "workflow_task_pollers must be at least 2 when sticky caching is enabled".to_owned(),
         ));
     }
-    if defaults.activity_task_pollers == 0 {
+    if options.activity_task_pollers == 0 {
         return Err(LambdaWorkerError::InvalidConfiguration(
             "activity_task_pollers must be greater than zero".to_owned(),
         ));
     }
-    if defaults.worker_shutdown_buffer.is_zero() || defaults.shutdown_hook_buffer.is_zero() {
+    if options.worker_shutdown_buffer.is_zero() || options.shutdown_hook_buffer.is_zero() {
         return Err(LambdaWorkerError::InvalidConfiguration(
             "worker_shutdown_buffer and shutdown_hook_buffer must be greater than zero".to_owned(),
         ));
@@ -689,11 +690,11 @@ mod tests {
     #[test]
     fn applies_lambda_worker_configuration() {
         let mut options = WorkerOptions::new("queue").build();
-        let defaults = LambdaWorkerDefaults::default();
+        let lambda_options = LambdaWorkerOptions::default();
         apply_worker_configuration(
             &mut options,
             &version(),
-            &defaults,
+            &lambda_options,
             None,
             VersioningBehavior::Pinned,
         );
@@ -733,7 +734,7 @@ mod tests {
         apply_worker_configuration(
             &mut options,
             &version(),
-            &LambdaWorkerDefaults::default(),
+            &LambdaWorkerOptions::default(),
             Some(custom.clone()),
             VersioningBehavior::AutoUpgrade,
         );
@@ -790,12 +791,12 @@ mod tests {
             Err(LambdaWorkerError::InvalidDeploymentVersion)
         ));
 
-        let defaults = LambdaWorkerDefaults {
+        let lambda_options = LambdaWorkerOptions {
             workflow_task_pollers: 1,
             ..Default::default()
         };
         assert!(matches!(
-            validate_defaults(&defaults),
+            validate_lambda_options(&lambda_options),
             Err(LambdaWorkerError::InvalidConfiguration(_))
         ));
     }
