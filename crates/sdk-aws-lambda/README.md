@@ -46,11 +46,12 @@ Polling ends when that reserve begins. Worker drain cannot consume the hook rese
 `LambdaWorkerDefaults` to adjust these budgets, and allow more than 9.1 seconds per invocation
 to leave at least one second for polling and connection setup.
 
-Telemetry flush runs before application hooks. Hook errors are logged; a hook that exceeds the
-shared hook budget is cancelled. A Worker that fails or cannot drain makes the handler unusable
-for warm invocations, and `run` exits the runtime loop so the process can terminate. If calling
-`handle` directly, recycle the process after `ShutdownTimedOut`, `WorkerRun`, or cancelling the
-handler future. Calls to the same handler must be sequential.
+Worker drain and finalization complete before telemetry flush and application hooks. Hook errors
+are logged; a hook that exceeds the shared hook budget is cancelled. A Worker that fails or cannot
+drain and finalize makes the handler unusable for warm invocations, and `run` exits the runtime loop
+so the process can terminate. If calling `handle` directly, recycle the process after
+`ShutdownTimedOut`, `WorkerRun`, or cancelling the handler future. Calls to the same handler must be
+sequential.
 
 ## OpenTelemetry
 

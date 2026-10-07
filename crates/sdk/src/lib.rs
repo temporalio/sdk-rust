@@ -1101,6 +1101,28 @@ impl Worker {
         result
     }
 
+    /// Complete shutdown and release this Worker's resources and heartbeat registration.
+    ///
+    /// Call this after [`Self::run`] returns. Drop all [`Self::shutdown_handle`] handles first,
+    /// since finalization requires sole ownership of the underlying Core Worker. If running the
+    /// Worker failed, finalization may wait for outstanding work; callers with a shutdown deadline
+    /// should bound this future and exit the process if cleanup cannot complete.
+    pub async fn finalize_shutdown(self) -> Result<(), WorkerRunError> {
+        let core = self.common.worker.clone();
+        drop(self);
+        core.shutdown().await;
+        let core = Arc::try_unwrap(core).map_err(|core| WorkerRunError::Fatal {
+            message: "worker shutdown could not be finalized".to_owned(),
+            source: anyhow!(
+                "expected sole ownership of the Core Worker, but {} references remain; drop all shutdown handles before finalizing",
+                Arc::strong_count(&core),
+            )
+            .into_boxed_dyn_error(),
+        })?;
+        core.finalize_shutdown().await;
+        Ok(())
+    }
+
     pub(crate) async fn run_inner(&mut self) -> Result<(), WorkerRunError> {
         // Perform the namespace check-in so poller behavior (e.g. autoscaling auto-enroll) is
         // resolved before any polling begins.
