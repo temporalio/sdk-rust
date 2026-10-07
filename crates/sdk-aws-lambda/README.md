@@ -37,13 +37,7 @@ workflow cache size of 30, and a five-second graceful shutdown period. Eager Act
 always disabled, and Worker Deployment Versioning is always enabled. Call `worker_tuner` to
 explicitly replace the fixed-size Lambda tuner with a custom tuner.
 
-Nexus service hosting is outside this integration's scope.
-
 ## Invocation lifecycle
-
-The adapter is a Lambda runtime handler, not an SDK plugin: it owns the invocation deadline and
-creates and drains a Worker. Its optional tracing configuration uses the SDK's general
-`OpenTelemetryPlugin` rather than a Lambda-specific interceptor implementation.
 
 The default shutdown reserve is 8.1 seconds: five for graceful Activity completion, one for
 Activity cancellation and Worker finalization, two for telemetry and application hooks, and
@@ -60,13 +54,8 @@ handler future. Calls to the same handler must be sequential.
 
 ## OpenTelemetry
 
-Enable the `otel` feature to configure Temporal metrics and tracing for the AWS Distro for
-OpenTelemetry Collector Lambda layer:
-
-```toml
-[dependencies]
-temporalio-sdk-aws-lambda = { version = "0.1", features = ["otel"] }
-```
+Enable the `otel` feature and call `open_telemetry` to configure Temporal metrics and tracing for
+the AWS Distro for OpenTelemetry (ADOT) Collector Lambda layer:
 
 ```rust,no_run
 use temporalio_sdk_aws_lambda::otel::OpenTelemetryOptions;
@@ -111,7 +100,7 @@ replace a global application subscriber.
 the builder's `runtime` method. Applications that provide their own runtime can use `shutdown_hook`
 to flush their application-owned telemetry providers.
 
-## Deployable example and local smoke test
+## Deployable example and local testing
 
 `examples/lambda_worker.rs` registers `GreetingWorkflow` and a greeting Activity. Build its container
 from the repository root (Docker BuildKit is required):
