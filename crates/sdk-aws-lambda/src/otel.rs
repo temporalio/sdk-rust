@@ -13,7 +13,7 @@ use temporalio_common::telemetry::{
     OtelCollectorOptions, TelemetryOptions, build_otlp_metric_exporter, metrics::CoreMeter,
 };
 use temporalio_sdk::{
-    Runtime, SimplePlugin, WorkerOptions, WorkerPlugin,
+    Runtime, WorkerOptions, WorkerPlugin,
     opentelemetry::{
         INSTRUMENTATION_SCOPE, OpenTelemetryPlugin, WorkflowIdGenerator, WorkflowSpanProcessor,
     },
@@ -63,96 +63,75 @@ impl Default for OpenTelemetryOptions {
     }
 }
 
-pub(crate) struct OpenTelemetryIntegration {
-    runtime: Arc<Runtime>,
-    flush_hook: ShutdownHook,
-    plugin: SimplePlugin,
-}
-
-impl OpenTelemetryIntegration {
-    pub(crate) fn new(options: OpenTelemetryOptions) -> Result<Self, anyhow::Error> {
-        if options.metric_export_interval.is_zero() {
-            anyhow::bail!("OpenTelemetry metric export interval must be greater than zero");
-        }
-        if options.export_timeout.is_zero() {
-            anyhow::bail!("OpenTelemetry export timeout must be greater than zero");
-        }
-        let endpoint = match options.endpoint {
-            Some(endpoint) => endpoint,
-            None => resolve_endpoint(|name| env::var(name).ok())?,
-        };
-        let service_name = options
-            .service_name
-            .filter(|name| !name.trim().is_empty())
-            .unwrap_or_else(|| resolve_service_name(|name| env::var(name).ok()));
-        let meter = Arc::new(build_otlp_metric_exporter(
-            OtelCollectorOptions::builder()
-                .url(endpoint.clone())
-                .metric_periodicity(options.metric_export_interval)
-                .export_timeout(options.export_timeout)
-                .global_tags(HashMap::from([(
-                    "service.name".to_owned(),
-                    service_name.clone(),
-                )]))
-                .build(),
-        )?);
-        let span_exporter = opentelemetry_otlp::SpanExporter::builder()
-            .with_tonic()
-            .with_endpoint(endpoint.to_string())
-            .with_timeout(options.export_timeout)
-            .build()?;
-        let tracer_provider = SdkTracerProvider::builder()
-            .with_span_processor(WorkflowSpanProcessor::new(
-                BatchSpanProcessor::builder(span_exporter).build(),
-            ))
-            .with_id_generator(WorkflowIdGenerator::default())
-            .with_resource(Resource::builder().with_service_name(service_name).build())
-            .build();
-        let plugin = OpenTelemetryPlugin::builder()
-            .tracer(tracer_provider.tracer(INSTRUMENTATION_SCOPE))
-            .build();
-        let telemetry_options = TelemetryOptions::builder()
-            .metrics(meter.clone() as Arc<dyn CoreMeter>)
-            .build();
-        let runtime_options = RuntimeOptions::builder()
-            .telemetry_options(telemetry_options)
-            .build()
-            .map_err(anyhow::Error::msg)?;
-        let runtime = Arc::new(Runtime::from_current_tokio(runtime_options)?);
-        let flushers = BlockingFlushers {
-            metrics: Arc::new(move || meter.force_flush()),
-            traces: Arc::new(move || tracer_provider.force_flush().map_err(anyhow::Error::from)),
-            gate: Arc::new(Semaphore::new(1)),
-        };
-        let flush_hook: ShutdownHook = Arc::new(move |_| {
-            let flushers = flushers.clone();
-            Box::pin(async move { flushers.flush().await })
-        });
-
-        Ok(Self {
-            runtime,
-            flush_hook,
-            plugin,
-        })
+pub(crate) fn configure(
+    options: OpenTelemetryOptions,
+    client: &mut ClientOptions,
+    worker: &mut WorkerOptions,
+    shutdown_hooks: &mut Vec<ShutdownHook>,
+    runtime: &mut Option<Arc<Runtime>>,
+) -> Result<(), anyhow::Error> {
+    if options.metric_export_interval.is_zero() {
+        anyhow::bail!("OpenTelemetry metric export interval must be greater than zero");
     }
-
-    pub(crate) fn runtime(&self) -> Arc<Runtime> {
-        self.runtime.clone()
+    if options.export_timeout.is_zero() {
+        anyhow::bail!("OpenTelemetry export timeout must be greater than zero");
     }
-
-    pub(crate) fn flush_hook(&self) -> ShutdownHook {
-        self.flush_hook.clone()
-    }
-
-    pub(crate) fn configure(
-        &self,
-        client: &mut ClientOptions,
-        worker: &mut WorkerOptions,
-    ) -> Result<(), anyhow::Error> {
-        self.plugin.configure_client_options(client)?;
-        self.plugin.configure_worker_options(worker)?;
-        Ok(())
-    }
+    let endpoint = match options.endpoint {
+        Some(endpoint) => endpoint,
+        None => resolve_endpoint(|name| env::var(name).ok())?,
+    };
+    let service_name = options
+        .service_name
+        .filter(|name| !name.trim().is_empty())
+        .unwrap_or_else(|| resolve_service_name(|name| env::var(name).ok()));
+    let meter = Arc::new(build_otlp_metric_exporter(
+        OtelCollectorOptions::builder()
+            .url(endpoint.clone())
+            .metric_periodicity(options.metric_export_interval)
+            .export_timeout(options.export_timeout)
+            .global_tags(HashMap::from([(
+                "service.name".to_owned(),
+                service_name.clone(),
+            )]))
+            .build(),
+    )?);
+    let span_exporter = opentelemetry_otlp::SpanExporter::builder()
+        .with_tonic()
+        .with_endpoint(endpoint.to_string())
+        .with_timeout(options.export_timeout)
+        .build()?;
+    let tracer_provider = SdkTracerProvider::builder()
+        .with_span_processor(WorkflowSpanProcessor::new(
+            BatchSpanProcessor::builder(span_exporter).build(),
+        ))
+        .with_id_generator(WorkflowIdGenerator::default())
+        .with_resource(Resource::builder().with_service_name(service_name).build())
+        .build();
+    let plugin = OpenTelemetryPlugin::builder()
+        .tracer(tracer_provider.tracer(INSTRUMENTATION_SCOPE))
+        .build();
+    let telemetry_options = TelemetryOptions::builder()
+        .metrics(meter.clone() as Arc<dyn CoreMeter>)
+        .build();
+    let runtime_options = RuntimeOptions::builder()
+        .telemetry_options(telemetry_options)
+        .build()
+        .map_err(anyhow::Error::msg)?;
+    let telemetry_runtime = Arc::new(Runtime::from_current_tokio(runtime_options)?);
+    plugin.configure_client_options(client)?;
+    plugin.configure_worker_options(worker)?;
+    let flushers = BlockingFlushers {
+        metrics: Arc::new(move || meter.force_flush()),
+        traces: Arc::new(move || tracer_provider.force_flush().map_err(anyhow::Error::from)),
+        gate: Arc::new(Semaphore::new(1)),
+    };
+    let flush_hook: ShutdownHook = Arc::new(move |_| {
+        let flushers = flushers.clone();
+        Box::pin(async move { flushers.flush().await })
+    });
+    shutdown_hooks.insert(0, flush_hook);
+    *runtime = Some(telemetry_runtime);
+    Ok(())
 }
 
 #[derive(Clone)]

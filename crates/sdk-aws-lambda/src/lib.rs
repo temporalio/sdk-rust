@@ -185,11 +185,12 @@ impl LambdaWorkerBuilder {
         self
     }
 
-    /// Configure OTLP metrics and tracing using AWS Lambda-oriented defaults.
+    /// Configure OTLP metrics and tracing for a Lambda OpenTelemetry Collector extension.
     ///
     /// This creates the SDK runtime, so it cannot be combined with [`Self::runtime`]. Pending
     /// telemetry is force-flushed after every invocation without shutting down the providers,
-    /// allowing them to remain available for warm starts.
+    /// allowing them to remain available for warm starts. Defaults target a local OTLP gRPC
+    /// receiver; the collector's configuration controls export to CloudWatch and AWS X-Ray.
     #[cfg(feature = "otel")]
     pub fn open_telemetry(mut self, options: otel::OpenTelemetryOptions) -> Self {
         self.open_telemetry = Some(options);
@@ -265,28 +266,21 @@ impl LambdaWorkerBuilder {
                 _ => unreachable!("client_options sets both option types"),
             };
         #[cfg(feature = "otel")]
-        let runtime = match (self.runtime, self.open_telemetry) {
-            (Some(_), Some(_)) => {
+        if let Some(options) = self.open_telemetry {
+            if self.runtime.is_some() {
                 return Err(LambdaWorkerError::InvalidConfiguration(
                     "runtime and OpenTelemetry options cannot both be supplied".to_owned(),
                 ));
             }
-            (Some(runtime), None) => runtime,
-            (None, Some(options)) => {
-                let integration = otel::OpenTelemetryIntegration::new(options)
-                    .map_err(LambdaWorkerError::OpenTelemetry)?;
-                integration
-                    .configure(&mut client_options, &mut self.worker_options)
-                    .map_err(LambdaWorkerError::OpenTelemetry)?;
-                self.shutdown_hooks.insert(0, integration.flush_hook());
-                integration.runtime()
-            }
-            (None, None) => Arc::new(
-                Runtime::from_current_tokio(Default::default())
-                    .map_err(LambdaWorkerError::Runtime)?,
-            ),
-        };
-        #[cfg(not(feature = "otel"))]
+            otel::configure(
+                options,
+                &mut client_options,
+                &mut self.worker_options,
+                &mut self.shutdown_hooks,
+                &mut self.runtime,
+            )
+            .map_err(LambdaWorkerError::OpenTelemetry)?;
+        }
         let runtime = match self.runtime {
             Some(runtime) => runtime,
             None => Arc::new(
