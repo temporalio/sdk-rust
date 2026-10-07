@@ -34,7 +34,7 @@ use temporalio_sdk::{
     workflow_replayer::{WorkflowReplayer, WorkflowReplayerOptions},
 };
 use temporalio_sdk_aws_lambda::{
-    LambdaWorker, LambdaWorkerDefaults, LambdaWorkerError, otel::OpenTelemetryOptions,
+    LambdaWorker, LambdaWorkerError, LambdaWorkerOptions, otel::OpenTelemetryOptions,
 };
 use tokio::{net::TcpListener, sync::oneshot};
 use tokio_stream::wrappers::TcpListenerStream;
@@ -169,8 +169,8 @@ async fn lambda_validation_failure_cannot_block_cleanup_or_allow_reuse() {
         .build();
     let hook_called = Arc::new(AtomicBool::new(false));
     let observed = hook_called.clone();
-    let mut defaults = LambdaWorkerDefaults::default();
-    defaults.graceful_shutdown_period = Duration::from_millis(100);
+    let mut lambda_options = LambdaWorkerOptions::default();
+    lambda_options.graceful_shutdown_period = Duration::from_millis(100);
     let worker = LambdaWorker::builder(
         version,
         WorkerOptions::new(queue)
@@ -183,7 +183,7 @@ async fn lambda_validation_failure_cannot_block_cleanup_or_allow_reuse() {
         get_integ_server_options(),
         ClientOptions::new(format!("missing-{}", Uuid::new_v4())).build(),
     )
-    .lambda_defaults(defaults)
+    .lambda_options(lambda_options)
     .shutdown_hook(move |_| {
         observed.store(true, Ordering::Relaxed);
         async { Ok(()) }
@@ -254,8 +254,8 @@ async fn lambda_warm_invocations_finalize_flush_propagate_and_replay() {
     telemetry.endpoint = Some(endpoint);
     telemetry.metric_export_interval = Duration::from_secs(3600);
     telemetry.export_timeout = Duration::from_millis(200);
-    let mut defaults = LambdaWorkerDefaults::default();
-    defaults.graceful_shutdown_period = Duration::from_millis(100);
+    let mut lambda_options = LambdaWorkerOptions::default();
+    lambda_options.graceful_shutdown_period = Duration::from_millis(100);
     let worker = LambdaWorker::builder(
         version.clone(),
         WorkerOptions::new(queue.clone())
@@ -272,7 +272,7 @@ async fn lambda_warm_invocations_finalize_flush_propagate_and_replay() {
         get_integ_server_options(),
         ClientOptions::new(integ_namespace()).build(),
     )
-    .lambda_defaults(defaults)
+    .lambda_options(lambda_options)
     .open_telemetry(telemetry)
     .shutdown_hook(move |_| {
         if let Some(registry) = hook_registry.lock().unwrap().take() {
@@ -404,8 +404,8 @@ async fn lambda_drains_cancelled_activities_before_hooks() {
     let observed_in_hook = Arc::new(AtomicBool::new(false));
     let finished = cancellation_complete.clone();
     let observed = observed_in_hook.clone();
-    let mut defaults = LambdaWorkerDefaults::default();
-    defaults.graceful_shutdown_period = Duration::from_millis(100);
+    let mut lambda_options = LambdaWorkerOptions::default();
+    lambda_options.graceful_shutdown_period = Duration::from_millis(100);
     let worker = LambdaWorker::builder(
         version.clone(),
         WorkerOptions::new(queue.clone())
@@ -421,7 +421,7 @@ async fn lambda_drains_cancelled_activities_before_hooks() {
         get_integ_server_options(),
         ClientOptions::new(integ_namespace()).build(),
     )
-    .lambda_defaults(defaults)
+    .lambda_options(lambda_options)
     .shutdown_hook(move |_| {
         observed.store(finished.load(Ordering::Relaxed), Ordering::Relaxed);
         async { Ok(()) }
