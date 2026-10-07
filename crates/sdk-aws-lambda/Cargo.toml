@@ -61,8 +61,6 @@ features = ["envconfig"]
 
 [dev-dependencies]
 futures = "0.3"
-temporalio-macros = { path = "../macros", version = "~1.1.0" }
-temporalio-workflow = { path = "../workflow", version = "~1.1.0" }
 tempfile = "3"
 tokio = { version = "1.47", default-features = false, features = [
   "macros",
@@ -72,10 +70,6 @@ tokio = { version = "1.47", default-features = false, features = [
   "test-util",
   "time",
 ] }
-
-[[example]]
-name = "lambda_worker"
-required-features = ["otel"]
 
 [lints]
 workspace = true

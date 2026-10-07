@@ -29,6 +29,7 @@ See each example's README for details and expected output.
 
 ## Examples
 
+- [AWS Lambda](aws_lambda/) — Deploy a versioned Worker to Lambda with OpenTelemetry metrics and tracing
 - [Hello World](hello_world/) — Basic workflow that calls a single activity
 - [Activity Heartbeating](activity_heartbeating/) — Long-running activity with heartbeating and resume-on-retry
 - [Activity Inbound Interceptor](activity_interceptor/) — Wrapping inbound activity execution and inspecting typed inputs/outputs
