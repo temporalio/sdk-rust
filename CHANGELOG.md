@@ -33,6 +33,10 @@ relevant information.
 
 ## Unreleased
 
+### Added
+* `Worker::run_until` runs a worker until a supplied future completes, then initiates shutdown and
+  waits for shutdown to finish.
+
 ## [1.1.0] - 2026-10-06
 
 ### Added

@@ -45,7 +45,6 @@ async fn test_workflow_environment_local() {
         .build();
     let task_queue = worker_options.task_queue.clone();
     let mut worker = Worker::new(&runtime, env.client().clone(), worker_options).unwrap();
-    let shutdown = worker.shutdown_handle();
     let handle = env
         .client()
         .start_workflow(
@@ -56,11 +55,12 @@ async fn test_workflow_environment_local() {
         .await
         .unwrap();
 
-    let (worker_result, ()) = tokio::join!(worker.run(), async move {
-        handle.get_result(Default::default()).await.unwrap();
-        shutdown();
-    });
-    worker_result.unwrap();
+    worker
+        .run_until(async move {
+            handle.get_result(Default::default()).await.unwrap();
+        })
+        .await
+        .unwrap();
     env.shutdown().await.unwrap();
 }
 
