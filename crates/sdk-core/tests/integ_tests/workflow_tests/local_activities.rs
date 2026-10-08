@@ -2046,31 +2046,28 @@ async fn la_resolve_during_legacy_query_does_not_combine(#[case] impossible_quer
     core.drain_pollers_and_shutdown().await;
 }
 
-/// A legacy query task that arrives while the run's workflow task waits on a local activity must
-/// be buffered until that task completes. Since local activities stopped holding the activation
-/// open (#1442), nothing is outstanding to lang in that state, so the query is applied at once:
-/// it replaces the run's workflow task ("Trying to send a new WFT for a run which already has
-/// one!"), and the workflow task is never completed and times out on the server.
+/// A query that arrives as its own task (a legacy query) while the workflow task waits on a local
+/// activity must wait until that workflow task is done. Otherwise it replaces the workflow task,
+/// which is then never completed.
 #[tokio::test]
 async fn legacy_query_while_waiting_on_la_is_buffered() {
     let wfid = "fake_wf_id";
     let mut t = TestHistoryBuilder::default();
     t.add(default_wes_attribs());
     t.add_full_wf_task();
+    let legacy_query = {
+        let mut pr = hist_to_poll_resp(&t, wfid.to_owned(), ResponseType::ToTaskNum(1));
+        pr.history = Some(History { events: vec![] });
+        pr.query = Some(WorkflowQuery {
+            query_type: "query-type".to_string(),
+            query_args: Some(b"hi".into()),
+            header: None,
+        });
+        pr
+    };
     let tasks = [
         hist_to_poll_resp(&t, wfid.to_owned(), ResponseType::ToTaskNum(1)),
-        {
-            // A query-only task, as the server sends a query when it sees no workflow task in
-            // flight.
-            let mut pr = hist_to_poll_resp(&t, wfid.to_owned(), ResponseType::ToTaskNum(1));
-            pr.history = Some(History { events: vec![] });
-            pr.query = Some(WorkflowQuery {
-                query_type: "query-type".to_string(),
-                query_args: Some(b"hi".into()),
-                header: None,
-            });
-            pr
-        },
+        legacy_query,
     ];
     let mut mh = MockPollCfg::from_resp_batches(wfid, t, tasks, mock_worker_client());
     mh.num_expected_legacy_query_resps = 1;
@@ -2078,72 +2075,62 @@ async fn legacy_query_while_waiting_on_la_is_buffered() {
     mock.worker_cfg(|wc| wc.max_cached_workflows = 10);
     let taskmap = mock.outstanding_task_map.clone().unwrap();
     let core = mock_worker(mock);
-    let query_delivered = Barrier::new(2);
 
-    let wf_fut = async {
-        let task = core.poll_workflow_activation().await.unwrap();
-        let run_id = task.run_id.clone();
-        // Core replies to this at once, keeping the workflow task open for the local activity.
-        core.complete_workflow_activation(WorkflowActivationCompletion::from_cmd(
-            task.run_id,
-            schedule_local_activity_cmd(
-                1,
-                "act-id",
-                ProtoActivityCancellationType::TryCancel,
-                Duration::from_secs(60),
-            ),
-        ))
-        .await
-        .unwrap();
-        // The server dispatched the query before it saw the workflow task start; with many
-        // pollers it arrives now, while the local activity runs.
-        taskmap.release_run(&run_id);
-        tokio::time::sleep(Duration::from_millis(200)).await;
-        query_delivered.wait().await;
+    // The workflow starts a local activity. Core replies at once and keeps the workflow task open.
+    let task = core.poll_workflow_activation().await.unwrap();
+    let run_id = task.run_id;
+    core.complete_workflow_activation(WorkflowActivationCompletion::from_cmd(
+        run_id.clone(),
+        schedule_local_activity_cmd(
+            1,
+            "act-id",
+            ProtoActivityCancellationType::TryCancel,
+            Duration::from_secs(60),
+        ),
+    ))
+    .await
+    .unwrap();
+    let local_activity = core.poll_activity_task().await.unwrap();
 
-        let task = core.poll_workflow_activation().await.unwrap();
-        assert_matches!(
-            task.jobs.as_slice(),
-            [WorkflowActivationJob {
-                variant: Some(workflow_activation_job::Variant::ResolveActivity(_)),
-            }]
-        );
-        // Reports the workflow task: the query must not have taken its place.
-        core.complete_workflow_activation(WorkflowActivationCompletion::from_cmd(
-            task.run_id,
-            start_timer_cmd(1, Duration::from_secs(1)),
-        ))
-        .await
-        .unwrap();
+    // The legacy query arrives while the local activity runs.
+    taskmap.release_run(&run_id);
+    tokio::time::sleep(Duration::from_millis(100)).await;
 
-        let task = core.poll_workflow_activation().await.unwrap();
-        assert_matches!(
-            task.jobs.as_slice(),
-            [WorkflowActivationJob {
-                variant: Some(workflow_activation_job::Variant::QueryWorkflow(q)),
-            }] if q.query_id == LEGACY_QUERY_ID
-        );
-        core.complete_workflow_activation(WorkflowActivationCompletion::from_cmd(
-            task.run_id,
-            query_ok(LEGACY_QUERY_ID, "whatev"),
-        ))
-        .await
-        .unwrap();
-    };
-    let act_fut = async {
-        let act_task = core.poll_activity_task().await.unwrap();
-        query_delivered.wait().await;
-        core.complete_activity_task(ActivityTaskCompletion {
-            task_token: act_task.task_token,
-            result: Some(ActivityExecutionResult::ok(vec![1].into())),
-        })
-        .await
-        .unwrap();
-    };
+    // The local activity finishes, and the workflow task is reported.
+    core.complete_activity_task(ActivityTaskCompletion {
+        task_token: local_activity.task_token,
+        result: Some(ActivityExecutionResult::ok(vec![1].into())),
+    })
+    .await
+    .unwrap();
+    let task = core.poll_workflow_activation().await.unwrap();
+    assert_matches!(
+        task.jobs.as_slice(),
+        [WorkflowActivationJob {
+            variant: Some(workflow_activation_job::Variant::ResolveActivity(_)),
+        }]
+    );
+    core.complete_workflow_activation(WorkflowActivationCompletion::from_cmd(
+        run_id.clone(),
+        start_timer_cmd(1, Duration::from_secs(1)),
+    ))
+    .await
+    .unwrap();
 
-    tokio::time::timeout(Duration::from_secs(10), async { join!(wf_fut, act_fut) })
-        .await
-        .expect("the workflow task was lost");
+    // Only then is the query answered.
+    let task = core.poll_workflow_activation().await.unwrap();
+    assert_matches!(
+        task.jobs.as_slice(),
+        [WorkflowActivationJob {
+            variant: Some(workflow_activation_job::Variant::QueryWorkflow(q)),
+        }] if q.query_id == LEGACY_QUERY_ID
+    );
+    core.complete_workflow_activation(WorkflowActivationCompletion::from_cmd(
+        run_id,
+        query_ok(LEGACY_QUERY_ID, "whatev"),
+    ))
+    .await
+    .unwrap();
     core.drain_pollers_and_shutdown().await;
 }
 
