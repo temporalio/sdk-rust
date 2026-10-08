@@ -23,6 +23,7 @@ fsm! {
     Created --(WorkflowTaskScheduled) --> Scheduled;
 
     Scheduled --(WorkflowTaskStarted(WFTStartedDat), shared on_workflow_task_started) --> Started;
+    Scheduled --(WorkflowTaskFailed(WFTFailedDat), on_workflow_task_failed) --> Failed;
     Scheduled --(WorkflowTaskTimedOut) --> TimedOut;
 
     Started --(WorkflowTaskCompleted, on_workflow_task_completed) --> Completed;
@@ -120,20 +121,17 @@ impl TryFrom<HistEventData> for WorkflowTaskMachineEvents {
             EventType::WorkflowTaskCompleted => Self::WorkflowTaskCompleted,
             EventType::WorkflowTaskFailed => {
                 if let Some(attributes) = e.attributes {
-                    Self::WorkflowTaskFailed(WFTFailedDat {
-                        new_run_id: match attributes {
-                            WorkflowTaskFailedEventAttributes(a) => {
-                                let cause = WorkflowTaskFailedCause::try_from(a.cause);
-                                match cause {
-                                    Ok(WorkflowTaskFailedCause::ResetWorkflow) => {
-                                        Some(a.new_run_id)
-                                    }
-                                    _ => None,
-                                }
-                            }
-                            _ => None,
-                        },
-                    })
+                    let (new_run_id, cause) = match attributes {
+                        WorkflowTaskFailedEventAttributes(a) => {
+                            let cause = WorkflowTaskFailedCause::try_from(a.cause).ok();
+                            let new_run_id = (cause
+                                == Some(WorkflowTaskFailedCause::ResetWorkflow))
+                            .then_some(a.new_run_id);
+                            (new_run_id, cause)
+                        }
+                        _ => (None, None),
+                    };
+                    Self::WorkflowTaskFailed(WFTFailedDat { new_run_id, cause })
                 } else {
                     return Err(fatal!("Workflow task failed is missing attributes: {e}"));
                 }
@@ -179,6 +177,7 @@ pub(super) struct WFTStartedDat {
 
 pub(super) struct WFTFailedDat {
     new_run_id: Option<String>,
+    cause: Option<WorkflowTaskFailedCause>,
 }
 
 impl Scheduled {
@@ -200,6 +199,19 @@ impl Scheduled {
                 started_event_id,
             },
         )
+    }
+
+    pub(super) fn on_workflow_task_failed(
+        self,
+        data: WFTFailedDat,
+    ) -> WorkflowTaskMachineTransition<Failed> {
+        if data.cause != Some(WorkflowTaskFailedCause::WorkflowPauseRequestedBeforeTaskStarted) {
+            return TransitionResult::Err(fatal!(
+                "Workflow task failed before it started with cause {:?}",
+                data.cause
+            ));
+        }
+        TransitionResult::default()
     }
 }
 
