@@ -1038,6 +1038,7 @@ impl Worker {
 
     /// Runs the worker. Eventually resolves after the worker has been explicitly shut down,
     /// or may return early with an error in the event of some unresolvable problem.
+    /// Call [`Self::finalize_shutdown`] afterward to release resources and heartbeat registration.
     pub async fn run(&mut self) -> Result<(), WorkerRunError> {
         let interceptors = self.common.worker_interceptors.clone();
         interceptors::call_run_worker(
@@ -1050,6 +1051,28 @@ impl Worker {
             ),
         )
         .await
+    }
+
+    /// Complete shutdown and release this Worker's resources and heartbeat registration.
+    ///
+    /// Call this after [`Self::run`] returns. Drop all [`Self::shutdown_handle`] handles first,
+    /// since finalization requires sole ownership of the underlying Core Worker. If running the
+    /// Worker failed, finalization may wait for outstanding work; callers with a shutdown deadline
+    /// should bound this future and exit the process if cleanup cannot complete.
+    pub async fn finalize_shutdown(self) -> Result<(), WorkerRunError> {
+        let core = self.common.worker.clone();
+        drop(self);
+        core.shutdown().await;
+        let core = Arc::try_unwrap(core).map_err(|core| WorkerRunError::Fatal {
+            message: "worker shutdown could not be finalized".to_owned(),
+            source: anyhow!(
+                "expected sole ownership of the Core Worker, but {} references remain; drop all shutdown handles before finalizing",
+                Arc::strong_count(&core),
+            )
+            .into_boxed_dyn_error(),
+        })?;
+        core.finalize_shutdown().await;
+        Ok(())
     }
 
     pub(crate) async fn run_inner(&mut self) -> Result<(), WorkerRunError> {

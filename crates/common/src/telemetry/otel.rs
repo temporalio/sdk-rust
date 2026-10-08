@@ -135,6 +135,10 @@ pub fn build_otlp_metric_exporter(
             let exporter = opentelemetry_otlp::MetricExporter::builder()
                 .with_tonic()
                 .with_endpoint(opts.url.to_string());
+            let exporter = match opts.export_timeout {
+                Some(timeout) => exporter.with_timeout(timeout),
+                None => exporter,
+            };
             #[cfg(any(feature = "tls-ring", feature = "tls-aws-lc"))]
             let exporter = if opts.url.scheme() == "https" || opts.url.scheme() == "grpcs" {
                 exporter.with_tls_config(ClientTlsConfig::new().with_native_roots())
@@ -146,12 +150,19 @@ pub fn build_otlp_metric_exporter(
                 .with_temporality(metric_temporality_to_temporality(opts.metric_temporality))
                 .build()?
         }
-        OtlpProtocol::Http => opentelemetry_otlp::MetricExporter::builder()
-            .with_http()
-            .with_endpoint(opts.url.to_string())
-            .with_headers(opts.headers)
-            .with_temporality(metric_temporality_to_temporality(opts.metric_temporality))
-            .build()?,
+        OtlpProtocol::Http => {
+            let exporter = opentelemetry_otlp::MetricExporter::builder()
+                .with_http()
+                .with_endpoint(opts.url.to_string());
+            let exporter = match opts.export_timeout {
+                Some(timeout) => exporter.with_timeout(timeout),
+                None => exporter,
+            };
+            exporter
+                .with_headers(opts.headers)
+                .with_temporality(metric_temporality_to_temporality(opts.metric_temporality))
+                .build()?
+        }
     };
     let reader = PeriodicReader::builder(TracingMetricExporter::new(exporter))
         .with_interval(opts.metric_periodicity)
@@ -166,7 +177,7 @@ pub fn build_otlp_metric_exporter(
     Ok::<_, anyhow::Error>(CoreOtelMeter {
         meter: mp.meter(TELEM_SERVICE_NAME),
         use_seconds_for_durations: opts.use_seconds_for_durations,
-        _mp: mp,
+        meter_provider: mp,
     })
 }
 
@@ -221,7 +232,7 @@ pub struct CoreOtelMeter {
     use_seconds_for_durations: bool,
     // we have to hold on to the provider otherwise otel automatically shuts it down on drop
     // for whatever crazy reason
-    _mp: SdkMeterProvider,
+    meter_provider: SdkMeterProvider,
 }
 
 impl CoreMeter for CoreOtelMeter {
@@ -305,6 +316,15 @@ impl CoreMeter for CoreOtelMeter {
 }
 
 impl CoreOtelMeter {
+    /// Export all metrics currently buffered by this meter.
+    ///
+    /// This may block while the collector responds. Async callers should run it on a blocking
+    /// thread; cancelling that caller does not cancel the underlying export.
+    pub fn force_flush(&self) -> Result<(), anyhow::Error> {
+        self.meter_provider.force_flush()?;
+        Ok(())
+    }
+
     fn create_histogram(&self, params: MetricParameters) -> opentelemetry::metrics::Histogram<u64> {
         self.meter
             .u64_histogram(params.name)
