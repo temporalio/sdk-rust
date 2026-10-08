@@ -5,7 +5,7 @@ use crate::common::{
 };
 use anyhow::anyhow;
 use crossbeam_queue::SegQueue;
-use futures_util::FutureExt;
+use futures_util::{FutureExt, StreamExt, stream};
 use rstest::Context;
 use std::{
     collections::HashMap,
@@ -50,6 +50,7 @@ use temporalio_common::{
                 history_event::{self, Attributes::MarkerRecordedEventAttributes},
             },
             query::v1::WorkflowQuery,
+            workflowservice::v1::{PollActivityTaskQueueResponse, PollNexusTaskQueueResponse},
         },
     },
 };
@@ -68,14 +69,14 @@ use temporalio_sdk_core::{
         canned_histories, default_wes_attribs,
     },
     test_help::{
-        LEGACY_QUERY_ID, MockPollCfg, ResponseType, WorkerExt, WorkerTestHelpers,
-        build_mock_pollers, hist_to_poll_resp, mock_worker, mock_worker_client, query_ok,
-        schedule_local_activity_cmd, single_hist_mock_sg, start_timer_cmd,
+        LEGACY_QUERY_ID, MockPollCfg, MocksHolder, QueueResponse, ResponseType, WorkerExt,
+        WorkerTestHelpers, build_mock_pollers, hist_to_poll_resp, mock_worker, mock_worker_client,
+        query_ok, schedule_local_activity_cmd, single_hist_mock_sg, start_timer_cmd,
     },
 };
 use tokio::{
     join, select,
-    sync::{Barrier, Notify},
+    sync::{Barrier, Notify, oneshot},
 };
 use tokio_util::sync::CancellationToken;
 
@@ -2046,34 +2047,66 @@ async fn la_resolve_during_legacy_query_does_not_combine(#[case] impossible_quer
     core.drain_pollers_and_shutdown().await;
 }
 
-/// A query that arrives as its own task (a legacy query) while the workflow task waits on a local
-/// activity must wait until that workflow task is done. Otherwise it replaces the workflow task,
-/// which is then never completed.
+/// A legacy query task (a query the server sends on its own, when it thinks the workflow is idle)
+/// that arrives while the run's workflow task waits on a local activity must be buffered until that
+/// workflow task completes. Since local activities stopped holding the activation open (#1442),
+/// nothing is outstanding to lang in that state, so the query is applied at once: it replaces the
+/// run's workflow task ("Trying to send a new WFT for a run which already has one!"), and the
+/// workflow task is never completed and times out on the server. With many pollers, the server can
+/// dispatch a query just before it starts the next workflow task, and the query can reach the
+/// worker just after it.
 #[tokio::test]
 async fn legacy_query_while_waiting_on_la_is_buffered() {
     let wfid = "fake_wf_id";
     let mut t = TestHistoryBuilder::default();
     t.add(default_wes_attribs());
     t.add_full_wf_task();
-    let legacy_query = {
-        let mut pr = hist_to_poll_resp(&t, wfid.to_owned(), ResponseType::ToTaskNum(1));
-        pr.history = Some(History { events: vec![] });
-        pr.query = Some(WorkflowQuery {
-            query_type: "query-type".to_string(),
-            query_args: Some(b"hi".into()),
-            header: None,
-        });
-        pr
-    };
-    let tasks = [
-        hist_to_poll_resp(&t, wfid.to_owned(), ResponseType::ToTaskNum(1)),
-        legacy_query,
-    ];
-    let mut mh = MockPollCfg::from_resp_batches(wfid, t, tasks, mock_worker_client());
-    mh.num_expected_legacy_query_resps = 1;
-    let mut mock = build_mock_pollers(mh);
-    mock.worker_cfg(|wc| wc.max_cached_workflows = 10);
-    let taskmap = mock.outstanding_task_map.clone().unwrap();
+    let workflow_task = hist_to_poll_resp(&t, wfid.to_owned(), ResponseType::ToTaskNum(1)).resp;
+    let mut legacy_query = workflow_task.clone();
+    legacy_query.history = Some(History { events: vec![] });
+    legacy_query.query = Some(WorkflowQuery {
+        query_type: "query-type".to_string(),
+        query_args: Some(b"hi".into()),
+        header: None,
+    });
+
+    // The test hands core its tasks. Core takes a task only after it has handled the one before
+    // (with history fetches one at a time), so core taking the task after the query means it has
+    // handled the query. If core stops instead, the stream is dropped.
+    let (send_query, query_sent) = oneshot::channel::<()>();
+    let (query_handled_tx, query_handled) = oneshot::channel::<()>();
+    let tasks = stream::iter([workflow_task])
+        .chain(stream::once(async move {
+            query_sent.await.unwrap();
+            legacy_query
+        }))
+        .chain(
+            stream::once(async move {
+                query_handled_tx.send(()).unwrap();
+            })
+            .filter_map(|()| async { None }),
+        )
+        .chain(stream::pending());
+
+    let mut client = mock_worker_client();
+    client
+        .expect_complete_workflow_task()
+        .times(1)
+        .returning(|_, _| Ok(Default::default()));
+    client
+        .expect_respond_legacy_query()
+        .times(1)
+        .returning(|_, _| Ok(Default::default()));
+    let mut mock = MocksHolder::from_client_with_custom(
+        client,
+        Some(tasks),
+        None::<Vec<QueueResponse<PollActivityTaskQueueResponse>>>,
+        None::<Vec<QueueResponse<PollNexusTaskQueueResponse>>>,
+    );
+    mock.worker_cfg(|wc| {
+        wc.max_cached_workflows = 10;
+        wc.fetching_concurrency = 1;
+    });
     let core = mock_worker(mock);
 
     // The workflow starts a local activity. Core replies at once and keeps the workflow task open.
@@ -2093,8 +2126,10 @@ async fn legacy_query_while_waiting_on_la_is_buffered() {
     let local_activity = core.poll_activity_task().await.unwrap();
 
     // The legacy query arrives while the local activity runs.
-    taskmap.release_run(&run_id);
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    send_query.send(()).unwrap();
+    query_handled
+        .await
+        .expect("core stopped while handling the legacy query");
 
     // The local activity finishes, and the workflow task is reported.
     core.complete_activity_task(ActivityTaskCompletion {
@@ -2131,7 +2166,7 @@ async fn legacy_query_while_waiting_on_la_is_buffered() {
     ))
     .await
     .unwrap();
-    core.drain_pollers_and_shutdown().await;
+    core.shutdown().await;
 }
 
 #[temporalio_macros::cloud_test_exclusion(crate::CloudTestExclusionReason::DoesNotUseServer)]
