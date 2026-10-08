@@ -33,6 +33,15 @@ relevant information.
 
 ## Unreleased
 
+### Fixed
+* Local activities still running when their workflow is evicted or the worker shuts down now
+  always receive a cancellation. Local activities no longer retry ordinary failures or
+  start-to-close timeouts after cancellation has been requested, matching non-local activities.
+  Workflow code no longer observes a spurious local activity cancellation when its run is evicted
+  or completes while the local activity is backing off between retries.
+* Evicting a workflow while some local activities are still running now preserves results already
+  delivered to workflow code, rather than panicking or losing those results.
+
 ## [1.1.0] - 2026-10-06
 
 ### Added
@@ -48,11 +57,6 @@ relevant information.
   are now distinguished by `StartChildWorkflowExecutionFailedCause::NamespaceNotFound`.
 
 ### Fixed
-* Local activities still running when their workflow is evicted or the worker shuts down now
-  always receive a cancellation. Local activities no longer retry ordinary failures or
-  start-to-close timeouts after cancellation has been requested, matching non-local activities.
-  Workflow code no longer observes a spurious local activity cancellation when its run is evicted
-  or completes while the local activity is backing off between retries.
 * `temporalio-common`'s build script now generates its payload-visitor implementations in a
   stable order. The generated code was emitted in `HashSet`/`HashMap` iteration order, so its
   content changed on every build and a compilation cache such as sccache missed

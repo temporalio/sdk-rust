@@ -33,6 +33,15 @@ relevant information.
 
 ## Unreleased
 
+### Fixed
+* Local activities still running when their workflow is evicted or the worker shuts down now
+  always receive a cancellation. Local activities no longer retry ordinary failures or
+  start-to-close timeouts after cancellation has been requested, matching non-local activities.
+  Workflow code no longer observes a spurious local activity cancellation when its run is evicted
+  or completes while the local activity is backing off between retries.
+* Workers no longer panic when evicting a workflow with buffered local activity results. Completed
+  activations' output is recorded before eviction, without recording eviction-induced cancellations.
+
 ## [0.10.0] - 2026-10-06
 
 ### Added
@@ -42,11 +51,6 @@ relevant information.
   namespaces from other start failures.
 
 ### Fixed
-* Local activities still running when their workflow is evicted or the worker shuts down now
-  always receive a cancellation. Local activities no longer retry ordinary failures or
-  start-to-close timeouts after cancellation has been requested, matching non-local activities.
-  Workflow code no longer observes a spurious local activity cancellation when its run is evicted
-  or completes while the local activity is backing off between retries.
 * Task-poll targets no longer decrease after cancelled or timed-out polls. Affected pollers still
   retain their slot during backoff, while resource-exhaustion errors still reduce the target.
 * Replay now preserves which local activity results were delivered together for newly recorded

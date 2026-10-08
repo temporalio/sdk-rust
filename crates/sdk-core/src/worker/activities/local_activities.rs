@@ -1342,7 +1342,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cancel_all_in_run_queues_one_cancel_per_attempt_and_reports_delivery() {
+    async fn duplicate_cancel_requests_queue_one_cancel_and_report_delivery() {
         let (lam, mut notify_rx) = LocalActivityManager::test_with_notifications(5);
         lam.enqueue([NewLocalAct {
             schedule_cmd: ValidScheduleLA {
