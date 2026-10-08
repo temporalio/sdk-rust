@@ -173,7 +173,7 @@ use tokio::sync::{
     mpsc::{UnboundedSender, unbounded_channel},
 };
 use tokio_stream::wrappers::UnboundedReceiverStream;
-use tokio_util::sync::CancellationToken;
+use tokio_util::{sync::CancellationToken, task::TaskTracker};
 use tracing::{Instrument, Span, field};
 use uuid::Uuid;
 
@@ -816,6 +816,7 @@ struct ActivityHalf {
     /// Maps activity type to the function for executing activities of that type
     activities: ActivityDefinitions,
     task_tokens_to_cancels: HashMap<TaskToken, CancellationToken>,
+    tasks: TaskTracker,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -1031,9 +1032,14 @@ impl Worker {
 
     /// Return a handle that can be used to initiate shutdown. This is useful because [Worker::run]
     /// takes self mutably, so you may want to obtain a handle for shutting down before running.
+    /// The handle does nothing after the worker has been dropped.
     pub fn shutdown_handle(&self) -> impl Fn() + use<> {
-        let w = self.common.worker.clone();
-        move || w.initiate_shutdown()
+        let w = Arc::downgrade(&self.common.worker);
+        move || {
+            if let Some(w) = w.upgrade() {
+                w.initiate_shutdown();
+            }
+        }
     }
 
     /// Runs the worker. Eventually resolves after the worker has been explicitly shut down,
@@ -1054,21 +1060,51 @@ impl Worker {
 
     /// Runs the worker, initiating shutdown when `shutdown` completes.
     ///
-    /// After shutdown is initiated, waits for the worker to finish shutting down and returns the
-    /// result of [`Worker::run`]. The output of `shutdown` is ignored. If the worker finishes first,
-    /// returns its result immediately and drops `shutdown`.
-    pub async fn run_until(&mut self, shutdown: impl Future) -> Result<(), WorkerRunError> {
-        let shutdown_handle = self.shutdown_handle();
-        let run = self.run();
-        tokio::pin!(run);
+    /// Consumes the worker and finalizes shutdown before returning the result of [`Worker::run`],
+    /// including when running fails. The output of `shutdown` is ignored. If the worker finishes
+    /// first, drops `shutdown` and finalizes shutdown without waiting for it.
+    ///
+    /// Finalization fails if additional references to the underlying Core worker remain, such as
+    /// activity contexts retained after their activities have completed.
+    pub async fn run_until(mut self, shutdown: impl Future) -> Result<(), WorkerRunError> {
+        let result = {
+            let shutdown_handle = self.shutdown_handle();
+            let run = self.run();
+            tokio::pin!(run);
 
-        tokio::select! {
-            result = &mut run => result,
-            _ = shutdown => {
-                shutdown_handle();
-                run.await
+            tokio::select! {
+                result = &mut run => result,
+                _ = shutdown => {
+                    shutdown_handle();
+                    run.await
+                }
             }
+        };
+
+        self.common.worker.initiate_shutdown();
+        // Validation failures skip the SDK polling loops, but Core's activity manager still needs
+        // a poll to observe shutdown before its finalizer can complete.
+        if matches!(result, Err(WorkerRunError::Validation(_))) {
+            let _ = self.common.worker.poll_activity_task().await;
         }
+        for cancellation in self.activity_half.task_tokens_to_cancels.values() {
+            cancellation.cancel();
+        }
+        // Activity completions can release Core's slots before their tasks drop their Core
+        // references, so wait for the SDK tasks before taking ownership for finalization.
+        self.activity_half.tasks.close();
+        self.activity_half.tasks.wait().await;
+        let core_worker =
+            Arc::try_unwrap(self.common.worker).map_err(|worker| WorkerRunError::Fatal {
+                message: "worker shutdown finalization failed".to_owned(),
+                source: anyhow!(
+                    "expected sole ownership of the Core worker, but {} references remain",
+                    Arc::strong_count(&worker)
+                )
+                .into_boxed_dyn_error(),
+            })?;
+        core_worker.finalize_shutdown().await;
+        result
     }
 
     pub(crate) async fn run_inner(&mut self) -> Result<(), WorkerRunError> {
@@ -1545,7 +1581,7 @@ impl ActivityHalf {
                 );
                 let codec_data_converter = data_converter.clone();
 
-                tokio::spawn(async move {
+                self.tasks.spawn(async move {
                     let act_fut = async move {
                         let span = Span::current();
                         if let Some(workflow_id) = &ctx.info().workflow_id {
@@ -1667,6 +1703,7 @@ mod tests {
     struct RunUntilObserver {
         started: Notify,
         finished: AtomicBool,
+        run_finished: Notify,
         shutdown: AtomicBool,
         fail_run: bool,
     }
@@ -1689,6 +1726,7 @@ mod tests {
                     next.run(input).await
                 };
                 self.finished.store(true, Ordering::SeqCst);
+                self.run_finished.notify_one();
                 result
             })
         }
@@ -1725,7 +1763,9 @@ mod tests {
     #[tokio::test]
     async fn run_until_waits_for_shutdown_to_finish(#[case] ready: bool) {
         let observer = Arc::new(RunUntilObserver::default());
-        let mut worker = run_until_test_worker(stream::pending(), observer.clone());
+        let worker = run_until_test_worker(stream::pending(), observer.clone());
+        let core_worker = Arc::downgrade(&worker.common.worker);
+        let shutdown_handle = worker.shutdown_handle();
         let signal_completed = Cell::new(false);
 
         tokio::time::timeout(
@@ -1745,6 +1785,8 @@ mod tests {
         assert!(signal_completed.get());
         assert!(observer.shutdown.load(Ordering::SeqCst));
         assert!(observer.finished.load(Ordering::SeqCst));
+        assert!(core_worker.upgrade().is_none());
+        shutdown_handle();
     }
 
     #[rstest::rstest]
@@ -1756,7 +1798,8 @@ mod tests {
             fail_run,
             ..Default::default()
         });
-        let mut worker = run_until_test_worker(stream::empty(), observer.clone());
+        let worker = run_until_test_worker(stream::empty(), observer.clone());
+        let core_worker = Arc::downgrade(&worker.common.worker);
         let signal_dropped = CancellationToken::new();
         let drop_guard = signal_dropped.clone().drop_guard();
         let result = tokio::time::timeout(
@@ -1773,13 +1816,42 @@ mod tests {
             assert!(
                 matches!(result, Err(WorkerRunError::Fatal { message, .. }) if message == "run failed")
             );
-            worker.common.worker.shutdown().await;
         } else {
             result.unwrap();
             assert!(observer.shutdown.load(Ordering::SeqCst));
         }
         assert!(observer.finished.load(Ordering::SeqCst));
         assert!(signal_dropped.is_cancelled());
+        assert!(core_worker.upgrade().is_none());
+    }
+
+    #[tokio::test]
+    async fn run_until_waits_for_activity_tasks_to_release_core() {
+        let observer = Arc::new(RunUntilObserver::default());
+        let worker = run_until_test_worker(stream::empty(), observer.clone());
+        let core_worker = worker.common.worker.clone();
+        let core_weak = Arc::downgrade(&core_worker);
+        let release_task = Arc::new(Notify::new());
+        let release_task_clone = release_task.clone();
+        worker.activity_half.tasks.spawn(async move {
+            release_task_clone.notified().await;
+            drop(core_worker);
+        });
+
+        let run_until = worker.run_until(async {});
+        tokio::pin!(run_until);
+        tokio::select! {
+            biased;
+            _ = observer.run_finished.notified() => {},
+            result = &mut run_until => panic!("returned before the activity task finished: {result:?}"),
+        }
+        assert!(run_until.as_mut().now_or_never().is_none());
+        release_task.notify_one();
+        tokio::time::timeout(Duration::from_secs(10), run_until)
+            .await
+            .expect("finalization should finish after the activity task releases Core")
+            .unwrap();
+        assert!(core_weak.upgrade().is_none());
     }
 
     #[derive(Default)]
