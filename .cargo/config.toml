@@ -7,6 +7,9 @@ CLI_VERSION_OVERRIDE = "v1.8.3-server-1.32.0-162.0"
 [alias]
 # Aliases are strings rather than arrays because Cargo concatenates arrays from nested config
 # files, which duplicates the arguments when a checkout lives inside another (ex: worktrees).
+# During the transition to this new format update any older version of this file to the string based
+# approach if needed.
+
 # Not sure why --all-features doesn't work
 integ-test = """\
     test \
