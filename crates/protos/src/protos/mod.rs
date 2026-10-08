@@ -1107,32 +1107,6 @@ pub mod coresdk {
             use prost_types::Timestamp;
             use std::fmt::{Display, Formatter};
 
-            pub fn create_evict_activation(
-                run_id: String,
-                message: String,
-                reason: EvictionReason,
-            ) -> WorkflowActivation {
-                WorkflowActivation {
-                    timestamp: None,
-                    run_id,
-                    is_replaying: false,
-                    history_length: 0,
-                    jobs: vec![WorkflowActivationJob::from(
-                        workflow_activation_job::Variant::RemoveFromCache(RemoveFromCache {
-                            message,
-                            reason: reason as i32,
-                        }),
-                    )],
-                    available_internal_flags: vec![],
-                    history_size_bytes: 0,
-                    continue_as_new_suggested: false,
-                    deployment_version_for_current_task: None,
-                    last_sdk_version: String::new(),
-                    suggest_continue_as_new_reasons: vec![],
-                    target_worker_deployment_version_changed: false,
-                }
-            }
-
             pub fn query_to_job(id: String, q: WorkflowQuery) -> QueryWorkflow {
                 QueryWorkflow {
                     query_id: id,

@@ -33,8 +33,8 @@ use temporalio_common::protos::{
     coresdk::{
         common::ExternalStorageMetrics,
         workflow_activation::{
-            WorkflowActivation, create_evict_activation, query_to_job,
-            remove_from_cache::EvictionReason, workflow_activation_job,
+            RemoveFromCache, WorkflowActivation, query_to_job, remove_from_cache::EvictionReason,
+            workflow_activation_job,
         },
         workflow_commands::{FailWorkflowExecution, QueryResult},
         workflow_completion,
@@ -351,12 +351,6 @@ impl ManagedRun {
         if self.activation.is_some() {
             return Ok(None);
         }
-        // In the event it's time to evict this run, cancel any outstanding LAs
-        if self.trying_to_evict.is_some() {
-            self.sink_la_requests(vec![LocalActRequest::CancelAllInRun(
-                self.wfm.machines.run_id.clone(),
-            )])?;
-        }
 
         if self.wft.is_none() {
             // It doesn't make sense to do workflow work unless we have a WFT
@@ -399,14 +393,23 @@ impl ManagedRun {
                 Ok(Some(ActivationOrAuto::Autocomplete {
                     run_id: self.run_id().to_string(),
                 }))
-            } else if let Some(wte) = self.trying_to_evict.clone() {
-                let act =
-                    create_evict_activation(self.run_id().to_string(), wte.message, wte.reason);
-                Ok(Some(ActivationOrAuto::LangActivation(act)))
             } else {
                 Ok(None)
             }
         }
+    }
+
+    /// Returns true while a cancellation for one of this run's in-flight local activities is
+    /// queued but has not yet been returned from an activity poll.
+    ///
+    /// Completing an eviction makes the LA manager forget this run's local activities, so a
+    /// cancellation still queued at that point would later be dropped as untracked. The eviction
+    /// is therefore withheld while this returns true, and the LA manager wakes the run when a
+    /// queued cancellation is handed to lang.
+    fn has_undelivered_la_cancels(&self) -> bool {
+        self.local_activity_request_sink
+            .as_ref()
+            .is_some_and(|sink| sink.has_undelivered_cancels(self.run_id()))
     }
 
     /// Called whenever lang successfully completes a workflow activation. Commands produced by the
@@ -761,8 +764,8 @@ impl ManagedRun {
 
         self.wfm.machines.add_lang_used_flags(completion.used_flags);
 
-        // If this is just bookkeeping after a reply to an eviction activation, we can bypass
-        // everything, since there is no reason to continue trying to update machines.
+        // Eviction must not advance the machines, but completed normal activations may have
+        // buffered output while waiting on other LAs. Preserve that output before removing the run.
         if completion.activation_was_eviction {
             return Ok(Some(self.prepare_complete_resp(
                 completion.resp_chan,
@@ -873,6 +876,20 @@ impl ManagedRun {
         &mut self,
         res: LocalResolution,
     ) -> Result<Option<ActivationOrAuto>, RunUpdateErr> {
+        // When the eviction is the only work left, its activation would already be outstanding
+        // were it not withheld for undelivered local activity cancels, and a result arriving then
+        // would be thrown away with the run. Applying it instead would let the cancellation the
+        // eviction itself caused reach workflow code as an activation ahead of the eviction, and
+        // the completion lang sends in reaction would be recorded in history.
+        if self.activation_is_eviction()
+            || (self.trying_to_evict.is_some()
+                && self.activation.is_none()
+                && !self.more_pending_work())
+        {
+            debug!(resolution=?res, "Discarding local resolution for run about to be evicted");
+            // The resolved attempt leaving the LA manager may be what lets the eviction go out
+            return self._check_more_activations();
+        }
         debug!(resolution=?res, "Applying local resolution");
         self.wfm.notify_of_local_result(res)?;
         if self.activation.is_none() {
@@ -976,7 +993,7 @@ impl ManagedRun {
                     run_id=%info.run_id,
                     reason=?info.reason,
                     outstanding_local_activities=outstanding_las,
-                    "Eviction requested while local activities are still in flight; local activities when using max_cached_workflows=0 are likely to be dropped or retried"
+                    "Eviction requested while local activities are still in flight; local activities when using max_cached_workflows=0 are cancelled and will be re-executed on replay"
                 );
             }
             debug!(run_id=%info.run_id, reason=%info.message, "Eviction requested");
@@ -1053,18 +1070,45 @@ impl ManagedRun {
                         ActivationOrAuto::Autocomplete { .. } | ActivationOrAuto::AutoFail { .. },
                     ) => a,
                     None => {
-                        if let Some(reason) = self.trying_to_evict.as_ref() {
+                        if let Some(reason) = self.trying_to_evict.clone() {
                             // If we had nothing to do, but we're trying to evict, just do that now
                             // as long as there's no other outstanding work.
-                            if self.activation.is_none() && !self.more_pending_work() {
-                                let mut evict_act = create_evict_activation(
-                                    self.run_id().to_string(),
-                                    reason.message.clone(),
-                                    reason.reason,
-                                );
-                                evict_act.history_length =
-                                    self.most_recently_processed_event_number() as u32;
-                                Some(ActivationOrAuto::LangActivation(evict_act))
+                            if self.activation.is_none()
+                                && (self.am_broken || !self.more_pending_work())
+                            {
+                                // Drain normal activations before cancellation so eviction-induced
+                                // results cannot be applied alongside legitimate workflow work.
+                                // Heartbeats must not reopen normal processing after this boundary.
+                                if let Some(waiting) = self.waiting_on_la.take() {
+                                    waiting.hb_timeout_handle.abort();
+                                }
+                                if let Err(e) =
+                                    self.sink_la_requests(vec![LocalActRequest::CancelAllInRun(
+                                        self.run_id().to_string(),
+                                    )])
+                                {
+                                    return self.update_to_acts(Err(e.into()));
+                                }
+                                if self.has_undelivered_la_cancels() {
+                                    None
+                                } else {
+                                    let evict_act = WorkflowActivation {
+                                        run_id: self.run_id().to_string(),
+                                        history_length: self.most_recently_processed_event_number()
+                                            as u32,
+                                        jobs: vec![
+                                            workflow_activation_job::Variant::RemoveFromCache(
+                                                RemoveFromCache {
+                                                    message: reason.message,
+                                                    reason: reason.reason as i32,
+                                                },
+                                            )
+                                            .into(),
+                                        ],
+                                        ..Default::default()
+                                    };
+                                    Some(ActivationOrAuto::LangActivation(evict_act))
+                                }
                             } else {
                                 None
                             }
@@ -1155,32 +1199,30 @@ impl ManagedRun {
         data: CompletionDataForWFT,
         due_to_heartbeat_timeout: bool,
     ) -> FulfillableActivationComplete {
+        let outstanding_las = self.wfm.machines.outstanding_local_activity_count() > 0;
+        let can_report_eviction =
+            data.activation_was_eviction && self.wft.is_some() && !self.am_broken;
         let mut machines_wft_response = self.wfm.prepare_for_wft_response();
-        if data.activation_was_eviction
+        let eviction_has_output = can_report_eviction
             && (machines_wft_response.commands().peek().is_some()
-                || machines_wft_response.has_messages())
-            && !self.am_broken
-        {
-            dbg_panic!(
-                "There should not be any outgoing commands or messages when preparing a completion \
-                 response if the activation was only an eviction. This is an SDK bug."
-            );
-        }
+                || machines_wft_response.has_messages());
 
         let query_responses = data.query_responses;
         let has_query_responses = !query_responses.is_empty();
         let is_query_playback = data.has_pending_query && !has_query_responses;
-        let mut force_new_wft = due_to_heartbeat_timeout;
+        // Unrecorded LAs must get a replacement task on which to execute after eviction, just
+        // like LAs that remain outstanding across a workflow-task heartbeat.
+        let mut force_new_wft =
+            due_to_heartbeat_timeout || (eviction_has_output && outstanding_las);
 
         // We only actually want to send commands back to the server if there are no more pending
         // activations and we are caught up on replay. We don't want to complete a wft if we already
         // saw the final event in the workflow, or if we are playing back for the express purpose of
-        // fulfilling a query. If the activation we sent was *only* an eviction, don't send that
-        // either.
+        // fulfilling a query. Eviction only reports output buffered by prior normal activations.
         let should_respond = !(machines_wft_response.has_pending_jobs
             || (machines_wft_response.replaying && !data.is_forced_failure)
             || is_query_playback
-            || data.activation_was_eviction
+            || (data.activation_was_eviction && !eviction_has_output)
             || machines_wft_response.have_seen_terminal_event);
         // If there are pending LA resolutions, and we're responding to a query here,
         // we want to make sure to force a new task, as otherwise once we tell lang about

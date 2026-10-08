@@ -26,7 +26,7 @@ use temporalio_common::{
             ActivityTaskCompletion, AsJsonPayloadExt, FromJsonPayloadExt,
             activity_result::ActivityExecutionResult,
             activity_task::activity_task as act_task,
-            common::extract_local_activity_marker_data,
+            common::{extract_local_activity_marker_data, extract_local_activity_marker_details},
             workflow_activation::{
                 WorkflowActivation, WorkflowActivationJob, workflow_activation_job,
             },
@@ -44,7 +44,7 @@ use temporalio_common::{
             enums::v1::{
                 CommandType, EventType, TimeoutType as ProtoTimeoutType, WorkflowTaskFailedCause,
             },
-            failure::v1::Failure,
+            failure::v1::{Failure, failure::FailureInfo},
             history::v1::history_event::{self, Attributes::MarkerRecordedEventAttributes},
             query::v1::WorkflowQuery,
         },
@@ -66,8 +66,9 @@ use temporalio_sdk_core::{
     },
     test_help::{
         LEGACY_QUERY_ID, MockPollCfg, ResponseType, WorkerExt, WorkerTestHelpers,
-        build_mock_pollers, hist_to_poll_resp, mock_worker, mock_worker_client, query_ok,
-        schedule_local_activity_cmd, single_hist_mock_sg, start_timer_cmd,
+        build_mock_pollers, drain_pollers_and_shutdown, hist_to_poll_resp, mock_worker,
+        mock_worker_client, query_ok, schedule_local_activity_cmd, single_hist_mock_sg,
+        start_timer_cmd,
     },
 };
 use tokio::{
@@ -448,6 +449,87 @@ async fn cancel_immediate(#[case] cancel_type: ActivityCancellationType) {
         .unwrap();
 }
 
+#[tokio::test]
+async fn ordinary_failure_after_local_activity_cancel_does_not_retry() {
+    let wf_name = "ordinary_failure_after_local_activity_cancel_does_not_retry";
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let mut starter = CoreWfStarter::new(wf_name);
+
+    struct FailAfterCancel {
+        attempts: Arc<AtomicUsize>,
+    }
+    #[activities]
+    impl FailAfterCancel {
+        #[activity]
+        async fn run(self: Arc<Self>, ctx: ActivityContext, _: ()) -> Result<(), ActivityError> {
+            let attempt = self.attempts.fetch_add(1, Ordering::SeqCst) + 1;
+            if attempt == 1 {
+                ctx.cancelled().await;
+            }
+            Err(anyhow!("ordinary failure on attempt {attempt}").into())
+        }
+    }
+
+    #[workflow]
+    #[derive(Default)]
+    struct CancelThenFail;
+
+    #[workflow_methods]
+    impl CancelThenFail {
+        #[run]
+        async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<()> {
+            let la = ctx.execute_local_activity(
+                FailAfterCancel::run,
+                (),
+                LocalActivityOptions::builder()
+                    .cancel_type(ActivityCancellationType::WaitCancellationCompleted)
+                    .retry_policy(
+                        RetryPolicy {
+                            initial_interval: Some(prost_dur!(from_millis(10))),
+                            backoff_coefficient: 1.,
+                            maximum_interval: Some(prost_dur!(from_millis(10))),
+                            maximum_attempts: 2,
+                            ..Default::default()
+                        }
+                        .into(),
+                    )
+                    .build(),
+            );
+            ctx.timer(Duration::from_secs(1)).await;
+            la.cancel();
+            let Err(ActivityExecutionError::Failed(failure)) = la.await else {
+                panic!("Expected ordinary failure after cancellation");
+            };
+            assert_eq!(failure.failure().message, "ordinary failure on attempt 1");
+            assert_matches!(
+                &failure.failure().failure_info,
+                Some(FailureInfo::ApplicationFailureInfo(_))
+            );
+            Ok(())
+        }
+    }
+
+    starter.sdk_config.register_activities(FailAfterCancel {
+        attempts: attempts.clone(),
+    });
+    starter
+        .sdk_config
+        .register_workflow::<CancelThenFail>()
+        .unwrap();
+    let mut worker = starter.worker().await;
+    let task_queue = starter.get_task_queue().to_owned();
+    worker
+        .submit_workflow(
+            CancelThenFail::run,
+            (),
+            WorkflowStartOptions::new(task_queue, wf_name.to_owned()).build(),
+        )
+        .await
+        .unwrap();
+    worker.run_until_done().await.unwrap();
+    assert_eq!(attempts.load(Ordering::SeqCst), 1);
+}
+
 struct LACancellerInterceptor {
     token: CancellationToken,
     cancel_on_workflow_completed: bool,
@@ -578,17 +660,31 @@ async fn cancel_after_act_starts(
             // resolving the LA with cancel on replay
             ctx.timer(Duration::from_secs(1)).await;
             let err = la.await.unwrap_err();
-            let ActivityExecutionError::Cancelled(cancel_err) = err else {
-                panic!("expected cancellation failure, got {err:?}");
+            match err {
+                ActivityExecutionError::Cancelled(cancel_err) => {
+                    let expected_details = if bo_dur == Duration::from_secs(1)
+                        && cancel_type == ActivityCancellationType::WaitCancellationCompleted
+                    {
+                        Some("cancel-after-start".to_string())
+                    } else {
+                        None
+                    };
+                    assert_eq!(cancel_err.details::<String>().unwrap(), expected_details);
+                }
+                ActivityExecutionError::Failed(failure)
+                    if bo_dur != Duration::from_secs(1)
+                        && cancel_type == ActivityCancellationType::WaitCancellationCompleted =>
+                {
+                    // Cancellation can land during an attempt rather than its backoff. That
+                    // attempt's ordinary failure is terminal, not converted to cancellation.
+                    assert_eq!(failure.failure().message, "Oh no I failed!");
+                    assert_matches!(
+                        &failure.failure().failure_info,
+                        Some(FailureInfo::ApplicationFailureInfo(_))
+                    );
+                }
+                other => panic!("Unexpected activity result after cancellation: {other:?}"),
             };
-            let expected_details = if bo_dur == Duration::from_secs(1)
-                && cancel_type == ActivityCancellationType::WaitCancellationCompleted
-            {
-                Some("cancel-after-start".to_string())
-            } else {
-                None
-            };
-            assert_eq!(cancel_err.details::<String>().unwrap(), expected_details);
             Ok(())
         }
     }
@@ -3341,6 +3437,205 @@ async fn zero_cache_doesnt_evict_before_wft_is_answered() {
     assert_eq!(
         markers_reported, 3,
         "all three local activity markers should reach the server, got {all_reported:?}"
+    );
+}
+
+#[tokio::test]
+async fn eviction_with_buffered_la_marker_replays_only_completed_la() {
+    let mut starter =
+        CoreWfStarter::new("eviction_with_buffered_la_marker_replays_only_completed_la");
+    starter.workflow_options.task_timeout = Some(Duration::from_secs(60));
+    let core = starter.get_core_worker().await;
+    let run_id = starter.start_wf().await;
+    let la_commands = || {
+        (1..=2)
+            .map(|seq| {
+                schedule_local_activity_cmd(
+                    seq,
+                    &seq.to_string(),
+                    ProtoActivityCancellationType::WaitCancellationCompleted,
+                    Duration::from_secs(60),
+                )
+            })
+            .collect()
+    };
+    let initial = core.poll_workflow_activation().await.unwrap();
+    assert!(!initial.is_replaying);
+    core.complete_workflow_activation(WorkflowActivationCompletion::from_cmds(
+        initial.run_id,
+        la_commands(),
+    ))
+    .await
+    .unwrap();
+
+    let mut starts = HashMap::new();
+    let mut execution_counts = HashMap::new();
+    for _ in 0..2 {
+        let task = core.poll_activity_task().await.unwrap();
+        let Some(act_task::Variant::Start(start)) = &task.variant else {
+            panic!("Expected LA start, got {task:?}");
+        };
+        assert!(start.is_local);
+        *execution_counts
+            .entry(start.activity_id.clone())
+            .or_insert(0) += 1;
+        assert!(
+            starts
+                .insert(start.activity_id.clone(), task.task_token)
+                .is_none()
+        );
+    }
+    core.complete_activity_task(ActivityTaskCompletion {
+        task_token: starts.remove("1").unwrap(),
+        result: Some(ActivityExecutionResult::ok(vec![1].into())),
+    })
+    .await
+    .unwrap();
+    let resolved = core.poll_workflow_activation().await.unwrap();
+    assert_matches!(
+        resolved.jobs.as_slice(),
+        [WorkflowActivationJob {
+            variant: Some(workflow_activation_job::Variant::ResolveActivity(resolution)),
+        }] if resolution.seq == 1
+    );
+
+    // Holding the resolution activation keeps LA1's marker buffered while eviction cancels LA2.
+    core.request_workflow_eviction(&run_id);
+    core.complete_workflow_activation(WorkflowActivationCompletion::empty(resolved.run_id))
+        .await
+        .unwrap();
+    let (eviction, cancel) = join!(core.poll_workflow_activation(), core.poll_activity_task());
+    let eviction = eviction.unwrap();
+    let cancel = cancel.unwrap();
+    assert_matches!(
+        eviction.jobs.as_slice(),
+        [WorkflowActivationJob {
+            variant: Some(workflow_activation_job::Variant::RemoveFromCache(_)),
+        }]
+    );
+    assert_eq!(cancel.task_token, starts.remove("2").unwrap());
+    assert_matches!(cancel.variant, Some(act_task::Variant::Cancel(_)));
+    core.complete_activity_task(ActivityTaskCompletion {
+        task_token: cancel.task_token,
+        result: Some(ActivityExecutionResult::cancel_from_details(None)),
+    })
+    .await
+    .unwrap();
+    core.complete_workflow_activation(WorkflowActivationCompletion::empty(eviction.run_id))
+        .await
+        .unwrap();
+
+    // The buffered-marker completion must force another workflow task so the cancelled,
+    // unrecorded LA can execute again.
+    let history = starter.get_history().await;
+    assert_eq!(
+        history
+            .events
+            .iter()
+            .filter(|event| event.event_type() == EventType::WorkflowTaskScheduled)
+            .count(),
+        2
+    );
+    let markers = history
+        .events
+        .iter()
+        .filter_map(|event| match &event.attributes {
+            Some(MarkerRecordedEventAttributes(marker)) => Some(
+                extract_local_activity_marker_details(&mut marker.details.clone()),
+            ),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(markers.len(), 1);
+    assert_eq!(markers[0].0.as_ref().unwrap().seq, 1);
+    assert_eq!(markers[0].1, Some(vec![1].into()));
+
+    let replacement = core.poll_workflow_activation().await.unwrap();
+    assert_eq!(replacement.run_id, run_id);
+    assert!(replacement.is_replaying);
+    assert_matches!(
+        replacement.jobs.as_slice(),
+        [WorkflowActivationJob {
+            variant: Some(workflow_activation_job::Variant::InitializeWorkflow(_)),
+        }]
+    );
+    core.complete_workflow_activation(WorkflowActivationCompletion::from_cmds(
+        replacement.run_id,
+        la_commands(),
+    ))
+    .await
+    .unwrap();
+    let replayed = core.poll_workflow_activation().await.unwrap();
+    assert!(replayed.is_replaying);
+    assert_matches!(
+        replayed.jobs.as_slice(),
+        [WorkflowActivationJob {
+            variant: Some(workflow_activation_job::Variant::ResolveActivity(resolution)),
+        }] if resolution.seq == 1
+    );
+    core.complete_workflow_activation(WorkflowActivationCompletion::empty(replayed.run_id))
+        .await
+        .unwrap();
+    let task = core.poll_activity_task().await.unwrap();
+    let Some(act_task::Variant::Start(start)) = &task.variant else {
+        panic!("Expected replacement LA start, got {task:?}");
+    };
+    assert!(start.is_local);
+    assert_eq!(start.activity_id, "2");
+    *execution_counts
+        .entry(start.activity_id.clone())
+        .or_insert(0) += 1;
+    core.complete_activity_task(ActivityTaskCompletion {
+        task_token: task.task_token,
+        result: Some(ActivityExecutionResult::ok(vec![2].into())),
+    })
+    .await
+    .unwrap();
+    let resolved = core.poll_workflow_activation().await.unwrap();
+    assert_matches!(
+        resolved.jobs.as_slice(),
+        [WorkflowActivationJob {
+            variant: Some(workflow_activation_job::Variant::ResolveActivity(resolution)),
+        }] if resolution.seq == 2
+    );
+    core.complete_execution(&resolved.run_id).await;
+    drain_pollers_and_shutdown(&core).await;
+
+    assert_eq!(
+        execution_counts,
+        HashMap::from([("1".to_owned(), 1), ("2".to_owned(), 2)])
+    );
+    let history = starter.get_history().await;
+    let markers = history
+        .events
+        .iter()
+        .filter_map(|event| match &event.attributes {
+            Some(MarkerRecordedEventAttributes(marker)) => Some(
+                extract_local_activity_marker_details(&mut marker.details.clone()),
+            ),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(markers.len(), 2);
+    for (index, (metadata, result)) in markers.into_iter().enumerate() {
+        assert_eq!(metadata.unwrap().seq, index as u32 + 1);
+        assert_eq!(result, Some(vec![index as u8 + 1].into()));
+    }
+    assert_eq!(
+        history
+            .events
+            .iter()
+            .filter(|event| event.event_type() == EventType::WorkflowTaskCompleted)
+            .count(),
+        2
+    );
+    assert!(!history.events.iter().any(|event| matches!(
+        event.event_type(),
+        EventType::WorkflowTaskFailed | EventType::WorkflowTaskTimedOut
+    )));
+    assert_eq!(
+        history.events.last().unwrap().event_type(),
+        EventType::WorkflowExecutionCompleted
     );
 }
 

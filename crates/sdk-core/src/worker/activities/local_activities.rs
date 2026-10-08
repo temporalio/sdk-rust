@@ -5,7 +5,10 @@ use crate::{
     telemetry::metrics::{
         FailureReason, activity_type, failure_reason, should_record_failure_metric, workflow_type,
     },
-    worker::{LocalActivitySlotKind, workflow::HeartbeatTimeoutMsg},
+    worker::{
+        LocalActivitySlotKind,
+        workflow::{HeartbeatTimeoutMsg, LocalActivityNotification},
+    },
 };
 use futures_util::{
     Stream, StreamExt, future, future::AbortRegistration, stream, stream::BoxStream,
@@ -41,6 +44,7 @@ use tokio::{
 };
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tokio_util::sync::CancellationToken;
+use tracing::Span;
 
 #[allow(clippy::large_enum_variant)] // Timeouts are relatively rare
 #[derive(Debug)]
@@ -51,12 +55,26 @@ pub(crate) enum NextPendingLAAction {
     Autocomplete(LACompleteAction),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CancelDelivery {
+    NotRequested,
+    Queued,
+    Delivered,
+}
+
 #[derive(Debug)]
 struct LocalInFlightActInfo {
     la_info: NewLocalAct,
     dispatch_time: Instant,
     attempt: u32,
+    cancel: CancelDelivery,
     _permit: UsedMeteredSemPermit<LocalActivitySlotKind>,
+}
+
+impl LocalInFlightActInfo {
+    fn has_undelivered_cancel(&self, run_id: &str) -> bool {
+        self.la_info.workflow_exec_info.run_id == run_id && self.cancel == CancelDelivery::Queued
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -138,6 +156,9 @@ impl Debug for NewLocalAct {
 pub(crate) enum LocalActRequest {
     New(NewLocalAct),
     Cancel(ExecutingLAId),
+    /// Cancel every local activity of a run that is terminating or being evicted. Unlike `Cancel`,
+    /// this never yields an immediate resolution: the run cannot use one, and applying it would
+    /// activate lang with a cancellation the eviction or completion itself caused.
     #[from(ignore)]
     CancelAllInRun(String),
     #[from(ignore)]
@@ -166,10 +187,10 @@ pub(crate) struct LocalActivityManager {
     act_req_tx: UnboundedSender<NewOrRetry>,
     /// Cancels need a different queue since they should be taken first, and don't take a permit
     cancels_req_tx: UnboundedSender<CancelOrTimeout>,
-    /// For the emission of heartbeat timeouts, back into the workflow machines. This channel
-    /// needs to come in from above us, because we cannot rely on callers getting the next
-    /// activation as a way to deliver heartbeats.
-    heartbeat_timeout_tx: UnboundedSender<HeartbeatTimeoutMsg>,
+    /// For the emission of heartbeat timeouts and cancel delivery notices, back into the workflow
+    /// machines. This channel needs to come in from above us, because we cannot rely on callers
+    /// getting the next activation as a way to deliver them.
+    workflow_notify_tx: UnboundedSender<LocalActivityNotification>,
     /// Wakes every time a complete is processed
     complete_notify: Notify,
     /// Set once workflows have finished shutting down, and thus we know we will no longer receive
@@ -219,7 +240,7 @@ impl LocalActivityManager {
     pub(crate) fn new(
         namespace: String,
         permit_dealer: MeteredPermitDealer<LocalActivitySlotKind>,
-        heartbeat_timeout_tx: UnboundedSender<HeartbeatTimeoutMsg>,
+        workflow_notify_tx: UnboundedSender<LocalActivityNotification>,
         metrics_context: MetricsContext,
     ) -> Self {
         let (act_req_tx, act_req_rx) = unbounded_channel();
@@ -235,7 +256,7 @@ impl LocalActivityManager {
             )),
             act_req_tx,
             cancels_req_tx,
-            heartbeat_timeout_tx,
+            workflow_notify_tx,
             complete_notify: Notify::new(),
             shutdown_complete_tok,
             dat: Mutex::new(LAMData {
@@ -250,12 +271,19 @@ impl LocalActivityManager {
 
     #[cfg(test)]
     fn test(max_concurrent: usize) -> Self {
+        Self::test_with_notifications(max_concurrent).0
+    }
+
+    #[cfg(test)]
+    fn test_with_notifications(
+        max_concurrent: usize,
+    ) -> (Self, UnboundedReceiver<LocalActivityNotification>) {
         use crate::worker::tuner::FixedSizeSlotSupplier;
         use std::sync::Arc;
 
         let ss = Arc::new(FixedSizeSlotSupplier::new(max_concurrent));
-        let (hb_tx, _hb_rx) = unbounded_channel();
-        Self::new(
+        let (notify_tx, notify_rx) = unbounded_channel();
+        let lam = Self::new(
             "fake_ns".to_string(),
             MeteredPermitDealer::new(
                 ss,
@@ -264,9 +292,10 @@ impl LocalActivityManager {
                 Arc::new(Default::default()),
                 None,
             ),
-            hb_tx,
+            notify_tx,
             MetricsContext::no_op(),
-        )
+        );
+        (lam, notify_rx)
     }
 
     #[cfg(test)]
@@ -344,11 +373,12 @@ impl LocalActivityManager {
                     deadline,
                     abort_reg,
                 } => {
-                    let chan = self.heartbeat_timeout_tx.clone();
+                    let chan = self.workflow_notify_tx.clone();
                     tokio::spawn(future::Abortable::new(
                         async move {
                             tokio::time::sleep_until(deadline.into()).await;
-                            let _ = chan.send(send_on_elapse);
+                            let _ = chan
+                                .send(LocalActivityNotification::HeartbeatTimeout(send_on_elapse));
                         },
                         abort_reg,
                     ));
@@ -356,30 +386,70 @@ impl LocalActivityManager {
                 LocalActRequest::Cancel(id) => {
                     debug!(id=?id, "Cancelling local activity");
                     let mut dlock = self.dat.lock();
-                    if let Some(lai) = dlock.la_info.get_mut(&id)
-                        && let Some(immediate_res) = self.cancel_one_la(id.seq_num, lai)
-                    {
-                        immediate_resolutions.push(immediate_res);
+                    let LAMData {
+                        la_info,
+                        outstanding_activity_tasks,
+                        ..
+                    } = &mut *dlock;
+                    let mut removed = false;
+                    if let Entry::Occupied(mut o) = la_info.entry(id) {
+                        let seq = o.key().seq_num;
+                        let (remove, res) =
+                            self.cancel_one_la(seq, o.get_mut(), outstanding_activity_tasks);
+                        immediate_resolutions.extend(res);
+                        if remove {
+                            o.remove();
+                            removed = true;
+                        }
+                    }
+                    if removed {
+                        // A never-dispatched LA disappearing can be the last thing a shutdown
+                        // parked in `wait_all_outstanding_tasks_finished` is waiting on
+                        self.set_shutdown_complete_if_ready(&mut dlock);
+                        self.complete_notify.notify_one();
                     }
                 }
                 LocalActRequest::CancelAllInRun(run_id) => {
                     debug!(run_id=%run_id, "Cancelling all local activities for run");
                     let mut dlock = self.dat.lock();
+                    let LAMData {
+                        la_info,
+                        outstanding_activity_tasks,
+                        ..
+                    } = &mut *dlock;
                     // Even if we've got 100k+ LAs this should only take a ms or two. Not worth
                     // adding another map to keep in sync.
-                    let las_for_run = dlock
-                        .la_info
-                        .iter_mut()
-                        .filter(|(id, _)| id.run_id == run_id);
-                    for (laid, lainf) in las_for_run {
-                        if let Some(immediate_res) = self.cancel_one_la(laid.seq_num, lainf) {
-                            immediate_resolutions.push(immediate_res);
+                    let before = la_info.len();
+                    la_info.retain(|id, lai| {
+                        if id.run_id != run_id {
+                            return true;
                         }
+                        // Resolutions for attempts that were backing off or never dispatched are
+                        // dropped here, see the variant's docs
+                        let (remove, _) =
+                            self.cancel_one_la(id.seq_num, lai, outstanding_activity_tasks);
+                        !remove
+                    });
+                    if la_info.len() != before {
+                        self.set_shutdown_complete_if_ready(&mut dlock);
+                        self.complete_notify.notify_one();
                     }
                 }
                 LocalActRequest::InvalidateRun(run_id) => {
                     debug!(run_id=%run_id, "Invalidating all local activities for run");
                     let mut dlock = self.dat.lock();
+                    // Evictions are withheld until every queued cancel for the run has been
+                    // polled, so a queued one here means a cancel is about to be lost
+                    if dlock
+                        .outstanding_activity_tasks
+                        .values()
+                        .any(|info| info.has_undelivered_cancel(&run_id))
+                    {
+                        dbg_panic!(
+                            "Run {run_id} invalidated while a local activity cancel for it was \
+                             still queued"
+                        );
+                    }
                     dlock
                         .outstanding_activity_tasks
                         .retain(|_, info| info.la_info.workflow_exec_info.run_id != run_id);
@@ -394,6 +464,8 @@ impl LocalActivityManager {
                         }
                     });
                     self.set_shutdown_complete_if_ready(&mut dlock);
+                    // Invalidation can empty the outstanding set, which a parked shutdown waits on
+                    self.complete_notify.notify_one();
                 }
                 LocalActRequest::IndicateWorkflowTaskCompleted(run_id) => {
                     let mut dlock = self.dat.lock();
@@ -417,14 +489,24 @@ impl LocalActivityManager {
         loop {
             let (new_or_retry, permit) = match self.rcvs.lock().await.next().await? {
                 NewOrCancel::Cancel(c) => match c {
-                    CancelOrTimeout::Cancel(c) => {
-                        if self
+                    CancelOrTimeout::Cancel(task) => {
+                        let run_id = self
                             .dat
                             .lock()
                             .outstanding_activity_tasks
-                            .contains_key(c.task_token.as_slice())
-                        {
-                            return Some(NextPendingLAAction::Dispatch(c));
+                            .get_mut(task.task_token.as_slice())
+                            .map(|info| {
+                                info.cancel = CancelDelivery::Delivered;
+                                info.la_info.workflow_exec_info.run_id.clone()
+                            });
+                        if let Some(run_id) = run_id {
+                            let _ = self.workflow_notify_tx.send(
+                                LocalActivityNotification::CancelProcessed {
+                                    run_id,
+                                    span: Span::current(),
+                                },
+                            );
+                            return Some(NextPendingLAAction::Dispatch(task));
                         }
                         // Don't dispatch cancels for things we've already stopped tracking
                         continue;
@@ -517,6 +599,7 @@ impl LocalActivityManager {
                     la_info: la_info_for_in_flight_map,
                     dispatch_time: Instant::now(),
                     attempt,
+                    cancel: CancelDelivery::NotRequested,
                     _permit: permit.into_used(LocalActivitySlotInfo {
                         activity_type: sa.activity_type.clone(),
                     }),
@@ -609,6 +692,11 @@ impl LocalActivityManager {
                 };
             }
 
+            // Like the server's RETRY_STATE_CANCEL_REQUESTED, cancellation stops retries without
+            // replacing the result the activity reports. Waiting for delivery would let a failure
+            // race past an already-processed cancellation request. Retrying could also strand an
+            // eviction: WillBeRetried never reaches the workflow to re-evaluate withheld eviction.
+            let cancel_requested = info.cancel != CancelDelivery::NotRequested;
             let mut is_timeout = false;
             let runtime = info.dispatch_time.elapsed();
             la_metrics.la_exec_latency(runtime);
@@ -619,8 +707,12 @@ impl LocalActivityManager {
                             .with_new_attrs([failure_reason(fail.cause().into())])
                             .la_execution_failed()
                     }
-                    Outcome::FailurePath {
-                        backoff: calc_backoff!(fail),
+                    if cancel_requested {
+                        Outcome::JustReport
+                    } else {
+                        Outcome::FailurePath {
+                            backoff: calc_backoff!(fail),
+                        }
                     }
                 }
                 LocalActivityExecutionResult::TimedOut(fail) => {
@@ -629,7 +721,9 @@ impl LocalActivityManager {
                         .la_execution_failed();
                     is_timeout = true;
                     // Start to close timeouts are retryable, other timeout types aren't.
-                    if matches!(status.get_timeout_type(), Some(TimeoutType::StartToClose)) {
+                    if matches!(status.get_timeout_type(), Some(TimeoutType::StartToClose))
+                        && !cancel_requested
+                    {
                         Outcome::FailurePath {
                             backoff: calc_backoff!(fail),
                         }
@@ -795,6 +889,15 @@ impl LocalActivityManager {
             .sum()
     }
 
+    /// True while an in-flight attempt still needs its queued cancel handed to lang.
+    pub(crate) fn has_undelivered_cancels(&self, run_id: &str) -> bool {
+        self.dat
+            .lock()
+            .outstanding_activity_tasks
+            .values()
+            .any(|info| info.has_undelivered_cancel(run_id))
+    }
+
     fn set_shutdown_complete_if_ready(&self, dlock: &mut MutexGuard<LAMData>) -> bool {
         let nothing_pending = dlock.outstanding_activity_tasks.is_empty()
             && dlock.la_info.values().all(|info| !info.queued_for_dispatch);
@@ -804,35 +907,55 @@ impl LocalActivityManager {
         nothing_pending
     }
 
+    /// Cancels one local activity. Returns whether its `la_info` entry must be removed, and a
+    /// resolution to apply right away when lang is not holding an attempt that could report one.
     fn cancel_one_la(
         &self,
         seq: u32,
         lai: &mut LocalActivityInfo,
-    ) -> Option<LocalActivityResolution> {
-        // First check if this ID is currently backing off, if so abort the backoff
-        // task
+        outstanding: &mut HashMap<TaskToken, LocalInFlightActInfo>,
+    ) -> (bool, Option<LocalActivityResolution>) {
+        let cancelled_now = || LocalActivityResolution {
+            seq,
+            result: LocalActivityExecutionResult::empty_cancel(),
+            runtime: Duration::ZERO,
+            attempt: 0,
+            backoff: None,
+            original_schedule_time: None,
+        };
         if let Some(t) = lai.backing_off_task.take() {
             t.abort();
-            return Some(LocalActivityResolution {
-                seq,
-                result: LocalActivityExecutionResult::Cancelled(Cancellation::from_details(None)),
-                runtime: Duration::from_secs(0),
-                attempt: 0,
-                backoff: None,
-                original_schedule_time: None,
-            });
+            // Dropping the entry makes next_pending discard a retry request the backoff task may
+            // already have sent, which would otherwise start an attempt no cancel follows
+            return (true, Some(cancelled_now()));
         }
-
-        self.cancels_req_tx
-            .send(CancelOrTimeout::Cancel(ActivityTask::cancel_from_ids(
-                lai.task_token.clone().into_inner(),
-                ActivityCancelReason::Cancelled,
-                ActivityTask::primary_reason_to_cancellation_details(
-                    ActivityCancelReason::Cancelled,
-                ),
-            )))
-            .expect("Receive half of LA cancel channel cannot be dropped");
-        None
+        if let Some(in_flight) = outstanding.get_mut(&lai.task_token) {
+            // Lang reports the result of an attempt it holds, and one cancel task per attempt is
+            // enough: CancelAllInRun is re-sunk on every pass while a run is evicting, and the
+            // eviction waits on queued cancels, so re-queueing would hold it back indefinitely
+            if in_flight.cancel == CancelDelivery::NotRequested {
+                self.cancels_req_tx
+                    .send(CancelOrTimeout::Cancel(ActivityTask::cancel_from_ids(
+                        lai.task_token.clone().into_inner(),
+                        ActivityCancelReason::Cancelled,
+                        ActivityTask::primary_reason_to_cancellation_details(
+                            ActivityCancelReason::Cancelled,
+                        ),
+                    )))
+                    .expect("Receive half of LA cancel channel cannot be dropped");
+                in_flight.cancel = CancelDelivery::Queued;
+            }
+            return (false, None);
+        }
+        if lai.queued_for_dispatch {
+            // The start request is still in the dispatch channel. Cancel tasks are only matched
+            // against dispatched attempts, so rather than queueing one the entry is dropped, which
+            // makes next_pending discard the start when it reaches it.
+            return (true, Some(cancelled_now()));
+        }
+        // Anything else already resolved without lang's involvement (ex: a schedule-to-start
+        // timeout) and merely left its entry behind; a second resolution would be ignored anyway
+        (true, None)
     }
 }
 
@@ -1013,6 +1136,7 @@ impl Drop for TimeoutBag {
 mod tests {
     use super::*;
     use crate::{prost_dur, protosext::LACloseTimeouts, retry_logic::ValidatedRetryPolicy};
+    use futures_util::FutureExt;
     use temporalio_common::protos::temporal::api::{
         common::v1::RetryPolicy,
         failure::v1::{ApplicationFailureInfo, Failure, failure::FailureInfo},
@@ -1218,6 +1342,175 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn duplicate_cancel_requests_queue_one_cancel_and_report_delivery() {
+        let (lam, mut notify_rx) = LocalActivityManager::test_with_notifications(5);
+        lam.enqueue([NewLocalAct {
+            schedule_cmd: ValidScheduleLA {
+                seq: 1,
+                activity_id: 1.to_string(),
+                ..Default::default()
+            },
+            workflow_type: "".to_string(),
+            workflow_exec_info: WorkflowExecution {
+                workflow_id: "".to_string(),
+                run_id: "run_id".to_string(),
+            },
+            schedule_time: SystemTime::now(),
+        }
+        .into()]);
+        let start = lam.next_pending().await.unwrap().unwrap();
+        assert!(!lam.has_undelivered_cancels("run_id"));
+
+        let immediate_res = lam.enqueue([
+            LocalActRequest::CancelAllInRun("run_id".to_string()),
+            LocalActRequest::CancelAllInRun("run_id".to_string()),
+            LocalActRequest::Cancel(ExecutingLAId {
+                run_id: "run_id".to_string(),
+                seq_num: 1,
+            }),
+        ]);
+        assert!(immediate_res.is_empty());
+        assert!(lam.has_undelivered_cancels("run_id"));
+        assert!(notify_rx.try_recv().is_err());
+
+        let cancel = lam.next_pending().await.unwrap().unwrap();
+        assert_eq!(cancel.task_token, start.task_token);
+        assert_matches!(cancel.variant, Some(activity_task::Variant::Cancel(_)));
+        assert!(!lam.has_undelivered_cancels("run_id"));
+        assert_matches!(
+            notify_rx.try_recv(),
+            Ok(LocalActivityNotification::CancelProcessed { run_id, .. }) if run_id == "run_id"
+        );
+        // Three cancel requests must have produced exactly one cancel task
+        assert!(lam.next_pending().now_or_never().is_none());
+
+        lam.enqueue([LocalActRequest::InvalidateRun("run_id".to_string())]);
+        assert_eq!(lam.num_outstanding(), 0);
+    }
+
+    #[tokio::test]
+    async fn cancel_all_in_run_drops_la_not_yet_dispatched() {
+        let lam = LocalActivityManager::test(1);
+        let new_la = |seq: u32, run_id: &str| NewLocalAct {
+            schedule_cmd: ValidScheduleLA {
+                seq,
+                activity_id: seq.to_string(),
+                ..Default::default()
+            },
+            workflow_type: "".to_string(),
+            workflow_exec_info: WorkflowExecution {
+                workflow_id: "".to_string(),
+                run_id: run_id.to_string(),
+            },
+            schedule_time: SystemTime::now(),
+        };
+        lam.enqueue([new_la(1, "run_id").into(), new_la(2, "run_id").into()]);
+        // Holds the only permit, so the second LA stays queued behind it
+        let start = lam.next_pending().await.unwrap().unwrap();
+        assert_matches!(
+            &start.variant,
+            Some(activity_task::Variant::Start(Start { activity_id, .. })) if activity_id == "1"
+        );
+
+        let immediate_res = lam.enqueue([LocalActRequest::CancelAllInRun("run_id".to_string())]);
+        assert!(immediate_res.is_empty());
+        // The never-dispatched LA is forgotten outright rather than resolved
+        assert_eq!(lam.dat.lock().la_info.len(), 1);
+        let cancel = lam.next_pending().await.unwrap().unwrap();
+        assert_eq!(cancel.task_token, start.task_token);
+        assert_matches!(cancel.variant, Some(activity_task::Variant::Cancel(_)));
+        assert_matches!(
+            lam.complete(
+                &start.task_token.into(),
+                LocalActivityExecutionResult::empty_cancel()
+            ),
+            LACompleteAction::Report { .. }
+        );
+
+        // The queued start for seq 2 is discarded when popped, so the next dispatch is the other
+        // run's LA enqueued behind it
+        lam.enqueue([new_la(1, "other_run").into()]);
+        let next = lam.next_pending().await.unwrap().unwrap();
+        assert_matches!(
+            next.variant,
+            Some(activity_task::Variant::Start(Start {
+                workflow_execution: Some(WorkflowExecution { run_id, .. }),
+                ..
+            })) if run_id == "other_run"
+        );
+        assert_eq!(lam.num_outstanding(), 1);
+        assert_eq!(lam.dat.lock().la_info.len(), 1);
+    }
+
+    #[rstest::rstest]
+    #[case::ordinary_cancel(false)]
+    #[case::eviction(true)]
+    #[tokio::test]
+    async fn cancelled_attempt_is_not_retried_locally(
+        #[case] evicting: bool,
+        #[values(false, true)] poll_cancel: bool,
+        #[values(
+            LocalActivityExecutionResult::Failed(Default::default()),
+            LocalActivityExecutionResult::timeout(TimeoutType::StartToClose)
+        )]
+        result: LocalActivityExecutionResult,
+    ) {
+        let lam = LocalActivityManager::test(1);
+        lam.enqueue([NewLocalAct {
+            schedule_cmd: ValidScheduleLA {
+                seq: 1,
+                activity_id: 1.to_string(),
+                retry_policy: ValidatedRetryPolicy::from_proto_with_defaults(RetryPolicy {
+                    initial_interval: Some(prost_dur!(from_millis(1))),
+                    backoff_coefficient: 1.0,
+                    maximum_attempts: 10,
+                    ..Default::default()
+                }),
+                local_retry_threshold: Duration::from_secs(500),
+                ..Default::default()
+            },
+            workflow_type: "".to_string(),
+            workflow_exec_info: WorkflowExecution {
+                workflow_id: "".to_string(),
+                run_id: "run_id".to_string(),
+            },
+            schedule_time: SystemTime::now(),
+        }
+        .into()]);
+        let start = lam.next_pending().await.unwrap().unwrap();
+        let cancel_request = if evicting {
+            LocalActRequest::CancelAllInRun("run_id".to_string())
+        } else {
+            LocalActRequest::Cancel(ExecutingLAId {
+                run_id: "run_id".to_string(),
+                seq_num: 1,
+            })
+        };
+        lam.enqueue([cancel_request]);
+        if poll_cancel {
+            let cancel = lam.next_pending().await.unwrap().unwrap();
+            assert_matches!(cancel.variant, Some(activity_task::Variant::Cancel(_)));
+        }
+
+        // Without the cancel this result would be retried after a local backoff.
+        let expected_variant = std::mem::discriminant(&result);
+        let res = lam.complete(&start.task_token.into(), result);
+        assert_matches!(
+            res,
+            LACompleteAction::Report {
+                resolution: LocalActivityResolution {
+                    backoff: None,
+                    result: reported_result,
+                    ..
+                },
+                ..
+            } if std::mem::discriminant(&reported_result) == expected_variant
+        );
+        assert_eq!(lam.num_in_backoff(), 0);
+        assert_eq!(lam.num_outstanding(), 0);
+    }
+
+    #[tokio::test]
     async fn respects_timer_backoff_threshold() {
         let lam = LocalActivityManager::test(1);
         lam.enqueue([NewLocalAct {
@@ -1344,6 +1637,9 @@ mod tests {
             immediate_res[0].result,
             LocalActivityExecutionResult::Cancelled { .. }
         );
+        // Removing the entry is what makes a retry request already sent by the backoff task get
+        // dropped instead of dispatched
+        assert!(lam.dat.lock().la_info.is_empty());
     }
 
     #[tokio::test]
