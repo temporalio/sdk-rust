@@ -79,6 +79,8 @@ fn core_update_through_preparation_and_publishing() {
     );
     let old = core.commit();
     let parent = core_parent(&core, &old);
+    git(&parent.root, &["tag", "-d", "1.0.0"]).unwrap();
+    git(&parent.root, &["tag", "v1.0.0"]).unwrap();
     core.write(path, "# Changelog\n\n## Unreleased\n\n### Fixed\n- Existing fix.\n* A new fix with\n  a [link](https://example.com).\n* Another new fix.\n\n### Breaking Changes\n- A breaking change.\n");
     core.commit();
     core.write(path, "# Changelog\n\n## Unreleased\n\n## [1.0.0] - 2026-10-02\n\n### Fixed\n- Existing fix.\n* A new fix with\n  a [link](https://example.com).\n* Another new fix.\n\n### Breaking Changes\n- A breaking change.\n");
@@ -663,6 +665,37 @@ fn range_notes_survive_fragment_migration_and_assembly() {
         1
     );
     assert!(!notes.contains("- Old feature."));
+}
+
+#[test]
+fn selects_previous_release_from_numeric_and_v_prefixed_tags() {
+    let repo = Repo::new();
+    repo.write("README.md", "Release tags\n");
+    repo.commit();
+    for tag in [
+        "1.8.0",
+        "v1.9.0",
+        "v1.10.0",
+        "1.11.0",
+        "v1.12.0",
+        "core-v99.0.0",
+        "vv99.0.0",
+    ] {
+        git(&repo.root, &["tag", tag]).unwrap();
+    }
+    assert_eq!(
+        previous_release_tag(&repo.root, "1.10.0").unwrap(),
+        "v1.9.0"
+    );
+    assert_eq!(
+        previous_release_tag(&repo.root, "1.11.0").unwrap(),
+        "v1.10.0"
+    );
+    assert_eq!(
+        previous_release_tag(&repo.root, "v1.12.0").unwrap(),
+        "1.11.0"
+    );
+    assert!(previous_release_tag(&repo.root, "1.8.0").is_err());
 }
 
 #[test]

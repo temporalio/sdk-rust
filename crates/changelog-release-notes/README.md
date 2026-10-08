@@ -47,13 +47,15 @@ Commands:
   appends Core commit links under `### SDK Core Commits` when the range is nonempty.
   It never collects Core changelog entries at release time. Core revisions come
   from the parent repository's Git links; the default baseline is the greatest
-  numeric release tag below the version. Other tag conventions can pass `--from`.
+  numeric release tag below the version, accepting an optional `v` prefix
+  (for example, `1.9.0` or `v1.9.0`). Other tag conventions can pass `--from`.
   Output goes to stdout unless a file is supplied. Relative output paths resolve
   against `--repo`; absolute output paths are also supported.
 * `core-notes --version <version> --submodule <path> [--from <tag> --to HEAD]`
   resolves Core revisions from the parent repository's Git links and produces
   the existing Core changelog/commit notes. Without `--from`, it selects the
-  greatest numeric release tag below the requested version. SDKs with other tag
+  greatest numeric release tag below the requested version, with or without a `v`
+  prefix. SDKs with other tag
   conventions should pass their previous tag explicitly.
 
 Changelog and fragment paths are relative to `--repo`. Fragments are `.md` files

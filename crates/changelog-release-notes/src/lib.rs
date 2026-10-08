@@ -342,6 +342,7 @@ pub fn check_fragments(
 }
 
 fn numeric_version(value: &str) -> Option<Vec<u64>> {
+    let value = value.strip_prefix('v').unwrap_or(value);
     let prefix = value
         .split(|c: char| !c.is_ascii_digit() && c != '.')
         .next()?;
