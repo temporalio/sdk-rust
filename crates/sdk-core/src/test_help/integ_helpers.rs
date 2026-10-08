@@ -216,6 +216,7 @@ pub fn mock_worker(mocks: MocksHolder) -> Worker {
         mocks.client,
         TaskPollers::Mocked {
             wft_stream: mocks.inputs.wft_stream,
+            drain_wft_stream: mocks.inputs.drain_wft_stream,
             act_poller,
             nexus_poller,
         },
@@ -284,6 +285,7 @@ impl MocksHolder {
 }
 
 pub struct MockWorkerInputs {
+    pub(crate) drain_wft_stream: bool,
     pub(crate) wft_stream: Option<BoxStream<'static, Result<ValidPollWFTQResponse, tonic::Status>>>,
     pub(crate) act_poller: Option<BoxedPoller<PollActivityTaskQueueResponse>>,
     pub(crate) nexus_poller: Option<BoxedPoller<PollNexusTaskQueueResponse>>,
@@ -302,6 +304,7 @@ impl MockWorkerInputs {
     ) -> Self {
         Self {
             wft_stream: Some(wft_stream),
+            drain_wft_stream: false,
             act_poller: None,
             nexus_poller: None,
             config: test_worker_cfg().build().unwrap(),
@@ -334,6 +337,7 @@ impl MocksHolder {
         let mock_act_poller = mock_poller_from_resps(act_tasks);
         let mock_worker = MockWorkerInputs {
             wft_stream: None,
+            drain_wft_stream: false,
             act_poller: Some(mock_act_poller),
             nexus_poller: None,
             config: test_worker_cfg().build().unwrap(),
@@ -358,6 +362,7 @@ impl MocksHolder {
         let mock_nexus_poller = mock_poller_from_resps(nexus_tasks);
         let mock_worker = MockWorkerInputs {
             wft_stream: None,
+            drain_wft_stream: false,
             act_poller: None,
             nexus_poller: Some(mock_nexus_poller),
             config: test_worker_cfg().build().unwrap(),
@@ -394,6 +399,7 @@ impl MocksHolder {
         let nexus_poller = nexus_tasks.map(|tasks| mock_poller_from_resps(tasks));
 
         let mock_worker = MockWorkerInputs {
+            drain_wft_stream: false,
             wft_stream,
             act_poller,
             nexus_poller,
@@ -421,6 +427,7 @@ impl MocksHolder {
                 .boxed(),
         );
         let mock_worker = MockWorkerInputs {
+            drain_wft_stream: false,
             wft_stream,
             act_poller: None,
             nexus_poller: None,

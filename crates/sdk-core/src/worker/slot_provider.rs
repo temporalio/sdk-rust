@@ -7,6 +7,7 @@ use crate::{
     protosext::ValidPollWFTQResponse,
     worker::{WorkflowSlotKind, workflow::wft_poller::validate_wft},
 };
+use parking_lot::Mutex;
 use temporalio_client::worker::Slot as SlotTrait;
 use temporalio_common::{
     protos::temporal::api::workflowservice::v1::PollWorkflowTaskQueueResponse,
@@ -59,7 +60,7 @@ pub(super) struct SlotProvider {
     namespace: String,
     task_queue: String,
     wft_semaphore: MeteredPermitDealer<WorkflowSlotKind>,
-    external_wft_tx: WFTStreamSender,
+    external_wft_tx: Mutex<Option<WFTStreamSender>>,
     deployment_options: Option<WorkerDeploymentOptions>,
 }
 
@@ -75,7 +76,7 @@ impl SlotProvider {
             namespace,
             task_queue,
             wft_semaphore,
-            external_wft_tx,
+            external_wft_tx: Mutex::new(Some(external_wft_tx)),
             deployment_options,
         }
     }
@@ -86,10 +87,15 @@ impl SlotProvider {
         &self.task_queue
     }
     pub(super) fn try_reserve_wft_slot(&self) -> Option<Box<dyn SlotTrait + Send>> {
+        let sender = self.external_wft_tx.lock().as_ref()?.clone();
         match self.wft_semaphore.try_acquire_owned().ok() {
-            Some(permit) => Some(Box::new(Slot::new(permit, self.external_wft_tx.clone()))),
+            Some(permit) => Some(Box::new(Slot::new(permit, sender))),
             None => None,
         }
+    }
+    pub(super) fn shutdown(&self) {
+        // Reserved slots retain senders until their already-started requests finish.
+        self.external_wft_tx.lock().take();
     }
     pub(super) fn deployment_options(&self) -> Option<WorkerDeploymentOptions> {
         self.deployment_options.clone()
@@ -157,6 +163,41 @@ mod tests {
             assert!(provider.try_reserve_wft_slot().is_some());
         }
         assert!(external_wft_rx.recv().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn shutdown_drains_reserved_eager_slots() {
+        let slots = fixed_size_permit_dealer(2);
+        let (tx, mut rx) = unbounded_channel();
+        let provider = SlotProvider::new("ns".into(), "queue".into(), slots.clone(), tx, None);
+        let completing = provider.try_reserve_wft_slot().unwrap();
+        let cancelled = provider.try_reserve_wft_slot().unwrap();
+        provider.shutdown();
+        provider.shutdown();
+        assert!(provider.try_reserve_wft_slot().is_none());
+        completing.schedule_wft(new_validatable_response()).unwrap();
+        assert!(rx.recv().await.is_some());
+        assert!(matches!(
+            rx.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
+        drop(cancelled);
+        assert!(rx.recv().await.is_none());
+        assert_eq!(slots.available_permits(), Some(2));
+    }
+
+    #[tokio::test]
+    async fn shutdown_closes_idle_eager_provider() {
+        let (tx, mut rx) = unbounded_channel();
+        let provider = SlotProvider::new(
+            "ns".into(),
+            "queue".into(),
+            fixed_size_permit_dealer(2),
+            tx,
+            None,
+        );
+        provider.shutdown();
+        assert!(rx.recv().await.is_none());
     }
 
     #[tokio::test]
