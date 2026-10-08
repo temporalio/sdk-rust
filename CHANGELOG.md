@@ -47,6 +47,9 @@ relevant information.
   or completes while the local activity is backing off between retries.
 * Evicting a workflow while some local activities are still running now preserves results already
   delivered to workflow code, rather than panicking or losing those results.
+### Added
+* `Worker::run_until` runs a worker until a supplied future completes, then initiates shutdown and
+  waits for shutdown to finish.
 
 ## [1.1.0] - 2026-10-06
 

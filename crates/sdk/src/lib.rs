@@ -1052,6 +1052,25 @@ impl Worker {
         .await
     }
 
+    /// Runs the worker, initiating shutdown when `shutdown` completes.
+    ///
+    /// After shutdown is initiated, waits for the worker to finish shutting down and returns the
+    /// result of [`Worker::run`]. The output of `shutdown` is ignored. If the worker finishes first,
+    /// returns its result immediately and drops `shutdown`.
+    pub async fn run_until(&mut self, shutdown: impl Future) -> Result<(), WorkerRunError> {
+        let shutdown_handle = self.shutdown_handle();
+        let run = self.run();
+        tokio::pin!(run);
+
+        tokio::select! {
+            result = &mut run => result,
+            _ = shutdown => {
+                shutdown_handle();
+                run.await
+            }
+        }
+    }
+
     pub(crate) async fn run_inner(&mut self) -> Result<(), WorkerRunError> {
         // Perform the namespace check-in so poller behavior (e.g. autoscaling auto-enroll) is
         // resolved before any polling begins.
@@ -1623,8 +1642,11 @@ impl PrintablePanicType for EndPrintingAttempts {
 mod tests {
     use super::*;
     use crate::{activities::ActivityError, workflow_interceptors::WorkflowInterceptor};
-    use futures_util::future::BoxFuture;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use futures_util::{Stream, future::BoxFuture, stream};
+    use std::{
+        cell::Cell,
+        sync::atomic::{AtomicBool, AtomicUsize, Ordering},
+    };
     use temporalio_common::{
         data_converters::{
             DefaultFailureConverter, PayloadCodec, PayloadConversionError, PayloadConverter,
@@ -1636,6 +1658,129 @@ mod tests {
         },
     };
     use temporalio_macros::{activities, activity_definitions, workflow, workflow_methods};
+    use temporalio_sdk_core::{
+        init_replay_worker,
+        replay::{HistoryForReplay, ReplayWorkerInput},
+    };
+
+    #[derive(Default)]
+    struct RunUntilObserver {
+        started: Notify,
+        finished: AtomicBool,
+        shutdown: AtomicBool,
+        fail_run: bool,
+    }
+
+    #[async_trait::async_trait(?Send)]
+    impl WorkerInterceptor for RunUntilObserver {
+        fn run_worker<'a>(
+            &'a self,
+            input: RunWorkerInput<'a>,
+            next: Next<'a, RunWorkerInput<'a>, LocalBoxFuture<'a, Result<(), WorkerRunError>>>,
+        ) -> LocalBoxFuture<'a, Result<(), WorkerRunError>> {
+            Box::pin(async move {
+                self.started.notify_one();
+                let result = if self.fail_run {
+                    Err(WorkerRunError::Fatal {
+                        message: "run failed".to_owned(),
+                        source: anyhow!("test failure").into_boxed_dyn_error(),
+                    })
+                } else {
+                    next.run(input).await
+                };
+                self.finished.store(true, Ordering::SeqCst);
+                result
+            })
+        }
+
+        fn on_shutdown(&self, _: &Worker) {
+            self.shutdown.store(true, Ordering::SeqCst);
+        }
+    }
+
+    fn run_until_test_worker(
+        histories: impl Stream<Item = HistoryForReplay> + Send + 'static,
+        observer: Arc<RunUntilObserver>,
+    ) -> Worker {
+        let mut options = WorkerOptions::new("run_until_test")
+            .register_workflow::<OtherWorkflow>()
+            .unwrap()
+            .build();
+        options.worker_interceptors.push(observer);
+        let core_options = options
+            .to_core_options("test_namespace".to_owned(), String::new())
+            .unwrap();
+        let core = init_replay_worker(ReplayWorkerInput::new(core_options, histories)).unwrap();
+        Worker::new_from_core_options_prepared(
+            Arc::new(core),
+            ClientOptions::new("test_namespace").build(),
+            options,
+        )
+        .unwrap()
+    }
+
+    #[rstest::rstest]
+    #[case::ready(true)]
+    #[case::after_run_starts(false)]
+    #[tokio::test]
+    async fn run_until_waits_for_shutdown_to_finish(#[case] ready: bool) {
+        let observer = Arc::new(RunUntilObserver::default());
+        let mut worker = run_until_test_worker(stream::pending(), observer.clone());
+        let signal_completed = Cell::new(false);
+
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            worker.run_until(async {
+                if !ready {
+                    observer.started.notified().await;
+                }
+                signal_completed.set(true);
+                Err::<(), _>("shutdown signal output is ignored")
+            }),
+        )
+        .await
+        .expect("worker should finish shutting down")
+        .unwrap();
+
+        assert!(signal_completed.get());
+        assert!(observer.shutdown.load(Ordering::SeqCst));
+        assert!(observer.finished.load(Ordering::SeqCst));
+    }
+
+    #[rstest::rstest]
+    #[case::success(false)]
+    #[case::error(true)]
+    #[tokio::test]
+    async fn run_until_returns_when_worker_finishes_first(#[case] fail_run: bool) {
+        let observer = Arc::new(RunUntilObserver {
+            fail_run,
+            ..Default::default()
+        });
+        let mut worker = run_until_test_worker(stream::empty(), observer.clone());
+        let signal_dropped = CancellationToken::new();
+        let drop_guard = signal_dropped.clone().drop_guard();
+        let result = tokio::time::timeout(
+            Duration::from_secs(10),
+            worker.run_until(async move {
+                let _drop_guard = drop_guard;
+                std::future::pending::<()>().await;
+            }),
+        )
+        .await
+        .expect("worker result should not wait for the shutdown signal");
+
+        if fail_run {
+            assert!(
+                matches!(result, Err(WorkerRunError::Fatal { message, .. }) if message == "run failed")
+            );
+            worker.common.worker.shutdown().await;
+        } else {
+            result.unwrap();
+            assert!(observer.shutdown.load(Ordering::SeqCst));
+        }
+        assert!(observer.finished.load(Ordering::SeqCst));
+        assert!(signal_dropped.is_cancelled());
+    }
 
     #[derive(Default)]
     struct FailingEncodeCodec {
