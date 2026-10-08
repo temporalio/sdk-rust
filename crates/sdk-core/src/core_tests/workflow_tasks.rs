@@ -40,7 +40,7 @@ use temporalio_common::{
                 self as ar, ActivityExecutionResult, ActivityResolution, activity_resolution,
             },
             activity_task::{ActivityCancelReason, Cancel, activity_task},
-            common::VersioningIntent,
+            common::{VersioningIntent, extract_local_activity_marker_details},
             workflow_activation::{
                 FireTimer, InitializeWorkflow, ResolveActivity, UpdateRandomSeed,
                 WorkflowActivationJob, remove_from_cache::EvictionReason, workflow_activation_job,
@@ -1674,6 +1674,129 @@ async fn la_cancel_delivered_before_eviction_activation() {
     .await
     .unwrap();
     assert_eq!(core.cached_workflows().await, 0);
+    assert_eq!(core.outstanding_workflow_tasks().await, 0);
+    drain_pollers_and_shutdown(&core).await;
+}
+
+#[rstest::rstest]
+#[case::before_heartbeat_deadline(false)]
+#[case::after_heartbeat_deadline(true)]
+#[tokio::test]
+async fn eviction_requested_during_activation_cancels_la_before_evicting(
+    #[case] cross_heartbeat_deadline: bool,
+) {
+    let mut mock_cfg = la_cancel_mock_cfg();
+    mock_cfg.num_expected_completions = Some(1.into());
+    mock_cfg.completion_mock_fn = Some(Box::new(|c| {
+        let [marker] = c.commands.as_slice() else {
+            panic!(
+                "Expected only the completed LA's marker, got {:?}",
+                c.commands
+            );
+        };
+        let Some(Attributes::RecordMarkerCommandAttributes(marker)) = &marker.attributes else {
+            panic!("Expected LA marker, got {marker:?}");
+        };
+        assert!(marker.failure.is_none());
+        let (metadata, result) = extract_local_activity_marker_details(&mut marker.details.clone());
+        let metadata = metadata.unwrap();
+        assert_eq!(metadata.seq, 1);
+        assert_eq!(metadata.activity_id, "1");
+        assert_eq!(metadata.activation_index, Some(1));
+        assert_eq!(result, Some(vec![1].into()));
+        assert!(c.force_create_new_workflow_task);
+        Ok(Default::default())
+    }));
+    let core = la_cancel_test_worker(mock_cfg, None);
+
+    let activation = core.poll_workflow_activation().await.unwrap();
+    let run_id = activation.run_id;
+    core.complete_workflow_activation(WorkflowActivationCompletion::from_cmds(
+        run_id.clone(),
+        vec![
+            la_cancel_test_cmd(1, ActivityCancellationType::WaitCancellationCompleted),
+            la_cancel_test_cmd(2, ActivityCancellationType::WaitCancellationCompleted),
+        ],
+    ))
+    .await
+    .unwrap();
+    let mut starts = HashMap::new();
+    for _ in 0..2 {
+        let task = core.poll_activity_task().await.unwrap();
+        let Some(activity_task::Variant::Start(start)) = &task.variant else {
+            panic!("Expected LA start, got {task:?}");
+        };
+        assert!(start.is_local);
+        starts.insert(start.activity_id.clone(), task.task_token);
+    }
+    let completed_token = starts.remove("1").unwrap();
+    let still_running_token = starts.remove("2").unwrap();
+
+    core.complete_activity_task(ActivityTaskCompletion {
+        task_token: completed_token,
+        result: Some(ActivityExecutionResult::ok(vec![1].into())),
+    })
+    .await
+    .unwrap();
+    let resolution_activation = core.poll_workflow_activation().await.unwrap();
+    assert_matches!(
+        resolution_activation.jobs.as_slice(),
+        [WorkflowActivationJob {
+            variant: Some(workflow_activation_job::Variant::ResolveActivity(
+                ResolveActivity { seq: 1, .. }
+            )),
+        }]
+    );
+
+    // The eviction request is processed while the resolution activation is still outstanding.
+    core.request_workflow_eviction(&run_id);
+    assert_eq!(core.cached_workflows().await, 1);
+    core.complete_workflow_activation(WorkflowActivationCompletion::empty(
+        resolution_activation.run_id,
+    ))
+    .await
+    .unwrap();
+
+    let wf_poll = core.poll_workflow_activation();
+    advance_fut!(wf_poll);
+    if cross_heartbeat_deadline {
+        // Crossing the heartbeat deadline while cancellation is undelivered must not reopen
+        // normal activation processing and allow an eviction-induced result into history.
+        time::pause();
+        time::advance(Duration::from_secs(50)).await;
+        let heartbeat_poll = wf_poll.as_mut();
+        advance_fut!(heartbeat_poll);
+        time::resume();
+    }
+    let cancel = core.poll_activity_task().await.unwrap();
+    assert_eq!(cancel.task_token, still_running_token);
+    assert_matches!(cancel.variant, Some(activity_task::Variant::Cancel(_)));
+
+    let eviction = wf_poll.await.unwrap();
+    assert_matches!(
+        eviction.jobs.as_slice(),
+        [WorkflowActivationJob {
+            variant: Some(workflow_activation_job::Variant::RemoveFromCache(rfc)),
+        }] if rfc.reason == EvictionReason::LangRequested as i32
+    );
+    // Cancellation can finish before lang acknowledges eviction. Its resolution must not
+    // leak into the buffered completion or become another activation for this run.
+    core.complete_activity_task(ActivityTaskCompletion {
+        task_token: cancel.task_token,
+        result: Some(ActivityExecutionResult::cancel_from_details(None)),
+    })
+    .await
+    .unwrap();
+    assert_eq!(core.cached_workflows().await, 1);
+    {
+        let wf_poll = core.poll_workflow_activation();
+        advance_fut!(wf_poll);
+        core.complete_workflow_activation(WorkflowActivationCompletion::empty(eviction.run_id))
+            .await
+            .unwrap();
+        assert_eq!(core.cached_workflows().await, 0);
+        advance_fut!(wf_poll);
+    }
     assert_eq!(core.outstanding_workflow_tasks().await, 0);
     drain_pollers_and_shutdown(&core).await;
 }
