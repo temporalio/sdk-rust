@@ -52,10 +52,11 @@ Commands:
   omitted, it selects the greatest numeric SDK release tag below the requested
   version, accepting an optional `v` prefix (for example, `1.9.0` or `v1.9.0`).
 
-  Without `--submodule`, `--from` is required. The command appends the SDK
-  repository's own commit links between `--from` and `--to` under `### Commits`
-  if there are any. Rust's publishing workflow passes its previous SDK release
-  tag (`v<version>`) as `--from`.
+  Without `--submodule`, the output contains only the completed changelog notes;
+  Git history is not read. `--from` and `--to` apply only with `--submodule`.
+  Rust's publishing workflow supplies this output to `gh release create` using
+  `--notes-file` alongside `--generate-notes`, so GitHub appends its generated
+  release summary.
 
   `--to` defaults to `HEAD`. Core changelog entries are imported by `update-core`
   and included in the prepared SDK changelog; this command extracts completed

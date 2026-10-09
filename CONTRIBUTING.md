@@ -106,12 +106,12 @@ over its existing `Unreleased` section. Review and commit the manifests, changel
 and fragment deletions together. If preparation fails after version updates,
 inspect the working tree before retrying.
 
-The Create Release workflow reads the completed SDK changelog section and appends
-repository commits with the shared `release-notes` command. To generate the same
-notes manually:
+The Create Release workflow reads the completed SDK changelog section with the
+shared `release-notes` command, then appends GitHub-generated notes using
+`gh release create --generate-notes`. To generate the changelog portion manually:
 
 ```bash
-cargo release-notes --version 1.2.0 --from v1.1.0 --output release-notes.md
+cargo release-notes --version 1.2.0 --output release-notes.md
 ```
 
 Fragments merged after preparation remain pending for the next release. Core
