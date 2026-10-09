@@ -61,21 +61,61 @@ Good pull requests are focused and easy to review:
 * Keep each pull request scoped to one logical change.
 * Include tests for behavior changes.
 * Update public API documentation or doc comments when public behavior changes.
-* Add a high-level changelog entry for user-facing changes, under the `## Unreleased`
-  heading. The two changelogs are split by audience: the repository-root `CHANGELOG.md`
-  serves users of the Rust SDK, and `crates/sdk-core/CHANGELOG.md` serves users of the
+* Add a high-level changelog entry for user-facing changes. The changelogs are split
+  by audience: fragments under `changelog/<category>/` serve users of the Rust SDK,
+  and the `## Unreleased` section of `crates/sdk-core/CHANGELOG.md` serves users of the
   other Temporal SDKs, whose workers and clients run on Core. The test is whether a user
   of that SDK can observe the change — behavior, an option they set, a log or metric, a
   different interaction with the server. Because the Rust SDK runs on Core too, a
   user-observable change in Core behavior normally belongs in both files; an internal Rust
   API change that a language SDK absorbs inside its own bridge is invisible to its users
   and belongs in neither. Write each entry from the perspective of the file's audience,
-  wording a change that goes in both files separately for each. The comment at the top of
-  either file lists the available headings.
+  wording a change that goes in both changelogs separately for each. See
+  [the fragment guide](changelog/README.md) for SDK categories and the comment at the
+  top of the Core changelog for its headings.
 * Describe what changed, why it changed, and what validation you ran.
 
 Run the relevant local checks when practical. CI must pass before a pull request can
 be merged.
+
+## Changelog Fragments
+
+Choose a fun, whimsical lowercase kebab-case filename for each Rust SDK fragment.
+Keep entries concise, ideally one or two sentences. Each nonempty line becomes one
+bullet; keep each entry on one line without a leading list marker. Use `stabilized/`
+when a feature is no longer experimental. Do not put pending entries in the root
+`CHANGELOG.md`. Run `cargo changelog-check` to validate fragments.
+
+PR CI accepts Rust SDK fragments or Core entries according to their audience. If
+both are changed, both checks run. Internal changes and release preparation PRs
+can use the `skip-changelog` label.
+
+## Preparing a Release
+
+Install the pinned `cargo-edit` with `mise install cargo:cargo-edit`, then run:
+
+```bash
+cargo prepare-release 1.2.0 0.11.0
+```
+
+The adapter validates both changelogs before changing versions. It updates SDK
+crate versions and the Core/Protos versions first, then invokes shared fragment
+preparation for the root `CHANGELOG.md`. Preparation creates a dated SDK section
+and consumes its fragments; empty releases are allowed. Core continues to turn
+over its existing `Unreleased` section. Review and commit the manifests, changelogs,
+and fragment deletions together. If preparation fails after version updates,
+inspect the working tree before retrying.
+
+The Create Release workflow reads the completed SDK changelog section with the
+shared `release-notes` command, then appends GitHub-generated notes using
+`gh release create --generate-notes`. To generate the changelog portion manually:
+
+```bash
+cargo release-notes --version 1.2.0 --output release-notes.md
+```
+
+Fragments merged after preparation remain pending for the next release. Core
+publishing retains its existing range-based notes.
 
 ## Things to Avoid
 
