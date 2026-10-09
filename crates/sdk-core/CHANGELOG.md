@@ -33,12 +33,14 @@ relevant information.
 
 ## Unreleased
 
+### Breaking Changes
+* Replay detects changes to the service or operation of scheduled Nexus operations, reporting
+  nondeterminism while retaining compatibility with histories recorded before these checks.
+
 ### Fixed
 * Worker heartbeats now report correct task-slot and poller counts when using buffered or custom
   metrics backends, including the Python SDK's `MetricBuffer`. Previously these counts could
   remain `0` because heartbeat accounting depended on reading labels from backend-owned attributes.
-* Replay detects changes to the service or operation of scheduled Nexus operations, reporting
-  nondeterminism while retaining compatibility with histories recorded before these checks.
 
 ## [0.10.0] - 2026-10-06
 

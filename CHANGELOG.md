@@ -33,11 +33,13 @@ relevant information.
 
 ## Unreleased
 
+### Breaking Changes
+* Workflow replay now reports nondeterminism when a scheduled Nexus operation's service or operation
+  differs from the command that produced it.
+
 ### Fixed
 * Workers using a custom metrics backend now report task-slot and poller counts correctly in
   worker heartbeats, rather than reporting zero when the backend does not expose its labels.
-* Workflow replay now reports nondeterminism when a scheduled Nexus operation's service or operation
-  differs from the command that produced it.
 
 ## [1.1.0] - 2026-10-06
 
