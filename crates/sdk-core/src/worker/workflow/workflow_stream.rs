@@ -10,7 +10,12 @@ use crate::{
     },
 };
 use futures_util::{Stream, StreamExt, stream, stream::PollNext};
-use std::{collections::VecDeque, fmt::Debug, future, sync::Arc};
+use std::{
+    collections::{HashMap, VecDeque},
+    fmt::Debug,
+    future,
+    sync::Arc,
+};
 use temporalio_common::protos::{
     coresdk::workflow_activation::remove_from_cache::EvictionReason,
     temporal::api::{enums::v1::WorkflowTaskFailedCause, failure::v1::Failure as ApiFailure},
@@ -26,9 +31,10 @@ use tracing::{Level, Span};
 pub(super) struct WFStream {
     runs: RunCache,
     /// Buffered polls for new runs which need a cache slot to open up before we can handle them.
-    /// The inner list is possibly multiple buffered tasks for one run, which can happen if there
-    /// is a backlog of queries.
-    buffered_polls_need_cache_slot: VecDeque<Vec<PermittedWFT>>,
+    buffered_polls_need_cache_slot: VecDeque<BufferedTasks>,
+    /// While the first task's full history is fetched, this owner retains later
+    /// work for the same run. It must not overtake the pending admission.
+    pending_run_admissions: HashMap<String, PendingRunAdmission>,
     /// Is filled with runs that we decided need to have their history fetched during state
     /// manipulation. Must be drained after handling each input.
     runs_needing_fetching: VecDeque<HistoryFetchReq>,
@@ -39,6 +45,20 @@ pub(super) struct WFStream {
 
     metrics: MetricsContext,
 }
+/// The history fetch owns the selected task; this owner retains its source and later work.
+struct PendingRunAdmission {
+    source: BufferedTaskSource,
+    buffered: BufferedTasks,
+}
+
+impl PendingRunAdmission {
+    fn restore(self, task: PermittedWFT) -> BufferedTasks {
+        let mut buffered = self.buffered;
+        buffered.restore_selected(task, self.source);
+        buffered
+    }
+}
+
 impl WFStream {
     /// Constructs workflow state management and returns a stream which outputs activations.
     ///
@@ -88,6 +108,7 @@ impl WFStream {
     ) -> impl Stream<Item = Result<WFStreamOutput, PollError>> {
         let mut state = WFStream {
             buffered_polls_need_cache_slot: Default::default(),
+            pending_run_admissions: Default::default(),
             runs: RunCache::new(
                 basics.worker_config.clone(),
                 (basics.sdk_name.clone(), basics.sdk_version.clone()),
@@ -112,6 +133,14 @@ impl WFStream {
                     WFStreamInput::NewWft(pwft) => {
                         debug!(run_id=%pwft.work.execution.run_id, "New WFT");
                         state.instantiate_or_update(*pwft)
+                    }
+                    WFStreamInput::FetchedWft(pwft) => {
+                        let run_id = pwft.work.execution.run_id.clone();
+                        if let Some(admission) = state.pending_run_admissions.remove(&run_id) {
+                            state.instantiate_selected(*pwft, admission)
+                        } else {
+                            state.instantiate_or_update(*pwft)
+                        }
                     }
                     WFStreamInput::Local(local_input) => {
                         let _span_g = local_input.span.enter();
@@ -162,34 +191,41 @@ impl WFStream {
                         err,
                         auto_reply_fail,
                     } => {
+                        let buffered = state
+                            .pending_run_admissions
+                            .remove(&run_id)
+                            .map(|admission| admission.buffered)
+                            .unwrap_or_default();
                         let message = format!("Fetching history failed: {err:?}");
-                        if !state.runs.has_run(&run_id)
-                            && let Some(info) = auto_reply_fail.clone()
-                        {
-                            actions.push(WorkflowStreamAction::FailUnstoredWft {
-                                run_id,
-                                report: Box::new(FailedActivationWFTReport::new(
-                                    info.task_token,
-                                    info.attempt,
-                                    WorkflowTaskFailedCause::WorkflowWorkerUnhandledFailure,
-                                    ApiFailure::application_failure(message, true).into(),
-                                    WftFailureKind::Task,
-                                    &state
-                                        .metrics
-                                        .with_new_attrs([workflow_type(info.workflow_type)]),
-                                )),
-                            });
+                        let result = if !state.runs.has_run(&run_id) {
+                            if let Some(info) = auto_reply_fail.clone() {
+                                actions.push(WorkflowStreamAction::FailUnstoredWft {
+                                    run_id: run_id.clone(),
+                                    report: Box::new(FailedActivationWFTReport::new(
+                                        info.task_token,
+                                        info.attempt,
+                                        WorkflowTaskFailedCause::WorkflowWorkerUnhandledFailure,
+                                        ApiFailure::application_failure(message, true).into(),
+                                        WftFailureKind::Task,
+                                        &state
+                                            .metrics
+                                            .with_new_attrs([workflow_type(info.workflow_type)]),
+                                    )),
+                                });
+                            }
                             None
                         } else {
                             state
                                 .request_eviction(RequestEvictMsg {
-                                    run_id,
+                                    run_id: run_id.clone(),
                                     message,
                                     reason: EvictionReason::PaginationOrHistoryFetch,
                                     auto_reply_fail,
                                 })
                                 .into_run_update_resp()
-                        }
+                        };
+                        activations.extend(state.instantiate_buffered(buffered));
+                        result
                     }
                     WFStreamInput::PollerDead => {
                         debug!("WFT poller died, beginning shutdown");
@@ -233,12 +269,27 @@ impl WFStream {
             .take_while(|o| future::ready(!matches!(o, Err(PollError::ShutDown))))
     }
 
-    /// Instantiate or update run machines with a new WFT
-    #[instrument(skip(self, pwft)
+    /// Instantiate or update run machines with a new polled WFT.
+    fn instantiate_or_update(&mut self, pwft: PermittedWFT) -> RunUpdateAct {
+        let mut buffered = BufferedTasks::default();
+        buffered.buffer(pwft);
+        self.instantiate_buffered(buffered)
+    }
+
+    fn instantiate_buffered(&mut self, mut buffered: BufferedTasks) -> RunUpdateAct {
+        let (source, task) = buffered.pop_next()?;
+        self.instantiate_selected(task, PendingRunAdmission { source, buffered })
+    }
+
+    #[instrument(skip(self, pwft, admission)
                  fields(run_id=%pwft.work.execution.run_id,
                         workflow_id=%pwft.work.execution.workflow_id))]
-    fn instantiate_or_update(&mut self, pwft: PermittedWFT) -> RunUpdateAct {
-        match self._instantiate_or_update(pwft) {
+    fn instantiate_selected(
+        &mut self,
+        pwft: PermittedWFT,
+        admission: PendingRunAdmission,
+    ) -> RunUpdateAct {
+        match self._instantiate_or_update(pwft, admission) {
             Err(histfetch) => {
                 self.runs_needing_fetching.push_back(histfetch);
                 Default::default()
@@ -249,43 +300,50 @@ impl WFStream {
 
     fn _instantiate_or_update(
         &mut self,
-        pwft: PermittedWFT,
+        mut pwft: PermittedWFT,
+        mut admission: PendingRunAdmission,
     ) -> Result<RunUpdateAct, HistoryFetchReq> {
-        // If the run already exists, possibly buffer the work and return early if we can't handle
-        // it yet.
-        let pwft = if let Some(rh) = self.runs.get_mut(&pwft.work.execution.run_id) {
-            if let Some(w) = rh.buffer_wft_if_outstanding_work(pwft) {
-                w
-            } else {
-                return Ok(None);
-            }
-        } else {
-            pwft
-        };
-
         let run_id = pwft.work.execution.run_id.clone();
-        // If our cache is full and this WFT is for an unseen run we must first evict a run before
-        // we can deal with this task. So, buffer the task in that case.
+        if let Some(pending) = self.pending_run_admissions.get_mut(&run_id) {
+            pending.buffered.append(admission.restore(pwft));
+            return Ok(None);
+        }
+        if let Some(rh) = self.runs.get_mut(&run_id) {
+            let Some(mut buffered) = rh.buffer_tasks_if_outstanding_work(admission.restore(pwft))
+            else {
+                return Ok(None);
+            };
+            let (source, task) = buffered
+                .pop_next()
+                .expect("Selected task must remain buffered");
+            pwft = task;
+            admission = PendingRunAdmission { source, buffered };
+        }
+
         if !self.runs.has_run(&run_id) && self.runs.is_full() {
-            self.buffer_resp_on_full_cache(pwft);
+            self.buffer_resp_on_full_cache(admission.restore(pwft));
             return Ok(None);
         }
 
-        // This check can't really be lifted up higher since we could EX: See it's in the cache,
-        // not fetch more history, send the task, see cache is full, buffer it, then evict that
-        // run, and now we still have a cache miss.
+        // A history fetch does not reserve cache capacity. Preserve the selected source in case
+        // the fetched task has to wait for another eviction before admission.
         if !self.runs.has_run(&run_id) && pwft.work.is_incremental() {
             debug!(run_id=?run_id, "Workflow task has partial history, but workflow is not in \
                    cache. Will fetch history");
             self.metrics.sticky_cache_miss();
+            self.pending_run_admissions.insert(run_id, admission);
             return Err(HistoryFetchReq::Full(
                 Box::new(CacheMissFetchReq { original_wft: pwft }),
                 self.history_fetch_refcounter.clone(),
             ));
         }
 
-        let rur = self.runs.instantiate_or_update(pwft);
-        Ok(rur)
+        let result = self.runs.instantiate_or_update(pwft);
+        self.runs
+            .get_mut(&run_id)
+            .expect("Run was just admitted")
+            .append_buffered_tasks(admission.buffered);
+        Ok(result)
     }
 
     fn process_completion(&mut self, complete: NewOrFetchedComplete) -> Vec<ActivationOrAuto> {
@@ -393,8 +451,8 @@ impl WFStream {
         });
         // Delete the activation, but only if the report came from lang, or we know the outstanding
         // activation is expected to be completed internally.
-        if let Some((should_evict, mut maybe_buffered)) = self.runs.get_mut(run_id).map(|rh| {
-            rh.finish_activation(|act| {
+        if let Some((should_evict, maybe_buffered)) = self.runs.get_mut(run_id).map(|rh| {
+            rh.finish_activation(wft_from_complete, |act| {
                 !report.is_autocomplete || matches!(act, OutstandingActivation::Autocomplete)
             })
         }) {
@@ -402,35 +460,15 @@ impl WFStream {
                 debug!(run_id=%run_id, "Evicting run");
                 self.runs.remove(run_id);
             }
-            let maybe_ready_wft = maybe_buffered
-                .get_next_wft()
-                .or(wft_from_complete)
-                .map(|x| vec![x])
-                .or_else(|| {
-                    // Attempt to apply a buffered poll for some *other* run, if we didn't have a
-                    // wft from complete or a buffered poll for *this* run and we evicted
-                    if should_evict {
-                        self.buffered_polls_need_cache_slot.pop_front()
-                    } else {
-                        None
-                    }
-                });
-            let mut maybe_wfts = maybe_ready_wft.unwrap_or_default();
-            if let Some(first_wft) = maybe_wfts.pop() {
-                res = self.instantiate_or_update(first_wft);
-                // We accept that there might be query tasks remaining in the buffer if we evicted
-                // and re-instantiated here. It's likely those tasks are now invalidated anyway.
-                if maybe_buffered.has_tasks() && should_evict {
-                    warn!("There were leftover buffered tasks when evicting run");
-                }
-            }
-            // If there happened to be more than one buffered WFT for this run, move them into the
-            // now-instantiated run's buffer.
-            for wft in maybe_wfts {
-                let should_be_nothing = self.instantiate_or_update(wft);
-                if should_be_nothing.is_some() {
-                    dbg_panic!("Extra buffered run should not have produced an activation");
-                }
+            let buffered = if maybe_buffered.has_tasks() {
+                Some(maybe_buffered)
+            } else if should_evict {
+                self.buffered_polls_need_cache_slot.pop_front()
+            } else {
+                None
+            };
+            if let Some(buffered) = buffered {
+                res = self.instantiate_buffered(buffered);
             }
         }
 
@@ -542,17 +580,16 @@ impl WFStream {
         }
     }
 
-    fn buffer_resp_on_full_cache(&mut self, work: PermittedWFT) {
-        debug!(run_id=%work.work.execution.run_id, "Buffering WFT because cache is full");
-        // If there's already a buffered poll for the run, add to it.
-        if let Some(rh) = self.buffered_polls_need_cache_slot.iter_mut().find(|w| {
-            w.first()
-                .is_some_and(|ww| ww.work.execution.run_id == work.work.execution.run_id)
-        }) {
-            rh.push(work);
+    fn buffer_resp_on_full_cache(&mut self, work: BufferedTasks) {
+        debug!(run_id=?work.run_id(), "Buffering WFT because cache is full");
+        if let Some(buffered) = self
+            .buffered_polls_need_cache_slot
+            .iter_mut()
+            .find(|buffered| buffered.run_id() == work.run_id())
+        {
+            buffered.append(work);
         } else {
-            //  Otherwise push it to the back
-            self.buffered_polls_need_cache_slot.push_back(vec![work]);
+            self.buffered_polls_need_cache_slot.push_back(work);
         }
     }
 
@@ -632,6 +669,8 @@ impl WFStream {
 #[derive(derive_more::From, Debug)]
 enum WFStreamInput {
     NewWft(Box<PermittedWFT>),
+    #[from(ignore)]
+    FetchedWft(Box<PermittedWFT>),
     Local(Box<LocalInput>),
     /// The stream given to us which represents the poller (or a mock) terminated.
     PollerDead,
@@ -718,7 +757,7 @@ impl From<ExternalPollerInputs> for WFStreamInput {
             ExternalPollerInputs::NewWft(v) => WFStreamInput::NewWft(Box::new(v)),
             ExternalPollerInputs::PollerDead => WFStreamInput::PollerDead,
             ExternalPollerInputs::PollerError(e) => WFStreamInput::PollerError(e),
-            ExternalPollerInputs::FetchedUpdate(wft) => WFStreamInput::NewWft(Box::new(wft)),
+            ExternalPollerInputs::FetchedUpdate(wft) => WFStreamInput::FetchedWft(Box::new(wft)),
             ExternalPollerInputs::FailedFetch {
                 run_id,
                 err,

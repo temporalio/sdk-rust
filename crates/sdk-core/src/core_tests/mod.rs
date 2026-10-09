@@ -1,6 +1,7 @@
 mod activity_tasks;
 mod event_groups;
 mod queries;
+mod query_supersession;
 mod replay_flag;
 mod updates;
 mod workers;

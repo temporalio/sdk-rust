@@ -52,6 +52,11 @@ relevant information.
   are now distinguished by `StartChildWorkflowExecutionFailedCause::NamespaceNotFound`.
 
 ### Fixed
+* Workers retain newer workflow tasks when a delayed completion response returns an older task,
+  avoiding an extra task timeout before workflows resume.
+* Workflow queries remain answerable when newer workflow tasks replace queued work or
+  workers evict workflow state. Pending queries retain their order across history fetches
+  and tasks returned by workflow completion.
 * `temporalio-common`'s build script now generates its payload-visitor implementations in a
   stable order. The generated code was emitted in `HashSet`/`HashMap` iteration order, so its
   content changed on every build and a compilation cache such as sccache missed
