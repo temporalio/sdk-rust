@@ -21,12 +21,6 @@ This file contains completed Rust SDK releases only.
 
 # Changelog
 
-## Unreleased
-
-### Fixed
-* Workers using a custom metrics backend now report task-slot and poller counts correctly in
-  worker heartbeats, rather than reporting zero when the backend does not expose its labels.
-
 ## [1.1.0] - 2026-10-06
 
 ### Added
