@@ -2,16 +2,16 @@
 //!
 //! An offloaded payload is replaced by one whose data is the proto JSON form of an
 //! `ExternalStorageReference`. This shape is part of the wire contract and must not be changed
-//! unilaterally. The driver contracts these serve live in `temporalio-common-wasm`; the format
-//! lives here because proto JSON support and the payload visitor that will drive it do.
+//! unilaterally. Unlike the driver contracts, it is defined here rather than in
+//! `temporalio-common-wasm`, because proto JSON support and the payload visitor that will drive it
+//! are here.
 
 // Crate-private until there is a consumer; nothing offloads or restores payloads yet.
 #![allow(dead_code)]
 
 use std::collections::HashMap;
 
-use temporalio_common_wasm::external_storage::ExternalStorageError;
-
+use super::ExternalStorageError;
 use crate::protos::temporal::api::{
     common::v1::{Payload, payload::ExternalPayloadDetails},
     sdk::v1::ExternalStorageReference,

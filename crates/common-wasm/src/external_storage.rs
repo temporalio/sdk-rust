@@ -1,18 +1,19 @@
 //! External storage contracts: offloading large payloads to a user-supplied driver, which replaces
 //! them on the wire with a small reference so the payload data never reaches the Temporal server.
 //!
-//! These are the contracts only. The reference wire format lives in `temporalio-common`, which is
-//! where the payload visitor and the proto JSON support it needs already are. They sit beside
+//! Import these from `temporalio_common::external_storage`, which re-exports them, so that they can
+//! later move out of this crate without breaking imports. They sit beside
 //! [`crate::data_converters::DataConverter`] because the configuration is expected to hang off it,
-//! the way it does in the SDKs that have already shipped external storage. Nothing here is wired
-//! into the SDK yet.
+//! the way it does in the SDKs that have already shipped external storage. The reference wire
+//! format lives in `temporalio-common`, alongside the payload visitor and the proto JSON support it
+//! needs. Nothing here is wired into the SDK yet.
 
 use crate::protos::temporal::api::common::v1::Payload;
 use futures::future::BoxFuture;
 use std::{collections::HashMap, fmt, sync::Arc};
 
 /// Shared with every other SDK, so the same payload offloads regardless of which one wrote it.
-pub const DEFAULT_PAYLOAD_SIZE_THRESHOLD: usize = 256 * 1024;
+const DEFAULT_PAYLOAD_SIZE_THRESHOLD: usize = 256 * 1024;
 
 /// Driver-defined reference to an externally stored payload, used to retrieve it later.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -234,7 +235,8 @@ impl ExternalStorage {
     }
 
     /// Set the minimum encoded payload size, in bytes, that is offloaded. Payloads at or above this
-    /// size are offloaded; smaller ones are left inline. Zero offloads every payload.
+    /// size are offloaded; smaller ones are left inline. Zero offloads every payload. Defaults to
+    /// 256 KiB.
     #[must_use]
     pub fn with_payload_size_threshold(mut self, payload_size_threshold: usize) -> Self {
         self.payload_size_threshold = payload_size_threshold;
