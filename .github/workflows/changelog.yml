@@ -9,42 +9,43 @@ permissions:
   pull-requests: read
 
 jobs:
-  changelog-paths:
+  select-checks:
     name: Select changelog checks
     runs-on: ubuntu-latest
     outputs:
-      core: ${{ steps.paths.outputs.core }}
-      fragments: ${{ steps.paths.outputs.fragments }}
+      check-core: ${{ steps.select.outputs.core }}
+      check-sdk: ${{ steps.select.outputs.sdk }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
-      - id: paths
+      - name: Require SDK fragments unless only Core has an entry
+        id: select
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
         run: |
           set -euo pipefail
-          if git diff --quiet "$BASE_SHA" HEAD -- crates/sdk-core/CHANGELOG.md; then
-            echo 'core=false' >> "$GITHUB_OUTPUT"
-          else
-            echo 'core=true' >> "$GITHUB_OUTPUT"
+          core=false
+          sdk=true
+          if ! git diff --quiet "$BASE_SHA" HEAD -- crates/sdk-core/CHANGELOG.md; then
+            core=true
+            if git diff --quiet "$BASE_SHA" HEAD -- changelog; then
+              sdk=false
+            fi
           fi
-          if git diff --quiet "$BASE_SHA" HEAD -- changelog; then
-            echo 'fragments=false' >> "$GITHUB_OUTPUT"
-          else
-            echo 'fragments=true' >> "$GITHUB_OUTPUT"
-          fi
+          echo "core=$core" >> "$GITHUB_OUTPUT"
+          echo "sdk=$sdk" >> "$GITHUB_OUTPUT"
 
   changelog-check:
     name: Changelog checkpoint
-    needs: changelog-paths
-    if: needs.changelog-paths.outputs.core != 'true' || needs.changelog-paths.outputs.fragments == 'true'
+    needs: select-checks
+    if: needs.select-checks.outputs.check-sdk == 'true'
     uses: temporalio/.github/.github/workflows/changelog-fragments.yml@b87e4183c4b74b7f6d4a2a7f3e77150da55cf733
     with:
       sdk-rust-path: '.'
 
   core-changelog-check:
     name: Core changelog
-    needs: changelog-paths
-    if: needs.changelog-paths.outputs.core == 'true'
+    needs: select-checks
+    if: needs.select-checks.outputs.check-core == 'true'
     uses: temporalio/.github/.github/workflows/changelog.yml@d8129c755fbd1d3f18c5a7a5420d5754acc63e3f
