@@ -42,16 +42,24 @@ Commands:
   body as Markdown, excluding the version heading. Empty release sections produce
   no output; missing release sections are errors.
 * `release-notes --version <version> [--submodule <path>] [--changelog CHANGELOG.md]
-  [--from <parent-ref> --to HEAD] [--output <file>]` generates complete publishing
-  notes. It reads the dated SDK changelog under `## Notable Changes`. With
-  `--submodule`, it appends Core commit links under `### SDK Core Commits` when
-  the range is nonempty. Without a submodule, `--from` is required and the
-  repository's own commit links appear under `### Commits`; Rust's publishing
-  workflow uses this form with its previous `v<version>` tag.
-  It never collects Core changelog entries at release time. Core revisions come
-  from the parent repository's Git links; the default Core baseline is the greatest
-  numeric release tag below the version, accepting an optional `v` prefix
-  (for example, `1.9.0` or `v1.9.0`). Other tag conventions can pass `--from`.
+  [--from <ref>] [--to <ref>] [--output <file>]` generates publishing notes.
+  It extracts the body of `## [<version>]` from the SDK changelog and places it
+  under `## Notable Changes` in the generated output.
+
+  With `--submodule`, `--from` and `--to` identify revisions in the SDK repository.
+  The command reads the Core submodule pins at those revisions and appends Core
+  commit links under `### SDK Core Commits` if there are any. When `--from` is
+  omitted, it selects the greatest numeric SDK release tag below the requested
+  version, accepting an optional `v` prefix (for example, `1.9.0` or `v1.9.0`).
+
+  Without `--submodule`, `--from` is required. The command appends the SDK
+  repository's own commit links between `--from` and `--to` under `### Commits`
+  if there are any. Rust's publishing workflow passes its previous SDK release
+  tag (`v<version>`) as `--from`.
+
+  `--to` defaults to `HEAD`. Core changelog entries are imported by `update-core`
+  and included in the prepared SDK changelog; this command extracts completed
+  notes and adds commit links.
   Output goes to stdout unless a file is supplied. Relative output paths resolve
   against `--repo`; absolute output paths are also supported.
 * `core-notes --version <version> --submodule <path> [--from <tag> --to HEAD]`
