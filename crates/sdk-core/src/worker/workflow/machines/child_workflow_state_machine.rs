@@ -5,7 +5,9 @@ use super::{
 use crate::{
     abstractions::dbg_panic,
     internal_flags::CoreInternalFlags,
-    worker::workflow::{InternalFlagsRef, fatal, machines::HistEventData, nondeterminism},
+    worker::workflow::{
+        CommandAnnotations, InternalFlagsRef, fatal, machines::HistEventData, nondeterminism,
+    },
 };
 use itertools::Itertools;
 use std::{
@@ -92,7 +94,7 @@ fsm! {
     Cancelled --(CommandRequestCancelExternalWorkflowExecution) --> Cancelled;
     Cancelled --(ChildWorkflowExecutionCancelled,
         on_child_workflow_execution_cancelled) --> Cancelled;
-    // Completions of any kind after cancellation are acceptable for abandoned children
+    // Late terminal events cannot affect children whose result was resolved on cancellation.
     Cancelled --(ChildWorkflowExecutionCompleted(Option<Payloads>),
         shared on_child_workflow_execution_completed) --> Cancelled;
     Cancelled --(ChildWorkflowExecutionFailed(ChildWorkflowExecutionFailedEventAttributes),
@@ -142,9 +144,9 @@ pub(super) struct Cancelled {
     seen_cancelled_event: bool,
 }
 
-fn completion_of_not_abandoned_err() -> WFMachinesError {
+fn completion_after_non_immediate_cancel_err() -> WFMachinesError {
     nondeterminism!(
-        "Child workflows which don't have the ABANDON cancellation type cannot complete after \
+        "Child workflows which don't resolve immediately on cancellation cannot complete after \
          being cancelled."
     )
 }
@@ -173,8 +175,8 @@ impl Cancelled {
         state: &mut SharedState,
         _: Option<Payloads>,
     ) -> ChildWorkflowMachineTransition<Cancelled> {
-        if !state.abandons() {
-            return ChildWorkflowMachineTransition::Err(completion_of_not_abandoned_err());
+        if !state.resolves_immediately_on_cancel() {
+            return ChildWorkflowMachineTransition::Err(completion_after_non_immediate_cancel_err());
         }
         ChildWorkflowMachineTransition::ok([], self)
     }
@@ -184,8 +186,8 @@ impl Cancelled {
         state: &mut SharedState,
         _: ChildWorkflowExecutionFailedEventAttributes,
     ) -> ChildWorkflowMachineTransition<Cancelled> {
-        if !state.abandons() {
-            return ChildWorkflowMachineTransition::Err(completion_of_not_abandoned_err());
+        if !state.resolves_immediately_on_cancel() {
+            return ChildWorkflowMachineTransition::Err(completion_after_non_immediate_cancel_err());
         }
         ChildWorkflowMachineTransition::ok([], self)
     }
@@ -195,8 +197,8 @@ impl Cancelled {
         state: &mut SharedState,
         _: RetryState,
     ) -> ChildWorkflowMachineTransition<Cancelled> {
-        if !state.abandons() {
-            return ChildWorkflowMachineTransition::Err(completion_of_not_abandoned_err());
+        if !state.resolves_immediately_on_cancel() {
+            return ChildWorkflowMachineTransition::Err(completion_after_non_immediate_cancel_err());
         }
         ChildWorkflowMachineTransition::ok([], self)
     }
@@ -205,8 +207,8 @@ impl Cancelled {
         self,
         state: &mut SharedState,
     ) -> ChildWorkflowMachineTransition<Cancelled> {
-        if !state.abandons() {
-            return ChildWorkflowMachineTransition::Err(completion_of_not_abandoned_err());
+        if !state.resolves_immediately_on_cancel() {
+            return ChildWorkflowMachineTransition::Err(completion_after_non_immediate_cancel_err());
         }
         ChildWorkflowMachineTransition::ok([], self)
     }
@@ -313,11 +315,10 @@ impl StartEventRecorded {
         state: &mut SharedState,
         reason: String,
     ) -> ChildWorkflowMachineTransition<StartEventRecordedOrCancelled> {
-        let dest = match state.cancel_type {
-            ChildWorkflowCancellationType::Abandon | ChildWorkflowCancellationType::TryCancel => {
-                StartEventRecordedOrCancelled::Cancelled(Default::default())
-            }
-            _ => StartEventRecordedOrCancelled::StartEventRecorded(Default::default()),
+        let dest = if state.resolves_immediately_on_cancel() {
+            StartEventRecordedOrCancelled::Cancelled(Default::default())
+        } else {
+            StartEventRecordedOrCancelled::StartEventRecorded(Default::default())
         };
         TransitionResult::ok(
             [ChildWorkflowCommand::IssueCancelAfterStarted { reason }],
@@ -416,11 +417,10 @@ impl Started {
         state: &mut SharedState,
         reason: String,
     ) -> ChildWorkflowMachineTransition<StartedOrCancelled> {
-        let dest = match state.cancel_type {
-            ChildWorkflowCancellationType::Abandon | ChildWorkflowCancellationType::TryCancel => {
-                StartedOrCancelled::Cancelled(Default::default())
-            }
-            _ => StartedOrCancelled::Started(Default::default()),
+        let dest = if state.resolves_immediately_on_cancel() {
+            StartedOrCancelled::Cancelled(Default::default())
+        } else {
+            StartedOrCancelled::Started(Default::default())
         };
         TransitionResult::ok(
             [ChildWorkflowCommand::IssueCancelAfterStarted { reason }],
@@ -447,11 +447,15 @@ pub(super) struct SharedState {
     cancelled_before_sent: bool,
     cancel_type: ChildWorkflowCancellationType,
     internal_flags: InternalFlagsRef,
+    annotations: CommandAnnotations,
 }
 
 impl SharedState {
-    fn abandons(&self) -> bool {
-        matches!(self.cancel_type, ChildWorkflowCancellationType::Abandon)
+    fn resolves_immediately_on_cancel(&self) -> bool {
+        matches!(
+            self.cancel_type,
+            ChildWorkflowCancellationType::Abandon | ChildWorkflowCancellationType::TryCancel
+        )
     }
 }
 
@@ -461,6 +465,7 @@ impl ChildWorkflowMachine {
         attribs: StartChildWorkflowExecution,
         internal_flags: InternalFlagsRef,
         use_compatible_version: bool,
+        annotations: CommandAnnotations,
     ) -> NewMachineWithCommand {
         let mut s = Self::from_parts(
             Created {}.into(),
@@ -475,6 +480,7 @@ impl ChildWorkflowMachine {
                 initiated_event_id: 0,
                 started_event_id: 0,
                 cancelled_before_sent: false,
+                annotations,
             },
         );
         OnEventWrapper::on_event_mut(&mut s, ChildWorkflowMachineEvents::Schedule)
@@ -515,7 +521,9 @@ impl ChildWorkflowMachine {
     pub(super) fn cancel(
         &mut self,
         reason: String,
+        annotations: CommandAnnotations,
     ) -> Result<Vec<MachineResponse>, MachineError<WFMachinesError>> {
+        self.shared_state.annotations.override_with(annotations);
         let event = ChildWorkflowMachineEvents::Cancel(reason);
         let vec = OnEventWrapper::on_event_mut(self, event)?;
         let res = vec
@@ -672,6 +680,20 @@ impl WFMachinesAdapter for ChildWorkflowMachine {
                 ]
             }
             ChildWorkflowCommand::StartFail(cause) => {
+                let cause = match cause {
+                    StartChildWorkflowExecutionFailedCause::Unspecified => {
+                        wfr::StartChildWorkflowExecutionFailedCause::Unspecified
+                    }
+                    StartChildWorkflowExecutionFailedCause::WorkflowAlreadyExists => {
+                        wfr::StartChildWorkflowExecutionFailedCause::WorkflowAlreadyExists
+                    }
+                    StartChildWorkflowExecutionFailedCause::NamespaceNotFound => {
+                        wfr::StartChildWorkflowExecutionFailedCause::NamespaceNotFound
+                    }
+                    StartChildWorkflowExecutionFailedCause::InvalidVersioningOverride => {
+                        wfr::StartChildWorkflowExecutionFailedCause::InvalidVersioningOverride
+                    }
+                };
                 vec![
                     ResolveChildWorkflowExecutionStart {
                         seq: self.shared_state.lang_sequence_number,
@@ -732,8 +754,8 @@ impl WFMachinesAdapter for ChildWorkflowMachine {
                 let mut resps = vec![];
                 if self.shared_state.cancel_type != ChildWorkflowCancellationType::Abandon {
                     #[allow(deprecated)]
-                    resps.push(MachineResponse::NewCoreOriginatedCommand(
-                        RequestCancelExternalWorkflowExecutionCommandAttributes {
+                    resps.push(MachineResponse::NewCoreOriginatedCommand {
+                        attrs: RequestCancelExternalWorkflowExecutionCommandAttributes {
                             namespace: self.shared_state.namespace.clone(),
                             workflow_id: self.shared_state.workflow_id.clone(),
                             run_id: self.shared_state.run_id.clone(),
@@ -742,14 +764,10 @@ impl WFMachinesAdapter for ChildWorkflowMachine {
                             ..Default::default()
                         }
                         .into(),
-                    ))
+                        annotations: self.shared_state.annotations.clone(),
+                    })
                 }
-                // Immediately resolve abandon/trycancel modes
-                if matches!(
-                    self.shared_state.cancel_type,
-                    ChildWorkflowCancellationType::Abandon
-                        | ChildWorkflowCancellationType::TryCancel
-                ) {
+                if self.shared_state.resolves_immediately_on_cancel() {
                     resps.push(self.resolve_cancelled_msg().into())
                 }
                 resps
@@ -801,10 +819,183 @@ fn convert_payloads(
 
 #[cfg(test)]
 mod test {
-    use super::*;
+    use super::{super::TemporalStateMachine, *};
     use crate::internal_flags::InternalFlags;
     use rstest::rstest;
     use std::{cell::RefCell, mem::discriminant, rc::Rc};
+    use temporalio_common::protos::{
+        coresdk::workflow_activation::workflow_activation_job,
+        temporal::api::{
+            command::v1::command,
+            deployment::v1::WorkerDeploymentVersion,
+            history::v1::{HistoryEvent, StartChildWorkflowExecutionInitiatedEventAttributes},
+            workflow::v1::{VersioningOverride, versioning_override},
+        },
+    };
+
+    #[rstest]
+    #[case::pinned(Some(versioning_override::Override::Pinned(
+        versioning_override::PinnedOverride {
+            behavior: versioning_override::PinnedOverrideBehavior::Pinned as i32,
+            version: Some(WorkerDeploymentVersion {
+                deployment_name: "child-deployment".into(),
+                build_id: "child-build".into(),
+            }),
+        }
+    )))]
+    #[case::auto_upgrade(Some(versioning_override::Override::AutoUpgrade(true)))]
+    #[case::one_time(Some(versioning_override::Override::OneTime(
+        versioning_override::OneTimeOverride {
+            target_deployment_version: Some(WorkerDeploymentVersion {
+                deployment_name: "child-deployment".into(),
+                build_id: "child-build".into(),
+            }),
+        }
+    )))]
+    #[case::unset(None)]
+    fn child_versioning_override_command(
+        #[case] override_variant: Option<versioning_override::Override>,
+        #[values(false, true)] inherit_build_id: bool,
+    ) {
+        let versioning_override = override_variant.map(|r#override| VersioningOverride {
+            r#override: Some(r#override),
+            ..Default::default()
+        });
+        let NewMachineWithCommand {
+            command,
+            mut machine,
+        } = ChildWorkflowMachine::new_scheduled(
+            StartChildWorkflowExecution {
+                seq: 7,
+                namespace: "namespace".into(),
+                workflow_id: "child-id".into(),
+                workflow_type: "child-type".into(),
+                task_queue: "child-queue".into(),
+                versioning_override: versioning_override.clone(),
+                ..Default::default()
+            },
+            Rc::new(RefCell::new(InternalFlags::default())),
+            inherit_build_id,
+            Default::default(),
+        );
+        let command::Attributes::StartChildWorkflowExecutionCommandAttributes(attrs) = command
+        else {
+            panic!("Expected child start command");
+        };
+        assert_eq!(attrs.versioning_override, versioning_override);
+        #[allow(deprecated)]
+        {
+            assert_eq!(attrs.inherit_build_id, inherit_build_id);
+        }
+        assert_eq!(attrs.task_queue.unwrap().name, "child-queue");
+        assert_eq!(attrs.workflow_id, "child-id");
+        assert!(
+            machine
+                .handle_command(CommandType::StartChildWorkflowExecution)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(machine
+            .handle_event(HistEventData {
+                event: HistoryEvent {
+                    event_id: 10,
+                    event_type: EventType::StartChildWorkflowExecutionInitiated as i32,
+                    attributes: Some(history_event::Attributes::StartChildWorkflowExecutionInitiatedEventAttributes(
+                        StartChildWorkflowExecutionInitiatedEventAttributes {
+                            workflow_id: attrs.workflow_id,
+                            workflow_type: attrs.workflow_type,
+                            versioning_override: attrs.versioning_override,
+                            ..Default::default()
+                        }
+                    )),
+                    ..Default::default()
+                },
+                replaying: true,
+                current_task_is_last_in_history: true,
+            })
+            .unwrap()
+            .is_empty());
+    }
+
+    #[rstest]
+    #[case::already_exists(
+        StartChildWorkflowExecutionFailedCause::WorkflowAlreadyExists,
+        wfr::StartChildWorkflowExecutionFailedCause::WorkflowAlreadyExists
+    )]
+    #[case::namespace_not_found(
+        StartChildWorkflowExecutionFailedCause::NamespaceNotFound,
+        wfr::StartChildWorkflowExecutionFailedCause::NamespaceNotFound
+    )]
+    #[case::invalid_versioning_override(
+        StartChildWorkflowExecutionFailedCause::InvalidVersioningOverride,
+        wfr::StartChildWorkflowExecutionFailedCause::InvalidVersioningOverride
+    )]
+    #[case::unspecified(
+        StartChildWorkflowExecutionFailedCause::Unspecified,
+        wfr::StartChildWorkflowExecutionFailedCause::Unspecified
+    )]
+    fn child_start_failure_activation(
+        #[case] api_cause: StartChildWorkflowExecutionFailedCause,
+        #[case] lang_cause: wfr::StartChildWorkflowExecutionFailedCause,
+        #[values(false, true)] replaying: bool,
+    ) {
+        let mut machine = ChildWorkflowMachine::from_parts(
+            StartEventRecorded {}.into(),
+            SharedState {
+                initiated_event_id: 10,
+                started_event_id: 0,
+                lang_sequence_number: 7,
+                namespace: "namespace".into(),
+                workflow_id: "child-id".into(),
+                run_id: String::new(),
+                workflow_type: "child-type".into(),
+                cancelled_before_sent: false,
+                cancel_type: ChildWorkflowCancellationType::WaitCancellationCompleted,
+                internal_flags: Rc::new(RefCell::new(InternalFlags::default())),
+                annotations: Default::default(),
+            },
+        );
+        let responses = machine
+            .handle_event(HistEventData {
+                event: HistoryEvent {
+                    event_id: 11,
+                    event_type: EventType::StartChildWorkflowExecutionFailed as i32,
+                    attributes: Some(
+                        history_event::Attributes::StartChildWorkflowExecutionFailedEventAttributes(
+                            StartChildWorkflowExecutionFailedEventAttributes {
+                                initiated_event_id: 10,
+                                cause: api_cause as i32,
+                                ..Default::default()
+                            },
+                        ),
+                    ),
+                    ..Default::default()
+                },
+                replaying,
+                current_task_is_last_in_history: true,
+            })
+            .unwrap();
+        assert!(matches!(
+            machine.state(),
+            ChildWorkflowMachineState::StartFailed(_)
+        ));
+        let [MachineResponse::PushWFJob(job)] = responses.as_slice() else {
+            panic!("Expected a single language activation job");
+        };
+        let workflow_activation_job::Variant::ResolveChildWorkflowExecutionStart(start) =
+            &job.variant
+        else {
+            panic!("Expected child start resolution");
+        };
+        assert_eq!(start.seq, 7);
+        let Some(resolve_child_workflow_execution_start::Status::Failed(failure)) = &start.status
+        else {
+            panic!("Expected failed child start resolution");
+        };
+        assert_eq!(failure.workflow_id, "child-id");
+        assert_eq!(failure.workflow_type, "child-type");
+        assert_eq!(failure.cause(), lang_cause);
+    }
 
     #[test]
     fn cancels_ignored_terminal() {
@@ -830,16 +1021,23 @@ mod test {
                     cancelled_before_sent: false,
                     cancel_type: Default::default(),
                     internal_flags: Rc::new(RefCell::new(InternalFlags::default())),
+                    annotations: Default::default(),
                 },
             );
-            let cmds = s.cancel("cancel reason".to_string()).unwrap();
+            let cmds = s
+                .cancel("cancel reason".to_string(), Default::default())
+                .unwrap();
             assert_eq!(cmds.len(), 0);
             assert_eq!(discriminant(&state), discriminant(s.state()));
         }
     }
 
-    #[test]
-    fn abandoned_ok_with_completions() {
+    #[rstest]
+    #[case::abandon(ChildWorkflowCancellationType::Abandon)]
+    #[case::try_cancel(ChildWorkflowCancellationType::TryCancel)]
+    fn immediately_cancelled_ok_with_terminal_events(
+        #[case] cancel_type: ChildWorkflowCancellationType,
+    ) {
         let mut shared = SharedState {
             initiated_event_id: 0,
             started_event_id: 0,
@@ -849,12 +1047,11 @@ mod test {
             run_id: "".to_string(),
             workflow_type: "".to_string(),
             cancelled_before_sent: false,
-            cancel_type: ChildWorkflowCancellationType::Abandon,
+            cancel_type,
             internal_flags: Rc::new(RefCell::new(InternalFlags::default())),
+            annotations: Default::default(),
         };
-        let state = Cancelled {
-            seen_cancelled_event: true,
-        };
+        let state = Cancelled::default();
         let res = state.on_child_workflow_execution_completed(&mut shared, None);
         // Can't use assert_matches b/c not Debug.
         assert!(matches!(
@@ -865,9 +1062,7 @@ mod test {
             }
             if commands.is_empty()
         ));
-        let state = Cancelled {
-            seen_cancelled_event: true,
-        };
+        let state = Cancelled::default();
         let res = state.on_child_workflow_execution_failed(&mut shared, Default::default());
         assert!(matches!(
             res,
@@ -877,9 +1072,7 @@ mod test {
             }
             if commands.is_empty()
         ));
-        let state = Cancelled {
-            seen_cancelled_event: true,
-        };
+        let state = Cancelled::default();
         let res = state.on_child_workflow_execution_timed_out(&mut shared, Default::default());
         assert!(matches!(
             res,
@@ -889,9 +1082,7 @@ mod test {
             }
             if commands.is_empty()
         ));
-        let state = Cancelled {
-            seen_cancelled_event: true,
-        };
+        let state = Cancelled::default();
         let res = state.on_child_workflow_execution_terminated(&mut shared);
         assert!(matches!(
             res,
@@ -933,10 +1124,11 @@ mod test {
                 cancelled_before_sent: false,
                 cancel_type,
                 internal_flags: Rc::new(RefCell::new(InternalFlags::default())),
+                annotations: Default::default(),
             },
         );
         let cmds = s
-            .cancel("parent cancelled".to_string())
+            .cancel("parent cancelled".to_string(), Default::default())
             .expect("Cancel in StartEventRecorded should not fail");
         assert!(
             !cmds.is_empty(),

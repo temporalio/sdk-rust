@@ -5,7 +5,7 @@ use crate::{
         temporal_core_client_connect, temporal_core_client_free, temporal_core_client_rpc_call,
     },
     runtime::{
-        Runtime, RuntimeOptions, RuntimeOrFail, temporal_core_byte_array_free,
+        Runtime, RuntimeInfoArray, RuntimeOptions, RuntimeOrFail, temporal_core_byte_array_free,
         temporal_core_runtime_free, temporal_core_runtime_new,
     },
     testing::{
@@ -154,6 +154,11 @@ impl Context {
         let RuntimeOrFail { runtime, fail } = temporal_core_runtime_new(&RuntimeOptions {
             telemetry: std::ptr::null(),
             worker_heartbeat_interval_millis: 0,
+            runtime_info: RuntimeInfoArray {
+                data: std::ptr::null(),
+                size: 0,
+            },
+            disable_environment_info: false,
         });
 
         if let Some(fail) = byte_array_to_string(runtime, fail) {

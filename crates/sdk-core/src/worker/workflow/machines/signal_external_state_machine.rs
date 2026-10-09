@@ -220,6 +220,7 @@ impl WFMachinesAdapter for SignalExternalMachine {
                     ResolveSignalExternalWorkflow {
                         seq: self.shared_state.seq,
                         failure: None,
+                        cause: SignalExternalWorkflowExecutionFailedCause::Unspecified as i32,
                     }
                     .into(),
                 ]
@@ -248,6 +249,7 @@ impl WFMachinesAdapter for SignalExternalMachine {
                             )),
                             ..Default::default()
                         }),
+                        cause: f as i32,
                     }
                     .into(),
                 ]
@@ -278,6 +280,7 @@ impl SignalExternalMachine {
                             )),
                             ..Default::default()
                         }),
+                        cause: SignalExternalWorkflowExecutionFailedCause::Unspecified as i32,
                     }
                     .into(),
                 ];

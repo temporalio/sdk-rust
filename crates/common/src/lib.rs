@@ -18,8 +18,9 @@ pub mod protos;
 pub mod telemetry;
 pub mod worker;
 pub use temporalio_common_wasm::{
-    ActivityDefinition, ActivityError, HasWorkflowDefinition, Memo, Priority, QueryDefinition,
-    RetryPolicy, SignalDefinition, UntypedActivity, UntypedWorkflow, UpdateDefinition,
+    ActivityCloseTimeouts, ActivityDefinition, ActivityError, HasWorkflowDefinition, Memo,
+    MemoValue, MemoValues, Priority, QueryDefinition, RetryPolicy, SignalDefinition,
+    UntypedActivity, UntypedWorkflow, UpdateDefinition, VersioningOverride,
     WorkerDeploymentVersion, WorkflowDefinition, WorkflowExecution, data_converters, error,
     search_attributes,
 };

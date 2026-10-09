@@ -1,14 +1,21 @@
 [package]
 name = "temporalio-workflow"
-version = "0.5.0"
+version = "1.1.0"
 edition = "2024"
+rust-version = "1.88.0"
 authors = ["Temporal Technologies Inc. <sdk@temporal.io>"]
 license-file = { workspace = true }
 description = "Temporal Rust workflow authoring surface"
 homepage = "https://temporal.io/"
-repository = "https://github.com/temporalio/sdk-core"
+repository = "https://github.com/temporalio/sdk-rust"
 keywords = ["temporal", "workflow"]
 categories = ["development-tools"]
+
+[package.metadata.docs.rs]
+features = ["experimental"]
+
+[features]
+experimental = []
 
 [dependencies]
 anyhow = "1.0"
@@ -27,17 +34,24 @@ prost-types = { workspace = true }
 rand = { version = "0.10", default-features = false }
 rand_pcg = "0.10"
 serde = { version = "1.0", features = ["derive"] }
+siphasher = "1.0"
 thiserror = "2"
 uuid = { version = "1.18", default-features = false }
-wit-bindgen = { version = "0.57.1", default-features = false, features = ["macros", "std", "realloc", "bitflags"] }
+wit-bindgen = { version = "0.61.1", default-features = false, features = ["macros", "std", "realloc", "bitflags"] }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+rand = { version = "0.10", default-features = false, features = ["thread_rng"] }
 
 [dependencies.temporalio-common-wasm]
 path = "../common-wasm"
-version = "0.5"
+version = "~1.1.0"
 
 [dependencies.temporalio-macros]
 path = "../macros"
-version = "0.5"
+version = "~1.1.0"
+
+[dev-dependencies]
+rstest = "0.26"
 
 [lints]
 workspace = true

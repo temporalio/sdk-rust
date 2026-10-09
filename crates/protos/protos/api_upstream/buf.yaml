@@ -1,24 +1,23 @@
-version: v1
-name: buf.build/temporalio/api
+version: v2
+modules:
+  - path: .
+    name: buf.build/temporalio/api
+    excludes:
+      # Vendored for api-linter (can't read the BSR); excluded so buf sees them once.
+      - google
+      - nexusannotations
 deps:
-  - buf.build/grpc-ecosystem/grpc-gateway
   - buf.build/googleapis/googleapis
   - buf.build/temporalio/nexus-annotations
-build:
-  excludes:
-    # Buf won't accept a local dependency on the google protos but we need them
-    # to run api-linter, so just tell buf it ignore it
+lint:
+  use:
+    - STANDARD
+  ignore:
+    - cmd
     - google
-    # Same for nexusannotations - local copy for api-linter, BSR dep for buf
-    - nexusannotations
+  disallow_comment_ignores: true
 breaking:
   use:
     - WIRE_JSON
   ignore:
     - google
-lint:
-  use:
-    - DEFAULT
-  ignore:
-    - google
-    - cmd

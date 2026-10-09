@@ -171,7 +171,6 @@ impl Parse for Transition {
 impl StateMachineDefinition {
     pub(crate) fn codegen(&self) -> TokenStream {
         let visibility = self.visibility.clone();
-        // First extract all of the states into a set, and build the enum's insides
         let states = self.all_states();
         let state_variants = states.iter().map(|s| {
             let statestr = s.to_string();
@@ -226,7 +225,14 @@ impl StateMachineDefinition {
         };
 
         // Build the events enum
-        let events: HashSet<Variant> = self.transitions.iter().map(|t| t.event.clone()).collect();
+        // Preserve declaration order so macro expansion is reproducible across builds.
+        let mut seen_events = HashSet::new();
+        let events: Vec<Variant> = self
+            .transitions
+            .iter()
+            .map(|t| t.event.clone())
+            .filter(|e| seen_events.insert(e.clone()))
+            .collect();
         let events_enum_name = Ident::new(&format!("{name}Events"), name.span());
         let events: Vec<_> = events
             .into_iter()
@@ -272,7 +278,11 @@ impl StateMachineDefinition {
         };
         let mut multi_dest_enums = vec![];
         let mut multi_dest_enum_names = HashSet::new();
-        let state_branches: Vec<_> = statemap.into_iter().map(|(from, transitions)| {
+        // HashMap iteration would make generated match arms vary between builds.
+        let state_branches: Vec<_> = states.iter().cloned().map(|from| {
+            let transitions = statemap.remove(&from).unwrap_or_default();
+            (from, transitions)
+        }).map(|(from, transitions)| {
             let occupied_current_state = quote! { Some(#state_enum_name::#from(state_data)) };
             // Merge transition dest states with the same handler
             let transitions = merge_transition_dests(transitions);
@@ -349,6 +359,7 @@ impl StateMachineDefinition {
                         // If events do not have a handler, attempt to construct the next state
                         // using `Default`.
                         if let [new_state] = ts.to.as_slice() {
+                            let from = &ts.from;
                             let span = new_state.span();
                             let default_trans = quote_spanned! { span =>
                             let res = TransitionResult::<Self, #new_state>::from::<#from>(state_data);
@@ -452,7 +463,9 @@ impl StateMachineDefinition {
         TokenStream::from(output)
     }
 
-    fn all_states(&self) -> HashSet<Ident> {
+    fn all_states(&self) -> Vec<Ident> {
+        // Preserve encounter order to keep generated code and visualizations reproducible.
+        let mut seen = HashSet::new();
         self.transitions
             .iter()
             .flat_map(|t| {
@@ -460,6 +473,7 @@ impl StateMachineDefinition {
                 states.push(t.from.clone());
                 states
             })
+            .filter(|s| seen.insert(s.clone()))
             .collect()
     }
 
@@ -486,7 +500,9 @@ impl StateMachineDefinition {
 
 /// Merge transition's dest state lists for those with the same from state & handler
 fn merge_transition_dests(transitions: Vec<Transition>) -> Vec<Transition> {
-    let mut map = HashMap::<_, Transition>::new();
+    // Use the map only for lookup so merging cannot reorder generated event branches.
+    let mut index = HashMap::<_, usize>::new();
+    let mut merged: Vec<Transition> = vec![];
     for t in transitions {
         // We want to use the transition sans-destinations as the key
         let without_dests = {
@@ -494,14 +510,15 @@ fn merge_transition_dests(transitions: Vec<Transition>) -> Vec<Transition> {
             wd.to = vec![];
             wd
         };
-        match map.entry(without_dests) {
-            Entry::Occupied(mut e) => {
-                e.get_mut().to.extend(t.to);
+        match index.entry(without_dests) {
+            Entry::Occupied(e) => {
+                merged[*e.get()].to.extend(t.to);
             }
             Entry::Vacant(v) => {
-                v.insert(t);
+                v.insert(merged.len());
+                merged.push(t);
             }
         }
     }
-    map.into_values().collect()
+    merged
 }

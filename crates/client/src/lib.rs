@@ -1,3 +1,4 @@
+#![cfg_attr(docsrs, feature(doc_cfg))]
 #![warn(missing_docs)] // error if there are missing docs
 
 //! This crate contains client implementations that can be used to contact the Temporal service.
@@ -7,6 +8,7 @@
 #[macro_use]
 extern crate tracing;
 
+mod activity;
 mod async_activity_handle;
 pub mod callback_based;
 mod dns;
@@ -15,14 +17,18 @@ mod dns;
 pub mod envconfig;
 pub mod errors;
 pub mod grpc;
+/// Interceptors for high-level client operations.
+pub mod interceptors;
 mod metrics;
 mod options_structs;
-/// Visible only for tests
-#[doc(hidden)]
-pub mod proxy;
+#[cfg(feature = "experimental")]
+/// Experimental APIs for configuring clients with reusable plugins.
+pub mod plugins;
+mod proxy;
 mod replaceable;
 pub mod request_extensions;
 mod retry;
+mod rpc_options;
 /// Schedule operations: create, describe, update, pause, trigger, backfill, list, and delete.
 pub mod schedules;
 #[cfg(test)]
@@ -31,22 +37,40 @@ pub mod worker;
 mod workflow_handle;
 mod workflow_status;
 
-pub use crate::{
-    proxy::HttpConnectProxyOptions,
-    request_extensions::PayloadErrorLimits,
-    retry::{CallType, RETRYABLE_ERROR_CODES},
-};
+pub use crate::{proxy::HttpConnectProxyOptions, request_extensions::PayloadErrorLimits};
+pub use activity::*;
 pub use async_activity_handle::{
     ActivityHeartbeatResponse, ActivityIdentifier, AsyncActivityHandle,
 };
+pub(crate) use retry::CallType;
 #[doc(hidden)]
 pub use retry::jittered;
 
+pub use interceptors::{
+    BackfillScheduleInput, CancelWorkflowInput, ClientInterceptor, CompleteAsyncActivityInput,
+    CountWorkflowsInput, CountWorkflowsOutput, CreateScheduleInput, CreateScheduleOutput,
+    DeleteScheduleInput, DescribeScheduleInput, DescribeScheduleOutput, DescribeWorkflowInput,
+    DescribeWorkflowOutput, FailAsyncActivityInput, FetchWorkflowHistoryPageInput,
+    FetchWorkflowHistoryPageOutput, HasArgs, HeartbeatAsyncActivityInput, ListSchedulesPageInput,
+    ListSchedulesPageOutput, ListWorkflowsPageInput, ListWorkflowsPageOutput, Next,
+    PauseScheduleInput, PollWorkflowUpdateInput, PollWorkflowUpdateOutput, QueryWorkflowInput,
+    QueryWorkflowOutput, ReportAsyncActivityCancellationInput, SendScheduleUpdateInput,
+    SignalWithStartWorkflowInput, SignalWorkflowInput, StartWorkflowInput, StartWorkflowOutput,
+    StartWorkflowUpdateInput, StartWorkflowUpdateOutput, TemporalClientValue,
+    TerminateWorkflowInput, TriggerScheduleInput, UnpauseScheduleInput, UpdateScheduleInput,
+    UpdateWithStartWorkflowInput, UpdateWithStartWorkflowOutput,
+};
 pub use metrics::{LONG_REQUEST_LATENCY_HISTOGRAM_NAME, REQUEST_LATENCY_HISTOGRAM_NAME};
 pub use options_structs::*;
+#[cfg(feature = "experimental")]
+pub use plugins::{
+    ClientPlugin, ErasedClientPlugin, PluginApplyError, PluginError, PluginTarget, WorkerPluginData,
+};
 pub use replaceable::SharedReplaceableClient;
 pub use retry::RetryOptions;
-pub use temporalio_common::{Memo, RetryPolicy};
+pub use rpc_options::{RpcMetadata, RpcMetadataError, RpcOptions};
+pub use temporalio_common::{Memo, RetryPolicy, VersioningOverride};
+pub use url::Url;
 /// Potentially dangerous TLS related functionality.
 pub mod danger {
     /// Re-export the `ServerCertVerifier` trait so that users can implement custom TLS
@@ -54,11 +78,29 @@ pub mod danger {
     /// while explicitly acknowledging the danger in the import path.
     pub use tokio_rustls::rustls::client::danger::ServerCertVerifier;
 }
+#[cfg(feature = "dynamic-tls")]
+/// Re-export of [`tokio_rustls::rustls::SignatureScheme`] — parameter type
+/// of [`ResolvesClientCert::resolve`].
+pub use tokio_rustls::rustls::SignatureScheme;
+#[cfg(feature = "dynamic-tls")]
+/// Re-export the `ResolvesClientCert` trait and supporting types so that users
+/// can implement dynamic client certificate resolution without depending on
+/// `tokio-rustls` directly.
+///
+/// This enables transparent certificate rotation for mTLS connections (e.g.,
+/// short-lived certs issued by Vault and rotated on disk by a sidecar).
+///
+/// Implementors will also need [`CertifiedKey`] and [`SignatureScheme`].
+pub use tokio_rustls::rustls::client::ResolvesClientCert;
+#[cfg(feature = "dynamic-tls")]
+/// Re-export of [`tokio_rustls::rustls::sign::CertifiedKey`] — the return type
+/// of [`ResolvesClientCert::resolve`].
+pub use tokio_rustls::rustls::sign::CertifiedKey;
 pub use tonic;
 pub use workflow_handle::{
     UntypedQuery, UntypedSignal, UntypedUpdate, UntypedWorkflow, UntypedWorkflowHandle,
     WorkflowExecutionDescription, WorkflowExecutionInfo, WorkflowExecutionResult, WorkflowHandle,
-    WorkflowHistory, WorkflowResultDetails, WorkflowUpdateHandle,
+    WorkflowHistory, WorkflowHistoryError, WorkflowResultDetails, WorkflowUpdateHandle,
 };
 pub use workflow_status::WorkflowExecutionStatus;
 
@@ -72,11 +114,16 @@ use crate::{
     worker::ClientWorkerSet,
 };
 use errors::*;
-use futures_util::{stream, stream::Stream};
+use futures_util::{
+    future::{BoxFuture, try_join},
+    stream,
+    stream::Stream,
+};
 use http::Uri;
 use parking_lot::RwLock;
 use std::{
     collections::{HashMap, VecDeque},
+    error::Error,
     fmt::Debug,
     pin::Pin,
     str::FromStr,
@@ -85,10 +132,10 @@ use std::{
     time::{Duration, SystemTime},
 };
 use temporalio_common::{
-    HasWorkflowDefinition,
+    ActivityDefinition, HasWorkflowDefinition, SignalDefinition, UntypedActivity, UpdateDefinition,
     data_converters::{
-        DataConverter, GenericPayloadConverter, PayloadConverter, SerializationContext,
-        SerializationContextData,
+        ActivitySerializationContext, DataConverter, SerializationContext,
+        SerializationContextData, WorkflowSerializationContext,
     },
     payload_visitor::decode_payloads,
     protos::{
@@ -97,20 +144,26 @@ use temporalio_common::{
         proto_ts_to_system_time,
         temporal::api::{
             cloud::cloudservice::v1::cloud_service_client::CloudServiceClient,
-            common::v1::WorkflowType,
-            enums::v1::TaskQueueKind,
-            errordetails::v1::WorkflowExecutionAlreadyStartedFailure,
+            common::v1::{ActivityType, Memo as ProtoMemo, Payloads, WorkflowType},
+            enums::v1::{
+                ActivityIdConflictPolicy as ProtoActivityIdConflictPolicy,
+                ActivityIdReusePolicy as ProtoActivityIdReusePolicy, TaskQueueKind,
+                UpdateWorkflowExecutionLifecycleStage,
+                WorkflowIdConflictPolicy as ProtoWorkflowIdConflictPolicy,
+                WorkflowIdReusePolicy as ProtoWorkflowIdReusePolicy,
+            },
             operatorservice::v1::operator_service_client::OperatorServiceClient,
             sdk::v1::UserMetadata,
             taskqueue::v1::TaskQueue,
             testservice::v1::test_service_client::TestServiceClient,
             workflow::v1 as workflow,
             workflowservice::v1::{
-                count_workflow_executions_response, workflow_service_client::WorkflowServiceClient,
-                *,
+                count_workflow_executions_response,
+                execute_multi_operation_request::operation::Operation as MultiOperationRequest,
+                execute_multi_operation_response::response::Response as MultiOperationResponse,
+                workflow_service_client::WorkflowServiceClient, *,
             },
         },
-        utilities::decode_status_detail,
     },
     search_attributes::{SearchAttributeError, SearchAttributeValue, SearchAttributes},
 };
@@ -138,14 +191,6 @@ static TEMPORAL_NAMESPACE_HEADER_KEY: &str = "temporal-namespace";
 /// Key used to communicate when a GRPC message is too large
 pub static MESSAGE_TOO_LARGE_KEY: &str = "message-too-large";
 #[doc(hidden)]
-/// Returns the violation, if `status` is the client proactively rejecting an outbound request for exceeding a
-/// payload/memo error size limit.
-pub fn payload_limit_violation_from(
-    status: &tonic::Status,
-) -> Option<&temporalio_common::payload_limits::PayloadLimitViolation> {
-    std::error::Error::source(status).and_then(|src| src.downcast_ref())
-}
-#[doc(hidden)]
 /// Key used to indicate a error was returned by the retryer because of the short-circuit predicate
 pub static ERROR_RETURNED_DUE_TO_SHORT_CIRCUIT: &str = "short-circuit";
 
@@ -158,13 +203,14 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 ///
 /// Cloning a connection is cheap (single Arc increment). The underlying connection is shared
 /// between clones.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct Connection {
     inner: Arc<ConnectionInner>,
 }
 
-#[derive(Clone)]
+#[derive(Clone, derive_more::Debug)]
 struct ConnectionInner {
+    #[debug(skip)]
     service: TemporalServiceClient,
     retry_options: RetryOptions,
     identity: String,
@@ -240,6 +286,7 @@ impl Connection {
                 options.keep_alive.clone(),
                 options.override_origin.clone(),
                 dns_opts.resolution_interval,
+                options.connect_timeout,
             );
             (
                 ServiceBuilder::new()
@@ -252,8 +299,31 @@ impl Connection {
                 Some(handle),
             )
         } else {
-            let channel = Endpoint::from_shared(options.target.to_string())?;
-            let channel = add_tls_to_channel(options.tls_options.as_ref(), channel).await?;
+            let endpoint = Endpoint::from_shared(options.target.to_string())?;
+            let endpoint = if let Some(timeout) = options.connect_timeout {
+                endpoint.connect_timeout(timeout)
+            } else {
+                endpoint
+            };
+            let tls_result = add_tls_to_channel(options.tls_options.as_ref(), endpoint).await?;
+
+            #[cfg(feature = "dynamic-tls")]
+            let (channel, custom_connector_info) = match tls_result {
+                TlsConfigResult::Standard(ep) => (
+                    ep,
+                    None::<(Arc<tokio_rustls::rustls::ClientConfig>, String)>,
+                ),
+                TlsConfigResult::CustomConnector {
+                    endpoint: ep,
+                    rustls_config,
+                    domain,
+                } => (ep, Some((rustls_config, domain))),
+            };
+            #[cfg(not(feature = "dynamic-tls"))]
+            let channel = match tls_result {
+                TlsConfigResult::Standard(ep) => ep,
+            };
+
             let channel = if let Some(keep_alive) = options.keep_alive.as_ref() {
                 channel
                     .keep_alive_while_idle(true)
@@ -267,10 +337,38 @@ impl Connection {
             } else {
                 channel
             };
-            // If there is a proxy, we have to connect that way
+            // Validate that proxy and dynamic cert resolver aren't combined
+            #[cfg(feature = "dynamic-tls")]
+            if options.http_connect_proxy.is_some() && custom_connector_info.is_some() {
+                return Err(ClientConnectError::InvalidConfig(
+                    "client_cert_resolver is not yet supported with http_connect_proxy. \
+                     Use static client_tls_options when using a proxy, or remove the proxy."
+                        .to_owned(),
+                ));
+            }
+            // Connect, using a custom TLS connector if dynamic cert resolution is needed
             let channel = if let Some(proxy) = options.http_connect_proxy.as_ref() {
                 proxy.connect_endpoint(&channel).await?
             } else {
+                #[cfg(feature = "dynamic-tls")]
+                if let Some((rustls_config, domain)) = custom_connector_info {
+                    let server_name =
+                        tokio_rustls::rustls::pki_types::ServerName::try_from(domain.as_str())
+                            .map_err(|e| {
+                                ClientConnectError::InvalidConfig(format!(
+                                    "Invalid TLS domain name '{domain}': {e}"
+                                ))
+                            })?
+                            .to_owned();
+                    let connector = DynamicTlsConnector {
+                        tls: tokio_rustls::TlsConnector::from(rustls_config),
+                        domain: Arc::new(server_name),
+                    };
+                    channel.connect_with_connector(connector).await?
+                } else {
+                    channel.connect().await?
+                }
+                #[cfg(not(feature = "dynamic-tls"))]
                 channel.connect().await?
             };
             (
@@ -326,6 +424,14 @@ impl Connection {
         } else {
             None
         };
+        #[cfg(feature = "experimental")]
+        let payloads_warn_size = options.payload_limits.payloads_warn_size;
+        #[cfg(not(feature = "experimental"))]
+        let payloads_warn_size = options_structs::DEFAULT_PAYLOADS_WARN_SIZE;
+        #[cfg(feature = "experimental")]
+        let memo_warn_size = options.payload_limits.memo_warn_size;
+        #[cfg(not(feature = "experimental"))]
+        let memo_warn_size = options_structs::DEFAULT_MEMO_WARN_SIZE;
         Ok(Self {
             inner: Arc::new(ConnectionInner {
                 service: svc_client,
@@ -339,12 +445,9 @@ impl Connection {
                 _dns_task: dns_task,
                 payloads_warn_size: resolve_warn_threshold(
                     "payloads_warn_size",
-                    options.payload_limits.payloads_warn_size,
+                    payloads_warn_size,
                 ),
-                memo_warn_size: resolve_warn_threshold(
-                    "memo_warn_size",
-                    options.payload_limits.memo_warn_size,
-                ),
+                memo_warn_size: resolve_warn_threshold("memo_warn_size", memo_warn_size),
             }),
         })
     }
@@ -488,12 +591,35 @@ impl ClientHeaders {
     }
 }
 
+/// Result of TLS configuration: either standard tonic TLS was applied to the endpoint,
+/// or a custom rustls config is needed for dynamic certificate resolution.
+#[derive(Debug)]
+enum TlsConfigResult {
+    /// Standard tonic TLS was applied, endpoint is ready to connect normally.
+    Standard(Endpoint),
+    /// A custom rustls::ClientConfig is needed. The endpoint has no TLS configured;
+    /// the caller must use `connect_with_connector` with a custom TLS connector.
+    ///
+    /// Experimental API subject to change
+    #[cfg(feature = "dynamic-tls")]
+    CustomConnector {
+        endpoint: Endpoint,
+        rustls_config: Arc<tokio_rustls::rustls::ClientConfig>,
+        domain: String,
+    },
+}
+
 /// If TLS is configured, set the appropriate options on the provided channel and return it.
 /// Passes it through if TLS options not set.
+///
+/// When `client_cert_resolver` is set, tonic's built-in TLS cannot be used (it only supports
+/// static client certificates). In that case, we return `TlsConfigResult::CustomConnector`
+/// with a manually-built `rustls::ClientConfig` that the caller must use with
+/// `connect_with_connector`.
 async fn add_tls_to_channel(
     tls_options: Option<&TlsOptions>,
     mut channel: Endpoint,
-) -> Result<Endpoint, ClientConnectError> {
+) -> Result<TlsConfigResult, ClientConnectError> {
     if let Some(tls_cfg) = tls_options {
         if tls_cfg.server_cert_verifier.is_some() && tls_cfg.server_root_ca_cert.is_some() {
             return Err(ClientConnectError::InvalidConfig(
@@ -501,6 +627,51 @@ async fn add_tls_to_channel(
             ));
         }
 
+        #[cfg(feature = "dynamic-tls")]
+        if tls_cfg.client_tls_options.is_some() && tls_cfg.client_cert_resolver.is_some() {
+            return Err(ClientConnectError::InvalidConfig(
+                "Cannot set both `client_tls_options` and `client_cert_resolver`. \
+                 Use `client_tls_options` for static certificates or \
+                 `client_cert_resolver` for dynamic certificate resolution, but not both."
+                    .to_owned(),
+            ));
+        }
+
+        // Extract the domain for SNI / :authority header
+        let domain_override = tls_cfg.domain.clone();
+        if let Some(domain) = &domain_override {
+            let uri: Uri = format!("https://{domain}").parse()?;
+            channel = channel.origin(uri);
+        }
+
+        // Dynamic certificate resolver path: build rustls::ClientConfig manually
+        #[cfg(feature = "dynamic-tls")]
+        if let Some(resolver) = &tls_cfg.client_cert_resolver {
+            let rustls_config = build_custom_rustls_config(tls_cfg, Some(resolver.clone()))?;
+            // Strip brackets from IPv6 literals (e.g. "[::1]" -> "::1")
+            // since ServerName::try_from expects raw IP addresses
+            let sni_domain = domain_override
+                .or_else(|| {
+                    channel
+                        .uri()
+                        .host()
+                        .map(|h| h.trim_matches(|c| c == '[' || c == ']').to_owned())
+                })
+                .ok_or_else(|| {
+                    ClientConnectError::InvalidConfig(
+                        "Cannot determine TLS server name for dynamic cert resolution: \
+                         set 'domain' in TlsOptions or use a URL with a hostname"
+                            .to_owned(),
+                    )
+                })?;
+            return Ok(TlsConfigResult::CustomConnector {
+                endpoint: channel,
+                rustls_config: Arc::new(rustls_config),
+                domain: sni_domain,
+            });
+        }
+
+        // Standard tonic TLS path
         let mut tls = tonic::transport::ClientTlsConfig::new();
 
         if tls_cfg.server_cert_verifier.is_none() {
@@ -514,13 +685,6 @@ async fn add_tls_to_channel(
 
         if let Some(domain) = &tls_cfg.domain {
             tls = tls.domain_name(domain);
-
-            // This song and dance ultimately is just to make sure the `:authority` header ends
-            // up correct on requests while we use TLS. Setting the header directly in our
-            // interceptor doesn't work since seemingly it is overridden at some point by
-            // something lower level.
-            let uri: Uri = format!("https://{domain}").parse()?;
-            channel = channel.origin(uri);
         }
 
         if let Some(client_opts) = &tls_cfg.client_tls_options {
@@ -529,15 +693,202 @@ async fn add_tls_to_channel(
             tls = tls.identity(client_identity);
         }
 
-        return if let Some(verifier) = &tls_cfg.server_cert_verifier {
+        let endpoint = if let Some(verifier) = &tls_cfg.server_cert_verifier {
             channel
                 .tls_config_with_verifier(tls, verifier.clone())
-                .map_err(Into::into)
+                .map_err(ClientConnectError::from)?
         } else {
-            channel.tls_config(tls).map_err(Into::into)
+            channel.tls_config(tls).map_err(ClientConnectError::from)?
         };
+        return Ok(TlsConfigResult::Standard(endpoint));
     }
-    Ok(channel)
+    Ok(TlsConfigResult::Standard(channel))
+}
+
+#[cfg(feature = "dynamic-tls")]
+/// Build a `rustls::ClientConfig` manually for the dynamic certificate resolver path.
+///
+/// This replicates the logic that tonic normally handles internally but uses
+/// `with_client_cert_resolver` instead of `with_client_auth_cert`.
+fn build_custom_rustls_config(
+    tls_cfg: &TlsOptions,
+    client_cert_resolver: Option<Arc<dyn tokio_rustls::rustls::client::ResolvesClientCert>>,
+) -> Result<tokio_rustls::rustls::ClientConfig, ClientConnectError> {
+    use tokio_rustls::rustls::{ClientConfig, RootCertStore, crypto};
+
+    // Get or install a crypto provider
+    let provider = crypto::CryptoProvider::get_default()
+        .cloned()
+        .or_else(|| {
+            // Try ring first, then aws-lc, matching tonic's behavior
+            #[cfg(feature = "tls-ring")]
+            {
+                return Some(Arc::new(crypto::ring::default_provider()));
+            }
+            #[cfg(feature = "tls-aws-lc")]
+            #[allow(unreachable_code)]
+            {
+                return Some(Arc::new(crypto::aws_lc_rs::default_provider()));
+            }
+            #[allow(unreachable_code)]
+            None
+        })
+        .ok_or_else(|| {
+            ClientConnectError::InvalidConfig(
+                "No TLS crypto provider available. Enable the `tls-ring` or `tls-aws-lc` feature."
+                    .to_owned(),
+            )
+        })?;
+
+    let builder = ClientConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .map_err(|e| {
+            ClientConnectError::InvalidConfig(format!("Failed to configure TLS protocols: {e}"))
+        })?;
+
+    // Configure server certificate verification
+    let builder = if let Some(verifier) = &tls_cfg.server_cert_verifier {
+        builder
+            .dangerous()
+            .with_custom_certificate_verifier(verifier.clone())
+    } else {
+        use std::io::Cursor;
+        use tokio_rustls::rustls::pki_types::{CertificateDer, pem::PemObject as _};
+
+        let mut roots = RootCertStore::empty();
+        if let Some(ca_cert) = &tls_cfg.server_root_ca_cert {
+            let certs: Vec<CertificateDer<'static>> =
+                CertificateDer::pem_reader_iter(&mut Cursor::new(ca_cert))
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|e| {
+                        ClientConnectError::InvalidConfig(format!(
+                            "Failed to parse CA certificate PEM: {e}"
+                        ))
+                    })?;
+            roots.add_parsable_certificates(certs);
+            if roots.is_empty() {
+                return Err(ClientConnectError::InvalidConfig(
+                    "None of the provided CA certificates could be parsed. \
+                     Ensure the PEM data contains valid X.509 certificates."
+                        .to_owned(),
+                ));
+            }
+        } else {
+            // Use native OS root certificates (same logic as tonic's with_native_roots)
+            let native_result = rustls_native_certs::load_native_certs();
+            if !native_result.errors.is_empty() {
+                warn!(
+                    "errors occurred when loading native certs: {:?}",
+                    native_result.errors
+                );
+            }
+            if native_result.certs.is_empty() {
+                return Err(ClientConnectError::InvalidConfig(
+                    "No native TLS root certificates found".to_owned(),
+                ));
+            }
+            roots.add_parsable_certificates(native_result.certs);
+            if roots.is_empty() {
+                return Err(ClientConnectError::InvalidConfig(
+                    "Native TLS root certificates were found but none could be parsed".to_owned(),
+                ));
+            }
+        }
+        builder.with_root_certificates(roots)
+    };
+
+    // Configure client authentication
+    let mut config = if let Some(resolver) = client_cert_resolver {
+        builder.with_client_cert_resolver(resolver)
+    } else {
+        builder.with_no_client_auth()
+    };
+
+    // Set ALPN to h2 for HTTP/2 (required by gRPC)
+    config.alpn_protocols.push(b"h2".to_vec());
+
+    Ok(config)
+}
+
+#[cfg(feature = "dynamic-tls")]
+/// Default TCP connect timeout for the dynamic TLS connector.
+/// Matches a reasonable timeout for production use; the built-in tonic connector
+/// uses `Endpoint::connect_timeout()` which we cannot access from a custom connector.
+const DYNAMIC_TLS_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+
+#[cfg(feature = "dynamic-tls")]
+/// A custom connector that wraps a TCP connector with TLS using a custom
+/// `rustls::ClientConfig` (needed for dynamic cert resolution).
+#[derive(Clone)]
+struct DynamicTlsConnector {
+    tls: tokio_rustls::TlsConnector,
+    domain: Arc<tokio_rustls::rustls::pki_types::ServerName<'static>>,
+}
+
+#[cfg(feature = "dynamic-tls")]
+impl std::fmt::Debug for DynamicTlsConnector {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DynamicTlsConnector")
+            .field("domain", &self.domain)
+            .finish()
+    }
+}
+
+#[cfg(feature = "dynamic-tls")]
+impl tower::Service<Uri> for DynamicTlsConnector {
+    type Response = hyper_util::rt::TokioIo<tokio_rustls::client::TlsStream<tokio::net::TcpStream>>;
+    type Error = Box<dyn std::error::Error + Send + Sync>;
+    type Future =
+        Pin<Box<dyn std::future::Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+
+    fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, uri: Uri) -> Self::Future {
+        let tls = self.tls.clone();
+        let domain = self.domain.clone();
+
+        Box::pin(async move {
+            let host = uri
+                .host()
+                .ok_or_else(|| -> Box<dyn std::error::Error + Send + Sync> {
+                    format!("URI has no host for TLS connection: {uri}").into()
+                })?;
+            let port = uri.port_u16().unwrap_or(443);
+            // Use (host, port) tuple to correctly handle IPv6 addresses
+            // (e.g. "::1" would break if formatted as "::1:443")
+            let addr_display = format!("{}:{}", host, port);
+
+            debug!(target: "temporal_client", %uri, addr = %addr_display, "DynamicTlsConnector: establishing TCP+TLS connection");
+
+            // Use a timeout to prevent hanging on unreachable hosts.
+            // Tonic's built-in connector respects Endpoint::connect_timeout(),
+            // but custom connectors must handle timeouts themselves.
+            let tcp = tokio::time::timeout(
+                DYNAMIC_TLS_CONNECT_TIMEOUT,
+                tokio::net::TcpStream::connect((host, port)),
+            )
+            .await
+            .map_err(|_| -> Box<dyn std::error::Error + Send + Sync> {
+                format!(
+                    "TCP connect to {addr_display} timed out after {}s",
+                    DYNAMIC_TLS_CONNECT_TIMEOUT.as_secs()
+                )
+                .into()
+            })?
+            .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+                format!("TCP connect to {addr_display} failed: {e}").into()
+            })?;
+
+            // Disable Nagle's algorithm for low-latency gRPC messaging
+            tcp.set_nodelay(true)?;
+
+            let tls_stream = tls.connect(domain.as_ref().to_owned(), tcp).await?;
+            debug!(target: "temporal_client", addr = %addr_display, "DynamicTlsConnector: TLS handshake complete");
+            Ok(hyper_util::rt::TokioIo::new(tls_stream))
+        })
+    }
 }
 
 fn parse_ascii_headers(
@@ -733,18 +1084,36 @@ impl TemporalServiceClient {
 
 /// Contains an instance of a namespace-bound client for interacting with the Temporal server.
 /// Cheap to clone.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct Client {
     connection: Connection,
     options: Arc<ClientOptions>,
 }
 
 impl Client {
+    /// Connect to a Temporal service and create a namespace-bound client, applying registered
+    /// plugins to connection and client options in registration order.
+    pub async fn connect(
+        connection_options: ConnectionOptions,
+        client_options: ClientOptions,
+    ) -> Result<Self, ClientConnectError> {
+        #[cfg(feature = "experimental")]
+        let mut connection_options = connection_options;
+        #[cfg(feature = "experimental")]
+        plugins::apply_connection_plugins(&client_options, &mut connection_options)?;
+        let connection = Connection::connect(connection_options).await?;
+        Ok(Self::new(connection, client_options)?)
+    }
+
     /// Create a new client from a connection and options.
     ///
-    /// Currently infallible, but returns a `Result` for future extensibility
-    /// (e.g., interceptor or plugin validation).
+    /// Registered client plugins are applied here. Connection plugin hooks only run when using
+    /// [`Client::connect`].
     pub fn new(connection: Connection, options: ClientOptions) -> Result<Self, ClientNewError> {
+        #[cfg(feature = "experimental")]
+        let mut options = options;
+        #[cfg(feature = "experimental")]
+        plugins::apply_client_plugins(&mut options)?;
         Ok(Client {
             connection,
             options: Arc::new(options),
@@ -796,6 +1165,92 @@ impl Client {
         WorkflowClientTrait::start_workflow(self, workflow, input, options).await
     }
 
+    /// Atomically signal a workflow as it starts.
+    ///
+    /// The workflow receives the signal before its first workflow task.
+    pub async fn signal_with_start_workflow<W, S>(
+        &self,
+        workflow: W,
+        workflow_input: W::Input,
+        signal: S,
+        signal_input: S::Input,
+        options: WorkflowStartOptions,
+    ) -> Result<WorkflowHandle<Self, W>, WorkflowStartError>
+    where
+        W: HasWorkflowDefinition,
+        W::Input: Send,
+        S: SignalDefinition<Workflow = W::Run>,
+        S::Input: Send,
+    {
+        WorkflowClientTrait::signal_with_start_workflow(
+            self,
+            workflow,
+            workflow_input,
+            signal,
+            signal_input,
+            options,
+        )
+        .await
+    }
+
+    /// Start a workflow and send it an update as a single atomic operation.
+    ///
+    /// Returns once the update has been accepted by the workflow, yielding a
+    /// [`WorkflowUpdateHandle`] that can be used to wait for the update result.
+    pub async fn start_update_with_start_workflow<W, U>(
+        &self,
+        workflow: W,
+        workflow_input: W::Input,
+        update: U,
+        update_input: U::Input,
+        options: WorkflowUpdateWithStartOptions,
+    ) -> Result<WorkflowUpdateHandle<Self, U::Output>, WorkflowUpdateWithStartError>
+    where
+        W: HasWorkflowDefinition,
+        W::Input: Send,
+        U: UpdateDefinition<Workflow = W::Run>,
+        U::Input: Send,
+    {
+        WorkflowClientTrait::start_update_with_start_workflow(
+            self,
+            workflow,
+            workflow_input,
+            update,
+            update_input,
+            options,
+        )
+        .await
+    }
+
+    /// Start a workflow and send it an update as a single atomic operation, waiting for the
+    /// update to complete and returning its result.
+    ///
+    /// See [Client::start_update_with_start_workflow] for details on option requirements.
+    pub async fn execute_update_with_start_workflow<W, U>(
+        &self,
+        workflow: W,
+        workflow_input: W::Input,
+        update: U,
+        update_input: U::Input,
+        options: WorkflowUpdateWithStartOptions,
+    ) -> Result<U::Output, WorkflowUpdateWithStartError>
+    where
+        W: HasWorkflowDefinition,
+        W::Input: Send,
+        U: UpdateDefinition<Workflow = W::Run>,
+        U::Input: Send,
+    {
+        WorkflowClientTrait::execute_update_with_start_workflow(
+            self,
+            workflow,
+            workflow_input,
+            update,
+            update_input,
+            options,
+        )
+        .await
+    }
+
     /// Get a handle to an existing workflow.
     ///
     /// For untyped access, use `get_workflow_handle::<UntypedWorkflow>(...)`.
@@ -830,11 +1285,92 @@ impl Client {
     /// Get a handle to complete an activity asynchronously.
     ///
     /// An activity returning `ActivityError::WillCompleteAsync` can be completed with this handle.
+    ///
+    /// To get a handle to a standalone activity that can be used to wait for result and manage
+    /// the execution, see [`get_activity_handle`](Self::get_activity_handle).
     pub fn get_async_activity_handle(
         &self,
         identifier: ActivityIdentifier,
     ) -> AsyncActivityHandle<Self> {
         WorkflowClientTrait::get_async_activity_handle(self, identifier)
+    }
+
+    /// Start a standalone activity.
+    ///
+    /// Returns [`ActivityHandle`] that can be used to wait for result or to perform other
+    /// operations on the activity.
+    pub async fn start_activity<A>(
+        &self,
+        activity: A,
+        input: A::Input,
+        options: ActivityStartOptions,
+    ) -> Result<ActivityHandle<Self, A>, StartActivityError>
+    where
+        A: ActivityDefinition,
+    {
+        WorkflowClientTrait::start_activity(self, activity, input, options).await
+    }
+
+    /// Get a handle to an existing standalone activity execution. If `run_id` is not specified,
+    /// the handle always targets the latest execution with matching ID.
+    ///
+    /// Note that the validity of the handle is not checked until a method is called on it.
+    /// If invalid ID or run ID is used, the method will return `NotFound` error.
+    ///
+    /// To get an untyped handle, use [`get_untyped_activity_handle`](Self::get_untyped_activity_handle).
+    ///
+    /// To get a handle that can be used to complete an activity asynchronously,
+    /// see [`get_async_activity_handle`](Self::get_async_activity_handle).
+    pub fn get_activity_handle<A>(
+        &self,
+        activity: A,
+        id: impl Into<String>,
+        run_id: Option<String>,
+    ) -> ActivityHandle<Self, A>
+    where
+        Self: Sized,
+        A: ActivityDefinition,
+    {
+        WorkflowClientTrait::get_activity_handle(self, activity, id, run_id)
+    }
+
+    /// Get an untyped handle to an existing standalone activity execution. If `run_id` is not
+    /// specified, the handle always targets the latest execution with matching ID.
+    ///
+    /// Note that the validity of the handle is not checked until a method is called on it.
+    /// If invalid ID or run ID is used, the method will return `NotFound` error.
+    ///
+    /// To get a typed handle, use [`get_activity_handle`](Self::get_activity_handle).
+    ///
+    /// To get a handle that can be used to complete an activity asynchronously,
+    /// see [`get_async_activity_handle`](Self::get_async_activity_handle).
+    pub fn get_untyped_activity_handle(
+        &self,
+        id: impl Into<String>,
+        run_id: Option<String>,
+    ) -> ActivityHandle<Self, UntypedActivity>
+    where
+        Self: Sized,
+    {
+        WorkflowClientTrait::get_untyped_activity_handle(self, id, run_id)
+    }
+
+    /// List activities matching a query. Returns a stream that lazily paginates through results.
+    pub fn list_activities(
+        &self,
+        query: impl Into<String>,
+        options: ActivityListOptions,
+    ) -> ListActivitiesStream {
+        WorkflowClientTrait::list_activities(self, query, options)
+    }
+
+    /// Count activities matching a query.
+    pub async fn count_activities(
+        &self,
+        query: impl Into<String>,
+        options: ActivityCountOptions,
+    ) -> Result<ActivityExecutionCount, ClientError> {
+        WorkflowClientTrait::count_activities(self, query, options).await
     }
 }
 
@@ -849,6 +1385,10 @@ impl NamespacedClient for Client {
 
     fn data_converter(&self) -> &DataConverter {
         &self.options.data_converter
+    }
+
+    fn client_interceptors(&self) -> &[Arc<dyn ClientInterceptor>] {
+        &self.options.client_interceptors
     }
 }
 
@@ -875,6 +1415,56 @@ pub(crate) trait WorkflowClientTrait: NamespacedClient {
         Self: Sized,
         W: HasWorkflowDefinition,
         W::Input: Send;
+
+    /// Start a workflow and atomically send it a signal.
+    fn signal_with_start_workflow<W, S>(
+        &self,
+        workflow: W,
+        workflow_input: W::Input,
+        signal: S,
+        signal_input: S::Input,
+        options: WorkflowStartOptions,
+    ) -> impl Future<Output = Result<WorkflowHandle<Self, W>, WorkflowStartError>>
+    where
+        Self: Sized,
+        W: HasWorkflowDefinition,
+        W::Input: Send,
+        S: SignalDefinition<Workflow = W::Run>,
+        S::Input: Send;
+
+    /// Start a workflow and send it an update as a single atomic operation, returning once the
+    /// update reaches the requested wait stage.
+    fn start_update_with_start_workflow<W, U>(
+        &self,
+        workflow: W,
+        workflow_input: W::Input,
+        update: U,
+        update_input: U::Input,
+        options: WorkflowUpdateWithStartOptions,
+    ) -> impl Future<Output = Result<WorkflowUpdateHandle<Self, U::Output>, WorkflowUpdateWithStartError>>
+    where
+        Self: Sized,
+        W: HasWorkflowDefinition,
+        W::Input: Send,
+        U: UpdateDefinition<Workflow = W::Run>,
+        U::Input: Send;
+
+    /// Start a workflow and send it an update as a single atomic operation, waiting for the
+    /// update to complete and returning its result.
+    fn execute_update_with_start_workflow<W, U>(
+        &self,
+        workflow: W,
+        workflow_input: W::Input,
+        update: U,
+        update_input: U::Input,
+        options: WorkflowUpdateWithStartOptions,
+    ) -> impl Future<Output = Result<U::Output, WorkflowUpdateWithStartError>>
+    where
+        Self: Sized,
+        W: HasWorkflowDefinition,
+        W::Input: Send,
+        U: UpdateDefinition<Workflow = W::Run>,
+        U::Input: Send;
 
     /// Get a handle to an existing workflow. `run_id` may be left blank to specify the most recent
     /// execution having the provided `workflow_id`.
@@ -914,6 +1504,51 @@ pub(crate) trait WorkflowClientTrait: NamespacedClient {
     ) -> AsyncActivityHandle<Self>
     where
         Self: Sized;
+
+    /// Start a standalone activity.
+    fn start_activity<A>(
+        &self,
+        activity: A,
+        input: A::Input,
+        options: ActivityStartOptions,
+    ) -> impl Future<Output = Result<ActivityHandle<Self, A>, StartActivityError>>
+    where
+        Self: Sized,
+        A: ActivityDefinition;
+
+    /// Get a handle to a previously started standalone activity.
+    fn get_activity_handle<A>(
+        &self,
+        activity: A,
+        id: impl Into<String>,
+        run_id: Option<String>,
+    ) -> ActivityHandle<Self, A>
+    where
+        Self: Sized,
+        A: ActivityDefinition;
+
+    /// Get an untyped handle to a previously started standalone activity.
+    fn get_untyped_activity_handle(
+        &self,
+        id: impl Into<String>,
+        run_id: Option<String>,
+    ) -> ActivityHandle<Self, UntypedActivity>
+    where
+        Self: Sized;
+
+    /// List activities matching a query. Returns a stream that lazily paginates through results.
+    fn list_activities(
+        &self,
+        query: impl Into<String>,
+        _options: ActivityListOptions,
+    ) -> ListActivitiesStream;
+
+    /// Count activities matching a query.
+    fn count_activities(
+        &self,
+        query: impl Into<String>,
+        _options: ActivityCountOptions,
+    ) -> impl Future<Output = Result<ActivityExecutionCount, ClientError>>;
 }
 
 /// A client that is bound to a namespace
@@ -927,6 +1562,16 @@ pub trait NamespacedClient {
     fn data_converter(&self) -> &DataConverter {
         static DEFAULT: OnceLock<DataConverter> = OnceLock::new();
         DEFAULT.get_or_init(DataConverter::default)
+    }
+    /// Returns the interceptors used for high-level client operations.
+    ///
+    /// # Warning
+    ///
+    /// This provider exists so SDK-owned client handles can carry interceptor configuration
+    /// through the high-level client blanket implementation. Custom client implementations should
+    /// normally retain the default empty chain unless they deliberately provide the same plumbing.
+    fn client_interceptors(&self) -> &[Arc<dyn ClientInterceptor>] {
+        &[]
     }
 }
 
@@ -1020,7 +1665,7 @@ impl WorkflowExecution {
         Memo::from_raw(
             self.raw.memo.clone(),
             self.data_converter.payload_converter().clone(),
-            SerializationContextData::Workflow,
+            SerializationContextData::Workflow(WorkflowSerializationContext::new()),
         )
     }
 
@@ -1156,6 +1801,60 @@ impl WorkflowCountAggregationGroup {
     }
 }
 
+// Keep the common fields used by start RPC variants in one place so their option handling does
+// not drift as new fields are added.
+fn build_start_workflow_request(
+    client: &impl NamespacedClient,
+    workflow_type: String,
+    input: Option<Payloads>,
+    memo: Option<ProtoMemo>,
+    options: WorkflowStartOptions,
+) -> StartWorkflowExecutionRequest {
+    let user_metadata = options.user_metadata();
+    let request_eager_execution = options.enable_eager_workflow_start;
+    StartWorkflowExecutionRequest {
+        namespace: client.namespace(),
+        input,
+        workflow_id: options.workflow_id,
+        workflow_type: Some(WorkflowType {
+            name: workflow_type,
+        }),
+        task_queue: Some(TaskQueue {
+            name: options.task_queue,
+            kind: TaskQueueKind::Unspecified as i32,
+            normal_name: String::new(),
+        }),
+        identity: client.identity(),
+        request_id: Uuid::new_v4().to_string(),
+        workflow_id_reuse_policy: ProtoWorkflowIdReusePolicy::from(options.id_reuse_policy) as i32,
+        workflow_id_conflict_policy: ProtoWorkflowIdConflictPolicy::from(options.id_conflict_policy)
+            as i32,
+        workflow_execution_timeout: options
+            .execution_timeout
+            .and_then(|duration| duration.try_into().ok()),
+        workflow_run_timeout: options
+            .run_timeout
+            .and_then(|duration| duration.try_into().ok()),
+        workflow_task_timeout: options
+            .task_timeout
+            .and_then(|duration| duration.try_into().ok()),
+        search_attributes: options
+            .search_attributes
+            .map(|attributes| attributes.into_proto()),
+        cron_schedule: options.cron_schedule.unwrap_or_default(),
+        request_eager_execution,
+        retry_policy: options.retry_policy.map(Into::into),
+        links: options.links,
+        completion_callbacks: options.completion_callbacks,
+        priority: Some(options.priority.into()),
+        versioning_override: options.versioning_override.map(Into::into),
+        memo,
+        header: options.header,
+        user_metadata,
+        ..Default::default()
+    }
+}
+
 impl<T> WorkflowClientTrait for T
 where
     T: WorkflowService + NamespacedClient + Clone + Send + Sync + 'static,
@@ -1170,133 +1869,63 @@ where
         W: HasWorkflowDefinition,
         W::Input: Send,
     {
-        let payloads = self
-            .data_converter()
-            .to_payloads(&SerializationContextData::Workflow, &input)
-            .await?;
         let namespace = self.namespace();
-        let workflow_id = options.workflow_id.clone();
-        let task_queue_name = options.task_queue.clone();
+        let interceptor_output = interceptors::call_start_workflow(
+            self.client_interceptors(),
+            StartWorkflowInput::new(workflow.name().to_owned(), input, options),
+            Next::new({
+                let client = (*self).clone();
+                move |input: StartWorkflowInput| -> BoxFuture<
+                    '_,
+                    Result<StartWorkflowOutput, WorkflowStartError>,
+                > {
+                    let mut client = client;
+                    Box::pin(async move {
+                        let (workflow_type, args, options, rpc_options) = input.into_parts();
+                        let data_converter = client.data_converter().clone();
+                        let unencoded_payloads = {
+                            let payload_converter = data_converter.payload_converter();
+                            let context_data = SerializationContextData::Workflow(
+                                WorkflowSerializationContext::new(),
+                            );
+                            let context =
+                                SerializationContext::new(&context_data, payload_converter);
+                            args.serialize_payloads(&context)
+                        };
+                        drop(args);
 
-        let user_metadata = if options.static_summary.is_some() || options.static_details.is_some()
-        {
-            let payload_converter = PayloadConverter::default();
-            let context = SerializationContext {
-                data: &SerializationContextData::Workflow,
-                converter: &payload_converter,
-            };
-            Some(UserMetadata {
-                summary: options.static_summary.map(|s| {
-                    payload_converter
-                        .to_payload(&context, &s)
-                        .expect("String-to-JSON payload serialization is infallible")
-                }),
-                details: options.static_details.map(|s| {
-                    payload_converter
-                        .to_payload(&context, &s)
-                        .expect("String-to-JSON payload serialization is infallible")
-                }),
-            })
-        } else {
-            None
-        };
+                        let payloads = data_converter
+                            .codec()
+                            .encode(&SerializationContextData::Workflow(WorkflowSerializationContext::new()), unencoded_payloads?)
+                            .await?;
+                        let workflow_id = options.workflow_id.clone();
+                        let memo = options.encoded_memo(&data_converter).await?;
+                        let mut request = build_start_workflow_request(
+                            &client,
+                            workflow_type,
+                            payloads.into_payloads(),
+                            memo,
+                            options,
+                        )
+                        .into_request();
+                        rpc_options.apply_to(&mut request);
+                        let run_id = client
+                            .start_workflow_execution(request)
+                            .await
+                            .map_err(WorkflowStartError::from_status)?
+                            .into_inner()
+                            .run_id;
 
-        let run_id = if let Some(start_signal) = options.start_signal {
-            // Use signal-with-start when a start_signal is provided
-            let res = WorkflowService::signal_with_start_workflow_execution(
-                &mut self.clone(),
-                SignalWithStartWorkflowExecutionRequest {
-                    namespace: namespace.clone(),
-                    workflow_id: workflow_id.clone(),
-                    workflow_type: Some(WorkflowType {
-                        name: workflow.name().to_string(),
-                    }),
-                    task_queue: Some(TaskQueue {
-                        name: task_queue_name,
-                        kind: TaskQueueKind::Normal as i32,
-                        normal_name: "".to_string(),
-                    }),
-                    input: payloads.into_payloads(),
-                    signal_name: start_signal.signal_name,
-                    signal_input: start_signal.input,
-                    identity: self.identity(),
-                    request_id: Uuid::new_v4().to_string(),
-                    workflow_id_reuse_policy: options.id_reuse_policy as i32,
-                    workflow_id_conflict_policy: options.id_conflict_policy as i32,
-                    workflow_execution_timeout: options
-                        .execution_timeout
-                        .and_then(|d| d.try_into().ok()),
-                    workflow_run_timeout: options.run_timeout.and_then(|d| d.try_into().ok()),
-                    workflow_task_timeout: options.task_timeout.and_then(|d| d.try_into().ok()),
-                    search_attributes: options.search_attributes.map(|t| t.into_proto()),
-                    cron_schedule: options.cron_schedule.unwrap_or_default(),
-                    retry_policy: options.retry_policy.map(Into::into),
-                    header: options.header.or(start_signal.header),
-                    user_metadata,
-                    ..Default::default()
+                        Ok(StartWorkflowOutput::new(workflow_id, run_id))
+                    })
                 }
-                .into_request(),
-            )
-            .await?
-            .into_inner();
-            res.run_id
-        } else {
-            // Normal start workflow
-            let res = self
-                .clone()
-                .start_workflow_execution(
-                    StartWorkflowExecutionRequest {
-                        namespace: namespace.clone(),
-                        input: payloads.into_payloads(),
-                        workflow_id: workflow_id.clone(),
-                        workflow_type: Some(WorkflowType {
-                            name: workflow.name().to_string(),
-                        }),
-                        task_queue: Some(TaskQueue {
-                            name: task_queue_name,
-                            kind: TaskQueueKind::Unspecified as i32,
-                            normal_name: "".to_string(),
-                        }),
-                        request_id: Uuid::new_v4().to_string(),
-                        workflow_id_reuse_policy: options.id_reuse_policy as i32,
-                        workflow_id_conflict_policy: options.id_conflict_policy as i32,
-                        workflow_execution_timeout: options
-                            .execution_timeout
-                            .and_then(|d| d.try_into().ok()),
-                        workflow_run_timeout: options.run_timeout.and_then(|d| d.try_into().ok()),
-                        workflow_task_timeout: options.task_timeout.and_then(|d| d.try_into().ok()),
-                        search_attributes: options.search_attributes.map(|t| t.into_proto()),
-                        cron_schedule: options.cron_schedule.unwrap_or_default(),
-                        request_eager_execution: options.enable_eager_workflow_start,
-                        retry_policy: options.retry_policy.map(Into::into),
-                        links: options.links,
-                        completion_callbacks: options.completion_callbacks,
-                        priority: Some(options.priority.into()),
-                        header: options.header,
-                        user_metadata,
-                        ..Default::default()
-                    }
-                    .into_request(),
-                )
-                .await
-                .map_err(|status| {
-                    if status.code() == Code::AlreadyExists {
-                        let run_id =
-                            decode_status_detail::<WorkflowExecutionAlreadyStartedFailure>(
-                                status.details(),
-                            )
-                            .map(|f| f.run_id);
-                        WorkflowStartError::AlreadyStarted {
-                            run_id,
-                            source: status,
-                        }
-                    } else {
-                        WorkflowStartError::Rpc(status)
-                    }
-                })?
-                .into_inner();
-            res.run_id
-        };
+            }),
+        )
+        .await?;
+        let StartWorkflowOutput {
+            workflow_id,
+            run_id,
+        } = interceptor_output;
 
         Ok(WorkflowHandle::new(
             self.clone(),
@@ -1307,6 +1936,348 @@ where
                 first_execution_run_id: Some(run_id),
             },
         ))
+    }
+
+    async fn signal_with_start_workflow<W, S>(
+        &self,
+        workflow: W,
+        workflow_input: W::Input,
+        signal: S,
+        signal_input: S::Input,
+        options: WorkflowStartOptions,
+    ) -> Result<WorkflowHandle<Self, W>, WorkflowStartError>
+    where
+        W: HasWorkflowDefinition,
+        W::Input: Send,
+        S: SignalDefinition<Workflow = W::Run>,
+        S::Input: Send,
+    {
+        let namespace = self.namespace();
+        let interceptor_output = interceptors::call_signal_with_start_workflow(
+            self.client_interceptors(),
+            SignalWithStartWorkflowInput::new(
+                workflow.name().to_owned(),
+                workflow_input,
+                signal.name().to_owned(),
+                signal_input,
+                options,
+            ),
+            Next::new({
+                let client = (*self).clone();
+                move |input: SignalWithStartWorkflowInput| -> BoxFuture<
+                    '_,
+                    Result<StartWorkflowOutput, WorkflowStartError>,
+                > {
+                    let mut client = client;
+                    Box::pin(async move {
+                        let (
+                            workflow_type,
+                            workflow_args,
+                            signal_name,
+                            signal_args,
+                            options,
+                            rpc_options,
+                        ) = input.into_parts();
+                        let data_converter = client.data_converter().clone();
+                        let payload_converter = data_converter.payload_converter();
+                        let context_data = SerializationContextData::Workflow(
+                            WorkflowSerializationContext::new(),
+                        );
+                        let context = SerializationContext::new(&context_data, payload_converter);
+                        let workflow_payloads = workflow_args.serialize_payloads(&context);
+                        let signal_payloads = signal_args.serialize_payloads(&context);
+                        drop(workflow_args);
+                        drop(signal_args);
+                        let workflow_payloads = data_converter
+                            .codec()
+                            .encode(&SerializationContextData::Workflow(WorkflowSerializationContext::new()), workflow_payloads?)
+                            .await?;
+                        let signal_payloads = data_converter
+                            .codec()
+                            .encode(&SerializationContextData::Workflow(WorkflowSerializationContext::new()), signal_payloads?)
+                            .await?;
+                        let workflow_id = options.workflow_id.clone();
+                        let memo = options.encoded_memo(&data_converter).await?;
+                        let mut start_request = build_start_workflow_request(
+                            &client,
+                            workflow_type,
+                            workflow_payloads.into_payloads(),
+                            memo,
+                            options,
+                        );
+                        if let Some(task_queue) = &mut start_request.task_queue {
+                            task_queue.kind = TaskQueueKind::Normal as i32;
+                        }
+                        let mut request = SignalWithStartWorkflowExecutionRequest {
+                            namespace: start_request.namespace,
+                            workflow_id: start_request.workflow_id,
+                            workflow_type: start_request.workflow_type,
+                            task_queue: start_request.task_queue,
+                            input: start_request.input,
+                            workflow_execution_timeout: start_request.workflow_execution_timeout,
+                            workflow_run_timeout: start_request.workflow_run_timeout,
+                            workflow_task_timeout: start_request.workflow_task_timeout,
+                            identity: start_request.identity,
+                            request_id: start_request.request_id,
+                            workflow_id_reuse_policy: start_request.workflow_id_reuse_policy,
+                            workflow_id_conflict_policy: start_request.workflow_id_conflict_policy,
+                            signal_name,
+                            signal_input: Some(Payloads {
+                                payloads: signal_payloads,
+                            }),
+                            retry_policy: start_request.retry_policy,
+                            cron_schedule: start_request.cron_schedule,
+                            memo: start_request.memo,
+                            search_attributes: start_request.search_attributes,
+                            header: start_request.header,
+                            workflow_start_delay: start_request.workflow_start_delay,
+                            user_metadata: start_request.user_metadata,
+                            links: start_request.links,
+                            versioning_override: start_request.versioning_override,
+                            priority: start_request.priority,
+                            time_skipping_config: start_request.time_skipping_config,
+                            ..Default::default()
+                        }
+                        .into_request();
+                        rpc_options.apply_to(&mut request);
+                        let run_id = WorkflowService::signal_with_start_workflow_execution(
+                            &mut client,
+                            request,
+                        )
+                        .await?
+                        .into_inner()
+                        .run_id;
+                        Ok(StartWorkflowOutput::new(workflow_id, run_id))
+                    })
+                }
+            }),
+        )
+        .await?;
+        let StartWorkflowOutput {
+            workflow_id,
+            run_id,
+        } = interceptor_output;
+
+        Ok(WorkflowHandle::new(
+            self.clone(),
+            WorkflowExecutionInfo {
+                namespace,
+                workflow_id,
+                run_id: Some(run_id.clone()),
+                first_execution_run_id: Some(run_id),
+            },
+        ))
+    }
+
+    async fn start_update_with_start_workflow<W, U>(
+        &self,
+        workflow: W,
+        workflow_input: W::Input,
+        update: U,
+        update_input: U::Input,
+        options: WorkflowUpdateWithStartOptions,
+    ) -> Result<WorkflowUpdateHandle<Self, U::Output>, WorkflowUpdateWithStartError>
+    where
+        W: HasWorkflowDefinition,
+        W::Input: Send,
+        U: UpdateDefinition<Workflow = W::Run>,
+        U::Input: Send,
+    {
+        let output = interceptors::call_update_with_start_workflow(
+            self.client_interceptors(),
+            UpdateWithStartWorkflowInput::new(
+                workflow.name().to_owned(),
+                workflow_input,
+                update.name().to_owned(),
+                update_input,
+                options,
+            ),
+            Next::new({
+                let client = (*self).clone();
+                move |input: UpdateWithStartWorkflowInput| -> BoxFuture<
+                    '_,
+                    Result<UpdateWithStartWorkflowOutput, WorkflowUpdateWithStartError>,
+                > {
+                    let mut client = client;
+                    Box::pin(async move {
+                        let UpdateWithStartWorkflowInput {
+                            workflow_type,
+                            update_name,
+                            options,
+                            rpc_options,
+                            workflow_args,
+                            update_args,
+                        } = input;
+                        let (start_options, update_id, update_header) = options.into_parts();
+
+                        let data_converter = client.data_converter().clone();
+                        let (unencoded_workflow_payloads, unencoded_update_payloads) = {
+                            let payload_converter = data_converter.payload_converter();
+                            let context_data = SerializationContextData::Workflow(
+                                WorkflowSerializationContext::new(),
+                            );
+                            let context =
+                                SerializationContext::new(&context_data, payload_converter);
+                            (
+                                workflow_args.serialize_payloads(&context),
+                                update_args.serialize_payloads(&context),
+                            )
+                        };
+                        drop(workflow_args);
+                        drop(update_args);
+                        // The codec may do expensive work per call (e.g. remote encryption), so
+                        // encode both payload sets concurrently.
+                        let (workflow_payloads, update_payloads) = try_join(
+                            data_converter.codec().encode(
+                                &SerializationContextData::Workflow(
+                                    WorkflowSerializationContext::new(),
+                                ),
+                                unencoded_workflow_payloads?,
+                            ),
+                            data_converter.codec().encode(
+                                &SerializationContextData::Workflow(
+                                    WorkflowSerializationContext::new(),
+                                ),
+                                unencoded_update_payloads?,
+                            ),
+                        )
+                        .await?;
+
+                        let namespace = client.namespace();
+                        let workflow_id = start_options.workflow_id.clone();
+                        let memo = start_options.encoded_memo(&data_converter).await?;
+                        let start_request = build_start_workflow_request(
+                            &client,
+                            workflow_type,
+                            workflow_payloads.into_payloads(),
+                            memo,
+                            start_options,
+                        );
+
+                        let update_id = update_id.unwrap_or_else(|| Uuid::new_v4().to_string());
+                        let update_request = workflow_handle::build_update_workflow_request(
+                            namespace.clone(),
+                            client.identity(),
+                            workflow_id.clone(),
+                            String::new(),
+                            update_id.clone(),
+                            update_name,
+                            update_header,
+                            update_payloads,
+                        );
+
+                        let request = ExecuteMultiOperationRequest {
+                            namespace,
+                            operations: vec![
+                                execute_multi_operation_request::Operation {
+                                    operation: Some(MultiOperationRequest::StartWorkflow(
+                                        start_request,
+                                    )),
+                                },
+                                execute_multi_operation_request::Operation {
+                                    operation: Some(MultiOperationRequest::UpdateWorkflow(
+                                        update_request,
+                                    )),
+                                },
+                            ],
+                            resource_id: workflow_id.clone(),
+                        };
+
+                        let (start_response, update_response) = loop {
+                            let mut rpc_request = request.clone().into_request();
+                            rpc_options.apply_to(&mut rpc_request);
+                            let response =
+                                WorkflowService::execute_multi_operation(&mut client, rpc_request)
+                                    .await
+                                    .map_err(WorkflowUpdateWithStartError::from_status)?
+                                    .into_inner();
+
+                            let [start_response, update_response]: [_; 2] =
+                                response.responses.try_into().map_err(|_| {
+                                    WorkflowUpdateWithStartError::Other(
+                                        "Server response did not include exactly two operation \
+                                         responses"
+                                            .into(),
+                                    )
+                                })?;
+                            let (
+                                Some(MultiOperationResponse::StartWorkflow(start_response)),
+                                Some(MultiOperationResponse::UpdateWorkflow(update_response)),
+                            ) = (start_response.response, update_response.response)
+                            else {
+                                return Err(WorkflowUpdateWithStartError::Other(
+                                    "Server response did not include start and update operation \
+                                     responses in request order"
+                                        .into(),
+                                ));
+                            };
+
+                            if update_response.stage
+                                < UpdateWorkflowExecutionLifecycleStage::Accepted as i32
+                            {
+                                continue;
+                            }
+                            break (start_response, update_response);
+                        };
+
+                        let run_id = update_response
+                            .update_ref
+                            .as_ref()
+                            .and_then(|reference| reference.workflow_execution.as_ref())
+                            .map(|execution| execution.run_id.clone())
+                            .filter(|run_id| !run_id.is_empty())
+                            .or_else(|| {
+                                (!start_response.run_id.is_empty()).then_some(start_response.run_id)
+                            });
+                        Ok(UpdateWithStartWorkflowOutput::new(
+                            workflow_id,
+                            update_id,
+                            run_id,
+                            update_response.outcome,
+                        ))
+                    })
+                }
+            }),
+        )
+        .await?;
+        Ok(WorkflowUpdateHandle::new(
+            self.clone(),
+            output.update_id,
+            output.workflow_id,
+            output.run_id,
+            output.known_outcome,
+        ))
+    }
+
+    async fn execute_update_with_start_workflow<W, U>(
+        &self,
+        workflow: W,
+        workflow_input: W::Input,
+        update: U,
+        update_input: U::Input,
+        options: WorkflowUpdateWithStartOptions,
+    ) -> Result<U::Output, WorkflowUpdateWithStartError>
+    where
+        W: HasWorkflowDefinition,
+        W::Input: Send,
+        U: UpdateDefinition<Workflow = W::Run>,
+        U::Input: Send,
+    {
+        let rpc_options = options.rpc_options.clone();
+        let update_handle = WorkflowClientTrait::start_update_with_start_workflow(
+            self,
+            workflow,
+            workflow_input,
+            update,
+            update_input,
+            options,
+        )
+        .await?;
+        let result = update_handle
+            .get_result(rpc_options)
+            .await
+            .map_err(WorkflowUpdateWithStartError::Update)?;
+        Ok(result)
     }
 
     fn get_workflow_handle<W: HasWorkflowDefinition>(
@@ -1336,6 +2307,7 @@ where
         let namespace = self.namespace();
         let query = query.into();
         let limit = opts.limit;
+        let rpc_options = opts.rpc_options;
 
         // State: (next_page_token, buffer, yielded_count, exhausted)
         let initial_state = (Vec::new(), VecDeque::new(), 0, false);
@@ -1343,9 +2315,10 @@ where
         let stream = stream::unfold(
             initial_state,
             move |(next_page_token, mut buffer, mut yielded, exhausted)| {
-                let mut client = client.clone();
+                let client = client.clone();
                 let namespace = namespace.clone();
                 let query = query.clone();
+                let rpc_options = rpc_options.clone();
 
                 async move {
                     if let Some(l) = limit
@@ -1363,36 +2336,68 @@ where
                         return None;
                     }
 
-                    let response = WorkflowService::list_workflow_executions(
-                        &mut client,
-                        ListWorkflowExecutionsRequest {
-                            namespace,
-                            page_size: 0, // Use server default
-                            next_page_token: next_page_token.clone(),
+                    let response = interceptors::call_list_workflows_page(
+                        client.client_interceptors(),
+                        ListWorkflowsPageInput {
                             query,
-                        }
-                        .into_request(),
+                            next_page_token: next_page_token.clone(),
+                            rpc_options,
+                        },
+                        Next::new({
+                            let mut rpc_client = client.clone();
+                            move |input: ListWorkflowsPageInput| -> BoxFuture<
+                                '_,
+                                Result<ListWorkflowsPageOutput, ClientError>,
+                            > {
+                                Box::pin(async move {
+                                    let mut request = ListWorkflowExecutionsRequest {
+                                        namespace,
+                                        page_size: 0,
+                                        next_page_token: input.next_page_token,
+                                        query: input.query,
+                                    }
+                                    .into_request();
+                                    input.rpc_options.apply_to(&mut request);
+                                    let response = WorkflowService::list_workflow_executions(
+                                        &mut rpc_client,
+                                        request,
+                                    )
+                                    .await?
+                                    .into_inner();
+                                    Ok(ListWorkflowsPageOutput::new(
+                                        response.executions,
+                                        response.next_page_token,
+                                    ))
+                                })
+                            }
+                        }),
                     )
                     .await;
 
                     match response {
-                        Ok(resp) => {
-                            let mut resp = resp.into_inner();
-                            let new_exhausted = resp.next_page_token.is_empty();
-                            let new_token = resp.next_page_token;
+                        Ok(mut output) => {
+                            let new_exhausted = output.next_page_token.is_empty();
+                            let new_token = output.next_page_token;
 
                             let data_converter = client.data_converter().clone();
-                            for execution in &mut resp.executions {
-                                if let Some(memo) = execution.memo.as_mut() {
-                                    decode_payloads(
+                            for execution in &mut output.executions {
+                                if let Some(memo) = execution.memo.as_mut()
+                                    && let Err(err) = decode_payloads(
                                         memo,
                                         data_converter.codec(),
-                                        &SerializationContextData::Workflow,
+                                        &SerializationContextData::Workflow(
+                                            WorkflowSerializationContext::new(),
+                                        ),
                                     )
-                                    .await;
+                                    .await
+                                {
+                                    return Some((
+                                        Err(ClientError::from(err)),
+                                        (new_token, buffer, yielded, true),
+                                    ));
                                 }
                             }
-                            buffer = resp
+                            buffer = output
                                 .executions
                                 .into_iter()
                                 .map(|raw| {
@@ -1410,7 +2415,7 @@ where
                                 None
                             }
                         }
-                        Err(e) => Some((Err(e.into()), (next_page_token, buffer, yielded, true))),
+                        Err(e) => Some((Err(e), (next_page_token, buffer, yielded, true))),
                     }
                 }
             },
@@ -1422,20 +2427,41 @@ where
     async fn count_workflows(
         &self,
         query: impl Into<String>,
-        _opts: WorkflowCountOptions,
+        opts: WorkflowCountOptions,
     ) -> Result<WorkflowExecutionCount, ClientError> {
-        let resp = WorkflowService::count_workflow_executions(
-            &mut self.clone(),
-            CountWorkflowExecutionsRequest {
-                namespace: self.namespace(),
+        let output = interceptors::call_count_workflows(
+            self.client_interceptors(),
+            CountWorkflowsInput {
                 query: query.into(),
-            }
-            .into_request(),
+                options: opts,
+            },
+            Next::new({
+                let mut client = (*self).clone();
+                move |input: CountWorkflowsInput| -> BoxFuture<
+                    '_,
+                    Result<CountWorkflowsOutput, ClientError>,
+                > {
+                    Box::pin(async move {
+                        let mut request = CountWorkflowExecutionsRequest {
+                            namespace: client.namespace(),
+                            query: input.query,
+                        }
+                        .into_request();
+                        input.options.rpc_options.apply_to(&mut request);
+                        let response = WorkflowService::count_workflow_executions(
+                            &mut client,
+                            request,
+                        )
+                        .await?
+                        .into_inner();
+                        Ok(CountWorkflowsOutput::new(response))
+                    })
+                }
+            }),
         )
-        .await?
-        .into_inner();
+        .await?;
 
-        Ok(WorkflowExecutionCount::from_response(resp))
+        Ok(WorkflowExecutionCount::from_response(output.response))
     }
 
     fn get_async_activity_handle(&self, identifier: ActivityIdentifier) -> AsyncActivityHandle<Self>
@@ -1443,6 +2469,183 @@ where
         Self: Sized,
     {
         AsyncActivityHandle::new(self.clone(), identifier)
+    }
+
+    async fn start_activity<A>(
+        &self,
+        activity: A,
+        input: A::Input,
+        options: ActivityStartOptions,
+    ) -> Result<ActivityHandle<Self, A>, StartActivityError>
+    where
+        Self: Sized,
+        A: ActivityDefinition,
+    {
+        let mut client = self.clone();
+        let dc = client.data_converter();
+        let sc = &SerializationContextData::Activity(ActivitySerializationContext::new());
+
+        let user_metadata = {
+            let summary = match &options.summary {
+                Some(summary) => Some(dc.to_payload(sc, summary).await?),
+                None => None,
+            };
+            let details = match &options.static_details {
+                Some(details) => Some(dc.to_payload(sc, details).await?),
+                None => None,
+            };
+            (summary.is_some() || details.is_some()).then_some(UserMetadata { summary, details })
+        };
+
+        let resp = client
+            .start_activity_execution(
+                StartActivityExecutionRequest {
+                    namespace: client.namespace(),
+                    identity: client.identity(),
+                    request_id: Uuid::new_v4().to_string(),
+                    activity_id: options.id.clone(),
+                    activity_type: Some(ActivityType {
+                        name: activity.name().to_string(),
+                    }),
+                    task_queue: Some(TaskQueue {
+                        name: options.task_queue,
+                        kind: TaskQueueKind::Normal.into(),
+                        normal_name: "".to_string(),
+                    }),
+                    schedule_to_close_timeout: try_into_or_box_err(
+                        options.close_timeouts.schedule_to_close(),
+                        StartActivityError::Other,
+                    )?,
+                    schedule_to_start_timeout: try_into_or_box_err(
+                        options.schedule_to_start_timeout,
+                        StartActivityError::Other,
+                    )?,
+                    start_to_close_timeout: try_into_or_box_err(
+                        options.close_timeouts.start_to_close(),
+                        StartActivityError::Other,
+                    )?,
+                    heartbeat_timeout: try_into_or_box_err(
+                        options.heartbeat_timeout,
+                        StartActivityError::Other,
+                    )?,
+                    retry_policy: options.retry_policy.map(Into::into),
+                    input: dc.to_payloads(sc, &input).await?.into_payloads(),
+                    id_reuse_policy: ProtoActivityIdReusePolicy::from(options.id_reuse_policy)
+                        .into(),
+                    id_conflict_policy: ProtoActivityIdConflictPolicy::from(
+                        options.id_conflict_policy,
+                    )
+                    .into(),
+                    search_attributes: options.search_attributes.map(SearchAttributes::into_proto),
+                    header: options.header,
+                    user_metadata,
+                    priority: Some(options.priority.into()),
+                    start_delay: try_into_or_box_err(
+                        options.start_delay,
+                        StartActivityError::Other,
+                    )?,
+                    ..Default::default()
+                }
+                .into_request(),
+            )
+            .await?
+            .into_inner();
+
+        Ok(ActivityHandle::new(
+            client,
+            options.id,
+            (!resp.run_id.is_empty()).then_some(resp.run_id),
+        ))
+    }
+
+    fn get_activity_handle<A>(
+        &self,
+        _activity: A,
+        id: impl Into<String>,
+        run_id: Option<String>,
+    ) -> ActivityHandle<Self, A>
+    where
+        Self: Sized,
+        A: ActivityDefinition,
+    {
+        ActivityHandle::new(self.clone(), id.into(), run_id)
+    }
+
+    fn get_untyped_activity_handle(
+        &self,
+        id: impl Into<String>,
+        run_id: Option<String>,
+    ) -> ActivityHandle<Self, UntypedActivity>
+    where
+        Self: Sized,
+    {
+        ActivityHandle::new(self.clone(), id.into(), run_id)
+    }
+
+    fn list_activities(
+        &self,
+        query: impl Into<String>,
+        _options: ActivityListOptions,
+    ) -> ListActivitiesStream {
+        let client = self.clone();
+        let namespace = client.namespace();
+        let query = query.into();
+
+        ListActivitiesStream::new(stream::unfold(
+            Some(vec![]), // empty token for initial query, None if done
+            move |next_page_token| {
+                let mut client = client.clone();
+                let namespace = namespace.clone();
+                let query = query.clone();
+
+                async move {
+                    // making it more visible that we're terminating stream here
+                    #[allow(clippy::question_mark)]
+                    let Some(token): Option<Vec<u8>> = next_page_token else {
+                        return None;
+                    };
+
+                    match WorkflowService::list_activity_executions(
+                        &mut client,
+                        ListActivityExecutionsRequest {
+                            namespace,
+                            page_size: 0, // Use server default
+                            next_page_token: token.clone(),
+                            query,
+                        }
+                        .into_request(),
+                    )
+                    .await
+                    .map(|r| r.into_inner())
+                    {
+                        Ok(resp) => Some((
+                            Ok(resp.executions),
+                            (!resp.next_page_token.is_empty()).then_some(resp.next_page_token),
+                        )),
+                        Err(e) => Some((Err(e.into()), Some(token))),
+                    }
+                }
+            },
+        ))
+    }
+
+    async fn count_activities(
+        &self,
+        query: impl Into<String>,
+        _options: ActivityCountOptions,
+    ) -> Result<ActivityExecutionCount, ClientError> {
+        let mut client = self.clone();
+        let resp = client
+            .count_activity_executions(
+                CountActivityExecutionsRequest {
+                    namespace: client.namespace(),
+                    query: query.into(),
+                }
+                .into_request(),
+            )
+            .await?
+            .into_inner();
+        Ok(ActivityExecutionCount::from_response(resp))
     }
 }
 
@@ -1455,11 +2658,25 @@ macro_rules! dbg_panic {
 }
 pub(crate) use dbg_panic;
 
+fn try_into_or_box_err<A, B, E, MapErr>(val: Option<A>, map_err: MapErr) -> Result<Option<B>, E>
+where
+    A: TryInto<B>,
+    <A as TryInto<B>>::Error: Error + Send + Sync + 'static,
+    MapErr: FnOnce(Box<dyn Error + Send + Sync + 'static>) -> E,
+{
+    val.map(TryInto::try_into)
+        .transpose()
+        .map_err(|e| map_err(Box::from(e)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::callback_based::CallbackBasedGrpcService;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::{
+        sync::atomic::{AtomicUsize, Ordering},
+        time::Instant,
+    };
     use temporalio_common::search_attributes::SearchAttributeKey;
     use tonic::{Status, metadata::Ascii};
     use url::Url;
@@ -1710,6 +2927,18 @@ mod tests {
         assert_eq!(attempts.load(Ordering::SeqCst), 1);
     }
 
+    #[tokio::test]
+    async fn connect_timeout_bounds_connection_attempt() {
+        let url = Url::parse("http://10.255.255.1:7233").unwrap();
+        let opts = ConnectionOptions::new(url)
+            .connect_timeout(Duration::from_millis(500))
+            .build();
+        let start = Instant::now();
+        let result = Connection::connect(opts).await;
+        assert!(result.is_err(), "connection should fail");
+        assert!(start.elapsed() < Duration::from_secs(2));
+    }
+
     mod tls_custom_verifier_tests {
         use super::*;
         use tokio_rustls::rustls::{
@@ -1763,15 +2992,14 @@ mod tests {
 
         #[tokio::test]
         async fn add_tls_to_channel_with_custom_verifier() {
-            let tls_opts = TlsOptions {
-                server_cert_verifier: Some(Arc::new(MockVerifier)),
-                domain: Some("test.temporal.io".to_string()),
-                ..Default::default()
-            };
+            let tls_opts = TlsOptions::builder()
+                .server_cert_verifier(Arc::new(MockVerifier))
+                .domain("test.temporal.io".to_string())
+                .build();
             let endpoint = tonic::transport::Channel::from_static("https://test.temporal.io:7233");
             let result = add_tls_to_channel(Some(&tls_opts), endpoint).await;
             assert!(
-                result.is_ok(),
+                matches!(&result, Ok(TlsConfigResult::Standard(_))),
                 "add_tls_to_channel should succeed with a custom verifier: {:?}",
                 result.err()
             );
@@ -1781,12 +3009,11 @@ mod tests {
         async fn add_tls_to_channel_with_verifier_and_ca_cert_fails() {
             // When both server_cert_verifier and server_root_ca_cert are set,
             // add_tls_to_channel should fail with InvalidConfig.
-            let tls_opts = TlsOptions {
-                server_root_ca_cert: Some(b"some-ca-cert-bytes".to_vec()),
-                server_cert_verifier: Some(Arc::new(MockVerifier)),
-                domain: Some("test.temporal.io".to_string()),
-                ..Default::default()
-            };
+            let tls_opts = TlsOptions::builder()
+                .server_root_ca_cert(b"some-ca-cert-bytes".to_vec())
+                .server_cert_verifier(Arc::new(MockVerifier))
+                .domain("test.temporal.io".to_string())
+                .build();
             let endpoint = tonic::transport::Channel::from_static("https://test.temporal.io:7233");
             let result = add_tls_to_channel(Some(&tls_opts), endpoint).await;
             assert!(
@@ -1799,27 +3026,1648 @@ mod tests {
         #[tokio::test]
         async fn add_tls_to_channel_without_verifier_still_works() {
             // Regression test: the original PEM path must still work.
-            let tls_opts = TlsOptions {
-                domain: Some("test.temporal.io".to_string()),
-                ..Default::default()
-            };
+            let tls_opts = TlsOptions::builder()
+                .domain("test.temporal.io".to_string())
+                .build();
             let endpoint = tonic::transport::Channel::from_static("https://test.temporal.io:7233");
             let result = add_tls_to_channel(Some(&tls_opts), endpoint).await;
             assert!(
-                result.is_ok(),
+                matches!(&result, Ok(TlsConfigResult::Standard(_))),
                 "add_tls_to_channel should succeed without a verifier (native roots): {:?}",
                 result.err()
             );
+        }
+
+        // --- Dynamic client cert resolver tests ---
+
+        #[cfg(feature = "dynamic-tls")]
+        mod dynamic_cert_tests {
+            use super::*;
+
+            /// A mock `ResolvesClientCert` that always returns None (no client cert).
+            /// Used to test the plumbing without requiring real certificates.
+            #[derive(Debug)]
+            struct MockClientCertResolver;
+
+            impl tokio_rustls::rustls::client::ResolvesClientCert for MockClientCertResolver {
+                fn resolve(
+                    &self,
+                    _acceptable_issuers: &[&[u8]],
+                    _sigschemes: &[tokio_rustls::rustls::SignatureScheme],
+                ) -> Option<Arc<tokio_rustls::rustls::sign::CertifiedKey>> {
+                    None // No client cert available — server may reject, but plumbing works
+                }
+
+                fn has_certs(&self) -> bool {
+                    false
+                }
+            }
+
+            #[tokio::test]
+            async fn add_tls_with_client_cert_resolver_returns_custom_connector() {
+                let resolver = Arc::new(MockClientCertResolver);
+                let tls_opts = TlsOptions {
+                    client_cert_resolver: Some(resolver),
+                    domain: Some("test.temporal.io".to_string()),
+                    ..Default::default()
+                };
+                let endpoint =
+                    tonic::transport::Channel::from_static("https://test.temporal.io:7233");
+                let result = add_tls_to_channel(Some(&tls_opts), endpoint).await;
+                match result {
+                    Ok(TlsConfigResult::CustomConnector {
+                        domain,
+                        rustls_config,
+                        ..
+                    }) => {
+                        assert_eq!(domain, "test.temporal.io");
+                        // Verify ALPN is set to h2
+                        assert_eq!(rustls_config.alpn_protocols, vec![b"h2".to_vec()]);
+                    }
+                    other => panic!(
+                        "Expected TlsConfigResult::CustomConnector, got {:?}",
+                        other.err()
+                    ),
+                }
+            }
+
+            #[tokio::test]
+            async fn add_tls_with_client_cert_resolver_inherits_domain_from_endpoint() {
+                let resolver = Arc::new(MockClientCertResolver);
+                let tls_opts = TlsOptions {
+                    client_cert_resolver: Some(resolver),
+                    // No explicit domain — should be derived from the endpoint URI
+                    ..Default::default()
+                };
+                let endpoint =
+                    tonic::transport::Channel::from_static("https://my-server.example.com:7233");
+                let result = add_tls_to_channel(Some(&tls_opts), endpoint).await;
+                match result {
+                    Ok(TlsConfigResult::CustomConnector { domain, .. }) => {
+                        assert_eq!(domain, "my-server.example.com");
+                    }
+                    other => panic!(
+                        "Expected TlsConfigResult::CustomConnector, got {:?}",
+                        other.err()
+                    ),
+                }
+            }
+
+            #[tokio::test]
+            async fn add_tls_with_resolver_and_custom_verifier() {
+                let resolver = Arc::new(MockClientCertResolver);
+                let tls_opts = TlsOptions {
+                    client_cert_resolver: Some(resolver),
+                    server_cert_verifier: Some(Arc::new(MockVerifier)),
+                    domain: Some("test.temporal.io".to_string()),
+                    ..Default::default()
+                };
+                let endpoint =
+                    tonic::transport::Channel::from_static("https://test.temporal.io:7233");
+                let result = add_tls_to_channel(Some(&tls_opts), endpoint).await;
+                assert!(
+                    matches!(&result, Ok(TlsConfigResult::CustomConnector { .. })),
+                    "Should succeed when combining cert resolver with custom server verifier: {:?}",
+                    result.err()
+                );
+            }
+
+            #[tokio::test]
+            async fn add_tls_with_resolver_and_custom_ca_cert() {
+                // Use a valid PEM-formatted CA certificate
+                let ca_pem = include_bytes!("../tests/testdata/ca.pem");
+                let resolver = Arc::new(MockClientCertResolver);
+                let tls_opts = TlsOptions {
+                    client_cert_resolver: Some(resolver),
+                    server_root_ca_cert: Some(ca_pem.to_vec()),
+                    domain: Some("test.temporal.io".to_string()),
+                    ..Default::default()
+                };
+                let endpoint =
+                    tonic::transport::Channel::from_static("https://test.temporal.io:7233");
+                let result = add_tls_to_channel(Some(&tls_opts), endpoint).await;
+                assert!(
+                    matches!(&result, Ok(TlsConfigResult::CustomConnector { .. })),
+                    "Should succeed when combining cert resolver with custom CA cert: {:?}",
+                    result.err()
+                );
+            }
+
+            #[tokio::test]
+            async fn add_tls_both_static_and_dynamic_client_cert_fails() {
+                let resolver = Arc::new(MockClientCertResolver);
+                let tls_opts = TlsOptions {
+                    client_tls_options: Some(ClientTlsOptions {
+                        client_cert: b"some-cert".to_vec(),
+                        client_private_key: b"some-key".to_vec(),
+                    }),
+                    client_cert_resolver: Some(resolver),
+                    domain: Some("test.temporal.io".to_string()),
+                    ..Default::default()
+                };
+                let endpoint =
+                    tonic::transport::Channel::from_static("https://test.temporal.io:7233");
+                let result = add_tls_to_channel(Some(&tls_opts), endpoint).await;
+                assert!(
+                    matches!(result, Err(ClientConnectError::InvalidConfig(msg)) if msg.contains("client_tls_options") && msg.contains("client_cert_resolver")),
+                    "Should fail with InvalidConfig when both static and dynamic client certs are set"
+                );
+            }
+
+            #[tokio::test]
+            async fn add_tls_no_options_returns_standard_passthrough() {
+                let endpoint = tonic::transport::Channel::from_static("http://localhost:7233");
+                let result = add_tls_to_channel(None, endpoint).await;
+                assert!(
+                    matches!(&result, Ok(TlsConfigResult::Standard(_))),
+                    "Should return Standard when no TLS options are set"
+                );
+            }
+
+            #[test]
+            fn build_custom_rustls_config_with_resolver() {
+                let resolver = Arc::new(MockClientCertResolver);
+                let tls_opts = TlsOptions {
+                    domain: Some("test.temporal.io".to_string()),
+                    ..Default::default()
+                };
+                let config = build_custom_rustls_config(&tls_opts, Some(resolver));
+                assert!(config.is_ok(), "Should build config: {:?}", config.err());
+                let config = config.unwrap();
+                assert_eq!(config.alpn_protocols, vec![b"h2".to_vec()]);
+            }
+
+            #[test]
+            fn build_custom_rustls_config_without_resolver() {
+                let tls_opts = TlsOptions {
+                    domain: Some("test.temporal.io".to_string()),
+                    ..Default::default()
+                };
+                let config = build_custom_rustls_config(&tls_opts, None);
+                assert!(config.is_ok(), "Should build config: {:?}", config.err());
+            }
+
+            #[test]
+            fn build_custom_rustls_config_with_custom_verifier_and_resolver() {
+                let resolver = Arc::new(MockClientCertResolver);
+                let tls_opts = TlsOptions {
+                    server_cert_verifier: Some(Arc::new(MockVerifier)),
+                    domain: Some("test.temporal.io".to_string()),
+                    ..Default::default()
+                };
+                let config = build_custom_rustls_config(&tls_opts, Some(resolver));
+                assert!(
+                    config.is_ok(),
+                    "Should build config with custom verifier + resolver: {:?}",
+                    config.err()
+                );
+            }
+
+            #[test]
+            fn tls_options_debug_shows_custom_for_resolver() {
+                let resolver = Arc::new(MockClientCertResolver);
+                let tls_opts = TlsOptions {
+                    client_cert_resolver: Some(resolver),
+                    ..Default::default()
+                };
+                let debug_str = format!("{:?}", tls_opts);
+                assert!(
+                    debug_str.contains("\"<custom>\""),
+                    "Debug should show <custom> for client_cert_resolver: {debug_str}"
+                );
+                assert!(
+                    debug_str.contains("client_cert_resolver"),
+                    "Debug should contain field name: {debug_str}"
+                );
+            }
+
+            #[test]
+            fn tls_options_default_has_no_resolver() {
+                let tls_opts = TlsOptions::default();
+                assert!(tls_opts.client_cert_resolver.is_none());
+                assert!(tls_opts.client_tls_options.is_none());
+                assert!(tls_opts.server_cert_verifier.is_none());
+            }
+
+            #[tokio::test]
+            async fn add_tls_resolver_with_ip_host_uses_ip_as_domain() {
+                // When no explicit domain is set, the host from the URI is used for SNI.
+                // This verifies the .or_else() fallback works correctly.
+                let resolver = Arc::new(MockClientCertResolver);
+                let tls_opts = TlsOptions {
+                    client_cert_resolver: Some(resolver),
+                    // No domain set — should fall back to URI host
+                    ..Default::default()
+                };
+                let endpoint = tonic::transport::Channel::from_static("https://192.168.1.100:7233");
+                let result = add_tls_to_channel(Some(&tls_opts), endpoint).await;
+                match result {
+                    Ok(TlsConfigResult::CustomConnector { domain, .. }) => {
+                        assert_eq!(domain, "192.168.1.100");
+                    }
+                    other => panic!(
+                        "Expected CustomConnector with IP domain, got {:?}",
+                        other.err()
+                    ),
+                }
+            }
+        }
+    }
+
+    mod start_workflow_interceptor_tests {
+        use super::*;
+        use crate::{request_extensions::RetryConfigForCall, test_helpers::XorCodec};
+        use parking_lot::Mutex;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use temporalio_common::{
+            MemoValues, SignalDefinition, WorkerDeploymentVersion,
+            data_converters::{
+                DefaultFailureConverter, PayloadCodec, PayloadConversionError, PayloadConverter,
+                SerializationContext, SerializationContextData, TemporalDeserializable,
+                TemporalSerializable,
+            },
+            protos::temporal::api::{
+                common::v1::{Link, Memo as ProtoMemo, Payload, Priority as ProtoPriority},
+                workflow::v1::VersioningOverride as ProtoVersioningOverride,
+            },
+        };
+        use temporalio_macros::{workflow, workflow_methods};
+        use temporalio_workflow::{SyncWorkflowContext, WorkflowContext, WorkflowResult};
+        use tonic::{Request, Response};
+
+        #[workflow]
+        #[derive(Default)]
+        struct TestWorkflow;
+
+        #[workflow_methods]
+        impl TestWorkflow {
+            #[run]
+            async fn run(
+                _ctx: &mut WorkflowContext<Self>,
+                _input: Vec<String>,
+            ) -> WorkflowResult<()> {
+                Ok(())
+            }
+
+            #[signal]
+            fn test_signal(&mut self, _ctx: &mut SyncWorkflowContext<Self>, _input: Vec<String>) {}
+        }
+
+        #[derive(Default)]
+        struct RecordedStart {
+            calls: usize,
+            workflow_type: String,
+            memo: Option<ProtoMemo>,
+            payloads: Vec<Payload>,
+            signal_name: String,
+            signal_payloads: Vec<Payload>,
+            identity: String,
+            links: Vec<Link>,
+            priority: Option<ProtoPriority>,
+            versioning_override: Option<ProtoVersioningOverride>,
+            ascii_metadata: Option<String>,
+            binary_metadata: Option<Vec<u8>>,
+            grpc_timeout: Option<String>,
+            retry_options: Option<RetryOptions>,
+        }
+
+        struct CountingCodec {
+            encode_calls: Arc<AtomicUsize>,
+        }
+
+        impl PayloadCodec for CountingCodec {
+            fn encode(
+                &self,
+                _context: &SerializationContextData,
+                payloads: Vec<Payload>,
+            ) -> futures_util::future::BoxFuture<
+                'static,
+                Result<Vec<Payload>, PayloadConversionError>,
+            > {
+                self.encode_calls.fetch_add(1, Ordering::SeqCst);
+                Box::pin(async move { Ok(payloads) })
+            }
+
+            fn decode(
+                &self,
+                _context: &SerializationContextData,
+                payloads: Vec<Payload>,
+            ) -> futures_util::future::BoxFuture<
+                'static,
+                Result<Vec<Payload>, PayloadConversionError>,
+            > {
+                Box::pin(async move { Ok(payloads) })
+            }
+        }
+
+        #[derive(Clone)]
+        struct MockStartWorkflowClient {
+            recorded: Arc<Mutex<RecordedStart>>,
+            data_converter: DataConverter,
+        }
+
+        impl NamespacedClient for MockStartWorkflowClient {
+            fn namespace(&self) -> String {
+                "test-namespace".to_owned()
+            }
+
+            fn identity(&self) -> String {
+                "test-identity".to_owned()
+            }
+
+            fn data_converter(&self) -> &DataConverter {
+                &self.data_converter
+            }
+        }
+
+        impl WorkflowService for MockStartWorkflowClient {
+            fn start_workflow_execution(
+                &mut self,
+                request: Request<StartWorkflowExecutionRequest>,
+            ) -> futures_util::future::BoxFuture<
+                '_,
+                Result<Response<StartWorkflowExecutionResponse>, tonic::Status>,
+            > {
+                let ascii_metadata = request
+                    .metadata()
+                    .get("call-meta")
+                    .map(|value| value.to_str().unwrap().to_owned());
+                let binary_metadata = request
+                    .metadata()
+                    .get_bin("call-meta-bin")
+                    .map(|value| value.to_bytes().unwrap().to_vec());
+                let grpc_timeout = request
+                    .metadata()
+                    .get("grpc-timeout")
+                    .map(|value| value.to_str().unwrap().to_owned());
+                let retry_options = request
+                    .extensions()
+                    .get::<RetryConfigForCall>()
+                    .map(|config| config.0.clone());
+                let request = request.into_inner();
+                let mut recorded = self.recorded.lock();
+                recorded.calls += 1;
+                recorded.workflow_type = request.workflow_type.unwrap().name;
+                recorded.memo = request.memo;
+                recorded.payloads = request.input.unwrap_or_default().payloads;
+                recorded.identity = request.identity;
+                recorded.links = request.links;
+                recorded.priority = request.priority;
+                recorded.versioning_override = request.versioning_override;
+                recorded.ascii_metadata = ascii_metadata;
+                recorded.binary_metadata = binary_metadata;
+                recorded.grpc_timeout = grpc_timeout;
+                recorded.retry_options = retry_options;
+
+                Box::pin(async {
+                    Ok(Response::new(StartWorkflowExecutionResponse {
+                        run_id: "server-run-id".to_owned(),
+                        ..Default::default()
+                    }))
+                })
+            }
+
+            fn signal_with_start_workflow_execution(
+                &mut self,
+                request: Request<SignalWithStartWorkflowExecutionRequest>,
+            ) -> futures_util::future::BoxFuture<
+                '_,
+                Result<Response<SignalWithStartWorkflowExecutionResponse>, tonic::Status>,
+            > {
+                let ascii_metadata = request
+                    .metadata()
+                    .get("call-meta")
+                    .map(|value| value.to_str().unwrap().to_owned());
+                let binary_metadata = request
+                    .metadata()
+                    .get_bin("call-meta-bin")
+                    .map(|value| value.to_bytes().unwrap().to_vec());
+                let grpc_timeout = request
+                    .metadata()
+                    .get("grpc-timeout")
+                    .map(|value| value.to_str().unwrap().to_owned());
+                let retry_options = request
+                    .extensions()
+                    .get::<RetryConfigForCall>()
+                    .map(|config| config.0.clone());
+                let request = request.into_inner();
+                let mut recorded = self.recorded.lock();
+                recorded.calls += 1;
+                recorded.workflow_type = request.workflow_type.unwrap().name;
+                recorded.memo = request.memo;
+                recorded.payloads = request.input.unwrap_or_default().payloads;
+                recorded.signal_name = request.signal_name;
+                recorded.signal_payloads = request.signal_input.unwrap_or_default().payloads;
+                recorded.identity = request.identity;
+                recorded.links = request.links;
+                recorded.priority = request.priority;
+                recorded.versioning_override = request.versioning_override;
+                recorded.ascii_metadata = ascii_metadata;
+                recorded.binary_metadata = binary_metadata;
+                recorded.grpc_timeout = grpc_timeout;
+                recorded.retry_options = retry_options;
+
+                Box::pin(async {
+                    Ok(Response::new(SignalWithStartWorkflowExecutionResponse {
+                        run_id: "signal-server-run-id".to_owned(),
+                        ..Default::default()
+                    }))
+                })
+            }
+        }
+
+        #[derive(Clone)]
+        struct InterceptedClient {
+            inner: MockStartWorkflowClient,
+            interceptors: Vec<Arc<dyn ClientInterceptor>>,
+        }
+
+        impl NamespacedClient for InterceptedClient {
+            fn namespace(&self) -> String {
+                self.inner.namespace()
+            }
+
+            fn identity(&self) -> String {
+                self.inner.identity()
+            }
+
+            fn data_converter(&self) -> &DataConverter {
+                self.inner.data_converter()
+            }
+
+            fn client_interceptors(&self) -> &[Arc<dyn ClientInterceptor>] {
+                &self.interceptors
+            }
+        }
+
+        impl WorkflowService for InterceptedClient {
+            fn start_workflow_execution(
+                &mut self,
+                request: Request<StartWorkflowExecutionRequest>,
+            ) -> futures_util::future::BoxFuture<
+                '_,
+                Result<Response<StartWorkflowExecutionResponse>, tonic::Status>,
+            > {
+                self.inner.start_workflow_execution(request)
+            }
+
+            fn signal_with_start_workflow_execution(
+                &mut self,
+                request: Request<SignalWithStartWorkflowExecutionRequest>,
+            ) -> futures_util::future::BoxFuture<
+                '_,
+                Result<Response<SignalWithStartWorkflowExecutionResponse>, tonic::Status>,
+            > {
+                self.inner.signal_with_start_workflow_execution(request)
+            }
+        }
+
+        struct OrderedInterceptor {
+            name: &'static str,
+            events: Arc<Mutex<Vec<String>>>,
+            encode_calls: Arc<AtomicUsize>,
+        }
+
+        impl ClientInterceptor for OrderedInterceptor {
+            fn start_workflow<'a>(
+                &'a self,
+                mut input: StartWorkflowInput,
+                next: Next<
+                    'a,
+                    StartWorkflowInput,
+                    BoxFuture<'a, Result<StartWorkflowOutput, WorkflowStartError>>,
+                >,
+            ) -> BoxFuture<'a, Result<StartWorkflowOutput, WorkflowStartError>> {
+                Box::pin(async move {
+                    assert_eq!(self.encode_calls.load(Ordering::SeqCst), 0);
+                    self.events.lock().push(format!("{}-pre", self.name));
+                    tokio::task::yield_now().await;
+                    if self.name == "outer" {
+                        input
+                            .args_mut::<Vec<String>>()
+                            .unwrap()
+                            .push("mutated".to_owned());
+                    } else {
+                        assert_eq!(
+                            input.args_ref::<Vec<String>>().unwrap(),
+                            &["initial".to_owned(), "mutated".to_owned()]
+                        );
+                        input.replace_args("replacement".to_owned());
+                        input.workflow_type = "replacement-workflow".to_owned();
+                    }
+                    let result = next.run(input).await;
+                    tokio::task::yield_now().await;
+                    self.events.lock().push(format!("{}-post", self.name));
+                    result
+                })
+            }
+        }
+
+        struct ShortCircuitInterceptor;
+
+        impl ClientInterceptor for ShortCircuitInterceptor {
+            fn start_workflow<'a>(
+                &'a self,
+                input: StartWorkflowInput,
+                _next: Next<
+                    'a,
+                    StartWorkflowInput,
+                    BoxFuture<'a, Result<StartWorkflowOutput, WorkflowStartError>>,
+                >,
+            ) -> BoxFuture<'a, Result<StartWorkflowOutput, WorkflowStartError>> {
+                assert_eq!(
+                    input.args_ref::<Vec<String>>().unwrap(),
+                    &["initial".to_owned()]
+                );
+                Box::pin(async {
+                    Ok(StartWorkflowOutput::new(
+                        "short-circuit-workflow-id",
+                        "short-circuit-run-id",
+                    ))
+                })
+            }
+        }
+
+        struct CountingInput {
+            conversion_calls: Arc<AtomicUsize>,
+        }
+
+        impl TemporalSerializable for CountingInput {
+            fn to_payloads(
+                &self,
+                _context: &SerializationContext<'_>,
+            ) -> Result<Vec<Payload>, PayloadConversionError> {
+                self.conversion_calls.fetch_add(1, Ordering::SeqCst);
+                Ok(vec![Payload::default()])
+            }
+        }
+
+        struct ConversionTimingInterceptor {
+            conversion_calls: Arc<AtomicUsize>,
+        }
+
+        impl ClientInterceptor for ConversionTimingInterceptor {
+            fn start_workflow<'a>(
+                &'a self,
+                mut input: StartWorkflowInput,
+                next: Next<
+                    'a,
+                    StartWorkflowInput,
+                    BoxFuture<'a, Result<StartWorkflowOutput, WorkflowStartError>>,
+                >,
+            ) -> BoxFuture<'a, Result<StartWorkflowOutput, WorkflowStartError>> {
+                input.replace_args(CountingInput {
+                    conversion_calls: self.conversion_calls.clone(),
+                });
+                let future = next.run(input);
+                assert_eq!(self.conversion_calls.load(Ordering::SeqCst), 0);
+                future
+            }
+        }
+
+        struct ReplacingSignalWithStartInterceptor;
+
+        impl ClientInterceptor for ReplacingSignalWithStartInterceptor {
+            fn signal_with_start_workflow<'a>(
+                &'a self,
+                mut input: SignalWithStartWorkflowInput,
+                next: Next<
+                    'a,
+                    SignalWithStartWorkflowInput,
+                    BoxFuture<'a, Result<StartWorkflowOutput, WorkflowStartError>>,
+                >,
+            ) -> BoxFuture<'a, Result<StartWorkflowOutput, WorkflowStartError>> {
+                assert_eq!(
+                    input.workflow_args_ref::<Vec<String>>().unwrap(),
+                    &["workflow".to_owned()]
+                );
+                assert_eq!(
+                    input.signal_args_ref::<Vec<String>>().unwrap(),
+                    &["signal".to_owned()]
+                );
+                input.replace_workflow_args(vec!["replaced-workflow".to_owned()]);
+                input.replace_signal_args(vec!["replaced-signal".to_owned()]);
+                next.run(input)
+            }
+        }
+
+        struct FailingSignal;
+
+        impl SignalDefinition for FailingSignal {
+            type Workflow = test_workflow::Run;
+            type Input = FailingSignalInput;
+
+            fn name(&self) -> &str {
+                "failing-signal"
+            }
+        }
+
+        struct FailingSignalInput;
+
+        impl TemporalDeserializable for FailingSignalInput {}
+
+        impl TemporalSerializable for FailingSignalInput {
+            fn to_payloads(
+                &self,
+                _context: &SerializationContext<'_>,
+            ) -> Result<Vec<Payload>, PayloadConversionError> {
+                Err(PayloadConversionError::WrongEncoding)
+            }
+        }
+
+        fn mock_client(
+            interceptors: Vec<Arc<dyn ClientInterceptor>>,
+            encode_calls: Arc<AtomicUsize>,
+        ) -> (InterceptedClient, Arc<Mutex<RecordedStart>>) {
+            let recorded = Arc::new(Mutex::new(RecordedStart::default()));
+            let data_converter = DataConverter::new(
+                PayloadConverter::default(),
+                DefaultFailureConverter::default(),
+                CountingCodec {
+                    encode_calls: encode_calls.clone(),
+                },
+            );
+            (
+                InterceptedClient {
+                    inner: MockStartWorkflowClient {
+                        recorded: recorded.clone(),
+                        data_converter,
+                    },
+                    interceptors,
+                },
+                recorded,
+            )
+        }
+
+        /// A mock client whose data converter uses `codec`, for asserting on what reaches the
+        /// wire.
+        fn mock_client_with_codec(
+            codec: impl PayloadCodec + Send + Sync + 'static,
+        ) -> (MockStartWorkflowClient, Arc<Mutex<RecordedStart>>) {
+            let recorded = Arc::new(Mutex::new(RecordedStart::default()));
+            let data_converter = DataConverter::new(
+                PayloadConverter::default(),
+                DefaultFailureConverter::default(),
+                codec,
+            );
+            (
+                MockStartWorkflowClient {
+                    recorded: recorded.clone(),
+                    data_converter,
+                },
+                recorded,
+            )
+        }
+
+        /// Decode a sent memo the same way `describe`/`list` do, and read it back.
+        async fn read_back(sent: ProtoMemo) -> Memo {
+            let mut sent = sent;
+            decode_payloads(
+                &mut sent,
+                &XorCodec,
+                &SerializationContextData::Workflow(WorkflowSerializationContext::new()),
+            )
+            .await
+            .unwrap();
+            Memo::from_raw(
+                Some(sent),
+                PayloadConverter::default(),
+                SerializationContextData::Workflow(WorkflowSerializationContext::new()),
+            )
+        }
+
+        #[rstest::rstest]
+        #[case::unset(None)]
+        #[case::pinned(Some(VersioningOverride::Pinned(
+            WorkerDeploymentVersion::builder().deployment_name("deployment").build_id("build").build()
+        )))]
+        #[case::auto_upgrade(Some(VersioningOverride::AutoUpgrade))]
+        #[case::one_time(Some(VersioningOverride::OneTime(
+            WorkerDeploymentVersion::builder().deployment_name("deployment").build_id("build").build()
+        )))]
+        #[tokio::test]
+        async fn start_workflow_sends_versioning_override(
+            #[case] versioning_override: Option<VersioningOverride>,
+            #[values(false, true)] signal_with_start: bool,
+        ) {
+            let (client, recorded) = mock_client_with_codec(XorCodec);
+            let options = WorkflowStartOptions::new("task-queue", "workflow-id")
+                .maybe_versioning_override(versioning_override.clone())
+                .build();
+            if signal_with_start {
+                client
+                    .signal_with_start_workflow(
+                        TestWorkflow::run,
+                        vec!["initial".to_owned()],
+                        TestWorkflow::test_signal,
+                        vec!["signal".to_owned()],
+                        options,
+                    )
+                    .await
+                    .unwrap();
+            } else {
+                client
+                    .start_workflow(TestWorkflow::run, vec!["initial".to_owned()], options)
+                    .await
+                    .unwrap();
+            }
+            let recorded = recorded.lock();
+            assert_eq!(recorded.calls, 1);
+            assert_eq!(
+                recorded.versioning_override,
+                versioning_override.map(Into::into)
+            );
+        }
+
+        #[tokio::test]
+        async fn start_workflow_encodes_memo_with_payload_converter_and_codec() {
+            let (client, recorded) = mock_client_with_codec(XorCodec);
+            let mut memo = MemoValues::new();
+            memo.insert("memo-key", "memo-value".to_owned());
+
+            client
+                .start_workflow(
+                    TestWorkflow::run,
+                    vec!["initial".to_owned()],
+                    WorkflowStartOptions::new("task-queue", "workflow-id")
+                        .memo(memo)
+                        .build(),
+                )
+                .await
+                .unwrap();
+
+            let sent = recorded.lock().memo.clone().expect("memo should be sent");
+            assert_eq!(
+                read_back(sent).await.get::<String>("memo-key").unwrap(),
+                Some("memo-value".to_owned())
+            );
+        }
+
+        #[tokio::test]
+        async fn signal_with_start_workflow_encodes_memo() {
+            let (client, recorded) = mock_client_with_codec(XorCodec);
+            let mut memo = MemoValues::new();
+            memo.insert("memo-key", "memo-value".to_owned());
+
+            client
+                .signal_with_start_workflow(
+                    TestWorkflow::run,
+                    vec!["initial".to_owned()],
+                    TestWorkflow::test_signal,
+                    vec!["signal".to_owned()],
+                    WorkflowStartOptions::new("task-queue", "workflow-id")
+                        .memo(memo)
+                        .build(),
+                )
+                .await
+                .unwrap();
+
+            let sent = recorded.lock().memo.clone().expect("memo should be sent");
+            assert_eq!(
+                read_back(sent).await.get::<String>("memo-key").unwrap(),
+                Some("memo-value".to_owned())
+            );
+        }
+
+        #[tokio::test]
+        async fn start_workflow_without_memo_sends_none() {
+            let (client, recorded) = mock_client_with_codec(XorCodec);
+
+            client
+                .start_workflow(
+                    TestWorkflow::run,
+                    vec!["initial".to_owned()],
+                    WorkflowStartOptions::new("task-queue", "workflow-id").build(),
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(recorded.lock().memo, None);
+        }
+
+        #[tokio::test]
+        async fn start_workflow_reports_memo_serialization_errors() {
+            #[derive(Debug)]
+            struct FailingMemoValue;
+
+            impl TemporalSerializable for FailingMemoValue {
+                fn to_payload(
+                    &self,
+                    _ctx: &SerializationContext<'_>,
+                ) -> Result<Payload, PayloadConversionError> {
+                    Err(PayloadConversionError::EncodingError(
+                        std::io::Error::other("memo serialization failure").into(),
+                    ))
+                }
+            }
+
+            let (client, recorded) = mock_client_with_codec(XorCodec);
+            let mut memo = MemoValues::new();
+            memo.insert("invalid", FailingMemoValue);
+
+            let err = client
+                .start_workflow(
+                    TestWorkflow::run,
+                    vec!["initial".to_owned()],
+                    WorkflowStartOptions::new("task-queue", "workflow-id")
+                        .memo(memo)
+                        .build(),
+                )
+                .await
+                .map(|_| ())
+                .expect_err("memo serialization errors should be surfaced");
+
+            assert!(
+                matches!(err, WorkflowStartError::PayloadConversion(_)),
+                "expected a payload conversion error, got {err:?}"
+            );
+            assert!(
+                err.to_string().contains("memo serialization failure"),
+                "error should surface the underlying cause, got {err}"
+            );
+            // The request must not have been sent.
+            assert_eq!(recorded.lock().calls, 0);
+        }
+
+        #[tokio::test]
+        async fn interceptors_order_mutate_replace_and_defer_conversion() {
+            let events = Arc::new(Mutex::new(Vec::new()));
+            let encode_calls = Arc::new(AtomicUsize::new(0));
+            let interceptors: Vec<Arc<dyn ClientInterceptor>> = vec![
+                Arc::new(OrderedInterceptor {
+                    name: "outer",
+                    events: events.clone(),
+                    encode_calls: encode_calls.clone(),
+                }),
+                Arc::new(OrderedInterceptor {
+                    name: "inner",
+                    events: events.clone(),
+                    encode_calls: encode_calls.clone(),
+                }),
+            ];
+            let (client, recorded) = mock_client(interceptors, encode_calls.clone());
+
+            let handle = client
+                .start_workflow(
+                    TestWorkflow::run,
+                    vec!["initial".to_owned()],
+                    WorkflowStartOptions::new("task-queue", "workflow-id").build(),
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(
+                events.lock().as_slice(),
+                ["outer-pre", "inner-pre", "inner-post", "outer-post"]
+            );
+            assert_eq!(encode_calls.load(Ordering::SeqCst), 1);
+            assert_eq!(handle.run_id(), Some("server-run-id"));
+            let payloads = {
+                let recorded = recorded.lock();
+                assert_eq!(recorded.calls, 1);
+                assert_eq!(recorded.workflow_type, "replacement-workflow");
+                recorded.payloads.clone()
+            };
+            let replacement: String = client
+                .data_converter()
+                .from_payloads(
+                    &SerializationContextData::Workflow(WorkflowSerializationContext::new()),
+                    payloads,
+                )
+                .await
+                .unwrap();
+            assert_eq!(replacement, "replacement");
+        }
+
+        #[tokio::test]
+        async fn interceptor_can_short_circuit() {
+            let encode_calls = Arc::new(AtomicUsize::new(0));
+            let (client, recorded) = mock_client(
+                vec![Arc::new(ShortCircuitInterceptor)],
+                encode_calls.clone(),
+            );
+            let handle = client
+                .start_workflow(
+                    TestWorkflow::run,
+                    vec!["initial".to_owned()],
+                    WorkflowStartOptions::new("task-queue", "ignored-workflow-id").build(),
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(handle.info().workflow_id, "short-circuit-workflow-id");
+            assert_eq!(handle.run_id(), Some("short-circuit-run-id"));
+            assert_eq!(recorded.lock().calls, 0);
+            assert_eq!(encode_calls.load(Ordering::SeqCst), 0);
+        }
+
+        #[tokio::test]
+        async fn payload_conversion_waits_for_next_future_poll() {
+            let conversion_calls = Arc::new(AtomicUsize::new(0));
+            let encode_calls = Arc::new(AtomicUsize::new(0));
+            let recorded = Arc::new(Mutex::new(RecordedStart::default()));
+            let data_converter = DataConverter::new(
+                PayloadConverter::UseWrappers,
+                DefaultFailureConverter::default(),
+                CountingCodec {
+                    encode_calls: encode_calls.clone(),
+                },
+            );
+            let client = InterceptedClient {
+                inner: MockStartWorkflowClient {
+                    recorded: recorded.clone(),
+                    data_converter,
+                },
+                interceptors: vec![Arc::new(ConversionTimingInterceptor {
+                    conversion_calls: conversion_calls.clone(),
+                })],
+            };
+
+            client
+                .start_workflow(
+                    TestWorkflow::run,
+                    vec!["initial".to_owned()],
+                    WorkflowStartOptions::new("task-queue", "workflow-id").build(),
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(conversion_calls.load(Ordering::SeqCst), 1);
+            assert_eq!(encode_calls.load(Ordering::SeqCst), 1);
+            assert_eq!(recorded.lock().calls, 1);
+        }
+
+        #[tokio::test]
+        async fn custom_client_defaults_to_empty_chain() {
+            let recorded = Arc::new(Mutex::new(RecordedStart::default()));
+            let client = MockStartWorkflowClient {
+                recorded: recorded.clone(),
+                data_converter: DataConverter::default(),
+            };
+            assert!(client.client_interceptors().is_empty());
+
+            client
+                .start_workflow(
+                    TestWorkflow::run,
+                    vec!["initial".to_owned()],
+                    WorkflowStartOptions::new("task-queue", "workflow-id").build(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(recorded.lock().calls, 1);
+        }
+
+        #[tokio::test]
+        async fn rpc_options_reach_the_request() {
+            let (client, recorded) = mock_client(Vec::new(), Arc::new(AtomicUsize::new(0)));
+            let mut metadata = RpcMetadata::new();
+            metadata.insert("call-meta", "call-value").unwrap();
+            metadata
+                .insert_binary("call-meta-bin", vec![0, 255])
+                .unwrap();
+            let rpc_options = RpcOptions::builder()
+                .metadata(metadata)
+                .timeout(Duration::from_millis(250))
+                .retry_options(RetryOptions::no_retries())
+                .build();
+            let mut options = WorkflowStartOptions::new("task-queue", "workflow-id").build();
+            options.rpc_options = rpc_options.clone();
+
+            client
+                .start_workflow(TestWorkflow::run, vec!["initial".to_owned()], options)
+                .await
+                .unwrap();
+
+            {
+                let recorded = recorded.lock();
+                assert_eq!(recorded.ascii_metadata.as_deref(), Some("call-value"));
+                assert_eq!(recorded.binary_metadata.as_deref(), Some(&[0, 255][..]));
+                assert_eq!(recorded.grpc_timeout.as_deref(), Some("250000u"));
+                assert_eq!(recorded.retry_options, Some(RetryOptions::no_retries()));
+            }
+
+            let mut options = WorkflowStartOptions::new("task-queue", "signal-workflow-id").build();
+            options.rpc_options = rpc_options;
+            let handle = client
+                .signal_with_start_workflow(
+                    TestWorkflow::run,
+                    vec!["initial".to_owned()],
+                    TestWorkflow::test_signal,
+                    vec!["signal".to_owned()],
+                    options,
+                )
+                .await
+                .unwrap();
+
+            let recorded = recorded.lock();
+            assert_eq!(recorded.calls, 2);
+            assert_eq!(recorded.ascii_metadata.as_deref(), Some("call-value"));
+            assert_eq!(recorded.binary_metadata.as_deref(), Some(&[0, 255][..]));
+            assert_eq!(recorded.grpc_timeout.as_deref(), Some("250000u"));
+            assert_eq!(recorded.retry_options, Some(RetryOptions::no_retries()));
+            assert_eq!(recorded.signal_name, "test_signal");
+            assert_eq!(recorded.signal_payloads.len(), 1);
+            assert_eq!(handle.run_id(), Some("signal-server-run-id"));
+        }
+
+        #[tokio::test]
+        async fn signal_with_start_interceptor_can_replace_both_argument_sets() {
+            let (client, recorded) = mock_client(
+                vec![Arc::new(ReplacingSignalWithStartInterceptor)],
+                Arc::new(AtomicUsize::new(0)),
+            );
+
+            client
+                .signal_with_start_workflow(
+                    TestWorkflow::run,
+                    vec!["workflow".to_owned()],
+                    TestWorkflow::test_signal,
+                    vec!["signal".to_owned()],
+                    WorkflowStartOptions::new("task-queue", "workflow-id").build(),
+                )
+                .await
+                .unwrap();
+
+            let data_converter = DataConverter::default();
+            let (workflow_payloads, signal_payloads) = {
+                let recorded = recorded.lock();
+                (recorded.payloads.clone(), recorded.signal_payloads.clone())
+            };
+            assert_eq!(
+                data_converter
+                    .from_payloads::<Vec<String>>(
+                        &SerializationContextData::Workflow(WorkflowSerializationContext::new()),
+                        workflow_payloads,
+                    )
+                    .await
+                    .unwrap(),
+                vec!["replaced-workflow".to_owned()]
+            );
+            assert_eq!(
+                data_converter
+                    .from_payloads::<Vec<String>>(
+                        &SerializationContextData::Workflow(WorkflowSerializationContext::new()),
+                        signal_payloads,
+                    )
+                    .await
+                    .unwrap(),
+                vec!["replaced-signal".to_owned()]
+            );
+        }
+
+        #[tokio::test]
+        async fn signal_with_start_payload_conversion_failure_does_not_call_service() {
+            let (client, recorded) = mock_client(Vec::new(), Arc::new(AtomicUsize::new(0)));
+
+            let result = client
+                .signal_with_start_workflow(
+                    TestWorkflow::run,
+                    vec!["workflow".to_owned()],
+                    FailingSignal,
+                    FailingSignalInput,
+                    WorkflowStartOptions::new("task-queue", "workflow-id").build(),
+                )
+                .await;
+
+            assert!(matches!(
+                result,
+                Err(WorkflowStartError::PayloadConversion(_))
+            ));
+            assert_eq!(recorded.lock().calls, 0);
+        }
+
+        #[test]
+        fn rpc_metadata_combines_with_and_overrides_connection_defaults() {
+            let headers = Arc::new(RwLock::new(ClientHeaders {
+                user_headers: HashMap::from([
+                    (
+                        "shared-meta".parse().unwrap(),
+                        "connection-value".parse().unwrap(),
+                    ),
+                    (
+                        "connection-meta".parse().unwrap(),
+                        "connection-only".parse().unwrap(),
+                    ),
+                ]),
+                user_binary_headers: HashMap::from([
+                    (
+                        "shared-meta-bin".parse().unwrap(),
+                        BinaryMetadataValue::from_bytes(&[1]),
+                    ),
+                    (
+                        "connection-meta-bin".parse().unwrap(),
+                        BinaryMetadataValue::from_bytes(&[2]),
+                    ),
+                ]),
+                api_key: None,
+            }));
+            let mut service_interceptor = ServiceCallInterceptor {
+                client_name: "test-client".to_owned(),
+                client_version: "test-version".to_owned(),
+                headers,
+            };
+            let mut rpc_options = RpcOptions::default();
+            rpc_options
+                .metadata
+                .insert("shared-meta", "call-value")
+                .unwrap();
+            rpc_options
+                .metadata
+                .insert("call-meta", "call-only")
+                .unwrap();
+            rpc_options
+                .metadata
+                .insert_binary("shared-meta-bin", vec![3])
+                .unwrap();
+            rpc_options
+                .metadata
+                .insert_binary("call-meta-bin", vec![4])
+                .unwrap();
+            let mut request = Request::new(());
+            rpc_options.apply_to(&mut request);
+
+            let request = service_interceptor.call(request).unwrap();
+            assert_eq!(request.metadata().get("shared-meta").unwrap(), "call-value");
+            assert_eq!(request.metadata().get("call-meta").unwrap(), "call-only");
+            assert_eq!(
+                request.metadata().get("connection-meta").unwrap(),
+                "connection-only"
+            );
+            assert_eq!(
+                request.metadata().get_bin("shared-meta-bin").unwrap(),
+                &[3][..]
+            );
+            assert_eq!(
+                request.metadata().get_bin("call-meta-bin").unwrap(),
+                &[4][..]
+            );
+            assert_eq!(
+                request.metadata().get_bin("connection-meta-bin").unwrap(),
+                &[2][..]
+            );
+        }
+    }
+
+    mod update_with_start_tests {
+        use super::*;
+        use assert_matches::assert_matches;
+        use parking_lot::Mutex;
+        use std::collections::VecDeque;
+        use temporalio_common::{
+            UpdateDefinition, WorkerDeploymentVersion, WorkflowDefinition,
+            data_converters::{GenericPayloadConverter, PayloadConverter},
+            protos::temporal::api::{
+                common::v1::{
+                    Header, Payload, Payloads, WorkflowExecution as ProtoWorkflowExecution,
+                },
+                enums::v1::{
+                    UpdateWorkflowExecutionLifecycleStage,
+                    WorkflowIdConflictPolicy as ProtoWorkflowIdConflictPolicy,
+                },
+                update::v1::{
+                    Input as UpdateInput, Meta as UpdateMeta, Outcome, Request as UpdateRequest,
+                    UpdateRef, WaitPolicy, outcome,
+                },
+            },
+        };
+        use tonic::{Request, Response};
+
+        struct TestWorkflow;
+
+        impl WorkflowDefinition for TestWorkflow {
+            type Input = String;
+            type Output = ();
+
+            fn name(&self) -> &str {
+                "test-workflow"
+            }
+        }
+
+        impl HasWorkflowDefinition for TestWorkflow {
+            type Run = Self;
+        }
+
+        struct TestUpdate;
+
+        impl UpdateDefinition for TestUpdate {
+            type Workflow = TestWorkflow;
+            type Input = String;
+            type Output = String;
+
+            fn name(&self) -> &str {
+                "test-update"
+            }
+        }
+
+        fn successful_multi_operation_response(
+            stage: UpdateWorkflowExecutionLifecycleStage,
+        ) -> ExecuteMultiOperationResponse {
+            let outcome = (stage == UpdateWorkflowExecutionLifecycleStage::Completed).then(|| {
+                let payload_converter = PayloadConverter::default();
+                let result_payloads =
+                    payload_converter
+                        .to_payloads(
+                            &SerializationContext::new(
+                                &SerializationContextData::Workflow(
+                                    WorkflowSerializationContext::new(),
+                                ),
+                                &payload_converter,
+                            ),
+                            &"update-result".to_owned(),
+                        )
+                        .unwrap();
+                Outcome {
+                    value: Some(outcome::Value::Success(Payloads {
+                        payloads: result_payloads,
+                    })),
+                }
+            });
+            ExecuteMultiOperationResponse {
+                responses: vec![
+                    execute_multi_operation_response::Response {
+                        response: Some(MultiOperationResponse::StartWorkflow(
+                            StartWorkflowExecutionResponse {
+                                run_id: "started-run-id".to_owned(),
+                                first_execution_run_id: "first-run-id".to_owned(),
+                                started: true,
+                                ..Default::default()
+                            },
+                        )),
+                    },
+                    execute_multi_operation_response::Response {
+                        response: Some(MultiOperationResponse::UpdateWorkflow(
+                            UpdateWorkflowExecutionResponse {
+                                update_ref: Some(UpdateRef {
+                                    workflow_execution: Some(ProtoWorkflowExecution {
+                                        workflow_id: "workflow-id".to_owned(),
+                                        run_id: "update-run-id".to_owned(),
+                                    }),
+                                    update_id: "server-update-id".to_owned(),
+                                }),
+                                outcome,
+                                stage: stage as i32,
+                                ..Default::default()
+                            },
+                        )),
+                    },
+                ],
+            }
+        }
+
+        #[derive(Clone)]
+        struct MockMultiOperationClient {
+            recorded: Arc<Mutex<Option<ExecuteMultiOperationRequest>>>,
+            responses: Arc<Mutex<VecDeque<ExecuteMultiOperationResponse>>>,
+            call_count: Arc<Mutex<usize>>,
+            interceptors: Vec<Arc<dyn ClientInterceptor>>,
+        }
+
+        impl MockMultiOperationClient {
+            fn new(
+                interceptors: Vec<Arc<dyn ClientInterceptor>>,
+                responses: impl IntoIterator<Item = ExecuteMultiOperationResponse>,
+            ) -> Self {
+                Self {
+                    recorded: Arc::new(Mutex::new(None)),
+                    responses: Arc::new(Mutex::new(responses.into_iter().collect())),
+                    call_count: Arc::new(Mutex::new(0)),
+                    interceptors,
+                }
+            }
+        }
+
+        impl NamespacedClient for MockMultiOperationClient {
+            fn namespace(&self) -> String {
+                "test-namespace".to_owned()
+            }
+
+            fn identity(&self) -> String {
+                "test-identity".to_owned()
+            }
+
+            fn client_interceptors(&self) -> &[Arc<dyn ClientInterceptor>] {
+                &self.interceptors
+            }
+        }
+
+        impl WorkflowService for MockMultiOperationClient {
+            fn execute_multi_operation(
+                &mut self,
+                request: Request<ExecuteMultiOperationRequest>,
+            ) -> futures_util::future::BoxFuture<
+                '_,
+                Result<Response<ExecuteMultiOperationResponse>, tonic::Status>,
+            > {
+                *self.recorded.lock() = Some(request.into_inner());
+                *self.call_count.lock() += 1;
+                let response = self.responses.lock().pop_front().unwrap_or_else(|| {
+                    successful_multi_operation_response(
+                        UpdateWorkflowExecutionLifecycleStage::Completed,
+                    )
+                });
+                Box::pin(async { Ok(Response::new(response)) })
+            }
+        }
+
+        fn update_with_start_options(
+            conflict_policy: WorkflowIdConflictPolicy,
+        ) -> WorkflowUpdateWithStartOptions {
+            WorkflowUpdateWithStartOptions::new("task-queue", "workflow-id", conflict_policy)
+                .build()
+        }
+
+        #[rstest::rstest]
+        #[case::unset(None)]
+        #[case::pinned(Some(VersioningOverride::Pinned(
+            WorkerDeploymentVersion::builder().deployment_name("deployment").build_id("build").build()
+        )))]
+        #[case::auto_upgrade(Some(VersioningOverride::AutoUpgrade))]
+        #[case::one_time(Some(VersioningOverride::OneTime(
+            WorkerDeploymentVersion::builder().deployment_name("deployment").build_id("build").build()
+        )))]
+        #[tokio::test]
+        async fn update_with_start_builds_multi_operation_request(
+            #[case] versioning_override: Option<VersioningOverride>,
+        ) {
+            let client = MockMultiOperationClient::new(Vec::new(), []);
+            let recorded = client.recorded.clone();
+
+            let start_header = Header {
+                fields: HashMap::from([("start-header".to_owned(), Payload::default())]),
+            };
+            let update_header = Header {
+                fields: HashMap::from([("update-header".to_owned(), Payload::default())]),
+            };
+            let update_handle = client
+                .start_update_with_start_workflow(
+                    TestWorkflow,
+                    "workflow-input".to_owned(),
+                    TestUpdate,
+                    "update-input".to_owned(),
+                    WorkflowUpdateWithStartOptions::new(
+                        "task-queue",
+                        "workflow-id",
+                        WorkflowIdConflictPolicy::UseExisting,
+                    )
+                    .update_id("my-update-id".to_owned())
+                    .start_header(start_header.clone())
+                    .update_header(update_header.clone())
+                    .maybe_versioning_override(versioning_override.clone())
+                    .build(),
+                )
+                .await
+                .unwrap();
+
+            let payload_converter = PayloadConverter::default();
+            let context_data =
+                SerializationContextData::Workflow(WorkflowSerializationContext::new());
+            let context = SerializationContext::new(&context_data, &payload_converter);
+            let workflow_payloads = payload_converter
+                .to_payloads(&context, &"workflow-input".to_owned())
+                .unwrap();
+            let update_payloads = payload_converter
+                .to_payloads(&context, &"update-input".to_owned())
+                .unwrap();
+
+            let request = recorded.lock().take().unwrap();
+            let request_id = assert_matches!(
+                &request.operations[0].operation,
+                Some(execute_multi_operation_request::operation::Operation::StartWorkflow(r)) => r
+            )
+            .request_id
+            .clone();
+            assert_eq!(
+                request,
+                ExecuteMultiOperationRequest {
+                    namespace: "test-namespace".to_owned(),
+                    operations: vec![
+                        execute_multi_operation_request::Operation {
+                            operation: Some(MultiOperationRequest::StartWorkflow(
+                                StartWorkflowExecutionRequest {
+                                    namespace: "test-namespace".to_owned(),
+                                    workflow_id: "workflow-id".to_owned(),
+                                    workflow_type: Some(WorkflowType {
+                                        name: "test-workflow".to_owned(),
+                                    }),
+                                    task_queue: Some(TaskQueue {
+                                        name: "task-queue".to_owned(),
+                                        ..Default::default()
+                                    }),
+                                    input: Some(Payloads {
+                                        payloads: workflow_payloads,
+                                    }),
+                                    request_id,
+                                    identity: "test-identity".to_owned(),
+                                    workflow_id_conflict_policy:
+                                        ProtoWorkflowIdConflictPolicy::UseExisting as i32,
+                                    header: Some(start_header),
+                                    priority: Some(Default::default()),
+                                    versioning_override: versioning_override.map(Into::into),
+                                    ..Default::default()
+                                },
+                            )),
+                        },
+                        execute_multi_operation_request::Operation {
+                            operation: Some(MultiOperationRequest::UpdateWorkflow(
+                                UpdateWorkflowExecutionRequest {
+                                    namespace: "test-namespace".to_owned(),
+                                    workflow_execution: Some(ProtoWorkflowExecution {
+                                        workflow_id: "workflow-id".to_owned(),
+                                        run_id: String::new(),
+                                    }),
+                                    wait_policy: Some(WaitPolicy {
+                                        lifecycle_stage:
+                                            UpdateWorkflowExecutionLifecycleStage::Accepted as i32,
+                                    }),
+                                    request: Some(UpdateRequest {
+                                        meta: Some(UpdateMeta {
+                                            update_id: "my-update-id".to_owned(),
+                                            identity: "test-identity".to_owned(),
+                                        }),
+                                        input: Some(UpdateInput {
+                                            header: Some(update_header),
+                                            name: "test-update".to_owned(),
+                                            args: Some(Payloads {
+                                                payloads: update_payloads,
+                                            }),
+                                        }),
+                                        ..Default::default()
+                                    }),
+                                    ..Default::default()
+                                },
+                            )),
+                        },
+                    ],
+                    resource_id: "workflow-id".to_owned(),
+                }
+            );
+
+            assert_eq!(update_handle.id(), "my-update-id");
+            assert_eq!(update_handle.workflow_run_id(), Some("update-run-id"));
+            // The outcome came back with the multi-operation response, so no poll RPC is needed
+            // (the mock would fail it).
+            let result: String = update_handle
+                .get_result(RpcOptions::default())
+                .await
+                .unwrap();
+            assert_eq!(result, "update-result");
+        }
+
+        #[tokio::test]
+        async fn update_with_start_retries_until_update_is_accepted() {
+            let client = MockMultiOperationClient::new(
+                Vec::new(),
+                [
+                    successful_multi_operation_response(
+                        UpdateWorkflowExecutionLifecycleStage::Unspecified,
+                    ),
+                    successful_multi_operation_response(
+                        UpdateWorkflowExecutionLifecycleStage::Accepted,
+                    ),
+                ],
+            );
+            let call_count = client.call_count.clone();
+
+            let update_handle = client
+                .start_update_with_start_workflow(
+                    TestWorkflow,
+                    "workflow-input".to_owned(),
+                    TestUpdate,
+                    "update-input".to_owned(),
+                    update_with_start_options(WorkflowIdConflictPolicy::Fail),
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(*call_count.lock(), 2);
+            assert_eq!(update_handle.workflow_run_id(), Some("update-run-id"));
+        }
+
+        #[tokio::test]
+        async fn update_with_start_rejects_malformed_operation_responses() {
+            let mut missing_response = successful_multi_operation_response(
+                UpdateWorkflowExecutionLifecycleStage::Accepted,
+            );
+            missing_response.responses[0] = execute_multi_operation_response::Response::default();
+            let mut extra_response = successful_multi_operation_response(
+                UpdateWorkflowExecutionLifecycleStage::Accepted,
+            );
+            extra_response
+                .responses
+                .push(execute_multi_operation_response::Response::default());
+            let mut wrong_order = successful_multi_operation_response(
+                UpdateWorkflowExecutionLifecycleStage::Accepted,
+            );
+            wrong_order.responses.swap(0, 1);
+
+            for response in [missing_response, extra_response, wrong_order] {
+                let client = MockMultiOperationClient::new(Vec::new(), [response]);
+                let result = client
+                    .start_update_with_start_workflow(
+                        TestWorkflow,
+                        "workflow-input".to_owned(),
+                        TestUpdate,
+                        "update-input".to_owned(),
+                        update_with_start_options(WorkflowIdConflictPolicy::Fail),
+                    )
+                    .await;
+                assert!(matches!(
+                    result,
+                    Err(WorkflowUpdateWithStartError::Other(_))
+                ));
+            }
+        }
+
+        #[tokio::test]
+        async fn update_with_start_interceptor_can_mutate_args() {
+            struct ReplaceArgsInterceptor;
+
+            impl ClientInterceptor for ReplaceArgsInterceptor {
+                fn update_with_start_workflow<'a>(
+                    &'a self,
+                    mut input: UpdateWithStartWorkflowInput,
+                    next: Next<
+                        'a,
+                        UpdateWithStartWorkflowInput,
+                        BoxFuture<
+                            'a,
+                            Result<UpdateWithStartWorkflowOutput, WorkflowUpdateWithStartError>,
+                        >,
+                    >,
+                ) -> BoxFuture<
+                    'a,
+                    Result<UpdateWithStartWorkflowOutput, WorkflowUpdateWithStartError>,
+                > {
+                    assert_eq!(
+                        input.workflow_args_ref::<String>().unwrap(),
+                        "workflow-input"
+                    );
+                    input.replace_workflow_args("replaced-workflow-input".to_owned());
+                    *input.update_args_mut::<String>().unwrap() =
+                        "replaced-update-input".to_owned();
+                    next.run(input)
+                }
+            }
+
+            let client = MockMultiOperationClient::new(vec![Arc::new(ReplaceArgsInterceptor)], []);
+            let recorded = client.recorded.clone();
+
+            client
+                .start_update_with_start_workflow(
+                    TestWorkflow,
+                    "workflow-input".to_owned(),
+                    TestUpdate,
+                    "update-input".to_owned(),
+                    update_with_start_options(WorkflowIdConflictPolicy::Fail),
+                )
+                .await
+                .unwrap();
+
+            let request = recorded.lock().take().unwrap();
+            let start_request = assert_matches!(
+                &request.operations[0].operation,
+                Some(execute_multi_operation_request::operation::Operation::StartWorkflow(r)) => r
+            );
+            let workflow_input: String = client
+                .data_converter()
+                .from_payloads(
+                    &SerializationContextData::Workflow(WorkflowSerializationContext::new()),
+                    start_request.input.clone().unwrap().payloads,
+                )
+                .await
+                .unwrap();
+            assert_eq!(workflow_input, "replaced-workflow-input");
+            let update_request = assert_matches!(
+                &request.operations[1].operation,
+                Some(execute_multi_operation_request::operation::Operation::UpdateWorkflow(r)) => r
+            );
+            let update_input: String = client
+                .data_converter()
+                .from_payloads(
+                    &SerializationContextData::Workflow(WorkflowSerializationContext::new()),
+                    update_request
+                        .request
+                        .clone()
+                        .unwrap()
+                        .input
+                        .unwrap()
+                        .args
+                        .unwrap()
+                        .payloads,
+                )
+                .await
+                .unwrap();
+            assert_eq!(update_input, "replaced-update-input");
         }
     }
 
     mod list_workflows_tests {
         use super::*;
-        use crate::test_helpers::XorCodec;
+        use crate::test_helpers::{FailingCodec, XorCodec};
         use futures_util::{FutureExt, StreamExt};
         use std::sync::atomic::{AtomicUsize, Ordering};
         use temporalio_common::{
-            data_converters::DefaultFailureConverter,
+            data_converters::{DefaultFailureConverter, PayloadConverter},
             protos::temporal::api::common::v1::{
                 Memo as ProtoMemo, Payload, WorkflowExecution as ProtoWorkflowExecution,
             },
@@ -1835,6 +4683,7 @@ mod tests {
             total_workflows: usize,
             data_converter: DataConverter,
             memo_payload: Option<Payload>,
+            interceptors: Vec<Arc<dyn ClientInterceptor>>,
         }
 
         impl NamespacedClient for MockListWorkflowsClient {
@@ -1846,6 +4695,28 @@ mod tests {
             }
             fn data_converter(&self) -> &DataConverter {
                 &self.data_converter
+            }
+            fn client_interceptors(&self) -> &[Arc<dyn ClientInterceptor>] {
+                &self.interceptors
+            }
+        }
+
+        struct CountingListInterceptor {
+            calls: Arc<AtomicUsize>,
+        }
+
+        impl ClientInterceptor for CountingListInterceptor {
+            fn list_workflows_page<'a>(
+                &'a self,
+                input: ListWorkflowsPageInput,
+                next: Next<
+                    'a,
+                    ListWorkflowsPageInput,
+                    BoxFuture<'a, Result<ListWorkflowsPageOutput, ClientError>>,
+                >,
+            ) -> BoxFuture<'a, Result<ListWorkflowsPageOutput, ClientError>> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                next.run(input)
             }
         }
 
@@ -1910,12 +4781,16 @@ mod tests {
         #[tokio::test]
         async fn list_workflows_paginates_through_all_results() {
             let call_count = Arc::new(AtomicUsize::new(0));
+            let interceptor_calls = Arc::new(AtomicUsize::new(0));
             let client = MockListWorkflowsClient {
                 call_count: call_count.clone(),
                 page_size: 3,
                 total_workflows: 10,
                 data_converter: DataConverter::default(),
                 memo_payload: None,
+                interceptors: vec![Arc::new(CountingListInterceptor {
+                    calls: interceptor_calls.clone(),
+                })],
             };
 
             let stream = client.list_workflows("", WorkflowListOptions::default());
@@ -1929,6 +4804,7 @@ mod tests {
             }
             // Should have made 4 calls: pages of 3, 3, 3, 1
             assert_eq!(call_count.load(Ordering::SeqCst), 4);
+            assert_eq!(interceptor_calls.load(Ordering::SeqCst), 4);
         }
 
         #[tokio::test]
@@ -1940,6 +4816,7 @@ mod tests {
                 total_workflows: 10,
                 data_converter: DataConverter::default(),
                 memo_payload: None,
+                interceptors: Vec::new(),
             };
 
             let opts = WorkflowListOptions::builder().limit(5).build();
@@ -1964,6 +4841,7 @@ mod tests {
                 total_workflows: 100,
                 data_converter: DataConverter::default(),
                 memo_payload: None,
+                interceptors: Vec::new(),
             };
 
             let opts = WorkflowListOptions::builder().limit(3).build();
@@ -1984,6 +4862,7 @@ mod tests {
                 total_workflows: 0,
                 data_converter: DataConverter::default(),
                 memo_payload: None,
+                interceptors: Vec::new(),
             };
 
             let stream = client.list_workflows("", WorkflowListOptions::default());
@@ -1997,12 +4876,12 @@ mod tests {
         async fn list_workflows_exposes_typed_memo() {
             let data_converter = DataConverter::new(
                 PayloadConverter::default(),
-                DefaultFailureConverter,
+                DefaultFailureConverter::default(),
                 XorCodec,
             );
             let memo_payload = data_converter
                 .to_payload(
-                    &SerializationContextData::Workflow,
+                    &SerializationContextData::Workflow(WorkflowSerializationContext::new()),
                     &"memo-value".to_owned(),
                 )
                 .await
@@ -2013,6 +4892,7 @@ mod tests {
                 total_workflows: 1,
                 data_converter,
                 memo_payload: Some(memo_payload),
+                interceptors: Vec::new(),
             };
 
             let workflow = client
@@ -2026,6 +4906,28 @@ mod tests {
                 workflow.memo().get::<String>("memo-key").unwrap(),
                 Some("memo-value".to_owned())
             );
+        }
+
+        #[tokio::test]
+        async fn list_workflows_yields_codec_error_then_ends() {
+            let client = MockListWorkflowsClient {
+                call_count: Arc::new(AtomicUsize::new(0)),
+                page_size: 1,
+                total_workflows: 1,
+                data_converter: DataConverter::new(
+                    PayloadConverter::default(),
+                    DefaultFailureConverter::default(),
+                    FailingCodec,
+                ),
+                memo_payload: Some(Payload::default()),
+                interceptors: Vec::new(),
+            };
+            let mut stream = client.list_workflows("", WorkflowListOptions::default());
+
+            let err = stream.next().await.unwrap().unwrap_err();
+
+            assert!(matches!(err, ClientError::PayloadConversion(_)));
+            assert!(stream.next().await.is_none());
         }
     }
 }

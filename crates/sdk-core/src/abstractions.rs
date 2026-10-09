@@ -108,6 +108,11 @@ where
         self.supplier.available_slots()
     }
 
+    /// Hard cap on extant permits (the workflow cache size), if any.
+    pub(crate) fn max_permits(&self) -> Option<usize> {
+        self.max_permits
+    }
+
     pub(crate) fn slot_supplier_kind(&self) -> &SlotSupplierKind {
         &self.slot_supplier_kind
     }

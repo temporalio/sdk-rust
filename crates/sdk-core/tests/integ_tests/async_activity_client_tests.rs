@@ -44,8 +44,8 @@ async fn async_activity_completions(
     #[derive(Clone)]
     struct SharedActivityInfo {
         task_token: Vec<u8>,
-        workflow_id: String,
-        run_id: String,
+        workflow_id: Option<String>,
+        workflow_run_id: Option<String>,
         activity_id: String,
     }
 
@@ -76,11 +76,10 @@ async fn async_activity_completions(
             }
 
             let activity_info = ctx.info();
-            let wf_exec = activity_info.workflow_execution.as_ref().unwrap();
             let info = SharedActivityInfo {
                 task_token: activity_info.task_token.clone(),
-                workflow_id: wf_exec.workflow_id().to_owned(),
-                run_id: wf_exec.run_id().to_owned(),
+                workflow_id: activity_info.workflow_id.clone(),
+                workflow_run_id: activity_info.workflow_run_id.clone(),
                 activity_id: activity_info.activity_id.clone(),
             };
             let _ = self.info_tx.send(info).await;
@@ -91,9 +90,6 @@ async fn async_activity_completions(
     starter
         .sdk_config
         .register_activities(AsyncActivities { info_tx });
-
-    let mut worker = starter.worker().await;
-    let client = starter.get_client().await;
 
     #[workflow]
     #[derive(Default)]
@@ -153,18 +149,21 @@ async fn async_activity_completions(
         }
     }
 
-    worker
+    starter
+        .sdk_config
         .register_workflow::<AsyncCompletionWorkflow>()
         .unwrap();
+    let mut worker = starter.worker().await;
+    let client = starter.get_core_client().await;
 
     let completion_task = tokio::spawn(async move {
         let info = info_rx.recv().await.expect("should receive activity info");
 
         eprintln!(
-            "DEBUG: Received activity info - task_token_len={}, workflow_id={}, run_id={}, activity_id={}",
+            "DEBUG: Received activity info - task_token_len={}, workflow_id={:?}, run_id={:?}, activity_id={}",
             info.task_token.len(),
             info.workflow_id,
-            info.run_id,
+            info.workflow_run_id,
             info.activity_id
         );
 
@@ -175,7 +174,11 @@ async fn async_activity_completions(
             }
             IdentifierType::ById => {
                 eprintln!("DEBUG: Using ById identifier");
-                ActivityIdentifier::by_id(info.workflow_id, info.run_id, info.activity_id)
+                ActivityIdentifier::by_id_workflow(
+                    info.workflow_id.unwrap(),
+                    info.workflow_run_id.unwrap(),
+                    info.activity_id,
+                )
             }
         };
 
@@ -183,7 +186,11 @@ async fn async_activity_completions(
         eprintln!("DEBUG: Calling {:?} on handle", outcome);
 
         let result = match outcome {
-            Outcome::Success => handle.complete(Some(async_response.to_owned())).await,
+            Outcome::Success => {
+                handle
+                    .complete(Some(async_response.to_owned()), Default::default())
+                    .await
+            }
             Outcome::Failure => {
                 handle
                     .fail(
@@ -191,10 +198,15 @@ async fn async_activity_completions(
                             .type_name("TestFailure".to_owned())
                             .build(),
                         None::<()>,
+                        Default::default(),
                     )
                     .await
             }
-            Outcome::Cancellation => handle.report_cancelation(None::<()>).await,
+            Outcome::Cancellation => {
+                handle
+                    .report_cancelation(None::<()>, Default::default())
+                    .await
+            }
         };
         if let Err(e) = &result {
             eprintln!(

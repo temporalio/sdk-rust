@@ -59,6 +59,11 @@ const THROTTLE_POLL_BACKOFF: ExponentialBuilder = ExponentialBuilder::new()
     .with_factor(2.0)
     .with_max_delay(Duration::from_secs(10))
     .without_max_times();
+const PERSISTENT_POLL_ERROR_WARN_BACKOFF: ExponentialBuilder = ExponentialBuilder::new()
+    .with_min_delay(Duration::from_secs(60))
+    .with_factor(2.0)
+    .with_max_delay(Duration::from_secs(15 * 60))
+    .without_max_times();
 
 type PollReceiver<T, SK> =
     Mutex<UnboundedReceiver<pollers::Result<(T, OwnedMeteredSemPermit<SK>)>>>;
@@ -132,7 +137,10 @@ impl LongPollBuffer<PollWorkflowTaskQueueResponse, WorkflowSlotKind> {
         );
         if let Some(wftps) = options.wft_poller_shared.as_ref() {
             if is_sticky {
-                wftps.set_sticky_active(poll_scaler.active_rx.clone());
+                wftps.set_sticky_active(
+                    poll_scaler.active_rx.clone(),
+                    poll_scaler.report_handle.target.subscribe(),
+                );
             } else {
                 wftps.set_non_sticky_active(poll_scaler.active_rx.clone());
             };
@@ -539,10 +547,11 @@ where
                 initial,
             } => (minimum, maximum, initial),
         };
+        let target = watch::Sender::new(target);
         let report_handle = Arc::new(PollScalerReportHandle {
             max,
             min,
-            target: AtomicUsize::new(target),
+            target,
             ever_saw_scaling_decision: AtomicBool::default(),
             capabilities,
             behavior,
@@ -550,6 +559,7 @@ where
             ingested_last_period: Default::default(),
             scale_up_allowed: AtomicBool::new(true),
             last_successful_poll_time,
+            persistent_error_warning_state: Default::default(),
             exponential_backoff: parking_lot::Mutex::new(TASK_POLL_BACKOFF.build()),
             resource_exhausted_backoff: parking_lot::Mutex::new(THROTTLE_POLL_BACKOFF.build()),
         });
@@ -590,10 +600,7 @@ where
 
     async fn wait_until_allowed(&mut self) -> ActiveCounter<impl Fn(usize) + use<F>> {
         self.active_rx
-            .wait_for(|v| {
-                *v < self.report_handle.max
-                    && *v < self.report_handle.target.load(Ordering::Relaxed)
-            })
+            .wait_for(|v| *v < self.report_handle.max && *v < *self.report_handle.target.borrow())
             .await
             .expect("Poll allow does not panic");
         ActiveCounter::new(self.active_tx.clone(), self.num_pollers_handler.clone())
@@ -607,7 +614,7 @@ where
 struct PollScalerReportHandle {
     max: usize,
     min: usize,
-    target: AtomicUsize,
+    target: watch::Sender<usize>,
     ever_saw_scaling_decision: AtomicBool,
     capabilities: Arc<NamespaceCapabilities>,
     behavior: PollerBehavior,
@@ -616,6 +623,7 @@ struct PollScalerReportHandle {
     ingested_last_period: AtomicUsize,
     scale_up_allowed: AtomicBool,
     last_successful_poll_time: Arc<AtomicCell<Option<SystemTime>>>,
+    persistent_error_warning_state: parking_lot::Mutex<PersistentPollErrorWarningState>,
 
     // Exponential backoff for normal errors and resource exhausted errors
     exponential_backoff: parking_lot::Mutex<backon::ExponentialBackoff>,
@@ -634,10 +642,10 @@ impl PollScalerReportHandle {
             Ok(res) => {
                 self.last_successful_poll_time
                     .store(Some(SystemTime::now()));
-
                 // Reset backoff on successful poll
                 *self.exponential_backoff.lock() = TASK_POLL_BACKOFF.build();
                 *self.resource_exhausted_backoff.lock() = THROTTLE_POLL_BACKOFF.build();
+                self.persistent_error_warning_state.lock().reset();
 
                 if let PollerBehavior::SimpleMaximum(_) = self.behavior {
                     // We don't do auto-scaling with the simple max
@@ -673,6 +681,18 @@ impl PollScalerReportHandle {
             }
             Err(e) => {
                 if matches!(self.behavior, PollerBehavior::Autoscaling { .. }) {
+                    if let Some(error_duration) = self
+                        .persistent_error_warning_state
+                        .lock()
+                        .record_error(Instant::now())
+                    {
+                        warn!(
+                            error = ?e,
+                            ?error_duration,
+                            "Task polling has encountered errors continuously; the worker will continue retrying"
+                        );
+                    }
+
                     // Follow the same backoff logic as the retry client
                     let mut backoff_duration = self
                         .exponential_backoff
@@ -695,15 +715,10 @@ impl PollScalerReportHandle {
                         .metadata()
                         .contains_key(ERROR_RETURNED_DUE_TO_SHORT_CIRCUIT);
 
-                    if self.can_scale_down() {
+                    if self.can_scale_down() && e.code() == Code::ResourceExhausted {
                         debug!("Got error from server while polling: {:?}", e);
-                        if e.code() == Code::ResourceExhausted {
-                            // Scale down significantly for resource exhaustion
-                            self.change_target(usize::saturating_div, 2);
-                        } else {
-                            // Other codes that would normally have made us back off briefly can reclaim this poller
-                            self.change_target(usize::saturating_sub, 1);
-                        }
+                        // Scale down significantly for resource exhaustion
+                        self.change_target(usize::saturating_div, 2);
                     }
                     return (should_forward, backoff_duration);
                 }
@@ -714,11 +729,15 @@ impl PollScalerReportHandle {
 
     #[inline]
     fn change_target(&self, change: fn(usize, usize) -> usize, change_by: usize) {
-        self.target
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
-                Some(change(v, change_by).clamp(self.min, self.max))
-            })
-            .expect("Cannot fail because always returns Some");
+        self.target.send_if_modified(|target| {
+            let new_target = change(*target, change_by).clamp(self.min, self.max);
+            if *target == new_target {
+                return false;
+            }
+
+            *target = new_target;
+            true
+        });
     }
 
     /// We want to avoid scaling down on empty polls if the server has never made any scaling
@@ -854,6 +873,44 @@ where
     }
 }
 
+#[derive(Debug)]
+struct PersistentPollErrorWarningState {
+    started_at: Option<Instant>,
+    next_warning_at: Option<Instant>,
+    warning_backoff: backon::ExponentialBackoff,
+}
+
+impl Default for PersistentPollErrorWarningState {
+    fn default() -> Self {
+        Self {
+            started_at: None,
+            next_warning_at: None,
+            warning_backoff: PERSISTENT_POLL_ERROR_WARN_BACKOFF.build(),
+        }
+    }
+}
+
+impl PersistentPollErrorWarningState {
+    fn record_error(&mut self, now: Instant) -> Option<Duration> {
+        let Some(started_at) = self.started_at else {
+            self.started_at = Some(now);
+            self.next_warning_at = self.warning_backoff.next().map(|delay| now + delay);
+            return None;
+        };
+        let next_warning_at = self.next_warning_at?;
+        if now < next_warning_at {
+            return None;
+        }
+
+        self.next_warning_at = self.warning_backoff.next().map(|delay| now + delay);
+        Some(now.saturating_duration_since(started_at))
+    }
+
+    fn reset(&mut self) {
+        *self = Self::default();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -863,7 +920,8 @@ mod tests {
     };
     use futures_util::FutureExt;
     use rstest::rstest;
-    use std::time::Duration;
+    use std::{future::pending, time::Duration};
+    use temporalio_common::protos::temporal::api::namespace::v1::namespace_info::Capabilities;
     use tokio::{select, sync::Notify};
 
     #[tokio::test]
@@ -1077,10 +1135,13 @@ mod tests {
 
     #[rstest]
     #[case::resource_exhausted(Code::ResourceExhausted)]
-    #[case::internal(Code::Internal)]
+    #[case::cancelled(Code::Cancelled)]
     #[tokio::test]
     async fn autoscaler_applies_backoff_on_errors(#[case] error_code: Code) {
         use temporalio_common::protos::temporal::api::taskqueue::v1::PollerScalingDecision;
+
+        const INITIAL_POLLERS: usize = 10;
+        const MAX_POLLS_DURING_BACKOFF: usize = INITIAL_POLLERS + 1;
 
         let call_count = Arc::new(AtomicUsize::new(0));
         let call_count_clone = call_count.clone();
@@ -1123,13 +1184,13 @@ mod tests {
             PollerBehavior::Autoscaling {
                 minimum: 5,
                 maximum: 100,
-                initial: 10,
+                initial: INITIAL_POLLERS,
             },
-            fixed_size_permit_dealer(10),
+            fixed_size_permit_dealer(INITIAL_POLLERS),
             CancellationToken::new(),
             None::<fn(usize)>,
             WorkflowTaskOptions {
-                wft_poller_shared: Some(Arc::new(WFTPollerShared::new(Some(10)))),
+                wft_poller_shared: Some(Arc::new(WFTPollerShared::new(Some(INITIAL_POLLERS)))),
             },
             Arc::new(AtomicCell::new(None)),
             Arc::new(NamespaceCapabilities::default()),
@@ -1148,11 +1209,10 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(100)).await;
         let hot_loop_calls = call_count.load(Ordering::SeqCst);
 
-        // Without backoff, this was producing ~6300 polls in ~100ms on my machine.
-        // With exponential backoff, I'm getting exactly 10 (initial poller count).
+        // One replacement may follow the successful setup poll, but errors must not create a hot loop.
         assert!(
-            hot_loop_calls == 10,
-            "Expected proper backoff with == 10 polls in 100ms, but got {} polls.",
+            hot_loop_calls <= MAX_POLLS_DURING_BACKOFF,
+            "Expected at most {MAX_POLLS_DURING_BACKOFF} polls during backoff, got {}.",
             hot_loop_calls
         );
 
@@ -1160,6 +1220,85 @@ mod tests {
             .unwrap_or_else(|_| panic!("Failed to unwrap Arc"))
             .shutdown()
             .await;
+    }
+
+    #[rstest]
+    #[case::cancelled(Code::Cancelled)]
+    #[case::deadline_exceeded(Code::DeadlineExceeded)]
+    #[tokio::test(start_paused = true)]
+    async fn transient_error_keeps_target(#[case] error_code: Code) {
+        const INITIAL_POLLERS: usize = 4;
+        const REPLACEMENT_CALLS: usize = INITIAL_POLLERS + 1;
+        const BACKOFF_SETTLE_TIME: Duration = Duration::from_millis(250);
+
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let call_count_clone = call_count.clone();
+        let fail_poll = Arc::new(Notify::new());
+        let fail_poll_clone = fail_poll.clone();
+
+        let mut mock_client = mock_manual_worker_client();
+        mock_client
+            .expect_poll_workflow_task()
+            .returning(move |_, _| {
+                let call_number = call_count_clone.fetch_add(1, Ordering::SeqCst) + 1;
+                let fail_poll = fail_poll_clone.clone();
+
+                async move {
+                    if call_number == INITIAL_POLLERS {
+                        fail_poll.notified().await;
+
+                        return Err(tonic::Status::new(error_code, "simulated poll error"));
+                    }
+
+                    pending().await
+                }
+                .boxed()
+            });
+
+        let (active_tx, mut active_rx) = watch::channel(0);
+        let pb = LongPollBuffer::new_workflow_task(
+            Arc::new(mock_client),
+            "normal".to_string(),
+            Some("sticky".to_string()),
+            PollerBehavior::Autoscaling {
+                minimum: 1,
+                maximum: INITIAL_POLLERS,
+                initial: INITIAL_POLLERS,
+            },
+            fixed_size_permit_dealer(INITIAL_POLLERS),
+            CancellationToken::new(),
+            Some(move |active| {
+                active_tx.send_replace(active);
+            }),
+            WorkflowTaskOptions {
+                wft_poller_shared: None,
+            },
+            Arc::new(AtomicCell::new(None)),
+            Arc::new(NamespaceCapabilities::resolved(Capabilities {
+                poller_autoscaling: true,
+                ..Default::default()
+            })),
+        );
+
+        let _ = pb.starter.send(());
+        active_rx
+            .wait_for(|active| *active == INITIAL_POLLERS)
+            .await
+            .unwrap();
+
+        fail_poll.notify_one();
+        tokio::task::yield_now().await;
+
+        assert_eq!(call_count.load(Ordering::SeqCst), INITIAL_POLLERS);
+        assert_eq!(*active_rx.borrow_and_update(), INITIAL_POLLERS);
+
+        tokio::time::advance(BACKOFF_SETTLE_TIME).await;
+        tokio::task::yield_now().await;
+
+        assert_eq!(call_count.load(Ordering::SeqCst), REPLACEMENT_CALLS);
+        assert_eq!(*active_rx.borrow_and_update(), INITIAL_POLLERS);
+
+        pb.shutdown().await;
     }
 
     #[rstest]
@@ -1213,11 +1352,10 @@ mod tests {
                 wft_poller_shared: None,
             },
             Arc::new(AtomicCell::new(None)),
-            Arc::new({
-                let ns = NamespaceCapabilities::default();
-                ns.graceful_poll_shutdown.store(graceful, Ordering::Relaxed);
-                ns
-            }),
+            Arc::new(NamespaceCapabilities::resolved(Capabilities {
+                worker_poll_complete_on_shutdown: graceful,
+                ..Default::default()
+            })),
         );
 
         let first = pb.poll().await.unwrap().unwrap();
@@ -1267,14 +1405,12 @@ mod tests {
         let handle = Arc::new(PollScalerReportHandle {
             max: 10,
             min: minimum,
-            target: AtomicUsize::new(10),
+            target: watch::channel(10).0,
             ever_saw_scaling_decision: AtomicBool::new(false),
-            capabilities: Arc::new({
-                let ns = NamespaceCapabilities::default();
-                ns.poller_autoscaling
-                    .store(supports_autoscaling, Ordering::Relaxed);
-                ns
-            }),
+            capabilities: Arc::new(NamespaceCapabilities::resolved(Capabilities {
+                poller_autoscaling: supports_autoscaling,
+                ..Default::default()
+            })),
             behavior: PollerBehavior::Autoscaling {
                 minimum,
                 maximum: 10,
@@ -1284,6 +1420,7 @@ mod tests {
             ingested_last_period: Default::default(),
             scale_up_allowed: AtomicBool::new(true),
             last_successful_poll_time: Arc::new(AtomicCell::new(None)),
+            persistent_error_warning_state: Default::default(),
             exponential_backoff: parking_lot::Mutex::new(TASK_POLL_BACKOFF.build()),
             resource_exhausted_backoff: parking_lot::Mutex::new(THROTTLE_POLL_BACKOFF.build()),
         });
@@ -1294,7 +1431,27 @@ mod tests {
             handle.poll_result(&empty_resp);
         }
 
-        assert_eq!(handle.target.load(Ordering::Relaxed), expected_target);
+        assert_eq!(*handle.target.borrow(), expected_target);
         assert!(!handle.ever_saw_scaling_decision.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn persistent_poll_error_warning_uses_exponential_backoff_and_resets() {
+        let mut state = PersistentPollErrorWarningState::default();
+        let started_at = Instant::now();
+        let minute = Duration::from_secs(60);
+
+        assert_eq!(state.record_error(started_at), None);
+        assert_eq!(
+            state.record_error(started_at + minute - Duration::from_secs(1)),
+            None
+        );
+        for warning_minute in [1, 3, 7, 15, 30, 45] {
+            let elapsed = minute * warning_minute;
+            assert_eq!(state.record_error(started_at + elapsed), Some(elapsed));
+        }
+
+        state.reset();
+        assert_eq!(state.record_error(started_at + minute * 45), None);
     }
 }

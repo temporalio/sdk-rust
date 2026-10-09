@@ -28,13 +28,13 @@ use temporalio_common::{
             },
         },
     },
-    worker::WorkerTaskTypes,
 };
 use temporalio_sdk::{PatchActivationCallback, WasmWorkflowComponent};
 use tokio::process::Command;
 
 const WASM_COMPONENT_ID: &str = "hello-workflow-component";
 const WASM_WORKFLOW_TYPE: &str = "HelloWorkflow";
+const WASM_INTERCEPTOR_WORKFLOW_TYPE: &str = "InterceptorWorkflow";
 const WASM_PATCH_ACTIVATION_WORKFLOW_TYPE: &str = "PatchActivationWorkflow";
 const WASM_TASK_FAILURE_WORKFLOW_TYPE: &str = "WasmTaskFailureWorkflow";
 const WASM_PATCH_ID: &str = "wasm-patch-activation";
@@ -44,7 +44,13 @@ async fn wasm_workflow_component_executes() {
     let component_path = build_wasm_hello_component().await;
     let component = WasmWorkflowComponent::from_file(WASM_COMPONENT_ID, component_path)
         .expect("sample WASM component should be loadable");
-    run_hello_workflow("wasm_workflow_component_executes", component).await;
+    run_string_workflow(
+        "wasm_workflow_component_executes",
+        component,
+        WASM_WORKFLOW_TYPE,
+        "Hello, workflow!",
+    )
+    .await;
 }
 
 // Mirrors `wasm_workflow_component_executes` but loads the component bytes into memory and
@@ -58,7 +64,27 @@ async fn wasm_workflow_component_executes_from_bytes() {
         .expect("WASM component file should be readable");
     let component = WasmWorkflowComponent::from_bytes(WASM_COMPONENT_ID, bytes)
         .expect("WASM component bytes should be loadable");
-    run_hello_workflow("wasm_workflow_component_executes_from_bytes", component).await;
+    run_string_workflow(
+        "wasm_workflow_component_executes_from_bytes",
+        component,
+        WASM_WORKFLOW_TYPE,
+        "Hello, workflow!",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn wasm_workflow_interceptor_executes() {
+    let component_path = build_wasm_interceptor_component().await;
+    let component = WasmWorkflowComponent::from_file(WASM_COMPONENT_ID, component_path)
+        .expect("interceptor WASM component should be loadable");
+    run_string_workflow(
+        "wasm_workflow_interceptor_executes",
+        component,
+        WASM_INTERCEPTOR_WORKFLOW_TYPE,
+        "Hello, workflow-intercepted! [intercepted]",
+    )
+    .await;
 }
 
 #[tokio::test]
@@ -69,7 +95,10 @@ async fn wasm_patch_activation_callback_can_decline() {
     let callback_input = input.clone();
     let callback: PatchActivationCallback = Arc::new(move |value| {
         callback_calls.fetch_add(1, Ordering::Relaxed);
-        *callback_input.lock().unwrap() = Some(value);
+        *callback_input.lock().unwrap() = Some((
+            value.workflow_info.workflow_type().to_string(),
+            value.patch_id,
+        ));
         false
     });
 
@@ -82,11 +111,8 @@ async fn wasm_patch_activation_callback_can_decline() {
     assert_eq!(marker_count, 0);
     let input = input.lock().unwrap();
     let input = input.as_ref().unwrap();
-    assert_eq!(
-        input.workflow_info.workflow_type(),
-        WASM_PATCH_ACTIVATION_WORKFLOW_TYPE
-    );
-    assert_eq!(input.patch_id, WASM_PATCH_ID);
+    assert_eq!(input.0, WASM_PATCH_ACTIVATION_WORKFLOW_TYPE);
+    assert_eq!(input.1, WASM_PATCH_ID);
 }
 
 #[tokio::test]
@@ -125,7 +151,6 @@ async fn wasm_patch_activation_callback_panic_fails_workflow_task() {
         .expect("sample WASM component should be loadable");
     let mut starter =
         CoreWfStarter::new("wasm_patch_activation_callback_panic_fails_workflow_task");
-    starter.sdk_config.task_types = WorkerTaskTypes::workflow_only();
     starter.sdk_config.patch_activation_callback =
         Some(Arc::new(|_| panic!("wasm patch activation callback panic")));
     starter.sdk_config.register_wasm_workflow(component);
@@ -180,12 +205,11 @@ async fn wasm_patch_activation_callback_panic_fails_workflow_task() {
 
 #[tokio::test]
 async fn wasm_task_failure_preserves_wit_failure_details() {
-    let component_path = build_wasm_hello_component().await;
+    let component_path = build_wasm_task_failure_component().await;
     let component = WasmWorkflowComponent::from_file(WASM_COMPONENT_ID, component_path)
         .expect("sample WASM component should be loadable");
 
     let mut starter = CoreWfStarter::new("wasm_task_failure_preserves_wit_failure_details");
-    starter.sdk_config.task_types = WorkerTaskTypes::workflow_only();
     starter.sdk_config.register_wasm_workflow(component);
 
     let mut worker = starter.worker().await;
@@ -238,13 +262,17 @@ async fn wasm_task_failure_preserves_wit_failure_details() {
     assert!(app_info.non_retryable);
 }
 
-async fn run_hello_workflow(test_name: &'static str, component: WasmWorkflowComponent) {
+async fn run_string_workflow(
+    test_name: &'static str,
+    component: WasmWorkflowComponent,
+    workflow_type: &'static str,
+    expected_result: &'static str,
+) {
     let mut starter = CoreWfStarter::new(test_name);
-    starter.sdk_config.task_types = WorkerTaskTypes::workflow_only();
     starter.sdk_config.register_wasm_workflow(component);
 
     let mut worker = starter.worker().await;
-    let client = starter.get_client().await;
+    let client = starter.get_core_client().await;
     let payload_converter = PayloadConverter::default();
     let input = RawValue::from_value(&"workflow", &payload_converter);
     let workflow_id = starter.get_wf_id().to_owned();
@@ -253,7 +281,7 @@ async fn run_hello_workflow(test_name: &'static str, component: WasmWorkflowComp
         WorkflowStartOptions::new(starter.get_task_queue().to_owned(), workflow_id.clone()).build();
     start_options.execution_timeout = Some(Duration::from_secs(60));
     worker
-        .submit_wf(WASM_WORKFLOW_TYPE, input.payloads, start_options)
+        .submit_wf(workflow_type, input.payloads, start_options)
         .await
         .expect("WASM workflow should start");
     worker
@@ -267,7 +295,7 @@ async fn run_hello_workflow(test_name: &'static str, component: WasmWorkflowComp
         .await
         .expect("WASM workflow result should be available");
     let greeting: String = result.to_value(&payload_converter);
-    assert_eq!(greeting, "Hello, workflow!");
+    assert_eq!(greeting, expected_result);
 }
 
 async fn run_patch_activation_workflow(
@@ -278,12 +306,11 @@ async fn run_patch_activation_workflow(
     let component = WasmWorkflowComponent::from_file(WASM_COMPONENT_ID, component_path)
         .expect("sample WASM component should be loadable");
     let mut starter = CoreWfStarter::new(test_name);
-    starter.sdk_config.task_types = WorkerTaskTypes::workflow_only();
     starter.sdk_config.patch_activation_callback = callback;
     starter.sdk_config.register_wasm_workflow(component);
 
     let mut worker = starter.worker().await;
-    let client = starter.get_client().await;
+    let client = starter.get_core_client().await;
     let payload_converter = PayloadConverter::default();
     let input = RawValue::from_value(&WASM_PATCH_ID, &payload_converter);
     let workflow_id = starter.get_wf_id().to_owned();
@@ -351,10 +378,20 @@ async fn build_wasm_hello_component() -> PathBuf {
     build_wasm_component(sample_dir, "temporal_wasm_hello_workflow.wasm").await
 }
 
+async fn build_wasm_interceptor_component() -> PathBuf {
+    let fixture_dir = repository_root().join("crates/sdk-core/tests/fixtures/wasm_interceptor");
+    build_wasm_component(fixture_dir, "temporal_wasm_interceptor_workflow.wasm").await
+}
+
 async fn build_wasm_patch_activation_component() -> PathBuf {
     let fixture_dir =
         repository_root().join("crates/sdk-core/tests/fixtures/wasm_patch_activation");
     build_wasm_component(fixture_dir, "temporal_wasm_patch_activation_workflow.wasm").await
+}
+
+async fn build_wasm_task_failure_component() -> PathBuf {
+    let fixture_dir = repository_root().join("crates/sdk-core/tests/fixtures/wasm_task_failure");
+    build_wasm_component(fixture_dir, "temporal_wasm_task_failure_workflow.wasm").await
 }
 
 fn repository_root() -> PathBuf {
@@ -373,7 +410,9 @@ async fn build_wasm_component(component_dir: PathBuf, artifact_name: &str) -> Pa
             "--release",
             "--target",
             "wasm32-unknown-unknown",
+            "--target-dir",
         ])
+        .arg(component_dir.join("target"))
         .current_dir(&component_dir)
         .output()
         .await

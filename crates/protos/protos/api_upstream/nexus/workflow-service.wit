@@ -13,6 +13,7 @@ world system {
 interface workflow-service {
   use nexus:temporal-types/model@1.0.0.{
     duration,
+    header,
     memo,
     payloads,
     placeholder,
@@ -36,9 +37,10 @@ interface workflow-service {
     ///   python="Workflow type name or callable identifying the workflow to start."
     ///   typescript="Workflow type name or workflow function identifying the workflow to start."
     ///   dotnet="Workflow type name or workflow expression identifying the workflow to start."
+    ///   go="Workflow function identifying the workflow to start."
     /// @nexus.proto-field "workflow_type"
     workflow: workflow-function,
-    /// @nexus.doc "Unique identifier for the workflow execution."
+    /// @nexus.doc "Unique identifier for the workflow execution. Must be nonempty."
     /// @nexus.proto-field "workflow_id"
     id: string,
     /// @nexus.doc "Task queue to run the workflow on."
@@ -49,24 +51,27 @@ interface workflow-service {
     ///   dotnet="Signal name or signal expression to send with the start request."
     /// @nexus.proto-field "signal_name"
     signal: signal-function,
-    /// @nexus.doc "Total workflow execution timeout, including retries and continue-as-new."
+    /// @nexus.doc "Total workflow execution timeout, including retries and continue-as-new. Defaults to unlimited."
     /// @nexus.proto-field "workflow_execution_timeout"
+    /// @nexus.name go="WorkflowExecutionTimeout"
     execution-timeout: option<duration>,
-    /// @nexus.doc "Timeout of a single workflow run."
+    /// @nexus.doc "Timeout of a single workflow run. Defaults to the workflow execution timeout."
     /// @nexus.proto-field "workflow_run_timeout"
+    /// @nexus.name go="WorkflowRunTimeout"
     run-timeout: option<duration>,
-    /// @nexus.doc "Timeout of a single workflow task."
+    /// @nexus.doc "Timeout of a single workflow task. Defaults to 10 seconds."
     /// @nexus.proto-field "workflow_task_timeout"
+    /// @nexus.name go="WorkflowTaskTimeout"
     task-timeout: option<duration>,
     /// @nexus.omit
     identity: placeholder,
-    /// @nexus.doc "Request ID used to deduplicate workflow start requests."
-    request-id: option<string>,
+    /// @nexus.omit
+    request-id: placeholder,
     /// @nexus.doc "Behavior when a closed workflow with the same ID exists. Default is allow-duplicate."
     /// @nexus.proto-field "workflow_id_reuse_policy"
     /// @nexus.default "allow-duplicate"
     id-reuse-policy: workflow-id-reuse-policy,
-    /// @nexus.doc "Behavior when a workflow is currently running with the same ID. Set to use-existing for idempotent deduplication on workflow ID. Cannot be set if id-reuse-policy is terminate-if-running."
+    /// @nexus.doc "Behavior when a workflow is currently running with the same ID. Set to use-existing for idempotent deduplication on workflow ID. Cannot be set if id-reuse-policy is terminate-if-running. Defaults to use-existing."
     /// @nexus.proto-field "workflow_id_conflict_policy"
     id-conflict-policy: option<workflow-id-conflict-policy>,
     /// @nexus.doc "Retry policy for the workflow."
@@ -84,26 +89,35 @@ interface workflow-service {
     /// @nexus.doc "Amount of time to wait before starting the workflow. This does not work with cron-schedule."
     /// @nexus.proto-field "workflow_start_delay"
     start-delay: option<duration>,
+    /// @nexus.doc "Static metadata for the workflow execution."
     user-metadata: option<user-metadata>,
-    /// @nexus.source python="workflow_namespace" typescript="workflowNamespace" dotnet="TemporalWorkflowContext.WorkflowNamespace"
+    /// @nexus.source python="workflow_namespace()" typescript="workflowNamespace()" go="workflow.GetInfo(ctx).Namespace" dotnet="TemporalWorkflowContext.WorkflowNamespace()"
+    /// @nexus.doc "Namespace of the workflow execution."
     namespace: string,
     /// @nexus.omit
     control: placeholder,
-    /// @nexus.omit
-    header: placeholder,
+    /// @nexus.api-omit
+    /// @nexus.doc "Headers for the request."
+    /// @nexus.proto-field "header"
+    headers: option<header>,
     /// @nexus.omit
     links: placeholder,
     /// @nexus.omit
     time-skipping-config: placeholder,
   }
 
+  /// @nexus.doc "Result of signaling a workflow and starting it if needed."
   /// @nexus.experimental
   /// @nexus.proto "temporal.api.workflowservice.v1.SignalWithStartWorkflowExecutionResponse" typescript-import="@temporalio/proto"
   record signal-with-start-workflow-response {
+    /// @nexus.doc "Run ID of the started workflow."
     run-id: option<string>,
+    /// @nexus.doc "Whether the workflow was started."
     started: option<bool>,
     /// @nexus.omit
     signal-link: placeholder,
+    /// @nexus.omit
+    first-execution-run-id: placeholder,
   }
 
   /// @nexus.doc
@@ -112,12 +126,14 @@ interface workflow-service {
   /// @nexus.output-transform
   ///   python-type="temporalio.workflow.ExternalWorkflowHandle[WorkflowResult]"
   ///   python="temporalio.workflow.get_external_workflow_handle(request.id, run_id=result.run_id)"
-  ///   typescript-type="workflow.ExternalWorkflowHandle"
+  ///   typescript-type="ExternalWorkflowHandle"
+  ///   typescript-type-import="../../../../workflow-handle"
   ///   typescript="workflow.getExternalWorkflowHandle(request.id, result.runId ?? undefined)"
   ///   typescript-import="@temporalio/workflow"
   ///   dotnet-type="Temporalio.Workflows.ExternalWorkflowHandle"
   ///   dotnet="Temporalio.Workflows.Workflow.GetExternalWorkflowHandle(request.Id, result.RunId)"
   /// @nexus.operation name="SignalWithStartWorkflowExecution"
+  /// @nexus.serialization-context python="signal_with_start_workflow_serialization_context" typescript="signalWithStartWorkflowSerializationContext" dotnet="WorkflowServiceSerializationContexts.SignalWithStartWorkflow"
   /// @nexus.experimental
   signal-with-start-workflow: func(
     request: signal-with-start-workflow-request,

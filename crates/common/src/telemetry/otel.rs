@@ -128,6 +128,8 @@ pub(super) fn augment_meter_provider_with_defaults(
 pub fn build_otlp_metric_exporter(
     opts: OtelCollectorOptions,
 ) -> Result<CoreOtelMeter, anyhow::Error> {
+    // The HTTP exporter's reqwest client resolves its rustls provider from the process default.
+    super::ensure_default_crypto_provider();
     let exporter = match opts.protocol {
         OtlpProtocol::Grpc => {
             let exporter = opentelemetry_otlp::MetricExporter::builder()

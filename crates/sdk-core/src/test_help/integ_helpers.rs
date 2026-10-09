@@ -56,8 +56,9 @@ use temporalio_common::{
             protocol::{self, v1::message},
             update,
             workflowservice::v1::{
-                PollActivityTaskQueueResponse, PollNexusTaskQueueResponse,
-                PollWorkflowTaskQueueResponse, RespondWorkflowTaskCompletedResponse,
+                DescribeNamespaceResponse, PollActivityTaskQueueResponse,
+                PollNexusTaskQueueResponse, PollWorkflowTaskQueueResponse,
+                RespondWorkflowTaskCompletedResponse,
             },
         },
         utilities::pack_any,
@@ -751,7 +752,7 @@ pub fn build_mock_pollers(mut cfg: MockPollCfg) -> MocksHolder {
                     let rid = t.workflow_execution.as_ref().unwrap().run_id.clone();
                     if !outstanding.has_run(&rid) {
                         let t = tasks.pop_front().unwrap();
-                        outstanding.put_token(rid, TaskToken(t.task_token.clone()));
+                        outstanding.put_token(rid, t.task_token.clone().into());
                         resp = Some(t);
                         break;
                     }
@@ -807,7 +808,7 @@ pub fn build_mock_pollers(mut cfg: MockPollCfg) -> MocksHolder {
     } else if cfg.completion_mock_fn.is_some() {
         expect_completes.times(1..);
     }
-    expect_completes.returning(move |comp| {
+    expect_completes.returning(move |comp, _| {
         let r = if let Some(ass) = cfg.completion_mock_fn.as_mut() {
             // tee hee
             ass(&comp)
@@ -835,6 +836,15 @@ pub fn build_mock_pollers(mut cfg: MockPollCfg) -> MocksHolder {
             outstanding.release_token(&tt);
             Ok(Default::default())
         });
+
+    // Fallback so worker validation (which describes the namespace to discover capabilities) works
+    // for mock-based tests that don't care about capabilities. Added last and with an open call
+    // count, so any test-provided `describe_namespace` expectation is matched first (mockall checks
+    // expectations FIFO) and tests that never validate don't trip an unsatisfied expectation.
+    cfg.mock_client
+        .expect_describe_namespace()
+        .times(0..)
+        .returning(|| Ok(DescribeNamespaceResponse::default()));
 
     let mut mh = MocksHolder {
         client: Arc::new(cfg.mock_client),

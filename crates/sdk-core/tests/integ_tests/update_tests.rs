@@ -14,8 +14,10 @@ use std::{
 };
 use temporalio_client::{
     Client, NamespacedClient, UntypedSignal, UntypedUpdate, UntypedWorkflow,
-    WorkflowExecuteUpdateOptions, WorkflowExecutionInfo, WorkflowSignalOptions,
-    WorkflowStartOptions, grpc::WorkflowService,
+    WorkflowExecuteUpdateOptions, WorkflowExecutionInfo, WorkflowIdConflictPolicy,
+    WorkflowSignalOptions, WorkflowStartOptions, WorkflowUpdateWithStartOptions,
+    errors::{WorkflowStartError, WorkflowUpdateError, WorkflowUpdateWithStartError},
+    grpc::WorkflowService,
 };
 use temporalio_common::{
     data_converters::RawValue,
@@ -70,8 +72,8 @@ enum CompleteWorkflow {
 #[tokio::test]
 async fn update_workflow(#[values(FailUpdate::Yes, FailUpdate::No)] will_fail: FailUpdate) {
     let mut starter = init_core_and_create_wf("update_workflow").await;
-    let core = starter.get_worker().await;
-    let client = starter.get_client().await;
+    let core = starter.get_core_worker().await;
+    let client = starter.get_core_client().await;
     let workflow_id = starter.get_task_queue();
     let update_id = "some_update";
     send_and_handle_update(
@@ -88,9 +90,9 @@ async fn update_workflow(#[values(FailUpdate::Yes, FailUpdate::No)] will_fail: F
     let events = client
         .get_workflow_handle::<UntypedWorkflow>(workflow_id)
         .fetch_history(Default::default())
+        .into_events()
         .await
-        .unwrap()
-        .into_events();
+        .unwrap();
     let with_id = HistoryForReplay::new(events, workflow_id.to_string());
     let replay_worker = init_core_replay_preloaded(workflow_id, [with_id]);
     // Init workflow comes by itself
@@ -105,8 +107,8 @@ async fn update_workflow(#[values(FailUpdate::Yes, FailUpdate::No)] will_fail: F
 #[tokio::test]
 async fn reapplied_updates_due_to_reset() {
     let mut starter = init_core_and_create_wf("update_workflow").await;
-    let core = starter.get_worker().await;
-    let client = starter.get_client().await;
+    let core = starter.get_core_worker().await;
+    let client = starter.get_core_client().await;
     let workflow_id = starter.get_task_queue();
     let pre_reset_run_id = send_and_handle_update(
         workflow_id,
@@ -161,17 +163,16 @@ async fn reapplied_updates_due_to_reset() {
     assert_eq!(post_reset_run_id, reset_response.run_id);
 
     // Make sure replay works
-    let events = WorkflowExecutionInfo {
-        namespace: client.namespace(),
-        workflow_id: workflow_id.to_string(),
-        run_id: Some(post_reset_run_id.clone()),
-        first_execution_run_id: None,
-    }
-    .bind_untyped(client.clone())
-    .fetch_history(Default::default())
-    .await
-    .unwrap()
-    .into_events();
+    let events = WorkflowExecutionInfo::builder()
+        .namespace(client.namespace())
+        .workflow_id(workflow_id.to_string())
+        .maybe_run_id(Some(post_reset_run_id.clone()))
+        .build()
+        .bind_untyped(client.clone())
+        .fetch_history(Default::default())
+        .into_events()
+        .await
+        .unwrap();
     let with_id = HistoryForReplay::new(events, workflow_id.to_string());
 
     let replay_worker = init_core_replay_preloaded(workflow_id, [with_id]);
@@ -206,13 +207,12 @@ async fn send_and_handle_update(
         .await
         .unwrap();
 
-    let handle = WorkflowExecutionInfo {
-        namespace: client.namespace(),
-        workflow_id: workflow_id.to_string(),
-        run_id: Some(act.run_id.clone()),
-        first_execution_run_id: None,
-    }
-    .bind_untyped(client.clone());
+    let handle = WorkflowExecutionInfo::builder()
+        .namespace(client.namespace())
+        .workflow_id(workflow_id.to_string())
+        .maybe_run_id(Some(act.run_id.clone()))
+        .build()
+        .bind_untyped(client.clone());
 
     // Send the update to the server
     let update_task = async {
@@ -301,8 +301,8 @@ async fn handle_update(
 #[tokio::test]
 async fn update_rejection() {
     let mut starter = init_core_and_create_wf("update_workflow").await;
-    let core = starter.get_worker().await;
-    let client = starter.get_client().await;
+    let core = starter.get_core_worker().await;
+    let client = starter.get_core_client().await;
     let workflow_id = starter.get_task_queue().to_string();
 
     let update_id = "some_update";
@@ -315,13 +315,12 @@ async fn update_rejection() {
     .await
     .unwrap();
 
-    let handle = WorkflowExecutionInfo {
-        namespace: client.namespace(),
-        workflow_id: workflow_id.clone(),
-        run_id: Some(res.run_id.clone()),
-        first_execution_run_id: None,
-    }
-    .bind_untyped(client.clone());
+    let handle = WorkflowExecutionInfo::builder()
+        .namespace(client.namespace())
+        .workflow_id(workflow_id.clone())
+        .maybe_run_id(Some(res.run_id.clone()))
+        .build()
+        .bind_untyped(client.clone());
 
     // Send the update to the server
     let update_task = async {
@@ -364,9 +363,9 @@ async fn update_rejection() {
     let events = client
         .get_workflow_handle::<UntypedWorkflow>(&workflow_id)
         .fetch_history(Default::default())
+        .into_events()
         .await
-        .unwrap()
-        .into_events();
+        .unwrap();
     let has_update_event = events.iter().any(|e| {
         matches!(
             e.event_type(),
@@ -380,8 +379,8 @@ async fn update_rejection() {
 #[tokio::test]
 async fn update_insta_complete(#[values(true, false)] accept_first: bool) {
     let mut starter = init_core_and_create_wf("update_workflow").await;
-    let core = starter.get_worker().await;
-    let client = starter.get_client().await;
+    let core = starter.get_core_worker().await;
+    let client = starter.get_core_client().await;
     let workflow_id = starter.get_task_queue().to_string();
 
     let update_id = "some_update";
@@ -394,13 +393,12 @@ async fn update_insta_complete(#[values(true, false)] accept_first: bool) {
     .await
     .unwrap();
 
-    let handle = WorkflowExecutionInfo {
-        namespace: client.namespace(),
-        workflow_id,
-        run_id: Some(res.run_id.clone()),
-        first_execution_run_id: None,
-    }
-    .bind_untyped(client.clone());
+    let handle = WorkflowExecutionInfo::builder()
+        .namespace(client.namespace())
+        .workflow_id(workflow_id)
+        .maybe_run_id(Some(res.run_id.clone()))
+        .build()
+        .bind_untyped(client.clone());
 
     // Send the update to the server
     let (update_task, stop_wait_update) = future::abortable(async {
@@ -473,8 +471,8 @@ async fn update_insta_complete(#[values(true, false)] accept_first: bool) {
 #[tokio::test]
 async fn update_complete_after_accept_without_new_task() {
     let mut starter = init_core_and_create_wf("update_workflow").await;
-    let core = starter.get_worker().await;
-    let client = starter.get_client().await;
+    let core = starter.get_core_worker().await;
+    let client = starter.get_core_client().await;
     let workflow_id = starter.get_task_queue().to_string();
 
     let update_id = "some_update";
@@ -487,13 +485,12 @@ async fn update_complete_after_accept_without_new_task() {
     .await
     .unwrap();
 
-    let handle = WorkflowExecutionInfo {
-        namespace: client.namespace(),
-        workflow_id,
-        run_id: Some(res.run_id.clone()),
-        first_execution_run_id: None,
-    }
-    .bind_untyped(client.clone());
+    let handle = WorkflowExecutionInfo::builder()
+        .namespace(client.namespace())
+        .workflow_id(workflow_id)
+        .maybe_run_id(Some(res.run_id.clone()))
+        .build()
+        .bind_untyped(client.clone());
 
     // Send the update to the server
     let update_task = async {
@@ -573,8 +570,8 @@ async fn update_complete_after_accept_without_new_task() {
 #[tokio::test]
 async fn update_speculative_wft() {
     let mut starter = init_core_and_create_wf("update_workflow").await;
-    let core = starter.get_worker().await;
-    let client = starter.get_client().await;
+    let core = starter.get_core_worker().await;
+    let client = starter.get_core_client().await;
     let workflow_id = starter.get_task_queue().to_string();
 
     let update_id = "some_update";
@@ -660,7 +657,6 @@ async fn update_with_local_acts() {
     // Short task timeout to get activities to heartbeat without taking ages
     starter.workflow_options.task_timeout = Some(Duration::from_secs(1));
     starter.sdk_config.register_activities(StdActivities);
-    let mut worker = starter.worker().await;
 
     #[workflow]
     #[derive(Default)]
@@ -672,7 +668,7 @@ async fn update_with_local_acts() {
     impl UpdateWithLocalActsWf {
         #[run]
         async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<()> {
-            ctx.wait_condition(|s| s.done).await;
+            ctx.wait_condition(|s| s.done).await?;
             Ok(())
         }
 
@@ -696,7 +692,11 @@ async fn update_with_local_acts() {
         }
     }
 
-    worker.register_workflow::<UpdateWithLocalActsWf>().unwrap();
+    starter
+        .sdk_config
+        .register_workflow::<UpdateWithLocalActsWf>()
+        .unwrap();
+    let mut worker = starter.worker().await;
     let task_queue = starter.get_task_queue().to_owned();
     let handle = worker
         .submit_workflow(
@@ -731,18 +731,13 @@ async fn update_with_local_acts() {
         worker.run_until_done().await.unwrap();
     };
     join!(update, run);
-    handle
-        .fetch_history_and_replay(worker.inner_mut())
-        .await
-        .unwrap();
+    handle.fetch_history_and_replay(&mut worker).await.unwrap();
 }
 
 #[tokio::test]
 async fn update_rejection_sdk() {
     let wf_name = "update_rejection_sdk";
     let mut starter = CoreWfStarter::new(wf_name);
-    starter.sdk_config.task_types = WorkerTaskTypes::workflow_only();
-    let mut worker = starter.worker().await;
     #[workflow]
     #[derive(Default)]
     struct UpdateRejectionSdkWf;
@@ -773,7 +768,11 @@ async fn update_rejection_sdk() {
         }
     }
 
-    worker.register_workflow::<UpdateRejectionSdkWf>().unwrap();
+    starter
+        .sdk_config
+        .register_workflow::<UpdateRejectionSdkWf>()
+        .unwrap();
+    let mut worker = starter.worker().await;
     let task_queue = starter.get_task_queue().to_owned();
     let handle = worker
         .submit_workflow(
@@ -797,18 +796,13 @@ async fn update_rejection_sdk() {
         worker.run_until_done().await.unwrap();
     };
     join!(update, run);
-    handle
-        .fetch_history_and_replay(worker.inner_mut())
-        .await
-        .unwrap();
+    handle.fetch_history_and_replay(&mut worker).await.unwrap();
 }
 
 #[tokio::test]
 async fn update_fail_sdk() {
     let wf_name = "update_fail_sdk";
     let mut starter = CoreWfStarter::new(wf_name);
-    starter.sdk_config.task_types = WorkerTaskTypes::workflow_only();
-    let mut worker = starter.worker().await;
     #[workflow]
     #[derive(Default)]
     struct UpdateFailSdkWf;
@@ -830,7 +824,11 @@ async fn update_fail_sdk() {
         }
     }
 
-    worker.register_workflow::<UpdateFailSdkWf>().unwrap();
+    starter
+        .sdk_config
+        .register_workflow::<UpdateFailSdkWf>()
+        .unwrap();
+    let mut worker = starter.worker().await;
     let task_queue = starter.get_task_queue().to_owned();
     let handle = worker
         .submit_workflow(
@@ -854,19 +852,19 @@ async fn update_fail_sdk() {
         worker.run_until_done().await.unwrap();
     };
     join!(update, run);
-    handle
-        .fetch_history_and_replay(worker.inner_mut())
-        .await
-        .unwrap();
+    handle.fetch_history_and_replay(&mut worker).await.unwrap();
 }
 
 #[tokio::test]
 async fn unknown_update_rejected_sdk() {
     let wf_name = "unknown_update_rejected_sdk";
     let mut starter = CoreWfStarter::new(wf_name);
-    starter.sdk_config.task_types = WorkerTaskTypes::workflow_only();
+    starter
+        .sdk_config
+        .register_workflow::<UnknownUpdateRejectedSdkWf>()
+        .unwrap();
     let mut worker = starter.worker().await;
-    let client = starter.get_client().await;
+    let client = starter.get_core_client().await;
 
     #[workflow]
     #[derive(Default)]
@@ -878,7 +876,7 @@ async fn unknown_update_rejected_sdk() {
     impl UnknownUpdateRejectedSdkWf {
         #[run]
         async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<()> {
-            ctx.wait_condition(|s| s.done).await;
+            ctx.wait_condition(|s| s.done).await?;
             Ok(())
         }
 
@@ -891,9 +889,6 @@ async fn unknown_update_rejected_sdk() {
         }
     }
 
-    worker
-        .register_workflow::<UnknownUpdateRejectedSdkWf>()
-        .unwrap();
     let task_queue = starter.get_task_queue().to_owned();
     let handle = worker
         .submit_workflow(
@@ -939,8 +934,6 @@ async fn unknown_update_rejected_sdk() {
 async fn update_timer_sequence() {
     let wf_name = "update_timer_sequence";
     let mut starter = CoreWfStarter::new(wf_name);
-    starter.sdk_config.task_types = WorkerTaskTypes::workflow_only();
-    let mut worker = starter.worker().await;
     #[workflow]
     #[derive(Default)]
     struct UpdateTimerSequenceWf {
@@ -951,7 +944,7 @@ async fn update_timer_sequence() {
     impl UpdateTimerSequenceWf {
         #[run]
         async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<()> {
-            ctx.wait_condition(|s| s.done).await;
+            ctx.wait_condition(|s| s.done).await?;
             Ok(())
         }
 
@@ -967,7 +960,11 @@ async fn update_timer_sequence() {
         }
     }
 
-    worker.register_workflow::<UpdateTimerSequenceWf>().unwrap();
+    starter
+        .sdk_config
+        .register_workflow::<UpdateTimerSequenceWf>()
+        .unwrap();
+    let mut worker = starter.worker().await;
     let task_queue = starter.get_task_queue().to_owned();
     let handle = worker
         .submit_workflow(
@@ -991,29 +988,36 @@ async fn update_timer_sequence() {
         worker.run_until_done().await.unwrap();
     };
     join!(update, run);
-    handle
-        .fetch_history_and_replay(worker.inner_mut())
-        .await
-        .unwrap();
+    handle.fetch_history_and_replay(&mut worker).await.unwrap();
 }
 
 #[tokio::test]
 async fn task_failure_during_validation() {
     let wf_name = "task_failure_during_validation";
     let mut starter = CoreWfStarter::new(wf_name);
-    starter.sdk_config.task_types = WorkerTaskTypes::workflow_only();
     starter.workflow_options.task_timeout = Some(Duration::from_secs(1));
+    starter
+        .sdk_config
+        .register_workflow::<TaskFailureDuringValidationWf>()
+        .unwrap();
     let mut worker = starter.worker().await;
     #[workflow]
     #[derive(Default)]
-    struct TaskFailureDuringValidationWf;
+    struct TaskFailureDuringValidationWf {
+        done: bool,
+    }
 
     #[workflow_methods]
     impl TaskFailureDuringValidationWf {
         #[run]
         async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<()> {
-            ctx.timer(Duration::from_secs(1)).await;
+            ctx.wait_condition(|state| state.done).await?;
             Ok(())
+        }
+
+        #[signal]
+        fn done(&mut self, _ctx: &mut SyncWorkflowContext<Self>, _: ()) {
+            self.done = true;
         }
 
         #[update_validator(do_update)]
@@ -1022,11 +1026,7 @@ async fn task_failure_during_validation() {
             _ctx: &WorkflowContextView,
             _: &(),
         ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-            static FAILCT: AtomicUsize = AtomicUsize::new(0);
-            if FAILCT.fetch_add(1, Ordering::Relaxed) < 2 {
-                panic!("ahhhhhh");
-            }
-            Ok(())
+            panic!("intentional validator panic")
         }
 
         #[update]
@@ -1038,9 +1038,6 @@ async fn task_failure_during_validation() {
         }
     }
 
-    worker
-        .register_workflow::<TaskFailureDuringValidationWf>()
-        .unwrap();
     let task_queue = starter.get_task_queue().to_owned();
     let handle = worker
         .submit_workflow(
@@ -1050,7 +1047,7 @@ async fn task_failure_during_validation() {
         )
         .await
         .unwrap();
-    let update = async {
+    let update_result = async {
         let res = handle
             .execute_update(
                 TaskFailureDuringValidationWf::do_update,
@@ -1058,16 +1055,102 @@ async fn task_failure_during_validation() {
                 WorkflowExecuteUpdateOptions::default(),
             )
             .await;
+
+        handle
+            .signal(
+                TaskFailureDuringValidationWf::done,
+                (),
+                WorkflowSignalOptions::default(),
+            )
+            .await
+            .unwrap();
+        res
+    };
+    let run = async {
+        worker.run_until_done().await.unwrap();
+    };
+    let (update_result, _) = join!(update_result, run);
+    assert_matches!(
+        update_result,
+        Err(WorkflowUpdateError::Failed(failure))
+            if failure.message.contains("intentional validator panic")
+    );
+}
+
+#[tokio::test]
+async fn task_failure_during_update_handler() {
+    let wf_name = "task_failure_during_update_handler";
+    let mut starter = CoreWfStarter::new(wf_name);
+    starter.workflow_options.task_timeout = Some(Duration::from_secs(1));
+    #[workflow]
+    #[derive(Default)]
+    struct TaskFailureDuringUpdateHandlerWf {
+        done: bool,
+    }
+
+    #[workflow_methods]
+    impl TaskFailureDuringUpdateHandlerWf {
+        #[run]
+        async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<()> {
+            ctx.wait_condition(|state| state.done).await?;
+            Ok(())
+        }
+
+        #[signal]
+        fn done(&mut self, _ctx: &mut SyncWorkflowContext<Self>, _: ()) {
+            self.done = true;
+        }
+
+        #[update]
+        async fn do_update(
+            _ctx: &mut WorkflowContext<Self>,
+            _: (),
+        ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+            static FAILCT: AtomicUsize = AtomicUsize::new(0);
+            if FAILCT.fetch_add(1, Ordering::Relaxed) == 0 {
+                panic!("intentional update handler panic");
+            }
+            Ok("done".to_string())
+        }
+    }
+
+    starter
+        .sdk_config
+        .register_workflow::<TaskFailureDuringUpdateHandlerWf>()
+        .unwrap();
+    let mut worker = starter.worker().await;
+    let task_queue = starter.get_task_queue().to_owned();
+    let handle = worker
+        .submit_workflow(
+            TaskFailureDuringUpdateHandlerWf::run,
+            (),
+            WorkflowStartOptions::new(task_queue, starter.get_wf_id().to_owned()).build(),
+        )
+        .await
+        .unwrap();
+    let update = async {
+        let res = handle
+            .execute_update(
+                TaskFailureDuringUpdateHandlerWf::do_update,
+                (),
+                WorkflowExecuteUpdateOptions::default(),
+            )
+            .await;
         assert!(res.unwrap() == "done");
+        handle
+            .signal(
+                TaskFailureDuringUpdateHandlerWf::done,
+                (),
+                WorkflowSignalOptions::default(),
+            )
+            .await
+            .unwrap();
     };
     let run = async {
         worker.run_until_done().await.unwrap();
     };
     join!(update, run);
-    handle
-        .fetch_history_and_replay(worker.inner_mut())
-        .await
-        .unwrap();
+    handle.fetch_history_and_replay(&mut worker).await.unwrap();
     // Verify we did not spam task failures. There should only be one.
     let history = starter.get_history().await;
     assert_eq!(
@@ -1084,8 +1167,11 @@ async fn task_failure_during_validation() {
 async fn task_failure_after_update() {
     let wf_name = "task_failure_after_update";
     let mut starter = CoreWfStarter::new(wf_name);
-    starter.sdk_config.task_types = WorkerTaskTypes::workflow_only();
     starter.workflow_options.task_timeout = Some(Duration::from_secs(1));
+    starter
+        .sdk_config
+        .register_workflow::<TaskFailureAfterUpdateWf>()
+        .unwrap();
     let mut worker = starter.worker().await;
     #[workflow]
     #[derive(Default)]
@@ -1112,9 +1198,6 @@ async fn task_failure_after_update() {
         }
     }
 
-    worker
-        .register_workflow::<TaskFailureAfterUpdateWf>()
-        .unwrap();
     let task_queue = starter.get_task_queue().to_owned();
     let handle = worker
         .submit_workflow(
@@ -1138,10 +1221,7 @@ async fn task_failure_after_update() {
         worker.run_until_done().await.unwrap();
     };
     join!(update, run);
-    handle
-        .fetch_history_and_replay(worker.inner_mut())
-        .await
-        .unwrap();
+    handle.fetch_history_and_replay(&mut worker).await.unwrap();
 }
 
 static BARR: LazyLock<Barrier> = LazyLock::new(|| Barrier::new(2));
@@ -1166,8 +1246,12 @@ async fn worker_restarted_in_middle_of_update() {
     }
 
     starter.sdk_config.register_activities(BlockingActivities);
+    starter
+        .sdk_config
+        .register_workflow::<WorkerRestartedInMiddleOfUpdateWf>()
+        .unwrap();
     let mut worker = starter.worker().await;
-    let client = starter.get_client().await;
+    let client = starter.get_core_client().await;
 
     #[workflow]
     #[derive(Default)]
@@ -1179,7 +1263,7 @@ async fn worker_restarted_in_middle_of_update() {
     impl WorkerRestartedInMiddleOfUpdateWf {
         #[run]
         async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<()> {
-            ctx.wait_condition(|s| s.done).await;
+            ctx.wait_condition(|s| s.done).await?;
             Ok(())
         }
 
@@ -1203,9 +1287,6 @@ async fn worker_restarted_in_middle_of_update() {
         }
     }
 
-    worker
-        .register_workflow::<WorkerRestartedInMiddleOfUpdateWf>()
-        .unwrap();
     let task_queue = starter.get_task_queue().to_owned();
     let handle = worker
         .submit_workflow(
@@ -1235,7 +1316,7 @@ async fn worker_restarted_in_middle_of_update() {
             .await
             .unwrap();
     };
-    let core_worker = starter.get_worker().await;
+    let core_worker = starter.get_core_worker().await;
     let mut second_starter = starter.clone_no_worker();
     let stopper = async {
         // Wait for the activity to start
@@ -1261,16 +1342,13 @@ async fn worker_restarted_in_middle_of_update() {
         // This run attempt will get shut down
         worker.inner_mut().run().await.unwrap();
         // Start up a new worker
-        let new_worker = second_starter.get_worker().await;
+        let new_worker = second_starter.get_core_worker().await;
         // Replace with new core and run again
         worker.inner_mut().with_new_core_worker(new_worker);
         worker.run_until_done().await.unwrap();
     };
     join!(update, run, stopper);
-    handle
-        .fetch_history_and_replay(worker.inner_mut())
-        .await
-        .unwrap();
+    handle.fetch_history_and_replay(&mut worker).await.unwrap();
 }
 
 #[tokio::test]
@@ -1278,7 +1356,6 @@ async fn update_after_empty_wft() {
     let wf_name = "update_after_empty_wft";
     let mut starter = CoreWfStarter::new(wf_name);
     starter.sdk_config.register_activities(StdActivities);
-    let mut worker = starter.worker().await;
 
     static ACT_STARTED: AtomicBool = AtomicBool::new(false);
 
@@ -1293,7 +1370,9 @@ async fn update_after_empty_wft() {
         #[run]
         async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<()> {
             let sig_handle = async {
-                ctx.wait_condition(|s| s.signal_received).await;
+                ctx.wait_condition(|s| s.signal_received)
+                    .await
+                    .expect("workflow was not cancelled");
                 ACT_STARTED.store(true, Ordering::Release);
                 let _ = ctx
                     .execute_activity(
@@ -1330,7 +1409,11 @@ async fn update_after_empty_wft() {
         }
     }
 
-    worker.register_workflow::<UpdateAfterEmptyWftWf>().unwrap();
+    starter
+        .sdk_config
+        .register_workflow::<UpdateAfterEmptyWftWf>()
+        .unwrap();
+    let mut worker = starter.worker().await;
     let task_queue = starter.get_task_queue().to_owned();
     let handle = worker
         .submit_workflow(
@@ -1364,10 +1447,7 @@ async fn update_after_empty_wft() {
         worker.run_until_done().await.unwrap();
     };
     join!(update, runner);
-    handle
-        .fetch_history_and_replay(worker.inner_mut())
-        .await
-        .unwrap();
+    handle.fetch_history_and_replay(&mut worker).await.unwrap();
 }
 
 #[tokio::test]
@@ -1375,6 +1455,10 @@ async fn update_lost_on_activity_mismatch() {
     let wf_name = "update_lost_on_activity_mismatch";
     let mut starter = CoreWfStarter::new(wf_name);
     starter.sdk_config.register_activities(StdActivities);
+    starter
+        .sdk_config
+        .register_workflow::<UpdateLostOnActivityMismatchWf>()
+        .unwrap();
     let mut worker = starter.worker().await;
 
     #[workflow]
@@ -1389,7 +1473,7 @@ async fn update_lost_on_activity_mismatch() {
         async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<()> {
             ctx.state_mut(|s| s.can_run = 1);
             for _ in 1..=3 {
-                ctx.wait_condition(|s| s.can_run > 0).await;
+                ctx.wait_condition(|s| s.can_run > 0).await?;
                 let _ = ctx
                     .execute_activity(
                         StdActivities::echo,
@@ -1408,9 +1492,6 @@ async fn update_lost_on_activity_mismatch() {
         }
     }
 
-    worker
-        .register_workflow::<UpdateLostOnActivityMismatchWf>()
-        .unwrap();
     let core_worker = worker.core_worker();
     let task_queue = starter.get_task_queue().to_owned();
     let handle = worker
@@ -1442,8 +1523,170 @@ async fn update_lost_on_activity_mismatch() {
         worker.run_until_done().await.unwrap();
     };
     join!(update, runner);
-    handle
-        .fetch_history_and_replay(worker.inner_mut())
-        .await
+    handle.fetch_history_and_replay(&mut worker).await.unwrap();
+}
+
+#[workflow]
+#[derive(Default)]
+struct UpdateWithStartWf {
+    done: bool,
+}
+
+#[workflow_methods]
+impl UpdateWithStartWf {
+    #[run]
+    async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<()> {
+        ctx.wait_condition(|s| s.done).await?;
+        Ok(())
+    }
+
+    #[update]
+    async fn do_update(
+        _ctx: &mut WorkflowContext<Self>,
+        arg: String,
+    ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+        if arg == "reject" {
+            return Err(anyhow!("update rejected").into());
+        }
+        Ok(format!("hello {arg}"))
+    }
+
+    #[signal]
+    fn done_signal(&mut self, _ctx: &mut SyncWorkflowContext<Self>, _: ()) {
+        self.done = true;
+    }
+}
+
+#[derive(Clone, Copy)]
+enum UpdateWithStartScenario {
+    StartAndGetHandle,
+    ExecuteOnExisting,
+    UpdateFailure,
+    StartConflict,
+}
+
+#[rstest::rstest]
+#[case::start_and_get_handle(UpdateWithStartScenario::StartAndGetHandle)]
+#[case::execute_on_existing(UpdateWithStartScenario::ExecuteOnExisting)]
+#[case::update_failure(UpdateWithStartScenario::UpdateFailure)]
+#[case::start_conflict(UpdateWithStartScenario::StartConflict)]
+#[tokio::test]
+async fn update_with_start(#[case] scenario: UpdateWithStartScenario) {
+    let mut starter = CoreWfStarter::new("update_with_start");
+    starter
+        .sdk_config
+        .register_workflow::<UpdateWithStartWf>()
         .unwrap();
+    starter.set_core_task_types(WorkerTaskTypes::workflow_only());
+    let mut worker = starter.worker().await;
+    let client = starter.get_core_client().await;
+    let task_queue = starter.get_task_queue().to_owned();
+    let wf_id = starter.get_wf_id().to_owned();
+
+    let existing_run_id = if matches!(scenario, UpdateWithStartScenario::StartAndGetHandle) {
+        None
+    } else {
+        let handle = worker
+            .submit_workflow(
+                UpdateWithStartWf::run,
+                (),
+                WorkflowStartOptions::new(task_queue.clone(), wf_id.clone()).build(),
+            )
+            .await
+            .unwrap();
+        Some(handle.run_id().unwrap().to_owned())
+    };
+
+    let core_worker = worker.core_worker();
+    let interactions = async {
+        let options = |conflict_policy| {
+            WorkflowUpdateWithStartOptions::new(task_queue.clone(), wf_id.clone(), conflict_policy)
+                .execution_timeout(Duration::from_secs(60 * 5))
+                .build()
+        };
+        match scenario {
+            UpdateWithStartScenario::StartAndGetHandle => {
+                let update_handle = client
+                    .start_update_with_start_workflow(
+                        UpdateWithStartWf::run,
+                        (),
+                        UpdateWithStartWf::do_update,
+                        "world".to_owned(),
+                        options(WorkflowIdConflictPolicy::Fail),
+                    )
+                    .await
+                    .unwrap();
+                assert!(update_handle.workflow_run_id().is_some());
+                assert_eq!(
+                    update_handle.get_result(Default::default()).await.unwrap(),
+                    "hello world"
+                );
+            }
+            UpdateWithStartScenario::ExecuteOnExisting => {
+                let result = client
+                    .execute_update_with_start_workflow(
+                        UpdateWithStartWf::run,
+                        (),
+                        UpdateWithStartWf::do_update,
+                        "again".to_owned(),
+                        options(WorkflowIdConflictPolicy::UseExisting),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(result, "hello again");
+            }
+            UpdateWithStartScenario::UpdateFailure => {
+                let error = client
+                    .execute_update_with_start_workflow(
+                        UpdateWithStartWf::run,
+                        (),
+                        UpdateWithStartWf::do_update,
+                        "reject".to_owned(),
+                        options(WorkflowIdConflictPolicy::UseExisting),
+                    )
+                    .await
+                    .expect_err("rejected update must be returned as an update failure");
+                assert_matches!(
+                    error,
+                    WorkflowUpdateWithStartError::Update(WorkflowUpdateError::Failed(failure))
+                        if failure.message.contains("update rejected")
+                );
+            }
+            UpdateWithStartScenario::StartConflict => {
+                let error = client
+                    .execute_update_with_start_workflow(
+                        UpdateWithStartWf::run,
+                        (),
+                        UpdateWithStartWf::do_update,
+                        "unused".to_owned(),
+                        options(WorkflowIdConflictPolicy::Fail),
+                    )
+                    .await
+                    .expect_err("update-with-start must fail against a running workflow");
+                assert_matches!(
+                    error,
+                    WorkflowUpdateWithStartError::Start(WorkflowStartError::AlreadyStarted {
+                        run_id: Some(run_id),
+                        ..
+                    }) if existing_run_id.as_deref() == Some(run_id.as_str())
+                );
+            }
+        }
+
+        let wf_handle = client.get_workflow_handle::<update_with_start_wf::Run>(wf_id);
+        wf_handle
+            .signal(
+                UpdateWithStartWf::done_signal,
+                (),
+                WorkflowSignalOptions::default(),
+            )
+            .await
+            .unwrap();
+        wf_handle.get_result(Default::default()).await.unwrap();
+        core_worker.initiate_shutdown();
+    };
+    let run = async {
+        worker.inner_mut().run().await.unwrap();
+    };
+    join!(interactions, run);
 }

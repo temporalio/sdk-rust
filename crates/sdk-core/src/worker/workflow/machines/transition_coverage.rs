@@ -116,7 +116,7 @@ mod machine_coverage_report {
         let mut upsert_search_attr = UpsertSearchAttributesMachine::visualizer().to_owned();
         let mut modify_wf_props = ModifyWorkflowPropertiesMachine::visualizer().to_owned();
         let mut update = UpdateMachine::visualizer().to_owned();
-        let mut nexus_op = NexusOperationMachine::visualizer().to_owned();
+        let mut nexus = NexusOperationMachine::visualizer().to_owned();
 
         // This isn't at all efficient but doesn't need to be.
         // Replace transitions in the vizzes with green color if they are covered.
@@ -143,7 +143,7 @@ mod machine_coverage_report {
                     cover_transitions(m, &mut modify_wf_props, coverage)
                 }
                 m @ "UpdateMachine" => cover_transitions(m, &mut update, coverage),
-                m @ "NexusOperationMachine" => cover_transitions(m, &mut nexus_op, coverage),
+                m @ "NexusOperationMachine" => cover_transitions(m, &mut nexus, coverage),
                 m => panic!("Unknown machine {m}"),
             }
         }

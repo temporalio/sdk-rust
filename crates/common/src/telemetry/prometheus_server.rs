@@ -29,6 +29,7 @@ pub fn start_prometheus_metric_exporter(
     let meter = Arc::new(
         crate::telemetry::prometheus_meter::CorePrometheusMeter::new(
             srv.registry().clone(),
+            opts.counters_total_suffix,
             opts.use_seconds_for_durations,
             opts.unit_suffix,
             opts.histogram_bucket_overrides,

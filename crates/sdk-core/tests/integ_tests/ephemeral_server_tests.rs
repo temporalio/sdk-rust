@@ -1,11 +1,18 @@
-use crate::common::{INTEG_CLIENT_IDENTITY, INTEG_CLIENT_NAME, INTEG_CLIENT_VERSION, NAMESPACE};
+use crate::common::{
+    INTEG_CLIENT_IDENTITY, INTEG_CLIENT_NAME, INTEG_CLIENT_VERSION, NAMESPACE, rand_6_chars,
+};
 use futures_util::{TryStreamExt, stream};
 use std::time::{SystemTime, UNIX_EPOCH};
 use temporalio_client::{
-    Connection, ConnectionOptions,
+    Connection, ConnectionOptions, WorkflowStartOptions,
     grpc::{TestService, WorkflowService},
 };
 use temporalio_common::protos::temporal::api::workflowservice::v1::DescribeNamespaceRequest;
+use temporalio_macros::{workflow, workflow_methods};
+use temporalio_sdk::{
+    Runtime, Worker, WorkerOptions, WorkflowContext, WorkflowResult,
+    testing::{LocalWorkflowEnvironmentOptions, WorkflowEnvironment},
+};
 use temporalio_sdk_core::ephemeral_server::{
     EphemeralExe, EphemeralExeVersion, EphemeralServer, TemporalDevServerConfig,
     default_cached_download,
@@ -13,6 +20,51 @@ use temporalio_sdk_core::ephemeral_server::{
 use tonic::IntoRequest;
 use url::Url;
 
+#[workflow]
+#[derive(Default)]
+struct TestEnvironmentWorkflow;
+
+#[workflow_methods]
+impl TestEnvironmentWorkflow {
+    #[run]
+    async fn run(_ctx: &mut WorkflowContext<Self>) -> WorkflowResult<()> {
+        Ok(())
+    }
+}
+
+#[temporalio_macros::cloud_test_exclusion(crate::CloudTestExclusionReason::RequiresLocalServer)]
+#[tokio::test]
+async fn test_workflow_environment_local() {
+    let env = WorkflowEnvironment::start_local(LocalWorkflowEnvironmentOptions::default())
+        .await
+        .unwrap();
+    let runtime = Runtime::from_current_tokio(Default::default()).unwrap();
+    let worker_options = WorkerOptions::new(format!("test-env-{}", rand_6_chars()))
+        .register_workflow::<TestEnvironmentWorkflow>()
+        .unwrap()
+        .build();
+    let task_queue = worker_options.task_queue.clone();
+    let mut worker = Worker::new(&runtime, env.client().clone(), worker_options).unwrap();
+    let shutdown = worker.shutdown_handle();
+    let handle = env
+        .client()
+        .start_workflow(
+            TestEnvironmentWorkflow::run,
+            (),
+            WorkflowStartOptions::new(task_queue, format!("test-env-{}", rand_6_chars())).build(),
+        )
+        .await
+        .unwrap();
+
+    let (worker_result, ()) = tokio::join!(worker.run(), async move {
+        handle.get_result(Default::default()).await.unwrap();
+        shutdown();
+    });
+    worker_result.unwrap();
+    env.shutdown().await.unwrap();
+}
+
+#[temporalio_macros::cloud_test_exclusion(crate::CloudTestExclusionReason::RequiresLocalServer)]
 #[tokio::test]
 async fn temporal_cli_default() {
     let config = TemporalDevServerConfig::builder()
@@ -28,6 +80,7 @@ async fn temporal_cli_default() {
     assert!(sysinfo::System::new_all().process(pid).is_none());
 }
 
+#[temporalio_macros::cloud_test_exclusion(crate::CloudTestExclusionReason::RequiresLocalServer)]
 #[tokio::test]
 async fn temporal_cli_fixed() {
     let config = TemporalDevServerConfig::builder()
@@ -38,6 +91,7 @@ async fn temporal_cli_fixed() {
     server.shutdown().await.unwrap();
 }
 
+#[temporalio_macros::cloud_test_exclusion(crate::CloudTestExclusionReason::RequiresLocalServer)]
 #[tokio::test]
 async fn temporal_cli_shutdown_port_reuse() {
     // Start, test shutdown, do again immediately on same port to ensure we can
@@ -88,6 +142,7 @@ mod test_server {
     use super::*;
     use temporalio_sdk_core::ephemeral_server::TestServerConfig;
 
+    #[temporalio_macros::cloud_test_exclusion(crate::CloudTestExclusionReason::RequiresLocalServer)]
     #[tokio::test]
     async fn test_server_default() {
         let config = TestServerConfig::builder()
@@ -98,6 +153,7 @@ mod test_server {
         server.shutdown().await.unwrap();
     }
 
+    #[temporalio_macros::cloud_test_exclusion(crate::CloudTestExclusionReason::RequiresLocalServer)]
     #[tokio::test]
     async fn test_server_fixed() {
         let config = TestServerConfig::builder()
@@ -108,6 +164,7 @@ mod test_server {
         server.shutdown().await.unwrap();
     }
 
+    #[temporalio_macros::cloud_test_exclusion(crate::CloudTestExclusionReason::RequiresLocalServer)]
     #[tokio::test]
     async fn test_server_shutdown_port_reuse() {
         // Start, test shutdown, do again immediately on same port to ensure we can

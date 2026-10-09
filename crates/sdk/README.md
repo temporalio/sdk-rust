@@ -3,11 +3,8 @@
 [![crates.io](https://img.shields.io/crates/v/temporalio-sdk.svg)](https://crates.io/crates/temporalio-sdk)
 [![docs.rs](https://docs.rs/temporalio-sdk/badge.svg)](https://docs.rs/temporalio-sdk)
 
-This crate contains a Public Preview Rust SDK. The SDK is built on top of
-Core and provides a native Rust experience for writing Temporal workflows and activities.
-
-⚠️ **The SDK is in Public Preview and under active development.** The API can and
-will continue to evolve.
+This crate contains the Temporal Rust SDK. The SDK is built on top of Core and provides a native
+Rust experience for writing Temporal workflows and activities.
 
 ## Quick Start
 
@@ -84,18 +81,16 @@ the TOML format.
 
 ```rust
 use temporalio_client::{Client, ClientOptions, Connection, envconfig::LoadClientConfigProfileOptions};
-use temporalio_sdk::{Worker, WorkerOptions};
-use temporalio_sdk_core::{CoreRuntime, RuntimeOptions};
+use temporalio_sdk::{Runtime, Worker, WorkerOptions};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let runtime = CoreRuntime::new_assume_tokio(RuntimeOptions::builder().build()?)?;
-
+    let runtime = Runtime::from_current_tokio(Default::default())?;
     let (conn_options, client_options) = ClientOptions::load_from_config(
         LoadClientConfigProfileOptions::default()
     )?;
     let connection = Connection::connect(conn_options).await?;
-    let client = Client::new(connection, client_options);
+    let client = Client::new(connection, client_options)?;
 
     let worker_options = WorkerOptions::new("my-task-queue")
         .register_activities(MyActivities { counter: Default::default() })
@@ -107,21 +102,86 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
+### Testing
+
+Enable the `testing` feature to run activities directly or start an isolated Temporal CLI dev
+server for workflow tests.
+
+Activity test inputs and outputs are ordinary Rust values. Register an activity implementer when
+testing an instance activity:
+
+```rust
+let env = ActivityEnvironment::builder()
+    .register_activities(MyActivities { counter: Default::default() })
+    .build();
+
+assert_eq!(env.run(MyActivities::greet, "Rust".to_owned()).await?, "Hello, Rust!");
+```
+
+Workflow tests can use a local server with the normal client and worker APIs. Local environments
+own their server and expose a consuming shutdown method:
+
+```rust
+let env = WorkflowEnvironment::start_local(LocalWorkflowEnvironmentOptions::default()).await?;
+let client = env.client().clone();
+// Construct workflow starters and workers with `client`.
+env.shutdown().await?;
+```
+
 ## Crate Features
 
 The SDK enables a few convenience integrations by default. Users who want a smaller dependency
-graph can disable defaults and opt back into the integrations they use:
+graph can disable defaults and opt back into the integrations they use.
 
-```toml
-temporalio-sdk = { version = "0.3", default-features = false, features = ["envconfig"] }
+- `envconfig`: Support for loading connection settings from environment variables and `temporal.toml` files. |
+- `prometheus`: The Prometheus metrics exporter for `temporalio_common::telemetry`. |
+- `otel`: The OpenTelemetry metrics exporter for `temporalio_common::telemetry`. |
+- `opentelemetry`: Experimental OpenTelemetry tracing and cross-SDK W3C trace-context propagation. Requires the `experimental` feature. |
+- `experimental`: Rust SDK, client, and Workflow APIs that are still under development and may change or be removed. |
+- `testing`: The `testing` module, direct activity test support, and local Temporal CLI dev-server lifecycle management. |
+- `dynamic-tls`: Dynamic mTLS client-certificate resolution for transparent certificate rotation. |
+- `wasm-workflows`: Support WebAssembly workflow components through Wasmtime for workers and workflow replay. |
+
+### OpenTelemetry tracing
+
+Enable both the `experimental` and `opentelemetry` features. Configure an OpenTelemetry tracer
+provider. Add the plugin to the Temporal client. Workers that use the client automatically get the
+worker interceptors.
+
+```rust,no_run
+use opentelemetry::trace::TracerProvider as _;
+use opentelemetry_sdk::trace::SdkTracerProvider;
+use temporalio_client::ClientOptions;
+use temporalio_sdk::opentelemetry::{OpenTelemetryPlugin, WorkflowIdGenerator};
+
+let tracer_provider = SdkTracerProvider::builder()
+    .with_id_generator(WorkflowIdGenerator::default())
+    .build();
+let plugin = OpenTelemetryPlugin::builder()
+    .tracer(tracer_provider.tracer("temporalio-sdk"))
+    .build();
+
+let client_options = ClientOptions::new("default")
+    .plugin(plugin)
+    .build();
+# let _ = client_options;
+# tracer_provider.shutdown().unwrap();
 ```
 
-- `envconfig` - enabled by default. Adds `ClientOptions::load_from_config` and related helpers for
-  loading connection settings from environment variables and `temporal.toml` files.
-- `prometheus` - enabled by default. Adds the Prometheus metrics exporter in
-  `temporalio_common::telemetry` for serving SDK metrics from a HTTP endpoint.
-- `otel` - optional. Adds the OpenTelemetry metrics exporter in `temporalio_common::telemetry` for
-  sending SDK metrics to an OpenTelemetry collector.
+By default, the plugin uses the OpenTelemetry global tracer. It propagates W3C Trace Context and W3C
+Baggage in the cross-SDK `_tracer-data` Temporal header. The application controls the tracer
+provider and exporters. The application is also responsible for flushing and shutting down these
+components. Use `OpenTelemetryPlugin::builder()` to set a tracer or propagator for this plugin.
+The builder returns a `SimplePlugin` when you call `build()`.
+
+Use `WorkflowIdGenerator` in the tracer provider for Workflow spans. If application Workflow code
+creates spans, also wrap each span processor in `WorkflowSpanProcessor`. These types keep span IDs
+the same during execution and replay. They do not export application spans that start during
+replay.
+
+The integration traces client calls, Workflow execution, Workflow message handlers, and Activity
+execution. It also traces Workflow calls to Activities, local Activities, child Workflows, and
+Signals. The integration propagates context through Continue-as-New.
 
 ## Workflows in detail
 
@@ -149,7 +209,8 @@ impl MyWorkflow {
     #[run]
     async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<Vec<u32>> {
         // Wait until we have at least 3 values
-        ctx.wait_condition(|s| s.values.len() >= 3).await;
+        ctx.wait_condition(|s| s.values.len() >= 3)
+            .await?;
         Ok(ctx.state(|s| s.values.clone()))
     }
 
@@ -309,21 +370,29 @@ ctx.execute_local_activity(
 
 ## Cancellation
 
-Workflows and activities support cancellation. Activity cancellation may be delivered independently
-from heartbeating, though long-running activities may still wish to heartbeat with
-`ctx.record_heartbeat(...)` to report progress.
+Workflow operations inherit the workflow's root cancellation token by default. This includes
+timers, activities, local activities, child workflows, signals, Nexus operations, and wait
+conditions. Long-running activities should heartbeat with `ctx.record_heartbeat(...)` to ensure they
+receive cancellation notifications and report progress.
 
 ```rust
-use temporalio_sdk::workflows::select;
+// Condition waits inherit workflow cancellation.
+ctx.wait_condition(|state| state.ready).await?;
 
-// In a workflow: wait for cancellation
-let reason = ctx.cancelled().await;
+// A child token cancels a related group of operations together.
+let group = ctx.cancellation_token().child_token();
+let timer = ctx.timer(TimerOptions {
+    duration: Duration::from_secs(60),
+    cancellation_token: Some(group.clone()),
+    ..Default::default()
+});
+group.cancel_with_reason("no longer needed");
 
-// Race a timer against cancellation
-select! {
-    _ = ctx.timer(Duration::from_secs(60)) => { /* timer fired */ }
-    reason = ctx.cancelled() => { /* workflow cancelled */ }
-}
+// A newly-created token is detached, which is useful for cleanup after workflow cancellation.
+let cleanup_token = WorkflowCancellationToken::new();
+let mut cleanup_options = ActivityOptions::start_to_close_timeout(Duration::from_secs(10));
+cleanup_options.cancellation_token = Some(cleanup_token);
+ctx.execute_activity(MyActivities::cleanup, (), cleanup_options).await?;
 ```
 
 ## Worker Configuration
@@ -340,6 +409,27 @@ let worker_options = WorkerOptions::new("task-queue")
     .register_workflow::<MyWorkflow>()?
     .build();
 ```
+
+## Workflow Replay
+
+`WorkflowReplayer` checks whether workflow code remains compatible with recorded workflow
+histories. Histories can come from directly from a workflow handle or from JSON:
+
+```rust
+use temporalio_client::WorkflowHistory;
+use temporalio_sdk::workflow_replayer::{WorkflowReplayer, WorkflowReplayerOptions};
+
+let replayer = WorkflowReplayer::new(
+    WorkflowReplayerOptions::new()
+        .register_workflow::<MyWorkflow>()?
+        .build(),
+)?;
+let saved_history = std::fs::read("workflow-history.json")?;
+let history = WorkflowHistory::from_json(&saved_history)?;
+
+replayer.replay_workflow(history).await?;
+```
+
 
 ## Using the Client
 
@@ -385,7 +475,7 @@ Once you have a workflow handle, you can interact with the running workflow:
 ```rust
 use temporalio_client::{
     SignalOptions, QueryOptions, UpdateOptions,
-    StartUpdateOptions, WorkflowUpdateWaitStage,
+    StartUpdateOptions,
     UntypedSignal,
 };
 use temporalio_common::data_converters::{PayloadConverter, RawValue};
@@ -411,9 +501,7 @@ let update_handle = handle
     .start_update(
         MyWorkflow::add_wait_return,
         50,
-        StartUpdateOptions::builder()
-            .wait_for_stage(WorkflowUpdateWaitStage::Accepted)
-            .build()
+        StartUpdateOptions::default()
     )
     .await?;
 update_handle.get_result().await?;

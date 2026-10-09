@@ -41,7 +41,7 @@ struct FuzzyWf {
 impl FuzzyWf {
     #[run(name = "fuzzy_wf")]
     async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<()> {
-        ctx.wait_condition(|s| s.done).await;
+        ctx.wait_condition(|s| s.done).await?;
         Ok(())
     }
 
@@ -63,10 +63,9 @@ impl FuzzyWf {
                     .execute_local_activity(
                         StdActivities::echo,
                         "hi!".to_string(),
-                        LocalActivityOptions {
-                            start_to_close_timeout: Some(Duration::from_secs(5)),
-                            ..Default::default()
-                        },
+                        LocalActivityOptions::builder()
+                            .start_to_close_timeout(Duration::from_secs(5))
+                            .build(),
                     )
                     .await;
             }
@@ -80,12 +79,12 @@ async fn fuzzy_workflow() {
     let wf_name = "fuzzy_wf";
     let mut starter = CoreWfStarter::new("fuzzy_workflow");
     starter.sdk_config.max_cached_workflows = 25;
-    starter.sdk_config.tuner = Arc::new(TunerHolder::fixed_size(25, 25, 100, 100));
+    starter.set_core_tuner(Arc::new(TunerHolder::fixed_size(25, 25, 100, 100)));
+    starter.sdk_config.register_activities(StdActivities);
+    starter.sdk_config.register_workflow::<FuzzyWf>().unwrap();
     let mut worker = starter.worker().await;
-    worker.register_workflow::<FuzzyWf>().unwrap();
-    worker.register_activities(StdActivities);
 
-    let client = starter.get_client().await;
+    let client = starter.get_core_client().await;
     let task_queue = starter.get_task_queue().to_owned();
 
     for i in 0..num_workflows {

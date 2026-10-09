@@ -37,6 +37,30 @@ message Success {
 // Used to report activity failure either when executing or resolving
 message Failure {
     temporal.api.failure.v1.Failure failure = 1;
+    // Only meaningful on ActivityExecutionResult (lang -> core); ignored on ActivityResolution,
+    // which reuses this message.
+    ActivityTaskFailedCause cause = 2;
+}
+
+/*
+ * A well-known condition that caused an activity task to fail. Lang reports one alongside the
+ * failure so core can categorize activity failures instead of treating them all alike; it becomes
+ * the `failure_reason` metric label, so the set of values is deliberately small and bounded.
+ */
+enum ActivityTaskFailedCause {
+    ACTIVITY_TASK_FAILED_CAUSE_UNSPECIFIED = 0;
+    // A payload-bearing field on a request the worker sent for this activity task exceeded the
+    // per-field size limit configured on the server for the namespace.
+    // Check the activity task failure message for more information.
+    ACTIVITY_TASK_FAILED_CAUSE_PAYLOADS_TOO_LARGE = 1;
+    // The worker failed to offload a payload to, or retrieve one from, external storage while
+    // processing this activity task.
+    // Check the activity task failure message for more information.
+    ACTIVITY_TASK_FAILED_CAUSE_EXTERNAL_STORAGE_FAILURE = 2;
+    // The default cause for an activity task failure reported by a worker; a more specific cause
+    // takes precedence whenever the condition is recognized.
+    // Check the activity task failure message for more information.
+    ACTIVITY_TASK_FAILED_CAUSE_ACTIVITY_WORKER_UNHANDLED_FAILURE = 3;
 }
 
 /*

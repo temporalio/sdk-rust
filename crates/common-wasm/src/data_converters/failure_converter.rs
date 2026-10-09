@@ -9,18 +9,24 @@
 //!   [`FailureDecodeHint`] implementations adapt that normalized value into the caller-facing error
 //!   type they expect.
 
-use super::{PayloadConversionError, PayloadConverter, SerializationContextData};
+use super::{
+    GenericPayloadConverter, PayloadConversionError, PayloadConverter, SerializationContext,
+    SerializationContextData,
+};
 use crate::{
     error::{
-        ActivityExecutionError, ActivityFailureError, ApplicationFailure, CancelledError,
-        ChildWorkflowExecutionError, ChildWorkflowFailureError, ChildWorkflowStartError,
-        IncomingError, IncomingNexusHandlerError, IncomingNexusOperationExecutionError,
-        OutgoingActivityError, OutgoingError, OutgoingWorkflowError, ResetWorkflowError,
-        ServerError, TerminatedError, TimeoutError, WorkflowSignalError,
-        WorkflowSignalFailureError,
+        ActivityExecutionError, ActivityFailureError, ApplicationFailure,
+        CancelExternalWorkflowError, CancelledError, ChildWorkflowExecutionError,
+        ChildWorkflowFailureError, ChildWorkflowStartError, IncomingError,
+        IncomingNexusHandlerError, IncomingNexusOperationExecutionError, OutgoingActivityError,
+        OutgoingError, OutgoingWorkflowError, ResetWorkflowError, ServerError, TerminatedError,
+        TimeoutError, WorkflowCancelFailureError, WorkflowSignalError, WorkflowSignalFailureError,
     },
     protos::temporal::api::{
-        enums::v1::ApplicationErrorCategory as ProtoApplicationErrorCategory,
+        enums::v1::{
+            ApplicationErrorCategory as ProtoApplicationErrorCategory,
+            CancelExternalWorkflowExecutionFailedCause, SignalExternalWorkflowExecutionFailedCause,
+        },
         failure::v1::{
             ActivityFailureInfo, ApplicationFailureInfo, CanceledFailureInfo,
             ChildWorkflowExecutionFailureInfo, Failure, failure::FailureInfo,
@@ -48,7 +54,35 @@ pub trait FailureConverter {
 }
 
 /// Default failure converter.
-pub struct DefaultFailureConverter;
+pub struct DefaultFailureConverter {
+    encode_common_attributes: bool,
+}
+
+impl DefaultFailureConverter {
+    /// Creates a failure converter, optionally moving failure messages and stack traces into
+    /// encoded attributes.
+    pub const fn new(encode_common_attributes: bool) -> Self {
+        Self {
+            encode_common_attributes,
+        }
+    }
+}
+
+impl Default for DefaultFailureConverter {
+    fn default() -> Self {
+        Self::new(false)
+    }
+}
+
+/// Failure attributes that can be moved into an encoded payload.
+#[derive(serde::Deserialize, serde::Serialize)]
+#[non_exhaustive]
+pub struct CommonAttributes {
+    /// Failure message.
+    pub message: String,
+    /// Failure stack trace.
+    pub stack_trace: String,
+}
 
 /// Adapts a normalized incoming failure into a caller-facing error surface.
 pub trait FailureDecodeHint {
@@ -59,11 +93,31 @@ pub trait FailureDecodeHint {
     fn adapt(self, normalized: IncomingError) -> Self::Output;
 }
 
+/// No-op decode hint; returns the error unchanged.
+#[derive(Debug, Clone, Copy)]
+pub struct NoopDecodeHint;
+
+impl FailureDecodeHint for NoopDecodeHint {
+    type Output = IncomingError;
+
+    fn adapt(self, normalized: IncomingError) -> Self::Output {
+        normalized
+    }
+}
+
 /// Decode hint for activity execution results.
 #[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
 pub struct ActivityExecutionDecodeHint {
     /// Whether the workflow-side resolution was cancelled rather than failed.
     pub cancelled: bool,
+}
+
+impl ActivityExecutionDecodeHint {
+    /// Creates a decode hint for an activity resolution.
+    pub fn new(cancelled: bool) -> Self {
+        Self { cancelled }
+    }
 }
 
 impl FailureDecodeHint for ActivityExecutionDecodeHint {
@@ -102,7 +156,8 @@ impl FailureDecodeHint for ActivityExecutionDecodeHint {
 }
 
 /// Decode hint for child-workflow start results.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Default)]
+#[non_exhaustive]
 pub struct ChildWorkflowStartDecodeHint;
 
 impl FailureDecodeHint for ChildWorkflowStartDecodeHint {
@@ -128,7 +183,8 @@ impl FailureDecodeHint for ChildWorkflowStartDecodeHint {
 }
 
 /// Decode hint for child-workflow execution results.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Default)]
+#[non_exhaustive]
 pub struct ChildWorkflowExecutionDecodeHint;
 
 impl FailureDecodeHint for ChildWorkflowExecutionDecodeHint {
@@ -149,17 +205,62 @@ impl FailureDecodeHint for ChildWorkflowExecutionDecodeHint {
 }
 
 /// Decode hint for workflow signal failures.
-#[derive(Debug, Clone, Copy)]
-pub struct WorkflowSignalDecodeHint;
+#[derive(Debug, Clone, Copy, Default)]
+#[non_exhaustive]
+pub struct WorkflowSignalDecodeHint {
+    cause: SignalExternalWorkflowExecutionFailedCause,
+}
+
+impl WorkflowSignalDecodeHint {
+    /// Creates a decode hint with the server-reported signal failure cause.
+    pub fn new(cause: SignalExternalWorkflowExecutionFailedCause) -> Self {
+        Self { cause }
+    }
+}
 
 impl FailureDecodeHint for WorkflowSignalDecodeHint {
     type Output = WorkflowSignalError;
 
     fn adapt(self, normalized: IncomingError) -> Self::Output {
         let failure = normalized.failure().clone();
-        WorkflowSignalError::Failed(Box::new(WorkflowSignalFailureError::new(
-            failure, normalized,
-        )))
+        let error = Box::new(WorkflowSignalFailureError::new(failure, normalized));
+        if self.cause
+            == SignalExternalWorkflowExecutionFailedCause::ExternalWorkflowExecutionNotFound
+        {
+            WorkflowSignalError::NotFound(error)
+        } else {
+            WorkflowSignalError::Failed(error)
+        }
+    }
+}
+
+/// Decode hint for external-workflow cancellation failures.
+#[derive(Debug, Clone, Copy, Default)]
+#[non_exhaustive]
+pub struct CancelExternalWorkflowDecodeHint {
+    cause: CancelExternalWorkflowExecutionFailedCause,
+}
+
+impl CancelExternalWorkflowDecodeHint {
+    /// Creates a decode hint with the server-reported cancellation failure cause.
+    pub fn new(cause: CancelExternalWorkflowExecutionFailedCause) -> Self {
+        Self { cause }
+    }
+}
+
+impl FailureDecodeHint for CancelExternalWorkflowDecodeHint {
+    type Output = CancelExternalWorkflowError;
+
+    fn adapt(self, normalized: IncomingError) -> Self::Output {
+        let failure = normalized.failure().clone();
+        let error = Box::new(WorkflowCancelFailureError::new(failure, normalized));
+        if self.cause
+            == CancelExternalWorkflowExecutionFailedCause::ExternalWorkflowExecutionNotFound
+        {
+            CancelExternalWorkflowError::NotFound(error)
+        } else {
+            CancelExternalWorkflowError::Failed(error)
+        }
     }
 }
 
@@ -178,6 +279,9 @@ impl FailureConverter for DefaultFailureConverter {
             OutgoingError::Workflow(OutgoingWorkflowError::Application(app)) => {
                 app.encode_failure(payload_converter, context)
             }
+            OutgoingError::Workflow(OutgoingWorkflowError::PayloadConversion(err)) => {
+                Ok(encode_generic_application_failure(&err))
+            }
             OutgoingError::Workflow(OutgoingWorkflowError::ActivityExecution(activity)) => {
                 activity.encode_failure(payload_converter, context)
             }
@@ -190,13 +294,25 @@ impl FailureConverter for DefaultFailureConverter {
             OutgoingError::Workflow(OutgoingWorkflowError::WorkflowSignal(signal)) => {
                 signal.encode_failure(payload_converter, context)
             }
+            OutgoingError::Workflow(OutgoingWorkflowError::CancelExternalWorkflow(cancel)) => {
+                cancel.encode_failure(payload_converter, context)
+            }
         };
-        encoded.unwrap_or_else(|converter_error| {
+        let mut failure = encoded.unwrap_or_else(|converter_error| {
             Failure::application_failure(
                 failed_error_conversion_message(&original_error, &converter_error),
                 false,
             )
-        })
+        });
+        if self.encode_common_attributes
+            && encode_common_attributes(&mut failure, payload_converter, context).is_err()
+        {
+            failure = Failure::application_failure(
+                "Failed encoding failure attributes".to_owned(),
+                false,
+            );
+        }
+        failure
     }
 
     fn to_error(
@@ -224,6 +340,7 @@ enum ClassifiedFailure<'a> {
     ChildWorkflowExecution(&'a ChildWorkflowExecutionError),
     ChildWorkflowStart(&'a ChildWorkflowStartError),
     WorkflowSignal(&'a WorkflowSignalError),
+    CancelExternalWorkflow(&'a CancelExternalWorkflowError),
     Generic(&'a (dyn std::error::Error + 'static)),
 }
 
@@ -249,6 +366,8 @@ impl<'a> ClassifiedFailure<'a> {
             Self::ChildWorkflowStart(child)
         } else if let Some(child_signal) = err.downcast_ref::<WorkflowSignalError>() {
             Self::WorkflowSignal(child_signal)
+        } else if let Some(cancel_external) = err.downcast_ref::<CancelExternalWorkflowError>() {
+            Self::CancelExternalWorkflow(cancel_external)
         } else {
             Self::Generic(err)
         }
@@ -295,6 +414,14 @@ impl<'a> ClassifiedFailure<'a> {
                 )
                 .unwrap_or_else(|converter_error| {
                     encode_failed_error_conversion(signal, converter_error)
+                }),
+            Self::CancelExternalWorkflow(cancel) => cancel
+                .encode_failure(
+                    &PayloadConverter::default(),
+                    &SerializationContextData::None,
+                )
+                .unwrap_or_else(|converter_error| {
+                    encode_failed_error_conversion(cancel, converter_error)
                 }),
             Self::Generic(err) => encode_generic_application_failure(err),
         }
@@ -397,7 +524,20 @@ impl EncodeFailure for WorkflowSignalError {
         _: &SerializationContextData,
     ) -> Result<Failure, PayloadConversionError> {
         Ok(match self {
-            Self::Failed(failure) => failure.failure().clone(),
+            Self::NotFound(failure) | Self::Failed(failure) => failure.failure().clone(),
+            Self::Serialization(err) => encode_generic_application_failure(err),
+        })
+    }
+}
+
+impl EncodeFailure for CancelExternalWorkflowError {
+    fn encode_failure(
+        &self,
+        _: &PayloadConverter,
+        _: &SerializationContextData,
+    ) -> Result<Failure, PayloadConversionError> {
+        Ok(match self {
+            Self::NotFound(error) | Self::Failed(error) => error.failure().clone(),
             Self::Serialization(err) => encode_generic_application_failure(err),
         })
     }
@@ -450,11 +590,39 @@ fn encode_failed_error_conversion(
     }
 }
 
+fn encode_common_attributes(
+    failure: &mut Failure,
+    payload_converter: &PayloadConverter,
+    context: &SerializationContextData,
+) -> Result<(), PayloadConversionError> {
+    if let Some(cause) = failure.cause.as_deref_mut() {
+        encode_common_attributes(cause, payload_converter, context)?;
+    }
+    failure.encoded_attributes = Some(payload_converter.to_payload(
+        &SerializationContext::new(context, payload_converter),
+        &CommonAttributes {
+            message: std::mem::take(&mut failure.message),
+            stack_trace: std::mem::take(&mut failure.stack_trace),
+        },
+    )?);
+    failure.message = "Encoded failure".to_owned();
+    Ok(())
+}
+
 fn decode_failure(
-    failure: Failure,
+    mut failure: Failure,
     payload_converter: &PayloadConverter,
     context: &SerializationContextData,
 ) -> IncomingError {
+    if let Some(encoded_attributes) = failure.encoded_attributes.clone()
+        && let Ok(attributes) = payload_converter.from_payload::<CommonAttributes>(
+            &SerializationContext::new(context, payload_converter),
+            encoded_attributes,
+        )
+    {
+        failure.message = attributes.message;
+        failure.stack_trace = attributes.stack_trace;
+    }
     let cause = failure
         .cause
         .clone()
@@ -503,8 +671,11 @@ fn decode_failure(
 mod tests {
     use super::*;
     use crate::{
-        data_converters::{GenericPayloadConverter, SerializationContext},
-        error::ApplicationErrorCategory,
+        data_converters::{
+            ActivitySerializationContext, GenericPayloadConverter, SerializationContext,
+            WorkflowSerializationContext,
+        },
+        error::{ApplicationErrorCategory, StartChildWorkflowExecutionFailedCause},
         protos::temporal::api::{
             common::v1::{Payload, Payloads},
             failure::v1::{
@@ -598,17 +769,17 @@ mod tests {
     }
 
     fn convert(err: OutgoingWorkflowError) -> Failure {
-        DefaultFailureConverter.to_failure(
+        DefaultFailureConverter::default().to_failure(
             OutgoingError::Workflow(err),
             &PayloadConverter::default(),
-            &SerializationContextData::Workflow,
+            &SerializationContextData::Workflow(WorkflowSerializationContext::new()),
         )
     }
 
     fn data_converter() -> crate::data_converters::DataConverter {
         crate::data_converters::DataConverter::new(
             PayloadConverter::default(),
-            DefaultFailureConverter,
+            DefaultFailureConverter::default(),
             crate::data_converters::DefaultPayloadCodec,
         )
     }
@@ -670,10 +841,10 @@ mod tests {
         let converter = PayloadConverter::default();
         let details: String = converter
             .from_payloads(
-                &SerializationContext {
-                    data: &SerializationContextData::Workflow,
-                    converter: &converter,
-                },
+                &SerializationContext::new(
+                    &SerializationContextData::Workflow(WorkflowSerializationContext::new()),
+                    &converter,
+                ),
                 payloads,
             )
             .unwrap();
@@ -682,14 +853,14 @@ mod tests {
 
     #[test]
     fn application_failures_surface_detail_encoding_errors_with_original_message() {
-        let failure = DefaultFailureConverter.to_failure(
+        let failure = DefaultFailureConverter::default().to_failure(
             OutgoingError::Workflow(OutgoingWorkflowError::Application(Box::new(
                 ApplicationFailure::builder(anyhow::anyhow!("app boom"))
                     .details(AlwaysFailsSerialize)
                     .build(),
             ))),
             &PayloadConverter::default(),
-            &SerializationContextData::Workflow,
+            &SerializationContextData::Workflow(WorkflowSerializationContext::new()),
         );
 
         assert_eq!(
@@ -703,10 +874,10 @@ mod tests {
         let converter = PayloadConverter::default();
         let payloads = converter
             .to_payloads(
-                &SerializationContext {
-                    data: &SerializationContextData::Workflow,
-                    converter: &converter,
-                },
+                &SerializationContext::new(
+                    &SerializationContextData::Workflow(WorkflowSerializationContext::new()),
+                    &converter,
+                ),
                 &"detail",
             )
             .unwrap();
@@ -721,8 +892,12 @@ mod tests {
             ..Default::default()
         };
 
-        let decoded = DefaultFailureConverter
-            .to_error(failure, &converter, &SerializationContextData::Workflow)
+        let decoded = DefaultFailureConverter::default()
+            .to_error(
+                failure,
+                &converter,
+                &SerializationContextData::Workflow(WorkflowSerializationContext::new()),
+            )
             .unwrap();
 
         let IncomingError::Application(app) = decoded else {
@@ -865,11 +1040,11 @@ mod tests {
         ));
         assert!(cause.cause.is_none());
 
-        let decoded = DefaultFailureConverter
+        let decoded = DefaultFailureConverter::default()
             .to_error(
                 converted.clone(),
                 &PayloadConverter::default(),
-                &SerializationContextData::Workflow,
+                &SerializationContextData::Workflow(WorkflowSerializationContext::new()),
             )
             .unwrap();
 
@@ -888,12 +1063,85 @@ mod tests {
     }
 
     #[test]
+    fn failure_converter_encodes_and_decodes_cause_chain() {
+        let payload_converter = PayloadConverter::default();
+        let converter = DefaultFailureConverter::new(true);
+        let context = SerializationContextData::Workflow(WorkflowSerializationContext::new());
+        let failure = Failure {
+            message: "outer message".to_owned(),
+            stack_trace: "outer stack trace".to_owned(),
+            cause: Some(Box::new(Failure {
+                message: "inner message".to_owned(),
+                stack_trace: "inner stack trace".to_owned(),
+                failure_info: Some(FailureInfo::ApplicationFailureInfo(
+                    ApplicationFailureInfo::default(),
+                )),
+                ..Default::default()
+            })),
+            failure_info: Some(FailureInfo::ActivityFailureInfo(
+                ActivityFailureInfo::default(),
+            )),
+            ..Default::default()
+        };
+        let activity_error = ActivityExecutionError::Failed(ActivityFailureError::new(
+            failure,
+            ActivityFailureInfo::default(),
+            None,
+        ));
+
+        let failure = converter.to_failure(
+            OutgoingError::Workflow(OutgoingWorkflowError::ActivityExecution(Box::new(
+                activity_error,
+            ))),
+            &payload_converter,
+            &context,
+        );
+
+        assert_eq!(failure.message, "Encoded failure");
+        assert_eq!(failure.cause.as_ref().unwrap().message, "Encoded failure");
+        assert!(failure.stack_trace.is_empty());
+        assert!(failure.cause.as_ref().unwrap().stack_trace.is_empty());
+        let payload_context = SerializationContext::new(&context, &payload_converter);
+        let outer_attributes: CommonAttributes = payload_converter
+            .from_payload(
+                &payload_context,
+                failure.encoded_attributes.clone().unwrap(),
+            )
+            .unwrap();
+        let inner_attributes: CommonAttributes = payload_converter
+            .from_payload(
+                &payload_context,
+                failure
+                    .cause
+                    .as_ref()
+                    .unwrap()
+                    .encoded_attributes
+                    .clone()
+                    .unwrap(),
+            )
+            .unwrap();
+        assert_eq!(outer_attributes.message, "outer message");
+        assert_eq!(inner_attributes.message, "inner message");
+        assert_eq!(outer_attributes.stack_trace, "outer stack trace");
+        assert_eq!(inner_attributes.stack_trace, "inner stack trace");
+
+        let decoded = DefaultFailureConverter::default()
+            .to_error(failure, &payload_converter, &context)
+            .unwrap();
+        assert_eq!(decoded.failure().message, "outer message");
+        assert_eq!(decoded.failure().stack_trace, "outer stack trace");
+        let cause = decoded.cause().unwrap().failure();
+        assert_eq!(cause.message, "inner message");
+        assert_eq!(cause.stack_trace, "inner stack trace");
+    }
+
+    #[test]
     fn start_failed_child_workflow_errors_fall_back_to_application_failures() {
         let failure = convert(OutgoingWorkflowError::ChildWorkflowStart(Box::new(
             ChildWorkflowStartError::StartFailed {
                 workflow_id: "wf-id".to_owned(),
                 workflow_type: "wf-type".to_owned(),
-                cause: crate::protos::coresdk::child_workflow::StartChildWorkflowExecutionFailedCause::WorkflowAlreadyExists,
+                cause: StartChildWorkflowExecutionFailedCause::WorkflowAlreadyExists,
             },
         )));
         assert!(matches!(
@@ -917,11 +1165,11 @@ mod tests {
             ..Default::default()
         };
 
-        let decoded = DefaultFailureConverter
+        let decoded = DefaultFailureConverter::default()
             .to_error(
                 failure.clone(),
                 &PayloadConverter::default(),
-                &SerializationContextData::Workflow,
+                &SerializationContextData::Workflow(WorkflowSerializationContext::new()),
             )
             .unwrap();
 
@@ -950,11 +1198,11 @@ mod tests {
             ..Default::default()
         };
 
-        let decoded = DefaultFailureConverter
+        let decoded = DefaultFailureConverter::default()
             .to_error(
                 failure.clone(),
                 &PayloadConverter::default(),
-                &SerializationContextData::Workflow,
+                &SerializationContextData::Workflow(WorkflowSerializationContext::new()),
             )
             .unwrap();
 
@@ -976,11 +1224,11 @@ mod tests {
             ..Default::default()
         };
 
-        let decoded = DefaultFailureConverter
+        let decoded = DefaultFailureConverter::default()
             .to_error(
                 failure.clone(),
                 &PayloadConverter::default(),
-                &SerializationContextData::Workflow,
+                &SerializationContextData::Workflow(WorkflowSerializationContext::new()),
             )
             .unwrap();
 
@@ -994,11 +1242,11 @@ mod tests {
         assert_eq!(reencoded.message, failure.message);
         assert_eq!(reencoded.cause.as_deref(), failure.cause.as_deref());
 
-        let decoded_reencoded = DefaultFailureConverter
+        let decoded_reencoded = DefaultFailureConverter::default()
             .to_error(
                 reencoded,
                 &PayloadConverter::default(),
-                &SerializationContextData::Workflow,
+                &SerializationContextData::Workflow(WorkflowSerializationContext::new()),
             )
             .unwrap();
         let IncomingError::Application(roundtripped) = decoded_reencoded else {
@@ -1024,11 +1272,11 @@ mod tests {
             ..Default::default()
         };
 
-        let decoded = DefaultFailureConverter
+        let decoded = DefaultFailureConverter::default()
             .to_error(
                 failure.clone(),
                 &PayloadConverter::default(),
-                &SerializationContextData::Workflow,
+                &SerializationContextData::Workflow(WorkflowSerializationContext::new()),
             )
             .unwrap();
 
@@ -1095,11 +1343,11 @@ mod tests {
             ..Default::default()
         };
 
-        let decoded = DefaultFailureConverter
+        let decoded = DefaultFailureConverter::default()
             .to_error(
                 failure.clone(),
                 &PayloadConverter::default(),
-                &SerializationContextData::Workflow,
+                &SerializationContextData::Workflow(WorkflowSerializationContext::new()),
             )
             .unwrap();
 
@@ -1132,13 +1380,13 @@ mod tests {
         };
         let data_converter = crate::data_converters::DataConverter::new(
             PayloadConverter::default(),
-            DefaultFailureConverter,
+            DefaultFailureConverter::default(),
             crate::data_converters::DefaultPayloadCodec,
         );
 
         let decoded = data_converter
             .to_error(
-                &SerializationContextData::Workflow,
+                &SerializationContextData::Workflow(WorkflowSerializationContext::new()),
                 failure.clone(),
                 ActivityExecutionDecodeHint { cancelled: false },
             )
@@ -1189,7 +1437,7 @@ mod tests {
     ) {
         let decoded = data_converter()
             .to_error(
-                &SerializationContextData::Workflow,
+                &SerializationContextData::Workflow(WorkflowSerializationContext::new()),
                 failure.clone(),
                 ActivityExecutionDecodeHint { cancelled: true },
             )
@@ -1234,11 +1482,11 @@ mod tests {
             ..Default::default()
         };
 
-        let decoded = DefaultFailureConverter
+        let decoded = DefaultFailureConverter::default()
             .to_error(
                 failure.clone(),
                 &PayloadConverter::default(),
-                &SerializationContextData::Workflow,
+                &SerializationContextData::Workflow(WorkflowSerializationContext::new()),
             )
             .unwrap();
 
@@ -1270,11 +1518,11 @@ mod tests {
             ..Default::default()
         };
 
-        let decoded = DefaultFailureConverter
+        let decoded = DefaultFailureConverter::default()
             .to_error(
                 failure.clone(),
                 &PayloadConverter::default(),
-                &SerializationContextData::Workflow,
+                &SerializationContextData::Workflow(WorkflowSerializationContext::new()),
             )
             .unwrap();
 
@@ -1311,7 +1559,7 @@ mod tests {
         };
         let decoded = data_converter()
             .to_error(
-                &SerializationContextData::Workflow,
+                &SerializationContextData::Workflow(WorkflowSerializationContext::new()),
                 failure.clone(),
                 ChildWorkflowExecutionDecodeHint,
             )
@@ -1360,7 +1608,7 @@ mod tests {
     ) {
         let decoded = data_converter()
             .to_error(
-                &SerializationContextData::Workflow,
+                &SerializationContextData::Workflow(WorkflowSerializationContext::new()),
                 failure.clone(),
                 ChildWorkflowExecutionDecodeHint,
             )
@@ -1392,7 +1640,7 @@ mod tests {
         };
         let decoded = data_converter()
             .to_error(
-                &SerializationContextData::Workflow,
+                &SerializationContextData::Workflow(WorkflowSerializationContext::new()),
                 failure.clone(),
                 ChildWorkflowStartDecodeHint,
             )
@@ -1403,6 +1651,58 @@ mod tests {
         };
         assert_eq!(decoded_failure.failure(), &failure);
         assert!(decoded_failure.cause().is_none());
+    }
+
+    #[test]
+    fn workflow_signal_decode_hint_recognizes_not_found() {
+        let failure = Failure {
+            message: "workflow not found".to_owned(),
+            ..Default::default()
+        };
+        let decoded = data_converter()
+            .to_error(
+                &SerializationContextData::Workflow(WorkflowSerializationContext::new()),
+                failure.clone(),
+                WorkflowSignalDecodeHint::new(
+                    SignalExternalWorkflowExecutionFailedCause::ExternalWorkflowExecutionNotFound,
+                ),
+            )
+            .unwrap();
+
+        let WorkflowSignalError::NotFound(decoded_failure) = decoded else {
+            panic!("expected not-found workflow signal error");
+        };
+        assert_eq!(decoded_failure.failure(), &failure);
+    }
+
+    #[test]
+    fn cancel_external_workflow_decode_hint_recognizes_not_found() {
+        let failure = Failure {
+            message: "workflow not found".to_owned(),
+            cause: Some(Box::new(Failure {
+                message: "timed out".to_owned(),
+                failure_info: Some(FailureInfo::TimeoutFailureInfo(
+                    TimeoutFailureInfo::default(),
+                )),
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        let decoded = data_converter()
+            .to_error(
+                &SerializationContextData::Workflow(WorkflowSerializationContext::new()),
+                failure.clone(),
+                CancelExternalWorkflowDecodeHint::new(
+                    CancelExternalWorkflowExecutionFailedCause::ExternalWorkflowExecutionNotFound,
+                ),
+            )
+            .unwrap();
+
+        let CancelExternalWorkflowError::NotFound(decoded_failure) = decoded else {
+            panic!("expected not-found external-workflow cancellation error");
+        };
+        assert_eq!(decoded_failure.failure(), &failure);
+        assert!(std::error::Error::source(&*decoded_failure).is_some());
     }
 
     #[test]
@@ -1420,9 +1720,9 @@ mod tests {
         };
         let decoded = data_converter()
             .to_error(
-                &SerializationContextData::Workflow,
+                &SerializationContextData::Workflow(WorkflowSerializationContext::new()),
                 failure.clone(),
-                WorkflowSignalDecodeHint,
+                WorkflowSignalDecodeHint::default(),
             )
             .unwrap();
 
@@ -1443,10 +1743,10 @@ mod tests {
 
     #[test]
     fn outgoing_cancelled_activity_errors_encode_to_cancelled_failures() {
-        let failure = DefaultFailureConverter.to_failure(
+        let failure = DefaultFailureConverter::default().to_failure(
             OutgoingError::Activity(OutgoingActivityError::Cancelled { details: None }),
             &PayloadConverter::default(),
-            &SerializationContextData::Activity,
+            &SerializationContextData::Activity(ActivitySerializationContext::new()),
         );
 
         assert_eq!(failure.message, "Activity cancelled");
@@ -1458,19 +1758,19 @@ mod tests {
 
     #[test]
     fn outgoing_cancelled_activity_errors_encode_serializable_details_with_payload_converter() {
-        let failure = DefaultFailureConverter.to_failure(
+        let failure = DefaultFailureConverter::default().to_failure(
             OutgoingError::Activity(OutgoingActivityError::Cancelled {
                 details: Some("detail".to_string().into()),
             }),
             &PayloadConverter::default(),
-            &SerializationContextData::Activity,
+            &SerializationContextData::Activity(ActivitySerializationContext::new()),
         );
 
-        let err = DefaultFailureConverter
+        let err = DefaultFailureConverter::default()
             .to_error(
                 failure,
                 &PayloadConverter::default(),
-                &SerializationContextData::Activity,
+                &SerializationContextData::Activity(ActivitySerializationContext::new()),
             )
             .unwrap();
         let cancelled = err.as_cancelled().unwrap();

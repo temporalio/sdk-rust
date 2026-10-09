@@ -1,4 +1,7 @@
-//! Contains types and logic for interactions between clients and Core/SDK workers
+//! Contains types and logic for interactions between clients and Core/SDK workers.
+//!
+//! This module is public for use by `temporalio-sdk-core` and is not intended to be used directly
+//! by SDK users.
 
 use anyhow::bail;
 use parking_lot::RwLock;
@@ -8,17 +11,21 @@ use std::{
         HashMap,
         hash_map::Entry::{Occupied, Vacant},
     },
-    sync::Arc,
+    future::Future,
+    sync::{Arc, Weak},
 };
 use temporalio_common::{
     protos::{
         TaskToken,
         temporal::api::{
-            worker::v1::WorkerHeartbeat, workflowservice::v1::PollWorkflowTaskQueueResponse,
+            worker::v1::WorkerHeartbeat,
+            workflowservice::v1::{DescribeNamespaceResponse, PollWorkflowTaskQueueResponse},
         },
     },
     worker::{WorkerDeploymentOptions, WorkerTaskTypes},
 };
+use tokio::sync::OnceCell;
+use tonic::Code;
 use uuid::Uuid;
 
 /// This trait represents a slot reserved for processing a WFT by a worker.
@@ -83,6 +90,8 @@ struct ClientWorkerSetImpl {
     all_workers: HashMap<Uuid, Arc<dyn ClientWorker + Send + Sync>>,
     /// Maps namespace to shared worker for worker heartbeating
     shared_worker: HashMap<String, Box<dyn SharedNamespaceWorkerTrait + Send + Sync>>,
+    // Avoid retaining namespace limits and capabilities after the last worker using them is gone.
+    namespace_descriptions: HashMap<String, Weak<NamespaceDescriptionSource>>,
 }
 
 impl ClientWorkerSetImpl {
@@ -92,7 +101,23 @@ impl ClientWorkerSetImpl {
             slot_providers: Default::default(),
             all_workers: Default::default(),
             shared_worker: Default::default(),
+            namespace_descriptions: Default::default(),
         }
+    }
+
+    fn namespace_description_source(&mut self, namespace: &str) -> Arc<NamespaceDescriptionSource> {
+        if let Some(description) = self
+            .namespace_descriptions
+            .get(namespace)
+            .and_then(Weak::upgrade)
+        {
+            return description;
+        }
+
+        let description = Arc::new(NamespaceDescriptionSource::unresolved());
+        self.namespace_descriptions
+            .insert(namespace.to_owned(), Arc::downgrade(&description));
+        description
     }
 
     fn try_reserve_wft_slot(
@@ -196,7 +221,7 @@ impl ClientWorkerSetImpl {
             let worker_instance_key = worker.worker_instance_key();
             let namespace = worker.namespace().to_string();
 
-            let shared_worker = match self.shared_worker.entry(namespace.clone()) {
+            let shared_worker = match self.shared_worker.entry(namespace) {
                 Occupied(o) => o.into_mut(),
                 Vacant(v) => {
                     let shared_worker = worker.new_shared_namespace_worker()?;
@@ -205,10 +230,11 @@ impl ClientWorkerSetImpl {
             };
             shared_worker.register_callback(
                 worker_instance_key,
-                WorkerCallbacks {
-                    heartbeat: heartbeat_callback,
-                    cancel_activity: worker.cancel_activity_callback(),
-                },
+                WorkerCallbacks::new(
+                    heartbeat_callback,
+                    worker.heartbeat_success_callback(),
+                    worker.cancel_activity_callback(),
+                ),
             );
         }
 
@@ -292,6 +318,55 @@ impl ClientWorkerSetImpl {
     }
 }
 
+/// A connection-scoped source for a namespace description shared by all workers in that namespace.
+#[derive(Debug)]
+#[doc(hidden)]
+pub struct NamespaceDescriptionSource {
+    description: OnceCell<DescribeNamespaceResponse>,
+}
+
+impl NamespaceDescriptionSource {
+    /// Construct a source whose description has not yet been resolved.
+    pub fn unresolved() -> Self {
+        Self {
+            description: OnceCell::new(),
+        }
+    }
+
+    /// Construct a source whose description has already been resolved.
+    pub fn resolved(description: DescribeNamespaceResponse) -> Self {
+        Self {
+            description: OnceCell::new_with(Some(description)),
+        }
+    }
+
+    /// Resolve the namespace description once, allowing concurrent callers to await the same RPC.
+    pub async fn resolve<F, Fut>(
+        &self,
+        fetch: F,
+    ) -> Result<&DescribeNamespaceResponse, tonic::Status>
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = Result<DescribeNamespaceResponse, tonic::Status>>,
+    {
+        self.description
+            .get_or_try_init(|| async {
+                match fetch().await {
+                    Err(status) if status.code() == Code::Unimplemented => {
+                        Ok(DescribeNamespaceResponse::default())
+                    }
+                    result => result,
+                }
+            })
+            .await
+    }
+
+    /// Return the resolved namespace description, if resolution has completed successfully.
+    pub fn get(&self) -> Option<&DescribeNamespaceResponse> {
+        self.description.get()
+    }
+}
+
 /// This trait represents a shared namespace worker that sends worker heartbeats and
 /// receives worker commands.
 pub trait SharedNamespaceWorkerTrait {
@@ -338,6 +413,14 @@ impl ClientWorkerSet {
             worker_grouping_key: Uuid::new_v4(),
             worker_manager: RwLock::new(ClientWorkerSetImpl::new()),
         }
+    }
+
+    /// Return the shared namespace description source for this connection and namespace.
+    #[doc(hidden)]
+    pub fn namespace_description_source(&self, namespace: &str) -> Arc<NamespaceDescriptionSource> {
+        self.worker_manager
+            .write()
+            .namespace_description_source(namespace)
     }
 
     /// Try to reserve a compatible processing slot in any of the registered workers.
@@ -417,18 +500,40 @@ impl std::fmt::Debug for ClientWorkerSet {
     }
 }
 
-/// Contains a worker heartbeat callback, wrapped for mocking
-pub type HeartbeatCallback = Arc<dyn Fn() -> WorkerHeartbeat + Send + Sync>;
+/// Contains a worker heartbeat callback, wrapped for mocking. Returns `None` until the worker has
+/// started running.
+pub type HeartbeatCallback = Arc<dyn Fn() -> Option<WorkerHeartbeat> + Send + Sync>;
+
+/// Callback invoked after a worker heartbeat has been accepted by the server.
+pub type HeartbeatSuccessCallback = Arc<dyn Fn() + Send + Sync>;
 
 /// Callback to cancel an activity by task token. Returns true if the activity was found.
 pub type CancelActivityCallback = Arc<dyn Fn(TaskToken) -> bool + Send + Sync>;
 
 /// Bundles all per-worker callbacks registered with the SharedNamespaceWorker.
+#[non_exhaustive]
 pub struct WorkerCallbacks {
     /// Callback to collect heartbeat data from the worker.
     pub heartbeat: HeartbeatCallback,
+    /// Callback acknowledging successful delivery of the collected heartbeat.
+    pub heartbeat_success: Option<HeartbeatSuccessCallback>,
     /// Callback to cancel an activity by task token.
     pub cancel_activity: Option<CancelActivityCallback>,
+}
+
+impl WorkerCallbacks {
+    /// Creates a callback bundle for a worker.
+    pub fn new(
+        heartbeat: HeartbeatCallback,
+        heartbeat_success: Option<HeartbeatSuccessCallback>,
+        cancel_activity: Option<CancelActivityCallback>,
+    ) -> Self {
+        Self {
+            heartbeat,
+            heartbeat_success,
+            cancel_activity,
+        }
+    }
 }
 
 /// Represents a complete worker that can handle both slot management
@@ -461,6 +566,11 @@ pub trait ClientWorker: Send + Sync {
     /// Returns the heartbeat callback that can be used to get WorkerHeartbeat data.
     fn heartbeat_callback(&self) -> Option<HeartbeatCallback>;
 
+    /// Returns a callback notified after the heartbeat is accepted by the server.
+    fn heartbeat_success_callback(&self) -> Option<HeartbeatSuccessCallback> {
+        None
+    }
+
     /// Returns a callback that can cancel an activity by task token.
     fn cancel_activity_callback(&self) -> Option<CancelActivityCallback>;
 
@@ -476,6 +586,55 @@ pub trait ClientWorker: Send + Sync {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[tokio::test]
+    async fn namespace_description_source_resolves_once() {
+        let source = NamespaceDescriptionSource::unresolved();
+        let calls = AtomicUsize::new(0);
+
+        let first = source.resolve(|| async {
+            calls.fetch_add(1, Ordering::Relaxed);
+            tokio::task::yield_now().await;
+            Ok(DescribeNamespaceResponse::default())
+        });
+        let second = source.resolve(|| async {
+            calls.fetch_add(1, Ordering::Relaxed);
+            Ok(DescribeNamespaceResponse::default())
+        });
+
+        let (first, second) = tokio::join!(first, second);
+        first.unwrap();
+        second.unwrap();
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn namespace_description_source_resolves_unimplemented_as_default() {
+        let source = NamespaceDescriptionSource::unresolved();
+
+        let description = source
+            .resolve(|| async { Err(tonic::Status::unimplemented("unsupported")) })
+            .await
+            .unwrap();
+
+        assert_eq!(description, &DescribeNamespaceResponse::default());
+    }
+
+    #[test]
+    fn namespace_description_sources_are_scoped_by_namespace() {
+        let workers = ClientWorkerSet::new();
+        let first = workers.namespace_description_source("first");
+
+        assert!(Arc::ptr_eq(
+            &first,
+            &workers.namespace_description_source("first")
+        ));
+        assert!(!Arc::ptr_eq(
+            &first,
+            &workers.namespace_description_source("second")
+        ));
+    }
 
     fn new_mock_slot(with_error: bool) -> Box<MockSlot> {
         let mut mock_slot = MockSlot::new();
@@ -544,16 +703,16 @@ mod tests {
         failing_worker
             .expect_task_queue()
             .return_const(task_queue.clone());
-        failing_worker
-            .expect_deployment_options()
-            .return_const(WorkerDeploymentOptions {
-                version: temporalio_common::worker::WorkerDeploymentVersion {
-                    deployment_name: "test-deployment".to_string(),
-                    build_id: "build-fail".to_string(),
-                },
-                use_worker_versioning: true,
-                default_versioning_behavior: None,
-            });
+        failing_worker.expect_deployment_options().return_const(
+            WorkerDeploymentOptions::new(
+                temporalio_common::worker::WorkerDeploymentVersion::builder()
+                    .deployment_name("test-deployment".to_string())
+                    .build_id("build-fail".to_string())
+                    .build(),
+            )
+            .use_worker_versioning(true)
+            .build(),
+        );
         failing_worker
             .expect_worker_instance_key()
             .return_const(failing_worker_id);
@@ -581,14 +740,14 @@ mod tests {
         succeeding_worker
             .expect_task_queue()
             .return_const(task_queue.clone());
-        let success_deployment_options = WorkerDeploymentOptions {
-            version: temporalio_common::worker::WorkerDeploymentVersion {
-                deployment_name: "test-deployment".to_string(),
-                build_id: "build-success".to_string(),
-            },
-            use_worker_versioning: true,
-            default_versioning_behavior: None,
-        };
+        let success_deployment_options = WorkerDeploymentOptions::new(
+            temporalio_common::worker::WorkerDeploymentVersion::builder()
+                .deployment_name("test-deployment".to_string())
+                .build_id("build-success".to_string())
+                .build(),
+        )
+        .use_worker_versioning(true)
+        .build();
         succeeding_worker
             .expect_deployment_options()
             .return_const(success_deployment_options.clone());
@@ -644,16 +803,16 @@ mod tests {
         failing_worker
             .expect_task_queue()
             .return_const(task_queue.clone());
-        failing_worker
-            .expect_deployment_options()
-            .return_const(WorkerDeploymentOptions {
-                version: temporalio_common::worker::WorkerDeploymentVersion {
-                    deployment_name: "test-deployment".to_string(),
-                    build_id: "build-fail".to_string(),
-                },
-                use_worker_versioning: true,
-                default_versioning_behavior: None,
-            });
+        failing_worker.expect_deployment_options().return_const(
+            WorkerDeploymentOptions::new(
+                temporalio_common::worker::WorkerDeploymentVersion::builder()
+                    .deployment_name("test-deployment".to_string())
+                    .build_id("build-fail".to_string())
+                    .build(),
+            )
+            .use_worker_versioning(true)
+            .build(),
+        );
         failing_worker
             .expect_worker_instance_key()
             .return_const(failing_worker_id);
@@ -856,22 +1015,25 @@ mod tests {
         mock_provider
             .expect_deployment_options()
             .returning(move || {
-                build_id_for_closure
-                    .as_ref()
-                    .map(|build_id| WorkerDeploymentOptions {
-                        version: temporalio_common::worker::WorkerDeploymentVersion {
-                            deployment_name: deployment_name.clone(),
-                            build_id: build_id.clone(),
-                        },
-                        use_worker_versioning: true,
-                        default_versioning_behavior: None,
-                    })
+                build_id_for_closure.as_ref().map(|build_id| {
+                    WorkerDeploymentOptions::new(
+                        temporalio_common::worker::WorkerDeploymentVersion::builder()
+                            .deployment_name(deployment_name.clone())
+                            .build_id(build_id.clone())
+                            .build(),
+                    )
+                    .use_worker_versioning(true)
+                    .build()
+                })
             });
 
         if heartbeat_enabled {
             mock_provider
                 .expect_heartbeat_callback()
-                .returning(|| Some(Arc::new(WorkerHeartbeat::default)));
+                .returning(|| Some(Arc::new(|| Some(WorkerHeartbeat::default()))));
+            mock_provider
+                .expect_heartbeat_success_callback()
+                .returning(|| None);
             mock_provider
                 .expect_cancel_activity_callback()
                 .returning(|| None);

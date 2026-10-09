@@ -1,4 +1,4 @@
-use crate::common::{CoreWfStarter, SEARCH_ATTR_INT, SEARCH_ATTR_TXT, build_fake_sdk};
+use crate::common::{CoreWfStarter, SEARCH_ATTR_INT, SEARCH_ATTR_TXT};
 use assert_matches::assert_matches;
 use std::time::Duration;
 use temporalio_client::{
@@ -13,7 +13,6 @@ use temporalio_common::{
         },
     },
     search_attributes::{SearchAttributeKey, SearchAttributes},
-    worker::WorkerTaskTypes,
 };
 use temporalio_macros::{workflow, workflow_methods};
 use temporalio_sdk::{WorkflowContext, WorkflowResult, WorkflowTermination};
@@ -49,15 +48,20 @@ impl SearchAttrUpdater {
     }
 }
 
+#[temporalio_macros::cloud_test_exclusion(
+    crate::CloudTestExclusionReason::RequiresCloudProvisioning,
+    "Uses custom search attributes that isolated Cloud CI does not provision."
+)]
 #[tokio::test]
 async fn sends_upsert() {
     let wf_name = "sends_upsert_search_attrs";
     let wf_id = Uuid::new_v4();
     let mut starter = CoreWfStarter::new(wf_name);
-    starter.sdk_config.task_types = WorkerTaskTypes::workflow_only();
+    starter
+        .sdk_config
+        .register_workflow::<SearchAttrUpdater>()
+        .unwrap();
     let mut worker = starter.worker().await;
-
-    worker.register_workflow::<SearchAttrUpdater>().unwrap();
     let task_queue = starter.get_task_queue().to_owned();
     worker
         .submit_wf(
@@ -75,7 +79,7 @@ async fn sends_upsert() {
         .unwrap();
     worker.run_until_done().await.unwrap();
 
-    let client = starter.get_client().await;
+    let client = starter.get_core_client().await;
     let search_attrs = client
         .get_workflow_handle::<UntypedWorkflow>(wf_id.to_string())
         .describe(WorkflowDescribeOptions::default())
@@ -122,6 +126,7 @@ impl UpsertTestWf {
     }
 }
 
+#[temporalio_macros::cloud_test_exclusion(crate::CloudTestExclusionReason::DoesNotUseServer)]
 #[tokio::test]
 async fn upsert_search_attrs_from_workflow() {
     let mut t = TestHistoryBuilder::default();
@@ -150,7 +155,8 @@ async fn upsert_search_attrs_from_workflow() {
         });
     });
 
-    let mut worker = build_fake_sdk(mock_cfg);
-    worker.register_workflow::<UpsertTestWf>().unwrap();
+    let mut worker = crate::common::build_fake_sdk_with_options(mock_cfg, |options| {
+        options.register_workflow::<UpsertTestWf>().unwrap();
+    });
     worker.run().await.unwrap();
 }

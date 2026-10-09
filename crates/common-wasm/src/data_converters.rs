@@ -2,15 +2,21 @@
 //! serialization related functionality.
 
 mod failure_converter;
+mod well_known;
 
 pub use failure_converter::{
-    ActivityExecutionDecodeHint, ChildWorkflowExecutionDecodeHint, ChildWorkflowStartDecodeHint,
-    DefaultFailureConverter, FailureConverter, FailureDecodeHint, WorkflowSignalDecodeHint,
+    ActivityExecutionDecodeHint, CancelExternalWorkflowDecodeHint,
+    ChildWorkflowExecutionDecodeHint, ChildWorkflowStartDecodeHint, CommonAttributes,
+    DefaultFailureConverter, FailureConverter, FailureDecodeHint, NoopDecodeHint,
+    WorkflowSignalDecodeHint,
 };
+use well_known::{BINARY_NULL_ENCODING_VAL, WellKnownType, binary_null_payload};
 
-use crate::protos::temporal::api::common::v1::Payload;
+use crate::protos::{ENCODING_PAYLOAD_KEY, JSON_ENCODING_VAL, temporal::api::common::v1::Payload};
 use futures::{FutureExt, future::BoxFuture};
 use std::{collections::HashMap, sync::Arc};
+
+const PROTOBUF_ENCODING_VAL: &str = "binary/protobuf";
 
 /// Combines a [`PayloadConverter`], [`FailureConverter`], and [`PayloadCodec`] to handle all
 /// serialization needs for communicating with the Temporal server.
@@ -50,12 +56,9 @@ impl DataConverter {
         data: &SerializationContextData,
         val: &T,
     ) -> Result<Payload, PayloadConversionError> {
-        let context = SerializationContext {
-            data,
-            converter: &self.payload_converter,
-        };
+        let context = SerializationContext::new(data, &self.payload_converter);
         let payload = self.payload_converter.to_payload(&context, val)?;
-        let encoded = self.codec.encode(data, vec![payload]).await;
+        let encoded = self.codec.encode(data, vec![payload]).await?;
         encoded
             .into_iter()
             .next()
@@ -68,11 +71,8 @@ impl DataConverter {
         data: &SerializationContextData,
         payload: Payload,
     ) -> Result<T, PayloadConversionError> {
-        let context = SerializationContext {
-            data,
-            converter: &self.payload_converter,
-        };
-        let decoded = self.codec.decode(data, vec![payload]).await;
+        let context = SerializationContext::new(data, &self.payload_converter);
+        let decoded = self.codec.decode(data, vec![payload]).await?;
         let payload = decoded
             .into_iter()
             .next()
@@ -86,12 +86,9 @@ impl DataConverter {
         data: &SerializationContextData,
         val: &T,
     ) -> Result<Vec<Payload>, PayloadConversionError> {
-        let context = SerializationContext {
-            data,
-            converter: &self.payload_converter,
-        };
+        let context = SerializationContext::new(data, &self.payload_converter);
         let payloads = self.payload_converter.to_payloads(&context, val)?;
-        Ok(self.codec.encode(data, payloads).await)
+        self.codec.encode(data, payloads).await
     }
 
     /// Deserialize a value from multiple payloads (e.g. for multi-arg support), applying the codec.
@@ -100,11 +97,8 @@ impl DataConverter {
         data: &SerializationContextData,
         payloads: Vec<Payload>,
     ) -> Result<T, PayloadConversionError> {
-        let context = SerializationContext {
-            data,
-            converter: &self.payload_converter,
-        };
-        let decoded = self.codec.decode(data, payloads).await;
+        let context = SerializationContext::new(data, &self.payload_converter);
+        let decoded = self.codec.decode(data, payloads).await?;
         self.payload_converter.from_payloads(&context, decoded)
     }
 
@@ -147,15 +141,61 @@ impl DataConverter {
     }
 }
 
+/// Data available when serializing in a workflow context.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct WorkflowSerializationContext {}
+
+#[allow(clippy::new_without_default)]
+impl WorkflowSerializationContext {
+    /// Creates an empty workflow serialization context.
+    ///
+    /// **Experimental:** This constructor may change when workflow context data is added.
+    pub fn new() -> Self {
+        Self {}
+    }
+}
+
+/// Data available when serializing in an activity context.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ActivitySerializationContext {}
+
+#[allow(clippy::new_without_default)]
+impl ActivitySerializationContext {
+    /// Creates an empty activity serialization context.
+    ///
+    /// **Experimental:** This constructor may change when activity context data is added.
+    pub fn new() -> Self {
+        Self {}
+    }
+}
+
+/// Data available when serializing in a Nexus context.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct NexusSerializationContext {}
+
+#[allow(clippy::new_without_default)]
+impl NexusSerializationContext {
+    /// Creates an empty Nexus serialization context.
+    ///
+    /// **Experimental:** This constructor may change when Nexus context data is added.
+    pub fn new() -> Self {
+        Self {}
+    }
+}
+
 /// Data about the serialization context, indicating where the serialization is occurring.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum SerializationContextData {
     /// Serialization is occurring in a workflow context.
-    Workflow,
+    Workflow(WorkflowSerializationContext),
     /// Serialization is occurring in an activity context.
-    Activity,
+    Activity(ActivitySerializationContext),
     /// Serialization is occurring in a nexus context.
-    Nexus,
+    Nexus(NexusSerializationContext),
     /// No specific serialization context.
     None,
 }
@@ -163,14 +203,24 @@ pub enum SerializationContextData {
 /// Context for serialization operations, including the kind of context and the
 /// payload converter for nested serialization.
 #[derive(Clone, Copy)]
+#[non_exhaustive]
 pub struct SerializationContext<'a> {
     /// The kind of serialization context (workflow, activity, etc.).
     pub data: &'a SerializationContextData,
     /// Allows nested types to serialize their contents using the same converter.
     pub converter: &'a PayloadConverter,
 }
+
+impl<'a> SerializationContext<'a> {
+    /// Creates a serialization context for the given execution context and payload converter.
+    pub fn new(data: &'a SerializationContextData, converter: &'a PayloadConverter) -> Self {
+        Self { data, converter }
+    }
+}
+
 /// Converts values to and from [`Payload`]s using different encoding strategies.
 #[derive(Clone)]
+#[non_exhaustive]
 pub enum PayloadConverter {
     /// Uses a serde-based converter for encoding/decoding.
     Serde(Arc<dyn ErasedSerdePayloadConverter>),
@@ -207,6 +257,7 @@ impl Default for PayloadConverter {
 
 /// Errors that can occur during payload conversion.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum PayloadConversionError {
     /// The payload's encoding does not match what the converter expects.
     WrongEncoding,
@@ -233,19 +284,22 @@ impl std::error::Error for PayloadConversionError {
 }
 
 /// Encodes and decodes payloads, enabling encryption or compression.
+///
+/// Operational codec failures should be returned as
+/// [`PayloadConversionError::EncodingError`].
 pub trait PayloadCodec {
     /// Encode payloads before they are sent to the server.
     fn encode(
         &self,
         context: &SerializationContextData,
         payloads: Vec<Payload>,
-    ) -> BoxFuture<'static, Vec<Payload>>;
+    ) -> BoxFuture<'static, Result<Vec<Payload>, PayloadConversionError>>;
     /// Decode payloads after they are received from the server.
     fn decode(
         &self,
         context: &SerializationContextData,
         payloads: Vec<Payload>,
-    ) -> BoxFuture<'static, Vec<Payload>>;
+    ) -> BoxFuture<'static, Result<Vec<Payload>, PayloadConversionError>>;
 }
 
 impl<T: PayloadCodec> PayloadCodec for Arc<T> {
@@ -253,14 +307,14 @@ impl<T: PayloadCodec> PayloadCodec for Arc<T> {
         &self,
         context: &SerializationContextData,
         payloads: Vec<Payload>,
-    ) -> BoxFuture<'static, Vec<Payload>> {
+    ) -> BoxFuture<'static, Result<Vec<Payload>, PayloadConversionError>> {
         (**self).encode(context, payloads)
     }
     fn decode(
         &self,
         context: &SerializationContextData,
         payloads: Vec<Payload>,
-    ) -> BoxFuture<'static, Vec<Payload>> {
+    ) -> BoxFuture<'static, Result<Vec<Payload>, PayloadConversionError>> {
         (**self).decode(context, payloads)
     }
 }
@@ -351,10 +405,7 @@ impl DecodablePayloads {
         &self,
     ) -> Result<T, PayloadConversionError> {
         self.payload_converter.from_payloads(
-            &SerializationContext {
-                data: &self.context,
-                converter: &self.payload_converter,
-            },
+            &SerializationContext::new(&self.context, &self.payload_converter),
             self.payloads.clone(),
         )
     }
@@ -398,10 +449,7 @@ impl RawValue {
         RawValue::new(vec![
             converter
                 .to_payload(
-                    &SerializationContext {
-                        data: &SerializationContextData::None,
-                        converter,
-                    },
+                    &SerializationContext::new(&SerializationContextData::None, converter),
                     value,
                 )
                 .unwrap(),
@@ -412,10 +460,7 @@ impl RawValue {
     pub fn to_value<T: TemporalDeserializable + 'static>(self, converter: &PayloadConverter) -> T {
         converter
             .from_payload(
-                &SerializationContext {
-                    data: &SerializationContextData::None,
-                    converter,
-                },
+                &SerializationContext::new(&SerializationContextData::None, converter),
                 self.payloads.into_iter().next().unwrap(),
             )
             .unwrap()
@@ -492,31 +537,55 @@ impl GenericPayloadConverter for PayloadConverter {
         context: &SerializationContext<'_>,
         val: &T,
     ) -> Result<Payload, PayloadConversionError> {
-        // If a single payload is explicitly needed for `()`, then produce a null payload
-        if std::any::TypeId::of::<T>() == std::any::TypeId::of::<()>() {
-            return Ok(Payload {
-                metadata: {
-                    let mut hm = HashMap::new();
-                    hm.insert("encoding".to_string(), b"binary/null".to_vec());
-                    hm
-                },
-                data: vec![],
-                external_payloads: vec![],
-            });
+        match self {
+            PayloadConverter::Serde(pc) => {
+                if let Some(well_known_type) = WellKnownType::of::<T>() {
+                    Ok(well_known_type.to_payload(val))
+                } else {
+                    pc.to_payload(context.data, val.as_serde()?)
+                }
+            }
+            PayloadConverter::UseWrappers => T::to_payload(val, context),
+            PayloadConverter::Composite(composite) => {
+                for converter in &composite.converters {
+                    match converter.to_payload(context, val) {
+                        Ok(payload) => return Ok(payload),
+                        Err(PayloadConversionError::WrongEncoding) => continue,
+                        Err(e) => return Err(e),
+                    }
+                }
+                Err(PayloadConversionError::WrongEncoding)
+            }
         }
-        let mut payloads = self.to_payloads(context, val)?;
-        if payloads.len() != 1 {
-            return Err(PayloadConversionError::WrongEncoding);
-        }
-        Ok(payloads.pop().unwrap())
     }
 
     fn from_payload<T: TemporalDeserializable + 'static>(
         &self,
         context: &SerializationContext<'_>,
-        payload: Payload,
+        mut payload: Payload,
     ) -> Result<T, PayloadConversionError> {
-        self.from_payloads(context, vec![payload])
+        match self {
+            PayloadConverter::Serde(pc) => {
+                if let Some(well_known_type) = WellKnownType::of::<T>() {
+                    payload = match well_known_type.try_from_payload(payload) {
+                        Ok(value) => return Ok(value),
+                        Err(payload) => payload,
+                    };
+                }
+                T::from_serde(pc.as_ref(), context, payload)
+            }
+            PayloadConverter::UseWrappers => T::from_payload(context, payload),
+            PayloadConverter::Composite(composite) => {
+                for converter in &composite.converters {
+                    match converter.from_payload(context, payload.clone()) {
+                        Ok(value) => return Ok(value),
+                        Err(PayloadConversionError::WrongEncoding) => continue,
+                        Err(e) => return Err(e),
+                    }
+                }
+                Err(PayloadConversionError::WrongEncoding)
+            }
+        }
     }
 
     fn to_payloads<T: TemporalSerializable + 'static>(
@@ -526,10 +595,8 @@ impl GenericPayloadConverter for PayloadConverter {
     ) -> Result<Vec<Payload>, PayloadConversionError> {
         match self {
             PayloadConverter::Serde(pc) => {
-                // Since Rust SDK uses () to denote no input, we must match other SDKs by producing
-                // no payloads for it.
-                if std::any::TypeId::of::<T>() == std::any::TypeId::of::<()>() {
-                    Ok(Vec::new())
+                if let Some(well_known_type) = WellKnownType::of::<T>() {
+                    Ok(well_known_type.to_payloads(val))
                 } else {
                     Ok(vec![pc.to_payload(context.data, val.as_serde()?)?])
                 }
@@ -551,23 +618,21 @@ impl GenericPayloadConverter for PayloadConverter {
     fn from_payloads<T: TemporalDeserializable + 'static>(
         &self,
         context: &SerializationContext<'_>,
-        payloads: Vec<Payload>,
+        mut payloads: Vec<Payload>,
     ) -> Result<T, PayloadConversionError> {
-        // Accept empty payloads (no args) and a single binary/null payload (result from a
-        // workflow/update with () return type as ().
-        if std::any::TypeId::of::<T>() == std::any::TypeId::of::<()>()
-            && is_unit_payloads(&payloads)
-        {
-            let boxed: Box<dyn std::any::Any> = Box::new(());
-            return Ok(*boxed.downcast::<T>().unwrap());
-        }
-
         match self {
             PayloadConverter::Serde(pc) => {
+                if let Some(well_known_type) = WellKnownType::of::<T>() {
+                    payloads = match well_known_type.try_from_payloads(payloads) {
+                        Ok(value) => return Ok(value),
+                        Err(payloads) => payloads,
+                    };
+                }
                 if payloads.len() != 1 {
                     return Err(PayloadConversionError::WrongEncoding);
                 }
-                T::from_serde(pc.as_ref(), context, payloads.into_iter().next().unwrap())
+                let payload = payloads.into_iter().next().unwrap();
+                T::from_serde(pc.as_ref(), context, payload)
             }
             PayloadConverter::UseWrappers => T::from_payloads(context, payloads),
             PayloadConverter::Composite(composite) => {
@@ -581,21 +646,6 @@ impl GenericPayloadConverter for PayloadConverter {
                 Err(PayloadConversionError::WrongEncoding)
             }
         }
-    }
-}
-
-fn is_unit_payloads(payloads: &[Payload]) -> bool {
-    match payloads {
-        [] => true,
-        [payload] => {
-            payload.data.is_empty()
-                && payload
-                    .metadata
-                    .get("encoding")
-                    .map(|encoding| encoding == b"binary/null")
-                    .unwrap_or(false)
-        }
-        _ => false,
     }
 }
 
@@ -635,10 +685,16 @@ impl ErasedSerdePayloadConverter for SerdeJsonPayloadConverter {
     ) -> Result<Payload, PayloadConversionError> {
         let as_json = serde_json::to_vec(value)
             .map_err(|e| PayloadConversionError::EncodingError(e.into()))?;
+        if as_json.as_slice() == b"null" {
+            return Ok(binary_null_payload());
+        }
         Ok(Payload {
             metadata: {
                 let mut hm = HashMap::new();
-                hm.insert("encoding".to_string(), b"json/plain".to_vec());
+                hm.insert(
+                    ENCODING_PAYLOAD_KEY.to_string(),
+                    JSON_ENCODING_VAL.as_bytes().to_vec(),
+                );
                 hm
             },
             data: as_json,
@@ -651,12 +707,18 @@ impl ErasedSerdePayloadConverter for SerdeJsonPayloadConverter {
         _: &SerializationContextData,
         payload: Payload,
     ) -> Result<Box<dyn erased_serde::Deserializer<'static>>, PayloadConversionError> {
-        let encoding = payload.metadata.get("encoding").map(|v| v.as_slice());
-        if encoding != Some(b"json/plain".as_slice()) {
+        let encoding = payload
+            .metadata
+            .get(ENCODING_PAYLOAD_KEY)
+            .map(|v| v.as_slice());
+        let json_v = if encoding == Some(JSON_ENCODING_VAL.as_bytes()) {
+            serde_json::from_slice(&payload.data)
+                .map_err(|e| PayloadConversionError::EncodingError(Box::new(e)))?
+        } else if encoding == Some(BINARY_NULL_ENCODING_VAL.as_bytes()) {
+            serde_json::Value::Null
+        } else {
             return Err(PayloadConversionError::WrongEncoding);
-        }
-        let json_v: serde_json::Value = serde_json::from_slice(&payload.data)
-            .map_err(|e| PayloadConversionError::EncodingError(Box::new(e)))?;
+        };
         Ok(Box::new(<dyn erased_serde::Deserializer>::erase(json_v)))
     }
 }
@@ -691,7 +753,10 @@ where
         Ok(Payload {
             metadata: {
                 let mut hm = HashMap::new();
-                hm.insert("encoding".to_string(), b"binary/protobuf".to_vec());
+                hm.insert(
+                    ENCODING_PAYLOAD_KEY.to_string(),
+                    PROTOBUF_ENCODING_VAL.as_bytes().to_vec(),
+                );
                 hm
             },
             data: as_proto,
@@ -710,8 +775,8 @@ where
     where
         Self: Sized,
     {
-        let encoding = p.metadata.get("encoding").map(|v| v.as_slice());
-        if encoding != Some(b"binary/protobuf".as_slice()) {
+        let encoding = p.metadata.get(ENCODING_PAYLOAD_KEY).map(|v| v.as_slice());
+        if encoding != Some(PROTOBUF_ENCODING_VAL.as_bytes()) {
             return Err(PayloadConversionError::WrongEncoding);
         }
         T::decode(p.data.as_slice())
@@ -730,7 +795,7 @@ impl Default for DataConverter {
     fn default() -> Self {
         Self::new(
             PayloadConverter::default(),
-            DefaultFailureConverter,
+            DefaultFailureConverter::default(),
             DefaultPayloadCodec,
         )
     }
@@ -740,15 +805,15 @@ impl PayloadCodec for DefaultPayloadCodec {
         &self,
         _: &SerializationContextData,
         payloads: Vec<Payload>,
-    ) -> BoxFuture<'static, Vec<Payload>> {
-        async move { payloads }.boxed()
+    ) -> BoxFuture<'static, Result<Vec<Payload>, PayloadConversionError>> {
+        async move { Ok(payloads) }.boxed()
     }
     fn decode(
         &self,
         _: &SerializationContextData,
         payloads: Vec<Payload>,
-    ) -> BoxFuture<'static, Vec<Payload>> {
-        async move { payloads }.boxed()
+    ) -> BoxFuture<'static, Result<Vec<Payload>, PayloadConversionError>> {
+        async move { Ok(payloads) }.boxed()
     }
 }
 
@@ -814,28 +879,14 @@ impl_multi_args!(MultiArgs6; 6; 0: A, 1: B, 2: C, 3: D, 4: E, 5: F);
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::data_converters::well_known::BINARY_PLAIN_ENCODING_VAL;
+    use rstest::rstest;
 
     #[test]
-    fn test_empty_payloads_as_unit_type() {
-        let converter = PayloadConverter::default();
-        let ctx = SerializationContext {
-            data: &SerializationContextData::Workflow,
-            converter: &converter,
-        };
-
-        let empty_payloads: Vec<Payload> = vec![];
-        let result: Result<(), _> = converter.from_payloads(&ctx, empty_payloads);
-
-        assert!(result.is_ok(), "Empty payloads should deserialize as ()");
-    }
-
-    #[test]
-    fn test_unit_type_roundtrip_serde() {
+    fn unit_payloads_roundtrip() {
         let converter = PayloadConverter::serde_json();
-        let ctx = SerializationContext {
-            data: &SerializationContextData::Workflow,
-            converter: &converter,
-        };
+        let context_data = SerializationContextData::Workflow(WorkflowSerializationContext::new());
+        let ctx = SerializationContext::new(&context_data, &converter);
 
         let payloads = converter.to_payloads(&ctx, &()).unwrap();
         assert!(payloads.is_empty());
@@ -844,46 +895,108 @@ mod tests {
         assert_eq!(result, ());
     }
 
-    #[test]
-    fn test_unit_composite_roundtrip() {
+    #[rstest]
+    #[case::unit((), BINARY_NULL_ENCODING_VAL, b"")]
+    #[case::none_string(Option::<String>::None, BINARY_NULL_ENCODING_VAL, b"")]
+    #[case::some_string(
+        Some("value".to_string()),
+        JSON_ENCODING_VAL,
+        br#""value""#
+    )]
+    #[case::bytes(vec![0_u8, 1, 2, 255], BINARY_PLAIN_ENCODING_VAL, &[0, 1, 2, 255])]
+    #[case::some_bytes(
+        Some(vec![1_u8, 2, 3]),
+        BINARY_PLAIN_ENCODING_VAL,
+        &[1, 2, 3]
+    )]
+    #[case::none_bytes(Option::<Vec<u8>>::None, BINARY_NULL_ENCODING_VAL, b"")]
+    fn value_encodes_as<T>(
+        #[case] value: T,
+        #[case] expected_encoding: &str,
+        #[case] expected_data: &[u8],
+    ) where
+        T: TemporalSerializable + std::fmt::Debug + 'static,
+    {
         let converter = PayloadConverter::default();
-        let ctx = SerializationContext {
-            data: &SerializationContextData::Workflow,
-            converter: &converter,
-        };
+        let context_data = SerializationContextData::Workflow(WorkflowSerializationContext::new());
+        let ctx = SerializationContext::new(&context_data, &converter);
 
-        let payloads = converter.to_payloads(&ctx, &()).unwrap();
-        assert!(payloads.is_empty());
+        let payload = converter.to_payload(&ctx, &value).unwrap();
 
-        let result: () = converter.from_payloads(&ctx, payloads).unwrap();
-        assert_eq!(result, ());
+        assert_eq!(
+            payload.metadata.get(ENCODING_PAYLOAD_KEY).unwrap(),
+            expected_encoding.as_bytes()
+        );
+        assert_eq!(payload.data, expected_data);
     }
 
-    #[test]
-    fn test_unit_to_payload_roundtrip() {
+    #[rstest]
+    #[case::unit(BINARY_NULL_ENCODING_VAL, b"", ())]
+    #[case::none_string(BINARY_NULL_ENCODING_VAL, b"", Option::<String>::None)]
+    #[case::legacy_none_string(JSON_ENCODING_VAL, b"null", Option::<String>::None)]
+    #[case::bytes(BINARY_PLAIN_ENCODING_VAL, &[0, 1, 2, 255], vec![0_u8, 1, 2, 255])]
+    #[case::legacy_bytes(JSON_ENCODING_VAL, b"[3,2,1]", vec![3_u8, 2, 1])]
+    #[case::some_bytes(
+        BINARY_PLAIN_ENCODING_VAL,
+        &[1, 2, 3],
+        Some(vec![1_u8, 2, 3])
+    )]
+    #[case::none_bytes(BINARY_NULL_ENCODING_VAL, b"", Option::<Vec<u8>>::None)]
+    #[case::legacy_some_bytes(
+        JSON_ENCODING_VAL,
+        b"[3,2,1]",
+        Some(vec![3_u8, 2, 1])
+    )]
+    #[case::legacy_none_bytes(JSON_ENCODING_VAL, b"null", Option::<Vec<u8>>::None)]
+    fn payload_decodes_as<T>(#[case] encoding: &str, #[case] data: &[u8], #[case] expected: T)
+    where
+        T: TemporalDeserializable + std::fmt::Debug + PartialEq + 'static,
+    {
         let converter = PayloadConverter::default();
-        let ctx = SerializationContext {
-            data: &SerializationContextData::Workflow,
-            converter: &converter,
-        };
+        let context_data = SerializationContextData::Workflow(WorkflowSerializationContext::new());
+        let ctx = SerializationContext::new(&context_data, &converter);
 
-        let mut payloads = vec![converter.to_payload(&ctx, &()).unwrap()];
-        assert!(is_unit_payloads(&payloads));
-        let result: () = converter
-            .from_payload(&ctx, payloads.pop().unwrap())
+        let actual: T = converter
+            .from_payload(
+                &ctx,
+                Payload {
+                    metadata: HashMap::from([(
+                        ENCODING_PAYLOAD_KEY.to_string(),
+                        encoding.as_bytes().to_vec(),
+                    )]),
+                    data: data.to_vec(),
+                    external_payloads: vec![],
+                },
+            )
             .unwrap();
-        assert_eq!(result, ());
+        assert_eq!(actual, expected);
     }
 
     #[test]
-    fn test_unit_use_wrappers_returns_wrong_encoding() {
+    fn use_wrappers_returns_wrong_encoding_for_standard_types() {
         let converter = PayloadConverter::UseWrappers;
-        let ctx = SerializationContext {
-            data: &SerializationContextData::Workflow,
-            converter: &converter,
-        };
+        let context_data = SerializationContextData::Workflow(WorkflowSerializationContext::new());
+        let ctx = SerializationContext::new(&context_data, &converter);
+
+        let result = converter.to_payload(&ctx, &());
+        assert!(
+            matches!(result, Err(PayloadConversionError::WrongEncoding)),
+            "{result:?}"
+        );
 
         let result = converter.to_payloads(&ctx, &());
+        assert!(
+            matches!(result, Err(PayloadConversionError::WrongEncoding)),
+            "{result:?}"
+        );
+
+        let result = converter.to_payloads(&ctx, &vec![1_u8, 2, 3]);
+        assert!(
+            matches!(result, Err(PayloadConversionError::WrongEncoding)),
+            "{result:?}"
+        );
+
+        let result: Result<(), _> = converter.from_payload(&ctx, binary_null_payload());
         assert!(
             matches!(result, Err(PayloadConversionError::WrongEncoding)),
             "{result:?}"
@@ -893,10 +1006,8 @@ mod tests {
     #[test]
     fn multi_args_round_trip() {
         let converter = PayloadConverter::default();
-        let ctx = SerializationContext {
-            data: &SerializationContextData::Workflow,
-            converter: &converter,
-        };
+        let context_data = SerializationContextData::Workflow(WorkflowSerializationContext::new());
+        let ctx = SerializationContext::new(&context_data, &converter);
 
         let args = MultiArgs2("hello".to_string(), 42i32);
         let payloads = converter.to_payloads(&ctx, &args).unwrap();
@@ -907,57 +1018,51 @@ mod tests {
     }
 
     #[test]
+    fn empty_payloads_do_not_decode_as_option() {
+        let converter = PayloadConverter::default();
+        let context_data = SerializationContextData::Workflow(WorkflowSerializationContext::new());
+        let ctx = SerializationContext::new(&context_data, &converter);
+
+        let result: Result<Option<String>, _> = converter.from_payloads(&ctx, vec![]);
+        assert!(matches!(result, Err(PayloadConversionError::WrongEncoding)));
+    }
+
+    #[test]
     fn multi_args_from_tuple() {
         let args: MultiArgs2<String, i32> = ("hello".to_string(), 42i32).into();
         assert_eq!(args, MultiArgs2("hello".to_string(), 42));
     }
 
-    fn decodable_from_value<T: TemporalSerializable + 'static>(value: &T) -> DecodablePayloads {
+    #[rstest]
+    #[case::string("hello".to_string())]
+    #[case::some_string(Some("hello".to_string()))]
+    #[case::none_string(Option::<String>::None)]
+    #[case::unit(())]
+    #[case::strings(vec!["hello".to_string(), "world".to_string()])]
+    #[case::bytes(vec![1_u8, 2, 3])]
+    #[case::some_bytes(Some(vec![1_u8, 2, 3]))]
+    #[case::none_bytes(Option::<Vec<u8>>::None)]
+    fn decodable_payloads_roundtrip<T>(#[case] value: T)
+    where
+        T: TemporalSerializable + TemporalDeserializable + std::fmt::Debug + PartialEq + 'static,
+    {
         let converter = PayloadConverter::default();
         let payloads = converter
             .to_payloads(
-                &SerializationContext {
-                    data: &SerializationContextData::Workflow,
-                    converter: &converter,
-                },
-                value,
+                &SerializationContext::new(
+                    &SerializationContextData::Workflow(WorkflowSerializationContext::new()),
+                    &converter,
+                ),
+                &value,
             )
             .unwrap();
-        DecodablePayloads::new(payloads, converter, SerializationContextData::Workflow)
-    }
-    #[test]
-    fn decodable_payloads_roundtrip_string() {
-        let payloads = decodable_from_value(&"hello".to_string());
+        let payloads = DecodablePayloads::new(
+            payloads,
+            converter,
+            SerializationContextData::Workflow(WorkflowSerializationContext::new()),
+        );
 
-        let result: String = payloads.deserialize().unwrap();
-
-        assert_eq!(result, "hello");
-    }
-
-    #[test]
-    fn decodable_payloads_roundtrip_option_string() {
-        let payloads = decodable_from_value(&Some("hello".to_string()));
-
-        let result: Option<String> = payloads.deserialize().unwrap();
-
-        assert_eq!(result, Some("hello".to_string()));
-    }
-
-    #[test]
-    fn decodable_payloads_roundtrip_unit() {
-        let payloads = decodable_from_value(&());
-
-        let result: () = payloads.deserialize().unwrap();
-
-        assert_eq!(result, ());
-    }
-
-    #[test]
-    fn decodable_payloads_roundtrip_vec_string() {
-        let payloads = decodable_from_value(&vec!["hello".to_string(), "world".to_string()]);
-
-        let result: Vec<String> = payloads.deserialize().unwrap();
-
-        assert_eq!(result, vec!["hello".to_string(), "world".to_string()]);
+        let result: T = payloads.deserialize().unwrap();
+        assert_eq!(result, value);
     }
 }

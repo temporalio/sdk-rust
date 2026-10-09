@@ -13,6 +13,7 @@ import "google/protobuf/empty.proto";
 import "temporal/api/failure/v1/message.proto";
 import "temporal/api/update/v1/message.proto";
 import "temporal/api/common/v1/message.proto";
+import "temporal/api/enums/v1/failed_cause.proto";
 import "temporal/api/enums/v1/workflow.proto";
 import "temporal/sdk/core/activity_result/activity_result.proto";
 import "temporal/sdk/core/child_workflow/child_workflow.proto";
@@ -211,6 +212,10 @@ message InitializeWorkflow {
     temporal.api.common.v1.WorkflowExecution root_workflow = 24;
     // Priority of this workflow execution
     temporal.api.common.v1.Priority priority = 25;
+    // The run id recorded on the `WORKFLOW_EXECUTION_STARTED` event. Unlike the execution's current
+    // run id, this value is preserved across workflow resets. Mirrors the `original_execution_run_id`
+    // field from `WorkflowExecutionStartedEventAttributes`.
+    string original_execution_run_id = 26;
 }
 
 // Notify a workflow that a timer has fired
@@ -300,6 +305,8 @@ message SignalWorkflow {
     string identity = 3;
     // Headers attached to the signal
     map<string, temporal.api.common.v1.Payload> headers = 5;
+    // Event ID of the `WORKFLOW_EXECUTION_SIGNALED` history event that produced this job.
+    int64 originating_event_id = 6;
 }
 
 // Inform lang what the result of a call to `patched` or similar API should be -- this is always
@@ -315,15 +322,19 @@ message ResolveSignalExternalWorkflow {
     // If populated, this signal either failed to be sent or was cancelled depending on failure
     // type / info.
     temporal.api.failure.v1.Failure failure = 2;
+    // The server-reported cause when the signal failed. Unspecified when the signal succeeded or
+    // was cancelled before being sent.
+    temporal.api.enums.v1.SignalExternalWorkflowExecutionFailedCause cause = 3;
 }
 
 message ResolveRequestCancelExternalWorkflow {
     // Sequence number as provided by lang in the corresponding
     // RequestCancelExternalWorkflowExecution command
     uint32 seq = 1;
-    // If populated, this signal either failed to be sent or was cancelled depending on failure
-    // type / info.
+    // If populated, the cancellation request failed.
     temporal.api.failure.v1.Failure failure = 2;
+    // The server-reported cause when the cancellation request failed.
+    temporal.api.enums.v1.CancelExternalWorkflowExecutionFailedCause cause = 3;
 }
 
 // Lang is requested to invoke an update handler on the workflow. Lang should invoke the update

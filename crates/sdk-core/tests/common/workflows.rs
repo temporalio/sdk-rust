@@ -16,28 +16,27 @@ impl LaProblemWorkflow {
         ctx.execute_local_activity(
             StdActivities::delay,
             Duration::from_secs(15),
-            LocalActivityOptions {
-                retry_policy: RetryPolicy {
-                    initial_interval: Some(prost_dur!(from_micros(15))),
-                    backoff_coefficient: 1_000.,
-                    maximum_interval: Some(prost_dur!(from_millis(1500))),
-                    maximum_attempts: 4,
-                    non_retryable_error_types: vec![],
-                }
-                .into(),
-                timer_backoff_threshold: Some(Duration::from_secs(1)),
-                ..Default::default()
-            },
+            LocalActivityOptions::builder()
+                .retry_policy(
+                    RetryPolicy {
+                        initial_interval: Some(prost_dur!(from_micros(15))),
+                        backoff_coefficient: 1_000.,
+                        maximum_interval: Some(prost_dur!(from_millis(1500))),
+                        maximum_attempts: 4,
+                        non_retryable_error_types: vec![],
+                    }
+                    .into(),
+                )
+                .timer_backoff_threshold(Duration::from_secs(1))
+                .build(),
         )
-        .await
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+        .await?;
         ctx.execute_activity(
             StdActivities::delay,
             Duration::from_secs(15),
             ActivityOptions::start_to_close_timeout(Duration::from_secs(20)),
         )
-        .await
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+        .await?;
         Ok(())
     }
 }

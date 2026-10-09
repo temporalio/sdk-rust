@@ -23,15 +23,16 @@ use crate::{
     internal_flags::InternalFlags,
     pollers::TrackedPermittedTqResp,
     protosext::{ValidPollWFTQResponse, protocol_messages::IncomingProtocolMessage},
-    telemetry::{
-        VecDisplayer,
-        metrics::{self, FailureReason},
-    },
+    telemetry::{VecDisplayer, metrics},
     worker::{
         ActivitySlotKind, CompleteWfError, LocalActRequest, LocalActivityExecutionResult,
-        LocalActivityResolution, PollError, PostActivateHookData, WorkflowSlotKind,
+        LocalActivityResolution, NamespaceCapabilities, PollError, PostActivateHookData,
+        WorkflowSlotKind,
         activities::{ActivitiesFromWFTsHandle, LocalActivityManager},
-        client::{LegacyQueryResult, WorkerClient, WorkflowTaskCompletion},
+        client::{
+            LegacyQueryResult, REQUEST_TOO_LARGE_KEY, WorkerClient, WorkflowTaskCompletion,
+            payload_limit_violation_from,
+        },
         workflow::{
             history_update::HistoryPaginator,
             machines::MachineError,
@@ -58,12 +59,13 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
-use temporalio_client::{MESSAGE_TOO_LARGE_KEY, payload_limit_violation_from};
+use temporalio_client::MESSAGE_TOO_LARGE_KEY;
 use temporalio_common::{
     payload_limits::PayloadLimitViolation,
     protos::{
         TaskToken,
         coresdk::{
+            common::ExternalStorageMetrics,
             workflow_activation::{
                 QueryWorkflow, WorkflowActivation, WorkflowActivationJob,
                 remove_from_cache::EvictionReason, workflow_activation_job,
@@ -74,7 +76,9 @@ use temporalio_common::{
             },
         },
         temporal::api::{
-            command::v1::{Command as ProtoCommand, Command, command::Attributes},
+            command::v1::{
+                Command as ProtoCommand, Command, CommandAttributesExt, command::Attributes,
+            },
             common::v1::{
                 Memo, MeteringMetadata, RetryPolicy, SearchAttributes, WorkflowExecution,
             },
@@ -82,7 +86,7 @@ use temporalio_common::{
             failure::v1::{ApplicationFailureInfo, failure::FailureInfo},
             protocol::v1::Message as ProtocolMessage,
             query::v1::WorkflowQuery,
-            sdk::v1::{UserMetadata, WorkflowTaskCompletedMetadata},
+            sdk::v1::{EventGroupMarker, UserMetadata, WorkflowTaskCompletedMetadata},
             taskqueue::v1::StickyExecutionAttributes,
             workflowservice::v1::{PollActivityTaskQueueResponse, get_system_info_response},
         },
@@ -108,10 +112,9 @@ pub const LEGACY_QUERY_ID: &str = "legacy_query";
 /// What percentage of a WFT timeout we are willing to wait before sending a WFT heartbeat when
 /// necessary.
 const WFT_HEARTBEAT_TIMEOUT_FRACTION: f32 = 0.8;
-const MAX_EAGER_ACTIVITY_RESERVATIONS_PER_WORKFLOW_TASK: usize = 3;
 
 type Result<T, E = WFMachinesError> = result::Result<T, E>;
-type BoxedActivationStream = BoxStream<'static, Result<ActivationOrAuto, PollError>>;
+type BoxedActivationStream = BoxStream<'static, Result<WorkflowStreamAction, PollError>>;
 type InternalFlagsRef = Rc<RefCell<InternalFlags>>;
 
 /// Centralizes all state related to workflows and workflow tasks
@@ -130,11 +133,15 @@ pub(crate) struct Workflows {
     sticky_attrs: Option<StickyExecutionAttributes>,
     /// If set, can be used to reserve activity task slots for eager-return of new activity tasks.
     activity_tasks_handle: Option<ActivitiesFromWFTsHandle>,
+    /// Maximum number of activity slots to reserve for eager execution per workflow task.
+    max_eager_activity_reservations_per_workflow_task: usize,
     /// Ensures we stay at or below this worker's maximum concurrent workflow task limit
     wft_semaphore: MeteredPermitDealer<WorkflowSlotKind>,
     local_act_mgr: Option<Arc<LocalActivityManager>>,
     ever_polled: AtomicBool,
     default_versioning_behavior: Option<VersioningBehavior>,
+    namespace_capabilities: Arc<NamespaceCapabilities>,
+    shutdown_token: CancellationToken,
 }
 
 pub(crate) struct WorkflowBasics {
@@ -142,6 +149,7 @@ pub(crate) struct WorkflowBasics {
     pub(crate) shutdown_token: CancellationToken,
     pub(crate) metrics: MetricsContext,
     pub(crate) server_capabilities: get_system_info_response::Capabilities,
+    pub(crate) namespace_capabilities: Arc<NamespaceCapabilities>,
     pub(crate) sdk_name: String,
     pub(crate) sdk_version: String,
     pub(crate) default_versioning_behavior: Option<VersioningBehavior>,
@@ -177,7 +185,12 @@ impl Workflows {
         let (fetch_tx, fetch_rx) = unbounded_channel();
         let shutdown_tok = basics.shutdown_token.clone();
         let task_queue = basics.worker_config.task_queue.clone();
+        let max_eager_activity_reservations_per_workflow_task = basics
+            .worker_config
+            .max_eager_activity_reservations_per_workflow_task;
         let default_versioning_behavior = basics.default_versioning_behavior;
+        let namespace_capabilities = basics.namespace_capabilities.clone();
+        let shutdown_token = basics.shutdown_token.clone();
         let extracted_wft_stream = WFTExtractor::build(
             client.clone(),
             basics.worker_config.fetching_concurrency,
@@ -237,9 +250,9 @@ impl Workflows {
                                         .send(fetchreq)
                                         .expect("Fetch channel must not be dropped");
                                 }
-                                for act in o.activations {
+                                for action in o.actions {
                                     activation_tx
-                                        .send(Ok(act))
+                                        .send(Ok(action))
                                         .expect("Activation processor channel not dropped");
                                 }
                             }
@@ -264,17 +277,20 @@ impl Workflows {
             client,
             sticky_attrs,
             activity_tasks_handle,
+            max_eager_activity_reservations_per_workflow_task,
             wft_semaphore,
             local_act_mgr,
             ever_polled: AtomicBool::new(false),
             default_versioning_behavior,
+            namespace_capabilities,
+            shutdown_token,
         }
     }
 
     pub(super) async fn next_workflow_activation(&self) -> Result<WorkflowActivation, PollError> {
         self.ever_polled.store(true, atomic::Ordering::Release);
         loop {
-            let al = {
+            let action = {
                 let mut lock = self.activation_stream.lock().await;
                 let (stream, beginner) = lock.deref_mut();
                 if let Some(beginner) = beginner.take() {
@@ -282,49 +298,57 @@ impl Workflows {
                 }
                 stream.next().await.unwrap_or(Err(PollError::ShutDown))?
             };
-            match al {
-                ActivationOrAuto::LangActivation(mut act)
-                | ActivationOrAuto::ReadyForQueries(mut act) => {
-                    prepare_to_ship_activation(&mut act);
-                    debug!(activation=%act, "Sending activation to lang");
-                    break Ok(act);
-                }
-                ActivationOrAuto::Autocomplete { run_id } => {
-                    if let Err(e) = self
-                        .activation_completed(
-                            WorkflowActivationCompletion {
-                                run_id,
-                                status: Some(
-                                    workflow_completion::Success::from_variants(vec![]).into(),
-                                ),
-                            },
-                            true,
-                            // We need to say a type, but the type is irrelevant, so imagine some
-                            // boxed function we'll never call.
-                            Option::<Box<dyn Fn(PostActivateHookData) + Send>>::None,
-                        )
-                        .await
-                    {
-                        error!(error=?e, "Error while auto-completing workflow task");
+            match action {
+                WorkflowStreamAction::Activation(al) => match al {
+                    ActivationOrAuto::LangActivation(mut act)
+                    | ActivationOrAuto::ReadyForQueries(mut act) => {
+                        prepare_to_ship_activation(&mut act);
+                        debug!(activation=%act, "Sending activation to lang");
+                        break Ok(act);
                     }
-                }
-                ActivationOrAuto::AutoFail {
-                    run_id,
-                    machines_err,
-                } => {
-                    if let Err(e) = self
-                        .activation_completed(
-                            WorkflowActivationCompletion {
-                                run_id,
-                                status: Some(machines_err.as_failure().into()),
-                            },
-                            true,
-                            Option::<Box<dyn Fn(PostActivateHookData) + Send>>::None,
-                        )
-                        .await
-                    {
-                        error!(error=?e, "Error while auto-failing workflow task");
+                    ActivationOrAuto::Autocomplete { run_id } => {
+                        if let Err(e) = self
+                            .activation_completed(
+                                WorkflowActivationCompletion {
+                                    run_id,
+                                    status: Some(
+                                        workflow_completion::Success::from_variants(vec![]).into(),
+                                    ),
+                                    ..Default::default()
+                                },
+                                true,
+                                // We need to say a type, but the type is irrelevant, so imagine some
+                                // boxed function we'll never call.
+                                Option::<Box<dyn Fn(PostActivateHookData) + Send>>::None,
+                            )
+                            .await
+                        {
+                            error!(error=?e, "Error while auto-completing workflow task");
+                        }
                     }
+                    ActivationOrAuto::AutoFail {
+                        run_id,
+                        machines_err,
+                    } => {
+                        if let Err(e) = self
+                            .activation_completed(
+                                WorkflowActivationCompletion {
+                                    run_id,
+                                    status: Some(machines_err.as_failure().into()),
+                                    ..Default::default()
+                                },
+                                true,
+                                Option::<Box<dyn Fn(PostActivateHookData) + Send>>::None,
+                            )
+                            .await
+                        {
+                            error!(error=?e, "Error while auto-failing workflow task");
+                        }
+                    }
+                },
+                WorkflowStreamAction::FailUnstoredWft { run_id, report } => {
+                    self.handle_activation_failed(&run_id, Instant::now(), *report)
+                        .await;
                 }
             }
         }
@@ -382,6 +406,12 @@ impl Workflows {
                         nonfirst_local_activity_execution_attempts,
                     },
                     versioning_behavior,
+                    pagination_enabled: self
+                        .namespace_capabilities
+                        .workflow_task_completion_pagination(),
+                    wft_completion_size_limit: self
+                        .namespace_capabilities
+                        .workflow_task_completion_size_limit(),
                 };
                 let sticky_attrs = self.sticky_attrs.clone();
                 // Do not return new WFT if we would not cache, because returned new WFTs are
@@ -393,7 +423,11 @@ impl Workflows {
 
                 let mut reset_last_started_to = None;
                 self.handle_wft_reporting_errs(run_id, || async {
-                    match self.client.complete_workflow_task(completion).await {
+                    match self
+                        .client
+                        .complete_workflow_task(completion, self.shutdown_token.clone())
+                        .await
+                    {
                         Ok(response) => {
                             if let Some(record) = maybe_record_terminal_metric.take() {
                                 record(&run_metrics);
@@ -410,37 +444,43 @@ impl Workflows {
                             );
                         }
                         Err(e) => {
-                            let cause_reason_failure = if e
-                                .metadata()
-                                .contains_key(MESSAGE_TOO_LARGE_KEY)
-                                && attempt < 2
-                            {
-                                // gRPC message too large from server; skip on nonfirst attempts to
-                                // avoid spamming.
-                                Some((
-                                    WorkflowTaskFailedCause::GrpcMessageTooLarge,
-                                    FailureReason::GrpcMessageTooLarge,
-                                    make_grpc_message_too_large_failure(),
-                                ))
-                            } else {
-                                // Client layer rejected the completion for exceeding the worker's
-                                // payload error limit.
-                                payload_limit_violation_from(&e).map(|violation| {
-                                    (
-                                        WorkflowTaskFailedCause::PayloadsTooLarge,
-                                        FailureReason::PayloadsTooLarge,
-                                        make_payloads_too_large_failure(violation),
-                                    )
-                                })
-                            };
-                            if let Some((cause, reason, failure)) = cause_reason_failure {
-                                let new_outcome =
-                                    FailedActivationWFTReport::Report(task_token, cause, failure);
-                                self.handle_activation_failed(run_id, completion_time, new_outcome)
-                                    .await;
-                                run_metrics
-                                    .with_new_attrs([metrics::failure_reason(reason)])
-                                    .wf_task_failed();
+                            let cause_and_failure =
+                                if e.metadata().contains_key(REQUEST_TOO_LARGE_KEY) {
+                                    // Completion exceeds the namespace's recombined size limit, so the
+                                    // worker failed it proactively rather than sending doomed pages.
+                                    Some((
+                                        WorkflowTaskFailedCause::RequestTooLarge,
+                                        make_request_too_large_failure(),
+                                    ))
+                                } else if e.metadata().contains_key(MESSAGE_TOO_LARGE_KEY) {
+                                    Some((
+                                        WorkflowTaskFailedCause::GrpcMessageTooLarge,
+                                        make_grpc_message_too_large_failure(),
+                                    ))
+                                } else {
+                                    // Client layer rejected the completion for exceeding the worker's
+                                    // payload error limit.
+                                    payload_limit_violation_from(&e).map(|violation| {
+                                        (
+                                            WorkflowTaskFailedCause::PayloadsTooLarge,
+                                            make_payloads_too_large_failure(violation),
+                                        )
+                                    })
+                                };
+                            if let Some((cause, failure)) = cause_and_failure {
+                                self.handle_activation_failed(
+                                    run_id,
+                                    completion_time,
+                                    FailedActivationWFTReport::new(
+                                        task_token,
+                                        attempt,
+                                        cause,
+                                        failure,
+                                        WftFailureKind::Task,
+                                        &run_metrics,
+                                    ),
+                                )
+                                .await;
                             }
                             return Err(e);
                         }
@@ -469,35 +509,52 @@ impl Workflows {
         }
     }
 
+    /// The single point through which every workflow task failure passes on its way to the
+    /// server. A task failure is only sent for the first attempt of a task. Later attempts almost
+    /// always fail the same way, so reporting them would just spam the server with failures it
+    /// already knows about. Instead they are left to time out.
     async fn handle_activation_failed(
         &self,
         run_id: &str,
         completion_time: Instant,
-        outcome: FailedActivationWFTReport,
+        report: FailedActivationWFTReport,
     ) -> WFTReportStatus {
-        match outcome {
-            FailedActivationWFTReport::Report(tt, cause, failure) => {
-                warn!(run_id=%run_id, failure=?failure, "Failing workflow task");
-                self.handle_wft_reporting_errs(run_id, || async {
-                    self.client
-                        .fail_workflow_task(tt, cause, failure.failure)
-                        .await
-                })
-                .await;
-                WFTReportStatus::Reported {
-                    reset_last_started_to: None,
-                    completion_time,
-                }
-            }
-            FailedActivationWFTReport::ReportLegacyQueryFailure(task_token, failure) => {
+        let FailedActivationWFTReport {
+            task_token,
+            attempt,
+            cause,
+            failure,
+            kind,
+        } = report;
+        match kind {
+            WftFailureKind::LegacyQuery => {
                 warn!(run_id=%run_id, failure=?failure, "Failing legacy query request");
                 self.respond_legacy_query(task_token, LegacyQueryResult::Failed(failure))
                     .await;
-                WFTReportStatus::Reported {
-                    reset_last_started_to: None,
-                    completion_time,
-                }
             }
+            WftFailureKind::RetryableLegacyQuery => {
+                debug!(run_id=%run_id, failure=?failure,
+                       "Dropping legacy query with retryable failure");
+                return WFTReportStatus::DropWft { completion_time };
+            }
+            WftFailureKind::Task if attempt > 1 => {
+                debug!(run_id=%run_id, attempt, failure=?failure,
+                       "Not reporting workflow task failure on non-first attempt");
+                return WFTReportStatus::DropWft { completion_time };
+            }
+            WftFailureKind::Task => {
+                warn!(run_id=%run_id, failure=?failure, "Failing workflow task");
+                self.handle_wft_reporting_errs(run_id, || async {
+                    self.client
+                        .fail_workflow_task(task_token, cause, failure.failure)
+                        .await
+                })
+                .await;
+            }
+        }
+        WFTReportStatus::Reported {
+            reset_last_started_to: None,
+            completion_time,
         }
     }
 
@@ -519,12 +576,9 @@ impl Workflows {
                 )
                 .await
             }
-            ActivationCompleteOutcome::ReportWFTFail(outcome) => {
-                self.handle_activation_failed(run_id, completion_time, outcome)
+            ActivationCompleteOutcome::ReportWFTFail(report) => {
+                self.handle_activation_failed(run_id, completion_time, *report)
                     .await
-            }
-            ActivationCompleteOutcome::WFTFailedDontReport => {
-                WFTReportStatus::DropWft { completion_time }
             }
             ActivationCompleteOutcome::DoNothing => WFTReportStatus::NotReported,
         }
@@ -541,6 +595,7 @@ impl Workflows {
         post_activate_hook: Option<impl Fn(PostActivateHookData)>,
     ) -> Result<(), CompleteWfError> {
         let is_empty_completion = completion.is_empty();
+        let task_storage_metrics = TaskStorageMetrics::from_completion(&completion);
         let completion = validate_completion(completion, is_autocomplete)?;
         let run_id = completion.run_id().to_string();
         let (tx, rx) = oneshot::channel();
@@ -610,6 +665,7 @@ impl Workflows {
             wft_report_status,
             wft_from_complete: maybe_pwft,
             is_autocomplete,
+            task_storage_metrics,
         });
 
         Ok(())
@@ -638,7 +694,7 @@ impl Workflows {
             run_id: run_id.into(),
             message: message.into(),
             reason,
-            auto_reply_fail_tt: None,
+            auto_reply_fail: None,
         });
     }
 
@@ -826,7 +882,7 @@ impl Workflows {
                         .map(|q| q.name == self.task_queue)
                         .unwrap_or_default();
                     if same_task_queue
-                        && reserved.len() < MAX_EAGER_ACTIVITY_RESERVATIONS_PER_WORKFLOW_TASK
+                        && reserved.len() < self.max_eager_activity_reservations_per_workflow_task
                     {
                         if let Some(p) = self
                             .activity_tasks_handle
@@ -900,8 +956,20 @@ struct NextPageReq {
 
 #[derive(Debug)]
 struct WFStreamOutput {
-    activations: VecDeque<ActivationOrAuto>,
+    actions: VecDeque<WorkflowStreamAction>,
     fetch_histories: VecDeque<HistoryFetchReq>,
+}
+
+#[derive(Debug, derive_more::Display)]
+enum WorkflowStreamAction {
+    Activation(ActivationOrAuto),
+    /// Fail a WFT that could not be associated with a run and therefore cannot use the normal
+    /// activation completion path.
+    #[display("FailUnstoredWft(run_id={run_id})")]
+    FailUnstoredWft {
+        run_id: String,
+        report: Box<FailedActivationWFTReport>,
+    },
 }
 
 #[derive(Debug, derive_more::Display)]
@@ -1021,10 +1089,59 @@ struct WorkflowTaskInfo {
     wf_id: String,
 }
 
+/// Everything needed to tell the server a workflow task failed. Every path that fails a WFT
+/// must produce one of these via [FailedActivationWFTReport::new] and feed it to
+/// [Workflows::handle_activation_failed].
 #[derive(Debug)]
-enum FailedActivationWFTReport {
-    Report(TaskToken, WorkflowTaskFailedCause, Failure),
-    ReportLegacyQueryFailure(TaskToken, Failure),
+struct FailedActivationWFTReport {
+    task_token: TaskToken,
+    attempt: u32,
+    cause: WorkflowTaskFailedCause,
+    failure: Failure,
+    kind: WftFailureKind,
+}
+impl FailedActivationWFTReport {
+    /// Records the task-failed metric as part of constructing the report.
+    fn new(
+        task_token: TaskToken,
+        attempt: u32,
+        cause: WorkflowTaskFailedCause,
+        failure: Failure,
+        kind: WftFailureKind,
+        metrics: &MetricsContext,
+    ) -> Self {
+        metrics
+            .with_new_attrs([metrics::failure_reason(cause.into())])
+            .wf_task_failed();
+        Self {
+            task_token,
+            attempt,
+            cause,
+            failure,
+            kind,
+        }
+    }
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+enum WftFailureKind {
+    /// A normal workflow task, failed via the task failure API.
+    Task,
+    /// A legacy query, answered through the query response API rather than by failing the task.
+    /// The caller is blocked until an answer arrives, so these are always reported.
+    LegacyQuery,
+    /// A legacy query whose failure is transient and may succeed if retried. Failing the query
+    /// would surface that transient error to the caller, so the task is dropped unanswered.
+    RetryableLegacyQuery,
+}
+
+/// Identifies a WFT whose failure must be reported outside the normal activation completion path,
+/// because the run it belongs to was never stored or is being torn down.
+#[derive(Debug, Clone)]
+struct UnstoredWftFailInfo {
+    task_token: TaskToken,
+    attempt: u32,
+    workflow_type: String,
 }
 
 struct ServerCommandsWithWorkflowInfo {
@@ -1060,16 +1177,17 @@ pub(crate) enum ActivationAction {
 #[derive(Debug)]
 #[allow(clippy::large_enum_variant)]
 enum EvictionRequestResult {
-    EvictionRequested(Option<u32>, RunUpdateAct),
+    EvictionRequested(RunUpdateAct),
     NotFound,
-    EvictionAlreadyRequested(Option<u32>),
+    EvictionAlreadyRequested,
 }
 impl EvictionRequestResult {
     fn into_run_update_resp(self) -> RunUpdateAct {
         match self {
-            EvictionRequestResult::EvictionRequested(_, resp) => resp,
-            EvictionRequestResult::NotFound
-            | EvictionRequestResult::EvictionAlreadyRequested(_) => None,
+            EvictionRequestResult::EvictionRequested(resp) => resp,
+            EvictionRequestResult::NotFound | EvictionRequestResult::EvictionAlreadyRequested => {
+                None
+            }
         }
     }
 }
@@ -1126,16 +1244,33 @@ struct PostActivationMsg {
     wft_report_status: WFTReportStatus,
     wft_from_complete: Option<WFTWithPaginator>,
     is_autocomplete: bool,
+    task_storage_metrics: TaskStorageMetrics,
 }
+
+#[derive(Debug, Default, Clone)]
+struct TaskStorageMetrics {
+    download: Option<ExternalStorageMetrics>,
+    upload: Option<ExternalStorageMetrics>,
+}
+
+impl TaskStorageMetrics {
+    fn from_completion(completion: &WorkflowActivationCompletion) -> Self {
+        Self {
+            download: completion.payload_download_metrics.clone(),
+            upload: completion.payload_upload_metrics.clone(),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 struct RequestEvictMsg {
     run_id: String,
     message: String,
     reason: EvictionReason,
     /// If set, we requested eviction because something went wrong processing a brand new poll task,
-    /// which means we won't have stored the WFT and we need to track the task token separately so
-    /// we can reply with a failure to server after the evict goes through.
-    auto_reply_fail_tt: Option<TaskToken>,
+    /// which means we won't have stored the WFT and we need to track it separately so we can
+    /// reply with a failure to server after the evict goes through.
+    auto_reply_fail: Option<UnstoredWftFailInfo>,
 }
 #[derive(Debug)]
 pub(crate) struct HeartbeatTimeoutMsg {
@@ -1161,12 +1296,9 @@ enum ActivationCompleteOutcome {
     /// The WFT must be reported as successful to the server using the contained information.
     ReportWFTSuccess(ServerCommandsWithWorkflowInfo),
     /// The WFT must be reported as failed to the server using the contained information.
-    ReportWFTFail(FailedActivationWFTReport),
+    ReportWFTFail(Box<FailedActivationWFTReport>),
     /// There's nothing to do right now. EX: The workflow needs to keep replaying.
     DoNothing,
-    /// The workflow task failed, but we shouldn't report it. EX: We have failed 2 or more attempts
-    /// in a row.
-    WFTFailedDontReport,
 }
 /// Did we report, or not, completion of a WFT to server?
 #[derive(Debug, Copy, Clone)]
@@ -1179,7 +1311,7 @@ enum WFTReportStatus {
     /// work to be done. EX: Running LAs.
     NotReported,
     /// We didn't report, but we want to clear the outstanding workflow task anyway. See
-    /// [ActivationCompleteOutcome::WFTFailedDontReport].
+    /// [Workflows::handle_activation_failed] for when this happens.
     DropWft { completion_time: Instant },
 }
 impl WFTReportStatus {
@@ -1357,7 +1489,61 @@ struct EmptyWorkflowCommandErr;
 #[display("{}", variant)]
 struct WFCommand {
     variant: WFCommandVariant,
+    annotations: CommandAnnotations,
+}
+
+impl WFCommand {
+    fn new(variant: WFCommandVariant) -> Self {
+        Self {
+            variant,
+            annotations: CommandAnnotations::default(),
+        }
+    }
+}
+
+/// The lang-supplied decorations that ride along on a [WFCommand] and end up on the [ProtoCommand]
+/// we send to the server. They are kept together because a command machine must remember them in
+/// order to repeat them on any further command it issues, most notably a cancellation.
+#[derive(Debug, Default, Clone, PartialEq)]
+struct CommandAnnotations {
     metadata: Option<UserMetadata>,
+    event_group_markers: Vec<EventGroupMarker>,
+}
+
+impl CommandAnnotations {
+    /// Apply annotations lang attached to a cancellation command on top of the ones the command
+    /// being cancelled carried. Anything lang set explicitly wins; anything it left out is
+    /// inherited, which is what makes a cancellation land in the same event group as the command
+    /// it cancels even when it is issued from somewhere no group is active.
+    fn override_with(&mut self, other: Self) {
+        if let Some(other_metadata) = other.metadata {
+            let metadata = self.metadata.get_or_insert_with(UserMetadata::default);
+            if let Some(summary) = other_metadata.summary {
+                metadata.summary = Some(summary);
+            }
+            if let Some(details) = other_metadata.details {
+                metadata.details = Some(details);
+            }
+        }
+        if !other.event_group_markers.is_empty() {
+            self.event_group_markers = other.event_group_markers;
+        }
+    }
+}
+
+trait ProtoCommandExt {
+    fn new(attributes: Attributes, annotations: CommandAnnotations) -> Self;
+}
+
+impl ProtoCommandExt for ProtoCommand {
+    fn new(attributes: Attributes, annotations: CommandAnnotations) -> Self {
+        Self {
+            command_type: attributes.as_type() as i32,
+            attributes: Some(attributes),
+            user_metadata: annotations.metadata,
+            event_group_markers: annotations.event_group_markers,
+        }
+    }
 }
 
 #[derive(Debug, derive_more::From, derive_more::Display)]
@@ -1451,7 +1637,10 @@ impl TryFrom<WorkflowCommand> for WFCommand {
         };
         Ok(Self {
             variant,
-            metadata: c.user_metadata,
+            annotations: CommandAnnotations {
+                metadata: c.user_metadata,
+                event_group_markers: c.event_group_markers,
+            },
         })
     }
 }
@@ -1738,6 +1927,25 @@ fn make_grpc_message_too_large_failure() -> Failure {
     }
 }
 
+fn make_request_too_large_failure() -> Failure {
+    Failure {
+        failure: Some(
+            temporalio_common::protos::temporal::api::failure::v1::Failure {
+                message: "Workflow task completion exceeds the namespace size limit".to_string(),
+                failure_info: Some(FailureInfo::ApplicationFailureInfo(
+                    ApplicationFailureInfo {
+                        r#type: "RequestTooLarge".to_string(),
+                        non_retryable: true,
+                        ..Default::default()
+                    },
+                )),
+                ..Default::default()
+            },
+        ),
+        force_cause: WorkflowTaskFailedCause::RequestTooLarge as i32,
+    }
+}
+
 fn make_payloads_too_large_failure(violation: &PayloadLimitViolation) -> Failure {
     Failure {
         failure: Some(
@@ -1761,8 +1969,34 @@ fn make_payloads_too_large_failure(violation: &PayloadLimitViolation) -> Failure
 mod tests {
     use super::*;
     use itertools::Itertools;
-    use temporalio_common::payload_limits::{LimitClass, LimitSeverity};
-    use temporalio_common::protos::coresdk::workflow_activation::SignalWorkflow;
+    use temporalio_common::{
+        payload_limits::{LimitClass, LimitSeverity},
+        protos::coresdk::workflow_activation::SignalWorkflow,
+    };
+
+    #[test]
+    fn task_storage_metrics_from_completion_keeps_directions_distinct() {
+        let download = ExternalStorageMetrics {
+            payload_count: 2,
+            total_size_bytes: 1024,
+            driver_names: vec!["s3".to_string()],
+            ..Default::default()
+        };
+        let upload = ExternalStorageMetrics {
+            payload_count: 3,
+            total_size_bytes: 2048,
+            driver_names: vec!["gcs".to_string()],
+            ..Default::default()
+        };
+        let completion = WorkflowActivationCompletion {
+            payload_download_metrics: Some(download.clone()),
+            payload_upload_metrics: Some(upload.clone()),
+            ..Default::default()
+        };
+        let metrics = TaskStorageMetrics::from_completion(&completion);
+        assert_eq!(metrics.download, Some(download));
+        assert_eq!(metrics.upload, Some(upload));
+    }
 
     #[test]
     fn payloads_too_large_wft_failure_is_retryable() {

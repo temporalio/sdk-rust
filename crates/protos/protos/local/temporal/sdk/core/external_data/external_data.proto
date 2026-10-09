@@ -28,6 +28,10 @@ message LocalActivityMarkerData {
   // The time the LA was originally scheduled (wall clock time). This is used to track
   // schedule-to-close timeouts when timer-based backoffs are used
   google.protobuf.Timestamp original_schedule_time = 7;
+  // Position, within the workflow task, of the activation this resolution was delivered in.
+  // Replay must deliver resolutions in the same activations because workflow code can branch on
+  // which handles are ready. Absent in markers written by Core versions that predate this field.
+  optional uint64 activation_index = 8;
 }
 
 message PatchedMarkerData {

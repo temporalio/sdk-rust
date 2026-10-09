@@ -4,7 +4,9 @@ use crate::protos::{coresdk, temporal};
 use std::str::FromStr;
 
 /// Identifies a specific version of a worker deployment.
-#[derive(Clone, Debug, Eq, PartialEq, Hash)]
+#[derive(Clone, Debug, Eq, PartialEq, Hash, bon::Builder)]
+#[builder(on(String, into), state_mod(vis = "pub"))]
+#[non_exhaustive]
 pub struct WorkerDeploymentVersion {
     /// Name of the deployment
     pub deployment_name: String,

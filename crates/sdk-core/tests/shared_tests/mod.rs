@@ -37,12 +37,11 @@ use temporalio_common::{
             workflowservice::v1::{DescribeNamespaceRequest, ListWorkflowExecutionsRequest},
         },
     },
-    worker::WorkerTaskTypes,
 };
 use temporalio_macros::{activities, workflow, workflow_methods};
 use temporalio_sdk::{
     ActivityOptions, CancellableFuture, SyncWorkflowContext, WorkflowContext, WorkflowResult,
-    WorkflowTermination, activities::ActivityContext,
+    activities::ActivityContext,
 };
 use tokio::{
     net::TcpListener,
@@ -242,7 +241,6 @@ pub(crate) async fn grpc_message_too_large() {
     let mut starter = CoreWfStarter::new_cloud_or_local(wf_name, "")
         .await
         .unwrap();
-    starter.sdk_config.task_types = WorkerTaskTypes::workflow_only();
     starter.sdk_config.disable_payload_error_limit = true;
     starter
         .sdk_config
@@ -306,8 +304,7 @@ impl ShutdownTimerActivityLoopWf {
                 (),
                 ActivityOptions::start_to_close_timeout(Duration::from_secs(10)),
             )
-            .await
-            .map_err(|e| WorkflowTermination::from(anyhow::Error::from(e)))?;
+            .await?;
         }
     }
 }
@@ -326,11 +323,12 @@ pub(crate) async fn shutdown_during_active_timer_activity_workflows() {
         } else {
             return;
         };
-    starter.sdk_config.register_activities(StdActivities);
-    let mut worker = starter.worker().await;
-    worker
+    starter
+        .sdk_config
+        .register_activities(StdActivities)
         .register_workflow::<ShutdownTimerActivityLoopWf>()
         .unwrap();
+    let mut worker = starter.worker().await;
 
     let core = worker.core_worker();
     core.validate().await.unwrap();
@@ -374,7 +372,7 @@ pub(crate) async fn shutdown_during_active_timer_activity_workflows() {
         "Worker shutdown took {shutdown_elapsed:?}, expected < 5s"
     );
 
-    let client = starter.get_client().await;
+    let client = starter.get_core_client().await;
     for wf_id in &wf_ids {
         client
             .get_workflow_handle::<UntypedWorkflow>(wf_id)
@@ -385,10 +383,10 @@ pub(crate) async fn shutdown_during_active_timer_activity_workflows() {
         let history = client
             .get_workflow_handle::<UntypedWorkflow>(wf_id)
             .fetch_history(WorkflowFetchHistoryOptions::default())
+            .into_events()
             .await
             .unwrap();
         let bad_events: Vec<_> = history
-            .events()
             .iter()
             .filter(|e| match &e.attributes {
                 Some(history_event::Attributes::WorkflowTaskFailedEventAttributes(f))
@@ -408,9 +406,14 @@ pub(crate) async fn shutdown_during_active_timer_activity_workflows() {
 }
 
 /// Verifies that activity cancellation is delivered via the nexus worker command channel
-/// even when the activity does not heartbeat.
-pub(crate) async fn activity_cancel_delivered_without_heartbeat() {
-    let wf_name = "activity_cancel_delivered_without_heartbeat";
+/// even when the activity does not heartbeat. When `disable_eager` is false, the activity
+/// is eagerly dispatched.
+pub(crate) async fn activity_cancel_delivered_without_heartbeat(disable_eager: bool) {
+    let wf_name = if disable_eager {
+        "activity_cancel_delivered_without_heartbeat"
+    } else {
+        "activity_cancel_delivered_without_heartbeat_eager"
+    };
     let mut starter = CoreWfStarter::new_cloud_or_local(wf_name, "")
         .await
         .unwrap();
@@ -441,15 +444,6 @@ pub(crate) async fn activity_cancel_delivered_without_heartbeat() {
     starter
         .sdk_config
         .register_activities(WaitForCancelActivities);
-    let mut worker = starter.worker().await;
-    if !worker
-        .core_worker()
-        .get_namespace_capabilities()
-        .worker_commands()
-    {
-        warn!("Skipping test: worker_commands not supported in this namespace");
-        return;
-    }
 
     #[workflow]
     #[derive(Default)]
@@ -460,7 +454,7 @@ pub(crate) async fn activity_cancel_delivered_without_heartbeat() {
     #[workflow_methods]
     impl CancelWithoutHeartbeatWorkflow {
         #[run]
-        async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<()> {
+        async fn run(ctx: &mut WorkflowContext<Self>, disable_eager: bool) -> WorkflowResult<()> {
             let act_fut = ctx.execute_activity(
                 WaitForCancelActivities::wait_for_cancel,
                 "hi".to_string(),
@@ -470,17 +464,14 @@ pub(crate) async fn activity_cancel_delivered_without_heartbeat() {
                         ..Default::default()
                     })
                     .cancellation_type(ActivityCancellationType::WaitCancellationCompleted)
-                    // TODO: enable eager dispatch once server supports it for worker commands.
-                    .do_not_eagerly_execute(true)
+                    .do_not_eagerly_execute(disable_eager)
                     .build(),
             );
             // ensure the activity is started on a worker before cancelling, so the cancel goes
             // through the worker commands path.
-            ctx.wait_condition(|s| s.act_started).await;
+            ctx.wait_condition(|s| s.act_started).await?;
             act_fut.cancel();
-            act_fut
-                .await
-                .map_err(|e| WorkflowTermination::from(anyhow::Error::from(e)))?;
+            act_fut.await?;
             Ok(())
         }
 
@@ -490,15 +481,25 @@ pub(crate) async fn activity_cancel_delivered_without_heartbeat() {
         }
     }
 
-    worker
+    starter
+        .sdk_config
         .register_workflow::<CancelWithoutHeartbeatWorkflow>()
         .unwrap();
+    let mut worker = starter.worker().await;
+    if !worker
+        .core_worker()
+        .get_namespace_capabilities()
+        .worker_commands()
+    {
+        warn!("Skipping test: worker_commands not supported in this namespace");
+        return;
+    }
 
     let task_queue = starter.get_task_queue().to_owned();
     let handle = worker
         .submit_workflow(
             CancelWithoutHeartbeatWorkflow::run,
-            (),
+            disable_eager,
             WorkflowStartOptions::new(task_queue, wf_name.to_owned())
                 .run_timeout(Duration::from_secs(10))
                 .build(),

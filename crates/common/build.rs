@@ -261,7 +261,11 @@ impl PayloadVisitorGenerator {
             }
         }
 
-        // Process oneofs
+        // Process oneofs in index order. This ordering reaches the generated file, and
+        // iterating the map directly emits a different field order on every build.
+        let mut oneof_fields: Vec<(i32, Vec<&FieldDescriptorProto>)> =
+            oneof_fields.into_iter().collect();
+        oneof_fields.sort_by_key(|(oneof_index, _)| *oneof_index);
         for (oneof_index, oneof_field_list) in oneof_fields {
             let oneof_desc = &msg.oneof_decl[oneof_index as usize];
             let oneof_name = oneof_desc.name.as_deref().unwrap_or("");
@@ -338,8 +342,12 @@ impl PayloadVisitorGenerator {
         let mut output = String::new();
         output.push_str("// Generated from descriptors.bin - DO NOT EDIT\n\n");
 
-        // Generate impls for each payload-containing type
-        for name in self.model.payload_containing.iter() {
+        // Generate impls for each payload-containing type, in name order. This output is
+        // compiled, so iterating the set directly emits the same impls in a different
+        // order on every build.
+        let mut payload_containing: Vec<&String> = self.model.payload_containing.iter().collect();
+        payload_containing.sort();
+        for name in payload_containing {
             if name == "temporal.api.common.v1.Payload" || name == "temporal.api.common.v1.Payloads"
             {
                 continue;
@@ -372,9 +380,10 @@ impl crate::payload_visitor::PayloadVisitable for {rust_path} {{
     fn visit_payloads_mut<'a>(
         &'a mut self,
         visitor: &'a mut (dyn crate::payload_visitor::AsyncPayloadVisitor + Send),
-    ) -> futures::future::BoxFuture<'a, ()> {{
+    ) -> futures::future::BoxFuture<'a, Result<(), crate::data_converters::PayloadConversionError>> {{
         Box::pin(async move {{
-{impl_body}        }})
+{impl_body}            Ok(())
+        }})
     }}
 }}
 "#,
@@ -398,7 +407,7 @@ impl crate::payload_visitor::PayloadVisitable for {rust_path} {{
             visitor.visit(crate::payload_visitor::PayloadField {{
                 path: "{path}",
                 data: crate::payload_visitor::PayloadFieldData::Single(payload),
-            }}).await;
+            }}).await?;
         }}
 "#,
                     field = rust_field,
@@ -410,7 +419,7 @@ impl crate::payload_visitor::PayloadVisitable for {rust_path} {{
                     r#"        visitor.visit(crate::payload_visitor::PayloadField {{
             path: "{path}",
             data: crate::payload_visitor::PayloadFieldData::Repeated(&mut self.{field}),
-        }}).await;
+        }}).await?;
 "#,
                     field = rust_field,
                     path = proto_path
@@ -422,7 +431,7 @@ impl crate::payload_visitor::PayloadVisitable for {rust_path} {{
             visitor.visit(crate::payload_visitor::PayloadField {{
                 path: "{path}",
                 data: crate::payload_visitor::PayloadFieldData::Payloads(payloads),
-            }}).await;
+            }}).await?;
         }}
 "#,
                     field = rust_field,
@@ -435,7 +444,7 @@ impl crate::payload_visitor::PayloadVisitable for {rust_path} {{
             visitor.visit(crate::payload_visitor::PayloadField {{
                 path: "{path}",
                 data: crate::payload_visitor::PayloadFieldData::Single(payload),
-            }}).await;
+            }}).await?;
         }}
 "#,
                     field = rust_field,
@@ -445,7 +454,7 @@ impl crate::payload_visitor::PayloadVisitable for {rust_path} {{
             PayloadFieldKind::MapNestedMessage => {
                 format!(
                     r#"        for item in self.{field}.values_mut() {{
-            item.visit_payloads_mut(visitor).await;
+            item.visit_payloads_mut(visitor).await?;
         }}
 "#,
                     field = rust_field
@@ -465,7 +474,7 @@ impl crate::payload_visitor::PayloadVisitable for {rust_path} {{
                 if is_field_repeated {
                     format!(
                         r#"        for item in &mut self.{field} {{
-            item.visit_payloads_mut(visitor).await;
+            item.visit_payloads_mut(visitor).await?;
         }}
 "#,
                         field = rust_field
@@ -473,7 +482,7 @@ impl crate::payload_visitor::PayloadVisitable for {rust_path} {{
                 } else {
                     format!(
                         r#"        if let Some(msg) = &mut self.{field} {{
-            msg.visit_payloads_mut(visitor).await;
+            msg.visit_payloads_mut(visitor).await?;
         }}
 "#,
                         field = rust_field
@@ -497,7 +506,7 @@ impl crate::payload_visitor::PayloadVisitable for {rust_path} {{
                 for variant in variants {
                     let variant_name = to_pascal_case(&variant.name);
                     arms.push_str(&format!(
-                        "                {enum_path}::{variant}(msg) => msg.visit_payloads_mut(visitor).await,\n",
+                        "                {enum_path}::{variant}(msg) => msg.visit_payloads_mut(visitor).await?,\n",
                         enum_path = enum_path,
                         variant = variant_name
                     ));
@@ -748,6 +757,7 @@ const BLOB_FIELDS: &[&str] = &[
     "temporal.api.command.v1.SignalExternalWorkflowExecutionCommandAttributes.input",
     "temporal.api.command.v1.StartChildWorkflowExecutionCommandAttributes.input",
     "temporal.api.command.v1.UpsertWorkflowSearchAttributesCommandAttributes.search_attributes", // indexed_fields data-sum
+    "temporal.api.common.v1.Callback.NexusHandler.source_context",
     "temporal.api.protocol.v1.Message.body", // whole Any body; see EXTRA_WHOLE_MESSAGE_LEAVES
     "temporal.api.query.v1.WorkflowQuery.query_args",
     "temporal.api.workflow.v1.NewWorkflowExecutionInfo.input",

@@ -25,8 +25,9 @@ use temporalio_common::{
 };
 use temporalio_macros::{workflow, workflow_methods};
 use temporalio_sdk::{
-    ActivityOptions, ContinueAsNewOptions, ContinueAsNewVersioningBehavior, SyncWorkflowContext,
-    WorkflowContext, WorkflowResult,
+    ActivityOptions, ChildWorkflowOptions, ChildWorkflowStartError, ContinueAsNewOptions,
+    ContinueAsNewVersioningBehavior, StartChildWorkflowExecutionFailedCause, SyncWorkflowContext,
+    VersioningOverride, WorkflowContext, WorkflowResult,
 };
 use temporalio_sdk_core::test_help::WorkerTestHelpers;
 use tokio::join;
@@ -38,18 +39,17 @@ async fn sets_deployment_info_on_task_responses(#[values(true, false)] use_defau
     let wf_type = "sets_deployment_info_on_task_responses";
     let mut starter = CoreWfStarter::new(wf_type);
     let deploy_name = format!("deployment-{}", starter.get_task_queue());
-    let version = WorkerDeploymentVersion {
-        deployment_name: deploy_name.clone(),
-        build_id: "1.0".to_string(),
-    };
-    starter.sdk_config.deployment_options = WorkerDeploymentOptions {
-        version: version.clone(),
-        use_worker_versioning: true,
-        default_versioning_behavior: Some(VersioningBehavior::AutoUpgrade),
-    };
-    starter.sdk_config.task_types = WorkerTaskTypes::workflow_only();
-    let core = starter.get_worker().await;
-    let client = starter.get_client().await;
+    let version = WorkerDeploymentVersion::builder()
+        .deployment_name(deploy_name.clone())
+        .build_id("1.0".to_string())
+        .build();
+    starter.sdk_config.deployment_options = WorkerDeploymentOptions::new(version.clone())
+        .use_worker_versioning(true)
+        .default_versioning_behavior(VersioningBehavior::AutoUpgrade)
+        .build();
+    starter.set_core_task_types(WorkerTaskTypes::workflow_only());
+    let core = starter.get_core_worker().await;
+    let client = starter.get_core_client().await;
 
     // A bit annoying. We have to start up polling here so that the deployment will exist before
     // we can describe it and then set the current version.
@@ -69,6 +69,7 @@ async fn sets_deployment_info_on_task_responses(#[values(true, false)] use_defau
         core.complete_workflow_activation(WorkflowActivationCompletion {
             run_id: res.run_id.clone(),
             status: Some(success_complete.into()),
+            ..Default::default()
         })
         .await
         .unwrap();
@@ -173,21 +174,22 @@ async fn activity_has_deployment_stamp() {
     let wf_name = "activity_has_deployment_stamp";
     let mut starter = CoreWfStarter::new(wf_name);
     let deploy_name = format!("deployment-{}", starter.get_task_queue());
-    starter.sdk_config.deployment_options = WorkerDeploymentOptions {
-        version: WorkerDeploymentVersion {
-            deployment_name: deploy_name.clone(),
-            build_id: "1.0".to_string(),
-        },
-        use_worker_versioning: true,
-        default_versioning_behavior: Some(VersioningBehavior::AutoUpgrade),
-    };
+    starter.sdk_config.deployment_options = WorkerDeploymentOptions::new(
+        WorkerDeploymentVersion::builder()
+            .deployment_name(deploy_name.clone())
+            .build_id("1.0".to_string())
+            .build(),
+    )
+    .use_worker_versioning(true)
+    .default_versioning_behavior(VersioningBehavior::AutoUpgrade)
+    .build();
     starter.sdk_config.register_activities(StdActivities);
-    let mut worker = starter.worker().await;
-    let client = starter.get_client().await;
-
-    worker
+    starter
+        .sdk_config
         .register_workflow::<ActivityHasDeploymentStampWf>()
         .unwrap();
+    let mut worker = starter.worker().await;
+    let client = starter.get_core_client().await;
     let submitter = worker.get_submitter_handle();
     let shutdown_handle = worker.inner_mut().shutdown_handle();
 
@@ -269,16 +271,15 @@ async fn versioning_off_with_custom_build_id() {
     let wf_type = "versioning_off_with_custom_build_id";
     let mut starter = CoreWfStarter::new(wf_type);
     let build_id = "my-custom-build-id-1.0";
-    starter.sdk_config.deployment_options = WorkerDeploymentOptions {
-        version: WorkerDeploymentVersion {
-            deployment_name: format!("deployment-{}", starter.get_task_queue()),
-            build_id: build_id.to_string(),
-        },
-        use_worker_versioning: false,
-        default_versioning_behavior: None,
-    };
-    starter.sdk_config.task_types = WorkerTaskTypes::workflow_only();
-    let core = starter.get_worker().await;
+    starter.sdk_config.deployment_options = WorkerDeploymentOptions::new(
+        WorkerDeploymentVersion::builder()
+            .deployment_name(format!("deployment-{}", starter.get_task_queue()))
+            .build_id(build_id.to_string())
+            .build(),
+    )
+    .build();
+    starter.set_core_task_types(WorkerTaskTypes::workflow_only());
+    let core = starter.get_core_worker().await;
     starter.start_wf().await;
 
     let res = core.poll_workflow_activation().await.unwrap();
@@ -290,6 +291,7 @@ async fn versioning_off_with_custom_build_id() {
             ])
             .into(),
         ),
+        ..Default::default()
     })
     .await
     .unwrap();
@@ -332,11 +334,11 @@ impl ContinueAsNewAutoUpgradeV1 {
             return Ok("v1.0".to_string());
         }
         ctx.wait_condition(|state| state.should_continue_as_new)
-            .await;
+            .await?;
         assert!(ctx.target_worker_deployment_version_changed());
         let mut options = ContinueAsNewOptions::default();
         options.initial_versioning_behavior = Some(ContinueAsNewVersioningBehavior::AutoUpgrade);
-        ctx.continue_as_new(&(attempt + 1), options)?;
+        ctx.continue_as_new(attempt + 1, options)?;
         Ok("v1.0".to_string())
     }
 
@@ -363,30 +365,29 @@ async fn continue_as_new_auto_upgrade_uses_current_deployment_version() {
     let wf_type = "continue_as_new_auto_upgrade_uses_current_deployment_version";
     let mut starter = CoreWfStarter::new(wf_type);
     let deploy_name = format!("deployment-{}", starter.get_task_queue());
-    let v1 = WorkerDeploymentVersion {
-        deployment_name: deploy_name.clone(),
-        build_id: "1.0".to_string(),
-    };
-    let v2 = WorkerDeploymentVersion {
-        deployment_name: deploy_name.clone(),
-        build_id: "2.0".to_string(),
-    };
+    let v1 = WorkerDeploymentVersion::builder()
+        .deployment_name(deploy_name.clone())
+        .build_id("1.0".to_string())
+        .build();
+    let v2 = WorkerDeploymentVersion::builder()
+        .deployment_name(deploy_name.clone())
+        .build_id("2.0".to_string())
+        .build();
     starter.sdk_config.deployment_options = versioned_worker_options(v1.clone());
-    starter.sdk_config.task_types = WorkerTaskTypes::workflow_only();
-    let mut worker1 = starter.worker().await;
-    worker1
-        .register_workflow::<ContinueAsNewAutoUpgradeV1>()
-        .unwrap();
-
     let mut starter2 = starter.clone_no_worker();
     starter2.sdk_config.deployment_options = versioned_worker_options(v2.clone());
-    starter2.sdk_config.task_types = WorkerTaskTypes::workflow_only();
-    let mut worker2 = starter2.worker().await;
-    worker2
+    starter
+        .sdk_config
+        .register_workflow::<ContinueAsNewAutoUpgradeV1>()
+        .unwrap();
+    starter2
+        .sdk_config
         .register_workflow::<ContinueAsNewAutoUpgradeV2>()
         .unwrap();
+    let mut worker1 = starter.worker().await;
+    let mut worker2 = starter2.worker().await;
 
-    let client = starter.get_client().await;
+    let client = starter.get_core_client().await;
     let task_queue = starter.get_task_queue().to_owned();
     let workflow_id = starter.get_wf_id();
     let shutdown1 = worker1.inner_mut().shutdown_handle();
@@ -460,11 +461,11 @@ impl ContinueAsNewUseRampingVersionV1 {
             return Ok("v1.0".to_string());
         }
         ctx.wait_condition(|state| state.should_continue_as_new)
-            .await;
+            .await?;
         let mut options = ContinueAsNewOptions::default();
         options.initial_versioning_behavior =
             Some(ContinueAsNewVersioningBehavior::UseRampingVersion);
-        ctx.continue_as_new(&(attempt + 1), options)?;
+        ctx.continue_as_new(attempt + 1, options)?;
         Ok("v1.0".to_string())
     }
 
@@ -491,30 +492,29 @@ async fn continue_as_new_use_ramping_version_uses_ramping_deployment_version() {
     let wf_type = "continue_as_new_use_ramping_version_uses_ramping_deployment_version";
     let mut starter = CoreWfStarter::new(wf_type);
     let deploy_name = format!("deployment-{}", starter.get_task_queue());
-    let v1 = WorkerDeploymentVersion {
-        deployment_name: deploy_name.clone(),
-        build_id: "1.0".to_string(),
-    };
-    let v2 = WorkerDeploymentVersion {
-        deployment_name: deploy_name.clone(),
-        build_id: "2.0".to_string(),
-    };
+    let v1 = WorkerDeploymentVersion::builder()
+        .deployment_name(deploy_name.clone())
+        .build_id("1.0".to_string())
+        .build();
+    let v2 = WorkerDeploymentVersion::builder()
+        .deployment_name(deploy_name.clone())
+        .build_id("2.0".to_string())
+        .build();
     starter.sdk_config.deployment_options = versioned_worker_options(v1.clone());
-    starter.sdk_config.task_types = WorkerTaskTypes::workflow_only();
-    let mut worker1 = starter.worker().await;
-    worker1
-        .register_workflow::<ContinueAsNewUseRampingVersionV1>()
-        .unwrap();
-
     let mut starter2 = starter.clone_no_worker();
     starter2.sdk_config.deployment_options = versioned_worker_options(v2.clone());
-    starter2.sdk_config.task_types = WorkerTaskTypes::workflow_only();
-    let mut worker2 = starter2.worker().await;
-    worker2
+    starter
+        .sdk_config
+        .register_workflow::<ContinueAsNewUseRampingVersionV1>()
+        .unwrap();
+    starter2
+        .sdk_config
         .register_workflow::<ContinueAsNewUseRampingVersionV2>()
         .unwrap();
+    let mut worker1 = starter.worker().await;
+    let mut worker2 = starter2.worker().await;
 
-    let client = starter.get_client().await;
+    let client = starter.get_core_client().await;
     let task_queue = starter.get_task_queue().to_owned();
     let workflow_id = starter.get_wf_id();
     let shutdown1 = worker1.inner_mut().shutdown_handle();
@@ -575,12 +575,404 @@ async fn continue_as_new_use_ramping_version_uses_ramping_deployment_version() {
     .unwrap();
 }
 
-fn versioned_worker_options(version: WorkerDeploymentVersion) -> WorkerDeploymentOptions {
-    WorkerDeploymentOptions {
-        version,
-        use_worker_versioning: true,
-        default_versioning_behavior: Some(VersioningBehavior::Pinned),
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+enum ChildVersioningOverrideCase {
+    Pinned,
+    AutoUpgrade,
+    OneTime,
+    Invalid,
+}
+
+#[workflow]
+#[derive(Default)]
+struct ChildVersioningOverrideParent {
+    start_child: bool,
+}
+
+#[workflow_methods]
+impl ChildVersioningOverrideParent {
+    #[run]
+    async fn run(
+        ctx: &mut WorkflowContext<Self>,
+        (kind, deployment_name, child_id): (ChildVersioningOverrideCase, String, String),
+    ) -> WorkflowResult<String> {
+        ctx.wait_condition(|state| state.start_child).await?;
+        let target = WorkerDeploymentVersion::builder()
+            .deployment_name(deployment_name)
+            .build_id("2.0".to_string())
+            .build();
+        let versioning_override = match kind {
+            ChildVersioningOverrideCase::Pinned => VersioningOverride::Pinned(target),
+            ChildVersioningOverrideCase::AutoUpgrade => VersioningOverride::AutoUpgrade,
+            ChildVersioningOverrideCase::OneTime => VersioningOverride::OneTime(target),
+            ChildVersioningOverrideCase::Invalid => VersioningOverride::Pinned(
+                WorkerDeploymentVersion::builder()
+                    .deployment_name(String::new())
+                    .build_id(String::new())
+                    .build(),
+            ),
+        };
+        let child = ctx
+            .start_child_workflow(
+                ChildVersioningOverrideChild::run,
+                (),
+                ChildWorkflowOptions::builder()
+                    .workflow_id(child_id)
+                    .versioning_override(versioning_override)
+                    .build(),
+            )
+            .await;
+        if kind == ChildVersioningOverrideCase::Invalid {
+            assert!(matches!(
+                child,
+                Err(ChildWorkflowStartError::StartFailed {
+                    cause: StartChildWorkflowExecutionFailedCause::InvalidVersioningOverride,
+                    ..
+                })
+            ));
+            return Ok("invalid override rejected".to_string());
+        }
+        Ok(child.expect("child should start").result().await?)
     }
+
+    #[signal]
+    fn start_child(&mut self, _ctx: &mut SyncWorkflowContext<Self>, _: ()) {
+        self.start_child = true;
+    }
+}
+
+#[workflow]
+struct ChildVersioningOverrideChild {
+    build_id: String,
+    finish: bool,
+}
+
+#[workflow_methods(factory_only)]
+impl ChildVersioningOverrideChild {
+    #[run]
+    async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<String> {
+        ctx.wait_condition(|state| state.finish).await?;
+        Ok(ctx.state(|state| state.build_id.clone()))
+    }
+
+    #[signal]
+    fn finish(&mut self, _ctx: &mut SyncWorkflowContext<Self>, _: ()) {
+        self.finish = true;
+    }
+}
+
+#[rstest::rstest]
+#[tokio::test]
+async fn child_workflow_versioning_override(
+    #[values(VersioningBehavior::Pinned, VersioningBehavior::AutoUpgrade)]
+    parent_behavior: VersioningBehavior,
+    #[values(
+        ChildVersioningOverrideCase::Pinned,
+        ChildVersioningOverrideCase::AutoUpgrade,
+        ChildVersioningOverrideCase::OneTime,
+        ChildVersioningOverrideCase::Invalid
+    )]
+    kind: ChildVersioningOverrideCase,
+) {
+    let mut starter = CoreWfStarter::new("child_workflow_versioning_override");
+    let deployment_name = format!("deployment-{}", starter.get_task_queue());
+    let v1 = WorkerDeploymentVersion::builder()
+        .deployment_name(deployment_name.clone())
+        .build_id("1.0".to_string())
+        .build();
+    let v2 = WorkerDeploymentVersion::builder()
+        .deployment_name(deployment_name.clone())
+        .build_id("2.0".to_string())
+        .build();
+    starter.sdk_config.deployment_options = WorkerDeploymentOptions::new(v1.clone())
+        .use_worker_versioning(true)
+        .default_versioning_behavior(parent_behavior)
+        .build();
+    let mut starter2 = starter.clone_no_worker();
+    starter2.sdk_config.deployment_options = WorkerDeploymentOptions::new(v2.clone())
+        .use_worker_versioning(true)
+        .default_versioning_behavior(VersioningBehavior::AutoUpgrade)
+        .build();
+    for (config, build_id) in [
+        (&mut starter.sdk_config, "1.0"),
+        (&mut starter2.sdk_config, "2.0"),
+    ] {
+        config
+            .register_workflow::<ChildVersioningOverrideParent>()
+            .unwrap();
+        config
+            .register_workflow_with_factory::<ChildVersioningOverrideChild, _>(move || {
+                ChildVersioningOverrideChild {
+                    build_id: build_id.to_string(),
+                    finish: false,
+                }
+            })
+            .unwrap();
+    }
+    let mut worker1 = starter.worker().await;
+    let mut worker2 = starter2.worker().await;
+    let shutdown1 = worker1.inner_mut().shutdown_handle();
+    let shutdown2 = worker2.inner_mut().shutdown_handle();
+    let client = starter.get_core_client().await;
+    let child_id = format!("{}-child", starter.get_wf_id());
+
+    let client_task = async {
+        wait_for_worker_deployment_version(&client, &deployment_name, &v1).await;
+        wait_for_worker_deployment_version(&client, &deployment_name, &v2).await;
+        set_current_deployment_version(&client, &deployment_name, &v1).await;
+        wait_for_worker_deployment_routing(&client, &deployment_name, Some(&v1), None, None).await;
+        let parent = client
+            .start_workflow(
+                ChildVersioningOverrideParent::run,
+                (kind, deployment_name.clone(), child_id.clone()),
+                WorkflowStartOptions::new(starter.get_task_queue().to_owned(), starter.get_wf_id())
+                    .build(),
+            )
+            .await
+            .unwrap();
+        wait_for_workflow_deployment_version(
+            &client,
+            &parent.info().workflow_id,
+            parent.run_id().unwrap_or_default(),
+            &v1,
+        )
+        .await;
+        if kind == ChildVersioningOverrideCase::AutoUpgrade {
+            set_current_deployment_version(&client, &deployment_name, &v2).await;
+            wait_for_worker_deployment_routing(&client, &deployment_name, Some(&v2), None, None)
+                .await;
+        }
+        parent
+            .signal(
+                ChildVersioningOverrideParent::start_child,
+                (),
+                WorkflowSignalOptions::default(),
+            )
+            .await
+            .unwrap();
+        if kind != ChildVersioningOverrideCase::Invalid {
+            wait_for_workflow_deployment_version(&client, &child_id, "", &v2).await;
+            let description = client
+                .connection()
+                .clone()
+                .describe_workflow_execution(
+                    DescribeWorkflowExecutionRequest {
+                        namespace: client.namespace(),
+                        execution: Some(WorkflowExecution {
+                            workflow_id: child_id.clone(),
+                            run_id: String::new(),
+                        }),
+                    }
+                    .into_request(),
+                )
+                .await
+                .unwrap()
+                .into_inner();
+            let info = description
+                .workflow_execution_info
+                .unwrap()
+                .versioning_info
+                .unwrap();
+            // One-time routing must not leave a persistent override on the child.
+            assert_eq!(
+                info.versioning_override.is_some(),
+                kind != ChildVersioningOverrideCase::OneTime
+            );
+            client
+                .get_workflow_handle::<child_versioning_override_child::Run>(&child_id)
+                .signal(
+                    ChildVersioningOverrideChild::finish,
+                    (),
+                    WorkflowSignalOptions::default(),
+                )
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            parent.get_result(Default::default()).await.unwrap(),
+            if kind == ChildVersioningOverrideCase::Invalid {
+                "invalid override rejected"
+            } else if kind == ChildVersioningOverrideCase::OneTime {
+                "1.0"
+            } else {
+                "2.0"
+            }
+        );
+        shutdown1();
+        shutdown2();
+    };
+    tokio::time::timeout(Duration::from_secs(60), async {
+        join!(
+            async { worker1.inner_mut().run().await.unwrap() },
+            async { worker2.inner_mut().run().await.unwrap() },
+            client_task
+        );
+    })
+    .await
+    .unwrap();
+}
+
+#[rstest::rstest]
+#[case(ChildVersioningOverrideCase::Pinned, false)]
+#[case(ChildVersioningOverrideCase::AutoUpgrade, false)]
+#[case(ChildVersioningOverrideCase::OneTime, false)]
+#[case(ChildVersioningOverrideCase::Pinned, true)]
+#[case(ChildVersioningOverrideCase::AutoUpgrade, true)]
+#[tokio::test]
+async fn client_workflow_versioning_override(
+    #[case] kind: ChildVersioningOverrideCase,
+    #[case] signal_with_start: bool,
+) {
+    let mut starter = CoreWfStarter::new("client_workflow_versioning_override");
+    let deployment_name = format!("deployment-{}", starter.get_task_queue());
+    let v1 = WorkerDeploymentVersion::builder()
+        .deployment_name(deployment_name.clone())
+        .build_id("1.0".to_string())
+        .build();
+    let v2 = WorkerDeploymentVersion::builder()
+        .deployment_name(deployment_name.clone())
+        .build_id("2.0".to_string())
+        .build();
+    starter.sdk_config.deployment_options = versioned_worker_options(v1.clone());
+    let mut starter2 = starter.clone_no_worker();
+    starter2.sdk_config.deployment_options = WorkerDeploymentOptions::new(v2.clone())
+        .use_worker_versioning(true)
+        .default_versioning_behavior(VersioningBehavior::AutoUpgrade)
+        .build();
+    for (config, build_id) in [
+        (&mut starter.sdk_config, "1.0"),
+        (&mut starter2.sdk_config, "2.0"),
+    ] {
+        config
+            .register_workflow_with_factory::<ChildVersioningOverrideChild, _>(move || {
+                ChildVersioningOverrideChild {
+                    build_id: build_id.to_string(),
+                    finish: false,
+                }
+            })
+            .unwrap();
+    }
+    let mut worker1 = starter.worker().await;
+    let mut worker2 = starter2.worker().await;
+    let shutdown1 = worker1.inner_mut().shutdown_handle();
+    let shutdown2 = worker2.inner_mut().shutdown_handle();
+    let client = starter.get_core_client().await;
+
+    let client_task = async {
+        wait_for_worker_deployment_version(&client, &deployment_name, &v1).await;
+        wait_for_worker_deployment_version(&client, &deployment_name, &v2).await;
+        set_current_deployment_version(&client, &deployment_name, &v1).await;
+        wait_for_worker_deployment_routing(&client, &deployment_name, Some(&v1), None, None).await;
+        let versioning_override = match kind {
+            ChildVersioningOverrideCase::Pinned => {
+                temporalio_common::VersioningOverride::Pinned(v2.clone())
+            }
+            ChildVersioningOverrideCase::AutoUpgrade => {
+                temporalio_common::VersioningOverride::AutoUpgrade
+            }
+            ChildVersioningOverrideCase::OneTime => {
+                temporalio_common::VersioningOverride::OneTime(v2.clone())
+            }
+            ChildVersioningOverrideCase::Invalid => unreachable!(),
+        };
+        let options =
+            WorkflowStartOptions::new(starter.get_task_queue().to_owned(), starter.get_wf_id())
+                .versioning_override(versioning_override)
+                .build();
+        let handle = if signal_with_start {
+            client
+                .signal_with_start_workflow(
+                    ChildVersioningOverrideChild::run,
+                    (),
+                    ChildVersioningOverrideChild::finish,
+                    (),
+                    options,
+                )
+                .await
+                .unwrap()
+        } else {
+            client
+                .start_workflow(ChildVersioningOverrideChild::run, (), options)
+                .await
+                .unwrap()
+        };
+        let initial_version = if kind == ChildVersioningOverrideCase::AutoUpgrade {
+            &v1
+        } else {
+            &v2
+        };
+        wait_for_workflow_deployment_version(
+            &client,
+            &handle.info().workflow_id,
+            handle.run_id().unwrap_or_default(),
+            initial_version,
+        )
+        .await;
+        let description = client
+            .connection()
+            .clone()
+            .describe_workflow_execution(
+                DescribeWorkflowExecutionRequest {
+                    namespace: client.namespace(),
+                    execution: Some(WorkflowExecution {
+                        workflow_id: handle.info().workflow_id.clone(),
+                        run_id: handle.run_id().unwrap_or_default().to_string(),
+                    }),
+                }
+                .into_request(),
+            )
+            .await
+            .unwrap()
+            .into_inner();
+        let info = description
+            .workflow_execution_info
+            .unwrap()
+            .versioning_info
+            .unwrap();
+        assert_eq!(
+            info.versioning_override.is_some(),
+            kind != ChildVersioningOverrideCase::OneTime
+        );
+        if kind == ChildVersioningOverrideCase::OneTime {
+            assert_eq!(info.behavior, ProtoVersioningBehavior::AutoUpgrade as i32);
+        }
+        if !signal_with_start {
+            handle
+                .signal(
+                    ChildVersioningOverrideChild::finish,
+                    (),
+                    WorkflowSignalOptions::default(),
+                )
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            handle.get_result(Default::default()).await.unwrap(),
+            if kind == ChildVersioningOverrideCase::Pinned {
+                "2.0"
+            } else {
+                "1.0"
+            }
+        );
+        shutdown1();
+        shutdown2();
+    };
+    tokio::time::timeout(Duration::from_secs(60), async {
+        join!(
+            async { worker1.inner_mut().run().await.unwrap() },
+            async { worker2.inner_mut().run().await.unwrap() },
+            client_task
+        );
+    })
+    .await
+    .unwrap();
+}
+
+fn versioned_worker_options(version: WorkerDeploymentVersion) -> WorkerDeploymentOptions {
+    WorkerDeploymentOptions::new(version)
+        .use_worker_versioning(true)
+        .default_versioning_behavior(VersioningBehavior::Pinned)
+        .build()
 }
 
 async fn try_describe_worker_deployment(

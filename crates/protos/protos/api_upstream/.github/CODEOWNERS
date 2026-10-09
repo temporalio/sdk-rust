@@ -2,4 +2,5 @@
 # https://docs.github.com/en/github/creating-cloning-and-archiving-repositories/about-code-owners#codeowners-syntax
 
 *                       @temporalio/server @temporalio/sdk
+*.wit                   @temporalio/sdk
 api/temporal/api/sdk/*  @temporalio/sdk

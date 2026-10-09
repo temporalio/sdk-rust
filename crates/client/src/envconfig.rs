@@ -66,10 +66,12 @@ fn build_tls_options(tls: ClientConfigTLS) -> Result<TlsOptions, ConfigError> {
                 resolve_datasource(cert).map_err(|e| ConfigError::LoadError(e.into()))?;
             let key_bytes =
                 resolve_datasource(key).map_err(|e| ConfigError::LoadError(e.into()))?;
-            Some(ClientTlsOptions {
-                client_cert: cert_bytes,
-                client_private_key: key_bytes,
-            })
+            Some(
+                ClientTlsOptions::builder()
+                    .client_cert(cert_bytes)
+                    .client_private_key(key_bytes)
+                    .build(),
+            )
         }
         (Some(_), None) | (None, Some(_)) => {
             return Err(ConfigError::InvalidConfig(
@@ -85,12 +87,11 @@ fn build_tls_options(tls: ClientConfigTLS) -> Result<TlsOptions, ConfigError> {
         .transpose()
         .map_err(|e| ConfigError::LoadError(e.into()))?;
 
-    Ok(TlsOptions {
-        server_root_ca_cert,
-        domain: tls.server_name,
-        client_tls_options,
-        server_cert_verifier: None,
-    })
+    Ok(TlsOptions::builder()
+        .maybe_server_root_ca_cert(server_root_ca_cert)
+        .maybe_domain(tls.server_name)
+        .maybe_client_tls_options(client_tls_options)
+        .build())
 }
 
 /// Determine whether TLS should be enabled based on the profile's TLS config and API key.
@@ -116,6 +117,7 @@ impl TryFrom<ClientConfigProfile> for ConnectionOptions {
             tls,
             codec: _,
             grpc_meta,
+            ..
         } = profile;
 
         let has_api_key = api_key.is_some();
@@ -146,6 +148,10 @@ fn resolve_datasource(data_source: DataSource) -> Result<Vec<u8>, std::io::Error
     match data_source {
         DataSource::Path(path) => fs::read(path),
         DataSource::Data(data) => Ok(data),
+        _ => Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "unsupported envconfig data source",
+        )),
     }
 }
 
@@ -183,31 +189,26 @@ mod tests {
         #[case] expected: &str,
     ) {
         let tls = enable_tls.then(ClientConfigTLS::default);
-        let profile = ClientConfigProfile {
-            address: address.map(str::to_string),
-            tls,
-            ..Default::default()
-        };
+        let profile = ClientConfigProfile::builder()
+            .maybe_address(address.map(str::to_string))
+            .maybe_tls(tls)
+            .build();
         let conn: ConnectionOptions = profile.try_into().unwrap();
         assert_eq!(conn.target.as_str(), expected);
     }
 
     #[test]
     fn invalid_address_errors() {
-        let profile = ClientConfigProfile {
-            address: Some("://bad".to_string()),
-            ..Default::default()
-        };
+        let profile = ClientConfigProfile::builder().address("://bad").build();
         assert!(ConnectionOptions::try_from(profile).is_err());
     }
 
     #[test]
     fn empty_profile_defaults() {
         let env = HashMap::new();
-        let opts = LoadClientConfigProfileOptions {
-            disable_file: true,
-            ..Default::default()
-        };
+        let opts = LoadClientConfigProfileOptions::builder()
+            .disable_file(true)
+            .build();
         let (conn, client) = load_from_config_with_env(opts, Some(&env)).unwrap();
 
         assert_eq!(conn.target.as_str(), "http://localhost:7233/");
@@ -221,10 +222,9 @@ mod tests {
     fn namespace_override() {
         let mut env = HashMap::new();
         env.insert("TEMPORAL_NAMESPACE".to_string(), "my-namespace".to_string());
-        let opts = LoadClientConfigProfileOptions {
-            disable_file: true,
-            ..Default::default()
-        };
+        let opts = LoadClientConfigProfileOptions::builder()
+            .disable_file(true)
+            .build();
         let (_, client) = load_from_config_with_env(opts, Some(&env)).unwrap();
         assert_eq!(client.namespace, "my-namespace");
     }
@@ -234,20 +234,16 @@ mod tests {
         let mut meta = HashMap::new();
         meta.insert("x-custom".to_string(), "value".to_string());
         meta.insert("another".to_string(), "header".to_string());
-        let profile = ClientConfigProfile {
-            grpc_meta: meta.clone(),
-            ..Default::default()
-        };
+        let profile = ClientConfigProfile::builder()
+            .grpc_meta(meta.clone())
+            .build();
         let conn: ConnectionOptions = profile.try_into().unwrap();
         assert_eq!(conn.headers.unwrap(), meta);
     }
 
     #[test]
     fn api_key_populates_field() {
-        let profile = ClientConfigProfile {
-            api_key: Some("my-key".to_string()),
-            ..Default::default()
-        };
+        let profile = ClientConfigProfile::builder().api_key("my-key").build();
         let conn: ConnectionOptions = profile.try_into().unwrap();
         assert_eq!(conn.api_key.as_deref(), Some("my-key"));
     }
@@ -265,28 +261,27 @@ mod tests {
         #[case] api_key: Option<&str>,
         #[case] expect_tls: bool,
     ) {
-        let profile = ClientConfigProfile {
-            api_key: api_key.map(str::to_string),
-            tls: tls_disabled.map(|disabled| ClientConfigTLS {
-                disabled,
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
+        let profile = ClientConfigProfile::builder()
+            .maybe_api_key(api_key.map(str::to_string))
+            .maybe_tls(
+                tls_disabled
+                    .map(|disabled| ClientConfigTLS::builder().maybe_disabled(disabled).build()),
+            )
+            .build();
         let conn: ConnectionOptions = profile.try_into().unwrap();
         assert_eq!(conn.tls_options.is_some(), expect_tls);
     }
 
     #[test]
     fn data_source_certs() {
-        let profile = ClientConfigProfile {
-            tls: Some(ClientConfigTLS {
-                client_cert: Some(DataSource::Data(b"cert-data".to_vec())),
-                client_key: Some(DataSource::Data(b"key-data".to_vec())),
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
+        let profile = ClientConfigProfile::builder()
+            .tls(
+                ClientConfigTLS::builder()
+                    .client_cert(DataSource::Data(b"cert-data".to_vec()))
+                    .client_key(DataSource::Data(b"key-data".to_vec()))
+                    .build(),
+            )
+            .build();
         let conn: ConnectionOptions = profile.try_into().unwrap();
         let tls = conn.tls_options.unwrap();
         let mtls = tls.client_tls_options.unwrap();
@@ -301,14 +296,14 @@ mod tests {
         std::fs::write(&cert_path, b"file-cert").unwrap();
         std::fs::write(&key_path, b"file-key").unwrap();
 
-        let profile = ClientConfigProfile {
-            tls: Some(ClientConfigTLS {
-                client_cert: Some(DataSource::Path(cert_path.to_str().unwrap().to_string())),
-                client_key: Some(DataSource::Path(key_path.to_str().unwrap().to_string())),
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
+        let profile = ClientConfigProfile::builder()
+            .tls(
+                ClientConfigTLS::builder()
+                    .client_cert(DataSource::Path(cert_path.to_str().unwrap().to_string()))
+                    .client_key(DataSource::Path(key_path.to_str().unwrap().to_string()))
+                    .build(),
+            )
+            .build();
         let conn: ConnectionOptions = profile.try_into().unwrap();
         let tls = conn.tls_options.unwrap();
         let mtls = tls.client_tls_options.unwrap();
@@ -318,13 +313,13 @@ mod tests {
 
     #[test]
     fn server_ca_cert() {
-        let profile = ClientConfigProfile {
-            tls: Some(ClientConfigTLS {
-                server_ca_cert: Some(DataSource::Data(b"ca-data".to_vec())),
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
+        let profile = ClientConfigProfile::builder()
+            .tls(
+                ClientConfigTLS::builder()
+                    .server_ca_cert(DataSource::Data(b"ca-data".to_vec()))
+                    .build(),
+            )
+            .build();
         let conn: ConnectionOptions = profile.try_into().unwrap();
         let tls = conn.tls_options.unwrap();
         assert_eq!(tls.server_root_ca_cert.unwrap(), b"ca-data");
@@ -332,13 +327,13 @@ mod tests {
 
     #[test]
     fn server_name_sni() {
-        let profile = ClientConfigProfile {
-            tls: Some(ClientConfigTLS {
-                server_name: Some("my.server.com".to_string()),
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
+        let profile = ClientConfigProfile::builder()
+            .tls(
+                ClientConfigTLS::builder()
+                    .server_name("my.server.com")
+                    .build(),
+            )
+            .build();
         let conn: ConnectionOptions = profile.try_into().unwrap();
         let tls = conn.tls_options.unwrap();
         assert_eq!(tls.domain.as_deref(), Some("my.server.com"));
@@ -351,14 +346,14 @@ mod tests {
         #[case] client_cert: Option<DataSource>,
         #[case] client_key: Option<DataSource>,
     ) {
-        let profile = ClientConfigProfile {
-            tls: Some(ClientConfigTLS {
-                client_cert,
-                client_key,
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
+        let profile = ClientConfigProfile::builder()
+            .tls(
+                ClientConfigTLS::builder()
+                    .maybe_client_cert(client_cert)
+                    .maybe_client_key(client_key)
+                    .build(),
+            )
+            .build();
         assert!(ConnectionOptions::try_from(profile).is_err());
     }
 
@@ -382,11 +377,10 @@ namespace = "custom-ns"
         );
 
         // Default profile
-        let opts = LoadClientConfigProfileOptions {
-            config_source: Some(DataSource::Path(config_path.to_str().unwrap().to_string())),
-            disable_env: true,
-            ..Default::default()
-        };
+        let opts = LoadClientConfigProfileOptions::builder()
+            .config_source(DataSource::Path(config_path.to_str().unwrap().to_string()))
+            .disable_env(true)
+            .build();
         let (conn, client) = ClientOptions::load_from_config(opts).unwrap();
         assert_eq!(conn.target.as_str(), "https://toml-server:7233/");
         assert_eq!(client.namespace, "toml-ns");
@@ -398,12 +392,11 @@ namespace = "custom-ns"
         );
 
         // Custom profile
-        let opts = LoadClientConfigProfileOptions {
-            config_source: Some(DataSource::Path(config_path.to_str().unwrap().to_string())),
-            config_file_profile: Some("custom".to_string()),
-            disable_env: true,
-            ..Default::default()
-        };
+        let opts = LoadClientConfigProfileOptions::builder()
+            .config_source(DataSource::Path(config_path.to_str().unwrap().to_string()))
+            .config_file_profile("custom".to_string())
+            .disable_env(true)
+            .build();
         let (conn, client) = ClientOptions::load_from_config(opts).unwrap();
         assert_eq!(conn.target.as_str(), "http://custom-server:9090/");
         assert_eq!(client.namespace, "custom-ns");

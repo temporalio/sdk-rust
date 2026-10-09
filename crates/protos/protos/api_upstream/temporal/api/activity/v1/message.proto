@@ -29,6 +29,10 @@ message ActivityExecutionOutcome {
         // The failure if the activity completed unsuccessfully.
         temporal.api.failure.v1.Failure failure = 2;
     }
+
+    // The retry state associated with an unsuccessful activity execution.
+    // This field is only meaningful when `failure` is set.
+    temporal.api.enums.v1.RetryState retry_state = 3;
 }
 
 message ActivityOptions {
@@ -63,6 +67,11 @@ message ActivityOptions {
     // Priority metadata. If this message is not present, or any fields are not
     // present, they inherit the values from the workflow.
     temporal.api.common.v1.Priority priority = 7;
+
+    // Time to wait before making the first activity task available for dispatch. This delay is not applied to retry attempts.
+    // When updated, the time is added to the original `schedule_time`, not to the current time.
+    // If the resulting time is in the past, the task is made available for dispatch immediately.
+    google.protobuf.Duration start_delay = 8;
 }
 
 // Information about a standalone activity.
@@ -119,7 +128,8 @@ message ActivityExecutionInfo {
     google.protobuf.Duration execution_duration = 16;
     // Time the activity was originally scheduled via a StartActivityExecution request.
     google.protobuf.Timestamp schedule_time = 17;
-    // Scheduled time + schedule to close timeout.
+    // The time at which the activity's Schedule-to-Close timeout expires.
+    // Calculated as `schedule_time` + `start_delay` + `schedule_to_close_timeout`.
     google.protobuf.Timestamp expiration_time = 18;
     // Time when the activity transitioned to a closed state.
     google.protobuf.Timestamp close_time = 19;
@@ -179,8 +189,12 @@ message ActivityExecutionInfo {
     // Overwritten on each new attempt. Empty if unknown.
     string sdk_version = 36;
 
-    // Time to wait before dispatching the first activity task. This delay is not applied to retry attempts.
+    // Time to wait before making the first activity task available for dispatch. This delay is not applied to retry attempts.
     google.protobuf.Duration start_delay = 37;
+
+    // The time at which the first activity task is made available for dispatch, computed as
+    // `schedule_time + start_delay`. Same as `schedule_time` if `start_delay` is not set.
+    google.protobuf.Timestamp execution_time = 38;
 }
 
 // Limited activity information returned in the list response.
@@ -214,6 +228,9 @@ message ActivityExecutionListInfo {
     // The difference between close time and scheduled time.
     // This field is only populated if the activity is closed.
     google.protobuf.Duration execution_duration = 11;
+    // The time at which the first activity task is made available for dispatch, computed as
+    // `schedule_time + start_delay`. Same as `schedule_time` if `start_delay` is not set.
+    google.protobuf.Timestamp execution_time = 12;
 }
 
 // CallbackInfo contains the state of an attached activity callback.

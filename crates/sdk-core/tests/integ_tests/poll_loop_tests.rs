@@ -56,7 +56,9 @@ async fn execute_steps(ctx: &mut WorkflowContext<ChainWf>, steps: Vec<Step>) {
     for step in steps {
         match step {
             Step::Wait(w) => {
-                ctx.wait_condition(move |s| s.flags[w]).await;
+                ctx.wait_condition(move |s| s.flags[w])
+                    .await
+                    .expect("workflow was not cancelled");
             }
             Step::Set(f) => {
                 ctx.state_mut(move |s| s.flags[f] = true);
@@ -83,7 +85,7 @@ impl ChainWf {
         ctx: &mut WorkflowContext<Self>,
         _: (),
     ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-        ctx.wait_condition(|s| s.script_ready).await;
+        ctx.wait_condition(|s| s.script_ready).await?;
         let steps = ctx.state_mut(|s| {
             let idx = s.next_update;
             s.next_update += 1;
@@ -95,7 +97,9 @@ impl ChainWf {
 
     #[signal]
     async fn trigger(ctx: &mut WorkflowContext<Self>, _: ()) {
-        ctx.wait_condition(|s| s.script_ready).await;
+        ctx.wait_condition(|s| s.script_ready)
+            .await
+            .expect("workflow was not cancelled");
         let steps = ctx.state_mut(|s| {
             let idx = s.next_signal;
             s.next_signal += 1;
@@ -109,8 +113,8 @@ impl ChainWf {
 /// updates and signals, and asserts everything completes within 5 seconds.
 async fn run_scripted_test(name: &str, script: TestScript) {
     let mut starter = CoreWfStarter::new(name);
+    starter.sdk_config.register_workflow::<ChainWf>().unwrap();
     let mut worker = starter.worker().await;
-    worker.register_workflow::<ChainWf>().unwrap();
 
     let num_updates = script.update_scripts.len();
     let num_signals = script.signal_scripts.len();

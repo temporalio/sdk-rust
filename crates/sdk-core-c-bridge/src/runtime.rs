@@ -15,10 +15,15 @@ use std::{
     },
     time::{Duration, UNIX_EPOCH},
 };
-use temporalio_common::telemetry::{
-    CoreLog, CoreLogConsumer, HistogramBucketOverrides, Logger, MetricTemporality,
-    OtelCollectorOptions, PrometheusExporterOptions, TelemetryOptions as CoreTelemetryOptions,
-    build_otlp_metric_exporter, metrics::CoreMeter, start_prometheus_metric_exporter,
+use temporalio_common::{
+    protos::temporal::api::worker::v1::environment_info::{
+        Runtime as CoreEnvironmentRuntime, runtime::RuntimeType as CoreRuntimeType,
+    },
+    telemetry::{
+        CoreLog, CoreLogConsumer, HistogramBucketOverrides, Logger, MetricTemporality,
+        OtelCollectorOptions, PrometheusExporterOptions, TelemetryOptions as CoreTelemetryOptions,
+        build_otlp_metric_exporter, metrics::CoreMeter, start_prometheus_metric_exporter,
+    },
 };
 use temporalio_sdk_core::{
     CoreRuntime, RuntimeOptions as CoreRuntimeOptions, TokioRuntimeBuilder as TokioRuntime,
@@ -30,6 +35,98 @@ use url::Url;
 pub struct RuntimeOptions {
     pub telemetry: *const TelemetryOptions,
     pub worker_heartbeat_interval_millis: u64,
+    /// SDK runtimes included in worker environment heartbeats. An empty array reports no runtime;
+    /// the bridge does not inherit Core's native-runtime default.
+    pub runtime_info: RuntimeInfoArray,
+    /// If true, worker heartbeats omit all runtime, hosting, and platform information.
+    pub disable_environment_info: bool,
+}
+
+#[derive(Clone, Copy)]
+#[repr(C)]
+pub enum RuntimeType {
+    Unspecified = 0,
+    Jvm = 1,
+    Cpython = 2,
+    Node = 3,
+    Bun = 4,
+    Cruby = 5,
+    Go = 6,
+    DotnetFramework = 7,
+    DotnetCore = 8,
+    Native = 9,
+    Roadrunner = 10,
+}
+
+#[repr(C)]
+pub struct RuntimeInfo {
+    /// The SDK runtime hosting Core.
+    pub runtime_type: RuntimeType,
+    /// The runtime version, or empty if it cannot be determined.
+    pub version: ByteArrayRef,
+}
+
+#[repr(C)]
+pub struct RuntimeInfoArray {
+    /// Runtime entries read during runtime construction; ownership remains with the caller.
+    pub data: *const RuntimeInfo,
+    pub size: libc::size_t,
+}
+
+impl RuntimeInfoArray {
+    fn to_core_runtimes(&self) -> Vec<CoreEnvironmentRuntime> {
+        if self.size == 0 {
+            return Vec::new();
+        }
+
+        unsafe { std::slice::from_raw_parts(self.data, self.size) }
+            .iter()
+            .filter_map(|runtime| {
+                let runtime_type = match runtime.runtime_type {
+                    RuntimeType::Unspecified => return None,
+                    RuntimeType::Jvm => CoreRuntimeType::Jvm,
+                    RuntimeType::Cpython => CoreRuntimeType::Cpython,
+                    RuntimeType::Node => CoreRuntimeType::Node,
+                    RuntimeType::Bun => CoreRuntimeType::Bun,
+                    RuntimeType::Cruby => CoreRuntimeType::Cruby,
+                    RuntimeType::Go => CoreRuntimeType::Go,
+                    RuntimeType::DotnetFramework => CoreRuntimeType::DotnetFramework,
+                    RuntimeType::DotnetCore => CoreRuntimeType::DotnetCore,
+                    RuntimeType::Native => CoreRuntimeType::Native,
+                    RuntimeType::Roadrunner => CoreRuntimeType::Roadrunner,
+                };
+                Some(CoreEnvironmentRuntime {
+                    r#type: runtime_type as i32,
+                    version: runtime.version.to_option_string().unwrap_or_default(),
+                })
+            })
+            .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn empty_runtime_version_with_null_data_is_supported() {
+        let runtime_info = [RuntimeInfo {
+            runtime_type: RuntimeType::Native,
+            version: ByteArrayRef {
+                data: std::ptr::null(),
+                size: 0,
+            },
+        }];
+        let runtimes = RuntimeInfoArray {
+            data: runtime_info.as_ptr(),
+            size: runtime_info.len(),
+        }
+        .to_core_runtimes();
+
+        assert_eq!(runtimes.len(), 1);
+        assert_eq!(runtimes[0].r#type, CoreRuntimeType::Native as i32);
+        assert!(runtimes[0].version.is_empty());
+    }
 }
 
 #[repr(C)]
@@ -223,6 +320,7 @@ impl Runtime {
                 } else {
                     Logger::Console {
                         filter: v.filter.to_string(),
+                        format: None,
                     }
                 }
             });
@@ -242,8 +340,10 @@ impl Runtime {
                 (options.worker_heartbeat_interval_millis != 0)
                     .then(|| Duration::from_millis(options.worker_heartbeat_interval_millis)),
             )
+            .disable_environment_info(options.disable_environment_info)
             .build()
-            .map_err(|e| anyhow::anyhow!(e))?;
+            .map_err(|e| anyhow::anyhow!(e))?
+            .with_runtimes(options.runtime_info.to_core_runtimes());
 
         // Build core runtime
         let mut core = CoreRuntime::new(core_runtime_options, TokioRuntime::default())?;

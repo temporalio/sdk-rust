@@ -1,6 +1,6 @@
 [package]
 name = "temporalio-sdk-core"
-version = "0.5.0"
+version = "0.10.0"
 authors = ["Temporal Technologies Inc. <sdk@temporal.io>"]
 edition = "2024"
 license-file = { workspace = true }
@@ -21,13 +21,14 @@ tls-ring = [
   "temporalio-client/tls-ring",
   "temporalio-common/tls-ring",
   "opentelemetry-otlp?/tls-ring",
-  "opentelemetry-otlp?/reqwest-rustls",
+  "reqwest?/rustls-no-provider",
   "tonic/tls-native-roots",
 ]
 tls-aws-lc = [
   "temporalio-client/tls-aws-lc",
   "temporalio-common/tls-aws-lc",
   "opentelemetry-otlp?/tls-aws-lc",
+  "reqwest?/rustls",
   "tonic/tls-native-roots",
 ]
 envconfig = ["temporalio-client/envconfig", "temporalio-common/envconfig"]
@@ -45,6 +46,9 @@ debug-plugin = ["dep:reqwest", "dep:hyper"]
 # crates should not enable this feature.
 test-utilities = ["dep:assert_matches", "dep:bimap"]
 antithesis_assertions = ["dep:antithesis_sdk"]
+dynamic-tls = ["temporalio-client/dynamic-tls"]
+# Used by the integration-test runner to make Cloud exclusions native libtest ignores.
+cloud-test-mode = []
 
 [dependencies]
 anyhow = "1.0"
@@ -92,7 +96,6 @@ reqwest = { version = "0.13", features = [
   "json",
   "stream",
   "query",
-  "rustls",
 ], default-features = false, optional = true }
 serde = "1.0"
 serde_json = { workspace = true }
@@ -130,19 +133,19 @@ zip = { version = "8.4", optional = true, default-features = false, features = [
 # 1st party local deps
 [dependencies.temporalio-common]
 path = "../common"
-version = "0.5"
+version = "~1.1.0"
 default-features = false
 features = ["core-telemetry-bridge", "serde_serialize"]
 
 [dependencies.temporalio-client]
 path = "../client"
-version = "0.5"
+version = "~1.1.0"
 default-features = false
 features = ["core-based-sdk"]
 
 [dependencies.temporalio-macros]
 path = "../macros"
-version = "0.5"
+version = "~1.1.0"
 
 [dev-dependencies]
 assert_matches = "1.5"
@@ -160,11 +163,21 @@ hyper-util = { version = "0.1", features = [
   "http2",
   "tokio",
 ] }
+opentelemetry = { workspace = true, features = ["trace"] }
+opentelemetry_sdk = { version = "0.32", features = ["testing", "trace"] }
 rstest = "0.26"
 semver = "1.0"
-temporalio-sdk = { path = "../sdk", features = ["wasm-workflows"] }
-temporalio-common = { path = "../common", version = "0.5", default-features = false }
-temporalio-workflow = { path = "../workflow" }
+# A registry version here creates a cycle when Cargo orders sdk-core before sdk for workspace publishing.
+temporalio-sdk = { path = "../sdk", features = [
+  "experimental",
+  "opentelemetry",
+  "testing",
+  "wasm-workflows",
+] }
+temporalio-common = { path = "../common", version = "~1.1.0", default-features = false }
+temporalio-workflow = { path = "../workflow", version = "~1.1.0", features = [
+  "experimental",
+] }
 tokio = { version = "1.47", default-features = false, features = [
   "rt",
   "rt-multi-thread",

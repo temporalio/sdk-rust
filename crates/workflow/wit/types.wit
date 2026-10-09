@@ -76,7 +76,7 @@ record task-failure {
 variant terminal-outcome {
   completed(payload),
   failed(failure),
-  cancelled,
+  cancelled(option<list<u8>>),
   continue-as-new(continue-as-new-request),
 }
 
@@ -112,8 +112,15 @@ variant routine-completion {
   update(update-routine-completion),
 }
 
+variant routine-pending-state {
+  handler,
+  interceptor,
+  interceptor-with-activation,
+}
+
 record routine-poll-result {
   completion: option<routine-completion>,
   made-progress: bool,
+  pending-state: option<routine-pending-state>,
 }
 }

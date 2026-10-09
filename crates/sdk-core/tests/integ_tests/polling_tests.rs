@@ -32,9 +32,12 @@ use temporalio_common::{
     telemetry::{CoreLogStreamConsumer, Logger, TelemetryOptions},
 };
 use temporalio_macros::{workflow, workflow_methods};
-use temporalio_sdk::{ActivityOptions, WorkflowContext, WorkflowResult};
+use temporalio_sdk::{
+    ActivityOptions, WorkflowContext, WorkflowResult,
+    runtime::{AutoscalingOptions, PollerBehavior},
+};
 use temporalio_sdk_core::{
-    CoreRuntime, PollerBehavior, RuntimeOptions, TunerHolder,
+    CoreRuntime, RuntimeOptions, TunerHolder,
     ephemeral_server::{TemporalDevServerConfig, default_cached_download},
     init_worker, prost_dur,
     test_help::{NAMESPACE, WorkerTestHelpers, drain_pollers_and_shutdown, schedule_activity_cmd},
@@ -46,7 +49,7 @@ use url::Url;
 #[tokio::test]
 async fn out_of_order_completion_doesnt_hang() {
     let mut starter = init_core_and_create_wf("out_of_order_completion_doesnt_hang").await;
-    let core = starter.get_worker().await;
+    let core = starter.get_core_worker().await;
     let task_q = starter.get_task_queue();
     let activity_id = "act-1";
     let task = core.poll_workflow_activation().await.unwrap();
@@ -120,6 +123,7 @@ async fn out_of_order_completion_doesnt_hang() {
     jh.await.unwrap();
 }
 
+#[temporalio_macros::cloud_test_exclusion(crate::CloudTestExclusionReason::RequiresLocalServer)]
 #[tokio::test]
 async fn switching_worker_client_changes_poll() {
     // Start two servers
@@ -205,16 +209,15 @@ async fn switching_worker_client_changes_poll() {
         worker.complete_execution(&act1.run_id).await;
         worker.handle_eviction().await;
         info!("Waiting on first workflow complete");
-        WorkflowExecutionInfo {
-            namespace: client1.namespace(),
-            workflow_id: "my-workflow-1".into(),
-            run_id: Some(wf1_run_id.clone()),
-            first_execution_run_id: None,
-        }
-        .bind_untyped(client1.clone())
-        .get_result(Default::default())
-        .await
-        .unwrap();
+        WorkflowExecutionInfo::builder()
+            .namespace(client1.namespace())
+            .workflow_id("my-workflow-1")
+            .maybe_run_id(Some(wf1_run_id.clone()))
+            .build()
+            .bind_untyped(client1.clone())
+            .get_result(Default::default())
+            .await
+            .unwrap();
 
         // Swap client, poll for next task, confirm it's second wf, and respond w/ empty
         info!("Replacing client and polling again");
@@ -224,16 +227,15 @@ async fn switching_worker_client_changes_poll() {
         worker.complete_execution(&act2.run_id).await;
         worker.handle_eviction().await;
         info!("Waiting on second workflow complete");
-        WorkflowExecutionInfo {
-            namespace: client2.namespace(),
-            workflow_id: "my-workflow-2".into(),
-            run_id: Some(wf2_run_id),
-            first_execution_run_id: None,
-        }
-        .bind_untyped(client2.clone())
-        .get_result(Default::default())
-        .await
-        .unwrap();
+        WorkflowExecutionInfo::builder()
+            .namespace(client2.namespace())
+            .workflow_id("my-workflow-2")
+            .maybe_run_id(Some(wf2_run_id))
+            .build()
+            .bind_untyped(client2.clone())
+            .get_result(Default::default())
+            .await
+            .unwrap();
 
         // Shutdown workers and servers
         drain_pollers_and_shutdown(&worker).await;
@@ -277,22 +279,24 @@ async fn small_workflow_slots_and_pollers(#[values(false, true)] use_autoscaling
     let wf_name = "only_one_workflow_slot_and_two_pollers";
     let mut starter = CoreWfStarter::new(wf_name);
     if use_autoscaling {
-        starter.sdk_config.workflow_task_poller_behavior = PollerBehavior::Autoscaling {
-            minimum: 1,
-            maximum: 5,
-            initial: 1,
-        };
+        starter.sdk_config.workflow_task_poller_behavior = Some(PollerBehavior::Autoscaling(
+            AutoscalingOptions::builder()
+                .minimum(1)
+                .maximum(5)
+                .initial(1)
+                .build(),
+        ));
     } else {
-        starter.sdk_config.workflow_task_poller_behavior = PollerBehavior::SimpleMaximum(2);
+        starter.sdk_config.workflow_task_poller_behavior = Some(PollerBehavior::SimpleMaximum(2));
     }
-    starter.sdk_config.activity_task_poller_behavior = PollerBehavior::SimpleMaximum(1);
-    starter.sdk_config.tuner = Arc::new(TunerHolder::fixed_size(2, 1, 1, 1));
-    starter.sdk_config.register_activities(StdActivities);
-    let mut worker = starter.worker().await;
-
-    worker
+    starter.sdk_config.activity_task_poller_behavior = Some(PollerBehavior::SimpleMaximum(1));
+    starter.set_core_tuner(Arc::new(TunerHolder::fixed_size(2, 1, 1, 1)));
+    starter
+        .sdk_config
+        .register_activities(StdActivities)
         .register_workflow::<OnlyOneWorkflowSlotAndTwoPollers>()
         .unwrap();
+    let mut worker = starter.worker().await;
     let task_queue = starter.get_task_queue().to_owned();
     worker
         .submit_workflow(
@@ -321,19 +325,20 @@ async fn small_workflow_slots_and_pollers(#[values(false, true)] use_autoscaling
         .any(|e| e.event_type() == EventType::WorkflowTaskTimedOut);
     assert!(!any_task_timeouts);
     let events = starter
-        .get_client()
+        .get_core_client()
         .await
         .get_workflow_handle::<UntypedWorkflow>(&wf2id)
         .fetch_history(Default::default())
+        .into_events()
         .await
-        .unwrap()
-        .into_events();
+        .unwrap();
     let any_task_timeouts = events
         .iter()
         .any(|e| e.event_type() == EventType::WorkflowTaskTimedOut);
     assert!(!any_task_timeouts);
 }
 
+#[temporalio_macros::cloud_test_exclusion(crate::CloudTestExclusionReason::RequiresLocalServer)]
 #[tokio::test]
 async fn replace_client_works_after_polling_failure() {
     let (log_consumer, mut log_rx) = CoreLogStreamConsumer::new(100);

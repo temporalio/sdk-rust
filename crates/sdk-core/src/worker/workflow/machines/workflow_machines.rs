@@ -24,9 +24,9 @@ use crate::{
     worker::{
         ExecutingLAId, LocalActRequest, LocalActivityExecutionResult, LocalActivityResolution,
         workflow::{
-            CommandID, DrivenWorkflow, HistoryUpdate, InternalFlagsRef, LocalResolution,
-            OutgoingJob, RunBasics, WFCommand, WFCommandVariant, WFMachinesError,
-            WorkflowStartedInfo, fatal,
+            CommandAnnotations, CommandID, DrivenWorkflow, HistoryUpdate, InternalFlagsRef,
+            LocalResolution, OutgoingJob, ProtoCommandExt, RunBasics, WFCommand, WFCommandVariant,
+            WFMachinesError, WorkflowStartedInfo, fatal,
             history_update::NextWFT,
             machines::{
                 HistEventData, activity_state_machine::ActivityMachine,
@@ -64,14 +64,12 @@ use temporalio_common::{
             workflow_commands::ContinueAsNewWorkflowExecution,
         },
         temporal::api::{
-            command::v1::{
-                Command as ProtoCommand, CommandAttributesExt, command::Attributes as ProtoCmdAttrs,
-            },
+            command::v1::{Command as ProtoCommand, command::Attributes as ProtoCmdAttrs},
             common::v1::SearchAttributes,
             enums::v1::EventType,
             history::v1::{HistoryEvent, history_event},
             protocol::v1::{Message as ProtocolMessage, message::SequencingId},
-            sdk::v1::{UserMetadata, WorkflowTaskCompletedMetadata},
+            sdk::v1::WorkflowTaskCompletedMetadata,
         },
     },
     worker::WorkerDeploymentVersion,
@@ -176,15 +174,8 @@ pub(crate) struct WorkflowMachines {
 #[derive(Debug, derive_more::Display)]
 #[display("Cmd&Machine({command})")]
 struct CommandAndMachine {
-    command: MachineAssociatedCommand,
+    command: ProtoCommand,
     machine: MachineKey,
-}
-
-#[derive(Debug, derive_more::Display)]
-enum MachineAssociatedCommand {
-    Real(Box<ProtoCommand>),
-    #[display("FakeLocalActivityMarker({_0})")]
-    FakeLocalActivityMarker(u32),
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -208,11 +199,13 @@ pub(super) enum MachineResponse {
     IssueNewMessage(ProtocolMessage),
     /// The machine requests the creation of another *different* machine. This acts as if lang
     /// had replied to the activation with a command, but we use a special set of IDs to avoid
-    /// collisions.
-    #[display("NewCoreOriginatedCommand({_0:?})")]
-    NewCoreOriginatedCommand(ProtoCmdAttrs),
-    #[display("IssueFakeLocalActivityMarker({_0})")]
-    IssueFakeLocalActivityMarker(u32),
+    /// collisions. The requesting machine supplies the annotations, since it is the only thing
+    /// that knows which lang command this one is being issued on behalf of.
+    #[display("NewCoreOriginatedCommand({attrs:?})")]
+    NewCoreOriginatedCommand {
+        attrs: ProtoCmdAttrs,
+        annotations: CommandAnnotations,
+    },
     #[display("TriggerWFTaskStarted")]
     TriggerWFTaskStarted {
         task_started_event_id: i64,
@@ -366,10 +359,17 @@ impl WorkflowMachines {
             }) => {
                 let act_id = CommandID::LocalActivity(seq);
                 let mk = self.get_machine_key(act_id)?;
+                let activation_index = self.local_activity_data.current_activation_index();
                 let mach = self.machine_mut(mk);
                 if let Machines::LocalActivityMachine(ref mut lam) = *mach {
-                    let resps =
-                        lam.try_resolve(result, runtime, attempt, backoff, original_schedule_time)?;
+                    let resps = lam.try_resolve(
+                        result,
+                        runtime,
+                        attempt,
+                        backoff,
+                        original_schedule_time,
+                        activation_index,
+                    )?;
                     if resps.is_empty() {
                         result_important = false;
                     }
@@ -406,6 +406,10 @@ impl WorkflowMachines {
         self.current_started_event_id
     }
 
+    pub(crate) fn history_size_bytes(&self) -> u64 {
+        self.history_size_bytes
+    }
+
     pub(crate) fn prepare_for_wft_response(&mut self) -> MachinesWFTResponseContent<'_> {
         MachinesWFTResponseContent {
             replaying: self.replaying,
@@ -425,16 +429,10 @@ impl WorkflowMachines {
         (*self.observed_internal_flags)
             .borrow_mut()
             .write_all_known();
-        self.commands.iter().filter_map(|c| {
-            if !self.machine(c.machine).is_final_state() {
-                match &c.command {
-                    MachineAssociatedCommand::Real(cmd) => Some((**cmd).clone()),
-                    MachineAssociatedCommand::FakeLocalActivityMarker(_) => None,
-                }
-            } else {
-                None
-            }
-        })
+        self.commands
+            .iter()
+            .filter(|c| !self.machine(c.machine).is_final_state())
+            .map(|c| c.command.clone())
     }
 
     /// Returns the next activation that needs to be performed by the lang sdk. Things like unblock
@@ -453,6 +451,10 @@ impl WorkflowMachines {
                 Some(workflow_activation_job::Variant::QueryWorkflow(_))
             )
         });
+        // Query-only activations are never recorded in history, so replay can't count them.
+        if !all_query {
+            self.local_activity_data.activation_dispatched();
+        }
         let is_replaying = self.replaying || all_query;
         let deployment_version_for_current_task = if is_replaying {
             self.current_wft_deployment_info.clone()
@@ -544,6 +546,8 @@ impl WorkflowMachines {
     pub(crate) fn iterate_machines(&mut self) -> Result<()> {
         let results = self.drive_me.fetch_workflow_iteration_output();
         self.handle_driven_results(results)?;
+        self.apply_local_activity_peeked_resolutions(false)?;
+        self.release_held_local_activity_resolutions_if_idle()?;
         self.prepare_commands()?;
         if self.workflow_is_finished()
             && let Some(rt) = self.total_runtime()
@@ -591,6 +595,9 @@ impl WorkflowMachines {
             }
         };
         let num_events_to_process = events.len();
+        if num_events_to_process > 0 {
+            self.local_activity_data.wft_applied();
+        }
 
         // Process any WFT completed events in the next sequence, as well as peek ahead to the
         // subsequent one to properly apply flags & any other data. Macro used to avoid self
@@ -600,10 +607,10 @@ impl WorkflowMachines {
                 (*$me.observed_internal_flags)
                     .borrow_mut()
                     .add_from_complete($wtc);
-                let mut combined_ver = WorkerDeploymentVersion {
-                    deployment_name: "".to_string(),
-                    build_id: "".to_string(),
-                };
+                let mut combined_ver = WorkerDeploymentVersion::builder()
+                    .deployment_name("")
+                    .build_id("")
+                    .build();
                 #[allow(deprecated)]
                 if let Some(bid) = $wtc.worker_version.as_ref().map(|wv| &wv.build_id) {
                     combined_ver.build_id = bid.to_string();
@@ -756,7 +763,7 @@ impl WorkflowMachines {
         // Needed to delay mutation of self until after we've iterated over peeked events.
         #[allow(clippy::large_enum_variant)]
         enum DelayedAction {
-            WakeLa(MachineKey, Box<CompleteLocalActivityData>),
+            LocalActivityMarker(Box<CompleteLocalActivityData>),
             ProtocolMessage(IncomingProtocolMessage),
         }
         let mut delayed_actions = vec![];
@@ -789,13 +796,7 @@ impl WorkflowMachines {
                 );
             } else if e.is_local_activity_marker() {
                 if let Some(la_dat) = e.clone().into_local_activity_marker_details() {
-                    if let Ok(mk) =
-                        self.get_machine_key(CommandID::LocalActivity(la_dat.marker_dat.seq))
-                    {
-                        delayed_actions.push(DelayedAction::WakeLa(mk, Box::new(la_dat)));
-                    } else {
-                        self.local_activity_data.insert_peeked_marker(la_dat);
-                    }
+                    delayed_actions.push(DelayedAction::LocalActivityMarker(Box::new(la_dat)));
                 } else {
                     return Err(fatal!("Local activity marker was unparsable: {e:?}"));
                 }
@@ -818,15 +819,18 @@ impl WorkflowMachines {
         }
         for action in delayed_actions {
             match action {
-                DelayedAction::WakeLa(mk, la_dat) => {
-                    let mach = self.machine_mut(mk);
-                    if let Machines::LocalActivityMachine(ref mut lam) = *mach {
-                        if lam.will_accept_resolve_marker() {
-                            let resps = lam.try_resolve_with_dat((*la_dat).into())?;
-                            self.process_machine_responses(mk, resps)?;
-                        } else {
-                            self.local_activity_data.insert_peeked_marker(*la_dat);
-                        }
+                DelayedAction::LocalActivityMarker(la_dat) => {
+                    let seq = la_dat.marker_dat.seq;
+                    let should_queue = self
+                        .get_machine_key(CommandID::LocalActivity(seq))
+                        .map(|mk| {
+                            matches!(self.machine(mk), Machines::LocalActivityMachine(lam)
+                                if lam.will_accept_resolve_marker())
+                        })
+                        .unwrap_or(true);
+                    if should_queue {
+                        self.local_activity_data.insert_peeked_marker(*la_dat);
+                        self.apply_local_activity_peeked_resolutions(false)?;
                     }
                 }
                 DelayedAction::ProtocolMessage(pm) => {
@@ -834,6 +838,7 @@ impl WorkflowMachines {
                 }
             }
         }
+        self.release_held_local_activity_resolutions_if_idle()?;
 
         // Only record replay latency if we actually did replay work. This avoids recording
         // near-zero latencies for the first workflow task (which has no history to replay) or
@@ -1040,8 +1045,9 @@ impl WorkflowMachines {
                     attrs,
                 )) = event_dat.event.attributes
                 {
-                    self.drive_me
-                        .send_job(workflow_activation::SignalWorkflow::from(attrs).into());
+                    self.drive_me.send_job(
+                        workflow_activation::SignalWorkflow::from((attrs, event_id)).into(),
+                    );
                 } else {
                     // err
                 }
@@ -1139,15 +1145,10 @@ impl WorkflowMachines {
                 .machine(c.machine)
                 .was_cancelled_before_sent_to_server()
             {
-                match &c.command {
-                    MachineAssociatedCommand::Real(cmd) => {
-                        let machine_responses = self
-                            .machine_mut(c.machine)
-                            .handle_command(cmd.command_type())?;
-                        self.process_machine_responses(c.machine, machine_responses)?;
-                    }
-                    MachineAssociatedCommand::FakeLocalActivityMarker(_) => {}
-                }
+                let machine_responses = self
+                    .machine_mut(c.machine)
+                    .handle_command(c.command.command_type())?;
+                self.process_machine_responses(c.machine, machine_responses)?;
                 self.commands.push_back(c);
             }
         }
@@ -1191,7 +1192,7 @@ impl WorkflowMachines {
                 }
                 MachineResponse::IssueNewCommand(c) => {
                     self.current_wf_task_commands.push_back(CommandAndMachine {
-                        command: MachineAssociatedCommand::Real(Box::new(c)),
+                        command: c,
                         machine: smk,
                     })
                 }
@@ -1202,7 +1203,7 @@ impl WorkflowMachines {
                         self.message_outbox.push_back(pm);
                     }
                 }
-                MachineResponse::NewCoreOriginatedCommand(attrs) => match attrs {
+                MachineResponse::NewCoreOriginatedCommand { attrs, annotations } => match attrs {
                     ProtoCmdAttrs::RequestCancelExternalWorkflowExecutionCommandAttributes(
                         attrs,
                     ) => {
@@ -1214,7 +1215,7 @@ impl WorkflowMachines {
                         };
                         self.add_cmd_to_wf_task(
                             new_external_cancel(0, we, attrs.child_workflow_only, attrs.reason),
-                            None,
+                            annotations,
                             CommandIdKind::CoreInternal,
                         );
                     }
@@ -1224,7 +1225,7 @@ impl WorkflowMachines {
                         // workflows by users (but rather, just for them to search with).
                         self.add_cmd_to_wf_task(
                             upsert_search_attrs_internal(attrs),
-                            None,
+                            annotations,
                             CommandIdKind::NeverResolves,
                         );
                     }
@@ -1234,16 +1235,15 @@ impl WorkflowMachines {
                         ));
                     }
                 },
-                MachineResponse::IssueFakeLocalActivityMarker(seq) => {
-                    self.current_wf_task_commands.push_back(CommandAndMachine {
-                        command: MachineAssociatedCommand::FakeLocalActivityMarker(seq),
-                        machine: smk,
-                    });
-                }
                 MachineResponse::QueueLocalActivity(act) => {
                     self.local_activity_data.enqueue(act);
                 }
                 MachineResponse::RequestCancelLocalActivity(seq) => {
+                    // A resolution recorded for a later activation must wait for it, even when lang
+                    // cancels the activity during an earlier one.
+                    if self.local_activity_data.has_held_preresolution(seq) {
+                        continue;
+                    }
                     // We might already know about the status from a pre-resolution. Apply it if so.
                     // We need to do this because otherwise we might need to perform additional
                     // activations during replay that didn't happen during execution, just like
@@ -1263,6 +1263,7 @@ impl WorkflowMachines {
                         self.local_activity_data.remove_from_queue(seq)
                     {
                         // We removed it. Notify the machine that the activity cancelled.
+                        let activation_index = self.local_activity_data.current_activation_index();
                         if let Machines::LocalActivityMachine(lam) = self.machine_mut(smk) {
                             let more_responses = lam.try_resolve(
                                 LocalActivityExecutionResult::empty_cancel(),
@@ -1270,6 +1271,7 @@ impl WorkflowMachines {
                                 removed_act.attempt,
                                 None,
                                 removed_act.original_schedule_time,
+                                activation_index,
                             )?;
                             self.process_machine_responses(smk, more_responses)?;
                         } else {
@@ -1331,12 +1333,16 @@ impl WorkflowMachines {
     /// server.
     fn handle_driven_results(&mut self, results: Vec<WFCommand>) -> Result<()> {
         for cmd in results {
-            match cmd.variant {
+            let WFCommand {
+                variant,
+                annotations,
+            } = cmd;
+            match variant {
                 WFCommandVariant::AddTimer(attrs) => {
                     let seq = attrs.seq;
                     self.add_cmd_to_wf_task(
-                        new_timer(attrs),
-                        cmd.metadata,
+                        new_timer(attrs, annotations.clone()),
+                        annotations,
                         CommandID::Timer(seq).into(),
                     );
                 }
@@ -1349,12 +1355,18 @@ impl WorkflowMachines {
                             self.observed_internal_flags.clone(),
                             self.replaying,
                         ),
-                        cmd.metadata,
+                        annotations,
                         CommandIdKind::NeverResolves,
                     );
                 }
                 WFCommandVariant::CancelTimer(attrs) => {
-                    cancel_machine!(self, CommandID::Timer(attrs.seq), TimerMachine, cancel);
+                    cancel_machine!(
+                        self,
+                        CommandID::Timer(attrs.seq),
+                        TimerMachine,
+                        cancel,
+                        annotations
+                    );
                 }
                 WFCommandVariant::AddActivity(attrs) => {
                     let seq = attrs.seq;
@@ -1367,21 +1379,25 @@ impl WorkflowMachines {
                             attrs,
                             self.observed_internal_flags.clone(),
                             use_compat,
+                            annotations.clone(),
                         ),
-                        cmd.metadata,
+                        annotations,
                         CommandID::Activity(seq).into(),
                     );
                 }
                 WFCommandVariant::AddLocalActivity(attrs) => {
                     let seq = attrs.seq;
-                    let attrs: ValidScheduleLA =
-                        ValidScheduleLA::from_schedule_la(attrs, cmd.metadata).map_err(|e| {
-                            fatal!("Invalid schedule local activity request (seq {seq}): {e}")
-                        })?;
+                    let attrs: ValidScheduleLA = ValidScheduleLA::from_schedule_la(
+                        attrs,
+                        annotations.metadata,
+                        annotations.event_group_markers,
+                    )
+                    .map_err(|e| {
+                        fatal!("Invalid schedule local activity request (seq {seq}): {e}")
+                    })?;
                     let (la, mach_resp) = new_local_activity(
                         attrs,
                         self.replaying,
-                        self.local_activity_data.take_preresolution(seq),
                         self.current_wf_time,
                         self.observed_internal_flags.clone(),
                     )?;
@@ -1395,22 +1411,25 @@ impl WorkflowMachines {
                         self,
                         CommandID::Activity(attrs.seq),
                         ActivityMachine,
-                        cancel
+                        cancel,
+                        annotations
                     );
                 }
                 WFCommandVariant::RequestCancelLocalActivity(attrs) => {
+                    let activation_index = self.local_activity_data.current_activation_index();
                     cancel_machine!(
                         self,
                         CommandID::LocalActivity(attrs.seq),
                         LocalActivityMachine,
-                        cancel
+                        cancel,
+                        activation_index
                     );
                 }
                 WFCommandVariant::CompleteWorkflow(attrs) => {
-                    self.add_terminal_command(complete_workflow(attrs), cmd.metadata);
+                    self.add_terminal_command(complete_workflow(attrs), annotations);
                 }
                 WFCommandVariant::FailWorkflow(attrs) => {
-                    self.add_terminal_command(fail_workflow(attrs), cmd.metadata);
+                    self.add_terminal_command(fail_workflow(attrs), annotations);
                 }
                 WFCommandVariant::ContinueAsNew(attrs) => {
                     let attrs = self.augment_continue_as_new_with_current_values(attrs);
@@ -1418,10 +1437,10 @@ impl WorkflowMachines {
                         attrs.versioning_intent(),
                         &attrs.task_queue,
                     );
-                    self.add_terminal_command(continue_as_new(attrs, use_compat), cmd.metadata);
+                    self.add_terminal_command(continue_as_new(attrs, use_compat), annotations);
                 }
                 WFCommandVariant::CancelWorkflow(attrs) => {
-                    self.add_terminal_command(cancel_workflow(attrs), cmd.metadata);
+                    self.add_terminal_command(cancel_workflow(attrs), annotations);
                 }
                 WFCommandVariant::SetPatchMarker(attrs) => {
                     // Do not create commands for change IDs that we have already created commands
@@ -1439,10 +1458,11 @@ impl WorkflowMachines {
                                 .iter()
                                 .filter_map(|(k, ci)| ci.created_command.then_some(k.as_str())),
                             self.observed_internal_flags.clone(),
+                            annotations.clone(),
                         )?;
                         let mkey = self.add_cmd_to_wf_task(
                             patch_machine,
-                            cmd.metadata,
+                            annotations,
                             CommandIdKind::NeverResolves,
                         );
                         self.process_machine_responses(mkey, other_cmds)?;
@@ -1470,8 +1490,9 @@ impl WorkflowMachines {
                             attrs,
                             self.observed_internal_flags.clone(),
                             use_compat,
+                            annotations.clone(),
                         ),
-                        cmd.metadata,
+                        annotations,
                         CommandID::ChildWorkflowStart(seq).into(),
                     );
                 }
@@ -1481,7 +1502,8 @@ impl WorkflowMachines {
                         CommandID::ChildWorkflowStart(attrs.child_workflow_seq),
                         ChildWorkflowMachine,
                         cancel,
-                        attrs.reason
+                        attrs.reason,
+                        annotations
                     );
                 }
                 WFCommandVariant::RequestCancelExternalWorkflow(attrs) => {
@@ -1498,7 +1520,7 @@ impl WorkflowMachines {
                                 self.run_id, attrs.reason
                             ),
                         ),
-                        cmd.metadata,
+                        annotations,
                         CommandID::CancelExternal(attrs.seq).into(),
                     );
                 }
@@ -1506,7 +1528,7 @@ impl WorkflowMachines {
                     let seq = attrs.seq;
                     self.add_cmd_to_wf_task(
                         new_external_signal(attrs, &self.worker_config.namespace)?,
-                        cmd.metadata,
+                        annotations,
                         CommandID::SignalExternal(seq).into(),
                     );
                 }
@@ -1525,7 +1547,7 @@ impl WorkflowMachines {
                 WFCommandVariant::ModifyWorkflowProperties(attrs) => {
                     self.add_cmd_to_wf_task(
                         modify_workflow_properties(attrs),
-                        cmd.metadata,
+                        annotations,
                         CommandIdKind::NeverResolves,
                     );
                 }
@@ -1549,8 +1571,9 @@ impl WorkflowMachines {
                         NexusOperationMachine::new_scheduled(
                             attrs,
                             self.observed_internal_flags.clone(),
+                            annotations.clone(),
                         ),
-                        cmd.metadata,
+                        annotations,
                         CommandID::NexusOperation(seq).into(),
                     );
                 }
@@ -1559,7 +1582,8 @@ impl WorkflowMachines {
                         self,
                         CommandID::NexusOperation(attrs.seq),
                         NexusOperationMachine,
-                        cancel
+                        cancel,
+                        annotations
                     );
                 }
                 WFCommandVariant::NoCommandsFromLang => (),
@@ -1595,9 +1619,9 @@ impl WorkflowMachines {
     fn add_terminal_command(
         &mut self,
         machine: NewMachineWithCommand,
-        metadata: Option<UserMetadata>,
+        annotations: CommandAnnotations,
     ) {
-        let cwfm = self.add_new_command_machine(machine, metadata);
+        let cwfm = self.add_new_command_machine(machine, annotations);
         self.workflow_end_time = Some(SystemTime::now());
         self.current_wf_task_commands.push_back(cwfm);
         // Wipe out any pending / executing local activity data since we're about to terminate
@@ -1609,10 +1633,10 @@ impl WorkflowMachines {
     fn add_cmd_to_wf_task(
         &mut self,
         machine: NewMachineWithCommand,
-        metadata: Option<UserMetadata>,
+        annotations: CommandAnnotations,
         id: CommandIdKind,
     ) -> MachineKey {
-        let mach = self.add_new_command_machine(machine, metadata);
+        let mach = self.add_new_command_machine(machine, annotations);
         let key = mach.machine;
         if let CommandIdKind::LangIssued(id) = id {
             self.id_to_machine.insert(id, key);
@@ -1627,17 +1651,11 @@ impl WorkflowMachines {
     fn add_new_command_machine(
         &mut self,
         machine: NewMachineWithCommand,
-        metadata: Option<UserMetadata>,
+        annotations: CommandAnnotations,
     ) -> CommandAndMachine {
         let k = self.all_machines.insert(machine.machine);
-        let cmd = ProtoCommand {
-            command_type: machine.command.as_type() as i32,
-            attributes: Some(machine.command),
-            user_metadata: metadata,
-            event_group_markers: vec![],
-        };
         CommandAndMachine {
-            command: MachineAssociatedCommand::Real(Box::new(cmd)),
+            command: ProtoCommand::new(machine.command, annotations),
             machine: k,
         }
     }
@@ -1688,6 +1706,46 @@ impl WorkflowMachines {
                 target_tq.is_empty() || target_tq == self.worker_config.task_queue
             }
         }
+    }
+
+    /// Held resolutions wait for a later activation, but with no pending jobs there won't be one.
+    /// That only happens if replay produced different activations than the original execution,
+    /// in which case the resolutions are delivered the way ungrouped markers are, rather than
+    /// never.
+    fn release_held_local_activity_resolutions_if_idle(&mut self) -> Result<()> {
+        if !self.has_pending_jobs() {
+            self.apply_local_activity_peeked_resolutions(true)?;
+        }
+        Ok(())
+    }
+
+    /// Applies peeked local activity resolutions until the next marker belongs to an activity the
+    /// workflow has not scheduled yet, or, unless `include_held` is set, was recorded for a later
+    /// activation in this WFT. Older markers lack grouping information and retain the historical
+    /// batching behavior.
+    fn apply_local_activity_peeked_resolutions(&mut self, include_held: bool) -> Result<()> {
+        while let Some(seq) = self
+            .local_activity_data
+            .peek_preresolution_seq(include_held)
+        {
+            let Ok(mk) = self.get_machine_key(CommandID::LocalActivity(seq)) else {
+                break;
+            };
+            let dat = self
+                .local_activity_data
+                .take_preresolution(seq)
+                .expect("This seq was just returned by peek_preresolution_seq");
+            if let Machines::LocalActivityMachine(lam) = self.machine_mut(mk) {
+                let responses = lam.try_resolve_with_dat(dat)?;
+                self.process_machine_responses(mk, responses)?;
+            } else {
+                return Err(nondeterminism!(
+                    "Peeked local activity marker but the associated machine was of the wrong \
+                     type"
+                ));
+            }
+        }
+        Ok(())
     }
 }
 

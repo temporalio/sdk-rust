@@ -1,0 +1,697 @@
+use crate::common::{get_integ_server_options, get_integ_telem_options, integ_namespace};
+use futures_util::future::BoxFuture;
+use opentelemetry::{
+    Context,
+    trace::{FutureExt as _, TraceContextExt, Tracer, TracerProvider as _},
+};
+use opentelemetry_sdk::trace::{
+    InMemorySpanExporter, SdkTracer, SdkTracerProvider, SimpleSpanProcessor,
+};
+use std::{
+    sync::{
+        Arc,
+        atomic::{
+            AtomicU8, AtomicUsize,
+            Ordering::{self, Relaxed},
+        },
+    },
+    time::Duration,
+};
+use temporalio_client::{
+    Client, ClientInterceptor, ClientOptions, ClientPlugin, ConnectionOptions, NamespacedClient,
+    Next, PluginError, StartWorkflowInput, StartWorkflowOutput, WorkflowHistory,
+    WorkflowStartOptions, errors::WorkflowStartError,
+};
+use temporalio_common::{
+    data_converters::{
+        DataConverter, DefaultFailureConverter, PayloadCodec, PayloadConversionError,
+        PayloadConverter, SerializationContextData,
+    },
+    protos::{
+        coresdk::workflow_activation::WorkflowActivation, temporal::api::common::v1::Payload,
+    },
+};
+use temporalio_macros::{activities, workflow, workflow_methods};
+use temporalio_sdk::{
+    ActivityOptions, ChildWorkflowOptions, ClientAndWorkerPlugin, LocalActivityOptions, Runtime,
+    SimplePlugin, SyncWorkflowContext, Worker, WorkerOptions, WorkerPlugin, WorkflowContext,
+    WorkflowDefinitions, WorkflowResult,
+    activities::{ActivityContext, ActivityDefinitions, ActivityError},
+    interceptors::WorkerInterceptor,
+    opentelemetry::{OpenTelemetryPlugin, WorkflowIdGenerator, WorkflowSpanProcessor},
+    runtime::RuntimeOptions,
+    workflow_replayer::{WorkflowReplayer, WorkflowReplayerOptions},
+};
+use url::Url;
+use uuid::Uuid;
+
+fn new_sdk_runtime() -> Runtime {
+    Runtime::from_current_tokio(
+        RuntimeOptions::builder()
+            .telemetry_options(get_integ_telem_options())
+            .build()
+            .unwrap(),
+    )
+    .unwrap()
+}
+
+#[derive(Clone)]
+struct IntegrationPlugin {
+    connection_calls: Arc<AtomicU8>,
+    client_calls: Arc<AtomicU8>,
+    worker_calls: Arc<AtomicU8>,
+    target: Url,
+}
+
+impl ClientPlugin for IntegrationPlugin {
+    fn name(&self) -> &str {
+        "integration-plugin"
+    }
+
+    fn configure_connection_options(
+        &self,
+        options: &mut ConnectionOptions,
+    ) -> Result<(), PluginError> {
+        self.connection_calls.fetch_add(1, Relaxed);
+        options.target = self.target.clone();
+        options.identity = "integration-plugin-client".to_owned();
+        Ok(())
+    }
+
+    fn configure_client_options(&self, options: &mut ClientOptions) -> Result<(), PluginError> {
+        self.client_calls.fetch_add(1, Relaxed);
+        options.namespace = integ_namespace();
+        Ok(())
+    }
+}
+
+impl WorkerPlugin for IntegrationPlugin {
+    fn name(&self) -> &str {
+        "integration-plugin"
+    }
+
+    fn configure_worker_options(&self, options: &mut WorkerOptions) -> Result<(), PluginError> {
+        self.worker_calls.fetch_add(1, Relaxed);
+        options.max_cached_workflows = 0;
+        Ok(())
+    }
+}
+
+#[temporalio_macros::cloud_test_exclusion(
+    crate::CloudTestExclusionReason::NeedsCloudAdaptation,
+    "Retargeting the client discards envconfig TLS options, so the HTTPS Cloud connection cannot be established."
+)]
+#[tokio::test]
+async fn plugins_configure_client_and_worker() {
+    let runtime = new_sdk_runtime();
+    let connection_calls = Arc::new(AtomicU8::new(0));
+    let client_calls = Arc::new(AtomicU8::new(0));
+    let worker_calls = Arc::new(AtomicU8::new(0));
+    let server_options = get_integ_server_options();
+    let plugin = ClientAndWorkerPlugin::new(IntegrationPlugin {
+        connection_calls: connection_calls.clone(),
+        client_calls: client_calls.clone(),
+        worker_calls: worker_calls.clone(),
+        target: server_options.target,
+    });
+    let client_options = ClientOptions::new("plugin-replaces-this-namespace")
+        .plugin(plugin)
+        .build();
+    let connection_options =
+        ConnectionOptions::new(Url::parse("http://127.0.0.1:1").unwrap()).build();
+    let client = Client::connect(connection_options, client_options)
+        .await
+        .unwrap();
+    assert_eq!(client.connection().identity(), "integration-plugin-client");
+    assert_eq!(client.namespace(), integ_namespace());
+    let worker_options = WorkerOptions::new(format!("plugins-{}", Uuid::new_v4()))
+        .register_workflow::<SimplePluginWorkflow>()
+        .unwrap()
+        .build();
+    let _worker = Worker::new(&runtime, client, worker_options).unwrap();
+
+    assert_eq!(connection_calls.load(Relaxed), 1);
+    assert_eq!(client_calls.load(Relaxed), 1);
+    assert_eq!(worker_calls.load(Relaxed), 1);
+}
+
+struct CountingPayloadCodec {
+    encode_calls: Arc<AtomicUsize>,
+    decode_calls: Arc<AtomicUsize>,
+}
+
+impl PayloadCodec for CountingPayloadCodec {
+    fn encode(
+        &self,
+        _context: &SerializationContextData,
+        payloads: Vec<Payload>,
+    ) -> BoxFuture<'static, Result<Vec<Payload>, PayloadConversionError>> {
+        self.encode_calls.fetch_add(1, Ordering::Relaxed);
+        Box::pin(async move { Ok(payloads) })
+    }
+
+    fn decode(
+        &self,
+        _context: &SerializationContextData,
+        payloads: Vec<Payload>,
+    ) -> BoxFuture<'static, Result<Vec<Payload>, PayloadConversionError>> {
+        self.decode_calls.fetch_add(1, Ordering::Relaxed);
+        Box::pin(async move { Ok(payloads) })
+    }
+}
+
+struct CountingClientInterceptor {
+    calls: Arc<AtomicUsize>,
+}
+
+impl ClientInterceptor for CountingClientInterceptor {
+    fn start_workflow<'a>(
+        &'a self,
+        input: StartWorkflowInput,
+        next: Next<
+            'a,
+            StartWorkflowInput,
+            BoxFuture<'a, Result<StartWorkflowOutput, WorkflowStartError>>,
+        >,
+    ) -> BoxFuture<'a, Result<StartWorkflowOutput, WorkflowStartError>> {
+        self.calls.fetch_add(1, Ordering::Relaxed);
+        next.run(input)
+    }
+}
+
+struct CountingWorkerInterceptor {
+    calls: Arc<AtomicUsize>,
+}
+
+#[async_trait::async_trait(?Send)]
+impl WorkerInterceptor for CountingWorkerInterceptor {
+    async fn on_workflow_activation(
+        &self,
+        _activation: &WorkflowActivation,
+    ) -> Result<(), anyhow::Error> {
+        self.calls.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
+}
+
+#[workflow]
+#[derive(Default)]
+struct SimplePluginWorkflow;
+
+struct SimplePluginActivities;
+
+#[activities]
+impl SimplePluginActivities {
+    #[activity]
+    async fn greet(_ctx: ActivityContext, name: String) -> Result<String, ActivityError> {
+        Ok(format!("Hello, {name}!"))
+    }
+}
+
+#[workflow]
+struct OpenTelemetryPluginWorkflow {
+    tracer: SdkTracer,
+}
+
+#[workflow]
+#[derive(Default)]
+struct OpenTelemetryReplayWorkflow;
+
+#[workflow_methods]
+impl OpenTelemetryReplayWorkflow {
+    #[run]
+    async fn run(_ctx: &mut WorkflowContext<Self>) -> WorkflowResult<()> {
+        Ok(())
+    }
+}
+
+#[workflow]
+#[derive(Default)]
+struct OpenTelemetryChildWorkflow {
+    unblocked: bool,
+}
+
+#[workflow_methods]
+impl OpenTelemetryChildWorkflow {
+    #[run]
+    async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<()> {
+        ctx.wait_condition(|workflow| workflow.unblocked).await?;
+        Ok(())
+    }
+
+    #[signal]
+    fn unblock(&mut self, _ctx: &mut SyncWorkflowContext<Self>, _: ()) {
+        self.unblocked = true;
+    }
+}
+
+#[workflow_methods(factory_only)]
+impl OpenTelemetryPluginWorkflow {
+    #[run]
+    async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<String> {
+        let tracer = ctx.state(|workflow| workflow.tracer.clone());
+        let parent = Context::current();
+        let span_context = parent.with_span(tracer.start_with_context("ApplicationSpan", &parent));
+        let activity_ctx = ctx.clone();
+        let result: WorkflowResult<String> = async move {
+            let result = activity_ctx
+                .execute_activity(
+                    SimplePluginActivities::greet,
+                    "Temporal".to_owned(),
+                    ActivityOptions::start_to_close_timeout(Duration::from_secs(5)),
+                )
+                .await?;
+            activity_ctx
+                .execute_local_activity(
+                    SimplePluginActivities::greet,
+                    "Temporal".to_owned(),
+                    LocalActivityOptions::default(),
+                )
+                .await?;
+            let child = activity_ctx
+                .start_child_workflow(
+                    OpenTelemetryChildWorkflow::run,
+                    (),
+                    ChildWorkflowOptions::default(),
+                )
+                .await?;
+            child
+                .signal(OpenTelemetryChildWorkflow::unblock, (), Default::default())
+                .await?;
+            child.result().await?;
+            Ok(result)
+        }
+        .with_context(span_context.clone())
+        .await;
+        span_context.span().end();
+        result
+    }
+}
+
+#[workflow_methods]
+impl SimplePluginWorkflow {
+    #[run]
+    async fn run(ctx: &mut WorkflowContext<Self>, name: String) -> WorkflowResult<String> {
+        Ok(ctx
+            .execute_activity(
+                SimplePluginActivities::greet,
+                name,
+                ActivityOptions::start_to_close_timeout(Duration::from_secs(5)),
+            )
+            .await?)
+    }
+}
+
+#[tokio::test]
+async fn simple_plugin_configures_working_client_and_worker() {
+    let encode_calls = Arc::new(AtomicUsize::new(0));
+    let decode_calls = Arc::new(AtomicUsize::new(0));
+    let client_interceptor_calls = Arc::new(AtomicUsize::new(0));
+    let worker_interceptor_calls = Arc::new(AtomicUsize::new(0));
+    let data_converter = DataConverter::new(
+        PayloadConverter::default(),
+        DefaultFailureConverter::default(),
+        CountingPayloadCodec {
+            encode_calls: encode_calls.clone(),
+            decode_calls: decode_calls.clone(),
+        },
+    );
+    let mut activities = ActivityDefinitions::default();
+    activities.register_activities(SimplePluginActivities);
+    let mut workflows = WorkflowDefinitions::new();
+    workflows
+        .register_workflow::<SimplePluginWorkflow>()
+        .unwrap();
+    let plugin = SimplePlugin::builder("simple-integration-plugin")
+        .data_converter(data_converter)
+        .client_interceptors(vec![Arc::new(CountingClientInterceptor {
+            calls: client_interceptor_calls.clone(),
+        }) as Arc<dyn ClientInterceptor>])
+        .worker_interceptors(vec![Arc::new(CountingWorkerInterceptor {
+            calls: worker_interceptor_calls.clone(),
+        }) as Arc<dyn WorkerInterceptor>])
+        .activities(activities)
+        .workflows(workflows)
+        .build();
+    let client_options = ClientOptions::new(integ_namespace()).plugin(plugin).build();
+    let client = Client::connect(get_integ_server_options(), client_options)
+        .await
+        .unwrap();
+    let runtime = new_sdk_runtime();
+    let task_queue = format!("simple-plugin-{}", Uuid::new_v4());
+    let mut worker = Worker::new(
+        &runtime,
+        client.clone(),
+        WorkerOptions::new(task_queue.clone()).build(),
+    )
+    .unwrap();
+    let workflow_id = format!("simple-plugin-{}", Uuid::new_v4());
+    let handle = client
+        .start_workflow(
+            SimplePluginWorkflow::run,
+            "Temporal".to_owned(),
+            WorkflowStartOptions::new(task_queue, workflow_id).build(),
+        )
+        .await
+        .unwrap();
+
+    let shutdown = worker.shutdown_handle();
+    let (workflow_result, worker_result) = tokio::join!(
+        async {
+            let result = handle.get_result(Default::default()).await;
+            shutdown();
+            result
+        },
+        worker.run(),
+    );
+    worker_result.unwrap();
+    let workflow_result = workflow_result.unwrap();
+    assert_eq!(workflow_result, "Hello, Temporal!");
+    assert_eq!(client_interceptor_calls.load(Ordering::Relaxed), 1);
+    assert!(worker_interceptor_calls.load(Ordering::Relaxed) > 0);
+    assert!(encode_calls.load(Ordering::Relaxed) > 0);
+    assert!(decode_calls.load(Ordering::Relaxed) > 0);
+}
+
+#[tokio::test]
+async fn opentelemetry_plugin_connects_supported_spans_and_replays() {
+    let exporter = InMemorySpanExporter::default();
+    let provider = SdkTracerProvider::builder()
+        .with_id_generator(WorkflowIdGenerator::default())
+        .with_span_processor(WorkflowSpanProcessor::new(SimpleSpanProcessor::new(
+            exporter.clone(),
+        )))
+        .build();
+    let tracer = provider.tracer("integration-test");
+    let plugin = OpenTelemetryPlugin::builder()
+        .tracer(tracer.clone())
+        .build();
+    let client = Client::connect(
+        get_integ_server_options(),
+        ClientOptions::new(integ_namespace())
+            .plugin(plugin.clone())
+            .build(),
+    )
+    .await
+    .unwrap();
+    let runtime = new_sdk_runtime();
+    let task_queue = format!("opentelemetry-plugin-{}", Uuid::new_v4());
+    let worker_options = WorkerOptions::new(task_queue.clone())
+        .register_activities(SimplePluginActivities)
+        .register_workflow::<OpenTelemetryChildWorkflow>()
+        .unwrap()
+        .register_workflow_with_factory({
+            let tracer = tracer.clone();
+            move || OpenTelemetryPluginWorkflow {
+                tracer: tracer.clone(),
+            }
+        })
+        .unwrap()
+        .build();
+    let mut worker = Worker::new(&runtime, client.clone(), worker_options).unwrap();
+    let handle = client
+        .start_workflow(
+            OpenTelemetryPluginWorkflow::run,
+            (),
+            WorkflowStartOptions::new(
+                task_queue,
+                format!("opentelemetry-plugin-{}", Uuid::new_v4()),
+            )
+            .build(),
+        )
+        .await
+        .unwrap();
+
+    let shutdown = worker.shutdown_handle();
+    let (workflow_result, worker_result) = tokio::join!(
+        async {
+            let result = handle.get_result(Default::default()).await;
+            shutdown();
+            result
+        },
+        worker.run(),
+    );
+    worker_result.unwrap();
+    assert_eq!(workflow_result.unwrap(), "Hello, Temporal!");
+
+    let live_spans = exporter.get_finished_spans().unwrap();
+    let application = live_spans
+        .iter()
+        .find(|span| span.name == "ApplicationSpan")
+        .unwrap();
+    let application_activity_starts = live_spans
+        .iter()
+        .filter(|span| {
+            span.name.starts_with("StartActivity:")
+                && span.parent_span_id == application.span_context.span_id()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(application_activity_starts.len(), 2);
+    for activity_start in application_activity_starts {
+        assert!(live_spans.iter().any(|span| {
+            span.name.starts_with("RunActivity:")
+                && span.parent_span_id == activity_start.span_context.span_id()
+        }));
+    }
+
+    let child_start = live_spans
+        .iter()
+        .find(|span| span.name.starts_with("StartChildWorkflow:"))
+        .unwrap();
+    assert_eq!(
+        child_start.parent_span_id,
+        application.span_context.span_id()
+    );
+    let child_run = live_spans
+        .iter()
+        .find(|span| {
+            span.name.starts_with("RunWorkflow:")
+                && span.parent_span_id == child_start.span_context.span_id()
+        })
+        .unwrap();
+    let child_signal = live_spans
+        .iter()
+        .find(|span| span.name.starts_with("SignalWorkflow:"))
+        .unwrap();
+    assert_eq!(
+        child_signal.parent_span_id,
+        application.span_context.span_id()
+    );
+    assert!(live_spans.iter().any(|span| {
+        span.name.starts_with("HandleSignal:")
+            && span.parent_span_id == child_signal.span_context.span_id()
+            && span.span_context.trace_id() == child_run.span_context.trace_id()
+    }));
+    for span in &live_spans {
+        assert!(span.span_context.is_valid());
+    }
+
+    let history = handle.fetch_history(Default::default());
+    let replayer = WorkflowReplayer::new(
+        WorkflowReplayerOptions::new()
+            .worker_plugin(plugin)
+            .register_workflow::<OpenTelemetryChildWorkflow>()
+            .unwrap()
+            .register_workflow_with_factory(move || OpenTelemetryPluginWorkflow {
+                tracer: tracer.clone(),
+            })
+            .unwrap()
+            .build(),
+    )
+    .unwrap();
+    replayer.replay_workflow(history).await.unwrap();
+    assert_eq!(
+        exporter.get_finished_spans().unwrap().len(),
+        live_spans.len()
+    );
+}
+
+async fn run_opentelemetry_replay_workflow(client: Client) -> WorkflowHistory {
+    let runtime = new_sdk_runtime();
+    let task_queue = format!("opentelemetry-replay-{}", Uuid::new_v4());
+    let mut worker = Worker::new(
+        &runtime,
+        client.clone(),
+        WorkerOptions::new(task_queue.clone())
+            .register_workflow::<OpenTelemetryReplayWorkflow>()
+            .unwrap()
+            .build(),
+    )
+    .unwrap();
+    let handle = client
+        .start_workflow(
+            OpenTelemetryReplayWorkflow::run,
+            (),
+            WorkflowStartOptions::new(
+                task_queue,
+                format!("opentelemetry-replay-{}", Uuid::new_v4()),
+            )
+            .build(),
+        )
+        .await
+        .unwrap();
+
+    let shutdown = worker.shutdown_handle();
+    let (workflow_result, worker_result) = tokio::join!(
+        async {
+            let result = handle.get_result(Default::default()).await;
+            shutdown();
+            result
+        },
+        worker.run(),
+    );
+    worker_result.unwrap();
+    workflow_result.unwrap();
+    handle.fetch_history(Default::default())
+}
+
+#[tokio::test]
+async fn opentelemetry_plugin_replay_compatibility() {
+    let provider = SdkTracerProvider::builder()
+        .with_id_generator(WorkflowIdGenerator::default())
+        .build();
+    let plugin = OpenTelemetryPlugin::builder()
+        .tracer(provider.tracer("replay-test"))
+        .build();
+    let instrumented_client = Client::connect(
+        get_integ_server_options(),
+        ClientOptions::new(integ_namespace())
+            .plugin(plugin.clone())
+            .build(),
+    )
+    .await
+    .unwrap();
+    let instrumented_history = run_opentelemetry_replay_workflow(instrumented_client)
+        .await
+        .to_json()
+        .await
+        .unwrap();
+    WorkflowReplayer::new(
+        WorkflowReplayerOptions::new()
+            .register_workflow::<OpenTelemetryReplayWorkflow>()
+            .unwrap()
+            .build(),
+    )
+    .unwrap()
+    .replay_workflow(WorkflowHistory::from_json(&instrumented_history).unwrap())
+    .await
+    .unwrap();
+
+    let uninstrumented_client = Client::connect(
+        get_integ_server_options(),
+        ClientOptions::new(integ_namespace()).build(),
+    )
+    .await
+    .unwrap();
+    let uninstrumented_history = run_opentelemetry_replay_workflow(uninstrumented_client)
+        .await
+        .to_json()
+        .await
+        .unwrap();
+
+    let replayer = WorkflowReplayer::new(
+        WorkflowReplayerOptions::new()
+            .worker_plugin(plugin)
+            .register_workflow::<OpenTelemetryReplayWorkflow>()
+            .unwrap()
+            .build(),
+    )
+    .unwrap();
+    replayer
+        .replay_workflow(WorkflowHistory::from_json(&uninstrumented_history).unwrap())
+        .await
+        .unwrap();
+    replayer
+        .replay_workflow(
+            WorkflowHistory::from_json(include_bytes!(
+                "../histories/opentelemetry_replay_history.json"
+            ))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn plugin_errors_surface() {
+    let connection_result = Client::connect(
+        get_integ_server_options(),
+        ClientOptions::new(integ_namespace())
+            .client_plugin(FailingConnectionPlugin)
+            .build(),
+    )
+    .await;
+    assert_eq!(
+        connection_result.unwrap_err().to_string(),
+        "plugin 'failing-connection' failed to configure connection options: connection failure"
+    );
+
+    let client_result = Client::connect(
+        get_integ_server_options(),
+        ClientOptions::new(integ_namespace())
+            .client_plugin(FailingClientPlugin)
+            .build(),
+    )
+    .await;
+    assert_eq!(
+        client_result.unwrap_err().to_string(),
+        "plugin 'failing-client' failed to configure client options: client failure"
+    );
+
+    let client = Client::connect(
+        get_integ_server_options(),
+        ClientOptions::new(integ_namespace()).build(),
+    )
+    .await
+    .unwrap();
+    let worker_result = Worker::new(
+        &new_sdk_runtime(),
+        client,
+        WorkerOptions::new(format!("failing-plugin-{}", Uuid::new_v4()))
+            .worker_plugin(FailingWorkerPlugin)
+            .build(),
+    );
+    assert_eq!(
+        worker_result.unwrap_err().to_string(),
+        "plugin 'failing-worker' failed to configure worker options: worker failure"
+    );
+}
+
+struct FailingConnectionPlugin;
+
+impl ClientPlugin for FailingConnectionPlugin {
+    fn name(&self) -> &str {
+        "failing-connection"
+    }
+
+    fn configure_connection_options(
+        &self,
+        _options: &mut ConnectionOptions,
+    ) -> Result<(), PluginError> {
+        Err(PluginError::new("connection failure"))
+    }
+}
+
+struct FailingClientPlugin;
+
+impl ClientPlugin for FailingClientPlugin {
+    fn name(&self) -> &str {
+        "failing-client"
+    }
+
+    fn configure_client_options(&self, _options: &mut ClientOptions) -> Result<(), PluginError> {
+        Err(PluginError::new("client failure"))
+    }
+}
+
+struct FailingWorkerPlugin;
+
+impl WorkerPlugin for FailingWorkerPlugin {
+    fn name(&self) -> &str {
+        "failing-worker"
+    }
+
+    fn configure_worker_options(&self, _options: &mut WorkerOptions) -> Result<(), PluginError> {
+        Err(PluginError::new("worker failure"))
+    }
+}

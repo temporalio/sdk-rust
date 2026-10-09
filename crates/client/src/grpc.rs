@@ -193,7 +193,7 @@ fn req_cloner<T: Clone>(cloneme: &Request<T>) -> Request<T> {
 
 /// `*_warn` are the connection's configured warn thresholds; per-call error limits ride a
 /// [`PayloadErrorLimits`] extension. On an error-level violation, returns a [`Status`] carrying
-/// the [`PayloadLimitViolation`] as its source (extract via [crate::payload_limit_violation_from]).
+/// the payload limit violation as its source.
 fn validate_request_payload_limits<Req: Any>(
     req: &Request<Req>,
     blob_warn: usize,
@@ -429,6 +429,11 @@ impl<C> PayloadLimitsClient<C> {
     /// Set (or clear) the error limits injected on every call. Shared across clones.
     pub fn set_error_limits(&self, limits: Option<PayloadErrorLimits>) {
         *self.error_limits.write() = limits;
+    }
+
+    /// Return the error limits currently injected into requests.
+    pub fn error_limits(&self) -> Option<PayloadErrorLimits> {
+        *self.error_limits.read()
     }
 }
 
@@ -1337,8 +1342,22 @@ proxier! {
         ExecuteMultiOperationRequest,
         ExecuteMultiOperationResponse,
         |r| {
-            let labels = namespaced_request!(r);
-            r.extensions_mut().insert(labels);
+            let mut labels = namespaced_request!(r);
+            if let Some(execute_multi_operation_request::operation::Operation::StartWorkflow(
+                start_req,
+            )) = r
+                .get_ref()
+                .operations
+                .first()
+                .and_then(|op| op.operation.as_ref())
+            {
+                labels.task_q(start_req.task_queue.clone());
+            }
+            let exts = r.extensions_mut();
+            exts.insert(labels);
+            // Update-with-start blocks until the update reaches the requested wait stage, so it
+            // must be retried/timed out like other user long-polls.
+            exts.insert(IsUserLongPoll);
         }
     );
     (
@@ -1805,6 +1824,16 @@ proxier! {
         }
     );
     (
+        poll_workflow_execution_time_skipping,
+        PollWorkflowExecutionTimeSkippingRequest,
+        PollWorkflowExecutionTimeSkippingResponse,
+        |r| {
+            let labels = namespaced_request!(r);
+            r.extensions_mut().insert(labels);
+            r.extensions_mut().insert(IsUserLongPoll);
+        }
+    );
+    (
         request_cancel_nexus_operation_execution,
         RequestCancelNexusOperationExecutionRequest,
         RequestCancelNexusOperationExecutionResponse,
@@ -2026,8 +2055,11 @@ mod tests {
         req.extensions_mut()
             .insert(PayloadErrorLimits { blob: 10, memo: 10 });
         let err = validate_request_payload_limits(&req, 1, 1).unwrap_err();
-        let violation =
-            crate::payload_limit_violation_from(&err).expect("violation carried on status");
+        let violation = std::error::Error::source(&err)
+            .and_then(|source| {
+                source.downcast_ref::<temporalio_common::payload_limits::PayloadLimitViolation>()
+            })
+            .expect("violation carried on status");
         assert_eq!(violation.path, "input");
         assert_eq!(
             violation.class,
@@ -2278,14 +2310,14 @@ mod tests {
             }
         }
 
-        let deployment_opts = WorkerDeploymentOptions {
-            version: WorkerDeploymentVersion {
-                deployment_name: "test-deployment".to_string(),
-                build_id: "test-build-123".to_string(),
-            },
-            use_worker_versioning,
-            default_versioning_behavior: None,
-        };
+        let deployment_opts = WorkerDeploymentOptions::new(
+            WorkerDeploymentVersion::builder()
+                .deployment_name("test-deployment".to_string())
+                .build_id("test-build-123".to_string())
+                .build(),
+        )
+        .use_worker_versioning(use_worker_versioning)
+        .build();
 
         let mut mock_provider = MockClientWorker::new();
         mock_provider

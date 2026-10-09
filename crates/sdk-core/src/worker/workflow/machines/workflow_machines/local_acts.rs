@@ -4,10 +4,17 @@ use crate::{
     worker::{ExecutingLAId, LocalActRequest, NewLocalAct},
 };
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashSet, VecDeque},
     time::SystemTime,
 };
 use temporalio_common::protos::temporal::api::common::v1::WorkflowExecution;
+
+struct Preresolution {
+    seq: u32,
+    /// Older markers have no group, so replay must keep their existing batching behavior.
+    activation_index: Option<u64>,
+    resolution: ResolveDat,
+}
 
 #[derive(Default)]
 pub(super) struct LocalActivityData {
@@ -17,9 +24,14 @@ pub(super) struct LocalActivityData {
     cancel_requests: Vec<ExecutingLAId>,
     /// Seq #s of local activities which we have sent to be executed but have not yet resolved
     executing: HashSet<u32>,
-    /// Maps local activity sequence numbers to their resolutions as found when looking ahead at
-    /// next WFT
-    preresolutions: HashMap<u32, ResolveDat>,
+    /// Local activity resolutions in the order their markers were found while looking ahead at the
+    /// next WFT.
+    preresolutions: VecDeque<Preresolution>,
+    /// Position of the next activation within the current WFT. Recorded on markers so replay can
+    /// deliver each resolution in the same activation it was delivered in originally. Counting
+    /// from the start of the WFT keeps activations that leave no trace in history, such as those
+    /// for rejected updates, from shifting the positions of later ones.
+    activation_index: u64,
     /// Set true if the workflow is terminating
     am_terminating: bool,
 }
@@ -78,11 +90,56 @@ impl LocalActivityData {
     }
 
     pub(super) fn insert_peeked_marker(&mut self, dat: CompleteLocalActivityData) {
-        self.preresolutions.insert(dat.marker_dat.seq, dat.into());
+        self.preresolutions.push_back(Preresolution {
+            seq: dat.marker_dat.seq,
+            activation_index: dat.marker_dat.activation_index,
+            resolution: dat.into(),
+        });
     }
 
     pub(super) fn take_preresolution(&mut self, seq: u32) -> Option<ResolveDat> {
-        self.preresolutions.remove(&seq)
+        let idx = self
+            .preresolutions
+            .iter()
+            .position(|item| item.seq == seq)?;
+        let item = self
+            .preresolutions
+            .remove(idx)
+            .expect("This index was just found to contain seq");
+        Some(item.resolution)
+    }
+
+    /// Returns the seq of the next peeked resolution, unless it was recorded for a later
+    /// activation in this WFT and `include_held` is false.
+    pub(super) fn peek_preresolution_seq(&self, include_held: bool) -> Option<u32> {
+        let item = self.preresolutions.front()?;
+        if !include_held && self.is_held(item) {
+            return None;
+        }
+        Some(item.seq)
+    }
+
+    pub(super) fn has_held_preresolution(&self, seq: u32) -> bool {
+        self.preresolutions
+            .iter()
+            .any(|item| item.seq == seq && self.is_held(item))
+    }
+
+    fn is_held(&self, item: &Preresolution) -> bool {
+        item.activation_index
+            .is_some_and(|group| group > self.activation_index)
+    }
+
+    pub(super) fn wft_applied(&mut self) {
+        self.activation_index = 0;
+    }
+
+    pub(super) fn activation_dispatched(&mut self) {
+        self.activation_index += 1;
+    }
+
+    pub(super) fn current_activation_index(&self) -> u64 {
+        self.activation_index
     }
 
     pub(super) fn remove_from_queue(&mut self, seq: u32) -> Option<ValidScheduleLA> {

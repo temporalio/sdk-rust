@@ -1,7 +1,8 @@
 [package]
 name = "temporalio-sdk"
-version = "0.5.0"
+version = "1.1.0"
 edition = "2024"
+rust-version = "1.92.0"
 authors = ["Spencer Judge <spencer@temporal.io>"]
 license-file = { workspace = true }
 description = "Temporal Rust SDK"
@@ -12,6 +13,9 @@ categories = ["development-tools"]
 readme = "README.md"
 autoexamples = false
 
+[package.metadata.docs.rs]
+features = ["experimental", "opentelemetry"]
+
 [dependencies]
 async-trait = "0.1"
 anyhow = "1.0"
@@ -21,6 +25,8 @@ futures-util = { version = "0.3", default-features = false, features = [
   "async-await-macro",
 ] }
 gethostname = "1.0.2"
+opentelemetry = { workspace = true, features = ["trace"], optional = true }
+opentelemetry_sdk = { version = "0.32", default-features = false, features = ["trace"], optional = true }
 parking_lot = { version = "0.12" }
 prost = { workspace = true }
 prost-types = { workspace = true }
@@ -39,42 +45,48 @@ tokio-stream = { version = "0.1", default-features = false }
 tracing = "0.1"
 uuid = { version = "1.18", default-features = false, features = ["v4"] }
 wasmtime = { version = "44", optional = true, features = ["component-model"] }
+url = { version = "2.5", optional = true }
 
 [dependencies.temporalio-sdk-core]
 path = "../sdk-core"
-version = "0.5"
+version = "=0.10.0"
 default-features = false
 
 [dependencies.temporalio-workflow]
 path = "../workflow"
-version = "0.5"
+version = "~1.1.0"
 
 [dependencies.temporalio-common]
 path = "../common"
-version = "0.5"
+version = "~1.1.0"
 default-features = false
 
 [dependencies.temporalio-client]
 path = "../client"
-version = "0.5"
+version = "~1.1.0"
 default-features = false
 
 [dependencies.temporalio-macros]
 path = "../macros"
-version = "0.5"
+version = "~1.1.0"
 
 [dev-dependencies]
 futures = "0.3"
+opentelemetry_sdk = { version = "0.32", features = ["testing"] }
 rstest = "0.26"
 
 [features]
 default = ["envconfig", "prometheus"]
 envconfig = ["temporalio-sdk-core/envconfig"]
+experimental = ["temporalio-client/experimental", "temporalio-workflow/experimental"]
 prometheus = ["temporalio-sdk-core/prometheus"]
 otel = ["temporalio-sdk-core/otel"]
+opentelemetry = ["dep:opentelemetry", "dep:opentelemetry_sdk"]
 examples = ["serde/derive", "dep:serde_json", "envconfig"]
 wasm-examples = []
 wasm-workflows = ["dep:wasmtime"]
+dynamic-tls = ["temporalio-client/dynamic-tls"]
+testing = ["temporalio-sdk-core/ephemeral-server", "dep:url"]
 
 [dependencies.serde_json]
 version = "1"
@@ -108,6 +120,11 @@ required-features = ["examples"]
 [[example]]
 name = "activity-interceptor-starter"
 path = "examples/activity_interceptor/starter.rs"
+required-features = ["examples"]
+
+[[example]]
+name = "workflow-context"
+path = "examples/workflow_context.rs"
 required-features = ["examples"]
 
 [[example]]
@@ -218,6 +235,36 @@ required-features = ["examples"]
 [[example]]
 name = "schedules-starter"
 path = "examples/schedules/starter.rs"
+required-features = ["examples"]
+
+[[example]]
+name = "standalone-activities-worker"
+path = "examples/standalone_activities/worker.rs"
+required-features = ["examples"]
+
+[[example]]
+name = "standalone-activities-execute"
+path = "examples/standalone_activities/execute_activity.rs"
+required-features = ["examples"]
+
+[[example]]
+name = "standalone-activities-start"
+path = "examples/standalone_activities/start_activity.rs"
+required-features = ["examples"]
+
+[[example]]
+name = "standalone-activities-get-handle"
+path = "examples/standalone_activities/get_activity_handle.rs"
+required-features = ["examples"]
+
+[[example]]
+name = "standalone-activities-list"
+path = "examples/standalone_activities/list_activities.rs"
+required-features = ["examples"]
+
+[[example]]
+name = "standalone-activities-count"
+path = "examples/standalone_activities/count_activities.rs"
 required-features = ["examples"]
 
 [[example]]

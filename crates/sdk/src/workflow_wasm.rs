@@ -6,17 +6,14 @@ use temporalio_common::protos::{
     coresdk::workflow_commands::WorkflowCommand, temporal::api::failure::v1::Failure,
 };
 use temporalio_workflow::{
-    PatchActivationCaller,
-    runtime::{
-        guest::WorkflowInstance,
-        host::WorkflowHost,
-        types::{
-            ActivationJobResult, ActivationResult, MainRoutineCompletion, QueryResponse,
-            RoutineCompletion, RoutinePollResult, StartedRoutine, TaskFailure, TerminalOutcome,
-            UpdateRoutineCompletion, UpdateRoutineKind, WorkflowActivation,
-            WorkflowDefinitionDescriptor, WorkflowFailure,
-        },
+    __private::sdk::{
+        ActivationJobResult, ActivationResult, MainRoutineCompletion, QueryResponse,
+        RoutineCompletion, RoutineKind, RoutinePendingState, RoutinePollResult, StartedRoutine,
+        TaskFailure, TerminalOutcome, UpdateRoutineCompletion, UpdateRoutineKind,
+        WorkflowActivation, WorkflowFailure, WorkflowHost, WorkflowInstance,
     },
+    PatchActivationCaller,
+    workflows::{UpdateDefinitionDescriptor, WorkflowDefinitionDescriptor},
 };
 use wasmtime::{
     Config, Engine, Store,
@@ -95,7 +92,14 @@ impl WorkflowDefinitions {
     pub(crate) fn register_wasm_workflows(
         &mut self,
         components: Vec<WasmWorkflowComponent>,
+        has_native_workflow_interceptors: bool,
     ) -> Result<(), anyhow::Error> {
+        if !components.is_empty() && has_native_workflow_interceptors {
+            tracing::warn!(
+                "Native workflow interceptors will not be applied to WASM workflow components; \
+                 define interceptors in the WASM bundle instead"
+            );
+        }
         for component in components {
             let module = Arc::new(CompiledWasmWorkflowModule::new(component)?);
             for definition in &module.definitions {
@@ -168,11 +172,9 @@ impl CompiledWasmWorkflowModule {
                         updates: def
                             .updates
                             .into_iter()
-                            .map(|u| {
-                                temporalio_workflow::runtime::types::UpdateDefinitionDescriptor {
-                                    name: u.name,
-                                    has_validator: u.has_validator,
-                                }
+                            .map(|u| UpdateDefinitionDescriptor {
+                                name: u.name,
+                                has_validator: u.has_validator,
                             })
                             .collect(),
                     })
@@ -199,6 +201,7 @@ impl CompiledWasmWorkflowModule {
             data_converter,
             host,
             patch_activation_callback,
+            ..
         } = input;
         let workflow_init = wit_types::WorkflowInit {
             namespace: namespace.clone(),
@@ -253,6 +256,7 @@ impl WorkflowInstance for WasmWorkflowInstance {
     fn activate(
         &mut self,
         activation: WorkflowActivation,
+        _waker: &std::task::Waker,
     ) -> Result<ActivationResult, WorkflowFailure> {
         let result = self.guest.workflow_instance().call_activate(
             &mut self.store,
@@ -269,20 +273,14 @@ impl WorkflowInstance for WasmWorkflowInstance {
                         ActivationJobResult::StartedRoutine(StartedRoutine {
                             routine_id: routine.routine_id,
                             kind: match routine.kind {
-                                wit_types::RoutineKind::Main => {
-                                    temporalio_workflow::runtime::types::RoutineKind::Main
-                                }
-                                wit_types::RoutineKind::Signal(name) => {
-                                    temporalio_workflow::runtime::types::RoutineKind::Signal(name)
-                                }
+                                wit_types::RoutineKind::Main => RoutineKind::Main,
+                                wit_types::RoutineKind::Signal(name) => RoutineKind::Signal(name),
                                 wit_types::RoutineKind::Update(update) => {
-                                    temporalio_workflow::runtime::types::RoutineKind::Update(
-                                        UpdateRoutineKind {
-                                            name: update.name,
-                                            update_id: update.update_id,
-                                            protocol_instance_id: update.protocol_instance_id,
-                                        },
-                                    )
+                                    RoutineKind::Update(UpdateRoutineKind {
+                                        name: update.name,
+                                        update_id: update.update_id,
+                                        protocol_instance_id: update.protocol_instance_id,
+                                    })
                                 }
                             },
                         })
@@ -332,7 +330,9 @@ impl WorkflowInstance for WasmWorkflowInstance {
                                 wit_types::TerminalOutcome::Failed(failure) => {
                                     TerminalOutcome::Failed(convert_failure(failure))
                                 }
-                                wit_types::TerminalOutcome::Cancelled => TerminalOutcome::Cancelled,
+                                wit_types::TerminalOutcome::Cancelled(details) => {
+                                    TerminalOutcome::Cancelled(details.map(decode_proto))
+                                }
                                 wit_types::TerminalOutcome::ContinueAsNew(req) => {
                                     TerminalOutcome::ContinueAsNew(Box::new(decode_proto(req)))
                                 }
@@ -366,6 +366,13 @@ impl WorkflowInstance for WasmWorkflowInstance {
                 }
             }),
             made_progress: result.made_progress,
+            pending_state: result.pending_state.map(|state| match state {
+                wit_types::RoutinePendingState::Handler => RoutinePendingState::Handler,
+                wit_types::RoutinePendingState::Interceptor => RoutinePendingState::Interceptor,
+                wit_types::RoutinePendingState::InterceptorWithActivation => {
+                    RoutinePendingState::InterceptorWithActivation
+                }
+            }),
         })
     }
 }

@@ -17,9 +17,14 @@ static LOCAL_ACT_TASK_TOKEN_PREFIX: &[u8] = b"local_act_";
     serde::Deserialize,
 )]
 /// Type-safe wrapper for task token bytes
-pub struct TaskToken(pub Vec<u8>);
+pub struct TaskToken(Vec<u8>);
 
 impl TaskToken {
+    /// Consumes this token and returns its underlying bytes.
+    pub fn into_inner(self) -> Vec<u8> {
+        self.0
+    }
+
     /// Task tokens for local activities are always prefixed with a special sigil so they can
     /// be identified easily
     pub fn new_local_activity_token(unique_data: impl IntoIterator<Item = u8>) -> Self {

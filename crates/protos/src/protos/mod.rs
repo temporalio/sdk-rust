@@ -89,7 +89,7 @@ pub mod coresdk {
             fn from(v: workflow_command::Variant) -> Self {
                 Self {
                     variant: Some(v),
-                    user_metadata: None,
+                    ..Default::default()
                 }
             }
         }
@@ -108,6 +108,7 @@ pub mod coresdk {
                 Self {
                     run_id: run_id.into(),
                     status: Some(workflow_activation_completion::Status::Successful(success)),
+                    ..Default::default()
                 }
             }
 
@@ -120,6 +121,7 @@ pub mod coresdk {
                 Self {
                     run_id: run_id.into(),
                     status: Some(workflow_activation_completion::Status::Successful(success)),
+                    ..Default::default()
                 }
             }
 
@@ -129,6 +131,7 @@ pub mod coresdk {
                 Self {
                     run_id: run_id.into(),
                     status: Some(workflow_activation_completion::Status::Successful(success)),
+                    ..Default::default()
                 }
             }
 
@@ -146,6 +149,7 @@ pub mod coresdk {
                                 as i32,
                         },
                     )),
+                    ..Default::default()
                 }
             }
 
@@ -269,6 +273,7 @@ pub mod coresdk {
                 WorkflowActivationCompletion {
                     run_id,
                     status: Some(workflow_activation_completion::Status::Successful(success)),
+                    ..Default::default()
                 }
             }
         }
@@ -741,6 +746,7 @@ pub mod coresdk {
                     Self {
                         status: Some(aer::Status::Failed(Failure {
                             failure: Some(fail),
+                            cause: ActivityTaskFailedCause::ActivityWorkerUnhandledFailure as i32,
                         })),
                     }
                 }
@@ -825,7 +831,11 @@ pub mod coresdk {
                     Self {
                         status: match r {
                             Ok(p) => Some(aer::Status::Completed(Success { result: Some(p) })),
-                            Err(f) => Some(aer::Status::Failed(Failure { failure: Some(f) })),
+                            Err(f) => Some(aer::Status::Failed(Failure {
+                                failure: Some(f),
+                                cause: ActivityTaskFailedCause::ActivityWorkerUnhandledFailure
+                                    as i32,
+                            })),
                         },
                     }
                 }
@@ -861,6 +871,7 @@ pub mod coresdk {
                     match self.status {
                         Some(activity_resolution::Status::Failed(Failure {
                             failure: Some(ref f),
+                            ..
                         })) => f.is_timeout(),
                         _ => None,
                     }
@@ -1302,13 +1313,16 @@ pub mod coresdk {
                 }
             }
 
-            impl From<WorkflowExecutionSignaledEventAttributes> for SignalWorkflow {
-                fn from(a: WorkflowExecutionSignaledEventAttributes) -> Self {
+            impl From<(WorkflowExecutionSignaledEventAttributes, i64)> for SignalWorkflow {
+                fn from(
+                    (a, originating_event_id): (WorkflowExecutionSignaledEventAttributes, i64),
+                ) -> Self {
                     Self {
                         signal_name: a.signal_name,
                         input: Vec::from_payloads(a.input),
                         identity: a.identity,
                         headers: a.header.map(Into::into).unwrap_or_default(),
+                        originating_event_id,
                     }
                 }
             }
@@ -1358,6 +1372,7 @@ pub mod coresdk {
                     start_time: Some(start_time),
                     root_workflow: attrs.root_workflow_execution,
                     priority: attrs.priority,
+                    original_execution_run_id: attrs.original_execution_run_id,
                 }
             }
         }
@@ -1952,6 +1967,7 @@ pub mod temporal {
                                 parent_close_policy: s.parent_close_policy,
                                 inherit_build_id,
                                 priority: s.priority,
+                                versioning_override: s.versioning_override,
                             },
                         )
                     }
@@ -2009,9 +2025,9 @@ pub mod temporal {
                     }
 
                     impl From<workflow_commands::CancelWorkflowExecution> for command::Attributes {
-                        fn from(_c: workflow_commands::CancelWorkflowExecution) -> Self {
+                        fn from(c: workflow_commands::CancelWorkflowExecution) -> Self {
                             Self::CancelWorkflowExecutionCommandAttributes(
-                                CancelWorkflowExecutionCommandAttributes { details: None },
+                                CancelWorkflowExecutionCommandAttributes { details: c.details },
                             )
                         }
                     }
@@ -2852,6 +2868,11 @@ pub mod temporal {
                         }
                     }
                 }
+            }
+        }
+        pub mod nexusoperation {
+            pub mod v1 {
+                tonic::include_proto!("temporal.api.nexusoperation.v1");
             }
         }
         pub mod nexusservices {

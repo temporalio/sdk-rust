@@ -1,11 +1,13 @@
+mod cloud_namespace;
+
 // All non-main.rs tests ignore dead common code so that the linter doesn't complain about about it.
 #[allow(dead_code)]
 mod common;
 
 use crate::common::integ_dev_server_config;
 use anyhow::{anyhow, bail};
-use clap::Parser;
-use common::INTEG_SERVER_TARGET_ENV_VAR;
+use clap::{Parser, Subcommand};
+use common::{INTEG_SERVER_TARGET_ENV_VAR, TEST_ENV_CONFIG_SERVER_ENV_VAR};
 use std::{
     env,
     path::{Path, PathBuf},
@@ -22,6 +24,9 @@ const INTEG_TEST_SERVER_USED_ENV_VAR: &str = "INTEG_TEST_SERVER_ON";
 #[derive(clap::Parser)]
 #[command(author, version, about, long_about = None)]
 struct Cli {
+    #[command(subcommand)]
+    command: Option<RunnerCommand>,
+
     /// Test harness to run. Anything defined as a `[[test]]` in core's `Cargo.toml` is valid.
     #[arg(short, long, default_value = "integ_tests")]
     test_name: String,
@@ -34,12 +39,37 @@ struct Cli {
     #[arg(short, long, allow_hyphen_values(true))]
     cargo_test_args: Vec<String>,
 
+    /// Existing test harness executable to run without invoking Cargo.
+    #[arg(long, conflicts_with_all = ["cargo_test_args", "just_build"])]
+    test_executable: Option<PathBuf>,
+
     #[arg(long)]
     /// If set, only run the build, not any tests
     just_build: bool,
 
+    /// Run only tests that are eligible for Temporal Cloud
+    #[arg(long)]
+    cloud: bool,
+
     /// The rest of the arguments will be passed through to the test harness
     harness_args: Vec<String>,
+}
+
+#[derive(Subcommand)]
+enum RunnerCommand {
+    /// Manage an isolated Temporal Cloud namespace for integration tests
+    CloudNamespace {
+        #[command(subcommand)]
+        command: CloudNamespaceCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum CloudNamespaceCommand {
+    /// Create a namespace and write its full name to GITHUB_OUTPUT
+    Create,
+    /// Delete a namespace and wait for deletion to finish
+    Delete { namespace: String },
 }
 
 #[derive(Copy, Clone, PartialEq, Eq, clap::ValueEnum)]
@@ -50,21 +80,41 @@ enum ServerKind {
     TestServer,
     /// Do not automatically start any server
     External,
+    /// Load the server connection configuration from envconfig without starting a server
+    #[value(name = "envconfig")]
+    EnvConfig,
 }
 
 #[tokio::main]
 async fn main() -> Result<(), anyhow::Error> {
     let Cli {
+        command,
         test_name,
         server_kind,
         cargo_test_args,
+        test_executable,
         just_build,
+        cloud,
         harness_args,
     } = Cli::parse();
+    if let Some(RunnerCommand::CloudNamespace { command }) = command {
+        return match command {
+            CloudNamespaceCommand::Create => cloud_namespace::create_namespace().await,
+            CloudNamespaceCommand::Delete { namespace } => {
+                cloud_namespace::delete_namespace(namespace).await
+            }
+        };
+    }
+    if cloud && test_name != "integ_tests" {
+        bail!("Cloud filtering is only defined for the integ_tests target");
+    }
+    if cloud && test_executable.is_some() {
+        bail!("Cloud filtering requires Cargo to build the test target with cloud-test-mode");
+    }
     let cargo = env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
     // Try building first, so that we error early on build failures & don't start server
     // Unclear why --all-features doesn't work here
-    let test_args_preamble = [
+    let mut test_args_preamble = [
         "test",
         "--features",
         "temporalio-common/serde_serialize",
@@ -74,26 +124,29 @@ async fn main() -> Result<(), anyhow::Error> {
         "ephemeral-server",
         "--features",
         "temporalio-sdk-core/otel",
-        "--test",
-        &test_name,
     ]
     .into_iter()
     .map(ToString::to_string)
-    .chain(cargo_test_args)
     .collect::<Vec<_>>();
-    let mut build_cmd = Command::new(&cargo);
-    strip_cargo_env_vars(&mut build_cmd);
-    let status = build_cmd
-        .args([test_args_preamble.as_slice(), &["--no-run".to_string()]].concat())
-        .status()
-        .await?;
-    if !status.success() {
-        bail!("Building integration tests failed!");
+    if cloud {
+        test_args_preamble.extend(["--features".to_owned(), "cloud-test-mode".to_owned()]);
+    }
+    test_args_preamble.extend(["--test".to_owned(), test_name.clone()]);
+    test_args_preamble.extend(cargo_test_args);
+    if test_executable.is_none() {
+        let mut build_cmd = Command::new(&cargo);
+        strip_cargo_env_vars(&mut build_cmd);
+        let status = build_cmd
+            .args([test_args_preamble.as_slice(), &["--no-run".to_string()]].concat())
+            .status()
+            .await?;
+        if !status.success() {
+            bail!("Building integration tests failed!");
+        }
     }
     if just_build {
         return Ok(());
     }
-
     let (server, envs) = match server_kind {
         ServerKind::TemporalCLI => {
             let config =
@@ -128,10 +181,29 @@ async fn main() -> Result<(), anyhow::Error> {
             println!("========================================================");
             (None, vec![])
         }
+        ServerKind::EnvConfig => {
+            println!("========================================================");
+            println!("Not starting up a server. Loading its configuration from envconfig.");
+            println!("========================================================");
+            (None, vec![(TEST_ENV_CONFIG_SERVER_ENV_VAR, "true")])
+        }
     };
 
-    let mut cmd = Command::new(&cargo);
-    strip_cargo_env_vars(&mut cmd);
+    let mut cmd = if let Some(test_executable) = test_executable {
+        let mut cmd = Command::new(test_executable);
+        cmd.args(harness_args);
+        cmd
+    } else {
+        let mut cmd = Command::new(&cargo);
+        strip_cargo_env_vars(&mut cmd);
+        cmd.args(
+            test_args_preamble
+                .into_iter()
+                .chain(["--".to_string()])
+                .chain(harness_args),
+        );
+        cmd
+    };
     if let Some(srv) = server.as_ref() {
         println!("Running on {}", srv.target);
         cmd.env(
@@ -140,14 +212,9 @@ async fn main() -> Result<(), anyhow::Error> {
         );
     }
     let status = cmd
+        .env_remove(TEST_ENV_CONFIG_SERVER_ENV_VAR)
         .envs(envs)
         .current_dir(project_root())
-        .args(
-            test_args_preamble
-                .into_iter()
-                .chain(["--".to_string()])
-                .chain(harness_args),
-        )
         .status()
         .await?;
 

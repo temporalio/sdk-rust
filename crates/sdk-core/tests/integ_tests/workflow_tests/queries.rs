@@ -1,6 +1,5 @@
 //! Tests for SDK-level query handling
 
-use crate::common::build_fake_sdk;
 use serde::{Deserialize, Serialize};
 use std::{cell::Cell, collections::HashMap, future::poll_fn, task::Poll, time::Duration};
 use temporalio_common::protos::{
@@ -60,6 +59,7 @@ impl CompleteOnSecondPollWf {
 /// The error message from core when this happens is:
 /// "Workflow completion had a legacy query response along with other commands.
 /// This is not allowed and constitutes an error in the lang SDK."
+#[temporalio_macros::cloud_test_exclusion(crate::CloudTestExclusionReason::DoesNotUseServer)]
 #[tokio::test]
 async fn query_only_activation_should_not_advance_workflow() {
     let mut t = TestHistoryBuilder::default();
@@ -111,14 +111,16 @@ async fn query_only_activation_should_not_advance_workflow() {
             });
     });
 
-    let mut worker = build_fake_sdk(mock_cfg);
-    worker
-        .register_workflow::<CompleteOnSecondPollWf>()
-        .unwrap();
+    let mut worker = crate::common::build_fake_sdk_with_options(mock_cfg, |options| {
+        options
+            .register_workflow::<CompleteOnSecondPollWf>()
+            .unwrap();
+    });
     worker.run().await.unwrap();
 }
 
 /// Test that a query for a non-existent handler doesn't advance the workflow either.
+#[temporalio_macros::cloud_test_exclusion(crate::CloudTestExclusionReason::DoesNotUseServer)]
 #[tokio::test]
 async fn nonexistent_query_should_not_advance_workflow() {
     let mut t = TestHistoryBuilder::default();
@@ -170,10 +172,11 @@ async fn nonexistent_query_should_not_advance_workflow() {
             });
     });
 
-    let mut worker = build_fake_sdk(mock_cfg);
-    worker
-        .register_workflow::<CompleteOnSecondPollWf>()
-        .unwrap();
+    let mut worker = crate::common::build_fake_sdk_with_options(mock_cfg, |options| {
+        options
+            .register_workflow::<CompleteOnSecondPollWf>()
+            .unwrap();
+    });
     worker.run().await.unwrap();
 }
 
@@ -191,7 +194,7 @@ impl CounterWf {
     #[run(name = DEFAULT_WORKFLOW_TYPE)]
     async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<()> {
         ctx.state_mut(|s| s.counter += 1);
-        ctx.wait_condition(|s| s.got_signal).await;
+        ctx.wait_condition(|s| s.got_signal).await?;
         ctx.state_mut(|s| s.counter += 1);
         Ok(())
     }
@@ -210,6 +213,7 @@ impl CounterWf {
 /// Non-legacy queries (in the `queries` field) come bundled with new history.
 /// Core sends these queries in their own activation after the workflow has processed
 /// the history, so queries should observe state AFTER the workflow has advanced.
+#[temporalio_macros::cloud_test_exclusion(crate::CloudTestExclusionReason::DoesNotUseServer)]
 #[tokio::test]
 async fn non_legacy_query_should_see_state_after_workflow_advances() {
     let wfid = "non_legacy_query_state_test";
@@ -298,8 +302,9 @@ async fn non_legacy_query_should_see_state_after_workflow_advances() {
             });
     });
 
-    let mut worker = build_fake_sdk(mock_cfg);
-    worker.register_workflow::<CounterWf>().unwrap();
+    let mut worker = crate::common::build_fake_sdk_with_options(mock_cfg, |options| {
+        options.register_workflow::<CounterWf>().unwrap();
+    });
     worker.run().await.unwrap();
 }
 
@@ -350,6 +355,7 @@ impl ContextViewWf {
 }
 
 /// Test that WorkflowContextView contains the correct workflow information.
+#[temporalio_macros::cloud_test_exclusion(crate::CloudTestExclusionReason::DoesNotUseServer)]
 #[tokio::test]
 async fn query_returns_workflow_context_view_info() {
     const WFID: &str = "context_view_test_wf";
@@ -414,8 +420,9 @@ async fn query_returns_workflow_context_view_info() {
         });
     });
 
-    let mut worker = build_fake_sdk(mock_cfg);
-    worker.register_workflow::<ContextViewWf>().unwrap();
+    let mut worker = crate::common::build_fake_sdk_with_options(mock_cfg, |options| {
+        options.register_workflow::<ContextViewWf>().unwrap();
+    });
     worker.run().await.unwrap();
 }
 
@@ -430,13 +437,14 @@ impl CurrentDetailsWf {
     #[run(name = DEFAULT_WORKFLOW_TYPE)]
     async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<()> {
         ctx.set_current_details("details from workflow");
-        ctx.wait_condition(|_| false).await;
+        ctx.wait_condition(|_| false).await?;
         Ok(())
     }
 }
 
 /// Verify that the query returns a proto-JSON-encoded `WorkflowMetadata`
 /// whose `current_details` field reflects the value set by `set_current_details`.
+#[temporalio_macros::cloud_test_exclusion(crate::CloudTestExclusionReason::DoesNotUseServer)]
 #[tokio::test]
 async fn workflow_metadata_query_returns_current_details() {
     let wfid = "workflow_metadata_query_test";
@@ -508,8 +516,9 @@ async fn workflow_metadata_query_returns_current_details() {
         true
     });
 
-    let mut worker = build_fake_sdk(mock_cfg);
-    worker.register_workflow::<CurrentDetailsWf>().unwrap();
+    let mut worker = crate::common::build_fake_sdk_with_options(mock_cfg, |options| {
+        options.register_workflow::<CurrentDetailsWf>().unwrap();
+    });
     worker.run().await.unwrap();
 }
 
@@ -522,13 +531,14 @@ struct NoCurrentDetailsWf;
 impl NoCurrentDetailsWf {
     #[run(name = DEFAULT_WORKFLOW_TYPE)]
     async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<()> {
-        ctx.wait_condition(|_| false).await;
+        ctx.wait_condition(|_| false).await?;
         Ok(())
     }
 }
 
 /// Verify that the query returns `{}` when `set_current_details` was never
 /// called, matching proto3 JSON behavior where default (empty) fields are omitted.
+#[temporalio_macros::cloud_test_exclusion(crate::CloudTestExclusionReason::DoesNotUseServer)]
 #[tokio::test]
 async fn workflow_metadata_query_empty_details() {
     let wfid = "workflow_metadata_query_empty_test";
@@ -583,7 +593,8 @@ async fn workflow_metadata_query_empty_details() {
         true
     });
 
-    let mut worker = build_fake_sdk(mock_cfg);
-    worker.register_workflow::<NoCurrentDetailsWf>().unwrap();
+    let mut worker = crate::common::build_fake_sdk_with_options(mock_cfg, |options| {
+        options.register_workflow::<NoCurrentDetailsWf>().unwrap();
+    });
     worker.run().await.unwrap();
 }

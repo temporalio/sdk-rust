@@ -1,15 +1,23 @@
-use std::time::{Duration, SystemTime};
+use super::{
+    WorkflowContextKey, WorkflowContextValueStore, WorkflowRandomState, WorkflowRandomStream,
+    WorkflowRandomStreamSource,
+};
+use std::{
+    cell::RefCell,
+    rc::Rc,
+    time::{Duration, SystemTime},
+};
 
 use temporalio_common_wasm::{
     Memo, Priority, RetryPolicy, WorkflowExecution,
-    data_converters::{PayloadConverter, SerializationContextData},
+    data_converters::{PayloadConverter, SerializationContextData, WorkflowSerializationContext},
     protos::coresdk::{
         common::NamespacedWorkflowExecution, workflow_activation::InitializeWorkflow,
     },
     search_attributes::SearchAttributes,
 };
 
-/// Read-only view of workflow context for use in init and query handlers.
+/// Read-only view of workflow context for use in init, query, and update-validator handlers.
 ///
 /// This provides access to workflow information but cannot issue commands.
 #[derive(Clone, Debug)]
@@ -20,6 +28,9 @@ pub struct WorkflowContextView {
     task_queue: String,
     run_id: String,
     payload_converter: PayloadConverter,
+    requires_replay_safety: bool,
+    workflow_random: Option<Rc<RefCell<WorkflowRandomState>>>,
+    context_values: WorkflowContextValueStore,
 }
 
 impl WorkflowContextView {
@@ -30,6 +41,8 @@ impl WorkflowContextView {
         run_id: String,
         raw: InitializeWorkflow,
         payload_converter: PayloadConverter,
+        requires_replay_safety: bool,
+        workflow_random: Option<Rc<RefCell<WorkflowRandomState>>>,
     ) -> Self {
         Self {
             raw,
@@ -37,7 +50,19 @@ impl WorkflowContextView {
             task_queue,
             run_id,
             payload_converter,
+            requires_replay_safety,
+            workflow_random,
+            context_values: WorkflowContextValueStore::default(),
         }
+    }
+
+    pub(super) fn with_context_values(mut self, context_values: WorkflowContextValueStore) -> Self {
+        self.context_values = context_values;
+        self
+    }
+
+    pub(super) fn into_parts(self) -> (String, String, String, InitializeWorkflow) {
+        (self.namespace, self.task_queue, self.run_id, self.raw)
     }
 
     /// Returns the workflow's unique identifier.
@@ -140,7 +165,7 @@ impl WorkflowContextView {
         Memo::from_raw(
             self.raw.memo.clone(),
             self.payload_converter.clone(),
-            SerializationContextData::Workflow,
+            SerializationContextData::Workflow(WorkflowSerializationContext::new()),
         )
     }
 
@@ -150,6 +175,34 @@ impl WorkflowContextView {
             .search_attributes
             .as_ref()
             .map(SearchAttributes::from_proto)
+    }
+
+    /// Return the value associated with key type `K` in the current workflow context scope.
+    ///
+    /// This allows queries and update validators to observe values established by synchronous
+    /// inbound interceptors without allowing the handler to modify the context scope.
+    pub fn context_value<K: WorkflowContextKey>(&self) -> Option<Rc<K::Value>> {
+        self.context_values.context_value::<K>()
+    }
+
+    #[allow(
+        dead_code,
+        reason = "used by SDK-provided interceptors built separately from this change"
+    )]
+    pub(crate) fn random_stream(&self, name: impl Into<String>) -> WorkflowRandomStream {
+        let source = if self.requires_replay_safety {
+            WorkflowRandomStreamSource::Workflow(
+                self.workflow_random
+                    .clone()
+                    .expect("replay-safe context views must have workflow randomness"),
+            )
+        } else {
+            super::system_random_stream_source()
+        };
+        WorkflowRandomStream {
+            source,
+            name: name.into(),
+        }
     }
 
     /// Accesses the underlying workflow initialization protobuf.

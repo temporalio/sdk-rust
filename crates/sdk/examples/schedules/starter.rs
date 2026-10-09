@@ -37,7 +37,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .await?;
     println!("Created schedule: {schedule_id}");
 
-    let desc = handle.describe().await?;
+    let desc = handle.describe(Default::default()).await?;
     println!("Schedule is paused: {}", desc.paused());
 
     let mut stream = client.list_schedules(ListSchedulesOptions::default());
@@ -46,12 +46,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("Found schedule: {:?}", entry);
     }
 
-    handle.trigger(ScheduleOverlapPolicy::Unspecified).await?;
+    handle
+        .trigger(ScheduleOverlapPolicy::Unspecified, Default::default())
+        .await?;
     println!("Triggered schedule");
 
     tokio::time::sleep(std::time::Duration::from_secs(5)).await;
 
-    handle.delete().await?;
+    handle.delete(Default::default()).await?;
     println!("Deleted schedule");
 
     Ok(())

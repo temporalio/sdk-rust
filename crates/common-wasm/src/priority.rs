@@ -19,7 +19,9 @@ use crate::protos::temporal::api::common;
 /// The overall semantics of Priority are:
 /// (more will be added here later)
 /// 1. First, consider "priority_key": lower number goes first.
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq, bon::Builder)]
+#[builder(on(String, into), state_mod(vis = "pub"))]
+#[non_exhaustive]
 pub struct Priority {
     /// Priority key is a positive integer from 1 to n, where smaller integers
     /// correspond to higher priorities (tasks run sooner). In general, tasks in

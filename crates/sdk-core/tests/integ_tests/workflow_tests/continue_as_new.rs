@@ -1,4 +1,4 @@
-use crate::common::{CoreWfStarter, SEARCH_ATTR_TXT, build_fake_sdk};
+use crate::common::{CoreWfStarter, SEARCH_ATTR_TXT};
 use std::{sync::Arc, time::Duration};
 use temporalio_client::WorkflowStartOptions;
 use temporalio_common::{
@@ -10,16 +10,16 @@ use temporalio_common::{
         history::v1::history_event,
     },
     search_attributes::{SearchAttributeKey, SearchAttributes},
-    worker::WorkerTaskTypes,
 };
 use temporalio_macros::{workflow, workflow_methods};
-use temporalio_sdk::{ContinueAsNewOptions, WorkflowContext, WorkflowResult, WorkflowTermination};
+use temporalio_sdk::{
+    ContinueAsNewOptions, ContinueAsNewVersioningBehavior, WorkflowContext, WorkflowResult,
+};
 use temporalio_sdk_core::{
     TunerHolder,
     replay::{DEFAULT_WORKFLOW_TYPE, canned_histories},
     test_help::MockPollCfg,
 };
-use temporalio_workflow::runtime::types::ContinueAsNewRequest;
 
 const SA_TXT: SearchAttributeKey<String> = SearchAttributeKey::text(SEARCH_ATTR_TXT);
 
@@ -33,7 +33,7 @@ impl ContinueAsNewWf {
     async fn run(ctx: &mut WorkflowContext<Self>, run_ct: u8) -> WorkflowResult<()> {
         ctx.timer(Duration::from_millis(500)).await;
         if run_ct < 5 {
-            ctx.continue_as_new(&(run_ct + 1), ContinueAsNewOptions::default())?;
+            ctx.continue_as_new(run_ct + 1, ContinueAsNewOptions::default())?;
         }
         Ok(())
     }
@@ -43,9 +43,11 @@ impl ContinueAsNewWf {
 async fn continue_as_new_happy_path() {
     let wf_name = "continue_as_new_happy_path";
     let mut starter = CoreWfStarter::new(wf_name);
-    starter.sdk_config.task_types = WorkerTaskTypes::workflow_only();
+    starter
+        .sdk_config
+        .register_workflow::<ContinueAsNewWf>()
+        .unwrap();
     let mut worker = starter.worker().await;
-    worker.register_workflow::<ContinueAsNewWf>().unwrap();
 
     let task_queue = starter.get_task_queue().to_owned();
     worker
@@ -59,15 +61,66 @@ async fn continue_as_new_happy_path() {
     worker.run_until_done().await.unwrap();
 }
 
+#[workflow]
+#[derive(Default)]
+struct ContinueAsNewRandomWf;
+
+#[workflow_methods]
+impl ContinueAsNewRandomWf {
+    #[run]
+    async fn run(
+        ctx: &mut WorkflowContext<Self>,
+        previous_value: Option<u64>,
+    ) -> WorkflowResult<(u64, u64)> {
+        let value = ctx.random_stream("continue-as-new-test").random::<u64>();
+        if ctx.info().continued_from_run_id().is_none() {
+            ctx.continue_as_new(Some(value), ContinueAsNewOptions::default())?;
+        }
+        Ok((
+            previous_value.expect("first run should pass its stream value"),
+            value,
+        ))
+    }
+}
+
+#[tokio::test]
+async fn continue_as_new_reseeds_named_random_streams() {
+    let wf_name = "continue_as_new_reseeds_named_random_streams";
+    let mut starter = CoreWfStarter::new(wf_name);
+    starter
+        .sdk_config
+        .register_workflow::<ContinueAsNewRandomWf>()
+        .unwrap();
+    let mut worker = starter.worker().await;
+
+    let task_queue = starter.get_task_queue().to_owned();
+    let handle = worker
+        .submit_workflow(
+            ContinueAsNewRandomWf::run,
+            None,
+            WorkflowStartOptions::new(task_queue, wf_name).build(),
+        )
+        .await
+        .unwrap();
+    worker.run_until_done().await.unwrap();
+    let (first_value, continued_value) = handle.get_result(Default::default()).await.unwrap();
+    assert_ne!(
+        first_value, continued_value,
+        "continue-as-new should independently seed named streams"
+    );
+}
+
 #[tokio::test]
 async fn continue_as_new_multiple_concurrent() {
     let wf_name = "continue_as_new_multiple_concurrent";
     let mut starter = CoreWfStarter::new(wf_name);
-    starter.sdk_config.task_types = WorkerTaskTypes::workflow_only();
     starter.sdk_config.max_cached_workflows = 5_usize;
-    starter.sdk_config.tuner = Arc::new(TunerHolder::fixed_size(5, 1, 1, 1));
+    starter.set_core_tuner(Arc::new(TunerHolder::fixed_size(5, 1, 1, 1)));
+    starter
+        .sdk_config
+        .register_workflow::<ContinueAsNewWf>()
+        .unwrap();
     let mut worker = starter.worker().await;
-    worker.register_workflow::<ContinueAsNewWf>().unwrap();
 
     let task_queue = starter.get_task_queue().to_owned();
     let wf_names = (1..=20).map(|i| format!("{wf_name}-{i}"));
@@ -93,14 +146,17 @@ impl WfWithTimer {
     #[run(name = DEFAULT_WORKFLOW_TYPE)]
     async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<()> {
         ctx.timer(Duration::from_millis(500)).await;
-        Err(WorkflowTermination::continue_as_new(ContinueAsNewRequest {
-            arguments: vec![[1].into()],
-            initial_versioning_behavior: ProtoContinueAsNewVersioningBehavior::AutoUpgrade.into(),
-            ..Default::default()
-        }))
+        ctx.continue_as_new(
+            (),
+            ContinueAsNewOptions::builder()
+                .initial_versioning_behavior(ContinueAsNewVersioningBehavior::AutoUpgrade)
+                .build(),
+        )?;
+        Ok(())
     }
 }
 
+#[temporalio_macros::cloud_test_exclusion(crate::CloudTestExclusionReason::DoesNotUseServer)]
 #[tokio::test]
 async fn wf_completing_with_continue_as_new() {
     let t = canned_histories::timer_then_continue_as_new("1");
@@ -125,8 +181,9 @@ async fn wf_completing_with_continue_as_new() {
             });
     });
 
-    let mut worker = build_fake_sdk(mock_cfg);
-    worker.register_workflow::<WfWithTimer>().unwrap();
+    let mut worker = crate::common::build_fake_sdk_with_options(mock_cfg, |options| {
+        options.register_workflow::<WfWithTimer>().unwrap();
+    });
     worker.run().await.unwrap();
 }
 
@@ -145,11 +202,12 @@ impl ContinueAsNewSuggestedWf {
         // Second WFT: flag should be true (set on WFT started event 8)
         assert!(ctx.continue_as_new_suggested());
         assert!(ctx.target_worker_deployment_version_changed());
-        ctx.continue_as_new(&(), ContinueAsNewOptions::default())?;
+        ctx.continue_as_new((), ContinueAsNewOptions::default())?;
         Ok(())
     }
 }
 
+#[temporalio_macros::cloud_test_exclusion(crate::CloudTestExclusionReason::DoesNotUseServer)]
 #[tokio::test]
 async fn continue_as_new_suggested_flag_exposed() {
     let mut t = canned_histories::timer_then_continue_as_new("1");
@@ -164,10 +222,11 @@ async fn continue_as_new_suggested_flag_exposed() {
     });
 
     let mock_cfg = MockPollCfg::from_hist_builder(t);
-    let mut worker = build_fake_sdk(mock_cfg);
-    worker
-        .register_workflow::<ContinueAsNewSuggestedWf>()
-        .unwrap();
+    let mut worker = crate::common::build_fake_sdk_with_options(mock_cfg, |options| {
+        options
+            .register_workflow::<ContinueAsNewSuggestedWf>()
+            .unwrap();
+    });
     worker.run().await.unwrap();
 }
 
@@ -182,7 +241,7 @@ impl ClearSearchAttrsOnContinueAsNewWf {
         if first_run {
             let mut opts = ContinueAsNewOptions::default();
             opts.search_attributes = Some(SearchAttributes::default());
-            ctx.continue_as_new(&false, opts)?;
+            ctx.continue_as_new(false, opts)?;
         }
 
         assert!(ctx.search_attributes().is_empty());
@@ -190,15 +249,19 @@ impl ClearSearchAttrsOnContinueAsNewWf {
     }
 }
 
+#[temporalio_macros::cloud_test_exclusion(
+    crate::CloudTestExclusionReason::RequiresCloudProvisioning,
+    "Uses a custom search attribute that isolated Cloud CI does not provision."
+)]
 #[tokio::test]
 async fn clear_search_attributes_on_continue_as_new() {
     let wf_name = "clear_search_attrs_on_continue_as_new";
     let mut starter = CoreWfStarter::new(wf_name);
-    starter.sdk_config.task_types = WorkerTaskTypes::workflow_only();
-    let mut worker = starter.worker().await;
-    worker
+    starter
+        .sdk_config
         .register_workflow::<ClearSearchAttrsOnContinueAsNewWf>()
         .unwrap();
+    let mut worker = starter.worker().await;
 
     let task_queue = starter.get_task_queue().to_owned();
     worker

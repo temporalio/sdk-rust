@@ -75,9 +75,16 @@ async fn build_endpoint(
     tls_options: Option<&TlsOptions>,
     keep_alive: Option<&ClientKeepAliveOptions>,
     override_origin: Option<&Uri>,
+    connect_timeout: Option<Duration>,
 ) -> Result<Endpoint, ClientConnectError> {
     let uri = endpoint_uri(addr, scheme);
     let channel = Channel::from_shared(uri)?;
+
+    let channel = if let Some(timeout) = connect_timeout {
+        channel.connect_timeout(timeout)
+    } else {
+        channel
+    };
 
     // When connecting to an IP with TLS, SNI must use the original hostname.
     let tls_for_ip = tls_options.map(|tls| {
@@ -89,7 +96,19 @@ async fn build_endpoint(
             patched
         }
     });
-    let channel = add_tls_to_channel(tls_for_ip.as_ref().or(tls_options), channel).await?;
+    let tls_result = add_tls_to_channel(tls_for_ip.as_ref().or(tls_options), channel).await?;
+
+    let channel = match tls_result {
+        crate::TlsConfigResult::Standard(ep) => ep,
+        #[cfg(feature = "dynamic-tls")]
+        crate::TlsConfigResult::CustomConnector { .. } => {
+            return Err(ClientConnectError::InvalidConfig(
+                "client_cert_resolver is not yet supported with dns_load_balancing. \
+                 Disable dns_load_balancing or use static client_tls_options instead."
+                    .to_owned(),
+            ));
+        }
+    };
 
     let channel = if let Some(keep_alive) = keep_alive {
         channel
@@ -146,6 +165,7 @@ pub(crate) async fn create_balanced_channel(
             options.tls_options.as_ref(),
             options.keep_alive.as_ref(),
             options.override_origin.as_ref(),
+            options.connect_timeout,
         )
         .await?;
         // Unbounded-ish send into the freshly-created channel; can't realistically fail.
@@ -156,6 +176,7 @@ pub(crate) async fn create_balanced_channel(
 }
 
 /// Handle that aborts the DNS re-resolution task when dropped.
+#[derive(Debug)]
 pub(crate) struct DnsReresolutionHandle {
     abort_handle: tokio::task::AbortHandle,
 }
@@ -174,6 +195,7 @@ pub(crate) fn spawn_dns_reresolution(
     keep_alive: Option<ClientKeepAliveOptions>,
     override_origin: Option<Uri>,
     resolution_interval: Duration,
+    connect_timeout: Option<Duration>,
 ) -> Arc<DnsReresolutionHandle> {
     let host = target.host_str().unwrap_or("").to_owned();
     let port = target.port_or_known_default().unwrap_or(7233);
@@ -225,6 +247,7 @@ pub(crate) fn spawn_dns_reresolution(
                     tls_options.as_ref(),
                     keep_alive.as_ref(),
                     override_origin.as_ref(),
+                    connect_timeout,
                 )
                 .await
                 {
@@ -317,10 +340,11 @@ mod tests {
     #[test]
     fn zero_resolution_interval_is_error() {
         let opts = ConnectionOptions::new(Url::parse("http://temporal.example.com:7233").unwrap())
-            .dns_load_balancing(Some(DnsLoadBalancingOptions {
-                resolution_interval: Duration::ZERO,
-                ..Default::default()
-            }))
+            .dns_load_balancing(Some(
+                DnsLoadBalancingOptions::builder()
+                    .resolution_interval(Duration::ZERO)
+                    .build(),
+            ))
             .build();
         assert!(validate_and_get_dns_lb(&opts).is_err());
     }
@@ -328,10 +352,11 @@ mod tests {
     #[test]
     fn sub_minimum_resolution_interval_is_error() {
         let opts = ConnectionOptions::new(Url::parse("http://temporal.example.com:7233").unwrap())
-            .dns_load_balancing(Some(DnsLoadBalancingOptions {
-                resolution_interval: Duration::from_millis(500),
-                ..Default::default()
-            }))
+            .dns_load_balancing(Some(
+                DnsLoadBalancingOptions::builder()
+                    .resolution_interval(Duration::from_millis(500))
+                    .build(),
+            ))
             .build();
         assert!(validate_and_get_dns_lb(&opts).is_err());
     }

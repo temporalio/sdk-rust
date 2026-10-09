@@ -16,7 +16,7 @@ impl ContinueAsNewWorkflow {
 
         if current_iteration < max_iterations {
             ctx.continue_as_new(
-                &(current_iteration + 1, max_iterations),
+                (current_iteration + 1, max_iterations),
                 ContinueAsNewOptions::default(),
             )?;
         }

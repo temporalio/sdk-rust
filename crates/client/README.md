@@ -7,9 +7,6 @@ This crate provides a Rust client for interacting with the Temporal service. It 
 standalone to start and manage workflows, or together with the
 [`temporalio-sdk`](https://crates.io/crates/temporalio-sdk) crate to run workers.
 
-⚠️ **This crate is in Public Preview and under active development.** The API can and
-will continue to evolve.
-
 ## Quick Start
 
 ### Connecting and Starting Workflows with Environment Configuration
@@ -54,9 +51,8 @@ supported variables and the TOML file format.
 ```rust
 use temporalio_client::{
     Client, ClientOptions, Connection, ConnectionOptions,
-    WorkflowOptions, GetWorkflowResultOptions,
+    WorkflowOptions, GetWorkflowResultOptions, Url,
 };
-use temporalio_sdk_core::{Url, CoreRuntime, RuntimeOptions};
 use std::str::FromStr;
 
 #[tokio::main]
@@ -91,7 +87,7 @@ Once you have a workflow handle, you can interact with the running workflow:
 ```rust
 use temporalio_client::{
     SignalOptions, QueryOptions, UpdateOptions,
-    StartUpdateOptions, WorkflowUpdateWaitStage,
+    StartUpdateOptions,
     UntypedSignal,
 };
 use temporalio_common::data_converters::{PayloadConverter, RawValue};
@@ -117,9 +113,7 @@ let update_handle = handle
     .start_update(
         MyWorkflow::add_wait_return,
         50,
-        StartUpdateOptions::builder()
-            .wait_for_stage(WorkflowUpdateWaitStage::Accepted)
-            .build()
+        StartUpdateOptions::default()
     )
     .await?;
 update_handle.get_result().await?;
@@ -164,6 +158,16 @@ while let Some(result) = stream.next().await {
     println!("Workflow: {} ({})", execution.id(), execution.workflow_type());
 }
 ```
+
+## Experimental APIs
+
+APIs that are still under development require the `experimental` Cargo feature and may change or
+be removed before stabilization.
+
+## Building Without `protoc`
+
+Enable the `vendored-protox` Cargo feature to compile protobuf definitions with `protox`
+instead of a system `protoc` binary.
 
 ## Raw gRPC Access
 

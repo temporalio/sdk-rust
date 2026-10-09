@@ -1,16 +1,22 @@
 //! Runtime protocol and execution model types shared by workflow code and native hosts.
 
+#[cfg(feature = "experimental")]
+mod nexus;
+#[cfg(feature = "experimental")]
+pub(crate) use nexus::NexusStartResult;
+
 use crate::{
+    WorkflowCancellationError,
     runtime::types::ContinueAsNewRequest,
-    workflow_context::{
-        ChildWfCommon, NexusUnblockData, PendingChildWorkflow, StartedNexusOperation,
-    },
+    workflow_context::{ChildWfCommon, PendingChildWorkflow},
+    workflow_interceptors::WorkflowOutputValue,
 };
 use temporalio_common_wasm::{
     WorkflowDefinition,
+    data_converters::{PayloadConversionError, TemporalSerializable},
     error::{
-        ActivityExecutionError, ApplicationFailure, ChildWorkflowExecutionError,
-        WorkflowSignalError,
+        ActivityExecutionError, ApplicationFailure, CancelExternalWorkflowError,
+        ChildWorkflowExecutionError, ChildWorkflowStartError, WorkflowSignalError,
     },
     protos::{
         coresdk::{
@@ -22,18 +28,25 @@ use temporalio_common_wasm::{
                 resolve_nexus_operation_start,
             },
         },
-        temporal::api::failure::v1::Failure,
+        temporal::api::{
+            enums::v1::{
+                CancelExternalWorkflowExecutionFailedCause,
+                SignalExternalWorkflowExecutionFailedCause,
+            },
+            failure::v1::Failure,
+        },
     },
 };
 
+#[cfg_attr(not(feature = "experimental"), allow(dead_code))]
 #[derive(Debug)]
-pub enum UnblockEvent {
+pub(crate) enum UnblockEvent {
     Timer(u32, TimerResult),
     Activity(u32, Box<ActivityResolution>),
     WorkflowStart(u32, Box<ChildWorkflowStartStatus>),
     WorkflowComplete(u32, Box<ChildWorkflowResult>),
-    SignalExternal(u32, Option<Failure>),
-    CancelExternal(u32, Option<Failure>),
+    SignalExternal(u32, Option<SignalExternalWfFailure>),
+    CancelExternal(u32, Option<CancelExternalWfFailure>),
     NexusOperationStart(u32, Box<resolve_nexus_operation_start::Status>),
     NexusOperationComplete(u32, Box<NexusOperationResult>),
 }
@@ -49,15 +62,25 @@ pub enum TimerResult {
 
 /// Successful result of sending a signal to an external workflow
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct SignalExternalOk;
+pub(crate) struct SignalExternalOk;
+#[derive(Debug)]
+pub(crate) struct SignalExternalWfFailure {
+    pub(crate) failure: Failure,
+    pub(crate) cause: SignalExternalWorkflowExecutionFailedCause,
+}
 /// Result of awaiting on sending a signal to an external workflow
-pub type SignalExternalWfResult = Result<SignalExternalOk, Failure>;
+pub(crate) type SignalExternalWfResult = Result<SignalExternalOk, SignalExternalWfFailure>;
 
-/// Successful result of sending a cancel request to an external workflow
+/// Distinguishes external cancellation resolutions from other command results.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct CancelExternalOk;
-/// Result of awaiting on sending a cancel request to an external workflow
-pub type CancelExternalWfResult = Result<CancelExternalOk, Failure>;
+pub(crate) struct CancelExternalOk;
+#[derive(Debug)]
+pub(crate) struct CancelExternalWfFailure {
+    pub(crate) failure: Failure,
+    pub(crate) cause: CancelExternalWorkflowExecutionFailedCause,
+}
+/// Internal result delivered when an external cancellation command resolves.
+pub(crate) type CancelExternalWfResult = Result<CancelExternalOk, CancelExternalWfFailure>;
 
 pub(crate) trait Unblockable {
     type OtherDat;
@@ -139,46 +162,9 @@ impl Unblockable for CancelExternalWfResult {
     }
 }
 
-pub(crate) type NexusStartResult = Result<StartedNexusOperation, Failure>;
-
-impl Unblockable for NexusStartResult {
-    type OtherDat = NexusUnblockData;
-
-    fn unblock(ue: UnblockEvent, od: Self::OtherDat) -> Self {
-        match ue {
-            UnblockEvent::NexusOperationStart(_, result) => match *result {
-                resolve_nexus_operation_start::Status::OperationToken(op_token) => {
-                    Ok(StartedNexusOperation {
-                        operation_token: Some(op_token),
-                        unblock_dat: od,
-                    })
-                }
-                resolve_nexus_operation_start::Status::StartedSync(_) => {
-                    Ok(StartedNexusOperation {
-                        operation_token: None,
-                        unblock_dat: od,
-                    })
-                }
-                resolve_nexus_operation_start::Status::Failed(f) => Err(f),
-            },
-            _ => panic!("Invalid unblock event for nexus operation"),
-        }
-    }
-}
-
-impl Unblockable for NexusOperationResult {
-    type OtherDat = ();
-
-    fn unblock(ue: UnblockEvent, _: Self::OtherDat) -> Self {
-        match ue {
-            UnblockEvent::NexusOperationComplete(_, result) => *result,
-            _ => panic!("Invalid unblock event for nexus operation complete"),
-        }
-    }
-}
-
+#[cfg_attr(not(feature = "experimental"), allow(dead_code))]
 #[derive(Debug, Clone)]
-pub enum CancellableID {
+pub(crate) enum CancellableID {
     Timer(u32),
     Activity(u32),
     LocalActivity(u32),
@@ -202,19 +188,49 @@ impl CancellableID {
 pub type WorkflowResult<T> = Result<T, WorkflowTermination>;
 
 /// Represents ways a workflow can terminate without producing a normal result.
-#[derive(Debug, thiserror::Error)]
+///
+/// Payload conversion errors returned by workflow operations propagated directly into `WorkflowTermination`, such as with `?`, will fail
+/// the current Workflow Task so it can be retried.
+///
+/// Wrap an error in an [`ApplicationFailure`] to explicitly fail the Workflow Execution.
+#[derive(derive_more::Debug, thiserror::Error)]
 pub enum WorkflowTermination {
+    /// The Workflow Execution was cancelled, optionally with user-supplied details.
     #[error("Workflow cancelled")]
-    Cancelled,
+    Cancelled {
+        /// Optional cancellation details.
+        #[debug(skip)]
+        details: Option<Box<dyn WorkflowOutputValue + Send + Sync>>,
+    },
+    /// The workflow was evicted and must stop without producing a completion command.
     #[error("Workflow evicted from cache")]
     Evicted,
+    /// The workflow requested a new run with the supplied command attributes.
     #[error("Continue as new")]
     ContinueAsNew(Box<ContinueAsNewRequest>),
+    /// The Workflow Execution failed with an error already converted for outbound handling.
     #[error("Workflow failed: {0}")]
     Failed(#[source] temporalio_common_wasm::error::OutgoingWorkflowError),
 }
 
 impl WorkflowTermination {
+    /// Construct a cancelled workflow termination without details.
+    pub fn cancelled() -> Self {
+        Self::Cancelled { details: None }
+    }
+
+    /// Construct a cancelled workflow termination with details that will be converted using the
+    /// active payload converter.
+    pub fn cancelled_with_details<T>(details: T) -> Self
+    where
+        T: TemporalSerializable + Send + Sync + 'static,
+    {
+        Self::Cancelled {
+            details: Some(Box::new(details)),
+        }
+    }
+
+    /// Constructs a termination that asks the worker to continue the workflow as a new run.
     pub fn continue_as_new(can: ContinueAsNewRequest) -> Self {
         Self::ContinueAsNew(Box::new(can))
     }
@@ -225,9 +241,9 @@ impl WorkflowTermination {
     }
 }
 
-impl From<anyhow::Error> for WorkflowTermination {
-    fn from(err: anyhow::Error) -> Self {
-        Self::Failed(err.into())
+impl From<WorkflowCancellationError> for WorkflowTermination {
+    fn from(_value: WorkflowCancellationError) -> Self {
+        Self::cancelled()
     }
 }
 
@@ -237,22 +253,9 @@ impl From<ApplicationFailure> for WorkflowTermination {
     }
 }
 
-impl From<temporalio_common_wasm::data_converters::PayloadConversionError> for WorkflowTermination {
-    fn from(value: temporalio_common_wasm::data_converters::PayloadConversionError) -> Self {
+impl From<PayloadConversionError> for WorkflowTermination {
+    fn from(value: PayloadConversionError) -> Self {
         Self::Failed(value.into())
-    }
-}
-
-impl From<crate::runtime::entry::WorkflowError> for WorkflowTermination {
-    fn from(value: crate::runtime::entry::WorkflowError) -> Self {
-        match value {
-            crate::runtime::entry::WorkflowError::PayloadConversion(err) => Self::from(err),
-            crate::runtime::entry::WorkflowError::Execution(err) => Self::Failed(
-                temporalio_common_wasm::error::OutgoingWorkflowError::Application(Box::new(
-                    ApplicationFailure::new(err),
-                )),
-            ),
-        }
     }
 }
 
@@ -274,8 +277,54 @@ impl From<WorkflowSignalError> for WorkflowTermination {
     }
 }
 
-impl From<temporalio_common_wasm::error::ChildWorkflowStartError> for WorkflowTermination {
-    fn from(value: temporalio_common_wasm::error::ChildWorkflowStartError) -> Self {
+impl From<CancelExternalWorkflowError> for WorkflowTermination {
+    fn from(value: CancelExternalWorkflowError) -> Self {
         Self::Failed(value.into())
+    }
+}
+
+impl From<ChildWorkflowStartError> for WorkflowTermination {
+    fn from(value: ChildWorkflowStartError) -> Self {
+        Self::Failed(value.into())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rstest::rstest;
+    use temporalio_common_wasm::error::OutgoingWorkflowError;
+
+    fn conversion_error() -> PayloadConversionError {
+        PayloadConversionError::EncodingError(std::io::Error::other("test conversion error").into())
+    }
+
+    #[rstest]
+    #[case::payload(conversion_error())]
+    #[case::activity(ActivityExecutionError::Serialization(conversion_error()))]
+    #[case::child_start(ChildWorkflowStartError::Serialization(conversion_error()))]
+    #[case::child_execution(ChildWorkflowExecutionError::Serialization(conversion_error()))]
+    #[case::signal(WorkflowSignalError::Serialization(conversion_error()))]
+    #[case::cancel_external(CancelExternalWorkflowError::Serialization(conversion_error()))]
+    fn conversion_error_is_preserved_in_workflow_termination<T: Into<WorkflowTermination>>(
+        #[case] error: T,
+    ) {
+        let termination = error.into();
+        let WorkflowTermination::Failed(OutgoingWorkflowError::PayloadConversion(err)) =
+            termination
+        else {
+            panic!("expected a payload conversion failure");
+        };
+        assert_eq!(err.to_string(), "Encoding error: test conversion error");
+    }
+
+    #[test]
+    fn explicitly_wrapped_conversion_error_remains_an_application_failure() {
+        let termination = WorkflowTermination::from(ApplicationFailure::new(conversion_error()));
+
+        assert!(matches!(
+            termination,
+            WorkflowTermination::Failed(OutgoingWorkflowError::Application(_))
+        ));
     }
 }

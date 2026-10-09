@@ -32,6 +32,7 @@ use temporalio_common::protos::{
     },
     temporal::api::{
         command::v1::{Command as ProtoCommand, RecordMarkerCommandAttributes, command},
+        common::v1::Payloads,
         enums::v1::{CommandType, EventType, RetryState},
         failure::v1::{Failure, failure::FailureInfo},
     },
@@ -48,8 +49,7 @@ fsm! {
     // is replaying), and then immediately scheduled and transitions to either requesting that lang
     // execute the activity, or waiting for the marker from history.
     Executing --(Schedule, shared on_schedule) --> RequestSent;
-    Replaying --(Schedule, on_schedule) --> WaitingMarkerEvent;
-    ReplayingPreResolved --(Schedule, on_schedule) --> WaitingMarkerEventPreResolved;
+    Replaying --(Schedule, on_schedule) --> WaitingResolveFromMarkerLookAhead;
 
     // Execution path =============================================================================
     RequestSent --(HandleResult(ResolveDat), on_handle_result) --> MarkerCommandCreated;
@@ -66,32 +66,35 @@ fsm! {
       --> MarkerCommandRecorded;
 
     // Replay path ================================================================================
-    // LAs on the replay path always need to eventually see the marker
-    WaitingMarkerEvent --(MarkerRecorded(CompleteLocalActivityData), shared on_marker_recorded)
-      --> MarkerCommandRecorded;
+    WaitingResolveFromMarkerLookAhead --(HandleKnownResult(ResolveDat), on_handle_result)
+      --> ResolvedFromMarkerLookAheadWaitingMarkerEvent;
     // If we are told to cancel while waiting for the marker, we still need to wait for the marker.
-    WaitingMarkerEvent --(Cancel, on_cancel_requested) --> WaitingMarkerEvent;
+    WaitingResolveFromMarkerLookAhead --(Cancel, on_cancel_requested)
+      --> WaitingResolveFromMarkerLookAhead;
+    ResolvedFromMarkerLookAheadWaitingMarkerEvent --(Cancel, on_cancel_requested)
+      --> ResolvedFromMarkerLookAheadWaitingMarkerEvent;
+
     // Because there could be non-heartbeat WFTs (ex: signals being received) between scheduling
     // the LA and the marker being recorded, peekahead might not always resolve the LA *before*
     // scheduling it. This transition accounts for that.
-    WaitingMarkerEvent --(HandleKnownResult(ResolveDat), on_handle_result) --> WaitingMarkerEvent;
-    WaitingMarkerEvent --(NoWaitCancel(ActivityCancellationType),
-                          on_no_wait_cancel) --> WaitingMarkerEvent;
+    WaitingResolveFromMarkerLookAhead --(NoWaitCancel(ActivityCancellationType),
+                                         on_no_wait_cancel)
+      --> WaitingResolveFromMarkerLookAhead;
+    ResolvedFromMarkerLookAheadWaitingMarkerEvent --(NoWaitCancel(ActivityCancellationType),
+                                                      on_no_wait_cancel)
+      --> ResolvedFromMarkerLookAheadWaitingMarkerEvent;
+
+    // LAs on the replay path always need to eventually see the marker
+    ResolvedFromMarkerLookAheadWaitingMarkerEvent --(MarkerRecorded(CompleteLocalActivityData),
+                                                      shared on_marker_recorded)
+      --> MarkerCommandRecorded;
 
     // It is entirely possible to have started the LA while replaying, only to find that we have
     // reached a new WFT and there still was no marker. In such cases we need to execute the LA.
     // This can easily happen if upon first execution, the worker does WFT heartbeating but then
     // dies for some reason.
-    WaitingMarkerEvent --(StartedNonReplayWFT, shared on_started_non_replay_wft) --> RequestSent;
-
-    // If the activity is pre resolved we still expect to see marker recorded event at some point,
-    // even though we already resolved the activity.
-    WaitingMarkerEventPreResolved --(MarkerRecorded(CompleteLocalActivityData),
-                                     shared on_marker_recorded) --> MarkerCommandRecorded;
-    // Ignore cancellations when waiting for the marker after being pre-resolved
-    WaitingMarkerEventPreResolved --(Cancel) --> WaitingMarkerEventPreResolved;
-    WaitingMarkerEventPreResolved --(NoWaitCancel(ActivityCancellationType))
-                                     --> WaitingMarkerEventPreResolved;
+    WaitingResolveFromMarkerLookAhead --(StartedNonReplayWFT, shared on_started_non_replay_wft)
+      --> RequestSent;
 
     // Ignore cancellation in final state
     MarkerCommandRecorded --(Cancel, on_cancel_requested) --> MarkerCommandRecorded;
@@ -112,6 +115,7 @@ pub(super) struct ResolveDat {
     pub(super) attempt: u32,
     pub(super) backoff: Option<prost_types::Duration>,
     pub(super) original_schedule_time: Option<SystemTime>,
+    pub(super) activation_index: Option<u64>,
 }
 
 impl From<CompleteLocalActivityData> for ResolveDat {
@@ -132,6 +136,7 @@ impl From<CompleteLocalActivityData> for ResolveDat {
                     } else {
                         LocalActivityExecutionResult::Failed(ActFail {
                             failure: Some(fail),
+                            ..Default::default()
                         })
                     }
                 }
@@ -140,6 +145,7 @@ impl From<CompleteLocalActivityData> for ResolveDat {
             attempt: d.marker_dat.attempt,
             backoff: d.marker_dat.backoff,
             original_schedule_time: d.marker_dat.original_schedule_time.try_into_or_none(),
+            activation_index: d.marker_dat.activation_index,
         }
     }
 }
@@ -151,22 +157,12 @@ impl From<CompleteLocalActivityData> for ResolveDat {
 pub(super) fn new_local_activity(
     mut attrs: ValidScheduleLA,
     replaying_when_invoked: bool,
-    maybe_pre_resolved: Option<ResolveDat>,
     wf_time: Option<SystemTime>,
     internal_flags: InternalFlagsRef,
 ) -> Result<(LocalActivityMachine, Vec<MachineResponse>), WFMachinesError> {
     let initial_state = if replaying_when_invoked {
-        if let Some(dat) = maybe_pre_resolved {
-            ReplayingPreResolved { dat }.into()
-        } else {
-            Replaying {}.into()
-        }
+        Replaying {}.into()
     } else {
-        if maybe_pre_resolved.is_some() {
-            return Err(nondeterminism!(
-                "Local activity cannot be created as pre-resolved while not replaying"
-            ));
-        }
         Executing {}.into()
     };
 
@@ -202,15 +198,11 @@ impl LocalActivityMachine {
     /// command-event processing - instead simply applying the event to this machine and then
     /// skipping over the rest. If this machine is in the `ResultNotified` state, that means
     /// command handling should proceed as normal (ie: The command needs to be matched and removed).
-    /// The other valid states to make this check in are the `WaitingMarkerEvent[PreResolved]`
-    /// states, which will return true.
-    ///
     /// Attempting the check in any other state likely means a bug in the SDK.
     pub(super) fn marker_should_get_special_handling(&self) -> Result<bool, WFMachinesError> {
         match self.state() {
             LocalActivityMachineState::ResultNotified(_) => Ok(false),
-            LocalActivityMachineState::WaitingMarkerEvent(_) => Ok(true),
-            LocalActivityMachineState::WaitingMarkerEventPreResolved(_) => Ok(true),
+            LocalActivityMachineState::ResolvedFromMarkerLookAheadWaitingMarkerEvent(_) => Ok(true),
             _ => Err(fatal!(
                 "Attempted to check for LA marker handling in invalid state {}",
                 self.state()
@@ -223,7 +215,7 @@ impl LocalActivityMachine {
     pub(super) fn will_accept_resolve_marker(&self) -> bool {
         matches!(
             self.state(),
-            LocalActivityMachineState::WaitingMarkerEvent(_)
+            LocalActivityMachineState::WaitingResolveFromMarkerLookAhead(_)
         )
     }
 
@@ -234,7 +226,7 @@ impl LocalActivityMachine {
         // This only applies to the waiting-for-marker state. It can safely be ignored in the others
         if !matches!(
             self.state(),
-            LocalActivityMachineState::WaitingMarkerEvent(_)
+            LocalActivityMachineState::WaitingResolveFromMarkerLookAhead(_)
         ) {
             return Ok(vec![]);
         }
@@ -264,6 +256,7 @@ impl LocalActivityMachine {
         attempt: u32,
         backoff: Option<prost_types::Duration>,
         original_schedule_time: Option<SystemTime>,
+        activation_index: u64,
     ) -> Result<Vec<MachineResponse>, WFMachinesError> {
         self._try_resolve(
             ResolveDat {
@@ -272,6 +265,7 @@ impl LocalActivityMachine {
                 attempt,
                 backoff,
                 original_schedule_time,
+                activation_index: Some(activation_index),
             },
             false,
         )
@@ -314,7 +308,10 @@ impl LocalActivityMachine {
             .collect())
     }
 
-    pub(super) fn cancel(&mut self) -> Result<Vec<MachineResponse>, MachineError<WFMachinesError>> {
+    pub(super) fn cancel(
+        &mut self,
+        activation_index: u64,
+    ) -> Result<Vec<MachineResponse>, MachineError<WFMachinesError>> {
         let event = match self.shared_state.attrs.cancellation_type {
             ct @ ActivityCancellationType::TryCancel | ct @ ActivityCancellationType::Abandon => {
                 LocalActivityMachineEvents::NoWaitCancel(ct)
@@ -324,7 +321,12 @@ impl LocalActivityMachine {
         let cmds = OnEventWrapper::on_event_mut(self, event)?;
         let mach_resps = cmds
             .into_iter()
-            .map(|mc| self.adapt_response(mc, None))
+            .map(|mut mc| {
+                if let LocalActivityCommand::Resolved(dat) = &mut mc {
+                    dat.activation_index = Some(activation_index);
+                }
+                self.adapt_response(mc, None)
+            })
             .flatten_ok()
             .try_collect()?;
         Ok(mach_resps)
@@ -358,6 +360,7 @@ impl SharedState {
             attempt: self.attrs.attempt,
             backoff: None,
             original_schedule_time: self.attrs.original_schedule_time,
+            activation_index: None,
         }
     }
 }
@@ -368,12 +371,6 @@ pub(super) enum LocalActivityCommand {
     RequestActivityExecution(ValidScheduleLA),
     #[display("Resolved")]
     Resolved(ResolveDat),
-    /// The fake marker is used to avoid special casing marker recorded event handling.
-    /// If we didn't have the fake marker, there would be no "outgoing command" to match
-    /// against the event. This way there is, but the command never will be issued to
-    /// server because it is understood to be meaningless.
-    #[display("FakeMarker")]
-    FakeMarker,
     /// Indicate we want to cancel an LA that is currently executing, or look up if we have
     /// processed a marker with resolution data since the machine was constructed.
     #[display("Cancel")]
@@ -448,31 +445,10 @@ impl MarkerCommandRecorded {
 #[derive(Default, Clone)]
 pub(super) struct Replaying {}
 impl Replaying {
-    pub(super) fn on_schedule(self) -> LocalActivityMachineTransition<WaitingMarkerEvent> {
-        TransitionResult::ok(
-            [],
-            WaitingMarkerEvent {
-                already_resolved: false,
-            },
-        )
-    }
-}
-
-#[derive(Clone)]
-pub(super) struct ReplayingPreResolved {
-    dat: ResolveDat,
-}
-impl ReplayingPreResolved {
     pub(super) fn on_schedule(
         self,
-    ) -> LocalActivityMachineTransition<WaitingMarkerEventPreResolved> {
-        TransitionResult::ok(
-            [
-                LocalActivityCommand::FakeMarker,
-                LocalActivityCommand::Resolved(self.dat),
-            ],
-            WaitingMarkerEventPreResolved {},
-        )
+    ) -> LocalActivityMachineTransition<WaitingResolveFromMarkerLookAhead> {
+        TransitionResult::ok([], WaitingResolveFromMarkerLookAhead {})
     }
 }
 
@@ -559,35 +535,16 @@ impl ResultNotified {
 }
 
 #[derive(Default, Clone)]
-pub(super) struct WaitingMarkerEvent {
-    already_resolved: bool,
-}
+pub(super) struct WaitingResolveFromMarkerLookAhead {}
 
-impl WaitingMarkerEvent {
-    pub(super) fn on_marker_recorded(
-        self,
-        shared: &mut SharedState,
-        dat: CompleteLocalActivityData,
-    ) -> LocalActivityMachineTransition<MarkerCommandRecorded> {
-        verify_marker_dat!(
-            shared,
-            &dat,
-            TransitionResult::commands(if self.already_resolved {
-                vec![]
-            } else {
-                vec![LocalActivityCommand::Resolved(dat.into())]
-            })
-        )
-    }
+impl WaitingResolveFromMarkerLookAhead {
     fn on_handle_result(
         self,
         dat: ResolveDat,
-    ) -> LocalActivityMachineTransition<WaitingMarkerEvent> {
+    ) -> LocalActivityMachineTransition<ResolvedFromMarkerLookAheadWaitingMarkerEvent> {
         TransitionResult::ok(
             [LocalActivityCommand::Resolved(dat)],
-            WaitingMarkerEvent {
-                already_resolved: true,
-            },
+            ResolvedFromMarkerLookAheadWaitingMarkerEvent {},
         )
     }
     pub(super) fn on_started_non_replay_wft(
@@ -601,7 +558,9 @@ impl WaitingMarkerEvent {
         )])
     }
 
-    fn on_cancel_requested(self) -> LocalActivityMachineTransition<WaitingMarkerEvent> {
+    fn on_cancel_requested(
+        self,
+    ) -> LocalActivityMachineTransition<WaitingResolveFromMarkerLookAhead> {
         // We still "request a cancel" even though we know the local activity should not be running
         // because the data might be in the pre-resolved list.
         TransitionResult::ok([LocalActivityCommand::RequestCancel], self)
@@ -610,7 +569,7 @@ impl WaitingMarkerEvent {
     fn on_no_wait_cancel(
         self,
         _: ActivityCancellationType,
-    ) -> LocalActivityMachineTransition<WaitingMarkerEvent> {
+    ) -> LocalActivityMachineTransition<WaitingResolveFromMarkerLookAhead> {
         // Markers are always recorded when cancelling, so this is the same as a normal cancel on
         // the replay path
         self.on_cancel_requested()
@@ -618,14 +577,27 @@ impl WaitingMarkerEvent {
 }
 
 #[derive(Default, Clone)]
-pub(super) struct WaitingMarkerEventPreResolved {}
-impl WaitingMarkerEventPreResolved {
+pub(super) struct ResolvedFromMarkerLookAheadWaitingMarkerEvent {}
+impl ResolvedFromMarkerLookAheadWaitingMarkerEvent {
     pub(super) fn on_marker_recorded(
         self,
         shared: &mut SharedState,
         dat: CompleteLocalActivityData,
     ) -> LocalActivityMachineTransition<MarkerCommandRecorded> {
         verify_marker_dat!(shared, &dat, TransitionResult::default())
+    }
+
+    fn on_cancel_requested(
+        self,
+    ) -> LocalActivityMachineTransition<ResolvedFromMarkerLookAheadWaitingMarkerEvent> {
+        TransitionResult::ok([LocalActivityCommand::RequestCancel], self)
+    }
+
+    fn on_no_wait_cancel(
+        self,
+        _: ActivityCancellationType,
+    ) -> LocalActivityMachineTransition<ResolvedFromMarkerLookAheadWaitingMarkerEvent> {
+        self.on_cancel_requested()
     }
 }
 
@@ -645,6 +617,7 @@ impl WFMachinesAdapter for LocalActivityMachine {
                 attempt,
                 backoff,
                 original_schedule_time,
+                activation_index,
             }) => {
                 let mut maybe_ok_result = None;
                 let mut maybe_failure = None;
@@ -659,7 +632,7 @@ impl WFMachinesAdapter for LocalActivityMachine {
                         maybe_failure = fail.failure;
                     }
                     LocalActivityExecutionResult::Cancelled(Cancellation { failure })
-                    | LocalActivityExecutionResult::TimedOut(ActFail { failure }) => {
+                    | LocalActivityExecutionResult::TimedOut(ActFail { failure, .. }) => {
                         will_not_run_again = true;
                         maybe_failure = failure;
                     }
@@ -755,36 +728,41 @@ impl WFMachinesAdapter for LocalActivityMachine {
                 }
 
                 if record_marker {
+                    let mut details = build_local_activity_marker_details(
+                        LocalActivityMarkerData {
+                            seq: self.shared_state.attrs.seq,
+                            attempt,
+                            activity_id: self.shared_state.attrs.activity_id.clone(),
+                            activity_type: self.shared_state.attrs.activity_type.clone(),
+                            complete_time: complete_time.map(Into::into),
+                            backoff,
+                            original_schedule_time: original_schedule_time.map(Into::into),
+                            activation_index,
+                        },
+                        maybe_ok_result,
+                    );
+                    if self.shared_state.attrs.include_arguments_in_marker {
+                        details.insert(
+                            "input".to_string(),
+                            Payloads {
+                                payloads: self.shared_state.attrs.arguments.clone(),
+                            },
+                        );
+                    }
                     let marker_data = RecordMarkerCommandAttributes {
                         marker_name: LOCAL_ACTIVITY_MARKER_NAME.to_string(),
-                        details: build_local_activity_marker_details(
-                            LocalActivityMarkerData {
-                                seq: self.shared_state.attrs.seq,
-                                attempt,
-                                activity_id: self.shared_state.attrs.activity_id.clone(),
-                                activity_type: self.shared_state.attrs.activity_type.clone(),
-                                complete_time: complete_time.map(Into::into),
-                                backoff,
-                                original_schedule_time: original_schedule_time.map(Into::into),
-                            },
-                            maybe_ok_result,
-                        ),
+                        details,
                         header: None,
                         failure: maybe_failure,
                     };
                     let command = ProtoCommand {
                         user_metadata: self.shared_state.attrs.user_metadata.clone(),
+                        event_group_markers: self.shared_state.attrs.event_group_markers.clone(),
                         ..command::Attributes::RecordMarkerCommandAttributes(marker_data).into()
                     };
                     responses.push(MachineResponse::IssueNewCommand(command));
                 }
                 Ok(responses)
-            }
-            LocalActivityCommand::FakeMarker => {
-                // See docs for `FakeMarker` for more
-                Ok(vec![MachineResponse::IssueFakeLocalActivityMarker(
-                    self.shared_state.attrs.seq,
-                )])
             }
             LocalActivityCommand::RequestCancel => {
                 Ok(vec![MachineResponse::RequestCancelLocalActivity(

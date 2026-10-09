@@ -275,10 +275,12 @@ mod tests {
     /// context reaches lang SDKs through log forwarding.
     #[tokio::test]
     async fn payload_limit_log_carries_span_context() {
-        use crate::payload_limits::{PayloadLimits, validate_payload_limits};
-        use crate::protos::temporal::api::{
-            common::v1::{Payload, Payloads},
-            workflowservice::v1::StartWorkflowExecutionRequest,
+        use crate::{
+            payload_limits::{PayloadLimits, validate_payload_limits},
+            protos::temporal::api::{
+                common::v1::{Payload, Payloads},
+                workflowservice::v1::StartWorkflowExecutionRequest,
+            },
         };
 
         let opts = TelemetryOptions::builder()
@@ -338,10 +340,12 @@ mod tests {
     /// the same span context.
     #[tokio::test]
     async fn payload_limit_error_log_carries_span_context() {
-        use crate::payload_limits::{PayloadLimits, validate_payload_limits};
-        use crate::protos::temporal::api::{
-            common::v1::{Payload, Payloads},
-            workflowservice::v1::StartWorkflowExecutionRequest,
+        use crate::{
+            payload_limits::{PayloadLimits, validate_payload_limits},
+            protos::temporal::api::{
+                common::v1::{Payload, Payloads},
+                workflowservice::v1::StartWorkflowExecutionRequest,
+            },
         };
 
         let opts = TelemetryOptions::builder()

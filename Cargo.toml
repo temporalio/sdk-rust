@@ -9,8 +9,9 @@ members = [
     "crates/sdk",
     "crates/workflow",
     "crates/sdk-core-c-bridge",
+    "crates/changelog-release-notes",
 ]
-resolver = "2"
+resolver = "3"
 
 [workspace.package]
 license = "MIT"

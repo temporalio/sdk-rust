@@ -3,7 +3,6 @@ use crate::{
     abstractions::dbg_panic,
     internal_flags::CoreInternalFlags,
     protosext::{WorkflowActivationExt, protocol_messages::IncomingProtocolMessage},
-    telemetry::metrics,
     worker::{
         LEGACY_QUERY_ID, LocalActRequest, WorkflowErrorType,
         workflow::{
@@ -12,8 +11,9 @@ use crate::{
             FailedActivationWFTReport, HeartbeatTimeoutMsg, HistoryUpdate,
             LocalActivityRequestSink, LocalResolution, NextPageReq, OutstandingActivation,
             OutstandingTask, PermittedWFT, RequestEvictMsg, RunBasics,
-            ServerCommandsWithWorkflowInfo, WFCommand, WFCommandVariant, WFMachinesError,
-            WFT_HEARTBEAT_TIMEOUT_FRACTION, WFTReportStatus, WorkflowTaskInfo,
+            ServerCommandsWithWorkflowInfo, TaskStorageMetrics, WFCommand, WFCommandVariant,
+            WFMachinesError, WFT_HEARTBEAT_TIMEOUT_FRACTION, WFTReportStatus, WftFailureKind,
+            WorkflowTaskInfo,
             history_update::HistoryPaginator,
             machines::{MachinesWFTResponseContent, WorkflowMachines},
         },
@@ -31,6 +31,7 @@ use std::{
 use temporalio_common::protos::{
     TaskToken,
     coresdk::{
+        common::ExternalStorageMetrics,
         workflow_activation::{
             WorkflowActivation, create_evict_activation, query_to_job,
             remove_from_cache::EvictionReason, workflow_activation_job,
@@ -139,6 +140,10 @@ impl ManagedRun {
         self.wft.is_some() && self.wfm.machines.has_pending_jobs()
     }
 
+    pub(super) fn waiting_on_local_activities(&self) -> bool {
+        self.waiting_on_la.is_some()
+    }
+
     pub(super) fn have_seen_terminal_event(&self) -> bool {
         self.wfm.machines.have_seen_terminal_event
     }
@@ -222,6 +227,10 @@ impl ManagedRun {
             start_time,
             permit: pwft.permit,
         });
+        if let Some(waiting) = self.waiting_on_la.as_mut() {
+            waiting.hb_timeout_handle.abort();
+            waiting.heartbeat_timeout_pending = false;
+        }
 
         if was_legacy_query
             && work.update.wft_started_id == 0
@@ -258,9 +267,6 @@ impl ManagedRun {
                 // If the activation has no jobs but there are outstanding LAs, we need to restart
                 // the WFT heartbeat.
                 if let Some(ref mut lawait) = self.waiting_on_la {
-                    if lawait.completion_dat.is_some() {
-                        panic!("Should not have completion dat when getting new wft & empty jobs")
-                    }
                     lawait.hb_timeout_handle.abort();
                     lawait.hb_timeout_handle = sink_heartbeat_timeout_start(
                         self.wfm.machines.run_id.clone(),
@@ -292,6 +298,7 @@ impl ManagedRun {
     pub(super) fn mark_wft_complete(
         &mut self,
         report_status: WFTReportStatus,
+        task_storage_metrics: &TaskStorageMetrics,
     ) -> Option<OutstandingTask> {
         debug!("Marking WFT completed");
         let retme = self.wft.take();
@@ -299,7 +306,17 @@ impl ManagedRun {
         if let Some(ot) = &retme
             && let Some(ct) = report_status.completion_time()
         {
-            self.metrics.wf_task_latency(ct.sub(ot.start_time));
+            let task_duration = ct.sub(ot.start_time);
+            self.metrics.wf_task_latency(task_duration);
+            log_workflow_task_duration(
+                &self.wfm.machines.run_id,
+                &self.wfm.machines.workflow_type,
+                self.wfm.machines.last_processed_event + 1,
+                ot.info.attempt,
+                self.wfm.machines.history_size_bytes(),
+                task_duration,
+                task_storage_metrics,
+            );
         }
 
         if let WFTReportStatus::Reported {
@@ -350,6 +367,17 @@ impl ManagedRun {
             Ok(Some(ActivationOrAuto::LangActivation(
                 self.wfm.get_next_activation()?,
             )))
+        } else if self.waiting_on_la.is_some()
+            && self.wfm.machines.outstanding_local_activity_count() == 0
+        {
+            self.waiting_on_la
+                .take()
+                .expect("waiting_on_la was just checked")
+                .hb_timeout_handle
+                .abort();
+            Ok(Some(ActivationOrAuto::Autocomplete {
+                run_id: self.run_id().to_string(),
+            }))
         } else {
             if !self.am_broken {
                 let has_pending_queries = self
@@ -363,7 +391,15 @@ impl ManagedRun {
                     )));
                 }
             }
-            if let Some(wte) = self.trying_to_evict.clone() {
+            if self
+                .waiting_on_la
+                .as_ref()
+                .is_some_and(|waiting| waiting.heartbeat_timeout_pending)
+            {
+                Ok(Some(ActivationOrAuto::Autocomplete {
+                    run_id: self.run_id().to_string(),
+                }))
+            } else if let Some(wte) = self.trying_to_evict.clone() {
                 let act =
                     create_evict_activation(self.run_id().to_string(), wte.message, wte.reason);
                 Ok(Some(ActivationOrAuto::LangActivation(act)))
@@ -403,16 +439,19 @@ impl ManagedRun {
                     self.run_id()
                 );
             }
-            let outcome = if let Some((tt, reason)) = self.trying_to_evict.as_mut().and_then(|te| {
-                te.auto_reply_fail_tt
-                    .take()
-                    .map(|tt| (tt, te.message.clone()))
-            }) {
-                ActivationCompleteOutcome::ReportWFTFail(FailedActivationWFTReport::Report(
-                    tt,
+            let outcome = if let Some((info, reason)) = self
+                .trying_to_evict
+                .as_mut()
+                .and_then(|te| te.auto_reply_fail.take().map(|i| (i, te.message.clone())))
+            {
+                ActivationCompleteOutcome::ReportWFTFail(Box::new(FailedActivationWFTReport::new(
+                    info.task_token,
+                    info.attempt,
                     WorkflowTaskFailedCause::WorkflowWorkerUnhandledFailure,
                     Failure::application_failure(reason, true).into(),
-                ))
+                    WftFailureKind::Task,
+                    &self.metrics,
+                )))
             } else {
                 ActivationCompleteOutcome::DoNothing
             };
@@ -567,8 +606,8 @@ impl ManagedRun {
         is_auto_fail: bool,
         resp_chan: Option<oneshot::Sender<ActivationCompleteResult>>,
     ) -> RunUpdateAct {
-        let tt = if let Some(tt) = self.wft.as_ref().map(|t| t.info.task_token.clone()) {
-            tt
+        let (tt, attempt) = if let Some(t) = self.wft.as_ref() {
+            (t.info.task_token.clone(), t.info.attempt)
         } else {
             dbg_panic!(
                 "No workflow task for run id {} found when trying to fail activation",
@@ -587,72 +626,68 @@ impl ManagedRun {
                 EvictionReason::Unspecified | EvictionReason::PaginationOrHistoryFetch
             );
 
-        let (should_report, rur) = if is_no_report_query_fail {
-            (false, None)
+        let rur = if is_no_report_query_fail {
+            None
         } else {
             // Blow up any cached data associated with the workflow
-            let evict_req_outcome = self.request_eviction(RequestEvictMsg {
+            self.request_eviction(RequestEvictMsg {
                 run_id: self.run_id().to_string(),
                 message,
                 reason,
-                auto_reply_fail_tt: None,
-            });
-            let should_report = match &evict_req_outcome {
-                EvictionRequestResult::EvictionRequested(Some(attempt), _)
-                | EvictionRequestResult::EvictionAlreadyRequested(Some(attempt)) => *attempt <= 1,
-                _ => false,
-            };
-            let rur = evict_req_outcome.into_run_update_resp();
-            (should_report, rur)
+                auto_reply_fail: None,
+            })
+            .into_run_update_resp()
         };
 
-        let outcome = if self.pending_work_is_legacy_query() {
-            if is_no_report_query_fail {
-                ActivationCompleteOutcome::WFTFailedDontReport
-            } else {
-                ActivationCompleteOutcome::ReportWFTFail(
-                    FailedActivationWFTReport::ReportLegacyQueryFailure(tt, failure),
-                )
-            }
-        } else if should_report {
-            // Check if we should fail the workflow instead of the WFT because of user's preferences
-            if matches!(cause, WorkflowTaskFailedCause::NonDeterministicError)
-                && self.config.should_fail_workflow(
-                    &self.wfm.machines.workflow_type,
-                    &WorkflowErrorType::Nondeterminism,
-                )
-            {
-                warn!(failure=?failure, "Failing workflow due to nondeterminism error");
-                return self
-                    .successful_completion(
-                        vec![WFCommand {
-                            variant: WFCommandVariant::FailWorkflow(FailWorkflowExecution {
-                                failure: failure.failure,
-                            }),
-                            metadata: None,
-                        }],
-                        vec![],
-                        VersioningBehavior::Unspecified, // Doesn't matter since we're failing wf
-                        resp_chan,
-                        true,
-                    )
-                    .unwrap_or_else(|e| {
-                        dbg_panic!("Got next page request when auto-failing workflow: {e:?}");
-                        None
-                    });
-            } else {
-                ActivationCompleteOutcome::ReportWFTFail(FailedActivationWFTReport::Report(
-                    tt, cause, failure,
-                ))
-            }
+        let kind = if !self.pending_work_is_legacy_query() {
+            WftFailureKind::Task
+        } else if is_no_report_query_fail {
+            WftFailureKind::RetryableLegacyQuery
         } else {
-            ActivationCompleteOutcome::WFTFailedDontReport
+            WftFailureKind::LegacyQuery
         };
 
-        self.metrics
-            .with_new_attrs([metrics::failure_reason(cause.into())])
-            .wf_task_failed();
-        self.reply_to_complete(outcome, resp_chan);
+        // Check if we should fail the workflow instead of the WFT because of user's preferences.
+        // Only done on the first attempt: if that attempt's completion didn't reach the server,
+        // later attempts fall through to the normal task failure path, which won't re-report.
+        if kind == WftFailureKind::Task
+            && attempt <= 1
+            && matches!(cause, WorkflowTaskFailedCause::NonDeterministicError)
+            && self.config.should_fail_workflow(
+                &self.wfm.machines.workflow_type,
+                &WorkflowErrorType::Nondeterminism,
+            )
+        {
+            warn!(failure=?failure, "Failing workflow due to nondeterminism error");
+            return self
+                .successful_completion(
+                    vec![WFCommand::new(WFCommandVariant::FailWorkflow(
+                        FailWorkflowExecution {
+                            failure: failure.failure,
+                        },
+                    ))],
+                    vec![],
+                    VersioningBehavior::Unspecified, // Doesn't matter since we're failing wf
+                    resp_chan,
+                    true,
+                )
+                .unwrap_or_else(|e| {
+                    dbg_panic!("Got next page request when auto-failing workflow: {e:?}");
+                    None
+                });
+        }
+
+        self.reply_to_complete(
+            ActivationCompleteOutcome::ReportWFTFail(Box::new(FailedActivationWFTReport::new(
+                tt,
+                attempt,
+                cause,
+                failure,
+                kind,
+                &self.metrics,
+            ))),
+            resp_chan,
+        );
         rur
     }
 
@@ -707,6 +742,14 @@ impl ManagedRun {
         completion: RunActivationCompletion,
         update_from_new_page: Option<HistoryUpdate>,
     ) -> Result<Option<FulfillableActivationComplete>, RunUpdateErr> {
+        let completing_heartbeat_autocomplete =
+            matches!(self.activation, Some(OutstandingActivation::Autocomplete))
+                && self.waiting_on_la.is_some();
+        let completing_la_heartbeat = completing_heartbeat_autocomplete
+            || self
+                .waiting_on_la
+                .as_ref()
+                .is_some_and(|waiting| waiting.heartbeat_timeout_pending);
         let data = CompletionDataForWFT {
             task_token: completion.task_token,
             query_responses: completion.query_responses,
@@ -762,26 +805,62 @@ impl ManagedRun {
         })();
 
         match outcome {
-            Ok(None) => Ok(Some(self.prepare_complete_resp(
-                completion.resp_chan,
-                data,
-                false,
-            ))),
+            Ok(None) => {
+                if let Some(waiting) = self.waiting_on_la.take() {
+                    waiting.hb_timeout_handle.abort();
+                }
+                Ok(Some(self.prepare_complete_resp(
+                    completion.resp_chan,
+                    data,
+                    completing_heartbeat_autocomplete,
+                )))
+            }
             Ok(Some((start_t, wft_timeout))) => {
                 if let Some(wola) = self.waiting_on_la.as_mut() {
                     wola.hb_timeout_handle.abort();
                 }
-                self.waiting_on_la = Some(WaitingOnLAs {
-                    wft_timeout,
-                    completion_dat: Some((data, completion.resp_chan)),
-                    hb_timeout_handle: sink_heartbeat_timeout_start(
+                if completing_la_heartbeat || !data.query_responses.is_empty() {
+                    // Reporting a query while an LA is still running must request another WFT;
+                    // otherwise the LA could resolve without a task on which to deliver its job.
+                    let hb_timeout_handle = sink_heartbeat_timeout_start(
                         self.run_id().to_string(),
                         self.local_activity_request_sink.as_deref(),
                         start_t,
                         wft_timeout,
-                    ),
-                });
-                Ok(None)
+                    );
+                    hb_timeout_handle.abort();
+                    self.waiting_on_la = Some(WaitingOnLAs {
+                        wft_timeout,
+                        hb_timeout_handle,
+                        // Keep this set until the replacement WFT arrives. If pending workflow
+                        // jobs prevent this completion from being reported, the heartbeat still
+                        // needs to be honored after those jobs are processed.
+                        heartbeat_timeout_pending: completing_la_heartbeat,
+                    });
+                    Ok(Some(self.prepare_complete_resp(
+                        completion.resp_chan,
+                        data,
+                        true,
+                    )))
+                } else {
+                    self.waiting_on_la = Some(WaitingOnLAs {
+                        wft_timeout,
+                        hb_timeout_handle: sink_heartbeat_timeout_start(
+                            self.run_id().to_string(),
+                            self.local_activity_request_sink.as_deref(),
+                            start_t,
+                            wft_timeout,
+                        ),
+                        heartbeat_timeout_pending: false,
+                    });
+                    Ok(Some(FulfillableActivationComplete {
+                        result: ActivationCompleteResult {
+                            outcome: ActivationCompleteOutcome::DoNothing,
+                            replaying: self.wfm.machines.replaying,
+                        },
+                        resp_chan: completion.resp_chan,
+                    }))
+                }
             }
             Err(e) => Err(RunUpdateErr {
                 source: e,
@@ -793,23 +872,14 @@ impl ManagedRun {
     fn _local_resolution(
         &mut self,
         res: LocalResolution,
-    ) -> Result<Option<FulfillableActivationComplete>, RunUpdateErr> {
+    ) -> Result<Option<ActivationOrAuto>, RunUpdateErr> {
         debug!(resolution=?res, "Applying local resolution");
         self.wfm.notify_of_local_result(res)?;
-        if self.wfm.machines.outstanding_local_activity_count() == 0
-            && let Some(mut wait_dat) = self.waiting_on_la.take()
-        {
-            // Cancel the heartbeat timeout
-            wait_dat.hb_timeout_handle.abort();
-            if let Some((completion_dat, resp_chan)) = wait_dat.completion_dat.take() {
-                return Ok(Some(self.prepare_complete_resp(
-                    resp_chan,
-                    completion_dat,
-                    false,
-                )));
-            }
+        if self.activation.is_none() {
+            self._check_more_activations()
+        } else {
+            Ok(None)
         }
-        Ok(None)
     }
 
     pub(super) fn heartbeat_timeout(&mut self) -> RunUpdateAct {
@@ -822,22 +892,12 @@ impl ManagedRun {
         };
         self.update_to_acts(Ok(maybe_act.into()))
     }
-    /// Returns `true` if autocompletion should be issued, which will actually cause us to end up
-    /// in [completion] again, at which point we'll start a new heartbeat timeout, which will
-    /// immediately trigger and thus finish the completion, forcing a new task as it should.
+    /// Returns `true` if autocompletion should be issued to report the heartbeat WFT completion.
     fn _heartbeat_timeout(&mut self) -> bool {
         if let Some(ref mut wait_dat) = self.waiting_on_la {
-            // Cancel the heartbeat timeout
             wait_dat.hb_timeout_handle.abort();
-            if let Some((completion_dat, resp_chan)) = wait_dat.completion_dat.take() {
-                let compl = self.prepare_complete_resp(resp_chan, completion_dat, true);
-                // Immediately fulfill the completion since the run update will already have
-                // been replied to
-                compl.fulfill();
-            } else {
-                // Auto-reply WFT complete
-                return true;
-            }
+            wait_dat.heartbeat_timeout_pending = true;
+            return self.activation.is_none();
         }
         false
     }
@@ -892,8 +952,6 @@ impl ManagedRun {
     }
 
     pub(super) fn request_eviction(&mut self, info: RequestEvictMsg) -> EvictionRequestResult {
-        let attempts = self.wft.as_ref().map(|wt| wt.info.attempt);
-
         // If we were waiting on a page fetch and we're getting evicted because fetching failed,
         // then make sure we allow the completion to proceed, otherwise we're stuck waiting forever.
         if self.completion_waiting_on_page_fetch.is_some()
@@ -908,7 +966,7 @@ impl ManagedRun {
                 true,
                 c.resp_chan,
             );
-            return EvictionRequestResult::EvictionRequested(attempts, run_upd);
+            return EvictionRequestResult::EvictionRequested(run_upd);
         }
 
         if !self.activation_is_eviction() && self.trying_to_evict.is_none() {
@@ -935,11 +993,11 @@ impl ManagedRun {
             }
 
             self.trying_to_evict = Some(info);
-            EvictionRequestResult::EvictionRequested(attempts, self.check_more_activations())
+            EvictionRequestResult::EvictionRequested(self.check_more_activations())
         } else {
             // Always store the most recent eviction reason
             self.trying_to_evict = Some(info);
-            EvictionRequestResult::EvictionAlreadyRequested(attempts)
+            EvictionRequestResult::EvictionAlreadyRequested
         }
     }
 
@@ -1161,11 +1219,12 @@ impl ManagedRun {
         } else {
             ActivationCompleteOutcome::DoNothing
         };
+        let replaying = machines_wft_response.replaying;
+        if matches!(outcome, ActivationCompleteOutcome::ReportWFTSuccess(_)) {
+            self.wfm.wft_completion_reported();
+        }
         FulfillableActivationComplete {
-            result: ActivationCompleteResult {
-                outcome,
-                replaying: machines_wft_response.replaying,
-            },
+            result: ActivationCompleteResult { outcome, replaying },
             resp_chan,
         }
     }
@@ -1210,7 +1269,7 @@ impl ManagedRun {
                 run_id: self.run_id().to_string(),
                 message: warnstr,
                 reason: EvictionReason::Fatal,
-                auto_reply_fail_tt: None,
+                auto_reply_fail: None,
             });
         }
     }
@@ -1339,19 +1398,14 @@ fn sink_heartbeat_timeout_start(
     abort_handle
 }
 
-/// If an activation completion needed to wait on LA completions (or heartbeat timeout) we use
-/// this struct to store the data we need to finish the completion once that has happened
+/// Tracks the heartbeat while a workflow task has outstanding local activities.
 struct WaitingOnLAs {
     wft_timeout: Duration,
-    /// If set, we are waiting for LAs to complete as part of a just-finished workflow activation.
-    /// If unset, we already had a heartbeat timeout and got a new WFT without any new work while
-    /// there are still incomplete LAs.
-    completion_dat: Option<(
-        CompletionDataForWFT,
-        Option<oneshot::Sender<ActivationCompleteResult>>,
-    )>,
     /// Can be used to abort heartbeat timeouts
     hb_timeout_handle: AbortHandle,
+    /// Defers the heartbeat when lang must finish an outstanding activation before Core can safely
+    /// complete the workflow task.
+    heartbeat_timeout_pending: bool,
 }
 #[derive(Debug)]
 struct CompletionDataForWFT {
@@ -1370,6 +1424,14 @@ struct WorkflowManager {
     /// Is always `Some` in normal operation. Optional to allow for unit testing with the test
     /// workflow driver, which does not need to complete activations the normal way.
     command_sink: Option<Sender<Vec<WFCommand>>>,
+    awaiting_activation_completion: bool,
+    awaiting_next_wft: bool,
+    /// Replay can only apply a peeked resolution after lang responds to the activation before it,
+    /// or after applying the events of the WFT it was recorded in. Resolutions arriving while lang
+    /// is busy, or between WFTs, wait until then too. Otherwise their jobs would precede those
+    /// produced by lang's response or the WFT's events, unlike during replay, and resolutions
+    /// arriving between WFTs would be recorded with an index from the previous WFT.
+    deferred_local_resolutions: Vec<LocalResolution>,
 }
 
 impl WorkflowManager {
@@ -1381,6 +1443,9 @@ impl WorkflowManager {
         Self {
             machines: state_machines,
             command_sink: Some(cmd_sink),
+            awaiting_activation_completion: false,
+            awaiting_next_wft: false,
+            deferred_local_resolutions: vec![],
         }
     }
 
@@ -1395,6 +1460,8 @@ impl WorkflowManager {
         messages: Vec<IncomingProtocolMessage>,
     ) -> Result<WorkflowActivation> {
         self.machines.new_work_from_server(update, messages)?;
+        self.awaiting_next_wft = false;
+        self.apply_deferred_local_resolutions()?;
         self.get_next_activation()
     }
 
@@ -1406,11 +1473,13 @@ impl WorkflowManager {
 
     /// Let this workflow know that something we've been waiting locally on has resolved, like a
     /// local activity or side effect
-    ///
-    /// Returns true if the resolution did anything. EX: If the activity is already canceled and
-    /// used the TryCancel or Abandon modes, the resolution is uninteresting.
-    fn notify_of_local_result(&mut self, resolved: LocalResolution) -> Result<bool> {
-        self.machines.local_resolution(resolved)
+    fn notify_of_local_result(&mut self, resolved: LocalResolution) -> Result<()> {
+        if self.awaiting_activation_completion || self.awaiting_next_wft {
+            self.deferred_local_resolutions.push(resolved);
+        } else {
+            self.machines.local_resolution(resolved)?;
+        }
+        Ok(())
     }
 
     /// Fetch the next workflow activation for this workflow if one is required. Doing so will apply
@@ -1420,13 +1489,13 @@ impl WorkflowManager {
     /// to the server.
     fn get_next_activation(&mut self) -> Result<WorkflowActivation> {
         // First check if there are already some pending jobs, which can be a result of replay.
-        let activation = self.machines.get_wf_activation();
-        if !activation.jobs.is_empty() {
-            return Ok(activation);
+        let mut activation = self.machines.get_wf_activation();
+        if activation.jobs.is_empty() {
+            self.machines.apply_next_wft_from_history()?;
+            activation = self.machines.get_wf_activation();
         }
-
-        self.machines.apply_next_wft_from_history()?;
-        Ok(self.machines.get_wf_activation())
+        self.awaiting_activation_completion = !activation.jobs.is_empty();
+        Ok(activation)
     }
 
     /// Returns true if machines are ready to apply the next WFT sequence, false if events will need
@@ -1475,6 +1544,22 @@ impl WorkflowManager {
             })?;
         }
         self.machines.iterate_machines()?;
+        self.awaiting_activation_completion = false;
+        self.apply_deferred_local_resolutions()
+    }
+
+    /// Must be called once the current WFT's completion has been reported to server.
+    fn wft_completion_reported(&mut self) {
+        self.awaiting_next_wft = true;
+    }
+
+    fn apply_deferred_local_resolutions(&mut self) -> Result<()> {
+        if self.awaiting_activation_completion || self.awaiting_next_wft {
+            return Ok(());
+        }
+        for resolution in mem::take(&mut self.deferred_local_resolutions) {
+            self.machines.local_resolution(resolution)?;
+        }
         Ok(())
     }
 }
@@ -1529,12 +1614,233 @@ impl From<WFMachinesError> for RunUpdateErr {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+fn log_workflow_task_duration(
+    run_id: &str,
+    workflow_type: &str,
+    event_id: i64,
+    attempt: u32,
+    history_size_bytes: u64,
+    duration: Duration,
+    storage: &TaskStorageMetrics,
+) {
+    let threshold = wft_duration_warn_threshold();
+    if duration <= threshold {
+        return;
+    }
+    let dl = storage.download.as_ref();
+    let ul = storage.upload.as_ref();
+    let duration_millis = |d: Duration| d.as_millis() as u64;
+    let storage_millis = |m: Option<&ExternalStorageMetrics>| -> u64 {
+        m.and_then(|m| m.total_duration)
+            .and_then(|d| Duration::try_from(d).ok())
+            .map(duration_millis)
+            .unwrap_or_default()
+    };
+    warn!(
+        workflow_type = %workflow_type,
+        event_id = event_id,
+        attempt = attempt,
+        workflow_task_duration = duration_millis(duration),
+        workflow_history_size = history_size_bytes,
+        payload_download_count = dl.map(|m| m.payload_count).unwrap_or_default(),
+        payload_download_size = dl.map(|m| m.total_size_bytes).unwrap_or_default(),
+        payload_download_duration = storage_millis(dl),
+        payload_download_drivers = ?dl.map(|m| sorted(&m.driver_names)).unwrap_or_default(),
+        payload_upload_count = ul.map(|m| m.payload_count).unwrap_or_default(),
+        payload_upload_size = ul.map(|m| m.total_size_bytes).unwrap_or_default(),
+        payload_upload_duration = storage_millis(ul),
+        payload_upload_drivers = ?ul.map(|m| sorted(&m.driver_names)).unwrap_or_default(),
+        "[TMPRL1104] {run_id}:{event_id}:{attempt} Workflow task duration exceeded {} seconds.",
+        threshold.as_secs()
+    );
+}
+
+fn wft_duration_warn_threshold() -> Duration {
+    static THRESHOLD: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
+    *THRESHOLD.get_or_init(|| {
+        parse_wft_duration_warn_threshold(
+            std::env::var("TEMPORAL_WORKFLOW_TASK_DURATION_WARN_SECONDS").ok(),
+        )
+    })
+}
+
+// Separated from the env read so the parse + default fallback can be unit-tested without mutating
+// the process environment.
+fn parse_wft_duration_warn_threshold(value: Option<String>) -> Duration {
+    value
+        .and_then(|s| s.parse::<u64>().ok())
+        .map(Duration::from_secs)
+        .unwrap_or(Duration::from_secs(5))
+}
+
+fn sorted(names: &[String]) -> Vec<String> {
+    let mut v = names.to_vec();
+    v.sort();
+    v
+}
+
 #[cfg(test)]
 mod tests {
+    use super::{
+        TaskStorageMetrics, log_workflow_task_duration, parse_wft_duration_warn_threshold,
+    };
     use crate::worker::workflow::{WFCommand, WFCommandVariant};
-    use std::mem::{Discriminant, discriminant};
+    use std::{
+        fmt::Write,
+        mem::{Discriminant, discriminant},
+        sync::{Arc, Mutex},
+        time::Duration,
+    };
+    use temporalio_common::protos::coresdk::common::ExternalStorageMetrics;
+    use tracing::{
+        Event, Level, Metadata, Subscriber,
+        field::{Field, Visit},
+        span,
+    };
 
     use command_utils::*;
+
+    #[derive(Default)]
+    struct CapturedEvent {
+        level: Option<Level>,
+        fields: String,
+    }
+    #[derive(Default, Clone)]
+    struct CapturingSub {
+        events: Arc<Mutex<Vec<CapturedEvent>>>,
+    }
+    struct FieldVisitor(String);
+    impl Visit for FieldVisitor {
+        fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+            let _ = write!(self.0, "{}={:?};", field.name(), value);
+        }
+        fn record_u64(&mut self, field: &Field, value: u64) {
+            let _ = write!(self.0, "{}={};", field.name(), value);
+        }
+        fn record_i64(&mut self, field: &Field, value: i64) {
+            let _ = write!(self.0, "{}={};", field.name(), value);
+        }
+        fn record_str(&mut self, field: &Field, value: &str) {
+            let _ = write!(self.0, "{}={};", field.name(), value);
+        }
+    }
+    impl Subscriber for CapturingSub {
+        fn enabled(&self, _: &Metadata<'_>) -> bool {
+            true
+        }
+        fn new_span(&self, _: &span::Attributes<'_>) -> span::Id {
+            span::Id::from_u64(1)
+        }
+        fn record(&self, _: &span::Id, _: &span::Record<'_>) {}
+        fn record_follows_from(&self, _: &span::Id, _: &span::Id) {}
+        fn event(&self, event: &Event<'_>) {
+            let mut v = FieldVisitor(String::new());
+            event.record(&mut v);
+            self.events.lock().unwrap().push(CapturedEvent {
+                level: Some(*event.metadata().level()),
+                fields: v.0,
+            });
+        }
+        fn enter(&self, _: &span::Id) {}
+        fn exit(&self, _: &span::Id) {}
+    }
+
+    fn capture(duration: Duration, storage: &TaskStorageMetrics) -> Option<CapturedEvent> {
+        let sub = CapturingSub::default();
+        tracing::subscriber::with_default(sub.clone(), || {
+            log_workflow_task_duration("run-1", "MyWorkflow", 12, 3, 4096, duration, storage);
+        });
+        sub.events.lock().unwrap().drain(..).next()
+    }
+
+    #[test]
+    fn tmprl1104_warns_only_over_threshold() {
+        let none = TaskStorageMetrics::default();
+        assert!(capture(Duration::from_secs(2), &none).is_none());
+        let warn_ev = capture(Duration::from_secs(7), &none).expect("warn emitted");
+        assert_eq!(warn_ev.level, Some(Level::WARN));
+        assert!(
+            warn_ev.fields.contains("[TMPRL1104]"),
+            "fields: {}",
+            warn_ev.fields
+        );
+    }
+
+    #[test]
+    fn tmprl1104_threshold_parsing() {
+        assert_eq!(
+            parse_wft_duration_warn_threshold(None),
+            Duration::from_secs(5)
+        );
+        assert_eq!(
+            parse_wft_duration_warn_threshold(Some("10".to_string())),
+            Duration::from_secs(10)
+        );
+        assert_eq!(
+            parse_wft_duration_warn_threshold(Some("0".to_string())),
+            Duration::from_secs(0)
+        );
+        // Unparseable / empty / negative values fall back to the default (parsed as u64, so a
+        // negative can never yield a threshold).
+        assert_eq!(
+            parse_wft_duration_warn_threshold(Some("nope".to_string())),
+            Duration::from_secs(5)
+        );
+        assert_eq!(
+            parse_wft_duration_warn_threshold(Some(String::new())),
+            Duration::from_secs(5)
+        );
+        assert_eq!(
+            parse_wft_duration_warn_threshold(Some("-5".to_string())),
+            Duration::from_secs(5)
+        );
+    }
+
+    #[test]
+    fn tmprl1104_fields_present() {
+        let storage = TaskStorageMetrics {
+            download: Some(ExternalStorageMetrics {
+                payload_count: 2,
+                total_size_bytes: 1024,
+                total_duration: Some(prost_types::Duration {
+                    seconds: 0,
+                    nanos: 5_000_000,
+                }),
+                driver_names: vec!["s3".to_string()],
+            }),
+            upload: None,
+        };
+        let ev = capture(Duration::from_secs(6), &storage).expect("warn emitted");
+        assert!(ev.fields.contains("attempt=3"), "fields: {}", ev.fields);
+        assert!(
+            ev.fields.contains("[TMPRL1104] run-1:12:3"),
+            "fields: {}",
+            ev.fields
+        );
+        // The message names the (default) threshold it exceeded.
+        assert!(
+            ev.fields.contains("exceeded 5 seconds"),
+            "fields: {}",
+            ev.fields
+        );
+        assert!(
+            ev.fields.contains("workflow_history_size=4096"),
+            "fields: {}",
+            ev.fields
+        );
+        assert!(
+            ev.fields.contains("payload_download_count=2"),
+            "fields: {}",
+            ev.fields
+        );
+        // No upload occurred; that group must still be present as zero.
+        assert!(
+            ev.fields.contains("payload_upload_count=0"),
+            "fields: {}",
+            ev.fields
+        );
+    }
 
     #[rstest::rstest]
     #[case::empty(
@@ -1628,43 +1934,779 @@ mod tests {
         use super::*;
 
         pub(crate) fn complete() -> WFCommand {
-            WFCommand {
-                variant: WFCommandVariant::CompleteWorkflow(CompleteWorkflowExecution {
-                    result: None,
-                }),
-                metadata: None,
-            }
+            WFCommand::new(WFCommandVariant::CompleteWorkflow(
+                CompleteWorkflowExecution { result: None },
+            ))
         }
 
         pub(crate) fn cancel() -> WFCommand {
-            WFCommand {
-                variant: WFCommandVariant::CancelWorkflow(CancelWorkflowExecution {}),
-                metadata: None,
-            }
+            WFCommand::new(WFCommandVariant::CancelWorkflow(
+                CancelWorkflowExecution::default(),
+            ))
         }
 
         pub(crate) fn query_response() -> WFCommand {
-            WFCommand {
-                variant: WFCommandVariant::QueryResponse(QueryResult {
-                    query_id: "".into(),
-                    variant: None,
-                }),
-                metadata: None,
-            }
+            WFCommand::new(WFCommandVariant::QueryResponse(QueryResult {
+                query_id: "".into(),
+                variant: None,
+            }))
         }
 
         pub(crate) fn update_response() -> WFCommand {
-            WFCommand {
-                variant: WFCommandVariant::UpdateResponse(UpdateResponse {
-                    protocol_instance_id: "".into(),
-                    response: None,
-                }),
-                metadata: None,
-            }
+            WFCommand::new(WFCommandVariant::UpdateResponse(UpdateResponse {
+                protocol_instance_id: "".into(),
+                response: None,
+            }))
         }
 
         pub(crate) fn command_types(commands: &[WFCommand]) -> Vec<Discriminant<WFCommand>> {
             commands.iter().map(discriminant).collect()
+        }
+    }
+
+    mod local_activity_replay_tests {
+        use super::super::WorkflowManager;
+        use crate::{
+            replay::{DEFAULT_WORKFLOW_TYPE, TestHistoryBuilder},
+            telemetry::metrics::MetricsContext,
+            test_help::{schedule_activity_cmd, schedule_local_activity_cmd, test_worker_cfg},
+            worker::{
+                LocalActRequest, LocalActivityExecutionResult, LocalActivityResolution,
+                workflow::{
+                    LocalResolution, RunBasics, WFCommand, WFCommandVariant, WFMachinesError,
+                },
+            },
+        };
+        use itertools::Itertools;
+        use prost::Message;
+        use rstest::rstest;
+        use std::{collections::BTreeMap, time::Duration};
+        use temporalio_common::protos::{
+            coresdk::{
+                AsJsonPayloadExt,
+                activity_result::{ActivityResolution, Success, activity_resolution},
+                workflow_activation::{
+                    ResolveActivity, WorkflowActivation, workflow_activation_job::Variant,
+                },
+                workflow_commands::{
+                    ActivityCancellationType, RequestCancelActivity, RequestCancelLocalActivity,
+                    workflow_command,
+                },
+            },
+            temporal::api::{
+                command::v1::command,
+                common::v1::Payload,
+                enums::v1::EventType,
+                history::v1::{History, HistoryEvent, MarkerRecordedEventAttributes},
+            },
+        };
+
+        #[derive(Clone, Copy, Debug)]
+        enum Activity {
+            Work(u32),
+            Expired,
+            Finish,
+        }
+
+        impl Activity {
+            fn result(self) -> Payload {
+                match self {
+                    Self::Work(index) => index.to_string().as_json_payload().unwrap(),
+                    Self::Expired => false.as_json_payload().unwrap(),
+                    Self::Finish => "finished".as_json_payload().unwrap(),
+                }
+            }
+        }
+
+        #[derive(Clone, Default)]
+        struct FanoutWorkflow {
+            outstanding: BTreeMap<u32, Activity>,
+            next_seq: u32,
+            pending_work: usize,
+            completed_work: usize,
+            waiting_on_expired: bool,
+            finished: bool,
+        }
+
+        impl FanoutWorkflow {
+            fn schedule(&mut self, activity: Activity) -> WFCommand {
+                self.next_seq += 1;
+                self.outstanding.insert(self.next_seq, activity);
+                let id = match activity {
+                    Activity::Work(index) => format!("work-{index}"),
+                    Activity::Expired => "expired".to_owned(),
+                    Activity::Finish => "finish".to_owned(),
+                };
+                let workflow_command::Variant::ScheduleLocalActivity(command) =
+                    schedule_local_activity_cmd(
+                        self.next_seq,
+                        &id,
+                        ActivityCancellationType::TryCancel,
+                        Duration::from_secs(10),
+                    )
+                else {
+                    unreachable!()
+                };
+                WFCommand::new(WFCommandVariant::AddLocalActivity(command))
+            }
+
+            fn activate(&mut self, activation: WorkflowActivation) -> Vec<WFCommand> {
+                let mut commands = vec![];
+                for job in activation.jobs {
+                    match job.variant.unwrap() {
+                        Variant::InitializeWorkflow(_) => {
+                            self.pending_work = 3;
+                            commands
+                                .extend((1..=3).map(|index| self.schedule(Activity::Work(index))));
+                        }
+                        Variant::ResolveActivity(resolution) => {
+                            let activity = self.outstanding.remove(&resolution.seq).unwrap();
+                            assert_eq!(
+                                resolution.result.unwrap().status,
+                                Some(activity_resolution::Status::Completed(Success {
+                                    result: Some(activity.result()),
+                                })),
+                                "wrong result for {activity:?} at sequence {}",
+                                resolution.seq,
+                            );
+                            match activity {
+                                Activity::Work(_) => self.completed_work += 1,
+                                Activity::Expired => self.waiting_on_expired = false,
+                                Activity::Finish => {
+                                    self.finished = true;
+                                    commands.push(WFCommand::new(
+                                        WFCommandVariant::CompleteWorkflow(Default::default()),
+                                    ));
+                                }
+                            }
+                        }
+                        unexpected => panic!("unexpected job: {unexpected:?}"),
+                    }
+                }
+                // The number of work results delivered together determines whether another
+                // activity is scheduled before the remaining work completes.
+                if !self.waiting_on_expired && self.completed_work > 0 {
+                    self.pending_work -= self.completed_work;
+                    self.completed_work = 0;
+                    if self.pending_work == 0 {
+                        commands.push(self.schedule(Activity::Finish));
+                    } else {
+                        self.waiting_on_expired = true;
+                        commands.push(self.schedule(Activity::Expired));
+                    }
+                }
+                commands
+            }
+        }
+
+        fn manager(history: &TestHistoryBuilder) -> WorkflowManager {
+            WorkflowManager::new(RunBasics {
+                worker_config: test_worker_cfg().build().unwrap().into(),
+                workflow_id: "fanout".to_owned(),
+                workflow_type: DEFAULT_WORKFLOW_TYPE.to_owned(),
+                run_id: history.get_orig_run_id().to_owned(),
+                history: history.get_full_history_info().unwrap().into(),
+                metrics: MetricsContext::no_op(),
+                capabilities: &Default::default(),
+                sdk_name: "test",
+                sdk_version: "test",
+            })
+        }
+
+        #[rstest]
+        #[case([1, 2, 3])]
+        #[case([1, 3, 2])]
+        #[case([2, 1, 3])]
+        #[case([2, 3, 1])]
+        #[case([3, 1, 2])]
+        #[case([3, 2, 1])]
+        fn local_activity_fanout_replay(
+            #[case] work_order: [u32; 3],
+            #[values(false, true)] legacy: bool,
+        ) {
+            let mut start = TestHistoryBuilder::default();
+            start.add_by_type(EventType::WorkflowExecutionStarted);
+            start.add_workflow_task_scheduled_and_started();
+            let mut initial = FanoutWorkflow::default();
+            initial.activate(manager(&start).get_next_activation().unwrap());
+            let mut paths = vec![(initial, vec![], 0)];
+            let mut plans = vec![];
+            // Enumerate every legal completion order and activation partition, including expired
+            // completing before, between, or after the remaining work activities.
+            while let Some((workflow, batches, work_done)) = paths.pop() {
+                if workflow.finished {
+                    plans.push(batches);
+                    continue;
+                }
+                for size in 1..=workflow.outstanding.len() {
+                    for batch in workflow.outstanding.keys().copied().permutations(size) {
+                        let work = batch
+                            .iter()
+                            .copied()
+                            .filter(|seq| *seq <= 3)
+                            .collect::<Vec<_>>();
+                        if work != work_order[work_done..work_done + work.len()] {
+                            continue;
+                        }
+                        let mut next = workflow.clone();
+                        next.activate(WorkflowActivation {
+                            jobs: batch
+                                .iter()
+                                .map(|seq| {
+                                    Variant::ResolveActivity(ResolveActivity {
+                                        seq: *seq,
+                                        is_local: true,
+                                        result: Some(ActivityResolution {
+                                            status: Some(activity_resolution::Status::Completed(
+                                                Success {
+                                                    result: Some(
+                                                        workflow.outstanding[seq].result(),
+                                                    ),
+                                                },
+                                            )),
+                                        }),
+                                    })
+                                    .into()
+                                })
+                                .collect(),
+                            ..Default::default()
+                        });
+                        let mut batches = batches.clone();
+                        batches.push(batch);
+                        paths.push((next, batches, work_done + work.len()));
+                    }
+                }
+            }
+
+            for plan in plans {
+                // Before incremental delivery, all three initial activities resolved together. Such
+                // histories must remain replayable even though they have no activation index field.
+                if legacy && plan[0].len() != 3 {
+                    continue;
+                }
+                let mut live = manager(&start);
+                let mut workflow = FanoutWorkflow::default();
+                let commands = workflow.activate(live.get_next_activation().unwrap());
+                live.push_commands_and_iterate(commands).unwrap();
+                for batch in &plan {
+                    live.drain_queued_local_activities();
+                    for seq in batch {
+                        live.notify_of_local_result(LocalResolution::LocalActivity(
+                            LocalActivityResolution {
+                                seq: *seq,
+                                result: LocalActivityExecutionResult::Completed(Success {
+                                    result: Some(workflow.outstanding[seq].result()),
+                                }),
+                                runtime: Duration::ZERO,
+                                attempt: 1,
+                                backoff: None,
+                                original_schedule_time: None,
+                            },
+                        ))
+                        .unwrap();
+                    }
+                    let commands = workflow.activate(live.get_next_activation().unwrap());
+                    live.push_commands_and_iterate(commands).unwrap();
+                }
+                assert!(workflow.finished);
+
+                let mut history = start.clone();
+                history.add_workflow_task_completed();
+                for command in live.machines.get_commands() {
+                    match command.attributes.unwrap() {
+                        command::Attributes::RecordMarkerCommandAttributes(mut marker) => {
+                            if legacy {
+                                let data =
+                                    &mut marker.details.get_mut("data").unwrap().payloads[0].data;
+                                let mut json: serde_json::Value =
+                                    serde_json::from_slice(data).unwrap();
+                                json.as_object_mut().unwrap().remove("activation_index");
+                                *data = serde_json::to_vec(&json).unwrap();
+                            }
+                            history.add(MarkerRecordedEventAttributes {
+                                marker_name: marker.marker_name,
+                                details: marker.details,
+                                failure: marker.failure,
+                                workflow_task_completed_event_id: 4,
+                                ..Default::default()
+                            });
+                        }
+                        command::Attributes::CompleteWorkflowExecutionCommandAttributes(_) => {
+                            history.add_workflow_execution_completed();
+                        }
+                        unexpected => panic!("unexpected command: {unexpected:?}"),
+                    }
+                }
+
+                let mut replay = manager(&history);
+                let mut workflow = FanoutWorkflow::default();
+                for _ in 0..=plan.len() {
+                    let activation = replay.get_next_activation().unwrap();
+                    assert!(!activation.jobs.is_empty(), "replay stalled for {plan:?}");
+                    let commands = workflow.activate(activation);
+                    replay.push_commands_and_iterate(commands).unwrap();
+                    if workflow.finished {
+                        break;
+                    }
+                }
+                assert!(workflow.finished, "replay failed to finish for {plan:?}");
+            }
+        }
+
+        #[test]
+        fn cancel_does_not_pull_resolution_from_later_activation() {
+            let mut history = TestHistoryBuilder::default();
+            history.add_by_type(EventType::WorkflowExecutionStarted);
+            history.add_full_wf_task();
+            for seq in 1..=3 {
+                history.add_local_activity_marker(
+                    seq,
+                    &format!("work-{seq}"),
+                    Some(Activity::Work(seq).result()),
+                    None,
+                    |data| data.activation_index = Some(u64::from(seq)),
+                );
+            }
+            history.add_workflow_execution_completed();
+            let mut replay = manager(&history);
+            replay.get_next_activation().unwrap();
+            let mut workflow = FanoutWorkflow::default();
+            let commands = (1..=3)
+                .map(|seq| {
+                    let mut command = workflow.schedule(Activity::Work(seq));
+                    if let WFCommandVariant::AddLocalActivity(activity) = &mut command.variant {
+                        activity.cancellation_type =
+                            ActivityCancellationType::WaitCancellationCompleted as i32;
+                    }
+                    command
+                })
+                .collect();
+            replay.push_commands_and_iterate(commands).unwrap();
+            for seq in 1..=3 {
+                let activation = replay.get_next_activation().unwrap();
+                assert_eq!(activation.jobs.len(), 1);
+                assert_matches!(activation.jobs[0].variant.as_ref(),
+                Some(Variant::ResolveActivity(result)) => assert_eq!(result.seq, seq));
+                let commands = match seq {
+                    1 => vec![WFCommand::new(
+                        WFCommandVariant::RequestCancelLocalActivity(RequestCancelLocalActivity {
+                            seq: 3,
+                        }),
+                    )],
+                    3 => vec![WFCommand::new(WFCommandVariant::CompleteWorkflow(
+                        Default::default(),
+                    ))],
+                    _ => vec![],
+                };
+                replay.push_commands_and_iterate(commands).unwrap();
+            }
+        }
+
+        #[derive(Clone, Copy, Debug)]
+        enum OnFirstResult {
+            Nothing,
+            CancelActivity,
+            CancelLaThenActivity,
+        }
+
+        #[derive(Clone, Copy)]
+        enum Step {
+            Resolve(u32),
+            Activate,
+            /// Activates, resolving the LA while lang is still working on the activation.
+            ActivateResolving(u32),
+            /// Reports the WFT complete while LAs are still running.
+            CompleteWft,
+            /// Applies the WFT server issues after a heartbeat completion.
+            NextWft {
+                signal: bool,
+            },
+        }
+
+        #[rstest]
+        // Cancelling the never-sent regular activity resolves it immediately, in an activation
+        // holding no LA results. LA 2 resolves afterwards, in its own activation, and replay must
+        // not fold it into the cancellation's activation.
+        #[case::activation_without_la_results(
+            OnFirstResult::CancelActivity,
+            vec![Step::Resolve(1), Step::Activate, Step::Activate, Step::Resolve(2), Step::Activate]
+        )]
+        // A TryCancel LA cancel resolves immediately, so live delivers LA 2's cancellation before
+        // the regular activity's, matching command order. Replay must too.
+        #[case::la_try_cancel_order(
+            OnFirstResult::CancelLaThenActivity,
+            vec![Step::Resolve(1), Step::Activate, Step::Activate]
+        )]
+        // LA 2 resolving while lang handles LA 1 must not jump ahead of the jobs produced by
+        // lang's response, since replay can only apply its marker after that response.
+        #[case::la_resolves_while_activation_outstanding(
+            OnFirstResult::CancelActivity,
+            vec![Step::Resolve(1), Step::ActivateResolving(2), Step::Activate]
+        )]
+        // A signal in the heartbeat WFT is delivered on its own before LA 2 resolves, so replay
+        // must not merge LA 2 into it.
+        #[case::heartbeat_signal_before_la(
+            OnFirstResult::Nothing,
+            vec![
+                Step::Resolve(1),
+                Step::Activate,
+                Step::CompleteWft,
+                Step::NextWft { signal: true },
+                Step::Resolve(2),
+                Step::Activate,
+            ]
+        )]
+        // LA 2 resolving between the heartbeat completion and the next WFT belongs to that WFT's
+        // first activation, after the WFT's own jobs, since that's where replay finds its marker.
+        #[case::la_resolves_before_heartbeat_wft_with_signal(
+            OnFirstResult::Nothing,
+            vec![
+                Step::Resolve(1),
+                Step::Activate,
+                Step::CompleteWft,
+                Step::Resolve(2),
+                Step::NextWft { signal: true },
+            ]
+        )]
+        #[case::la_resolves_before_heartbeat_wft(
+            OnFirstResult::Nothing,
+            vec![
+                Step::Resolve(1),
+                Step::Activate,
+                Step::CompleteWft,
+                Step::Resolve(2),
+                Step::NextWft { signal: false },
+            ]
+        )]
+        fn replay_matches_live_activations(
+            #[case] on_first_result: OnFirstResult,
+            #[case] steps: Vec<Step>,
+        ) {
+            let mut history = TestHistoryBuilder::default();
+            history.add_by_type(EventType::WorkflowExecutionStarted);
+            history.add_workflow_task_scheduled_and_started();
+            let mut live = manager(&history);
+            let mut live_activations = vec![];
+            let jobs = job_names(&live.get_next_activation().unwrap());
+            live.push_commands_and_iterate(respond(on_first_result, &jobs))
+                .unwrap();
+            live_activations.push(jobs);
+            let mut wft_number = 1;
+            for step in steps {
+                let activation = match step {
+                    Step::Resolve(seq) => {
+                        resolve(&mut live, seq);
+                        continue;
+                    }
+                    Step::Activate | Step::ActivateResolving(_) => {
+                        live.get_next_activation().unwrap()
+                    }
+                    Step::CompleteWft => {
+                        record_wft_completion(&mut history, &live);
+                        live.wft_completion_reported();
+                        continue;
+                    }
+                    Step::NextWft { signal } => {
+                        if signal {
+                            history.add_we_signaled("signal", vec![]);
+                        }
+                        history.add_workflow_task_scheduled_and_started();
+                        wft_number += 1;
+                        let activation = live
+                            .new_work_from_server(
+                                history.get_one_wft(wft_number).unwrap().into(),
+                                vec![],
+                            )
+                            .unwrap();
+                        if activation.jobs.is_empty() {
+                            continue;
+                        }
+                        activation
+                    }
+                };
+                let jobs = job_names(&activation);
+                if let Step::ActivateResolving(seq) = step {
+                    resolve(&mut live, seq);
+                }
+                live.push_commands_and_iterate(respond(on_first_result, &jobs))
+                    .unwrap();
+                live_activations.push(jobs);
+            }
+            record_wft_completion(&mut history, &live);
+
+            let replay_activations = replay(&history, |activation| {
+                respond(on_first_result, &job_names(activation))
+            })
+            .unwrap();
+            assert_eq!(replay_activations, live_activations);
+        }
+
+        /// Histories recorded by the scenarios of `local_activity_fanout_replay` and
+        /// `replay_matches_live_activations` on Core before markers carried activation indices
+        /// (commit 0eb03f213), paired with the activations that Core produced when replaying them.
+        /// Histories it could not replay are omitted. Replaying the rest must not change, or
+        /// existing workflows could start failing with nondeterminism errors.
+        fn histories_without_activation_indices() -> Vec<Gold> {
+            let golds: Vec<serde_json::Value> = serde_json::from_str(include_str!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/histories/la_replay_without_activation_index.json"
+            )))
+            .unwrap();
+            let mut histories = &include_bytes!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/histories/la_replay_without_activation_index.bin"
+            ))[..];
+            let golds = golds
+                .into_iter()
+                .map(|gold| {
+                    let history = History::decode_length_delimited(&mut histories).unwrap();
+                    Gold {
+                        name: gold["name"].as_str().unwrap().to_owned(),
+                        workflow: gold["workflow"].as_str().unwrap().to_owned(),
+                        events: history.events,
+                        activations: serde_json::from_value(gold["activations"].clone()).unwrap(),
+                    }
+                })
+                .collect();
+            assert!(histories.is_empty());
+            golds
+        }
+
+        struct Gold {
+            name: String,
+            /// `Fanout` for `FanoutWorkflow`, otherwise the `OnFirstResult` passed to `respond`.
+            workflow: String,
+            events: Vec<HistoryEvent>,
+            activations: Vec<Vec<String>>,
+        }
+
+        fn on_first_result_named(name: &str) -> OnFirstResult {
+            [
+                OnFirstResult::Nothing,
+                OnFirstResult::CancelActivity,
+                OnFirstResult::CancelLaThenActivity,
+            ]
+            .into_iter()
+            .find(|r| format!("{r:?}") == name)
+            .unwrap()
+        }
+
+        #[test]
+        fn histories_without_activation_indices_replay_unchanged() {
+            for Gold {
+                name,
+                workflow,
+                events,
+                activations: expected,
+            } in histories_without_activation_indices()
+            {
+                let history = TestHistoryBuilder::from_history(events);
+                let activations = if workflow == "Fanout" {
+                    let mut fanout = FanoutWorkflow::default();
+                    replay(&history, |activation| fanout.activate(activation.clone()))
+                } else {
+                    let on_first_result = on_first_result_named(&workflow);
+                    replay(&history, |activation| {
+                        respond(on_first_result, &job_names(activation))
+                    })
+                };
+                assert_eq!(activations.unwrap(), expected, "{name}");
+            }
+        }
+
+        /// A worker running this Core picks up a workflow at its latest WFT, after an older Core
+        /// recorded the earlier ones. The resulting history mixes markers with and without
+        /// activation indices, and must replay the way it executed.
+        #[test]
+        fn histories_without_activation_indices_continue_and_replay() {
+            let mut continued = 0;
+            for Gold {
+                name,
+                workflow,
+                events,
+                ..
+            } in histories_without_activation_indices()
+            {
+                let wft_starts = events
+                    .iter()
+                    .filter(|e| e.event_type() == EventType::WorkflowTaskStarted)
+                    .map(|e| e.event_id)
+                    .collect::<Vec<_>>();
+                let [_, .., last_wft_started] = wft_starts[..] else {
+                    continue;
+                };
+                let on_first_result = on_first_result_named(&workflow);
+                let mut history = TestHistoryBuilder::from_history(
+                    events
+                        .into_iter()
+                        .take_while(|e| e.event_id <= last_wft_started)
+                        .collect(),
+                );
+                let mut live = manager(&history);
+                let mut live_activations = vec![];
+                loop {
+                    let activation = live.get_next_activation().unwrap();
+                    if activation.jobs.is_empty() {
+                        let requested = live
+                            .drain_queued_local_activities()
+                            .into_iter()
+                            .filter_map(|request| match request {
+                                LocalActRequest::New(act) => Some(act.schedule_cmd.seq),
+                                _ => None,
+                            })
+                            .collect::<Vec<_>>();
+                        if requested.is_empty() {
+                            break;
+                        }
+                        for seq in requested {
+                            resolve(&mut live, seq);
+                        }
+                        continue;
+                    }
+                    let jobs = job_names(&activation);
+                    live.push_commands_and_iterate(respond(on_first_result, &jobs))
+                        .unwrap();
+                    live_activations.push(jobs);
+                }
+                record_wft_completion(&mut history, &live);
+                assert!(live.machines.workflow_is_finished(), "{name}");
+
+                let replay_activations = replay(&history, |activation| {
+                    respond(on_first_result, &job_names(activation))
+                })
+                .unwrap();
+                assert_eq!(replay_activations, live_activations, "{name}");
+                continued += 1;
+            }
+            assert!(continued > 0);
+        }
+
+        fn job_names(activation: &WorkflowActivation) -> Vec<String> {
+            activation
+                .jobs
+                .iter()
+                .map(|job| match job.variant.as_ref().unwrap() {
+                    Variant::InitializeWorkflow(_) => "init".to_owned(),
+                    Variant::SignalWorkflow(_) => "signal".to_owned(),
+                    Variant::ResolveActivity(r) if r.is_local => format!("la-{}", r.seq),
+                    Variant::ResolveActivity(r) => format!("act-{}", r.seq),
+                    unexpected => panic!("unexpected job: {unexpected:?}"),
+                })
+                .collect()
+        }
+
+        /// The workflow schedules LAs 1 and 2 plus regular activity 3, reacts to LA 1's result as
+        /// directed, and completes once LA 2's result arrives.
+        fn respond(on_first_result: OnFirstResult, jobs: &[String]) -> Vec<WFCommand> {
+            let cancel_activity = || {
+                WFCommand::new(WFCommandVariant::RequestCancelActivity(
+                    RequestCancelActivity { seq: 3 },
+                ))
+            };
+            match jobs {
+                [init] if init == "init" => {
+                    let mut commands = (1..=2)
+                        .map(|seq| {
+                            let workflow_command::Variant::ScheduleLocalActivity(command) =
+                                schedule_local_activity_cmd(
+                                    seq,
+                                    &format!("la-{seq}"),
+                                    ActivityCancellationType::TryCancel,
+                                    Duration::from_secs(10),
+                                )
+                            else {
+                                unreachable!()
+                            };
+                            WFCommand::new(WFCommandVariant::AddLocalActivity(command))
+                        })
+                        .collect::<Vec<_>>();
+                    let workflow_command::Variant::ScheduleActivity(regular) =
+                        schedule_activity_cmd(
+                            3,
+                            "q",
+                            "act-3",
+                            ActivityCancellationType::TryCancel,
+                            Duration::from_secs(10),
+                            Duration::from_secs(10),
+                        )
+                    else {
+                        unreachable!()
+                    };
+                    commands.push(WFCommand::new(WFCommandVariant::AddActivity(regular)));
+                    commands
+                }
+                [la] if la == "la-1" => match on_first_result {
+                    OnFirstResult::Nothing => vec![],
+                    OnFirstResult::CancelActivity => vec![cancel_activity()],
+                    OnFirstResult::CancelLaThenActivity => vec![
+                        WFCommand::new(WFCommandVariant::RequestCancelLocalActivity(
+                            RequestCancelLocalActivity { seq: 2 },
+                        )),
+                        cancel_activity(),
+                    ],
+                },
+                jobs if jobs.iter().any(|j| j == "la-2") => vec![WFCommand::new(
+                    WFCommandVariant::CompleteWorkflow(Default::default()),
+                )],
+                _ => vec![],
+            }
+        }
+
+        fn resolve(live: &mut WorkflowManager, seq: u32) {
+            live.drain_queued_local_activities();
+            live.notify_of_local_result(LocalResolution::LocalActivity(LocalActivityResolution {
+                seq,
+                result: LocalActivityExecutionResult::Completed(Success {
+                    result: Some(seq.as_json_payload().unwrap()),
+                }),
+                runtime: Duration::ZERO,
+                attempt: 1,
+                backoff: None,
+                original_schedule_time: None,
+            }))
+            .unwrap();
+        }
+
+        fn record_wft_completion(history: &mut TestHistoryBuilder, live: &WorkflowManager) {
+            history.add_workflow_task_completed();
+            let wft_completed_id = history.current_event_id();
+            for command in live.machines.get_commands() {
+                match command.attributes.unwrap() {
+                    command::Attributes::RecordMarkerCommandAttributes(marker) => {
+                        history.add(MarkerRecordedEventAttributes {
+                            marker_name: marker.marker_name,
+                            details: marker.details,
+                            failure: marker.failure,
+                            workflow_task_completed_event_id: wft_completed_id,
+                            ..Default::default()
+                        });
+                    }
+                    command::Attributes::ScheduleActivityTaskCommandAttributes(attrs) => {
+                        history.add_activity_task_scheduled(attrs.activity_id);
+                    }
+                    command::Attributes::CompleteWorkflowExecutionCommandAttributes(_) => {
+                        history.add_workflow_execution_completed();
+                    }
+                    unexpected => panic!("unexpected command: {unexpected:?}"),
+                }
+            }
+        }
+
+        /// Replays the history, returning the job names of each activation.
+        fn replay(
+            history: &TestHistoryBuilder,
+            mut respond: impl FnMut(&WorkflowActivation) -> Vec<WFCommand>,
+        ) -> Result<Vec<Vec<String>>, WFMachinesError> {
+            let mut replay = manager(history);
+            let mut activations = vec![];
+            loop {
+                let activation = replay.get_next_activation()?;
+                if activation.jobs.is_empty() {
+                    return Ok(activations);
+                }
+                replay.push_commands_and_iterate(respond(&activation))?;
+                activations.push(job_names(&activation));
+            }
         }
     }
 }

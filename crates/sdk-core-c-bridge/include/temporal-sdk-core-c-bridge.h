@@ -5,6 +5,11 @@
 #include <stdint.h>
 #include <stdlib.h>
 
+/* Forward declarations for structs referenced in callback typedefs */
+struct TemporalCoreCustomMetricMeter;
+struct TemporalCoreCustomSlotSupplierCallbacks;
+
+
 typedef enum TemporalCoreClientGrpcCompression {
   TemporalCoreClientGrpcCompression_Gzip = 0,
   TemporalCoreClientGrpcCompression_None = 1,
@@ -52,6 +57,20 @@ typedef enum TemporalCoreOpenTelemetryProtocol {
   TemporalCoreOpenTelemetryProtocol_Grpc = 1,
   TemporalCoreOpenTelemetryProtocol_Http,
 } TemporalCoreOpenTelemetryProtocol;
+
+typedef enum TemporalCoreRuntimeType {
+  TemporalCoreRuntimeType_Unspecified = 0,
+  TemporalCoreRuntimeType_Jvm = 1,
+  TemporalCoreRuntimeType_Cpython = 2,
+  TemporalCoreRuntimeType_Node = 3,
+  TemporalCoreRuntimeType_Bun = 4,
+  TemporalCoreRuntimeType_Cruby = 5,
+  TemporalCoreRuntimeType_Go = 6,
+  TemporalCoreRuntimeType_DotnetFramework = 7,
+  TemporalCoreRuntimeType_DotnetCore = 8,
+  TemporalCoreRuntimeType_Native = 9,
+  TemporalCoreRuntimeType_Roadrunner = 10,
+} TemporalCoreRuntimeType;
 
 typedef enum TemporalCoreSlotKindType {
   TemporalCoreSlotKindType_WorkflowSlotKindType,
@@ -495,9 +514,37 @@ typedef struct TemporalCoreTelemetryOptions {
   const struct TemporalCoreMetricsOptions *metrics;
 } TemporalCoreTelemetryOptions;
 
+typedef struct TemporalCoreRuntimeInfo {
+  /**
+   * The SDK runtime hosting Core.
+   */
+  enum TemporalCoreRuntimeType runtime_type;
+  /**
+   * The runtime version, or empty if it cannot be determined.
+   */
+  struct TemporalCoreByteArrayRef version;
+} TemporalCoreRuntimeInfo;
+
+typedef struct TemporalCoreRuntimeInfoArray {
+  /**
+   * Runtime entries read during runtime construction; ownership remains with the caller.
+   */
+  const struct TemporalCoreRuntimeInfo *data;
+  size_t size;
+} TemporalCoreRuntimeInfoArray;
+
 typedef struct TemporalCoreRuntimeOptions {
   const struct TemporalCoreTelemetryOptions *telemetry;
   uint64_t worker_heartbeat_interval_millis;
+  /**
+   * SDK runtimes included in worker environment heartbeats. An empty array reports no runtime;
+   * the bridge does not inherit Core's native-runtime default.
+   */
+  struct TemporalCoreRuntimeInfoArray runtime_info;
+  /**
+   * If true, worker heartbeats omit all runtime, hosting, and platform information.
+   */
+  bool disable_environment_info;
 } TemporalCoreRuntimeOptions;
 
 typedef struct TemporalCoreTestServerOptions {
@@ -839,6 +886,11 @@ typedef struct TemporalCoreWorkerOptions {
    * NOTE: Experimental
    */
   bool disable_payload_error_limit;
+  /**
+   * Maximum number of activity slots that may be reserved for eager execution when completing
+   * a workflow task. Zero disables eager activity execution.
+   */
+  uint32_t max_eager_activity_reservations_per_workflow_task;
 } TemporalCoreWorkerOptions;
 
 /**
@@ -1069,6 +1121,14 @@ void temporal_core_worker_poll_nexus_task(struct TemporalCoreWorker *worker,
                                           void *user_data,
                                           TemporalCoreWorkerPollCallback callback);
 
+/**
+ * Accepts a protobuf-encoded `coresdk.workflow_completion.WorkflowActivationCompletion`.
+ *
+ * Child workflow versioning overrides are carried in
+ * `coresdk.workflow_commands.StartChildWorkflowExecution.versioning_override`, so language SDKs
+ * can configure child routing without a separate C ABI option. Requires Temporal Server 1.32.0
+ * or later.
+ */
 void temporal_core_worker_complete_workflow_activation(struct TemporalCoreWorker *worker,
                                                        struct TemporalCoreByteArrayRef completion,
                                                        void *user_data,

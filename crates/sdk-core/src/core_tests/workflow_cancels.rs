@@ -117,7 +117,7 @@ async fn immediate_cancel() {
                 workflow_activation_job::Variant::InitializeWorkflow(_),
                 workflow_activation_job::Variant::CancelWorkflow(_)
             ),
-            vec![CancelWorkflowExecution {}.into()],
+            vec![CancelWorkflowExecution::default().into()],
         )],
     )
     .await;

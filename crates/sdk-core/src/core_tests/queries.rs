@@ -468,7 +468,7 @@ async fn query_cache_miss_causes_page_fetch_dont_reply_wft_too_early(
     mock_client
         .expect_complete_workflow_task()
         .times(1)
-        .returning(|resp| {
+        .returning(|resp, _| {
             // Verify both the complete command and the query response are sent
             assert_eq!(resp.commands.len(), 1);
             assert_eq!(resp.query_responses.len(), 1);
@@ -549,7 +549,7 @@ async fn query_replay_with_continue_as_new_doesnt_reply_empty_command() {
     mock_client
         .expect_complete_workflow_task()
         .times(1)
-        .returning(|resp| {
+        .returning(|resp, _| {
             // Verify both the complete command and the query response are sent
             assert_eq!(resp.commands.len(), 1);
             assert_eq!(resp.query_responses.len(), 1);
@@ -754,7 +754,7 @@ async fn new_query_fail() {
     mock_client
         .expect_complete_workflow_task()
         .times(1)
-        .returning(|resp| {
+        .returning(|resp, _| {
             // Verify there is a failed query response along w/ start timer cmd
             assert_eq!(resp.commands.len(), 1);
             assert_matches!(
@@ -1043,7 +1043,7 @@ async fn queries_arent_lost_in_buffer_void(#[values(false, true)] buffered_becau
 
     let mut mock = mock_worker_client();
     mock.expect_complete_workflow_task()
-        .returning(|_| Ok(Default::default()));
+        .returning(|_, _| Ok(Default::default()));
     mock.expect_respond_legacy_query()
         .times(2)
         .returning(|_, _| Ok(Default::default()));

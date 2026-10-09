@@ -110,7 +110,7 @@ async fn initial_request_sent_back(#[values(false, true)] reject: bool) {
     mock_client
         .expect_complete_workflow_task()
         .times(1)
-        .returning(move |mut resp| {
+        .returning(move |mut resp, _| {
             let msg = resp.messages.pop().unwrap();
             let orig_req = if reject {
                 let acceptance = msg.body.unwrap().to_msg::<Rejection>().unwrap();
@@ -318,6 +318,48 @@ async fn replay_with_signal_and_update_same_task() {
             .into(),
             CompleteWorkflowExecution { result: None }.into(),
         ],
+    ))
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn update_activation_has_update_id() {
+    let wfid = "fakeid";
+    let mut t = TestHistoryBuilder::default();
+    t.add_by_type(EventType::WorkflowExecutionStarted);
+    t.add_workflow_task_scheduled_and_started();
+
+    let update_id = "upd-1";
+    let mut poll_resp = hist_to_poll_resp(&t, wfid, ResponseType::AllHistory);
+    poll_resp.add_update_request(update_id, 1);
+
+    let mut mock_client = mock_worker_client();
+    mock_client
+        .expect_complete_workflow_task()
+        .times(1)
+        .returning(|_, _| Ok(RespondWorkflowTaskCompletedResponse::default()));
+    let mh = MockPollCfg::from_resp_batches(wfid, t, [poll_resp], mock_client);
+    let core = mock_worker(build_mock_pollers(mh));
+
+    let task = core.poll_workflow_activation().await.unwrap();
+    let update = task
+        .jobs
+        .iter()
+        .find_map(|job| match job.variant.as_ref() {
+            Some(workflow_activation_job::Variant::DoUpdate(update)) => Some(update),
+            _ => None,
+        })
+        .expect("activation should contain an update");
+    assert_eq!(update.id, update_id);
+
+    core.complete_workflow_activation(WorkflowActivationCompletion::from_cmd(
+        task.run_id,
+        UpdateResponse {
+            protocol_instance_id: update_id.to_string(),
+            response: Some(Response::Accepted(())),
+        }
+        .into(),
     ))
     .await
     .unwrap();

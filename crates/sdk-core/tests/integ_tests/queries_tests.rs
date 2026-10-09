@@ -27,7 +27,7 @@ use tokio::join;
 async fn simple_query_legacy() {
     let query_resp = b"response";
     let mut starter = init_core_and_create_wf("simple_query_legacy").await;
-    let core = starter.get_worker().await;
+    let core = starter.get_core_worker().await;
     let workflow_id = starter.get_task_queue().to_string();
     let task = core.poll_workflow_activation().await.unwrap();
     core.complete_workflow_activation(WorkflowActivationCompletion::from_cmds(
@@ -49,36 +49,34 @@ async fn simple_query_legacy() {
     .unwrap();
     tokio::time::sleep(Duration::from_secs(1)).await;
     // Query after timer should have fired and there should be new WFT
+    let timer_task = core.poll_workflow_activation().await.unwrap();
+    assert_matches!(
+        timer_task.jobs.as_slice(),
+        [WorkflowActivationJob {
+            variant: Some(workflow_activation_job::Variant::FireTimer(_)),
+        }]
+    );
     let query_fut = async {
-        WorkflowExecutionInfo {
-            namespace: starter.get_client().await.namespace(),
-            workflow_id,
-            run_id: Some(task.run_id.to_string()),
-            first_execution_run_id: None,
-        }
-        .bind_untyped(starter.get_client().await.clone())
-        .query(
-            UntypedQuery::new("myquery"),
-            RawValue::empty(),
-            WorkflowQueryOptions::default(),
-        )
-        .await
-        .unwrap()
+        WorkflowExecutionInfo::builder()
+            .namespace(starter.get_core_client().await.namespace())
+            .workflow_id(workflow_id)
+            .maybe_run_id(Some(task.run_id.to_string()))
+            .build()
+            .bind_untyped(starter.get_core_client().await.clone())
+            .query(
+                UntypedQuery::new("myquery"),
+                RawValue::empty(),
+                WorkflowQueryOptions::default(),
+            )
+            .await
+            .unwrap()
     };
     let workflow_completions_future = async {
-        // Give query a beat to get going
+        // Let the query reach the server before completing the outstanding timer task so the
+        // server sends the query activation next.
         tokio::time::sleep(Duration::from_millis(400)).await;
-        // This poll *should* have the `queries` field populated, but doesn't, seemingly due to
-        // a server bug. So, complete the WF task of the first timer firing with empty commands
-        let task = core.poll_workflow_activation().await.unwrap();
-        assert_matches!(
-            task.jobs.as_slice(),
-            [WorkflowActivationJob {
-                variant: Some(workflow_activation_job::Variant::FireTimer(_)),
-            }]
-        );
         core.complete_workflow_activation(WorkflowActivationCompletion::from_cmds(
-            task.run_id,
+            timer_task.run_id,
             vec![],
         ))
         .await
@@ -124,7 +122,7 @@ async fn query_after_execution_complete(#[case] do_evict: bool) {
     let query_resp = b"response";
     let mut starter =
         init_core_and_create_wf(&format!("query_after_execution_complete-{do_evict}")).await;
-    let core = &starter.get_worker().await;
+    let core = &starter.get_core_worker().await;
     let workflow_id = &starter.get_task_queue().to_string();
 
     let do_workflow = |go_until_query: bool| async move {
@@ -195,22 +193,21 @@ async fn query_after_execution_complete(#[case] do_evict: bool) {
     // we could screw-up re-applying the final WFT)
     let mut query_futs = FuturesUnordered::new();
     for _ in 0..3 {
-        let gw = starter.get_client().await.clone();
+        let gw = starter.get_core_client().await.clone();
         let query_fut = async move {
-            let q_resp: RawValue = WorkflowExecutionInfo {
-                namespace: gw.namespace(),
-                workflow_id: workflow_id.to_string(),
-                run_id: Some(run_id.to_string()),
-                first_execution_run_id: None,
-            }
-            .bind_untyped(gw.clone())
-            .query(
-                UntypedQuery::new("myquery"),
-                RawValue::empty(),
-                WorkflowQueryOptions::default(),
-            )
-            .await
-            .unwrap();
+            let q_resp: RawValue = WorkflowExecutionInfo::builder()
+                .namespace(gw.namespace())
+                .workflow_id(workflow_id.to_string())
+                .maybe_run_id(Some(run_id.to_string()))
+                .build()
+                .bind_untyped(gw.clone())
+                .query(
+                    UntypedQuery::new("myquery"),
+                    RawValue::empty(),
+                    WorkflowQueryOptions::default(),
+                )
+                .await
+                .unwrap();
             // Ensure query response is as expected
             assert_eq!(q_resp.payloads[0].data, query_resp);
         };
@@ -229,7 +226,7 @@ async fn query_after_execution_complete(#[case] do_evict: bool) {
 async fn fail_legacy_query(#[case] with_nde: bool) {
     let query_err = "oh no broken";
     let mut starter = CoreWfStarter::new("fail_legacy_query");
-    let core = starter.get_worker().await;
+    let core = starter.get_core_worker().await;
     starter.workflow_options.task_timeout = Some(Duration::from_secs(1));
     starter.start_wf().await;
     let workflow_id = starter.get_task_queue().to_string();
@@ -239,20 +236,19 @@ async fn fail_legacy_query(#[case] with_nde: bool) {
     core.complete_execution(&task.run_id).await;
     core.handle_eviction().await;
     let query_fut = async {
-        WorkflowExecutionInfo {
-            namespace: starter.get_client().await.namespace(),
-            workflow_id: workflow_id.to_string(),
-            run_id: Some(task.run_id.to_string()),
-            first_execution_run_id: None,
-        }
-        .bind_untyped(starter.get_client().await.clone())
-        .query(
-            UntypedQuery::new("myquery"),
-            RawValue::empty(),
-            WorkflowQueryOptions::default(),
-        )
-        .await
-        .unwrap_err()
+        WorkflowExecutionInfo::builder()
+            .namespace(starter.get_core_client().await.namespace())
+            .workflow_id(workflow_id.to_string())
+            .maybe_run_id(Some(task.run_id.to_string()))
+            .build()
+            .bind_untyped(starter.get_core_client().await.clone())
+            .query(
+                UntypedQuery::new("myquery"),
+                RawValue::empty(),
+                WorkflowQueryOptions::default(),
+            )
+            .await
+            .unwrap_err()
     };
     let query_responder = async {
         // Have to replay first since we've evicted
@@ -298,7 +294,7 @@ async fn fail_legacy_query(#[case] with_nde: bool) {
 #[tokio::test]
 async fn multiple_concurrent_queries_no_new_history() {
     let mut starter = init_core_and_create_wf("multiple_concurrent_queries_no_new_history").await;
-    let core = starter.get_worker().await;
+    let core = starter.get_core_worker().await;
     let workflow_id = starter.get_task_queue().to_string();
     let started = Instant::now();
     let task = core.poll_workflow_activation().await.unwrap();
@@ -308,23 +304,22 @@ async fn multiple_concurrent_queries_no_new_history() {
     ))
     .await
     .unwrap();
-    let client = starter.get_client().await;
+    let client = starter.get_core_client().await;
     let num_queries = 10;
     let query_futs = (1..=num_queries).map(|_| async {
-        WorkflowExecutionInfo {
-            namespace: client.namespace(),
-            workflow_id: workflow_id.to_string(),
-            run_id: Some(task.run_id.to_string()),
-            first_execution_run_id: None,
-        }
-        .bind_untyped(client.clone())
-        .query(
-            UntypedQuery::new("myquery"),
-            RawValue::empty(),
-            WorkflowQueryOptions::default(),
-        )
-        .await
-        .unwrap();
+        WorkflowExecutionInfo::builder()
+            .namespace(client.namespace())
+            .workflow_id(workflow_id.to_string())
+            .maybe_run_id(Some(task.run_id.to_string()))
+            .build()
+            .bind_untyped(client.clone())
+            .query(
+                UntypedQuery::new("myquery"),
+                RawValue::empty(),
+                WorkflowQueryOptions::default(),
+            )
+            .await
+            .unwrap();
     });
     let complete_fut = async {
         for _ in 1..=num_queries {
@@ -369,7 +364,7 @@ async fn multiple_concurrent_queries_no_new_history() {
 #[tokio::test]
 async fn queries_handled_before_next_wft() {
     let mut starter = init_core_and_create_wf("queries_handled_before_next_wft").await;
-    let core = starter.get_worker().await;
+    let core = starter.get_core_worker().await;
     let workflow_id = starter.get_task_queue().to_string();
     let task = core.poll_workflow_activation().await.unwrap();
     core.complete_workflow_activation(WorkflowActivationCompletion::from_cmds(
@@ -378,23 +373,22 @@ async fn queries_handled_before_next_wft() {
     ))
     .await
     .unwrap();
-    let client = starter.get_client().await;
+    let client = starter.get_core_client().await;
     // Send two queries so that one of them is buffered
     let query_futs = (1..=2).map(|_| async {
-        WorkflowExecutionInfo {
-            namespace: client.namespace(),
-            workflow_id: workflow_id.to_string(),
-            run_id: Some(task.run_id.to_string()),
-            first_execution_run_id: None,
-        }
-        .bind_untyped(client.clone())
-        .query(
-            UntypedQuery::new("myquery"),
-            RawValue::empty(),
-            WorkflowQueryOptions::default(),
-        )
-        .await
-        .unwrap();
+        WorkflowExecutionInfo::builder()
+            .namespace(client.namespace())
+            .workflow_id(workflow_id.to_string())
+            .maybe_run_id(Some(task.run_id.to_string()))
+            .build()
+            .bind_untyped(client.clone())
+            .query(
+                UntypedQuery::new("myquery"),
+                RawValue::empty(),
+                WorkflowQueryOptions::default(),
+            )
+            .await
+            .unwrap();
     });
     let complete_fut = async {
         let task = core.poll_workflow_activation().await.unwrap();
@@ -406,20 +400,19 @@ async fn queries_handled_before_next_wft() {
         );
         // While handling the first query, signal the workflow so a new WFT is generated and the
         // second query is still in the buffer
-        WorkflowExecutionInfo {
-            namespace: client.namespace(),
-            workflow_id: workflow_id.to_string(),
-            run_id: Some(task.run_id.to_string()),
-            first_execution_run_id: None,
-        }
-        .bind_untyped(client.clone())
-        .signal(
-            UntypedSignal::new("blah"),
-            RawValue::empty(),
-            WorkflowSignalOptions::default(),
-        )
-        .await
-        .unwrap();
+        WorkflowExecutionInfo::builder()
+            .namespace(client.namespace())
+            .workflow_id(workflow_id.to_string())
+            .maybe_run_id(Some(task.run_id.to_string()))
+            .build()
+            .bind_untyped(client.clone())
+            .signal(
+                UntypedSignal::new("blah"),
+                RawValue::empty(),
+                WorkflowSignalOptions::default(),
+            )
+            .await
+            .unwrap();
         tokio::time::sleep(Duration::from_millis(500)).await;
         core.complete_workflow_activation(WorkflowActivationCompletion::from_cmd(
             task.run_id,
@@ -478,9 +471,9 @@ async fn queries_handled_before_next_wft() {
 async fn query_should_not_be_sent_if_wft_about_to_fail() {
     let mut starter =
         init_core_and_create_wf("query_should_not_be_sent_if_wft_about_to_fail").await;
-    let core = starter.get_worker().await;
+    let core = starter.get_core_worker().await;
     let workflow_id = starter.get_task_queue().to_string();
-    let client = starter.get_client().await;
+    let client = starter.get_core_client().await;
     // query straight away
     let handle = client.get_workflow_handle::<UntypedWorkflow>(workflow_id.to_string());
     let query_fut = handle.query(

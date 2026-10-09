@@ -5,7 +5,10 @@ use crate::{
     protosext::legacy_query_failure,
     worker::{WorkerVersioningStrategy, worker_control_task_queue},
 };
+use backon::{BackoffBuilder, ExponentialBuilder};
+use futures_util::{StreamExt, TryStreamExt, stream};
 use parking_lot::Mutex;
+use prost::Message;
 use prost_types::Duration as PbDuration;
 use std::{
     collections::HashMap,
@@ -20,7 +23,11 @@ use temporalio_client::{
 };
 use temporalio_common::protos::{
     TaskToken,
-    coresdk::{workflow_commands::QueryResult, workflow_completion},
+    coresdk::{
+        activity_result::ActivityTaskFailedCause, workflow_commands::QueryResult,
+        workflow_completion,
+    },
+    google::rpc::Status as RpcStatus,
     temporal::api::{
         command::v1::Command,
         common::v1::{
@@ -32,6 +39,7 @@ use temporalio_common::protos::{
             TaskQueueKind, TaskQueueType, VersioningBehavior, WorkerVersioningMode,
             WorkflowTaskFailedCause,
         },
+        errordetails::v1::WorkflowTaskCompletionBufferLostFailure,
         failure::v1::Failure,
         nexus::{self, v1::NexusTaskFailure},
         protocol::v1::Message as ProtocolMessage,
@@ -42,10 +50,147 @@ use temporalio_common::protos::{
         workflowservice::v1::{get_system_info_response::Capabilities, *},
     },
 };
-use tonic::IntoRequest;
+use tokio::time::sleep;
+use tokio_util::sync::CancellationToken;
+use tonic::{IntoRequest, metadata::MetadataValue};
 use uuid::Uuid;
 
 type Result<T, E = tonic::Status> = std::result::Result<T, E>;
+
+pub(crate) fn payload_limit_violation_from(
+    status: &tonic::Status,
+) -> Option<&temporalio_common::payload_limits::PayloadLimitViolation> {
+    std::error::Error::source(status).and_then(|source| source.downcast_ref())
+}
+
+/// Maximum encoded size of a single completion page, kept below the ~4 MiB gRPC frame limit. This
+/// per-page cap is distinct from the server's namespace-wide limit on the recombined completion
+/// size.
+///
+/// Pages are packed by summing command body sizes only; the 512 KiB of headroom below 4 MiB absorbs
+/// everything that sum omits: the per-request overhead (task token, identity, namespace) and the
+/// per-command wire framing (a field tag plus a length varint, up to 6 bytes each). At the server's
+/// default per-workflow history-count limit (~51,200 events), worst-case framing is ~300 KiB, so
+/// this headroom covers even a page of many tiny commands and lets us skip per-command accounting.
+const MAX_WFT_COMPLETION_PAGE_SIZE: usize = 4 * 1024 * 1024 - 512 * 1024;
+// Conservative heuristic, not a tuned value: caps the client-side burst (concurrent request bodies
+// and streams); the cost is only extra serial rounds for completions over this many pages.
+const MAX_CONCURRENT_WFT_COMPLETION_PAGES: usize = 3;
+// Backoff between resends of lost pages. Values are a conservative heuristic, not tuned;
+// `without_max_times` leaves the number of resends to the loop (bounded by a stale token or
+// shutdown), not the backoff.
+const WFT_COMPLETION_PAGE_RESEND_BACKOFF: ExponentialBuilder = ExponentialBuilder::new()
+    .with_min_delay(Duration::from_millis(100))
+    .with_factor(2.0)
+    .with_max_delay(Duration::from_secs(5))
+    .without_max_times();
+/// Marker set on the error returned when a completion is failed proactively for exceeding the
+/// namespace's recombined completion-size limit, so the workflow layer reports it as
+/// `REQUEST_TOO_LARGE`.
+pub(crate) static REQUEST_TOO_LARGE_KEY: &str = "request-too-large";
+
+/// How a workflow task completion should be delivered, produced by [paginate_wft_completion].
+enum WftCompletionPages {
+    /// Send as a single request: it fits within a page, or it cannot be split.
+    Single(RespondWorkflowTaskCompletedRequest),
+    /// The server buffers only the commands of intermediate pages, so all messages and metadata
+    /// ride on the final page.
+    Paginated {
+        intermediate_pages: Vec<RespondWorkflowTaskCompletedRequest>,
+        final_page: RespondWorkflowTaskCompletedRequest,
+    },
+}
+
+/// Split a completion that may exceed `max_page_bytes` into pages that each stay under it, by
+/// distributing its commands across intermediate pages in order.
+///
+/// Falls back to [WftCompletionPages::Single] when the request already fits, has no commands to
+/// distribute, or has a single command that alone exceeds a page (which the server then rejects).
+fn paginate_wft_completion(
+    mut request: RespondWorkflowTaskCompletedRequest,
+    max_page_bytes: usize,
+) -> WftCompletionPages {
+    if request.encoded_len() <= max_page_bytes {
+        return WftCompletionPages::Single(request);
+    }
+
+    let intermediate_template = RespondWorkflowTaskCompletedRequest {
+        task_token: request.task_token.clone(),
+        identity: request.identity.clone(),
+        namespace: request.namespace.clone(),
+        intermediate_page: true,
+        ..Default::default()
+    };
+
+    // Pages are packed purely by command body size; MAX_WFT_COMPLETION_PAGE_SIZE reserves headroom
+    // for the per-request and per-command overhead this ignores. Only commands can be split across
+    // pages, so pagination cannot help when there are none, or when a single command alone exceeds
+    // a page.
+    if request.commands.is_empty()
+        || request
+            .commands
+            .iter()
+            .any(|c| c.encoded_len() > max_page_bytes)
+    {
+        return WftCompletionPages::Single(request);
+    }
+
+    let commands = std::mem::take(&mut request.commands);
+    let mut intermediate = Vec::new();
+    let mut current = Vec::new();
+    let mut current_len = 0;
+    for command in commands {
+        let command_len = command.encoded_len();
+        if !current.is_empty() && current_len + command_len > max_page_bytes {
+            let mut page = intermediate_template.clone();
+            page.commands = std::mem::take(&mut current);
+            page.page_number = intermediate.len() as i32;
+            intermediate.push(page);
+            current_len = 0;
+        }
+        current_len += command_len;
+        current.push(command);
+    }
+    if !current.is_empty() {
+        let mut page = intermediate_template.clone();
+        page.commands = current;
+        page.page_number = intermediate.len() as i32;
+        intermediate.push(page);
+    }
+
+    request.page_number = intermediate.len() as i32;
+    request.intermediate_page = false;
+    WftCompletionPages::Paginated {
+        intermediate_pages: intermediate,
+        final_page: request,
+    }
+}
+
+/// Returns true if `status` carries a `WorkflowTaskCompletionBufferLostFailure` detail, the
+/// server's signal that it dropped the buffered pages and they must be resent from page 0.
+fn is_workflow_task_completion_buffer_lost(status: &tonic::Status) -> bool {
+    RpcStatus::decode(status.details())
+        .map(|rpc_status| {
+            rpc_status.details.iter().any(|detail| {
+                detail
+                    .to_msg::<WorkflowTaskCompletionBufferLostFailure>()
+                    .is_ok()
+            })
+        })
+        .unwrap_or(false)
+}
+
+/// Wraps a completion page in a request that opts out of the client-layer retry for buffer loss,
+/// which `complete_workflow_task` recovers itself by resending every page.
+fn wft_completion_page_request(
+    page: RespondWorkflowTaskCompletedRequest,
+) -> tonic::Request<RespondWorkflowTaskCompletedRequest> {
+    let mut request = page.into_request();
+    request.extensions_mut().insert(NoRetryOnMatching {
+        predicate: is_workflow_task_completion_buffer_lost,
+    });
+    request
+}
 
 /// The result of a legacy query sent via `respond_legacy_query`.
 pub enum LegacyQueryResult {
@@ -182,6 +327,7 @@ pub trait WorkerClient: Sync + Send {
     async fn complete_workflow_task(
         &self,
         request: WorkflowTaskCompletion,
+        shutdown_token: CancellationToken,
     ) -> Result<RespondWorkflowTaskCompletedResponse>;
     /// Complete an activity task
     async fn complete_activity_task(
@@ -211,7 +357,9 @@ pub trait WorkerClient: Sync + Send {
     async fn fail_activity_task(
         &self,
         task_token: TaskToken,
+        cause: ActivityTaskFailedCause,
         failure: Option<Failure>,
+        last_heartbeat_details: Option<Payloads>,
     ) -> Result<RespondActivityTaskFailedResponse>;
     /// Fail a workflow task
     async fn fail_workflow_task(
@@ -281,6 +429,10 @@ pub trait WorkerClient: Sync + Send {
     fn set_heartbeat_client_fields(&self, heartbeat: &mut WorkerHeartbeat);
     /// Set the worker's payload/memo error limits
     fn set_payload_error_limits(&self, _limits: Option<PayloadErrorLimits>) {}
+    /// Get the worker's payload/memo error limits
+    fn payload_error_limits(&self) -> Option<PayloadErrorLimits> {
+        None
+    }
 }
 
 /// Configuration options shared by workflow, activity, and Nexus polling calls
@@ -407,11 +559,18 @@ impl WorkerClient for WorkerClientBag {
         poll_options: PollOptions,
         nexus_options: PollNexusOptions,
     ) -> Result<PollNexusTaskQueueResponse> {
-        let kind = if nexus_options.worker_commands_queue {
-            TaskQueueKind::WorkerCommands
-        } else {
-            TaskQueueKind::Normal
-        };
+        let (kind, worker_version_capabilities, deployment_options) =
+            if nexus_options.worker_commands_queue {
+                // Worker-command partitions do not support versioning, even when the client was
+                // created for a versioned application worker.
+                (TaskQueueKind::WorkerCommands, None, None)
+            } else {
+                (
+                    TaskQueueKind::Normal,
+                    self.worker_version_capabilities(),
+                    self.deployment_options(),
+                )
+            };
         #[allow(deprecated)] // want to list all fields explicitly
         let mut request = PollNexusTaskQueueRequest {
             namespace: self.namespace.clone(),
@@ -421,8 +580,8 @@ impl WorkerClient for WorkerClientBag {
                 normal_name: "".to_string(),
             }),
             identity: self.identity(),
-            worker_version_capabilities: self.worker_version_capabilities(),
-            deployment_options: self.deployment_options(),
+            worker_version_capabilities,
+            deployment_options,
             // TODO: Piggyback worker heartbeats here if this is the system nexus worker and reset
             //   heartbeating ticker when done
             worker_heartbeat: Vec::new(),
@@ -449,7 +608,10 @@ impl WorkerClient for WorkerClientBag {
     async fn complete_workflow_task(
         &self,
         request: WorkflowTaskCompletion,
+        shutdown_token: CancellationToken,
     ) -> Result<RespondWorkflowTaskCompletedResponse> {
+        let pagination_enabled = request.pagination_enabled;
+        let wft_completion_size_limit = request.wft_completion_size_limit;
         #[allow(deprecated)] // want to list all fields explicitly
         let request = RespondWorkflowTaskCompletedRequest {
             task_token: request.task_token.into(),
@@ -491,13 +653,98 @@ impl WorkerClient for WorkerClientBag {
             worker_instance_key: self.worker_instance_key.to_string(),
             worker_control_task_queue: self.worker_control_task_queue(),
             resource_id: Default::default(),
+            page_number: 0,
+            intermediate_page: false,
         };
-        Ok(self
-            .client
-            .clone()
-            .respond_workflow_task_completed(request.into_request())
-            .await?
-            .into_inner())
+
+        let pages = if pagination_enabled {
+            paginate_wft_completion(request, MAX_WFT_COMPLETION_PAGE_SIZE)
+        } else {
+            WftCompletionPages::Single(request)
+        };
+        let (intermediate_pages, final_page) = match pages {
+            WftCompletionPages::Single(request) => {
+                return Ok(self
+                    .client
+                    .clone()
+                    .respond_workflow_task_completed(request.into_request())
+                    .await?
+                    .into_inner());
+            }
+            WftCompletionPages::Paginated {
+                intermediate_pages,
+                final_page,
+            } => (intermediate_pages, final_page),
+        };
+
+        // The server rejects the completion with REQUEST_TOO_LARGE and terminates the workflow once
+        // the buffered command bytes exceed the namespace limit, so fail here instead of sending
+        // doomed pages. Only buffered command bytes count toward that limit, not messages or
+        // metadata, which aren't buffered.
+        if let Some(limit) = wft_completion_size_limit {
+            let buffered_command_bytes: usize = intermediate_pages
+                .iter()
+                .flat_map(|page| page.commands.iter())
+                .map(|command| command.encoded_len())
+                .sum();
+            if buffered_command_bytes > limit {
+                let mut status = tonic::Status::resource_exhausted(
+                    "workflow task completion exceeds the namespace's recombined size limit",
+                );
+                status
+                    .metadata_mut()
+                    .insert(REQUEST_TOO_LARGE_KEY, MetadataValue::from(0));
+                return Err(status);
+            }
+        }
+
+        // Buffer loss is transient, so resend the whole set from page 0 with exponential backoff.
+        // The server bounds the loop: once the task times out it starts a new attempt, and the next
+        // resend fails the token check with a non-buffer-lost error. Worker shutdown ends the loop
+        // sooner, so a stream of buffer losses can't hold shutdown's drain open until the task times
+        // out (a completion that is not resending still drains normally). Recovery has to live here
+        // because the client's retry layer would resend only the single failed page, which cannot
+        // rebuild the buffer the server dropped; it is told to pass buffer loss straight through
+        // (see `wft_completion_page_request`).
+        let mut backoff = WFT_COMPLETION_PAGE_RESEND_BACKOFF.build();
+        loop {
+            let send_all = async {
+                // Cancel in-flight pages on the first error rather than awaiting them: any failure
+                // means we fail the task or resend from page 0, so the rest is wasted work.
+                stream::iter(intermediate_pages.iter().cloned())
+                    .map(|page| {
+                        let mut client = self.client.clone();
+                        async move {
+                            client
+                                .respond_workflow_task_completed(wft_completion_page_request(page))
+                                .await
+                        }
+                    })
+                    .buffer_unordered(MAX_CONCURRENT_WFT_COMPLETION_PAGES)
+                    .try_collect::<Vec<_>>()
+                    .await?;
+                // The final page must be sent only after every intermediate page has been
+                // buffered: it triggers the server-side merge, which requires pages 0..N-1 to all
+                // be present and otherwise returns a buffer-lost error.
+                self.client
+                    .clone()
+                    .respond_workflow_task_completed(wft_completion_page_request(
+                        final_page.clone(),
+                    ))
+                    .await
+            };
+            match send_all.await {
+                Ok(response) => return Ok(response.into_inner()),
+                Err(e) if is_workflow_task_completion_buffer_lost(&e) => {
+                    let delay = backoff.next().expect("resend backoff is unbounded");
+                    tokio::select! {
+                        _ = shutdown_token.cancelled() => return Err(e),
+                        _ = sleep(delay) => {}
+                    }
+                }
+                Err(e) => return Err(e),
+            }
+        }
     }
 
     async fn complete_activity_task(
@@ -511,7 +758,7 @@ impl WorkerClient for WorkerClientBag {
             .respond_activity_task_completed(
                 #[allow(deprecated)] // want to list all fields explicitly
                 RespondActivityTaskCompletedRequest {
-                    task_token: task_token.0,
+                    task_token: task_token.into_inner(),
                     result,
                     identity: self.identity(),
                     namespace: self.namespace.clone(),
@@ -539,7 +786,7 @@ impl WorkerClient for WorkerClientBag {
                 RespondNexusTaskCompletedRequest {
                     namespace: self.namespace.clone(),
                     identity: self.identity(),
-                    task_token: task_token.0,
+                    task_token: task_token.into_inner(),
                     response: Some(response),
                     poller_group_id: Default::default(),
                 }
@@ -559,7 +806,7 @@ impl WorkerClient for WorkerClientBag {
             .clone()
             .record_activity_task_heartbeat(
                 RecordActivityTaskHeartbeatRequest {
-                    task_token: task_token.0,
+                    task_token: task_token.into_inner(),
                     details,
                     identity: self.identity(),
                     namespace: self.namespace.clone(),
@@ -582,7 +829,7 @@ impl WorkerClient for WorkerClientBag {
             .respond_activity_task_canceled(
                 #[allow(deprecated)] // want to list all fields explicitly
                 RespondActivityTaskCanceledRequest {
-                    task_token: task_token.0,
+                    task_token: task_token.into_inner(),
                     details,
                     identity: self.identity(),
                     namespace: self.namespace.clone(),
@@ -601,7 +848,9 @@ impl WorkerClient for WorkerClientBag {
     async fn fail_activity_task(
         &self,
         task_token: TaskToken,
+        cause: ActivityTaskFailedCause,
         failure: Option<Failure>,
+        last_heartbeat_details: Option<Payloads>,
     ) -> Result<RespondActivityTaskFailedResponse> {
         Ok(self
             .client
@@ -609,17 +858,17 @@ impl WorkerClient for WorkerClientBag {
             .respond_activity_task_failed(
                 #[allow(deprecated)] // want to list all fields explicitly
                 RespondActivityTaskFailedRequest {
-                    task_token: task_token.0,
+                    task_token: task_token.into_inner(),
                     failure,
                     identity: self.identity(),
                     namespace: self.namespace.clone(),
-                    // TODO: Implement - https://github.com/temporalio/sdk-core/issues/293
-                    last_heartbeat_details: None,
+                    last_heartbeat_details,
                     worker_version: self.worker_version_stamp(),
                     // Will never be set, deprecated.
                     deployment: None,
                     deployment_options: self.deployment_options(),
                     resource_id: Default::default(),
+                    cause: cause as i32,
                 }
                 .into_request(),
             )
@@ -635,7 +884,7 @@ impl WorkerClient for WorkerClientBag {
     ) -> Result<RespondWorkflowTaskFailedResponse> {
         #[allow(deprecated)] // want to list all fields explicitly
         let request = RespondWorkflowTaskFailedRequest {
-            task_token: task_token.0,
+            task_token: task_token.into_inner(),
             cause: cause as i32,
             failure,
             identity: self.identity(),
@@ -674,7 +923,7 @@ impl WorkerClient for WorkerClientBag {
                 RespondNexusTaskFailedRequest {
                     namespace: self.namespace.clone(),
                     identity: self.identity(),
-                    task_token: task_token.0,
+                    task_token: task_token.into_inner(),
                     failure,
                     error,
                     poller_group_id: Default::default(),
@@ -901,6 +1150,10 @@ impl WorkerClient for WorkerClientBag {
     fn set_payload_error_limits(&self, limits: Option<PayloadErrorLimits>) {
         self.client.set_error_limits(limits);
     }
+
+    fn payload_error_limits(&self) -> Option<PayloadErrorLimits> {
+        self.client.error_limits()
+    }
 }
 
 impl NamespacedClient for WorkerClientBag {
@@ -915,7 +1168,7 @@ impl NamespacedClient for WorkerClientBag {
 
 /// A version of [RespondWorkflowTaskCompletedRequest] that will finish being filled out by the
 /// server client
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub struct WorkflowTaskCompletion {
     /// The task token that would've been received from polling for a workflow activation
     pub task_token: TaskToken,
@@ -937,6 +1190,13 @@ pub struct WorkflowTaskCompletion {
     pub metering_metadata: MeteringMetadata,
     /// Versioning behavior of the workflow, if any.
     pub versioning_behavior: VersioningBehavior,
+    /// Whether the namespace permits paginating this completion across multiple page requests when
+    /// it would otherwise exceed the server's gRPC request size limit.
+    pub pagination_enabled: bool,
+    /// The namespace's limit on the recombined size of a paginated completion, if the server
+    /// advertises one. A paginated completion larger than this is rejected server-side with
+    /// `REQUEST_TOO_LARGE`, so the worker fails it proactively instead of sending doomed pages.
+    pub wft_completion_size_limit: Option<usize>,
 }
 
 #[derive(Clone, Default)]
@@ -964,5 +1224,863 @@ fn update_slots(slots_info: &mut Option<WorkerSlotsInfo>, client_heartbeat_data:
 
         client_heartbeat_data.total_processed_tasks = wft_slot_info.total_processed_tasks;
         client_heartbeat_data.total_failed_tasks = wft_slot_info.total_failed_tasks;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use prost::Message;
+    use std::sync::{Arc, Mutex};
+    use temporalio_client::{
+        ConnectionOptions,
+        callback_based::{CallbackBasedGrpcService, GrpcSuccessResponse},
+    };
+    use temporalio_common::worker::{WorkerDeploymentOptions, WorkerDeploymentVersion};
+
+    #[tokio::test]
+    async fn activity_failure_request_includes_last_heartbeat_details() {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let requests_clone = requests.clone();
+        let service_override = CallbackBasedGrpcService {
+            callback: Arc::new(move |request| {
+                let requests = requests_clone.clone();
+                Box::pin(async move {
+                    let proto = match request.rpc.as_str() {
+                        "GetSystemInfo" => GetSystemInfoResponse::default().encode_to_vec(),
+                        "RespondActivityTaskFailed" => {
+                            requests.lock().unwrap().push(
+                                RespondActivityTaskFailedRequest::decode(request.proto)
+                                    .expect("failure request is valid"),
+                            );
+                            RespondActivityTaskFailedResponse::default().encode_to_vec()
+                        }
+                        rpc => panic!("unexpected RPC: {rpc}"),
+                    };
+                    Ok(GrpcSuccessResponse {
+                        headers: Default::default(),
+                        proto,
+                    })
+                })
+            }),
+        };
+        let connection = Connection::connect(
+            ConnectionOptions::new(url::Url::parse("http://localhost:7233").unwrap())
+                .service_override(service_override)
+                .dns_load_balancing(None)
+                .build(),
+        )
+        .await
+        .unwrap();
+        let client = WorkerClientBag::new(
+            SharedReplaceableClient::new(connection),
+            "namespace".to_string(),
+            WorkerVersioningStrategy::None {
+                build_id: String::new(),
+            },
+            Uuid::new_v4(),
+        );
+        let last_heartbeat_details = Payloads {
+            payloads: vec![
+                temporalio_common::protos::temporal::api::common::v1::Payload {
+                    data: vec![1, 2, 3],
+                    ..Default::default()
+                },
+            ],
+        };
+
+        client
+            .fail_activity_task(
+                vec![1].into(),
+                ActivityTaskFailedCause::ActivityWorkerUnhandledFailure,
+                None,
+                Some(last_heartbeat_details.clone()),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            requests.lock().unwrap()[0].last_heartbeat_details,
+            Some(last_heartbeat_details)
+        );
+    }
+
+    #[allow(deprecated)]
+    #[tokio::test]
+    async fn worker_command_nexus_polls_omit_versioning_metadata() {
+        let strategies = [
+            (
+                "deployment",
+                WorkerVersioningStrategy::WorkerDeploymentBased(
+                    WorkerDeploymentOptions::new(
+                        WorkerDeploymentVersion::builder()
+                            .deployment_name("deployment".to_string())
+                            .build_id("deployment-build".to_string())
+                            .build(),
+                    )
+                    .use_worker_versioning(true)
+                    .build(),
+                ),
+            ),
+            (
+                "legacy",
+                WorkerVersioningStrategy::LegacyBuildIdBased {
+                    build_id: "legacy-build".to_string(),
+                },
+            ),
+        ];
+
+        for (strategy_name, strategy) in strategies {
+            let requests = Arc::new(Mutex::new(Vec::new()));
+            let requests_clone = requests.clone();
+            let service_override = CallbackBasedGrpcService {
+                callback: Arc::new(move |request| {
+                    let requests = requests_clone.clone();
+                    Box::pin(async move {
+                        let proto = match request.rpc.as_str() {
+                            "GetSystemInfo" => GetSystemInfoResponse {
+                                capabilities: Some(Capabilities {
+                                    build_id_based_versioning: true,
+                                    ..Default::default()
+                                }),
+                                ..Default::default()
+                            }
+                            .encode_to_vec(),
+                            "PollNexusTaskQueue" => {
+                                requests.lock().unwrap().push(
+                                    PollNexusTaskQueueRequest::decode(request.proto)
+                                        .expect("poll request is valid"),
+                                );
+                                PollNexusTaskQueueResponse::default().encode_to_vec()
+                            }
+                            rpc => panic!("unexpected RPC: {rpc}"),
+                        };
+                        Ok(GrpcSuccessResponse {
+                            headers: Default::default(),
+                            proto,
+                        })
+                    })
+                }),
+            };
+            let connection = Connection::connect(
+                ConnectionOptions::new(url::Url::parse("http://localhost:7233").unwrap())
+                    .service_override(service_override)
+                    .dns_load_balancing(None)
+                    .build(),
+            )
+            .await
+            .unwrap();
+            let client = WorkerClientBag::new(
+                SharedReplaceableClient::new(connection),
+                "namespace".to_string(),
+                strategy,
+                Uuid::new_v4(),
+            );
+
+            client
+                .poll_nexus_task(
+                    PollOptions {
+                        task_queue: "application-queue".to_string(),
+                        no_retry: None,
+                        timeout_override: None,
+                    },
+                    PollNexusOptions {
+                        worker_commands_queue: false,
+                    },
+                )
+                .await
+                .unwrap();
+            client
+                .poll_nexus_task(
+                    PollOptions {
+                        task_queue: "worker-command-queue".to_string(),
+                        no_retry: None,
+                        timeout_override: None,
+                    },
+                    PollNexusOptions {
+                        worker_commands_queue: true,
+                    },
+                )
+                .await
+                .unwrap();
+
+            let requests = requests.lock().unwrap();
+            assert_eq!(requests.len(), 2, "{strategy_name}");
+            let normal_poll = &requests[0];
+            assert_eq!(
+                normal_poll.task_queue.as_ref().unwrap().kind,
+                TaskQueueKind::Normal as i32,
+                "{strategy_name}",
+            );
+            assert!(
+                normal_poll
+                    .worker_version_capabilities
+                    .as_ref()
+                    .is_some_and(|capabilities| capabilities.use_versioning)
+                    || normal_poll
+                        .deployment_options
+                        .as_ref()
+                        .is_some_and(|options| {
+                            options.worker_versioning_mode == WorkerVersioningMode::Versioned as i32
+                        }),
+                "{strategy_name}",
+            );
+
+            let worker_command_poll = &requests[1];
+            assert_eq!(
+                worker_command_poll.task_queue.as_ref().unwrap().kind,
+                TaskQueueKind::WorkerCommands as i32,
+                "{strategy_name}",
+            );
+            assert!(
+                worker_command_poll.worker_version_capabilities.is_none(),
+                "{strategy_name}",
+            );
+            assert!(
+                worker_command_poll.deployment_options.is_none(),
+                "{strategy_name}",
+            );
+        }
+    }
+
+    mod pagination {
+        use super::*;
+        use temporalio_common::protos::temporal::api::{
+            command::v1::{CompleteWorkflowExecutionCommandAttributes, command},
+            common::v1::{Payload, Payloads},
+            errordetails::v1::WorkflowExecutionAlreadyStartedFailure,
+        };
+
+        fn command_with_payload(data_size: usize) -> Command {
+            Command {
+                attributes: Some(
+                    command::Attributes::CompleteWorkflowExecutionCommandAttributes(
+                        CompleteWorkflowExecutionCommandAttributes {
+                            result: Some(Payloads {
+                                payloads: vec![Payload {
+                                    metadata: Default::default(),
+                                    data: vec![0u8; data_size],
+                                    ..Default::default()
+                                }],
+                            }),
+                        },
+                    ),
+                ),
+                ..Default::default()
+            }
+        }
+
+        fn request_with(commands: Vec<Command>) -> RespondWorkflowTaskCompletedRequest {
+            RespondWorkflowTaskCompletedRequest {
+                task_token: b"task-token".to_vec(),
+                identity: "identity".to_string(),
+                namespace: "namespace".to_string(),
+                commands,
+                ..Default::default()
+            }
+        }
+
+        #[test]
+        fn completion_within_limit_is_a_single_final_page() {
+            let request = request_with(vec![command_with_payload(16)]);
+            let WftCompletionPages::Single(page) = paginate_wft_completion(request, 4096) else {
+                panic!("expected a single page");
+            };
+            assert_eq!(page.page_number, 0);
+            assert!(!page.intermediate_page);
+            assert_eq!(page.commands.len(), 1);
+        }
+
+        #[test]
+        fn large_completion_splits_commands_across_pages() {
+            let max = 1024;
+            let command_count = 6;
+            let commands: Vec<_> = (0..command_count)
+                .map(|_| command_with_payload(400))
+                .collect();
+            let request = request_with(commands);
+            assert!(request.encoded_len() > max);
+
+            let WftCompletionPages::Paginated {
+                intermediate_pages: intermediate,
+                final_page,
+            } = paginate_wft_completion(request, max)
+            else {
+                panic!("expected multiple pages");
+            };
+
+            assert!(!final_page.intermediate_page);
+            assert!(final_page.commands.is_empty());
+            assert_eq!(final_page.page_number as usize, intermediate.len());
+            assert!(final_page.encoded_len() <= max);
+            assert_eq!(final_page.task_token, b"task-token");
+
+            let mut total_commands = 0;
+            for (idx, page) in intermediate.iter().enumerate() {
+                assert!(page.intermediate_page);
+                assert_eq!(page.page_number as usize, idx);
+                assert_eq!(page.task_token, b"task-token");
+                assert!(
+                    page.encoded_len() <= max,
+                    "intermediate page {idx} over limit"
+                );
+                total_commands += page.commands.len();
+            }
+            // Every command is preserved exactly once across the intermediate pages.
+            assert_eq!(total_commands, command_count);
+        }
+
+        #[test]
+        fn single_command_larger_than_a_page_is_not_split() {
+            let max = 1024;
+            let request = request_with(vec![command_with_payload(4096)]);
+            // Cannot be split, so it is left as one (oversized) request for the server to reject.
+            let WftCompletionPages::Single(page) = paginate_wft_completion(request, max) else {
+                panic!("expected a single page");
+            };
+            assert_eq!(page.commands.len(), 1);
+            assert!(!page.intermediate_page);
+        }
+
+        // Pack the detail with `Any::from_msg` so its `type_url` is derived from the message name,
+        // the way the server sets it, rather than a hand-written string.
+        fn status_with_detail<M: prost::Name>(detail: &M) -> tonic::Status {
+            let rpc_status = RpcStatus {
+                code: tonic::Code::Aborted as i32,
+                message: String::new(),
+                details: vec![prost_types::Any::from_msg(detail).expect("detail encodes")],
+            };
+            tonic::Status::with_details(tonic::Code::Aborted, "", rpc_status.encode_to_vec().into())
+        }
+
+        #[test]
+        fn detects_buffer_lost_failure_detail() {
+            let status = status_with_detail(&WorkflowTaskCompletionBufferLostFailure {});
+            assert!(is_workflow_task_completion_buffer_lost(&status));
+
+            let unrelated = tonic::Status::new(tonic::Code::Internal, "boom");
+            assert!(!is_workflow_task_completion_buffer_lost(&unrelated));
+        }
+
+        #[test]
+        fn buffer_lost_detection_ignores_unrelated_detail() {
+            // A different error detail carried on the same gRPC code must not be mistaken for a
+            // buffer-lost failure.
+            let status = status_with_detail(&WorkflowExecutionAlreadyStartedFailure {
+                start_request_id: "req".to_string(),
+                run_id: "run".to_string(),
+                ..Default::default()
+            });
+            assert!(!is_workflow_task_completion_buffer_lost(&status));
+        }
+
+        #[tokio::test]
+        async fn paginated_completion_sends_ordered_pages_sharing_a_token() {
+            let captured = Arc::new(Mutex::new(Vec::new()));
+            let captured_clone = captured.clone();
+            let service_override = CallbackBasedGrpcService {
+                callback: Arc::new(move |request| {
+                    let captured = captured_clone.clone();
+                    Box::pin(async move {
+                        let proto = match request.rpc.as_str() {
+                            "GetSystemInfo" => GetSystemInfoResponse {
+                                capabilities: Some(Capabilities::default()),
+                                ..Default::default()
+                            }
+                            .encode_to_vec(),
+                            "RespondWorkflowTaskCompleted" => {
+                                captured.lock().unwrap().push(
+                                    RespondWorkflowTaskCompletedRequest::decode(request.proto)
+                                        .expect("completion request is valid"),
+                                );
+                                RespondWorkflowTaskCompletedResponse::default().encode_to_vec()
+                            }
+                            rpc => panic!("unexpected RPC: {rpc}"),
+                        };
+                        Ok(GrpcSuccessResponse {
+                            headers: Default::default(),
+                            proto,
+                        })
+                    })
+                }),
+            };
+            let connection = Connection::connect(
+                ConnectionOptions::new(url::Url::parse("http://localhost:7233").unwrap())
+                    .service_override(service_override)
+                    .dns_load_balancing(None)
+                    .build(),
+            )
+            .await
+            .unwrap();
+            let client = WorkerClientBag::new(
+                SharedReplaceableClient::new(connection),
+                "namespace".to_string(),
+                WorkerVersioningStrategy::LegacyBuildIdBased {
+                    build_id: "test-build".to_string(),
+                },
+                Uuid::new_v4(),
+            );
+
+            // Roughly 4 MiB of commands forces splitting under the ~3 MiB page target.
+            let commands: Vec<_> = (0..8).map(|_| command_with_payload(512 * 1024)).collect();
+            let completion = WorkflowTaskCompletion {
+                task_token: b"shared-token".to_vec().into(),
+                commands,
+                messages: vec![],
+                sticky_attributes: None,
+                query_responses: vec![],
+                return_new_workflow_task: false,
+                force_create_new_workflow_task: false,
+                sdk_metadata: Default::default(),
+                metering_metadata: Default::default(),
+                versioning_behavior: VersioningBehavior::Unspecified,
+                pagination_enabled: true,
+                wft_completion_size_limit: None,
+            };
+            client
+                .complete_workflow_task(completion, CancellationToken::new())
+                .await
+                .unwrap();
+
+            let sent = captured.lock().unwrap();
+            assert!(
+                sent.len() >= 2,
+                "expected multiple pages, got {}",
+                sent.len()
+            );
+            // Every page shares the one task token.
+            assert!(sent.iter().all(|r| r.task_token == b"shared-token"));
+            // Exactly one final page, numbered after all the intermediate ones.
+            let finals: Vec<_> = sent.iter().filter(|r| !r.intermediate_page).collect();
+            assert_eq!(finals.len(), 1);
+            assert_eq!(finals[0].page_number as usize, sent.len() - 1);
+            assert!(finals[0].commands.is_empty());
+            // Intermediate pages carry sequential page numbers 0..N-1.
+            let mut intermediate_numbers: Vec<_> = sent
+                .iter()
+                .filter(|r| r.intermediate_page)
+                .map(|r| r.page_number)
+                .collect();
+            intermediate_numbers.sort_unstable();
+            assert_eq!(
+                intermediate_numbers,
+                (0..(sent.len() as i32 - 1)).collect::<Vec<_>>()
+            );
+        }
+
+        #[tokio::test]
+        async fn failed_page_cancels_other_inflight_pages() {
+            // Page 0 fails immediately; every other intermediate page hangs forever. The call can
+            // only return if the failed page short-circuits the send and the hung pages are
+            // dropped (cancelled) rather than awaited.
+            let never = Arc::new(tokio::sync::Notify::new());
+            let never_cb = never.clone();
+            let service_override = CallbackBasedGrpcService {
+                callback: Arc::new(move |request| {
+                    let never = never_cb.clone();
+                    Box::pin(async move {
+                        match request.rpc.as_str() {
+                            "GetSystemInfo" => Ok(GrpcSuccessResponse {
+                                headers: Default::default(),
+                                proto: GetSystemInfoResponse {
+                                    capabilities: Some(Capabilities::default()),
+                                    ..Default::default()
+                                }
+                                .encode_to_vec(),
+                            }),
+                            "RespondWorkflowTaskCompleted" => {
+                                let page =
+                                    RespondWorkflowTaskCompletedRequest::decode(request.proto)
+                                        .expect("completion request is valid");
+                                if page.intermediate_page && page.page_number == 0 {
+                                    // InvalidArgument is non-retryable, so it is forwarded at once.
+                                    Err(tonic::Status::new(tonic::Code::InvalidArgument, "boom"))
+                                } else {
+                                    never.notified().await;
+                                    unreachable!("a cancelled page must not resume");
+                                }
+                            }
+                            rpc => panic!("unexpected RPC: {rpc}"),
+                        }
+                    })
+                }),
+            };
+            let connection = Connection::connect(
+                ConnectionOptions::new(url::Url::parse("http://localhost:7233").unwrap())
+                    .service_override(service_override)
+                    .dns_load_balancing(None)
+                    .build(),
+            )
+            .await
+            .unwrap();
+            let client = WorkerClientBag::new(
+                SharedReplaceableClient::new(connection),
+                "namespace".to_string(),
+                WorkerVersioningStrategy::LegacyBuildIdBased {
+                    build_id: "test-build".to_string(),
+                },
+                Uuid::new_v4(),
+            );
+
+            // Enough commands to yield at least two intermediate pages (one fails, one hangs).
+            let commands: Vec<_> = (0..8).map(|_| command_with_payload(512 * 1024)).collect();
+            let completion = WorkflowTaskCompletion {
+                task_token: b"shared-token".to_vec().into(),
+                commands,
+                messages: vec![],
+                sticky_attributes: None,
+                query_responses: vec![],
+                return_new_workflow_task: false,
+                force_create_new_workflow_task: false,
+                sdk_metadata: Default::default(),
+                metering_metadata: Default::default(),
+                versioning_behavior: VersioningBehavior::Unspecified,
+                pagination_enabled: true,
+                wft_completion_size_limit: None,
+            };
+
+            // Without cancellation this would hang on the never-completing page; the timeout guards
+            // against that regression instead of relying on a sleep.
+            let outcome = tokio::time::timeout(
+                Duration::from_secs(10),
+                client.complete_workflow_task(completion, CancellationToken::new()),
+            )
+            .await
+            .expect("completion resolved without waiting on the hung page");
+            assert!(
+                outcome.is_err(),
+                "the failed page should surface as an error"
+            );
+        }
+
+        #[tokio::test]
+        async fn completion_over_namespace_limit_fails_proactively_without_sending() {
+            let sent = Arc::new(Mutex::new(0usize));
+            let sent_cb = sent.clone();
+            let service_override = CallbackBasedGrpcService {
+                callback: Arc::new(move |request| {
+                    let sent = sent_cb.clone();
+                    Box::pin(async move {
+                        let proto = match request.rpc.as_str() {
+                            "GetSystemInfo" => GetSystemInfoResponse {
+                                capabilities: Some(Capabilities::default()),
+                                ..Default::default()
+                            }
+                            .encode_to_vec(),
+                            "RespondWorkflowTaskCompleted" => {
+                                *sent.lock().unwrap() += 1;
+                                RespondWorkflowTaskCompletedResponse::default().encode_to_vec()
+                            }
+                            rpc => panic!("unexpected RPC: {rpc}"),
+                        };
+                        Ok(GrpcSuccessResponse {
+                            headers: Default::default(),
+                            proto,
+                        })
+                    })
+                }),
+            };
+            let connection = Connection::connect(
+                ConnectionOptions::new(url::Url::parse("http://localhost:7233").unwrap())
+                    .service_override(service_override)
+                    .dns_load_balancing(None)
+                    .build(),
+            )
+            .await
+            .unwrap();
+            let client = WorkerClientBag::new(
+                SharedReplaceableClient::new(connection),
+                "namespace".to_string(),
+                WorkerVersioningStrategy::LegacyBuildIdBased {
+                    build_id: "test-build".to_string(),
+                },
+                Uuid::new_v4(),
+            );
+
+            // ~4 MiB total (so it would be paginated) but the namespace caps the recombined size
+            // at 1 MiB, so the server would reject it, and the worker must fail it without sending.
+            let commands: Vec<_> = (0..8).map(|_| command_with_payload(512 * 1024)).collect();
+            let completion = WorkflowTaskCompletion {
+                task_token: b"shared-token".to_vec().into(),
+                commands,
+                messages: vec![],
+                sticky_attributes: None,
+                query_responses: vec![],
+                return_new_workflow_task: false,
+                force_create_new_workflow_task: false,
+                sdk_metadata: Default::default(),
+                metering_metadata: Default::default(),
+                versioning_behavior: VersioningBehavior::Unspecified,
+                pagination_enabled: true,
+                wft_completion_size_limit: Some(1024 * 1024),
+            };
+            let err = client
+                .complete_workflow_task(completion, CancellationToken::new())
+                .await
+                .expect_err("completion over the namespace limit must fail");
+            assert!(err.metadata().contains_key(REQUEST_TOO_LARGE_KEY));
+            assert_eq!(*sent.lock().unwrap(), 0, "no pages should have been sent");
+        }
+
+        #[tokio::test]
+        async fn buffer_loss_resends_all_pages_until_it_succeeds() {
+            // The server reports buffer loss on the final page of the first two attempts, then
+            // accepts the third. The whole set must be resent from page 0 each time, and the
+            // completion must ultimately succeed. Because buffer loss is marked non-retryable at the
+            // client layer, each attempt sends the final page exactly once, so a count of three
+            // proves the resend loop, not the client's retry policy, did the retrying.
+            let final_attempts = Arc::new(Mutex::new(0usize));
+            let final_attempts_cb = final_attempts.clone();
+            let service_override = CallbackBasedGrpcService {
+                callback: Arc::new(move |request| {
+                    let final_attempts = final_attempts_cb.clone();
+                    Box::pin(async move {
+                        match request.rpc.as_str() {
+                            "GetSystemInfo" => Ok(GrpcSuccessResponse {
+                                headers: Default::default(),
+                                proto: GetSystemInfoResponse {
+                                    capabilities: Some(Capabilities::default()),
+                                    ..Default::default()
+                                }
+                                .encode_to_vec(),
+                            }),
+                            "RespondWorkflowTaskCompleted" => {
+                                let page =
+                                    RespondWorkflowTaskCompletedRequest::decode(request.proto)
+                                        .expect("completion request is valid");
+                                if !page.intermediate_page {
+                                    let mut attempts = final_attempts.lock().unwrap();
+                                    *attempts += 1;
+                                    if *attempts <= 2 {
+                                        return Err(status_with_detail(
+                                            &WorkflowTaskCompletionBufferLostFailure {},
+                                        ));
+                                    }
+                                }
+                                Ok(GrpcSuccessResponse {
+                                    headers: Default::default(),
+                                    proto: RespondWorkflowTaskCompletedResponse::default()
+                                        .encode_to_vec(),
+                                })
+                            }
+                            rpc => panic!("unexpected RPC: {rpc}"),
+                        }
+                    })
+                }),
+            };
+            let connection = Connection::connect(
+                ConnectionOptions::new(url::Url::parse("http://localhost:7233").unwrap())
+                    .service_override(service_override)
+                    .dns_load_balancing(None)
+                    .build(),
+            )
+            .await
+            .unwrap();
+            let client = WorkerClientBag::new(
+                SharedReplaceableClient::new(connection),
+                "namespace".to_string(),
+                WorkerVersioningStrategy::LegacyBuildIdBased {
+                    build_id: "test-build".to_string(),
+                },
+                Uuid::new_v4(),
+            );
+
+            let commands: Vec<_> = (0..8).map(|_| command_with_payload(512 * 1024)).collect();
+            let completion = WorkflowTaskCompletion {
+                task_token: b"shared-token".to_vec().into(),
+                commands,
+                messages: vec![],
+                sticky_attributes: None,
+                query_responses: vec![],
+                return_new_workflow_task: false,
+                force_create_new_workflow_task: false,
+                sdk_metadata: Default::default(),
+                metering_metadata: Default::default(),
+                versioning_behavior: VersioningBehavior::Unspecified,
+                pagination_enabled: true,
+                wft_completion_size_limit: None,
+            };
+            client
+                .complete_workflow_task(completion, CancellationToken::new())
+                .await
+                .expect("completion eventually succeeds after the buffer is re-established");
+            assert_eq!(
+                *final_attempts.lock().unwrap(),
+                3,
+                "the final page is sent once per resend, with no client-layer retry"
+            );
+        }
+
+        #[tokio::test]
+        async fn shutdown_stops_buffer_loss_resends() {
+            // The server never re-establishes the buffer, so without shutdown handling the resend
+            // loop would run until the task times out on the server, potentially minutes, holding
+            // shutdown open. A cancelled shutdown token must end it promptly instead. The token is
+            // cancelled before the call, so the first attempt still sends fully (in-flight work is
+            // never abandoned) and the loop bails as soon as that attempt reports buffer loss.
+            let final_attempts = Arc::new(Mutex::new(0usize));
+            let final_attempts_cb = final_attempts.clone();
+            let service_override = CallbackBasedGrpcService {
+                callback: Arc::new(move |request| {
+                    let final_attempts = final_attempts_cb.clone();
+                    Box::pin(async move {
+                        match request.rpc.as_str() {
+                            "GetSystemInfo" => Ok(GrpcSuccessResponse {
+                                headers: Default::default(),
+                                proto: GetSystemInfoResponse {
+                                    capabilities: Some(Capabilities::default()),
+                                    ..Default::default()
+                                }
+                                .encode_to_vec(),
+                            }),
+                            "RespondWorkflowTaskCompleted" => {
+                                let page =
+                                    RespondWorkflowTaskCompletedRequest::decode(request.proto)
+                                        .expect("completion request is valid");
+                                if page.intermediate_page {
+                                    Ok(GrpcSuccessResponse {
+                                        headers: Default::default(),
+                                        proto: RespondWorkflowTaskCompletedResponse::default()
+                                            .encode_to_vec(),
+                                    })
+                                } else {
+                                    *final_attempts.lock().unwrap() += 1;
+                                    Err(status_with_detail(
+                                        &WorkflowTaskCompletionBufferLostFailure {},
+                                    ))
+                                }
+                            }
+                            rpc => panic!("unexpected RPC: {rpc}"),
+                        }
+                    })
+                }),
+            };
+            let connection = Connection::connect(
+                ConnectionOptions::new(url::Url::parse("http://localhost:7233").unwrap())
+                    .service_override(service_override)
+                    .dns_load_balancing(None)
+                    .build(),
+            )
+            .await
+            .unwrap();
+            let client = WorkerClientBag::new(
+                SharedReplaceableClient::new(connection),
+                "namespace".to_string(),
+                WorkerVersioningStrategy::LegacyBuildIdBased {
+                    build_id: "test-build".to_string(),
+                },
+                Uuid::new_v4(),
+            );
+
+            let shutdown_token = CancellationToken::new();
+            shutdown_token.cancel();
+            let commands: Vec<_> = (0..8).map(|_| command_with_payload(512 * 1024)).collect();
+            let completion = WorkflowTaskCompletion {
+                task_token: b"shared-token".to_vec().into(),
+                commands,
+                messages: vec![],
+                sticky_attributes: None,
+                query_responses: vec![],
+                return_new_workflow_task: false,
+                force_create_new_workflow_task: false,
+                sdk_metadata: Default::default(),
+                metering_metadata: Default::default(),
+                versioning_behavior: VersioningBehavior::Unspecified,
+                pagination_enabled: true,
+                wft_completion_size_limit: None,
+            };
+
+            let err = tokio::time::timeout(
+                Duration::from_secs(10),
+                client.complete_workflow_task(completion, shutdown_token),
+            )
+            .await
+            .expect("shutdown ends the resend loop instead of waiting for the server timeout")
+            .expect_err("the last buffer-loss error is surfaced");
+            assert!(is_workflow_task_completion_buffer_lost(&err));
+            assert_eq!(
+                *final_attempts.lock().unwrap(),
+                1,
+                "the first attempt still sends; shutdown prevents any resend"
+            );
+        }
+
+        #[tokio::test]
+        async fn cancelled_shutdown_does_not_interrupt_successful_completion() {
+            // The shutdown token is only consulted while resending after buffer loss. A completion
+            // that never hits buffer loss must still succeed even when the worker is shutting down,
+            // so graceful drain can finish outstanding completions rather than abandon them.
+            let final_pages = Arc::new(Mutex::new(0usize));
+            let final_pages_cb = final_pages.clone();
+            let service_override = CallbackBasedGrpcService {
+                callback: Arc::new(move |request| {
+                    let final_pages = final_pages_cb.clone();
+                    Box::pin(async move {
+                        let proto = match request.rpc.as_str() {
+                            "GetSystemInfo" => GetSystemInfoResponse {
+                                capabilities: Some(Capabilities::default()),
+                                ..Default::default()
+                            }
+                            .encode_to_vec(),
+                            "RespondWorkflowTaskCompleted" => {
+                                let page =
+                                    RespondWorkflowTaskCompletedRequest::decode(request.proto)
+                                        .expect("completion request is valid");
+                                if !page.intermediate_page {
+                                    *final_pages.lock().unwrap() += 1;
+                                }
+                                RespondWorkflowTaskCompletedResponse::default().encode_to_vec()
+                            }
+                            rpc => panic!("unexpected RPC: {rpc}"),
+                        };
+                        Ok(GrpcSuccessResponse {
+                            headers: Default::default(),
+                            proto,
+                        })
+                    })
+                }),
+            };
+            let connection = Connection::connect(
+                ConnectionOptions::new(url::Url::parse("http://localhost:7233").unwrap())
+                    .service_override(service_override)
+                    .dns_load_balancing(None)
+                    .build(),
+            )
+            .await
+            .unwrap();
+            let client = WorkerClientBag::new(
+                SharedReplaceableClient::new(connection),
+                "namespace".to_string(),
+                WorkerVersioningStrategy::LegacyBuildIdBased {
+                    build_id: "test-build".to_string(),
+                },
+                Uuid::new_v4(),
+            );
+
+            let shutdown_token = CancellationToken::new();
+            shutdown_token.cancel();
+            let commands: Vec<_> = (0..8).map(|_| command_with_payload(512 * 1024)).collect();
+            let completion = WorkflowTaskCompletion {
+                task_token: b"shared-token".to_vec().into(),
+                commands,
+                messages: vec![],
+                sticky_attributes: None,
+                query_responses: vec![],
+                return_new_workflow_task: false,
+                force_create_new_workflow_task: false,
+                sdk_metadata: Default::default(),
+                metering_metadata: Default::default(),
+                versioning_behavior: VersioningBehavior::Unspecified,
+                pagination_enabled: true,
+                wft_completion_size_limit: None,
+            };
+
+            client
+                .complete_workflow_task(completion, shutdown_token)
+                .await
+                .expect("a completion without buffer loss succeeds despite shutdown");
+            // The paginated path ran to its final page rather than being cut short.
+            assert_eq!(*final_pages.lock().unwrap(), 1);
+        }
     }
 }

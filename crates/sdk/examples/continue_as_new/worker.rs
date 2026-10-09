@@ -3,18 +3,12 @@ mod workflows;
 use temporalio_client::{
     Client, ClientOptions, Connection, envconfig::LoadClientConfigProfileOptions,
 };
-use temporalio_common::{telemetry::TelemetryOptions, worker::WorkerTaskTypes};
-use temporalio_sdk::{Worker, WorkerOptions};
-use temporalio_sdk_core::{CoreRuntime, RuntimeOptions};
+use temporalio_sdk::{Runtime, Worker, WorkerOptions};
 use workflows::ContinueAsNewWorkflow;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let runtime = CoreRuntime::new_assume_tokio(
-        RuntimeOptions::builder()
-            .telemetry_options(TelemetryOptions::builder().build())
-            .build()?,
-    )?;
+    let runtime = Runtime::from_current_tokio(Default::default())?;
     let (conn_opts, client_opts) =
         ClientOptions::load_from_config(LoadClientConfigProfileOptions::default())?;
     let connection = Connection::connect(conn_opts).await?;
@@ -22,7 +16,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let worker_options = WorkerOptions::new("continue-as-new")
         .register_workflow::<ContinueAsNewWorkflow>()?
-        .task_types(WorkerTaskTypes::workflow_only())
         .build();
 
     let mut worker = Worker::new(&runtime, client, worker_options)?;

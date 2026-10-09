@@ -1,6 +1,4 @@
-use crate::common::{
-    CoreWfStarter, WorkflowHandleExt, activity_functions::StdActivities, mock_sdk, mock_sdk_cfg,
-};
+use crate::common::{CoreWfStarter, WorkflowHandleExt, activity_functions::StdActivities};
 use futures::FutureExt;
 use std::{
     sync::{
@@ -11,7 +9,7 @@ use std::{
 };
 use temporalio_client::WorkflowStartOptions;
 use temporalio_common::{
-    UntypedWorkflow,
+    UntypedActivity, UntypedWorkflow,
     data_converters::RawValue,
     protos::{
         coresdk::{AsJsonPayloadExt, FromJsonPayloadExt},
@@ -21,7 +19,6 @@ use temporalio_common::{
             history::v1::history_event::Attributes::WorkflowTaskFailedEventAttributes,
         },
     },
-    worker::WorkerTaskTypes,
 };
 use temporalio_macros::{workflow, workflow_methods};
 use temporalio_sdk::{
@@ -69,16 +66,15 @@ impl TimerWfNondeterministic {
 async fn test_determinism_error_then_recovers() {
     let wf_name = "test_determinism_error_then_recovers";
     let mut starter = CoreWfStarter::new(wf_name);
-    starter.sdk_config.task_types = WorkerTaskTypes::workflow_only();
-    let mut worker = starter.worker().await;
-
     let run_ct = Arc::new(AtomicUsize::new(1));
     let run_ct_clone = run_ct.clone();
-    worker
+    starter
+        .sdk_config
         .register_workflow_with_factory(move || TimerWfNondeterministic {
             run_ct: run_ct_clone.clone(),
         })
         .unwrap();
+    let mut worker = starter.worker().await;
     let task_queue = starter.get_task_queue().to_owned();
     worker
         .submit_workflow(
@@ -124,15 +120,15 @@ async fn task_fail_causes_replay_unset_too_soon() {
     let wf_name = "task_fail_causes_replay_unset_too_soon";
     let mut starter = CoreWfStarter::new(wf_name);
     starter.sdk_config.register_activities(StdActivities);
-    let mut worker = starter.worker().await;
-
     let did_fail = Arc::new(AtomicBool::new(false));
     let did_fail_clone = did_fail.clone();
-    worker
+    starter
+        .sdk_config
         .register_workflow_with_factory(move || TaskFailReplayWf {
             did_fail: did_fail_clone.clone(),
         })
         .unwrap();
+    let mut worker = starter.worker().await;
 
     let task_queue = starter.get_task_queue().to_owned();
     let handle = worker
@@ -145,10 +141,7 @@ async fn task_fail_causes_replay_unset_too_soon() {
         .unwrap();
 
     worker.run_until_done().await.unwrap();
-    handle
-        .fetch_history_and_replay(worker.inner_mut())
-        .await
-        .unwrap();
+    handle.fetch_history_and_replay(&mut worker).await.unwrap();
 }
 
 #[workflow]
@@ -159,7 +152,15 @@ struct RandomReplayWf;
 impl RandomReplayWf {
     #[run]
     async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<String> {
-        Ok(format!("{}:{}", ctx.random::<u64>(), ctx.uuid4()))
+        let orders = ctx.random_stream("example.com/orders");
+        let first_order = orders.random::<u64>();
+        let _ = ctx.random_stream("example.com/telemetry").random::<u64>();
+        let second_order = ctx.random_stream("example.com/orders").random::<u64>();
+        Ok(format!(
+            "{}:{}:{first_order}:{second_order}",
+            ctx.random::<u64>(),
+            ctx.uuid4()
+        ))
     }
 }
 
@@ -167,9 +168,11 @@ impl RandomReplayWf {
 async fn random_workflow_replays() {
     let wf_name = "random_workflow_replays";
     let mut starter = CoreWfStarter::new(wf_name);
-    starter.sdk_config.task_types = WorkerTaskTypes::workflow_only();
+    starter
+        .sdk_config
+        .register_workflow::<RandomReplayWf>()
+        .unwrap();
     let mut worker = starter.worker().await;
-    worker.register_workflow::<RandomReplayWf>().unwrap();
 
     let task_queue = starter.get_task_queue().to_owned();
     let handle = worker
@@ -184,7 +187,7 @@ async fn random_workflow_replays() {
     worker.run_until_done().await.unwrap();
     let result = handle.get_result(Default::default()).await.unwrap();
     let replay_result = handle
-        .fetch_history_and_replay(worker.inner_mut())
+        .fetch_history_and_replay(&mut worker)
         .await
         .unwrap()
         .expect("replayed workflow should return a result");
@@ -217,6 +220,7 @@ impl TimerWfFailsOnce {
 
 /// Verifies that workflow panics (which in this case the Rust SDK turns into workflow activation
 /// failures) are turned into unspecified WFT failures.
+#[temporalio_macros::cloud_test_exclusion(crate::CloudTestExclusionReason::DoesNotUseServer)]
 #[tokio::test]
 async fn test_panic_wf_task_rejected_properly() {
     let wf_id = "fakeid";
@@ -233,14 +237,18 @@ async fn test_panic_wf_task_rejected_properly() {
             WorkflowTaskFailedCause::WorkflowWorkerUnhandledFailure
         )
     });
-    let mut worker = mock_sdk(mh);
-
     let did_fail = Arc::new(AtomicBool::new(false));
-    worker
-        .register_workflow_with_factory(move || TimerWfFailsOnce {
-            did_fail: did_fail.clone(),
-        })
-        .unwrap();
+    let mut worker = crate::common::mock_sdk_cfg_with_options(
+        mh,
+        |_| {},
+        |options| {
+            options
+                .register_workflow_with_factory(move || TimerWfFailsOnce {
+                    did_fail: did_fail.clone(),
+                })
+                .unwrap();
+        },
+    );
     let task_queue = "fake_tq".to_owned();
     worker
         .submit_wf(
@@ -272,6 +280,7 @@ impl NondeterministicTimerWf {
 
 /// Verifies nondeterministic behavior in workflows results in automatic WFT failure with the
 /// appropriate nondeterminism cause.
+#[temporalio_macros::cloud_test_exclusion(crate::CloudTestExclusionReason::DoesNotUseServer)]
 #[rstest::rstest]
 #[case::with_cache(true)]
 #[case::without_cache(false)]
@@ -290,19 +299,23 @@ async fn test_wf_task_rejected_properly_due_to_nondeterminism(#[case] use_cache:
     mh.num_expected_fails = 1;
     mh.expect_fail_wft_matcher =
         Box::new(|_, cause, _| matches!(cause, WorkflowTaskFailedCause::NonDeterministicError));
-    let mut worker = mock_sdk_cfg(mh, |cfg| {
-        if use_cache {
-            cfg.max_cached_workflows = 2;
-        }
-    });
-
     let started_count = Arc::new(AtomicUsize::new(0));
     let count_clone = started_count.clone();
-    worker
-        .register_workflow_with_factory(move || NondeterministicTimerWf {
-            started_count: count_clone.clone(),
-        })
-        .unwrap();
+    let mut worker = crate::common::mock_sdk_cfg_with_options(
+        mh,
+        |cfg| {
+            if use_cache {
+                cfg.max_cached_workflows = 2;
+            }
+        },
+        |options| {
+            options
+                .register_workflow_with_factory(move || NondeterministicTimerWf {
+                    started_count: count_clone.clone(),
+                })
+                .unwrap();
+        },
+    );
 
     let task_queue = "fake_tq".to_owned();
     worker
@@ -333,15 +346,18 @@ impl ActivityIdOrTypeChangeWf {
                 ctx.execute_local_activity(
                     StdActivities::default,
                     (),
-                    LocalActivityOptions {
-                        activity_id: Some("I'm bad and wrong!".to_string()),
-                        ..Default::default()
-                    },
+                    LocalActivityOptions::builder()
+                        .activity_id("I'm bad and wrong!".to_string())
+                        .build(),
                 )
                 .await?;
             } else {
-                ctx.execute_local_activity(StdActivities::no_op, (), Default::default())
-                    .await?;
+                ctx.execute_local_activity(
+                    UntypedActivity::new("not the activity type"),
+                    RawValue::empty(),
+                    Default::default(),
+                )
+                .await?;
             }
         } else if id_change {
             ctx.execute_activity(
@@ -354,8 +370,8 @@ impl ActivityIdOrTypeChangeWf {
             .await?;
         } else {
             ctx.execute_activity(
-                StdActivities::no_op,
-                (),
+                UntypedActivity::new("not the activity type"),
+                RawValue::empty(),
                 ActivityOptions::start_to_close_timeout(Duration::from_secs(5)),
             )
             .await?;
@@ -364,6 +380,7 @@ impl ActivityIdOrTypeChangeWf {
     }
 }
 
+#[temporalio_macros::cloud_test_exclusion(crate::CloudTestExclusionReason::DoesNotUseServer)]
 #[rstest::rstest]
 #[tokio::test]
 async fn activity_id_or_type_change_is_nondeterministic(
@@ -400,14 +417,19 @@ async fn activity_id_or_type_change_is_nondeterministic(
                 ..
             }) if message.contains(should_contain))
     });
-    let mut worker = mock_sdk_cfg(mh, |cfg| {
-        if use_cache {
-            cfg.max_cached_workflows = 2;
-        }
-    });
-    worker
-        .register_workflow::<ActivityIdOrTypeChangeWf>()
-        .unwrap();
+    let mut worker = crate::common::mock_sdk_cfg_with_options(
+        mh,
+        |cfg| {
+            if use_cache {
+                cfg.max_cached_workflows = 2;
+            }
+        },
+        |options| {
+            options
+                .register_workflow::<ActivityIdOrTypeChangeWf>()
+                .unwrap();
+        },
+    );
 
     let task_queue = "fake_tq".to_owned();
     worker
@@ -448,6 +470,7 @@ impl ChildWfIdOrTypeChangeWf {
     }
 }
 
+#[temporalio_macros::cloud_test_exclusion(crate::CloudTestExclusionReason::DoesNotUseServer)]
 #[rstest::rstest]
 #[tokio::test]
 async fn child_wf_id_or_type_change_is_nondeterministic(
@@ -479,15 +502,19 @@ async fn child_wf_id_or_type_change_is_nondeterministic(
                 ..
             }) if message.contains(should_contain))
     });
-    let mut worker = mock_sdk_cfg(mh, |cfg| {
-        if use_cache {
-            cfg.max_cached_workflows = 2;
-        }
-    });
-
-    worker
-        .register_workflow::<ChildWfIdOrTypeChangeWf>()
-        .unwrap();
+    let mut worker = crate::common::mock_sdk_cfg_with_options(
+        mh,
+        |cfg| {
+            if use_cache {
+                cfg.max_cached_workflows = 2;
+            }
+        },
+        |options| {
+            options
+                .register_workflow::<ChildWfIdOrTypeChangeWf>()
+                .unwrap();
+        },
+    );
 
     let task_queue = "fake_tq".to_owned();
     worker
@@ -531,16 +558,15 @@ impl TokioSleepWf {
 async fn nondeterministic_future_detection_fails_wft() {
     let wf_name = "nondeterministic_future_detection_fails_wft";
     let mut starter = CoreWfStarter::new(wf_name);
-    starter.sdk_config.task_types = WorkerTaskTypes::workflow_only();
-    let mut worker = starter.worker().await;
-
     let attempt = Arc::new(AtomicUsize::new(0));
     let attempt_clone = attempt.clone();
-    worker
+    starter
+        .sdk_config
         .register_workflow_with_factory(move || TokioSleepWf {
             attempt: attempt_clone.clone(),
         })
         .unwrap();
+    let mut worker = starter.worker().await;
 
     let task_queue = starter.get_task_queue().to_owned();
     let handle = worker
@@ -603,6 +629,7 @@ impl ReproChannelMissingWf {
 /// us to want to auto-fail the workflow task while there is also an outstanding eviction, the wf
 /// would get evicted but then try to send some info down the completion channel afterward, causing
 /// a panic.
+#[temporalio_macros::cloud_test_exclusion(crate::CloudTestExclusionReason::DoesNotUseServer)]
 #[tokio::test]
 async fn repro_channel_missing_because_nondeterminism() {
     for _ in 1..50 {
@@ -619,12 +646,18 @@ async fn repro_channel_missing_because_nondeterminism() {
         let mut mh =
             MockPollCfg::from_resp_batches(wf_id, t, [1.into(), ResponseType::AllHistory], mock);
         mh.num_expected_fails = 1;
-        let mut worker = mock_sdk_cfg(mh, |cfg| {
-            cfg.max_cached_workflows = 2;
-            cfg.ignore_evicts_on_shutdown = false;
-        });
-
-        worker.register_workflow::<ReproChannelMissingWf>().unwrap();
+        let mut worker = crate::common::mock_sdk_cfg_with_options(
+            mh,
+            |cfg| {
+                cfg.max_cached_workflows = 2;
+                cfg.ignore_evicts_on_shutdown = false;
+            },
+            |options| {
+                options
+                    .register_workflow::<ReproChannelMissingWf>()
+                    .unwrap();
+            },
+        );
 
         let task_queue = "fake_tq".to_owned();
         worker

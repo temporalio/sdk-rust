@@ -8,6 +8,15 @@ fn main() {
     // Prefix every enum's variants with the enum's type name to avoid collisions.
     let mut config = cbindgen::Config::default();
     config.enumeration.prefix_with_name = true;
+    config.after_includes = Some(
+        concat!(
+            "\n",
+            "/* Forward declarations for structs referenced in callback typedefs */\n",
+            "struct TemporalCoreCustomMetricMeter;\n",
+            "struct TemporalCoreCustomSlotSupplierCallbacks;\n",
+        )
+        .to_string(),
+    );
 
     let changed = cbindgen::Builder::new()
         .with_config(config)

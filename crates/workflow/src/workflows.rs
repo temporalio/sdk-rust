@@ -92,9 +92,12 @@ pub use crate::__temporal_join as join;
 use crate::runtime::SdkGuardedFuture;
 use futures_util::FutureExt;
 
-pub use crate::runtime::entry::{
-    ExecutableAsyncSignal, ExecutableAsyncUpdate, ExecutableQuery, ExecutableSyncSignal,
-    ExecutableSyncUpdate, WorkflowError, WorkflowImplementation, serialize_result,
+pub use crate::runtime::{
+    entry::{
+        ExecutableAsyncSignal, ExecutableAsyncUpdate, ExecutableQuery, ExecutableSyncSignal,
+        ExecutableSyncUpdate, WorkflowError, WorkflowImplementation, serialize_result,
+    },
+    types::{UpdateDefinitionDescriptor, WorkflowDefinitionDescriptor},
 };
 
 /// Deterministic `join_all` for use in Temporal workflows.

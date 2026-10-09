@@ -101,6 +101,7 @@ impl From<toml::ser::Error> for ConfigError {
 
 /// A source for configuration or a TLS certificate/key, from a path or raw data.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub enum DataSource {
     /// A filesystem path to the data.
     Path(String),
@@ -109,14 +110,18 @@ pub enum DataSource {
 }
 
 /// ClientConfig represents a client config file.
-#[derive(Debug, Clone, PartialEq, Default)]
+#[derive(Debug, Clone, PartialEq, Default, bon::Builder)]
+#[non_exhaustive]
 pub struct ClientConfig {
     /// Profiles, keyed by profile name
+    #[builder(default)]
     pub profiles: HashMap<String, ClientConfigProfile>,
 }
 
 /// ClientConfigProfile is profile-level configuration for a client.
-#[derive(Debug, Clone, PartialEq, Default)]
+#[derive(Debug, Clone, PartialEq, Default, bon::Builder)]
+#[builder(on(String, into))]
+#[non_exhaustive]
 pub struct ClientConfigProfile {
     /// Client address
     pub address: Option<String>,
@@ -137,11 +142,14 @@ pub struct ClientConfigProfile {
     /// Client gRPC metadata (aka headers). When loading from TOML and env var, or writing to TOML, the keys are
     /// lowercased and underscores are replaced with hyphens. This is used for deduplicating/overriding too, so manually
     /// set values that are not normalized may not get overridden when applying environment variables.
+    #[builder(default)]
     pub grpc_meta: HashMap<String, String>,
 }
 
 /// ClientConfigTLS is TLS configuration for a client.
-#[derive(Debug, Clone, PartialEq, Default)]
+#[derive(Debug, Clone, PartialEq, Default, bon::Builder)]
+#[builder(on(String, into))]
+#[non_exhaustive]
 pub struct ClientConfigTLS {
     /// If Some(true), TLS is explicitly disabled. If Some(false), TLS is explicitly enabled.
     /// If None, TLS behavior depends on other factors (API key presence, etc.)
@@ -160,11 +168,14 @@ pub struct ClientConfigTLS {
     pub server_name: Option<String>,
 
     /// True if host verification should be skipped
+    #[builder(default)]
     pub disable_host_verification: bool,
 }
 
 /// Codec configuration for a client
-#[derive(Debug, Clone, PartialEq, Default)]
+#[derive(Debug, Clone, PartialEq, Default, bon::Builder)]
+#[builder(on(String, into))]
+#[non_exhaustive]
 pub struct ClientConfigCodec {
     /// Remote endpoint for the codec
     pub endpoint: Option<String>,
@@ -174,17 +185,26 @@ pub struct ClientConfigCodec {
 }
 
 /// Options for loading client configuration
-#[derive(Debug, Default)]
+#[derive(Debug, PartialEq, bon::Builder)]
+#[non_exhaustive]
 pub struct LoadClientConfigOptions {
     /// Where to load config from. If unset, will try env vars then default path.
     pub config_source: Option<DataSource>,
 
     /// If true, will error if there are unrecognized keys
+    #[builder(default)]
     pub config_file_strict: bool,
 }
 
+impl Default for LoadClientConfigOptions {
+    fn default() -> Self {
+        Self::builder().build()
+    }
+}
+
 /// Options for loading a client configuration profile
-#[derive(Debug, Default)]
+#[derive(Debug, PartialEq, bon::Builder)]
+#[non_exhaustive]
 pub struct LoadClientConfigProfileOptions {
     /// Where to load config from. If unset, will try env vars then default path.
     pub config_source: Option<DataSource>,
@@ -193,20 +213,37 @@ pub struct LoadClientConfigProfileOptions {
     pub config_file_profile: Option<String>,
 
     /// If true, will error if there are unrecognized keys.
+    #[builder(default)]
     pub config_file_strict: bool,
 
     /// Disable loading from file
+    #[builder(default)]
     pub disable_file: bool,
 
     /// Disable loading from environment variables
+    #[builder(default)]
     pub disable_env: bool,
 }
 
+impl Default for LoadClientConfigProfileOptions {
+    fn default() -> Self {
+        Self::builder().build()
+    }
+}
+
 /// Options for parsing TOML configuration
-#[derive(Debug, Default)]
+#[derive(Debug, PartialEq, bon::Builder)]
+#[non_exhaustive]
 pub struct ClientConfigFromTOMLOptions {
     /// If true, will error if there are unrecognized keys.
+    #[builder(default)]
     pub strict: bool,
+}
+
+impl Default for ClientConfigFromTOMLOptions {
+    fn default() -> Self {
+        Self::builder().build()
+    }
 }
 
 /// A source for environment variables, which can be either a provided HashMap or the system's
@@ -292,9 +329,9 @@ fn load_client_config_inner(
     if let Some(data) = toml_data {
         ClientConfig::from_toml(
             &data,
-            ClientConfigFromTOMLOptions {
-                strict: options.config_file_strict,
-            },
+            ClientConfigFromTOMLOptions::builder()
+                .strict(options.config_file_strict)
+                .build(),
         )
     } else {
         Ok(ClientConfig::default())
@@ -339,10 +376,10 @@ pub fn load_client_config_profile(
     } else {
         // Load the full config
         let config = load_client_config(
-            LoadClientConfigOptions {
-                config_source: options.config_source,
-                config_file_strict: options.config_file_strict,
-            },
+            LoadClientConfigOptions::builder()
+                .maybe_config_source(options.config_source)
+                .config_file_strict(options.config_file_strict)
+                .build(),
             env_vars,
         )?;
 
@@ -1412,7 +1449,7 @@ unrecognized_field = "is-bad"
 "#;
         let err = ClientConfig::from_toml(
             toml_str.as_bytes(),
-            ClientConfigFromTOMLOptions { strict: true },
+            ClientConfigFromTOMLOptions::builder().strict(true).build(),
         )
         .unwrap_err();
         let err_str = err.to_string();
@@ -1427,7 +1464,7 @@ foo = "bar"
 "#;
         let err = ClientConfig::from_toml(
             toml_str.as_bytes(),
-            ClientConfigFromTOMLOptions { strict: true },
+            ClientConfigFromTOMLOptions::builder().strict(true).build(),
         )
         .unwrap_err();
         let err_str = err.to_string();

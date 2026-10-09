@@ -12,7 +12,7 @@ pub struct MessagePassingWorkflow {
 impl MessagePassingWorkflow {
     #[run]
     pub async fn run(ctx: &mut WorkflowContext<Self>, target_value: i32) -> WorkflowResult<i32> {
-        ctx.wait_condition(|s| s.counter >= target_value).await;
+        ctx.wait_condition(|s| s.counter >= target_value).await?;
         Ok(ctx.state(|s| s.counter))
     }
 

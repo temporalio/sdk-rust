@@ -1,7 +1,6 @@
 use crate::{
     common::{
-        ActivationAssertionsInterceptor, build_fake_sdk, history_from_proto_binary,
-        init_core_replay_preloaded, replay_sdk_worker, replay_sdk_worker_stream,
+        ActivationAssertionsInterceptor, history_from_proto_binary, init_core_replay_preloaded,
     },
     integ_tests::workflow_tests::patches::ChangesWf,
 };
@@ -62,43 +61,49 @@ impl TimersWf {
 fn fire_happy_hist(num_timers: u32) -> Worker {
     let mut t = canned_histories::long_sequential_timers(num_timers as usize);
     t.set_wf_input(num_timers.as_json_payload().unwrap());
-    let mut worker = build_fake_sdk(MockPollCfg::from_resps(t, [ResponseType::AllHistory]));
-    worker.register_workflow::<TimersWf>().unwrap();
-    worker
+    let mut aai = ActivationAssertionsInterceptor::default();
+    for _ in 1..=num_timers + 1 {
+        aai.then(|activation| assert!(activation.is_replaying));
+    }
+    crate::common::build_fake_sdk_intercepted_with_options(
+        MockPollCfg::from_resps(t, [ResponseType::AllHistory]),
+        aai,
+        |options| {
+            options.register_workflow::<TimersWf>().unwrap();
+        },
+    )
 }
 
+#[temporalio_macros::cloud_test_exclusion(crate::CloudTestExclusionReason::DoesNotUseServer)]
 #[rstest]
 #[case::one_timer(fire_happy_hist(1), 1)]
 #[case::five_timers(fire_happy_hist(5), 5)]
 #[tokio::test]
-async fn replay_flag_is_correct(#[case] mut worker: Worker, #[case] num_timers: usize) {
+async fn replay_flag_is_correct(#[case] mut worker: Worker, #[case] _num_timers: usize) {
     // Verify replay flag is correct by constructing a workflow manager that already has a complete
     // history fed into it. It should always be replaying, because history is complete.
 
-    let mut aai = ActivationAssertionsInterceptor::default();
-
-    for _ in 1..=num_timers + 1 {
-        aai.then(|a| assert!(a.is_replaying));
-    }
-
-    worker.set_worker_interceptor(aai);
     worker.run().await.unwrap();
 }
 
+#[temporalio_macros::cloud_test_exclusion(crate::CloudTestExclusionReason::DoesNotUseServer)]
 #[tokio::test(flavor = "multi_thread")]
 async fn replay_flag_is_correct_partial_history() {
     let mut t = canned_histories::long_sequential_timers(2);
     t.set_wf_input(1u32.as_json_payload().unwrap());
-    let mut worker = build_fake_sdk(MockPollCfg::from_resps(t, [1]));
-    worker.register_workflow::<TimersWf>().unwrap();
-
     let mut aai = ActivationAssertionsInterceptor::default();
     aai.then(|a| assert!(!a.is_replaying));
-
-    worker.set_worker_interceptor(aai);
+    let mut worker = crate::common::build_fake_sdk_intercepted_with_options(
+        MockPollCfg::from_resps(t, [1]),
+        aai,
+        |options| {
+            options.register_workflow::<TimersWf>().unwrap();
+        },
+    );
     worker.run().await.unwrap();
 }
 
+#[temporalio_macros::cloud_test_exclusion(crate::CloudTestExclusionReason::DoesNotUseServer)]
 #[tokio::test]
 async fn timer_workflow_replay() {
     let core = init_core_replay_preloaded(
@@ -156,6 +161,7 @@ async fn timer_workflow_replay() {
     core.shutdown().await;
 }
 
+#[temporalio_macros::cloud_test_exclusion(crate::CloudTestExclusionReason::DoesNotUseServer)]
 #[tokio::test]
 async fn workflow_nondeterministic_replay() {
     let core = init_core_replay_preloaded(
@@ -196,16 +202,20 @@ async fn workflow_nondeterministic_replay() {
     );
 }
 
+#[temporalio_macros::cloud_test_exclusion(crate::CloudTestExclusionReason::DoesNotUseServer)]
 #[tokio::test]
 async fn replay_using_wf_function() {
     let num_timers = 10u32;
     let mut t = canned_histories::long_sequential_timers(num_timers as usize);
     t.set_wf_input(num_timers.as_json_payload().unwrap());
-    let mut worker = replay_sdk_worker([test_hist_to_replay(t)]);
-    worker.register_workflow::<TimersWf>().unwrap();
+    let mut worker =
+        crate::common::replay_sdk_worker_with_options([test_hist_to_replay(t)], |options| {
+            options.register_workflow::<TimersWf>().unwrap();
+        });
     worker.run().await.unwrap();
 }
 
+#[temporalio_macros::cloud_test_exclusion(crate::CloudTestExclusionReason::DoesNotUseServer)]
 #[tokio::test]
 async fn replay_ending_wft_complete_with_commands_but_no_scheduled_started() {
     let mut t = TestHistoryBuilder::default();
@@ -218,23 +228,29 @@ async fn replay_ending_wft_complete_with_commands_but_no_scheduled_started() {
         t.add_full_wf_task();
     }
     t.set_wf_input(3u32.as_json_payload().unwrap());
-    let mut worker = replay_sdk_worker([test_hist_to_replay(t)]);
-    worker.register_workflow::<TimersWf>().unwrap();
+    let mut worker =
+        crate::common::replay_sdk_worker_with_options([test_hist_to_replay(t)], |options| {
+            options.register_workflow::<TimersWf>().unwrap();
+        });
     worker.run().await.unwrap();
 }
 
 async fn replay_abrupt_ending(mut t: TestHistoryBuilder) {
     t.set_wf_input(1u32.as_json_payload().unwrap());
-    let mut worker = replay_sdk_worker([test_hist_to_replay(t)]);
-    worker.register_workflow::<TimersWf>().unwrap();
+    let mut worker =
+        crate::common::replay_sdk_worker_with_options([test_hist_to_replay(t)], |options| {
+            options.register_workflow::<TimersWf>().unwrap();
+        });
     worker.run().await.unwrap();
 }
+#[temporalio_macros::cloud_test_exclusion(crate::CloudTestExclusionReason::DoesNotUseServer)]
 #[tokio::test]
 async fn replay_ok_ending_with_terminated() {
     let mut t1 = canned_histories::single_timer("1");
     t1.add_workflow_execution_terminated();
     replay_abrupt_ending(t1).await;
 }
+#[temporalio_macros::cloud_test_exclusion(crate::CloudTestExclusionReason::DoesNotUseServer)]
 #[tokio::test]
 async fn replay_ok_ending_with_timed_out() {
     let mut t2 = canned_histories::single_timer("1");
@@ -242,15 +258,20 @@ async fn replay_ok_ending_with_timed_out() {
     replay_abrupt_ending(t2).await;
 }
 
+#[temporalio_macros::cloud_test_exclusion(crate::CloudTestExclusionReason::DoesNotUseServer)]
 #[tokio::test]
 async fn replay_shutdown_worker() {
     let mut t = canned_histories::single_timer("1");
     t.set_wf_input(1u32.as_json_payload().unwrap());
-    let mut worker = replay_sdk_worker([test_hist_to_replay(t)]);
-    worker.register_workflow::<TimersWf>().unwrap();
     let shutdown_ctr_i = UniqueShutdownWorker::default();
     let shutdown_ctr = shutdown_ctr_i.runs.clone();
-    worker.set_worker_interceptor(shutdown_ctr_i);
+    let mut worker = crate::common::replay_sdk_worker_intercepted_with_options(
+        [test_hist_to_replay(t)],
+        shutdown_ctr_i,
+        |options| {
+            options.register_workflow::<TimersWf>().unwrap();
+        },
+    );
     worker.run().await.unwrap();
     assert_eq!(shutdown_ctr.lock().len(), 1);
 }
@@ -299,6 +320,7 @@ impl SeqTimerWf {
     }
 }
 
+#[temporalio_macros::cloud_test_exclusion(crate::CloudTestExclusionReason::DoesNotUseServer)]
 #[rstest::rstest]
 #[tokio::test]
 async fn multiple_histories_replay(#[values(false, true)] use_feeder: bool) {
@@ -310,19 +332,30 @@ async fn multiple_histories_replay(#[values(false, true)] use_feeder: bool) {
     seq_timer_hist.set_wf_type("seqtimer");
     seq_timer_hist.set_wf_input(num_timers.as_json_payload().unwrap());
     let (feeder, stream) = HistoryFeeder::new(1);
-    let mut worker = if use_feeder {
-        replay_sdk_worker_stream(stream)
-    } else {
-        replay_sdk_worker([
-            test_hist_to_replay(one_timer_hist.clone()),
-            test_hist_to_replay(seq_timer_hist.clone()),
-        ])
-    };
     let runs_ctr_i = UniqueRunsCounter::default();
     let runs_ctr = runs_ctr_i.runs.clone();
-    worker.set_worker_interceptor(runs_ctr_i);
-    worker.register_workflow::<OneTimerWf>().unwrap();
-    worker.register_workflow::<SeqTimerWf>().unwrap();
+    let mut worker = if use_feeder {
+        crate::common::replay_sdk_worker_stream_intercepted_with_options(
+            stream,
+            runs_ctr_i,
+            |options| {
+                options.register_workflow::<OneTimerWf>().unwrap();
+                options.register_workflow::<SeqTimerWf>().unwrap();
+            },
+        )
+    } else {
+        crate::common::replay_sdk_worker_intercepted_with_options(
+            [
+                test_hist_to_replay(one_timer_hist.clone()),
+                test_hist_to_replay(seq_timer_hist.clone()),
+            ],
+            runs_ctr_i,
+            |options| {
+                options.register_workflow::<OneTimerWf>().unwrap();
+                options.register_workflow::<SeqTimerWf>().unwrap();
+            },
+        )
+    };
 
     if use_feeder {
         let feed_fut = async move {
@@ -343,33 +376,44 @@ async fn multiple_histories_replay(#[values(false, true)] use_feeder: bool) {
     assert_eq!(runs_ctr.lock().len(), 2);
 }
 
+#[temporalio_macros::cloud_test_exclusion(crate::CloudTestExclusionReason::DoesNotUseServer)]
 #[tokio::test]
 async fn multiple_histories_can_handle_dupe_run_ids() {
     let mut hist1 = canned_histories::single_timer("1");
     hist1.set_wf_type("onetimer");
     hist1.set_wf_input(1u32.as_json_payload().unwrap());
-    let mut worker = replay_sdk_worker([
-        test_hist_to_replay(hist1.clone()),
-        test_hist_to_replay(hist1.clone()),
-        test_hist_to_replay(hist1),
-    ]);
-    worker.register_workflow::<OneTimerWf>().unwrap();
+    let mut worker = crate::common::replay_sdk_worker_with_options(
+        [
+            test_hist_to_replay(hist1.clone()),
+            test_hist_to_replay(hist1.clone()),
+            test_hist_to_replay(hist1),
+        ],
+        |options| {
+            options.register_workflow::<OneTimerWf>().unwrap();
+        },
+    );
     worker.run().await.unwrap();
 }
 
 // Verifies SDK can decode patch markers before changing them to use json encoding.
+#[temporalio_macros::cloud_test_exclusion(crate::CloudTestExclusionReason::DoesNotUseServer)]
 #[tokio::test]
 async fn replay_old_patch_format() {
-    let mut worker = replay_sdk_worker([HistoryForReplay::new(
-        history_from_proto_binary("old_change_marker_format.bin")
-            .await
-            .unwrap(),
-        "fake".to_owned(),
-    )]);
-    worker.register_workflow::<ChangesWf>().unwrap();
+    let mut worker = crate::common::replay_sdk_worker_with_options(
+        [HistoryForReplay::new(
+            history_from_proto_binary("old_change_marker_format.bin")
+                .await
+                .unwrap(),
+            "fake".to_owned(),
+        )],
+        |options| {
+            options.register_workflow::<ChangesWf>().unwrap();
+        },
+    );
     worker.run().await.unwrap();
 }
 
+#[temporalio_macros::cloud_test_exclusion(crate::CloudTestExclusionReason::DoesNotUseServer)]
 #[tokio::test]
 async fn replay_ends_with_empty_wft() {
     let core = init_core_replay_preloaded(

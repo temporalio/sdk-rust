@@ -7,19 +7,32 @@ use crate::{
         RawValue, SerializationContext, SerializationContextData, TemporalDeserializable,
         TemporalSerializable,
     },
-    protos::{
-        coresdk::child_workflow::StartChildWorkflowExecutionFailedCause,
-        temporal::api::{
-            common::v1::{Payload, Payloads},
-            enums::v1::{
-                ApplicationErrorCategory as ProtoApplicationErrorCategory,
-                RetryState as ProtoRetryState, TimeoutType as ProtoTimeoutType,
-            },
-            failure::v1::Failure,
+    protos::temporal::api::{
+        common::v1::{Payload, Payloads},
+        enums::v1::{
+            ApplicationErrorCategory as ProtoApplicationErrorCategory,
+            RetryState as ProtoRetryState, TimeoutType as ProtoTimeoutType,
         },
+        failure::v1::Failure,
     },
 };
 use std::time::Duration;
+
+/// Why starting a child workflow failed.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[non_exhaustive]
+pub enum StartChildWorkflowExecutionFailedCause {
+    /// No cause was specified.
+    Unspecified,
+    /// A workflow with the requested ID already exists.
+    WorkflowAlreadyExists,
+    /// The child workflow's namespace does not exist.
+    NamespaceNotFound,
+    /// The server rejected the child workflow's versioning override.
+    InvalidVersioningOverride,
+    /// A cause introduced by a newer server or API version.
+    Unknown,
+}
 
 /// Describes why a retry did or did not occur.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -123,13 +136,7 @@ where
         payload_converter: &PayloadConverter,
         context: &SerializationContextData,
     ) -> Result<Vec<Payload>, PayloadConversionError> {
-        payload_converter.to_payloads(
-            &SerializationContext {
-                data: context,
-                converter: payload_converter,
-            },
-            self,
-        )
+        payload_converter.to_payloads(&SerializationContext::new(context, payload_converter), self)
     }
 }
 
@@ -370,7 +377,7 @@ impl ApplicationFailure {
                 FailurePayloads::from(DecodablePayloads::new(
                     details.payloads,
                     payload_converter.clone(),
-                    *context,
+                    context.clone(),
                 ))
             }),
             failure: Some(failure),
@@ -408,6 +415,7 @@ impl From<PayloadConversionError> for ApplicationFailure {
 
 /// A typed outbound error surface used before encoding to a Temporal failure proto.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum OutgoingError {
     /// An error produced while completing an activity.
     #[error(transparent)]
@@ -419,6 +427,7 @@ pub enum OutgoingError {
 
 /// A typed outbound activity error.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum OutgoingActivityError {
     /// An activity application failure.
     #[error(transparent)]
@@ -433,10 +442,14 @@ pub enum OutgoingActivityError {
 
 /// A typed outbound workflow failure.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum OutgoingWorkflowError {
     /// A workflow application failure.
     #[error(transparent)]
     Application(#[from] Box<ApplicationFailure>),
+    /// A workflow payload conversion failure.
+    #[error(transparent)]
+    PayloadConversion(#[from] PayloadConversionError),
     /// A workflow failure sourced from an activity execution.
     #[error(transparent)]
     ActivityExecution(#[from] Box<ActivityExecutionError>),
@@ -449,17 +462,30 @@ pub enum OutgoingWorkflowError {
     /// A workflow failure sourced from signaling a workflow.
     #[error(transparent)]
     WorkflowSignal(#[from] Box<WorkflowSignalError>),
+    /// A workflow failure sourced from requesting cancellation of an external workflow.
+    #[error(transparent)]
+    CancelExternalWorkflow(#[from] Box<CancelExternalWorkflowError>),
+}
+
+impl OutgoingWorkflowError {
+    /// If this workflow error was caused by cancellation, returns the associated
+    /// [`CancelledError`].
+    pub fn as_cancelled(&self) -> Option<&CancelledError> {
+        match self {
+            Self::Application(err) => err.as_cancelled(),
+            Self::PayloadConversion(_) => None,
+            Self::ActivityExecution(err) => err.as_cancelled(),
+            Self::ChildWorkflowExecution(err) => err.as_cancelled(),
+            Self::ChildWorkflowStart(err) => err.as_cancelled(),
+            Self::WorkflowSignal(err) => err.as_cancelled(),
+            Self::CancelExternalWorkflow(err) => err.as_cancelled(),
+        }
+    }
 }
 
 impl From<anyhow::Error> for OutgoingWorkflowError {
     fn from(value: anyhow::Error) -> Self {
         Self::Application(Box::new(ApplicationFailure::new(value)))
-    }
-}
-
-impl From<PayloadConversionError> for OutgoingWorkflowError {
-    fn from(value: PayloadConversionError) -> Self {
-        Self::Application(Box::new(value.into()))
     }
 }
 
@@ -471,30 +497,52 @@ impl From<ApplicationFailure> for OutgoingWorkflowError {
 
 impl From<ActivityExecutionError> for OutgoingWorkflowError {
     fn from(value: ActivityExecutionError) -> Self {
-        Self::ActivityExecution(Box::new(value))
+        match value {
+            ActivityExecutionError::Serialization(err) => Self::PayloadConversion(err),
+            other => Self::ActivityExecution(Box::new(other)),
+        }
     }
 }
 
 impl From<ChildWorkflowExecutionError> for OutgoingWorkflowError {
     fn from(value: ChildWorkflowExecutionError) -> Self {
-        Self::ChildWorkflowExecution(Box::new(value))
+        match value {
+            ChildWorkflowExecutionError::Serialization(err) => Self::PayloadConversion(err),
+            other => Self::ChildWorkflowExecution(Box::new(other)),
+        }
     }
 }
 
 impl From<ChildWorkflowStartError> for OutgoingWorkflowError {
     fn from(value: ChildWorkflowStartError) -> Self {
-        Self::ChildWorkflowStart(Box::new(value))
+        match value {
+            ChildWorkflowStartError::Serialization(err) => Self::PayloadConversion(err),
+            other => Self::ChildWorkflowStart(Box::new(other)),
+        }
     }
 }
 
 impl From<WorkflowSignalError> for OutgoingWorkflowError {
     fn from(value: WorkflowSignalError) -> Self {
-        Self::WorkflowSignal(Box::new(value))
+        match value {
+            WorkflowSignalError::Serialization(err) => Self::PayloadConversion(err),
+            other => Self::WorkflowSignal(Box::new(other)),
+        }
+    }
+}
+
+impl From<CancelExternalWorkflowError> for OutgoingWorkflowError {
+    fn from(value: CancelExternalWorkflowError) -> Self {
+        match value {
+            CancelExternalWorkflowError::Serialization(err) => Self::PayloadConversion(err),
+            other => Self::CancelExternalWorkflow(Box::new(other)),
+        }
     }
 }
 
 /// A normalized incoming Temporal failure decoded from a protobuf [`Failure`].
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum IncomingError {
     /// A decoded application failure.
     Application(ApplicationFailure),
@@ -708,7 +756,7 @@ impl TimeoutError {
             cause: cause.map(Box::new),
             timeout_type: TimeoutType::from_raw(failure_info.timeout_type),
             last_heartbeat_details: failure_info.last_heartbeat_details.map(|details| {
-                DecodablePayloads::new(details.payloads, payload_converter.clone(), *context)
+                DecodablePayloads::new(details.payloads, payload_converter.clone(), context.clone())
             }),
         }
     }
@@ -759,7 +807,7 @@ impl CancelledError {
             failure,
             cause: cause.map(Box::new),
             details: failure_info.details.map(|details| {
-                DecodablePayloads::new(details.payloads, payload_converter.clone(), *context)
+                DecodablePayloads::new(details.payloads, payload_converter.clone(), context.clone())
             }),
         }
     }
@@ -955,6 +1003,7 @@ incoming_failure_wrapper!(
 
 /// Error type for activity execution outcomes.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum ActivityExecutionError {
     /// The activity failed with the given failure details.
     #[error("Activity failed: {}", .0.failure().message)]
@@ -1016,6 +1065,7 @@ impl ActivityExecutionError {
 
 /// Error returned when starting a child workflow fails.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum ChildWorkflowStartError {
     /// The child workflow start was cancelled before the normal execution wrapper path existed.
     #[error("Child workflow start cancelled: {}", .0.failure().message)]
@@ -1055,10 +1105,21 @@ impl ChildWorkflowStartError {
             | ChildWorkflowStartError::Serialization(_) => None,
         }
     }
+
+    /// If this [`ChildWorkflowStartError`] was caused by cancellation, returns the associated
+    /// [`CancelledError`].
+    pub fn as_cancelled(&self) -> Option<&CancelledError> {
+        match self {
+            ChildWorkflowStartError::Cancelled(err) => Some(err),
+            ChildWorkflowStartError::StartFailed { .. }
+            | ChildWorkflowStartError::Serialization(_) => None,
+        }
+    }
 }
 
 /// Error returned when a child workflow execution fails.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum ChildWorkflowExecutionError {
     /// The child workflow failed.
     #[error("Child workflow failed: {}", .0.failure().message)]
@@ -1114,7 +1175,11 @@ impl ChildWorkflowExecutionError {
 
 /// Error returned when signaling a workflow fails.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum WorkflowSignalError {
+    /// The target workflow was not found.
+    #[error("Workflow not found: {}", .0.failure().message)]
+    NotFound(#[source] Box<WorkflowSignalFailureError>),
     /// The signal delivery failed.
     #[error("Child workflow signal failed: {}", .0.failure().message)]
     Failed(#[source] Box<WorkflowSignalFailureError>),
@@ -1123,11 +1188,58 @@ pub enum WorkflowSignalError {
     Serialization(#[from] PayloadConversionError),
 }
 
+/// Error returned when requesting cancellation of an external workflow fails.
+#[derive(Debug, thiserror::Error)]
+pub enum CancelExternalWorkflowError {
+    /// The target workflow was not found.
+    #[error("Workflow not found: {}", .0.failure().message)]
+    NotFound(#[source] Box<WorkflowCancelFailureError>),
+    /// The cancellation request failed.
+    #[error("External workflow cancellation request failed: {}", .0.failure().message)]
+    Failed(#[source] Box<WorkflowCancelFailureError>),
+    /// Failed to deserialize payloads attached to the cancellation failure.
+    #[error("External workflow cancellation failure conversion failed: {0}")]
+    Serialization(#[from] PayloadConversionError),
+}
+
+impl CancelExternalWorkflowError {
+    /// Returns the retained top-level cancellation failure proto, if one exists.
+    pub fn failure(&self) -> Option<&Failure> {
+        match self {
+            Self::NotFound(err) | Self::Failed(err) => Some(err.failure()),
+            Self::Serialization(_) => None,
+        }
+    }
+
+    /// Returns the normalized cause of the cancellation failure, if any.
+    pub fn cause(&self) -> Option<&IncomingError> {
+        match self {
+            Self::NotFound(err) | Self::Failed(err) => err.cause(),
+            Self::Serialization(_) => None,
+        }
+    }
+
+    /// Returns the normalized cancellation failure itself, if one exists.
+    pub fn reason(&self) -> Option<&IncomingError> {
+        match self {
+            Self::NotFound(err) | Self::Failed(err) => Some(err.error()),
+            Self::Serialization(_) => None,
+        }
+    }
+
+    /// If this error was caused by cancellation, returns the associated [`CancelledError`].
+    pub fn as_cancelled(&self) -> Option<&CancelledError> {
+        self.reason()?.as_cancelled()
+    }
+}
+
 impl WorkflowSignalError {
     /// Returns the retained top-level workflow signal failure proto, if one exists.
     pub fn failure(&self) -> Option<&Failure> {
         match self {
-            WorkflowSignalError::Failed(err) => Some(err.failure()),
+            WorkflowSignalError::NotFound(err) | WorkflowSignalError::Failed(err) => {
+                Some(err.failure())
+            }
             WorkflowSignalError::Serialization(_) => None,
         }
     }
@@ -1135,7 +1247,7 @@ impl WorkflowSignalError {
     /// Returns the normalized cause of the workflow signal failure, if any.
     pub fn cause(&self) -> Option<&IncomingError> {
         match self {
-            WorkflowSignalError::Failed(err) => err.cause(),
+            WorkflowSignalError::NotFound(err) | WorkflowSignalError::Failed(err) => err.cause(),
             WorkflowSignalError::Serialization(_) => None,
         }
     }
@@ -1143,9 +1255,17 @@ impl WorkflowSignalError {
     /// Returns the underlying failure reason for wrapper-shaped signal failures.
     pub fn reason(&self) -> Option<&IncomingError> {
         match self {
-            WorkflowSignalError::Failed(err) => Some(err.error()),
+            WorkflowSignalError::NotFound(err) | WorkflowSignalError::Failed(err) => {
+                Some(err.error())
+            }
             WorkflowSignalError::Serialization(_) => None,
         }
+    }
+
+    /// If this [`WorkflowSignalError`] was caused by cancellation, returns the associated
+    /// [`CancelledError`].
+    pub fn as_cancelled(&self) -> Option<&CancelledError> {
+        self.reason()?.as_cancelled()
     }
 }
 
@@ -1194,13 +1314,58 @@ impl std::error::Error for WorkflowSignalFailureError {
     }
 }
 
+/// A normalized external workflow cancellation failure wrapper.
+#[derive(Debug)]
+pub struct WorkflowCancelFailureError {
+    failure: Failure,
+    error: Box<IncomingError>,
+}
+
+impl WorkflowCancelFailureError {
+    /// Creates an external workflow cancellation failure wrapper.
+    pub(crate) fn new(failure: Failure, error: IncomingError) -> Self {
+        Self {
+            failure,
+            error: Box::new(error),
+        }
+    }
+
+    /// Returns the retained top-level proto failure.
+    pub fn failure(&self) -> &Failure {
+        &self.failure
+    }
+
+    /// Returns the normalized direct cause of the external workflow cancellation failure, if any.
+    pub fn cause(&self) -> Option<&IncomingError> {
+        self.error.cause()
+    }
+
+    /// Returns the direct decoded incoming error represented by the top-level proto failure.
+    pub fn error(&self) -> &IncomingError {
+        &self.error
+    }
+}
+
+impl std::fmt::Display for WorkflowCancelFailureError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.failure.fmt(f)
+    }
+}
+
+impl std::error::Error for WorkflowCancelFailureError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.cause()
+            .map(|cause| cause as &(dyn std::error::Error + 'static))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::{
         data_converters::{
             DefaultFailureConverter, FailureConverter, GenericPayloadConverter, PayloadConverter,
-            SerializationContext, SerializationContextData,
+            SerializationContext, SerializationContextData, WorkflowSerializationContext,
         },
         protos::temporal::api::{
             common::v1::Payload,
@@ -1233,11 +1398,11 @@ mod tests {
             ..Default::default()
         };
 
-        let decoded = DefaultFailureConverter
+        let decoded = DefaultFailureConverter::default()
             .to_error(
                 failure,
                 &PayloadConverter::default(),
-                &SerializationContextData::Workflow,
+                &SerializationContextData::Workflow(WorkflowSerializationContext::new()),
             )
             .unwrap();
         let IncomingError::Activity(activity) = decoded else {
@@ -1278,7 +1443,7 @@ mod tests {
                 ..Default::default()
             }],
         };
-        let failure = DefaultFailureConverter.to_failure(
+        let failure = DefaultFailureConverter::default().to_failure(
             OutgoingError::Workflow(OutgoingWorkflowError::Application(Box::new(
                 ApplicationFailure::builder(anyhow::anyhow!("oops"))
                     .type_name("MyType".to_owned())
@@ -1308,7 +1473,7 @@ mod tests {
             data: b"details".to_vec(),
             ..Default::default()
         };
-        let failure = DefaultFailureConverter.to_failure(
+        let failure = DefaultFailureConverter::default().to_failure(
             OutgoingError::Workflow(OutgoingWorkflowError::Application(Box::new(
                 ApplicationFailure::builder(anyhow::anyhow!("oops"))
                     .details(RawValue::new(vec![payload.clone()]))
@@ -1326,7 +1491,7 @@ mod tests {
 
     #[test]
     fn builder_accepts_serializable_details() {
-        let failure = DefaultFailureConverter.to_failure(
+        let failure = DefaultFailureConverter::default().to_failure(
             OutgoingError::Workflow(OutgoingWorkflowError::Application(Box::new(
                 ApplicationFailure::builder(anyhow::anyhow!("oops"))
                     .details("details".to_string())
@@ -1343,10 +1508,7 @@ mod tests {
         let converter = PayloadConverter::default();
         let details: String = converter
             .from_payloads(
-                &SerializationContext {
-                    data: &SerializationContextData::None,
-                    converter: &converter,
-                },
+                &SerializationContext::new(&SerializationContextData::None, &converter),
                 payloads,
             )
             .unwrap();
@@ -1355,7 +1517,7 @@ mod tests {
 
     #[test]
     fn application_failure_encoding_surfaces_detail_encoding_errors() {
-        let failure = DefaultFailureConverter.to_failure(
+        let failure = DefaultFailureConverter::default().to_failure(
             OutgoingError::Workflow(OutgoingWorkflowError::Application(Box::new(
                 ApplicationFailure::builder(anyhow::anyhow!("oops"))
                     .details(AlwaysFailsSerialize)
@@ -1386,13 +1548,13 @@ mod tests {
     }
 
     #[test]
-    fn payload_conversion_errors_default_to_application_outgoing_errors() {
+    fn payload_conversion_errors_use_dedicated_outgoing_variant() {
         let outgoing: OutgoingWorkflowError =
             PayloadConversionError::EncodingError(anyhow::anyhow!("encode boom").into()).into();
 
-        let OutgoingWorkflowError::Application(app) = outgoing else {
-            panic!("payload conversion errors should default to application failures");
+        let OutgoingWorkflowError::PayloadConversion(err) = outgoing else {
+            panic!("expected a payload conversion failure");
         };
-        assert_eq!(app.to_string(), "Encoding error: encode boom");
+        assert_eq!(err.to_string(), "Encoding error: encode boom");
     }
 }

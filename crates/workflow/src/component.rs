@@ -2,17 +2,19 @@
 //!
 //! Everything in this module is internal SDK/component glue.
 use crate::{
-    BaseWorkflowContext, PatchActivationCallback,
+    BaseWorkflowContext, InternalPatchActivationCallback as PatchActivationCallback,
     runtime::{
         entry::WorkflowImplementation,
         guest::WorkflowInstance as RuntimeWorkflowInstance,
         host::WorkflowHost,
-        instance::instantiate_workflow,
+        instance::GuestWorkflowInstance,
         types::{
-            ActivationJobResult, MainRoutineCompletion, RoutineCompletion, TerminalOutcome,
-            UpdateRoutineCompletion, WorkflowDefinitionDescriptor, WorkflowFailure, WorkflowInit,
+            ActivationJobResult, MainRoutineCompletion, RoutineCompletion, RoutinePendingState,
+            TerminalOutcome, UpdateRoutineCompletion, WorkflowDefinitionDescriptor,
+            WorkflowFailure, WorkflowInit,
         },
     },
+    workflow_interceptors::WorkflowInterceptorConstructor,
 };
 use futures_util::task::noop_waker;
 use prost::Message;
@@ -22,6 +24,10 @@ use temporalio_common_wasm::{
     protos::{coresdk::workflow_commands::WorkflowCommand, temporal::api::failure::v1::Failure},
 };
 
+/// Generated component-model bindings named by the workflow export macro.
+///
+/// This module must remain public because the export macro expands in the workflow author's crate.
+#[doc(hidden)]
 pub mod bindings {
     wit_bindgen::generate!({
         path: "wit",
@@ -44,8 +50,11 @@ use self::bindings::{
     temporal::workflow_runtime::{types as wit_types, workflow_host as wit_host},
 };
 
+/// Connects the static workflow set emitted by `export_workflow_module!` to the component adapter.
 pub trait StaticWorkflowComponent {
+    /// Describes every workflow implementation exported by the component.
     fn list_workflows() -> Vec<WorkflowDefinitionDescriptor>;
+    /// Instantiates the workflow selected by the host from the component's static workflow set.
     fn instantiate_workflow(
         workflow_type: &str,
         init: WorkflowInit,
@@ -53,6 +62,7 @@ pub trait StaticWorkflowComponent {
     ) -> Result<Box<dyn RuntimeWorkflowInstance>, WorkflowFailure>;
 }
 
+/// Adapts a [`StaticWorkflowComponent`] to the guest interface generated from the workflow WIT.
 pub struct ExportedComponent<T>(PhantomData<T>);
 
 impl<T: StaticWorkflowComponent> wit_guest::Guest for ExportedComponent<T> {
@@ -81,6 +91,7 @@ impl<T: StaticWorkflowComponent> wit_guest::Guest for ExportedComponent<T> {
     }
 }
 
+/// Adapts one runtime workflow instance to the resource interface generated from the workflow WIT.
 pub struct ExportedWorkflowInstance(RefCell<Box<dyn RuntimeWorkflowInstance>>);
 
 impl wit_guest::GuestWorkflowInstance for ExportedWorkflowInstance {
@@ -90,7 +101,7 @@ impl wit_guest::GuestWorkflowInstance for ExportedWorkflowInstance {
     ) -> Result<wit_guest::ActivationResult, wit_guest::Failure> {
         self.0
             .borrow_mut()
-            .activate(decode_proto(activation))
+            .activate(decode_proto(activation), &noop_waker())
             .map(|result| wit_types::ActivationResult {
                 job_results: result
                     .job_results
@@ -152,8 +163,10 @@ impl wit_guest::GuestWorkflowInstance for ExportedWorkflowInstance {
                                     TerminalOutcome::Failed(failure) => {
                                         wit_types::TerminalOutcome::Failed(failure.encode_to_vec())
                                     }
-                                    TerminalOutcome::Cancelled => {
-                                        wit_types::TerminalOutcome::Cancelled
+                                    TerminalOutcome::Cancelled(details) => {
+                                        wit_types::TerminalOutcome::Cancelled(
+                                            details.map(|details| details.encode_to_vec()),
+                                        )
                                     }
                                     TerminalOutcome::ContinueAsNew(req) => {
                                         wit_types::TerminalOutcome::ContinueAsNew(
@@ -196,14 +209,34 @@ impl wit_guest::GuestWorkflowInstance for ExportedWorkflowInstance {
                     }
                 }),
                 made_progress: result.made_progress,
+                pending_state: result.pending_state.map(|state| match state {
+                    RoutinePendingState::Handler => wit_types::RoutinePendingState::Handler,
+                    RoutinePendingState::Interceptor => wit_types::RoutinePendingState::Interceptor,
+                    RoutinePendingState::InterceptorWithActivation => {
+                        wit_types::RoutinePendingState::InterceptorWithActivation
+                    }
+                }),
             })
             .map_err(|e| e.encode_to_vec())
     }
 }
 
+/// Instantiates a generated workflow implementation for a component without interceptors.
 pub fn instantiate_component_workflow<W: WorkflowImplementation>(
     init: WorkflowInit,
     host: Rc<dyn WorkflowHost>,
+) -> Result<Box<dyn RuntimeWorkflowInstance>, WorkflowFailure>
+where
+    <W::Run as temporalio_common_wasm::WorkflowDefinition>::Input: Send,
+{
+    instantiate_component_workflow_with_interceptor_constructors::<W>(init, host, Vec::new())
+}
+
+/// Instantiates a generated workflow implementation with component-local interceptor constructors.
+pub fn instantiate_component_workflow_with_interceptor_constructors<W: WorkflowImplementation>(
+    init: WorkflowInit,
+    host: Rc<dyn WorkflowHost>,
+    interceptor_constructors: Vec<WorkflowInterceptorConstructor>,
 ) -> Result<Box<dyn RuntimeWorkflowInstance>, WorkflowFailure>
 where
     <W::Run as temporalio_common_wasm::WorkflowDefinition>::Input: Send,
@@ -214,15 +247,13 @@ where
     let patch_activation_callback: PatchActivationCallback =
         Arc::new(|input| wit_host::patch_activation(&input.patch_id));
     let base_ctx = BaseWorkflowContext::from_raw(
-        init.namespace,
-        init.task_queue,
-        init.run_id,
-        init.initialize_workflow,
+        init,
         data_converter,
         host,
         Some(patch_activation_callback),
+        interceptor_constructors,
     );
-    instantiate_workflow::<W>(args, payload_converter, base_ctx).map_err(|err| {
+    GuestWorkflowInstance::<W>::instantiate(args, payload_converter, base_ctx).map_err(|err| {
         Box::new(Failure {
             message: format!("Workflow input deserialization failed: {err}"),
             ..Default::default()

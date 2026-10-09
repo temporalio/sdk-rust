@@ -4,7 +4,8 @@ use crate::{
     job_assert,
     replay::{TestHistoryBuilder, canned_histories, default_act_sched, default_wes_attribs},
     test_help::{
-        FakeWfResponses, MockPollCfg, MocksHolder, ResponseType, WorkerExt, WorkerTestHelpers,
+        CounterRecordingMeter, FakeWfResponses, MockPollCfg, MocksHolder, ResponseType, WorkerExt,
+        WorkerTestHelpers,
         WorkflowCachingPolicy::{self, AfterEveryReply, NonSticky},
         build_fake_worker, build_mock_pollers, build_multihist_mock_sg, fanout_tasks,
         gen_assert_and_fail, gen_assert_and_reply, hist_to_poll_resp, mock_worker, poll_and_reply,
@@ -31,6 +32,7 @@ use std::{
 };
 use temporalio_client::MESSAGE_TOO_LARGE_KEY;
 use temporalio_common::{
+    payload_limits::{LimitClass, LimitSeverity, PayloadLimitViolation},
     protos::{
         coresdk::{
             ActivityTaskCompletion,
@@ -317,7 +319,7 @@ async fn scheduled_activity_timeout(hist_batches: &'static [usize]) {
                                     seq,
                                     result: Some(ActivityResolution {
                                         status: Some(activity_resolution::Status::Failed(ar::Failure {
-                                            failure: Some(failure)
+                                            failure: Some(failure), ..
                                         })),
                                     }), ..
                                 }
@@ -370,7 +372,7 @@ async fn started_activity_timeout(hist_batches: &'static [usize]) {
                                     seq,
                                     result: Some(ActivityResolution {
                                         status: Some(activity_resolution::Status::Failed(ar::Failure {
-                                            failure: Some(failure)
+                                            failure: Some(failure), ..
                                         })),
                                     }), ..
                                 }
@@ -783,6 +785,38 @@ async fn simple_timer_fail_wf_execution(hist_batches: &'static [usize]) {
     .await;
 }
 
+#[tokio::test]
+async fn signal_activation_has_originating_event_id() {
+    let mut t = TestHistoryBuilder::default();
+    t.add_by_type(EventType::WorkflowExecutionStarted);
+    t.add_full_wf_task();
+    t.add_we_signaled("signal", vec![]);
+    let signal_event_id = t.current_event_id();
+    t.add_full_wf_task();
+    t.add_workflow_execution_completed();
+
+    let mock = MockPollCfg::from_resps(t, [ResponseType::AllHistory]);
+    let mut mock = build_mock_pollers(mock);
+    mock.worker_cfg(|wc| wc.max_cached_workflows = 1);
+    let core = mock_worker(mock);
+
+    let task = core.poll_workflow_activation().await.unwrap();
+    core.complete_workflow_activation(WorkflowActivationCompletion::empty(task.run_id))
+        .await
+        .unwrap();
+
+    let task = core.poll_workflow_activation().await.unwrap();
+    assert_matches!(
+        task.jobs.as_slice(),
+        [WorkflowActivationJob {
+            variant: Some(workflow_activation_job::Variant::SignalWorkflow(signal)),
+        }] => {
+            assert_eq!(signal.originating_event_id, signal_event_id);
+        }
+    );
+    core.complete_execution(&task.run_id).await;
+}
+
 #[rstest(hist_batches, case::incremental(&[1, 2]), case::replay(&[2]))]
 #[tokio::test]
 async fn two_signals(hist_batches: &'static [usize]) {
@@ -1105,9 +1139,9 @@ async fn sends_appropriate_sticky_task_queue_responses() {
     let t = canned_histories::single_timer("1");
     let mut mock = mock_worker_client();
     mock.expect_complete_workflow_task()
-        .withf(|comp| comp.sticky_attributes.is_some())
+        .withf(|comp, _| comp.sticky_attributes.is_some())
         .times(1)
-        .returning(|_| Ok(Default::default()));
+        .returning(|_, _| Ok(Default::default()));
     mock.expect_complete_workflow_task().times(0);
     let mut mock = single_hist_mock_sg(wfid, t, [1], mock, false);
     mock.worker_cfg(|wc| wc.max_cached_workflows = 10);
@@ -1190,7 +1224,7 @@ async fn buffered_work_drained_on_shutdown() {
     );
     let mut mock = mock_worker_client();
     mock.expect_complete_workflow_task()
-        .returning(|_| Ok(RespondWorkflowTaskCompletedResponse::default()));
+        .returning(|_, _| Ok(RespondWorkflowTaskCompletedResponse::default()));
     let mut mock = MocksHolder::from_wft_stream(mock, stream::iter(tasks));
     // Cache on to avoid being super repetitive
     mock.worker_cfg(|wc| wc.max_cached_workflows = 10);
@@ -1364,10 +1398,10 @@ async fn lang_slower_than_wft_timeouts() {
     let mut mock = mock_worker_client();
     mock.expect_complete_workflow_task()
         .times(1)
-        .returning(|_| Err(tonic::Status::not_found("Workflow task not found.")));
+        .returning(|_, _| Err(tonic::Status::not_found("Workflow task not found.")));
     mock.expect_complete_workflow_task()
         .times(1)
-        .returning(|_| Ok(Default::default()));
+        .returning(|_, _| Ok(Default::default()));
     let mut mock = single_hist_mock_sg(wfid, t, [1, 1], mock, true);
     let tasksmap = mock.outstanding_task_map.clone().unwrap();
     mock.worker_cfg(|wc| {
@@ -1517,17 +1551,8 @@ async fn la_resolution_after_wft_not_found_during_eviction() {
             .is_err()
     );
 
-    core.complete_workflow_activation(WorkflowActivationCompletion::from_cmds(
+    core.complete_workflow_activation(WorkflowActivationCompletion::empty(
         replay_activation.run_id,
-        vec![
-            schedule_local_activity_cmd(
-                1,
-                "1",
-                ActivityCancellationType::WaitCancellationCompleted,
-                Duration::from_secs(30),
-            ),
-            start_timer_cmd(1, Duration::from_millis(10)),
-        ],
     ))
     .await
     .unwrap();
@@ -1792,10 +1817,10 @@ async fn tasks_from_completion_are_delivered() {
     };
     mock.expect_complete_workflow_task()
         .times(1)
-        .returning(move |_| Ok(complete_resp.clone()));
+        .returning(move |_, _| Ok(complete_resp.clone()));
     mock.expect_complete_workflow_task()
         .times(1)
-        .returning(|_| Ok(Default::default()));
+        .returning(|_, _| Ok(Default::default()));
     let mut mock = single_hist_mock_sg(wfid, t, [1], mock, true);
     mock.worker_cfg(|wc| wc.max_cached_workflows = 2);
     let core = mock_worker(mock);
@@ -1838,10 +1863,10 @@ async fn pagination_works_with_tasks_from_completion() {
     };
     mock.expect_complete_workflow_task()
         .times(1)
-        .returning(move |_| Ok(complete_resp.clone()));
+        .returning(move |_, _| Ok(complete_resp.clone()));
     mock.expect_complete_workflow_task()
         .times(1)
-        .returning(|_| Ok(Default::default()));
+        .returning(|_, _| Ok(Default::default()));
 
     let get_exec_resp: GetWorkflowExecutionHistoryResponse =
         t.get_full_history_info().unwrap().into();
@@ -1887,7 +1912,7 @@ async fn poll_faster_than_complete_wont_overflow_cache() {
     mock_client
         .expect_complete_workflow_task()
         .times(3)
-        .returning(|_| Ok(Default::default()));
+        .returning(|_, _| Ok(Default::default()));
     let mut mock_cfg = MockPollCfg::new(tasks, true, 0);
     mock_cfg.mock_client = mock_client;
     let mut mock = build_mock_pollers(mock_cfg);
@@ -2144,7 +2169,7 @@ async fn no_race_acquiring_permits() {
         .returning(move |_, _| async move { Ok(Default::default()) }.boxed());
     mock_client
         .expect_complete_workflow_task()
-        .returning(|_| async move { Ok(Default::default()) }.boxed());
+        .returning(|_, _| async move { Ok(Default::default()) }.boxed());
 
     let worker = Worker::new_test(
         {
@@ -2230,7 +2255,7 @@ async fn continue_as_new_preserves_some_values() {
     };
     mock_client
         .expect_complete_workflow_task()
-        .returning(move |mut c| {
+        .returning(move |mut c, _| {
             let cmd = c.commands.pop().unwrap().attributes.unwrap();
             if let Attributes::ContinueAsNewWorkflowExecutionCommandAttributes(a) = cmd {
                 assert_eq!(a.workflow_type.unwrap().name, "meow");
@@ -2798,14 +2823,14 @@ async fn poller_wont_run_ahead_of_task_slots() {
         .returning(move |_, _| Ok(bunch_of_first_tasks.next().unwrap()));
     mock_client
         .expect_complete_workflow_task()
-        .returning(|_| Ok(Default::default()));
+        .returning(|_, _| Ok(Default::default()));
 
     let worker = Worker::new_test(
         {
             let mut cfg = test_worker_cfg().build().unwrap();
             cfg.max_cached_workflows = 10_usize;
             cfg.max_outstanding_workflow_tasks = Some(10_usize);
-            cfg.workflow_task_poller_behavior = PollerBehavior::SimpleMaximum(10_usize);
+            cfg.workflow_task_poller_behavior = Some(PollerBehavior::SimpleMaximum(10_usize));
             cfg.task_types = WorkerTaskTypes::workflow_only();
             cfg
         },
@@ -2908,7 +2933,7 @@ async fn use_compatible_version_flag(
     #[allow(deprecated)]
     mock_client
         .expect_complete_workflow_task()
-        .returning(move |mut c| {
+        .returning(move |mut c, _| {
             let can_cmd = c.commands.pop().unwrap().attributes.unwrap();
             match can_cmd {
                 Attributes::ContinueAsNewWorkflowExecutionCommandAttributes(a) => {
@@ -2984,7 +3009,7 @@ async fn slot_provider_cant_hand_out_more_permits_than_cache_size() {
         .returning(move |_, _| Ok(bunch_of_first_tasks.next().unwrap()));
     mock_client
         .expect_complete_workflow_task()
-        .returning(|_| Ok(Default::default()));
+        .returning(|_, _| Ok(Default::default()));
 
     struct EndlessSupplier {}
     #[async_trait::async_trait]
@@ -3012,7 +3037,7 @@ async fn slot_provider_cant_hand_out_more_permits_than_cache_size() {
                     .workflow_slot_supplier(Arc::new(EndlessSupplier {}))
                     .build(),
             ));
-            cfg.workflow_task_poller_behavior = PollerBehavior::SimpleMaximum(10_usize);
+            cfg.workflow_task_poller_behavior = Some(PollerBehavior::SimpleMaximum(10_usize));
             cfg.task_types = WorkerTaskTypes::workflow_only();
             cfg
         },
@@ -3146,8 +3171,8 @@ async fn both_normal_and_sticky_pollers_poll_concurrently() {
     let cc = Arc::clone(&counters);
     mock_client
         .expect_complete_workflow_task()
-        .returning(move |completion| {
-            if completion.task_token.0.ends_with(b"normal") {
+        .returning(move |completion, _| {
+            if completion.task_token.into_inner().ends_with(b"normal") {
                 cc.normal_slots_active_count.fetch_sub(1, Ordering::Relaxed);
             } else {
                 cc.sticky_slots_active_count.fetch_sub(1, Ordering::Relaxed);
@@ -3160,13 +3185,14 @@ async fn both_normal_and_sticky_pollers_poll_concurrently() {
             let mut cfg = test_worker_cfg().build().unwrap();
             cfg.max_cached_workflows = 500_usize; // We need cache, but don't want to deal with evictions
             cfg.max_outstanding_workflow_tasks = Some(2_usize);
-            cfg.workflow_task_poller_behavior = PollerBehavior::SimpleMaximum(2_usize);
+            cfg.workflow_task_poller_behavior = Some(PollerBehavior::SimpleMaximum(2_usize));
             cfg.nonsticky_to_sticky_poll_ratio = 0.2;
             cfg.task_types = WorkerTaskTypes::workflow_only();
             cfg
         },
         Some("stickytq".to_string()),
         Arc::new(mock_client),
+        None,
         None,
         None,
     )
@@ -3247,6 +3273,8 @@ async fn grpc_message_too_large_doesnt_spam_task_fails() {
 
     let mut mock = build_mock_pollers(mh);
     mock.worker_cfg(|wc| wc.max_cached_workflows = 1);
+    let meter = Arc::new(CounterRecordingMeter::default());
+    mock.set_temporal_meter(meter.clone().into_temporal_meter());
     let core = mock_worker(mock);
 
     // Since the mock makes us fail 5 times, we should succeed on the sixth
@@ -3261,4 +3289,216 @@ async fn grpc_message_too_large_doesnt_spam_task_fails() {
     core.complete_execution(&act.run_id).await;
     core.drain_pollers_and_shutdown().await;
     // Mock only expects 1 task failure, and would fail here if we spammed
+    // Every attempt counts as a failure though, even the unreported ones
+    assert_eq!(
+        meter.counter_total(
+            "workflow_task_execution_failed",
+            &[("failure_reason", "GrpcMessageTooLarge")]
+        ),
+        5
+    );
+}
+
+#[tokio::test]
+async fn payloads_too_large_doesnt_spam_task_fails() {
+    let mut t = TestHistoryBuilder::default();
+    t.add_by_type(EventType::WorkflowExecutionStarted);
+    t.add_workflow_task_scheduled_and_started();
+
+    let mut mh = MockPollCfg::from_resp_batches(
+        "fake_wf_id",
+        t,
+        [
+            ResponseType::AllHistory,
+            ResponseType::AllHistory,
+            ResponseType::AllHistory,
+            ResponseType::AllHistory,
+            ResponseType::AllHistory,
+            ResponseType::AllHistory,
+        ],
+        mock_worker_client(),
+    );
+    mh.num_expected_fails = 1;
+    let mut times = 1;
+    mh.completion_mock_fn = Some(Box::new(move |_| {
+        if times <= 5 {
+            let violation = PayloadLimitViolation {
+                path: "commands[0].input".to_string(),
+                class: LimitClass::Blob,
+                severity: LimitSeverity::Error,
+                size: 1024,
+                limit: 10,
+            };
+            let mut err = tonic::Status::new(tonic::Code::InvalidArgument, violation.to_string());
+            err.set_source(Arc::new(violation));
+            times += 1;
+            Err(err)
+        } else {
+            Ok(Default::default())
+        }
+    }));
+    let fails = Arc::new(AtomicUsize::new(0));
+    let fails_clone = fails.clone();
+    mh.expect_fail_wft_matcher = Box::new(move |_, cause, _| {
+        fails_clone.fetch_add(1, Ordering::Relaxed);
+        *cause == WorkflowTaskFailedCause::PayloadsTooLarge
+    });
+
+    let mut mock = build_mock_pollers(mh);
+    mock.worker_cfg(|wc| wc.max_cached_workflows = 1);
+    let meter = Arc::new(CounterRecordingMeter::default());
+    mock.set_temporal_meter(meter.clone().into_temporal_meter());
+    let core = mock_worker(mock);
+
+    for _ in 1..=5 {
+        let act = core.poll_workflow_activation().await.unwrap();
+        core.complete_workflow_activation(WorkflowActivationCompletion::empty(&act.run_id))
+            .await
+            .unwrap();
+        core.handle_eviction().await;
+    }
+    let act = core.poll_workflow_activation().await.unwrap();
+    core.complete_execution(&act.run_id).await;
+    core.drain_pollers_and_shutdown().await;
+    assert_eq!(fails.load(Ordering::Relaxed), 1);
+    assert_eq!(
+        meter.counter_total(
+            "workflow_task_execution_failed",
+            &[("failure_reason", "PayloadsTooLarge")]
+        ),
+        5
+    );
+}
+
+/// A history fetch failure for a run that was never cached is reported through a path that has no
+/// activation to complete. Later attempts of that same task must still not be re-reported.
+#[tokio::test]
+async fn unstored_wft_fetch_failure_doesnt_spam_task_fails() {
+    let mut t = TestHistoryBuilder::default();
+    t.add_by_type(EventType::WorkflowExecutionStarted);
+    t.add_workflow_task_scheduled_and_started();
+    t.add_workflow_task_completed();
+    let mut need_fetch_resp =
+        hist_to_poll_resp(&t, "wfid".to_owned(), ResponseType::AllHistory).resp;
+    need_fetch_resp.next_page_token = vec![1];
+
+    let mut mock_client = mock_worker_client();
+    mock_client
+        .expect_get_workflow_execution_history()
+        .returning(|_, _, _| Err(tonic::Status::not_found("Ahh broken")))
+        .times(2);
+    // Identical responses are handed out with incrementing attempt numbers by the mock
+    let mut mh = MockPollCfg::from_resp_batches(
+        "wfid",
+        t,
+        [
+            ResponseType::Raw(need_fetch_resp.clone()),
+            ResponseType::Raw(need_fetch_resp),
+        ],
+        mock_client,
+    );
+    // Counted explicitly because a violated mock expectation inside the worker does not reliably
+    // fail the test.
+    let fails = Arc::new(AtomicUsize::new(0));
+    let fails_clone = fails.clone();
+    mh.num_expected_fails = 1;
+    mh.expect_fail_wft_matcher = Box::new(move |_, cause, _| {
+        fails_clone.fetch_add(1, Ordering::Relaxed);
+        *cause == WorkflowTaskFailedCause::WorkflowWorkerUnhandledFailure
+    });
+    let mut mock = build_mock_pollers(mh);
+    let meter = Arc::new(CounterRecordingMeter::default());
+    mock.set_temporal_meter(meter.clone().into_temporal_meter());
+    let core = mock_worker(mock);
+
+    // Both fetch failures are processed before the exhausted poller shuts the worker down
+    assert_matches!(
+        core.poll_workflow_activation().await.unwrap_err(),
+        PollError::ShutDown
+    );
+    core.shutdown().await;
+    assert_eq!(fails.load(Ordering::Relaxed), 1);
+    assert_eq!(
+        meter.counter_total(
+            "workflow_task_execution_failed",
+            &[("failure_reason", "WorkflowError")]
+        ),
+        2
+    );
+}
+
+/// A history fetch failure for a cached run evicts it and reports the failure once the eviction
+/// completes. Later attempts of that same task must still not be re-reported.
+#[tokio::test]
+async fn cached_run_fetch_failure_doesnt_spam_task_fails() {
+    let mut t = TestHistoryBuilder::default();
+    t.add_by_type(EventType::WorkflowExecutionStarted);
+    t.add_workflow_task_scheduled_and_started();
+    t.add_workflow_task_completed();
+    let mut need_fetch_resp =
+        hist_to_poll_resp(&t, "wfid".to_owned(), ResponseType::AllHistory).resp;
+    need_fetch_resp.next_page_token = vec![1];
+
+    let mut mock_client = mock_worker_client();
+    mock_client
+        .expect_get_workflow_execution_history()
+        .returning(|_, _, _| Err(tonic::Status::not_found("Ahh broken")))
+        .times(2);
+    let mut mh = MockPollCfg::from_resp_batches(
+        "wfid",
+        t,
+        [
+            ResponseType::ToTaskNum(1),
+            ResponseType::Raw(need_fetch_resp.clone()),
+            ResponseType::ToTaskNum(1),
+            ResponseType::Raw(need_fetch_resp),
+        ],
+        mock_client,
+    );
+    // Counted explicitly because a violated mock expectation inside the worker does not reliably
+    // fail the test.
+    let fails = Arc::new(AtomicUsize::new(0));
+    let fails_clone = fails.clone();
+    mh.num_expected_fails = 1;
+    mh.expect_fail_wft_matcher = Box::new(move |_, cause, _| {
+        fails_clone.fetch_add(1, Ordering::Relaxed);
+        *cause == WorkflowTaskFailedCause::WorkflowWorkerUnhandledFailure
+    });
+    let mut mock = build_mock_pollers(mh);
+    // Otherwise the poller runs dry and starts shutdown before the second eviction completes
+    mock.make_wft_stream_interminable();
+    mock.worker_cfg(|wc| wc.max_cached_workflows = 10);
+    let meter = Arc::new(CounterRecordingMeter::default());
+    mock.set_temporal_meter(meter.clone().into_temporal_meter());
+    let core = mock_worker(mock);
+
+    for _ in 0..2 {
+        let act = core.poll_workflow_activation().await.unwrap();
+        assert_matches!(
+            act.jobs[0].variant,
+            Some(workflow_activation_job::Variant::InitializeWorkflow(_))
+        );
+        core.complete_workflow_activation(WorkflowActivationCompletion::empty(act.run_id))
+            .await
+            .unwrap();
+        let evict_act = core.poll_workflow_activation().await.unwrap();
+        assert_matches!(
+            evict_act.jobs.as_slice(),
+            [WorkflowActivationJob {
+                variant: Some(workflow_activation_job::Variant::RemoveFromCache(r)),
+            }] => r.message.contains("Fetching history failed")
+        );
+        core.complete_workflow_activation(WorkflowActivationCompletion::empty(evict_act.run_id))
+            .await
+            .unwrap();
+    }
+    core.shutdown().await;
+    assert_eq!(fails.load(Ordering::Relaxed), 1);
+    assert_eq!(
+        meter.counter_total(
+            "workflow_task_execution_failed",
+            &[("failure_reason", "WorkflowError")]
+        ),
+        2
+    );
 }

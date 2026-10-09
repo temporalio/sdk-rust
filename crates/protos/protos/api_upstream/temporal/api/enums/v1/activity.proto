@@ -10,8 +10,8 @@ option ruby_package = "Temporalio::Api::Enums::V1";
 option csharp_namespace = "Temporalio.Api.Enums.V1";
 
 // Status of a standalone activity.
-// The status is updated once, when the activity is originally scheduled, and again when the activity reaches a terminal
-// status.
+// The status is updated when the activity is originally scheduled, paused, unpaused, and when the
+// activity reaches a terminal state.
 // (-- api-linter: core::0216::synonyms=disabled
 //     aip.dev/not-precedent: Named consistently with WorkflowExecutionStatus. --)
 enum ActivityExecutionStatus {
@@ -50,6 +50,10 @@ enum ActivityExecutionStatus {
     //   reached when retry is blocked (RetryPolicy.maximum_attempts exhausted,
     //   SCHEDULE_TO_CLOSE would be exceeded, or cancellation has been requested).
     ACTIVITY_EXECUTION_STATUS_TIMED_OUT = 6;
+
+    // The activity is paused. Paused state is only reachable after calling
+    // PauseActivityExecution on a standalone activity.
+    ACTIVITY_EXECUTION_STATUS_PAUSED = 7;
 }
 
 // Defines whether to allow re-using an activity ID from a previously *closed* activity.

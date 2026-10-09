@@ -1,8 +1,8 @@
 use crate::{
     common::{
-        ActivationAssertionsInterceptor, CoreWfStarter, INTEG_CLIENT_IDENTITY,
-        activity_functions::StdActivities, build_fake_sdk, eventually, init_core_and_create_wf,
-        mock_sdk, mock_sdk_cfg,
+        ActivationAssertionsInterceptor, CLI_VERSION_OVERRIDE_ENV_VAR, CoreWfStarter,
+        INTEG_CLIENT_IDENTITY, activity_functions::StdActivities, init_core_and_create_wf,
+        init_integ_telem,
     },
     shared_tests,
 };
@@ -10,6 +10,7 @@ use anyhow::anyhow;
 use assert_matches::assert_matches;
 use futures_util::FutureExt;
 use std::{
+    env,
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
@@ -17,8 +18,7 @@ use std::{
     time::Duration,
 };
 use temporalio_client::{
-    ActivityIdentifier, UntypedWorkflow, WorkflowDescribeOptions, WorkflowStartOptions,
-    WorkflowTerminateOptions,
+    ActivityIdentifier, UntypedWorkflow, WorkflowStartOptions, WorkflowTerminateOptions,
 };
 
 use temporalio_common::{
@@ -28,7 +28,6 @@ use temporalio_common::{
     protos::{
         coresdk::{
             ActivityHeartbeat, ActivityTaskCompletion, AsJsonPayloadExt, IntoCompletion,
-            IntoPayloadsExt,
             activity_result::{
                 self, ActivityExecutionResult, ActivityResolution, activity_resolution as act_res,
             },
@@ -45,6 +44,7 @@ use temporalio_common::{
             common::v1::{ActivityType, Payload, RetryPolicy},
             enums::v1::{CommandType, EventType, RetryState as ProtoRetryState},
             failure::v1::{ActivityFailureInfo, Failure, failure::FailureInfo},
+            history::v1::history_event::Attributes::WorkflowTaskFailedEventAttributes,
             sdk::v1::UserMetadata,
         },
     },
@@ -58,9 +58,10 @@ use temporalio_sdk::{
         ActivityInboundInterceptor, ExecuteActivityInput, ExecuteActivityOutput,
         ExecuteActivityResult, Next,
     },
+    runtime::{AutoscalingOptions, PollerBehavior},
 };
 use temporalio_sdk_core::{
-    PollerBehavior, prost_dur,
+    prost_dur,
     replay::{DEFAULT_ACTIVITY_TYPE, DEFAULT_WORKFLOW_TYPE, TestHistoryBuilder, canned_histories},
     test_help::{
         MockPollCfg, ResponseType, WorkerTestHelpers, drain_pollers_and_shutdown,
@@ -68,6 +69,7 @@ use temporalio_sdk_core::{
     },
 };
 use tokio::{join, sync::Semaphore, time::sleep};
+use tracing::warn;
 
 #[workflow]
 #[derive(Default)]
@@ -134,7 +136,7 @@ struct ActivityInterceptorRecord {
     interceptor: &'static str,
     phase: ActivityInterceptorPhase,
     activity_type: String,
-    workflow_type: String,
+    workflow_type: Option<String>,
     is_local: bool,
     input: Option<String>,
     output: Option<String>,
@@ -207,6 +209,7 @@ fn activity_execution_result_status(result: &ExecuteActivityResult) -> &'static 
         Err(ActivityError::Application(_)) => "failed",
         Err(ActivityError::Cancelled { .. }) => "cancelled",
         Err(ActivityError::WillCompleteAsync) => "will_complete_async",
+        Err(_) => "unknown",
     }
 }
 
@@ -226,6 +229,76 @@ impl MultiArgActivityWorkflow {
             )
             .await?;
         Ok(r)
+    }
+}
+
+static FAIL_ACTIVITY_INPUT_SERIALIZATION_ONCE: AtomicBool = AtomicBool::new(true);
+
+#[derive(serde::Deserialize)]
+struct FailOnceActivityInput;
+
+impl serde::Serialize for FailOnceActivityInput {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        if FAIL_ACTIVITY_INPUT_SERIALIZATION_ONCE.swap(false, Ordering::SeqCst) {
+            return Err(serde::ser::Error::custom(
+                "intentional activity input serialization failure",
+            ));
+        }
+        serializer.serialize_unit_struct("FailOnceActivityInput")
+    }
+}
+
+struct PayloadConversionActivities;
+
+#[activities]
+impl PayloadConversionActivities {
+    #[activity]
+    async fn fail_once_input(
+        _ctx: ActivityContext,
+        _input: FailOnceActivityInput,
+    ) -> Result<(), ActivityError> {
+        Ok(())
+    }
+}
+
+#[workflow]
+#[derive(Default)]
+struct PropagatedActivityInputConversionFailureWorkflow;
+
+#[workflow_methods]
+impl PropagatedActivityInputConversionFailureWorkflow {
+    #[run]
+    async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<()> {
+        ctx.execute_activity(
+            PayloadConversionActivities::fail_once_input,
+            FailOnceActivityInput,
+            ActivityOptions::start_to_close_timeout(Duration::from_secs(5)),
+        )
+        .await?;
+        Ok(())
+    }
+}
+
+#[workflow]
+#[derive(Default)]
+struct CaughtActivityInputConversionFailureWorkflow;
+
+#[workflow_methods]
+impl CaughtActivityInputConversionFailureWorkflow {
+    #[run]
+    async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<()> {
+        let result = ctx
+            .execute_activity(
+                PayloadConversionActivities::fail_once_input,
+                FailOnceActivityInput,
+                ActivityOptions::start_to_close_timeout(Duration::from_secs(5)),
+            )
+            .await;
+        match result {
+            Err(ActivityExecutionError::Serialization(_error)) => (),
+            other => panic!("expected a serialization error, got {other:?}"),
+        }
+        Ok(())
     }
 }
 
@@ -253,6 +326,81 @@ async fn multi_arg_activity() {
     worker.run_until_done().await.unwrap();
     let r = handle.get_result(Default::default()).await.unwrap();
     assert_eq!(r, "hello world");
+}
+
+#[tokio::test]
+async fn propagated_activity_input_conversion_failure_fails_workflow_task() {
+    FAIL_ACTIVITY_INPUT_SERIALIZATION_ONCE.store(true, Ordering::SeqCst);
+    let wf_name = PropagatedActivityInputConversionFailureWorkflow::name();
+    let mut starter = CoreWfStarter::new(wf_name);
+    starter
+        .sdk_config
+        .register_activities(PayloadConversionActivities);
+    starter
+        .sdk_config
+        .register_workflow::<PropagatedActivityInputConversionFailureWorkflow>()
+        .unwrap();
+    let mut worker = starter.worker().await;
+
+    let task_queue = starter.get_task_queue().to_owned();
+    let handle = worker
+        .submit_workflow(
+            PropagatedActivityInputConversionFailureWorkflow::run,
+            (),
+            WorkflowStartOptions::new(task_queue, wf_name.to_owned()).build(),
+        )
+        .await
+        .unwrap();
+    worker.run_until_done().await.unwrap();
+    handle.get_result(Default::default()).await.unwrap();
+
+    let history = handle
+        .fetch_history(Default::default())
+        .into_events()
+        .await
+        .unwrap();
+    let workflow_task_failures: Vec<_> = history
+        .iter()
+        .filter(|event| event.event_type() == EventType::WorkflowTaskFailed)
+        .collect();
+    assert_eq!(workflow_task_failures.len(), 1);
+    let Some(WorkflowTaskFailedEventAttributes(attributes)) =
+        workflow_task_failures[0].attributes.as_ref()
+    else {
+        panic!("expected workflow task failed attributes");
+    };
+    let failure = attributes
+        .failure
+        .as_ref()
+        .expect("workflow task failure should include a failure");
+    assert!(
+        failure
+            .message
+            .contains("intentional activity input serialization failure")
+    );
+}
+
+#[tokio::test]
+async fn activity_input_conversion_failure_can_be_caught() {
+    let wf_name = CaughtActivityInputConversionFailureWorkflow::name();
+    let mut starter = CoreWfStarter::new(wf_name);
+    starter
+        .sdk_config
+        .register_workflow::<CaughtActivityInputConversionFailureWorkflow>()
+        .unwrap();
+    let mut worker = starter.worker().await;
+
+    let task_queue = starter.get_task_queue().to_owned();
+    let handle = worker
+        .submit_workflow(
+            CaughtActivityInputConversionFailureWorkflow::run,
+            (),
+            WorkflowStartOptions::new(task_queue, wf_name.to_owned()).build(),
+        )
+        .await
+        .unwrap();
+    worker.run_until_done().await.unwrap();
+    handle.get_result(Default::default()).await.unwrap();
 }
 
 #[tokio::test]
@@ -316,21 +464,20 @@ async fn activity_interceptor_wraps_activity_execution() {
         .sdk_config
         .register_workflow::<OneActivityWorkflow>()
         .unwrap();
-    let mut worker = starter.worker().await;
-
     let records = Arc::new(ActivityInterceptorRecords::default());
-    worker
-        .inner_mut()
-        .add_activity_inbound_interceptor(RecordingActivityInboundInterceptor {
+    starter
+        .sdk_config
+        .activity_inbound_interceptor(RecordingActivityInboundInterceptor {
             interceptor: "outer",
             records: records.clone(),
         });
-    worker
-        .inner_mut()
-        .add_activity_inbound_interceptor(RecordingActivityInboundInterceptor {
+    starter
+        .sdk_config
+        .activity_inbound_interceptor(RecordingActivityInboundInterceptor {
             interceptor: "inner",
             records: records.clone(),
         });
+    let mut worker = starter.worker().await;
 
     let input = "hello from input!".to_string();
     let task_queue = starter.get_task_queue().to_owned();
@@ -353,7 +500,7 @@ async fn activity_interceptor_wraps_activity_execution() {
                 interceptor: "outer",
                 phase: ActivityInterceptorPhase::Before,
                 activity_type: "StdActivities::echo".to_owned(),
-                workflow_type: wf_name.to_owned(),
+                workflow_type: Some(wf_name.to_owned()),
                 is_local: false,
                 input: Some(input.clone()),
                 output: None,
@@ -363,7 +510,7 @@ async fn activity_interceptor_wraps_activity_execution() {
                 interceptor: "inner",
                 phase: ActivityInterceptorPhase::Before,
                 activity_type: "StdActivities::echo".to_owned(),
-                workflow_type: wf_name.to_owned(),
+                workflow_type: Some(wf_name.to_owned()),
                 is_local: false,
                 input: Some(input.clone()),
                 output: None,
@@ -373,7 +520,7 @@ async fn activity_interceptor_wraps_activity_execution() {
                 interceptor: "inner",
                 phase: ActivityInterceptorPhase::After,
                 activity_type: "StdActivities::echo".to_owned(),
-                workflow_type: wf_name.to_owned(),
+                workflow_type: Some(wf_name.to_owned()),
                 is_local: false,
                 input: None,
                 output: Some(input.clone()),
@@ -383,7 +530,7 @@ async fn activity_interceptor_wraps_activity_execution() {
                 interceptor: "outer",
                 phase: ActivityInterceptorPhase::After,
                 activity_type: "StdActivities::echo".to_owned(),
-                workflow_type: wf_name.to_owned(),
+                workflow_type: Some(wf_name.to_owned()),
                 is_local: false,
                 input: None,
                 output: Some(input.clone()),
@@ -402,15 +549,14 @@ async fn activity_interceptor_wraps_local_activity_execution() {
         .sdk_config
         .register_workflow::<OneLocalActivityWorkflow>()
         .unwrap();
-    let mut worker = starter.worker().await;
-
     let records = Arc::new(ActivityInterceptorRecords::default());
-    worker
-        .inner_mut()
-        .add_activity_inbound_interceptor(RecordingActivityInboundInterceptor {
+    starter
+        .sdk_config
+        .activity_inbound_interceptor(RecordingActivityInboundInterceptor {
             interceptor: "local",
             records: records.clone(),
         });
+    let mut worker = starter.worker().await;
 
     let input = "hello from local input!".to_string();
     let task_queue = starter.get_task_queue().to_owned();
@@ -433,7 +579,7 @@ async fn activity_interceptor_wraps_local_activity_execution() {
                 interceptor: "local",
                 phase: ActivityInterceptorPhase::Before,
                 activity_type: "StdActivities::echo".to_owned(),
-                workflow_type: wf_name.to_owned(),
+                workflow_type: Some(wf_name.to_owned()),
                 is_local: true,
                 input: Some(input.clone()),
                 output: None,
@@ -443,7 +589,7 @@ async fn activity_interceptor_wraps_local_activity_execution() {
                 interceptor: "local",
                 phase: ActivityInterceptorPhase::After,
                 activity_type: "StdActivities::echo".to_owned(),
-                workflow_type: wf_name.to_owned(),
+                workflow_type: Some(wf_name.to_owned()),
                 is_local: true,
                 input: None,
                 output: Some(input.clone()),
@@ -476,11 +622,10 @@ async fn activity_inbound_interceptor_can_mutate_activity_input() {
         .sdk_config
         .register_workflow::<OneActivityWorkflow>()
         .unwrap();
+    starter
+        .sdk_config
+        .activity_inbound_interceptor(MutatingActivityInboundInterceptor);
     let mut worker = starter.worker().await;
-
-    worker
-        .inner_mut()
-        .add_activity_inbound_interceptor(MutatingActivityInboundInterceptor);
 
     let input = "hello from input!".to_string();
     let task_queue = starter.get_task_queue().to_owned();
@@ -541,15 +686,14 @@ async fn activity_interceptor_observes_activity_error() {
         .sdk_config
         .register_workflow::<ActivityFailureWorkflow>()
         .unwrap();
-    let mut worker = starter.worker().await;
-
     let records = Arc::new(ActivityInterceptorRecords::default());
-    worker
-        .inner_mut()
-        .add_activity_inbound_interceptor(RecordingActivityInboundInterceptor {
+    starter
+        .sdk_config
+        .activity_inbound_interceptor(RecordingActivityInboundInterceptor {
             interceptor: "failure",
             records: records.clone(),
         });
+    let mut worker = starter.worker().await;
 
     let input = "bad input".to_string();
     let task_queue = starter.get_task_queue().to_owned();
@@ -571,7 +715,7 @@ async fn activity_interceptor_observes_activity_error() {
                 interceptor: "failure",
                 phase: ActivityInterceptorPhase::Before,
                 activity_type: "FailingActivities::fail".to_owned(),
-                workflow_type: wf_name.to_owned(),
+                workflow_type: Some(wf_name.to_owned()),
                 is_local: false,
                 input: Some(input),
                 output: None,
@@ -581,7 +725,7 @@ async fn activity_interceptor_observes_activity_error() {
                 interceptor: "failure",
                 phase: ActivityInterceptorPhase::After,
                 activity_type: "FailingActivities::fail".to_owned(),
-                workflow_type: wf_name.to_owned(),
+                workflow_type: Some(wf_name.to_owned()),
                 is_local: false,
                 input: None,
                 output: None,
@@ -638,15 +782,14 @@ async fn activity_interceptor_observes_activity_panic() {
         .sdk_config
         .register_workflow::<ActivityPanicWorkflow>()
         .unwrap();
-    let mut worker = starter.worker().await;
-
     let records = Arc::new(ActivityInterceptorRecords::default());
-    worker
-        .inner_mut()
-        .add_activity_inbound_interceptor(RecordingActivityInboundInterceptor {
+    starter
+        .sdk_config
+        .activity_inbound_interceptor(RecordingActivityInboundInterceptor {
             interceptor: "panic",
             records: records.clone(),
         });
+    let mut worker = starter.worker().await;
 
     let input = "panic input".to_string();
     let task_queue = starter.get_task_queue().to_owned();
@@ -668,7 +811,7 @@ async fn activity_interceptor_observes_activity_panic() {
                 interceptor: "panic",
                 phase: ActivityInterceptorPhase::Before,
                 activity_type: "PanickingActivities::panic_activity".to_owned(),
-                workflow_type: wf_name.to_owned(),
+                workflow_type: Some(wf_name.to_owned()),
                 is_local: false,
                 input: Some(input),
                 output: None,
@@ -678,7 +821,7 @@ async fn activity_interceptor_observes_activity_panic() {
                 interceptor: "panic",
                 phase: ActivityInterceptorPhase::After,
                 activity_type: "PanickingActivities::panic_activity".to_owned(),
-                workflow_type: wf_name.to_owned(),
+                workflow_type: Some(wf_name.to_owned()),
                 is_local: false,
                 input: None,
                 output: None,
@@ -835,7 +978,7 @@ async fn unregistered_activity_type_fails_activity_task_not_worker() {
 #[tokio::test]
 async fn activity_workflow() {
     let mut starter = init_core_and_create_wf("activity_workflow").await;
-    let core = starter.get_worker().await;
+    let core = starter.get_core_worker().await;
     let task_q = starter.get_task_queue();
     let activity_id = "act-1";
     let task = core.poll_workflow_activation().await.unwrap();
@@ -900,7 +1043,7 @@ async fn activity_workflow() {
 #[tokio::test]
 async fn activity_non_retryable_failure() {
     let mut starter = init_core_and_create_wf("activity_non_retryable_failure").await;
-    let core = starter.get_worker().await;
+    let core = starter.get_core_worker().await;
     let task_q = starter.get_task_queue();
     let activity_id = "act-1";
     let task = core.poll_workflow_activation().await.unwrap();
@@ -938,7 +1081,7 @@ async fn activity_non_retryable_failure() {
                 variant: Some(workflow_activation_job::Variant::ResolveActivity(
                     ResolveActivity {seq, result: Some(ActivityResolution{
                     status: Some(act_res::Status::Failed(activity_result::Failure{
-                        failure: Some(f),
+                        failure: Some(f), ..
                     }))}),..}
                 )),
             },
@@ -967,7 +1110,7 @@ async fn activity_non_retryable_failure() {
 #[tokio::test]
 async fn activity_non_retryable_failure_with_error() {
     let mut starter = init_core_and_create_wf("activity_non_retryable_failure").await;
-    let core = starter.get_worker().await;
+    let core = starter.get_core_worker().await;
     let task_q = starter.get_task_queue();
     let activity_id = "act-1";
     let task = core.poll_workflow_activation().await.unwrap();
@@ -1005,7 +1148,7 @@ async fn activity_non_retryable_failure_with_error() {
                 variant: Some(workflow_activation_job::Variant::ResolveActivity(
                     ResolveActivity {seq, result: Some(ActivityResolution{
                     status: Some(act_res::Status::Failed(activity_result::Failure{
-                        failure: Some(f),
+                        failure: Some(f), ..
                     }))}),..}
                 )),
             },
@@ -1037,6 +1180,10 @@ async fn workflow_observes_non_retryable_activity() {
     starter
         .sdk_config
         .register_activities(NonRetryableActivityErrorActivities);
+    starter
+        .sdk_config
+        .register_workflow::<NonRetryableActivityFailureWorkflow>()
+        .unwrap();
     let mut worker = starter.worker().await;
 
     #[workflow]
@@ -1094,10 +1241,6 @@ async fn workflow_observes_non_retryable_activity() {
         }
     }
 
-    worker
-        .register_workflow::<NonRetryableActivityFailureWorkflow>()
-        .unwrap();
-
     let task_queue = starter.get_task_queue().to_owned();
     worker
         .submit_workflow(
@@ -1113,7 +1256,7 @@ async fn workflow_observes_non_retryable_activity() {
 #[tokio::test]
 async fn activity_retry() {
     let mut starter = init_core_and_create_wf("activity_retry").await;
-    let core = starter.get_worker().await;
+    let core = starter.get_core_worker().await;
     let task_q = starter.get_task_queue();
     let activity_id = "act-1";
     let task = core.poll_workflow_activation().await.unwrap();
@@ -1179,7 +1322,7 @@ async fn activity_retry() {
 #[tokio::test]
 async fn activity_cancellation_try_cancel() {
     let mut starter = init_core_and_create_wf("activity_cancellation_try_cancel").await;
-    let core = starter.get_worker().await;
+    let core = starter.get_core_worker().await;
     let task_q = starter.get_task_queue();
     let activity_id = "act-1";
     let task = core.poll_workflow_activation().await.unwrap();
@@ -1236,7 +1379,7 @@ async fn activity_cancellation_try_cancel() {
 async fn activity_cancellation_plus_complete_doesnt_double_resolve() {
     let mut starter =
         init_core_and_create_wf("activity_cancellation_plus_complete_doesnt_double_resolve").await;
-    let core = starter.get_worker().await;
+    let core = starter.get_core_worker().await;
     let task_q = starter.get_task_queue();
     let activity_id = "act-1";
     let task = core.poll_workflow_activation().await.unwrap();
@@ -1328,7 +1471,7 @@ async fn activity_cancellation_plus_complete_doesnt_double_resolve() {
 #[tokio::test]
 async fn started_activity_timeout() {
     let mut starter = init_core_and_create_wf("started_activity_timeout").await;
-    let core = starter.get_worker().await;
+    let core = starter.get_core_worker().await;
     let task_q = starter.get_task_queue();
     let activity_id = "act-1";
     let task = core.poll_workflow_activation().await.unwrap();
@@ -1361,7 +1504,7 @@ async fn started_activity_timeout() {
                         result: Some(ActivityResolution{
                             status: Some(
                                 act_res::Status::Failed(
-                                    activity_result::Failure{failure: Some(_)}
+                                    activity_result::Failure{failure: Some(_), ..}
                                 )
                             ),
                             ..
@@ -1380,7 +1523,7 @@ async fn started_activity_timeout() {
 async fn activity_cancellation_wait_cancellation_completed() {
     let mut starter =
         init_core_and_create_wf("activity_cancellation_wait_cancellation_completed").await;
-    let core = starter.get_worker().await;
+    let core = starter.get_core_worker().await;
     let task_q = starter.get_task_queue();
     let activity_id = "act-1";
     let task = core.poll_workflow_activation().await.unwrap();
@@ -1442,7 +1585,7 @@ async fn activity_cancellation_wait_cancellation_completed() {
 #[tokio::test]
 async fn activity_cancellation_abandon() {
     let mut starter = init_core_and_create_wf("activity_cancellation_abandon").await;
-    let core = starter.get_worker().await;
+    let core = starter.get_core_worker().await;
     let task_q = starter.get_task_queue();
     let activity_id = "act-1";
     let task = core.poll_workflow_activation().await.unwrap();
@@ -1500,7 +1643,7 @@ async fn activity_cancellation_abandon() {
 #[tokio::test]
 async fn async_activity_completion_workflow() {
     let mut starter = init_core_and_create_wf("async_activity_workflow").await;
-    let core = starter.get_worker().await;
+    let core = starter.get_core_worker().await;
     let task_q = starter.get_task_queue();
     let activity_id = "act-1";
     let task = core.poll_workflow_activation().await.unwrap();
@@ -1534,10 +1677,13 @@ async fn async_activity_completion_workflow() {
     .await
     .unwrap();
     starter
-        .get_client()
+        .get_core_client()
         .await
         .get_async_activity_handle(ActivityIdentifier::TaskToken(task.task_token.into()))
-        .complete(Some(RawValue::new(vec![response_payload.clone()])))
+        .complete(
+            Some(RawValue::new(vec![response_payload.clone()])),
+            Default::default(),
+        )
         .await
         .unwrap();
 
@@ -1564,7 +1710,7 @@ async fn async_activity_completion_workflow() {
 #[tokio::test]
 async fn activity_cancelled_after_heartbeat_times_out() {
     let mut starter = init_core_and_create_wf("activity_cancelled_after_heartbeat_times_out").await;
-    let core = starter.get_worker().await;
+    let core = starter.get_core_worker().await;
     let task_q = starter.get_task_queue().to_string();
     let activity_id = "act-1";
     let task = core.poll_workflow_activation().await.unwrap();
@@ -1616,7 +1762,7 @@ async fn activity_cancelled_after_heartbeat_times_out() {
     drain_pollers_and_shutdown(&core).await;
     // Cleanup just in case
     starter
-        .get_client()
+        .get_core_client()
         .await
         .get_workflow_handle::<UntypedWorkflow>(task_q)
         .terminate(WorkflowTerminateOptions::default())
@@ -1624,26 +1770,25 @@ async fn activity_cancelled_after_heartbeat_times_out() {
         .unwrap();
 }
 
-#[ignore] // Currently skipped because of https://github.com/temporalio/temporal/issues/8376
 #[tokio::test]
-async fn activity_heartbeat_not_flushed_on_success() {
-    let mut starter = init_core_and_create_wf("activity_heartbeat_not_flushed_on_success").await;
-    let core = starter.get_worker().await;
+async fn activity_failure_includes_latest_heartbeat_on_retry() {
+    let mut starter =
+        init_core_and_create_wf("activity_failure_includes_latest_heartbeat_on_retry").await;
+    let core = starter.get_core_worker().await;
     let task_q = starter.get_task_queue().to_string();
-    let activity_id = "act-1";
     let task = core.poll_workflow_activation().await.unwrap();
     core.complete_workflow_activation(WorkflowActivationCompletion::from_cmd(
         task.run_id,
         ScheduleActivity {
             seq: 0,
-            activity_id: activity_id.to_string(),
+            activity_id: "act-1".to_string(),
             activity_type: "dontcare".to_string(),
             task_queue: task_q.clone(),
             schedule_to_close_timeout: Some(prost_dur!(from_secs(60))),
             heartbeat_timeout: Some(prost_dur!(from_secs(10))),
             retry_policy: Some(RetryPolicy {
                 maximum_attempts: 2,
-                initial_interval: Some(prost_dur!(from_secs(5))),
+                initial_interval: Some(prost_dur!(from_millis(10))),
                 ..Default::default()
             }),
             ..Default::default()
@@ -1665,45 +1810,45 @@ async fn activity_heartbeat_not_flushed_on_success() {
         task_token: task.task_token.clone(),
         details: vec!["two".into()],
     });
-    // Complete activity with fail
-    let failure = Failure::application_failure("activity failed".to_string(), false);
     core.complete_activity_task(ActivityTaskCompletion {
         task_token: task.task_token,
-        result: Some(ActivityExecutionResult::fail(failure)),
+        result: Some(ActivityExecutionResult::fail(Failure::application_failure(
+            "activity failed".to_string(),
+            false,
+        ))),
     })
     .await
     .unwrap();
-    // The activity is still in the pending state since it has retries left
-    let client = starter.get_client().await;
-    eventually(
-        || async {
-            // Verify pending details has the flushed heartbeat
-            let details = client
-                .get_workflow_handle::<UntypedWorkflow>(starter.get_wf_id().to_string())
-                .describe(WorkflowDescribeOptions::default())
-                .await
-                .unwrap();
-            let last_deets = details
-                .raw_description
-                .pending_activities
-                .into_iter()
-                .find(|i| i.activity_id == activity_id)
-                .and_then(|i| i.heartbeat_details);
-            if last_deets == ["two".into()].into_payloads() {
-                Ok(())
-            } else {
-                Err("details don't yet match")
-            }
-        },
-        Duration::from_secs(5),
-    )
+
+    let retry = core.poll_activity_task().await.unwrap();
+    let retry_task_token = retry.task_token;
+    let retry_start =
+        assert_matches!(retry.variant, Some(act_task::Variant::Start(start)) => start);
+    assert_eq!(retry_start.heartbeat_details, ["two".into()]);
+    core.complete_activity_task(ActivityTaskCompletion {
+        task_token: retry_task_token,
+        result: Some(ActivityExecutionResult::ok("done".into())),
+    })
     .await
     .unwrap();
-    client
-        .get_workflow_handle::<UntypedWorkflow>(task_q)
-        .terminate(WorkflowTerminateOptions::default())
-        .await
-        .unwrap();
+
+    let task = core.poll_workflow_activation().await.unwrap();
+    assert_matches!(
+        task.jobs.as_slice(),
+        [WorkflowActivationJob {
+            variant: Some(workflow_activation_job::Variant::ResolveActivity(
+                ResolveActivity {
+                    result: Some(ActivityResolution {
+                        status: Some(act_res::Status::Completed(_)),
+                        ..
+                    }),
+                    ..
+                }
+            )),
+        }]
+    );
+    core.complete_execution(&task.run_id).await;
+    core.handle_eviction().await;
     drain_pollers_and_shutdown(&core).await;
 }
 
@@ -1832,8 +1977,12 @@ async fn graceful_shutdown() {
         acts_started: acts_started.clone(),
         acts_done: acts_done.clone(),
     });
+    starter
+        .sdk_config
+        .register_workflow::<GracefulShutdownWorkflow>()
+        .unwrap();
     let mut worker = starter.worker().await;
-    let client = starter.get_client().await;
+    let client = starter.get_core_client().await;
 
     #[workflow]
     #[derive(Default)]
@@ -1860,10 +2009,6 @@ async fn graceful_shutdown() {
             Ok(())
         }
     }
-
-    worker
-        .register_workflow::<GracefulShutdownWorkflow>()
-        .unwrap();
 
     let task_queue = starter.get_task_queue().to_owned();
     worker
@@ -1927,6 +2072,10 @@ async fn activity_can_be_cancelled_by_local_timeout() {
         .register_activities(CancellableEchoActivities {
             was_cancelled: was_cancelled.clone(),
         });
+    starter
+        .sdk_config
+        .register_workflow::<ActivityLocalTimeoutWorkflow>()
+        .unwrap();
     let mut worker = starter.worker().await;
 
     #[workflow]
@@ -1966,10 +2115,6 @@ async fn activity_can_be_cancelled_by_local_timeout() {
         }
     }
 
-    worker
-        .register_workflow::<ActivityLocalTimeoutWorkflow>()
-        .unwrap();
-
     let task_queue = starter.get_task_queue().to_owned();
     worker
         .submit_workflow(
@@ -1990,19 +2135,27 @@ async fn activity_can_be_cancelled_by_local_timeout() {
 async fn long_activity_timeout_repro() {
     let wf_name = "long_activity_timeout_repro";
     let mut starter = CoreWfStarter::new(wf_name);
-    starter.sdk_config.workflow_task_poller_behavior = PollerBehavior::Autoscaling {
-        minimum: 1,
-        maximum: 10,
-        initial: 5,
-    };
-    starter.sdk_config.activity_task_poller_behavior = PollerBehavior::Autoscaling {
-        minimum: 1,
-        maximum: 10,
-        initial: 5,
-    };
+    starter.sdk_config.workflow_task_poller_behavior = Some(PollerBehavior::Autoscaling(
+        AutoscalingOptions::builder()
+            .minimum(1)
+            .maximum(10)
+            .initial(5)
+            .build(),
+    ));
+    starter.sdk_config.activity_task_poller_behavior = Some(PollerBehavior::Autoscaling(
+        AutoscalingOptions::builder()
+            .minimum(1)
+            .maximum(10)
+            .initial(5)
+            .build(),
+    ));
     starter
         .set_core_cfg_mutator(|m| m.local_timeout_buffer_for_activities = Duration::from_secs(0));
     starter.sdk_config.register_activities(StdActivities);
+    starter
+        .sdk_config
+        .register_workflow::<LongActivityTimeoutReproWorkflow>()
+        .unwrap();
     let mut worker = starter.worker().await;
 
     #[workflow]
@@ -2031,20 +2184,17 @@ async fn long_activity_timeout_repro() {
                 ctx.timer(Duration::from_secs(60 * 3)).await;
                 iter += 1;
                 if iter > 5000 {
-                    ctx.continue_as_new(&(), Default::default())?;
+                    ctx.continue_as_new((), Default::default())?;
                 }
             }
         }
     }
 
-    worker
-        .register_workflow::<LongActivityTimeoutReproWorkflow>()
-        .unwrap();
-
     starter.start_with_worker(wf_name, &mut worker).await;
     worker.run_until_done().await.unwrap();
 }
 
+#[temporalio_macros::cloud_test_exclusion(crate::CloudTestExclusionReason::DoesNotUseServer)]
 #[tokio::test]
 async fn pass_activity_summary_to_metadata() {
     let t = canned_histories::single_activity("1");
@@ -2074,8 +2224,6 @@ async fn pass_activity_summary_to_metadata() {
             });
     });
 
-    let mut worker = mock_sdk_cfg(mock_cfg, |_| {});
-
     #[workflow]
     #[derive(Default)]
     struct ActivitySummaryWorkflow;
@@ -2096,9 +2244,15 @@ async fn pass_activity_summary_to_metadata() {
         }
     }
 
-    worker
-        .register_workflow::<ActivitySummaryWorkflow>()
-        .unwrap();
+    let mut worker = crate::common::mock_sdk_cfg_with_options(
+        mock_cfg,
+        |_| {},
+        |options| {
+            options
+                .register_workflow::<ActivitySummaryWorkflow>()
+                .unwrap();
+        },
+    );
     let task_queue = worker.inner_mut().task_queue().to_owned();
     worker
         .submit_wf(
@@ -2111,6 +2265,7 @@ async fn pass_activity_summary_to_metadata() {
     worker.run_until_done().await.unwrap();
 }
 
+#[temporalio_macros::cloud_test_exclusion(crate::CloudTestExclusionReason::DoesNotUseServer)]
 #[rstest(hist_batches, case::incremental(&[1, 2, 3, 4]), case::replay(&[4]))]
 #[tokio::test]
 async fn abandoned_activities_ignore_start_and_complete(hist_batches: &'static [usize]) {
@@ -2137,8 +2292,6 @@ async fn abandoned_activities_ignore_start_and_complete(hist_batches: &'static [
     t.add_full_wf_task();
     t.add_workflow_execution_completed();
     let mock = mock_worker_client();
-    let mut worker = mock_sdk(MockPollCfg::from_resp_batches(wfid, t, hist_batches, mock));
-
     #[workflow]
     #[derive(Default)]
     struct AbandonedActivitiesWorkflow;
@@ -2171,9 +2324,15 @@ async fn abandoned_activities_ignore_start_and_complete(hist_batches: &'static [
         }
     }
 
-    worker
-        .register_workflow::<AbandonedActivitiesWorkflow>()
-        .unwrap();
+    let mut worker = crate::common::mock_sdk_cfg_with_options(
+        MockPollCfg::from_resp_batches(wfid, t, hist_batches, mock),
+        |_| {},
+        |options| {
+            options
+                .register_workflow::<AbandonedActivitiesWorkflow>()
+                .unwrap();
+        },
+    );
     let task_queue = worker.inner_mut().task_queue().to_owned();
     worker
         .submit_wf(
@@ -2210,17 +2369,13 @@ impl ImmediateActivityCancelationWorkflow {
     }
 }
 
+#[temporalio_macros::cloud_test_exclusion(crate::CloudTestExclusionReason::DoesNotUseServer)]
 #[tokio::test]
 async fn immediate_activity_cancelation() {
     let mut t = TestHistoryBuilder::default();
     t.add_by_type(EventType::WorkflowExecutionStarted);
     t.add_full_wf_task();
     t.add_workflow_execution_completed();
-    let mut worker = build_fake_sdk(MockPollCfg::from_resps(t, [ResponseType::AllHistory]));
-    worker
-        .register_workflow::<ImmediateActivityCancelationWorkflow>()
-        .unwrap();
-
     let mut aai = ActivationAssertionsInterceptor::default();
     aai.then(|a| {
         assert_matches!(
@@ -2230,6 +2385,7 @@ async fn immediate_activity_cancelation() {
             }]
         )
     });
+
     aai.then(|a| {
         assert_matches!(
             a.jobs.as_slice(),
@@ -2246,13 +2402,45 @@ async fn immediate_activity_cancelation() {
         )
     });
 
-    worker.set_worker_interceptor(aai);
+    let mut worker = crate::common::build_fake_sdk_intercepted_with_options(
+        MockPollCfg::from_resps(t, [ResponseType::AllHistory]),
+        aai,
+        |options| {
+            options
+                .register_workflow::<ImmediateActivityCancelationWorkflow>()
+                .unwrap();
+        },
+    );
+
     worker.run().await.unwrap();
 }
 
 /// Verifies that activity cancellation is delivered via the nexus worker command channel
-/// even when the activity does not heartbeat.
+/// even when the activity does not heartbeat, with and without eager dispatch.
+#[rstest::rstest]
+#[case::no_eager(true)]
+#[case::eager(false)]
 #[tokio::test]
-async fn activity_cancel_delivered_without_heartbeat() {
-    shared_tests::activity_cancel_delivered_without_heartbeat().await
+async fn activity_cancel_delivered_without_heartbeat(#[case] disable_eager: bool) {
+    // Cancellation of activities through Worker Commands was added in Server v1.32.0-158.0,
+    // but the case for eager activities was initially broken. It got fixed in
+    // temporalio/temporal#10634, which was released in Server v1.32.0-159.0.
+    //
+    // At this time, there is no release of the Temporal CLI that bundles Server
+    // v1.32.0-159.0. We're pinned on CLI "v1.7.4-standalone-nexus-operations" which
+    // bundles Server v1.32.0-158.0, and therefore has the broken support for eager
+    // activity cancellation. That results in the eager activity cancelation test
+    // failing in CI and local tests against the CLI Dev Server.
+    //
+    // FIXME: Remove once we're pinned on a CLI that bundles Server >v1.32.0-159.0.
+    const CLI_WITHOUT_EAGER_CANCEL_FIX: &str = "v1.7.4-standalone-nexus-operations";
+    if !disable_eager
+        && env::var(CLI_VERSION_OVERRIDE_ENV_VAR).is_ok_and(|v| v == CLI_WITHOUT_EAGER_CANCEL_FIX)
+    {
+        // The skip message would go unlogged as no telemetry has been initialized yet.
+        init_integ_telem();
+        warn!("Skipping test: eager activity cancel requires server >= v1.32.0-159.0");
+        return;
+    }
+    shared_tests::activity_cancel_delivered_without_heartbeat(disable_eager).await
 }
