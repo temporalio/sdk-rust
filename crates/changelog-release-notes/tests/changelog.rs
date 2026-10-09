@@ -6,8 +6,8 @@ use std::{
 
 use changelog_release_notes::{
     ReleaseOptions, assemble_release, check_fragments, collect_fragments, core_notes, git,
-    prepare_release, previous_release_tag, published_release_notes,
-    published_repository_release_notes, release_section, update_core,
+    prepare_release, previous_release_tag, published_changelog_release_notes,
+    published_release_notes, release_section, update_core,
 };
 use chrono::NaiveDate;
 #[cfg(unix)]
@@ -44,7 +44,7 @@ impl Repo {
 }
 
 #[test]
-fn repository_notes_use_completed_release_and_keep_late_fragments_pending() {
+fn publishing_notes_use_completed_release_and_keep_late_fragments_pending() {
     let repo = Repo::new();
     repo.write(
         "CHANGELOG.md",
@@ -66,32 +66,31 @@ fn repository_notes_use_completed_release_and_keep_late_fragments_pending() {
     repo.commit();
     repo.write("changelog/fixed/dancing-duck.md", "A later fix.\n");
     repo.commit();
-    let notes = published_repository_release_notes(
-        &repo.root,
-        Path::new("CHANGELOG.md"),
-        "1.1.0",
-        "v1.0.0",
-        "HEAD",
-    )
-    .unwrap();
+    let notes =
+        published_changelog_release_notes(&repo.root, Path::new("CHANGELOG.md"), "1.1.0").unwrap();
     assert!(notes.starts_with(
         "## Notable Changes\n\n### Stabilized\n\n- Stable feature.\n- Second entry.\n"
     ));
-    assert!(notes.contains("### Commits\n\n- [`"));
+    assert!(!notes.contains("### Commits"));
     assert!(!notes.contains("A later fix."));
     assert!(!notes.contains("Old."));
     assert!(!notes.contains("SDK Core Commits"));
     assert!(repo.root.join("changelog/fixed/dancing-duck.md").exists());
     assert!(
-        published_repository_release_notes(
-            &repo.root,
-            Path::new("CHANGELOG.md"),
-            "9.9.9",
-            "v1.0.0",
-            "HEAD",
-        )
-        .is_err()
+        published_changelog_release_notes(&repo.root, Path::new("CHANGELOG.md"), "9.9.9").is_err()
     );
+    let output = Command::new(env!("CARGO_BIN_EXE_changelog-tool"))
+        .args(["release-notes", "--repo"])
+        .arg(&repo.root)
+        .args(["--version", "1.1.0"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(String::from_utf8(output.stdout).unwrap(), notes);
 }
 
 fn core_parent(core: &Repo, revision: &str) -> Repo {

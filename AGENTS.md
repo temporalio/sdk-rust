@@ -39,7 +39,7 @@ document as your quick reference when submitting pull requests.
   - `cargo integ-test` – run the integration test runner
   - `cargo changelog-check` – validate Rust SDK changelog fragments
   - `cargo prepare-release <sdk-version> <core-protos-version>` – prepare crate versions and changelogs
-  - `cargo release-notes --version <sdk-version> --from <previous-sdk-tag>` – generate SDK publishing notes
+  - `cargo release-notes --version <sdk-version>` – generate SDK publishing notes
 
 ## Building and Testing
 

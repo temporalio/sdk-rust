@@ -430,33 +430,24 @@ pub fn published_release_notes(
     from: Option<&str>,
     to: &str,
 ) -> Result<String> {
-    relative(changelog)?;
-    let section = release_section(&read(&repo.join(changelog))?, version)?;
+    let mut notes = published_changelog_release_notes(repo, changelog, version)?;
     let (core, old, new) = core_range(repo, submodule, version, from, to)?;
     let commits = range::commit_notes(&core, &old, &new)?;
-    Ok(format_release_notes(&section, &commits, "SDK Core Commits"))
-}
-
-pub fn published_repository_release_notes(
-    repo: &Path,
-    changelog: &Path,
-    version: &str,
-    from: &str,
-    to: &str,
-) -> Result<String> {
-    relative(changelog)?;
-    let section = release_section(&read(&repo.join(changelog))?, version)?;
-    let commits = range::commit_notes(repo, from, to)?;
-    Ok(format_release_notes(&section, &commits, "Commits"))
-}
-
-fn format_release_notes(section: &str, commits: &[String], heading: &str) -> String {
-    let mut notes = format!("## Notable Changes\n\n{section}");
     if !commits.is_empty() {
         if !notes.ends_with("\n\n") {
             notes.push('\n');
         }
-        notes.push_str(&format!("### {heading}\n\n{}\n", commits.join("\n")));
+        notes.push_str(&format!("### SDK Core Commits\n\n{}\n", commits.join("\n")));
     }
-    notes
+    Ok(notes)
+}
+
+pub fn published_changelog_release_notes(
+    repo: &Path,
+    changelog: &Path,
+    version: &str,
+) -> Result<String> {
+    relative(changelog)?;
+    let section = release_section(&read(&repo.join(changelog))?, version)?;
+    Ok(format!("## Notable Changes\n\n{section}"))
 }

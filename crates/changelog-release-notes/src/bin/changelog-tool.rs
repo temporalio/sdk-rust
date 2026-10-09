@@ -2,8 +2,8 @@
 
 use anyhow::{Context, Result};
 use changelog_release_notes::{
-    ReleaseOptions, check_fragments, core_notes, prepare_release, published_release_notes,
-    published_repository_release_notes, release_section, update_core,
+    ReleaseOptions, check_fragments, core_notes, prepare_release,
+    published_changelog_release_notes, published_release_notes, release_section, update_core,
 };
 use chrono::NaiveDate;
 use clap::{Parser, Subcommand};
@@ -31,7 +31,7 @@ enum Command {
         #[arg(long, default_value = "changelog")]
         fragments: PathBuf,
     },
-    #[command(about = "Generate complete release notes from the SDK changelog and Git commits")]
+    #[command(about = "Generate publishing notes from the changelog and optional Core commits")]
     ReleaseNotes {
         #[arg(long)]
         submodule: Option<PathBuf>,
@@ -39,9 +39,9 @@ enum Command {
         version: String,
         #[arg(long, default_value = "CHANGELOG.md")]
         changelog: PathBuf,
-        #[arg(long, required_unless_present = "submodule")]
+        #[arg(long, requires = "submodule")]
         from: Option<String>,
-        #[arg(long, default_value = "HEAD")]
+        #[arg(long, default_value = "HEAD", requires = "submodule")]
         to: String,
         #[arg(long)]
         output: Option<PathBuf>,
@@ -127,14 +127,7 @@ fn main() -> Result<()> {
                     from.as_deref(),
                     &to,
                 )?,
-                None => published_repository_release_notes(
-                    &repo,
-                    &changelog,
-                    &version,
-                    from.as_deref()
-                        .context("--from is required without --submodule")?,
-                    &to,
-                )?,
+                None => published_changelog_release_notes(&repo, &changelog, &version)?,
             };
             match output {
                 Some(path) => fs::write(repo.join(path), notes)?,
