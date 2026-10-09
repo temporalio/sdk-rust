@@ -1,16 +1,18 @@
 use crate::common::{
-    INTEG_CLIENT_IDENTITY, INTEG_CLIENT_NAME, INTEG_CLIENT_VERSION, NAMESPACE, rand_6_chars,
+    INTEG_CLIENT_IDENTITY, INTEG_CLIENT_NAME, INTEG_CLIENT_VERSION, NAMESPACE,
+    activity_functions::StdActivities, rand_6_chars,
 };
 use futures_util::{TryStreamExt, stream};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use temporalio_client::{
-    Connection, ConnectionOptions, WorkflowStartOptions,
+    Client, ClientOptions, Connection, ConnectionOptions, WorkflowStartOptions,
     grpc::{TestService, WorkflowService},
 };
 use temporalio_common::protos::temporal::api::workflowservice::v1::DescribeNamespaceRequest;
 use temporalio_macros::{workflow, workflow_methods};
 use temporalio_sdk::{
-    Runtime, Worker, WorkerOptions, WorkflowContext, WorkflowResult,
+    ActivityOptions, Runtime, Worker, WorkerOptions, WorkerRunError, WorkflowContext,
+    WorkflowResult,
     testing::{LocalWorkflowEnvironmentOptions, WorkflowEnvironment},
 };
 use temporalio_sdk_core::ephemeral_server::{
@@ -32,35 +34,81 @@ impl TestEnvironmentWorkflow {
     }
 }
 
+#[workflow]
+#[derive(Default)]
+struct RunUntilWorkflow;
+
+#[workflow_methods]
+impl RunUntilWorkflow {
+    #[run]
+    async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<()> {
+        ctx.execute_activity(
+            StdActivities::no_op,
+            (),
+            ActivityOptions::start_to_close_timeout(Duration::from_secs(10)),
+        )
+        .await?;
+        Ok(())
+    }
+}
+
 #[temporalio_macros::cloud_test_exclusion(crate::CloudTestExclusionReason::RequiresLocalServer)]
+#[rstest::rstest]
+#[case::workflow_completed(false)]
+#[case::validation_failed(true)]
 #[tokio::test]
-async fn test_workflow_environment_local() {
+async fn test_workflow_environment_local(#[case] invalid_namespace: bool) {
     let env = WorkflowEnvironment::start_local(LocalWorkflowEnvironmentOptions::default())
         .await
         .unwrap();
     let runtime = Runtime::from_current_tokio(Default::default()).unwrap();
-    let worker_options = WorkerOptions::new(format!("test-env-{}", rand_6_chars()))
-        .register_workflow::<TestEnvironmentWorkflow>()
+    let client = if invalid_namespace {
+        Client::new(
+            env.client().connection().clone(),
+            ClientOptions::new(format!("missing-{}", rand_6_chars())).build(),
+        )
         .unwrap()
+    } else {
+        env.client().clone()
+    };
+    let worker_options = WorkerOptions::new(format!("test-env-{}", rand_6_chars()))
+        .register_workflow::<RunUntilWorkflow>()
+        .unwrap()
+        .register_activities(StdActivities)
         .build();
     let task_queue = worker_options.task_queue.clone();
-    let mut worker = Worker::new(&runtime, env.client().clone(), worker_options).unwrap();
-    let shutdown = worker.shutdown_handle();
-    let handle = env
-        .client()
-        .start_workflow(
-            TestEnvironmentWorkflow::run,
-            (),
-            WorkflowStartOptions::new(task_queue, format!("test-env-{}", rand_6_chars())).build(),
-        )
-        .await
-        .unwrap();
+    let worker = Worker::new(&runtime, client.clone(), worker_options).unwrap();
+    let worker_instance_key = worker.worker_instance_key();
+    let shutdown_handle = worker.shutdown_handle();
+    if invalid_namespace {
+        let result = worker.run_until(std::future::pending::<()>()).await;
+        assert!(matches!(result, Err(WorkerRunError::Validation(_))));
+    } else {
+        let handle = client
+            .start_workflow(
+                RunUntilWorkflow::run,
+                (),
+                WorkflowStartOptions::new(task_queue, format!("test-env-{}", rand_6_chars()))
+                    .build(),
+            )
+            .await
+            .unwrap();
 
-    let (worker_result, ()) = tokio::join!(worker.run(), async move {
-        handle.get_result(Default::default()).await.unwrap();
-        shutdown();
-    });
-    worker_result.unwrap();
+        worker
+            .run_until(async move {
+                handle.get_result(Default::default()).await.unwrap();
+            })
+            .await
+            .unwrap();
+    }
+    shutdown_handle();
+    let unregister_error = client
+        .connection()
+        .workers()
+        .finalize_unregister(worker_instance_key)
+        .err()
+        .expect("run_until should already have unregistered the worker");
+    assert!(unregister_error.to_string().contains("Worker not found"));
     env.shutdown().await.unwrap();
 }
 
