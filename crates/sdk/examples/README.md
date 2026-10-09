@@ -27,6 +27,10 @@ cargo run --features examples --example hello-world-starter
 
 See each example's README for details and expected output.
 
+Workers use `Worker::run_until_signal()` to shut down gracefully on Ctrl-C (SIGINT) or Unix SIGTERM.
+Shutdown waits for outstanding activities; configure `WorkerOptions::graceful_shutdown_period`
+to request cancellation after a grace period.
+
 ## Examples
 
 - [Hello World](hello_world/) — Basic workflow that calls a single activity

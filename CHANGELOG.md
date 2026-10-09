@@ -33,6 +33,10 @@ relevant information.
 
 ## Unreleased
 
+### Added
+* `Worker::run_until_signal()` gracefully shuts down on Ctrl-C or Unix SIGTERM, using the
+  configured activity shutdown grace period. Worker examples now use this signal handling.
+
 ## [1.1.0] - 2026-10-06
 
 ### Added

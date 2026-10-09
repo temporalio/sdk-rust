@@ -97,10 +97,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .register_workflow::<GreetingWorkflow>()?
         .build();
 
-    Worker::new(&runtime, client, worker_options)?.run().await?;
+    Worker::new(&runtime, client, worker_options)?.run_until_signal().await?;
     Ok(())
 }
 ```
+
+`run_until_signal()` initiates graceful worker shutdown on Ctrl-C (SIGINT) or Unix SIGTERM and
+waits for the worker to finish. Set `WorkerOptions::graceful_shutdown_period` to give activities
+time to finish before requesting cancellation. Applications that manage their own signals can
+use `run()` and `shutdown_handle()` instead. Tokio's process-wide signal handlers remain installed
+after `run_until_signal()` returns; see its API documentation for signal and cancellation behavior.
 
 ### Testing
 

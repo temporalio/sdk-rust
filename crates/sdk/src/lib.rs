@@ -52,7 +52,7 @@
 //!         .build();
 //!
 //!     let mut worker = Worker::new(&runtime, client, worker_options)?;
-//!     worker.run().await?;
+//!     worker.run_until_signal().await?;
 //!
 //!     Ok(())
 //! }
@@ -1038,6 +1038,7 @@ impl Worker {
 
     /// Runs the worker. Eventually resolves after the worker has been explicitly shut down,
     /// or may return early with an error in the event of some unresolvable problem.
+    /// Use [`Worker::run_until_signal`] to initiate graceful shutdown on process shutdown signals.
     pub async fn run(&mut self) -> Result<(), WorkerRunError> {
         let interceptors = self.common.worker_interceptors.clone();
         interceptors::call_run_worker(
@@ -1050,6 +1051,52 @@ impl Worker {
             ),
         )
         .await
+    }
+
+    /// Runs the worker until Ctrl-C (SIGINT) or, on Unix, SIGTERM initiates graceful shutdown.
+    ///
+    /// Uses the same shutdown path as [`Worker::shutdown_handle`] and waits for [`Worker::run`]
+    /// to finish, respecting [`WorkerOptions::graceful_shutdown_period`]. Explicit shutdown and
+    /// worker errors can also end the run before a signal arrives.
+    ///
+    /// Signal listeners are registered before running the worker and dropped when this method
+    /// returns or its future is dropped. Tokio's underlying process-wide signal handlers remain
+    /// installed, so the signals' default process-termination behavior is not restored. Use
+    /// [`Worker::run`] with [`Worker::shutdown_handle`] to manage signals in the application instead.
+    /// Dropping this future does not initiate graceful shutdown, just as with [`Worker::run`].
+    #[cfg(any(unix, windows))]
+    pub async fn run_until_signal(&mut self) -> Result<(), WorkerRunError> {
+        #[cfg(unix)]
+        let mut interrupt =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
+                .map_err(WorkerRunError::ShutdownSignal)?;
+        #[cfg(unix)]
+        let mut terminate =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                .map_err(WorkerRunError::ShutdownSignal)?;
+        #[cfg(windows)]
+        let mut interrupt =
+            tokio::signal::windows::ctrl_c().map_err(WorkerRunError::ShutdownSignal)?;
+
+        let shutdown_signal = async {
+            #[cfg(unix)]
+            tokio::select! {
+                _ = interrupt.recv() => {},
+                _ = terminate.recv() => {},
+            }
+            #[cfg(windows)]
+            interrupt.recv().await;
+        };
+        let shutdown_handle = self.shutdown_handle();
+        let run = self.run();
+        tokio::pin!(run);
+        tokio::select! {
+            result = &mut run => result,
+            _ = shutdown_signal => {
+                shutdown_handle();
+                run.await
+            }
+        }
     }
 
     pub(crate) async fn run_inner(&mut self) -> Result<(), WorkerRunError> {
