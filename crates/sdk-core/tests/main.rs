@@ -37,6 +37,8 @@ mod integ_tests {
     mod update_tests;
     mod visibility_tests;
     mod worker_heartbeat_tests;
+    #[cfg(unix)]
+    mod worker_signal_tests;
     mod worker_tests;
     mod worker_versioning_tests;
     mod workflow_client_tests;

@@ -67,6 +67,9 @@ pub enum WorkerCreateError {
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum WorkerRunError {
+    /// An operating-system shutdown signal handler could not be registered.
+    #[error("failed to register worker shutdown signal handler: {0}")]
+    ShutdownSignal(#[source] std::io::Error),
     /// Worker validation failed before polling began.
     #[error("worker validation failed: {0}")]
     Validation(#[source] WorkerValidationError),

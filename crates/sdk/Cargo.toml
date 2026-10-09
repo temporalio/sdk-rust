@@ -39,6 +39,7 @@ tokio = { version = "1.47", default-features = false, features = [
   "time",
   "fs",
   "macros",
+  "signal",
 ] }
 tokio-util = { version = "0.7" }
 tokio-stream = { version = "0.1", default-features = false }

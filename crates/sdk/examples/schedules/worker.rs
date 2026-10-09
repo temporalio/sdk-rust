@@ -20,7 +20,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .build();
 
     let mut worker = Worker::new(&runtime, client, worker_options)?;
-    worker.run().await?;
+    worker.run_until_signal().await?;
 
     Ok(())
 }

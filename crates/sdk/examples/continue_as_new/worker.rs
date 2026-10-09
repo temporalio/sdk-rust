@@ -20,7 +20,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut worker = Worker::new(&runtime, client, worker_options)?;
     println!("Worker started on task queue: continue-as-new");
-    worker.run().await?;
+    worker.run_until_signal().await?;
 
     Ok(())
 }
