@@ -427,6 +427,10 @@ impl ManagedRun {
         is_forced_failure: bool,
     ) -> Result<RunUpdateAct, Box<NextPageReq>> {
         let activation_was_only_eviction = self.activation_is_eviction();
+        if activation_was_only_eviction && !commands.is_empty() {
+            dbg_panic!("Reply to an eviction included commands");
+            commands.clear();
+        }
         let (task_token, has_pending_query, start_time) = if let Some(entry) = self.wft.as_ref() {
             (
                 entry.info.task_token.clone(),
@@ -488,10 +492,6 @@ impl ManagedRun {
             Ok(None)
         } else {
             let (commands, query_responses) = self.preprocess_command_sequence(commands);
-
-            if activation_was_only_eviction && !commands.is_empty() {
-                dbg_panic!("Reply to an eviction included commands");
-            }
 
             let rac = RunActivationCompletion {
                 task_token,
@@ -1233,9 +1233,10 @@ impl ManagedRun {
         }
 
         let outcome = if should_respond || has_query_responses {
-            // If we broke there could be commands or messages in the pipe that we didn't
-            // get a chance to handle properly during replay. Don't send them.
+            // Broken evictions cannot pass should_respond or contain query responses. Keep this
+            // fallback to avoid sending buffered output if those invariants regress.
             let (commands, messages) = if self.am_broken && data.activation_was_eviction {
+                dbg_panic!("Attempted to report a successful completion for a broken evicted run");
                 (vec![], vec![])
             } else {
                 (
