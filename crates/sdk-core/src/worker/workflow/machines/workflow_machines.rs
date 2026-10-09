@@ -1568,7 +1568,11 @@ impl WorkflowMachines {
                 WFCommandVariant::ScheduleNexusOperation(attrs) => {
                     let seq = attrs.seq;
                     self.add_cmd_to_wf_task(
-                        NexusOperationMachine::new_scheduled(attrs, annotations.clone()),
+                        NexusOperationMachine::new_scheduled(
+                            attrs,
+                            self.observed_internal_flags.clone(),
+                            annotations.clone(),
+                        ),
                         annotations,
                         CommandID::NexusOperation(seq).into(),
                     );
