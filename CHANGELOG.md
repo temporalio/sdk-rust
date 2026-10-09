@@ -38,6 +38,8 @@ relevant information.
   case rather than snake case and the binary encoding is unchanged. They previously could not be
   deserialized from the camel case that other Temporal SDKs and protobuf tools emit, and both
   spellings are now accepted.
+* Workers using a custom metrics backend now report task-slot and poller counts correctly in
+  worker heartbeats, rather than reporting zero when the backend does not expose its labels.
 
 ## [1.1.0] - 2026-10-06
 

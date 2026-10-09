@@ -127,7 +127,7 @@ pub trait CoreMeter: Send + Sync + Debug {
     fn counter_with_in_memory(
         &self,
         params: MetricParameters,
-        in_memory_counter: HeartbeatMetricType,
+        in_memory_counter: HeartbeatMetric,
     ) -> Counter {
         let primary_counter = self.counter(params);
 
@@ -148,7 +148,7 @@ pub trait CoreMeter: Send + Sync + Debug {
     fn histogram_duration_with_in_memory(
         &self,
         params: MetricParameters,
-        in_memory_hist: HeartbeatMetricType,
+        in_memory_hist: HeartbeatMetric,
     ) -> HistogramDuration {
         let primary_hist = self.histogram_duration(params);
 
@@ -161,7 +161,7 @@ pub trait CoreMeter: Send + Sync + Debug {
     fn gauge_with_in_memory(
         &self,
         params: MetricParameters,
-        in_memory_metrics: HeartbeatMetricType,
+        in_memory_metrics: HeartbeatMetric,
     ) -> Gauge {
         let primary_gauge = self.gauge(params.clone());
         Gauge::new_with_in_memory(primary_gauge.primary.metric.clone(), in_memory_metrics)
@@ -174,73 +174,8 @@ pub trait CoreMeter: Send + Sync + Debug {
     fn up_down_counter(&self, params: MetricParameters) -> UpDownCounter;
 }
 
-/// Provides a generic way to record metrics in memory.
-/// This can be done either with individual metrics or more fine-grained metrics
-/// that vary by a set of labels for the same metric.
-#[derive(Clone, Debug)]
-pub enum HeartbeatMetricType {
-    /// A single counter shared across all label values.
-    Individual(Arc<AtomicU64>),
-    /// Per-label-value counters, keyed by a specific label.
-    WithLabel {
-        /// The label key to match against metric attributes.
-        label_key: String,
-        /// Map from label value to its atomic counter.
-        metrics: HashMap<String, Arc<AtomicU64>>,
-    },
-}
-
-impl HeartbeatMetricType {
-    fn record_counter(&self, delta: u64) {
-        match self {
-            HeartbeatMetricType::Individual(metric) => {
-                metric.fetch_add(delta, Ordering::Relaxed);
-            }
-            HeartbeatMetricType::WithLabel { .. } => {
-                dbg_panic!("Counter does not support in-memory metric with labels");
-            }
-        }
-    }
-
-    fn record_histogram_observation(&self) {
-        match self {
-            HeartbeatMetricType::Individual(metric) => {
-                metric.fetch_add(1, Ordering::Relaxed);
-            }
-            HeartbeatMetricType::WithLabel { .. } => {
-                dbg_panic!("Histogram does not support in-memory metric with labels");
-            }
-        }
-    }
-
-    fn record_gauge(&self, value: u64, attributes: &MetricAttributes) {
-        match self {
-            HeartbeatMetricType::Individual(metric) => {
-                metric.store(value, Ordering::Relaxed);
-            }
-            HeartbeatMetricType::WithLabel { label_key, metrics } => {
-                if let Some(metric) = label_value_from_attributes(attributes, label_key.as_str())
-                    .and_then(|label_value| metrics.get(label_value.as_str()))
-                {
-                    metric.store(value, Ordering::Relaxed)
-                }
-            }
-        }
-    }
-}
-
-fn label_value_from_attributes(attributes: &MetricAttributes, key: &str) -> Option<String> {
-    match attributes {
-        MetricAttributes::Prometheus { labels } => labels.as_prom_labels().get(key).cloned(),
-        #[cfg(feature = "otel")]
-        MetricAttributes::OTel { kvs } => kvs
-            .iter()
-            .find(|kv| kv.key.as_str() == key)
-            .map(|kv| kv.value.to_string()),
-        MetricAttributes::NoOp(labels) => labels.get(key).cloned(),
-        _ => None,
-    }
-}
+/// A shared in-memory metric value used for worker heartbeat reporting.
+pub type HeartbeatMetric = Arc<AtomicU64>;
 
 /// Parameters used when creating a new metric instrument (name, description, unit).
 #[derive(Debug, Clone, bon::Builder)]
@@ -516,7 +451,7 @@ pub type CounterImpl = LazyBoundMetric<
 #[derive(Clone)]
 pub struct Counter {
     primary: CounterImpl,
-    in_memory: Option<HeartbeatMetricType>,
+    in_memory: Option<HeartbeatMetric>,
 }
 impl Counter {
     /// Create a new counter from an attributable metric source.
@@ -534,7 +469,7 @@ impl Counter {
     /// Create a new counter with an additional in-memory tracker for heartbeat reporting.
     pub fn new_with_in_memory(
         primary: Arc<dyn MetricAttributable<Box<dyn CounterBase>> + Send + Sync>,
-        in_memory: HeartbeatMetricType,
+        in_memory: HeartbeatMetric,
     ) -> Self {
         Self {
             primary: LazyBoundMetric {
@@ -556,7 +491,7 @@ impl Counter {
         }
 
         if let Some(ref in_mem) = self.in_memory {
-            in_mem.record_counter(value);
+            in_mem.fetch_add(value, Ordering::Relaxed);
         }
     }
 
@@ -582,7 +517,7 @@ impl CounterBase for Counter {
         bound.adds(value);
 
         if let Some(ref in_mem) = self.in_memory {
-            in_mem.record_counter(value);
+            in_mem.fetch_add(value, Ordering::Relaxed);
         }
     }
 }
@@ -738,7 +673,7 @@ pub type HistogramDurationImpl = LazyBoundMetric<
 #[derive(Clone)]
 pub struct HistogramDuration {
     primary: HistogramDurationImpl,
-    in_memory: Option<HeartbeatMetricType>,
+    in_memory: Option<HeartbeatMetric>,
 }
 impl HistogramDuration {
     /// Create a new duration histogram from an attributable metric source.
@@ -757,7 +692,7 @@ impl HistogramDuration {
     /// Create a new duration histogram with an additional in-memory tracker for heartbeat reporting.
     pub fn new_with_in_memory(
         primary: Arc<dyn MetricAttributable<Box<dyn HistogramDurationBase>> + Send + Sync>,
-        in_memory: HeartbeatMetricType,
+        in_memory: HeartbeatMetric,
     ) -> Self {
         Self {
             primary: LazyBoundMetric {
@@ -780,7 +715,7 @@ impl HistogramDuration {
         }
 
         if let Some(ref in_mem) = self.in_memory {
-            in_mem.record_histogram_observation();
+            in_mem.fetch_add(1, Ordering::Relaxed);
         }
     }
 
@@ -804,7 +739,7 @@ impl HistogramDurationBase for HistogramDuration {
         bound.records(value);
 
         if let Some(ref in_mem) = self.in_memory {
-            in_mem.record_histogram_observation();
+            in_mem.fetch_add(1, Ordering::Relaxed);
         }
     }
 }
@@ -842,7 +777,7 @@ pub type GaugeImpl = LazyBoundMetric<
 #[derive(Clone)]
 pub struct Gauge {
     primary: GaugeImpl,
-    in_memory: Option<HeartbeatMetricType>,
+    in_memory: Option<HeartbeatMetric>,
 }
 impl Gauge {
     /// Create a new gauge from an attributable metric source.
@@ -860,7 +795,7 @@ impl Gauge {
     /// Create a new gauge with an additional in-memory tracker for heartbeat reporting.
     pub fn new_with_in_memory(
         primary: Arc<dyn MetricAttributable<Box<dyn GaugeBase>> + Send + Sync>,
-        in_memory: HeartbeatMetricType,
+        in_memory: HeartbeatMetric,
     ) -> Self {
         Self {
             primary: LazyBoundMetric {
@@ -870,6 +805,12 @@ impl Gauge {
             },
             in_memory: Some(in_memory),
         }
+    }
+
+    /// Select the heartbeat count to update when this gauge records a value.
+    /// Other clones keep their existing counts.
+    pub fn set_in_memory(&mut self, metric: HeartbeatMetric) {
+        self.in_memory = Some(metric);
     }
 
     /// Record a `u64` gauge value with the given attributes.
@@ -882,7 +823,7 @@ impl Gauge {
         }
 
         if let Some(ref in_mem) = self.in_memory {
-            in_mem.record_gauge(value, attributes);
+            in_mem.store(value, Ordering::Relaxed);
         }
     }
 
@@ -906,7 +847,7 @@ impl GaugeBase for Gauge {
         bound.records(value);
 
         if let Some(ref in_mem) = self.in_memory {
-            in_mem.record_gauge(value, &self.primary.attributes);
+            in_mem.store(value, Ordering::Relaxed);
         }
     }
 }
@@ -1156,41 +1097,56 @@ impl_no_op!(GaugeBase, u64);
 impl_no_op!(GaugeF64Base, f64);
 impl_no_op!(UpDownCounterBase, signed);
 
-#[cfg(test)]
+#[cfg(all(test, feature = "core-telemetry-bridge"))]
 mod tests {
     use super::*;
-    use std::{
-        collections::HashMap,
-        sync::{
-            Arc,
-            atomic::{AtomicU64, Ordering},
-        },
+    use std::sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
     };
 
+    #[derive(Debug)]
+    struct OpaqueAttributes;
+
+    impl core::CustomMetricAttributes for OpaqueAttributes {
+        fn as_any(self: Arc<Self>) -> Arc<dyn std::any::Any + Send + Sync> {
+            self
+        }
+    }
+
     #[test]
-    fn in_memory_attributes_provide_label_values() {
-        let meter = NoOpCoreMeter;
-        let base_attrs = meter.new_attributes(NewAttributes::default());
-        let attrs = meter.extend_attributes(
-            base_attrs,
-            NewAttributes::from(vec![MetricKeyValue::new("poller_type", "workflow_task")]),
-        );
+    fn gauge_clones_update_independent_heartbeat_counts() {
+        let attributes = MetricAttributes::Dynamic(Arc::new(OpaqueAttributes));
+        let original_value = Arc::new(AtomicU64::new(0));
+        let other_value = Arc::new(AtomicU64::new(0));
+        let original = Gauge::new_with_in_memory(Arc::new(NoOpInstrument), original_value.clone());
+        original.records(1);
+        let mut cloned = original.clone();
+        cloned.set_in_memory(other_value.clone());
+        let mut attributed = original.with_attributes(&attributes).unwrap();
+        attributed.set_in_memory(other_value.clone());
 
-        let value = Arc::new(AtomicU64::new(0));
-        let mut metrics = HashMap::new();
-        metrics.insert("workflow_task".to_string(), value.clone());
-        let heartbeat_metric = HeartbeatMetricType::WithLabel {
-            label_key: "poller_type".to_string(),
-            metrics,
-        };
+        cloned.records(2);
+        assert_eq!(original_value.load(Ordering::Relaxed), 1);
+        assert_eq!(other_value.load(Ordering::Relaxed), 2);
 
-        heartbeat_metric.record_gauge(3, &attrs);
+        original.records(3);
+        assert_eq!(original_value.load(Ordering::Relaxed), 3);
+        assert_eq!(other_value.load(Ordering::Relaxed), 2);
 
-        assert_eq!(value.load(Ordering::Relaxed), 3);
-        assert_eq!(
-            label_value_from_attributes(&attrs, "poller_type").as_deref(),
-            Some("workflow_task")
-        );
+        attributed.record(4, &attributes);
+        assert_eq!(original_value.load(Ordering::Relaxed), 3);
+        assert_eq!(other_value.load(Ordering::Relaxed), 4);
+
+        cloned.records(5);
+        assert_eq!(other_value.load(Ordering::Relaxed), 5);
+        cloned.record(6, &attributes);
+        assert_eq!(original_value.load(Ordering::Relaxed), 3);
+        assert_eq!(other_value.load(Ordering::Relaxed), 6);
+
+        attributed.records(7);
+        assert_eq!(original_value.load(Ordering::Relaxed), 3);
+        assert_eq!(other_value.load(Ordering::Relaxed), 7);
     }
 }
 

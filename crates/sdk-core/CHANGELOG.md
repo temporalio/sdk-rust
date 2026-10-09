@@ -33,6 +33,11 @@ relevant information.
 
 ## Unreleased
 
+### Fixed
+* Worker heartbeats now report correct task-slot and poller counts when using buffered or custom
+  metrics backends, including the Python SDK's `MetricBuffer`. Previously these counts could
+  remain `0` because heartbeat accounting depended on reading labels from backend-owned attributes.
+
 ## [0.10.0] - 2026-10-06
 
 ### Added
