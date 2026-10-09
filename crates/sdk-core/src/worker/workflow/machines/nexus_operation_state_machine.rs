@@ -1,11 +1,14 @@
 use super::{MachineError, StateMachine, TransitionResult, fsm};
-use crate::worker::workflow::{
-    WFMachinesError,
-    machines::{
-        EventInfo, HistEventData, NewMachineWithCommand, OnEventWrapper, WFMachinesAdapter,
-        workflow_machines::MachineResponse,
+use crate::{
+    internal_flags::CoreInternalFlags,
+    worker::workflow::{
+        InternalFlagsRef, WFMachinesError,
+        machines::{
+            EventInfo, HistEventData, NewMachineWithCommand, OnEventWrapper, WFMachinesAdapter,
+            workflow_machines::MachineResponse,
+        },
+        nondeterminism,
     },
-    nondeterminism,
 };
 use itertools::Itertools;
 use temporalio_common::protos::{
@@ -124,6 +127,7 @@ pub(super) struct SharedState {
     endpoint: String,
     service: String,
     operation: String,
+    internal_flags: InternalFlagsRef,
 
     cancelled_before_sent: bool,
     cancel_sent: bool,
@@ -132,7 +136,10 @@ pub(super) struct SharedState {
 }
 
 impl NexusOperationMachine {
-    pub(super) fn new_scheduled(attribs: ScheduleNexusOperation) -> NewMachineWithCommand {
+    pub(super) fn new_scheduled(
+        attribs: ScheduleNexusOperation,
+        internal_flags: InternalFlagsRef,
+    ) -> NewMachineWithCommand {
         let s = Self::from_parts(
             ScheduleCommandCreated.into(),
             SharedState {
@@ -141,6 +148,7 @@ impl NexusOperationMachine {
                 endpoint: attribs.endpoint.clone(),
                 service: attribs.service.clone(),
                 operation: attribs.operation.clone(),
+                internal_flags,
                 cancelled_before_sent: false,
                 cancel_sent: false,
                 cancel_type: attribs.cancellation_type(),
@@ -174,6 +182,9 @@ pub(super) struct ScheduleCommandCreated;
 
 pub(super) struct NexusOpScheduledData {
     event_id: i64,
+    service: String,
+    operation: String,
+    last_task_in_history: bool,
 }
 
 impl ScheduleCommandCreated {
@@ -182,6 +193,25 @@ impl ScheduleCommandCreated {
         state: &mut SharedState,
         event_dat: NexusOpScheduledData,
     ) -> NexusOperationMachineTransition<ScheduledEventRecorded> {
+        if state.internal_flags.borrow_mut().try_use(
+            CoreInternalFlags::NexusOperationDeterminismChecks,
+            event_dat.last_task_in_history,
+        ) {
+            if event_dat.service != state.service {
+                return TransitionResult::Err(nondeterminism!(
+                    "Nexus operation service of scheduled event '{}' does not match service of command '{}'",
+                    event_dat.service,
+                    state.service
+                ));
+            }
+            if event_dat.operation != state.operation {
+                return TransitionResult::Err(nondeterminism!(
+                    "Nexus operation of scheduled event '{}' does not match operation of command '{}'",
+                    event_dat.operation,
+                    state.operation
+                ));
+            }
+        }
         state.scheduled_event_id = event_dat.event_id;
         NexusOperationMachineTransition::default()
     }
@@ -445,14 +475,19 @@ impl TryFrom<HistEventData> for NexusOperationMachineEvents {
     type Error = WFMachinesError;
 
     fn try_from(e: HistEventData) -> Result<Self, Self::Error> {
+        let last_task_in_history = e.current_task_is_last_in_history;
         let e = e.event;
         Ok(match EventType::try_from(e.event_type) {
             Ok(EventType::NexusOperationScheduled) => {
-                if let Some(history_event::Attributes::NexusOperationScheduledEventAttributes(_)) =
-                    e.attributes
+                if let Some(history_event::Attributes::NexusOperationScheduledEventAttributes(
+                    attrs,
+                )) = e.attributes
                 {
                     Self::NexusOperationScheduled(NexusOpScheduledData {
                         event_id: e.event_id,
+                        service: attrs.service,
+                        operation: attrs.operation,
+                        last_task_in_history,
                     })
                 } else {
                     return Err(nondeterminism!(
@@ -714,5 +749,99 @@ impl SharedState {
             )),
             ..Default::default()
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        internal_flags::InternalFlags,
+        worker::workflow::machines::{Machines, TemporalStateMachine},
+    };
+    use std::{cell::RefCell, rc::Rc};
+    use temporalio_common::protos::temporal::api::{
+        enums::v1::EventType,
+        history::v1::{HistoryEvent, NexusOperationScheduledEventAttributes, history_event},
+        workflowservice::v1::get_system_info_response::Capabilities,
+    };
+
+    fn apply_scheduled_event(
+        service: &str,
+        operation: &str,
+        current_task_is_last_in_history: bool,
+    ) -> Result<Vec<MachineResponse>, WFMachinesError> {
+        let internal_flags = Rc::new(RefCell::new(InternalFlags::new(
+            &Capabilities {
+                sdk_metadata: true,
+                ..Default::default()
+            },
+            "sdk".to_owned(),
+            "version".to_owned(),
+        )));
+        let new_machine = NexusOperationMachine::new_scheduled(
+            ScheduleNexusOperation {
+                service: "service".to_owned(),
+                operation: "operation".to_owned(),
+                ..Default::default()
+            },
+            internal_flags,
+        );
+        let mut machine = match new_machine.machine {
+            Machines::NexusOperationMachine(machine) => machine,
+            _ => panic!("wrong machine type"),
+        };
+
+        machine.handle_event(HistEventData {
+            event: HistoryEvent {
+                event_id: 1,
+                event_type: EventType::NexusOperationScheduled as i32,
+                attributes: Some(
+                    history_event::Attributes::NexusOperationScheduledEventAttributes(
+                        NexusOperationScheduledEventAttributes {
+                            service: service.to_owned(),
+                            operation: operation.to_owned(),
+                            ..Default::default()
+                        },
+                    ),
+                ),
+                ..Default::default()
+            },
+            replaying: true,
+            current_task_is_last_in_history,
+        })
+    }
+
+    #[test]
+    fn matching_service_and_operation_are_deterministic() {
+        assert!(apply_scheduled_event("service", "operation", true).is_ok());
+    }
+
+    #[test]
+    fn service_mismatch_is_nondeterministic() {
+        let result = apply_scheduled_event("other-service", "operation", true);
+
+        assert!(matches!(
+            result,
+            Err(WFMachinesError::Nondeterminism(message))
+                if message.contains("Nexus operation service") && message.contains("does not match")
+        ));
+    }
+
+    #[test]
+    fn operation_mismatch_is_nondeterministic() {
+        let result = apply_scheduled_event("service", "other-operation", true);
+
+        assert!(matches!(
+            result,
+            Err(WFMachinesError::Nondeterminism(message))
+                if message.contains("Nexus operation of scheduled event")
+                    && message.contains("does not match")
+        ));
+    }
+
+    #[test]
+    fn mismatch_is_allowed_before_determinism_flag_is_recorded() {
+        assert!(apply_scheduled_event("other-service", "other-operation", false).is_ok());
     }
 }
