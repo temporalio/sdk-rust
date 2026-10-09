@@ -34,6 +34,7 @@ prometheus = [
   "dep:tokio",
 ]
 envconfig = ["dep:toml", "dep:dirs"]
+experimental = ["temporalio-common-wasm/experimental"]
 serde_serialize = ["temporalio-common-wasm/serde_serialize", "temporalio-protos/serde_serialize"]
 core-telemetry-bridge = ["dep:ringbuf", "dep:futures-channel"]
 core-based-sdk = ["core-telemetry-bridge", "prometheus", "envconfig"]
