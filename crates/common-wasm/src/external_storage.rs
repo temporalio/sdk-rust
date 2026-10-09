@@ -160,6 +160,10 @@ pub enum ExternalStorageError {
 
 /// Configuration for offloading large payloads to an external storage system.
 ///
+/// This and the driver and selector traits it holds are defined in this crate only so that it can
+/// be configured on a [`DataConverter`](crate::data_converters::DataConverter). Drivers are
+/// implemented and invoked outside of WASM, by the worker and client, never from workflow code.
+///
 /// Validated when constructed rather than when used, so a misconfiguration surfaces at startup
 /// instead of on the first payload large enough to offload.
 #[derive(Clone)]
