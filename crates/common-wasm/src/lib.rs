@@ -12,6 +12,9 @@ use std::time::Duration;
 mod activity_definition;
 pub mod data_converters;
 pub mod error;
+#[cfg(feature = "experimental")]
+#[doc(hidden)]
+pub mod external_storage;
 mod memo;
 mod priority;
 mod retry_policy;

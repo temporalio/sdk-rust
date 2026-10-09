@@ -14,6 +14,7 @@ categories = ["development-tools"]
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [features]
+experimental = []
 serde_serialize = ["temporalio-protos/serde_serialize"]
 grpc-clients = ["temporalio-protos/grpc-clients"]
 
