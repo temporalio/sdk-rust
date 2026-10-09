@@ -16,6 +16,7 @@ use crate::{
         PollerBehavior, SlotMarkUsedContext, SlotReleaseContext, SlotReservationContext,
         SlotSupplier, SlotSupplierPermit, TunerBuilder, WorkflowSlotKind,
         client::mocks::{mock_manual_worker_client, mock_worker_client},
+        parse_wft_chunking_v2_opt_in,
     },
 };
 use futures_util::{FutureExt, stream};
@@ -2482,6 +2483,20 @@ async fn ensure_fetching_fail_during_complete_sends_task_failure() {
         .await
         .unwrap();
 
+    let wf_task = core.poll_workflow_activation().await.unwrap();
+    assert_matches!(
+        wf_task.jobs.as_slice(),
+        [WorkflowActivationJob {
+            variant: Some(workflow_activation_job::Variant::SignalWorkflow(_)),
+        }]
+    );
+    core.complete_workflow_activation(WorkflowActivationCompletion::from_cmd(
+        wf_task.run_id,
+        start_timer_cmd(1, Duration::from_secs(1)),
+    ))
+    .await
+    .unwrap();
+
     // Expect to see eviction b/c of history fetching error here.
     let wf_task = core.poll_workflow_activation().await.unwrap();
     assert_matches!(
@@ -2611,15 +2626,23 @@ async fn core_internal_flags() {
         mock_worker_client(),
     );
     mh.completion_mock_fn = Some(Box::new(move |c| {
+        let mut expected: HashSet<_> = CoreInternalFlags::all_cumulative_default_enabled()
+            .map(|f| f as u32)
+            .collect();
+        if parse_wft_chunking_v2_opt_in(
+            std::env::var("TEMPORAL_USE_WFT_CHUNKING_V2")
+                .ok()
+                .as_deref(),
+        ) {
+            expected.insert(CoreInternalFlags::WftChunkingV2 as u32);
+        }
         assert_eq!(
             c.sdk_metadata
                 .core_used_flags
                 .iter()
                 .copied()
                 .collect::<HashSet<_>>(),
-            CoreInternalFlags::all_except_too_high()
-                .map(|f| f as u32)
-                .collect()
+            expected
         );
         Ok(Default::default())
     }));
@@ -3501,4 +3524,58 @@ async fn cached_run_fetch_failure_doesnt_spam_task_fails() {
         ),
         2
     );
+}
+
+#[tokio::test]
+async fn unknown_first_completion_flag_fails_polled_task() {
+    let mut t = TestHistoryBuilder::default();
+    t.add_by_type(EventType::WorkflowExecutionStarted);
+    t.add_full_wf_task();
+    t.add_workflow_task_scheduled_and_started();
+    t.modify_event(4, |event| {
+        let Some(history_event::Attributes::WorkflowTaskCompletedEventAttributes(attrs)) =
+            event.attributes.as_mut()
+        else {
+            panic!("event 4 must be WorkflowTaskCompleted");
+        };
+        attrs
+            .sdk_metadata
+            .get_or_insert_default()
+            .core_used_flags
+            .push(1_000_000);
+    });
+    let mut mh = MockPollCfg::from_resp_batches(
+        "unknown-chunker",
+        t,
+        [ResponseType::AllHistory, ResponseType::AllHistory],
+        mock_worker_client(),
+    );
+    mh.num_expected_completions = Some(TimesRange::from(0));
+    mh.num_expected_fails = 2;
+    mh.expect_fail_wft_matcher = Box::new(|_, cause, failure| {
+        *cause == WorkflowTaskFailedCause::NonDeterministicError
+            && failure.as_ref().is_some_and(|failure| {
+                failure.message.contains("1000000") && failure.message.contains("event 4")
+            })
+    });
+    let worker = mock_worker(build_mock_pollers(mh));
+
+    for _ in 0..2 {
+        let activation = worker.poll_workflow_activation().await.unwrap();
+        assert_matches!(
+            activation.jobs.as_slice(),
+            [WorkflowActivationJob {
+                variant: Some(workflow_activation_job::Variant::RemoveFromCache(eviction)),
+            }] if eviction.message.contains("Unknown Core flag 1000000")
+        );
+        worker
+            .complete_workflow_activation(WorkflowActivationCompletion::empty(activation.run_id))
+            .await
+            .unwrap();
+    }
+    assert_matches!(
+        worker.poll_workflow_activation().await,
+        Err(PollError::ShutDown)
+    );
+    worker.shutdown().await;
 }

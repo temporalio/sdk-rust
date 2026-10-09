@@ -47,6 +47,10 @@ relevant information.
   namespaces from other start failures.
 
 ### Fixed
+* Workers can opt in to corrected Workflow Task chunking with `TEMPORAL_USE_WFT_CHUNKING_V2=true`.
+  Updates retain their execution order relative to earlier activations, even when acceptance follows
+  other commands or spans history pages. The first successful task records the choice on servers
+  supporting SDK metadata, and replay honors it independently of the worker's setting.
 * Task-poll targets no longer decrease after cancelled or timed-out polls. Affected pollers still
   retain their slot during backoff, while resource-exhaustion errors still reduce the target.
 * Replay now preserves which local activity results were delivered together for newly recorded

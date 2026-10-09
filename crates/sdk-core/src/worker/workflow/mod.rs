@@ -2,6 +2,7 @@
 //! lion's share of the complexity in Core). See the `ARCHITECTURE.md` file in the repo root for
 //! a diagram of the internals.
 
+mod chunking;
 mod driven_workflow;
 mod history_update;
 mod machines;
@@ -112,6 +113,21 @@ pub const LEGACY_QUERY_ID: &str = "legacy_query";
 /// What percentage of a WFT timeout we are willing to wait before sending a WFT heartbeat when
 /// necessary.
 const WFT_HEARTBEAT_TIMEOUT_FRACTION: f32 = 0.8;
+
+pub(crate) fn parse_wft_chunking_v2_opt_in(value: Option<&str>) -> bool {
+    value.is_some_and(|value| value.eq_ignore_ascii_case("true") || value == "1")
+}
+
+pub(super) fn chunking_v2_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        parse_wft_chunking_v2_opt_in(
+            std::env::var("TEMPORAL_USE_WFT_CHUNKING_V2")
+                .ok()
+                .as_deref(),
+        )
+    })
+}
 
 type Result<T, E = WFMachinesError> = result::Result<T, E>;
 type BoxedActivationStream = BoxStream<'static, Result<WorkflowStreamAction, PollError>>;
@@ -2108,5 +2124,14 @@ mod tests {
             ..Default::default()
         };
         prepare_to_ship_activation(&mut act);
+    }
+    #[test]
+    fn chunking_v2_opt_in_requires_explicit_truthy_value() {
+        for value in [Some("true"), Some("TRUE"), Some("1")] {
+            assert!(parse_wft_chunking_v2_opt_in(value));
+        }
+        for value in [None, Some(""), Some("false"), Some("0"), Some("yes")] {
+            assert!(!parse_wft_chunking_v2_opt_in(value));
+        }
     }
 }

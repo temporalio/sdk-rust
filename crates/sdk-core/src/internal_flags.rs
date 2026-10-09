@@ -33,6 +33,8 @@ pub enum CoreInternalFlags {
     /// if in the sequence delivered by lang they came after a terminal command.
     /// See <https://github.com/temporalio/features/issues/481>.
     MoveTerminalCommands = 3,
+    /// A run must keep its original activation boundaries when replayed by a newer worker.
+    WftChunkingV2 = 4,
     /// We received a value higher than this code can understand.
     TooHigh = u32::MAX,
 }
@@ -70,6 +72,8 @@ impl InternalFlags {
     }
 
     pub(crate) fn add_from_complete(&mut self, e: &WorkflowTaskCompletedEventAttributes) {
+        self.core_since_last_complete
+            .remove(&CoreInternalFlags::WftChunkingV2);
         if let Some(metadata) = e.sdk_metadata.as_ref() {
             self.core.extend(
                 metadata
@@ -85,6 +89,10 @@ impl InternalFlags {
                 self.last_sdk_version = metadata.sdk_version.clone();
             }
         }
+    }
+
+    pub(crate) fn can_write_metadata(&self) -> bool {
+        self.can_write_sdk_metadata
     }
 
     pub(crate) fn add_lang_used(&mut self, flags: impl IntoIterator<Item = u32>) {
@@ -113,7 +121,7 @@ impl InternalFlags {
     pub(crate) fn write_all_known(&mut self) {
         if self.can_write_sdk_metadata {
             self.core_since_last_complete
-                .extend(CoreInternalFlags::all_except_too_high());
+                .extend(CoreInternalFlags::all_cumulative_default_enabled());
         }
     }
 
@@ -136,7 +144,11 @@ impl InternalFlags {
             .filter(|f| !self.lang.contains(f))
             .copied()
             .collect();
-        self.core.extend(self.core_since_last_complete.iter());
+        self.core.extend(
+            self.core_since_last_complete
+                .iter()
+                .filter(|flag| **flag != CoreInternalFlags::WftChunkingV2),
+        );
         self.lang.extend(self.lang_since_last_complete.iter());
         let sdk_name = if self.last_sdk_name != self.sdk_name {
             self.sdk_name.clone()
@@ -170,15 +182,26 @@ impl InternalFlags {
 }
 
 impl CoreInternalFlags {
-    fn from_u32(v: u32) -> Self {
+    pub(crate) fn from_u32(v: u32) -> Self {
         match v {
             1 => Self::IdAndTypeDeterminismChecks,
             2 => Self::UpsertSearchAttributeOnPatch,
             3 => Self::MoveTerminalCommands,
+            4 => Self::WftChunkingV2,
             _ => Self::TooHigh,
         }
     }
 
+    pub(crate) fn all_cumulative_default_enabled() -> impl Iterator<Item = CoreInternalFlags> {
+        enum_iterator::all::<CoreInternalFlags>().filter(|flag| {
+            !matches!(
+                flag,
+                CoreInternalFlags::TooHigh | CoreInternalFlags::WftChunkingV2
+            )
+        })
+    }
+
+    #[cfg(test)]
     pub(crate) fn all_except_too_high() -> impl Iterator<Item = CoreInternalFlags> {
         enum_iterator::all::<CoreInternalFlags>()
             .filter(|f| !matches!(f, CoreInternalFlags::TooHigh))
@@ -311,5 +334,30 @@ mod tests {
         let gathered = f.gather_for_wft_complete();
         assert!(gathered.sdk_name.is_empty());
         assert_matches!(gathered.sdk_version.as_str(), "ver");
+    }
+    #[test]
+    fn chunking_v2_stays_staged_until_first_completion_is_observed() {
+        let mut flags = InternalFlags::new(
+            &Capabilities {
+                sdk_metadata: true,
+                ..Default::default()
+            },
+            "name".to_string(),
+            "ver".to_string(),
+        );
+
+        flags.try_use(CoreInternalFlags::WftChunkingV2, true);
+
+        assert_eq!(
+            flags.gather_for_wft_complete().core_used_flags,
+            vec![CoreInternalFlags::WftChunkingV2 as u32]
+        );
+        assert_eq!(
+            flags.gather_for_wft_complete().core_used_flags,
+            vec![CoreInternalFlags::WftChunkingV2 as u32]
+        );
+
+        flags.add_from_complete(&WorkflowTaskCompletedEventAttributes::default());
+        assert!(flags.gather_for_wft_complete().core_used_flags.is_empty());
     }
 }

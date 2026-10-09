@@ -1,51 +1,74 @@
 # Workflow Task Chunking
 
-One source of complexity in Core is the chunking of history into "logical" Workflow Tasks.
+A physical Workflow Task (WFT) starts with `WorkflowTaskScheduled` and
+`WorkflowTaskStarted`, then records its completion and any command events. Core
+feeds workflow code a logical task ending at `WorkflowTaskStarted`: it processes
+commands from the previous completion, inbound events, and the next task's start.
 
-Workflow tasks (WFTs) always take the following form in event history:
+Failed and timed-out attempts made no durable decision and can be folded into a
+retry. Successful tasks require more care. A commandless completion can represent
+an activity waiter updating workflow state, while a truly empty task can be a
+heartbeat for an outstanding local activity. Folding those tasks indiscriminately
+can change which state an Update observes during replay.
 
-* \[Preceding Events\] (optional)
-* WFT Scheduled
-* WFT Started
-* WFT Completed
-* \[Commands\] (optional)
+This design builds on [PR #1597](https://github.com/temporalio/sdk-rust/pull/1597)
+by [hikaru-212](https://github.com/hikaru-212), whose contribution uses Update
+sequencing to preserve Workflow Task boundaries and adds regression coverage for
+that behavior. This rework extends that approach with complete command-batch
+scanning and run-level version selection.
 
-In the typical case, the "logical" WFT consists of all the commands from the last workflow task,
-any events generated in the interrim, and the scheduled/started preamble. So:
+## Boundary rules
 
-* WFT Completed
-* \[Commands\] (optional)
-* \[Events\] (optional)
-* WFT Scheduled
-* WFT Started
+The original chunker remains available as v1 for existing runs. The opt-in v2
+scanner preserves a task that consumes inbound events or produces commands. It
+folds an otherwise empty heartbeat only after checking the successor's outcome
+and complete command batch.
 
-Commands and events are both "optional" in the sense that:
+Updates provide additional boundary evidence:
 
-Workflow code, after being woken up, might not do anything, and thus generate no new commands
+* Live protocol messages carry sequencing event IDs. Their preceding successful
+  task must be preserved so Update code runs after that task's activation.
+* Durable `WorkflowExecutionUpdateAdmitted` events provide the same evidence on
+  replay; failed starts do not become boundaries.
+* An accepted Update can follow other commands, including local activity or patch
+  markers. The scanner checks the entire batch after `WorkflowTaskCompleted`
+  before folding its predecessor. An ignorable unknown command also prevents
+  folding, since its effect cannot be determined by this reader.
 
-There may be no events for more nuanced reasons:
+A page ending within either relevant command batch provides insufficient evidence.
+The scanner waits for another page instead of emitting a provisional boundary.
+The paginator returns all fetched events, including partial tails. The run appends
+new pages to the unconsumed tail and decides its boundaries there. During v2 replay,
+local activity markers, patch markers, and accepted Updates are preprocessed only
+from the command batch belonging to the current physical task.
 
-1. The workflow might have been running a long-running local activity. In such cases, the workflow
-   must "workflow task heartbeat" in order to avoid timing out the workflow task. This means
-   completing the WFT with no commands while the LA is ongoing.
-2. The workflow might have received an update, which does not come as an event in history, but
-   rather as a "protocol message" attached to the task.
-3. Server can forcibly generate a new WFT with some obscure APIs
+## Run version and rollout
 
-Core does not consider such empty WFT sequences as worthy of waking lang (on replay - as a new
-task, they always will), since nothing meaningful has happened. Thus, they are grouped together
-as part of a "logical" WFT with the last WFT that had any real work in it.
+`CoreInternalFlags::WftChunkingV2` (4) on the **first successful**
+`WorkflowTaskCompleted` selects v2 for the entire run. Its absence selects v1.
+Failed attempts select neither. Later completions cannot change that choice, so
+there is no mid-run cutover. A new continue-as-new run can select v2.
 
-## Possible issues as of this writing (5/25)
+The choice belongs to the existing workflow machine instance. Sticky tasks reuse
+it; cache misses already fetch history from event 1 and recover it from durable
+metadata. There is no separate registry of run versions or completion-RPC latch.
+An attempted first completion keeps its flag staged until history confirms the
+successful completion, so a failed RPC cannot select a version or consume the flag.
+Unknown Core flags at the selection point fail the task as incompatible history.
 
-The "new WFT force-issued by server" case would, currently, not cause a wakeup on replay for the
-reasons discussed above. In some obscure edge cases (inspecting workflow clock) this could cause
-NDE.
+Readers always honor the recorded flag. Writers are disabled by default; set
+`TEMPORAL_USE_WFT_CHUNKING_V2=true` or `1` before starting the process to opt in
+(case-insensitive `true` is accepted). The process reads this setting once. Only
+runs without a successful completion can record the flag, and only when the server
+advertises SDK metadata support. Without that capability, execution uses v1.
 
-### Possible solutions
+Deploy readers to every worker that might process these runs, including rollback
+versions, before enabling writers. Existing flagless runs keep their original
+chunking even on a worker with the writer enabled.
 
-* Core can attach a flag on WFT completes in order to be explicit that that WFT may be skipped on
-  replay. IE: During WFT heartbeating for LAs.
-* We could legislate that server should never send empty WFTs. Seemingly the only case of this
-  is
-  the [obscure api](https://github.com/temporalio/temporal/blob/d189737aa2ed1b07c221abb9fbdd28ecf68f0492/proto/internal/temporal/server/api/adminservice/v1/service.proto#L151)
+## Remaining limitation
+
+An externally forced task with no observable events or commands may still be
+folded. Workflow code that observes only the task's clock can distinguish such a
+task from a local activity heartbeat. Fixing that ambiguity requires an explicit
+server or SDK indication that a task may be skipped.

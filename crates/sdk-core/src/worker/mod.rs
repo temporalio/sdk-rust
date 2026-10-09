@@ -6,6 +6,9 @@ mod slot_provider;
 pub(crate) mod tuner;
 mod workflow;
 
+#[cfg(test)]
+pub(crate) use workflow::parse_wft_chunking_v2_opt_in;
+
 /// The failure `type` set on the task failures workers synthesize when an outbound payload exceeds
 /// the error limit, shared so every conversion site reports the same identifier.
 pub(crate) const PAYLOADS_TOO_LARGE_FAILURE_TYPE: &str = "PayloadsTooLarge";
