@@ -120,10 +120,8 @@ impl Service<hyper::Uri> for OverrideAddrConnector {
     }
 }
 
-/// Visible only for tests
-#[doc(hidden)]
 #[cfg(feature = "native-transport")]
-pub enum ProxyStream {
+enum ProxyStream {
     Tcp(TcpStream),
     #[cfg(unix)]
     Unix(UnixStream),
