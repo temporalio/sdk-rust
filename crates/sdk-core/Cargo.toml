@@ -16,7 +16,17 @@ rust-version = "1.88.0"
 [lib]
 
 [features]
-default = ["envconfig", "prometheus", "tls-ring"]
+default = [
+  "envconfig",
+  "prometheus",
+  "tls-ring",
+  "native-environment",
+  "native-runtime",
+  "native-transport",
+]
+native-environment = ["dep:gethostname"]
+native-runtime = ["tokio/rt-multi-thread", "tokio/fs", "tokio/process"]
+native-transport = ["temporalio-client/native-transport"]
 tls-ring = [
   "temporalio-client/tls-ring",
   "temporalio-common/tls-ring",
@@ -39,7 +49,7 @@ otel = [
   "dep:opentelemetry-otlp",
   "temporalio-common/otel",
 ]
-ephemeral-server = ["dep:flate2", "dep:reqwest", "dep:tar", "dep:zip"]
+ephemeral-server = ["dep:flate2", "dep:reqwest", "dep:tar", "dep:zip", "native-runtime"]
 debug-plugin = ["dep:reqwest", "dep:hyper"]
 # Exposes mocks and helpers used by sdk-core's own integration tests, benches,
 # and the `histfetch` binary. Not part of the public API surface; downstream
@@ -68,7 +78,7 @@ enum-iterator = "2"
 flate2 = { version = "1.1", optional = true }
 futures = { version = "0.3", default-features = false }
 futures-util = { version = "0.3", default-features = false }
-gethostname = "1.0.2"
+gethostname = { version = "1.0.2", optional = true }
 hyper = { version = "1.7", optional = true }
 itertools = "0.14"
 lru = "0.18"
@@ -106,18 +116,14 @@ tar = { version = "0.4", optional = true }
 thiserror = { workspace = true }
 tokio = { version = "1.47", default-features = false, features = [
   "rt",
-  "rt-multi-thread",
   "parking_lot",
   "time",
-  "fs",
-  "process",
+  "sync",
   "macros",
 ] }
 tokio-util = { version = "0.7", features = ["io", "io-util"] }
 tokio-stream = { version = "0.1", default-features = false }
 tonic = { workspace = true, default-features = false, features = [
-  "tls-native-roots",
-  "transport",
   "codegen",
 ] }
 tracing = "0.1"
@@ -141,7 +147,7 @@ features = ["core-telemetry-bridge", "serde_serialize"]
 path = "../client"
 version = "~1.1.0"
 default-features = false
-features = ["core-based-sdk"]
+features = ["callback-transport", "core-based-sdk"]
 
 [dependencies.temporalio-macros]
 path = "../macros"
@@ -189,7 +195,7 @@ tokio = { version = "1.47", default-features = false, features = [
   "macros",
 ] }
 tokio-stream = { version = "0.1", default-features = false, features = ["net"] }
-tonic = { workspace = true, default-features = false, features = ["router"] }
+tonic = { workspace = true, default-features = false, features = ["router", "server"] }
 tracing-subscriber = { version = "0.3", default-features = false }
 trybuild = { version = "1.0", features = ["diff"] }
 

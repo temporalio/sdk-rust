@@ -1,0 +1,29 @@
+[package]
+name = "temporalio-sdk-core-wasm-bridge"
+version = "0.1.0"
+edition = "2024"
+license-file = { workspace = true }
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+futures-util = { version = "0.3", default-features = false }
+http = "1"
+prost = { workspace = true }
+temporalio-client = { path = "../client", default-features = false, features = [
+  "callback-transport",
+  "core-based-sdk",
+] }
+temporalio-common = { path = "../common", default-features = false }
+temporalio-sdk-core = { path = "../sdk-core", default-features = false }
+tokio = { version = "1.47", default-features = false, features = [
+  "rt",
+  "sync",
+  "time",
+] }
+tonic = { workspace = true, default-features = false, features = ["codegen"] }
+
+[lints]
+workspace = true

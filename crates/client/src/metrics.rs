@@ -1,8 +1,7 @@
 use crate::{AttachMetricLabels, CallType, callback_based, dbg_panic};
-use futures_util::{
-    FutureExt, TryFutureExt,
-    future::{BoxFuture, Either},
-};
+#[cfg(feature = "native-transport")]
+use futures_util::future::Either;
+use futures_util::{FutureExt, TryFutureExt, future::BoxFuture};
 use std::{
     fmt,
     task::{Context, Poll},
@@ -15,7 +14,9 @@ use temporalio_common::telemetry::{
         MetricAttributes, MetricKeyValue, MetricParameters, TemporalMeter,
     },
 };
-use tonic::{Code, body::Body, transport::Channel};
+#[cfg(feature = "native-transport")]
+use tonic::transport::Channel;
+use tonic::{Code, body::Body};
 use tower::Service;
 
 /// The string name (which may be prefixed) for this metric
@@ -227,6 +228,7 @@ pub(crate) struct GrpcMetricSvc {
 
 #[derive(Clone)]
 pub(crate) enum ChannelOrGrpcOverride {
+    #[cfg(feature = "native-transport")]
     Channel(Channel),
     GrpcOverride(callback_based::CallbackBasedGrpcService),
 }
@@ -234,6 +236,7 @@ pub(crate) enum ChannelOrGrpcOverride {
 impl fmt::Debug for ChannelOrGrpcOverride {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            #[cfg(feature = "native-transport")]
             ChannelOrGrpcOverride::Channel(inner) => fmt::Debug::fmt(inner, f),
             ChannelOrGrpcOverride::GrpcOverride(_) => f.write_str("<callback-based-grpc-service>"),
         }
@@ -248,6 +251,7 @@ impl Service<http::Request<Body>> for GrpcMetricSvc {
 
     fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         match &mut self.inner {
+            #[cfg(feature = "native-transport")]
             ChannelOrGrpcOverride::Channel(inner) => inner.poll_ready(cx).map_err(Into::into),
             ChannelOrGrpcOverride::GrpcOverride(inner) => inner.poll_ready(cx).map_err(Into::into),
         }
@@ -294,13 +298,19 @@ impl Service<http::Request<Body>> for GrpcMetricSvc {
                     metrics
                 })
             });
+        #[cfg(feature = "native-transport")]
         let callfut = match &mut self.inner {
+            #[cfg(feature = "native-transport")]
             ChannelOrGrpcOverride::Channel(inner) => {
                 Either::Left(inner.call(req).map_err(Into::into))
             }
             ChannelOrGrpcOverride::GrpcOverride(inner) => {
                 Either::Right(inner.call(req).map_err(Into::into))
             }
+        };
+        #[cfg(not(feature = "native-transport"))]
+        let callfut = match &mut self.inner {
+            ChannelOrGrpcOverride::GrpcOverride(inner) => inner.call(req).map_err(Into::into),
         };
         let errcode_label_disabled = self.disable_errcode_label;
         async move {

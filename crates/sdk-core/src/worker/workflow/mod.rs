@@ -37,16 +37,20 @@ use crate::{
             history_update::HistoryPaginator,
             machines::MachineError,
             managed_run::RunUpdateAct,
-            wft_extraction::{HistoryFetchReq, WFTExtractor, WFTStreamIn},
+            wft_extraction::{HistoryFetchReq, WFTExtractor, WFTExtractorOutput, WFTStreamIn},
             wft_poller::validate_wft,
             workflow_stream::{LocalInput, LocalInputs, WFStream},
         },
     },
 };
 use anyhow::anyhow;
-use futures_util::{Stream, StreamExt, future::abortable, stream, stream::BoxStream};
+#[cfg(not(target_arch = "wasm32"))]
+use futures_util::future::abortable;
+use futures_util::{Stream, StreamExt, stream, stream::BoxStream};
 use itertools::Itertools;
 use prost_types::TimestampError;
+#[cfg(not(target_arch = "wasm32"))]
+use std::thread;
 use std::{
     cell::RefCell,
     collections::VecDeque,
@@ -56,7 +60,6 @@ use std::{
     rc::Rc,
     result,
     sync::{Arc, atomic, atomic::AtomicBool},
-    thread,
     time::{Duration, Instant},
 };
 use temporalio_client::MESSAGE_TOO_LARGE_KEY;
@@ -93,13 +96,14 @@ use temporalio_common::{
     },
     telemetry::set_trace_subscriber_for_current_thread,
 };
-use tokio::{
-    sync::{
-        mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel},
-        oneshot,
-    },
-    task::{LocalSet, spawn_blocking},
+use tokio::sync::{
+    mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel},
+    oneshot,
 };
+#[cfg(target_arch = "wasm32")]
+use tokio::task::spawn_local;
+#[cfg(not(target_arch = "wasm32"))]
+use tokio::task::{LocalSet, spawn_blocking};
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tokio_util::{either::Either, sync::CancellationToken};
 use tracing::{Span, Subscriber};
@@ -116,12 +120,90 @@ const WFT_HEARTBEAT_TIMEOUT_FRACTION: f32 = 0.8;
 type Result<T, E = WFMachinesError> = result::Result<T, E>;
 type BoxedActivationStream = BoxStream<'static, Result<WorkflowStreamAction, PollError>>;
 type InternalFlagsRef = Rc<RefCell<InternalFlags>>;
+type ExtractedWftStream = BoxStream<'static, result::Result<WFTExtractorOutput, tonic::Status>>;
+type WorkflowLocalInputStream = BoxStream<'static, LocalInput>;
+#[cfg(not(target_arch = "wasm32"))]
+type WorkflowProcessingTaskHandle = thread::JoinHandle<()>;
+#[cfg(target_arch = "wasm32")]
+type WorkflowProcessingTaskHandle = tokio::task::JoinHandle<()>;
+
+#[allow(clippy::too_many_arguments)] // Keeps native and wasm executors on one processing loop.
+async fn workflow_processing_loop<LS>(
+    basics: WorkflowBasics,
+    shutdown_tok: CancellationToken,
+    start_polling_rx: oneshot::Receiver<()>,
+    extracted_wft_stream: ExtractedWftStream,
+    locals_stream: WorkflowLocalInputStream,
+    local_activity_request_sink: Option<LS>,
+    fetch_tx: UnboundedSender<HistoryFetchReq>,
+    activation_tx: UnboundedSender<Result<WorkflowStreamAction, PollError>>,
+) where
+    LS: LocalActivityRequestSink,
+{
+    // Avoid plowing ahead until we've been asked to poll at least once. This supports
+    // activity-only workers.
+    let do_poll = tokio::select! {
+        sp = start_polling_rx => {
+            sp.is_ok()
+        }
+        _ = shutdown_tok.cancelled() => {
+            false
+        }
+    };
+    if !do_poll {
+        return;
+    }
+
+    let mut stream = WFStream::build(
+        basics,
+        extracted_wft_stream,
+        locals_stream,
+        local_activity_request_sink,
+    );
+
+    while let Some(output) = stream.next().await {
+        match output {
+            Ok(o) => {
+                for fetchreq in o.fetch_histories {
+                    fetch_tx
+                        .send(fetchreq)
+                        .expect("Fetch channel must not be dropped");
+                }
+                for action in o.actions {
+                    activation_tx
+                        .send(Ok(action))
+                        .expect("Activation processor channel not dropped");
+                }
+            }
+            Err(e) => {
+                let _ = activation_tx.send(Err(e)).inspect_err(|e| {
+                    error!(activation=?e.0, "Activation processor channel dropped");
+                });
+            }
+        }
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+fn workflow_processing_task_join_error(err: tokio::task::JoinError) -> anyhow::Error {
+    if err.is_panic() {
+        let panic = err.into_panic();
+        if let Some(as_str) = panic.downcast_ref::<&str>() {
+            return anyhow!("Error awaiting workflow processing task: {as_str:?}");
+        }
+        if let Some(as_string) = panic.downcast_ref::<String>() {
+            return anyhow!("Error awaiting workflow processing task: {as_string:?}");
+        }
+        return anyhow!("Error awaiting workflow processing task: panic");
+    }
+    anyhow!("Error awaiting workflow processing task: {err}")
+}
 
 /// Centralizes all state related to workflows and workflow tasks
 pub(crate) struct Workflows {
     task_queue: String,
     local_tx: UnboundedSender<LocalInput>,
-    processing_task: TakeCell<thread::JoinHandle<()>>,
+    processing_task: TakeCell<WorkflowProcessingTaskHandle>,
     activation_stream: tokio::sync::Mutex<(
         BoxedActivationStream,
         // Used to indicate polling may begin
@@ -196,7 +278,8 @@ impl Workflows {
             basics.worker_config.fetching_concurrency,
             wft_stream,
             UnboundedReceiverStream::new(fetch_rx),
-        );
+        )
+        .boxed();
         let locals_stream = if let Some(hb_rx) = heartbeat_timeout_rx {
             Either::Left(stream::select(
                 UnboundedReceiverStream::new(local_rx),
@@ -204,11 +287,13 @@ impl Workflows {
             ))
         } else {
             Either::Right(UnboundedReceiverStream::new(local_rx))
-        };
+        }
+        .boxed();
         let (activation_tx, activation_rx) = unbounded_channel();
         let (start_polling_tx, start_polling_rx) = oneshot::channel();
         // We must spawn a task to constantly poll the activation stream, because otherwise
         // activation completions would not cause anything to happen until the next poll.
+        #[cfg(not(target_arch = "wasm32"))]
         let processing_task = thread::Builder::new()
             .name("workflow-processing".to_string())
             .spawn(move || {
@@ -220,52 +305,38 @@ impl Workflows {
                     .build()
                     .unwrap();
                 let local = LocalSet::new();
-                local.block_on(&rt, async move {
-                    // However, we want to avoid plowing ahead until we've been asked to poll at
-                    // least once. This supports activity-only workers.
-                    let do_poll = tokio::select! {
-                        sp = start_polling_rx => {
-                            sp.is_ok()
-                        }
-                        _ = shutdown_tok.cancelled() => {
-                            false
-                        }
-                    };
-                    if !do_poll {
-                        return;
-                    }
-
-                    let mut stream = WFStream::build(
+                local.block_on(
+                    &rt,
+                    workflow_processing_loop(
                         basics,
+                        shutdown_tok,
+                        start_polling_rx,
                         extracted_wft_stream,
                         locals_stream,
                         local_activity_request_sink,
-                    );
-
-                    while let Some(output) = stream.next().await {
-                        match output {
-                            Ok(o) => {
-                                for fetchreq in o.fetch_histories {
-                                    fetch_tx
-                                        .send(fetchreq)
-                                        .expect("Fetch channel must not be dropped");
-                                }
-                                for action in o.actions {
-                                    activation_tx
-                                        .send(Ok(action))
-                                        .expect("Activation processor channel not dropped");
-                                }
-                            }
-                            Err(e) => {
-                                let _ = activation_tx.send(Err(e)).inspect_err(|e| {
-                                    error!(activation=?e.0, "Activation processor channel dropped");
-                                });
-                            }
-                        }
-                    }
-                });
+                        fetch_tx,
+                        activation_tx,
+                    ),
+                );
             })
             .expect("Must be able to spawn workflow processing thread");
+        #[cfg(target_arch = "wasm32")]
+        let processing_task = spawn_local(async move {
+            if let Some(ts) = tracing_sub {
+                set_trace_subscriber_for_current_thread(ts);
+            }
+            workflow_processing_loop(
+                basics,
+                shutdown_tok,
+                start_polling_rx,
+                extracted_wft_stream,
+                locals_stream,
+                local_activity_request_sink,
+                fetch_tx,
+                activation_tx,
+            )
+            .await;
+        });
         Self {
             task_queue,
             local_tx,
@@ -284,6 +355,54 @@ impl Workflows {
             default_versioning_behavior,
             namespace_capabilities,
             shutdown_token,
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    async fn shutdown_processing_task(
+        &self,
+        jh: WorkflowProcessingTaskHandle,
+    ) -> Result<(), anyhow::Error> {
+        // This serves to drive the stream if it is still alive and wouldn't otherwise receive
+        // another message. It allows it to shut itself down.
+        let (waker, stop_waker) = abortable(async {
+            let mut interval = tokio::time::interval(Duration::from_millis(10));
+            loop {
+                interval.tick().await;
+                self.bump_stream();
+            }
+        });
+        let (_, jh_res) = tokio::join!(
+            waker,
+            spawn_blocking(move || {
+                let r = jh.join();
+                stop_waker.abort();
+                r
+            })
+        );
+        jh_res?.map_err(|e| {
+            let as_str = e.downcast::<&str>();
+            anyhow!("Error joining workflow processing thread: {as_str:?}")
+        })?;
+        Ok(())
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    async fn shutdown_processing_task(
+        &self,
+        jh: WorkflowProcessingTaskHandle,
+    ) -> Result<(), anyhow::Error> {
+        // The LocalSet-owned task exits cooperatively, so keep bumping the stream while we await it.
+        let mut interval = tokio::time::interval(Duration::from_millis(10));
+        tokio::pin!(jh);
+        loop {
+            tokio::select! {
+                _ = interval.tick() => self.bump_stream(),
+                res = &mut jh => {
+                    res.map_err(workflow_processing_task_join_error)?;
+                    return Ok(());
+                }
+            }
         }
     }
 
@@ -728,27 +847,7 @@ impl Workflows {
 
     pub(super) async fn shutdown(&self) -> Result<(), anyhow::Error> {
         if let Some(jh) = self.processing_task.take_once() {
-            // This serves to drive the stream if it is still alive and wouldn't otherwise receive
-            // another message. It allows it to shut itself down.
-            let (waker, stop_waker) = abortable(async {
-                let mut interval = tokio::time::interval(Duration::from_millis(10));
-                loop {
-                    interval.tick().await;
-                    self.bump_stream();
-                }
-            });
-            let (_, jh_res) = tokio::join!(
-                waker,
-                spawn_blocking(move || {
-                    let r = jh.join();
-                    stop_waker.abort();
-                    r
-                })
-            );
-            jh_res?.map_err(|e| {
-                let as_str = e.downcast::<&str>();
-                anyhow!("Error joining workflow processing thread: {as_str:?}")
-            })?;
+            self.shutdown_processing_task(jh).await?;
         }
         Ok(())
     }

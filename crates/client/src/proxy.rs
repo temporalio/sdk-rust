@@ -1,6 +1,10 @@
+#[cfg(feature = "native-transport")]
 use base64::prelude::*;
+#[cfg(feature = "native-transport")]
 use http_body_util::Empty;
+#[cfg(feature = "native-transport")]
 use hyper::{body::Bytes, header};
+#[cfg(feature = "native-transport")]
 use hyper_util::{
     client::legacy::{
         Client,
@@ -8,20 +12,24 @@ use hyper_util::{
     },
     rt::{TokioExecutor, TokioIo},
 };
+#[cfg(feature = "native-transport")]
 use std::{
     future::Future,
     io,
     pin::Pin,
     task::{Context, Poll},
 };
+#[cfg(feature = "native-transport")]
 use tokio::{
     io::{AsyncRead, AsyncWrite, ReadBuf},
     net::TcpStream,
 };
+#[cfg(feature = "native-transport")]
 use tonic::transport::{Channel, Endpoint};
+#[cfg(feature = "native-transport")]
 use tower::{Service, service_fn};
 
-#[cfg(unix)]
+#[cfg(all(feature = "native-transport", unix))]
 use tokio::net::UnixStream;
 
 /// Options for HTTP CONNECT proxy.
@@ -39,6 +47,7 @@ pub struct HttpConnectProxyOptions {
 
 impl HttpConnectProxyOptions {
     /// Create a channel from the given endpoint that uses the HTTP CONNECT proxy.
+    #[cfg(feature = "native-transport")]
     pub async fn connect_endpoint(
         &self,
         endpoint: &Endpoint,
@@ -51,6 +60,7 @@ impl HttpConnectProxyOptions {
         endpoint.connect_with_connector(svc_fn).await
     }
 
+    #[cfg(feature = "native-transport")]
     async fn connect(
         &self,
         uri: tonic::transport::Uri,
@@ -83,9 +93,11 @@ impl HttpConnectProxyOptions {
     }
 }
 
+#[cfg(feature = "native-transport")]
 #[derive(Clone)]
 struct OverrideAddrConnector(String);
 
+#[cfg(feature = "native-transport")]
 impl Service<hyper::Uri> for OverrideAddrConnector {
     type Response = TokioIo<ProxyStream>;
 
@@ -108,12 +120,16 @@ impl Service<hyper::Uri> for OverrideAddrConnector {
     }
 }
 
-enum ProxyStream {
+/// Visible only for tests
+#[doc(hidden)]
+#[cfg(feature = "native-transport")]
+pub enum ProxyStream {
     Tcp(TcpStream),
     #[cfg(unix)]
     Unix(UnixStream),
 }
 
+#[cfg(feature = "native-transport")]
 impl ProxyStream {
     async fn connect(target_addr: &str) -> anyhow::Result<Self> {
         if target_addr.starts_with("unix:/") {
@@ -135,6 +151,7 @@ impl ProxyStream {
     }
 }
 
+#[cfg(feature = "native-transport")]
 impl AsyncRead for ProxyStream {
     fn poll_read(
         self: Pin<&mut Self>,
@@ -149,6 +166,7 @@ impl AsyncRead for ProxyStream {
     }
 }
 
+#[cfg(feature = "native-transport")]
 impl AsyncWrite for ProxyStream {
     fn poll_write(
         self: Pin<&mut Self>,
@@ -199,6 +217,7 @@ impl AsyncWrite for ProxyStream {
     }
 }
 
+#[cfg(feature = "native-transport")]
 impl Connection for ProxyStream {
     fn connected(&self) -> Connected {
         match self {
@@ -212,6 +231,7 @@ impl Connection for ProxyStream {
 
 /// Ensure the URI authority includes an explicit port so that hyper emits a
 /// RFC 9110-compliant CONNECT request-target (authority-form requires host:port).
+#[cfg(feature = "native-transport")]
 fn ensure_connect_authority_port(uri: tonic::transport::Uri) -> tonic::transport::Uri {
     if uri.port().is_some() {
         return uri;
@@ -230,7 +250,7 @@ fn ensure_connect_authority_port(uri: tonic::transport::Uri) -> tonic::transport
     tonic::transport::Uri::from_parts(parts).expect("adding port to valid URI should not fail")
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "native-transport"))]
 mod tests {
     use super::{HttpConnectProxyOptions, ProxyStream};
     use crate::{

@@ -6,6 +6,10 @@ use std::path::Path;
 
 #[cfg(target_os = "macos")]
 use temporalio_common::protos::temporal::api::worker::v1::environment_info::MacOsPlatform;
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+use temporalio_common::protos::temporal::api::worker::v1::environment_info::{
+    Architecture, platform::Variant,
+};
 #[cfg(target_os = "linux")]
 use temporalio_common::protos::temporal::api::worker::v1::environment_info::{
     LinuxPlatform, linux_platform::Libc,
@@ -17,8 +21,8 @@ use temporalio_common::protos::temporal::api::worker::v1::environment_info::{
 use temporalio_common::protos::temporal::api::worker::v1::{
     EnvironmentInfo,
     environment_info::{
-        Architecture, HostingEnvironment, Platform, Runtime,
-        hosting_environment::HostingEnvironmentType, platform::Variant, runtime::RuntimeType,
+        HostingEnvironment, Platform, Runtime, hosting_environment::HostingEnvironmentType,
+        runtime::RuntimeType,
     },
 };
 
@@ -143,9 +147,11 @@ fn is_docker() -> bool {
 }
 
 fn detect_platform() -> Option<Platform> {
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     let version = sysinfo::System::os_version()
         .or_else(sysinfo::System::kernel_version)
         .unwrap_or_default();
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     let architecture = architecture() as i32;
 
     #[cfg(target_os = "linux")]
@@ -178,6 +184,7 @@ fn detect_platform() -> Option<Platform> {
     None
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 fn architecture() -> Architecture {
     #[cfg(target_arch = "x86_64")]
     return Architecture::Amd64;

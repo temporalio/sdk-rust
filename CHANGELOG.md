@@ -262,6 +262,18 @@ relevant information.
 * The Rust SDK now has an optional `testing` feature with a typed activity test environment and
   local or external workflow test environments. Local workflow environments manage a Temporal CLI
   dev server and expose shutdown through their local-server type state.
+* Core workflow processing can run on a caller-driven Tokio `LocalSet` on `wasm32` targets where
+  native threads are unavailable.
+* Native client transport, runtime, and host-environment dependencies can now be disabled so Core
+  workers can run behind a callback transport on WASM hosts.
+* The WASM bridge now exports `temporal_core_init_with_worker_options` for explicit workflow
+  worker capacity configuration and supports multiple concurrent workflow activation and activity
+  task completions via ID-keyed completion operations. Runtime progress calls now drain ready work
+  without the previous fixed one-millisecond delay. `temporal_core_take_*` operations for poll
+  results, keyed completion results, and queued gRPC requests now return `BRIDGE_BUFFER_TOO_SMALL`
+  (`2`) with the required byte length when the host buffer is undersized, and they retain the
+  ready result/request so the host can retry without duplicating side effects. The superseded init,
+  tick, and no-ID workflow/activity completion exports were removed.
 * Worker heartbeats now report the SDK runtime, hosting environments, operating system, and
   architecture once per worker, retrying until the first successful delivery. Runtime options can
   disable this reporting, and language SDK bridges can supply their own runtime details. The Rust
@@ -380,6 +392,21 @@ relevant information.
   preserving the resolution ordering recorded in existing histories during replay.
 * Try-cancel child workflows no longer cause nondeterminism when they complete or fail after their
   cancellation was requested.
+
+### Added
+* `WorkflowCancellationToken` for deterministic cancellation of workflow operations.
+* `WorkflowContext::wait_condition_with_options` and `WaitConditionOptions` for waiting with a
+  custom cancellation token.
+
+### Changed
+* The WASM bridge no longer clears guest allocations that are immediately populated by the host.
+* Cancellation errors propagated after workflow cancellation now complete the workflow as cancelled
+  instead of failed.
+* The default `tls-ring` build no longer pulls in `aws-lc-rs`. `tls-aws-lc` builds are unchanged.
+
+### Fixed
+* The WASM callback transport now preserves unary gRPC response metadata and structured status
+  details when responses cross the host bridge.
 * Panics from update validators now reject the update instead of repeatedly failing workflow
   tasks.
 * Workers with `max_cached_workflows` set to 0 no longer stall when a local activity resolves while

@@ -5,8 +5,9 @@ use crate::{
 };
 use backon::{BackoffBuilder, ExponentialBuilder};
 use futures_retry::{ErrorHandler, FutureRetry, RetryPolicy};
+#[cfg(feature = "native-transport")]
+use std::error::Error;
 use std::{
-    error::Error,
     fmt::Debug,
     future::Future,
     time::{Duration, Instant},
@@ -359,6 +360,7 @@ impl ErrorHandler<tonic::Status> for TonicErrorHandler {
 /// transport-level failure (tonic::transport::Error → hyper::Error) rather than
 /// an application/caller-initiated cancellation. These should be retried like
 /// `Code::Unavailable`.
+#[cfg(feature = "native-transport")]
 fn is_transport_cancelled(status: &tonic::Status) -> bool {
     status
         .source()
@@ -366,6 +368,11 @@ fn is_transport_cancelled(status: &tonic::Status) -> bool {
         .and_then(|te| te.source())
         .and_then(|tec| tec.downcast_ref::<hyper::Error>())
         .is_some()
+}
+
+#[cfg(not(feature = "native-transport"))]
+fn is_transport_cancelled(_status: &tonic::Status) -> bool {
+    false
 }
 
 #[cfg(test)]

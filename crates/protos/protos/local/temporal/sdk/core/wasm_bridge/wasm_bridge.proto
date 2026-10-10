@@ -1,0 +1,30 @@
+syntax = "proto3";
+
+package coresdk.wasm_bridge;
+
+// A unary gRPC request sent from Temporal Core to the Go host transport.
+message GrpcRequest {
+    uint64 id = 1;
+    string service = 2;
+    string rpc = 3;
+    repeated MetadataEntry metadata = 4;
+    bytes proto = 5;
+}
+
+// A unary gRPC response returned by the Go host transport to Temporal Core.
+message GrpcResponse {
+    int32 status_code = 1;
+    string status_message = 2;
+    repeated MetadataEntry headers = 3;
+    repeated MetadataEntry trailers = 4;
+    bytes status_details = 5;
+    bytes proto = 6;
+}
+
+// One gRPC metadata value. Repeated entries preserve duplicate values and their
+// order. Values use the decoded gRPC representation, including raw binary
+// values for keys ending in "-bin".
+message MetadataEntry {
+    string key = 1;
+    bytes value = 2;
+}

@@ -35,6 +35,7 @@ use temporalio_common::{
 };
 #[cfg(feature = "dynamic-tls")]
 use tokio_rustls::rustls::client::ResolvesClientCert;
+#[cfg(feature = "native-transport")]
 use tokio_rustls::rustls::client::danger::ServerCertVerifier;
 use url::Url;
 
@@ -318,6 +319,7 @@ pub struct TlsOptions {
     /// The verifier must implement [`ServerCertVerifier`] from the `rustls` crate.
     /// Note that `domain` is still respected for the `:authority` header / origin override
     /// even when a custom verifier is set.
+    #[cfg(feature = "native-transport")]
     pub server_cert_verifier: Option<Arc<dyn ServerCertVerifier>>,
     /// Optional dynamic client certificate resolver for transparent mTLS certificate rotation.
     ///
@@ -345,6 +347,7 @@ impl std::fmt::Debug for TlsOptions {
         );
         s.field("domain", &self.domain);
         s.field("client_tls_options", &self.client_tls_options);
+        #[cfg(feature = "native-transport")]
         s.field(
             "server_cert_verifier",
             &self.server_cert_verifier.as_ref().map(|_| "<custom>"),

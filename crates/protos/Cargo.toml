@@ -16,8 +16,9 @@ links = "temporalio_protos"
 [features]
 default = []
 serde_serialize = []
-grpc-clients = ["tonic/channel"]
 vendored-protox = ["dep:protox", "prost-types/vendored-protox"]
+grpc-clients = []
+grpc-transport = ["grpc-clients", "tonic/channel"]
 
 [dependencies]
 anyhow = "1.0"

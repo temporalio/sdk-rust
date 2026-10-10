@@ -39,7 +39,7 @@ pub use crate::worker::client::{
     PollActivityOptions, PollOptions, PollWorkflowOptions, WorkerClient, WorkflowTaskCompletion,
 };
 pub use pollers::{Client, ClientOptions, ClientTlsOptions, RetryOptions, TlsOptions};
-pub use temporalio_common::protos::TaskToken;
+pub use temporalio_common::{protos::TaskToken, worker::WorkerTaskTypes};
 pub use url::Url;
 pub use worker::{
     ActivitySlotKind, CompleteActivityError, CompleteNexusError, CompleteWfError,
@@ -244,7 +244,10 @@ pub struct TokioRuntimeBuilder<F> {
 impl Default for TokioRuntimeBuilder<Box<dyn Fn() + Send + Sync>> {
     fn default() -> Self {
         TokioRuntimeBuilder {
+            #[cfg(feature = "native-runtime")]
             inner: tokio::runtime::Builder::new_multi_thread(),
+            #[cfg(not(feature = "native-runtime"))]
+            inner: tokio::runtime::Builder::new_current_thread(),
             lang_on_thread_start: None,
         }
     }

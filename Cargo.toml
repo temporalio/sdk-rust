@@ -10,6 +10,7 @@ members = [
     "crates/workflow",
     "crates/sdk-core-c-bridge",
     "crates/changelog-release-notes",
+    "crates/sdk-core-wasm-bridge",
 ]
 resolver = "3"
 

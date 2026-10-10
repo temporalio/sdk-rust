@@ -72,6 +72,7 @@ pub use rpc_options::{RpcMetadata, RpcMetadataError, RpcOptions};
 pub use temporalio_common::{Memo, RetryPolicy, VersioningOverride};
 pub use url::Url;
 /// Potentially dangerous TLS related functionality.
+#[cfg(feature = "native-transport")]
 pub mod danger {
     /// Re-export the `ServerCertVerifier` trait so that users can implement custom TLS
     /// server certificate verification without depending on `tokio-rustls` directly,
@@ -119,6 +120,7 @@ use futures_util::{
     stream,
     stream::Stream,
 };
+#[cfg(feature = "native-transport")]
 use http::Uri;
 use parking_lot::RwLock;
 use std::{
@@ -167,6 +169,8 @@ use temporalio_common::{
     },
     search_attributes::{SearchAttributeError, SearchAttributeValue, SearchAttributes},
 };
+#[cfg(feature = "native-transport")]
+use tonic::transport::{Certificate, Endpoint, Identity};
 use tonic::{
     Code, IntoRequest,
     body::Body,
@@ -178,8 +182,8 @@ use tonic::{
         MetadataValue,
     },
     service::Interceptor,
-    transport::{Certificate, Endpoint, Identity},
 };
+#[cfg(feature = "native-transport")]
 use tower::ServiceBuilder;
 use uuid::Uuid;
 
@@ -267,7 +271,10 @@ impl Connection {
     }
 
     async fn connect_once(options: &ConnectionOptions) -> Result<Self, ClientConnectError> {
+        #[cfg(feature = "native-transport")]
         let dns_lb_opts = dns::validate_and_get_dns_lb(options)?.cloned();
+        #[cfg(not(feature = "native-transport"))]
+        dns::validate_and_get_dns_lb(options)?;
         let (service, dns_task) = if let Some(service_override) = options.service_override.clone() {
             (
                 GrpcMetricSvc {
@@ -277,110 +284,121 @@ impl Connection {
                 },
                 None,
             )
-        } else if let Some(dns_opts) = &dns_lb_opts {
-            let (channel, sender) = dns::create_balanced_channel(options).await?;
-            let handle = dns::spawn_dns_reresolution(
-                sender,
-                options.target.clone(),
-                options.tls_options.clone(),
-                options.keep_alive.clone(),
-                options.override_origin.clone(),
-                dns_opts.resolution_interval,
-                options.connect_timeout,
-            );
-            (
-                ServiceBuilder::new()
-                    .layer_fn(move |channel| GrpcMetricSvc {
-                        inner: ChannelOrGrpcOverride::Channel(channel),
-                        metrics: options.metrics_meter.clone().map(MetricsContext::new),
-                        disable_errcode_label: options.disable_error_code_metric_tags,
-                    })
-                    .service(channel),
-                Some(handle),
-            )
         } else {
-            let endpoint = Endpoint::from_shared(options.target.to_string())?;
-            let endpoint = if let Some(timeout) = options.connect_timeout {
-                endpoint.connect_timeout(timeout)
-            } else {
-                endpoint
-            };
-            let tls_result = add_tls_to_channel(options.tls_options.as_ref(), endpoint).await?;
-
-            #[cfg(feature = "dynamic-tls")]
-            let (channel, custom_connector_info) = match tls_result {
-                TlsConfigResult::Standard(ep) => (
-                    ep,
-                    None::<(Arc<tokio_rustls::rustls::ClientConfig>, String)>,
-                ),
-                TlsConfigResult::CustomConnector {
-                    endpoint: ep,
-                    rustls_config,
-                    domain,
-                } => (ep, Some((rustls_config, domain))),
-            };
-            #[cfg(not(feature = "dynamic-tls"))]
-            let channel = match tls_result {
-                TlsConfigResult::Standard(ep) => ep,
-            };
-
-            let channel = if let Some(keep_alive) = options.keep_alive.as_ref() {
-                channel
-                    .keep_alive_while_idle(true)
-                    .http2_keep_alive_interval(keep_alive.interval)
-                    .keep_alive_timeout(keep_alive.timeout)
-            } else {
-                channel
-            };
-            let channel = if let Some(origin) = options.override_origin.clone() {
-                channel.origin(origin)
-            } else {
-                channel
-            };
-            // Validate that proxy and dynamic cert resolver aren't combined
-            #[cfg(feature = "dynamic-tls")]
-            if options.http_connect_proxy.is_some() && custom_connector_info.is_some() {
+            #[cfg(not(feature = "native-transport"))]
+            {
                 return Err(ClientConnectError::InvalidConfig(
-                    "client_cert_resolver is not yet supported with http_connect_proxy. \
-                     Use static client_tls_options when using a proxy, or remove the proxy."
+                    "Connection::connect without service_override requires the \
+                     `native-transport` feature"
                         .to_owned(),
                 ));
             }
-            // Connect, using a custom TLS connector if dynamic cert resolution is needed
-            let channel = if let Some(proxy) = options.http_connect_proxy.as_ref() {
-                proxy.connect_endpoint(&channel).await?
+            #[cfg(feature = "native-transport")]
+            if let Some(dns_opts) = &dns_lb_opts {
+                let (channel, sender) = dns::create_balanced_channel(options).await?;
+                let handle = dns::spawn_dns_reresolution(
+                    sender,
+                    options.target.clone(),
+                    options.tls_options.clone(),
+                    options.keep_alive.clone(),
+                    options.override_origin.clone(),
+                    dns_opts.resolution_interval,
+                    options.connect_timeout,
+                );
+                (
+                    ServiceBuilder::new()
+                        .layer_fn(move |channel| GrpcMetricSvc {
+                            inner: ChannelOrGrpcOverride::Channel(channel),
+                            metrics: options.metrics_meter.clone().map(MetricsContext::new),
+                            disable_errcode_label: options.disable_error_code_metric_tags,
+                        })
+                        .service(channel),
+                    Some(handle),
+                )
             } else {
-                #[cfg(feature = "dynamic-tls")]
-                if let Some((rustls_config, domain)) = custom_connector_info {
-                    let server_name =
-                        tokio_rustls::rustls::pki_types::ServerName::try_from(domain.as_str())
-                            .map_err(|e| {
-                                ClientConnectError::InvalidConfig(format!(
-                                    "Invalid TLS domain name '{domain}': {e}"
-                                ))
-                            })?
-                            .to_owned();
-                    let connector = DynamicTlsConnector {
-                        tls: tokio_rustls::TlsConnector::from(rustls_config),
-                        domain: Arc::new(server_name),
-                    };
-                    channel.connect_with_connector(connector).await?
+                let endpoint = Endpoint::from_shared(options.target.to_string())?;
+                let endpoint = if let Some(timeout) = options.connect_timeout {
+                    endpoint.connect_timeout(timeout)
                 } else {
-                    channel.connect().await?
-                }
+                    endpoint
+                };
+                let tls_result = add_tls_to_channel(options.tls_options.as_ref(), endpoint).await?;
+
+                #[cfg(feature = "dynamic-tls")]
+                let (channel, custom_connector_info) = match tls_result {
+                    TlsConfigResult::Standard(ep) => (
+                        ep,
+                        None::<(Arc<tokio_rustls::rustls::ClientConfig>, String)>,
+                    ),
+                    TlsConfigResult::CustomConnector {
+                        endpoint: ep,
+                        rustls_config,
+                        domain,
+                    } => (ep, Some((rustls_config, domain))),
+                };
                 #[cfg(not(feature = "dynamic-tls"))]
-                channel.connect().await?
-            };
-            (
-                ServiceBuilder::new()
-                    .layer_fn(move |channel| GrpcMetricSvc {
-                        inner: ChannelOrGrpcOverride::Channel(channel),
-                        metrics: options.metrics_meter.clone().map(MetricsContext::new),
-                        disable_errcode_label: options.disable_error_code_metric_tags,
-                    })
-                    .service(channel),
-                None,
-            )
+                let channel = match tls_result {
+                    TlsConfigResult::Standard(ep) => ep,
+                };
+
+                let channel = if let Some(keep_alive) = options.keep_alive.as_ref() {
+                    channel
+                        .keep_alive_while_idle(true)
+                        .http2_keep_alive_interval(keep_alive.interval)
+                        .keep_alive_timeout(keep_alive.timeout)
+                } else {
+                    channel
+                };
+                let channel = if let Some(origin) = options.override_origin.clone() {
+                    channel.origin(origin)
+                } else {
+                    channel
+                };
+                // Validate that proxy and dynamic cert resolver aren't combined
+                #[cfg(feature = "dynamic-tls")]
+                if options.http_connect_proxy.is_some() && custom_connector_info.is_some() {
+                    return Err(ClientConnectError::InvalidConfig(
+                        "client_cert_resolver is not yet supported with http_connect_proxy. \
+                     Use static client_tls_options when using a proxy, or remove the proxy."
+                            .to_owned(),
+                    ));
+                }
+                // Connect, using a custom TLS connector if dynamic cert resolution is needed
+                let channel = if let Some(proxy) = options.http_connect_proxy.as_ref() {
+                    proxy.connect_endpoint(&channel).await?
+                } else {
+                    #[cfg(feature = "dynamic-tls")]
+                    if let Some((rustls_config, domain)) = custom_connector_info {
+                        let server_name =
+                            tokio_rustls::rustls::pki_types::ServerName::try_from(domain.as_str())
+                                .map_err(|e| {
+                                    ClientConnectError::InvalidConfig(format!(
+                                        "Invalid TLS domain name '{domain}': {e}"
+                                    ))
+                                })?
+                                .to_owned();
+                        let connector = DynamicTlsConnector {
+                            tls: tokio_rustls::TlsConnector::from(rustls_config),
+                            domain: Arc::new(server_name),
+                        };
+                        channel.connect_with_connector(connector).await?
+                    } else {
+                        channel.connect().await?
+                    }
+                    #[cfg(not(feature = "dynamic-tls"))]
+                    channel.connect().await?
+                };
+                (
+                    ServiceBuilder::new()
+                        .layer_fn(move |channel| GrpcMetricSvc {
+                            inner: ChannelOrGrpcOverride::Channel(channel),
+                            metrics: options.metrics_meter.clone().map(MetricsContext::new),
+                            disable_errcode_label: options.disable_error_code_metric_tags,
+                        })
+                        .service(channel),
+                    None,
+                )
+            }
         };
 
         let headers = Arc::new(RwLock::new(ClientHeaders {
@@ -593,6 +611,7 @@ impl ClientHeaders {
 
 /// Result of TLS configuration: either standard tonic TLS was applied to the endpoint,
 /// or a custom rustls config is needed for dynamic certificate resolution.
+#[cfg(feature = "native-transport")]
 #[derive(Debug)]
 enum TlsConfigResult {
     /// Standard tonic TLS was applied, endpoint is ready to connect normally.
@@ -616,6 +635,7 @@ enum TlsConfigResult {
 /// static client certificates). In that case, we return `TlsConfigResult::CustomConnector`
 /// with a manually-built `rustls::ClientConfig` that the caller must use with
 /// `connect_with_connector`.
+#[cfg(feature = "native-transport")]
 async fn add_tls_to_channel(
     tls_options: Option<&TlsOptions>,
     mut channel: Endpoint,
@@ -2927,6 +2947,7 @@ mod tests {
         assert_eq!(attempts.load(Ordering::SeqCst), 1);
     }
 
+    #[cfg(feature = "native-transport")]
     #[tokio::test]
     async fn connect_timeout_bounds_connection_attempt() {
         let url = Url::parse("http://10.255.255.1:7233").unwrap();
@@ -2939,6 +2960,7 @@ mod tests {
         assert!(start.elapsed() < Duration::from_secs(2));
     }
 
+    #[cfg(feature = "native-transport")]
     mod tls_custom_verifier_tests {
         use super::*;
         use tokio_rustls::rustls::{

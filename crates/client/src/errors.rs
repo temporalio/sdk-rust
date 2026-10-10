@@ -37,6 +37,7 @@ pub enum ClientConnectError {
     #[error("Invalid headers: {0}")]
     InvalidHeaders(#[from] InvalidHeaderError),
     /// Server connection error. Crashing and restarting the worker is likely best.
+    #[cfg(feature = "native-transport")]
     #[error("Server connection error: {0:?}")]
     TonicTransportError(#[from] tonic::transport::Error),
     /// We couldn't successfully make the `get_system_info` call at connection time to establish

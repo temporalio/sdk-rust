@@ -1,14 +1,22 @@
+#[cfg(feature = "native-transport")]
 use crate::{
     add_tls_to_channel,
-    errors::ClientConnectError,
-    options_structs::{
-        ClientKeepAliveOptions, ConnectionOptions, DnsLoadBalancingOptions, TlsOptions,
-    },
+    options_structs::{ClientKeepAliveOptions, TlsOptions},
 };
+use crate::{
+    errors::ClientConnectError,
+    options_structs::{ConnectionOptions, DnsLoadBalancingOptions},
+};
+#[cfg(feature = "native-transport")]
 use http::Uri;
-use std::{collections::HashSet, net::SocketAddr, sync::Arc, time::Duration};
+use std::time::Duration;
+#[cfg(feature = "native-transport")]
+use std::{collections::HashSet, net::SocketAddr, sync::Arc};
+#[cfg(feature = "native-transport")]
 use tokio::sync::mpsc;
+#[cfg(feature = "native-transport")]
 use tonic::transport::{Channel, Endpoint, channel::Change};
+#[cfg(feature = "native-transport")]
 use url::Url;
 
 const MIN_DNS_RESOLUTION_INTERVAL: Duration = Duration::from_secs(1);
@@ -55,12 +63,14 @@ pub(crate) fn validate_and_get_dns_lb(
     }
 }
 
+#[cfg(feature = "native-transport")]
 async fn resolve_host(host: &str, port: u16) -> Result<Vec<SocketAddr>, std::io::Error> {
     tokio::net::lookup_host(format!("{host}:{port}"))
         .await
         .map(|addrs| addrs.collect())
 }
 
+#[cfg(feature = "native-transport")]
 fn endpoint_uri(addr: SocketAddr, scheme: &str) -> String {
     match addr {
         SocketAddr::V4(v4) => format!("{scheme}://{v4}"),
@@ -68,6 +78,7 @@ fn endpoint_uri(addr: SocketAddr, scheme: &str) -> String {
     }
 }
 
+#[cfg(feature = "native-transport")]
 async fn build_endpoint(
     addr: SocketAddr,
     original_host: &str,
@@ -129,6 +140,7 @@ async fn build_endpoint(
 }
 
 /// Creates a balanced channel backed by all DNS-resolved addresses for the target.
+#[cfg(feature = "native-transport")]
 pub(crate) async fn create_balanced_channel(
     options: &ConnectionOptions,
 ) -> Result<(Channel, mpsc::Sender<Change<SocketAddr, Endpoint>>), ClientConnectError> {
@@ -176,18 +188,25 @@ pub(crate) async fn create_balanced_channel(
 }
 
 /// Handle that aborts the DNS re-resolution task when dropped.
+#[cfg(feature = "native-transport")]
 #[derive(Debug)]
 pub(crate) struct DnsReresolutionHandle {
     abort_handle: tokio::task::AbortHandle,
 }
 
+#[cfg(feature = "native-transport")]
 impl Drop for DnsReresolutionHandle {
     fn drop(&mut self) {
         self.abort_handle.abort();
     }
 }
 
+#[cfg(not(feature = "native-transport"))]
+#[derive(Debug)]
+pub(crate) struct DnsReresolutionHandle;
+
 /// Spawns a background task that periodically re-resolves DNS and updates the balanced channel.
+#[cfg(feature = "native-transport")]
 pub(crate) fn spawn_dns_reresolution(
     sender: mpsc::Sender<Change<SocketAddr, Endpoint>>,
     target: Url,
@@ -325,12 +344,14 @@ mod tests {
         assert!(validate_and_get_dns_lb(&opts).unwrap().is_none());
     }
 
+    #[cfg(feature = "native-transport")]
     #[test]
     fn endpoint_uri_v4() {
         let addr: SocketAddr = "1.2.3.4:7233".parse().unwrap();
         assert_eq!(endpoint_uri(addr, "https"), "https://1.2.3.4:7233");
     }
 
+    #[cfg(feature = "native-transport")]
     #[test]
     fn endpoint_uri_v6() {
         let addr: SocketAddr = "[::1]:7233".parse().unwrap();

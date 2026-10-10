@@ -56,6 +56,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("cargo:descriptor_path={}", descriptor_file.display());
     let protos = &[
         "./protos/local/temporal/sdk/core/core_interface.proto",
+        "./protos/local/temporal/sdk/core/wasm_bridge/wasm_bridge.proto",
         "./protos/api_upstream/temporal/api/sdk/v1/workflow_metadata.proto",
         "./protos/api_upstream/temporal/api/workflowservice/v1/service.proto",
         "./protos/api_upstream/temporal/api/nexusservices/workerservice/v1/request_response.proto",
@@ -79,6 +80,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // feature to preserve the generated clients it re-exports today.
         .build_server(false)
         .build_client(env::var_os("CARGO_FEATURE_GRPC_CLIENTS").is_some())
+        .build_transport(env::var_os("CARGO_FEATURE_GRPC_TRANSPORT").is_some())
         // Make conversions easier for some types
         .type_attribute(
             "temporal.api.history.v1.HistoryEvent.attributes",
