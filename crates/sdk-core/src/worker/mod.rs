@@ -31,8 +31,12 @@ pub use tuner::{
     SlotSupplierOptions, TunerBuilder, TunerHolder, TunerHolderOptions,
 };
 // Re-export the generated builder (it's in the tuner module)
+#[cfg(not(target_family = "wasm"))]
+pub(crate) use tuner::RealSysInfo;
+pub(crate) use tuner::SystemResourceInfo;
 pub use tuner::TunerHolderOptionsBuilder;
-pub(crate) use tuner::{RealSysInfo, SystemResourceInfo};
+#[cfg(target_family = "wasm")]
+pub(crate) use tuner::UnavailableSysInfo;
 
 pub(crate) use activities::{
     ExecutingLAId, LocalActRequest, LocalActivityExecutionResult, LocalActivityResolution,
@@ -874,7 +878,7 @@ impl Worker {
         let worker_heartbeat = worker_heartbeat_options.map(|heartbeat_options| {
             let hb_interval = heartbeat_options.interval;
             let heartbeat_sys_info =
-                sys_info.unwrap_or_else(|| Arc::new(RealSysInfo::new(hb_interval)));
+                sys_info.unwrap_or_else(|| default_heartbeat_sys_info(hb_interval));
             let hb_metrics = HeartbeatMetrics {
                 in_mem_metrics: metrics.in_memory_meter(),
                 wft_slots: wft_slots.clone(),
@@ -2341,7 +2345,7 @@ impl WorkerHeartbeatManager {
                 worker_instance_key: worker_instance_key.to_string(),
                 host_info: Some(WorkerHostInfo {
                     host_name: worker_host_name(),
-                    process_id: std::process::id().to_string(),
+                    process_id: worker_process_id(),
                     current_host_cpu_usage: heartbeat_manager_metrics.sys_info.used_cpu_percent()
                         as f32,
                     current_host_mem_usage: heartbeat_manager_metrics.sys_info.used_mem_percent()
@@ -2495,6 +2499,30 @@ fn worker_host_name() -> String {
 
 #[cfg(not(feature = "native-environment"))]
 fn worker_host_name() -> String {
+    String::new()
+}
+
+#[cfg(not(target_family = "wasm"))]
+fn worker_process_id() -> String {
+    std::process::id().to_string()
+}
+
+#[cfg(not(target_family = "wasm"))]
+fn default_heartbeat_sys_info(
+    refresh_interval: Duration,
+) -> Arc<dyn SystemResourceInfo + Send + Sync> {
+    Arc::new(RealSysInfo::new(refresh_interval))
+}
+
+#[cfg(target_family = "wasm")]
+fn default_heartbeat_sys_info(
+    _refresh_interval: Duration,
+) -> Arc<dyn SystemResourceInfo + Send + Sync> {
+    Arc::new(UnavailableSysInfo)
+}
+
+#[cfg(target_family = "wasm")]
+fn worker_process_id() -> String {
     String::new()
 }
 

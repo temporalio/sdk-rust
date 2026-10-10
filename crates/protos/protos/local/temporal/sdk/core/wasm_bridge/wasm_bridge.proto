@@ -2,6 +2,30 @@ syntax = "proto3";
 
 package coresdk.wasm_bridge;
 
+import "temporal/api/workflowservice/v1/request_response.proto";
+
+// Standalone-activity client calls supported by the Core WASM bridge.
+message ClientRequest {
+    oneof operation {
+        temporal.api.workflowservice.v1.StartActivityExecutionRequest start_activity = 1;
+        temporal.api.workflowservice.v1.PollActivityExecutionRequest poll_activity = 2;
+        temporal.api.workflowservice.v1.RequestCancelActivityExecutionRequest cancel_activity = 3;
+        temporal.api.workflowservice.v1.DescribeActivityExecutionRequest describe_activity = 4;
+    }
+}
+
+message ClientResponse {
+    int32 status_code = 1;
+    string status_message = 2;
+    bytes status_details = 3;
+    oneof operation {
+        temporal.api.workflowservice.v1.StartActivityExecutionResponse start_activity = 10;
+        temporal.api.workflowservice.v1.PollActivityExecutionResponse poll_activity = 11;
+        temporal.api.workflowservice.v1.RequestCancelActivityExecutionResponse cancel_activity = 12;
+        temporal.api.workflowservice.v1.DescribeActivityExecutionResponse describe_activity = 13;
+    }
+}
+
 // A unary gRPC request sent from Temporal Core to the Go host transport.
 message GrpcRequest {
     uint64 id = 1;

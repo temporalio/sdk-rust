@@ -262,6 +262,14 @@ relevant information.
 * The Rust SDK now has an optional `testing` feature with a typed activity test environment and
   local or external workflow test environments. Local workflow environments manage a Temporal CLI
   dev server and expose shutdown through their local-server type state.
+* The WASM bridge exports a source and protobuf fingerprint so Go hosts can reject incompatible
+  embedded Core binaries before making bridge calls.
+* The WASM bridge exports Core envconfig profile and file loading for Go hosts that provide
+  configuration bytes and environment values.
+* The WASM bridge supports a client-only connection and standalone activity start, poll,
+  cancellation, and describe RPCs through Core's callback transport.
+* The WASM bridge client RPC now uses generated protobuf request and response variants instead of
+  a numeric method selector and untyped response bytes.
 * Core workflow processing can run on a caller-driven Tokio `LocalSet` on `wasm32` targets where
   native threads are unavailable.
 * Native client transport, runtime, and host-environment dependencies can now be disabled so Core
@@ -405,6 +413,10 @@ relevant information.
 * The default `tls-ring` build no longer pulls in `aws-lc-rs`. `tls-aws-lc` builds are unchanged.
 
 ### Fixed
+* Oversized WASM host transport responses now fail the affected gRPC request with
+  `RESOURCE_EXHAUSTED` instead of stopping the bridge event loop.
+* Canceling a Go client call now aborts the matching Core RPC and its host gRPC request, releasing
+  bridge operation and transport capacity without waiting for the server response.
 * The WASM callback transport now preserves unary gRPC response metadata and structured status
   details when responses cross the host bridge.
 * Panics from update validators now reject the update instead of repeatedly failing workflow

@@ -1,9 +1,6 @@
 # Build files
 /target/
 
-# sdk-core is a library we allow consumers pin specific versions.
-Cargo.lock
-
 /.idea/
 *.iml
 *~

@@ -2,7 +2,11 @@ mod fixed_size;
 mod resource_based;
 
 pub use fixed_size::FixedSizeSlotSupplier;
-pub(crate) use resource_based::{RealSysInfo, SystemResourceInfo};
+#[cfg(not(target_family = "wasm"))]
+pub(crate) use resource_based::RealSysInfo;
+pub(crate) use resource_based::SystemResourceInfo;
+#[cfg(target_family = "wasm")]
+pub(crate) use resource_based::UnavailableSysInfo;
 pub use resource_based::{
     ResourceBasedSlotsOptions, ResourceBasedSlotsOptionsBuilder, ResourceBasedTuner,
     ResourceController, ResourceSlotOptions,

@@ -273,6 +273,28 @@ pub trait SystemResourceInfo {
     }
 }
 
+#[cfg(target_family = "wasm")]
+pub(crate) struct UnavailableSysInfo;
+
+#[cfg(target_family = "wasm")]
+impl SystemResourceInfo for UnavailableSysInfo {
+    fn total_mem(&self) -> u64 {
+        0
+    }
+
+    fn used_mem(&self) -> u64 {
+        0
+    }
+
+    fn used_cpu_percent(&self) -> f64 {
+        0.0
+    }
+
+    fn used_mem_percent(&self) -> f64 {
+        0.0
+    }
+}
+
 #[async_trait::async_trait]
 impl<MI, SK> SlotSupplier for ResourceBasedSlotsForType<MI, SK>
 where

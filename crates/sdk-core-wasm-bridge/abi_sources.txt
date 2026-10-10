@@ -1,0 +1,14 @@
+crates/sdk-core-wasm-bridge/build.rs
+crates/sdk-core-wasm-bridge/src/lib.rs
+crates/sdk-core-wasm-bridge/src/envconfig.rs
+crates/protos/protos/local/temporal/sdk/core/activity_result/activity_result.proto
+crates/protos/protos/local/temporal/sdk/core/activity_task/activity_task.proto
+crates/protos/protos/local/temporal/sdk/core/child_workflow/child_workflow.proto
+crates/protos/protos/local/temporal/sdk/core/common/common.proto
+crates/protos/protos/local/temporal/sdk/core/core_interface.proto
+crates/protos/protos/local/temporal/sdk/core/external_data/external_data.proto
+crates/protos/protos/local/temporal/sdk/core/nexus/nexus.proto
+crates/protos/protos/local/temporal/sdk/core/wasm_bridge/wasm_bridge.proto
+crates/protos/protos/local/temporal/sdk/core/workflow_activation/workflow_activation.proto
+crates/protos/protos/local/temporal/sdk/core/workflow_commands/workflow_commands.proto
+crates/protos/protos/local/temporal/sdk/core/workflow_completion/workflow_completion.proto

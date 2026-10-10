@@ -14,6 +14,7 @@ use std::{
         Arc, Mutex, OnceLock,
         atomic::{AtomicU64, Ordering},
     },
+    time::Duration,
 };
 use temporalio_client::{
     Connection, ConnectionOptions,
@@ -24,7 +25,9 @@ use temporalio_client::{
 use temporalio_common::protos::coresdk::{
     ActivityHeartbeat, ActivityTaskCompletion,
     wasm_bridge::{
+        ClientRequest as BridgeClientRequest, ClientResponse as BridgeClientResponse,
         GrpcRequest as BridgeGrpcRequest, GrpcResponse as BridgeGrpcResponse, MetadataEntry,
+        client_request, client_response,
     },
     workflow_completion::WorkflowActivationCompletion,
 };
@@ -39,6 +42,19 @@ use tonic::{
     Code, Status,
     metadata::{BinaryMetadataValue, KeyAndValueRef, MetadataMap},
 };
+
+mod envconfig;
+
+include!(concat!(env!("OUT_DIR"), "/abi_fingerprint.rs"));
+
+/// Identifies the bridge implementation and Core protobuf sources bundled in this module.
+#[unsafe(no_mangle)]
+pub extern "C" fn temporal_core_abi_fingerprint() -> u64 {
+    ABI_FINGERPRINT
+}
+
+const SDK_NAME: &str = "go-sdk-core";
+const SDK_VERSION: &str = "v0.1.0";
 
 const BRIDGE_ERROR: i32 = -1;
 const BRIDGE_PENDING: i32 = 1;
@@ -60,6 +76,7 @@ enum BridgeInitMode {
     ActivityOnly = 0,
     WorkflowOnly = 1,
     Combined = 2,
+    ClientOnly = 3,
 }
 
 impl BridgeInitMode {
@@ -68,6 +85,7 @@ impl BridgeInitMode {
             Self::ActivityOnly => "activity",
             Self::WorkflowOnly => "workflow",
             Self::Combined => "combined",
+            Self::ClientOnly => "client",
         }
     }
 
@@ -88,6 +106,7 @@ impl TryFrom<u32> for BridgeInitMode {
             x if x == Self::ActivityOnly as u32 => Ok(Self::ActivityOnly),
             x if x == Self::WorkflowOnly as u32 => Ok(Self::WorkflowOnly),
             x if x == Self::Combined as u32 => Ok(Self::Combined),
+            x if x == Self::ClientOnly as u32 => Ok(Self::ClientOnly),
             _ => Err(format!("unsupported bridge init mode {value}")),
         }
     }
@@ -116,6 +135,7 @@ struct BridgeState {
     runtime: tokio::runtime::Runtime,
     _core_runtime: CoreRuntime,
     worker: Option<Arc<Worker>>,
+    connection: Option<Connection>,
     worker_config: Option<WorkerConfig>,
     connection_result: ConnectionSlot,
     initialization_result: OperationSlot,
@@ -123,6 +143,8 @@ struct BridgeState {
     workflow_completion_results: OperationRegistry,
     activity_poll_result: OperationSlot,
     activity_completion_results: OperationRegistry,
+    client_rpc_results: OperationRegistry,
+    client_rpc_tasks: HashMap<u64, tokio::task::AbortHandle>,
     shutdown_result: OperationSlot,
 }
 
@@ -140,6 +162,45 @@ struct HostTransport {
     next_id: AtomicU64,
     requests: Mutex<QueuedGrpcRequests>,
     responders: Mutex<HashMap<u64, oneshot::Sender<HostGrpcResponse>>>,
+    cancelled: Mutex<VecDeque<u64>>,
+}
+
+struct HostRequestGuard<'a> {
+    transport: &'a HostTransport,
+    id: u64,
+}
+
+impl Drop for HostRequestGuard<'_> {
+    fn drop(&mut self) {
+        let sender = self
+            .transport
+            .responders
+            .lock()
+            .expect("host transport responders lock is not poisoned")
+            .remove(&self.id);
+        if sender.is_none() {
+            return;
+        }
+        let mut queued = self
+            .transport
+            .requests
+            .lock()
+            .expect("host transport request lock is not poisoned");
+        if let Some(index) = queued
+            .queue
+            .iter()
+            .position(|request| request.id == self.id)
+        {
+            let request = queued.queue.remove(index).expect("request index is valid");
+            queued.queued_bytes -= request.encoded_len();
+        } else {
+            self.transport
+                .cancelled
+                .lock()
+                .expect("host transport cancellation lock is not poisoned")
+                .push_back(self.id);
+        }
+    }
 }
 
 impl HostTransport {
@@ -161,6 +222,10 @@ impl HostTransport {
                 .remove(&id);
             return Err(Status::resource_exhausted(error));
         }
+        let _guard = HostRequestGuard {
+            transport: self,
+            id,
+        };
         response_rx
             .await
             .unwrap_or_else(|_| Err(Status::cancelled("host transport response was dropped")))
@@ -231,9 +296,14 @@ impl HostTransport {
             .expect("host transport request lock is not poisoned");
         queued.queue.clear();
         queued.queued_bytes = 0;
+        drop(queued);
         self.responders
             .lock()
             .expect("host transport responders lock is not poisoned")
+            .clear();
+        self.cancelled
+            .lock()
+            .expect("host transport cancellation lock is not poisoned")
             .clear();
     }
 }
@@ -286,6 +356,7 @@ pub extern "C" fn temporal_core_init_with_worker_options(
     max_concurrent_workflow_task_pollers: usize,
     max_cached_workflows: usize,
     max_eager_activity_reservations_per_workflow_task: usize,
+    worker_heartbeat_interval_millis: usize,
     mode: u32,
     error_ptr: *mut u8,
     error_capacity: usize,
@@ -318,7 +389,7 @@ pub extern "C" fn temporal_core_init_with_worker_options(
             .build()
             .map_err(|err| format!("failed to create Tokio runtime: {err}"))?;
         let runtime_options = RuntimeOptions::builder()
-            .heartbeat_interval(None)
+            .heartbeat_interval(worker_heartbeat_interval(worker_heartbeat_interval_millis))
             .disable_environment_info(true)
             .build()
             .map_err(|err| format!("invalid Core runtime options: {err}"))?;
@@ -341,12 +412,20 @@ pub extern "C" fn temporal_core_init_with_worker_options(
                 .expect("static URL is valid"),
         )
         .identity(identity)
+        .client_name(SDK_NAME.to_owned())
+        .client_version(SDK_VERSION.to_owned())
         .service_override(grpc_service)
         .dns_load_balancing(None)
         .keep_alive(None)
         .build();
 
-        let worker_config = worker_config_for_mode(mode, namespace, task_queue, options)?;
+        let worker_config = if mode == BridgeInitMode::ClientOnly {
+            None
+        } else {
+            Some(worker_config_for_mode(
+                mode, namespace, task_queue, options,
+            )?)
+        };
 
         let connection_result = Arc::new(Mutex::new(None));
         let initialization_result = operation_slot();
@@ -366,13 +445,16 @@ pub extern "C" fn temporal_core_init_with_worker_options(
             runtime,
             _core_runtime: core_runtime,
             worker: None,
-            worker_config: Some(worker_config),
+            connection: None,
+            worker_config,
             connection_result,
             initialization_result,
             workflow_poll_result: operation_slot(),
             workflow_completion_results: operation_registry(),
             activity_poll_result: operation_slot(),
             activity_completion_results: operation_registry(),
+            client_rpc_results: operation_registry(),
+            client_rpc_tasks: HashMap::new(),
             shutdown_result: operation_slot(),
         });
         Ok(Vec::new())
@@ -394,7 +476,14 @@ fn worker_config_for_mode(
         ),
         BridgeInitMode::WorkflowOnly => workflow_worker_config(namespace, task_queue, options),
         BridgeInitMode::Combined => combined_worker_config(namespace, task_queue, options),
+        BridgeInitMode::ClientOnly => {
+            Err("client-only mode has no worker configuration".to_owned())
+        }
     }
+}
+
+fn worker_heartbeat_interval(interval_millis: usize) -> Option<Duration> {
+    (interval_millis != 0).then(|| Duration::from_millis(interval_millis as u64))
 }
 
 fn decode_worker_init_options(
@@ -420,7 +509,9 @@ fn decode_worker_init_options(
                     max_eager_activity_reservations_per_workflow_task
                 }
             }
-            BridgeInitMode::ActivityOnly | BridgeInitMode::WorkflowOnly => {
+            BridgeInitMode::ActivityOnly
+            | BridgeInitMode::WorkflowOnly
+            | BridgeInitMode::ClientOnly => {
                 DEFAULT_MAX_EAGER_ACTIVITY_RESERVATIONS_PER_WORKFLOW_TASK
             }
         },
@@ -507,7 +598,7 @@ fn combined_worker_config(
 #[unsafe(no_mangle)]
 pub extern "C" fn temporal_core_take_init(error_ptr: *mut u8, error_capacity: usize) -> i64 {
     let preparation = with_state(|state| {
-        if state.worker.is_some() {
+        if state.worker.is_some() || state.connection.is_some() {
             return Ok(());
         }
         let Some(connection) = state
@@ -525,18 +616,29 @@ pub extern "C" fn temporal_core_take_init(error_ptr: *mut u8, error_capacity: us
                 return Ok(());
             }
         };
+        if state.mode == BridgeInitMode::ClientOnly {
+            state.connection = Some(connection);
+            set_ready(&state.initialization_result, Ok(Vec::new()));
+            return Ok(());
+        }
         let mode = state.mode;
         let worker_config = state
             .worker_config
             .take()
             .ok_or_else(|| "worker configuration is missing".to_owned())?;
         #[cfg(not(target_arch = "wasm32"))]
-        let worker_result = init_worker(&state._core_runtime, worker_config, connection);
-        #[cfg(target_arch = "wasm32")]
-        let worker_result = WORKFLOW_LOCAL_SET.with(|local| {
-            let _guard = local.enter();
+        let worker_result = {
+            let _runtime_guard = state.runtime.enter();
             init_worker(&state._core_runtime, worker_config, connection)
-        });
+        };
+        #[cfg(target_arch = "wasm32")]
+        let worker_result = {
+            let _runtime_guard = state.runtime.enter();
+            WORKFLOW_LOCAL_SET.with(|local| {
+                let _local_guard = local.enter();
+                init_worker(&state._core_runtime, worker_config, connection)
+            })
+        };
         let worker = match worker_result {
             Ok(worker) => Arc::new(worker),
             Err(error) => {
@@ -577,6 +679,150 @@ pub extern "C" fn temporal_core_take_init(error_ptr: *mut u8, error_capacity: us
         reset_bridge_state();
     }
     result
+}
+
+fn decode_client_request(bytes: &[u8]) -> Result<BridgeClientRequest, String> {
+    let request = BridgeClientRequest::decode(bytes)
+        .map_err(|error| format!("invalid client request protobuf: {error}"))?;
+    if request.operation.is_none() {
+        return Err("client request has no operation".to_owned());
+    }
+    Ok(request)
+}
+
+fn encode_client_response<T>(
+    response: Result<tonic::Response<T>, Status>,
+    wrap: impl FnOnce(T) -> client_response::Operation,
+) -> Vec<u8> {
+    let response = match response {
+        Ok(value) => BridgeClientResponse {
+            status_code: Code::Ok as i32,
+            operation: Some(wrap(value.into_inner())),
+            ..Default::default()
+        },
+        Err(status) => BridgeClientResponse {
+            status_code: status.code() as i32,
+            status_message: status.message().to_owned(),
+            status_details: status.details().to_vec(),
+            ..Default::default()
+        },
+    };
+    response.encode_to_vec()
+}
+
+/// Start a standalone-activity client RPC through Core's callback transport.
+#[unsafe(no_mangle)]
+pub extern "C" fn temporal_core_start_client_rpc(
+    operation_id: u64,
+    request_ptr: *const u8,
+    request_len: usize,
+    error_ptr: *mut u8,
+    error_capacity: usize,
+) -> i64 {
+    write_result(error_ptr, error_capacity, || {
+        if request_len > MAX_HOST_TRANSPORT_MESSAGE_BYTES {
+            return Err("client request exceeds bridge message limit".to_owned());
+        }
+        let request = decode_client_request(read_bytes(request_ptr, request_len))?;
+        with_state(|state| {
+            if state.mode != BridgeInitMode::ClientOnly {
+                return Err("client RPC requires client-only bridge mode".to_owned());
+            }
+            let connection = state
+                .connection
+                .clone()
+                .ok_or_else(|| "Core client initialization is not complete".to_owned())?;
+            mark_operation_pending(&state.client_rpc_results, operation_id, "client RPC")?;
+            let results = state.client_rpc_results.clone();
+            let task = state.runtime.spawn(async move {
+                let mut service = connection.workflow_service();
+                let encoded = match request.operation.expect("validated client request") {
+                    client_request::Operation::StartActivity(request) => encode_client_response(
+                        service
+                            .start_activity_execution(tonic::Request::new(request))
+                            .await,
+                        client_response::Operation::StartActivity,
+                    ),
+                    client_request::Operation::PollActivity(request) => encode_client_response(
+                        service
+                            .poll_activity_execution(tonic::Request::new(request))
+                            .await,
+                        client_response::Operation::PollActivity,
+                    ),
+                    client_request::Operation::CancelActivity(request) => encode_client_response(
+                        service
+                            .request_cancel_activity_execution(tonic::Request::new(request))
+                            .await,
+                        client_response::Operation::CancelActivity,
+                    ),
+                    client_request::Operation::DescribeActivity(request) => encode_client_response(
+                        service
+                            .describe_activity_execution(tonic::Request::new(request))
+                            .await,
+                        client_response::Operation::DescribeActivity,
+                    ),
+                };
+                set_operation_ready(&results, operation_id, Ok(encoded));
+            });
+            state
+                .client_rpc_tasks
+                .insert(operation_id, task.abort_handle());
+            Ok(Vec::new())
+        })
+    })
+}
+
+/// Take a completed client RPC response.
+#[unsafe(no_mangle)]
+pub extern "C" fn temporal_core_take_client_rpc(
+    operation_id: u64,
+    output_ptr: *mut u8,
+    output_capacity: usize,
+) -> i64 {
+    let result = take_operation_registry_result(
+        operation_id,
+        output_ptr,
+        output_capacity,
+        |state| &state.client_rpc_results,
+        "client RPC",
+    );
+    if matches!(unpack_result_code(result), 0 | BRIDGE_ERROR) {
+        let _ = with_state(|state| {
+            state.client_rpc_tasks.remove(&operation_id);
+            Ok(())
+        });
+    }
+    result
+}
+
+/// Cancel a client RPC and release its operation slot.
+#[unsafe(no_mangle)]
+pub extern "C" fn temporal_core_cancel_client_rpc(
+    operation_id: u64,
+    error_ptr: *mut u8,
+    error_capacity: usize,
+) -> i64 {
+    write_result(error_ptr, error_capacity, || {
+        with_state(|state| {
+            if state.mode != BridgeInitMode::ClientOnly {
+                return Err("client RPC requires client-only bridge mode".to_owned());
+            }
+            let removed = state
+                .client_rpc_results
+                .lock()
+                .map_err(|_| "client RPC registry lock is poisoned".to_owned())?
+                .remove(&operation_id);
+            if removed.is_none() {
+                return Err(format!(
+                    "client RPC operation ID {operation_id} has not been started"
+                ));
+            }
+            if let Some(task) = state.client_rpc_tasks.remove(&operation_id) {
+                task.abort();
+            }
+            Ok(Vec::new())
+        })
+    })
 }
 
 /// Start an asynchronous Core activity poll.
@@ -867,6 +1113,37 @@ pub extern "C" fn temporal_core_take_grpc_request(
     )
 }
 
+/// Take a host gRPC request ID whose Core future was canceled.
+#[unsafe(no_mangle)]
+pub extern "C" fn temporal_core_take_cancelled_grpc_request(
+    output_ptr: *mut u8,
+    output_capacity: usize,
+) -> i64 {
+    let transport = HOST_TRANSPORT.get_or_init(HostTransport::default);
+    let result = (|| -> Result<i64, String> {
+        let mut cancelled = transport
+            .cancelled
+            .lock()
+            .map_err(|_| "host transport cancellation lock is poisoned".to_owned())?;
+        let Some(id) = cancelled.front() else {
+            return Ok(pack_result(BRIDGE_PENDING, 0));
+        };
+        let bytes = id.to_le_bytes();
+        if let Some(too_small) =
+            buffer_too_small_result(bytes.len(), output_capacity, "gRPC cancellation ID")?
+        {
+            return Ok(too_small);
+        }
+        cancelled.pop_front();
+        copy_to_guest(output_ptr, &bytes);
+        Ok(pack_result(0, bytes.len() as u32))
+    })();
+    match result {
+        Ok(code) => code,
+        Err(error) => write_result(output_ptr, output_capacity, || Err(error)),
+    }
+}
+
 /// Return a prost-encoded `coresdk.wasm_bridge.GrpcResponse` to the waiting Core transport future.
 #[unsafe(no_mangle)]
 pub extern "C" fn temporal_core_complete_grpc_request(
@@ -878,12 +1155,11 @@ pub extern "C" fn temporal_core_complete_grpc_request(
 ) -> i64 {
     write_result(error_ptr, error_capacity, || {
         let response = read_bytes(response_ptr, response_len);
-        ensure_host_transport_response_size(response.len())?;
-        let response = decode_grpc_response(response)?;
-        let response = into_grpc_response(response)?;
-        HOST_TRANSPORT
-            .get_or_init(HostTransport::default)
-            .complete(id, response)?;
+        complete_grpc_response(
+            HOST_TRANSPORT.get_or_init(HostTransport::default),
+            id,
+            response,
+        )?;
         Ok(Vec::new())
     })
 }
@@ -1084,6 +1360,10 @@ fn reset_bridge_state() {
     {
         reset_operation_registry(&state.workflow_completion_results);
         reset_operation_registry(&state.activity_completion_results);
+        reset_operation_registry(&state.client_rpc_results);
+        for task in state.client_rpc_tasks.into_values() {
+            task.abort();
+        }
     }
     HOST_TRANSPORT.get_or_init(HostTransport::default).reset();
 }
@@ -1104,6 +1384,18 @@ fn ensure_host_transport_response_size(response_len: usize) -> Result<(), String
         ));
     }
     Ok(())
+}
+
+fn complete_grpc_response(
+    transport: &HostTransport,
+    id: u64,
+    encoded: &[u8],
+) -> Result<(), String> {
+    let response = match ensure_host_transport_response_size(encoded.len()) {
+        Ok(()) => into_grpc_response(decode_grpc_response(encoded)?)?,
+        Err(error) => Err(Status::resource_exhausted(error)),
+    };
+    transport.complete(id, response)
 }
 
 fn encoded_grpc_request_len(request: &PendingGrpcRequest) -> Result<usize, String> {
@@ -1438,6 +1730,35 @@ fn unpack_result(result: i64) -> (i32, usize) {
 mod tests {
     use super::*;
     use http::HeaderValue;
+    use temporalio_common::protos::temporal::api::workflowservice::v1::{
+        StartActivityExecutionRequest, StartActivityExecutionResponse,
+    };
+
+    #[test]
+    fn worker_heartbeat_interval_disables_on_zero() {
+        assert_eq!(worker_heartbeat_interval(0), None);
+        assert_eq!(
+            worker_heartbeat_interval(30_000),
+            Some(Duration::from_secs(30))
+        );
+    }
+
+    fn build_runtime_options(interval_millis: usize) -> Result<RuntimeOptions, String> {
+        RuntimeOptions::builder()
+            .heartbeat_interval(worker_heartbeat_interval(interval_millis))
+            .disable_environment_info(true)
+            .build()
+    }
+
+    #[test]
+    fn runtime_options_accept_the_supported_heartbeat_range() {
+        for millis in [1_000, 60_000] {
+            assert!(build_runtime_options(millis).is_ok());
+        }
+        for millis in [999, 60_001] {
+            assert!(build_runtime_options(millis).is_err());
+        }
+    }
 
     #[test]
     fn worker_config_uses_core_activity_concurrency() {
@@ -1611,7 +1932,39 @@ mod tests {
             BridgeInitMode::try_from(BridgeInitMode::Combined as u32).expect("mode is valid"),
             BridgeInitMode::Combined
         );
+        assert_eq!(
+            BridgeInitMode::try_from(BridgeInitMode::ClientOnly as u32).expect("mode is valid"),
+            BridgeInitMode::ClientOnly
+        );
         assert!(BridgeInitMode::try_from(99).is_err());
+    }
+
+    #[test]
+    fn client_rpc_wire_preserves_requests_and_status_details() {
+        let request = BridgeClientRequest {
+            operation: Some(client_request::Operation::StartActivity(
+                StartActivityExecutionRequest {
+                    activity_id: "activity-id".to_owned(),
+                    ..Default::default()
+                },
+            )),
+        };
+        assert!(matches!(
+            decode_client_request(&request.encode_to_vec()),
+            Ok(BridgeClientRequest { operation: Some(client_request::Operation::StartActivity(decoded)) })
+                if decoded.activity_id == "activity-id"
+        ));
+        assert!(decode_client_request(&[]).is_err());
+
+        let status = Status::with_details(Code::InvalidArgument, "bad activity", vec![1, 2].into());
+        let encoded = encode_client_response::<StartActivityExecutionResponse>(
+            Err(status),
+            client_response::Operation::StartActivity,
+        );
+        let response = BridgeClientResponse::decode(encoded.as_slice()).expect("decode response");
+        assert_eq!(response.status_code, Code::InvalidArgument as i32);
+        assert_eq!(response.status_message, "bad activity");
+        assert_eq!(response.status_details, [1, 2]);
     }
 
     #[test]
@@ -2087,6 +2440,31 @@ mod tests {
     }
 
     #[test]
+    fn oversized_grpc_response_completes_only_its_rpc_with_resource_exhausted() {
+        let transport = HostTransport::default();
+        let (sender, mut receiver) = oneshot::channel();
+        transport
+            .responders
+            .lock()
+            .expect("responders lock is not poisoned")
+            .insert(7, sender);
+
+        complete_grpc_response(
+            &transport,
+            7,
+            &vec![0; MAX_HOST_TRANSPORT_MESSAGE_BYTES + 1],
+        )
+        .expect("oversized response should complete the pending RPC");
+
+        let status = receiver
+            .try_recv()
+            .expect("pending RPC should receive its response")
+            .expect_err("oversized response should be an RPC error");
+        assert_eq!(status.code(), Code::ResourceExhausted);
+        assert!(status.message().contains("host transport response payload"));
+    }
+
+    #[test]
     fn grpc_request_take_retries_after_undersized_buffer_without_dequeueing() {
         let transport = HostTransport::default();
         let request = PendingGrpcRequest {
@@ -2208,6 +2586,79 @@ mod tests {
             .enqueue_request(request, request_bytes)
             .expect_err("queued byte limit should reject additional requests");
         assert!(error.contains(&MAX_HOST_TRANSPORT_QUEUED_BYTES.to_string()));
+    }
+
+    #[test]
+    fn cancelled_core_future_removes_queued_host_request() {
+        let transport = HostTransport::default();
+        let request = PendingGrpcRequest {
+            id: 11,
+            service: "svc".to_owned(),
+            rpc: "rpc".to_owned(),
+            ..Default::default()
+        };
+        let encoded_len = request.encoded_len();
+        transport
+            .reserve_response_slot(11, oneshot::channel().0)
+            .expect("response slot is available");
+        transport
+            .enqueue_request(request, encoded_len)
+            .expect("request is queued");
+
+        drop(HostRequestGuard {
+            transport: &transport,
+            id: 11,
+        });
+
+        let queued = transport
+            .requests
+            .lock()
+            .expect("request lock is not poisoned");
+        assert!(queued.queue.is_empty());
+        assert_eq!(queued.queued_bytes, 0);
+        assert!(
+            transport
+                .responders
+                .lock()
+                .expect("responders lock is not poisoned")
+                .is_empty()
+        );
+        assert!(
+            transport
+                .cancelled
+                .lock()
+                .expect("cancellation lock is not poisoned")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn cancelled_core_future_notifies_host_after_dispatch() {
+        let transport = HostTransport::default();
+        transport
+            .reserve_response_slot(12, oneshot::channel().0)
+            .expect("response slot is available");
+
+        drop(HostRequestGuard {
+            transport: &transport,
+            id: 12,
+        });
+
+        assert_eq!(
+            transport
+                .cancelled
+                .lock()
+                .expect("cancellation lock is not poisoned")
+                .pop_front(),
+            Some(12)
+        );
+        assert!(
+            transport
+                .responders
+                .lock()
+                .expect("responders lock is not poisoned")
+                .is_empty()
+        );
     }
 
     #[test]
