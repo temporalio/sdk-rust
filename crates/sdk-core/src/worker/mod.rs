@@ -570,6 +570,7 @@ pub(crate) fn resolve_effective_behavior(
 
 /// The task subsystems, constructed lazily after namespace capabilities are known so that the
 /// effective poller behavior can be resolved once (see [resolve_effective_behavior]).
+#[derive(Default)]
 struct TaskSubsystems {
     workflows: Option<Workflows>,
     at_task_mgr: Option<WorkerActivityTasks>,
@@ -921,12 +922,21 @@ impl Worker {
         let worker_shutdown_token = shutdown_token.clone();
         let worker_local_act_mgr = local_act_mgr.clone();
         let worker_capabilities = capabilities.clone();
+        // Non-local activities are already complete if configured not to poll for them.
+        let non_local_activities_complete =
+            Arc::new(AtomicBool::new(!poll_on_non_local_activities));
+        let worker_non_local_activities_complete = non_local_activities_complete.clone();
 
-        // Build the poller-dependent subsystems lazily. This closure runs once, after namespace
-        // capabilities have been fetched (see `Worker::validate`), so the effective poller behavior
-        // can be resolved with knowledge of those capabilities.
+        // Build the poller-dependent subsystems lazily so effective poller behavior can be resolved
+        // with the namespace capabilities fetched by `Worker::validate`.
         let task_subsystems_builder: Box<dyn FnOnce() -> TaskSubsystems + Send> = Box::new(
             move || {
+                // Failed validation can leave this initializer untouched. Shutdown must not create
+                // task managers that wait for SDK polling loops which never started.
+                if shutdown_token.is_cancelled() {
+                    non_local_activities_complete.store(true, Ordering::Relaxed);
+                    return TaskSubsystems::default();
+                }
                 let (wft_stream, act_poller, nexus_poller) = match task_pollers {
                     TaskPollers::Real => {
                         let wft_stream = if config.task_types.enable_workflows {
@@ -1149,8 +1159,7 @@ impl Worker {
             config: worker_config,
             shutdown_token: worker_shutdown_token,
             post_activate_hook: None,
-            // Non-local activities are already complete if configured not to poll for them.
-            non_local_activities_complete: Arc::new(AtomicBool::new(!poll_on_non_local_activities)),
+            non_local_activities_complete: worker_non_local_activities_complete,
             local_activities_complete: Default::default(),
             all_permits_tracker: tokio::sync::Mutex::new(AllPermitsTracker {
                 wft_permits,
