@@ -79,8 +79,13 @@ use tokio_util::sync::CancellationToken;
 use tracing::Level;
 use uuid::Uuid;
 
+#[rstest::rstest]
+#[case::all(WorkerTaskTypes::all())]
+#[case::workflows(WorkerTaskTypes::workflow_only())]
+#[case::activities(WorkerTaskTypes::activity_only())]
+#[case::nexus(WorkerTaskTypes::nexus_only())]
 #[tokio::test]
-async fn worker_validation_fails_on_nonexistent_namespace() {
+async fn worker_validation_fails_on_nonexistent_namespace(#[case] task_types: WorkerTaskTypes) {
     let mut opts = get_integ_server_options();
     let runtime =
         CoreRuntime::new_assume_tokio(get_integ_runtime_options(get_integ_telem_options()))
@@ -96,10 +101,10 @@ async fn worker_validation_fails_on_nonexistent_namespace() {
             .versioning_strategy(WorkerVersioningStrategy::None {
                 build_id: "blah".to_owned(),
             })
-            .task_types(WorkerTaskTypes::all())
+            .task_types(task_types)
             .build()
             .unwrap(),
-        connection,
+        connection.clone(),
     )
     .unwrap();
 
@@ -108,6 +113,25 @@ async fn worker_validation_fails_on_nonexistent_namespace() {
         res,
         Err(WorkerValidationError::NamespaceDescribeError { .. })
     );
+    let worker_instance_key = worker.worker_instance_key();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        worker.shutdown().await;
+        assert_matches!(
+            worker.poll_workflow_activation().await,
+            Err(PollError::ShutDown)
+        );
+        assert_matches!(worker.poll_activity_task().await, Err(PollError::ShutDown));
+        assert_matches!(worker.poll_nexus_task().await, Err(PollError::ShutDown));
+        worker.finalize_shutdown().await;
+    })
+    .await
+    .expect("shutdown should complete after failed validation without polling");
+    let unregister_error = connection
+        .workers()
+        .finalize_unregister(worker_instance_key)
+        .err()
+        .expect("finalization should already have unregistered the worker");
+    assert!(unregister_error.to_string().contains("Worker not found"));
 }
 
 #[tokio::test]
