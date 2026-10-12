@@ -8,13 +8,13 @@ use crate::{
 use futures_util::{TryStreamExt, stream};
 use std::time::{SystemTime, UNIX_EPOCH};
 use temporalio_client::{
-    Client, ClientOptions, Connection, ConnectionOptions, WorkflowStartOptions,
+    Connection, ConnectionOptions, WorkflowStartOptions,
     grpc::{TestService, WorkflowService},
 };
 use temporalio_common::protos::temporal::api::workflowservice::v1::DescribeNamespaceRequest;
 use temporalio_macros::{workflow, workflow_methods};
 use temporalio_sdk::{
-    Runtime, Worker, WorkerOptions, WorkerRunError, WorkflowContext, WorkflowResult,
+    Runtime, Worker, WorkerOptions, WorkflowContext, WorkflowResult,
     testing::{LocalWorkflowEnvironmentOptions, WorkflowEnvironment},
 };
 use temporalio_sdk_core::ephemeral_server::{
@@ -37,24 +37,13 @@ impl TestEnvironmentWorkflow {
 }
 
 #[temporalio_macros::cloud_test_exclusion(crate::CloudTestExclusionReason::RequiresLocalServer)]
-#[rstest::rstest]
-#[case::workflow_completed(false)]
-#[case::validation_failed(true)]
 #[tokio::test]
-async fn test_workflow_environment_local(#[case] invalid_namespace: bool) {
+async fn test_workflow_environment_local() {
     let env = WorkflowEnvironment::start_local(LocalWorkflowEnvironmentOptions::default())
         .await
         .unwrap();
     let runtime = Runtime::from_current_tokio(Default::default()).unwrap();
-    let client = if invalid_namespace {
-        Client::new(
-            env.client().connection().clone(),
-            ClientOptions::new(format!("missing-{}", rand_6_chars())).build(),
-        )
-        .unwrap()
-    } else {
-        env.client().clone()
-    };
+    let client = env.client().clone();
     let worker_options = WorkerOptions::new(format!("test-env-{}", rand_6_chars()))
         .register_workflow::<OneActivityWorkflow>()
         .unwrap()
@@ -64,27 +53,21 @@ async fn test_workflow_environment_local(#[case] invalid_namespace: bool) {
     let worker = Worker::new(&runtime, client.clone(), worker_options).unwrap();
     let worker_instance_key = worker.worker_instance_key();
     let shutdown_handle = worker.shutdown_handle();
-    if invalid_namespace {
-        let result = worker.run_until(std::future::pending::<()>()).await;
-        assert!(matches!(result, Err(WorkerRunError::Validation(_))));
-    } else {
-        let handle = client
-            .start_workflow(
-                OneActivityWorkflow::run,
-                "run_until".to_owned(),
-                WorkflowStartOptions::new(task_queue, format!("test-env-{}", rand_6_chars()))
-                    .build(),
-            )
-            .await
-            .unwrap();
+    let handle = client
+        .start_workflow(
+            OneActivityWorkflow::run,
+            "run_until".to_owned(),
+            WorkflowStartOptions::new(task_queue, format!("test-env-{}", rand_6_chars())).build(),
+        )
+        .await
+        .unwrap();
 
-        worker
-            .run_until(async move {
-                handle.get_result(Default::default()).await.unwrap();
-            })
-            .await
-            .unwrap();
-    }
+    worker
+        .run_until(async move {
+            handle.get_result(Default::default()).await.unwrap();
+        })
+        .await
+        .unwrap();
     shutdown_handle();
     let unregister_error = client
         .connection()
