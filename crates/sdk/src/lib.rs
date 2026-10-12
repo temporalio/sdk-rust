@@ -1082,14 +1082,6 @@ impl Worker {
         };
 
         self.common.worker.initiate_shutdown();
-        // Validation failures skip the SDK polling loops, but Core's activity manager still needs
-        // a poll to observe shutdown before its finalizer can complete.
-        if matches!(result, Err(WorkerRunError::Validation(_))) {
-            let _ = self.common.worker.poll_activity_task().await;
-        }
-        for cancellation in self.activity_half.task_tokens_to_cancels.values() {
-            cancellation.cancel();
-        }
         // Activity completions can release Core's slots before their tasks drop their Core
         // references, so wait for the SDK tasks before taking ownership for finalization.
         self.activity_half.tasks.close();

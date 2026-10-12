@@ -1,9 +1,12 @@
-use crate::common::{
-    INTEG_CLIENT_IDENTITY, INTEG_CLIENT_NAME, INTEG_CLIENT_VERSION, NAMESPACE,
-    activity_functions::StdActivities, rand_6_chars,
+use crate::{
+    common::{
+        INTEG_CLIENT_IDENTITY, INTEG_CLIENT_NAME, INTEG_CLIENT_VERSION, NAMESPACE,
+        activity_functions::StdActivities, rand_6_chars,
+    },
+    integ_tests::workflow_tests::OneActivityWorkflow,
 };
 use futures_util::{TryStreamExt, stream};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 use temporalio_client::{
     Client, ClientOptions, Connection, ConnectionOptions, WorkflowStartOptions,
     grpc::{TestService, WorkflowService},
@@ -11,8 +14,7 @@ use temporalio_client::{
 use temporalio_common::protos::temporal::api::workflowservice::v1::DescribeNamespaceRequest;
 use temporalio_macros::{workflow, workflow_methods};
 use temporalio_sdk::{
-    ActivityOptions, Runtime, Worker, WorkerOptions, WorkerRunError, WorkflowContext,
-    WorkflowResult,
+    Runtime, Worker, WorkerOptions, WorkerRunError, WorkflowContext, WorkflowResult,
     testing::{LocalWorkflowEnvironmentOptions, WorkflowEnvironment},
 };
 use temporalio_sdk_core::ephemeral_server::{
@@ -30,24 +32,6 @@ struct TestEnvironmentWorkflow;
 impl TestEnvironmentWorkflow {
     #[run]
     async fn run(_ctx: &mut WorkflowContext<Self>) -> WorkflowResult<()> {
-        Ok(())
-    }
-}
-
-#[workflow]
-#[derive(Default)]
-struct RunUntilWorkflow;
-
-#[workflow_methods]
-impl RunUntilWorkflow {
-    #[run]
-    async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<()> {
-        ctx.execute_activity(
-            StdActivities::no_op,
-            (),
-            ActivityOptions::start_to_close_timeout(Duration::from_secs(10)),
-        )
-        .await?;
         Ok(())
     }
 }
@@ -72,7 +56,7 @@ async fn test_workflow_environment_local(#[case] invalid_namespace: bool) {
         env.client().clone()
     };
     let worker_options = WorkerOptions::new(format!("test-env-{}", rand_6_chars()))
-        .register_workflow::<RunUntilWorkflow>()
+        .register_workflow::<OneActivityWorkflow>()
         .unwrap()
         .register_activities(StdActivities)
         .build();
@@ -86,8 +70,8 @@ async fn test_workflow_environment_local(#[case] invalid_namespace: bool) {
     } else {
         let handle = client
             .start_workflow(
-                RunUntilWorkflow::run,
-                (),
+                OneActivityWorkflow::run,
+                "run_until".to_owned(),
                 WorkflowStartOptions::new(task_queue, format!("test-env-{}", rand_6_chars()))
                     .build(),
             )
