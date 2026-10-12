@@ -37,6 +37,9 @@ document as your quick reference when submitting pull requests.
   - `cargo lint` – run clippy on workspace crates and integration tests
   - `cargo test-lint` – run clippy on unit tests
   - `cargo integ-test` – run the integration test runner
+  - `cargo changelog-check` – validate Rust SDK changelog fragments
+  - `cargo prepare-release <sdk-version> <core-protos-version>` – prepare crate versions and changelogs
+  - `cargo release-notes --version <sdk-version>` – generate SDK publishing notes
 
 ## Building and Testing
 
@@ -62,27 +65,31 @@ Documentation can be generated with `cargo doc`.
 - Keep commit messages short and in the imperative mood.
 - Provide a clear PR description outlining what changed and why.
 - Reviewers expect new features or fixes to include corresponding tests when applicable.
-- Always add a changelog entry for each user-facing change in a PR, under the `## Unreleased`
-  heading and never under a released version heading. The two changelogs are split by audience:
-  the repository-root `CHANGELOG.md` serves users of the Rust SDK, and
+- Always add a changelog entry for each user-facing change in a PR. The changelogs are split by audience:
+  fragments under `changelog/<category>/` serve users of the Rust SDK, and
   `crates/sdk-core/CHANGELOG.md` serves users of the other Temporal SDKs, whose workers and
   clients run on Core.
 - Keep changelog entries concise, ideally one or two sentences describing what users can observe.
+  Rust SDK fragments use fun, whimsical lowercase kebab-case filenames. The folder supplies the
+  category, including `stabilized` for features that are no longer experimental. Each nonempty line
+  becomes a separate bullet; omit bullet markers and keep each entry on one line. See
+  `changelog/README.md`. The root `CHANGELOG.md` contains completed releases only; Core entries
+  still belong under `## Unreleased` in `crates/sdk-core/CHANGELOG.md`.
 - The test for either file is whether a user of that SDK can observe the change: different
   behavior, an option they can set, a new log or metric, a different interaction with the server.
   Ask what the user sees, not which crate or which files the PR touched.
 - The Rust SDK runs on Core too, so a user-observable change in Core behavior normally belongs in
-  both files, worded for each audience. What belongs only in the sdk-core changelog is what only
+  both changelogs, worded for each audience. What belongs only in the sdk-core changelog is what only
   the other SDKs' users can see — a Core capability the Rust SDK does not surface, or a C-bridge
   change. Conversely, an internal Rust API change that a language SDK absorbs inside its own
   bridge, without its users noticing, belongs in neither file. This applies to the crates Core
   shares as well: `temporalio-client`, `temporalio-common`, `temporalio-common-wasm`,
   `temporalio-macros`, and `temporalio-protos`.
 - Write each entry from the perspective of the file's audience, and word a change that goes in
-  both files separately for each rather than copying it verbatim. The root changelog should not
+  both changelogs separately for each rather than copying it verbatim. The root changelog should not
   describe Core internals or bridge-only APIs, and the sdk-core changelog should not name Rust
-  identifiers its readers cannot call. The comment at the top of either file lists the available
-  headings.
+  identifiers its readers cannot call. The fragment guide lists SDK categories; the comment at the
+  top of the Core changelog lists its headings.
 
 ## Review Checklist
 
