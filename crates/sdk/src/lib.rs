@@ -1043,10 +1043,11 @@ impl Worker {
     }
 
     /// Runs the worker. Eventually resolves after the worker has been explicitly shut down,
-    /// or may return early with an error in the event of some unresolvable problem.
+    /// or encounters some unresolvable problem. Initiates shutdown and waits for activity tasks
+    /// to finish before returning, including when running fails.
     pub async fn run(&mut self) -> Result<(), WorkerRunError> {
         let interceptors = self.common.worker_interceptors.clone();
-        interceptors::call_run_worker(
+        let result = interceptors::call_run_worker(
             &interceptors,
             RunWorkerInput::new(self),
             Next::new(
@@ -1055,7 +1056,14 @@ impl Worker {
                 },
             ),
         )
-        .await
+        .await;
+
+        self.common.worker.initiate_shutdown();
+        // Activity completions can release Core's slots before their tasks drop their Core
+        // references, so wait for the SDK tasks before reporting shutdown complete.
+        self.activity_half.tasks.close();
+        self.activity_half.tasks.wait().await;
+        result
     }
 
     /// Runs the worker, initiating shutdown when `shutdown` completes.
@@ -1081,11 +1089,6 @@ impl Worker {
             }
         };
 
-        self.common.worker.initiate_shutdown();
-        // Activity completions can release Core's slots before their tasks drop their Core
-        // references, so wait for the SDK tasks before taking ownership for finalization.
-        self.activity_half.tasks.close();
-        self.activity_half.tasks.wait().await;
         let core_worker =
             Arc::try_unwrap(self.common.worker).map_err(|worker| WorkerRunError::Fatal {
                 message: "worker shutdown finalization failed".to_owned(),
@@ -1844,6 +1847,63 @@ mod tests {
             .expect("finalization should finish after the activity task releases Core")
             .unwrap();
         assert!(core_weak.upgrade().is_none());
+    }
+
+    #[rstest::rstest]
+    #[case::success(false)]
+    #[case::error(true)]
+    #[tokio::test]
+    async fn run_waits_for_activity_tasks(#[case] fail_run: bool) {
+        let observer = Arc::new(RunUntilObserver {
+            fail_run,
+            ..Default::default()
+        });
+        let histories = if fail_run {
+            stream::pending().left_stream()
+        } else {
+            stream::empty().right_stream()
+        };
+        let mut worker = run_until_test_worker(histories, observer.clone());
+        let core_worker = worker.common.worker.clone();
+        let release_task = Arc::new(Notify::new());
+        let release_task_clone = release_task.clone();
+        worker.activity_half.tasks.spawn(async move {
+            release_task_clone.notified().await;
+            drop(core_worker);
+        });
+
+        let result = tokio::time::timeout(Duration::from_secs(10), async {
+            let run = worker.run();
+            tokio::pin!(run);
+            tokio::select! {
+                biased;
+                _ = observer.run_finished.notified() => {},
+                result = &mut run => panic!("returned before the activity task finished: {result:?}"),
+            }
+            assert!(run.as_mut().now_or_never().is_none());
+            release_task.notify_one();
+            run.await
+        })
+        .await
+        .expect("run should finish after the activity task releases Core");
+
+        if fail_run {
+            assert!(
+                matches!(result, Err(WorkerRunError::Fatal { message, .. }) if message == "run failed")
+            );
+        } else {
+            result.unwrap();
+        }
+        assert_eq!(Arc::strong_count(&worker.common.worker), 1);
+        assert!(matches!(
+            tokio::time::timeout(
+                Duration::from_secs(10),
+                worker.common.worker.poll_workflow_activation()
+            )
+            .await
+            .expect("run should have initiated shutdown"),
+            Err(PollError::ShutDown)
+        ));
     }
 
     #[derive(Default)]
