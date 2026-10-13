@@ -53,15 +53,12 @@ relevant information.
 ### Added
 * `Worker::run_until` consumes a worker and runs it until a supplied future completes, then shuts
   it down and releases its worker registration before returning, including when running fails.
-### Added
 * The experimental `temporalio-sdk-aws-lambda` crate runs a versioned Rust SDK Worker for each AWS
   Lambda invocation with Lambda-oriented concurrency defaults, deadline-aware graceful shutdown,
   and optional OpenTelemetry tracing and metrics.
 * OpenTelemetry metric exporters accept an explicit per-request timeout through
   `OtelCollectorOptions::export_timeout`; `CoreOtelMeter::force_flush` exports pending metrics
   without shutting down the provider.
-* `Worker::finalize_shutdown` releases Worker resources and heartbeat registration after polling
-  stops.
 
 ## [1.1.0] - 2026-10-06
 

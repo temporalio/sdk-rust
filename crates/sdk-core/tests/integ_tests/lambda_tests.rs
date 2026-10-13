@@ -34,7 +34,10 @@ use temporalio_sdk::{
     workflow_replayer::{WorkflowReplayer, WorkflowReplayerOptions},
 };
 use temporalio_sdk_aws_lambda::{LambdaWorker, LambdaWorkerOptions, otel::OpenTelemetryOptions};
-use tokio::{net::TcpListener, sync::oneshot};
+use tokio::{
+    net::TcpListener,
+    sync::{Notify, oneshot},
+};
 use tokio_stream::wrappers::TcpListenerStream;
 use tonic::{Request, Response, Status, transport::Server};
 use url::Url;
@@ -88,6 +91,8 @@ impl MetricsService for Collector {
 #[derive(Default)]
 struct LambdaActivities {
     cancellation_complete: Arc<AtomicBool>,
+    cancellation_completion: Arc<Notify>,
+    cancellation_gate: Option<Arc<Notify>>,
     invocation_registry: Arc<Mutex<Option<Arc<ClientWorkerSet>>>>,
 }
 
@@ -110,7 +115,11 @@ impl LambdaActivities {
         _: (),
     ) -> Result<(), ActivityError> {
         ctx.cancelled().await;
+        if let Some(gate) = &self.cancellation_gate {
+            gate.notified().await;
+        }
         self.cancellation_complete.store(true, Ordering::Relaxed);
+        self.cancellation_completion.notify_one();
         Ok(())
     }
 }
@@ -198,16 +207,19 @@ async fn lambda_validation_failure_cannot_block_cleanup_or_allow_reuse() {
     assert!(result.requires_restart());
     let mut cause = std::error::Error::source(&result);
     let mut validation_failure = false;
+    let mut cleanup_timed_out = false;
     while let Some(error) = cause {
         validation_failure |= matches!(
             error.downcast_ref::<WorkerRunError>(),
             Some(WorkerRunError::Validation(_))
         );
+        cleanup_timed_out |= error.is::<tokio::time::error::Elapsed>();
         cause = error.source();
     }
+    // run_until only returns the validation error after finalization; a cleanup timeout may win.
     assert!(
-        validation_failure,
-        "cleanup must preserve the original Worker failure"
+        validation_failure || cleanup_timed_out,
+        "expected the validation error or a bounded cleanup timeout: {result:?}"
     );
     assert!(hook_called.load(Ordering::Relaxed));
     assert!(
@@ -399,8 +411,11 @@ impl LambdaCancellationWorkflow {
     }
 }
 
+#[rstest::rstest]
+#[case::drained(false)]
+#[case::timed_out(true)]
 #[tokio::test]
-async fn lambda_drains_cancelled_activities_before_hooks() {
+async fn lambda_drains_cancelled_activities_before_hooks(#[case] block_completion: bool) {
     let client = Client::connect(
         get_integ_server_options(),
         ClientOptions::new(integ_namespace()).build(),
@@ -413,6 +428,10 @@ async fn lambda_drains_cancelled_activities_before_hooks() {
         .build_id("test")
         .build();
     let cancellation_complete = Arc::new(AtomicBool::new(false));
+    let cancellation_completion = Arc::new(Notify::new());
+    let cancellation_gate = block_completion.then(|| Arc::new(Notify::new()));
+    let hook_called = Arc::new(AtomicBool::new(false));
+    let called = hook_called.clone();
     let observed_in_hook = Arc::new(AtomicBool::new(false));
     let finished = cancellation_complete.clone();
     let observed = observed_in_hook.clone();
@@ -425,6 +444,8 @@ async fn lambda_drains_cancelled_activities_before_hooks() {
             .unwrap()
             .register_activities(LambdaActivities {
                 cancellation_complete: cancellation_complete.clone(),
+                cancellation_completion: cancellation_completion.clone(),
+                cancellation_gate: cancellation_gate.clone(),
                 ..Default::default()
             })
             .build(),
@@ -434,13 +455,19 @@ async fn lambda_drains_cancelled_activities_before_hooks() {
         ClientOptions::new(integ_namespace()).build(),
     )
     .lambda_options(lambda_options)
-    .shutdown_hook(move |_| {
+    .shutdown_hook(move |remaining| {
+        assert!(
+            !remaining.is_zero(),
+            "Worker drain consumed the hook reserve"
+        );
+        called.store(true, Ordering::Relaxed);
         observed.store(finished.load(Ordering::Relaxed), Ordering::Relaxed);
         async { Ok(()) }
     })
     .build()
     .unwrap();
     worker.handle(event("register-version")).await.unwrap();
+    hook_called.store(false, Ordering::Relaxed);
     let _handle = client
         .start_workflow(
             LambdaCancellationWorkflow::run,
@@ -451,7 +478,29 @@ async fn lambda_drains_cancelled_activities_before_hooks() {
         )
         .await
         .unwrap();
-    worker.handle(event("cancel-activity")).await.unwrap();
-    assert!(cancellation_complete.load(Ordering::Relaxed));
-    assert!(observed_in_hook.load(Ordering::Relaxed));
+    let result = worker.handle(event("cancel-activity")).await;
+    assert!(hook_called.load(Ordering::Relaxed));
+    if block_completion {
+        let error = result.unwrap_err();
+        assert!(error.requires_restart());
+        assert!(error.to_string().contains("did not drain and finalize"));
+        assert!(!cancellation_complete.load(Ordering::Relaxed));
+        assert!(!observed_in_hook.load(Ordering::Relaxed));
+        assert!(
+            worker
+                .handle(event("after-timeout"))
+                .await
+                .unwrap_err()
+                .requires_restart()
+        );
+        // Release the background Activity so the test runtime can close without retained work.
+        cancellation_gate.unwrap().notify_one();
+        tokio::time::timeout(Duration::from_secs(6), cancellation_completion.notified())
+            .await
+            .expect("cancelled Activity did not finish after being released");
+    } else {
+        result.unwrap();
+        assert!(cancellation_complete.load(Ordering::Relaxed));
+        assert!(observed_in_hook.load(Ordering::Relaxed));
+    }
 }

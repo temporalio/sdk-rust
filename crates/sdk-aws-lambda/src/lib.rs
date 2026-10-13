@@ -495,61 +495,27 @@ impl LambdaWorker {
             )
         })?
         .map_err(|error| LambdaInvocationError::new(error, false))?;
-        let mut worker = Worker::new(
+        let worker = Worker::new(
             &self.inner.runtime,
             client,
             self.inner.worker_options.clone(),
         )
         .map_err(|error| LambdaInvocationError::new(error, false))?;
-        let mut shutdown = ShutdownGuard(Some(worker.shutdown_handle()));
-        let worker_result = {
-            let run = worker.run();
-            tokio::pin!(run);
-            tokio::select! {
-                result = &mut run => result,
-                () = sleep_until(shutdown_at) => {
-                    shutdown.0.take().expect("shutdown has not been initiated")();
-                    timeout_at(drain_deadline, &mut run)
-                        .await
-                        .map_err(|error| {
-                            LambdaInvocationError::new(
-                                anyhow::Error::new(error).context(format!(
-                                    "Temporal Worker did not drain and finalize within {:?}",
-                                    self.inner.drain_budget,
-                                )),
-                                true,
-                            )
-                        })?
-                }
-            }
-        };
-        if let Some(initiate_shutdown) = shutdown.0.take() {
-            initiate_shutdown();
-        }
-        if let Err(error) = &worker_result {
-            tracing::error!(
-                ?error,
-                "Temporal Worker failed; attempting shutdown finalization"
-            );
-        }
-        // Core retains the heartbeat registration after polling stops; finalize before hooks or
-        // a warm invocation, without letting cleanup consume the hooks' reserved time.
-        match timeout_at(drain_deadline, worker.finalize_shutdown()).await {
-            Ok(result) => result.map_err(|error| LambdaInvocationError::new(error, true))?,
-            Err(error) => {
-                let source = worker_result
-                    .err()
-                    .map_or_else(|| anyhow::Error::new(error), anyhow::Error::new);
-                return Err(LambdaInvocationError::new(
-                    source.context(format!(
+        // Cancelling run_until can leave Activity tasks holding Core alive, so initiate shutdown
+        // even if the invocation is cancelled or exceeds its drain deadline.
+        let _shutdown = ShutdownGuard(Some(worker.shutdown_handle()));
+        timeout_at(drain_deadline, worker.run_until(sleep_until(shutdown_at)))
+            .await
+            .map_err(|error| {
+                LambdaInvocationError::new(
+                    anyhow::Error::new(error).context(format!(
                         "Temporal Worker did not drain and finalize within {:?}",
                         self.inner.drain_budget,
                     )),
                     true,
-                ));
-            }
-        }
-        worker_result.map_err(|error| LambdaInvocationError::new(error, true))
+                )
+            })?
+            .map_err(|error| LambdaInvocationError::new(error, true))
     }
 
     async fn run_shutdown_hooks(&self, deadline: Instant) {
