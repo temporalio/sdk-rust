@@ -2047,14 +2047,12 @@ async fn la_resolve_during_legacy_query_does_not_combine(#[case] impossible_quer
     core.drain_pollers_and_shutdown().await;
 }
 
-/// A legacy query task (a query the server sends on its own, when it thinks the workflow is idle)
-/// that arrives while the run's workflow task waits on a local activity must be buffered until that
-/// workflow task completes. Since local activities stopped holding the activation open (#1442),
-/// nothing is outstanding to lang in that state, so the query is applied at once: it replaces the
-/// run's workflow task ("Trying to send a new WFT for a run which already has one!"), and the
-/// workflow task is never completed and times out on the server. With many pollers, the server can
-/// dispatch a query just before it starts the next workflow task, and the query can reach the
-/// worker just after it.
+/// While a workflow task waits on a local activity, core holds it with nothing outstanding to lang
+/// (since #1442). A legacy query task (a query the server sends on its own, when it thinks the
+/// workflow is idle) that arrives then must wait until that workflow task is reported. Core used
+/// to apply it at once, replacing the workflow task ("Trying to send a new WFT for a run which
+/// already has one!"), which was then never reported and timed out on the server. Under load, the
+/// retried workflow task can fail with a nondeterminism error and leave the workflow stuck.
 #[tokio::test]
 async fn legacy_query_while_waiting_on_la_is_buffered() {
     let wfid = "fake_wf_id";
@@ -2070,9 +2068,10 @@ async fn legacy_query_while_waiting_on_la_is_buffered() {
         header: None,
     });
 
-    // The test hands core its tasks. Core takes a task only after it has handled the one before
-    // (with history fetches one at a time), so core taking the task after the query means it has
-    // handled the query. If core stops instead, the stream is dropped.
+    // The test hands core its tasks: the workflow task, then the query when the test sends it.
+    // Core asks for a task only after it has handled the one before (history fetches run one at a
+    // time), so its asking after the query means it has handled the query. If core stops instead,
+    // the stream is dropped.
     let (send_query, query_sent) = oneshot::channel::<()>();
     let (query_handled_tx, query_handled) = oneshot::channel::<()>();
     let tasks = stream::iter([workflow_task])
@@ -2080,13 +2079,10 @@ async fn legacy_query_while_waiting_on_la_is_buffered() {
             query_sent.await.unwrap();
             legacy_query
         }))
-        .chain(
-            stream::once(async move {
-                query_handled_tx.send(()).unwrap();
-            })
-            .filter_map(|()| async { None }),
-        )
-        .chain(stream::pending());
+        .chain(stream::once(async move {
+            query_handled_tx.send(()).unwrap();
+            std::future::pending().await
+        }));
 
     let mut client = mock_worker_client();
     client
