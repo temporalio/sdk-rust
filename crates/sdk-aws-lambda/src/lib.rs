@@ -157,8 +157,7 @@ impl LambdaInvocationError {
 pub struct LambdaWorkerBuilder {
     version: WorkerDeploymentVersion,
     worker_options: WorkerOptions,
-    connection_options: Option<ConnectionOptions>,
-    client_options: Option<ClientOptions>,
+    client_options: Option<(ConnectionOptions, ClientOptions)>,
     runtime: Option<Arc<Runtime>>,
     lambda_options: LambdaWorkerOptions,
     custom_tuner: Option<WorkerTuner>,
@@ -175,8 +174,7 @@ impl LambdaWorkerBuilder {
         connection_options: ConnectionOptions,
         client_options: ClientOptions,
     ) -> Self {
-        self.connection_options = Some(connection_options);
-        self.client_options = Some(client_options);
+        self.client_options = Some((connection_options, client_options));
         self
     }
 
@@ -264,12 +262,10 @@ impl LambdaWorkerBuilder {
         );
 
         #[allow(unused_mut)]
-        let (connection_options, mut client_options) =
-            match (self.connection_options, self.client_options) {
-                (Some(connection), Some(client)) => (connection, client),
-                (None, None) => load_client_options().map_err(LambdaWorkerBuildError::new)?,
-                _ => unreachable!("client_options sets both option types"),
-            };
+        let (connection_options, mut client_options) = match self.client_options {
+            Some(options) => options,
+            None => load_client_options().map_err(LambdaWorkerBuildError::new)?,
+        };
         #[cfg(feature = "otel")]
         if let Some(options) = self.open_telemetry {
             if self.runtime.is_some() {
@@ -373,7 +369,6 @@ impl LambdaWorker {
         LambdaWorkerBuilder {
             version,
             worker_options,
-            connection_options: None,
             client_options: None,
             runtime: None,
             lambda_options: LambdaWorkerOptions::default(),
