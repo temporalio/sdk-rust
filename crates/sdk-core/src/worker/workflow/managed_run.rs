@@ -936,7 +936,10 @@ impl ManagedRun {
     ) -> Option<PermittedWFT> {
         let about_to_issue_evict = self.trying_to_evict.is_some();
         let has_activation = self.activation().is_some();
-        if has_activation || about_to_issue_evict || self.more_pending_work() {
+        // A run can hold a WFT with nothing outstanding to lang, e.g. while it waits on local
+        // activities, so the WFT is checked on its own.
+        if has_activation || about_to_issue_evict || self.wft.is_some() || self.more_pending_work()
+        {
             debug!(run_id = %self.run_id(),
                    "Got new WFT for a run with outstanding work, buffering it act: {:?} wft: {:?} about to evict: {:?}", &self.activation(), &self.wft, about_to_issue_evict);
             self.task_buffer.buffer(work);
