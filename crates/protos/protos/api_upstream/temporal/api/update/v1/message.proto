@@ -12,6 +12,7 @@ option csharp_namespace = "Temporalio.Api.Update.V1";
 import "temporal/api/common/v1/message.proto";
 import "temporal/api/enums/v1/update.proto";
 import "temporal/api/failure/v1/message.proto";
+import "temporal/api/nexus/v1/message.proto";
 
 // Specifies client's intent to wait for Update results.
 message WaitPolicy {
@@ -68,6 +69,8 @@ message Request {
     repeated temporal.api.common.v1.Callback completion_callbacks = 4;
      // Links to be associated with this update.
     repeated temporal.api.common.v1.Link links = 5;
+    // Serialization context propagated from the Nexus caller that started this update.
+    temporal.api.nexus.v1.PropagatedSerializationContext propagated_nexus_serialization_context = 6;
 }
 
 // An Update protocol message indicating that a Workflow Update has been rejected.

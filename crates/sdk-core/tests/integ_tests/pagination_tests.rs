@@ -94,6 +94,7 @@ async fn weird_pagination_doesnt_drop_wft_events() {
                 raw_history: vec![],
                 next_page_token: vec![2],
                 archived: false,
+                ..Default::default()
             })
         })
         .times(1);
@@ -113,6 +114,7 @@ async fn weird_pagination_doesnt_drop_wft_events() {
                 raw_history: vec![],
                 next_page_token: vec![],
                 archived: false,
+                ..Default::default()
             })
         })
         .times(1);
@@ -221,6 +223,7 @@ async fn extreme_pagination_doesnt_drop_wft_events_worker() {
                     raw_history: vec![],
                     next_page_token: vec![(i * 10 + 1) as u8],
                     archived: false,
+                    ..Default::default()
                 })
             })
             .times(1);
@@ -236,6 +239,7 @@ async fn extreme_pagination_doesnt_drop_wft_events_worker() {
                     raw_history: vec![],
                     next_page_token: vec![(i * 10) as u8],
                     archived: false,
+                    ..Default::default()
                 })
             })
             .times(1);
@@ -250,6 +254,7 @@ async fn extreme_pagination_doesnt_drop_wft_events_worker() {
                 raw_history: vec![],
                 next_page_token: vec![],
                 archived: false,
+                ..Default::default()
             })
         })
         .times(1);

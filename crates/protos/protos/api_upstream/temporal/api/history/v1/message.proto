@@ -19,6 +19,7 @@ import "temporal/api/enums/v1/workflow.proto";
 import "temporal/api/common/v1/message.proto";
 import "temporal/api/deployment/v1/message.proto";
 import "temporal/api/failure/v1/message.proto";
+import "temporal/api/nexus/v1/message.proto";
 import "temporal/api/taskqueue/v1/message.proto";
 import "temporal/api/update/v1/message.proto";
 import "temporal/api/workflow/v1/message.proto";
@@ -213,6 +214,8 @@ message WorkflowExecutionStartedEventAttributes {
     // if no time skipping has occurred or there is no previous run.
     temporal.api.common.v1.TimeSkippingStatePropagation time_skipping_state_propagation = 43;
 
+    // Serialization context propagated from the Nexus caller that started this workflow.
+    temporal.api.nexus.v1.PropagatedSerializationContext propagated_nexus_serialization_context = 44;
 }
 
 

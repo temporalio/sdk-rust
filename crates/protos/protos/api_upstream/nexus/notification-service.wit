@@ -1,10 +1,10 @@
 package temporal:nexus@1.0.0;
 
 world system {
-  export on-complete-request;
+  export notification-service;
 }
 
-interface on-complete-request {
+interface notification-service {
   use nexus:temporal-types/model@1.0.0.{
     failure,
     placeholder,
