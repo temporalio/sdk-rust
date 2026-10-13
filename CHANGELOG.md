@@ -38,8 +38,8 @@ relevant information.
   differs from the command that produced it.
 
 ### Fixed
-* `Worker::run()` now initiates shutdown and waits for spawned activity tasks to finish before
-  returning, including when running fails.
+* `Worker::run()` now waits for spawned activity tasks to finish before returning, including
+  when running fails.
 * Workers using a custom metrics backend now report task-slot and poller counts correctly in
   worker heartbeats, rather than reporting zero when the backend does not expose its labels.
 * Local activities still running when their workflow is evicted or the worker shuts down now

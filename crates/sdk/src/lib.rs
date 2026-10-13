@@ -1043,8 +1043,8 @@ impl Worker {
     }
 
     /// Runs the worker. Eventually resolves after the worker has been explicitly shut down,
-    /// or encounters some unresolvable problem. Initiates shutdown and waits for activity tasks
-    /// to finish before returning, including when running fails.
+    /// or encounters some unresolvable problem. Waits for activity tasks to finish before
+    /// returning, including when running fails.
     pub async fn run(&mut self) -> Result<(), WorkerRunError> {
         let interceptors = self.common.worker_interceptors.clone();
         let result = interceptors::call_run_worker(
@@ -1058,9 +1058,8 @@ impl Worker {
         )
         .await;
 
-        self.common.worker.initiate_shutdown();
         // Activity completions can release Core's slots before their tasks drop their Core
-        // references, so wait for the SDK tasks before reporting shutdown complete.
+        // references, so wait for the SDK tasks before returning.
         self.activity_half.tasks.close();
         self.activity_half.tasks.wait().await;
         result
@@ -1858,12 +1857,7 @@ mod tests {
             fail_run,
             ..Default::default()
         });
-        let histories = if fail_run {
-            stream::pending().left_stream()
-        } else {
-            stream::empty().right_stream()
-        };
-        let mut worker = run_until_test_worker(histories, observer.clone());
+        let mut worker = run_until_test_worker(stream::empty(), observer.clone());
         let core_worker = worker.common.worker.clone();
         let release_task = Arc::new(Notify::new());
         let release_task_clone = release_task.clone();
@@ -1895,15 +1889,6 @@ mod tests {
             result.unwrap();
         }
         assert_eq!(Arc::strong_count(&worker.common.worker), 1);
-        assert!(matches!(
-            tokio::time::timeout(
-                Duration::from_secs(10),
-                worker.common.worker.poll_workflow_activation()
-            )
-            .await
-            .expect("run should have initiated shutdown"),
-            Err(PollError::ShutDown)
-        ));
     }
 
     #[derive(Default)]
