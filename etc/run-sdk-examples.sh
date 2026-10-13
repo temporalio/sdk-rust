@@ -43,6 +43,11 @@ for starter in "${examples[@]}"; do
   fi
 
   sample="${starter%-starter}"
+  # Lambda needs its runtime and deployment configuration, not a local Worker subprocess.
+  if [[ "$sample" == "aws-lambda" ]]; then
+    echo "Skipping $sample because it requires a Lambda deployment or runtime emulator"
+    continue
+  fi
   worker="${sample}-worker"
 
   if ! has_example "$worker"; then
