@@ -823,16 +823,16 @@ impl Worker {
         );
         let la_permits = la_permit_dealer.get_extant_count_rcv();
 
-        let (local_act_mgr, la_sink, hb_rx) = if config.task_types.enable_local_activities {
-            let (hb_tx, hb_rx) = unbounded_channel();
+        let (local_act_mgr, la_sink, la_notify_rx) = if config.task_types.enable_local_activities {
+            let (la_notify_tx, la_notify_rx) = unbounded_channel();
             let local_act_mgr = Arc::new(LocalActivityManager::new(
                 config.namespace.clone(),
                 la_permit_dealer.clone(),
-                hb_tx,
+                la_notify_tx,
                 metrics.clone(),
             ));
             let la_sink = LAReqSink::new(local_act_mgr.clone());
-            (Some(local_act_mgr), Some(la_sink), Some(hb_rx))
+            (Some(local_act_mgr), Some(la_sink), Some(la_notify_rx))
         } else {
             (None, None, None)
         };
@@ -1121,7 +1121,7 @@ impl Worker {
                         stream,
                         la_sink,
                         local_act_mgr,
-                        hb_rx,
+                        la_notify_rx,
                         at_task_mgr.as_ref().and_then(|mgr| {
                             match config.max_task_queue_activities_per_second {
                                 Some(persec) if persec > 0.0 => None,

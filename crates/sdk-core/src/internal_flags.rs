@@ -33,6 +33,8 @@ pub enum CoreInternalFlags {
     /// if in the sequence delivered by lang they came after a terminal command.
     /// See <https://github.com/temporalio/features/issues/481>.
     MoveTerminalCommands = 3,
+    /// Detects service and operation changes when replaying Nexus operation schedules.
+    NexusOperationDeterminismChecks = 4,
     /// We received a value higher than this code can understand.
     TooHigh = u32::MAX,
 }
@@ -175,6 +177,7 @@ impl CoreInternalFlags {
             1 => Self::IdAndTypeDeterminismChecks,
             2 => Self::UpsertSearchAttributeOnPatch,
             3 => Self::MoveTerminalCommands,
+            4 => Self::NexusOperationDeterminismChecks,
             _ => Self::TooHigh,
         }
     }
