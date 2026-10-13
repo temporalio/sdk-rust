@@ -46,10 +46,12 @@ Polling ends when that reserve begins. Worker drain cannot consume the hook rese
 `LambdaWorkerOptions` through `lambda_options` to adjust these budgets. Allow more than 9.1 seconds
 per invocation to leave at least one second for polling and connection setup.
 
-Worker drain and finalization complete before telemetry flush and application hooks. Hook errors
-are logged; a hook that exceeds the shared hook budget is cancelled. A Worker that fails or cannot
-drain and finalize makes the handler unusable for warm invocations, and `run` exits the runtime loop
-so the process can terminate. If calling `handle` directly, recycle the process when
+Worker drain and finalization normally complete before telemetry flush and application hooks. If
+the drain budget expires, shutdown continues alongside the hooks until the response deadline; the
+handler is still retired because telemetry may have flushed before the last Worker spans. Hook
+errors are logged; a hook that exceeds the shared hook budget is cancelled. When the handler must
+be retired, `run` reports the invocation error before exiting the runtime loop. If calling `handle`
+directly, recycle the process when
 `LambdaInvocationError::requires_restart()` is true, or after cancelling the handler future.
 Calls to the same handler must be sequential.
 

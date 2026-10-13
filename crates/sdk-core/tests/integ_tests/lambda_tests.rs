@@ -114,6 +114,7 @@ impl LambdaActivities {
         ctx: ActivityContext,
         _: (),
     ) -> Result<(), ActivityError> {
+        *self.invocation_registry.lock().unwrap() = Some(ctx.client().connection().workers());
         ctx.cancelled().await;
         if let Some(gate) = &self.cancellation_gate {
             gate.notified().await;
@@ -412,10 +413,14 @@ impl LambdaCancellationWorkflow {
 }
 
 #[rstest::rstest]
-#[case::drained(false)]
-#[case::timed_out(true)]
+#[case::drained(false, false)]
+#[case::timed_out(true, false)]
+#[case::drains_during_hooks(true, true)]
 #[tokio::test]
-async fn lambda_drains_cancelled_activities_before_hooks(#[case] block_completion: bool) {
+async fn lambda_drains_cancelled_activities_before_hooks(
+    #[case] block_completion: bool,
+    #[case] release_during_cleanup: bool,
+) {
     let client = Client::connect(
         get_integ_server_options(),
         ClientOptions::new(integ_namespace()).build(),
@@ -430,6 +435,11 @@ async fn lambda_drains_cancelled_activities_before_hooks(#[case] block_completio
     let cancellation_complete = Arc::new(AtomicBool::new(false));
     let cancellation_completion = Arc::new(Notify::new());
     let cancellation_gate = block_completion.then(|| Arc::new(Notify::new()));
+    let hook_gate = cancellation_gate.clone();
+    let release_from_hook = Arc::new(AtomicBool::new(false));
+    let release = release_from_hook.clone();
+    let invocation_registry = Arc::new(Mutex::new(None::<Arc<ClientWorkerSet>>));
+    let shutdown_key = Arc::new(Mutex::new(None::<Uuid>));
     let hook_called = Arc::new(AtomicBool::new(false));
     let called = hook_called.clone();
     let observed_in_hook = Arc::new(AtomicBool::new(false));
@@ -446,8 +456,9 @@ async fn lambda_drains_cancelled_activities_before_hooks(#[case] block_completio
                 cancellation_complete: cancellation_complete.clone(),
                 cancellation_completion: cancellation_completion.clone(),
                 cancellation_gate: cancellation_gate.clone(),
-                ..Default::default()
+                invocation_registry: invocation_registry.clone(),
             })
+            .worker_interceptor(ShutdownObserver(shutdown_key.clone()))
             .build(),
     )
     .client_options(
@@ -462,12 +473,16 @@ async fn lambda_drains_cancelled_activities_before_hooks(#[case] block_completio
         );
         called.store(true, Ordering::Relaxed);
         observed.store(finished.load(Ordering::Relaxed), Ordering::Relaxed);
+        if release.load(Ordering::Relaxed) {
+            hook_gate.as_ref().unwrap().notify_one();
+        }
         async { Ok(()) }
     })
     .build()
     .unwrap();
     worker.handle(event("register-version")).await.unwrap();
     hook_called.store(false, Ordering::Relaxed);
+    release_from_hook.store(release_during_cleanup, Ordering::Relaxed);
     let _handle = client
         .start_workflow(
             LambdaCancellationWorkflow::run,
@@ -484,7 +499,6 @@ async fn lambda_drains_cancelled_activities_before_hooks(#[case] block_completio
         let error = result.unwrap_err();
         assert!(error.requires_restart());
         assert!(error.to_string().contains("did not drain and finalize"));
-        assert!(!cancellation_complete.load(Ordering::Relaxed));
         assert!(!observed_in_hook.load(Ordering::Relaxed));
         assert!(
             worker
@@ -493,14 +507,27 @@ async fn lambda_drains_cancelled_activities_before_hooks(#[case] block_completio
                 .unwrap_err()
                 .requires_restart()
         );
-        // Release the background Activity so the test runtime can close without retained work.
-        cancellation_gate.unwrap().notify_one();
-        tokio::time::timeout(Duration::from_secs(6), cancellation_completion.notified())
-            .await
-            .expect("cancelled Activity did not finish after being released");
+        if release_during_cleanup {
+            assert!(cancellation_complete.load(Ordering::Relaxed));
+        } else {
+            assert!(!cancellation_complete.load(Ordering::Relaxed));
+            // Release the background Activity so the test runtime can close without retained work.
+            cancellation_gate.unwrap().notify_one();
+            tokio::time::timeout(Duration::from_secs(6), cancellation_completion.notified())
+                .await
+                .expect("cancelled Activity did not finish after being released");
+        }
     } else {
         result.unwrap();
         assert!(cancellation_complete.load(Ordering::Relaxed));
         assert!(observed_in_hook.load(Ordering::Relaxed));
+    }
+    if !block_completion || release_during_cleanup {
+        let registry = invocation_registry.lock().unwrap().take().unwrap();
+        let key = shutdown_key.lock().unwrap().unwrap();
+        assert!(
+            registry.unregister_slot_provider(key).is_err(),
+            "shutdown finalization was abandoned while hooks ran",
+        );
     }
 }

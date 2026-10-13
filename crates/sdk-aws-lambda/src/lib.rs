@@ -19,10 +19,11 @@ use std::{
         Arc,
         atomic::{AtomicBool, Ordering},
     },
+    task::{Context as TaskContext, Poll},
     time::{Duration, SystemTime},
 };
 
-use lambda_runtime::{LambdaEvent, service_fn};
+use lambda_runtime::{LambdaEvent, LambdaInvocation, Service, service_fn, tower::layer::layer_fn};
 use temporalio_client::{
     Client, ClientOptions, ConnectionOptions,
     envconfig::{ConfigError, DataSource, LoadClientConfigProfileOptions},
@@ -38,7 +39,7 @@ use temporalio_sdk::{
     },
 };
 use tokio::{
-    sync::{Notify, Semaphore},
+    sync::Semaphore,
     time::{Instant, sleep_until, timeout_at},
 };
 
@@ -216,11 +217,12 @@ impl LambdaWorkerBuilder {
         self
     }
 
-    /// Add a hook that runs after the invocation's Worker has stopped.
+    /// Add a cleanup hook, normally run after the invocation's Worker has stopped.
     ///
     /// Hooks run in registration order. Each receives the shared hook budget remaining when it starts.
     /// Hook failures are logged and do not prevent later hooks from running. The automatic
     /// telemetry flush runs first. All hooks share [`LambdaWorkerOptions::shutdown_hook_buffer`].
+    /// If draining overruns its budget, hooks run alongside continued Worker shutdown.
     pub fn shutdown_hook<F, Fut>(mut self, hook: F) -> Self
     where
         F: Fn(Duration) -> Fut + Send + Sync + 'static,
@@ -309,7 +311,6 @@ impl LambdaWorkerBuilder {
                 shutdown_hooks: self.shutdown_hooks,
                 invocation_gate: Semaphore::new(1),
                 healthy: AtomicBool::new(true),
-                interrupted: Notify::new(),
             }),
         })
     }
@@ -332,12 +333,10 @@ struct LambdaWorkerInner {
     shutdown_hooks: Vec<ShutdownHook>,
     invocation_gate: Semaphore,
     healthy: AtomicBool,
-    interrupted: Notify,
 }
 
 struct InvocationGuard<'a> {
     healthy: &'a AtomicBool,
-    interrupted: &'a Notify,
     completed: bool,
 }
 
@@ -345,7 +344,6 @@ impl Drop for InvocationGuard<'_> {
     fn drop(&mut self) {
         if !self.completed {
             self.healthy.store(false, Ordering::Release);
-            self.interrupted.notify_one();
         }
     }
 }
@@ -357,6 +355,40 @@ impl<S: FnOnce()> Drop for ShutdownGuard<S> {
         if let Some(shutdown) = self.0.take() {
             shutdown();
         }
+    }
+}
+
+struct RestartAfterResponse<S> {
+    inner: S,
+    worker: LambdaWorker,
+}
+
+impl<S> Service<LambdaInvocation> for RestartAfterResponse<S>
+where
+    S: Service<LambdaInvocation, Response = (), Error = lambda_runtime::Error>,
+    S::Future: 'static,
+{
+    type Response = ();
+    type Error = lambda_runtime::Error;
+    type Future = Pin<Box<dyn Future<Output = Result<(), Self::Error>>>>;
+
+    fn poll_ready(&mut self, cx: &mut TaskContext<'_>) -> Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(cx)
+    }
+
+    fn call(&mut self, invocation: LambdaInvocation) -> Self::Future {
+        let response = self.inner.call(invocation);
+        let worker = self.worker.clone();
+        Box::pin(async move {
+            // The inner runtime service includes posting the response; don't interrupt that I/O
+            // when an invocation has made this execution environment unsafe for warm reuse.
+            response.await?;
+            if worker.inner.healthy.load(Ordering::Acquire) {
+                Ok(())
+            } else {
+                Err(LambdaInvocationError::interrupted().into())
+            }
+        })
     }
 }
 
@@ -420,20 +452,56 @@ impl LambdaWorker {
         }
         let mut guard = InvocationGuard {
             healthy: &self.inner.healthy,
-            interrupted: &self.inner.interrupted,
             completed: false,
         };
         // Use one monotonic deadline so wall-clock adjustments cannot extend polling into cleanup.
         let invocation_deadline = now + initial_remaining;
         let shutdown_at = invocation_deadline - self.inner.shutdown_buffer;
         let drain_deadline = shutdown_at + self.inner.drain_budget;
-        let result = self
-            .run_worker(event.context, shutdown_at, drain_deadline)
-            .await;
-        self.run_shutdown_hooks(
-            (invocation_deadline - RESPONSE_BUFFER).min(Instant::now() + self.inner.hook_budget),
-        )
-        .await;
+        let response_deadline = invocation_deadline - RESPONSE_BUFFER;
+        let worker_run = self.run_worker(event.context, shutdown_at);
+        tokio::pin!(worker_run);
+        let result = match timeout_at(drain_deadline, &mut worker_run).await {
+            Ok(result) => {
+                self.run_shutdown_hooks(
+                    response_deadline.min(Instant::now() + self.inner.hook_budget),
+                )
+                .await;
+                result
+            }
+            Err(error) => {
+                tracing::error!(
+                    drain_budget = ?self.inner.drain_budget,
+                    "Worker drain budget elapsed; continuing shutdown alongside cleanup hooks"
+                );
+                // Keep finalization alive while giving hooks their reserve. An overrun still
+                // requires a restart because the hooks may have flushed before the last spans.
+                let (drain_result, ()) = tokio::join!(
+                    timeout_at(response_deadline, &mut worker_run),
+                    self.run_shutdown_hooks(
+                        response_deadline.min(Instant::now() + self.inner.hook_budget),
+                    ),
+                );
+                match drain_result {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) => {
+                        tracing::error!(%error, "Worker shutdown failed during cleanup");
+                    }
+                    Err(_) => {
+                        tracing::error!(
+                            "Worker shutdown exceeded the invocation response deadline"
+                        );
+                    }
+                }
+                Err(LambdaInvocationError::new(
+                    anyhow::Error::new(error).context(format!(
+                        "Temporal Worker did not drain and finalize within {:?}",
+                        self.inner.drain_budget,
+                    )),
+                    true,
+                ))
+            }
+        };
         guard.completed = result
             .as_ref()
             .err()
@@ -443,30 +511,32 @@ impl LambdaWorker {
 
     /// Run this handler using the standard AWS Lambda Rust runtime.
     pub async fn run(self) -> Result<(), lambda_runtime::Error> {
-        let handler = self.clone();
-        let runtime =
-            lambda_runtime::run(service_fn(move |event: LambdaEvent<serde_json::Value>| {
-                let worker = handler.clone();
-                async move {
-                    worker
-                        .handle(event)
-                        .await
-                        .map_err(lambda_runtime::Error::from)
-                }
-            }));
-        // An interrupted Worker can retain background Activities. Ending the runtime loop lets
-        // the process exit instead of letting AWS reuse an unsafe execution environment.
-        tokio::select! {
-            result = runtime => result,
-            () = self.inner.interrupted.notified() => Err(LambdaInvocationError::interrupted().into()),
+        if !self.inner.healthy.load(Ordering::Acquire) {
+            return Err(LambdaInvocationError::interrupted().into());
         }
+        let handler = self.clone();
+        lambda_runtime::Runtime::new(service_fn(move |event: LambdaEvent<serde_json::Value>| {
+            let worker = handler.clone();
+            async move {
+                worker
+                    .handle(event)
+                    .await
+                    .map_err(lambda_runtime::Error::from)
+            }
+        }))
+        .layer(lambda_runtime::layers::TracingLayer::new())
+        .layer(layer_fn(move |inner| RestartAfterResponse {
+            inner,
+            worker: self.clone(),
+        }))
+        .run()
+        .await
     }
 
     async fn run_worker(
         &self,
         context: lambda_runtime::Context,
         shutdown_at: Instant,
-        drain_deadline: Instant,
     ) -> Result<(), LambdaInvocationError> {
         let mut connection_options = self.inner.connection_options.clone();
         if connection_options.identity.is_empty()
@@ -499,17 +569,9 @@ impl LambdaWorker {
         // Cancelling run_until can leave Activity tasks holding Core alive, so initiate shutdown
         // even if the invocation is cancelled or exceeds its drain deadline.
         let _shutdown = ShutdownGuard(Some(worker.shutdown_handle()));
-        timeout_at(drain_deadline, worker.run_until(sleep_until(shutdown_at)))
+        worker
+            .run_until(sleep_until(shutdown_at))
             .await
-            .map_err(|error| {
-                LambdaInvocationError::new(
-                    anyhow::Error::new(error).context(format!(
-                        "Temporal Worker did not drain and finalize within {:?}",
-                        self.inner.drain_budget,
-                    )),
-                    true,
-                )
-            })?
             .map_err(|error| LambdaInvocationError::new(error, true))
     }
 
@@ -662,6 +724,7 @@ fn invocation_identity(context: &lambda_runtime::Context) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures::FutureExt;
     use std::{
         ffi::OsString,
         sync::{Mutex, atomic::AtomicBool},
@@ -814,6 +877,81 @@ mod tests {
             error.source().unwrap().downcast_ref::<RuntimeError>(),
             Some(RuntimeError::NoCurrentTokioRuntime)
         ));
+    }
+
+    #[test]
+    fn error_display_and_runtime_diagnostic_do_not_duplicate_the_cause() {
+        let build_error = LambdaWorkerBuildError::invalid("invalid Lambda configuration");
+        assert_eq!(build_error.to_string(), "invalid Lambda configuration");
+        assert!(build_error.source().unwrap().is::<std::io::Error>());
+
+        let invocation_error =
+            LambdaInvocationError::new(std::io::Error::other("expected Worker failure"), true);
+        assert_eq!(invocation_error.to_string(), "expected Worker failure");
+        assert!(invocation_error.source().unwrap().is::<std::io::Error>());
+        let diagnostic =
+            lambda_runtime::Diagnostic::from(lambda_runtime::Error::from(invocation_error));
+        assert_eq!(diagnostic.error_message, "expected Worker failure");
+    }
+
+    #[tokio::test]
+    async fn restart_waits_for_the_response_service_to_finish() {
+        let worker = LambdaWorker::builder(version(), WorkerOptions::new("queue").build())
+            .client_options(
+                ConnectionOptions::new(
+                    temporalio_client::Url::parse("http://localhost:7233").unwrap(),
+                )
+                .build(),
+                ClientOptions::new("default").build(),
+            )
+            .build()
+            .unwrap();
+        let posted = Arc::new(Notify::new());
+        let acknowledge = Arc::new(Notify::new());
+        let response_posted = posted.clone();
+        let response_acknowledge = acknowledge.clone();
+        let response_worker = worker.clone();
+        let transport = service_fn(move |_invocation: LambdaInvocation| {
+            let worker = response_worker.clone();
+            let posted = response_posted.clone();
+            let acknowledge = response_acknowledge.clone();
+            async move {
+                drop(InvocationGuard {
+                    healthy: &worker.inner.healthy,
+                    completed: false,
+                });
+                posted.notify_one();
+                acknowledge.notified().await;
+                Ok::<(), lambda_runtime::Error>(())
+            }
+        });
+        let mut service = RestartAfterResponse {
+            inner: transport,
+            worker: worker.clone(),
+        };
+        let (parts, ()) = http::Response::new(()).into_parts();
+        let mut context = lambda_runtime::Context::default();
+        context.request_id = "request-123".to_owned();
+        let response = service.call(LambdaInvocation {
+            parts,
+            body: b"{}".to_vec().into(),
+            context,
+        });
+        tokio::pin!(response);
+        tokio::select! {
+            result = &mut response => panic!("runtime exited before response acknowledgment: {result:?}"),
+            () = posted.notified() => {}
+        }
+        assert!(!worker.inner.healthy.load(Ordering::Acquire));
+        assert!(response.as_mut().now_or_never().is_none());
+        acknowledge.notify_one();
+        let error = response.await.unwrap_err();
+        assert!(
+            error
+                .downcast_ref::<LambdaInvocationError>()
+                .unwrap()
+                .requires_restart()
+        );
     }
 
     #[tokio::test]
@@ -981,7 +1119,6 @@ mod tests {
                 hook_budget: Duration::from_secs(2),
                 invocation_gate: Semaphore::new(1),
                 healthy: AtomicBool::new(true),
-                interrupted: Notify::new(),
                 shutdown_hooks: vec![
                     Arc::new(move |_| {
                         first_order.lock().unwrap().push("first");
