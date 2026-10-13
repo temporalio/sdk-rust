@@ -19,7 +19,7 @@ use temporalio_sdk::{
     },
     runtime::RuntimeOptions,
 };
-use tokio::sync::Semaphore;
+use tokio::sync::Mutex;
 
 use crate::ShutdownHook;
 
@@ -120,45 +120,32 @@ pub(crate) fn configure(
     let telemetry_runtime = Arc::new(Runtime::from_current_tokio(runtime_options)?);
     plugin.configure_client_options(client)?;
     plugin.configure_worker_options(worker)?;
-    let flushers = BlockingFlushers {
-        metrics: Arc::new(move || meter.force_flush()),
-        traces: Arc::new(move || tracer_provider.force_flush().map_err(anyhow::Error::from)),
-        gate: Arc::new(Semaphore::new(1)),
-    };
-    let flush_hook: ShutdownHook = Arc::new(move |_| {
-        let flushers = flushers.clone();
-        Box::pin(async move { flushers.flush().await })
-    });
+    let flushers = Arc::new(Mutex::new(BlockingFlushers {
+        metrics: Box::new(move || meter.force_flush()),
+        traces: Box::new(move || tracer_provider.force_flush().map_err(anyhow::Error::from)),
+    }));
+    let flush_hook: ShutdownHook =
+        Arc::new(move |_| Box::pin(BlockingFlushers::flush(flushers.clone())));
     shutdown_hooks.insert(0, flush_hook);
     *runtime = Some(telemetry_runtime);
     Ok(())
 }
 
-#[derive(Clone)]
 struct BlockingFlushers {
-    metrics: Arc<dyn Fn() -> anyhow::Result<()> + Send + Sync>,
-    traces: Arc<dyn Fn() -> anyhow::Result<()> + Send + Sync>,
-    gate: Arc<Semaphore>,
+    metrics: Box<dyn Fn() -> anyhow::Result<()> + Send + Sync>,
+    traces: Box<dyn Fn() -> anyhow::Result<()> + Send + Sync>,
 }
 
 impl BlockingFlushers {
-    async fn flush(&self) -> anyhow::Result<()> {
-        let permit = Arc::new(self.gate.clone().try_acquire_owned().map_err(|_| {
+    async fn flush(flushers: Arc<Mutex<Self>>) -> anyhow::Result<()> {
+        let guard = Arc::new(flushers.try_lock_owned().map_err(|_| {
             anyhow::anyhow!("a telemetry flush from the previous invocation is still running")
         })?);
-        let metrics = self.metrics.clone();
-        let traces = self.traces.clone();
-        let metric_permit = permit.clone();
-        // Blocking provider calls cannot be cancelled. Keep the permit inside both tasks so a
+        let metric_guard = guard.clone();
+        // Blocking provider calls cannot be cancelled. Keep the guard inside both tasks so a
         // timed-out invocation cannot queue more flushes when the environment is reused.
-        let metrics = tokio::task::spawn_blocking(move || {
-            let _permit = metric_permit;
-            metrics()
-        });
-        let traces = tokio::task::spawn_blocking(move || {
-            let _permit = permit;
-            traces()
-        });
+        let metrics = tokio::task::spawn_blocking(move || (metric_guard.metrics)());
+        let traces = tokio::task::spawn_blocking(move || (guard.traces)());
         let (metrics, traces) = tokio::join!(metrics, traces);
         match (metrics?, traces?) {
             (Ok(()), Ok(())) => Ok(()),
@@ -188,7 +175,7 @@ fn resolve_service_name(getenv: impl Fn(&str) -> Option<String>) -> String {
 mod tests {
     use super::*;
     use std::sync::{
-        Mutex,
+        Mutex as StdMutex,
         atomic::{AtomicUsize, Ordering},
         mpsc,
     };
@@ -199,63 +186,59 @@ mod tests {
         let (started_tx, mut started_rx) = unbounded_channel();
         let (metric_tx, metric_rx) = mpsc::channel();
         let (trace_tx, trace_rx) = mpsc::channel();
-        let metric_rx = Mutex::new(Some(metric_rx));
-        let trace_rx = Mutex::new(Some(trace_rx));
+        let metric_rx = StdMutex::new(Some(metric_rx));
+        let trace_rx = StdMutex::new(Some(trace_rx));
         let metric_started = started_tx.clone();
-        let flushers = BlockingFlushers {
-            metrics: Arc::new(move || {
+        let flushers = Arc::new(Mutex::new(BlockingFlushers {
+            metrics: Box::new(move || {
                 metric_started.send(()).unwrap();
                 if let Some(rx) = metric_rx.lock().unwrap().take() {
                     rx.recv().unwrap();
                 }
                 Ok(())
             }),
-            traces: Arc::new(move || {
+            traces: Box::new(move || {
                 started_tx.send(()).unwrap();
                 if let Some(rx) = trace_rx.lock().unwrap().take() {
                     rx.recv().unwrap();
                 }
                 Ok(())
             }),
-            gate: Arc::new(Semaphore::new(1)),
-        };
+        }));
         let running = flushers.clone();
-        let invocation = tokio::spawn(async move { running.flush().await });
+        let invocation = tokio::spawn(BlockingFlushers::flush(running));
         started_rx.recv().await.unwrap();
         started_rx.recv().await.unwrap();
         invocation.abort();
         assert!(invocation.await.unwrap_err().is_cancelled());
         assert!(
-            flushers
-                .flush()
+            BlockingFlushers::flush(flushers.clone())
                 .await
                 .unwrap_err()
                 .to_string()
                 .contains("previous invocation")
         );
         metric_tx.send(()).unwrap();
-        assert!(flushers.flush().await.is_err());
+        assert!(BlockingFlushers::flush(flushers.clone()).await.is_err());
         trace_tx.send(()).unwrap();
-        drop(flushers.gate.acquire().await.unwrap());
-        flushers.flush().await.unwrap();
+        drop(flushers.lock().await);
+        BlockingFlushers::flush(flushers).await.unwrap();
     }
 
     #[tokio::test]
     async fn collector_failure_does_not_skip_traces_or_disable_warm_flushes() {
         let exported = Arc::new(AtomicUsize::new(0));
         let traces = exported.clone();
-        let flushers = BlockingFlushers {
-            metrics: Arc::new(|| anyhow::bail!("collector unavailable")),
-            traces: Arc::new(move || {
+        let flushers = Arc::new(Mutex::new(BlockingFlushers {
+            metrics: Box::new(|| anyhow::bail!("collector unavailable")),
+            traces: Box::new(move || {
                 traces.fetch_add(1, Ordering::Relaxed);
                 Ok(())
             }),
-            gate: Arc::new(Semaphore::new(1)),
-        };
+        }));
         for _ in 0..2 {
             assert!(
-                flushers
-                    .flush()
+                BlockingFlushers::flush(flushers.clone())
                     .await
                     .unwrap_err()
                     .to_string()
