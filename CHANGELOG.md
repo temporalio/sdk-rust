@@ -47,6 +47,9 @@ relevant information.
   or completes while the local activity is backing off between retries.
 * Evicting a workflow while some local activities are still running now preserves results already
   delivered to workflow code, rather than panicking or losing those results.
+* A query or other workflow task that arrives while a workflow waits on a local activity no longer
+  causes the current workflow task to be lost and time out, which could leave the workflow stuck on
+  a nondeterminism error.
 
 ## [1.1.0] - 2026-10-06
 
