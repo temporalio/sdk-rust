@@ -1,6 +1,6 @@
 use std::{collections::HashMap, time::Duration};
 
-use crate::WorkflowCancellationToken;
+use crate::{EventGroup, WorkflowCancellationToken};
 use temporalio_common_wasm::protos::{
     coresdk::{
         nexus::NexusOperationCancellationType as ProtoNexusOperationCancellationType,
@@ -101,33 +101,49 @@ pub struct NexusOperationOptions {
     /// Only applies to asynchronous operations. Synchronous operations ignore this timeout.
     /// If not set or zero, no start-to-close timeout is enforced.
     pub start_to_close_timeout: Option<Duration>,
+    /// Event Groups to attach to the resulting schedule-nexus-operation command, in addition to
+    /// any groups from the enclosing Event Group scope.
+    ///
+    /// **EXPERIMENTAL:** Event Groups is an experimental API and may change without notice.
+    #[cfg(feature = "experimental")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "experimental")))]
+    #[builder(default)]
+    pub event_groups: Vec<EventGroup>,
 }
 
 impl NexusOperationOptions {
     pub(crate) fn into_command(self, seq: u32) -> WorkflowCommand {
-        workflow_command::Variant::ScheduleNexusOperation(ScheduleNexusOperation {
-            seq,
-            endpoint: self.endpoint,
-            service: self.service,
-            operation: self.operation,
-            input: self.input,
-            schedule_to_close_timeout: self
-                .schedule_to_close_timeout
-                .and_then(|duration| duration.try_into().ok()),
-            schedule_to_start_timeout: self
-                .schedule_to_start_timeout
-                .and_then(|duration| duration.try_into().ok()),
-            start_to_close_timeout: self
-                .start_to_close_timeout
-                .and_then(|duration| duration.try_into().ok()),
-            nexus_header: self.nexus_header,
-            cancellation_type: ProtoNexusOperationCancellationType::from(
-                self.cancellation_type
-                    .unwrap_or(NexusOperationCancellationType::WaitCancellationCompleted),
-            )
-            .into(),
-        })
-        .into()
+        #[cfg(feature = "experimental")]
+        let event_group_markers = EventGroup::to_markers(self.event_groups);
+        #[cfg(not(feature = "experimental"))]
+        let event_group_markers = Vec::new();
+        super::command_with_metadata(
+            workflow_command::Variant::ScheduleNexusOperation(ScheduleNexusOperation {
+                seq,
+                endpoint: self.endpoint,
+                service: self.service,
+                operation: self.operation,
+                input: self.input,
+                schedule_to_close_timeout: self
+                    .schedule_to_close_timeout
+                    .and_then(|duration| duration.try_into().ok()),
+                schedule_to_start_timeout: self
+                    .schedule_to_start_timeout
+                    .and_then(|duration| duration.try_into().ok()),
+                start_to_close_timeout: self
+                    .start_to_close_timeout
+                    .and_then(|duration| duration.try_into().ok()),
+                nexus_header: self.nexus_header,
+                cancellation_type: ProtoNexusOperationCancellationType::from(
+                    self.cancellation_type
+                        .unwrap_or(NexusOperationCancellationType::WaitCancellationCompleted),
+                )
+                .into(),
+            }),
+            None,
+            None,
+            event_group_markers,
+        )
     }
 }
 

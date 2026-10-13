@@ -37,6 +37,19 @@ relevant information.
 * Workflow replay now reports nondeterminism when a scheduled Nexus operation's service or operation
   differs from the command that produced it.
 
+### Added
+* Experimental Event Groups support (requires the `experimental` feature). Event Groups
+  are workflow-level metadata that group related history events for UI and observability.
+  `EventGroup::new` takes a required ID (used verbatim; do not put secrets in it);
+  `EventGroup::with_label` sets an optional label that is stored as a codec-encoded
+  payload. Attach groups with `with_event_group` / `with_event_groups` or the
+  `event_groups` field on command options. Signal and update handlers receive implicit
+  inbound groups. This API may change without notice.
+* `original_execution_run_id()` on workflow context, the run ID recorded on the
+  `WorkflowExecutionStarted` event. Unlike `run_id()`, this value is preserved across
+  workflow resets.
+
+
 ### Fixed
 * Workers using a custom metrics backend now report task-slot and poller counts correctly in
   worker heartbeats, rather than reporting zero when the backend does not expose its labels.

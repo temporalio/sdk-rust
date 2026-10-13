@@ -3,13 +3,14 @@ use std::{fs, io, path::PathBuf, rc::Rc, sync::Arc};
 use anyhow::{Context, bail};
 use prost::Message;
 use temporalio_common::protos::{
-    coresdk::workflow_commands::WorkflowCommand, temporal::api::failure::v1::Failure,
+    coresdk::workflow_commands::{WorkflowCommand, workflow_command},
+    temporal::api::failure::v1::Failure,
 };
 use temporalio_workflow::{
     __private::sdk::{
-        ActivationJobResult, ActivationResult, MainRoutineCompletion, QueryResponse,
-        RoutineCompletion, RoutineKind, RoutinePendingState, RoutinePollResult, StartedRoutine,
-        TaskFailure, TerminalOutcome, UpdateRoutineCompletion, UpdateRoutineKind,
+        ActivationJobResult, ActivationResult, ContinueAsNewRequest, MainRoutineCompletion,
+        QueryResponse, RoutineCompletion, RoutineKind, RoutinePendingState, RoutinePollResult,
+        StartedRoutine, TaskFailure, TerminalOutcome, UpdateRoutineCompletion, UpdateRoutineKind,
         WorkflowActivation, WorkflowFailure, WorkflowHost, WorkflowInstance,
     },
     PatchActivationCaller,
@@ -334,7 +335,9 @@ impl WorkflowInstance for WasmWorkflowInstance {
                                     TerminalOutcome::Cancelled(details.map(decode_proto))
                                 }
                                 wit_types::TerminalOutcome::ContinueAsNew(req) => {
-                                    TerminalOutcome::ContinueAsNew(Box::new(decode_proto(req)))
+                                    TerminalOutcome::ContinueAsNew(Box::new(
+                                        continue_as_new_request(req),
+                                    ))
                                 }
                             }))
                         }
@@ -434,6 +437,19 @@ fn trap_to_failure<T, U>(
 
 fn convert_failure(failure: wit_types::Failure) -> WorkflowFailure {
     Box::new(decode_proto(failure))
+}
+
+fn continue_as_new_request(bytes: Vec<u8>) -> ContinueAsNewRequest {
+    let command: WorkflowCommand = decode_proto(bytes);
+    let Some(workflow_command::Variant::ContinueAsNewWorkflowExecution(attributes)) =
+        command.variant
+    else {
+        panic!("WASM continue-as-new request was not a continue-as-new command");
+    };
+    ContinueAsNewRequest {
+        attributes,
+        event_group_markers: command.event_group_markers,
+    }
 }
 
 fn decode_proto<M: Message + prost::Name + Default>(bytes: Vec<u8>) -> M {

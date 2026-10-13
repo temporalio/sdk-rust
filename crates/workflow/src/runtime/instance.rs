@@ -544,6 +544,8 @@ where
         &mut self,
         signal: SignalWorkflow,
     ) -> Result<ActivationJobResult, WorkflowFailure> {
+        #[cfg(feature = "experimental")]
+        let originating_event_id = signal.originating_event_id;
         let name = signal.signal_name;
         let payloads = Payloads {
             payloads: signal.input,
@@ -553,9 +555,20 @@ where
             Ok(Some(input)) => {
                 let input = HandleSignalInput::new(name.clone(), input, signal.headers);
                 let handler_execution = self.base_ctx.track_handler();
+                #[cfg(feature = "experimental")]
+                let (ctx, base_ctx) = (
+                    self.ctx
+                        .clone()
+                        .with_implicit_inbound_event(originating_event_id),
+                    self.base_ctx
+                        .clone()
+                        .with_implicit_inbound_event(originating_event_id),
+                );
+                #[cfg(not(feature = "experimental"))]
+                let (ctx, base_ctx) = (self.ctx.clone(), self.base_ctx.clone());
                 let mut future = intercepted_signal_future::<W>(
-                    self.ctx.clone(),
-                    self.base_ctx.clone(),
+                    ctx,
+                    base_ctx,
                     self.interceptors.clone(),
                     input,
                     handler_execution,
@@ -661,9 +674,18 @@ where
                 let input = HandleUpdateInput::new(id.clone(), name.clone(), input, headers);
                 let handler_execution =
                     handler_execution.unwrap_or_else(|| self.base_ctx.track_handler());
+                #[cfg(feature = "experimental")]
+                let (ctx, base_ctx) = (
+                    self.ctx.clone().with_implicit_inbound_update(id.clone()),
+                    self.base_ctx
+                        .clone()
+                        .with_implicit_inbound_update(id.clone()),
+                );
+                #[cfg(not(feature = "experimental"))]
+                let (ctx, base_ctx) = (self.ctx.clone(), self.base_ctx.clone());
                 let mut future = intercepted_update_future::<W>(
-                    self.ctx.clone(),
-                    self.base_ctx.clone(),
+                    ctx,
+                    base_ctx,
                     self.interceptors.clone(),
                     input,
                     handler_execution,

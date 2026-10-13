@@ -170,7 +170,7 @@ impl wit_guest::GuestWorkflowInstance for ExportedWorkflowInstance {
                                     }
                                     TerminalOutcome::ContinueAsNew(req) => {
                                         wit_types::TerminalOutcome::ContinueAsNew(
-                                            req.encode_to_vec(),
+                                            WorkflowCommand::from(*req).encode_to_vec(),
                                         )
                                     }
                                 })
