@@ -38,6 +38,9 @@ relevant information.
   differs from the command that produced it.
 
 ### Fixed
+* Opting in with `TEMPORAL_USE_WFT_CHUNKING_V2=true` preserves workflow activation boundaries
+  around Updates and commandless tasks during replay, including paginated histories. The setting
+  applies to new runs on servers with SDK metadata support; existing runs retain their recorded behavior.
 * `Worker::run()` now waits for spawned activity tasks to finish before returning, including
   when running fails.
 * Workers using a custom metrics backend now report task-slot and poller counts correctly in

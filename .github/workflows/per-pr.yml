@@ -74,6 +74,11 @@ jobs:
           script: |
             core.exportVariable('RUSTFLAGS', '-Csymbol-mangling-version=v0');
       - run: cargo test --features experimental -- --include-ignored --nocapture
+      - name: Test opt-in workflow task chunking
+        if: matrix.os == 'ubuntu-latest'
+        run: cargo test -p temporalio-sdk-core --lib
+        env:
+          TEMPORAL_USE_WFT_CHUNKING_V2: 'true'
       - name: Find test executable for cgroup tests
         id: find-cgroup-test
         if: runner.os == 'Linux' && runner.arch == 'X64'
@@ -172,6 +177,11 @@ jobs:
           script: |
             core.exportVariable('RUSTFLAGS', '-Csymbol-mangling-version=v0');
       - run: cargo integ-test
+      - name: Replay local activity and Update histories with the chunking writer enabled
+        if: matrix.os == 'ubuntu-latest'
+        run: cargo integ-test long_local_activity_with_update
+        env:
+          TEMPORAL_USE_WFT_CHUNKING_V2: 'true'
 
   wasm-workflow-tests:
     name: WASM workflow tests

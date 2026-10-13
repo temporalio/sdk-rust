@@ -38,6 +38,10 @@ relevant information.
   nondeterminism while retaining compatibility with histories recorded before these checks.
 
 ### Fixed
+* Workers can opt in to corrected Workflow Task chunking with `TEMPORAL_USE_WFT_CHUNKING_V2=true`.
+  Updates retain their execution order relative to earlier activations, even when acceptance follows
+  other commands or spans history pages. The first successful task records the choice on servers
+  supporting SDK metadata, and replay honors it independently of the worker's setting.
 * Worker heartbeats now report correct task-slot and poller counts when using buffered or custom
   metrics backends, including the Python SDK's `MetricBuffer`. Previously these counts could
   remain `0` because heartbeat accounting depended on reading labels from backend-owned attributes.
