@@ -3,7 +3,7 @@
 use std::{collections::HashMap, env, sync::Arc, time::Duration};
 
 use opentelemetry::trace::TracerProvider as _;
-use opentelemetry_otlp::WithExportConfig;
+use opentelemetry_otlp::{WithExportConfig, WithTonicConfig};
 use opentelemetry_sdk::{
     Resource,
     trace::{BatchSpanProcessor, SdkTracerProvider},
@@ -20,6 +20,7 @@ use temporalio_sdk::{
     runtime::RuntimeOptions,
 };
 use tokio::sync::Mutex;
+use tonic::transport::ClientTlsConfig;
 
 use crate::ShutdownHook;
 
@@ -98,8 +99,13 @@ pub(crate) fn configure(
     let span_exporter = opentelemetry_otlp::SpanExporter::builder()
         .with_tonic()
         .with_endpoint(endpoint.to_string())
-        .with_timeout(options.export_timeout)
-        .build()?;
+        .with_timeout(options.export_timeout);
+    let span_exporter = if matches!(endpoint.scheme(), "https" | "grpcs") {
+        span_exporter.with_tls_config(ClientTlsConfig::new().with_native_roots())
+    } else {
+        span_exporter
+    }
+    .build()?;
     let tracer_provider = SdkTracerProvider::builder()
         .with_span_processor(WorkflowSpanProcessor::new(
             BatchSpanProcessor::builder(span_exporter).build(),

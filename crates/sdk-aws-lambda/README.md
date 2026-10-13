@@ -78,7 +78,8 @@ let worker = temporalio_sdk_aws_lambda::LambdaWorker::builder(version, worker_op
 ```
 
 The default OTLP gRPC endpoint is `OTEL_EXPORTER_OTLP_ENDPOINT`, then
-`http://localhost:4317`. The service name is taken from `OTEL_SERVICE_NAME`, then
+`http://localhost:4317`. HTTPS collectors use the platform's trusted root certificates for both
+metrics and traces. The service name is taken from `OTEL_SERVICE_NAME`, then
 `AWS_LAMBDA_FUNCTION_NAME`, and otherwise defaults to `temporal-lambda-worker`. The helper installs
 the SDK's `OpenTelemetryPlugin`, `WorkflowIdGenerator`, and `WorkflowSpanProcessor`. Client,
 Workflow, and Activity spans propagate W3C trace context through the cross-SDK `_tracer-data`

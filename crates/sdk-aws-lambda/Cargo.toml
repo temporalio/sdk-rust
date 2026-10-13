@@ -18,7 +18,9 @@ otel = [
   "dep:opentelemetry",
   "dep:opentelemetry-otlp",
   "dep:opentelemetry_sdk",
+  "dep:tonic",
   "temporalio-common/otel",
+  "temporalio-common/tls-ring",
   "temporalio-sdk/otel",
   "temporalio-sdk/experimental",
   "temporalio-sdk/opentelemetry",
@@ -30,6 +32,8 @@ lambda_runtime = "1.3"
 opentelemetry = { workspace = true, features = ["trace"], optional = true }
 opentelemetry-otlp = { version = "0.32", default-features = false, features = [
   "grpc-tonic",
+  "tls-ring",
+  "tls-roots",
   "tokio",
   "trace",
 ], optional = true }
@@ -40,6 +44,7 @@ opentelemetry_sdk = { version = "0.32", default-features = false, features = [
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 tokio = { version = "1.47", default-features = false, features = ["sync", "time"] }
+tonic = { workspace = true, features = ["tls-ring", "tls-native-roots"], optional = true }
 tracing = "0.1"
 
 [dependencies.temporalio-client]

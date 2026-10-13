@@ -894,6 +894,26 @@ mod tests {
         assert_eq!(diagnostic.error_message, "expected Worker failure");
     }
 
+    #[cfg(feature = "otel")]
+    #[tokio::test]
+    async fn configures_secure_collectors_for_metrics_and_traces() {
+        let options = otel::OpenTelemetryOptions {
+            endpoint: Some(temporalio_client::Url::parse("https://localhost:4317").unwrap()),
+            ..Default::default()
+        };
+        LambdaWorker::builder(version(), WorkerOptions::new("queue").build())
+            .client_options(
+                ConnectionOptions::new(
+                    temporalio_client::Url::parse("http://localhost:7233").unwrap(),
+                )
+                .build(),
+                ClientOptions::new("default").build(),
+            )
+            .open_telemetry(options)
+            .build()
+            .unwrap();
+    }
+
     #[tokio::test]
     async fn restart_waits_for_the_response_service_to_finish() {
         let worker = LambdaWorker::builder(version(), WorkerOptions::new("queue").build())
