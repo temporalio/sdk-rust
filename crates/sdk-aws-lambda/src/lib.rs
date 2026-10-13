@@ -53,7 +53,7 @@ const RESPONSE_BUFFER: Duration = Duration::from_millis(100);
 type HookFuture = Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send>>;
 type ShutdownHook = Arc<dyn Fn(Duration) -> HookFuture + Send + Sync>;
 
-/// Lambda-oriented Worker limits applied by [`LambdaWorkerBuilder`].
+/// Lambda-oriented Worker options applied by [`LambdaWorkerBuilder`].
 ///
 /// These settings are distinct from [`WorkerOptions`] so callers can explicitly choose Lambda
 /// defaults or replace them without the integration guessing whether an SDK default was intentional.
