@@ -72,7 +72,7 @@ pub enum ConfigError {
 
     /// An I/O or parsing error occurred while loading configuration.
     #[error("Configuration loading error: {0}")]
-    LoadError(Box<dyn std::error::Error>),
+    LoadError(Box<dyn std::error::Error + Send + Sync>),
 }
 
 impl From<std::env::VarError> for ConfigError {

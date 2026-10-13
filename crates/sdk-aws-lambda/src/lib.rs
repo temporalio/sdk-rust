@@ -102,10 +102,10 @@ impl Default for LambdaWorkerOptions {
 /// [`std::error::Error::source`].
 #[derive(Debug, thiserror::Error)]
 #[error("failed to configure Lambda Worker")]
-pub struct LambdaWorkerBuildError(#[source] Box<dyn StdError>);
+pub struct LambdaWorkerBuildError(#[source] Box<dyn StdError + Send + Sync>);
 
 impl LambdaWorkerBuildError {
-    fn new(source: impl Into<Box<dyn StdError>>) -> Self {
+    fn new(source: impl Into<Box<dyn StdError + Send + Sync>>) -> Self {
         Self(source.into())
     }
 

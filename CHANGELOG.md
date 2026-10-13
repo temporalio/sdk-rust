@@ -34,6 +34,8 @@ relevant information.
 ## Unreleased
 
 ### Breaking Changes
+* Configuration-loading errors are now `Send + Sync`. Constructing `ConfigError::LoadError`
+  requires `Box<dyn Error + Send + Sync>` instead of `Box<dyn Error>`.
 * Workflow replay now reports nondeterminism when a scheduled Nexus operation's service or operation
   differs from the command that produced it.
 
