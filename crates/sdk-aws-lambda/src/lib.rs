@@ -387,15 +387,7 @@ impl LambdaWorker {
 
     /// Handle one Lambda invocation.
     ///
-    /// Typically, use [`Self::run`] to let the AWS Lambda runtime drive invocations and exit the
-    /// runtime loop if this handler can no longer be reused safely.
-    ///
-    /// The event payload is ignored; the invocation exists to give the Worker a bounded polling
-    /// window and an invocation-specific identity. Calls must be sequential. Cancelling this
-    /// future or exceeding the Worker drain budget makes this handler unusable for later calls,
-    /// since background Activity work may still be running. Recycle the Lambda environment in
-    /// that case rather than constructing another handler in the same process. For returned
-    /// errors, use [`LambdaInvocationError::requires_restart`] to determine whether to recycle.
+    /// Typically, use [`Self::run`] to let the AWS Lambda runtime drive invocations.
     pub async fn handle<T>(&self, event: LambdaEvent<T>) -> Result<(), LambdaInvocationError> {
         if !self.inner.healthy.load(Ordering::Acquire) {
             return Err(LambdaInvocationError::interrupted());
