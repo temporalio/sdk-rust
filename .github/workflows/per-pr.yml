@@ -141,7 +141,7 @@ jobs:
 
   integ-tests:
     name: Integ tests
-    timeout-minutes: ${{ github.ref == 'refs/heads/main' && 30 || 25 }}
+    timeout-minutes: ${{ matrix.timeoutMinutes || (github.ref == 'refs/heads/main' && 30 || 25) }}
     strategy:
       fail-fast: false
       matrix:
