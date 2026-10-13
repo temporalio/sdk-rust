@@ -1274,7 +1274,7 @@ async fn nexus_metrics() {
 
     let task_queue = starter.get_task_queue().to_owned();
     let workflow_id = wf_name.to_owned();
-    worker
+    let handle = worker
         .submit_workflow(
             NexusMetricsWf::run,
             endpoint,
@@ -1283,6 +1283,7 @@ async fn nexus_metrics() {
         .await
         .unwrap();
 
+    let shutdown = worker.inner_mut().shutdown_handle();
     let nexus_polling = async {
         for _ in 0..5 {
             let nt = core_worker.poll_nexus_task().await.unwrap();
@@ -1358,6 +1359,10 @@ async fn nexus_metrics() {
                 .await
                 .unwrap();
         }
+        // Workflow completion can precede the handler's timeout task; keep polling until both
+        // sides have finished so shutdown cannot hide the Nexus failure metrics.
+        handle.get_result(Default::default()).await.unwrap();
+        shutdown();
         // Gotta get shutdown poll
         assert_matches!(
             core_worker.poll_nexus_task().await,
@@ -1366,7 +1371,7 @@ async fn nexus_metrics() {
     };
 
     join!(nexus_polling, async {
-        worker.run_until_done().await.unwrap()
+        worker.inner_mut().run().await.unwrap()
     });
 
     let body = get_text(format!("http://{addr}/metrics")).await;
