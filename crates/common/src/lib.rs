@@ -10,8 +10,7 @@ extern crate tracing;
 #[cfg(feature = "envconfig")]
 pub mod envconfig;
 #[cfg(feature = "experimental")]
-#[doc(hidden)]
-pub mod external_storage;
+pub(crate) mod external_storage_references;
 #[doc(hidden)]
 pub mod fsm_trait;
 #[doc(hidden)]

@@ -10,6 +10,12 @@ pub use failure_converter::{
     DefaultFailureConverter, FailureConverter, FailureDecodeHint, NoopDecodeHint,
     WorkflowSignalDecodeHint,
 };
+// Published beside the `DataConverter` the configuration hangs off, which is the only reason these
+// are defined in this crate: drivers are implemented and invoked outside of WASM, by the worker and
+// client, never from workflow code.
+#[cfg(feature = "experimental")]
+#[doc(hidden)]
+pub use crate::external_storage::*;
 use well_known::{BINARY_NULL_ENCODING_VAL, WellKnownType, binary_null_payload};
 
 use crate::protos::{ENCODING_PAYLOAD_KEY, JSON_ENCODING_VAL, temporal::api::common::v1::Payload};

@@ -11,11 +11,11 @@
 
 use std::collections::HashMap;
 
-use super::ExternalStorageError;
 use crate::protos::temporal::api::{
     common::v1::{Payload, payload::ExternalPayloadDetails},
     sdk::v1::ExternalStorageReference,
 };
+use temporalio_common_wasm::data_converters::ExternalStorageError;
 
 const REFERENCE_ENCODING: &str = "json/protobuf";
 // Spelled out rather than taken from `prost::Name` so that a proto-side rename fails

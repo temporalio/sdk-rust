@@ -1,12 +1,12 @@
 //! External storage contracts: offloading large payloads to a user-supplied driver, which replaces
 //! them on the wire with a small reference so the payload data never reaches the Temporal server.
 //!
-//! Import these from `temporalio_common::external_storage`, which re-exports them, so that they can
-//! later move out of this crate without breaking imports. They sit beside
-//! [`crate::data_converters::DataConverter`] because the configuration is expected to hang off it,
-//! the way it does in the SDKs that have already shipped external storage. The reference wire
-//! format lives in `temporalio-common`, alongside the payload visitor and the proto JSON support it
-//! needs. Nothing here is wired into the SDK yet.
+//! This module is private. The contracts are published from [`crate::data_converters`], beside the
+//! [`DataConverter`](crate::data_converters::DataConverter) the configuration hangs off, which is
+//! the only reason they are defined in this crate: drivers are implemented and invoked outside of
+//! WASM, by the worker and client, never from workflow code. The reference wire format lives in
+//! `temporalio-common`, alongside the payload visitor and the proto JSON support it needs. Nothing
+//! here is wired into the SDK yet.
 
 use crate::protos::temporal::api::common::v1::Payload;
 use futures::future::BoxFuture;
