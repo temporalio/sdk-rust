@@ -498,7 +498,12 @@ async fn lambda_drains_cancelled_activities_before_hooks(
     if block_completion {
         let error = result.unwrap_err();
         assert!(error.requires_restart());
-        assert!(error.to_string().contains("did not drain and finalize"));
+        assert!(
+            std::error::Error::source(&error)
+                .unwrap()
+                .to_string()
+                .contains("did not drain and finalize")
+        );
         assert!(!observed_in_hook.load(Ordering::Relaxed));
         assert!(
             worker

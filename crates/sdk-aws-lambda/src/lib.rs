@@ -101,7 +101,7 @@ impl Default for LambdaWorkerOptions {
 /// An error configuring a Lambda Worker. The underlying cause is available through
 /// [`std::error::Error::source`].
 #[derive(Debug, thiserror::Error)]
-#[error("{0}")]
+#[error("failed to configure Lambda Worker")]
 pub struct LambdaWorkerBuildError(#[source] Box<dyn StdError>);
 
 impl LambdaWorkerBuildError {
@@ -120,7 +120,7 @@ impl LambdaWorkerBuildError {
 /// An error handling a Lambda invocation. The underlying cause is available through
 /// [`std::error::Error::source`].
 #[derive(Debug, thiserror::Error)]
-#[error("{source}")]
+#[error("Lambda Worker invocation failed")]
 pub struct LambdaInvocationError {
     #[source]
     source: Box<dyn StdError + Send + Sync>,
@@ -151,6 +151,15 @@ impl LambdaInvocationError {
     /// failure alone does not prevent a subsequent invocation.
     pub fn requires_restart(&self) -> bool {
         self.requires_restart
+    }
+}
+
+impl From<LambdaInvocationError> for lambda_runtime::Diagnostic {
+    fn from(error: LambdaInvocationError) -> Self {
+        Self {
+            error_type: std::any::type_name::<LambdaInvocationError>().to_owned(),
+            error_message: format!("{:#}", anyhow::Error::new(error)),
+        }
     }
 }
 
@@ -485,7 +494,7 @@ impl LambdaWorker {
                 match drain_result {
                     Ok(Ok(())) => {}
                     Ok(Err(error)) => {
-                        tracing::error!(%error, "Worker shutdown failed during cleanup");
+                        tracing::error!(?error, "Worker shutdown failed during cleanup");
                     }
                     Err(_) => {
                         tracing::error!(
@@ -517,12 +526,7 @@ impl LambdaWorker {
         let handler = self.clone();
         lambda_runtime::Runtime::new(service_fn(move |event: LambdaEvent<serde_json::Value>| {
             let worker = handler.clone();
-            async move {
-                worker
-                    .handle(event)
-                    .await
-                    .map_err(lambda_runtime::Error::from)
-            }
+            async move { worker.handle(event).await }
         }))
         .layer(lambda_runtime::layers::TracingLayer::new())
         .layer(layer_fn(move |inner| RestartAfterResponse {
@@ -830,6 +834,8 @@ mod tests {
             result
                 .err()
                 .unwrap()
+                .source()
+                .unwrap()
                 .to_string()
                 .contains("runtime and OpenTelemetry")
         );
@@ -844,6 +850,8 @@ mod tests {
         assert!(
             validate_version(&invalid_version)
                 .unwrap_err()
+                .source()
+                .unwrap()
                 .to_string()
                 .contains("deployment name and build ID")
         );
@@ -855,6 +863,8 @@ mod tests {
         assert!(
             validate_lambda_options(&lambda_options)
                 .unwrap_err()
+                .source()
+                .unwrap()
                 .to_string()
                 .contains("workflow_task_pollers must be at least 2")
         );
@@ -880,18 +890,61 @@ mod tests {
     }
 
     #[test]
-    fn error_display_and_runtime_diagnostic_do_not_duplicate_the_cause() {
+    fn error_chain_reports_and_runtime_diagnostic_do_not_duplicate_the_cause() {
         let build_error = LambdaWorkerBuildError::invalid("invalid Lambda configuration");
-        assert_eq!(build_error.to_string(), "invalid Lambda configuration");
+        assert_eq!(build_error.to_string(), "failed to configure Lambda Worker");
         assert!(build_error.source().unwrap().is::<std::io::Error>());
+        let report = anyhow::Error::new(build_error);
+        assert_eq!(
+            format!("{report:?}")
+                .matches("invalid Lambda configuration")
+                .count(),
+            1,
+        );
+        assert_eq!(
+            format!("{report:#}"),
+            "failed to configure Lambda Worker: invalid Lambda configuration",
+        );
 
         let invocation_error =
             LambdaInvocationError::new(std::io::Error::other("expected Worker failure"), true);
-        assert_eq!(invocation_error.to_string(), "expected Worker failure");
+        assert_eq!(
+            invocation_error.to_string(),
+            "Lambda Worker invocation failed"
+        );
         assert!(invocation_error.source().unwrap().is::<std::io::Error>());
-        let diagnostic =
-            lambda_runtime::Diagnostic::from(lambda_runtime::Error::from(invocation_error));
-        assert_eq!(diagnostic.error_message, "expected Worker failure");
+        let report = anyhow::Error::new(invocation_error);
+        assert_eq!(
+            format!("{report:?}")
+                .matches("expected Worker failure")
+                .count(),
+            1,
+        );
+        assert_eq!(
+            format!("{report:#}"),
+            "Lambda Worker invocation failed: expected Worker failure",
+        );
+        let error = report.downcast::<LambdaInvocationError>().unwrap();
+        assert!(error.requires_restart());
+        let diagnostic = lambda_runtime::Diagnostic::from(error);
+        assert_eq!(
+            diagnostic.error_message,
+            "Lambda Worker invocation failed: expected Worker failure",
+        );
+    }
+
+    #[test]
+    fn runtime_diagnostic_preserves_nested_error_context() {
+        let error = LambdaInvocationError::new(
+            anyhow::Error::new(std::io::Error::other("collector unavailable"))
+                .context("telemetry export failed"),
+            false,
+        );
+        let diagnostic = lambda_runtime::Diagnostic::from(error);
+        assert_eq!(
+            diagnostic.error_message,
+            "Lambda Worker invocation failed: telemetry export failed: collector unavailable",
+        );
     }
 
     #[cfg(feature = "otel")]
@@ -1009,6 +1062,8 @@ mod tests {
         assert!(!error.requires_restart());
         assert!(
             error
+                .source()
+                .unwrap()
                 .to_string()
                 .contains("insufficient Lambda invocation time")
         );
@@ -1109,7 +1164,13 @@ mod tests {
             .await
             .unwrap_err();
         assert!(!error.requires_restart());
-        assert!(error.to_string().contains("invocation is already running"));
+        assert!(
+            error
+                .source()
+                .unwrap()
+                .to_string()
+                .contains("invocation is already running")
+        );
         drop(invocation);
         context.deadline = 0;
         let error = worker
@@ -1117,7 +1178,13 @@ mod tests {
             .await
             .unwrap_err();
         assert!(error.requires_restart());
-        assert!(error.to_string().contains("cannot be reused"));
+        assert!(
+            error
+                .source()
+                .unwrap()
+                .to_string()
+                .contains("cannot be reused")
+        );
     }
 
     #[tokio::test]

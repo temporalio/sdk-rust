@@ -19,8 +19,7 @@ async fn main() -> Result<(), lambda_runtime::Error> {
         .build();
     LambdaWorker::builder(version, options)
         .open_telemetry(OpenTelemetryOptions::default())
-        .build()
-        .map_err(|error| std::io::Error::other(error.to_string()))?
+        .build()?
         .run()
         .await
 }
