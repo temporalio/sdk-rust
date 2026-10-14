@@ -560,7 +560,7 @@ pub(crate) fn resolve_effective_behavior(
     match configured {
         Some(b) => b,
         None if capabilities.poller_autoscaling_auto_enroll() => PollerBehavior::Autoscaling {
-            minimum: 1,
+            minimum: 5,
             maximum: 100,
             initial: 5,
         },
@@ -2831,7 +2831,7 @@ mod tests {
         assert_eq!(
             resolve_effective_behavior(None, &caps),
             PollerBehavior::Autoscaling {
-                minimum: 1,
+                minimum: 5,
                 maximum: 100,
                 initial: 5,
             },
