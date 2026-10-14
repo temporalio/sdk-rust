@@ -4999,12 +4999,20 @@ mod tests {
             let WorkflowTermination::ContinueAsNew(continue_as_new) = termination else {
                 panic!("expected continue-as-new termination")
             };
-            assert_eq!(continue_as_new.workflow_type, "mutated-workflow-type");
             assert_eq!(
-                continue_as_new.arguments,
+                continue_as_new.attributes.workflow_type,
+                "mutated-workflow-type"
+            );
+            assert_eq!(
+                continue_as_new.attributes.arguments,
                 vec![42u8.as_json_payload().unwrap()]
             );
-            assert!(continue_as_new.headers.contains_key("continue-header"));
+            assert!(
+                continue_as_new
+                    .attributes
+                    .headers
+                    .contains_key("continue-header")
+            );
 
             let commands = host.commands.borrow();
             assert_eq!(commands.len(), 3);
@@ -5101,7 +5109,7 @@ mod tests {
         };
 
         assert_eq!(
-            proto_command.headers,
+            proto_command.attributes.headers,
             HashMap::from([(
                 "continue-header".to_string(),
                 Payload::from(b"continue-header-value".as_slice()),
@@ -5251,7 +5259,7 @@ mod tests {
             };
 
             assert_eq!(
-                cmd.initial_versioning_behavior,
+                cmd.attributes.initial_versioning_behavior,
                 ProtoContinueAsNewVersioningBehavior::AutoUpgrade as i32
             );
         }
@@ -5309,7 +5317,7 @@ mod tests {
         };
 
         assert_eq!(
-            cmd.search_attributes,
+            cmd.attributes.search_attributes,
             Some(ProtoSearchAttributes::default())
         );
     }
