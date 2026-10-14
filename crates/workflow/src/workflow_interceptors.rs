@@ -1375,7 +1375,6 @@ pub struct CancelExternalWorkflowInput {
     ///
     /// **EXPERIMENTAL:** Event Groups is an experimental API and may change without notice.
     #[cfg(feature = "experimental")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "experimental")))]
     pub event_groups: Vec<crate::EventGroup>,
 }
 

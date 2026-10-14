@@ -106,7 +106,6 @@ pub struct NexusOperationOptions {
     ///
     /// **EXPERIMENTAL:** Event Groups is an experimental API and may change without notice.
     #[cfg(feature = "experimental")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "experimental")))]
     #[builder(default)]
     pub event_groups: Vec<EventGroup>,
 }

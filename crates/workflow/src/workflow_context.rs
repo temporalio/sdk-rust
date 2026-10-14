@@ -979,7 +979,6 @@ impl BaseWorkflowContext {
     ///
     /// **EXPERIMENTAL:** Event Groups is an experimental API and may change without notice.
     #[cfg(feature = "experimental")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "experimental")))]
     pub fn with_event_group(&self, group: EventGroup) -> Self {
         self.with_event_groups([group])
     }
@@ -988,7 +987,6 @@ impl BaseWorkflowContext {
     ///
     /// **EXPERIMENTAL:** Event Groups is an experimental API and may change without notice.
     #[cfg(feature = "experimental")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "experimental")))]
     pub fn with_event_groups(&self, groups: impl IntoIterator<Item = EventGroup>) -> Self {
         Self {
             inner: self.inner.clone(),
@@ -1796,7 +1794,6 @@ impl<W> SyncWorkflowContext<W> {
     ///
     /// **EXPERIMENTAL:** Event Groups is an experimental API and may change without notice.
     #[cfg(feature = "experimental")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "experimental")))]
     pub fn with_event_group(&self, group: EventGroup) -> Self {
         self.with_event_groups([group])
     }
@@ -1805,7 +1802,6 @@ impl<W> SyncWorkflowContext<W> {
     ///
     /// **EXPERIMENTAL:** Event Groups is an experimental API and may change without notice.
     #[cfg(feature = "experimental")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "experimental")))]
     pub fn with_event_groups(&self, groups: impl IntoIterator<Item = EventGroup>) -> Self {
         Self {
             base: self.base.with_event_groups(groups),
@@ -2159,7 +2155,6 @@ impl<W> SyncWorkflowContext<W> {
     ///
     /// This experimental API may change without notice.
     #[cfg(feature = "experimental")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "experimental")))]
     pub fn patched_with_options(&self, patch_id: &str, options: PatchedOptions) -> bool {
         self.patch_impl(
             patch_id,
@@ -2179,7 +2174,6 @@ impl<W> SyncWorkflowContext<W> {
     ///
     /// This experimental API may change without notice.
     #[cfg(feature = "experimental")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "experimental")))]
     pub fn deprecate_patch_with_options(
         &self,
         patch_id: &str,
@@ -2262,7 +2256,6 @@ impl<W> SyncWorkflowContext<W> {
     ///
     /// This experimental API may change without notice.
     #[cfg(feature = "experimental")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "experimental")))]
     pub fn upsert_search_attributes_with_options(
         &self,
         updates: impl IntoIterator<Item = SearchAttributeUpdate>,
@@ -2319,7 +2312,6 @@ impl<W> SyncWorkflowContext<W> {
     ///
     /// This experimental API may change without notice.
     #[cfg(feature = "experimental")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "experimental")))]
     pub fn upsert_memo_with_options<K>(
         &self,
         updates: impl IntoIterator<Item = (K, Option<MemoValue>)>,
@@ -2479,7 +2471,6 @@ impl<W> WorkflowContext<W> {
     ///
     /// **EXPERIMENTAL:** Event Groups is an experimental API and may change without notice.
     #[cfg(feature = "experimental")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "experimental")))]
     pub fn with_event_group(&self, group: EventGroup) -> Self {
         self.with_event_groups([group])
     }
@@ -2488,7 +2479,6 @@ impl<W> WorkflowContext<W> {
     ///
     /// **EXPERIMENTAL:** Event Groups is an experimental API and may change without notice.
     #[cfg(feature = "experimental")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "experimental")))]
     pub fn with_event_groups(&self, groups: impl IntoIterator<Item = EventGroup>) -> Self {
         Self {
             sync: self.sync.with_event_groups(groups),
@@ -2775,7 +2765,6 @@ impl<W> WorkflowContext<W> {
     ///
     /// This experimental API may change without notice.
     #[cfg(feature = "experimental")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "experimental")))]
     pub fn patched_with_options(&self, patch_id: &str, options: PatchedOptions) -> bool {
         self.sync.patched_with_options(patch_id, options)
     }
@@ -2791,7 +2780,6 @@ impl<W> WorkflowContext<W> {
     ///
     /// This experimental API may change without notice.
     #[cfg(feature = "experimental")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "experimental")))]
     pub fn deprecate_patch_with_options(
         &self,
         patch_id: &str,
@@ -2821,7 +2809,6 @@ impl<W> WorkflowContext<W> {
     ///
     /// This experimental API may change without notice.
     #[cfg(feature = "experimental")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "experimental")))]
     pub fn upsert_search_attributes_with_options(
         &self,
         updates: impl IntoIterator<Item = SearchAttributeUpdate>,
@@ -2847,7 +2834,6 @@ impl<W> WorkflowContext<W> {
     ///
     /// This experimental API may change without notice.
     #[cfg(feature = "experimental")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "experimental")))]
     pub fn upsert_memo_with_options<K>(
         &self,
         updates: impl IntoIterator<Item = (K, Option<MemoValue>)>,
@@ -3897,7 +3883,6 @@ where
     ///
     /// This experimental API may change without notice.
     #[cfg(feature = "experimental")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "experimental")))]
     pub fn cancel_with_options(&self, options: CancelChildWorkflowOptions) {
         self.base_ctx
             .cancel_child_workflow_with_options(self.child_seq, options);
@@ -3996,7 +3981,6 @@ impl ExternalWorkflowHandle {
     ///
     /// This experimental API may change without notice.
     #[cfg(feature = "experimental")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "experimental")))]
     pub fn cancel_with_options(
         &self,
         options: CancelExternalWorkflowOptions,

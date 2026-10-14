@@ -293,7 +293,6 @@ pub struct ActivityOptions {
     ///
     /// **EXPERIMENTAL:** Event Groups is an experimental API and may change without notice.
     #[cfg(feature = "experimental")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "experimental")))]
     #[builder(default)]
     pub event_groups: Vec<EventGroup>,
 }
@@ -426,7 +425,6 @@ pub struct LocalActivityOptions {
     ///
     /// **EXPERIMENTAL:** Event Groups is an experimental API and may change without notice.
     #[cfg(feature = "experimental")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "experimental")))]
     #[builder(default)]
     pub event_groups: Vec<EventGroup>,
 }
@@ -536,7 +534,6 @@ pub struct ChildWorkflowOptions {
     ///
     /// **EXPERIMENTAL:** Event Groups is an experimental API and may change without notice.
     #[cfg(feature = "experimental")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "experimental")))]
     #[builder(default)]
     pub event_groups: Vec<EventGroup>,
 }
@@ -619,7 +616,6 @@ pub struct TimerOptions {
     ///
     /// **EXPERIMENTAL:** Event Groups is an experimental API and may change without notice.
     #[cfg(feature = "experimental")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "experimental")))]
     #[builder(default)]
     pub event_groups: Vec<EventGroup>,
 }
@@ -673,7 +669,6 @@ pub struct WaitConditionOptions {
 ///
 /// This experimental API may change without notice.
 #[cfg(feature = "experimental")]
-#[cfg_attr(docsrs, doc(cfg(feature = "experimental")))]
 #[derive(Default, Debug, Clone, bon::Builder)]
 #[non_exhaustive]
 pub struct CancelExternalWorkflowOptions {
@@ -684,7 +679,6 @@ pub struct CancelExternalWorkflowOptions {
     ///
     /// **EXPERIMENTAL:** Event Groups is an experimental API and may change without notice.
     #[cfg(feature = "experimental")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "experimental")))]
     #[builder(default)]
     pub event_groups: Vec<EventGroup>,
 }
@@ -693,7 +687,6 @@ pub struct CancelExternalWorkflowOptions {
 ///
 /// This experimental API may change without notice.
 #[cfg(feature = "experimental")]
-#[cfg_attr(docsrs, doc(cfg(feature = "experimental")))]
 #[derive(Default, Debug, Clone, bon::Builder)]
 #[non_exhaustive]
 pub struct CancelChildWorkflowOptions {
@@ -704,7 +697,6 @@ pub struct CancelChildWorkflowOptions {
     ///
     /// **EXPERIMENTAL:** Event Groups is an experimental API and may change without notice.
     #[cfg(feature = "experimental")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "experimental")))]
     #[builder(default)]
     pub event_groups: Vec<EventGroup>,
 }
@@ -722,7 +714,6 @@ pub struct SignalWorkflowOptions {
     ///
     /// **EXPERIMENTAL:** Event Groups is an experimental API and may change without notice.
     #[cfg(feature = "experimental")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "experimental")))]
     #[builder(default)]
     pub event_groups: Vec<EventGroup>,
 }
@@ -797,7 +788,6 @@ pub struct ContinueAsNewOptions {
     ///
     /// **EXPERIMENTAL:** Event Groups is an experimental API and may change without notice.
     #[cfg(feature = "experimental")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "experimental")))]
     #[builder(default)]
     pub event_groups: Vec<EventGroup>,
 }
@@ -864,7 +854,6 @@ impl ContinueAsNewOptions {
 ///
 /// This experimental API may change without notice.
 #[cfg(feature = "experimental")]
-#[cfg_attr(docsrs, doc(cfg(feature = "experimental")))]
 #[derive(Default, Debug, Clone, bon::Builder)]
 #[non_exhaustive]
 pub struct PatchedOptions {
@@ -873,7 +862,6 @@ pub struct PatchedOptions {
     ///
     /// **EXPERIMENTAL:** Event Groups is an experimental API and may change without notice.
     #[cfg(feature = "experimental")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "experimental")))]
     #[builder(default)]
     pub event_groups: Vec<EventGroup>,
 }
@@ -882,7 +870,6 @@ pub struct PatchedOptions {
 ///
 /// This experimental API may change without notice.
 #[cfg(feature = "experimental")]
-#[cfg_attr(docsrs, doc(cfg(feature = "experimental")))]
 #[derive(Default, Debug, Clone, bon::Builder)]
 #[non_exhaustive]
 pub struct DeprecatePatchOptions {
@@ -891,7 +878,6 @@ pub struct DeprecatePatchOptions {
     ///
     /// **EXPERIMENTAL:** Event Groups is an experimental API and may change without notice.
     #[cfg(feature = "experimental")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "experimental")))]
     #[builder(default)]
     pub event_groups: Vec<EventGroup>,
 }
@@ -900,7 +886,6 @@ pub struct DeprecatePatchOptions {
 ///
 /// This experimental API may change without notice.
 #[cfg(feature = "experimental")]
-#[cfg_attr(docsrs, doc(cfg(feature = "experimental")))]
 #[derive(Default, Debug, Clone, bon::Builder)]
 #[non_exhaustive]
 pub struct UpsertMemoOptions {
@@ -909,7 +894,6 @@ pub struct UpsertMemoOptions {
     ///
     /// **EXPERIMENTAL:** Event Groups is an experimental API and may change without notice.
     #[cfg(feature = "experimental")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "experimental")))]
     #[builder(default)]
     pub event_groups: Vec<EventGroup>,
 }
@@ -918,7 +902,6 @@ pub struct UpsertMemoOptions {
 ///
 /// This experimental API may change without notice.
 #[cfg(feature = "experimental")]
-#[cfg_attr(docsrs, doc(cfg(feature = "experimental")))]
 #[derive(Default, Debug, Clone, bon::Builder)]
 #[non_exhaustive]
 pub struct UpsertSearchAttributesOptions {
@@ -927,7 +910,6 @@ pub struct UpsertSearchAttributesOptions {
     ///
     /// **EXPERIMENTAL:** Event Groups is an experimental API and may change without notice.
     #[cfg(feature = "experimental")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "experimental")))]
     #[builder(default)]
     pub event_groups: Vec<EventGroup>,
 }

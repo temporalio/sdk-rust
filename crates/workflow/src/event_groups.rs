@@ -23,7 +23,6 @@ use temporalio_common_wasm::{
 /// [`crate::WorkflowContext::with_event_group`].
 ///
 /// **EXPERIMENTAL:** Event Groups is an experimental API and may change without notice.
-#[cfg_attr(docsrs, doc(cfg(feature = "experimental")))]
 #[derive(Clone, Debug)]
 pub struct EventGroup {
     inner: EventGroupInner,
