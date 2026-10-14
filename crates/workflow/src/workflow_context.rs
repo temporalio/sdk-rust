@@ -5280,7 +5280,7 @@ mod tests {
         }
 
         #[test]
-        fn continue_as_new_merges_ambient_and_direct_event_groups() {
+        fn continue_as_new_merges_scope_and_direct_event_groups() {
             let ctx = test_context();
             let direct = EventGroup::new("direct-id").with_label("direct-label");
             let scope = EventGroup::new("scope-id").with_label("scope-label");

@@ -43,10 +43,10 @@ enum EventGroupKey {
     InboundUpdate(String),
 }
 
-/// Ambient Event Groups carried by a workflow context.
+/// Active Event Groups carried by a workflow context.
 ///
-/// Implicit groups (signal / update handlers) replace any enclosing explicit scope. Explicit groups
-/// nest and compose.
+/// Implicit groups (signal / update handlers) replace any enclosing explicit scope.
+/// Explicit groups nest and compose.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct ActiveEventGroups {
     implicit: Option<EventGroup>,
@@ -177,16 +177,16 @@ impl ActiveEventGroups {
     }
 }
 
-/// Merge ambient context groups with markers directly attached to a command.
+/// Merge active context groups with markers directly attached to a command.
 pub(crate) fn merge_event_group_markers(
-    ambient: &ActiveEventGroups,
+    active: &ActiveEventGroups,
     direct: Vec<EventGroupMarker>,
 ) -> Vec<EventGroupMarker> {
     if direct.is_empty() {
-        return ambient.markers();
+        return active.markers();
     }
     let mut result = Vec::with_capacity(
-        usize::from(ambient.implicit.is_some()) + ambient.explicit.len() + direct.len(),
+        usize::from(active.implicit.is_some()) + active.explicit.len() + direct.len(),
     );
     let mut index_by_key = HashMap::new();
     let mut push = |marker: EventGroupMarker| {
@@ -200,7 +200,7 @@ pub(crate) fn merge_event_group_markers(
             result.push(marker);
         }
     };
-    ambient.for_each_marker(&mut push);
+    active.for_each_marker(&mut push);
     for marker in direct {
         push(marker);
     }
@@ -278,12 +278,12 @@ mod tests {
 
     #[test]
     fn merge_collapses_duplicate_ids_and_keeps_direct_label() {
-        let ambient = ActiveEventGroups::default().with_explicit([
+        let active = ActiveEventGroups::default().with_explicit([
             EventGroup::new("a-id").with_label("aaa"),
             EventGroup::new("b-id").with_label("bbb"),
         ]);
         let extra = vec![EventGroup::new("a-id").with_label("aaa-direct").to_marker()];
-        let merged = merge_event_group_markers(&ambient, extra);
+        let merged = merge_event_group_markers(&active, extra);
         assert_eq!(merged.len(), 2);
         let a = merged
             .iter()
