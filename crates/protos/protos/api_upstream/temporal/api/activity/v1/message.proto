@@ -18,6 +18,7 @@ import "temporal/api/enums/v1/activity.proto";
 import "temporal/api/callback/v1/message.proto";
 import "temporal/api/enums/v1/workflow.proto";
 import "temporal/api/failure/v1/message.proto";
+import "temporal/api/nexus/v1/message.proto";
 import "temporal/api/taskqueue/v1/message.proto";
 import "temporal/api/sdk/v1/user_metadata.proto";
 
@@ -195,6 +196,13 @@ message ActivityExecutionInfo {
     // The time at which the first activity task is made available for dispatch, computed as
     // `schedule_time + start_delay`. Same as `schedule_time` if `start_delay` is not set.
     google.protobuf.Timestamp execution_time = 38;
+
+    // Serialization context propagated from the Nexus caller that started this activity.
+    temporal.api.nexus.v1.PropagatedSerializationContext propagated_nexus_serialization_context = 39;
+
+    // Indicates whether eager execution was requested for this activity and accepted by the server
+    // for its first task.
+    bool eager_execution_accepted = 40;
 }
 
 // Limited activity information returned in the list response.

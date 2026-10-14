@@ -73,12 +73,15 @@ use tracing::warn;
 
 #[workflow]
 #[derive(Default)]
-struct OneActivityWorkflow;
+pub(crate) struct OneActivityWorkflow;
 
 #[workflow_methods]
 impl OneActivityWorkflow {
     #[run]
-    async fn run(ctx: &mut WorkflowContext<Self>, input: String) -> WorkflowResult<String> {
+    pub(crate) async fn run(
+        ctx: &mut WorkflowContext<Self>,
+        input: String,
+    ) -> WorkflowResult<String> {
         let r = ctx
             .execute_activity(
                 StdActivities::echo,
