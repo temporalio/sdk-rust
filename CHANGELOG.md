@@ -64,6 +64,8 @@ relevant information.
   names are camel case rather than snake case and the binary encoding is unchanged. They previously
   could not be deserialized from the camel case that other Temporal SDKs and protobuf tools emit,
   and both spellings are now accepted.
+* Legacy queries no longer execute local activities while reconstructing workflow state, avoiding
+  duplicate activity executions and stalled workflows.
 * `Worker::run()` now waits for spawned activity tasks to finish before returning, including
   when running fails.
 * Workers no longer leak memory for every activity task they run. Each task's cancellation

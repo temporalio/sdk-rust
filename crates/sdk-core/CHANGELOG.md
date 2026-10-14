@@ -46,6 +46,8 @@ relevant information.
   request stalls. Timeout messages include the last connection failure when available.
 * Workers with large workflow caches avoid unnecessary CPU usage when no workflow tasks are waiting
   for a cache slot.
+* Preparing a legacy query now remains in replay mode, preventing unrecorded local activity
+  attempts that could execute twice or leave the workflow stuck.
 * Worker heartbeats now report correct task-slot and poller counts when using buffered or custom
   metrics backends, including the Python SDK's `MetricBuffer`. Previously these counts could
   remain `0` because heartbeat accounting depended on reading labels from backend-owned attributes.
