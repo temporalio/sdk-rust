@@ -247,7 +247,8 @@ impl ManagedRun {
             if is_incremental {
                 self.metrics.sticky_cache_hit();
             }
-            self.wfm.new_work_from_server(work.update, work.messages)?
+            self.wfm
+                .new_work_from_server(work.update, work.messages, was_legacy_query)?
         } else {
             let r = self.wfm.get_next_activation()?;
             if r.jobs.is_empty() {
@@ -277,17 +278,13 @@ impl ManagedRun {
                     // No activation needs to be sent to lang. We just need to wait for another
                     // heartbeat timeout or LAs to resolve
                     return Ok(None);
-                } else {
-                    panic!(
-                        "Got a new WFT while there are outstanding local activities, but there \
-                     was no waiting on LA info."
-                    )
                 }
-            } else {
-                return Ok(Some(ActivationOrAuto::Autocomplete {
-                    run_id: self.wfm.machines.run_id.clone(),
-                }));
             }
+            // Autocomplete dispatches enqueued LAs that could not start during query replay
+            // and establishes the normal LA heartbeat.
+            return Ok(Some(ActivationOrAuto::Autocomplete {
+                run_id: self.wfm.machines.run_id.clone(),
+            }));
         }
 
         Ok(Some(ActivationOrAuto::LangActivation(activation)))
@@ -1504,8 +1501,10 @@ impl WorkflowManager {
         &mut self,
         update: HistoryUpdate,
         messages: Vec<IncomingProtocolMessage>,
+        preparing_legacy_query: bool,
     ) -> Result<WorkflowActivation> {
-        self.machines.new_work_from_server(update, messages)?;
+        self.machines
+            .new_work_from_server(update, messages, preparing_legacy_query)?;
         self.awaiting_next_wft = false;
         self.apply_deferred_local_resolutions()?;
         self.get_next_activation()
@@ -2462,6 +2461,7 @@ mod tests {
                             .new_work_from_server(
                                 history.get_one_wft(wft_number).unwrap().into(),
                                 vec![],
+                                false,
                             )
                             .unwrap();
                         if activation.jobs.is_empty() {

@@ -71,8 +71,8 @@ use temporalio_sdk_core::{
     test_help::{
         LEGACY_QUERY_ID, MockPollCfg, MocksHolder, QueueResponse, ResponseType, WorkerExt,
         WorkerTestHelpers, build_mock_pollers, drain_pollers_and_shutdown, hist_to_poll_resp,
-        mock_worker, mock_worker_client, query_ok, schedule_local_activity_cmd,
-        single_hist_mock_sg, start_timer_cmd,
+        mock_worker, mock_worker_client, query_ok, schedule_activity_cmd,
+        schedule_local_activity_cmd, single_hist_mock_sg, start_timer_cmd,
     },
 };
 use tokio::{
@@ -2140,6 +2140,196 @@ async fn la_resolve_during_legacy_query_does_not_combine(#[case] impossible_quer
     };
 
     join!(wf_fut, act_fut);
+    core.drain_pollers_and_shutdown().await;
+}
+
+#[rstest::rstest]
+#[case::pending_workflow_task(false, false)]
+#[case::started_workflow_task(true, false)]
+#[case::cached_pending_workflow_task(false, true)]
+#[case::cached_started_workflow_task(true, true)]
+#[temporalio_macros::cloud_test_exclusion(crate::CloudTestExclusionReason::DoesNotUseServer)]
+#[tokio::test]
+async fn legacy_query_must_not_execute_local_activity(
+    #[case] task_started: bool,
+    #[case] cached: bool,
+) {
+    let mut history = TestHistoryBuilder::default();
+    history.add(default_wes_attribs());
+    history.add_full_wf_task();
+    let scheduled = history.add_activity_task_scheduled("remote");
+    let started = history.add_activity_task_started(scheduled);
+    history.add_activity_task_completed(scheduled, started, vec![1].into());
+    history.add_workflow_task_scheduled();
+    if task_started {
+        history.add_workflow_task_started();
+    }
+    // A replacement worker can receive a legacy query with the activity completion in its
+    // history, before the workflow task that will commit the resulting local activity.
+    let mut query = hist_to_poll_resp(
+        &history,
+        "legacy_query_local_activity",
+        ResponseType::AllHistory,
+    )
+    .resp;
+    query.query = Some(WorkflowQuery {
+        query_type: "query-type".to_owned(),
+        ..Default::default()
+    });
+    query.started_event_id = 0;
+    if !task_started {
+        history.add_workflow_task_started();
+    }
+    let workflow_task = hist_to_poll_resp(
+        &history,
+        "legacy_query_local_activity",
+        ResponseType::AllHistory,
+    )
+    .resp;
+    let (send_workflow_task, workflow_task_ready) = oneshot::channel::<()>();
+    let tasks = stream::iter([query])
+        .chain(stream::once(async move {
+            workflow_task_ready.await.unwrap();
+            workflow_task
+        }))
+        .chain(stream::pending());
+    let mut client = mock_worker_client();
+    client
+        .expect_respond_legacy_query()
+        .times(1)
+        .returning(|_, _| Ok(Default::default()));
+    client
+        .expect_complete_workflow_task()
+        .times(usize::from(cached))
+        .returning(|completion, _| {
+            assert_eq!(
+                completion
+                    .commands
+                    .iter()
+                    .map(|cmd| cmd.command_type())
+                    .collect::<Vec<_>>(),
+                [
+                    CommandType::RecordMarker,
+                    CommandType::CompleteWorkflowExecution
+                ]
+            );
+            Ok(Default::default())
+        });
+    let mut mock = MocksHolder::from_client_with_custom(
+        client,
+        Some(tasks),
+        None::<Vec<QueueResponse<PollActivityTaskQueueResponse>>>,
+        None::<Vec<QueueResponse<PollNexusTaskQueueResponse>>>,
+    );
+    mock.worker_cfg(|wc| wc.max_cached_workflows = usize::from(cached));
+    let core = mock_worker(mock);
+
+    let activation = core.poll_workflow_activation().await.unwrap();
+    assert!(activation.is_replaying);
+    assert_matches!(
+        activation.jobs.as_slice(),
+        [WorkflowActivationJob {
+            variant: Some(workflow_activation_job::Variant::InitializeWorkflow(_)),
+        }]
+    );
+    core.complete_workflow_activation(WorkflowActivationCompletion::from_cmd(
+        activation.run_id,
+        schedule_activity_cmd(
+            1,
+            "task-queue",
+            "remote",
+            ProtoActivityCancellationType::TryCancel,
+            Duration::from_secs(60),
+            Duration::ZERO,
+        ),
+    ))
+    .await
+    .unwrap();
+    let activation = core.poll_workflow_activation().await.unwrap();
+    assert!(activation.is_replaying);
+    assert_matches!(
+        activation.jobs.as_slice(),
+        [WorkflowActivationJob {
+            variant: Some(workflow_activation_job::Variant::ResolveActivity(_)),
+        }]
+    );
+    core.complete_workflow_activation(WorkflowActivationCompletion::from_cmd(
+        activation.run_id,
+        schedule_local_activity_cmd(
+            2,
+            "local",
+            ProtoActivityCancellationType::TryCancel,
+            Duration::from_secs(60),
+        ),
+    ))
+    .await
+    .unwrap();
+
+    // Dispatch must lose to query handling without relying on a timing window.
+    let query_and_eviction = async {
+        let activation = core.poll_workflow_activation().await.unwrap();
+        assert_matches!(
+            activation.jobs.as_slice(),
+            [WorkflowActivationJob {
+                variant: Some(workflow_activation_job::Variant::QueryWorkflow(q)),
+            }] if q.query_id == LEGACY_QUERY_ID
+        );
+        core.complete_workflow_activation(WorkflowActivationCompletion::from_cmd(
+            activation.run_id,
+            query_ok(LEGACY_QUERY_ID, "answer"),
+        ))
+        .await
+        .unwrap();
+        if cached {
+            return;
+        }
+        let activation = core.poll_workflow_activation().await.unwrap();
+        assert_matches!(
+            activation.jobs.as_slice(),
+            [WorkflowActivationJob {
+                variant: Some(workflow_activation_job::Variant::RemoveFromCache(_)),
+            }]
+        );
+        core.complete_workflow_activation(WorkflowActivationCompletion::empty(activation.run_id))
+            .await
+            .unwrap();
+    };
+    select! {
+        biased;
+        task = core.poll_activity_task() => {
+            panic!("Legacy query dispatched a local activity: {:?}", task.unwrap());
+        }
+        () = query_and_eviction => {}
+    }
+    if cached {
+        send_workflow_task.send(()).unwrap();
+        let execute_activity = async {
+            let activity = core.poll_activity_task().await.unwrap();
+            assert_matches!(
+                activity.variant,
+                Some(act_task::Variant::Start(ref start))
+                    if start.is_local && start.activity_id == "local"
+            );
+            core.complete_activity_task(ActivityTaskCompletion {
+                task_token: activity.task_token,
+                result: Some(ActivityExecutionResult::ok(vec![1].into())),
+            })
+            .await
+            .unwrap();
+        };
+        let finish_workflow = async {
+            let activation = core.poll_workflow_activation().await.unwrap();
+            assert!(!activation.is_replaying);
+            assert_matches!(
+                activation.jobs.as_slice(),
+                [WorkflowActivationJob {
+                    variant: Some(workflow_activation_job::Variant::ResolveActivity(_)),
+                }]
+            );
+            core.complete_execution(&activation.run_id).await;
+        };
+        join!(execute_activity, finish_workflow);
+    }
     core.drain_pollers_and_shutdown().await;
 }
 
