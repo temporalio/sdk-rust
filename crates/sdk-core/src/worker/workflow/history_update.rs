@@ -985,6 +985,7 @@ mod tests {
                     raw_history: vec![],
                     next_page_token,
                     archived: false,
+                    ..Default::default()
                 })
             });
 
@@ -1254,6 +1255,7 @@ mod tests {
                     raw_history: vec![],
                     next_page_token: vec![2],
                     archived: false,
+                    ..Default::default()
                 })
             })
             .times(1);
@@ -1307,6 +1309,7 @@ mod tests {
                     raw_history: vec![],
                     next_page_token: vec![],
                     archived: false,
+                    ..Default::default()
                 })
             })
             .times(1);
@@ -1380,6 +1383,7 @@ mod tests {
                         raw_history: vec![],
                         next_page_token: vec![(i * 10) as u8],
                         archived: false,
+                        ..Default::default()
                     })
                 })
                 .times(1);
@@ -1395,6 +1399,7 @@ mod tests {
                         raw_history: vec![],
                         next_page_token: vec![(i * 10 + 1) as u8],
                         archived: false,
+                        ..Default::default()
                     })
                 })
                 .times(1);
@@ -1409,6 +1414,7 @@ mod tests {
                     raw_history: vec![],
                     next_page_token: vec![],
                     archived: false,
+                    ..Default::default()
                 })
             })
             .times(1);

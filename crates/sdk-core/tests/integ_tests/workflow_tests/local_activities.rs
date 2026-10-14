@@ -5,7 +5,7 @@ use crate::common::{
 };
 use anyhow::anyhow;
 use crossbeam_queue::SegQueue;
-use futures_util::FutureExt;
+use futures_util::{FutureExt, StreamExt, stream};
 use rstest::Context;
 use std::{
     collections::HashMap,
@@ -45,8 +45,12 @@ use temporalio_common::{
                 CommandType, EventType, TimeoutType as ProtoTimeoutType, WorkflowTaskFailedCause,
             },
             failure::v1::{Failure, failure::FailureInfo},
-            history::v1::history_event::{self, Attributes::MarkerRecordedEventAttributes},
+            history::v1::{
+                History,
+                history_event::{self, Attributes::MarkerRecordedEventAttributes},
+            },
             query::v1::WorkflowQuery,
+            workflowservice::v1::{PollActivityTaskQueueResponse, PollNexusTaskQueueResponse},
         },
     },
 };
@@ -65,15 +69,15 @@ use temporalio_sdk_core::{
         canned_histories, default_wes_attribs,
     },
     test_help::{
-        LEGACY_QUERY_ID, MockPollCfg, ResponseType, WorkerExt, WorkerTestHelpers,
-        build_mock_pollers, drain_pollers_and_shutdown, hist_to_poll_resp, mock_worker,
-        mock_worker_client, query_ok, schedule_local_activity_cmd, single_hist_mock_sg,
-        start_timer_cmd,
+        LEGACY_QUERY_ID, MockPollCfg, MocksHolder, QueueResponse, ResponseType, WorkerExt,
+        WorkerTestHelpers, build_mock_pollers, drain_pollers_and_shutdown, hist_to_poll_resp,
+        mock_worker, mock_worker_client, query_ok, schedule_local_activity_cmd,
+        single_hist_mock_sg, start_timer_cmd,
     },
 };
 use tokio::{
     join, select,
-    sync::{Barrier, Notify},
+    sync::{Barrier, Notify, oneshot},
 };
 use tokio_util::sync::CancellationToken;
 
@@ -2137,6 +2141,124 @@ async fn la_resolve_during_legacy_query_does_not_combine(#[case] impossible_quer
 
     join!(wf_fut, act_fut);
     core.drain_pollers_and_shutdown().await;
+}
+
+/// While a workflow task waits on a local activity, core holds it with nothing outstanding to lang
+/// (since #1442). A legacy query task (a query the server sends on its own, when it thinks the
+/// workflow is idle) that arrives then must wait until that workflow task is reported. Core used
+/// to apply it at once, replacing the workflow task ("Trying to send a new WFT for a run which
+/// already has one!"), which was then never reported and timed out on the server. Under load, the
+/// retried workflow task can fail with a nondeterminism error and leave the workflow stuck.
+#[tokio::test]
+async fn legacy_query_while_waiting_on_la_is_buffered() {
+    let wfid = "fake_wf_id";
+    let mut t = TestHistoryBuilder::default();
+    t.add(default_wes_attribs());
+    t.add_full_wf_task();
+    let workflow_task = hist_to_poll_resp(&t, wfid.to_owned(), ResponseType::ToTaskNum(1)).resp;
+    let mut legacy_query = workflow_task.clone();
+    legacy_query.history = Some(History { events: vec![] });
+    legacy_query.query = Some(WorkflowQuery {
+        query_type: "query-type".to_string(),
+        query_args: Some(b"hi".into()),
+        header: None,
+    });
+
+    // The test hands core its tasks: the workflow task, then the query when the test sends it.
+    // Core asks for a task only after it has handled the one before (history fetches run one at a
+    // time), so its asking after the query means it has handled the query. If core stops instead,
+    // the stream is dropped.
+    let (send_query, query_sent) = oneshot::channel::<()>();
+    let (query_handled_tx, query_handled) = oneshot::channel::<()>();
+    let tasks = stream::iter([workflow_task])
+        .chain(stream::once(async move {
+            query_sent.await.unwrap();
+            legacy_query
+        }))
+        .chain(stream::once(async move {
+            query_handled_tx.send(()).unwrap();
+            std::future::pending().await
+        }));
+
+    let mut client = mock_worker_client();
+    client
+        .expect_complete_workflow_task()
+        .times(1)
+        .returning(|_, _| Ok(Default::default()));
+    client
+        .expect_respond_legacy_query()
+        .times(1)
+        .returning(|_, _| Ok(Default::default()));
+    let mut mock = MocksHolder::from_client_with_custom(
+        client,
+        Some(tasks),
+        None::<Vec<QueueResponse<PollActivityTaskQueueResponse>>>,
+        None::<Vec<QueueResponse<PollNexusTaskQueueResponse>>>,
+    );
+    mock.worker_cfg(|wc| {
+        wc.max_cached_workflows = 10;
+        wc.fetching_concurrency = 1;
+    });
+    let core = mock_worker(mock);
+
+    // The workflow starts a local activity. Core replies at once and keeps the workflow task open.
+    let task = core.poll_workflow_activation().await.unwrap();
+    let run_id = task.run_id;
+    core.complete_workflow_activation(WorkflowActivationCompletion::from_cmd(
+        run_id.clone(),
+        schedule_local_activity_cmd(
+            1,
+            "act-id",
+            ProtoActivityCancellationType::TryCancel,
+            Duration::from_secs(60),
+        ),
+    ))
+    .await
+    .unwrap();
+    let local_activity = core.poll_activity_task().await.unwrap();
+
+    // The legacy query arrives while the local activity runs.
+    send_query.send(()).unwrap();
+    query_handled
+        .await
+        .expect("core stopped while handling the legacy query");
+
+    // The local activity finishes, and the workflow task is reported.
+    core.complete_activity_task(ActivityTaskCompletion {
+        task_token: local_activity.task_token,
+        result: Some(ActivityExecutionResult::ok(vec![1].into())),
+    })
+    .await
+    .unwrap();
+    let task = core.poll_workflow_activation().await.unwrap();
+    assert_matches!(
+        task.jobs.as_slice(),
+        [WorkflowActivationJob {
+            variant: Some(workflow_activation_job::Variant::ResolveActivity(_)),
+        }]
+    );
+    core.complete_workflow_activation(WorkflowActivationCompletion::from_cmd(
+        run_id.clone(),
+        start_timer_cmd(1, Duration::from_secs(1)),
+    ))
+    .await
+    .unwrap();
+
+    // Only then is the query answered.
+    let task = core.poll_workflow_activation().await.unwrap();
+    assert_matches!(
+        task.jobs.as_slice(),
+        [WorkflowActivationJob {
+            variant: Some(workflow_activation_job::Variant::QueryWorkflow(q)),
+        }] if q.query_id == LEGACY_QUERY_ID
+    );
+    core.complete_workflow_activation(WorkflowActivationCompletion::from_cmd(
+        run_id,
+        query_ok(LEGACY_QUERY_ID, "whatev"),
+    ))
+    .await
+    .unwrap();
+    core.shutdown().await;
 }
 
 #[temporalio_macros::cloud_test_exclusion(crate::CloudTestExclusionReason::DoesNotUseServer)]

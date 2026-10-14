@@ -48,6 +48,10 @@ relevant information.
   or completes while the local activity is backing off between retries.
 * Workers no longer panic when evicting a workflow with buffered local activity results. Completed
   activations' output is recorded before eviction, without recording eviction-induced cancellations.
+* A workflow task that arrives while a workflow waits on a local activity, such as a legacy query,
+  now waits until the current workflow task is reported. Previously it replaced that workflow task
+  ("Trying to send a new WFT for a run which already has one!"), which then timed out on the server
+  and could leave the workflow stuck on a nondeterminism error.
 
 ## [0.10.0] - 2026-10-06
 

@@ -11366,10 +11366,12 @@
         "RUNTIME_TYPE_DOTNET_FRAMEWORK",
         "RUNTIME_TYPE_DOTNET_CORE",
         "RUNTIME_TYPE_NATIVE",
-        "RUNTIME_TYPE_ROADRUNNER"
+        "RUNTIME_TYPE_ROADRUNNER",
+        "RUNTIME_TYPE_GRAAL_AOT",
+        "RUNTIME_TYPE_KOTLIN"
       ],
       "default": "RUNTIME_TYPE_UNSPECIFIED",
-      "description": " - RUNTIME_TYPE_UNSPECIFIED: Should never actually be set, exists to follow convention of having a default.\nSDKs should just leave `runtimes` empty if none can be determined."
+      "description": " - RUNTIME_TYPE_UNSPECIFIED: Should never actually be set, exists to follow convention of having a default.\nSDKs should just leave `runtimes` empty if none can be determined.\n - RUNTIME_TYPE_GRAAL_AOT: Report when the application is compiled ahead-of-time as a GraalVM native image.\n - RUNTIME_TYPE_KOTLIN: Report when any registered Workflow or Activity implementation is a Kotlin class."
     },
     "UpdateTaskQueueConfigRequestRateLimitUpdate": {
       "type": "object",
@@ -12634,6 +12636,14 @@
         "startDelay": {
           "type": "string",
           "description": "Time to wait before making the first activity task available for dispatch. This delay is not applied to retry attempts."
+        },
+        "propagatedNexusSerializationContext": {
+          "$ref": "#/definitions/v1PropagatedSerializationContext",
+          "description": "Serialization context propagated from the Nexus caller that started this activity."
+        },
+        "requestEagerExecution": {
+          "type": "boolean",
+          "description": "Request that the first activity task be returned directly in the start response instead of\nbeing dispatched through a task queue. If set to true, the caller is expected to have a\nworker available and capable of processing the task. The returned task will be marked as\nstarted. The server may ignore this request."
         }
       }
     },
@@ -12903,6 +12913,10 @@
         "timeSkippingConfig": {
           "$ref": "#/definitions/v1TimeSkippingConfig",
           "description": "Time-skipping configuration. If not set, time skipping is disabled."
+        },
+        "propagatedNexusSerializationContext": {
+          "$ref": "#/definitions/v1PropagatedSerializationContext",
+          "description": "Serialization context propagated from the Nexus caller that started this workflow."
         }
       }
     },
@@ -13423,6 +13437,10 @@
                 "$ref": "#/definitions/apiCommonV1Link"
               },
               "description": "Links to be associated with this update."
+            },
+            "propagatedNexusSerializationContext": {
+              "$ref": "#/definitions/v1PropagatedSerializationContext",
+              "description": "Serialization context propagated from the Nexus caller that started this update."
             }
           },
           "description": "The request information that will be delivered all the way down to the\nWorkflow Execution."
@@ -13908,6 +13926,14 @@
           "type": "string",
           "format": "date-time",
           "description": "The time at which the first activity task is made available for dispatch, computed as\n`schedule_time + start_delay`. Same as `schedule_time` if `start_delay` is not set."
+        },
+        "propagatedNexusSerializationContext": {
+          "$ref": "#/definitions/v1PropagatedSerializationContext",
+          "description": "Serialization context propagated from the Nexus caller that started this activity."
+        },
+        "eagerExecutionAccepted": {
+          "type": "boolean",
+          "description": "Indicates whether eager execution was requested for this activity and accepted by the server\nfor its first task."
         }
       },
       "description": "Information about a standalone activity."
@@ -15108,6 +15134,13 @@
           },
           "description": "Optional. The set of task queue types this scaling group serves.\nIf not provided, this scaling group serves all not otherwise defined\ntask types."
         },
+        "regionIds": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Optional. If set, this scaling group is used only while the namespace is\nactive in one of these regions."
+        },
         "provider": {
           "$ref": "#/definitions/v1ComputeProvider",
           "description": "Stores instructions for a worker control plane controller how to respond\nto worker lifeycle events."
@@ -15129,6 +15162,12 @@
         },
         "providerType": {
           "type": "string"
+        },
+        "regionIds": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
         }
       }
     },
@@ -15140,7 +15179,7 @@
         },
         "updateMask": {
           "type": "string",
-          "title": "Controls which fields from `scaling_group` will be applied. Semantics:\n- Mask is ignored for new scaling groups (only applicable when scaling group already exists).\n- Empty mask for an existing scaling group is no-op: no change.\n- Non-empty mask for an existing scaling group will update/unset only to the fields\n  mentioned in the mask.\n- Accepted paths: \"task_queue_types\", \"provider\", \"provider.type\", \"provider.details\",\n  \"provider.nexus_endpoint\", \"scaler\", \"scaler.type\", \"scaler.details\""
+          "title": "Controls which fields from `scaling_group` will be applied. Semantics:\n- Mask is ignored for new scaling groups (only applicable when scaling group already exists).\n- Empty mask for an existing scaling group is no-op: no change.\n- Non-empty mask for an existing scaling group will update/unset only to the fields\n  mentioned in the mask.\n- Accepted paths: \"task_queue_types\", \"region_ids\", \"provider\", \"provider.type\", \"provider.details\",\n  \"provider.nexus_endpoint\", \"scaler\", \"scaler.type\", \"scaler.details\""
         }
       }
     },
@@ -16514,6 +16553,10 @@
         },
         "archived": {
           "type": "boolean"
+        },
+        "propagatedNexusSerializationContext": {
+          "$ref": "#/definitions/v1PropagatedSerializationContext",
+          "description": "Serialization context propagated from the Nexus caller that started this run.\nReturned on the initial request (without next_page_token) when present. Clients should\nretain it across paginated responses, which may omit it."
         }
       }
     },
@@ -18420,6 +18463,115 @@
         },
         "outcome": {
           "$ref": "#/definitions/v1ActivityExecutionOutcome"
+        },
+        "propagatedNexusSerializationContext": {
+          "$ref": "#/definitions/v1PropagatedSerializationContext",
+          "description": "Serialization context propagated from the Nexus caller that started this activity."
+        }
+      }
+    },
+    "v1PollActivityTaskQueueResponse": {
+      "type": "object",
+      "properties": {
+        "taskToken": {
+          "type": "string",
+          "format": "byte",
+          "title": "A unique identifier for this task"
+        },
+        "workflowNamespace": {
+          "type": "string",
+          "description": "The namespace of the activity. If this is a workflow activity then this is the namespace of\nthe workflow also. If this is a standalone activity then the name of this field is\nmisleading, but retained for compatibility with workflow activities."
+        },
+        "workflowType": {
+          "$ref": "#/definitions/v1WorkflowType",
+          "description": "Type of the requesting workflow (if this is a workflow activity)."
+        },
+        "workflowExecution": {
+          "$ref": "#/definitions/v1WorkflowExecution",
+          "title": "Execution info of the requesting workflow (if this is a workflow activity)"
+        },
+        "activityType": {
+          "$ref": "#/definitions/v1ActivityType"
+        },
+        "activityId": {
+          "type": "string",
+          "description": "The autogenerated or user specified identifier of this activity. Can be used to complete the\nactivity via `RespondActivityTaskCompletedById`. May be re-used as long as the last usage\nhas resolved, but unique IDs for every activity invocation is a good idea.\nNote that only a workflow activity ID may be autogenerated."
+        },
+        "header": {
+          "$ref": "#/definitions/v1Header",
+          "description": "Headers specified by the scheduling workflow. Commonly used to propagate contextual info\nfrom the workflow to its activities. For example, tracing contexts."
+        },
+        "input": {
+          "$ref": "#/definitions/v1Payloads",
+          "title": "Arguments to the activity invocation"
+        },
+        "heartbeatDetails": {
+          "$ref": "#/definitions/v1Payloads",
+          "description": "Details of the last heartbeat that was recorded for this activity as of the time this task\nwas delivered."
+        },
+        "scheduledTime": {
+          "type": "string",
+          "format": "date-time",
+          "title": "When was this task first scheduled"
+        },
+        "currentAttemptScheduledTime": {
+          "type": "string",
+          "format": "date-time",
+          "title": "When was this task attempt scheduled"
+        },
+        "startedTime": {
+          "type": "string",
+          "format": "date-time",
+          "title": "When was this task started (this attempt)"
+        },
+        "attempt": {
+          "type": "integer",
+          "format": "int32",
+          "title": "Starting at 1, the number of attempts to perform this activity"
+        },
+        "scheduleToCloseTimeout": {
+          "type": "string",
+          "title": "First scheduled -> final result reported timeout"
+        },
+        "startToCloseTimeout": {
+          "type": "string",
+          "title": "Current attempt start -> final result reported timeout"
+        },
+        "heartbeatTimeout": {
+          "type": "string",
+          "description": "Window within which the activity must report a heartbeat, or be timed out."
+        },
+        "retryPolicy": {
+          "$ref": "#/definitions/v1RetryPolicy",
+          "description": "This is the retry policy the service uses which may be different from the one provided\n(or not) during activity scheduling. The service can override the provided one if some\nvalues are not specified or exceed configured system limits."
+        },
+        "pollerScalingDecision": {
+          "$ref": "#/definitions/v1PollerScalingDecision",
+          "description": "Server-advised information the SDK may use to adjust its poller count."
+        },
+        "priority": {
+          "$ref": "#/definitions/v1Priority",
+          "title": "Priority metadata"
+        },
+        "activityRunId": {
+          "type": "string",
+          "description": "The run ID of the activity execution, only set for standalone activities."
+        },
+        "pollerGroupInfos": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "$ref": "#/definitions/v1PollerGroupInfo"
+          },
+          "description": "The weighted list of poller groups IDs that client should use for future polls to this task\nqueue. Client is expected to:\n  1. Maintain minimum number of pollers no less than the number of groups.\n  2. Try to assign the next poll to a group without any pending polls,\n  3. If every group has some pending polls, assign the next poll to a group randomly\n    according to the weights."
+        },
+        "pollerGroupsInfo": {
+          "$ref": "#/definitions/v1PollerGroupsInfo",
+          "description": "The weighted, versioned list of poller groups IDs that client should use for future polls to\nthis task queue. Client should ignore this if it has already applied a snapshot with a\nversion greater than or equal to `poller_groups_info.version`. Client is expected to:\n  1. Maintain minimum number of pollers no less than the number of groups.\n  2. Try to assign the next poll to a group without any pending polls,\n  3. If every group has some pending polls, assign the next poll to a group randomly\n    according to the weights."
+        },
+        "propagatedNexusSerializationContext": {
+          "$ref": "#/definitions/v1PropagatedSerializationContext",
+          "description": "Serialization context propagated from the Nexus caller that started this activity."
         }
       }
     },
@@ -18437,6 +18589,10 @@
         "operationToken": {
           "type": "string",
           "description": "Operation token. Only populated for asynchronous operations after a successful StartOperation call."
+        },
+        "propagatedNexusSerializationContext": {
+          "$ref": "#/definitions/v1PropagatedSerializationContext",
+          "description": "Serialization context for this operation's payloads, derived from its stored target.\nFor a reused operation, this is the original execution's context."
         },
         "result": {
           "$ref": "#/definitions/v1Payload",
@@ -18674,6 +18830,21 @@
         }
       },
       "description": "Priority contains metadata that controls relative ordering of task processing\nwhen tasks are backed up in a queue. Initially, Priority will be used in\nmatching (workflow and activity) task queues. Later it may be used in history\ntask queues and in rate limiting decisions.\n\nPriority is attached to workflows and activities. By default, activities\ninherit Priority from the workflow that created them, but may override fields\nwhen an activity is started or modified.\n\nDespite being named \"Priority\", this message also contains fields that\ncontrol \"fairness\" mechanisms.\n\nFor all fields, the field not present or equal to zero/empty string means to\ninherit the value from the calling workflow, or if there is no calling\nworkflow, then use the default value.\n\nFor all fields other than fairness_key, the zero value isn't meaningful so\nthere's no confusion between inherit/default and a meaningful value. For\nfairness_key, the empty string will be interpreted as \"inherit\". This means\nthat if a workflow has a non-empty fairness key, you can't override the\nfairness key of its activity to the empty string.\n\nThe overall semantics of Priority are:\n1. First, consider \"priority\": higher priority (lower number) goes first.\n2. Then, consider fairness: try to dispatch tasks for different fairness keys\n   in proportion to their weight.\n\nApplications may use any subset of mechanisms that are useful to them and\nleave the other fields to use default values.\n\nNot all queues in the system may support the \"full\" semantics of all priority\nfields. (Currently only support in matching task queues is planned.)"
+    },
+    "v1PropagatedSerializationContext": {
+      "type": "object",
+      "properties": {
+        "endpoint": {
+          "type": "string"
+        },
+        "service": {
+          "type": "string"
+        },
+        "operation": {
+          "type": "string"
+        }
+      },
+      "description": "PropagatedSerializationContext represents the context of the Nexus caller that started this execution."
     },
     "v1QueryRejectCondition": {
       "type": "string",
@@ -18919,6 +19090,10 @@
             "$ref": "#/definitions/v1Link"
           },
           "description": "Links to be associated with this update."
+        },
+        "propagatedNexusSerializationContext": {
+          "$ref": "#/definitions/v1PropagatedSerializationContext",
+          "description": "Serialization context propagated from the Nexus caller that started this update."
         }
       },
       "description": "The client request that triggers a Workflow Update."
@@ -19855,6 +20030,10 @@
         "link": {
           "$ref": "#/definitions/v1Link",
           "description": "Link to the started activity."
+        },
+        "eagerActivityTask": {
+          "$ref": "#/definitions/v1PollActivityTaskQueueResponse",
+          "description": "The first activity task when eager execution was requested and accepted.\nThis is set only for the first attempt of a newly started activity."
         }
       }
     },
@@ -21649,6 +21828,10 @@
         "timeSkippingInfo": {
           "$ref": "#/definitions/v1TimeSkippingInfo",
           "description": "Information about time skipping of the workflow execution.\nIf the execution has never enabled time skipping, it will be nil."
+        },
+        "propagatedNexusSerializationContext": {
+          "$ref": "#/definitions/v1PropagatedSerializationContext",
+          "description": "Serialization context propagated from the Nexus caller that started this workflow."
         }
       },
       "description": "Holds all the extra information about workflow execution that is not part of Visibility."
@@ -22076,6 +22259,10 @@
         "timeSkippingStatePropagation": {
           "$ref": "#/definitions/v1TimeSkippingStatePropagation",
           "description": "The time-skipping state propagated from a previous run of this workflow. This can be nil\nif no time skipping has occurred or there is no previous run."
+        },
+        "propagatedNexusSerializationContext": {
+          "$ref": "#/definitions/v1PropagatedSerializationContext",
+          "description": "Serialization context propagated from the Nexus caller that started this workflow."
         }
       },
       "title": "Always the first event in workflow history"
