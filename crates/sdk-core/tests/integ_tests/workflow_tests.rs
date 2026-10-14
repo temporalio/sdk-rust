@@ -21,6 +21,8 @@ mod stickyness;
 mod timers;
 mod upsert_search_attrs;
 
+pub(crate) use activities::OneActivityWorkflow;
+
 use crate::{
     common::{
         CoreWfStarter, activity_functions::StdActivities, get_integ_runtime_options,

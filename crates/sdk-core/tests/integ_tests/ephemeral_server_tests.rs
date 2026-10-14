@@ -1,5 +1,9 @@
-use crate::common::{
-    INTEG_CLIENT_IDENTITY, INTEG_CLIENT_NAME, INTEG_CLIENT_VERSION, NAMESPACE, rand_6_chars,
+use crate::{
+    common::{
+        INTEG_CLIENT_IDENTITY, INTEG_CLIENT_NAME, INTEG_CLIENT_VERSION, NAMESPACE,
+        activity_functions::StdActivities, rand_6_chars,
+    },
+    integ_tests::workflow_tests::OneActivityWorkflow,
 };
 use futures_util::{TryStreamExt, stream};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -39,28 +43,39 @@ async fn test_workflow_environment_local() {
         .await
         .unwrap();
     let runtime = Runtime::from_current_tokio(Default::default()).unwrap();
+    let client = env.client().clone();
     let worker_options = WorkerOptions::new(format!("test-env-{}", rand_6_chars()))
-        .register_workflow::<TestEnvironmentWorkflow>()
+        .register_workflow::<OneActivityWorkflow>()
         .unwrap()
+        .register_activities(StdActivities)
         .build();
     let task_queue = worker_options.task_queue.clone();
-    let mut worker = Worker::new(&runtime, env.client().clone(), worker_options).unwrap();
-    let shutdown = worker.shutdown_handle();
-    let handle = env
-        .client()
+    let worker = Worker::new(&runtime, client.clone(), worker_options).unwrap();
+    let worker_instance_key = worker.worker_instance_key();
+    let shutdown_handle = worker.shutdown_handle();
+    let handle = client
         .start_workflow(
-            TestEnvironmentWorkflow::run,
-            (),
+            OneActivityWorkflow::run,
+            "run_until".to_owned(),
             WorkflowStartOptions::new(task_queue, format!("test-env-{}", rand_6_chars())).build(),
         )
         .await
         .unwrap();
 
-    let (worker_result, ()) = tokio::join!(worker.run(), async move {
-        handle.get_result(Default::default()).await.unwrap();
-        shutdown();
-    });
-    worker_result.unwrap();
+    worker
+        .run_until(async move {
+            handle.get_result(Default::default()).await.unwrap();
+        })
+        .await
+        .unwrap();
+    shutdown_handle();
+    let unregister_error = client
+        .connection()
+        .workers()
+        .finalize_unregister(worker_instance_key)
+        .err()
+        .expect("run_until should already have unregistered the worker");
+    assert!(unregister_error.to_string().contains("Worker not found"));
     env.shutdown().await.unwrap();
 }
 

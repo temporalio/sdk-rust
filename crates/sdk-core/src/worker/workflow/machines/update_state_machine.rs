@@ -191,6 +191,7 @@ impl UpdateMachine {
     }
 }
 
+#[allow(clippy::large_enum_variant)]
 enum UpdateMsg {
     Accept(Acceptance),
     Reject(Rejection),

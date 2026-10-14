@@ -17,6 +17,13 @@ import "temporal/api/enums/v1/nexus.proto";
 import "temporal/api/failure/v1/message.proto";
 import "temporal/api/sdk/v1/user_metadata.proto";
 
+// PropagatedSerializationContext represents the context of the Nexus caller that started this execution.
+message PropagatedSerializationContext {
+    string endpoint = 1;
+    string service = 2;
+    string operation = 3;
+}
+
 // A general purpose failure message.
 // See: https://github.com/nexus-rpc/api/blob/main/SPEC.md#failure
 message Failure {

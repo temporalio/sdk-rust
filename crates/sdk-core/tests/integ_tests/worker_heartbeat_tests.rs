@@ -1,5 +1,6 @@
 use crate::common::{
-    ANY_PORT, CoreWfStarter, activity_functions::StdActivities, eventually, get_integ_telem_options,
+    ANY_PORT, CoreWfStarter, activity_functions::StdActivities, eventually,
+    get_integ_server_options, get_integ_telem_options,
 };
 use anyhow::anyhow;
 use crossbeam_utils::atomic::AtomicCell;
@@ -624,8 +625,12 @@ fn after_shutdown_checks(
         heartbeat.deployment_version.clone().unwrap().build_id,
         "test_build_id"
     );
-    assert_eq!(heartbeat.sdk_name, "temporal-core");
-    assert_eq!(heartbeat.sdk_version, "0.1.0");
+    let envconfig_options = get_integ_server_options();
+    assert_eq!(heartbeat.sdk_name, envconfig_options.get_client_name());
+    assert_eq!(
+        heartbeat.sdk_version,
+        envconfig_options.get_client_version()
+    );
     assert_eq!(heartbeat.status, WorkerStatus::ShuttingDown as i32);
 
     assert_eq!(start_time.load().unwrap(), heartbeat.start_time.unwrap());

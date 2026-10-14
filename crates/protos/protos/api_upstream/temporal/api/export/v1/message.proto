@@ -10,14 +10,26 @@ option ruby_package = "Temporalio::Api::Export::V1";
 option csharp_namespace = "Temporalio.Api.Export.V1";
 
 import "temporal/api/history/v1/message.proto";
+import "temporal/api/workflowservice/v1/request_response.proto";
 
 message WorkflowExecution {
     temporal.api.history.v1.History history = 1;
 }
 
-// WorkflowExecutions is used by the Cloud Export feature to deserialize 
-// the exported file. It encapsulates a collection of workflow execution information.
+// WorkflowExecutions is the legacy Cloud Export file format containing only workflow executions.
+// New exporters should use ExportedExecutions.
 message WorkflowExecutions {
     repeated WorkflowExecution items = 1;
+}
+
+message ActivityExecution {
+    temporal.api.workflowservice.v1.DescribeActivityExecutionResponse activity = 1;
+}
+
+// ExportedExecutions is used by the Cloud Export feature to deserialize the exported file.
+// It encapsulates workflow execution information and contains other execution types.
+message ExportedExecutions {
+    repeated WorkflowExecution workflows = 1;
+    repeated ActivityExecution activities = 2;
 }
 

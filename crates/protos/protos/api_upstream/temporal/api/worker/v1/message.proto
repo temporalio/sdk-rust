@@ -213,6 +213,10 @@ message EnvironmentInfo {
       RUNTIME_TYPE_DOTNET_CORE = 8;
       RUNTIME_TYPE_NATIVE = 9;
       RUNTIME_TYPE_ROADRUNNER = 10;
+      // Report when the application is compiled ahead-of-time as a GraalVM native image.
+      RUNTIME_TYPE_GRAAL_AOT = 11;
+      // Report when any registered Workflow or Activity implementation is a Kotlin class.
+      RUNTIME_TYPE_KOTLIN = 12;
     }
     // The type of the runtime.
     RuntimeType type = 1;

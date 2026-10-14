@@ -33,13 +33,41 @@ relevant information.
 
 ## Unreleased
 
+### Breaking Changes
+* Workflow replay now reports nondeterminism when a scheduled Nexus operation's service or operation
+  differs from the command that produced it.
+
 ### Fixed
 * `temporal.api.sdk.v1` messages are capable of serialization to proto JSON, so their JSON field
   names are camel case rather than snake case and the binary encoding is unchanged. They previously
   could not be deserialized from the camel case that other Temporal SDKs and protobuf tools emit,
   and both spellings are now accepted.
+* `Worker::run()` now waits for spawned activity tasks to finish before returning, including
+  when running fails.
 * Workers using a custom metrics backend now report task-slot and poller counts correctly in
   worker heartbeats, rather than reporting zero when the backend does not expose its labels.
+* Local activities still running when their workflow is evicted or the worker shuts down now
+  always receive a cancellation. Local activities no longer retry ordinary failures or
+  start-to-close timeouts after cancellation has been requested, matching non-local activities.
+  Workflow code no longer observes a spurious local activity cancellation when its run is evicted
+  or completes while the local activity is backing off between retries.
+* Evicting a workflow while some local activities are still running now preserves results already
+  delivered to workflow code, rather than panicking or losing those results.
+* A query or other workflow task that arrives while a workflow waits on a local activity no longer
+  causes the current workflow task to be lost and time out, which could leave the workflow stuck on
+  a nondeterminism error.
+* Workflows paused before a scheduled workflow task starts now resume after unpause instead of
+  failing during history replay.
+
+### Added
+* `Worker::run_until` consumes a worker and runs it until a supplied future completes, then shuts
+  it down and releases its worker registration before returning, including when running fails.
+* `OtelCollectorOptions::histogram_aggregation` selects how the OTLP exporter aggregates histograms.
+  `HistogramAggregation::Base2Exponential` exports every histogram, including custom ones, as an
+  OpenTelemetry exponential histogram, which Prometheus-compatible backends store as a native
+  histogram. Each series carries `Base2ExponentialHistogramOptions::name_suffix` (`_native` by
+  default) so it never shares a name with the fixed-bucket series it replaces, and
+  `histogram_bucket_overrides` is rejected in this mode. Explicit buckets remain the default.
 
 ## [1.1.0] - 2026-10-06
 
