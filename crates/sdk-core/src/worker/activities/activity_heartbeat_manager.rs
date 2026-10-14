@@ -15,11 +15,11 @@ use std::{
 use temporalio_common::protos::{
     coresdk::{
         ActivityHeartbeat, IntoPayloadsExt,
-        activity_result::ActivityTaskFailedCause,
         activity_task::{ActivityCancelReason, ActivityCancellationDetails, ActivityTask},
     },
     temporal::api::{
-        common::v1::Payload, workflowservice::v1::RecordActivityTaskHeartbeatResponse,
+        common::v1::Payload, enums::v1::ActivityTaskFailedCause,
+        workflowservice::v1::RecordActivityTaskHeartbeatResponse,
     },
 };
 use tokio::{

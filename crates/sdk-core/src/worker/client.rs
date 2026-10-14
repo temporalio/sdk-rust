@@ -23,10 +23,7 @@ use temporalio_client::{
 };
 use temporalio_common::protos::{
     TaskToken,
-    coresdk::{
-        activity_result::ActivityTaskFailedCause, workflow_commands::QueryResult,
-        workflow_completion,
-    },
+    coresdk::{workflow_commands::QueryResult, workflow_completion},
     google::rpc::Status as RpcStatus,
     temporal::api::{
         command::v1::Command,
@@ -36,8 +33,8 @@ use temporalio_common::protos::{
         },
         deployment,
         enums::v1::{
-            TaskQueueKind, TaskQueueType, VersioningBehavior, WorkerVersioningMode,
-            WorkflowTaskFailedCause,
+            ActivityTaskFailedCause, TaskQueueKind, TaskQueueType, VersioningBehavior,
+            WorkerVersioningMode, WorkflowTaskFailedCause,
         },
         errordetails::v1::WorkflowTaskCompletionBufferLostFailure,
         failure::v1::Failure,
