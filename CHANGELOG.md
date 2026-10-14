@@ -51,6 +51,10 @@ relevant information.
 
 
 ### Fixed
+* `temporal.api.sdk.v1` messages are capable of serialization to proto JSON, so their JSON field
+  names are camel case rather than snake case and the binary encoding is unchanged. They previously
+  could not be deserialized from the camel case that other Temporal SDKs and protobuf tools emit,
+  and both spellings are now accepted.
 * `Worker::run()` now waits for spawned activity tasks to finish before returning, including
   when running fails.
 * Workers using a custom metrics backend now report task-slot and poller counts correctly in
@@ -65,10 +69,18 @@ relevant information.
 * A query or other workflow task that arrives while a workflow waits on a local activity no longer
   causes the current workflow task to be lost and time out, which could leave the workflow stuck on
   a nondeterminism error.
+* Workflows paused before a scheduled workflow task starts now resume after unpause instead of
+  failing during history replay.
 
 ### Added
 * `Worker::run_until` consumes a worker and runs it until a supplied future completes, then shuts
   it down and releases its worker registration before returning, including when running fails.
+* `OtelCollectorOptions::histogram_aggregation` selects how the OTLP exporter aggregates histograms.
+  `HistogramAggregation::Base2Exponential` exports every histogram, including custom ones, as an
+  OpenTelemetry exponential histogram, which Prometheus-compatible backends store as a native
+  histogram. Each series carries `Base2ExponentialHistogramOptions::name_suffix` (`_native` by
+  default) so it never shares a name with the fixed-bucket series it replaces, and
+  `histogram_bucket_overrides` is rejected in this mode. Explicit buckets remain the default.
 
 ## [1.1.0] - 2026-10-06
 
