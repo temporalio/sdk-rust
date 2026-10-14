@@ -580,7 +580,15 @@ impl WorkflowFuture {
                                 )
                                 .into()
                             }
-                            TerminalOutcome::ContinueAsNew(req) => (*req).into(),
+                            TerminalOutcome::ContinueAsNew(req) => WorkflowCommand {
+                                variant: Some(
+                                    workflow_command::Variant::ContinueAsNewWorkflowExecution(
+                                        req.attributes,
+                                    ),
+                                ),
+                                event_group_markers: req.event_group_markers,
+                                user_metadata: None,
+                            },
                         };
                         activation_cmds.push(terminal_command);
                         should_stop_polling = true;

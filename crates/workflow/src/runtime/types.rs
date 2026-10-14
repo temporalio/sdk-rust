@@ -5,7 +5,7 @@
 use temporalio_common_wasm::protos::{
     coresdk::{
         workflow_activation::{InitializeWorkflow, WorkflowActivation as CoreWorkflowActivation},
-        workflow_commands::{ContinueAsNewWorkflowExecution, WorkflowCommand, workflow_command},
+        workflow_commands::ContinueAsNewWorkflowExecution,
     },
     temporal::api::{
         common::v1::{Payload, Payloads},
@@ -127,26 +127,6 @@ pub struct ContinueAsNewRequest {
     pub attributes: ContinueAsNewWorkflowExecution,
     /// Event Group markers attached to the continue-as-new command.
     pub event_group_markers: Vec<EventGroupMarker>,
-}
-
-impl std::ops::Deref for ContinueAsNewRequest {
-    type Target = ContinueAsNewWorkflowExecution;
-
-    fn deref(&self) -> &Self::Target {
-        &self.attributes
-    }
-}
-
-impl From<ContinueAsNewRequest> for WorkflowCommand {
-    fn from(request: ContinueAsNewRequest) -> Self {
-        Self {
-            variant: Some(workflow_command::Variant::ContinueAsNewWorkflowExecution(
-                request.attributes,
-            )),
-            event_group_markers: request.event_group_markers,
-            user_metadata: None,
-        }
-    }
 }
 
 /// Workflow Task failure requested by the main workflow routine.

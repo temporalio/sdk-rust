@@ -66,7 +66,12 @@ record activation-result {
   job-results: list<activation-job-result>,
 }
 
-type continue-as-new-request = list<u8>;
+type event-group-marker = list<u8>;
+
+record continue-as-new-request {
+  attributes: list<u8>,
+  event-group-markers: list<event-group-marker>,
+}
 
 record task-failure {
   failure: failure,
