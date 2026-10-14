@@ -960,14 +960,11 @@ impl BaseWorkflowContext {
         self.inner.runtime.host.push_command(command);
     }
 
-    /// Push a command without attaching contextual metadata (e.g. Event Groups).
+    /// Push a command without attaching Event Groups from the current scope.
     ///
-    /// A very few token-driven cancellation commands, do not accept explicit Event Groups and do
-    /// not inherit Event Groups from the active scope. `push_command_no_metadata` records a command
-    /// without attaching Event Groups to it.
-    ///
-    /// Most commands inherit scoped Event Groups from the context, and should therefore
-    /// call [`Self::push_command_with_metadata`] instead of this method.
+    /// Records the command unchanged, so markers the caller left empty stay empty.
+    /// Commands that should carry the scope's Event Groups use
+    /// [`Self::push_command_with_metadata`].
     fn push_command_no_metadata(&self, command: WorkflowCommand) {
         self.inner.runtime.host.push_command(command);
     }
@@ -1137,14 +1134,12 @@ impl BaseWorkflowContext {
                     .runtime
                     .maybe_unblock(UnblockEvent::Timer(seq, TimerResult::Cancelled))
                 {
-                    // Cancellation command will copy EG markers from the original timer command.
                     self.push_command_no_metadata(
                         workflow_command::Variant::CancelTimer(CancelTimer { seq }).into(),
                     );
                 }
             }
             CancellableID::Activity(seq) => {
-                // Cancellation command will copy EG markers from the original activity command.
                 self.push_command_no_metadata(
                     workflow_command::Variant::RequestCancelActivity(RequestCancelActivity { seq })
                         .into(),
@@ -1162,7 +1157,6 @@ impl BaseWorkflowContext {
                 );
             }
             CancellableID::ChildWorkflow { seqnum, reason } => {
-                // Cancellation command will copy EG markers from the original child workflow command.
                 self.push_command_no_metadata(
                     workflow_command::Variant::CancelChildWorkflowExecution(
                         CancelChildWorkflowExecution {
@@ -1175,7 +1169,7 @@ impl BaseWorkflowContext {
             }
             CancellableID::SignalExternalWorkflow(seq) => {
                 // Note that `CancelSignalWorkflow` is Core-only: it applies only if the signal
-                //command has not yet been sent. It is never transcribed to history, so Event Groups
+                // command has not yet been sent. It is never transcribed to history, so Event Groups
                 // and user metadata would not be observable.
                 self.push_command_no_metadata(
                     workflow_command::Variant::CancelSignalWorkflow(CancelSignalWorkflow { seq })
@@ -1183,7 +1177,6 @@ impl BaseWorkflowContext {
                 );
             }
             CancellableID::NexusOp(seq) => {
-                // Cancellation command will copy EG markers from the original Nexus operation command.
                 self.push_command_no_metadata(
                     workflow_command::Variant::RequestCancelNexusOperation(
                         RequestCancelNexusOperation { seq },

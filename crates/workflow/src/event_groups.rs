@@ -53,7 +53,7 @@ pub(crate) struct ActiveEventGroups {
 }
 
 impl EventGroup {
-    /// Create an Event Group with the given opaque identifier and no display label.
+    /// Create an Event Group with the given identifier and no display label.
     ///
     /// Commands with the same `id` belong to the same group. The identifier is stored as plaintext
     /// in workflow history and should not contain sensitive information.
