@@ -1,0 +1,9 @@
+**
+!Cargo.toml
+!LICENSE.txt
+!.cargo
+!.cargo/config.toml
+!crates
+!crates/**
+crates/**/target
+crates/**/.git

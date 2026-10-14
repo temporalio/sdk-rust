@@ -34,6 +34,8 @@ relevant information.
 ## Unreleased
 
 ### Breaking Changes
+* Configuration-loading errors are now `Send + Sync`. Constructing `ConfigError::LoadError`
+  requires `Box<dyn Error + Send + Sync>` instead of `Box<dyn Error>`.
 * Workflow replay now reports nondeterminism when a scheduled Nexus operation's service or operation
   differs from the command that produced it.
 
@@ -56,6 +58,12 @@ relevant information.
 ### Added
 * `Worker::run_until` consumes a worker and runs it until a supplied future completes, then shuts
   it down and releases its worker registration before returning, including when running fails.
+* The experimental `temporalio-sdk-aws-lambda` crate runs a versioned Rust SDK Worker for each AWS
+  Lambda invocation with Lambda-oriented concurrency defaults, deadline-aware graceful shutdown,
+  and optional OpenTelemetry tracing and metrics.
+* OpenTelemetry metric exporters accept an explicit per-request timeout through
+  `OtelCollectorOptions::export_timeout`; `CoreOtelMeter::force_flush` exports pending metrics
+  without shutting down the provider.
 
 ## [1.1.0] - 2026-10-06
 

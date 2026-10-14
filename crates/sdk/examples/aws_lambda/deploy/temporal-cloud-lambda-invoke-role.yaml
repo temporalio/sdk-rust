@@ -1,0 +1,41 @@
+# Temporal Cloud assumes this role; self-hosted Services must instead trust their own AWS identity.
+AWSTemplateFormatVersion: "2010-09-09"
+Description: Allows Temporal Cloud to invoke this sample's Lambda function versions.
+Parameters:
+  AssumeRoleExternalId:
+    Type: String
+    AllowedPattern: "[a-zA-Z0-9_+=,.@-]*"
+    MinLength: 5
+    MaxLength: 45
+  LambdaFunctionARNs:
+    Type: CommaDelimitedList
+Resources:
+  InvocationRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS:
+                - arn:aws:iam::902542641901:role/wci-lambda-invoke
+                - arn:aws:iam::160190466495:role/wci-lambda-invoke
+                - arn:aws:iam::819232936619:role/wci-lambda-invoke
+                - arn:aws:iam::829909441867:role/wci-lambda-invoke
+                - arn:aws:iam::354116250941:role/wci-lambda-invoke
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                sts:ExternalId: !Ref AssumeRoleExternalId
+      Policies:
+        - PolicyName: InvokeSampleLambda
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: ["lambda:InvokeFunction", "lambda:GetFunction"]
+                Resource: !Ref LambdaFunctionARNs
+Outputs:
+  RoleARN:
+    Value: !GetAtt InvocationRole.Arn
