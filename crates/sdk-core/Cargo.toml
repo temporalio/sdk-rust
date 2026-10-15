@@ -17,6 +17,8 @@ rust-version = "1.88.0"
 
 [features]
 default = ["envconfig", "prometheus", "tls-ring"]
+# Only controls adoption; recorded history must replay consistently in every build.
+disable_workflow_task_chunking = []
 tls-ring = [
   "temporalio-client/tls-ring",
   "temporalio-common/tls-ring",
