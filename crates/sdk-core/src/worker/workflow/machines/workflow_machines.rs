@@ -579,7 +579,7 @@ impl WorkflowMachines {
                     &cmd.variant,
                     WFCommandVariant::UpdateResponse(response)
                         if matches!(response.response, Some(update_response::Response::Rejected(_)))
-                ) && !matches!(cmd.variant, WFCommandVariant::NoCommandsFromLang)
+                )
             }) {
                 return Err(nondeterminism!(
                     "Update-only activation produced commands without accepting an update"
@@ -1630,7 +1630,6 @@ impl WorkflowMachines {
                         annotations
                     );
                 }
-                WFCommandVariant::NoCommandsFromLang => (),
             }
         }
         Ok(())
