@@ -20,6 +20,10 @@ pub mod grpc;
 /// Interceptors for high-level client operations.
 pub mod interceptors;
 mod metrics;
+#[cfg(feature = "experimental")]
+pub mod nexus;
+#[cfg(feature = "experimental")]
+pub use nexus::NexusOperationStartOptions;
 mod options_structs;
 #[cfg(feature = "experimental")]
 /// Experimental APIs for configuring clients with reusable plugins.

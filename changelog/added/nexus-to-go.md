@@ -1,0 +1,1 @@
+Clients can start typed Nexus operations outside workflows with the experimental `nexus_client` API, then wait for results, reconnect to an execution, describe it, or request cancellation. Workflow-backed operations link to the workflow they start, and the workflow links back to the operation.
