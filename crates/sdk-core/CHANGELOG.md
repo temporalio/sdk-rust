@@ -36,7 +36,8 @@ relevant information.
 ### Breaking Changes
 * Language SDK bridges must exchange workflow activation batches and indexed batch completions,
   including singleton batches. The C bridge uses this protocol unconditionally, independently of
-  workflow task chunking; each result retains its own commands and metadata.
+  workflow task chunking; each result retains its own commands and metadata. Bridges apply the
+  continuation allowlist supplied by Core so future batching policies need no language changes.
 * Replay detects changes to the service or operation of scheduled Nexus operations, reporting
   nondeterminism while retaining compatibility with histories recorded before these checks.
 

@@ -37,7 +37,7 @@ use temporalio_common::protos::{
             RemoveFromCache, WorkflowActivation, WorkflowActivationBatch, query_to_job,
             remove_from_cache::EvictionReason, workflow_activation_job,
         },
-        workflow_commands::{FailWorkflowExecution, QueryResult},
+        workflow_commands::{FailWorkflowExecution, QueryResult, WorkflowCommandKind},
         workflow_completion,
     },
     temporal::api::{
@@ -102,7 +102,7 @@ pub(super) struct ManagedRun {
     paginator: Option<HistoryPaginator>,
     completion_waiting_on_page_fetch: Option<RunActivationCompletion>,
     config: Arc<WorkerConfig>,
-    outstanding_batch: Option<Vec<WorkflowActivation>>,
+    outstanding_batch: Option<WorkflowActivationBatch>,
 }
 impl ManagedRun {
     pub(super) fn new(
@@ -140,6 +140,10 @@ impl ManagedRun {
         let mut batch = WorkflowActivationBatch {
             run_id: activation.run_id.clone(),
             activations: vec![activation],
+            allowed_continuation_commands: vec![
+                WorkflowCommandKind::StartTimer as i32,
+                WorkflowCommandKind::CancelTimer as i32,
+            ],
         };
         if !self.am_broken
             && self.trying_to_evict.is_none()
@@ -161,7 +165,7 @@ impl ManagedRun {
                     .preview_activation_batch(&batch.activations[0]),
             );
         }
-        self.outstanding_batch = Some(batch.activations.clone());
+        self.outstanding_batch = Some(batch.clone());
         batch
     }
 
@@ -178,7 +182,7 @@ impl ManagedRun {
             .as_ref()
             .ok_or_else(|| malformed("No workflow activation batch is outstanding"))?;
         let count = completions.len();
-        if count == 0 || count > outstanding.len() {
+        if count == 0 || count > outstanding.activations.len() {
             return Err(malformed(
                 "Completion count does not match the outstanding activation batch",
             ));
@@ -190,16 +194,15 @@ impl ManagedRun {
                         "A failed completion must end the completed prefix",
                     ));
                 }
-                ValidatedCompletion::Success { commands, .. }
-                    if commands.iter().any(|c| {
-                        !matches!(
-                            c.variant,
-                            WFCommandVariant::AddTimer(_) | WFCommandVariant::CancelTimer(_)
-                        )
+                ValidatedCompletion::Success { command_kinds, .. }
+                    if command_kinds.iter().any(|kind| {
+                        !outstanding
+                            .allowed_continuation_commands
+                            .contains(&(*kind as i32))
                     }) =>
                 {
                     return Err(malformed(
-                        "Stop the completed prefix after commands that require a Core response",
+                        "Stop the completed prefix after commands excluded by the batch continuation policy",
                     ));
                 }
                 _ => {}
@@ -222,7 +225,7 @@ impl ManagedRun {
                 self.wfm.apply_next_task_if_ready()?;
                 let mut actual = self.wfm.get_next_activation()?;
                 prepare_to_ship_activation(&mut actual);
-                if actual != outstanding[index + 1] {
+                if actual != outstanding.activations[index + 1] {
                     return Err(WFMachinesError::Nondeterminism(
                         "Batched replay commands changed the next activation".to_owned(),
                     ));
@@ -241,7 +244,7 @@ impl ManagedRun {
                 ));
             }
         }
-        Ok((last, outstanding[count - 1].is_replaying, count))
+        Ok((last, outstanding.activations[count - 1].is_replaying, count))
     }
 
     /// Returns true if there are pending jobs that need to be sent to lang.

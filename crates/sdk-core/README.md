@@ -41,7 +41,7 @@ these protobufs; Rust bridges use `poll_workflow_activation_batch` and
 `complete_workflow_activation_batch`. No batching feature or capability opt-in is required.
 
 Execute each activation at its own boundary and preserve commands and metadata for each result.
-Stop on failure or commands requiring a Core response before continuing; Core sends fresh work for
-any unexecuted suffix. Batching does not change history recording and is independent of the
+Apply the batch's `allowed_continuation_commands` allowlist and always stop on failure; Core sends
+fresh work for any unexecuted suffix. Batching does not change history recording and is independent of the
 chunking feature. See [the batch protocol](../../arch_docs/workflow_activation_batching.md) for the
 execution contract, command barriers, and conservative accumulation rules.

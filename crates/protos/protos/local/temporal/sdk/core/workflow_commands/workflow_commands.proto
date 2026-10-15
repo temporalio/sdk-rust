@@ -21,6 +21,35 @@ import "temporal/sdk/core/child_workflow/child_workflow.proto";
 import "temporal/sdk/core/nexus/nexus.proto";
 import "temporal/sdk/core/common/common.proto";
 
+// Batch policies need language-command identities because some commands produce no server
+// command or history event. Values match WorkflowCommand.variant field numbers and must never
+// be reassigned, including when a command is removed.
+enum WorkflowCommandKind {
+    UNSPECIFIED = 0;
+    START_TIMER = 1;
+    SCHEDULE_ACTIVITY = 2;
+    RESPOND_TO_QUERY = 3;
+    REQUEST_CANCEL_ACTIVITY = 4;
+    CANCEL_TIMER = 5;
+    COMPLETE_WORKFLOW_EXECUTION = 6;
+    FAIL_WORKFLOW_EXECUTION = 7;
+    CONTINUE_AS_NEW_WORKFLOW_EXECUTION = 8;
+    CANCEL_WORKFLOW_EXECUTION = 9;
+    SET_PATCH_MARKER = 10;
+    START_CHILD_WORKFLOW_EXECUTION = 11;
+    CANCEL_CHILD_WORKFLOW_EXECUTION = 12;
+    REQUEST_CANCEL_EXTERNAL_WORKFLOW_EXECUTION = 13;
+    SIGNAL_EXTERNAL_WORKFLOW_EXECUTION = 14;
+    CANCEL_SIGNAL_WORKFLOW = 15;
+    SCHEDULE_LOCAL_ACTIVITY = 16;
+    REQUEST_CANCEL_LOCAL_ACTIVITY = 17;
+    UPSERT_WORKFLOW_SEARCH_ATTRIBUTES = 18;
+    MODIFY_WORKFLOW_PROPERTIES = 19;
+    UPDATE_RESPONSE = 20;
+    SCHEDULE_NEXUS_OPERATION = 21;
+    REQUEST_CANCEL_NEXUS_OPERATION = 22;
+}
+
 message WorkflowCommand {
     // User metadata that may or may not be persisted into history depending on the command type.
     // Lang layers are expected to expose the setting of the internals of this metadata on a

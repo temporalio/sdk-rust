@@ -1563,7 +1563,7 @@ impl Worker {
     /// Complete a batch returned by [`Self::poll_workflow_activation_batch`].
     ///
     /// Return one successful completion per activation, or a contiguous prefix ending in the
-    /// first failed completion or a completion requiring a Core response before continuing.
+    /// first failed completion or a completion excluded by the batch's continuation allowlist.
     /// Every activation may contain commands. Preserve per-activation metadata even for empty
     /// successes; see [`WorkflowActivationBatchCompletion`] for the full response contract.
     ///

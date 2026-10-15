@@ -10,6 +10,7 @@ option ruby_package = "Temporalio::Internal::Bridge::Api::WorkflowActivation";
 import "google/protobuf/timestamp.proto";
 import "google/protobuf/duration.proto";
 import "google/protobuf/empty.proto";
+import "temporal/sdk/core/workflow_commands/workflow_commands.proto";
 import "temporal/api/failure/v1/message.proto";
 import "temporal/api/update/v1/message.proto";
 import "temporal/api/common/v1/message.proto";
@@ -121,13 +122,19 @@ message WorkflowActivation {
 // deadlock checks; healthy progress across a batch is not one long activation.
 //
 // Return one WorkflowActivationBatchCompletion containing indexed results for the executed
-// prefix. Every activation may produce commands. Stop on failure or after commands other than
-// StartTimer/CancelTimer, which may require additional Core jobs before continuing. Do not execute
-// the remaining suffix or rerun the completed prefix in place; await fresh Core work.
+// prefix. Every activation may produce commands. Stop on failure or after a command whose kind
+// is absent from allowed_continuation_commands. Such commands may need additional Core jobs before
+// continuing. Do not execute the remaining suffix or rerun the completed prefix in place; await
+// fresh Core work.
 // Queries retain their read-only semantics and evictions retain their isolation and cleanup rules.
 message WorkflowActivationBatch {
     string run_id = 1;
     repeated WorkflowActivation activations = 2;
+    // Core controls this allowlist so batching can expand without changing SDK execution loops.
+    // Continue only after a successful completion whose commands are all listed here. An empty
+    // list allows only command-free successes. Unknown command kinds never permit continuation;
+    // ignore unknown allowlist values. Always stop on failure, regardless of this list.
+    repeated workflow_commands.WorkflowCommandKind allowed_continuation_commands = 3;
 }
 
 message WorkflowActivationJob {

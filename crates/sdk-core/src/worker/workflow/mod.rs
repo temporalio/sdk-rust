@@ -1582,6 +1582,16 @@ fn validate_completion(
 ) -> Result<ValidatedCompletion, CompleteWfError> {
     match completion.status {
         Some(workflow_activation_completion::Status::Successful(success)) => {
+            let command_kinds = success
+                .commands
+                .iter()
+                .filter_map(|command| {
+                    command
+                        .variant
+                        .as_ref()
+                        .map(workflow_command::Variant::kind)
+                })
+                .collect();
             // Convert to wf commands
             let commands = success
                 .commands
@@ -1614,6 +1624,7 @@ fn validate_completion(
             Ok(ValidatedCompletion::Success {
                 run_id: completion.run_id,
                 commands,
+                command_kinds,
                 used_flags: success.used_internal_flags,
                 versioning_behavior: success.versioning_behavior.try_into().unwrap_or_default(),
             })
@@ -1638,6 +1649,7 @@ enum ValidatedCompletion {
     Success {
         run_id: String,
         commands: Vec<WFCommand>,
+        command_kinds: Vec<WorkflowCommandKind>,
         used_flags: Vec<u32>,
         versioning_behavior: VersioningBehavior,
     },
@@ -2195,6 +2207,7 @@ mod tests {
                 run_id: "retained".to_owned(),
                 ..Default::default()
             }],
+            ..Default::default()
         })
         .unwrap();
         let batch = core.poll_workflow_activation_batch().await.unwrap();

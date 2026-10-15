@@ -794,8 +794,8 @@ pub extern "C" fn temporal_core_worker_poll_nexus_task(
 /// Accepts a protobuf-encoded `coresdk.workflow_completion.WorkflowActivationBatchCompletion`.
 ///
 /// Return indexed results for the executed contiguous prefix, retaining each activation's
-/// commands and metadata. Stop on failure or commands requiring a Core response, as specified
-/// by the batch protobuf contract, and leave the remaining suffix unexecuted.
+/// commands and metadata. Stop on failure or commands excluded by the supplied batch's
+/// `allowed_continuation_commands` policy, and leave the remaining suffix unexecuted.
 /// Submit completions for different workflow runs concurrently; completion may wait for history.
 ///
 /// Child workflow versioning overrides are carried in
