@@ -1463,6 +1463,8 @@ impl Worker {
     /// It is important to understand that all activations must be responded to. There can only
     /// be one outstanding activation for a particular run of a workflow at any time. If an
     /// activation is not responded to, it will cause that workflow to become stuck forever.
+    /// This includes activations with no jobs: lang must apply their time and metadata and drive
+    /// its workflow scheduler so clock-dependent conditions behave consistently during replay.
     ///
     /// See [WorkflowActivation] for more details on the expected behavior of lang w.r.t activation
     /// & job processing.

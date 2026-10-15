@@ -35,6 +35,9 @@ pub enum CoreInternalFlags {
     MoveTerminalCommands = 3,
     /// Detects service and operation changes when replaying Nexus operation schedules.
     NexusOperationDeterminismChecks = 4,
+    /// Preserves workflow task boundaries so replay observes the same clock advances as live
+    /// execution, including tasks that have no activation jobs.
+    DisableWorkflowTaskChunking = 5,
     /// We received a value higher than this code can understand.
     TooHigh = u32::MAX,
 }
@@ -115,7 +118,11 @@ impl InternalFlags {
     pub(crate) fn write_all_known(&mut self) {
         if self.can_write_sdk_metadata {
             self.core_since_last_complete
-                .extend(CoreInternalFlags::all_except_too_high());
+                // Local activity marker indices require an explicit, safe chunking transition.
+                .extend(
+                    CoreInternalFlags::all_except_too_high()
+                        .filter(|f| !matches!(f, CoreInternalFlags::DisableWorkflowTaskChunking)),
+                );
         }
     }
 
@@ -178,6 +185,7 @@ impl CoreInternalFlags {
             2 => Self::UpsertSearchAttributeOnPatch,
             3 => Self::MoveTerminalCommands,
             4 => Self::NexusOperationDeterminismChecks,
+            5 => Self::DisableWorkflowTaskChunking,
             _ => Self::TooHigh,
         }
     }

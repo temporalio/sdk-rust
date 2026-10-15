@@ -3388,6 +3388,10 @@ async fn core_internal_flags() {
                 .copied()
                 .collect::<HashSet<_>>(),
             CoreInternalFlags::all_except_too_high()
+                .filter(|f| {
+                    *f != CoreInternalFlags::DisableWorkflowTaskChunking
+                        || cfg!(feature = "disable_workflow_task_chunking")
+                })
                 .map(|f| f as u32)
                 .collect()
         );
