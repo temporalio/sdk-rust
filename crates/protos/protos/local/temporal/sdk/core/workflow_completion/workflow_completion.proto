@@ -13,9 +13,10 @@ import "temporal/sdk/core/workflow_commands/workflow_commands.proto";
 // prefix in activation order. Return every activation's status and metadata, including successes
 // with no commands. Commands from every completed activation are applied at their original
 // boundary using the normal replay validation; they need not have corresponding history events.
-// Stop on failure, or after commands other than StartTimer/CancelTimer because those may create
-// additional Core jobs before the next supplied activation. Leave the suffix unexecuted; Core
-// will send fresh work. There is no fixed batch size or transaction across workflow activations.
+// Stop on failure, or after a command whose kind is not in the supplied batch's
+// allowed_continuation_commands, because additional Core jobs may be needed before continuing.
+// Leave the suffix unexecuted; Core will send fresh work. There is no fixed batch size or
+// transaction across workflow activations.
 message WorkflowActivationBatchCompletion {
     string run_id = 1;
     repeated IndexedWorkflowActivationCompletion completions = 2;
