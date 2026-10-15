@@ -71,8 +71,10 @@ import "temporal/sdk/core/nexus/nexus.proto";
 // should not cause the workflow code to be invoked and may be responded to with an empty command
 // list.
 message WorkflowActivation {
-    // The workflow run's cache key. A run must not be driven concurrently; when this activation
-    // belongs to a batch, this must match the batch's run_id.
+    // The id of the currently active run of the workflow. Also used as a cache key. There may
+    // only ever be one active workflow task (and hence activation) of a run at one time.
+    // Only one batch may be outstanding per workflow run. All activations in a batch must have
+    // the same run_id as the containing batch.
     string run_id = 1;
     // The current time as understood by the workflow, which is set by workflow task started events
     google.protobuf.Timestamp timestamp = 2;
@@ -111,9 +113,10 @@ message WorkflowActivation {
     bool target_worker_deployment_version_changed = 12;
 }
 
-// Every workflow poll returns a nonempty batch for one run, including singleton batches for
-// live work, queries, evictions, and legacy chunked replay. At most one batch is outstanding per
-// run; other runs may execute concurrently. SDKs must accept variable batch lengths.
+// Every workflow poll returns a nonempty batch for one workflow run, including singleton batches
+// for live work, queries, evictions, and legacy chunked replay. At most one batch is outstanding
+// per workflow run. Batches for different workflow runs with different workflow run IDs may execute
+// concurrently. SDKs must accept variable batch lengths.
 //
 // Execute activations sequentially on the same workflow instance. Apply each activation's own
 // timestamp, replay state, flags and metadata, and finish its jobs, runnable workflow work,
@@ -122,10 +125,11 @@ message WorkflowActivation {
 // deadlock checks; healthy progress across a batch is not one long activation.
 //
 // Return one WorkflowActivationBatchCompletion containing indexed results for the executed
-// prefix. Every activation may produce commands. Stop on failure or after a command whose kind
-// is absent from allowed_continuation_commands. Such commands may need additional Core jobs before
-// continuing. Do not execute the remaining suffix or rerun the completed prefix in place; await
-// fresh Core work.
+// prefix. Each result's activation_index is its activation's zero-based position in this
+// WorkflowActivationBatch.activations list. Every activation may produce commands.
+// Stop on failure or after a command whose kind is absent from allowed_continuation_commands.
+// Such commands may need additional Core jobs before continuing. Do not execute the remaining
+// suffix or rerun the completed prefix in place; await fresh Core work.
 // Queries retain their read-only semantics and evictions retain their isolation and cleanup rules.
 message WorkflowActivationBatch {
     string run_id = 1;

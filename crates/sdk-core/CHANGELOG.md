@@ -34,12 +34,10 @@ relevant information.
 ## Unreleased
 
 ### Breaking Changes
-* Language SDK bridges must exchange workflow activation batches and indexed batch completions,
-  including singleton batches. The C bridge uses this protocol unconditionally, independently of
-  workflow task chunking; each result retains its own commands and metadata. Bridges apply the
-  continuation allowlist supplied by Core so future batching policies need no language changes.
-  Batches include replay work from available history pages without a fixed activation-count limit,
-  stopping where earlier language commands are needed to determine subsequent inputs.
+* Language SDK bridges must exchange workflow activation batches and completions indexed within
+  each batch, including singleton batches, unconditionally and independently of workflow task
+  chunking. Bridges must execute activations sequentially per workflow run, retain each
+  activation's commands and metadata, and stop according to Core's continuation allowlist.
 * Replay detects changes to the service or operation of scheduled Nexus operations, reporting
   nondeterminism while retaining compatibility with histories recorded before these checks.
 

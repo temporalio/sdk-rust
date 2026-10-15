@@ -23,7 +23,8 @@ message WorkflowActivationBatchCompletion {
 }
 
 message IndexedWorkflowActivationCompletion {
-    // Zero-based index in the supplied activation batch. Indices must be 0, 1, ... with no gaps.
+    // Zero-based index relative to the supplied WorkflowActivationBatch.activations list.
+    // Indices must be 0, 1, ... with no gaps.
     uint32 activation_index = 1;
     WorkflowActivationCompletion completion = 2;
 }

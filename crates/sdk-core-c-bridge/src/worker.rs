@@ -677,14 +677,16 @@ pub type WorkerPollCallback = unsafe extern "C" fn(
 );
 
 /// Success contains a protobuf-encoded `coresdk.workflow_activation.WorkflowActivationBatch`.
+/// The C signature is unchanged; the protobuf payload now uses the batch message.
 ///
 /// Process a batch's activations sequentially according to their individual metadata and
 /// execution boundaries. Each activation may produce commands. Do not assume a fixed
 /// batch size. Each batch must receive one `WorkflowActivationBatchCompletion` response.
 ///
 /// There may be at most one batch outstanding per workflow run. Do not
-/// poll workflows concurrently; work for different runs may be processed concurrently. Continue
-/// polling and completing outstanding batches during shutdown until the callback reports shutdown.
+/// poll workflows concurrently; work for different workflow runs may be processed concurrently.
+/// Continue polling and completing outstanding batches during shutdown until the callback reports
+/// shutdown.
 #[unsafe(no_mangle)]
 pub extern "C" fn temporal_core_worker_poll_workflow_activation(
     worker: *mut Worker,
@@ -792,8 +794,10 @@ pub extern "C" fn temporal_core_worker_poll_nexus_task(
 }
 
 /// Accepts a protobuf-encoded `coresdk.workflow_completion.WorkflowActivationBatchCompletion`.
+/// The C signature is unchanged; the protobuf payload now uses the batch message.
 ///
-/// Return indexed results for the executed contiguous prefix, retaining each activation's
+/// Return results indexed by their activation's zero-based position in the supplied workflow
+/// activation batch, covering the executed contiguous prefix and retaining each activation's
 /// commands and metadata. Stop on failure or commands excluded by the supplied batch's
 /// `allowed_continuation_commands` policy, and leave the remaining suffix unexecuted.
 /// Submit completions for different workflow runs concurrently; completion may wait for history.
