@@ -40,21 +40,30 @@ hard-code command-specific continuation rules: Core can expand the allowlist for
 schemes without changing the language execution loop. Core retains the exact dispatched policy
 and rejects a response that executes beyond a disallowed command.
 
-## Conservative construction
+## Construction from available history
 
-Core currently allows continuation after `StartTimer` and `CancelTimer` commands and accumulates
-up to 256 replay activations containing only signals or empty jobs, where history has already
-transitioned to preserving individual task boundaries. It previews these
-inputs without applying assumed empty command results. The authoritative machines stay at the
-first boundary until the language returns actual completions. Before applying each later result,
-Core processes the preceding commands and history and checks the resulting activation against the
-preview, retaining normal nondeterminism handling.
+Core collects the replay activations it can determine from the buffered history, without a fixed
+activation-count limit or requiring pagination to finish. A batch can contain the entire replay,
+including initialization, or an available suffix. Only completed replay tasks with the necessary
+lookahead are included; live work remains separate.
 
-Legacy chunked activations, initialization, live work, queries, evictions, pagination, outstanding
-local activities, and history events or metadata changes that cannot be previewed conservatively
-use singleton batches or end accumulation. This affects batch size only. The batch protocol is
-always used whether chunking is enabled or disabled and regardless of the
-`disable_workflow_task_chunking` Cargo feature.
+The projection includes signals, empty tasks, timer firings, workflow cancellation, patch
+notifications, and resolutions whose command state Core already knows. Timer sequence numbers
+come from the recorded timer IDs. Other stateful events are projected using private copies of
+their existing machines; Core stops before events whose language sequence mapping or intervening
+Core work depends on a command it has not received. Each activation retains its own clock, flags,
+SDK version, deployment information, and history metadata, including changes within the batch.
+
+The authoritative machines remain at the first activation boundary until the language returns
+actual completions. Before applying each later result, Core processes the preceding commands and
+history and compares the resulting activation with the projection, retaining normal replay and
+nondeterminism checks. Core currently permits continuation after `StartTimer` and `CancelTimer`;
+all other command kinds end the executed prefix even when more activations were supplied.
+
+Legacy chunked activations, live work, queries, and evictions use singleton batches. Local activity
+and update dependencies, unsupported events, or missing lookahead end accumulation. This affects
+batch size only: the batch protocol is always used whether chunking is enabled or disabled and
+regardless of the `disable_workflow_task_chunking` Cargo feature.
 
 Batching adds no history flags, markers, or recording changes. The separate chunking transition
 continues to control history boundaries as described in [workflow task chunking](workflow_task_chunking.md).

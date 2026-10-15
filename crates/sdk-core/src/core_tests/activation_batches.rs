@@ -1,21 +1,37 @@
 use crate::{
     CompleteWfError, PollError, Worker,
     internal_flags::CoreInternalFlags,
-    replay::TestHistoryBuilder,
-    test_help::{MockPollCfg, build_mock_pollers, mock_worker, start_timer_cmd},
+    replay::{TestHistoryBuilder, default_act_sched},
+    test_help::{
+        MockPollCfg, ResponseType, build_mock_pollers, hist_to_poll_resp, mock_worker,
+        start_timer_cmd,
+    },
+    worker::client::mocks::mock_worker_client,
 };
-use std::time::Duration;
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+    time::Duration,
+};
 use temporalio_common::protos::{
     coresdk::{
         workflow_activation::workflow_activation_job::Variant,
-        workflow_commands::{CancelTimer, CompleteWorkflowExecution, workflow_command},
+        workflow_commands::{
+            CancelTimer, CompleteWorkflowExecution, SetPatchMarker, workflow_command,
+        },
         workflow_completion::{
             IndexedWorkflowActivationCompletion, WorkflowActivationBatchCompletion,
             WorkflowActivationCompletion,
         },
     },
     temporal::api::{
-        enums::v1::EventType, workflowservice::v1::RespondWorkflowTaskCompletedResponse,
+        enums::v1::EventType,
+        history::v1::history_event::Attributes,
+        workflowservice::v1::{
+            GetWorkflowExecutionHistoryResponse, RespondWorkflowTaskCompletedResponse,
+        },
     },
 };
 
@@ -69,7 +85,10 @@ async fn finish(core: Worker, run_id: String) {
 
 async fn initialize(core: &Worker) -> String {
     let batch = core.poll_workflow_activation_batch().await.unwrap();
-    assert_eq!(batch.activations.len(), 1);
+    assert_matches!(
+        batch.activations[0].jobs[0].variant,
+        Some(Variant::InitializeWorkflow(_))
+    );
     let run_id = batch.run_id;
     core.complete_workflow_activation_batch(WorkflowActivationBatchCompletion {
         run_id: run_id.clone(),
@@ -157,7 +176,7 @@ async fn batches_apply_unrecorded_commands_at_each_boundary(#[case] task_count: 
         }
     }
     assert_eq!(replayed, task_count);
-    assert!(batches < task_count);
+    assert_eq!(batches, 2);
     finish(core, run_id).await;
 }
 
@@ -254,15 +273,48 @@ async fn invalid_indices_and_dependency_crossings_do_not_advance_batch() {
 }
 
 #[tokio::test]
-async fn metadata_changes_are_batch_barriers() {
+async fn batch_preserves_metadata_changes() {
     let mut history = history(5, true);
     history.set_flags_last_wft(&[], &[700]);
+    let last_completion = history
+        .get_full_history_info()
+        .unwrap()
+        .events()
+        .iter()
+        .rfind(|e| e.event_type() == EventType::WorkflowTaskCompleted)
+        .unwrap()
+        .event_id;
+    history.modify_event(last_completion, |event| {
+        let Some(Attributes::WorkflowTaskCompletedEventAttributes(attrs)) = &mut event.attributes
+        else {
+            unreachable!()
+        };
+        attrs.sdk_metadata.as_mut().unwrap().sdk_version = "new-sdk".to_owned();
+        attrs.worker_deployment_name = "deployment".to_owned();
+        attrs.deployment_version = Some(
+            temporalio_common::protos::temporal::api::deployment::v1::WorkerDeploymentVersion {
+                deployment_name: "deployment".to_owned(),
+                build_id: "new-build".to_owned(),
+            },
+        );
+    });
     let mut mocks = build_mock_pollers(MockPollCfg::from_resps(history, [7]));
     mocks.make_wft_stream_interminable();
     let core = mock_worker(mocks);
     let run_id = initialize(&core).await;
     let batch = core.poll_workflow_activation_batch().await.unwrap();
-    assert_eq!(batch.activations.len(), 4);
+    assert_eq!(batch.activations.len(), 5);
+    assert!(
+        batch.activations[..4]
+            .iter()
+            .all(|a| !a.available_internal_flags.contains(&700))
+    );
+    let last = batch.activations.last().unwrap();
+    assert!(last.available_internal_flags.contains(&700));
+    assert_eq!(last.last_sdk_version, "new-sdk");
+    let version = last.deployment_version_for_current_task.as_ref().unwrap();
+    assert_eq!(version.deployment_name, "deployment");
+    assert_eq!(version.build_id, "new-build");
     core.complete_workflow_activation_batch(WorkflowActivationBatchCompletion {
         run_id: run_id.clone(),
         completions: batch
@@ -274,13 +326,372 @@ async fn metadata_changes_are_batch_barriers() {
     })
     .await
     .unwrap();
-    let last_replay = core.poll_workflow_activation_batch().await.unwrap();
-    assert!(
-        last_replay.activations[0]
-            .available_internal_flags
-            .contains(&700)
+    let live = core.poll_workflow_activation_batch().await.unwrap();
+    assert!(!live.activations[0].is_replaying);
+    core.complete_workflow_activation_batch(WorkflowActivationBatchCompletion {
+        run_id: run_id.clone(),
+        completions: vec![indexed(0, WorkflowActivationCompletion::empty(&run_id))],
+    })
+    .await
+    .unwrap();
+    finish(core, run_id).await;
+}
+
+#[tokio::test]
+async fn entire_timer_replay_is_one_batch() {
+    let task_count = 600;
+    let mut history = TestHistoryBuilder::default();
+    history.add_by_type(EventType::WorkflowExecutionStarted);
+    history.add_full_wf_task();
+    history.set_flags_first_wft(&[CoreInternalFlags::DisableWorkflowTaskChunking], &[]);
+    for seq in 1..=task_count {
+        let started = history.add_timer_started(seq.to_string());
+        history.add_timer_fired(started, seq.to_string());
+        if seq == task_count {
+            history.add_workflow_task_scheduled_and_started();
+        } else {
+            history.add_full_wf_task();
+        }
+    }
+    let mut mocks = build_mock_pollers(MockPollCfg::from_resps(history, [task_count + 1]));
+    mocks.make_wft_stream_interminable();
+    let core = mock_worker(mocks);
+    let batch = core.poll_workflow_activation_batch().await.unwrap();
+    let run_id = batch.run_id;
+    assert_eq!(batch.activations.len(), task_count);
+    assert_matches!(
+        batch.activations[0].jobs[0].variant,
+        Some(Variant::InitializeWorkflow(_))
     );
-    assert_eq!(last_replay.activations.len(), 1);
+    for (index, activation) in batch.activations.iter().enumerate().skip(1) {
+        assert_matches!(activation.jobs[0].variant, Some(Variant::FireTimer(ref timer)) => timer.seq as usize == index);
+    }
+    core.complete_workflow_activation_batch(WorkflowActivationBatchCompletion {
+        run_id: run_id.clone(),
+        completions: batch
+            .activations
+            .into_iter()
+            .enumerate()
+            .map(|(index, _)| {
+                indexed(
+                    index,
+                    WorkflowActivationCompletion::from_cmd(
+                        &run_id,
+                        start_timer_cmd(index as u32 + 1, Duration::from_secs(1)),
+                    ),
+                )
+            })
+            .collect(),
+    })
+    .await
+    .unwrap();
+    let live = core.poll_workflow_activation_batch().await.unwrap();
+    assert_eq!(live.activations.len(), 1);
+    assert!(!live.activations[0].is_replaying);
+    assert_matches!(live.activations[0].jobs[0].variant, Some(Variant::FireTimer(ref timer)) => timer.seq as usize == task_count);
+    core.complete_workflow_activation_batch(WorkflowActivationBatchCompletion {
+        run_id: run_id.clone(),
+        completions: vec![indexed(
+            0,
+            WorkflowActivationCompletion::from_cmd(
+                &run_id,
+                workflow_command::Variant::CompleteWorkflowExecution(
+                    CompleteWorkflowExecution::default(),
+                ),
+            ),
+        )],
+    })
+    .await
+    .unwrap();
+    finish(core, run_id).await;
+}
+
+#[tokio::test]
+async fn known_activity_resolution_and_workflow_cancellation_are_batched() {
+    let mut history = TestHistoryBuilder::default();
+    history.add_by_type(EventType::WorkflowExecutionStarted);
+    history.add_full_wf_task();
+    history.set_flags_first_wft(&[CoreInternalFlags::DisableWorkflowTaskChunking], &[]);
+    let activity = history.add_activity_task_scheduled("activity-id");
+    history.add_we_signaled("tick", vec![]);
+    history.add_full_wf_task();
+    let started = history.add_activity_task_started(activity);
+    history.add_activity_task_completed(activity, started, Default::default());
+    history.add_full_wf_task();
+    history.add_cancel_requested();
+    history.add_full_wf_task();
+    history.add_workflow_task_scheduled_and_started();
+    let mut mocks = build_mock_pollers(MockPollCfg::from_resps(history, [5]));
+    mocks.make_wft_stream_interminable();
+    let core = mock_worker(mocks);
+    let initial = core.poll_workflow_activation_batch().await.unwrap();
+    assert_eq!(initial.activations.len(), 1);
+    let run_id = initial.run_id;
+    core.complete_workflow_activation_batch(WorkflowActivationBatchCompletion {
+        run_id: run_id.clone(),
+        completions: vec![indexed(
+            0,
+            WorkflowActivationCompletion::from_cmd(
+                &run_id,
+                workflow_command::Variant::ScheduleActivity(
+                    temporalio_common::protos::coresdk::workflow_commands::ScheduleActivity {
+                        seq: 42,
+                        activity_id: "activity-id".to_owned(),
+                        ..default_act_sched()
+                    },
+                ),
+            ),
+        )],
+    })
+    .await
+    .unwrap();
+    let batch = core.poll_workflow_activation_batch().await.unwrap();
+    assert_eq!(batch.activations.len(), 3);
+    assert_matches!(
+        batch.activations[0].jobs[0].variant,
+        Some(Variant::SignalWorkflow(_))
+    );
+    assert_matches!(batch.activations[1].jobs[0].variant, Some(Variant::ResolveActivity(ref activity)) => activity.seq == 42);
+    assert_matches!(
+        batch.activations[2].jobs[0].variant,
+        Some(Variant::CancelWorkflow(_))
+    );
+    core.complete_workflow_activation_batch(WorkflowActivationBatchCompletion {
+        run_id: run_id.clone(),
+        completions: batch
+            .activations
+            .into_iter()
+            .enumerate()
+            .map(|(index, _)| indexed(index, WorkflowActivationCompletion::empty(&run_id)))
+            .collect(),
+    })
+    .await
+    .unwrap();
+    let live = core.poll_workflow_activation_batch().await.unwrap();
+    assert!(!live.activations[0].is_replaying);
+    core.complete_workflow_activation_batch(WorkflowActivationBatchCompletion {
+        run_id: run_id.clone(),
+        completions: vec![indexed(0, WorkflowActivationCompletion::empty(&run_id))],
+    })
+    .await
+    .unwrap();
+    finish(core, run_id).await;
+}
+
+#[tokio::test]
+async fn batches_use_buffered_history_before_pagination_finishes() {
+    let history = history(12, true);
+    let mut response =
+        hist_to_poll_resp(&history, "wfid".to_owned(), ResponseType::AllHistory).resp;
+    // Keep the replay watermark in the first page so extraction can yield before fetching the rest.
+    response.previous_started_event_id = 3;
+    let events = response.history.as_ref().unwrap().events.clone();
+    let cutoff = events
+        .iter()
+        .filter(|e| e.event_type() == EventType::WorkflowTaskStarted)
+        .nth(7)
+        .unwrap()
+        .event_id as usize;
+    response.history.as_mut().unwrap().events.truncate(5);
+    response.next_page_token = vec![1];
+    let first_page = GetWorkflowExecutionHistoryResponse {
+        history: Some(
+            temporalio_common::protos::temporal::api::history::v1::History {
+                events: events[5..cutoff].to_vec(),
+            },
+        ),
+        next_page_token: vec![2],
+        ..Default::default()
+    };
+    let last_page = GetWorkflowExecutionHistoryResponse {
+        history: Some(
+            temporalio_common::protos::temporal::api::history::v1::History {
+                events: events[cutoff..].to_vec(),
+            },
+        ),
+        ..Default::default()
+    };
+    let fetches = Arc::new(AtomicUsize::new(0));
+    let observed_fetches = fetches.clone();
+    let mut client = mock_worker_client();
+    client
+        .expect_get_workflow_execution_history()
+        .times(2)
+        .returning(move |_, _, token| {
+            observed_fetches.fetch_add(1, Ordering::SeqCst);
+            match token.as_slice() {
+                [1] => Ok(first_page.clone()),
+                [2] => Ok(last_page.clone()),
+                _ => panic!("Unexpected page token: {token:?}"),
+            }
+        });
+    let mut mocks = build_mock_pollers(MockPollCfg::from_resp_batches(
+        "wfid",
+        history,
+        [ResponseType::Raw(response)],
+        client,
+    ));
+    mocks.make_wft_stream_interminable();
+    let core = mock_worker(mocks);
+    let mut batch = core.poll_workflow_activation_batch().await.unwrap();
+    assert!(
+        batch.activations.len() > 1,
+        "{batch:?}; fetches={}",
+        fetches.load(Ordering::SeqCst)
+    );
+    assert!(batch.activations.len() < 13);
+    assert_eq!(fetches.load(Ordering::SeqCst), 1);
+    let run_id = batch.run_id.clone();
+    let mut replayed = 0;
+    loop {
+        let live = !batch.activations.last().unwrap().is_replaying;
+        let results = batch
+            .activations
+            .into_iter()
+            .enumerate()
+            .map(|(index, activation)| {
+                let completion = if matches!(
+                    activation.jobs.first().and_then(|j| j.variant.as_ref()),
+                    Some(Variant::InitializeWorkflow(_))
+                ) {
+                    replayed += 1;
+                    WorkflowActivationCompletion::from_cmd(
+                        &run_id,
+                        start_timer_cmd(1, Duration::from_secs(1)),
+                    )
+                } else {
+                    replayed += usize::from(activation.is_replaying);
+                    WorkflowActivationCompletion::empty(&run_id)
+                };
+                indexed(index, completion)
+            })
+            .collect();
+        core.complete_workflow_activation_batch(WorkflowActivationBatchCompletion {
+            run_id: run_id.clone(),
+            completions: results,
+        })
+        .await
+        .unwrap();
+        if live {
+            break;
+        }
+        batch = core.poll_workflow_activation_batch().await.unwrap();
+    }
+    assert_eq!(replayed, 13);
+    assert_eq!(fetches.load(Ordering::SeqCst), 2);
+    finish(core, run_id).await;
+}
+
+#[tokio::test]
+async fn unknown_activity_sequence_requires_an_early_batch_return() {
+    let mut history = TestHistoryBuilder::default();
+    history.add_by_type(EventType::WorkflowExecutionStarted);
+    history.add_full_wf_task();
+    history.set_flags_first_wft(&[CoreInternalFlags::DisableWorkflowTaskChunking], &[]);
+    history.add_we_signaled("schedule", vec![]);
+    history.add_full_wf_task();
+    let activity = history.add_activity_task_scheduled("7");
+    let started = history.add_activity_task_started(activity);
+    history.add_activity_task_completed(activity, started, Default::default());
+    history.add_full_wf_task();
+    history.add_full_wf_task();
+    history.add_workflow_task_scheduled_and_started();
+    let mut mocks = build_mock_pollers(MockPollCfg::from_resps(history, [5]));
+    mocks.make_wft_stream_interminable();
+    let core = mock_worker(mocks);
+    let initial = core.poll_workflow_activation_batch().await.unwrap();
+    assert_eq!(initial.activations.len(), 2);
+    let run_id = initial.run_id;
+    core.complete_workflow_activation_batch(WorkflowActivationBatchCompletion {
+        run_id: run_id.clone(),
+        completions: vec![
+            indexed(0, WorkflowActivationCompletion::empty(&run_id)),
+            indexed(
+                1,
+                WorkflowActivationCompletion::from_cmd(
+                    &run_id,
+                    workflow_command::Variant::ScheduleActivity(
+                        temporalio_common::protos::coresdk::workflow_commands::ScheduleActivity {
+                            seq: 42,
+                            activity_id: "7".to_owned(),
+                            ..default_act_sched()
+                        },
+                    ),
+                ),
+            ),
+        ],
+    })
+    .await
+    .unwrap();
+    let suffix = core.poll_workflow_activation_batch().await.unwrap();
+    assert_eq!(suffix.activations.len(), 2);
+    assert_matches!(suffix.activations[0].jobs[0].variant,
+        Some(Variant::ResolveActivity(ref activity)) => activity.seq == 42);
+    core.complete_workflow_activation_batch(WorkflowActivationBatchCompletion {
+        run_id: run_id.clone(),
+        completions: suffix
+            .activations
+            .into_iter()
+            .enumerate()
+            .map(|(index, _)| indexed(index, WorkflowActivationCompletion::empty(&run_id)))
+            .collect(),
+    })
+    .await
+    .unwrap();
+    let live = core.poll_workflow_activation_batch().await.unwrap();
+    assert!(!live.activations[0].is_replaying);
+    core.complete_workflow_activation_batch(WorkflowActivationBatchCompletion {
+        run_id: run_id.clone(),
+        completions: vec![indexed(0, WorkflowActivationCompletion::empty(&run_id))],
+    })
+    .await
+    .unwrap();
+    finish(core, run_id).await;
+}
+
+#[tokio::test]
+async fn patch_lookahead_is_included_before_early_return() {
+    let mut history = TestHistoryBuilder::default();
+    history.add_by_type(EventType::WorkflowExecutionStarted);
+    history.add_full_wf_task();
+    history.set_flags_first_wft(&[CoreInternalFlags::DisableWorkflowTaskChunking], &[]);
+    history.add_we_signaled("patch", vec![]);
+    history.add_full_wf_task();
+    history.add_has_change_marker("patch-id", false);
+    history.add_full_wf_task();
+    history.add_workflow_task_scheduled_and_started();
+    let mut mocks = build_mock_pollers(MockPollCfg::from_resps(history, [4]));
+    mocks.make_wft_stream_interminable();
+    let core = mock_worker(mocks);
+    let initial = core.poll_workflow_activation_batch().await.unwrap();
+    assert_eq!(initial.activations.len(), 3);
+    assert_matches!(initial.activations[1].jobs[0].variant,
+        Some(Variant::NotifyHasPatch(ref patch)) => patch.patch_id == "patch-id");
+    assert_matches!(
+        initial.activations[1].jobs[1].variant,
+        Some(Variant::SignalWorkflow(_))
+    );
+    let run_id = initial.run_id;
+    core.complete_workflow_activation_batch(WorkflowActivationBatchCompletion {
+        run_id: run_id.clone(),
+        completions: vec![
+            indexed(0, WorkflowActivationCompletion::empty(&run_id)),
+            indexed(
+                1,
+                WorkflowActivationCompletion::from_cmd(
+                    &run_id,
+                    workflow_command::Variant::SetPatchMarker(SetPatchMarker {
+                        patch_id: "patch-id".to_owned(),
+                        deprecated: false,
+                    }),
+                ),
+            ),
+        ],
+    })
+    .await
+    .unwrap();
+    let suffix = core.poll_workflow_activation_batch().await.unwrap();
+    assert_eq!(suffix.activations, initial.activations[2..]);
     core.complete_workflow_activation_batch(WorkflowActivationBatchCompletion {
         run_id: run_id.clone(),
         completions: vec![indexed(0, WorkflowActivationCompletion::empty(&run_id))],
