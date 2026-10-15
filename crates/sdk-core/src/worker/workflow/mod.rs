@@ -1569,8 +1569,6 @@ impl ProtoCommandExt for ProtoCommand {
 #[derive(Debug, derive_more::From, derive_more::Display)]
 #[allow(clippy::large_enum_variant)]
 enum WFCommandVariant {
-    /// Returned when we need to wait for the lang sdk to send us something
-    NoCommandsFromLang,
     AddActivity(ScheduleActivity),
     AddLocalActivity(ScheduleLocalActivity),
     RequestCancelActivity(RequestCancelActivity),
