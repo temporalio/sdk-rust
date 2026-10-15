@@ -36,6 +36,30 @@ Core does not consider such empty WFT sequences as worthy of waking lang (on rep
 task, they always will), since nothing meaningful has happened. Thus, they are grouped together
 as part of a "logical" WFT with the last WFT that had any real work in it.
 
+## Disabling chunking
+
+The non-default Core Cargo feature `disable_workflow_task_chunking` requests Core SDK flag 5,
+`DisableWorkflowTaskChunking`, in `WorkflowTaskCompleted` SDK metadata. The task whose completion
+first records the flag ends its logical chunk even if it produces no commands, preserving its
+activation time. All subsequent successful workflow tasks produce separate language activations,
+including tasks with no jobs. Earlier history retains legacy chunking. This works for both new
+and already-running workflows; no separate marker command is needed.
+
+Core requests the transition at the first live completion with no outstanding local activities
+and a language activation in that task. Waiting for local activities avoids changing the meaning
+of their recorded activation indices. The transition takes effect only after its completion is
+consumed from history. Core requests it again if a speculative task is discarded, and cannot
+establish it when the server does not support SDK metadata.
+
+Failed and timed-out attempts are still skipped during replay. Queries retain their separate,
+unrecorded activation boundaries. Language SDKs must execute empty activations, applying their
+time and metadata and driving their schedulers before returning a completion. Once recorded, the
+transition is honored even by builds with the Cargo feature disabled; disabling adoption cannot
+re-enable chunking in an already-transitioned workflow.
+
+The C bridge forwards the same Cargo feature to Core. It is enabled when building the bridge,
+rather than through a worker option at runtime.
+
 ## Possible issues as of this writing (5/25)
 
 The "new WFT force-issued by server" case would, currently, not cause a wakeup on replay for the

@@ -194,6 +194,7 @@ pub(crate) struct WorkflowMachines {
     /// Metrics context
     pub(crate) metrics: MetricsContext,
     worker_config: Arc<WorkerConfig>,
+    pending_wft_activation: bool,
 }
 
 #[derive(Debug, derive_more::Display)]
@@ -334,6 +335,7 @@ impl WorkflowMachines {
             local_activity_data: LocalActivityData::default(),
             have_seen_terminal_event: false,
             worker_config: basics.worker_config,
+            pending_wft_activation: false,
         }
     }
 
@@ -367,8 +369,9 @@ impl WorkflowMachines {
         Ok(())
     }
 
-    pub(crate) fn new_history_from_server(&mut self, update: HistoryUpdate) -> Result<()> {
+    pub(crate) fn new_history_from_server(&mut self, mut update: HistoryUpdate) -> Result<()> {
         self.note_wft_events(update.get_events());
+        update.chunking_disabled |= self.last_history_from_server.chunking_disabled;
         self.last_history_from_server = update;
         self.replaying = self.preparing_legacy_query
             || self.last_history_from_server.previous_wft_started_id > 0;
@@ -550,12 +553,14 @@ impl WorkflowMachines {
         }
         // Even though technically we may have satisfied all the criteria to be done with replay,
         // query only activations are always "replaying" to keep things sane.
-        let all_query = jobs.iter().all(|j| {
-            matches!(
-                j.variant,
-                workflow_activation_job::Variant::QueryWorkflow(_)
-            )
-        });
+        let is_wft_activation = std::mem::take(&mut self.pending_wft_activation);
+        let all_query = !is_wft_activation
+            && jobs.iter().all(|j| {
+                matches!(
+                    j.variant,
+                    workflow_activation_job::Variant::QueryWorkflow(_)
+                )
+            });
         // Query-only activations are never recorded in history, so replay can't count them.
         if !all_query {
             self.local_activity_data.activation_dispatched();
@@ -600,7 +605,7 @@ impl WorkflowMachines {
     }
 
     pub(crate) fn has_pending_jobs(&self) -> bool {
-        !self.drive_me.peek_pending_jobs().is_empty()
+        self.pending_wft_activation || !self.drive_me.peek_pending_jobs().is_empty()
     }
 
     fn has_non_update_jobs(jobs: &[OutgoingJob]) -> bool {
@@ -622,9 +627,26 @@ impl WorkflowMachines {
         // current build ID, so that if we get a query before any new history, we properly can
         // report that our ID was the one used for the completion.
         self.current_wft_deployment_info = self.worker_config.computed_deployment_version();
-        (*self.observed_internal_flags)
-            .borrow_mut()
-            .gather_for_wft_complete()
+        let mut flags = (*self.observed_internal_flags).borrow_mut();
+        let record_transition = cfg!(feature = "disable_workflow_task_chunking")
+            && !self.replaying
+            && !self.last_history_from_server.chunking_disabled
+            && self.outstanding_local_activity_count() == 0
+            && self.local_activity_data.current_activation_index() > 0
+            && flags.try_use(CoreInternalFlags::DisableWorkflowTaskChunking, true);
+        let mut metadata = flags.gather_for_wft_complete();
+        // A speculative completion may never reach history. Request the transition until its
+        // completion is consumed, rather than changing replay boundaries optimistically.
+        if record_transition
+            && !metadata
+                .core_used_flags
+                .contains(&(CoreInternalFlags::DisableWorkflowTaskChunking as u32))
+        {
+            metadata
+                .core_used_flags
+                .push(CoreInternalFlags::DisableWorkflowTaskChunking as u32);
+        }
+        metadata
     }
 
     pub(crate) fn add_lang_used_flags(&self, flags: Vec<u32>) {
@@ -898,6 +920,13 @@ impl WorkflowMachines {
                 do_handle_event = true;
             }
             self.last_processed_event = eid;
+        }
+
+        if self.last_history_from_server.chunking_disabled
+            && self.current_started_event_id > last_handled_wft_started_id
+            && !self.have_seen_terminal_event
+        {
+            self.pending_wft_activation = true;
         }
 
         // Needed to delay mutation of self until after we've iterated over peeked events.
