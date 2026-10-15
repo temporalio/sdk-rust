@@ -38,6 +38,8 @@ relevant information.
   including singleton batches. The C bridge uses this protocol unconditionally, independently of
   workflow task chunking; each result retains its own commands and metadata. Bridges apply the
   continuation allowlist supplied by Core so future batching policies need no language changes.
+  Batches include replay work from available history pages without a fixed activation-count limit,
+  stopping where earlier language commands are needed to determine subsequent inputs.
 * Replay detects changes to the service or operation of scheduled Nexus operations, reporting
   nondeterminism while retaining compatibility with histories recorded before these checks.
 

@@ -27,7 +27,7 @@ use crate::{
             CommandAnnotations, CommandID, DrivenWorkflow, HistoryUpdate, InternalFlagsRef,
             LocalResolution, OutgoingJob, ProtoCommandExt, RunBasics, WFCommand, WFCommandVariant,
             WFMachinesError, WorkflowStartedInfo, fatal,
-            history_update::NextWFT,
+            history_update::{NextWFT, completed_deployment_version},
             machines::{
                 HistEventData, activity_state_machine::ActivityMachine,
                 child_workflow_state_machine::ChildWorkflowMachine,
@@ -599,8 +599,53 @@ impl WorkflowMachines {
         {
             return vec![];
         }
+        // Only timer commands may precede these predictions. Other machines can therefore be
+        // advanced on private copies without assuming the language returned empty completions.
+        let mut machines = HashMap::new();
+        let flags = self.observed_internal_flags.borrow().clone();
         self.last_history_from_server
-            .preview_activation_batch(first, 255)
+            .preview_activation_batch(first, flags, |event| {
+                match &event.attributes {
+                    Some(
+                        history_event::Attributes::TimerStartedEventAttributes(_)
+                        | history_event::Attributes::TimerCanceledEventAttributes(_),
+                    ) => return Some(vec![]),
+                    Some(history_event::Attributes::TimerFiredEventAttributes(timer)) => {
+                        let seq = timer.timer_id.parse().ok()?;
+                        return Some(vec![
+                            workflow_activation_job::Variant::FireTimer(
+                                workflow_activation::FireTimer { seq },
+                            )
+                            .into(),
+                        ]);
+                    }
+                    _ => {}
+                }
+                let initial_id = event.get_initial_command_event_id()?;
+                let key = *self.machines_by_event_id.get(&initial_id)?;
+                let machine = machines
+                    .entry(key)
+                    .or_insert_with(|| self.machine(key).clone());
+                let responses = machine
+                    .handle_event(HistEventData {
+                        event: event.clone(),
+                        replaying: true,
+                        current_task_is_last_in_history: false,
+                    })
+                    .ok()?;
+                let mut jobs = vec![];
+                for response in responses {
+                    match response {
+                        MachineResponse::PushWFJob(job) => {
+                            if !self.machine_is_core_created.contains_key(key) {
+                                jobs.push(job.into());
+                            }
+                        }
+                        _ => return None,
+                    }
+                }
+                Some(jobs)
+            })
     }
 
     /// Apply the next (unapplied) entire workflow task from history to these machines. Will replay
@@ -646,28 +691,8 @@ impl WorkflowMachines {
                 (*$me.observed_internal_flags)
                     .borrow_mut()
                     .add_from_complete($wtc);
-                let mut combined_ver = WorkerDeploymentVersion::builder()
-                    .deployment_name("")
-                    .build_id("")
-                    .build();
-                #[allow(deprecated)]
-                if let Some(bid) = $wtc.worker_version.as_ref().map(|wv| &wv.build_id) {
-                    combined_ver.build_id = bid.to_string();
-                }
-                if !$wtc.worker_deployment_name.is_empty() {
-                    combined_ver.deployment_name = $wtc.worker_deployment_name.clone();
-                }
-                #[allow(deprecated)]
-                if !$wtc.worker_deployment_version.is_empty() {
-                    if let Ok(ver) = $wtc.worker_deployment_version.parse() {
-                        combined_ver = ver;
-                    }
-                }
-                if let Some(dv) = $wtc.deployment_version.as_ref() {
-                    combined_ver = dv.clone().into();
-                }
-                if !combined_ver.is_empty() {
-                    $me.current_wft_deployment_info = Some(combined_ver);
+                if let Some(version) = completed_deployment_version($wtc) {
+                    $me.current_wft_deployment_info = Some(version);
                 }
             }};
         }

@@ -152,10 +152,16 @@ impl ManagedRun {
                 .wft
                 .as_ref()
                 .is_some_and(|wft| wft.pending_queries.is_empty())
-            && batch.activations[0].jobs.iter().all(|job| {
+            && !batch.activations[0].jobs.iter().any(|job| {
                 matches!(
-                    job.variant,
-                    Some(workflow_activation_job::Variant::SignalWorkflow(_))
+                    job.variant.as_ref(),
+                    Some(
+                        workflow_activation_job::Variant::QueryWorkflow(_)
+                            | workflow_activation_job::Variant::RemoveFromCache(_)
+                    )
+                ) || matches!(
+                    job.variant.as_ref(),
+                    Some(workflow_activation_job::Variant::ResolveActivity(result)) if result.is_local
                 )
             })
         {
