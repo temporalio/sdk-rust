@@ -219,6 +219,8 @@ message StartWorkflowExecutionRequest {
 
     // Time-skipping configuration. If not set, time skipping is disabled.
     temporal.api.common.v1.TimeSkippingConfig time_skipping_config = 29;
+    // Serialization context propagated from the Nexus caller that started this workflow.
+    temporal.api.nexus.v1.PropagatedSerializationContext propagated_nexus_serialization_context = 30;
 }
 
 message StartWorkflowExecutionResponse {
@@ -263,6 +265,11 @@ message GetWorkflowExecutionHistoryResponse {
     // Will be set if there are more history events than were included in this response
     bytes next_page_token = 3;
     bool archived = 4;
+
+    // Serialization context propagated from the Nexus caller that started this run.
+    // Returned on the initial request (without next_page_token) when present. Clients should
+    // retain it across paginated responses, which may omit it.
+    temporal.api.nexus.v1.PropagatedSerializationContext propagated_nexus_serialization_context = 5;
 }
 
 message GetWorkflowExecutionHistoryReverseRequest {
@@ -612,6 +619,8 @@ message PollActivityTaskQueueResponse {
     //   3. If every group has some pending polls, assign the next poll to a group randomly
     //     according to the weights.
     temporal.api.taskqueue.v1.PollerGroupsInfo poller_groups_info = 22;
+    // Serialization context propagated from the Nexus caller that started this activity.
+    temporal.api.nexus.v1.PropagatedSerializationContext propagated_nexus_serialization_context = 23;
 }
 
 message RecordActivityTaskHeartbeatRequest {
@@ -3270,6 +3279,13 @@ message StartActivityExecutionRequest {
     temporal.api.common.v1.OnConflictOptions on_conflict_options = 21;
     // Time to wait before making the first activity task available for dispatch. This delay is not applied to retry attempts.
     google.protobuf.Duration start_delay = 22;
+    // Serialization context propagated from the Nexus caller that started this activity.
+    temporal.api.nexus.v1.PropagatedSerializationContext propagated_nexus_serialization_context = 23;
+    // Request that the first activity task be returned directly in the start response instead of
+    // being dispatched through a task queue. If set to true, the caller is expected to have a
+    // worker available and capable of processing the task. The returned task will be marked as
+    // started. The server may ignore this request.
+    bool request_eager_execution = 24;
 }
 
 message StartActivityExecutionResponse {
@@ -3279,6 +3295,9 @@ message StartActivityExecutionResponse {
     bool started = 2;
     // Link to the started activity.
     temporal.api.common.v1.Link link = 3;
+    // The first activity task when eager execution was requested and accepted.
+    // This is set only for the first attempt of a newly started activity.
+    PollActivityTaskQueueResponse eager_activity_task = 4;
 }
 
 message DescribeActivityExecutionRequest {
@@ -3337,6 +3356,9 @@ message PollActivityExecutionResponse {
     string run_id = 1;
 
     temporal.api.activity.v1.ActivityExecutionOutcome outcome = 2;
+
+    // Serialization context propagated from the Nexus caller that started this activity.
+    temporal.api.nexus.v1.PropagatedSerializationContext propagated_nexus_serialization_context = 3;
 }
 
 message ListActivityExecutionsRequest {
@@ -3500,6 +3522,10 @@ message PollNexusOperationExecutionResponse {
 
     // Operation token. Only populated for asynchronous operations after a successful StartOperation call.
     string operation_token = 3;
+
+    // Serialization context for this operation's payloads, derived from its stored target.
+    // For a reused operation, this is the original execution's context.
+    temporal.api.nexus.v1.PropagatedSerializationContext propagated_nexus_serialization_context = 6;
 
     // The operation outcome, available if the operation is in a closed state.
     oneof outcome {

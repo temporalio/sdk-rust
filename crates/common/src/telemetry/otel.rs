@@ -1,6 +1,6 @@
 use super::{
-    HistogramBucketOverrides, MetricTemporality, OtelCollectorOptions, OtlpProtocol,
-    TELEM_SERVICE_NAME,
+    HistogramAggregation, HistogramBucketOverrides, MetricTemporality, OtelCollectorOptions,
+    OtlpProtocol, TELEM_SERVICE_NAME,
     metrics::{
         ACTIVITY_EXEC_LATENCY_HISTOGRAM_NAME, ACTIVITY_SCHED_TO_START_LATENCY_HISTOGRAM_NAME,
         CoreMeter, Counter, DEFAULT_MS_BUCKETS, DEFAULT_S_BUCKETS, Gauge, GaugeF64, Histogram,
@@ -12,6 +12,7 @@ use super::{
     },
 };
 use crate::dbg_panic;
+use anyhow::{anyhow, bail};
 use opentelemetry::{
     self, Key, KeyValue,
     metrics::{Meter, MeterProvider as MeterProviderT},
@@ -61,7 +62,40 @@ pub(super) fn augment_meter_provider_with_defaults(
     global_tags: &HashMap<String, String>,
     use_seconds: bool,
     bucket_overrides: HistogramBucketOverrides,
+    histogram_aggregation: HistogramAggregation,
 ) -> Result<MeterProviderBuilder, anyhow::Error> {
+    if let HistogramAggregation::Base2Exponential(opts) = histogram_aggregation {
+        if !bucket_overrides.overrides.is_empty() {
+            bail!("histogram_bucket_overrides cannot be combined with exponential histograms");
+        }
+        if opts.name_suffix.is_empty() {
+            bail!("exponential histogram name_suffix must not be empty");
+        }
+        let aggregation = Aggregation::Base2ExponentialHistogram {
+            max_size: opts.max_size,
+            max_scale: opts.max_scale,
+            record_min_max: true,
+        };
+        // The view closure can only panic on a bad aggregation, so validate it once here.
+        metrics::Stream::builder()
+            .with_aggregation(aggregation.clone())
+            .build()
+            .map_err(|e| anyhow!("invalid exponential histogram options: {e}"))?;
+        let mpb = mpb.with_view(move |ins: &Instrument| {
+            if ins.kind() == InstrumentKind::Histogram {
+                Some(
+                    metrics::Stream::builder()
+                        .with_name(format!("{}{}", ins.name(), opts.name_suffix))
+                        .with_aggregation(aggregation.clone())
+                        .build()
+                        .expect("Aggregation was validated above"),
+                )
+            } else {
+                None
+            }
+        });
+        return Ok(mpb.with_resource(default_resource(global_tags)));
+    }
     for (name, buckets) in bucket_overrides.overrides {
         mpb = mpb.with_view(move |ins: &Instrument| {
             if ins.name().contains(&name) {
@@ -161,6 +195,7 @@ pub fn build_otlp_metric_exporter(
         &opts.global_tags,
         opts.use_seconds_for_durations,
         opts.histogram_bucket_overrides,
+        opts.histogram_aggregation,
     )?
     .build();
     Ok::<_, anyhow::Error>(CoreOtelMeter {
@@ -410,10 +445,15 @@ fn metric_temporality_to_temporality(t: MetricTemporality) -> Temporality {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use crate::telemetry::Base2ExponentialHistogramOptions;
     use opentelemetry::{Key, Value};
     use opentelemetry_sdk::{
         error::{OTelSdkError, OTelSdkResult},
-        metrics::{Temporality, data::ResourceMetrics, exporter::PushMetricExporter},
+        metrics::{
+            InMemoryMetricExporter, Temporality,
+            data::{AggregatedMetrics, MetricData, ResourceMetrics},
+            exporter::PushMetricExporter,
+        },
     };
     use std::{
         sync::{
@@ -482,6 +522,147 @@ pub(crate) mod tests {
         fn temporality(&self) -> Temporality {
             Temporality::Cumulative
         }
+    }
+
+    fn metric_kind<T>(data: &MetricData<T>) -> &'static str {
+        match data {
+            MetricData::Gauge(_) => "gauge",
+            MetricData::Sum(_) => "sum",
+            MetricData::Histogram(_) => "histogram",
+            MetricData::ExponentialHistogram(_) => "exponential_histogram",
+        }
+    }
+
+    fn exported(exporter: &InMemoryMetricExporter) -> Vec<(String, &'static str)> {
+        let mut exported: Vec<_> = exporter
+            .get_finished_metrics()
+            .unwrap()
+            .iter()
+            .flat_map(|rm| rm.scope_metrics())
+            .flat_map(|sm| sm.metrics())
+            .map(|metric| {
+                let kind = match metric.data() {
+                    AggregatedMetrics::F64(d) => metric_kind(d),
+                    AggregatedMetrics::U64(d) => metric_kind(d),
+                    AggregatedMetrics::I64(d) => metric_kind(d),
+                };
+                (metric.name().to_string(), kind)
+            })
+            .collect();
+        exported.sort();
+        exported
+    }
+
+    fn provider_with(
+        aggregation: HistogramAggregation,
+        overrides: HistogramBucketOverrides,
+    ) -> Result<(SdkMeterProvider, InMemoryMetricExporter), anyhow::Error> {
+        let exporter = InMemoryMetricExporter::default();
+        let reader = PeriodicReader::builder(exporter.clone())
+            .with_interval(Duration::from_secs(60))
+            .build();
+        let mpb = augment_meter_provider_with_defaults(
+            MeterProviderBuilder::default().with_reader(reader),
+            &HashMap::new(),
+            false,
+            overrides,
+            aggregation,
+        )?;
+        Ok((mpb.build(), exporter))
+    }
+
+    #[test]
+    pub(crate) fn explicit_buckets_export_histograms_under_instrument_name() {
+        let (provider, exporter) =
+            provider_with(HistogramAggregation::default(), Default::default()).unwrap();
+        let meter = provider.meter("temporalio_common_test");
+        meter
+            .u64_histogram("temporal_test_latency")
+            .build()
+            .record(5, &[]);
+        provider.force_flush().unwrap();
+
+        assert_eq!(
+            exported(&exporter),
+            vec![("temporal_test_latency".to_string(), "histogram")]
+        );
+    }
+
+    #[test]
+    pub(crate) fn exponential_histograms_export_under_suffixed_name_only() {
+        let opts = Base2ExponentialHistogramOptions {
+            name_suffix: "_exp".to_string(),
+            ..Default::default()
+        };
+        let (provider, exporter) = provider_with(
+            HistogramAggregation::Base2Exponential(opts),
+            Default::default(),
+        )
+        .unwrap();
+        let meter = provider.meter("temporalio_common_test");
+        meter
+            .u64_histogram("temporal_test_latency")
+            .build()
+            .record(5, &[]);
+        meter
+            .f64_histogram("temporal_test_seconds")
+            .build()
+            .record(0.5, &[]);
+        meter.u64_counter("temporal_test_count").build().add(1, &[]);
+        provider.force_flush().unwrap();
+
+        assert_eq!(
+            exported(&exporter),
+            vec![
+                ("temporal_test_count".to_string(), "sum"),
+                (
+                    "temporal_test_latency_exp".to_string(),
+                    "exponential_histogram"
+                ),
+                (
+                    "temporal_test_seconds_exp".to_string(),
+                    "exponential_histogram"
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    pub(crate) fn exponential_histogram_options_are_validated() {
+        let with_override = HistogramBucketOverrides {
+            overrides: HashMap::from([("temporal_test_latency".to_string(), vec![1.0])]),
+        };
+        assert!(
+            provider_with(
+                HistogramAggregation::Base2Exponential(Default::default()),
+                with_override,
+            )
+            .is_err()
+        );
+
+        let empty_suffix = Base2ExponentialHistogramOptions {
+            name_suffix: String::new(),
+            ..Default::default()
+        };
+        assert!(
+            provider_with(
+                HistogramAggregation::Base2Exponential(empty_suffix),
+                Default::default(),
+            )
+            .is_err()
+        );
+
+        let bad_scale = Base2ExponentialHistogramOptions {
+            max_scale: 21,
+            ..Default::default()
+        };
+        assert!(
+            provider_with(
+                HistogramAggregation::Base2Exponential(bad_scale),
+                Default::default(),
+            )
+            .is_err()
+        );
     }
 
     #[test]

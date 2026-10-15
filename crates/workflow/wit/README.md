@@ -60,4 +60,4 @@ Changes that force a major bump include:
 - Changing a field/case/parameter type (including widening `u32` to `u64` etc.).
 - Reordering variant cases (the discriminant order is part of the ABI).
 - Changing the proto messages encoded into `list<u8>`-typed fields (`failure`, `payload`,
-  `workflow-command`, `workflow-activation`, `continue-as-new-request`).
+  `workflow-command` and their attributes, `workflow-activation`, etc.).

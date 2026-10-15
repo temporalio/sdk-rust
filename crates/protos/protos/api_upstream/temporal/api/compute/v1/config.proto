@@ -20,6 +20,10 @@ message ComputeConfigScalingGroup {
     // task types.
     repeated temporal.api.enums.v1.TaskQueueType task_queue_types = 1;
 
+    // Optional. If set, this scaling group is used only while the namespace is
+    // active in one of these regions.
+    repeated string region_ids = 2;
+
     // Stores instructions for a worker control plane controller how to respond
     // to worker lifeycle events.
     temporal.api.compute.v1.ComputeProvider provider = 3;
@@ -52,7 +56,7 @@ message ComputeConfigScalingGroupUpdate {
   // - Empty mask for an existing scaling group is no-op: no change.
   // - Non-empty mask for an existing scaling group will update/unset only to the fields
   //   mentioned in the mask.
-  // - Accepted paths: "task_queue_types", "provider", "provider.type", "provider.details",
+  // - Accepted paths: "task_queue_types", "region_ids", "provider", "provider.type", "provider.details",
   //   "provider.nexus_endpoint", "scaler", "scaler.type", "scaler.details"
   google.protobuf.FieldMask update_mask = 2;
 }
@@ -65,4 +69,5 @@ message ComputeConfigSummary {
 message ComputeConfigScalingGroupSummary {
     repeated temporal.api.enums.v1.TaskQueueType task_queue_types = 1;
     string provider_type = 2;
+    repeated string region_ids = 3;
 }

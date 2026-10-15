@@ -7,9 +7,9 @@ use temporalio_common::protos::{
 };
 use temporalio_workflow::{
     __private::sdk::{
-        ActivationJobResult, ActivationResult, MainRoutineCompletion, QueryResponse,
-        RoutineCompletion, RoutineKind, RoutinePendingState, RoutinePollResult, StartedRoutine,
-        TaskFailure, TerminalOutcome, UpdateRoutineCompletion, UpdateRoutineKind,
+        ActivationJobResult, ActivationResult, ContinueAsNewRequest, MainRoutineCompletion,
+        QueryResponse, RoutineCompletion, RoutineKind, RoutinePendingState, RoutinePollResult,
+        StartedRoutine, TaskFailure, TerminalOutcome, UpdateRoutineCompletion, UpdateRoutineKind,
         WorkflowActivation, WorkflowFailure, WorkflowHost, WorkflowInstance,
     },
     PatchActivationCaller,
@@ -334,7 +334,14 @@ impl WorkflowInstance for WasmWorkflowInstance {
                                     TerminalOutcome::Cancelled(details.map(decode_proto))
                                 }
                                 wit_types::TerminalOutcome::ContinueAsNew(req) => {
-                                    TerminalOutcome::ContinueAsNew(Box::new(decode_proto(req)))
+                                    TerminalOutcome::ContinueAsNew(Box::new(ContinueAsNewRequest {
+                                        attributes: decode_proto(req.attributes),
+                                        event_group_markers: req
+                                            .event_group_markers
+                                            .into_iter()
+                                            .map(decode_proto)
+                                            .collect(),
+                                    }))
                                 }
                             }))
                         }

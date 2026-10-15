@@ -33,6 +33,36 @@ relevant information.
 
 ## Unreleased
 
+### Breaking Changes
+* Replay detects changes to the service or operation of scheduled Nexus operations, reporting
+  nondeterminism while retaining compatibility with histories recorded before these checks.
+
+### Fixed
+* Worker heartbeats now report correct task-slot and poller counts when using buffered or custom
+  metrics backends, including the Python SDK's `MetricBuffer`. Previously these counts could
+  remain `0` because heartbeat accounting depended on reading labels from backend-owned attributes.
+* Local activities still running when their workflow is evicted or the worker shuts down now
+  always receive a cancellation. Local activities no longer retry ordinary failures or
+  start-to-close timeouts after cancellation has been requested, matching non-local activities.
+  Workflow code no longer observes a spurious local activity cancellation when its run is evicted
+  or completes while the local activity is backing off between retries.
+* Workers no longer panic when evicting a workflow with buffered local activity results. Completed
+  activations' output is recorded before eviction, without recording eviction-induced cancellations.
+* A workflow task that arrives while a workflow waits on a local activity, such as a legacy query,
+  now waits until the current workflow task is reported. Previously it replaced that workflow task
+  ("Trying to send a new WFT for a run which already has one!"), which then timed out on the server
+  and could leave the workflow stuck on a nondeterminism error.
+* Workers now replay workflows paused before a scheduled task starts, allowing those workflows to
+  make progress after unpause.
+
+### Added
+* The OTLP metrics exporter can export histograms as OpenTelemetry exponential histograms, which
+  Prometheus-compatible backends store as native histograms, when an SDK enables the option,
+  including through the C bridge. It applies to every histogram, including custom ones, and names
+  each series with a suffix, `_native` by default, so it never shares a name with the fixed-bucket
+  series it replaces. It cannot be combined with histogram bucket overrides. Explicit buckets
+  remain the default.
+
 ## [0.10.0] - 2026-10-06
 
 ### Added

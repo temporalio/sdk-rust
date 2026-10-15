@@ -120,10 +120,6 @@ struct NativeWorkflowHost {
 }
 
 impl NativeWorkflowHost {
-    fn push_command_variant(&self, variant: workflow_command::Variant) {
-        self.push_command(variant.into());
-    }
-
     fn push_command(&self, command: WorkflowCommand) {
         self.activation_cmds.borrow_mut().push(command);
     }
@@ -561,38 +557,40 @@ impl WorkflowFuture {
                     }
                     RoutineCompletion::Main(MainRoutineCompletion::Terminal(outcome)) => {
                         let outcome = *outcome;
-                        match outcome {
+                        let terminal_command = match outcome {
                             TerminalOutcome::Completed(result) => {
-                                self.host.push_command_variant(
-                                    workflow_command::Variant::CompleteWorkflowExecution(
-                                        CompleteWorkflowExecution {
-                                            result: Some(result),
-                                        },
-                                    ),
-                                );
+                                workflow_command::Variant::CompleteWorkflowExecution(
+                                    CompleteWorkflowExecution {
+                                        result: Some(result),
+                                    },
+                                )
+                                .into()
                             }
                             TerminalOutcome::Failed(failure) => {
-                                self.host.push_command_variant(
-                                    workflow_command::Variant::FailWorkflowExecution(
-                                        FailWorkflowExecution {
-                                            failure: Some(*failure),
-                                        },
-                                    ),
-                                );
+                                workflow_command::Variant::FailWorkflowExecution(
+                                    FailWorkflowExecution {
+                                        failure: Some(*failure),
+                                    },
+                                )
+                                .into()
                             }
                             TerminalOutcome::Cancelled(details) => {
-                                self.host.push_command_variant(
-                                    workflow_command::Variant::CancelWorkflowExecution(
-                                        CancelWorkflowExecution { details },
+                                workflow_command::Variant::CancelWorkflowExecution(
+                                    CancelWorkflowExecution { details },
+                                )
+                                .into()
+                            }
+                            TerminalOutcome::ContinueAsNew(req) => WorkflowCommand {
+                                variant: Some(
+                                    workflow_command::Variant::ContinueAsNewWorkflowExecution(
+                                        req.attributes,
                                     ),
-                                );
-                            }
-                            TerminalOutcome::ContinueAsNew(req) => {
-                                self.host.push_command_variant(
-                                    workflow_command::Variant::ContinueAsNewWorkflowExecution(*req),
-                                );
-                            }
-                        }
+                                ),
+                                event_group_markers: req.event_group_markers,
+                                user_metadata: None,
+                            },
+                        };
+                        activation_cmds.push(terminal_command);
                         should_stop_polling = true;
                     }
                     other => {

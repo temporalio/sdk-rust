@@ -10,6 +10,7 @@ use temporalio_common_wasm::protos::{
     temporal::api::{
         common::v1::{Payload, Payloads},
         failure::v1::Failure,
+        sdk::v1::EventGroupMarker,
     },
 };
 
@@ -118,8 +119,15 @@ pub struct ActivationResult {
     pub job_results: Vec<ActivationJobResult>,
 }
 
-/// Command attributes used when a workflow continues as a new run.
-pub(crate) type ContinueAsNewRequest = ContinueAsNewWorkflowExecution;
+/// Continue-as-new command attributes plus any Event Group markers on the wrapping command.
+#[doc(hidden)]
+#[derive(Clone, Debug, PartialEq, Default)]
+pub struct ContinueAsNewRequest {
+    /// Continue-as-new attributes sent to Core.
+    pub attributes: ContinueAsNewWorkflowExecution,
+    /// Event Group markers attached to the continue-as-new command.
+    pub event_group_markers: Vec<EventGroupMarker>,
+}
 
 /// Workflow Task failure requested by the main workflow routine.
 #[derive(Clone, Debug, PartialEq)]

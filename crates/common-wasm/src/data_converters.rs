@@ -10,6 +10,12 @@ pub use failure_converter::{
     DefaultFailureConverter, FailureConverter, FailureDecodeHint, NoopDecodeHint,
     WorkflowSignalDecodeHint,
 };
+// Published beside the `DataConverter` the configuration hangs off, which is the only reason these
+// are defined in this crate: drivers are implemented and invoked outside of WASM, by the worker and
+// client, never from workflow code.
+#[cfg(feature = "experimental")]
+#[doc(hidden)]
+pub use crate::external_storage::*;
 use well_known::{BINARY_NULL_ENCODING_VAL, WellKnownType, binary_null_payload};
 
 use crate::protos::{ENCODING_PAYLOAD_KEY, JSON_ENCODING_VAL, temporal::api::common::v1::Payload};
@@ -243,6 +249,16 @@ impl PayloadConverter {
     /// Create a payload converter that uses JSON serialization via serde.
     pub fn serde_json() -> Self {
         Self::Serde(Arc::new(SerdeJsonPayloadConverter))
+    }
+
+    /// Build an ordered composite converter.
+    ///
+    /// TODO: Hidden until we're ready to freeze the Composite Payload Converter API.
+    #[doc(hidden)]
+    pub fn composite(converters: impl IntoIterator<Item = Self>) -> Self {
+        Self::Composite(Arc::new(CompositePayloadConverter {
+            converters: converters.into_iter().collect(),
+        }))
     }
     // TODO [rust-sdk-branch]: Proto binary, other standard built-ins
 }
