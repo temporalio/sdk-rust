@@ -1,5 +1,5 @@
 use crate::{
-    MetricsContext, WorkerConfig,
+    CompleteWfError, MetricsContext, WorkerConfig,
     abstractions::dbg_panic,
     internal_flags::CoreInternalFlags,
     protosext::{WorkflowActivationExt, protocol_messages::IncomingProtocolMessage},
@@ -11,11 +11,12 @@ use crate::{
             FailedActivationWFTReport, HeartbeatTimeoutMsg, HistoryUpdate,
             LocalActivityRequestSink, LocalResolution, NextPageReq, OutstandingActivation,
             OutstandingTask, PermittedWFT, RequestEvictMsg, RunBasics,
-            ServerCommandsWithWorkflowInfo, TaskStorageMetrics, WFCommand, WFCommandVariant,
-            WFMachinesError, WFT_HEARTBEAT_TIMEOUT_FRACTION, WFTReportStatus, WftFailureKind,
-            WorkflowTaskInfo,
+            ServerCommandsWithWorkflowInfo, TaskStorageMetrics, ValidatedCompletion, WFCommand,
+            WFCommandVariant, WFMachinesError, WFT_HEARTBEAT_TIMEOUT_FRACTION, WFTReportStatus,
+            WftFailureKind, WorkflowTaskInfo,
             history_update::HistoryPaginator,
             machines::{MachinesWFTResponseContent, WorkflowMachines},
+            prepare_to_ship_activation,
         },
     },
 };
@@ -33,8 +34,8 @@ use temporalio_common::protos::{
     coresdk::{
         common::ExternalStorageMetrics,
         workflow_activation::{
-            RemoveFromCache, WorkflowActivation, query_to_job, remove_from_cache::EvictionReason,
-            workflow_activation_job,
+            RemoveFromCache, WorkflowActivation, WorkflowActivationBatch, query_to_job,
+            remove_from_cache::EvictionReason, workflow_activation_job,
         },
         workflow_commands::{FailWorkflowExecution, QueryResult},
         workflow_completion,
@@ -101,6 +102,7 @@ pub(super) struct ManagedRun {
     paginator: Option<HistoryPaginator>,
     completion_waiting_on_page_fetch: Option<RunActivationCompletion>,
     config: Arc<WorkerConfig>,
+    outstanding_batch: Option<Vec<WorkflowActivation>>,
 }
 impl ManagedRun {
     pub(super) fn new(
@@ -125,9 +127,121 @@ impl ManagedRun {
             paginator: None,
             completion_waiting_on_page_fetch: None,
             config,
+            outstanding_batch: None,
         };
         let rua = me.incoming_wft(wft);
         (me, rua)
+    }
+
+    pub(super) fn prepare_activation_batch(
+        &mut self,
+        activation: WorkflowActivation,
+    ) -> WorkflowActivationBatch {
+        let mut batch = WorkflowActivationBatch {
+            run_id: activation.run_id.clone(),
+            activations: vec![activation],
+        };
+        if !self.am_broken
+            && self.trying_to_evict.is_none()
+            && self.waiting_on_la.is_none()
+            && self
+                .wft
+                .as_ref()
+                .is_some_and(|wft| wft.pending_queries.is_empty())
+            && batch.activations[0].jobs.iter().all(|job| {
+                matches!(
+                    job.variant,
+                    Some(workflow_activation_job::Variant::SignalWorkflow(_))
+                )
+            })
+        {
+            batch.activations.extend(
+                self.wfm
+                    .machines
+                    .preview_activation_batch(&batch.activations[0]),
+            );
+        }
+        self.outstanding_batch = Some(batch.activations.clone());
+        batch
+    }
+
+    pub(super) fn validate_batch_completion(
+        &mut self,
+        mut completions: Vec<ValidatedCompletion>,
+    ) -> std::result::Result<(ValidatedCompletion, bool, usize), CompleteWfError> {
+        let malformed = |reason: &str| CompleteWfError::MalformedWorkflowCompletion {
+            run_id: self.run_id().to_owned(),
+            reason: reason.to_owned(),
+        };
+        let outstanding = self
+            .outstanding_batch
+            .as_ref()
+            .ok_or_else(|| malformed("No workflow activation batch is outstanding"))?;
+        let count = completions.len();
+        if count == 0 || count > outstanding.len() {
+            return Err(malformed(
+                "Completion count does not match the outstanding activation batch",
+            ));
+        }
+        for completion in &completions[..count - 1] {
+            match completion {
+                ValidatedCompletion::Fail { .. } => {
+                    return Err(malformed(
+                        "A failed completion must end the completed prefix",
+                    ));
+                }
+                ValidatedCompletion::Success { commands, .. }
+                    if commands.iter().any(|c| {
+                        !matches!(
+                            c.variant,
+                            WFCommandVariant::AddTimer(_) | WFCommandVariant::CancelTimer(_)
+                        )
+                    }) =>
+                {
+                    return Err(malformed(
+                        "Stop the completed prefix after commands that require a Core response",
+                    ));
+                }
+                _ => {}
+            }
+        }
+        let outstanding = self.outstanding_batch.take().unwrap();
+        let last = completions.pop().unwrap();
+        for (index, completion) in completions.into_iter().enumerate() {
+            let ValidatedCompletion::Success {
+                commands,
+                used_flags,
+                ..
+            } = completion
+            else {
+                unreachable!()
+            };
+            self.wfm.machines.add_lang_used_flags(used_flags);
+            let result = (|| {
+                self.wfm.push_commands_and_iterate(commands)?;
+                self.wfm.apply_next_task_if_ready()?;
+                let mut actual = self.wfm.get_next_activation()?;
+                prepare_to_ship_activation(&mut actual);
+                if actual != outstanding[index + 1] {
+                    return Err(WFMachinesError::Nondeterminism(
+                        "Batched replay commands changed the next activation".to_owned(),
+                    ));
+                }
+                Ok(())
+            })();
+            if let Err(error) = result {
+                return Ok((
+                    ValidatedCompletion::Fail {
+                        run_id: self.run_id().to_owned(),
+                        failure: error.as_failure(),
+                        is_autocomplete: true,
+                    },
+                    true,
+                    index + 1,
+                ));
+            }
+        }
+        Ok((last, outstanding[count - 1].is_replaying, count))
     }
 
     /// Returns true if there are pending jobs that need to be sent to lang.

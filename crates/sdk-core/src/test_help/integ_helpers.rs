@@ -45,7 +45,9 @@ pub use temporalio_common::telemetry::metrics::TemporalMeter;
 use temporalio_common::{
     protos::{
         coresdk::{
-            workflow_activation::{WorkflowActivationJob, workflow_activation_job},
+            workflow_activation::{
+                WorkflowActivation, WorkflowActivationJob, workflow_activation_job,
+            },
             workflow_commands::{CompleteWorkflowExecution, StartTimer},
             workflow_completion::WorkflowActivationCompletion,
         },
@@ -1042,6 +1044,13 @@ impl WorkerExt for Worker {
 #[async_trait::async_trait]
 /// Test helper methods for core workers
 pub trait WorkerTestHelpers {
+    /// Drive one activation when a fixture must control each Core boundary directly.
+    async fn poll_workflow_activation(&self) -> Result<WorkflowActivation, PollError>;
+    /// Supply a fixture result without exposing a single-activation language interface.
+    async fn complete_workflow_activation(
+        &self,
+        completion: WorkflowActivationCompletion,
+    ) -> Result<(), crate::CompleteWfError>;
     /// Complete a workflow execution
     async fn complete_execution(&self, run_id: &str);
     /// Complete a timer with the given sequence number and duration
@@ -1052,6 +1061,17 @@ pub trait WorkerTestHelpers {
 
 #[async_trait::async_trait]
 impl WorkerTestHelpers for Worker {
+    async fn poll_workflow_activation(&self) -> Result<WorkflowActivation, PollError> {
+        self.poll_workflow_activation_for_test().await
+    }
+
+    async fn complete_workflow_activation(
+        &self,
+        completion: WorkflowActivationCompletion,
+    ) -> Result<(), crate::CompleteWfError> {
+        self.complete_workflow_activation_for_test(completion).await
+    }
+
     async fn complete_execution(&self, run_id: &str) {
         self.complete_workflow_activation(WorkflowActivationCompletion::from_cmds(
             run_id.to_string(),

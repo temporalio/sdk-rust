@@ -1,5 +1,6 @@
+use super::{BatchCompleteMsg, PrepareActivationBatchMsg};
 use crate::{
-    MetricsContext,
+    CompleteWfError, MetricsContext,
     abstractions::dbg_panic,
     telemetry::metrics::workflow_type,
     worker::workflow::{
@@ -121,6 +122,43 @@ impl WFStream {
                             rh.record_span_fields(&local_input.span);
                         }
                         match local_input.input {
+                            LocalInputs::PrepareBatch(request) => {
+                                if let Some(run) = state.runs.get_mut(&request.activation.run_id) {
+                                    let batch = run.prepare_activation_batch(request.activation);
+                                    let _ = request.response_tx.send(batch);
+                                }
+                                None
+                            }
+                            LocalInputs::BatchCompletion(request) => {
+                                let result = state
+                                    .runs
+                                    .get_mut(&request.run_id)
+                                    .ok_or_else(|| CompleteWfError::MalformedWorkflowCompletion {
+                                        run_id: request.run_id.clone(),
+                                        reason: "No workflow activation batch is outstanding"
+                                            .to_owned(),
+                                    })
+                                    .and_then(|run| {
+                                        run.validate_batch_completion(request.completions)
+                                    });
+                                match result {
+                                    Ok((completion, replaying, applied_count)) => {
+                                        let _ = request
+                                            .validation_tx
+                                            .send(Ok((replaying, applied_count)));
+                                        activations.extend(state.process_completion(
+                                            NewOrFetchedComplete::New(Box::new(WFActCompleteMsg {
+                                                completion,
+                                                response_tx: Some(request.response_tx),
+                                            })),
+                                        ));
+                                    }
+                                    Err(error) => {
+                                        let _ = request.validation_tx.send(Err(error));
+                                    }
+                                }
+                                None
+                            }
                             LocalInputs::Completion(completion) => {
                                 activations.extend(state.process_completion(
                                     NewOrFetchedComplete::New(Box::new(completion)),
@@ -135,6 +173,12 @@ impl WFStream {
                             }
                             LocalInputs::PostActivation(report) => {
                                 state.process_post_activation(*report)
+                            }
+                            LocalInputs::PostActivationBatch(reports) => {
+                                for report in reports {
+                                    activations.extend(state.process_post_activation(report));
+                                }
+                                None
                             }
                             LocalInputs::LocalResolution(res) => state.local_resolution(res),
                             LocalInputs::HeartbeatTimeout(hbt) => {
@@ -680,12 +724,15 @@ impl From<LocalActivityNotification> for LocalInput {
 #[derive(Debug, derive_more::From)]
 pub(super) enum LocalInputs {
     Completion(WFActCompleteMsg),
+    PrepareBatch(PrepareActivationBatchMsg),
+    BatchCompletion(BatchCompleteMsg),
     FetchedPageCompletion {
         paginator: HistoryPaginator,
         update: HistoryUpdate,
     },
     LocalResolution(LocalResolutionMsg),
     PostActivation(Box<PostActivationMsg>),
+    PostActivationBatch(Vec<PostActivationMsg>),
     RequestEviction(RequestEvictMsg),
     HeartbeatTimeout(String),
     /// A queued cancel was handed to lang, so the run may be ready to evict
@@ -698,9 +745,12 @@ impl LocalInputs {
     fn run_id(&self) -> Option<&str> {
         Some(match self {
             LocalInputs::Completion(c) => c.completion.run_id(),
+            LocalInputs::PrepareBatch(p) => &p.activation.run_id,
+            LocalInputs::BatchCompletion(b) => &b.run_id,
             LocalInputs::FetchedPageCompletion { paginator, .. } => &paginator.run_id,
             LocalInputs::LocalResolution(lr) => &lr.run_id,
             LocalInputs::PostActivation(pa) => &pa.run_id,
+            LocalInputs::PostActivationBatch(reports) => &reports.first()?.run_id,
             LocalInputs::RequestEviction(re) => &re.run_id,
             LocalInputs::HeartbeatTimeout(run_id)
             | LocalInputs::LocalActivityCancelProcessed(run_id) => run_id,

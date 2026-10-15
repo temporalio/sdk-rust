@@ -1109,6 +1109,17 @@ void temporal_core_worker_validate(struct TemporalCoreWorker *worker,
 const struct TemporalCoreByteArray *temporal_core_worker_replace_client(struct TemporalCoreWorker *worker,
                                                                         struct TemporalCoreConnection *new_connection);
 
+/**
+ * Success contains a protobuf-encoded `coresdk.workflow_activation.WorkflowActivationBatch`.
+ *
+ * Process a batch's activations sequentially according to their individual metadata and
+ * execution boundaries. Each activation may produce commands. Do not assume a fixed
+ * batch size. Each batch must receive one `WorkflowActivationBatchCompletion` response.
+ *
+ * There may be at most one batch outstanding per workflow run. Do not
+ * poll workflows concurrently; work for different runs may be processed concurrently. Continue
+ * polling and completing outstanding batches during shutdown until the callback reports shutdown.
+ */
 void temporal_core_worker_poll_workflow_activation(struct TemporalCoreWorker *worker,
                                                    void *user_data,
                                                    TemporalCoreWorkerPollCallback callback);
@@ -1122,7 +1133,12 @@ void temporal_core_worker_poll_nexus_task(struct TemporalCoreWorker *worker,
                                           TemporalCoreWorkerPollCallback callback);
 
 /**
- * Accepts a protobuf-encoded `coresdk.workflow_completion.WorkflowActivationCompletion`.
+ * Accepts a protobuf-encoded `coresdk.workflow_completion.WorkflowActivationBatchCompletion`.
+ *
+ * Return indexed results for the executed contiguous prefix, retaining each activation's
+ * commands and metadata. Stop on failure or commands requiring a Core response, as specified
+ * by the batch protobuf contract, and leave the remaining suffix unexecuted.
+ * Submit completions for different workflow runs concurrently; completion may wait for history.
  *
  * Child workflow versioning overrides are carried in
  * `coresdk.workflow_commands.StartChildWorkflowExecution.versioning_override`, so language SDKs

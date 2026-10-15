@@ -586,6 +586,23 @@ impl WorkflowMachines {
             .can_take_next_wft_sequence(self.current_started_event_id)
     }
 
+    pub(crate) fn preview_activation_batch(
+        &self,
+        first: &WorkflowActivation,
+    ) -> Vec<WorkflowActivation> {
+        if self.outstanding_local_activity_count() != 0
+            || self.has_pending_jobs()
+            || !self.protocol_msgs.is_empty()
+            || !self.commands.is_empty()
+            || !self.current_wf_task_commands.is_empty()
+            || !self.message_outbox.is_empty()
+        {
+            return vec![];
+        }
+        self.last_history_from_server
+            .preview_activation_batch(first, 255)
+    }
+
     /// Apply the next (unapplied) entire workflow task from history to these machines. Will replay
     /// any events that need to be replayed until caught up to the newest WFT.
     pub(crate) fn apply_next_wft_from_history(&mut self) -> Result<usize> {

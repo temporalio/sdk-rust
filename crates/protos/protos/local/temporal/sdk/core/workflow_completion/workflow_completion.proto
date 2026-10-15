@@ -9,6 +9,24 @@ import "temporal/api/enums/v1/workflow.proto";
 import "temporal/sdk/core/common/common.proto";
 import "temporal/sdk/core/workflow_commands/workflow_commands.proto";
 
+// Response to an outstanding WorkflowActivationBatch. Results form a nonempty contiguous
+// prefix in activation order. Return every activation's status and metadata, including successes
+// with no commands. Commands from every completed activation are applied at their original
+// boundary using the normal replay validation; they need not have corresponding history events.
+// Stop on failure, or after commands other than StartTimer/CancelTimer because those may create
+// additional Core jobs before the next supplied activation. Leave the suffix unexecuted; Core
+// will send fresh work. There is no fixed batch size or transaction across workflow activations.
+message WorkflowActivationBatchCompletion {
+    string run_id = 1;
+    repeated IndexedWorkflowActivationCompletion completions = 2;
+}
+
+message IndexedWorkflowActivationCompletion {
+    // Zero-based index in the supplied activation batch. Indices must be 0, 1, ... with no gaps.
+    uint32 activation_index = 1;
+    WorkflowActivationCompletion completion = 2;
+}
+
 // Result of a single workflow activation, reported from lang to core
 message WorkflowActivationCompletion {
     // The run id from the workflow activation you are completing

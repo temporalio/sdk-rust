@@ -38,7 +38,10 @@ use temporalio_sdk::{
 };
 use temporalio_sdk_core::{
     replay::{DEFAULT_WORKFLOW_TYPE, TestHistoryBuilder, canned_histories},
-    test_help::{MockPollCfg, ResponseType, mock_worker, mock_worker_client, single_hist_mock_sg},
+    test_help::{
+        MockPollCfg, ResponseType, WorkerTestHelpers as _, mock_worker, mock_worker_client,
+        single_hist_mock_sg,
+    },
 };
 use tokio::{
     join,

@@ -72,12 +72,13 @@ use temporalio_common::{
         coresdk::{
             common::ExternalStorageMetrics,
             workflow_activation::{
-                QueryWorkflow, WorkflowActivation, WorkflowActivationJob,
+                QueryWorkflow, WorkflowActivation, WorkflowActivationBatch, WorkflowActivationJob,
                 remove_from_cache::EvictionReason, workflow_activation_job,
             },
             workflow_commands::*,
             workflow_completion::{
-                self, Failure, WorkflowActivationCompletion, workflow_activation_completion,
+                self, Failure, WorkflowActivationBatchCompletion, WorkflowActivationCompletion,
+                workflow_activation_completion,
             },
         },
         temporal::api::{
@@ -144,6 +145,8 @@ pub(crate) struct Workflows {
     wft_semaphore: MeteredPermitDealer<WorkflowSlotKind>,
     local_act_mgr: Option<Arc<LocalActivityManager>>,
     ever_polled: AtomicBool,
+    pending_activation_batch:
+        tokio::sync::Mutex<Option<oneshot::Receiver<WorkflowActivationBatch>>>,
     default_versioning_behavior: Option<VersioningBehavior>,
     namespace_capabilities: Arc<NamespaceCapabilities>,
     shutdown_token: CancellationToken,
@@ -290,10 +293,35 @@ impl Workflows {
             wft_semaphore,
             local_act_mgr,
             ever_polled: AtomicBool::new(false),
+            pending_activation_batch: Default::default(),
             default_versioning_behavior,
             namespace_capabilities,
             shutdown_token,
         }
+    }
+
+    pub(super) async fn next_workflow_activation_batch(
+        &self,
+    ) -> Result<WorkflowActivationBatch, PollError> {
+        let mut pending = self.pending_activation_batch.lock().await;
+        if pending.is_none() {
+            let activation = self.next_workflow_activation().await?;
+            let (response_tx, response_rx) = oneshot::channel();
+            self.send_local(PrepareActivationBatchMsg {
+                activation,
+                response_tx,
+            });
+            // Keep ownership outside the poll future so cancellation cannot lose activations
+            // already removed from the stream while Core prepares the batch.
+            *pending = Some(response_rx);
+        }
+        let result = pending
+            .as_mut()
+            .unwrap()
+            .await
+            .map_err(|_| PollError::ShutDown);
+        *pending = None;
+        result
     }
 
     pub(super) async fn next_workflow_activation(&self) -> Result<WorkflowActivation, PollError> {
@@ -623,6 +651,33 @@ impl Workflows {
             );
         }
 
+        self.finish_completion(
+            ActivationCompletionContext {
+                run_id,
+                is_empty_completion,
+                is_autocomplete,
+                task_storage_metrics,
+                replaying: None,
+            },
+            rx,
+            post_activate_hook,
+        )
+        .await
+    }
+
+    async fn finish_completion(
+        &self,
+        context: ActivationCompletionContext,
+        rx: oneshot::Receiver<ActivationCompleteResult>,
+        post_activate_hook: Option<impl Fn(PostActivateHookData)>,
+    ) -> Result<(), CompleteWfError> {
+        let ActivationCompletionContext {
+            run_id,
+            is_empty_completion,
+            is_autocomplete,
+            task_storage_metrics,
+            replaying,
+        } = context;
         let completion_outcome = if let Ok(c) = rx.await {
             c
         } else if is_empty_completion {
@@ -639,7 +694,7 @@ impl Workflows {
             );
             return Ok(());
         };
-        let replaying = completion_outcome.replaying;
+        let replaying = replaying.unwrap_or(completion_outcome.replaying);
 
         let mut wft_from_complete = None;
         let wft_report_status = self
@@ -678,6 +733,101 @@ impl Workflows {
         });
 
         Ok(())
+    }
+
+    pub(super) async fn activation_batch_completed(
+        &self,
+        completion: WorkflowActivationBatchCompletion,
+        post_activate_hook: Option<impl Fn(PostActivateHookData)>,
+    ) -> Result<(), CompleteWfError> {
+        let run_id = completion.run_id;
+        if completion.completions.is_empty() {
+            return Err(CompleteWfError::MalformedWorkflowCompletion {
+                run_id,
+                reason: "A batch completion must contain at least one result".to_owned(),
+            });
+        }
+        let mut metrics = vec![];
+        let mut validated = vec![];
+        let is_empty_completion = completion
+            .completions
+            .last()
+            .and_then(|c| c.completion.as_ref())
+            .is_some_and(WorkflowActivationCompletion::is_empty);
+        for (index, indexed) in completion.completions.into_iter().enumerate() {
+            if indexed.activation_index as usize != index {
+                return Err(CompleteWfError::MalformedWorkflowCompletion {
+                    run_id,
+                    reason: "Activation completion indices must form a contiguous prefix"
+                        .to_owned(),
+                });
+            }
+            let completion =
+                indexed
+                    .completion
+                    .ok_or_else(|| CompleteWfError::MalformedWorkflowCompletion {
+                        run_id: run_id.clone(),
+                        reason: "An indexed completion must contain a result".to_owned(),
+                    })?;
+            if completion.run_id != run_id {
+                return Err(CompleteWfError::MalformedWorkflowCompletion {
+                    run_id,
+                    reason: "Activation completion run ID does not match the batch run ID"
+                        .to_owned(),
+                });
+            }
+            metrics.push(TaskStorageMetrics::from_completion(&completion));
+            validated.push(validate_completion(completion, false)?);
+        }
+        let (response_tx, response_rx) = oneshot::channel();
+        let (validation_tx, validation_rx) = oneshot::channel();
+        self.send_local(BatchCompleteMsg {
+            run_id: run_id.clone(),
+            completions: validated,
+            response_tx,
+            validation_tx,
+        });
+        let (replaying, applied_count) =
+            validation_rx
+                .await
+                .map_err(|_| CompleteWfError::MalformedWorkflowCompletion {
+                    run_id: run_id.clone(),
+                    reason: "Workflow processing shut down before accepting the batch completion"
+                        .to_owned(),
+                })??;
+        metrics.truncate(applied_count);
+        let task_storage_metrics = metrics.pop().unwrap();
+        let mut posts = Vec::with_capacity(metrics.len());
+        for task_storage_metrics in metrics {
+            if let Some(hook) = &post_activate_hook {
+                hook(PostActivateHookData {
+                    run_id: &run_id,
+                    replaying: true,
+                });
+            }
+            posts.push(PostActivationMsg {
+                run_id: run_id.clone(),
+                wft_report_status: WFTReportStatus::NotReported,
+                wft_from_complete: None,
+                is_autocomplete: true,
+                task_storage_metrics,
+            });
+        }
+        if !posts.is_empty() {
+            self.send_local(LocalInputs::PostActivationBatch(posts));
+        }
+        self.finish_completion(
+            ActivationCompletionContext {
+                run_id,
+                is_empty_completion,
+                is_autocomplete: false,
+                task_storage_metrics,
+                replaying: Some(replaying),
+            },
+            response_rx,
+            post_activate_hook,
+        )
+        .await
     }
 
     /// Tell workflow that a local activity has finished with the provided result
@@ -1235,6 +1385,28 @@ fn detect_terminal_command(
 pub(crate) struct WorkflowStateInfo {
     pub(crate) cached_workflows: usize,
     pub(crate) outstanding_wft: usize,
+}
+
+struct ActivationCompletionContext {
+    run_id: String,
+    is_empty_completion: bool,
+    is_autocomplete: bool,
+    task_storage_metrics: TaskStorageMetrics,
+    replaying: Option<bool>,
+}
+
+#[derive(Debug)]
+struct PrepareActivationBatchMsg {
+    activation: WorkflowActivation,
+    response_tx: oneshot::Sender<WorkflowActivationBatch>,
+}
+
+#[derive(Debug)]
+struct BatchCompleteMsg {
+    run_id: String,
+    completions: Vec<ValidatedCompletion>,
+    response_tx: oneshot::Sender<ActivationCompleteResult>,
+    validation_tx: oneshot::Sender<Result<(bool, usize), CompleteWfError>>,
 }
 
 #[derive(Debug)]
@@ -1995,11 +2167,42 @@ fn make_payloads_too_large_failure(violation: &PayloadLimitViolation) -> Failure
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{
+        test_help::{MockWorkerInputs, MocksHolder, mock_worker},
+        worker::client::mocks::mock_worker_client,
+    };
     use itertools::Itertools;
     use temporalio_common::{
         payload_limits::{LimitClass, LimitSeverity},
         protos::coresdk::workflow_activation::SignalWorkflow,
     };
+
+    #[tokio::test]
+    async fn cancelled_batch_poll_keeps_prepared_work() {
+        let core = mock_worker(MocksHolder::from_mock_worker(
+            mock_worker_client(),
+            MockWorkerInputs::new(stream::pending().boxed()),
+        ));
+        let workflows = core.task_subsystems.workflows.as_ref().unwrap();
+        let (tx, rx) = oneshot::channel();
+        *workflows.pending_activation_batch.lock().await = Some(rx);
+        let mut poll = Box::pin(core.poll_workflow_activation_batch());
+        assert!(futures_util::poll!(poll.as_mut()).is_pending());
+        drop(poll);
+        tx.send(WorkflowActivationBatch {
+            run_id: "retained".to_owned(),
+            activations: vec![WorkflowActivation {
+                run_id: "retained".to_owned(),
+                ..Default::default()
+            }],
+        })
+        .unwrap();
+        let batch = core.poll_workflow_activation_batch().await.unwrap();
+        assert_eq!(batch.run_id, "retained");
+        assert!(workflows.pending_activation_batch.lock().await.is_none());
+        core.shutdown().await;
+        core.finalize_shutdown().await;
+    }
 
     #[test]
     fn task_storage_metrics_from_completion_keeps_directions_distinct() {

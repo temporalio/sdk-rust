@@ -17,11 +17,15 @@ use std::{
     pin::Pin,
     sync::{Arc, LazyLock},
     task::{Context, Poll},
+    time::SystemTime,
 };
-use temporalio_common::protos::temporal::api::{
-    enums::v1::EventType,
-    history::v1::{
-        History, HistoryEvent, WorkflowTaskCompletedEventAttributes, history_event::Attributes,
+use temporalio_common::protos::{
+    coresdk::workflow_activation::{SignalWorkflow, WorkflowActivation, workflow_activation_job},
+    temporal::api::{
+        enums::v1::EventType,
+        history::v1::{
+            History, HistoryEvent, WorkflowTaskCompletedEventAttributes, history_event::Attributes,
+        },
     },
 };
 use tracing::Instrument;
@@ -69,6 +73,110 @@ impl Debug for HistoryUpdate {
 }
 
 impl HistoryUpdate {
+    pub(crate) fn preview_activation_batch(
+        &self,
+        first: &WorkflowActivation,
+        limit: usize,
+    ) -> Vec<WorkflowActivation> {
+        // Signal-only tasks have no inputs that depend on commands returned by an earlier task.
+        // Keep the authoritative machines at the first boundary until lang returns its results.
+        if !self.chunking_disabled || !first.is_replaying || !self.has_last_wft {
+            return vec![];
+        }
+        let mut rest = self.events.as_slice();
+        let mut from_id = i64::from(first.history_length);
+        let mut previous = first.clone();
+        let mut activations = vec![];
+        while activations.len() < limit {
+            let start = rest.partition_point(|e| e.event_id <= from_id);
+            rest = &rest[start..];
+            let NextWFTSeqEndIndex::Complete(end) =
+                find_end_index_of_next_wft_seq(rest, from_id, self.has_last_wft, true)
+            else {
+                break;
+            };
+            let events = &rest[..=end];
+            let Some(started) = events.last() else { break };
+            let Some(Attributes::WorkflowTaskStartedEventAttributes(attrs)) = &started.attributes
+            else {
+                break;
+            };
+            // A completed successor is replay work. Stop before live tasks or metadata changes;
+            // the normal machine path will produce their complete activation metadata.
+            let Some(Attributes::WorkflowTaskCompletedEventAttributes(completed)) =
+                rest.get(end + 1).and_then(|e| e.attributes.as_ref())
+            else {
+                break;
+            };
+            #[allow(deprecated)]
+            if completed
+                .sdk_metadata
+                .as_ref()
+                .is_some_and(|m| m != &Default::default())
+                || completed
+                    .worker_version
+                    .as_ref()
+                    .is_some_and(|v| v != &Default::default())
+                || !completed.worker_deployment_name.is_empty()
+                || !completed.worker_deployment_version.is_empty()
+                || completed.deployment_version.is_some()
+            {
+                break;
+            }
+            let mut jobs = vec![];
+            let mut safe = matches!(
+                events.first().and_then(|e| e.attributes.as_ref()),
+                Some(Attributes::WorkflowTaskCompletedEventAttributes(_))
+            );
+            for event in events {
+                match &event.attributes {
+                    Some(Attributes::WorkflowExecutionSignaledEventAttributes(signal)) => jobs
+                        .push(
+                            workflow_activation_job::Variant::SignalWorkflow(SignalWorkflow::from(
+                                (signal.clone(), event.event_id),
+                            ))
+                            .into(),
+                        ),
+                    Some(
+                        Attributes::WorkflowTaskCompletedEventAttributes(_)
+                        | Attributes::WorkflowTaskScheduledEventAttributes(_)
+                        | Attributes::WorkflowTaskStartedEventAttributes(_),
+                    ) => {}
+                    _ => {
+                        safe = false;
+                        break;
+                    }
+                }
+            }
+            let Some(timestamp) = started.event_time else {
+                break;
+            };
+            if !safe || SystemTime::try_from(timestamp).is_err() {
+                break;
+            }
+            let timestamp = match previous.timestamp {
+                Some(old) if (old.seconds, old.nanos) > (timestamp.seconds, timestamp.nanos) => old,
+                _ => timestamp,
+            };
+            let next = WorkflowActivation {
+                timestamp: Some(timestamp),
+                history_length: started.event_id as u32,
+                history_size_bytes: u64::try_from(attrs.history_size_bytes).unwrap_or_default(),
+                continue_as_new_suggested: attrs.suggest_continue_as_new,
+                suggest_continue_as_new_reasons: attrs.suggest_continue_as_new_reasons.clone(),
+                target_worker_deployment_version_changed: attrs
+                    .target_worker_deployment_version_changed,
+                jobs,
+                ..previous
+            };
+            from_id = started.event_id;
+            previous = next.clone();
+            activations.push(next);
+            rest = &rest[end + 1..];
+        }
+        activations
+    }
+
     pub(crate) fn get_events(&self) -> &[HistoryEvent] {
         &self.events
     }

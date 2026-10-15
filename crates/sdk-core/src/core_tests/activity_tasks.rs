@@ -4,9 +4,10 @@ use crate::{
     replay::{TestHistoryBuilder, canned_histories},
     test_help::{
         FakeWfResponses, MockPollCfg, MockWorkerInputs, MocksHolder, QueueResponse, WorkerExt,
-        WorkflowCachingPolicy, build_fake_worker, build_mock_pollers, build_multihist_mock_sg,
-        fanout_tasks, gen_assert_and_reply, mock_manual_poller, mock_poller, mock_worker,
-        poll_and_reply, single_hist_mock_sg, start_timer_cmd, test_worker_cfg,
+        WorkerTestHelpers as _, WorkflowCachingPolicy, build_fake_worker, build_mock_pollers,
+        build_multihist_mock_sg, fanout_tasks, gen_assert_and_reply, mock_manual_poller,
+        mock_poller, mock_worker, poll_and_reply, single_hist_mock_sg, start_timer_cmd,
+        test_worker_cfg,
     },
     worker::{
         PollerBehavior, WorkerVersioningStrategy,
