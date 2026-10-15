@@ -563,10 +563,14 @@ impl WFStream {
     /// Makes sure we have enough pending evictions to fulfill the needs of buffered WFTs who are
     /// waiting on a cache slot
     fn reconcile_buffered(&mut self) -> Vec<ActivationOrAuto> {
+        let num_in_buff = self.buffered_polls_need_cache_slot.len();
+        if num_in_buff == 0 {
+            return vec![];
+        }
+
         // We must ensure that there are at least as many pending evictions as there are tasks
         // that we might need to un-buffer (skipping runs which already have buffered tasks for
         // themselves)
-        let num_in_buff = self.buffered_polls_need_cache_slot.len();
         let mut evict_these = vec![];
         let num_existing_evictions = self
             .runs

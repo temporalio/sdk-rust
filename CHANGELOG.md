@@ -51,6 +51,8 @@ relevant information.
 
 
 ### Fixed
+* Avoid scanning the workflow cache when no workflow tasks are waiting for a cache slot, reducing
+  workflow processing CPU overhead with large caches.
 * `temporal.api.sdk.v1` messages are capable of serialization to proto JSON, so their JSON field
   names are camel case rather than snake case and the binary encoding is unchanged. They previously
   could not be deserialized from the camel case that other Temporal SDKs and protobuf tools emit,
