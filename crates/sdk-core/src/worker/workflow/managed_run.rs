@@ -2014,7 +2014,9 @@ mod tests {
         use crate::{
             replay::{DEFAULT_WORKFLOW_TYPE, TestHistoryBuilder},
             telemetry::metrics::MetricsContext,
-            test_help::{schedule_activity_cmd, schedule_local_activity_cmd, test_worker_cfg},
+            test_help::{
+                PollWFTRespExt, schedule_activity_cmd, schedule_local_activity_cmd, test_worker_cfg,
+            },
             worker::{
                 LocalActRequest, LocalActivityExecutionResult, LocalActivityResolution,
                 workflow::{
@@ -2035,7 +2037,7 @@ mod tests {
                 },
                 workflow_commands::{
                     ActivityCancellationType, RequestCancelActivity, RequestCancelLocalActivity,
-                    workflow_command,
+                    UpdateResponse, update_response, workflow_command,
                 },
             },
             temporal::api::{
@@ -2156,6 +2158,89 @@ mod tests {
                 sdk_name: "test",
                 sdk_version: "test",
             })
+        }
+
+        #[rstest]
+        fn rejected_update_with_deferred_la_result(#[values(false, true)] before_task: bool) {
+            let mut history = TestHistoryBuilder::default();
+            history.add_by_type(EventType::WorkflowExecutionStarted);
+            history.add_workflow_task_scheduled_and_started();
+            let mut live = manager(&history);
+            live.get_next_activation().unwrap();
+            let workflow_command::Variant::ScheduleLocalActivity(command) =
+                schedule_local_activity_cmd(
+                    1,
+                    "local",
+                    ActivityCancellationType::TryCancel,
+                    Duration::from_secs(10),
+                )
+            else {
+                unreachable!()
+            };
+            live.push_commands_and_iterate(vec![WFCommand::new(
+                WFCommandVariant::AddLocalActivity(command),
+            )])
+            .unwrap();
+            live.drain_queued_local_activities();
+            live.wft_completion_reported();
+            let mut result = Some(LocalResolution::LocalActivity(LocalActivityResolution {
+                seq: 1,
+                result: LocalActivityExecutionResult::Completed(Success {
+                    result: Some("done".as_json_payload().unwrap()),
+                }),
+                runtime: Duration::ZERO,
+                attempt: 1,
+                backoff: None,
+                original_schedule_time: None,
+            }));
+            if before_task {
+                live.notify_of_local_result(result.take().unwrap()).unwrap();
+            }
+            history.add_workflow_task_completed();
+            history.add_workflow_task_scheduled_and_started();
+            let mut task = history
+                .get_full_history_info()
+                .unwrap()
+                .as_poll_wft_response();
+            task.add_update_request("update", task.started_event_id - 1);
+            let activation = live
+                .new_work_from_server(
+                    history.get_full_history_info().unwrap().into(),
+                    task.messages
+                        .into_iter()
+                        .map(|message| message.try_into().unwrap())
+                        .collect(),
+                    false,
+                )
+                .unwrap();
+            assert!(activation.jobs.iter().any(|job| {
+                matches!(&job.variant, Some(Variant::DoUpdate(update)) if update.run_validator)
+            }));
+            let mut commands = vec![WFCommand::new(WFCommandVariant::UpdateResponse(
+                UpdateResponse {
+                    protocol_instance_id: "update".to_owned(),
+                    response: Some(update_response::Response::Rejected(Default::default())),
+                },
+            ))];
+            if before_task {
+                assert!(activation.jobs.iter().any(|job| {
+                    matches!(&job.variant, Some(Variant::ResolveActivity(result)) if result.is_local)
+                }));
+            } else {
+                assert_eq!(activation.jobs.len(), 1);
+                live.notify_of_local_result(result.take().unwrap()).unwrap();
+                live.push_commands_and_iterate(commands).unwrap();
+                let activation = live.get_next_activation().unwrap();
+                assert_matches!(
+                    activation.jobs[0].variant,
+                    Some(Variant::ResolveActivity(_))
+                );
+                commands = vec![];
+            }
+            commands.push(WFCommand::new(WFCommandVariant::CompleteWorkflow(
+                Default::default(),
+            )));
+            live.push_commands_and_iterate(commands).unwrap();
         }
 
         #[rstest]
