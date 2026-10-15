@@ -1812,6 +1812,21 @@ fn build_start_workflow_request(
 ) -> StartWorkflowExecutionRequest {
     let user_metadata = options.user_metadata();
     let request_eager_execution = options.enable_eager_workflow_start;
+    let on_conflict_options = (options.id_conflict_policy == WorkflowIdConflictPolicy::UseExisting
+        && (!options.completion_callbacks.is_empty() || !options.links.is_empty()))
+    .then_some(
+        temporalio_common::protos::temporal::api::workflow::v1::OnConflictOptions {
+            attach_request_id: true,
+            attach_completion_callbacks: !options.completion_callbacks.is_empty(),
+            attach_links: !options.links.is_empty(),
+        },
+    );
+    #[cfg(feature = "experimental")]
+    let request_id = options
+        .request_id
+        .unwrap_or_else(|| Uuid::new_v4().to_string());
+    #[cfg(not(feature = "experimental"))]
+    let request_id = Uuid::new_v4().to_string();
     StartWorkflowExecutionRequest {
         namespace: client.namespace(),
         input,
@@ -1825,7 +1840,7 @@ fn build_start_workflow_request(
             normal_name: String::new(),
         }),
         identity: client.identity(),
-        request_id: Uuid::new_v4().to_string(),
+        request_id,
         workflow_id_reuse_policy: ProtoWorkflowIdReusePolicy::from(options.id_reuse_policy) as i32,
         workflow_id_conflict_policy: ProtoWorkflowIdConflictPolicy::from(options.id_conflict_policy)
             as i32,
@@ -1846,6 +1861,7 @@ fn build_start_workflow_request(
         retry_policy: options.retry_policy.map(Into::into),
         links: options.links,
         completion_callbacks: options.completion_callbacks,
+        on_conflict_options,
         priority: Some(options.priority.into()),
         versioning_override: options.versioning_override.map(Into::into),
         memo,
@@ -1909,14 +1925,16 @@ where
                         )
                         .into_request();
                         rpc_options.apply_to(&mut request);
-                        let run_id = client
+                        let response = client
                             .start_workflow_execution(request)
                             .await
                             .map_err(WorkflowStartError::from_status)?
-                            .into_inner()
-                            .run_id;
+                            .into_inner();
 
-                        Ok(StartWorkflowOutput::new(workflow_id, run_id))
+                        let mut output = StartWorkflowOutput::new(workflow_id, response.run_id);
+                        output.first_execution_run_id = (!response.first_execution_run_id.is_empty())
+                            .then_some(response.first_execution_run_id);
+                        Ok(output)
                     })
                 }
             }),
@@ -1925,6 +1943,7 @@ where
         let StartWorkflowOutput {
             workflow_id,
             run_id,
+            first_execution_run_id,
         } = interceptor_output;
 
         Ok(WorkflowHandle::new(
@@ -1933,7 +1952,7 @@ where
                 namespace,
                 workflow_id,
                 run_id: Some(run_id.clone()),
-                first_execution_run_id: Some(run_id),
+                first_execution_run_id: first_execution_run_id.or(Some(run_id)),
             },
         ))
     }
@@ -2056,6 +2075,7 @@ where
         let StartWorkflowOutput {
             workflow_id,
             run_id,
+            first_execution_run_id,
         } = interceptor_output;
 
         Ok(WorkflowHandle::new(
@@ -2064,7 +2084,7 @@ where
                 namespace,
                 workflow_id,
                 run_id: Some(run_id.clone()),
-                first_execution_run_id: Some(run_id),
+                first_execution_run_id: first_execution_run_id.or(Some(run_id)),
             },
         ))
     }

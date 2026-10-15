@@ -371,8 +371,57 @@ Nexus request headers can be set by workflow interceptors, not by the typed call
 Calls use the workflow's payload and failure converters, with payload codecs applied at the worker
 boundary. Service and operation wire names are recorded in history, so changing them in existing
 workflow code requires the same replay-safe versioning as other command changes.
-The endpoint must already exist in the server's endpoint registry. Hosting Nexus handlers is not
-included yet.
+The endpoint must already exist in the server's endpoint registry.
+
+#### Serving a Nexus service
+
+Register a handler to serve Nexus tasks on a worker. Handler method names refer to the typed
+operation markers on the service, including any wire-name overrides in its definition.
+
+```rust
+use temporalio_client::WorkflowStartOptions;
+use temporalio_sdk::nexus::{
+    TemporalNexusClient, TemporalOperationError, TemporalOperationResult,
+    temporal_nexus_service_handler,
+};
+
+struct PaymentHandlers;
+
+#[temporal_nexus_service_handler(service = PaymentService)]
+impl PaymentHandlers {
+    #[temporal_operation]
+    async fn charge(
+        &self,
+        client: TemporalNexusClient,
+        input: String,
+    ) -> Result<TemporalOperationResult<String>, TemporalOperationError> {
+        client
+            .start_workflow(
+                ChargeWorkflow::run,
+                input,
+                WorkflowStartOptions::new(
+                    "payments",
+                    format!("charge-{}", context.request_id()),
+                )
+                .build(),
+            )
+            .await
+    }
+}
+
+let options = WorkerOptions::new("payments")
+    .register_nexus_service(PaymentHandlers)?
+    .register_workflow::<ChargeWorkflow>()?
+    .build();
+```
+
+The macro binds `context` from the request-scoped client. Handlers can instead take an explicit
+`TemporalOperationStartContext` parameter between the client and input. Return
+`TemporalOperationResult::Sync(output)` for a synchronous result, or use `start_workflow` to attach
+the Nexus completion callback to a typed workflow. Supplied workflow options, including the task
+queue, are passed through unchanged; the helper uses the Nexus request ID for start idempotency.
+Workflow-backed operation tokens identify a workflow by namespace and workflow ID, so use a unique
+workflow ID for each independent operation. Nexus polling is enabled only when services are registered.
 
 ## Activities in detail
 

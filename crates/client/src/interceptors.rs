@@ -295,6 +295,8 @@ pub struct StartWorkflowOutput {
     pub workflow_id: String,
     /// The run ID returned by the service or a short-circuiting interceptor.
     pub run_id: String,
+    /// First run in the execution chain, when supplied by the service.
+    pub first_execution_run_id: Option<String>,
 }
 
 impl StartWorkflowOutput {
@@ -302,6 +304,7 @@ impl StartWorkflowOutput {
         Self {
             workflow_id: workflow_id.into(),
             run_id: run_id.into(),
+            first_execution_run_id: None,
         }
     }
 }

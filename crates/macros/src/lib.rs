@@ -6,7 +6,37 @@ mod activities_definitions;
 mod cloud_test_exclusion;
 mod fsm_impl;
 mod macro_utils;
+mod nexus_handlers;
 mod workflow_definitions;
+
+/// Implements typed Nexus service registration for an inherent handler impl.
+///
+/// Requires `service = ServiceMarker` and at least one `#[temporal_operation]` async method.
+/// Methods take `&self`, a request-scoped `TemporalNexusClient`, and an input. An optional
+/// `TemporalOperationStartContext` can appear between the client and input; otherwise a local
+/// `context` is bound from the client for use in the method body.
+#[proc_macro_attribute]
+pub fn temporal_nexus_service_handler(attr: TokenStream, item: TokenStream) -> TokenStream {
+    match nexus_handlers::expand(attr.into(), item.into()) {
+        Ok(output) => output.into(),
+        Err(error) => error.into_compile_error().into(),
+    }
+}
+
+/// Marks an async operation method inside a Nexus service handler impl.
+///
+/// This attribute takes no arguments and must be used inside `#[temporal_nexus_service_handler]`.
+#[proc_macro_attribute]
+pub fn temporal_operation(attr: TokenStream, _item: TokenStream) -> TokenStream {
+    let message = if attr.is_empty() {
+        "#[temporal_operation] must be used inside #[temporal_nexus_service_handler]"
+    } else {
+        "#[temporal_operation] does not accept arguments"
+    };
+    syn::Error::new(proc_macro2::Span::call_site(), message)
+        .into_compile_error()
+        .into()
+}
 
 /// Can be used to define Activities for invocation and execution. Using this macro requires that
 /// you also depend on the `temporalio_sdk` crate.
