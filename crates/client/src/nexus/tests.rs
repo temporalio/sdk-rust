@@ -139,7 +139,7 @@ async fn request_codec_and_run_pinned_result() {
                         ("endpoint", "Payments", "charge")
                     );
                     assert_eq!(request.operation_id, "charge-123");
-                    assert_eq!(request.request_id, "stable-request-id");
+                    assert!(!request.request_id.is_empty());
                     assert_eq!(request.input, Some(encoded.clone()));
                     assert_eq!(request.nexus_header["trace"], "span");
                     assert_eq!(request.schedule_to_close_timeout.unwrap().seconds, 60);
@@ -199,7 +199,6 @@ async fn request_codec_and_run_pinned_result() {
             Payments::charge,
             "order".into(),
             NexusOperationStartOptions::new("charge-123")
-                .request_id("stable-request-id")
                 .schedule_to_close_timeout(Duration::from_secs(60))
                 .id_conflict_policy(NexusOperationIdConflictPolicy::UseExisting)
                 .search_attributes(SearchAttributes::new([SearchAttributeKey::keyword(

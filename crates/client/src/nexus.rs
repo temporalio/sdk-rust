@@ -93,9 +93,6 @@ pub struct NexusOperationStartOptions {
     /// Caller-assigned ID, unique in the namespace subject to reuse/conflict policies.
     #[builder(start_fn)]
     pub operation_id: String,
-    /// Optional idempotency key for the start RPC. Reuse a stable ID when retrying a start
-    /// call at the application level. If omitted, a UUID is generated for each start call.
-    pub request_id: Option<String>,
     /// Maximum total execution time, including retries.
     pub schedule_to_close_timeout: Option<Duration>,
     /// Maximum time until the handler starts or synchronously completes.
@@ -217,9 +214,7 @@ impl<S: NexusService> NexusClient<S> {
         let request = StartNexusOperationExecutionRequest {
             namespace: self.client.namespace(),
             identity: self.client.identity(),
-            request_id: options
-                .request_id
-                .unwrap_or_else(|| Uuid::new_v4().to_string()),
+            request_id: Uuid::new_v4().to_string(),
             operation_id: operation_id.clone(),
             endpoint: self.endpoint.clone(),
             service: S::name().to_owned(),
