@@ -4584,13 +4584,17 @@ mod tests {
                 Vec::new(),
             );
             let scoped = base.with_event_group(EventGroup::new("outside"));
-            let _ = scoped
-                .with_implicit_inbound_event(0)
-                .timer(Duration::from_secs(1));
-            let _ = scoped
-                .with_implicit_inbound_event(-1)
-                .timer(Duration::from_secs(1));
-            let _ = scoped.timer(Duration::from_secs(1));
+            drop(
+                scoped
+                    .with_implicit_inbound_event(0)
+                    .timer(Duration::from_secs(1)),
+            );
+            drop(
+                scoped
+                    .with_implicit_inbound_event(-1)
+                    .timer(Duration::from_secs(1)),
+            );
+            drop(scoped.timer(Duration::from_secs(1)));
 
             let commands = host.commands.borrow();
             let timers: Vec<_> = commands

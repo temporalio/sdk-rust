@@ -1210,6 +1210,10 @@ impl CancelAndMetadataWf {
     fn ping(&mut self, _ctx: &mut SyncWorkflowContext<Self>) {}
 }
 
+#[temporalio_macros::cloud_test_exclusion(
+    crate::CloudTestExclusionReason::RequiresCloudProvisioning,
+    "Uses a custom search attribute that isolated Cloud CI does not provision."
+)]
 #[tokio::test]
 async fn event_groups_cancel_external_upsert_and_patch_commands() {
     let wf_name = "event_groups_cancel_and_metadata";
@@ -1837,6 +1841,10 @@ impl NexusCommandsWf {
     }
 }
 
+#[temporalio_macros::cloud_test_exclusion(
+    crate::CloudTestExclusionReason::RequiresCloudProvisioning,
+    "Creates a Nexus endpoint through the Operator Service, unavailable to isolated Cloud namespace credentials."
+)]
 #[tokio::test]
 async fn event_groups_nexus_operation_cancel() {
     let wf_name = "event_groups_nexus_commands";
