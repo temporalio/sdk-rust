@@ -15,12 +15,13 @@ categories = ["development-tools"]
 features = ["experimental"]
 
 [features]
-experimental = []
+experimental = ["dep:nexus-rpc", "temporalio-common-wasm/experimental"]
 
 [dependencies]
 anyhow = "1.0"
 bon = { workspace = true }
 derive_more = { workspace = true }
+nexus-rpc = { workspace = true, optional = true }
 futures-util = { version = "0.3", default-features = false, features = [
   "async-await-macro",
   "alloc",

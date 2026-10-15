@@ -164,6 +164,7 @@ hyper-util = { version = "0.1", features = [
   "http2",
   "tokio",
 ] }
+nexus-rpc = { workspace = true }
 opentelemetry = { workspace = true, features = ["trace"] }
 opentelemetry_sdk = { version = "0.32", features = ["testing", "trace"] }
 rstest = "0.26"

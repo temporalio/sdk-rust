@@ -37,6 +37,7 @@ prost-types = { version = "0.7", package = "prost-wkt-types" }
 pbjson = "0.9"
 pbjson-build = "0.9"
 serde_json = "1.0"
+nexus-rpc = { git = "https://github.com/nexus-rpc/sdk-rust", rev = "a6ebfedd3bb4c751d68f385521d70033a09fe5ee" }
 
 [workspace.lints.rust]
 unreachable_pub = "warn"
