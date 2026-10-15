@@ -21,9 +21,10 @@ import "temporal/sdk/core/child_workflow/child_workflow.proto";
 import "temporal/sdk/core/nexus/nexus.proto";
 import "temporal/sdk/core/common/common.proto";
 
-// Batch policies distinguish language commands that temporal.api.enums.v1.CommandType cannot
-// represent, including RespondToQuery, ScheduleLocalActivity, and CancelChildWorkflowExecution.
-// The WorkflowCommand oneof has no protobuf enum that an allowlist field can reference.
+// Core must send its allowed_continuation_commands policy to every language SDK without
+// sending command payloads. WorkflowCommand.variant is a oneof, not a protobuf enum that can
+// type an allowlist field. temporal.api.enums.v1.CommandType cannot substitute because it
+// omits RespondToQuery, ScheduleLocalActivity, and CancelChildWorkflowExecution.
 // Values match WorkflowCommand.variant field numbers and must never be reassigned, including
 // when a command is removed.
 enum WorkflowCommandKind {
