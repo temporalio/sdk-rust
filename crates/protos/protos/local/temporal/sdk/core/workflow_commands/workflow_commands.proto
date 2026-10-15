@@ -21,9 +21,11 @@ import "temporal/sdk/core/child_workflow/child_workflow.proto";
 import "temporal/sdk/core/nexus/nexus.proto";
 import "temporal/sdk/core/common/common.proto";
 
-// Batch policies need language-command identities because some commands produce no server
-// command or history event. Values match WorkflowCommand.variant field numbers and must never
-// be reassigned, including when a command is removed.
+// Batch policies distinguish language commands that temporal.api.enums.v1.CommandType cannot
+// represent, including RespondToQuery, ScheduleLocalActivity, and CancelChildWorkflowExecution.
+// The WorkflowCommand oneof has no protobuf enum that an allowlist field can reference.
+// Values match WorkflowCommand.variant field numbers and must never be reassigned, including
+// when a command is removed.
 enum WorkflowCommandKind {
     UNSPECIFIED = 0;
     START_TIMER = 1;

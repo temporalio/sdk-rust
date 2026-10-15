@@ -2,14 +2,18 @@
 
 All Core language integrations exchange `WorkflowActivationBatch` and
 `WorkflowActivationBatchCompletion`. This is an unconditional breaking interface change: there is
-no batching feature or capability negotiation. The C bridge's existing workflow poll and completion
-functions now encode and decode these batch messages. Rust integrations use
-`poll_workflow_activation_batch` and `complete_workflow_activation_batch`.
+no batching feature or capability negotiation. The C bridge retains its existing workflow poll and
+completion function names and C signatures, but their serialized protobuf payloads now use these
+batch messages. The Core crate's public single-activation methods `Worker::poll_workflow_activation`
+and `Worker::complete_workflow_activation` are removed. Rust integrations must use
+`Worker::poll_workflow_activation_batch` and `Worker::complete_workflow_activation_batch` instead.
 
-Each nonempty batch belongs to one workflow run. Different runs can execute concurrently, but a
-run has only one outstanding batch. SDKs must accept variable batch lengths, including singleton
-batches. Continue polling and completing outstanding work during shutdown until polling reports
-shutdown. Complete different runs concurrently because completions may need history pagination.
+Each nonempty batch belongs to one workflow run, identified by its `run_id`. Batches for different
+workflow runs with different workflow run IDs may execute concurrently. A workflow run has at most
+one outstanding batch, and two batches for the same workflow run must never execute concurrently.
+SDKs must accept variable batch lengths, including singleton batches. Continue polling and
+completing outstanding work during shutdown until polling reports shutdown. Complete batches for
+different workflow runs concurrently because completions may need history pagination.
 
 ## Language execution and results
 
@@ -20,10 +24,11 @@ execution. Preserve activation timeouts and deadlock detection separately for ea
 Queries and cache removal retain their existing semantics and isolation.
 
 Return one batch completion containing a nonempty contiguous prefix of
-`IndexedWorkflowActivationCompletion` results. The zero-based `activation_index` identifies the
-activation that produced each result. Include its complete success or failure and metadata even
-when it produced no commands. Preserve commands on every result rather than combining commands
-from different activations. Core applies them in order through its existing replay machinery.
+`IndexedWorkflowActivationCompletion` results. Each `activation_index` is the zero-based position
+of the activation that produced that result in the supplied `WorkflowActivationBatch.activations`
+list. Include its complete success or failure and metadata even when it produced no commands.
+Preserve commands on every result rather than combining commands from different activations.
+Core applies them in order through its existing replay machinery.
 Commands that leave no history events, such as starting and cancelling a timer in one activation,
 remain valid.
 
