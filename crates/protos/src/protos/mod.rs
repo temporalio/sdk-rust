@@ -102,6 +102,15 @@ pub mod coresdk {
         }
 
         impl WorkflowActivationCompletion {
+            /// Whether another activation can execute without receiving additional Core jobs.
+            /// Other commands conservatively end the completed prefix, even when Core may elide
+            /// them during replay, because their resolutions can change the next activation.
+            pub fn can_continue_batch(&self) -> bool {
+                matches!(&self.status, Some(workflow_activation_completion::Status::Successful(success))
+                    if success.commands.iter().all(|command| matches!(&command.variant,
+                        Some(Variant::StartTimer(_) | Variant::CancelTimer(_)))))
+            }
+
             /// Create a successful activation with no commands in it
             pub fn empty(run_id: impl Into<String>) -> Self {
                 let success = workflow_completion::Success::from_variants(vec![]);

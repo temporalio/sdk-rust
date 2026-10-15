@@ -1,3 +1,5 @@
+use crate::test_help::WorkerTestHelpers as _;
+mod activation_batches;
 mod activity_tasks;
 mod event_groups;
 mod local_activity_workflow_task;

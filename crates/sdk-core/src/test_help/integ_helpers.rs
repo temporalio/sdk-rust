@@ -45,7 +45,9 @@ pub use temporalio_common::telemetry::metrics::TemporalMeter;
 use temporalio_common::{
     protos::{
         coresdk::{
-            workflow_activation::{WorkflowActivationJob, workflow_activation_job},
+            workflow_activation::{
+                WorkflowActivation, WorkflowActivationJob, workflow_activation_job,
+            },
             workflow_commands::{CompleteWorkflowExecution, StartTimer},
             workflow_completion::WorkflowActivationCompletion,
         },
@@ -1017,6 +1019,13 @@ impl WorkerExt for Worker {
 pub trait WorkerTestHelpers {
     /// Drain workflow activations during shutdown, completing pending evictions.
     async fn drain_workflow_poller(&self);
+    /// Drive one activation when a fixture must control each Core boundary directly.
+    async fn poll_workflow_activation(&self) -> Result<WorkflowActivation, PollError>;
+    /// Supply a fixture result without exposing a single-activation language interface.
+    async fn complete_workflow_activation(
+        &self,
+        completion: WorkflowActivationCompletion,
+    ) -> Result<(), crate::CompleteWfError>;
     /// Complete a workflow execution
     async fn complete_execution(&self, run_id: &str);
     /// Complete a timer with the given sequence number and duration
@@ -1041,6 +1050,17 @@ impl WorkerTestHelpers for Worker {
                 o => panic!("Unexpected activation while draining: {o:?}"),
             }
         }
+    }
+
+    async fn poll_workflow_activation(&self) -> Result<WorkflowActivation, PollError> {
+        self.poll_workflow_activation_for_test().await
+    }
+
+    async fn complete_workflow_activation(
+        &self,
+        completion: WorkflowActivationCompletion,
+    ) -> Result<(), crate::CompleteWfError> {
+        self.complete_workflow_activation_for_test(completion).await
     }
 
     async fn complete_execution(&self, run_id: &str) {

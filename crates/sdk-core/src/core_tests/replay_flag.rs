@@ -1,8 +1,8 @@
 use crate::{
     replay::{TestHistoryBuilder, canned_histories},
     test_help::{
-        MockPollCfg, ResponseType, build_mock_pollers, hist_to_poll_resp, mock_worker, query_ok,
-        start_timer_cmd,
+        MockPollCfg, ResponseType, WorkerTestHelpers as _, build_mock_pollers, hist_to_poll_resp,
+        mock_worker, query_ok, start_timer_cmd,
     },
     worker::{LEGACY_QUERY_ID, client::mocks::mock_worker_client},
 };

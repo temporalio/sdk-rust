@@ -1,6 +1,8 @@
 use crate::{
     replay::{TestHistoryBuilder, canned_histories, default_act_sched},
-    test_help::{MockPollCfg, build_mock_pollers, mock_worker, start_timer_cmd},
+    test_help::{
+        MockPollCfg, WorkerTestHelpers as _, build_mock_pollers, mock_worker, start_timer_cmd,
+    },
 };
 use std::time::Duration;
 use temporalio_common::protos::{
