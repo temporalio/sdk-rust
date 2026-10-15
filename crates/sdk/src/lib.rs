@@ -99,6 +99,8 @@ pub use crate::{
 };
 pub use runtime::Runtime;
 pub use temporalio_client::Namespace;
+#[cfg(feature = "experimental")]
+pub use temporalio_workflow::nexus;
 pub use temporalio_workflow::{
     ActivityCancellationType, ActivityCloseTimeouts, ActivityOptions, BaseWorkflowContext,
     CancellableFuture, CancellableFutureWithReason, ChildWorkflowCancellationType,

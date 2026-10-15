@@ -4,6 +4,8 @@
 mod failure_converter;
 mod well_known;
 
+#[cfg(feature = "experimental")]
+pub use failure_converter::NexusOperationDecodeHint;
 pub use failure_converter::{
     ActivityExecutionDecodeHint, CancelExternalWorkflowDecodeHint,
     ChildWorkflowExecutionDecodeHint, ChildWorkflowStartDecodeHint, CommonAttributes,

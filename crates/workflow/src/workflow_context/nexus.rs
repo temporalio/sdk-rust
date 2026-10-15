@@ -1,5 +1,6 @@
 use super::*;
 use crate::{
+    nexus::{NexusService, NexusWorkflowClient, NexusWorkflowClientOptions},
     runtime::{SdkGuardedFuture, model::NexusStartResult},
     workflow_interceptors::{StartNexusOperationInput, call_start_nexus_operation},
 };
@@ -10,7 +11,7 @@ impl BaseWorkflowContext {
     pub(crate) fn start_nexus_operation(
         &self,
         opts: NexusOperationOptions,
-    ) -> impl CancellableFuture<Output = NexusStartResult> {
+    ) -> CancellableWorkflowOutboundFuture<NexusStartResult> {
         let input = StartNexusOperationInput::new(opts);
         let base_ctx = self.clone();
         let next = WorkflowNext::new(move |input: StartNexusOperationInput| {
@@ -60,6 +61,15 @@ impl BaseWorkflowContext {
 }
 
 impl<W> SyncWorkflowContext<W> {
+    /// Create a typed Nexus client for a service at the configured endpoint.
+    pub fn nexus_client<S: NexusService>(
+        &self,
+        service: S,
+        options: NexusWorkflowClientOptions,
+    ) -> NexusWorkflowClient<S> {
+        NexusWorkflowClient::new(self.base.clone(), service, options)
+    }
+
     /// Start a Nexus operation.
     pub fn start_nexus_operation(
         &self,
@@ -70,6 +80,15 @@ impl<W> SyncWorkflowContext<W> {
 }
 
 impl<W> WorkflowContext<W> {
+    /// Create a typed Nexus client for a service at the configured endpoint.
+    pub fn nexus_client<S: NexusService>(
+        &self,
+        service: S,
+        options: NexusWorkflowClientOptions,
+    ) -> NexusWorkflowClient<S> {
+        self.sync.nexus_client(service, options)
+    }
+
     /// Start a Nexus operation.
     pub fn start_nexus_operation(
         &self,

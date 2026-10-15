@@ -326,19 +326,53 @@ if ctx.patched("my-patch-id") {
 
 ### Nexus Operations
 
-The SDK supports starting Nexus operations from a workflow:
+Enable `experimental` to call Nexus services from workflows with typed input and output.
+Service definitions use the draft [Nexus Rust SDK](https://github.com/nexus-rpc/sdk-rust/pull/2).
+Until that SDK is published, add the same pinned dependency used by this SDK:
 
-```rust
-let started = ctx.start_nexus_operation(NexusOperationOptions {
-    endpoint: "my-endpoint".to_string(),
-    service: "my-service".to_string(),
-    operation: "my-operation".to_string(),
-    input: Some(payload),
-    ..Default::default()
-}).await?;
+```toml
+nexus-rpc = { git = "https://github.com/nexus-rpc/sdk-rust", rev = "a6ebfedd3bb4c751d68f385521d70033a09fe5ee" }
 ```
 
-Defining Nexus handlers will be added later.
+```rust
+use nexus_rpc::service;
+use temporalio_sdk::nexus::{
+    NexusWorkflowClientOptions, NexusWorkflowOperationOptions,
+};
+
+#[service(name = "payments")]
+pub trait PaymentService {
+    #[operation(name = "charge")]
+    fn charge(input: String) -> String;
+}
+
+let payments = ctx.nexus_client(
+    PaymentService,
+    NexusWorkflowClientOptions::new("payments-endpoint").build(),
+);
+
+let receipt: String = payments
+    .execute(PaymentService::charge, input, NexusWorkflowOperationOptions::default())
+    .await?;
+
+let handle = payments
+    .start(PaymentService::charge, another_input, NexusWorkflowOperationOptions::default())
+    .await?;
+handle.cancel();
+let receipt = handle.result().await?;
+```
+
+The operation marker fixes its service, input, and output types. `start` waits for the operation
+to be acknowledged; the handle exposes `operation_token()` (`None` for synchronous operations),
+`cancel()`, and a typed `result()`. Cancellation can race with completion. Options include timeouts,
+cancellation behavior, and a cancellation token; absent a token, workflow cancellation is inherited.
+Nexus request headers can be set by workflow interceptors, not by the typed call options.
+
+Calls use the workflow's payload and failure converters, with payload codecs applied at the worker
+boundary. Service and operation wire names are recorded in history, so changing them in existing
+workflow code requires the same replay-safe versioning as other command changes.
+The endpoint must already exist in the server's endpoint registry. Hosting Nexus handlers is not
+included yet.
 
 ## Activities in detail
 

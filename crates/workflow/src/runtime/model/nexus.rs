@@ -1,7 +1,16 @@
 use super::*;
-use crate::workflow_context::{NexusUnblockData, StartedNexusOperation};
+use crate::{
+    nexus::NexusOperationError,
+    workflow_context::{NexusUnblockData, StartedNexusOperation},
+};
 
 pub(crate) type NexusStartResult = Result<StartedNexusOperation, Failure>;
+
+impl From<NexusOperationError> for WorkflowTermination {
+    fn from(value: NexusOperationError) -> Self {
+        Self::Failed(value.into())
+    }
+}
 
 impl Unblockable for NexusStartResult {
     type OtherDat = NexusUnblockData;

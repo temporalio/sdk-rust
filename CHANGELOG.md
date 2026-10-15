@@ -24,6 +24,19 @@ This file contains completed Rust SDK releases only.
 ## [1.2.0] - 2026-11-09
 
 ### Added
+* Workflows can call typed Nexus service operations with `nexus_client`, `execute`, and `start`
+  when the `experimental` feature is enabled, using service definitions from the draft Nexus Rust
+  SDK. Started operations expose a typed result, operation token, and cancellation.
+* Experimental Event Groups support (requires the `experimental` feature). Event Groups
+  are workflow-level metadata that group related history events for UI and observability.
+  `EventGroup::new` takes a required ID (used verbatim; do not put secrets in it);
+  `EventGroup::with_label` sets an optional label that is stored as a codec-encoded
+  payload. Attach groups with `with_event_group` / `with_event_groups` or the
+  `event_groups` field on command options. Signal and update handlers receive implicit
+  inbound groups. This API may change without notice.
+* `original_execution_run_id()` on workflow context, the run ID recorded on the
+  `WorkflowExecutionStarted` event. Unlike `run_id()`, this value is preserved across
+  workflow resets.
 
 - `OtelCollectorOptions::histogram_aggregation` selects how the OTLP exporter aggregates histograms. `HistogramAggregation::Base2Exponential` exports every histogram, including custom ones, as an OpenTelemetry exponential histogram, which Prometheus-compatible backends store as a native histogram. Each series carries `Base2ExponentialHistogramOptions::name_suffix` (`_native` by default) so it never shares a name with the fixed-bucket series it replaces, and `histogram_bucket_overrides` is rejected in this mode. Explicit buckets remain the default.
 
