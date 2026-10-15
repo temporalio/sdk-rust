@@ -33,6 +33,25 @@ message TaskQueueMetadata {
     google.protobuf.DoubleValue max_tasks_per_second = 1;
 }
 
+// Worker-reported state about the poller pool issuing this poll, used by the server to
+// distribute poller-scaling suggestions fairly across a fleet.
+//
+// Scaling suggestions ride on dispatched tasks, and the matcher hands tasks to waiting
+// pollers in FIFO order, so a worker holding a large share of a task queue's pollers
+// receives suggestions at a proportionally higher rate. That makes poller growth
+// proportional to current poller count, which preserves and amplifies any imbalance
+// between otherwise identical workers. Reporting this lets the server withhold
+// suggestions that would push a worker further from its share.
+message PollerScalingInfo {
+    // Number of concurrent poll requests this worker is currently targeting for this task
+    // queue and task type -- the poller pool's own scaling target, not the count
+    // momentarily in flight. Fleet-wide for the pool, not per partition.
+    //
+    // 0 means unknown (for example, a worker whose poller count is fixed rather than
+    // auto-scaled); the server applies no share-based fairness to such a worker.
+    int32 poller_target = 1;
+}
+
 message TaskQueueVersioningInfo {
     // Specifies which Deployment Version should receive new workflow executions and tasks of
     // existing unversioned or AutoUpgrade workflows.

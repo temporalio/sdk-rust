@@ -168,7 +168,7 @@ impl LongPollBuffer<PollWorkflowTaskQueueResponse, WorkflowSlotKind> {
         } else {
             None
         };
-        let poll_fn = move |timeout_override: Option<Duration>| {
+        let poll_fn = move |timeout_override: Option<Duration>, poller_target: Option<i32>| {
             let client = client.clone();
             let task_queue = task_queue.clone();
             let sticky_queue_name = sticky_queue.clone();
@@ -179,6 +179,7 @@ impl LongPollBuffer<PollWorkflowTaskQueueResponse, WorkflowSlotKind> {
                             task_queue,
                             no_retry,
                             timeout_override,
+                            poller_target,
                         },
                         PollWorkflowOptions { sticky_queue_name },
                     )
@@ -226,7 +227,7 @@ impl LongPollBuffer<PollActivityTaskQueueResponse, ActivitySlotKind> {
         } else {
             None
         };
-        let poll_fn = move |timeout_override: Option<Duration>| {
+        let poll_fn = move |timeout_override: Option<Duration>, poller_target: Option<i32>| {
             let client = client.clone();
             let task_queue = task_queue.clone();
             async move {
@@ -236,6 +237,7 @@ impl LongPollBuffer<PollActivityTaskQueueResponse, ActivitySlotKind> {
                             task_queue,
                             no_retry,
                             timeout_override,
+                            poller_target,
                         },
                         PollActivityOptions {
                             max_tasks_per_sec: options.max_tps,
@@ -284,7 +286,7 @@ impl LongPollBuffer<PollNexusTaskQueueResponse, NexusSlotKind> {
         } else {
             None
         };
-        let poll_fn = move |timeout_override: Option<Duration>| {
+        let poll_fn = move |timeout_override: Option<Duration>, poller_target: Option<i32>| {
             let client = client.clone();
             let task_queue = task_queue.clone();
             async move {
@@ -294,6 +296,7 @@ impl LongPollBuffer<PollNexusTaskQueueResponse, NexusSlotKind> {
                             task_queue,
                             no_retry,
                             timeout_override,
+                            poller_target,
                         },
                         PollNexusOptions {
                             worker_commands_queue,
@@ -335,7 +338,7 @@ where
     SK: SlotKind + 'static,
 {
     fn new<FT, DelayFut, F>(
-        poll_fn: impl Fn(Option<Duration>) -> FT + Send + Sync + 'static,
+        poll_fn: impl Fn(Option<Duration>, Option<i32>) -> FT + Send + Sync + 'static,
         permit_dealer: MeteredPermitDealer<SK>,
         shutdown: CancellationToken,
         mut poll_scaler: PollScaler<F>,
@@ -412,10 +415,11 @@ where
                         } else {
                             None
                         };
+                    let poller_target = report_handle.reportable_target();
                     let capabilities = capabilities.clone();
                     let poll_task = tokio::spawn(async move {
                         let r = if capabilities.graceful_poll_shutdown() {
-                            pf(timeout_override).await
+                            pf(timeout_override, poller_target).await
                         } else {
                             let poll_interruptor = shutdown.cancelled().then(|_| async move {
                                 if let Some(w) = poll_shutdown_interrupt_wait {
@@ -423,7 +427,7 @@ where
                                 }
                             });
                             tokio::select! {
-                                r = pf(timeout_override) => r,
+                                r = pf(timeout_override, poller_target) => r,
                                 _ = poll_interruptor => return,
                             }
                         };
@@ -631,6 +635,19 @@ struct PollScalerReportHandle {
 }
 
 impl PollScalerReportHandle {
+    /// The pool's current scaling target, reported to the server on each poll so it can
+    /// spread poller-scaling suggestions across a fleet by share rather than letting them
+    /// land on whichever worker happens to receive the most tasks.
+    ///
+    /// `None` for a fixed-size pool: it has no target to balance, and the server leaves
+    /// such a worker out of fairness entirely rather than assuming anything about it.
+    fn reportable_target(&self) -> Option<i32> {
+        if !self.behavior.is_autoscaling() {
+            return None;
+        }
+        Some((*self.target.borrow()).try_into().unwrap_or(i32::MAX))
+    }
+
     /// Returns (should_forward, backoff_duration)
     /// - should_forward: true if the response should be passed on, false if it should be swallowed
     /// - backoff_duration: Some(duration) if we should sleep before the next poll
