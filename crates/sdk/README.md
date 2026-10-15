@@ -377,8 +377,57 @@ workflow code requires the same replay-safe versioning as other command changes.
 `NexusOperationError::Failed` retains a `NexusOperationFailureError`; use `operation_failure()` to
 inspect its metadata and normalized reason, and `as_cancelled()` / `as_timeout()` to classify it.
 `NexusOperationError::Serialization` reports input or result conversion errors.
-The endpoint must already exist in the server's endpoint registry. Hosting Nexus handlers is not
-included yet.
+The endpoint must already exist in the server's endpoint registry.
+
+#### Serving a Nexus service
+
+Register a handler to serve Nexus tasks on a worker. Handler method names refer to the typed
+operation markers on the service, including any wire-name overrides in its definition.
+
+```rust
+use temporalio_client::WorkflowStartOptions;
+use temporalio_sdk::nexus::{
+    TemporalNexusClient, TemporalOperationError, TemporalOperationResult,
+    temporal_nexus_service_handler,
+};
+
+struct PaymentHandlers;
+
+#[temporal_nexus_service_handler(service = PaymentService)]
+impl PaymentHandlers {
+    #[temporal_operation]
+    async fn charge(
+        &self,
+        client: TemporalNexusClient,
+        input: String,
+    ) -> Result<TemporalOperationResult<String>, TemporalOperationError> {
+        client
+            .start_workflow(
+                ChargeWorkflow::run,
+                input,
+                WorkflowStartOptions::new(
+                    "payments",
+                    format!("charge-{}", client.info().request_id),
+                )
+                .build(),
+            )
+            .await
+    }
+}
+
+let options = WorkerOptions::new("payments")
+    .register_nexus_service(PaymentHandlers)?
+    .register_workflow::<ChargeWorkflow>()?
+    .build();
+```
+
+Request metadata, including headers, request ID, deadline, and cancellation, is available on the
+`NexusInfo` returned by `client.info()`. Return
+`TemporalOperationResult::Sync(output)` for a synchronous result, or use `start_workflow` to attach
+the Nexus completion callback to a typed workflow. Supplied workflow options, including the task
+queue, are passed through unchanged; the helper uses the Nexus request ID for start idempotency.
+Workflow-backed operation tokens identify a workflow by namespace and workflow ID, so use a unique
+workflow ID for each independent operation. Nexus polling is enabled only when services are registered.
 
 ## Activities in detail
 

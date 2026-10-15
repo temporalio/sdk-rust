@@ -37,6 +37,32 @@ pub mod worker;
 mod workflow_handle;
 mod workflow_status;
 
+#[cfg(feature = "experimental")]
+#[doc(hidden)]
+pub mod __internal {
+    use crate::{
+        Client, WorkflowClientTrait, WorkflowHandle, WorkflowStartOptions,
+        errors::WorkflowStartError,
+    };
+    use temporalio_common::HasWorkflowDefinition;
+
+    pub async fn start_nexus_workflow<W>(
+        client: &Client,
+        workflow: W,
+        input: W::Input,
+        options: WorkflowStartOptions,
+        request_id: &str,
+    ) -> Result<WorkflowHandle<Client, W>, WorkflowStartError>
+    where
+        W: HasWorkflowDefinition,
+        W::Input: Send,
+    {
+        client
+            .start_workflow_with_request_id(workflow, input, options, Some(request_id.to_owned()))
+            .await
+    }
+}
+
 pub use crate::{proxy::HttpConnectProxyOptions, request_extensions::PayloadErrorLimits};
 pub use activity::*;
 pub use async_activity_handle::{
@@ -1416,6 +1442,21 @@ pub(crate) trait WorkflowClientTrait: NamespacedClient {
     where
         Self: Sized,
         W: HasWorkflowDefinition,
+        W::Input: Send,
+    {
+        self.start_workflow_with_request_id(workflow, input, options, None)
+    }
+
+    fn start_workflow_with_request_id<W>(
+        &self,
+        workflow: W,
+        input: W::Input,
+        options: WorkflowStartOptions,
+        request_id: Option<String>,
+    ) -> impl Future<Output = Result<WorkflowHandle<Self, W>, WorkflowStartError>>
+    where
+        Self: Sized,
+        W: HasWorkflowDefinition,
         W::Input: Send;
 
     /// Start a workflow and atomically send it a signal.
@@ -1815,6 +1856,15 @@ fn build_start_workflow_request(
     options: WorkflowStartOptions,
 ) -> StartWorkflowExecutionRequest {
     let request_eager_execution = options.enable_eager_workflow_start;
+    let on_conflict_options = (options.id_conflict_policy == WorkflowIdConflictPolicy::UseExisting
+        && (!options.completion_callbacks.is_empty() || !options.links.is_empty()))
+    .then_some(
+        temporalio_common::protos::temporal::api::workflow::v1::OnConflictOptions {
+            attach_request_id: true,
+            attach_completion_callbacks: !options.completion_callbacks.is_empty(),
+            attach_links: !options.links.is_empty(),
+        },
+    );
     StartWorkflowExecutionRequest {
         namespace: client.namespace(),
         input,
@@ -1849,6 +1899,7 @@ fn build_start_workflow_request(
         retry_policy: options.retry_policy.map(Into::into),
         links: options.links,
         completion_callbacks: options.completion_callbacks,
+        on_conflict_options,
         priority: Some(options.priority.into()),
         versioning_override: options.versioning_override.map(Into::into),
         memo,
@@ -1862,11 +1913,12 @@ impl<T> WorkflowClientTrait for T
 where
     T: WorkflowService + NamespacedClient + Clone + Send + Sync + 'static,
 {
-    async fn start_workflow<W>(
+    async fn start_workflow_with_request_id<W>(
         &self,
         workflow: W,
         input: W::Input,
         options: WorkflowStartOptions,
+        request_id: Option<String>,
     ) -> Result<WorkflowHandle<Self, W>, WorkflowStartError>
     where
         W: HasWorkflowDefinition,
@@ -1912,6 +1964,10 @@ where
                             user_metadata,
                             options,
                         );
+                        // Nexus task redeliveries must reuse the caller's idempotency key.
+                        if let Some(request_id) = request_id {
+                            request.request_id = request_id;
+                        }
                         let target = StoreTarget::workflow(
                             &request.namespace,
                             &request.workflow_id,

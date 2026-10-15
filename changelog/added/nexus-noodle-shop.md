@@ -1,0 +1,1 @@
+Workers can serve typed Nexus service operations with experimental `temporal_nexus_service_handler` handlers, including synchronous results and workflow-backed asynchronous operations with cancellation.
