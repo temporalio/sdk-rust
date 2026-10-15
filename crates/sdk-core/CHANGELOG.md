@@ -38,6 +38,9 @@ relevant information.
   [yanked upstream for security issues](https://github.com/zip-rs/zip2/issues/1075#issuecomment-6209381974).
 
 ### Breaking Changes
+* Core now rejects activation responses with a nondeterminism error if the activation contained
+  only updates and the response rejects every update but also includes another workflow command.
+  SDKs must return only update rejections when all validators reject an update-only activation.
 * Replay detects changes to the service or operation of scheduled Nexus operations, reporting
   nondeterminism while retaining compatibility with histories recorded before these checks.
 
@@ -46,6 +49,8 @@ relevant information.
   request stalls. Timeout messages include the last connection failure when available.
 * Workers with large workflow caches avoid unnecessary CPU usage when no workflow tasks are waiting
   for a cache slot.
+* Rejection-only update tasks no longer dispatch local activities resumed from replay before
+  validation, allowing those tasks to remain unrecorded in workflow history.
 * Preparing a legacy query now remains in replay mode, preventing unrecorded local activity
   attempts that could execute twice or leave the workflow stuck.
 * Worker heartbeats now report correct task-slot and poller counts when using buffered or custom

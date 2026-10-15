@@ -8,7 +8,7 @@ use std::{
     sync::mpsc::{self, Receiver, Sender},
 };
 use temporalio_common::protos::{
-    coresdk::workflow_activation::{WorkflowActivationJob, start_workflow_from_attribs},
+    coresdk::workflow_activation::start_workflow_from_attribs,
     temporal::api::{
         common::v1::{Payload, SearchAttributes},
         history::v1::WorkflowExecutionStartedEventAttributes,
@@ -76,11 +76,8 @@ impl DrivenWorkflow {
     }
 
     /// Drain all pending jobs, so that they may be sent to the driven workflow
-    pub(super) fn drain_jobs(&mut self) -> Vec<WorkflowActivationJob> {
-        self.outgoing_wf_activation_jobs
-            .drain(..)
-            .map(Into::into)
-            .collect()
+    pub(super) fn drain_jobs(&mut self) -> Vec<OutgoingJob> {
+        self.outgoing_wf_activation_jobs.drain(..).collect()
     }
 
     /// Obtain any output from the workflow's recent execution(s). Because the lang sdk is
