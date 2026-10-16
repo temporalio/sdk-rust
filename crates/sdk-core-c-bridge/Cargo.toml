@@ -63,6 +63,5 @@ thiserror = { workspace = true }
 cbindgen = { version = "0.29", default-features = false }
 
 [features]
-antithesis_assertions = ["temporalio-sdk-core/antithesis_assertions"]
 xz2-static = ["xz2/static"]
 dynamic-tls = ["temporalio-client/dynamic-tls"]

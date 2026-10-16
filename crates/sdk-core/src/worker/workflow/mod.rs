@@ -1731,77 +1731,33 @@ pub(crate) enum WFMachinesError {
     Fatal(String),
 }
 
-/// Helper macro to create Nondeterminism errors with automatic assertion
+/// Helper macro to create Nondeterminism errors
 ///
 /// Usage: `nondeterminism!("Activity id mismatch: {} vs {}", id1, id2)`
 macro_rules! nondeterminism {
     ($($arg:tt)*) => {{
-        let msg = format!($($arg)*);
-        #[cfg(feature = "antithesis_assertions")]
-        $crate::antithesis::assert_unreachable!(
-            "Nondeterminism error detected",
-            ::serde_json::json!({
-                "error_message": &msg,
-                "error_type": "Nondeterminism",
-                "location": format!("{}:{}", file!(), line!())
-            })
-        );
-        WFMachinesError::Nondeterminism(msg)
+        WFMachinesError::Nondeterminism(format!($($arg)*))
     }};
 }
 pub(crate) use nondeterminism;
 
-/// Helper macro to create Fatal errors with automatic assertion
+/// Helper macro to create Fatal errors
 ///
 /// Usage: `fatal!("Invalid state transition: {:?}", state)`
 macro_rules! fatal {
     ($($arg:tt)*) => {{
-        let msg = format!($($arg)*);
-        #[cfg(feature = "antithesis_assertions")]
-        $crate::antithesis::assert_unreachable!(
-            "Fatal error detected",
-            ::serde_json::json!({
-                "error_message": &msg,
-                "error_type": "Fatal",
-                "location": format!("{}:{}", file!(), line!())
-            })
-        );
-        WFMachinesError::Fatal(msg)
+        WFMachinesError::Fatal(format!($($arg)*))
     }};
 }
 pub(crate) use fatal;
 
 impl WFMachinesError {
-    /// Create a new Nondeterminism error with assertion instrumentation
     pub(crate) fn nondeterminism(message: impl Into<String>) -> Self {
-        let msg = message.into();
-
-        #[cfg(feature = "antithesis_assertions")]
-        crate::antithesis::assert_unreachable!(
-            "Nondeterminism error detected",
-            ::serde_json::json!({
-                "error_message": msg,
-                "error_type": "Nondeterminism"
-            })
-        );
-
-        WFMachinesError::Nondeterminism(msg)
+        WFMachinesError::Nondeterminism(message.into())
     }
 
-    /// Create a new Fatal error with assertion instrumentation
     pub(crate) fn fatal(message: impl Into<String>) -> Self {
-        let msg = message.into();
-
-        #[cfg(feature = "antithesis_assertions")]
-        crate::antithesis::assert_unreachable!(
-            "Fatal error detected",
-            ::serde_json::json!({
-                "error_message": msg,
-                "error_type": "Fatal"
-            })
-        );
-
-        WFMachinesError::Fatal(msg)
+        WFMachinesError::Fatal(message.into())
     }
 
     fn evict_reason(&self) -> EvictionReason {

@@ -71,15 +71,6 @@ impl ValidatedRetryPolicy {
         application_failure: Option<&ApplicationFailureInfo>,
     ) -> Option<Duration> {
         if self.maximum_attempts > 0 && attempt_number.get() >= self.maximum_attempts {
-            #[cfg(feature = "antithesis_assertions")]
-            crate::antithesis::assert_sometimes!(
-                true,
-                "Retry maximum_attempts limit reached",
-                ::serde_json::json!({
-                    "attempt": attempt_number.get(),
-                    "maximum_attempts": self.maximum_attempts
-                })
-            );
             return None;
         }
 
@@ -87,15 +78,6 @@ impl ValidatedRetryPolicy {
             .map(|f| f.non_retryable)
             .unwrap_or_default();
         if non_retryable {
-            #[cfg(feature = "antithesis_assertions")]
-            crate::antithesis::assert_sometimes!(
-                true,
-                "Non-retryable application failure encountered",
-                ::serde_json::json!({
-                    "attempt": attempt_number.get(),
-                    "error_type": application_failure.map(|f| &f.r#type)
-                })
-            );
             return None;
         }
 

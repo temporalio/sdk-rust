@@ -426,17 +426,6 @@ macro_rules! dbg_panic {
         let message = format!($($arg)*);
         error!("{}", message);
 
-        #[cfg(feature = "antithesis_assertions")]
-        crate::antithesis::assert_always!(
-            false,
-            "dbg_panic invariant triggered",
-            ::serde_json::json!({
-                "message": message,
-                "file": file!(),
-                "line": line!(),
-                "module": module_path!(),
-            })
-        );
         debug_assert!(false, "{}", message);
     }};
 }

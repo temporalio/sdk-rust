@@ -45,16 +45,12 @@ debug-plugin = ["dep:reqwest", "dep:hyper"]
 # and the `histfetch` binary. Not part of the public API surface; downstream
 # crates should not enable this feature.
 test-utilities = ["dep:assert_matches", "dep:bimap"]
-antithesis_assertions = ["dep:antithesis_sdk"]
 dynamic-tls = ["temporalio-client/dynamic-tls"]
 # Used by the integration-test runner to make Cloud exclusions native libtest ignores.
 cloud-test-mode = []
 
 [dependencies]
 anyhow = "1.0"
-antithesis_sdk = { version = "0.2.1", optional = true, default-features = false, features = [
-  "full",
-] }
 assert_matches = { version = "1.5", optional = true }
 backon = { version = "1.6", default-features = false }
 bimap = { version = "0.6.3", optional = true }
