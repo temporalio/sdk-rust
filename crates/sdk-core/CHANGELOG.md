@@ -97,6 +97,8 @@ relevant information.
 ### Security
 * Ephemeral server downloads now use `zip` 9.0 for ZIP extraction, replacing the 8.x dependency
   [yanked upstream for security issues](https://github.com/zip-rs/zip2/issues/1075#issuecomment-6209381974).
+* SDK bridges can opt in at build time to preserving workflow task boundaries during replay,
+  including for running workflows. The transition is recorded in history and defaults to off.
 
 ### Breaking Changes
 * Core now rejects activation responses with a nondeterminism error if the activation contained
@@ -166,8 +168,6 @@ relevant information.
 ## [0.10.0] - 2026-10-06
 
 ### Added
-* SDK bridges can opt in at build time to preserving workflow task boundaries during replay,
-  including for running workflows. The transition is recorded in history and defaults to off.
 * Child workflow commands, including those submitted through the C bridge, support pinned,
   auto-upgrade, and one-time worker deployment versioning overrides on Temporal Server 1.32.0
   or later. Child-start resolutions distinguish invalid versioning overrides and missing
