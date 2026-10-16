@@ -6,8 +6,8 @@ use proc_macro::TokenStream;
 use proc_macro2::TokenStream as TokenStream2;
 use quote::{format_ident, quote, quote_spanned};
 use syn::{
-    Attribute, Block, Expr, FnArg, ImplItem, ItemImpl, ReturnType, Stmt, Type, TypePath,
-    parse::ParseStream, spanned::Spanned,
+    Attribute, Block, Expr, FnArg, ImplItem, ItemImpl, ReceiverKind, ReturnType, Stmt, Type,
+    TypePath, parse::ParseStream, spanned::Spanned,
 };
 
 #[derive(Copy, Clone, Eq, PartialEq)]
@@ -103,8 +103,8 @@ fn parse_activity_method(method: &syn::ImplItemFn, mode: ParseMode) -> syn::Resu
                      contract",
                 ));
             }
-            if receiver.colon_token.is_some() {
-                validate_arc_self_type(&receiver.ty)?;
+            if let ReceiverKind::Typed(_, ty) = &receiver.kind {
+                validate_arc_self_type(ty)?;
                 false
             } else {
                 return Err(syn::Error::new_spanned(

@@ -6,7 +6,7 @@ use proc_macro::TokenStream;
 use proc_macro2::TokenStream as TokenStream2;
 use quote::{format_ident, quote};
 use syn::{
-    Attribute, FnArg, ImplItem, ItemImpl, ReturnType, Type, TypePath,
+    Attribute, FnArg, ImplItem, ItemImpl, ReceiverKind, ReturnType, Type, TypePath,
     parse::{Parse, ParseStream},
 };
 
@@ -449,7 +449,7 @@ fn extract_validator_target(attrs: &[Attribute]) -> syn::Result<syn::Ident> {
 fn validate_mut_self_receiver(method: &syn::ImplItemFn) -> syn::Result<()> {
     match method.sig.inputs.first() {
         Some(FnArg::Receiver(receiver)) => {
-            if receiver.reference.is_none() || receiver.mutability.is_none() {
+            if !matches!(&receiver.kind, ReceiverKind::Reference(_, _, Some(_))) {
                 return Err(syn::Error::new_spanned(
                     receiver,
                     "This method must use `&mut self` as the receiver",
@@ -467,13 +467,13 @@ fn validate_mut_self_receiver(method: &syn::ImplItemFn) -> syn::Result<()> {
 fn validate_immut_self_receiver(method: &syn::ImplItemFn) -> syn::Result<()> {
     match method.sig.inputs.first() {
         Some(FnArg::Receiver(receiver)) => {
-            if receiver.reference.is_none() {
+            if !matches!(&receiver.kind, ReceiverKind::Reference(..)) {
                 return Err(syn::Error::new_spanned(
                     receiver,
                     "#[query] methods must use `&self` as the receiver (not `self`)",
                 ));
             }
-            if receiver.mutability.is_some() {
+            if matches!(&receiver.kind, ReceiverKind::Reference(_, _, Some(_))) {
                 return Err(syn::Error::new_spanned(
                     receiver,
                     "#[query] methods must use `&self` as the receiver (not `&mut self`) - queries are read-only",
