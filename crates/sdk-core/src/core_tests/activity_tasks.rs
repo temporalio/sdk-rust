@@ -58,6 +58,7 @@ use temporalio_common::{
             command::v1::{ScheduleActivityTaskCommandAttributes, command::Attributes},
             enums::v1::{ApplicationErrorCategory, EventType},
             failure::v1::{ApplicationFailureInfo, Failure, failure::FailureInfo},
+            session::v1::{ActivitySessionOptions, activity_session_options},
             workflowservice::v1::{
                 GetSystemInfoResponse, PollActivityTaskQueueResponse,
                 RecordActivityTaskHeartbeatRequest, RecordActivityTaskHeartbeatResponse,
@@ -1343,6 +1344,68 @@ async fn oversized_heartbeat_fails_activity() {
     .await
     .unwrap();
     core.drain_activity_poller_and_shutdown().await;
+}
+
+#[rstest::rstest]
+#[tokio::test]
+async fn workflow_sticky_activity_session_commands(
+    #[values("enabled", "default_queue", "false_session")] scenario: &'static str,
+) {
+    let mut history = TestHistoryBuilder::default();
+    history.add_by_type(EventType::WorkflowExecutionStarted);
+    history.add_full_wf_task();
+    let mut client = mock_worker_client();
+    client
+        .expect_complete_workflow_task()
+        .times(1)
+        .returning(move |request, _| {
+            assert!(matches!(
+                &request.commands[0].attributes,
+                Some(Attributes::ScheduleActivityTaskCommandAttributes(attrs))
+                    if attrs.session_options.as_ref().unwrap().session
+                        == Some(activity_session_options::Session::WorkflowStickySession(
+                            scenario != "false_session"
+                        ))
+                        && !attrs.request_eager_execution
+                        && !attrs.task_queue.as_ref().unwrap().name.is_empty()
+            ));
+            Ok(RespondWorkflowTaskCompletedResponse::default())
+        });
+    let mut mocks = single_hist_mock_sg("sticky_activity_session", history, [1], client, true);
+    mocks.worker_cfg(|config| {
+        config.max_cached_workflows = 2;
+        config.session_worker_options = (scenario != "false_session").then(Default::default);
+        config.max_eager_activity_reservations_per_workflow_task = 0;
+    });
+    let core = mock_worker(mocks);
+    let activation = core.poll_workflow_activation().await.unwrap();
+    let result = core
+        .complete_workflow_activation(WorkflowActivationCompletion::from_cmds(
+            activation.run_id.clone(),
+            vec![
+                ScheduleActivity {
+                    seq: 1,
+                    activity_id: "affine_activity".to_owned(),
+                    activity_type: "affine_activity".to_owned(),
+                    task_queue: if scenario == "default_queue" {
+                        String::new()
+                    } else {
+                        core.get_config().task_queue.clone()
+                    },
+                    start_to_close_timeout: Some(prost_dur!(from_secs(10))),
+                    session_options: Some(ActivitySessionOptions {
+                        session: Some(activity_session_options::Session::WorkflowStickySession(
+                            scenario != "false_session",
+                        )),
+                    }),
+                    ..Default::default()
+                }
+                .into(),
+            ],
+        ))
+        .await;
+    result.unwrap();
+    core.drain_pollers_and_shutdown().await;
 }
 
 #[tokio::test]

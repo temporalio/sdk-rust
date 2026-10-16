@@ -446,16 +446,20 @@ pub struct PollOptions {
     pub timeout_override: Option<Duration>,
 }
 /// Additional options specific to workflow task polling
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default, bon::Builder)]
+#[non_exhaustive]
 pub struct PollWorkflowOptions {
     /// Optional sticky queue name for session‐based workflow polling
     pub sticky_queue_name: Option<String>,
 }
 /// Additional options specific to activity task polling
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default, bon::Builder)]
+#[non_exhaustive]
 pub struct PollActivityOptions {
     /// Optional rate limit (tasks per second) for activity polling
     pub max_tasks_per_sec: Option<f64>,
+    /// Poll the worker's sticky queue instead of the normal activity queue.
+    pub sticky_queue_name: Option<String>,
 }
 /// Additional options specific to Nexus task polling
 #[derive(Debug, Clone, Default)]
@@ -524,9 +528,20 @@ impl WorkerClient for WorkerClientBag {
         let mut request = PollActivityTaskQueueRequest {
             namespace: self.namespace.clone(),
             task_queue: Some(TaskQueue {
-                name: poll_options.task_queue,
-                kind: TaskQueueKind::Normal as i32,
-                normal_name: "".to_string(),
+                name: act_options
+                    .sticky_queue_name
+                    .clone()
+                    .unwrap_or_else(|| poll_options.task_queue.clone()),
+                kind: if act_options.sticky_queue_name.is_some() {
+                    TaskQueueKind::Sticky
+                } else {
+                    TaskQueueKind::Normal
+                } as i32,
+                normal_name: if act_options.sticky_queue_name.is_some() {
+                    poll_options.task_queue
+                } else {
+                    String::new()
+                },
             }),
             identity: self.identity(),
             task_queue_metadata: act_options.max_tasks_per_sec.map(|tps| TaskQueueMetadata {
@@ -1239,6 +1254,120 @@ mod tests {
         callback_based::{CallbackBasedGrpcService, GrpcSuccessResponse},
     };
     use temporalio_common::worker::{WorkerDeploymentOptions, WorkerDeploymentVersion};
+
+    #[tokio::test]
+    async fn poll_requests_encode_affinity_and_queue_names() {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let captured = requests.clone();
+        let service_override = CallbackBasedGrpcService {
+            callback: Arc::new(move |request| {
+                let captured = captured.clone();
+                Box::pin(async move {
+                    let proto = match request.rpc.as_str() {
+                        "GetSystemInfo" => GetSystemInfoResponse::default().encode_to_vec(),
+                        "PollActivityTaskQueue" => {
+                            let request =
+                                PollActivityTaskQueueRequest::decode(request.proto).unwrap();
+                            assert_eq!(request.namespace, "namespace");
+                            assert_eq!(
+                                request.task_queue_metadata.unwrap().max_tasks_per_second,
+                                Some(7.0)
+                            );
+                            captured.lock().unwrap().push((
+                                "activity",
+                                request.task_queue.unwrap(),
+                                request.single_workflow_mode,
+                            ));
+                            PollActivityTaskQueueResponse::default().encode_to_vec()
+                        }
+                        "PollWorkflowTaskQueue" => {
+                            let request =
+                                PollWorkflowTaskQueueRequest::decode(request.proto).unwrap();
+                            assert_eq!(request.namespace, "namespace");
+                            captured.lock().unwrap().push((
+                                "workflow",
+                                request.task_queue.unwrap(),
+                                request.single_workflow_mode,
+                            ));
+                            PollWorkflowTaskQueueResponse::default().encode_to_vec()
+                        }
+                        rpc => panic!("unexpected RPC: {rpc}"),
+                    };
+                    Ok(GrpcSuccessResponse {
+                        headers: Default::default(),
+                        proto,
+                    })
+                })
+            }),
+        };
+        let connection = Connection::connect(
+            ConnectionOptions::new(url::Url::parse("http://localhost:7233").unwrap())
+                .service_override(service_override)
+                .dns_load_balancing(None)
+                .build(),
+        )
+        .await
+        .unwrap();
+        let client = WorkerClientBag::new(
+            SharedReplaceableClient::new(connection),
+            "namespace".to_owned(),
+            WorkerVersioningStrategy::None {
+                build_id: String::new(),
+            },
+            Uuid::new_v4(),
+        );
+        for sticky_queue_name in [None, Some("sticky".to_owned())] {
+            client
+                .poll_workflow_task(
+                    PollOptions {
+                        task_queue: "normal".to_owned(),
+                        no_retry: None,
+                        timeout_override: None,
+                    },
+                    PollWorkflowOptions::builder()
+                        .maybe_sticky_queue_name(sticky_queue_name.clone())
+                        .build(),
+                )
+                .await
+                .unwrap();
+            client
+                .poll_activity_task(
+                    PollOptions {
+                        task_queue: "normal".to_owned(),
+                        no_retry: None,
+                        timeout_override: None,
+                    },
+                    PollActivityOptions::builder()
+                        .maybe_sticky_queue_name(sticky_queue_name)
+                        .max_tasks_per_sec(7.0)
+                        .build(),
+                )
+                .await
+                .unwrap();
+        }
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 4);
+        for (i, (rpc, queue, single_workflow_mode)) in requests.iter().enumerate() {
+            assert_eq!(*rpc, if i % 2 == 0 { "workflow" } else { "activity" });
+            assert!(!*single_workflow_mode);
+            assert_eq!(
+                *queue,
+                if i < 2 {
+                    TaskQueue {
+                        name: "normal".to_owned(),
+                        kind: TaskQueueKind::Normal as i32,
+                        normal_name: String::new(),
+                    }
+                } else {
+                    TaskQueue {
+                        name: "sticky".to_owned(),
+                        kind: TaskQueueKind::Sticky as i32,
+                        normal_name: "normal".to_owned(),
+                    }
+                }
+            );
+        }
+    }
 
     #[tokio::test]
     async fn activity_failure_request_includes_last_heartbeat_details() {

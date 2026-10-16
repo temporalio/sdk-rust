@@ -8,6 +8,7 @@ use tokio::sync::Semaphore;
 /// Implements [SlotSupplier] with a fixed number of slots
 pub struct FixedSizeSlotSupplier<SK> {
     sem: Arc<Semaphore>,
+    capacity: usize,
     _pd: PhantomData<SK>,
 }
 
@@ -16,6 +17,7 @@ impl<SK> FixedSizeSlotSupplier<SK> {
     pub fn new(size: usize) -> Self {
         Self {
             sem: Arc::new(Semaphore::new(size)),
+            capacity: size,
             _pd: Default::default(),
         }
     }
@@ -49,6 +51,10 @@ where
 
     fn available_slots(&self) -> Option<usize> {
         Some(self.sem.available_permits())
+    }
+
+    fn fixed_capacity(&self) -> Option<usize> {
+        Some(self.capacity)
     }
 
     fn slot_supplier_kind(&self) -> String {

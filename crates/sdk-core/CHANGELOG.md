@@ -60,6 +60,8 @@ relevant information.
   make progress after unpause.
 
 ### Added
+* Experimental workflow-affine activity support allows opted-in activities to use the workflow
+  worker's sticky destination while sharing activity concurrency and rate limits.
 * The OTLP metrics exporter can export histograms as OpenTelemetry exponential histograms, which
   Prometheus-compatible backends store as native histograms, when an SDK enables the option,
   including through the C bridge. It applies to every histogram, including custom ones, and names

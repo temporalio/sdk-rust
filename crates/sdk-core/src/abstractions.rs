@@ -35,9 +35,9 @@ pub(crate) struct MeteredPermitDealer<SK: SlotKind> {
     max_permits: Option<usize>,
     metrics_ctx: MetricsContext,
     meter: Option<TemporalMeter>,
-    /// Only applies to permit dealers for workflow tasks. True if this permit dealer is associated
-    /// with a sticky queue poller.
+    /// Reservations must identify their source before a task has been received.
     is_sticky_poller: bool,
+    is_paired_activity_poller: bool,
     context_data: Arc<PermitDealerContextData>,
 }
 
@@ -100,6 +100,7 @@ where
             meter,
             max_permits,
             is_sticky_poller: false,
+            is_paired_activity_poller: false,
             context_data,
         }
     }
@@ -205,6 +206,14 @@ impl MeteredPermitDealer<WorkflowSlotKind> {
     }
 }
 
+impl MeteredPermitDealer<ActivitySlotKind> {
+    pub(crate) fn for_activity_poller(mut self, sticky: bool, paired: bool) -> Self {
+        self.is_sticky_poller = sticky;
+        self.is_paired_activity_poller = paired;
+        self
+    }
+}
+
 impl<SK: SlotKind> SlotReservationContext for MeteredPermitDealer<SK> {
     fn task_queue(&self) -> &str {
         &self.context_data.task_queue
@@ -224,6 +233,10 @@ impl<SK: SlotKind> SlotReservationContext for MeteredPermitDealer<SK> {
 
     fn is_sticky(&self) -> bool {
         self.is_sticky_poller
+    }
+
+    fn is_paired_activity_poller(&self) -> bool {
+        self.is_paired_activity_poller
     }
 
     fn get_metrics_meter(&self) -> Option<TemporalMeter> {
