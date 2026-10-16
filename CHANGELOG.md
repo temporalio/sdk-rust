@@ -33,6 +33,9 @@ relevant information.
 
 ## Unreleased
 
+### Changed
+* Updated workflow and activity macros to syn 3 for improved Rust syntax compatibility.
+
 ### Breaking Changes
 * Workflow replay now reports nondeterminism when a scheduled Nexus operation's service or operation
   differs from the command that produced it.
