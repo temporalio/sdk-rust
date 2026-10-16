@@ -55,6 +55,8 @@ mod cancellation;
 mod component;
 #[cfg(feature = "experimental")]
 mod event_groups;
+#[cfg(feature = "experimental")]
+pub mod nexus;
 mod runtime;
 mod workflow_context;
 pub mod workflow_interceptors;
