@@ -156,7 +156,10 @@ use temporalio_common::{
             activity_result::ActivityExecutionResult,
             activity_task::{ActivityTask, activity_task},
             workflow_activation::{WorkflowActivation, workflow_activation_job::Variant},
-            workflow_completion::WorkflowActivationCompletion,
+            workflow_completion::{
+                IndexedWorkflowActivationCompletion, WorkflowActivationBatchCompletion,
+                WorkflowActivationCompletion,
+            },
         },
         temporal::api::{
             common::v1::Payload, enums::v1::WorkflowTaskFailedCause, failure::v1::Failure,
@@ -171,6 +174,7 @@ use temporalio_workflow::{InternalPatchActivationCallback, workflows::WorkflowIm
 use tokio::sync::{
     Notify,
     mpsc::{UnboundedSender, unbounded_channel},
+    oneshot,
 };
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
@@ -1114,7 +1118,13 @@ impl Worker {
         let (common, wf_half, act_half) = self.split_apart();
         let (wf_future_tx, wf_future_rx) =
             unbounded_channel::<WorkflowFutureHandle<TaskHandle<WorkflowResult<Payload>>>>();
-        let (completions_tx, completions_rx) = unbounded_channel();
+        let (completions_tx, completions_rx) = unbounded_channel::<WorkflowActivationCompletion>();
+        // Routing completions by run lets different batches make progress while each workflow
+        // waits for its own activation to finish before executing the next boundary.
+        let pending_completions = RefCell::new(HashMap::<
+            String,
+            oneshot::Sender<WorkflowActivationCompletion>,
+        >::new());
 
         // Workflows run in a LocalSet because they use Rc<RefCell> for state management.
         // This allows them to not require Send/Sync bounds. The WorkflowExecutor replaces
@@ -1159,109 +1169,159 @@ impl Worker {
         };
         let wf_completion_processor = async {
             UnboundedReceiverStream::new(completions_rx)
-                .map(Ok)
-                .try_for_each_concurrent(None, |mut completion| async {
-                    encode_workflow_completion(&mut completion, &common.data_converter).await;
-                    for i in &common.worker_interceptors {
-                        i.on_workflow_activation_completion(&completion).await;
-                    }
-                    common.worker.complete_workflow_activation(completion).await
+                .map(Ok::<_, WorkerRunError>)
+                .try_for_each(|completion| async {
+                    let sender = pending_completions
+                        .borrow_mut()
+                        .remove(&completion.run_id)
+                        .ok_or_else(|| WorkerRunError::Fatal {
+                            message: "workflow completion has no pending activation".to_owned(),
+                            source: anyhow!("run {}", completion.run_id).into(),
+                        })?;
+                    sender.send(completion).map_err(|_| WorkerRunError::Fatal {
+                        message: "workflow activation receiver dropped".to_owned(),
+                        source: anyhow!("activation batch interrupted").into(),
+                    })
                 })
                 .await
-                .map_err(|source| WorkerRunError::Fatal {
-                    message: "workflow completions processor encountered an error".to_owned(),
-                    source: Box::new(source),
-                })
+        };
+        let workflow_poller = async {
+            futures_util::stream::try_unfold((), |_| async {
+                match common.worker.poll_workflow_activation_batch().await {
+                    Ok(batch) => Ok(Some((batch, ()))),
+                    Err(PollError::ShutDown) => Ok(None),
+                    Err(source) => Err(WorkerRunError::Fatal {
+                        message: "workflow polling failed".to_owned(),
+                        source: source.into(),
+                    }),
+                }
+            })
+            .try_for_each_concurrent(None, |mut batch| {
+                let common = &*common;
+                let wf_half = &*wf_half;
+                let executor = &executor;
+                let pending_completions = &pending_completions;
+                let completions_tx = &completions_tx;
+                let wf_future_tx = &wf_future_tx;
+                let shutdown_token = shutdown_token.clone();
+                async move {
+                    let mut completions = Vec::with_capacity(batch.activations.len());
+                    let activations = std::mem::take(&mut batch.activations);
+                    for (index, mut activation) in activations.into_iter().enumerate() {
+                        let mut completion = if let Err(err) =
+                            decode_payloads(
+                                &mut activation,
+                                common.data_converter.codec(),
+                                &SerializationContextData::Workflow(
+                                    WorkflowSerializationContext::new(),
+                                ),
+                            )
+                            .await
+                        {
+                            error!(run_id = %batch.run_id, error = %err, "Failed decoding workflow activation");
+                            WorkflowActivationCompletion::fail(
+                                batch.run_id.clone(),
+                                Failure {
+                                    message: format!("Failed decoding activation: {err}"),
+                                    ..Default::default()
+                                },
+                                Some(WorkflowTaskFailedCause::WorkflowWorkerUnhandledFailure),
+                            )
+                        } else {
+                            for interceptor in &common.worker_interceptors {
+                                interceptor
+                                    .on_workflow_activation(&activation)
+                                    .await
+                                    .map_err(|source| WorkerRunError::Fatal {
+                                        message: "workflow activation interceptor failed"
+                                            .to_owned(),
+                                        source: source.into_boxed_dyn_error(),
+                                    })?;
+                            }
+                            let (sender, receiver) = oneshot::channel();
+                            assert!(
+                                pending_completions
+                                    .borrow_mut()
+                                    .insert(batch.run_id.clone(), sender)
+                                    .is_none()
+                            );
+                            if let Some(workflow) = wf_half
+                                .workflow_activation_handler(
+                                    common,
+                                    shutdown_token.clone(),
+                                    activation,
+                                    completions_tx,
+                                    executor,
+                                )
+                                .await
+                                .map_err(|source| WorkerRunError::Fatal {
+                                    message: "workflow activation processing failed".to_owned(),
+                                    source: source.into_boxed_dyn_error(),
+                                })?
+                            {
+                                assert!(
+                                    wf_future_tx.send(workflow).is_ok(),
+                                    "Workflow joiner remains alive"
+                                );
+                            }
+                            receiver.await.map_err(|source| WorkerRunError::Fatal {
+                                message: "workflow activation completion dropped".to_owned(),
+                                source: source.into(),
+                            })?
+                        };
+                        encode_workflow_completion(&mut completion, &common.data_converter).await;
+                        for interceptor in &common.worker_interceptors {
+                            interceptor
+                                .on_workflow_activation_completion(&completion)
+                                .await;
+                        }
+                        let keep_going = batch.can_continue_after(&completion);
+                        completions.push(IndexedWorkflowActivationCompletion {
+                            activation_index: index as u32,
+                            completion: Some(completion),
+                        });
+                        if !keep_going {
+                            break;
+                        }
+                    }
+                    common
+                        .worker
+                        .complete_workflow_activation_batch(WorkflowActivationBatchCompletion {
+                            run_id: batch.run_id,
+                            completions,
+                        })
+                        .await
+                        .map_err(|source| WorkerRunError::Fatal {
+                            message: "workflow batch completion failed".to_owned(),
+                            source: source.into(),
+                        })
+                }
+            })
+            .await?;
+            // Tell still-alive workflows to evict themselves
+            shutdown_token.cancel();
+            // It's important to drop these so the future and completion processors will
+            // terminate.
+            drop(wf_future_tx);
+            drop(completions_tx);
+            Result::<_, WorkerRunError>::Ok(())
         };
         tokio::try_join!(
             // Workflow-related tasks run inside LocalSet (allows !Send futures)
             async {
                 workflow_local_set.run_until(async {
                     tokio::try_join!(
-                        // Workflow polling loop
+                        workflow_poller,
+                        wf_future_joiner,
                         async {
-                            loop {
-                            let mut activation =
-                                match common.worker.poll_workflow_activation().await {
-                                    Err(PollError::ShutDown) => {
-                                        break;
-                                    }
-                                    o => o.map_err(|source| WorkerRunError::Fatal {
-                                        message: "workflow polling failed".to_owned(),
-                                        source: Box::new(source),
-                                    })?,
-                                };
-                            if let Err(err) = decode_payloads(
-                                &mut activation,
-                                common.data_converter.codec(),
-                                &SerializationContextData::Workflow(WorkflowSerializationContext::new()),
-                            )
-                            .await
-                            {
-                                let run_id = activation.run_id;
-                                error!(run_id, error = %err, "Failed decoding workflow activation");
-                                completions_tx
-                                    .send(WorkflowActivationCompletion::fail(
-                                        run_id,
-                                        Failure {
-                                            message: format!("Failed decoding activation: {err}"),
-                                            ..Default::default()
-                                        },
-                                        Some(
-                                            WorkflowTaskFailedCause::WorkflowWorkerUnhandledFailure,
-                                        ),
-                                    ))
-                                    .expect("Completion channel intact");
-                                continue;
+                            tokio::select! {
+                                _ = executor.drive() => unreachable!("executor driver cannot finish"),
+                                _ = shutdown_token.cancelled() => {}
                             }
-                            for i in &common.worker_interceptors {
-                                i.on_workflow_activation(&activation).await.map_err(|source| {
-                                    WorkerRunError::Fatal {
-                                        message: "workflow activation interceptor failed".to_owned(),
-                                        source: source.into_boxed_dyn_error(),
-                                    }
-                                })?;
-                            }
-                            if let Some(wf_fut) = wf_half
-                                .workflow_activation_handler(
-                                    common,
-                                    shutdown_token.clone(),
-                                    activation,
-                                    &completions_tx,
-                                    &executor,
-                                )
-                                .await
-                                .map_err(|source| {
-                                    WorkerRunError::Fatal {
-                                        message: "workflow activation processing failed".to_owned(),
-                                        source: source.into_boxed_dyn_error(),
-                                    }
-                                })?
-                                && wf_future_tx.send(wf_fut).is_err()
-                            {
-                                panic!(
-                                    "Receive half of completion processor channel cannot be dropped"
-                                );
-                            }
-                        }
-                        // Tell still-alive workflows to evict themselves
-                        shutdown_token.cancel();
-                        // It's important to drop these so the future and completion processors will
-                        // terminate.
-                        drop(wf_future_tx);
-                        drop(completions_tx);
-                        Result::<_, WorkerRunError>::Ok(())
-                    },
-                    wf_future_joiner,
-                    async {
-                        tokio::select! {
-                            _ = executor.drive() => unreachable!("executor driver cannot finish"),
-                            _ = shutdown_token.cancelled() => {}
-                        }
-                        executor.shutdown().await;
-                        Result::<_, WorkerRunError>::Ok(())
-                    },
-                )
+                            executor.shutdown().await;
+                            Result::<_, WorkerRunError>::Ok(())
+                        },
+                    )
                 }).await
             },
             // Only poll on the activity queue if activity functions have been registered. This
