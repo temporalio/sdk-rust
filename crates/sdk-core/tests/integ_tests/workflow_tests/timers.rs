@@ -388,3 +388,60 @@ async fn wait_condition_waker_in_futures_unordered() {
     });
     worker.run().await.unwrap();
 }
+
+#[workflow]
+#[derive(Default)]
+struct BatchTimerWorkflow {
+    signals: usize,
+}
+
+#[workflow_methods]
+impl BatchTimerWorkflow {
+    #[run(name = DEFAULT_WORKFLOW_TYPE)]
+    async fn run(
+        ctx: &mut temporalio_sdk::WorkflowContext<Self>,
+    ) -> temporalio_sdk::WorkflowResult<()> {
+        ctx.timer(Duration::from_secs(1)).await;
+        assert_eq!(ctx.state(|state| state.signals), 4);
+        Ok(())
+    }
+
+    #[signal]
+    async fn tick(ctx: &mut temporalio_sdk::WorkflowContext<Self>) {
+        let timer = ctx.timer(Duration::from_secs(10));
+        timer.cancel();
+        timer.await;
+        ctx.state_mut(|state| state.signals += 1);
+    }
+}
+
+#[temporalio_macros::cloud_test_exclusion(crate::CloudTestExclusionReason::DoesNotUseServer)]
+#[tokio::test]
+async fn native_sdk_drives_batches_with_unrecorded_timer_commands() {
+    let mut history = TestHistoryBuilder::default();
+    history.add_by_type(EventType::WorkflowExecutionStarted);
+    history.add_full_wf_task();
+    let timer = history.add_timer_started("1".to_owned());
+    history.set_flags_first_wft(
+        &[temporalio_sdk_core::test_help::CoreInternalFlags::DisableWorkflowTaskChunking],
+        &[],
+    );
+    for index in 0..8 {
+        if index % 2 == 0 {
+            history.add_we_signaled("tick", vec![]);
+        }
+        history.add_full_wf_task();
+    }
+    history.add_timer_fired(timer, "1".to_owned());
+    history.add_workflow_task_scheduled_and_started();
+    let mut worker = crate::common::build_fake_sdk_with_options(
+        MockPollCfg::from_resps(history, [10]),
+        |options| {
+            options.register_workflow::<BatchTimerWorkflow>().unwrap();
+        },
+    );
+    tokio::time::timeout(Duration::from_secs(10), worker.run())
+        .await
+        .unwrap()
+        .unwrap();
+}
