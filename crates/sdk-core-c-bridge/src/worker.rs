@@ -14,7 +14,7 @@ use std::{
 use temporalio_common::protos::{
     coresdk::{
         ActivityHeartbeat, ActivityTaskCompletion, nexus::NexusTaskCompletion,
-        workflow_completion::WorkflowActivationCompletion,
+        workflow_completion::WorkflowActivationBatchCompletion,
     },
     temporal::api::{
         enums::v1::VersioningBehavior as ProtoVersioningBehavior, history::v1::History,
@@ -676,6 +676,17 @@ pub type WorkerPollCallback = unsafe extern "C" fn(
     fail: *const ByteArray,
 );
 
+/// Success contains a protobuf-encoded `coresdk.workflow_activation.WorkflowActivationBatch`.
+/// The C signature is unchanged; the protobuf payload now uses the batch message.
+///
+/// Process a batch's activations sequentially according to their individual metadata and
+/// execution boundaries. Each activation may produce commands. Do not assume a fixed
+/// batch size. Each batch must receive one `WorkflowActivationBatchCompletion` response.
+///
+/// There may be at most one batch outstanding per workflow run. Do not
+/// poll workflows concurrently; work for different workflow runs may be processed concurrently.
+/// Continue polling and completing outstanding batches during shutdown until the callback reports
+/// shutdown.
 #[unsafe(no_mangle)]
 pub extern "C" fn temporal_core_worker_poll_workflow_activation(
     worker: *mut Worker,
@@ -686,7 +697,8 @@ pub extern "C" fn temporal_core_worker_poll_workflow_activation(
     let user_data = UserDataHandle(user_data);
     let core_worker = worker.worker.as_ref().unwrap().clone();
     worker.runtime.core.tokio_handle().spawn(async move {
-        let (success, fail) = match core_worker.poll_workflow_activation().await {
+        let polled = core_worker.poll_workflow_activation_batch().await;
+        let (success, fail) = match polled {
             Ok(act) => (
                 ByteArray::from_vec(act.encode_to_vec())
                     .into_raw()
@@ -781,7 +793,14 @@ pub extern "C" fn temporal_core_worker_poll_nexus_task(
     });
 }
 
-/// Accepts a protobuf-encoded `coresdk.workflow_completion.WorkflowActivationCompletion`.
+/// Accepts a protobuf-encoded `coresdk.workflow_completion.WorkflowActivationBatchCompletion`.
+/// The C signature is unchanged; the protobuf payload now uses the batch message.
+///
+/// Return results indexed by their activation's zero-based position in the supplied workflow
+/// activation batch, covering the executed contiguous prefix and retaining each activation's
+/// commands and metadata. Stop on failure or commands excluded by the supplied batch's
+/// `allowed_continuation_commands` policy, and leave the remaining suffix unexecuted.
+/// Submit completions for different workflow runs concurrently; completion may wait for history.
 ///
 /// Child workflow versioning overrides are carried in
 /// `coresdk.workflow_commands.StartChildWorkflowExecution.versioning_override`, so language SDKs
@@ -795,7 +814,7 @@ pub extern "C" fn temporal_core_worker_complete_workflow_activation(
     callback: WorkerCallback,
 ) {
     let worker = unsafe { &*worker };
-    let completion = match WorkflowActivationCompletion::decode(completion.to_slice()) {
+    let completion = match WorkflowActivationBatchCompletion::decode(completion.to_slice()) {
         Ok(completion) => completion,
         Err(err) => {
             unsafe {
@@ -814,7 +833,10 @@ pub extern "C" fn temporal_core_worker_complete_workflow_activation(
     let user_data = UserDataHandle(user_data);
     let core_worker = worker.worker.as_ref().unwrap().clone();
     worker.runtime.core.tokio_handle().spawn(async move {
-        let fail = match core_worker.complete_workflow_activation(completion).await {
+        let result = core_worker
+            .complete_workflow_activation_batch(completion)
+            .await;
+        let fail = match result {
             Ok(_) => std::ptr::null(),
             Err(err) => worker
                 .runtime

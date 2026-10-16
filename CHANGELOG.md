@@ -33,6 +33,10 @@ relevant information.
 
 ## Unreleased
 
+### Changed
+* Replay batches work from available history, including timers and known activity results,
+  while preserving each task's workflow execution, clock, and command handling.
+
 ### Breaking Changes
 * Workflow replay now reports nondeterminism when a scheduled Nexus operation's service or operation
   differs from the command that produced it.

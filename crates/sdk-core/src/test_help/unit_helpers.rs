@@ -1,5 +1,6 @@
 //! Unit test helpers - only available in unit tests (cfg(test))
 
+use crate::test_help::WorkerTestHelpers as _;
 use futures_util::{StreamExt, stream::FuturesUnordered};
 use std::{
     collections::{HashMap, HashSet},

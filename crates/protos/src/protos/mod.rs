@@ -63,7 +63,9 @@ pub mod coresdk {
             fmt::{Display, Formatter},
             iter::FromIterator,
         };
-        use workflow_activation::{WorkflowActivationJob, workflow_activation_job};
+        use workflow_activation::{
+            WorkflowActivationBatch, WorkflowActivationJob, workflow_activation_job,
+        };
         use workflow_commands::{WorkflowCommand, workflow_command, workflow_command::Variant};
         use workflow_completion::{WorkflowActivationCompletion, workflow_activation_completion};
 
@@ -98,6 +100,93 @@ pub mod coresdk {
             pub fn from_variants(cmds: Vec<Variant>) -> Self {
                 let cmds: Vec<_> = cmds.into_iter().map(|c| c.into()).collect();
                 cmds.into()
+            }
+        }
+
+        impl WorkflowActivationBatch {
+            /// Apply Core's continuation policy without embedding batching restrictions in SDKs.
+            pub fn can_continue_after(&self, completion: &WorkflowActivationCompletion) -> bool {
+                let Some(workflow_activation_completion::Status::Successful(success)) =
+                    &completion.status
+                else {
+                    return false;
+                };
+                success.commands.iter().all(|command| {
+                    command.variant.as_ref().is_some_and(|variant| {
+                        self.allowed_continuation_commands
+                            .contains(&(variant.kind() as i32))
+                    })
+                })
+            }
+        }
+
+        #[cfg(test)]
+        mod batch_continuation_tests {
+            use super::*;
+            use prost::Message;
+            use workflow_commands::{
+                StartTimer, UpsertWorkflowSearchAttributes, WorkflowCommandKind,
+            };
+
+            #[test]
+            fn core_can_expand_continuation_without_changing_the_runner() {
+                let completion = WorkflowActivationCompletion::from_cmds(
+                    "run",
+                    vec![
+                        Variant::StartTimer(StartTimer::default()),
+                        Variant::UpsertWorkflowSearchAttributes(
+                            UpsertWorkflowSearchAttributes::default(),
+                        ),
+                    ],
+                );
+                let mut batch = WorkflowActivationBatch {
+                    allowed_continuation_commands: vec![WorkflowCommandKind::StartTimer as i32],
+                    ..Default::default()
+                };
+                assert!(!batch.can_continue_after(&completion));
+                batch
+                    .allowed_continuation_commands
+                    .push(WorkflowCommandKind::UpsertWorkflowSearchAttributes as i32);
+                let mut received =
+                    WorkflowActivationBatch::decode(batch.encode_to_vec().as_slice()).unwrap();
+                assert!(received.can_continue_after(&completion));
+                received.allowed_continuation_commands.remove(0);
+                assert!(!received.can_continue_after(&completion));
+            }
+
+            #[test]
+            fn continuation_stops_on_failure_or_unrecognized_commands() {
+                let mut batch = WorkflowActivationBatch::default();
+                assert!(batch.can_continue_after(&WorkflowActivationCompletion::empty("run")));
+                let timer = WorkflowActivationCompletion::from_cmd(
+                    "run",
+                    Variant::StartTimer(StartTimer::default()),
+                );
+                assert!(!batch.can_continue_after(&timer));
+                batch.allowed_continuation_commands = vec![0, 23, 9999];
+                assert!(!batch.can_continue_after(&timer));
+                batch
+                    .allowed_continuation_commands
+                    .push(WorkflowCommandKind::StartTimer as i32);
+                assert!(batch.can_continue_after(&timer));
+                // A newer Core's permission cannot make an unrecognized oneof safe to execute.
+                let unknown = WorkflowCommand::decode([0xba, 0x01, 0x00].as_slice()).unwrap();
+                let completion = WorkflowActivationCompletion {
+                    run_id: "run".to_owned(),
+                    status: Some(workflow_activation_completion::Status::Successful(
+                        vec![unknown].into(),
+                    )),
+                    ..Default::default()
+                };
+                assert!(!batch.can_continue_after(&completion));
+                assert!(
+                    !batch.can_continue_after(&WorkflowActivationCompletion::fail(
+                        "run",
+                        Failure::default(),
+                        None,
+                    ))
+                );
+                assert!(!batch.can_continue_after(&WorkflowActivationCompletion::default()));
             }
         }
 
@@ -1450,6 +1539,66 @@ pub mod coresdk {
             use super::*;
             use crate::protos::temporal::api::{common::v1::Payloads, enums::v1::QueryResultType};
             use std::fmt::{Display, Formatter};
+
+            impl workflow_command::Variant {
+                /// Identify the language command rather than a potentially absent server command.
+                pub fn kind(&self) -> WorkflowCommandKind {
+                    match self {
+                        Self::StartTimer(_) => WorkflowCommandKind::StartTimer,
+                        Self::ScheduleActivity(_) => WorkflowCommandKind::ScheduleActivity,
+                        Self::RespondToQuery(_) => WorkflowCommandKind::RespondToQuery,
+                        Self::RequestCancelActivity(_) => {
+                            WorkflowCommandKind::RequestCancelActivity
+                        }
+                        Self::CancelTimer(_) => WorkflowCommandKind::CancelTimer,
+                        Self::CompleteWorkflowExecution(_) => {
+                            WorkflowCommandKind::CompleteWorkflowExecution
+                        }
+                        Self::FailWorkflowExecution(_) => {
+                            WorkflowCommandKind::FailWorkflowExecution
+                        }
+                        Self::ContinueAsNewWorkflowExecution(_) => {
+                            WorkflowCommandKind::ContinueAsNewWorkflowExecution
+                        }
+                        Self::CancelWorkflowExecution(_) => {
+                            WorkflowCommandKind::CancelWorkflowExecution
+                        }
+                        Self::SetPatchMarker(_) => WorkflowCommandKind::SetPatchMarker,
+                        Self::StartChildWorkflowExecution(_) => {
+                            WorkflowCommandKind::StartChildWorkflowExecution
+                        }
+                        Self::CancelChildWorkflowExecution(_) => {
+                            WorkflowCommandKind::CancelChildWorkflowExecution
+                        }
+                        Self::RequestCancelExternalWorkflowExecution(_) => {
+                            WorkflowCommandKind::RequestCancelExternalWorkflowExecution
+                        }
+                        Self::SignalExternalWorkflowExecution(_) => {
+                            WorkflowCommandKind::SignalExternalWorkflowExecution
+                        }
+                        Self::CancelSignalWorkflow(_) => WorkflowCommandKind::CancelSignalWorkflow,
+                        Self::ScheduleLocalActivity(_) => {
+                            WorkflowCommandKind::ScheduleLocalActivity
+                        }
+                        Self::RequestCancelLocalActivity(_) => {
+                            WorkflowCommandKind::RequestCancelLocalActivity
+                        }
+                        Self::UpsertWorkflowSearchAttributes(_) => {
+                            WorkflowCommandKind::UpsertWorkflowSearchAttributes
+                        }
+                        Self::ModifyWorkflowProperties(_) => {
+                            WorkflowCommandKind::ModifyWorkflowProperties
+                        }
+                        Self::UpdateResponse(_) => WorkflowCommandKind::UpdateResponse,
+                        Self::ScheduleNexusOperation(_) => {
+                            WorkflowCommandKind::ScheduleNexusOperation
+                        }
+                        Self::RequestCancelNexusOperation(_) => {
+                            WorkflowCommandKind::RequestCancelNexusOperation
+                        }
+                    }
+                }
+            }
 
             impl Display for WorkflowCommand {
                 fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {

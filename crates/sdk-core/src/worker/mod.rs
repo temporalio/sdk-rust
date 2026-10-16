@@ -11,6 +11,10 @@ mod workflow;
 pub(crate) const PAYLOADS_TOO_LARGE_FAILURE_TYPE: &str = "PayloadsTooLarge";
 
 use temporalio_client::{Connection, PayloadErrorLimits, worker::NamespaceDescriptionSource};
+#[cfg(any(test, feature = "test-utilities"))]
+use temporalio_common::protos::coresdk::{
+    workflow_activation::WorkflowActivation, workflow_completion::WorkflowActivationCompletion,
+};
 use temporalio_common::{
     protos::{
         coresdk::{
@@ -94,8 +98,8 @@ use temporalio_common::{
             ActivityTaskCompletion,
             activity_task::ActivityTask,
             nexus::{NexusTask, NexusTaskCompletion},
-            workflow_activation::{WorkflowActivation, remove_from_cache::EvictionReason},
-            workflow_completion::WorkflowActivationCompletion,
+            workflow_activation::{WorkflowActivationBatch, remove_from_cache::EvictionReason},
+            workflow_completion::WorkflowActivationBatchCompletion,
         },
         temporal::api::{
             deployment,
@@ -1471,27 +1475,59 @@ impl Worker {
     ///
     /// Do not call poll concurrently. It handles polling the server concurrently internally.
     #[instrument(skip(self), fields(run_id, workflow_id, task_queue=%self.config.task_queue))]
-    pub async fn poll_workflow_activation(&self) -> Result<WorkflowActivation, PollError> {
+    #[cfg(any(test, feature = "test-utilities"))]
+    #[doc(hidden)]
+    pub(crate) async fn poll_workflow_activation_for_test(
+        &self,
+    ) -> Result<WorkflowActivation, PollError> {
         self.mark_started();
         match self.task_subsystems.workflows.as_ref() {
             Some(workflows) => {
                 let r = workflows.next_workflow_activation().await;
-                // In the event workflows are shutdown or erroring, begin shutdown of everything else. Once
-                // they are shut down, tell the local activity manager that, so that it can know to cancel
-                // any remaining outstanding LAs and shutdown.
-                if let Err(ref e) = r {
-                    // This is covering the situation where WFT pollers dying is the reason for shutdown
-                    self.initiate_shutdown();
-                    if matches!(e, PollError::ShutDown)
-                        && let Some(la_mgr) = &self.local_act_mgr
-                    {
-                        la_mgr.workflows_have_shutdown();
-                    }
-                }
-                r
+                self.workflow_poll_result(r)
             }
             None => Err(PollError::ShutDown),
         }
+    }
+
+    /// Poll for an ordered, nonempty batch of activations for one workflow run.
+    ///
+    /// Process activations sequentially with their individual execution boundaries and metadata
+    /// intact. Return indexed results in order, retaining commands from every activation. See
+    /// [`WorkflowActivationBatch`] for the execution and failure contracts.
+    ///
+    /// At most one batch is outstanding per run. Other runs may be
+    /// processed concurrently. Batch size is chosen by Core and must not be assumed by the SDK.
+    ///
+    /// Blocks until work is available or polling shuts down. Do not call this method concurrently
+    /// with itself, since polling consumes one shared work stream.
+    /// During shutdown, keep polling until [`PollError::ShutDown`] and respond to every dispatched
+    /// batch with [`Self::complete_workflow_activation_batch`].
+    pub async fn poll_workflow_activation_batch(
+        &self,
+    ) -> Result<WorkflowActivationBatch, PollError> {
+        self.mark_started();
+        match self.task_subsystems.workflows.as_ref() {
+            Some(workflows) => {
+                let result = workflows.next_workflow_activation_batch().await;
+                self.workflow_poll_result(result)
+            }
+            None => Err(PollError::ShutDown),
+        }
+    }
+
+    fn workflow_poll_result<T>(&self, result: Result<T, PollError>) -> Result<T, PollError> {
+        // Pollers can end workflow processing before worker shutdown is requested. Both poll
+        // interfaces must cancel the remaining subsystems and release local activity waiters.
+        if let Err(ref error) = result {
+            self.initiate_shutdown();
+            if matches!(error, PollError::ShutDown)
+                && let Some(manager) = &self.local_act_mgr
+            {
+                manager.workflows_have_shutdown();
+            }
+        }
+        result
     }
 
     /// Tell the worker that a workflow activation has completed. May (and should) be freely called
@@ -1501,7 +1537,9 @@ impl Worker {
     #[instrument(skip(self, completion),
         fields(completion=%&completion, run_id=%completion.run_id, workflow_id,
                task_queue=%self.config.task_queue))]
-    pub async fn complete_workflow_activation(
+    #[cfg(any(test, feature = "test-utilities"))]
+    #[doc(hidden)]
+    pub(crate) async fn complete_workflow_activation_for_test(
         &self,
         completion: WorkflowActivationCompletion,
     ) -> Result<(), CompleteWfError> {
@@ -1520,6 +1558,32 @@ impl Worker {
             }
             None => Err(CompleteWfError::WorkflowNotEnabled),
         }
+    }
+
+    /// Complete a batch returned by [`Self::poll_workflow_activation_batch`].
+    ///
+    /// Return one successful completion per activation, or a contiguous prefix ending in the
+    /// first failed completion or a completion excluded by the batch's continuation allowlist.
+    /// Every activation may contain commands. Preserve per-activation metadata even for empty
+    /// successes; see [`WorkflowActivationBatchCompletion`] for the full response contract.
+    ///
+    /// Complete batches for different runs concurrently. As with individual completions, this
+    /// future may need to fetch history, so serializing all completions can block other runs.
+    pub async fn complete_workflow_activation_batch(
+        &self,
+        completion: WorkflowActivationBatchCompletion,
+    ) -> Result<(), CompleteWfError> {
+        self.task_subsystems
+            .workflows
+            .as_ref()
+            .ok_or(CompleteWfError::WorkflowNotEnabled)?
+            .activation_batch_completed(
+                completion,
+                self.post_activate_hook
+                    .as_ref()
+                    .map(|hook| |data: PostActivateHookData| hook(self, data)),
+            )
+            .await
     }
 
     /// Ask the worker for some nexus related work. It is then the language SDK's

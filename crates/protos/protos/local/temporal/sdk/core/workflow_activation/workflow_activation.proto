@@ -10,6 +10,7 @@ option ruby_package = "Temporalio::Internal::Bridge::Api::WorkflowActivation";
 import "google/protobuf/timestamp.proto";
 import "google/protobuf/duration.proto";
 import "google/protobuf/empty.proto";
+import "temporal/sdk/core/workflow_commands/workflow_commands.proto";
 import "temporal/api/failure/v1/message.proto";
 import "temporal/api/update/v1/message.proto";
 import "temporal/api/common/v1/message.proto";
@@ -72,6 +73,8 @@ import "temporal/sdk/core/nexus/nexus.proto";
 message WorkflowActivation {
     // The id of the currently active run of the workflow. Also used as a cache key. There may
     // only ever be one active workflow task (and hence activation) of a run at one time.
+    // Only one batch may be outstanding per workflow run. All activations in a batch must have
+    // the same run_id as the containing batch.
     string run_id = 1;
     // The current time as understood by the workflow, which is set by workflow task started events
     google.protobuf.Timestamp timestamp = 2;
@@ -108,6 +111,34 @@ message WorkflowActivation {
     // the workflow is Pinned.
     // Experimental.
     bool target_worker_deployment_version_changed = 12;
+}
+
+// Every workflow poll returns a nonempty batch for one workflow run, including singleton batches
+// for live work, queries, evictions, and legacy chunked replay. At most one batch is outstanding
+// per workflow run. Batches for different workflow runs with different workflow run IDs may execute
+// concurrently. SDKs must accept variable batch lengths.
+//
+// Execute activations sequentially on the same workflow instance. Apply each activation's own
+// timestamp, replay state, flags and metadata, and finish its jobs, runnable workflow work,
+// microtasks, conditions, failure checks and completion processing before advancing. Never merge
+// activation boundaries or skip an activation with no jobs. Preserve per-activation timeouts and
+// deadlock checks; healthy progress across a batch is not one long activation.
+//
+// Return one WorkflowActivationBatchCompletion containing indexed results for the executed
+// prefix. Each result's activation_index is its activation's zero-based position in this
+// WorkflowActivationBatch.activations list. Every activation may produce commands.
+// Stop on failure or after a command whose kind is absent from allowed_continuation_commands.
+// Such commands may need additional Core jobs before continuing. Do not execute the remaining
+// suffix or rerun the completed prefix in place; await fresh Core work.
+// Queries retain their read-only semantics and evictions retain their isolation and cleanup rules.
+message WorkflowActivationBatch {
+    string run_id = 1;
+    repeated WorkflowActivation activations = 2;
+    // Core controls this allowlist so batching can expand without changing SDK execution loops.
+    // Continue only after a successful completion whose commands are all listed here. An empty
+    // list allows only command-free successes. Unknown command kinds never permit continuation;
+    // ignore unknown allowlist values. Always stop on failure, regardless of this list.
+    repeated workflow_commands.WorkflowCommandKind allowed_continuation_commands = 3;
 }
 
 message WorkflowActivationJob {

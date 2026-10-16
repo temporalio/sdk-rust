@@ -65,6 +65,7 @@ use transition_coverage::add_coverage;
 
 #[enum_dispatch::enum_dispatch]
 #[allow(clippy::enum_variant_names, clippy::large_enum_variant)]
+#[derive(Clone)]
 enum Machines {
     ActivityMachine,
     CancelExternalMachine,

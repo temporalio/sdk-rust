@@ -1,9 +1,9 @@
 use crate::{
-    internal_flags::CoreInternalFlags,
-    protosext::ValidPollWFTQResponse,
+    internal_flags::{CoreInternalFlags, InternalFlags},
+    protosext::{HistoryEventExt, ValidPollWFTQResponse},
     worker::{
         client::WorkerClient,
-        workflow::{CacheMissFetchReq, PermittedWFT, PreparedWFT},
+        workflow::{CacheMissFetchReq, PermittedWFT, PreparedWFT, prepare_to_ship_activation},
     },
 };
 use futures_util::{FutureExt, Stream, TryFutureExt, future::BoxFuture};
@@ -17,12 +17,23 @@ use std::{
     pin::Pin,
     sync::{Arc, LazyLock},
     task::{Context, Poll},
+    time::SystemTime,
 };
-use temporalio_common::protos::temporal::api::{
-    enums::v1::EventType,
-    history::v1::{
-        History, HistoryEvent, WorkflowTaskCompletedEventAttributes, history_event::Attributes,
+use temporalio_common::{
+    protos::{
+        coresdk::workflow_activation::{
+            CancelWorkflow, NotifyHasPatch, SignalWorkflow, WorkflowActivation,
+            WorkflowActivationJob, workflow_activation_job,
+        },
+        temporal::api::{
+            enums::v1::EventType,
+            history::v1::{
+                History, HistoryEvent, WorkflowTaskCompletedEventAttributes,
+                history_event::Attributes,
+            },
+        },
     },
+    worker::WorkerDeploymentVersion,
 };
 use tracing::Instrument;
 
@@ -69,9 +80,180 @@ impl Debug for HistoryUpdate {
 }
 
 impl HistoryUpdate {
+    pub(crate) fn preview_activation_batch(
+        &self,
+        first: &WorkflowActivation,
+        mut flags: InternalFlags,
+        mut stateful_jobs: impl FnMut(&HistoryEvent) -> Option<Vec<WorkflowActivationJob>>,
+    ) -> Vec<WorkflowActivation> {
+        if !first.is_replaying {
+            return vec![];
+        }
+        let mut rest = &self.events[self
+            .events
+            .partition_point(|e| e.event_id <= i64::from(first.history_length))..];
+        // The completion immediately after initialization may establish the unchunked boundaries.
+        // Legacy chunked work must still be constructed by the existing chunker.
+        if !self.chunking_disabled && !rest.first().is_some_and(disables_chunking) {
+            return vec![];
+        }
+        let mut previous = first.clone();
+        let mut activations = vec![];
+        loop {
+            let NextWFTSeqEndIndex::Complete(end) = find_end_index_of_next_wft_seq(
+                rest,
+                i64::from(previous.history_length),
+                self.has_last_wft || self.ends_at_known_boundary(),
+                true,
+            ) else {
+                break;
+            };
+            let events = &rest[..=end];
+            let Some(started) = events.last() else { break };
+            let Some(Attributes::WorkflowTaskStartedEventAttributes(attrs)) = &started.attributes
+            else {
+                break;
+            };
+            let lookahead = &rest[end + 1..];
+            let Some(Attributes::WorkflowTaskCompletedEventAttributes(completed)) =
+                lookahead.first().and_then(|e| e.attributes.as_ref())
+            else {
+                break;
+            };
+            // Markers and updates can add jobs to this activation via Core's lookahead. Never
+            // dispatch it before that context is available, even if its own events are complete.
+            let lookahead_end = find_end_index_of_next_wft_seq(
+                lookahead,
+                started.event_id,
+                self.has_last_wft || self.ends_at_known_boundary(),
+                true,
+            );
+            if matches!(lookahead_end, NextWFTSeqEndIndex::Incomplete(_)) && !self.has_last_wft {
+                break;
+            }
+            let lookahead_events = &lookahead[..=lookahead_end.index()];
+            if lookahead_events.iter().any(|e| {
+                matches!(
+                    e.attributes,
+                    Some(
+                        Attributes::MarkerRecordedEventAttributes(_)
+                            | Attributes::WorkflowExecutionUpdateAcceptedEventAttributes(_)
+                    )
+                ) && e.get_patch_marker_details().is_none()
+            }) {
+                break;
+            }
+            let mut jobs = vec![];
+            let mut safe = true;
+            for event in events {
+                match &event.attributes {
+                    Some(Attributes::WorkflowTaskCompletedEventAttributes(completed)) => {
+                        flags.add_from_complete(completed);
+                        if let Some(version) = completed_deployment_version(completed) {
+                            previous.deployment_version_for_current_task = Some(version.into());
+                        }
+                    }
+                    Some(Attributes::WorkflowExecutionSignaledEventAttributes(signal)) => jobs
+                        .push(
+                            workflow_activation_job::Variant::SignalWorkflow(SignalWorkflow::from(
+                                (signal.clone(), event.event_id),
+                            ))
+                            .into(),
+                        ),
+                    Some(Attributes::WorkflowExecutionCancelRequestedEventAttributes(cancel)) => {
+                        jobs.push(
+                            workflow_activation_job::Variant::CancelWorkflow(CancelWorkflow::from(
+                                cancel.clone(),
+                            ))
+                            .into(),
+                        );
+                    }
+                    Some(
+                        Attributes::WorkflowTaskScheduledEventAttributes(_)
+                        | Attributes::WorkflowTaskStartedEventAttributes(_),
+                    ) => {}
+                    Some(Attributes::MarkerRecordedEventAttributes(_))
+                        if event.get_patch_marker_details().is_some() => {}
+                    _ => match stateful_jobs(event) {
+                        Some(mut more) => jobs.append(&mut more),
+                        None => {
+                            safe = false;
+                            break;
+                        }
+                    },
+                }
+            }
+            let Some(timestamp) = started.event_time else {
+                break;
+            };
+            if !safe || SystemTime::try_from(timestamp).is_err() {
+                break;
+            }
+            jobs.extend(lookahead_events.iter().filter_map(|event| {
+                event.get_patch_marker_details().map(|(patch_id, _)| {
+                    workflow_activation_job::Variant::NotifyHasPatch(NotifyHasPatch { patch_id })
+                        .into()
+                })
+            }));
+            // Replay reads completion metadata ahead of executing the corresponding activation.
+            flags.add_from_complete(completed);
+            if let Some(version) = completed_deployment_version(completed) {
+                previous.deployment_version_for_current_task = Some(version.into());
+            }
+            let timestamp = match previous.timestamp {
+                Some(old) if (old.seconds, old.nanos) > (timestamp.seconds, timestamp.nanos) => old,
+                _ => timestamp,
+            };
+            let mut next = WorkflowActivation {
+                timestamp: Some(timestamp),
+                history_length: started.event_id as u32,
+                history_size_bytes: u64::try_from(attrs.history_size_bytes).unwrap_or_default(),
+                continue_as_new_suggested: attrs.suggest_continue_as_new,
+                suggest_continue_as_new_reasons: attrs.suggest_continue_as_new_reasons.clone(),
+                target_worker_deployment_version_changed: attrs
+                    .target_worker_deployment_version_changed,
+                available_internal_flags: flags.all_lang().collect(),
+                last_sdk_version: flags.last_sdk_version().unwrap_or_default().to_owned(),
+                jobs,
+                ..previous
+            };
+            prepare_to_ship_activation(&mut next);
+            previous = next.clone();
+            activations.push(next);
+            rest = lookahead;
+        }
+        activations
+    }
+
     pub(crate) fn get_events(&self) -> &[HistoryEvent] {
         &self.events
     }
+}
+
+pub(super) fn completed_deployment_version(
+    completed: &WorkflowTaskCompletedEventAttributes,
+) -> Option<WorkerDeploymentVersion> {
+    let mut version = WorkerDeploymentVersion::builder()
+        .deployment_name("")
+        .build_id("")
+        .build();
+    #[allow(deprecated)]
+    if let Some(build_id) = completed.worker_version.as_ref().map(|v| &v.build_id) {
+        version.build_id = build_id.clone();
+    }
+    if !completed.worker_deployment_name.is_empty() {
+        version.deployment_name = completed.worker_deployment_name.clone();
+    }
+    #[allow(deprecated)]
+    if !completed.worker_deployment_version.is_empty()
+        && let Ok(parsed) = completed.worker_deployment_version.parse()
+    {
+        version = parsed;
+    }
+    if let Some(deployment) = completed.deployment_version.as_ref() {
+        version = deployment.clone().into();
+    }
+    (!version.is_empty()).then_some(version)
 }
 
 #[derive(Debug)]
