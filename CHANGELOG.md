@@ -51,6 +51,7 @@ relevant information.
 
 
 ### Fixed
+* Local activities now respect ScheduleToClose deadlines that expire between in-process retries.
 * Avoid scanning the workflow cache when no workflow tasks are waiting for a cache slot, reducing
   workflow processing CPU overhead with large caches.
 * `temporal.api.sdk.v1` messages are capable of serialization to proto JSON, so their JSON field

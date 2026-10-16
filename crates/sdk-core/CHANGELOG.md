@@ -42,6 +42,7 @@ relevant information.
   nondeterminism while retaining compatibility with histories recorded before these checks.
 
 ### Fixed
+* Local Activity retries now stop when the ScheduleToClose deadline expires between in-process attempts.
 * Workers with large workflow caches avoid unnecessary CPU usage when no workflow tasks are waiting
   for a cache slot.
 * Worker heartbeats now report correct task-slot and poller counts when using buffered or custom
