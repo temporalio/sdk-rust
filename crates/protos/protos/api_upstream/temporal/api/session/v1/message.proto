@@ -1,0 +1,18 @@
+syntax = "proto3";
+
+package temporal.api.session.v1;
+
+option go_package = "go.temporal.io/api/session/v1;session";
+option java_package = "io.temporal.api.session.v1";
+option java_multiple_files = true;
+option java_outer_classname = "MessageProto";
+option ruby_package = "Temporalio::Api::Session::V1";
+option csharp_namespace = "Temporalio.Api.Session.V1";
+
+message ActivitySessionOptions {
+    oneof session {
+        bool workflow_sticky_session = 1;
+
+        // later session_id, etc
+    }
+}

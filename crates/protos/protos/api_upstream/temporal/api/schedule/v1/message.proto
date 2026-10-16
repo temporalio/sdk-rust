@@ -310,6 +310,10 @@ message SchedulePatch {
     // notes field to the value of the string.
     string pause = 3;
     string unpause = 4;
+
+    // If set, applies the specified time-skipping configuration to this schedule,
+    // replacing any existing time-skipping configuration.
+    temporal.api.common.v1.TimeSkippingConfig time_skipping_config = 5;
 }
 
 message ScheduleInfo {
@@ -352,6 +356,10 @@ message ScheduleInfo {
 
     // Size of the schedule's internal state (including payloads) in bytes.
     int64 state_size_bytes = 12;
+
+    // Information about time skipping for this schedule.
+    // If the schedule has never enabled time skipping, this will be unset.
+    temporal.api.common.v1.TimeSkippingInfo time_skipping_info = 13;
 }
 
 message Schedule {

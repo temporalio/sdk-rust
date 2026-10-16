@@ -219,8 +219,14 @@ message StartWorkflowExecutionRequest {
 
     // Time-skipping configuration. If not set, time skipping is disabled.
     temporal.api.common.v1.TimeSkippingConfig time_skipping_config = 29;
+
     // Serialization context propagated from the Nexus caller that started this workflow.
     temporal.api.nexus.v1.PropagatedSerializationContext propagated_nexus_serialization_context = 30;
+
+    // Time-skipping state propagated by the execution that started this workflow.
+    // This field is intended for use by the Temporal server, for example when a schedule
+    // starts a workflow, and is not intended to be set by external clients.
+    temporal.api.common.v1.TimeSkippingStatePropagation time_skipping_state_propagation = 31;
 }
 
 message StartWorkflowExecutionResponse {
@@ -317,6 +323,17 @@ message PollWorkflowTaskQueueRequest {
     // Removed in 1.55.0; was temporal.api.worker.v1.WorkerHeartbeat worker_heartbeat
     reserved 7;
     reserved "worker_heartbeat";
+
+    // EXPERIMENTAL. Subject to removal in the future.
+    // This flag is only applicable to sticky polls. In this mode, server will forward the workflow task sticky polls
+    // to the normal queue only once. The forwarding to normal queue will stop once a single task is dispatched from the
+    // normal queue to pollers of this particular sticky queue.
+    // Server persists the workflow ID of the first matched task in the sticky task queue's metadata. This will allow
+    // system to enforce single-workflow mode even when the server crashes, or a worker with stable identity restarts
+    // (when worker's sticky queue name remains the same after restart.)
+    // For activity sticky polls, this mode will disable forwarding to normal queue completely.
+    // (-- api-linter: core::0140::prepositions=disabled
+    bool single_workflow_mode = 11;
 }
 
 message PollWorkflowTaskQueueResponse {
@@ -547,6 +564,17 @@ message PollActivityTaskQueueRequest {
     // Removed in 1.55.0; was temporal.api.worker.v1.WorkerHeartbeat worker_heartbeat
     reserved 7;
     reserved "worker_heartbeat";
+
+    // EXPERIMENTAL. Subject to removal in the future.
+    // This flag is only applicable to sticky polls. In this mode, server will forward the workflow task sticky polls
+    // to the normal queue only once. The forwarding to normal queue will stop once a single task is dispatched from the
+    // normal queue to pollers of this particular sticky queue.
+    // Server persists the workflow ID of the first matched task in the sticky task queue's metadata. This will allow
+    // system to enforce single-workflow mode even when the server crashes, or a worker with stable identity restarts
+    // (when worker's sticky queue name remains the same after restart.)
+    // For activity sticky polls, this mode will disable forwarding to normal queue completely.
+    // (-- api-linter: core::0140::prepositions=disabled
+    bool single_workflow_mode = 11;
 }
 
 message PollActivityTaskQueueResponse {
