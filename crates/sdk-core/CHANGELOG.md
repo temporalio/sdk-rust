@@ -33,6 +33,10 @@ relevant information.
 
 ## Unreleased
 
+### Added
+* SDK bridges can opt in at build time to preserving workflow task boundaries during replay,
+  including for running workflows. The transition is recorded in history and defaults to off.
+
 ### Breaking Changes
 * Replay detects changes to the service or operation of scheduled Nexus operations, reporting
   nondeterminism while retaining compatibility with histories recorded before these checks.
@@ -52,8 +56,6 @@ relevant information.
 ## [0.10.0] - 2026-10-06
 
 ### Added
-* SDK bridges can opt in at build time to preserving workflow task boundaries during replay,
-  including for running workflows. The transition is recorded in history and defaults to off.
 * Child workflow commands, including those submitted through the C bridge, support pinned,
   auto-upgrade, and one-time worker deployment versioning overrides on Temporal Server 1.32.0
   or later. Child-start resolutions distinguish invalid versioning overrides and missing
