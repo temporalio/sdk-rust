@@ -38,6 +38,8 @@ relevant information.
   differs from the command that produced it.
 
 ### Added
+* Clients can start typed Temporal-managed Nexus operations outside workflows with the experimental
+  `nexus_client` API, then retrieve results, reconnect to an execution, cancel it, or describe it.
 * Workers can serve typed Nexus service operations with experimental
   `temporal_nexus_service_handler` handlers, including synchronous results and workflow-backed
   asynchronous operations with cancellation.
