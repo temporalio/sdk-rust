@@ -33,6 +33,10 @@ relevant information.
 
 ## Unreleased
 
+### Added
+* SDK bridges can opt in at build time to preserving workflow task boundaries during replay,
+  including for running workflows. The transition is recorded in history and defaults to off.
+
 ### Breaking Changes
 * Replay detects changes to the service or operation of scheduled Nexus operations, reporting
   nondeterminism while retaining compatibility with histories recorded before these checks.

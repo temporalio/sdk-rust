@@ -59,6 +59,11 @@ import "temporal/sdk/core/nexus/nexus.proto";
 // (which must be stable based on lang implementation or convention), rather than the order jobs are
 // processed.
 //
+// An activation may have no jobs when a workflow task boundary must be preserved for replay.
+// Lang must still apply its timestamp and metadata, drive the workflow scheduler (including
+// conditions that depend on the clock), and return a completion. Skipping such activations can
+// change workflow behavior between live execution and replay.
+//
 // ## Evictions
 //
 // Evictions appear as an activations that contains only a `remove_from_cache` job. Such activations
