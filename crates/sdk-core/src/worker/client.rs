@@ -451,6 +451,9 @@ pub struct PollOptions {
 pub struct PollWorkflowOptions {
     /// Optional sticky queue name for session‐based workflow polling
     pub sticky_queue_name: Option<String>,
+    /// Experimental: dedicate this sticky poller to a single workflow.
+    #[builder(default)]
+    pub single_workflow_mode: bool,
 }
 /// Additional options specific to activity task polling
 #[derive(Debug, Clone, Default, bon::Builder)]
@@ -460,6 +463,9 @@ pub struct PollActivityOptions {
     pub max_tasks_per_sec: Option<f64>,
     /// Poll the worker's sticky queue instead of the normal activity queue.
     pub sticky_queue_name: Option<String>,
+    /// Experimental: dedicate this sticky poller to a single workflow.
+    #[builder(default)]
+    pub single_workflow_mode: bool,
 }
 /// Additional options specific to Nexus task polling
 #[derive(Debug, Clone, Default)]
@@ -500,7 +506,7 @@ impl WorkerClient for WorkerClientBag {
             worker_instance_key: self.worker_instance_key.to_string(),
             worker_control_task_queue: self.worker_control_task_queue(),
             poller_group_id: Default::default(),
-            single_workflow_mode: false,
+            single_workflow_mode: wf_options.single_workflow_mode,
         }
         .into_request();
         request.extensions_mut().insert(IsWorkerTaskLongPoll);
@@ -552,7 +558,7 @@ impl WorkerClient for WorkerClientBag {
             worker_instance_key: self.worker_instance_key.to_string(),
             worker_control_task_queue: self.worker_control_task_queue(),
             poller_group_id: Default::default(),
-            single_workflow_mode: false,
+            single_workflow_mode: act_options.single_workflow_mode,
         }
         .into_request();
         request.extensions_mut().insert(IsWorkerTaskLongPoll);
@@ -1316,7 +1322,11 @@ mod tests {
             },
             Uuid::new_v4(),
         );
-        for sticky_queue_name in [None, Some("sticky".to_owned())] {
+        for (sticky_queue_name, single_workflow_mode) in [
+            (None, false),
+            (Some("sticky".to_owned()), false),
+            (Some("sticky".to_owned()), true),
+        ] {
             client
                 .poll_workflow_task(
                     PollOptions {
@@ -1326,6 +1336,7 @@ mod tests {
                     },
                     PollWorkflowOptions::builder()
                         .maybe_sticky_queue_name(sticky_queue_name.clone())
+                        .single_workflow_mode(single_workflow_mode)
                         .build(),
                 )
                 .await
@@ -1340,16 +1351,17 @@ mod tests {
                     PollActivityOptions::builder()
                         .maybe_sticky_queue_name(sticky_queue_name)
                         .max_tasks_per_sec(7.0)
+                        .single_workflow_mode(single_workflow_mode)
                         .build(),
                 )
                 .await
                 .unwrap();
         }
         let requests = requests.lock().unwrap();
-        assert_eq!(requests.len(), 4);
+        assert_eq!(requests.len(), 6);
         for (i, (rpc, queue, single_workflow_mode)) in requests.iter().enumerate() {
             assert_eq!(*rpc, if i % 2 == 0 { "workflow" } else { "activity" });
-            assert!(!*single_workflow_mode);
+            assert_eq!(*single_workflow_mode, i >= 4);
             assert_eq!(
                 *queue,
                 if i < 2 {

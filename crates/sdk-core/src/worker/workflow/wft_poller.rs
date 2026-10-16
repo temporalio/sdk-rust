@@ -43,7 +43,8 @@ pub(crate) fn make_wft_poller(
         config.workflow_task_poller_behavior,
         &capabilities,
     );
-    let wft_poller_shared = if sticky_queue_name.is_some() {
+    let single_workflow_mode = config.single_workflow_mode();
+    let wft_poller_shared = if sticky_queue_name.is_some() && !single_workflow_mode {
         // Balance on the limit `acquire_owned` actually enforces (min of slot supplier and cache
         // size). Using only the slot supplier lets a small cache starve the non-sticky poller.
         let balance_limit = [wft_slots.available_permits(), wft_slots.max_permits()]
@@ -54,35 +55,45 @@ pub(crate) fn make_wft_poller(
     } else {
         None
     };
-    let wf_task_poll_buffer = Some(LongPollBuffer::new_workflow_task(
-        client.clone(),
-        config.task_queue.clone(),
-        None,
-        sticky_poller_behavior(effective_behavior, config, false),
-        wft_slots.clone(),
-        shutdown_token.child_token(),
-        Some(move |np| {
-            wft_metrics.record_num_pollers(np);
-        }),
-        WorkflowTaskOptions {
-            wft_poller_shared: wft_poller_shared.clone(),
-        },
-        last_successful_poll_time,
-        capabilities.clone(),
-    ));
+    let wf_task_poll_buffer = (!single_workflow_mode).then(|| {
+        LongPollBuffer::new_workflow_task(
+            client.clone(),
+            config.task_queue.clone(),
+            None,
+            sticky_poller_behavior(effective_behavior, config, false),
+            wft_slots.clone(),
+            shutdown_token.child_token(),
+            Some(move |np| {
+                wft_metrics.record_num_pollers(np);
+            }),
+            WorkflowTaskOptions {
+                wft_poller_shared: wft_poller_shared.clone(),
+                single_workflow_mode,
+            },
+            last_successful_poll_time,
+            capabilities.clone(),
+        )
+    });
     let sticky_queue_poller = sticky_queue_name.as_ref().map(|sqn| {
         let sticky_metrics = metrics.with_new_attrs([workflow_sticky_poller()]);
         LongPollBuffer::new_workflow_task(
             client.clone(),
             config.task_queue.clone(),
             Some(sqn.clone()),
-            sticky_poller_behavior(effective_behavior, config, true),
+            if single_workflow_mode {
+                effective_behavior
+            } else {
+                sticky_poller_behavior(effective_behavior, config, true)
+            },
             wft_slots.clone().into_sticky(),
             shutdown_token.child_token(),
             Some(move |np| {
                 sticky_metrics.record_num_pollers(np);
             }),
-            WorkflowTaskOptions { wft_poller_shared },
+            WorkflowTaskOptions {
+                wft_poller_shared,
+                single_workflow_mode,
+            },
             sticky_last_successful_poll_time,
             capabilities,
         )
@@ -172,6 +183,7 @@ mod tests {
         },
     };
     use futures_util::{FutureExt, StreamExt, pin_mut};
+    use rstest::rstest;
     use std::{
         future::Future,
         sync::{
@@ -179,6 +191,7 @@ mod tests {
             atomic::{AtomicUsize, Ordering},
         },
         task::{Context, Poll, Wake},
+        time::Duration,
     };
     use temporalio_common::protos::temporal::api::enums::v1::EventType;
     use tokio::sync::watch;
@@ -228,6 +241,66 @@ mod tests {
         sticky_target_tx.send_replace(2);
         assert_ne!(wake_counter.0.load(Ordering::Relaxed), 0);
         assert_eq!(waiter.as_mut().poll(&mut context), Poll::Ready(()));
+    }
+
+    #[rstest]
+    #[case(PollerBehavior::SimpleMaximum(1), 1)]
+    #[case(PollerBehavior::SimpleMaximum(5), 5)]
+    #[case(PollerBehavior::Autoscaling { minimum: 1, maximum: 8, initial: 3 }, 3)]
+    #[tokio::test]
+    async fn single_workflow_polls_only_sticky_with_full_behavior(
+        #[case] behavior: PollerBehavior,
+        #[case] expected_polls: usize,
+    ) {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut client = mock_manual_worker_client();
+        client
+            .expect_poll_workflow_task()
+            .times(expected_polls)
+            .returning(move |poll, workflow| {
+                assert_eq!(poll.task_queue, "normal");
+                assert_eq!(workflow.sticky_queue_name.as_deref(), Some("stable-sticky"));
+                assert!(workflow.single_workflow_mode);
+                tx.send(()).unwrap();
+                std::future::pending().boxed()
+            });
+        let client: Arc<dyn WorkerClient> = Arc::new(client);
+        let mut config = test_worker_cfg().build().unwrap();
+        config.task_queue = "normal".to_owned();
+        config.session_worker_options = Some(crate::SessionWorkerOptions::default());
+        config.experimental_worker_affinity_options = Some(
+            crate::ExperimentalWorkerAffinityOptions::builder()
+                .single_workflow_mode(true)
+                .build(),
+        );
+        config.workflow_task_poller_behavior = Some(behavior);
+        config.nonsticky_to_sticky_poll_ratio = 1.0;
+        let slots = fixed_size_permit_dealer(10);
+        let shutdown = CancellationToken::new();
+        let stream = make_wft_poller(
+            &config,
+            &Some("stable-sticky".to_owned()),
+            &client,
+            &MetricsContext::no_op(),
+            &shutdown,
+            &slots,
+            Arc::new(AtomicCell::new(None)),
+            Arc::new(AtomicCell::new(None)),
+            Arc::new(NamespaceCapabilities::default()),
+        );
+        let polling = tokio::spawn(async move {
+            pin_mut!(stream);
+            stream.next().await
+        });
+        for _ in 0..expected_polls {
+            tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+        }
+        shutdown.cancel();
+        assert!(polling.await.unwrap().is_none());
+        assert_eq!(slots.available_permits(), Some(10));
     }
 
     #[tokio::test]
