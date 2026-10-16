@@ -100,7 +100,7 @@ pub use crate::{
 pub use runtime::Runtime;
 pub use temporalio_client::Namespace;
 #[cfg(feature = "experimental")]
-pub use temporalio_workflow::nexus;
+pub mod nexus;
 pub use temporalio_workflow::{
     ActivityCancellationType, ActivityCloseTimeouts, ActivityOptions, BaseWorkflowContext,
     CancellableFuture, CancellableFutureWithReason, ChildWorkflowCancellationType,
@@ -185,8 +185,8 @@ use crate::runtime::{PollerBehavior, WorkflowErrorType, worker_tuner::WorkerTune
 
 /// Contains options for configuring a worker.
 ///
-/// The worker polls task types according to its registered workflows and activities. At least one
-/// workflow or activity must be registered.
+/// The worker polls task types according to its registered workflows, activities, and experimental
+/// Nexus services. At least one task handler must be registered.
 #[derive(bon::Builder, Clone)]
 #[builder(start_fn = new, on(String, into), state_mod(vis = "pub"))]
 #[non_exhaustive]
@@ -201,6 +201,10 @@ pub struct WorkerOptions {
 
     #[builder(field)]
     workflows: WorkflowDefinitions,
+
+    #[cfg(feature = "experimental")]
+    #[builder(field)]
+    nexus_services: nexus::NexusServices,
 
     #[builder(field)]
     worker_interceptors: Vec<Arc<dyn WorkerInterceptor>>,
@@ -399,6 +403,26 @@ impl<S: worker_options_builder::State> WorkerOptionsBuilder<S> {
 }
 
 impl<S: worker_options_builder::State> WorkerOptionsBuilder<S> {
+    /// Register an experimental typed Nexus service handler.
+    #[cfg(feature = "experimental")]
+    pub fn register_nexus_service(
+        mut self,
+        handler: impl nexus::TemporalNexusServiceHandler,
+    ) -> Result<Self, nexus::NexusRegistrationError> {
+        self.nexus_services.register(handler)?;
+        Ok(self)
+    }
+
+    /// Observe experimental Nexus handler requests and outcomes.
+    #[cfg(feature = "experimental")]
+    pub fn nexus_handler_interceptor(
+        mut self,
+        interceptor: Arc<dyn nexus::NexusHandlerInterceptor>,
+    ) -> Self {
+        self.nexus_services.interceptor(interceptor);
+        self
+    }
+
     pub(crate) fn with_workflows(mut self, workflows: WorkflowDefinitions) -> Self {
         self.workflows = workflows;
         self
@@ -560,6 +584,25 @@ fn def_build_id() -> WorkerDeploymentOptions {
 }
 
 impl WorkerOptions {
+    /// Register an experimental typed Nexus service handler.
+    #[cfg(feature = "experimental")]
+    pub fn register_nexus_service(
+        &mut self,
+        handler: impl nexus::TemporalNexusServiceHandler,
+    ) -> Result<(), nexus::NexusRegistrationError> {
+        self.nexus_services.register(handler)
+    }
+
+    /// Observe experimental Nexus handler requests and outcomes.
+    #[cfg(feature = "experimental")]
+    pub fn nexus_handler_interceptor(
+        &mut self,
+        interceptor: Arc<dyn nexus::NexusHandlerInterceptor>,
+    ) -> &mut Self {
+        self.nexus_services.interceptor(interceptor);
+        self
+    }
+
     /// Append a worker interceptor. Interceptors run in registration order.
     #[cfg(feature = "experimental")]
     pub fn worker_interceptor<I: WorkerInterceptor + 'static>(
@@ -672,8 +715,17 @@ impl WorkerOptions {
         let workflows_registered =
             workflows_registered || !self.wasm_workflow_components.is_empty();
         let activities_registered = !self.activities.is_empty();
-        if !workflows_registered && !activities_registered {
-            return Err("At least one workflow or activity must be registered".to_owned());
+        #[cfg(feature = "experimental")]
+        let nexus_registered = !self.nexus_services.is_empty();
+        #[cfg(not(feature = "experimental"))]
+        let nexus_registered = false;
+        if !workflows_registered && !activities_registered && !nexus_registered {
+            return Err(if cfg!(feature = "experimental") {
+                "At least one workflow, activity, or Nexus service must be registered"
+            } else {
+                "At least one workflow or activity must be registered"
+            }
+            .to_owned());
         }
         #[cfg(feature = "experimental")]
         let disable_payload_error_limit = self.disable_payload_error_limit;
@@ -727,7 +779,7 @@ impl WorkerOptions {
                 enable_workflows: workflows_registered,
                 enable_local_activities: workflows_registered && activities_registered,
                 enable_remote_activities: activities_registered,
-                enable_nexus: false,
+                enable_nexus: nexus_registered,
             })
             .sticky_queue_schedule_to_start_timeout(self.sticky_queue_schedule_to_start_timeout)
             .max_heartbeat_throttle_interval(self.max_heartbeat_throttle_interval)
@@ -777,6 +829,8 @@ pub struct Worker {
     common: CommonWorker,
     workflow_half: WorkflowHalf,
     activity_half: ActivityHalf,
+    #[cfg(feature = "experimental")]
+    nexus_half: nexus::NexusHalf,
 }
 
 #[derive(derive_more::Debug)]
@@ -983,6 +1037,7 @@ impl Worker {
         #[cfg(feature = "experimental")]
         {
             me.workflow_half.patch_activation_callback = options.patch_activation_callback;
+            me.nexus_half.services = options.nexus_services;
         }
         #[cfg(feature = "wasm-workflows")]
         me.workflow_half
@@ -1026,6 +1081,8 @@ impl Worker {
                 activities,
                 ..Default::default()
             },
+            #[cfg(feature = "experimental")]
+            nexus_half: Default::default(),
         }
     }
 
@@ -1115,6 +1172,10 @@ impl Worker {
             .map_err(WorkerValidationError::from_core)
             .map_err(WorkerRunError::Validation)?;
         let shutdown_token = CancellationToken::new();
+        #[cfg(feature = "experimental")]
+        let mut nexus_half = nexus::NexusHalf {
+            services: self.nexus_half.services.clone(),
+        };
         let (common, wf_half, act_half) = self.split_apart();
         let (wf_future_tx, wf_future_rx) =
             unbounded_channel::<WorkflowFutureHandle<TaskHandle<WorkflowResult<Payload>>>>();
@@ -1364,6 +1425,11 @@ impl Worker {
                 Result::<_, WorkerRunError>::Ok(())
             },
             wf_completion_processor,
+            async {
+                #[cfg(feature = "experimental")]
+                nexus_half.run(common).await?;
+                Result::<_, WorkerRunError>::Ok(())
+            },
         )?;
 
         for i in &self.common.worker_interceptors {
@@ -2143,7 +2209,11 @@ mod tests {
     #[case::empty(
         false,
         false,
-        Err("At least one workflow or activity must be registered")
+        Err(if cfg!(feature = "experimental") {
+            "At least one workflow, activity, or Nexus service must be registered"
+        } else {
+            "At least one workflow or activity must be registered"
+        })
     )]
     #[test]
     fn task_types_are_derived_from_registrations(

@@ -497,6 +497,11 @@ pub struct WorkflowStartOptions {
     #[builder(start_fn)]
     pub workflow_id: String,
 
+    /// Stable idempotency ID for retrying the same start across independent client calls.
+    /// If omitted, each call generates a UUID.
+    #[cfg(feature = "experimental")]
+    pub request_id: Option<String>,
+
     /// Set the policy for reusing the workflow id
     #[builder(default)]
     pub id_reuse_policy: WorkflowIdReusePolicy,
@@ -729,6 +734,8 @@ impl WorkflowUpdateWithStartOptions {
             WorkflowStartOptions {
                 task_queue,
                 workflow_id,
+                #[cfg(feature = "experimental")]
+                request_id: None,
                 id_reuse_policy,
                 id_conflict_policy,
                 execution_timeout,

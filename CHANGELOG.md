@@ -38,6 +38,9 @@ relevant information.
   differs from the command that produced it.
 
 ### Added
+* Workers can serve typed Nexus service operations with experimental
+  `temporal_nexus_service_handler` handlers, including synchronous results and workflow-backed
+  asynchronous operations with cancellation.
 * Workflows can call typed Nexus service operations with `nexus_client`, `execute`, and `start`
   when the `experimental` feature is enabled, using service definitions from the draft Nexus Rust
   SDK. Started operations expose a typed result, operation token, and cancellation.
@@ -54,6 +57,9 @@ relevant information.
 
 
 ### Fixed
+* Workflow starts retain the server's first execution run ID when it differs from the current run.
+* Workflow starts that reuse a running execution attach their requested completion callbacks and
+  links, including callbacks for workflow-backed Nexus operations.
 * `temporal.api.sdk.v1` messages are capable of serialization to proto JSON, so their JSON field
   names are camel case rather than snake case and the binary encoding is unchanged. They previously
   could not be deserialized from the camel case that other Temporal SDKs and protobuf tools emit,
