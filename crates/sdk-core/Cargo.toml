@@ -124,7 +124,7 @@ tracing = "0.1"
 url = "2.5"
 uuid = { version = "1.18", default-features = false, features = ["v4"] }
 # Only need specific features to decompress zip files for ephemeral server download
-zip = { version = "8.4", optional = true, default-features = false, features = [
+zip = { version = "9.0", optional = true, default-features = false, features = [
   "deflate",
   "bzip2",
   "zstd",
