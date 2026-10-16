@@ -38,7 +38,6 @@ pub(crate) use activities::{
     ExecutingLAId, LocalActRequest, LocalActivityExecutionResult, LocalActivityResolution,
     NewLocalAct,
 };
-pub(crate) use wft_poller::WFTPollerShared;
 
 #[allow(unreachable_pub)] // re-exported in test_help::integ_helpers
 pub use workflow::LEGACY_QUERY_ID;
@@ -46,11 +45,11 @@ pub use workflow::LEGACY_QUERY_ID;
 use crate::{
     ActivityHeartbeat,
     abstractions::{MeteredPermitDealer, PermitDealerContextData, dbg_panic},
-    pollers::{ActivityTaskOptions, BoxedActPoller, BoxedNexusPoller, LongPollBuffer},
+    pollers::{BoxedActPoller, BoxedNexusPoller, LongPollBuffer, make_activity_task_buffer},
     protosext::validate_activity_completion,
     telemetry::metrics::{
-        MetricsContext, WorkerHeartbeatMetrics, activity_poller, activity_worker_type,
-        local_activity_worker_type, nexus_poller, nexus_worker_type, workflow_worker_type,
+        MetricsContext, WorkerHeartbeatMetrics, activity_worker_type, local_activity_worker_type,
+        nexus_poller, nexus_worker_type, workflow_worker_type,
     },
     worker::{
         activities::{LACompleteAction, LocalActivityManager, NextPendingLAAction},
@@ -58,8 +57,7 @@ use crate::{
         heartbeat::SharedNamespaceWorker,
         nexus::NexusManager,
         workflow::{
-            LAReqSink, LocalResolution, WorkflowBasics, Workflows, wft_poller,
-            wft_poller::make_wft_poller,
+            LAReqSink, LocalResolution, WorkflowBasics, Workflows, wft_poller::make_wft_poller,
         },
     },
 };
@@ -128,6 +126,33 @@ use {
     },
 };
 
+/// Experimental options enabling sticky activity support for session workers.
+#[derive(Clone, Debug, Default, bon::Builder)]
+#[non_exhaustive]
+pub struct SessionWorkerOptions {}
+
+/// Short-lived experimental worker affinity controls.
+///
+/// This API is expected to be substantially redesigned or removed as sessions evolve.
+/// Applications using it should expect migration work in future releases.
+#[derive(Clone, Debug, Default, bon::Builder)]
+#[non_exhaustive]
+pub struct ExperimentalWorkerAffinityOptions {
+    /// Override the workflow sticky queue name, also used for sticky activity polling when
+    /// [`WorkerConfig::session_worker_options`] is enabled.
+    ///
+    /// The name must be unique to one concurrently live worker, but should remain stable across
+    /// that worker's restarts to retain the server's routing association. Sharing it between live
+    /// workers defeats worker affinity. Requires a nonzero workflow cache and a nonempty name.
+    pub sticky_queue_name: Option<String>,
+    /// Poll only the sticky workflow and activity queues, dedicating this worker to one workflow.
+    /// Requires session worker support, workflows, remote activities, and a nonzero workflow cache.
+    /// Workflow completion does not rebind the sticky destination; serving another workflow requires
+    /// deliberately choosing a new destination and worker lifecycle. Nexus polling is unchanged.
+    #[builder(default)]
+    pub single_workflow_mode: bool,
+}
+
 /// Defines per-worker configuration options
 #[derive(Clone, bon::Builder)]
 #[builder(on(String, into), state_mod(vis = "pub"), finish_fn(vis = "", name = build_internal))]
@@ -149,12 +174,19 @@ pub struct WorkerConfig {
     /// or failures.
     #[builder(default = 0)]
     pub max_cached_workflows: usize,
+    /// Experimental: enables session activity polling on this worker's workflow sticky queue.
+    /// Requires workflows, remote activities, and a nonzero workflow cache.
+    /// `None` leaves activity polling on the normal task queue only.
+    pub session_worker_options: Option<SessionWorkerOptions>,
+    /// Short-lived experimental affinity controls, expected to require migration as sessions evolve.
+    pub experimental_worker_affinity_options: Option<ExperimentalWorkerAffinityOptions>,
     /// Set a [crate::WorkerTuner] for this worker. Either this or at least one of the
     /// `max_outstanding_*` fields must be set.
     pub tuner: Option<Arc<dyn WorkerTuner + Send + Sync>>,
     /// Maximum number of concurrent poll workflow task requests we will perform at a time on this
     /// worker's task queue. See also [WorkerConfig::nonsticky_to_sticky_poll_ratio].
-    /// If using SimpleMaximum, Must be at least 2 when `max_cached_workflows` > 0, or is an error.
+    /// If using SimpleMaximum, must be at least 2 when `max_cached_workflows` > 0, except in
+    /// single-workflow mode.
     ///
     /// When left unset (`None`), the effective behavior is resolved at worker start: pollers are
     /// automatically enrolled into poller autoscaling when the namespace advertises the
@@ -168,6 +200,9 @@ pub struct WorkerConfig {
     /// queue will allow 4 max pollers while the nonsticky queue will allow one. The minimum for
     /// either poller is 1, so if the maximum allowed is 1 and sticky queues are enabled, there will
     /// be 2 concurrent polls.
+    ///
+    /// Session workers also use this ratio to divide activity pollers between normal and sticky
+    /// queues. Single-workflow mode ignores the ratio and uses all configured pollers on sticky.
     #[builder(default = 0.2)]
     pub nonsticky_to_sticky_poll_ratio: f32,
     /// Maximum number of concurrent poll activity task requests we will perform at a time on this
@@ -261,6 +296,8 @@ pub struct WorkerConfig {
     #[builder(into)]
     pub max_outstanding_workflow_tasks: Option<usize>,
     /// The maximum number of activity tasks that will ever be given to this worker concurrently.
+    /// Must be at least 2 for session workers polling both normal and sticky activity queues.
+    /// Sticky-only single-workflow workers may use 1.
     ///
     /// Mutually exclusive with `tuner`
     #[builder(into)]
@@ -302,6 +339,12 @@ pub struct WorkerConfig {
 }
 
 impl WorkerConfig {
+    pub(crate) fn single_workflow_mode(&self) -> bool {
+        self.experimental_worker_affinity_options
+            .as_ref()
+            .is_some_and(|options| options.single_workflow_mode)
+    }
+
     /// Returns true if the configuration specifies we should fail a workflow on a certain error
     /// type rather than failing the workflow task.
     pub fn should_fail_workflow(
@@ -348,6 +391,31 @@ impl<S: worker_config_builder::IsComplete> WorkerConfigBuilder<S> {
                 "`task_types` cannot enable local activities without workflows".to_string(),
             );
         }
+        if config.session_worker_options.is_some()
+            && (!task_types.enable_workflows
+                || !task_types.enable_remote_activities
+                || config.max_cached_workflows == 0)
+        {
+            return Err(
+                "`session_worker_options` requires workflows, remote activities, and `max_cached_workflows` > 0"
+                    .to_string(),
+            );
+        }
+        if let Some(options) = &config.experimental_worker_affinity_options {
+            if options.single_workflow_mode && config.session_worker_options.is_none() {
+                return Err("`single_workflow_mode` requires `session_worker_options`".to_string());
+            }
+            if let Some(name) = &options.sticky_queue_name {
+                if name.is_empty() {
+                    return Err("`sticky_queue_name` must not be empty".to_string());
+                }
+                if config.max_cached_workflows == 0 {
+                    return Err(
+                        "`sticky_queue_name` requires `max_cached_workflows` > 0".to_string()
+                    );
+                }
+            }
+        }
 
         if let Some(b) = config.workflow_task_poller_behavior {
             b.validate()?;
@@ -373,6 +441,15 @@ impl<S: worker_config_builder::IsComplete> WorkerConfigBuilder<S> {
         if matches!(config.max_outstanding_activities, Some(v) if v == 0) {
             return Err("`max_outstanding_activities` must be > 0".to_string());
         }
+        if config.session_worker_options.is_some()
+            && !config.single_workflow_mode()
+            && matches!(config.max_outstanding_activities, Some(v) if v < 2)
+        {
+            return Err(
+                "Paired session activity polling requires `max_outstanding_activities` >= 2"
+                    .to_string(),
+            );
+        }
         if matches!(config.max_outstanding_local_activities, Some(v) if v == 0) {
             return Err("`max_outstanding_local_activities` must be > 0".to_string());
         }
@@ -389,7 +466,8 @@ impl<S: worker_config_builder::IsComplete> WorkerConfigBuilder<S> {
                         .to_string(),
                 );
             }
-            if matches!(config.workflow_task_poller_behavior, Some(PollerBehavior::SimpleMaximum(u)) if u < 2)
+            if !config.single_workflow_mode()
+                && matches!(config.workflow_task_poller_behavior, Some(PollerBehavior::SimpleMaximum(u)) if u < 2)
             {
                 return Err("`max_cached_workflows` > 0 requires `workflow_task_poller_behavior` to be at least 2".to_string());
             }
@@ -747,6 +825,11 @@ impl Worker {
         worker_heartbeat_options: Option<WorkerHeartbeatOptions>,
         shared_namespace_worker: bool,
     ) -> Result<Worker, anyhow::Error> {
+        let sticky_queue_name = config
+            .experimental_worker_affinity_options
+            .as_ref()
+            .and_then(|options| options.sticky_queue_name.clone())
+            .or(sticky_queue_name);
         let (metrics, meter) = if let Some(wt) = worker_telemetry.as_ref() {
             (
                 MetricsContext::top_level_with_meter(
@@ -766,6 +849,18 @@ impl Worker {
             sys_info = tuner_builder.get_sys_info();
             Arc::new(tuner_builder.build())
         });
+
+        let activity_supplier = tuner.activity_task_slot_supplier();
+        if config.session_worker_options.is_some()
+            && !config.single_workflow_mode()
+            && activity_supplier
+                .fixed_capacity()
+                .is_some_and(|size| size < 2)
+        {
+            anyhow::bail!(
+                "Paired session activity polling requires at least 2 fixed activity slots"
+            );
+        }
 
         metrics.worker_registered();
         let shutdown_token = CancellationToken::new();
@@ -789,7 +884,7 @@ impl Worker {
         );
         let wft_permits = wft_slots.get_extant_count_rcv();
         let act_slots = MeteredPermitDealer::new(
-            tuner.activity_task_slot_supplier(),
+            activity_supplier,
             metrics.with_new_attrs([activity_worker_type()]),
             None,
             slot_context_data.clone(),
@@ -959,22 +1054,13 @@ impl Worker {
                         };
 
                         let act_poll_buffer = if config.task_types.enable_remote_activities {
-                            let act_metrics = metrics.with_new_attrs([activity_poller()]);
-                            let ap = LongPollBuffer::new_activity_task(
-                                client.clone(),
-                                config.task_queue.clone(),
-                                resolve_effective_behavior(
-                                    config.activity_task_poller_behavior,
-                                    &capabilities,
-                                ),
-                                act_slots.clone(),
-                                shutdown_token.child_token(),
-                                Some(move |np| act_metrics.record_num_pollers(np)),
-                                ActivityTaskOptions {
-                                    max_worker_acts_per_second: config
-                                        .max_worker_activities_per_second,
-                                    max_tps: config.max_task_queue_activities_per_second,
-                                },
+                            let ap = make_activity_task_buffer(
+                                &config,
+                                &sticky_queue_name,
+                                &client,
+                                &metrics,
+                                &shutdown_token,
+                                &act_slots,
                                 act_last_suc_poll_time.clone(),
                                 capabilities.clone(),
                             );
@@ -1855,7 +1941,10 @@ pub trait WorkerTuner {
         &self,
     ) -> Arc<dyn SlotSupplier<SlotKind = WorkflowSlotKind> + Send + Sync>;
 
-    /// Return a [SlotSupplier] for activity tasks
+    /// Return a [SlotSupplier] for activity tasks. Session workers polling both normal and sticky
+    /// queues need at least one reservation per source, even under resource pressure, to avoid
+    /// becoming stuck polling only one queue. Custom suppliers must provide this protection;
+    /// [`SlotReservationContext::is_paired_activity_poller`] identifies these reservations.
     fn activity_task_slot_supplier(
         &self,
     ) -> Arc<dyn SlotSupplier<SlotKind = ActivitySlotKind> + Send + Sync>;
@@ -1907,6 +1996,12 @@ pub trait SlotSupplier {
         None
     }
 
+    /// Returns the configured capacity for fixed-size suppliers, independent of reservations.
+    /// Custom and dynamically sized suppliers need not implement this.
+    fn fixed_capacity(&self) -> Option<usize> {
+        None
+    }
+
     /// Returns a human-friendly identifier describing this supplier implementation for
     /// diagnostics and telemetry.
     fn slot_supplier_kind(&self) -> String {
@@ -1928,8 +2023,15 @@ pub trait SlotReservationContext: Send + Sync {
     /// Returns the number of currently outstanding slot permits, whether used or un-used.
     fn num_issued_slots(&self) -> usize;
 
-    /// Returns true iff this is a sticky poll for a workflow task
+    /// Returns true iff this is a sticky poll for a workflow or activity task.
     fn is_sticky(&self) -> bool;
+
+    /// Whether this activity reservation belongs to a worker polling both normal and sticky
+    /// queues. Suppliers must allow at least one reservation for each source in this case.
+    /// Sticky-only single-workflow workers do not require two reservations.
+    fn is_paired_activity_poller(&self) -> bool {
+        false
+    }
 
     /// Returns the metrics meter if metrics are enabled
     fn get_metrics_meter(&self) -> Option<TemporalMeter> {
@@ -2096,7 +2198,7 @@ impl SlotKind for NexusSlotKind {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum PollerBehavior {
     /// Will attempt to poll as long as a slot is available, up to the provided maximum. Cannot
-    /// be less than two for workflow tasks, or one for other tasks.
+    /// be less than two for cached workflow tasks outside single-workflow mode, or one otherwise.
     SimpleMaximum(usize),
     /// Will automatically scale the number of pollers based on feedback from the server. Still
     /// requires a slot to be available before beginning polling.
@@ -2404,10 +2506,14 @@ impl WorkerHeartbeatManager {
                     .is_autoscaling(),
                 });
                 worker_heartbeat.activity_poller_info = Some(WorkerPollerInfo {
-                    current_pollers: in_mem
+                    current_pollers: (in_mem
                         .num_pollers
                         .activity_current_pollers
-                        .load(Ordering::Relaxed) as i32,
+                        .load(Ordering::Relaxed)
+                        + in_mem
+                            .num_pollers
+                            .sticky_activity_current_pollers
+                            .load(Ordering::Relaxed)) as i32,
                     last_successful_poll_time: heartbeat_manager_metrics
                         .act_last_suc_poll_time
                         .load()
@@ -2502,10 +2608,10 @@ pub(crate) enum TaskPollers {
     },
 }
 
-/// Given an already-resolved workflow task poller `behavior` (see [resolve_effective_behavior]),
+/// Given an already-resolved poller `behavior` (see [resolve_effective_behavior]),
 /// applies the sticky/non-sticky split when it is a [PollerBehavior::SimpleMaximum]; other
 /// behaviors are returned unchanged.
-pub(crate) fn wft_poller_behavior(
+pub(crate) fn sticky_poller_behavior(
     behavior: PollerBehavior,
     config: &WorkerConfig,
     is_sticky: bool,
@@ -2640,11 +2746,11 @@ mod tests {
             cfg
         };
         assert_eq!(
-            wft_poller_behavior(PollerBehavior::SimpleMaximum(5), &cfg, false),
+            sticky_poller_behavior(PollerBehavior::SimpleMaximum(5), &cfg, false),
             PollerBehavior::SimpleMaximum(1)
         );
         assert_eq!(
-            wft_poller_behavior(PollerBehavior::SimpleMaximum(5), &cfg, true),
+            sticky_poller_behavior(PollerBehavior::SimpleMaximum(5), &cfg, true),
             PollerBehavior::SimpleMaximum(4)
         );
     }
@@ -2668,6 +2774,232 @@ mod tests {
     fn default_versioning_strategy() -> WorkerVersioningStrategy {
         WorkerVersioningStrategy::None {
             build_id: String::new(),
+        }
+    }
+
+    #[test]
+    fn session_worker_requires_workflows_remote_activities_and_cache() {
+        for (workflows, activities, cache, valid) in [
+            (true, true, 10, true),
+            (false, true, 10, false),
+            (true, false, 10, false),
+            (true, true, 0, false),
+        ] {
+            let result = WorkerConfig::builder()
+                .namespace("default")
+                .task_queue("test-queue")
+                .versioning_strategy(default_versioning_strategy())
+                .task_types(WorkerTaskTypes {
+                    enable_workflows: workflows,
+                    enable_remote_activities: activities,
+                    enable_local_activities: false,
+                    enable_nexus: false,
+                })
+                .max_cached_workflows(cache)
+                .session_worker_options(SessionWorkerOptions::default())
+                .build();
+            assert_eq!(result.is_ok(), valid);
+            if let Err(error) = result {
+                assert!(error.contains("session_worker_options"));
+            }
+        }
+    }
+
+    #[test]
+    fn affinity_options_validate_only_required_coherence() {
+        for (session, single, name, cache, workflows, activities, expected_error) in [
+            (false, false, None, 0, true, true, None),
+            (
+                false,
+                true,
+                None,
+                10,
+                true,
+                true,
+                Some("session_worker_options"),
+            ),
+            (true, true, None, 10, true, true, None),
+            (
+                true,
+                true,
+                None,
+                0,
+                true,
+                true,
+                Some("session_worker_options"),
+            ),
+            (
+                true,
+                true,
+                None,
+                10,
+                false,
+                true,
+                Some("session_worker_options"),
+            ),
+            (
+                true,
+                true,
+                None,
+                10,
+                true,
+                false,
+                Some("session_worker_options"),
+            ),
+            (
+                false,
+                false,
+                Some(""),
+                10,
+                true,
+                true,
+                Some("must not be empty"),
+            ),
+            (
+                false,
+                false,
+                Some("stable"),
+                0,
+                true,
+                true,
+                Some("max_cached_workflows"),
+            ),
+            (false, false, Some("stable"), 10, true, false, None),
+            (true, true, Some("normal"), 10, true, true, None),
+            (true, true, Some("different"), 10, true, true, None),
+        ] {
+            let result = WorkerConfig::builder()
+                .namespace("default")
+                .task_queue("normal")
+                .versioning_strategy(default_versioning_strategy())
+                .task_types(WorkerTaskTypes {
+                    enable_workflows: workflows,
+                    enable_remote_activities: activities,
+                    enable_local_activities: false,
+                    enable_nexus: false,
+                })
+                .max_cached_workflows(cache)
+                .workflow_task_poller_behavior(PollerBehavior::SimpleMaximum(if single {
+                    1
+                } else {
+                    2
+                }))
+                .maybe_session_worker_options(session.then(SessionWorkerOptions::default))
+                .experimental_worker_affinity_options(ExperimentalWorkerAffinityOptions {
+                    sticky_queue_name: name.map(str::to_owned),
+                    single_workflow_mode: single,
+                })
+                .build();
+            match expected_error {
+                Some(expected) => assert!(result.err().unwrap().contains(expected)),
+                None => assert!(result.is_ok(), "{:?}", result.err()),
+            }
+        }
+    }
+
+    #[test]
+    fn session_activity_fixed_capacity_validation() {
+        for (session, single, capacity, valid) in [
+            (false, false, 1_usize, true),
+            (true, false, 1, false),
+            (true, false, 2, true),
+            (true, true, 1, true),
+        ] {
+            let result = WorkerConfig::builder()
+                .namespace("default")
+                .task_queue("queue")
+                .versioning_strategy(default_versioning_strategy())
+                .task_types(WorkerTaskTypes::all())
+                .max_cached_workflows(10_usize)
+                .workflow_task_poller_behavior(PollerBehavior::SimpleMaximum(2))
+                .maybe_session_worker_options(session.then(SessionWorkerOptions::default))
+                .experimental_worker_affinity_options(ExperimentalWorkerAffinityOptions {
+                    sticky_queue_name: None,
+                    single_workflow_mode: single,
+                })
+                .max_outstanding_activities(capacity)
+                .build();
+            assert_eq!(result.is_ok(), valid);
+            if let Err(error) = result {
+                assert!(error.contains("max_outstanding_activities"));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn session_activity_tuner_fixed_capacity_validation() {
+        for (session, single, capacity, valid) in [
+            (false, false, 1, true),
+            (true, false, 0, false),
+            (true, false, 1, false),
+            (true, false, 2, true),
+            (true, true, 1, true),
+        ] {
+            let config = WorkerConfig::builder()
+                .namespace("default")
+                .task_queue("queue")
+                .versioning_strategy(default_versioning_strategy())
+                .task_types(WorkerTaskTypes::all())
+                .max_cached_workflows(10_usize)
+                .workflow_task_poller_behavior(PollerBehavior::SimpleMaximum(2))
+                .maybe_session_worker_options(session.then(SessionWorkerOptions::default))
+                .experimental_worker_affinity_options(ExperimentalWorkerAffinityOptions {
+                    sticky_queue_name: None,
+                    single_workflow_mode: single,
+                })
+                .tuner(Arc::new(TunerHolder::fixed_size(10, capacity, 10, 10)))
+                .build()
+                .unwrap();
+            let result = Worker::new(
+                config,
+                Some("sticky".to_owned()),
+                Arc::new(mock_worker_client()),
+                None,
+                None,
+                None,
+            );
+            assert_eq!(result.is_ok(), valid);
+            if let Err(error) = result {
+                assert!(error.to_string().contains("fixed activity slots"));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn explicit_sticky_name_survives_worker_recreation_and_test_construction() {
+        let config = test_worker_cfg()
+            .max_cached_workflows(10_usize)
+            .session_worker_options(SessionWorkerOptions::builder().build())
+            .experimental_worker_affinity_options(
+                ExperimentalWorkerAffinityOptions::builder()
+                    .sticky_queue_name("stable-sticky".to_owned())
+                    .single_workflow_mode(true)
+                    .build(),
+            )
+            .build()
+            .unwrap();
+        for worker in [
+            Worker::new_test(config.clone(), mock_worker_client()),
+            Worker::new(
+                config,
+                Some("randomly-generated".to_owned()),
+                Arc::new(mock_worker_client()),
+                None,
+                None,
+                None,
+            )
+            .unwrap(),
+        ] {
+            assert_eq!(
+                worker
+                    .task_subsystems
+                    .workflows
+                    .as_ref()
+                    .unwrap()
+                    .get_sticky_queue_name()
+                    .as_deref(),
+                Some("stable-sticky")
+            );
         }
     }
 

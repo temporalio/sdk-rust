@@ -1,9 +1,10 @@
 use crate::{
+    WorkerConfig,
     abstractions::{ActiveCounter, MeteredPermitDealer, OwnedMeteredSemPermit, dbg_panic},
-    pollers::{self, Poller},
+    pollers::{self, Poller, StickyPollerShared},
     worker::{
         ActivitySlotKind, NamespaceCapabilities, NexusSlotKind, PollerBehavior, SlotKind,
-        WFTPollerShared, WorkflowSlotKind,
+        WorkflowSlotKind,
         client::{
             PollActivityOptions, PollNexusOptions, PollOptions, PollWorkflowOptions, WorkerClient,
         },
@@ -68,13 +69,13 @@ const PERSISTENT_POLL_ERROR_WARN_BACKOFF: ExponentialBuilder = ExponentialBuilde
 type PollReceiver<T, SK> =
     Mutex<UnboundedReceiver<pollers::Result<(T, OwnedMeteredSemPermit<SK>)>>>;
 
-struct PollRateLimiter {
+pub(crate) struct PollRateLimiter {
     interval: Duration,
     next_allowed_at: Mutex<Instant>,
 }
 
 impl PollRateLimiter {
-    fn new(polls_per_second: f64) -> Self {
+    pub(crate) fn new(polls_per_second: f64) -> Self {
         Self {
             interval: Duration::from_secs_f64(polls_per_second.recip()),
             next_allowed_at: Mutex::new(Instant::now()),
@@ -102,15 +103,84 @@ pub(crate) struct LongPollBuffer<T, SK: SlotKind> {
     did_start: AtomicBool,
 }
 
+#[derive(Default)]
 pub(crate) struct WorkflowTaskOptions {
-    pub(crate) wft_poller_shared: Option<Arc<WFTPollerShared>>,
+    pub(crate) wft_poller_shared: Option<Arc<StickyPollerShared>>,
+    pub(crate) single_workflow_mode: bool,
 }
 
+#[derive(Default)]
 pub(crate) struct ActivityTaskOptions {
     /// Local ratelimit
-    pub(crate) max_worker_acts_per_second: Option<f64>,
+    pub(crate) rate_limiter: Option<Arc<PollRateLimiter>>,
     /// Server ratelimit
     pub(crate) max_tps: Option<f64>,
+    pub(crate) sticky_queue_name: Option<String>,
+    pub(crate) poller_shared: Option<Arc<StickyPollerShared>>,
+    pub(crate) single_workflow_mode: bool,
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn make_activity_task_buffer(
+    config: &WorkerConfig,
+    sticky_queue_name: &Option<String>,
+    client: &Arc<dyn WorkerClient>,
+    metrics: &crate::MetricsContext,
+    shutdown: &CancellationToken,
+    slots: &MeteredPermitDealer<ActivitySlotKind>,
+    last_successful_poll_time: Arc<AtomicCell<Option<SystemTime>>>,
+    capabilities: Arc<NamespaceCapabilities>,
+) -> StickyTaskPoller<PollActivityTaskQueueResponse, ActivitySlotKind> {
+    let sticky_queue_name = sticky_queue_name
+        .as_ref()
+        .filter(|_| config.session_worker_options.is_some());
+    let single_workflow_mode = config.single_workflow_mode();
+    let shared = sticky_queue_name
+        .filter(|_| !single_workflow_mode)
+        .map(|_| Arc::new(StickyPollerShared::new(slots.available_permits())));
+    let rate_limiter = config
+        .max_worker_activities_per_second
+        .map(|rate| Arc::new(PollRateLimiter::new(rate)));
+    let behavior = crate::worker::resolve_effective_behavior(
+        config.activity_task_poller_behavior,
+        &capabilities,
+    );
+    let make = |sticky: Option<String>| {
+        let behavior = if sticky_queue_name.is_some() && !single_workflow_mode {
+            crate::worker::sticky_poller_behavior(behavior, config, sticky.is_some())
+        } else {
+            behavior
+        };
+        let metrics = metrics.with_new_attrs([if sticky.is_some() {
+            crate::telemetry::metrics::activity_sticky_poller()
+        } else {
+            crate::telemetry::metrics::activity_poller()
+        }]);
+        LongPollBuffer::new_activity_task(
+            client.clone(),
+            config.task_queue.clone(),
+            behavior,
+            slots.clone().for_activity_poller(
+                sticky.is_some(),
+                sticky_queue_name.is_some() && !single_workflow_mode,
+            ),
+            shutdown.child_token(),
+            Some(move |np| metrics.record_num_pollers(np)),
+            ActivityTaskOptions {
+                rate_limiter: rate_limiter.clone(),
+                max_tps: config.max_task_queue_activities_per_second,
+                sticky_queue_name: sticky,
+                poller_shared: shared.clone(),
+                single_workflow_mode,
+            },
+            last_successful_poll_time.clone(),
+            capabilities.clone(),
+        )
+    };
+    StickyTaskPoller::new(
+        (!single_workflow_mode).then(|| make(None)),
+        sticky_queue_name.map(|name| make(Some(name.clone()))),
+    )
 }
 
 impl LongPollBuffer<PollWorkflowTaskQueueResponse, WorkflowSlotKind> {
@@ -180,7 +250,10 @@ impl LongPollBuffer<PollWorkflowTaskQueueResponse, WorkflowSlotKind> {
                             no_retry,
                             timeout_override,
                         },
-                        PollWorkflowOptions { sticky_queue_name },
+                        PollWorkflowOptions::builder()
+                            .maybe_sticky_queue_name(sticky_queue_name)
+                            .single_workflow_mode(options.single_workflow_mode)
+                            .build(),
                     )
                     .await
             }
@@ -210,15 +283,36 @@ impl LongPollBuffer<PollActivityTaskQueueResponse, ActivitySlotKind> {
         last_successful_poll_time: Arc<AtomicCell<Option<SystemTime>>>,
         capabilities: Arc<NamespaceCapabilities>,
     ) -> Self {
-        let pre_permit_delay = options
-            .max_worker_acts_per_second
-            .map(|ps| Arc::new(PollRateLimiter::new(ps)))
-            .map(|rl| {
-                move || {
-                    let rl = rl.clone();
-                    async move { rl.wait().await }.boxed()
+        let is_sticky = options.sticky_queue_name.is_some();
+        let poll_scaler = PollScaler::new(
+            poller_behavior,
+            num_pollers_handler,
+            shutdown.clone(),
+            last_successful_poll_time,
+            capabilities.clone(),
+        );
+        if let Some(shared) = &options.poller_shared {
+            if is_sticky {
+                shared.set_sticky_active(
+                    poll_scaler.active_rx.clone(),
+                    poll_scaler.report_handle.target.subscribe(),
+                );
+            } else {
+                shared.set_non_sticky_active(poll_scaler.active_rx.clone());
+            }
+        }
+        let pre_permit_delay = Some(move || {
+            let shared = options.poller_shared.clone();
+            let rate_limiter = options.rate_limiter.clone();
+            async move {
+                if let Some(shared) = shared {
+                    shared.wait_if_needed(is_sticky).await;
                 }
-            });
+                if let Some(rate_limiter) = rate_limiter {
+                    rate_limiter.wait().await;
+                }
+            }
+        });
         let no_retry = if matches!(poller_behavior, PollerBehavior::Autoscaling { .. }) {
             Some(NoRetryOnMatching {
                 predicate: poll_scaling_error_matcher,
@@ -229,6 +323,7 @@ impl LongPollBuffer<PollActivityTaskQueueResponse, ActivitySlotKind> {
         let poll_fn = move |timeout_override: Option<Duration>| {
             let client = client.clone();
             let task_queue = task_queue.clone();
+            let sticky_queue_name = options.sticky_queue_name.clone();
             async move {
                 client
                     .poll_activity_task(
@@ -237,21 +332,16 @@ impl LongPollBuffer<PollActivityTaskQueueResponse, ActivitySlotKind> {
                             no_retry,
                             timeout_override,
                         },
-                        PollActivityOptions {
-                            max_tasks_per_sec: options.max_tps,
-                        },
+                        PollActivityOptions::builder()
+                            .maybe_max_tasks_per_sec(options.max_tps)
+                            .maybe_sticky_queue_name(sticky_queue_name)
+                            .single_workflow_mode(options.single_workflow_mode)
+                            .build(),
                     )
                     .await
             }
         };
 
-        let poll_scaler = PollScaler::new(
-            poller_behavior,
-            num_pollers_handler,
-            shutdown.clone(),
-            last_successful_poll_time,
-            capabilities.clone(),
-        );
         Self::new(
             poll_fn,
             permit_dealer,
@@ -749,48 +839,43 @@ impl PollScalerReportHandle {
     }
 }
 
-/// A poller capable of polling on a sticky and a nonsticky queue simultaneously for workflow tasks.
+/// Preserves workflow polling's first-result termination semantics for both task types.
 #[derive(derive_more::Constructor)]
-pub(crate) struct WorkflowTaskPoller {
-    normal_poller: PollWorkflowTaskBuffer,
-    sticky_poller: Option<PollWorkflowTaskBuffer>,
+pub(crate) struct StickyTaskPoller<T, SK: SlotKind> {
+    normal_poller: Option<LongPollBuffer<T, SK>>,
+    sticky_poller: Option<LongPollBuffer<T, SK>>,
 }
-type PollWorkflowTaskBuffer = LongPollBuffer<PollWorkflowTaskQueueResponse, WorkflowSlotKind>;
 
 #[async_trait::async_trait]
-impl
-    Poller<(
-        PollWorkflowTaskQueueResponse,
-        OwnedMeteredSemPermit<WorkflowSlotKind>,
-    )> for WorkflowTaskPoller
+impl<T, SK> Poller<(T, OwnedMeteredSemPermit<SK>)> for StickyTaskPoller<T, SK>
+where
+    T: TaskPollerResult + Send + Sync + Debug + 'static,
+    SK: SlotKind + 'static,
 {
-    async fn poll(
-        &self,
-    ) -> Option<
-        pollers::Result<(
-            PollWorkflowTaskQueueResponse,
-            OwnedMeteredSemPermit<WorkflowSlotKind>,
-        )>,
-    > {
-        if let Some(sq) = self.sticky_poller.as_ref() {
-            tokio::select! {
-                r = self.normal_poller.poll() => r,
+    async fn poll(&self) -> Option<pollers::Result<(T, OwnedMeteredSemPermit<SK>)>> {
+        match (self.normal_poller.as_ref(), self.sticky_poller.as_ref()) {
+            (Some(normal), Some(sq)) => tokio::select! {
+                r = normal.poll() => r,
                 r = sq.poll() => r,
-            }
-        } else {
-            self.normal_poller.poll().await
+            },
+            (Some(source), None) | (None, Some(source)) => source.poll().await,
+            (None, None) => None,
         }
     }
 
     fn notify_shutdown(&self) {
-        self.normal_poller.notify_shutdown();
+        if let Some(normal) = self.normal_poller.as_ref() {
+            normal.notify_shutdown();
+        }
         if let Some(sq) = self.sticky_poller.as_ref() {
             sq.notify_shutdown();
         }
     }
 
-    async fn shutdown(mut self) {
-        self.normal_poller.shutdown().await;
+    async fn shutdown(self) {
+        if let Some(normal) = self.normal_poller {
+            normal.shutdown().await;
+        }
         if let Some(sq) = self.sticky_poller {
             sq.shutdown().await;
         }
@@ -915,14 +1000,474 @@ impl PersistentPollErrorWarningState {
 mod tests {
     use super::*;
     use crate::{
+        WorkerVersioningStrategy,
         abstractions::tests::fixed_size_permit_dealer,
-        worker::client::mocks::mock_manual_worker_client,
+        test_help::test_worker_cfg,
+        worker::{
+            ResourceBasedSlotsOptions, ResourceController, ResourceSlotOptions, SystemResourceInfo,
+            client::mocks::mock_manual_worker_client,
+        },
     };
     use futures_util::FutureExt;
     use rstest::rstest;
     use std::{future::pending, time::Duration};
     use temporalio_common::protos::temporal::api::namespace::v1::namespace_info::Capabilities;
     use tokio::{select, sync::Notify};
+
+    struct ExhaustedResources;
+
+    impl SystemResourceInfo for ExhaustedResources {
+        fn total_mem(&self) -> u64 {
+            100
+        }
+
+        fn used_mem(&self) -> u64 {
+            100
+        }
+
+        fn used_cpu_percent(&self) -> f64 {
+            1.0
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn paired_activity_resource_capacity_allows_both_poll_sources() {
+        let (tx, mut rx) = unbounded_channel();
+        let mut client = mock_manual_worker_client();
+        client
+            .expect_poll_activity_task()
+            .times(2)
+            .returning(move |_, activity| {
+                tx.send(activity.sticky_queue_name.is_some()).unwrap();
+                std::future::pending().boxed()
+            });
+        let client: Arc<dyn WorkerClient> = Arc::new(client);
+        let mut config = test_worker_cfg().build().unwrap();
+        config.session_worker_options = Some(crate::SessionWorkerOptions::default());
+        config.activity_task_poller_behavior = Some(PollerBehavior::SimpleMaximum(2));
+        let supplier = Arc::new(ResourceController::new_with_sysinfo(
+            ResourceBasedSlotsOptions::builder()
+                .target_mem_usage(0.5)
+                .target_cpu_usage(0.5)
+                .build(),
+            Arc::new(ExhaustedResources),
+        ))
+        .as_kind(ResourceSlotOptions::new(0, 1, Duration::from_secs(60)));
+        let slots = MeteredPermitDealer::new(
+            supplier,
+            crate::MetricsContext::no_op(),
+            None,
+            Arc::new(Default::default()),
+            None,
+        );
+        assert!(slots.try_acquire_owned().is_err());
+        let poller = Arc::new(make_activity_task_buffer(
+            &config,
+            &Some("sticky".to_owned()),
+            &client,
+            &crate::MetricsContext::no_op(),
+            &CancellationToken::new(),
+            &slots,
+            Arc::new(AtomicCell::new(None)),
+            Arc::new(NamespaceCapabilities::default()),
+        ));
+        let polling = tokio::spawn({
+            let poller = poller.clone();
+            async move { poller.poll().await }
+        });
+        let first = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let second = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_ne!(first, second);
+        poller.notify_shutdown();
+        assert!(polling.await.unwrap().is_none());
+        match Arc::try_unwrap(poller) {
+            Ok(poller) => poller.shutdown().await,
+            Err(_) => panic!("poller still referenced"),
+        }
+        let _normal = slots
+            .clone()
+            .for_activity_poller(false, true)
+            .try_acquire_owned()
+            .unwrap();
+        let _sticky = slots
+            .clone()
+            .for_activity_poller(true, true)
+            .try_acquire_owned()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn single_workflow_activity_capacity_one_polls_sticky() {
+        let (tx, mut rx) = unbounded_channel();
+        let mut client = mock_manual_worker_client();
+        client
+            .expect_poll_activity_task()
+            .times(1)
+            .returning(move |_, activity| {
+                assert_eq!(activity.sticky_queue_name.as_deref(), Some("sticky"));
+                tx.send(()).unwrap();
+                std::future::pending().boxed()
+            });
+        let client: Arc<dyn WorkerClient> = Arc::new(client);
+        let mut config = test_worker_cfg().build().unwrap();
+        config.session_worker_options = Some(crate::SessionWorkerOptions::default());
+        config.experimental_worker_affinity_options = Some(
+            crate::ExperimentalWorkerAffinityOptions::builder()
+                .single_workflow_mode(true)
+                .build(),
+        );
+        let slots = fixed_size_permit_dealer(1);
+        let poller = Arc::new(make_activity_task_buffer(
+            &config,
+            &Some("sticky".to_owned()),
+            &client,
+            &crate::MetricsContext::no_op(),
+            &CancellationToken::new(),
+            &slots,
+            Arc::new(AtomicCell::new(None)),
+            Arc::new(NamespaceCapabilities::default()),
+        ));
+        let polling = tokio::spawn({
+            let poller = poller.clone();
+            async move { poller.poll().await }
+        });
+        tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        poller.notify_shutdown();
+        assert!(polling.await.unwrap().is_none());
+        match Arc::try_unwrap(poller) {
+            Ok(poller) => poller.shutdown().await,
+            Err(_) => panic!("poller still referenced"),
+        }
+        assert_eq!(slots.available_permits(), Some(1));
+    }
+
+    #[rstest]
+    #[case(PollerBehavior::SimpleMaximum(1), 1)]
+    #[case(PollerBehavior::SimpleMaximum(5), 5)]
+    #[case(PollerBehavior::Autoscaling { minimum: 1, maximum: 8, initial: 3 }, 3)]
+    #[tokio::test]
+    async fn single_workflow_activity_polls_only_sticky_with_full_behavior(
+        #[case] behavior: PollerBehavior,
+        #[case] expected_polls: usize,
+    ) {
+        let (tx, mut rx) = unbounded_channel();
+        let mut client = mock_manual_worker_client();
+        client
+            .expect_poll_activity_task()
+            .times(expected_polls)
+            .returning(move |poll, activity| {
+                assert_eq!(poll.task_queue, "normal");
+                assert_eq!(activity.sticky_queue_name.as_deref(), Some("stable-sticky"));
+                assert!(activity.single_workflow_mode);
+                tx.send(()).unwrap();
+                std::future::pending().boxed()
+            });
+        let client: Arc<dyn WorkerClient> = Arc::new(client);
+        let mut config = test_worker_cfg().build().unwrap();
+        config.task_queue = "normal".to_owned();
+        config.session_worker_options = Some(crate::SessionWorkerOptions::default());
+        config.experimental_worker_affinity_options = Some(
+            crate::ExperimentalWorkerAffinityOptions::builder()
+                .single_workflow_mode(true)
+                .build(),
+        );
+        config.activity_task_poller_behavior = Some(behavior);
+        config.nonsticky_to_sticky_poll_ratio = 1.0;
+        let slots = fixed_size_permit_dealer(10);
+        let poller = Arc::new(make_activity_task_buffer(
+            &config,
+            &Some("stable-sticky".to_owned()),
+            &client,
+            &crate::MetricsContext::no_op(),
+            &CancellationToken::new(),
+            &slots,
+            Arc::new(AtomicCell::new(None)),
+            Arc::new(NamespaceCapabilities::default()),
+        ));
+        assert!(poller.normal_poller.is_none());
+        assert!(poller.sticky_poller.is_some());
+        let polling = tokio::spawn({
+            let poller = poller.clone();
+            async move { poller.poll().await }
+        });
+        for _ in 0..expected_polls {
+            tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+        }
+        poller.notify_shutdown();
+        assert!(polling.await.unwrap().is_none());
+        match Arc::try_unwrap(poller) {
+            Ok(poller) => poller.shutdown().await,
+            Err(_) => panic!("poller still referenced"),
+        }
+        assert_eq!(slots.available_permits(), Some(10));
+    }
+
+    #[rstest]
+    #[case(false)]
+    #[case(true)]
+    #[tokio::test]
+    async fn activity_sticky_polling_shares_capacity_and_options(#[case] enabled: bool) {
+        let (tx, mut rx) = unbounded_channel();
+        let mut client = mock_manual_worker_client();
+        client
+            .expect_poll_activity_task()
+            .times(2)
+            .returning(move |poll, activity| {
+                tx.send((poll, activity)).unwrap();
+                std::future::pending().boxed()
+            });
+        let client: Arc<dyn WorkerClient> = Arc::new(client);
+        let mut config = test_worker_cfg().build().unwrap();
+        config.session_worker_options = enabled.then(crate::SessionWorkerOptions::default);
+        config.activity_task_poller_behavior = Some(PollerBehavior::SimpleMaximum(10));
+        config.max_task_queue_activities_per_second = Some(7.0);
+        let slots = fixed_size_permit_dealer(2);
+        let poller = Arc::new(make_activity_task_buffer(
+            &config,
+            &Some("sticky".to_owned()),
+            &client,
+            &crate::MetricsContext::no_op(),
+            &CancellationToken::new(),
+            &slots,
+            Arc::new(AtomicCell::new(None)),
+            Arc::new(NamespaceCapabilities::default()),
+        ));
+        let polling = tokio::spawn({
+            let poller = poller.clone();
+            async move { poller.poll().await }
+        });
+        let mut sticky_polls = 0;
+        for _ in 0..2 {
+            let (poll, activity) = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(poll.task_queue, config.task_queue);
+            assert_eq!(activity.max_tasks_per_sec, Some(7.0));
+            assert!(!activity.single_workflow_mode);
+            if let Some(sticky) = activity.sticky_queue_name {
+                assert_eq!(sticky, "sticky");
+                sticky_polls += 1;
+            }
+        }
+        assert_eq!(sticky_polls, usize::from(enabled));
+        assert_eq!(slots.available_permits(), Some(0));
+        assert!(rx.try_recv().is_err());
+        poller.notify_shutdown();
+        assert!(polling.await.unwrap().is_none());
+        match Arc::try_unwrap(poller) {
+            Ok(poller) => poller.shutdown().await,
+            Err(_) => panic!("poller still referenced"),
+        }
+        assert_eq!(slots.available_permits(), Some(2));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn activity_sticky_polling_uses_aggregate_worker_rate_limit() {
+        let (tx, mut rx) = unbounded_channel();
+        let mut client = mock_manual_worker_client();
+        client
+            .expect_poll_activity_task()
+            .times(2)
+            .returning(move |_, options| {
+                tx.send((
+                    options.sticky_queue_name.is_some(),
+                    tokio::time::Instant::now(),
+                ))
+                .unwrap();
+                std::future::pending().boxed()
+            });
+        let client: Arc<dyn WorkerClient> = Arc::new(client);
+        let mut config = test_worker_cfg().build().unwrap();
+        config.session_worker_options = Some(crate::SessionWorkerOptions::default());
+        config.activity_task_poller_behavior = Some(PollerBehavior::SimpleMaximum(2));
+        config.max_worker_activities_per_second = Some(2.0);
+        let poller = Arc::new(make_activity_task_buffer(
+            &config,
+            &Some("sticky".to_owned()),
+            &client,
+            &crate::MetricsContext::no_op(),
+            &CancellationToken::new(),
+            &fixed_size_permit_dealer(2),
+            Arc::new(AtomicCell::new(None)),
+            Arc::new(NamespaceCapabilities::default()),
+        ));
+        let polling = tokio::spawn({
+            let poller = poller.clone();
+            async move { poller.poll().await }
+        });
+        let first = rx.recv().await.unwrap();
+        let second = rx.recv().await.unwrap();
+        assert_ne!(first.0, second.0);
+        assert!(second.1.duration_since(first.1) >= Duration::from_millis(500));
+        poller.notify_shutdown();
+        assert!(polling.await.unwrap().is_none());
+        match Arc::try_unwrap(poller) {
+            Ok(poller) => poller.shutdown().await,
+            Err(_) => panic!("poller still referenced"),
+        }
+    }
+
+    #[rstest]
+    #[case(false)]
+    #[case(true)]
+    #[tokio::test]
+    async fn activity_sticky_polling_forwards_shutdown_empty(#[case] sticky_first: bool) {
+        let (tx, mut rx) = unbounded_channel();
+        let mut client = mock_manual_worker_client();
+        client
+            .expect_poll_activity_task()
+            .times(2)
+            .returning(move |_, options| {
+                let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+                tx.send((options.sticky_queue_name.is_some(), response_tx))
+                    .unwrap();
+                async move { Ok(response_rx.await.unwrap()) }.boxed()
+            });
+        let client: Arc<dyn WorkerClient> = Arc::new(client);
+        let mut config = test_worker_cfg().build().unwrap();
+        config.session_worker_options = Some(crate::SessionWorkerOptions::default());
+        config.activity_task_poller_behavior = Some(PollerBehavior::SimpleMaximum(2));
+        let slots = fixed_size_permit_dealer(2);
+        let poller = Arc::new(make_activity_task_buffer(
+            &config,
+            &Some("sticky".to_owned()),
+            &client,
+            &crate::MetricsContext::no_op(),
+            &CancellationToken::new(),
+            &slots,
+            Arc::new(AtomicCell::new(None)),
+            Arc::new(NamespaceCapabilities::resolved(Capabilities {
+                worker_poll_complete_on_shutdown: true,
+                ..Default::default()
+            })),
+        ));
+        let polling = tokio::spawn({
+            let poller = poller.clone();
+            async move { poller.poll().await }
+        });
+        let first = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let second = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let (empty, task) = if first.0 == sticky_first {
+            (first.1, second.1)
+        } else {
+            (second.1, first.1)
+        };
+        poller.notify_shutdown();
+        empty
+            .send(PollActivityTaskQueueResponse::default())
+            .unwrap();
+        let (response, permit) = polling.await.unwrap().unwrap().unwrap();
+        assert!(response.task_token.is_empty());
+        drop(permit);
+        let other_source = if sticky_first {
+            poller.normal_poller.as_ref().unwrap()
+        } else {
+            poller.sticky_poller.as_ref().unwrap()
+        };
+        task.send(PollActivityTaskQueueResponse {
+            task_token: vec![1],
+            ..Default::default()
+        })
+        .unwrap();
+        let (response, permit) = other_source.poll().await.unwrap().unwrap();
+        assert_eq!(response.task_token, vec![1]);
+        drop(permit);
+        assert!(poller.poll().await.is_none());
+        match Arc::try_unwrap(poller) {
+            Ok(poller) => poller.shutdown().await,
+            Err(_) => panic!("poller still referenced"),
+        }
+        assert_eq!(slots.available_permits(), Some(2));
+    }
+
+    #[rstest]
+    #[case(false)]
+    #[case(true)]
+    #[tokio::test]
+    async fn activity_sticky_polling_ends_with_either_source(#[case] sticky_first: bool) {
+        let (tx, mut rx) = unbounded_channel();
+        let mut client = mock_manual_worker_client();
+        client
+            .expect_poll_activity_task()
+            .times(2)
+            .returning(move |_, _| {
+                tx.send(()).unwrap();
+                std::future::pending().boxed()
+            });
+        let client: Arc<dyn WorkerClient> = Arc::new(client);
+        let config = WorkerConfig::builder()
+            .namespace("default")
+            .task_queue("normal")
+            .versioning_strategy(WorkerVersioningStrategy::None {
+                build_id: "test".to_owned(),
+            })
+            .task_types(temporalio_common::worker::WorkerTaskTypes::all())
+            .max_cached_workflows(2_usize)
+            .workflow_task_poller_behavior(PollerBehavior::SimpleMaximum(2))
+            .session_worker_options(crate::SessionWorkerOptions::default())
+            .activity_task_poller_behavior(PollerBehavior::SimpleMaximum(2))
+            .build()
+            .unwrap();
+        let slots = fixed_size_permit_dealer(2);
+        let poller = Arc::new(make_activity_task_buffer(
+            &config,
+            &Some("sticky".to_owned()),
+            &client,
+            &crate::MetricsContext::no_op(),
+            &CancellationToken::new(),
+            &slots,
+            Arc::new(AtomicCell::new(None)),
+            Arc::new(NamespaceCapabilities::default()),
+        ));
+        let polling = tokio::spawn({
+            let poller = poller.clone();
+            async move { poller.poll().await }
+        });
+        for _ in 0..2 {
+            tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+        }
+        let first = if sticky_first {
+            poller.sticky_poller.as_ref().unwrap()
+        } else {
+            poller.normal_poller.as_ref().unwrap()
+        };
+        first.notify_shutdown();
+        assert!(
+            tokio::time::timeout(Duration::from_secs(5), polling)
+                .await
+                .unwrap()
+                .unwrap()
+                .is_none()
+        );
+        poller.notify_shutdown();
+        match Arc::try_unwrap(poller) {
+            Ok(poller) => poller.shutdown().await,
+            Err(_) => panic!("poller still referenced"),
+        }
+        assert_eq!(slots.available_permits(), Some(2));
+    }
 
     #[tokio::test]
     async fn only_polls_once_with_1_poller() {
@@ -947,7 +1492,8 @@ mod tests {
             CancellationToken::new(),
             None::<fn(usize)>,
             WorkflowTaskOptions {
-                wft_poller_shared: Some(Arc::new(WFTPollerShared::new(Some(10)))),
+                wft_poller_shared: Some(Arc::new(StickyPollerShared::new(Some(10)))),
+                ..Default::default()
             },
             Arc::new(AtomicCell::new(None)),
             Arc::new(NamespaceCapabilities::default()),
@@ -1004,7 +1550,8 @@ mod tests {
             CancellationToken::new(),
             None::<fn(usize)>,
             WorkflowTaskOptions {
-                wft_poller_shared: Some(Arc::new(WFTPollerShared::new(Some(1)))),
+                wft_poller_shared: Some(Arc::new(StickyPollerShared::new(Some(1)))),
+                ..Default::default()
             },
             Arc::new(AtomicCell::new(None)),
             Arc::new(NamespaceCapabilities::default()),
@@ -1081,7 +1628,8 @@ mod tests {
             shutdown_token.clone(),
             None::<fn(usize)>,
             WorkflowTaskOptions {
-                wft_poller_shared: Some(Arc::new(WFTPollerShared::new(Some(10)))),
+                wft_poller_shared: Some(Arc::new(StickyPollerShared::new(Some(10)))),
+                ..Default::default()
             },
             Arc::new(AtomicCell::new(None)),
             Arc::new(NamespaceCapabilities::default()),
@@ -1190,7 +1738,8 @@ mod tests {
             CancellationToken::new(),
             None::<fn(usize)>,
             WorkflowTaskOptions {
-                wft_poller_shared: Some(Arc::new(WFTPollerShared::new(Some(INITIAL_POLLERS)))),
+                wft_poller_shared: Some(Arc::new(StickyPollerShared::new(Some(INITIAL_POLLERS)))),
+                ..Default::default()
             },
             Arc::new(AtomicCell::new(None)),
             Arc::new(NamespaceCapabilities::default()),
@@ -1272,6 +1821,7 @@ mod tests {
             }),
             WorkflowTaskOptions {
                 wft_poller_shared: None,
+                ..Default::default()
             },
             Arc::new(AtomicCell::new(None)),
             Arc::new(NamespaceCapabilities::resolved(Capabilities {
@@ -1350,6 +1900,7 @@ mod tests {
             None::<fn(usize)>,
             WorkflowTaskOptions {
                 wft_poller_shared: None,
+                ..Default::default()
             },
             Arc::new(AtomicCell::new(None)),
             Arc::new(NamespaceCapabilities::resolved(Capabilities {

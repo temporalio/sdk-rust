@@ -647,6 +647,7 @@ pub(crate) struct NumPollersMetric {
     pub wft_current_pollers: HeartbeatMetric,
     pub sticky_wft_current_pollers: HeartbeatMetric,
     pub activity_current_pollers: HeartbeatMetric,
+    pub sticky_activity_current_pollers: HeartbeatMetric,
     pub nexus_current_pollers: HeartbeatMetric,
 }
 
@@ -659,6 +660,10 @@ impl NumPollersMetric {
                 self.sticky_wft_current_pollers.clone(),
             ),
             ("activity_task", self.activity_current_pollers.clone()),
+            (
+                "sticky_activity_task",
+                self.sticky_activity_current_pollers.clone(),
+            ),
             ("nexus_task", self.nexus_current_pollers.clone()),
         ])
     }
@@ -759,6 +764,9 @@ pub(crate) fn workflow_sticky_poller() -> MetricKeyValue {
 }
 pub(crate) fn activity_poller() -> MetricKeyValue {
     MetricKeyValue::new(KEY_POLLER_TYPE, "activity_task")
+}
+pub(crate) fn activity_sticky_poller() -> MetricKeyValue {
+    MetricKeyValue::new(KEY_POLLER_TYPE, "sticky_activity_task")
 }
 pub(crate) fn nexus_poller() -> MetricKeyValue {
     MetricKeyValue::new(KEY_POLLER_TYPE, "nexus_task")
@@ -1205,6 +1213,39 @@ mod tests {
     #[derive(Debug, Clone)]
     struct DummyInstrumentRef(usize);
     impl BufferInstrumentRef for DummyInstrumentRef {}
+
+    #[test]
+    fn heartbeat_tracks_normal_and_sticky_activity_pollers_independently() {
+        let metrics = MetricsContext::no_op();
+        let normal = metrics.with_new_attrs([activity_poller()]);
+        let sticky = metrics.with_new_attrs([activity_sticky_poller()]);
+        let heartbeat = metrics.in_memory_meter().unwrap();
+        normal.record_num_pollers(3);
+        sticky.record_num_pollers(5);
+        normal.record_num_pollers(1);
+        assert_eq!(
+            heartbeat
+                .num_pollers
+                .activity_current_pollers
+                .load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            heartbeat
+                .num_pollers
+                .sticky_activity_current_pollers
+                .load(Ordering::Relaxed),
+            5
+        );
+        sticky.record_num_pollers(0);
+        assert_eq!(
+            heartbeat
+                .num_pollers
+                .activity_current_pollers
+                .load(Ordering::Relaxed),
+            1
+        );
+    }
 
     #[test]
     fn with_new_attrs_adds_attrs_to_returned_context() {

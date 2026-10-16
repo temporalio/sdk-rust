@@ -36,21 +36,23 @@ mod core_tests;
 pub mod test_help;
 
 pub use crate::worker::client::{
-    PollActivityOptions, PollOptions, PollWorkflowOptions, WorkerClient, WorkflowTaskCompletion,
+    PollActivityOptions, PollActivityOptionsBuilder, PollOptions, PollWorkflowOptions,
+    PollWorkflowOptionsBuilder, WorkerClient, WorkflowTaskCompletion,
 };
 pub use pollers::{Client, ClientOptions, ClientTlsOptions, RetryOptions, TlsOptions};
 pub use temporalio_common::protos::TaskToken;
 pub use url::Url;
 pub use worker::{
     ActivitySlotKind, CompleteActivityError, CompleteNexusError, CompleteWfError,
+    ExperimentalWorkerAffinityOptions, ExperimentalWorkerAffinityOptionsBuilder,
     FixedSizeSlotSupplier, LocalActivitySlotKind, NamespaceCapabilities, NexusSlotKind, PollError,
     PollerBehavior, ResourceBasedSlotsOptions, ResourceBasedSlotsOptionsBuilder,
     ResourceBasedTuner, ResourceBasedTunerConfig, ResourceController, ResourceSlotOptions,
-    SlotInfo, SlotInfoTrait, SlotKind, SlotKindType, SlotMarkUsedContext, SlotReleaseContext,
-    SlotReservationContext, SlotSupplier, SlotSupplierOptions, SlotSupplierPermit, TunerBuilder,
-    TunerHolder, TunerHolderOptions, TunerHolderOptionsBuilder, Worker, WorkerConfig,
-    WorkerConfigBuilder, WorkerTuner, WorkerValidationError, WorkerVersioningStrategy,
-    WorkflowErrorType, WorkflowSlotKind,
+    SessionWorkerOptions, SessionWorkerOptionsBuilder, SlotInfo, SlotInfoTrait, SlotKind,
+    SlotKindType, SlotMarkUsedContext, SlotReleaseContext, SlotReservationContext, SlotSupplier,
+    SlotSupplierOptions, SlotSupplierPermit, TunerBuilder, TunerHolder, TunerHolderOptions,
+    TunerHolderOptionsBuilder, Worker, WorkerConfig, WorkerConfigBuilder, WorkerTuner,
+    WorkerValidationError, WorkerVersioningStrategy, WorkflowErrorType, WorkflowSlotKind,
 };
 
 use crate::{
@@ -102,7 +104,11 @@ pub fn init_worker(
     if client_ident.is_empty() {
         bail!("Client identity cannot be empty. Either lang or user should be setting this value");
     }
-    let sticky_q = sticky_q_name_for_worker(&client_ident, worker_config.max_cached_workflows);
+    let sticky_q = worker_config
+        .experimental_worker_affinity_options
+        .as_ref()
+        .and_then(|options| options.sticky_queue_name.clone())
+        .or_else(|| sticky_q_name_for_worker(&client_ident, worker_config.max_cached_workflows));
 
     let worker_instance_key = uuid::Uuid::new_v4();
     let client_bag = Arc::new(WorkerClientBag::new(

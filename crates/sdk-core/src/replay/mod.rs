@@ -75,6 +75,10 @@ where
     }
 
     pub(crate) fn into_core_worker(mut self) -> Result<Worker, anyhow::Error> {
+        // Replay consumes supplied history, not server placement, even when callers reuse a
+        // production worker configuration with sticky-only polling enabled.
+        self.config.session_worker_options = None;
+        self.config.experimental_worker_affinity_options = None;
         self.config.max_cached_workflows = 1;
         self.config.workflow_task_poller_behavior = Some(PollerBehavior::SimpleMaximum(1));
         self.config.task_types = WorkerTaskTypes::workflow_only();
@@ -150,8 +154,102 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_help::test_worker_cfg;
+    use crate::{
+        WorkerVersioningStrategy,
+        test_help::{WorkerExt, test_worker_cfg},
+    };
     use futures_util::{FutureExt, stream};
+    use temporalio_common::protos::{
+        coresdk::{
+            workflow_activation::workflow_activation_job,
+            workflow_commands::{CompleteWorkflowExecution, ScheduleActivity},
+            workflow_completion::WorkflowActivationCompletion,
+        },
+        temporal::api::session::v1::{ActivitySessionOptions, activity_session_options},
+    };
+
+    #[rstest::rstest]
+    #[tokio::test]
+    async fn replay_workflow_sticky_activity_without_session_worker(
+        #[values("ordinary", "single_generated_name", "single_explicit_name")] mode: &str,
+    ) {
+        let mut history = canned_histories::single_activity("activity");
+        history.add_workflow_task_completed();
+        history.add_workflow_execution_completed();
+        let mut client = mock_manual_worker_client();
+        client.expect_fail_workflow_task().times(0);
+        let single_workflow = mode != "ordinary";
+        let config = WorkerConfig::builder()
+            .namespace("default")
+            .task_queue("replay")
+            .versioning_strategy(WorkerVersioningStrategy::None {
+                build_id: "test".to_owned(),
+            })
+            .task_types(WorkerTaskTypes::all())
+            .max_cached_workflows(2_usize)
+            .workflow_task_poller_behavior(PollerBehavior::SimpleMaximum(2))
+            .maybe_session_worker_options(single_workflow.then(Default::default))
+            .maybe_experimental_worker_affinity_options(single_workflow.then(|| {
+                crate::ExperimentalWorkerAffinityOptions::builder()
+                    .single_workflow_mode(true)
+                    .maybe_sticky_queue_name(
+                        (mode == "single_explicit_name").then(|| "stable-sticky".to_owned()),
+                    )
+                    .build()
+            }))
+            .build()
+            .unwrap();
+        let mut input = ReplayWorkerInput::new(config, stream::iter([history.into()]));
+        input.client_override = Some(client);
+        let worker = input.into_core_worker().unwrap();
+        assert!(worker.get_config().session_worker_options.is_none());
+        assert!(
+            worker
+                .get_config()
+                .experimental_worker_affinity_options
+                .is_none()
+        );
+
+        let start = worker.poll_workflow_activation().await.unwrap();
+        assert!(start.is_replaying);
+        assert!(matches!(
+            start.jobs[0].variant,
+            Some(workflow_activation_job::Variant::InitializeWorkflow(_))
+        ));
+        worker
+            .complete_workflow_activation(WorkflowActivationCompletion::from_cmds(
+                start.run_id,
+                vec![
+                    ScheduleActivity {
+                        seq: 1,
+                        activity_id: "activity".to_owned(),
+                        activity_type: DEFAULT_ACTIVITY_TYPE.to_owned(),
+                        session_options: Some(ActivitySessionOptions {
+                            session: Some(
+                                activity_session_options::Session::WorkflowStickySession(true),
+                            ),
+                        }),
+                        ..Default::default()
+                    }
+                    .into(),
+                ],
+            ))
+            .await
+            .unwrap();
+        let resolved = worker.poll_workflow_activation().await.unwrap();
+        assert!(matches!(
+            resolved.jobs[0].variant,
+            Some(workflow_activation_job::Variant::ResolveActivity(_))
+        ));
+        worker
+            .complete_workflow_activation(WorkflowActivationCompletion::from_cmds(
+                resolved.run_id,
+                vec![CompleteWorkflowExecution::default().into()],
+            ))
+            .await
+            .unwrap();
+        worker.drain_pollers_and_shutdown().await;
+    }
 
     #[tokio::test]
     async fn client_override_describe_namespace_precedes_fallback() {

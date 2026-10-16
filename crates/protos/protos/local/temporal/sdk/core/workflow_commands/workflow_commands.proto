@@ -17,6 +17,7 @@ import "temporal/api/failure/v1/message.proto";
 import "temporal/api/sdk/v1/user_metadata.proto";
 import "temporal/api/sdk/v1/event_group_marker.proto";
 import "temporal/api/workflow/v1/message.proto";
+import "temporal/api/session/v1/message.proto";
 import "temporal/sdk/core/child_workflow/child_workflow.proto";
 import "temporal/sdk/core/nexus/nexus.proto";
 import "temporal/sdk/core/common/common.proto";
@@ -106,6 +107,7 @@ message ScheduleActivity {
     coresdk.common.VersioningIntent versioning_intent = 15;
     // The Priority to use for this activity
     temporal.api.common.v1.Priority priority = 16;
+    temporal.api.session.v1.ActivitySessionOptions session_options = 17;
 }
 
 message ScheduleLocalActivity {

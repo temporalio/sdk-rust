@@ -325,6 +325,13 @@ where
     fn mark_slot_used(&self, _ctx: &dyn SlotMarkUsedContext<SlotKind = Self::SlotKind>) {}
 
     fn release_slot(&self, ctx: &dyn SlotReleaseContext<SlotKind = Self::SlotKind>) {
+        if let Some(source) = ctx.permit().user_data::<PairedActivitySource>() {
+            if source.is_sticky {
+                self.issued_sticky.fetch_sub(1, Ordering::Relaxed);
+            } else {
+                self.issued_nonsticky.fetch_sub(1, Ordering::Relaxed);
+            }
+        }
         // Really could use specialization here
         if let Some(SlotInfo::Workflow(info)) = ctx.info().map(|i| i.downcast()) {
             if info.is_sticky {
@@ -338,6 +345,10 @@ where
     fn slot_supplier_kind(&self) -> String {
         "ResourceBased".to_string()
     }
+}
+
+struct PairedActivitySource {
+    is_sticky: bool,
 }
 
 impl<MI, SK> ResourceBasedSlotsForType<MI, SK>
@@ -367,7 +378,8 @@ where
         if ctx.num_issued_slots() < self.opts.min_slots {
             return Some(self.issue_slot(ctx));
         }
-        if SK::kind() == SlotKindType::Workflow
+        if (SK::kind() == SlotKindType::Workflow
+            || (SK::kind() == SlotKindType::Activity && ctx.is_paired_activity_poller()))
             && (ctx.is_sticky() && self.issued_sticky.load(Ordering::Relaxed) == 0
                 || !ctx.is_sticky() && self.issued_nonsticky.load(Ordering::Relaxed) == 0)
         {
@@ -380,7 +392,9 @@ where
     fn issue_slot(&self, ctx: &dyn SlotReservationContext) -> SlotSupplierPermit {
         // Always be willing to hand out at least 1 slot for sticky and 1 for non-sticky to avoid
         // getting stuck.
-        if SK::kind() == SlotKindType::Workflow {
+        let paired_activity =
+            SK::kind() == SlotKindType::Activity && ctx.is_paired_activity_poller();
+        if SK::kind() == SlotKindType::Workflow || paired_activity {
             if ctx.is_sticky() {
                 self.issued_sticky.fetch_add(1, Ordering::Relaxed);
             } else {
@@ -388,7 +402,15 @@ where
             }
         }
         let _ = self.last_slot_issued_tx.send(Instant::now());
-        SlotSupplierPermit::default()
+        if paired_activity {
+            // A poll may end without receiving a task, so slot info cannot identify its source
+            // when the reservation is released.
+            SlotSupplierPermit::with_user_data(PairedActivitySource {
+                is_sticky: ctx.is_sticky(),
+            })
+        } else {
+            SlotSupplierPermit::default()
+        }
     }
 
     fn time_since_last_issued(&self) -> Duration {
@@ -461,7 +483,7 @@ impl<MI: SystemResourceInfo + Sync + Send> ResourceController<MI> {
         Arc::new(ResourceBasedSlotsForType::new(self.clone(), opts))
     }
 
-    fn new_with_sysinfo(options: ResourceBasedSlotsOptions, sys_info: Arc<MI>) -> Self {
+    pub(crate) fn new_with_sysinfo(options: ResourceBasedSlotsOptions, sys_info: Arc<MI>) -> Self {
         Self {
             pids: Mutex::new(PidControllers::new(&options)),
             options,
@@ -766,8 +788,9 @@ impl CGroupCpuFileSystem for CgroupV2CpuFileSystem {
 mod tests {
     use super::*;
     use crate::{
-        abstractions::MeteredPermitDealer, telemetry::metrics::MetricsContext,
-        worker::WorkflowSlotKind,
+        abstractions::MeteredPermitDealer,
+        telemetry::metrics::MetricsContext,
+        worker::{ActivitySlotInfo, WorkflowSlotKind},
     };
     use std::{
         cell::RefCell,
@@ -887,6 +910,47 @@ mod tests {
         used.store(0, Ordering::Release);
         // Now it's willing to hand out slots again when usage is zero
         assert!(rbs.try_reserve_slot(&pd).is_some());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn paired_activity_minimums_release_unused_and_used_reservations() {
+        let (fmis, used) = FakeMIS::new();
+        used.store(90_000, Ordering::Release);
+        let rbs = Arc::new(ResourceController::new_with_sysinfo(test_options(), fmis))
+            .as_kind::<ActivitySlotKind>(ResourceSlotOptions {
+            min_slots: 0,
+            max_slots: 1,
+            ramp_throttle: Duration::from_secs(60),
+        });
+        let ordinary = MeteredPermitDealer::new(
+            rbs.clone(),
+            MetricsContext::no_op(),
+            None,
+            Arc::new(Default::default()),
+            None,
+        );
+        assert!(ordinary.try_acquire_owned().is_err());
+        let normal = ordinary.clone().for_activity_poller(false, true);
+        let sticky = ordinary.clone().for_activity_poller(true, true);
+        let normal_permit = normal.acquire_owned().await;
+        let sticky_permit = sticky.acquire_owned().await;
+        assert!(normal.try_acquire_owned().is_err());
+        assert!(sticky.try_acquire_owned().is_err());
+
+        // Canceled and empty polls return unused reservations without slot info.
+        drop(normal_permit);
+        let normal_permit = normal.try_acquire_owned().unwrap();
+        assert!(sticky.try_acquire_owned().is_err());
+        drop(sticky_permit);
+        let sticky_permit = sticky.try_acquire_owned().unwrap();
+        assert!(normal.try_acquire_owned().is_err());
+
+        let normal_permit = normal_permit.into_used(ActivitySlotInfo::default());
+        let sticky_permit = sticky_permit.into_used(ActivitySlotInfo::default());
+        drop((normal_permit, sticky_permit));
+        let _normal = normal.try_acquire_owned().unwrap();
+        let _sticky = sticky.try_acquire_owned().unwrap();
+        assert!(ordinary.try_acquire_owned().is_err());
     }
 
     #[test]

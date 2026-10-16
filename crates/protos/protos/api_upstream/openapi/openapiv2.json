@@ -12917,6 +12917,10 @@
         "propagatedNexusSerializationContext": {
           "$ref": "#/definitions/v1PropagatedSerializationContext",
           "description": "Serialization context propagated from the Nexus caller that started this workflow."
+        },
+        "timeSkippingStatePropagation": {
+          "$ref": "#/definitions/v1TimeSkippingStatePropagation",
+          "description": "Time-skipping state propagated by the execution that started this workflow.\nThis field is intended for use by the Temporal server, for example when a schedule\nstarts a workflow, and is not intended to be set by external clients."
         }
       }
     },
@@ -19591,6 +19595,10 @@
           "type": "string",
           "format": "int64",
           "description": "Size of the schedule's internal state (including payloads) in bytes."
+        },
+        "timeSkippingInfo": {
+          "$ref": "#/definitions/v1TimeSkippingInfo",
+          "description": "Information about time skipping for this schedule.\nIf the schedule has never enabled time skipping, this will be unset."
         }
       }
     },
@@ -19688,6 +19696,10 @@
         },
         "unpause": {
           "type": "string"
+        },
+        "timeSkippingConfig": {
+          "$ref": "#/definitions/v1TimeSkippingConfig",
+          "description": "If set, applies the specified time-skipping configuration to this schedule,\nreplacing any existing time-skipping configuration."
         }
       }
     },
