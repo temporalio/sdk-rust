@@ -57,8 +57,7 @@ Documentation can be generated with `cargo doc`.
 ## Expectations for Pull Requests
 
 - Format and lint your code before submitting.
-- Ensure all tests pass locally. Integration tests may require a running Temporal server or the
-  ephemeral server started by `cargo integ-test`.
+- Ensure all tests pass locally. Integration tests should be run via `cargo integ-test`.
 - Keep commit messages short and in the imperative mood.
 - Provide a clear PR description outlining what changed and why.
 - Reviewers expect new features or fixes to include corresponding tests when applicable.

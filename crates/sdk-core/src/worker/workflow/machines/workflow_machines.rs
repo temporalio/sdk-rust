@@ -61,7 +61,7 @@ use temporalio_common::{
             workflow_activation::{
                 self, NotifyHasPatch, UpdateRandomSeed, WorkflowActivation, workflow_activation_job,
             },
-            workflow_commands::ContinueAsNewWorkflowExecution,
+            workflow_commands::{ContinueAsNewWorkflowExecution, update_response},
         },
         temporal::api::{
             command::v1::{Command as ProtoCommand, command::Attributes as ProtoCmdAttrs},
@@ -100,6 +100,11 @@ pub(crate) struct WorkflowMachines {
     pub(crate) last_processed_event: i64,
     /// True if the workflow is replaying from history
     pub(crate) replaying: bool,
+    /// Legacy queries cannot produce commands, so catching up on their history must not cause any
+    /// side effects, like dispatching LA requests.
+    preparing_legacy_query: bool,
+    /// Rejection-only tasks can be discarded, so they must not release LAs waiting on replay.
+    update_only_task: bool,
     /// Workflow identifier
     pub(crate) workflow_id: String,
     /// Workflow type identifier. (Function name, class, etc)
@@ -277,6 +282,8 @@ impl WorkflowMachines {
             run_id: basics.run_id,
             drive_me: driven_wf,
             replaying,
+            preparing_legacy_query: false,
+            update_only_task: false,
             metrics: basics.metrics,
             // In an ideal world one could say ..Default::default() here and it'd still work.
             current_started_event_id: 0,
@@ -325,18 +332,22 @@ impl WorkflowMachines {
         &mut self,
         update: HistoryUpdate,
         protocol_messages: Vec<IncomingProtocolMessage>,
+        preparing_legacy_query: bool,
     ) -> Result<()> {
         if !self.protocol_msgs.is_empty() {
             dbg_panic!("There are unprocessed protocol messages while receiving new work");
         }
         self.protocol_msgs = protocol_messages;
+        self.preparing_legacy_query = preparing_legacy_query;
+        self.update_only_task = false;
         self.new_history_from_server(update)?;
         Ok(())
     }
 
     pub(crate) fn new_history_from_server(&mut self, update: HistoryUpdate) -> Result<()> {
         self.last_history_from_server = update;
-        self.replaying = self.last_history_from_server.previous_wft_started_id > 0;
+        self.replaying = self.preparing_legacy_query
+            || self.last_history_from_server.previous_wft_started_id > 0;
         self.apply_next_wft_from_history()?;
         Ok(())
     }
@@ -443,12 +454,16 @@ impl WorkflowMachines {
     /// "no work" situation. Possibly, it may know about some work the machines don't, like queries.
     pub(crate) fn get_wf_activation(&mut self) -> WorkflowActivation {
         let jobs = self.drive_me.drain_jobs();
+        // Deferred LA results can add ordinary workflow work after history application.
+        if Self::has_non_update_jobs(&jobs) {
+            self.update_only_task = false;
+        }
         // Even though technically we may have satisfied all the criteria to be done with replay,
         // query only activations are always "replaying" to keep things sane.
         let all_query = jobs.iter().all(|j| {
             matches!(
                 j.variant,
-                Some(workflow_activation_job::Variant::QueryWorkflow(_))
+                workflow_activation_job::Variant::QueryWorkflow(_)
             )
         });
         // Query-only activations are never recorded in history, so replay can't count them.
@@ -467,7 +482,7 @@ impl WorkflowMachines {
             is_replaying,
             run_id: self.run_id.clone(),
             history_length: self.last_processed_event as u32,
-            jobs,
+            jobs: jobs.into_iter().map(Into::into).collect(),
             available_internal_flags: (*self.observed_internal_flags)
                 .borrow()
                 .all_lang()
@@ -488,6 +503,13 @@ impl WorkflowMachines {
 
     pub(crate) fn has_pending_jobs(&self) -> bool {
         !self.drive_me.peek_pending_jobs().is_empty()
+    }
+
+    fn has_non_update_jobs(jobs: &[OutgoingJob]) -> bool {
+        jobs.iter().any(|job| {
+            !matches!(&job.variant, workflow_activation_job::Variant::DoUpdate(update)
+                if update.run_validator)
+        })
     }
 
     pub(crate) fn has_pending_la_resolutions(&self) -> bool {
@@ -545,6 +567,25 @@ impl WorkflowMachines {
     /// the workflow code, handling them, and preparing them to be sent off to the server.
     pub(crate) fn iterate_machines(&mut self) -> Result<()> {
         let results = self.drive_me.fetch_workflow_iteration_output();
+        if self.update_only_task {
+            let accepts_update = results.iter().any(|cmd| {
+                matches!(&cmd.variant, WFCommandVariant::UpdateResponse(response)
+                    if matches!(response.response, Some(update_response::Response::Accepted(_))))
+            });
+            if accepts_update {
+                self.update_only_task = false;
+            } else if results.iter().any(|cmd| {
+                !matches!(
+                    &cmd.variant,
+                    WFCommandVariant::UpdateResponse(response)
+                        if matches!(response.response, Some(update_response::Response::Rejected(_)))
+                )
+            }) {
+                return Err(nondeterminism!(
+                    "Update-only activation produced commands without accepting an update"
+                ));
+            }
+        }
         self.handle_driven_results(results)?;
         self.apply_local_activity_peeked_resolutions(false)?;
         self.release_held_local_activity_resolutions_if_idle()?;
@@ -572,7 +613,7 @@ impl WorkflowMachines {
         // final WFT.
         if self.have_seen_terminal_event {
             // Replay clearly counts as done now, since we return here and never do anything else.
-            self.replaying = false;
+            self.replaying = self.preparing_legacy_query;
             return Ok(0);
         }
 
@@ -650,7 +691,7 @@ impl WorkflowMachines {
 
         // We're caught up on replay if there are no new events to process
         if events.is_empty() {
-            self.replaying = false;
+            self.replaying = self.preparing_legacy_query;
         }
         // Track if we were replaying before processing events. We only want to record replay
         // latency if we actually did replay work (i.e., started with replaying=true).
@@ -688,6 +729,7 @@ impl WorkflowMachines {
             // history, and we want to ignore it and its associated commands since we "produced"
             // them.
             if self.replaying
+                && !self.preparing_legacy_query
                 && has_final_event
                 && eid > self.last_history_from_server.previous_wft_started_id
                 && event.event_type() != EventType::WorkflowTaskCompleted
@@ -839,6 +881,24 @@ impl WorkflowMachines {
             }
         }
         self.release_held_local_activity_resolutions_if_idle()?;
+
+        let pending_jobs = self.drive_me.peek_pending_jobs();
+        if !self.replaying && !pending_jobs.is_empty() {
+            self.update_only_task = !Self::has_non_update_jobs(pending_jobs);
+        }
+        // Wait until marker lookahead is applied before starting LAs without recorded results.
+        // This also covers a live task whose started event was already consumed by a legacy query.
+        if !self.replaying && !self.update_only_task {
+            let mut resps = vec![];
+            for (k, mach) in self.all_machines.iter_mut() {
+                if let Machines::LocalActivityMachine(lam) = mach {
+                    resps.push((k, lam.encountered_non_replay_wft()?));
+                }
+            }
+            for (mkey, resp_set) in resps {
+                self.process_machine_responses(mkey, resp_set)?;
+            }
+        }
 
         // Only record replay latency if we actually did replay work. This avoids recording
         // near-zero latencies for the first workflow task (which has no history to replay) or
@@ -1180,7 +1240,7 @@ impl WorkflowMachines {
                     task_started_event_id,
                     time,
                 } => {
-                    self.task_started(task_started_event_id, time)?;
+                    self.task_started(task_started_event_id, time);
                 }
                 MachineResponse::UpdateRunIdOnWorkflowReset { run_id: new_run_id } => {
                     self.drive_me.send_job(
@@ -1303,26 +1363,10 @@ impl WorkflowMachines {
 
     /// Called when a workflow task started event has triggered. Ensures we are tracking the ID
     /// of the current started event as well as workflow time properly.
-    fn task_started(&mut self, task_started_event_id: i64, time: SystemTime) -> Result<()> {
+    fn task_started(&mut self, task_started_event_id: i64, time: SystemTime) {
         self.current_started_event_id = task_started_event_id;
         self.wft_start_time = Some(time);
         self.set_current_time(time);
-
-        // Notify local activity machines that we started a non-replay WFT, which will allow any
-        // which were waiting for a marker to instead decide to execute the LA since it clearly
-        // will not be resolved via marker.
-        if !self.replaying {
-            let mut resps = vec![];
-            for (k, mach) in self.all_machines.iter_mut() {
-                if let Machines::LocalActivityMachine(lam) = mach {
-                    resps.push((k, lam.encountered_non_replay_wft()?));
-                }
-            }
-            for (mkey, resp_set) in resps {
-                self.process_machine_responses(mkey, resp_set)?;
-            }
-        }
-        Ok(())
     }
 
     /// Handles results of the workflow activation, delegating work to the appropriate state
@@ -1586,7 +1630,6 @@ impl WorkflowMachines {
                         annotations
                     );
                 }
-                WFCommandVariant::NoCommandsFromLang => (),
             }
         }
         Ok(())

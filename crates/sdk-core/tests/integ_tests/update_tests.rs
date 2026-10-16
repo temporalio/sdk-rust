@@ -4,7 +4,7 @@ use crate::common::{
 };
 use anyhow::anyhow;
 use assert_matches::assert_matches;
-use futures_util::{future, future::join_all};
+use futures_util::{StreamExt, future, future::join_all, stream};
 use std::{
     sync::{
         LazyLock,
@@ -35,8 +35,12 @@ use temporalio_common::{
         },
         temporal::api::{
             common::v1::WorkflowExecution,
-            enums::v1::{EventType, ResetReapplyType},
-            workflowservice::v1::{ResetStickyTaskQueueRequest, ResetWorkflowExecutionRequest},
+            enums::v1::{CommandType, EventType, ResetReapplyType},
+            workflowservice::v1::{
+                PollActivityTaskQueueResponse, PollNexusTaskQueueResponse,
+                ResetStickyTaskQueueRequest, ResetWorkflowExecutionRequest,
+                RespondWorkflowTaskCompletedResponse,
+            },
         },
     },
     worker::WorkerTaskTypes,
@@ -49,10 +53,17 @@ use temporalio_sdk::{
 };
 use temporalio_sdk_core::{
     Worker, prost_dur,
-    replay::HistoryForReplay,
-    test_help::{WorkerTestHelpers, drain_pollers_and_shutdown, start_timer_cmd},
+    replay::{HistoryForReplay, TestHistoryBuilder, default_wes_attribs},
+    test_help::{
+        MocksHolder, PollWFTRespExt, QueueResponse, ResponseType, WorkerTestHelpers,
+        drain_pollers_and_shutdown, hist_to_poll_resp, mock_worker, mock_worker_client,
+        start_timer_cmd,
+    },
 };
-use tokio::{join, sync::Barrier};
+use tokio::{
+    join, select,
+    sync::{Barrier, oneshot},
+};
 use tonic::IntoRequest;
 use uuid::Uuid;
 
@@ -332,6 +343,14 @@ async fn update_rejection() {
                 WorkflowExecuteUpdateOptions::default(),
             )
             .await;
+        handle
+            .signal(
+                UntypedSignal::new("continue"),
+                RawValue::empty(),
+                WorkflowSignalOptions::default(),
+            )
+            .await
+            .unwrap();
     };
 
     let processing_task = async {
@@ -350,13 +369,18 @@ async fn update_rejection() {
                     response: Some(update_response::Response::Rejected("bah humbug".into())),
                 }
                 .into(),
-                start_timer_cmd(1, Duration::from_millis(1)),
             ],
         ))
         .await
         .unwrap();
 
         let res = core.poll_workflow_activation().await.unwrap();
+        assert_matches!(
+            res.jobs.as_slice(),
+            [WorkflowActivationJob {
+                variant: Some(workflow_activation_job::Variant::SignalWorkflow(_)),
+            }]
+        );
         core.complete_execution(&res.run_id).await;
     };
     join!(update_task, processing_task);
@@ -648,6 +672,228 @@ async fn update_speculative_wft() {
         core.complete_execution(&res.run_id).await;
     };
     join!(sender_task, processing_task);
+}
+
+#[rstest::rstest]
+#[case::all_rejected(false, false)]
+#[case::accepted_update(true, false)]
+#[case::signal_and_rejection(false, true)]
+#[temporalio_macros::cloud_test_exclusion(crate::CloudTestExclusionReason::DoesNotUseServer)]
+#[tokio::test]
+async fn update_validation_gates_local_activity_dispatch(
+    #[values(1, 2)] update_count: usize,
+    #[case] accept_update: bool,
+    #[case] with_signal: bool,
+) {
+    let mut history = TestHistoryBuilder::default();
+    history.add(default_wes_attribs());
+    // A timer command keeps the heartbeat from being collapsed into the live task during replay.
+    // The LA was still running at that heartbeat, so there is no result marker.
+    history.add_full_wf_task();
+    history.add_by_type(EventType::TimerStarted);
+    let mut continuation = history.clone();
+    continuation.add_we_signaled("continue", vec![]);
+    continuation.add_workflow_task_scheduled_and_started();
+    let continuation = hist_to_poll_resp(
+        &continuation,
+        "update_validator_with_la",
+        ResponseType::AllHistory,
+    )
+    .resp;
+    if with_signal {
+        history.add_we_signaled("continue", vec![]);
+    }
+    history.add_workflow_task_scheduled_and_started();
+    let mut update_task = hist_to_poll_resp(
+        &history,
+        "update_validator_with_la",
+        ResponseType::AllHistory,
+    )
+    .resp;
+    for i in 0..update_count {
+        update_task.add_update_request(format!("update-{i}"), update_task.started_event_id - 1);
+    }
+    let (continue_tx, continue_rx) = oneshot::channel();
+    let tasks = stream::iter([update_task])
+        .chain(stream::once(async move {
+            continue_rx.await.unwrap();
+            continuation
+        }))
+        .chain(stream::pending());
+    let (reported_tx, reported_rx) = oneshot::channel();
+    let mut reported_tx = Some(reported_tx);
+    let all_rejected_only = !accept_update && !with_signal;
+    let mut client = mock_worker_client();
+    client
+        .expect_complete_workflow_task()
+        .times(if all_rejected_only { 2 } else { 1 })
+        .returning(move |completion, _| {
+            if all_rejected_only && reported_tx.is_some() {
+                assert!(completion.commands.is_empty());
+                assert!(!completion.force_create_new_workflow_task);
+                assert_eq!(completion.messages.len(), update_count);
+                assert!(completion.messages.iter().all(|message| {
+                    message
+                        .body
+                        .as_ref()
+                        .unwrap()
+                        .type_url
+                        .ends_with("Rejection")
+                }));
+                reported_tx.take().unwrap().send(()).unwrap();
+                return Ok(RespondWorkflowTaskCompletedResponse {
+                    reset_history_event_id: 3,
+                    ..Default::default()
+                });
+            }
+            let commands = completion
+                .commands
+                .iter()
+                .map(|cmd| cmd.command_type())
+                .collect::<Vec<_>>();
+            let mut expected = vec![];
+            if accept_update {
+                expected.extend([CommandType::ProtocolMessage; 2]);
+            }
+            expected.extend([
+                CommandType::RecordMarker,
+                CommandType::CompleteWorkflowExecution,
+            ]);
+            assert_eq!(commands, expected);
+            Ok(Default::default())
+        });
+    let mut mock = MocksHolder::from_client_with_custom(
+        client,
+        Some(tasks),
+        None::<Vec<QueueResponse<PollActivityTaskQueueResponse>>>,
+        None::<Vec<QueueResponse<PollNexusTaskQueueResponse>>>,
+    );
+    mock.worker_cfg(|cfg| cfg.max_cached_workflows = 1);
+    let core = mock_worker(mock);
+
+    let activation = core.poll_workflow_activation().await.unwrap();
+    assert!(activation.is_replaying);
+    assert_matches!(
+        activation.jobs.as_slice(),
+        [WorkflowActivationJob {
+            variant: Some(workflow_activation_job::Variant::InitializeWorkflow(_)),
+        }]
+    );
+    core.complete_workflow_activation(WorkflowActivationCompletion::from_cmds(
+        activation.run_id,
+        vec![
+            start_timer_cmd(1, Duration::from_secs(60)),
+            ScheduleLocalActivity {
+                seq: 1,
+                activity_id: "local".to_string(),
+                activity_type: "local".to_string(),
+                start_to_close_timeout: Some(prost_dur!(from_secs(60))),
+                ..Default::default()
+            }
+            .into(),
+        ],
+    ))
+    .await
+    .unwrap();
+
+    let activation = core.poll_workflow_activation().await.unwrap();
+    assert!(!activation.is_replaying);
+    assert_eq!(
+        activation.jobs.len(),
+        update_count + usize::from(with_signal)
+    );
+    let mut responses = vec![];
+    for job in &activation.jobs {
+        if matches!(
+            job.variant,
+            Some(workflow_activation_job::Variant::SignalWorkflow(_))
+        ) {
+            assert!(with_signal);
+        } else {
+            let update = assert_matches!(
+                job.variant.as_ref(),
+                Some(workflow_activation_job::Variant::DoUpdate(update))
+                    if update.run_validator => update
+            );
+            if accept_update && update.protocol_instance_id == "update-0" {
+                responses.push(
+                    UpdateResponse {
+                        protocol_instance_id: update.protocol_instance_id.clone(),
+                        response: Some(update_response::Response::Accepted(())),
+                    }
+                    .into(),
+                );
+                responses.push(
+                    UpdateResponse {
+                        protocol_instance_id: update.protocol_instance_id.clone(),
+                        response: Some(update_response::Response::Completed("accepted".into())),
+                    }
+                    .into(),
+                );
+            } else {
+                responses.push(
+                    UpdateResponse {
+                        protocol_instance_id: update.protocol_instance_id.clone(),
+                        response: Some(update_response::Response::Rejected("rejected".into())),
+                    }
+                    .into(),
+                );
+            }
+        }
+    }
+    let complete_validation = core.complete_workflow_activation(
+        WorkflowActivationCompletion::from_cmds(activation.run_id, responses),
+    );
+    if with_signal || accept_update {
+        complete_validation.await.unwrap();
+    } else {
+        select! {
+            biased;
+            activity = core.poll_activity_task() => {
+                panic!("Update-only task dispatched an LA before validation: {:?}", activity.unwrap());
+            }
+            completed = complete_validation => completed.unwrap(),
+        }
+    }
+
+    // Rejection-only speculative tasks may be discarded, so no LA may execute on their behalf.
+    // Wait for the actual task report rather than allowing an arbitrary dispatch timing window.
+    if all_rejected_only {
+        select! {
+            biased;
+            activity = core.poll_activity_task() => {
+                panic!("Rejected update-only task dispatched an LA: {:?}", activity.unwrap());
+            }
+            reported = reported_rx => reported.unwrap(),
+        }
+        continue_tx.send(()).unwrap();
+        let activation = core.poll_workflow_activation().await.unwrap();
+        assert_matches!(
+            activation.jobs.as_slice(),
+            [WorkflowActivationJob {
+                variant: Some(workflow_activation_job::Variant::SignalWorkflow(_)),
+            }]
+        );
+        core.complete_workflow_activation(WorkflowActivationCompletion::empty(activation.run_id))
+            .await
+            .unwrap();
+    }
+    let activity = core.poll_activity_task().await.unwrap();
+    core.complete_activity_task(ActivityTaskCompletion {
+        task_token: activity.task_token,
+        result: Some(ActivityExecutionResult::ok(vec![1].into())),
+    })
+    .await
+    .unwrap();
+    let activation = core.poll_workflow_activation().await.unwrap();
+    assert_matches!(
+        activation.jobs.as_slice(),
+        [WorkflowActivationJob {
+            variant: Some(workflow_activation_job::Variant::ResolveActivity(result)),
+        }] if result.is_local
+    );
+    core.complete_execution(&activation.run_id).await;
+    drain_pollers_and_shutdown(&core).await;
 }
 
 #[tokio::test]
