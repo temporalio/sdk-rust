@@ -1284,8 +1284,14 @@ async fn nexus_metrics() {
         .unwrap();
 
     let nexus_polling = async {
-        for _ in 0..5 {
-            let nt = core_worker.poll_nexus_task().await.unwrap();
+        loop {
+            let nt = match core_worker.poll_nexus_task().await {
+                Ok(nt) => nt,
+                Err(err) => {
+                    assert_matches!(err, PollError::ShutDown);
+                    break;
+                }
+            };
             let task_token = nt.task_token().to_vec();
             let status = if matches!(nt.variant, Some(nexus_task::Variant::CancelTask(_))) {
                 nexus_task_completion::Status::AckCancel(true)
@@ -1358,11 +1364,6 @@ async fn nexus_metrics() {
                 .await
                 .unwrap();
         }
-        // Gotta get shutdown poll
-        assert_matches!(
-            core_worker.poll_nexus_task().await,
-            Err(PollError::ShutDown)
-        );
     };
 
     join!(nexus_polling, async {
