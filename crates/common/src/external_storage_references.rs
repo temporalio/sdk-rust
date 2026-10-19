@@ -22,18 +22,22 @@ const REFERENCE_ENCODING: &str = "json/protobuf";
 // `reference_message_type_matches_the_proto` instead of silently changing what we put on the wire.
 const REFERENCE_MESSAGE_TYPE: &str = "temporal.api.sdk.v1.ExternalStorageReference";
 
-/// Whether the given payload is a reference to externally stored data.
-pub(crate) fn is_reference(payload: &Payload) -> bool {
+/// Whether the given payload is an external storage reference and so has to be retrieved. Reads
+/// metadata only, so one that needs no retrieval is not touched.
+///
+/// Both halves are required: `json/protobuf` on its own is an ordinary encoding for any protobuf
+/// payload.
+pub(crate) fn is_plain_reference(payload: &Payload) -> bool {
     payload.metadata.get("encoding").map(Vec::as_slice) == Some(REFERENCE_ENCODING.as_bytes())
         && payload.metadata.get("messageType").map(Vec::as_slice)
             == Some(REFERENCE_MESSAGE_TYPE.as_bytes())
 }
 
-/// Parse the reference from the given payload, which must be one.
+/// Parse the reference from the given payload, which must be a plain reference.
 pub(crate) fn parse_reference(
     payload: &Payload,
 ) -> Result<ExternalStorageReference, ExternalStorageError> {
-    if !is_reference(payload) {
+    if !is_plain_reference(payload) {
         return Err(ExternalStorageError::InvalidReference(
             "payload is not an external storage reference".into(),
         ));
@@ -101,7 +105,7 @@ mod tests {
             Some(REFERENCE_ENCODING.as_bytes())
         );
         assert_eq!(payload.external_payloads[0].size_bytes, 385);
-        assert!(is_reference(&payload));
+        assert!(is_plain_reference(&payload));
 
         let reference = parse_reference(&payload).unwrap();
         assert_eq!(reference.driver_name, "aws.s3driver");
@@ -144,6 +148,52 @@ mod tests {
     }
 
     #[test]
+    fn the_right_encoding_with_another_message_type_is_not_a_reference() {
+        let payload = Payload {
+            metadata: HashMap::from([
+                ("encoding".to_owned(), b"json/protobuf".to_vec()),
+                (
+                    "messageType".to_owned(),
+                    b"temporal.api.common.v1.Payload".to_vec(),
+                ),
+            ]),
+            data: b"{}".to_vec(),
+            external_payloads: vec![],
+        };
+
+        assert!(!is_plain_reference(&payload));
+    }
+
+    #[test]
+    fn the_reference_message_type_with_another_encoding_is_not_a_reference() {
+        let payload = Payload {
+            metadata: HashMap::from([
+                ("encoding".to_owned(), b"binary/protobuf".to_vec()),
+                (
+                    "messageType".to_owned(),
+                    b"temporal.api.sdk.v1.ExternalStorageReference".to_vec(),
+                ),
+            ]),
+            data: b"{}".to_vec(),
+            external_payloads: vec![],
+        };
+
+        assert!(!is_plain_reference(&payload));
+    }
+
+    #[test]
+    fn a_created_reference_is_detected() {
+        let payload = create_reference_payload(
+            "mem",
+            HashMap::from([("key".to_owned(), "k".to_owned())]),
+            10,
+        )
+        .unwrap();
+
+        assert!(is_plain_reference(&payload));
+    }
+
+    #[test]
     fn ordinary_payload_is_not_a_reference() {
         let payload = Payload {
             metadata: HashMap::from([("encoding".to_owned(), b"json/plain".to_vec())]),
@@ -151,7 +201,7 @@ mod tests {
             external_payloads: vec![],
         };
 
-        assert!(!is_reference(&payload));
+        assert!(!is_plain_reference(&payload));
         assert!(matches!(
             parse_reference(&payload),
             Err(ExternalStorageError::InvalidReference(_))
