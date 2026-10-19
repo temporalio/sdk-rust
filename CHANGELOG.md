@@ -62,6 +62,8 @@ relevant information.
   and both spellings are now accepted.
 * `Worker::run()` now waits for spawned activity tasks to finish before returning, including
   when running fails.
+* Workers no longer leak memory for every activity task they run. Each task's cancellation
+  handle was previously kept until the worker exited.
 * Workers using a custom metrics backend now report task-slot and poller counts correctly in
   worker heartbeats, rather than reporting zero when the backend does not expose its labels.
 * Local activities still running when their workflow is evicted or the worker shuts down now
