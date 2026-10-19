@@ -94,15 +94,15 @@ impl fmt::Debug for StorageDriverPermit {
 /// [`StorageDriverStoreContext`] and [`StorageDriverRetrieveContext`]; a driver calls it rather
 /// than implementing it.
 ///
-/// A driver is handed a whole batch and decides for itself how many requests to make of it, so the
-/// limit is cooperative: a driver that never acquires a permit makes requests that no limit counts,
-/// and the SDK warns when it detects that.
+/// The SDK cannot see the requests a driver makes, so the limit works only if the driver acquires
+/// a permit for each request.
 pub trait StorageDriverLimiter<Item>: Send + Sync {
     /// Acquire a permit for one request, waiting until the limits allow it.
     ///
-    /// Acquire one permit per request, not one around a whole batch: holding a single permit
-    /// across a fan out satisfies the signature while quietly defeating the limit. Do not acquire
-    /// a permit while holding one.
+    /// Holding a single permit across a fan out satisfies the signature while quietly defeating
+    /// the limit. Acquiring a second permit while handling one request, directly or in a helper,
+    /// deadlocks at the limit: every holder would be waiting for a permit only another holder can
+    /// release.
     ///
     /// `item` is what the request covers, a payload when storing and a claim when retrieving.
     fn acquire<'a>(
