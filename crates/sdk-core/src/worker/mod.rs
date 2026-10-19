@@ -2500,35 +2500,6 @@ pub(crate) enum TaskPollers {
     },
 }
 
-/// Given an already-resolved workflow task poller `behavior` (see [resolve_effective_behavior]),
-/// applies the sticky/non-sticky split when it is a [PollerBehavior::SimpleMaximum]; other
-/// behaviors are returned unchanged.
-pub(crate) fn wft_poller_behavior(
-    behavior: PollerBehavior,
-    config: &WorkerConfig,
-    is_sticky: bool,
-) -> PollerBehavior {
-    fn calc_max_nonsticky(max_polls: usize, ratio: f32) -> usize {
-        ((max_polls as f32 * ratio) as usize).max(1)
-    }
-
-    if let PollerBehavior::SimpleMaximum(m) = behavior {
-        if !is_sticky {
-            PollerBehavior::SimpleMaximum(calc_max_nonsticky(
-                m,
-                config.nonsticky_to_sticky_poll_ratio,
-            ))
-        } else {
-            PollerBehavior::SimpleMaximum(
-                m.saturating_sub(calc_max_nonsticky(m, config.nonsticky_to_sticky_poll_ratio))
-                    .max(1),
-            )
-        }
-    } else {
-        behavior
-    }
-}
-
 fn make_slots_info<SK>(
     dealer: &MeteredPermitDealer<SK>,
     slots_available: Arc<AtomicU64>,
@@ -2627,23 +2598,6 @@ mod tests {
                 .unwrap()
                 .unused_permits(),
             Some(5)
-        );
-    }
-
-    #[test]
-    fn max_polls_calculated_properly() {
-        let cfg = {
-            let mut cfg = test_worker_cfg().build().unwrap();
-            cfg.workflow_task_poller_behavior = Some(PollerBehavior::SimpleMaximum(5_usize));
-            cfg
-        };
-        assert_eq!(
-            wft_poller_behavior(PollerBehavior::SimpleMaximum(5), &cfg, false),
-            PollerBehavior::SimpleMaximum(1)
-        );
-        assert_eq!(
-            wft_poller_behavior(PollerBehavior::SimpleMaximum(5), &cfg, true),
-            PollerBehavior::SimpleMaximum(4)
         );
     }
 

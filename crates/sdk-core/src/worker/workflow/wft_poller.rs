@@ -2,12 +2,12 @@ use crate::{
     MetricsContext, WorkerConfig,
     abstractions::{MeteredPermitDealer, OwnedMeteredSemPermit},
     pollers::{
-        BoxedWFPoller, LongPollBuffer, Poller, StickyPollerShared, WorkflowTaskOptions,
-        WorkflowTaskPoller,
+        BoxedWFPoller, LongPollBuffer, Poller, StickyPollerShared, StickyTaskPoller,
+        WorkflowTaskOptions, sticky_poller_behavior,
     },
     protosext::ValidPollWFTQResponse,
     telemetry::metrics::{workflow_poller, workflow_sticky_poller},
-    worker::{NamespaceCapabilities, WorkflowSlotKind, client::WorkerClient, wft_poller_behavior},
+    worker::{NamespaceCapabilities, WorkflowSlotKind, client::WorkerClient},
 };
 use crossbeam_utils::atomic::AtomicCell;
 use futures_util::{Stream, stream};
@@ -56,7 +56,7 @@ pub(crate) fn make_wft_poller(
         client.clone(),
         config.task_queue.clone(),
         None,
-        wft_poller_behavior(effective_behavior, config, false),
+        sticky_poller_behavior(effective_behavior, config, false),
         wft_slots.clone(),
         shutdown_token.child_token(),
         Some(move |np| {
@@ -74,7 +74,7 @@ pub(crate) fn make_wft_poller(
             client.clone(),
             config.task_queue.clone(),
             Some(sqn.clone()),
-            wft_poller_behavior(effective_behavior, config, true),
+            sticky_poller_behavior(effective_behavior, config, true),
             wft_slots.clone().into_sticky(),
             shutdown_token.child_token(),
             Some(move |np| {
@@ -85,7 +85,7 @@ pub(crate) fn make_wft_poller(
             capabilities,
         )
     });
-    let wf_task_poll_buffer = Box::new(WorkflowTaskPoller::new(
+    let wf_task_poll_buffer = Box::new(StickyTaskPoller::new(
         wf_task_poll_buffer,
         sticky_queue_poller,
     ));

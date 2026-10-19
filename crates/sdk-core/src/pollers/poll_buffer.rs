@@ -749,59 +749,6 @@ impl PollScalerReportHandle {
     }
 }
 
-/// A poller capable of polling on a sticky and a nonsticky queue simultaneously for workflow tasks.
-#[derive(derive_more::Constructor)]
-pub(crate) struct WorkflowTaskPoller {
-    normal_poller: PollWorkflowTaskBuffer,
-    sticky_poller: Option<PollWorkflowTaskBuffer>,
-}
-type PollWorkflowTaskBuffer = LongPollBuffer<PollWorkflowTaskQueueResponse, WorkflowSlotKind>;
-
-#[async_trait::async_trait]
-impl
-    Poller<(
-        PollWorkflowTaskQueueResponse,
-        OwnedMeteredSemPermit<WorkflowSlotKind>,
-    )> for WorkflowTaskPoller
-{
-    async fn poll(
-        &self,
-    ) -> Option<
-        pollers::Result<(
-            PollWorkflowTaskQueueResponse,
-            OwnedMeteredSemPermit<WorkflowSlotKind>,
-        )>,
-    > {
-        if let Some(sq) = self.sticky_poller.as_ref() {
-            tokio::select! {
-                r = self.normal_poller.poll() => r,
-                r = sq.poll() => r,
-            }
-        } else {
-            self.normal_poller.poll().await
-        }
-    }
-
-    fn notify_shutdown(&self) {
-        self.normal_poller.notify_shutdown();
-        if let Some(sq) = self.sticky_poller.as_ref() {
-            sq.notify_shutdown();
-        }
-    }
-
-    async fn shutdown(mut self) {
-        self.normal_poller.shutdown().await;
-        if let Some(sq) = self.sticky_poller {
-            sq.shutdown().await;
-        }
-    }
-
-    async fn shutdown_box(self: Box<Self>) {
-        let this = *self;
-        this.shutdown().await;
-    }
-}
-
 /// Returns true for errors that the poller scaler wants to see
 fn poll_scaling_error_matcher(err: &tonic::Status) -> bool {
     matches!(
