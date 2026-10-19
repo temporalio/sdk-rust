@@ -51,14 +51,15 @@ pub trait PayloadVisitable: Send {
     ) -> BoxFuture<'a, Result<(), PayloadConversionError>>;
 }
 
-/// Check if a field path represents search attributes that should not be encoded.
+/// Check if a field path represents search attributes that must not be transformed.
 /// Search attributes must remain server-readable for indexing.
 fn is_search_attributes_path(path: &str) -> bool {
     // All search attributes go through the SearchAttributes message which has indexed_fields
     path.contains("SearchAttributes.indexed_fields")
 }
 
-fn should_encode(path: &str) -> bool {
+/// Whether a field at this path may be transformed: encoded, decoded, or offloaded.
+pub(crate) fn should_transform(path: &str) -> bool {
     !is_search_attributes_path(path)
 }
 
@@ -74,7 +75,7 @@ impl AsyncPayloadVisitor for EncodeVisitor<'_> {
         field: PayloadField<'a>,
     ) -> BoxFuture<'a, Result<(), PayloadConversionError>> {
         Box::pin(async move {
-            if !should_encode(field.path) {
+            if !should_transform(field.path) {
                 return Ok(());
             }
             match field.data {
@@ -117,7 +118,7 @@ impl AsyncPayloadVisitor for DecodeVisitor<'_> {
         field: PayloadField<'a>,
     ) -> BoxFuture<'a, Result<(), PayloadConversionError>> {
         Box::pin(async move {
-            if !should_encode(field.path) {
+            if !should_transform(field.path) {
                 return Ok(());
             }
             match field.data {

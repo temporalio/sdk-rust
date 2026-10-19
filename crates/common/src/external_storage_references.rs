@@ -21,19 +21,58 @@ const REFERENCE_ENCODING: &str = "json/protobuf";
 // Spelled out rather than taken from `prost::Name` so that a proto-side rename fails
 // `reference_message_type_matches_the_proto` instead of silently changing what we put on the wire.
 const REFERENCE_MESSAGE_TYPE: &str = "temporal.api.sdk.v1.ExternalStorageReference";
+const REFERENCE_MARKER: &str = "__temporal_external_storage_reference";
+const REFERENCE_MARKER_VALUE: &str = "true";
 
-/// Whether the given payload is a reference to externally stored data.
-pub(crate) fn is_reference(payload: &Payload) -> bool {
+/// Whether the given payload has to be retrieved from external storage. Reads metadata only, so
+/// no payload is decoded and one that needs no retrieval is not touched.
+pub(crate) fn needs_retrieval(payload: &Payload) -> bool {
+    has_reference_marker(payload) || is_plain_reference(payload)
+}
+
+/// Whether the given payload carries the marker. The value is checked, not just the key.
+pub(crate) fn has_reference_marker(payload: &Payload) -> bool {
+    payload.metadata.get(REFERENCE_MARKER).map(Vec::as_slice)
+        == Some(REFERENCE_MARKER_VALUE.as_bytes())
+}
+
+/// Whether the given payload is a reference in the form a codec has not encoded, so its data can
+/// be parsed directly. A marked payload that a codec encoded must be decoded before it is parsed.
+///
+/// Both halves are required: `json/protobuf` on its own is an ordinary encoding for any protobuf
+/// payload.
+pub(crate) fn is_plain_reference(payload: &Payload) -> bool {
     payload.metadata.get("encoding").map(Vec::as_slice) == Some(REFERENCE_ENCODING.as_bytes())
         && payload.metadata.get("messageType").map(Vec::as_slice)
             == Some(REFERENCE_MESSAGE_TYPE.as_bytes())
 }
 
-/// Parse the reference from the given payload, which must be one.
+/// Mark a reference so a reader finds it without decoding anything.
+///
+/// The SDK does this after the codec has encoded the reference, so the marker lands on the
+/// outermost payload. With no codec configured the reference is itself outermost and is marked
+/// just the same.
+pub(crate) fn mark_reference(payload: &mut Payload) {
+    payload.metadata.insert(
+        REFERENCE_MARKER.to_owned(),
+        REFERENCE_MARKER_VALUE.as_bytes().to_vec(),
+    );
+}
+
+/// Copy the payload with what the SDK added after the codec ran removed, so the codec is handed
+/// exactly what it encoded.
+pub(crate) fn strip_for_decode(payload: &Payload) -> Payload {
+    let mut stripped = payload.clone();
+    stripped.metadata.remove(REFERENCE_MARKER);
+    stripped.external_payloads.clear();
+    stripped
+}
+
+/// Parse the reference from the given payload, which must be a plain reference.
 pub(crate) fn parse_reference(
     payload: &Payload,
 ) -> Result<ExternalStorageReference, ExternalStorageError> {
-    if !is_reference(payload) {
+    if !is_plain_reference(payload) {
         return Err(ExternalStorageError::InvalidReference(
             "payload is not an external storage reference".into(),
         ));
@@ -101,7 +140,7 @@ mod tests {
             Some(REFERENCE_ENCODING.as_bytes())
         );
         assert_eq!(payload.external_payloads[0].size_bytes, 385);
-        assert!(is_reference(&payload));
+        assert!(is_plain_reference(&payload));
 
         let reference = parse_reference(&payload).unwrap();
         assert_eq!(reference.driver_name, "aws.s3driver");
@@ -144,6 +183,88 @@ mod tests {
     }
 
     #[test]
+    fn a_marked_payload_needs_retrieval_whatever_its_encoding() {
+        // A codec has encoded the reference, so neither the encoding nor the message type still
+        // identifies it; only the marker does.
+        let mut payload = Payload {
+            metadata: HashMap::from([("encoding".to_owned(), b"binary/encrypted".to_vec())]),
+            data: b"opaque".to_vec(),
+            external_payloads: vec![],
+        };
+        assert!(!needs_retrieval(&payload));
+
+        mark_reference(&mut payload);
+
+        assert!(needs_retrieval(&payload));
+        // Its data is not a reference until the codec has decoded it.
+        assert!(!is_plain_reference(&payload));
+    }
+
+    #[test]
+    fn the_marker_value_is_checked_not_just_the_key() {
+        let payload = Payload {
+            metadata: HashMap::from([(
+                "__temporal_external_storage_reference".to_owned(),
+                b"false".to_vec(),
+            )]),
+            data: b"{}".to_vec(),
+            external_payloads: vec![],
+        };
+
+        assert!(!needs_retrieval(&payload));
+    }
+
+    #[test]
+    fn the_right_encoding_with_another_message_type_is_not_a_reference() {
+        let payload = Payload {
+            metadata: HashMap::from([
+                ("encoding".to_owned(), b"json/protobuf".to_vec()),
+                (
+                    "messageType".to_owned(),
+                    b"temporal.api.common.v1.Payload".to_vec(),
+                ),
+            ]),
+            data: b"{}".to_vec(),
+            external_payloads: vec![],
+        };
+
+        assert!(!is_plain_reference(&payload));
+        assert!(!needs_retrieval(&payload));
+    }
+
+    #[test]
+    fn the_reference_message_type_with_another_encoding_is_not_a_reference() {
+        let payload = Payload {
+            metadata: HashMap::from([
+                ("encoding".to_owned(), b"binary/protobuf".to_vec()),
+                (
+                    "messageType".to_owned(),
+                    b"temporal.api.sdk.v1.ExternalStorageReference".to_vec(),
+                ),
+            ]),
+            data: b"{}".to_vec(),
+            external_payloads: vec![],
+        };
+
+        assert!(!is_plain_reference(&payload));
+        assert!(!needs_retrieval(&payload));
+    }
+
+    #[test]
+    fn an_unmarked_reference_still_needs_retrieval() {
+        // A history written before the marker existed, or one no codec encoded.
+        let payload = create_reference_payload(
+            "mem",
+            HashMap::from([("key".to_owned(), "k".to_owned())]),
+            10,
+        )
+        .unwrap();
+
+        assert!(needs_retrieval(&payload));
+        assert!(is_plain_reference(&payload));
+    }
+
+    #[test]
     fn ordinary_payload_is_not_a_reference() {
         let payload = Payload {
             metadata: HashMap::from([("encoding".to_owned(), b"json/plain".to_vec())]),
@@ -151,7 +272,7 @@ mod tests {
             external_payloads: vec![],
         };
 
-        assert!(!is_reference(&payload));
+        assert!(!needs_retrieval(&payload));
         assert!(matches!(
             parse_reference(&payload),
             Err(ExternalStorageError::InvalidReference(_))
