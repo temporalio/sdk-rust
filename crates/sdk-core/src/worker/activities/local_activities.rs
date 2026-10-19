@@ -207,6 +207,8 @@ pub(crate) struct LocalActivityManager {
 
 struct LocalActivityInfo {
     task_token: TaskToken,
+    /// Tracks the last dispatched attempt for timeouts that fire between attempts.
+    attempt: u32,
     /// Prevents shutdown from dropping work already requested by a workflow while allowing retry
     /// backoffs to be abandoned after workflows stop.
     queued_for_dispatch: bool,
@@ -346,6 +348,7 @@ impl LocalActivityManager {
                             // ending up in the queue at once.
                             let lai = ve.insert(LocalActivityInfo {
                                 task_token: tt,
+                                attempt: act.schedule_cmd.attempt,
                                 queued_for_dispatch: false,
                                 backing_off_task: None,
                                 timeout_bag: None,
@@ -512,19 +515,48 @@ impl LocalActivityManager {
                         continue;
                     }
                     CancelOrTimeout::Timeout { run_id, resolution } => {
-                        let tt = self
-                            .dat
-                            .lock()
-                            .la_info
-                            .get(&ExecutingLAId {
-                                run_id,
-                                seq_num: resolution.seq,
-                            })
-                            .as_ref()
-                            .map(|lai| lai.task_token.clone());
+                        let id = ExecutingLAId {
+                            run_id: run_id.clone(),
+                            seq_num: resolution.seq,
+                        };
+                        let (tt, report_attempt) = {
+                            let mut dat = self.dat.lock();
+                            let Some(lai) = dat.la_info.get(&id) else {
+                                continue;
+                            };
+                            let tt = lai.task_token.clone();
+                            if dat.outstanding_activity_tasks.contains_key(&tt) {
+                                (Some(tt), None)
+                            } else if lai.queued_for_dispatch || lai.backing_off_task.is_some() {
+                                // There is no attempt for `complete` to resolve yet. Remove the
+                                // queued dispatch or pending retry so it cannot start after the
+                                // schedule-to-close deadline has already elapsed.
+                                let mut lai = dat.la_info.remove(&id).expect("activity must exist");
+                                let attempt = lai.attempt;
+                                if let Some(backoff_task) = lai.backing_off_task.take() {
+                                    backoff_task.abort();
+                                }
+                                self.set_shutdown_complete_if_ready(&mut dat);
+                                self.complete_notify.notify_one();
+                                (None, Some(attempt))
+                            } else {
+                                (None, None)
+                            }
+                        };
                         if let Some(task_token) = tt {
                             return Some(NextPendingLAAction::Autocomplete(
                                 self.complete(&task_token, resolution.result),
+                            ));
+                        }
+                        if let Some(attempt) = report_attempt {
+                            let mut resolution = resolution;
+                            resolution.attempt = attempt;
+                            return Some(NextPendingLAAction::Autocomplete(
+                                LACompleteAction::Report {
+                                    run_id,
+                                    resolution,
+                                    task: None,
+                                },
                             ));
                         }
                         // This timeout is for a no-longer-tracked activity, so, whatever
@@ -589,6 +621,7 @@ impl LocalActivityManager {
             }
 
             let la_info = dat.la_info.get_mut(&id).expect("Activity must exist");
+            la_info.attempt = attempt;
             let tt = la_info.task_token.clone();
             if let Some(to) = la_info.timeout_bag.as_mut() {
                 to.mark_started();
@@ -816,6 +849,7 @@ impl LocalActivityManager {
                             exec_id,
                             LocalActivityInfo {
                                 task_token: tt,
+                                attempt: info.attempt,
                                 queued_for_dispatch: false,
                                 backing_off_task: Some(jh),
                                 first_wft_has_ended: maybe_old_lai
@@ -1543,6 +1577,56 @@ mod tests {
         assert_matches!(res, LACompleteAction::Report{resolution, ..}
             if resolution.backoff.as_ref().unwrap().seconds == 10 && resolution.attempt == 5
         )
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn schedule_to_close_timeout_during_local_backoff_stops_retry() {
+        let lam = LocalActivityManager::test(1);
+        lam.enqueue([NewLocalAct {
+            schedule_cmd: ValidScheduleLA {
+                seq: 1,
+                activity_id: "1".to_string(),
+                retry_policy: ValidatedRetryPolicy::from_proto_with_defaults(RetryPolicy {
+                    initial_interval: Some(prost_dur!(from_secs(3))),
+                    backoff_coefficient: 1.0,
+                    maximum_attempts: 10,
+                    ..Default::default()
+                }),
+                local_retry_threshold: Duration::from_secs(500),
+                close_timeouts: LACloseTimeouts::ScheduleOnly(Duration::from_secs(2)),
+                ..Default::default()
+            },
+            workflow_type: "".to_string(),
+            workflow_exec_info: WorkflowExecution {
+                workflow_id: "".to_string(),
+                run_id: "run_id".to_string(),
+            },
+            schedule_time: SystemTime::now(),
+        }
+        .into()]);
+
+        let start = lam.next_pending().await.unwrap().unwrap();
+        let tt: TaskToken = start.task_token.into();
+        assert_matches!(
+            lam.complete(
+                &tt,
+                LocalActivityExecutionResult::Failed(Default::default())
+            ),
+            LACompleteAction::WillBeRetried(None)
+        );
+        assert_eq!(lam.num_in_backoff(), 1);
+
+        tokio::time::advance(Duration::from_secs(2)).await;
+        let timeout = lam.next_pending().await.unwrap();
+
+        assert!(timeout.is_timeout(false));
+        assert_matches!(
+            timeout,
+            NextPendingLAAction::Autocomplete(LACompleteAction::Report { resolution, .. })
+                if resolution.attempt == 1
+        );
+        assert_eq!(lam.num_in_backoff(), 0);
+        assert_eq!(lam.num_outstanding(), 0);
     }
 
     #[tokio::test]
