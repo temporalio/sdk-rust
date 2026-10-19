@@ -1,9 +1,9 @@
 use crate::{
     abstractions::{ActiveCounter, MeteredPermitDealer, OwnedMeteredSemPermit, dbg_panic},
-    pollers::{self, Poller},
+    pollers::{self, Poller, StickyPollerShared},
     worker::{
         ActivitySlotKind, NamespaceCapabilities, NexusSlotKind, PollerBehavior, SlotKind,
-        WFTPollerShared, WorkflowSlotKind,
+        WorkflowSlotKind,
         client::{
             PollActivityOptions, PollNexusOptions, PollOptions, PollWorkflowOptions, WorkerClient,
         },
@@ -103,7 +103,7 @@ pub(crate) struct LongPollBuffer<T, SK: SlotKind> {
 }
 
 pub(crate) struct WorkflowTaskOptions {
-    pub(crate) wft_poller_shared: Option<Arc<WFTPollerShared>>,
+    pub(crate) wft_poller_shared: Option<Arc<StickyPollerShared>>,
 }
 
 pub(crate) struct ActivityTaskOptions {
@@ -947,7 +947,7 @@ mod tests {
             CancellationToken::new(),
             None::<fn(usize)>,
             WorkflowTaskOptions {
-                wft_poller_shared: Some(Arc::new(WFTPollerShared::new(Some(10)))),
+                wft_poller_shared: Some(Arc::new(StickyPollerShared::new(Some(10)))),
             },
             Arc::new(AtomicCell::new(None)),
             Arc::new(NamespaceCapabilities::default()),
@@ -1004,7 +1004,7 @@ mod tests {
             CancellationToken::new(),
             None::<fn(usize)>,
             WorkflowTaskOptions {
-                wft_poller_shared: Some(Arc::new(WFTPollerShared::new(Some(1)))),
+                wft_poller_shared: Some(Arc::new(StickyPollerShared::new(Some(1)))),
             },
             Arc::new(AtomicCell::new(None)),
             Arc::new(NamespaceCapabilities::default()),
@@ -1081,7 +1081,7 @@ mod tests {
             shutdown_token.clone(),
             None::<fn(usize)>,
             WorkflowTaskOptions {
-                wft_poller_shared: Some(Arc::new(WFTPollerShared::new(Some(10)))),
+                wft_poller_shared: Some(Arc::new(StickyPollerShared::new(Some(10)))),
             },
             Arc::new(AtomicCell::new(None)),
             Arc::new(NamespaceCapabilities::default()),
@@ -1190,7 +1190,7 @@ mod tests {
             CancellationToken::new(),
             None::<fn(usize)>,
             WorkflowTaskOptions {
-                wft_poller_shared: Some(Arc::new(WFTPollerShared::new(Some(INITIAL_POLLERS)))),
+                wft_poller_shared: Some(Arc::new(StickyPollerShared::new(Some(INITIAL_POLLERS)))),
             },
             Arc::new(AtomicCell::new(None)),
             Arc::new(NamespaceCapabilities::default()),
