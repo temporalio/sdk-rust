@@ -23,7 +23,10 @@ use temporalio_common_wasm::{
         },
         temporal::api::{
             common::v1::Payload,
-            failure::v1::{ApplicationFailureInfo, Failure, failure::FailureInfo},
+            failure::v1::{
+                ApplicationFailureInfo, CanceledFailureInfo, Failure, NexusOperationFailureInfo,
+                TimeoutFailureInfo, failure::FailureInfo,
+            },
         },
     },
 };
@@ -404,10 +407,96 @@ fn start_and_result_failures_preserve_server_failure_details() {
             for _ in 0..2 {
                 let error = handle.result().now_or_never().unwrap().unwrap_err();
                 assert_eq!(error.failure(), Some(&failure));
-                assert_eq!(error.as_cancelled().is_some(), phase == 2);
-                assert_eq!(error.as_timeout().is_some(), phase == 3);
+                assert_eq!(error.is_cancelled(), phase == 2);
+                assert_eq!(error.is_timed_out(), phase == 3);
             }
         }
+    }
+}
+
+#[test]
+fn start_infers_outcomes_from_failure_info() {
+    for (failure_info, cancelled, timed_out) in [
+        (None, false, false),
+        (
+            Some(FailureInfo::CanceledFailureInfo(
+                CanceledFailureInfo::default(),
+            )),
+            true,
+            false,
+        ),
+        (
+            Some(FailureInfo::TimeoutFailureInfo(
+                TimeoutFailureInfo::default(),
+            )),
+            false,
+            true,
+        ),
+    ] {
+        for wrapped in [false, true] {
+            let reason = Failure {
+                message: "start resolution".to_owned(),
+                failure_info: failure_info.clone(),
+                ..Default::default()
+            };
+            let failure = if wrapped {
+                Failure {
+                    message: "operation failed to start".to_owned(),
+                    cause: Some(Box::new(reason)),
+                    failure_info: Some(FailureInfo::NexusOperationExecutionFailureInfo(
+                        NexusOperationFailureInfo::default(),
+                    )),
+                    ..Default::default()
+                }
+            } else {
+                reason
+            };
+            let (base, client, _) = client();
+            let execute = client.execute(
+                Payments::charge,
+                request(),
+                NexusWorkflowOperationOptions::default(),
+            );
+            let mut execute = std::pin::pin!(execute);
+            assert!(execute.as_mut().now_or_never().is_none());
+            resolve_start(&base, 1, StartStatus::Failed(failure.clone()));
+            let error = execute.now_or_never().unwrap().unwrap_err();
+            assert_eq!(error.is_cancelled(), cancelled);
+            assert_eq!(error.is_timed_out(), timed_out);
+            assert_eq!(error.failure(), Some(&failure));
+        }
+    }
+}
+
+#[test]
+fn result_preserves_explicit_outcomes_without_failure_info() {
+    let failure = Failure {
+        message: "resolution without failure info".to_owned(),
+        ..Default::default()
+    };
+    for status in [
+        nexus_operation_result::Status::Failed(failure.clone()),
+        nexus_operation_result::Status::Cancelled(failure.clone()),
+        nexus_operation_result::Status::TimedOut(failure.clone()),
+    ] {
+        let cancelled = matches!(status, nexus_operation_result::Status::Cancelled(_));
+        let timed_out = matches!(status, nexus_operation_result::Status::TimedOut(_));
+        let (base, client, _) = client();
+        let execute = client.execute(
+            Payments::charge,
+            request(),
+            NexusWorkflowOperationOptions::default(),
+        );
+        let mut execute = std::pin::pin!(execute);
+        assert!(execute.as_mut().now_or_never().is_none());
+        resolve_start(&base, 1, StartStatus::OperationToken("token".to_owned()));
+        resolve_result(&base, 1, Some(status));
+        let error = execute.now_or_never().unwrap().unwrap_err();
+        assert_eq!(error.is_cancelled(), cancelled);
+        assert_eq!(error.is_timed_out(), timed_out);
+        assert_eq!(error.failure(), Some(&failure));
+        assert!(error.cancellation_cause().is_none());
+        assert!(error.timeout_cause().is_none());
     }
 }
 

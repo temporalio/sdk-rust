@@ -94,7 +94,10 @@ impl NexusBasicWf {
                 let res = started.result().await;
                 Ok(Ok(res))
             }
-            Err(failure) => Ok(Err(failure)),
+            Err(error) => Ok(Err(error
+                .failure()
+                .expect("expected operation failure")
+                .clone())),
         }
     }
 }
@@ -563,8 +566,13 @@ impl NexusCancelBeforeStartWf {
         );
         started.cancel();
         let res = started.await.unwrap_err();
-        assert_eq!(res.message, "Nexus Operation cancelled before scheduled");
-        if let FailureInfo::NexusOperationExecutionFailureInfo(fi) = res.failure_info.unwrap() {
+        assert!(res.is_cancelled());
+        let failure = res.failure().unwrap();
+        assert_eq!(
+            failure.message,
+            "Nexus Operation cancelled before scheduled"
+        );
+        if let Some(FailureInfo::NexusOperationExecutionFailureInfo(fi)) = &failure.failure_info {
             assert_eq!(fi.endpoint, ctx.state(|wf| wf.endpoint.clone()));
             assert_eq!(fi.service, "svc");
             assert_eq!(fi.operation, "op");

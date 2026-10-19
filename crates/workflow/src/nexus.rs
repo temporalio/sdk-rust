@@ -3,6 +3,11 @@
 //! **Experimental:** Enable the `experimental` feature. This API and the draft Nexus SDK it
 //! depends on may change.
 //!
+//! Calls return [`NexusOperationError`]. Its remote outcome variants retain a
+//! [`NexusOperationFailureError`] with optional Nexus metadata and a normalized failure reason.
+//! Check the variant or its outcome predicates to distinguish cancellation and timeout;
+//! [`NexusOperationError::reason`] describes the cause independently of that outcome.
+//!
 //! Services are defined with the Nexus SDK's [`nexus_rpc::service`] macro. Operation markers bind each
 //! operation to its service, input, and output types. Calls use the workflow's payload converter;
 //! payload codecs are applied at the worker boundary, just as for activities.
@@ -48,7 +53,10 @@
 
 pub use crate::NexusOperationCancellationType;
 pub use nexus_rpc::{NexusOperation, NexusService};
-pub use temporalio_common_wasm::error::NexusOperationError;
+pub use temporalio_common_wasm::error::{
+    NexusHandlerFailureError, NexusHandlerRetryBehavior, NexusOperationError,
+    NexusOperationFailureError,
+};
 
 use crate::{
     BaseWorkflowContext, EventGroup, NexusOperationOptions, StartedNexusOperation,
@@ -58,7 +66,7 @@ use crate::{
 use std::{future, marker::PhantomData, time::Duration};
 use temporalio_common_wasm::{
     data_converters::{
-        GenericPayloadConverter, NexusOperationDecodeHint, NoopDecodeHint, PayloadConversionError,
+        GenericPayloadConverter, NexusOperationDecodeHint, PayloadConversionError,
         SerializationContext, SerializationContextData, TemporalDeserializable,
         TemporalSerializable, WorkflowSerializationContext,
     },
@@ -188,6 +196,9 @@ impl<S: NexusService> NexusWorkflowClient<S> {
 
     /// Start an operation and wait for the handler to acknowledge it.
     ///
+    /// Before acknowledgment, cancellation and timeout are inferred from failure info. If Core
+    /// omits that information, the error is reported as [`NexusOperationError::Failed`].
+    ///
     /// Synchronous operations return a handle with no operation token. The operation is scheduled
     /// when this method is called, as with activities. Dropping the future or handle does not cancel
     /// it; use [`crate::CancellableFuture::cancel`] while starting, the options' cancellation token,
@@ -218,7 +229,6 @@ impl<S: NexusService> NexusWorkflowClient<S> {
                 );
             }
         };
-        let context = self.context.clone();
         self.context
             .start_nexus_operation(
                 NexusOperationOptions::builder()
@@ -235,18 +245,10 @@ impl<S: NexusService> NexusWorkflowClient<S> {
                     .build(),
             )
             .map(move |result| {
-                result
-                    .map(|started| NexusWorkflowOperationHandle {
-                        started,
-                        output: PhantomData,
-                    })
-                    .map_err(|failure| {
-                        context
-                            .data_converter()
-                            .to_error(&context_data, failure, NoopDecodeHint)
-                            .map(NexusOperationError::from)
-                            .unwrap_or_else(NexusOperationError::Serialization)
-                    })
+                result.map(|started| NexusWorkflowOperationHandle {
+                    started,
+                    output: PhantomData,
+                })
             })
     }
 
