@@ -100,9 +100,8 @@ pub trait StorageDriverLimiter<Item>: Send + Sync {
     /// Acquire a permit for one request, waiting until the limits allow it.
     ///
     /// Holding a single permit across a fan out satisfies the signature while quietly defeating
-    /// the limit. Acquiring a second permit while handling one request, directly or in a helper,
-    /// deadlocks at the limit: every holder would be waiting for a permit only another holder can
-    /// release.
+    /// the limit. Do not acquire more than one permit for a given request: at the limit, every
+    /// holder would be waiting for a permit only another holder can release.
     ///
     /// `item` is what the request covers, a payload when storing and a claim when retrieving.
     fn acquire<'a>(
