@@ -38,6 +38,9 @@ pub struct TestServerOptions {
     pub extra_args: ByteArrayRef,
     /// 0 means no TTL
     pub download_ttl_seconds: u64,
+    /// Readiness timeout for dev and test servers, excluding executable download time.
+    /// 0 uses the five-second default.
+    pub startup_timeout_millis: u64,
 }
 
 /// Anything besides user data must be freed if non-null.
@@ -220,6 +223,7 @@ impl TryFrom<&DevServerOptions> for ephemeral_server::TemporalDevServerConfig {
                 options.log_level.to_string(),
             ))
             .extra_args(test_server_options.extra_args())
+            .maybe_startup_timeout(test_server_options.startup_timeout())
             .build())
     }
 }
@@ -232,11 +236,17 @@ impl TryFrom<&TestServerOptions> for ephemeral_server::TestServerConfig {
             .exe(options.exe())
             .maybe_port(options.port())
             .extra_args(options.extra_args())
+            .maybe_startup_timeout(options.startup_timeout())
             .build())
     }
 }
 
 impl TestServerOptions {
+    fn startup_timeout(&self) -> Option<Duration> {
+        (self.startup_timeout_millis != 0)
+            .then(|| Duration::from_millis(self.startup_timeout_millis))
+    }
+
     fn exe(&self) -> ephemeral_server::EphemeralExe {
         if let Some(existing_path) = self.existing_path.to_option_string() {
             ephemeral_server::EphemeralExe::ExistingPath(existing_path)

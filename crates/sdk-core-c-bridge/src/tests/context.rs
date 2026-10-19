@@ -192,6 +192,7 @@ impl Context {
             port: config.port.unwrap_or(0),
             extra_args: extra_args.as_str().into(),
             download_ttl_seconds: 0,
+            startup_timeout_millis: config.startup_timeout.as_millis().try_into().unwrap(),
         });
 
         match config.exe {

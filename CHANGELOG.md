@@ -41,6 +41,8 @@ relevant information.
   differs from the command that produced it.
 
 ### Added
+* Local workflow environments and ephemeral server configurations support a `startup_timeout`
+  setting, defaulting to five seconds and excluding executable downloads.
 * Experimental Event Groups support (requires the `experimental` feature). Event Groups
   are workflow-level metadata that group related history events for UI and observability.
   `EventGroup::new` takes a required ID (used verbatim; do not put secrets in it);
@@ -54,6 +56,8 @@ relevant information.
 
 
 ### Fixed
+* Ephemeral server startup now enforces its elapsed-time deadline even when a connection stalls,
+  and startup timeout messages include the last connection error when available.
 * Avoid scanning the workflow cache when no workflow tasks are waiting for a cache slot, reducing
   workflow processing CPU overhead with large caches.
 * `temporal.api.sdk.v1` messages are capable of serialization to proto JSON, so their JSON field

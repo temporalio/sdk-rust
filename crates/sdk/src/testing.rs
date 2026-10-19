@@ -458,6 +458,10 @@ pub struct LocalWorkflowEnvironmentOptions {
     /// Additional arguments appended to the Temporal CLI invocation.
     #[builder(default)]
     pub extra_args: Vec<String>,
+    /// Maximum time to wait for dev server readiness after spawning the process.
+    /// Defaults to five seconds. Does not include executable download time.
+    #[builder(default = Duration::from_secs(5))]
+    pub startup_timeout: Duration,
 }
 
 impl Default for LocalWorkflowEnvironmentOptions {
@@ -532,6 +536,7 @@ impl WorkflowEnvironment<LocalServer> {
                 options.log_level.to_string(),
             ))
             .extra_args(options.extra_args)
+            .startup_timeout(options.startup_timeout)
             .build();
         let mut server = server_config
             .start_server()

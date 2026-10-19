@@ -594,6 +594,11 @@ typedef struct TemporalCoreTestServerOptions {
    * 0 means no TTL
    */
   uint64_t download_ttl_seconds;
+  /**
+   * Readiness timeout for dev and test servers, excluding executable download time.
+   * 0 uses the five-second default.
+   */
+  uint64_t startup_timeout_millis;
 } TemporalCoreTestServerOptions;
 
 typedef struct TemporalCoreDevServerOptions {
