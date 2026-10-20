@@ -368,18 +368,13 @@ to be acknowledged; the handle exposes `operation_token()` (`None` for synchrono
 cancellation behavior, and a cancellation token; absent a token, workflow cancellation is inherited.
 Nexus request headers can be set by workflow interceptors, not by the typed call options.
 
-`start`, `execute`, and the typed handle's `result` return `NexusOperationError`. Its `Failed`,
-`Cancelled`, and `TimedOut` variants carry a `NexusOperationFailureError` with endpoint, service,
-operation, token, and scheduled event ID accessors. Metadata is optional when the incoming failure
-has no Nexus wrapper. `reason()` exposes the underlying normalized error, including
-`IncomingError::NexusHandler` with handler type and explicit retry behavior accessors.
-
-Use the variant or `is_cancelled()` / `is_timed_out()` to check the operation's outcome.
-`cancellation_cause()` and `timeout_cause()` inspect its immediate reason; that reason can differ
-from the outcome or be absent. After starting, the resolution status determines the outcome even
-without failure info, and a `Failed` operation with a cancellation reason remains `Failed`.
-Before starting, cancellation and timeout are inferred from failure info; if it is missing, the
-error is reported as `Failed`.
+`start`, `execute`, and the typed handle's `result` return `NexusOperationError`. Its `Failed`
+variant carries a `NexusOperationFailureError`; `Serialization` reports payload conversion errors.
+Use `operation_failure()` to access the remote failure's endpoint, service, operation, token, and
+scheduled event ID. Metadata is optional when the incoming failure has no Nexus wrapper.
+The failure's `as_cancelled()` and `as_timeout()` expose typed cancellation and timeout causes.
+Its `reason()` exposes the underlying normalized error, including `IncomingError::NexusHandler`
+with handler type and explicit retry behavior accessors.
 
 Calls use the workflow's payload and failure converters, with payload codecs applied at the worker
 boundary. Service and operation wire names are recorded in history, so changing them in existing

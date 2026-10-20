@@ -107,40 +107,21 @@ impl FailureDecodeHint for NoopDecodeHint {
     }
 }
 
-/// Decode hint preserving the workflow-side Nexus operation resolution status.
+/// Decode hint for Nexus operation failures.
 #[cfg(feature = "experimental")]
 #[derive(Debug, Clone, Copy)]
-#[non_exhaustive]
-pub enum NexusOperationDecodeHint {
-    /// Infer the outcome from the immediate failure reason when resolving an operation start.
-    InferFromFailure,
-    /// The operation failed.
-    Failed,
-    /// The operation was cancelled.
-    Cancelled,
-    /// The operation timed out.
-    TimedOut,
-}
+pub struct NexusOperationDecodeHint;
 
 #[cfg(feature = "experimental")]
 impl FailureDecodeHint for NexusOperationDecodeHint {
     type Output = NexusOperationError;
 
     fn adapt(self, normalized: IncomingError) -> Self::Output {
-        let operation = Box::new(match normalized {
+        let operation = match normalized {
             IncomingError::NexusOperationExecution(operation) => operation,
             other => NexusOperationFailureError::new(other.failure().clone(), Some(other)),
-        });
-        match self {
-            Self::InferFromFailure => match operation.reason() {
-                Some(IncomingError::Cancelled(_)) => NexusOperationError::Cancelled(operation),
-                Some(IncomingError::Timeout(_)) => NexusOperationError::TimedOut(operation),
-                _ => NexusOperationError::Failed(operation),
-            },
-            Self::Failed => NexusOperationError::Failed(operation),
-            Self::Cancelled => NexusOperationError::Cancelled(operation),
-            Self::TimedOut => NexusOperationError::TimedOut(operation),
-        }
+        };
+        NexusOperationError::Failed(Box::new(operation))
     }
 }
 
@@ -542,8 +523,6 @@ impl EncodeFailure for NexusOperationError {
     ) -> Result<Failure, PayloadConversionError> {
         Ok(match self {
             Self::Failed(failure) => failure.failure().clone(),
-            Self::Cancelled(failure) => failure.failure().clone(),
-            Self::TimedOut(failure) => failure.failure().clone(),
             Self::Serialization(err) => encode_generic_application_failure(err),
         })
     }
@@ -919,14 +898,15 @@ mod tests {
                 NoopDecodeHint,
             )
             .unwrap();
-        let operation = NexusOperationDecodeHint::Failed.adapt(decoded);
-        assert_eq!(operation.failure(), Some(&failure));
-        assert_eq!(operation.endpoint(), Some("endpoint"));
-        assert_eq!(operation.service(), Some("service"));
-        assert_eq!(operation.operation(), Some("operation"));
-        assert_eq!(operation.operation_token(), Some("token"));
-        assert_eq!(operation.scheduled_event_id(), Some(42));
-        let Some(IncomingError::Application(application)) = operation.cause() else {
+        let operation = NexusOperationDecodeHint.adapt(decoded);
+        let operation_failure = operation.operation_failure().unwrap();
+        assert_eq!(operation_failure.failure(), &failure);
+        assert_eq!(operation_failure.endpoint(), Some("endpoint"));
+        assert_eq!(operation_failure.service(), Some("service"));
+        assert_eq!(operation_failure.operation(), Some("operation"));
+        assert_eq!(operation_failure.operation_token(), Some("token"));
+        assert_eq!(operation_failure.scheduled_event_id(), Some(42));
+        let Some(IncomingError::Application(application)) = operation_failure.cause() else {
             panic!("expected normalized application cause");
         };
         assert_eq!(application.type_name(), Some("RemoteError"));
@@ -963,12 +943,15 @@ mod tests {
                 NoopDecodeHint,
             )
             .unwrap();
-        let operation = NexusOperationDecodeHint::Cancelled.adapt(incoming);
+        let operation = NexusOperationDecodeHint.adapt(incoming);
         assert_eq!(
-            operation.cancellation_cause().map(CancelledError::failure),
+            operation
+                .operation_failure()
+                .unwrap()
+                .as_cancelled()
+                .map(CancelledError::failure),
             Some(&cancellation)
         );
-        assert!(operation.is_cancelled());
         let outgoing = OutgoingWorkflowError::from(operation);
         assert_eq!(
             outgoing.as_cancelled().map(CancelledError::failure),
@@ -979,75 +962,29 @@ mod tests {
 
     #[cfg(feature = "experimental")]
     #[rstest]
-    #[case(NexusOperationDecodeHint::Cancelled)]
-    #[case(NexusOperationDecodeHint::TimedOut)]
-    fn nexus_bare_failure_preserves_resolution_status(#[case] hint: NexusOperationDecodeHint) {
-        let failure = Failure {
-            message: "bare operation failure".to_owned(),
-            source: "core".to_owned(),
-            stack_trace: "original stack".to_owned(),
-            ..Default::default()
-        };
-        let operation = data_converter()
-            .to_error(
-                &SerializationContextData::Workflow(WorkflowSerializationContext::new()),
-                failure.clone(),
-                hint,
-            )
-            .unwrap();
-        assert_eq!(operation.failure(), Some(&failure));
-        assert_eq!(operation.endpoint(), None);
-        assert_eq!(
-            operation.is_cancelled(),
-            matches!(hint, NexusOperationDecodeHint::Cancelled)
-        );
-        assert_eq!(
-            operation.is_timed_out(),
-            matches!(hint, NexusOperationDecodeHint::TimedOut)
-        );
-        assert!(operation.cancellation_cause().is_none());
-        assert!(operation.timeout_cause().is_none());
-        let Some(IncomingError::Application(application)) = operation.reason() else {
-            panic!("expected the unwrapped failure reason");
-        };
-        assert_eq!(application.failure(), Some(&failure));
-        let outgoing = OutgoingWorkflowError::from(operation);
-        assert_eq!(convert(outgoing), failure);
-    }
-
-    #[cfg(feature = "experimental")]
-    #[rstest]
-    #[case(NexusOperationDecodeHint::Cancelled)]
-    #[case(NexusOperationDecodeHint::TimedOut)]
-    fn nexus_wrapped_resolution_retains_details_and_metadata(
-        #[case] hint: NexusOperationDecodeHint,
-    ) {
+    #[case(false)]
+    #[case(true)]
+    fn nexus_wrapped_resolution_retains_details_and_metadata(#[case] timed_out: bool) {
         let details = vec![Payload {
             data: b"original detail".to_vec(),
             ..Default::default()
         }];
         let cause = Failure {
             message: "operation cause".to_owned(),
-            failure_info: Some(match hint {
-                NexusOperationDecodeHint::Cancelled => {
-                    FailureInfo::CanceledFailureInfo(CanceledFailureInfo {
-                        details: Some(Payloads {
-                            payloads: details.clone(),
-                        }),
-                        ..Default::default()
-                    })
-                }
-                NexusOperationDecodeHint::TimedOut => {
-                    FailureInfo::TimeoutFailureInfo(TimeoutFailureInfo {
-                        timeout_type: ProtoTimeoutType::StartToClose as i32,
-                        last_heartbeat_details: Some(Payloads {
-                            payloads: details.clone(),
-                        }),
-                    })
-                }
-                NexusOperationDecodeHint::Failed | NexusOperationDecodeHint::InferFromFailure => {
-                    unreachable!()
-                }
+            failure_info: Some(if timed_out {
+                FailureInfo::TimeoutFailureInfo(TimeoutFailureInfo {
+                    timeout_type: ProtoTimeoutType::StartToClose as i32,
+                    last_heartbeat_details: Some(Payloads {
+                        payloads: details.clone(),
+                    }),
+                })
+            } else {
+                FailureInfo::CanceledFailureInfo(CanceledFailureInfo {
+                    details: Some(Payloads {
+                        payloads: details.clone(),
+                    }),
+                    ..Default::default()
+                })
             }),
             ..Default::default()
         };
@@ -1070,39 +1007,37 @@ mod tests {
             .to_error(
                 &SerializationContextData::Workflow(WorkflowSerializationContext::new()),
                 failure.clone(),
-                hint,
+                NexusOperationDecodeHint,
             )
             .unwrap();
-        assert_eq!(operation.failure(), Some(&failure));
-        assert_eq!(operation.cause().map(IncomingError::failure), Some(&cause));
-        assert_eq!(operation.endpoint(), Some("endpoint"));
-        assert_eq!(operation.service(), Some("service"));
-        assert_eq!(operation.operation(), Some("operation"));
-        assert_eq!(operation.operation_token(), Some("token"));
-        assert_eq!(operation.scheduled_event_id(), Some(42));
-        match hint {
-            NexusOperationDecodeHint::Cancelled => {
-                let cancelled = operation.cancellation_cause().unwrap();
-                assert_eq!(cancelled.failure(), &cause);
-                assert_eq!(cancelled.raw_details(), Some(details.as_slice()));
-                assert!(operation.timeout_cause().is_none());
-            }
-            NexusOperationDecodeHint::TimedOut => {
-                let timeout = operation.timeout_cause().unwrap();
-                assert_eq!(timeout.failure(), &cause);
-                assert_eq!(
-                    timeout.timeout_type(),
-                    crate::error::TimeoutType::StartToClose
-                );
-                assert_eq!(
-                    timeout.raw_last_heartbeat_details(),
-                    Some(details.as_slice())
-                );
-                assert!(operation.cancellation_cause().is_none());
-            }
-            NexusOperationDecodeHint::Failed | NexusOperationDecodeHint::InferFromFailure => {
-                unreachable!()
-            }
+        let operation_failure = operation.operation_failure().unwrap();
+        assert_eq!(operation_failure.failure(), &failure);
+        assert_eq!(
+            operation_failure.cause().map(IncomingError::failure),
+            Some(&cause)
+        );
+        assert_eq!(operation_failure.endpoint(), Some("endpoint"));
+        assert_eq!(operation_failure.service(), Some("service"));
+        assert_eq!(operation_failure.operation(), Some("operation"));
+        assert_eq!(operation_failure.operation_token(), Some("token"));
+        assert_eq!(operation_failure.scheduled_event_id(), Some(42));
+        if timed_out {
+            let timeout = operation_failure.as_timeout().unwrap();
+            assert_eq!(timeout.failure(), &cause);
+            assert_eq!(
+                timeout.timeout_type(),
+                crate::error::TimeoutType::StartToClose
+            );
+            assert_eq!(
+                timeout.raw_last_heartbeat_details(),
+                Some(details.as_slice())
+            );
+            assert!(operation_failure.as_cancelled().is_none());
+        } else {
+            let cancelled = operation_failure.as_cancelled().unwrap();
+            assert_eq!(cancelled.failure(), &cause);
+            assert_eq!(cancelled.raw_details(), Some(details.as_slice()));
+            assert!(operation_failure.as_timeout().is_none());
         }
         assert_eq!(convert(operation.into()), failure);
     }
@@ -1116,71 +1051,13 @@ mod tests {
             PayloadConversionError::EncodingError(anyhow::anyhow!("encode boom").into()).into(),
         );
         let operation = NexusOperationError::from(conversion);
-        assert!(operation.failure().is_none());
-        assert!(operation.cause().is_none());
-        assert!(operation.cancellation_cause().is_none());
+        assert!(operation.operation_failure().is_none());
         let outgoing = OutgoingWorkflowError::from(operation);
         assert!(matches!(
             outgoing,
             OutgoingWorkflowError::PayloadConversion(_)
         ));
         assert_eq!(convert(outgoing), expected);
-    }
-
-    #[cfg(feature = "experimental")]
-    #[rstest]
-    fn nexus_outcomes_are_independent_of_the_immediate_failure_reason(
-        #[values(
-            NexusOperationDecodeHint::Failed,
-            NexusOperationDecodeHint::Cancelled,
-            NexusOperationDecodeHint::TimedOut,
-            NexusOperationDecodeHint::InferFromFailure
-        )]
-        hint: NexusOperationDecodeHint,
-        #[values(false, true)] timeout: bool,
-        #[values(false, true)] wrapped: bool,
-    ) {
-        let reason = if timeout {
-            Failure {
-                message: "remote timeout".to_owned(),
-                failure_info: Some(FailureInfo::TimeoutFailureInfo(
-                    TimeoutFailureInfo::default(),
-                )),
-                ..Default::default()
-            }
-        } else {
-            cancelled_failure("remote cancellation")
-        };
-        let failure = if wrapped {
-            Failure {
-                message: "operation failed".to_owned(),
-                cause: Some(Box::new(reason.clone())),
-                failure_info: Some(FailureInfo::NexusOperationExecutionFailureInfo(
-                    NexusOperationFailureInfo::default(),
-                )),
-                ..Default::default()
-            }
-        } else {
-            reason.clone()
-        };
-        let operation = data_converter()
-            .to_error(&SerializationContextData::None, failure.clone(), hint)
-            .unwrap();
-        let cancelled = matches!(hint, NexusOperationDecodeHint::Cancelled)
-            || matches!(hint, NexusOperationDecodeHint::InferFromFailure) && !timeout;
-        let timed_out = matches!(hint, NexusOperationDecodeHint::TimedOut)
-            || matches!(hint, NexusOperationDecodeHint::InferFromFailure) && timeout;
-        assert_eq!(operation.is_cancelled(), cancelled);
-        assert_eq!(operation.is_timed_out(), timed_out);
-        assert_eq!(
-            operation.reason().map(IncomingError::failure),
-            Some(&reason)
-        );
-        assert_eq!(operation.cancellation_cause().is_some(), !timeout);
-        assert_eq!(operation.timeout_cause().is_some(), timeout);
-        let outgoing = OutgoingWorkflowError::from(operation);
-        assert_eq!(outgoing.as_cancelled().is_some(), cancelled && !timeout);
-        assert_eq!(convert(outgoing), failure);
     }
 
     #[cfg(feature = "experimental")]
@@ -1206,17 +1083,17 @@ mod tests {
             .to_error(
                 &SerializationContextData::None,
                 failure.clone(),
-                NexusOperationDecodeHint::InferFromFailure,
+                NexusOperationDecodeHint,
             )
             .unwrap();
         assert!(matches!(operation, NexusOperationError::Failed(_)));
-        assert!(!operation.is_cancelled());
-        assert!(operation.cancellation_cause().is_none());
+        let operation_failure = operation.operation_failure().unwrap();
+        assert!(operation_failure.as_cancelled().is_none());
         assert_eq!(
-            operation.cause().map(IncomingError::failure),
+            operation_failure.cause().map(IncomingError::failure),
             Some(&failure)
         );
-        let Some(IncomingError::Application(application)) = operation.reason() else {
+        let Some(IncomingError::Application(application)) = operation_failure.reason() else {
             panic!("expected application reason");
         };
         assert_eq!(application.type_name(), Some("PaymentRejected"));
@@ -1428,11 +1305,7 @@ mod tests {
 
     #[cfg(feature = "experimental")]
     #[rstest]
-    #[case(NexusOperationDecodeHint::Failed)]
-    #[case(NexusOperationDecodeHint::Cancelled)]
-    #[case(NexusOperationDecodeHint::TimedOut)]
     fn application_failures_preserve_nested_nexus_errors(
-        #[case] hint: NexusOperationDecodeHint,
         #[values(false, true)] generic_wrapper: bool,
     ) {
         let failure = Failure {
@@ -1456,7 +1329,7 @@ mod tests {
                 &SerializationContextData::None,
             )
             .unwrap();
-        let operation = hint.adapt(normalized);
+        let operation = NexusOperationDecodeHint.adapt(normalized);
         let source: Box<dyn std::error::Error + Send + Sync> = if generic_wrapper {
             Box::new(TestError::new("outer wrapper", Some(Box::new(operation))))
         } else {

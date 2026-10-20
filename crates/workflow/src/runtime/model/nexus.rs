@@ -47,7 +47,7 @@ impl Unblockable for NexusStartResult {
                     .to_error(
                         &SerializationContextData::Workflow(WorkflowSerializationContext::new()),
                         failure,
-                        NexusOperationDecodeHint::InferFromFailure,
+                        NexusOperationDecodeHint,
                     )
                     .unwrap_or_else(NexusOperationError::Serialization)),
             },

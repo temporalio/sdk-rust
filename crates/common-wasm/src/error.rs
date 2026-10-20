@@ -485,9 +485,9 @@ impl OutgoingWorkflowError {
             Self::WorkflowSignal(err) => err.as_cancelled(),
             Self::CancelExternalWorkflow(err) => err.as_cancelled(),
             #[cfg(feature = "experimental")]
-            Self::NexusOperation(err) if err.is_cancelled() => err.cancellation_cause(),
-            #[cfg(feature = "experimental")]
-            Self::NexusOperation(_) => None,
+            Self::NexusOperation(err) => err
+                .operation_failure()
+                .and_then(NexusOperationFailureError::as_cancelled),
         }
     }
 }
@@ -1020,6 +1020,10 @@ pub struct NexusOperationFailureError {
     cause: Option<Box<IncomingError>>,
 }
 
+/// Compatibility alias for [`NexusOperationFailureError`].
+#[deprecated(note = "Use NexusOperationFailureError instead.")]
+pub type IncomingNexusOperationExecutionError = NexusOperationFailureError;
+
 impl NexusOperationFailureError {
     pub(crate) fn new(failure: Failure, cause: Option<IncomingError>) -> Self {
         Self {
@@ -1045,9 +1049,24 @@ impl NexusOperationFailureError {
         self.cause()
     }
 
+    /// Returns the immediate cancellation cause, if present.
+    pub fn as_cancelled(&self) -> Option<&CancelledError> {
+        self.cause().and_then(IncomingError::as_cancelled)
+    }
+
+    /// Returns the immediate timeout cause, if present.
+    pub fn as_timeout(&self) -> Option<&TimeoutError> {
+        self.cause().and_then(IncomingError::as_timeout)
+    }
+
     /// Consumes this error and returns the original failure proto.
     pub fn into_failure(self) -> Failure {
         self.failure
+    }
+
+    /// Consumes this wrapper and returns the retained proto failure and normalized cause.
+    pub fn into_parts(self) -> (Failure, Option<IncomingError>) {
+        (self.failure, self.cause.map(|cause| *cause))
     }
 
     /// Returns the endpoint reported by the Nexus wrapper, if present.
@@ -1090,6 +1109,10 @@ incoming_failure_wrapper!(
     NexusHandlerFailureError,
     "A normalized nexus handler failure wrapper."
 );
+
+/// Compatibility alias for [`NexusHandlerFailureError`].
+#[deprecated(note = "Use NexusHandlerFailureError instead.")]
+pub type IncomingNexusHandlerError = NexusHandlerFailureError;
 
 /// An explicit retry behavior reported by a Nexus handler failure.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1200,15 +1223,9 @@ impl ActivityExecutionError {
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum NexusOperationError {
-    /// The Nexus operation failed.
+    /// The Nexus operation returned a failure, including cancellation or timeout.
     #[error("Nexus operation failed: {0}")]
     Failed(#[source] Box<NexusOperationFailureError>),
-    /// The Nexus operation resolved as cancelled.
-    #[error("Nexus operation cancelled: {0}")]
-    Cancelled(#[source] Box<NexusOperationFailureError>),
-    /// The Nexus operation resolved as timed out.
-    #[error("Nexus operation timed out: {0}")]
-    TimedOut(#[source] Box<NexusOperationFailureError>),
     /// Failed to serialize input or deserialize the operation result payload.
     #[error("Payload conversion failed: {0}")]
     Serialization(#[from] PayloadConversionError),
@@ -1219,81 +1236,9 @@ impl NexusOperationError {
     /// Returns the operation failure, if the error came from a remote operation resolution.
     pub fn operation_failure(&self) -> Option<&NexusOperationFailureError> {
         match self {
-            Self::Failed(err) | Self::Cancelled(err) | Self::TimedOut(err) => Some(err),
+            Self::Failed(err) => Some(err),
             Self::Serialization(_) => None,
         }
-    }
-
-    /// Returns whether the operation resolved as cancelled, independently of its failure reason.
-    pub fn is_cancelled(&self) -> bool {
-        matches!(self, Self::Cancelled(_))
-    }
-
-    /// Returns whether the operation resolved as timed out, independently of its failure reason.
-    pub fn is_timed_out(&self) -> bool {
-        matches!(self, Self::TimedOut(_))
-    }
-
-    /// Returns the original failure proto, including any Nexus operation wrapper.
-    pub fn failure(&self) -> Option<&Failure> {
-        self.operation_failure()
-            .map(NexusOperationFailureError::failure)
-    }
-
-    /// Returns the normalized operation failure reason, if any.
-    pub fn cause(&self) -> Option<&IncomingError> {
-        self.operation_failure()
-            .and_then(NexusOperationFailureError::cause)
-    }
-
-    /// Returns the normalized operation failure reason, if any.
-    pub fn reason(&self) -> Option<&IncomingError> {
-        self.operation_failure()
-            .and_then(NexusOperationFailureError::reason)
-    }
-
-    /// Returns an immediate cancellation reason, independently of the operation's outcome.
-    ///
-    /// A cancelled resolution without cancellation failure info has no cancellation cause.
-    pub fn cancellation_cause(&self) -> Option<&CancelledError> {
-        self.reason().and_then(IncomingError::as_cancelled)
-    }
-
-    /// Returns an immediate timeout reason, independently of the operation's outcome.
-    ///
-    /// A timed-out resolution without timeout failure info has no timeout cause.
-    pub fn timeout_cause(&self) -> Option<&TimeoutError> {
-        self.reason().and_then(IncomingError::as_timeout)
-    }
-
-    /// Returns the Nexus endpoint from the retained operation wrapper, if present.
-    pub fn endpoint(&self) -> Option<&str> {
-        self.operation_failure()
-            .and_then(NexusOperationFailureError::endpoint)
-    }
-
-    /// Returns the Nexus service from the retained operation wrapper, if present.
-    pub fn service(&self) -> Option<&str> {
-        self.operation_failure()
-            .and_then(NexusOperationFailureError::service)
-    }
-
-    /// Returns the operation name from the retained operation wrapper, if present.
-    pub fn operation(&self) -> Option<&str> {
-        self.operation_failure()
-            .and_then(NexusOperationFailureError::operation)
-    }
-
-    /// Returns the operation token from the retained operation wrapper, if present.
-    pub fn operation_token(&self) -> Option<&str> {
-        self.operation_failure()
-            .and_then(NexusOperationFailureError::operation_token)
-    }
-
-    /// Returns the scheduled event ID from the retained operation wrapper, if present.
-    pub fn scheduled_event_id(&self) -> Option<i64> {
-        self.operation_failure()
-            .and_then(NexusOperationFailureError::scheduled_event_id)
     }
 }
 

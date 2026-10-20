@@ -3,10 +3,10 @@
 //! **Experimental:** Enable the `experimental` feature. This API and the draft Nexus SDK it
 //! depends on may change.
 //!
-//! Calls return [`NexusOperationError`]. Its remote outcome variants retain a
-//! [`NexusOperationFailureError`] with optional Nexus metadata and a normalized failure reason.
-//! Check the variant or its outcome predicates to distinguish cancellation and timeout;
-//! [`NexusOperationError::reason`] describes the cause independently of that outcome.
+//! Calls return [`NexusOperationError`]. Its [`Failed`](NexusOperationError::Failed) variant retains
+//! a [`NexusOperationFailureError`] with optional Nexus metadata and a normalized failure reason.
+//! Use [`NexusOperationFailureError::as_cancelled`] and [`NexusOperationFailureError::as_timeout`]
+//! to inspect cancellation and timeout causes.
 //!
 //! Services are defined with the Nexus SDK's [`nexus_rpc::service`] macro. Operation markers bind each
 //! operation to its service, input, and output types. Calls use the workflow's payload converter;
@@ -196,9 +196,6 @@ impl<S: NexusService> NexusWorkflowClient<S> {
 
     /// Start an operation and wait for the handler to acknowledge it.
     ///
-    /// Before acknowledgment, cancellation and timeout are inferred from failure info. If Core
-    /// omits that information, the error is reported as [`NexusOperationError::Failed`].
-    ///
     /// Synchronous operations return a handle with no operation token. The operation is scheduled
     /// when this method is called, as with activities. Dropping the future or handle does not cancel
     /// it; use [`crate::CancellableFuture::cancel`] while starting, the options' cancellation token,
@@ -310,19 +307,11 @@ impl<Output: TemporalDeserializable + 'static> NexusWorkflowOperationHandle<Outp
                     success,
                 )?)
             }
-            Some(nexus_operation_result::Status::Failed(failure)) => {
-                Err(converter.to_error(&context_data, failure, NexusOperationDecodeHint::Failed)?)
-            }
-            Some(nexus_operation_result::Status::Cancelled(failure)) => Err(converter.to_error(
-                &context_data,
-                failure,
-                NexusOperationDecodeHint::Cancelled,
-            )?),
-            Some(nexus_operation_result::Status::TimedOut(failure)) => Err(converter.to_error(
-                &context_data,
-                failure,
-                NexusOperationDecodeHint::TimedOut,
-            )?),
+            Some(
+                nexus_operation_result::Status::Failed(failure)
+                | nexus_operation_result::Status::Cancelled(failure)
+                | nexus_operation_result::Status::TimedOut(failure),
+            ) => Err(converter.to_error(&context_data, failure, NexusOperationDecodeHint)?),
             None => Err(PayloadConversionError::EncodingError(
                 std::io::Error::other("Nexus operation completed without a status").into(),
             )

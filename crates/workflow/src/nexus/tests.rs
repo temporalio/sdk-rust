@@ -380,7 +380,7 @@ fn start_and_result_failures_preserve_server_failure_details() {
         )),
         ..Default::default()
     };
-    for phase in 0..4 {
+    for phase in 0..2 {
         let (base, client, _) = client();
         let start = client.start(
             Payments::charge,
@@ -394,28 +394,22 @@ fn start_and_result_failures_preserve_server_failure_details() {
             let Err(error) = start.now_or_never().unwrap() else {
                 panic!("start should fail");
             };
-            assert_eq!(error.failure(), Some(&failure));
+            assert_eq!(error.operation_failure().unwrap().failure(), &failure);
         } else {
             resolve_start(&base, 1, StartStatus::OperationToken("token".to_string()));
             let handle = start.now_or_never().unwrap().unwrap();
-            let status = match phase {
-                1 => nexus_operation_result::Status::Failed(failure.clone()),
-                2 => nexus_operation_result::Status::Cancelled(failure.clone()),
-                _ => nexus_operation_result::Status::TimedOut(failure.clone()),
-            };
+            let status = nexus_operation_result::Status::Failed(failure.clone());
             resolve_result(&base, 1, Some(status));
             for _ in 0..2 {
                 let error = handle.result().now_or_never().unwrap().unwrap_err();
-                assert_eq!(error.failure(), Some(&failure));
-                assert_eq!(error.is_cancelled(), phase == 2);
-                assert_eq!(error.is_timed_out(), phase == 3);
+                assert_eq!(error.operation_failure().unwrap().failure(), &failure);
             }
         }
     }
 }
 
 #[test]
-fn start_infers_outcomes_from_failure_info() {
+fn start_preserves_typed_failure_causes() {
     for (failure_info, cancelled, timed_out) in [
         (None, false, false),
         (
@@ -461,26 +455,39 @@ fn start_infers_outcomes_from_failure_info() {
             assert!(execute.as_mut().now_or_never().is_none());
             resolve_start(&base, 1, StartStatus::Failed(failure.clone()));
             let error = execute.now_or_never().unwrap().unwrap_err();
-            assert_eq!(error.is_cancelled(), cancelled);
-            assert_eq!(error.is_timed_out(), timed_out);
-            assert_eq!(error.failure(), Some(&failure));
+            let operation_failure = error.operation_failure().unwrap();
+            assert_eq!(operation_failure.as_cancelled().is_some(), cancelled);
+            assert_eq!(operation_failure.as_timeout().is_some(), timed_out);
+            assert_eq!(operation_failure.failure(), &failure);
         }
     }
 }
 
 #[test]
-fn result_preserves_explicit_outcomes_without_failure_info() {
-    let failure = Failure {
-        message: "resolution without failure info".to_owned(),
-        ..Default::default()
-    };
-    for status in [
-        nexus_operation_result::Status::Failed(failure.clone()),
-        nexus_operation_result::Status::Cancelled(failure.clone()),
-        nexus_operation_result::Status::TimedOut(failure.clone()),
-    ] {
-        let cancelled = matches!(status, nexus_operation_result::Status::Cancelled(_));
-        let timed_out = matches!(status, nexus_operation_result::Status::TimedOut(_));
+fn result_preserves_typed_failure_causes() {
+    for timed_out in [false, true] {
+        let cause = Failure {
+            message: "operation cause".to_owned(),
+            failure_info: Some(if timed_out {
+                FailureInfo::TimeoutFailureInfo(TimeoutFailureInfo::default())
+            } else {
+                FailureInfo::CanceledFailureInfo(CanceledFailureInfo::default())
+            }),
+            ..Default::default()
+        };
+        let failure = Failure {
+            message: "operation failed".to_owned(),
+            cause: Some(Box::new(cause.clone())),
+            failure_info: Some(FailureInfo::NexusOperationExecutionFailureInfo(
+                NexusOperationFailureInfo::default(),
+            )),
+            ..Default::default()
+        };
+        let status = if timed_out {
+            nexus_operation_result::Status::TimedOut(failure.clone())
+        } else {
+            nexus_operation_result::Status::Cancelled(failure.clone())
+        };
         let (base, client, _) = client();
         let execute = client.execute(
             Payments::charge,
@@ -492,11 +499,14 @@ fn result_preserves_explicit_outcomes_without_failure_info() {
         resolve_start(&base, 1, StartStatus::OperationToken("token".to_owned()));
         resolve_result(&base, 1, Some(status));
         let error = execute.now_or_never().unwrap().unwrap_err();
-        assert_eq!(error.is_cancelled(), cancelled);
-        assert_eq!(error.is_timed_out(), timed_out);
-        assert_eq!(error.failure(), Some(&failure));
-        assert!(error.cancellation_cause().is_none());
-        assert!(error.timeout_cause().is_none());
+        let operation_failure = error.operation_failure().unwrap();
+        assert_eq!(operation_failure.as_cancelled().is_some(), !timed_out);
+        assert_eq!(operation_failure.as_timeout().is_some(), timed_out);
+        assert_eq!(operation_failure.failure(), &failure);
+        assert_eq!(
+            operation_failure.cause().map(|cause| cause.failure()),
+            Some(&cause)
+        );
     }
 }
 
