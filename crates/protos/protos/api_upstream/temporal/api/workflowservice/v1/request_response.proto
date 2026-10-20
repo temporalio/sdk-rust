@@ -38,6 +38,7 @@ import "temporal/api/replication/v1/message.proto";
 import "temporal/api/rules/v1/message.proto";
 import "temporal/api/sdk/v1/worker_config.proto";
 import "temporal/api/schedule/v1/message.proto";
+import "temporal/api/session/v1/message.proto";
 import "temporal/api/taskqueue/v1/message.proto";
 import "temporal/api/update/v1/message.proto";
 import "temporal/api/version/v1/message.proto";
@@ -323,6 +324,9 @@ message PollWorkflowTaskQueueRequest {
     // Removed in 1.55.0; was temporal.api.worker.v1.WorkerHeartbeat worker_heartbeat
     reserved 7;
     reserved "worker_heartbeat";
+
+    // EXPERIMENTAL. Subject to redesign or removal. Only applicable to sticky polls.
+    temporal.api.session.v1.WorkerSessionOptions session_options = 11;
 }
 
 message PollWorkflowTaskQueueResponse {
@@ -553,6 +557,9 @@ message PollActivityTaskQueueRequest {
     // Removed in 1.55.0; was temporal.api.worker.v1.WorkerHeartbeat worker_heartbeat
     reserved 7;
     reserved "worker_heartbeat";
+
+    // EXPERIMENTAL. Subject to redesign or removal. Only applicable to sticky polls.
+    temporal.api.session.v1.WorkerSessionOptions session_options = 11;
 }
 
 message PollActivityTaskQueueResponse {
