@@ -70,6 +70,7 @@ use temporalio_common::{
             history::v1::{HistoryEvent, history_event},
             protocol::v1::{Message as ProtocolMessage, message::SequencingId},
             sdk::v1::WorkflowTaskCompletedMetadata,
+            session::v1::activity_session_options,
         },
     },
     worker::WorkerDeploymentVersion,
@@ -1368,7 +1369,36 @@ impl WorkflowMachines {
                         annotations
                     );
                 }
-                WFCommandVariant::AddActivity(attrs) => {
+                WFCommandVariant::AddActivity(mut attrs) => {
+                    if attrs.session_options.as_ref().is_some_and(|options| {
+                        matches!(
+                            options.session,
+                            Some(activity_session_options::Session::UseWorkflowSession(true))
+                        )
+                    }) {
+                        if attrs.task_queue.is_empty() {
+                            attrs.task_queue.clone_from(&self.worker_config.task_queue);
+                        }
+                        // Replay must not depend on this worker's activity execution capabilities.
+                        if !self.replaying {
+                            if self.worker_config.session_worker_options.is_none() {
+                                return Err(fatal!(
+                                    "Activity '{}' (seq {}) requests a workflow session, but session_worker_options is not enabled",
+                                    attrs.activity_id,
+                                    attrs.seq
+                                ));
+                            }
+                            if attrs.task_queue != self.worker_config.task_queue {
+                                return Err(fatal!(
+                                    "Activity '{}' (seq {}) requests a workflow session on queue '{}', but must use '{}'",
+                                    attrs.activity_id,
+                                    attrs.seq,
+                                    attrs.task_queue,
+                                    self.worker_config.task_queue
+                                ));
+                            }
+                        }
+                    }
                     let seq = attrs.seq;
                     let use_compat = self.determine_use_compatible_flag(
                         attrs.versioning_intent(),
@@ -1849,6 +1879,81 @@ fn patch_marker_handling(
     } else {
         // Not a patch machine or a patch event
         Ok(EventHandlingOutcome::Normal)
+    }
+}
+
+#[cfg(test)]
+mod session_tests {
+    use super::*;
+    use crate::test_help::test_worker_cfg;
+    use temporalio_common::protos::{
+        coresdk::workflow_commands::ScheduleActivity,
+        temporal::api::session::v1::ActivitySessionOptions,
+    };
+
+    #[rstest::rstest]
+    #[case(true, true, "", true)]
+    #[case(true, true, "other", false)]
+    #[case(false, true, "", false)]
+    #[case(false, false, "", true)]
+    fn session_activity_validation(
+        #[case] enabled: bool,
+        #[case] use_session: bool,
+        #[case] queue: &str,
+        #[case] valid: bool,
+    ) {
+        let mut config = test_worker_cfg().build().unwrap();
+        config.session_worker_options = enabled.then(Default::default);
+        let expected_queue = config.task_queue.clone();
+        let (driven, _commands) = DrivenWorkflow::new();
+        let mut machines = WorkflowMachines::new(
+            RunBasics {
+                worker_config: Arc::new(config),
+                workflow_id: "workflow".to_owned(),
+                workflow_type: "type".to_owned(),
+                run_id: "run".to_owned(),
+                history: HistoryUpdate::dummy(),
+                metrics: MetricsContext::no_op(),
+                capabilities: &Default::default(),
+                sdk_name: "test",
+                sdk_version: "test",
+            },
+            driven,
+        );
+        machines.replaying = false;
+        let result = machines.handle_driven_results(vec![WFCommand {
+            variant: WFCommandVariant::AddActivity(ScheduleActivity {
+                seq: 1,
+                activity_id: "activity".to_owned(),
+                activity_type: "type".to_owned(),
+                task_queue: queue.to_owned(),
+                session_options: Some(ActivitySessionOptions {
+                    session: Some(activity_session_options::Session::UseWorkflowSession(
+                        use_session,
+                    )),
+                }),
+                ..Default::default()
+            }),
+            annotations: Default::default(),
+        }]);
+        assert_eq!(result.is_ok(), valid, "{result:?}");
+        if valid {
+            assert!(matches!(
+                &machines.current_wf_task_commands[0].command.attributes,
+                Some(ProtoCmdAttrs::ScheduleActivityTaskCommandAttributes(attrs))
+                    if attrs.session_options.as_ref().unwrap().session
+                        == Some(activity_session_options::Session::UseWorkflowSession(use_session))
+                    && attrs.task_queue.as_ref().unwrap().name
+                        == if use_session { expected_queue.as_str() } else { queue }
+            ));
+        } else {
+            assert!(
+                result
+                    .unwrap_err()
+                    .to_string()
+                    .contains("Activity 'activity' (seq 1)")
+            );
+        }
     }
 }
 

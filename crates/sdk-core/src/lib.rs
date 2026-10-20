@@ -36,7 +36,8 @@ mod core_tests;
 pub mod test_help;
 
 pub use crate::worker::client::{
-    PollActivityOptions, PollOptions, PollWorkflowOptions, WorkerClient, WorkflowTaskCompletion,
+    PollActivityOptions, PollActivityOptionsBuilder, PollOptions, PollWorkflowOptions,
+    WorkerClient, WorkflowTaskCompletion,
 };
 pub use pollers::{Client, ClientOptions, ClientTlsOptions, RetryOptions, TlsOptions};
 pub use temporalio_common::protos::TaskToken;
@@ -46,11 +47,11 @@ pub use worker::{
     FixedSizeSlotSupplier, LocalActivitySlotKind, NamespaceCapabilities, NexusSlotKind, PollError,
     PollerBehavior, ResourceBasedSlotsOptions, ResourceBasedSlotsOptionsBuilder,
     ResourceBasedTuner, ResourceBasedTunerConfig, ResourceController, ResourceSlotOptions,
-    SlotInfo, SlotInfoTrait, SlotKind, SlotKindType, SlotMarkUsedContext, SlotReleaseContext,
-    SlotReservationContext, SlotSupplier, SlotSupplierOptions, SlotSupplierPermit, TunerBuilder,
-    TunerHolder, TunerHolderOptions, TunerHolderOptionsBuilder, Worker, WorkerConfig,
-    WorkerConfigBuilder, WorkerTuner, WorkerValidationError, WorkerVersioningStrategy,
-    WorkflowErrorType, WorkflowSlotKind,
+    SessionWorkerOptions, SessionWorkerOptionsBuilder, SlotInfo, SlotInfoTrait, SlotKind,
+    SlotKindType, SlotMarkUsedContext, SlotReleaseContext, SlotReservationContext, SlotSupplier,
+    SlotSupplierOptions, SlotSupplierPermit, TunerBuilder, TunerHolder, TunerHolderOptions,
+    TunerHolderOptionsBuilder, Worker, WorkerConfig, WorkerConfigBuilder, WorkerTuner,
+    WorkerValidationError, WorkerVersioningStrategy, WorkflowErrorType, WorkflowSlotKind,
 };
 
 use crate::{

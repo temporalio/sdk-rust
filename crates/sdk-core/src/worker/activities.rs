@@ -1031,7 +1031,7 @@ mod tests {
     use super::*;
     use crate::{
         abstractions::tests::fixed_size_permit_dealer,
-        pollers::{ActivityTaskOptions, LongPollBuffer},
+        pollers::{ActivityTaskOptions, LongPollBuffer, PollRateLimiter},
         prost_dur,
         worker::{
             NamespaceCapabilities, PollerBehavior,
@@ -1055,8 +1055,8 @@ mod tests {
             shutdown_token,
             None::<fn(usize)>,
             ActivityTaskOptions {
-                max_worker_acts_per_second: None,
                 max_tps: None,
+                ..Default::default()
             },
             Arc::new(AtomicCell::new(None)),
             Arc::new(NamespaceCapabilities::default()),
@@ -1142,8 +1142,9 @@ mod tests {
             shutdown_token.clone(),
             None::<fn(usize)>,
             ActivityTaskOptions {
-                max_worker_acts_per_second: Some(2.0),
+                rate_limiter: Some(Arc::new(PollRateLimiter::new(2.0))),
                 max_tps: None,
+                ..Default::default()
             },
             Arc::new(AtomicCell::new(None)),
             Arc::new(NamespaceCapabilities::default()),

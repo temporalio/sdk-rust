@@ -35,9 +35,9 @@ pub(crate) struct MeteredPermitDealer<SK: SlotKind> {
     max_permits: Option<usize>,
     metrics_ctx: MetricsContext,
     meter: Option<TemporalMeter>,
-    /// Only applies to permit dealers for workflow tasks. True if this permit dealer is associated
-    /// with a sticky queue poller.
+    /// Poll source must be known before a task (and its slot info) is received.
     is_sticky_poller: bool,
+    has_sticky_queue: bool,
     context_data: Arc<PermitDealerContextData>,
 }
 
@@ -100,12 +100,18 @@ where
             meter,
             max_permits,
             is_sticky_poller: false,
+            has_sticky_queue: false,
             context_data,
         }
     }
 
     pub(crate) fn available_permits(&self) -> Option<usize> {
         self.supplier.available_slots()
+    }
+
+    pub(crate) fn with_sticky_queue(mut self, enabled: bool) -> Self {
+        self.has_sticky_queue = enabled;
+        self
     }
 
     /// Hard cap on extant permits (the workflow cache size), if any.
@@ -201,6 +207,15 @@ where
 impl MeteredPermitDealer<WorkflowSlotKind> {
     pub(crate) fn into_sticky(mut self) -> Self {
         self.is_sticky_poller = true;
+        self.has_sticky_queue = true;
+        self
+    }
+}
+
+impl MeteredPermitDealer<ActivitySlotKind> {
+    pub(crate) fn for_activity_poller(mut self, sticky: bool, has_sticky_queue: bool) -> Self {
+        self.is_sticky_poller = sticky;
+        self.has_sticky_queue = has_sticky_queue;
         self
     }
 }
@@ -224,6 +239,10 @@ impl<SK: SlotKind> SlotReservationContext for MeteredPermitDealer<SK> {
 
     fn is_sticky(&self) -> bool {
         self.is_sticky_poller
+    }
+
+    fn has_sticky_queue(&self) -> bool {
+        self.has_sticky_queue
     }
 
     fn get_metrics_meter(&self) -> Option<TemporalMeter> {

@@ -353,6 +353,9 @@ where
     fn mark_slot_used(&self, _ctx: &dyn SlotMarkUsedContext<SlotKind = Self::SlotKind>) {}
 
     fn release_slot(&self, ctx: &dyn SlotReleaseContext<SlotKind = Self::SlotKind>) {
+        if let Some(source) = ctx.permit().user_data::<ActivityPollSource>() {
+            self.sticky_slots.record_release(source.is_sticky);
+        }
         // Really could use specialization here
         if let Some(SlotInfo::Workflow(info)) = ctx.info().map(|i| i.downcast()) {
             self.sticky_slots.record_release(info.is_sticky);
@@ -362,6 +365,10 @@ where
     fn slot_supplier_kind(&self) -> String {
         "ResourceBased".to_string()
     }
+}
+
+struct ActivityPollSource {
+    is_sticky: bool,
 }
 
 impl<MI, SK> ResourceBasedSlotsForType<MI, SK>
@@ -388,7 +395,8 @@ where
         if ctx.num_issued_slots() < self.opts.min_slots {
             return Some(self.issue_slot(ctx));
         }
-        if SK::kind() == SlotKindType::Workflow
+        if (SK::kind() == SlotKindType::Workflow
+            || (SK::kind() == SlotKindType::Activity && ctx.has_sticky_queue()))
             && self.sticky_slots.needs_first_slot(ctx.is_sticky())
         {
             return Some(self.issue_slot(ctx));
@@ -400,11 +408,19 @@ where
     fn issue_slot(&self, ctx: &dyn SlotReservationContext) -> SlotSupplierPermit {
         // Always be willing to hand out at least 1 slot for sticky and 1 for non-sticky to avoid
         // getting stuck.
-        if SK::kind() == SlotKindType::Workflow {
+        let session_activity = SK::kind() == SlotKindType::Activity && ctx.has_sticky_queue();
+        if SK::kind() == SlotKindType::Workflow || session_activity {
             self.sticky_slots.record_issue(ctx.is_sticky());
         }
         let _ = self.last_slot_issued_tx.send(Instant::now());
-        SlotSupplierPermit::default()
+        if session_activity {
+            // Empty or canceled polls release reservations before task slot info exists.
+            SlotSupplierPermit::with_user_data(ActivityPollSource {
+                is_sticky: ctx.is_sticky(),
+            })
+        } else {
+            SlotSupplierPermit::default()
+        }
     }
 
     fn time_since_last_issued(&self) -> Duration {
@@ -903,6 +919,43 @@ mod tests {
         used.store(0, Ordering::Release);
         // Now it's willing to hand out slots again when usage is zero
         assert!(rbs.try_reserve_slot(&pd).is_some());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn session_activity_reservations_release_each_source() {
+        let (fmis, used) = FakeMIS::new();
+        used.store(90_000, Ordering::Release);
+        let supplier = Arc::new(ResourceController::new_with_sysinfo(test_options(), fmis))
+            .as_kind::<ActivitySlotKind>(ResourceSlotOptions::new(
+            0,
+            1,
+            Duration::from_secs(60),
+        ));
+        let ordinary = MeteredPermitDealer::new(
+            supplier,
+            MetricsContext::no_op(),
+            None,
+            Arc::new(Default::default()),
+            None,
+        );
+        assert!(ordinary.try_acquire_owned().is_err());
+        let normal = ordinary.clone().for_activity_poller(false, true);
+        let sticky = ordinary.clone().for_activity_poller(true, true);
+        let normal_permit = normal.acquire_owned().await;
+        let sticky_permit = sticky.acquire_owned().await;
+        assert!(normal.try_acquire_owned().is_err());
+        assert!(sticky.try_acquire_owned().is_err());
+        drop(normal_permit);
+        let normal_permit = normal.try_acquire_owned().unwrap();
+        assert!(sticky.try_acquire_owned().is_err());
+        drop(sticky_permit);
+        let sticky_permit = sticky.try_acquire_owned().unwrap();
+        let normal_permit = normal_permit.into_used(crate::worker::ActivitySlotInfo::default());
+        let sticky_permit = sticky_permit.into_used(crate::worker::ActivitySlotInfo::default());
+        drop((normal_permit, sticky_permit));
+        let _normal = normal.try_acquire_owned().unwrap();
+        let _sticky = sticky.try_acquire_owned().unwrap();
+        assert!(ordinary.try_acquire_owned().is_err());
     }
 
     #[test]

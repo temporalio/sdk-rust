@@ -452,10 +452,13 @@ pub struct PollWorkflowOptions {
     pub sticky_queue_name: Option<String>,
 }
 /// Additional options specific to activity task polling
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default, bon::Builder)]
+#[non_exhaustive]
 pub struct PollActivityOptions {
     /// Optional rate limit (tasks per second) for activity polling
     pub max_tasks_per_sec: Option<f64>,
+    /// Poll this sticky destination instead of the normal activity queue.
+    pub sticky_queue_name: Option<String>,
 }
 /// Additional options specific to Nexus task polling
 #[derive(Debug, Clone, Default)]
@@ -524,9 +527,20 @@ impl WorkerClient for WorkerClientBag {
         let mut request = PollActivityTaskQueueRequest {
             namespace: self.namespace.clone(),
             task_queue: Some(TaskQueue {
-                name: poll_options.task_queue,
-                kind: TaskQueueKind::Normal as i32,
-                normal_name: "".to_string(),
+                name: act_options
+                    .sticky_queue_name
+                    .clone()
+                    .unwrap_or_else(|| poll_options.task_queue.clone()),
+                kind: if act_options.sticky_queue_name.is_some() {
+                    TaskQueueKind::Sticky
+                } else {
+                    TaskQueueKind::Normal
+                } as i32,
+                normal_name: if act_options.sticky_queue_name.is_some() {
+                    poll_options.task_queue
+                } else {
+                    String::new()
+                },
             }),
             identity: self.identity(),
             task_queue_metadata: act_options.max_tasks_per_sec.map(|tps| TaskQueueMetadata {

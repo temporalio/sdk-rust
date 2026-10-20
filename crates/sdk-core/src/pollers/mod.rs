@@ -1,7 +1,9 @@
 mod poll_buffer;
 mod sticky;
 
-pub(crate) use poll_buffer::{ActivityTaskOptions, LongPollBuffer, WorkflowTaskOptions};
+#[cfg(test)]
+pub(crate) use poll_buffer::{ActivityTaskOptions, PollRateLimiter};
+pub(crate) use poll_buffer::{LongPollBuffer, WorkflowTaskOptions, make_activity_task_buffer};
 pub(crate) use sticky::{StickyPollerShared, StickyTaskPoller, sticky_poller_behavior};
 pub use temporalio_client::{Client, ClientOptions, ClientTlsOptions, RetryOptions, TlsOptions};
 
