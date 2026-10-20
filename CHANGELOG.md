@@ -34,13 +34,19 @@ relevant information.
 ## Unreleased
 
 ### Breaking Changes
+* Nexus start errors now return `NexusOperationError` instead of a raw failure.
 * Workflow replay now reports nondeterminism when a scheduled Nexus operation's service or operation
   differs from the command that produced it.
+
+### Deprecated
+* `IncomingNexusOperationExecutionError` is a deprecated alias for `NexusOperationFailureError`.
 
 ### Added
 * Workflows can call typed Nexus service operations with `nexus_client`, `execute`, and `start`
   when the `experimental` feature is enabled, using service definitions from the draft Nexus Rust
-  SDK. Started operations expose a typed result, operation token, and cancellation.
+  SDK. Started operations expose a typed result, operation token, and cancellation. Operation errors
+  expose Nexus metadata and typed cancellation and timeout causes through a shared
+  operation failure type.
 * Experimental Event Groups support (requires the `experimental` feature). Event Groups
   are workflow-level metadata that group related history events for UI and observability.
   `EventGroup::new` takes a required ID (used verbatim; do not put secrets in it);
@@ -302,7 +308,7 @@ relevant information.
 
 ### Added
 * Support for running Standalone Activities in Rust SDK Worker.
-* Client methods for starting and managing execution of Standalone Activities. 
+* Client methods for starting and managing execution of Standalone Activities.
 * `WorkflowTermination::cancelled_with_details` for recording structured details when a Workflow
   Execution completes as cancelled.
 * `LoggerFormat` for selecting compact, pretty, or JSON Core console log output. Configured log
@@ -347,7 +353,7 @@ relevant information.
 * `WorkflowTermination::Cancelled` now has an optional `details` field. Use
   `WorkflowTermination::cancelled()` to construct a cancellation without details.
 * Changes to `ActivityInfo`: instead of `workflow_namespace`, `workflow_execution` and `run_id`,
-  there is now `namespace`, `workflow_id`, `workflow_run_id` and `activity_run_id`. 
+  there is now `namespace`, `workflow_id`, `workflow_run_id` and `activity_run_id`.
   Also, `workflow_type` is now `Option<String>`.
 * `ActivityIdentifier::ById` was split into 2 variants, `ByIdWorkflow` and `ByIdStandalone`.
   `ActivityIdentifier::by_id` method was renamed to `by_id_workflow`, and `by_id_standalone`

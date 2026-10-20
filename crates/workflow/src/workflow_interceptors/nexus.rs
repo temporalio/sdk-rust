@@ -1,6 +1,8 @@
 use super::*;
-use crate::{NexusOperationOptions, StartedNexusOperation, runtime::model::NexusStartResult};
-use temporalio_common_wasm::protos::temporal::api::failure::v1::Failure;
+use crate::{
+    NexusOperationOptions, StartedNexusOperation, nexus::NexusOperationError,
+    runtime::model::NexusStartResult,
+};
 
 impl WorkflowInterceptorContext {
     /// Start a Nexus operation through the workflow outbound interceptor chain.
@@ -39,7 +41,7 @@ impl StartNexusOperationInput {
 }
 
 /// Result of an intercepted Nexus operation start.
-pub type StartNexusOperationResult = Result<StartedNexusOperation, Failure>;
+pub type StartNexusOperationResult = Result<StartedNexusOperation, NexusOperationError>;
 
 outbound_chain!(
     call_start_nexus_operation,

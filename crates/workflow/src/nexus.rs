@@ -3,6 +3,11 @@
 //! **Experimental:** Enable the `experimental` feature. This API and the draft Nexus SDK it
 //! depends on may change.
 //!
+//! Calls return [`NexusOperationError`]. Its [`Failed`](NexusOperationError::Failed) variant retains
+//! a [`NexusOperationFailureError`] with optional Nexus metadata and a normalized failure reason.
+//! Use [`NexusOperationError::as_cancelled`] and [`NexusOperationError::as_timeout`]
+//! to inspect cancellation and timeout causes.
+//!
 //! Services are defined with the Nexus SDK's [`nexus_rpc::service`] macro. Operation markers bind each
 //! operation to its service, input, and output types. Calls use the workflow's payload converter;
 //! payload codecs are applied at the worker boundary, just as for activities.
@@ -48,7 +53,7 @@
 
 pub use crate::NexusOperationCancellationType;
 pub use nexus_rpc::{NexusOperation, NexusService};
-pub use temporalio_common_wasm::error::NexusOperationError;
+pub use temporalio_common_wasm::error::{NexusOperationError, NexusOperationFailureError};
 
 use crate::{
     BaseWorkflowContext, EventGroup, NexusOperationOptions, StartedNexusOperation,
@@ -58,7 +63,7 @@ use crate::{
 use std::{future, marker::PhantomData, time::Duration};
 use temporalio_common_wasm::{
     data_converters::{
-        GenericPayloadConverter, NexusOperationDecodeHint, NoopDecodeHint, PayloadConversionError,
+        GenericPayloadConverter, NexusOperationDecodeHint, PayloadConversionError,
         SerializationContext, SerializationContextData, TemporalDeserializable,
         TemporalSerializable, WorkflowSerializationContext,
     },
@@ -218,7 +223,6 @@ impl<S: NexusService> NexusWorkflowClient<S> {
                 );
             }
         };
-        let context = self.context.clone();
         self.context
             .start_nexus_operation(
                 NexusOperationOptions::builder()
@@ -235,18 +239,10 @@ impl<S: NexusService> NexusWorkflowClient<S> {
                     .build(),
             )
             .map(move |result| {
-                result
-                    .map(|started| NexusWorkflowOperationHandle {
-                        started,
-                        output: PhantomData,
-                    })
-                    .map_err(|failure| {
-                        context
-                            .data_converter()
-                            .to_error(&context_data, failure, NoopDecodeHint)
-                            .map(NexusOperationError::from)
-                            .unwrap_or_else(NexusOperationError::Serialization)
-                    })
+                result.map(|started| NexusWorkflowOperationHandle {
+                    started,
+                    output: PhantomData,
+                })
             })
     }
 
@@ -308,19 +304,11 @@ impl<Output: TemporalDeserializable + 'static> NexusWorkflowOperationHandle<Outp
                     success,
                 )?)
             }
-            Some(nexus_operation_result::Status::Failed(failure)) => {
-                Err(converter.to_error(&context_data, failure, NexusOperationDecodeHint::Failed)?)
-            }
-            Some(nexus_operation_result::Status::Cancelled(failure)) => Err(converter.to_error(
-                &context_data,
-                failure,
-                NexusOperationDecodeHint::Cancelled,
-            )?),
-            Some(nexus_operation_result::Status::TimedOut(failure)) => Err(converter.to_error(
-                &context_data,
-                failure,
-                NexusOperationDecodeHint::TimedOut,
-            )?),
+            Some(
+                nexus_operation_result::Status::Failed(failure)
+                | nexus_operation_result::Status::Cancelled(failure)
+                | nexus_operation_result::Status::TimedOut(failure),
+            ) => Err(converter.to_error(&context_data, failure, NexusOperationDecodeHint)?),
             None => Err(PayloadConversionError::EncodingError(
                 std::io::Error::other("Nexus operation completed without a status").into(),
             )

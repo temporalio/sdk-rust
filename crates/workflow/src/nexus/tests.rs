@@ -23,7 +23,10 @@ use temporalio_common_wasm::{
         },
         temporal::api::{
             common::v1::Payload,
-            failure::v1::{ApplicationFailureInfo, Failure, failure::FailureInfo},
+            failure::v1::{
+                ApplicationFailureInfo, CanceledFailureInfo, Failure, NexusOperationFailureInfo,
+                TimeoutFailureInfo, failure::FailureInfo,
+            },
         },
     },
 };
@@ -378,6 +381,16 @@ fn start_and_result_failures_preserve_server_failure_details() {
         ..Default::default()
     };
     for phase in 0..4 {
+        let mut failure = failure.clone();
+        if phase == 2 {
+            failure.failure_info = Some(FailureInfo::CanceledFailureInfo(
+                CanceledFailureInfo::default(),
+            ));
+        } else if phase == 3 {
+            failure.failure_info = Some(FailureInfo::TimeoutFailureInfo(
+                TimeoutFailureInfo::default(),
+            ));
+        }
         let (base, client, _) = client();
         let start = client.start(
             Payments::charge,
@@ -391,7 +404,7 @@ fn start_and_result_failures_preserve_server_failure_details() {
             let Err(error) = start.now_or_never().unwrap() else {
                 panic!("start should fail");
             };
-            assert_eq!(error.failure(), Some(&failure));
+            assert_eq!(error.operation_failure().unwrap().failure(), &failure);
         } else {
             resolve_start(&base, 1, StartStatus::OperationToken("token".to_string()));
             let handle = start.now_or_never().unwrap().unwrap();
@@ -403,11 +416,54 @@ fn start_and_result_failures_preserve_server_failure_details() {
             resolve_result(&base, 1, Some(status));
             for _ in 0..2 {
                 let error = handle.result().now_or_never().unwrap().unwrap_err();
-                assert_eq!(error.failure(), Some(&failure));
+                assert_eq!(error.operation_failure().unwrap().failure(), &failure);
                 assert_eq!(error.as_cancelled().is_some(), phase == 2);
                 assert_eq!(error.as_timeout().is_some(), phase == 3);
             }
         }
+    }
+}
+
+#[test]
+fn start_failures_preserve_cancellation_and_timeout_causes() {
+    for cancelled in [true, false] {
+        let cause = Failure {
+            message: "operation cause".to_string(),
+            failure_info: Some(if cancelled {
+                FailureInfo::CanceledFailureInfo(CanceledFailureInfo::default())
+            } else {
+                FailureInfo::TimeoutFailureInfo(TimeoutFailureInfo::default())
+            }),
+            ..Default::default()
+        };
+        let failure = Failure {
+            message: "operation failed to start".to_string(),
+            cause: Some(Box::new(cause.clone())),
+            failure_info: Some(FailureInfo::NexusOperationExecutionFailureInfo(
+                NexusOperationFailureInfo::default(),
+            )),
+            ..Default::default()
+        };
+        let (base, client, _) = client();
+        let start = client.start(
+            Payments::charge,
+            request(),
+            NexusWorkflowOperationOptions::default(),
+        );
+        let mut start = std::pin::pin!(start);
+        assert!(start.as_mut().now_or_never().is_none());
+        resolve_start(&base, 1, StartStatus::Failed(failure.clone()));
+        let Err(error) = start.now_or_never().unwrap() else {
+            panic!("start should fail");
+        };
+        let operation_failure = error.operation_failure().unwrap();
+        assert_eq!(operation_failure.failure(), &failure);
+        assert_eq!(
+            operation_failure.cause().map(|cause| cause.failure()),
+            Some(&cause)
+        );
+        assert_eq!(error.as_cancelled().is_some(), cancelled);
+        assert_eq!(error.as_timeout().is_some(), !cancelled);
     }
 }
 
