@@ -11,7 +11,6 @@ use crate::{
         common::v1::{Payload, Payloads},
         enums::v1::{
             ApplicationErrorCategory as ProtoApplicationErrorCategory,
-            NexusHandlerErrorRetryBehavior as ProtoNexusHandlerRetryBehavior,
             RetryState as ProtoRetryState, TimeoutType as ProtoTimeoutType,
         },
         failure::v1::Failure,
@@ -580,7 +579,7 @@ pub enum IncomingError {
     /// A decoded nexus operation failure wrapper.
     NexusOperationExecution(NexusOperationFailureError),
     /// A decoded nexus handler failure wrapper.
-    NexusHandler(NexusHandlerFailureError),
+    NexusHandler(IncomingNexusHandlerError),
 }
 
 impl IncomingError {
@@ -1104,55 +1103,9 @@ impl NexusOperationFailureError {
 }
 
 incoming_failure_wrapper!(
-    NexusHandlerFailureError,
+    IncomingNexusHandlerError,
     "A normalized nexus handler failure wrapper."
 );
-
-/// Compatibility alias for [`NexusHandlerFailureError`].
-#[deprecated(note = "Use NexusHandlerFailureError instead.")]
-pub type IncomingNexusHandlerError = NexusHandlerFailureError;
-
-/// An explicit retry behavior reported by a Nexus handler failure.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum NexusHandlerRetryBehavior {
-    /// The handler did not override the error type's retry behavior.
-    Unspecified,
-    /// The handler explicitly marked the failure retryable.
-    Retryable,
-    /// The handler explicitly marked the failure non-retryable.
-    NonRetryable,
-    /// The handler reported an unrecognized retry behavior.
-    Unknown,
-}
-
-impl NexusHandlerFailureError {
-    /// Returns the handler error type reported by the failure.
-    pub fn type_name(&self) -> &str {
-        &self.handler_info().r#type
-    }
-
-    /// Returns the explicit retry behavior without resolving error-type defaults.
-    pub fn retry_behavior(&self) -> NexusHandlerRetryBehavior {
-        match ProtoNexusHandlerRetryBehavior::try_from(self.handler_info().retry_behavior) {
-            Ok(ProtoNexusHandlerRetryBehavior::Unspecified) => {
-                NexusHandlerRetryBehavior::Unspecified
-            }
-            Ok(ProtoNexusHandlerRetryBehavior::Retryable) => NexusHandlerRetryBehavior::Retryable,
-            Ok(ProtoNexusHandlerRetryBehavior::NonRetryable) => {
-                NexusHandlerRetryBehavior::NonRetryable
-            }
-            Err(_) => NexusHandlerRetryBehavior::Unknown,
-        }
-    }
-
-    fn handler_info(&self) -> &crate::protos::temporal::api::failure::v1::NexusHandlerFailureInfo {
-        match self.failure.failure_info.as_ref() {
-            Some(crate::protos::temporal::api::failure::v1::failure::FailureInfo::NexusHandlerFailureInfo(info)) => info,
-            _ => unreachable!("handler errors are constructed only from handler failure info"),
-        }
-    }
-}
 
 /// Error type for activity execution outcomes.
 #[derive(Debug, thiserror::Error)]

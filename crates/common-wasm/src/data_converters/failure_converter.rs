@@ -20,9 +20,9 @@ use crate::{
         ActivityExecutionError, ActivityFailureError, ApplicationFailure,
         CancelExternalWorkflowError, CancelledError, ChildWorkflowExecutionError,
         ChildWorkflowFailureError, ChildWorkflowStartError, IncomingError,
-        NexusHandlerFailureError, NexusOperationFailureError, OutgoingActivityError, OutgoingError,
-        OutgoingWorkflowError, ResetWorkflowError, ServerError, TerminatedError, TimeoutError,
-        WorkflowCancelFailureError, WorkflowSignalError, WorkflowSignalFailureError,
+        IncomingNexusHandlerError, NexusOperationFailureError, OutgoingActivityError,
+        OutgoingError, OutgoingWorkflowError, ResetWorkflowError, ServerError, TerminatedError,
+        TimeoutError, WorkflowCancelFailureError, WorkflowSignalError, WorkflowSignalFailureError,
     },
     protos::temporal::api::{
         enums::v1::{
@@ -713,7 +713,7 @@ fn decode_failure(
             IncomingError::NexusOperationExecution(NexusOperationFailureError::new(failure, cause))
         }
         Some(FailureInfo::NexusHandlerFailureInfo(_)) => {
-            IncomingError::NexusHandler(NexusHandlerFailureError::new(failure, cause))
+            IncomingError::NexusHandler(IncomingNexusHandlerError::new(failure, cause))
         }
     }
 }
@@ -1105,42 +1105,6 @@ mod tests {
             Some("insufficient funds")
         );
         assert_eq!(convert(operation.into()), failure);
-    }
-
-    #[rstest]
-    #[case(0, crate::error::NexusHandlerRetryBehavior::Unspecified)]
-    #[case(1, crate::error::NexusHandlerRetryBehavior::Retryable)]
-    #[case(2, crate::error::NexusHandlerRetryBehavior::NonRetryable)]
-    #[case(99, crate::error::NexusHandlerRetryBehavior::Unknown)]
-    fn nexus_handler_metadata_survives_normalization(
-        #[case] retry_behavior: i32,
-        #[case] expected: crate::error::NexusHandlerRetryBehavior,
-    ) {
-        let failure = Failure {
-            message: "handler failed".to_owned(),
-            cause: Some(Box::new(cancelled_failure("handler cause"))),
-            failure_info: Some(FailureInfo::NexusHandlerFailureInfo(
-                NexusHandlerFailureInfo {
-                    r#type: "future-handler-error".to_owned(),
-                    retry_behavior,
-                },
-            )),
-            ..Default::default()
-        };
-        let IncomingError::NexusHandler(handler) = data_converter()
-            .to_error(
-                &SerializationContextData::None,
-                failure.clone(),
-                NoopDecodeHint,
-            )
-            .unwrap()
-        else {
-            panic!("expected handler error");
-        };
-        assert_eq!(handler.type_name(), "future-handler-error");
-        assert_eq!(handler.retry_behavior(), expected);
-        assert!(matches!(handler.cause(), Some(IncomingError::Cancelled(_))));
-        assert_eq!(handler.into_failure(), failure);
     }
 
     #[test]

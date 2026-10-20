@@ -53,10 +53,7 @@
 
 pub use crate::NexusOperationCancellationType;
 pub use nexus_rpc::{NexusOperation, NexusService};
-pub use temporalio_common_wasm::error::{
-    NexusHandlerFailureError, NexusHandlerRetryBehavior, NexusOperationError,
-    NexusOperationFailureError,
-};
+pub use temporalio_common_wasm::error::{NexusOperationError, NexusOperationFailureError};
 
 use crate::{
     BaseWorkflowContext, EventGroup, NexusOperationOptions, StartedNexusOperation,
