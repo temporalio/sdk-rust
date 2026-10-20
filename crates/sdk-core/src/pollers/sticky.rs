@@ -39,7 +39,7 @@ pub(crate) fn sticky_poller_behavior(
 /// A poller capable of polling on a sticky and a nonsticky queue simultaneously.
 #[derive(derive_more::Constructor)]
 pub(crate) struct StickyTaskPoller<T, SK: SlotKind> {
-    normal_poller: LongPollBuffer<T, SK>,
+    normal_poller: Option<LongPollBuffer<T, SK>>,
     sticky_poller: Option<LongPollBuffer<T, SK>>,
 }
 
@@ -50,25 +50,29 @@ where
     SK: SlotKind + 'static,
 {
     async fn poll(&self) -> Option<super::Result<(T, OwnedMeteredSemPermit<SK>)>> {
-        if let Some(sq) = self.sticky_poller.as_ref() {
-            tokio::select! {
-                r = self.normal_poller.poll() => r,
+        match (self.normal_poller.as_ref(), self.sticky_poller.as_ref()) {
+            (Some(normal), Some(sq)) => tokio::select! {
+                r = normal.poll() => r,
                 r = sq.poll() => r,
-            }
-        } else {
-            self.normal_poller.poll().await
+            },
+            (Some(poller), None) | (None, Some(poller)) => poller.poll().await,
+            (None, None) => None,
         }
     }
 
     fn notify_shutdown(&self) {
-        self.normal_poller.notify_shutdown();
+        if let Some(normal) = &self.normal_poller {
+            normal.notify_shutdown();
+        }
         if let Some(sq) = self.sticky_poller.as_ref() {
             sq.notify_shutdown();
         }
     }
 
     async fn shutdown(mut self) {
-        self.normal_poller.shutdown().await;
+        if let Some(normal) = self.normal_poller {
+            normal.shutdown().await;
+        }
         if let Some(sq) = self.sticky_poller {
             sq.shutdown().await;
         }

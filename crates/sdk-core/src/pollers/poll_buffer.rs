@@ -103,8 +103,11 @@ pub(crate) struct LongPollBuffer<T, SK: SlotKind> {
     did_start: AtomicBool,
 }
 
+#[derive(Default)]
 pub(crate) struct WorkflowTaskOptions {
     pub(crate) wft_poller_shared: Option<Arc<StickyPollerShared>>,
+    pub(crate) session_options:
+        Option<temporalio_common::protos::temporal::api::session::v1::WorkerSessionOptions>,
 }
 
 #[derive(Default)]
@@ -115,6 +118,8 @@ pub(crate) struct ActivityTaskOptions {
     pub(crate) max_tps: Option<f64>,
     pub(crate) sticky_queue_name: Option<String>,
     pub(crate) poller_shared: Option<Arc<StickyPollerShared>>,
+    pub(crate) session_options:
+        Option<temporalio_common::protos::temporal::api::session::v1::WorkerSessionOptions>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -131,8 +136,10 @@ pub(crate) fn make_activity_task_buffer(
     let sticky_queue_name = sticky_queue_name
         .as_ref()
         .filter(|_| config.session_worker_options.is_some());
-    let shared =
-        sticky_queue_name.map(|_| Arc::new(StickyPollerShared::new(slots.available_permits())));
+    let single_session = config.single_workflow_mode();
+    let shared = sticky_queue_name
+        .filter(|_| !single_session)
+        .map(|_| Arc::new(StickyPollerShared::new(slots.available_permits())));
     let rate_limiter = config
         .max_worker_activities_per_second
         .map(|rate| Arc::new(PollRateLimiter::new(rate)));
@@ -141,7 +148,7 @@ pub(crate) fn make_activity_task_buffer(
         &capabilities,
     );
     let make = |sticky: Option<String>| {
-        let behavior = if sticky_queue_name.is_some() {
+        let behavior = if sticky_queue_name.is_some() && !single_session {
             sticky_poller_behavior(behavior, config, sticky.is_some())
         } else {
             behavior
@@ -163,6 +170,7 @@ pub(crate) fn make_activity_task_buffer(
             ActivityTaskOptions {
                 rate_limiter: rate_limiter.clone(),
                 max_tps: config.max_task_queue_activities_per_second,
+                session_options: config.poll_session_options(sticky.as_deref()),
                 sticky_queue_name: sticky,
                 poller_shared: shared.clone(),
             },
@@ -171,7 +179,7 @@ pub(crate) fn make_activity_task_buffer(
         )
     };
     StickyTaskPoller::new(
-        make(None),
+        (!single_session).then(|| make(None)),
         sticky_queue_name.map(|name| make(Some(name.clone()))),
     )
 }
@@ -235,6 +243,7 @@ impl LongPollBuffer<PollWorkflowTaskQueueResponse, WorkflowSlotKind> {
             let client = client.clone();
             let task_queue = task_queue.clone();
             let sticky_queue_name = sticky_queue.clone();
+            let session_options = options.session_options.clone();
             async move {
                 client
                     .poll_workflow_task(
@@ -243,7 +252,10 @@ impl LongPollBuffer<PollWorkflowTaskQueueResponse, WorkflowSlotKind> {
                             no_retry,
                             timeout_override,
                         },
-                        PollWorkflowOptions { sticky_queue_name },
+                        PollWorkflowOptions::builder()
+                            .maybe_sticky_queue_name(sticky_queue_name)
+                            .maybe_session_options(session_options)
+                            .build(),
                     )
                     .await
             }
@@ -315,6 +327,7 @@ impl LongPollBuffer<PollActivityTaskQueueResponse, ActivitySlotKind> {
             let client = client.clone();
             let task_queue = task_queue.clone();
             let sticky_queue_name = options.sticky_queue_name.clone();
+            let session_options = options.session_options.clone();
             async move {
                 client
                     .poll_activity_task(
@@ -326,6 +339,7 @@ impl LongPollBuffer<PollActivityTaskQueueResponse, ActivitySlotKind> {
                         PollActivityOptions::builder()
                             .maybe_max_tasks_per_sec(options.max_tps)
                             .maybe_sticky_queue_name(sticky_queue_name)
+                            .maybe_session_options(session_options)
                             .build(),
                     )
                     .await
@@ -1044,6 +1058,7 @@ mod tests {
             None::<fn(usize)>,
             WorkflowTaskOptions {
                 wft_poller_shared: Some(Arc::new(StickyPollerShared::new(Some(10)))),
+                ..Default::default()
             },
             Arc::new(AtomicCell::new(None)),
             Arc::new(NamespaceCapabilities::default()),
@@ -1101,6 +1116,7 @@ mod tests {
             None::<fn(usize)>,
             WorkflowTaskOptions {
                 wft_poller_shared: Some(Arc::new(StickyPollerShared::new(Some(1)))),
+                ..Default::default()
             },
             Arc::new(AtomicCell::new(None)),
             Arc::new(NamespaceCapabilities::default()),
@@ -1178,6 +1194,7 @@ mod tests {
             None::<fn(usize)>,
             WorkflowTaskOptions {
                 wft_poller_shared: Some(Arc::new(StickyPollerShared::new(Some(10)))),
+                ..Default::default()
             },
             Arc::new(AtomicCell::new(None)),
             Arc::new(NamespaceCapabilities::default()),
@@ -1287,6 +1304,7 @@ mod tests {
             None::<fn(usize)>,
             WorkflowTaskOptions {
                 wft_poller_shared: Some(Arc::new(StickyPollerShared::new(Some(INITIAL_POLLERS)))),
+                ..Default::default()
             },
             Arc::new(AtomicCell::new(None)),
             Arc::new(NamespaceCapabilities::default()),
@@ -1368,6 +1386,7 @@ mod tests {
             }),
             WorkflowTaskOptions {
                 wft_poller_shared: None,
+                ..Default::default()
             },
             Arc::new(AtomicCell::new(None)),
             Arc::new(NamespaceCapabilities::resolved(Capabilities {
@@ -1446,6 +1465,7 @@ mod tests {
             None::<fn(usize)>,
             WorkflowTaskOptions {
                 wft_poller_shared: None,
+                ..Default::default()
             },
             Arc::new(AtomicCell::new(None)),
             Arc::new(NamespaceCapabilities::resolved(Capabilities {

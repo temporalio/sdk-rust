@@ -36,6 +36,8 @@ relevant information.
 ### Added
 * Experimental session workers can poll workflow-affine activity queues; individual activities opt
   into their workflow's session, while normal activity routing remains the default.
+* Experimental affinity controls support stable sticky destinations and lifetime dedication to a
+  single workflow with a supporting server. These demo-specific controls may be redesigned or removed.
 
 ### Security
 * Ephemeral server downloads now use `zip` 9.0 for ZIP extraction, replacing the 8.x dependency

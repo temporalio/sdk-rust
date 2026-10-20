@@ -37,13 +37,14 @@ pub mod test_help;
 
 pub use crate::worker::client::{
     PollActivityOptions, PollActivityOptionsBuilder, PollOptions, PollWorkflowOptions,
-    WorkerClient, WorkflowTaskCompletion,
+    PollWorkflowOptionsBuilder, WorkerClient, WorkflowTaskCompletion,
 };
 pub use pollers::{Client, ClientOptions, ClientTlsOptions, RetryOptions, TlsOptions};
 pub use temporalio_common::protos::TaskToken;
 pub use url::Url;
 pub use worker::{
     ActivitySlotKind, CompleteActivityError, CompleteNexusError, CompleteWfError,
+    ExperimentalWorkerAffinityOptions, ExperimentalWorkerAffinityOptionsBuilder,
     FixedSizeSlotSupplier, LocalActivitySlotKind, NamespaceCapabilities, NexusSlotKind, PollError,
     PollerBehavior, ResourceBasedSlotsOptions, ResourceBasedSlotsOptionsBuilder,
     ResourceBasedTuner, ResourceBasedTunerConfig, ResourceController, ResourceSlotOptions,

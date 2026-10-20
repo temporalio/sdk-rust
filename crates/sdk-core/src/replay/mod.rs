@@ -77,6 +77,7 @@ where
     pub(crate) fn into_core_worker(mut self) -> Result<Worker, anyhow::Error> {
         // Offline replay consumes supplied history and does not execute activities.
         self.config.session_worker_options = None;
+        self.config.experimental_worker_affinity_options = None;
         self.config.max_cached_workflows = 1;
         self.config.workflow_task_poller_behavior = Some(PollerBehavior::SimpleMaximum(1));
         self.config.task_types = WorkerTaskTypes::workflow_only();
@@ -163,17 +164,33 @@ mod tests {
         temporal::api::session::v1::{ActivitySessionOptions, activity_session_options},
     };
 
+    #[rstest::rstest]
+    #[case(false)]
+    #[case(true)]
     #[tokio::test]
-    async fn replay_session_activity_without_session_worker() {
+    async fn replay_session_activity_without_session_worker(#[case] single_session: bool) {
         let mut history = canned_histories::single_activity("activity");
         history.add_workflow_task_completed();
         history.add_workflow_execution_completed();
         let mut client = mock_manual_worker_client();
         client.expect_fail_workflow_task().times(0);
-        let mut input = ReplayWorkerInput::new(
-            test_worker_cfg().build().unwrap(),
-            stream::iter([history.into()]),
-        );
+        let config = WorkerConfig::builder()
+            .namespace("default")
+            .task_queue("queue")
+            .versioning_strategy(crate::WorkerVersioningStrategy::None {
+                build_id: String::new(),
+            })
+            .task_types(WorkerTaskTypes::all())
+            .max_cached_workflows(2_usize)
+            .maybe_session_worker_options(single_session.then(crate::SessionWorkerOptions::default))
+            .maybe_experimental_worker_affinity_options(single_session.then(|| {
+                crate::ExperimentalWorkerAffinityOptions::builder()
+                    .single_workflow_mode(true)
+                    .build()
+            }))
+            .build()
+            .unwrap();
+        let mut input = ReplayWorkerInput::new(config, stream::iter([history.into()]));
         input.client_override = Some(client);
         let worker = input.into_core_worker().unwrap();
         let start = worker.poll_workflow_activation().await.unwrap();
