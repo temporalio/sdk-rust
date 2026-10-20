@@ -165,13 +165,43 @@ pub(crate) struct ResourceBasedSlotsForType<MI, SK> {
     last_slot_issued_tx: watch::Sender<Instant>,
     last_slot_issued_rx: watch::Receiver<Instant>,
 
+    sticky_slots: StickySlotAccounting,
+
+    _slot_kind: PhantomData<SK>,
+}
+
+#[derive(Default)]
+struct StickySlotAccounting {
     // Only used for workflow slots - count of issued non-sticky slots
     issued_nonsticky: AtomicUsize,
     // Only used for workflow slots - count of issued sticky slots
     issued_sticky: AtomicUsize,
-
-    _slot_kind: PhantomData<SK>,
 }
+
+impl StickySlotAccounting {
+    // Always be willing to hand out at least 1 slot for sticky and 1 for non-sticky to
+    // avoid getting stuck.
+    fn needs_first_slot(&self, is_sticky: bool) -> bool {
+        self.counter(is_sticky).load(Ordering::Relaxed) == 0
+    }
+
+    fn record_issue(&self, is_sticky: bool) {
+        self.counter(is_sticky).fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_release(&self, is_sticky: bool) {
+        self.counter(is_sticky).fetch_sub(1, Ordering::Relaxed);
+    }
+
+    fn counter(&self, is_sticky: bool) -> &AtomicUsize {
+        if is_sticky {
+            &self.issued_sticky
+        } else {
+            &self.issued_nonsticky
+        }
+    }
+}
+
 /// Allows for the full customization of the PID options for a resource based tuner
 #[derive(Clone, Debug, bon::Builder)]
 #[non_exhaustive]
@@ -327,11 +357,7 @@ where
     fn release_slot(&self, ctx: &dyn SlotReleaseContext<SlotKind = Self::SlotKind>) {
         // Really could use specialization here
         if let Some(SlotInfo::Workflow(info)) = ctx.info().map(|i| i.downcast()) {
-            if info.is_sticky {
-                self.issued_sticky.fetch_sub(1, Ordering::Relaxed);
-            } else {
-                self.issued_nonsticky.fetch_sub(1, Ordering::Relaxed);
-            }
+            self.sticky_slots.record_release(info.is_sticky);
         }
     }
 
@@ -352,14 +378,11 @@ where
             last_slot_issued_tx: tx,
             last_slot_issued_rx: rx,
             inner,
-            issued_nonsticky: Default::default(),
-            issued_sticky: Default::default(),
+            sticky_slots: Default::default(),
             _slot_kind: PhantomData,
         }
     }
 
-    // Always be willing to hand out at least 1 slot for sticky and 1 for non-sticky to
-    // avoid getting stuck.
     fn issue_if_below_minimums(
         &self,
         ctx: &dyn SlotReservationContext,
@@ -368,8 +391,7 @@ where
             return Some(self.issue_slot(ctx));
         }
         if SK::kind() == SlotKindType::Workflow
-            && (ctx.is_sticky() && self.issued_sticky.load(Ordering::Relaxed) == 0
-                || !ctx.is_sticky() && self.issued_nonsticky.load(Ordering::Relaxed) == 0)
+            && self.sticky_slots.needs_first_slot(ctx.is_sticky())
         {
             return Some(self.issue_slot(ctx));
         }
@@ -381,11 +403,7 @@ where
         // Always be willing to hand out at least 1 slot for sticky and 1 for non-sticky to avoid
         // getting stuck.
         if SK::kind() == SlotKindType::Workflow {
-            if ctx.is_sticky() {
-                self.issued_sticky.fetch_add(1, Ordering::Relaxed);
-            } else {
-                self.issued_nonsticky.fetch_add(1, Ordering::Relaxed);
-            }
+            self.sticky_slots.record_issue(ctx.is_sticky());
         }
         let _ = self.last_slot_issued_tx.send(Instant::now());
         SlotSupplierPermit::default()
