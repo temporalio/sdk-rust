@@ -372,9 +372,10 @@ Nexus request headers can be set by workflow interceptors, not by the typed call
 variant carries a `NexusOperationFailureError`; `Serialization` reports payload conversion errors.
 Use `operation_failure()` to access the remote failure's endpoint, service, operation, token, and
 scheduled event ID. Metadata is optional when the incoming failure has no Nexus wrapper.
-The failure's `as_cancelled()` and `as_timeout()` expose typed cancellation and timeout causes.
-Its `reason()` exposes the underlying normalized error, including `IncomingError::NexusHandler`
-with handler type and explicit retry behavior accessors.
+Call `as_cancelled()` or `as_timeout()` directly on `NexusOperationError` to inspect typed
+cancellation and timeout causes. The operation failure's `reason()` exposes the underlying
+normalized error, including `IncomingError::NexusHandler` with handler type and explicit retry
+behavior accessors.
 
 Calls use the workflow's payload and failure converters, with payload codecs applied at the worker
 boundary. Service and operation wire names are recorded in history, so changing them in existing

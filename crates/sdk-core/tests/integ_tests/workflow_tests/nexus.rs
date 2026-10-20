@@ -567,8 +567,8 @@ impl NexusCancelBeforeStartWf {
         );
         started.cancel();
         let res = started.await.unwrap_err();
+        assert!(res.as_cancelled().is_some());
         let operation_failure = res.operation_failure().unwrap();
-        assert!(operation_failure.as_cancelled().is_some());
         let failure = operation_failure.failure();
         assert_eq!(
             failure.message,

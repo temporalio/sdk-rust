@@ -945,11 +945,7 @@ mod tests {
             .unwrap();
         let operation = NexusOperationDecodeHint.adapt(incoming);
         assert_eq!(
-            operation
-                .operation_failure()
-                .unwrap()
-                .as_cancelled()
-                .map(CancelledError::failure),
+            operation.as_cancelled().map(CancelledError::failure),
             Some(&cancellation)
         );
         let outgoing = OutgoingWorkflowError::from(operation);
@@ -1022,7 +1018,7 @@ mod tests {
         assert_eq!(operation_failure.operation_token(), Some("token"));
         assert_eq!(operation_failure.scheduled_event_id(), Some(42));
         if timed_out {
-            let timeout = operation_failure.as_timeout().unwrap();
+            let timeout = operation.as_timeout().unwrap();
             assert_eq!(timeout.failure(), &cause);
             assert_eq!(
                 timeout.timeout_type(),
@@ -1032,12 +1028,12 @@ mod tests {
                 timeout.raw_last_heartbeat_details(),
                 Some(details.as_slice())
             );
-            assert!(operation_failure.as_cancelled().is_none());
+            assert!(operation.as_cancelled().is_none());
         } else {
-            let cancelled = operation_failure.as_cancelled().unwrap();
+            let cancelled = operation.as_cancelled().unwrap();
             assert_eq!(cancelled.failure(), &cause);
             assert_eq!(cancelled.raw_details(), Some(details.as_slice()));
-            assert!(operation_failure.as_timeout().is_none());
+            assert!(operation.as_timeout().is_none());
         }
         assert_eq!(convert(operation.into()), failure);
     }
@@ -1052,6 +1048,8 @@ mod tests {
         );
         let operation = NexusOperationError::from(conversion);
         assert!(operation.operation_failure().is_none());
+        assert!(operation.as_cancelled().is_none());
+        assert!(operation.as_timeout().is_none());
         let outgoing = OutgoingWorkflowError::from(operation);
         assert!(matches!(
             outgoing,
@@ -1088,7 +1086,7 @@ mod tests {
             .unwrap();
         assert!(matches!(operation, NexusOperationError::Failed(_)));
         let operation_failure = operation.operation_failure().unwrap();
-        assert!(operation_failure.as_cancelled().is_none());
+        assert!(operation.as_cancelled().is_none());
         assert_eq!(
             operation_failure.cause().map(IncomingError::failure),
             Some(&failure)

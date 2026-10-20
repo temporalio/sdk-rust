@@ -485,9 +485,7 @@ impl OutgoingWorkflowError {
             Self::WorkflowSignal(err) => err.as_cancelled(),
             Self::CancelExternalWorkflow(err) => err.as_cancelled(),
             #[cfg(feature = "experimental")]
-            Self::NexusOperation(err) => err
-                .operation_failure()
-                .and_then(NexusOperationFailureError::as_cancelled),
+            Self::NexusOperation(err) => err.as_cancelled(),
         }
     }
 }
@@ -1239,6 +1237,18 @@ impl NexusOperationError {
             Self::Failed(err) => Some(err),
             Self::Serialization(_) => None,
         }
+    }
+
+    /// Returns the immediate cancellation cause, if present.
+    pub fn as_cancelled(&self) -> Option<&CancelledError> {
+        self.operation_failure()
+            .and_then(NexusOperationFailureError::as_cancelled)
+    }
+
+    /// Returns the immediate timeout cause, if present.
+    pub fn as_timeout(&self) -> Option<&TimeoutError> {
+        self.operation_failure()
+            .and_then(NexusOperationFailureError::as_timeout)
     }
 }
 

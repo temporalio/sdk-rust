@@ -224,7 +224,7 @@ impl NexusTypedAsyncWf {
             TypedAsyncOutcome::Cancel => {
                 handle.cancel();
                 let error = handle.result().await.unwrap_err();
-                assert!(error.operation_failure().unwrap().as_cancelled().is_some());
+                assert!(error.as_cancelled().is_some());
             }
         }
         Ok(())

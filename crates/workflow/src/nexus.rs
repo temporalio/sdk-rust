@@ -5,7 +5,7 @@
 //!
 //! Calls return [`NexusOperationError`]. Its [`Failed`](NexusOperationError::Failed) variant retains
 //! a [`NexusOperationFailureError`] with optional Nexus metadata and a normalized failure reason.
-//! Use [`NexusOperationFailureError::as_cancelled`] and [`NexusOperationFailureError::as_timeout`]
+//! Use [`NexusOperationError::as_cancelled`] and [`NexusOperationError::as_timeout`]
 //! to inspect cancellation and timeout causes.
 //!
 //! Services are defined with the Nexus SDK's [`nexus_rpc::service`] macro. Operation markers bind each

@@ -456,8 +456,8 @@ fn start_preserves_typed_failure_causes() {
             resolve_start(&base, 1, StartStatus::Failed(failure.clone()));
             let error = execute.now_or_never().unwrap().unwrap_err();
             let operation_failure = error.operation_failure().unwrap();
-            assert_eq!(operation_failure.as_cancelled().is_some(), cancelled);
-            assert_eq!(operation_failure.as_timeout().is_some(), timed_out);
+            assert_eq!(error.as_cancelled().is_some(), cancelled);
+            assert_eq!(error.as_timeout().is_some(), timed_out);
             assert_eq!(operation_failure.failure(), &failure);
         }
     }
@@ -500,8 +500,8 @@ fn result_preserves_typed_failure_causes() {
         resolve_result(&base, 1, Some(status));
         let error = execute.now_or_never().unwrap().unwrap_err();
         let operation_failure = error.operation_failure().unwrap();
-        assert_eq!(operation_failure.as_cancelled().is_some(), !timed_out);
-        assert_eq!(operation_failure.as_timeout().is_some(), timed_out);
+        assert_eq!(error.as_cancelled().is_some(), !timed_out);
+        assert_eq!(error.as_timeout().is_some(), timed_out);
         assert_eq!(operation_failure.failure(), &failure);
         assert_eq!(
             operation_failure.cause().map(|cause| cause.failure()),
