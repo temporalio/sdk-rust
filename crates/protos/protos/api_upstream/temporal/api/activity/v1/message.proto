@@ -203,6 +203,21 @@ message ActivityExecutionInfo {
     // Indicates whether eager execution was requested for this activity and accepted by the server
     // for its first task.
     bool eager_execution_accepted = 40;
+
+    // Authenticated principal by which this activity execution was started.
+    //
+    // (-- api-linter: core::0140::prepositions=disabled
+    //     aip.dev/not-precedent: "by" identifies the authenticated actor. --)
+    temporal.api.common.v1.ResolvedPrincipal started_by_principal = 41;
+
+    // Authenticated principal by which this activity execution was closed.
+    //
+    // (-- api-linter: core::0140::prepositions=disabled
+    //     aip.dev/not-precedent: "by" identifies the authenticated actor. --)
+    temporal.api.common.v1.ResolvedPrincipal closed_by_principal = 42;
+
+    // Authenticated principal of the worker that most recently interacted with this activity execution.
+    temporal.api.common.v1.ResolvedPrincipal last_worker_principal = 43;
 }
 
 // Limited activity information returned in the list response.

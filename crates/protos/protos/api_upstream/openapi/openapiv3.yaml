@@ -9924,6 +9924,26 @@ components:
           description: |-
             Indicates whether eager execution was requested for this activity and accepted by the server
              for its first task.
+        startedByPrincipal:
+          allOf:
+            - $ref: '#/components/schemas/ResolvedPrincipal'
+          description: |-
+            Authenticated principal by which this activity execution was started.
+
+             (-- api-linter: core::0140::prepositions=disabled
+                 aip.dev/not-precedent: "by" identifies the authenticated actor. --)
+        closedByPrincipal:
+          allOf:
+            - $ref: '#/components/schemas/ResolvedPrincipal'
+          description: |-
+            Authenticated principal by which this activity execution was closed.
+
+             (-- api-linter: core::0140::prepositions=disabled
+                 aip.dev/not-precedent: "by" identifies the authenticated actor. --)
+        lastWorkerPrincipal:
+          allOf:
+            - $ref: '#/components/schemas/ResolvedPrincipal'
+          description: Authenticated principal of the worker that most recently interacted with this activity execution.
       description: Information about a standalone activity.
     ActivityExecutionListInfo:
       type: object
@@ -15990,6 +16010,22 @@ components:
       properties:
         lastHeartbeatDetails:
           $ref: '#/components/schemas/Payloads'
+    ResolvedPrincipal:
+      type: object
+      properties:
+        type:
+          type: string
+          description: Low-cardinality category of the principal (e.g., "jwt", "users").
+        nameAtWriteTime:
+          type: string
+          description: |-
+            Identifier within that category (e.g., sub JWT claim, email address).
+
+             (-- api-linter: core::0140::prepositions=disabled
+                 aip.dev/not-precedent: Identifies the principal name snapshot used for this response. --)
+             (-- api-linter: core::0142::time-field-type=disabled
+                 aip.dev/not-precedent: This string is a principal name snapshot, not a timestamp. --)
+      description: ResolvedPrincipal is a principal returned to an API caller.
     RespondActivityTaskCanceledByIdRequest:
       type: object
       properties:
@@ -16446,6 +16482,12 @@ components:
         stateSizeBytes:
           type: string
           description: Size of the schedule's internal state (including payloads) in bytes.
+        timeSkippingInfo:
+          allOf:
+            - $ref: '#/components/schemas/TimeSkippingInfo'
+          description: |-
+            Information about time skipping for this schedule.
+             If the schedule has never enabled time skipping, this will be unset.
     ScheduleListEntry:
       type: object
       properties:
@@ -16517,6 +16559,12 @@ components:
              notes field to the value of the string.
         unpause:
           type: string
+        timeSkippingConfig:
+          allOf:
+            - $ref: '#/components/schemas/TimeSkippingConfig'
+          description: |-
+            If set, applies the specified time-skipping configuration to this schedule,
+             replacing any existing time-skipping configuration.
     SchedulePolicies:
       type: object
       properties:
@@ -17846,6 +17894,13 @@ components:
           allOf:
             - $ref: '#/components/schemas/PropagatedSerializationContext'
           description: Serialization context propagated from the Nexus caller that started this workflow.
+        timeSkippingStatePropagation:
+          allOf:
+            - $ref: '#/components/schemas/TimeSkippingStatePropagation'
+          description: |-
+            Time-skipping state propagated by the execution that started this workflow.
+             This field is intended for use by the Temporal server, for example when a schedule
+             starts a workflow, and is not intended to be set by external clients.
     StartWorkflowExecutionResponse:
       type: object
       properties:
@@ -19144,6 +19199,10 @@ components:
           allOf:
             - $ref: '#/components/schemas/Link'
           description: Link to the update event. May be null if the update has not yet been accepted.
+        propagatedNexusSerializationContext:
+          allOf:
+            - $ref: '#/components/schemas/PropagatedSerializationContext'
+          description: Serialization context propagated from the Nexus caller that started this update.
     UpsertWorkflowSearchAttributesEventAttributes:
       type: object
       properties:

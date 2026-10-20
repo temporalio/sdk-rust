@@ -219,8 +219,14 @@ message StartWorkflowExecutionRequest {
 
     // Time-skipping configuration. If not set, time skipping is disabled.
     temporal.api.common.v1.TimeSkippingConfig time_skipping_config = 29;
+
     // Serialization context propagated from the Nexus caller that started this workflow.
     temporal.api.nexus.v1.PropagatedSerializationContext propagated_nexus_serialization_context = 30;
+
+    // Time-skipping state propagated by the execution that started this workflow.
+    // This field is intended for use by the Temporal server, for example when a schedule
+    // starts a workflow, and is not intended to be set by external clients.
+    temporal.api.common.v1.TimeSkippingStatePropagation time_skipping_state_propagation = 31;
 }
 
 message StartWorkflowExecutionResponse {
@@ -1877,6 +1883,9 @@ message UpdateWorkflowExecutionResponse {
 
     // Link to the update event. May be null if the update has not yet been accepted.
     temporal.api.common.v1.Link link = 4;
+
+    // Serialization context propagated from the Nexus caller that started this update.
+    temporal.api.nexus.v1.PropagatedSerializationContext propagated_nexus_serialization_context = 5;
 }
 
 message StartBatchOperationRequest {
@@ -2019,6 +2028,9 @@ message PollWorkflowExecutionUpdateResponse {
     temporal.api.enums.v1.UpdateWorkflowExecutionLifecycleStage stage = 2;
     // Sufficient information to address this Update.
     temporal.api.update.v1.UpdateRef update_ref = 3;
+
+    // Serialization context propagated from the Nexus caller that started this update.
+    temporal.api.nexus.v1.PropagatedSerializationContext propagated_nexus_serialization_context = 4;
 }
 
 message PollNexusTaskQueueRequest {

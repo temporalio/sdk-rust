@@ -12917,6 +12917,10 @@
         "propagatedNexusSerializationContext": {
           "$ref": "#/definitions/v1PropagatedSerializationContext",
           "description": "Serialization context propagated from the Nexus caller that started this workflow."
+        },
+        "timeSkippingStatePropagation": {
+          "$ref": "#/definitions/v1TimeSkippingStatePropagation",
+          "description": "Time-skipping state propagated by the execution that started this workflow.\nThis field is intended for use by the Temporal server, for example when a schedule\nstarts a workflow, and is not intended to be set by external clients."
         }
       }
     },
@@ -13934,6 +13938,18 @@
         "eagerExecutionAccepted": {
           "type": "boolean",
           "description": "Indicates whether eager execution was requested for this activity and accepted by the server\nfor its first task."
+        },
+        "startedByPrincipal": {
+          "$ref": "#/definitions/v1ResolvedPrincipal",
+          "description": "Authenticated principal by which this activity execution was started.\n"
+        },
+        "closedByPrincipal": {
+          "$ref": "#/definitions/v1ResolvedPrincipal",
+          "description": "Authenticated principal by which this activity execution was closed.\n"
+        },
+        "lastWorkerPrincipal": {
+          "$ref": "#/definitions/v1ResolvedPrincipal",
+          "description": "Authenticated principal of the worker that most recently interacted with this activity execution."
         }
       },
       "description": "Information about a standalone activity."
@@ -19334,6 +19350,20 @@
         }
       }
     },
+    "v1ResolvedPrincipal": {
+      "type": "object",
+      "properties": {
+        "type": {
+          "type": "string",
+          "description": "Low-cardinality category of the principal (e.g., \"jwt\", \"users\")."
+        },
+        "nameAtWriteTime": {
+          "type": "string",
+          "description": "Identifier within that category (e.g., sub JWT claim, email address).\n"
+        }
+      },
+      "description": "ResolvedPrincipal is a principal returned to an API caller."
+    },
     "v1RespondActivityTaskCanceledByIdResponse": {
       "type": "object"
     },
@@ -19591,6 +19621,10 @@
           "type": "string",
           "format": "int64",
           "description": "Size of the schedule's internal state (including payloads) in bytes."
+        },
+        "timeSkippingInfo": {
+          "$ref": "#/definitions/v1TimeSkippingInfo",
+          "description": "Information about time skipping for this schedule.\nIf the schedule has never enabled time skipping, this will be unset."
         }
       }
     },
@@ -19688,6 +19722,10 @@
         },
         "unpause": {
           "type": "string"
+        },
+        "timeSkippingConfig": {
+          "$ref": "#/definitions/v1TimeSkippingConfig",
+          "description": "If set, applies the specified time-skipping configuration to this schedule,\nreplacing any existing time-skipping configuration."
         }
       }
     },
@@ -20973,6 +21011,10 @@
         "link": {
           "$ref": "#/definitions/v1Link",
           "description": "Link to the update event. May be null if the update has not yet been accepted."
+        },
+        "propagatedNexusSerializationContext": {
+          "$ref": "#/definitions/v1PropagatedSerializationContext",
+          "description": "Serialization context propagated from the Nexus caller that started this update."
         }
       }
     },
