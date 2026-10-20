@@ -172,9 +172,7 @@ pub(crate) struct ResourceBasedSlotsForType<MI, SK> {
 
 #[derive(Default)]
 struct StickySlotAccounting {
-    // Only used for workflow slots - count of issued non-sticky slots
     issued_nonsticky: AtomicUsize,
-    // Only used for workflow slots - count of issued sticky slots
     issued_sticky: AtomicUsize,
 }
 
