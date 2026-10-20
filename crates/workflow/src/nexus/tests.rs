@@ -380,7 +380,17 @@ fn start_and_result_failures_preserve_server_failure_details() {
         )),
         ..Default::default()
     };
-    for phase in 0..2 {
+    for phase in 0..4 {
+        let mut failure = failure.clone();
+        if phase == 2 {
+            failure.failure_info = Some(FailureInfo::CanceledFailureInfo(
+                CanceledFailureInfo::default(),
+            ));
+        } else if phase == 3 {
+            failure.failure_info = Some(FailureInfo::TimeoutFailureInfo(
+                TimeoutFailureInfo::default(),
+            ));
+        }
         let (base, client, _) = client();
         let start = client.start(
             Payments::charge,
@@ -398,115 +408,62 @@ fn start_and_result_failures_preserve_server_failure_details() {
         } else {
             resolve_start(&base, 1, StartStatus::OperationToken("token".to_string()));
             let handle = start.now_or_never().unwrap().unwrap();
-            let status = nexus_operation_result::Status::Failed(failure.clone());
+            let status = match phase {
+                1 => nexus_operation_result::Status::Failed(failure.clone()),
+                2 => nexus_operation_result::Status::Cancelled(failure.clone()),
+                _ => nexus_operation_result::Status::TimedOut(failure.clone()),
+            };
             resolve_result(&base, 1, Some(status));
             for _ in 0..2 {
                 let error = handle.result().now_or_never().unwrap().unwrap_err();
                 assert_eq!(error.operation_failure().unwrap().failure(), &failure);
+                assert_eq!(error.as_cancelled().is_some(), phase == 2);
+                assert_eq!(error.as_timeout().is_some(), phase == 3);
             }
         }
     }
 }
 
 #[test]
-fn start_preserves_typed_failure_causes() {
-    for (failure_info, cancelled, timed_out) in [
-        (None, false, false),
-        (
-            Some(FailureInfo::CanceledFailureInfo(
-                CanceledFailureInfo::default(),
-            )),
-            true,
-            false,
-        ),
-        (
-            Some(FailureInfo::TimeoutFailureInfo(
-                TimeoutFailureInfo::default(),
-            )),
-            false,
-            true,
-        ),
-    ] {
-        for wrapped in [false, true] {
-            let reason = Failure {
-                message: "start resolution".to_owned(),
-                failure_info: failure_info.clone(),
-                ..Default::default()
-            };
-            let failure = if wrapped {
-                Failure {
-                    message: "operation failed to start".to_owned(),
-                    cause: Some(Box::new(reason)),
-                    failure_info: Some(FailureInfo::NexusOperationExecutionFailureInfo(
-                        NexusOperationFailureInfo::default(),
-                    )),
-                    ..Default::default()
-                }
-            } else {
-                reason
-            };
-            let (base, client, _) = client();
-            let execute = client.execute(
-                Payments::charge,
-                request(),
-                NexusWorkflowOperationOptions::default(),
-            );
-            let mut execute = std::pin::pin!(execute);
-            assert!(execute.as_mut().now_or_never().is_none());
-            resolve_start(&base, 1, StartStatus::Failed(failure.clone()));
-            let error = execute.now_or_never().unwrap().unwrap_err();
-            let operation_failure = error.operation_failure().unwrap();
-            assert_eq!(error.as_cancelled().is_some(), cancelled);
-            assert_eq!(error.as_timeout().is_some(), timed_out);
-            assert_eq!(operation_failure.failure(), &failure);
-        }
-    }
-}
-
-#[test]
-fn result_preserves_typed_failure_causes() {
-    for timed_out in [false, true] {
+fn start_failures_preserve_cancellation_and_timeout_causes() {
+    for cancelled in [true, false] {
         let cause = Failure {
-            message: "operation cause".to_owned(),
-            failure_info: Some(if timed_out {
-                FailureInfo::TimeoutFailureInfo(TimeoutFailureInfo::default())
-            } else {
+            message: "operation cause".to_string(),
+            failure_info: Some(if cancelled {
                 FailureInfo::CanceledFailureInfo(CanceledFailureInfo::default())
+            } else {
+                FailureInfo::TimeoutFailureInfo(TimeoutFailureInfo::default())
             }),
             ..Default::default()
         };
         let failure = Failure {
-            message: "operation failed".to_owned(),
+            message: "operation failed to start".to_string(),
             cause: Some(Box::new(cause.clone())),
             failure_info: Some(FailureInfo::NexusOperationExecutionFailureInfo(
                 NexusOperationFailureInfo::default(),
             )),
             ..Default::default()
         };
-        let status = if timed_out {
-            nexus_operation_result::Status::TimedOut(failure.clone())
-        } else {
-            nexus_operation_result::Status::Cancelled(failure.clone())
-        };
         let (base, client, _) = client();
-        let execute = client.execute(
+        let start = client.start(
             Payments::charge,
             request(),
             NexusWorkflowOperationOptions::default(),
         );
-        let mut execute = std::pin::pin!(execute);
-        assert!(execute.as_mut().now_or_never().is_none());
-        resolve_start(&base, 1, StartStatus::OperationToken("token".to_owned()));
-        resolve_result(&base, 1, Some(status));
-        let error = execute.now_or_never().unwrap().unwrap_err();
+        let mut start = std::pin::pin!(start);
+        assert!(start.as_mut().now_or_never().is_none());
+        resolve_start(&base, 1, StartStatus::Failed(failure.clone()));
+        let Err(error) = start.now_or_never().unwrap() else {
+            panic!("start should fail");
+        };
         let operation_failure = error.operation_failure().unwrap();
-        assert_eq!(error.as_cancelled().is_some(), !timed_out);
-        assert_eq!(error.as_timeout().is_some(), timed_out);
         assert_eq!(operation_failure.failure(), &failure);
         assert_eq!(
             operation_failure.cause().map(|cause| cause.failure()),
             Some(&cause)
         );
+        assert_eq!(error.as_cancelled().is_some(), cancelled);
+        assert_eq!(error.as_timeout().is_some(), !cancelled);
     }
 }
 
