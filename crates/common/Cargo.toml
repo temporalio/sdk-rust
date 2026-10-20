@@ -61,7 +61,7 @@ hyper-util = { version = "0.1", features = [
   "tokio",
 ], optional = true }
 opentelemetry = { workspace = true, features = ["metrics"], optional = true }
-opentelemetry_sdk = { version = "0.32", default-features = false, features = [
+opentelemetry_sdk = { version = "0.33", default-features = false, features = [
   "rt-tokio",
   "metrics",
   "spec_unstable_metrics_views",
@@ -126,7 +126,7 @@ workspace = true
 
 [dev-dependencies]
 futures-util = { version = "0.3", default-features = false }
-opentelemetry_sdk = { version = "0.32", features = ["testing"] }
+opentelemetry_sdk = { version = "0.33", features = ["testing"] }
 rstest = "0.26"
 tempfile = "3.21"
 tokio = { version = "1.47", features = ["macros", "rt"] }
