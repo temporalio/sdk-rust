@@ -56,6 +56,7 @@ relevant information.
 
 
 ### Fixed
+* Fixed queries timing out when several requests are queued while a workflow is being evicted from the worker cache.
 * Ephemeral server startup now enforces its elapsed-time deadline even when a connection stalls,
   and startup timeout messages include the last connection error when available.
 * Avoid scanning the workflow cache when no workflow tasks are waiting for a cache slot, reducing

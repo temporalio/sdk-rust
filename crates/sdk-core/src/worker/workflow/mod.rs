@@ -1361,7 +1361,19 @@ struct BufferedTasks {
     query_only_tasks_for_buffered: VecDeque<PermittedWFT>,
 }
 
+#[cfg(test)]
+mod buffered_tasks_tests;
+
 impl BufferedTasks {
+    fn into_buffer_order(self) -> impl Iterator<Item = PermittedWFT> {
+        // BufferedTasks::buffer associates Queries with the preceding WFT. Preserve that
+        // association so a superseding WFT still invalidates only its own buffered Queries.
+        self.query_only_tasks
+            .into_iter()
+            .chain(self.wft)
+            .chain(self.query_only_tasks_for_buffered)
+    }
+
     /// Buffers a new task. If it is a query-only task, multiple such tasks may be buffered which
     /// all will be handled at the end of the current WFT. If a new WFT which would advance history
     /// is provided, it will be buffered - but if another such task comes in while there is already
