@@ -1910,7 +1910,7 @@ pub mod temporal {
                                 request_eager_execution: !s.do_not_eagerly_execute,
                                 use_workflow_build_id,
                                 priority: s.priority,
-                                session_options: None,
+                                session_options: s.session_options,
                             },
                         )
                     }

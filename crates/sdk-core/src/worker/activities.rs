@@ -1,3 +1,4 @@
+pub(crate) mod act_poller;
 mod activity_heartbeat_manager;
 mod local_activities;
 
@@ -1031,7 +1032,7 @@ mod tests {
     use super::*;
     use crate::{
         abstractions::tests::fixed_size_permit_dealer,
-        pollers::{ActivityTaskOptions, LongPollBuffer},
+        pollers::{ActivityTaskOptions, LongPollBuffer, PollRateLimiter},
         prost_dur,
         worker::{
             NamespaceCapabilities, PollerBehavior,
@@ -1050,13 +1051,14 @@ mod tests {
         let ap = LongPollBuffer::new_activity_task(
             mock_client.clone(),
             "tq".to_string(),
+            None,
             PollerBehavior::SimpleMaximum(1),
             sem.clone(),
             shutdown_token,
             None::<fn(usize)>,
             ActivityTaskOptions {
-                max_worker_acts_per_second: None,
                 max_tps: None,
+                ..Default::default()
             },
             Arc::new(AtomicCell::new(None)),
             Arc::new(NamespaceCapabilities::default()),
@@ -1136,14 +1138,16 @@ mod tests {
         let ap = LongPollBuffer::new_activity_task(
             mock_client.clone(),
             "tq".to_string(),
+            None,
             // Lots of concurrent pollers, to ensure we don't poll to much when that's the case
             PollerBehavior::SimpleMaximum(5),
             sem.clone(),
             shutdown_token.clone(),
             None::<fn(usize)>,
             ActivityTaskOptions {
-                max_worker_acts_per_second: Some(2.0),
+                rate_limiter: Some(Arc::new(PollRateLimiter::new(2.0))),
                 max_tps: None,
+                ..Default::default()
             },
             Arc::new(AtomicCell::new(None)),
             Arc::new(NamespaceCapabilities::default()),

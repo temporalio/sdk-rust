@@ -18,7 +18,7 @@ use tokio_util::sync::CancellationToken;
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn make_wft_poller(
     config: &WorkerConfig,
-    sticky_queue_name: &Option<String>,
+    sticky_queue_name: Option<&str>,
     client: &Arc<dyn WorkerClient>,
     metrics: &MetricsContext,
     shutdown_token: &CancellationToken,
@@ -68,12 +68,12 @@ pub(crate) fn make_wft_poller(
         last_successful_poll_time,
         capabilities.clone(),
     );
-    let sticky_queue_poller = sticky_queue_name.as_ref().map(|sqn| {
+    let sticky_queue_poller = sticky_queue_name.map(|sqn| {
         let sticky_metrics = metrics.with_new_attrs([workflow_sticky_poller()]);
         LongPollBuffer::new_workflow_task(
             client.clone(),
             config.task_queue.clone(),
-            Some(sqn.clone()),
+            Some(sqn.to_owned()),
             sticky_poller_behavior(effective_behavior, config, true),
             wft_slots.clone().into_sticky(),
             shutdown_token.child_token(),
@@ -314,7 +314,7 @@ mod tests {
         let client: Arc<dyn WorkerClient> = Arc::new(client);
         let stream = make_wft_poller(
             &cfg,
-            &Some("sticky-q".to_string()),
+            Some("sticky-q"),
             &client,
             &MetricsContext::no_op(),
             &CancellationToken::new(),

@@ -209,11 +209,7 @@ mod tests {
 
     #[test]
     fn max_polls_calculated_properly() {
-        let cfg = {
-            let mut cfg = test_worker_cfg().build().unwrap();
-            cfg.workflow_task_poller_behavior = Some(PollerBehavior::SimpleMaximum(5_usize));
-            cfg
-        };
+        let cfg = test_worker_cfg().build().unwrap();
         assert_eq!(
             sticky_poller_behavior(PollerBehavior::SimpleMaximum(5), &cfg, false),
             PollerBehavior::SimpleMaximum(1)
@@ -222,5 +218,15 @@ mod tests {
             sticky_poller_behavior(PollerBehavior::SimpleMaximum(5), &cfg, true),
             PollerBehavior::SimpleMaximum(4)
         );
+        let autoscaling = PollerBehavior::Autoscaling {
+            minimum: 1,
+            maximum: 10,
+            initial: 3,
+        };
+        assert_eq!(
+            sticky_poller_behavior(autoscaling, &cfg, false),
+            autoscaling
+        );
+        assert_eq!(sticky_poller_behavior(autoscaling, &cfg, true), autoscaling);
     }
 }
