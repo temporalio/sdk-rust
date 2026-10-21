@@ -384,7 +384,8 @@ async fn replace_client_works_after_polling_failure() {
 
     // Starting a second dev server for the worker to connect to initially. Later this server will be shut down
     // and the worker client replaced with a client connected to the main integration test server.
-    let initial_server_config = integ_dev_server_config(vec![], false);
+    let mut initial_server_config = integ_dev_server_config(vec![], false);
+    initial_server_config.startup_timeout = Duration::from_secs(30);
     let initial_server = Arc::new(Mutex::new(Some(
         initial_server_config
             .start_server_with_output(Stdio::null(), Stdio::null())

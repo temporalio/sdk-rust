@@ -340,6 +340,19 @@ message Principal {
     string name = 2;
 }
 
+// ResolvedPrincipal is a principal returned to an API caller.
+message ResolvedPrincipal {
+    // Low-cardinality category of the principal (e.g., "jwt", "users").
+    string type = 1;
+    // Identifier within that category (e.g., sub JWT claim, email address).
+    //
+    // (-- api-linter: core::0140::prepositions=disabled
+    //     aip.dev/not-precedent: Identifies the principal name snapshot used for this response. --)
+    // (-- api-linter: core::0142::time-field-type=disabled
+    //     aip.dev/not-precedent: This string is a principal name snapshot, not a timestamp. --)
+    string name_at_write_time = 2;
+}
+
 // Priority contains metadata that controls relative ordering of task processing
 // when tasks are backed up in a queue. Initially, Priority will be used in
 // matching (workflow and activity) task queues. Later it may be used in history

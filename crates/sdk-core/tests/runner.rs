@@ -8,11 +8,7 @@ use crate::common::integ_dev_server_config;
 use anyhow::{anyhow, bail};
 use clap::{Parser, Subcommand};
 use common::{INTEG_SERVER_TARGET_ENV_VAR, TEST_ENV_CONFIG_SERVER_ENV_VAR};
-use std::{
-    env,
-    path::{Path, PathBuf},
-    process::Stdio,
-};
+use std::{env, path::PathBuf, process::Stdio};
 use temporalio_sdk_core::ephemeral_server::{TestServerConfig, default_cached_download};
 use tokio::{self, process::Command};
 
@@ -238,9 +234,10 @@ fn strip_cargo_env_vars(build_cmd: &mut Command) {
 }
 
 fn project_root() -> PathBuf {
-    Path::new(&env!("CARGO_MANIFEST_DIR"))
-        .ancestors()
-        .nth(1)
-        .unwrap()
-        .to_path_buf()
+    // Shared build caches can reuse a runner compiled in another worktree. Cargo's runtime
+    // manifest directory identifies the checkout being tested, unlike the compiled-in path.
+    let manifest_dir = env::var_os("CARGO_MANIFEST_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")));
+    manifest_dir.parent().unwrap().to_path_buf()
 }

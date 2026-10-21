@@ -13,7 +13,7 @@ use std::{
 use temporalio_client::{Connection, ConnectionOptions, errors::ClientConnectError};
 use tokio::{
     task::spawn_blocking,
-    time::{Duration, sleep},
+    time::{Duration, sleep, timeout},
 };
 use tokio_util::io::{StreamReader, SyncIoBridge};
 use url::Url;
@@ -58,12 +58,13 @@ pub enum EphemeralServerError {
     },
     /// The server process did not become available before its startup deadline.
     #[error(
-        "ephemeral server at {target} did not start within {timeout:?}. Make sure another download isn't stuck and delete the temp file."
+        "ephemeral server at {target} did not start within {timeout:?}; last connection error: {}",
+        last_error.as_ref().map(ToString::to_string).unwrap_or_else(|| "no connection attempt completed before the deadline".to_owned())
     )]
     StartupTimeout {
         /// Server target that could not be reached.
         target: String,
-        /// Amount of time spent waiting.
+        /// Configured startup timeout.
         timeout: Duration,
         /// Last connection error, when one was observed.
         #[source]
@@ -142,6 +143,10 @@ pub struct TemporalDevServerConfig {
     /// Additional arguments to Temporal dev server.
     #[builder(default)]
     pub extra_args: Vec<String>,
+    /// Maximum time to wait for readiness after spawning the process, including connection attempts.
+    /// Defaults to five seconds. Does not include executable download time.
+    #[builder(default = Duration::from_secs(5))]
+    pub startup_timeout: Duration,
 }
 
 impl TemporalDevServerConfig {
@@ -215,6 +220,7 @@ impl TemporalDevServerConfig {
             has_test_service: false,
             output,
             err_output,
+            startup_timeout: self.startup_timeout,
         })
         .await
     }
@@ -230,6 +236,10 @@ pub struct TestServerConfig {
     /// Additional arguments to the test server.
     #[builder(default)]
     pub extra_args: Vec<String>,
+    /// Maximum time to wait for readiness after spawning the process, including connection attempts.
+    /// Defaults to five seconds. Does not include executable download time.
+    #[builder(default = Duration::from_secs(5))]
+    pub startup_timeout: Duration,
 }
 
 impl TestServerConfig {
@@ -269,6 +279,7 @@ impl TestServerConfig {
             has_test_service: true,
             output,
             err_output,
+            startup_timeout: self.startup_timeout,
         })
         .await
     }
@@ -281,6 +292,7 @@ struct EphemeralServerConfig {
     has_test_service: bool,
     output: Stdio,
     err_output: Stdio,
+    startup_timeout: Duration,
 }
 
 /// Server that will be stopped when dropped.
@@ -317,22 +329,27 @@ impl EphemeralServer {
         .client_version("0.1.0".to_owned())
         .build();
 
-        // Try to connect every 100ms for 5s
         // TODO(cretz): Some other way, e.g. via stdout, to know whether the
         // server is up?
         let mut last_error = None;
-        for _ in 0..50 {
-            sleep(Duration::from_millis(100)).await;
-            let connect_res = Connection::connect(connection_options.clone()).await;
-            if let Err(err) = connect_res {
-                last_error = Some(err);
-            } else {
-                return Ok(EphemeralServer {
-                    target,
-                    has_test_service: config.has_test_service,
-                    child,
-                });
+        // Bound connection attempts too: a server can accept TCP connections before gRPC is ready.
+        if timeout(config.startup_timeout, async {
+            loop {
+                match Connection::connect(connection_options.clone()).await {
+                    Ok(_) => break,
+                    Err(err) => last_error = Some(err),
+                }
+                sleep(Duration::from_millis(100)).await;
             }
+        })
+        .await
+        .is_ok()
+        {
+            return Ok(EphemeralServer {
+                target,
+                has_test_service: config.has_test_service,
+                child,
+            });
         }
         // Kill the process explicitly (rather than relying on kill_on_drop,
         // which does not wait for the kill to complete) so it cannot linger
@@ -340,7 +357,7 @@ impl EphemeralServer {
         let _ = child.kill().await;
         Err(EphemeralServerError::StartupTimeout {
             target,
-            timeout: Duration::from_secs(5),
+            timeout: config.startup_timeout,
             last_error,
         })
     }
@@ -815,21 +832,28 @@ fn remove_file_past_ttl(
 
 #[cfg(test)]
 mod tests {
-    #[cfg(unix)]
-    use super::{EphemeralServer, EphemeralServerConfig};
-    use super::{get_free_port, remove_file_past_ttl};
-    #[cfg(unix)]
-    use std::process::Stdio;
+    use super::{
+        EphemeralServer, EphemeralServerConfig, EphemeralServerError, get_free_port,
+        remove_file_past_ttl,
+    };
+    use bytes::Bytes;
+    use http_body_util::{Empty, Full};
+    use hyper::{Response, server::conn::http2, service::service_fn};
+    use hyper_util::rt::{TokioExecutor, TokioIo};
     use std::{
+        convert::Infallible,
         env::temp_dir,
         fs::File,
+        future::pending,
         net::{TcpListener, TcpStream},
+        process::Stdio,
+        sync::Arc,
         time::{Duration, SystemTime},
     };
+    use tokio::{net::TcpListener as TokioTcpListener, sync::Notify, time::timeout};
 
     #[cfg(unix)]
     #[tokio::test]
-    #[ignore = "takes ~5s: must exhaust EphemeralServer::start's connect-retry window"]
     async fn failed_start_kills_server_process() {
         let pid_file = temp_dir().join(format!("core-test-pid-{}", rand::random::<u64>()));
 
@@ -845,13 +869,23 @@ mod tests {
             has_test_service: false,
             output: Stdio::null(),
             err_output: Stdio::null(),
+            startup_timeout: Duration::from_millis(500),
         };
 
-        let result = EphemeralServer::start(config).await;
-        assert!(
-            result.is_err(),
-            "start against a non-listening exe must fail"
-        );
+        let started = std::time::Instant::now();
+        let error = timeout(Duration::from_secs(3), EphemeralServer::start(config))
+            .await
+            .expect("startup must respect the configured deadline")
+            .unwrap_err();
+        assert!(started.elapsed() >= Duration::from_millis(500));
+        assert!(matches!(
+            &error,
+            EphemeralServerError::StartupTimeout { timeout, last_error: Some(_), .. }
+                if *timeout == Duration::from_millis(500)
+        ));
+        let message = error.to_string();
+        assert!(message.contains("within 500ms; last connection error: Server connection error:"));
+        assert!(!message.contains("download"));
 
         let pid: u32 = std::fs::read_to_string(&pid_file)
             .unwrap()
@@ -870,6 +904,117 @@ mod tests {
             !alive,
             "ephemeral server process {pid} leaked after failed start"
         );
+    }
+
+    #[tokio::test]
+    async fn startup_timeout_bounds_get_system_info() {
+        let listener = TokioTcpListener::bind("127.0.0.1:0").await.unwrap();
+        let request_received = Arc::new(Notify::new());
+        let notify = request_received.clone();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            http2::Builder::new(TokioExecutor::new())
+                .serve_connection(
+                    TokioIo::new(stream),
+                    service_fn(move |_| {
+                        notify.notify_one();
+                        pending::<Result<Response<Empty<Bytes>>, Infallible>>()
+                    }),
+                )
+                .await
+                .ok();
+        });
+        let startup = EphemeralServer::start(EphemeralServerConfig {
+            exe_path: std::env::current_exe().unwrap(),
+            args: vec!["--list".to_owned()],
+            port,
+            has_test_service: false,
+            output: Stdio::null(),
+            err_output: Stdio::null(),
+            startup_timeout: Duration::from_secs(1),
+        });
+        tokio::pin!(startup);
+        tokio::select! {
+            result = &mut startup => panic!("startup finished before GetSystemInfo: {result:?}"),
+            _ = request_received.notified() => {},
+        }
+        let error = timeout(Duration::from_secs(3), startup)
+            .await
+            .expect("a stalled GetSystemInfo must not outlive the startup deadline")
+            .unwrap_err();
+        assert!(matches!(
+            &error,
+            EphemeralServerError::StartupTimeout { timeout, last_error: None, .. }
+                if *timeout == Duration::from_secs(1)
+        ));
+        assert!(
+            error
+                .to_string()
+                .contains("no connection attempt completed before the deadline")
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn respects_startup_timeout() {
+        let listener = TokioTcpListener::bind("127.0.0.1:0").await.unwrap();
+        let request_received = Arc::new(Notify::new());
+        let ready = Arc::new(Notify::new());
+        let notify = request_received.clone();
+        let release = ready.clone();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            http2::Builder::new(TokioExecutor::new())
+                .serve_connection(
+                    TokioIo::new(stream),
+                    service_fn(move |_| {
+                        let notify = notify.clone();
+                        let release = release.clone();
+                        async move {
+                            notify.notify_one();
+                            release.notified().await;
+                            Ok::<_, Infallible>(
+                                Response::builder()
+                                    .header("content-type", "application/grpc")
+                                    .header("grpc-status", "0")
+                                    .body(Full::new(Bytes::from_static(&[0, 0, 0, 0, 0])))
+                                    .unwrap(),
+                            )
+                        }
+                    }),
+                )
+                .await
+                .ok();
+        });
+        let started = tokio::time::Instant::now();
+        let startup = EphemeralServer::start(EphemeralServerConfig {
+            exe_path: std::env::current_exe().unwrap(),
+            args: vec!["--list".to_owned()],
+            port,
+            has_test_service: false,
+            output: Stdio::null(),
+            err_output: Stdio::null(),
+            startup_timeout: Duration::from_secs(10),
+        });
+        tokio::pin!(startup);
+        tokio::select! {
+            result = &mut startup => panic!("startup finished before GetSystemInfo: {result:?}"),
+            _ = request_received.notified() => {},
+        }
+        // Pause only while advancing so network I/O cannot auto-advance to the deadline.
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(6)).await;
+        tokio::time::resume();
+        ready.notify_one();
+        let mut ephemeral_server = timeout(Duration::from_secs(3), startup)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(started.elapsed() >= Duration::from_secs(6));
+        ephemeral_server.shutdown().await.unwrap();
+        server.abort();
     }
 
     #[test]

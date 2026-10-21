@@ -1,6 +1,6 @@
 use crate::{
     telemetry::VecDisplayer,
-    worker::workflow::{OutgoingJob, WFCommand, WFCommandVariant, WorkflowStartedInfo},
+    worker::workflow::{OutgoingJob, WFCommand, WorkflowStartedInfo},
 };
 use prost_types::Timestamp;
 use std::{
@@ -8,7 +8,7 @@ use std::{
     sync::mpsc::{self, Receiver, Sender},
 };
 use temporalio_common::protos::{
-    coresdk::workflow_activation::{WorkflowActivationJob, start_workflow_from_attribs},
+    coresdk::workflow_activation::start_workflow_from_attribs,
     temporal::api::{
         common::v1::{Payload, SearchAttributes},
         history::v1::WorkflowExecutionStartedEventAttributes,
@@ -76,11 +76,8 @@ impl DrivenWorkflow {
     }
 
     /// Drain all pending jobs, so that they may be sent to the driven workflow
-    pub(super) fn drain_jobs(&mut self) -> Vec<WorkflowActivationJob> {
-        self.outgoing_wf_activation_jobs
-            .drain(..)
-            .map(Into::into)
-            .collect()
+    pub(super) fn drain_jobs(&mut self) -> Vec<OutgoingJob> {
+        self.outgoing_wf_activation_jobs.drain(..).collect()
     }
 
     /// Obtain any output from the workflow's recent execution(s). Because the lang sdk is
@@ -88,9 +85,7 @@ impl DrivenWorkflow {
     /// [crate::Core::poll_task], we cannot directly iterate it here. Commands are simply pulled
     /// from a buffer that the language side sinks into when it calls [crate::Core::complete_task]
     pub(super) fn fetch_workflow_iteration_output(&mut self) -> Vec<WFCommand> {
-        let in_cmds = self.incoming_commands.try_recv();
-        let in_cmds =
-            in_cmds.unwrap_or_else(|_| vec![WFCommand::new(WFCommandVariant::NoCommandsFromLang)]);
+        let in_cmds = self.incoming_commands.try_recv().unwrap_or_default();
         debug!(in_cmds = %in_cmds.display(), "wf bridge iteration fetch");
         in_cmds
     }

@@ -4,30 +4,44 @@ world system {
   export notification-service;
 }
 
+/// @nexus.doc "Notification models for Nexus Handler Callbacks."
+/// @nexus.experimental
 interface notification-service {
   use nexus:temporal-types/model@1.0.0.{
     failure,
     placeholder,
   };
 
+  /// @nexus.doc "Type of the user-supplied data associated with the source invocation."
   /// @nexus.type-parameter
   type source-context-t = placeholder;
 
+  /// @nexus.doc "Type of the successful output of the source operation."
   /// @nexus.type-parameter
   type output-t = placeholder;
 
+  /// @nexus.doc "The successful output or failure of the source operation."
+  /// @nexus.experimental
   /// @nexus.proto "temporal.api.notificationservice.v1.OnCompleteRequest.result"
   variant on-complete-request-result {
+    /// @nexus.doc "The source operation completed successfully with this output."
     success(output-t),
+    /// @nexus.doc "The source operation failed, including timeout, cancellation, and application errors."
     failure(failure),
   }
 
+  /// @nexus.doc "A notification that reports that a source operation completed."
+  /// @nexus.experimental
   /// @nexus.proto "temporal.api.notificationservice.v1.OnCompleteRequest"
   record on-complete-request {
+    /// @nexus.doc "The successful output or failure of the source operation."
     %result: on-complete-request-result,
+    /// @nexus.doc "User-supplied data associated with the source invocation."
     source-context: source-context-t,
   }
 
+  /// @nexus.doc "An empty response that acknowledges a completion notification."
+  /// @nexus.experimental
   /// @nexus.proto "temporal.api.notificationservice.v1.OnCompleteResponse"
   record on-complete-response {
   }
