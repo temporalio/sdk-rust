@@ -100,7 +100,6 @@ where
             .times(0..)
             .returning(|| async { Ok(DescribeNamespaceResponse::default()) }.boxed());
 
-        let hist_allow_tx = historator.replay_done_tx.clone();
         let historator = Arc::new(TokioMutex::new(historator));
 
         // TODO: Should use `new_with_pollers` and avoid re-doing mocking stuff
@@ -137,7 +136,6 @@ where
         client
             .expect_fail_workflow_task()
             .returning(move |_, _, _| {
-                hist_allow_tx.send("Failed".to_string()).unwrap();
                 async move { Ok(RespondWorkflowTaskFailedResponse::default()) }.boxed()
             });
         let mut worker = Worker::new(self.config, None, Arc::new(client), None, None, None)?;

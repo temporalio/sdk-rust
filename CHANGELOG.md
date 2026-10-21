@@ -56,6 +56,8 @@ relevant information.
 
 
 ### Fixed
+* Batch workflow replay no longer reports a final nondeterministic history as successful when
+  shutdown races with delivery of its replay result.
 * Ephemeral server startup now enforces its elapsed-time deadline even when a connection stalls,
   and startup timeout messages include the last connection error when available.
 * Avoid scanning the workflow cache when no workflow tasks are waiting for a cache slot, reducing
