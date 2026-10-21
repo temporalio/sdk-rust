@@ -61,7 +61,9 @@ use temporalio_common::{
             workflow_activation::{
                 self, NotifyHasPatch, UpdateRandomSeed, WorkflowActivation, workflow_activation_job,
             },
-            workflow_commands::{ContinueAsNewWorkflowExecution, update_response},
+            workflow_commands::{
+                ContinueAsNewWorkflowExecution, ScheduleActivity, update_response,
+            },
         },
         temporal::api::{
             command::v1::{Command as ProtoCommand, command::Attributes as ProtoCmdAttrs},
@@ -70,6 +72,7 @@ use temporalio_common::{
             history::v1::{HistoryEvent, history_event},
             protocol::v1::{Message as ProtocolMessage, message::SequencingId},
             sdk::v1::WorkflowTaskCompletedMetadata,
+            session::v1::activity_session_options,
         },
     },
     worker::WorkerDeploymentVersion,
@@ -1412,7 +1415,8 @@ impl WorkflowMachines {
                         annotations
                     );
                 }
-                WFCommandVariant::AddActivity(attrs) => {
+                WFCommandVariant::AddActivity(mut attrs) => {
+                    prepare_session_activity(&mut attrs, &self.worker_config, self.replaying)?;
                     let seq = attrs.seq;
                     let use_compat = self.determine_use_compatible_flag(
                         attrs.versioning_intent(),
@@ -1892,6 +1896,114 @@ fn patch_marker_handling(
     } else {
         // Not a patch machine or a patch event
         Ok(EventHandlingOutcome::Normal)
+    }
+}
+
+fn prepare_session_activity(
+    attrs: &mut ScheduleActivity,
+    worker: &WorkerConfig,
+    replaying: bool,
+) -> Result<()> {
+    let Some(options) = &attrs.session_options else {
+        return Ok(());
+    };
+    if !matches!(
+        options.session,
+        Some(activity_session_options::Session::UseWorkflowSession(true))
+    ) {
+        return Err(fatal!(
+            "Activity '{}' (seq {}) has invalid session_options: use_workflow_session must be true",
+            attrs.activity_id,
+            attrs.seq
+        ));
+    }
+    if attrs.task_queue.is_empty() {
+        attrs.task_queue.clone_from(&worker.task_queue);
+    }
+    // Replay must not depend on this worker's activity execution capabilities.
+    if replaying {
+        return Ok(());
+    }
+    if worker.session_worker_options.is_none() {
+        return Err(fatal!(
+            "Activity '{}' (seq {}) requests a workflow session, but session_worker_options is not enabled",
+            attrs.activity_id,
+            attrs.seq
+        ));
+    }
+    if attrs.task_queue != worker.task_queue {
+        return Err(fatal!(
+            "Activity '{}' (seq {}) requests a workflow session on queue '{}', but must use '{}'",
+            attrs.activity_id,
+            attrs.seq,
+            attrs.task_queue,
+            worker.task_queue
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod session_tests {
+    use super::*;
+    use temporalio_common::protos::temporal::api::session::v1::ActivitySessionOptions;
+
+    #[rstest::rstest]
+    #[case(true, Some(true), "", false, true)]
+    #[case(true, Some(true), "other", false, false)]
+    #[case(false, Some(true), "", false, false)]
+    #[case(false, Some(false), "", false, false)]
+    #[case(false, None, "", false, false)]
+    #[case(false, Some(false), "", true, false)]
+    #[case(false, None, "", true, false)]
+    #[case(false, Some(true), "other", true, true)]
+    fn session_activity_validation(
+        #[case] enabled: bool,
+        #[case] use_session: Option<bool>,
+        #[case] queue: &str,
+        #[case] replaying: bool,
+        #[case] valid: bool,
+    ) {
+        let config = WorkerConfig::builder()
+            .namespace("default")
+            .task_queue("queue")
+            .versioning_strategy(crate::WorkerVersioningStrategy::None {
+                build_id: String::new(),
+            })
+            .task_types(temporalio_common::worker::WorkerTaskTypes::all())
+            .max_cached_workflows(2_usize)
+            .maybe_session_worker_options(enabled.then(crate::SessionWorkerOptions::default))
+            .build()
+            .unwrap();
+        let expected_queue = config.task_queue.clone();
+        let mut attrs = ScheduleActivity {
+            seq: 1,
+            activity_id: "activity".to_owned(),
+            task_queue: queue.to_owned(),
+            session_options: Some(ActivitySessionOptions {
+                session: use_session.map(activity_session_options::Session::UseWorkflowSession),
+            }),
+            ..Default::default()
+        };
+        let result = prepare_session_activity(&mut attrs, &config, replaying);
+        assert_eq!(result.is_ok(), valid, "{result:?}");
+        if valid {
+            assert_eq!(
+                attrs.task_queue,
+                if use_session == Some(true) && queue.is_empty() {
+                    expected_queue.as_str()
+                } else {
+                    queue
+                }
+            );
+        } else {
+            assert!(
+                result
+                    .unwrap_err()
+                    .to_string()
+                    .contains("Activity 'activity' (seq 1)")
+            );
+        }
     }
 }
 

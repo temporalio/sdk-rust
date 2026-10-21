@@ -647,6 +647,7 @@ pub(crate) struct NumPollersMetric {
     pub wft_current_pollers: HeartbeatMetric,
     pub sticky_wft_current_pollers: HeartbeatMetric,
     pub activity_current_pollers: HeartbeatMetric,
+    pub sticky_activity_current_pollers: HeartbeatMetric,
     pub nexus_current_pollers: HeartbeatMetric,
 }
 
@@ -659,6 +660,10 @@ impl NumPollersMetric {
                 self.sticky_wft_current_pollers.clone(),
             ),
             ("activity_task", self.activity_current_pollers.clone()),
+            (
+                "sticky_activity_task",
+                self.sticky_activity_current_pollers.clone(),
+            ),
             ("nexus_task", self.nexus_current_pollers.clone()),
         ])
     }
@@ -759,6 +764,9 @@ pub(crate) fn workflow_sticky_poller() -> MetricKeyValue {
 }
 pub(crate) fn activity_poller() -> MetricKeyValue {
     MetricKeyValue::new(KEY_POLLER_TYPE, "activity_task")
+}
+pub(crate) fn activity_sticky_poller() -> MetricKeyValue {
+    MetricKeyValue::new(KEY_POLLER_TYPE, "sticky_activity_task")
 }
 pub(crate) fn nexus_poller() -> MetricKeyValue {
     MetricKeyValue::new(KEY_POLLER_TYPE, "nexus_task")
