@@ -1,0 +1,1 @@
+A query or other workflow task that arrives while a workflow waits on a local activity no longer causes the current workflow task to be lost and time out, which could leave the workflow stuck on a nondeterminism error.
