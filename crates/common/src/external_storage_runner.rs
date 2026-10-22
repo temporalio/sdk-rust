@@ -95,9 +95,6 @@ pub(crate) fn reject_references(payloads: &[Payload]) -> Result<(), ExternalStor
 }
 
 /// Replace every reference with the payload the driver returns for it.
-///
-/// Each retrieved payload is left exactly as the driver returned it: the form `store` was given,
-/// so it flows through the rest of the inbound path like any inline payload.
 async fn retrieve_payloads(
     payloads: &mut [Payload],
     storage: &ExternalStorage,
