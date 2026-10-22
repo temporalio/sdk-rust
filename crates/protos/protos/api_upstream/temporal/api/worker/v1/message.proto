@@ -22,6 +22,10 @@ message WorkerPollerInfo {
 
   // Set true if the number of concurrent pollers is auto-scaled
   bool is_autoscaling = 3;
+
+  // Number of concurrent poll requests this poller pool is currently targeting, which may
+  // differ from current_pollers. 0 if unknown, such as a poller pool of fixed size.
+  int32 poller_target = 4;
 }
 
 message WorkerSlotsInfo {

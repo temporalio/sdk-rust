@@ -314,9 +314,8 @@ message PollWorkflowTaskQueueRequest {
     // Worker deployment options that user has set in the worker.
     temporal.api.deployment.v1.WorkerDeploymentOptions deployment_options = 6;
 
-    // Worker-reported poller pool state, used for fair distribution of poller scaling
-    // suggestions across a fleet. Optional; when absent the server applies no share-based
-    // fairness to this worker.
+    // Worker-reported poller pool state, used to spread poller scaling suggestions across
+    // a fleet. Optional.
     temporal.api.taskqueue.v1.PollerScalingInfo poller_scaling_info = 11;
 
     // Removed in 1.55.0; was temporal.api.worker.v1.WorkerHeartbeat worker_heartbeat
@@ -549,9 +548,8 @@ message PollActivityTaskQueueRequest {
     // Worker deployment options that user has set in the worker.
     temporal.api.deployment.v1.WorkerDeploymentOptions deployment_options = 6;
 
-    // Worker-reported poller pool state, used for fair distribution of poller scaling
-    // suggestions across a fleet. Optional; when absent the server applies no share-based
-    // fairness to this worker.
+    // Worker-reported poller pool state, used to spread poller scaling suggestions across
+    // a fleet. Optional.
     temporal.api.taskqueue.v1.PollerScalingInfo poller_scaling_info = 11;
 
     // Removed in 1.55.0; was temporal.api.worker.v1.WorkerHeartbeat worker_heartbeat
