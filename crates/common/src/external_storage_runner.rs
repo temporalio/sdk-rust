@@ -3,7 +3,8 @@
 //! Outbound, a payload at or above the configured size threshold is handed to a storage driver and
 //! replaced by a reference to what the driver stored. Inbound, references are swapped back for the
 //! payloads they point at. [`ExternalStorageRunner`] runs either direction over a whole message,
-//! visiting every payload-bearing field except search attributes.
+//! visiting every payload-bearing field except search attributes, which the server has to be able
+//! to read.
 //!
 //! References are stored and read in plain form, so a reference's claim data (its driver name and
 //! claim keys) is written to history unencrypted. The payload codec is not applied to references,
