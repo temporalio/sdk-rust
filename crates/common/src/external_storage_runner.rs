@@ -263,8 +263,7 @@ impl AsyncPayloadVisitor for RetrievePayloadsVisitor<'_> {
 /// proto size.
 type DriverGroup = (Arc<dyn StorageDriver>, Vec<(usize, Payload, i64)>);
 
-/// Replace every eligible payload with a reference, marking each one it creates when writing is
-/// enabled so [`encode_references`] can find them without re-examining encodings.
+/// Replace every eligible payload with a reference.
 async fn store_payloads(
     payloads: &mut [Payload],
     storage: &ExternalStorage,
