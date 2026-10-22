@@ -704,6 +704,9 @@ impl Future for WorkflowFuture {
                     activation_result,
                     &mut commands,
                 ) {
+                    // Rejected updates leave nothing in history, so workflow code they let run
+                    // (e.g. a condition on a value refreshed every activation) could not run on
+                    // replay.
                     Ok(update_accepted) => should_poll_routines |= update_accepted,
                     Err(e) => {
                         self.fail_wft(run_id.clone(), e, None);
@@ -711,8 +714,6 @@ impl Future for WorkflowFuture {
                     }
                 }
 
-                // Rejected updates leave nothing in history, so workflow code they let run (e.g. a
-                // condition on a value refreshed every activation) could not run on replay.
                 if !should_poll_routines {
                     commands.extend(self.host.take_commands());
                     self.send_completion(run_id, commands);
