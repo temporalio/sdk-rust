@@ -724,6 +724,7 @@ mod tests {
         ));
     }
 
+    #[tokio::test]
     async fn a_store_driver_returning_the_wrong_number_of_claims_is_an_error() {
         let driver: Arc<dyn StorageDriver> = Arc::new(MiscountingDriver { name: "mem" });
         let storage = ExternalStorage::with_selector(
