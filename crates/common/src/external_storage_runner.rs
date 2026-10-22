@@ -38,15 +38,15 @@ use crate::{
 /// uniform message, such as a client request, is a single call.
 pub(crate) struct ExternalStorageRunner<'a> {
     storage: &'a ExternalStorage,
-    store_limiter: &'a Arc<dyn StorageDriverLimiter<Payload>>,
-    retrieve_limiter: &'a Arc<dyn StorageDriverLimiter<StorageDriverClaim>>,
+    store_limiter: Arc<dyn StorageDriverLimiter<Payload>>,
+    retrieve_limiter: Arc<dyn StorageDriverLimiter<StorageDriverClaim>>,
 }
 
 impl<'a> ExternalStorageRunner<'a> {
     pub(crate) fn new(
         storage: &'a ExternalStorage,
-        store_limiter: &'a Arc<dyn StorageDriverLimiter<Payload>>,
-        retrieve_limiter: &'a Arc<dyn StorageDriverLimiter<StorageDriverClaim>>,
+        store_limiter: Arc<dyn StorageDriverLimiter<Payload>>,
+        retrieve_limiter: Arc<dyn StorageDriverLimiter<StorageDriverClaim>>,
     ) -> Self {
         Self {
             storage,
@@ -64,7 +64,7 @@ impl<'a> ExternalStorageRunner<'a> {
         let mut store = StorePayloadsVisitor {
             storage: self.storage,
             target,
-            limiter: self.store_limiter,
+            limiter: &self.store_limiter,
             error: None,
         };
         let walked = message.visit_payloads_mut(&mut store).await;
@@ -78,7 +78,7 @@ impl<'a> ExternalStorageRunner<'a> {
     ) -> Result<(), ExternalStorageError> {
         let mut retrieve = RetrievePayloadsVisitor {
             storage: self.storage,
-            limiter: self.retrieve_limiter,
+            limiter: &self.retrieve_limiter,
             error: None,
         };
         let walked = message.visit_payloads_mut(&mut retrieve).await;
@@ -913,9 +913,7 @@ mod tests {
         )
         .unwrap()
         .with_payload_size_threshold(1);
-        let store_lim = store_limiter();
-        let retrieve_lim = limiter();
-        let runner = ExternalStorageRunner::new(&storage, &store_lim, &retrieve_lim);
+        let runner = ExternalStorageRunner::new(&storage, store_limiter(), limiter());
         let mut request = request_with_large_payloads();
         let before = request.clone();
 
@@ -934,9 +932,7 @@ mod tests {
     async fn the_runner_reports_a_driver_it_does_not_know() {
         let batches = Arc::new(Mutex::new(vec![]));
         let storage = storage("mem", Arc::clone(&batches));
-        let store_lim = store_limiter();
-        let retrieve_lim = limiter();
-        let runner = ExternalStorageRunner::new(&storage, &store_lim, &retrieve_lim);
+        let runner = ExternalStorageRunner::new(&storage, store_limiter(), limiter());
         // A reference to the registered driver sits beside the unknown one.
         let mut request = SignalWithStartWorkflowExecutionRequest {
             input: Some(Payloads {
@@ -1007,9 +1003,7 @@ mod tests {
         stored: Arc<Mutex<Vec<Payload>>>,
     ) {
         let storage = storage_with_threshold(1, stored);
-        let store_lim = store_limiter();
-        let retrieve_lim = limiter();
-        let runner = ExternalStorageRunner::new(&storage, &store_lim, &retrieve_lim);
+        let runner = ExternalStorageRunner::new(&storage, store_limiter(), limiter());
         runner.store_in(request, None).await.unwrap();
     }
 
@@ -1040,9 +1034,7 @@ mod tests {
     async fn every_other_payload_bearing_field_is_retrieved() {
         let batches = Arc::new(Mutex::new(vec![]));
         let storage = storage("mem", Arc::clone(&batches));
-        let store_lim = store_limiter();
-        let retrieve_lim = limiter();
-        let runner = ExternalStorageRunner::new(&storage, &store_lim, &retrieve_lim);
+        let runner = ExternalStorageRunner::new(&storage, store_limiter(), limiter());
         let mut request = request_with_references();
         let search_attributes = request.search_attributes.clone();
 
