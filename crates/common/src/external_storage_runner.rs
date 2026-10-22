@@ -56,6 +56,8 @@ impl<'a> ExternalStorageRunner<'a> {
     }
 
     /// Replace every eligible payload in a message with a reference.
+    ///
+    /// On error the message is left partly processed and must not be used.
     pub(crate) async fn store_in<M: PayloadVisitable + Send>(
         &self,
         message: &mut M,
@@ -72,6 +74,8 @@ impl<'a> ExternalStorageRunner<'a> {
     }
 
     /// Replace every reference in a message with the payload it points at.
+    ///
+    /// On error the message is left partly processed and must not be used.
     pub(crate) async fn retrieve_in<M: PayloadVisitable + Send>(
         &self,
         message: &mut M,
