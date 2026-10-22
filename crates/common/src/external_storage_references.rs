@@ -22,11 +22,14 @@ const REFERENCE_ENCODING: &str = "json/protobuf";
 // `reference_message_type_matches_the_proto` instead of silently changing what we put on the wire.
 const REFERENCE_MESSAGE_TYPE: &str = "temporal.api.sdk.v1.ExternalStorageReference";
 
-/// Whether the given payload is an external storage reference and so has to be retrieved. Reads
-/// metadata only, so one that needs no retrieval is not touched.
+/// Whether the given payload is a plain external storage reference and so has to be retrieved.
+/// Reads metadata only, so one that needs no retrieval is not touched.
 ///
-/// Both halves are required: `json/protobuf` on its own is an ordinary encoding for any protobuf
-/// payload.
+/// Plain means the reference exactly as [`create_reference_payload`] built it, before any payload
+/// codec has run over it. A codec rewrites the metadata, so an encoded reference is not recognized
+/// here and has to be decoded first.
+///
+/// Both the `encoding` and the `messageType` metadata must match.
 pub(crate) fn is_plain_reference(payload: &Payload) -> bool {
     payload.metadata.get("encoding").map(Vec::as_slice) == Some(REFERENCE_ENCODING.as_bytes())
         && payload.metadata.get("messageType").map(Vec::as_slice)
