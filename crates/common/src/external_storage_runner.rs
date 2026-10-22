@@ -90,15 +90,6 @@ impl<'a> ExternalStorageRunner<'a> {
     }
 }
 
-/// Fail if any payload needs retrieval. For a caller with no external storage configured, which
-/// must not hand a reference to application code as though it were the application's own data.
-pub(crate) fn reject_references(payloads: &[Payload]) -> Result<(), ExternalStorageError> {
-    if payloads.iter().any(is_plain_reference) {
-        return Err(ExternalStorageError::NotConfigured);
-    }
-    Ok(())
-}
-
 /// Replace every reference with the payload the driver returns for it.
 async fn retrieve_payloads(
     payloads: &mut [Payload],
@@ -1057,14 +1048,5 @@ mod tests {
         let mut sizes = batches.lock().unwrap().clone();
         sizes.sort_unstable();
         assert_eq!(sizes, vec![1, 1, 1, 2]);
-    }
-
-    #[test]
-    fn rejecting_references_without_storage_is_tmprl1105() {
-        assert!(reject_references(&[inline("fine")]).is_ok());
-
-        let err = reject_references(&[reference("mem", "a")]).unwrap_err();
-        assert!(matches!(err, ExternalStorageError::NotConfigured));
-        assert!(err.to_string().contains("TMPRL1105"));
     }
 }
