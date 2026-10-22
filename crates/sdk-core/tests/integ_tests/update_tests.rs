@@ -6,6 +6,7 @@ use anyhow::anyhow;
 use assert_matches::assert_matches;
 use futures_util::{StreamExt, future, future::join_all, stream};
 use std::{
+    cell::Cell,
     sync::{
         LazyLock,
         atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -15,7 +16,8 @@ use std::{
 use temporalio_client::{
     Client, NamespacedClient, UntypedSignal, UntypedUpdate, UntypedWorkflow,
     WorkflowExecuteUpdateOptions, WorkflowExecutionInfo, WorkflowIdConflictPolicy,
-    WorkflowSignalOptions, WorkflowStartOptions, WorkflowUpdateWithStartOptions,
+    WorkflowQueryOptions, WorkflowSignalOptions, WorkflowStartOptions,
+    WorkflowUpdateWithStartOptions,
     errors::{WorkflowStartError, WorkflowUpdateError, WorkflowUpdateWithStartError},
     grpc::WorkflowService,
 };
@@ -1043,6 +1045,115 @@ async fn update_rejection_sdk() {
     };
     join!(update, run);
     handle.fetch_history_and_replay(&mut worker).await.unwrap();
+}
+
+#[tokio::test]
+async fn rejected_update_does_not_evaluate_conditions_sdk() {
+    let wf_name = "rejected_update_does_not_evaluate_conditions_sdk";
+    let mut starter = CoreWfStarter::new(wf_name);
+    #[workflow]
+    #[derive(Default)]
+    struct ConditionEvaluationWf {
+        condition_evaluations: Cell<u32>,
+        done: bool,
+    }
+
+    #[workflow_methods]
+    impl ConditionEvaluationWf {
+        #[run]
+        async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<()> {
+            ctx.wait_condition(|s| {
+                s.condition_evaluations
+                    .set(s.condition_evaluations.get() + 1);
+                s.done
+            })
+            .await?;
+            Ok(())
+        }
+
+        #[query]
+        fn condition_evaluations(&self, _ctx: &WorkflowContextView) -> u32 {
+            self.condition_evaluations.get()
+        }
+
+        #[update_validator(finish)]
+        fn validate_finish(
+            &self,
+            _ctx: &WorkflowContextView,
+            accept: &bool,
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            if *accept {
+                Ok(())
+            } else {
+                Err("rejected".into())
+            }
+        }
+
+        #[update]
+        fn finish(&mut self, _ctx: &mut SyncWorkflowContext<Self>, _accept: bool) {
+            self.done = true;
+        }
+    }
+
+    starter
+        .sdk_config
+        .register_workflow::<ConditionEvaluationWf>()
+        .unwrap();
+    let mut worker = starter.worker().await;
+    let task_queue = starter.get_task_queue().to_owned();
+    let handle = worker
+        .submit_workflow(
+            ConditionEvaluationWf::run,
+            (),
+            WorkflowStartOptions::new(task_queue, starter.get_wf_id().to_owned()).build(),
+        )
+        .await
+        .unwrap();
+    let client_ops = async {
+        let evaluations = handle
+            .query(
+                ConditionEvaluationWf::condition_evaluations,
+                (),
+                WorkflowQueryOptions::default(),
+            )
+            .await
+            .unwrap();
+
+        // Neither the rejected update nor the queries can change state, so none of their
+        // activations may evaluate the condition
+        handle
+            .execute_update(
+                ConditionEvaluationWf::finish,
+                false,
+                WorkflowExecuteUpdateOptions::default(),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(
+            handle
+                .query(
+                    ConditionEvaluationWf::condition_evaluations,
+                    (),
+                    WorkflowQueryOptions::default(),
+                )
+                .await
+                .unwrap(),
+            evaluations
+        );
+
+        handle
+            .execute_update(
+                ConditionEvaluationWf::finish,
+                true,
+                WorkflowExecuteUpdateOptions::default(),
+            )
+            .await
+            .unwrap();
+    };
+    let run = async {
+        worker.run_until_done().await.unwrap();
+    };
+    join!(client_ops, run);
 }
 
 #[tokio::test]
