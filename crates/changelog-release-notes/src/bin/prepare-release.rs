@@ -4,6 +4,9 @@ use std::{
     process::Command,
 };
 
+use changelog_release_notes::{
+    ReleaseOptions, assemble_release, collect_fragments, prepare_release,
+};
 use chrono::{NaiveDate, Utc};
 use semver::Version;
 
@@ -28,7 +31,7 @@ fn cargo_set_version(root: &Path, args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-fn turn_over_changelog(
+fn turn_over_core_changelog(
     changelog: &str,
     version: &Version,
     date: NaiveDate,
@@ -100,11 +103,19 @@ fn main() -> Result<(), String> {
     let changelog_path = root.join("CHANGELOG.md");
     let changelog = fs::read_to_string(&changelog_path)
         .map_err(|err| format!("failed to read {}: {err}", changelog_path.display()))?;
-    let changelog = turn_over_changelog(&changelog, &target_sdk, release_date)?;
+    let fragments_path = Path::new("changelog");
+    let fragments = collect_fragments(&root, fragments_path).map_err(|err| err.to_string())?;
+    let sdk_version = target_sdk.to_string();
+    let options = ReleaseOptions {
+        version: &sdk_version,
+        date: release_date,
+    };
+    assemble_release(&changelog, &fragments, &options).map_err(|err| err.to_string())?;
     let core_changelog_path = root.join("crates/sdk-core/CHANGELOG.md");
     let core_changelog = fs::read_to_string(&core_changelog_path)
         .map_err(|err| format!("failed to read {}: {err}", core_changelog_path.display()))?;
-    let core_changelog = turn_over_changelog(&core_changelog, &target_core_protos, release_date)?;
+    let core_changelog =
+        turn_over_core_changelog(&core_changelog, &target_core_protos, release_date)?;
 
     let sdk_update = vec![
         "set-version".into(),
@@ -144,8 +155,8 @@ fn main() -> Result<(), String> {
     cargo_set_version(&root, &sdk_update)?;
     cargo_set_version(&root, &core_update)?;
     cargo_set_version(&root, &protos_update)?;
-    fs::write(&changelog_path, changelog)
-        .map_err(|err| format!("failed to write {}: {err}", changelog_path.display()))?;
+    prepare_release(&root, Path::new("CHANGELOG.md"), fragments_path, &options)
+        .map_err(|err| err.to_string())?;
     fs::write(&core_changelog_path, core_changelog)
         .map_err(|err| format!("failed to write {}: {err}", core_changelog_path.display()))?;
 
@@ -174,7 +185,7 @@ mod tests {
     fn turns_over_a_populated_changelog() {
         let input = "# Changelog\n\n## Unreleased\n\n### Added\n* Feature.\n\n## [0.7.0] - 2026-01-01\n\nOld.\n";
         assert_eq!(
-            turn_over_changelog(
+            turn_over_core_changelog(
                 input,
                 &version("1.0.0"),
                 NaiveDate::from_ymd_opt(2026, 8, 27).unwrap()
@@ -188,7 +199,7 @@ mod tests {
     fn turns_over_an_empty_changelog() {
         let input = "# Changelog\n\n## Unreleased\n\n## [0.7.0] - 2026-01-01\n";
         assert_eq!(
-            turn_over_changelog(
+            turn_over_core_changelog(
                 input,
                 &version("1.0.0-rc.1"),
                 NaiveDate::from_ymd_opt(2026, 8, 27).unwrap()
@@ -202,7 +213,7 @@ mod tests {
     fn rejects_a_duplicate_changelog_release() {
         let input = "# Changelog\n\n## Unreleased\n\n## [1.0.0] - 2026-01-01\n";
         assert!(
-            turn_over_changelog(
+            turn_over_core_changelog(
                 input,
                 &version("1.0.0"),
                 NaiveDate::from_ymd_opt(2026, 8, 27).unwrap()
