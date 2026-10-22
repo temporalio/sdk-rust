@@ -13,7 +13,7 @@
 // Crate-private until a worker or client calls it.
 #![allow(dead_code)]
 
-use futures::future;
+use futures::stream::{FuturesUnordered, TryStreamExt};
 use std::{collections::HashMap, sync::Arc};
 
 use prost::Message;
@@ -122,13 +122,13 @@ async fn retrieve_payloads(
         work.push((driver_name, driver, group));
     }
 
-    let retrieved_groups =
-        future::try_join_all(work.into_iter().map(|(driver_name, driver, group)| {
-            let limiter = Arc::clone(limiter);
+    let mut pending: FuturesUnordered<_> = work
+        .into_iter()
+        .map(|(driver_name, driver, group)| {
+            let context = StorageDriverRetrieveContext::builder()
+                .limiter(Arc::clone(limiter))
+                .build();
             async move {
-                let context = StorageDriverRetrieveContext::builder()
-                    .limiter(limiter)
-                    .build();
                 let claims: Vec<_> = group.iter().map(|(_, claim)| claim.clone()).collect();
                 let retrieved = driver.retrieve(&context, claims).await?;
                 if retrieved.len() != group.len() {
@@ -138,19 +138,13 @@ async fn retrieve_payloads(
                         returned: retrieved.len(),
                     });
                 }
-                Ok::<_, ExternalStorageError>(
-                    group
-                        .into_iter()
-                        .map(|(index, _)| index)
-                        .zip(retrieved)
-                        .collect::<Vec<_>>(),
-                )
+                Ok(group.into_iter().map(|(index, _)| index).zip(retrieved))
             }
-        }))
-        .await?;
+        })
+        .collect();
 
-    for group in retrieved_groups {
-        for (index, payload) in group {
+    while let Some(retrieved) = pending.try_next().await? {
+        for (index, payload) in retrieved {
             payloads[index] = payload;
         }
     }
@@ -303,15 +297,14 @@ async fn store_payloads(
             .push((index, payload.clone(), size as i64));
     }
 
-    let stored =
-        future::try_join_all(by_driver.into_iter().map(|(driver_name, (driver, group))| {
-            let limiter = Arc::clone(limiter);
-            let target = target.cloned();
+    let mut pending: FuturesUnordered<_> = by_driver
+        .into_iter()
+        .map(|(driver_name, (driver, group))| {
+            let context = StorageDriverStoreContext::builder()
+                .maybe_target(target.cloned())
+                .limiter(Arc::clone(limiter))
+                .build();
             async move {
-                let context = StorageDriverStoreContext::builder()
-                    .maybe_target(target)
-                    .limiter(limiter)
-                    .build();
                 let to_store: Vec<_> = group
                     .iter()
                     .map(|(_, payload, _)| payload.clone())
@@ -331,11 +324,11 @@ async fn store_payloads(
                 }
                 Ok::<_, ExternalStorageError>(replaced)
             }
-        }))
-        .await?;
+        })
+        .collect();
 
-    for group in stored {
-        for (index, reference) in group {
+    while let Some(replaced) = pending.try_next().await? {
+        for (index, reference) in replaced {
             payloads[index] = reference;
         }
     }
