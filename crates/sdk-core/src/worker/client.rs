@@ -456,6 +456,8 @@ pub struct PollWorkflowOptions {
 pub struct PollActivityOptions {
     /// Optional rate limit (tasks per second) for activity polling
     pub max_tasks_per_sec: Option<f64>,
+    /// Poll this sticky destination instead of the normal activity queue.
+    pub sticky_queue_name: Option<String>,
 }
 /// Additional options specific to Nexus task polling
 #[derive(Debug, Clone, Default)]
@@ -465,6 +467,21 @@ pub struct PollNexusOptions {
     pub worker_commands_queue: bool,
 }
 
+fn poll_task_queue(normal_name: String, sticky_name: Option<String>) -> TaskQueue {
+    match sticky_name {
+        Some(name) => TaskQueue {
+            name,
+            kind: TaskQueueKind::Sticky.into(),
+            normal_name,
+        },
+        None => TaskQueue {
+            name: normal_name,
+            kind: TaskQueueKind::Normal.into(),
+            normal_name: String::new(),
+        },
+    }
+}
+
 #[async_trait::async_trait]
 impl WorkerClient for WorkerClientBag {
     async fn poll_workflow_task(
@@ -472,19 +489,7 @@ impl WorkerClient for WorkerClientBag {
         poll_options: PollOptions,
         wf_options: PollWorkflowOptions,
     ) -> Result<PollWorkflowTaskQueueResponse> {
-        let task_queue = if let Some(sticky) = wf_options.sticky_queue_name {
-            TaskQueue {
-                name: sticky,
-                kind: TaskQueueKind::Sticky.into(),
-                normal_name: poll_options.task_queue,
-            }
-        } else {
-            TaskQueue {
-                name: poll_options.task_queue,
-                kind: TaskQueueKind::Normal.into(),
-                normal_name: "".to_string(),
-            }
-        };
+        let task_queue = poll_task_queue(poll_options.task_queue, wf_options.sticky_queue_name);
         #[allow(deprecated)] // want to list all fields explicitly
         let mut request = PollWorkflowTaskQueueRequest {
             namespace: self.namespace.clone(),
@@ -496,6 +501,8 @@ impl WorkerClient for WorkerClientBag {
             worker_instance_key: self.worker_instance_key.to_string(),
             worker_control_task_queue: self.worker_control_task_queue(),
             poller_group_id: Default::default(),
+            // Activity routing does not opt this worker into the deferred isolation policy.
+            session_options: None,
         }
         .into_request();
         request.extensions_mut().insert(IsWorkerTaskLongPoll);
@@ -522,11 +529,10 @@ impl WorkerClient for WorkerClientBag {
         #[allow(deprecated)] // want to list all fields explicitly
         let mut request = PollActivityTaskQueueRequest {
             namespace: self.namespace.clone(),
-            task_queue: Some(TaskQueue {
-                name: poll_options.task_queue,
-                kind: TaskQueueKind::Normal as i32,
-                normal_name: "".to_string(),
-            }),
+            task_queue: Some(poll_task_queue(
+                poll_options.task_queue,
+                act_options.sticky_queue_name,
+            )),
             identity: self.identity(),
             task_queue_metadata: act_options.max_tasks_per_sec.map(|tps| TaskQueueMetadata {
                 max_tasks_per_second: Some(tps),
@@ -536,6 +542,8 @@ impl WorkerClient for WorkerClientBag {
             worker_instance_key: self.worker_instance_key.to_string(),
             worker_control_task_queue: self.worker_control_task_queue(),
             poller_group_id: Default::default(),
+            // Activity routing does not opt this worker into the deferred isolation policy.
+            session_options: None,
         }
         .into_request();
         request.extensions_mut().insert(IsWorkerTaskLongPoll);

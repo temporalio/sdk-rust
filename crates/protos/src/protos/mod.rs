@@ -1910,6 +1910,7 @@ pub mod temporal {
                                 request_eager_execution: !s.do_not_eagerly_execute,
                                 use_workflow_build_id,
                                 priority: s.priority,
+                                session_options: s.session_options,
                             },
                         )
                     }
@@ -2612,6 +2613,11 @@ pub mod temporal {
         pub mod sdk {
             pub mod v1 {
                 include_proto_with_serde!("temporal.api.sdk.v1");
+            }
+        }
+        pub mod session {
+            pub mod v1 {
+                tonic::include_proto!("temporal.api.session.v1");
             }
         }
         pub mod taskqueue {

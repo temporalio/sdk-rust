@@ -75,6 +75,8 @@ where
     }
 
     pub(crate) fn into_core_worker(mut self) -> Result<Worker, anyhow::Error> {
+        // Offline replay consumes supplied history and does not execute activities.
+        self.config.session_worker_options = None;
         self.config.max_cached_workflows = 1;
         self.config.workflow_task_poller_behavior = Some(PollerBehavior::SimpleMaximum(1));
         self.config.task_types = WorkerTaskTypes::workflow_only();
@@ -150,8 +152,66 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_help::test_worker_cfg;
+    use crate::test_help::{WorkerExt, test_worker_cfg};
     use futures_util::{FutureExt, stream};
+    use temporalio_common::protos::{
+        coresdk::{
+            workflow_activation::workflow_activation_job,
+            workflow_commands::{CompleteWorkflowExecution, ScheduleActivity},
+            workflow_completion::WorkflowActivationCompletion,
+        },
+        temporal::api::session::v1::{ActivitySessionOptions, activity_session_options},
+    };
+
+    #[tokio::test]
+    async fn replay_session_activity_without_session_worker() {
+        let mut history = canned_histories::single_activity("activity");
+        history.add_workflow_task_completed();
+        history.add_workflow_execution_completed();
+        let mut client = mock_manual_worker_client();
+        client.expect_fail_workflow_task().times(0);
+        let mut input = ReplayWorkerInput::new(
+            test_worker_cfg().build().unwrap(),
+            stream::iter([history.into()]),
+        );
+        input.client_override = Some(client);
+        let worker = input.into_core_worker().unwrap();
+        let start = worker.poll_workflow_activation().await.unwrap();
+        assert!(start.is_replaying);
+        worker
+            .complete_workflow_activation(WorkflowActivationCompletion::from_cmds(
+                start.run_id,
+                vec![
+                    ScheduleActivity {
+                        seq: 1,
+                        activity_id: "activity".to_owned(),
+                        activity_type: DEFAULT_ACTIVITY_TYPE.to_owned(),
+                        session_options: Some(ActivitySessionOptions {
+                            session: Some(activity_session_options::Session::UseWorkflowSession(
+                                true,
+                            )),
+                        }),
+                        ..Default::default()
+                    }
+                    .into(),
+                ],
+            ))
+            .await
+            .unwrap();
+        let resolved = worker.poll_workflow_activation().await.unwrap();
+        assert!(matches!(
+            resolved.jobs[0].variant,
+            Some(workflow_activation_job::Variant::ResolveActivity(_))
+        ));
+        worker
+            .complete_workflow_activation(WorkflowActivationCompletion::from_cmds(
+                resolved.run_id,
+                vec![CompleteWorkflowExecution::default().into()],
+            ))
+            .await
+            .unwrap();
+        worker.drain_pollers_and_shutdown().await;
+    }
 
     #[tokio::test]
     async fn client_override_describe_namespace_precedes_fallback() {

@@ -20,6 +20,7 @@ import "temporal/api/common/v1/message.proto";
 import "temporal/api/deployment/v1/message.proto";
 import "temporal/api/failure/v1/message.proto";
 import "temporal/api/nexus/v1/message.proto";
+import "temporal/api/session/v1/message.proto";
 import "temporal/api/taskqueue/v1/message.proto";
 import "temporal/api/update/v1/message.proto";
 import "temporal/api/workflow/v1/message.proto";
@@ -465,6 +466,9 @@ message ActivityTaskScheduledEventAttributes {
     // Priority metadata. If this message is not present, or any fields are not
     // present, they inherit the values from the workflow.
     temporal.api.common.v1.Priority priority = 14;
+    // Preserves the scheduling command's session routing options so activity state
+    // can be reconstructed from history.
+    temporal.api.session.v1.ActivitySessionOptions session_options = 15;
 }
 
 message ActivityTaskStartedEventAttributes {
