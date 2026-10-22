@@ -10,7 +10,11 @@
 
 use crate::protos::temporal::api::common::v1::Payload;
 use futures::future::BoxFuture;
-use std::{collections::HashMap, fmt, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    fmt,
+    sync::Arc,
+};
 
 const DEFAULT_PAYLOAD_SIZE_THRESHOLD: usize = 256 * 1024;
 
@@ -306,7 +310,6 @@ pub enum ExternalStorageError {
 #[derive(Clone)]
 pub struct ExternalStorage {
     drivers: Vec<Arc<dyn StorageDriver>>,
-    drivers_by_name: HashMap<String, Arc<dyn StorageDriver>>,
     driver_selector: Arc<dyn StorageDriverSelector>,
     payload_size_threshold: usize,
     concurrency: ExternalStorageConcurrency,
@@ -345,7 +348,7 @@ impl ExternalStorage {
                 "at least one driver is required".to_owned(),
             ));
         }
-        let mut drivers_by_name = HashMap::with_capacity(drivers.len());
+        let mut names = HashSet::with_capacity(drivers.len());
         for driver in &drivers {
             let name = driver.name();
             // The name is the routing key written into history, so a driver without one can never
@@ -355,10 +358,7 @@ impl ExternalStorage {
                     "driver name cannot be empty".to_owned(),
                 ));
             }
-            if drivers_by_name
-                .insert(name.to_owned(), Arc::clone(driver))
-                .is_some()
-            {
+            if !names.insert(name) {
                 return Err(ExternalStorageError::InvalidConfiguration(format!(
                     "multiple drivers given with name '{name}'"
                 )));
@@ -366,7 +366,6 @@ impl ExternalStorage {
         }
         Ok(Self {
             drivers,
-            drivers_by_name,
             driver_selector,
             payload_size_threshold: DEFAULT_PAYLOAD_SIZE_THRESHOLD,
             concurrency: ExternalStorageConcurrency::default(),
@@ -411,7 +410,7 @@ impl ExternalStorage {
 
     /// The driver registered under the given name, if any.
     pub fn driver(&self, name: &str) -> Option<&Arc<dyn StorageDriver>> {
-        self.drivers_by_name.get(name)
+        self.drivers.iter().find(|d| d.name() == name)
     }
 }
 
