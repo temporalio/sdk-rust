@@ -1059,14 +1059,14 @@ async fn rejected_update_does_not_evaluate_conditions_sdk() {
     #[workflow_methods]
     impl ConditionEvaluationWf {
         #[run]
-        async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<()> {
+        async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<u32> {
             ctx.wait_condition(|s| {
                 s.condition_evaluations
                     .set(s.condition_evaluations.get() + 1);
                 s.done
             })
             .await?;
-            Ok(())
+            Ok(ctx.state(|s| s.condition_evaluations.get()))
         }
 
         #[query]
@@ -1114,14 +1114,17 @@ async fn rejected_update_does_not_evaluate_conditions_sdk() {
                 )
                 .await
                 .unwrap();
-            let evaluations = handle
-                .query(
-                    ConditionEvaluationWf::condition_evaluations,
-                    (),
-                    WorkflowQueryOptions::default(),
-                )
-                .await
-                .unwrap();
+            assert_eq!(
+                handle
+                    .query(
+                        ConditionEvaluationWf::condition_evaluations,
+                        (),
+                        WorkflowQueryOptions::default(),
+                    )
+                    .await
+                    .unwrap(),
+                1
+            );
 
             // Neither the rejected update nor the queries can change state, so none of their
             // activations may evaluate the condition
@@ -1142,7 +1145,7 @@ async fn rejected_update_does_not_evaluate_conditions_sdk() {
                     )
                     .await
                     .unwrap(),
-                evaluations
+                1
             );
 
             handle
@@ -1153,7 +1156,7 @@ async fn rejected_update_does_not_evaluate_conditions_sdk() {
                 )
                 .await
                 .unwrap();
-            handle.get_result(Default::default()).await.unwrap();
+            assert_eq!(handle.get_result(Default::default()).await.unwrap(), 2);
         })
         .await
         .unwrap();
