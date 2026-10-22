@@ -102,8 +102,11 @@ pub(crate) struct LongPollBuffer<T, SK: SlotKind> {
     did_start: AtomicBool,
 }
 
+#[derive(Default)]
 pub(crate) struct WorkflowTaskOptions {
     pub(crate) wft_poller_shared: Option<Arc<StickyPollerShared>>,
+    pub(crate) session_options:
+        Option<temporalio_common::protos::temporal::api::session::v1::WorkerSessionOptions>,
 }
 
 #[derive(Default)]
@@ -113,6 +116,8 @@ pub(crate) struct ActivityTaskOptions {
     /// Server ratelimit
     pub(crate) max_tps: Option<f64>,
     pub(crate) poller_shared: Option<Arc<StickyPollerShared>>,
+    pub(crate) session_options:
+        Option<temporalio_common::protos::temporal::api::session::v1::WorkerSessionOptions>,
 }
 
 impl LongPollBuffer<PollWorkflowTaskQueueResponse, WorkflowSlotKind> {
@@ -174,6 +179,7 @@ impl LongPollBuffer<PollWorkflowTaskQueueResponse, WorkflowSlotKind> {
             let client = client.clone();
             let task_queue = task_queue.clone();
             let sticky_queue_name = sticky_queue.clone();
+            let session_options = options.session_options.clone();
             async move {
                 client
                     .poll_workflow_task(
@@ -182,7 +188,10 @@ impl LongPollBuffer<PollWorkflowTaskQueueResponse, WorkflowSlotKind> {
                             no_retry,
                             timeout_override,
                         },
-                        PollWorkflowOptions { sticky_queue_name },
+                        PollWorkflowOptions {
+                            sticky_queue_name,
+                            session_options,
+                        },
                     )
                     .await
             }
@@ -255,6 +264,7 @@ impl LongPollBuffer<PollActivityTaskQueueResponse, ActivitySlotKind> {
             let client = client.clone();
             let task_queue = task_queue.clone();
             let sticky_queue_name = sticky_queue.clone();
+            let session_options = options.session_options.clone();
             async move {
                 client
                     .poll_activity_task(
@@ -266,6 +276,7 @@ impl LongPollBuffer<PollActivityTaskQueueResponse, ActivitySlotKind> {
                         PollActivityOptions {
                             max_tasks_per_sec: options.max_tps,
                             sticky_queue_name,
+                            session_options,
                         },
                     )
                     .await
@@ -915,6 +926,7 @@ mod tests {
             None::<fn(usize)>,
             WorkflowTaskOptions {
                 wft_poller_shared: Some(Arc::new(StickyPollerShared::new(Some(10)))),
+                ..Default::default()
             },
             Arc::new(AtomicCell::new(None)),
             Arc::new(NamespaceCapabilities::default()),
@@ -972,6 +984,7 @@ mod tests {
             None::<fn(usize)>,
             WorkflowTaskOptions {
                 wft_poller_shared: Some(Arc::new(StickyPollerShared::new(Some(1)))),
+                ..Default::default()
             },
             Arc::new(AtomicCell::new(None)),
             Arc::new(NamespaceCapabilities::default()),
@@ -1049,6 +1062,7 @@ mod tests {
             None::<fn(usize)>,
             WorkflowTaskOptions {
                 wft_poller_shared: Some(Arc::new(StickyPollerShared::new(Some(10)))),
+                ..Default::default()
             },
             Arc::new(AtomicCell::new(None)),
             Arc::new(NamespaceCapabilities::default()),
@@ -1158,6 +1172,7 @@ mod tests {
             None::<fn(usize)>,
             WorkflowTaskOptions {
                 wft_poller_shared: Some(Arc::new(StickyPollerShared::new(Some(INITIAL_POLLERS)))),
+                ..Default::default()
             },
             Arc::new(AtomicCell::new(None)),
             Arc::new(NamespaceCapabilities::default()),
@@ -1239,6 +1254,7 @@ mod tests {
             }),
             WorkflowTaskOptions {
                 wft_poller_shared: None,
+                ..Default::default()
             },
             Arc::new(AtomicCell::new(None)),
             Arc::new(NamespaceCapabilities::resolved(Capabilities {
@@ -1317,6 +1333,7 @@ mod tests {
             None::<fn(usize)>,
             WorkflowTaskOptions {
                 wft_poller_shared: None,
+                ..Default::default()
             },
             Arc::new(AtomicCell::new(None)),
             Arc::new(NamespaceCapabilities::resolved(Capabilities {
