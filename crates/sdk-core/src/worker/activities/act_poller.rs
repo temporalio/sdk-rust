@@ -28,39 +28,48 @@ pub(crate) fn make_activity_poller(
         config.activity_task_poller_behavior,
         &capabilities,
     );
-    let poller_shared =
-        sticky_queue.map(|_| Arc::new(StickyPollerShared::new(act_slots.available_permits())));
+    let single_session = config.is_single_session();
+    let poller_shared = sticky_queue
+        .filter(|_| !single_session)
+        .map(|_| Arc::new(StickyPollerShared::new(act_slots.available_permits())));
     let rate_limiter = config
         .max_worker_activities_per_second
         .map(|rate| Arc::new(PollRateLimiter::new(rate)));
     let act_metrics = metrics.with_new_attrs([activity_poller()]);
-    let normal_poller = LongPollBuffer::new_activity_task(
-        client.clone(),
-        config.task_queue.clone(),
-        None,
-        if sticky_queue.is_some() {
-            sticky_poller_behavior(effective_behavior, config, false)
-        } else {
-            effective_behavior
-        },
-        act_slots.clone(),
-        shutdown_token.child_token(),
-        Some(move |np| act_metrics.record_num_pollers(np)),
-        ActivityTaskOptions {
-            rate_limiter: rate_limiter.clone(),
-            max_tps: config.max_task_queue_activities_per_second,
-            poller_shared: poller_shared.clone(),
-        },
-        last_successful_poll_time.clone(),
-        capabilities.clone(),
-    );
+    let normal_poller = (!single_session).then(|| {
+        LongPollBuffer::new_activity_task(
+            client.clone(),
+            config.task_queue.clone(),
+            None,
+            if sticky_queue.is_some() {
+                sticky_poller_behavior(effective_behavior, config, false)
+            } else {
+                effective_behavior
+            },
+            act_slots.clone(),
+            shutdown_token.child_token(),
+            Some(move |np| act_metrics.record_num_pollers(np)),
+            ActivityTaskOptions {
+                rate_limiter: rate_limiter.clone(),
+                max_tps: config.max_task_queue_activities_per_second,
+                poller_shared: poller_shared.clone(),
+                ..Default::default()
+            },
+            last_successful_poll_time.clone(),
+            capabilities.clone(),
+        )
+    });
     let sticky_poller = sticky_queue.map(|sqn| {
         let sticky_metrics = metrics.with_new_attrs([activity_sticky_poller()]);
         LongPollBuffer::new_activity_task(
             client.clone(),
             config.task_queue.clone(),
             Some(sqn.to_owned()),
-            sticky_poller_behavior(effective_behavior, config, true),
+            if single_session {
+                effective_behavior
+            } else {
+                sticky_poller_behavior(effective_behavior, config, true)
+            },
             act_slots.clone().into_sticky(),
             shutdown_token.child_token(),
             Some(move |np| sticky_metrics.record_num_pollers(np)),
@@ -68,6 +77,7 @@ pub(crate) fn make_activity_poller(
                 rate_limiter,
                 max_tps: config.max_task_queue_activities_per_second,
                 poller_shared,
+                session_options: config.poll_session_options(Some(sqn)),
             },
             last_successful_poll_time,
             capabilities,
@@ -117,7 +127,7 @@ mod tests {
             .workflow_task_poller_behavior(PollerBehavior::SimpleMaximum(2))
             .activity_task_poller_behavior(PollerBehavior::SimpleMaximum(10))
             .max_worker_activities_per_second(2.0)
-            .session_worker_options(crate::SessionWorkerOptions::default())
+            .session_worker_options(crate::WorkerSessionOptions::default())
             .build()
             .unwrap();
         let slots = fixed_size_permit_dealer(2);

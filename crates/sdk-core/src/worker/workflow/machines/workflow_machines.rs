@@ -1927,7 +1927,7 @@ mod session_tests {
             })
             .task_types(temporalio_common::worker::WorkerTaskTypes::all())
             .max_cached_workflows(2_usize)
-            .maybe_session_worker_options(enabled.then(crate::SessionWorkerOptions::default))
+            .maybe_session_worker_options(enabled.then(crate::WorkerSessionOptions::default))
             .build()
             .unwrap();
         let expected_queue = config.task_queue.clone();

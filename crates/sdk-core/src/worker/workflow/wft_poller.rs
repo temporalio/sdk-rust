@@ -41,7 +41,8 @@ pub(crate) fn make_wft_poller(
         config.workflow_task_poller_behavior,
         &capabilities,
     );
-    let wft_poller_shared = if sticky_queue_name.is_some() {
+    let single_session = config.is_single_session();
+    let wft_poller_shared = if sticky_queue_name.is_some() && !single_session {
         // Balance on the limit `acquire_owned` actually enforces (min of slot supplier and cache
         // size). Using only the slot supplier lets a small cache starve the non-sticky poller.
         let balance_limit = [wft_slots.available_permits(), wft_slots.max_permits()]
@@ -52,35 +53,45 @@ pub(crate) fn make_wft_poller(
     } else {
         None
     };
-    let wf_task_poll_buffer = LongPollBuffer::new_workflow_task(
-        client.clone(),
-        config.task_queue.clone(),
-        None,
-        sticky_poller_behavior(effective_behavior, config, false),
-        wft_slots.clone(),
-        shutdown_token.child_token(),
-        Some(move |np| {
-            wft_metrics.record_num_pollers(np);
-        }),
-        WorkflowTaskOptions {
-            wft_poller_shared: wft_poller_shared.clone(),
-        },
-        last_successful_poll_time,
-        capabilities.clone(),
-    );
+    let wf_task_poll_buffer = (!single_session).then(|| {
+        LongPollBuffer::new_workflow_task(
+            client.clone(),
+            config.task_queue.clone(),
+            None,
+            sticky_poller_behavior(effective_behavior, config, false),
+            wft_slots.clone(),
+            shutdown_token.child_token(),
+            Some(move |np| {
+                wft_metrics.record_num_pollers(np);
+            }),
+            WorkflowTaskOptions {
+                wft_poller_shared: wft_poller_shared.clone(),
+                ..Default::default()
+            },
+            last_successful_poll_time,
+            capabilities.clone(),
+        )
+    });
     let sticky_queue_poller = sticky_queue_name.map(|sqn| {
         let sticky_metrics = metrics.with_new_attrs([workflow_sticky_poller()]);
         LongPollBuffer::new_workflow_task(
             client.clone(),
             config.task_queue.clone(),
             Some(sqn.to_owned()),
-            sticky_poller_behavior(effective_behavior, config, true),
+            if single_session {
+                effective_behavior
+            } else {
+                sticky_poller_behavior(effective_behavior, config, true)
+            },
             wft_slots.clone().into_sticky(),
             shutdown_token.child_token(),
             Some(move |np| {
                 sticky_metrics.record_num_pollers(np);
             }),
-            WorkflowTaskOptions { wft_poller_shared },
+            WorkflowTaskOptions {
+                wft_poller_shared,
+                session_options: config.poll_session_options(Some(sqn)),
+            },
             sticky_last_successful_poll_time,
             capabilities,
         )
