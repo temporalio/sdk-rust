@@ -101,16 +101,15 @@ async fn retrieve_payloads(
     storage: &ExternalStorage,
     limiter: &Arc<dyn StorageDriverLimiter<StorageDriverClaim>>,
 ) -> Result<(), ExternalStorageError> {
-    let mut by_driver: HashMap<String, Vec<(usize, StorageDriverClaim)>> = HashMap::new();
+    let mut by_driver: HashMap<String, (Vec<usize>, Vec<StorageDriverClaim>)> = HashMap::new();
     for (index, payload) in payloads.iter().enumerate() {
         if !is_plain_reference(payload) {
             continue;
         }
         let reference = parse_reference(payload)?;
-        by_driver
-            .entry(reference.driver_name)
-            .or_default()
-            .push((index, StorageDriverClaim::new(reference.claim_data)));
+        let (indices, claims) = by_driver.entry(reference.driver_name).or_default();
+        indices.push(index);
+        claims.push(StorageDriverClaim::new(reference.claim_data));
     }
 
     // Resolve every driver first, so an unregistered name fails before any request is made.
@@ -124,21 +123,20 @@ async fn retrieve_payloads(
 
     let mut pending: FuturesUnordered<_> = work
         .into_iter()
-        .map(|(driver_name, driver, group)| {
+        .map(|(driver_name, driver, (indices, claims))| {
             let context = StorageDriverRetrieveContext::builder()
                 .limiter(Arc::clone(limiter))
                 .build();
             async move {
-                let claims: Vec<_> = group.iter().map(|(_, claim)| claim.clone()).collect();
                 let retrieved = driver.retrieve(&context, claims).await?;
-                if retrieved.len() != group.len() {
+                if retrieved.len() != indices.len() {
                     return Err(ExternalStorageError::DriverContract {
                         driver: driver_name,
-                        requested: group.len(),
+                        requested: indices.len(),
                         returned: retrieved.len(),
                     });
                 }
-                Ok(group.into_iter().map(|(index, _)| index).zip(retrieved))
+                Ok(indices.into_iter().zip(retrieved))
             }
         })
         .collect();
@@ -254,9 +252,8 @@ impl AsyncPayloadVisitor for RetrievePayloadsVisitor<'_> {
     }
 }
 
-/// One driver and the payloads it takes: each payload's index, the payload, and its pre-offload
-/// proto size.
-type DriverGroup = (Arc<dyn StorageDriver>, Vec<(usize, Payload, i64)>);
+/// One driver and the payloads it takes: each payload's index and its pre-offload proto size.
+type DriverGroup = (Arc<dyn StorageDriver>, Vec<(usize, i64)>);
 
 /// Replace every eligible payload with a reference.
 async fn store_payloads(
@@ -294,21 +291,23 @@ async fn store_payloads(
             .entry(driver.name().to_owned())
             .or_insert_with(|| (Arc::clone(&driver), Vec::new()))
             .1
-            .push((index, payload.clone(), size as i64));
+            .push((index, size as i64));
     }
 
     let mut pending: FuturesUnordered<_> = by_driver
         .into_iter()
         .map(|(driver_name, (driver, group))| {
+            // Moved out rather than cloned because payloads can be large. Selection is complete by
+            // now, so a selection error never leaves an emptied slot behind.
+            let to_store: Vec<_> = group
+                .iter()
+                .map(|&(index, _)| std::mem::take(&mut payloads[index]))
+                .collect();
             let context = StorageDriverStoreContext::builder()
                 .maybe_target(target.cloned())
                 .limiter(Arc::clone(limiter))
                 .build();
             async move {
-                let to_store: Vec<_> = group
-                    .iter()
-                    .map(|(_, payload, _)| payload.clone())
-                    .collect();
                 let claims = driver.store(&context, to_store).await?;
                 if claims.len() != group.len() {
                     return Err(ExternalStorageError::DriverContract {
@@ -318,7 +317,7 @@ async fn store_payloads(
                     });
                 }
                 let mut replaced = Vec::with_capacity(group.len());
-                for ((index, _, size), claim) in group.into_iter().zip(claims) {
+                for ((index, size), claim) in group.into_iter().zip(claims) {
                     let reference = create_reference_payload(&driver_name, claim.claim_data, size)?;
                     replaced.push((index, reference));
                 }
