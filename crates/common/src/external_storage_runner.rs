@@ -288,7 +288,10 @@ async fn store_payloads(
             continue;
         };
         // Checked by identity, so a driver built to look like a registered one is rejected.
-        if !storage.drivers().iter().any(|d| Arc::ptr_eq(d, &driver)) {
+        if !storage
+            .driver(driver.name())
+            .is_some_and(|registered| Arc::ptr_eq(registered, &driver))
+        {
             return Err(ExternalStorageError::UnregisteredSelection(
                 driver.name().to_owned(),
             ));
