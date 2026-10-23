@@ -30,7 +30,7 @@ use temporalio_common::{
         WorkflowSerializationContext,
     },
     error::IncomingError,
-    payload_visitor::decode_payloads,
+    payload_visitor::{decode_payloads, retrieve_external_payloads, store_external_payloads},
     protos::{
         coresdk::FromPayloadsExt,
         proto_ts_to_system_time,
@@ -806,8 +806,9 @@ where
                                 .unwrap_or_else(|| Uuid::new_v4().to_string()),
                             header: options.header,
                             ..Default::default()
-                        }
-                        .into_request();
+                        };
+                        store_external_payloads(&mut request, &data_converter).await?;
+                        let mut request = request.into_request();
                         options.rpc_options.apply_to(&mut request);
                         WorkflowService::signal_workflow_execution(&mut client, request)
                             .await
@@ -879,14 +880,16 @@ where
                                 .reject_condition
                                 .map(|condition| ProtoQueryRejectCondition::from(condition) as i32)
                                 .unwrap_or(ProtoQueryRejectCondition::None as i32),
-                        }
-                        .into_request();
+                        };
+                        store_external_payloads(&mut request, &data_converter).await?;
+                        let mut request = request.into_request();
                         options.rpc_options.apply_to(&mut request);
-                        let response = client
+                        let mut response = client
                             .query_workflow(request)
                             .await
                             .map_err(WorkflowQueryError::from_status)?
                             .into_inner();
+                        retrieve_external_payloads(&mut response, &data_converter).await?;
                         Ok(QueryWorkflowOutput::new(response))
                     })
                 }
@@ -989,7 +992,7 @@ where
                             let update_id = options
                                 .update_id
                                 .unwrap_or_else(|| Uuid::new_v4().to_string());
-                            let request = build_update_workflow_request(
+                            let mut request = build_update_workflow_request(
                                 client.namespace(),
                                 client.identity(),
                                 workflow_id.clone(),
@@ -999,7 +1002,8 @@ where
                                 options.header,
                                 payloads,
                             );
-                            let response = loop {
+                            store_external_payloads(&mut request, &data_converter).await?;
+                            let mut response = loop {
                                 let mut rpc_request = request.clone().into_request();
                                 options.rpc_options.apply_to(&mut rpc_request);
                                 let response = WorkflowService::update_workflow_execution(
@@ -1015,6 +1019,8 @@ where
                                     break response;
                                 }
                             };
+                            retrieve_external_payloads(&mut response, client.data_converter())
+                                .await?;
                             let run_id = response
                                 .update_ref
                                 .as_ref()
@@ -1156,8 +1162,9 @@ where
                             identity: client.identity(),
                             first_execution_run_id: input.first_execution_run_id,
                             links: vec![],
-                        }
-                        .into_request();
+                        };
+                        store_external_payloads(&mut request, client.data_converter()).await?;
+                        let mut request = request.into_request();
                         input.options.rpc_options.apply_to(&mut request);
                         WorkflowService::terminate_workflow_execution(&mut client, request)
                             .await
@@ -1201,11 +1208,13 @@ where
                             }
                             .into_request();
                             input.options.rpc_options.apply_to(&mut request);
-                            let response =
+                            let mut response =
                                 WorkflowService::describe_workflow_execution(&mut client, request)
                                     .await
                                     .map_err(WorkflowInteractionError::from_status)?
                                     .into_inner();
+                            retrieve_external_payloads(&mut response, client.data_converter())
+                                .await?;
                             Ok(DescribeWorkflowOutput::new(response))
                         })
                     }
@@ -1294,7 +1303,7 @@ where
                                         }
                                         .into_request();
                                         input.options.rpc_options.apply_to(&mut request);
-                                        let response =
+                                        let mut response =
                                             WorkflowService::get_workflow_execution_history(
                                                 &mut rpc_client,
                                                 request,
@@ -1302,6 +1311,11 @@ where
                                             .await
                                             .map_err(WorkflowInteractionError::from_status)?
                                             .into_inner();
+                                        retrieve_external_payloads(
+                                            &mut response,
+                                            rpc_client.data_converter(),
+                                        )
+                                        .await?;
                                         Ok(FetchWorkflowHistoryPageOutput::new(
                                             response
                                                 .history
@@ -1433,13 +1447,15 @@ where
                             }
                             .into_request();
                             input.rpc_options.apply_to(&mut request);
-                            let response = WorkflowService::poll_workflow_execution_update(
+                            let mut response = WorkflowService::poll_workflow_execution_update(
                                 &mut client,
                                 request,
                             )
                             .await
                             .map_err(WorkflowUpdateError::from_status)?
                             .into_inner();
+                            retrieve_external_payloads(&mut response, client.data_converter())
+                                .await?;
                             if let Some(outcome) = response.outcome {
                                 return Ok(PollWorkflowUpdateOutput::new(outcome));
                             }

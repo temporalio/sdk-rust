@@ -17,7 +17,7 @@ features = ["experimental"]
 
 [features]
 default = ["envconfig", "tls-ring"]
-experimental = []
+experimental = ["temporalio-common/experimental"]
 tls-ring = ["tonic/tls-ring"]
 tls-aws-lc = ["tonic/tls-aws-lc"]
 telemetry = ["dep:opentelemetry"]

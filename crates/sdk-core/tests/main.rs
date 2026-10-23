@@ -25,6 +25,7 @@ mod integ_tests {
     mod client_tests;
     mod data_converter_tests;
     mod ephemeral_server_tests;
+    mod external_storage_tests;
     mod heartbeat_tests;
     mod metrics_tests;
     mod pagination_tests;

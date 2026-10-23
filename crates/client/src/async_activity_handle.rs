@@ -12,7 +12,7 @@ use temporalio_common::{
         TemporalSerializable,
     },
     error::{ApplicationFailure, OutgoingActivityError, OutgoingError},
-    payload_visitor::encode_payloads,
+    payload_visitor::{encode_payloads, store_external_payloads},
     protos::{
         TaskToken,
         temporal::api::{
@@ -174,8 +174,9 @@ impl<CT: WorkflowService + NamespacedClient + Clone> AsyncActivityHandle<CT> {
                                 identity: client.identity(),
                                 namespace: client.namespace(),
                                 ..Default::default()
-                            }
-                            .into_request();
+                            };
+                            store_external_payloads(&mut request, client.data_converter()).await?;
+                            let mut request = request.into_request();
                             rpc_options.apply_to(&mut request);
                             WorkflowService::respond_activity_task_completed(
                                 &mut client,
@@ -193,8 +194,9 @@ impl<CT: WorkflowService + NamespacedClient + Clone> AsyncActivityHandle<CT> {
                                 result,
                                 identity: client.identity(),
                                 resource_id: Default::default(),
-                            }
-                            .into_request();
+                            };
+                            store_external_payloads(&mut request, client.data_converter()).await?;
+                            let mut request = request.into_request();
                             rpc_options.apply_to(&mut request);
                             WorkflowService::respond_activity_task_completed_by_id(
                                 &mut client,
@@ -262,8 +264,9 @@ impl<CT: WorkflowService + NamespacedClient + Clone> AsyncActivityHandle<CT> {
                                 namespace: client.namespace(),
                                 last_heartbeat_details,
                                 ..Default::default()
-                            }
-                            .into_request();
+                            };
+                            store_external_payloads(&mut request, client.data_converter()).await?;
+                            let mut request = request.into_request();
                             rpc_options.apply_to(&mut request);
                             WorkflowService::respond_activity_task_failed(
                                 &mut client,
@@ -283,8 +286,9 @@ impl<CT: WorkflowService + NamespacedClient + Clone> AsyncActivityHandle<CT> {
                                 last_heartbeat_details,
                                 resource_id: Default::default(),
                                 ..Default::default()
-                            }
-                            .into_request();
+                            };
+                            store_external_payloads(&mut request, client.data_converter()).await?;
+                            let mut request = request.into_request();
                             rpc_options.apply_to(&mut request);
                             WorkflowService::respond_activity_task_failed_by_id(
                                 &mut client,
@@ -333,8 +337,9 @@ impl<CT: WorkflowService + NamespacedClient + Clone> AsyncActivityHandle<CT> {
                                 identity: client.identity(),
                                 namespace: client.namespace(),
                                 ..Default::default()
-                            }
-                            .into_request();
+                            };
+                            store_external_payloads(&mut request, client.data_converter()).await?;
+                            let mut request = request.into_request();
                             rpc_options.apply_to(&mut request);
                             WorkflowService::respond_activity_task_canceled(
                                 &mut client,
@@ -352,8 +357,9 @@ impl<CT: WorkflowService + NamespacedClient + Clone> AsyncActivityHandle<CT> {
                                 details,
                                 identity: client.identity(),
                                 ..Default::default()
-                            }
-                            .into_request();
+                            };
+                            store_external_payloads(&mut request, client.data_converter()).await?;
+                            let mut request = request.into_request();
                             rpc_options.apply_to(&mut request);
                             WorkflowService::respond_activity_task_canceled_by_id(
                                 &mut client,
@@ -401,8 +407,9 @@ impl<CT: WorkflowService + NamespacedClient + Clone> AsyncActivityHandle<CT> {
                                 identity: client.identity(),
                                 namespace: client.namespace(),
                                 resource_id: Default::default(),
-                            }
-                            .into_request();
+                            };
+                            store_external_payloads(&mut request, client.data_converter()).await?;
+                            let mut request = request.into_request();
                             rpc_options.apply_to(&mut request);
                             let response = WorkflowService::record_activity_task_heartbeat(
                                 &mut client,
@@ -422,8 +429,9 @@ impl<CT: WorkflowService + NamespacedClient + Clone> AsyncActivityHandle<CT> {
                                 details,
                                 identity: client.identity(),
                                 resource_id: Default::default(),
-                            }
-                            .into_request();
+                            };
+                            store_external_payloads(&mut request, client.data_converter()).await?;
+                            let mut request = request.into_request();
                             rpc_options.apply_to(&mut request);
                             let response =
                                 WorkflowService::record_activity_task_heartbeat_by_id(

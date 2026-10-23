@@ -5,8 +5,7 @@
 //! [`DataConverter`](crate::data_converters::DataConverter) the configuration hangs off, which is
 //! the only reason they are defined in this crate: drivers are implemented and invoked outside of
 //! WASM, by the worker and client, never from workflow code. The reference wire format lives in
-//! `temporalio-common`, alongside the payload visitor and the proto JSON support it needs. Nothing
-//! here is wired into the SDK yet.
+//! `temporalio-common`, alongside the payload visitor and the proto JSON support it needs.
 
 use crate::protos::temporal::api::common::v1::Payload;
 use futures::future::BoxFuture;
@@ -111,22 +110,29 @@ pub trait StorageDriverLimiter<Item>: Send + Sync {
     fn acquire<'a>(
         &'a self,
         item: &'a Item,
-    ) -> BoxFuture<'a, Result<StorageDriverPermit, ExternalStorageError>>;
+    ) -> BoxFuture<'a, Result<StorageDriverPermit, StorageDriverError>>;
 }
 
 const DEFAULT_MAX_DRIVER_OPERATIONS: usize = 64;
 const DEFAULT_MAX_OPERATIONS_PER_MESSAGE: usize = 8;
 
-fn check_limit(value: usize, name: &str) -> Result<(), ExternalStorageError> {
+fn check_limit(value: usize, name: &str) -> Result<(), ExternalStorageConfigError> {
     if value == 0 {
-        return Err(ExternalStorageError::InvalidConfiguration(format!(
+        return Err(ExternalStorageConfigError(format!(
             "{name} must be at least 1"
         )));
     }
     Ok(())
 }
 
+/// The external storage configuration is not usable.
+#[derive(Debug, thiserror::Error)]
+#[error("Invalid external storage configuration: {0}")]
+pub struct ExternalStorageConfigError(String);
+
 /// Limits on how many external storage requests may be in flight at once.
+// Hidden, and its builder kept crate-private, until the SDK enforces these limits.
+#[doc(hidden)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct ExternalStorageConcurrency {
@@ -153,11 +159,13 @@ impl Default for ExternalStorageConcurrency {
 #[bon::bon]
 impl ExternalStorageConcurrency {
     /// Create concurrency limits. Each must be at least 1, and each defaults when omitted.
-    #[builder(state_mod(vis = "pub"))]
-    pub fn new(
+    // Unused outside tests until the limits are enforced and the builder is published again.
+    #[allow(dead_code)]
+    #[builder]
+    pub(crate) fn new(
         #[builder(default = DEFAULT_MAX_DRIVER_OPERATIONS)] max_driver_operations: usize,
         #[builder(default = DEFAULT_MAX_OPERATIONS_PER_MESSAGE)] max_operations_per_message: usize,
-    ) -> Result<Self, ExternalStorageError> {
+    ) -> Result<Self, ExternalStorageConfigError> {
         check_limit(max_driver_operations, "max_driver_operations")?;
         check_limit(max_operations_per_message, "max_operations_per_message")?;
         Ok(Self {
@@ -172,7 +180,8 @@ impl ExternalStorageConcurrency {
 #[builder(state_mod(vis = "pub"))]
 #[non_exhaustive]
 pub struct StorageDriverStoreContext {
-    /// The execution the payloads are being stored on behalf of, when there is one.
+    /// The execution the payloads are being stored on behalf of, when there is one. The SDK does
+    /// not set this yet, so for now it is always `None`.
     pub target: Option<StorageDriverTargetInfo>,
     /// Limiter for this driver's store requests.
     pub limiter: Arc<dyn StorageDriverLimiter<Payload>>,
@@ -191,7 +200,8 @@ impl fmt::Debug for StorageDriverStoreContext {
 #[builder(state_mod(vis = "pub"))]
 #[non_exhaustive]
 pub struct StorageDriverSelectContext {
-    /// The execution the payload is being stored on behalf of, when there is one.
+    /// The execution the payload is being stored on behalf of, when there is one. The SDK does not
+    /// set this yet, so for now it is always `None`.
     pub target: Option<StorageDriverTargetInfo>,
 }
 
@@ -215,6 +225,32 @@ impl fmt::Debug for StorageDriverRetrieveContext {
     }
 }
 
+/// Returned as errors from storage drivers.
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum StorageDriverError {
+    /// Any driver failure.
+    Other(anyhow::Error),
+}
+
+impl StorageDriverError {
+    /// The error the driver reported.
+    pub fn into_source(self) -> anyhow::Error {
+        match self {
+            Self::Other(source) => source,
+        }
+    }
+}
+
+impl<E> From<E> for StorageDriverError
+where
+    E: Into<anyhow::Error>,
+{
+    fn from(source: E) -> Self {
+        Self::Other(source.into())
+    }
+}
+
 /// Stores and retrieves payloads in an external storage system.
 ///
 /// Implementations are called concurrently and must be thread safe.
@@ -235,7 +271,7 @@ pub trait StorageDriver: Send + Sync {
         &self,
         context: &StorageDriverStoreContext,
         payloads: Vec<Payload>,
-    ) -> BoxFuture<'static, Result<Vec<StorageDriverClaim>, ExternalStorageError>>;
+    ) -> BoxFuture<'static, Result<Vec<StorageDriverClaim>, StorageDriverError>>;
 
     /// Retrieve the payloads for the given claims, returning one payload per claim in the same
     /// order.
@@ -243,7 +279,7 @@ pub trait StorageDriver: Send + Sync {
         &self,
         context: &StorageDriverRetrieveContext,
         claims: Vec<StorageDriverClaim>,
-    ) -> BoxFuture<'static, Result<Vec<Payload>, ExternalStorageError>>;
+    ) -> BoxFuture<'static, Result<Vec<Payload>, StorageDriverError>>;
 }
 
 /// Chooses which driver stores a payload, or returns `None` to pass the payload through.
@@ -256,57 +292,29 @@ pub trait StorageDriverSelector: Send + Sync {
     ) -> Option<Arc<dyn StorageDriver>>;
 }
 
-/// Failures raised by the external storage machinery.
-#[derive(Debug, thiserror::Error)]
-#[non_exhaustive]
-pub enum ExternalStorageError {
-    /// A reference to externally stored data was found, but no external storage is configured to
-    /// retrieve it.
-    #[error(
-        "[TMPRL1105] Encountered a reference to a payload in external storage, but no external \
-         storage is configured to retrieve it"
-    )]
-    NotConfigured,
-    /// A payload is marked as a reference but its contents cannot be read as one.
-    #[error("Invalid external storage reference: {0}")]
-    InvalidReference(#[source] Box<dyn std::error::Error + Send + Sync>),
-    /// The configuration is not usable.
-    #[error("Invalid external storage configuration: {0}")]
-    InvalidConfiguration(String),
-    /// A driver failed to store or retrieve.
-    #[error("Storage driver error: {0}")]
-    Driver(#[source] Box<dyn std::error::Error + Send + Sync>),
-    /// Walking the message's payloads failed, outside any storage operation.
-    #[error("External storage payload walk failed: {0}")]
-    Walk(#[source] Box<dyn std::error::Error + Send + Sync>),
-    /// A reference names a driver that is not registered.
-    #[error("No storage driver is registered under the name '{0}'")]
-    UnregisteredDriver(String),
-    /// The selector returned a driver that is not one of the registered instances.
-    #[error("Selector returned a driver that is not registered: '{0}'")]
-    UnregisteredSelection(String),
-    /// A driver returned a different number of results than it was given inputs. A store is given
-    /// payloads and returns claims; a retrieve is given claims and returns payloads. Either way
-    /// there must be one result per input, in order.
-    #[error("Storage driver '{driver}' returned {returned} results for {requested} inputs")]
-    DriverContract {
-        /// Name of the driver.
-        driver: String,
-        /// How many inputs it was given.
-        requested: usize,
-        /// How many results it returned.
-        returned: usize,
-    },
-}
-
-/// Configuration for offloading large payloads to an external storage system.
+/// Configuration for offloading large payloads to an external storage system, so that their data
+/// never reaches the Temporal server.
 ///
-/// This and the driver and selector traits it holds are defined in this crate only so that it can
-/// be configured on a [`DataConverter`](crate::data_converters::DataConverter). Drivers are
-/// implemented and invoked outside of WASM, by the worker and client, never from workflow code.
+/// A payload at or above [`Self::payload_size_threshold`] is handed to a [`StorageDriver`] and
+/// replaced on the wire by a small reference to what the driver stored. Workers and clients swap
+/// references back for the payloads they point at when they read them. Configure it with
+/// [`DataConverter::with_external_storage`](crate::data_converters::DataConverter::with_external_storage).
+/// Drivers are called by the worker and the client, never from workflow code.
 ///
 /// Validated when constructed rather than when used, so a misconfiguration surfaces at startup
 /// instead of on the first payload large enough to offload.
+///
+/// # Limitations
+///
+/// This API is experimental and may change without notice. For now:
+///
+/// - Heartbeat details recorded from inside an activity are not offloaded.
+/// - Drivers are not told which workflow or activity a payload belongs to: the `target` on
+///   [`StorageDriverStoreContext`] and [`StorageDriverSelectContext`] is always `None`.
+/// - Storage requests are not limited, so every request a message needs runs at once.
+/// - References are not passed through the payload codec, so their claim data is written to history
+///   unencrypted, and a reference that another SDK encoded with a codec is not recognized.
+/// - Replaying a workflow stores its payloads again.
 #[derive(Clone)]
 pub struct ExternalStorage {
     drivers: Vec<Arc<dyn StorageDriver>>,
@@ -330,7 +338,7 @@ impl fmt::Debug for ExternalStorage {
 
 impl ExternalStorage {
     /// Configure external storage with a single driver that stores every eligible payload.
-    pub fn new(driver: Arc<dyn StorageDriver>) -> Result<Self, ExternalStorageError> {
+    pub fn new(driver: Arc<dyn StorageDriver>) -> Result<Self, ExternalStorageConfigError> {
         let selected = Arc::clone(&driver);
         Self::with_selector(vec![driver], Arc::new(SingleDriverSelector(selected)))
     }
@@ -342,9 +350,9 @@ impl ExternalStorage {
     pub fn with_selector(
         drivers: Vec<Arc<dyn StorageDriver>>,
         driver_selector: Arc<dyn StorageDriverSelector>,
-    ) -> Result<Self, ExternalStorageError> {
+    ) -> Result<Self, ExternalStorageConfigError> {
         if drivers.is_empty() {
-            return Err(ExternalStorageError::InvalidConfiguration(
+            return Err(ExternalStorageConfigError(
                 "at least one driver is required".to_owned(),
             ));
         }
@@ -354,12 +362,12 @@ impl ExternalStorage {
             // The name is the routing key written into history, so a driver without one can never
             // be resolved on the retrieval side.
             if name.is_empty() {
-                return Err(ExternalStorageError::InvalidConfiguration(
+                return Err(ExternalStorageConfigError(
                     "driver name cannot be empty".to_owned(),
                 ));
             }
             if !names.insert(name) {
-                return Err(ExternalStorageError::InvalidConfiguration(format!(
+                return Err(ExternalStorageConfigError(format!(
                     "multiple drivers given with name '{name}'"
                 )));
             }
@@ -382,6 +390,7 @@ impl ExternalStorage {
     }
 
     /// Set the limits on how many storage requests may be in flight at once.
+    #[doc(hidden)]
     #[must_use]
     pub fn with_concurrency(mut self, concurrency: ExternalStorageConcurrency) -> Self {
         self.concurrency = concurrency;
@@ -389,6 +398,7 @@ impl ExternalStorage {
     }
 
     /// The limits on how many storage requests may be in flight at once.
+    #[doc(hidden)]
     pub fn concurrency(&self) -> &ExternalStorageConcurrency {
         &self.concurrency
     }
@@ -444,14 +454,14 @@ mod tests {
             &self,
             _context: &StorageDriverStoreContext,
             _payloads: Vec<Payload>,
-        ) -> BoxFuture<'static, Result<Vec<StorageDriverClaim>, ExternalStorageError>> {
+        ) -> BoxFuture<'static, Result<Vec<StorageDriverClaim>, StorageDriverError>> {
             Box::pin(future::ready(Ok(vec![])))
         }
         fn retrieve(
             &self,
             _context: &StorageDriverRetrieveContext,
             _claims: Vec<StorageDriverClaim>,
-        ) -> BoxFuture<'static, Result<Vec<Payload>, ExternalStorageError>> {
+        ) -> BoxFuture<'static, Result<Vec<Payload>, StorageDriverError>> {
             Box::pin(future::ready(Ok(vec![])))
         }
     }
@@ -507,13 +517,13 @@ mod tests {
             ExternalStorageConcurrency::builder()
                 .max_driver_operations(0)
                 .build(),
-            Err(ExternalStorageError::InvalidConfiguration(_))
+            Err(ExternalStorageConfigError(_))
         ));
         assert!(matches!(
             ExternalStorageConcurrency::builder()
                 .max_operations_per_message(0)
                 .build(),
-            Err(ExternalStorageError::InvalidConfiguration(_))
+            Err(ExternalStorageConfigError(_))
         ));
     }
 
@@ -521,18 +531,18 @@ mod tests {
     fn configuration_is_validated_when_built() {
         assert!(matches!(
             ExternalStorage::with_selector(vec![], Arc::new(NullSelector)),
-            Err(ExternalStorageError::InvalidConfiguration(_))
+            Err(ExternalStorageConfigError(_))
         ));
         assert!(matches!(
             ExternalStorage::with_selector(vec![driver("")], Arc::new(NullSelector)),
-            Err(ExternalStorageError::InvalidConfiguration(_))
+            Err(ExternalStorageConfigError(_))
         ));
         assert!(matches!(
             ExternalStorage::with_selector(
                 vec![driver("dup"), driver("dup")],
                 Arc::new(NullSelector)
             ),
-            Err(ExternalStorageError::InvalidConfiguration(_))
+            Err(ExternalStorageConfigError(_))
         ));
     }
 }
