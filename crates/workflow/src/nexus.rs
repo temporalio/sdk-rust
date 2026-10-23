@@ -190,7 +190,7 @@ impl<S: NexusService> NexusWorkflowClient<S> {
     ///
     /// Synchronous operations return a handle with no operation token. The operation is scheduled
     /// when this method is called, as with activities. Dropping the future or handle does not cancel
-    /// it; use [`crate::CancellableFuture::cancel`] while starting, the options' cancellation token,
+    /// it. Use [`crate::CancellableFuture::cancel`] while starting. Use the options' cancellation token
     /// or [`NexusWorkflowOperationHandle::cancel`] after starting.
     pub fn start<O>(
         &self,
