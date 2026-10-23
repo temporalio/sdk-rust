@@ -25,9 +25,7 @@ use temporalio_common_wasm::data_converters::{
 
 use crate::{
     external_storage_references::{create_reference_payload, is_plain_reference, parse_reference},
-    payload_visitor::{
-        AsyncPayloadVisitor, PayloadField, PayloadFieldData, PayloadVisitable, should_transform,
-    },
+    payload_visitor::{PayloadVisitable, payload_visitor},
     protos::temporal::api::common::v1::Payload,
 };
 
@@ -156,8 +154,16 @@ fn finish(
     walked.map_err(|e| ExternalStorageError::Walk(Box::new(e)))
 }
 
-fn stop_walk() -> PayloadConversionError {
-    PayloadConversionError::EncodingError("external storage pass failed".into())
+/// Keep a pass's typed error aside and stop the walk with a placeholder, since the walk can only
+/// report a [`PayloadConversionError`].
+fn stop_walk(
+    slot: &mut Option<ExternalStorageError>,
+    result: Result<(), ExternalStorageError>,
+) -> Result<(), PayloadConversionError> {
+    result.map_err(|e| {
+        *slot = Some(e);
+        PayloadConversionError::EncodingError("external storage pass failed".into())
+    })
 }
 
 struct StorePayloadsVisitor<'a> {
@@ -166,48 +172,13 @@ struct StorePayloadsVisitor<'a> {
     limiter: &'a Arc<dyn StorageDriverLimiter<Payload>>,
     error: Option<ExternalStorageError>,
 }
-impl AsyncPayloadVisitor for StorePayloadsVisitor<'_> {
-    fn visit<'a>(
-        &'a mut self,
-        field: PayloadField<'a>,
-    ) -> futures::future::BoxFuture<'a, Result<(), PayloadConversionError>> {
-        Box::pin(async move {
-            if !should_transform(field.path) {
-                return Ok(());
-            }
-            let result = match field.data {
-                PayloadFieldData::Single(payload) => {
-                    store_payloads(
-                        std::slice::from_mut(payload),
-                        self.storage,
-                        self.target,
-                        self.limiter,
-                    )
-                    .await
-                }
-                PayloadFieldData::Repeated(payloads) => {
-                    store_payloads(payloads, self.storage, self.target, self.limiter).await
-                }
-                PayloadFieldData::Payloads(message) => {
-                    store_payloads(
-                        &mut message.payloads,
-                        self.storage,
-                        self.target,
-                        self.limiter,
-                    )
-                    .await
-                }
-            };
-            match result {
-                Ok(()) => Ok(()),
-                Err(e) => {
-                    self.error = Some(e);
-                    Err(stop_walk())
-                }
-            }
-        })
-    }
-}
+
+payload_visitor!(StorePayloadsVisitor<'_>, |this, payloads| {
+    let mut payloads = payloads;
+    let result = store_payloads(&mut payloads, this.storage, this.target, this.limiter).await;
+    stop_walk(&mut this.error, result)?;
+    payloads
+});
 
 struct RetrievePayloadsVisitor<'a> {
     storage: &'a ExternalStorage,
@@ -215,37 +186,12 @@ struct RetrievePayloadsVisitor<'a> {
     error: Option<ExternalStorageError>,
 }
 
-impl AsyncPayloadVisitor for RetrievePayloadsVisitor<'_> {
-    fn visit<'a>(
-        &'a mut self,
-        field: PayloadField<'a>,
-    ) -> futures::future::BoxFuture<'a, Result<(), PayloadConversionError>> {
-        Box::pin(async move {
-            if !should_transform(field.path) {
-                return Ok(());
-            }
-            let result = match field.data {
-                PayloadFieldData::Single(payload) => {
-                    retrieve_payloads(std::slice::from_mut(payload), self.storage, self.limiter)
-                        .await
-                }
-                PayloadFieldData::Repeated(payloads) => {
-                    retrieve_payloads(payloads, self.storage, self.limiter).await
-                }
-                PayloadFieldData::Payloads(message) => {
-                    retrieve_payloads(&mut message.payloads, self.storage, self.limiter).await
-                }
-            };
-            match result {
-                Ok(()) => Ok(()),
-                Err(e) => {
-                    self.error = Some(e);
-                    Err(stop_walk())
-                }
-            }
-        })
-    }
-}
+payload_visitor!(RetrievePayloadsVisitor<'_>, |this, payloads| {
+    let mut payloads = payloads;
+    let result = retrieve_payloads(&mut payloads, this.storage, this.limiter).await;
+    stop_walk(&mut this.error, result)?;
+    payloads
+});
 
 /// One driver and the payloads it takes: each payload's index and its pre-offload proto size.
 type DriverGroup = (Arc<dyn StorageDriver>, Vec<(usize, i64)>);

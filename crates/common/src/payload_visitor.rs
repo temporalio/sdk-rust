@@ -63,48 +63,58 @@ pub(crate) fn should_transform(path: &str) -> bool {
     !is_search_attributes_path(path)
 }
 
+/// Implement [`AsyncPayloadVisitor`] for a visitor that applies one batch operation to every
+/// transformable field, given `|visitor, payloads| body`. The body takes the field's payloads as an
+/// owned `Vec<Payload>` and evaluates to the payloads that replace them.
+macro_rules! payload_visitor {
+    ($visitor:ty, |$this:ident, $payloads:ident| $body:expr) => {
+        impl $crate::payload_visitor::AsyncPayloadVisitor for $visitor {
+            fn visit<'a>(
+                &'a mut self,
+                field: $crate::payload_visitor::PayloadField<'a>,
+            ) -> ::futures::future::BoxFuture<
+                'a,
+                Result<(), $crate::data_converters::PayloadConversionError>,
+            > {
+                Box::pin(async move {
+                    if !$crate::payload_visitor::should_transform(field.path) {
+                        return Ok(());
+                    }
+                    let $this = self;
+                    match field.data {
+                        $crate::payload_visitor::PayloadFieldData::Single(payload) => {
+                            let $payloads = vec![::std::mem::take(payload)];
+                            if let Some(p) = $body.into_iter().next() {
+                                *payload = p;
+                            }
+                        }
+                        $crate::payload_visitor::PayloadFieldData::Repeated(payloads) => {
+                            let $payloads = ::std::mem::take(payloads);
+                            *payloads = $body;
+                        }
+                        $crate::payload_visitor::PayloadFieldData::Payloads(message) => {
+                            let $payloads = ::std::mem::take(&mut message.payloads);
+                            message.payloads = $body;
+                        }
+                    }
+                    Ok(())
+                })
+            }
+        }
+    };
+}
+#[cfg(feature = "experimental")]
+pub(crate) use payload_visitor;
+
 /// Visitor that encodes payloads using a codec.
 pub struct EncodeVisitor<'a> {
     codec: &'a (dyn PayloadCodec + Send + Sync),
     context: &'a SerializationContextData,
 }
 
-impl AsyncPayloadVisitor for EncodeVisitor<'_> {
-    fn visit<'a>(
-        &'a mut self,
-        field: PayloadField<'a>,
-    ) -> BoxFuture<'a, Result<(), PayloadConversionError>> {
-        Box::pin(async move {
-            if !should_transform(field.path) {
-                return Ok(());
-            }
-            match field.data {
-                PayloadFieldData::Single(payload) => {
-                    let encoded = self
-                        .codec
-                        .encode(self.context, vec![std::mem::take(payload)])
-                        .await?;
-                    if let Some(p) = encoded.into_iter().next() {
-                        *payload = p;
-                    }
-                }
-                PayloadFieldData::Repeated(payloads) => {
-                    *payloads = self
-                        .codec
-                        .encode(self.context, std::mem::take(payloads))
-                        .await?;
-                }
-                PayloadFieldData::Payloads(payloads_msg) => {
-                    payloads_msg.payloads = self
-                        .codec
-                        .encode(self.context, std::mem::take(&mut payloads_msg.payloads))
-                        .await?;
-                }
-            }
-            Ok(())
-        })
-    }
-}
+payload_visitor!(EncodeVisitor<'_>, |this, payloads| {
+    this.codec.encode(this.context, payloads).await?
+});
 
 /// Visitor that decodes payloads using a codec.
 pub struct DecodeVisitor<'a> {
@@ -112,42 +122,9 @@ pub struct DecodeVisitor<'a> {
     context: &'a SerializationContextData,
 }
 
-impl AsyncPayloadVisitor for DecodeVisitor<'_> {
-    fn visit<'a>(
-        &'a mut self,
-        field: PayloadField<'a>,
-    ) -> BoxFuture<'a, Result<(), PayloadConversionError>> {
-        Box::pin(async move {
-            if !should_transform(field.path) {
-                return Ok(());
-            }
-            match field.data {
-                PayloadFieldData::Single(payload) => {
-                    let decoded = self
-                        .codec
-                        .decode(self.context, vec![std::mem::take(payload)])
-                        .await?;
-                    if let Some(p) = decoded.into_iter().next() {
-                        *payload = p;
-                    }
-                }
-                PayloadFieldData::Repeated(payloads) => {
-                    *payloads = self
-                        .codec
-                        .decode(self.context, std::mem::take(payloads))
-                        .await?;
-                }
-                PayloadFieldData::Payloads(payloads_msg) => {
-                    payloads_msg.payloads = self
-                        .codec
-                        .decode(self.context, std::mem::take(&mut payloads_msg.payloads))
-                        .await?;
-                }
-            }
-            Ok(())
-        })
-    }
-}
+payload_visitor!(DecodeVisitor<'_>, |this, payloads| {
+    this.codec.decode(this.context, payloads).await?
+});
 
 /// Encode all payloads in a message using the given codec.
 pub async fn encode_payloads<M: PayloadVisitable + Send>(
