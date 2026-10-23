@@ -25,7 +25,7 @@ use temporalio_common_wasm::data_converters::{
 
 use crate::{
     external_storage_references::{create_reference_payload, is_plain_reference, parse_reference},
-    payload_visitor::{PayloadVisitable, payload_visitor},
+    payload_visitor::{AsyncPayloadVisitor, PayloadVisitable, payload_visitor},
     protos::temporal::api::common::v1::Payload,
 };
 
@@ -61,14 +61,13 @@ impl<'a> ExternalStorageRunner<'a> {
         message: &mut M,
         target: Option<&StorageDriverTargetInfo>,
     ) -> Result<(), ExternalStorageError> {
-        let mut store = StorePayloadsVisitor {
+        let store = StorePayloadsVisitor {
             storage: self.storage,
             target,
             limiter: &self.store_limiter,
             error: None,
         };
-        let walked = message.visit_payloads_mut(&mut store).await;
-        finish(store.error, walked)
+        Self::walk(message, store, |v| v.error.take()).await
     }
 
     /// Replace every reference in a message with the payload it points at.
@@ -78,13 +77,26 @@ impl<'a> ExternalStorageRunner<'a> {
         &self,
         message: &mut M,
     ) -> Result<(), ExternalStorageError> {
-        let mut retrieve = RetrievePayloadsVisitor {
+        let retrieve = RetrievePayloadsVisitor {
             storage: self.storage,
             limiter: &self.retrieve_limiter,
             error: None,
         };
-        let walked = message.visit_payloads_mut(&mut retrieve).await;
-        finish(retrieve.error, walked)
+        Self::walk(message, retrieve, |v| v.error.take()).await
+    }
+
+    /// The visitor reports only that it failed, so the typed error it captured is preferred over the
+    /// placeholder that stopped the walk.
+    async fn walk<M: PayloadVisitable + Send, V: AsyncPayloadVisitor + Send>(
+        message: &mut M,
+        mut visitor: V,
+        take_error: impl FnOnce(&mut V) -> Option<ExternalStorageError>,
+    ) -> Result<(), ExternalStorageError> {
+        let walked = message.visit_payloads_mut(&mut visitor).await;
+        if let Some(error) = take_error(&mut visitor) {
+            return Err(error);
+        }
+        walked.map_err(|e| ExternalStorageError::Walk(Box::new(e)))
     }
 }
 
@@ -140,18 +152,6 @@ async fn retrieve_payloads(
         }
     }
     Ok(())
-}
-
-/// The visitor reports only that it failed, so the typed error it captured is preferred over the
-/// placeholder that stopped the walk.
-fn finish(
-    captured: Option<ExternalStorageError>,
-    walked: Result<(), PayloadConversionError>,
-) -> Result<(), ExternalStorageError> {
-    if let Some(error) = captured {
-        return Err(error);
-    }
-    walked.map_err(|e| ExternalStorageError::Walk(Box::new(e)))
 }
 
 /// Keep a pass's typed error aside and stop the walk with a placeholder, since the walk can only
