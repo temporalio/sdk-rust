@@ -40,7 +40,9 @@ relevant information.
 ### Added
 * Workflows can call typed Nexus service operations with `nexus_client`, `execute`, and `start`
   when the `experimental` feature is enabled, using service definitions from the draft Nexus Rust
-  SDK. Started operations expose a typed result, operation token, and cancellation.
+  SDK. `NexusServiceClient` uses `NexusServiceClientOptions`; calls take `NexusOperationOptions`
+  and return a typed result or `NexusOperationHandle`. The `cancellation_type` option is a
+  non-optional enum that defaults to waiting for cancellation completion.
 * Experimental Event Groups support (requires the `experimental` feature). Event Groups
   are workflow-level metadata that group related history events for UI and observability.
   `EventGroup::new` takes a required ID (used verbatim; do not put secrets in it);

@@ -1,6 +1,6 @@
 use super::*;
 use crate::{
-    nexus::{NexusService, NexusWorkflowClient, NexusWorkflowClientOptions},
+    nexus::{NexusService, NexusServiceClient, NexusServiceClientOptions},
     runtime::{SdkGuardedFuture, model::NexusStartResult},
     workflow_interceptors::{StartNexusOperationInput, call_start_nexus_operation},
 };
@@ -65,9 +65,9 @@ impl<W> SyncWorkflowContext<W> {
     pub fn nexus_client<S: NexusService>(
         &self,
         service: S,
-        options: NexusWorkflowClientOptions,
-    ) -> NexusWorkflowClient<S> {
-        NexusWorkflowClient::new(self.base.clone(), service, options)
+        options: NexusServiceClientOptions,
+    ) -> NexusServiceClient<S> {
+        NexusServiceClient::new(self.base.clone(), service, options)
     }
 
     /// Start a Nexus operation.
@@ -84,8 +84,8 @@ impl<W> WorkflowContext<W> {
     pub fn nexus_client<S: NexusService>(
         &self,
         service: S,
-        options: NexusWorkflowClientOptions,
-    ) -> NexusWorkflowClient<S> {
+        options: NexusServiceClientOptions,
+    ) -> NexusServiceClient<S> {
         self.sync.nexus_client(service, options)
     }
 

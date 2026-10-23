@@ -337,7 +337,7 @@ nexus-rpc = { git = "https://github.com/nexus-rpc/sdk-rust", rev = "a6ebfedd3bb4
 ```rust
 use nexus_rpc::service;
 use temporalio_sdk::nexus::{
-    NexusWorkflowClientOptions, NexusWorkflowOperationOptions,
+    NexusOperationOptions, NexusServiceClientOptions,
 };
 
 #[service(name = "payments")]
@@ -348,22 +348,25 @@ pub trait PaymentService {
 
 let payments = ctx.nexus_client(
     PaymentService,
-    NexusWorkflowClientOptions::new("payments-endpoint").build(),
+    NexusServiceClientOptions::new("payments-endpoint").build(),
 );
 
 let receipt: String = payments
-    .execute(PaymentService::charge, input, NexusWorkflowOperationOptions::default())
+    .execute(PaymentService::charge, input, NexusOperationOptions::default())
     .await?;
 
 let handle = payments
-    .start(PaymentService::charge, another_input, NexusWorkflowOperationOptions::default())
+    .start(PaymentService::charge, another_input, NexusOperationOptions::default())
     .await?;
 handle.cancel();
 let receipt = handle.result().await?;
 ```
 
-The operation marker fixes its service, input, and output types. `start` waits for the operation
-to be acknowledged; the handle exposes `operation_token()` (`None` for synchronous operations),
+The `nexus_client` call returns a `NexusServiceClient` bound to the service and endpoint.
+The `#[service]` macro generates the `PaymentService::charge` value passed to `execute` or `start`.
+It identifies the operation and its service, input, and output types, so mismatched calls are rejected
+at compile time. `start` waits for the operation to be acknowledged; the handle exposes
+`operation_token()` (`None` for synchronous operations),
 `cancel()`, and a typed `result()`. Cancellation can race with completion. Options include timeouts,
 cancellation behavior, and a cancellation token; absent a token, workflow cancellation is inherited.
 Nexus request headers can be set by workflow interceptors, not by the typed call options.

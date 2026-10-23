@@ -98,7 +98,7 @@ impl WorkflowInterceptor for AddTraceHeader {
 
 fn client() -> (
     BaseWorkflowContext,
-    NexusWorkflowClient<Payments>,
+    NexusServiceClient<Payments>,
     Rc<RecordingHost>,
 ) {
     let host = Rc::new(RecordingHost::default());
@@ -114,10 +114,10 @@ fn client() -> (
         None,
         vec![WorkflowInterceptorConstructor::new(|_| AddTraceHeader)],
     );
-    let client = NexusWorkflowClient::new(
+    let client = NexusServiceClient::new(
         base.clone(),
         Payments,
-        NexusWorkflowClientOptions::new("payments-endpoint").build(),
+        NexusServiceClientOptions::new("payments-endpoint").build(),
     );
     (base, client, host)
 }
@@ -159,10 +159,11 @@ fn execute_uses_renamed_wire_names_and_converts_distinct_input_and_output_types(
     let execute = client.execute(
         Payments::charge,
         request(),
-        NexusWorkflowOperationOptions::builder()
+        NexusOperationOptions::builder()
             .schedule_to_close_timeout(Duration::from_secs(60))
             .schedule_to_start_timeout(Duration::from_secs(10))
             .start_to_close_timeout(Duration::from_secs(30))
+            .cancellation_type(NexusOperationCancellationType::TryCancel)
             .build(),
     );
     let mut execute = std::pin::pin!(execute);
@@ -189,6 +190,10 @@ fn execute_uses_renamed_wire_names_and_converts_distinct_input_and_output_types(
             10
         );
         assert_eq!(command.start_to_close_timeout.as_ref().unwrap().seconds, 30);
+        assert_eq!(
+            NexusOperationCancellationType::from(command.cancellation_type()),
+            NexusOperationCancellationType::TryCancel
+        );
         assert_eq!(command.nexus_header["trace-id"], "trace-42");
     }
     resolve_start(&base, 1, StartStatus::StartedSync(true));
@@ -215,7 +220,7 @@ fn asynchronous_handle_exposes_token_and_repeats_typed_result_without_rescheduli
     let start = client.start(
         Payments::charge,
         request(),
-        NexusWorkflowOperationOptions::default(),
+        NexusOperationOptions::default(),
     );
     let mut start = std::pin::pin!(start);
     assert!(start.as_mut().now_or_never().is_none());
@@ -246,7 +251,7 @@ fn synchronous_handle_has_no_operation_token() {
     let start = client.start(
         Payments::charge,
         request(),
-        NexusWorkflowOperationOptions::default(),
+        NexusOperationOptions::default(),
     );
     let mut start = std::pin::pin!(start);
     assert!(start.as_mut().now_or_never().is_none());
@@ -269,12 +274,12 @@ fn calls_schedule_eagerly_and_can_cancel_before_start_acknowledgment() {
     let start = client.start(
         Payments::charge,
         request(),
-        NexusWorkflowOperationOptions::default(),
+        NexusOperationOptions::default(),
     );
     let execute = client.execute(
         Payments::charge,
         request(),
-        NexusWorkflowOperationOptions::default(),
+        NexusOperationOptions::default(),
     );
     assert_eq!(host.commands.borrow().len(), 2);
     start.cancel();
@@ -300,7 +305,7 @@ fn handle_cancellation_targets_its_schedule_and_is_idempotent() {
         let start = client.start(
             Payments::charge,
             request(),
-            NexusWorkflowOperationOptions::default(),
+            NexusOperationOptions::default(),
         );
         let mut start = std::pin::pin!(start);
         assert!(start.as_mut().now_or_never().is_none());
@@ -332,7 +337,7 @@ fn workflow_cancellation_is_inherited_but_custom_token_is_independent() {
         let start = client.start(
             Payments::charge,
             request(),
-            NexusWorkflowOperationOptions {
+            NexusOperationOptions {
                 cancellation_token: custom_token.then(|| token.clone()),
                 ..Default::default()
             },
@@ -382,7 +387,7 @@ fn start_and_result_failures_preserve_server_failure_details() {
         let start = client.start(
             Payments::charge,
             request(),
-            NexusWorkflowOperationOptions::default(),
+            NexusOperationOptions::default(),
         );
         let mut start = std::pin::pin!(start);
         assert!(start.as_mut().now_or_never().is_none());
@@ -418,7 +423,7 @@ fn serialization_failure_does_not_schedule_or_consume_operation_sequence() {
         .start(
             Payments::unencodable,
             Unserializable,
-            NexusWorkflowOperationOptions::default(),
+            NexusOperationOptions::default(),
         )
         .now_or_never()
         .unwrap();
@@ -431,7 +436,7 @@ fn serialization_failure_does_not_schedule_or_consume_operation_sequence() {
     let start = client.start(
         Payments::charge,
         request(),
-        NexusWorkflowOperationOptions::default(),
+        NexusOperationOptions::default(),
     );
     let mut start = std::pin::pin!(start);
     assert!(start.as_mut().now_or_never().is_none());
@@ -455,7 +460,7 @@ fn malformed_output_and_missing_status_return_serialization_errors() {
         let start = client.start(
             Payments::charge,
             request(),
-            NexusWorkflowOperationOptions::default(),
+            NexusOperationOptions::default(),
         );
         let mut start = std::pin::pin!(start);
         assert!(start.as_mut().now_or_never().is_none());

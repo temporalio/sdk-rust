@@ -29,7 +29,7 @@ use temporalio_common::{
 use temporalio_macros::{workflow, workflow_methods};
 use temporalio_sdk::{
     WorkflowContext, WorkflowContextView, WorkflowResult, WorkflowTermination,
-    nexus::{NexusWorkflowClientOptions, NexusWorkflowOperationOptions},
+    nexus::{NexusOperationOptions, NexusServiceClientOptions},
 };
 use temporalio_sdk_core::PollError;
 use tokio::join;
@@ -66,7 +66,7 @@ impl NexusTypedWf {
     pub(crate) async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<TypedOutput> {
         let client = ctx.nexus_client(
             TypedService,
-            NexusWorkflowClientOptions::new(ctx.state(|wf| wf.endpoint.clone())).build(),
+            NexusServiceClientOptions::new(ctx.state(|wf| wf.endpoint.clone())).build(),
         );
         let first: TypedOutput = client
             .execute(
@@ -74,7 +74,7 @@ impl NexusTypedWf {
                 TypedInput {
                     message: "execute".to_owned(),
                 },
-                NexusWorkflowOperationOptions::builder()
+                NexusOperationOptions::builder()
                     .schedule_to_close_timeout(Duration::from_secs(10))
                     .build(),
             )
@@ -86,7 +86,7 @@ impl NexusTypedWf {
                 TypedInput {
                     message: first.reply,
                 },
-                NexusWorkflowOperationOptions::builder()
+                NexusOperationOptions::builder()
                     .schedule_to_close_timeout(Duration::from_secs(10))
                     .build(),
             )
@@ -202,7 +202,7 @@ impl NexusTypedAsyncWf {
     pub(crate) async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<()> {
         let client = ctx.nexus_client(
             TypedService,
-            NexusWorkflowClientOptions::new(ctx.state(|wf| wf.endpoint.clone())).build(),
+            NexusServiceClientOptions::new(ctx.state(|wf| wf.endpoint.clone())).build(),
         );
         let handle = client
             .start(
@@ -210,7 +210,7 @@ impl NexusTypedAsyncWf {
                 TypedInput {
                     message: "async".to_owned(),
                 },
-                NexusWorkflowOperationOptions::builder()
+                NexusOperationOptions::builder()
                     .schedule_to_close_timeout(Duration::from_secs(60))
                     .build(),
             )
