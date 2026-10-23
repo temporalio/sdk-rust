@@ -3,15 +3,15 @@
 //! **Experimental:** Enable the `experimental` feature. This API and the draft Nexus SDK it
 //! depends on may change.
 //!
-//! Services are defined with the Nexus SDK's [`nexus_rpc::service`] macro. Operation markers bind each
-//! operation to its service, input, and output types. Calls use the workflow's payload converter;
+//! Services are defined with the Nexus SDK's [`nexus_rpc::service`] macro. Each generated operation
+//! value identifies its service, input, and output types. Calls use the workflow's payload converter;
 //! payload codecs are applied at the worker boundary, just as for activities.
 //!
 //! ```
 //! use nexus_rpc::service;
 //! use temporalio_workflow::{
 //!     WorkflowContext, WorkflowResult,
-//!     nexus::{NexusWorkflowClientOptions, NexusWorkflowOperationOptions},
+//!     nexus::{NexusOperationOptions, NexusServiceClientOptions},
 //! };
 //!
 //! #[service(name = "payments")]
@@ -23,13 +23,13 @@
 //! async fn charge<W>(ctx: &WorkflowContext<W>, input: String) -> WorkflowResult<String> {
 //!     let payments = ctx.nexus_client(
 //!         PaymentService,
-//!         NexusWorkflowClientOptions::new("payments-endpoint").build(),
+//!         NexusServiceClientOptions::new("payments-endpoint").build(),
 //!     );
 //!     let receipt: String = payments
 //!         .execute(
 //!             PaymentService::charge,
 //!             input,
-//!             NexusWorkflowOperationOptions::default(),
+//!             NexusOperationOptions::default(),
 //!         )
 //!         .await?;
 //!
@@ -37,7 +37,7 @@
 //!         .start(
 //!             PaymentService::charge,
 //!             receipt,
-//!             NexusWorkflowOperationOptions::default(),
+//!             NexusOperationOptions::default(),
 //!         )
 //!         .await?;
 //!     handle.cancel();
@@ -51,8 +51,7 @@ pub use nexus_rpc::{NexusOperation, NexusService};
 pub use temporalio_common_wasm::error::NexusOperationError;
 
 use crate::{
-    BaseWorkflowContext, EventGroup, NexusOperationOptions, StartedNexusOperation,
-    WorkflowCancellationToken,
+    BaseWorkflowContext, EventGroup, StartedNexusOperation, WorkflowCancellationToken,
     workflow_interceptors::{CancellableWorkflowOutboundFuture, WorkflowCancellationHandle},
 };
 use std::{future, marker::PhantomData, time::Duration};
@@ -72,7 +71,7 @@ mod tests;
 #[derive(Debug, Clone, bon::Builder)]
 #[builder(start_fn = new, on(String, into))]
 #[non_exhaustive]
-pub struct NexusWorkflowClientOptions {
+pub struct NexusServiceClientOptions {
     /// Endpoint name registered with the Temporal server.
     #[builder(start_fn)]
     pub endpoint: String,
@@ -81,7 +80,7 @@ pub struct NexusWorkflowClientOptions {
 /// Options for an individual Nexus operation called from a workflow.
 #[derive(Debug, Clone, Default, bon::Builder)]
 #[non_exhaustive]
-pub struct NexusWorkflowOperationOptions {
+pub struct NexusOperationOptions {
     /// Maximum time from scheduling to completion, including server retries.
     pub schedule_to_close_timeout: Option<Duration>,
     /// Maximum time from scheduling until the handler starts or synchronously completes.
@@ -91,7 +90,8 @@ pub struct NexusWorkflowOperationOptions {
     /// Ignored for synchronous operations; `None` or zero disables this timeout.
     pub start_to_close_timeout: Option<Duration>,
     /// When cancellation is reported. Defaults to waiting for cancellation completion.
-    pub cancellation_type: Option<NexusOperationCancellationType>,
+    #[builder(default)]
+    pub cancellation_type: NexusOperationCancellationType,
     /// Cancellation token for this operation. `None` inherits workflow cancellation.
     pub cancellation_token: Option<WorkflowCancellationToken>,
     /// Event Groups to attach in addition to those on the enclosing workflow context.
@@ -120,7 +120,7 @@ pub struct NexusWorkflowOperationOptions {
 ///     fn ship(input: String) -> String;
 /// }
 /// async fn wrong_service<W>(ctx: &WorkflowContext<W>) {
-///     let payments = ctx.nexus_client(Payments, NexusWorkflowClientOptions::new("payments").build());
+///     let payments = ctx.nexus_client(Payments, NexusServiceClientOptions::new("payments").build());
 ///     payments.execute(Shipping::ship, String::new(), Default::default()).await;
 /// }
 /// # fn main() {}
@@ -136,34 +136,19 @@ pub struct NexusWorkflowOperationOptions {
 ///     #[operation]
 ///     fn charge(input: String) -> String;
 /// }
-/// async fn wrong_input<W>(ctx: &WorkflowContext<W>) {
-///     let payments = ctx.nexus_client(Payments, NexusWorkflowClientOptions::new("payments").build());
-///     payments.execute(Payments::charge, 42_u32, Default::default()).await;
+/// async fn wrong_types<W>(ctx: &WorkflowContext<W>) {
+///     let payments = ctx.nexus_client(Payments, NexusServiceClientOptions::new("payments").build());
+///     let _: u32 = payments.execute(Payments::charge, 42_u32, Default::default()).await.unwrap();
 /// }
 /// # fn main() {}
 /// ```
-///
-/// ```compile_fail
-/// use nexus_rpc::service;
-/// use temporalio_workflow::{WorkflowContext, nexus::*};
-/// #[service]
-/// trait Payments {
-///     #[operation]
-///     fn charge(input: String) -> String;
-/// }
-/// async fn wrong_output<W>(ctx: &WorkflowContext<W>) {
-///     let payments = ctx.nexus_client(Payments, NexusWorkflowClientOptions::new("payments").build());
-///     let _: u32 = payments.execute(Payments::charge, String::new(), Default::default()).await.unwrap();
-/// }
-/// # fn main() {}
-/// ```
-pub struct NexusWorkflowClient<S> {
+pub struct NexusServiceClient<S> {
     context: BaseWorkflowContext,
-    options: NexusWorkflowClientOptions,
-    service: PhantomData<fn() -> S>,
+    options: NexusServiceClientOptions,
+    service: PhantomData<S>,
 }
 
-impl<S> Clone for NexusWorkflowClient<S> {
+impl<S> Clone for NexusServiceClient<S> {
     fn clone(&self) -> Self {
         Self {
             context: self.context.clone(),
@@ -173,11 +158,11 @@ impl<S> Clone for NexusWorkflowClient<S> {
     }
 }
 
-impl<S: NexusService> NexusWorkflowClient<S> {
+impl<S: NexusService> NexusServiceClient<S> {
     pub(crate) fn new(
         context: BaseWorkflowContext,
         _service: S,
-        options: NexusWorkflowClientOptions,
+        options: NexusServiceClientOptions,
     ) -> Self {
         Self {
             context,
@@ -191,14 +176,14 @@ impl<S: NexusService> NexusWorkflowClient<S> {
     /// Synchronous operations return a handle with no operation token. The operation is scheduled
     /// when this method is called, as with activities. Dropping the future or handle does not cancel
     /// it. Use [`crate::CancellableFuture::cancel`] while starting. Use the options' cancellation token
-    /// or [`NexusWorkflowOperationHandle::cancel`] after starting.
+    /// or [`NexusOperationHandle::cancel`] after starting.
     pub fn start<O>(
         &self,
         operation: O,
         input: O::Input,
-        options: NexusWorkflowOperationOptions,
+        options: NexusOperationOptions,
     ) -> CancellableWorkflowOutboundFuture<
-        Result<NexusWorkflowOperationHandle<O::Output>, NexusOperationError>,
+        Result<NexusOperationHandle<O::Output>, NexusOperationError>,
     >
     where
         O: NexusOperation<Service = S>,
@@ -221,7 +206,7 @@ impl<S: NexusService> NexusWorkflowClient<S> {
         let context = self.context.clone();
         self.context
             .start_nexus_operation(
-                NexusOperationOptions::builder()
+                crate::NexusOperationOptions::builder()
                     .endpoint(self.options.endpoint.clone())
                     .service(S::name())
                     .operation(operation.name())
@@ -229,14 +214,14 @@ impl<S: NexusService> NexusWorkflowClient<S> {
                     .maybe_schedule_to_close_timeout(options.schedule_to_close_timeout)
                     .maybe_schedule_to_start_timeout(options.schedule_to_start_timeout)
                     .maybe_start_to_close_timeout(options.start_to_close_timeout)
-                    .maybe_cancellation_type(options.cancellation_type)
+                    .cancellation_type(options.cancellation_type)
                     .maybe_cancellation_token(options.cancellation_token)
                     .event_groups(options.event_groups)
                     .build(),
             )
             .map(move |result| {
                 result
-                    .map(|started| NexusWorkflowOperationHandle {
+                    .map(|started| NexusOperationHandle {
                         started,
                         output: PhantomData,
                     })
@@ -257,7 +242,7 @@ impl<S: NexusService> NexusWorkflowClient<S> {
         &self,
         operation: O,
         input: O::Input,
-        options: NexusWorkflowOperationOptions,
+        options: NexusOperationOptions,
     ) -> CancellableWorkflowOutboundFuture<Result<O::Output, NexusOperationError>>
     where
         O: NexusOperation<Service = S>,
@@ -274,12 +259,12 @@ impl<S: NexusService> NexusWorkflowClient<S> {
 }
 
 /// A started Nexus operation whose result has type `Output`.
-pub struct NexusWorkflowOperationHandle<Output> {
+pub struct NexusOperationHandle<Output> {
     started: StartedNexusOperation,
-    output: PhantomData<fn() -> Output>,
+    output: PhantomData<Output>,
 }
 
-impl<Output> NexusWorkflowOperationHandle<Output> {
+impl<Output> NexusOperationHandle<Output> {
     /// The token returned by an asynchronous handler, or `None` for a synchronous operation.
     pub fn operation_token(&self) -> Option<&str> {
         self.started.operation_token.as_deref()
@@ -293,7 +278,7 @@ impl<Output> NexusWorkflowOperationHandle<Output> {
     }
 }
 
-impl<Output: TemporalDeserializable + 'static> NexusWorkflowOperationHandle<Output> {
+impl<Output: TemporalDeserializable + 'static> NexusOperationHandle<Output> {
     /// Wait for the operation's result, converting success and failure with the workflow's
     /// configured converters. This may be called more than once.
     pub async fn result(&self) -> Result<Output, NexusOperationError> {
