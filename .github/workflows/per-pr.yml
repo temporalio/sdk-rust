@@ -352,3 +352,36 @@ jobs:
 
       - name: Run C test program
         run: ./test
+
+  build-and-test:
+    name: Heavy Tests
+    permissions:
+      contents: read
+    timeout-minutes: 20
+    runs-on: ubuntu-latest-16-cores
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: ./.github/actions/setup
+        with:
+          mise-install-args: protoc
+      - run: cargo integ-test -c "--release" -t heavy_tests -- --test-threads 1
+
+  # The single required status check for merging: a PR can merge only if every job in
+  # `needs` passed.
+  required-pr-checks:
+    name: Required PR Checks
+    # Without always(), this job would be skipped when a dependency fails, and GitHub
+    # treats a skipped required check as passing.
+    if: always()
+    needs:
+      - build-and-lint
+      - test
+      - integ-tests
+      - c-bridge-static-link-test
+      - cloud-tests
+      - build-and-test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fail if any check failed or was cancelled
+        if: ${{ contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') }}
+        run: exit 1
