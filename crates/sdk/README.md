@@ -326,7 +326,7 @@ if ctx.patched("my-patch-id") {
 
 ### Nexus Operations
 
-Enable `experimental` to call Nexus services from workflows with typed input and output.
+Enable the `experimental` feature to call Nexus services from workflows with typed input and output.
 Service definitions use the draft [Nexus Rust SDK](https://github.com/nexus-rpc/sdk-rust/pull/2).
 Until that SDK is published, add the same pinned dependency used by this SDK:
 
