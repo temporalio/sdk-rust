@@ -2,7 +2,7 @@
 //!
 //! Outbound, a payload at or above the configured size threshold is handed to a storage driver and
 //! replaced by a reference to what the driver stored. Inbound, references are swapped back for the
-//! payloads they point at. [`ExternalStorageRunner`] runs either direction over a whole message,
+//! payloads they point at. [`store_in`] and [`retrieve_in`] run either direction over a whole message,
 //! visiting every payload-bearing field except search attributes, which the server has to be able
 //! to read.
 //!
@@ -10,16 +10,16 @@
 //! claim keys) is written to history unencrypted. The payload codec is not applied to references,
 //! and the configured concurrency limits are not enforced.
 
-// Crate-private until a worker or client calls it.
-#![allow(dead_code)]
-
-use futures::stream::{FuturesUnordered, TryStreamExt};
+use futures::{
+    future::{self, BoxFuture},
+    stream::{FuturesUnordered, TryStreamExt},
+};
 use std::{collections::HashMap, sync::Arc};
 
 use prost::Message;
 use temporalio_common_wasm::data_converters::{
-    ExternalStorage, ExternalStorageError, PayloadConversionError, StorageDriver,
-    StorageDriverClaim, StorageDriverLimiter, StorageDriverRetrieveContext,
+    ExternalStorage, PayloadConversionError, StorageDriver, StorageDriverClaim, StorageDriverError,
+    StorageDriverLimiter, StorageDriverPermit, StorageDriverRetrieveContext,
     StorageDriverSelectContext, StorageDriverStoreContext, StorageDriverTargetInfo,
 };
 
@@ -28,6 +28,104 @@ use crate::{
     payload_visitor::{AsyncPayloadVisitor, PayloadVisitable, payload_visitor},
     protos::temporal::api::common::v1::Payload,
 };
+
+/// Failures raised while storing payloads in, or retrieving them from, external storage.
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum ExternalStorageError {
+    /// A reference to externally stored data was found, but no external storage is configured to
+    /// retrieve it.
+    #[error(
+        "[TMPRL1105] Encountered a reference to a payload in external storage, but no external \
+         storage is configured to retrieve it"
+    )]
+    NotConfigured,
+    /// A payload is marked as a reference but its contents cannot be read as one.
+    #[error("Invalid external storage reference: {0}")]
+    InvalidReference(#[source] Box<dyn std::error::Error + Send + Sync>),
+    /// A driver failed to store or retrieve.
+    #[error("Storage driver error: {0}")]
+    Driver(#[source] anyhow::Error),
+    /// Walking the message's payloads failed, outside any storage operation.
+    #[error("External storage payload walk failed: {0}")]
+    Walk(#[source] Box<dyn std::error::Error + Send + Sync>),
+    /// A reference names a driver that is not registered.
+    #[error("No storage driver is registered under the name '{0}'")]
+    UnregisteredDriver(String),
+    /// The selector returned a driver that is not one of the registered instances.
+    #[error("Selector returned a driver that is not registered: '{0}'")]
+    UnregisteredSelection(String),
+    /// A driver returned a different number of results than it was given inputs. A store is given
+    /// payloads and returns claims; a retrieve is given claims and returns payloads. Either way
+    /// there must be one result per input, in order.
+    #[error("Storage driver '{driver}' returned {returned} results for {requested} inputs")]
+    DriverContract {
+        /// Name of the driver.
+        driver: String,
+        /// How many inputs it was given.
+        requested: usize,
+        /// How many results it returned.
+        returned: usize,
+    },
+}
+
+impl From<StorageDriverError> for ExternalStorageError {
+    fn from(error: StorageDriverError) -> Self {
+        Self::Driver(error.into_source())
+    }
+}
+
+/// Replace every eligible payload in an outbound message with a reference. Does nothing when no
+/// external storage is configured.
+///
+/// On error the message is left partly processed and must not be used.
+pub async fn store_in<M: PayloadVisitable + Send>(
+    storage: Option<&ExternalStorage>,
+    message: &mut M,
+    target: Option<&StorageDriverTargetInfo>,
+) -> Result<(), ExternalStorageError> {
+    match storage {
+        Some(storage) => {
+            ExternalStorageRunner::new(storage)
+                .store_in(message, target)
+                .await
+        }
+        None => Ok(()),
+    }
+}
+
+/// Replace every reference in an inbound message with the payload it points at. With no external
+/// storage configured, a reference is an error rather than something to hand to application code
+/// as though it were the application's own data.
+///
+/// On error the message is left partly processed and must not be used.
+pub async fn retrieve_in<M: PayloadVisitable + Send>(
+    storage: Option<&ExternalStorage>,
+    message: &mut M,
+) -> Result<(), ExternalStorageError> {
+    match storage {
+        Some(storage) => {
+            ExternalStorageRunner::new(storage)
+                .retrieve_in(message)
+                .await
+        }
+        None => {
+            let reject = RejectReferencesVisitor { error: None };
+            ExternalStorageRunner::walk(message, reject, |v| v.error.take()).await
+        }
+    }
+}
+
+struct UnboundedLimiter;
+
+impl<Item: Sync> StorageDriverLimiter<Item> for UnboundedLimiter {
+    fn acquire<'a>(
+        &'a self,
+        _item: &'a Item,
+    ) -> BoxFuture<'a, Result<StorageDriverPermit, StorageDriverError>> {
+        Box::pin(future::ready(Ok(StorageDriverPermit::new(Box::new(())))))
+    }
+}
 
 /// Drives external storage for the payloads reachable from one activation or request.
 ///
@@ -41,15 +139,11 @@ pub(crate) struct ExternalStorageRunner<'a> {
 }
 
 impl<'a> ExternalStorageRunner<'a> {
-    pub(crate) fn new(
-        storage: &'a ExternalStorage,
-        store_limiter: Arc<dyn StorageDriverLimiter<Payload>>,
-        retrieve_limiter: Arc<dyn StorageDriverLimiter<StorageDriverClaim>>,
-    ) -> Self {
+    pub(crate) fn new(storage: &'a ExternalStorage) -> Self {
         Self {
             storage,
-            store_limiter,
-            retrieve_limiter,
+            store_limiter: Arc::new(UnboundedLimiter),
+            retrieve_limiter: Arc::new(UnboundedLimiter),
         }
     }
 
@@ -133,7 +227,10 @@ async fn retrieve_payloads(
                 .limiter(Arc::clone(limiter))
                 .build();
             async move {
-                let retrieved = driver.retrieve(&context, claims).await?;
+                let retrieved = driver
+                    .retrieve(&context, claims)
+                    .await
+                    .map_err(ExternalStorageError::from)?;
                 if retrieved.len() != indices.len() {
                     return Err(ExternalStorageError::DriverContract {
                         driver: driver_name,
@@ -189,6 +286,20 @@ struct RetrievePayloadsVisitor<'a> {
 payload_visitor!(RetrievePayloadsVisitor<'_>, |this, payloads| {
     let mut payloads = payloads;
     let result = retrieve_payloads(&mut payloads, this.storage, this.limiter).await;
+    stop_walk(&mut this.error, result)?;
+    payloads
+});
+
+struct RejectReferencesVisitor {
+    error: Option<ExternalStorageError>,
+}
+
+payload_visitor!(RejectReferencesVisitor, |this, payloads| {
+    let result = if payloads.iter().any(is_plain_reference) {
+        Err(ExternalStorageError::NotConfigured)
+    } else {
+        Ok(())
+    };
     stop_walk(&mut this.error, result)?;
     payloads
 });
@@ -249,7 +360,10 @@ async fn store_payloads(
                 .limiter(Arc::clone(limiter))
                 .build();
             async move {
-                let claims = driver.store(&context, to_store).await?;
+                let claims = driver
+                    .store(&context, to_store)
+                    .await
+                    .map_err(ExternalStorageError::from)?;
                 if claims.len() != group.len() {
                     return Err(ExternalStorageError::DriverContract {
                         driver: driver_name,
@@ -285,10 +399,11 @@ mod tests {
             workflowservice::v1::SignalWithStartWorkflowExecutionRequest,
         },
     };
+    use anyhow::anyhow;
     use futures::future::{self, BoxFuture};
     use std::sync::Mutex;
     use temporalio_common_wasm::data_converters::{
-        StorageDriver, StorageDriverPermit, StorageDriverSelector,
+        StorageDriver, StorageDriverError, StorageDriverPermit, StorageDriverSelector,
     };
 
     /// Echoes each claim back as a payload (and each payload as a claim), recording the batch
@@ -323,7 +438,7 @@ mod tests {
             &self,
             _context: &temporalio_common_wasm::data_converters::StorageDriverStoreContext,
             payloads: Vec<Payload>,
-        ) -> BoxFuture<'static, Result<Vec<StorageDriverClaim>, ExternalStorageError>> {
+        ) -> BoxFuture<'static, Result<Vec<StorageDriverClaim>, StorageDriverError>> {
             self.batches.lock().unwrap().push(payloads.len());
             let barrier = Arc::clone(&self.barrier);
             Box::pin(async move {
@@ -345,7 +460,7 @@ mod tests {
             &self,
             _context: &StorageDriverRetrieveContext,
             claims: Vec<StorageDriverClaim>,
-        ) -> BoxFuture<'static, Result<Vec<Payload>, ExternalStorageError>> {
+        ) -> BoxFuture<'static, Result<Vec<Payload>, StorageDriverError>> {
             self.batches.lock().unwrap().push(claims.len());
             let barrier = Arc::clone(&self.barrier);
             Box::pin(async move {
@@ -369,7 +484,7 @@ mod tests {
         fn acquire<'a>(
             &'a self,
             _item: &'a Item,
-        ) -> BoxFuture<'a, Result<StorageDriverPermit, ExternalStorageError>> {
+        ) -> BoxFuture<'a, Result<StorageDriverPermit, StorageDriverError>> {
             Box::pin(future::ready(Ok(StorageDriverPermit::new(Box::new(())))))
         }
     }
@@ -481,7 +596,7 @@ mod tests {
             &self,
             _context: &StorageDriverStoreContext,
             payloads: Vec<Payload>,
-        ) -> BoxFuture<'static, Result<Vec<StorageDriverClaim>, ExternalStorageError>> {
+        ) -> BoxFuture<'static, Result<Vec<StorageDriverClaim>, StorageDriverError>> {
             let stored = Arc::clone(&self.stored);
             Box::pin(async move {
                 let mut held = stored.lock().unwrap();
@@ -502,8 +617,40 @@ mod tests {
             &self,
             _context: &StorageDriverRetrieveContext,
             _claims: Vec<StorageDriverClaim>,
-        ) -> BoxFuture<'static, Result<Vec<Payload>, ExternalStorageError>> {
+        ) -> BoxFuture<'static, Result<Vec<Payload>, StorageDriverError>> {
             Box::pin(future::ready(Ok(vec![])))
+        }
+    }
+
+    /// Fails every request with an I/O error, converted with `?` as a real driver would.
+    struct FailingDriver;
+
+    impl FailingDriver {
+        async fn fail<T>() -> Result<T, StorageDriverError> {
+            Err(std::io::Error::other("bucket unreachable"))?
+        }
+    }
+
+    impl StorageDriver for FailingDriver {
+        fn name(&self) -> &str {
+            "mem"
+        }
+        fn driver_type(&self) -> &str {
+            "test.failing"
+        }
+        fn store(
+            &self,
+            _context: &StorageDriverStoreContext,
+            _payloads: Vec<Payload>,
+        ) -> BoxFuture<'static, Result<Vec<StorageDriverClaim>, StorageDriverError>> {
+            Box::pin(Self::fail())
+        }
+        fn retrieve(
+            &self,
+            _context: &StorageDriverRetrieveContext,
+            _claims: Vec<StorageDriverClaim>,
+        ) -> BoxFuture<'static, Result<Vec<Payload>, StorageDriverError>> {
+            Box::pin(Self::fail())
         }
     }
 
@@ -523,14 +670,14 @@ mod tests {
             &self,
             _context: &StorageDriverStoreContext,
             _payloads: Vec<Payload>,
-        ) -> BoxFuture<'static, Result<Vec<StorageDriverClaim>, ExternalStorageError>> {
+        ) -> BoxFuture<'static, Result<Vec<StorageDriverClaim>, StorageDriverError>> {
             Box::pin(future::ready(Ok(vec![])))
         }
         fn retrieve(
             &self,
             _context: &StorageDriverRetrieveContext,
             _claims: Vec<StorageDriverClaim>,
-        ) -> BoxFuture<'static, Result<Vec<Payload>, ExternalStorageError>> {
+        ) -> BoxFuture<'static, Result<Vec<Payload>, StorageDriverError>> {
             Box::pin(future::ready(Ok(vec![])))
         }
     }
@@ -683,6 +830,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_driver_failure_is_reported_with_the_drivers_error() {
+        let storage = ExternalStorage::new(Arc::new(FailingDriver))
+            .unwrap()
+            .with_payload_size_threshold(1);
+
+        let store_err = store_payloads(&mut [sized(50)], &storage, None, &store_limiter())
+            .await
+            .unwrap_err();
+        let retrieve_err = retrieve_payloads(&mut [reference("mem", "a")], &storage, &limiter())
+            .await
+            .unwrap_err();
+
+        for err in [store_err, retrieve_err] {
+            assert!(
+                matches!(err, ExternalStorageError::Driver(_)),
+                "got {err:?}"
+            );
+            let source = std::error::Error::source(&err).expect("the driver's error is the source");
+            assert!(source.downcast_ref::<std::io::Error>().is_some());
+            assert_eq!(source.to_string(), "bucket unreachable");
+        }
+    }
+
+    #[tokio::test]
     async fn a_retrieve_driver_returning_the_wrong_number_of_payloads_is_an_error() {
         let storage = ExternalStorage::new(Arc::new(MiscountingDriver { name: "mem" })).unwrap();
         let mut payloads = vec![reference("mem", "a")];
@@ -801,7 +972,7 @@ mod tests {
             &self,
             _context: &StorageDriverStoreContext,
             payloads: Vec<Payload>,
-        ) -> BoxFuture<'static, Result<Vec<StorageDriverClaim>, ExternalStorageError>> {
+        ) -> BoxFuture<'static, Result<Vec<StorageDriverClaim>, StorageDriverError>> {
             let stored = Arc::clone(&self.stored);
             Box::pin(async move {
                 let mut held = stored.lock().unwrap();
@@ -819,18 +990,16 @@ mod tests {
             &self,
             _context: &StorageDriverRetrieveContext,
             claims: Vec<StorageDriverClaim>,
-        ) -> BoxFuture<'static, Result<Vec<Payload>, ExternalStorageError>> {
+        ) -> BoxFuture<'static, Result<Vec<Payload>, StorageDriverError>> {
             let stored = Arc::clone(&self.stored);
             Box::pin(async move {
                 let held = stored.lock().unwrap();
                 claims
                     .into_iter()
                     .map(|c| {
-                        held.get(&c.claim_data["key"]).cloned().ok_or_else(|| {
-                            ExternalStorageError::InvalidReference(
-                                "stored payload not found".into(),
-                            )
-                        })
+                        held.get(&c.claim_data["key"])
+                            .cloned()
+                            .ok_or_else(|| anyhow!("stored payload not found").into())
                     })
                     .collect()
             })
@@ -849,7 +1018,7 @@ mod tests {
         )
         .unwrap()
         .with_payload_size_threshold(1);
-        let runner = ExternalStorageRunner::new(&storage, store_limiter(), limiter());
+        let runner = ExternalStorageRunner::new(&storage);
         let mut request = request_with_large_payloads();
         let before = request.clone();
 
@@ -868,7 +1037,7 @@ mod tests {
     async fn the_runner_reports_a_driver_it_does_not_know() {
         let batches = Arc::new(Mutex::new(vec![]));
         let storage = storage("mem", Arc::clone(&batches));
-        let runner = ExternalStorageRunner::new(&storage, store_limiter(), limiter());
+        let runner = ExternalStorageRunner::new(&storage);
         // A reference to the registered driver sits beside the unknown one.
         let mut request = SignalWithStartWorkflowExecutionRequest {
             input: Some(Payloads {
@@ -939,7 +1108,7 @@ mod tests {
         stored: Arc<Mutex<Vec<Payload>>>,
     ) {
         let storage = storage_with_threshold(1, stored);
-        let runner = ExternalStorageRunner::new(&storage, store_limiter(), limiter());
+        let runner = ExternalStorageRunner::new(&storage);
         runner.store_in(request, None).await.unwrap();
     }
 
@@ -970,7 +1139,7 @@ mod tests {
     async fn every_other_payload_bearing_field_is_retrieved() {
         let batches = Arc::new(Mutex::new(vec![]));
         let storage = storage("mem", Arc::clone(&batches));
-        let runner = ExternalStorageRunner::new(&storage, store_limiter(), limiter());
+        let runner = ExternalStorageRunner::new(&storage);
         let mut request = request_with_references();
         let search_attributes = request.search_attributes.clone();
 
@@ -994,5 +1163,31 @@ mod tests {
         let mut sizes = batches.lock().unwrap().clone();
         sizes.sort_unstable();
         assert_eq!(sizes, vec![1, 1, 1, 2]);
+    }
+
+    #[tokio::test]
+    async fn a_reference_with_no_storage_configured_is_tmprl1105() {
+        let mut request = SignalWithStartWorkflowExecutionRequest {
+            input: Some(Payloads {
+                payloads: vec![inline("fine"), reference("mem", "a")],
+            }),
+            ..Default::default()
+        };
+
+        let err = retrieve_in(None, &mut request).await.unwrap_err();
+
+        assert!(matches!(err, ExternalStorageError::NotConfigured));
+        assert!(err.to_string().contains("TMPRL1105"));
+    }
+
+    #[tokio::test]
+    async fn with_no_storage_configured_messages_pass_through() {
+        let mut request = request_with_large_payloads();
+        let before = request.clone();
+
+        store_in(None, &mut request, None).await.unwrap();
+        retrieve_in(None, &mut request).await.unwrap();
+
+        assert_eq!(request, before);
     }
 }

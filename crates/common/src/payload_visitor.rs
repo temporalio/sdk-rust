@@ -5,7 +5,9 @@
 //! boundary between the SDK and Core.
 
 use crate::{
-    data_converters::{PayloadCodec, PayloadConversionError, SerializationContextData},
+    data_converters::{
+        DataConverter, PayloadCodec, PayloadConversionError, SerializationContextData,
+    },
     protos::temporal::api::common::v1::{Payload, Payloads},
 };
 use futures::future::BoxFuture;
@@ -144,6 +146,54 @@ pub async fn decode_payloads<M: PayloadVisitable + Send>(
 ) -> Result<(), PayloadConversionError> {
     let mut visitor = DecodeVisitor { codec, context };
     msg.visit_payloads_mut(&mut visitor).await
+}
+
+/// Offload every eligible payload in an outbound message to the data converter's external storage.
+/// Runs after [`encode_payloads`], since the size threshold applies to encoded payloads.
+///
+/// On error the message is left partly processed and must not be sent.
+#[cfg(feature = "experimental")]
+#[doc(hidden)]
+pub async fn store_external_payloads<M: PayloadVisitable + Send>(
+    msg: &mut M,
+    data_converter: &DataConverter,
+) -> Result<(), crate::external_storage_runner::ExternalStorageError> {
+    // Stored without a target until the worker and client can name the execution a message is for.
+    crate::external_storage_runner::store_in(data_converter.external_storage(), msg, None).await
+}
+
+/// Replace every external storage reference in an inbound message with the payload it points at.
+/// Runs before [`decode_payloads`], since a driver returns a payload as it was before offloading.
+///
+/// On error the message is left partly processed and must not be used.
+#[cfg(feature = "experimental")]
+#[doc(hidden)]
+pub async fn retrieve_external_payloads<M: PayloadVisitable + Send>(
+    msg: &mut M,
+    data_converter: &DataConverter,
+) -> Result<(), crate::external_storage_runner::ExternalStorageError> {
+    crate::external_storage_runner::retrieve_in(data_converter.external_storage(), msg).await
+}
+
+// Without the feature these do nothing, so call sites need not be gated on it. They return the
+// conversion error because the storage error does not exist without the feature, and every call
+// site already converts from this one.
+#[cfg(not(feature = "experimental"))]
+#[doc(hidden)]
+pub async fn store_external_payloads<M: PayloadVisitable + Send>(
+    _msg: &mut M,
+    _data_converter: &DataConverter,
+) -> Result<(), PayloadConversionError> {
+    Ok(())
+}
+
+#[cfg(not(feature = "experimental"))]
+#[doc(hidden)]
+pub async fn retrieve_external_payloads<M: PayloadVisitable + Send>(
+    _msg: &mut M,
+    _data_converter: &DataConverter,
+) -> Result<(), PayloadConversionError> {
+    Ok(())
 }
 
 // Manual impl for Payload - visits itself as a single payload

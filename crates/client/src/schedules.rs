@@ -13,13 +13,15 @@ use std::{
     task::{Context, Poll},
     time::{Duration, SystemTime},
 };
+#[cfg(feature = "experimental")]
+use temporalio_common::data_converters::ExternalStorageError;
 use temporalio_common::{
     HasWorkflowDefinition,
     data_converters::{
         DataConverter, PayloadConversionError, SerializationContextData, TemporalDeserializable,
         TemporalSerializable, WorkflowSerializationContext,
     },
-    payload_visitor::decode_payloads,
+    payload_visitor::{decode_payloads, retrieve_external_payloads, store_external_payloads},
     protos::{
         coresdk::IntoPayloadsExt,
         proto_ts_to_system_time,
@@ -44,6 +46,10 @@ pub enum ScheduleError {
     /// Failed to encode workflow input payloads.
     #[error("Payload conversion error: {0}")]
     PayloadConversion(#[from] PayloadConversionError),
+    /// Storing payloads in, or retrieving them from, external storage failed.
+    #[cfg(feature = "experimental")]
+    #[error("External storage error: {0}")]
+    ExternalStorage(#[from] ExternalStorageError),
     /// The server returned a schedule description that is missing required fields.
     #[error("Malformed schedule description for schedule ID '{schedule_id}': {reason}")]
     MalformedDescription {
@@ -1212,11 +1218,11 @@ where
         }
         .into_request();
         rpc_options.apply_to(&mut request);
-        Ok(
-            WorkflowService::describe_schedule(&mut self.client.clone(), request)
-                .await?
-                .into_inner(),
-        )
+        let mut response = WorkflowService::describe_schedule(&mut self.client.clone(), request)
+            .await?
+            .into_inner();
+        retrieve_external_payloads(&mut response, self.client.data_converter()).await?;
+        Ok(response)
     }
 
     async fn send_update_raw(
@@ -1235,8 +1241,9 @@ where
             identity: self.client.identity(),
             request_id: Uuid::new_v4().to_string(),
             ..Default::default()
-        }
-        .into_request();
+        };
+        store_external_payloads(&mut request, self.client.data_converter()).await?;
+        let mut request = request.into_request();
         rpc_options.apply_to(&mut request);
         WorkflowService::update_schedule(&mut self.client.clone(), request).await?;
         Ok(())
@@ -1514,8 +1521,9 @@ impl Client {
                             identity: client.identity(),
                             request_id: Uuid::new_v4().to_string(),
                             ..Default::default()
-                        }
-                        .into_request();
+                        };
+                        store_external_payloads(&mut request, client.data_converter()).await?;
+                        let mut request = request.into_request();
                         options.rpc_options.apply_to(&mut request);
                         WorkflowService::create_schedule(&mut client, request).await?;
                         Ok(CreateScheduleOutput::new(input.schedule_id))
@@ -1590,10 +1598,15 @@ where
                                     }
                                     .into_request();
                                     input.rpc_options.apply_to(&mut request);
-                                    let response =
+                                    let mut response =
                                         WorkflowService::list_schedules(&mut rpc_client, request)
                                             .await?
                                             .into_inner();
+                                    retrieve_external_payloads(
+                                        &mut response,
+                                        rpc_client.data_converter(),
+                                    )
+                                    .await?;
                                     Ok(ListSchedulesPageOutput::new(
                                         response.schedules,
                                         response.next_page_token,
