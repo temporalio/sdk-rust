@@ -213,6 +213,7 @@ pub struct ClientOptions {
     client_plugins_applied: bool,
 
     /// The data converter used for serializing/deserializing payloads.
+    /// Configure automatic client header encoding with [`DataConverter::with_encode_headers`].
     #[builder(default)]
     pub data_converter: DataConverter,
     /// Interceptors for high-level client operations, ordered outermost to innermost.
