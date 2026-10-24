@@ -32,6 +32,7 @@ pub struct DataConverter {
     #[allow(dead_code)] // Will be used for failure conversion
     failure_converter: Arc<dyn FailureConverter + Send + Sync>,
     codec: Arc<dyn PayloadCodec + Send + Sync>,
+    encode_headers: bool,
 }
 
 impl std::fmt::Debug for DataConverter {
@@ -53,7 +54,33 @@ impl DataConverter {
             payload_converter,
             failure_converter: Arc::new(failure_converter),
             codec: Arc::new(codec),
+            encode_headers: false,
         }
+    }
+
+    /// Apply the codec to serialized headers on high-level client requests. Defaults to false.
+    ///
+    /// The default converter uses an identity codec, so enabling this option is a no-op.
+    ///
+    /// Header payloads must already be serialized, but not codec-encoded. Remove manual header
+    /// encoding before enabling this option, including for tracing headers; their serialization
+    /// is unchanged. Ensure decoders can read both existing and newly written headers before
+    /// enabling it; codecs need not accept legacy plaintext. Workers always codec headers,
+    /// independently of this option.
+    ///
+    /// Low-level RPCs and raw schedule actions retained from descriptions remain wire payloads
+    /// and are not processed by this option. The codec must return exactly one payload per header
+    /// entry; other output cardinalities fail the request.
+    pub fn with_encode_headers(mut self, enabled: bool) -> Self {
+        self.encode_headers = enabled;
+        self
+    }
+
+    /// Whether high-level client requests apply the codec to serialized header payloads.
+    ///
+    /// This does not affect the unconditional header codec behavior of Rust workers.
+    pub fn encode_headers(&self) -> bool {
+        self.encode_headers
     }
 
     /// Serialize a value into a single payload, applying the codec.
@@ -897,6 +924,15 @@ mod tests {
     use super::*;
     use crate::data_converters::well_known::BINARY_PLAIN_ENCODING_VAL;
     use rstest::rstest;
+
+    #[test]
+    fn header_encoding_policy() {
+        let converter = DataConverter::default();
+        assert!(!converter.encode_headers());
+        let converter = converter.with_encode_headers(true);
+        assert!(converter.clone().encode_headers());
+        assert!(!converter.with_encode_headers(false).encode_headers());
+    }
 
     #[test]
     fn unit_payloads_roundtrip() {
