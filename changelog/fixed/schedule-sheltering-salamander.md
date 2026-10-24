@@ -1,0 +1,1 @@
+Schedule descriptions and updates now preserve codec-encoded action headers, arguments, and memo when retaining the existing action instead of resending decoded payloads; response memo is still decoded.

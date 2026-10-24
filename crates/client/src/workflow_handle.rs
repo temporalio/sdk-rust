@@ -809,7 +809,11 @@ where
                             request_id: options
                                 .request_id
                                 .unwrap_or_else(|| Uuid::new_v4().to_string()),
-                            header: options.header,
+                            header: crate::encode_client_headers(
+                                &client,
+                                options.header,
+                                &SerializationContextData::Workflow(WorkflowSerializationContext::new()),
+                            ).await?,
                             ..Default::default()
                         };
                         let target = request.workflow_execution.as_ref().map(|execution| {
@@ -887,7 +891,11 @@ where
                             query: Some(WorkflowQuery {
                                 query_type: query_name,
                                 query_args: Some(Payloads { payloads }),
-                                header: options.header,
+                                header: crate::encode_client_headers(
+                                    &client,
+                                    options.header,
+                                    &SerializationContextData::Workflow(WorkflowSerializationContext::new()),
+                                ).await?,
                             }),
                             query_reject_condition: options
                                 .reject_condition
@@ -1020,7 +1028,14 @@ where
                                 run_id,
                                 update_id.clone(),
                                 update_name,
-                                options.header,
+                                crate::encode_client_headers(
+                                    &client,
+                                    options.header,
+                                    &SerializationContextData::Workflow(
+                                        WorkflowSerializationContext::new(),
+                                    ),
+                                )
+                                .await?,
                                 payloads,
                             );
                             let target = request.workflow_execution.as_ref().map(|execution| {

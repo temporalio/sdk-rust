@@ -1,0 +1,1 @@
+Added opt-in automatic client header codec processing with `DataConverter::with_encode_headers(true)`, including with the default identity codec. Header payloads must be serialized but not manually codec-encoded when enabled; existing client defaults and unconditional worker header processing are unchanged.

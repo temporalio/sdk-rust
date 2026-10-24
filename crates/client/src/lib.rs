@@ -17,6 +17,8 @@ mod dns;
 pub mod envconfig;
 pub mod errors;
 pub mod grpc;
+#[cfg(test)]
+mod header_tests;
 /// Interceptors for high-level client operations.
 pub mod interceptors;
 mod metrics;
@@ -134,7 +136,7 @@ use std::{
 use temporalio_common::{
     ActivityDefinition, HasWorkflowDefinition, SignalDefinition, UntypedActivity, UpdateDefinition,
     data_converters::{
-        ActivitySerializationContext, DataConverter, SerializationContext,
+        ActivitySerializationContext, DataConverter, PayloadConversionError, SerializationContext,
         SerializationContextData, WorkflowSerializationContext,
     },
     external_storage::{StoreTarget, retrieve_external_payloads, store_external_payloads},
@@ -145,7 +147,7 @@ use temporalio_common::{
         proto_ts_to_system_time,
         temporal::api::{
             cloud::cloudservice::v1::cloud_service_client::CloudServiceClient,
-            common::v1::{ActivityType, Memo as ProtoMemo, Payloads, WorkflowType},
+            common::v1::{ActivityType, Header, Memo as ProtoMemo, Payloads, WorkflowType},
             enums::v1::{
                 ActivityIdConflictPolicy as ProtoActivityIdConflictPolicy,
                 ActivityIdReusePolicy as ProtoActivityIdReusePolicy, TaskQueueKind,
@@ -1804,16 +1806,16 @@ impl WorkflowCountAggregationGroup {
 
 // Keep the common fields used by start RPC variants in one place so their option handling does
 // not drift as new fields are added.
-fn build_start_workflow_request(
+async fn build_start_workflow_request(
     client: &impl NamespacedClient,
     workflow_type: String,
     input: Option<Payloads>,
     memo: Option<ProtoMemo>,
     options: WorkflowStartOptions,
-) -> StartWorkflowExecutionRequest {
+) -> Result<StartWorkflowExecutionRequest, PayloadConversionError> {
     let user_metadata = options.user_metadata();
     let request_eager_execution = options.enable_eager_workflow_start;
-    StartWorkflowExecutionRequest {
+    Ok(StartWorkflowExecutionRequest {
         namespace: client.namespace(),
         input,
         workflow_id: options.workflow_id,
@@ -1850,10 +1852,44 @@ fn build_start_workflow_request(
         priority: Some(options.priority.into()),
         versioning_override: options.versioning_override.map(Into::into),
         memo,
-        header: options.header,
+        header: encode_client_headers(
+            client,
+            options.header,
+            &SerializationContextData::Workflow(WorkflowSerializationContext::new()),
+        )
+        .await?,
         user_metadata,
         ..Default::default()
+    })
+}
+
+pub(crate) async fn encode_client_headers(
+    client: &impl NamespacedClient,
+    mut header: Option<Header>,
+    context: &SerializationContextData,
+) -> Result<Option<Header>, PayloadConversionError> {
+    if client.data_converter().encode_headers()
+        && let Some(header) = header.as_mut()
+    {
+        for (key, payload) in &mut header.fields {
+            let mut encoded = client
+                .data_converter()
+                .codec()
+                .encode(context, vec![std::mem::take(payload)])
+                .await?;
+            if encoded.len() != 1 {
+                return Err(PayloadConversionError::EncodingError(
+                    format!(
+                        "Header {key:?} requires exactly one encoded payload, codec returned {}",
+                        encoded.len()
+                    )
+                    .into(),
+                ));
+            }
+            *payload = encoded.remove(0);
+        }
     }
+    Ok(header)
 }
 
 impl<T> WorkflowClientTrait for T
@@ -1907,7 +1943,7 @@ where
                             payloads.into_payloads(),
                             memo,
                             options,
-                        );
+                        ).await?;
                         let target = StoreTarget::workflow(
                             &request.namespace,
                             &request.workflow_id,
@@ -2015,7 +2051,7 @@ where
                             workflow_payloads.into_payloads(),
                             memo,
                             options,
-                        );
+                        ).await?;
                         if let Some(task_queue) = &mut start_request.task_queue {
                             task_queue.kind = TaskQueueKind::Normal as i32;
                         }
@@ -2173,7 +2209,8 @@ where
                             workflow_payloads.into_payloads(),
                             memo,
                             start_options,
-                        );
+                        )
+                        .await?;
                         let target = StoreTarget::workflow(
                             &namespace,
                             &workflow_id,
@@ -2192,7 +2229,14 @@ where
                             String::new(),
                             update_id.clone(),
                             update_name,
-                            update_header,
+                            encode_client_headers(
+                                &client,
+                                update_header,
+                                &SerializationContextData::Workflow(
+                                    WorkflowSerializationContext::new(),
+                                ),
+                            )
+                            .await?,
                             update_payloads,
                         );
 
@@ -2571,7 +2615,7 @@ where
             id_conflict_policy: ProtoActivityIdConflictPolicy::from(options.id_conflict_policy)
                 .into(),
             search_attributes: options.search_attributes.map(SearchAttributes::into_proto),
-            header: options.header,
+            header: encode_client_headers(&client, options.header, sc).await?,
             user_metadata,
             priority: Some(options.priority.into()),
             start_delay: try_into_or_box_err(options.start_delay, StartActivityError::Other)?,
@@ -4361,6 +4405,7 @@ mod tests {
             responses: Arc<Mutex<VecDeque<ExecuteMultiOperationResponse>>>,
             call_count: Arc<Mutex<usize>>,
             interceptors: Vec<Arc<dyn ClientInterceptor>>,
+            converter: DataConverter,
         }
 
         impl MockMultiOperationClient {
@@ -4373,6 +4418,7 @@ mod tests {
                     responses: Arc::new(Mutex::new(responses.into_iter().collect())),
                     call_count: Arc::new(Mutex::new(0)),
                     interceptors,
+                    converter: DataConverter::default(),
                 }
             }
         }
@@ -4384,6 +4430,10 @@ mod tests {
 
             fn identity(&self) -> String {
                 "test-identity".to_owned()
+            }
+
+            fn data_converter(&self) -> &DataConverter {
+                &self.converter
             }
 
             fn client_interceptors(&self) -> &[Arc<dyn ClientInterceptor>] {
@@ -4399,7 +4449,10 @@ mod tests {
                 '_,
                 Result<Response<ExecuteMultiOperationResponse>, tonic::Status>,
             > {
-                *self.recorded.lock() = Some(request.into_inner());
+                let request = request.into_inner();
+                if let Some(previous) = self.recorded.lock().replace(request.clone()) {
+                    assert_eq!(previous, request, "retry must reuse the encoded request");
+                }
                 *self.call_count.lock() += 1;
                 let response = self.responses.lock().pop_front().unwrap_or_else(|| {
                     successful_multi_operation_response(
@@ -4552,6 +4605,123 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(result, "update-result");
+        }
+
+        #[tokio::test]
+        async fn update_with_start_encodes_interceptor_headers_once_before_retry() {
+            struct InjectHeaders;
+
+            impl ClientInterceptor for InjectHeaders {
+                fn update_with_start_workflow<'a>(
+                    &'a self,
+                    mut input: UpdateWithStartWorkflowInput,
+                    next: Next<
+                        'a,
+                        UpdateWithStartWorkflowInput,
+                        BoxFuture<
+                            'a,
+                            Result<UpdateWithStartWorkflowOutput, WorkflowUpdateWithStartError>,
+                        >,
+                    >,
+                ) -> BoxFuture<
+                    'a,
+                    Result<UpdateWithStartWorkflowOutput, WorkflowUpdateWithStartError>,
+                > {
+                    input.options.start_header = Some(Header {
+                        fields: [(
+                            "_tracer-data".into(),
+                            Payload {
+                                data: vec![1],
+                                ..Default::default()
+                            },
+                        )]
+                        .into(),
+                    });
+                    input.options.update_header = Some(Header {
+                        fields: [(
+                            "custom".into(),
+                            Payload {
+                                data: vec![2],
+                                ..Default::default()
+                            },
+                        )]
+                        .into(),
+                    });
+                    next.run(input)
+                }
+            }
+
+            let calls = Arc::default();
+            let mut client = MockMultiOperationClient::new(
+                vec![Arc::new(InjectHeaders)],
+                [
+                    UpdateWorkflowExecutionLifecycleStage::Unspecified,
+                    UpdateWorkflowExecutionLifecycleStage::Accepted,
+                ]
+                .map(successful_multi_operation_response),
+            );
+            client.converter = DataConverter::new(
+                PayloadConverter::default(),
+                temporalio_common::data_converters::DefaultFailureConverter::default(),
+                crate::header_tests::RecordingHeaderCodec {
+                    calls: Arc::clone(&calls),
+                    output_count: 1,
+                },
+            )
+            .with_encode_headers(true);
+            client
+                .start_update_with_start_workflow(
+                    TestWorkflow,
+                    "workflow-input".to_owned(),
+                    TestUpdate,
+                    "update-input".to_owned(),
+                    update_with_start_options(WorkflowIdConflictPolicy::Fail),
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(*client.call_count.lock(), 2);
+            let calls = calls.lock().unwrap();
+            assert_eq!(calls.len(), 4);
+            assert!(calls.iter().all(|(context, _)| *context
+                == SerializationContextData::Workflow(WorkflowSerializationContext::new())));
+            for data in [vec![1], vec![2]] {
+                assert_eq!(
+                    calls
+                        .iter()
+                        .filter(|(_, payloads)| payloads[0].data == data)
+                        .count(),
+                    1
+                );
+            }
+            let request = client.recorded.lock().take().unwrap();
+            let start = assert_matches!(
+                &request.operations[0].operation,
+                Some(MultiOperationRequest::StartWorkflow(request)) => request
+            );
+            let update = assert_matches!(
+                &request.operations[1].operation,
+                Some(MultiOperationRequest::UpdateWorkflow(request)) => request
+            );
+            assert_eq!(
+                start.header.as_ref().unwrap().fields["_tracer-data"].data,
+                vec![1, 42]
+            );
+            assert_eq!(
+                update
+                    .request
+                    .as_ref()
+                    .unwrap()
+                    .input
+                    .as_ref()
+                    .unwrap()
+                    .header
+                    .as_ref()
+                    .unwrap()
+                    .fields["custom"]
+                    .data,
+                vec![2, 42]
+            );
         }
 
         #[tokio::test]
