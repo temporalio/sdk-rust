@@ -1058,6 +1058,7 @@ mod tests {
                 max_tps: None,
             },
             Arc::new(AtomicCell::new(None)),
+            Arc::new(AtomicCell::new(None)),
             Arc::new(NamespaceCapabilities::default()),
         );
         WorkerActivityTasks::new(
@@ -1144,6 +1145,7 @@ mod tests {
                 max_worker_acts_per_second: Some(2.0),
                 max_tps: None,
             },
+            Arc::new(AtomicCell::new(None)),
             Arc::new(AtomicCell::new(None)),
             Arc::new(NamespaceCapabilities::default()),
         );

@@ -26,6 +26,8 @@ pub(crate) fn make_wft_poller(
     wft_slots: &MeteredPermitDealer<WorkflowSlotKind>,
     last_successful_poll_time: Arc<AtomicCell<Option<SystemTime>>>,
     sticky_last_successful_poll_time: Arc<AtomicCell<Option<SystemTime>>>,
+    target: Arc<AtomicCell<Option<i32>>>,
+    sticky_target: Arc<AtomicCell<Option<i32>>>,
     capabilities: Arc<NamespaceCapabilities>,
 ) -> impl Stream<
     Item = Result<
@@ -67,6 +69,7 @@ pub(crate) fn make_wft_poller(
             wft_poller_shared: wft_poller_shared.clone(),
         },
         last_successful_poll_time,
+        target,
         capabilities.clone(),
     );
     let sticky_queue_poller = sticky_queue_name.as_ref().map(|sqn| {
@@ -83,6 +86,7 @@ pub(crate) fn make_wft_poller(
             }),
             WorkflowTaskOptions { wft_poller_shared },
             sticky_last_successful_poll_time,
+            sticky_target,
             capabilities,
         )
     });
@@ -441,6 +445,8 @@ mod tests {
             &MetricsContext::no_op(),
             &CancellationToken::new(),
             &wft_slots,
+            Arc::new(AtomicCell::new(None)),
+            Arc::new(AtomicCell::new(None)),
             Arc::new(AtomicCell::new(None)),
             Arc::new(AtomicCell::new(None)),
             Arc::new(NamespaceCapabilities::default()),
