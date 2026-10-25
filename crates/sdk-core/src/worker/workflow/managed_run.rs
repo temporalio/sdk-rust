@@ -31,6 +31,7 @@ use std::{
 use temporalio_common::protos::{
     TaskToken,
     coresdk::{
+        activity_task::WorkflowTaskAttempt,
         common::ExternalStorageMetrics,
         workflow_activation::{
             RemoveFromCache, WorkflowActivation, query_to_job, remove_from_cache::EvictionReason,
@@ -194,6 +195,9 @@ impl ManagedRun {
         let is_incremental = work.is_incremental();
         let wft_info = WorkflowTaskInfo {
             attempt: work.attempt,
+            started_event_id: work.update.wft_started_id,
+            started_time: work.started_time,
+            previous_started_event_id: work.update.previous_wft_started_id,
             task_token: work.task_token,
             wf_id: work.execution.workflow_id.clone(),
         };
@@ -783,7 +787,8 @@ impl ManagedRun {
             if !completion.activation_was_eviction && !self.am_broken {
                 self.wfm.apply_next_task_if_ready()?;
             }
-            let new_local_acts = self.wfm.drain_queued_local_activities();
+            let mut new_local_acts = self.wfm.drain_queued_local_activities();
+            self.stamp_dispatching_task(&mut new_local_acts);
             self.sink_la_requests(new_local_acts)?;
 
             if self.wfm.machines.outstanding_local_activity_count() == 0 {
@@ -1269,6 +1274,40 @@ impl ManagedRun {
         FulfillableActivationComplete {
             result: ActivationCompleteResult { outcome, replaying },
             resp_chan,
+        }
+    }
+
+    /// Sets the current workflow task on each `LocalActRequest::New`. The activity can't find out
+    /// by itself which task dispatched it.
+    fn stamp_dispatching_task(&self, requests: &mut [LocalActRequest]) {
+        let Some(wft) = self.wft.as_ref() else {
+            if requests
+                .iter()
+                .any(|r| matches!(r, LocalActRequest::New(_)))
+            {
+                dbg_panic!("Local activities were dispatched with no workflow task");
+            }
+            return;
+        };
+        let previous_started_event_id = wft.info.previous_started_event_id;
+        let completed = self
+            .wfm
+            .machines
+            .completed_wft()
+            .filter(|c| c.started_event_id == previous_started_event_id);
+        let task = WorkflowTaskAttempt {
+            started_event_id: wft.info.started_event_id,
+            attempt: wft.info.attempt,
+            started_time: wft.info.started_time.map(Into::into),
+            previous_started_event_id,
+            failed_tasks: self.wfm.machines.failed_wft_started_ids(),
+            previous_attempt: completed.map_or(0, |c| c.attempt),
+            previous_started_time: completed.and_then(|c| c.started_time).map(Into::into),
+        };
+        for request in requests {
+            if let LocalActRequest::New(new_la) = request {
+                new_la.workflow_task = Some(task.clone());
+            }
         }
     }
 

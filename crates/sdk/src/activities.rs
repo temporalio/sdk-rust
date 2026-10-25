@@ -228,6 +228,7 @@ impl ActivityContext {
             priority,
             run_id,
             propagated_nexus_serialization_context: _,
+            workflow_task: _,
         } = task;
         let deadline = calculate_deadline(
             scheduled_time.as_ref(),

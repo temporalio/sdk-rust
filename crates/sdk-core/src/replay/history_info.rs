@@ -177,6 +177,12 @@ impl HistoryInfo {
             }),
             previous_started_event_id: self.previous_started_event_id,
             started_event_id: self.workflow_task_started_event_id,
+            // The server sets this to the time of the task's started event.
+            started_time: self
+                .events
+                .iter()
+                .find(|e| e.event_id == self.workflow_task_started_event_id)
+                .and_then(|e| e.event_time),
             ..Default::default()
         }
     }

@@ -156,6 +156,7 @@ impl HistoryPaginator {
         let prepared = PreparedWFT {
             task_token: wft.task_token,
             attempt: wft.attempt,
+            started_time: wft.started_time,
             execution: wft.workflow_execution,
             workflow_type: wft.workflow_type,
             legacy_query: wft.legacy_query,

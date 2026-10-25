@@ -78,6 +78,19 @@ use temporalio_common::{
 type Result<T, E = WFMachinesError> = std::result::Result<T, E>;
 
 slotmap::new_key_type! { struct MachineKey; }
+
+/// The maximum number of failed workflow tasks in a local activity start.
+const MAX_FAILED_WFTS: usize = 100;
+
+/// One workflow task attempt, from its scheduled and started events.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct WftAttempt {
+    scheduled_event_id: i64,
+    pub(crate) started_event_id: i64,
+    pub(crate) attempt: u32,
+    pub(crate) started_time: Option<SystemTime>,
+}
+
 /// Handles all the logic for driving a workflow. It orchestrates many state machines that together
 /// comprise the logic of an executing workflow. One instance will exist per currently executing
 /// (or cached) workflow on the worker.
@@ -86,6 +99,13 @@ pub(crate) struct WorkflowMachines {
     /// kept because the lang side polls & completes for every workflow task, but we do not need
     /// to poll the server that often during replay.
     last_history_from_server: HistoryUpdate,
+    /// The started event ids of the run's failed and timed out workflow tasks. Each local activity
+    /// start has them, so that the activity knows which tasks never completed.
+    failed_wft_started_ids: VecDeque<i64>,
+    /// The last workflow task in history, and the last one that completed. A local activity start
+    /// has the attempt and the started time of the completed one.
+    last_wft: WftAttempt,
+    completed_wft: Option<WftAttempt>,
     /// Protocol messages that have yet to be processed for the current WFT.
     protocol_msgs: Vec<IncomingProtocolMessage>,
     /// EventId of the last handled WorkflowTaskStarted event
@@ -276,6 +296,9 @@ impl WorkflowMachines {
         };
         Self {
             last_history_from_server: basics.history,
+            failed_wft_started_ids: VecDeque::new(),
+            last_wft: WftAttempt::default(),
+            completed_wft: None,
             protocol_msgs: vec![],
             workflow_id: basics.workflow_id,
             workflow_type: basics.workflow_type,
@@ -345,6 +368,7 @@ impl WorkflowMachines {
     }
 
     pub(crate) fn new_history_from_server(&mut self, update: HistoryUpdate) -> Result<()> {
+        self.note_wft_events(update.get_events());
         self.last_history_from_server = update;
         self.replaying = self.preparing_legacy_query
             || self.last_history_from_server.previous_wft_started_id > 0;
@@ -415,6 +439,73 @@ impl WorkflowMachines {
 
     pub(crate) fn get_last_wft_started_id(&self) -> i64 {
         self.current_started_event_id
+    }
+
+    pub(crate) fn failed_wft_started_ids(&self) -> Vec<i64> {
+        self.failed_wft_started_ids.iter().copied().collect()
+    }
+
+    pub(crate) fn completed_wft(&self) -> Option<WftAttempt> {
+        self.completed_wft
+    }
+
+    /// Notes the failed and the completed workflow tasks. Keeps only the last `MAX_FAILED_WFTS`
+    /// failed ids, so that the list stays small on a long run.
+    fn note_wft_events(&mut self, events: &[HistoryEvent]) {
+        for event in events {
+            let started = match &event.attributes {
+                Some(history_event::Attributes::WorkflowTaskScheduledEventAttributes(a)) => {
+                    self.last_wft = WftAttempt {
+                        scheduled_event_id: event.event_id,
+                        attempt: a.attempt.max(0) as u32,
+                        ..Default::default()
+                    };
+                    continue;
+                }
+                Some(history_event::Attributes::WorkflowTaskStartedEventAttributes(a)) => {
+                    if a.scheduled_event_id == self.last_wft.scheduled_event_id {
+                        self.last_wft.started_event_id = event.event_id;
+                        // This is the conversion of the poll response's started time, so the two
+                        // are equal.
+                        self.last_wft.started_time =
+                            event.event_time.and_then(|t| t.try_into().ok());
+                    }
+                    continue;
+                }
+                Some(history_event::Attributes::WorkflowTaskCompletedEventAttributes(a)) => {
+                    let wft = self.last_wft;
+                    let newer = self
+                        .completed_wft
+                        .is_none_or(|c| c.started_event_id < wft.started_event_id);
+                    if a.scheduled_event_id == wft.scheduled_event_id
+                        && wft.started_event_id > 0
+                        && newer
+                    {
+                        self.completed_wft = Some(wft);
+                    }
+                    continue;
+                }
+                Some(history_event::Attributes::WorkflowTaskFailedEventAttributes(a)) => {
+                    a.started_event_id
+                }
+                Some(history_event::Attributes::WorkflowTaskTimedOutEventAttributes(a)) => {
+                    a.started_event_id
+                }
+                _ => continue,
+            };
+            // Core can get the same page of history again after a cache miss.
+            if self
+                .failed_wft_started_ids
+                .back()
+                .is_some_and(|&last| last >= started)
+            {
+                continue;
+            }
+            if self.failed_wft_started_ids.len() == MAX_FAILED_WFTS {
+                self.failed_wft_started_ids.pop_front();
+            }
+            self.failed_wft_started_ids.push_back(started);
+        }
     }
 
     pub(crate) fn history_size_bytes(&self) -> u64 {

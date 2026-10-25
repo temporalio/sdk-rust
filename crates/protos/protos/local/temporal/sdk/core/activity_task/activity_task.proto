@@ -70,6 +70,28 @@ message Start {
     // Only set for standalone activities. Lang should use it to serialize the activity's result and
     // failure, which are returned to the Nexus caller.
     temporal.api.nexus.v1.PropagatedSerializationContext propagated_nexus_serialization_context = 20;
+    // For a local activity, the workflow task in which Core dispatched this execution. Retries that
+    // Core runs locally keep the value. Unset for other activities.
+    WorkflowTaskAttempt workflow_task = 21;
+}
+
+// One attempt of a workflow task, from the poll response and the history of that attempt.
+message WorkflowTaskAttempt {
+    // The event id of the task's WorkflowTaskStarted event.
+    int64 started_event_id = 1;
+    uint32 attempt = 2;
+    // When the server started the task.
+    google.protobuf.Timestamp started_time = 3;
+    // The started event id of the run's last completed workflow task, from the poll response.
+    // 0 when no task of the run has completed.
+    int64 previous_started_event_id = 4;
+    // The started event ids of the run's last 100 failed and timed out workflow tasks in history,
+    // in event order. The cap keeps each start small. A transient attempt has no such event.
+    repeated int64 failed_tasks = 5;
+    // The attempt and the started time of the task at previous_started_event_id, from its
+    // WorkflowTaskScheduled and WorkflowTaskStarted events. Unset when no task has completed.
+    uint32 previous_attempt = 6;
+    google.protobuf.Timestamp previous_started_time = 7;
 }
 
 // Attempt to cancel a running activity

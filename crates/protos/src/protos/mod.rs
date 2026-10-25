@@ -356,6 +356,7 @@ pub mod coresdk {
                             run_id: r.activity_run_id,
                             propagated_nexus_serialization_context: r
                                 .propagated_nexus_serialization_context,
+                            workflow_task: None,
                         },
                     )),
                 }

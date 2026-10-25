@@ -57,6 +57,8 @@ pub(crate) struct ValidPollWFTQResponse {
     pub(crate) attempt: u32,
     pub(crate) previous_started_event_id: i64,
     pub(crate) started_event_id: i64,
+    /// When the server started the task. From the `started_time` field.
+    pub(crate) started_time: Option<SystemTime>,
     /// If this is present, `history` will be empty. This is not a very "tight" design, but it's
     /// enforced at construction time. From the `query` field.
     pub(crate) legacy_query: Option<WorkflowQuery>,
@@ -106,6 +108,7 @@ impl TryFrom<PollWorkflowTaskQueueResponse> for ValidPollWFTQResponse {
                 attempt,
                 previous_started_event_id,
                 started_event_id,
+                started_time,
                 query,
                 queries,
                 messages,
@@ -130,6 +133,7 @@ impl TryFrom<PollWorkflowTaskQueueResponse> for ValidPollWFTQResponse {
                     attempt: attempt as u32,
                     previous_started_event_id,
                     started_event_id,
+                    started_time: started_time.and_then(|t| t.try_into().ok()),
                     legacy_query: query,
                     query_requests,
                     messages,
