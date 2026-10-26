@@ -10,7 +10,7 @@ use temporalio_common::{
     data_converters::{
         ActivitySerializationContext, DecodablePayloads, NoopDecodeHint, SerializationContextData,
     },
-    payload_visitor::decode_payloads,
+    payload_visitor::{decode_payloads, retrieve_external_payloads},
     protos::temporal::api::{
         activity::v1::{ActivityExecutionOutcome, activity_execution_outcome},
         failure::v1::failure::FailureInfo,
@@ -79,7 +79,7 @@ where
     pub async fn result(&self) -> Result<ActivityT::Output, ActivityResultError> {
         let mut client = self.client.clone();
         loop {
-            let resp = client
+            let mut resp = client
                 .poll_activity_execution(
                     PollActivityExecutionRequest {
                         namespace: client.namespace(),
@@ -90,6 +90,7 @@ where
                 )
                 .await?
                 .into_inner();
+            retrieve_external_payloads(&mut resp, client.data_converter()).await?;
 
             // If resp.outcome.value is None, poll again
             let Some(ActivityExecutionOutcome {
@@ -139,7 +140,7 @@ where
         options: ActivityDescribeOptions,
     ) -> Result<ActivityExecutionDescription<ActivityT>, ActivityInteractionError> {
         let mut client = self.client.clone();
-        let resp = client
+        let mut resp = client
             .describe_activity_execution(
                 DescribeActivityExecutionRequest {
                     namespace: client.namespace(),
@@ -155,6 +156,7 @@ where
             )
             .await?
             .into_inner();
+        retrieve_external_payloads(&mut resp, client.data_converter()).await?;
 
         Ok(ActivityExecutionDescription::new(
             client.data_converter().clone(),

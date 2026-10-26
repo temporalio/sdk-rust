@@ -30,7 +30,7 @@ use temporalio_common::{
         WorkflowSerializationContext,
     },
     error::IncomingError,
-    payload_visitor::decode_payloads,
+    payload_visitor::{decode_payloads, retrieve_external_payloads},
     protos::{
         coresdk::FromPayloadsExt,
         proto_ts_to_system_time,
@@ -664,7 +664,11 @@ where
                 continue;
             }
 
-            let event_attrs = events.pop().and_then(|ev| ev.attributes);
+            let mut close_event = events.pop();
+            if let Some(event) = close_event.as_mut() {
+                retrieve_external_payloads(event, self.client.data_converter()).await?;
+            }
+            let event_attrs = close_event.and_then(|ev| ev.attributes);
 
             macro_rules! follow {
                 ($attrs:ident) => {
@@ -882,11 +886,12 @@ where
                         }
                         .into_request();
                         options.rpc_options.apply_to(&mut request);
-                        let response = client
+                        let mut response = client
                             .query_workflow(request)
                             .await
                             .map_err(WorkflowQueryError::from_status)?
                             .into_inner();
+                        retrieve_external_payloads(&mut response, &data_converter).await?;
                         Ok(QueryWorkflowOutput::new(response))
                     })
                 }
@@ -999,7 +1004,7 @@ where
                                 options.header,
                                 payloads,
                             );
-                            let response = loop {
+                            let mut response = loop {
                                 let mut rpc_request = request.clone().into_request();
                                 options.rpc_options.apply_to(&mut rpc_request);
                                 let response = WorkflowService::update_workflow_execution(
@@ -1015,6 +1020,8 @@ where
                                     break response;
                                 }
                             };
+                            retrieve_external_payloads(&mut response, client.data_converter())
+                                .await?;
                             let run_id = response
                                 .update_ref
                                 .as_ref()
@@ -1201,11 +1208,13 @@ where
                             }
                             .into_request();
                             input.options.rpc_options.apply_to(&mut request);
-                            let response =
+                            let mut response =
                                 WorkflowService::describe_workflow_execution(&mut client, request)
                                     .await
                                     .map_err(WorkflowInteractionError::from_status)?
                                     .into_inner();
+                            retrieve_external_payloads(&mut response, client.data_converter())
+                                .await?;
                             Ok(DescribeWorkflowOutput::new(response))
                         })
                     }
@@ -1433,13 +1442,15 @@ where
                             }
                             .into_request();
                             input.rpc_options.apply_to(&mut request);
-                            let response = WorkflowService::poll_workflow_execution_update(
+                            let mut response = WorkflowService::poll_workflow_execution_update(
                                 &mut client,
                                 request,
                             )
                             .await
                             .map_err(WorkflowUpdateError::from_status)?
                             .into_inner();
+                            retrieve_external_payloads(&mut response, client.data_converter())
+                                .await?;
                             if let Some(outcome) = response.outcome {
                                 return Ok(PollWorkflowUpdateOutput::new(outcome));
                             }

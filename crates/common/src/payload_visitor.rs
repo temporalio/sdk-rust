@@ -5,7 +5,10 @@
 //! boundary between the SDK and Core.
 
 use crate::{
-    data_converters::{PayloadCodec, PayloadConversionError, SerializationContextData},
+    data_converters::{
+        DataConverter, ExternalStorageError, PayloadCodec, PayloadConversionError,
+        SerializationContextData,
+    },
     protos::temporal::api::common::v1::{Payload, Payloads},
 };
 use futures::future::BoxFuture;
@@ -103,7 +106,6 @@ macro_rules! payload_visitor {
         }
     };
 }
-#[cfg(feature = "experimental")]
 pub(crate) use payload_visitor;
 
 /// Visitor that encodes payloads using a codec.
@@ -144,6 +146,21 @@ pub async fn decode_payloads<M: PayloadVisitable + Send>(
 ) -> Result<(), PayloadConversionError> {
     let mut visitor = DecodeVisitor { codec, context };
     msg.visit_payloads_mut(&mut visitor).await
+}
+
+/// Replace every external storage reference in an inbound message with the payload it points at.
+/// Runs before [`decode_payloads`], since a driver returns a payload as it was before offloading.
+/// Without external storage to retrieve them, a reference is an error instead.
+///
+/// On error the message is left partly processed and must not be used.
+#[doc(hidden)]
+pub async fn retrieve_external_payloads<M: PayloadVisitable + Send>(
+    msg: &mut M,
+    data_converter: &DataConverter,
+) -> Result<(), ExternalStorageError> {
+    // External storage cannot be configured yet, so there is never anything to retrieve with.
+    let _ = data_converter;
+    crate::external_storage_references::reject_references_in(msg).await
 }
 
 // Manual impl for Payload - visits itself as a single payload
