@@ -6,8 +6,9 @@
 //! `temporalio-common-wasm`, because proto JSON support and the payload visitor that will drive it
 //! are here.
 
-// Only the runner creates or parses references, and nothing calls it yet.
-#![allow(dead_code)]
+// Only the runner, which needs the `experimental` feature, creates or parses references. Detecting
+// them is needed in every build.
+#![cfg_attr(not(feature = "experimental"), allow(dead_code))]
 
 use std::collections::HashMap;
 

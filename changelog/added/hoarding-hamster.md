@@ -1,0 +1,1 @@
+Experimental external storage (requires the `experimental` feature). `DataConverter::with_external_storage` offloads payloads at or above a size threshold to a user-supplied `StorageDriver`, replacing them in history with small references that workers and clients resolve transparently. See `ExternalStorage` for current limitations. This API may change without notice.
