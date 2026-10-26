@@ -19,7 +19,7 @@ use temporalio_common::{
         DataConverter, PayloadConversionError, SerializationContextData, TemporalDeserializable,
         TemporalSerializable, WorkflowSerializationContext,
     },
-    payload_visitor::{decode_payloads, retrieve_external_payloads},
+    payload_visitor::{decode_payloads, retrieve_external_payloads, store_external_payloads},
     protos::{
         coresdk::IntoPayloadsExt,
         proto_ts_to_system_time,
@@ -1235,8 +1235,9 @@ where
             identity: self.client.identity(),
             request_id: Uuid::new_v4().to_string(),
             ..Default::default()
-        }
-        .into_request();
+        };
+        store_external_payloads(&mut request, self.client.data_converter()).await?;
+        let mut request = request.into_request();
         rpc_options.apply_to(&mut request);
         WorkflowService::update_schedule(&mut self.client.clone(), request).await?;
         Ok(())
@@ -1514,8 +1515,9 @@ impl Client {
                             identity: client.identity(),
                             request_id: Uuid::new_v4().to_string(),
                             ..Default::default()
-                        }
-                        .into_request();
+                        };
+                        store_external_payloads(&mut request, client.data_converter()).await?;
+                        let mut request = request.into_request();
                         options.rpc_options.apply_to(&mut request);
                         WorkflowService::create_schedule(&mut client, request).await?;
                         Ok(CreateScheduleOutput::new(input.schedule_id))

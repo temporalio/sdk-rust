@@ -147,9 +147,36 @@ pub async fn decode_payloads<M: PayloadVisitable + Send>(
     msg.visit_payloads_mut(&mut visitor).await
 }
 
+/// Offload every eligible payload in an outbound message to the data converter's external storage.
+/// Runs after [`encode_payloads`], since the size threshold applies to encoded payloads. Does
+/// nothing without the `experimental` feature.
+///
+/// On error, reported as [`PayloadConversionError::ExternalStorage`], the message is left partly
+/// processed and must not be sent.
+#[doc(hidden)]
+pub async fn store_external_payloads<M: PayloadVisitable + Send>(
+    msg: &mut M,
+    data_converter: &DataConverter,
+) -> Result<(), PayloadConversionError> {
+    // Stored without a target until the worker and client can name the execution a message is for.
+    #[cfg(feature = "experimental")]
+    return Ok(crate::external_storage_runner::store_in(
+        data_converter.external_storage(),
+        msg,
+        None,
+    )
+    .await?);
+    #[cfg(not(feature = "experimental"))]
+    {
+        let _ = (msg, data_converter);
+        Ok(())
+    }
+}
+
 /// Replace every external storage reference in an inbound message with the payload it points at.
 /// Runs before [`decode_payloads`], since a driver returns a payload as it was before offloading.
-/// Without external storage to retrieve them, a reference is an error instead, reported as
+/// Without external storage to retrieve them, which includes every build without the
+/// `experimental` feature, a reference is an error instead. Failures are reported as
 /// [`PayloadConversionError::ExternalStorage`].
 ///
 /// On error the message is left partly processed and must not be used.
@@ -158,9 +185,15 @@ pub async fn retrieve_external_payloads<M: PayloadVisitable + Send>(
     msg: &mut M,
     data_converter: &DataConverter,
 ) -> Result<(), PayloadConversionError> {
-    // External storage cannot be configured yet, so there is never anything to retrieve with.
-    let _ = data_converter;
-    Ok(crate::external_storage_references::reject_references_in(msg).await?)
+    #[cfg(feature = "experimental")]
+    return Ok(
+        crate::external_storage_runner::retrieve_in(data_converter.external_storage(), msg).await?,
+    );
+    #[cfg(not(feature = "experimental"))]
+    {
+        let _ = data_converter;
+        Ok(crate::external_storage_references::reject_references_in(msg).await?)
+    }
 }
 
 // Manual impl for Payload - visits itself as a single payload
