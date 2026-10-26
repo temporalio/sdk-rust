@@ -312,9 +312,10 @@ impl WorkflowFuture {
                 Variant::ResolveRequestCancelExternalWorkflow(_) => {
                     push_polled_context!(ActivationJobContext::Passive);
                 }
+                // Whether an update can change state is only known once its validator has run
                 Variant::DoUpdate(u) => {
                     let protocol_instance_id = u.protocol_instance_id.clone();
-                    push_polled_context!(ActivationJobContext::Update {
+                    push_context!(ActivationJobContext::Update {
                         protocol_instance_id,
                     });
                 }
@@ -341,12 +342,14 @@ impl WorkflowFuture {
         Ok((activation, job_contexts, should_poll_routines))
     }
 
+    /// Returns whether any update was accepted.
     fn process_activation_results(
         &mut self,
         job_contexts: Vec<ActivationJobContext>,
         activation_result: ActivationResult,
         outgoing_cmds: &mut Vec<WorkflowCommand>,
-    ) -> Result<(), Error> {
+    ) -> Result<bool, Error> {
+        let mut update_accepted = false;
         if job_contexts.len() != activation_result.job_results.len() {
             bail!(
                 "Activation result count {} did not match job count {}",
@@ -389,6 +392,7 @@ impl WorkflowFuture {
                             )
                             .into(),
                         );
+                        update_accepted = true;
                         self.active_routines.push(started_routine.routine_id);
                     }
                     other => bail!("Update job started unexpected routine kind {other:?}"),
@@ -429,7 +433,7 @@ impl WorkflowFuture {
             }
         }
 
-        Ok(())
+        Ok(update_accepted)
     }
 
     fn poll_guest_routine(
@@ -662,7 +666,7 @@ impl Future for WorkflowFuture {
                     continue 'activations;
                 }
 
-                let (guest_activation, job_contexts, should_poll_routines) =
+                let (guest_activation, job_contexts, mut should_poll_routines) =
                     match self.translate_activation(activation) {
                         Ok(translated) => translated,
                         Err(e) => {
@@ -695,11 +699,19 @@ impl Future for WorkflowFuture {
                 }
 
                 let mut commands = Vec::new();
-                if let Err(e) =
-                    self.process_activation_results(job_contexts, activation_result, &mut commands)
-                {
-                    self.fail_wft(run_id.clone(), e, None);
-                    continue 'activations;
+                match self.process_activation_results(
+                    job_contexts,
+                    activation_result,
+                    &mut commands,
+                ) {
+                    // Rejected updates leave nothing in history, so workflow code they let run
+                    // (e.g. a condition on a value refreshed every activation) could not run on
+                    // replay.
+                    Ok(update_accepted) => should_poll_routines |= update_accepted,
+                    Err(e) => {
+                        self.fail_wft(run_id.clone(), e, None);
+                        continue 'activations;
+                    }
                 }
 
                 if !should_poll_routines {

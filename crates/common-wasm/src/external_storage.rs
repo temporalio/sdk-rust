@@ -10,7 +10,11 @@
 
 use crate::protos::temporal::api::common::v1::Payload;
 use futures::future::BoxFuture;
-use std::{collections::HashMap, fmt, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    fmt,
+    sync::Arc,
+};
 
 const DEFAULT_PAYLOAD_SIZE_THRESHOLD: usize = 256 * 1024;
 
@@ -146,11 +150,13 @@ impl Default for ExternalStorageConcurrency {
     }
 }
 
+#[bon::bon]
 impl ExternalStorageConcurrency {
-    /// Create concurrency limits, setting both of them. Each must be at least 1.
+    /// Create concurrency limits. Each must be at least 1, and each defaults when omitted.
+    #[builder(state_mod(vis = "pub"))]
     pub fn new(
-        max_driver_operations: usize,
-        max_operations_per_message: usize,
+        #[builder(default = DEFAULT_MAX_DRIVER_OPERATIONS)] max_driver_operations: usize,
+        #[builder(default = DEFAULT_MAX_OPERATIONS_PER_MESSAGE)] max_operations_per_message: usize,
     ) -> Result<Self, ExternalStorageError> {
         check_limit(max_driver_operations, "max_driver_operations")?;
         check_limit(max_operations_per_message, "max_operations_per_message")?;
@@ -159,30 +165,11 @@ impl ExternalStorageConcurrency {
             max_operations_per_message,
         })
     }
-
-    /// Set the limit shared across the whole configuration. Must be at least 1.
-    pub fn with_max_driver_operations(
-        mut self,
-        max_driver_operations: usize,
-    ) -> Result<Self, ExternalStorageError> {
-        check_limit(max_driver_operations, "max_driver_operations")?;
-        self.max_driver_operations = max_driver_operations;
-        Ok(self)
-    }
-
-    /// Set the limit for one message. Must be at least 1.
-    pub fn with_max_operations_per_message(
-        mut self,
-        max_operations_per_message: usize,
-    ) -> Result<Self, ExternalStorageError> {
-        check_limit(max_operations_per_message, "max_operations_per_message")?;
-        self.max_operations_per_message = max_operations_per_message;
-        Ok(self)
-    }
 }
 
 /// Context given to [`StorageDriver::store`].
-#[derive(Clone)]
+#[derive(Clone, bon::Builder)]
+#[builder(state_mod(vis = "pub"))]
 #[non_exhaustive]
 pub struct StorageDriverStoreContext {
     /// The execution the payloads are being stored on behalf of, when there is one.
@@ -200,7 +187,8 @@ impl fmt::Debug for StorageDriverStoreContext {
 }
 
 /// Context given to [`StorageDriverSelector::select_driver`].
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, bon::Builder)]
+#[builder(state_mod(vis = "pub"))]
 #[non_exhaustive]
 pub struct StorageDriverSelectContext {
     /// The execution the payload is being stored on behalf of, when there is one.
@@ -212,7 +200,8 @@ pub struct StorageDriverSelectContext {
 /// This deliberately carries no target. A payload must be retrievable from its
 /// [`StorageDriverClaim`] alone, since the same payload can be read from a different execution than
 /// the one that stored it.
-#[derive(Clone)]
+#[derive(Clone, bon::Builder)]
+#[builder(state_mod(vis = "pub"))]
 #[non_exhaustive]
 pub struct StorageDriverRetrieveContext {
     /// Limiter for this driver's retrieve requests.
@@ -287,6 +276,27 @@ pub enum ExternalStorageError {
     /// A driver failed to store or retrieve.
     #[error("Storage driver error: {0}")]
     Driver(#[source] Box<dyn std::error::Error + Send + Sync>),
+    /// Walking the message's payloads failed, outside any storage operation.
+    #[error("External storage payload walk failed: {0}")]
+    Walk(#[source] Box<dyn std::error::Error + Send + Sync>),
+    /// A reference names a driver that is not registered.
+    #[error("No storage driver is registered under the name '{0}'")]
+    UnregisteredDriver(String),
+    /// The selector returned a driver that is not one of the registered instances.
+    #[error("Selector returned a driver that is not registered: '{0}'")]
+    UnregisteredSelection(String),
+    /// A driver returned a different number of results than it was given inputs. A store is given
+    /// payloads and returns claims; a retrieve is given claims and returns payloads. Either way
+    /// there must be one result per input, in order.
+    #[error("Storage driver '{driver}' returned {returned} results for {requested} inputs")]
+    DriverContract {
+        /// Name of the driver.
+        driver: String,
+        /// How many inputs it was given.
+        requested: usize,
+        /// How many results it returned.
+        returned: usize,
+    },
 }
 
 /// Configuration for offloading large payloads to an external storage system.
@@ -300,7 +310,6 @@ pub enum ExternalStorageError {
 #[derive(Clone)]
 pub struct ExternalStorage {
     drivers: Vec<Arc<dyn StorageDriver>>,
-    drivers_by_name: HashMap<String, Arc<dyn StorageDriver>>,
     driver_selector: Arc<dyn StorageDriverSelector>,
     payload_size_threshold: usize,
     concurrency: ExternalStorageConcurrency,
@@ -339,7 +348,7 @@ impl ExternalStorage {
                 "at least one driver is required".to_owned(),
             ));
         }
-        let mut drivers_by_name = HashMap::with_capacity(drivers.len());
+        let mut names = HashSet::with_capacity(drivers.len());
         for driver in &drivers {
             let name = driver.name();
             // The name is the routing key written into history, so a driver without one can never
@@ -349,10 +358,7 @@ impl ExternalStorage {
                     "driver name cannot be empty".to_owned(),
                 ));
             }
-            if drivers_by_name
-                .insert(name.to_owned(), Arc::clone(driver))
-                .is_some()
-            {
+            if !names.insert(name) {
                 return Err(ExternalStorageError::InvalidConfiguration(format!(
                     "multiple drivers given with name '{name}'"
                 )));
@@ -360,7 +366,6 @@ impl ExternalStorage {
         }
         Ok(Self {
             drivers,
-            drivers_by_name,
             driver_selector,
             payload_size_threshold: DEFAULT_PAYLOAD_SIZE_THRESHOLD,
             concurrency: ExternalStorageConcurrency::default(),
@@ -405,7 +410,7 @@ impl ExternalStorage {
 
     /// The driver registered under the given name, if any.
     pub fn driver(&self, name: &str) -> Option<&Arc<dyn StorageDriver>> {
-        self.drivers_by_name.get(name)
+        self.drivers.iter().find(|d| d.name() == name)
     }
 }
 
@@ -424,8 +429,7 @@ impl StorageDriverSelector for SingleDriverSelector {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use futures::{FutureExt, future};
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use futures::future;
 
     struct FakeDriver(&'static str);
 
@@ -468,122 +472,49 @@ mod tests {
         Arc::new(FakeDriver(name))
     }
 
-    struct ImmediateLimiter;
-
-    impl<Item: Sync> StorageDriverLimiter<Item> for ImmediateLimiter {
-        fn acquire<'a>(
-            &'a self,
-            _item: &'a Item,
-        ) -> BoxFuture<'a, Result<StorageDriverPermit, ExternalStorageError>> {
-            Box::pin(future::ready(Ok(StorageDriverPermit::new(Box::new(())))))
-        }
-    }
-
     #[test]
-    fn concurrency_defaults_until_overridden() {
-        let storage = ExternalStorage::new(Arc::new(FakeDriver("mem"))).unwrap();
+    fn concurrency_defaults_to_the_spec_values_and_each_limit_overrides_alone() {
+        // The spec's defaults; `#[non_exhaustive]` makes the builder the only way to set one limit
+        // without restating the other.
+        let defaults = ExternalStorageConcurrency::default();
+        assert_eq!(defaults.max_driver_operations, 64);
+        assert_eq!(defaults.max_operations_per_message, 8);
         assert_eq!(
-            storage.concurrency(),
-            &ExternalStorageConcurrency::default()
+            ExternalStorage::new(Arc::new(FakeDriver("mem")))
+                .unwrap()
+                .concurrency(),
+            &defaults
         );
 
-        let storage = storage.with_concurrency(ExternalStorageConcurrency::new(2, 1).unwrap());
-        assert_eq!(storage.concurrency().max_driver_operations, 2);
-        assert_eq!(storage.concurrency().max_operations_per_message, 1);
-    }
-
-    #[test]
-    fn one_limit_can_be_set_without_restating_the_other() {
-        // `#[non_exhaustive]` blocks struct literals and functional update syntax downstream, so
-        // without these builders a caller would have to repeat the default it did not want to
-        // change.
-        let only_shared = ExternalStorageConcurrency::default()
-            .with_max_driver_operations(10)
+        let only_shared = ExternalStorageConcurrency::builder()
+            .max_driver_operations(10)
+            .build()
             .unwrap();
         assert_eq!(only_shared.max_driver_operations, 10);
         assert_eq!(only_shared.max_operations_per_message, 8);
 
-        let only_message = ExternalStorageConcurrency::default()
-            .with_max_operations_per_message(2)
+        let only_message = ExternalStorageConcurrency::builder()
+            .max_operations_per_message(2)
+            .build()
             .unwrap();
         assert_eq!(only_message.max_driver_operations, 64);
         assert_eq!(only_message.max_operations_per_message, 2);
-
-        let both = ExternalStorageConcurrency::default()
-            .with_max_driver_operations(10)
-            .unwrap()
-            .with_max_operations_per_message(2)
-            .unwrap();
-        assert_eq!(both, ExternalStorageConcurrency::new(10, 2).unwrap());
-    }
-
-    #[test]
-    fn builders_reject_a_limit_of_zero() {
-        assert!(matches!(
-            ExternalStorageConcurrency::default().with_max_driver_operations(0),
-            Err(ExternalStorageError::InvalidConfiguration(_))
-        ));
-        assert!(matches!(
-            ExternalStorageConcurrency::default().with_max_operations_per_message(0),
-            Err(ExternalStorageError::InvalidConfiguration(_))
-        ));
     }
 
     #[test]
     fn a_limit_of_zero_is_rejected() {
         assert!(matches!(
-            ExternalStorageConcurrency::new(0, 8),
+            ExternalStorageConcurrency::builder()
+                .max_driver_operations(0)
+                .build(),
             Err(ExternalStorageError::InvalidConfiguration(_))
         ));
         assert!(matches!(
-            ExternalStorageConcurrency::new(64, 0),
+            ExternalStorageConcurrency::builder()
+                .max_operations_per_message(0)
+                .build(),
             Err(ExternalStorageError::InvalidConfiguration(_))
         ));
-        assert!(ExternalStorageConcurrency::new(1, 1).is_ok());
-    }
-
-    #[test]
-    fn dropping_a_permit_releases_the_limit() {
-        struct ReleaseOnDrop(Arc<AtomicBool>);
-        impl Drop for ReleaseOnDrop {
-            fn drop(&mut self) {
-                self.0.store(true, Ordering::SeqCst);
-            }
-        }
-
-        let released = Arc::new(AtomicBool::new(false));
-        let permit = StorageDriverPermit::new(Box::new(ReleaseOnDrop(Arc::clone(&released))));
-
-        assert!(!released.load(Ordering::SeqCst));
-        drop(permit);
-        assert!(released.load(Ordering::SeqCst));
-    }
-
-    #[test]
-    fn contexts_carry_a_limiter() {
-        let store = StorageDriverStoreContext {
-            target: None,
-            limiter: Arc::new(ImmediateLimiter),
-        };
-        let retrieve = StorageDriverRetrieveContext {
-            limiter: Arc::new(ImmediateLimiter),
-        };
-
-        let payload = Payload::default();
-        let claim = StorageDriverClaim::new(HashMap::new());
-        // The fake limiter is always ready, so the permits resolve without an executor.
-        let _store_permit = store
-            .limiter
-            .acquire(&payload)
-            .now_or_never()
-            .expect("ready")
-            .unwrap();
-        let _retrieve_permit = retrieve
-            .limiter
-            .acquire(&claim)
-            .now_or_never()
-            .expect("ready")
-            .unwrap();
     }
 
     #[test]

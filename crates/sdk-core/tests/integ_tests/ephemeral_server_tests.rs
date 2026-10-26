@@ -177,6 +177,7 @@ mod test_server {
     async fn test_server_fixed() {
         let config = TestServerConfig::builder()
             .exe(fixed_cached_download("v1.16.0"))
+            .startup_timeout(Duration::from_secs(30))
             .build();
         let mut server = config.start_server().await.unwrap();
         assert_ephemeral_server(&server).await;

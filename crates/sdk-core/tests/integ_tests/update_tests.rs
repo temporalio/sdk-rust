@@ -1,11 +1,12 @@
 use crate::common::{
-    CoreWfStarter, WorkflowHandleExt, activity_functions::StdActivities, init_core_and_create_wf,
-    init_core_replay_preloaded,
+    CoreWfStarter, WorkflowHandleExt, activity_functions::StdActivities, get_integ_client,
+    init_core_and_create_wf, init_core_replay_preloaded, integ_namespace, rand_6_chars,
 };
 use anyhow::anyhow;
 use assert_matches::assert_matches;
 use futures_util::{StreamExt, future, future::join_all, stream};
 use std::{
+    cell::Cell,
     sync::{
         LazyLock,
         atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -15,7 +16,8 @@ use std::{
 use temporalio_client::{
     Client, NamespacedClient, UntypedSignal, UntypedUpdate, UntypedWorkflow,
     WorkflowExecuteUpdateOptions, WorkflowExecutionInfo, WorkflowIdConflictPolicy,
-    WorkflowSignalOptions, WorkflowStartOptions, WorkflowUpdateWithStartOptions,
+    WorkflowQueryOptions, WorkflowSignalOptions, WorkflowStartOptions,
+    WorkflowUpdateWithStartOptions,
     errors::{WorkflowStartError, WorkflowUpdateError, WorkflowUpdateWithStartError},
     grpc::WorkflowService,
 };
@@ -47,8 +49,8 @@ use temporalio_common::{
 };
 use temporalio_macros::{activities, workflow, workflow_methods};
 use temporalio_sdk::{
-    ActivityOptions, LocalActivityOptions, SyncWorkflowContext, WorkflowContext,
-    WorkflowContextView, WorkflowResult,
+    ActivityOptions, LocalActivityOptions, Runtime, SyncWorkflowContext, WorkerOptions,
+    WorkflowContext, WorkflowContextView, WorkflowResult,
     activities::{ActivityContext, ActivityError},
 };
 use temporalio_sdk_core::{
@@ -1043,6 +1045,121 @@ async fn update_rejection_sdk() {
     };
     join!(update, run);
     handle.fetch_history_and_replay(&mut worker).await.unwrap();
+}
+
+#[tokio::test]
+async fn rejected_update_does_not_evaluate_conditions_sdk() {
+    #[workflow]
+    #[derive(Default)]
+    struct ConditionEvaluationWf {
+        condition_evaluations: Cell<u32>,
+        done: bool,
+    }
+
+    #[workflow_methods]
+    impl ConditionEvaluationWf {
+        #[run]
+        async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<u32> {
+            ctx.wait_condition(|s| {
+                s.condition_evaluations
+                    .set(s.condition_evaluations.get() + 1);
+                s.done
+            })
+            .await?;
+            Ok(ctx.state(|s| s.condition_evaluations.get()))
+        }
+
+        #[query]
+        fn condition_evaluations(&self, _ctx: &WorkflowContextView) -> u32 {
+            self.condition_evaluations.get()
+        }
+
+        #[update_validator(finish)]
+        fn validate_finish(
+            &self,
+            _ctx: &WorkflowContextView,
+            accept: &bool,
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            if *accept {
+                Ok(())
+            } else {
+                Err("rejected".into())
+            }
+        }
+
+        #[update]
+        fn finish(&mut self, _ctx: &mut SyncWorkflowContext<Self>, _accept: bool) {
+            self.done = true;
+        }
+    }
+
+    let task_queue = format!(
+        "rejected_update_does_not_evaluate_conditions_sdk_{}",
+        rand_6_chars()
+    );
+    let runtime = Runtime::from_current_tokio(Default::default()).unwrap();
+    let client = get_integ_client(integ_namespace(), None).await;
+    let worker_options = WorkerOptions::new(task_queue.clone())
+        .register_workflow::<ConditionEvaluationWf>()
+        .unwrap()
+        .build();
+    let worker = temporalio_sdk::Worker::new(&runtime, client.clone(), worker_options).unwrap();
+    worker
+        .run_until(async {
+            let handle = client
+                .start_workflow(
+                    ConditionEvaluationWf::run,
+                    (),
+                    WorkflowStartOptions::new(task_queue.clone(), task_queue).build(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                handle
+                    .query(
+                        ConditionEvaluationWf::condition_evaluations,
+                        (),
+                        WorkflowQueryOptions::default(),
+                    )
+                    .await
+                    .unwrap(),
+                1
+            );
+
+            // Neither the rejected update nor the queries can change state, so none of their
+            // activations may evaluate the condition
+            handle
+                .execute_update(
+                    ConditionEvaluationWf::finish,
+                    false,
+                    WorkflowExecuteUpdateOptions::default(),
+                )
+                .await
+                .unwrap_err();
+            assert_eq!(
+                handle
+                    .query(
+                        ConditionEvaluationWf::condition_evaluations,
+                        (),
+                        WorkflowQueryOptions::default(),
+                    )
+                    .await
+                    .unwrap(),
+                1
+            );
+
+            handle
+                .execute_update(
+                    ConditionEvaluationWf::finish,
+                    true,
+                    WorkflowExecuteUpdateOptions::default(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(handle.get_result(Default::default()).await.unwrap(), 2);
+        })
+        .await
+        .unwrap();
 }
 
 #[tokio::test]

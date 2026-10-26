@@ -45,6 +45,7 @@ relevant information.
   nondeterminism while retaining compatibility with histories recorded before these checks.
 
 ### Fixed
+* Preserve queued queries across workflow eviction so requests for the same run are answered instead of silently dropped.
 * Dev and test server startup now stops waiting at the configured deadline even if a readiness
   request stalls. Timeout messages include the last connection failure when available.
 * Workers with large workflow caches avoid unnecessary CPU usage when no workflow tasks are waiting

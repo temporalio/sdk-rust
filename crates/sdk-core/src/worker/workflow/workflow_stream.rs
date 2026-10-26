@@ -422,18 +422,21 @@ impl WFStream {
             let mut maybe_wfts = maybe_ready_wft.unwrap_or_default();
             if let Some(first_wft) = maybe_wfts.pop() {
                 res = self.instantiate_or_update(first_wft);
-                // We accept that there might be query tasks remaining in the buffer if we evicted
-                // and re-instantiated here. It's likely those tasks are now invalidated anyway.
-                if maybe_buffered.has_tasks() && should_evict {
-                    warn!("There were leftover buffered tasks when evicting run");
-                }
             }
             // If there happened to be more than one buffered WFT for this run, move them into the
             // now-instantiated run's buffer.
-            for wft in maybe_wfts {
-                let should_be_nothing = self.instantiate_or_update(wft);
-                if should_be_nothing.is_some() {
-                    dbg_panic!("Extra buffered run should not have produced an activation");
+            for wft in maybe_wfts
+                .into_iter()
+                .chain(maybe_buffered.into_buffer_order())
+            {
+                // _instantiate_or_update may defer the first task for a history fetch, so
+                // a later task with full history can produce the first activation instead.
+                match self.instantiate_or_update(wft) {
+                    Some(activation) if res.is_none() => res = Some(activation),
+                    Some(_) => {
+                        dbg_panic!("Extra buffered run should not have produced an activation")
+                    }
+                    None => {}
                 }
             }
         }
