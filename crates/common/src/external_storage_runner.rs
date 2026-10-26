@@ -18,12 +18,13 @@ use std::{collections::HashMap, sync::Arc};
 
 use prost::Message;
 use temporalio_common_wasm::data_converters::{
-    ExternalStorage, ExternalStorageError, PayloadConversionError, StorageDriver,
-    StorageDriverClaim, StorageDriverLimiter, StorageDriverRetrieveContext,
-    StorageDriverSelectContext, StorageDriverStoreContext, StorageDriverTargetInfo,
+    ExternalStorage, PayloadConversionError, StorageDriver, StorageDriverClaim,
+    StorageDriverLimiter, StorageDriverRetrieveContext, StorageDriverSelectContext,
+    StorageDriverStoreContext, StorageDriverTargetInfo,
 };
 
 use crate::{
+    data_converters::ExternalStorageError,
     external_storage_references::{create_reference_payload, is_plain_reference, parse_reference},
     payload_visitor::{AsyncPayloadVisitor, PayloadVisitable, payload_visitor},
     protos::temporal::api::common::v1::Payload,
@@ -133,7 +134,10 @@ async fn retrieve_payloads(
                 .limiter(Arc::clone(limiter))
                 .build();
             async move {
-                let retrieved = driver.retrieve(&context, claims).await?;
+                let retrieved = driver
+                    .retrieve(&context, claims)
+                    .await
+                    .map_err(ExternalStorageError::from)?;
                 if retrieved.len() != indices.len() {
                     return Err(ExternalStorageError::DriverContract {
                         driver: driver_name,
@@ -249,7 +253,10 @@ async fn store_payloads(
                 .limiter(Arc::clone(limiter))
                 .build();
             async move {
-                let claims = driver.store(&context, to_store).await?;
+                let claims = driver
+                    .store(&context, to_store)
+                    .await
+                    .map_err(ExternalStorageError::from)?;
                 if claims.len() != group.len() {
                     return Err(ExternalStorageError::DriverContract {
                         driver: driver_name,
@@ -285,10 +292,11 @@ mod tests {
             workflowservice::v1::SignalWithStartWorkflowExecutionRequest,
         },
     };
+    use anyhow::anyhow;
     use futures::future::{self, BoxFuture};
     use std::sync::Mutex;
     use temporalio_common_wasm::data_converters::{
-        StorageDriver, StorageDriverPermit, StorageDriverSelector,
+        StorageDriver, StorageDriverError, StorageDriverPermit, StorageDriverSelector,
     };
 
     /// Echoes each claim back as a payload (and each payload as a claim), recording the batch
@@ -323,7 +331,7 @@ mod tests {
             &self,
             _context: &temporalio_common_wasm::data_converters::StorageDriverStoreContext,
             payloads: Vec<Payload>,
-        ) -> BoxFuture<'static, Result<Vec<StorageDriverClaim>, ExternalStorageError>> {
+        ) -> BoxFuture<'static, Result<Vec<StorageDriverClaim>, StorageDriverError>> {
             self.batches.lock().unwrap().push(payloads.len());
             let barrier = Arc::clone(&self.barrier);
             Box::pin(async move {
@@ -345,7 +353,7 @@ mod tests {
             &self,
             _context: &StorageDriverRetrieveContext,
             claims: Vec<StorageDriverClaim>,
-        ) -> BoxFuture<'static, Result<Vec<Payload>, ExternalStorageError>> {
+        ) -> BoxFuture<'static, Result<Vec<Payload>, StorageDriverError>> {
             self.batches.lock().unwrap().push(claims.len());
             let barrier = Arc::clone(&self.barrier);
             Box::pin(async move {
@@ -369,7 +377,7 @@ mod tests {
         fn acquire<'a>(
             &'a self,
             _item: &'a Item,
-        ) -> BoxFuture<'a, Result<StorageDriverPermit, ExternalStorageError>> {
+        ) -> BoxFuture<'a, Result<StorageDriverPermit, StorageDriverError>> {
             Box::pin(future::ready(Ok(StorageDriverPermit::new(Box::new(())))))
         }
     }
@@ -481,7 +489,7 @@ mod tests {
             &self,
             _context: &StorageDriverStoreContext,
             payloads: Vec<Payload>,
-        ) -> BoxFuture<'static, Result<Vec<StorageDriverClaim>, ExternalStorageError>> {
+        ) -> BoxFuture<'static, Result<Vec<StorageDriverClaim>, StorageDriverError>> {
             let stored = Arc::clone(&self.stored);
             Box::pin(async move {
                 let mut held = stored.lock().unwrap();
@@ -502,8 +510,40 @@ mod tests {
             &self,
             _context: &StorageDriverRetrieveContext,
             _claims: Vec<StorageDriverClaim>,
-        ) -> BoxFuture<'static, Result<Vec<Payload>, ExternalStorageError>> {
+        ) -> BoxFuture<'static, Result<Vec<Payload>, StorageDriverError>> {
             Box::pin(future::ready(Ok(vec![])))
+        }
+    }
+
+    /// Fails every request with an I/O error, converted with `?` as a real driver would.
+    struct FailingDriver;
+
+    impl FailingDriver {
+        async fn fail<T>() -> Result<T, StorageDriverError> {
+            Err(std::io::Error::other("bucket unreachable"))?
+        }
+    }
+
+    impl StorageDriver for FailingDriver {
+        fn name(&self) -> &str {
+            "mem"
+        }
+        fn driver_type(&self) -> &str {
+            "test.failing"
+        }
+        fn store(
+            &self,
+            _context: &StorageDriverStoreContext,
+            _payloads: Vec<Payload>,
+        ) -> BoxFuture<'static, Result<Vec<StorageDriverClaim>, StorageDriverError>> {
+            Box::pin(Self::fail())
+        }
+        fn retrieve(
+            &self,
+            _context: &StorageDriverRetrieveContext,
+            _claims: Vec<StorageDriverClaim>,
+        ) -> BoxFuture<'static, Result<Vec<Payload>, StorageDriverError>> {
+            Box::pin(Self::fail())
         }
     }
 
@@ -523,14 +563,14 @@ mod tests {
             &self,
             _context: &StorageDriverStoreContext,
             _payloads: Vec<Payload>,
-        ) -> BoxFuture<'static, Result<Vec<StorageDriverClaim>, ExternalStorageError>> {
+        ) -> BoxFuture<'static, Result<Vec<StorageDriverClaim>, StorageDriverError>> {
             Box::pin(future::ready(Ok(vec![])))
         }
         fn retrieve(
             &self,
             _context: &StorageDriverRetrieveContext,
             _claims: Vec<StorageDriverClaim>,
-        ) -> BoxFuture<'static, Result<Vec<Payload>, ExternalStorageError>> {
+        ) -> BoxFuture<'static, Result<Vec<Payload>, StorageDriverError>> {
             Box::pin(future::ready(Ok(vec![])))
         }
     }
@@ -683,6 +723,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_driver_failure_is_reported_with_the_drivers_error() {
+        let storage = ExternalStorage::new(Arc::new(FailingDriver))
+            .unwrap()
+            .with_payload_size_threshold(1);
+
+        let store_err = store_payloads(&mut [sized(50)], &storage, None, &store_limiter())
+            .await
+            .unwrap_err();
+        let retrieve_err = retrieve_payloads(&mut [reference("mem", "a")], &storage, &limiter())
+            .await
+            .unwrap_err();
+
+        for err in [store_err, retrieve_err] {
+            assert!(
+                matches!(err, ExternalStorageError::Driver(_)),
+                "got {err:?}"
+            );
+            let source = std::error::Error::source(&err).expect("the driver's error is the source");
+            assert!(source.downcast_ref::<std::io::Error>().is_some());
+            assert_eq!(source.to_string(), "bucket unreachable");
+        }
+    }
+
+    #[tokio::test]
     async fn a_retrieve_driver_returning_the_wrong_number_of_payloads_is_an_error() {
         let storage = ExternalStorage::new(Arc::new(MiscountingDriver { name: "mem" })).unwrap();
         let mut payloads = vec![reference("mem", "a")];
@@ -801,7 +865,7 @@ mod tests {
             &self,
             _context: &StorageDriverStoreContext,
             payloads: Vec<Payload>,
-        ) -> BoxFuture<'static, Result<Vec<StorageDriverClaim>, ExternalStorageError>> {
+        ) -> BoxFuture<'static, Result<Vec<StorageDriverClaim>, StorageDriverError>> {
             let stored = Arc::clone(&self.stored);
             Box::pin(async move {
                 let mut held = stored.lock().unwrap();
@@ -819,18 +883,16 @@ mod tests {
             &self,
             _context: &StorageDriverRetrieveContext,
             claims: Vec<StorageDriverClaim>,
-        ) -> BoxFuture<'static, Result<Vec<Payload>, ExternalStorageError>> {
+        ) -> BoxFuture<'static, Result<Vec<Payload>, StorageDriverError>> {
             let stored = Arc::clone(&self.stored);
             Box::pin(async move {
                 let held = stored.lock().unwrap();
                 claims
                     .into_iter()
                     .map(|c| {
-                        held.get(&c.claim_data["key"]).cloned().ok_or_else(|| {
-                            ExternalStorageError::InvalidReference(
-                                "stored payload not found".into(),
-                            )
-                        })
+                        held.get(&c.claim_data["key"])
+                            .cloned()
+                            .ok_or_else(|| anyhow!("stored payload not found").into())
                     })
                     .collect()
             })
