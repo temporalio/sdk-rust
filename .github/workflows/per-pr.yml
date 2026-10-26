@@ -353,7 +353,7 @@ jobs:
       - name: Run C test program
         run: ./test
 
-  build-and-test:
+  heavy-tests:
     name: Heavy Tests
     permissions:
       contents: read
@@ -379,7 +379,7 @@ jobs:
       - integ-tests
       - c-bridge-static-link-test
       - cloud-tests
-      - build-and-test
+      - heavy-tests
     runs-on: ubuntu-latest
     steps:
       - name: Fail if any check failed or was cancelled
