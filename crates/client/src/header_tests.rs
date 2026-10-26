@@ -5,8 +5,10 @@ use temporalio_common::{
     protos::temporal::api::common::v1::Payload,
 };
 
+type HeaderCodecCall = (SerializationContextData, Vec<Payload>);
+
 pub(crate) struct RecordingHeaderCodec {
-    pub calls: Arc<std::sync::Mutex<Vec<(SerializationContextData, Vec<Payload>)>>>,
+    pub calls: Arc<std::sync::Mutex<Vec<HeaderCodecCall>>>,
     pub output_count: usize,
 }
 
