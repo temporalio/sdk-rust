@@ -10,7 +10,6 @@ extern crate tracing;
 pub mod data_converters;
 #[cfg(feature = "envconfig")]
 pub mod envconfig;
-#[cfg(feature = "experimental")]
 pub(crate) mod external_storage_references;
 #[cfg(feature = "experimental")]
 pub(crate) mod external_storage_runner;
