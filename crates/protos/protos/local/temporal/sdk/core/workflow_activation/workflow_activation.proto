@@ -11,6 +11,7 @@ import "google/protobuf/timestamp.proto";
 import "google/protobuf/duration.proto";
 import "google/protobuf/empty.proto";
 import "temporal/api/failure/v1/message.proto";
+import "temporal/api/nexus/v1/message.proto";
 import "temporal/api/update/v1/message.proto";
 import "temporal/api/common/v1/message.proto";
 import "temporal/api/enums/v1/failed_cause.proto";
@@ -216,6 +217,10 @@ message InitializeWorkflow {
     // run id, this value is preserved across workflow resets. Mirrors the `original_execution_run_id`
     // field from `WorkflowExecutionStartedEventAttributes`.
     string original_execution_run_id = 26;
+    // Serialization context of the Nexus operation handler that started this workflow, if any.
+    // Lang should use it to serialize the workflow's result and failure, which are returned to the
+    // Nexus caller.
+    temporal.api.nexus.v1.PropagatedSerializationContext propagated_nexus_serialization_context = 27;
 }
 
 // Notify a workflow that a timer has fired
@@ -358,6 +363,10 @@ message DoUpdate {
     // If set true, lang must run the update's validator before running the handler. This will be
     // set false during replay, since validation is not re-run during replay.
     bool run_validator = 7;
+    // Serialization context of the Nexus operation handler that sent this update, if any. Lang
+    // should use it to serialize the update's result and failure, which are returned to the Nexus
+    // caller.
+    temporal.api.nexus.v1.PropagatedSerializationContext propagated_nexus_serialization_context = 8;
 }
 
 message ResolveNexusOperationStart {

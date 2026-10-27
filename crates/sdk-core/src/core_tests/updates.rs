@@ -19,9 +19,11 @@ use temporalio_common::protos::{
     temporal::api::{
         common::v1::Payload,
         enums::v1::EventType,
+        nexus::v1::PropagatedSerializationContext,
         update::v1::{Acceptance, Rejection},
         workflowservice::v1::RespondWorkflowTaskCompletedResponse,
     },
+    utilities::pack_any,
 };
 
 #[tokio::test]
@@ -352,6 +354,61 @@ async fn update_activation_has_update_id() {
         })
         .expect("activation should contain an update");
     assert_eq!(update.id, update_id);
+
+    core.complete_workflow_activation(WorkflowActivationCompletion::from_cmd(
+        task.run_id,
+        UpdateResponse {
+            protocol_instance_id: update_id.to_string(),
+            response: Some(Response::Accepted(())),
+        }
+        .into(),
+    ))
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn update_activation_has_propagated_nexus_serialization_context() {
+    let wfid = "fakeid";
+    let mut t = TestHistoryBuilder::default();
+    t.add_by_type(EventType::WorkflowExecutionStarted);
+    t.add_workflow_task_scheduled_and_started();
+
+    let update_id = "upd-1";
+    let ctx = PropagatedSerializationContext {
+        endpoint: "my-endpoint".to_string(),
+        service: "my-service".to_string(),
+        operation: "my-operation".to_string(),
+    };
+    let mut poll_resp = hist_to_poll_resp(&t, wfid, ResponseType::AllHistory);
+    let mut request = poll_resp.add_update_request(update_id, 1);
+    request.propagated_nexus_serialization_context = Some(ctx.clone());
+    poll_resp.messages.last_mut().unwrap().body = Some(
+        pack_any(
+            "type.googleapis.com/temporal.api.update.v1.Request".to_string(),
+            &request,
+        )
+        .unwrap(),
+    );
+
+    let mut mock_client = mock_worker_client();
+    mock_client
+        .expect_complete_workflow_task()
+        .times(1)
+        .returning(|_, _| Ok(RespondWorkflowTaskCompletedResponse::default()));
+    let mh = MockPollCfg::from_resp_batches(wfid, t, [poll_resp], mock_client);
+    let core = mock_worker(build_mock_pollers(mh));
+
+    let task = core.poll_workflow_activation().await.unwrap();
+    let update = task
+        .jobs
+        .iter()
+        .find_map(|job| match job.variant.as_ref() {
+            Some(workflow_activation_job::Variant::DoUpdate(update)) => Some(update),
+            _ => None,
+        })
+        .expect("activation should contain an update");
+    assert_eq!(update.propagated_nexus_serialization_context, Some(ctx));
 
     core.complete_workflow_activation(WorkflowActivationCompletion::from_cmd(
         task.run_id,

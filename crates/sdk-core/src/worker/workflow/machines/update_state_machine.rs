@@ -101,6 +101,10 @@ impl UpdateMachine {
             headers: request.headers(),
             meta: Some(meta.clone()),
             run_validator: !replaying,
+            propagated_nexus_serialization_context: request
+                .original
+                .propagated_nexus_serialization_context
+                .clone(),
         };
         let me = Self::from_parts(
             RequestInitiated {
