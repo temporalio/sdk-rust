@@ -8,7 +8,7 @@
 //! `temporalio-common`, alongside the payload visitor and the proto JSON support it needs. Nothing
 //! here is wired into the SDK yet.
 
-use crate::protos::temporal::api::common::v1::Payload;
+use crate::{data_converters::ExternalStorageError, protos::temporal::api::common::v1::Payload};
 use futures::future::BoxFuture;
 use std::{
     collections::{HashMap, HashSet},
@@ -245,6 +245,12 @@ where
 {
     fn from(source: E) -> Self {
         Self::Other(source.into())
+    }
+}
+
+impl From<StorageDriverError> for ExternalStorageError {
+    fn from(error: StorageDriverError) -> Self {
+        Self::Driver(error.into_source())
     }
 }
 

@@ -5,7 +5,7 @@ use crate::PluginApplyError;
 use crate::{WorkflowExecutionStatus, workflow_handle::WorkflowResultDetails};
 use http::uri::InvalidUri;
 use temporalio_common::{
-    data_converters::{DecodablePayloads, ExternalStorageError, PayloadConversionError},
+    data_converters::{DecodablePayloads, PayloadConversionError},
     error::{IncomingError, TimeoutType},
     protos::{
         google::rpc::Status as RpcStatus,
@@ -114,9 +114,6 @@ pub enum WorkflowStartError {
     /// Error converting the input to a payload.
     #[error("Failed to serialize workflow input: {0}")]
     PayloadConversion(#[from] PayloadConversionError),
-    /// Storing payloads in, or retrieving them from, external storage failed.
-    #[error("External storage error: {0}")]
-    ExternalStorage(#[from] ExternalStorageError),
     /// An uncategorized rpc error from the server.
     #[error("Server error: {0}")]
     Rpc(#[from] tonic::Status),
@@ -157,10 +154,6 @@ pub enum WorkflowQueryError {
     #[error("Payload conversion error: {0}")]
     PayloadConversion(#[from] PayloadConversionError),
 
-    /// Storing payloads in, or retrieving them from, external storage failed.
-    #[error("External storage error: {0}")]
-    ExternalStorage(#[from] ExternalStorageError),
-
     /// An uncategorized RPC error from the server.
     #[error("Server error: {0}")]
     Rpc(tonic::Status),
@@ -195,10 +188,6 @@ pub enum WorkflowUpdateError {
     /// Error serializing input or deserializing output.
     #[error("Payload conversion error: {0}")]
     PayloadConversion(#[from] PayloadConversionError),
-
-    /// Storing payloads in, or retrieving them from, external storage failed.
-    #[error("External storage error: {0}")]
-    ExternalStorage(#[from] ExternalStorageError),
 
     /// An uncategorized RPC error from the server.
     #[error("Server error: {0}")]
@@ -235,10 +224,6 @@ pub enum WorkflowUpdateWithStartError {
     /// Error serializing the workflow input or update arguments.
     #[error("Payload conversion error: {0}")]
     PayloadConversion(#[from] PayloadConversionError),
-
-    /// Storing payloads in, or retrieving them from, external storage failed.
-    #[error("External storage error: {0}")]
-    ExternalStorage(#[from] ExternalStorageError),
 
     /// An RPC error from the server that could not be attributed to either operation.
     #[error("Server error: {0}")]
@@ -334,10 +319,6 @@ pub enum WorkflowGetResultError {
     #[error("Payload conversion error: {0}")]
     PayloadConversion(#[from] PayloadConversionError),
 
-    /// Storing payloads in, or retrieving them from, external storage failed.
-    #[error("External storage error: {0}")]
-    ExternalStorage(#[from] ExternalStorageError),
-
     /// An uncategorized RPC error from the server.
     #[error("Server error: {0}")]
     Rpc(tonic::Status),
@@ -352,7 +333,6 @@ impl From<WorkflowInteractionError> for WorkflowGetResultError {
         match err {
             WorkflowInteractionError::NotFound(s) => Self::NotFound(s),
             WorkflowInteractionError::PayloadConversion(e) => Self::PayloadConversion(e),
-            WorkflowInteractionError::ExternalStorage(e) => Self::ExternalStorage(e),
             WorkflowInteractionError::Rpc(s) => Self::Rpc(s),
             WorkflowInteractionError::Other(e) => Self::Other(e),
         }
@@ -382,9 +362,6 @@ pub enum ClientError {
     /// Error decoding payloads returned by the server.
     #[error("Payload conversion error: {0}")]
     PayloadConversion(#[from] PayloadConversionError),
-    /// Storing payloads in, or retrieving them from, external storage failed.
-    #[error("External storage error: {0}")]
-    ExternalStorage(#[from] ExternalStorageError),
     /// An uncategorized rpc error from the server.
     #[error("Server error: {0}")]
     Rpc(#[from] tonic::Status),
@@ -402,10 +379,6 @@ pub enum WorkflowInteractionError {
     /// Error serializing input or deserializing output.
     #[error("Payload conversion error: {0}")]
     PayloadConversion(#[from] PayloadConversionError),
-
-    /// Storing payloads in, or retrieving them from, external storage failed.
-    #[error("External storage error: {0}")]
-    ExternalStorage(#[from] ExternalStorageError),
 
     /// An uncategorized RPC error from the server.
     #[error("Server error: {0}")]
@@ -436,9 +409,6 @@ pub enum AsyncActivityError {
     /// Error serializing an activity result, failure, or details.
     #[error("Payload conversion error: {0}")]
     PayloadConversion(#[from] PayloadConversionError),
-    /// Storing payloads in, or retrieving them from, external storage failed.
-    #[error("External storage error: {0}")]
-    ExternalStorage(#[from] ExternalStorageError),
     /// An uncategorized rpc error from the server.
     #[error("Server error: {0}")]
     Rpc(#[from] tonic::Status),
@@ -475,10 +445,6 @@ pub enum ActivityInteractionError {
     /// Error deserializing output.
     #[error("Payload conversion error: {0}")]
     PayloadConversion(#[from] PayloadConversionError),
-
-    /// Storing payloads in, or retrieving them from, external storage failed.
-    #[error("External storage error: {0}")]
-    ExternalStorage(#[from] ExternalStorageError),
 
     /// An uncategorized RPC error from the server.
     #[error("Server error: {0}")]
@@ -518,10 +484,6 @@ pub enum StartActivityError {
     /// Error serializing input.
     #[error("Payload conversion error: {0}")]
     PayloadConversion(#[from] PayloadConversionError),
-
-    /// Storing payloads in, or retrieving them from, external storage failed.
-    #[error("External storage error: {0}")]
-    ExternalStorage(#[from] ExternalStorageError),
 
     /// An uncategorized RPC error from the server.
     #[error("Server error: {0}")]
@@ -579,10 +541,6 @@ pub enum ActivityResultError {
     /// Error deserializing output.
     #[error("Payload conversion error: {0}")]
     PayloadConversion(#[from] PayloadConversionError),
-
-    /// Storing payloads in, or retrieving them from, external storage failed.
-    #[error("External storage error: {0}")]
-    ExternalStorage(#[from] ExternalStorageError),
 
     /// An uncategorized RPC error from the server.
     #[error("Server error: {0}")]

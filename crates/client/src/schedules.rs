@@ -16,8 +16,8 @@ use std::{
 use temporalio_common::{
     HasWorkflowDefinition,
     data_converters::{
-        DataConverter, ExternalStorageError, PayloadConversionError, SerializationContextData,
-        TemporalDeserializable, TemporalSerializable, WorkflowSerializationContext,
+        DataConverter, PayloadConversionError, SerializationContextData, TemporalDeserializable,
+        TemporalSerializable, WorkflowSerializationContext,
     },
     payload_visitor::{decode_payloads, retrieve_external_payloads},
     protos::{
@@ -44,9 +44,6 @@ pub enum ScheduleError {
     /// Failed to encode workflow input payloads.
     #[error("Payload conversion error: {0}")]
     PayloadConversion(#[from] PayloadConversionError),
-    /// Storing payloads in, or retrieving them from, external storage failed.
-    #[error("External storage error: {0}")]
-    ExternalStorage(#[from] ExternalStorageError),
     /// The server returned a schedule description that is missing required fields.
     #[error("Malformed schedule description for schedule ID '{schedule_id}': {reason}")]
     MalformedDescription {
