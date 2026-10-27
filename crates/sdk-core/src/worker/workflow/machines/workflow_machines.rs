@@ -1904,19 +1904,14 @@ fn prepare_session_activity(
     worker: &WorkerConfig,
     replaying: bool,
 ) -> Result<()> {
-    let Some(options) = &attrs.session_options else {
+    // Unset placement means normal task-queue routing.
+    let Some(activity_session_options::Placement::WorkflowSession(())) = attrs
+        .session_options
+        .as_ref()
+        .and_then(|options| options.placement.as_ref())
+    else {
         return Ok(());
     };
-    if !matches!(
-        options.session,
-        Some(activity_session_options::Session::UseWorkflowSession(true))
-    ) {
-        return Err(fatal!(
-            "Activity '{}' (seq {}) has invalid session_options: use_workflow_session must be true",
-            attrs.activity_id,
-            attrs.seq
-        ));
-    }
     if attrs.task_queue.is_empty() {
         attrs.task_queue.clone_from(&worker.task_queue);
     }
@@ -1949,17 +1944,16 @@ mod session_tests {
     use temporalio_common::protos::temporal::api::session::v1::ActivitySessionOptions;
 
     #[rstest::rstest]
-    #[case(true, Some(true), "", false, true)]
-    #[case(true, Some(true), "other", false, false)]
-    #[case(false, Some(true), "", false, false)]
-    #[case(false, Some(false), "", false, false)]
-    #[case(false, None, "", false, false)]
-    #[case(false, Some(false), "", true, false)]
-    #[case(false, None, "", true, false)]
-    #[case(false, Some(true), "other", true, true)]
+    #[case(true, true, "", false, true)]
+    #[case(true, true, "other", false, false)]
+    #[case(true, false, "other", false, true)]
+    #[case(false, true, "", false, false)]
+    #[case(false, false, "", false, true)]
+    #[case(false, false, "", true, true)]
+    #[case(false, true, "other", true, true)]
     fn session_activity_validation(
         #[case] enabled: bool,
-        #[case] use_session: Option<bool>,
+        #[case] workflow_session: bool,
         #[case] queue: &str,
         #[case] replaying: bool,
         #[case] valid: bool,
@@ -1981,7 +1975,8 @@ mod session_tests {
             activity_id: "activity".to_owned(),
             task_queue: queue.to_owned(),
             session_options: Some(ActivitySessionOptions {
-                session: use_session.map(activity_session_options::Session::UseWorkflowSession),
+                placement: workflow_session
+                    .then_some(activity_session_options::Placement::WorkflowSession(())),
             }),
             ..Default::default()
         };
@@ -1990,7 +1985,7 @@ mod session_tests {
         if valid {
             assert_eq!(
                 attrs.task_queue,
-                if use_session == Some(true) && queue.is_empty() {
+                if workflow_session && queue.is_empty() {
                     expected_queue.as_str()
                 } else {
                     queue

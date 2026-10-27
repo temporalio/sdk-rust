@@ -447,6 +447,9 @@ pub struct PollOptions {
 pub struct PollWorkflowOptions {
     /// Optional sticky queue name for session‐based workflow polling
     pub sticky_queue_name: Option<String>,
+    /// Experimental server session options, expected to change with the session API.
+    pub session_options:
+        Option<temporalio_common::protos::temporal::api::session::v1::WorkerSessionOptions>,
 }
 /// Additional options specific to activity task polling
 #[derive(Debug, Clone)]
@@ -455,6 +458,9 @@ pub struct PollActivityOptions {
     pub max_tasks_per_sec: Option<f64>,
     /// Poll this sticky destination instead of the normal activity queue.
     pub sticky_queue_name: Option<String>,
+    /// Experimental server session options, expected to change with the session API.
+    pub session_options:
+        Option<temporalio_common::protos::temporal::api::session::v1::WorkerSessionOptions>,
 }
 /// Additional options specific to Nexus task polling
 #[derive(Debug, Clone, Default)]
@@ -498,8 +504,7 @@ impl WorkerClient for WorkerClientBag {
             worker_instance_key: self.worker_instance_key.to_string(),
             worker_control_task_queue: self.worker_control_task_queue(),
             poller_group_id: Default::default(),
-            // Activity routing does not opt this worker into the deferred isolation policy.
-            session_options: None,
+            session_options: wf_options.session_options,
         }
         .into_request();
         request.extensions_mut().insert(IsWorkerTaskLongPoll);
@@ -539,8 +544,7 @@ impl WorkerClient for WorkerClientBag {
             worker_instance_key: self.worker_instance_key.to_string(),
             worker_control_task_queue: self.worker_control_task_queue(),
             poller_group_id: Default::default(),
-            // Activity routing does not opt this worker into the deferred isolation policy.
-            session_options: None,
+            session_options: act_options.session_options,
         }
         .into_request();
         request.extensions_mut().insert(IsWorkerTaskLongPoll);

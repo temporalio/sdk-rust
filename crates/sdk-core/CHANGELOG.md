@@ -37,8 +37,8 @@ relevant information.
 * Experimental session workers can poll workflow-affine activity queues; individual activities opt
   into their workflow's session, while normal activity routing remains the default. This increment
   supports fixed-size activity slots with capacity of at least two; resource-based and custom
-  activity suppliers are not supported yet. Activity session options must select workflow-session
-  routing; empty options or an explicit false selection are rejected.
+  activity suppliers are not supported yet. Activity session options without a placement use normal
+  task-queue routing. Session workers advertise session support on their sticky polls.
 
 ### Security
 * Ephemeral server downloads now use `zip` 9.0 for ZIP extraction, replacing the 8.x dependency

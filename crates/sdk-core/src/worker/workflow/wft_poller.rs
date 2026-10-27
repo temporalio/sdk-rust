@@ -64,6 +64,7 @@ pub(crate) fn make_wft_poller(
         }),
         WorkflowTaskOptions {
             wft_poller_shared: wft_poller_shared.clone(),
+            ..Default::default()
         },
         last_successful_poll_time,
         capabilities.clone(),
@@ -80,7 +81,10 @@ pub(crate) fn make_wft_poller(
             Some(move |np| {
                 sticky_metrics.record_num_pollers(np);
             }),
-            WorkflowTaskOptions { wft_poller_shared },
+            WorkflowTaskOptions {
+                wft_poller_shared,
+                session_options: config.poll_session_options(),
+            },
             sticky_last_successful_poll_time,
             capabilities,
         )

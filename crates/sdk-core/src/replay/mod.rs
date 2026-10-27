@@ -187,8 +187,8 @@ mod tests {
                         activity_id: "activity".to_owned(),
                         activity_type: DEFAULT_ACTIVITY_TYPE.to_owned(),
                         session_options: Some(ActivitySessionOptions {
-                            session: Some(activity_session_options::Session::UseWorkflowSession(
-                                true,
+                            placement: Some(activity_session_options::Placement::WorkflowSession(
+                                (),
                             )),
                         }),
                         ..Default::default()

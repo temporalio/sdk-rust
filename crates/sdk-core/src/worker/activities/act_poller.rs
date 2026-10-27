@@ -50,6 +50,7 @@ pub(crate) fn make_activity_poller(
             rate_limiter: rate_limiter.clone(),
             max_tps: config.max_task_queue_activities_per_second,
             poller_shared: poller_shared.clone(),
+            ..Default::default()
         },
         last_successful_poll_time.clone(),
         capabilities.clone(),
@@ -68,6 +69,7 @@ pub(crate) fn make_activity_poller(
                 rate_limiter,
                 max_tps: config.max_task_queue_activities_per_second,
                 poller_shared,
+                session_options: config.poll_session_options(),
             },
             last_successful_poll_time,
             capabilities,
@@ -101,6 +103,7 @@ mod tests {
                     poll.task_queue,
                     options.sticky_queue_name,
                     tokio::time::Instant::now(),
+                    options.session_options,
                 ))
                 .unwrap();
                 pending().boxed()
@@ -148,6 +151,10 @@ mod tests {
         assert_ne!(first.1, second.1);
         assert!(second.2.duration_since(first.2) >= Duration::from_millis(500));
         assert!(first.1.as_deref() == Some("sticky") || second.1.as_deref() == Some("sticky"));
+        // Only sticky polls advertise session support.
+        for (_, sticky, _, session_options) in [&first, &second] {
+            assert_eq!(sticky.is_some(), session_options.is_some());
+        }
         assert_eq!(slots.available_permits(), Some(0));
         poller.notify_shutdown();
         assert!(polling.await.unwrap().is_none());
@@ -168,6 +175,7 @@ mod tests {
                 .times(5)
                 .returning(move |_, options| {
                     assert!(options.sticky_queue_name.is_none());
+                    assert!(options.session_options.is_none());
                     tx.send(()).unwrap();
                     pending().boxed()
                 });

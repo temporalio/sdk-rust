@@ -102,6 +102,7 @@ use temporalio_common::{
             deployment,
             enums::v1::{TaskQueueKind, TaskQueueType, WorkerStatus},
             namespace::v1::namespace_info::Capabilities as ApiNamespaceCapabilities,
+            session::v1::WorkerSessionOptions as ApiWorkerSessionOptions,
             taskqueue::v1::{StickyExecutionAttributes, TaskQueue},
             worker::v1::{
                 EnvironmentInfo, WorkerHeartbeat, WorkerHostInfo, WorkerPollerInfo, WorkerSlotsInfo,
@@ -314,6 +315,14 @@ pub struct WorkerConfig {
 }
 
 impl WorkerConfig {
+    /// Session options for sticky polls. Their presence tells the server this worker can serve
+    /// sessions.
+    pub(crate) fn poll_session_options(&self) -> Option<ApiWorkerSessionOptions> {
+        self.session_worker_options
+            .as_ref()
+            .map(|_| ApiWorkerSessionOptions::default())
+    }
+
     /// Returns true if the configuration specifies we should fail a workflow on a certain error
     /// type rather than failing the workflow task.
     pub fn should_fail_workflow(
