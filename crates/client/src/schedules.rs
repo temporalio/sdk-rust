@@ -543,14 +543,17 @@ impl ScheduleDescriptionStartWorkflowAction {
         &self,
     ) -> Result<Option<T>, PayloadConversionError> {
         match &self.input {
-            Some(input) => self
-                .data_converter
-                .from_payloads(
-                    &SerializationContextData::Workflow(WorkflowSerializationContext::new()),
-                    input.payloads.clone(),
-                )
-                .await
-                .map(Some),
+            Some(input) => {
+                let mut input = input.clone();
+                retrieve_external_payloads(&mut input, &self.data_converter).await?;
+                self.data_converter
+                    .from_payloads(
+                        &SerializationContextData::Workflow(WorkflowSerializationContext::new()),
+                        input.payloads,
+                    )
+                    .await
+                    .map(Some)
+            }
             None => Ok(None),
         }
     }
@@ -1092,6 +1095,7 @@ where
 
         let mut resp = output.response;
         if let Some(memo) = resp.memo.as_mut() {
+            retrieve_external_payloads(memo, self.client.data_converter()).await?;
             decode_payloads(
                 memo,
                 self.client.data_converter().codec(),
@@ -1146,6 +1150,8 @@ where
                     Box::pin(async move {
                         let mut response = handle
                             .describe_raw(input.schedule_id.clone(), input.rpc_options.clone())
+                            .await?;
+                        retrieve_external_payloads(&mut response, handle.client.data_converter())
                             .await?;
                         decode_payloads(
                             &mut response,
@@ -1212,11 +1218,11 @@ where
         }
         .into_request();
         rpc_options.apply_to(&mut request);
-        let mut response = WorkflowService::describe_schedule(&mut self.client.clone(), request)
-            .await?
-            .into_inner();
-        retrieve_external_payloads(&mut response, self.client.data_converter()).await?;
-        Ok(response)
+        Ok(
+            WorkflowService::describe_schedule(&mut self.client.clone(), request)
+                .await?
+                .into_inner(),
+        )
     }
 
     async fn send_update_raw(
@@ -1672,7 +1678,8 @@ mod tests {
     use temporalio_common::{
         UntypedWorkflow,
         data_converters::{
-            DataConverter, DefaultFailureConverter, MultiArgs2, PayloadConverter, RawValue,
+            DataConverter, DefaultFailureConverter, ExternalStorageError, MultiArgs2,
+            PayloadConverter, RawValue,
         },
         protos::temporal::api::{
             common::v1::{
@@ -2572,6 +2579,66 @@ mod tests {
 
         let err = action.args::<i32>().await.unwrap_err();
         assert!(matches!(err, PayloadConversionError::EncodingError(_)));
+    }
+
+    fn storage_reference() -> Payload {
+        Payload {
+            metadata: HashMap::from([
+                ("encoding".to_owned(), b"json/protobuf".to_vec()),
+                (
+                    "messageType".to_owned(),
+                    b"temporal.api.sdk.v1.ExternalStorageReference".to_vec(),
+                ),
+            ]),
+            data: b"{}".to_vec(),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn schedule_describe_leaves_argument_references_to_args() {
+        let reference = storage_reference();
+        let client = MockScheduleClient {
+            describe_response: describe_response_with_start_workflow(Some(Payloads {
+                payloads: vec![reference.clone()],
+            })),
+            ..Default::default()
+        };
+
+        let desc = make_schedule_handle(client)
+            .describe(RpcOptions::default())
+            .await
+            .unwrap();
+        let ScheduleDescriptionAction::StartWorkflow(action) = desc.action();
+
+        assert_eq!(action.raw_args().unwrap(), &[reference]);
+        assert!(matches!(
+            action.args::<String>().await.unwrap_err(),
+            PayloadConversionError::ExternalStorage(ExternalStorageError::NotConfigured)
+        ));
+    }
+
+    #[tokio::test]
+    async fn schedule_update_rejects_argument_references_before_sending() {
+        let client = MockScheduleClient {
+            describe_response: describe_response_with_start_workflow(Some(Payloads {
+                payloads: vec![storage_reference()],
+            })),
+            ..Default::default()
+        };
+
+        let err = make_schedule_handle(client.clone())
+            .update(|_| {}, RpcOptions::default())
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            err,
+            ScheduleError::PayloadConversion(PayloadConversionError::ExternalStorage(
+                ExternalStorageError::NotConfigured
+            ))
+        ));
+        assert_eq!(client.captured.update.load(Ordering::SeqCst), 0);
     }
 
     #[rstest::rstest]

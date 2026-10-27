@@ -11,7 +11,7 @@ use temporalio_common::{
         TemporalDeserializable,
     },
     error::IncomingError,
-    payload_visitor::decode_payloads,
+    payload_visitor::{decode_payloads, retrieve_external_payloads},
     protos::{
         proto_ts_to_system_time,
         temporal::api::{
@@ -197,10 +197,12 @@ where
             return Err("info missing in describe response".into());
         };
         if let Some(failure) = raw_info.last_failure.as_mut() {
+            retrieve_external_payloads(failure, &data_converter).await?;
             decode_payloads(failure, data_converter.codec(), &serialization_context).await?;
         }
         let mut raw_outcome = response.outcome.and_then(|o| o.value);
         if let Some(ActivityExecutionOutcomeValue::Failure(failure)) = raw_outcome.as_mut() {
+            retrieve_external_payloads(failure, &data_converter).await?;
             decode_payloads(failure, data_converter.codec(), &serialization_context).await?;
         }
         Ok(Self {
@@ -479,8 +481,9 @@ where
 
     async fn convert_payload<T: TemporalDeserializable + 'static>(
         &self,
-        payload: Payload,
+        mut payload: Payload,
     ) -> Result<T, PayloadConversionError> {
+        retrieve_external_payloads(&mut payload, &self.data_converter).await?;
         self.data_converter
             .from_payload(&self.serialization_context, payload)
             .await
@@ -490,8 +493,10 @@ where
         &self,
         payloads: &Payloads,
     ) -> Result<T, PayloadConversionError> {
+        let mut payloads = payloads.clone();
+        retrieve_external_payloads(&mut payloads, &self.data_converter).await?;
         self.data_converter
-            .from_payloads(&self.serialization_context, payloads.payloads.clone())
+            .from_payloads(&self.serialization_context, payloads.payloads)
             .await
     }
 

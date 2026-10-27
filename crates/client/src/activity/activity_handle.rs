@@ -140,7 +140,7 @@ where
         options: ActivityDescribeOptions,
     ) -> Result<ActivityExecutionDescription<ActivityT>, ActivityInteractionError> {
         let mut client = self.client.clone();
-        let mut resp = client
+        let resp = client
             .describe_activity_execution(
                 DescribeActivityExecutionRequest {
                     namespace: client.namespace(),
@@ -156,7 +156,6 @@ where
             )
             .await?
             .into_inner();
-        retrieve_external_payloads(&mut resp, client.data_converter()).await?;
 
         Ok(ActivityExecutionDescription::new(
             client.data_converter().clone(),
@@ -218,13 +217,18 @@ mod tests {
     use super::*;
     use crate::test_helpers::XorCodec;
     use futures_util::future::BoxFuture;
+    use std::collections::HashMap;
     use temporalio_common::{
         UntypedActivity,
-        data_converters::{DataConverter, DefaultFailureConverter, PayloadConverter},
+        data_converters::{
+            DataConverter, DefaultFailureConverter, ExternalStorageError, PayloadConversionError,
+            PayloadConverter,
+        },
         error::{ApplicationFailure, OutgoingActivityError, OutgoingError},
         payload_visitor::encode_payloads,
         protos::temporal::api::{
             activity::v1::ActivityExecutionInfo,
+            common::v1::{Payload, Payloads},
             failure::v1::Failure,
             workflowservice::v1::{
                 DescribeActivityExecutionResponse, PollActivityExecutionResponse,
@@ -237,6 +241,7 @@ mod tests {
     struct MockActivityClient {
         data_converter: DataConverter,
         failure: Failure,
+        input: Option<Payloads>,
     }
 
     impl NamespacedClient for MockActivityClient {
@@ -275,8 +280,10 @@ mod tests {
             _request: Request<DescribeActivityExecutionRequest>,
         ) -> BoxFuture<'_, Result<Response<DescribeActivityExecutionResponse>, Status>> {
             let failure = self.failure.clone();
+            let input = self.input.clone();
             Box::pin(async move {
                 Ok(Response::new(DescribeActivityExecutionResponse {
+                    input,
                     info: Some(ActivityExecutionInfo {
                         last_failure: Some(failure.clone()),
                         ..Default::default()
@@ -310,6 +317,7 @@ mod tests {
         MockActivityClient {
             data_converter,
             failure,
+            input: None,
         }
     }
 
@@ -348,5 +356,43 @@ mod tests {
         let last_failure = description.last_failure().unwrap().unwrap();
         assert_eq!(outcome.failure().message, "private message");
         assert_eq!(last_failure.failure().message, "private message");
+    }
+
+    #[tokio::test]
+    async fn describe_leaves_references_to_the_accessor_that_reads_them() {
+        let reference = Payload {
+            metadata: HashMap::from([
+                ("encoding".to_owned(), b"json/protobuf".to_vec()),
+                (
+                    "messageType".to_owned(),
+                    b"temporal.api.sdk.v1.ExternalStorageReference".to_vec(),
+                ),
+            ]),
+            data: b"{}".to_vec(),
+            ..Default::default()
+        };
+        let mut client = activity_client_with_encoded_failure().await;
+        client.input = Some(Payloads {
+            payloads: vec![reference.clone()],
+        });
+        let handle =
+            ActivityHandle::<_, UntypedActivity>::new(client, "activity-id".to_owned(), None);
+
+        let description = handle
+            .describe(
+                ActivityDescribeOptions::builder()
+                    .include_input(true)
+                    .include_outcome(true)
+                    .build(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(description.raw_input().unwrap().payloads, vec![reference]);
+        assert!(description.outcome().await.unwrap().unwrap().is_err());
+        assert!(matches!(
+            description.input().await.unwrap_err(),
+            PayloadConversionError::ExternalStorage(ExternalStorageError::NotConfigured)
+        ));
     }
 }
