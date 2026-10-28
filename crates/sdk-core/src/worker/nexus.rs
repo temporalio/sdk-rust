@@ -148,7 +148,7 @@ impl NexusManager {
                     warn!(error=?e, "Network error while completing Nexus task");
                 }
             } else if did_send {
-                // Record e2e latency if we sent replied to server without an RPC error
+                // Record e2e latency if we replied to server without an RPC error
                 if let Some(elapsed) = task_info.scheduled_time.and_then(|t| t.elapsed().ok()) {
                     self.metrics.nexus_task_e2e_latency(elapsed);
                 }
