@@ -519,7 +519,7 @@ struct RealSysInfoInner {
     total_mem: AtomicU64,
     cur_mem_usage: AtomicU64,
     cur_cpu_usage: AtomicU64,
-    cgroup_cpu_info: CGroupCpuInfo<CgroupV2CpuFileSystem>,
+    cgroup_cpu_info: CGroupCpuInfo<LinuxCgroupCpuFileSystem>,
 }
 
 impl RealSysInfoInner {
@@ -586,7 +586,7 @@ impl RealSysInfo {
             cur_mem_usage: AtomicU64::new(0),
             cur_cpu_usage: AtomicU64::new(0),
             total_mem: AtomicU64::new(total_mem),
-            cgroup_cpu_info: CGroupCpuInfo::new(CgroupV2CpuFileSystem),
+            cgroup_cpu_info: CGroupCpuInfo::new(LinuxCgroupCpuFileSystem::default()),
         });
         inner.refresh();
 
@@ -742,23 +742,65 @@ impl<T: CGroupCpuFileSystem> CGroupCpuInfo<T> {
 }
 
 /// Implementation of the `CGroupCpuFileSystem` that reads directly
-/// from the host cgroup v2 hierarchy.
+/// from standard cgroup v1 or v2 mounts.
 #[derive(Debug)]
-struct CgroupV2CpuFileSystem;
-
-impl CgroupV2CpuFileSystem {
-    const BASE_PATH: &'static str = "/sys/fs/cgroup";
+struct LinuxCgroupCpuFileSystem {
+    base_path: PathBuf,
 }
 
-impl CGroupCpuFileSystem for CgroupV2CpuFileSystem {
+impl Default for LinuxCgroupCpuFileSystem {
+    fn default() -> Self {
+        Self {
+            base_path: PathBuf::from("/sys/fs/cgroup"),
+        }
+    }
+}
+
+impl LinuxCgroupCpuFileSystem {
+    fn read_cpu_files(&self) -> Option<(String, String)> {
+        // Usage and quota must come from the same hierarchy on hybrid systems.
+        if let (Ok(stat), Ok(limit)) = (
+            fs::read_to_string(self.base_path.join("cpu.stat")),
+            fs::read_to_string(self.base_path.join("cpu.max")),
+        ) {
+            return Some((stat, limit));
+        }
+
+        [
+            ("cpuacct", "cpu"),
+            ("cpu,cpuacct", "cpu,cpuacct"),
+            ("cpuacct,cpu", "cpuacct,cpu"),
+        ]
+        .into_iter()
+        .find_map(|(accounting, cpu)| {
+            let usage =
+                fs::read_to_string(self.base_path.join(accounting).join("cpuacct.usage")).ok()?;
+            let cpu_path = self.base_path.join(cpu);
+            let quota = fs::read_to_string(cpu_path.join("cpu.cfs_quota_us")).ok()?;
+            let period = fs::read_to_string(cpu_path.join("cpu.cfs_period_us")).ok()?;
+
+            // Normalize v1 values to the v2 format used by the existing sampler.
+            let usage_ns: u64 = usage.trim().parse().ok()?;
+            let quota = if quota.trim() == "-1" {
+                "max"
+            } else {
+                quota.trim()
+            };
+            Some((
+                format!("usage_usec {}", usage_ns / 1_000),
+                format!("{} {}", quota, period.trim()),
+            ))
+        })
+    }
+}
+
+impl CGroupCpuFileSystem for LinuxCgroupCpuFileSystem {
     fn read_cpu_stat_file(&self) -> Option<String> {
-        let path = PathBuf::from(Self::BASE_PATH).join("cpu.stat");
-        fs::read_to_string(path).ok()
+        self.read_cpu_files().map(|(stat, _)| stat)
     }
 
     fn read_cpu_limit_file(&self) -> Option<String> {
-        let path = PathBuf::from(Self::BASE_PATH).join("cpu.max");
-        fs::read_to_string(path).ok()
+        self.read_cpu_files().map(|(_, limit)| limit)
     }
 }
 
@@ -1017,6 +1059,60 @@ mod tests {
         assert!(pd.try_acquire_owned().is_err());
     }
 
+    #[rstest::rstest]
+    #[case("cpu", "cpuacct")]
+    #[case("cpu,cpuacct", "cpu,cpuacct")]
+    #[case("cpuacct,cpu", "cpuacct,cpu")]
+    fn cgroup_cpu_files_support_v1_mounts_and_prefer_v2(
+        #[case] cpu_mount: &str,
+        #[case] cpuacct_mount: &str,
+    ) {
+        let base_path = env::temp_dir().join(format!("temporal-cgroup-{}", uuid::Uuid::new_v4()));
+        let cpu_path = base_path.join(cpu_mount);
+        let cpuacct_path = base_path.join(cpuacct_mount);
+        fs::create_dir_all(&cpu_path).unwrap();
+        fs::create_dir_all(&cpuacct_path).unwrap();
+        fs::write(cpuacct_path.join("cpuacct.usage"), "1234567000\n").unwrap();
+        fs::write(cpu_path.join("cpu.cfs_quota_us"), "50000\n").unwrap();
+        fs::write(cpu_path.join("cpu.cfs_period_us"), "100000\n").unwrap();
+        fs::write(base_path.join("cpu.stat"), "usage_usec 42\n").unwrap();
+        let info = CGroupCpuInfo::new(LinuxCgroupCpuFileSystem {
+            base_path: base_path.clone(),
+        });
+
+        assert_eq!(info.read_cpu_usage(), Some(1_234_567));
+        assert!(matches!(
+            info.read_cpus_limit(),
+            Some(CGroupCpuLimits {
+                quota: CpuQuota::Limited(50_000),
+                period: 100_000,
+            })
+        ));
+        fs::write(cpu_path.join("cpu.cfs_quota_us"), "-1\n").unwrap();
+        assert!(matches!(
+            info.read_cpus_limit().unwrap().quota,
+            CpuQuota::Unlimited
+        ));
+
+        fs::write(base_path.join("cpu.max"), "20000 100000\n").unwrap();
+        assert_eq!(info.read_cpu_usage(), Some(42));
+        assert!(matches!(
+            info.read_cpus_limit(),
+            Some(CGroupCpuLimits {
+                quota: CpuQuota::Limited(20_000),
+                period: 100_000,
+            })
+        ));
+
+        fs::remove_file(base_path.join("cpu.stat")).unwrap();
+        assert_eq!(info.read_cpu_usage(), Some(1_234_567));
+        assert!(matches!(
+            info.read_cpus_limit().unwrap().quota,
+            CpuQuota::Unlimited
+        ));
+        fs::remove_dir_all(base_path).unwrap();
+    }
+
     #[derive(Clone)]
     struct FakeCGroupFS {
         stat: Rc<RefCell<Option<String>>>,
@@ -1126,7 +1222,7 @@ mod tests {
         }
 
         let sys_info = RealSysInfo::new(RealSysInfo::MIN_REFRESH_INTERVAL);
-        let cgroup_info = CGroupCpuInfo::new(CgroupV2CpuFileSystem);
+        let cgroup_info = CGroupCpuInfo::new(LinuxCgroupCpuFileSystem::default());
         let CGroupCpuLimits { quota, period } = cgroup_info
             .read_cpus_limit()
             .expect("unable to read cpu quota.");

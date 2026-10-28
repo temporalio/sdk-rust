@@ -45,6 +45,9 @@ relevant information.
   nondeterminism while retaining compatibility with histories recorded before these checks.
 
 ### Fixed
+* Resource-based worker tuners now read CPU usage and quotas from standard cgroup v1 mounts. Workers
+  on cgroup v1 systems no longer fall back to host CPU usage and admit work based on understated
+  container load.
 * Preserve queued queries across workflow eviction so requests for the same run are answered instead of silently dropped.
 * Dev and test server startup now stops waiting at the configured deadline even if a readiness
   request stalls. Timeout messages include the last connection failure when available.

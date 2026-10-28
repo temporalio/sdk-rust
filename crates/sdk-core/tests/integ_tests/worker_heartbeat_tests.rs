@@ -214,6 +214,14 @@ async fn worker_heartbeat_basic(backing: &str) {
     let wf_name = format!("worker_heartbeat_basic_{backing}");
     let mut starter = CoreWfStarter::new_with_runtime(&wf_name, rt);
     starter.sdk_config.max_cached_workflows = 5_usize;
+    // Sticky caching requires at least two workflow pollers, split one per queue here.
+    starter.sdk_config.workflow_task_poller_behavior = Some(PollerBehavior::SimpleMaximum(2));
+    starter.sdk_config.activity_task_poller_behavior = Some(PollerBehavior::SimpleMaximum(1));
+    starter.sdk_config.nexus_task_poller_behavior = Some(PollerBehavior::SimpleMaximum(1));
+    // Eager delivery would bypass the activity poll whose timestamp the heartbeat must report.
+    starter
+        .sdk_config
+        .max_eager_activity_reservations_per_workflow_task = 0;
     starter.set_core_tuner(Arc::new(TunerHolder::fixed_size(5, 5, 100, 0)));
     starter.set_core_cfg_mutator(|c| {
         c.plugins = vec![
