@@ -169,7 +169,7 @@ impl S3StorageDriver {
         context_segments: &str,
     ) -> Result<StoredObject, S3StorageDriverError> {
         let bucket = (self.bucket_selector)(context, &payload);
-        let data = encode_payload(&mut payload);
+        let data = serialize_payload(&mut payload);
         if data.len() > self.max_payload_size {
             return Err(S3StorageDriverError::PayloadTooLarge {
                 size: data.len(),
@@ -348,8 +348,8 @@ fn validate_claim(claim: &StorageDriverClaim) -> Result<(), S3StorageDriverError
     Ok(())
 }
 
-/// Encodes a payload with its metadata entries sorted by key.
-fn encode_payload(payload: &mut Payload) -> Vec<u8> {
+/// Serializes a payload with its metadata entries sorted by key.
+fn serialize_payload(payload: &mut Payload) -> Vec<u8> {
     let mut metadata: Vec<_> = std::mem::take(&mut payload.metadata).into_iter().collect();
     metadata.sort_unstable_by(|(a, _), (b, _)| a.cmp(b));
     let mut data = Vec::new();
@@ -979,8 +979,6 @@ mod tests {
 
     #[tokio::test]
     async fn store_equal_payloads_with_several_metadata_entries_uploads_once() {
-        // Each HashMap iterates in its own random order, so with this many entries two equal
-        // payloads would almost never encode the same way unless the driver sorts them
         let entries: Vec<_> = (0..8u8).map(|i| (format!("key-{i}"), vec![i])).collect();
         let equal_payload = || Payload {
             metadata: entries.iter().cloned().collect(),
