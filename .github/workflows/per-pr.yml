@@ -106,7 +106,7 @@ jobs:
           - group: rust-1.88
             crates: client common common-wasm macros protos sdk-core workflow
           - group: rust-1.92
-            crates: sdk
+            crates: aws-s3driver sdk
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - uses: ./.github/actions/setup
