@@ -160,17 +160,10 @@ pub async fn store_external_payloads<M: PayloadVisitable + Send>(
 ) -> Result<(), PayloadConversionError> {
     // Stored without a target until the worker and client can name the execution a message is for.
     #[cfg(feature = "experimental")]
-    return Ok(crate::external_storage_runner::store_in(
-        data_converter.external_storage(),
-        msg,
-        None,
-    )
-    .await?);
+    crate::external_storage_runner::store_in(data_converter.external_storage(), msg, None).await?;
     #[cfg(not(feature = "experimental"))]
-    {
-        let _ = (msg, data_converter);
-        Ok(())
-    }
+    let _ = (msg, data_converter);
+    Ok(())
 }
 
 /// Replace every external storage reference in an inbound message with the payload it points at.
@@ -186,14 +179,13 @@ pub async fn retrieve_external_payloads<M: PayloadVisitable + Send>(
     data_converter: &DataConverter,
 ) -> Result<(), PayloadConversionError> {
     #[cfg(feature = "experimental")]
-    return Ok(
-        crate::external_storage_runner::retrieve_in(data_converter.external_storage(), msg).await?,
-    );
+    crate::external_storage_runner::retrieve_in(data_converter.external_storage(), msg).await?;
     #[cfg(not(feature = "experimental"))]
     {
         let _ = data_converter;
-        Ok(crate::external_storage_references::reject_references_in(msg).await?)
+        crate::external_storage_references::reject_references_in(msg).await?;
     }
+    Ok(())
 }
 
 // Manual impl for Payload - visits itself as a single payload
