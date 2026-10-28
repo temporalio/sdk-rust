@@ -19,7 +19,7 @@ use temporalio_common::{
         DataConverter, PayloadConversionError, SerializationContextData, TemporalDeserializable,
         TemporalSerializable, WorkflowSerializationContext,
     },
-    payload_visitor::decode_payloads,
+    payload_visitor::{decode_payloads, retrieve_external_payloads},
     protos::{
         coresdk::IntoPayloadsExt,
         proto_ts_to_system_time,
@@ -1212,11 +1212,11 @@ where
         }
         .into_request();
         rpc_options.apply_to(&mut request);
-        Ok(
-            WorkflowService::describe_schedule(&mut self.client.clone(), request)
-                .await?
-                .into_inner(),
-        )
+        let mut response = WorkflowService::describe_schedule(&mut self.client.clone(), request)
+            .await?
+            .into_inner();
+        retrieve_external_payloads(&mut response, self.client.data_converter()).await?;
+        Ok(response)
     }
 
     async fn send_update_raw(
@@ -1590,10 +1590,15 @@ where
                                     }
                                     .into_request();
                                     input.rpc_options.apply_to(&mut request);
-                                    let response =
+                                    let mut response =
                                         WorkflowService::list_schedules(&mut rpc_client, request)
                                             .await?
                                             .into_inner();
+                                    retrieve_external_payloads(
+                                        &mut response,
+                                        rpc_client.data_converter(),
+                                    )
+                                    .await?;
                                     Ok(ListSchedulesPageOutput::new(
                                         response.schedules,
                                         response.next_page_token,

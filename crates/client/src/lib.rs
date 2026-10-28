@@ -137,7 +137,7 @@ use temporalio_common::{
         ActivitySerializationContext, DataConverter, SerializationContext,
         SerializationContextData, WorkflowSerializationContext,
     },
-    payload_visitor::decode_payloads,
+    payload_visitor::{decode_payloads, retrieve_external_payloads},
     protos::{
         coresdk::IntoPayloadsExt,
         grpc::health::v1::health_client::HealthClient,
@@ -2186,11 +2186,13 @@ where
                         let (start_response, update_response) = loop {
                             let mut rpc_request = request.clone().into_request();
                             rpc_options.apply_to(&mut rpc_request);
-                            let response =
+                            let mut response =
                                 WorkflowService::execute_multi_operation(&mut client, rpc_request)
                                     .await
                                     .map_err(WorkflowUpdateWithStartError::from_status)?
                                     .into_inner();
+                            retrieve_external_payloads(&mut response, client.data_converter())
+                                .await?;
 
                             let [start_response, update_response]: [_; 2] =
                                 response.responses.try_into().map_err(|_| {
@@ -2358,12 +2360,17 @@ where
                                     }
                                     .into_request();
                                     input.rpc_options.apply_to(&mut request);
-                                    let response = WorkflowService::list_workflow_executions(
+                                    let mut response = WorkflowService::list_workflow_executions(
                                         &mut rpc_client,
                                         request,
                                     )
                                     .await?
                                     .into_inner();
+                                    retrieve_external_payloads(
+                                        &mut response,
+                                        rpc_client.data_converter(),
+                                    )
+                                    .await?;
                                     Ok(ListWorkflowsPageOutput::new(
                                         response.executions,
                                         response.next_page_token,

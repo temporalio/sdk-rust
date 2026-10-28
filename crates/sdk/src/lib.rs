@@ -151,7 +151,7 @@ use temporalio_common::{
         ActivitySerializationContext, DataConverter, SerializationContext,
         SerializationContextData, WorkflowSerializationContext,
     },
-    payload_visitor::{decode_payloads, encode_payloads},
+    payload_visitor::{decode_payloads, encode_payloads, retrieve_external_payloads},
     protos::{
         TaskToken,
         coresdk::{
@@ -1194,13 +1194,19 @@ impl Worker {
                                         source: Box::new(source),
                                     })?,
                                 };
-                            if let Err(err) = decode_payloads(
-                                &mut activation,
-                                common.data_converter.codec(),
-                                &SerializationContextData::Workflow(WorkflowSerializationContext::new()),
-                            )
-                            .await
-                            {
+                            let decoded = async {
+                                retrieve_external_payloads(&mut activation, &common.data_converter)
+                                    .await?;
+                                decode_payloads(
+                                    &mut activation,
+                                    common.data_converter.codec(),
+                                    &SerializationContextData::Workflow(WorkflowSerializationContext::new()),
+                                )
+                                .await?;
+                                Ok::<_, anyhow::Error>(())
+                            }
+                            .await;
+                            if let Err(err) = decoded {
                                 let run_id = activation.run_id;
                                 error!(run_id, error = %err, "Failed decoding workflow activation");
                                 completions_tx
@@ -1280,7 +1286,9 @@ impl Worker {
                             message: "activity polling failed".to_owned(),
                             source: Box::new(source),
                         })?;
-                        if let Err(err) =
+                        let decoded = async {
+                            retrieve_external_payloads(&mut activity, &common.data_converter)
+                                .await?;
                             decode_payloads(
                                 &mut activity,
                                 common.data_converter.codec(),
@@ -1288,8 +1296,11 @@ impl Worker {
                                     ActivitySerializationContext::new(),
                                 ),
                             )
-                            .await
-                        {
+                            .await?;
+                            Ok::<_, anyhow::Error>(())
+                        }
+                        .await;
+                        if let Err(err) = decoded {
                             error!(error = %err, "Failed decoding activity task");
                             let mut completion = ActivityTaskCompletion {
                                 task_token: activity.task_token,

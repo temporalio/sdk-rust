@@ -5,7 +5,9 @@
 //! boundary between the SDK and Core.
 
 use crate::{
-    data_converters::{PayloadCodec, PayloadConversionError, SerializationContextData},
+    data_converters::{
+        DataConverter, PayloadCodec, PayloadConversionError, SerializationContextData,
+    },
     protos::temporal::api::common::v1::{Payload, Payloads},
 };
 use futures::future::BoxFuture;
@@ -103,7 +105,6 @@ macro_rules! payload_visitor {
         }
     };
 }
-#[cfg(feature = "experimental")]
 pub(crate) use payload_visitor;
 
 /// Visitor that encodes payloads using a codec.
@@ -144,6 +145,22 @@ pub async fn decode_payloads<M: PayloadVisitable + Send>(
 ) -> Result<(), PayloadConversionError> {
     let mut visitor = DecodeVisitor { codec, context };
     msg.visit_payloads_mut(&mut visitor).await
+}
+
+/// Replace every external storage reference in an inbound message with the payload it points at.
+/// Runs before [`decode_payloads`], since a driver returns a payload as it was before offloading.
+/// Without external storage to retrieve them, a reference is an error instead, reported as
+/// [`PayloadConversionError::ExternalStorage`].
+///
+/// On error the message is left partly processed and must not be used.
+#[doc(hidden)]
+pub async fn retrieve_external_payloads<M: PayloadVisitable + Send>(
+    msg: &mut M,
+    data_converter: &DataConverter,
+) -> Result<(), PayloadConversionError> {
+    // External storage cannot be configured yet, so there is never anything to retrieve with.
+    let _ = data_converter;
+    Ok(crate::external_storage_references::reject_references_in(msg).await?)
 }
 
 // Manual impl for Payload - visits itself as a single payload
@@ -187,7 +204,7 @@ include!(concat!(env!("OUT_DIR"), "/payload_visitor_impl.rs"));
 mod tests {
     use super::*;
     use crate::{
-        data_converters::WorkflowSerializationContext,
+        data_converters::{ExternalStorageError, WorkflowSerializationContext},
         protos::{
             coresdk::{
                 activity_result::{
@@ -806,5 +823,28 @@ mod tests {
             panic!("expected application failure info")
         };
         assert!(is_encoded(&info.details.unwrap().payloads[0]));
+    }
+
+    #[tokio::test]
+    async fn unretrievable_reference_is_a_payload_conversion_error() {
+        let reference = crate::external_storage_references::create_reference_payload(
+            "mem",
+            HashMap::from([("key".to_owned(), "a".to_owned())]),
+            99,
+        )
+        .unwrap();
+        let mut message = Payloads {
+            payloads: vec![reference],
+        };
+
+        let err = retrieve_external_payloads(&mut message, &DataConverter::default())
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            err,
+            PayloadConversionError::ExternalStorage(ExternalStorageError::NotConfigured)
+        ));
+        assert!(err.to_string().contains("TMPRL1105"));
     }
 }

@@ -6,16 +6,19 @@
 //! `temporalio-common-wasm`, because proto JSON support and the payload visitor that will drive it
 //! are here.
 
-// Crate-private until there is a consumer; nothing offloads or restores payloads yet.
+// Only the runner creates or parses references, and nothing calls it yet.
 #![allow(dead_code)]
 
 use std::collections::HashMap;
 
-use crate::protos::temporal::api::{
-    common::v1::{Payload, payload::ExternalPayloadDetails},
-    sdk::v1::ExternalStorageReference,
+use crate::{
+    data_converters::ExternalStorageError,
+    payload_visitor::{PayloadVisitable, payload_visitor},
+    protos::temporal::api::{
+        common::v1::{Payload, payload::ExternalPayloadDetails},
+        sdk::v1::ExternalStorageReference,
+    },
 };
-use temporalio_common_wasm::data_converters::ExternalStorageError;
 
 const REFERENCE_ENCODING: &str = "json/protobuf";
 // Spelled out rather than taken from `prost::Name` so that a proto-side rename fails
@@ -35,6 +38,31 @@ pub(crate) fn is_plain_reference(payload: &Payload) -> bool {
         && payload.metadata.get("messageType").map(Vec::as_slice)
             == Some(REFERENCE_MESSAGE_TYPE.as_bytes())
 }
+
+/// Fail if any payload in the message is a reference, for a caller with no external storage to
+/// retrieve it with.
+pub(crate) async fn reject_references_in<M: PayloadVisitable + Send>(
+    message: &mut M,
+) -> Result<(), ExternalStorageError> {
+    let mut finder = ReferenceFinder { found: false };
+    message
+        .visit_payloads_mut(&mut finder)
+        .await
+        .map_err(|e| ExternalStorageError::Walk(Box::new(e)))?;
+    if finder.found {
+        return Err(ExternalStorageError::NotConfigured);
+    }
+    Ok(())
+}
+
+struct ReferenceFinder {
+    found: bool,
+}
+
+payload_visitor!(ReferenceFinder, |this, payloads| {
+    this.found |= payloads.iter().any(is_plain_reference);
+    payloads
+});
 
 /// Parse the reference from the given payload, which must be a plain reference.
 pub(crate) fn parse_reference(
@@ -86,6 +114,7 @@ pub(crate) fn create_reference_payload(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::protos::temporal::api::common::v1::Payloads;
 
     #[test]
     fn reference_payload_uses_the_cross_sdk_wire_shape() {
@@ -194,6 +223,33 @@ mod tests {
         .unwrap();
 
         assert!(is_plain_reference(&payload));
+    }
+
+    #[tokio::test]
+    async fn a_reference_with_no_storage_to_retrieve_it_is_tmprl1105() {
+        let ordinary = Payload {
+            data: b"fine".to_vec(),
+            ..Default::default()
+        };
+        let reference = create_reference_payload(
+            "mem",
+            HashMap::from([("key".to_owned(), "a".to_owned())]),
+            99,
+        )
+        .unwrap();
+        let mut message = Payloads {
+            payloads: vec![ordinary.clone(), reference],
+        };
+
+        let err = reject_references_in(&mut message).await.unwrap_err();
+
+        assert!(matches!(err, ExternalStorageError::NotConfigured));
+        assert!(err.to_string().contains("TMPRL1105"));
+        reject_references_in(&mut Payloads {
+            payloads: vec![ordinary],
+        })
+        .await
+        .unwrap();
     }
 
     #[test]
