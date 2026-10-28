@@ -354,6 +354,8 @@ pub mod coresdk {
                             priority: r.priority,
                             is_local: false,
                             run_id: r.activity_run_id,
+                            propagated_nexus_serialization_context: r
+                                .propagated_nexus_serialization_context,
                         },
                     )),
                 }
@@ -1347,6 +1349,8 @@ pub mod coresdk {
                     root_workflow: attrs.root_workflow_execution,
                     priority: attrs.priority,
                     original_execution_run_id: attrs.original_execution_run_id,
+                    propagated_nexus_serialization_context: attrs
+                        .propagated_nexus_serialization_context,
                 }
             }
         }
@@ -3077,6 +3081,50 @@ mod sdk_helpers {
             assert!(start.run_id.is_empty());
             // workflow_execution is preserved and distinct from run_id
             assert_eq!(start.workflow_execution.unwrap().run_id, "wf-run-456");
+        }
+
+        #[test]
+        fn start_from_poll_resp_propagates_nexus_serialization_context() {
+            use crate::protos::temporal::api::nexus::v1::PropagatedSerializationContext;
+            let ctx = PropagatedSerializationContext {
+                endpoint: "my-endpoint".to_string(),
+                service: "my-service".to_string(),
+                operation: "my-operation".to_string(),
+            };
+            let resp = PollActivityTaskQueueResponse {
+                activity_run_id: "test-run-id-123".to_string(),
+                propagated_nexus_serialization_context: Some(ctx.clone()),
+                ..Default::default()
+            };
+            let task = ActivityTask::start_from_poll_resp(resp);
+            let start = match task.variant {
+                Some(activity_task::activity_task::Variant::Start(s)) => s,
+                _ => panic!("expected Start variant"),
+            };
+            assert_eq!(start.propagated_nexus_serialization_context, Some(ctx));
+        }
+
+        #[test]
+        fn start_workflow_from_attribs_propagates_nexus_serialization_context() {
+            use crate::protos::{
+                coresdk::workflow_activation::start_workflow_from_attribs,
+                temporal::api::{
+                    history::v1::WorkflowExecutionStartedEventAttributes,
+                    nexus::v1::PropagatedSerializationContext,
+                },
+            };
+            let ctx = PropagatedSerializationContext {
+                endpoint: "my-endpoint".to_string(),
+                service: "my-service".to_string(),
+                operation: "my-operation".to_string(),
+            };
+            let attrs = WorkflowExecutionStartedEventAttributes {
+                propagated_nexus_serialization_context: Some(ctx.clone()),
+                ..Default::default()
+            };
+            let init =
+                start_workflow_from_attribs(attrs, "wf-id".to_string(), 1, Default::default());
+            assert_eq!(init.propagated_nexus_serialization_context, Some(ctx));
         }
 
         #[test]
