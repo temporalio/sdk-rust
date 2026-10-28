@@ -45,6 +45,7 @@ relevant information.
   nondeterminism while retaining compatibility with histories recorded before these checks.
 
 ### Fixed
+* Fixed dropping workflow tasks during shutdown in certain scenarios.
 * Preserve queued queries across workflow eviction so requests for the same run are answered instead of silently dropped.
 * Dev and test server startup now stops waiting at the configured deadline even if a readiness
   request stalls. Timeout messages include the last connection failure when available.
@@ -80,6 +81,9 @@ relevant information.
   each series with a suffix, `_native` by default, so it never shares a name with the fixed-bucket
   series it replaces. It cannot be combined with histogram bucket overrides. Explicit buckets
   remain the default.
+
+### Changed
+* Worker now retries `ShutdownWorker` RPC on retryable errors until the task pollers finish.
 
 ## [0.10.0] - 2026-10-06
 

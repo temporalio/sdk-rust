@@ -687,6 +687,7 @@ async fn update_validation_gates_local_activity_dispatch(
     #[case] accept_update: bool,
     #[case] with_signal: bool,
 ) {
+    let all_rejected_only = !accept_update && !with_signal;
     let mut history = TestHistoryBuilder::default();
     history.add(default_wes_attribs());
     // A timer command keeps the heartbeat from being collapsed into the live task during replay.
@@ -716,15 +717,17 @@ async fn update_validation_gates_local_activity_dispatch(
         update_task.add_update_request(format!("update-{i}"), update_task.started_event_id - 1);
     }
     let (continue_tx, continue_rx) = oneshot::channel();
-    let tasks = stream::iter([update_task])
-        .chain(stream::once(async move {
-            continue_rx.await.unwrap();
-            continuation
-        }))
-        .chain(stream::pending());
+    let mut tasks = stream::iter([update_task]).boxed();
+    if all_rejected_only {
+        tasks = tasks
+            .chain(stream::once(async move {
+                continue_rx.await.unwrap();
+                continuation
+            }))
+            .boxed();
+    }
     let (reported_tx, reported_rx) = oneshot::channel();
     let mut reported_tx = Some(reported_tx);
-    let all_rejected_only = !accept_update && !with_signal;
     let mut client = mock_worker_client();
     client
         .expect_complete_workflow_task()

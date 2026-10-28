@@ -12,7 +12,11 @@ use crate::{
         ActiveCounter, ClosableMeteredPermitDealer, MeteredPermitDealer,
         TrackedOwnedMeteredSemPermit, UsedMeteredSemPermit,
     },
-    pollers::{BoxedActPoller, PermittedTqResp, TrackedPermittedTqResp, new_activity_task_poller},
+    pollers,
+    pollers::{
+        BoxedActPoller, PermittedTqResp, PollerError, TrackedPermittedTqResp,
+        new_activity_task_poller,
+    },
     telemetry::metrics::{
         FailureReason, MetricsContext, activity_type, eager, failure_reason,
         should_record_failure_metric, workflow_type,
@@ -36,6 +40,7 @@ use std::{
         Arc,
         atomic::{AtomicBool, Ordering},
     },
+    task::Poll,
     time::{Duration, Instant, SystemTime},
 };
 use temporalio_client::{PayloadErrorLimits, worker::CancelActivityCallback};
@@ -271,7 +276,7 @@ impl WorkerActivityTasks {
     fn merge_start_task_sources(
         non_poll_tasks_rx: UnboundedReceiver<TrackedPermittedTqResp<PollActivityTaskQueueResponse>>,
         poller_stream: impl Stream<
-            Item = Result<PermittedTqResp<PollActivityTaskQueueResponse>, tonic::Status>,
+            Item = pollers::PollerResult<PermittedTqResp<PollActivityTaskQueueResponse>>,
         >,
         eager_activities_semaphore: Arc<ClosableMeteredPermitDealer<ActivitySlotKind>>,
         on_complete_token: CancellationToken,
@@ -292,7 +297,8 @@ impl WorkerActivityTasks {
                                 (non_poll_tasks_rx, eager_activities_semaphore)));
                         }
                         _ = eager_activities_semaphore.close_complete() => {
-                            // Once shutting down, we stop accepting eager activities
+                            // All permits have been released, so there will be no more eager tasks.
+                            // Closing the channel so that it can be drained.
                             non_poll_tasks_rx.close();
                             continue;
                         }
@@ -305,12 +311,18 @@ impl WorkerActivityTasks {
 
         // Prefer eager activities over polling the server
         stream::select_with_strategy(non_poll_stream, poller_stream, |_: &mut ()| PollNext::Left)
-            .map(|res| Some(res.map_err(Into::into)))
-            .chain(futures_util::stream::once(async move {
+            .filter_map(|res| {
+                future::ready(match res {
+                    Ok(t) => Some(Ok(t)),
+                    // We don't need to handle poller stopping in any special way, so we filter it out.
+                    Err(PollerError::PollerStopped) => None,
+                    Err(PollerError::Tonic(e)) => Some(Err(e.into())),
+                })
+            })
+            .chain(futures_util::stream::poll_fn(move |_| {
                 on_complete_token.cancel();
-                None
+                Poll::Ready(None)
             }))
-            .filter_map(future::ready)
     }
 
     pub(crate) fn initiate_shutdown(&self) {
@@ -1043,7 +1055,7 @@ mod tests {
     fn build_local_timeout_test_atm(
         mock_client: Arc<MockWorkerClient>,
         local_timeout_buffer: Duration,
-    ) -> WorkerActivityTasks {
+    ) -> (WorkerActivityTasks, CancellationToken) {
         let sem = fixed_size_permit_dealer(1);
         let shutdown_token = CancellationToken::new();
         let ap = LongPollBuffer::new_activity_task(
@@ -1051,7 +1063,7 @@ mod tests {
             "tq".to_string(),
             PollerBehavior::SimpleMaximum(1),
             sem.clone(),
-            shutdown_token,
+            shutdown_token.clone(),
             None::<fn(usize)>,
             ActivityTaskOptions {
                 max_worker_acts_per_second: None,
@@ -1060,15 +1072,18 @@ mod tests {
             Arc::new(AtomicCell::new(None)),
             Arc::new(NamespaceCapabilities::default()),
         );
-        WorkerActivityTasks::new(
-            sem,
-            Box::new(ap),
-            mock_client,
-            MetricsContext::no_op(),
-            Duration::from_secs(1),
-            Duration::from_secs(1),
-            None,
-            local_timeout_buffer,
+        (
+            WorkerActivityTasks::new(
+                sem,
+                Box::new(ap),
+                mock_client,
+                MetricsContext::no_op(),
+                Duration::from_secs(1),
+                Duration::from_secs(1),
+                None,
+                local_timeout_buffer,
+            ),
+            shutdown_token,
         )
     }
 
@@ -1223,8 +1238,12 @@ mod tests {
                     ..Default::default()
                 })
             });
+        mock_client
+            .expect_poll_activity_task()
+            .returning(move |_, _| Ok(Default::default()));
         let mock_client = Arc::new(mock_client);
-        let atm = build_local_timeout_test_atm(mock_client.clone(), Duration::from_millis(100));
+        let (atm, shutdown_token) =
+            build_local_timeout_test_atm(mock_client.clone(), Duration::from_millis(100));
 
         for _ in 1..=3 {
             let start = Instant::now();
@@ -1244,7 +1263,7 @@ mod tests {
             )
             .await;
         }
-
+        shutdown_token.cancel();
         atm.initiate_shutdown();
         assert_matches!(atm.poll().await.unwrap_err(), PollError::ShutDown);
         atm.shutdown().await;
@@ -1274,7 +1293,8 @@ mod tests {
             .times(2)
             .returning(|_, _| Ok(Default::default()));
         let mock_client = Arc::new(mock_client);
-        let atm = build_local_timeout_test_atm(mock_client.clone(), Duration::from_millis(0));
+        let (atm, shutdown_token) =
+            build_local_timeout_test_atm(mock_client.clone(), Duration::from_millis(0));
 
         let t = atm.poll().await.unwrap();
 
@@ -1309,6 +1329,7 @@ mod tests {
         )
         .await;
 
+        shutdown_token.cancel();
         atm.initiate_shutdown();
         assert_matches!(atm.poll().await.unwrap_err(), PollError::ShutDown);
         atm.shutdown().await;
@@ -1337,7 +1358,8 @@ mod tests {
             .expect_record_activity_heartbeat()
             .returning(|_, _| Ok(Default::default()));
         let mock_client = Arc::new(mock_client);
-        let atm = build_local_timeout_test_atm(mock_client.clone(), Duration::from_millis(0));
+        let (atm, shutdown_token) =
+            build_local_timeout_test_atm(mock_client.clone(), Duration::from_millis(0));
 
         let t = atm.poll().await.unwrap();
         let tt = t.task_token.clone();
@@ -1377,6 +1399,7 @@ mod tests {
         )
         .await;
 
+        shutdown_token.cancel();
         atm.initiate_shutdown();
         assert_matches!(atm.poll().await.unwrap_err(), PollError::ShutDown);
         atm.shutdown().await;

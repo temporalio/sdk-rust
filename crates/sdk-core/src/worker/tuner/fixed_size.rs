@@ -24,7 +24,7 @@ impl<SK> FixedSizeSlotSupplier<SK> {
 #[async_trait::async_trait]
 impl<SK> SlotSupplier for FixedSizeSlotSupplier<SK>
 where
-    SK: SlotKind + Send + Sync,
+    SK: SlotKind,
 {
     type SlotKind = SK;
 

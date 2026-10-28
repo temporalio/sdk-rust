@@ -1391,7 +1391,7 @@ impl<SK> TrackingSlotSupplier<SK> {
 #[async_trait::async_trait]
 impl<SK> SlotSupplier for TrackingSlotSupplier<SK>
 where
-    SK: temporalio_sdk_core::SlotKind + Send + Sync,
+    SK: temporalio_sdk_core::SlotKind,
     SK::Info: SlotInfoTrait,
 {
     type SlotKind = SK;
@@ -1624,14 +1624,14 @@ async fn test_custom_slot_supplier_simple() {
 
 #[temporalio_macros::cloud_test_exclusion(crate::CloudTestExclusionReason::DoesNotUseServer)]
 #[tokio::test]
-async fn shutdown_worker_not_retried() {
+async fn shutdown_worker_unimplemented_error_is_not_retried() {
     let shutdown_call_count = Arc::new(AtomicU8::new(0));
     let scc = shutdown_call_count.clone();
     let fs = fake_server(move |req| {
         if req.uri().to_string().contains("ShutdownWorker") {
             scc.fetch_add(1, Ordering::Relaxed);
         }
-        let s = tonic::Status::new(tonic::Code::Unknown, "bla").into_http();
+        let s = tonic::Status::new(tonic::Code::Unimplemented, "bla").into_http();
         async { s }.boxed()
     })
     .await;

@@ -3,36 +3,31 @@
 //! This enables latency optimizations such as Eager Workflow Start.
 
 use crate::{
-    abstractions::{MeteredPermitDealer, OwnedMeteredSemPermit},
+    abstractions::{ClosableMeteredPermitDealer, TrackedOwnedMeteredSemPermit},
     protosext::ValidPollWFTQResponse,
     worker::{WorkflowSlotKind, workflow::wft_poller::validate_wft},
 };
+use std::sync::Arc;
 use temporalio_client::worker::Slot as SlotTrait;
 use temporalio_common::{
     protos::temporal::api::workflowservice::v1::PollWorkflowTaskQueueResponse,
     worker::WorkerDeploymentOptions,
 };
 use tokio::sync::mpsc::UnboundedSender;
-use tonic::Status;
 
-type WFTStreamSender = UnboundedSender<
-    Result<
-        (
-            ValidPollWFTQResponse,
-            OwnedMeteredSemPermit<WorkflowSlotKind>,
-        ),
-        Status,
-    >,
->;
+type WFTStreamSender = UnboundedSender<(
+    ValidPollWFTQResponse,
+    TrackedOwnedMeteredSemPermit<WorkflowSlotKind>,
+)>;
 
 struct Slot {
-    permit: OwnedMeteredSemPermit<WorkflowSlotKind>,
+    permit: TrackedOwnedMeteredSemPermit<WorkflowSlotKind>,
     external_wft_tx: WFTStreamSender,
 }
 
 impl Slot {
     fn new(
-        permit: OwnedMeteredSemPermit<WorkflowSlotKind>,
+        permit: TrackedOwnedMeteredSemPermit<WorkflowSlotKind>,
         external_wft_tx: WFTStreamSender,
     ) -> Self {
         Self {
@@ -48,7 +43,7 @@ impl SlotTrait for Slot {
         task: PollWorkflowTaskQueueResponse,
     ) -> Result<(), anyhow::Error> {
         let wft = validate_wft(task)?;
-        self.external_wft_tx.send(Ok((wft, self.permit)))?;
+        self.external_wft_tx.send((wft, self.permit))?;
         Ok(())
     }
 }
@@ -58,7 +53,7 @@ impl SlotTrait for Slot {
 pub(super) struct SlotProvider {
     namespace: String,
     task_queue: String,
-    wft_semaphore: MeteredPermitDealer<WorkflowSlotKind>,
+    wft_semaphore: Arc<ClosableMeteredPermitDealer<WorkflowSlotKind>>,
     external_wft_tx: WFTStreamSender,
     deployment_options: Option<WorkerDeploymentOptions>,
 }
@@ -67,7 +62,7 @@ impl SlotProvider {
     pub(super) fn new(
         namespace: String,
         task_queue: String,
-        wft_semaphore: MeteredPermitDealer<WorkflowSlotKind>,
+        wft_semaphore: Arc<ClosableMeteredPermitDealer<WorkflowSlotKind>>,
         external_wft_tx: WFTStreamSender,
         deployment_options: Option<WorkerDeploymentOptions>,
     ) -> Self {
@@ -99,8 +94,9 @@ impl SlotProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures_util::FutureExt;
 
-    use crate::abstractions::tests::fixed_size_permit_dealer;
+    use crate::{SlotKind, abstractions::tests::fixed_size_permit_dealer};
     use temporalio_common::protos::temporal::api::{
         common::v1::{WorkflowExecution, WorkflowType},
         history::v1::History,
@@ -120,9 +116,13 @@ mod tests {
         }
     }
 
+    fn new_dealer<SK: SlotKind>() -> Arc<ClosableMeteredPermitDealer<SK>> {
+        ClosableMeteredPermitDealer::new_arc(Arc::new(fixed_size_permit_dealer(2)))
+    }
+
     #[tokio::test]
     async fn slot_propagates_through_channel() {
-        let wft_semaphore = fixed_size_permit_dealer(2);
+        let wft_semaphore = new_dealer();
         let (external_wft_tx, mut external_wft_rx) = unbounded_channel();
 
         let provider = SlotProvider::new(
@@ -146,7 +146,7 @@ mod tests {
         let (external_wft_tx, mut external_wft_rx) = unbounded_channel();
         {
             let external_wft_tx = external_wft_tx;
-            let wft_semaphore = fixed_size_permit_dealer(2);
+            let wft_semaphore = new_dealer();
             let provider = SlotProvider::new(
                 "my_namespace".to_string(),
                 "my_queue".to_string(),
@@ -161,7 +161,7 @@ mod tests {
 
     #[tokio::test]
     async fn unused_slots_reclaimed() {
-        let wft_semaphore = fixed_size_permit_dealer(2);
+        let wft_semaphore = new_dealer();
         {
             let wft_semaphore = wft_semaphore.clone();
             let (external_wft_tx, _) = unbounded_channel();
@@ -178,5 +178,28 @@ mod tests {
             // drop slot without using it
         }
         assert_eq!(wft_semaphore.available_permits(), Some(2));
+    }
+
+    #[tokio::test]
+    async fn dealer_closes_after_pulling_task() {
+        let (external_wft_tx, mut external_wft_rx) = unbounded_channel();
+        let wft_semaphore = new_dealer();
+        let provider = SlotProvider::new(
+            "my_namespace".to_string(),
+            "my_queue".to_string(),
+            wft_semaphore.clone(),
+            external_wft_tx,
+            None,
+        );
+        let slot = provider.try_reserve_wft_slot().unwrap();
+
+        wft_semaphore.close();
+        assert!(provider.try_reserve_wft_slot().is_none());
+        assert!(wft_semaphore.close_complete().now_or_never().is_none());
+        slot.schedule_wft(new_validatable_response()).unwrap();
+        assert!(wft_semaphore.close_complete().now_or_never().is_none());
+        external_wft_rx.try_recv().unwrap();
+        assert!(wft_semaphore.close_complete().now_or_never().is_some());
+        assert!(external_wft_rx.try_recv().is_err());
     }
 }

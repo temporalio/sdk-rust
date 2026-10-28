@@ -80,7 +80,7 @@ impl std::fmt::Display for SlotSupplierKind {
 
 impl<SK> MeteredPermitDealer<SK>
 where
-    SK: SlotKind + 'static,
+    SK: SlotKind,
 {
     pub(crate) fn new(
         supplier: Arc<dyn SlotSupplier<SlotKind = SK> + Send + Sync>,
@@ -285,6 +285,8 @@ pub(crate) struct ClosableMeteredPermitDealer<SK: SlotKind> {
     close_complete_token: CancellationToken,
 }
 
+// All atomic accesses must use SeqCst ordering to guarantee consistency between outstanding_permits
+// and close_requested.
 impl<SK> ClosableMeteredPermitDealer<SK>
 where
     SK: SlotKind,
@@ -297,12 +299,7 @@ where
             close_complete_token: CancellationToken::new(),
         })
     }
-}
 
-impl<SK> ClosableMeteredPermitDealer<SK>
-where
-    SK: SlotKind + 'static,
-{
     #[cfg(test)]
     pub(crate) fn unused_permits(&self) -> Option<usize> {
         self.inner.unused_permits()
@@ -310,8 +307,8 @@ where
 
     /// Request to close the semaphore and prevent new permits from being acquired.
     pub(crate) fn close(&self) {
-        self.close_requested.store(true, Ordering::Release);
-        if self.outstanding_permits.load(Ordering::Acquire) == 0 {
+        self.close_requested.store(true, Ordering::SeqCst);
+        if self.outstanding_permits.load(Ordering::SeqCst) == 0 {
             self.close_complete_token.cancel();
         }
     }
@@ -331,7 +328,7 @@ where
         self.outstanding_permits.fetch_add(1, Ordering::Release);
         let res = self.inner.try_acquire_owned();
         if res.is_err() {
-            self.outstanding_permits.fetch_sub(1, Ordering::Release);
+            self.release_outstanding_permit();
         }
         res.map(|permit| TrackedOwnedMeteredSemPermit {
             inner: Some(permit),
@@ -339,16 +336,27 @@ where
         })
     }
 
+    #[allow(dead_code)]
+    pub(crate) fn available_permits(&self) -> Option<usize> {
+        self.inner.available_permits()
+    }
+
     fn on_permit_dropped(self: &Arc<Self>) -> Box<dyn Fn() + Send + Sync> {
         let sem = self.clone();
-        Box::new(move || {
-            sem.outstanding_permits.fetch_sub(1, Ordering::Release);
-            if sem.close_requested.load(Ordering::Acquire)
-                && sem.outstanding_permits.load(Ordering::Acquire) == 0
-            {
-                sem.close_complete_token.cancel();
+        Box::new(move || sem.release_outstanding_permit())
+    }
+
+    fn release_outstanding_permit(&self) {
+        // We must release permit before checking close_requested to guarantee that if this is the
+        // last permit but we observe close_requested as false, then close() will cancel the token.
+        self.outstanding_permits.fetch_sub(1, Ordering::SeqCst);
+        if self.close_requested.load(Ordering::SeqCst) {
+            // Another thread might've observed close_requested as false and acquired a new permit
+            // after we released, so we must check outstanding_permits again.
+            if self.outstanding_permits.load(Ordering::SeqCst) == 0 {
+                self.close_complete_token.cancel();
             }
-        })
+        }
     }
 }
 
@@ -469,9 +477,7 @@ pub(crate) mod tests {
     };
     use futures_util::FutureExt;
 
-    pub(crate) fn fixed_size_permit_dealer<SK: SlotKind + Send + Sync + 'static>(
-        size: usize,
-    ) -> MeteredPermitDealer<SK> {
+    pub(crate) fn fixed_size_permit_dealer<SK: SlotKind>(size: usize) -> MeteredPermitDealer<SK> {
         MeteredPermitDealer::new(
             Arc::new(FixedSizeSlotSupplier::new(size)),
             MetricsContext::no_op(),

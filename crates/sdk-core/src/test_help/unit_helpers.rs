@@ -333,7 +333,7 @@ where
     T: Send + Sync + 'static,
 {
     let mut mock_poller = MockPoller::new();
+    mock_poller.expect_shutdown().return_const(());
     mock_poller.expect_shutdown_box().return_const(());
-    mock_poller.expect_notify_shutdown().return_const(());
     mock_poller
 }

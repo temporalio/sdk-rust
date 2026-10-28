@@ -6,7 +6,10 @@ pub use crate::{
     internal_flags::CoreInternalFlags,
     worker::{
         LEGACY_QUERY_ID,
-        client::{LegacyQueryResult, mocks::mock_worker_client},
+        client::{
+            LegacyQueryResult,
+            mocks::{mock_worker_client, setup_mock_worker_client},
+        },
     },
 };
 
@@ -32,6 +35,7 @@ use parking_lot::RwLock;
 use std::{
     collections::{BTreeMap, HashMap, VecDeque},
     fmt::Debug,
+    future,
     ops::{Deref, DerefMut},
     pin::Pin,
     sync::{
@@ -67,6 +71,7 @@ use temporalio_common::{
 };
 use tokio::sync::{Notify, mpsc::unbounded_channel};
 use tokio_stream::wrappers::UnboundedReceiverStream;
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 /// Default namespace for testing
@@ -215,7 +220,25 @@ pub fn mock_worker(mocks: MocksHolder) -> Worker {
         sticky_q,
         mocks.client,
         TaskPollers::Mocked {
-            wft_stream: mocks.inputs.wft_stream,
+            wft_stream: mocks.inputs.wft_stream.map(move |wft_stream| {
+                let fun: Box<dyn FnOnce(_) -> _ + Send> =
+                    Box::new(move |shutdown_token: CancellationToken| {
+                        if mocks.keep_wft_pending_until_worker_shutdown {
+                            wft_stream
+                                .chain(
+                                    stream::once(async move {
+                                        shutdown_token.cancelled().await;
+                                        None
+                                    })
+                                    .filter_map(future::ready),
+                                )
+                                .boxed()
+                        } else {
+                            wft_stream
+                        }
+                    });
+                fun
+            }),
             act_poller,
             nexus_poller,
         },
@@ -238,6 +261,7 @@ pub struct MocksHolder {
     inputs: MockWorkerInputs,
     pub outstanding_task_map: Option<OutstandingWFTMap>,
     worker_telemetry: Option<WorkerTelemetry>,
+    keep_wft_pending_until_worker_shutdown: bool,
 }
 
 impl MocksHolder {
@@ -275,11 +299,10 @@ impl MocksHolder {
         self.worker_telemetry = Some(WorkerTelemetry::from_meter(meter));
     }
 
-    /// Can be used for tests that need to avoid auto-shutdown due to running out of mock responses
-    pub fn make_wft_stream_interminable(&mut self) {
-        if let Some(old_stream) = self.inputs.wft_stream.take() {
-            self.inputs.wft_stream = Some(old_stream.chain(stream::pending()).boxed());
-        }
+    /// Delays WFT poller shutdown until the worker shutdown is initiated. Normally, mock WFT poller
+    /// shuts down when WFT stream ends.
+    pub fn keep_wft_pending_until_worker_shutdown(&mut self) {
+        self.keep_wft_pending_until_worker_shutdown = true;
     }
 }
 
@@ -319,6 +342,7 @@ impl MocksHolder {
             inputs: mock_worker,
             outstanding_task_map: None,
             worker_telemetry: None,
+            keep_wft_pending_until_worker_shutdown: false,
         }
     }
 
@@ -343,6 +367,7 @@ impl MocksHolder {
             inputs: mock_worker,
             outstanding_task_map: None,
             worker_telemetry: None,
+            keep_wft_pending_until_worker_shutdown: false,
         }
     }
 
@@ -367,6 +392,7 @@ impl MocksHolder {
             inputs: mock_worker,
             outstanding_task_map: None,
             worker_telemetry: None,
+            keep_wft_pending_until_worker_shutdown: false,
         }
     }
 
@@ -405,6 +431,7 @@ impl MocksHolder {
             inputs: mock_worker,
             outstanding_task_map: None,
             worker_telemetry: None,
+            keep_wft_pending_until_worker_shutdown: false,
         }
     }
 
@@ -431,6 +458,7 @@ impl MocksHolder {
             inputs: mock_worker,
             outstanding_task_map: None,
             worker_telemetry: None,
+            keep_wft_pending_until_worker_shutdown: false,
         }
     }
 }
@@ -464,10 +492,10 @@ where
     T: Send + Sync + 'static,
 {
     let mut mock_poller = MockManualPoller::new();
+    mock_poller.expect_shutdown().returning(|| async {}.boxed());
     mock_poller
         .expect_shutdown_box()
         .returning(|| async {}.boxed());
-    mock_poller.expect_notify_shutdown().return_const(());
     mock_poller
 }
 
@@ -527,10 +555,11 @@ pub struct MockPollCfg {
     /// early with no work, since we cannot know the exact number of times polling will happen.
     /// Instead, they will just block forever.
     pub using_rust_sdk: bool,
-    pub make_poll_stream_interminable: bool,
     /// If set, will create a mock activity poller with the provided responeses. If unset, no poller
     /// is created.
     pub activity_responses: Option<Vec<QueueResponse<PollActivityTaskQueueResponse>>>,
+    /// See [`MocksHolder::keep_wft_pending_until_worker_shutdown`].
+    pub keep_wft_pending_until_worker_shutdown: bool,
 }
 
 impl MockPollCfg {
@@ -550,8 +579,8 @@ impl MockPollCfg {
             completion_mock_fn: None,
             num_expected_completions: None,
             using_rust_sdk: false,
-            make_poll_stream_interminable: false,
             activity_responses: None,
+            keep_wft_pending_until_worker_shutdown: false,
         }
     }
 
@@ -590,8 +619,8 @@ impl MockPollCfg {
             completion_mock_fn: None,
             num_expected_completions: None,
             using_rust_sdk: false,
-            make_poll_stream_interminable: false,
             activity_responses: None,
+            keep_wft_pending_until_worker_shutdown: false,
         }
     }
 
@@ -851,13 +880,11 @@ pub fn build_mock_pollers(mut cfg: MockPollCfg) -> MocksHolder {
         inputs: mock_worker,
         outstanding_task_map: Some(outstanding_wf_task_tokens),
         worker_telemetry: None,
+        keep_wft_pending_until_worker_shutdown: cfg.keep_wft_pending_until_worker_shutdown,
     };
     if let Some(activity_responses) = cfg.activity_responses {
         let act_poller = mock_poller_from_resps(activity_responses);
         mh.set_act_poller(act_poller);
-    }
-    if cfg.make_poll_stream_interminable {
-        mh.make_wft_stream_interminable();
     }
     mh
 }

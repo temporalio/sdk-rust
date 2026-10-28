@@ -4,7 +4,11 @@
 //! request handling logic.
 
 use crate::RetryOptions;
-use std::time::Duration;
+use dyn_clone::DynClone;
+use std::{
+    fmt::{Debug, Formatter},
+    time::Duration,
+};
 
 /// A request extension that, when set, should make the retry behavior consider this call to be a
 /// worker task long poll.
@@ -23,6 +27,28 @@ pub struct NoRetryOnMatching {
 /// A request extension that forces overriding the current retry policy of the [crate::Connection].
 #[derive(Clone, Debug)]
 pub struct RetryConfigForCall(pub RetryOptions);
+
+/// A request extension that forces overriding the current retry policy of the [crate::Connection]
+/// used in throttling (resource exhausted) scenarios.
+#[derive(Clone, Debug)]
+pub struct ThrottleRetryConfigForCall(pub RetryOptions);
+
+/// Closure type that can be used in [`RetryCallback`].
+pub trait RetryCallbackTrait: FnMut(&tonic::Status) + DynClone + Send + Sync + 'static {}
+
+impl<T> RetryCallbackTrait for T where T: FnMut(&tonic::Status) + Clone + Send + Sync + 'static {}
+
+dyn_clone::clone_trait_object!(RetryCallbackTrait);
+
+impl Debug for Box<dyn RetryCallbackTrait> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.write_str("<callback>")
+    }
+}
+
+/// A request extension that calls a callback after a request failed if it's going to be retried.
+#[derive(Clone, Debug)]
+pub struct RetryCallback(pub Box<dyn RetryCallbackTrait>);
 
 /// Per-call payload/memo size error limits, attached to a request's extensions by a caller that
 /// wants error-level enforcement on this call.

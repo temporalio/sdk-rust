@@ -12,7 +12,7 @@ use crate::{
         PollerBehavior, WorkerVersioningStrategy,
         client::{
             MockWorkerClient, WorkerClient, WorkerClientBag,
-            mocks::{DEFAULT_TEST_CAPABILITIES, mock_manual_worker_client, mock_worker_client},
+            mocks::{mock_manual_worker_client, mock_worker_client, setup_mock_worker_client},
         },
     },
 };
@@ -33,7 +33,6 @@ use std::{
 use temporalio_client::{
     Connection, ConnectionOptions, PayloadErrorLimits, SharedReplaceableClient,
     callback_based::{CallbackBasedGrpcService, GrpcSuccessResponse},
-    worker::ClientWorkerSet,
 };
 use temporalio_common::{
     payload_limits::{LimitClass, LimitSeverity, PayloadLimitViolation},
@@ -551,7 +550,7 @@ async fn eviction_completion_during_shutdown_does_not_panic() {
         0,
     );
     // Prevent PollerDead from arriving so we control shutdown timing exactly.
-    mh.make_wft_stream_interminable();
+    mh.keep_wft_pending_until_worker_shutdown();
     let core = mock_worker(mh);
     let activity_id = 1;
 
@@ -1195,39 +1194,12 @@ async fn oversized_cancel_details_fails_activity() {
 /// oversized details are dropped so the server does not reject the whole request.
 #[tokio::test]
 async fn oversized_final_heartbeat_details_replace_reported_failure() {
-    // Manually created because we need non-default payload error limits, and mockall matches
-    // expectations in creation order, so they cannot be overridden after `mock_worker_client`.
-    // This will no longer be needed if https://github.com/asomers/mockall/issues/283 is implemented.
     let mut mock_client = MockWorkerClient::new();
-    let workers = Arc::new(ClientWorkerSet::new());
     mock_client
         .expect_payload_error_limits()
         .returning(|| Some(PayloadErrorLimits { blob: 10, memo: 10 }));
-    mock_client
-        .expect_capabilities()
-        .returning(|| Some(*DEFAULT_TEST_CAPABILITIES));
-    mock_client
-        .expect_workers()
-        .returning(move || workers.clone());
-    mock_client.expect_is_mock().returning(|| true);
-    mock_client
-        .expect_shutdown_worker()
-        .returning(|_, _, _, _| Ok(ShutdownWorkerResponse {}));
-    mock_client
-        .expect_sdk_name_and_version()
-        .returning(|| ("test-core".to_string(), "0.0.0".to_string()));
-    mock_client
-        .expect_identity()
-        .returning(|| "test-identity".to_string());
-    mock_client
-        .expect_worker_grouping_key()
-        .returning(Uuid::new_v4);
-    mock_client
-        .expect_worker_instance_key()
-        .returning(Uuid::new_v4);
-    mock_client
-        .expect_set_heartbeat_client_fields()
-        .returning(|_| {});
+    setup_mock_worker_client(&mut mock_client);
+
     mock_client
         .expect_record_activity_heartbeat()
         .returning(|_, _| Ok(RecordActivityTaskHeartbeatResponse::default()));

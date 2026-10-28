@@ -18,7 +18,10 @@ use std::{
 use temporalio_client::{
     Connection, NamespacedClient, PayloadErrorLimits, RetryOptions, SharedReplaceableClient,
     grpc::{PayloadLimitsClient, WorkflowService},
-    request_extensions::{IsWorkerTaskLongPoll, NoRetryOnMatching, RetryConfigForCall},
+    request_extensions::{
+        IsWorkerTaskLongPoll, NoRetryOnMatching, RetryCallback, RetryCallbackTrait,
+        RetryConfigForCall, ThrottleRetryConfigForCall,
+    },
     worker::ClientWorkerSet,
 };
 use temporalio_common::protos::{
@@ -393,6 +396,7 @@ pub trait WorkerClient: Sync + Send {
         task_queue: String,
         task_queue_types: Vec<TaskQueueType>,
         final_heartbeat: Option<WorkerHeartbeat>,
+        retry_callback: Option<Box<dyn RetryCallbackTrait>>,
     ) -> Result<ShutdownWorkerResponse>;
     /// Record a worker heartbeat
     async fn record_worker_heartbeat(
@@ -1014,6 +1018,7 @@ impl WorkerClient for WorkerClientBag {
         task_queue: String,
         task_queue_types: Vec<TaskQueueType>,
         final_heartbeat: Option<WorkerHeartbeat>,
+        retry_callback: Option<Box<dyn RetryCallbackTrait>>,
     ) -> Result<ShutdownWorkerResponse> {
         let mut final_heartbeat = final_heartbeat;
         if let Some(w) = final_heartbeat.as_mut() {
@@ -1030,9 +1035,25 @@ impl WorkerClient for WorkerClientBag {
             task_queue_types: task_queue_types.into_iter().map(|t| t as i32).collect(),
         }
         .into_request();
+
+        let max_duration = Duration::from_secs(70); // matches temporalio_client::LONG_POLL_TIMEOUT
+        let retry_options = RetryOptions::builder()
+            .initial_interval(Duration::from_secs(1))
+            .multiplier(2.0)
+            .max_interval(max_duration)
+            .max_elapsed_time(Some(max_duration))
+            .max_retries(0)
+            .build();
+
         request
             .extensions_mut()
-            .insert(RetryConfigForCall(RetryOptions::no_retries()));
+            .insert(RetryConfigForCall(retry_options.clone()));
+        request
+            .extensions_mut()
+            .insert(ThrottleRetryConfigForCall(retry_options));
+        if let Some(cb) = retry_callback {
+            request.extensions_mut().insert(RetryCallback(cb));
+        }
 
         Ok(
             WorkflowService::shutdown_worker(&mut self.client.clone(), request)

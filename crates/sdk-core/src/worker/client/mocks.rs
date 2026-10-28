@@ -1,10 +1,10 @@
 use super::*;
 use futures_util::{Future, FutureExt};
-use std::sync::Arc;
+use std::{future, sync::Arc};
 use temporalio_client::worker::ClientWorkerSet;
 use temporalio_common::protos::temporal::api::enums::v1::ActivityTaskFailedCause;
 
-pub(crate) static DEFAULT_TEST_CAPABILITIES: &Capabilities = &Capabilities {
+pub(crate) static DEFAULT_TEST_CAPABILITIES: Capabilities = Capabilities {
     signal_and_query_header: true,
     internal_error_differentiation: true,
     activity_failure_include_heartbeat: true,
@@ -20,50 +20,68 @@ pub(crate) static DEFAULT_TEST_CAPABILITIES: &Capabilities = &Capabilities {
     server_scaled_provider_cloud_run: false,
 };
 
-#[cfg(any(feature = "test-utilities", test))]
-/// Create a mock client primed with basic necessary expectations
-pub fn mock_worker_client() -> MockWorkerClient {
-    let mut r = MockWorkerClient::new();
-    r.expect_payload_error_limits().returning(|| None);
-    let workers = Arc::new(ClientWorkerSet::new());
-    r.expect_capabilities()
-        .returning(|| Some(*DEFAULT_TEST_CAPABILITIES));
-    r.expect_workers().returning(move || workers.clone());
-    r.expect_is_mock().returning(|| true);
-    r.expect_shutdown_worker()
-        .returning(|_, _, _, _| Ok(ShutdownWorkerResponse {}));
-    r.expect_sdk_name_and_version()
-        .returning(|| ("test-core".to_string(), "0.0.0".to_string()));
-    r.expect_identity()
-        .returning(|| "test-identity".to_string());
-    r.expect_worker_grouping_key().returning(Uuid::new_v4);
-    r.expect_worker_instance_key().returning(Uuid::new_v4);
-    r.expect_set_heartbeat_client_fields().returning(|hb| {
-        hb.sdk_name = "test-core".to_string();
-        hb.sdk_version = "0.0.0".to_string();
-        hb.worker_identity = "test-identity".to_string();
-        hb.heartbeat_time = Some(SystemTime::now().into());
-    });
-    r
+macro_rules! common_expectations {
+    ($mock:ident) => {
+        let workers = Arc::new(ClientWorkerSet::new());
+        $mock
+            .expect_capabilities()
+            .return_const(Some(DEFAULT_TEST_CAPABILITIES));
+        $mock.expect_workers().return_const(workers);
+        $mock.expect_is_mock().return_const(true);
+        $mock
+            .expect_sdk_name_and_version()
+            .return_const(("test-core".to_string(), "0.0.0".to_string()));
+        $mock
+            .expect_identity()
+            .return_const("test-identity".to_string());
+        $mock.expect_worker_grouping_key().returning(Uuid::new_v4);
+        $mock.expect_worker_instance_key().returning(Uuid::new_v4);
+        $mock.expect_set_heartbeat_client_fields().returning(|hb| {
+            hb.sdk_name = "test-core".to_string();
+            hb.sdk_version = "0.0.0".to_string();
+            hb.worker_identity = "test-identity".to_string();
+            hb.heartbeat_time = Some(SystemTime::now().into());
+        });
+        $mock.expect_payload_error_limits().return_const(None);
+    };
 }
 
-/// Create a mock manual client primed with basic necessary expectations
+#[cfg(any(feature = "test-utilities", test))]
+/// Create a mock client primed with basic necessary expectations.
+/// Because these expectations always take precedence, the behavior cannot be customized
+/// - use [`setup_mock_worker_client`] if customization is needed.
+pub fn mock_worker_client() -> MockWorkerClient {
+    let mut mock = MockWorkerClient::new();
+    setup_mock_worker_client(&mut mock);
+    mock
+}
+
+#[cfg(any(feature = "test-utilities", test))]
+/// Sets up basic expectations on the provided mock client.
+/// Any expectations set before calling this function will take precedence, which makes it possible
+/// to customize the mock's behavior more than when using [`mock_worker_client`].
+pub fn setup_mock_worker_client(mock: &mut MockWorkerClient) {
+    common_expectations!(mock);
+    mock.expect_shutdown_worker()
+        .return_const(Ok(ShutdownWorkerResponse {}));
+}
+
+/// Create a mock manual client primed with basic necessary expectations.
+/// Because these expectations always take precedence, the behavior cannot be customized
+/// - use [`setup_mock_manual_worker_client`] if customization is needed.
 pub(crate) fn mock_manual_worker_client() -> MockManualWorkerClient {
-    let mut r = MockManualWorkerClient::new();
-    let workers = Arc::new(ClientWorkerSet::new());
-    r.expect_capabilities()
-        .returning(|| Some(*DEFAULT_TEST_CAPABILITIES));
-    r.expect_workers().returning(move || workers.clone());
-    r.expect_is_mock().returning(|| true);
-    r.expect_shutdown_worker()
-        .returning(|_, _, _, _| async { Ok(ShutdownWorkerResponse {}) }.boxed());
-    r.expect_sdk_name_and_version()
-        .returning(|| ("test-core".to_string(), "0.0.0".to_string()));
-    r.expect_identity()
-        .returning(|| "test-identity".to_string());
-    r.expect_worker_grouping_key().returning(Uuid::new_v4);
-    r.expect_worker_instance_key().returning(Uuid::new_v4);
-    r
+    let mut mock = MockManualWorkerClient::new();
+    setup_mock_manual_worker_client(&mut mock);
+    mock
+}
+
+/// Sets up basic expectations on the provided mock manual client.
+/// Any expectations set before calling this function will take precedence, which makes it possible
+/// to customize the mock's behavior more than when using [`mock_manual_worker_client`].
+pub(crate) fn setup_mock_manual_worker_client(mock: &mut MockManualWorkerClient) {
+    common_expectations!(mock);
+    mock.expect_shutdown_worker()
+        .returning(|_, _, _, _, _| future::ready(Ok(ShutdownWorkerResponse {})).boxed());
 }
 
 // Need a version of the mock that can return futures so we can return potentially pending
@@ -163,7 +181,14 @@ mockall::mock! {
           impl Future<Output = Result<DescribeNamespaceResponse>> + Send + 'b
           where 'a: 'b, Self: 'b;
 
-        fn shutdown_worker<'a, 'b>(&self, sticky_task_queue: String, task_queue: String, task_queue_types: Vec<TaskQueueType>, worker_heartbeat: Option<WorkerHeartbeat>) -> impl Future<Output = Result<ShutdownWorkerResponse>> + Send + 'b
+        fn shutdown_worker<'a, 'b>(
+            &self,
+            sticky_task_queue: String,
+            task_queue: String,
+            task_queue_types: Vec<TaskQueueType>,
+            worker_heartbeat: Option<WorkerHeartbeat>,
+            retry_callback: Option<Box<dyn RetryCallbackTrait>>,
+        ) -> impl Future<Output = Result<ShutdownWorkerResponse>> + Send + 'b
             where 'a: 'b, Self: 'b;
 
         fn record_worker_heartbeat<'a, 'b>(
@@ -181,5 +206,7 @@ mockall::mock! {
         fn worker_grouping_key(&self) -> Uuid;
         fn worker_instance_key(&self) -> Uuid;
         fn set_heartbeat_client_fields(&self, heartbeat: &mut WorkerHeartbeat);
+        fn set_payload_error_limits(&self, _limits: Option<PayloadErrorLimits>);
+        fn payload_error_limits(&self) -> Option<PayloadErrorLimits>;
     }
 }

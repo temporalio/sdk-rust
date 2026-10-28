@@ -870,7 +870,7 @@ async fn workflow_failures_only_reported_once() {
         // Poll again after evicting after second good reply, then two more fails
         3, 3, 3,
     ];
-    let mocks = build_multihist_mock_sg(
+    let mut mocks = build_multihist_mock_sg(
         vec![FakeWfResponses {
             wf_id: wfid.to_string(),
             hist,
@@ -880,6 +880,7 @@ async fn workflow_failures_only_reported_once() {
         // We should only call the server to say we failed twice (once after each success)
         2,
     );
+    mocks.worker_cfg(|wc| wc.ignore_evicts_on_shutdown = false);
     let omap = mocks.outstanding_task_map.clone();
     let core = mock_worker(mocks);
 
@@ -1018,7 +1019,7 @@ async fn lots_of_workflows() {
         }
     });
     let mut mock = build_multihist_mock_sg(hists, false, 0);
-    mock.make_wft_stream_interminable();
+    mock.keep_wft_pending_until_worker_shutdown();
     let worker = &mock_worker(mock);
     let completed_count = Arc::new(Semaphore::new(0));
     let killer = async {
@@ -1195,11 +1196,24 @@ async fn new_server_work_while_eviction_outstanding_doesnt_overwrite_activation(
         .await
         .unwrap();
     // The task buffered during eviction is applied and we start over
-    let start_again = core.poll_workflow_activation().await.unwrap();
+    let activation = core.poll_workflow_activation().await.unwrap();
     assert_matches!(
-        start_again.jobs[0].variant,
+        activation.jobs[0].variant,
         Some(workflow_activation_job::Variant::InitializeWorkflow(_))
     );
+    core.complete_workflow_activation(WorkflowActivationCompletion::from_cmd(
+        activation.run_id,
+        start_timer_cmd(1, Duration::from_secs(1)),
+    ))
+    .await
+    .unwrap();
+    let activation = core.poll_workflow_activation().await.unwrap();
+    assert_matches!(
+        activation.jobs[0].variant,
+        Some(workflow_activation_job::Variant::FireTimer(_))
+    );
+    core.complete_execution(&activation.run_id).await;
+    core.shutdown().await;
 }
 
 #[tokio::test]
@@ -1380,16 +1394,14 @@ async fn poll_response_triggers_wf_error() {
     mh.expect_fail_wft_matcher = Box::new(move |_, cause, _| {
         matches!(cause, WorkflowTaskFailedCause::NonDeterministicError)
     });
-    let mock = build_mock_pollers(mh);
+    let mut mock = build_mock_pollers(mh);
+    mock.worker_cfg(|wc| {
+        wc.ignore_evicts_on_shutdown = false;
+    });
     let core = mock_worker(mock);
     // Poll for first WFT, which is immediately an eviction
-    let act = core.poll_workflow_activation().await.unwrap();
-    assert_matches!(
-        act.jobs.as_slice(),
-        [WorkflowActivationJob {
-            variant: Some(workflow_activation_job::Variant::RemoveFromCache(_)),
-        }]
-    );
+    core.handle_eviction().await;
+    core.shutdown().await;
 }
 
 // Verifies we can handle multiple wft timeouts in a row if lang is being very slow in responding
@@ -1467,7 +1479,6 @@ async fn la_resolution_after_wft_not_found_during_eviction() {
         [ResponseType::Raw(first_wft), ResponseType::Raw(second_wft)],
         mock_worker_client(),
     );
-    mock_cfg.make_poll_stream_interminable = true;
     let heartbeat_failed = Arc::new(Notify::new());
     let completion_heartbeat_failed = heartbeat_failed.clone();
     let mut first_completion = true;
@@ -1481,7 +1492,10 @@ async fn la_resolution_after_wft_not_found_during_eviction() {
         }
     }));
     let mut mock = build_mock_pollers(mock_cfg);
-    mock.worker_cfg(|wc| wc.max_cached_workflows = 1);
+    mock.worker_cfg(|wc| {
+        wc.max_cached_workflows = 1;
+        wc.ignore_evicts_on_shutdown = false;
+    });
     let core = mock_worker(mock);
     let core = Arc::new(core);
 
@@ -1599,7 +1613,6 @@ fn la_cancel_mock_cfg() -> MockPollCfg {
     t.add_wfe_started_with_wft_timeout(Duration::from_secs(60));
     t.add_workflow_task_scheduled_and_started();
     let mut mock_cfg = MockPollCfg::from_resp_batches("fake_wf_id", t, [1], mock_worker_client());
-    mock_cfg.make_poll_stream_interminable = true;
     mock_cfg.num_expected_completions = Some(0.into());
     mock_cfg
 }
@@ -1611,6 +1624,7 @@ fn la_cancel_test_worker(mock_cfg: MockPollCfg, max_outstanding_las: Option<usiz
         if let Some(max_outstanding_las) = max_outstanding_las {
             wc.max_outstanding_local_activities = Some(max_outstanding_las);
         }
+        wc.ignore_evicts_on_shutdown = false;
     });
     mock_worker(mock)
 }
@@ -1629,7 +1643,8 @@ fn la_cancel_test_cmd(
 
 #[tokio::test]
 async fn la_cancel_delivered_before_eviction_activation() {
-    let core = la_cancel_test_worker(la_cancel_mock_cfg(), None);
+    let mock_cfg = la_cancel_mock_cfg();
+    let core = la_cancel_test_worker(mock_cfg, None);
 
     let activation = core.poll_workflow_activation().await.unwrap();
     let run_id = activation.run_id;
@@ -1801,7 +1816,7 @@ async fn eviction_requested_during_activation_cancels_la_before_evicting(
             .await
             .unwrap();
         assert_eq!(core.cached_workflows().await, 0);
-        advance_fut!(wf_poll);
+        assert_matches!(wf_poll.await, Err(PollError::ShutDown));
     }
     assert_eq!(core.outstanding_workflow_tasks().await, 0);
     drain_pollers_and_shutdown(&core).await;
@@ -1937,7 +1952,8 @@ async fn abandoned_la_cancel_delivered_before_workflow_completion_eviction() {
 async fn la_results_during_withheld_eviction_do_not_surface(
     #[case] result: ActivityExecutionResult,
 ) {
-    let core = la_cancel_test_worker(la_cancel_mock_cfg(), None);
+    let mock_cfg = la_cancel_mock_cfg();
+    let core = la_cancel_test_worker(mock_cfg, None);
 
     let activation = core.poll_workflow_activation().await.unwrap();
     let run_id = activation.run_id;
@@ -2040,7 +2056,8 @@ async fn la_results_during_withheld_eviction_do_not_surface(
 
 #[tokio::test]
 async fn la_result_before_its_cancel_is_polled_releases_withheld_eviction() {
-    let core = la_cancel_test_worker(la_cancel_mock_cfg(), None);
+    let mock_cfg = la_cancel_mock_cfg();
+    let core = la_cancel_test_worker(mock_cfg, None);
 
     let activation = core.poll_workflow_activation().await.unwrap();
     let run_id = activation.run_id;
@@ -2092,7 +2109,8 @@ async fn la_result_before_its_cancel_is_polled_releases_withheld_eviction() {
 async fn la_success_after_its_cancel_is_polled_does_not_surface(
     #[case] complete_after_eviction_ack: bool,
 ) {
-    let core = la_cancel_test_worker(la_cancel_mock_cfg(), None);
+    let mock_cfg = la_cancel_mock_cfg();
+    let core = la_cancel_test_worker(mock_cfg, None);
 
     let activation = core.poll_workflow_activation().await.unwrap();
     let run_id = activation.run_id;
@@ -2150,10 +2168,10 @@ async fn la_success_after_its_cancel_is_polled_does_not_surface(
     }
     // The FIFO state query makes the absence of a resolution observable after both messages.
     assert_eq!(core.cached_workflows().await, 0);
-    {
-        let wf_poll = core.poll_workflow_activation();
-        advance_fut!(wf_poll);
-    }
+    assert_matches!(
+        core.poll_workflow_activation().await,
+        Err(PollError::ShutDown)
+    );
     assert_eq!(core.outstanding_workflow_tasks().await, 0);
     drain_pollers_and_shutdown(&core).await;
 }
@@ -2161,7 +2179,8 @@ async fn la_success_after_its_cancel_is_polled_does_not_surface(
 #[tokio::test]
 async fn queued_la_cancelled_by_eviction_does_not_surface() {
     // A single slot keeps the second LA waiting for dispatch behind the first.
-    let core = la_cancel_test_worker(la_cancel_mock_cfg(), Some(1));
+    let mock_cfg = la_cancel_mock_cfg();
+    let core = la_cancel_test_worker(mock_cfg, None);
 
     let activation = core.poll_workflow_activation().await.unwrap();
     let run_id = activation.run_id;
@@ -2213,7 +2232,8 @@ async fn queued_la_cancelled_by_eviction_does_not_surface() {
 
 #[tokio::test]
 async fn backing_off_la_cancelled_by_eviction_does_not_surface() {
-    let core = la_cancel_test_worker(la_cancel_mock_cfg(), None);
+    let mock_cfg = la_cancel_mock_cfg();
+    let core = la_cancel_test_worker(mock_cfg, None);
 
     let activation = core.poll_workflow_activation().await.unwrap();
     let run_id = activation.run_id;
@@ -2570,7 +2590,9 @@ async fn history_byte_size_and_can_suggestion_in_activation() {
     let activation = worker.poll_workflow_activation().await.unwrap();
     assert_eq!(activation.history_size_bytes, 70);
     assert!(activation.continue_as_new_suggested);
-    assert_eq!(activation.suggest_continue_as_new_reasons, vec![1, 2, 3, 4])
+    assert_eq!(activation.suggest_continue_as_new_reasons, vec![1, 2, 3, 4]);
+    worker.complete_execution(&activation.run_id).await;
+    worker.shutdown().await;
 }
 
 /// This test verifies that WFTs which come as replies to completing a WFT are properly delivered
@@ -2695,6 +2717,7 @@ async fn poll_faster_than_complete_wont_overflow_cache() {
     mock.worker_cfg(|wc| {
         wc.max_cached_workflows = 3;
         wc.max_outstanding_workflow_tasks = Some(3);
+        wc.ignore_evicts_on_shutdown = false;
     });
     let core = mock_worker(mock);
     // Poll 4 times, completing once, such that max tasks are never exceeded
@@ -2803,6 +2826,7 @@ async fn poll_faster_than_complete_wont_overflow_cache() {
     // p5 outstanding and final poll outstanding -- hence one permit available
     assert_eq!(core.available_wft_permits(), Some(1));
     assert_eq!(core.cached_workflows().await, 3);
+    // TODO: the worker is leaking, we should complete all activations and call shutdown.
 }
 
 #[tokio::test]
@@ -3089,6 +3113,10 @@ async fn ignorable_events_are_ok(#[values(true, false)] attribs_unset: bool) {
         act.jobs[0].variant,
         Some(workflow_activation_job::Variant::InitializeWorkflow(_))
     );
+    core.complete_workflow_activation(WorkflowActivationCompletion::empty(act.run_id))
+        .await
+        .unwrap();
+    core.shutdown().await;
 }
 
 #[tokio::test]
@@ -3160,6 +3188,10 @@ async fn fetching_to_continue_replay_works() {
             variant: Some(workflow_activation_job::Variant::FireTimer(_)),
         }]
     );
+    core.complete_workflow_activation(WorkflowActivationCompletion::empty(act.run_id))
+        .await
+        .unwrap();
+    core.shutdown().await;
 }
 
 #[tokio::test]
@@ -3198,6 +3230,10 @@ async fn fetching_error_evicts_wf() {
             variant: Some(workflow_activation_job::Variant::RemoveFromCache(r)),
         }] => r.message.contains("Fetching history failed")
     );
+    core.complete_workflow_activation(WorkflowActivationCompletion::empty(evict_act.run_id))
+        .await
+        .unwrap();
+    core.shutdown().await;
 }
 
 /// This test verifies that if we fail to fetch a page during a completion, that we don't get stuck
@@ -3249,8 +3285,10 @@ async fn ensure_fetching_fail_during_complete_sends_task_failure() {
         .times(1);
 
     let mut mock = single_hist_mock_sg(wfid, t, [ResponseType::Raw(first_poll)], mock, true);
-    mock.make_wft_stream_interminable();
-    mock.worker_cfg(|wc| wc.max_cached_workflows = 2);
+    mock.worker_cfg(|wc| {
+        wc.max_cached_workflows = 2;
+        wc.ignore_evicts_on_shutdown = false;
+    });
     let core = mock_worker(mock);
 
     let wf_task = core.poll_workflow_activation().await.unwrap();
@@ -3266,6 +3304,9 @@ async fn ensure_fetching_fail_during_complete_sends_task_failure() {
             variant: Some(workflow_activation_job::Variant::RemoveFromCache(c)),
         }] if c.message.contains("Fetching history")
     );
+    core.complete_workflow_activation(WorkflowActivationCompletion::empty(wf_task.run_id))
+        .await
+        .unwrap();
 
     core.shutdown().await;
 }
@@ -3565,6 +3606,7 @@ async fn jobs_are_in_appropriate_order() {
     ))
     .await
     .unwrap();
+
     let act = core.poll_workflow_activation().await.unwrap();
     assert_matches!(
         act.jobs[0].variant.as_ref().unwrap(),
@@ -3578,6 +3620,21 @@ async fn jobs_are_in_appropriate_order() {
         act.jobs[2].variant.as_ref().unwrap(),
         workflow_activation_job::Variant::FireTimer(_)
     );
+    core.complete_workflow_activation(WorkflowActivationCompletion::from_cmds(
+        act.run_id,
+        vec![
+            SetPatchMarker {
+                patch_id: p2.to_string(),
+                deprecated: false,
+            }
+            .into(),
+            CompleteWorkflowExecution { result: None }.into(),
+        ],
+    ))
+    .await
+    .unwrap();
+
+    core.shutdown().await;
 }
 
 #[tokio::test]
@@ -4242,7 +4299,7 @@ async fn cached_run_fetch_failure_doesnt_spam_task_fails() {
     });
     let mut mock = build_mock_pollers(mh);
     // Otherwise the poller runs dry and starts shutdown before the second eviction completes
-    mock.make_wft_stream_interminable();
+    mock.keep_wft_pending_until_worker_shutdown();
     mock.worker_cfg(|wc| wc.max_cached_workflows = 10);
     let meter = Arc::new(CounterRecordingMeter::default());
     mock.set_temporal_meter(meter.clone().into_temporal_meter());

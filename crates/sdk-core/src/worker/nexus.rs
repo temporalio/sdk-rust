@@ -1,6 +1,6 @@
 use crate::{
     abstractions::UsedMeteredSemPermit,
-    pollers::{BoxedNexusPoller, NexusPollItem, new_nexus_task_poller},
+    pollers::{BoxedNexusPoller, NexusPollItem, PollerError, new_nexus_task_poller},
     telemetry::metrics::{self, FailureReason, MetricsContext},
     worker::{
         CompleteNexusError, NexusSlotKind, PollError,
@@ -489,7 +489,8 @@ where
                                 endpoint,
                             }))
                         },
-                        Err(e) => Some(Err(PollError::TonicError(e)))
+                        Err(PollerError::PollerStopped) => None, // end of stream is handled by SourceComplete
+                        Err(PollerError::Tonic(e)) => Some(Err(PollError::TonicError(e)))
                     },
                     TaskStreamInput::Cancel(c) => Some(Ok(NexusTask {
                         variant: Some(nexus_task::Variant::CancelTask(c)),

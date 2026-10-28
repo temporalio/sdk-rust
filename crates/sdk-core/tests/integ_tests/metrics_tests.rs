@@ -1454,7 +1454,7 @@ struct MetricRecordingSlotSupplier<SK> {
 #[async_trait::async_trait]
 impl<SK> SlotSupplier for MetricRecordingSlotSupplier<SK>
 where
-    SK: SlotKind + Send + Sync,
+    SK: SlotKind,
 {
     type SlotKind = SK;
 

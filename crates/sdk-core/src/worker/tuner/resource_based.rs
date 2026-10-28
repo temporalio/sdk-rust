@@ -277,7 +277,7 @@ pub trait SystemResourceInfo {
 impl<MI, SK> SlotSupplier for ResourceBasedSlotsForType<MI, SK>
 where
     MI: SystemResourceInfo + Send + Sync + 'static,
-    SK: SlotKind + Send + Sync,
+    SK: SlotKind,
 {
     type SlotKind = SK;
 
@@ -343,7 +343,7 @@ where
 impl<MI, SK> ResourceBasedSlotsForType<MI, SK>
 where
     MI: SystemResourceInfo + Send + Sync,
-    SK: SlotKind + Send + Sync,
+    SK: SlotKind,
 {
     fn new(inner: Arc<ResourceController<MI>>, opts: ResourceSlotOptions) -> Self {
         let (tx, rx) = watch::channel(Instant::now());
@@ -454,7 +454,7 @@ impl<MI: SystemResourceInfo + Sync + Send> ResourceController<MI> {
     /// where activities might use a lot of resources, because otherwise the implementation may
     /// hand out many slots quickly before resource usage has a chance to be reflected, possibly
     /// resulting in OOM (for example).
-    pub(crate) fn as_kind<SK: SlotKind + Send + Sync>(
+    pub(crate) fn as_kind<SK: SlotKind>(
         self: &Arc<Self>,
         opts: ResourceSlotOptions,
     ) -> Arc<ResourceBasedSlotsForType<MI, SK>> {

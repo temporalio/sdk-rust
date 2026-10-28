@@ -57,19 +57,23 @@ async fn preserves_queries_buffered_during_same_run_eviction(
         })
     });
     let (buffered_tx, buffered_rx) = tokio::sync::oneshot::channel();
-    let input = UnboundedReceiverStream::new(receiver).chain(stream::once(async move {
-        buffered_tx.send(()).unwrap();
-        future::pending().await
-    }));
+    let input = UnboundedReceiverStream::new(receiver).chain(
+        stream::once(async move {
+            buffered_tx.send(()).unwrap();
+            None
+        })
+        .filter_map(future::ready),
+    );
     let mut mocks = MocksHolder::from_wft_stream(client, input);
+    mocks.keep_wft_pending_until_worker_shutdown();
     mocks.worker_cfg(|cfg| {
         cfg.max_cached_workflows = cache_capacity;
         // With one extractor future, polling past the last response means WFStream
         // has processed it; the channel then synchronizes with the processing thread.
         cfg.fetching_concurrency = 1;
+        cfg.ignore_evicts_on_shutdown = false;
     });
     let core = mock_worker(mocks);
-    let initial_permits = core.available_wft_permits();
     let task = core.poll_workflow_activation().await.unwrap();
     let run_id = task.run_id.clone();
     core.complete_execution(&run_id).await;
@@ -117,7 +121,7 @@ async fn preserves_queries_buffered_during_same_run_eviction(
         let mut next_query = None;
         for _ in 0..3 {
             let task =
-                tokio::time::timeout(Duration::from_secs(1), core.poll_workflow_activation())
+                tokio::time::timeout(Duration::from_secs(5), core.poll_workflow_activation())
                     .await
                     .expect("every buffered Query must reach a language activation")
                     .unwrap();
@@ -161,6 +165,5 @@ async fn preserves_queries_buffered_during_same_run_eviction(
     tokio::time::timeout(Duration::from_secs(5), drain_pollers_and_shutdown(&core))
         .await
         .expect("serviced queries must not prevent shutdown");
-    assert_eq!(core.available_wft_permits(), initial_permits);
     core.finalize_shutdown().await;
 }

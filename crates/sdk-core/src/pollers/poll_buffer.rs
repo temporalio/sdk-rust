@@ -1,6 +1,6 @@
 use crate::{
     abstractions::{ActiveCounter, MeteredPermitDealer, OwnedMeteredSemPermit, dbg_panic},
-    pollers::{self, Poller},
+    pollers::{Poller, PollerError, PollerResult},
     worker::{
         ActivitySlotKind, NamespaceCapabilities, NexusSlotKind, PollerBehavior, SlotKind,
         WFTPollerShared, WorkflowSlotKind,
@@ -65,8 +65,7 @@ const PERSISTENT_POLL_ERROR_WARN_BACKOFF: ExponentialBuilder = ExponentialBuilde
     .with_max_delay(Duration::from_secs(15 * 60))
     .without_max_times();
 
-type PollReceiver<T, SK> =
-    Mutex<UnboundedReceiver<pollers::Result<(T, OwnedMeteredSemPermit<SK>)>>>;
+type PollReceiver<T, SK> = UnboundedReceiver<PollerResult<(T, OwnedMeteredSemPermit<SK>)>>;
 
 struct PollRateLimiter {
     interval: Duration,
@@ -95,11 +94,10 @@ impl PollRateLimiter {
 
 pub(crate) struct LongPollBuffer<T, SK: SlotKind> {
     buffered_polls: PollReceiver<T, SK>,
-    shutdown: CancellationToken,
     poller_task: JoinHandle<()>,
     /// Pollers won't actually start polling until initialized & value is sent
-    starter: broadcast::Sender<()>,
-    did_start: AtomicBool,
+    starter: Option<broadcast::Sender<()>>,
+    did_stop: bool,
 }
 
 pub(crate) struct WorkflowTaskOptions {
@@ -320,8 +318,7 @@ impl LongPollBuffer<PollNexusTaskQueueResponse, NexusSlotKind> {
     }
 }
 
-// Simple way to test this w/o plumbing options through. This will be removed after
-// the proper server implementation for terminating polls on worker shutdown exists.
+// Simple way to test this w/o plumbing options through.
 #[cfg(test)]
 use std::cell::RefCell;
 #[cfg(test)]
@@ -332,7 +329,7 @@ thread_local! {
 impl<T, SK> LongPollBuffer<T, SK>
 where
     T: TaskPollerResult + Send + Debug + 'static,
-    SK: SlotKind + 'static,
+    SK: SlotKind,
 {
     fn new<FT, DelayFut, F>(
         poll_fn: impl Fn(Option<Duration>) -> FT + Send + Sync + 'static,
@@ -344,7 +341,7 @@ where
         capabilities: Arc<NamespaceCapabilities>,
     ) -> Self
     where
-        FT: Future<Output = pollers::Result<T>> + Send,
+        FT: Future<Output = Result<T, tonic::Status>> + Send,
         DelayFut: Future<Output = ()> + Send,
         F: Fn(usize) + Send + Sync + 'static,
     {
@@ -352,7 +349,6 @@ where
         let (starter, mut wait_for_start) = broadcast::channel(1);
         let pf = Arc::new(poll_fn);
         let post_pf = Arc::new(post_poll_fn);
-        let shutdown_clone = shutdown.clone();
         #[cfg(test)]
         let poll_shutdown_interrupt_wait = POLL_SHUTDOWN_INTERRUPT.with(|v| *v.borrow());
         #[cfg(not(test))]
@@ -366,40 +362,41 @@ where
             async move {
                 tokio::select! {
                     _ = wait_for_start.recv() => (),
-                    _ = shutdown_clone.cancelled() => return,
+                    _ = shutdown.cancelled() => return,
                 }
                 drop(wait_for_start);
 
                 let (spawned_tx, spawned_rx) = unbounded_channel();
+                let shutdown_clone = shutdown.clone();
                 // This is needed to ensure we don't exit this task before all received polls have
                 // been sent out for processing.
                 let poll_task_awaiter = tokio::spawn(async move {
                     UnboundedReceiverStream::new(spawned_rx)
-                        .for_each_concurrent(None, |t| async move {
-                            handle_task_panic(t).await;
+                        .for_each_concurrent(None, |t| async {
+                            handle_task_panic(t, Some(&shutdown_clone)).await;
                         })
                         .await;
                 });
                 loop {
-                    if shutdown_clone.is_cancelled() {
+                    if shutdown.is_cancelled() {
                         break;
                     }
                     if let Some(ref ppd) = pre_permit_delay {
                         tokio::select! {
                             _ = ppd() => (),
-                            _ = shutdown_clone.cancelled() => break,
+                            _ = shutdown.cancelled() => break,
                         }
                     }
                     let permit = tokio::select! {
                         p = permit_dealer.acquire_owned() => p,
-                        _ = shutdown_clone.cancelled() => break,
+                        _ = shutdown.cancelled() => break,
                     };
                     let active_guard = tokio::select! {
                         ag = poll_scaler.wait_until_allowed() => ag,
-                        _ = shutdown_clone.cancelled() => break,
+                        _ = shutdown.cancelled() => break,
                     };
                     // Spawn poll task
-                    let shutdown = shutdown_clone.clone();
+                    let shutdown = shutdown.clone();
                     let pf = pf.clone();
                     let post_pf = post_pf.clone();
                     let tx = tx.clone();
@@ -413,39 +410,42 @@ where
                             None
                         };
                     let capabilities = capabilities.clone();
-                    let poll_task = tokio::spawn(async move {
-                        let r = if capabilities.graceful_poll_shutdown() {
-                            pf(timeout_override).await
-                        } else {
-                            let poll_interruptor = shutdown.cancelled().then(|_| async move {
-                                if let Some(w) = poll_shutdown_interrupt_wait {
-                                    tokio::time::sleep(w).await;
+                    let poll_task = tokio::spawn(
+                        async move {
+                            let r = if capabilities.graceful_poll_shutdown() {
+                                pf(timeout_override).await
+                            } else {
+                                let poll_interruptor = shutdown.cancelled().then(|_| async move {
+                                    if let Some(w) = poll_shutdown_interrupt_wait {
+                                        tokio::time::sleep(w).await;
+                                    }
+                                });
+                                tokio::select! {
+                                    r = pf(timeout_override) => r,
+                                    _ = poll_interruptor => return,
                                 }
-                            });
-                            tokio::select! {
-                                r = pf(timeout_override) => r,
-                                _ = poll_interruptor => return,
-                            }
-                        };
-                        if let Ok(r) = &r
-                            && let Some(ppf) = post_pf.as_ref()
-                        {
-                            ppf(r);
-                        }
-                        let (should_forward, backoff_duration) = report_handle.poll_result(&r);
-                        if let Some(duration) = backoff_duration {
-                            // Apply backoff BEFORE dropping active_guard to prevent next poll from
-                            // starting
-                            tokio::select! {
-                                _ = tokio::time::sleep(duration) => return,
-                                _ = shutdown.cancelled() => (),
                             };
+                            if let Ok(r) = &r
+                                && let Some(ppf) = post_pf.as_ref()
+                            {
+                                ppf(r);
+                            }
+                            let (should_forward, backoff_duration) = report_handle.poll_result(&r);
+                            if let Some(duration) = backoff_duration {
+                                // Apply backoff BEFORE dropping active_guard to prevent next poll from
+                                // starting
+                                tokio::select! {
+                                    _ = tokio::time::sleep(duration) => return,
+                                    _ = shutdown.cancelled() => (),
+                                };
+                            }
+                            drop(active_guard);
+                            if should_forward {
+                                let _ = tx.send(r.map(|r| (r, permit)).map_err(Into::into));
+                            }
                         }
-                        drop(active_guard);
-                        if should_forward {
-                            let _ = tx.send(r.map(|r| (r, permit)));
-                        }
-                    });
+                        .in_current_span(),
+                    );
                     let _ = spawned_tx.send(poll_task);
                 }
                 drop(spawned_tx);
@@ -457,11 +457,10 @@ where
             .instrument(info_span!("polling_task").or_current()),
         );
         Self {
-            buffered_polls: Mutex::new(rx),
-            shutdown,
+            buffered_polls: rx,
             poller_task,
-            starter,
-            did_start: AtomicBool::new(false),
+            starter: Some(starter),
+            did_stop: false,
         }
     }
 }
@@ -470,40 +469,47 @@ where
 impl<T, SK> Poller<(T, OwnedMeteredSemPermit<SK>)> for LongPollBuffer<T, SK>
 where
     T: Send + Sync + Debug + 'static,
-    SK: SlotKind + 'static,
+    SK: SlotKind,
 {
-    /// Poll for the next item from this poller
+    /// Poll for the next item from this poller.
     ///
-    /// Returns `None` if the poller has been shut down
+    /// After the poller stops and all previous items are returned, the next poll returns
+    /// [`PollerError::PollerStopped`]. After that, all subsequent polls return `None`.
     #[instrument(name = "long_poll", level = "trace", skip(self))]
-    async fn poll(&self) -> Option<pollers::Result<(T, OwnedMeteredSemPermit<SK>)>> {
-        if !self.did_start.fetch_or(true, Ordering::Relaxed) {
-            let _ = self.starter.send(());
+    async fn poll(&mut self) -> Option<PollerResult<(T, OwnedMeteredSemPermit<SK>)>> {
+        if let Some(starter) = self.starter.take() {
+            let _ = starter.send(());
         }
 
-        let mut locked = self.buffered_polls.lock().await;
-        (*locked).recv().await
-    }
-
-    fn notify_shutdown(&self) {
-        self.shutdown.cancel();
+        self.buffered_polls.recv().await.or_else(|| {
+            if self.did_stop {
+                None
+            } else {
+                self.did_stop = true;
+                Some(Err(PollerError::PollerStopped))
+            }
+        })
     }
 
     async fn shutdown(mut self) {
-        self.notify_shutdown();
-        handle_task_panic(self.poller_task).await;
+        handle_task_panic(self.poller_task, None).await;
     }
 
     async fn shutdown_box(self: Box<Self>) {
-        let this = *self;
-        this.shutdown().await;
+        self.shutdown().await;
     }
 }
 
-async fn handle_task_panic(t: JoinHandle<()>) {
-    if let Err(e) = t.await
+async fn handle_task_panic(task: JoinHandle<()>, shutdown_token: Option<&CancellationToken>) {
+    if let Err(e) = task.await
         && e.is_panic()
     {
+        // In debug build, stop the poller so that panics can propagate outward.
+        #[cfg(debug_assertions)]
+        shutdown_token
+            .into_iter()
+            .for_each(CancellationToken::cancel);
+
         let as_panic = e.into_panic().downcast::<String>();
         dbg_panic!(
             "Poller task died or did not terminate cleanly: {:?}",
@@ -765,27 +771,20 @@ impl
     )> for WorkflowTaskPoller
 {
     async fn poll(
-        &self,
+        &mut self,
     ) -> Option<
-        pollers::Result<(
+        PollerResult<(
             PollWorkflowTaskQueueResponse,
             OwnedMeteredSemPermit<WorkflowSlotKind>,
         )>,
     > {
-        if let Some(sq) = self.sticky_poller.as_ref() {
+        if let Some(sq) = self.sticky_poller.as_mut() {
             tokio::select! {
                 r = self.normal_poller.poll() => r,
                 r = sq.poll() => r,
             }
         } else {
             self.normal_poller.poll().await
-        }
-    }
-
-    fn notify_shutdown(&self) {
-        self.normal_poller.notify_shutdown();
-        if let Some(sq) = self.sticky_poller.as_ref() {
-            sq.notify_shutdown();
         }
     }
 
@@ -797,8 +796,7 @@ impl
     }
 
     async fn shutdown_box(self: Box<Self>) {
-        let this = *self;
-        this.shutdown().await;
+        self.shutdown().await;
     }
 }
 
@@ -853,15 +851,11 @@ impl<T, PT, SK> Poller<(T, OwnedMeteredSemPermit<SK>)> for MockPermittedPollBuff
 where
     T: Send + Sync + 'static,
     PT: Poller<T> + Send + Sync + 'static,
-    SK: SlotKind + 'static,
+    SK: SlotKind,
 {
-    async fn poll(&self) -> Option<pollers::Result<(T, OwnedMeteredSemPermit<SK>)>> {
+    async fn poll(&mut self) -> Option<PollerResult<(T, OwnedMeteredSemPermit<SK>)>> {
         let p = self.sem.acquire_owned().await;
         self.inner.poll().await.map(|r| r.map(|r| (r, p)))
-    }
-
-    fn notify_shutdown(&self) {
-        self.inner.notify_shutdown();
     }
 
     async fn shutdown(self) {
@@ -938,13 +932,14 @@ mod tests {
                 .boxed()
             });
 
-        let pb = LongPollBuffer::new_workflow_task(
+        let shutdown_token = CancellationToken::new();
+        let mut pb = LongPollBuffer::new_workflow_task(
             Arc::new(mock_client),
             "sometq".to_string(),
             None,
             PollerBehavior::SimpleMaximum(1),
             fixed_size_permit_dealer(10),
-            CancellationToken::new(),
+            shutdown_token.clone(),
             None::<fn(usize)>,
             WorkflowTaskOptions {
                 wft_poller_shared: Some(Arc::new(WFTPollerShared::new(Some(10)))),
@@ -969,6 +964,7 @@ mod tests {
         // Now we grab the buffered poll response, the poll task will go again but we don't grab it,
         // therefore we will have only polled twice.
         pb.poll().await.unwrap().unwrap();
+        shutdown_token.cancel();
         pb.shutdown().await;
     }
 
@@ -991,7 +987,8 @@ mod tests {
             .expect_poll_workflow_task()
             .returning(move |_, _| async { Ok(Default::default()) }.boxed());
 
-        let pb = LongPollBuffer::new_workflow_task(
+        let shutdown_token = CancellationToken::new();
+        let mut pb = LongPollBuffer::new_workflow_task(
             Arc::new(mock_client),
             "sometq".to_string(),
             None,
@@ -1001,7 +998,7 @@ mod tests {
                 initial: 1,
             },
             fixed_size_permit_dealer(1),
-            CancellationToken::new(),
+            shutdown_token.clone(),
             None::<fn(usize)>,
             WorkflowTaskOptions {
                 wft_poller_shared: Some(Arc::new(WFTPollerShared::new(Some(1)))),
@@ -1012,6 +1009,7 @@ mod tests {
 
         // Should not see error, unwraps should get empty response
         pb.poll().await.unwrap().unwrap();
+        shutdown_token.cancel();
         pb.shutdown().await;
     }
 
@@ -1072,7 +1070,7 @@ mod tests {
             });
 
         let shutdown_token = CancellationToken::new();
-        let pb = LongPollBuffer::new_workflow_task(
+        let mut pb = LongPollBuffer::new_workflow_task(
             Arc::new(mock_client),
             "sometq".to_string(),
             None,
@@ -1111,9 +1109,15 @@ mod tests {
         let third_task_result = pb.poll().await;
         let elapsed = shutdown_time.elapsed();
 
-        assert!(
-            third_task_result.is_none(),
+        assert_matches!(
+            third_task_result,
+            Some(Err(PollerError::PollerStopped)),
             "Third task should not be received - poll should be interrupted after interrupt period"
+        );
+
+        assert!(
+            pb.poll().await.is_none(),
+            "Fourth poll should return None rather than Some(Err)"
         );
 
         // Total elapsed time should be at least the interrupt wait (200ms), but not significantly
@@ -1177,7 +1181,8 @@ mod tests {
                 .boxed()
             });
 
-        let pb = Arc::new(LongPollBuffer::new_workflow_task(
+        let shutdown_token = CancellationToken::new();
+        let mut pb = LongPollBuffer::new_workflow_task(
             Arc::new(mock_client),
             "sometq".to_string(),
             None,
@@ -1187,19 +1192,19 @@ mod tests {
                 initial: INITIAL_POLLERS,
             },
             fixed_size_permit_dealer(INITIAL_POLLERS),
-            CancellationToken::new(),
+            shutdown_token.clone(),
             None::<fn(usize)>,
             WorkflowTaskOptions {
                 wft_poller_shared: Some(Arc::new(WFTPollerShared::new(Some(INITIAL_POLLERS)))),
             },
             Arc::new(AtomicCell::new(None)),
             Arc::new(NamespaceCapabilities::default()),
-        ));
+        );
 
         // Trigger the first poll to initialize and get the scaling decision
-        let pb_clone = pb.clone();
-        tokio::spawn(async move {
-            let _ = pb_clone.poll().await;
+        let join_handle = tokio::spawn(async move {
+            let _ = pb.poll().await;
+            pb
         });
 
         // Wait for the first poll to complete
@@ -1216,10 +1221,8 @@ mod tests {
             hot_loop_calls
         );
 
-        Arc::try_unwrap(pb)
-            .unwrap_or_else(|_| panic!("Failed to unwrap Arc"))
-            .shutdown()
-            .await;
+        shutdown_token.cancel();
+        join_handle.await.unwrap().shutdown().await;
     }
 
     #[rstest]
@@ -1256,7 +1259,8 @@ mod tests {
             });
 
         let (active_tx, mut active_rx) = watch::channel(0);
-        let pb = LongPollBuffer::new_workflow_task(
+        let shutdown_token = CancellationToken::new();
+        let mut pb = LongPollBuffer::new_workflow_task(
             Arc::new(mock_client),
             "normal".to_string(),
             Some("sticky".to_string()),
@@ -1266,7 +1270,7 @@ mod tests {
                 initial: INITIAL_POLLERS,
             },
             fixed_size_permit_dealer(INITIAL_POLLERS),
-            CancellationToken::new(),
+            shutdown_token.clone(),
             Some(move |active| {
                 active_tx.send_replace(active);
             }),
@@ -1280,7 +1284,7 @@ mod tests {
             })),
         );
 
-        let _ = pb.starter.send(());
+        let _ = pb.starter.take().unwrap().send(());
         active_rx
             .wait_for(|active| *active == INITIAL_POLLERS)
             .await
@@ -1298,6 +1302,7 @@ mod tests {
         assert_eq!(call_count.load(Ordering::SeqCst), REPLACEMENT_CALLS);
         assert_eq!(*active_rx.borrow_and_update(), INITIAL_POLLERS);
 
+        shutdown_token.cancel();
         pb.shutdown().await;
     }
 
@@ -1340,7 +1345,7 @@ mod tests {
             });
 
         let shutdown_token = CancellationToken::new();
-        let pb = LongPollBuffer::new_workflow_task(
+        let mut pb = LongPollBuffer::new_workflow_task(
             Arc::new(mock_client),
             "sometq".to_string(),
             None,
@@ -1383,10 +1388,7 @@ mod tests {
             let result = tokio::time::timeout(Duration::from_secs(2), pb.poll())
                 .await
                 .expect("legacy poll should resolve quickly");
-            assert!(
-                result.is_none(),
-                "Legacy shutdown should kill in-flight poll, buffer returns None"
-            );
+            assert_matches!(result, Some(Err(PollerError::PollerStopped)));
         }
 
         pb.shutdown().await;

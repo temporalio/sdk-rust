@@ -1,6 +1,7 @@
 use crate::{
     MetricsContext,
     abstractions::dbg_panic,
+    pollers::{PollerError, PollerResult},
     telemetry::metrics::workflow_type,
     worker::workflow::{
         managed_run::RunUpdateAct,
@@ -15,6 +16,7 @@ use temporalio_common::protos::{
     coresdk::workflow_activation::remove_from_cache::EvictionReason,
     temporal::api::{enums::v1::WorkflowTaskFailedCause, failure::v1::Failure as ApiFailure},
 };
+use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 use tracing::{Level, Span};
 
@@ -36,8 +38,9 @@ pub(super) struct WFStream {
     history_fetch_refcounter: Arc<HistfetchRC>,
     shutdown_token: CancellationToken,
     ignore_evicts_on_shutdown: bool,
-
     metrics: MetricsContext,
+    is_poller_stopped: bool,
+    delayed_evictions: VecDeque<WorkflowStreamAction>,
 }
 impl WFStream {
     /// Constructs workflow state management and returns a stream which outputs activations.
@@ -64,20 +67,29 @@ impl WFStream {
     /// manager), which is a quite substantial change.
     pub(super) fn build(
         basics: WorkflowBasics,
-        wft_stream: impl Stream<Item = Result<WFTExtractorOutput, tonic::Status>> + Send + 'static,
+        wft_stream: impl Stream<Item = PollerResult<WFTExtractorOutput>> + Send + 'static,
         local_rx: impl Stream<Item = LocalInput> + Send + 'static,
         local_activity_request_sink: Option<impl LocalActivityRequestSink>,
+        notify_check_shutdown: Arc<Notify>,
     ) -> impl Stream<Item = Result<WFStreamOutput, PollError>> {
+        let check_shutdown_stream = stream::unfold(notify_check_shutdown.clone(), async move |n| {
+            n.notified().await;
+            Some((WFStreamInput::CheckShutdown, n))
+        });
         let all_inputs = stream::select_with_strategy(
-            local_rx.map(Into::into),
-            wft_stream
-                .map(Into::into)
-                .chain(stream::once(async { ExternalPollerInputs::PollerDead }))
-                .map(Into::into)
-                .boxed(),
-            // Priority always goes to the local stream
+            stream::select_with_strategy(
+                local_rx.map(Into::into),
+                wft_stream.map(Into::into),
+                // Local stream goes first, poller stream goes second.
+                |_: &mut ()| PollNext::Left,
+            )
+            // Each message in non-shutdown stream must schedule shutdown check.
+            .inspect(move |_| notify_check_shutdown.notify_one()),
+            check_shutdown_stream,
+            // Shutdown stream must always go last for shutdown to work properly.
             |_: &mut ()| PollNext::Left,
-        );
+        )
+        .boxed();
         Self::build_internal(all_inputs, basics, local_activity_request_sink)
     }
 
@@ -100,6 +112,8 @@ impl WFStream {
             metrics: basics.metrics,
             runs_needing_fetching: Default::default(),
             history_fetch_refcounter: Arc::new(HistfetchRC {}),
+            is_poller_stopped: false,
+            delayed_evictions: Default::default(),
         };
         all_inputs
             .map(move |action: WFStreamInput| {
@@ -107,7 +121,7 @@ impl WFStream {
                 let _span_g = span.enter();
 
                 let mut activations = vec![];
-                let mut actions = vec![];
+                let mut actions = VecDeque::new();
                 let maybe_act = match action {
                     WFStreamInput::NewWft(pwft) => {
                         debug!(run_id=%pwft.work.execution.run_id, "New WFT");
@@ -154,11 +168,6 @@ impl WFStream {
                                 });
                                 None
                             }
-                            LocalInputs::BumpStream => {
-                                // Ensures pending workflow activation polls resolve for
-                                // scenarios like during shutdown
-                                None
-                            }
                         }
                     }
                     WFStreamInput::FailedFetch {
@@ -170,7 +179,7 @@ impl WFStream {
                         if !state.runs.has_run(&run_id)
                             && let Some(info) = auto_reply_fail.clone()
                         {
-                            actions.push(WorkflowStreamAction::FailUnstoredWft {
+                            actions.push_back(WorkflowStreamAction::FailUnstoredWft {
                                 run_id,
                                 report: Box::new(FailedActivationWFTReport::new(
                                     info.task_token,
@@ -195,13 +204,24 @@ impl WFStream {
                                 .into_run_update_resp()
                         }
                     }
-                    WFStreamInput::PollerDead => {
-                        debug!("WFT poller died, beginning shutdown");
+                    WFStreamInput::PollerError(PollerError::PollerStopped) => {
+                        debug!("WFT poller stopped, beginning shutdown");
+                        state.is_poller_stopped = true;
                         state.shutdown_token.cancel();
                         None
                     }
-                    WFStreamInput::PollerError(e) => {
+                    WFStreamInput::PollerError(PollerError::Tonic(e)) => {
                         return Err(PollError::TonicError(e));
+                    }
+                    WFStreamInput::CheckShutdown => {
+                        // This input is always the lowest priority, so we know all other streams
+                        // are empty at this moment. If other shutdown conditions are met, we can
+                        // safely terminate the stream.
+                        if state.shutdown_done() {
+                            info!("Workflow shutdown is done");
+                            return Err(PollError::ShutDown);
+                        }
+                        None
                     }
                 };
 
@@ -213,13 +233,31 @@ impl WFStream {
                         .map(WorkflowStreamAction::Activation),
                 );
 
-                if state.shutdown_done() {
-                    info!("Workflow shutdown is done");
-                    return Err(PollError::ShutDown);
+                if state.ignore_evicts_on_shutdown && state.shutdown_token.is_cancelled() {
+                    // We can only ignore evictions if there is no other pending work. But we don't
+                    // know if there's no pending work until the stream is drained. If the current
+                    // iteration only has eviction actions, we save these for later. But if there's
+                    // other work to be done, we prepend current actions with all evictions we've
+                    // saved before.
+                    if state.runs_needing_fetching.is_empty()
+                        && actions.iter().all(WorkflowStreamAction::is_only_eviction)
+                    {
+                        if !actions.is_empty() {
+                            state.delayed_evictions.extend(std::mem::take(&mut actions));
+                        }
+                    } else {
+                        if !state.delayed_evictions.is_empty() {
+                            actions = {
+                                let mut merged = std::mem::take(&mut state.delayed_evictions);
+                                merged.extend(actions);
+                                merged
+                            };
+                        }
+                    }
                 }
 
                 Ok(WFStreamOutput {
-                    actions: actions.into(),
+                    actions,
                     fetch_histories: std::mem::take(&mut state.runs_needing_fetching),
                 })
             })
@@ -606,20 +644,30 @@ impl WFStream {
     }
 
     fn shutdown_done(&self) -> bool {
-        if self.shutdown_token.is_cancelled() {
-            if Arc::strong_count(&self.history_fetch_refcounter) > 1 {
-                // Don't exit if there are outstanding fetch requests
-                return false;
-            }
-            let all_runs_ready = self
-                .runs
-                .handles()
-                .all(|r| !r.has_any_pending_work(self.ignore_evicts_on_shutdown, false));
-            if all_runs_ready {
-                return true;
-            }
+        if !self.shutdown_token.is_cancelled() {
+            return false;
         }
-        false
+
+        if !self.is_poller_stopped {
+            debug!("Workflow shutdown: waiting for poller to finish");
+            return false;
+        }
+
+        if Arc::strong_count(&self.history_fetch_refcounter) > 1 {
+            debug!("Workflow shutdown: waiting for outstanding history fetch requests");
+            return false;
+        }
+
+        if self
+            .runs
+            .handles()
+            .any(|r| r.has_any_pending_work(self.ignore_evicts_on_shutdown, false))
+        {
+            debug!("Workflow shutdown: workflow runs have pending work");
+            return false;
+        }
+
+        true
     }
 
     fn outstanding_wfts(&self) -> usize {
@@ -644,16 +692,14 @@ impl WFStream {
 enum WFStreamInput {
     NewWft(Box<PermittedWFT>),
     Local(Box<LocalInput>),
-    /// The stream given to us which represents the poller (or a mock) terminated.
-    PollerDead,
-    /// The stream given to us which represents the poller (or a mock) encountered a non-retryable
-    /// error while polling
-    PollerError(tonic::Status),
+    /// The poller stream encountered a non-retryable error while polling.
+    PollerError(PollerError),
     FailedFetch {
         run_id: String,
         err: tonic::Status,
         auto_reply_fail: Option<UnstoredWftFailInfo>,
     },
+    CheckShutdown,
 }
 impl From<LocalInput> for WFStreamInput {
     fn from(input: LocalInput) -> Self {
@@ -699,7 +745,6 @@ pub(super) enum LocalInputs {
     #[from(ignore)]
     LocalActivityCancelProcessed(String),
     GetStateInfo(GetStateInfoMsg),
-    BumpStream,
 }
 impl LocalInputs {
     fn run_id(&self) -> Option<&str> {
@@ -711,83 +756,34 @@ impl LocalInputs {
             LocalInputs::RequestEviction(re) => &re.run_id,
             LocalInputs::HeartbeatTimeout(run_id)
             | LocalInputs::LocalActivityCancelProcessed(run_id) => run_id,
-            LocalInputs::GetStateInfo(_) | LocalInputs::BumpStream => return None,
+            LocalInputs::GetStateInfo(_) => return None,
         })
     }
 }
-#[derive(Debug)]
-#[allow(clippy::large_enum_variant)] // PollerDead only ever gets used once, so not important.
-enum ExternalPollerInputs {
-    NewWft(PermittedWFT),
-    PollerDead,
-    PollerError(tonic::Status),
-    FetchedUpdate(PermittedWFT),
-    NextPage {
-        paginator: HistoryPaginator,
-        update: HistoryUpdate,
-        span: Span,
-    },
-    FailedFetch {
-        run_id: String,
-        err: tonic::Status,
-        auto_reply_fail: Option<UnstoredWftFailInfo>,
-    },
-}
-impl From<ExternalPollerInputs> for WFStreamInput {
-    fn from(l: ExternalPollerInputs) -> Self {
-        match l {
-            ExternalPollerInputs::NewWft(v) => WFStreamInput::NewWft(Box::new(v)),
-            ExternalPollerInputs::PollerDead => WFStreamInput::PollerDead,
-            ExternalPollerInputs::PollerError(e) => WFStreamInput::PollerError(e),
-            ExternalPollerInputs::FetchedUpdate(wft) => WFStreamInput::NewWft(Box::new(wft)),
-            ExternalPollerInputs::FailedFetch {
-                run_id,
-                err,
-                auto_reply_fail,
-            } => WFStreamInput::FailedFetch {
-                run_id,
-                err,
-                auto_reply_fail,
-            },
-            ExternalPollerInputs::NextPage {
-                paginator,
-                update,
-                span,
-            } => WFStreamInput::Local(Box::new(LocalInput {
-                input: LocalInputs::FetchedPageCompletion { paginator, update },
-                span,
-            })),
-        }
-    }
-}
-impl From<Result<WFTExtractorOutput, tonic::Status>> for ExternalPollerInputs {
-    fn from(v: Result<WFTExtractorOutput, tonic::Status>) -> Self {
+impl From<PollerResult<WFTExtractorOutput>> for WFStreamInput {
+    fn from(v: PollerResult<WFTExtractorOutput>) -> Self {
         match v {
-            Ok(WFTExtractorOutput::NewWFT(pwft)) => ExternalPollerInputs::NewWft(pwft),
-            Ok(WFTExtractorOutput::FetchResult(updated_wft, _)) => {
-                ExternalPollerInputs::FetchedUpdate(updated_wft)
-            }
-            Ok(WFTExtractorOutput::NextPage {
-                paginator,
-                update,
-                span,
-                rc: _rc,
-            }) => ExternalPollerInputs::NextPage {
-                paginator,
-                update,
-                span,
-            },
+            Ok(WFTExtractorOutput::NewWFT(v)) => WFStreamInput::NewWft(Box::new(v)),
+            Ok(WFTExtractorOutput::FetchResult(wft, _)) => WFStreamInput::NewWft(Box::new(wft)),
             Ok(WFTExtractorOutput::FailedFetch {
                 run_id,
                 err,
                 auto_reply_fail,
-            }) => ExternalPollerInputs::FailedFetch {
+            }) => WFStreamInput::FailedFetch {
                 run_id,
                 err,
                 auto_reply_fail,
             },
-            Ok(WFTExtractorOutput::PollerDead) => ExternalPollerInputs::PollerDead,
-            Err(e) => ExternalPollerInputs::PollerError(e),
+            Ok(WFTExtractorOutput::NextPage {
+                paginator,
+                update,
+                span,
+                rc: _,
+            }) => WFStreamInput::Local(Box::new(LocalInput {
+                input: LocalInputs::FetchedPageCompletion { paginator, update },
+                span,
+            })),
+            Err(e) => WFStreamInput::PollerError(e),
         }
     }
 }

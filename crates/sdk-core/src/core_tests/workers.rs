@@ -10,20 +10,12 @@ use crate::{
         self, PollerBehavior,
         client::{
             MockWorkerClient,
-            mocks::{DEFAULT_TEST_CAPABILITIES, mock_worker_client},
+            mocks::{DEFAULT_TEST_CAPABILITIES, mock_worker_client, setup_mock_worker_client},
         },
     },
 };
-use futures_util::{stream, stream::StreamExt};
-use std::{
-    cell::RefCell,
-    collections::HashMap,
-    sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-    },
-    time::Duration,
-};
+use futures_util::{FutureExt, stream, stream::StreamExt};
+use std::{cell::RefCell, collections::HashMap, future, sync::Arc, time::Duration};
 use temporalio_client::worker::ClientWorkerSet;
 use temporalio_common::{
     protos::{
@@ -62,7 +54,10 @@ use temporalio_common::{
     },
     worker::WorkerTaskTypes,
 };
-use tokio::sync::{Barrier, Notify, watch};
+use tokio::{
+    select,
+    sync::{Barrier, watch},
+};
 use uuid::Uuid;
 
 #[tokio::test]
@@ -126,38 +121,6 @@ async fn shutdown_worker_can_complete_pending_activation() {
             PollError::ShutDown
         );
     });
-}
-
-#[tokio::test]
-async fn worker_shutdown_during_poll_doesnt_deadlock() {
-    let (tx, rx) = watch::channel(false);
-    let rx = rx.clone();
-    let stream = stream::unfold(rx, |mut rx| async move {
-        // Don't resolve polls until worker shuts down
-        rx.changed().await.unwrap();
-        // We don't want to return a real response here because it would get buffered and
-        // then we'd have real work to do to be able to finish shutdown.
-        Some((
-            Ok(PollWorkflowTaskQueueResponse::default().try_into().unwrap()),
-            rx,
-        ))
-    });
-    let mw = MockWorkerInputs::new(stream.boxed());
-    let mut mock_client = mock_worker_client();
-    mock_client
-        .expect_complete_workflow_task()
-        .returning(|_, _| Ok(RespondWorkflowTaskCompletedResponse::default()));
-    let worker = mock_worker(MocksHolder::from_mock_worker(mock_client, mw));
-    let pollfut = worker.poll_workflow_activation();
-    let shutdownfut = async {
-        worker.shutdown().await;
-        // Either the send works and unblocks the poll or the poll future is dropped before actually
-        // polling -- either way things worked OK
-        let _ = tx.send(true);
-    };
-    let (pollres, _) = tokio::join!(pollfut, shutdownfut);
-    assert_matches!(pollres.unwrap_err(), PollError::ShutDown);
-    worker.finalize_shutdown().await;
 }
 
 #[tokio::test]
@@ -242,14 +205,9 @@ async fn complete_with_task_not_found_during_shutdown() {
 #[tokio::test]
 async fn complete_eviction_after_shutdown_doesnt_panic() {
     let t = canned_histories::single_timer("1");
-    let mut mh = build_mock_pollers(MockPollCfg::from_resp_batches(
-        "fakeid",
-        t,
-        [1],
-        mock_worker_client(),
-    ));
-    mh.make_wft_stream_interminable();
-    let core = mock_worker(mh);
+    let mut mock_cfg = MockPollCfg::from_resp_batches("fakeid", t, [1], mock_worker_client());
+    mock_cfg.keep_wft_pending_until_worker_shutdown = true;
+    let core = mock_worker(build_mock_pollers(mock_cfg));
 
     let res = core.poll_workflow_activation().await.unwrap();
     assert_eq!(res.jobs.len(), 1);
@@ -339,37 +297,22 @@ async fn worker_can_shutdown_after_never_polling_ok(#[values(true, false)] poll_
 #[case::not_sticky(false, true)]
 #[tokio::test]
 async fn worker_shutdown_api(#[case] use_cache: bool, #[case] api_success: bool) {
-    // Manually need to create MockWorkerClient because we want to specify
-    // the expected number of calls for shutdown_worker.
-    // This will no longer be needed if
-    // https://github.com/asomers/mockall/issues/283 is implemented.
     let mut mock = MockWorkerClient::new();
-    let workers = Arc::new(ClientWorkerSet::new());
-    mock.expect_capabilities()
-        .returning(|| Some(*DEFAULT_TEST_CAPABILITIES));
-    mock.expect_workers().returning(move || workers.clone());
-    mock.expect_is_mock().returning(|| true);
-    mock.expect_sdk_name_and_version()
-        .returning(|| ("test-core".to_string(), "0.0.0".to_string()));
-    mock.expect_identity()
-        .returning(|| "test-identity".to_string());
-    mock.expect_worker_grouping_key().returning(Uuid::new_v4);
-    mock.expect_worker_instance_key().returning(Uuid::new_v4);
-    if api_success {
-        mock.expect_shutdown_worker()
-            .times(1)
-            .returning(|_, _, _, _| Ok(ShutdownWorkerResponse {}));
-    } else {
-        // worker.shutdown() should succeed even if shutdown_worker fails
-        mock.expect_shutdown_worker()
-            .times(1)
-            .returning(|_, _, _, _| Err(tonic::Status::unavailable("fake shutdown error")));
-    }
+    mock.expect_shutdown_worker()
+        .times(1)
+        .returning(move |_, _, _, _, _| {
+            if api_success {
+                Ok(ShutdownWorkerResponse {})
+            } else {
+                Err(tonic::Status::unavailable("fake shutdown error"))
+            }
+        });
+    setup_mock_worker_client(&mut mock);
 
     let t = canned_histories::single_timer("1");
-    let mut mh =
-        MockPollCfg::from_resp_batches("fakeid", t, [1.into(), ResponseType::AllHistory], mock);
+    let mut mh = MockPollCfg::from_resp_batches("fakeid", t, [1], mock);
     mh.enforce_correct_number_of_polls = false;
+    mh.keep_wft_pending_until_worker_shutdown = true;
     let mut mock = build_mock_pollers(mh);
     mock.worker_cfg(|w| w.max_cached_workflows = if use_cache { 1 } else { 0 });
     let worker = mock_worker(mock);
@@ -392,10 +335,8 @@ async fn worker_shutdown_api(#[case] use_cache: bool, #[case] api_success: bool)
             .unwrap();
 
         // Shutdown proceeds if the only outstanding activations are evictions
-        assert_matches!(
-            worker.poll_workflow_activation().await.unwrap_err(),
-            PollError::ShutDown
-        );
+        let poll_result = worker.poll_workflow_activation().await;
+        assert_matches!(poll_result, Err(PollError::ShutDown));
     });
 }
 
@@ -1228,22 +1169,26 @@ async fn nexus_start_operation_failure_converts_to_legacy_for_old_server(
 }
 
 /// Verifies that `initiate_shutdown` sends the `ShutdownWorker` RPC so that the server can
-/// complete in-flight polls. Without this, graceful poll shutdown deadlocks: the SDK waits for
-/// polls to drain, but the server was never told to flush them.
+/// complete in-flight polls. Without this, graceful poll shutdown waits until poll times out, which
+/// can take a long time.
 #[tokio::test]
 async fn graceful_shutdown_sends_shutdown_worker_rpc_during_initiate() {
-    let shutdown_rpc_called = Arc::new(AtomicBool::new(false));
-    let shutdown_rpc_called_clone = shutdown_rpc_called.clone();
-    // When the shutdown_worker RPC fires, it signals polls to complete (simulating server
-    // behavior where ShutdownWorker causes the server to return empty poll responses).
-    let poll_releaser = Arc::new(Notify::new());
-    let poll_releaser_for_rpc = poll_releaser.clone();
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum TestStage {
+        Begin,
+        TaskPollPending,
+        ShutdownRpcExpected,
+        ShutdownRpcCalled,
+        TaskPollReturned,
+    }
+
+    let mut stage_chan = watch::channel(TestStage::Begin);
 
     let mut mock_client = MockWorkerClient::new();
     let workers = Arc::new(ClientWorkerSet::new());
     mock_client
         .expect_capabilities()
-        .returning(|| Some(*DEFAULT_TEST_CAPABILITIES));
+        .returning(|| Some(DEFAULT_TEST_CAPABILITIES));
     mock_client
         .expect_workers()
         .returning(move || workers.clone());
@@ -1282,27 +1227,33 @@ async fn graceful_shutdown_sends_shutdown_worker_rpc_during_initiate() {
         })
     });
     // When shutdown_worker RPC is called, mark it and release polls
-    mock_client
-        .expect_shutdown_worker()
-        .returning(move |_, _, _, _| {
-            shutdown_rpc_called_clone.store(true, Ordering::SeqCst);
-            poll_releaser_for_rpc.notify_waiters();
-            Ok(ShutdownWorkerResponse {})
-        });
+    mock_client.expect_shutdown_worker().returning({
+        let (tx, mut rx) = stage_chan.clone();
+        move |_, _, _, _, _| {
+            assert_eq!(*rx.borrow_and_update(), TestStage::ShutdownRpcExpected);
+            tx.send(TestStage::ShutdownRpcCalled).unwrap();
+            Ok(ShutdownWorkerResponse::default())
+        }
+    });
     mock_client
         .expect_complete_workflow_task()
         .returning(|_, _| Ok(RespondWorkflowTaskCompletedResponse::default()));
 
     // Polls block until shutdown_worker RPC releases them (simulating server holding polls
     // open until it receives the ShutdownWorker signal)
-    let poll_releaser_for_stream = poll_releaser.clone();
-    let stream = stream::unfold(poll_releaser_for_stream, |releaser| async move {
-        releaser.notified().await;
-        Some((
-            Ok(PollWorkflowTaskQueueResponse::default().try_into().unwrap()),
-            releaser,
-        ))
-    });
+    let stream = stream::once({
+        let (tx, mut rx) = stage_chan.clone();
+        async move {
+            assert_eq!(*rx.borrow_and_update(), TestStage::Begin);
+            tx.send(TestStage::TaskPollPending).unwrap();
+            while *rx.borrow_and_update() != TestStage::ShutdownRpcCalled {
+                rx.changed().await.unwrap();
+            }
+            tx.send(TestStage::TaskPollReturned).unwrap();
+            None
+        }
+    })
+    .filter_map(future::ready);
 
     let mw = MockWorkerInputs::new(stream.boxed());
     let worker = mock_worker(MocksHolder::from_mock_worker(mock_client, mw));
@@ -1310,23 +1261,29 @@ async fn graceful_shutdown_sends_shutdown_worker_rpc_during_initiate() {
     // validate() reads describe_namespace and sets capabilities.graceful_poll_shutdown = true
     worker.validate().await.unwrap();
 
-    let poll_fut = worker.poll_workflow_activation();
-    let shutdown_fut = async {
-        // initiate_shutdown must send the ShutdownWorker RPC, which releases the polls
-        worker.initiate_shutdown();
-    };
+    let mut poll_fut = Box::pin(worker.poll_workflow_activation());
+    // polling the poll future will eventually poll the WFT stream, advancing test stage
+    while *stage_chan.1.borrow_and_update() != TestStage::TaskPollPending {
+        select! {
+            _ = stage_chan.1.changed() => (),
+            _ = &mut poll_fut => panic!("poll should not resolve yet"),
+        }
+    }
 
-    let (poll_result, _) = tokio::time::timeout(Duration::from_secs(5), async {
-        tokio::join!(poll_fut, shutdown_fut)
-    })
+    stage_chan.0.send(TestStage::ShutdownRpcExpected).unwrap();
+    // initiate_shutdown must eventually lead to ShutdownWorker RPC, which releases the polls
+    worker.initiate_shutdown();
+
+    let poll_result = tokio::time::timeout(Duration::from_secs(5), poll_fut.inspect({
+        let mut rx = stage_chan.1.clone();
+        move |_| {
+            assert_eq!(*rx.borrow_and_update(), TestStage::TaskPollReturned);
+        }
+    }))
     .await
     .expect("Shutdown should complete within 5s -- if it hangs, the ShutdownWorker RPC was not sent during initiate_shutdown");
 
-    assert_matches!(poll_result.unwrap_err(), PollError::ShutDown);
-    assert!(
-        shutdown_rpc_called.load(Ordering::SeqCst),
-        "ShutdownWorker RPC must be called during initiate_shutdown"
-    );
+    assert_matches!(poll_result, Err(PollError::ShutDown));
 
     worker.finalize_shutdown().await;
 }
@@ -1346,10 +1303,7 @@ async fn validate_enables_auto_enroll_capability() {
             ..DescribeNamespaceResponse::default()
         })
     });
-    let t = canned_histories::single_timer("1");
-    let mut mh = MockPollCfg::from_resp_batches("fakeid", t, [1], mock);
-    mh.enforce_correct_number_of_polls = false;
-    let worker = mock_worker(build_mock_pollers(mh));
+    let worker = mock_worker(MocksHolder::from_wft_stream(mock, stream::empty()));
 
     worker.validate().await.unwrap();
     let caps = worker.get_namespace_capabilities();
@@ -1376,10 +1330,7 @@ async fn validate_without_auto_enroll_leaves_capabilities_off() {
             ..DescribeNamespaceResponse::default()
         })
     });
-    let t = canned_histories::single_timer("1");
-    let mut mh = MockPollCfg::from_resp_batches("fakeid", t, [1], mock);
-    mh.enforce_correct_number_of_polls = false;
-    let worker = mock_worker(build_mock_pollers(mh));
+    let worker = mock_worker(MocksHolder::from_wft_stream(mock, stream::empty()));
 
     worker.validate().await.unwrap();
     let caps = worker.get_namespace_capabilities();

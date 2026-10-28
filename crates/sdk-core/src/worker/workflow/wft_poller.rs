@@ -1,7 +1,10 @@
 use crate::{
     MetricsContext, WorkerConfig,
     abstractions::{MeteredPermitDealer, OwnedMeteredSemPermit},
-    pollers::{BoxedWFPoller, LongPollBuffer, Poller, WorkflowTaskOptions, WorkflowTaskPoller},
+    pollers::{
+        BoxedWFPoller, LongPollBuffer, Poller, PollerError, PollerResult, WorkflowTaskOptions,
+        WorkflowTaskPoller,
+    },
     protosext::ValidPollWFTQResponse,
     telemetry::metrics::{workflow_poller, workflow_sticky_poller},
     worker::{NamespaceCapabilities, WorkflowSlotKind, client::WorkerClient, wft_poller_behavior},
@@ -28,13 +31,10 @@ pub(crate) fn make_wft_poller(
     sticky_last_successful_poll_time: Arc<AtomicCell<Option<SystemTime>>>,
     capabilities: Arc<NamespaceCapabilities>,
 ) -> impl Stream<
-    Item = Result<
-        (
-            ValidPollWFTQResponse,
-            OwnedMeteredSemPermit<WorkflowSlotKind>,
-        ),
-        tonic::Status,
-    >,
+    Item = PollerResult<(
+        ValidPollWFTQResponse,
+        OwnedMeteredSemPermit<WorkflowSlotKind>,
+    )>,
 > + Sized
 + 'static {
     let wft_metrics = metrics.with_new_attrs([workflow_poller()]);
@@ -219,15 +219,12 @@ fn new_wft_poller(
     poller: BoxedWFPoller,
     metrics: MetricsContext,
 ) -> impl Stream<
-    Item = Result<
-        (
-            ValidPollWFTQResponse,
-            OwnedMeteredSemPermit<WorkflowSlotKind>,
-        ),
-        tonic::Status,
-    >,
+    Item = PollerResult<(
+        ValidPollWFTQResponse,
+        OwnedMeteredSemPermit<WorkflowSlotKind>,
+    )>,
 > {
-    stream::unfold((poller, metrics), |(poller, metrics)| async move {
+    stream::unfold((poller, metrics), |(mut poller, metrics)| async move {
         loop {
             return match poller.poll().await {
                 Some(Ok((wft, permit))) => {
@@ -251,7 +248,9 @@ fn new_wft_poller(
                     Some((Ok((work, permit)), (poller, metrics)))
                 }
                 Some(Err(e)) => {
-                    warn!(error=?e, "Error while polling for workflow tasks");
+                    if let PollerError::Tonic(e) = &e {
+                        warn!(error=?e, "Error while polling for workflow tasks");
+                    }
                     Some((Err(e), (poller, metrics)))
                 }
                 // If poller returns None, it's dead, thus we also return None to terminate
@@ -259,7 +258,7 @@ fn new_wft_poller(
                 None => {
                     // Make sure we call the actual shutdown function here to propagate any
                     // panics inside the polling tasks as errors.
-                    poller.shutdown_box().await;
+                    poller.shutdown().await;
                     None
                 }
             };
@@ -350,40 +349,23 @@ mod tests {
         assert_eq!(waiter.as_mut().poll(&mut context), Poll::Ready(()));
     }
 
+    #[rstest::rstest]
+    #[case::immediately(0)]
+    #[case::after_empty_responses(10)]
     #[tokio::test]
-    async fn poll_timeouts_do_not_produce_responses() {
+    async fn poller_returning_none_terminates_wft_stream(#[case] empty_responses: usize) {
         let mut mock_poller = mock_poller();
         mock_poller
             .expect_poll()
-            .times(1)
+            .times(empty_responses)
             .returning(|| Some(Ok(PollWorkflowTaskQueueResponse::default())));
         mock_poller.expect_poll().times(1).returning(|| None);
-        mock_poller.expect_shutdown().times(1).returning(|| ());
         let sem = Arc::new(fixed_size_permit_dealer::<WorkflowSlotKind>(10));
         let stream = new_wft_poller(
             Box::new(MockPermittedPollBuffer::new(sem, mock_poller)),
             MetricsContext::no_op(),
         );
         pin_mut!(stream);
-        assert_matches!(stream.next().await, None);
-    }
-
-    /// When the underlying poller returns None (indicating shutdown), the wrapping WFT stream
-    /// should also return None to terminate.
-    #[tokio::test]
-    async fn poller_returning_none_terminates_wft_stream() {
-        let mut mock_poller = mock_poller();
-        mock_poller.expect_poll().times(1).returning(|| None);
-        mock_poller.expect_shutdown().times(1).returning(|| ());
-
-        let sem = Arc::new(fixed_size_permit_dealer::<WorkflowSlotKind>(10));
-
-        let stream = new_wft_poller(
-            Box::new(MockPermittedPollBuffer::new(sem, mock_poller)),
-            MetricsContext::no_op(),
-        );
-        pin_mut!(stream);
-
         assert_matches!(stream.next().await, None);
     }
 
@@ -459,7 +441,7 @@ mod tests {
         mock_poller
             .expect_poll()
             .times(1)
-            .returning(|| Some(Err(tonic::Status::internal("ahhh"))));
+            .returning(|| Some(Err(tonic::Status::internal("ahhh").into())));
         let sem = Arc::new(fixed_size_permit_dealer::<WorkflowSlotKind>(10));
         let stream = new_wft_poller(
             Box::new(MockPermittedPollBuffer::new(sem, mock_poller)),

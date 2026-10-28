@@ -16,7 +16,6 @@ use std::{fmt::Debug, marker::PhantomData};
 use temporalio_common::protos::temporal::api::workflowservice::v1::{
     PollActivityTaskQueueResponse, PollNexusTaskQueueResponse, PollWorkflowTaskQueueResponse,
 };
-use tokio::select;
 use tokio_util::sync::CancellationToken;
 
 #[cfg(any(feature = "test-utilities", test))]
@@ -24,7 +23,16 @@ use futures_util::Future;
 #[cfg(any(feature = "test-utilities", test))]
 pub(crate) use poll_buffer::MockPermittedPollBuffer;
 
-pub(crate) type Result<T, E = tonic::Status> = std::result::Result<T, E>;
+/// Error returned by the poller. Not to be confused with [`crate::worker::PollError`].
+#[derive(thiserror::Error, Debug)]
+pub(crate) enum PollerError {
+    #[error("Poller has stopped, shutting down")]
+    PollerStopped,
+    #[error(transparent)]
+    Tonic(#[from] tonic::Status),
+}
+
+pub(crate) type PollerResult<T> = Result<T, PollerError>;
 
 /// A trait for things that long poll the server.
 #[cfg_attr(any(feature = "test-utilities", test), mockall::automock)]
@@ -34,8 +42,7 @@ pub(crate) trait Poller<PollResult>
 where
     PollResult: Send + Sync + 'static,
 {
-    async fn poll(&self) -> Option<Result<PollResult>>;
-    fn notify_shutdown(&self);
+    async fn poll(&mut self) -> Option<PollerResult<PollResult>>;
     async fn shutdown(self);
     /// Need a separate shutdown to be able to consume boxes :(
     async fn shutdown_box(self: Box<Self>);
@@ -59,20 +66,16 @@ impl<T> Poller<T> for Box<dyn Poller<T> + Send + Sync>
 where
     T: Send + Sync + 'static,
 {
-    async fn poll(&self) -> Option<Result<T>> {
-        Poller::poll(self.as_ref()).await
-    }
-
-    fn notify_shutdown(&self) {
-        Poller::notify_shutdown(self.as_ref())
+    async fn poll(&mut self) -> Option<PollerResult<T>> {
+        self.as_mut().poll().await
     }
 
     async fn shutdown(self) {
-        Poller::shutdown(self).await
+        <dyn Poller<T> as Poller<T>>::shutdown_box(self).await
     }
 
     async fn shutdown_box(self: Box<Self>) {
-        Poller::shutdown_box(self).await
+        self.shutdown().await
     }
 }
 
@@ -81,10 +84,9 @@ mockall::mock! {
     pub ManualPoller<T: Send + Sync + 'static> {}
     #[allow(unused)]
     impl<T: Send + Sync + 'static> Poller<T> for ManualPoller<T> {
-        fn poll<'a, 'b>(&self)
-          -> impl Future<Output = Option<Result<T>>> + Send + 'b
+        fn poll<'a, 'b>(&mut self)
+          -> impl Future<Output = Option<PollerResult<T>>> + Send + 'b
             where 'a: 'b, Self: 'b;
-        fn notify_shutdown(&self);
         fn shutdown<'a>(self)
           -> impl Future<Output = ()> + Send + 'a
             where Self: 'a;
@@ -124,7 +126,6 @@ where
     metrics: MetricsContext,
     metrics_no_task: fn(&MetricsContext),
     shutdown_token: CancellationToken,
-    poller_was_shutdown: bool,
     _phantom: PhantomData<T>,
 }
 
@@ -144,70 +145,51 @@ where
             metrics,
             metrics_no_task,
             shutdown_token,
-            poller_was_shutdown: false,
             _phantom: PhantomData,
         }
     }
 
-    fn into_stream(self) -> impl Stream<Item = Result<PermittedTqResp<T>, tonic::Status>> {
-        stream::unfold(self, |mut state| async move {
+    fn into_stream(self) -> impl Stream<Item = PollerResult<PermittedTqResp<T>>> {
+        stream::unfold(Box::new(self), |mut state| async move {
             loop {
-                let poll = async {
-                    loop {
-                        return match state.poller.poll().await {
-                            Some(Ok((task, permit))) => {
-                                if task == Default::default() {
-                                    if state.poller_was_shutdown {
-                                        // Server sent an empty response after we initiated
-                                        // shutdown — this is the graceful shutdown signal.
-                                        return None;
-                                    }
-                                    // We get the default proto in the event that the long poll
-                                    // times out.
-                                    debug!("Poll {} task timeout", T::task_name());
-                                    (state.metrics_no_task)(&state.metrics);
-                                    continue;
-                                }
-
-                                if let Err(e) = task.validate() {
-                                    warn!(
-                                        "Received invalid {} task ({}): {:?}",
-                                        T::task_name(),
-                                        e,
-                                        &task
-                                    );
-                                    return Some(Err(tonic::Status::invalid_argument(
-                                        e.to_string(),
-                                    )));
-                                }
-
-                                Some(Ok(PermittedTqResp { resp: task, permit }))
+                let result = match state.poller.poll().await {
+                    Some(Ok((task, permit))) => {
+                        if task == Default::default() {
+                            // We get the default proto in the event that the long poll
+                            // times out, or when worker is shutting down. We only report
+                            // the metric on timeout.
+                            if !state.shutdown_token.is_cancelled() {
+                                debug!("Poll {} task timeout", T::task_name());
+                                (state.metrics_no_task)(&state.metrics);
                             }
-                            Some(Err(e)) => {
-                                warn!(error=?e, "Error while polling for {} tasks", T::task_name());
-                                Some(Err(e))
-                            }
-                            // If poller returns None, it's dead, thus we also return None to
-                            // terminate this stream.
-                            None => None,
-                        };
+                            continue;
+                        }
+
+                        if let Err(e) = task.validate() {
+                            warn!(
+                                "Received invalid {} task ({}): {:?}",
+                                T::task_name(),
+                                e,
+                                &task
+                            );
+                            Err(tonic::Status::invalid_argument(e.to_string()).into())
+                        } else {
+                            Ok(PermittedTqResp { resp: task, permit })
+                        }
+                    }
+                    Some(Err(e)) => {
+                        if let PollerError::Tonic(e) = &e {
+                            warn!(error=?e, "Error while polling for {} tasks", T::task_name());
+                        }
+                        Err(e)
+                    }
+                    // If poller returns None, it's dead, thus we also return None to terminate this stream.
+                    None => {
+                        state.poller.shutdown().await;
+                        return None;
                     }
                 };
-                if state.poller_was_shutdown {
-                    return poll.await.map(|res| (res, state));
-                }
-                select! {
-                    biased;
-
-                    _ = state.shutdown_token.cancelled() => {
-                        state.poller.notify_shutdown();
-                        state.poller_was_shutdown = true;
-                        continue;
-                    }
-                    res = poll => {
-                        return res.map(|res| (res, state));
-                    }
-                }
+                return Some((result, state));
             }
         })
     }
@@ -232,7 +214,7 @@ pub(crate) fn new_activity_task_poller(
     poller: BoxedActPoller,
     metrics: MetricsContext,
     shutdown_token: CancellationToken,
-) -> impl Stream<Item = Result<PermittedTqResp<PollActivityTaskQueueResponse>, tonic::Status>> {
+) -> impl Stream<Item = PollerResult<PermittedTqResp<PollActivityTaskQueueResponse>>> {
     TaskPollerStream::new(
         poller,
         metrics,
@@ -267,7 +249,7 @@ impl ValidatableTask for PollNexusTaskQueueResponse {
     }
 }
 
-pub(crate) type NexusPollItem = Result<PermittedTqResp<PollNexusTaskQueueResponse>, tonic::Status>;
+pub(crate) type NexusPollItem = PollerResult<PermittedTqResp<PollNexusTaskQueueResponse>>;
 pub(crate) fn new_nexus_task_poller(
     poller: BoxedNexusPoller,
     metrics: MetricsContext,
@@ -286,8 +268,10 @@ pub(crate) fn new_nexus_task_poller(
 mod tests {
     use super::*;
     use crate::{
-        abstractions::tests::fixed_size_permit_dealer, pollers::MockPermittedPollBuffer,
-        test_help::mock_poller, worker::ActivitySlotKind,
+        abstractions::tests::fixed_size_permit_dealer,
+        pollers::MockPermittedPollBuffer,
+        test_help::{CounterRecordingMeter, mock_poller},
+        worker::ActivitySlotKind,
     };
     use futures_util::{StreamExt, pin_mut};
     use std::sync::{
@@ -295,50 +279,9 @@ mod tests {
         atomic::{AtomicUsize, Ordering},
     };
 
-    /// Verify that empty responses after shutdown are not treated as poll timeout and retried
-    /// indefinitely
+    #[rstest::rstest]
     #[tokio::test]
-    async fn empty_response_after_shutdown_terminates_stream() {
-        let poll_count = Arc::new(AtomicUsize::new(0));
-        let poll_count_clone = poll_count.clone();
-
-        let mut mock_poller = mock_poller();
-        mock_poller.expect_poll().returning(move || {
-            poll_count_clone.fetch_add(1, Ordering::SeqCst);
-            Some(Ok(PollActivityTaskQueueResponse::default()))
-        });
-
-        let sem = Arc::new(fixed_size_permit_dealer::<ActivitySlotKind>(10));
-        let shutdown_token = CancellationToken::new();
-
-        let stream = new_activity_task_poller(
-            Box::new(MockPermittedPollBuffer::new(sem, mock_poller)),
-            MetricsContext::no_op(),
-            shutdown_token.clone(),
-        );
-        pin_mut!(stream);
-
-        shutdown_token.cancel();
-
-        let result = tokio::time::timeout(std::time::Duration::from_secs(2), stream.next()).await;
-        assert!(
-            result.is_ok(),
-            "Stream should terminate promptly after shutdown, not hang"
-        );
-        assert!(
-            result.unwrap().is_none(),
-            "Stream should return None (terminated) on empty response after shutdown"
-        );
-
-        let total = poll_count.load(Ordering::SeqCst);
-        assert!(
-            total < 5,
-            "Expected stream to terminate quickly, but poller was called {total} times"
-        );
-    }
-
-    #[tokio::test]
-    async fn empty_response_before_shutdown_retries() {
+    async fn empty_response_is_retried(#[values(false, true)] is_shutdown: bool) {
         let mut mock_poller = mock_poller();
         let call_count = Arc::new(AtomicUsize::new(0));
         let call_count_clone = call_count.clone();
@@ -353,21 +296,34 @@ mod tests {
 
         let sem = Arc::new(fixed_size_permit_dealer::<ActivitySlotKind>(10));
         let shutdown_token = CancellationToken::new();
+        if is_shutdown {
+            shutdown_token.cancel();
+        }
+
+        let meter = Arc::new(CounterRecordingMeter::default());
 
         let stream = new_activity_task_poller(
             Box::new(MockPermittedPollBuffer::new(sem, mock_poller)),
-            MetricsContext::no_op(),
+            MetricsContext::top_level_with_meter(
+                "ns".into(),
+                "tq".into(),
+                Some(meter.clone().into_temporal_meter()),
+            ),
             shutdown_token,
         );
         pin_mut!(stream);
 
-        // Without shutdown, empty responses should be skipped and the stream terminates
-        // only when the poller returns None.
+        // Empty responses should be skipped and the stream terminates only when the poller returns
+        // None.
         let result = stream.next().await;
         assert!(
             result.is_none(),
             "Stream should end when poller returns None"
         );
         assert_eq!(call_count.load(Ordering::SeqCst), 3);
+        assert_eq!(
+            meter.counter_total("activity_poll_no_task", &[]),
+            if is_shutdown { 0 } else { 2 }
+        );
     }
 }

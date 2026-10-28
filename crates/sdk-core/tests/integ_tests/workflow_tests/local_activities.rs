@@ -9,6 +9,7 @@ use futures_util::{FutureExt, StreamExt, stream};
 use rstest::Context;
 use std::{
     collections::HashMap,
+    future,
     ops::Sub,
     sync::{
         Arc, OnceLock,
@@ -1562,9 +1563,10 @@ async fn local_act_heartbeat(#[case] shutdown_middle: bool) {
 
     let wf_id = "fakeid";
     let mock = mock_worker_client();
-    let mut mh = MockPollCfg::from_resp_batches(wf_id, t, [1, 2, 2, 2], mock);
-    mh.enforce_correct_number_of_polls = false;
+    let mut mh = MockPollCfg::from_resp_batches(wf_id, t, [1], mock);
+    mh.keep_wft_pending_until_worker_shutdown = true;
     let shutdown_barr = Arc::new(Barrier::new(2));
+    let la_done = CancellationToken::new();
 
     #[workflow]
     #[derive(Default)]
@@ -1574,7 +1576,6 @@ async fn local_act_heartbeat(#[case] shutdown_middle: bool) {
     impl LocalActHeartbeatWf {
         #[run(name = DEFAULT_WORKFLOW_TYPE)]
         async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<()> {
-            dbg!("dafuq");
             ctx.execute_local_activity(
                 EchoWithConditionalBarrier::echo,
                 "hi".to_string(),
@@ -1588,6 +1589,7 @@ async fn local_act_heartbeat(#[case] shutdown_middle: bool) {
     struct EchoWithConditionalBarrier {
         shutdown_barr: Option<Arc<Barrier>>,
         wft_timeout: Duration,
+        la_done: CancellationToken,
     }
     #[activities]
     impl EchoWithConditionalBarrier {
@@ -1603,6 +1605,7 @@ async fn local_act_heartbeat(#[case] shutdown_middle: bool) {
             }
             // Take slightly more than two workflow tasks
             tokio::time::sleep(self.wft_timeout.mul_f32(2.2)).await;
+            self.la_done.cancel();
             Ok(str)
         }
     }
@@ -1622,15 +1625,20 @@ async fn local_act_heartbeat(#[case] shutdown_middle: bool) {
                     None
                 },
                 wft_timeout,
+                la_done: la_done.clone(),
             });
         },
     );
     let core = worker.core_worker();
-    let (_, runres) = tokio::join!(
+    let (_, runres) = join!(
         async {
             if shutdown_middle {
                 shutdown_barr.wait().await;
                 dbg!("Past barrier");
+                core.shutdown().await;
+            }
+            la_done.cancelled().await;
+            if !shutdown_middle {
                 core.shutdown().await;
             }
         },
@@ -2186,13 +2194,7 @@ async fn legacy_query_must_not_execute_local_activity(
         ResponseType::AllHistory,
     )
     .resp;
-    let (send_workflow_task, workflow_task_ready) = oneshot::channel::<()>();
-    let tasks = stream::iter([query])
-        .chain(stream::once(async move {
-            workflow_task_ready.await.unwrap();
-            workflow_task
-        }))
-        .chain(stream::pending());
+    let tasks = stream::iter(std::iter::once(query).chain(cached.then_some(workflow_task)));
     let mut client = mock_worker_client();
     client
         .expect_respond_legacy_query()
@@ -2221,6 +2223,7 @@ async fn legacy_query_must_not_execute_local_activity(
         None::<Vec<QueueResponse<PollActivityTaskQueueResponse>>>,
         None::<Vec<QueueResponse<PollNexusTaskQueueResponse>>>,
     );
+    mock.keep_wft_pending_until_worker_shutdown();
     mock.worker_cfg(|wc| wc.max_cached_workflows = usize::from(cached));
     let core = mock_worker(mock);
 
@@ -2302,7 +2305,6 @@ async fn legacy_query_must_not_execute_local_activity(
         () = query_and_eviction => {}
     }
     if cached {
-        send_workflow_task.send(()).unwrap();
         let execute_activity = async {
             let activity = core.poll_activity_task().await.unwrap();
             assert_matches!(
@@ -2365,10 +2367,13 @@ async fn legacy_query_while_waiting_on_la_is_buffered() {
             query_sent.await.unwrap();
             legacy_query
         }))
-        .chain(stream::once(async move {
-            query_handled_tx.send(()).unwrap();
-            std::future::pending().await
-        }));
+        .chain(
+            stream::once(async move {
+                query_handled_tx.send(()).unwrap();
+                None
+            })
+            .filter_map(future::ready),
+        );
 
     let mut client = mock_worker_client();
     client
@@ -2389,6 +2394,7 @@ async fn legacy_query_while_waiting_on_la_is_buffered() {
         wc.max_cached_workflows = 10;
         wc.fetching_concurrency = 1;
     });
+    mock.keep_wft_pending_until_worker_shutdown();
     let core = mock_worker(mock);
 
     // The workflow starts a local activity. Core replies at once and keeps the workflow task open.
@@ -3114,7 +3120,6 @@ async fn local_activity_after_wf_complete_is_discarded(#[case] old_heartbeat_his
         ResponseType::ToTaskNum(1)
     };
     let mut mock_cfg = MockPollCfg::from_resp_batches(wfid, t, [response], mock);
-    mock_cfg.make_poll_stream_interminable = true;
     mock_cfg.completion_asserts_from_expectations(|mut asserts| {
         asserts.then(move |wft| {
             assert_eq!(wft.commands.len(), 2);
@@ -3419,7 +3424,6 @@ async fn local_activity_marker_optionally_includes_arguments(#[case] include_arg
     let arguments: Vec<Payload> = vec![b"first".into(), b"second".into()];
     let expected_arguments = arguments.clone();
     let mut mock_cfg = MockPollCfg::from_hist_builder(history);
-    mock_cfg.make_poll_stream_interminable = true;
     mock_cfg.completion_asserts_from_expectations(|mut asserts| {
         asserts.then(move |wft| {
             assert_eq!(wft.commands.len(), 2);

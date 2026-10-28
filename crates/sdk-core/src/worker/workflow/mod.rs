@@ -100,6 +100,7 @@ use temporalio_common::{
 };
 use tokio::{
     sync::{
+        Notify,
         mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel},
         oneshot,
     },
@@ -107,7 +108,7 @@ use tokio::{
 };
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tokio_util::{either::Either, sync::CancellationToken};
-use tracing::{Span, Subscriber};
+use tracing::{Instrument, Span, Subscriber};
 
 /// Id used by server for "legacy" queries. IE: Queries that come in the `query` rather than
 /// `queries` field of a WFT, and are responded to on the separate `respond_query_task_completed`
@@ -147,6 +148,7 @@ pub(crate) struct Workflows {
     default_versioning_behavior: Option<VersioningBehavior>,
     namespace_capabilities: Arc<NamespaceCapabilities>,
     shutdown_token: CancellationToken,
+    notify_check_shutdown: Arc<Notify>,
 }
 
 pub(crate) struct WorkflowBasics {
@@ -216,63 +218,72 @@ impl Workflows {
         };
         let (activation_tx, activation_rx) = unbounded_channel();
         let (start_polling_tx, start_polling_rx) = oneshot::channel();
+        let notify_check_shutdown = Arc::new(Notify::new());
+        let notify_check_shutdown_clone = notify_check_shutdown.clone();
         // We must spawn a task to constantly poll the activation stream, because otherwise
         // activation completions would not cause anything to happen until the next poll.
+        let calling_thread_span = Span::current();
         let processing_task = thread::Builder::new()
             .name("workflow-processing".to_string())
             .spawn(move || {
                 if let Some(ts) = tracing_sub {
                     set_trace_subscriber_for_current_thread(ts);
                 }
+                let _span_guard = calling_thread_span.enter();
                 let rt = tokio::runtime::Builder::new_current_thread()
                     .enable_all()
                     .build()
                     .unwrap();
                 let local = LocalSet::new();
-                local.block_on(&rt, async move {
-                    // However, we want to avoid plowing ahead until we've been asked to poll at
-                    // least once. This supports activity-only workers.
-                    let do_poll = tokio::select! {
-                        sp = start_polling_rx => {
-                            sp.is_ok()
+                local.block_on(
+                    &rt,
+                    async move {
+                        // However, we want to avoid plowing ahead until we've been asked to poll at
+                        // least once. This supports activity-only workers.
+                        let do_poll = tokio::select! {
+                            sp = start_polling_rx => {
+                                sp.is_ok()
+                            }
+                            _ = shutdown_tok.cancelled() => {
+                                false
+                            }
+                        };
+                        if !do_poll {
+                            return;
                         }
-                        _ = shutdown_tok.cancelled() => {
-                            false
-                        }
-                    };
-                    if !do_poll {
-                        return;
-                    }
 
-                    let mut stream = WFStream::build(
-                        basics,
-                        extracted_wft_stream,
-                        locals_stream,
-                        local_activity_request_sink,
-                    );
+                        let mut stream = WFStream::build(
+                            basics,
+                            extracted_wft_stream,
+                            locals_stream,
+                            local_activity_request_sink,
+                            notify_check_shutdown_clone,
+                        );
 
-                    while let Some(output) = stream.next().await {
-                        match output {
-                            Ok(o) => {
-                                for fetchreq in o.fetch_histories {
-                                    fetch_tx
-                                        .send(fetchreq)
-                                        .expect("Fetch channel must not be dropped");
+                        while let Some(output) = stream.next().await {
+                            match output {
+                                Ok(o) => {
+                                    for fetchreq in o.fetch_histories {
+                                        fetch_tx
+                                            .send(fetchreq)
+                                            .expect("Fetch channel must not be dropped");
+                                    }
+                                    for action in o.actions {
+                                        activation_tx
+                                            .send(Ok(action))
+                                            .expect("Activation processor channel not dropped");
+                                    }
                                 }
-                                for action in o.actions {
-                                    activation_tx
-                                        .send(Ok(action))
-                                        .expect("Activation processor channel not dropped");
+                                Err(e) => {
+                                    let _ = activation_tx.send(Err(e)).inspect_err(|e| {
+                                        error!(activation=?e.0, "Activation processor channel dropped");
+                                    });
                                 }
                             }
-                            Err(e) => {
-                                let _ = activation_tx.send(Err(e)).inspect_err(|e| {
-                                    error!(activation=?e.0, "Activation processor channel dropped");
-                                });
-                            }
                         }
                     }
-                });
+                    .in_current_span(),
+                );
             })
             .expect("Must be able to spawn workflow processing thread");
         Self {
@@ -293,6 +304,7 @@ impl Workflows {
             default_versioning_behavior,
             namespace_capabilities,
             shutdown_token,
+            notify_check_shutdown,
         }
     }
 
@@ -715,10 +727,10 @@ impl Workflows {
         rx
     }
 
-    /// Send a `BumpStream` message to the workflow stream. This ensures that any pending
-    /// workflow activation polls will resolve, like during shutdown, even if there are no other inputs.
+    /// Populates the workflow stream with no-op message. This ensures that any pending workflow
+    /// activation polls will resolve, like during shutdown, even if there are no other inputs.
     pub(super) fn bump_stream(&self) {
-        self.send_local(LocalInputs::BumpStream);
+        self.notify_check_shutdown.notify_one();
     }
 
     /// Query the state of workflow management. Can return `None` if workflow state is shut down.
@@ -806,7 +818,7 @@ impl Workflows {
     fn send_local(&self, msg: impl Into<LocalInputs>) -> bool {
         let msg = msg.into();
         let print_err = match &msg {
-            LocalInputs::GetStateInfo(_) | LocalInputs::BumpStream => false,
+            LocalInputs::GetStateInfo(_) => false,
             LocalInputs::LocalResolution(lr) if lr.res.is_la_cancel_confirmation() => false,
             _ => true,
         };
@@ -981,6 +993,16 @@ enum WorkflowStreamAction {
     },
 }
 
+impl WorkflowStreamAction {
+    /// Returns true if the only job in the activation is eviction
+    pub(crate) fn is_only_eviction(&self) -> bool {
+        match self {
+            Self::Activation(a) => a.is_only_eviction(),
+            _ => false,
+        }
+    }
+}
+
 #[derive(Debug, derive_more::Display)]
 enum ActivationOrAuto {
     LangActivation(WorkflowActivation),
@@ -996,6 +1018,16 @@ enum ActivationOrAuto {
         run_id: String,
         machines_err: WFMachinesError,
     },
+}
+
+impl ActivationOrAuto {
+    /// Returns true if the only job in the activation is eviction
+    pub(crate) fn is_only_eviction(&self) -> bool {
+        match self {
+            Self::LangActivation(a) => a.is_only_eviction(),
+            _ => false,
+        }
+    }
 }
 
 /// A WFT which is considered to be using a slot for metrics purposes and being or about to be
