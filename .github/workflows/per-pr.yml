@@ -81,16 +81,16 @@ jobs:
           test_executable=$(cargo build --tests --features experimental --message-format json | jq -r 'select(.profile?.test == true and .target?.name == "temporalio_sdk_core" and .executable) | .executable')
           cp $test_executable ./core-tests
       - name: Upload cgroup test executable
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         if: runner.os == 'Linux' && runner.arch == 'X64'
         with:
           name: cgroup-tests-linux-x86_64
           path: ./core-tests
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: coverage-report
           path: tarpaulin-report.html
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: state-machine-coverage
           path: machine_coverage/
@@ -250,7 +250,7 @@ jobs:
         run: echo "::warning title=Cloud namespace cleanup failed::Failed to delete Cloud namespace ${{ steps.create-cloud-namespace.outputs.namespace }}"
       - name: Upload Cloud test output
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: cloud-integration-tests-output
           path: cloud-integration.log
