@@ -38,7 +38,10 @@ relevant information.
   into their workflow's session, while normal activity routing remains the default. This increment
   supports fixed-size activity slots with capacity of at least two; resource-based and custom
   activity suppliers are not supported yet. Activity session options without a placement use normal
-  task-queue routing. Session workers advertise session support on their sticky polls.
+  task-queue routing. Session workers advertise session support on their sticky polls. A workflow
+  task that schedules a session activity fails on a worker without session support, including
+  during replay, so replay workers must be configured with session options to replay such
+  workflows.
 
 ### Security
 * Ephemeral server downloads now use `zip` 9.0 for ZIP extraction, replacing the 8.x dependency

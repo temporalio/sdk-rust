@@ -1416,7 +1416,7 @@ impl WorkflowMachines {
                     );
                 }
                 WFCommandVariant::AddActivity(mut attrs) => {
-                    prepare_session_activity(&mut attrs, &self.worker_config, self.replaying)?;
+                    prepare_session_activity(&mut attrs, &self.worker_config)?;
                     let seq = attrs.seq;
                     let use_compat = self.determine_use_compatible_flag(
                         attrs.versioning_intent(),
@@ -1899,11 +1899,7 @@ fn patch_marker_handling(
     }
 }
 
-fn prepare_session_activity(
-    attrs: &mut ScheduleActivity,
-    worker: &WorkerConfig,
-    replaying: bool,
-) -> Result<()> {
+fn prepare_session_activity(attrs: &mut ScheduleActivity, worker: &WorkerConfig) -> Result<()> {
     // Unset placement means normal task-queue routing.
     let Some(activity_session_options::Placement::WorkflowSession(())) = attrs
         .session_options
@@ -1915,10 +1911,8 @@ fn prepare_session_activity(
     if attrs.task_queue.is_empty() {
         attrs.task_queue.clone_from(&worker.task_queue);
     }
-    // Replay must not depend on this worker's activity execution capabilities.
-    if replaying {
-        return Ok(());
-    }
+    // Checked during replay too: session workflows only run on session workers, since
+    // running elsewhere would drop the affinity their activities expect.
     if worker.session_worker_options.is_none() {
         return Err(fatal!(
             "Activity '{}' (seq {}) requests a workflow session, but session_worker_options is not enabled",
@@ -1944,18 +1938,16 @@ mod session_tests {
     use temporalio_common::protos::temporal::api::session::v1::ActivitySessionOptions;
 
     #[rstest::rstest]
-    #[case(true, true, "", false, true)]
-    #[case(true, true, "other", false, false)]
-    #[case(true, false, "other", false, true)]
-    #[case(false, true, "", false, false)]
-    #[case(false, false, "", false, true)]
-    #[case(false, false, "", true, true)]
-    #[case(false, true, "other", true, true)]
+    #[case(true, true, "", true)]
+    #[case(true, true, "other", false)]
+    #[case(true, false, "other", true)]
+    #[case(false, true, "", false)]
+    #[case(false, true, "other", false)]
+    #[case(false, false, "", true)]
     fn session_activity_validation(
         #[case] enabled: bool,
         #[case] workflow_session: bool,
         #[case] queue: &str,
-        #[case] replaying: bool,
         #[case] valid: bool,
     ) {
         let config = WorkerConfig::builder()
@@ -1980,7 +1972,7 @@ mod session_tests {
             }),
             ..Default::default()
         };
-        let result = prepare_session_activity(&mut attrs, &config, replaying);
+        let result = prepare_session_activity(&mut attrs, &config);
         assert_eq!(result.is_ok(), valid, "{result:?}");
         if valid {
             assert_eq!(
