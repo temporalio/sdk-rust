@@ -2,10 +2,10 @@ use crate::client::{BoxError, S3StorageDriverClient};
 use futures_util::future::{BoxFuture, try_join_all};
 use prost::Message;
 use sha2::{Digest, Sha256};
-use std::{collections::HashSet, sync::Arc};
+use std::{collections::HashSet, num::NonZeroUsize, sync::Arc};
 use temporalio_common::{
     data_converters::{
-        ExternalStorageError, StorageDriver, StorageDriverClaim, StorageDriverLimiter,
+        StorageDriver, StorageDriverClaim, StorageDriverError, StorageDriverLimiter,
         StorageDriverRetrieveContext, StorageDriverStoreContext, StorageDriverTargetInfo,
     },
     protos::temporal::api::common::v1::Payload,
@@ -22,7 +22,7 @@ const SAFE_SPECIAL_CHARACTERS: &[u8] = b"!-_.*'()";
 
 type BucketSelector = dyn Fn(&StorageDriverStoreContext, &Payload) -> String + Send + Sync;
 
-/// Errors raised by [`S3StorageDriver`], returned inside [`ExternalStorageError::Driver`].
+/// Errors raised by [`S3StorageDriver`], returned inside [`StorageDriverError`].
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum S3StorageDriverError {
@@ -107,12 +107,6 @@ pub enum S3StorageDriverError {
     },
 }
 
-impl From<S3StorageDriverError> for ExternalStorageError {
-    fn from(err: S3StorageDriverError) -> Self {
-        ExternalStorageError::Driver(Box::new(err))
-    }
-}
-
 /// Storage driver that stores and retrieves payloads in Amazon S3.
 ///
 /// Payloads are content addressed by a SHA-256 hash of their serialized bytes, so storing the same
@@ -159,17 +153,9 @@ impl S3StorageDriver {
 
     /// Set the maximum serialized payload size, in bytes. Storing a larger payload fails. Defaults
     /// to 50 MiB.
-    pub fn with_max_payload_size(
-        mut self,
-        max_payload_size: usize,
-    ) -> Result<Self, ExternalStorageError> {
-        if max_payload_size == 0 {
-            return Err(ExternalStorageError::InvalidConfiguration(
-                "max payload size must be at least 1".to_owned(),
-            ));
-        }
-        self.max_payload_size = max_payload_size;
-        Ok(self)
+    pub fn with_max_payload_size(mut self, max_payload_size: NonZeroUsize) -> Self {
+        self.max_payload_size = max_payload_size.get();
+        self
     }
 
     fn stored_object(
@@ -210,7 +196,7 @@ impl StorageDriver for S3StorageDriver {
         &self,
         context: &StorageDriverStoreContext,
         payloads: Vec<Payload>,
-    ) -> BoxFuture<'static, Result<Vec<StorageDriverClaim>, ExternalStorageError>> {
+    ) -> BoxFuture<'static, Result<Vec<StorageDriverClaim>, StorageDriverError>> {
         let context_segments = context_key_segments(context.target.as_ref());
         let objects: Result<Vec<_>, _> = payloads
             .into_iter()
@@ -235,7 +221,7 @@ impl StorageDriver for S3StorageDriver {
         &self,
         context: &StorageDriverRetrieveContext,
         claims: Vec<StorageDriverClaim>,
-    ) -> BoxFuture<'static, Result<Vec<Payload>, ExternalStorageError>> {
+    ) -> BoxFuture<'static, Result<Vec<Payload>, StorageDriverError>> {
         let client = self.client.clone();
         let limiter = context.limiter.clone();
         Box::pin(async move {
@@ -280,7 +266,7 @@ async fn upload_if_absent(
     client: &dyn S3StorageDriverClient,
     limiter: &dyn StorageDriverLimiter<Payload>,
     object: StoredObject,
-) -> Result<(), ExternalStorageError> {
+) -> Result<(), StorageDriverError> {
     let _permit = limiter.acquire(&object.payload).await?;
     let StoredObject {
         bucket, key, data, ..
@@ -307,7 +293,7 @@ async fn download(
     client: &dyn S3StorageDriverClient,
     limiter: &dyn StorageDriverLimiter<StorageDriverClaim>,
     claim: &StorageDriverClaim,
-) -> Result<Payload, ExternalStorageError> {
+) -> Result<Payload, StorageDriverError> {
     let bucket = &claim.claim_data[CLAIM_BUCKET];
     let key = &claim.claim_data[CLAIM_KEY];
     let data = {
@@ -333,7 +319,7 @@ async fn download(
         }
         .into());
     }
-    Payload::decode(data.as_slice()).map_err(|err| ExternalStorageError::Driver(Box::new(err)))
+    Ok(Payload::decode(data.as_slice())?)
 }
 
 fn validate_claim(claim: &StorageDriverClaim) -> Result<(), S3StorageDriverError> {
@@ -446,7 +432,7 @@ mod tests {
         fn acquire<'a>(
             &'a self,
             item: &'a Item,
-        ) -> BoxFuture<'a, Result<StorageDriverPermit, ExternalStorageError>> {
+        ) -> BoxFuture<'a, Result<StorageDriverPermit, StorageDriverError>> {
             self.items.lock().unwrap().push(item.clone());
             future::ready(Ok(StorageDriverPermit::new(Box::new(())))).boxed()
         }
@@ -467,7 +453,7 @@ mod tests {
         fn acquire<'a>(
             &'a self,
             _: &'a Item,
-        ) -> BoxFuture<'a, Result<StorageDriverPermit, ExternalStorageError>> {
+        ) -> BoxFuture<'a, Result<StorageDriverPermit, StorageDriverError>> {
             self.0.fetch_add(1, Ordering::SeqCst);
             let permit = StorageDriverPermit::new(Box::new(LivePermit(self.0.clone())));
             future::ready(Ok(permit)).boxed()
@@ -527,7 +513,7 @@ mod tests {
         fn acquire<'a>(
             &'a self,
             _: &'a Payload,
-        ) -> BoxFuture<'a, Result<StorageDriverPermit, ExternalStorageError>> {
+        ) -> BoxFuture<'a, Result<StorageDriverPermit, StorageDriverError>> {
             async move {
                 let permit: OwnedSemaphorePermit = self.0.clone().acquire_owned().await.unwrap();
                 Ok(StorageDriverPermit::new(Box::new(permit)))
@@ -819,11 +805,8 @@ mod tests {
         claims[0].claim_data[CLAIM_KEY].clone()
     }
 
-    fn driver_error(err: ExternalStorageError) -> S3StorageDriverError {
-        match err {
-            ExternalStorageError::Driver(err) => *err.downcast().unwrap(),
-            err => panic!("expected a driver error, got {err}"),
-        }
+    fn driver_error(err: StorageDriverError) -> S3StorageDriverError {
+        err.into_source().downcast().unwrap()
     }
 
     #[test]
@@ -832,16 +815,6 @@ mod tests {
         // SDKs. The literal is deliberate: a test against the constant would pass if it changed.
         let driver = S3StorageDriver::new(Arc::new(FakeS3Client::default()), "b");
         assert_eq!(driver.name(), "aws.s3driver");
-    }
-
-    #[test]
-    fn max_payload_size_of_zero_is_rejected() {
-        let result =
-            S3StorageDriver::new(Arc::new(FakeS3Client::default()), "b").with_max_payload_size(0);
-        assert!(matches!(
-            result,
-            Err(ExternalStorageError::InvalidConfiguration(_))
-        ));
     }
 
     #[tokio::test]
@@ -1122,11 +1095,9 @@ mod tests {
     async fn store_payload_over_max_payload_size_fails_and_at_the_limit_succeeds() {
         let size = payload("one").encode_to_vec().len();
         let at_limit = S3StorageDriver::new(Arc::new(FakeS3Client::default()), "b")
-            .with_max_payload_size(size)
-            .unwrap();
+            .with_max_payload_size(NonZeroUsize::new(size).unwrap());
         let below_limit = S3StorageDriver::new(Arc::new(FakeS3Client::default()), "b")
-            .with_max_payload_size(size - 1)
-            .unwrap();
+            .with_max_payload_size(NonZeroUsize::new(size - 1).unwrap());
 
         at_limit
             .store(&store_context(None), vec![payload("one")])
