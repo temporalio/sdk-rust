@@ -1,5 +1,5 @@
-//! External storage contracts: offloading large payloads to a user-supplied driver, which replaces
-//! them on the wire with a small reference so the payload data never reaches the Temporal server.
+//! External storage contracts: offloading large payloads to a user-supplied driver instead of
+//! sending them inline to the Temporal server. A small reference takes each payload's place.
 //!
 //! This module is private. The contracts are published from [`crate::data_converters`], beside the
 //! [`DataConverter`](crate::data_converters::DataConverter) the configuration hangs off, which is
@@ -17,7 +17,8 @@ use std::{
 
 const DEFAULT_PAYLOAD_SIZE_THRESHOLD: usize = 256 * 1024;
 
-/// Driver-defined reference to an externally stored payload, used to retrieve it later.
+/// What a driver returns for a stored payload, used to retrieve it later. The SDK wraps it in the
+/// reference that replaces the payload on the wire.
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct StorageDriverClaim {
@@ -296,8 +297,8 @@ pub trait StorageDriverSelector: Send + Sync {
     ) -> Option<Arc<dyn StorageDriver>>;
 }
 
-/// Configuration for offloading large payloads to an external storage system, so that their data
-/// never reaches the Temporal server.
+/// Configuration for offloading large payloads to an external storage system instead of sending
+/// them inline to the Temporal server.
 ///
 /// A payload at or above [`Self::payload_size_threshold`] is handed to a [`StorageDriver`] and
 /// replaced on the wire by a small reference to what the driver stored. Workers and clients swap
@@ -317,8 +318,9 @@ pub trait StorageDriverSelector: Send + Sync {
 /// - Drivers are not told which workflow or activity a payload belongs to: the `target` on
 ///   [`StorageDriverStoreContext`] and [`StorageDriverSelectContext`] is always `None`.
 /// - Storage requests are not limited, so every request a message needs runs at once.
-/// - References are not passed through the payload codec, so their claim data is written to history
-///   unencrypted, and a reference that another SDK encoded with a codec is not recognized.
+/// - References are not passed through the payload codec, so the
+///   [`claim_data`](StorageDriverClaim::claim_data) they carry is written to history unencrypted,
+///   and a reference that another SDK encoded with a codec is not recognized.
 /// - Replaying a workflow stores its payloads again.
 #[derive(Clone)]
 pub struct ExternalStorage {
