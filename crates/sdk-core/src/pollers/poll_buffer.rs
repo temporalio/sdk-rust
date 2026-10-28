@@ -774,8 +774,14 @@ impl
     > {
         if let Some(sq) = self.sticky_poller.as_ref() {
             tokio::select! {
-                r = self.normal_poller.poll() => r,
-                r = sq.poll() => r,
+                r = self.normal_poller.poll() => match r {
+                    Some(_) => r,
+                    None => sq.poll().await,
+                },
+                r = sq.poll() => match r {
+                    Some(_) => r,
+                    None => self.normal_poller.poll().await,
+                },
             }
         } else {
             self.normal_poller.poll().await
@@ -923,6 +929,58 @@ mod tests {
     use std::{future::pending, time::Duration};
     use temporalio_common::protos::temporal::api::namespace::v1::namespace_info::Capabilities;
     use tokio::{select, sync::Notify};
+
+    #[rstest]
+    #[case(true)]
+    #[case(false)]
+    #[tokio::test]
+    async fn workflow_poller_drains_both_queues(#[case] normal_closes_first: bool) {
+        fn buffer(
+            rx: UnboundedReceiver<
+                pollers::Result<(
+                    PollWorkflowTaskQueueResponse,
+                    OwnedMeteredSemPermit<WorkflowSlotKind>,
+                )>,
+            >,
+        ) -> PollWorkflowTaskBuffer {
+            LongPollBuffer {
+                buffered_polls: Mutex::new(rx),
+                shutdown: CancellationToken::new(),
+                poller_task: tokio::spawn(async {}),
+                starter: broadcast::channel(1).0,
+                did_start: AtomicBool::new(false),
+            }
+        }
+        let (closed_tx, closed_rx) = unbounded_channel();
+        drop(closed_tx);
+        let (live_tx, live_rx) = unbounded_channel();
+        let (normal, sticky) = if normal_closes_first {
+            (buffer(closed_rx), buffer(live_rx))
+        } else {
+            (buffer(live_rx), buffer(closed_rx))
+        };
+        let poller = WorkflowTaskPoller::new(normal, Some(sticky));
+        let mut poll = Box::pin(poller.poll());
+        assert!(
+            futures_util::poll!(&mut poll).is_pending(),
+            "one closed queue must not discard the other queue's in-flight task"
+        );
+        let permit = fixed_size_permit_dealer(1).acquire_owned().await;
+        live_tx
+            .send(Ok((
+                PollWorkflowTaskQueueResponse {
+                    task_token: vec![1],
+                    ..Default::default()
+                },
+                permit,
+            )))
+            .unwrap();
+        let (task, _) = poll.await.unwrap().unwrap();
+        assert_eq!(task.task_token, vec![1]);
+        drop(live_tx);
+        assert!(poller.poll().await.is_none());
+        poller.shutdown().await;
+    }
 
     #[tokio::test]
     async fn only_polls_once_with_1_poller() {

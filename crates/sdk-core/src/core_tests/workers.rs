@@ -10,11 +10,11 @@ use crate::{
         self, PollerBehavior,
         client::{
             MockWorkerClient,
-            mocks::{DEFAULT_TEST_CAPABILITIES, mock_worker_client},
+            mocks::{DEFAULT_TEST_CAPABILITIES, mock_manual_worker_client, mock_worker_client},
         },
     },
 };
-use futures_util::{stream, stream::StreamExt};
+use futures_util::{FutureExt, stream, stream::StreamExt};
 use std::{
     cell::RefCell,
     collections::HashMap,
@@ -42,6 +42,7 @@ use temporalio_common::{
                 ApplicationFailureInfo, CanceledFailureInfo, Failure, NexusHandlerFailureInfo,
                 TimeoutFailureInfo, failure::FailureInfo,
             },
+            history::v1::History,
             namespace::v1::{NamespaceInfo, namespace_info::Capabilities},
             nexus::{
                 self,
@@ -52,11 +53,11 @@ use temporalio_common::{
                 },
             },
             workflowservice::v1::{
-                DescribeNamespaceResponse, PollActivityTaskQueueResponse,
-                PollNexusTaskQueueResponse, PollWorkflowTaskQueueResponse,
-                RespondActivityTaskCompletedResponse, RespondNexusTaskCompletedResponse,
-                RespondNexusTaskFailedResponse, RespondWorkflowTaskCompletedResponse,
-                ShutdownWorkerResponse,
+                DescribeNamespaceResponse, GetWorkflowExecutionHistoryResponse,
+                PollActivityTaskQueueResponse, PollNexusTaskQueueResponse,
+                PollWorkflowTaskQueueResponse, RespondActivityTaskCompletedResponse,
+                RespondNexusTaskCompletedResponse, RespondNexusTaskFailedResponse,
+                RespondWorkflowTaskCompletedResponse, ShutdownWorkerResponse,
             },
         },
     },
@@ -1387,4 +1388,136 @@ async fn validate_without_auto_enroll_leaves_capabilities_off() {
     assert!(!caps.poller_autoscaling());
 
     worker.drain_pollers_and_shutdown().await;
+}
+
+#[tokio::test]
+async fn shutdown_drains_workflow_task_already_in_flight() {
+    let history = canned_histories::single_timer("1");
+    let mut response = history.get_history_info(1).unwrap().as_poll_wft_response();
+    response.workflow_execution = Some(WorkflowExecution {
+        workflow_id: "shutdown-in-flight".to_string(),
+        run_id: Uuid::new_v4().to_string(),
+    });
+    let response = response.try_into().unwrap();
+    let (send_response, receive_response) = tokio::sync::oneshot::channel();
+    let poll_started = Arc::new(Notify::new());
+    let poll_started_in_stream = poll_started.clone();
+    let responses = stream::once(async move {
+        poll_started_in_stream.notify_one();
+        receive_response.await.unwrap();
+        Ok(response)
+    });
+    let mut client = mock_worker_client();
+    client
+        .expect_complete_workflow_task()
+        .times(1)
+        .returning(|_, _| Ok(RespondWorkflowTaskCompletedResponse::default()));
+    let mut inputs = MockWorkerInputs::new(responses.boxed());
+    inputs.drain_wft_stream = true;
+    let worker = mock_worker(MocksHolder::from_mock_worker(client, inputs));
+    let mut activation = Box::pin(worker.poll_workflow_activation());
+    assert!(futures_util::poll!(&mut activation).is_pending());
+    poll_started.notified().await;
+    worker.initiate_shutdown();
+    // An assigned task may still be in transit when shutdown wakes the stream.
+    assert!(
+        futures_util::poll!(&mut activation).is_pending(),
+        "workflow processing exited before the in-flight poll drained"
+    );
+    send_response.send(()).unwrap();
+    let activation = tokio::time::timeout(Duration::from_secs(2), activation)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_matches!(
+        &activation.jobs[0].variant,
+        Some(workflow_activation_job::Variant::InitializeWorkflow(_))
+    );
+    worker
+        .complete_workflow_activation(WorkflowActivationCompletion::from_cmds(
+            activation.run_id,
+            vec![start_timer_cmd(1, Duration::from_secs(1))],
+        ))
+        .await
+        .unwrap();
+    assert_matches!(
+        worker.poll_workflow_activation().await.unwrap_err(),
+        PollError::ShutDown
+    );
+    worker.finalize_shutdown().await;
+}
+
+#[tokio::test]
+async fn shutdown_drains_in_flight_workflow_history_fetch() {
+    let history = canned_histories::single_timer("1");
+    let mut response = history.get_history_info(1).unwrap().as_poll_wft_response();
+    response.workflow_execution = Some(WorkflowExecution {
+        workflow_id: "shutdown-history-fetch".to_string(),
+        run_id: Uuid::new_v4().to_string(),
+    });
+    let rest = response.history.as_mut().unwrap().events.split_off(1);
+    response.next_page_token = b"next-page".to_vec();
+    let response = response.try_into().unwrap();
+    let fetch_started = Arc::new(Notify::new());
+    let release_fetch = Arc::new(Notify::new());
+    let mut client = mock_manual_worker_client();
+    client
+        .expect_complete_workflow_task()
+        .times(1)
+        .returning(|_, _| async { Ok(RespondWorkflowTaskCompletedResponse::default()) }.boxed());
+    let started = fetch_started.clone();
+    let release = release_fetch.clone();
+    client
+        .expect_get_workflow_execution_history()
+        .times(1)
+        .returning(move |_, _, _| {
+            let started = started.clone();
+            let release = release.clone();
+            let events = rest.clone();
+            async move {
+                started.notify_one();
+                release.notified().await;
+                Ok(GetWorkflowExecutionHistoryResponse {
+                    history: Some(History { events }),
+                    ..Default::default()
+                })
+            }
+            .boxed()
+        });
+    let (finish_polling, polling_finished) = tokio::sync::oneshot::channel::<()>();
+    let responses =
+        stream::iter([Ok(response)]).chain(stream::pending().take_until(polling_finished));
+    let mut inputs = MockWorkerInputs::new(responses.boxed());
+    inputs.drain_wft_stream = true;
+    let worker = mock_worker(MocksHolder::from_mock_worker(client, inputs));
+    let mut activation = Box::pin(worker.poll_workflow_activation());
+    assert!(futures_util::poll!(&mut activation).is_pending());
+    tokio::time::timeout(Duration::from_secs(2), fetch_started.notified())
+        .await
+        .unwrap();
+    worker.initiate_shutdown();
+    finish_polling.send(()).unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), &mut activation)
+            .await
+            .is_err(),
+        "workflow processing exited while an assigned task's history was still loading"
+    );
+    release_fetch.notify_one();
+    let activation = tokio::time::timeout(Duration::from_secs(2), activation)
+        .await
+        .unwrap()
+        .unwrap();
+    worker
+        .complete_workflow_activation(WorkflowActivationCompletion::from_cmds(
+            activation.run_id,
+            vec![start_timer_cmd(1, Duration::from_secs(1))],
+        ))
+        .await
+        .unwrap();
+    assert_matches!(
+        worker.poll_workflow_activation().await.unwrap_err(),
+        PollError::ShutDown
+    );
+    worker.finalize_shutdown().await;
 }
