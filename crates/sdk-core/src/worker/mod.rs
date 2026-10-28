@@ -1538,6 +1538,10 @@ impl Worker {
 
     /// Tell the worker that a nexus task has completed. May (and should) be freely called
     /// concurrently.
+    ///
+    /// This method is not cancellation-safe. Callers must await the returned future to completion:
+    /// dropping it may abandon the completion RPC after Core has stopped tracking the task.
+    /// Core unblocks shutdown in that case, but does not guarantee delivery of the completion.
     #[instrument(
         skip(self, completion),
         fields(task_token, status, task_queue=%self.config.task_queue)

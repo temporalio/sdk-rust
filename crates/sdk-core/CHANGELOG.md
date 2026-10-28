@@ -45,6 +45,7 @@ relevant information.
   nondeterminism while retaining compatibility with histories recorded before these checks.
 
 ### Fixed
+* Nexus worker shutdown no longer hangs when a language SDK abandons an in-flight task completion. Core logs this SDK contract violation and panics when debug assertions are enabled.
 * Preserve queued queries across workflow eviction so requests for the same run are answered instead of silently dropped.
 * Dev and test server startup now stops waiting at the configured deadline even if a readiness
   request stalls. Timeout messages include the last connection failure when available.

@@ -18,6 +18,7 @@ use futures_util::{FutureExt, future, stream, stream::StreamExt};
 use std::{
     cell::RefCell,
     collections::HashMap,
+    panic::{AssertUnwindSafe, catch_unwind},
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -1464,7 +1465,8 @@ async fn nexus_shutdown_does_not_hang_when_pending_completion_is_cancelled() {
             panic!("completion should stay pending, got {result:?}");
         }
     }
-    drop(completion);
+    let drop_result = catch_unwind(AssertUnwindSafe(|| drop(completion)));
+    assert_eq!(drop_result.is_err(), cfg!(debug_assertions));
 
     let logs = telemetry.fetch_buffered_logs();
     assert!(
@@ -1473,9 +1475,9 @@ async fn nexus_shutdown_does_not_hang_when_pending_completion_is_cancelled() {
                 && log.target == "temporalio_sdk_core::worker::nexus"
                 && log
                     .message
-                    .starts_with("TaskCompletedGuard triggered notify on drop")
+                    .starts_with("Nexus task completion future was dropped before completion.")
         }),
-        "expected TaskCompletedGuard error log, got {logs:#?}"
+        "expected dropped Nexus completion error log, got {logs:#?}"
     );
 
     // Polling again should now return PollError::ShutDown because the outstanding task map is empty
@@ -1488,4 +1490,70 @@ async fn nexus_shutdown_does_not_hang_when_pending_completion_is_cancelled() {
 
     worker.shutdown().await;
     worker.finalize_shutdown().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn nexus_shutdown_does_not_hang_when_completion_is_malformed() {
+    let telemetry = telemetry_init(
+        TelemetryOptions::builder()
+            .logging(Logger::Forward {
+                filter: "OFF,temporalio_sdk_core::worker::nexus=ERROR".to_string(),
+            })
+            .build(),
+    )
+    .unwrap();
+    let _guard = tracing::subscriber::set_default(telemetry.trace_subscriber().unwrap().clone());
+
+    for status in [
+        nexus_task_completion::Status::Completed(NexusResponse::default()),
+        nexus_task_completion::Status::Failure(Failure::default()),
+    ] {
+        let mut mocks = MocksHolder::from_client_with_custom(
+            mock_manual_worker_client(),
+            None::<stream::Empty<PollWorkflowTaskQueueResponse>>,
+            None::<Vec<QueueResponse<PollActivityTaskQueueResponse>>>,
+            Some(vec![QueueResponse::from(create_test_nexus_task(
+                None, None,
+            ))]),
+        );
+        mocks.worker_cfg(|w| {
+            w.task_types = WorkerTaskTypes {
+                enable_workflows: false,
+                enable_local_activities: false,
+                enable_remote_activities: false,
+                enable_nexus: true,
+            };
+            w.skip_client_worker_set_check = true;
+        });
+        let worker = mock_worker(mocks);
+        let nexus_task = worker.poll_nexus_task().await.unwrap();
+        worker.initiate_shutdown();
+
+        let mut poll_future = Box::pin(worker.poll_nexus_task());
+        assert!(poll_future.as_mut().now_or_never().is_none());
+
+        let result = worker
+            .complete_nexus_task(NexusTaskCompletion {
+                task_token: nexus_task.task_token().to_vec(),
+                status: Some(status),
+            })
+            .await;
+        assert_matches!(
+            result,
+            Err(CompleteNexusError::MalformedNexusCompletion { .. })
+        );
+        let logs = telemetry.fetch_buffered_logs();
+        assert!(
+            logs.is_empty(),
+            "unexpected cancellation diagnostic: {logs:#?}"
+        );
+
+        let poll_result = tokio::time::timeout(Duration::from_secs(1), poll_future.as_mut())
+            .await
+            .expect("a rejected completion must still unblock shutdown");
+        assert_matches!(poll_result, Err(PollError::ShutDown));
+        drop(poll_future);
+        worker.shutdown().await;
+        worker.finalize_shutdown().await;
+    }
 }

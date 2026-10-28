@@ -1,0 +1,1 @@
+Prevent Nexus worker shutdown from hanging if a task completion future is dropped or its response is rejected as malformed. Dropping an in-flight completion logs an error and panics when debug assertions are enabled; callers must still await completion to preserve RPC delivery.
