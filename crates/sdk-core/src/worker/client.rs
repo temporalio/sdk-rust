@@ -42,7 +42,9 @@ use temporalio_common::protos::{
         protocol::v1::Message as ProtocolMessage,
         query::v1::WorkflowQueryResult,
         sdk::v1::WorkflowTaskCompletedMetadata,
-        taskqueue::v1::{StickyExecutionAttributes, TaskQueue, TaskQueueMetadata},
+        taskqueue::v1::{
+            PollerScalingInfo, StickyExecutionAttributes, TaskQueue, TaskQueueMetadata,
+        },
         worker::v1::{WorkerHeartbeat, WorkerSlotsInfo},
         workflowservice::v1::{get_system_info_response::Capabilities, *},
     },
@@ -441,6 +443,11 @@ pub struct PollOptions {
     pub no_retry: Option<NoRetryOnMatching>,
     /// Overrides the default RPC timeout for the poll request
     pub timeout_override: Option<Duration>,
+    /// The poller pool's current scaling target, reported to the server so it can spread
+    /// poller-scaling suggestions across a fleet by share rather than letting them land on
+    /// whichever worker happens to receive the most tasks. `None` for a fixed-size pool,
+    /// which has no target to balance; the server then leaves this worker out of fairness.
+    pub poller_target: Option<i32>,
 }
 /// Additional options specific to workflow task polling
 #[derive(Debug, Clone)]
@@ -493,6 +500,9 @@ impl WorkerClient for WorkerClientBag {
             worker_instance_key: self.worker_instance_key.to_string(),
             worker_control_task_queue: self.worker_control_task_queue(),
             poller_group_id: Default::default(),
+            poller_scaling_info: poll_options
+                .poller_target
+                .map(|poller_target| PollerScalingInfo { poller_target }),
         }
         .into_request();
         request.extensions_mut().insert(IsWorkerTaskLongPoll);
@@ -533,6 +543,9 @@ impl WorkerClient for WorkerClientBag {
             worker_instance_key: self.worker_instance_key.to_string(),
             worker_control_task_queue: self.worker_control_task_queue(),
             poller_group_id: Default::default(),
+            poller_scaling_info: poll_options
+                .poller_target
+                .map(|poller_target| PollerScalingInfo { poller_target }),
         }
         .into_request();
         request.extensions_mut().insert(IsWorkerTaskLongPoll);
@@ -1380,6 +1393,7 @@ mod tests {
                         task_queue: "application-queue".to_string(),
                         no_retry: None,
                         timeout_override: None,
+                        poller_target: None,
                     },
                     PollNexusOptions {
                         worker_commands_queue: false,
@@ -1393,6 +1407,7 @@ mod tests {
                         task_queue: "worker-command-queue".to_string(),
                         no_retry: None,
                         timeout_override: None,
+                        poller_target: None,
                     },
                     PollNexusOptions {
                         worker_commands_queue: true,
