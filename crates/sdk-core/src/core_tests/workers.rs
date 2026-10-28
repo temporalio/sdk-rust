@@ -1448,45 +1448,48 @@ async fn nexus_shutdown_does_not_hang_when_pending_completion_is_cancelled() {
     worker.initiate_shutdown();
 
     // Poll the stream again and expect it to wait for the task to complete
-    let mut poll_future = Box::pin(worker.poll_nexus_task());
-    tokio::time::timeout(Duration::from_millis(50), poll_future.as_mut())
-        .await
-        .expect_err("poll should wait for the outstanding Nexus task");
+    {
+        let poll_future = worker.poll_nexus_task();
+        tokio::pin!(poll_future);
+        tokio::time::timeout(Duration::from_millis(50), poll_future.as_mut())
+            .await
+            .expect_err("poll should wait for the outstanding Nexus task");
 
-    // Send completion that we know will hang indefinitely before notifying waiters
-    let mut completion =
-        Box::pin(worker.complete_nexus_task(create_test_nexus_completion(nexus_task.task_token())));
+        // Send completion that we know will hang indefinitely before notifying waiters
+        let mut completion = Box::pin(
+            worker.complete_nexus_task(create_test_nexus_completion(nexus_task.task_token())),
+        );
 
-    // Wait for the completion to start then drop it before notify_waiters is triggered
-    // Use select so the completion future is polled and completion actually starts
-    tokio::select! {
-        _ = completion_rpc_started.wait() => {}
-        result = completion.as_mut() => {
-            panic!("completion should stay pending, got {result:?}");
+        // Wait for the completion to start then drop it before notify_waiters is triggered
+        // Use select so the completion future is polled and completion actually starts
+        tokio::select! {
+            _ = completion_rpc_started.wait() => {}
+            result = completion.as_mut() => {
+                panic!("completion should stay pending, got {result:?}");
+            }
         }
+        let drop_result = catch_unwind(AssertUnwindSafe(|| drop(completion)));
+        assert_eq!(drop_result.is_err(), cfg!(debug_assertions));
+
+        let logs = telemetry.fetch_buffered_logs();
+        assert!(
+            logs.iter().any(|log| {
+                log.level == tracing::Level::ERROR
+                    && log.target == "temporalio_sdk_core::worker::nexus"
+                    && log
+                        .message
+                        .starts_with("Nexus task completion future was dropped before completion.")
+            }),
+            "expected dropped Nexus completion error log, got {logs:#?}"
+        );
+
+        // Polling again should now return PollError::ShutDown because the outstanding task map is empty
+        // and waiters should have been notified.
+        let poll_result = tokio::time::timeout(Duration::from_secs(1), poll_future.as_mut())
+            .await
+            .expect("shutdown poll should finish when a pending completion future is cancelled");
+        assert_matches!(poll_result, Err(PollError::ShutDown));
     }
-    let drop_result = catch_unwind(AssertUnwindSafe(|| drop(completion)));
-    assert_eq!(drop_result.is_err(), cfg!(debug_assertions));
-
-    let logs = telemetry.fetch_buffered_logs();
-    assert!(
-        logs.iter().any(|log| {
-            log.level == tracing::Level::ERROR
-                && log.target == "temporalio_sdk_core::worker::nexus"
-                && log
-                    .message
-                    .starts_with("Nexus task completion future was dropped before completion.")
-        }),
-        "expected dropped Nexus completion error log, got {logs:#?}"
-    );
-
-    // Polling again should now return PollError::ShutDown because the outstanding task map is empty
-    // and waiters should have been notified.
-    let poll_result = tokio::time::timeout(Duration::from_secs(1), poll_future.as_mut())
-        .await
-        .expect("shutdown poll should finish when a pending completion future is cancelled");
-    assert_matches!(poll_result, Err(PollError::ShutDown));
-    drop(poll_future);
 
     worker.shutdown().await;
     worker.finalize_shutdown().await;
@@ -1529,30 +1532,32 @@ async fn nexus_shutdown_does_not_hang_when_completion_is_malformed() {
         let nexus_task = worker.poll_nexus_task().await.unwrap();
         worker.initiate_shutdown();
 
-        let mut poll_future = Box::pin(worker.poll_nexus_task());
-        assert!(poll_future.as_mut().now_or_never().is_none());
+        {
+            let poll_future = worker.poll_nexus_task();
+            tokio::pin!(poll_future);
+            assert!(poll_future.as_mut().now_or_never().is_none());
 
-        let result = worker
-            .complete_nexus_task(NexusTaskCompletion {
-                task_token: nexus_task.task_token().to_vec(),
-                status: Some(status),
-            })
-            .await;
-        assert_matches!(
-            result,
-            Err(CompleteNexusError::MalformedNexusCompletion { .. })
-        );
-        let logs = telemetry.fetch_buffered_logs();
-        assert!(
-            logs.is_empty(),
-            "unexpected cancellation diagnostic: {logs:#?}"
-        );
+            let result = worker
+                .complete_nexus_task(NexusTaskCompletion {
+                    task_token: nexus_task.task_token().to_vec(),
+                    status: Some(status),
+                })
+                .await;
+            assert_matches!(
+                result,
+                Err(CompleteNexusError::MalformedNexusCompletion { .. })
+            );
+            let logs = telemetry.fetch_buffered_logs();
+            assert!(
+                logs.is_empty(),
+                "unexpected cancellation diagnostic: {logs:#?}"
+            );
 
-        let poll_result = tokio::time::timeout(Duration::from_secs(1), poll_future.as_mut())
-            .await
-            .expect("a rejected completion must still unblock shutdown");
-        assert_matches!(poll_result, Err(PollError::ShutDown));
-        drop(poll_future);
+            let poll_result = tokio::time::timeout(Duration::from_secs(1), poll_future.as_mut())
+                .await
+                .expect("a rejected completion must still unblock shutdown");
+            assert_matches!(poll_result, Err(PollError::ShutDown));
+        }
         worker.shutdown().await;
         worker.finalize_shutdown().await;
     }
