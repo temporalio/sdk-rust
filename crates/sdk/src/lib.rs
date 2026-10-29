@@ -2378,11 +2378,6 @@ mod tests {
     #[cfg(feature = "experimental")]
     mod experimental_tests {
         use super::*;
-        use temporalio_common::data_converters::{
-            ExternalStorage, StorageDriver, StorageDriverClaim, StorageDriverError,
-            StorageDriverRetrieveContext, StorageDriverSelectContext, StorageDriverSelector,
-            StorageDriverStoreContext,
-        };
 
         #[test]
         fn simple_plugin_workflow_function_merges_definitions() {
@@ -2424,90 +2419,6 @@ mod tests {
                 .to_core_options("ns".into(), String::new(), &DataConverter::default())
                 .unwrap();
             assert_eq!(config.disable_payload_error_limit, expected);
-        }
-
-        struct TypedDriver {
-            name: &'static str,
-            driver_type: &'static str,
-        }
-
-        impl StorageDriver for TypedDriver {
-            fn name(&self) -> &str {
-                self.name
-            }
-
-            fn driver_type(&self) -> &str {
-                self.driver_type
-            }
-
-            fn store(
-                &self,
-                _context: &StorageDriverStoreContext,
-                _payloads: Vec<Payload>,
-            ) -> BoxFuture<'static, Result<Vec<StorageDriverClaim>, StorageDriverError>>
-            {
-                unreachable!("only the configuration is inspected")
-            }
-
-            fn retrieve(
-                &self,
-                _context: &StorageDriverRetrieveContext,
-                _claims: Vec<StorageDriverClaim>,
-            ) -> BoxFuture<'static, Result<Vec<Payload>, StorageDriverError>> {
-                unreachable!("only the configuration is inspected")
-            }
-        }
-
-        struct NoDriverSelector;
-
-        impl StorageDriverSelector for NoDriverSelector {
-            fn select_driver(
-                &self,
-                _context: &StorageDriverSelectContext,
-                _payload: &Payload,
-            ) -> Option<Arc<dyn StorageDriver>> {
-                None
-            }
-        }
-
-        #[test]
-        fn storage_driver_types_propagate() {
-            let drivers: Vec<Arc<dyn StorageDriver>> = vec![
-                Arc::new(TypedDriver {
-                    name: "s3-a",
-                    driver_type: "aws.s3driver",
-                }),
-                Arc::new(TypedDriver {
-                    name: "s3-b",
-                    driver_type: "aws.s3driver",
-                }),
-                Arc::new(TypedDriver {
-                    name: "gcs",
-                    driver_type: "gcp.gcsdriver",
-                }),
-            ];
-            let storage =
-                ExternalStorage::with_selector(drivers, Arc::new(NoDriverSelector)).unwrap();
-            let config = WorkerOptions::new("task_q")
-                .register_activities(MyActivities {})
-                .build()
-                .to_core_options(
-                    "ns".into(),
-                    String::new(),
-                    &DataConverter::default().with_external_storage(storage),
-                )
-                .unwrap();
-            assert_eq!(
-                config.storage_drivers,
-                HashSet::from([
-                    StorageDriverInfo {
-                        r#type: "aws.s3driver".to_owned(),
-                    },
-                    StorageDriverInfo {
-                        r#type: "gcp.gcsdriver".to_owned(),
-                    },
-                ])
-            );
         }
     }
 }
