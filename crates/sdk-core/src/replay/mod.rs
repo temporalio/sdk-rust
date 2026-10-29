@@ -164,10 +164,12 @@ mod tests {
     };
 
     #[rstest::rstest]
-    #[case::session_worker(true)]
-    #[case::non_session_worker(false)]
+    #[case::non_session_worker(None)]
+    #[case::shared_session_worker(Some(false))]
+    #[case::single_session_worker(Some(true))]
     #[tokio::test]
-    async fn replay_session_activity_requires_session_worker(#[case] session_worker: bool) {
+    async fn replay_session_activity_requires_session_worker(#[case] single_session: Option<bool>) {
+        let session_worker = single_session.is_some();
         let mut history = canned_histories::single_activity("activity");
         history.add_workflow_task_completed();
         history.add_workflow_execution_completed();
@@ -183,7 +185,15 @@ mod tests {
             })
             .task_types(WorkerTaskTypes::all())
             .max_cached_workflows(2_usize)
-            .maybe_session_worker_options(session_worker.then(crate::SessionWorkerOptions::default))
+            .maybe_session_worker_options(single_session.map(|single| {
+                crate::WorkerSessionOptions::builder()
+                    .maybe_single_session(single.then(|| {
+                        crate::SingleSessionOptions::builder()
+                            .stable_identity("replay-session".to_owned())
+                            .build()
+                    }))
+                    .build()
+            }))
             .build()
             .unwrap();
         let mut input = ReplayWorkerInput::new(config, stream::iter([history.into()]));

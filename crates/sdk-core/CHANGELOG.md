@@ -42,6 +42,10 @@ relevant information.
   task that schedules a session activity fails on a worker without session support, including
   during replay, so replay workers must be configured with session options to replay such
   workflows.
+  task-queue routing. Session workers advertise session support on their sticky polls.
+* Experimental worker session options support single-session admission: with a required stable
+  identity, the worker polls only its sticky destination and serves exactly one session for its
+  lifetime with a supporting server. Sticky-only mode may use one fixed activity slot.
 
 ### Security
 * Ephemeral server downloads now use `zip` 9.0 for ZIP extraction, replacing the 8.x dependency
