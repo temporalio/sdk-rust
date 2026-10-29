@@ -4,6 +4,7 @@ members = [
     "crates/client",
     "crates/common",
     "crates/common-wasm",
+    "crates/aws-s3driver",
     "crates/protos",
     "crates/macros",
     "crates/sdk",
