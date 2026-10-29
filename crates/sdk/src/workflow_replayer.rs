@@ -428,7 +428,11 @@ impl WorkflowReplayer {
         let worker_options = self.replay_worker_options(observer);
 
         let core_options = worker_options
-            .to_core_options(self.options.namespace.clone(), String::new())
+            .to_core_options(
+                self.options.namespace.clone(),
+                String::new(),
+                &self.options.data_converter,
+            )
             .map_err(|message| WorkflowReplayWorkerError::Initialization { message })?;
         let core_worker = init_replay_worker(ReplayWorkerInput::new(
             core_options,

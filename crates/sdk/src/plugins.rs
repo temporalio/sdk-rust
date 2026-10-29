@@ -671,7 +671,11 @@ mod tests {
             }]
         );
         let core_options = worker_options
-            .to_core_options("namespace".to_owned(), "identity".to_owned())
+            .to_core_options(
+                "namespace".to_owned(),
+                "identity".to_owned(),
+                &DataConverter::default(),
+            )
             .unwrap();
 
         let expected_plugins: HashSet<_> = vec![

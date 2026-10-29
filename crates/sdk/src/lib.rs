@@ -144,7 +144,7 @@ use std::{
 };
 use temporalio_client::{Client, ClientOptions, NamespacedClient};
 #[cfg(feature = "experimental")]
-use temporalio_common::protos::temporal::api::worker::v1::PluginInfo;
+use temporalio_common::protos::temporal::api::worker::v1::{PluginInfo, StorageDriverInfo};
 use temporalio_common::{
     ActivityDefinition, WorkflowDefinition,
     data_converters::{
@@ -667,6 +667,7 @@ impl WorkerOptions {
         &self,
         namespace: String,
         connection_identity: String,
+        data_converter: &DataConverter,
     ) -> Result<WorkerConfig, String> {
         let workflows_registered = !self.workflows.is_empty();
         #[cfg(feature = "wasm-workflows")]
@@ -695,6 +696,20 @@ impl WorkerOptions {
             .collect();
         #[cfg(not(feature = "experimental"))]
         let plugin_info = HashSet::new();
+        #[cfg(feature = "experimental")]
+        let storage_drivers = data_converter
+            .external_storage()
+            .into_iter()
+            .flat_map(|external_storage| external_storage.drivers())
+            .map(|driver| StorageDriverInfo {
+                r#type: driver.driver_type().to_owned(),
+            })
+            .collect();
+        #[cfg(not(feature = "experimental"))]
+        let storage_drivers = {
+            let _ = data_converter;
+            HashSet::new()
+        };
 
         let tuner = self.tuner.to_core()?;
 
@@ -765,6 +780,7 @@ impl WorkerOptions {
                     .collect(),
             )
             .plugins(plugin_info)
+            .storage_drivers(storage_drivers)
             .disable_payload_error_limit(disable_payload_error_limit)
             .build()
     }
@@ -927,7 +943,11 @@ impl Worker {
         #[cfg(feature = "experimental")]
         plugins::apply_worker_plugins(client.options(), &mut options)?;
         let wc = options
-            .to_core_options(client.namespace(), client.identity())
+            .to_core_options(
+                client.namespace(),
+                client.identity(),
+                &client.options().data_converter,
+            )
             .map_err(|error| WorkerCreateError::Initialization(anyhow!(error)))?;
         let core = init_worker(runtime.core(), wc, client.connection().clone())
             .map_err(WorkerCreateError::Initialization)?;
@@ -1771,7 +1791,11 @@ mod tests {
             .build();
         options.worker_interceptors.push(observer);
         let core_options = options
-            .to_core_options("test_namespace".to_owned(), String::new())
+            .to_core_options(
+                "test_namespace".to_owned(),
+                String::new(),
+                &DataConverter::default(),
+            )
             .unwrap();
         let core = init_replay_worker(ReplayWorkerInput::new(core_options, histories)).unwrap();
         Worker::new_from_core_options_prepared(
@@ -2240,7 +2264,7 @@ mod tests {
 
         let actual = options
             .build()
-            .to_core_options("ns".into(), String::new())
+            .to_core_options("ns".into(), String::new(), &DataConverter::default())
             .map(|config| config.task_types);
         assert_eq!(
             actual.as_ref().map_err(String::as_str),
@@ -2331,7 +2355,11 @@ mod tests {
             .maybe_client_identity_override(worker_override.map(|s| s.to_owned()))
             .build();
         let config = opts
-            .to_core_options("ns".into(), connection_identity.into())
+            .to_core_options(
+                "ns".into(),
+                connection_identity.into(),
+                &DataConverter::default(),
+            )
             .unwrap();
         assert_eq!(config.client_identity_override, expected);
     }
@@ -2342,7 +2370,7 @@ mod tests {
             .register_activities(MyActivities {})
             .max_eager_activity_reservations_per_workflow_task(7)
             .build()
-            .to_core_options("ns".into(), String::new())
+            .to_core_options("ns".into(), String::new(), &DataConverter::default())
             .unwrap();
         assert_eq!(config.max_eager_activity_reservations_per_workflow_task, 7);
     }
@@ -2350,6 +2378,11 @@ mod tests {
     #[cfg(feature = "experimental")]
     mod experimental_tests {
         use super::*;
+        use temporalio_common::data_converters::{
+            ExternalStorage, StorageDriver, StorageDriverClaim, StorageDriverError,
+            StorageDriverRetrieveContext, StorageDriverSelectContext, StorageDriverSelector,
+            StorageDriverStoreContext,
+        };
 
         #[test]
         fn simple_plugin_workflow_function_merges_definitions() {
@@ -2388,9 +2421,93 @@ mod tests {
                 .register_activities(MyActivities {})
                 .maybe_disable_payload_error_limit(override_value)
                 .build()
-                .to_core_options("ns".into(), String::new())
+                .to_core_options("ns".into(), String::new(), &DataConverter::default())
                 .unwrap();
             assert_eq!(config.disable_payload_error_limit, expected);
+        }
+
+        struct TypedDriver {
+            name: &'static str,
+            driver_type: &'static str,
+        }
+
+        impl StorageDriver for TypedDriver {
+            fn name(&self) -> &str {
+                self.name
+            }
+
+            fn driver_type(&self) -> &str {
+                self.driver_type
+            }
+
+            fn store(
+                &self,
+                _context: &StorageDriverStoreContext,
+                _payloads: Vec<Payload>,
+            ) -> BoxFuture<'static, Result<Vec<StorageDriverClaim>, StorageDriverError>>
+            {
+                unreachable!("only the configuration is inspected")
+            }
+
+            fn retrieve(
+                &self,
+                _context: &StorageDriverRetrieveContext,
+                _claims: Vec<StorageDriverClaim>,
+            ) -> BoxFuture<'static, Result<Vec<Payload>, StorageDriverError>> {
+                unreachable!("only the configuration is inspected")
+            }
+        }
+
+        struct NoDriverSelector;
+
+        impl StorageDriverSelector for NoDriverSelector {
+            fn select_driver(
+                &self,
+                _context: &StorageDriverSelectContext,
+                _payload: &Payload,
+            ) -> Option<Arc<dyn StorageDriver>> {
+                None
+            }
+        }
+
+        #[test]
+        fn storage_driver_types_propagate() {
+            let drivers: Vec<Arc<dyn StorageDriver>> = vec![
+                Arc::new(TypedDriver {
+                    name: "s3-a",
+                    driver_type: "aws.s3driver",
+                }),
+                Arc::new(TypedDriver {
+                    name: "s3-b",
+                    driver_type: "aws.s3driver",
+                }),
+                Arc::new(TypedDriver {
+                    name: "gcs",
+                    driver_type: "gcp.gcsdriver",
+                }),
+            ];
+            let storage =
+                ExternalStorage::with_selector(drivers, Arc::new(NoDriverSelector)).unwrap();
+            let config = WorkerOptions::new("task_q")
+                .register_activities(MyActivities {})
+                .build()
+                .to_core_options(
+                    "ns".into(),
+                    String::new(),
+                    &DataConverter::default().with_external_storage(storage),
+                )
+                .unwrap();
+            assert_eq!(
+                config.storage_drivers,
+                HashSet::from([
+                    StorageDriverInfo {
+                        r#type: "aws.s3driver".to_owned(),
+                    },
+                    StorageDriverInfo {
+                        r#type: "gcp.gcsdriver".to_owned(),
+                    },
+                ])
+            );
         }
     }
 }

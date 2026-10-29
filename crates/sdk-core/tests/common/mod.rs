@@ -674,7 +674,11 @@ impl CoreWfStarter {
                         .expect("placeholder workflow registers");
                 }
                 let mut core_config = sdk_config
-                    .to_core_options(client.namespace(), client.identity())
+                    .to_core_options(
+                        client.namespace(),
+                        client.identity(),
+                        &client.options().data_converter,
+                    )
                     .expect("sdk config converts to core config");
                 if let Some(task_types) = self.core_task_types {
                     core_config.task_types = task_types;

@@ -1,9 +1,10 @@
 use crate::common::{
-    ANY_PORT, CoreWfStarter, activity_functions::StdActivities, eventually,
-    get_integ_server_options, get_integ_telem_options,
+    ANY_PORT, CoreWfStarter, activity_functions::StdActivities, eventually, get_integ_connection,
+    get_integ_server_options, get_integ_telem_options, integ_namespace,
 };
 use anyhow::anyhow;
 use crossbeam_utils::atomic::AtomicCell;
+use futures::future::{self, BoxFuture};
 use prost_types::{Duration as PbDuration, Timestamp};
 use std::{
     collections::HashSet,
@@ -15,14 +16,19 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use temporalio_client::{
-    Client, NamespacedClient, WorkflowExecutionInfo, WorkflowSignalOptions, WorkflowStartOptions,
-    grpc::WorkflowService,
+    Client, ClientOptions, NamespacedClient, WorkflowExecutionInfo, WorkflowSignalOptions,
+    WorkflowStartOptions, grpc::WorkflowService,
 };
 use temporalio_common::{
+    data_converters::{
+        DataConverter, ExternalStorage, StorageDriver, StorageDriverClaim, StorageDriverError,
+        StorageDriverRetrieveContext, StorageDriverSelectContext, StorageDriverSelector,
+        StorageDriverStoreContext,
+    },
     protos::{
         coresdk::AsJsonPayloadExt,
         temporal::api::{
-            common::v1::RetryPolicy,
+            common::v1::{Payload, RetryPolicy},
             enums::v1::WorkerStatus,
             worker::v1::{
                 PluginInfo, StorageDriverInfo, WorkerHeartbeat,
@@ -1340,5 +1346,136 @@ async fn worker_heartbeat_skip_client_worker_set_check() {
             .unwrap()
             .environment
             .is_none()
+    );
+}
+
+struct HeartbeatDriver {
+    name: &'static str,
+    driver_type: &'static str,
+}
+
+impl StorageDriver for HeartbeatDriver {
+    fn name(&self) -> &str {
+        self.name
+    }
+
+    fn driver_type(&self) -> &str {
+        self.driver_type
+    }
+
+    fn store(
+        &self,
+        _context: &StorageDriverStoreContext,
+        _payloads: Vec<Payload>,
+    ) -> BoxFuture<'static, Result<Vec<StorageDriverClaim>, StorageDriverError>> {
+        Box::pin(future::ready(Err(anyhow!("not used").into())))
+    }
+
+    fn retrieve(
+        &self,
+        _context: &StorageDriverRetrieveContext,
+        _claims: Vec<StorageDriverClaim>,
+    ) -> BoxFuture<'static, Result<Vec<Payload>, StorageDriverError>> {
+        Box::pin(future::ready(Err(anyhow!("not used").into())))
+    }
+}
+
+struct PassThroughSelector;
+
+impl StorageDriverSelector for PassThroughSelector {
+    fn select_driver(
+        &self,
+        _context: &StorageDriverSelectContext,
+        _payload: &Payload,
+    ) -> Option<Arc<dyn StorageDriver>> {
+        None
+    }
+}
+
+#[tokio::test]
+async fn worker_heartbeat_reports_storage_driver_types() {
+    let drivers: Vec<Arc<dyn StorageDriver>> = vec![
+        Arc::new(HeartbeatDriver {
+            name: "s3-a",
+            driver_type: "aws.s3driver",
+        }),
+        Arc::new(HeartbeatDriver {
+            name: "s3-b",
+            driver_type: "aws.s3driver",
+        }),
+        Arc::new(HeartbeatDriver {
+            name: "gcs",
+            driver_type: "gcp.gcsdriver",
+        }),
+    ];
+    let storage = ExternalStorage::with_selector(drivers, Arc::new(PassThroughSelector)).unwrap();
+    let client = Client::new(
+        get_integ_connection(None).await,
+        ClientOptions::new(integ_namespace())
+            .data_converter(DataConverter::default().with_external_storage(storage))
+            .build(),
+    )
+    .unwrap();
+    let runtime_options = RuntimeOptions::builder()
+        .telemetry_options(TelemetryOptions::builder().build())
+        .heartbeat_interval(Some(Duration::from_secs(1)))
+        .build()
+        .unwrap();
+    let mut starter = CoreWfStarter::new_with_overrides(
+        "worker_heartbeat_storage_drivers",
+        Some(CoreRuntime::new_assume_tokio(runtime_options).unwrap()),
+        Some(client.clone()),
+    );
+    starter
+        .sdk_config
+        .register_workflow::<StorageDriversWf>()
+        .unwrap();
+
+    #[workflow]
+    #[derive(Default)]
+    struct StorageDriversWf;
+
+    #[workflow_methods]
+    impl StorageDriversWf {
+        #[run]
+        #[allow(dead_code)]
+        async fn run(_ctx: &mut WorkflowContext<Self>) -> WorkflowResult<()> {
+            Ok(())
+        }
+    }
+
+    let mut worker = starter.worker().await;
+    let worker_key = worker.worker_instance_key().to_string();
+    starter
+        .start_with_worker(StorageDriversWf::name(), &mut worker)
+        .await;
+    worker.run_until_done().await.unwrap();
+
+    let heartbeat = eventually(
+        || {
+            let client = client.clone();
+            let worker_key = worker_key.clone();
+            async move {
+                list_worker_heartbeats(&client, format!("WorkerInstanceKey=\"{worker_key}\""))
+                    .await
+                    .into_iter()
+                    .find(|heartbeat| heartbeat.status == WorkerStatus::ShuttingDown as i32)
+                    .ok_or("final worker heartbeat has not been recorded")
+            }
+        },
+        Duration::from_secs(7),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        heartbeat.drivers,
+        vec![
+            StorageDriverInfo {
+                r#type: "aws.s3driver".to_owned(),
+            },
+            StorageDriverInfo {
+                r#type: "gcp.gcsdriver".to_owned(),
+            },
+        ]
     );
 }
