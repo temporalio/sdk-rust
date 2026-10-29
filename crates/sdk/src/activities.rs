@@ -81,6 +81,7 @@ use temporalio_common::{
         SerializationContextData, TemporalDeserializable, TemporalSerializable,
     },
     error::ApplicationFailure,
+    external_storage::{StoreTarget, store_external_payloads},
     protos::{
         coresdk::{ActivityHeartbeat, activity_result::ActivityExecutionResult, activity_task},
         temporal::api::common::v1::Payload,
@@ -108,6 +109,7 @@ enum ActivityContextBackend {
     Worker {
         worker: Arc<CoreWorker>,
         client_options: ClientOptions,
+        store_target: Option<Box<StoreTarget>>,
     },
     #[cfg(feature = "testing")]
     Test {
@@ -129,6 +131,7 @@ impl ActivityContextBackend {
             Self::Worker {
                 worker,
                 client_options,
+                store_target,
             } => {
                 let details = client_options
                     .data_converter
@@ -137,10 +140,17 @@ impl ActivityContextBackend {
                         &details,
                     )
                     .await?;
-                worker.record_activity_heartbeat(ActivityHeartbeat {
+                let mut heartbeat = ActivityHeartbeat {
                     task_token: task_token.to_vec(),
                     details,
-                });
+                };
+                store_external_payloads(
+                    &mut heartbeat,
+                    &client_options.data_converter,
+                    store_target.as_deref().cloned(),
+                )
+                .await?;
+                worker.record_activity_heartbeat(heartbeat);
             }
             #[cfg(feature = "testing")]
             Self::Test {
@@ -159,6 +169,7 @@ impl ActivityContextBackend {
             Self::Worker {
                 worker,
                 client_options,
+                ..
             } => {
                 let connection = worker.get_client_connection().expect(
                     "activity context client is unavailable because the worker was not created from a Temporal client",
@@ -206,6 +217,7 @@ impl ActivityContext {
         task_queue: String,
         task_token: Vec<u8>,
         task: activity_task::Start,
+        store_target: Option<StoreTarget>,
     ) -> (Self, Vec<Payload>) {
         let activity_task::Start {
             workflow_namespace,
@@ -249,6 +261,7 @@ impl ActivityContext {
                 backend: ActivityContextBackend::Worker {
                     worker,
                     client_options,
+                    store_target: store_target.map(Box::new),
                 },
                 cancellation_token,
                 heartbeat_details,
