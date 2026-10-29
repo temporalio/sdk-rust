@@ -45,7 +45,7 @@ use siphasher::sip::SipHasher13;
 use slotmap::{SlotMap, SparseSecondaryMap};
 use std::{
     cell::RefCell,
-    collections::{HashMap, VecDeque},
+    collections::{BTreeSet, HashMap, VecDeque},
     convert::TryInto,
     hash::{Hash, Hasher},
     iter::Peekable,
@@ -100,11 +100,14 @@ pub(crate) struct WorkflowMachines {
     /// to poll the server that often during replay.
     last_history_from_server: HistoryUpdate,
     /// The started event ids of the run's failed and timed out workflow tasks. Each local activity
-    /// start has them, so that the activity knows which tasks never completed.
-    failed_wft_started_ids: VecDeque<i64>,
-    /// The last workflow task in history, and the last one that completed. A local activity start
-    /// has the attempt and the started time of the completed one.
+    /// start has them, so that the activity knows which tasks never completed. A set keeps them in
+    /// event order and ignores the ids of a history page that Core reads again.
+    failed_wft_started_ids: BTreeSet<i64>,
+    /// The newest workflow task in history. When its completed event comes, it becomes
+    /// `completed_wft`.
     last_wft: WftAttempt,
+    /// The newest workflow task that completed. A local activity start has its attempt and started
+    /// time, so that the activity knows which lower attempts at that event id never completed.
     completed_wft: Option<WftAttempt>,
     /// Protocol messages that have yet to be processed for the current WFT.
     protocol_msgs: Vec<IncomingProtocolMessage>,
@@ -296,7 +299,7 @@ impl WorkflowMachines {
         };
         Self {
             last_history_from_server: basics.history,
-            failed_wft_started_ids: VecDeque::new(),
+            failed_wft_started_ids: BTreeSet::new(),
             last_wft: WftAttempt::default(),
             completed_wft: None,
             protocol_msgs: vec![],
@@ -493,18 +496,12 @@ impl WorkflowMachines {
                 }
                 _ => continue,
             };
-            // Core can get the same page of history again after a cache miss.
-            if self
-                .failed_wft_started_ids
-                .back()
-                .is_some_and(|&last| last >= started)
-            {
-                continue;
+            self.failed_wft_started_ids.insert(started);
+            // Past the cap, the oldest id goes. That also drops an old id from a page that Core
+            // reads again.
+            if self.failed_wft_started_ids.len() > MAX_FAILED_WFTS {
+                self.failed_wft_started_ids.pop_first();
             }
-            if self.failed_wft_started_ids.len() == MAX_FAILED_WFTS {
-                self.failed_wft_started_ids.pop_front();
-            }
-            self.failed_wft_started_ids.push_back(started);
         }
     }
 
