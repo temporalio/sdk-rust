@@ -26,6 +26,7 @@ use temporalio_client::{
     ERROR_RETURNED_DUE_TO_SHORT_CIRCUIT, jittered, request_extensions::NoRetryOnMatching,
 };
 use temporalio_common::protos::temporal::api::{
+    session::v1::WorkerSessionOptions,
     taskqueue::v1::PollerScalingDecision,
     workflowservice::v1::{
         PollActivityTaskQueueResponse, PollNexusTaskQueueResponse, PollWorkflowTaskQueueResponse,
@@ -68,13 +69,13 @@ const PERSISTENT_POLL_ERROR_WARN_BACKOFF: ExponentialBuilder = ExponentialBuilde
 type PollReceiver<T, SK> =
     Mutex<UnboundedReceiver<pollers::Result<(T, OwnedMeteredSemPermit<SK>)>>>;
 
-struct PollRateLimiter {
+pub(crate) struct PollRateLimiter {
     interval: Duration,
     next_allowed_at: Mutex<Instant>,
 }
 
 impl PollRateLimiter {
-    fn new(polls_per_second: f64) -> Self {
+    pub(crate) fn new(polls_per_second: f64) -> Self {
         Self {
             interval: Duration::from_secs_f64(polls_per_second.recip()),
             next_allowed_at: Mutex::new(Instant::now()),
@@ -102,15 +103,20 @@ pub(crate) struct LongPollBuffer<T, SK: SlotKind> {
     did_start: AtomicBool,
 }
 
+#[derive(Default)]
 pub(crate) struct WorkflowTaskOptions {
     pub(crate) wft_poller_shared: Option<Arc<StickyPollerShared>>,
+    pub(crate) session_options: Option<WorkerSessionOptions>,
 }
 
+#[derive(Default)]
 pub(crate) struct ActivityTaskOptions {
     /// Local ratelimit
-    pub(crate) max_worker_acts_per_second: Option<f64>,
+    pub(crate) rate_limiter: Option<Arc<PollRateLimiter>>,
     /// Server ratelimit
     pub(crate) max_tps: Option<f64>,
+    pub(crate) poller_shared: Option<Arc<StickyPollerShared>>,
+    pub(crate) session_options: Option<WorkerSessionOptions>,
 }
 
 impl LongPollBuffer<PollWorkflowTaskQueueResponse, WorkflowSlotKind> {
@@ -172,6 +178,7 @@ impl LongPollBuffer<PollWorkflowTaskQueueResponse, WorkflowSlotKind> {
             let client = client.clone();
             let task_queue = task_queue.clone();
             let sticky_queue_name = sticky_queue.clone();
+            let session_options = options.session_options.clone();
             async move {
                 client
                     .poll_workflow_task(
@@ -180,7 +187,10 @@ impl LongPollBuffer<PollWorkflowTaskQueueResponse, WorkflowSlotKind> {
                             no_retry,
                             timeout_override,
                         },
-                        PollWorkflowOptions { sticky_queue_name },
+                        PollWorkflowOptions {
+                            sticky_queue_name,
+                            session_options,
+                        },
                     )
                     .await
             }
@@ -202,6 +212,7 @@ impl LongPollBuffer<PollActivityTaskQueueResponse, ActivitySlotKind> {
     pub(crate) fn new_activity_task(
         client: Arc<dyn WorkerClient>,
         task_queue: String,
+        sticky_queue: Option<String>,
         poller_behavior: PollerBehavior,
         permit_dealer: MeteredPermitDealer<ActivitySlotKind>,
         shutdown: CancellationToken,
@@ -210,15 +221,37 @@ impl LongPollBuffer<PollActivityTaskQueueResponse, ActivitySlotKind> {
         last_successful_poll_time: Arc<AtomicCell<Option<SystemTime>>>,
         capabilities: Arc<NamespaceCapabilities>,
     ) -> Self {
-        let pre_permit_delay = options
-            .max_worker_acts_per_second
-            .map(|ps| Arc::new(PollRateLimiter::new(ps)))
-            .map(|rl| {
-                move || {
-                    let rl = rl.clone();
-                    async move { rl.wait().await }.boxed()
+        let is_sticky = sticky_queue.is_some();
+        let poll_scaler = PollScaler::new(
+            poller_behavior,
+            num_pollers_handler,
+            shutdown.clone(),
+            last_successful_poll_time,
+            capabilities.clone(),
+        );
+        if let Some(shared) = &options.poller_shared {
+            if is_sticky {
+                shared.set_sticky_active(
+                    poll_scaler.active_rx.clone(),
+                    poll_scaler.report_handle.target.subscribe(),
+                );
+            } else {
+                shared.set_non_sticky_active(poll_scaler.active_rx.clone());
+            }
+        }
+        let pre_permit_delay = Some(move || {
+            let shared = options.poller_shared.clone();
+            let rate_limiter = options.rate_limiter.clone();
+            async move {
+                if let Some(shared) = shared {
+                    // Activity responses have no sticky backlog hint; backlog priority stays inactive.
+                    shared.wait_if_needed(is_sticky).await;
                 }
-            });
+                if let Some(rate_limiter) = rate_limiter {
+                    rate_limiter.wait().await;
+                }
+            }
+        });
         let no_retry = if matches!(poller_behavior, PollerBehavior::Autoscaling { .. }) {
             Some(NoRetryOnMatching {
                 predicate: poll_scaling_error_matcher,
@@ -229,6 +262,8 @@ impl LongPollBuffer<PollActivityTaskQueueResponse, ActivitySlotKind> {
         let poll_fn = move |timeout_override: Option<Duration>| {
             let client = client.clone();
             let task_queue = task_queue.clone();
+            let sticky_queue_name = sticky_queue.clone();
+            let session_options = options.session_options.clone();
             async move {
                 client
                     .poll_activity_task(
@@ -239,19 +274,14 @@ impl LongPollBuffer<PollActivityTaskQueueResponse, ActivitySlotKind> {
                         },
                         PollActivityOptions {
                             max_tasks_per_sec: options.max_tps,
+                            sticky_queue_name,
+                            session_options,
                         },
                     )
                     .await
             }
         };
 
-        let poll_scaler = PollScaler::new(
-            poller_behavior,
-            num_pollers_handler,
-            shutdown.clone(),
-            last_successful_poll_time,
-            capabilities.clone(),
-        );
         Self::new(
             poll_fn,
             permit_dealer,
@@ -895,6 +925,7 @@ mod tests {
             None::<fn(usize)>,
             WorkflowTaskOptions {
                 wft_poller_shared: Some(Arc::new(StickyPollerShared::new(Some(10)))),
+                ..Default::default()
             },
             Arc::new(AtomicCell::new(None)),
             Arc::new(NamespaceCapabilities::default()),
@@ -952,6 +983,7 @@ mod tests {
             None::<fn(usize)>,
             WorkflowTaskOptions {
                 wft_poller_shared: Some(Arc::new(StickyPollerShared::new(Some(1)))),
+                ..Default::default()
             },
             Arc::new(AtomicCell::new(None)),
             Arc::new(NamespaceCapabilities::default()),
@@ -1029,6 +1061,7 @@ mod tests {
             None::<fn(usize)>,
             WorkflowTaskOptions {
                 wft_poller_shared: Some(Arc::new(StickyPollerShared::new(Some(10)))),
+                ..Default::default()
             },
             Arc::new(AtomicCell::new(None)),
             Arc::new(NamespaceCapabilities::default()),
@@ -1138,6 +1171,7 @@ mod tests {
             None::<fn(usize)>,
             WorkflowTaskOptions {
                 wft_poller_shared: Some(Arc::new(StickyPollerShared::new(Some(INITIAL_POLLERS)))),
+                ..Default::default()
             },
             Arc::new(AtomicCell::new(None)),
             Arc::new(NamespaceCapabilities::default()),
@@ -1219,6 +1253,7 @@ mod tests {
             }),
             WorkflowTaskOptions {
                 wft_poller_shared: None,
+                ..Default::default()
             },
             Arc::new(AtomicCell::new(None)),
             Arc::new(NamespaceCapabilities::resolved(Capabilities {
@@ -1297,6 +1332,7 @@ mod tests {
             None::<fn(usize)>,
             WorkflowTaskOptions {
                 wft_poller_shared: None,
+                ..Default::default()
             },
             Arc::new(AtomicCell::new(None)),
             Arc::new(NamespaceCapabilities::resolved(Capabilities {

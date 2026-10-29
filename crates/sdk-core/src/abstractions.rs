@@ -35,8 +35,7 @@ pub(crate) struct MeteredPermitDealer<SK: SlotKind> {
     max_permits: Option<usize>,
     metrics_ctx: MetricsContext,
     meter: Option<TemporalMeter>,
-    /// Only applies to permit dealers for workflow tasks. True if this permit dealer is associated
-    /// with a sticky queue poller.
+    /// True if this permit dealer is associated with a sticky queue poller.
     is_sticky_poller: bool,
     context_data: Arc<PermitDealerContextData>,
 }
@@ -198,7 +197,7 @@ where
     }
 }
 
-impl MeteredPermitDealer<WorkflowSlotKind> {
+impl<SK: SlotKind> MeteredPermitDealer<SK> {
     pub(crate) fn into_sticky(mut self) -> Self {
         self.is_sticky_poller = true;
         self

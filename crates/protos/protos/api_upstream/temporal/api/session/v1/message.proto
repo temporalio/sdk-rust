@@ -1,0 +1,56 @@
+syntax = "proto3";
+
+package temporal.api.session.v1;
+
+option go_package = "go.temporal.io/api/session/v1;session";
+option java_package = "io.temporal.api.session.v1";
+option java_multiple_files = true;
+option java_outer_classname = "MessageProto";
+option ruby_package = "Temporalio::Api::Session::V1";
+option csharp_namespace = "Temporalio.Api.Session.V1";
+
+import "google/protobuf/empty.proto";
+
+// EXPERIMENTAL. Subject to redesign or removal.
+// Sent on workflow and activity polls. Presence means this worker can serve
+// sessions. Currently, the only supported Session type is Workflow Session
+// (aka Workflow-as-Session). A Workflow Session can receive both workflow
+// tasks and activity tasks of an execution.
+message WorkerSessionOptions {
+    // Admission control, if unset the worker accepts an arbitrary number of
+    // sessions (bounded by session slots in the future)
+    oneof admission {
+        // If specified, the worker only polls for work belonging to its session.
+        SingleSessionOptions single_session = 1;
+    }
+}
+
+// EXPERIMENTAL. Subject to redesign or removal.
+// Serve exactly one session for the worker's lifetime, including across
+// process restarts with the same stable_identity. The server binds the worker
+// to the first session that needs a worker, and dispatches no other work here,
+// even after that session completes.
+message SingleSessionOptions {
+    // Identity the binding is stored under. Reuse it across restarts of the
+    // same session, not across concurrently running workers. If multiple
+    // workers poll with the same stable_identity concurrently, the server
+    // treats them as pollers of a single worker and process affinity is lost.
+    //
+    // Note: this effectively acts as a configurable sticky queue.
+    // Note: we are currently unsure how this will evolve. May be deprecated as
+    // the session model develops.
+    string stable_identity = 1;
+}
+
+// EXPERIMENTAL. Subject to redesign or removal.
+// Resolved activity placement. Unset = normal task-queue routing.
+message ActivitySessionOptions {
+    oneof placement {
+        // Run in the workflow's current session (on its sticky queue).
+        // Currently requires the activity's task queue to be the workflow's,
+        // and the workflow's worker to serve sessions.
+        google.protobuf.Empty workflow_session = 1;
+
+        // Future: references to other types of sessions.
+    }
+}

@@ -155,6 +155,8 @@ enum ResourceExhaustedCause {
     RESOURCE_EXHAUSTED_CAUSE_WORKER_DEPLOYMENT_LIMITS = 10;
     // Namespace exceeds bandwidth limit.
     RESOURCE_EXHAUSTED_CAUSE_BANDWIDTH_LIMIT = 11;
+    // Caller exceeds Nexus requests per second limit.
+    RESOURCE_EXHAUSTED_CAUSE_CALLER_RPS_LIMIT = 12;
 }
 
 enum ResourceExhaustedScope {
