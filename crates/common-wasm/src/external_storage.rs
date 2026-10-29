@@ -1,12 +1,11 @@
-//! External storage contracts: offloading large payloads to a user-supplied driver, which replaces
-//! them on the wire with a small reference so the payload data never reaches the Temporal server.
+//! External storage contracts: offloading large payloads to a user-supplied driver instead of
+//! sending them inline to the Temporal server. A small reference takes each payload's place.
 //!
 //! This module is private. The contracts are published from [`crate::data_converters`], beside the
 //! [`DataConverter`](crate::data_converters::DataConverter) the configuration hangs off, which is
 //! the only reason they are defined in this crate: drivers are implemented and invoked outside of
 //! WASM, by the worker and client, never from workflow code. The reference wire format lives in
-//! `temporalio-common`, alongside the payload visitor and the proto JSON support it needs. Nothing
-//! here is wired into the SDK yet.
+//! `temporalio-common`, alongside the payload visitor and the proto JSON support it needs.
 
 use crate::{data_converters::ExternalStorageError, protos::temporal::api::common::v1::Payload};
 use futures::future::BoxFuture;
@@ -18,7 +17,8 @@ use std::{
 
 const DEFAULT_PAYLOAD_SIZE_THRESHOLD: usize = 256 * 1024;
 
-/// Driver-defined reference to an externally stored payload, used to retrieve it later.
+/// What a driver returns for a stored payload, used to retrieve it later. The SDK wraps it in the
+/// reference that replaces the payload on the wire.
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct StorageDriverClaim {
@@ -179,7 +179,8 @@ impl ExternalStorageConcurrency {
 #[builder(state_mod(vis = "pub"))]
 #[non_exhaustive]
 pub struct StorageDriverStoreContext {
-    /// The execution the payloads are being stored on behalf of, when there is one.
+    /// The execution the payloads are being stored on behalf of, when there is one. The SDK does
+    /// not set this yet, so for now it is always `None`.
     pub target: Option<StorageDriverTargetInfo>,
     /// Limiter for this driver's store requests.
     pub limiter: Arc<dyn StorageDriverLimiter<Payload>>,
@@ -198,7 +199,8 @@ impl fmt::Debug for StorageDriverStoreContext {
 #[builder(state_mod(vis = "pub"))]
 #[non_exhaustive]
 pub struct StorageDriverSelectContext {
-    /// The execution the payload is being stored on behalf of, when there is one.
+    /// The execution the payload is being stored on behalf of, when there is one. The SDK does not
+    /// set this yet, so for now it is always `None`.
     pub target: Option<StorageDriverTargetInfo>,
 }
 
@@ -295,14 +297,31 @@ pub trait StorageDriverSelector: Send + Sync {
     ) -> Option<Arc<dyn StorageDriver>>;
 }
 
-/// Configuration for offloading large payloads to an external storage system.
+/// Configuration for offloading large payloads to an external storage system instead of sending
+/// them inline to the Temporal server.
 ///
-/// This and the driver and selector traits it holds are defined in this crate only so that it can
-/// be configured on a [`DataConverter`](crate::data_converters::DataConverter). Drivers are
-/// implemented and invoked outside of WASM, by the worker and client, never from workflow code.
+/// A payload at or above [`Self::payload_size_threshold`] is handed to a [`StorageDriver`] and
+/// replaced on the wire by a small reference to what the driver stored. Workers and clients swap
+/// references back for the payloads they point at when they read them, except that a workflow's
+/// fetched history is returned as stored, references included. Configure it with
+/// [`DataConverter::with_external_storage`](crate::data_converters::DataConverter::with_external_storage).
+/// Drivers are called by the worker and the client, never from workflow code.
 ///
 /// Validated when constructed rather than when used, so a misconfiguration surfaces at startup
 /// instead of on the first payload large enough to offload.
+///
+/// # Limitations
+///
+/// This API is experimental and may change without notice. For now:
+///
+/// - Heartbeat details recorded from inside an activity are not offloaded.
+/// - Drivers are not told which workflow or activity a payload belongs to: the `target` on
+///   [`StorageDriverStoreContext`] and [`StorageDriverSelectContext`] is always `None`.
+/// - Storage requests are not limited, so every request a message needs runs at once.
+/// - References are not passed through the payload codec, so the
+///   [`claim_data`](StorageDriverClaim::claim_data) they carry is written to history unencrypted,
+///   and a reference that another SDK encoded with a codec is not recognized.
+/// - Replaying a workflow stores its payloads again.
 #[derive(Clone)]
 pub struct ExternalStorage {
     drivers: Vec<Arc<dyn StorageDriver>>,

@@ -137,7 +137,7 @@ use temporalio_common::{
         ActivitySerializationContext, DataConverter, SerializationContext,
         SerializationContextData, WorkflowSerializationContext,
     },
-    payload_visitor::{decode_payloads, retrieve_external_payloads},
+    payload_visitor::{decode_payloads, retrieve_external_payloads, store_external_payloads},
     protos::{
         coresdk::IntoPayloadsExt,
         grpc::health::v1::health_client::HealthClient,
@@ -1906,8 +1906,9 @@ where
                             payloads.into_payloads(),
                             memo,
                             options,
-                        )
-                        .into_request();
+                        );
+                        store_external_payloads(&mut request, &data_converter).await?;
+                        let mut request = request.into_request();
                         rpc_options.apply_to(&mut request);
                         let run_id = client
                             .start_workflow_execution(request)
@@ -2037,8 +2038,9 @@ where
                             priority: start_request.priority,
                             time_skipping_config: start_request.time_skipping_config,
                             ..Default::default()
-                        }
-                        .into_request();
+                        };
+                        store_external_payloads(&mut request, &data_converter).await?;
+                        let mut request = request.into_request();
                         rpc_options.apply_to(&mut request);
                         let run_id = WorkflowService::signal_with_start_workflow_execution(
                             &mut client,
@@ -2166,7 +2168,7 @@ where
                             update_payloads,
                         );
 
-                        let request = ExecuteMultiOperationRequest {
+                        let mut request = ExecuteMultiOperationRequest {
                             namespace,
                             operations: vec![
                                 execute_multi_operation_request::Operation {
@@ -2182,6 +2184,7 @@ where
                             ],
                             resource_id: workflow_id.clone(),
                         };
+                        store_external_payloads(&mut request, &data_converter).await?;
 
                         let (start_response, update_response) = loop {
                             let mut rpc_request = request.clone().into_request();
@@ -2504,57 +2507,50 @@ where
             (summary.is_some() || details.is_some()).then_some(UserMetadata { summary, details })
         };
 
+        let mut request = StartActivityExecutionRequest {
+            namespace: client.namespace(),
+            identity: client.identity(),
+            request_id: Uuid::new_v4().to_string(),
+            activity_id: options.id.clone(),
+            activity_type: Some(ActivityType {
+                name: activity.name().to_string(),
+            }),
+            task_queue: Some(TaskQueue {
+                name: options.task_queue,
+                kind: TaskQueueKind::Normal.into(),
+                normal_name: "".to_string(),
+            }),
+            schedule_to_close_timeout: try_into_or_box_err(
+                options.close_timeouts.schedule_to_close(),
+                StartActivityError::Other,
+            )?,
+            schedule_to_start_timeout: try_into_or_box_err(
+                options.schedule_to_start_timeout,
+                StartActivityError::Other,
+            )?,
+            start_to_close_timeout: try_into_or_box_err(
+                options.close_timeouts.start_to_close(),
+                StartActivityError::Other,
+            )?,
+            heartbeat_timeout: try_into_or_box_err(
+                options.heartbeat_timeout,
+                StartActivityError::Other,
+            )?,
+            retry_policy: options.retry_policy.map(Into::into),
+            input: dc.to_payloads(sc, &input).await?.into_payloads(),
+            id_reuse_policy: ProtoActivityIdReusePolicy::from(options.id_reuse_policy).into(),
+            id_conflict_policy: ProtoActivityIdConflictPolicy::from(options.id_conflict_policy)
+                .into(),
+            search_attributes: options.search_attributes.map(SearchAttributes::into_proto),
+            header: options.header,
+            user_metadata,
+            priority: Some(options.priority.into()),
+            start_delay: try_into_or_box_err(options.start_delay, StartActivityError::Other)?,
+            ..Default::default()
+        };
+        store_external_payloads(&mut request, dc).await?;
         let resp = client
-            .start_activity_execution(
-                StartActivityExecutionRequest {
-                    namespace: client.namespace(),
-                    identity: client.identity(),
-                    request_id: Uuid::new_v4().to_string(),
-                    activity_id: options.id.clone(),
-                    activity_type: Some(ActivityType {
-                        name: activity.name().to_string(),
-                    }),
-                    task_queue: Some(TaskQueue {
-                        name: options.task_queue,
-                        kind: TaskQueueKind::Normal.into(),
-                        normal_name: "".to_string(),
-                    }),
-                    schedule_to_close_timeout: try_into_or_box_err(
-                        options.close_timeouts.schedule_to_close(),
-                        StartActivityError::Other,
-                    )?,
-                    schedule_to_start_timeout: try_into_or_box_err(
-                        options.schedule_to_start_timeout,
-                        StartActivityError::Other,
-                    )?,
-                    start_to_close_timeout: try_into_or_box_err(
-                        options.close_timeouts.start_to_close(),
-                        StartActivityError::Other,
-                    )?,
-                    heartbeat_timeout: try_into_or_box_err(
-                        options.heartbeat_timeout,
-                        StartActivityError::Other,
-                    )?,
-                    retry_policy: options.retry_policy.map(Into::into),
-                    input: dc.to_payloads(sc, &input).await?.into_payloads(),
-                    id_reuse_policy: ProtoActivityIdReusePolicy::from(options.id_reuse_policy)
-                        .into(),
-                    id_conflict_policy: ProtoActivityIdConflictPolicy::from(
-                        options.id_conflict_policy,
-                    )
-                    .into(),
-                    search_attributes: options.search_attributes.map(SearchAttributes::into_proto),
-                    header: options.header,
-                    user_metadata,
-                    priority: Some(options.priority.into()),
-                    start_delay: try_into_or_box_err(
-                        options.start_delay,
-                        StartActivityError::Other,
-                    )?,
-                    ..Default::default()
-                }
-                .into_request(),
-            )
+            .start_activity_execution(request.into_request())
             .await?
             .into_inner();
 

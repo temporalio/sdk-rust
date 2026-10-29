@@ -14,7 +14,6 @@ pub use failure_converter::{
 // are defined in this crate: drivers are implemented and invoked outside of WASM, by the worker and
 // client, never from workflow code.
 #[cfg(feature = "experimental")]
-#[doc(hidden)]
 pub use crate::external_storage::*;
 use well_known::{BINARY_NULL_ENCODING_VAL, WellKnownType, binary_null_payload};
 
@@ -32,6 +31,8 @@ pub struct DataConverter {
     #[allow(dead_code)] // Will be used for failure conversion
     failure_converter: Arc<dyn FailureConverter + Send + Sync>,
     codec: Arc<dyn PayloadCodec + Send + Sync>,
+    #[cfg(feature = "experimental")]
+    external_storage: Option<Arc<ExternalStorage>>,
 }
 
 impl std::fmt::Debug for DataConverter {
@@ -53,7 +54,25 @@ impl DataConverter {
             payload_converter,
             failure_converter: Arc::new(failure_converter),
             codec: Arc::new(codec),
+            #[cfg(feature = "experimental")]
+            external_storage: None,
         }
+    }
+
+    /// Offload payloads at or above the configured size threshold to external storage, keeping
+    /// large data out of workflow history. See [`ExternalStorage`] for how offloading works and its
+    /// current limitations.
+    #[cfg(feature = "experimental")]
+    #[must_use]
+    pub fn with_external_storage(mut self, external_storage: ExternalStorage) -> Self {
+        self.external_storage = Some(Arc::new(external_storage));
+        self
+    }
+
+    /// Returns the external storage configuration, if any.
+    #[cfg(feature = "experimental")]
+    pub fn external_storage(&self) -> Option<&ExternalStorage> {
+        self.external_storage.as_deref()
     }
 
     /// Serialize a value into a single payload, applying the codec.
