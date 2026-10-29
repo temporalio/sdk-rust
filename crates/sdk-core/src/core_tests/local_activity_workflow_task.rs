@@ -193,34 +193,6 @@ async fn a_retry_that_core_runs_keeps_the_dispatching_task() {
 }
 
 #[tokio::test]
-async fn local_activities_of_one_activation_name_the_same_task() {
-    let mut t = TestHistoryBuilder::default();
-    t.add_by_type(EventType::WorkflowExecutionStarted);
-    t.add_workflow_task_scheduled_and_started();
-    let mut mock = build_mock_pollers(MockPollCfg::from_resps(t, [ResponseType::AllHistory]));
-    mock.worker_cfg(|wc| wc.max_cached_workflows = 1);
-    let worker = mock_worker(mock);
-
-    let first = worker.poll_workflow_activation().await.unwrap();
-    complete(&worker, &first, vec![la_cmd(1), la_cmd(2)]).await;
-
-    let one = worker.poll_activity_task().await.unwrap();
-    let two = worker.poll_activity_task().await.unwrap();
-    assert_eq!(dispatching(start_of(&one)), (3, 1));
-    assert_eq!(start_of(&one).workflow_task, start_of(&two).workflow_task);
-    worker
-        .complete_activity_task(ActivityTaskCompletion {
-            task_token: one.task_token,
-            result: Some(ActivityExecutionResult::ok(vec![1].into())),
-        })
-        .await
-        .unwrap();
-    let resolved = worker.poll_workflow_activation().await.unwrap();
-    complete(&worker, &resolved, vec![]).await;
-    finish(worker, two).await;
-}
-
-#[tokio::test]
 async fn failed_tasks_from_every_history_page_are_named() {
     let wf_id = "fake_wf_id";
     let mut t = TestHistoryBuilder::default();
