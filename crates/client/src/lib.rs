@@ -137,7 +137,8 @@ use temporalio_common::{
         ActivitySerializationContext, DataConverter, SerializationContext,
         SerializationContextData, WorkflowSerializationContext,
     },
-    payload_visitor::{decode_payloads, retrieve_external_payloads, store_external_payloads},
+    external_storage::{retrieve_external_payloads, store_external_payloads},
+    payload_visitor::decode_payloads,
     protos::{
         coresdk::IntoPayloadsExt,
         grpc::health::v1::health_client::HealthClient,

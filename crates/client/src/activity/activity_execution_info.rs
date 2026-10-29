@@ -11,7 +11,8 @@ use temporalio_common::{
         TemporalDeserializable,
     },
     error::IncomingError,
-    payload_visitor::{decode_payloads, retrieve_external_payloads},
+    external_storage::retrieve_external_payloads,
+    payload_visitor::decode_payloads,
     protos::{
         proto_ts_to_system_time,
         temporal::api::{

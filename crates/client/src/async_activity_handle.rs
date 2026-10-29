@@ -12,7 +12,8 @@ use temporalio_common::{
         TemporalSerializable,
     },
     error::{ApplicationFailure, OutgoingActivityError, OutgoingError},
-    payload_visitor::{encode_payloads, store_external_payloads},
+    external_storage::store_external_payloads,
+    payload_visitor::encode_payloads,
     protos::{
         TaskToken,
         temporal::api::{

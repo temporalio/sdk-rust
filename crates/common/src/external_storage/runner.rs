@@ -25,7 +25,7 @@ use temporalio_common_wasm::data_converters::{
 
 use crate::{
     data_converters::ExternalStorageError,
-    external_storage_references::{create_reference_payload, is_plain_reference, parse_reference},
+    external_storage::references::{create_reference_payload, is_plain_reference, parse_reference},
     payload_visitor::{AsyncPayloadVisitor, PayloadVisitable, payload_visitor},
     protos::temporal::api::common::v1::Payload,
 };
@@ -64,7 +64,7 @@ pub(crate) async fn retrieve_in<M: PayloadVisitable + Send>(
                 .retrieve_in(message)
                 .await
         }
-        None => crate::external_storage_references::reject_references_in(message).await,
+        None => crate::external_storage::references::reject_references_in(message).await,
     }
 }
 
@@ -331,7 +331,7 @@ async fn store_payloads(
 mod tests {
     use super::*;
     use crate::{
-        external_storage_references::create_reference_payload,
+        external_storage::references::create_reference_payload,
         protos::temporal::api::{
             common::v1::{Header, Memo, Payloads, SearchAttributes},
             workflowservice::v1::SignalWithStartWorkflowExecutionRequest,
@@ -692,7 +692,7 @@ mod tests {
 
         assert_eq!(payloads[0], small, "below the threshold, left inline");
         assert!(
-            crate::external_storage_references::is_plain_reference(&payloads[1]),
+            crate::external_storage::references::is_plain_reference(&payloads[1]),
             "only the one at the threshold was offloaded"
         );
         // What the driver was handed is byte-identical to what history would have held inline.
@@ -1086,7 +1086,7 @@ mod tests {
         // Search attributes are indexed literally, so they are left untouched and still reference
         // external storage afterward.
         assert_eq!(request.search_attributes, search_attributes);
-        assert!(crate::external_storage_references::is_plain_reference(
+        assert!(crate::external_storage::references::is_plain_reference(
             &request.search_attributes.as_ref().unwrap().indexed_fields["s"]
         ));
         let input = request.input.unwrap().payloads;

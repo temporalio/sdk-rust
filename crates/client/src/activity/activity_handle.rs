@@ -10,7 +10,8 @@ use temporalio_common::{
     data_converters::{
         ActivitySerializationContext, DecodablePayloads, NoopDecodeHint, SerializationContextData,
     },
-    payload_visitor::{decode_payloads, retrieve_external_payloads},
+    external_storage::retrieve_external_payloads,
+    payload_visitor::decode_payloads,
     protos::temporal::api::{
         activity::v1::{ActivityExecutionOutcome, activity_execution_outcome},
         failure::v1::failure::FailureInfo,

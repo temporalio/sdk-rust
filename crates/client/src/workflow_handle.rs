@@ -30,7 +30,8 @@ use temporalio_common::{
         WorkflowSerializationContext,
     },
     error::IncomingError,
-    payload_visitor::{decode_payloads, retrieve_external_payloads, store_external_payloads},
+    external_storage::{retrieve_external_payloads, store_external_payloads},
+    payload_visitor::decode_payloads,
     protos::{
         coresdk::FromPayloadsExt,
         proto_ts_to_system_time,

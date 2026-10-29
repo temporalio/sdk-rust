@@ -19,7 +19,8 @@ use temporalio_common::{
         DataConverter, PayloadConversionError, SerializationContextData, TemporalDeserializable,
         TemporalSerializable, WorkflowSerializationContext,
     },
-    payload_visitor::{decode_payloads, retrieve_external_payloads, store_external_payloads},
+    external_storage::{retrieve_external_payloads, store_external_payloads},
+    payload_visitor::decode_payloads,
     protos::{
         coresdk::IntoPayloadsExt,
         proto_ts_to_system_time,
